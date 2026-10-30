@@ -296,8 +296,9 @@ def fused_moe_gmm(
     with an elementwise subtract and masks non-local experts. When present,
     the sparse-core parity path dispatches ragged gather/gather-reduce.
 
-    With ``hidden_scale``, ``hidden_states`` are rows from
-    ``quantize_moe_input_rows`` and these their scales (see ``fused_moe_func``).
+    With ``hidden_scale``, ``hidden_states`` are rows quantized by the op of
+    ``build_moe_input_quantizer`` and these their scales (see
+    ``fused_moe_func``).
     """
     use_ep = experts_start is not None
     fused_moe = _get_fused_moe_custom_op(
@@ -327,9 +328,16 @@ def fused_moe_gmm(
     )
 
 
-def _get_moe_input_quantizer(
+def build_moe_input_quantizer(
     *, q_dtype, dispatch_size: int, topk: int, use_ep: bool
-) -> Callable:
+) -> Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    """The op quantizing this rank's MoE rows as ``fused_moe_gmm`` would.
+
+    It returns the rows as int8-carried ``q_dtype`` and their scales, for a
+    dispatch that gathers ``dispatch_size`` ranks' rows and hands them to
+    ``fused_moe_gmm(hidden_scale=...)``; see ``quantize_moe_input``. Build it
+    outside tracing and call the returned op from the forward.
+    """
     key = (q_dtype, dispatch_size, topk, use_ep)
     op = _moe_input_quantizer_cache.get(key)
     if op is not None:
@@ -360,32 +368,3 @@ def _get_moe_input_quantizer(
     op.register_fake(_fake_quantize)
     _moe_input_quantizer_cache[key] = op
     return op
-
-
-def prebuild_moe_input_quantizer(
-    *, q_dtype, dispatch_size: int, topk: int, use_ep: bool
-) -> None:
-    """Prebuild the quantizer `quantize_moe_input_rows` calls, outside tracing."""
-    _get_moe_input_quantizer(
-        q_dtype=q_dtype, dispatch_size=dispatch_size, topk=topk, use_ep=use_ep
-    )
-
-
-def quantize_moe_input_rows(
-    hidden_states: torch.Tensor,
-    *,
-    q_dtype,
-    dispatch_size: int,
-    topk: int,
-    use_ep: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """This rank's MoE rows, as int8-carried ``q_dtype``, and their scales,
-    quantized as ``fused_moe_gmm`` would.
-
-    For a dispatch that gathers ``dispatch_size`` ranks' rows and hands them to
-    ``fused_moe_gmm(hidden_scale=...)``; see ``quantize_moe_input``.
-    """
-    quantizer = _get_moe_input_quantizer(
-        q_dtype=q_dtype, dispatch_size=dispatch_size, topk=topk, use_ep=use_ep
-    )
-    return quantizer(hidden_states)

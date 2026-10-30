@@ -71,10 +71,9 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
+    build_moe_input_quantizer,
     fused_moe_gmm,
     prebuild_fused_moe_kernel,
-    prebuild_moe_input_quantizer,
-    quantize_moe_input_rows,
     quantize_native_fp4_kmajor,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -381,9 +380,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
 
     rhs_quant_dtype = jnp.float4_e2m1fn
-    # What the GMM path quantizes the dispatched rows to when this layer
-    # quantizes them before its own DP gather instead; set at weight load.
-    _dispatch_quant_dtype: jnp.dtype | None = None
+    # Quantizes this rank's rows before the layer's own DP gather, as the GMM
+    # path would after it; set at weight load when that gives the same output.
+    _dispatch_quantizer: Any | None = None
 
     @property
     def supports_internal_mk(self) -> bool:
@@ -394,7 +393,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         return (
             enable_pipelined_collective_and_compute()
             or fused_moe_ep_supported(self)
-            or self._dispatch_quant_dtype is not None
+            or self._dispatch_quantizer is not None
         )
 
     def _select_dispatch_quant_dtype(
@@ -776,17 +775,17 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 REQUANTIZED_BLOCK_SIZE,
             )
 
-        self._dispatch_quant_dtype = self._select_dispatch_quant_dtype(layer, op)
-        if self._dispatch_quant_dtype is not None:
-            prebuild_moe_input_quantizer(
-                q_dtype=self._dispatch_quant_dtype,
+        dispatch_quant_dtype = self._select_dispatch_quant_dtype(layer, op)
+        if dispatch_quant_dtype is not None:
+            # Built outside tracing, so the forward only calls the op.
+            self._dispatch_quantizer = build_moe_input_quantizer(
+                q_dtype=dispatch_quant_dtype,
                 dispatch_size=get_dp_group().world_size,
                 topk=layer.moe_config.experts_per_token,
                 use_ep=True,
             )
             logger.info_once(
-                "DeepSeek-V4 MXFP4 MoE gathers its rows in %s.",
-                self._dispatch_quant_dtype,
+                "DeepSeek-V4 MXFP4 MoE gathers its rows in %s.", dispatch_quant_dtype
             )
 
     def _forward_monolithic_tpu(
@@ -820,7 +819,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 score_bias_operand(layer),
                 hash_topk_ids_operand(layer, input_ids),
             )
-        if self._dispatch_quant_dtype is not None:
+        if self._dispatch_quantizer is not None:
             return self._forward_quantized_dispatch(layer, x, router_logits, input_ids)
         return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)
 
@@ -834,13 +833,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         """vLLM's naive DP dispatch and combine around the GMM path, with this
         rank's rows quantized before the gather instead of inside the GMM."""
         dp_group = get_dp_group()
-        rows, rows_scale = quantize_moe_input_rows(
-            x,
-            q_dtype=self._dispatch_quant_dtype,
-            dispatch_size=dp_group.world_size,
-            topk=layer.moe_config.experts_per_token,
-            use_ep=True,
-        )
+        rows, rows_scale = self._dispatch_quantizer(x)
         rows = dp_group.all_gather(rows, dim=0)
         rows_scale = dp_group.all_gather(rows_scale, dim=0)
         router_logits = dp_group.all_gather(router_logits, dim=0)
