@@ -57,6 +57,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
     VllmDeepseekV4Indexer,
     static_verify_q_len,
 )
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -87,6 +91,30 @@ def _qnorm_rope_jax(
     """Per-head RMSNorm (no weight) fused with RoPE on the flat q projection."""
     return rope_kernel.qnorm_rope_flat(
         x, positions, cos_sin_cache, num_heads=x.shape[1] // head_dim, eps=eps
+    )
+
+
+def _wq_b_qnorm_rope_jax(
+    qr: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    eps: float,
+    head_dim: int,
+) -> jax.Array:
+    """`wq_b` then `_qnorm_rope_jax`, with the norm and RoPE done on the
+    projection's output tiles in VMEM."""
+    return rope_kernel.quantized_matmul_heads(
+        qr,
+        w_q,
+        w_s,
+        head_dim,
+        functools.partial(rope_kernel.qnorm_rope_head, eps=eps),
+        rope_kernel.cos_sin_lanes,
+        positions,
+        cos_sin_cache,
     )
 
 
@@ -131,6 +159,15 @@ def _make_fake_qnorm_rope(head_dim: int):
 
     def _fake(x, positions, cos_sin_cache):
         return x.new_empty((x.shape[0], x.shape[1] // head_dim, head_dim))
+
+    return _fake
+
+
+def _make_fake_wq_b_qnorm_rope(head_dim: int):
+    """Abstract implementation: ``[tokens, q_lora_rank]`` -> 3-D."""
+
+    def _fake(qr, w_q, w_s, positions, cos_sin_cache):
+        return qr.new_empty((qr.shape[0], w_q.shape[1] // head_dim, head_dim))
 
     return _fake
 
@@ -558,6 +595,47 @@ class VllmDeepseekV4MLAAttention(
         """Project the q latent: [num_tokens, heads * head_dim], heads side by side."""
         return self.wq_b(qr)
 
+    @property
+    def wq_b_qnorm_rope_op(self):
+        """`wq_b` fused with `qnorm_rope`, or None where `wq_b` cannot be fused.
+
+        Takes a K-major FP8 `wq_b` with per-channel scales and no bias, on a
+        rank whose kernels run unsharded, projected by `_project_q` itself.
+        """
+        if "_wq_b_qnorm_rope_op_instance" in self.__dict__:
+            return self.__dict__["_wq_b_qnorm_rope_op_instance"]
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            VllmFp8LinearMethodTPU,
+        )
+
+        wq_b = self.wq_b
+        op = None
+        if (
+            type(self)._project_q is VllmDeepseekV4MLAAttention._project_q
+            and get_pallas_op_mesh() is None
+            and isinstance(getattr(wq_b, "quant_method", None), VllmFp8LinearMethodTPU)
+            and getattr(wq_b, WEIGHT_FLIPPED_ATTR, False)
+            and not getattr(wq_b, KEEP_VLLM_LAYOUT_ATTR, False)
+            and getattr(wq_b, "bias", None) is None
+            and wq_b.weight.dtype == torch.float8_e4m3fn
+            and wq_b.weight_scale.dim() == 1
+        ):
+            eps = float(self.mla_attn.eps)
+            head_dim = int(self.mla_attn.head_dim)
+            op_name = (
+                f"pallas::deepseek_v4_wq_b_qnorm_rope_e{_name_float(eps)}_d{head_dim}"
+            )
+            op = _pallas_op_cache.get(op_name)
+            if op is None:
+                op = pallas.jax_op(
+                    op_name,
+                    functools.partial(_wq_b_qnorm_rope_jax, eps=eps, head_dim=head_dim),
+                )
+                op.register_fake(_make_fake_wq_b_qnorm_rope(head_dim))
+                _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_wq_b_qnorm_rope_op_instance", op)
+        return op
+
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -568,8 +646,20 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self._project_q(qr)
-        q = self.qnorm_rope(q, positions)
+        fused_op = self.wq_b_qnorm_rope_op
+        # Shapes the fused kernel does not take keep the two original ops.
+        if fused_op is None or not rope_kernel.quantized_matmul_heads_supported(
+            *qr.shape, self.wq_b.weight.shape[1], int(self.mla_attn.head_dim)
+        ):
+            q = self.qnorm_rope(self._project_q(qr), positions)
+        else:
+            q = fused_op(
+                qr,
+                self.wq_b.weight,
+                self.wq_b.weight_scale,
+                positions,
+                self.mla_attn.rotary_emb.cos_sin_cache,
+            )
         kv = self.kv_rope(kv, positions)
 
         topk_indices = None
