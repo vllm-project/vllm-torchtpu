@@ -31,19 +31,22 @@ def _write_kv_op_fn(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    new_kv_cache = write_kv(
+) -> jax.Array:
+    return write_kv(
         kv_cache, keys, values, kv_lens, page_indices, cu_q_lens, distribution
     )
-    return new_kv_cache, distribution[2]
 
 
 def _fake_write_kv_op(
-    kv_cache: torch.Tensor, keys: torch.Tensor, *args: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(kv_cache), torch.empty(
-        (), dtype=torch.int32, device=kv_cache.device
-    )
+    kv_cache: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    kv_lens: torch.Tensor,
+    page_indices: torch.Tensor,
+    cu_q_lens: torch.Tensor,
+    distribution: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(kv_cache)
 
 
 # Built at import, not on first use: the first use is inside torch.compile's
@@ -69,7 +72,7 @@ def write_new_kv_(
     kv_cache is the layer-major 5-D RPA v3 pool; key and value are
     [num_tokens, num_kv_heads, head_size] in the cache dtype.
     """
-    new_kv_cache, _ = _write_kv_op(
+    new_kv_cache = _write_kv_op(
         kv_cache,
         key,
         value,

@@ -1678,6 +1678,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         computing attention. key, value: [num_tokens, num_kv_heads, head_size]
         or flattened to [num_tokens, num_kv_heads * head_size]."""
         assert self.supports_kv_cache_write()
+        # For determine_available_memory case, as in forward().
+        if kv_cache.numel() == 0:
+            return
         assert kv_cache.ndim == 5, (
             f"write_kv_cache needs the 5-D layer-major pool, got {kv_cache.shape}"
         )

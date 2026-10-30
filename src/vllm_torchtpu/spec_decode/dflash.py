@@ -129,6 +129,7 @@ class DFlashProposer:
         self.draft_model = None
         self._draft_has_moe_cache: bool | None = None
         self._write_only_context_kv = False
+        self._write_only_pools_checked = False
         self._draft_attn_layer_names: set[str] | None = None
         self.draft_chunks: list[DraftChunkInputs] | None = None
         self._static_attn_tensors_cache: dict[
@@ -289,6 +290,29 @@ class DFlashProposer:
             ):
                 return False
         return True
+
+    def _check_write_only_kv_pools(self) -> None:
+        """Fall back to the RPA context-KV update if a draft layer's KV pool is
+        not the 5-D layer-major pool write_kv_cache writes (e.g. a 4-D shared
+        packed pool). The pools are allocated after load_model, so this runs
+        before the first context-KV update instead."""
+        if not self._write_only_context_kv or self._write_only_pools_checked:
+            return
+        assert self.draft_model is not None
+        caches = [
+            layer.self_attn.attn.kv_cache for layer in self.draft_model.model.layers
+        ]
+        if any(cache.numel() == 0 for cache in caches):
+            # Memory profiling runs before the pools exist; decide later.
+            return
+        self._write_only_pools_checked = True
+        if all(cache.ndim == 5 for cache in caches):
+            return
+        self._write_only_context_kv = False
+        logger.info(
+            "VLLM_TPU_DFLASH_WRITE_ONLY_KV is set, but a draft layer's KV cache "
+            "is a shared packed pool; keeping the RPA context-KV update."
+        )
 
     def _load_draft_model(self) -> None:
         logger.info("Loading DFlash draft model...")
@@ -579,6 +603,7 @@ class DFlashProposer:
             positions = positions[0]
         positions = positions[:num_tokens]
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
+        self._check_write_only_kv_pools()
 
         with set_vllm_model_wrapper_context(
             mesh=self.runner.mesh, vllm_config=self.vllm_config
@@ -839,6 +864,7 @@ class DFlashProposer:
         )
         dummy_positions = cast(torch.Tensor, dummy_attn_metadata.input_positions)
         assert self.draft_model is not None
+        self._check_write_only_kv_pools()
 
         with set_vllm_model_wrapper_context(
             mesh=runner.mesh, vllm_config=self.vllm_config

@@ -20,6 +20,7 @@ the caller's cache.
 """
 
 from types import SimpleNamespace
+from unittest import mock
 
 import jax.numpy as jnp
 import numpy as np
@@ -137,6 +138,20 @@ def test_write_kv_cache_quantizes_like_forward(monkeypatch):
     assert torch.equal(written["key"].view(torch.uint8), q_key.view(torch.uint8))
     assert torch.equal(written["value"].view(torch.uint8), q_value.view(torch.uint8))
     assert written["md"] is md
+
+
+def test_write_kv_cache_skips_the_memory_profiling_placeholder(monkeypatch):
+    """Like forward(), the write is a no-op on the empty cache that memory
+    profiling passes before the pools exist."""
+    monkeypatch.setattr(
+        attention,
+        "write_new_kv_",
+        mock.Mock(side_effect=AssertionError("must not write an empty cache")),
+    )
+    key = torch.zeros(NUM_TOKENS, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.bfloat16)
+    empty_cache = torch.empty(0, dtype=torch.bfloat16)
+
+    _impl().write_kv_cache(SimpleNamespace(), key, key, empty_cache, _metadata())
 
 
 def test_write_kv_cache_rejects_a_dtype_mismatch():

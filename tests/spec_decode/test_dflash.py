@@ -591,6 +591,42 @@ def test_context_kv_write_needs_every_draft_layer_supported(
     assert proposer._context_kv_write_supported() is expected
 
 
+@pytest.mark.parametrize(
+    "cache_shapes,write_only,checked",
+    [
+        pytest.param([(4, 16, 2, 2, 128)] * 2, True, True, id="layer-major-pool"),
+        pytest.param(
+            [(4, 16, 2, 2, 128), (4, 16, 2, 256)], False, True, id="shared-packed-pool"
+        ),
+        pytest.param([(0,), (0,)], True, False, id="before-pools-exist"),
+    ],
+)
+def test_write_only_context_kv_falls_back_on_a_packed_pool(
+    cache_shapes, write_only, checked
+):
+    """Pools are allocated after load_model, so a 4-D shared packed pool is
+    only visible at the first context-KV update; it must fall back to RPA."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer._write_only_context_kv = True
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(
+                        attn=SimpleNamespace(kv_cache=torch.empty(shape))
+                    )
+                )
+                for shape in cache_shapes
+            ]
+        )
+    )
+
+    proposer._check_write_only_kv_pools()
+
+    assert proposer._write_only_context_kv is write_only
+    assert proposer._write_only_pools_checked is checked
+
+
 @pytest.mark.tpu_test
 def test_tpu_precompute_context_kv_uses_explicit_tpu_hook(device):
     proposer = _make_proposer(draft_tp=1)
