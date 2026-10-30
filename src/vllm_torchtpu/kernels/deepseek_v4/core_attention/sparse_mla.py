@@ -69,69 +69,143 @@ def _largest_divisor(x: int, cap: int) -> int:
 
 
 _GATHER_PAGE_CHUNK = 128
+# Query tokens per grid step of `gather_row_indices`.
+GATHER_INDEX_BLOCK_TOKENS = 8
 
 
-def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
-    logical = logical_ref[...]  # i32[block_tokens, topk]
-    out = jnp.zeros_like(logical)
-    for c in range(num_chunks):
-        window_chunk = windows_ref[
-            :, c * _GATHER_PAGE_CHUNK : (c + 1) * _GATHER_PAGE_CHUNK
-        ]  # i32[block_tokens, 128]
+def _gather_row_indices_kernel(
+    # Prefetch
+    block_ids_ref,  # [num_blocks] token blocks to fill; the grid ends before the rest
+    seq_ids_ref,  # [num_tokens] request of each token
+    # Input
+    page_table_ref,  # i32[max_num_seqs, padded_pps]
+    topk_ref,  # i32[block_tokens, topk]
+    # Output
+    out_ref,  # i32[block_tokens * topk // 128, 128]
+    *,
+    page_size: int,
+    pages_per_seq: int,
+    total_num_pages: int,
+):
+    block_tokens, topk = topk_ref.shape
+    num_tokens = seq_ids_ref.shape[0]
+    first = block_ids_ref[pl.program_id(0)] * block_tokens
+    # Per-token page-table window: row t is the page table of token t's
+    # request. A partial last block repeats the last token's request.
+    seqs = [
+        seq_ids_ref[jnp.minimum(first + t, num_tokens - 1)] for t in range(block_tokens)
+    ]
+    windows = jnp.concatenate(
+        [page_table_ref[pl.ds(seq, 1), :] for seq in seqs], axis=0
+    )  # i32[block_tokens, padded_pps]
+    topk_indices = topk_ref[...]
+    logical = jnp.clip(topk_indices // page_size, 0, pages_per_seq - 1)
+    page_ids = jnp.zeros_like(logical)
+    for c in range(page_table_ref.shape[1] // _GATHER_PAGE_CHUNK):
+        window_chunk = windows[:, c * _GATHER_PAGE_CHUNK : (c + 1) * _GATHER_PAGE_CHUNK]
         local = logical - c * _GATHER_PAGE_CHUNK
         gathered = jnp.take_along_axis(
             window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
         )
-        out = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, out)
-    out_ref[...] = out
+        page_ids = jnp.where(
+            (local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, page_ids
+        )
+    token_offset = topk_indices % page_size
+
+    # For the "-1" padding elements in topk_indices, we scatter the
+    # corresponding page_ids and token_offset to avoid gather memory access
+    # hotspotting. 104729 and 15485863 are randomly chosen large prime numbers.
+    flat_element_index = (
+        first + lax.broadcasted_iota(jnp.int32, topk_indices.shape, 0)
+    ) * topk + lax.broadcasted_iota(jnp.int32, topk_indices.shape, 1)
+    is_padding = topk_indices == -1
+    page_ids = jnp.where(
+        is_padding, (flat_element_index * 104729) % total_num_pages, page_ids
+    )
+    token_offset = jnp.where(
+        is_padding, (flat_element_index * 15485863) % page_size, token_offset
+    )
+    indices = page_ids * page_size + token_offset
+    # Row-major [num_tokens * topk] as 128-lane rows: token t, lanes
+    # [128 c, 128 c + 128) go to row t * topk // 128 + c.
+    row_chunks = topk // 128
+    for c in range(row_chunks):
+        out_ref[pl.ds(c, block_tokens, stride=row_chunks), :] = indices[
+            :, c * 128 : (c + 1) * 128
+        ]
 
 
-def gather_page_ids(
+def gather_row_indices(
+    topk_indices: jax.Array,  # i32[num_tokens, topk]  (position within seq)
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
-    seq_page_ids: jax.Array,  # i32[num_tokens, topk]  (logical page within seq)
     seq_ids_segment: jax.Array,  # i32[num_tokens]  (token -> seq id)
-    max_num_seqs: int,
+    range_ends: jax.Array,  # i32[num_ranges]
     *,
-    block_tokens: int = 8,
+    max_num_seqs: int,
+    page_size: int,
+    total_num_pages: int,
+    range_size: int,
 ) -> jax.Array:
-    """Gathers physical page ids for the CSA top-k tokens."""
-    num_tokens, topk = seq_page_ids.shape
-    pages_per_seq = page_indices.shape[0] // max_num_seqs
-    num_chunks = cdiv(pages_per_seq, _GATHER_PAGE_CHUNK)
-    padded_pps = num_chunks * _GATHER_PAGE_CHUNK
+    """Cache row of every top-k entry of the tokens the gather path reads.
 
+    Range r covers tokens [r * range_size, range_ends[r]); the grid walks the
+    token blocks those ranges touch only. Returns the row-major
+    [num_tokens * topk] row indices as i32[num_tokens * topk // 128, 128];
+    rows of tokens outside every range are left unwritten.
+    """
+    num_tokens, topk = topk_indices.shape
+    block_tokens = min(GATHER_INDEX_BLOCK_TOKENS, num_tokens)
+    # Every range starts on a block.
+    assert num_tokens <= range_size or range_size % block_tokens == 0
+    assert topk % 128 == 0
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    padded_pps = align_to(pages_per_seq, _GATHER_PAGE_CHUNK)
     page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
     if padded_pps != pages_per_seq:
         page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
-    # Per-token page-table window. This is a whole-row gather.
-    windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
-    logical = jnp.clip(seq_page_ids, 0, pages_per_seq - 1)
 
-    padded_tokens = align_to(num_tokens, block_tokens)
-    if padded_tokens != num_tokens:
-        pad = padded_tokens - num_tokens
-        windows = jnp.pad(windows, ((0, pad), (0, 0)))
-        logical = jnp.pad(logical, ((0, pad), (0, 0)))
+    # The touched blocks of every range, in order, at the front.
+    num_blocks = cdiv(num_tokens, block_tokens)
+    range_starts = jnp.arange(range_ends.shape[0], dtype=jnp.int32) * range_size
+    range_blocks = cdiv(jnp.maximum(range_ends - range_starts, 0), block_tokens)
+    range_offsets = jnp.cumsum(range_blocks) - range_blocks
+    slot = jnp.arange(num_blocks, dtype=jnp.int32)[:, None]
+    in_range = (slot >= range_offsets) & (slot < range_offsets + range_blocks)
+    block_ids = jnp.sum(
+        jnp.where(in_range, range_starts // block_tokens + slot - range_offsets, 0),
+        axis=1,
+    )
+    num_touched = jnp.sum(range_blocks)
 
-    out = pl.pallas_call(
-        functools.partial(_gather_page_ids_kernel, num_chunks=num_chunks),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=[
-                pl.BlockSpec((block_tokens, padded_pps), lambda t: (t, 0)),
-                pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
-            ],
-            out_specs=pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
-            grid=(padded_tokens // block_tokens,),
+    row_chunks = topk // 128
+    return pl.pallas_call(
+        functools.partial(
+            _gather_row_indices_kernel,
+            page_size=page_size,
+            pages_per_seq=pages_per_seq,
+            total_num_pages=total_num_pages,
         ),
-        out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.VMEM),
+                pl.BlockSpec(
+                    (block_tokens, topk), lambda i, block_ids, *_: (block_ids[i], 0)
+                ),
+            ],
+            out_specs=pl.BlockSpec(
+                (block_tokens * row_chunks, 128),
+                lambda i, block_ids, *_: (block_ids[i], 0),
+            ),
+            grid=(num_touched,),
+        ),
+        out_shape=jax.ShapeDtypeStruct((num_tokens * row_chunks, 128), jnp.int32),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             disable_bounds_checks=True,
         ),
-        name="gather_page_ids",
-    )(windows, logical)
-    return out[:num_tokens]
+        name="gather_row_indices",
+    )(block_ids, seq_ids_segment.astype(jnp.int32), page_table, topk_indices)
 
 
 # DSV4 FP8 nope layout: 448 e4m3 values, then one e8m0 scale per lane of a
@@ -1320,32 +1394,7 @@ def sparse_ragged_paged_attention(
     assert topk_indices is not None
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
 
-    seq_page_ids = topk_indices // page_size
-    token_offset = topk_indices % page_size
     topk = topk_indices.shape[-1]
-    page_ids = gather_page_ids(
-        page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
-    )
-
-    # For the "-1" padding elements in topk_indices, we scatter the corresponding
-    # page_ids and token_offset to avoid gather memory access hotspotting.
-    is_padding = topk_indices == -1
-    total_num_pages = cache_kv_nope.shape[0]
-    flat_element_index = jnp.arange(q.shape[0] * topk, dtype=jnp.int32).reshape(
-        q.shape[0], topk
-    )
-    # 104729 and 15485863 are randomly chosen large prime numbers.
-    scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-    scattered_token_offset = (flat_element_index * 15485863) % page_size
-    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-    token_offset = jnp.where(
-        is_padding,
-        scattered_token_offset,
-        token_offset,
-    )
-
-    assert page_ids.shape == (q.shape[0], topk)
-    gather_indices = (page_ids * page_size + token_offset).reshape(-1)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     dense_path = (
         gather_and_attention_chunk_size >= DENSE_MIN_CHUNK_TOKENS
@@ -1377,11 +1426,12 @@ def sparse_ragged_paged_attention(
             vmem_limit_bytes=vmem_limit_bytes,
         )
 
+    # Each chunk's gather range [start_pos, batch_end).
+    chunks = []
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
-        indices = gather_indices[start_pos * topk : end_pos * topk]
 
         # Batching
         kernel_batch_size = _largest_divisor(chunk_size, attention_kernel_batch_size)
@@ -1406,6 +1456,22 @@ def sparse_ragged_paged_attention(
         if dense_path:
             # Rows past the gather range were attended by the dense path.
             batch_end = jnp.minimum(batch_end, gather_ends[i])
+        chunks.append((start_pos, chunk_size, kernel_batch_size, batch_end))
+
+    # Only the gather ranges' indices are computed; the SparseCore gather
+    # skips every other token.
+    gather_indices = gather_row_indices(
+        topk_indices,
+        page_indices,
+        seq_ids_segment,
+        jnp.stack([batch_end for *_, batch_end in chunks]),
+        max_num_seqs=max_num_seqs,
+        page_size=page_size,
+        total_num_pages=cache_kv_nope.shape[0],
+        range_size=gather_and_attention_chunk_size,
+    ).reshape(-1)
+
+    for start_pos, chunk_size, kernel_batch_size, batch_end in chunks:
         num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
         # For prefilling of short sequences (or early in the sequence), there are
@@ -1418,7 +1484,7 @@ def sparse_ragged_paged_attention(
         gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
             cache_kv_nope,
             cache_kv_rope,
-            indices,
+            gather_indices[start_pos * topk : (start_pos + chunk_size) * topk],
             num_valid_indices=num_valid_indices,
             top_k=topk,
         )

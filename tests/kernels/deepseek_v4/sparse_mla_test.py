@@ -435,6 +435,46 @@ class CorrectnessTest(parameterized.TestCase):
         # Padding rows are left as q, as the gather path leaves them.
         np.testing.assert_array_equal(out_agent[num_valid:], q[num_valid:])
 
+    # Chunk 0's range ends mid-block, chunk 1's is empty, chunk 2's is whole;
+    # then every range is empty.
+    @parameterized.parameters(([20, 128, 384],), ([0, 128, 256],))
+    def test_gather_row_indices(self, range_ends):
+        """Rows of the tokens in the ranges match the page-table lookup."""
+        num_tokens, topk, chunk_size = 384, 512, 128
+        page_size, pages_per_seq, max_num_seqs, total_pages = 256, 9, 8, 1000
+        rng = np.random.default_rng(0)
+        topk_indices = rng.integers(0, pages_per_seq * page_size, (num_tokens, topk))
+        topk_indices[rng.random((num_tokens, topk)) < 0.3] = -1
+        page_indices = rng.integers(0, total_pages, max_num_seqs * pages_per_seq)
+        seq_ids = np.sort(rng.integers(0, max_num_seqs, num_tokens))
+
+        rows = sparse_mla.gather_row_indices(
+            jnp.asarray(topk_indices, jnp.int32),
+            jnp.asarray(page_indices, jnp.int32),
+            jnp.asarray(seq_ids, jnp.int32),
+            jnp.asarray(range_ends, jnp.int32),
+            max_num_seqs=max_num_seqs,
+            page_size=page_size,
+            total_num_pages=total_pages,
+            range_size=chunk_size,
+        )
+        rows = np.asarray(rows).reshape(num_tokens, topk)
+
+        page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
+        expected = (
+            page_table[seq_ids[:, None], topk_indices // page_size] * page_size
+            + topk_indices % page_size
+        )
+        # -1 entries point anywhere in the cache.
+        valid = topk_indices != -1
+        for c, end in enumerate(range_ends):
+            tokens = slice(c * chunk_size, end)
+            np.testing.assert_array_equal(
+                rows[tokens][valid[tokens]], expected[tokens][valid[tokens]]
+            )
+            self.assertTrue(np.all(rows[tokens] >= 0))
+            self.assertTrue(np.all(rows[tokens] < total_pages * page_size))
+
 
 if __name__ == "__main__":
     absltest.main()
