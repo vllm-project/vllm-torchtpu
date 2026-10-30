@@ -23,5 +23,5 @@ Two simulated ranks run the DCP path on projections of a replicated pool: the ow
 - `test_dcp2_decode.py` (a): verify rows 4/8/32/96 plus NaN padding, idle seats, tail phases 0/1/B-1/B/B+1, 3-40 pages, a rank with no keys, the tail on either owner; metadata is exact. Fault controls: flipped owner, token-parity owner, rank-0 only, plain average, metadata order/owner.
 - `test_dcp2_prefill.py` (b): chunks of 2048 (prefix 1234), 8192 (prefix 3001, budget 64 on CPU) and ragged pieces; the reference is tied to the real kernel; the real DCP kernel at a small shape; the same 4 fault controls.
 - `test_dcp2_combine.py` (d): one-sided rows, rows with no owner (0, no NaN), lse gaps, head pick. Fault controls: rank-0 only, plain average.
-- `test_dcp2_op.py`: `pooled_qsa_dcp_step` x2 + `dcp_combine` vs `pooled_qsa_step` (verify, mixed); identical selection; exact pools.
+- `test_dcp2_op.py`: `pooled_qsa_dcp_step` x2 + `dcp_combine` vs `pooled_qsa_step` (verify, mixed), and the SP pair (token_select_dcp + shard_attend_dcp); identical selection, exact pools.
 - `test_dcp2_tpu.py`: real RPA (served env, slots 0/1, 32/96 rows) and block-sparse prefill (2048/8192 chunks with prefixes 1234/5000/9003, ragged mix).
