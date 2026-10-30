@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -38,6 +39,9 @@ import numpy as np
 
 D = 2
 FP8 = jnp.float8_e4m3fn
+# DCP2_HARNESS_DEVICE=tpu: real Mosaic kernels (no interpret / RPA stand-in),
+# fp8 NaN poison everywhere a kernel must not use, TPU tolerances.
+ON_TPU = os.environ.get("DCP2_HARNESS_DEVICE", "cpu").lower() == "tpu"
 FP8_NAN_BYTE = 0x7F
 # 448, the largest finite E4M3. Poison for rows a correct kernel may LOAD but
 # must mask (rows past kv_len inside a fetched micro-page / tile, the null
@@ -398,9 +402,16 @@ class Tolerance:
     # near-zero element produced by cancellation is judged at its vector's
     # scale, not its own (f32 summation order moves it by ~1e-7 x scale).
     ulp_floor_ratio: float = 64.0
+    # merged pre-gate vs the replicated route's f32 output, / max|head vector|
+    pregate_rel: float = 1e-4
 
 
-DEFAULT_TOL = Tolerance()
+CPU_TOL = Tolerance()
+# Real kernels: the replicated and per-rank kernels see different tiles and
+# running maxima, so bf16 rounding inside the kernels differs; held to the
+# same 2-ulp gated bar, with fp32-level checks relaxed to kernel precision.
+TPU_TOL = Tolerance(rtol=4e-3, atol=4e-3, lse_atol=1e-3, pregate_rel=4e-3)
+DEFAULT_TOL = TPU_TOL if ON_TPU else CPU_TOL
 
 
 def bf16_ulp(x):
@@ -506,6 +517,14 @@ class AttentionCase:
     ratio: int
     k_scale: float
     v_scale: float
+    kv_head_offset: int = 0  # paired main-KV layer slot (1 = second layer)
+
+    @property
+    def opts(self):
+        o = dict(kv_heads=1, ratio=self.ratio, k_scale=self.k_scale, v_scale=self.v_scale)
+        if self.kv_head_offset:
+            o["kv_head_offset"] = self.kv_head_offset
+        return o
 
     @property
     def full_rows(self):
@@ -534,8 +553,8 @@ def random_blocks(rng, lengths, ratio, budget):
 
 def make_case(rng, *, row_lengths, row_req, seq_tokens, page_size=512, heads=3,
               head_dim=256, ratio=4, budget=512, k_scale=0.375, v_scale=2.5,
-              num_pages=None, poison_tail=FP8_SENTINEL_BYTE,
-              null_page=FP8_SENTINEL_BYTE, nan_rows=()):
+              num_pages=None, poison_tail=None, null_page=None, nan_rows=(),
+              kv_head_offset=0):
     """Build both layouts and pools for the given rows.
 
     ``seq_tokens[r]``: KV rows request r has written (the max row length);
@@ -546,6 +565,10 @@ def make_case(rng, *, row_lengths, row_req, seq_tokens, page_size=512, heads=3,
     ``nan_rows``: query rows (padding) whose q/gate are NaN; their length
     must be 0.
     """
+    if poison_tail is None:
+        poison_tail = FP8_NAN_BYTE if ON_TPU else FP8_SENTINEL_BYTE
+    if null_page is None:
+        null_page = FP8_NAN_BYTE if ON_TPU else FP8_SENTINEL_BYTE
     row_lengths = np.asarray(row_lengths, np.int32)
     row_req = np.asarray(row_req, np.int32)
     seq_tokens = np.asarray(seq_tokens, np.int64)
@@ -575,6 +598,7 @@ def make_case(rng, *, row_lengths, row_req, seq_tokens, page_size=512, heads=3,
         blocks=random_blocks(rng, row_lengths, ratio, budget), lengths=row_lengths,
         row_req=row_req, starts=starts, layout=layout, full_pool=full,
         rank_pools=pools, heads=heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale,
+        kv_head_offset=kv_head_offset,
     )
 
 
@@ -620,7 +644,7 @@ def run_dcp_attention(case, attend=reference_attend, combine=None, tol=DEFAULT_T
         from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
 
         combine = qsa_rpa.dcp_combine
-    opts = dict(kv_heads=1, ratio=case.ratio, k_scale=case.k_scale, v_scale=case.v_scale)
+    opts = case.opts
     b = case.layout.page_size
     reports = {}
     partial = []
@@ -682,7 +706,7 @@ def check_pregate(merged_out, merged_lse, rep_out, rep_lse, live, tol=DEFAULT_TO
     rep["max_err_over_vector_max"] = float((np.abs(a - e) / np.maximum(scale, 1e-30)).max(initial=0))
     la, le = np.asarray(merged_lse)[live], np.asarray(rep_lse)[live]
     rep["lse_max_abs"] = float(np.abs(la - le).max(initial=0))
-    assert rep["max_err_over_vector_max"] <= tol.rtol * 10 + tol.atol, f"{what}: {rep}"
+    assert rep["max_err_over_vector_max"] <= tol.pregate_rel, f"{what}: {rep}"
     assert rep["lse_max_abs"] <= tol.lse_atol * max(1.0, float(np.abs(le).max(initial=1))), \
         f"{what}: {rep}"
     return rep
