@@ -78,6 +78,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         union_stats: bool = False,
         union_phys: bool = False,
         loop_requests: bool = False,
+        dcp: int = 1,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`; "fp8" = the
@@ -112,7 +113,10 @@ class QSAFullIndexedBlock(QSAFullBlock):
         `per_request_scores`): the per-request work of a QSA layer (completed group, key
         streaming and scores, selection, recent tile) runs in a `fori_loop` over requests instead
         of a Python loop, so the kernel body, and its compile time, does not grow with the
-        bucket's request count."""
+        bucket's request count. `dcp` = 2 (VLLM_TPU_QSA_MAIN_KV_DCP, needs `union_attn`): the
+        main KV is split by token over TP rank pairs (`me`, `me ^ 1`; owner `(t // B) % 2`, one
+        table column = `2 B` tokens); each rank attends both ranks' heads over the groups it owns
+        and the pair combines the partials by LSE (`QSAFullStepBlock`)."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
@@ -125,6 +129,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
         assert not shard_index or per_request_scores, "the sharded indexer selects per request"
         self.union_attn = union_attn
         assert not union_attn or per_request_scores, "the union is built per request"
+        self.dcp = max(int(dcp), 1)
+        assert self.dcp in (1, 2), dcp
+        assert self.dcp == 1 or union_attn, "main-KV DCP is implemented on the union path"
         if union_attn:
             # The union path's scratch (codes, union ids, compaction) pushed the 16-row kernel
             # past scoped VMEM (j-3d8ad822: 62.6 of 62.1 MiB; with loop_requests' row copies and

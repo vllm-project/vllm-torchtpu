@@ -208,7 +208,8 @@ CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts
 
 def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False,
            union: bool = False, stats: bool = False, loop: bool = False, ctx: list | None = None,
-           max_groups: int | None = None, phys: bool = False):
+           max_groups: int | None = None, phys: bool = False, dcp: int = 1, dcp_pool: bool = True,
+           shared_kv: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, IR_NEW, KR_NEW, RING_NEW
 
@@ -222,12 +223,20 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     if long:  # served long-context mode: HBM page tables, one request's scores at a time
         d = wi.add_carrier(key, d)
         d["hbm_tables"] = True
+    if shared_kv:  # the ranks share one KV head (a DCP pair): same K/V columns, same pool
+        kv = 2 * G.HD  # `[q0|g0|..|k|v]`: K and V are the last two 256-wide column blocks
+        d["qkvg"] = d["qkvg"].at[1:, ..., -kv:].set(
+            jnp.broadcast_to(d["qkvg"][:1, ..., -kv:], d["qkvg"][1:, ..., -kv:].shape)
+        )
+        d["pool"] = jnp.broadcast_to(d["pool"][:1], d["pool"].shape)
     ref, _ = wi.wholestep_reference(G, ex, d, L)
     steps = d.pop("_step_out")
     pps = d["mtab"].shape[1]
+    if dcp > 1 and dcp_pool:
+        _dcp_split(d)
     long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
                    bounded_chunks=True, shard_index=shard, union_attn=union,
-                   union_stats=stats, union_phys=phys, loop_requests=loop)
+                   union_stats=stats, union_phys=phys, loop_requests=loop, dcp=dcp)
     spec = wholestep_spec(
         G, R, L=L, qsa=dict(budget=BUDGET), step=True,
         indexed=dict(max_groups=MG, pages_per_seq=pps, debug=True, **(long_kw if long else {})),
@@ -256,6 +265,51 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
 
         d["_stats"] = np.asarray(outs[UNION_STATS]).reshape(R, n_att, UNION_STATS_REQS, -1)[:, :, :nreq]
     return res, np.asarray(ref, np.float32), x0, ck, ring, steps, iq, ids, d
+
+
+def _dcp_split(d: dict) -> None:
+    """Main-KV DCP-2 layout of the replicated test pool, in place: table column `c` now covers
+    tokens `[2cB, 2(c+1)B)` at page `mtab[2c]`; rank 0 keeps that page (its first `B` tokens),
+    rank 1's copy of it gets page `mtab[2c + 1]`'s rows (the next `B`), and every odd-column page
+    is NaN-poisoned on both ranks (nothing may read it)."""
+    pool = np.array(d["pool"])  # [R, pages, B, 1, 4, 256] FP8
+    mtab = np.asarray(d["mtab"])
+    even, odd = mtab[..., 0::2], mtab[..., 1::2]
+    n = odd.shape[-1]
+    nan = np.full(pool.shape[2:], np.nan, np.float32).astype(pool.dtype)
+    for r in range(pool.shape[0]):
+        src = pool[r].copy()
+        for e, o in zip(even[..., :n].ravel(), odd.ravel()):
+            if r == 1:
+                pool[r, e] = src[o]
+        for o in set(odd.ravel().tolist()) - set(even.ravel().tolist()):
+            pool[r, o] = nan
+    d["pool"] = jnp.asarray(pool)
+    pad = np.zeros_like(mtab[..., : mtab.shape[-1] - even.shape[-1]])
+    d["mtab"] = jnp.asarray(np.concatenate([even, pad], axis=-1))
+
+
+def test_dcp2_union_attention_matches_replicated(monkeypatch):
+    """Main-KV DCP-2 (`dcp=2`, R = 2 = one pair sharing a KV head): each rank holds half of every request's main
+    KV (`_dcp_split`, the other half NaN-poisoned), attends both ranks' heads over the groups it
+    owns and the pair combines by LSE. Matches the replicated union kernel to f32 combine
+    rounding; the DCP kernel on the unsplit pool (wrong rows for every odd-B span) is caught."""
+    from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
+
+    base = _run_c(long=True, rank_ids=True, union=True, shard=True, shared_kv=True)
+    scale = float(np.abs(base[1]).mean())
+
+    def close(run: tuple) -> None:
+        dd = np.abs(run[0] - base[0])
+        assert np.isfinite(run[0]).all()
+        assert dd.max() < 1e-2 * scale, dd.max() / scale
+        np.testing.assert_array_equal(run[7], base[7])  # selection untouched
+
+    monkeypatch.setenv(pool_layout.MAIN_KV_DCP_ENV, "2")
+    close(_run_c(long=True, rank_ids=True, union=True, shard=True, shared_kv=True, dcp=2))
+    with pytest.raises(AssertionError):
+        close(_run_c(long=True, rank_ids=True, union=True, shard=True, shared_kv=True, dcp=2,
+                     dcp_pool=False))
 
 
 @pytest.mark.parametrize("long", [False, True])

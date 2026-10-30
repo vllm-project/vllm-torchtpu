@@ -39,6 +39,8 @@ from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 
 from .qwen38_scatter import scatter_gdn_ckpts_fast
 from .qwen38_segment_call import GDN_META, T_VERIFY, gdn_blocks, ring_depths, segment_tiles
+from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
+
 from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
 from .qwen38_wholestep_inputs import qsa_step_inputs
 
@@ -69,10 +71,11 @@ def union_stats_on() -> bool:
 
 
 def indexed_options() -> dict:
-    """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union attention)."""
+    """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union attention,
+    the main-KV DCP size)."""
     return dict(
         LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN, union_stats=union_stats_on(),
-        loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS,
+        loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS, dcp=main_kv_dcp(),
     )
 
 
@@ -195,10 +198,14 @@ def build_wholestep_call(
         rows = [(kr[o, :Bq], kv[o, :Bq, kv.shape[-1] // 2 :], ir[o, :Bq]) for o in range(n_att)]
         norms = [tuple(norms_flat[2 * o : 2 * o + 2]) for o in range(n_att)]
         tables = [tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)]
+        dcp = None
+        if main_kv_dcp() > 1:  # pair rank = tp rank % 2 (the mesh is in TP order)
+            size = main_kv_dcp()
+            dcp = ((jax.lax.axis_index("tp") % size).astype(jnp.int32).reshape(1), size)
         return wholestep_qsa_writes(
             pool, rows, norms, tables, qsa_layers, positions, trig, starts, context,
             compress_ratio=4, norm_eps=norm_eps, rotary_dim=rotary_dim, max_query_len=T,
-            num_requests=M // T,
+            num_requests=M // T, dcp=dcp,
         )
 
     writes = jax.shard_map(

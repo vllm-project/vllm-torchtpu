@@ -69,6 +69,7 @@ def wholestep_qsa_writes(
     max_query_len: int,
     num_requests: int | None = None,
     batched: bool = True,
+    dcp: tuple[Any, int] | None = None,
 ) -> Any:
     """Write every QSA layer's step tokens, in layer order; returns the pool.
 
@@ -82,6 +83,8 @@ def wholestep_qsa_writes(
     batched: one ring read / write and one (vmapped) indexer update for all layers, the
       token metadata once (`_batched_writes`); same bytes as the per-layer stock sequence.
       The fused-writer path (`VLLM_TPU_QSA_FUSED_KV_WRITE`) keeps the per-layer sequence.
+    dcp: `(rank int32 [1], size)` under VLLM_TPU_QSA_MAIN_KV_DCP: main K/V rows go only to
+      their owner rank (`qsa_cache_writes`' rule); compressed keys and rings stay replicated.
     """
     n = len(context)
     nreq = n if num_requests is None else min(n, num_requests)
@@ -91,7 +94,7 @@ def wholestep_qsa_writes(
     if batched and not envs.VLLM_TPU_QSA_FUSED_KV_WRITE:
         return _batched_writes(
             pool, rows, norms, tables, layers, positions, trig, starts, context,
-            compress_ratio=compress_ratio, norm_eps=norm_eps, rotary_dim=rotary_dim,
+            compress_ratio=compress_ratio, norm_eps=norm_eps, rotary_dim=rotary_dim, dcp=dcp,
         )
     for (key, value, index_k), (nk, nik), (ring, main, comp), lay in zip(
         rows, norms, tables, layers, strict=True
@@ -118,12 +121,13 @@ def wholestep_qsa_writes(
             compressed_slot=lay.compressed_slot,
             main_slot=lay.main_slot,
             max_query_len=max_query_len,
+            dcp=dcp,
         )
     return pool
 
 
 def _batched_writes(pool, rows, norms, tables, layers, positions, trig, starts, context, *,
-                    compress_ratio, norm_eps, rotary_dim):
+                    compress_ratio, norm_eps, rotary_dim, dcp=None):
     """`qsa_cache_writes`' unfused sequence for all layers at once.
 
     Each layer's main K/V and compressed keys still go through their own writer (paired /
@@ -137,12 +141,18 @@ def _batched_writes(pool, rows, norms, tables, layers, positions, trig, starts, 
     slots = jnp.where(active, jnp.arange(nreq, dtype=jnp.int32), -1)
     req, logical, valid = _token_metadata(len(positions), starts, context, slots)
     fp8 = pool.dtype == jnp.float8_e4m3fn
+    main_valid, span = valid, pool.shape[1]
+    if dcp is not None:  # `qsa_cache_writes`' owner rule
+        rank, size = dcp
+        span = size * pool.shape[1]
+        owner = (logical // pool.shape[1]) % size
+        main_valid = valid & (owner == rank.reshape(()).astype(owner.dtype))
     for (key, value, _), (nk, _), (_, main, _), lay in zip(rows, norms, tables, layers, strict=True):
         k, v = produce_kv(key, value, nk, positions, trig, norm_eps, rotary_dim)
-        page = jnp.where(valid, main[req, logical // pool.shape[1]], len(pool))
+        page = jnp.where(main_valid, main[req, logical // span], len(pool))
         packed = pack_rows(k, v, fp8=fp8, k_scale=lay.k_scale, v_scale=lay.v_scale)
         slot_kw = {"slot": lay.main_slot} if lay.main_slot >= 0 else {}
-        pool = write_main_cache(pool, packed, page, logical, valid, **slot_kw)
+        pool = write_main_cache(pool, packed, page, logical, main_valid, **slot_kw)
     raw = jnp.stack([r[2] for r in rows])
     ring_rows = math.ceil(compress_ratio / 8) * 8
     ids = jnp.concatenate([t[0] for t in tables])

@@ -95,16 +95,18 @@ def compact_union(code: jax.Array, KU: int, consts: tuple) -> tuple[jax.Array, j
     return cat(ids_out), cat(codes_out), n
 
 
-def physical_ids(ids: jax.Array, tab: jax.Array, per_page: int) -> jax.Array:
+def physical_ids(ids: jax.Array, tab: jax.Array, per_page: int, dcp: int = 1) -> jax.Array:
     """Physical micro-page ids `[1, 128]` of 128 request-local group ids `ids [1, 128]`: what
     `attend_request` computes per copy (`tab[v >> shift] * per_page + (v & (per_page - 1))`), as
     one vector pass against the request's page-table row `tab [1, pps]` (lane select + lane sum:
     exact int32), so each copy issues from a single SMEM load (RPAd's precomputed page ids).
+    `dcp` = 2: a table column covers `2 * per_page` groups (main-KV DCP; the row is unchanged).
     """
     shift = per_page.bit_length() - 1
+    cshift = shift + dcp.bit_length() - 1
     col = jnp.transpose(jnp.broadcast_to(ids, (128, 128)))[:, 0:1]
     lane = jax.lax.broadcasted_iota(I32, (1, tab.shape[1]), 1)
-    page = jnp.sum(jnp.where((col >> shift) == lane, tab, 0), axis=1, keepdims=True)
+    page = jnp.sum(jnp.where((col >> cshift) == lane, tab, 0), axis=1, keepdims=True)
     phys = page * per_page + (col & (per_page - 1))
     return jnp.transpose(jnp.broadcast_to(phys, (128, 128)))[0:1, :]
 
@@ -131,7 +133,8 @@ def attend_request(
     interpret: bool,
     recent: tuple[jax.Array, jax.Array, list[jax.Array], jax.Array],
     phys: bool = False,
-) -> list[jax.Array]:
+    dcp: int = 1,
+) -> list[Any]:
     """Gated sparse attention of one request's `T` rows over their union: `T` `[nh, 256]` F32.
 
     `ids` SMEM `[1, KU + 128]` request-local group ids of the union (ascending), `codes` a
@@ -139,6 +142,10 @@ def attend_request(
     maps a group to its micro-page as `attend_row`'s `table` does. `qs` / `gates` `[nh, 256]` and
     `phys`: `ids` already holds physical micro-page ids (`physical_ids`) for every slot a tile
     reads (`< ceil(n_union / 64) * 64`); each copy is then one SMEM load, no table, no clamp.
+    `dcp` = 2 (main-KV DCP): a table column covers `2 * per_page` groups; the caller zeroes the
+    codes of groups this rank does not own (their slots then hold the pair rank's rows: read,
+    sanitised, never scored), and each row returns its ungated partial `(attn [nh, 256], lse
+    [nh, 1])` (`lse = -inf`: no owned token) for the pair's LSE combine.
     `has` (the row has pool tokens) per row. `recent = (k [8, 256], v [8, 256], ok_rows, ok_any
     [8, 1])` in pool units, `ok_rows` `T` `[1, 8]` masks. Each tile is copied and unpacked once and
     scored per row (`[nh, 256]` queries, as `attend_row`); scaling follows `attend_row` without
@@ -149,6 +156,7 @@ def attend_request(
     ncols = ids.shape[1]
     assert per_page & (per_page - 1) == 0, per_page
     shift = per_page.bit_length() - 1
+    cshift = shift + dcp.bit_length() - 1
     length = n_union * MICRO
     ntiles = (length + TILE - 1) // TILE
 
@@ -160,7 +168,7 @@ def attend_request(
                 v = ids[0, base + j]
             else:
                 v = ids[0, jnp.minimum(base + j, ncols - 1)]
-                v = table[table_row, v >> shift] * per_page + (v & (per_page - 1))
+                v = table[table_row, v >> cshift] * per_page + (v & (per_page - 1))
             out.append(
                 pltpu.make_async_copy(
                     pool.at[v >> shift, pl.ds((v & (per_page - 1)) * MICRO, MICRO)],
@@ -214,7 +222,10 @@ def attend_request(
         k8, v8 = _unpack_kv(ring.at[s], off, interpret)
         key = k8.astype(F32) * scale_k
         tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
-        value = jnp.where(tok_col < length, v8.astype(F32) * scale_v, 0.0)
+        value = v8.astype(F32)
+        if dcp > 1:  # unowned slots hold the pair rank's rows (FP8: may be NaN)
+            value = jnp.where(value == value, value, 0.0)
+        value = jnp.where(tok_col < length, value * scale_v, 0.0)
         out = []
         for r in range(T):
             m, l, acc = carry[r]
@@ -247,6 +258,8 @@ def attend_request(
     rk, rv, ok_rows, ok_any = recent
     rkey = rk * scale_k
     rval = jnp.where(ok_any, rv * scale_v, 0.0)
+    if dcp > 1:
+        partial = []
     out = []
     for r in range(T):
         m, l, acc = state[r]
@@ -260,10 +273,14 @@ def attend_request(
         l = l * alpha + jnp.sum(p, axis=-1, keepdims=True)
         acc = acc * alpha + jnp.dot(p, rval, preferred_element_type=F32)
         attn = acc / jnp.where(l > 0, l, 1.0)
+        if dcp > 1:
+            lse = jnp.where(l > 0, m_new + jnp.log(jnp.where(l > 0, l, 1.0)), -jnp.inf)
+            partial.append((jnp.where(l > 0, attn, 0.0), lse))
+            continue
         gated = (
             attn.astype(BF16).astype(F32)
             * jax.nn.sigmoid(gates[r].astype(F32)).astype(BF16).astype(F32)
         ).astype(BF16).astype(F32)
         row_has = has[r] | (jnp.max(jnp.where(ok, 1, 0)) > 0)
         out.append(jnp.where(row_has, gated, 0.0))
-    return out
+    return partial if dcp > 1 else out
