@@ -1798,6 +1798,49 @@ def _patch_circular_buffer_block_zeroing() -> None:
     logger.info("Applied TPU patch: CircularBufferManager records zeroed blocks.")
 
 
+def _patch_dflash_sliding_window_retained_tokens() -> None:
+    """Retain trailing SWA tokens required by block-parallel drafters.
+
+    Upstream ``get_kv_cache_configs`` overwrites ``SlidingWindowSpec``
+    ``extra_retained_tokens`` with ``max(0, num_prefill_lookahead_tokens - 1)``
+    right before calling ``get_kv_cache_groups``, which resets it to ``0`` for
+    ``dflash`` and ``dspark``. Their non-causal draft forward widens the window
+    by the draft block size (``num_lookahead_tokens + 1``), so clamping
+    ``extra_retained_tokens`` to at least that block size inside
+    ``get_kv_cache_groups`` prevents premature eviction to the null block.
+    """
+    from dataclasses import replace
+    from functools import wraps
+
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    orig_groups = kv_cache_utils.get_kv_cache_groups
+    if getattr(orig_groups, "_tpu_swa_retained_tokens_patch", False):
+        return
+
+    @wraps(orig_groups)
+    def get_kv_cache_groups(vllm_config, kv_cache_spec):
+        spec_cfg = vllm_config.speculative_config
+        if spec_cfg is not None and spec_cfg.method in ("dflash", "dspark"):
+            lookahead = int(vllm_config.num_lookahead_tokens or 0)
+            min_retained = lookahead + 1 if lookahead > 0 else 0
+            if min_retained > 0:
+                for name, spec in list(kv_cache_spec.items()):
+                    if (
+                        isinstance(spec, SlidingWindowSpec)
+                        and spec.extra_retained_tokens < min_retained
+                    ):
+                        kv_cache_spec[name] = replace(
+                            spec, extra_retained_tokens=min_retained
+                        )
+        return orig_groups(vllm_config, kv_cache_spec)
+
+    setattr(get_kv_cache_groups, "_tpu_swa_retained_tokens_patch", True)  # noqa: B010
+    kv_cache_utils.get_kv_cache_groups = get_kv_cache_groups
+    logger.info("Applied TPU patch: DFlash/DSpark retain trailing SWA draft window.")
+
+
 def _patch_vllm_config_triton_tpu() -> None:
     """Bypass V2 model runner Triton check on TPU.
 

@@ -171,6 +171,13 @@ def _make_runner(
     runner._collect_mamba_state_seed_copies = (
         TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
     )
+    runner._replay_starts = {}
+    runner._prefix_replay_tokens = types.MethodType(
+        TPUModelRunner._prefix_replay_tokens, runner
+    )
+    runner._build_replay_starts_cpu = types.MethodType(
+        TPUModelRunner._build_replay_starts_cpu, runner
+    )
     runner._prepare_async_token_substitution_indices = lambda *_args, **_kwargs: (
         np.array([], dtype=np.int32),
         np.array([], dtype=np.int32),

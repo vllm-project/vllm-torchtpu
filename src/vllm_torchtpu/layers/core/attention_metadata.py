@@ -74,7 +74,12 @@ def attention_block_table_width(
         "sequence_layout_protocol",
         "sequence_layout_version",
     ],
-    drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
+    drop_fields=[
+        "query_start_loc_cpu",
+        "seq_lens_cpu",
+        "prompt_lens_cpu",
+        "replay_starts_cpu",
+    ],
 )
 @dataclass
 class AttentionMetadata:
@@ -123,8 +128,26 @@ class AttentionMetadata:
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
 
-    query_start_loc_cpu: Any = field(init=False)
-    seq_lens_cpu: Any = field(init=False)
+    # NOTE(cross-boundary-contract): TPU-specific host tuple[int, ...] snapshots
+    # (distinct from upstream CommonAttentionMetadata.query_start_loc_cpu Tensor)
+    # for graph-break-free host schedule planning.
+    # Immutable host scheduling snapshots for model-side input planning. They
+    # never participate in device graphs and require no device-to-host reads.
+    # Protocol across runner execution modes:
+    # - Active serving steps (`SequenceLayoutKind.ALL`): `tuple[int, ...]`
+    #   padded to `target_num_reqs` (`target_num_reqs + 1` for
+    #   `query_start_loc_cpu`).
+    # - Idle `dp_lockstep` serving dummy runs (`not profiling`): all-zero
+    #   `tuple[int, ...]` (`(0,) * (num_reqs + 1)` / `(0,) * num_reqs`) so idle
+    #   DP participants report zero active decoder rows.
+    # - Non-`ALL` layouts, startup warmup, and profiling dummy runs: `None`,
+    #   signaling models to trace the full padded bucket without narrowing.
+    query_start_loc_cpu: tuple[int, ...] | None = None
+    seq_lens_cpu: tuple[int, ...] | None = None
+    prompt_lens_cpu: tuple[int, ...] | None = None
+    # First position each request holds sliding-window KV for (SWA bounded
+    # replay); 0 when nothing replays, or `None` alongside the fields above.
+    replay_starts_cpu: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -146,6 +169,10 @@ class AttentionMetadataBuilderContext:
     query_start_loc: torch.Tensor
     request_distribution: torch.Tensor
     position_ids_override: torch.Tensor | None = None
+    query_start_loc_cpu: tuple[int, ...] | None = None
+    seq_lens_cpu: tuple[int, ...] | None = None
+    prompt_lens_cpu: tuple[int, ...] | None = None
+    replay_starts_cpu: tuple[int, ...] | None = None
     # Compact-mamba per-request recurrent-slot ids (device int32, length =
     # target_num_reqs). Only the mamba group's builder reads it; None when the
     # model has no mamba layers. See AttentionMetadata.mamba_state_indices.
@@ -561,6 +588,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
+            query_start_loc_cpu=ctx.query_start_loc_cpu,
+            seq_lens_cpu=ctx.seq_lens_cpu,
+            prompt_lens_cpu=ctx.prompt_lens_cpu,
+            replay_starts_cpu=ctx.replay_starts_cpu,
         )
 
 

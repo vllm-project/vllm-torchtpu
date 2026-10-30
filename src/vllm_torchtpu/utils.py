@@ -387,6 +387,32 @@ class NativeKVCacheLayer:
         del block_ids
 
 
+class RpaSmemPageTableModel:
+    """Mixin for models that configure RPA SMEM page-table request caps.
+
+    Attributes:
+        uses_rpa_smem_page_table: Whether `TPUModelRunner` should cap
+            `num_reqs_max_model_len` and `num_reqs_most_model_len` by
+            `PallasAttentionBackend.get_max_num_seqs_for_pages` (`False` when
+            attention gathers KV pages directly via VMEM/SparseCore without an
+            SMEM `[max_num_seqs, pages_per_seq]` page table).
+    """
+
+    uses_rpa_smem_page_table: bool = True
+
+
+class TokenLookbackModel:
+    """Mixin for models with request-level host token lookback.
+
+    Attributes:
+        token_lookback_depth: Number of preceding token IDs (`> 0`) gathered per
+            request into `lookback_token_ids` and forwarded to `model(...)` each
+            step (`0` disables lookback buffer allocation).
+    """
+
+    token_lookback_depth: int = 0
+
+
 def tpu_bind_kv_cache(
     kv_caches: Mapping[str, torch.Tensor | Sequence[torch.Tensor]],
     forward_context: dict[str, Any],
