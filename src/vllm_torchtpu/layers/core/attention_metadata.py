@@ -707,9 +707,7 @@ def stage_block_table_uploads(
                 if gid in seen or (gids is not None and gid not in gids):
                     continue
                 seen.add(gid)
-                block_table_obj, target_num_blocks = builder._block_table_geometry(
-                    ctx
-                )
+                block_table_obj, target_num_blocks = builder._block_table_geometry(ctx)
                 entries.append((gid, block_table_obj, target_num_blocks))
                 entry_builders.append(builder)
         if envs.VLLM_TPU_STAGE_ENTRIES_CACHE:

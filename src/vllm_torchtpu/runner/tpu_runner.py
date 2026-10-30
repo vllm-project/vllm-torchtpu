@@ -408,7 +408,13 @@ def _verify_fused_impl(
     bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
     target_logits = torch.index_select(logits, 0, target_logits_indices)
     bonus_token_ids = _sample_from_logits_impl(
-        bonus_logits, temperatures, bonus_u, top_k, top_p, topk_candidates, apply_topk_topp
+        bonus_logits,
+        temperatures,
+        bonus_u,
+        top_k,
+        top_p,
+        topk_candidates,
+        apply_topk_topp,
     ).view(-1)
     return _random_rejection_sample_impl(
         draft_token_ids,
@@ -3692,7 +3698,9 @@ class TPUModelRunner(GPUModelRunner):
                 release_cb()
             self._fenced_h2d_sources.clear()
 
-    def _upload_keyed(self, slot: str, host: torch.Tensor, values: bytes) -> torch.Tensor:
+    def _upload_keyed(
+        self, slot: str, host: torch.Tensor, values: bytes
+    ) -> torch.Tensor:
         """`_upload_unless_unchanged` with the caller's value key (for dtypes
         numpy cannot view)."""
         key = (host.dtype, tuple(host.shape), values)
@@ -5021,7 +5029,9 @@ class TPUModelRunner(GPUModelRunner):
         temps, top_k, top_p = self._padded_sampling_params(
             cur_start_idx, cur_end_idx, padded_num_reqs, logits.dtype, logits.device
         )
-        topk_candidates = self._sampler_topk_candidates(cur_start_idx, cur_end_idx, None)
+        topk_candidates = self._sampler_topk_candidates(
+            cur_start_idx, cur_end_idx, None
+        )
         bonus_u = torch.rand(
             (padded_num_reqs, vocab),
             dtype=torch.float32,
@@ -5123,7 +5133,9 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates=topk_candidates,
             apply_topk_topp=apply_topk_topp,
         )
-        faulted = self._verify_fused_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
+        faulted = (
+            self._verify_fused_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
+        )
         compared = fused
         if faulted:
             compared = fused.clone()
@@ -5131,7 +5143,10 @@ class TPUModelRunner(GPUModelRunner):
         mismatches = (compared != ref).sum().to(torch.int64)
         # [clean mismatched positions, faulted checks that were caught]
         delta = torch.stack(
-            [mismatches * (0 if faulted else 1), (mismatches > 0).to(torch.int64) * (1 if faulted else 0)]
+            [
+                mismatches * (0 if faulted else 1),
+                (mismatches > 0).to(torch.int64) * (1 if faulted else 0),
+            ]
         )
         self._verify_fused_mismatches = (
             delta
@@ -5150,7 +5165,10 @@ class TPUModelRunner(GPUModelRunner):
                 "faulted_checks=%d faulted_caught=%d",
                 self._verify_fused_checks_done,
                 clean,
-                min(self._verify_fused_checks_done, envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT),
+                min(
+                    self._verify_fused_checks_done,
+                    envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT,
+                ),
                 caught,
             )
 

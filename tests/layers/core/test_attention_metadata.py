@@ -849,3 +849,51 @@ class TestAttentionMetadataBuilderPlumbing:
         )
         stage_block_table_uploads(runner, ctx_preinit, 4)
         assert ctx_preinit.staged_block_tables is None
+
+    def test_stage_entries_cache_reuses_walk_and_invalidates_on_key_change(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_TPU_STAGE_ENTRIES_CACHE", "1")
+        runner = self._make_runner_mock(num_groups=2, most_model_len=64)
+        builders = [
+            self._make_mamba_builder(runner, kv_cache_group_id=gid) for gid in range(2)
+        ]
+        self._make_attn_groups(runner, builders)
+
+        walk_counts = [0, 0]
+        for gid, builder in enumerate(builders):
+            orig = builder._block_table_geometry
+
+            def wrapped(c, _orig=orig, _gid=gid):
+                walk_counts[_gid] += 1
+                return _orig(c)
+
+            builder._block_table_geometry = wrapped
+
+        def make_ctx(*, use_max_model_len=True, mamba_ckpt_window=1):
+            return AttentionMetadataBuilderContext(
+                num_reqs=2,
+                start_index=0,
+                use_max_model_len=use_max_model_len,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+                mamba_ckpt_window=mamba_ckpt_window,
+            )
+
+        stage_block_table_uploads(runner, make_ctx(), 4)
+        assert walk_counts == [1, 1]
+
+        # Identical walk key reuses cached entries without re-walking.
+        stage_block_table_uploads(runner, make_ctx(), 4)
+        assert walk_counts == [1, 1]
+
+        # Changing gids, use_max_model_len, or mamba_ckpt_window invalidates the cache.
+        stage_block_table_uploads(runner, make_ctx(), 4, gids={1})
+        assert walk_counts == [1, 2]
+
+        stage_block_table_uploads(runner, make_ctx(use_max_model_len=False), 4)
+        assert walk_counts == [2, 3]
+
+        stage_block_table_uploads(runner, make_ctx(mamba_ckpt_window=3), 4)
+        assert walk_counts == [3, 4]

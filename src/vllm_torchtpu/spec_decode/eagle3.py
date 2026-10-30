@@ -202,9 +202,7 @@ def _async_seed_inputs_impl(
 # The chunk's input_ids carry the draft forward's dynamic-dim marks; see
 # _static_shape_args.
 _async_seed_inputs_compiled = _static_shape_args(
-    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(
-        _async_seed_inputs_impl
-    )
+    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(_async_seed_inputs_impl)
 )
 
 
@@ -1976,7 +1974,10 @@ class Eagle3Proposer:
             + (num_rejected != nrej).sum()
         ).to(torch.int64)
         delta = torch.stack(
-            [mism * (0 if faulted else 1), (mism > 0).to(torch.int64) * (1 if faulted else 0)]
+            [
+                mism * (0 if faulted else 1),
+                (mism > 0).to(torch.int64) * (1 if faulted else 0),
+            ]
         )
         self._seed_mismatches = (
             delta if self._seed_mismatches is None else self._seed_mismatches + delta

@@ -1163,7 +1163,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Compare the fused verify and draft seed with the separate programs for
     # the first N chunks; the first _FAULT checks perturb the compared copy
     # (a positive control that must be caught).
-    "VLLM_TPU_VERIFY_FUSED_CHECK": env_nonnegative_int("VLLM_TPU_VERIFY_FUSED_CHECK", 0),
+    "VLLM_TPU_VERIFY_FUSED_CHECK": env_nonnegative_int(
+        "VLLM_TPU_VERIFY_FUSED_CHECK", 0
+    ),
     "VLLM_TPU_VERIFY_FUSED_CHECK_FAULT": env_nonnegative_int(
         "VLLM_TPU_VERIFY_FUSED_CHECK_FAULT", 0
     ),
