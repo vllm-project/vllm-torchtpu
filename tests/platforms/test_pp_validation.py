@@ -30,6 +30,7 @@ def _config(
     pcp=1,
     dp=1,
     ep=False,
+    index_topk=None,
 ):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -43,7 +44,9 @@ def _config(
         speculative_config=speculative,
         kv_transfer_config=kv_transfer,
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(layer_types=layer_types)
+            hf_text_config=SimpleNamespace(
+                layer_types=layer_types, index_topk=index_topk
+            )
         ),
     )
 
@@ -302,3 +305,12 @@ def test_the_ring_depth_stays_within_the_receive_flags(monkeypatch, ring):
     # the wave posts no receives
     monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
     validate_pipeline_parallel_config(_config(pp=8))
+
+
+def test_a_model_with_a_top_k_table_hands_on_two_tensors_per_forward(monkeypatch, ring):
+    monkeypatch.setenv("TPU_PP_RING_DEPTH", "3")
+    validate_pipeline_parallel_config(_config(pp=4))
+    with pytest.raises(ValueError, match="2 per forward"):
+        validate_pipeline_parallel_config(_config(pp=4, index_topk=2048))
+    monkeypatch.setenv("TPU_PP_RING_DEPTH", "2")
+    validate_pipeline_parallel_config(_config(pp=4, index_topk=2048))

@@ -404,6 +404,40 @@ def test_the_ring_installs_no_push_or_settle(monkeypatch, ring, queue):
     assert VllmConfig.max_concurrent_batches is dispatch_depth
 
 
+def test_an_executor_without_a_pipeline_keeps_its_own_calls(monkeypatch, queue):
+    monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+    executor_cls = _bare_executor_cls(monkeypatch)
+    asked = []
+    executor_cls.take_draft_token_ids = lambda self: asked.append(self) or "drafts"
+    pp_push.patch_executor_for_pp_handoff(_config(4))
+    # an engine of one stage built in the same process after a pipeline's
+    single = executor_cls()
+    single.vllm_config = _config(1)
+    future = single.execute_model(_step(16, 1), non_block=True)
+    assert not isinstance(future, pp_push._PushFuture)
+    assert future.result() == ("forward", 1)
+    sampled = single.sample_tokens("g", non_block=True)
+    assert not isinstance(sampled, pp_push._PushFuture)
+    assert single.take_draft_token_ids() == "drafts" and asked == [single]
+    assert single.calls == []
+    deep = executor_cls()
+    pushed = deep.execute_model(_step(16, 1), non_block=True)
+    assert isinstance(pushed, pp_push._PushFuture)
+    assert deep.take_draft_token_ids() is None and asked == [single]
+
+
+def test_the_ring_leaves_an_executor_without_a_pipeline_its_draft_tokens(
+    monkeypatch, ring, queue
+):
+    executor_cls = _bare_executor_cls(monkeypatch)
+    executor_cls.take_draft_token_ids = lambda self: "drafts"
+    pp_push.patch_executor_for_pp_handoff(_config(4))
+    single = executor_cls()
+    single.vllm_config = _config(1)
+    assert single.take_draft_token_ids() == "drafts"
+    assert executor_cls().take_draft_token_ids() is None
+
+
 def test_the_wave_flag_installs_the_wave(monkeypatch, queue):
     monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
     executor_cls = _bare_executor_cls(monkeypatch)

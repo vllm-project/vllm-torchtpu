@@ -572,6 +572,40 @@ def test_a_step_of_many_forwards_keeps_seven_receives_outstanding(monkeypatch, s
         assert (transfer - 1 - landed) * carried + index + 1 <= 7
 
 
+def test_forwards_that_post_their_own_receives_keep_seven_outstanding(monkeypatch):
+    transport, rings = _build(monkeypatch, stages=2, transport=_Watched())
+    fences = _hold_fences(monkeypatch)
+    second = transport.ring = rings[1, 0]
+    errors = []
+
+    def warmup():
+        # warmup forwards: no begin_step, each posts its own receive
+        try:
+            for _ in range(9):
+                second.start_forward(8)
+                second.end_forward(None, 8)
+        except BaseException as exc:  # reported by the test thread
+            errors.append(exc)
+
+    device = threading.Thread(target=warmup, daemon=True)
+    device.start()
+    assert _until(lambda: second.posted_through == 7)
+    # the eighth forward waits until one before it completes
+    assert not _until(lambda: second.posted_through > 7, seconds=0.3)
+    for completed in range(1, 3):
+        fences[completed - 1].done.set()
+        want = 7 + completed
+        assert _until(lambda want=want: second.posted_through == want)
+    for fence in fences:
+        fence.done.set()
+    device.join(TIMEOUT)
+    assert not device.is_alive() and not errors, errors
+    second.close()
+    assert second.landed_through == 9
+    for transfer, index, landed in transport.landed_at_post:
+        assert (transfer - 1 - landed) + index + 1 <= 7
+
+
 def test_a_send_thread_failure_fails_a_forward_waiting_for_its_receive(monkeypatch):
     _, rings = _build(monkeypatch, stages=2)
     fences = _hold_fences(monkeypatch)

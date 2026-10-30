@@ -285,8 +285,10 @@ def ring_handoff() -> bool:
     return envs.TPU_PP_HANDOFF == "ring"
 
 
-def _take_draft_token_ids(self: Any) -> None:
-    """``MultiprocExecutor.take_draft_token_ids`` under a pipeline.
+def _install_take_draft_token_ids(executor_cls: Any) -> None:
+    """Have a pipeline executor's ``take_draft_token_ids`` return None
+    without asking the workers; an executor without a pipeline keeps the
+    class's own method.
 
     A pipeline admits prefill-only MTP alone (pp_validation): its drafts
     exist to fill the draft layer's KV, and no step consumes them. The
@@ -296,7 +298,24 @@ def _take_draft_token_ids(self: Any) -> None:
     step's hand-off, waiting for a push that only a wait on the step's
     future sends.
     """
-    return None
+    if getattr(executor_cls, "_tpu_pp_take_draft_patch", False):
+        return
+    orig = getattr(executor_cls, "take_draft_token_ids", None)
+
+    def take_draft_token_ids(self: Any) -> Any:
+        if int(self.vllm_config.parallel_config.pipeline_parallel_size) > 1:
+            return None
+        return orig(self) if orig is not None else None
+
+    executor_cls.take_draft_token_ids = take_draft_token_ids
+    executor_cls._tpu_pp_take_draft_patch = True
+
+
+def _rides_the_wave(executor: Any) -> bool:
+    """Whether an executor's steps go through the wave: a pipeline whose
+    stages hand off with it. Executors of other depths share the class."""
+    stages = int(executor.vllm_config.parallel_config.pipeline_parallel_size)
+    return stages > 1 and not ring_handoff()
 
 
 def patch_executor_for_pp_handoff(vllm_config: Any) -> None:
@@ -324,7 +343,7 @@ def patch_executor_for_pp_ring(vllm_config: Any) -> None:
 
     if getattr(MultiprocExecutor, "_tpu_pp_ring_patch", False):
         return
-    MultiprocExecutor.take_draft_token_ids = _take_draft_token_ids
+    _install_take_draft_token_ids(MultiprocExecutor)
     MultiprocExecutor._tpu_pp_ring_patch = True
     logger.info(
         "PP ring: engine side installed, message ring %d chunks",
@@ -353,6 +372,8 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     orig_sample = MultiprocExecutor.sample_tokens
 
     def execute_model(self, scheduler_output, non_block=False):
+        if not _rides_the_wave(self):
+            return orig_execute(self, scheduler_output, non_block=non_block)
         state = wave_state(self)
         if scheduler_output.total_num_scheduled_tokens <= 0:
             return orig_execute(self, scheduler_output, non_block=non_block)
@@ -364,6 +385,8 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         return future if non_block else future.result()
 
     def sample_tokens(self, grammar_output, non_block=False):
+        if not _rides_the_wave(self):
+            return orig_sample(self, grammar_output, non_block=non_block)
         state = wave_state(self)
         inner = cast(Future, orig_sample(self, grammar_output, non_block=True))
         # Sampling belongs to the last dispatched step, whatever pushes
@@ -373,7 +396,7 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
 
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
-    MultiprocExecutor.take_draft_token_ids = _take_draft_token_ids
+    _install_take_draft_token_ids(MultiprocExecutor)
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
         "PP wave: engine push and settle installed, message ring %d chunks",
