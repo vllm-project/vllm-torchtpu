@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_DP_VOCAB_PARALLEL: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -698,6 +699,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # Shard the input embedding and lm_head over every DP x TP rank (the EP
+    # group) instead of the TP group. Needs DP with EP (lockstep DP engines);
+    # ignored with PP, context parallelism, speculative decoding, LoRA or
+    # TPU_GREEDY_TOP_TOKENS. See layers/adapter/dp_vocab_parallel.py.
+    "TPU_DP_VOCAB_PARALLEL": env_bool("TPU_DP_VOCAB_PARALLEL"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.

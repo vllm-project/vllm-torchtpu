@@ -3655,3 +3655,60 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+class TestLogitsAtDpVocabRows:
+    """TPU_DP_VOCAB_PARALLEL: every logits batch reaches the compiled logits
+    program at the fixed row count, padded and sliced outside it."""
+
+    @staticmethod
+    def _runner(rows):
+        runner = MagicMock(spec=TPUModelRunner)
+        runner._dp_vocab_rows = rows
+        runner.num_reqs_paddings = [8, 16, 32]
+        return runner
+
+    def test_off_passes_straight_through(self):
+        runner = self._runner(None)
+        compute = MagicMock(return_value="logits")
+        hidden, indices = torch.zeros(4, 2), torch.arange(3)
+        got = TPUModelRunner._logits_at_dp_vocab_rows(runner, compute, hidden, indices)
+        assert got == "logits"
+        compute.assert_called_once_with(hidden, indices)
+        assert TPUModelRunner._logits_num_reqs_paddings(runner) == [8, 16, 32]
+
+    def test_pads_indices_and_slices_the_rows_back(self):
+        runner = self._runner(8)
+        seen = {}
+
+        def compute(hidden, indices):
+            seen["indices"] = indices
+            return hidden[indices] * 10
+
+        hidden = torch.arange(16.0).reshape(16, 1)
+        indices = torch.tensor([3, 7, 9], dtype=torch.int32)
+        got = TPUModelRunner._logits_at_dp_vocab_rows(runner, compute, hidden, indices)
+        assert seen["indices"].tolist() == [3, 7, 9, 0, 0, 0, 0, 0]
+        assert got.flatten().tolist() == [30.0, 70.0, 90.0]
+        assert TPUModelRunner._logits_num_reqs_paddings(runner) == [8]
+
+    def test_pads_hidden_rows_without_indices(self):
+        runner = self._runner(8)
+        seen = {}
+
+        def compute(hidden):
+            seen["shape"] = tuple(hidden.shape)
+            return hidden + 1
+
+        got = TPUModelRunner._logits_at_dp_vocab_rows(
+            runner, compute, torch.zeros(5, 3)
+        )
+        assert seen["shape"] == (8, 3)
+        assert tuple(got.shape) == (5, 3)
+
+    def test_rejects_a_batch_above_the_row_count(self):
+        runner = self._runner(4)
+        with pytest.raises(ValueError, match="exceeds"):
+            TPUModelRunner._logits_at_dp_vocab_rows(
+                runner, MagicMock(), torch.zeros(9, 2), torch.arange(5)
+            )
