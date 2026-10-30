@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 from typing import cast
 
@@ -1111,6 +1112,8 @@ HEADS_PER_TILE = 16
 HEADS_BLOCK_ROWS = 512
 # Fewest rows routed to `quantized_matmul_heads`.
 HEADS_MIN_ROWS = 128
+# Rows of a head pair's product per pass of the norm/RoPE epilogue.
+HEADS_EPILOGUE_ROWS = 128
 # Table-row copies issued per iteration of the gather loop.
 HEADS_GATHER_UNROLL = 8
 # Heads per output tile of a quantizing `quantized_matmul_heads`: one 32-row
@@ -1279,11 +1282,11 @@ def _quantized_matmul_heads_kernel(
     words_per_row = heads // 2
     if quant_dtype is None:
         words_ref = o_buf.bitcast(jnp.uint32).at[o_slot]
-        row_values = [ref[rows, :] for ref in row_refs]
     else:
         words_ref = stage_buf.bitcast(jnp.uint32)
     words_ref = words_ref.reshape(lane_blocks, block_rows * words_per_row, LANE)
     x_scale = xs_ref[rows, 0:1]
+    chunk_rows = math.gcd(HEADS_EPILOGUE_ROWS, block_rows)
     for p in range(words_per_row):
         cols = slice(2 * p * head_dim, (2 * p + 2) * head_dim)
         # xla_quantized_matmul's dot and epilogue, rounded to its output.
@@ -1294,17 +1297,23 @@ def _quantized_matmul_heads_kernel(
         acc = acc * ws_buf[w_slot, :, cols]
         if quant_dtype is None:
             acc = acc.astype(jnp.bfloat16).astype(jnp.float32)
-            pair = [
-                head_fn(acc[:, h * head_dim : (h + 1) * head_dim], *row_values)
+        # The epilogue goes over row chunks, so each chunk's norm, RoPE and
+        # stores need only its own rows of the product.
+        for r0 in range(0, block_rows, chunk_rows):
+            heads_of_pair = [
+                acc[r0 : r0 + chunk_rows, h * head_dim : (h + 1) * head_dim]
                 for h in range(2)
             ]
-        else:  # rounded to bf16 by the pack
-            pair = [acc[:, h * head_dim : (h + 1) * head_dim] for h in range(2)]
-        words = pltpu.pack_elementwise(pair, packed_dtype=jnp.bfloat16)
-        for c in range(lane_blocks):
-            words_ref.at[c][pl.ds(p, block_rows, stride=words_per_row), :] = words[
-                :, c * LANE : (c + 1) * LANE
-            ]
+            if quant_dtype is None:
+                chunk = pl.ds(pl.multiple_of(i * block_rows + r0, chunk_rows), chunk_rows)
+                row_values = [ref[chunk, :] for ref in row_refs]
+                pair = [head_fn(head, *row_values) for head in heads_of_pair]
+            else:  # rounded to bf16 by the pack
+                pair = heads_of_pair
+            words = pltpu.pack_elementwise(pair, packed_dtype=jnp.bfloat16)
+            dst = pl.ds(r0 * words_per_row + p, chunk_rows, stride=words_per_row)
+            for c in range(lane_blocks):
+                words_ref.at[c][dst, :] = words[:, c * LANE : (c + 1) * LANE]
 
     if quant_dtype is not None:
         pass_rows = min(HEADS_QUANT_PASS_ROWS, block_rows)

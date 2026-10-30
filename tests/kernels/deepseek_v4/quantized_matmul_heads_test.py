@@ -80,16 +80,17 @@ def _as_bits(a: jax.Array) -> np.ndarray:
     return np.asarray(a).view(np.uint16)
 
 
-# Several row blocks and weight tiles, and one of each.
+# Several row blocks, weight tiles and epilogue row chunks, and one of each.
 @pytest.mark.parametrize(
-    "m,k,n,head_dim,block_rows",
-    [(128, 256, 8192, 256, 64), (64, 128, 8192, 512, 64)],
+    "m,k,n,head_dim,block_rows,epilogue_rows",
+    [(128, 256, 8192, 256, 64, 32), (64, 128, 8192, 512, 64, 128)],
 )
 def test_quantized_matmul_heads_matches_unfused(
-    monkeypatch, m, k, n, head_dim, block_rows
+    monkeypatch, m, k, n, head_dim, block_rows, epilogue_rows
 ):
     monkeypatch.setattr(rope, "HEADS_BLOCK_ROWS", block_rows)
     monkeypatch.setattr(rope, "HEADS_MIN_ROWS", 32)
+    monkeypatch.setattr(rope, "HEADS_EPILOGUE_ROWS", epilogue_rows)
     x, w_q, w_s, positions, cos_sin_cache = _operands(m, k, n)
     got = _fused(x, w_q, w_s, positions, cos_sin_cache, head_dim, interpret=True)
     q = xla_quantized_matmul(x, w_q, w_s).reshape(m, n // head_dim, head_dim)
