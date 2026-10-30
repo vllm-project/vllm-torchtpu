@@ -632,6 +632,24 @@ def test_main_kv_dcp_doubles_only_target_main_kv_spans(monkeypatch, pair, compre
     assert specs[draft].block_size == B
 
 
+@pytest.mark.parametrize("pair", [False, True])
+def test_mtp_kv_dcp_doubles_the_draft_main_kv_span_too(monkeypatch, pair):
+    """VLLM_TPU_QSA_MTP_KV_DCP: the MTP draft's main KV splits like the
+    target's (2B tokens per entry, B rows per rank); nothing else changes."""
+    _, target_only = pooled_cache_specs(dcp_config(monkeypatch, pair=pair, compressed=True))
+    monkeypatch.setenv("VLLM_TPU_QSA_MTP_KV_DCP", "1")
+    layout, specs = pooled_cache_specs(dcp_config(monkeypatch, pair=pair, compressed=True))
+    B = layout.block_size
+    draft = "mtp.layers.48.self_attn"
+    assert draft in layout.main_dcp_owners
+    assert (specs[draft].block_size, specs[draft].tokens_per_state) == (2 * B, 2)
+    assert specs[draft].page_size_bytes == layout.page_bytes
+    assert replace(specs[draft], block_size=B, tokens_per_state=1) == target_only[draft]
+    assert {n: s for n, s in specs.items() if n != draft} == {
+        n: s for n, s in target_only.items() if n != draft
+    }
+
+
 def test_main_kv_dcp_schedules_lcm_and_hashes_gcd_blocks(monkeypatch):
     cfg = dcp_config(monkeypatch, compressed=True)
     layout, specs = pooled_cache_specs(cfg)
