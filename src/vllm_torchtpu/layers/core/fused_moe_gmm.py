@@ -395,6 +395,46 @@ def _single_sort_permutation(
     return sorted_indices, revert, sorted_indices // topk
 
 
+def _sort_tokens_by_expert(
+    sort_keys: jax.Array,
+    token_indices_flat: jax.Array,
+    token_bits: int,
+    row_values: jax.Array | None,
+    topk: int,
+) -> tuple[jax.Array, jax.Array | None]:
+    """Token ids in (expert, token) order, and `row_values` moved with them.
+
+    Packing (key, token) into one int32 keeps the payload out of the comparison
+    and drops the follow-up gather. Equal packed values carry the same token,
+    so their order cannot matter, to the ids or to the token's `row_values`,
+    which ride the same sort as raw int32 words, one operand per word. That
+    replaces a gather of a few columns per routed row: on tpu7x a TensorCore
+    gather takes ~3.5 ns a row, and the SparseCore one queues behind the EP
+    dispatch all-gather.
+    """
+    packed = jnp.left_shift(sort_keys, token_bits) | token_indices_flat
+    if row_values is None:
+        packed = jax.lax.sort(packed, is_stable=False)
+        return jnp.bitwise_and(packed, (1 << token_bits) - 1), None
+    num_tokens, num_values = row_values.shape
+    per_word = 4 // row_values.dtype.itemsize
+    words = jnp.pad(row_values, ((0, 0), (0, -num_values % per_word)))
+    if per_word > 1:
+        words = words.reshape(num_tokens, -1, per_word)
+    words = jax.lax.bitcast_convert_type(words, jnp.int32)
+    # Flat route p belongs to token p // topk.
+    routed_words = jnp.broadcast_to(
+        words.T[:, :, None], (words.shape[1], num_tokens, topk)
+    ).reshape(words.shape[1], -1)
+    packed, *sorted_words = jax.lax.sort(
+        (packed, *routed_words), num_keys=1, is_stable=False
+    )
+    sorted_values = jax.lax.bitcast_convert_type(
+        jnp.stack(sorted_words, axis=1), row_values.dtype
+    ).reshape(packed.shape[0], -1)[:, :num_values]
+    return jnp.bitwise_and(packed, (1 << token_bits) - 1), sorted_values
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -406,8 +446,14 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    row_scales: jax.Array | None = None,
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None
+]:
     """Prepare the local-only routing layout using already-local expert ids.
+
+    `row_scales`, the scales of quantized rows, come back permuted with the
+    rows as the last output (None without them).
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
     valid-mask path computed below is a no-op (jnp.where on an all-True
@@ -458,6 +504,7 @@ def prepare_routed_gmm_inputs(
         else None
     )
     token_indices_sorted: jax.Array | None = None
+    x_scale: jax.Array | None = None
 
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
@@ -477,14 +524,9 @@ def prepare_routed_gmm_inputs(
 
     if token_indices_sorted is None:
         if packable:
-            # Packing (key, token) into one int32 keeps the payload out of the sort
-            # and drops the follow-up gather. Equal packed values carry the same
-            # token id, so their order cannot matter.
-            packed = jax.lax.sort(
-                jnp.left_shift(sort_keys, token_bits) | token_indices_flat,
-                is_stable=False,
+            token_indices_sorted, x_scale = _sort_tokens_by_expert(
+                sort_keys, token_indices_flat, token_bits, row_scales, topk
             )
-            token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
         else:
             token_indices_sorted = token_indices_flat[sorted_indices]
 
@@ -509,6 +551,15 @@ def prepare_routed_gmm_inputs(
             )
     else:
         x = hidden_states_local[token_indices_sorted]
+    if row_scales is not None and x_scale is None:
+        x_scale = permute_row_scales(
+            row_scales,
+            token_indices_sorted,
+            group_sizes_local,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        )
     return (
         x,
         group_sizes_local,
@@ -516,6 +567,7 @@ def prepare_routed_gmm_inputs(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
+        x_scale,
     )
 
 
@@ -866,6 +918,7 @@ def fused_moe_func(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
+        x_scale,
     ) = prepare_routed_gmm_inputs(
         hidden_states,
         topk_ids,
@@ -876,18 +929,9 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        row_scales=hidden_scale,
     )
     # Every permute copies the int8-carried rows and their scales exactly.
-    x_scale = None
-    if hidden_scale is not None:
-        x_scale = permute_row_scales(
-            hidden_scale,
-            token_indices_sorted,
-            group_sizes,
-            use_ep=use_ep,
-            use_sparse_core=use_sparse_core,
-            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-        )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,

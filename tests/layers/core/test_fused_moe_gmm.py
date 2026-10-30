@@ -444,6 +444,7 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
+        _,
     ) = prepare_routed_gmm_inputs(
         hidden_states,
         topk_indices,
@@ -465,6 +466,38 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
     np.testing.assert_array_equal(valid_mask, valid)
     np.testing.assert_array_equal(token_indices_sorted, sorted_indices_expected // 2)
     np.testing.assert_array_equal(group_sizes, np.array([3, 2]))
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32, jnp.float8_e4m3fn])
+def test_prepare_routed_gmm_inputs_sorts_row_scales_with_the_rows(dtype):
+    """Row scales come back in the rows' routed order, bit for bit, from the
+    routing sort itself."""
+    num_tokens, topk, num_experts = 400, 6, 5
+    rng = np.random.default_rng(0)
+    topk_indices = jnp.asarray(
+        rng.integers(-1, num_experts, (num_tokens, topk)), dtype=jnp.int32
+    )
+    scales = rng.standard_normal((num_tokens, 3)).astype(np.float32)
+    scales[0, 0], scales[1, 1] = np.nan, -0.0
+    row_scales = jnp.asarray(scales).astype(dtype)
+
+    *_, token_indices_sorted, x_scale = prepare_routed_gmm_inputs(
+        jnp.zeros((num_tokens, 8), jnp.int8),
+        topk_indices,
+        jnp.ones((num_tokens, topk), jnp.float32),
+        local_num_experts=num_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=False,
+        row_scales=row_scales,
+    )
+
+    bits = {1: np.uint8, 2: np.uint16, 4: np.uint32}[jnp.dtype(dtype).itemsize]
+    assert x_scale.dtype == row_scales.dtype
+    np.testing.assert_array_equal(
+        np.asarray(x_scale).view(bits),
+        np.asarray(row_scales[token_indices_sorted]).view(bits),
+    )
 
 
 @pytest.mark.parametrize(("mode", "owner_called"), [("on", True), ("off", False)])
