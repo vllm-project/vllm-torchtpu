@@ -229,9 +229,11 @@ def kv_page_head_padding(
     never matches it, so those layers keep the width rule they had before.
 
     Args:
-        pool_page: Trailing `(page_size, ...)` axes of the allocated KV pool.
-        native_page: Trailing axes `PallasAttentionBackend.get_kv_cache_shape`
-            would allocate for this layer on its own pool.
+        pool_page: Trailing `(heads, packing, head_dim)` axes of the allocated
+            KV pool, after the block and page-size axes.
+        native_page: The same trailing axes that
+            `PallasAttentionBackend.get_kv_cache_shape` would allocate for this
+            layer on its own pool.
         pool_head_dim: Effective head width of `pool_page`.
         head_size: Unpadded head size of this attention layer.
 
@@ -1544,15 +1546,18 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # SEQ_ALONG_LANE places `page_size` on the last axis and the packed
         # `head_dim` axes at `[-3, -2]` (indexed from the end so both 5D
         # layer-major and 6D block-major pools resolve identically).
-        native_page = PallasAttentionBackend.get_kv_cache_shape(
-            1, 1, self.num_kv_heads, self.head_size, kv_cache.dtype
-        )[2:]
         if kv_cache.ndim == 4:
             pool_head_dim = self.head_size
         elif self._pool_is_seq_along_lane:
             pool_head_dim = kv_cache.shape[-3] * kv_cache.shape[-2]
         else:
             pool_head_dim = kv_cache.shape[-1]
+        # A layer writing its own native page is never padded, even when the
+        # page is wider than head_size (the head_dim=64 page packs K and V along
+        # its last axis). Only a page defined by another spec is padded.
+        native_page = PallasAttentionBackend.get_kv_cache_shape(
+            1, 1, self.num_kv_heads, self.head_size, kv_cache.dtype
+        )[2:]
         pad_size = kv_page_head_padding(
             tuple(kv_cache.shape[-3:]), native_page, pool_head_dim, self.head_size
         )

@@ -15,8 +15,8 @@
 
 The kernel is picked from the query width (`q.shape[-1] == 64` selects the
 head_dim=64 kernel), so padding a head_dim=64 query to its own packed page
-width (128) silently switches to the v3 kernel and its layout check fails
-(#2386). Padding is only for a page defined by another spec.
+width (128) silently switches to the v3 kernel and its layout check fails.
+Padding is only for a page defined by another spec.
 """
 
 from types import SimpleNamespace
@@ -57,7 +57,7 @@ def test_native_page_needs_no_padding(num_kv_heads, head_size, dtype):
 
 
 def test_hd64_native_page_is_wider_than_the_head():
-    # The precondition for #2386: the packed page is 128 lanes wide.
+    # The packed head_dim=64 page is 128 lanes wide, twice the head width.
     assert _page(8, 64, BF16)[-1] == 128
 
 
@@ -66,7 +66,7 @@ def test_hd64_native_page_is_wider_than_the_head():
     "draft_heads,draft_head_size,target_heads,target_head_size,expected_padding",
     [
         (8, 64, 8, 128, 64),  # head_dim=64 draft in a v3 head_dim=128 pool
-        (4, 128, 4, 256, 128),  # narrower draft in a wider pool (#316)
+        (4, 128, 4, 256, 128),  # narrower draft in a wider target pool
     ],
 )
 def test_page_from_another_spec_is_padded_to_its_width(
@@ -152,10 +152,10 @@ def _forward_query_width(head_size: int, pool_heads: int, pool_head_size: int):
 
 
 def test_forward_keeps_hd64_query_on_its_own_page(vllm_config_context):
-    # #2386: padding to 128 here picked the v3 kernel for a head_dim=64 layer.
+    # Padding to 128 here would pick the v3 kernel for a head_dim=64 layer.
     assert _forward_query_width(64, pool_heads=4, pool_head_size=64) == 64
 
 
 def test_forward_pads_hd64_query_in_a_hd128_pool(vllm_config_context):
-    # A head_dim=64 draft layer writing into a head_dim=128 target's pool (#316).
+    # A head_dim=64 draft layer writing into a head_dim=128 target's pool.
     assert _forward_query_width(64, pool_heads=4, pool_head_size=128) == 128
