@@ -29,7 +29,10 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 from vllm.model_executor.model_loader import weight_utils
 from vllm.platforms import current_platform
 
-from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    gdn_attention_op,
+    mamba_mixer3_op,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention,
 )
@@ -43,6 +46,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 def _empty_shared_gdn_ops(monkeypatch):
     """Keep an op built from one test's mocks out of every other test."""
     monkeypatch.setattr(gdn_attention_op, "_shared_gdn_ops", {})
+    monkeypatch.setattr(mamba_mixer3_op, "_shared_mamba3_ops", {})
 
 
 @pytest.fixture
