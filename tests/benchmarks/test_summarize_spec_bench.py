@@ -45,10 +45,10 @@ def test_summarize_spec_bench_single_rep(tmp_path: Path):
     # BS=1: K=0, K=1, K=2
     _create_mock_result(results_dir / "bs1" / "k0_rep1.json", duration=100.0)
     _create_mock_result(
-        results_dir / "bs1" / "k1_rep1.json", duration=80.0, acceptance_rate=0.75
+        results_dir / "bs1" / "k1_rep1.json", duration=80.0, acceptance_rate=75.0
     )
     _create_mock_result(
-        results_dir / "bs1" / "k2_rep1.json", duration=50.0, acceptance_rate=0.60
+        results_dir / "bs1" / "k2_rep1.json", duration=50.0, acceptance_rate=60.0
     )
 
     summary = aggregate_spec_results(results_dir)
@@ -84,10 +84,10 @@ def test_summarize_spec_bench_multi_rep(tmp_path: Path):
     _create_mock_result(results_dir / "bs1" / "k0_rep1.json", duration=90.0)
     _create_mock_result(results_dir / "bs1" / "k0_rep2.json", duration=110.0)
     _create_mock_result(
-        results_dir / "bs1" / "k1_rep1.json", duration=45.0, acceptance_rate=0.80
+        results_dir / "bs1" / "k1_rep1.json", duration=45.0, acceptance_rate=80.0
     )
     _create_mock_result(
-        results_dir / "bs1" / "k1_rep2.json", duration=55.0, acceptance_rate=0.82
+        results_dir / "bs1" / "k1_rep2.json", duration=55.0, acceptance_rate=82.0
     )
 
     summary = aggregate_spec_results(results_dir)
@@ -104,12 +104,12 @@ def test_summarize_spec_bench_multi_batch(tmp_path: Path):
     # BS=1
     _create_mock_result(results_dir / "bs1" / "k0_rep1.json", duration=100.0)
     _create_mock_result(
-        results_dir / "bs1" / "k1_rep1.json", duration=80.0, acceptance_rate=0.70
+        results_dir / "bs1" / "k1_rep1.json", duration=80.0, acceptance_rate=70.0
     )
     # BS=4 (independent baseline)
     _create_mock_result(results_dir / "bs4" / "k0_rep1.json", duration=30.0)
     _create_mock_result(
-        results_dir / "bs4" / "k1_rep1.json", duration=20.0, acceptance_rate=0.70
+        results_dir / "bs4" / "k1_rep1.json", duration=20.0, acceptance_rate=70.0
     )
 
     summary = aggregate_spec_results(results_dir)
@@ -159,3 +159,24 @@ def test_summarize_spec_bench_completed_is_int(tmp_path: Path):
 
     assert summary[1][0]["completed"] == 99
     assert isinstance(summary[1][0]["completed"], int)
+
+
+def test_summarize_spec_bench_low_acceptance_rate_percentage(tmp_path: Path):
+    """vLLM reports the acceptance rate in percent (0-100), so rates <= 1.0 are
+    still percentages (0.8% and 1.0%), not ratios (80% and 100%)."""
+    results_dir = tmp_path / "results"
+    _create_mock_result(results_dir / "bs1" / "k0_rep1.json", duration=100.0)
+    _create_mock_result(
+        results_dir / "bs1" / "k1_rep1.json", duration=99.0, acceptance_rate=0.8
+    )
+    _create_mock_result(
+        results_dir / "bs1" / "k2_rep1.json", duration=98.0, acceptance_rate=1.0
+    )
+
+    summary = aggregate_spec_results(results_dir)
+    table_text = format_summary_table(summary)
+
+    assert round(summary[1][1]["acceptance_rate"], 6) == 0.008
+    assert round(summary[1][2]["acceptance_rate"], 6) == 0.01
+    assert "0.80%" in table_text
+    assert "1.00%" in table_text
