@@ -277,6 +277,17 @@ def uses_onehot_permute(
     )
 
 
+def uses_ragged_permute(
+    num_routed_rows: int,
+    *,
+    use_ep: bool,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+) -> bool:
+    """Whether `num_routed_rows` are permuted by the SparseCore ragged gather."""
+    return use_ep and use_sparse_core and num_routed_rows > onehot_moe_permute_threshold
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -421,10 +432,11 @@ def prepare_routed_gmm_inputs(
     # The keys take only `local_num_experts + 1` values, so a counting sort
     # gives the positions and `group_sizes` without a second comparison sort.
     # Ragged permute only: under the one-hot permute these positions break MTP.
-    ragged_permute = (
-        use_ep
-        and use_sparse_core
-        and token_indices_flat.shape[0] > onehot_moe_permute_threshold
+    ragged_permute = uses_ragged_permute(
+        token_indices_flat.shape[0],
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
     )
     argsort_revert_indices, bucket_counts = (
         _counting_sort_positions(sort_keys, local_num_experts + 1)
@@ -505,6 +517,41 @@ def prepare_routed_gmm_inputs(
         valid_mask,
         token_indices_sorted,
     )
+
+
+def permute_row_scales(
+    row_scales: jax.Array,
+    token_indices_sorted: jax.Array,
+    group_sizes: jax.Array,
+    *,
+    use_ep: bool,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int = 0,
+) -> jax.Array:
+    """Moves the scales of quantized rows the way `prepare_routed_gmm_inputs`
+    moved the rows.
+
+    Where the rows went through the SparseCore ragged gather, so do their
+    scales, lane-padded to the 128 columns it moves: as an XLA gather on the
+    TensorCore, 49152 rows of 8 scales took 171 us per MoE layer on tpu7x.
+    Rows past the valid prefix are left unwritten, as the rows' are.
+    """
+    if not uses_ragged_permute(
+        token_indices_sorted.shape[0],
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    ):
+        return row_scales[token_indices_sorted]
+    num_blocks = row_scales.shape[1]
+    padded = jnp.pad(row_scales, ((0, 0), (0, -num_blocks % 128)))
+    valid_count = group_sizes.sum(dtype=jnp.int32)
+    return ragged_gather_v2(
+        padded,
+        token_indices_sorted,
+        jnp.array([0], dtype=jnp.int32),
+        valid_count[None],
+    )[:, :num_blocks]
 
 
 def moe_gmm(
@@ -830,8 +877,17 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
     )
-    # Every permute copies the int8-carried rows exactly.
-    x_scale = None if hidden_scale is None else hidden_scale[token_indices_sorted]
+    # Every permute copies the int8-carried rows and their scales exactly.
+    x_scale = None
+    if hidden_scale is not None:
+        x_scale = permute_row_scales(
+            hidden_scale,
+            token_indices_sorted,
+            group_sizes,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
