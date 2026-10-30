@@ -614,8 +614,9 @@ def _dense_attention_kernel(
 ):
     """Grid (dense block,): FlashAttention over one request's pages.
 
-    Each grid step runs all of its block's KV steps of DENSE_KV_PAGES_PER_STEP
-    pages, up to the block's largest selected position. The running max, sum
+    Each grid step runs all of its block's KV steps, up to the block's largest
+    selected position: steps of DENSE_KV_PAGES_PER_STEP pages, the last one
+    shorter if the block's page count is not a multiple. The running max, sum
     and accumulator start from the SWA partials, as the gather kernel's do,
     and a KV position contributes to a token only if the token's top-k
     selected it. Same keys as the gather path, so the output differs from it
@@ -637,7 +638,6 @@ def _dense_attention_kernel(
     rope_words = csa_cache_layout.ROPE_WORDS
     rope_tokens_per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
     halves = page_size // _MASK_LANES
-    kv_len = kv_group * page_size
 
     block = pl.program_id(0)
     bq_idx = block_ids_ref[block]
@@ -669,11 +669,8 @@ def _dense_attention_kernel(
             for copy in page_copies(req, page):
                 copy.start()
 
-    # Every cache page holds zeros or a decoded page, both finite: a step reads
-    # pages past its block's last, which no token selected.
     @pl.when(block == 0)
     def init_cache():
-        kv_cache_ref[...] = jnp.zeros_like(kv_cache_ref)
         cache_state_ref[0] = -1
         cache_state_ref[1] = 0
         start_fetch(seq, 0, block_pages_ref[bq_idx])
@@ -782,14 +779,16 @@ def _dense_attention_kernel(
         have = jnp.where(next_seq == seq, decoded_pages, 0)
         start_fetch(next_seq, have, jnp.maximum(have, block_pages_ref[next_idx]))
 
-    def compute(kv_step, from_swa=False):
-        first_page = kv_step * kv_group
-        bkv = kv_cache_ref[pl.ds(pl.multiple_of(first_page * page_size, kv_len), kv_len), :]
+    def compute(first_page, num_pages=kv_group, from_swa=False):
+        step_len = num_pages * page_size
+        bkv = kv_cache_ref[
+            pl.ds(pl.multiple_of(first_page * page_size, page_size), step_len), :
+        ]
 
         selected = jnp.concatenate(
-            [mask_ref[first_page * halves + h] for h in range(kv_group * halves)],
+            [mask_ref[first_page * halves + h] for h in range(num_pages * halves)],
             axis=-1,
-        )  # [bq_sz, kv_len]
+        )  # [bq_sz, step_len]
         group_rows = DENSE_GROUP_TOKENS * num_q_heads
 
         def scores(g):
@@ -800,9 +799,9 @@ def _dense_attention_kernel(
             sel = selected[g * DENSE_GROUP_TOKENS : (g + 1) * DENSE_GROUP_TOKENS]
             return jnp.where(
                 sel[:, None, :] > 0,
-                s.reshape(DENSE_GROUP_TOKENS, num_q_heads, kv_len),
+                s.reshape(DENSE_GROUP_TOKENS, num_q_heads, step_len),
                 jnp.finfo(s.dtype).min,
-            ).reshape(group_rows, kv_len)
+            ).reshape(group_rows, step_len)
 
         # Group g + 1's QK is issued before group g's PV, so the MXU works on
         # one group while the VPU and EUP run the other's softmax.
@@ -831,20 +830,35 @@ def _dense_attention_kernel(
                 acc_prev = acc_ref[rows, :]
             acc_ref[rows, :] = exp_m_diff * acc_prev + pv
 
-    num_kv_steps = cdiv(kv_bound, kv_len)
+    # Steps of kv_group pages, then one page if the block reads an odd count:
+    # a step over a page past the block's last would do its work all masked.
+    num_pages = cdiv(kv_bound, page_size)
+    num_full_steps = num_pages // kv_group
+    tail_pages = num_pages % kv_group
 
     # No token of the block selected any key.
-    @pl.when(num_kv_steps == 0)
+    @pl.when(num_pages == 0)
     def keep_swa_acc():
         acc_ref[...] = swa_acc_ref[...].reshape(num_rows, head_dim).astype(jnp.float32)
 
-    @pl.when(num_kv_steps > 0)
+    @pl.when(num_full_steps > 0)
     def first_kv_step():
         compute(0, from_swa=True)
 
-    @pl.loop(1, num_kv_steps)
+    @pl.loop(1, num_full_steps)
     def _(kv_step):
-        compute(kv_step)
+        compute(kv_step * kv_group)
+
+    tail_page = num_full_steps * kv_group
+    for pages in range(1, kv_group):
+
+        @pl.when((tail_pages == pages) & (num_full_steps == 0))
+        def first_tail_step(*, pages=pages):
+            compute(tail_page, pages, from_swa=True)
+
+        @pl.when((tail_pages == pages) & (num_full_steps > 0))
+        def tail_step(*, pages=pages):
+            compute(tail_page, pages)
 
     sinks = jnp.broadcast_to(attention_sinks_ref[...][:, None], (num_q_heads, 128))
     # Token by token, so no [num_rows, head_dim] temporary is live at once.
@@ -905,8 +919,7 @@ def _dense_attention(
     num_l_heads = swa_l.shape[1]
     pages_per_seq = page_indices.shape[0] // max_num_seqs
     max_kv_pages = min(DENSE_MAX_KV_PAGES, pages_per_seq)
-    # Every KV step reads mask rows of whole pages, up to the last step's.
-    cache_pages = align_to(max_kv_pages, kv_group)
+    cache_pages = max_kv_pages
     mask_rows = align_to(cache_pages * page_size // _MASK_LANES, 8)
     num_chunks = num_tokens // chunk_size
     chunk_blocks = chunk_size // bq_sz
