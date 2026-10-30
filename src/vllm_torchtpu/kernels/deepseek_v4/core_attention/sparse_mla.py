@@ -757,8 +757,16 @@ def _dense_attention_kernel(
                 if o_ref.dtype == jnp.float32
                 else (acc * pl.reciprocal(l_total, approx=True)).astype(o_ref.dtype)
             )
-            # Padding rows keep q, as the gather kernel leaves them.
-            o_ref[t] = jnp.where(bq_idx * bq_sz + t < chunk_ref[1], out, q_ref[t])
+            o_ref[t] = out
+
+        # Padding rows keep q, as the gather kernel leaves them. Only the
+        # chunk's last block can hold any.
+        num_valid = chunk_ref[1] - bq_idx * bq_sz
+
+        @pl.when(num_valid < bq_sz)
+        def keep_padding_rows():
+            for t in range(bq_sz):
+                o_ref[t] = jnp.where(t < num_valid, o_ref[t], q_ref[t])
 
 
 def _dense_chunk_attention(
