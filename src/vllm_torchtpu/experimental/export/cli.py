@@ -272,34 +272,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-# Speculative methods the artifact can declare: ngram drafts on the host from the
-# sequence itself, so it needs no exported draft graphs.
-SPECULATIVE_METHODS = ("ngram",)
-_SPECULATIVE_FIELDS = frozenset(
-    {"method", "num_speculative_tokens", "prompt_lookup_max", "prompt_lookup_min"}
-)
+# Speculative methods the artifact can declare, with the fields each takes: ngram
+# drafts on the host from the sequence itself; mtp drafts with the model's MTP
+# layer, which the export lowers as `mtp_draft`.
+_SPECULATIVE_FIELDS = {
+    "ngram": frozenset(
+        {"method", "num_speculative_tokens", "prompt_lookup_max", "prompt_lookup_min"}
+    ),
+    "mtp": frozenset({"method", "num_speculative_tokens"}),
+}
+SPECULATIVE_METHODS = tuple(_SPECULATIVE_FIELDS)
 
 
 def export_speculative_config(raw: Any) -> dict[str, Any] | None:
     """The `serving_config.speculative_config` for `--speculative-config`.
 
-    Keeps vLLM's field names. Rejects methods that would need exported draft
-    graphs (MTP, EAGLE, a draft model) and fields the runtime would not honor.
+    Keeps vLLM's field names. Rejects methods whose drafts the export does not
+    lower (EAGLE, a draft model) and fields the runtime would not honor.
     """
     if raw is None:
         return None
     cfg = json.loads(raw) if isinstance(raw, str) else dict(raw)
     method = cfg.get("method")
-    if method not in SPECULATIVE_METHODS:
+    if method not in _SPECULATIVE_FIELDS:
         raise ValueError(
             f"--speculative-config method {method!r} is not supported by the "
             f"exporter; supported: {', '.join(SPECULATIVE_METHODS)}"
         )
-    unknown = sorted(set(cfg) - _SPECULATIVE_FIELDS)
+    fields = _SPECULATIVE_FIELDS[method]
+    unknown = sorted(set(cfg) - fields)
     if unknown:
         raise ValueError(
             f"--speculative-config fields {unknown} are not supported for method "
-            f"{method!r}; supported: {sorted(_SPECULATIVE_FIELDS)}"
+            f"{method!r}; supported: {sorted(fields)}"
         )
 
     def positive(name: str) -> int:
@@ -310,14 +315,16 @@ def export_speculative_config(raw: Any) -> dict[str, Any] | None:
             )
         return value
 
-    lookup_max = positive("prompt_lookup_max")
-    cfg.setdefault("prompt_lookup_min", lookup_max)
-    return {
+    out = {
         "method": method,
         "num_speculative_tokens": positive("num_speculative_tokens"),
-        "prompt_lookup_max": lookup_max,
-        "prompt_lookup_min": positive("prompt_lookup_min"),
     }
+    if method == "ngram":
+        lookup_max = positive("prompt_lookup_max")
+        cfg.setdefault("prompt_lookup_min", lookup_max)
+        out["prompt_lookup_max"] = lookup_max
+        out["prompt_lookup_min"] = positive("prompt_lookup_min")
+    return out
 
 
 def create_vllm_config_from_args(args: argparse.Namespace) -> Any:
@@ -337,8 +344,9 @@ def run_export_from_args(
     speculative_config = export_speculative_config(
         getattr(args, "speculative_config", None)
     )
-    # The serving runtime drafts; vLLM must not build a drafter for the export.
-    args.speculative_config = None
+    # vLLM loads the model with the speculative config, so recurrent layers keep
+    # a checkpoint per draft token, and builds the MTP draft for `mtp`. ngram
+    # drafts on the host and exports nothing more.
     if vllm_config is None and model is None:
         vllm_config = create_vllm_config_from_args(args)
     if vllm_config is not None:
