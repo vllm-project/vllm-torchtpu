@@ -14,7 +14,6 @@
 
 import dataclasses
 import functools
-import inspect
 import itertools
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -178,7 +177,7 @@ def gdn_attention_core_tpu(
 
 
 def gdn_attention_pooled_core_tpu(
-    mixed_qkv: jax.Array | Conv1DInput,
+    mixed_qkv: jax.Array,
     b: jax.Array,
     a: jax.Array,
     recurrent_state: jax.Array,
@@ -202,6 +201,7 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
+    prepare_input: Callable[[jax.Array], jax.Array | Conv1DInput] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -227,6 +227,7 @@ def gdn_attention_pooled_core_tpu(
         recurrent_state_dtype=recurrent_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        prepare_input=prepare_input,
     )
 
 
@@ -704,25 +705,20 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     @staticmethod
     def _prepare_pooled_gdn_input(
         mixed_qkv: jax.Array,
-        seq_lens: jax.Array,
-        mesh: jax.sharding.Mesh,
     ) -> jax.Array | Conv1DInput:
         """Stateless trace-time hook; overrides must also be static methods.
 
         Only the pooled non-PCP operator calls this hook. Dense and PCP
         operators keep their existing input preparation.
-        Use only the operands and mesh. Instance-dependent preparation needs
+        Use only the local projection. Instance-dependent preparation needs
         an explicit immutable configuration in the shared operator key.
         """
         return mixed_qkv
 
     def _build_pooled_gdn_op(self, *, block_major: bool = False):
-        preparation = inspect.getattr_static(type(self), "_prepare_pooled_gdn_input")
-        if not isinstance(preparation, staticmethod):
-            raise TypeError(
-                "_prepare_pooled_gdn_input must be a stateless staticmethod"
-            )
-        prepare_input = preparation.__func__
+        prepare_input: Callable[[jax.Array], jax.Array | Conv1DInput] = type(
+            self
+        )._prepare_pooled_gdn_input
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)
@@ -761,9 +757,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # pool adapters index flat kernel blocks along dim 0; both reshapes
             # compile to zero-copy bitcasts on the donated buffer.
             pool = kernel_view(recurrent_state) if block_major else recurrent_state
-            prepared_qkv = prepare_input(mixed_qkv, seq_lens, mesh)
             result = gdn_attention_pooled_core_tpu(
-                prepared_qkv,
+                mixed_qkv,
                 b,
                 a,
                 pool,
@@ -792,6 +787,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
+                prepare_input=prepare_input,
             )
             if not block_major:
                 return result
