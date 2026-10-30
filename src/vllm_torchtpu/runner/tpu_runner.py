@@ -3684,12 +3684,13 @@ class TPUModelRunner(GPUModelRunner):
         planner = _get_sequence_layout_planner_for_runner(self)
         num_reqs = self.input_batch.num_reqs
         rows: list[int] = []
+        all_counts = [
+            scheduler_output.num_scheduled_tokens[self.input_batch.req_ids[i]]
+            for i in range(num_reqs)
+        ]
         start_index = 0
         while start_index < num_reqs:
-            counts = [
-                scheduler_output.num_scheduled_tokens[self.input_batch.req_ids[i]]
-                for i in range(start_index, num_reqs)
-            ]
+            counts = all_counts[start_index:]
             if self.most_model_len is None or max(counts) > self.most_model_len:
                 chunk_reqs = self.num_reqs_max_model_len
             else:

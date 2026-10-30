@@ -124,8 +124,9 @@ def ring_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
     received. No stage holds more than the ``stages`` steps the engine keeps
     in flight.
 
-    At run time the posting thread holds every device to _MAX_RECEIVES, so
-    a step of more forwards, or a deeper ring, waits there instead.
+    At run time every device holds its posted receives to _MAX_RECEIVES,
+    whether a step queues them ahead or a forward posts its own, so a step
+    of more forwards, or a deeper ring, waits there instead.
     """
     if stages < 2:
         return 0
@@ -395,11 +396,10 @@ class PPRing:
             self._cv.notify_all()
         self._posted.extend(queued)
 
-    def _has_room(self) -> bool:
-        """Whether posting the next queued transfer keeps at most
-        _MAX_RECEIVES receive calls posted whose forwards have not
-        completed; called with the lock held."""
-        transfer = self._to_post[0][0]
+    def _has_room(self, transfer: int) -> bool:
+        """Whether posting ``transfer`` keeps at most _MAX_RECEIVES receive
+        calls posted whose forwards have not completed; called with the
+        lock held."""
         outstanding = (transfer - self.landed_through) * len(self.carried)
         return outstanding <= _MAX_RECEIVES
 
@@ -412,11 +412,14 @@ class PPRing:
         while True:
             with self._cv:
                 self._cv.wait_for(lambda: bool(self._to_post) or self._post_stops())
-                if not self._post_stops() and not self._has_room():
-                    with TraceAnnotation("PP:PostThrottled"):
-                        self._cv.wait_for(
-                            lambda: self._post_stops() or self._has_room()
-                        )
+                if not self._post_stops():
+                    transfer = self._to_post[0][0]
+                    if not self._has_room(transfer):
+                        with TraceAnnotation("PP:PostThrottled"):
+                            self._cv.wait_for(
+                                lambda t=transfer: self._post_stops()
+                                or self._has_room(t)
+                            )
                 if self._post_stops():
                     # The forwards these were queued for will not run.
                     for *_, landing in self._to_post:
@@ -469,7 +472,16 @@ class PPRing:
             transfer, posted_rows, landing = self._posted.popleft()
             received = self._wait_posted(landing)
         else:
+            # A forward whose receives were not queued ahead posts them
+            # itself, within the bound the posting thread keeps.
             transfer, posted_rows = self.transfers, rows
+            with self._cv:
+                if not self._has_room(transfer):
+                    with TraceAnnotation("PP:PostThrottled"):
+                        self._cv.wait_for(
+                            lambda: self._error is not None or self._has_room(transfer)
+                        )
+                self._raise_send_failure_locked()
             received = self._post(transfer, rows)
         if transfer != self.transfers or posted_rows != rows:
             raise RuntimeError(
