@@ -110,8 +110,10 @@ class _FakeSublayer(nn.Module):
         self.calls.append(args)
         return torch.tanh(self.proj(hidden))
 
-    def forward_with_indices(self, hidden, *args, rows=None, reduce=True):
-        """QSA's entry point: (output, selected), here without selection."""
+    def forward_with_indices(self, hidden, *args, rows=None, reduce=True, **_routing):
+        """QSA's entry point: (output, selected), here without selection;
+        ``_routing`` takes the indexer routing flags (replicated_indexer,
+        token_shard)."""
         return self.forward(hidden, *args), None
 
 
