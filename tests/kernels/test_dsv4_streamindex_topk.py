@@ -1466,6 +1466,53 @@ class TestChunkedPipelining:
             "an indivisible chunk_tokens emitted more than one chunk; the"
             " fallback that the cases above rely on has changed")
 
+    @pytest.mark.parametrize("kv_layout", [_HAS, _SAL], ids=["has", "sal"])
+    @pytest.mark.parametrize(
+        "num_decodes, prefill_len, chunk_tokens",
+        [
+            # max_num_seqs (35) < chunk_tokens (128): only chunk 0 runs the
+            # static_q_len == 1 decode passes; chunks 1..3 skip them.
+            (34, 478, 128),
+            # max_num_seqs (141) > chunk_tokens (128): chunks 0 and 1 run the
+            # static_q_len == 1 decode passes; chunks 2..3 skip them.
+            (140, 372, 128),
+        ],
+        ids=["seqs_within_first_chunk", "seqs_spanning_two_chunks"],
+    )
+    def test_mixed_decode_prefill_skips_dead_decode_chunks(
+        self, num_decodes, prefill_len, chunk_tokens, kv_layout
+    ):
+        """Mixed decode+prefill with `chunk_tokens=128` omits `static_q_len==1`
+        kernel calls on chunks starting at or past `max_num_seqs` while keeping
+        selections identical to the unchunked pass."""
+        T_list = (1,) * num_decodes + (prefill_len,)
+        B = len(T_list)
+        S_list = (512,) * B
+        inputs = _chunk_inputs(T_list, _fragmented_pages(B), 128, 4, 128)
+        common = (inputs, T_list, S_list, 128, 1, 8, 2, kv_layout)
+        chunked_kwargs = _chunk_call_kwargs(*common, chunk_tokens)
+
+        hlo = streamindex_topk.lower(**chunked_kwargs).as_text()
+        assert "_scheduling_group_id" in hlo
+        num_chunks = sum(T_list) // chunk_tokens
+        expected_decode_chunks = (B + chunk_tokens - 1) // chunk_tokens
+        custom_calls = hlo.count('custom_call_target="tpu_custom_call"')
+        assert custom_calls < 4 * num_chunks, (
+            f"expected dead decode chunks to be omitted, got {custom_calls} "
+            f"tpu_custom_call sites across {num_chunks} chunks "
+            f"(expected_decode_chunks={expected_decode_chunks})"
+        )
+
+        chunked = np.array(streamindex_topk(**chunked_kwargs))
+        unchunked = np.array(
+            streamindex_topk(**_chunk_call_kwargs(*common, None))
+        )
+        _verify_padding_at_end(chunked)
+        np.testing.assert_array_equal(
+            np.sort(chunked, axis=-1),
+            np.sort(unchunked, axis=-1),
+        )
+
 
 def main(argv):
     del argv

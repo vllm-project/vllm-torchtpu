@@ -53,8 +53,8 @@ RANDOM_RANGE_RATIO="0.0"
 # the GLM-5.2 NVFP4 recipe.
 export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-512}"
 
-# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+129.78% output tok/s/device:
-# 139.72 -> 321.05 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
+# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+142.98% output tok/s/device:
+# 139.72 -> 339.48 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
 # 1. Fused EP MoE v2 with W4A8 MXU matmuls + sharded schedule plan + padded-row skip
 export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
 export MOE_FUSED_EP_ENABLE_W4A8="${MOE_FUSED_EP_ENABLE_W4A8:-1}"
@@ -63,29 +63,33 @@ export TPU_MOE_SKIP_PADDED_TOKENS="${TPU_MOE_SKIP_PADDED_TOKENS:-1}"
 # 2. TpuDpScheduler with KV-bounded prefill-then-decode wave shaping across DP=8 ranks
 export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
 export TPU_DP_SCHED_PREFILL_WAVE="${TPU_DP_SCHED_PREFILL_WAVE:-1}"
-# 3. Split-Q in-VMEM join for non-DCP sparse MLA attention + 64B packed fp8 RoPE cache + 128-token chunked gather/attention & pipelined DSA top-k
+# 3. Split-Q in-VMEM join for non-DCP sparse MLA attention + 64B packed fp8 RoPE cache + 128-token chunked gather/attention & pipelined DSA top-k + fused Pallas indexer q-prep
 export TPU_MLA_SPARSE_SPLIT_Q="${TPU_MLA_SPARSE_SPLIT_Q:-1}"
 export TPU_SPARSE_MLA_PACKED_ROPE="${TPU_SPARSE_MLA_PACKED_ROPE:-1}"
 export TPU_SPARSE_MLA_CHUNK_TOKENS="${TPU_SPARSE_MLA_CHUNK_TOKENS:-128}"
 export TPU_STREAMIDX_CHUNK_TOKENS="${TPU_STREAMIDX_CHUNK_TOKENS:-128}"
-# 4. Truncated row-major RoPE cache + fast device token substitution
+export TPU_INDEXER_QPREP_FUSED="${TPU_INDEXER_QPREP_FUSED:-1}"
+# 4. Truncated row-major RoPE cache + fast device token substitution + fused greedy top-token argmax
 export TPU_ROPE_CACHE_TRUNCATE="${TPU_ROPE_CACHE_TRUNCATE:-1}"
 export TPU_ROPE_CACHE_ROW_MAJOR="${TPU_ROPE_CACHE_ROW_MAJOR:-1}"
 export VLLM_TPU_FAST_TOKEN_SUBSTITUTION="${VLLM_TPU_FAST_TOKEN_SUBSTITUTION:-1}"
-# 5. SparseCore async All-Gather offload (512 KiB threshold: keeps q_g >= 768 KiB on SparseCore while keeping 296 KiB MoE routing exchange on TensorCore ICI)
+export TPU_GREEDY_TOP_TOKENS="${TPU_GREEDY_TOP_TOKENS:-1}"
+# 5. TPU7x Ironwood P-state 7 + SparseCore async All-Gather offload (512 KiB threshold: keeps q_g >= 768 KiB on SparseCore while keeping 296 KiB MoE routing exchange on TensorCore ICI)
 export SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES="${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES:-524288}"
-export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES}"
-# 6. Load-time per-channel FP8 quantization of excluded BF16 dense MLP, shared-expert, and MLA linear projections (frees 9.23 GiB/chip for 1-wave C=64 KV cache + W8A8 on T>=64 prefill/decode, W8A16 on T<=32)
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_tpu_dvfs_p_state=7 --xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES}"
+# 6. Load-time per-channel FP8 quantization of excluded BF16 dense MLP, shared-expert, and MLA linear projections (frees 14.57 GiB/chip for 1-wave C=64 KV cache + W8A8 on T>=64 prefill/decode, W8A16 on T<=32)
 export QUANTIZE_ON_LOAD_PREFIXES="${QUANTIZE_ON_LOAD_PREFIXES:-shared_experts,layers.0.mlp,layers.1.mlp,layers.2.mlp,fused_qkv_a_proj,q_b_proj,o_proj}"
 export TPU_FP8_LINEAR_W8A16_MAX_ROWS="${TPU_FP8_LINEAR_W8A16_MAX_ROWS:-32}"
 # 7. One-pass Pallas fused add + RMSNorm + dynamic per-row FP8 quant on T>=1024 prefill/mixed buckets (eliminates 2-pass RMSNorm + amax/convert HBM round-trips across 156 residual-stream pairs)
 export TPU_FUSED_ADD_RMSNORM="${TPU_FUSED_ADD_RMSNORM:-1}"
 export TPU_FUSED_ADD_RMSNORM_QUANT="${TPU_FUSED_ADD_RMSNORM_QUANT:-1}"
 export TPU_FUSED_ADD_RMSNORM_MIN_TOKENS="${TPU_FUSED_ADD_RMSNORM_MIN_TOKENS:-1024}"
-# 8. Serving-thread host overhead elimination: gate StageTiming perf_counter_ns + fuse 78-buffer AOT KV copy_ epilogue into _foreach_copy_ + bypass stable AOT guard_fn
+# 8. Serving-thread host overhead elimination: gate StageTiming perf_counter_ns + fuse 78-buffer AOT KV copy_ epilogue into _foreach_copy_ + bypass stable AOT guard_fn + NUMA-local worker CPU pinning + unchanged padding-mask skip
 export TPU_STAGE_TIMING_ONLY_WITH_CONSUMER="${TPU_STAGE_TIMING_ONLY_WITH_CONSUMER:-1}"
 export TPU_AOT_SKIP_GUARD_CHECK="${TPU_AOT_SKIP_GUARD_CHECK:-1}"
 export TPU_FOREACH_MUTATION_EPILOGUE="${TPU_FOREACH_MUTATION_EPILOGUE:-1}"
+export TPU_WORKER_CPU_PIN="${TPU_WORKER_CPU_PIN:-1}"
+export TPU_TOKEN_PADDING_SKIP_UNCHANGED="${TPU_TOKEN_PADDING_SKIP_UNCHANGED:-1}"
 
 # Server configuration:
 # - max-model-len=9216: exact nominal length for 8192 input + 1024 output.

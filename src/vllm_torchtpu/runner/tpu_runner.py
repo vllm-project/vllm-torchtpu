@@ -194,6 +194,7 @@ from vllm_torchtpu.tracing.utils import (
     extract_request_ids_for_tracing,
 )
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
+from vllm_torchtpu.worker.cpu_pin import WorkerCpuPinner
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.interfaces import SupportsPP
@@ -1095,6 +1096,12 @@ class TPUModelRunner(GPUModelRunner):
             aot_guard_skip.install()
         self._host_levers_pending = bool(
             envs.TPU_AOT_SKIP_GUARD_CHECK or envs.TPU_FOREACH_MUTATION_EPILOGUE
+        )
+        self._cpu_pinner = WorkerCpuPinner(
+            envs.TPU_WORKER_CPU_PIN,
+            local_rank=int(os.environ.get("LOCAL_RANK", "0") or 0),
+            local_world_size=int(os.environ.get("LOCAL_WORLD_SIZE", "1") or 1),
+            skip=envs.TPU_WORKER_CPU_PIN_SKIP,
         )
 
     def _host_levers_first_step(self) -> None:
@@ -3803,6 +3810,9 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        pinner = getattr(self, "_cpu_pinner", None)
+        if pinner is not None:
+            pinner.maybe_pin()
         if getattr(self, "_host_levers_pending", False):
             self._host_levers_first_step()
         # Update cached state

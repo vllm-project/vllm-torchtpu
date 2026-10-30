@@ -15,6 +15,9 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TORCH_TPU_BASE_PORT` | `8070` | Base TCP port for `torch_tpu` worker slice-builder communication. |
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
 | `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
+| `TPU_TOKEN_PADDING_SKIP_UNCHANGED` | `True` | Skips re-uploading the per-rank token padding mask from host to device when the `[valid, padded)` padding slice has not changed since the previous forward. |
+| `TPU_WORKER_CPU_PIN` | `True` | Pins each TPU worker's serving thread to a dedicated NUMA-local physical core and moves background threads onto the remaining NUMA-local CPUs. |
+| `TPU_WORKER_CPU_PIN_SKIP` | `2` | Number of lowest-numbered NUMA-local physical cores skipped before reserving per-worker serving cores under `TPU_WORKER_CPU_PIN`. |
 
 ---
 
@@ -69,6 +72,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_SPARSE_MLA_NOPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA non-positional (`nope`) KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `TPU_INDEXER_QPREP_FUSED` | `False` | Fuses DSA indexer query RoPE rotation and per-(token, head) FP8 quantization into a single Pallas kernel. |
 
 ---
 

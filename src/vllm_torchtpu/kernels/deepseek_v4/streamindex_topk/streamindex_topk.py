@@ -1433,6 +1433,16 @@ def streamindex_topk(
 
     def _pass_metadata(spec, chunk_starts, chunk_tokens):
         """One schedule per pass, holding every chunk's steps back to back."""
+        if (
+            spec["static_q_len"] == 1
+            and chunk_starts != (None,)
+            and chunk_tokens is not None
+        ):
+            # Each sequence in a `static_q_len == 1` pass contributes at most
+            # one query token, so its tokens stay within `[0, max_num_seqs)`.
+            # Chunks starting at or past `max_num_seqs` have zero decode steps.
+            decode_chunks = min(len(chunk_starts), cdiv(max_num_seqs, chunk_tokens))
+            chunk_starts = chunk_starts[:decode_chunks]
         bq_sz, bkv_sz = _block_sizes(
             spec["num_queries_per_block"],
             spec["num_kv_pages_per_block"],
@@ -1472,6 +1482,12 @@ def streamindex_topk(
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
         scores = None
         for spec, pass_meta in passes:
+            if (
+                spec["static_q_len"] == 1
+                and chunk_token_start is not None
+                and chunk_token_start >= max_num_seqs
+            ):
+                continue
             scores = run_scores_kernel(
                 q,
                 prepared_indexer_weights,

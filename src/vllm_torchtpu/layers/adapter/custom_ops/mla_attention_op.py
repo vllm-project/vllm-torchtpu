@@ -15,6 +15,8 @@
 Multi-Head Latent Attention (MLA)."""
 
 import math
+from collections.abc import Callable
+from threading import Lock
 from typing import Any, cast
 
 import jax
@@ -46,6 +48,7 @@ from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
+from vllm_torchtpu.kernels import indexer_qprep
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     KVLayout,
@@ -938,6 +941,54 @@ def _get_rope_matmul_buffers(
     )
 
 
+_indexer_qprep_ops: dict[tuple[int, int], Callable[..., Any]] = {}
+_indexer_qprep_lock = Lock()
+
+
+def _get_indexer_qprep_op(n_head: int, head_dim: int) -> Callable[..., Any]:
+    """Build (outside Dynamo) the fused indexer query RoPE + FP8 quant op."""
+    key = (int(n_head), int(head_dim))
+    op = _indexer_qprep_ops.get(key)
+    if op is not None:
+        return op
+    with _indexer_qprep_lock:
+        op = _indexer_qprep_ops.get(key)
+        if op is not None:
+            return op
+        nh, hd = key
+
+        def fn(
+            q_2d: jax.Array,
+            cos_full: jax.Array,
+            sin_full: jax.Array,
+            p_mat: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            q_fp8, q_scale = indexer_qprep.indexer_q_prep(
+                q_2d, cos_full, sin_full, p_mat, n_head=nh
+            )
+            return q_fp8, q_scale[..., None]
+
+        def fake(
+            q_2d: torch.Tensor,
+            cos_full: torch.Tensor,
+            sin_full: torch.Tensor,
+            p_mat: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del cos_full, sin_full, p_mat
+            rows = q_2d.shape[0]
+            return (
+                torch.empty(
+                    (rows, nh, hd), dtype=torch.float8_e4m3fn, device=q_2d.device
+                ),
+                torch.empty((rows, nh, 1), dtype=torch.float32, device=q_2d.device),
+            )
+
+        op = pallas.jax_op(f"pallas::indexer_qprep_h{nh}_d{hd}", fn)
+        op.register_fake(fake)
+        _indexer_qprep_ops[key] = op
+        return op
+
+
 class VllmTPUIndexer(Indexer):
     """TPU-optimized out-of-tree wrapper for Indexer.
 
@@ -967,13 +1018,20 @@ class VllmTPUIndexer(Indexer):
         indexer.k_cache.head_dim = (
             indexer.head_dim + indexer.head_dim // indexer.quant_block_size
         )
-        return cast("VllmTPUIndexer", indexer)
+        tpu_indexer = cast("VllmTPUIndexer", indexer)
+        tpu_indexer._qprep_op = (
+            _get_indexer_qprep_op(indexer.n_head, indexer.head_dim)
+            if envs.TPU_INDEXER_QPREP_FUSED
+            else None
+        )
+        return tpu_indexer
+
+    _qprep_op: Callable[..., Any] | None = None
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
-        q = q.view(-1, self.n_head, self.head_dim)
+        q_2d, _ = self.wq_b(qr)
         # Fused wk + weights_proj: one GEMM, then split
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
@@ -981,13 +1039,16 @@ class VllmTPUIndexer(Indexer):
 
         k = self.k_norm(k)
 
+        q: torch.Tensor | None = None
+        q_fp8: torch.Tensor | None = None
+        q_scale: torch.Tensor | None = None
         if (
-            q.dtype == torch.bfloat16
+            q_2d.dtype == torch.bfloat16
             and type(rotary_emb) is RotaryEmbedding
             and rotary_emb.rotary_dim == self.rope_dim
             and rotary_emb.head_size == self.rope_dim
         ):
-            cos_sin = rotary_emb._match_cos_sin_cache_dtype(q).index_select(
+            cos_sin = rotary_emb._match_cos_sin_cache_dtype(q_2d).index_select(
                 0, positions.flatten()
             )
             cos, sin = cos_sin.chunk(2, dim=-1)
@@ -996,18 +1057,29 @@ class VllmTPUIndexer(Indexer):
                 self.rope_dim,
                 self.head_dim,
                 rotary_emb.is_neox_style,
-                q.dtype,
-                q.device,
+                q_2d.dtype,
+                q_2d.device,
             )
             cos_full = torch.matmul(cos, r_mat)
             if b_nope is not None:
                 cos_full = cos_full + b_nope
             sin_full = torch.matmul(sin, r_mat)
-            q = q * cos_full.unsqueeze(-2) + torch.matmul(
-                q, p_mat
-            ) * sin_full.unsqueeze(-2)
             k = k * cos_full + torch.matmul(k, p_mat) * sin_full
+            qprep_op = self._qprep_op
+            if qprep_op is not None and q_2d.device.type == "tpu":
+                q_fp8, q_scale = qprep_op(
+                    q_2d.reshape(-1, self.n_head * self.head_dim),
+                    cos_full,
+                    sin_full,
+                    p_mat,
+                )
+            else:
+                q = q_2d.view(-1, self.n_head, self.head_dim)
+                q = q * cos_full.unsqueeze(-2) + torch.matmul(
+                    q, p_mat
+                ) * sin_full.unsqueeze(-2)
         else:
+            q = q_2d.view(-1, self.n_head, self.head_dim)
             q_pe, q_nope = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
@@ -1027,13 +1099,15 @@ class VllmTPUIndexer(Indexer):
             # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
             k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
-        # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = quantize_tensor(
-            q, torch.float8_e4m3fn, axis=-1, use_ue8m0=False
-        )
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
+        if q_fp8 is None or q_scale is None:
+            # we only quant q here since k quant is fused with cache insertion
+            assert q is not None
+            q = q.view(-1, self.head_dim)
+            q_fp8, q_scale = quantize_tensor(
+                q, torch.float8_e4m3fn, axis=-1, use_ue8m0=False
+            )
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
 
         # q_scale is fp32, so fold it in and cast back: the kernel expects the
         # weights in the activation dtype.

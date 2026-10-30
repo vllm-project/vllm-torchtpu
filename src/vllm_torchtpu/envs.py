@@ -203,6 +203,10 @@ if TYPE_CHECKING:
     TPU_STAGE_TIMING_ONLY_WITH_CONSUMER: bool = True
     TPU_AOT_SKIP_GUARD_CHECK: bool = True
     TPU_FOREACH_MUTATION_EPILOGUE: bool = True
+    TPU_TOKEN_PADDING_SKIP_UNCHANGED: bool = True
+    TPU_WORKER_CPU_PIN: bool = True
+    TPU_WORKER_CPU_PIN_SKIP: int = 2
+    TPU_INDEXER_QPREP_FUSED: bool = False
 
 
 def env_with_choices(
@@ -1196,6 +1200,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # torch._foreach_copy_ instead of one copy_ per input in AOTAutograd's
     # epilogue (compilation/foreach_epilogue.py).
     "TPU_FOREACH_MUTATION_EPILOGUE": env_bool("TPU_FOREACH_MUTATION_EPILOGUE", True),
+    # Skip re-uploading the per-rank token padding mask when [valid, padded)
+    # rows did not change since the previous forward.
+    "TPU_TOKEN_PADDING_SKIP_UNCHANGED": env_bool(
+        "TPU_TOKEN_PADDING_SKIP_UNCHANGED", True
+    ),
+    # Pin each TPU worker's serving thread to a dedicated NUMA-local physical
+    # core and sweep background threads onto the remaining NUMA-local CPUs.
+    "TPU_WORKER_CPU_PIN": env_bool("TPU_WORKER_CPU_PIN", True),
+    "TPU_WORKER_CPU_PIN_SKIP": env_nonnegative_int("TPU_WORKER_CPU_PIN_SKIP", 2),
+    # Fuse DSA indexer query RoPE + per-(token, head) FP8 quantization into a
+    # single one-pass Pallas kernel (kernels/indexer_qprep.py).
+    "TPU_INDEXER_QPREP_FUSED": env_bool("TPU_INDEXER_QPREP_FUSED"),
 }
 
 
