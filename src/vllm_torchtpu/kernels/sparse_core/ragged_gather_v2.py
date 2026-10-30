@@ -276,13 +276,264 @@ def pack_row_quads(rows: jax.Array) -> jax.Array:
     return jax.lax.bitcast_convert_type(quads, jnp.int32)
 
 
+# Token quads (`pack_token_quads`): int32 [n, token_cols + r] holding int8 rows
+# 4i..4i+3 like row quads, except that row 4i+k's leading `token_cols` bytes
+# fill words [k * token_cols / 4, (k + 1) * token_cols / 4) of the row, so a
+# gather of one row reads only that row's bytes. Word 128 * b + p of that span
+# holds the row's columns 512 * b + 128 * j + p in byte j. The last r columns
+# stay row quads.
+TOKEN_QUAD_LANES = 128
+TOKEN_QUAD_COLS = 4 * TOKEN_QUAD_LANES
+
+
+def transpose_byte_quads(
+    w: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Byte ``k`` of output word ``j`` is byte ``j`` of input word ``k``.
+
+    Its own inverse. Static shifts and masks, so it runs on a TensorCore and
+    a SparseCore alike.
+    """
+    w0, w1, w2, w3 = w
+
+    def swap(a, b, shift, mask):
+        t = jnp.bitwise_and(jnp.bitwise_xor(jnp.right_shift(a, shift), b), mask)
+        return jnp.bitwise_xor(a, jnp.left_shift(t, shift)), jnp.bitwise_xor(b, t)
+
+    w0, w2 = swap(w0, w2, 16, 0x0000FFFF)
+    w1, w3 = swap(w1, w3, 16, 0x0000FFFF)
+    w0, w1 = swap(w0, w1, 8, 0x00FF00FF)
+    w2, w3 = swap(w2, w3, 8, 0x00FF00FF)
+    return w0, w1, w2, w3
+
+
+def pack_token_quads(rows: jax.Array, token_cols: int) -> jax.Array:
+    """int8 ``[n, h]`` as token quads, ``n`` a multiple of 4."""
+    n, _ = rows.shape
+    assert token_cols % TOKEN_QUAD_COLS == 0, token_cols
+    data = rows[:, :token_cols].reshape(
+        n // 4, 4, token_cols // TOKEN_QUAD_COLS, 4, TOKEN_QUAD_LANES
+    )
+    words = jax.lax.bitcast_convert_type(jnp.swapaxes(data, 3, 4), jnp.int32)
+    return jnp.concatenate(
+        [words.reshape(n // 4, token_cols), pack_row_quads(rows[:, token_cols:])],
+        axis=1,
+    )
+
+
+def unpack_token_quads(packed: jax.Array, token_cols: int) -> jax.Array:
+    """Inverse of `pack_token_quads`."""
+    quads, _ = packed.shape
+    data = jax.lax.bitcast_convert_type(packed[:, :token_cols], jnp.int8).reshape(
+        quads, 4, token_cols // TOKEN_QUAD_COLS, TOKEN_QUAD_LANES, 4
+    )
+    return jnp.concatenate(
+        [
+            jnp.swapaxes(data, 3, 4).reshape(4 * quads, token_cols),
+            unpack_row_quads(packed[:, token_cols:]),
+        ],
+        axis=1,
+    )
+
+
+def token_quads_kernel(
+    start_ref: jax.Ref,
+    end_ref: jax.Ref,
+    in_hbm_ref: jax.Ref,
+    indices_hbm_ref: jax.Ref,
+    out_hbm_ref: jax.Ref,
+    start_vmem_ref: jax.Ref,
+    end_vmem_ref: jax.Ref,
+    idx_vmem_ref: jax.Ref,
+    data_vmem_ref: jax.Ref,
+    trailer_vmem_ref: jax.Ref,
+    out_vmem_ref: jax.Ref,
+    sem_ref: jax.Ref,
+    *,
+    core_axis_name: str,
+    subcore_axis_name: str,
+    num_row_subchunks: int,
+    token_cols: int,
+):
+    """Gathers token-quad rows into row quads, the rows `main_kernel_v2` would.
+
+    Each 16-row subchunk DMAs every row's own token span and its quad's
+    trailer; two slots overlap the next subchunk's DMAs and the last one's
+    write with this one's byte transposes.
+    """
+    sc_info = pltpu.get_tpu_info().sparse_core
+    assert sc_info is not None
+    lanes = sc_info.num_lanes
+    num_cores = jax.lax.axis_size((core_axis_name, subcore_axis_name))
+    row_chunk_size = lanes * num_row_subchunks
+    block_size = row_chunk_size * num_cores
+    token_words = token_cols // 4
+    trailer_cols = in_hbm_ref.shape[-1] - token_cols
+    out_rows = lanes // 4
+    idx_sem, in_sem, out_sem = (sem_ref.at[pl.ds(2 * i, 2)] for i in range(3))
+
+    copy_start = pltpu.make_async_copy(start_ref, start_vmem_ref.at[:1], in_sem.at[0])
+    copy_end = pltpu.make_async_copy(end_ref, end_vmem_ref.at[:1], in_sem.at[0])
+    copy_start.start()
+    copy_end.start()
+    copy_start.wait()
+    copy_end.wait()
+    start = start_vmem_ref[...][0]
+    end = end_vmem_ref[...][0]
+
+    block_start = start // block_size
+    num_blocks = jnp.where(end <= start, 0, pl.cdiv(end, block_size) - block_start)
+    num_subchunks = num_blocks * num_row_subchunks
+    core_index = lax.axis_index((core_axis_name, subcore_axis_name))
+
+    def first_row(g):
+        block = block_start + g // num_row_subchunks
+        subchunk = g % num_row_subchunks
+        return (block * num_cores + core_index) * row_chunk_size + subchunk * lanes
+
+    def idx_copy(g, slot):
+        return pltpu.make_async_copy(
+            indices_hbm_ref.at[pl.ds(first_row(g), lanes)],
+            idx_vmem_ref.at[pl.ds(slot * lanes, lanes)],
+            idx_sem.at[slot],
+        )
+
+    def slot_indices(slot: int):
+        return idx_vmem_ref[pl.ds(slot * lanes, lanes)]
+
+    def start_gathers(slot: int):
+        idx = slot_indices(slot)
+        for r in range(lanes):
+            row = idx[r]
+            col = jnp.bitwise_and(row, 3) * token_words
+            pltpu.make_async_copy(
+                in_hbm_ref.at[
+                    pl.ds(jnp.right_shift(row, 2), 1), pl.ds(col, token_words)
+                ],
+                data_vmem_ref.at[pl.ds(slot * lanes + r, 1)],
+                in_sem.at[slot],
+            ).start()
+        pltpu.make_async_copy(
+            in_hbm_ref.at[jnp.right_shift(idx, 2), pl.ds(token_cols, trailer_cols)],
+            trailer_vmem_ref.at[pl.ds(slot * lanes, lanes)],
+            in_sem.at[slot],
+        ).start()
+
+    def wait_gathers(slot):
+        # A wait takes its descriptor's size, here that of all the slot's copies.
+        for cols, dst in (
+            (pl.ds(0, token_words), data_vmem_ref),
+            (pl.ds(token_cols, trailer_cols), trailer_vmem_ref),
+        ):
+            pltpu.make_async_copy(
+                in_hbm_ref.at[pl.ds(0, lanes), cols],
+                dst.at[pl.ds(slot * lanes, lanes)],
+                in_sem.at[slot],
+            ).wait()
+
+    def out_copy(g, slot):
+        return pltpu.make_async_copy(
+            out_vmem_ref.at[pl.ds(slot * out_rows, out_rows)],
+            out_hbm_ref.at[
+                pl.ds(pl.multiple_of(first_row(g) // 4, out_rows), out_rows)
+            ],
+            out_sem.at[slot],
+        )
+
+    def transpose(slot: int):
+        in_row = slot * lanes
+        out_row = slot * out_rows
+
+        @plsc.parallel_loop(0, TOKEN_QUAD_LANES, step=lanes)
+        def _(p):
+            for m in range(out_rows):
+                # All loads ahead of all stores: the stores could alias them.
+                spans = range(token_words // TOKEN_QUAD_LANES)
+                words = [
+                    tuple(
+                        data_vmem_ref[
+                            in_row + 4 * m + k, pl.ds(TOKEN_QUAD_LANES * b + p, lanes)
+                        ]
+                        for k in range(4)
+                    )
+                    for b in spans
+                ]
+                words = [transpose_byte_quads(w) for w in words]
+                for b in spans:
+                    for j, word in enumerate(words[b]):
+                        col = TOKEN_QUAD_COLS * b + TOKEN_QUAD_LANES * j + p
+                        out_vmem_ref[out_row + m, pl.ds(col, lanes)] = word
+
+        # The trailer is row quads: pick each row's byte.
+        shifts = jnp.left_shift(jnp.bitwise_and(slot_indices(slot), 3), 3)
+
+        @plsc.parallel_loop(0, trailer_cols, step=lanes)
+        def _(c):
+            for m in range(out_rows):
+                packed = jnp.zeros((lanes,), jnp.int32)
+                for k in range(4):
+                    r = 4 * m + k
+                    byte = jnp.right_shift(
+                        trailer_vmem_ref[in_row + r, pl.ds(c, lanes)], shifts[r]
+                    )
+                    byte = jnp.left_shift(jnp.bitwise_and(byte, 0xFF), 8 * k)
+                    packed = jnp.bitwise_or(packed, byte)
+                out_vmem_ref[out_row + m, pl.ds(token_cols + c, lanes)] = packed
+
+    def step(g, slot):
+        @pl.when(g + 1 < num_subchunks)
+        def _():
+            idx_copy(g + 1, 1 - slot).wait()
+            start_gathers(1 - slot)
+
+        wait_gathers(slot)
+
+        @pl.when(g >= 2)
+        def _():
+            out_copy(g - 2, slot).wait()
+
+        transpose(slot)
+        out_copy(g, slot).start()
+
+        # The slot's indices are read for the last time above.
+        @pl.when(g + 2 < num_subchunks)
+        def _():
+            idx_copy(g + 2, slot).start()
+
+    @pl.when(num_subchunks > 0)
+    def _():
+        idx_copy(0, 0).start()
+        idx_copy(0, 0).wait()
+        start_gathers(0)
+
+        @pl.when(num_subchunks > 1)
+        def _():
+            idx_copy(1, 1).start()
+
+        # Subchunk g runs in slot g % 2, unrolled so that every slot offset is
+        # static.
+        @pl.loop(0, pl.cdiv(num_subchunks, 2))
+        def _(i):
+            step(2 * i, 0)
+
+            @pl.when(2 * i + 1 < num_subchunks)
+            def _():
+                step(2 * i + 1, 1)
+
+        out_copy(0, 0).wait()
+
+        @pl.when(num_subchunks > 1)
+        def _():
+            out_copy(0, 1).wait()
+
+
 def _unpack_rows(packed: jax.Array, dtype: jnp.dtype) -> jax.Array:
     if dtype == jnp.int8:
         return unpack_row_quads(packed)
     return unpack_row_pairs(packed, dtype)
 
 
-@functools.partial(jax.jit, static_argnames=("out_dtype", "packed_out"))
+@functools.partial(jax.jit, static_argnames=("out_dtype", "packed_out", "token_cols"))
 def ragged_gather_v2(
     x: jax.Array,
     indices: jax.Array,
@@ -290,6 +541,7 @@ def ragged_gather_v2(
     end: jax.Array,
     out_dtype: jnp.dtype | None = None,
     packed_out: bool = False,
+    token_cols: int | None = None,
 ) -> jax.Array:
     """Perform gather on indices within dynamic array start and end using BlockSpec.
 
@@ -298,7 +550,8 @@ def ragged_gather_v2(
     ``out_dtype`` int8; ``indices`` then still name unpacked rows.
 
     ``packed_out`` returns int8 rows as their int32 row quads, the layout a
-    TensorCore kernel reads an 8-bit array in.
+    TensorCore kernel reads an 8-bit array in. ``token_cols`` says ``x`` holds
+    the int8 rows as `pack_token_quads` token quads instead.
     """
 
     assert x.ndim == 2, "Ragged gather only supports 2d inputs."
@@ -324,8 +577,13 @@ def ragged_gather_v2(
     if packed_out and (dtype != jnp.int8 or indices.size % 4):
         raise ValueError(f"packed_out takes int8 rows in fours, got {dtype}")
 
+    if token_cols is not None and not (row_packed and packed_out):
+        raise ValueError("token quads gather int8 rows into row quads")
+
     sc_info = pltpu.get_tpu_info().sparse_core
     if sc_info is None:
+        if token_cols is not None:
+            return pack_row_quads(unpack_token_quads(x, token_cols)[indices])
         rows = (_unpack_rows(x, dtype) if row_packed else x)[indices]
         return pack_row_quads(rows) if packed_out else rows
 
@@ -361,6 +619,37 @@ def ragged_gather_v2(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
+    compiler_params = pltpu.CompilerParams(
+        use_tc_tiling_on_sc=True,
+        needs_layout_passes=True,
+        disable_bounds_checks=True,
+    )
+    if token_cols is not None:
+        slot_rows = 2 * num_simd_lanes
+        return core_map_helper.kernel(
+            functools.partial(
+                token_quads_kernel,
+                core_axis_name=vector_mesh.core_axis_name,
+                subcore_axis_name=vector_mesh.subcore_axis_name,
+                num_row_subchunks=num_row_subchunks,
+                token_cols=token_cols,
+            ),
+            out_type=jax.ShapeDtypeStruct(
+                ((out_size + out_pad_size) // 4, hidden_size), jnp.int32
+            ),
+            compiler_params=compiler_params,
+            scratch_types=[
+                pltpu.VMEM((16,), jnp.int32),
+                pltpu.VMEM((16,), jnp.int32),
+                pltpu.VMEM((slot_rows,), jnp.int32),
+                pltpu.VMEM((slot_rows, token_cols // 4), jnp.int32),
+                pltpu.VMEM((slot_rows, hidden_size - token_cols), jnp.int32),
+                pltpu.VMEM((slot_rows // 4, hidden_size), jnp.int32),
+                pltpu.SemaphoreType.DMA((6,)),
+            ],
+            mesh=vector_mesh,
+            name="sc_ragged_gather_v2",
+        )(start, end, x, indices)[: out_size // 4]
     return core_map_helper.kernel(
         functools.partial(
             main_kernel_v2,
@@ -373,11 +662,7 @@ def ragged_gather_v2(
             ((out_size + out_pad_size) // out_packing, aligned_hidden_size),
             jnp.int32 if packed_out else dtype,
         ),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=True,
-            needs_layout_passes=True,
-            disable_bounds_checks=True,
-        ),
+        compiler_params=compiler_params,
         scratch_types=[
             pltpu.VMEM((16,), jnp.int32),
             pltpu.VMEM((16,), jnp.int32),
