@@ -912,6 +912,9 @@ class TPUModelRunner(GPUModelRunner):
         # Whether the lm_head is sharded over DP (TPU_DP_VOCAB_PARALLEL); set at
         # model load.
         self._dp_vocab_logits = False
+        # The slice's batch composition for the phased profiler, set by
+        # _dp_coordinated_step under DP lockstep with phased profiling on.
+        self._dp_step_profile_stats: dict[str, Any] | None = None
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
         self._dp_step_has_encoder_inputs = False
@@ -1237,6 +1240,12 @@ class TPUModelRunner(GPUModelRunner):
                 runner_utils.PHASED_PROFILER_TRACK_CONCURRENCY_KEY, False
             )
         )
+        capture_ranks = [
+            int(r)
+            for r in runner_utils.config_list(
+                additional_config.get(runner_utils.PHASED_PROFILER_RANKS_KEY)
+            )
+        ]
         # Same scoping as the standard profiler: the prefix names the run, and
         # the per-phase subdirectories sit beneath it.
 
@@ -1267,6 +1276,7 @@ class TPUModelRunner(GPUModelRunner):
             only_phases=only_phases,
             target_concurrencies=target_concurrencies,
             track_concurrency=track_concurrency,
+            capture_ranks=capture_ranks,
         )
 
     def stop_phased_profiling(self) -> None:
@@ -4009,9 +4019,16 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         local_any_decode: bool = False,
+        profile_stats: dict[str, Any] | None = None,
     ) -> "tuple[int | None, int]":
-        """Return the DP-wide padded token bucket and forward chunk count."""
+        """Return the DP-wide padded token bucket and forward chunk count.
+
+        With phased profiling configured, the same all-reduce carries this
+        rank's batch composition (`profile_stats`, None on an idle rank), and
+        the slice's lands in `_dp_step_profile_stats` for the profiler.
+        """
         self._dp_step_other_decode = False
+        self._dp_step_profile_stats = None
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
@@ -4022,20 +4039,23 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
-        t = torch.tensor(
-            [
-                int(local_num_tokens),
-                int(local_num_chunks),
-                int(local_num_reqs),
-                int(has_encoder_inputs),
-                # The highest and the lowest decoding rank, so each rank can
-                # tell under a MAX reduction whether another one decodes.
-                int(local_any_decode) * (dp_rank + 1),
-                int(local_any_decode) * (dp_size - dp_rank),
-            ],
-            dtype=torch.int64,
-            device="cpu",
-        )
+        values = [
+            int(local_num_tokens),
+            int(local_num_chunks),
+            int(local_num_reqs),
+            int(has_encoder_inputs),
+            # The highest and the lowest decoding rank, so each rank can
+            # tell under a MAX reduction whether another one decodes.
+            int(local_any_decode) * (dp_rank + 1),
+            int(local_any_decode) * (dp_size - dp_rank),
+        ]
+        # Keyed on configuration, not on whether the profiler is armed, so
+        # every rank sends the same length on every step.
+        if self.phased_profiling_dir:
+            values += runner_utils.encode_dp_profile_stats(
+                profile_stats, armed=self.phase_based_profiler is not None
+            )
+        t = torch.tensor(values, dtype=torch.int64, device="cpu")
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=dp_group.cpu_group
         )
@@ -4050,6 +4070,12 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_other_decode = highest >= 0 and (
             highest != lowest or highest != dp_rank
         )
+        if self.phased_profiling_dir:
+            self._dp_step_profile_stats = {
+                **runner_utils.decode_dp_profile_stats(t[6:].tolist()),
+                "dp_num_tokens_max": int(t[0].item()),
+                "dp_padded_num_tokens": bucket,
+            }
         return bucket, int(t[1].item())
 
     def _any_decode(self, scheduler_output: "SchedulerOutput") -> bool:
@@ -4209,12 +4235,29 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output
         )
+        # The batch composition (prefill vs decode) for phased profiling, taken
+        # before the DP all-reduce, which carries it to the other ranks.
+        local_profile_stats = None
+        if self.phase_based_profiler:
+            self.batch_counter += 1
+            padded_total_tokens = _get_padded_token_len(
+                self.num_tokens_paddings, scheduler_output.total_num_scheduled_tokens
+            )
+            local_profile_stats = runner_utils.get_batch_composition_stats(
+                batch_id=self.batch_counter,
+                input_batch=self.input_batch,
+                total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                num_reqs=self.input_batch.num_reqs,
+                padded_total_num_scheduled_tokens=padded_total_tokens,
+                scheduler_output=scheduler_output,
+            )
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
             local_num_chunks,
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             local_any_decode=self._any_decode(scheduler_output),
+            profile_stats=local_profile_stats,
         )
         self._dp_step_num_chunks = target_num_chunks
         readmitted = self._readmit_trimmed_drafts(
@@ -4242,22 +4285,14 @@ class TPUModelRunner(GPUModelRunner):
                 if has_encoder_inputs:
                     synchronize_tensors()
 
-        # Profile the current batch composition (prefill vs decode) if phased profiling
-        # is enabled.
-        batch_composition_stats = None
-        if self.phase_based_profiler:
-            self.batch_counter += 1
-            padded_total_tokens = _get_padded_token_len(
-                self.num_tokens_paddings, scheduler_output.total_num_scheduled_tokens
-            )
-            batch_composition_stats = runner_utils.get_batch_composition_stats(
-                batch_id=self.batch_counter,
-                input_batch=self.input_batch,
-                total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
-                num_reqs=self.input_batch.num_reqs,
-                padded_total_num_scheduled_tokens=padded_total_tokens,
-                scheduler_output=scheduler_output,
-            )
+        # Step the phased profiler on the batch composition: under DP lockstep
+        # the slice's, since every rank runs the DP-wide padded step.
+        batch_composition_stats = local_profile_stats
+        if self.phase_based_profiler and local_profile_stats is not None:
+            if self._dp_step_profile_stats is not None:
+                batch_composition_stats = runner_utils.merge_dp_profile_stats(
+                    local_profile_stats, self._dp_step_profile_stats
+                )
             self.phase_based_profiler.step(batch_composition_stats)
 
         # Gather mm embeddings AFTER reordering so the mask order matches the
