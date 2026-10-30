@@ -13,7 +13,8 @@ A warmed qwen4_exp worker holds ~35 GiB more host memory than before compile
 
 ``VLLM_TPU_POST_WARMUP_HOSTMEM=report`` logs it once warmup is done;
 ``drop`` also removes the ``.serialize`` attributes, collects and returns the
-freed pages, then logs it again. Off by default.
+freed pages, then logs it again. ``release`` only collects and returns
+tcmalloc's free pages, with no census. Off by default.
 """
 
 import ctypes
@@ -187,16 +188,35 @@ def _release_heap() -> None:
         process.malloc_trim(0)
 
 
+def _release() -> None:
+    """Return tcmalloc's free page heap (~6 GiB/worker after warmup) to the
+    OS. No census, so it costs about a second."""
+    start = time.perf_counter()
+    before = _status()
+    collected = gc.collect()
+    _release_heap()
+    logger.info(
+        "[hostmem] release: gc (%d) + release, %.1f s: %s -> %s",
+        collected,
+        time.perf_counter() - start,
+        before,
+        _status(),
+    )
+
+
 def report_and_maybe_drop() -> None:
     """Called at the end of compile_or_warm_up_model, before the GC freeze.
 
     Diagnostic only: a failure is logged and never takes the worker down.
     """
     mode = envs.VLLM_TPU_POST_WARMUP_HOSTMEM
-    if mode not in ("report", "drop", "clearjax"):
+    if mode not in ("release", "report", "drop", "clearjax"):
         return
     try:
-        _report_and_maybe_drop(mode)
+        if mode == "release":
+            _release()
+        else:
+            _report_and_maybe_drop(mode)
     except Exception:
         logger.exception("[hostmem] report failed; continuing")
 
