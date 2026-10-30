@@ -44,6 +44,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel import MegakernelLayoutError
 from vllm_torchtpu.megakernel import runtime as _rt
 from vllm_torchtpu.megakernel.runtime.contract import (
+    DOMAIN_TP,
     PARALLELISM_UNSUPPORTED,
     REQUIRES_KEYS,
     REQUIRES_UNMET,
@@ -310,6 +311,17 @@ def _tp_cpu_group() -> Any:
     return tp_group.cpu_group
 
 
+def agreement_group(domain: str, runner: Any) -> Any:
+    """The CPU process group a spec's agreements run over for its
+    `collective_domain` (`None` on a single rank): the ranks its kernel
+    communicates with. Only "tp" (the TP group) resolves today;
+    `check_spec` declines the other domains before any collective."""
+    del runner
+    if domain == DOMAIN_TP:
+        return _tp_cpu_group()
+    raise MegakernelPluginError(f"collective_domain {domain!r} has no agreement group")
+
+
 def _all_reduce_max(t: torch.Tensor, group: Any) -> None:
     torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=group)
 
@@ -388,17 +400,19 @@ class DeclinedDriver:
         display_name: str = "megakernel",
         stats_period_s: float = 60.0,
         codes: Sequence[str] = DECLINE_VOTE_CODES,
+        domain: str = DOMAIN_TP,
     ) -> None:
         self.decline = result
         self.tp_rank, self._display_name = int(tp_rank), display_name
         self._codes = tuple(codes)
+        self._domain = domain
         self.step_mix_tracker = _rt.StepMixTracker(period_s=float(stats_period_s))
         self._step_key = f"stock_{result.code}"
 
     def bind_and_warmup(self, runner: Any) -> None:
-        del runner
         # Join the bind-time agreement the serving drivers on other ranks run.
-        agree_on_decline(self.decline, codes=self._codes)
+        group = agreement_group(self._domain, runner)
+        agree_on_decline(self.decline, group=group, codes=self._codes)
         logger.warning(
             "%s megakernel declined (%s): %s",
             self._display_name,
@@ -656,7 +670,8 @@ def check_spec(
     runner: Any, spec: Any, *, view: RunnerView
 ) -> _rt.EligibilityResult | None:
     """Enforce a spec's declarative fields before `create`: `chips`,
-    `tp_sizes`, `parallelism`, `features`, then `requires`. Returns the first
+    `tp_sizes`, `collective_domain`, `parallelism`, `features`, then
+    `requires`. Returns the first
     named decline (`None` if all pass). Reads config and local device facts
     only, identical on every rank: no collective."""
     tp_size = view.tp_size
@@ -677,6 +692,13 @@ def check_spec(
             f"{tp_size}; skipping."
         )
         return _rt.EligibilityResult(False, UNSUPPORTED_TP_SIZE, msg)
+    domain = spec.collective_domain
+    if domain != DOMAIN_TP:
+        return _decline(
+            f"{PARALLELISM_UNSUPPORTED}:{domain}",
+            f"agrees across the TP group only: collective_domain {domain!r} "
+            "is unsupported",
+        )
     for kind in detect_parallelism(runner, tp_size):
         if kind not in spec.parallelism:
             return _decline(
@@ -854,11 +876,14 @@ def _check_create_result(out: Any, ref: Any) -> _rt.EligibilityResult | None:
     return None
 
 
-def _vote_startup_failure(token: int, codes: Sequence[str]) -> None:
+def _vote_startup_failure(
+    token: int, codes: Sequence[str], domain: str, runner: Any
+) -> None:
     """Join agreement #1 as `create_error` from a rank that is about to raise."""
     try:
         agree_on_decline(
             _rt.EligibilityResult(False, "create_error", "startup failed"),
+            group=agreement_group(domain, runner),
             token=token,
             mismatch_code="plugin_mismatch",
             codes=codes,
@@ -893,8 +918,10 @@ class ProgramDriver:
         codes: Sequence[str] = DECLINE_VOTE_CODES,
         backbone: Any = None,
         text_embeds: bool = False,
+        domain: str = DOMAIN_TP,
     ) -> None:
         self.program, self.view = program, view
+        self._domain = domain
         # The runner embeds text tokens for a multimodal-capable model that
         # can't receive multimodal inputs here (see `_text_ctx`).
         self._text_embeds = bool(text_embeds)
@@ -940,7 +967,7 @@ class ProgramDriver:
         ref, options = resolved
         # Until the fingerprint exists, a failing rank votes with token 0: it
         # can't match the peers' token, so they decline with plugin_mismatch.
-        token, codes = 0, vote_codes()
+        token, codes, domain = 0, vote_codes(), DOMAIN_TP
         mesh: Any = None
         try:
             plugin, module = import_plugin(ref)
@@ -970,6 +997,8 @@ class ProgramDriver:
             if el is not None:
                 cls._log_startup_ineligible(el)
                 return None
+            domain = plugin.collective_domain
+            group = agreement_group(domain, runner)
             create = resolve_callable(plugin.create, module, what="create")
             tp_rank = _local_tp_rank()
             view = RunnerView(runner, tp_rank=tp_rank)
@@ -988,11 +1017,15 @@ class ProgramDriver:
                     )
                     decline = None if el_mesh.eligible else el_mesh
         except BaseException:
-            _vote_startup_failure(token, codes)
+            _vote_startup_failure(token, codes, domain, runner)
             raise
         # Agreement #1: the first collective; it also compares fingerprints.
         decline = agree_on_decline(
-            decline, token=token, mismatch_code="plugin_mismatch", codes=codes
+            decline,
+            group=group,
+            token=token,
+            mismatch_code="plugin_mismatch",
+            codes=codes,
         )
         name = str(getattr(out, "display_name", "") or plugin.name)
         if decline is not None:
@@ -1003,6 +1036,7 @@ class ProgramDriver:
                 display_name=name,
                 stats_period_s=float(cfg.stats_period_s),
                 codes=codes,
+                domain=domain,
             )
         out.load(mesh)
         return cls(
@@ -1016,6 +1050,7 @@ class ProgramDriver:
             backbone=_runner_backbone(runner),
             text_embeds=bool(getattr(runner, "supports_mm_inputs", False))
             and not _multimodal_inputs_possible(runner),
+            domain=domain,
         )
 
     @staticmethod
@@ -1102,13 +1137,17 @@ class ProgramDriver:
                 # instead of waiting in the agreement.
                 agree_on_decline(
                     _rt.EligibilityResult(False, "bind_error", "bind failed"),
+                    group=agreement_group(self._domain, runner),
                     codes=self._codes,
                 )
                 raise
             token = None
             if decline is None:
                 token = buckets_token(list(self._steps), salt=self.fingerprint)
-            decline = agree_on_decline(decline, token=token, codes=self._codes)
+            group = agreement_group(self._domain, runner)
+            decline = agree_on_decline(
+                decline, group=group, token=token, codes=self._codes
+            )
             if decline is not None:
                 detach = getattr(self.program, "detach_draft", None)
                 if callable(detach):
@@ -1126,6 +1165,7 @@ class ProgramDriver:
                         display_name=self._display_name,
                         stats_period_s=self.step_mix_tracker.period_s,
                         codes=self._codes,
+                        domain=self._domain,
                     )
                 return
             self.warmup(runner)

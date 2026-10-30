@@ -684,6 +684,7 @@ def test_features_before_requires() -> None:
         ({"parallelism": {"tp", "sp"}}, "unknown parallelism"),
         ({"parallelism": {"ep_in_tp"}}, "must include 'tp'"),
         ({"features": {"telepathy"}}, "unknown features"),
+        ({"collective_domain": "dp"}, "collective_domain='dp'"),
     ],
 )
 def test_invalid_spec_fields_raise(kw: dict[str, Any], match: str) -> None:
@@ -753,6 +754,80 @@ def test_numerics_is_logged_and_fingerprinted(
     exact = fp.plugin_fingerprint(plugin=_spec(), raw_env="", **doc)
     approx = fp.plugin_fingerprint(plugin=_spec(numerics="approx"), raw_env="", **doc)
     assert exact != approx
+
+
+# --- collective_domain ------------------------------------------------------
+
+
+def _record_agreements(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[Any]]:
+    """Resolve every domain to a sentinel group; record the domains asked for
+    and the group each all-reduce runs over."""
+    group, log = object(), []
+
+    def resolve(domain: str, runner: Any) -> Any:
+        log.append(("resolve", domain))
+        return group
+
+    def all_reduce_max(t: torch.Tensor, g: Any) -> None:
+        log.append(("all_reduce", g))
+
+    monkeypatch.setattr(driver_mod, "agreement_group", resolve)
+    monkeypatch.setattr(driver_mod, "_all_reduce_max", all_reduce_max)
+    monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: None)
+    return group, log
+
+
+@pytest.mark.parametrize("options", [{}, {"decline": True}])
+def test_agreements_run_over_the_declared_domain_group(
+    toy: Path, monkeypatch: pytest.MonkeyPatch, options: dict[str, Any]
+) -> None:
+    """Agreement #1 and the bind agreement (serving or declined driver) use
+    the group `agreement_group` resolves for the spec's domain."""
+    group, log = _record_agreements(monkeypatch)
+    runner = _runner(options)
+    drv = driver_mod.ProgramDriver.maybe_create(runner)
+    assert drv.serving is not options.get("decline", False)
+    runner._megakernel = drv
+    drv.bind_and_warmup(runner)
+    assert log == [("resolve", "tp"), ("all_reduce", group)] * 2
+
+
+def test_agreement_group_resolves_the_tp_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    tp = object()
+    monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: tp)
+    assert driver_mod.agreement_group("tp", None) is tp
+    for domain in ("tp_x_dcp", "kernel_mesh"):
+        with pytest.raises(driver_mod.MegakernelPluginError, match=domain):
+            driver_mod.agreement_group(domain, None)
+
+
+@pytest.mark.parametrize("domain", ["tp_x_dcp", "kernel_mesh"])
+def test_unsupported_collective_domain_declines_before_any_collective(
+    toy: Path, monkeypatch: pytest.MonkeyPatch, domain: str
+) -> None:
+    res = _check(testing.fake_runner(), collective_domain=domain)
+    assert res is not None and res.code == f"parallelism_unsupported:{domain}"
+    assert _check(testing.fake_runner(), collective_domain="tp") is None
+    src = toy.read_text("utf-8").replace(
+        'decline_codes=("toy_declined",)',
+        f'decline_codes=("toy_declined",), collective_domain="{domain}"',
+    )
+    toy.write_text(src, encoding="utf-8")
+    _forbid_create_and_collectives(monkeypatch)
+
+    def no_group(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("must decline before resolving an agreement group")
+
+    monkeypatch.setattr(driver_mod, "agreement_group", no_group)
+    monkeypatch.setattr(driver_mod, "_tp_cpu_group", no_group)
+    assert driver_mod.ProgramDriver.maybe_create(_runner()) is None
+
+
+def test_collective_domain_is_fingerprinted() -> None:
+    doc = {"module": "m", "attr": "SPEC", "source_hash": "s", "config": {}}
+    tp = fp.plugin_fingerprint(plugin=_spec(), raw_env="", **doc)
+    mesh = _spec(collective_domain="kernel_mesh")
+    assert fp.plugin_fingerprint(plugin=mesh, raw_env="", **doc) != tp
 
 
 def test_weight_update_guard() -> None:

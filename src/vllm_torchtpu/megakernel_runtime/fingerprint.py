@@ -184,6 +184,7 @@ def plugin_fingerprint(
         "features": sorted(plugin.features),
         "requires": dict(sorted(plugin.requires.items())),
         "numerics": plugin.numerics,
+        "collective_domain": plugin.collective_domain,
         "decline_codes": list(plugin.decline_codes),
         "config": dict(config),
         "raw_env": raw_env,

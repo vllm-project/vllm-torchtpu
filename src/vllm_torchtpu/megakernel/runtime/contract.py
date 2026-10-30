@@ -92,6 +92,17 @@ REQUIRES_KEYS: Mapping[str, str] = {
 
 NUMERICS: frozenset[str] = frozenset({"exact", "approx"})
 
+# --- Collective domains: the group of ranks a spec's kernel communicates
+# across, which is the group the runtime's startup / bind agreements must
+# span. Only "tp" (the TP group) is served today; the others decline at
+# startup with `parallelism_unsupported:<domain>`.
+DOMAIN_TP = "tp"
+DOMAIN_TP_X_DCP = "tp_x_dcp"
+DOMAIN_KERNEL_MESH = "kernel_mesh"
+COLLECTIVE_DOMAINS: frozenset[str] = frozenset(
+    {DOMAIN_TP, DOMAIN_TP_X_DCP, DOMAIN_KERNEL_MESH}
+)
+
 # --- Decline codes the runtime itself can produce.
 UNSUPPORTED_TPU_CHIP = "unsupported_tpu_chip"
 UNSUPPORTED_TP_SIZE = "unsupported_tp_size"
@@ -249,6 +260,8 @@ class TpuMonoSpec:
     `features` (framework features served) and `requires` (server settings,
     keys from `REQUIRES_KEYS`). `numerics` ("exact" | "approx", of the
     default profile) is logged and part of the fingerprint, not a gate.
+    `collective_domain` names the ranks the kernel's collectives span (see
+    `COLLECTIVE_DOMAINS`); the runtime's agreements run over that group.
     """
 
     name: str
@@ -260,6 +273,7 @@ class TpuMonoSpec:
     features: frozenset[str] = frozenset()
     requires: Mapping[str, str] = dataclasses.field(default_factory=dict)
     numerics: str = "exact"
+    collective_domain: str = DOMAIN_TP
     layout_request: str | Callable[..., Any] | None = None
     decline_codes: tuple[str, ...] = ()
     source_root: str | None = None
@@ -298,10 +312,16 @@ class TpuMonoSpec:
                 f"{where}: numerics={self.numerics!r}; expected one of "
                 f"{sorted(NUMERICS)}"
             )
+        if self.collective_domain not in COLLECTIVE_DOMAINS:
+            raise MegakernelConfigError(
+                f"{where}: collective_domain={self.collective_domain!r}; "
+                f"expected one of {sorted(COLLECTIVE_DOMAINS)}"
+            )
 
 
 __all__ = [
     "API_VERSION",
+    "COLLECTIVE_DOMAINS",
     "FEATURES",
     "NUMERICS",
     "PARALLELISM",
