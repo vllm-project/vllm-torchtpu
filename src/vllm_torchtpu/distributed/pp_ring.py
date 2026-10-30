@@ -345,6 +345,7 @@ class PPRing:
                     for i, x in enumerate(sent)
                 ]
                 for work in works:
+                    assert work is not None
                     work.wait()
             got = [_first_and_last(x) for x in received]
         except Exception as exc:
@@ -573,6 +574,7 @@ class PPRing:
                 for i, x in enumerate(outgoing)
             ]
             for work in works:
+                assert work is not None
                 work.wait()
 
     def _send_loop(self) -> None:
