@@ -501,6 +501,7 @@ def test_draft_loads_every_checkpoint_mtp_tensor(monkeypatch):
         additional_config={},
         quant_config=NS(ignored_layers=["mtp.layers.0.mlp.gate"]),
         speculative_config=spec_config(3),
+        scheduler_config=NS(max_num_seqs=8, max_num_batched_tokens=256),
     )
     monkeypatch.setattr(model, "use_unified_pool", lambda: True)
     with torch.device("cpu"):
@@ -638,6 +639,7 @@ def test_draft_rows_match_all_token_step_at_those_rows(monkeypatch):
         additional_config={},
         quant_config=None,
         speculative_config=spec_config(3),
+        scheduler_config=NS(max_num_seqs=8, max_num_batched_tokens=256),
     )
     monkeypatch.setattr(model, "use_unified_pool", lambda: True)
     torch.manual_seed(0)
@@ -649,7 +651,7 @@ def test_draft_rows_match_all_token_step_at_those_rows(monkeypatch):
     attention = draft.model.layers[0].self_attn
     attended = []
 
-    def forward_with_indices(hidden, positions, metadata, rows=None, reduce=True):
+    def forward_with_indices(hidden, positions, metadata, rows=None, reduce=True, **_):
         attended.append((len(hidden), None if rows is None else rows.tolist()))
         output = torch.sin(hidden.float() * 3 + positions[:, None].float() / 7)
         output = output.to(hidden.dtype)
