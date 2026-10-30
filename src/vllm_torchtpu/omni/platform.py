@@ -14,6 +14,7 @@
 """TPU platform plugin for vllm-omni."""
 
 import os
+from collections.abc import Sequence
 
 import torch
 from torch_tpu._internal.utils import hardware
@@ -25,6 +26,123 @@ from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
+
+_BASE_TPU_RUNTIME_METRICS_PORT = 8431
+
+# Multi-worker PjRt and torch.distributed bootstrap variables that must never
+# leak across stage subprocess spawns.
+_DISTRIBUTED_BOOTSTRAP_ENV_VARS: tuple[str, ...] = (
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "RANK",
+    "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+    "TORCH_TPU_TOPOLOGY",
+    "WORLD_SIZE",
+)
+
+# Complete set of TPU and distributed environment variables snapshotted before
+# mutating os.environ for a stage subprocess spawn and restored afterward.
+_MANAGED_SPAWN_ENV_VARS: tuple[str, ...] = (
+    *_DISTRIBUTED_BOOTSTRAP_ENV_VARS,
+    "ALLOW_MULTIPLE_LIBTPU_LOAD",
+    "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    "TORCH_TPU_XPROF_SESSION_ID",
+    "TPU_RUNTIME_METRICS_PORTS",
+    "TPU_VISIBLE_CHIPS",
+    "TPU_VISIBLE_DEVICES",
+)
+
+
+def _parse_single_chip_id(token: str, raw_devices: str | int) -> int:
+    """Validate and parse one comma-delimited TPU chip ID token."""
+    if not token:
+        raise ValueError(
+            f"Invalid TPU visible devices specification: {raw_devices!r}. "
+            "Empty chip ID entry is not allowed."
+        )
+    try:
+        chip_id = int(token)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid TPU visible devices specification: {raw_devices!r}. "
+            f"Chip ID {token!r} is not an integer."
+        ) from exc
+    if chip_id < 0:
+        raise ValueError(
+            f"Invalid TPU visible devices specification: {raw_devices!r}. "
+            f"Chip ID {chip_id} must be non-negative."
+        )
+    return chip_id
+
+
+def _parse_visible_chip_ids(devices: str | int | None) -> list[int]:
+    """Parse comma-separated non-negative TPU chip IDs for stage pinning.
+
+    Args:
+        devices: Comma-separated chip IDs (e.g. ``"0"`` or ``"2,3"``), a single
+            non-negative integer chip ID, or ``None``/whitespace-only string.
+
+    Returns:
+        Ordered list of unique non-negative physical TPU chip IDs, or ``[]``
+        when ``devices`` is ``None`` or empty.
+
+    Raises:
+        ValueError: If ``devices`` is a boolean or contains empty, non-integer,
+            negative, duplicate, or non-contiguous multi-chip IDs.
+    """
+    if isinstance(devices, bool):
+        raise ValueError(
+            f"Invalid TPU visible devices specification: {devices!r}. "
+            "Expected comma-separated non-negative integer chip IDs."
+        )
+    if devices is None:
+        return []
+    raw = str(devices).strip()
+    if not raw:
+        return []
+
+    chip_ids: list[int] = []
+    seen: set[int] = set()
+    for part in raw.split(","):
+        chip_id = _parse_single_chip_id(part.strip(), devices)
+        if chip_id in seen:
+            raise ValueError(
+                f"Invalid TPU visible devices specification: {devices!r}. "
+                f"Duplicate chip ID {chip_id} is not allowed."
+            )
+        seen.add(chip_id)
+        chip_ids.append(chip_id)
+    if len(chip_ids) > 1 and not _are_chip_ids_contiguous(chip_ids):
+        raise ValueError(
+            f"Invalid TPU visible devices specification: {devices!r}. "
+            "Multi-chip TPU stages require contiguous ascending chip IDs "
+            "(e.g. '0,1' or '2,3')."
+        )
+    return chip_ids
+
+
+def _format_chip_id_list(chip_ids: Sequence[int]) -> str:
+    """Format physical TPU chip IDs as a canonical comma-separated string."""
+    return ",".join(str(chip_id) for chip_id in chip_ids)
+
+
+def _format_runtime_metrics_ports(chip_ids: Sequence[int]) -> str:
+    """Assign disjoint libtpu Runtime Metric Service ports per physical chip.
+
+    When TPU_RUNTIME_METRICS_PORTS is unset, libtpu queries GCE TPU VM metadata
+    (8431,8432,...) and indexes by local slice rank, causing independent stages
+    on the same host to collide on local rank 0's port 8431.
+    """
+    return ",".join(
+        str(_BASE_TPU_RUNTIME_METRICS_PORT + chip_id) for chip_id in chip_ids
+    )
+
+
+def _are_chip_ids_contiguous(chip_ids: Sequence[int]) -> bool:
+    """Return True when chip_ids form a contiguous ascending integer slice."""
+    return list(chip_ids) == list(range(chip_ids[0], chip_ids[0] + len(chip_ids)))
 
 
 class OmniTpuPlatform(OmniPlatform, TpuPlatform):
@@ -38,6 +156,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     # Diffusion worker world size recorded by set_device (see dist_backend).
     _worker_world_size: int = 1
+    _saved_spawn_env: dict[str, str | None] | None = None
 
     @property
     def dist_backend(self) -> str:
@@ -97,6 +216,126 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     @classmethod
     def supports_talker_mtp_graph_capture(cls) -> bool:
         return False
+
+    @classmethod
+    def set_device_control_env_var(cls, devices: str | int | None) -> None:
+        """Configure TPU device-isolation env vars before spawning a stage.
+
+        Args:
+            devices: Comma-separated physical TPU chip IDs (e.g. ``"0"`` or
+                ``"2,3"``), a single integer chip ID, or ``None``/``""`` to
+                clear visible chips.
+
+        Raises:
+            ValueError: If ``devices`` contains invalid, duplicate, or
+                non-contiguous multi-chip IDs.
+        """
+        chip_ids = _parse_visible_chip_ids(devices)
+        if cls._is_parent_spawn_env_restore(devices):
+            cls._restore_spawn_env()
+            return
+
+        cls._save_spawn_env_if_needed()
+        cls._clear_distributed_bootstrap_env()
+        if not chip_ids:
+            cls._clear_visible_chips_env()
+            return
+
+        cls._configure_stage_runtime_env(chip_ids)
+        if len(chip_ids) == 1:
+            cls._pin_single_chip_env(chip_ids[0])
+        else:
+            cls._pin_multi_chip_env(chip_ids)
+
+    @classmethod
+    def unset_device_control_env_var(cls) -> None:
+        """Restore parent TPU env vars after spawning a stage subprocess."""
+        cls._restore_spawn_env()
+        os.environ.pop(cls.device_control_env_var, None)
+
+    @classmethod
+    def _is_parent_spawn_env_restore(cls, devices: str | int | None) -> bool:
+        """Return True when scoped_spawn_device_env restores pre-set parent chips."""
+        if cls._saved_spawn_env is None or not isinstance(devices, str):
+            return False
+        saved_chips = cls._saved_spawn_env.get(cls.device_control_env_var)
+        return saved_chips is not None and devices == saved_chips
+
+    @classmethod
+    def _save_spawn_env_if_needed(cls) -> None:
+        """Snapshot parent TPU env vars once before mutating os.environ."""
+        if cls._saved_spawn_env is not None:
+            return
+        snapshot = dict(os.environ)
+        cls._saved_spawn_env = {
+            key: snapshot.get(key) for key in _MANAGED_SPAWN_ENV_VARS
+        }
+
+    @classmethod
+    def _restore_spawn_env(cls) -> None:
+        """Restore os.environ from _saved_spawn_env and clear the snapshot."""
+        saved = cls._saved_spawn_env
+        cls._saved_spawn_env = None
+        if saved is None:
+            return
+        for key, previous in saved.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+    @staticmethod
+    def _clear_distributed_bootstrap_env() -> None:
+        """Clear inherited multi-worker PjRt and torch.distributed env vars."""
+        for key in _DISTRIBUTED_BOOTSTRAP_ENV_VARS:
+            os.environ.pop(key, None)
+
+    @classmethod
+    def _clear_visible_chips_env(cls) -> None:
+        """Clear TPU chip visibility, metrics ports, and rank-binding env vars."""
+        os.environ[cls.device_control_env_var] = ""
+        os.environ["TPU_VISIBLE_DEVICES"] = ""
+        os.environ["TPU_RUNTIME_METRICS_PORTS"] = ""
+        os.environ.pop("DEBUG_TPU_LOCAL_RANK_OFFSET", None)
+
+    @classmethod
+    def _configure_stage_runtime_env(cls, chip_ids: Sequence[int]) -> None:
+        """Set common libtpu isolation env vars shared by 1-chip and TP stages."""
+        os.environ[cls.device_control_env_var] = _format_chip_id_list(chip_ids)
+        os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
+        os.environ["TPU_RUNTIME_METRICS_PORTS"] = _format_runtime_metrics_ports(
+            chip_ids
+        )
+
+    @staticmethod
+    def _pin_single_chip_env(chip_id: int) -> None:
+        """Pin a single-worker stage to one physical TPU chip."""
+        os.environ["TPU_VISIBLE_DEVICES"] = str(chip_id)
+        os.environ.pop("DEBUG_TPU_LOCAL_RANK_OFFSET", None)
+
+    @classmethod
+    def _pin_multi_chip_env(cls, chip_ids: Sequence[int]) -> None:
+        """Pin a multi-worker LLM stage to a contiguous TPU chip slice.
+
+        StageRuntime._prepare_stage_plans() builds VllmConfig for all stages
+        sequentially in the parent orchestrator before spawning any stage
+        EngineCoreProc, so earlier stages' bootstrap env vars in os.environ are
+        overwritten by later stages. Re-running _prepare_singlehost_tpu_env at
+        spawn time gives this multi-chip stage fresh MASTER_PORT,
+        TORCH_TPU_SLICEBUILDER_ADDRESSES, and TORCH_TPU_TOPOLOGY without
+        initializing libtpu or opening VFIO devices in the parent. When no
+        physical TPU PCI devices are attached (e.g. CPU-only unit test hosts),
+        device_count() == 0 skips hardware.get_tpu_topology(), which otherwise
+        raises ValueError("No TPU devices found.").
+        """
+        # Never set TPU_VISIBLE_DEVICES to a multi-chip list: torch_tpu falls
+        # back to LOCAL_RANK when TPU_VISIBLE_DEVICES is not a single integer,
+        # and TPUWorker.init_device offsets LOCAL_RANK by
+        # DEBUG_TPU_LOCAL_RANK_OFFSET.
+        os.environ.pop("TPU_VISIBLE_DEVICES", None)
+        os.environ["DEBUG_TPU_LOCAL_RANK_OFFSET"] = str(chip_ids[0])
+        if cls.device_count() > 0:
+            cls._prepare_singlehost_tpu_env(len(chip_ids))
 
     @classmethod
     def set_device(cls, device: torch.device | int) -> None:
