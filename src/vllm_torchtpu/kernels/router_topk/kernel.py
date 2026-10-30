@@ -26,6 +26,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -139,60 +140,72 @@ SWEEP_ROWS = 16
 SWEEP_UNROLL = 4
 
 
-def _softmax_select_kernel(x_ref, w_ref, i_ref, s_ref, *, topk: int, n: int):
+# Clamp floor of the fused kernel: NEG rounded to bf16, so that like every
+# bf16 logit it leaves the low 16 bits of its f32 pattern zero.
+NEG_BF16 = float(ml_dtypes.bfloat16(NEG))
+
+# Low bits of a fused-kernel sort key that carry the expert id.
+KEY_ID_BITS = 16
+
+
+def _flip(b: jax.Array) -> jax.Array:
+    """f32 bit pattern <-> int32 whose signed order is the float order.
+
+    Flips the magnitude bits of negatives; its own inverse."""
+    return b ^ ((b >> 31) & 0x7FFFFFFF)
+
+
+def _softmax_select_kernel(x_ref, w_ref, i_ref, k_ref, *, topk: int, n: int):
     """One block of tokens, expert-major: ``x_ref`` is ``[experts, tokens]``.
 
-    Each of the ``topk`` passes is one sweep over the experts in steps of
-    ``SWEEP_ROWS``, keeping per sublane the running maximum and the first
-    step that attained it, so the arg-max needs no second pass and no
-    cross-lane reduction; only the last ``SWEEP_ROWS``-row max/min crosses
-    sublanes. Strict ``>`` over ascending steps plus the lowest id among tied
-    sublanes keeps ``_select_kernel``'s rule: ties go to the lowest expert.
-    Pass ``j`` masks pass ``j - 1``'s pick while it sweeps; the clamped f32
-    scores live in ``s_ref`` between passes.
+    Every bf16 logit leaves the low ``KEY_ID_BITS`` of its f32 pattern zero,
+    so one int32 key per score holds the order-preserving value bits above
+    and ``n - 1 - id`` below: keys are unique, the largest key is the largest
+    logit and among equal logits the lowest expert id, so each pass is one
+    max per element. Pass 0 builds the keys into ``k_ref``; pass ``j`` takes
+    the largest key below pass ``j - 1``'s, so nothing is written back.
+    Only the final ``SWEEP_ROWS``-row max crosses sublanes.
     """
     tb = x_ref.shape[1]
-    masked = jnp.finfo(jnp.float32).min
+    low = (1 << KEY_ID_BITS) - 1
+    lowest = jnp.iinfo(jnp.int32).min
     sub = jax.lax.broadcasted_iota(jnp.int32, (SWEEP_ROWS, tb), 0)
-    idx_rel = None
-    for j in range(topk):
+    init = jnp.full((SWEEP_ROWS, tb), lowest, jnp.int32)
 
-        def step(v, carry, j=j, idx_rel=idx_rel):
-            best, bv = carry
+    def build(v, best):
+        r = pl.multiple_of(v * SWEEP_ROWS, SWEEP_ROWS)
+        x = x_ref[pl.ds(r, SWEEP_ROWS), :].astype(jnp.float32)
+        x = jnp.where(x > NEG_BF16, x, NEG_BF16)
+        # -0.0 would order below +0.0; the reference ties them.
+        x = jnp.where(x == 0.0, 0.0, x)
+        key = _flip(jax.lax.bitcast_convert_type(x, jnp.int32)) & ~low
+        key = key | (n - 1 - r - sub)
+        k_ref[pl.ds(r, SWEEP_ROWS), :] = key
+        return jnp.maximum(best, key)
+
+    best = jax.lax.fori_loop(0, n // SWEEP_ROWS, build, init, unroll=SWEEP_UNROLL)
+    keys = [jnp.max(best, axis=0, keepdims=True)]
+    for _ in range(1, topk):
+
+        def below(v, best, prev=keys[-1]):
             r = pl.multiple_of(v * SWEEP_ROWS, SWEEP_ROWS)
-            if j == 0:
-                x = x_ref[pl.ds(r, SWEEP_ROWS), :].astype(jnp.float32)
-                x = jnp.where(x > NEG, x, NEG)
-            else:
-                x = s_ref[pl.ds(r, SWEEP_ROWS), :]
-                x = jnp.where(idx_rel == r, masked, x)
-            if j < topk - 1:
-                s_ref[pl.ds(r, SWEEP_ROWS), :] = x
-            return jnp.maximum(best, x), jnp.where(x > best, v, bv)
+            key = k_ref[pl.ds(r, SWEEP_ROWS), :]
+            return jnp.maximum(best, jnp.where(key < prev, key, lowest))
 
-        best, bv = jax.lax.fori_loop(
-            0,
-            n // SWEEP_ROWS,
-            step,
-            (
-                jnp.full((SWEEP_ROWS, tb), masked, jnp.float32),
-                jnp.zeros((SWEEP_ROWS, tb), jnp.int32),
-            ),
-            unroll=SWEEP_UNROLL,
+        best = jax.lax.fori_loop(
+            0, n // SWEEP_ROWS, below, init, unroll=SWEEP_UNROLL
         )
-        m = jnp.max(best, axis=0, keepdims=True)
-        idx = jnp.min(
-            jnp.where(best == m, bv * SWEEP_ROWS + sub, n), axis=0, keepdims=True
-        )
-        w_ref[pl.ds(j, 1), :] = m
-        i_ref[pl.ds(j, 1), :] = idx
-        idx_rel = idx - sub
+        keys.append(jnp.max(best, axis=0, keepdims=True))
+    for j, key in enumerate(keys):
+        i_ref[pl.ds(j, 1), :] = n - 1 - (key & low)
+        bits = _flip(jnp.where(key < 0, key | low, key & ~low))
+        w_ref[pl.ds(j, 1), :] = jax.lax.bitcast_convert_type(bits, jnp.float32)
     # Softmax over the k selected logits: the full-row denominator cancels in
-    # the renormalization. A row with no logit above NEG stays NaN.
+    # the renormalization. A row with no logit above the floor stays NaN.
     w = w_ref[...]
     e = jnp.exp(w - w[:1])
     p = e / jnp.sum(e, axis=0, keepdims=True)
-    w_ref[...] = jnp.where(w[:1] <= NEG, jnp.nan, p)
+    w_ref[...] = jnp.where(w[:1] <= NEG_BF16, jnp.nan, p)
 
 
 def select_softmax(
@@ -201,7 +214,7 @@ def select_softmax(
     """Top-k experts of softmax(``logits``), weights renormalized over the k.
 
     Softmax is monotonic, so the experts are selected on the ``[rows,
-    experts]`` logits (any float dtype) and only the k selected are
+    experts]`` bf16 logits and only the k selected are
     exponentiated: the full-width softmax and its f32 copy of the scores are
     never materialized. Returns ``(weights f32, indices int32)`` of shape
     ``[rows, topk]``, weights descending and summing to 1.
@@ -211,8 +224,13 @@ def select_softmax(
     rather than a copy.
     """
     rows, n = logits.shape
-    if n % SWEEP_ROWS:
-        raise ValueError(f"expert count {n} is not a multiple of {SWEEP_ROWS}")
+    if logits.dtype != jnp.bfloat16:
+        raise ValueError(f"fused router top-k takes bf16 logits, got {logits.dtype}")
+    if n % SWEEP_ROWS or n > 1 << KEY_ID_BITS:
+        raise ValueError(
+            f"expert count {n} must be a multiple of {SWEEP_ROWS}, at most "
+            f"{1 << KEY_ID_BITS}"
+        )
     block = min(MAX_BLOCK_TOKENS, rows)
     w, i = pl.pallas_call(
         functools.partial(_softmax_select_kernel, topk=topk, n=n),
@@ -226,7 +244,7 @@ def select_softmax(
             jax.ShapeDtypeStruct((topk, rows), jnp.float32),
             jax.ShapeDtypeStruct((topk, rows), jnp.int32),
         ],
-        scratch_shapes=[pltpu.VMEM((n, block), jnp.float32)],
+        scratch_shapes=[pltpu.VMEM((n, block), jnp.int32)],
         interpret=interpret,
     )(logits.T)
     return w.T, i.T

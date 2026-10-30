@@ -309,6 +309,7 @@ def select_experts(
         and scoring_fn == "softmax"
         and renormalize
         and e_score_correction_bias is None
+        and router_logits.dtype == torch.bfloat16
     ):
         # Selects on the logits and renormalizes in-kernel: no full softmax.
         topk_weights, topk_ids = rowmax_select_softmax(router_logits, topk)
