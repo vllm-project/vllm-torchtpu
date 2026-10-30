@@ -118,6 +118,14 @@ _WAN_PATCHED_CLASSES = (
 # that installs a patch installs it for good. Tests that reinstall a patch
 # start from the functions captured here, at collection, before any test has
 # run.
+_UPSTREAM_FORWARDS = {
+    cls: cls.forward for cls in (*_QWEN_IMAGE_ROPES, *_WAN_PATCHED_CLASSES)
+}
+_UPSTREAM_EAGER_MODE = execution_mode.eager_mode
+_UPSTREAM_PACK_TENSOR_IF_LARGE = ipc._pack_tensor_if_large
+_UPSTREAM_RUN_STARTUP_WARMUP = DiffusionEngine.run_startup_warmup
+_UPSTREAM_WAN_ROPE_FORWARD = RotaryEmbeddingWan.forward
+_UPSTREAM_ASYNC_OUTPUT_LOOP = WorkerProc._async_output_loop
 _UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
 _UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
 _UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
@@ -184,10 +192,9 @@ def test_model_patches_skip_other_models(monkeypatch, model_class_name):
 def test_diffusion_model_load_patches_only_the_served_model(monkeypatch):
     monkeypatch.setattr(patch_registry, "_applied", set())
     monkeypatch.setattr(patch_registry, "_entered_stages", set())
-    qwen_forwards = [rope_cls.forward for rope_cls in _QWEN_IMAGE_ROPES]
-    for cls in (*_QWEN_IMAGE_ROPES, *_WAN_PATCHED_CLASSES):
-        monkeypatch.setattr(cls, "forward", cls.forward)
-    gelu_forward = ColumnParallelGELU.forward
+    for cls, forward in _UPSTREAM_FORWARDS.items():
+        monkeypatch.setattr(cls, "forward", forward)
+    gelu_forward = _UPSTREAM_FORWARDS[ColumnParallelGELU]
     with monkeypatch.context() as blocked:
         # Wan modules are unimportable here, so loading Qwen-Image only
         # succeeds if no Wan patch imports them.
@@ -197,8 +204,8 @@ def test_diffusion_model_load_patches_only_the_served_model(monkeypatch):
             None, _QWEN_IMAGE, torch.device("cpu")
         )
     assert all(
-        rope_cls.forward is not forward
-        for rope_cls, forward in zip(_QWEN_IMAGE_ROPES, qwen_forwards, strict=True)
+        rope_cls.forward is not _UPSTREAM_FORWARDS[rope_cls]
+        for rope_cls in _QWEN_IMAGE_ROPES
     )
     assert ColumnParallelGELU.forward is gelu_forward
 
@@ -231,7 +238,7 @@ def test_model_load_does_not_log_patched_pipeline(monkeypatch):
     monkeypatch.setattr(patch_registry, "_applied", set())
     monkeypatch.setattr(patch_registry, "_entered_stages", set())
     for rope_cls in _QWEN_IMAGE_ROPES:
-        monkeypatch.setattr(rope_cls, "forward", rope_cls.forward)
+        monkeypatch.setattr(rope_cls, "forward", _UPSTREAM_FORWARDS[rope_cls])
     info = MagicMock()
     monkeypatch.setattr(patches.logger, "info", info)
     OmniTpuPlatform.init_diffusion_model_runner_runtime(
@@ -248,13 +255,13 @@ def test_model_load_does_not_log_patched_pipeline(monkeypatch):
 
 def _isolate_diffusion_worker_patches(monkeypatch):
     monkeypatch.setattr(patch_registry, "_applied", set())
-    monkeypatch.setattr(execution_mode, "eager_mode", execution_mode.eager_mode)
-    monkeypatch.setattr(ipc, "_pack_tensor_if_large", ipc._pack_tensor_if_large)
+    monkeypatch.setattr(execution_mode, "eager_mode", _UPSTREAM_EAGER_MODE)
+    monkeypatch.setattr(ipc, "_pack_tensor_if_large", _UPSTREAM_PACK_TENSOR_IF_LARGE)
     monkeypatch.setattr(
-        DiffusionEngine, "run_startup_warmup", DiffusionEngine.run_startup_warmup
+        DiffusionEngine, "run_startup_warmup", _UPSTREAM_RUN_STARTUP_WARMUP
     )
-    monkeypatch.setattr(RotaryEmbeddingWan, "forward", RotaryEmbeddingWan.forward)
-    monkeypatch.setattr(WorkerProc, "_async_output_loop", WorkerProc._async_output_loop)
+    monkeypatch.setattr(RotaryEmbeddingWan, "forward", _UPSTREAM_WAN_ROPE_FORWARD)
+    monkeypatch.setattr(WorkerProc, "_async_output_loop", _UPSTREAM_ASYNC_OUTPUT_LOOP)
     monkeypatch.setattr(SDPAImpl, "forward", _UPSTREAM_SDPA_FORWARD)
 
 
@@ -348,7 +355,7 @@ def test_rope_pair_swap_matches_native():
 
 
 def test_rope_patch_installed(monkeypatch):
-    monkeypatch.setattr(RotaryEmbeddingWan, "forward", RotaryEmbeddingWan.forward)
+    monkeypatch.setattr(RotaryEmbeddingWan, "forward", _UPSTREAM_WAN_ROPE_FORWARD)
     _patch_wan_pair_swap_rope()
     assert RotaryEmbeddingWan.forward is rotary_embedding_wan_forward
     # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
@@ -619,10 +626,11 @@ def test_tpu_sdpa_attention_backend():
 )
 def test_qwen_image_rope_txt_freqs_clone(monkeypatch, rope_cls_name):
     for cls in _QWEN_IMAGE_ROPES:
-        monkeypatch.setattr(cls, "forward", cls.forward)
+        monkeypatch.setattr(cls, "forward", _UPSTREAM_FORWARDS[cls])
     rope_cls = getattr(qwen_image_transformer, rope_cls_name)
     _patch_qwen_image_rope_txt_freqs_clone(od_config=_QWEN_IMAGE)
     patched_forward = rope_cls.forward
+    assert patched_forward is not _UPSTREAM_FORWARDS[rope_cls]
     _patch_qwen_image_rope_txt_freqs_clone(od_config=_QWEN_IMAGE)
     assert rope_cls.forward is patched_forward
 
@@ -647,9 +655,10 @@ def test_qwen_image_rope_txt_freqs_clone(monkeypatch, rope_cls_name):
     ids=["lt_1mb", "gt_1mb"],
 )
 def test_safe_pack_tensor_if_large(monkeypatch, nbytes):
-    monkeypatch.setattr(ipc, "_pack_tensor_if_large", ipc._pack_tensor_if_large)
+    monkeypatch.setattr(ipc, "_pack_tensor_if_large", _UPSTREAM_PACK_TENSOR_IF_LARGE)
     _patch_diffusion_ipc_cpu_pack()
     patched_pack = ipc._pack_tensor_if_large
+    assert patched_pack is not _UPSTREAM_PACK_TENSOR_IF_LARGE
     _patch_diffusion_ipc_cpu_pack()
     assert ipc._pack_tensor_if_large is patched_pack
     # Return the tensor that would be copied to SHM, so that the test sees
