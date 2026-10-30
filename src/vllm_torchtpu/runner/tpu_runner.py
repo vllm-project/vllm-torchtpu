@@ -293,11 +293,51 @@ def _update_read_offsets_impl(
     read_offsets.index_put_((indices,), offsets.repeat(len(groups)))
 
 
+def _spec_seed_rows_impl(
+    read_offsets: torch.Tensor,
+    packed: torch.Tensor,
+    split: int,
+    out_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Seed-copy (src, dst) pool rows for a step's speculative crossings.
+
+    `packed` is int64 [B, 4 + window], one row per crossing: state source block,
+    new-owner flag, valid flag (0 on bucket padding), destination block, then the
+    pre-crossing group's checkpoint blocks. The source is the checkpoint the
+    request resumes from, picked by its device-resident read offset (checkpoint 0
+    for a new owner: a recycled source block can carry another request's offset).
+    Each manager block fans out to `split` consecutive pool blocks, sized to
+    `out_len` on the seed-copy bucket ladder; padding rows become (0, 0)
+    null-block self-copies.
+    """
+    state, dst, ckpt = packed[:, 0], packed[:, 3], packed[:, 4:]
+    off = read_offsets[state].long().clamp(0, ckpt.shape[1] - 1)
+    off = torch.where(packed[:, 1] != 0, 0, off)
+    src = ckpt.gather(1, off.unsqueeze(1)).squeeze(1)
+    valid = packed[:, 2] != 0
+    if split > 1:
+        j = torch.arange(split, dtype=src.dtype, device=src.device)
+        src = src.unsqueeze(1) * split + j
+        dst = dst.unsqueeze(1) * split + j
+        valid = valid.unsqueeze(1).expand(-1, split)
+    src = torch.where(valid, src, 0).reshape(-1).to(torch.int32)
+    dst = torch.where(valid, dst, 0).reshape(-1).to(torch.int32)
+    n = src.shape[0]
+    if n < out_len:
+        src = torch.nn.functional.pad(src, (0, out_len - n))
+        dst = torch.nn.functional.pad(dst, (0, out_len - n))
+    elif n > out_len:
+        src = src[:out_len]
+        dst = dst[:out_len]
+    return src, dst
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _update_read_offsets_compiled = _tpu_compile(_update_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
+_spec_seed_rows_compiled = _tpu_compile(_spec_seed_rows_impl)
 
 
 def _reset_read_offsets(
@@ -2065,7 +2105,7 @@ class TPUModelRunner(GPUModelRunner):
         # checkpoint the request is about to resume from — which becomes
         # checkpoint 0 of the new group, so the read offset resets to 0.
         # That index lives in the device-resident read-offset buffer, hence
-        # the device-side gather in `_spec_seed_sources`.
+        # the device-side gather in `_spec_seed_copies`.
         window = self._mamba_ckpt_window
         spec_seed = self.mamba_slot_read_offsets is not None and window > 1
 
@@ -2074,9 +2114,11 @@ class TPUModelRunner(GPUModelRunner):
         per_raw: dict[
             tuple[int, ...], tuple[list[torch.Tensor], list[int], list[int]]
         ] = {}
-        per_raw_dev: dict[
-            tuple[int, ...],
-            tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]],
+        # Speculative crossings of every group on the same buffers, as
+        # `_spec_seed_rows_impl` rows: one upload and one program per buffer
+        # set.
+        per_raw_spec: dict[
+            tuple[int, ...], tuple[list[torch.Tensor], list[list[int]]]
         ] = {}
         # Manager-level (src, dst) block pairs across mamba groups: without
         # spec decoding the per-block read offsets just follow the state to
@@ -2087,9 +2129,7 @@ class TPUModelRunner(GPUModelRunner):
             bt = self.input_batch.block_table[gid].get_cpu_tensor()
             row_width = bt.shape[1]
             pairs: list[tuple[int, int]] = []
-            state_srcs: list[int] = []
-            new_owners: list[bool] = []
-            ckpt_rows: list[list[int]] = []
+            spec_rows: list[list[int]] = []
             for row, prev, curr in crossings:
                 src = int(bt[row, prev])
                 dst = int(bt[row, curr])
@@ -2097,8 +2137,7 @@ class TPUModelRunner(GPUModelRunner):
                     continue
                 pairs.append((src, dst))
                 if spec_seed:
-                    state_srcs.append(src)
-                    new_owners.append(req_ids[row] not in self._mamba_offset_seeded)
+                    new_owner = req_ids[row] not in self._mamba_offset_seeded
                     # The pre-crossing group's checkpoint blocks. A column
                     # the manager has not filled reads past the row or lands
                     # on the null block; either way fall back to the state
@@ -2110,19 +2149,13 @@ class TPUModelRunner(GPUModelRunner):
                         col = prev + t
                         ckpt = int(bt[row, col]) if col < row_width else 0
                         row_ckpts.append(ckpt if ckpt != 0 else src)
-                    ckpt_rows.append(row_ckpts)
+                    spec_rows.append([src, int(new_owner), 1, dst, *row_ckpts])
             if not pairs:
                 continue
             if spec_seed:
-                dsts_g = [d for _, d in pairs]
-                spec_dsts.extend(dsts_g)
-                src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
-                dst_t = stage_h2d_upload(self, torch.tensor(dsts_g, dtype=torch.int32))
-                src_t, dst_t = self._expand_pool_split(src_t, dst_t)
+                spec_dsts.extend(d for _, d in pairs)
                 key = tuple(id(raw) for raw in raws)
-                entry = per_raw_dev.setdefault(key, (raws, [], []))
-                entry[1].append(src_t)
-                entry[2].append(dst_t)
+                per_raw_spec.setdefault(key, (raws, []))[1].extend(spec_rows)
                 continue
             offset_pairs.extend(pairs)
             if self._pool_block_split > 1:
@@ -2159,9 +2192,8 @@ class TPUModelRunner(GPUModelRunner):
             )
             _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t, dst_t)
 
-        for raws, srcs_dev, dsts_dev in per_raw_dev.values():
-            src_t = self._pad_dev_to_bucket(torch.cat(srcs_dev))
-            dst_t = self._pad_dev_to_bucket(torch.cat(dsts_dev))
+        for raws, rows in per_raw_spec.values():
+            src_t, dst_t = self._spec_seed_copies(rows, window)
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
         for raws, srcs, dsts in per_raw.values():
@@ -2190,62 +2222,32 @@ class TPUModelRunner(GPUModelRunner):
         """
         return values + [pad] * (cls._bucket_len(len(values)) - len(values))
 
-    def _pad_dev_to_bucket(self, ids: torch.Tensor) -> torch.Tensor:
-        """`_pad_to_bucket` for an already-on-device id tensor."""
-        n = int(ids.shape[0])
-        padded = self._bucket_len(n)
-        if padded == n:
-            return ids
-        return torch.cat(
-            [
-                ids,
-                torch.zeros(padded - n, dtype=ids.dtype, device=ids.device),
-            ]
-        )
-
-    def _expand_pool_split(
-        self, src: torch.Tensor, dst: torch.Tensor
+    def _spec_seed_copies(
+        self, rows: list[list[int]], window: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Device twin of the manager-block -> pool-block expansion.
-
-        The pool is born at kernel granularity: a manager state block is
-        `split` consecutive pool blocks.
-        """
-        split = self._pool_block_split
-        if split <= 1:
-            return src, dst
-        j = torch.arange(split, dtype=src.dtype, device=src.device)
-        return (
-            (src.unsqueeze(1) * split + j).reshape(-1),
-            (dst.unsqueeze(1) * split + j).reshape(-1),
-        )
-
-    def _spec_seed_sources(
-        self,
-        state_srcs: list[int],
-        ckpt_rows: list[list[int]],
-        new_owners: list[bool],
-    ) -> torch.Tensor:
-        """Seed source per crossing: the checkpoint being resumed from.
+        """Seed-copy (src, dst) for speculative crossings, one program.
 
         `mamba_slot_read_offsets` is device-resident and indexed by block
         id, so which of the window's blocks holds the last accepted token's
         state is only known on device — the choice is a gather there rather
-        than a CPU lookup.
+        than a CPU lookup (`_spec_seed_rows_impl`). Rows pad up to
+        `ceil(out_len / split)` before the upload so `(in_len, out_len)` sits
+        1-to-1 on the seed-copy bucket ladder.
         """
         offsets = self.mamba_slot_read_offsets
         assert offsets is not None
-        state_t = stage_h2d_upload(self, torch.tensor(state_srcs, dtype=torch.long))
-        ckpt_t = stage_h2d_upload(self, torch.tensor(ckpt_rows, dtype=torch.int32))
-        off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
-        # PD and prefix-cache restores provide committed state in checkpoint 0.
-        # A recycled source block can retain another request's MTP offset.
-        # The first-forward reset clears the destination, after this source
-        # selection, so ignore that stale offset here without mutating the
-        # source block (which may be shared). Live requests retain their offset.
-        new_owner_t = stage_h2d_upload(self, torch.tensor(new_owners, dtype=torch.bool))
-        off = torch.where(new_owner_t, 0, off)
-        return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
+        split = self._pool_block_split
+        out_len = self._bucket_len(len(rows) * split)
+        in_len = (out_len + split - 1) // split
+        pad = [0, 1, 0, 0] + [0] * window
+        rows = rows + [pad] * (in_len - len(rows))
+        packed = stage_h2d_upload(self, torch.tensor(rows, dtype=torch.long))
+        fn = (
+            _spec_seed_rows_compiled
+            if packed.device.type == "tpu"
+            else _spec_seed_rows_impl
+        )
+        return fn(offsets, packed, split, out_len)
 
     def _flush_mamba_state_seed_copies(self) -> None:
         if not self._pending_mamba_state_copies:
@@ -7230,7 +7232,7 @@ class TPUModelRunner(GPUModelRunner):
         offsets = self.mamba_slot_read_offsets
         if offsets is None:
             return
-        with self._precompile_timed("mamba rollback helpers"):
+        with self._precompile_timed("mamba rollback helpers"), torch.no_grad():
             num_groups = max(
                 1,
                 len(self._mamba_copy_plan),
@@ -7246,6 +7248,18 @@ class TPUModelRunner(GPUModelRunner):
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
                 n *= 4
+            window = getattr(self, "_mamba_ckpt_window", 1)
+            if window > 1:
+                split = self._pool_block_split
+                spec_limit = self._bucket_len(num_groups * self.max_num_reqs * split)
+                out_len = 8
+                while out_len <= spec_limit:
+                    in_len = (out_len + split - 1) // split
+                    packed = torch.zeros((in_len, 4 + window), dtype=torch.long).to(
+                        offsets.device
+                    )
+                    _spec_seed_rows_compiled(offsets, packed, split, out_len)
+                    out_len *= 4
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.
