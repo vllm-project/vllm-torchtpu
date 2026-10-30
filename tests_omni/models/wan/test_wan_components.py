@@ -95,9 +95,9 @@ from vllm_torchtpu.omni.rope import can_fuse_qk_norm_rope
 pytestmark = [pytest.mark.omni]
 
 
-# (TPU fp32, TPU bf16) rel_l2 bounds vs the CPU fp32 reference, ~3% above the
-# observed values. Both sides are deterministic across hosts; a CPU bf16
-# reference is not, so it is not used.
+# (TPU fp32, TPU bf16) rel_l2 and max_abs limits vs the CPU fp32 reference,
+# ~3% above the observed values. Both sides are deterministic across hosts; a
+# CPU bf16 reference is not, so it is not used.
 TRANSFORMER_MAX_REL_L2: dict[str, tuple[float, float]] = {
     "t2v": (3.4e-3, 7.0e-3),
     "i2v-clip": (3.8e-3, 7.4e-3),
@@ -105,7 +105,14 @@ TRANSFORMER_MAX_REL_L2: dict[str, tuple[float, float]] = {
     "ti2v": (3.4e-3, 7.0e-3),
     "vace": (3.7e-3, 7.8e-3),
 }
-# Keyed by (variant, output); "decode-frame" bounds the worst decoded frame.
+TRANSFORMER_MAX_ABS: dict[str, tuple[float, float]] = {
+    "t2v": (7.8e-3, 1.6e-2),
+    "i2v-clip": (1.0e-2, 1.8e-2),
+    "i2v-a14b": (8.0e-3, 1.8e-2),
+    "ti2v": (8.1e-3, 1.8e-2),
+    "vace": (8.7e-3, 2.0e-2),
+}
+# Keyed by (variant, output); "decode-frame" limits the worst decoded frame.
 VAE_MAX_REL_L2: dict[tuple[str, str], tuple[float, float]] = {
     ("wan2.1", "mode"): (3.2e-3, 6.2e-3),
     ("wan2.1", "decode"): (1.3e-2, 2.2e-2),
@@ -114,8 +121,18 @@ VAE_MAX_REL_L2: dict[tuple[str, str], tuple[float, float]] = {
     ("wan2.2", "decode"): (6.7e-3, 1.2e-2),
     ("wan2.2", "decode-frame"): (7.1e-3, 1.4e-2),
 }
+VAE_MAX_ABS: dict[tuple[str, str], tuple[float, float]] = {
+    ("wan2.1", "mode"): (5.7e-3, 7.4e-3),
+    ("wan2.1", "decode"): (3.6e-2, 5.0e-2),
+    ("wan2.1", "decode-frame"): (3.6e-2, 5.0e-2),
+    ("wan2.2", "mode"): (3.2e-3, 6.2e-3),
+    ("wan2.2", "decode"): (1.2e-2, 1.9e-2),
+    ("wan2.2", "decode-frame"): (1.2e-2, 1.9e-2),
+}
 UMT5_MAX_REL_L2 = (3.6e-3, 7.0e-3)
+UMT5_MAX_ABS = (1.7e-2, 4.4e-2)
 CLIP_MAX_REL_L2 = (3.0e-3, 5.6e-3)
+CLIP_MAX_ABS = (1.8e-2, 6.2e-2)
 
 
 @pytest.fixture(scope="module")
@@ -214,13 +231,14 @@ def _to_omni(inputs: dict, dtype) -> dict:
 # --------------------------------------------------------------------------- #
 # Tier 1: kernels
 # --------------------------------------------------------------------------- #
+# Limits ~3% above the observed values.
 # Fused q/k RMSNorm + RoPE (single bf16 rounding) vs unpatched (intermediate
-# bf16 roundings): observed max_abs is 1.95e-3 (2^-9) at output std ~0.039.
-FUSED_ATTN_RTOL = 1e-2
-FUSED_ATTN_ATOL = 3e-3
-# TPU float32 vs diffusers CPU float64 RoPE frequency tables: observed max_abs
-# is 4.3e-5 - 6.8e-5 across the 5x30x52 grid.
-ROPE_FREQS_ATOL = 1e-4
+# bf16 roundings).
+FUSED_ATTN_MAX_REL_L2 = 6.7e-3
+FUSED_ATTN_MAX_ABS = 2.1e-3
+# TPU float32 vs diffusers CPU float64 RoPE frequency tables, worst table.
+ROPE_FREQS_MAX_REL_L2 = 3.0e-7
+ROPE_FREQS_MAX_ABS = 1.7e-6
 
 
 def test_wan_rotary_embedding_pair_swap_bit_exact_on_tpu() -> None:
@@ -285,11 +303,12 @@ def test_wan_self_attention_fused_matches_unpatched(
 
     assert fused_out.device.type == "tpu"
     assert torch.isfinite(fused_out).all()
-    torch.testing.assert_close(
-        fused_out.cpu().float(),
-        unpatched_out.cpu().float(),
-        rtol=FUSED_ATTN_RTOL,
-        atol=FUSED_ATTN_ATOL,
+    assert_parity(
+        fused_out,
+        unpatched_out,
+        name="WanSelfAttention fused vs unpatched",
+        max_rel_l2=FUSED_ATTN_MAX_REL_L2,
+        max_abs=FUSED_ATTN_MAX_ABS,
     )
 
 
@@ -302,12 +321,13 @@ def test_wan_rope_freqs_on_tpu_match_diffusers():
     latents = torch.zeros(1, 16, 5, 60, 104)
     tpu_freqs = rope(latents.to("tpu"))
     ref_freqs = ref_rope(latents)
-    for tpu_table, ref_table in zip(tpu_freqs, ref_freqs, strict=True):
-        torch.testing.assert_close(
-            tpu_table.cpu().double(),
-            ref_table.double(),
-            atol=ROPE_FREQS_ATOL,
-            rtol=0,
+    for i, (tpu_table, ref_table) in enumerate(zip(tpu_freqs, ref_freqs, strict=True)):
+        assert_parity(
+            tpu_table,
+            ref_table,
+            name=f"WanRotaryPosEmbed table {i}",
+            max_rel_l2=ROPE_FREQS_MAX_REL_L2,
+            max_abs=ROPE_FREQS_MAX_ABS,
         )
 
 
@@ -373,10 +393,21 @@ def test_wan_tiny_transformer_parity(arch, omni_ctx):
         omni_model = omni_model.to(device="tpu").eval()
         tpu[dtype] = omni_model(**_to_omni(inputs, dtype), return_dict=False)[0]
 
-    fp32_max, bf16_max = TRANSFORMER_MAX_REL_L2[arch]
-    assert_parity(tpu[torch.float32], ref, name=f"{arch} TPU fp32", max_rel_l2=fp32_max)
+    fp32_max_rel_l2, bf16_max_rel_l2 = TRANSFORMER_MAX_REL_L2[arch]
+    fp32_max_abs, bf16_max_abs = TRANSFORMER_MAX_ABS[arch]
     assert_parity(
-        tpu[torch.bfloat16], ref, name=f"{arch} TPU bf16", max_rel_l2=bf16_max
+        tpu[torch.float32],
+        ref,
+        name=f"{arch} TPU fp32",
+        max_rel_l2=fp32_max_rel_l2,
+        max_abs=fp32_max_abs,
+    )
+    assert_parity(
+        tpu[torch.bfloat16],
+        ref,
+        name=f"{arch} TPU bf16",
+        max_rel_l2=bf16_max_rel_l2,
+        max_abs=bf16_max_abs,
     )
 
 
@@ -445,35 +476,41 @@ def test_wan_tiny_vae_parity(variant, omni_ctx):
     }
 
     for output in ("mode", "decode"):
-        fp32_max, bf16_max = VAE_MAX_REL_L2[variant, output]
+        fp32_max_rel_l2, bf16_max_rel_l2 = VAE_MAX_REL_L2[variant, output]
+        fp32_max_abs, bf16_max_abs = VAE_MAX_ABS[variant, output]
         assert_parity(
             tpu[torch.float32][output],
             ref[output],
             name=f"{variant} {output} TPU fp32",
-            max_rel_l2=fp32_max,
+            max_rel_l2=fp32_max_rel_l2,
+            max_abs=fp32_max_abs,
         )
         assert_parity(
             tpu[torch.bfloat16][output],
             ref[output],
             name=f"{variant} {output} TPU bf16",
-            max_rel_l2=bf16_max,
+            max_rel_l2=bf16_max_rel_l2,
+            max_abs=bf16_max_abs,
         )
 
     # Whole-video metrics can average away an error confined to a single frame
     # (e.g. frame 0 causal-conv padding).
-    fp32_max, bf16_max = VAE_MAX_REL_L2[variant, "decode-frame"]
+    fp32_max_rel_l2, bf16_max_rel_l2 = VAE_MAX_REL_L2[variant, "decode-frame"]
+    fp32_max_abs, bf16_max_abs = VAE_MAX_ABS[variant, "decode-frame"]
     for frame in range(ref["decode"].shape[2]):
         assert_parity(
             tpu[torch.float32]["decode"][:, :, frame],
             ref["decode"][:, :, frame],
             name=f"{variant} decode frame {frame} TPU fp32",
-            max_rel_l2=fp32_max,
+            max_rel_l2=fp32_max_rel_l2,
+            max_abs=fp32_max_abs,
         )
         assert_parity(
             tpu[torch.bfloat16]["decode"][:, :, frame],
             ref["decode"][:, :, frame],
             name=f"{variant} decode frame {frame} TPU bf16",
-            max_rel_l2=bf16_max,
+            max_rel_l2=bf16_max_rel_l2,
+            max_abs=bf16_max_abs,
         )
 
 
@@ -549,6 +586,7 @@ def test_wan_tiny_umt5_parity(tmp_path, dtype, limit_index):
         torch.cat([ref_hidden[row, :n] for row, n in enumerate(seq_lens)]),
         name=f"UMT5EncoderModel TPU {dtype}",
         max_rel_l2=UMT5_MAX_REL_L2[limit_index],
+        max_abs=UMT5_MAX_ABS[limit_index],
     )
 
 
@@ -575,6 +613,7 @@ def test_wan_tiny_clip_parity(tmp_path, dtype, limit_index):
         ref_hidden,
         name=f"CLIPVisionModel TPU {dtype}",
         max_rel_l2=CLIP_MAX_REL_L2[limit_index],
+        max_abs=CLIP_MAX_ABS[limit_index],
     )
 
 
