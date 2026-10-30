@@ -41,6 +41,9 @@ def test_speculative_decoding_manager_metadata_indices(device):
     # E.g., 10 scheduled tokens
     input_ids_cpu = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.int32)
     mock_runner.input_ids_cpu = input_ids_cpu
+    mock_runner._verify_draft_rows = types.MethodType(
+        TPUModelRunner._verify_draft_rows, mock_runner
+    )
 
     # Instantiate manager
     manager = SpeculativeDecodingManager(mock_runner)
