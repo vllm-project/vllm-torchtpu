@@ -151,7 +151,7 @@ def make_weights(mesh, ep, key):
     )
 
 
-def today_fn(mesh, ep, wts):
+def today_fn(mesh, ep):
     """Today's MoE: all rows on every rank, grouped matmuls, TP shared
     expert, one all-reduce. x and logits replicated; returns replicated."""
     g = E // ep
@@ -190,21 +190,13 @@ def today_fn(mesh, ep, wts):
         out_specs=P(),
         check_vma=False,
     )
-    return lambda x, logits: sm(
-        x,
-        logits,
-        wts["bias"],
-        wts["w13"],
-        wts["w2"],
-        wts["s13"],
-        wts["s2"],
-        *wts["shared_tp"],
+    return lambda x, logits, w: sm(
+        x, logits, w["bias"], w["w13"], w["w2"], w["s13"], w["s2"], *w["shared_tp"]
     )
 
 
-def split_fn(mesh, ep, wts, *, wire, sharded_plan):
+def split_fn(mesh, ep, *, wire, sharded_plan):
     """The split: own rows in, own rows out (x, logits sharded on rows)."""
-    w13s, s13s, w2s, s2s = wts["shared_rep"]
 
     def shared_local(x, w13s, s13s, w2s, s2s):
         act = _silu_mul(xla_quantized_matmul(x, w13s, s13s))
@@ -228,13 +220,13 @@ def split_fn(mesh, ep, wts, *, wire, sharded_plan):
     )
     kw = {} if wire == "fp8" else {"wire_dtype": jnp.bfloat16}
 
-    def fn(x, logits):
+    def fn(x, logits, w):
         routed = fused_ep_moe_v2(
             x,
-            wts["w13"],
-            wts["w2"],
-            wts["s13"],
-            wts["s2"],
+            w["w13"],
+            w["w2"],
+            w["s13"],
+            w["s2"],
             logits,
             topk=K,
             renormalize=True,
@@ -244,19 +236,18 @@ def split_fn(mesh, ep, wts, *, wire, sharded_plan):
             act_fn="silu",
             sharded_plan=sharded_plan,
             scoring_fn="sigmoid",
-            score_bias=wts["bias"],
+            score_bias=w["bias"],
             routed_scaling_factor=1.0,
             **kw,
         )
-        return shared(x, w13s, s13s, w2s, s2s) + routed * ROUTED_SCALE
+        return shared(x, *w["shared_rep"]) + routed * ROUTED_SCALE
 
     return fn
 
 
-def reference_fn(mesh, ep, wts):
+def reference_fn(mesh, ep):
     """f32 reference on a few rows (replicated in, replicated out)."""
     g = E // ep
-    w13s, s13s, w2s, s2s = wts["shared_rep"]
 
     def local(x, logits, bias, w13, w2, s13, s2, w13s, s13s, w2s, s2s):
         x = x.astype(jnp.float32)
@@ -282,18 +273,8 @@ def reference_fn(mesh, ep, wts):
         check_vma=False,
     )
     return jax.jit(
-        lambda x, logits: sm(
-            x,
-            logits,
-            wts["bias"],
-            wts["w13"],
-            wts["w2"],
-            wts["s13"],
-            wts["s2"],
-            w13s,
-            s13s,
-            w2s,
-            s2s,
+        lambda x, logits, w: sm(
+            x, logits, w["bias"], w["w13"], w["w2"], w["s13"], w["s2"], *w["shared_rep"]
         )
     )
 
@@ -301,9 +282,9 @@ def reference_fn(mesh, ep, wts):
 def chained(fn, chain):
     """`chain` layers per call, each fed the previous output, renormalized."""
 
-    def run(x, logits):
+    def run(x, logits, w):
         for _ in range(chain):
-            y = fn(x, logits).astype(jnp.float32)
+            y = fn(x, logits, w).astype(jnp.float32)
             x = (y * lax.rsqrt(jnp.mean(y * y, -1, keepdims=True) + 1e-6)).astype(
                 x.dtype
             )
@@ -351,27 +332,28 @@ def main():
         )(x, wts["gate"])
         x_s, logits_s = jax.jit(lambda *v: v, out_shardings=(shd, shd))(x, logits)
 
-        today = today_fn(mesh, ep, wts)
+        today = today_fn(mesh, ep)
         splits = {
-            f"split_{w}_plan{int(p)}": split_fn(mesh, ep, wts, wire=w, sharded_plan=p)
+            f"split_{w}_plan{int(p)}": split_fn(mesh, ep, wire=w, sharded_plan=p)
             for w, p in (("bf16", False), ("bf16", True), ("fp8", False))
         }
         rows = (np.arange(ep)[:, None] * t + np.arange(a.check_rows)[None, :]).ravel()
         pick = jax.jit(lambda x, lg, r=rows: (x[r], lg[r]), out_shardings=(rep, rep))
-        ref = _host(reference_fn(mesh, ep, wts)(*pick(x, logits)))
-        y_today = _host(jax.jit(today)(x, logits))[rows]
+        ref = _host(reference_fn(mesh, ep)(*pick(x, logits), wts))
+        y_today = _host(jax.jit(today)(x, logits, wts))[rows]
         r["rel_l2_today"] = rel_l2(y_today, ref)
         for name, fn in splits.items():
-            y = _host(jax.jit(fn)(x_s, logits_s))[rows]
+            y = _host(jax.jit(fn)(x_s, logits_s, wts))[rows]
             r[f"rel_l2_{name}"] = rel_l2(y, ref)
             r[f"rel_l2_{name}_vs_today"] = rel_l2(y, y_today)
 
         r["today_ms"] = (
-            _timeit(chained(today, a.chain), x, logits, iters=a.iters) / a.chain
+            _timeit(chained(today, a.chain), x, logits, wts, iters=a.iters) / a.chain
         )
         for name, fn in splits.items():
             r[f"{name}_ms"] = (
-                _timeit(chained(fn, a.chain), x_s, logits_s, iters=a.iters) / a.chain
+                _timeit(chained(fn, a.chain), x_s, logits_s, wts, iters=a.iters)
+                / a.chain
             )
 
         def coll(f, spec_in, spec_out):
@@ -401,8 +383,8 @@ def main():
         if a.trace_dir:
             jax.profiler.start_trace(os.path.join(a.trace_dir, f"t{T}"))
             for fn, args in (
-                (chained(today, a.chain), (x, logits)),
-                (chained(splits["split_bf16_plan0"], a.chain), (x_s, logits_s)),
+                (chained(today, a.chain), (x, logits, wts)),
+                (chained(splits["split_bf16_plan0"], a.chain), (x_s, logits_s, wts)),
             ):
                 for _ in range(3):
                     jax.block_until_ready(fn(*args))
