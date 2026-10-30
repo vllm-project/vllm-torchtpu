@@ -27,6 +27,7 @@ from .attention import (
 )
 from .cache import NativeCacheView, PagedCacheRows
 from .ced import DecoderReplayPlan, build_decoder_inverse_rows
+from .dspark import DSparkDeepseekV41ForCausalLM, DSparkDeepseekV41Model
 from .engram import (
     Engram,
     NgramHashState,
@@ -34,16 +35,22 @@ from .engram import (
     TpuDPSharedEngramStorage,
     dequant_fp8_rows,
 )
+from .model import DeepseekV41DecoderLayer, DeepseekV41ForCausalLM, DeepseekV41Model
 from .moe import DeepseekV41MoE
 
 __all__ = [
     "AttentionBackend",
     "CompressorStateCache",
+    "DSparkDeepseekV41ForCausalLM",
+    "DSparkDeepseekV41Model",
     "DecoderReplayPlan",
     "DeepseekCompressor",
     "DeepseekV41Attention",
+    "DeepseekV41DecoderLayer",
+    "DeepseekV41ForCausalLM",
     "DeepseekV41Indexer",
     "DeepseekV41MoE",
+    "DeepseekV41Model",
     "Engram",
     "IndexerCache",
     "NativeCacheView",
