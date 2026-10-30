@@ -986,6 +986,14 @@ class KVCacheManager:
 
         cache_config.num_gpu_blocks_override = int(attn_num_blocks)
         self.runner._mamba_num_blocks = int(mamba_num_blocks)
+        # Kept so the sizing can be redone after the profile run.
+        self.runner._compact_mamba_sizing = (
+            attn_page_size_bytes,
+            unpadded_mamba_page_size_bytes,
+            num_attn_groups,
+            num_mamba_groups,
+            group_size,
+        )
 
         # Total HBM = group_size regions, each holding num_attn_groups
         # attention blocks + num_mamba_groups mamba slots.
@@ -1008,6 +1016,32 @@ class KVCacheManager:
             mamba_bytes / (2**30),
             (attn_bytes + mamba_bytes) / (2**30),
             avail / (2**30),
+        )
+
+    def resize_compact_mamba_after_profile(self) -> None:
+        """Redo the compact-mamba sizing against the post-profile HBM budget.
+
+        The first sizing runs inside get_kv_cache_spec, which vLLM calls before
+        determine_available_memory's profile run, so its budget misses what the
+        profile run leaves allocated. Pinning that count overshoots the
+        gpu_memory_utilization cap by the residue: Qwen3.8-2.4T at DP16 x TP2
+        on a TPU8i 4x4x1 sized 45.22 GiB of KV against 44.76 GiB left after
+        the profile run. TPUWorker.determine_available_memory calls this after
+        its profile run, and the executors pin the resized count.
+        """
+        sizing = getattr(self.runner, "_compact_mamba_sizing", None)
+        if sizing is None:
+            return
+        cache_config = self.runner.cache_config
+        before = cache_config.num_gpu_blocks_override
+        cache_config.num_gpu_blocks_override = None
+        self.runner._mamba_num_blocks = None
+        self._maybe_set_compact_mamba_num_blocks_override(*sizing)
+        logger.info(
+            "Compact-mamba KV cache resized after the profile run: "
+            "num_gpu_blocks_override %s -> %s (attn).",
+            before,
+            cache_config.num_gpu_blocks_override,
         )
 
     def _maybe_set_num_blocks_override(

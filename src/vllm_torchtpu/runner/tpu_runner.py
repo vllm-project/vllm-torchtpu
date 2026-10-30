@@ -758,6 +758,9 @@ class TPUModelRunner(GPUModelRunner):
         # or a user-pinned num_gpu_blocks_override) — in which case mamba and
         # attention share the uniform `num_blocks` as before.
         self._mamba_num_blocks: int | None = None
+        # The compact sizing's inputs, kept so it can be redone against the
+        # post-profile HBM budget (KVCacheManager.resize_compact_mamba_after_profile).
+        self._compact_mamba_sizing: tuple[int, int, int, int, int] | None = None
         # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
         # allocated when a request first appears and retained until its KV
         # ownership ends. Keying on req_id (rather than persistent-batch

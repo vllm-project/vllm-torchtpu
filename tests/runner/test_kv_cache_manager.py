@@ -336,6 +336,44 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
         return_value=4096,
     )
+    def test_compact_mamba_resized_against_the_post_profile_budget(
+        self, mock_get_page_size
+    ):
+        """The first sizing (in get_kv_cache_spec) predates the profile run;
+        resizing after it uses the HBM the profile run left, so the pinned
+        count no longer overshoots the gpu_memory_utilization cap."""
+        gib = 1024**3
+        layers = {"attn_0": _attention_layer_mock()}
+        layers["attn_0"].num_kv_heads = 2
+        layers["attn_0"].head_size = 128
+        layers.update({f"mamba_{i}": DummyMamba() for i in range(3)})
+        mem = "vllm_torchtpu.utils.torch.accelerator.get_memory_info"
+
+        with patch(mem, return_value=(10 * gib, 10 * gib)):
+            self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+        before = self.runner.cache_config.num_gpu_blocks_override
+        assert self.runner._mamba_num_blocks == 17
+
+        # The profile run leaves 0.5 GiB allocated.
+        with patch(mem, return_value=(int(9.5 * gib), 10 * gib)):
+            self.runner.kv_cache_manager.resize_compact_mamba_after_profile()
+        after = self.runner.cache_config.num_gpu_blocks_override
+
+        mamba = 3 * 17 * 66560
+        assert before == (int(0.9 * 10 * gib) - mamba) // 4096
+        assert after == (int(0.9 * 10 * gib) - gib // 2 - mamba) // 4096
+        assert self.runner._mamba_num_blocks == 17
+
+    def test_resize_is_a_no_op_without_compact_sizing(self):
+        """A user-pinned or uniform layout has no compact sizing to redo."""
+        self.runner.cache_config.num_gpu_blocks_override = 1234
+        self.runner.kv_cache_manager.resize_compact_mamba_after_profile()
+        assert self.runner.cache_config.num_gpu_blocks_override == 1234
+
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
     @patch(
         "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
         return_value=(3 * 1024 * 1024, 3 * 1024 * 1024),

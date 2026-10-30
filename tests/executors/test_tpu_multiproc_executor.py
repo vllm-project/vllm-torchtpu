@@ -220,3 +220,30 @@ def test_ray_executor_raises_on_real_disagreement():
         pytest.raises(ValueError, match="workers disagree"),
     ):
         executor.get_kv_cache_specs()
+
+
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=[1 << 30])
+@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+def test_repins_the_count_workers_resized_after_the_profile_run(mock_specs, mock_mem):
+    """Workers redo their compact-mamba sizing after the profile run; the
+    engine must pin that count, not the one from before the profile run."""
+    executor = _make_executor(engine_override=None, worker_overrides=[5428, 5428])
+    executor.get_kv_cache_specs()
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5428
+
+    executor.collective_rpc = MagicMock(return_value=[5310, 5312])
+    assert executor.determine_available_memory() == [1 << 30]
+
+    executor.collective_rpc.assert_called_once_with("get_num_gpu_blocks_override")
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5310
+
+
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=[1 << 30])
+@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+def test_user_override_is_not_repinned_after_the_profile_run(mock_specs, mock_mem):
+    executor = _make_executor(engine_override=1234, worker_overrides=[5428, 5428])
+    executor.get_kv_cache_specs()
+    executor.determine_available_memory()
+
+    executor.collective_rpc.assert_not_called()
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 1234

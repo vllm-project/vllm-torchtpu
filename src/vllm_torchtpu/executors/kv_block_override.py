@@ -105,3 +105,20 @@ def reconcile_num_gpu_blocks_override(
         lo,
     )
     return lo
+
+
+def pin_worker_num_gpu_blocks_override(executor) -> bool:
+    """Copy the workers' agreed compact-mamba block count to the engine config.
+
+    Compact-mamba sizing sets `num_gpu_blocks_override` on each worker's
+    cache_config; workers are separate processes, so the engine side has to
+    collect it. Returns whether the workers set one (and it was pinned).
+    """
+    pc = executor.vllm_config.parallel_config
+    agreed = reconcile_num_gpu_blocks_override(
+        executor.collective_rpc("get_num_gpu_blocks_override"),
+        workers_per_stage=pc.world_size // pc.pipeline_parallel_size,
+    )
+    if agreed is not None:
+        executor.vllm_config.cache_config.num_gpu_blocks_override = agreed
+    return agreed is not None
