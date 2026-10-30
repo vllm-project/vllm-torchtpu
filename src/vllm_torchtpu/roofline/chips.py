@@ -18,6 +18,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from jax.experimental.pallas import tpu as pltpu
+
 
 @dataclass(frozen=True)
 class ChipSpec:
@@ -33,6 +35,32 @@ class ChipSpec:
     cores_per_chip: int = 2
     ici_link_bw: float = 100.0e9
     ici_hop_latency_s: float = 1.0e-6
+
+
+def _from_jax(
+    name: str,
+    version: pltpu.ChipVersion,
+    *,
+    cores_per_chip: int,
+    ici_link_bw: float,
+    ici_bw: float,
+    ici_hop_latency_s: float,
+) -> ChipSpec:
+    # One TensorCore per logical device gives per-core HBM, bandwidth, MXU peaks,
+    # and VMEM; JAX's table has no ICI rates, so callers pass them.
+    info = pltpu.get_tpu_info_for_chip(version, 1)
+    return ChipSpec(
+        name=name,
+        hbm_bytes=info.hbm_capacity_bytes,
+        hbm_bw=float(info.mem_bw_bytes_per_second),
+        bf16_flops=float(info.bf16_ops_per_second),
+        fp8_flops=float(info.fp8_ops_per_second),
+        vmem_bytes=info.vmem_capacity_bytes,
+        cores_per_chip=cores_per_chip,
+        ici_link_bw=ici_link_bw,
+        ici_bw=ici_bw,
+        ici_hop_latency_s=ici_hop_latency_s,
+    )
 
 
 @dataclass(frozen=True)
@@ -69,19 +97,13 @@ class SliceTopology:
 
 
 CHIPS: dict[str, ChipSpec] = {
-    "tpu7x": ChipSpec(
-        name="tpu7x",
-        # Per-TensorCore HBM capacity (103 GB/core) and peak HBM bandwidth (3.7 TB/s),
-        # FLOP ceiling BF16 (1.155 PF), VMEM (64 MiB), and 2 cores/chip:
-        # JAX jax/_src/tpu_info.py (ChipVersion.TPU_7X,
-        # https://github.com/jax-ml/jax/blob/main/jax/_src/tpu_info.py).
-        # FP8 ceiling: Cloud TPU7x doc peak 4,614 TFLOPs FP8 per chip / 2 TensorCores
+    # HBM, bandwidth, BF16 and FP8 MXU peaks, and VMEM: JAX's TPU table
+    # (ChipVersion.TPU_7X, https://github.com/jax-ml/jax/blob/main/jax/_src/tpu_info.py).
+    "tpu7x": _from_jax(
+        "tpu7x",
+        pltpu.ChipVersion.TPU_7X,
+        # 2 TensorCores per chip: Google Cloud TPU7x docs
         # (https://cloud.google.com/tpu/docs/tpu7x).
-        hbm_bytes=103_000_000_000,
-        hbm_bw=3.7e12,
-        bf16_flops=1.155e15,
-        fp8_flops=2.307e15,
-        vmem_bytes=67_108_864,
         cores_per_chip=2,
         # Peak ICI rate: 6 links x 200 GB/s bidirectional = 1,200 GB/s per chip, so
         # 100 GB/s per link per direction and 600 GB/s egress per chip (300 GB/s per
