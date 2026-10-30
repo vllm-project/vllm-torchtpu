@@ -20,7 +20,7 @@ from typing import Any, ClassVar
 
 import jax
 
-from . import pool
+from . import _builtins, pool
 from .decls import (
     FrozenDict,
     KVCacheDecl,
@@ -326,11 +326,13 @@ def register_model(
 
 def list_models() -> tuple[str, ...]:
     """Return sorted names of all registered `ModelDef`s."""
+    _builtins.ensure_builtins()
     return tuple(sorted(_MODEL_REGISTRY))
 
 
 def find_model(target: Any) -> type[ModelDef] | None:
     """Look up a `ModelDef` by name, HF architecture, `model_type`, or `hf_config`."""
+    _builtins.ensure_builtins()
     if isinstance(target, type) and issubclass(target, ModelDef):
         return target
     if (mdef := getattr(target, "_model_def", None)) is not None:

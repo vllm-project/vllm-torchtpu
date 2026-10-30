@@ -19,6 +19,8 @@ import dataclasses
 from collections.abc import Iterator, Mapping
 from typing import Any, Literal
 
+from . import _builtins
+
 NumericsClass = Literal["exact", "approx"]
 
 # Module name -> its `Tunables` class (registered via `register_tunables`).
@@ -58,6 +60,7 @@ def register_tunables(name: str, cls: type) -> None:
 
 def tunables_class(name: str) -> type:
     """The registered `Tunables` class of modules named `name`."""
+    _builtins.ensure_builtins()
     try:
         return _TUNABLES[name]
     except KeyError:
@@ -68,6 +71,7 @@ def tunables_class(name: str) -> type:
 
 def registered_tunables() -> dict[str, type]:
     """All registered `{module name: Tunables class}` (a copy)."""
+    _builtins.ensure_builtins()
     return dict(_TUNABLES)
 
 
@@ -90,6 +94,7 @@ def register_debug(name: str, cls: type) -> None:
 
 def debug_class(name: str) -> type:
     """The registered `Debug` class of modules named `name`."""
+    _builtins.ensure_builtins()
     try:
         return _DEBUG[name]
     except KeyError:
@@ -100,6 +105,7 @@ def debug_class(name: str) -> type:
 
 def registered_debug() -> dict[str, type]:
     """All registered `{module name: Debug class}` (a copy)."""
+    _builtins.ensure_builtins()
     return dict(_DEBUG)
 
 
