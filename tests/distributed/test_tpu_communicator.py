@@ -20,6 +20,14 @@ import torch
 from vllm_torchtpu.distributed import tpu_communicator as comm
 
 
+@pytest.fixture(autouse=True)
+def pin(monkeypatch):
+    """Stands in for the TPU-only compact-tiling op; records its inputs."""
+    op = Mock(side_effect=lambda x: x)
+    monkeypatch.setattr(comm, "_pin_compact_tiling_op", op)
+    return op
+
+
 @pytest.fixture
 def communicator(monkeypatch):
     def init(instance, *args, **kwargs):
@@ -53,7 +61,7 @@ def test_all2all_probe_manager(monkeypatch, use_all2all):
 )
 @pytest.mark.parametrize("dp_size", [1, 2])
 def test_dispatch_and_combine_use_dp_group(
-    monkeypatch, communicator, method, count, dp_size
+    monkeypatch, communicator, pin, method, count, dp_size
 ):
     group = Mock(world_size=dp_size)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
@@ -83,6 +91,9 @@ def test_dispatch_and_combine_use_dp_group(
             assert invocation.kwargs == {"dim": 0}
         assert group.all_gather.call_count == count
         group.reduce_scatter.assert_not_called()
+        pin.assert_called_once_with(tensors[0])
+    if method == "combine" or dp_size == 1:
+        pin.assert_not_called()
 
 
 @pytest.mark.parametrize(
