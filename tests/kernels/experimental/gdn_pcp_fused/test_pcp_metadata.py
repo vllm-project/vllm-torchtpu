@@ -15,6 +15,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import config, pcp_metadata
 
@@ -70,7 +71,8 @@ def _assert_pytree_array_equal(actual, expected):
         )
 
 
-def test_schedule_splits_cross_request_batch_flat_pcp_rounds():
+@pytest.mark.parametrize("projection_chunks", [1, 2, 4])
+def test_schedule_splits_cross_request_batch_flat_pcp_rounds(projection_chunks):
     cfg = _cfg(batch_size=128, tile_size=4)
     seq_lens, query_start, state_indices, distribution = _metadata_inputs(
         lengths=[13, 11],
@@ -87,7 +89,7 @@ def test_schedule_splits_cross_request_batch_flat_pcp_rounds():
         distribution[-1],
         pcp_size=4,
         comm_chunk_size=4,
-        projection_token_block_size=16,
+        projection_token_block_size=4 * projection_chunks,
         num_qkv_out_blocks=6,
         num_projection_out_blocks=8,
     )
@@ -119,6 +121,24 @@ def test_schedule_splits_cross_request_batch_flat_pcp_rounds():
             [4, 4, 4, 1],
             [4, 4, 4, 4],
         ],
+    )
+    # Stage 2 launches at tile 4. One-chunk projection needs eight queued
+    # jobs to cover rank 0/1's second token block, hence four catch-up jobs.
+    catchup = [4, 4, 0, 0] if projection_chunks == 1 else [0, 0, 0, 0]
+    np.testing.assert_array_equal(
+        np.asarray(schedule.projection_catchup_start[:3]),
+        [[0, 0, 0, 0], [0, 0, 0, 0], [4, 4, 4, 4]],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.projection_catchup_count[:3]),
+        [[0, 0, 0, 0], [0, 0, 0, 0], catchup],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.projection_work_offset[:3]),
+        [[0, 0, 0, 0], catchup, catchup],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.projection_work_offset_end), catchup
     )
     assert int(metadata.num_tiles) == 7
     np.testing.assert_array_equal(

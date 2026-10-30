@@ -762,7 +762,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 values,
                 (
                     (0, 0),
-                    (0, _TPU_TILE_ROWS - lanes),
+                    (0, projection_z_out_ref.shape[-2] - lanes),
                     (0, 0),
                 ),
             )
@@ -1421,9 +1421,12 @@ def fused_qkvz_projection_pcp_gdn(
     shard_value_dim = local_n_v * d_v
     local_dim = 2 * shard_key_dim + shard_value_dim
     expected_local_qkv_dim = 2 * full_key_dim + full_value_dim
-    # Two communication chunks keep short ragged batches from doing a large
-    # rounded-up projection while still amortizing the projection loop.
-    projection_token_block_size = 2 * comm_chunk_size
+    # Preserve the two-chunk overlap for the original single-tile envelope.
+    # Wider Z shards grow the live projection output and GDN state; reduce
+    # the token tile only for those newly admitted shards.
+    projection_token_block_size = comm_chunk_size * (
+        1 if shard_value_dim > _TPU_TILE_ROWS * _TPU_TILE_COLUMNS else 2
+    )
     projection_out_block_size = local_dim
     expected_qkvz_dim = expected_local_qkv_dim + full_value_dim
     if hidden_states.ndim != 2 or qkvz_weight.ndim != 2:
@@ -1463,8 +1466,8 @@ def fused_qkvz_projection_pcp_gdn(
         )
     if local_num_tokens % projection_token_block_size != 0:
         raise ValueError(
-            "Rank-local tokens must be divisible by two "
-            "communication chunks for projection fusion: "
+            "Rank-local tokens must be divisible by the "
+            "projection token block: "
             f"{local_num_tokens=} "
             f"{projection_token_block_size=}."
         )
@@ -1481,11 +1484,9 @@ def fused_qkvz_projection_pcp_gdn(
     if (
         shard_key_dim % _TPU_TILE_COLUMNS != 0
         or shard_value_dim % _TPU_TILE_COLUMNS != 0
-        or shard_value_dim > _TPU_TILE_ROWS * _TPU_TILE_COLUMNS
     ):
         raise ValueError(
-            "QKVZ projection requires tile-aligned PCP-local shards and a Z "
-            "shard that fits one physical output tile: "
+            "QKVZ projection requires tile-aligned PCP-local shards: "
             f"{shard_key_dim=} {shard_value_dim=} "
             f"{projection_out_block_size=}."
         )
@@ -1661,11 +1662,17 @@ def fused_qkvz_projection_pcp_gdn(
         ),
         act_out_dtype,
     )
+    # The value shard may span several physical tiles (e.g. 2048 channels
+    # with PCP8). Keep the same layout and round the sublane extent up to a
+    # whole tile instead of requiring the entire shard to fit one tile.
+    z_tile_rows = (
+        pl.cdiv(shard_value_dim, _TPU_TILE_ROWS * _TPU_TILE_COLUMNS) * _TPU_TILE_ROWS
+    )
     z_shape = jax.ShapeDtypeStruct(
         (
             local_num_tokens,
             num_z_out_blocks,
-            _TPU_TILE_ROWS,
+            z_tile_rows,
             _TPU_TILE_COLUMNS,
         ),
         act_out_dtype,
@@ -1715,7 +1722,7 @@ def fused_qkvz_projection_pcp_gdn(
         pltpu.VMEM(
             (
                 projection_cfg.token_block_size,
-                _TPU_TILE_ROWS,
+                z_tile_rows,
                 _TPU_TILE_COLUMNS,
             ),
             act_out_dtype,

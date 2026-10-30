@@ -18,6 +18,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
@@ -29,6 +30,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 )
 from vllm_torchtpu.kernels.experimental.batched_rpa.utils import get_dtype_packing
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
+    ONLINE_STATE_PADDED_LANES,
     PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
     pcp_streaming_attention_page_groups_packed_local_from_metadata,
 )
@@ -40,6 +42,9 @@ PCP_AXIS_NAME = "pcp"
 TP_AXIS_NAME = "tp"
 
 KVLayout = batched_rpa_configs.KVLayout
+
+_Q_TILE_VMEM_FRACTION = 0.5
+_VMEM_USABLE_FRACTION = 0.9
 
 
 class _PCPQueryRowMapping(NamedTuple):
@@ -623,6 +628,37 @@ def _select_replicated_query_row_mapping_for_pcp_rank(
     )
 
 
+def _default_q_block_size(
+    q: jax.Array, kv_cache: jax.Array, interleave_size: int
+) -> int:
+    """Size the padded, rank-local Q tile against the device VMEM budget."""
+    heads = q.shape[1] * q.shape[2]
+    head_dim = q.shape[-1]
+    # Q DMA, FP32 accumulator, and both padded FP32 softmax states.
+    bytes_per_row = heads * (
+        head_dim * (q.dtype.itemsize + jnp.dtype(jnp.float32).itemsize)
+        + 2 * ONLINE_STATE_PADDED_LANES * jnp.dtype(jnp.float32).itemsize
+    )
+    capacity = pltpu.get_tpu_info().vmem_capacity_bytes
+    # Reserve half for metadata and scoped compute temporaries, and always
+    # leave room for the two KV page buffers plus 10% compiler headroom.
+    kv_buffer_bytes = 2 * math.prod(kv_cache.shape[1:]) * kv_cache.dtype.itemsize
+    q_budget = min(
+        int(_Q_TILE_VMEM_FRACTION * capacity),
+        int(_VMEM_USABLE_FRACTION * capacity) - kv_buffer_bytes,
+    )
+    block_size = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+    while block_size * bytes_per_row > q_budget and block_size // 2 >= interleave_size:
+        block_size //= 2
+    if block_size < interleave_size or block_size * bytes_per_row > q_budget:
+        raise ValueError(
+            "PCP attention Q tile does not fit VMEM at the interleave floor; "
+            "reduce cp_kv_cache_interleave_size or increase tensor parallelism: "
+            f"{interleave_size=} {bytes_per_row=} {q_budget=}."
+        )
+    return block_size
+
+
 def sharded_pcp_ragged_paged_attention(
     mesh: Mesh,
     q: jax.Array,
@@ -641,7 +677,7 @@ def sharded_pcp_ragged_paged_attention(
     v_scale: float | None = None,
     update_kv_cache: bool = True,
     cp_kv_cache_interleave_size: int = 0,
-    q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+    q_block_size: int | None = None,
     q_compute_size: int | None = None,
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ):
@@ -791,6 +827,11 @@ def sharded_pcp_ragged_paged_attention(
                 constant_values=0,
             )
         attention_kv_cache = _reshape_packed_kv_cache_for_attention(kv_cache, kv_layout)
+        local_q_block_size = q_block_size
+        if local_q_block_size is None:
+            local_q_block_size = _default_q_block_size(
+                q_streaming, attention_kv_cache, cp_kv_cache_interleave_size
+            )
         segment_descriptors, num_segments = _build_writeback_segment_descriptors(
             compact_slot_ids,
             writeback_count,
@@ -811,7 +852,7 @@ def sharded_pcp_ragged_paged_attention(
                 pcp_size=pcp_size,
                 interleave_size=cp_kv_cache_interleave_size,
                 sm_scale=sm_scale,
-                q_block_size=q_block_size,
+                q_block_size=local_q_block_size,
                 q_compute_size=q_compute_size,
                 k_scale=k_scale,
                 v_scale=v_scale,

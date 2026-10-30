@@ -81,6 +81,30 @@ _GDN_PCP_DESCRIPTOR_CASES = (
 
 _GDN_PCP_FUSED_PROJECTION_CASES = (
     pytest.param(
+        4,
+        4,
+        64,
+        2048,
+        (64, 64),
+        (0, 64),
+        None,
+        jnp.float32,
+        1024,
+        id="wide-z-two-tiles",
+    ),
+    pytest.param(
+        4,
+        4,
+        48,
+        2048,
+        (64, 64),
+        (0, 64),
+        None,
+        jnp.float32,
+        1024,
+        id="wide-z-partial-tile",
+    ),
+    pytest.param(
         2,
         4,
         16,
@@ -148,6 +172,8 @@ _GDN_PCP_FUSED_PROJECTION_CASES = (
 # block slice it is also what leaves non-state padding in the kernel's
 # compact state updates, which the NHD shapes above never do.
 _GDN_PCP_FUSED_PROJECTION_HND_CASE_IDS = (
+    "wide-z-two-tiles",
+    "wide-z-partial-tile",
     "gqa-multiple-groups-per-shard",
     "batch-flat-owner-with-history-bf16-ssm-cache",
 )
@@ -790,6 +816,18 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         (qkvz_dim, hidden_size),
         dtype=jnp.float32,
     )
+    if n_v // pcp_size * d_v > 1024 and projection_dtype == jnp.bfloat16:
+        # Integer products with a power-of-two scale accumulate exactly in
+        # FP32, giving the new Z layout a bit-exact dense reference.
+        hidden = jax.random.randint(keys[0], (num_tokens, hidden_size), -1, 2).astype(
+            jnp.bfloat16
+        )
+        weight_f32 = (
+            jax.random.randint(keys[7], (qkvz_dim, hidden_size), -1, 2).astype(
+                jnp.float32
+            )
+            / 64
+        )
     # `qkvz_weight` is N-major `[n_out, n_in]` to match the projection kernel;
     # `xla_quantized_matmul` takes the canonical (k, n) layout.
     if projection_dtype == jnp.bfloat16:
@@ -1108,3 +1146,7 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         rtol=tolerance,
         atol=tolerance,
     )
+    if local_value_dim > 1024 and projection_dtype == jnp.bfloat16:
+        np.testing.assert_array_equal(
+            actual_z.view(np.uint16), expected_z.view(np.uint16)
+        )
