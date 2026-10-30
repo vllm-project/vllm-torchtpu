@@ -2,7 +2,7 @@
 
 ## Topology & Base Container
 - **Hardware**: `2x tpu7x 2x2x4` (`16` prefill chips + `16` decode chips = `32` total chips).
-- **Base image**: `gcr.io/cloud-tpu-shared-capacity/jianpingsyu/vllm-torchtpu:k3engine-v0.29.0` with `PYTHONPATH` pointing to `src/` from this branch (`rishabhmanoj/k3-mega-ovdp2`).
+- **Base image**: `gcr.io/cloud-tpu-shared-capacity/jianpingsyu/vllm-torchtpu:k3engine-v0.29.0` with this branch (`rishabhmanoj/k3-mega-ovdp2`) installed via `pip install --no-deps --no-build-isolation -e .` (or preserving `/workspace/vllm-torchtpu/src/*.egg-info` alongside `PYTHONPATH=/workspace/vllm-torchtpu/src`; `cd /` first if replacing `/workspace/vllm-torchtpu`).
 - **Inputs**:
   - `MODEL_DIR`: Kimi-K3 HF metadata/tokenizer directory (`config.json`, tokenizer files).
   - `PRESHARDED_DIR`: `TP=32` presharded megakernel checkpoint directory (containing `layout.json` and `prefill-sp-cache/layout.json`).
@@ -10,6 +10,9 @@
 ## Environment Variables (`ROLE=prefill` or `ROLE=decode`, `INDEX=0..3`)
 
 ```bash
+# On 2-slice GKE JobSets (replicas: 2), unset webhook-injected MegaScale vars so prefill & decode form separate 1-slice meshes:
+unset MEGASCALE_NUM_SLICES MEGASCALE_SLICE_ID MEGASCALE_COORDINATOR_ADDRESS MEGASCALE_PORT
+export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-cloud-tpu-shared-capacity}"
 export VLLM_TARGET_DEVICE=tpu VLLM_NO_USAGE_STATS=1 VLLM_SERVER_DEV_MODE=1
 export VLLM_HOST_IP="${POD_IP}" VLLM_ENGINE_READY_TIMEOUT_S=14400 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
 export TPU_CHIPS_PER_HOST_BOUNDS="2,2,1" TPU_HOST_BOUNDS="1,1,4" TPU_NODE_ID="${INDEX}"
@@ -76,7 +79,7 @@ vllm serve "${COMMON_ARGS[@]}" \
   --nnodes 4 --node-rank "${INDEX}" --master-addr "${DECODE_HEAD_IP}"
 ```
 
-- **Disagg Proxy** (run on prefill head once both `/health` return `200`):
+- **Disagg Proxy** (run on prefill head once both engine `/health` endpoints return `200`; proxy readiness endpoint is `/healthcheck`):
 
 ```bash
 python3 examples/disagg/toy_proxy_server.py --host 0.0.0.0 --port 8100 \
