@@ -29,22 +29,25 @@ _LOADER_KEYS = {
         "shared_blocks",
         "synthetic_acceptance_lengths",
     },
+    # Prefill and decode in one engine (no KV transfer): the decoder's keys.
+    "agg": {"presharded", "attention_dp", "shared_blocks"},
 }
 
 
 def role(vllm_config: Any) -> str | None:
     """``"prefill"`` or ``"decode"`` when the backend is selected
-    (``--load-format megakernel``), else None. Raises on a configuration the
-    backend can't serve."""
+    (``--load-format megakernel``) with a KV transfer config, ``"agg"``
+    (both programs in one engine) without one, else None. Raises on a
+    configuration the backend can't serve."""
     load_config = getattr(vllm_config, "load_config", None)
     if getattr(load_config, "load_format", None) != LOAD_FORMAT:
         return None
     kv = getattr(vllm_config, "kv_transfer_config", None)
-    if kv is None or kv.is_kv_producer == kv.is_kv_consumer:
+    if kv is not None and kv.is_kv_producer == kv.is_kv_consumer:
         raise ValueError(
-            "the megakernel backend serves one role of a P/D pair: "
-            "a KV transfer config with "
-            "kv_role kv_producer (prefill) or kv_consumer (decode)"
+            "the megakernel backend serves one role of a P/D pair (a KV "
+            "transfer config with kv_role kv_producer (prefill) or kv_consumer "
+            "(decode)) or, without a KV transfer config, both (agg)"
         )
     model_config = getattr(vllm_config, "model_config", None)
     architectures = (
@@ -55,7 +58,7 @@ def role(vllm_config: Any) -> str | None:
             f"no megakernel program for {architectures}; "
             f"supported: {list(ARCHITECTURES)}"
         )
-    selected = "prefill" if kv.is_kv_producer else "decode"
+    selected = "agg" if kv is None else "prefill" if kv.is_kv_producer else "decode"
     _loader_config(vllm_config, selected)
     return selected
 
@@ -134,18 +137,20 @@ def attention_dp(vllm_config: Any) -> int:
     """The decoder's attention data parallelism (``attention_dp`` in the
     decode role's loader config, default 1): the decode role then runs
     ``--decode-context-parallel-size`` TP / attention_dp."""
-    if role(vllm_config) != "decode":
+    selected = role(vllm_config)
+    if selected not in ("decode", "agg"):
         return 1
-    return int(_loader_config(vllm_config, "decode").get("attention_dp", 1))
+    return int(_loader_config(vllm_config, selected).get("attention_dp", 1))
 
 
 def shared_blocks(vllm_config: Any) -> int | None:
     """The decode role's shared KV block region under attention DP
     (``shared_blocks`` in its loader config; None: the default size,
     ``megakernel.dp_blocks``)."""
-    if role(vllm_config) != "decode":
+    selected = role(vllm_config)
+    if selected not in ("decode", "agg"):
         return None
-    value = _loader_config(vllm_config, "decode").get("shared_blocks")
+    value = _loader_config(vllm_config, selected).get("shared_blocks")
     return None if value is None else int(value)
 
 

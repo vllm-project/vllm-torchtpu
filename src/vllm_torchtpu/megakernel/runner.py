@@ -122,24 +122,28 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
         raise NotImplementedError("the K3 decoder speculates with DSpark only")
     config = MegakernelEngineConfig.from_vllm_config(vllm_config)
     moe_reduce_dtype = tpu_envs.TPU_K3_MOE_REDUCE_DTYPE
-    if config.attention_dp > 1:
+    if config.attention_dp > 1 or config.role == "agg":
         k3.check(config)
-    if config.attention_dp > 1 or moe_reduce_dtype != "float32":
+    if config.attention_dp > 1 or moe_reduce_dtype != "float32" or config.role == "agg":
         from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
 
         # Kernel modules read the config at import: install it before the
-        # program imports them.
+        # program imports them. The aggregated program's prefill runs EP8: it
+        # adopts the decoder's routed experts (the files as stored).
         kernel_config.install(
             kernel_config.KernelConfig(
                 attention_dp=config.attention_dp,
                 dcp_group=config.decode_context_parallel_size,
                 moe_reduce_dtype=moe_reduce_dtype,
+                prefill_expert_parallel=8 if config.role == "agg" else 16,
             )
         )
     # The prefill computes the rings of its loader config's draft; the
     # decoder drafts with the speculative config's model (and imports rings).
     if config.role == "prefill":
         draft = backend.draft(vllm_config)
+    elif config.role == "agg":
+        draft = None
     else:
         draft = Path(str(spec.model)) if spec is not None else None
     return k3.build(config, backend.presharded(vllm_config), draft, tp_rank=tp_rank)
@@ -360,7 +364,7 @@ class MegakernelModelRunner(TPUModelRunner):
         step_input = self._prepare_step_input(scheduler_output)
         assert self.program is not None
         if (
-            self.megakernel_role == "decode"
+            self.megakernel_role in ("decode", "agg")
             and scheduler_output.has_structured_output_requests
         ):
             # A structured request decodes this step: the grammar bitmask

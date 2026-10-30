@@ -159,6 +159,56 @@ def skips_step(
     return end // block == computed // block
 
 
+def rank_page_plan(
+    row: np.ndarray,
+    first: int,
+    pages: int,
+    skip: int,
+    *,
+    cp_rank: int,
+    position: int,
+    groups: int = 1,
+    num_physical: int = 0,
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """One rank's pages of a sequence continuing at global page ``first``
+    over a window piece of ``pages`` pages (the first ``skip`` cached, not
+    rewritten): ``(owned prefix pages' pool rows, [(piece page, pool row)]
+    to write)``, from the sequence's MLA block-table ``row``.
+
+    ``groups == 1`` (P/D): DCP 32 over every rank; this rank (``cp_rank``)
+    owns global page ``k`` with ``k % 32 == cp_rank``, at logical block
+    ``k // 32``. ``groups > 1`` (aggregated, the decoder under attention DP):
+    the scheduler's ids are ``g * num_physical + r`` (``megakernel.dp_blocks``),
+    so the sequence is DP group ``g``'s; only that group's mesh positions
+    ``g * cp .. (g + 1) * cp - 1`` own pages (``cp = 32 / groups``), page
+    ``k`` on member ``k % cp`` at logical block ``k // cp`` and physical row
+    ``id % num_physical`` -- where the decoder's DCP attention reads it.
+    """
+    if groups == 1:
+        cp, member, mine = DCP_SIZE, cp_rank, True
+
+        def block(index: int) -> int:
+            return int(row[index])
+    else:
+        if num_physical <= 0:
+            raise ValueError("rank_page_plan: attention DP needs num_physical")
+        cp = DCP_SIZE // groups
+        member, mine = position % cp, int(np.max(row)) // num_physical == position // cp
+
+        def block(index: int) -> int:
+            return int(row[index]) % num_physical
+
+    if not mine:
+        return [], []
+    owned = [block(k // cp) for k in range(member, first, cp)]
+    writes = [
+        (p, block((first + p) // cp))
+        for p in range(skip, pages)
+        if (first + p) % cp == member
+    ]
+    return owned, writes
+
+
 def plan_pieces(
     row: int,
     start: int,
@@ -301,15 +351,25 @@ class PrefillProgram:
         self._state_ops: dict[tuple[str, int], Any] = {}
 
     # ------------------------------------------------------------ weights
-    def load_weights(self, presharded) -> None:
+    def load_weights(self, presharded, shared_experts=None) -> None:
+        """``shared_experts``: the decoder's resident routed-expert tensors
+        (name -> tensor; the aggregated program): adopted instead of loading
+        a second copy, which needs the EP8 layout (the files as stored)."""
         cache = presharded / "prefill-sp-cache"
         from .config import active
 
         iterator = self._rank_loader.iter_prefill_rank(
-            presharded, cache, self.rank, split_experts=True
+            presharded,
+            cache,
+            self.rank,
+            split_experts=True,
+            skip_experts=shared_experts is not None,
         )
         self._expert_banks = []
-        if active().prefill_fused_moe and active().prefill_expert_parallel == 16:
+        if shared_experts is not None:
+            for name in _EXPERT_FAMILIES:
+                self.weights.setdefault("moe", {})[name] = shared_experts[name]
+        elif active().prefill_fused_moe and active().prefill_expert_parallel == 16:
             self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
             iterator = _bank_expert_weights(iterator)
 
@@ -337,6 +397,8 @@ class PrefillProgram:
         materialize(
             self._expert_banks[-1]["expert_ds"]
             if self._expert_banks
+            else self.weights["moe"]["latent_up"]
+            if shared_experts is not None
             else self.weights["moe"]["expert_ds"]
         )
         if self.rank == 0:
@@ -1165,19 +1227,31 @@ class KimiPrefiller:
         draft_checkpoint: Path | None = None,
         *,
         tp_rank: int,
+        page_groups: int = 1,
     ) -> None:
+        """``page_groups``: lay the pages out for a decoder under attention
+        DP ``page_groups`` (the aggregated program): a request's pages live
+        on its DP group's ``32 / page_groups`` ranks only (mesh positions
+        ``g * cp ..``), page ``k`` on member ``k % cp`` at physical row
+        ``id % N`` (``megakernel.dp_blocks``), so the decoder reads them in
+        place. 1: the P/D layout (DCP 32 over every rank)."""
         self.config = config
         self.page_tokens = config.block_size
         self.presharded = Path(presharded)
         self.cp_rank = tp_rank % config.decode_context_parallel_size
+        if page_groups not in (1, 2) or DCP_SIZE % page_groups:
+            raise NotImplementedError(f"K3 prefill: page_groups {page_groups}")
+        self.page_groups = page_groups
+        self.cp = DCP_SIZE // page_groups  # page owners per sequence
+        self._num_physical = 0
         budget = config.max_num_batched_tokens
         windows = prefill_windows(budget, config.max_model_len)
         # The most prefix tokens a window's sequences may hold in all (a
-        # multiple of 4096), and a rank's share of them: 1/32 plus a page of
+        # multiple of 4096), and a rank's share of them: 1/cp plus a page of
         # rounding slack per sequence, in multiples of 1024.
         capacity = max(windows[-1], -(-config.max_model_len // 4096) * 4096)
         self.cp_capacity = (
-            -(-(capacity // DCP_SIZE + SLOTS * self.page_tokens) // 1024) * 1024
+            -(-(capacity // self.cp + SLOTS * self.page_tokens) // 1024) * 1024
         )
         self.slots = min(config.max_num_seqs, SLOTS)
         self.program = PrefillProgram(windows, capacity, self.slots, self.page_tokens)
@@ -1226,11 +1300,11 @@ class KimiPrefiller:
                     self.presharded,
                 )
 
-    def load_weights(self) -> None:
+    def load_weights(self, shared_experts=None) -> None:
         if self._loaded:
             return
         started = time.perf_counter()
-        self.program.load_weights(self.presharded)
+        self.program.load_weights(self.presharded, shared_experts)
         if self.ring is not None:
             self.ring.load_weights()
         if self.draft_latents is not None:
@@ -1255,6 +1329,7 @@ class KimiPrefiller:
         self._writer = PoolWriter(
             self.program.mesh, self.rank, raw_pools, mla_raw, kda_raw, self._state_perm
         )
+        self._num_physical = int(raw_pools[0].shape[0])
         if self.draft_latents is not None:
             self.draft_latents.bind(draft_raw_pools(caches))
         of = {name: g for g, group in enumerate(groups) for name in group.layer_names}
@@ -1323,7 +1398,7 @@ class KimiPrefiller:
                 if state.start:
                     hits.append((i, state))
             if skips_step(
-                cached, total, prompt, state.start, largest, self.page_tokens * DCP_SIZE
+                cached, total, prompt, state.start, largest, self.page_tokens * self.cp
             ):
                 state.skipped.append(
                     (
@@ -1367,6 +1442,10 @@ class KimiPrefiller:
             if finishes:
                 del self._requests[state.req_id]
         return StepOutput(self._first_tokens(rows, logits, done))
+
+    def forget(self, req_id: str) -> None:
+        """Drop a finished (or aborted) request's in-memory prompt state."""
+        self._requests.pop(req_id, None)
 
     def _blocks(self, values: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(np.ascontiguousarray(values, np.int32)).to("tpu")
@@ -1645,28 +1724,34 @@ class KimiPrefiller:
         """This rank's context parallel operands for a packed window: its own
         prefix pages end to end (``[1, 1 + cp_capacity / page]``: count, then
         the block ids of global pages k with ``k % 32 == cp_rank``, at logical
-        block ``k // 32``), each sequence's base and token count in that list
+        block ``k // 32``; see :func:`rank_page_plan` for the attention DP
+        layout), each sequence's base and token count in that list
         (``[1, 2 * slots]``, the window's slots), and its page table for the
         window's writes (``[1, W / page]``: the pages it owns, the null block
         elsewhere)."""
-        cp, rank = DCP_SIZE, self.cp_rank
         own, bases, counts, cursor = [], [], [], 0
         table = [0] * (window // self.page_tokens)
         for piece, offset in members:
             state, _ = by_row[piece.row]
             row = rows[piece.row].block_tables[self._mla_group]
-            first = piece.start // self.page_tokens
-            # Prefix pages: all whole.
-            owned = [int(row[k // cp]) for k in range(rank, first, cp)]
+            # Cached pages: not rewritten.
+            skip = max(state.first_cached - piece.start, 0) // self.page_tokens
+            owned, writes = rank_page_plan(
+                row,
+                piece.start // self.page_tokens,
+                piece.rows // self.page_tokens,
+                skip,
+                cp_rank=self.cp_rank,
+                position=self.rank,
+                groups=self.page_groups,
+                num_physical=self._num_physical,
+            )
             bases.append(cursor)
             counts.append(len(owned) * self.page_tokens)
             own += owned
             cursor += len(owned) * self.page_tokens
-            # Cached pages: not rewritten.
-            skip = max(state.first_cached - piece.start, 0) // self.page_tokens
-            for p in range(skip, piece.rows // self.page_tokens):
-                if (first + p) % cp == rank:
-                    table[offset // self.page_tokens + p] = int(row[(first + p) // cp])
+            for p, block in writes:
+                table[offset // self.page_tokens + p] = block
         unused = self.program.window_slots(window) - len(members)
         if cursor > self.cp_capacity:
             raise RuntimeError(

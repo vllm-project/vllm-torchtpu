@@ -94,7 +94,21 @@ def add_arguments(parser) -> None:
         "decoder (masked steps fall back to plain ones) and check speculation "
         "around a run of masked steps",
     )
-    for check in (spec, handoff, packing, greedy, masked):
+    agg = sub.add_parser(
+        "agg",
+        help="the aggregated program (prefill + decode, shared experts): HBM, "
+        "then prefill -> in-place pages -> decode against a decode-only replay",
+    )
+    agg.add_argument("--kv-gib", type=float, default=9.0)
+    agg.add_argument("--max-num-seqs", type=int, default=128)
+    agg.add_argument("--max-model-len", type=int, default=16384)
+    agg.add_argument("--generate", type=int, default=32)
+    agg.add_argument("--prompt-tokens", default="1024,8192")
+    agg.add_argument("--hbm-limit-gib", type=float, default=92.0)
+    agg.add_argument(
+        "--load-only", action="store_true", help="stop after the HBM report"
+    )
+    for check in (spec, handoff, packing, greedy, masked, agg):
         check.add_argument(
             "--model",
             required=True,
@@ -109,6 +123,7 @@ def run(args, records: harness.Records) -> None:
         "packing": run_packing,
         "greedy": run_greedy,
         "masked": run_masked,
+        "agg": run_agg,
     }[args.check](args, records)
 
 
@@ -1392,3 +1407,227 @@ def run_packing(args, records: harness.Records) -> None:
         worst["packed"][n] > 2 * worst["packed4"][n] + 0.02 for n in names
     ):
         harness.fail("one-window packing departs further than the reference packing")
+
+
+def _hbm_all(tag: str, records: harness.Records) -> float:
+    """Every rank's device HBM (GiB in use, peak) gathered to rank 0; logs
+    the max over ranks and returns the max peak."""
+    import jax
+    import torch
+
+    stats = jax.local_devices()[0].memory_stats() or {}
+    mine = (
+        stats.get("bytes_in_use", 0) / 2**30,
+        stats.get("peak_bytes_in_use", 0) / 2**30,
+        stats.get("bytes_limit", 0) / 2**30,
+    )
+    every: list = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(every, mine)
+    use = max(e[0] for e in every)
+    peak = max(e[1] for e in every)
+    limit = min(e[2] for e in every)
+    harness.log(
+        f"HBM [{tag}]: in use max {use:.2f} GiB (min {min(e[0] for e in every):.2f}), "
+        f"peak max {peak:.2f} GiB of {limit:.2f}"
+    )
+    records.add(
+        case=f"agg-hbm-{tag}",
+        in_use_gib=round(use, 3),
+        peak_gib=round(peak, 3),
+        limit_gib=round(limit, 3),
+    )
+    return peak
+
+
+def run_agg(args, records: harness.Records) -> None:
+    """``check agg``: build the aggregated program as the server does, report
+    HBM after each phase (gate: peak <= ``--hbm-limit-gib``), then prefill
+    prompts through ``KimiAggregated.step`` exactly as the scheduler feeds it
+    (prompt minus its last token, then the last token on the decoder) in
+    both DP groups, and compare the greedy tokens with a decode-only replay
+    of the same prompt; finally the "Paris" coherence prompt."""
+    import time as _time
+
+    import torch
+
+    from vllm_torchtpu.megakernel import bridge
+    from vllm_torchtpu.megakernel import program as mk
+    from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
+    from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
+    from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
+
+    active = kernel_config.active()
+    if (active.attention_dp, active.dcp_group, active.prefill_expert_parallel) != (
+        2,
+        16,
+        8,
+    ):
+        harness.fail(
+            "check agg needs --set attention_dp=2 --set dcp_group=16 "
+            "--set prefill_expert_parallel=8"
+        )
+    rank = bridge.kernel_mesh("tp", k3_program.TP_SIZE)[1]
+    max_seqs, max_model_len = args.max_num_seqs, args.max_model_len
+    config = MegakernelEngineConfig(
+        role="agg",
+        tensor_parallel_size=32,
+        decode_context_parallel_size=16,
+        block_size=k3.PAGE,
+        kv_cache_dtype=k3.CACHE_DTYPE,
+        cp_kv_cache_interleave_size=k3.PAGE,
+        max_num_seqs=max_seqs,
+        max_model_len=max_model_len,
+        max_num_batched_tokens=k3_program.MAX_STEP_TOKENS + max_seqs,
+        async_scheduling=True,
+        attention_dp=2,
+    )
+    _hbm_all("start", records)
+    started = _time.perf_counter()
+    agg = k3_program.build(config, args.presharded, None, tp_rank=rank)
+    agg.load_weights()
+    harness.log(f"agg weights loaded in {_time.perf_counter() - started:.1f} s")
+    _hbm_all("weights", records)
+    from vllm_torchtpu.megakernel.kimi_k3.layout import cache_layout
+
+    layout = cache_layout(k3.CACHE_DTYPE)
+    block_bytes = (
+        24 * int(np.prod(layout.block_shape)) * (1 if "8" in layout.dtype else 2)
+    )
+    num_blocks = int(args.kv_gib * 2**30 // block_bytes)
+    harness.log(
+        f"KV: {num_blocks} blocks x {block_bytes / 2**20:.2f} MiB ({args.kv_gib} GiB)"
+    )
+    mla_width = max_model_len // k3.logical()
+    state_width = max_model_len // k3.PAGE
+    pools = k3.Pools(num_blocks, mla_width, state_width)
+    agg.bind_kv_caches(pools.caches, pools.groups)
+    _hbm_all("kv-bound", records)
+    started = _time.perf_counter()
+    agg.warmup()
+    harness.log(f"agg warm in {_time.perf_counter() - started:.1f} s")
+    peak = _hbm_all("warm", records)
+    if peak > args.hbm_limit_gib:
+        harness.fail(f"HBM peak {peak:.2f} GiB exceeds {args.hbm_limit_gib} GiB")
+    if args.load_only:
+        return
+
+    ids, tokenizer = k3.fixed_prompt(24000, args.model)
+    lengths = [int(n) for n in args.prompt_tokens.split(",") if n]
+    paris = list(tokenizer.encode("The capital of France is", disallowed_special=()))
+    prompts = {f"P{n}": ids[1000 * i : 1000 * i + n] for i, n in enumerate(lengths)}
+    prompts["paris"] = paris
+    generate = args.generate
+
+    def tables_for(name, index, n):
+        mla = pools.scheduled(
+            pools.fresh(-(-(n + generate + 1) // k3.logical())), index
+        )
+        columns = -(-(n + generate + 1) // k3.PAGE)
+        kda = [pools.fresh(columns) for _ in range(3)]
+        return pools.tables(list(mla), kda)
+
+    def run_agg_request(name, index, prompt):
+        n = len(prompt)
+        tables = tables_for(name, index, n)
+        token_ids = np.zeros(n + generate + 1, np.int32)
+        token_ids[:n] = prompt
+        outs = []
+        if n > 1:  # the prefill's chunk: the prompt minus its last token
+            agg.step(
+                mk.StepInput(
+                    [
+                        mk.RequestInput(
+                            req_id=name,
+                            computed=0,
+                            scheduled=n - 1,
+                            token_ids=token_ids,
+                            num_tokens=n,
+                            num_prompt_tokens=n,
+                            block_tables=tables,
+                        )
+                    ]
+                )
+            )
+        computed = n - 1 if n > 1 else 0
+        scheduled = 1 if n > 1 else n
+        for step in range(generate):
+            out = agg.step(
+                mk.StepInput(
+                    [
+                        mk.RequestInput(
+                            req_id=name,
+                            computed=computed,
+                            scheduled=scheduled,
+                            token_ids=token_ids,
+                            num_tokens=computed + scheduled,
+                            num_prompt_tokens=n,
+                            block_tables=tables,
+                        )
+                    ]
+                )
+            )
+            outs.append(out.tokens[:1])
+            computed += scheduled
+            scheduled = 1
+        agg.step(mk.StepInput([], (name,)))
+        return [int(t) for t in torch.cat(outs).cpu().reshape(-1).tolist() if t >= 0]
+
+    def run_reference(name, index, prompt):
+        n = len(prompt)
+        tables = tables_for(name, index, n)
+        token_ids = np.zeros(n + generate + 1, np.int32)
+        token_ids[:n] = prompt
+        outs, computed, scheduled = [], 0, n
+        for step in range(generate):
+            out = agg.decoder.step(
+                mk.StepInput(
+                    [
+                        mk.RequestInput(
+                            req_id=name,
+                            computed=computed,
+                            scheduled=scheduled,
+                            token_ids=token_ids,
+                            num_tokens=computed + scheduled,
+                            num_prompt_tokens=n,
+                            block_tables=tables,
+                        )
+                    ]
+                )
+            )
+            outs.append(out.tokens[:1])
+            computed += scheduled
+            scheduled = 1
+        agg.decoder.step(mk.StepInput([], (name,)))
+        return [int(t) for t in torch.cat(outs).cpu().reshape(-1).tolist() if t >= 0]
+
+    all_ok = True
+    for index, (name, prompt) in enumerate(prompts.items()):
+        for group in (0, 1) if name != "paris" else (0,):
+            started = _time.perf_counter()
+            got = run_agg_request(f"agg-{name}-g{group}", group, prompt)
+            agg_s = _time.perf_counter() - started
+            ref = run_reference(f"ref-{name}-g{group}", group, prompt)
+            same = _agree(got, ref)
+            ok = bool(got) and bool(ref) and got[0] == ref[0]
+            all_ok &= ok
+            harness.log(
+                f"agg {name} ({len(prompt)} tokens, DP group {group}): first token "
+                f"{'matches' if ok else 'DIFFERS'}; first {same} of {len(ref)} agree "
+                f"({agg_s:.1f} s); agg {tokenizer.decode(got[:24])!r}; "
+                f"ref {tokenizer.decode(ref[:24])!r}"
+            )
+            records.add(
+                case=f"agg-{name}-g{group}",
+                prompt_tokens=len(prompt),
+                first_token_matches=ok,
+                agree=[same, len(ref)],
+            )
+            if name == "paris":
+                text = tokenizer.decode(got)
+                harness.log(
+                    f"PARIS check: {'PASS' if 'Paris' in text else 'FAIL'} {text!r}"
+                )
+                all_ok &= "Paris" in text
+    harness.log(f"agg stats {agg.stats}")
+    if not all_ok:
+        harness.fail("an aggregated first token differs from the decode-only replay")

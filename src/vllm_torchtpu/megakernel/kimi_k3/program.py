@@ -152,26 +152,36 @@ def check(config: MegakernelEngineConfig) -> None:
     """Raise ``NotImplementedError`` for a configuration the K3 programs
     do not implement."""
     recurrent_state_dtype(config.mamba_ssm_cache_dtype)
-    if config.role == "prefill" and config.mamba_ssm_cache_dtype == "bfloat16":
+    if config.role in ("prefill", "agg") and config.mamba_ssm_cache_dtype == "bfloat16":
         raise NotImplementedError(
             "K3 megakernel --mamba-ssm-cache-dtype bfloat16 is decode-only; "
             "the prefill worker requires auto or float32 for its FP32 state "
             "and transfer format"
         )
-    if config.role not in ("prefill", "decode"):
+    if config.role not in ("prefill", "decode", "agg"):
         raise NotImplementedError(
-            f"the K3 megakernel serves one role of a P/D pair, not {config.role!r}"
+            "the K3 megakernel serves one role of a P/D pair or both "
+            f"(agg), not {config.role!r}"
         )
     if config.tensor_parallel_size != TP_SIZE:
         raise NotImplementedError(
             f"the K3 megakernel needs --tensor-parallel-size {TP_SIZE}"
         )
     if config.attention_dp not in (1, 2) or (
-        config.attention_dp > 1 and config.role != "decode"
+        config.attention_dp > 1 and config.role == "prefill"
     ):
         raise NotImplementedError(
             "the K3 decoder runs attention_dp 1 or 2; the prefill runs 1"
         )
+    if config.role == "agg":
+        if config.num_speculative_tokens:
+            raise NotImplementedError("K3 agg does not speculate (yet)")
+        if config.max_num_batched_tokens < MAX_STEP_TOKENS + config.max_num_seqs:
+            raise NotImplementedError(
+                "K3 agg needs --max-num-batched-tokens >= "
+                f"{MAX_STEP_TOKENS} + --max-num-seqs (one prefill window "
+                "beside a full decode batch)"
+            )
     dcp = DCP_SIZE // config.attention_dp
     if config.decode_context_parallel_size != dcp:
         raise NotImplementedError(
@@ -221,7 +231,7 @@ def check(config: MegakernelEngineConfig) -> None:
                 f"rates {list(own)} differ from --speculative-config's "
                 f"{list(config.synthetic_acceptance_rates or ())}"
             )
-    if config.role == "decode" and not config.async_scheduling:
+    if config.role in ("decode", "agg") and not config.async_scheduling:
         raise NotImplementedError(
             "the K3 decoder needs async scheduling (it keeps each request's next "
             "input on the device)"
@@ -240,7 +250,7 @@ def capabilities(config: MegakernelEngineConfig) -> Capabilities:
         max_step_tokens=MAX_STEP_TOKENS
         if config.role == "prefill"
         else config.max_num_batched_tokens,
-        page_aligned_chunks=config.role == "prefill",
+        page_aligned_chunks=config.role in ("prefill", "agg"),
         block_copies=config.role == "prefill",
         # The decoder's plain op masks its logits (the prefill discards its
         # first tokens, so it only accepts the requests). DSpark's verify ops
@@ -261,6 +271,10 @@ def build(
     the prefill computes its ring, the decoder drafts with it and imports the
     ring the prefill wrote)."""
     check(config)
+    if config.role == "agg":
+        from vllm_torchtpu.megakernel.kimi_k3.agg import KimiAggregated
+
+        return KimiAggregated(config, Path(presharded), tp_rank=tp_rank)
     if config.role == "prefill":
         from vllm_torchtpu.megakernel.kimi_k3.prefill import KimiPrefiller
 

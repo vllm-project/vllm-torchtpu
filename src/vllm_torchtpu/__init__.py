@@ -94,6 +94,25 @@ def _model_needs_page_aligned_chunks(vllm_config) -> bool:
     return capabilities is not None and capabilities.page_aligned_chunks
 
 
+def _model_is_megakernel_agg(vllm_config) -> bool:
+    """Whether the megakernel backend runs both programs in one engine."""
+    from vllm_torchtpu.megakernel import backend
+
+    return backend.role(vllm_config) == "agg"
+
+
+def hold_back_last_prompt_token(start: int, num_new_tokens: int, prompt: int) -> int:
+    """The megakernel agg engine's prompt chunks stop before the prompt's last
+    token: a chunk ``[start, start + num_new_tokens)`` crossing it ends there,
+    so that token is scheduled alone next step and runs on the decoder (as
+    the P/D producer's handoff does:
+    ``tpu_connector._maybe_truncate_prompt_for_handoff``)."""
+    last = prompt - 1
+    if start < last < start + num_new_tokens:
+        return last - start
+    return num_new_tokens
+
+
 def _disable_partial_hits_without_block_copies(scheduler) -> bool:
     """Round prefix hits down to scheduler blocks for a megakernel program
     that cannot apply copy-on-write block copies, which vLLM's partial hits
@@ -197,6 +216,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         if needs_pages is None:
             needs_pages = _model_needs_page_aligned_chunks(self.vllm_config)
             self._tpu_page_aligned_chunks = needs_pages
+            self._tpu_megakernel_agg = _model_is_megakernel_agg(self.vllm_config)
         if not needs_pages:
             return num_new_tokens
         page = physical_cache_config.block_size
@@ -205,6 +225,12 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
+        if self._tpu_megakernel_agg:
+            num_new_tokens = hold_back_last_prompt_token(
+                start, num_new_tokens, request.num_prompt_tokens
+            )
+            if start + num_new_tokens == request.num_prompt_tokens - 1:
+                return num_new_tokens  # the prefill's last chunk: exempt
         end = start + num_new_tokens
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
         if start < prefill_end and end < prefill_end and end % page:

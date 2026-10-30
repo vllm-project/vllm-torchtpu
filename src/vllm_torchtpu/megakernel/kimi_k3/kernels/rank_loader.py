@@ -297,12 +297,15 @@ def _sequence_parallel_output(own: np.ndarray, peer_dir: RankDir, name: str, ran
 
 
 def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 93,
-                      split_experts: bool = False) -> Iterator[tuple[str, str, np.ndarray]]:
+                      split_experts: bool = False,
+                      skip_experts: bool = False) -> Iterator[tuple[str, str, np.ndarray]]:
     """The prefill stack's weights for ``rank``.
 
     Yields ``(group, name, array)`` with ``group`` in io/common/kda/mla/moe
     (per-rank arrays, without the rank axis); expert families first
     (``split_experts``: per file, as in :func:`iter_decode_rank`).
+    ``skip_experts``: yield no routed-expert family (the caller adopts the
+    decoder's resident copy: EP8 reads the decoder's files as stored).
     """
     rank_dir = RankDir(presharded, rank, layers)
     peer_dir = RankDir(presharded, rank ^ 1, layers)
@@ -324,7 +327,10 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
 
     ep = _config().prefill_expert_parallel
     jobs: list[tuple] = []
-    if ep in (16, 32):  # regrouped from the EP8 group's quarters (same host)
+    if skip_experts:
+        if ep != 8:
+            raise ValueError("sharing the decoder's experts needs prefill_expert_parallel=8")
+    elif ep in (16, 32):  # regrouped from the EP8 group's quarters (same host)
         group = 4 * (rank // 4)
         if ep == 32:  # 28 whole experts
             quarters, part, parts = range(4), rank % 4, 4
