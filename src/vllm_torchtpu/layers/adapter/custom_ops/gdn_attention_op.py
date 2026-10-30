@@ -50,7 +50,6 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
-from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -201,7 +200,6 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
-    prepare_input: Callable[[jax.Array], jax.Array | Conv1DInput] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -227,7 +225,6 @@ def gdn_attention_pooled_core_tpu(
         recurrent_state_dtype=recurrent_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
-        prepare_input=prepare_input,
     )
 
 
@@ -372,7 +369,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
-    _pooled_input_preparer: Callable[[jax.Array], jax.Array | Conv1DInput] | None = None
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -381,12 +377,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(
         self,
         *args,
-        pooled_input_preparer: Callable[[jax.Array], jax.Array | Conv1DInput]
-        | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self._pooled_input_preparer = pooled_input_preparer
         self._create_conv1d()
         # `_require_pcp_projection_parameters` hands this weight straight to
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
@@ -711,9 +704,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return gdn_impl
 
     def _build_pooled_gdn_op(self, *, block_major: bool = False):
-        # The stateless callback and its identity are shared by the pooled op.
-        # Dense and PCP operators do not call it.
-        prepare_input = self._pooled_input_preparer
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)
@@ -782,7 +772,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
-                prepare_input=prepare_input,
             )
             if not block_major:
                 return result
@@ -808,7 +797,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         gdn_jax_op = _get_shared_gdn_op(
             "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled",
             (
-                prepare_input,
                 id(mesh),
                 id(vllm_config),
                 n_kq,

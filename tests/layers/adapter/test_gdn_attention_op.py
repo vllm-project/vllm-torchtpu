@@ -1591,15 +1591,7 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
     assert tuple(new_pool.shape) == tuple(pool.shape)
 
 
-@pytest.mark.parametrize(
-    "ssm_cache_dtype,ssm_dtype", [("bfloat16", jnp.bfloat16), ("float32", jnp.float32)]
-)
-def test_pooled_input_preparation_separates_cached_ops(
-    cpu_vllm_config_context, ssm_cache_dtype, ssm_dtype
-):
-    def prepare_projection(mixed_qkv):
-        return mixed_qkv + 1
-
+def test_pooled_cache_distinguishes_recurrent_state_dtypes(cpu_vllm_config_context):
     captured = []
 
     def build(name, function, **kwargs):
@@ -1611,21 +1603,15 @@ def test_pooled_input_preparation_separates_cached_ops(
         set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
         patch.object(gdn_attention_op.pallas, "jax_op", side_effect=build),
     ):
-        for index, preparation in enumerate(
-            (None, prepare_projection, prepare_projection)
-        ):
+        for index, dtype in enumerate(("bfloat16", "float32", "bfloat16")):
             attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
-            attn._pooled_input_preparer = preparation
-            attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
+            attn.cache_config.mamba_ssm_cache_dtype = dtype
             attn._build_pooled_gdn_op()
-
     assert len(captured) == 2
     assert captured[0][0] != captured[1][0]
     operands: list[torch.Tensor | None] = [torch.zeros((1, 1)) for _ in range(12)]
     operands[5] = None
-    projection = operands[0]
-    assert projection is not None
-    for index, (_, function) in enumerate(captured):
+    for (_, function), dtype in zip(captured, (jnp.bfloat16, jnp.float32), strict=True):
         with patch.object(
             gdn_attention_op,
             "gdn_attention_pooled_core_tpu",
@@ -1633,13 +1619,7 @@ def test_pooled_input_preparation_separates_cached_ops(
         ) as dispatch:
             function(*operands)
         assert dispatch.call_args.args[0] is operands[0]
-        preparation = dispatch.call_args.kwargs["prepare_input"]
-        actual = projection if preparation is None else preparation(projection)
-        torch.testing.assert_close(actual, projection + index)
-        assert attn.get_state_dtype()[0] == torch.float32
-        assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
-            ssm_dtype
-        )
+        assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(dtype)
 
 
 @pytest.mark.parametrize(
@@ -1717,7 +1697,7 @@ def test_shared_pooled_op_does_not_retain_first_layer(cpu_vllm_config_context):
             assert dispatch.call_args.args[0] is operands[0]
 
 
-def test_pooled_builder_uses_static_callback_without_descriptor_probe(
+def test_pooled_builder_does_not_probe_descriptors(
     cpu_vllm_config_context, monkeypatch
 ):
     layer = _qwen35_397b_gdn_attn("model.layers.0.linear_attn")
@@ -1735,12 +1715,7 @@ def test_pooled_builder_uses_static_callback_without_descriptor_probe(
     assert build.called
 
 
-def test_qwen_model_preparation_is_shared_without_retaining_layer(
-    cpu_vllm_config_context,
-):
-    from vllm_torchtpu.kernels.qwen4_exp import gdn_input as gdn
-
-    preparation = gdn.prepare_gdn_input
+def test_pooled_cache_shares_geometry_without_retaining_layer(cpu_vllm_config_context):
     captured = []
 
     def register(name, function, **kwargs):
@@ -1754,16 +1729,13 @@ def test_qwen_model_preparation_is_shared_without_retaining_layer(
         patch.object(gdn_attention_op.pallas, "jax_op", side_effect=register),
     ):
         first = _qwen38_gdn_attn("model.layers.0.linear_attn")
-        first._pooled_input_preparer = preparation
         torch.nn.Module.__init__(first)
         first._build_pooled_gdn_op()
         first_ref = weakref.ref(first)
         second = _qwen38_gdn_attn("model.layers.1.linear_attn")
-        second._pooled_input_preparer = preparation
         second._build_pooled_gdn_op()
         assert len(captured) == 1
         callback = captured[0]
-        assert any(preparation in key[1] for key in gdn_attention_op._shared_gdn_ops)
         del first
         gc.collect()
         assert first_ref() is None
@@ -1771,101 +1743,15 @@ def test_qwen_model_preparation_is_shared_without_retaining_layer(
         operands: list[torch.Tensor | None] = [torch.zeros((1, 1)) for _ in range(12)]
         operands[5] = None
         operands[11] = torch.zeros((3,), dtype=torch.int32)
-        prepared = jnp.ones((1, 1, 1), jnp.float32)
-        # The cached callback must read the resolved block size at invocation.
-        config.cache_config.block_size = 1664
-        with (
-            patch.object(gdn, "supports_compact_qkv", return_value=True),
-            patch.object(gdn, "compact_qkv_input", return_value=prepared) as prepare,
-            patch.object(
-                gdn_attention_op,
-                "gdn_attention_pooled_core_tpu",
-                return_value=(operands[3], operands[0]),
-            ) as dispatch,
-        ):
+        config.cache_config.block_size += 1
+        with patch.object(
+            gdn_attention_op,
+            "gdn_attention_pooled_core_tpu",
+            return_value=(operands[3], operands[0]),
+        ) as dispatch:
             callback(*operands)
-            prepare.assert_not_called()
-            local_projection = jnp.zeros((1, 1), jnp.bfloat16)
-            local_prepared = preparation(local_projection)
         assert dispatch.call_args.args[0] is operands[0]
-        assert dispatch.call_args.kwargs["prepare_input"] is preparation
-        assert isinstance(local_prepared, gdn.Conv1DInput)
-        assert local_prepared.values is prepared
-        assert local_prepared.output_dtype == local_projection.dtype
-        prepare.assert_called_once_with(local_projection)
-        assert dispatch.call_args.kwargs["pool_block_tokens"] == 1664
-
-
-def test_qwen_decoder_constructs_real_static_preparation_layer(
-    cpu_vllm_config_context, monkeypatch
-):
-    """Keep the real decoder and GDN constructor; avoid weight/kernel allocation."""
-    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-        QwenGatedDeltaNetAttention,
-    )
-
-    from vllm_torchtpu.kernels.qwen4_exp import gdn_input as gdn
-    from vllm_torchtpu.models.vllm.qwen4_exp import model
-
-    def initialize_projection_metadata(self, config, **kwargs):
-        torch.nn.Module.__init__(self)
-        prototype = _qwen38_gdn_attn(kwargs["prefix"])
-        self.__dict__.update(prototype.__dict__)
-
-    # Projection/weight allocation is orthogonal to the constructor's static
-    # callback binding. The real pooled builder and shared key are exercised.
-    monkeypatch.setattr(
-        QwenGatedDeltaNetAttention, "__init__", initialize_projection_metadata
-    )
-    monkeypatch.setattr(VllmGatedDeltaNetAttention, "_create_conv1d", lambda self: None)
-    monkeypatch.setattr(VllmGatedDeltaNetAttention, "_build_gdn_op", lambda self: None)
-    monkeypatch.setattr(
-        model, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
-    )
-    monkeypatch.setattr(model, "hc_config", lambda cfg: object())
-    monkeypatch.setattr(model, "GatedResidual", lambda *a, **kw: torch.nn.Identity())
-    monkeypatch.setattr(
-        model, "Qwen3NextSparseMoeBlock", lambda *a, **kw: torch.nn.Identity()
-    )
-    monkeypatch.setenv("VLLM_TPU_BLOCK_MAJOR_KV", "1")
-    text = SimpleNamespace(layer_types=["linear_attention"], ple_layer_ids=[])
-    cfg = SimpleNamespace(
-        model_config=SimpleNamespace(hf_text_config=text),
-        quant_config=None,
-        additional_config={},
-    )
-    kernel_config = _vllm_config()
-    kernel_config.model_config = SimpleNamespace(
-        architecture="Qwen4ExpForCausalLM",
-        is_hybrid=True,
-    )
-    callbacks = []
-
-    def register(name, function, **kwargs):
-        callbacks.append(function)
-        return MagicMock()
-
-    with (
-        patch.dict(gdn_attention_op._shared_gdn_ops, {}, clear=True),
-        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=kernel_config),
-        patch.object(gdn_attention_op.pallas, "jax_op", side_effect=register),
-    ):
-        layer = model.Qwen4ExpDecoderLayer(cfg, 0, "model.layers.0")
-        cache_keys = tuple(gdn_attention_op._shared_gdn_ops)
-    attention = layer.linear_attn
-    assert type(attention) is VllmGatedDeltaNetAttention
-    assert attention._bm_kernel
-    assert len(callbacks) == 1
-    preparation = attention._pooled_input_preparer
-    assert preparation is gdn.prepare_gdn_input
-    operands: list[torch.Tensor | None] = [torch.zeros((1, 1)) for _ in range(12)]
-    operands[5] = None
-    with patch.object(
-        gdn_attention_op,
-        "gdn_attention_pooled_core_tpu",
-        return_value=(operands[3], operands[0]),
-    ) as dispatch:
-        callbacks[0](*operands)
-    assert dispatch.call_args.kwargs["prepare_input"] is preparation
-    assert any(preparation in key[1] for key in cache_keys)
-    assert attention.kv_cache is None
+        assert (
+            dispatch.call_args.kwargs["pool_block_tokens"]
+            == config.cache_config.block_size
+        )

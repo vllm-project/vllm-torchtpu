@@ -17,7 +17,6 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 
 import functools
-from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -34,7 +33,6 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     derive_gdn_head_geometry,
 )
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
-from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 _GDN_TP_AXIS_NAME = "tp"
@@ -836,19 +834,17 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
-    prepare_input: Callable[[jax.Array], jax.Array | Conv1DInput] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Run GDN on a logical-block view of the unified pool.
 
     The V3 kernel addresses FP32 Conv and configured SSM granules within
-    each logical block. Input preparation runs on the rank-local projection.
+    each logical block.
     """
 
     pool_shape = recurrent_state.shape
     pool = _as_logical_block_pool(recurrent_state, pool_block_tokens)
-    prepared_qkv = mixed_qkv if prepare_input is None else prepare_input(mixed_qkv)
     pool, output = gdn_v3_wrapper.fused_conv1d_gdn(
-        prepared_qkv,
+        mixed_qkv,
         b,
         a,
         pool,
@@ -899,7 +895,6 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
-    prepare_input: Callable[[jax.Array], jax.Array | Conv1DInput] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -983,7 +978,6 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
-        prepare_input=prepare_input,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,

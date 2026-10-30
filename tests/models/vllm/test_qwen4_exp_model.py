@@ -117,13 +117,11 @@ def test_rope_sharing_is_model_local_and_excludes_kv_state(monkeypatch, layer_ty
     assert not any(name.endswith("rope_cache") for name in first.state_dict())
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_qwen_decoder_compact_input_requires_explicit_opt_in(monkeypatch, enabled):
+def test_qwen_decoder_uses_registered_gdn_layer(monkeypatch):
     from unittest.mock import Mock
 
     from vllm_torchtpu.models.vllm.qwen4_exp import model
 
-    monkeypatch.setenv("TPU_GDN_COMPACT_INPUT", str(int(enabled)))
     text = q4exp_text_config(ple_layer_ids=[], layer_types=["linear_attention"])
     cfg = NS(model_config=NS(hf_text_config=text), additional_config={})
     attention = Mock(return_value=nn.Identity())
@@ -137,8 +135,7 @@ def test_qwen_decoder_compact_input_requires_explicit_opt_in(monkeypatch, enable
     layer = model.Qwen4ExpDecoderLayer(cfg, 0, "model.layers.0")
 
     assert layer.linear_attn is attention.return_value
-    expected = model.prepare_gdn_input if enabled else None
-    assert attention.call_args.kwargs["pooled_input_preparer"] is expected
+    assert "pooled_input_preparer" not in attention.call_args.kwargs
     assert "use_compact_qkv" not in attention.call_args.kwargs
     assert "pooled_conv_state_dtype" not in attention.call_args.kwargs
 
@@ -216,15 +213,3 @@ def test_model_hc_reads_typed_debug_override(
     for connection in connections[:2]:
         assert combine_selected(connection, block, x, x) is bool(expected)
     assert connections[2]._prefill_combine_op is None
-
-
-def test_compact_input_environment_default_and_validation(monkeypatch):
-    from vllm_torchtpu import envs
-
-    monkeypatch.delenv("TPU_GDN_COMPACT_INPUT", raising=False)
-    assert envs.TPU_GDN_COMPACT_INPUT is False
-    monkeypatch.setenv("TPU_GDN_COMPACT_INPUT", "1")
-    assert envs.TPU_GDN_COMPACT_INPUT is True
-    monkeypatch.setenv("TPU_GDN_COMPACT_INPUT", "invalid")
-    with pytest.raises(ValueError, match="TPU_GDN_COMPACT_INPUT"):
-        _ = envs.TPU_GDN_COMPACT_INPUT
