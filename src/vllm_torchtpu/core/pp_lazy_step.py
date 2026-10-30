@@ -42,10 +42,9 @@ until hand-off ``p + 1`` stage ``r`` runs the forward of the burst's step
 to a step's forward or push call right after the hand-off that starts that
 step on it, so its reply for step ``m`` marks hand-off ``m + stages - 1``.
 Earlier hand-offs are estimated from the dispatch times and the expected
-forward times: the step cost model's (``core/pp_chunks.py``) scaled by the
-measured ones, or the measured ones alone. Step ``p`` is pushed once the
-time since hand-off ``p`` exceeds ``_PUSH_DELAY`` of the longest forward
-the other stages run before hand-off ``p + 1``.
+forward times, the running estimate of the measured ones. Step ``p`` is
+pushed once the time since hand-off ``p`` exceeds ``_PUSH_DELAY`` of the
+longest forward the other stages run before hand-off ``p + 1``.
 
 Two things about the setup are needed, and other setups keep vLLM's loop:
 the engine reads a reply only once it has arrived, which needs the last
@@ -114,8 +113,6 @@ class _Slot:
     dispatched: float
     # Expected forward time on one stage in seconds; 0 for a push.
     expected: float
-    # The cost model's time for the step in ms, None without it.
-    modelled_ms: float | None = None
     # When the last stage's reply to the step's forward or push call was
     # read, and in which drain.
     started_last: float | None = None
@@ -147,7 +144,6 @@ class LazyPushStepper:
             self.executor.output_rank
         ].remote_socket
         self.timeout = vllm_envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
-        self.modelled = getattr(core.scheduler, "step_estimate_ms", None)
         # Dispatched steps, oldest first; the engine core's batch queue.
         self.in_flight: deque[_Step] = deque()
         # This burst's newest steps in dispatch order, pushes included, and
@@ -155,9 +151,8 @@ class LazyPushStepper:
         self.slots: list[_Slot] = []
         self.first_slot = 0
         self.last_real = -1
-        # Measured over modelled forward time, and the measured time in
-        # seconds for steps the cost model does not cover.
-        self.ratio = 1.0
+        # Running estimate of a step's forward time on one stage in
+        # seconds; 0 until a forward is measured.
         self.measured = 0.0
         self.drains = 0
         self.dropped = 0
@@ -268,15 +263,7 @@ class LazyPushStepper:
         if opens:
             self.slots.clear()
             self.first_slot = 0
-        modelled_ms = (
-            self.modelled(scheduler_output) if self.modelled is not None else None
-        )
-        expected = (
-            self.ratio * modelled_ms / 1000.0
-            if modelled_ms is not None
-            else self.measured
-        )
-        slot = _Slot(now, expected, modelled_ms)
+        slot = _Slot(now, self.measured)
         self._add_slot(slot)
         self.last_real = self.first_slot + len(self.slots) - 1
         exec_future.add_done_callback(lambda _: self._started_last(slot))
@@ -305,12 +292,12 @@ class LazyPushStepper:
         if settles <= 5 or settles % 100 == 0:
             logger.info(
                 "PP lazy push: %d settles, %d pushes, %d steps, %d empty "
-                "steps dropped; forwards take %.2fx the cost model's time",
+                "steps dropped; forwards take %.1f ms",
                 settles,
                 self.wave.pushes,
                 self.wave.real_steps,
                 self.dropped,
-                self.ratio,
+                self.measured * 1000.0,
             )
 
     def _push(self) -> None:
@@ -362,11 +349,7 @@ class LazyPushStepper:
         if slot.started_last is None or slot.started_drain == self.drains:
             return
         seconds = time.monotonic() - slot.started_last
-        if slot.modelled_ms:
-            self.ratio += _MEASURE_WEIGHT * (
-                _banded(seconds * 1000.0 / slot.modelled_ms, self.ratio) - self.ratio
-            )
-        elif self.measured == 0.0:
+        if self.measured == 0.0:
             self.measured = seconds
         else:
             self.measured += _MEASURE_WEIGHT * (
