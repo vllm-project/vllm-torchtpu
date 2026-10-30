@@ -6,7 +6,8 @@
     --model-loader-extra-config '{"presharded": "/path/to/kimi-k3-tp32"}'
 
 ``presharded`` is the program's TP32 pre-shard directory. A KV producer runs
-the prefill program, a KV consumer the decode program; the worker then builds
+the prefill program, a KV consumer the decode program, and an engine without a
+KV transfer config both on one engine (``aggregate``); the worker then builds
 ``MegakernelModelRunner`` and loads the weightless model through
 ``megakernel.loader``. Cheap to import: the platform and the scheduler
 patches call it.
@@ -29,22 +30,24 @@ _LOADER_KEYS = {
         "shared_blocks",
         "synthetic_acceptance_lengths",
     },
+    "aggregate": {"presharded", "synthetic_acceptance_lengths"},
 }
 
 
 def role(vllm_config: Any) -> str | None:
-    """``"prefill"`` or ``"decode"`` when the backend is selected
+    """``"prefill"``, ``"decode"`` or ``"aggregate"`` (no KV transfer config:
+    both programs on one engine) when the backend is selected
     (``--load-format megakernel``), else None. Raises on a configuration the
     backend can't serve."""
     load_config = getattr(vllm_config, "load_config", None)
     if getattr(load_config, "load_format", None) != LOAD_FORMAT:
         return None
     kv = getattr(vllm_config, "kv_transfer_config", None)
-    if kv is None or kv.is_kv_producer == kv.is_kv_consumer:
+    if kv is not None and kv.is_kv_producer == kv.is_kv_consumer:
         raise ValueError(
-            "the megakernel backend serves one role of a P/D pair: "
-            "a KV transfer config with "
-            "kv_role kv_producer (prefill) or kv_consumer (decode)"
+            "the megakernel backend serves one role of a P/D pair "
+            "(a KV transfer config with kv_role kv_producer or kv_consumer) "
+            "or both on one engine (no KV transfer config)"
         )
     model_config = getattr(vllm_config, "model_config", None)
     architectures = (
@@ -55,7 +58,10 @@ def role(vllm_config: Any) -> str | None:
             f"no megakernel program for {architectures}; "
             f"supported: {list(ARCHITECTURES)}"
         )
-    selected = "prefill" if kv.is_kv_producer else "decode"
+    if kv is None:
+        selected = "aggregate"
+    else:
+        selected = "prefill" if kv.is_kv_producer else "decode"
     _loader_config(vllm_config, selected)
     return selected
 
@@ -115,7 +121,7 @@ def mla_draft(vllm_config: Any) -> Path | None:
     selected = role(vllm_config)
     if selected == "prefill":
         path = draft(vllm_config)
-    elif selected == "decode":
+    elif selected in ("decode", "aggregate"):
         spec = vllm_config.speculative_config
         path = (
             Path(str(spec.model))
@@ -154,9 +160,10 @@ def synthetic_acceptance_lengths(vllm_config: Any) -> dict[int, float] | None:
     (``synthetic_acceptance_lengths`` in its loader config, e.g.
     ``{"3": 2.87, "7": 3.78}``; None: vLLM's one rate vector, truncated to
     each width)."""
-    if role(vllm_config) != "decode":
+    selected = role(vllm_config)
+    if selected not in ("decode", "aggregate"):
         return None
-    value = _loader_config(vllm_config, "decode").get("synthetic_acceptance_lengths")
+    value = _loader_config(vllm_config, selected).get("synthetic_acceptance_lengths")
     if value is None:
         return None
     if not isinstance(value, dict) or not value:
@@ -175,7 +182,7 @@ def draft_ring_rows(vllm_config: Any) -> int:
     selected = role(vllm_config)
     if selected == "prefill":
         carries = draft(vllm_config) is not None
-    elif selected == "decode":
+    elif selected in ("decode", "aggregate"):
         spec = vllm_config.speculative_config
         carries = spec is not None and spec.method == "dspark"
     else:

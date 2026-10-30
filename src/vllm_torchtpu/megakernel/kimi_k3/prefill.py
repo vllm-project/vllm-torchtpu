@@ -303,12 +303,17 @@ class PrefillProgram:
         self._state_ops: dict[tuple[str, int], Any] = {}
 
     # ------------------------------------------------------------ weights
-    def load_weights(self, presharded) -> None:
+    def load_weights(
+        self, presharded, shared: Mapping[str, torch.Tensor] | None = None
+    ) -> None:
+        """Stream this rank's weights; families in ``shared`` (the decode's
+        device tensors, ``rank_loader.PREFILL_SHARED``) are used as they are."""
         cache = presharded / "prefill-sp-cache"
         from .config import active
 
+        shared = dict(shared or {})
         iterator = self._rank_loader.iter_prefill_rank(
-            presharded, cache, self.rank, split_experts=True
+            presharded, cache, self.rank, split_experts=True, skip=frozenset(shared)
         )
         self._expert_banks = []
         if active().prefill_fused_moe and active().prefill_expert_parallel == 16:
@@ -328,6 +333,10 @@ class PrefillProgram:
             self.weights.setdefault(group, {})[name] = tensor
 
         stats = stream_to_device(iterator, store)
+        for group, names in self.names.items():
+            for name in names:
+                if name in shared:
+                    self.weights.setdefault(group, {})[name] = shared[name]
         if self._expert_banks and any(
             set(bank) != set(_EXPERT_FAMILIES) for bank in self._expert_banks
         ):
@@ -1235,11 +1244,13 @@ class KimiPrefiller:
                     self.presharded,
                 )
 
-    def load_weights(self) -> None:
+    def load_weights(self, shared: Mapping[str, torch.Tensor] | None = None) -> None:
+        """Load once; ``shared``: device tensors to use instead of reading
+        those families (see :meth:`PrefillProgram.load_weights`)."""
         if self._loaded:
             return
         started = time.perf_counter()
-        self.program.load_weights(self.presharded)
+        self.program.load_weights(self.presharded, shared)
         if self.ring is not None:
             self.ring.load_weights()
         if self.draft_latents is not None:

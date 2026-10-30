@@ -117,8 +117,29 @@ def _disable_partial_hits_without_block_copies(scheduler) -> bool:
     return True
 
 
+def _cache_only_prefill_tokens(scheduler) -> bool:
+    """On a megakernel aggregate engine, cache a request's blocks only up to
+    the tokens its prefill computed (``num_prompt_tokens - 1``): the decoder
+    keeps KDA state in its own slots, so the pool's state blocks past that
+    hold none. Returns whether it changed anything."""
+    from vllm_torchtpu.megakernel import backend
+
+    if backend.role(scheduler.vllm_config) != "aggregate":
+        return False
+    coordinator = scheduler.kv_cache_manager.coordinator
+    original = coordinator.cache_blocks
+
+    def cache_blocks(request, num_computed_tokens):
+        limit = max(request.num_prompt_tokens - 1, 0)
+        original(request, min(num_computed_tokens, limit))
+
+    coordinator.cache_blocks = cache_blocks
+    return True
+
+
 def _patch_vllm_megakernel_prefix_hits() -> None:
-    """Apply ``_disable_partial_hits_without_block_copies`` to every scheduler."""
+    """Apply ``_disable_partial_hits_without_block_copies`` and
+    ``_cache_only_prefill_tokens`` to every scheduler."""
     from functools import wraps
 
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -135,6 +156,11 @@ def _patch_vllm_megakernel_prefix_hits() -> None:
                 "Prefix hits round down to %d-token blocks: the megakernel "
                 "program does not apply block copies.",
                 self.kv_cache_manager.coordinator.scheduler_block_size,
+            )
+        if _cache_only_prefill_tokens(self):
+            logger.info(
+                "Prefix caching covers prompt tokens only: the megakernel "
+                "aggregate decoder writes no KDA state blocks."
             )
 
     init._tpu_megakernel_prefix_hits_patch = True
