@@ -1,80 +1,83 @@
 # Adaptive sparse GQA prefill
 
 TensorCore (TC) attention reuses KV across query blocks; SparseCore (SC)
-gathers each query's selected KV before grouped attention. The Qwen QSA
-adapter selects this kernel only within its calibrated envelope and retains
-TC otherwise. Adding this standalone kernel does not change model defaults.
+gathers each query's selected KV before grouped attention. The QSA caller
+supplies rank-local `kv_heads` and the configured compression `ratio`.
+Eligibility checks packed cache layout, dtype, GQA divisibility, alignment,
+unit K/V scales, available VMEM and SparseCore support. Physical page size,
+page-table width and selected-group budget are inputs to the work estimate.
 
-## Admission and metadata
+## Metadata and scheduling
 
-Adaptive admission currently requires TPU7x with SparseCore, BF16 Q/gate
-`[T, 24, 256]`, two KV heads, ratio four, 512 selected-group slots, unit K/V
-scales, and native BF16 or FP8 E4M3FN cache. The validated guards are page size
-1664, `1 <= T <= 262144`, up to 158 page-table columns and a 16 GiB cache.
-These scope the calibration, not physical addressing or hardware capacity.
-Other valid geometries/scales retain TC. Paired TC eligibility derives from
-local heads, GQA divisibility, dimension alignment, packing, page segments and
-working-set capacity; it does not assume a TP degree or a D256 upper bound.
+Callers provide int32 offsets/IDs and nondecreasing request starts from zero.
+Each active query has a unique valid prefix of
+`min(length // ratio, selected_group_budget)` complete groups, followed by -1
+padding; the partial tail is implicit. Inactive rows have zero lengths and
+-1 IDs and produce zero even for NaN Q/gate. Repeated padded starts are valid.
 
-Callers provide valid int32 offsets/IDs, nondecreasing request starts from
-zero, and a unique valid prefix of `min(length // 4, 512)` complete groups,
-then -1 IDs; the partial tail is implicit. Inactive rows have zero lengths
-and -1 IDs and produce zero even for NaN Q/gate. Repeated padded starts are
-valid. Boundaries inside Q256 retain request-aware TC alignment because its
-padding is outside the calibrated union costs. See [admission and dispatch][dispatch].
+The adaptive schedule uses TC query blocks of 256 and SC groups of eight.
+The TC KV tile follows the resource-selected geometry; the SC attention tile
+contains 256 KV rows. These are kernel scheduling choices. Ragged TC work
+uses request-local query tiles, bounded packs and source windows. Its cost
+accounts for the resulting calls and padded query rows. SC gathers each
+query's own page table, including requests that start inside a TC block.
+See [admission and dispatch][dispatch].
 
-## Cost and choice
+## Work model and choice
 
-Predictions are milliseconds, with separate BF16/FP8 [fitted coefficients][cost]:
+The [work model][cost] derives byte traffic and QK/PV matrix-product FLOPs
+from actual query heads/dimensions, KV heads, compression ratio, cache packing
+and dtype, selected-group budget, page-table width and scheduled tiles.
+Page size determines the logical tile extent; table width contributes index
+traffic. SC accounting includes padded index/table loads, compact gather
+traffic, packed query/gate/output boundaries and padded attention heads.
+TC accounting includes metadata, mask words, repeated KV-tile loads and
+request-local pack padding.
 
-```text
-TC = a0 + a1*Qtc + a2*Qtc*W + a3*V
-SC = b0 + b1*Qsc + b2*A
-Select SC if TC > 1.02*SC; otherwise TC.
-```
+Traffic is divided by public TPU memory bandwidth; matrix-product FLOPs are
+divided by public BF16 throughput, using the reported core count. These are
+peak-rate work estimates, not measured latency predictions. They exclude
+runtime launch latency and do not model every compiler allocation or
+non-matrix operation.
 
-`Qtc` and `Qsc` count scheduled rows, including branch padding and tail bounds.
-`W = ceil(2*num_tiles/128)*128` counts aligned uint32 mask words. `V` sums
-unique KV256 tiles per Q256 block; `A` sums KV256 tiles per eight-query group,
-using each group's largest selected length and at least one tile when inactive.
-Static/span bounds, sampled lower bounds and coarse upper bounds avoid exact
-unions where possible. Sampling may establish SC, never TC by missing queries;
-nonnegative coefficients keep these work bounds monotone.
-
-The 1.02 margin prefers TC near crossover; it is a policy, not an error bound
-or measured optimum. The [fit inputs, expected fit and commands][fit] preserve
-all 14 coefficients from the calibrated TPU7x geometry. They do not qualify
-other chips/shapes or current full-model latency; historical validation feedback
-also informed dispatch, so it was not an untouched blind test of the final policy.
+The selector chooses SC when estimated TC cost exceeds `1.02 * SC cost`.
+The margin is a policy, not a numerical error bound or measured optimum.
+Nonnegative work terms support lower/upper bounds; exact selected-tile
+unions are computed only when those bounds leave the choice unresolved.
+The model has no fitted coefficient table or calibration-data dependency.
 
 ## Memory and arithmetic
 
-Outer chunks contain at most 8192 queries. BF16/FP8 gathers use microchunks
-of 32/64 queries, bounding selected-KV storage to 144 MiB at the supported
-budget. Only the final tile/microchunk is padded; output writes and scratch
-reuse avoid whole-context selected-KV or alignment workspaces. Compiler scratch
-checks are regression targets, not measured peak HBM.
+Outer dispatch chunks contain at most 8192 queries. SC microchunks are
+bounded by dtype-specific row ceilings and a soft selected-KV workspace
+target in [the scheduling policy][tuning]; actual geometry can reduce the
+microchunk or use a TC resource fallback. TC metadata and request-local packs
+have separate soft workspace targets. These logical planning estimates are
+not compiler peak-memory guarantees. Compiler memory analysis and measured
+resident memory describe different allocation/resource observations.
 
-FP32 accumulation and explicit BF16 output/gate rounding preserve QSA arithmetic.
-Each query keeps its own softmax. The cache is returned unchanged; standalone
-non-donating JIT returns can still materialize an array. The serving custom op
-already donates its pool; this kernel does not change that ownership contract.
+FP32 accumulation and explicit BF16 output/gate rounding preserve QSA
+arithmetic. Each query keeps its own softmax. The cache is returned unchanged;
+standalone non-donating JIT returns can still materialize an array. The serving
+custom op donates its pool.
 
 ## Checks and benchmark
 
-Use the project environment and `tpu_test` markers for hardware tests:
+Run the focused CPU work-model and dispatch tests in the project environment:
 
 ```bash
-pytest tests/kernels/test_sparse_gqa_adaptive_prefill.py \
+JAX_PLATFORMS=cpu TORCH_DEVICE_BACKEND_AUTOLOAD=0 pytest \
+  tests/kernels/test_sparse_gqa_prefill_work_model.py \
   tests/kernels/test_sparse_gqa_prefill_cost_model.py \
-  tests/kernels/test_sparse_gqa_grouped_prefill.py
+  tests/kernels/test_sparse_gqa_adaptive_prefill.py -m 'not tpu_test'
 python scripts/benchmark_qsa_prefill.py --help
 ```
 
-The benchmark includes dispatch/gather/attention/gating, excluding compilation,
+Hardware tests use the `tpu_test` marker. The benchmark includes
+attention/gating and the selected dispatch/gather path, excluding compilation,
 indexer scoring, cache writes and other model layers. Kernel fixtures are not
 checkpoint or distributed-serving qualification.
 
 [dispatch]: ../../src/vllm_torchtpu/kernels/sparse_gqa_prefill/adaptive.py
 [cost]: ../../src/vllm_torchtpu/kernels/sparse_gqa_prefill/cost_model.py
-[fit]: ../../scripts/sparse_gqa_prefill_cost_model/README.md
+[tuning]: ../../src/vllm_torchtpu/kernels/sparse_gqa_prefill/tuned_block_sizes.py
