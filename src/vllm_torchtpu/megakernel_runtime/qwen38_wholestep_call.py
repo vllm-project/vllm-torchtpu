@@ -24,6 +24,7 @@ and writes every QSA layer's step tokens through the stock writer sequence
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import jax
@@ -80,6 +81,16 @@ def indexed_options() -> dict:
 
 
 def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
+    """`_wholestep_tiles`; with main-KV DCP-2 above 16 rows the expert ring drops one more 2 MiB
+    slot: the pair exchange buffers and the doubled-head union attention put b32 (f32 state)
+    over scoped VMEM (tpu_bench_wholestep_call j-677db355: CompileTimeScopedVmemOom)."""
+    t = _wholestep_tiles(B, max_groups)
+    if main_kv_dcp() > 1 and B > 16:
+        t = dataclasses.replace(t, nbe=t.nbe - 1)
+    return t
+
+
+def _wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     """Segment tiles, with the 64-row ring depths from 48 rows up: at 48 rows the segment's
     (6, 10) rings leave the whole-step kernel 0.65 MiB over the 62 MiB VMEM limit (w01
     j-508c1d10: CompileTimeScopedVmemOom 62.63M at qwen38_mk_whole_b48). Past 32768 groups
