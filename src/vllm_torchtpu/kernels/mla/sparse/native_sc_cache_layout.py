@@ -24,7 +24,8 @@ import numpy as np
 
 NOPE_SUBROWS = 4
 LANE_BYTES = 128
-ROPE_WORDS = LANE_BYTES // np.dtype(np.uint32).itemsize
+WORD_BYTES = np.dtype(np.uint32).itemsize
+ROPE_WORDS = LANE_BYTES // WORD_BYTES
 
 
 def _require_u8(name: str, value: np.ndarray, suffix: tuple[int, ...]) -> np.ndarray:
@@ -100,6 +101,39 @@ def unpack_rope_banded(rope_i32: np.ndarray) -> np.ndarray:
     )
 
 
+def pack_rope_packed(rope_u8: np.ndarray) -> np.ndarray:
+    """Pack ``[..., token, D] u8`` as ``[..., token / k, 128] u32`` (``k = 512 / D``).
+
+    ``word[token, w].byte[band] = rope_u8[token, (D / 4) * band + w]``: token
+    ``t`` owns ``D / 4`` consecutive words of the flat cache (e.g. 16 words for
+    64-byte RoPE, eight tokens per 128-word row).
+    """
+    rope_u8 = np.asarray(rope_u8)
+    if rope_u8.dtype != np.uint8 or rope_u8.ndim < 2:
+        raise ValueError(
+            "rope_u8 must be uint8[..., tokens, token_bytes], got "
+            f"{rope_u8.dtype} {rope_u8.shape}"
+        )
+    token_bytes = rope_u8.shape[-1]
+    row_bytes = WORD_BYTES * LANE_BYTES
+    if token_bytes <= 0 or token_bytes % WORD_BYTES or row_bytes % token_bytes:
+        raise ValueError(
+            f"token_bytes ({token_bytes}) must be a positive multiple of "
+            f"{WORD_BYTES} dividing {row_bytes}"
+        )
+    rope_words = token_bytes // WORD_BYTES
+    tokens = rope_u8.shape[-2]
+    tokens_per_row = LANE_BYTES // rope_words
+    if tokens % tokens_per_row:
+        raise ValueError(f"{tokens} tokens do not fill {tokens_per_row}-token rows")
+    banded = np.ascontiguousarray(
+        rope_u8.reshape(*rope_u8.shape[:-1], WORD_BYTES, rope_words).swapaxes(-2, -1)
+    )
+    return banded.view(np.uint32).reshape(
+        *rope_u8.shape[:-2], tokens // tokens_per_row, LANE_BYTES
+    )
+
+
 def pack_native_caches(
     nope_u8: np.ndarray, rope_u8: np.ndarray, page_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -133,19 +167,35 @@ def flatten_nope_rows(nope_i32: np.ndarray) -> np.ndarray:
     return nope_i32.reshape(-1, LANE_BYTES)
 
 
-def flatten_rope_rows(rope_i32: np.ndarray) -> np.ndarray:
+def flatten_rope_rows(rope_i32: np.ndarray, rope_words: int = ROPE_WORDS) -> np.ndarray:
     rope_i32 = np.asarray(rope_i32)
     if rope_i32.dtype != np.uint32 or rope_i32.shape[-1] != LANE_BYTES:
         raise ValueError("expected uint32 ROPE cache with 128-word group rows")
-    return rope_i32.reshape(-1, ROPE_WORDS)
+    if rope_words <= 0 or LANE_BYTES % rope_words != 0:
+        raise ValueError(f"rope_words ({rope_words}) must divide {LANE_BYTES}")
+    return rope_i32.reshape(-1, rope_words)
 
 
 def source_bytes_per_token(
     nope_i32: np.ndarray, rope_i32: np.ndarray
 ) -> tuple[int, int]:
     """Return the logical allocation bytes per token for both caches."""
-    nope_tokens = np.prod(nope_i32.shape[:-1], dtype=np.int64)
-    rope_tokens = np.prod(rope_i32.shape[:-1], dtype=np.int64) * NOPE_SUBROWS
-    if nope_tokens != rope_tokens:
-        raise ValueError(f"cache token counts differ: {nope_tokens} vs {rope_tokens}")
-    return (nope_i32.nbytes // int(nope_tokens), rope_i32.nbytes // int(rope_tokens))
+    nope_i32 = np.asarray(nope_i32)
+    rope_i32 = np.asarray(rope_i32)
+    if nope_i32.ndim == rope_i32.ndim and nope_i32.shape[:-2] != rope_i32.shape[:-2]:
+        raise ValueError(
+            f"cache page dimensions differ: {nope_i32.shape} vs {rope_i32.shape}"
+        )
+    nope_tokens = int(np.prod(nope_i32.shape[:-1], dtype=np.int64))
+    rope_rows = int(np.prod(rope_i32.shape[:-1], dtype=np.int64))
+    if (
+        nope_tokens <= 0
+        or rope_rows <= 0
+        or nope_tokens % rope_rows != 0
+        or LANE_BYTES % (nope_tokens // rope_rows) != 0
+    ):
+        raise ValueError(
+            f"cache token counts incompatible: {nope_tokens} NOPE tokens vs "
+            f"{rope_rows} ROPE rows"
+        )
+    return (nope_i32.nbytes // nope_tokens, rope_i32.nbytes // nope_tokens)

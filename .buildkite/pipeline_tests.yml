@@ -86,12 +86,18 @@ steps:
     key: "unit_tests_cpu_pr"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
+    # bktec splits the files across the shards by recorded timing. It does not
+    # know the marker filter, so a shard can get only TPU-marked files and
+    # collect nothing; exit 5 (no tests collected) is tolerated per shard, as
+    # in the TPU steps.
+    parallelism: 3
+    commands:
+      - .buildkite/kubernetes/run.sh bash -c 'bktec run || [ $$? -eq 5 ]'
     plugins:
       - *kube_plugin
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
-          fail-on-no-tests: true
           test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
   - label: "Unit Tests - CPU (Nightly)"
@@ -252,6 +258,7 @@ steps:
         key: "unit_tests_general_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 3
         env:
           SHAPE: *shape_single
         plugins:

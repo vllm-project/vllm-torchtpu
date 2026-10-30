@@ -270,6 +270,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_vl",
         "maybe_patch_qwen3_next",
         "maybe_patch_qwen2",
+        "maybe_patch_qwen3_5_attn_moe_overlap",
     ]
     assert stages["omni_platform"] == ["_extend_async_output_timeout"]
     assert stages["diffusion_worker"] == [

@@ -84,10 +84,14 @@ class TpuCompilationHandle:
 _tpu_backend = TpuBackend()
 
 # How long a rank waits for the rank of its host that compiles a bucket, and
-# how often it looks. The wait is bounded only for a peer that never saves the
-# artifact (its serialize() failed); the rank then compiles the bucket itself.
-PEER_WAIT_S = 3600.0
-_PEER_POLL_S = 5.0
+# how often it looks. The wait is bounded for a peer that never saves the
+# artifact (its serialize() failed, it crashed, or it does not exist); the rank
+# then compiles the bucket itself. A single bucket compiles in well under this
+# even with every rank of the host compiling at once (~165 s for the biggest
+# Qwen3.5-397B bucket at DP8), so a timeout costs one redundant compile rather
+# than stalling startup for an hour.
+PEER_WAIT_S = 600.0
+_PEER_POLL_S = 0.5
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
 # weights rather than constants, by dtype and shape.
 _FINGERPRINT_MAX_NUMEL = 1 << 16
@@ -176,6 +180,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # compiled model or custom-kernel lowering.
     "DP_SCHED_ENABLED",
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
+    "VLLM_TPU_SRPT_ATTN_WORK_CAP",
+    "VLLM_TPU_SRPT_ATTN_TILE_TOKENS",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
@@ -610,6 +616,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         `fingerprint` is `_graph_fingerprint(graph)` taken before the backend
         ran, as a peer replaying this artifact computes it.
         """
+        tmp_path = f"{path}.{os.getpid()}.tmp"
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             payload = TpuCompilationHandle(
@@ -622,7 +629,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             # Write-then-rename: a crash or a full disk partway through
             # pickling a 400 MB entry would otherwise leave a truncated file
             # that the next run reads back as a corrupt artifact.
-            tmp_path = f"{path}.tmp"
+            # The temp name is PID-unique, like _link_artifact's: two writers
+            # of the same path must not interleave into one temp file.
             with open(tmp_path, "wb") as f:
                 pickle.dump(payload, f)
             os.replace(tmp_path, path)
@@ -632,6 +640,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             # Non-fatal by design: a failed save costs a recompile next run,
             # which is strictly better than persisting something unloadable.
             logger.warning("[TpuCompilerAdaptor] Failed to save artifact: %s", e)
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
             return False
 
     def _replay(

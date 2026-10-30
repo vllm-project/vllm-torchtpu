@@ -175,6 +175,11 @@ PATCHES = (
         ("platform_activation", "model_load"),
         model_config=True,
     ),
+    Patch(
+        "vllm_torchtpu.models.vllm.qwen3_5_patch:maybe_patch_qwen3_5_attn_moe_overlap",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
     # vLLM-Omni diffusion patches. OmniTpuPlatform applies these stages, since
     # diffusion workers do not run TPUWorker.
     Patch(

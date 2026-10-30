@@ -1141,6 +1141,23 @@ def test_glm_manifest_sparsecore_layout_keeps_tensorcore_geometry():
     } == {"uint32"}
 
 
+def test_glm_manifest_sparsecore_packed_rope_halves_rope_rows():
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=_glm_sparsecore_caches(
+            rope_shape=(16, _GLM_BLOCK_SIZE // 8, 128)
+        ),
+        raw_tensors=(),
+        block_size_tokens=_GLM_BLOCK_SIZE,
+    )
+    geo = manifest.geometry_by_tag()
+    assert geo["mla.nope"]["live_bytes_per_block"] == _GLM_BLOCK_SIZE * 512
+    assert geo["mla.rope"]["live_bytes_per_block"] == (_GLM_BLOCK_SIZE // 8) * 512
+    rope_pools = [p for p in manifest.pools if p.tag.startswith("mla.rope")]
+    assert rope_pools and all(
+        p.regions[0].num_units == _GLM_BLOCK_SIZE // 8 for p in rope_pools
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
