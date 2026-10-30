@@ -80,5 +80,6 @@ def absorb_q(q_nope: jax.Array, w_uk_t: jax.Array) -> jax.Array:
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",),
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes * 7 // 8,
+            disable_bounds_checks=True,
         ),
     )(q_nope, w_uk_t)

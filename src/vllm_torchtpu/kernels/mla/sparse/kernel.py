@@ -119,7 +119,7 @@ def gather_page_ids(
         ),
         out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",),
+            dimension_semantics=("parallel",),
             disable_bounds_checks=True,
         ),
         name="gather_page_ids",
@@ -1644,7 +1644,7 @@ def prepare_gather_indices(
             ),
             out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
             compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("arbitrary",),
+                dimension_semantics=("parallel",),
                 disable_bounds_checks=True,
             ),
             name="fused_gather_indices",

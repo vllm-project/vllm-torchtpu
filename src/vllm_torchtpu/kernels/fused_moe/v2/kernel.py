@@ -171,17 +171,20 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
         or rows_alloc > MAX_LADDER_TILES_PER_EXPERT * ep * g_local * tile_m
     ):
         return (tile_m,)
-    if (
-        not envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE
-        and tile_m == 128
-        and rungs == 4
-        and rows_alloc <= (ep * g_local * tile_m) // 3
-    ):
-        # In the small-batch single-tile regime (mean <= 32 rows/expert, e.g.
-        # 16 rows/expert at t_local=64, topk=8, E=256), over 95% of experts
-        # receive <= 24 rows, so front-loading rungs at 16, 24, 48 cuts empty
-        # tail MXU/VPU padding without losing full-tile coverage.
-        return (16, 24, 48, 128)
+    if not envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE and tile_m == 128 and rungs == 4:
+        if rows_alloc <= (ep * g_local * tile_m) // 3:
+            # In the small-batch single-tile regime (mean <= 32 rows/expert, e.g.
+            # 16 rows/expert at t_local=64, topk=8, E=256), over 95% of experts
+            # receive <= 24 rows, so front-loading rungs at 16, 24, 48 cuts empty
+            # tail MXU/VPU padding without losing full-tile coverage.
+            return (16, 24, 48, 128)
+        # In the multi-tile prefill regime (up to MAX_LADDER_TILES_PER_EXPERT
+        # tiles/expert, e.g. mean 256 rows/expert at t_local=1024, topk=8,
+        # E=256), experts below the mean finish their second tile in (64, 96] or
+        # (96, 128], while experts above the mean open a short third tail tile
+        # with mean ~12.6 rows (~88% <= 24 rows). Front-loading the first two
+        # rungs at 16 and 24 while keeping 96 covers both tail regimes.
+        return (16, 24, 96, 128)
     return tuple(range(step, tile_m + 1, step))
 
 

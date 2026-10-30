@@ -242,7 +242,9 @@ def _kernel(
             )(indices_hbm_ref)
 
 
-def _rope_transpose_atom(rope_src: Any, rope_dst: Any, rope_words: int):
+def _rope_transpose_atom(
+    rope_src: Any, rope_dst: Any, rope_words: int, *, zero_tail: bool = True
+):
     """One atom's (64, rope_words) gathered ROPE rows -> its (16, 128) tile.
 
     The same quad transpose and zeroed tail as `_kernel`'s body.
@@ -255,10 +257,11 @@ def _rope_transpose_atom(rope_src: Any, rope_dst: Any, rope_words: int):
         data = transpose_quad(data)
         for band in range(ROPE_PACKING):
             rope_dst[pl.ds(row, 1), pl.ds(band * rope_words, rope_words)] = data[band]
-        for band in range(ROPE_PACKING, 128 // rope_words):
-            rope_dst[pl.ds(row, 1), pl.ds(band * rope_words, rope_words)] = jnp.zeros(
-                (1, rope_words), jnp.uint32
-            )
+        if zero_tail:
+            for band in range(ROPE_PACKING, 128 // rope_words):
+                rope_dst[pl.ds(row, 1), pl.ds(band * rope_words, rope_words)] = (
+                    jnp.zeros((1, rope_words), jnp.uint32)
+                )
 
 
 def _ring_kernel(
@@ -383,6 +386,12 @@ def _ring_kernel(
     def _run():
         first = idx_copy(jnp.int32(0))
         first.start()
+        for half in range(2):
+            for row in range(QUADS_PER_ATOM):
+                for band in range(ROPE_PACKING, 128 // rope_words):
+                    rope_out_buf[
+                        half, pl.ds(row, 1), pl.ds(band * rope_words, rope_words)
+                    ] = jnp.zeros((1, rope_words), jnp.uint32)
         first.wait()
         for j in range(ring_slots - 1):
             pl.when(j < num_atoms)(functools.partial(start_gather, jnp.int32(j)))
@@ -397,7 +406,10 @@ def _ring_kernel(
                 rope_write(j - 2).wait()
 
             _rope_transpose_atom(
-                rope_buf.at[slot(j)], rope_out_buf.at[jnp.bitwise_and(j, 1)], rope_words
+                rope_buf.at[slot(j)],
+                rope_out_buf.at[jnp.bitwise_and(j, 1)],
+                rope_words,
+                zero_tail=False,
             )
             rope_write(j).start()
 

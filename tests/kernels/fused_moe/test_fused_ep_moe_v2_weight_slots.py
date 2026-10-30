@@ -195,4 +195,4 @@ def test_the_height_ladder_multi_tile_bound(monkeypatch):
 def test_the_height_ladder_small_batch_rungs(monkeypatch):
     monkeypatch.delenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", raising=False)
     assert kernel.tile_height_rungs(128, 4608, 32, 8) == (16, 24, 48, 128)
-    assert kernel.tile_height_rungs(128, 66048, 32, 8) == (32, 64, 96, 128)
+    assert kernel.tile_height_rungs(128, 66048, 32, 8) == (16, 24, 96, 128)
