@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """QSA over one donated pool, with independent group-native block tables."""
 
+import dataclasses
 import math
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -816,6 +818,15 @@ def _sharded_topk(
     return jnp.stack([bits, position.astype(jnp.int32)], axis=-1)
 
 
+@dataclasses.dataclass(frozen=True)
+class _SequentialSparseCoreTopK(SparseCoreTopK):
+    """The SparseCore selector without the score / next-chunk overlap: the
+    DCP owned scan's chunked prefill otherwise leaves unannotated ops inside
+    an overlap group ("annotation groups with gaps", j-5830132e)."""
+
+    overlaps_scoring: ClassVar[bool] = False
+
+
 def _dcp_topk(
     q, weights, cache, seq_lens, pages, cu, distribution, *, dcp, block_tokens, **kw
 ):
@@ -839,6 +850,7 @@ def _dcp_topk(
         else (kw["num_kv_pages_per_block"],)
     )
     kw.pop("enable_early_exit", None)
+    kw["topk_backend"] = _SequentialSparseCoreTopK()
     pages = jnp.pad(pages, ((0, 0), (0, (-pages.shape[1]) % align)))
     idx, bits = streamindex_topk(
         q,
