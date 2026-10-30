@@ -22,6 +22,9 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -38,10 +41,13 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.qwen4_exp.gdn_input import prepare_gdn_input
+from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+    VllmGatedDeltaNetAttention,
+)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import Qwen4ExpEngramConfig, gdn_cache_spec, require_unified_pool
-from .gdn import Qwen4ExpGatedDeltaNetAttention
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .parallel import PLEParallel
 from .pd_identity import LoadedWeightIdentity
@@ -111,11 +117,15 @@ class Qwen4ExpDecoderLayer(nn.Module):
             cfg.compilation_config.static_forward_context[prefix + ".ple"] = self.ple
         self.layer_type = t.layer_types[index]
         if self.layer_type == "linear_attention":
-            self.linear_attn = Qwen4ExpGatedDeltaNetAttention(
+            attention_cls = cast(
+                type[VllmGatedDeltaNetAttention], QwenGatedDeltaNetAttention
+            )
+            self.linear_attn = attention_cls(
                 t,
                 vllm_config=cfg,
                 prefix=prefix + ".linear_attn",
                 gqa_interleaved_layout=False,
+                pooled_input_preparer=prepare_gdn_input,
             )
         else:
             self.self_attn = Qwen4ExpQSA(

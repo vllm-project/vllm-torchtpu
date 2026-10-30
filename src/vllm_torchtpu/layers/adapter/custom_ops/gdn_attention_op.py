@@ -372,13 +372,21 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+    _pooled_input_preparer: Callable[[jax.Array], jax.Array | Conv1DInput] | None = None
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
     conv1d: GdnColumnParallelLinear
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        pooled_input_preparer: Callable[[jax.Array], jax.Array | Conv1DInput]
+        | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
+        self._pooled_input_preparer = pooled_input_preparer
         self._create_conv1d()
         # `_require_pcp_projection_parameters` hands this weight straight to
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
@@ -702,23 +710,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return gdn_impl
 
-    @staticmethod
-    def _prepare_pooled_gdn_input(
-        mixed_qkv: jax.Array,
-    ) -> jax.Array | Conv1DInput:
-        """Stateless trace-time hook; overrides must also be static methods.
-
-        Only the pooled non-PCP operator calls this hook. Dense and PCP
-        operators keep their existing input preparation.
-        Use only the local projection. Instance-dependent preparation needs
-        an explicit immutable configuration in the shared operator key.
-        """
-        return mixed_qkv
-
     def _build_pooled_gdn_op(self, *, block_major: bool = False):
-        prepare_input: Callable[[jax.Array], jax.Array | Conv1DInput] = type(
-            self
-        )._prepare_pooled_gdn_input
+        # The stateless callback and its identity are shared by the pooled op.
+        # Dense and PCP operators do not call it.
+        prepare_input = self._pooled_input_preparer
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)

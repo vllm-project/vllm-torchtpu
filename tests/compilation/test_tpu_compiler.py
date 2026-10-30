@@ -17,11 +17,15 @@ import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import pytest
 
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 class TestTpuCompilerCache:
@@ -194,9 +198,30 @@ class TestTpuCompilerCache:
         assert {
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
+            "vllm_torchtpu/kernels/qwen4_exp/gdn_input.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
+
+    def test_runtime_hash_tracks_pooled_input_preparer_source(self, tmp_path):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        relative = Path("vllm_torchtpu/kernels/qwen4_exp/gdn_input.py")
+        source_root = Path(tpu_compiler.__file__).resolve().parents[2]
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True)
+        source.write_bytes((source_root / relative).read_bytes())
+        config = cast("VllmConfig", self._config())
+        collect = tpu_compiler._iter_runtime_cache_key_files
+        assert source in collect(tmp_path)
+        compiler_source = tmp_path / "vllm_torchtpu/compilation/tpu_compiler.py"
+        compiler_source.parent.mkdir(parents=True)
+        compiler_source.write_bytes(Path(tpu_compiler.__file__).read_bytes())
+        with patch.object(tpu_compiler, "__file__", str(compiler_source)):
+            before = tpu_compiler.compute_tpu_compilation_hash(config)
+            source.write_text(source.read_text() + "\n")
+            after = tpu_compiler.compute_tpu_compilation_hash(config)
+        assert before != after
 
     def test_runtime_hash_excluded_kernels_stay_omni_only(self):
         """Excluded diffusion kernels must have no caller in hashed code.
