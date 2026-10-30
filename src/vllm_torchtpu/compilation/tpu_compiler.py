@@ -423,6 +423,17 @@ class TpuCompilerAdaptor(CompilerInterface):
         # guards -- correct for static shapes -- and lets the artifact cache work.
         from torch._subclasses.fake_tensor import FakeTensor
 
+        placeholders = [n for n in graph.graph.nodes if n.op == "placeholder"]
+        if len(placeholders) == len(example_inputs):
+            inlined_int = False
+            for node, val in zip(placeholders, example_inputs):
+                if type(val) is int and node.users:
+                    node.replace_all_uses_with(val)
+                    inlined_int = True
+            if inlined_int:
+                graph.graph.lint()
+                graph.recompile()
+
         fake_mode = next(
             (t.fake_mode for t in example_inputs if isinstance(t, FakeTensor)), None
         )
