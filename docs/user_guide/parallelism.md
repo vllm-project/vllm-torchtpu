@@ -95,7 +95,7 @@ vllm serve meta-llama/Llama-3.1-70B-Instruct \
   --max-model-len 8192
 ```
 
-By default, `TPU_PP_DYNAMIC_CHUNKS=1` dynamically sizes microbatch chunks to keep pipeline bubbles minimal without recompiling static token buckets.
+By default, `TPU_PP_DYNAMIC_CHUNKS=1` cuts prefill into smaller chunks while the pending prefill work cannot fill every stage, so a lone prompt runs on all stages at once instead of one full step at a time.
 
 The stages hand activations on in lockstep by default (`TPU_PP_HANDOFF=wave`): one collective per forward on every stage, so each round lasts as long as the slowest forward in flight. `TPU_PP_HANDOFF=ring` sends each forward's output point to point to the next stage as soon as it is done, which keeps the stages busy when prompts of different lengths are in flight. Under the ring the engine keeps half as many steps again in flight as the pipeline has stages (twelve for eight stages), so stage 0 has a forward queued while the engine core schedules the next step; the wave keeps vLLM's one step per stage. It needs libtpu 0.0.50 or later with torch_tpu 0.2.0 or later; the start-up self-test fails fast otherwise. `TPU_PP_RING_DEPTH` (default `2`) caps the forwards a stage queues for sending: each device holds up to that many outgoing buffers and up to 7 landing buffers for receives posted ahead of their forwards, each `--max-num-batched-tokens` x hidden size in the model dtype, and that memory is reserved before the KV cache is sized.
 
