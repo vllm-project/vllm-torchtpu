@@ -1151,14 +1151,20 @@ class TPUModelRunner(GPUModelRunner):
         only_phases = runner_utils.config_list(
             additional_config.get(runner_utils.PHASED_PROFILER_ONLY_PHASES_KEY)
         )
-        target_concurrencies = [
-            int(c)
-            for c in runner_utils.config_list(
-                additional_config.get(
-                    runner_utils.PHASED_PROFILER_TARGET_CONCURRENCY_KEY
-                )
-            )
-        ]
+        # A list for every phase, or a map from phase name to a list.
+        raw_targets = additional_config.get(
+            runner_utils.PHASED_PROFILER_TARGET_CONCURRENCY_KEY
+        )
+        target_concurrencies: list[int] | dict[str, list[int]]
+        if isinstance(raw_targets, dict):
+            target_concurrencies = {
+                phase: [int(c) for c in runner_utils.config_list(counts)]
+                for phase, counts in raw_targets.items()
+            }
+        else:
+            target_concurrencies = [
+                int(c) for c in runner_utils.config_list(raw_targets)
+            ]
         track_concurrency = bool(
             additional_config.get(
                 runner_utils.PHASED_PROFILER_TRACK_CONCURRENCY_KEY, False
@@ -1201,6 +1207,11 @@ class TPUModelRunner(GPUModelRunner):
             target_concurrencies=target_concurrencies,
             track_concurrency=track_concurrency,
             capture_ranks=capture_ranks,
+            stop_on_phase_change=bool(
+                additional_config.get(
+                    runner_utils.PHASED_PROFILER_STOP_ON_PHASE_CHANGE_KEY, False
+                )
+            ),
         )
 
     def stop_phased_profiling(self) -> None:

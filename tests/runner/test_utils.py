@@ -798,3 +798,117 @@ def test_phased_profiler_capture_ranks(profiler_fixture, rank, captures):
     assert (profiler.current_phase == "decode_only") is captures
     profiler.step({"num_reqs": 93, "total_num_scheduled_tokens": 93})
     assert mock_profile.call_count == int(captures)
+
+
+def test_phased_profiler_per_phase_target_concurrencies(tmp_path):
+    """The map form: decode_only only at 93 requests; prefill_only, left out of
+    the map, once at any request count (one request per engine when a wave's
+    first prompts prefill)."""
+    with (
+        patch("torch.profiler.profile") as mock_profile,
+        patch("builtins.open", mock_open()),
+        patch.object(
+            PhaseBasedProfiler, "_resolve_canonical_dst_ts", return_value="ts"
+        ),
+        patch.object(PhaseBasedProfiler, "_merge_profile_directories"),
+    ):
+        profiler = PhaseBasedProfiler(
+            profile_dir=str(tmp_path),
+            num_steps_to_profile_for=2,
+            standard_opts={
+                "host_tracer_level": 2,
+                "device_tracer_level": 1,
+                "python_tracer_level": 1,
+            },
+            only_phases=["decode_only", "prefill_only"],
+            target_concurrencies={"decode_only": [93]},
+        )
+        assert profiler._targets(InferencePhase.PREFILL_ONLY) == frozenset()
+        prefill = {
+            "num_reqs": 1,
+            "num_prefill_tokens": 1024,
+            "total_num_scheduled_tokens": 1024,
+            "min_kv_len": 0,
+        }
+        decode = {
+            "num_reqs": 92,
+            "num_prefill_tokens": 0,
+            "total_num_scheduled_tokens": 92,
+            "min_kv_len": 9000,
+        }
+
+        profiler.step(prefill)
+        assert profiler.current_phase == "prefill_only"
+        for _ in range(2):
+            profiler.step(prefill)
+        assert profiler.current_phase == ""
+        profiler.step(dict(prefill, num_reqs=2))  # once, not once per num_reqs
+        assert mock_profile.call_count == 1
+
+        profiler.step(decode)  # not the target
+        assert mock_profile.call_count == 1
+        assert not profiler._all_captures_done()
+        profiler.step(dict(decode, num_reqs=93, total_num_scheduled_tokens=93))
+        assert profiler.current_phase == "decode_only_concur_93"
+        for _ in range(2):
+            profiler.step(dict(decode, num_reqs=93, total_num_scheduled_tokens=93))
+        assert profiler._all_captures_done()
+        assert mock_profile.call_count == 2
+
+
+def test_phased_profiler_rejects_unknown_phase_in_target_map(tmp_path):
+    with pytest.raises(ValueError, match="unknown phase"):
+        PhaseBasedProfiler(
+            profile_dir=str(tmp_path), target_concurrencies={"decode": [93]}
+        )
+
+
+def test_phased_profiler_stops_a_capture_when_the_phase_ends(profiler_fixture):
+    """With stop_on_phase_change, the capture ends before the first step that
+    left the phase, so every captured step is the phase's."""
+    profiler = profiler_fixture["profiler"]
+    mock_context = profiler_fixture["mock_context"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+    profiler.stop_on_phase_change = True
+    stats = {"num_reqs": 1, "total_num_scheduled_tokens": 1024}
+
+    mock_determine_phase.return_value = InferencePhase.PREFILL_ONLY
+    profiler.step(stats)
+    profiler.step(stats)
+    assert profiler.current_phase == "prefill_only"
+    mock_determine_phase.return_value = InferencePhase.PREFILL_HEAVY
+    profiler.step(stats)
+    mock_context.__exit__.assert_called_once_with(None, None, None)
+    assert profiler.current_phase == ""
+
+
+def test_phased_profiler_stop_on_concurrency_change(profiler_fixture):
+    """A capture keyed on num_reqs ends when num_reqs changes."""
+    profiler = profiler_fixture["profiler"]
+    mock_context = profiler_fixture["mock_context"]
+    profiler_fixture["mock_determine_phase"].return_value = InferencePhase.DECODE_ONLY
+    profiler.stop_on_phase_change = True
+    profiler.target_concurrencies = frozenset({93})
+    profiler.track_concurrency = True
+
+    profiler.step({"num_reqs": 93, "total_num_scheduled_tokens": 93})
+    profiler.step({"num_reqs": 93, "total_num_scheduled_tokens": 93})
+    mock_context.__exit__.assert_not_called()
+    profiler.step({"num_reqs": 92, "total_num_scheduled_tokens": 92})
+    mock_context.__exit__.assert_called_once()
+
+
+def test_phased_profiler_no_start_while_an_engine_is_idle(profiler_fixture):
+    """Under DP a step with an idle engine (padded dummy work there) does not
+    start a capture."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    profiler_fixture["mock_determine_phase"].return_value = InferencePhase.PREFILL_ONLY
+    profiler.step(
+        {"num_reqs": 1, "total_num_scheduled_tokens": 1024, "dp_num_reqs_min": 0}
+    )
+    mock_profile.assert_not_called()
+    profiler.step(
+        {"num_reqs": 1, "total_num_scheduled_tokens": 1024, "dp_num_reqs_min": 1}
+    )
+    mock_profile.assert_called_once()

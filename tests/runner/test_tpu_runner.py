@@ -1144,6 +1144,7 @@ class TestStartStopPhasedProfiling:
                 "phased_profiler_only_phases": "decode_only, prefill_heavy",
                 "phased_profiler_target_concurrency": [93],
                 "phased_profiler_ranks": [0],
+                "phased_profiler_stop_on_phase_change": True,
             },
             max_iterations=20,
             delay_iterations=3,
@@ -1175,8 +1176,24 @@ class TestStartStopPhasedProfiling:
             target_concurrencies=[93],
             track_concurrency=False,
             capture_ranks=[0],
+            stop_on_phase_change=True,
         )
         assert runner.phase_based_profiler is mock_profiler_cls.return_value
+
+    def test_start_passes_a_per_phase_target_map(self, monkeypatch):
+        runner = _init_phased_runner(
+            monkeypatch,
+            additional_config={
+                "phased_profiler_target_concurrency": {"decode_only": [93]},
+            },
+        )
+        with patch(
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner.start_phased_profiling(runner)
+        assert mock_profiler_cls.call_args.kwargs["target_concurrencies"] == {
+            "decode_only": [93]
+        }
 
     def test_profile_prefix_scopes_the_phase_dirs(self, monkeypatch):
         """Same scoping the standard profiler gives /start_profile's prefix:
