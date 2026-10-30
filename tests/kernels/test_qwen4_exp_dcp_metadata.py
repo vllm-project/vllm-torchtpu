@@ -12,10 +12,15 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import virtual_page_metadata
 
 RATIO, B, D, BUDGET = 4, 32, 2, 16  # small page: 8 groups per page
 
-# The page-id lookup (sparse MLA's gather_page_ids) is a Pallas kernel.
-pytestmark = pytest.mark.skipif(
-    jax.default_backend() != "tpu", reason="gather_page_ids runs on TPU"
-)
+
+
+@pytest.fixture(autouse=True)
+def _on_tpu():
+    # The page-id lookup (sparse MLA's gather_page_ids) is a Pallas kernel.
+    # Checked per test: querying the backend at import initializes JAX during
+    # collection, which tests/conftest.py rejects.
+    if jax.default_backend() != "tpu":
+        pytest.skip("gather_page_ids runs on TPU")
 
 
 @pytest.mark.parametrize("seed", range(3))
