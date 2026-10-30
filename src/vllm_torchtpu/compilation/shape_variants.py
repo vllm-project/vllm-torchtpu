@@ -172,20 +172,54 @@ def _input_spec(value: Any) -> Any:
     return (str(value.dtype), dims)
 
 
-def _placeholders(graph: fx.GraphModule) -> list[tuple[str, Any, Any]]:
-    """(name, input spec, SymInt expression or None) for every placeholder.
+def _real_tensor_ids(values: list[Any]) -> dict[int, int]:
+    """id(fake placeholder value) -> id(the real tensor Dynamo faked it from).
+
+    A parameter keeps its identity across traces even when the traces reach
+    it through different module attributes (and so name it differently).
+    """
+    found: dict[int, int] = {}
+    wanted = {id(v) for v in values if isinstance(v, torch.Tensor)}
+    modes = {
+        id(mode): mode
+        for v in values
+        if (mode := getattr(v, "fake_mode", None)) is not None
+    }
+    for mode in modes.values():
+        try:
+            converter = mode.fake_tensor_converter
+            memo = converter.tensor_memo
+            lookup = converter.meta_converter.describer.lookup_tensor
+            for real, tensor_id in list(lookup.items()):
+                fake = memo.get(tensor_id)
+                if fake is not None and id(fake) in wanted:
+                    found[id(fake)] = id(real)
+        except AttributeError:  # pragma: no cover - other torch versions
+            continue
+    return found
+
+
+def _placeholders(graph: fx.GraphModule) -> list[tuple[str, Any, Any, int | None]]:
+    """(name, input spec, SymInt expr or None, real tensor id or None) per input.
 
     Unlike :func:`_placeholder_values` this keeps placeholders without a value,
     so the list lines up one-to-one with the runnable's positional arguments.
     """
-    entries = []
+    nodes = []
     for node in graph.graph.nodes:
         if node.op != "placeholder":
             break
-        value = node.meta.get("example_value", node.meta.get("val"))
-        expr = value.node.expr if isinstance(value, torch.SymInt) else None
-        entries.append((node.name, _input_spec(value), expr))
-    return entries
+        nodes.append((node.name, node.meta.get("example_value", node.meta.get("val"))))
+    real_ids = _real_tensor_ids([value for _, value in nodes])
+    return [
+        (
+            name,
+            _input_spec(value),
+            value.node.expr if isinstance(value, torch.SymInt) else None,
+            real_ids.get(id(value)) if value is not None else None,
+        )
+        for name, value in nodes
+    ]
 
 
 def _symint_at(expr: Any, size: int) -> int | None:
@@ -231,24 +265,27 @@ def _outputs_match(stored: tuple, current: tuple) -> bool:
 
 
 # Dynamo names a lifted input after its source (``L['x']`` -> ``l_x_``, a
-# parameter -> ``l_self_modules_..._parameters_weight_``), which is the same in
-# every trace. Placeholders without the prefix are values a split graph passes
-# between its pieces, whose names carry no identity across traces.
-_SOURCE_PREFIX = "l_"
+# parameter -> ``l_self_modules_..._parameters_weight_``, a global -> ``g_...``),
+# which is the same in every trace. Placeholders without these prefixes are
+# values a split graph passes between its pieces, whose names carry no identity
+# across traces.
+_SOURCE_PREFIXES = ("l_", "g_")
 
 
 def _argument_adapter(
-    stored: list[tuple[str, Any, Any]],
-    current: list[tuple[str, Any, Any]],
+    stored: list[tuple[str, Any, Any, int | None]],
+    current: list[tuple[str, Any, Any, int | None]],
     size: int | None,
 ) -> list[tuple[bool, Any]] | None:
     """How to build a stored runnable's arguments from the current graph's.
 
     Two traces of one model can lift their inputs differently: one keeps a
     SymInt for the token count that the other folded away, or a branch reads
-    the parameters in another order, or only a subset of them. Parameters and
-    model inputs keep their Dynamo source names across traces, so a stored
-    tensor input is taken from the current input of the same name and spec.
+    the parameters in another order, or only a subset of them, possibly through
+    other module attributes. A stored tensor input is taken from the current
+    input faked from the same real tensor (parameters, buffers) or, failing
+    that, from the one with the same Dynamo source name (per-step model
+    inputs), and either way with the same spec.
     A stored SymInt input is a function of the trace symbols, and for a
     single-size bucket every symbol is that size (the substitution vLLM's
     ``create_concrete_args`` makes), so it is passed as a constant.
@@ -258,20 +295,26 @@ def _argument_adapter(
     """
     if size is None:
         return None
-    by_name = {
-        name: (index, spec)
-        for index, (name, spec, expr) in enumerate(current)
-        if expr is None and name.startswith(_SOURCE_PREFIX)
-    }
+    by_real: dict[int, tuple[int, Any]] = {}
+    by_name: dict[str, tuple[int, Any]] = {}
+    for index, (name, spec, expr, real) in enumerate(current):
+        if expr is not None:
+            continue
+        if real is not None:
+            by_real.setdefault(real, (index, spec))
+        if name.startswith(_SOURCE_PREFIXES):
+            by_name[name] = (index, spec)
     plan: list[tuple[bool, Any]] = []
-    for name, spec, expr in stored:
+    for name, spec, expr, real in stored:
         if expr is not None:
             value = _symint_at(expr, size)
             if value is None:
                 return None
             plan.append((False, value))
             continue
-        found = by_name.get(name)
+        found = by_real.get(real) if real is not None else None
+        if found is None and name.startswith(_SOURCE_PREFIXES):
+            found = by_name.get(name)
         if found is None or found[1] != spec:
             return None
         plan.append((True, found[0]))
@@ -305,7 +348,7 @@ class BucketExecutables:
     def __init__(self) -> None:
         self._runnables: dict[
             tuple[str, str],
-            tuple[Callable[..., Any], tuple, list[tuple[str, Any, Any]], tuple],
+            tuple[Callable[..., Any], tuple, list[tuple[str, Any, Any, Any]], tuple],
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0

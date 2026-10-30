@@ -150,22 +150,27 @@ class FakeTpuBackend:
 class BranchParamModel(nn.Module):
     """Each branch lifts a different set and order of parameters.
 
-    The small-token branch reads ``b`` then ``c`` and builds a token-count
-    tensor (so its trace keeps a SymInt input); the large one reads ``a``,
-    ``c`` and ``b``. This is the shape of K3 SP prefill vs decode buckets.
+    The small-token branch reads ``b`` then ``inner.c`` and builds a
+    token-count tensor (so its trace keeps a SymInt input); the large one
+    reads ``a``, ``alias.c`` and ``b``. This is the shape of K3 SP prefill vs
+    decode buckets.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         self.a = nn.Parameter(torch.ones(HIDDEN, HIDDEN))
         self.b = nn.Parameter(torch.ones(HIDDEN, 3))
-        self.c = nn.Parameter(torch.ones(3, HIDDEN))
+        # One parameter, reached through a different attribute per branch, as
+        # a fused-MoE runner reaches the shared experts of its parent layer.
+        self.inner = nn.Module()
+        self.inner.c = nn.Parameter(torch.ones(3, HIDDEN))
+        self.alias = self.inner
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[0] >= 2048:
-            return WAVE(x @ self.a) + (x @ self.c.T) @ self.b.T
+            return WAVE(x @ self.a) + (x @ self.alias.c.T) @ self.b.T
         rows = torch.arange(x.shape[0], dtype=x.dtype).unsqueeze(1)
-        return WAVE(x) + (x @ self.b) @ self.c + rows
+        return WAVE(x) + (x @ self.b) @ self.inner.c + rows
 
 
 @dataclasses.dataclass
