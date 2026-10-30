@@ -58,6 +58,10 @@
 /src/vllm_torchtpu/offload/ @qizzzh @Nanfang-Li
 /tests/offload/ @qizzzh @Nanfang-Li
 
+# Multi-LoRA
+/src/vllm_torchtpu/lora/ @qizzzh @Nanfang-Li @haotianxue-google
+/tests/lora/ @qizzzh @Nanfang-Li @haotianxue-google
+
 # Speculative Decoding
 /src/vllm_torchtpu/spec_decode/ @Lumosis @gxd3
 /tests/spec_decode/ @Lumosis @gxd3
