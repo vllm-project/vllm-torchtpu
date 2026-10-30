@@ -24,6 +24,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
@@ -92,6 +94,19 @@ def test_page_no_wider_than_the_head_is_never_padded():
     assert kv_page_head_padding(pool, native, 128, 128) == 0
 
 
+@pytest.fixture
+def cpu_vllm_config():
+    """A current vLLM config pinned to CPU.
+
+    CPU CI does not always register torch's TPU device type, so the default
+    `VllmConfig()` device detection can fail there.
+    """
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
+
+
 def _forward_query_width(head_size: int, pool_heads: int, pool_head_size: int):
     """Run `forward` and return the width of the query the kernel receives."""
     num_heads = 4
@@ -151,11 +166,11 @@ def _forward_query_width(head_size: int, pool_heads: int, pool_head_size: int):
     return seen["width"]
 
 
-def test_forward_keeps_hd64_query_on_its_own_page(vllm_config_context):
+def test_forward_keeps_hd64_query_on_its_own_page(cpu_vllm_config):
     # Padding to 128 here would pick the v3 kernel for a head_dim=64 layer.
     assert _forward_query_width(64, pool_heads=4, pool_head_size=64) == 64
 
 
-def test_forward_pads_hd64_query_in_a_hd128_pool(vllm_config_context):
+def test_forward_pads_hd64_query_in_a_hd128_pool(cpu_vllm_config):
     # A head_dim=64 draft layer writing into a head_dim=128 target's pool.
     assert _forward_query_width(64, pool_heads=4, pool_head_size=128) == 128
