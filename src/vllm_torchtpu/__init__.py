@@ -130,14 +130,6 @@ def _patch_vllm_megakernel_prefix_hits() -> None:
     @wraps(original_init)
     def init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        # vLLM calls _mamba_block_aligned_split only in mamba_cache_mode
-        # "align", which it turns off without prefix caching. A program that
-        # needs page-aligned chunks still needs the split.
-        self._tpu_mamba_split = self.need_mamba_block_aligned_split
-        if not self.need_mamba_block_aligned_split and _model_needs_page_aligned_chunks(
-            self.vllm_config
-        ):
-            self.need_mamba_block_aligned_split = True
         if _disable_partial_hits_without_block_copies(self):
             logger.info(
                 "Prefix hits round down to %d-token blocks: the megakernel "
@@ -159,6 +151,11 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     scheduler-local cache-config view backports the corresponding one-line fix
     without mutating the shared ``VllmConfig.cache_config`` or copying the
     scheduling algorithm into this plugin.
+
+    vLLM calls the split only in Mamba cache mode "align", which it turns off
+    without prefix caching. A program that declares ``page_aligned_chunks``
+    still needs page-aligned chunks, so the scheduler always calls the split
+    for it and, outside align mode, skips the upstream part.
     """
     import copy
     from functools import wraps
@@ -168,6 +165,28 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     original_split = Scheduler._mamba_block_aligned_split
     if getattr(original_split, "_tpu_scheduler_block_size_patch", False):
         return
+    original_init = Scheduler.__init__
+
+    @wraps(original_init)
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._tpu_mamba_align_split = self.need_mamba_block_aligned_split
+        self._tpu_page_aligned_chunks = _model_needs_page_aligned_chunks(
+            self.vllm_config
+        )
+        if not self._tpu_page_aligned_chunks:
+            return
+        self.need_mamba_block_aligned_split = True
+        # A chunk limit under one page would never schedule a non-final chunk.
+        page = self.cache_config.block_size
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if self.max_num_scheduled_tokens < page or 0 < threshold < page:
+            raise ValueError(
+                f"The megakernel prefill schedules whole {page}-token pages: "
+                "max_num_batched_tokens and long_prefill_token_threshold must "
+                f"be at least {page} (got {self.max_num_scheduled_tokens} and "
+                f"{threshold})."
+            )
 
     @wraps(original_split)
     def split_with_scheduler_block_size(
@@ -184,8 +203,8 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
             num_external_computed_tokens,
         )
         physical_cache_config = self.cache_config
-        # False: only page alignment is needed (no Mamba cache mode "align").
-        if getattr(self, "_tpu_mamba_split", True):
+        # Run the upstream split only in Mamba cache mode "align".
+        if getattr(self, "_tpu_mamba_align_split", True):
             if physical_cache_config.block_size == self.block_size:
                 return original_split(self, *args)
 
@@ -228,6 +247,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
 
     split_with_scheduler_block_size._tpu_scheduler_block_size_patch = True
     Scheduler._mamba_block_aligned_split = split_with_scheduler_block_size
+    Scheduler.__init__ = init
     logger.info("Applied TPU patch: align Mamba prefill splits to scheduler blocks.")
 
 
