@@ -356,12 +356,13 @@ def gather_index_k(
 
 
 def own_rows(layout: TokenParallelLayout, x: jax.Array, rank: jax.Array) -> jax.Array:
-    """This rank's token-parallel rows of a replicated `[T, ...]` operand
-    (rows past `T` zero)."""
-    rows = layout.rows_per_rank(x.shape[0])
-    pad = [(0, layout.split_rows)] + [(0, 0)] * (x.ndim - 1)
-    start = layout.split_rows + rank * rows
-    return lax.dynamic_slice_in_dim(jnp.pad(x, pad), start, rows, axis=0)
+    """This rank's token-parallel rows of a replicated `[T, ...]` operand, read
+    by row index (no copy of `x`); rows past `T` repeat row `T - 1` and are
+    padding."""
+    num_tokens = x.shape[0]
+    rows = layout.rows_per_rank(num_tokens)
+    idx = layout.split_rows + rank * rows + jnp.arange(rows, dtype=jnp.int32)
+    return jnp.take(x, jnp.minimum(idx, num_tokens - 1), axis=0)
 
 
 def heads_to_tokens(
