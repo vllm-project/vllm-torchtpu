@@ -240,6 +240,7 @@ def adaptive_fused_moe(
     rank=None,
     mesh_ep_ranks=None,
     token_replica_groups=None,
+    ag_lead_axis: bool = False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -285,6 +286,9 @@ def adaptive_fused_moe(
     mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
     order relabels only the selected expert ids after top-k, keeping the full
     router-logit tensor in its original order.
+
+    ag_lead_axis all-gathers the quantized activation rows over a new leading
+    singleton axis before reshaping back to [tokens, hidden // 128, 128].
     """
     if weight_format is None:
         weight_format = weight_format_of_dtype(w1.dtype)
@@ -453,12 +457,16 @@ def adaptive_fused_moe(
             # The rows go on the wire as they arrived. There is no scale to
             # carry, so nothing downstream builds or ships one.
             q_l, row_scale_l = rows_bf16, None
-        q_g = lax.all_gather(
-            q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
-            ax,
-            axis=0,
-            tiled=True,
-        )
+        q_rows = q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK)
+        if ag_lead_axis:
+            # Gathered over a new leading axis, XLA lands the rows in the
+            # row-major layout the kernel reads; tiled on the token axis it
+            # gathers in {2,0,1} and relayouts the whole block afterwards.
+            q_g = lax.all_gather(q_rows[None], ax, axis=0, tiled=True).reshape(
+                T, *q_rows.shape[1:]
+            )
+        else:
+            q_g = lax.all_gather(q_rows, ax, axis=0, tiled=True)
 
         scores = jax.nn.softmax(gate_l, axis=-1)
         select_rows = MAX_ROUTING_BLOCK
@@ -684,6 +692,7 @@ def adaptive_fused_moe(
         gating.dtype,
         has_w1_bias and w1_bias.dtype,
         has_w2_bias and w2_bias.dtype,
+        bool(ag_lead_axis),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

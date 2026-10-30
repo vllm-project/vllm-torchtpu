@@ -339,8 +339,9 @@ def test_small_shape_tracks_a_dense_reference(weight_format):
     )
 
 
-def test_sharded_routing_plan_matches_original_v2_replicated_plan():
-    """Plan decomposition changes only how the kernel operands are built."""
+@pytest.mark.parametrize("ag_lead_axis", [False, True])
+def test_sharded_routing_plan_matches_original_v2_replicated_plan(ag_lead_axis):
+    """Plan decomposition and leading-axis activation all-gather are bit-exact."""
     mesh = _mesh()
     w1, w2, w1_scale, w2_scale = _make_weights(
         mesh,
@@ -369,7 +370,16 @@ def test_sharded_routing_plan_matches_original_v2_replicated_plan():
     replicated = fused_ep_moe_v2(
         x, w1, w2, w1_scale, w2_scale, gating, sharded_plan=False, **common
     )
-    sharded = adaptive_fused_moe(x, w1, w2, w1_scale, w2_scale, gating, **common)
+    sharded = adaptive_fused_moe(
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        ag_lead_axis=ag_lead_axis,
+        **common,
+    )
     np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
 
 
