@@ -436,6 +436,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                     target_num_blocks + ctx.mamba_ckpt_window - 1,
                     block_table_obj.max_num_blocks_per_req,
                 )
+            # Fixed-capacity specs (such as CircularBufferSpec with 1 block per
+            # request) bound their block table below cdiv(most_model_len, block_size).
+            target_num_blocks = min(
+                target_num_blocks, block_table_obj.max_num_blocks_per_req
+            )
         return block_table_obj, target_num_blocks
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):

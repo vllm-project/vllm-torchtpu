@@ -77,7 +77,9 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CircularBufferSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -461,6 +463,22 @@ def _spec_warmup_all_token_ids(
         req_id: [0] * (num_computed + 1)
         for req_id, num_computed in zip(req_ids, num_computed_tokens)
     }
+
+
+def _spec_warmup_group_num_blocks(
+    runner: "TPUModelRunner", group: KVCacheGroupSpec, max_position: int
+) -> int:
+    """Return the KV block count a synthetic warmup request needs in ``group``.
+
+    Fixed-capacity ``CircularBufferSpec`` groups hold 1 block per request for
+    their entire lifetime (``max_num_blocks_per_req == 1``), whereas positional
+    groups scale as ``cdiv(min(max_position, max_model_len), block_size)``.
+    """
+    spec = group.kv_cache_spec
+    max_len = min(max_position, runner.max_model_len)
+    if isinstance(spec, CircularBufferSpec):
+        return spec.max_num_blocks_per_req(runner.vllm_config, max_len)
+    return cdiv(max_len, int(spec.block_size))
 
 
 @contextmanager
@@ -2248,6 +2266,15 @@ class TPUModelRunner(GPUModelRunner):
             and getattr(self, "kv_cache_raw_tensors", None)
         )
 
+    def _zero_block_ids(self, block_ids: list[int]) -> None:
+        """Zero newly claimed KV blocks via custom pool owner or base runner."""
+        owner = self._native_kv_cache_owner
+        if owner is not None:
+            if block_ids:
+                owner.zero_blocks(block_ids)
+            return
+        super()._zero_block_ids(block_ids)
+
     def _apply_kv_cache_block_copies(self, copies) -> None:
         """Copy CoW blocks within each unified pool buffer page-locally.
 
@@ -3229,6 +3256,10 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, non_blocking=True
             )
         else:
+            if layout_plan.kind is SequenceLayoutKind.ALL:
+                self.positions_cpu[
+                    total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+                ] = 0
             self.position_ids = self.positions_cpu[local_token_slice].to(
                 self.device, non_blocking=True
             )
@@ -5896,6 +5927,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_tokens, zeros=not profiling, random=profiling
             )
             self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        num_tokens_across_dp = self._dp_num_tokens_across_dp(num_tokens)
         with (
             self.maybe_select_dummy_loras(
                 self.lora_config, np.array([num_tokens], dtype=np.int32)
@@ -5903,10 +5935,11 @@ class TPUModelRunner(GPUModelRunner):
             set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=num_tokens if dp_lockstep else 0,
-                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens)
-                if dp_lockstep
-                else None,
+                # Startup warmup traces real padded model rows too; passing 0
+                # makes DPMetadata describe an empty batch while model-local
+                # collectives (such as sharded embeddings/MoE) consume this bucket.
+                num_tokens=num_tokens if num_tokens_across_dp is not None else 0,
+                num_tokens_across_dp=num_tokens_across_dp,
             ),
             set_vllm_model_wrapper_context(
                 mesh=self.mesh,
@@ -5951,7 +5984,12 @@ class TPUModelRunner(GPUModelRunner):
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
-                _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
+                logits_num_reqs = _get_padded_num_reqs_with_upper_limit(
+                    min(num_tokens, num_reqs), self.max_num_reqs
+                )
+                _idx = torch.zeros(
+                    logits_num_reqs, dtype=torch.int32, device=out.device
+                )
                 _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
@@ -6970,11 +7008,7 @@ class TPUModelRunner(GPUModelRunner):
         block_ids_per_group = []
         max_nblk = 0
         for group in self.kv_cache_config.kv_cache_groups:
-            group_block_size = int(group.kv_cache_spec.block_size)
-            group_num_blocks = min(
-                cdiv(max_pos, group_block_size),
-                cdiv(self.max_model_len, group_block_size),
-            )
+            group_num_blocks = _spec_warmup_group_num_blocks(self, group, max_pos)
             block_ids_per_group.append(list(range(top - group_num_blocks, top)))
             max_nblk = max(max_nblk, group_num_blocks)
         if top <= max_nblk + 1:
@@ -7458,10 +7492,7 @@ class TPUModelRunner(GPUModelRunner):
                 P_mix = int(self.max_num_tokens) - R * (1 + K)
                 P_mix = max(P, min(P_mix, self.max_model_len - (1 + K) - 1))
                 mix_nblks = [
-                    min(
-                        cdiv(P_mix + 1 + K, int(g.kv_cache_spec.block_size)),
-                        cdiv(self.max_model_len, int(g.kv_cache_spec.block_size)),
-                    )
+                    _spec_warmup_group_num_blocks(self, g, P_mix + 1 + K)
                     for g in self.kv_cache_config.kv_cache_groups
                 ]
                 mix_nblk = max(mix_nblks)

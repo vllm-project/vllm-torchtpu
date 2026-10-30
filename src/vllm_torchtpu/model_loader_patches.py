@@ -109,7 +109,7 @@ def _should_skip_weight_tpu(
     return _should_skip(weight_name, local_expert_ids)
 
 
-def _compute_local_expert_ids() -> set[int] | None:
+def _compute_local_expert_ids(model_config=None) -> set[int] | None:
     """Local expert ids for this rank, or None when filtering is off.
 
     Mirrors ``DefaultModelLoader._init_ep_weight_filter`` (vLLM 0.26) so the
@@ -119,7 +119,8 @@ def _compute_local_expert_ids() -> set[int] | None:
     from vllm.model_executor.model_loader import default_loader
 
     vllm_config = get_current_vllm_config()
-    model_config = vllm_config.model_config
+    if model_config is None:
+        model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
 
     if not (
@@ -132,6 +133,14 @@ def _compute_local_expert_ids() -> set[int] | None:
     if parallel_config.enable_eplb:
         return None
     num_experts = model_config.get_num_experts()
+    if model_config.runner_type == "draft":
+        # NOTE(cross-boundary-contract): Upstream SpeculativeConfig copies
+        # target hf_config (n_routed_experts=384) onto draft_model_config; read
+        # dspark_n_routed_experts (128) for draft EP weight filtering (paired
+        # with deepseek_v41/dspark.py:117-124).
+        num_experts = (
+            getattr(model_config.hf_config, "dspark_n_routed_experts", 0) or num_experts
+        )
     if num_experts <= 0:
         return None
 
@@ -433,15 +442,19 @@ def patch_runai_sharded_expert_streaming() -> None:
     original_load_weights = rsl.RunaiModelStreamerLoader.load_weights
 
     def load_weights(self, model, model_config):
+        """Record active `(model, model_config)` around `original_load_weights`."""
         self._loading_model = model
+        self._loading_model_config = model_config
         try:
             return original_load_weights(self, model, model_config)
         finally:
             self._loading_model = None
+            self._loading_model_config = None
 
     def _get_weights_iterator(self, model_or_path: str, revision: str | None):
+        """Stream only local-rank expert weights for `self._loading_model_config`."""
         try:
-            local_expert_ids = _compute_local_expert_ids()
+            local_expert_ids = _compute_local_expert_ids(self._loading_model_config)
         except AttributeError:
             # A vLLM without the EP weight filter (no
             # enable_ep_weight_filter / expert_placement_strategy fields).
@@ -476,6 +489,7 @@ def patch_runai_sharded_expert_streaming() -> None:
         )
 
     rsl.RunaiModelStreamerLoader._loading_model = None
+    rsl.RunaiModelStreamerLoader._loading_model_config = None
     rsl.RunaiModelStreamerLoader.load_weights = load_weights
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator
     rsl.RunaiModelStreamerLoader._tpu_sharded_ep_patch = True
@@ -580,6 +594,12 @@ def patch_default_loader_ep_weight_filter() -> None:
     weight_utils.safetensors_weights_iterator = safetensors_weights_iterator
     default_loader.safetensors_weights_iterator = safetensors_weights_iterator
     default_loader.DefaultModelLoader._get_weights_iterator = _get_weights_iterator
+
+    def _init_ep_weight_filter(self, model_config):
+        """Initialize `self.local_expert_ids` from the explicit `model_config`."""
+        self.local_expert_ids = _compute_local_expert_ids(model_config)
+
+    default_loader.DefaultModelLoader._init_ep_weight_filter = _init_ep_weight_filter
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
         "Applied TPU patch: EP weight filter covers "

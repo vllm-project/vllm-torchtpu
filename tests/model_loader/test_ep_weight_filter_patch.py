@@ -109,6 +109,11 @@ def _restore_iterators(monkeypatch):
         "_get_weights_iterator",
         default_loader.DefaultModelLoader._get_weights_iterator,
     )
+    monkeypatch.setattr(
+        default_loader.DefaultModelLoader,
+        "_init_ep_weight_filter",
+        default_loader.DefaultModelLoader._init_ep_weight_filter,
+    )
 
 
 def test_patch_installs_predicate_and_is_idempotent(monkeypatch):
@@ -493,3 +498,115 @@ def test_default_loader_skips_unused_shards_and_colocated_tensors(
     (tmp_path / "main.safetensors").unlink()
     with pytest.raises(FileNotFoundError, match="main.safetensors"):
         list(loader.get_all_weights(model_config, dummy_model))
+
+
+def test_draft_ep_weight_filter_uses_dspark_n_routed_experts(monkeypatch):
+    from types import SimpleNamespace
+
+    import vllm.config as vllm_config_mod
+    import vllm.distributed as vllm_dist_mod
+    from vllm.model_executor.model_loader import (
+        default_loader,
+        ep_weight_filter,
+        weight_utils,
+    )
+    from vllm.model_executor.model_loader import (
+        runai_streamer_loader as rsl,
+    )
+
+    monkeypatch.setattr(
+        weight_utils, "should_skip_weight", weight_utils.should_skip_weight
+    )
+    monkeypatch.setattr(
+        ep_weight_filter, "should_skip_weight", ep_weight_filter.should_skip_weight
+    )
+    monkeypatch.setattr(weight_utils, "_tpu_ep_filter_patch", False, raising=False)
+    _restore_iterators(monkeypatch)
+    patch_default_loader_ep_weight_filter()
+
+    hf_config = SimpleNamespace(
+        n_routed_experts=384,
+        dspark_n_routed_experts=128,
+    )
+    target_model_config = SimpleNamespace(
+        is_moe=True,
+        runner_type="generate",
+        hf_config=hf_config,
+        get_num_experts=lambda: 384,
+    )
+    draft_model_config = SimpleNamespace(
+        is_moe=True,
+        runner_type="draft",
+        hf_config=hf_config,
+        get_num_experts=lambda: 384,
+    )
+    parallel_config = SimpleNamespace(
+        enable_expert_parallel=True,
+        enable_ep_weight_filter=True,
+        enable_eplb=False,
+        data_parallel_size=8,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=1,
+        expert_placement_strategy="linear",
+    )
+    # Note: get_current_vllm_config().model_config points to target_model_config
+    # (runner_type="generate") while DFlashProposer._load_draft_model passes
+    # model_config=draft_model_config (runner_type="draft") to load_model.
+    active_vllm_config = SimpleNamespace(
+        model_config=target_model_config,
+        parallel_config=parallel_config,
+    )
+    monkeypatch.setattr(
+        vllm_config_mod, "get_current_vllm_config", lambda: active_vllm_config
+    )
+
+    class _FakeRunaiLoader:
+        load_config = SimpleNamespace(use_tqdm_on_load=False)
+        _is_distributed = False
+
+        def _prepare_weights(self, model_or_path, revision):
+            return ["gs://b/m"]
+
+        def _get_weights_iterator(self, model_or_path, revision):
+            raise AssertionError("unpatched _get_weights_iterator called")
+
+        def load_weights(self, model, model_config):
+            return list(self._get_weights_iterator("gs://b/m", None))
+
+    monkeypatch.setattr(rsl, "RunaiModelStreamerLoader", _FakeRunaiLoader)
+    model_loader_patches.patch_runai_sharded_expert_streaming()
+
+    runai_local_ids: list[set[int]] = []
+    monkeypatch.setattr(
+        model_loader_patches,
+        "_sharded_runai_weights_iterator",
+        lambda files, local_ids, tqdm_flag, model: (
+            runai_local_ids.append(local_ids) or iter(())
+        ),
+    )
+
+    for rank in range(1, 8):
+        monkeypatch.setattr(
+            vllm_dist_mod,
+            "get_dp_group",
+            lambda r=rank: SimpleNamespace(rank_in_group=r),
+        )
+        expected = set(range(rank * 16, (rank + 1) * 16))
+        assert (
+            model_loader_patches._compute_local_expert_ids(draft_model_config)
+            == expected
+        )
+        # 1. DefaultModelLoader._init_ep_weight_filter path:
+        loader = SimpleNamespace(local_expert_ids=None)
+        default_loader.DefaultModelLoader._init_ep_weight_filter(
+            loader, draft_model_config
+        )
+        assert loader.local_expert_ids == expected
+        assert all(eid < 128 for eid in loader.local_expert_ids)
+
+        # 2. RunaiModelStreamerLoader.load_weights -> _get_weights_iterator path:
+        runai_local_ids.clear()
+        runai_loader = _FakeRunaiLoader()
+        runai_loader.load_weights(object(), draft_model_config)
+        assert runai_local_ids == [expected]
+        assert runai_loader._loading_model_config is None

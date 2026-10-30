@@ -1747,6 +1747,57 @@ def _patch_dflash_drafting_slot_budget() -> None:
     logger.info("Applied TPU patch: DFlash/DSpark drafting slots are not charged.")
 
 
+def _patch_circular_buffer_block_zeroing() -> None:
+    """Record newly claimed ``CircularBufferSpec`` blocks when pool zeroing is on.
+
+    Upstream ``SingleTypeKVCacheManager.__init__`` excludes ``CircularBufferSpec``
+    from ``_record_new_block_ids`` because standalone circular buffers overwrite
+    in sequence order. In TPU unified raw pools (``may_share_blocks=True``), a
+    recycled block claimed by ``CircularBufferManager`` can carry arbitrary
+    cross-dtype bit patterns from non-circular groups and must be zeroed before
+    first read-modify-write accumulation.
+    """
+    from functools import wraps
+
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
+
+    orig_init = CircularBufferManager.__init__
+    if getattr(orig_init, "_tpu_circular_buffer_zeroing_patch", False):
+        return
+
+    @wraps(orig_init)
+    def __init__(
+        self,
+        kv_cache_spec,
+        block_pool,
+        enable_caching: bool,
+        kv_cache_group_id: int,
+        scheduler_block_size: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+        needs_kv_cache_zeroing: bool = False,
+        max_admission_blocks_per_request: int | None = None,
+    ) -> None:
+        orig_init(
+            self,
+            kv_cache_spec,
+            block_pool,
+            enable_caching,
+            kv_cache_group_id,
+            scheduler_block_size,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            needs_kv_cache_zeroing=needs_kv_cache_zeroing,
+            max_admission_blocks_per_request=max_admission_blocks_per_request,
+        )
+        if needs_kv_cache_zeroing:
+            self._record_new_block_ids = True
+
+    setattr(__init__, "_tpu_circular_buffer_zeroing_patch", True)  # noqa: B010
+    CircularBufferManager.__init__ = __init__
+    logger.info("Applied TPU patch: CircularBufferManager records zeroed blocks.")
+
+
 def _patch_vllm_config_triton_tpu() -> None:
     """Bypass V2 model runner Triton check on TPU.
 
