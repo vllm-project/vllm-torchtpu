@@ -50,26 +50,42 @@ def _gather_hidden_states(
 
 
 def gather_topk(
-    group: GroupCoordinator, topk_weights: torch.Tensor, topk_ids: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """All-gather the top-k weights and ids as one int32 collective.
+    group: GroupCoordinator,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *row_values: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """All-gather the top-k weights and ids, and any other per-row
+    `row_values`, as one int32 collective; returns them in that order.
 
-    Both are a few bytes per row, so each gather costs about its fixed
-    latency; one gather pays it once. The weights ride as f32 bits, which
-    holds any float of at most 32 bits exactly.
+    Each is a few bytes per row, so each gather costs about its fixed
+    latency; one gather pays it once. Floats ride as f32 bits, which hold
+    any float of at most 32 bits exactly.
     """
-    if (
-        topk_ids.dtype != torch.int32
-        or not topk_weights.is_floating_point()
-        or topk_weights.element_size() > 4
-        or topk_weights.shape != topk_ids.shape
+    tensors = (topk_weights, topk_ids, *row_values)
+    if topk_ids.dtype != torch.int32 or not all(
+        t.shape[:-1] == topk_ids.shape[:-1]
+        and (
+            t.dtype == torch.int32 or (t.is_floating_point() and t.element_size() <= 4)
+        )
+        for t in tensors
     ):
-        return group.all_gather(topk_weights, dim=0), group.all_gather(topk_ids, dim=0)
-    topk = topk_ids.shape[-1]
-    packed = torch.cat([topk_ids, topk_weights.float().view(torch.int32)], dim=-1)
-    packed = group.all_gather(packed, dim=0)
-    weights = packed.view(torch.float32)[..., topk:].to(topk_weights.dtype)
-    return weights, packed[..., :topk].contiguous()
+        return tuple(group.all_gather(t, dim=0) for t in tensors)
+    words = [
+        t if t.dtype == torch.int32 else t.float().view(torch.int32) for t in tensors
+    ]
+    packed = group.all_gather(torch.cat(words, dim=-1), dim=0)
+    as_float = packed.view(torch.float32)
+    gathered = []
+    start = 0
+    for t in tensors:
+        end = start + t.shape[-1]
+        if t.dtype == torch.int32:
+            gathered.append(packed[..., start:end].contiguous())
+        else:
+            gathered.append(as_float[..., start:end].to(t.dtype))
+        start = end
+    return tuple(gathered)
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):

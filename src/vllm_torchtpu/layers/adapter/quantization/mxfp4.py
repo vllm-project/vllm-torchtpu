@@ -862,8 +862,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         dp_group = get_dp_group()
         rows, rows_scale = self._dispatch_quantizer(x)
         rows = dp_group.all_gather(rows, dim=0)
-        rows_scale = dp_group.all_gather(rows_scale, dim=0)
-        topk_weights, topk_ids = gather_topk(dp_group, topk_weights, topk_ids)
+        topk_weights, topk_ids, rows_scale = gather_topk(
+            dp_group, topk_weights, topk_ids, rows_scale
+        )
         out = fused_moe_gmm(
             hidden_states=rows,
             w1=layer.w13_weight,
