@@ -704,11 +704,13 @@ class PallasAttentionBackend(AttentionBackend):
     @staticmethod
     def get_page_size(vllm_config: VllmConfig) -> int:
         # Longer contexts use 128-token pages. KV offload moves one page of one
-        # layer per transfer, so 16-token pages stalled the engine (#2158). The
-        # RPA v3 kernel sizes its VMEM blocks by bkv_sz, which only has to be a
-        # multiple of the page size. This is smaller than the 256 that 8192
-        # gets, because 128 is the size measured at long context.
-        # get_min_page_size can still raise it for very long contexts.
+        # layer per transfer, so smaller pages multiply the transfer count. The
+        # RPA kernels size their VMEM blocks in tokens (bkv_sz) and only align
+        # them to the page size, so the page size does not set VMEM use. 128 is
+        # the smallest page the CUSTOM backend supports, which keeps both
+        # backends on the same page size and prefix-cache granularity.
+        # TpuPlatform.update_block_size_for_backend still raises the page size
+        # to get_min_page_size when the block table would not fit in SMEM.
         if vllm_config.model_config.max_model_len > 8192:
             return 128
         page_size = next_power_of_2(vllm_config.model_config.max_model_len) // 16

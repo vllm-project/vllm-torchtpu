@@ -14,7 +14,7 @@
 """Default KV page size for dense attention models.
 
 KV offload moves one page of one layer per transfer, so the page size sets the
-transfer size. 16-token pages at long context stalled offload (#2158).
+transfer size and the number of transfers per reloaded prefix.
 """
 
 from types import SimpleNamespace

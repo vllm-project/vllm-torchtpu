@@ -14,13 +14,13 @@
 # limitations under the License.
 
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
-# Dense long-context model with Raiden KV offload under prefix reuse (#2158).
+# Dense long-context model with Raiden KV offload under prefix reuse.
 # 100 prefixes of 8192 tokens, each request adds a 256-token suffix, so most
 # prompt tokens are reloaded from the host pool. The device pool is capped at
 # DEVICE_KV_TOKENS so prefixes are evicted and reloaded. KV_PAGE_SIZE=16
 # compares against the old default page size at the same token capacity.
-# FLASH_ATTN is the backend whose default page size #2158 changes. CUSTOM only
-# supports 128 and 256 pages, so it cannot run the 16-token arm.
+# FLASH_ATTN is the backend whose default page size depends on max_model_len.
+# CUSTOM only supports 128 and 256 pages, so it cannot run the 16-token arm.
 MODEL="Qwen/Qwen3-32B"
 TENSOR_PARALLELISM=8
 DATA_PARALLELISM=1
