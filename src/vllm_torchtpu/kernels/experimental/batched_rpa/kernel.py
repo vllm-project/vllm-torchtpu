@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -368,6 +369,35 @@ def fetch_compute_metadata(
     )
 
 
+# Modes whose steps branch to an unmasked body when the KV block lies entirely
+# below the causal diagonal. Each listed mode compiles its step body twice.
+# DECODE is left out: its unmasked body scheduled longer than its masked one.
+MASK_FREE_BRANCH_MODES = (configs.RpaCase.MIXED,)
+
+
+def causal_mask_is_all_true(
+    step_meta: ComputeMetadata, *, cfgs: configs.RpaConfigs
+) -> jax.Array | None:
+    """Whether `generate_mask` would be all-true for every q chunk of this step.
+
+    Returns None when the mask can never be skipped for this config.
+    """
+    if (
+        cfgs.mode not in MASK_FREE_BRANCH_MODES
+        or cfgs.model.sliding_window is not None
+        or step_meta.local_k_start is not None
+        or step_meta.local_k_end is not None
+    ):
+        return None
+    # The mask is `q_kv_diff >= causal_offset - bq_start`; the smallest q_kv_diff
+    # in a tile is -(bkv_sz - 1), and bq_start = 0 gives the largest bound.
+    all_true = None
+    for causal_offset in step_meta.causal_offset:
+        b_all_true = causal_offset <= -(cfgs.bkv_sz - 1)
+        all_true = b_all_true if all_true is None else all_true & b_all_true
+    return all_true
+
+
 def generate_mask(
     shape: tuple[int, int, int, int],
     *,
@@ -499,6 +529,51 @@ def rpa_body(
         cfgs=cfgs,
     )
 
+    compute = functools.partial(
+        rpa_compute,
+        step,
+        q_vref,
+        kv_in_vref,
+        o_vref,
+        lse_o_vref,
+        schedule_ref,
+        m_scratch_ref,
+        l_scratch_ref,
+        acc_scratch_ref,
+        stitch_meta,
+        step_meta,
+        cfgs=cfgs,
+    )
+    mask_all_true = causal_mask_is_all_true(step_meta, cfgs=cfgs)
+    if mask_all_true is None:
+        compute(apply_causal_mask=True)
+    else:
+        # The whole compute sits in each branch so no vector value crosses the
+        # region boundary, and the unmasked body keeps its own schedule.
+        lax.cond(
+            mask_all_true,
+            functools.partial(compute, apply_causal_mask=False),
+            functools.partial(compute, apply_causal_mask=True),
+        )
+
+
+def rpa_compute(
+    step: jax.Array,
+    q_vref: jax.Ref,
+    kv_in_vref: jax.Ref,
+    o_vref: jax.Ref,
+    lse_o_vref: jax.Ref | None,
+    schedule_ref: schedule.RpaSchedule,
+    m_scratch_ref: jax.Ref,
+    l_scratch_ref: jax.Ref,
+    acc_scratch_ref: jax.Ref,
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+    apply_causal_mask: bool,
+):
+    """Loads q/k/v, runs the flash-attention chunks and stores the outputs."""
     # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
@@ -631,17 +706,19 @@ def rpa_body(
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
 
-        custom_mask = generate_mask(
-            shape=(
-                cfgs.batch_size,
-                cfgs.model.num_kv_heads,
-                q_end - q_start,
-                cfgs.bkv_sz,
-            ),
-            bq_start=bq_start,
-            step_meta=step_meta,
-            cfgs=cfgs,
-        )
+        custom_mask = None
+        if apply_causal_mask:
+            custom_mask = generate_mask(
+                shape=(
+                    cfgs.batch_size,
+                    cfgs.model.num_kv_heads,
+                    q_end - q_start,
+                    cfgs.bkv_sz,
+                ),
+                bq_start=bq_start,
+                step_meta=step_meta,
+                cfgs=cfgs,
+            )
 
         p, alpha_list, m_next, l_next, m_carry, l_carry = (
             flash_attention.flash_attention_qk_softmax(
