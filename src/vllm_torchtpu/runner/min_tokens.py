@@ -139,18 +139,24 @@ def build_stop_table(
     state: MinTokensState,
     rows: StateRows,
     num_rows: int,
+    vocab_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Host-side mask inputs for one logits tensor of ``num_rows`` rows, from
     the rows of the tracked requests (``plain_rows`` / ``verify_rows`` /
     ``verify_logits_rows``). Returns ``(stop_ids [num_rows, k *
     STOP_IDS_WIDTH] int32, restore [num_rows] bool)``, or None when no row
-    needs masking.
+    needs masking. Stop ids outside ``[0, vocab_size)`` are ignored when
+    ``vocab_size`` is given (e.g. text EOS ids on a narrower codec head).
     """
     # (stop ids, structured) -> ([first rows], [row counts]); requests usually
     # share their stop ids, so each group is written with one indexed store.
     groups: dict[tuple[tuple[int, ...], bool], tuple[list[int], list[int]]] = {}
     for batch_index, (first, ahead, count) in rows.items():
         min_toks, num_output, stop_ids, structured = state[batch_index]
+        if vocab_size is not None:
+            stop_ids = tuple(sid for sid in stop_ids if 0 <= sid < vocab_size)
+            if not stop_ids:
+                continue
         # Rows first .. first + n - 1 are still below min_tokens.
         n = min(count, min_toks - num_output - ahead)
         if n > 0:

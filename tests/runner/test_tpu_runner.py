@@ -2908,6 +2908,7 @@ class TestInputStagingFence:
         )
         for name in (
             "_build_attention_metadata",
+            "_dummy_run_uses_embeds",
             "_record_input_staging_fence",
             "_wait_input_staging_fence",
             "_pp_take_topk_indices",
@@ -3631,6 +3632,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _is_dspark_pd_producer=False,
             _fence_spec_kv_under_token_copy=False,
             _min_tokens_batch_state=lambda: {},
+            _repetition_penalty_batch_state=lambda: {},
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(
@@ -3646,7 +3648,11 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _stage_timing=MagicMock(),
         )
         runner._stage_timing.take_samples.return_value = ([], [])
-        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+        for name in (
+            "_make_model_runner_output",
+            "maybe_wait_for_kv_save",
+            "get_finished_kv_transfers",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
         TPUModelRunner.sample_tokens(runner, None)
