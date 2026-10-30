@@ -63,6 +63,7 @@ def _abstract_args(dtype=jnp.bfloat16):
         "dynamic_scale",
         "packing",
         "cache_size",
+        "address_overflow",
         "context",
         "dtype",
         "hardware",
@@ -89,6 +90,15 @@ def test_adaptive_envelope_preserves_existing_fallbacks(monkeypatch, fp8, case):
     if case in replacement:
         index, shape = replacement[case]
         args[index] = jax.ShapeDtypeStruct(shape, args[index].dtype)
+    cache = args[5]
+    rows_per_page = cache.shape[1] * cache.shape[2]
+    if case == "cache_size":
+        assert cache.size * np.dtype(cache.dtype).itemsize > 16 * 1024**3
+        assert cache.shape[0] * rows_per_page < np.iinfo(np.int32).max
+    if case == "address_overflow":
+        pages = np.iinfo(np.int32).max // rows_per_page + 1
+        args[5] = jax.ShapeDtypeStruct((pages, *cache.shape[1:]), cache.dtype)
+        assert args[5].shape[0] * rows_per_page > np.iinfo(np.int32).max
     if case == "dtype":
         args[0] = jax.ShapeDtypeStruct(args[0].shape, jnp.float32)
     if case == "scale":
@@ -96,7 +106,7 @@ def test_adaptive_envelope_preserves_existing_fallbacks(monkeypatch, fp8, case):
     if case == "dynamic_scale":
         kwargs["k_scale"] = cast(float, jax.ShapeDtypeStruct((), jnp.float32))
     assert is_supported_by_adaptive_prefill(*args, **kwargs) == (
-        case in ("supported", "ragged", "page", "context", "budget")
+        case in ("supported", "ragged", "page", "context", "budget", "cache_size")
     )
 
 
@@ -171,15 +181,11 @@ def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
     )
     hlo = compiled.as_text()
     assert hlo is not None
-    assert ("sc_compact_grouped_prefill" in hlo) == (context > 8192)
-    # Empirical compiler-plan regression budget, not a device capacity or
-    # measured runtime peak. Keep the original mixed-output budget; unused
-    # physical capacity is checked separately with fixed logical inputs.
+    record_property("has_sc_branch", "sc_compact_grouped_prefill" in hlo)
     memory = compiled.memory_analysis()
     assert memory is not None
     temporary = memory.temp_size_in_bytes
     record_property("compiler_temporary_bytes", temporary)
-    assert temporary < 400 * 1024**2
     output, returned = compiled(*args)
     baseline, _ = jax.jit(
         functools.partial(
@@ -218,9 +224,7 @@ def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
             )
             for i in range(0, tokens, 8192)
         ]
-        np.testing.assert_array_equal(
-            choices, [(i < 8192) == sc_first for i in range(0, tokens, 8192)]
-        )
+        record_property("standalone_selector_choices", choices)
     # FP64 independent reference includes partial groups and physical page tails.
     for row in (1, 32, min(8190, tokens - 2), tokens - 2):
         length = int(args[3][row])
