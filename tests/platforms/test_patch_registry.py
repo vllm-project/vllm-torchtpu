@@ -222,7 +222,12 @@ def test_invalid_stage_is_rejected(registry):
 
 
 def test_entered_reports_applied_stages(registry):
-    reg, _ = registry
+    reg, callbacks = registry
+    callbacks.flaky = Mock(side_effect=[RuntimeError("boom"), None])
+    _patch(reg, callbacks, "flaky", ("diffusion_worker",))
+    with pytest.raises(RuntimeError, match="boom"):
+        reg.apply("diffusion_worker")
+    assert reg.entered("diffusion_worker") is False
     reg.apply("diffusion_worker")
     with pytest.raises(ValueError, match="Unknown TPU patch stage"):
         reg.apply("worker")

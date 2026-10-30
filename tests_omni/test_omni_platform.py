@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 from diffusers.pipelines.ltx2.vocoder import UpSample1d
+from torch_tpu._internal import execution_mode
 from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -30,9 +31,16 @@ from vllm_omni.diffusion.models.ltx2 import (
     ltx2_transformer,
 )
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
+from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
+    WanS2VTransformer3DModel,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     ColumnParallelGELU,
     WanSelfAttention,
+    WanTransformer3DModel,
+)
+from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
+    WanVACETransformer3DModel,
 )
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
@@ -80,14 +88,30 @@ _WAN = SimpleNamespace(model_class_name="WanPipeline")
 _QWEN_IMAGE = SimpleNamespace(model_class_name="QwenImagePipeline")
 _LTX2 = SimpleNamespace(model_class_name="LTX2Pipeline")
 _WAN_MODULES = (
-    "vllm_omni.diffusion.layers.rope",
+    "vllm_omni.diffusion.models.wan2_2",
     "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer",
     "vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer",
     "vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer",
 )
+_DIFFUSION_MODEL_MODULES = (
+    *_WAN_MODULES,
+    "vllm_omni.diffusion.models.qwen_image",
+    "vllm_omni.diffusion.models.qwen_image.qwen_image_transformer",
+    "vllm_omni.diffusion.models.ltx2",
+    "vllm_omni.diffusion.models.ltx2.ltx2_components",
+    "vllm_omni.diffusion.models.ltx2.ltx2_runtime",
+    "vllm_omni.diffusion.models.ltx2.ltx2_transformer",
+)
 _QWEN_IMAGE_ROPES = (
     qwen_image_transformer.QwenEmbedRope,
     qwen_image_transformer.QwenEmbedLayer3DRope,
+)
+_WAN_PATCHED_CLASSES = (
+    ColumnParallelGELU,
+    WanSelfAttention,
+    WanTransformer3DModel,
+    WanVACETransformer3DModel,
+    WanS2VTransformer3DModel,
 )
 
 # The patches rebind these upstream functions in place, and the first test
@@ -130,7 +154,9 @@ def test_platform_attributes():
 
 
 def test_backend_selection_imports_no_model_module(monkeypatch):
-    for name in (*_WAN_MODULES, "vllm_omni.diffusion.models.qwen_image"):
+    _isolate_diffusion_worker_patches(monkeypatch)
+    monkeypatch.setattr(patch_registry, "_entered_stages", set())
+    for name in _DIFFUSION_MODEL_MODULES:
         monkeypatch.setitem(sys.modules, name, None)
     assert (
         OmniTpuPlatform.get_diffusion_attn_backend_cls(None, 64)
@@ -145,11 +171,7 @@ def test_backend_selection_imports_no_model_module(monkeypatch):
 def test_model_patches_skip_other_models(monkeypatch, model_class_name):
     # Another model's patch neither imports its module nor completes, so it
     # still runs if this process loads that model later.
-    for name in (
-        *_WAN_MODULES,
-        "vllm_omni.diffusion.models.qwen_image",
-        "vllm_omni.diffusion.models.ltx2",
-    ):
+    for name in _DIFFUSION_MODEL_MODULES:
         monkeypatch.setitem(sys.modules, name, None)
     od_config = SimpleNamespace(model_class_name=model_class_name)
     assert _patch_qwen_image_rope_txt_freqs_clone(od_config=od_config) is False
@@ -161,11 +183,11 @@ def test_model_patches_skip_other_models(monkeypatch, model_class_name):
 
 def test_diffusion_model_load_patches_only_the_served_model(monkeypatch):
     monkeypatch.setattr(patch_registry, "_applied", set())
+    monkeypatch.setattr(patch_registry, "_entered_stages", set())
     qwen_forwards = [rope_cls.forward for rope_cls in _QWEN_IMAGE_ROPES]
-    for rope_cls in _QWEN_IMAGE_ROPES:
-        monkeypatch.setattr(rope_cls, "forward", rope_cls.forward)
+    for cls in (*_QWEN_IMAGE_ROPES, *_WAN_PATCHED_CLASSES):
+        monkeypatch.setattr(cls, "forward", cls.forward)
     gelu_forward = ColumnParallelGELU.forward
-    monkeypatch.setattr(ColumnParallelGELU, "forward", gelu_forward)
     with monkeypatch.context() as blocked:
         # Wan modules are unimportable here, so loading Qwen-Image only
         # succeeds if no Wan patch imports them.
@@ -194,6 +216,7 @@ def test_diffusion_model_load_patches_only_the_served_model(monkeypatch):
 )
 def test_model_load_logs_unpatched_pipeline(monkeypatch, od_config, logged_name):
     monkeypatch.setattr(patch_registry, "_applied", set())
+    monkeypatch.setattr(patch_registry, "_entered_stages", set())
     info = MagicMock()
     monkeypatch.setattr(patches.logger, "info", info)
     OmniTpuPlatform.init_diffusion_model_runner_runtime(
@@ -206,6 +229,7 @@ def test_model_load_logs_unpatched_pipeline(monkeypatch, od_config, logged_name)
 
 def test_model_load_does_not_log_patched_pipeline(monkeypatch):
     monkeypatch.setattr(patch_registry, "_applied", set())
+    monkeypatch.setattr(patch_registry, "_entered_stages", set())
     for rope_cls in _QWEN_IMAGE_ROPES:
         monkeypatch.setattr(rope_cls, "forward", rope_cls.forward)
     info = MagicMock()
@@ -222,6 +246,35 @@ def test_model_load_does_not_log_patched_pipeline(monkeypatch):
     )
 
 
+def _isolate_diffusion_worker_patches(monkeypatch):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    monkeypatch.setattr(execution_mode, "eager_mode", execution_mode.eager_mode)
+    monkeypatch.setattr(ipc, "_pack_tensor_if_large", ipc._pack_tensor_if_large)
+    monkeypatch.setattr(
+        DiffusionEngine, "run_startup_warmup", DiffusionEngine.run_startup_warmup
+    )
+    monkeypatch.setattr(RotaryEmbeddingWan, "forward", RotaryEmbeddingWan.forward)
+    monkeypatch.setattr(WorkerProc, "_async_output_loop", WorkerProc._async_output_loop)
+    monkeypatch.setattr(SDPAImpl, "forward", _UPSTREAM_SDPA_FORWARD)
+
+
+def test_init_diffusion_worker_vllm_config_applies_shared_patches(monkeypatch):
+    _isolate_diffusion_worker_patches(monkeypatch)
+    monkeypatch.setattr(patch_registry, "_entered_stages", set())
+    for name in _DIFFUSION_MODEL_MODULES:
+        monkeypatch.setitem(sys.modules, name, None)
+
+    fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
+    q, k, v = (torch.ones(1, 3, 2, 8) for _ in range(3))
+    with pytest.raises(NotImplementedError):
+        fallback.forward(q, k, v)
+
+    OmniTpuPlatform.init_diffusion_worker_vllm_config(None)
+    assert patch_registry.entered("diffusion_worker") is True
+    assert patch_registry.entered("diffusion_model_load") is False
+    torch.testing.assert_close(fallback.forward(q, k, v), v, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize(
     ("entered_stages", "warns"),
     [
@@ -234,11 +287,42 @@ def test_model_load_does_not_log_patched_pipeline(monkeypatch):
 def test_backend_selection_warns_without_model_load_stage(
     monkeypatch, entered_stages, warns
 ):
-    monkeypatch.setattr(patch_registry, "_entered_stages", entered_stages)
+    _isolate_diffusion_worker_patches(monkeypatch)
+    monkeypatch.setattr(patch_registry, "_entered_stages", set(entered_stages))
     warning_once = MagicMock()
     monkeypatch.setattr(omni_platform.logger, "warning_once", warning_once)
     OmniTpuPlatform.get_diffusion_attn_backend_cls(None, 64)
     assert warning_once.call_count == int(warns)
+
+
+def test_backend_selection_in_worker_init_applies_shared_diffusion_patches(
+    monkeypatch,
+):
+    # A GENERATION-stage TPUWorker enters worker_init, not the diffusion stages;
+    # building diffusion attention there must still install shared diffusion
+    # patches (such as SDPAImpl fallback dispatch) without importing models.
+    _isolate_diffusion_worker_patches(monkeypatch)
+    monkeypatch.setattr(patch_registry, "_entered_stages", {"worker_init"})
+    warning_once = MagicMock()
+    monkeypatch.setattr(omni_platform.logger, "warning_once", warning_once)
+    for name in _DIFFUSION_MODEL_MODULES:
+        monkeypatch.setitem(sys.modules, name, None)
+
+    fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 5, 2, 8) for _ in range(3))
+    with pytest.raises(NotImplementedError):
+        fallback.forward(q, k, v)
+
+    backend = OmniTpuPlatform.get_diffusion_attn_backend_cls(None, 64)
+    assert backend == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
+    assert warning_once.call_count == 0
+
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.double(), k.double()) * 0.3
+    want = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v.double()).float()
+    torch.testing.assert_close(fallback.forward(q, k, v), want, rtol=1e-5, atol=1e-5)
+    assert patch_registry.entered("diffusion_worker") is True
+    assert patch_registry.entered("diffusion_model_load") is False
 
 
 def test_rope_pair_swap_matches_native():
@@ -534,9 +618,13 @@ def test_tpu_sdpa_attention_backend():
     ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
 )
 def test_qwen_image_rope_txt_freqs_clone(monkeypatch, rope_cls_name):
+    for cls in _QWEN_IMAGE_ROPES:
+        monkeypatch.setattr(cls, "forward", cls.forward)
     rope_cls = getattr(qwen_image_transformer, rope_cls_name)
-    monkeypatch.setattr(rope_cls, "forward", rope_cls.forward)
     _patch_qwen_image_rope_txt_freqs_clone(od_config=_QWEN_IMAGE)
+    patched_forward = rope_cls.forward
+    _patch_qwen_image_rope_txt_freqs_clone(od_config=_QWEN_IMAGE)
+    assert rope_cls.forward is patched_forward
 
     rope = rope_cls(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
 
@@ -561,6 +649,9 @@ def test_qwen_image_rope_txt_freqs_clone(monkeypatch, rope_cls_name):
 def test_safe_pack_tensor_if_large(monkeypatch, nbytes):
     monkeypatch.setattr(ipc, "_pack_tensor_if_large", ipc._pack_tensor_if_large)
     _patch_diffusion_ipc_cpu_pack()
+    patched_pack = ipc._pack_tensor_if_large
+    _patch_diffusion_ipc_cpu_pack()
+    assert ipc._pack_tensor_if_large is patched_pack
     # Return the tensor that would be copied to SHM, so that the test sees
     # what the original function received for tensors above the threshold.
     monkeypatch.setattr(ipc, "_tensor_to_shm", lambda val, **kwargs: val)
@@ -600,6 +691,9 @@ def test_startup_warmup_device_sync(monkeypatch):
         DiffusionEngine, "run_startup_warmup", lambda self: calls.append("warmup")
     )
     _patch_diffusion_startup_warmup_sync()
+    patched_warmup = DiffusionEngine.run_startup_warmup
+    _patch_diffusion_startup_warmup_sync()
+    assert DiffusionEngine.run_startup_warmup is patched_warmup
 
     DiffusionEngine.run_startup_warmup(object())
     assert calls == ["warmup", "sync"]

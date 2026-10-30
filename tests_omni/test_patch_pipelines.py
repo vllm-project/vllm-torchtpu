@@ -27,25 +27,25 @@ pytestmark = pytest.mark.omni
 _MODELS = "vllm_omni.diffusion.models"
 
 
-def _pipelines_in(package: str) -> set[str]:
+def _pipelines_in(*packages: str) -> set[str]:
+    prefixes = tuple(f"{_MODELS}.{package}." for package in packages)
     return {
         arch
         for arch, model in DiffusionModelRegistry.models.items()
-        if model.module_name.startswith(f"{_MODELS}.{package}.")
+        if model.module_name.startswith(prefixes)
     }
 
 
 @pytest.mark.parametrize(
-    ("pipelines", "package"),
+    ("pipelines", "packages"),
     [
-        (_QWEN_IMAGE_PIPELINES, "qwen_image"),
-        (_WAN_PIPELINES, "wan2_2"),
-        (_LTX2_PIPELINES, "ltx2"),
+        (_QWEN_IMAGE_PIPELINES, ("qwen_image",)),
+        (_WAN_PIPELINES, ("wan2_2", "causvid_wan")),
+        (_LTX2_PIPELINES, ("ltx2",)),
     ],
-    ids=["qwen_image", "wan2_2", "ltx2"],
+    ids=["qwen_image", "wan", "ltx2"],
 )
-def test_patched_pipelines_match_registry(pipelines, package):
-    in_package = _pipelines_in(package)
-    assert in_package, f"no registry entry under {_MODELS}.{package}"
-    assert pipelines - DiffusionModelRegistry.models.keys() == set()
-    assert in_package - pipelines == set()
+def test_patched_pipelines_match_registry(pipelines, packages):
+    for package in packages:
+        assert _pipelines_in(package), f"no registry entry under {_MODELS}.{package}"
+    assert pipelines == _pipelines_in(*packages)

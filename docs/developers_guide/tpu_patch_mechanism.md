@@ -116,12 +116,14 @@ Patch(
 
 After the `diffusion_model_load` pass, `OmniTpuPlatform` logs
 `No model-specific TPU diffusion patch applies to pipeline <name>.` at INFO
-when the served pipeline is in no set. `OmniTpuPlatform.get_diffusion_attn_backend_cls`
-logs a warning when it runs in a process that entered neither
-`diffusion_model_load` nor `worker_init`, which means that vLLM-Omni built the
-pipeline without calling `init_diffusion_model_runner_runtime`.
-`patch_registry.entered(stage)` reports whether a stage was applied in the
-process.
+when the served pipeline is in no set. When a `TPUWorker` process (which
+entered `worker_init`, not `diffusion_model_load`) builds diffusion attention,
+`OmniTpuPlatform.get_diffusion_attn_backend_cls` applies `diffusion_worker` so
+the shared diffusion patches still cover that stage. When neither
+`diffusion_model_load` nor `worker_init` ran, `get_diffusion_attn_backend_cls`
+logs a warning because vLLM-Omni built the pipeline without calling
+`init_diffusion_model_runner_runtime`. `patch_registry.entered(stage)` reports
+whether a stage was applied in the process.
 
 ## Completion, retries, and model selection
 

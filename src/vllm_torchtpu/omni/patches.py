@@ -124,6 +124,9 @@ def _extend_async_output_timeout() -> None:
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
 
 
+_IPC_CPU_PACK_PATCHED = "_tpu_ipc_cpu_pack_patched"
+
+
 def _patch_diffusion_ipc_cpu_pack() -> None:
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
@@ -145,12 +148,18 @@ def _patch_diffusion_ipc_cpu_pack() -> None:
     from vllm_omni.diffusion import ipc
 
     orig_pack_tensor = ipc._pack_tensor_if_large
+    if getattr(orig_pack_tensor, _IPC_CPU_PACK_PATCHED, False):
+        return
 
     def _safe_pack_tensor_if_large(val: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
         return orig_pack_tensor(val.cpu(), *args, **kwargs)
 
+    setattr(_safe_pack_tensor_if_large, _IPC_CPU_PACK_PATCHED, True)
     ipc._pack_tensor_if_large = _safe_pack_tensor_if_large
     logger.info("Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
+
+
+_TXT_FREQS_CLONE_PATCHED = "_tpu_txt_freqs_clone_patched"
 
 
 def _patch_qwen_image_rope_txt_freqs_clone(
@@ -172,12 +181,16 @@ def _patch_qwen_image_rope_txt_freqs_clone(
         return False
     from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
+    patched = False
     for rope_cls in (
         qwen_image_transformer.QwenEmbedRope,
         qwen_image_transformer.QwenEmbedLayer3DRope,
     ):
-        rope_cls.forward = _clone_txt_freqs(rope_cls.forward)
-    logger.info("Applied TPU patch: Qwen-Image RoPE txt_freqs clone.")
+        if not getattr(rope_cls.forward, _TXT_FREQS_CLONE_PATCHED, False):
+            rope_cls.forward = _clone_txt_freqs(rope_cls.forward)
+            patched = True
+    if patched:
+        logger.info("Applied TPU patch: Qwen-Image RoPE txt_freqs clone.")
 
 
 def _clone_txt_freqs(forward: Any) -> Any:
@@ -185,6 +198,7 @@ def _clone_txt_freqs(forward: Any) -> Any:
         vid_freqs, txt_freqs = forward(self, *args, **kwargs)
         return vid_freqs, txt_freqs.clone()
 
+    setattr(_forward, _TXT_FREQS_CLONE_PATCHED, True)
     return _forward
 
 
@@ -219,6 +233,9 @@ def _patch_wan_pair_swap_rope() -> None:
     logger.info("Applied TPU patch: pair-swap matmul RotaryEmbeddingWan.")
 
 
+_FFN_GELU_FENCE_PATCHED = "_tpu_ffn_gelu_fence_patched"
+
+
 def _patch_wan_ffn_gelu_fence(
     od_config: "OmniDiffusionConfig | None" = None,
 ) -> bool | None:
@@ -243,6 +260,8 @@ def _patch_wan_ffn_gelu_fence(
         ColumnParallelGELU,
     )
 
+    if getattr(ColumnParallelGELU.forward, _FFN_GELU_FENCE_PATCHED, False):
+        return
     orig_forward = getattr(
         ColumnParallelGELU, "_tpu_orig_forward", ColumnParallelGELU.forward
     )
@@ -251,6 +270,7 @@ def _patch_wan_ffn_gelu_fence(
     def _fenced_gelu_forward(self: Any, x: torch.Tensor) -> torch.Tensor:
         return _optimization_barrier_op()(orig_forward(self, x))
 
+    setattr(_fenced_gelu_forward, _FFN_GELU_FENCE_PATCHED, True)
     ColumnParallelGELU.forward = _fenced_gelu_forward
     logger.info("Applied TPU patch: fusion fence after Wan FFN GELU.")
 
@@ -308,6 +328,9 @@ class _CurrentDeviceWorkerProxy:
         setattr(self._worker, name, value)
 
 
+_WARMUP_SYNC_PATCHED = "_tpu_warmup_sync_patched"
+
+
 # TODO: Remove once vLLM-Omni synchronizes the device at the end of its
 # startup warmup (e.g. self.executor.collective_rpc("synchronize_device") in
 # _dummy_run).
@@ -331,6 +354,8 @@ def _patch_diffusion_startup_warmup_sync() -> None:
     from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
     orig_run_startup_warmup = DiffusionEngine.run_startup_warmup
+    if getattr(orig_run_startup_warmup, _WARMUP_SYNC_PATCHED, False):
+        return
 
     def _synced_run_startup_warmup(self: Any) -> None:
         orig_run_startup_warmup(self)
@@ -339,8 +364,12 @@ def _patch_diffusion_startup_warmup_sync() -> None:
         # patch at platform init, so that mp engines are covered too.
         torch.accelerator.synchronize()
 
+    setattr(_synced_run_startup_warmup, _WARMUP_SYNC_PATCHED, True)
     DiffusionEngine.run_startup_warmup = _synced_run_startup_warmup
     logger.info("Applied TPU patch: device sync after diffusion startup warmup.")
+
+
+_FUSED_QK_NORM_ROPE_PATCHED = "_tpu_fused_qk_norm_rope_patched"
 
 
 def _patch_wan_fused_qk_norm_rope(
@@ -370,9 +399,11 @@ def _patch_wan_fused_qk_norm_rope(
         wan_self_attention_fused,
     )
 
-    if hasattr(WanSelfAttention, "_tpu_orig_forward"):
+    if getattr(WanSelfAttention.forward, _FUSED_QK_NORM_ROPE_PATCHED, False):
         return
-    WanSelfAttention._tpu_orig_forward = WanSelfAttention.forward
+    WanSelfAttention._tpu_orig_forward = getattr(
+        WanSelfAttention, "_tpu_orig_forward", WanSelfAttention.forward
+    )
 
     def _fused_self_attention_forward(
         self: Any,
@@ -386,6 +417,7 @@ def _patch_wan_fused_qk_norm_rope(
             )
         return wan_self_attention_fused(self, hidden_states, rotary_emb, attn_metadata)
 
+    setattr(_fused_self_attention_forward, _FUSED_QK_NORM_ROPE_PATCHED, True)
     WanSelfAttention.forward = _fused_self_attention_forward
     logger.info("Applied TPU patch: fused q/k RMSNorm + RoPE for Wan attention.")
 

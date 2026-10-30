@@ -100,6 +100,7 @@ pytestmark = [pytest.mark.omni]
 
 
 def _apply_model_patches() -> None:
+    patch_registry.apply("diffusion_worker")
     patch_registry.apply(
         "diffusion_model_load",
         od_config=SimpleNamespace(model_class_name="WanPipeline"),
@@ -162,6 +163,7 @@ def _assert_parity(
 @pytest.fixture(scope="module")
 def omni_ctx():
     """Single-rank diffusion parallel groups plus a default forward context."""
+    _apply_model_patches()
     owns_dist_env = not torch.distributed.is_initialized()
     if owns_dist_env:
         init_distributed_environment(

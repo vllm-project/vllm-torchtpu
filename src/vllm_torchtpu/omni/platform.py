@@ -79,11 +79,14 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         allow_trtllm_default: bool = False,
     ) -> str:
         # TPUWorker processes (e.g. GENERATION stages) also build diffusion
-        # attention layers; they enter worker_init, not the diffusion stages.
-        if not (
-            patch_registry.entered("diffusion_model_load")
-            or patch_registry.entered("worker_init")
-        ):
+        # attention layers; they enter worker_init, not the diffusion stages,
+        # so apply the shared diffusion_worker patches here without importing
+        # model modules.
+        if patch_registry.entered("diffusion_model_load"):
+            pass
+        elif patch_registry.entered("worker_init"):
+            patch_registry.apply("diffusion_worker")
+        else:
             logger.warning_once(
                 "Diffusion attention is being built before the "
                 "diffusion_model_load TPU patch stage ran in this process, so "

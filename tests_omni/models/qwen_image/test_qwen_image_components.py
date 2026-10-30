@@ -44,6 +44,7 @@ pytestmark = [pytest.mark.omni]
 
 
 def _apply_model_patches() -> None:
+    patch_registry.apply("diffusion_worker")
     patch_registry.apply(
         "diffusion_model_load",
         od_config=SimpleNamespace(model_class_name="QwenImagePipeline"),

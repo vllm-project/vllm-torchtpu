@@ -282,7 +282,6 @@ def apply(
     if stage not in get_args(Stage):
         raise ValueError(f"Unknown TPU patch stage: {stage}")
     with _lock:
-        _entered_stages.add(stage)
         if stage in _active_stages:
             return
         _active_stages.add(stage)
@@ -309,6 +308,7 @@ def apply(
                     continue
                 _applied.add(patch.target)
                 applied.append(patch.target)
+            _entered_stages.add(stage)
         finally:
             _active_stages.discard(stage)
             if applied:
@@ -318,5 +318,5 @@ def apply(
 
 
 def entered(stage: Stage) -> bool:
-    """Returns whether `apply` has been called for `stage` in this process."""
+    """Returns whether `apply` has completed for `stage` in this process."""
     return stage in _entered_stages
