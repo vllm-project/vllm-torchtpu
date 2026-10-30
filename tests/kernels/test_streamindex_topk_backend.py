@@ -110,6 +110,7 @@ def test_backend_replacement_keeps_real_streamindex_scores(chunk_tokens, return_
     q = jnp.zeros((256, 4, 128), jnp.bfloat16)
     weights = jnp.zeros((256, 4), jnp.float32)
     cache = jnp.zeros((4, 32, 4, 256), jnp.uint8)
+    ratio = 2
     args = (
         q,
         weights,
@@ -121,7 +122,7 @@ def test_backend_replacement_keeps_real_streamindex_scores(chunk_tokens, return_
     )
     kwargs = dict(
         k=128,
-        compression_ratio=2,
+        compression_ratio=ratio,
         num_kv_pages_per_block=2,
         num_queries_per_block=(1, 128, 128),
         chunk_tokens=chunk_tokens,
@@ -132,7 +133,8 @@ def test_backend_replacement_keeps_real_streamindex_scores(chunk_tokens, return_
     for result in (default, alternate):
         ids = np.asarray(result[0] if return_scores else result)
         positions = np.r_[np.arange(128, 256), np.arange(129, 257)]
-        lengths = np.minimum(positions // 2 + 1, np.repeat([128, 128], 128))
+        group_ends = ratio * np.arange(1, 129) - 1
+        lengths = np.count_nonzero(group_ends[None, :] <= positions[:, None], axis=1)
         for row, length in enumerate(lengths):
             live = ids[row][ids[row] >= 0]
             assert len(live) == min(length, 128)
@@ -500,3 +502,24 @@ def test_unsupported_layout_skips_both_component_validators():
             kv_layout=KVLayout.SEQ_ALONG_LANE,
             components=StreamIndexComponents(ForbiddenReader(), ForbiddenSchedule()),
         )
+
+
+def test_complete_group_visibility_matches_last_token_reference():
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+        _effective_row_lengths,
+    )
+
+    positions = np.r_[np.arange(128, 256), np.arange(129, 257)]
+    group_ends = 2 * np.arange(1, 129) - 1
+    expected = np.count_nonzero(group_ends[None, :] <= positions[:, None], axis=1)
+    actual = _effective_row_lengths(
+        jnp.array([256, 257], jnp.int32),
+        jnp.array([0, 128, 256], jnp.int32),
+        jnp.array([0, 0, 2], jnp.int32),
+        num_tokens=256,
+        num_positions=128,
+        compression_ratio=2,
+    )
+    np.testing.assert_array_equal(actual, expected)
+    assert expected[0] == 64
+    assert expected[1] == 65

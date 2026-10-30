@@ -103,6 +103,13 @@ def runner_inputs(
     ring_tables = ring_tables.reshape(8, -1)
     torch.testing.assert_close(ring_tables[0], tables[1][0])
     assert torch.count_nonzero(ring_tables[1:]) == 0
+    main_tables = prepared[0][names[0]].block_tables
+    distribution = prepared[0][names[0]].request_distribution
+    assert isinstance(main_tables, torch.Tensor)
+    assert isinstance(distribution, torch.Tensor)
+    torch.testing.assert_close(main_tables.reshape(8, -1)[0], tables[0][0])
+    assert torch.count_nonzero(main_tables.reshape(8, -1)[1:]) == 0
+    assert distribution.tolist() == [0, 0, 1]
     assert kwargs["valid_tokens"].tolist() == [True] * (tokens - 3) + [False] * 3
     return runner, kwargs, layout, columns
 
@@ -188,11 +195,24 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
         ].block_tables.numpy(),
         jnp.int32,
     )
-    tables = tuple(
-        jnp.asarray(md[n].numpy(), jnp.int32).reshape(-1)
-        for n in ("main_block_table", "compressed_block_table")
+    attention = runner.test_attention_metadata["model.layers.3.self_attn"]
+    main_table_tensor = attention.block_tables
+    distribution_tensor = attention.request_distribution
+    assert isinstance(main_table_tensor, torch.Tensor)
+    assert isinstance(distribution_tensor, torch.Tensor)
+    main_table_flat = jnp.asarray(main_table_tensor.numpy(), jnp.int32).reshape(-1)
+    distribution = jnp.asarray(distribution_tensor.numpy(), jnp.int32)
+    args = (
+        *producers,
+        pool,
+        index_pool,
+        starts,
+        contexts,
+        rings,
+        main_table_flat,
+        main_table_flat,
+        distribution,
     )
-    args = (*producers, pool, index_pool, starts, contexts, rings, *tables)
     options = dict(compress_ratio=4, token_topk=2048, norm_eps=1e-6, rotary_dim=64)
     import functools
 
@@ -218,8 +238,11 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
             )
         return torch.from_numpy(np.asarray(x).copy()).to("tpu")
 
-    tensors = [tensor(x) for x in args]
-    tensors[-1] = tensors[-2]  # Both stores use the same production table object.
+    tensors = [
+        tensor(x) for x in (*producers, pool, index_pool, starts, contexts, rings)
+    ]
+    native_table = tensor(main_table_flat)
+    tensors.extend((native_table, native_table, tensor(distribution)))
     # Each call mutates its pool. Compare direct/compiled execution from the
     # same initial history, rather than replaying an old context on new state.
     compiled_tensors = list(tensors)
@@ -285,7 +308,7 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
     )
     from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import pack_rows
 
-    main_table = md["main_block_table"][0].numpy()
+    main_table = main_table_tensor.reshape(len(contexts), -1)[0].numpy()
     logical = context + np.arange(tokens)
     expected_written = np.asarray(
         pack_rows(key[:-3], value[:-3], fp8=fp8, k_scale=1.0, v_scale=1.0)
@@ -329,12 +352,32 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
         block_ids = selections[:, :2048:4] // 4
         block_ids = np.where(selections[:, :2048:4] >= 0, block_ids, -1)
         if fp8 and local_heads == 24:
+            from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
+                get_sparse_prefill_tiles,
+            )
+            from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import (
+                prefill_cost_model,
+            )
+
+            cache_spec = jax.ShapeDtypeStruct(cache.shape, cache.dtype)
+            _, kv_tile = get_sparse_prefill_tiles(
+                query, cache_spec, kv_heads=kv_heads, ratio=options["compress_ratio"]
+            )
+            model = prefill_cost_model(
+                query,
+                jax.ShapeDtypeStruct(block_ids.shape, jnp.int32),
+                jax.ShapeDtypeStruct((len(query), len(main_table)), jnp.int32),
+                cache_spec,
+                kv_heads=kv_heads,
+                ratio=options["compress_ratio"],
+                kv_tile=kv_tile,
+            )
             assert bool(
                 jax.jit(
                     functools.partial(
                         select_sc,
-                        num_tiles=math.ceil(columns * layout.block_size / 256),
-                        dtype=dtype,
+                        num_tiles=math.ceil(len(main_table) * cache.shape[1] / kv_tile),
+                        model=model,
                     )
                 )(jnp.asarray(block_ids), jnp.asarray(lengths))
             )
