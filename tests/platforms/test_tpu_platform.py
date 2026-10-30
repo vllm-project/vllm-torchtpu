@@ -46,6 +46,7 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_8I_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform,
     _validate_lora_config,
+    _validate_peer_replay_config,
     _validate_phased_profiling_config,
     get_tpu_multihost_topology,
 )
@@ -1487,3 +1488,28 @@ def test_tpu_platform_accelerator_methods(monkeypatch):
 
     TpuPlatform.set_stream(fake_stream)
     assert calls[-1] == ("set_stream", fake_stream)
+
+
+@pytest.mark.parametrize(
+    "parallel, peer_replay, disable_cache, raises",
+    [
+        ("1", "1", "1", True),
+        ("1", "1", "0", False),
+        ("1", "0", "1", False),
+        ("0", "1", "1", False),  # peer replay only acts under parallel precompile
+    ],
+)
+def test_peer_replay_requires_the_compile_cache(
+    monkeypatch, parallel, peer_replay, disable_cache, raises
+):
+    """TPU_PRECOMPILE_PEER_REPLAY hands ranges over through vLLM's compile
+    cache, so turning it on with VLLM_DISABLE_COMPILE_CACHE=1 fails at startup
+    instead of doing nothing."""
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", parallel)
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", peer_replay)
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", disable_cache)
+    if raises:
+        with pytest.raises(ValueError, match="VLLM_DISABLE_COMPILE_CACHE"):
+            _validate_peer_replay_config()
+    else:
+        _validate_peer_replay_config()

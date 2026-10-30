@@ -59,6 +59,7 @@ from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.runner.kv_cache_manager import (
     KVCacheManager,
     check_kv_caches_cover_block_ids,
+    sparse_mla_page_size_bytes,
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker
@@ -152,6 +153,78 @@ def test_check_kv_caches_cover_block_ids_rejects_missing_attention_cache():
         check_kv_caches_cover_block_ids(
             {"attn.0": torch.empty((4, 1))}, [tensor], 4, lambda _: spec
         )
+
+
+@pytest.mark.parametrize("rope_layout", ["sparsecore", "tensorcore"])
+@pytest.mark.parametrize("use_sparse", [False, True])
+def test_sparse_mla_page_size_bytes(monkeypatch, rope_layout, use_sparse):
+    """Sparse MLA layers measure their allocated (nope, rope) page size
+    (576 B/token on SparseCore, 640 B/token on TensorCore); dense MLA layers
+    and unconfigured mocks return None."""
+    monkeypatch.setenv("TPU_SPARSE_MLA_ROPE_LAYOUT", rope_layout)
+    layer = SimpleNamespace(head_size=576, use_sparse=use_sparse)
+    got = sparse_mla_page_size_bytes(layer, 256, torch.float8_e4m3fn)
+    expected = (
+        None if not use_sparse else (576 if rope_layout == "sparsecore" else 640) * 256
+    )
+    assert got == expected
+    assert (
+        sparse_mla_page_size_bytes(
+            MagicMock(spec=MLAAttention), 256, torch.float8_e4m3fn
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("layout", ["sparsecore", "tensorcore"])
+def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
+    """By default (SparseCore), a sparse MLA layer publishes its 576 B/token
+    page and the TPU normalizer preserves it; on TensorCore it publishes the
+    640 B/token padded page. Runs on CPU."""
+    monkeypatch.setenv("TPU_SPARSE_MLA_NOPE_LAYOUT", layout)
+    monkeypatch.setenv("TPU_SPARSE_MLA_ROPE_LAYOUT", layout)
+    runner = MagicMock(spec=TPUModelRunner)
+    runner.block_size = 16
+    runner.kv_cache_dtype = torch.float8_e4m3fn
+    runner.vllm_config = MagicMock()
+    runner.vllm_config.speculative_config = None
+    runner.cache_config = runner.vllm_config.cache_config = CacheConfig(
+        block_size=16, gpu_memory_utilization=0.9, cache_dtype="auto"
+    )
+    runner.scheduler_config = runner.vllm_config.scheduler_config = SimpleNamespace(
+        disable_hybrid_kv_cache_manager=False
+    )
+    runner.vllm_config.attention_config = None  # no HiSparse
+    runner.use_spmd = False
+    runner._hybrid_uniform_page_size_bytes = None
+    runner._unified_kv_layout = False
+    runner._mamba_num_blocks = None
+    runner._uniform_mamba_layout = False
+    runner.shared_kv_cache_layers = {}
+    runner.runner_only_attn_layers = set()
+    runner.speculative_config = None
+    runner.kv_cache_manager = KVCacheManager(runner)
+    runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(runner)
+    mock_mla = MagicMock(spec=MLAAttention)
+    mock_mla.num_kv_heads = 1
+    mock_mla.head_size = 576
+    mock_mla.use_sparse = True
+    with (
+        patch.object(
+            TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
+        ),
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+            return_value={"mla_0": mock_mla},
+        ),
+    ):
+        spec = runner.get_kv_cache_spec()["mla_0"]
+
+    token_bytes = 576 if layout == "sparsecore" else 640
+    assert isinstance(spec, MLAAttentionSpec)
+    assert spec.page_size_bytes == token_bytes * runner.block_size
+    assert spec.state_content_bytes == token_bytes
+    assert spec.num_head_slots == 1
 
 
 @pytest.mark.tpu_test
