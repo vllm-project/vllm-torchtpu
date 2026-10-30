@@ -290,6 +290,8 @@ def pack_row_quads(rows: jax.Array) -> jax.Array:
 # stay row quads.
 TOKEN_QUAD_LANES = 128
 TOKEN_QUAD_COLS = 4 * TOKEN_QUAD_LANES
+# Token-span words each transpose loop iteration covers.
+TRANSPOSE_WORDS = 16
 
 
 def transpose_byte_quads(
@@ -510,25 +512,32 @@ def token_quads_kernel(
         in_row = slot * lanes
         out_row = slot * out_rows
 
-        @plsc.parallel_loop(0, TOKEN_QUAD_LANES, step=lanes)
-        def _(p):
-            for m in range(out_rows):
+        assert token_words % TRANSPOSE_WORDS == 0 and TRANSPOSE_WORDS % lanes == 0
+
+        # Word w = 128 b + p of a row's token span holds its columns
+        # 512 b + 128 j + p, j its byte; that is output column 4 w - 3 p + 128 j.
+        @plsc.parallel_loop(0, token_words, step=TRANSPOSE_WORDS)
+        def _(w0):
+            for v in range(0, TRANSPOSE_WORDS, lanes):
+                w = pl.multiple_of(w0 + v, lanes)
+                out_col = 4 * w - 3 * jnp.bitwise_and(w, TOKEN_QUAD_LANES - 1)
                 # All loads ahead of all stores: the stores could alias them.
-                spans = range(token_words // TOKEN_QUAD_LANES)
                 words = [
                     tuple(
-                        data_vmem_ref[
-                            in_row + 4 * m + k, pl.ds(TOKEN_QUAD_LANES * b + p, lanes)
-                        ]
+                        data_vmem_ref[in_row + 4 * m + k, pl.ds(w, lanes)]
                         for k in range(4)
                     )
-                    for b in spans
+                    for m in range(out_rows)
                 ]
-                words = [transpose_byte_quads(w) for w in words]
-                for b in spans:
-                    for j, word in enumerate(words[b]):
-                        col = TOKEN_QUAD_COLS * b + TOKEN_QUAD_LANES * j + p
-                        out_vmem_ref[out_row + m, pl.ds(col, lanes)] = word
+                for m in range(out_rows):
+                    for j, word in enumerate(transpose_byte_quads(words[m])):
+                        out_vmem_ref[
+                            out_row + m,
+                            pl.ds(
+                                pl.multiple_of(out_col + TOKEN_QUAD_LANES * j, lanes),
+                                lanes,
+                            ),
+                        ] = word
 
         # The trailer is row quads: pick each row's byte.
         shifts = jnp.left_shift(jnp.bitwise_and(chunk_indices(g), 3), 3)
