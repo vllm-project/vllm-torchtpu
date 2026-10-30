@@ -216,12 +216,9 @@ class _AdapterSlotWriter:
         # dynamic_update_slice clamps an out-of-range index to a valid slot.
         assert 0 <= slot < len(self._slot_indices), slot
         slot_weights = self._host_slot_weights.to(self._device)
-        # The add_lora RPC runs with grad enabled, and a grad-mode change
-        # retraces the compiled writer.
-        with torch.no_grad():
-            write_adapter_to_slot(
-                self._stacked_weights, slot_weights, self._slot_indices[slot]
-            )
+        write_adapter_to_slot(
+            self._stacked_weights, slot_weights, self._slot_indices[slot]
+        )
 
     def precompile(self) -> None:
         self._host_slot_weights.zero_()
