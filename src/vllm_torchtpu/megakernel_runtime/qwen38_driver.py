@@ -1397,7 +1397,8 @@ class Qwen38SegmentDriver:
     def _log_per_request(self, runner: Any, mk: Any, stock: Any, mk_pre: Any, seg_pre: Any,
                          kw: dict, positions: Any, rows: int, n_req: int) -> None:
         """Per request: top-1 agreement MK vs stock, residual rel (shadow vs cut segment
-        reference) entering the last QSA layer; metadata of every request that disagrees."""
+        reference) entering the last QSA layer; per-request ctx / pos / state slot and the
+        final-hidden rel scaled by each request's own magnitude, logged for every request."""
         T = T_VERIFY
         n = n_req or rows // T
         mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
@@ -1412,19 +1413,32 @@ class Qwen38SegmentDriver:
             a, b = mk_pre.float()[: n * T], seg_pre.float()[: n * T]
             scale = b.abs().mean().clamp_min(1e-6)
             pre = [round(float(v), 4) for v in ((a - b).abs().reshape(n, T, -1).mean((1, 2)) / scale).cpu()]
-        bad = [q for q in range(n) if agree[q] < 0.5]
-        meta = {}
-        if bad:
-            def at(name, q):
-                t = kw.get(name)
-                return int(t[q]) if isinstance(t, torch.Tensor) and t.numel() > q else None
+        pre_own = None  # same, scaled by each request's own reference magnitude
+        if mk_pre is not None:
+            pre_own = [round(float(v), 4) for v in
+                       ((a - b).abs().reshape(n, T, -1).mean((1, 2))
+                        / b.abs().reshape(n, T, -1).mean((1, 2)).clamp_min(1e-6)).cpu()]
+        fa = mk_h.float()[: n * T].reshape(n, T, -1)
+        fb = st_h.float()[: n * T].reshape(n, T, -1)
+        fin = [round(float(v), 4) for v in
+               ((fa - fb).abs().mean((1, 2)) / fb.abs().mean((1, 2)).clamp_min(1e-6)).cpu()]
 
-            for q in bad:
-                meta[q] = dict(ctx=at("context_lens", q), qsl=at("query_start_loc", q),
-                               slot=at("state_slots", q), pos=int(positions[q * T]))
+        def col(name):
+            t = kw.get(name)
+            if isinstance(t, torch.Tensor) and t.numel() >= n:
+                return [int(v) for v in t[:n].cpu()]
+            return None
+
+        bad = [q for q in range(n) if agree[q] < 0.5]
         logger.info(
             "qwen38 whole-step shadow per-request rows=%d agree=%s pre_last_rel_vs_seg=%s bad=%s",
-            rows, agree, pre, meta,
+            rows, agree, pre, bad,
+        )
+        logger.info(
+            "qwen38 per-request meta rows=%d ctx=%s pos=%s slot=%s qsl=%s fin_rel_own=%s "
+            "pre_rel_own=%s", rows, col("context_lens"),
+            [int(v) for v in positions[: n * T : T].cpu()], col("state_slots"),
+            col("query_start_loc"), fin, pre_own,
         )
 
     # Context buckets (tokens) for the per-row hidden-state error.

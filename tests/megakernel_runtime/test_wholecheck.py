@@ -42,11 +42,17 @@ def test_per_request_log_names_the_request_that_disagrees(caplog):
     drv = object.__new__(qd.Qwen38SegmentDriver)
     with caplog.at_level(logging.INFO):
         drv._log_per_request(_runner(), mk, stock, pre, seg, kw, positions, n * T, n)
-    line = caplog.records[-1].getMessage()
+    line = caplog.records[-2].getMessage()
     assert "agree=[1.0, 1.0, 0.0, 1.0]" in line, line
-    assert "bad={2: {'ctx': 300, 'qsl': 8, 'slot': 9, 'pos': 8}}" in line, line
+    assert "bad=[2]" in line, line
     rel = eval(line.split("pre_last_rel_vs_seg=")[1].split(" bad=")[0])
     assert rel[2] > 0.5 and max(rel[0], rel[1], rel[3]) == 0.0, rel
+    meta = caplog.records[-1].getMessage()
+    assert "ctx=[100, 200, 300, 400] pos=[0, 4, 8, 12] slot=[7, 8, 9, 10]" in meta, meta
+    own = eval(meta.split("pre_rel_own=")[1])
+    assert own[2] > 0.5 and max(own[0], own[1], own[3]) == 0.0, own
+    fin = eval(meta.split("fin_rel_own=")[1].split(" pre_rel_own=")[0])
+    assert len(fin) == n, fin
 
 
 def test_vs_stock_counts_top1_agreement():
