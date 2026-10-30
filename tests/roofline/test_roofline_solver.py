@@ -24,6 +24,14 @@ import pytest
 import vllm_torchtpu.roofline as rf
 from vllm_torchtpu.roofline import cli
 from vllm_torchtpu.roofline.solver import _candidate_decode_parallels
+import math
+from vllm_torchtpu.roofline import CHIPS, Dtypes, Parallel
+from vllm_torchtpu.roofline.solver import (
+    TrafficScenario,
+    hbm_breakdown_per_core_bytes,
+    hbm_footprint_per_core_bytes,
+    solve_serving_plan,
+)
 
 EXAMPLE_ACCEPT_LEN: float = 3.0
 
@@ -667,3 +675,122 @@ def test_engine_memory_utilization_and_explicit_scenario_inputs(tmp_path: Path) 
         ]
     )
     assert rc_exp == 0
+
+
+def test_hbm_breakdown_matches_footprint():
+    """HbmBreakdown total matches hbm_footprint_per_core_bytes across geometries."""
+
+    gqa_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    mla_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 30,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "head_dim": 128,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "vocab_size": 32000,
+    }
+
+    geoms = [
+        rf.from_hf_config(gqa_cfg),
+        rf.from_hf_config(mla_cfg),
+        rf.from_hf_config(QWEN35_CFG),
+    ]
+    dt = Dtypes(kv=1.0)
+    par = Parallel(tp=4, dp=1, ep=1, pp=1, pcp=1)
+
+    for geom in geoms:
+        bd = hbm_breakdown_per_core_bytes(geom, dt, par, seqs_per_dp=16, context=2048)
+        footprint = hbm_footprint_per_core_bytes(geom, dt, par, seqs_per_dp=16, context=2048)
+        assert bd.total == footprint
+        assert math.isclose(bd.weights + bd.kv + bd.state, bd.total, rel_tol=1e-9)
+        assert bd.weights > 0
+        assert bd.kv >= 0
+        if geom.linear_k_heads:
+            assert bd.state > 0
+        else:
+            assert bd.state == 0.0
+
+
+@pytest.mark.parametrize("mode", ["mixed", "disagg", "auto"])
+def test_search_stats_funnel_is_monotone(mode: str):
+    """Search funnel is monotonically non-increasing and frontier is positive."""
+
+    chip = CHIPS["tpu7x"]
+    gqa_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    geom = rf.from_hf_config(gqa_cfg)
+    dt = Dtypes(kv=1.0)
+    scenario = dc_replace(
+        rf.EXAMPLE_SCENARIOS["chat-8k1k"],
+        concurrencies=(1, 4),
+        ttft_slo_ms=5000.0,
+        tpot_slo_ms=500.0,
+    )
+    plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        max_chips=4,
+        mode=mode,
+    )
+    assert plan.search is not None
+    s = plan.search
+    assert s.enumerated >= s.hbm_fit >= s.slo_met >= s.frontier >= 1
+    assert s.frontier == len(plan.frontier)
+
+
+def test_decode_floor_matches_binding():
+    """Every candidate has decode_floor matching binding resource."""
+    chip = CHIPS["tpu7x"]
+    gqa_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    geom = rf.from_hf_config(gqa_cfg)
+    dt = Dtypes(kv=1.0)
+    scenario = dc_replace(
+        rf.EXAMPLE_SCENARIOS["chat-8k1k"],
+        concurrencies=(1, 4),
+    )
+    plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        max_chips=4,
+        mode="mixed",
+    )
+    for pt in plan.candidates:
+        assert pt.decode_floor is not None
+        df = pt.decode_floor
+        expected_hard = max(
+            df.hbm_ms, df.matmul_ms, df.ici_ms, df.chain_ms, df.hop_latency_ms
+        )
+        assert math.isclose(df.hard_floor_ms, expected_hard, rel_tol=1e-5)
+        if df.binding == "hbm":
+            assert math.isclose(df.hbm_ms, df.hard_floor_ms, rel_tol=1e-5)
+        elif df.binding == "matmul":
+            assert math.isclose(df.matmul_ms, df.hard_floor_ms, rel_tol=1e-5)
