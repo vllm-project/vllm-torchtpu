@@ -291,6 +291,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         finally:
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4IndexerCache = orig_cache
+        # Read here, where the vLLM config is current: the fused op is built
+        # later, by the runner's op prebuild, outside that context.
+        self._verify_q_len = static_verify_q_len(get_current_vllm_config())
         object.__setattr__(self, "indexer_op", self._build_indexer_op())
         object.__setattr__(self.compressor, "k_cache", self.k_cache)
 
@@ -298,7 +301,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         """``fn`` bound to this layer's static arguments, and its op name."""
         # Speculative verify windows all hold K + 1 tokens; the runner puts
         # them in `[distribution[0], distribution[1])`.
-        verify_q_len = static_verify_q_len(get_current_vllm_config())
+        verify_q_len = self._verify_q_len
 
         wrapped_fn = functools.partial(
             fn,
