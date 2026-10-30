@@ -268,17 +268,18 @@ def _sized_gather(
     layout: TokenParallelLayout,
     total_pages: jax.Array,
     gather: Callable[[int], jax.Array],
+    page_axis: int,
 ) -> jax.Array:
     """`gather(cap)` for the smallest cap in `gather_caps` holding
     `total_pages`. Every rank takes the same branch (the metadata is
-    replicated); each returns `[dcp, max_pages, ...]`, pages past the cap
-    zero (no flat row reaches them)."""
+    replicated); `page_axis` (`cap` long) is zero-padded to `max_pages` (no
+    flat row reaches the padding)."""
 
     def branch(cap: int) -> Callable[[], jax.Array]:
         def run() -> jax.Array:
             g = gather(cap)
             pad = [(0, 0)] * g.ndim
-            pad[1] = (0, layout.max_pages - cap)
+            pad[page_axis] = (0, layout.max_pages - cap)
             return jnp.pad(g, pad)
 
         return run
@@ -305,6 +306,7 @@ def gather_latent(
             layout,
             total_pages,
             lambda cap: lax.all_gather(cache[page_ids[:cap]], axis_name, axis=0),
+            page_axis=1,
         )
         return g.reshape(-1, *g.shape[2:])
 
@@ -319,33 +321,31 @@ def gather_index_k(
     axis_name: str,
 ) -> jax.Array:
     """Every rank's `page_ids` pages of a token-along-lane index-K cache
-    (`[pages, rows, 4, page_size]`, slot on the last axis), reordered into
-    natural position order: natural page `offsets[r] * dcp + q` of request `r`
-    holds its positions `[q * page_size, (q + 1) * page_size)`.
+    (u8 `[pages, rows, 4, page_size]`, slot on the last axis), in natural
+    position order: natural page `offsets[r] * dcp + q` of request `r` holds
+    its positions `[q * page_size, (q + 1) * page_size)`.
 
     Slot `c * il + i` of rank `r` is in-page position `c * dcp * il + r * il +
-    i`; with `c = q * cpp + c'` (`cpp = page_size / (dcp * il)` cycles per
-    natural page) that is natural page `q`, lane `c' * dcp * il + r * il + i`.
+    i`, so gathering each rank's slots `(c, i)` along a new rank axis between
+    `c` and `i` lays the virtual page out in position order. The four bytes of
+    a slot's sublane group move as one u32 word.
     """
     dcp, il, ps = layout.dcp_size, layout.interleave_size, layout.page_size
-    if cache.ndim != 4 or cache.shape[-1] != ps:
+    if cache.ndim != 4 or cache.shape[2:] != (4, ps) or cache.dtype != jnp.uint8:
         raise ValueError(
-            f"index-K cache {cache.shape} is not token-along-lane with page {ps}"
+            f"index-K cache {cache.shape} {cache.dtype} is not token-along-lane "
+            f"u8 with page {ps}"
         )
-    cpp = ps // (dcp * il)
 
     def gather(cap: int) -> jax.Array:
-        g = lax.all_gather(cache[page_ids[:cap]], axis_name, axis=0)
-        rows, sub = g.shape[2:4]
-        g = g.reshape(dcp, cap, rows, sub, dcp, cpp, il)
-        # -> [cap, dcp (natural page q), ...]; returned as [cap, dcp, ...] so
-        # the padding below extends the virtual-page axis.
-        return g.transpose(1, 4, 2, 3, 5, 0, 6).reshape(cap, dcp, rows, sub, ps)
+        local = cache[page_ids[:cap]]
+        rows = local.shape[1]
+        words = lax.bitcast_convert_type(local.swapaxes(2, 3), jnp.uint32)
+        g = lax.all_gather(words.reshape(cap, rows, ps // il, il), axis_name, axis=3)
+        g = g.reshape(cap, rows, dcp, ps).swapaxes(1, 2)  # [cap, q, rows, ps]
+        return lax.bitcast_convert_type(g, jnp.uint8).swapaxes(3, 4)
 
-    def gather_t(cap: int) -> jax.Array:
-        return gather(cap).swapaxes(0, 1)  # pad axis 1 = virtual pages
-
-    g = _sized_gather(layout, total_pages, gather_t).swapaxes(0, 1)
+    g = _sized_gather(layout, total_pages, gather, page_axis=0)
     return g.reshape(layout.max_pages * dcp, *g.shape[2:])
 
 

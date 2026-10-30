@@ -195,6 +195,7 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--check-rows", type=int, default=256)
     ap.add_argument("--out", default="")
+    ap.add_argument("--trace-dir", default="", help="capture a profile of each op")
     a = ap.parse_args()
 
     if os.environ.get("NPROC"):
@@ -727,6 +728,21 @@ def main():
         q_sharded,
         iters=a.iters,
     )
+    if a.trace_dir:
+        # Three calls of each path, after warmup, in one capture; ops are
+        # told apart by their module names.
+        with jax.profiler.trace(a.trace_dir):
+            for fn, args in (
+                (tp_attn, (nope0, rope0, q_sharded, lat_c, pe_c, flat_dev, *meta)),
+                (tp_index, (icache, q_idx_g, w_idx_g, *meta)),
+                (
+                    jax.jit(dcp_attn_fn),
+                    (nope0, rope0, q_sharded, lat_c, pe_c, local_topk, *meta),
+                ),
+                (dcp_index, (icache, q_idx_g, w_idx_g, *meta)),
+            ):
+                for _ in range(3):
+                    jax.block_until_ready(fn(*args))
     results.update(_collective_breakdown(mesh, lay, T, h, a.iters))
     # The kernel alone, on this rank's gathered buffers and rows.
     g_nope, g_rope = jax.jit(gather_only)(nope0, rope0, *meta)

@@ -105,14 +105,14 @@ class Step:
         self.nope = [rng.standard_normal((s, DN), np.float32) for s in self.seq_lens]
         self.rope = [rng.standard_normal((s, DR), np.float32) for s in self.seq_lens]
         self.idx = [
-            rng.standard_normal((s, IDX_ROWS * IDX_SUB), np.float32)
+            rng.integers(0, 256, (s, IDX_ROWS * IDX_SUB), dtype=np.uint8)
             for s in self.seq_lens
         ]
         nope_c = np.zeros((dcp, num_pages, ps, DN), np.float32)
         rope_c = np.zeros(
             (dcp, num_pages, ps // ROPE_PER_ROW, ROPE_PER_ROW, DR), np.float32
         )
-        idx_c = np.zeros((dcp, num_pages, IDX_ROWS, IDX_SUB, ps), np.float32)
+        idx_c = np.zeros((dcp, num_pages, IDX_ROWS, IDX_SUB, ps), np.uint8)
         for i, r in enumerate(reqs):
             for p in range(r.prefix + r.chunk):
                 owner, slot = (int(v) for v in tp.owner_and_slot(layout, np.int32(p)))
@@ -322,7 +322,7 @@ def _select_topk_ref(layout):
         p = jnp.arange(tbl.shape[1] * ps)
         page = tbl[k][:, p // ps]  # [rows, P]
         keys = natural[page, :, :, (p % ps)[None, :]]  # [rows, P, A, B]
-        keys = keys.reshape(rows, p.shape[0], -1)
+        keys = keys.reshape(rows, p.shape[0], -1).astype(jnp.float32)
         s = jnp.einsum("rd,rpd->rp", q.reshape(rows, -1), keys)
         s = jnp.where(p[None, :] < visible[:, None], s, -jnp.inf)
         _, top = jax.lax.top_k(s, TOPK)
@@ -359,7 +359,7 @@ def test_indexer_topk_matches_natural_reference(dcp):
     seen = np.zeros((dcp, per), bool)
     for (rank, i), t in st.tp_rows():
         r, pos = st.row_req[t], int(st.row_pos[t])
-        s = st.idx[r][: pos + 1] @ q[t, 0]
+        s = st.idx[r][: pos + 1].astype(np.float32) @ q[t, 0]
         want = np.argsort(-s, kind="stable")[:TOPK].astype(np.int32)
         want = np.concatenate([want, -np.ones(TOPK - want.size, np.int32)])
         want_flat = np.asarray(
