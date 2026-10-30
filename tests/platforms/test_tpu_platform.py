@@ -46,6 +46,7 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_8I_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform,
     _validate_lora_config,
+    _validate_peer_replay_config,
     _validate_phased_profiling_config,
     get_tpu_multihost_topology,
 )
@@ -485,6 +486,45 @@ class TestTpuPlatform:
                 TpuPlatform.check_and_update_config(vllm_config)
         else:
             TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize("batched_rpa", [True, False])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_registered_attention_backend_class_sets_the_kv_cache_layout(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        batched_rpa,
+    ):
+        from vllm_torchtpu.layers.adapter import attention_backend
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasBatchedRPAAttentionBackend,
+            PallasMLAttentionBackend,
+        )
+
+        # Only batched RPA lays out HND, so passing shows its layouts were used.
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+        monkeypatch.setattr(attention_backend, "_REGISTERED_BACKENDS", {"tpu_test"})
+        backend = (
+            PallasBatchedRPAAttentionBackend
+            if batched_rpa
+            else PallasMLAttentionBackend
+        )
+        vllm_config.attention_config.backend = SimpleNamespace(
+            name="TPU_TEST", get_class=lambda: backend
+        )
+        vllm_config.model_config.get_head_size = lambda: 128
+
+        if batched_rpa:
+            TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            with pytest.raises(TypeError, match="not a PallasAttentionBackend"):
+                TpuPlatform.check_and_update_config(vllm_config)
 
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
     @patch("vllm_torchtpu.patch_registry.apply")
@@ -1448,3 +1488,28 @@ def test_tpu_platform_accelerator_methods(monkeypatch):
 
     TpuPlatform.set_stream(fake_stream)
     assert calls[-1] == ("set_stream", fake_stream)
+
+
+@pytest.mark.parametrize(
+    "parallel, peer_replay, disable_cache, raises",
+    [
+        ("1", "1", "1", True),
+        ("1", "1", "0", False),
+        ("1", "0", "1", False),
+        ("0", "1", "1", False),  # peer replay only acts under parallel precompile
+    ],
+)
+def test_peer_replay_requires_the_compile_cache(
+    monkeypatch, parallel, peer_replay, disable_cache, raises
+):
+    """TPU_PRECOMPILE_PEER_REPLAY hands ranges over through vLLM's compile
+    cache, so turning it on with VLLM_DISABLE_COMPILE_CACHE=1 fails at startup
+    instead of doing nothing."""
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", parallel)
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", peer_replay)
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", disable_cache)
+    if raises:
+        with pytest.raises(ValueError, match="VLLM_DISABLE_COMPILE_CACHE"):
+            _validate_peer_replay_config()
+    else:
+        _validate_peer_replay_config()

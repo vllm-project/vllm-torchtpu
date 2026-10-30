@@ -19,6 +19,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
@@ -46,7 +49,12 @@ def _recording_connector(events: list[str]) -> MagicMock:
         connector.metadata_bound = False
 
     connector.wait_for_save.side_effect = logged("save")
-    connector.get_finished.side_effect = logged("poll", ({"sent"}, {"loaded"}))
+    connector.get_transfer_results.side_effect = logged(
+        "poll",
+        KVConnectorTransferResults(
+            finished_sending={"sent"}, finished_recving={"loaded"}
+        ),
+    )
     connector.clear_connector_metadata.side_effect = clear
     connector.get_block_ids_with_load_errors.return_value = set()
     connector.build_connector_worker_meta.return_value = None
@@ -65,6 +73,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     async_source = ([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
     runner = SimpleNamespace(
         _pp_wave=None,
+        _dp_step_other_decode=False,
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
@@ -105,6 +114,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         spec_decode_manager=SimpleNamespace(propose_draft_token_ids=propose),
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda _logits: torch.tensor([7]),
+        _min_tokens_batch_state=lambda: {},
         _sample_spec_verify_chunk=lambda *_args: torch.tensor([[7, -1]]),
         _update_mamba_slot_read_offsets=lambda *_args: None,
         _update_num_xla_graphs=lambda *_args: None,

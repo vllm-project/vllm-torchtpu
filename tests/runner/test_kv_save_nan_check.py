@@ -20,6 +20,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.sequence import IntermediateTensors
 
@@ -183,8 +186,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         def wait_for_save(self, nan_check=None):
             self.snapshot = nan_check
 
-        def get_finished(self, _finished_req_ids):
-            return {"r0"}, None
+        def get_transfer_results(self, _finished_req_ids):
+            return KVConnectorTransferResults(finished_sending={"r0"})
 
         def get_block_ids_with_load_errors(self):
             return set()
@@ -231,6 +234,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
 
     runner = SimpleNamespace(
         _pp_wave=None if pp_is_last else wave,
+        _dp_step_other_decode=False,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,
         _pp_pending_scheduler_output=None,
@@ -247,6 +251,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         phase_based_profiler=None,
         _is_async_drafter=False,
         _greedy_top_tokens_this_step=lambda: False,
+        _min_tokens_batch_state=lambda: {},
         vllm_config=SimpleNamespace(),
         maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
         input_batch=SimpleNamespace(
@@ -323,6 +328,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     runner._prepare_inputs = prepare_inputs
     runner.forward_model = MagicMock(side_effect=[(out, None) for out in chunk_outputs])
     for name in (
+        "_any_decode",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_sample_tokens_pp_intermediate_stage",

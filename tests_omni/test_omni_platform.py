@@ -11,32 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 import os
-import subprocess
-import sys
-import textwrap
-import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
-from .mock_omni import (  # isort: split
-    _mock_apply_split_rotary_emb,
-    _mock_ltx2_rope_cls,
-    _MockRMSNorm,
-    _MockRotaryEmbeddingWan,
-    vllm_omni_mock,
-)
-
-import vllm_omni
+from diffusers.pipelines.ltx2.vocoder import UpSample1d
+from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
-from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.layers.norm import RMSNorm
+from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
+from vllm_omni.diffusion.models.ltx2 import (
+    ltx2_components,
+    ltx2_runtime,
+    ltx2_transformer,
+)
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+    ColumnParallelGELU,
+    WanSelfAttention,
+)
+from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
-from vllm_torchtpu.omni import register_omni_tpu_platform
+from vllm_torchtpu.omni import patches, register_omni_tpu_platform
 from vllm_torchtpu.omni import rope as omni_rope
 from vllm_torchtpu.omni.attention import (
     TpuFlashAttentionBackend,
@@ -48,6 +47,7 @@ from vllm_torchtpu.omni.patches import (
     _BWE_FILTER_CPU_RESTORE_PATCHED,
     _D2H_STREAM_PATCHED,
     _SDPA_FALLBACK_PATCHED,
+    _SPLIT_ROPE_PATCHED,
     _VOCODER_CPU_INIT_PATCHED,
     _patch_diffusion_startup_warmup_sync,
     _patch_diffusion_worker_d2h_stream,
@@ -69,13 +69,14 @@ from vllm_torchtpu.omni.rope import (
 
 pytestmark = pytest.mark.omni
 
-
-@pytest.fixture(scope="module", autouse=True)
-def cleanup_mock_omni():
-    yield
-    for mod_name in list(sys.modules.keys()):
-        if mod_name == "vllm_omni" or mod_name.startswith("vllm_omni."):
-            del sys.modules[mod_name]
+# The patches rebind these upstream functions in place, and the first
+# apply_omni_model_specific_patches() call in the session installs them for
+# good. Tests that reinstall a patch start from the functions captured here,
+# at collection, before any test has run.
+_UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
+_UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
+_UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
+_UPSTREAM_RESTORE_BWE_FILTER = ltx2_runtime._restore_ltx_bwe_resampler_filter
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -109,7 +110,7 @@ def test_platform_attributes():
 
 def test_rope_pair_swap_matches_native():
     torch.manual_seed(0)
-    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
     x = torch.randn(1, 24, 3, 16)
     cos = torch.randn(1, 24, 1, 8)
     sin = torch.randn(1, 24, 1, 8)
@@ -130,12 +131,10 @@ def test_rope_pair_swap_matches_native():
 
 
 def test_rope_patch_installed():
-    from unittest.mock import MagicMock
-
     apply_omni_model_specific_patches()
-    assert _MockRotaryEmbeddingWan.forward is rotary_embedding_wan_forward
+    assert RotaryEmbeddingWan.forward is rotary_embedding_wan_forward
     # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
-    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
     x = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
     cos = torch.randn(1, 4, 1, 4, dtype=torch.bfloat16)
     sin = torch.randn(1, 4, 1, 4, dtype=torch.bfloat16)
@@ -144,7 +143,7 @@ def test_rope_patch_installed():
     )
 
     # Non-half-dim or Neox calls delegate to _forward_method.
-    rope_fallback = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=False)
+    rope_fallback = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=False)
     spy = MagicMock(wraps=rope_fallback.forward_native)
     rope_fallback._forward_method = spy
     out_fb = rope_fallback(x, cos, sin)
@@ -166,7 +165,7 @@ def test_rope_patch_installed():
 
 def test_rope_patch_accepts_token_major_tables():
     # vLLM-Omni 0.32 (vllm-omni#8112): LingBot-World passes (tokens, D/2) tables.
-    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
     x = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
     cos = torch.randn(4, 4, dtype=torch.bfloat16)
     sin = torch.randn(4, 4, dtype=torch.bfloat16)
@@ -177,9 +176,6 @@ def test_rope_patch_accepts_token_major_tables():
 
 
 def test_tpu_flash_attention_backend(monkeypatch):
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock
-
     assert TpuFlashAttentionBackend.get_name() == "TPU_FLASH_ATTN"
     assert TpuFlashAttentionBackend.get_impl_cls() is TpuFlashAttentionImpl
 
@@ -247,14 +243,12 @@ def test_tpu_flash_attention_backend(monkeypatch):
 def test_wan_ffn_gelu_fence(monkeypatch):
     # The Wan FFN returns the GELU output passed through the XLA
     # optimization barrier (its result must be used, or XLA drops it).
-    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
-        ColumnParallelGELU,
-    )
-
-    from vllm_torchtpu.omni import patches
-
     apply_omni_model_specific_patches()
-    ffn = ColumnParallelGELU(8, 16)
+    # Skip __init__ (ColumnParallelLinear requires an initialized TP group).
+    ffn = object.__new__(ColumnParallelGELU)
+    torch.nn.Module.__init__(ffn)
+    ffn.proj = torch.nn.Linear(8, 16)
+    ffn.approximate = "tanh"
     x = torch.randn(3, 8)
     want = torch.nn.functional.gelu(ffn.proj(x), approximate="tanh")
     fenced = []
@@ -401,11 +395,6 @@ def test_tpu_sdpa_attention_backend():
     assert res_gqa.shape == (1, 16, 8, 16)
 
 
-def test_vllm_omni_is_mocked():
-    assert sys.modules["vllm_omni"] is vllm_omni_mock
-    assert not hasattr(vllm_omni, "__file__") or vllm_omni.__file__ is None
-
-
 @pytest.mark.parametrize(
     "rope_cls_name",
     ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
@@ -414,7 +403,7 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
     apply_omni_model_specific_patches()
 
     rope_cls = getattr(qwen_image_transformer, rope_cls_name)
-    rope = rope_cls()
+    rope = rope_cls(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
 
     vid_freqs, txt_freqs = rope.forward([(1, 2, 2)], [3], torch.device("cpu"))
 
@@ -423,21 +412,24 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
         txt_freqs.untyped_storage().data_ptr()
         != rope.pos_freqs.untyped_storage().data_ptr()
     )
-    assert torch.equal(txt_freqs, rope.pos_freqs[2:5])
+    # With scale_rope, text positions start at max(h // 2, w // 2) = 1.
+    assert torch.equal(txt_freqs, rope.pos_freqs[1:4])
     assert txt_freqs.dtype == torch.complex64
-    assert torch.equal(vid_freqs, rope.pos_freqs[:2])
+    assert vid_freqs.shape == (4, 64)
 
 
-def test_safe_pack_tensor_if_large():
-    from vllm_omni.diffusion import ipc
-
-    orig_pack = MagicMock()
-    ipc._pack_tensor_if_large = orig_pack
-
-    apply_omni_model_specific_patches.cache_clear()
+@pytest.mark.parametrize(
+    "nbytes",
+    [1, 1 << 20],
+    ids=["lt_1mb", "gt_1mb"],
+)
+def test_safe_pack_tensor_if_large(monkeypatch, nbytes):
     apply_omni_model_specific_patches()
+    # Return the tensor that would be copied to SHM, so that the test sees
+    # what the original function received for tensors above the threshold.
+    monkeypatch.setattr(ipc, "_tensor_to_shm", lambda val, **kwargs: val)
 
-    cpu_tensor = torch.empty(1, device="cpu")
+    cpu_tensor = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
     tpu_tensor = MagicMock()
     tpu_tensor.cpu.return_value = cpu_tensor
     created = []
@@ -447,10 +439,7 @@ def test_safe_pack_tensor_if_large():
     )
 
     tpu_tensor.cpu.assert_called_once_with()
-    orig_pack.assert_called_once_with(
-        cpu_tensor, "stream", created, enable_registered_shm=True
-    )
-    assert res is orig_pack.return_value
+    assert res is cpu_tensor
 
 
 def test_omni_tpu_patches_configuration():
@@ -467,8 +456,6 @@ def test_omni_tpu_patches_configuration():
 def test_startup_warmup_device_sync(monkeypatch):
     # The startup warmup must be followed by a device sync so that its pending
     # deferred TPU ops are not fused into the first request.
-    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
-
     calls = []
 
     monkeypatch.setattr(
@@ -502,52 +489,43 @@ def _reference_qk_norm_rope(qkv, wq, wk, cos, sin, eps, head_dim):
     return tuple(outs)
 
 
-class _FakeWanSelfAttention(torch.nn.Module):
-    def __init__(self, dim=64, heads=2, head_dim=128):
-        super().__init__()
-        self.num_heads = self.num_kv_heads = heads
-        self.head_dim = head_dim
-        self.qkv = torch.nn.Linear(dim, 3 * heads * head_dim)
-        self.norm_q = _MockRMSNorm(heads * head_dim)
-        self.norm_k = _MockRMSNorm(heads * head_dim)
-        with torch.no_grad():
-            self.norm_q.weight.uniform_(0.5, 1.5)
-            self.norm_k.weight.uniform_(0.5, 1.5)
-        self.to_gate_compress = None
-        self.to_out = torch.nn.Identity()
-        self.dropout = torch.nn.Identity()
-
-    def to_qkv(self, x):
-        return self.qkv(x), None
-
-    def attn(self, q, k, v, attn_metadata=None):
-        return q * 3 + k * 2 + v
+def _make_wan_self_attention(dim=64, heads=2, head_dim=128) -> WanSelfAttention:
+    attn = object.__new__(WanSelfAttention)
+    torch.nn.Module.__init__(attn)
+    attn.num_heads = attn.num_kv_heads = heads
+    attn.head_dim = head_dim
+    qkv = torch.nn.Linear(dim, 3 * heads * head_dim)
+    attn.to_qkv = lambda x: (qkv(x), None)
+    attn.norm_q = RMSNorm(heads * head_dim)
+    attn.norm_k = RMSNorm(heads * head_dim)
+    with torch.no_grad():
+        attn.norm_q.weight.uniform_(0.5, 1.5)
+        attn.norm_k.weight.uniform_(0.5, 1.5)
+    attn.rotary_embedding = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    attn.to_gate_compress = None
+    attn.to_out = torch.nn.Identity()
+    attn.dropout = torch.nn.Identity()
+    attn.attn = lambda q, k, v, attn_metadata=None: q * 3 + k * 2 + v
+    return attn
 
 
 def test_wan_self_attention_fused_matches_native(monkeypatch):
     # The fused forward's glue (flattening, tables, value slice) around the
     # kernel reproduces vLLM-Omni's norm -> unflatten -> RoPE -> attention.
+    apply_omni_model_specific_patches()
     torch.manual_seed(0)
-    attn = _FakeWanSelfAttention()
+    attn = _make_wan_self_attention()
     batch, seq, half = 2, 5, attn.head_dim // 2
     x = torch.randn(batch, seq, 64)
     cos, sin = torch.randn(1, seq, 1, half), torch.randn(1, seq, 1, half)
     monkeypatch.setattr(omni_rope, "_qk_norm_rope_op", lambda: _reference_qk_norm_rope)
     out = wan_self_attention_fused(attn, x, (cos, sin))
-
-    qkv, _ = attn.to_qkv(x)
-    q, k, v = qkv.split(attn.num_heads * attn.head_dim, dim=-1)
-    shape = (attn.num_heads, attn.head_dim)
-    q = _rms_norm(q, attn.norm_q.weight, 1e-6).unflatten(2, shape)
-    k = _rms_norm(k, attn.norm_k.weight, 1e-6).unflatten(2, shape)
-    q = apply_rotary_pair_swap(q, cos, sin)
-    k = apply_rotary_pair_swap(k, cos, sin)
-    want = attn.attn(q, k, v.unflatten(2, shape)).flatten(2, 3)
+    want = WanSelfAttention._tpu_orig_forward(attn, x, (cos, sin))
     torch.testing.assert_close(out, want)
 
 
 def test_can_fuse_qk_norm_rope():
-    attn = _FakeWanSelfAttention()
+    attn = _make_wan_self_attention()
     rot = (torch.ones(1, 3, 1, 64), torch.ones(1, 3, 1, 64))
     bf16_x = torch.ones(1, 3, 64, dtype=torch.bfloat16)
     assert can_fuse_qk_norm_rope(attn, bf16_x, rot)
@@ -558,29 +536,29 @@ def test_can_fuse_qk_norm_rope():
 
 
 def test_wan_self_attention_patch_falls_back_on_f32():
-    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
-        WanSelfAttention,
-    )
-
     apply_omni_model_specific_patches()
-    assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
+    attn = _make_wan_self_attention()
+    x = torch.ones(1, 3, 64)
+    rot = (torch.ones(1, 3, 1, 64), torch.ones(1, 3, 1, 64))
+    torch.testing.assert_close(
+        attn(x, rot),
+        WanSelfAttention._tpu_orig_forward(attn, x, rot),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
     # Upstream AttentionImpl.forward raises on out-of-tree platforms; after
     # the patch, sdpa_fallback (a plain SDPAImpl) runs PyTorch SDPA.
-    def _raise_oot(self, query, key, value, attn_metadata=None):
-        raise NotImplementedError("No forward implementation for platform: oot")
-
-    monkeypatch.setattr(SDPAImpl, "forward", _raise_oot)
+    monkeypatch.setattr(SDPAImpl, "forward", _UPSTREAM_SDPA_FORWARD)
     fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
     torch.manual_seed(0)
     q, k, v = (torch.randn(2, 5, 2, 8) for _ in range(3))
     with pytest.raises(NotImplementedError):
         fallback.forward(q, k, v)
 
-    apply_omni_model_specific_patches.cache_clear()
-    apply_omni_model_specific_patches()
+    _patch_sdpa_fallback_dispatch()
     assert getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False)
     assert SDPAImpl.forward is TpuSDPAImpl.forward
 
@@ -603,92 +581,50 @@ def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
     assert SDPAImpl.forward is TpuSDPAImpl.forward
 
 
-_DIFFUSION_WORKER = "vllm_omni.diffusion.worker.diffusion_worker"
+@pytest.fixture
+def output_loop_calls(monkeypatch):
+    """Replaces the upstream WorkerProc._async_output_loop with a recorder.
 
-
-class _FakeWorkerProc:
-    """Builds its stream device from self.gpu_id like the upstream loop."""
-
-    def __init__(self, gpu_id):
-        self.gpu_id = gpu_id
-        self.queue = "queue"
+    The upstream loop serves its output queue until shutdown; the recorder
+    keeps only what the patch changes, the gpu_id the loop reads.
+    """
+    calls = []
 
     def _async_output_loop(self):
-        self.stream_device = torch.device("cpu", self.gpu_id)
-        self.seen_queue = self.queue
+        calls.append((self.gpu_id, self.queue))
 
-
-def _install_worker_proc(monkeypatch, cls):
-    module = types.ModuleType(_DIFFUSION_WORKER)
-    module.WorkerProc = cls
-    monkeypatch.setitem(sys.modules, _DIFFUSION_WORKER, module)
-
-
-@pytest.fixture
-def worker_proc(monkeypatch):
-    # A fresh subclass per test, so the patch never edits a shared class.
-    cls = type("WorkerProc", (_FakeWorkerProc,), {})
-    _install_worker_proc(monkeypatch, cls)
+    monkeypatch.setattr(WorkerProc, "_async_output_loop", _async_output_loop)
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 1)
-    return cls
+    return calls
 
 
-def test_d2h_stream_uses_current_device_index(worker_proc):
+def _make_worker_proc(gpu_id):
+    worker = object.__new__(WorkerProc)  # skips __init__, which builds the worker
+    worker.gpu_id = gpu_id
+    worker.queue = "queue"
+    return worker
+
+
+def test_d2h_stream_uses_current_device_index(output_loop_calls):
     _patch_diffusion_worker_d2h_stream()
 
-    worker = worker_proc(gpu_id=3)
+    worker = _make_worker_proc(gpu_id=3)
     worker._async_output_loop()
 
-    assert worker.stream_device == torch.device("cpu", 1)
-    assert worker.seen_queue == "queue"
+    assert output_loop_calls == [(1, "queue")]
     assert worker.gpu_id == 3
 
 
-def test_d2h_stream_patch_is_idempotent(worker_proc):
-    orig_loop = worker_proc._async_output_loop
+def test_d2h_stream_patch_is_idempotent(output_loop_calls):
+    orig_loop = WorkerProc._async_output_loop
 
     _patch_diffusion_worker_d2h_stream()
-    patched_loop = worker_proc._async_output_loop
+    patched_loop = WorkerProc._async_output_loop
     _patch_diffusion_worker_d2h_stream()
 
     assert patched_loop is not orig_loop
     assert getattr(patched_loop, _D2H_STREAM_PATCHED, False)
-    assert worker_proc._async_output_loop is patched_loop
-
-
-def test_d2h_stream_patch_targets_real_worker_proc():
-    # Runs in a fresh interpreter because tests/omni mock vllm_omni in
-    # sys.modules. Skipped when no importable vLLM-Omni is on the path.
-    code = textwrap.dedent(
-        """
-        import sys
-
-        try:
-            from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
-        except ImportError as e:
-            print(e)
-            sys.exit(77)
-
-        from vllm_torchtpu.omni.patches import (
-            _D2H_STREAM_PATCHED,
-            _patch_diffusion_worker_d2h_stream,
-        )
-
-        orig_loop = WorkerProc._async_output_loop
-        _patch_diffusion_worker_d2h_stream()
-        assert WorkerProc._async_output_loop is not orig_loop
-        assert getattr(WorkerProc._async_output_loop, _D2H_STREAM_PATCHED, False)
-        """
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    if result.returncode == 77:
-        pytest.skip(f"vllm_omni is not importable: {result.stdout.strip()}")
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert WorkerProc._async_output_loop is patched_loop
 
 
 def test_ltx2_vocoder_cpu_init_patch(monkeypatch):
@@ -700,16 +636,16 @@ def test_ltx2_vocoder_cpu_init_patch(monkeypatch):
         calls.append((subfolder, local_files_only, dtype, revision))
         return torch.empty(0).device.type
 
-    # A real module: the MagicMock-backed ltx2 package reports every
-    # attribute as present, which would trip the idempotency guard.
-    ltx2_components = types.ModuleType("ltx2_components")
-    ltx2_components._load_component = _load_component
+    # Upstream _load_component loads weights from the checkpoint. Both module
+    # attributes the patch rebinds are restored after the test.
+    monkeypatch.setattr(ltx2_components, "_load_component", _load_component)
     monkeypatch.setattr(
-        vllm_omni_mock.diffusion.models.ltx2, "ltx2_components", ltx2_components
+        ltx2_runtime,
+        "_restore_ltx_bwe_resampler_filter",
+        _UPSTREAM_RESTORE_BWE_FILTER,
     )
 
-    apply_omni_model_specific_patches.cache_clear()
-    apply_omni_model_specific_patches()
+    _patch_ltx2_vocoder_cpu_init()
     patched = ltx2_components._load_component
     assert patched is not _load_component
     assert getattr(patched, _VOCODER_CPU_INIT_PATCHED, False)
@@ -727,44 +663,15 @@ def test_ltx2_vocoder_cpu_init_patch(monkeypatch):
     assert ltx2_components._load_component is patched
 
 
-def _upstream_restore_ltx_bwe_resampler_filter(vocoder):
-    # Copy of vllm-omni v0.32.0rc1 ltx2_runtime._restore_ltx_bwe_resampler_filter
-    # (ltx2_runtime.py:81-110); vllm_omni is mocked here, so the real module
-    # cannot be imported.
-    resampler = getattr(vocoder, "resampler", None)
-    current_filter = getattr(resampler, "filter", None)
-    ratio = getattr(resampler, "ratio", None)
-    kernel_size = getattr(resampler, "kernel_size", None)
-    if (
-        not isinstance(current_filter, torch.Tensor)
-        or not isinstance(ratio, int)
-        or not isinstance(kernel_size, int)
-    ):
-        return
-    if current_filter is getattr(resampler, "_ltx_restored_filter", None):
-        return
-    rolloff = 0.99
-    lowpass_filter_width = 6
-    width = math.ceil(lowpass_filter_width / rolloff)
-    if kernel_size != 2 * width * ratio + 1:
-        return
-    device = current_filter.device
-    time_axis = torch.arange(kernel_size, device=device, dtype=torch.float32)
-    time_axis = (time_axis / ratio - width) * rolloff
-    time_clamped = time_axis.clamp(-lowpass_filter_width, lowpass_filter_width)
-    window = torch.cos(time_clamped * math.pi / lowpass_filter_width / 2).square()
-    filter_value = (torch.sinc(time_axis) * window * rolloff / ratio).reshape(1, 1, -1)
-    resampler.filter = filter_value
-    resampler._ltx_restored_filter = filter_value
-
-
-class _FakeBweResampler(torch.nn.Module):
-    def __init__(self, device, kernel_size=29):
-        super().__init__()
-        self.ratio = 2
-        self.kernel_size = kernel_size
-        bf16 = torch.empty(1, 1, kernel_size, dtype=torch.bfloat16, device=device)
-        self.register_buffer("filter", bf16, persistent=False)
+def _make_bwe_vocoder(device, kernel_size=None):
+    # LTX2VocoderWithBWE's resampler, with its filter cast to BF16 on device
+    # as at decode. kernel_size builds a Kaiser filter, which upstream's
+    # restore skips.
+    if kernel_size is None:
+        resampler = UpSample1d(ratio=2, window_type="hann", persistent=False)
+    else:
+        resampler = UpSample1d(ratio=2, kernel_size=kernel_size, persistent=False)
+    return SimpleNamespace(resampler=resampler.to(device, torch.bfloat16))
 
 
 def test_ltx2_bwe_filter_cpu_restore_patch(monkeypatch):
@@ -772,16 +679,15 @@ def test_ltx2_bwe_filter_cpu_restore_patch(monkeypatch):
 
     def _restore(vocoder):
         device = vocoder.resampler.filter.device.type
-        _upstream_restore_ltx_bwe_resampler_filter(vocoder)
+        _UPSTREAM_RESTORE_BWE_FILTER(vocoder)
         calls.append((device, vocoder.resampler.filter))
 
-    ltx2_runtime = types.ModuleType("ltx2_runtime")
-    ltx2_runtime._restore_ltx_bwe_resampler_filter = _restore
-    ltx2_components = types.ModuleType("ltx2_components")
-    ltx2_components._load_component = lambda *args, **kwargs: None
-    ltx2 = vllm_omni_mock.diffusion.models.ltx2
-    monkeypatch.setattr(ltx2, "ltx2_runtime", ltx2_runtime)
-    monkeypatch.setattr(ltx2, "ltx2_components", ltx2_components)
+    monkeypatch.setattr(ltx2_runtime, "_restore_ltx_bwe_resampler_filter", _restore)
+    monkeypatch.setattr(
+        ltx2_components,
+        "_load_component",
+        ltx2_components._load_component,
+    )
 
     _patch_ltx2_vocoder_cpu_init()
     patched = ltx2_runtime._restore_ltx_bwe_resampler_filter
@@ -791,15 +697,15 @@ def test_ltx2_bwe_filter_cpu_restore_patch(monkeypatch):
     assert ltx2_runtime._restore_ltx_bwe_resampler_filter is patched
 
     # A CPU filter goes straight to upstream.
-    cpu_vocoder = types.SimpleNamespace(resampler=_FakeBweResampler("cpu"))
+    cpu_vocoder = _make_bwe_vocoder("cpu")
     patched(cpu_vocoder)
     want = cpu_vocoder.resampler.filter
     assert calls == [("cpu", want)] and want.dtype == torch.float32
 
     # Off CPU ("meta" stands in for TPU), upstream rebuilds on CPU and the
     # FP32 result moves to the filter's device as the restored filter.
-    resampler = _FakeBweResampler("meta")
-    vocoder = types.SimpleNamespace(resampler=resampler)
+    vocoder = _make_bwe_vocoder("meta")
+    resampler = vocoder.resampler
     patched(vocoder)
     assert calls[-1][0] == "cpu" and torch.equal(calls[-1][1], want)
     restored = resampler.filter
@@ -815,9 +721,9 @@ def test_ltx2_bwe_filter_cpu_restore_patch(monkeypatch):
     assert resampler._ltx_restored_filter is restored
 
     # Upstream's early return (unexpected kernel size) leaves the filter alone.
-    other = _FakeBweResampler("meta", kernel_size=31)
+    other = _make_bwe_vocoder("meta", kernel_size=31).resampler
     original = other.filter
-    patched(types.SimpleNamespace(resampler=other))
+    patched(SimpleNamespace(resampler=other))
     assert calls[-1][0] == "cpu"
     assert other.filter is original
     assert not hasattr(other, "_ltx_restored_filter")
@@ -837,30 +743,36 @@ def table_syncs(monkeypatch):
 
 @pytest.fixture
 def ltx2(monkeypatch, table_syncs):
-    """The mocked LTX-2 transformer module with _patch_ltx2_split_rope applied.
+    """The LTX-2 transformer module with _patch_ltx2_split_rope reinstalled.
 
-    The patch is installed on a fresh rope class; the module attributes it
-    replaces are restored after the test.
+    The patch wraps the upstream functions again; the attributes it rebinds
+    are restored after the test.
     """
+    monkeypatch.setattr(
+        ltx2_transformer.LTX2AudioVideoRotaryPosEmbed, "forward", _UPSTREAM_ROPE_FORWARD
+    )
     for name, value in (
-        ("LTX2AudioVideoRotaryPosEmbed", _mock_ltx2_rope_cls()),
-        ("apply_split_rotary_emb", _mock_apply_split_rotary_emb),
+        ("apply_split_rotary_emb", _UPSTREAM_APPLY_SPLIT_ROTARY_EMB),
         ("get_tensor_model_parallel_world_size", lambda: 1),
         ("get_tensor_model_parallel_rank", lambda: 0),
     ):
         monkeypatch.setattr(ltx2_transformer, name, value)
     _patch_ltx2_split_rope()
+    assert getattr(
+        ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward, _SPLIT_ROPE_PATCHED
+    )
     return ltx2_transformer
+
+
+def _ltx2_rope(rope_type="split", heads=3, head_dim=8):
+    return ltx2_transformer.LTX2AudioVideoRotaryPosEmbed(
+        dim=heads * head_dim, rope_type=rope_type, num_attention_heads=heads
+    )
 
 
 def _ltx2_coords(batch=2, tokens=5):
     # (B, 3, T, 2) patch bounds, the input of LTX2AudioVideoRotaryPosEmbed.
     return 10 * torch.rand(batch, 3, tokens, 2)
-
-
-def _upstream_rope_forward(rope, coords, device=None, out_dtype=None):
-    # The unpatched forward: _mock_ltx2_rope_cls() builds a new class per call.
-    return _mock_ltx2_rope_cls().forward(rope, coords, device, out_dtype)
 
 
 @pytest.mark.parametrize(
@@ -875,16 +787,16 @@ def test_ltx2_split_rope_matches_upstream(ltx2, x_dtype, table_dtype, tol):
     # The patched rope and apply_split_rotary_emb give upstream's rotation
     # with its per-head (B, H, T, D/2) tables, in x.dtype.
     torch.manual_seed(0)
-    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(heads=3, head_dim=8)
+    rope = _ltx2_rope(heads=3, head_dim=8)
     coords = _ltx2_coords()
     tables = rope(coords, out_dtype=table_dtype)
     assert tables[0].shape == (2, 1, 5, 3 * 8)
     x = torch.randn(2, 5, 3 * 8, dtype=x_dtype)
     out = ltx2.apply_split_rotary_emb(x, tables, head_dim=8)
 
-    upstream_tables = _upstream_rope_forward(rope, coords, None, table_dtype)
+    upstream_tables = _UPSTREAM_ROPE_FORWARD(rope, coords, None, table_dtype)
     assert upstream_tables[0].shape == (2, 3, 5, 8 // 2)  # (B, H, T, D/2)
-    want = _mock_apply_split_rotary_emb(x, upstream_tables, head_dim=8)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, upstream_tables, head_dim=8)
     assert out.dtype == x_dtype
     torch.testing.assert_close(out, want.to(x_dtype), rtol=tol, atol=tol)
 
@@ -893,15 +805,15 @@ def test_ltx2_split_rope_tensor_parallel_lanes(ltx2, monkeypatch):
     # _slice_rope_for_tp leaves the (B, 1, T, H * D) tables whole; rank 1 of
     # 2 rotates its two local heads with heads 2 and 3 of the tables.
     torch.manual_seed(0)
-    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(heads=4, head_dim=8)
+    rope = _ltx2_rope(heads=4, head_dim=8)
     coords = _ltx2_coords()
     tables = rope(coords)
-    cos, sin = _upstream_rope_forward(rope, coords)
+    cos, sin = _UPSTREAM_ROPE_FORWARD(rope, coords)
     monkeypatch.setattr(ltx2, "get_tensor_model_parallel_world_size", lambda: 2)
     monkeypatch.setattr(ltx2, "get_tensor_model_parallel_rank", lambda: 1)
     x = torch.randn(2, 5, 2 * 8)
     out = ltx2.apply_split_rotary_emb(x, tables, head_dim=8)
-    want = _mock_apply_split_rotary_emb(x, (cos[:, 2:], sin[:, 2:]), head_dim=8)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, (cos[:, 2:], sin[:, 2:]), head_dim=8)
     torch.testing.assert_close(out, want, rtol=1e-6, atol=1e-6)
 
     monkeypatch.setattr(ltx2, "get_tensor_model_parallel_world_size", lambda: 3)
@@ -912,19 +824,19 @@ def test_ltx2_split_rope_tensor_parallel_lanes(ltx2, monkeypatch):
 def test_ltx2_split_rope_passes_other_tables_through(ltx2):
     torch.manual_seed(0)
     coords = _ltx2_coords()
-    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(rope_type="interleaved")
-    upstream = _upstream_rope_forward(rope, coords)
+    rope = _ltx2_rope(rope_type="interleaved")
+    upstream = _UPSTREAM_ROPE_FORWARD(rope, coords)
     for got, want in zip(rope(coords), upstream, strict=True):
         assert torch.equal(got, want)
 
     # (B, H, T, D/2) tables, also with a single head, use upstream's function.
     for heads, head_dim in ((3, 8), (1, 24)):
-        rope = ltx2.LTX2AudioVideoRotaryPosEmbed(heads=heads, head_dim=head_dim)
-        tables = _upstream_rope_forward(rope, coords)
+        rope = _ltx2_rope(heads=heads, head_dim=head_dim)
+        tables = _UPSTREAM_ROPE_FORWARD(rope, coords)
         x = torch.randn(2, 5, heads * head_dim)
         torch.testing.assert_close(
             ltx2.apply_split_rotary_emb(x, tables, head_dim=head_dim),
-            _mock_apply_split_rotary_emb(x, tables, head_dim=head_dim),
+            _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, tables, head_dim=head_dim),
             rtol=0,
             atol=0,
         )
@@ -941,22 +853,22 @@ def test_ltx2_split_rope_tables_reused(ltx2, table_syncs):
     # The original forward runs, and the tables are synced, once per coords
     # tensor, coords version, device and out_dtype.
     torch.manual_seed(0)
-    rope = ltx2.LTX2AudioVideoRotaryPosEmbed()
+    rope = _ltx2_rope()
     coords = _ltx2_coords()
     cpu, bf16, f32 = torch.device("cpu"), torch.bfloat16, torch.float32
     tables = rope(coords, device=cpu, out_dtype=bf16)
     assert rope(coords, device=cpu, out_dtype=bf16) is tables
-    assert (rope.calls, len(table_syncs)) == (1, 1)
+    assert len(table_syncs) == 1
     rope(coords.clone(), device=cpu, out_dtype=bf16)
     rope(coords, device=cpu, out_dtype=f32)
     stale = rope(coords, out_dtype=f32)
     assert rope(coords, out_dtype=f32) is stale
-    assert (rope.calls, len(table_syncs)) == (4, 4)
+    assert len(table_syncs) == 4
 
     coords.add_(1.0)  # bumps the version counter
     fresh = rope(coords, out_dtype=f32)
-    assert rope.calls == 5
-    want = split_rope_natural_tables(*_upstream_rope_forward(rope, coords, None, f32))
+    assert len(table_syncs) == 5
+    want = split_rope_natural_tables(*_UPSTREAM_ROPE_FORWARD(rope, coords, None, f32))
     assert torch.equal(fresh[0], want[0]) and torch.equal(fresh[1], want[1])
     assert not torch.equal(fresh[0], stale[0])
 
@@ -966,10 +878,9 @@ def test_ltx2_split_rope_tables_reused(ltx2, table_syncs):
     tables = rope(coords)
     assert rope(coords) is tables
 
-    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(rope_type="interleaved")
-    rope(coords)
-    rope(coords)
-    assert rope.calls == 2
+    # Interleaved RoPE is not cached.
+    rope = _ltx2_rope(rope_type="interleaved")
+    assert rope(coords)[0] is not rope(coords)[0]
 
 
 @pytest.mark.parametrize("inference", [False, True], ids=["grad", "inference"])
@@ -980,14 +891,12 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
     # storage offset, shape or dtype, or another tensor with equal values,
     # rebuilds.
     torch.manual_seed(0)
-    rope = ltx2.LTX2AudioVideoRotaryPosEmbed()
-    ref = ltx2.LTX2AudioVideoRotaryPosEmbed()  # counts the reference calls
-    ref.freqs = rope.freqs
+    rope = _ltx2_rope()
     f32 = torch.float32
 
     def call(view):
         tables = rope(view, out_dtype=f32)
-        want = split_rope_natural_tables(*_upstream_rope_forward(ref, view, None, f32))
+        want = split_rope_natural_tables(*_UPSTREAM_ROPE_FORWARD(rope, view, None, f32))
         assert torch.equal(tables[0], want[0]) and torch.equal(tables[1], want[1])
         return tables
 
@@ -996,7 +905,7 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
         assert (coords[:, 0:1, :]._base is None) == inference
         tables = call(coords[:, 0:1, :])
         assert call(coords[:, 0:1, :]) is tables
-        assert (rope.calls, len(table_syncs)) == (1, 1)
+        assert len(table_syncs) == 1
 
         other = coords.clone()  # equal values and layout, another storage
         for view in (
@@ -1006,15 +915,15 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
             other[:, 0:1, :],
         ):
             call(coords[:, 0:1, :])
-            calls = rope.calls
+            syncs = len(table_syncs)
             call(view)
-            assert (rope.calls, len(table_syncs)) == (calls + 1, calls + 1)
+            assert len(table_syncs) == syncs + 1
 
     if not inference:
         # An in-place edit bumps the version counter that views share.
         stale = call(coords[:, 0:1, :])
-        calls = rope.calls
+        syncs = len(table_syncs)
         coords.add_(1.0)
         fresh = call(coords[:, 0:1, :])
-        assert (rope.calls, len(table_syncs)) == (calls + 1, calls + 1)
+        assert len(table_syncs) == syncs + 1
         assert not torch.equal(fresh[0], stale[0])

@@ -39,6 +39,9 @@ from typing import Any
 
 import portpicker
 
+from vllm_torchtpu.experimental.export import weight_mapper
+from vllm_torchtpu.experimental.export.trace import trace
+
 # vLLM picks its platform when imported, so CPU workers start with this env.
 CPU_ENV = {"VLLM_TARGET_DEVICE": "cpu", "JAX_PLATFORMS": "cpu", "PJRT_DEVICE": "CPU"}
 # Worker-only flags the launchers add: the `host:port` of the JAX distributed
@@ -81,12 +84,13 @@ def shard_shape(spec: Mapping[str, Any], axis_sizes: Mapping[str, int]) -> list[
 def local_tensors(model: Any) -> dict[str, Any]:
     """The model's parameters and buffers by name.
 
-    A tied `lm_head.weight` is the embedding tensor.
+    A tied LM head (see `weight_mapper.tied_lm_head_alias`) is the embedding tensor.
     """
     tensors = dict(model.named_buffers())
     tensors.update(model.named_parameters())
-    if "lm_head.weight" not in tensors and "model.embed_tokens.weight" in tensors:
-        tensors["lm_head.weight"] = tensors["model.embed_tokens.weight"]
+    tied = weight_mapper.tied_lm_head_alias(tensors)
+    if tied:
+        tensors[tied[0]] = tensors[tied[1]]
     return tensors
 
 
@@ -300,6 +304,7 @@ def init_jax(rank: int, world_size: int, coordinator: str | None) -> None:
         )
 
 
+@trace("export.save_checkpoint")
 def save_model_checkpoint(
     tensors: Mapping[str, Any], artifact_dir: str, data_dir: str
 ) -> None:

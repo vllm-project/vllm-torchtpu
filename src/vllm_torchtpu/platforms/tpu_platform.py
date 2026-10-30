@@ -41,6 +41,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
@@ -317,6 +318,25 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
     )
 
 
+def _validate_peer_replay_config() -> None:
+    """Fail fast on TPU_PRECOMPILE_PEER_REPLAY with vLLM's compile cache off.
+
+    Peer replay hands a compiled range to the host's other ranks through the
+    compile cache (TpuCompilerAdaptor saves and replays the cache artifact),
+    so with VLLM_DISABLE_COMPILE_CACHE=1 there is nothing to replay.
+    """
+    if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
+        return
+    if vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
+        raise ValueError(
+            "TPU_PRECOMPILE_PEER_REPLAY=1 needs vLLM's compile cache: peer ranks "
+            "share compiled ranges through it, so it does nothing with "
+            "VLLM_DISABLE_COMPILE_CACHE=1. Unset VLLM_DISABLE_COMPILE_CACHE "
+            "(point VLLM_CACHE_ROOT at a temporary directory for a cold start "
+            "with nothing kept across runs) or set TPU_PRECOMPILE_PEER_REPLAY=0."
+        )
+
+
 def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
     """Fail fast on phased-profiling settings that would silently do nothing.
 
@@ -485,6 +505,35 @@ class TpuPlatform(Platform):
         return
 
     @classmethod
+    def import_ir_kernels(cls) -> None:
+        """Register the TPU providers for vLLM IR ops on top of the built-ins.
+
+        ``IrOpPriorityConfig.set_default`` calls this in every worker before
+        installing the priorities from ``get_default_ir_op_priority``.
+        """
+        super().import_ir_kernels()
+        import vllm_torchtpu.layers.adapter.ir_ops  # noqa: F401
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        """Prefer the CUDA-numerics ``tpu`` RMSNorm providers over ``native``.
+
+        See ``vllm_torchtpu/layers/adapter/ir_ops.py``. Users can still force
+        ``native`` through ``--kernel-config`` for A/B comparisons.
+        """
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        from vllm_torchtpu.layers.adapter.ir_ops import TPU_IR_PROVIDER
+
+        return IrOpPriorityConfig.with_default(
+            ["native"],
+            rms_norm=[TPU_IR_PROVIDER, "native"],
+            fused_add_rms_norm=[TPU_IR_PROVIDER, "native"],
+        )
+
+    @classmethod
     def device_id_to_physical_device_id(cls, device_id: int) -> int:
         """Map logical DP/TP device id to a local physical TPU device.
 
@@ -628,7 +677,19 @@ class TpuPlatform(Platform):
         # backend for KV offloading without instantiating model layers.
         import vllm_torchtpu.layers.adapter.attention  # noqa: F401
 
+        # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
+        # vllm.platforms while it is still loading (a cycle).
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            is_registered_attention_backend,
+        )
+
+        registered = is_registered_attention_backend(selected_backend)
         if attn_selector_config.use_mla:
+            if registered:
+                raise ValueError(
+                    f"--attention-backend {selected_backend.name.lower()} does not "
+                    "support MLA models; leave --attention-backend unset."
+                )
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 
         supported_backends = [
@@ -636,10 +697,12 @@ class TpuPlatform(Platform):
             AttentionBackendEnum.CUSTOM,
             AttentionBackendEnum.FLASH_ATTN_MLA,
         ]
-        if selected_backend not in supported_backends:
-            logger.info(
-                "Cannot use %s backend on TPU. Setting to FLASH_ATTN.", selected_backend
-            )
+        if not registered and selected_backend not in supported_backends:
+            if selected_backend is not None:
+                logger.warning_once(
+                    "Cannot use %s backend on TPU. Setting to FLASH_ATTN.",
+                    selected_backend,
+                )
             selected_backend = AttentionBackendEnum.FLASH_ATTN
         logger.info("Using %s backend.", selected_backend.name)
         return selected_backend.get_path()
@@ -718,6 +781,7 @@ class TpuPlatform(Platform):
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
         _validate_phased_profiling_config(vllm_config)
+        _validate_peer_replay_config()
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
@@ -752,11 +816,25 @@ class TpuPlatform(Platform):
             PallasBatchedRPAAttentionBackend,
         )
 
-        backend = (
-            PallasBatchedRPAAttentionBackend
-            if vllm_config.attention_config.backend == AttentionBackendEnum.CUSTOM
-            else PallasAttentionBackend
+        # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
+        # vllm.platforms while it is still loading (a cycle).
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            is_registered_attention_backend,
         )
+
+        selected_backend = vllm_config.attention_config.backend
+        if is_registered_attention_backend(selected_backend):
+            assert selected_backend is not None
+            backend = selected_backend.get_class()
+            if not issubclass(backend, PallasAttentionBackend):
+                raise TypeError(
+                    f"--attention-backend {selected_backend.name.lower()} resolves "
+                    f"to {backend.__qualname__}, not a PallasAttentionBackend."
+                )
+        elif selected_backend == AttentionBackendEnum.CUSTOM:
+            backend = PallasBatchedRPAAttentionBackend
+        else:
+            backend = PallasAttentionBackend
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
         if (
             vllm_config.model_config is not None
@@ -1096,6 +1174,16 @@ class TpuPlatform(Platform):
                 multihost_backend,
             )
             parallel_config.distributed_executor_backend = "uni"
+
+        # After the executor is chosen: whether it starts processes decides
+        # whether a registered backend's name reaches them.
+        # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
+        # vllm.platforms while it is still loading (a cycle).
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            check_attention_backend_config,
+        )
+
+        check_attention_backend_config(vllm_config)
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"

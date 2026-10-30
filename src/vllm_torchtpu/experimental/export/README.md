@@ -45,13 +45,14 @@ explicitly rather than relying on the exporter's defaults:
 In order of precedence:
 
 1. `--num-blocks`, or `num_gpu_blocks_override`, is used as given.
-2. `--kv-cache-memory-bytes`: `num_blocks` = bytes / bytes per KV block. The
-   device is not queried, so this also works on a host without the target TPU.
+2. `--kv-cache-memory-bytes`: `num_blocks` = (bytes - recurrent state bytes) /
+   bytes per KV block. The device is not queried, so this also works on a host
+   without the target TPU.
 3. Otherwise, when the exporter loads the model itself: the device's HBM limit
    times `--gpu-memory-utilization` (default 0.9), minus the HBM in use after
-   loading the dummy weights, divided by the bytes per KV block. Every rank
-   computes this and all take the minimum, because rank 0's artifact serves
-   every rank.
+   loading the dummy weights and the recurrent state bytes, divided by the
+   bytes per KV block. Every rank computes this and all take the minimum,
+   because rank 0's artifact serves every rank.
 
 Bytes per KV block come from the KV state tensors the artifact declares, so
 they include the attention backend's padding.
@@ -73,13 +74,17 @@ fp8, with fp8's packing), or the model's activation dtype when it is `auto`.
 ### Hybrid recurrent models
 
 Models with recurrent layers, such as the Gated DeltaNet layers of Qwen3.5 and
-Qwen3-Next, export each such layer's state as two `[num_blocks, ...]` tensors:
-its conv state and its recurrent state, split over the model axis along the
-conv channels and the value heads. The forward graphs take one more `user_io`
-input after the states, `mamba_state_indices[max_num_seqs]`: the block holding
-each request's recurrent state. These layers keep this per-layer layout rather
-than vLLM's unified KV block pool, and the export runs with prefix caching off.
-Bytes per KV block include the recurrent states.
+Qwen3-Next, export each such layer's state as two `[num_state_slots, ...]`
+tensors: its conv state and its recurrent state, split over the model axis
+along the conv channels and the value heads. A recurrent state is fixed-size
+per request, so these pools hold one slot per request plus null slot 0
+(`num_state_slots = max_num_seqs + 1`, recorded in `serving_config`) rather
+than one per KV block. The forward graphs take one more `user_io` input after
+the states, `mamba_state_indices[max_num_seqs]`: the slot holding each
+request's recurrent state. These layers keep this per-layer layout rather than
+vLLM's unified KV block pool, and the export runs with prefix caching off. The
+recurrent state bytes come off the KV budget before it is divided among KV
+blocks.
 
 ### Example: match a `vllm serve` run
 

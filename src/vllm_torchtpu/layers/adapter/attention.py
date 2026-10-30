@@ -1474,6 +1474,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
         else:
             q_len, q_compute_dim = query.shape
 
+        if key is None:
+            # KV-shared layers get no K/V from vLLM. The kernel runs with
+            # skip_kv_update and reads all K/V from the target layer's cache,
+            # so zeros only fill the operand slots.
+            assert value is None and self.kv_sharing_target_layer_name is not None
+            key = query.new_zeros(q_len, self.num_kv_heads * self.head_size)
+            value = key
+
         if key.dim() == 3:
             k_len = key.shape[0]
             k_compute_dim = key.shape[1] * key.shape[2]
@@ -1784,6 +1792,18 @@ class PallasMLAttentionBackend(AttentionBackend):
                 kv_packing,
             ),
         )
+
+    @staticmethod
+    def get_sparse_kv_cache_page_size_bytes(
+        block_size: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        """Bytes per block of one sparse-MLA layer's (nope, rope) caches."""
+        specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            1, block_size, head_size, cache_dtype_str
+        )
+        return sum(math.prod(spec.shape) * spec.torch_dtype.itemsize for spec in specs)
 
     @staticmethod
     def get_kv_cache_page_size_bytes(

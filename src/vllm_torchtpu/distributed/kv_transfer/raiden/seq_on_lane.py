@@ -43,7 +43,6 @@ import dataclasses
 import hashlib
 import importlib.metadata
 import json
-import math
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -61,6 +60,7 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
     PoolManifest,
     RegionSpec,
     build_qwen35_pool_manifest,
+    gdn_state_unit_bytes,
 )
 from vllm_torchtpu.distributed.kv_transfer.raiden.tags import (
     TAG_FA,
@@ -81,8 +81,6 @@ SOL_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v2"
 SOL_REGION_NAME = "fa_sol"
 # Smallest head_dim the batched-RPA kernel materializes (8 sublanes x packing).
 MIN_HEAD_DIM = 32
-# The pooled GDN kernel stores conv state as BF16 rows of carrier lanes.
-GDN_CONV_ITEMSIZE = 2
 EXPECTED_SOL_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
 EXPECTED_SOL_TILES = ((4, 128), (4, 1))
 
@@ -522,7 +520,6 @@ def lower_gdn_state_shard_spans_sol(
     physical_granule_bytes: int = 1024,
     num_key_heads: int | None = None,
     num_value_heads: int | None = None,
-    conv_lane_bytes: int | None = None,
 ) -> PoolSpanRegistration:
     """One rank's GDN head shard into its destination shard's full state.
 
@@ -537,7 +534,7 @@ def lower_gdn_state_shard_spans_sol(
     destination shards than ranks (``dst_shards % parallelism == 0``) feeds
     several destinations from each rank
     (``lower_gdn_state_fanout_spans_sol``, which needs the model's head
-    counts and ``conv_lane_bytes``). Layout-independent: GDN state bytes
+    counts). Layout-independent: GDN state bytes
     are word-row separable under both FA layouts.
 
     ``physical_granule_bytes`` is the measured state carrier's word-row
@@ -582,7 +579,6 @@ def lower_gdn_state_shard_spans_sol(
             dst_shards=dst_shards,
             num_key_heads=num_key_heads,
             num_value_heads=num_value_heads,
-            conv_lane_bytes=conv_lane_bytes,
             physical_granule_bytes=physical_granule_bytes,
         )
     if parallelism % dst_shards:
@@ -676,12 +672,6 @@ def _lower_gdn_state_split_spans(
     return dataclasses.replace(full, spans=tuple(spans))
 
 
-def sol_gdn_conv_lane_bytes(geometry: SolFaGeometry) -> int:
-    """Lane width in bytes of the pooled GDN kernel's conv rows on the HND
-    carrier: ``page_tokens`` lanes of BF16 conv state."""
-    return geometry.page_tokens * GDN_CONV_ITEMSIZE
-
-
 _STATE_REGION_FIELDS = (
     "offset_bytes",
     "stride_bytes",
@@ -719,7 +709,6 @@ def lower_gdn_state_fanout_spans_sol(
     dst_shards: int,
     num_key_heads: int,
     num_value_heads: int,
-    conv_lane_bytes: int | None = None,
     physical_granule_bytes: int = 1024,
 ) -> PoolSpanRegistration:
     """One rank's GDN head shard into the narrower states of the
@@ -732,13 +721,9 @@ def lower_gdn_state_fanout_spans_sol(
     whole state from that rank, routed by ``dst_unit_ordinal``.
     Destinations sharing a key head each receive a copy of its Q/K rows.
 
-    Conv, QK pair-blocked layout: per tap the QK block stores ``[Q, K]``
-    row pairs in row order, followed by the V heads. A row is
-    ``gcd(conv row, conv_lane_bytes, Q segment)`` bytes, the pooled
-    kernel's logical row width. With equal row widths on both sides, each
-    key head is a contiguous run of row pairs, so a destination takes one
-    QK run and one V run per tap. The split q/k/v layout takes one run
-    per segment and tap. SSM: one run of the destination's value heads.
+    Conv: the unified pool stores each tap segment-major, ``[Q heads |
+    K heads | V heads]``, so a destination takes one run per segment and
+    tap. SSM: one run of the destination's value heads.
 
     ``declared_bytes`` counts every routed byte, so replicated Q/K rows
     count once per destination.
@@ -805,50 +790,6 @@ def lower_gdn_state_fanout_spans_sol(
         runs = [
             (shard, [(value * head_bytes, 0, dst_values * head_bytes)])
             for shard, _, value in targets
-        ]
-    elif is_conv and names == {"gdn_conv_qk", "gdn_conv_v"}:
-        qk, v = layout["gdn_conv_qk"], layout["gdn_conv_v"]
-        taps = qk[3]
-        qk_bytes = qk[2] * qk[4]
-        value_bytes = v[2]
-        src_row = qk_bytes + value_bytes * v[4]
-        pair_bytes = qk_bytes // src_keys  # Q and K rows of one key head
-        if (
-            qk[0] != 0
-            or v[0] != qk_bytes
-            or qk[1] != src_row
-            or v[1] != src_row
-            or v[3] != taps
-            or v[4] != src_values
-            or qk_bytes % (2 * src_keys)
-        ):
-            raise SeqOnLaneError(
-                "GDN conv compact layout must be dense tap-major [QK | V] "
-                f"over the rank's heads ({tag})"
-            )
-        dst_qk = dst_keys * pair_bytes
-        dst_row = dst_qk + dst_values * value_bytes
-        if conv_lane_bytes is None or conv_lane_bytes <= 0:
-            raise SeqOnLaneError(
-                "QK pair-blocked GDN fan-out requires the conv lane width"
-            )
-        src_width = math.gcd(src_row, conv_lane_bytes, qk_bytes // 2)
-        dst_width = math.gcd(dst_row, conv_lane_bytes, dst_qk // 2)
-        if src_width != dst_width or (pair_bytes // 2) % src_width:
-            raise SeqOnLaneError(
-                "producer and destination QK row pairs differ: "
-                f"row bytes {src_width} vs {dst_width}, key head bytes "
-                f"{pair_bytes // 2} ({tag})"
-            )
-        runs = [
-            (
-                shard,
-                [
-                    (key * pair_bytes, 0, dst_qk),
-                    (qk_bytes + value * value_bytes, dst_qk, dst_values * value_bytes),
-                ],
-            )
-            for shard, key, value in targets
         ]
     elif is_conv and names == {"gdn_conv_q", "gdn_conv_k", "gdn_conv_v"}:
         q, k, v = layout["gdn_conv_q"], layout["gdn_conv_k"], layout["gdn_conv_v"]
@@ -1014,8 +955,8 @@ def measured_sol_layout_fingerprint(
             f"gate: measured={element_bits} expected=8"
         )
     version = package_version or importlib.metadata.version
-    qk_pair = bool(getattr(tpu_envs, "TPU_GDN_CONV_QK_PAIR_LAYOUT", True))
-    payload = {
+    qk_pair = tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
+    payload: dict[str, Any] = {
         "schema": SOL_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
         "libtpu": version("libtpu"),
@@ -1028,13 +969,16 @@ def measured_sol_layout_fingerprint(
         "pool_lane_width": LANE_WIDTH,
         "gdn_conv_layout": "qk-pair-v1" if qk_pair else "legacy-split-qk",
     }
+    # See measured_fa_layout_fingerprint: pins the GDN state dtypes.
+    unit_bytes = gdn_state_unit_bytes(manifest)
+    if unit_bytes:
+        payload["gdn_state_unit_bytes"] = unit_bytes
     return canonical_fingerprint(payload), payload
 
 
 __all__ = [
     "EXPECTED_SOL_MINOR_TO_MAJOR",
     "EXPECTED_SOL_TILES",
-    "GDN_CONV_ITEMSIZE",
     "LANE_WIDTH",
     "PACKING",
     "SOL_FINGERPRINT_SCHEMA",
@@ -1056,5 +1000,4 @@ __all__ = [
     "sol_fa_page_tokens",
     "sol_fa_regions",
     "sol_fa_skip_bytes",
-    "sol_gdn_conv_lane_bytes",
 ]

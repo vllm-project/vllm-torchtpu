@@ -218,13 +218,13 @@ steps:
       # The kube launcher uploads whatever the workload leaves here as the
       # step's artifacts, as pipeline_perf.yml declares it.
       ARTIFACTS_DIR: "perf_eval_results"
-      # bootstrap_dev.sh leaves its builds unclassed: Kueue priority 0, ahead of
-      # the nightlies and behind every other kind of build. post-merge queues
-      # this one with main, and it preempts: the 2x2x4 ClusterQueue reclaims
-      # within its cohort from LowerPriority workloads, so the quota it lends to
-      # other tpu7x shapes is taken back by evicting their jobs (Kueue requeues
-      # them).
-      WORKLOAD_PRIORITY: "post-merge"
+      # bootstrap_dev.sh leaves dev builds unclassed (Kueue priority 0), the
+      # same standing as scheduled nightlies and behind CI. Setting integration
+      # (30) keeps this 32-chip dev experiment strictly below post-merge (100,
+      # main / merge queue) and pre-merge (50, pull requests) so it never blocks
+      # or evicts CI, while still letting the 2x2x4 ClusterQueue reclaim lent
+      # quota from lower-priority unclassed (0) and low (-100) workloads.
+      WORKLOAD_PRIORITY: "integration"
     agents:
       queue: "kube"
     plugins:

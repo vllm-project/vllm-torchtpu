@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -194,6 +195,8 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
+    VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
 
 
 def env_with_choices(
@@ -402,6 +405,10 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Qwen3.5 MoE at TP > 1: reduce-scatter the attention output, run the
+    # post-attention norm and router gate on the token shard, and fold the
+    # attention partial sum into the MoE all-reduce. Default MoE path only.
+    "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
@@ -432,15 +439,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
-    # QK pair-blocked pooled GDN conv layout: full-width states interleave
-    # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
-    # to one whole destination pool token (2 contiguous transfer spans per
-    # rank per state group).  Identity for head-shard states.  Must match
-    # across a disagg pair; the value rides the raiden layout fingerprint.
-    # Resolution is layered (see env_override.py): an explicitly set
-    # value always wins; otherwise raiden runs derive it from
-    # TPU_RAIDEN_TRANSFER_PARALLELISM (enabled iff >= 8, and 8 is that
-    # variable's default — so it is on by default under raiden).
+    # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
+    # with the unified GDN state pool: its kernel reads segment-major
+    # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must
+    # match across a disagg pair; the value rides the raiden layout
+    # fingerprint.
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
@@ -1149,6 +1152,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies it automatically to DP/Ray engine-core actors.
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    # SrptPrefillScheduler: cap on a step's attention work, sum of
+    # n * (context + n / 2) over its scheduled chunks; while some DP rank
+    # decodes, prefill chunks are shrunk to stay under it (0 disables).
+    "VLLM_TPU_SRPT_ATTN_WORK_CAP": env_nonnegative_int(
+        "VLLM_TPU_SRPT_ATTN_WORK_CAP", 0
+    ),
+    # SrptPrefillScheduler: a chunk shrunk by the attention work cap ends on a
+    # multiple of this many tokens, rounded down (the attention kernel's query
+    # tile).
+    "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
 }
 

@@ -53,6 +53,14 @@ fi
 exec /usr/bin/git "$@"
 """
 
+# GitHub's labels API for a merged PR: TEST_GITHUB_LABELS, or a failed request.
+_FAKE_CURL = """#!/usr/bin/env bash
+if [[ -z "${TEST_GITHUB_LABELS:-}" ]]; then
+  exit 22
+fi
+echo "${TEST_GITHUB_LABELS}"
+"""
+
 
 def run_bootstrap(
     **env: str,
@@ -65,6 +73,7 @@ def run_bootstrap(
         for name, script in (
             ("buildkite-agent", _FAKE_AGENT),
             ("git", _FAKE_GIT),
+            ("curl", _FAKE_CURL),
         ):
             path = bin_dir / name
             path.write_text(script)
@@ -184,6 +193,46 @@ class TestBootstrap(unittest.TestCase):
                 doc["steps"][0]["concurrency_group"],
                 "tpu-pr/alice@example.com",
             )
+
+    def test_skip_tpu_ci_runs_only_the_tests_lane(self) -> None:
+        calls, uploads, _, out = run_bootstrap(
+            BUILDKITE_PULL_REQUEST="123",
+            BUILDKITE_PULL_REQUEST_LABELS="ready,run-full-ci,skip-tpu-ci",
+        )
+        # pipeline_tests.yml + pipeline_build.yml
+        self.assertEqual(len(uploads), 2)
+        self.assertIn("Uploading .buildkite/pipeline_tests.yml", out["stdout"])
+        for lane in ("verify", "perf", "integration"):
+            self.assertNotIn(f"Uploading .buildkite/pipeline_{lane}.yml", out["stdout"])
+        self.assertTrue(any("--context skip-tpu-ci" in c for c in calls))
+        # The TPU group's condition, filled in from SKIP_TPU_CI at upload.
+        self.assertIn('"${SKIP_TPU_CI:-0}" != "1"', uploads[0])
+
+    def test_post_merge_of_a_skip_tpu_ci_pr_runs_only_the_tests_lane(self) -> None:
+        calls, uploads, _, out = run_bootstrap(
+            BUILDKITE_BRANCH="main",
+            BUILDKITE_PULL_REQUEST="false",
+            BUILDKITE_SOURCE="webhook",
+            BUILDKITE_MESSAGE="[CI/Build] Fix a script (#123)",
+            TEST_GITHUB_LABELS='[{"name": "ready"}, {"name": "skip-tpu-ci"}]',
+        )
+        self.assertEqual(len(uploads), 2)
+        self.assertNotIn("Uploading .buildkite/pipeline_integration.yml", out["stdout"])
+        self.assertTrue(any("--context skip-tpu-ci" in c for c in calls))
+
+    def test_post_merge_runs_everything_without_the_label_or_the_lookup(
+        self,
+    ) -> None:
+        for labels in ('[{"name": "ready"}]', ""):
+            calls, uploads, _, _ = run_bootstrap(
+                BUILDKITE_BRANCH="main",
+                BUILDKITE_PULL_REQUEST="false",
+                BUILDKITE_SOURCE="webhook",
+                BUILDKITE_MESSAGE="[Core] Change something (#124)",
+                TEST_GITHUB_LABELS=labels,
+            )
+            self.assertEqual(len(uploads), 4)
+            self.assertFalse(any("--context skip-tpu-ci" in c for c in calls))
 
     def test_scheduled_nightly_keeps_nightly_priority(self) -> None:
         calls, uploads, _, _ = run_bootstrap(

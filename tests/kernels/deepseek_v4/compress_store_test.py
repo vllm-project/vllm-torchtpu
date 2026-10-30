@@ -135,6 +135,7 @@ class CompressStoreTest(jtu.JaxTestCase):
         hidden_size=7168,
         block_table_rows=1,
         block_table_max_model_len=None,
+        poisoned_state_tokens=0,
     ):
         # Create config first
         if head_dim == 128:
@@ -403,6 +404,45 @@ class CompressStoreTest(jtu.JaxTestCase):
 
         self.assertArraysEqual(pallas_cache_normalized, ref_cache_normalized)
 
+        if poisoned_state_tokens:
+            # A prefix hit leaves the state of the tokens before it as
+            # whatever the reused pages hold (RunLocalStateSpec does not cache
+            # it). Fill those rows with NaN bytes: a kernel that reads them,
+            # even under a zero mask, changes the output.
+            assert separate_state, "only the HCA state is not prefix-cached"
+            rows = np.concatenate(
+                [
+                    np.arange(slot, slot + slots_per_token)
+                    for slot in state_slot(np.arange(poisoned_state_tokens))
+                ]
+            )
+            state_shape = populated_state_cache.shape
+            poisoned_state_cache = (
+                populated_state_cache.reshape(-1, *state_shape[2:])
+                .at[rows]
+                .set(0xFF)
+                .reshape(state_shape)
+            )
+            poisoned_out = compress_store.compress_norm_rope_store(
+                jnp.copy(populated_cache),
+                positions,
+                block_table,
+                token_to_req_indices,
+                kv_slot_mapping,
+                rms_weight,
+                block_table_stride=block_table_stride,
+                state_block_size=state_block_size,
+                state_cache=poisoned_state_cache,
+                rope_cache=jnp.copy(init_rope_cache),
+                cos_sin_cache=cos_sin_cache,
+                compress_ratio=cfgs.dims.compress_ratio,
+                overlap=cfgs.dims.overlap,
+                quant_block=cfgs.dims.quant_block,
+                rms_eps=cfgs.dims.rms_eps,
+                interpret=interpret,
+            )
+            self.assertArraysEqual(poisoned_out[0], pallas_cache_output)
+
     @parameterized.named_parameters(
         (
             # DSv4-Flash's real geometry: hidden_size 4096 vs state_dim 2048.
@@ -518,6 +558,23 @@ class CompressStoreTest(jtu.JaxTestCase):
                 state_physical_page_size=256,
                 positions=np.array([383, 127, 511, 255], dtype=np.int32),
                 prefill_len=512,
+            ),
+        ),
+        (
+            # A prefix hit at a run start (token 128): run 2's compressed entry
+            # must not read run 1's state, which is not prefix-cached.
+            "hca_run_after_prefix_hit",
+            dict(
+                num_tokens=4,
+                head_dim=512,
+                rope_head_dim=64,
+                compress_ratio=128,
+                overlap=False,
+                physical_page_size=16,
+                state_physical_page_size=256,
+                positions=np.array([255, 254, 253, 252], dtype=np.int32),
+                prefill_len=256,
+                poisoned_state_tokens=128,
             ),
         ),
         (

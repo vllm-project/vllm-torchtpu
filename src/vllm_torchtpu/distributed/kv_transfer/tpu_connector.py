@@ -3249,12 +3249,14 @@ class TPURaidenConnectorWorker:
             )
         interleave = _raiden_dst_interleave_tokens(self.vllm_config)
         page_tokens = int(self.vllm_config.cache_config.block_size)
-        # Every GLM cache row packs at most one 32-bit word's worth of tokens.
-        if page_tokens % interleave or interleave % 4:
+        # SparseCore RoPE packs eight 64-byte tokens per 512-byte row;
+        # TensorCore caches and the DSA indexer pack four tokens per row.
+        min_interleave = 8 if tpu_envs.TPU_SPARSE_MLA_ROPE_LAYOUT == "sparsecore" else 4
+        if page_tokens % interleave or interleave % min_interleave:
             raise ValueError(
                 "destination_cp_kv_cache_interleave_size must be a multiple "
-                f"of 4 that divides the page: interleave={interleave}, "
-                f"page_tokens={page_tokens}"
+                f"of {min_interleave} that divides the page: "
+                f"interleave={interleave}, page_tokens={page_tokens}"
             )
 
     def _admit_raiden_dsv4_kv_cache(self, runner: TPUModelRunner) -> None:
@@ -5120,17 +5122,15 @@ class TPURaidenConnectorWorker:
             lower_gdn_state_shard_spans_sol,
             registration_source_bytes,
             sol_fa_geometry_from_manifest,
-            sol_gdn_conv_lane_bytes,
         )
 
         assert self._raiden_manifest is not None
         aliased_raw = self._raiden_manifest.binding == BINDING_ALIASED_RAW
         if aliased_raw and not self._stage3_kimi:
             # Raw transfers move physical bytes; admit only the fingerprinted
-            # tiled layout.  The whole-token QK pair-blocked conv layout is
-            # enforced downstream: the span lowering rejects any other conv
-            # region vocabulary, and the layout version rides the compared
-            # fingerprint payload.
+            # tiled layout.  The conv layout is enforced downstream: the
+            # span lowering requires whole-token conv segments, and the
+            # layout version rides the compared fingerprint payload.
             payload = self._raiden_layout_fingerprint_payload
             if not payload:
                 raise RuntimeError(
@@ -5156,13 +5156,11 @@ class TPURaidenConnectorWorker:
                 )
 
         physical_granule = 1024
-        conv_lane_bytes = None
         if _raiden_seq_on_lane_layout() and not self._stage3_kimi:
             if aliased_raw and payload.get("fa_kv_layout") != SOL_LAYOUT_TOKEN:
                 raise RuntimeError("HND GDN spans require an HND layout fingerprint")
             geometry = sol_fa_geometry_from_manifest(self._raiden_manifest)
             physical_granule = geometry.packing * geometry.page_tokens
-            conv_lane_bytes = sol_gdn_conv_lane_bytes(geometry)
 
         registrations = []
         for exact_tag, ordinal in self._stage3_state_registration_tags():
@@ -5207,7 +5205,6 @@ class TPURaidenConnectorWorker:
                     physical_granule_bytes=physical_granule,
                     num_key_heads=self._model_config_int("linear_num_key_heads", 0),
                     num_value_heads=self._model_config_int("linear_num_value_heads", 0),
-                    conv_lane_bytes=conv_lane_bytes,
                 )
             # Every admitted source byte is read; fan-out reads some of them
             # for several destinations.
