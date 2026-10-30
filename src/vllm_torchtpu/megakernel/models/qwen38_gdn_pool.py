@@ -28,11 +28,18 @@ With an f32 recurrent state (`VLLM_TPU_MK_GDN_REC_F32=1`) on the whole-state pat
 the gather writes each request's state straight into the block's `recb` instead
 of through `pg_rec`: an f32 `pg_rec` (NS * 384 KiB) does not fit beside the f32
 `recb` at b32.
+
+Chunk gather (`VLLM_TPU_MK_GDN_CHUNK_GATHER`, auto above 32 rows): on the chunked
+(`GCH`) verify path each row chunk's states are read from the pool when the chunk's
+`recb` slot is filled, through per-slot FP8 staging, instead of from a `pg_rec`
+holding every request's state (NS * 384 KiB f32: 12 MiB at 128 rows). Same values
+(typed f32 view, zero without a prior state, cast to `REC`); scheduling only.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import Any
 
 import jax.numpy as jnp
@@ -53,6 +60,19 @@ MANAGER_ROWS = 512  # pool rows (tokens) per manager block
 SSM_ROWS = 128  # pool rows per staged recurrent-state chunk
 SSM_BLOCKS = 3  # chunks holding the recurrent state (rows 0 .. 383)
 CONV_ROWS = 16  # pool rows holding the conv history (rounded to a power of two)
+
+
+# "auto": chunk gather on chunked verify buckets above 32 rows; "1": every chunked
+# verify bucket; "0": off (states staged in `pg_rec`).
+CHUNK_GATHER = os.environ.get("VLLM_TPU_MK_GDN_CHUNK_GATHER", "auto")
+CHUNK_GATHER_AUTO_ROWS = 32
+
+
+def _chunk_gather(gp: GDNParams, ex: ExecSpec) -> bool:
+    """Read each `GCH` row chunk's states from the pool into its `recb` slot."""
+    if CHUNK_GATHER == "0" or not (gp.GCH and ex.VER) or gp.GPR or cache_exec(ex).FUSED:
+        return False
+    return CHUNK_GATHER == "1" or ex.B > CHUNK_GATHER_AUTO_ROWS
 
 
 def _gather_into_recb(gp: GDNParams, ex: ExecSpec) -> bool:
@@ -95,6 +115,85 @@ def _typed_f32(block_ref: Any, interpret: bool, lanes: int) -> Any:
     return view.reshape(-1, lanes)[...]
 
 
+def _pool_state(raws: list[Any], interp: bool, vh: int, KD: int, VD: int) -> Any:
+    """A request's f32 recurrent state `[vh, KD, VD]` from its staged FP8 pool rows."""
+    # 128-lane rows: the state's row-major order, so only the leading
+    # dimension is split (lane-changing reshapes do not lower).
+    return jnp.concatenate([_typed_f32(r, interp, VD) for r in raws], axis=0)[
+        : vh * KD
+    ].reshape(vh, KD, VD)
+
+
+class _ChunkIn:
+    """`rec_chunk` read handle of the chunk gather: row chunk `j`'s requests' pool
+    states -> the tail of `recb` slot `s` (where the stock chunk read puts them).
+
+    `start` issues the requests' FP8 pool-row copies into slot `s`'s staging;
+    `wait` waits for them and writes the f32 states (zero without a prior state)
+    as `REC`. The caller orders both after slot `s`'s previous write-back."""
+
+    def __init__(self, ctx: Any, gp: GDNParams, o: Any, j: Any, s: Any, n: int) -> None:
+        T = ctx.ex.T
+        self.ctx, self.gp, self.o, self.s, self.n = ctx, gp, o, s, n
+        self.nseq = n // (T * gp.vh)
+        per = gp.CB // T
+        r0 = j * per if isinstance(j, int) else pl.multiple_of(j * per, per)
+        self.seqs = [r0 + q for q in range(self.nseq)]
+
+    def _slots(self, body: Any) -> None:
+        """`body(sv)` for the static slot `sv == s` (staging refs are whole refs)."""
+        if isinstance(self.s, int):
+            body(self.s)
+            return
+        for sv in range(self.gp.NRB):
+
+            @pl.when(self.s == sv)
+            def _(sv=sv):
+                body(sv)
+
+    def _copies(self, sv: int) -> list[Any]:
+        ctx = self.ctx
+        pool, scr = ctx.extra[POOL], ctx.scr
+        cps = []
+        for q, sq in enumerate(self.seqs):
+            m = ctx.extra[READ_BLOCKS][self.o, sq]
+            for j in range(SSM_BLOCKS):
+                cps.append(
+                    pltpu.make_async_copy(
+                        pool_rows(pool, m, j * SSM_ROWS, SSM_ROWS),
+                        scr[f"pg_cs{sv}{q}{j}"],
+                        scr["pg_csem"].at[sv, q, j],
+                    )
+                )
+        return cps
+
+    def start(self) -> None:
+        def body(sv: int) -> None:
+            for c in self._copies(sv):
+                c.start()
+
+        self._slots(body)
+
+    def wait(self) -> None:
+        ctx, gp = self.ctx, self.gp
+        scr, vh = ctx.scr, gp.vh
+        interp = bool(ctx.ex.interpret)
+        ni = self.n // ctx.ex.T
+
+        def body(sv: int) -> None:
+            for c in self._copies(sv):
+                c.wait()
+            for q, sq in enumerate(self.seqs):
+                keep = ctx.extra[HAS_STATE][self.o, sq] != 0
+                state = _pool_state(
+                    [scr[f"pg_cs{sv}{q}{j}"] for j in range(SSM_BLOCKS)], interp, vh, gp.KD, gp.VD
+                )
+                r = self.n - ni + q * vh
+                scr["recb"][sv, r : r + vh] = jnp.where(keep, state, 0.0).astype(REC)
+
+        self._slots(body)
+
+
 class Qwen38PoolGDN(Qwen38GDN):
     """`Qwen38GDN` whose input states come straight from the unified pool."""
 
@@ -123,11 +222,19 @@ class Qwen38PoolGDN(Qwen38GDN):
             pg_sem=pltpu.SemaphoreType.DMA((2, SSM_BLOCKS + 1)),
             pg_conv=pltpu.VMEM((ex.NS, rup(3 + ex.T, 8), lay.QKV), F32),
         )
-        if not _gather_into_recb(plan.block_params[self.name], ex):
+        gp = plan.block_params[self.name]
+        if _chunk_gather(gp, ex):
+            # Per ring slot and request of a chunk: the state's FP8 pool rows.
+            for sv in range(gp.NRB):
+                for q in range(gp.CB // ex.T):
+                    for j in range(SSM_BLOCKS):
+                        scr[f"pg_cs{sv}{q}{j}"] = pltpu.VMEM((SSM_ROWS, 1, 4, 256), f8)
+            scr["pg_csem"] = pltpu.SemaphoreType.DMA((gp.NRB, gp.CB // ex.T, SSM_BLOCKS))
+        elif not _gather_into_recb(gp, ex):
             scr["pg_rec"] = pltpu.VMEM((ex.NS * lay.vh, lay.KD, lay.VD), REC)
         return scr
 
-    def _copies(self, ctx: Any, o: Any, s: int, buf: int) -> list[Any]:
+    def _copies(self, ctx: Any, o: Any, s: int, buf: int, ssm: bool = True) -> list[Any]:
         pool, scr = ctx.extra[POOL], ctx.scr
         m = ctx.extra[READ_BLOCKS][o, s]
         cps = [
@@ -136,7 +243,7 @@ class Qwen38PoolGDN(Qwen38GDN):
                 scr[f"pg_raw{buf}{j}"],
                 scr["pg_sem"].at[buf, j],
             )
-            for j in range(SSM_BLOCKS)
+            for j in range(SSM_BLOCKS if ssm else 0)
         ]
         cps.append(
             pltpu.make_async_copy(
@@ -147,12 +254,13 @@ class Qwen38PoolGDN(Qwen38GDN):
         )
         return cps
 
-    def _gather(self, ctx: Any, o: Any, direct: bool = False) -> None:
+    def _gather(self, ctx: Any, o: Any, direct: bool = False, ssm: bool = True) -> None:
         """Layer `o`'s pool states -> `pg_rec` (`REC`) / `pg_conv` (f32 history rows).
 
         `direct`: the states go to each request's first `recb` row group instead
         (the slot `rec_in` would copy them to), once the previous GDN layer's
-        `recb` write-back has drained; `gdn_in` then skips both."""
+        `recb` write-back has drained; `gdn_in` then skips both. `ssm=False` (chunk
+        gather): only the conv history; the chunks read their states (`_ChunkIn`)."""
         ex, scr = ctx.ex, ctx.scr
         lay = self.lin_in_layout(ctx.g, ex)
         vh, KD, VD, QKV = lay.vh, lay.KD, lay.VD, lay.QKV
@@ -170,28 +278,28 @@ class Qwen38PoolGDN(Qwen38GDN):
                         scr["st_sem"].at[3],
                     ).wait()
 
-        else:
+        elif ssm:
             rec_dst, rec_stride = scr["pg_rec"], vh
         scr["pg_conv"][...] = jnp.zeros(scr["pg_conv"].shape, F32)
-        pending = self._copies(ctx, o, 0, 0)
+        pending = self._copies(ctx, o, 0, 0, ssm)
         for c in pending:
             c.start()
         for s in range(NS):
             buf = s % 2
             if s + 1 < NS:
-                nxt = self._copies(ctx, o, s + 1, 1 - buf)
+                nxt = self._copies(ctx, o, s + 1, 1 - buf, ssm)
                 for c in nxt:
                     c.start()
             for c in pending:
                 c.wait()
             keep = ctx.extra[HAS_STATE][o, s] != 0
-            # 128-lane rows: the state's row-major order, so only the leading
-            # dimension is split (lane-changing reshapes do not lower).
-            ssm = jnp.concatenate(
-                [_typed_f32(scr[f"pg_raw{buf}{j}"], interp, VD) for j in range(SSM_BLOCKS)],
-                axis=0,
-            )[: vh * KD].reshape(vh, KD, VD)
-            rec_dst[s * rec_stride : s * rec_stride + vh] = jnp.where(keep, ssm, 0.0).astype(REC)
+            if ssm:
+                state = _pool_state(
+                    [scr[f"pg_raw{buf}{j}"] for j in range(SSM_BLOCKS)], interp, vh, KD, VD
+                )
+                rec_dst[s * rec_stride : s * rec_stride + vh] = jnp.where(
+                    keep, state, 0.0
+                ).astype(REC)
             crow = _typed_f32(scr[f"pg_craw{buf}"], interp, 256)  # [16, 256]
             per = QKV // 256
             for r in range(3):
@@ -204,11 +312,15 @@ class Qwen38PoolGDN(Qwen38GDN):
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         o = ctx.stream.sp.block_ord(l, self.name)
-        direct = _gather_into_recb(ctx.block_params(self.name), ctx.ex)
+        gp = ctx.block_params(self.name)
+        chunked = _chunk_gather(gp, ctx.ex)
+        direct = not chunked and _gather_into_recb(gp, ctx.ex)
         with ctx.sc("gdn_pool_gather"):
-            self._gather(ctx, o, direct)
+            self._gather(ctx, o, direct, ssm=not chunked)
         st = {**ctx.ST, "conv": _LayerView(ctx.scr["pg_conv"])}
-        if direct:
+        if chunked:
+            st["rec_chunk_in"] = _ChunkIn
+        elif direct:
             st["rec_in_recb"] = True
         else:
             st["rec"] = _LayerView(ctx.scr["pg_rec"])

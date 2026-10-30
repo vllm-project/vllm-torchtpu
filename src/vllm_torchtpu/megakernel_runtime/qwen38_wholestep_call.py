@@ -89,9 +89,16 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     (j-f4f467fc: 64.37M at qwen38_mk_whole_b32; 2.16 MiB in tpu_bench_wholestep_call j-5ae41ffb,
     where one expert slot fell 8 KiB short): the chunked GDN state ring (f32 chunk 3 MiB) drops
     from 3 to 2 buffers there; scheduling only. Up to 16 rows (whole-state path, f32 `recb`) it
-    misses by 0.30 MiB (j-4aeaf924: 62.30M at qwen38_mk_whole_b16): one more expert slot."""
+    misses by 0.30 MiB (j-4aeaf924: 62.30M at qwen38_mk_whole_b16): one more expert slot.
+    Above 32 rows the GDN chunks read their states from the pool per `recb` slot (chunk
+    gather, `qwen38_gdn_pool`; no NS-sized `pg_rec`); above 64 rows the dense ring drops to
+    3 slots. Scratch (f32 state): b48 42.1 / b64 47.9 / b96 53.7 MiB (CPU plan)."""
+    if B > 64:
+        t = segment_tiles(B, rings=(6, 3))
+        return t.with_blocks({"gdn": {"gdn_bufs": 2}}) if REC == F32 else t
     if B >= 48:
-        return segment_tiles(B, rings=(6, 4))
+        t = segment_tiles(B, rings=(6, 4))
+        return t.with_blocks({"gdn": {"gdn_bufs": 2}}) if REC == F32 else t
     if REC == F32 and B > 16:
         return segment_tiles(B).with_blocks({"gdn": {"gdn_bufs": 2}})
     if B <= 16 and (max_groups > 32768 or REC == F32):
