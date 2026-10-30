@@ -15,6 +15,7 @@
 
 import functools
 import hashlib
+import math
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +26,12 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa, qsa_state
 from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import _COMPILER_SMEM_RESERVE
+
+
+def _int32_prefetch_bytes(array, lanes):
+    assert array.dtype == jnp.int32
+    minor = math.ceil(array.shape[-1] / lanes) * lanes
+    return math.prod(array.shape[:-1]) * minor * array.dtype.itemsize
 
 
 def compressed_fixture(fp8, edges):
@@ -82,11 +89,14 @@ def compressed_fixture(fp8, edges):
 def test_compressed_prefetch_is_bounded_and_values_are_2d(monkeypatch, tiles, edges):
     from types import SimpleNamespace
 
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     word_bytes = 4
     words = 128 * (1 + 1 + 2) + 2
     capacity = _COMPILER_SMEM_RESERVE + tiles * words * word_bytes
     monkeypatch.setattr(
-        pltpu, "get_tpu_info", lambda: SimpleNamespace(smem_capacity_bytes=capacity)
+        pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(smem_capacity_bytes=capacity, num_lanes=info.num_lanes),
     )
     seen = []
 
@@ -99,11 +109,18 @@ def test_compressed_prefetch_is_bounded_and_values_are_2d(monkeypatch, tiles, ed
             assert values.shape == (2 * len(pairs), 128)
             metadata = sum(a.nbytes for a in (first, bulk, pairs, active, masks))
             assert metadata + _COMPILER_SMEM_RESERVE <= capacity
+            assert (
+                sum(
+                    _int32_prefetch_bytes(a, info.num_lanes)
+                    for a in (first, bulk, pairs, active, masks)
+                )
+                <= capacity
+            )
             seen.append(
                 (
                     np.asarray(pairs),
                     np.asarray(active),
-                    np.asarray(masks),
+                    np.asarray(masks).reshape(len(pairs), 2),
                     np.asarray(values),
                 )
             )
@@ -136,6 +153,57 @@ def test_compressed_prefetch_is_bounded_and_values_are_2d(monkeypatch, tiles, ed
     assert actual.keys() == expected.keys()
     for location in actual:
         np.testing.assert_array_equal(actual[location], expected[location])
+
+
+def test_compressed_prefetch_lane_padding_fits_large_batch(monkeypatch):
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    tokens, width, page, ratio = 2048, 128, 128, 4
+    logical = jnp.arange(tokens, dtype=jnp.int32)
+    keys = jnp.arange(tokens * width, dtype=jnp.float32).reshape(tokens, width)
+    keys = keys.astype(jnp.bfloat16)
+    pool = jnp.zeros((tokens // page + 1, page, 1, 2, width), jnp.bfloat16)
+    calls = []
+
+    def capture(kernel, **kwargs):
+        assert kwargs["grid_spec"].num_scalar_prefetch == 5
+        assert kwargs["input_output_aliases"] == {6: 0}
+
+        def run(first, bulk, indices, active, masks, values, owner):
+            metadata = (first, bulk, indices, active, masks)
+            actual_bytes = sum(
+                _int32_prefetch_bytes(a, info.num_lanes) for a in metadata
+            )
+            assert actual_bytes <= info.smem_capacity_bytes
+            rows = len(indices)
+            old_mask_bytes = rows * info.num_lanes * np.dtype(np.int32).itemsize
+            other_bytes = sum(
+                _int32_prefetch_bytes(a, info.num_lanes) for a in metadata[:-1]
+            )
+            assert old_mask_bytes + other_bytes > info.smem_capacity_bytes
+            assert masks.shape == (rows * 2,)
+            np.testing.assert_array_equal(masks.reshape(rows, 2), 1)
+            calls.append(actual_bytes)
+            return owner
+
+        return run
+
+    monkeypatch.setattr(pl, "pallas_call", capture)
+    with jax.disable_jit():
+        result = pooled_qsa.write_compressed(
+            pool,
+            keys,
+            (logical + 1) % ratio == 0,
+            jnp.zeros(tokens, jnp.int32),
+            logical,
+            jnp.array([0, tokens], jnp.int32),
+            jnp.zeros(1, jnp.int32),
+            jnp.arange(1, tokens // page + 1, dtype=jnp.int32)[None],
+            ratio=ratio,
+        )
+    assert len(calls) == 1
+    assert result.shape == pool.shape and result.dtype == pool.dtype
+    np.testing.assert_array_equal(result, pool)
 
 
 @pytest.mark.tpu_test
