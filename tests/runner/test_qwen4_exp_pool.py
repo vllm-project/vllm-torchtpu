@@ -736,6 +736,10 @@ def test_main_kv_dcp_allocation_and_prefix_hits_align_to_scheduler_blocks(
         blocks = len(m.req_to_blocks["a"])
         assert blocks == -(-len(prompt) // spec.block_size), g.layer_names
     manager.free(first)
+    # Step boundary: once installed (any TPU VllmConfig in the session runs
+    # platform activation), _patch_vllm_same_step_prefix_hits hides blocks
+    # hashed since the last Scheduler.schedule; no scheduler runs here.
+    manager.block_pool.__dict__.get("_tpu_unwritten_block_ids", set()).clear()
     second = request("b")
     _, hit, *_ = manager.get_computed_blocks(second)
     assert hit > 0 and hit % scheduler_block == 0, (hit, scheduler_block)
