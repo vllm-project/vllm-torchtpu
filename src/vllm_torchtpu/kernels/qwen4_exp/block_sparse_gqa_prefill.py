@@ -788,8 +788,10 @@ def _ragged_prefill(
     kv_tile,
     k_scale,
     v_scale,
+    output_base=0,
 ):
-    if size == 0:
+    """Read global source rows and write output relative to output_base."""
+    if size == 0 or len(output) == 0:
         return output
     first, ends, total = _request_tiles(starts, offset, size, query_block)
     groups = page_table.shape[1] * cache.shape[1] // ratio
@@ -815,6 +817,8 @@ def _ragged_prefill(
         stop = jnp.minimum(jnp.searchsorted(ends, limit, side="right"), total)
         source_end = ends[stop - 1]
         source_indices = source_first + jnp.arange(source_rows, dtype=jnp.int32)
+        output_indices = source_indices - output_base
+        read_indices = jnp.where(output_indices >= 0, output_indices, len(output))
         live = source_indices < source_end
         source_lengths = jnp.where(
             live, jnp.take(lengths, source_indices, mode="fill", fill_value=0), 0
@@ -885,23 +889,31 @@ def _ragged_prefill(
                 len(result),
             )
             compact = jnp.take(result, result_row, axis=0, mode="fill", fill_value=0)
-            old = jnp.take(output, source_indices, axis=0, mode="fill", fill_value=0)
+            old = jnp.take(output, read_indices, axis=0, mode="fill", fill_value=0)
             window = jnp.where(current[:, None, None], compact, old)
             # Arange row indices and their full H/D windows are disjoint,
             # including distinct positive out-of-bounds rows.
-            return output.at[source_indices].set(
-                window, mode="drop", indices_are_sorted=True, unique_indices=True
+            return output.at[output_indices].set(
+                window,
+                mode="drop",
+                indices_are_sorted=True,
+                unique_indices=True,
+                wrap_negative_indices=False,
             )
 
         output = lax.fori_loop(
             0, (stop - cursor + pack_tiles - 1) // pack_tiles, pack, output
         )
-        raw = jnp.take(output, source_indices, axis=0, mode="fill", fill_value=0)
+        raw = jnp.take(output, read_indices, axis=0, mode="fill", fill_value=0)
         source_gate = jnp.take(gate, source_indices, axis=0, mode="fill", fill_value=0)
         gated = _gate_output(raw, source_gate, source_lengths)
         window = jnp.where(live[:, None, None], gated, raw)
-        output = output.at[source_indices].set(
-            window, mode="drop", indices_are_sorted=True, unique_indices=True
+        output = output.at[output_indices].set(
+            window,
+            mode="drop",
+            indices_are_sorted=True,
+            unique_indices=True,
+            wrap_negative_indices=False,
         )
         return stop, output
 

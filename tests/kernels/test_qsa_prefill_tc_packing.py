@@ -883,3 +883,431 @@ def test_jit_ragged_offsets_keep_gate_owner_and_untouched_rows(core_calls):
         wanted[offset : offset + 128] = reference[offset : offset + 128]
         np.testing.assert_array_equal(actual, wanted)
     np.testing.assert_array_equal(np.asarray(args[5]).view(np.uint8), before)
+
+
+def output_window_reference(args, initial, offset, size, output_base):
+    wanted = np.asarray(initial).copy()
+    values = np.asarray(expected(args))
+    for lo, hi in zip(np.asarray(args[6][:-1]), np.asarray(args[6][1:])):
+        for row in range(max(int(lo), offset), min(int(hi), offset + size)):
+            destination = row - output_base
+            if 0 <= row < len(values) and 0 <= destination < len(wanted):
+                wanted[destination] = values[row]
+    return wanted
+
+
+@pytest.mark.parametrize(
+    "offset,size,output_base,capacity",
+    [
+        (17, 256, 0, 385),
+        (17, 256, 17, 256),
+        (17, 256, 8, 300),
+        (17, 256, 129, 31),
+        (380, 17, 379, 19),
+        (17, 0, 10, 7),
+        (17, 20, 17, 0),
+    ],
+)
+def test_ragged_output_origin_keeps_global_sources_and_nonzero_unwritten_rows(
+    core_calls, offset, size, output_base, capacity
+):
+    args = inputs(385, [0, 3, 3, 131, 273, 385, 385])
+    args = (
+        *args[:5],
+        jax.lax.bitcast_convert_type(
+            jnp.full(args[5].shape, 0xFFFF, jnp.uint16), jnp.bfloat16
+        ),
+        args[6],
+    )
+    initial = jnp.full((capacity, *args[0].shape[1:]), 13, args[0].dtype)
+    before = [np.asarray(x).tobytes(order="C") for x in args]
+    with jax.disable_jit():
+        actual = tc._ragged_prefill(
+            *args[:6],
+            args[6],
+            initial,
+            offset,
+            size,
+            ratio=4,
+            kv_heads=2,
+            query_block=128,
+            kv_tile=128,
+            k_scale=1.0,
+            v_scale=1.0,
+            output_base=output_base,
+        )
+    np.testing.assert_array_equal(
+        actual, output_window_reference(args, initial, offset, size, output_base)
+    )
+    assert [np.asarray(x).tobytes(order="C") for x in args] == before
+    if not size or not capacity:
+        assert core_calls == []
+
+
+@pytest.mark.parametrize(
+    "heads,dim,ratio,page,columns",
+    [(2, 128, 4, 256, 1), (4, 128, 8, 384, 3), (6, 256, 4, 896, 2)],
+)
+def test_output_origin_varies_head_ratio_page_geometry(
+    core_calls, heads, dim, ratio, page, columns
+):
+    original = inputs(145, [0, 0, 3, 17, 131, 145, 145], columns)
+    query = jnp.broadcast_to(original[0][:, :1, :1], (145, heads, dim))
+    gate = jnp.broadcast_to(original[1][:, :1, :1], query.shape)
+    cache = jnp.zeros((8, page, 2, 2, dim), jnp.bfloat16)
+    args = (query, gate, *original[2:5], cache, original[6])
+    initial = jnp.full((140, heads, dim), 13, jnp.bfloat16)
+    with jax.disable_jit():
+        actual = tc._ragged_prefill(
+            *args[:6],
+            args[6],
+            initial,
+            17,
+            128,
+            ratio=ratio,
+            kv_heads=2,
+            query_block=128,
+            kv_tile=256,
+            k_scale=1.0,
+            v_scale=1.0,
+            output_base=8,
+        )
+    np.testing.assert_array_equal(
+        actual, output_window_reference(args, initial, 17, 128, 8)
+    )
+
+
+@pytest.mark.parametrize("output_base", [0, 17, 8])
+def test_output_origin_multiple_source_windows(core_calls, monkeypatch, output_base):
+    original = tc._ragged_plan
+
+    def one_tile(*args, **kwargs):
+        _, _, selection_rows = original(*args, **kwargs)
+        rows = min(args[0], args[7])
+        return 1, rows, min(rows, selection_rows)
+
+    monkeypatch.setattr(tc, "_ragged_plan", one_tile)
+    args = inputs(385, [0, 3, 3, 131, 273, 385, 385])
+    initial = jnp.full((385 - output_base, 4, 128), 13, jnp.bfloat16)
+    with jax.disable_jit():
+        actual = adaptive._ragged_tc_write(
+            args[:5],
+            args[5],
+            args[6],
+            initial,
+            17,
+            256,
+            output_base=output_base,
+            kv_heads=2,
+            ratio=4,
+            kv_tile=128,
+        )
+    assert len(core_calls) > 1
+    np.testing.assert_array_equal(
+        actual, output_window_reference(args, initial, 17, 256, output_base)
+    )
+
+
+@pytest.mark.parametrize("output_base", [0, 256, 17])
+@pytest.mark.parametrize("choose_sc", [False, True])
+def test_contained_output_origin_direct_and_sc_micro_tail(
+    monkeypatch, output_base, choose_sc
+):
+    args = inputs(273, [0, 256, 273])
+    calls = []
+
+    def primitive(query, gate, blocks, lengths, table, cache, **kwargs):
+        calls.append(tuple(np.asarray(x).copy() for x in (query, gate, table)))
+        raw = (query.astype(jnp.float32) + table[:, :1, None]).astype(query.dtype)
+        return tc._gate_output(raw, gate, lengths), cache
+
+    monkeypatch.setattr(adaptive, "sc_chunk_size", lambda *args, **kwargs: 8)
+    monkeypatch.setattr(adaptive, "sc_grouped_attention", primitive)
+
+    def direct(*args, **kwargs):
+        return primitive(*args, **kwargs)[0]
+
+    monkeypatch.setattr(adaptive, "_direct_tc", direct)
+    initial = jnp.full((273 - output_base, 4, 128), 13, jnp.bfloat16)
+    before = [np.asarray(x).tobytes(order="C") for x in args]
+    with jax.disable_jit():
+        if choose_sc:
+            actual = adaptive._write_sc_chunk(
+                args[:5],
+                args[5],
+                initial,
+                256,
+                17,
+                tail=True,
+                output_base=output_base,
+                kv_heads=2,
+                ratio=4,
+                kv_tile=128,
+            )
+        else:
+            actual = adaptive._write_tc_chunk(
+                args[:5],
+                args[5],
+                args[6],
+                initial,
+                256,
+                17,
+                tail=True,
+                output_base=output_base,
+                kv_heads=2,
+                ratio=4,
+                kv_tile=128,
+            )
+    np.testing.assert_array_equal(
+        actual, output_window_reference(args, initial, 256, 17, output_base)
+    )
+    assert calls
+    assert [np.asarray(x).tobytes(order="C") for x in args] == before
+
+
+@pytest.mark.parametrize("choose_sc", [False, True])
+@pytest.mark.parametrize("empty_partition", [False, True])
+def test_branch_output_only_is_local_with_global_input_references(
+    core_calls, monkeypatch, choose_sc, empty_partition
+):
+    args = inputs(273, [0, 0, 0] if empty_partition else [0, 3, 131, 273])
+    if empty_partition:
+        args = (
+            *args[:2],
+            jnp.full_like(args[2], -1),
+            jnp.zeros_like(args[3]),
+            *args[4:],
+        )
+    initial = jnp.full_like(args[0], 13)
+    original = adaptive._write_sc_chunk if choose_sc else adaptive._write_tc_chunk
+    observed = []
+
+    def inspect(arrays, cache, *params, **kwargs):
+        output = params[0] if choose_sc else params[1]
+        assert arrays is global_arrays and cache is args[5]
+        if not choose_sc:
+            assert params[0] is args[6]
+        observed.append((len(output), kwargs["output_base"]))
+        return original(arrays, cache, *params, **kwargs)
+
+    def sc(query, gate, blocks, lengths, table, cache, **kwargs):
+        raw = (query.astype(jnp.float32) + table[:, :1, None]).astype(query.dtype)
+        return tc._gate_output(raw, gate, lengths), cache
+
+    monkeypatch.setattr(adaptive, "sc_chunk_size", lambda *args, **kwargs: 8)
+    monkeypatch.setattr(adaptive, "sc_grouped_attention", sc)
+    name = "_write_sc_chunk" if choose_sc else "_write_tc_chunk"
+    monkeypatch.setattr(adaptive, name, inspect)
+    global_arrays = args[:5]
+    with jax.disable_jit():
+        actual = adaptive._write_chunk(
+            global_arrays,
+            args[5],
+            args[6],
+            initial,
+            17,
+            256,
+            jnp.array(choose_sc),
+            initial_window=jnp.full((256, *args[0].shape[1:]), 19, args[0].dtype),
+            kv_heads=2,
+            ratio=4,
+            kv_tile=128,
+        )
+    wanted = np.asarray(initial).copy()
+    local_initial = jnp.full((256, *args[0].shape[1:]), 19, args[0].dtype)
+    wanted[17:] = output_window_reference(args, local_initial, 17, 256, 17)
+    if empty_partition:
+        # The original aligned TC and SC writers zero inactive rows.
+        wanted[17:] = 0
+    np.testing.assert_array_equal(actual, wanted)
+    assert observed == [(256, 17)]
+
+
+def test_output_origin_wrong_global_input_offset_is_rejected(core_calls):
+    args = inputs(273, [0, 3, 131, 273])
+    initial = jnp.full((128, 4, 128), 13, jnp.bfloat16)
+    wrong = (jnp.roll(args[0], 17, axis=0), *args[1:])
+    with jax.disable_jit():
+        actual = adaptive._ragged_tc_write(
+            wrong[:5],
+            wrong[5],
+            wrong[6],
+            initial,
+            17,
+            128,
+            output_base=17,
+            kv_heads=2,
+            ratio=4,
+            kv_tile=128,
+        )
+    with pytest.raises(AssertionError):
+        np.testing.assert_array_equal(
+            actual, output_window_reference(args, initial, 17, 128, 17)
+        )
+
+
+def test_jit_dynamic_output_origin_keeps_global_inputs_and_untouched_rows(core_calls):
+    args = inputs(385, [0, 3, 3, 131, 273, 385, 385])
+    initial = jnp.full((200, 4, 128), 13, jnp.bfloat16)
+    before = [np.asarray(x).tobytes(order="C") for x in args]
+    compiled = jax.jit(
+        lambda offset, output_base: adaptive._ragged_tc_write(
+            args[:5],
+            args[5],
+            args[6],
+            initial,
+            offset,
+            128,
+            output_base=output_base,
+            kv_heads=2,
+            ratio=4,
+            kv_tile=128,
+        )
+    )
+    for offset, output_base in [(17, 0), (17, 17), (17, 8), (17, 64), (129, 129)]:
+        actual = compiled(jnp.int32(offset), jnp.int32(output_base))
+        np.testing.assert_array_equal(
+            actual, output_window_reference(args, initial, offset, 128, output_base)
+        )
+    assert [np.asarray(x).tobytes(order="C") for x in args] == before
+
+
+@pytest.mark.parametrize("choose_sc", [False, True])
+def test_explicit_initial_window_preserves_unwritten_bytes_and_global_outside(
+    monkeypatch, choose_sc
+):
+    args = inputs(273, [0, 3, 131, 273])
+    arrays = args[:5]
+    output = jnp.full_like(args[0], 13)
+    window = jnp.full((128, *args[0].shape[1:]), 19, args[0].dtype)
+    before = [np.asarray(x).tobytes(order="C") for x in (*args, output, window)]
+    values = np.asarray(expected(args))
+    seen = []
+
+    def write(actual_arrays, cache, *params, **kwargs):
+        assert actual_arrays is arrays and cache is args[5]
+        if choose_sc:
+            local, offset, size = params
+        else:
+            starts, local, offset, size = params
+            assert starts is args[6]
+        assert local is window
+        assert offset == kwargs["output_base"] == 17 and size == 128
+        seen.append(True)
+        # Independent partial writer: deliberately leave local row zero untouched.
+        return local.at[1:].set(values[18:145])
+
+    name = "_write_sc_chunk" if choose_sc else "_write_tc_chunk"
+    monkeypatch.setattr(adaptive, name, write)
+    with jax.disable_jit():
+        actual = adaptive._write_chunk(
+            arrays,
+            args[5],
+            args[6],
+            output,
+            17,
+            128,
+            jnp.array(choose_sc),
+            initial_window=window,
+            kv_heads=2,
+            ratio=4,
+            kv_tile=128,
+        )
+    wanted = np.asarray(output).copy()
+    wanted[17] = np.asarray(window)[0]
+    wanted[18:145] = values[18:145]
+    np.testing.assert_array_equal(actual, wanted)
+    assert seen == [True]
+    assert [np.asarray(x).tobytes(order="C") for x in (*args, output, window)] == before
+
+
+@pytest.mark.parametrize("choose_sc", [False, True])
+def test_public_zero_initial_windows_cover_full_chunks_and_tail_once(
+    core_calls, monkeypatch, choose_sc
+):
+    args = inputs(273, [0, 3, 3, 131, 273, 273])
+    arrays = args[:5]
+    original = adaptive._write_chunk
+    observed = []
+
+    def inspect(actual_arrays, cache, starts, output, offset, size, choose, **kwargs):
+        assert all(a is b for a, b in zip(actual_arrays, arrays))
+        assert starts is args[6] and cache is args[5]
+        window = kwargs["initial_window"]
+        assert window.shape == (size, *args[0].shape[1:])
+        assert window.dtype == args[0].dtype
+        np.testing.assert_array_equal(window, 0)
+        np.testing.assert_array_equal(output[offset : offset + size], 0)
+        observed.append((int(offset), size))
+        return original(
+            actual_arrays, cache, starts, output, offset, size, choose, **kwargs
+        )
+
+    def sc(query, gate, blocks, lengths, table, cache, **kwargs):
+        raw = (query.astype(jnp.float32) + table[:, :1, None]).astype(query.dtype)
+        return tc._gate_output(raw, gate, lengths), cache
+
+    # Small CPU schedule only; real helpers retain global source coordinates.
+    monkeypatch.setattr(adaptive, "PREFILL_DISPATCH_CHUNK_QUERIES", 128)
+    monkeypatch.setattr(
+        adaptive, "is_supported_by_adaptive_prefill", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        adaptive, "get_sparse_prefill_tiles", lambda *a, **k: (128, 128)
+    )
+    monkeypatch.setattr(adaptive, "_paired_working_set", lambda *a, **k: 0)
+    monkeypatch.setattr(adaptive, "prefill_vmem_limit", lambda: 1)
+    monkeypatch.setattr(adaptive, "sc_chunk_size", lambda *a, **k: 8)
+    monkeypatch.setattr(adaptive, "prefill_cost_model", lambda *a, **k: work_model())
+    monkeypatch.setattr(
+        adaptive, "_select_sc_for_full_chunks", lambda *a: jnp.full(2, choose_sc)
+    )
+    monkeypatch.setattr(
+        adaptive, "_select_sc_for_tail", lambda *a: jnp.array(choose_sc)
+    )
+    monkeypatch.setattr(adaptive, "_write_chunk", inspect)
+    monkeypatch.setattr(adaptive, "sc_grouped_attention", sc)
+    before = [np.asarray(x).tobytes(order="C") for x in args]
+    with jax.disable_jit():
+        actual, cache = adaptive.adaptive_prefill(*args, kv_heads=2, ratio=4)
+    np.testing.assert_array_equal(actual, expected(args))
+    assert observed == [(0, 128), (128, 128), (256, 17)]
+    assert cache is args[5]
+    assert [np.asarray(x).tobytes(order="C") for x in args] == before
+
+
+def test_explicit_window_jit_dynamic_global_offset(core_calls, monkeypatch):
+    args = inputs(385, [0, 3, 3, 131, 273, 385, 385])
+    output = jnp.full_like(args[0], 13)
+    window = jnp.full((128, *args[0].shape[1:]), 19, args[0].dtype)
+
+    def sc(query, gate, blocks, lengths, table, cache, **kwargs):
+        raw = (query.astype(jnp.float32) + table[:, :1, None]).astype(query.dtype)
+        return tc._gate_output(raw, gate, lengths), cache
+
+    monkeypatch.setattr(adaptive, "sc_chunk_size", lambda *a, **k: 8)
+    monkeypatch.setattr(adaptive, "sc_grouped_attention", sc)
+    before = [np.asarray(x).tobytes(order="C") for x in (*args, output, window)]
+    compiled = jax.jit(
+        lambda offset: adaptive._write_chunk(
+            args[:5],
+            args[5],
+            args[6],
+            output,
+            offset,
+            128,
+            jnp.array(False),
+            initial_window=window,
+            kv_heads=2,
+            ratio=4,
+            kv_tile=128,
+        )
+    )
+    for offset in (17, 129):
+        actual = compiled(jnp.int32(offset))
+        wanted = np.asarray(output).copy()
+        wanted[offset : offset + 128] = output_window_reference(
+            args, window, offset, 128, offset
+        )
+        np.testing.assert_array_equal(actual, wanted)
+    assert [np.asarray(x).tobytes(order="C") for x in (*args, output, window)] == before

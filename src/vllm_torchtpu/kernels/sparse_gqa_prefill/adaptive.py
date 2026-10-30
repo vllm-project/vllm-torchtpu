@@ -147,6 +147,9 @@ def adaptive_prefill(
             i * PREFILL_DISPATCH_CHUNK_QUERIES,
             PREFILL_DISPATCH_CHUNK_QUERIES,
             choose,
+            initial_window=jnp.zeros(
+                (PREFILL_DISPATCH_CHUNK_QUERIES, *q.shape[1:]), dtype=q.dtype
+            ),
             kv_heads=kv_heads,
             ratio=ratio,
             kv_tile=kv_tile,
@@ -183,6 +186,7 @@ def adaptive_prefill(
             offset,
             tail,
             choose,
+            initial_window=jnp.zeros((tail, *q.shape[1:]), dtype=q.dtype),
             tail=True,
             kv_heads=kv_heads,
             ratio=ratio,
@@ -291,6 +295,7 @@ def _ragged_tc_write(
     offset,
     size,
     *,
+    output_base=0,
     kv_heads: int,
     ratio: int,
     kv_tile: int,
@@ -313,6 +318,7 @@ def _ragged_tc_write(
         kv_tile=kv_tile,
         k_scale=1.0,
         v_scale=1.0,
+        output_base=output_base,
     )
 
 
@@ -564,11 +570,16 @@ def _write_chunk(
     size,
     choose,
     *,
+    initial_window,
     tail=False,
     kv_heads: int,
     ratio: int,
     kv_tile: int,
 ):
+    """Write one disjoint window, with its initial value supplied by the caller."""
+    if size == 0:
+        return output
+
     def tc(output):
         return _write_tc_chunk(
             arrays,
@@ -578,6 +589,7 @@ def _write_chunk(
             offset,
             size,
             tail=tail,
+            output_base=offset,
             kv_heads=kv_heads,
             ratio=ratio,
             kv_tile=kv_tile,
@@ -591,12 +603,14 @@ def _write_chunk(
             offset,
             size,
             tail=tail,
+            output_base=offset,
             kv_heads=kv_heads,
             ratio=ratio,
             kv_tile=kv_tile,
         )
 
-    return lax.cond(choose, sc, tc, output)
+    chunk_output = lax.cond(choose, sc, tc, initial_window)
+    return lax.dynamic_update_slice_in_dim(output, chunk_output, offset, axis=0)
 
 
 def _write_tc_chunk(
@@ -608,6 +622,7 @@ def _write_tc_chunk(
     size,
     *,
     tail=False,
+    output_base=0,
     kv_heads: int,
     ratio: int,
     kv_tile: int,
@@ -643,7 +658,9 @@ def _write_tc_chunk(
             ratio=ratio,
             kv_tile=kv_tile,
         )[:size]
-        return lax.dynamic_update_slice_in_dim(output, result, offset, axis=0)
+        return lax.dynamic_update_slice_in_dim(
+            output, result, offset - output_base, axis=0
+        )
 
     # Align only one request-local Q256 tile directly into the final
     # output. Do not retain full-chunk Q/gate copies and a separate
@@ -658,6 +675,7 @@ def _write_tc_chunk(
             out,
             offset,
             size,
+            output_base=output_base,
             kv_heads=kv_heads,
             ratio=ratio,
             kv_tile=kv_tile,
@@ -674,6 +692,7 @@ def _write_sc_chunk(
     size,
     *,
     tail=False,
+    output_base=0,
     kv_heads: int,
     ratio: int,
     kv_tile: int,
@@ -698,7 +717,9 @@ def _write_sc_chunk(
             query_group=8,
             tile_k=256,
         )
-        return lax.dynamic_update_slice_in_dim(output, result, start, axis=0)
+        return lax.dynamic_update_slice_in_dim(
+            output, result, start - output_base, axis=0
+        )
 
     if size // chunk:
         output = lax.fori_loop(0, size // chunk, micro, output)
@@ -725,7 +746,9 @@ def _write_sc_chunk(
             query_group=8,
             tile_k=256,
         )
-        output = lax.dynamic_update_slice_in_dim(output, result[:live], start, axis=0)
+        output = lax.dynamic_update_slice_in_dim(
+            output, result[:live], start - output_base, axis=0
+        )
     return output
 
 
