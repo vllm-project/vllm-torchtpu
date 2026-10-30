@@ -495,6 +495,11 @@ def cos_sin_lanes(
     return _cos_sin_lanes(cos_sin, rotary_dim=cos_sin.shape[-1], inverse=inverse)
 
 
+def rope_lanes(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+    """`_rope_body`'s f32 rotation of ``(tokens, LANE)`` rows."""
+    return x * cos + _rotate_gptj(x) * sin
+
+
 def qnorm_rope_head(
     x: jax.Array, cos: jax.Array, sin: jax.Array, *, eps: float
 ) -> jax.Array:
@@ -1087,18 +1092,12 @@ def _quantized_matmul_heads_kernel(
     table_hbm,
     w_hbm,
     ws_hbm,
-    o_hbm,
-    xq_ref,
-    xs_ref,
-    w_buf,
-    ws_buf,
-    o_buf,
-    table_buf,
     *refs,
     num_row_blocks: int,
     num_col_blocks: int,
     head_fn: Callable[..., jax.Array],
     row_fn: Callable[[jax.Array], tuple[jax.Array, ...]],
+    kv_fn: Callable[..., jax.Array] | None,
 ):
     """One (weight tile j, row block i) step of `quantized_matmul_heads`.
 
@@ -1106,7 +1105,15 @@ def _quantized_matmul_heads_kernel(
     row block while the next tile streams in. On its first visit (j == 0) row
     block i is quantized into the resident x_q, and its table rows, gathered
     during the step before, go through ``row_fn`` into resident row values.
+    With ``kv_fn``, the same visit also rewrites row block i of kv's last lane
+    block in place with ``kv_fn`` of those row values.
     """
+    if kv_fn is None:
+        o_hbm, *refs = refs
+    else:  # the kv input is aliased to kv_hbm, its output
+        _, o_hbm, kv_hbm, *refs = refs
+        *refs, kv_buf, kv_sems = refs
+    xq_ref, xs_ref, w_buf, ws_buf, o_buf, table_buf, *refs = refs
     *row_refs, w_sems, o_sems, table_sems = refs
     s = pl.program_id(0)
     j = s // num_row_blocks
@@ -1149,6 +1156,13 @@ def _quantized_matmul_heads_kernel(
                 table_sems.at[sl],
             ).start()
 
+    def kv_copy(block, sl, *, write):
+        span = pl.ds(pl.multiple_of(block * block_rows, block_rows), block_rows)
+        hbm = kv_hbm.at[span, pl.ds(kv_hbm.shape[1] - LANE, LANE)]
+        if write:
+            return pltpu.make_async_copy(kv_buf.at[sl], hbm, kv_sems.at[1, sl])
+        return pltpu.make_async_copy(hbm, kv_buf.at[sl], kv_sems.at[0, sl])
+
     def wait_table_rows(sl):
         # One wait for the bytes of every row copy into the slot.
         whole = table_buf.at[sl]
@@ -1159,6 +1173,8 @@ def _quantized_matmul_heads_kernel(
         for copy in weight_copies(0, 0):
             copy.start()
         gather_table_rows(0, 0)
+        if kv_fn is not None:
+            kv_copy(0, 0, write=False).start()
 
     @pl.when(i == 0)
     def _():
@@ -1187,9 +1203,23 @@ def _quantized_matmul_heads_kernel(
         @pl.when(i + 1 < num_row_blocks)
         def _():
             gather_table_rows(i + 1, (i + 1) % 2)
+            if kv_fn is not None:
+                # The slot's last user, block i - 1, has to be back in HBM.
+                @pl.when(i >= 1)
+                def _():
+                    kv_copy(i - 1, (i + 1) % 2, write=True).wait()
 
-        for ref, value in zip(row_refs, row_fn(table_buf[i % 2])):
+                kv_copy(i + 1, (i + 1) % 2, write=False).start()
+
+        values = row_fn(table_buf[i % 2])
+        for ref, value in zip(row_refs, values):
             ref[rows, :] = value
+        if kv_fn is not None:
+            kv_slot = i % 2
+            kv_copy(i, kv_slot, write=False).wait()
+            kv = kv_buf[kv_slot].astype(jnp.float32)
+            kv_buf[kv_slot] = kv_fn(kv, *values).astype(kv_buf.dtype)
+            kv_copy(i, kv_slot, write=True).start()
 
     # The output buffer this step fills left for HBM two steps ago.
     @pl.when(s >= 2)
@@ -1232,6 +1262,9 @@ def _quantized_matmul_heads_kernel(
         for sl in (1 - o_slot, o_slot) if steps > 1 else (o_slot,):
             for copy in out_copies(sl):
                 copy.wait()
+        if kv_fn is not None:
+            for block in range(max(0, num_row_blocks - 2), num_row_blocks):
+                kv_copy(block, block % 2, write=True).wait()
 
 
 def quantized_matmul_heads_supported(m: int, k: int, n: int, head_dim: int) -> bool:
@@ -1258,8 +1291,10 @@ def quantized_matmul_heads(
     row_fn: Callable[[jax.Array], tuple[jax.Array, ...]],
     indices: jax.Array,
     table: jax.Array,
+    kv: jax.Array | None = None,
+    kv_fn: Callable[..., jax.Array] | None = None,
     interpret: bool = False,
-) -> jax.Array:
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """``head_fn`` on each head of ``xla_quantized_matmul(x, w_q, w_scale)``.
 
     The bf16 product of an 8-bit float ``w_q`` is split into heads of
@@ -1268,6 +1303,10 @@ def quantized_matmul_heads(
     back to bf16. Returns ``[m, n // head_dim, head_dim]`` bf16, written
     straight from VMEM, so the product never round-trips through HBM before
     ``head_fn`` reads it.
+
+    With ``kv`` (``[m, c * LANE]``), also returns ``kv`` with its last lane
+    block replaced by ``kv_fn(block, *row_fn(table[indices]))`` in f32,
+    rounded back; ``kv`` is donated.
     """
     m, k = x.shape
     n = w_q.shape[1]
@@ -1285,6 +1324,31 @@ def quantized_matmul_heads(
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     out_dtype = jnp.bfloat16
+    # Pinned to HBM, so XLA neither prefetches them nor evicts the output.
+    out_shape = pltpu.HBM((m, n // head_dim, head_dim), out_dtype)
+    operands = [
+        indices.astype(jnp.int32),
+        x,
+        pltpu.with_memory_space_constraint(table, pltpu.HBM),
+        pltpu.with_memory_space_constraint(w_q, pltpu.HBM),
+        pltpu.with_memory_space_constraint(w_scale.reshape(1, n), pltpu.HBM),
+    ]
+    in_specs = [pl.BlockSpec((block_rows, k), x_block), hbm, hbm, hbm]
+    out_specs = hbm
+    kv_scratch = []
+    input_output_aliases = {}
+    if kv is not None:
+        assert kv_fn is not None
+        assert kv.shape[0] == m and kv.ndim == 2 and kv.shape[1] % LANE == 0
+        input_output_aliases = {len(operands): 1}
+        operands.append(pltpu.with_memory_space_constraint(kv, pltpu.HBM))
+        in_specs.append(hbm)
+        out_shape = (out_shape, pltpu.HBM(kv.shape, kv.dtype))
+        out_specs = (hbm, hbm)
+        kv_scratch = [
+            pltpu.VMEM((2, block_rows, LANE), kv.dtype),
+            pltpu.SemaphoreType.DMA((2, 2)),
+        ]
     return pl.pallas_call(
         functools.partial(
             _quantized_matmul_heads_kernel,
@@ -1292,14 +1356,14 @@ def quantized_matmul_heads(
             num_col_blocks=num_col_blocks,
             head_fn=head_fn,
             row_fn=row_fn,
+            kv_fn=None if kv is None else kv_fn,
         ),
-        # Pinned to HBM, so XLA neither prefetches them nor evicts the output.
-        out_shape=pltpu.HBM((m, n // head_dim, head_dim), out_dtype),
+        out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             grid=(num_row_blocks * num_col_blocks,),
-            in_specs=[pl.BlockSpec((block_rows, k), x_block), hbm, hbm, hbm],
-            out_specs=hbm,
+            in_specs=in_specs,
+            out_specs=out_specs,
             scratch_shapes=[
                 pltpu.VMEM((m, k), w_q.dtype),
                 pltpu.VMEM((m, _SCALE_LANES), jnp.float32),
@@ -1314,8 +1378,10 @@ def quantized_matmul_heads(
                 pltpu.SemaphoreType.DMA((2, 2)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
+                *kv_scratch,
             ],
         ),
+        input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=_heads_vmem_bytes(
@@ -1324,13 +1390,7 @@ def quantized_matmul_heads(
         ),
         name="quantized_matmul_heads",
         interpret=interpret,
-    )(
-        indices.astype(jnp.int32),
-        x,
-        pltpu.with_memory_space_constraint(table, pltpu.HBM),
-        pltpu.with_memory_space_constraint(w_q, pltpu.HBM),
-        pltpu.with_memory_space_constraint(w_scale.reshape(1, n), pltpu.HBM),
-    )
+    )(*operands)
 
 
 def _heads_vmem_bytes(m, k, rows, cols, x_dtype, w_dtype, row_shapes) -> int:

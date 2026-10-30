@@ -106,6 +106,35 @@ def test_quantized_matmul_heads_matches_unfused(
     )
 
 
+@pytest.mark.parametrize("m,block_rows", [(128, 32), (64, 64)])
+def test_quantized_matmul_heads_rotates_kv(monkeypatch, m, block_rows):
+    monkeypatch.setattr(rope, "HEADS_BLOCK_ROWS", block_rows)
+    monkeypatch.setattr(rope, "HEADS_MIN_ROWS", 32)
+    k, n, head_dim = 128, 8192, 512
+    x, w_q, w_s, positions, cos_sin_cache = _operands(m, k, n)
+    kv = jax.random.normal(jax.random.key(7), (m, head_dim), jnp.float32)
+    kv = kv.astype(jnp.bfloat16)
+    want_q = _fused(x, w_q, w_s, positions, cos_sin_cache, head_dim, interpret=True)
+    got_q, got_kv = quantized_matmul_heads(
+        x,
+        w_q,
+        w_s,
+        head_dim,
+        functools.partial(rope.qnorm_rope_head, eps=EPS),
+        rope.cos_sin_lanes,
+        positions,
+        cos_sin_cache,
+        kv=kv,
+        kv_fn=rope.rope_lanes,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(_as_bits(got_q), _as_bits(want_q))
+    cos, sin = rope.cos_sin_lanes(cos_sin_cache[positions])
+    tail = rope.rope_lanes(kv[:, -128:].astype(jnp.float32), cos, sin)
+    want_kv = kv.at[:, -128:].set(tail.astype(jnp.bfloat16))
+    np.testing.assert_array_equal(_as_bits(got_kv), _as_bits(want_kv))
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("m", [128, 1024])
 def test_quantized_matmul_heads_is_bit_identical_on_tpu(m):

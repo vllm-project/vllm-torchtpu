@@ -99,23 +99,29 @@ def _wq_b_qnorm_rope_jax(
     qr: jax.Array,
     w_q: jax.Array,
     w_s: jax.Array,
+    kv: jax.Array,
     positions: jax.Array,
     cos_sin_cache: jax.Array,
     *,
     eps: float,
     head_dim: int,
-) -> jax.Array:
+) -> tuple[jax.Array, jax.Array]:
     """`wq_b` then `_qnorm_rope_jax`, with the norm and RoPE done on the
-    projection's output tiles in VMEM."""
-    return rope_kernel.quantized_matmul_heads(
-        qr,
-        w_q,
-        w_s,
-        head_dim,
-        functools.partial(rope_kernel.qnorm_rope_head, eps=eps),
-        rope_kernel.cos_sin_lanes,
-        positions,
-        cos_sin_cache,
+    projection's output tiles in VMEM, and kv roped on the same cos/sin rows."""
+    return cast(
+        tuple[jax.Array, jax.Array],
+        rope_kernel.quantized_matmul_heads(
+            qr,
+            w_q,
+            w_s,
+            head_dim,
+            functools.partial(rope_kernel.qnorm_rope_head, eps=eps),
+            rope_kernel.cos_sin_lanes,
+            positions,
+            cos_sin_cache,
+            kv=kv,
+            kv_fn=rope_kernel.rope_lanes,
+        ),
     )
 
 
@@ -166,10 +172,11 @@ def _make_fake_qnorm_rope(head_dim: int):
 
 
 def _make_fake_wq_b_qnorm_rope(head_dim: int):
-    """Abstract implementation: ``[tokens, q_lora_rank]`` -> 3-D."""
+    """Abstract implementation: ``[tokens, q_lora_rank]`` -> 3-D, and kv."""
 
-    def _fake(qr, w_q, w_s, positions, cos_sin_cache):
-        return qr.new_empty((qr.shape[0], w_q.shape[1] // head_dim, head_dim))
+    def _fake(qr, w_q, w_s, kv, positions, cos_sin_cache):
+        q = qr.new_empty((qr.shape[0], w_q.shape[1] // head_dim, head_dim))
+        return q, torch.empty_like(kv)
 
     return _fake
 
@@ -608,7 +615,7 @@ class VllmDeepseekV4MLAAttention(
 
     @property
     def wq_b_qnorm_rope_op(self):
-        """`wq_b` fused with `qnorm_rope`, or None where `wq_b` cannot be fused.
+        """`wq_b` fused with `qnorm_rope` and `kv_rope`, or None where it cannot be.
 
         Takes a K-major FP8 `wq_b` with per-channel scales and no bias, on a
         rank whose kernels run unsharded, projected by `_project_q` itself.
@@ -634,7 +641,8 @@ class VllmDeepseekV4MLAAttention(
             eps = float(self.mla_attn.eps)
             head_dim = int(self.mla_attn.head_dim)
             op_name = (
-                f"pallas::deepseek_v4_wq_b_qnorm_rope_e{_name_float(eps)}_d{head_dim}"
+                "pallas::deepseek_v4_wq_b_qnorm_kv_rope"
+                f"_e{_name_float(eps)}_d{head_dim}"
             )
             op = _pallas_op_cache.get(op_name)
             if op is None:
@@ -664,14 +672,14 @@ class VllmDeepseekV4MLAAttention(
         ):
             q, kv = self.qnorm_rope(self._project_q(qr), kv, positions)
         else:
-            q = fused_op(
+            q, kv = fused_op(
                 qr,
                 self.wq_b.weight,
                 self.wq_b.weight_scale,
+                kv,
                 positions,
                 self.mla_attn.rotary_emb.cos_sin_cache,
             )
-            kv = self.kv_rope(kv, positions)
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
