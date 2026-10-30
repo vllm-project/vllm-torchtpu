@@ -1,0 +1,29 @@
+# Qwen3.5-397B-A17B-FP8 on one tpu7x 2x2x1 node (TP8, DP1, EP) with the server settings
+# of the InferenceX AgentX deployment, served on Cloud DevKit. `repo` is relative: a scorer
+# arm runs with its own tree as the working directory, so the arm's benchmark config, src/
+# and dry-run shim are read from that tree on any host.
+[target]
+adapter = "vllm_torchtpu"
+role = "baseline"
+repo = "."
+kernel_dirs = ["src/vllm_torchtpu/kernels", "src/vllm_torchtpu/layers"]
+source_dirs = ["src"]
+
+[target.env]
+PYTHONPATH = "src"
+# The dry run perfkit reads the serve command from needs a findable vllm package.
+PATH = "scripts/kernel_evolve/qwen35_397b_agentx/shim/bin:/usr/local/bin:/usr/bin:/bin"
+
+[target.cdk]
+# A copy of the CI image vllm-torchtpu:ce8fad9af615fb5e5557c4d8eaa2f0dee7d69501-v0.32.0,
+# built from the golden commit, in a registry with no cleanup policy; same digest.
+# jax 0.11.2, libtpu 0.0.50.
+image = "us-central1-docker.pkg.dev/cloud-tpu-inference-test/forge-arms/vllm-torchtpu@sha256:225646483eb5c468e66588a65493c692cccc397766c815ca611130f2a7f97ef3"
+topology = "2x2x1"
+timeout_minutes = 240
+
+[target.cdk.env]
+# The cluster's own copy of the checkpoint, which the AgentX recipe copies too. With
+# MODEL_URI the server streams it, and a layer arm's loader filter fetches only the
+# layers its cut keeps.
+MODEL_URI = "gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.5-397B-A17B-FP8"

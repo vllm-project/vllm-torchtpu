@@ -1,0 +1,33 @@
+# Serve configs for scorers/serve_e2e.py (perfkit/scorer_configs.py). The campaign freezes
+# `qwen3.5-397b-fp8-tp8-dp1-ep-agentx@layers`, the variant the scorer derives from this one:
+# the model cut to 4 of its 60 layers (3 Gated DeltaNet + 1 full-attention layer, every
+# expert kept), served on one tpu7x 2x2x1 node through Cloud DevKit, and scored on the
+# step-weighted device op time of the AgentX replay's own step shapes (the cells below).
+[configs."qwen3.5-397b-fp8-tp8-dp1-ep-agentx"]
+config = "qwen3.5-397b-fp8-tp8-dp1-ep-agentx"
+target = "vllm-torchtpu-qwen35-agentx"
+cell = "7f7b02900fa6"
+remote = "cdk"
+# Where a layer arm reads the model's config.json to plan its cut; the pods serve the
+# same copy (the target's MODEL_URI).
+weights = "gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.5-397B-A17B-FP8"
+# The step mix of golden's AgentX job (infx-qwen35-agentx, CLIENT_CONCURRENCIES=64,
+# 3600 s), from `perfkit mix --job j-094ffbf0-e12d-4011-b1dc --concurrency 64 --toml`
+# with the server's literal --max-num-batched-tokens=16384 (the recipe passes it as a
+# shell variable the mix cannot read).
+cells_source = "j-094ffbf0-e12d-4011-b1dc at concurrency 64"
+cells = [
+  {name = "dec-k1-b64-l74k", kind = "decode", engines = 1, batch = 64, context = 76037, steps = 6783.7},
+  {name = "dec-k1-b16-l85k", kind = "decode", engines = 1, batch = 16, context = 86552, steps = 4413.7},
+  {name = "dec-k1-b12-l76k", kind = "decode", engines = 1, batch = 12, context = 77739, steps = 4410.2},
+  {name = "dec-k1-b48-l92k", kind = "decode", engines = 1, batch = 48, context = 94593, steps = 2963.7},
+  {name = "dec-k1-b8-l77k", kind = "decode", engines = 1, batch = 8, context = 78876, steps = 1866.4},
+  {name = "dec-k1-b4-l53k", kind = "decode", engines = 1, batch = 4, context = 54625, steps = 1708.0},
+  {name = "dec-k1-b12-l100k", kind = "decode", engines = 1, batch = 12, context = 102127, steps = 1595.5},
+  {name = "dec-k1-b48-l89k", kind = "decode", engines = 1, batch = 48, context = 91509, steps = 770.5},
+  {name = "mix-k1-b64-l78k-p64k", kind = "mixed", engines = 1, batch = 64, context = 79799, steps = 1715.7, prefix = 65328, chunk = 16332},
+  {name = "mix-k1-b64-l78k-p32k", kind = "mixed", engines = 1, batch = 64, context = 79799, steps = 1023.0, prefix = 32664, chunk = 16332},
+  {name = "mix-k1-b64-l78k-p0", kind = "mixed", engines = 1, batch = 64, context = 79799, steps = 1022.2, prefix = 0, chunk = 16332},
+  {name = "mix-k1-b64-l78k-p16k", kind = "mixed", engines = 1, batch = 64, context = 79799, steps = 953.0, prefix = 16332, chunk = 16332},
+  {name = "mix-k1-b64-l78k-p112k", kind = "mixed", engines = 1, batch = 64, context = 79799, steps = 604.6, prefix = 114324, chunk = 16332},
+]

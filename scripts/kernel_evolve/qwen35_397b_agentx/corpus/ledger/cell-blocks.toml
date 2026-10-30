@@ -1,0 +1,269 @@
+# Cell 7f7b02900fa6: qwen3.5-397b-fp8-tp8-dp1-ep-agentx on tpu7x 2x2x1 (TP8 EP), scored on layer runs
+# of the InferenceX AgentX replay's step cells. Rules written by scoping run zsbz502r from golden's
+# full-model phased capture (cdk job j-fd3b7b90-de48-405e-9a86); first match wins.
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "attention: RPAm (batched RPA, chunk with cached prefix)"
+family = "RPAm-.*"
+why = "the batched ragged paged attention kernel's mixed/prefill mode over the paged fp8 KV cache (src/vllm_torchtpu/kernels/experimental/batched_rpa)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "attention: RPAd (batched RPA, decode)"
+family = "RPAd-.*"
+why = "the batched ragged paged attention kernel's decode mode (src/vllm_torchtpu/kernels/experimental/batched_rpa)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "attention: RPA metadata schedule"
+family = "rpa_metadata_schedule"
+why = "the batched RPA schedule kernel (src/vllm_torchtpu/kernels/experimental/batched_rpa/schedule.py)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "MoE grouped matmul: gmm_v2"
+family = "gmm_v.*"
+why = "the routed experts' gate_up and down grouped matmuls (pallas gmm_v2, src/vllm_torchtpu/kernels/megablox)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "MoE EP combine: sc_ragged_gather_reduce_v3"
+family = "sc_ragged_gather_reduce_v.*"
+why = "SparseCore combine of the experts' outputs (src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v3.py)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "MoE EP dispatch: sc_ragged_gather_v2"
+family = "sc_ragged_gather_v.*"
+why = "SparseCore gather of the tokens each local expert reads (src/vllm_torchtpu/kernels/sparse_core/ragged_gather_v2.py)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "MoE SparseCore other"
+category = "moe_sparsecore"
+why = "every other SparseCore op of the MoE dispatch and combine"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "MoE routing"
+family = "router_topk"
+why = "the router top-k kernel (src/vllm_torchtpu/kernels/router_topk.py)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "MoE routing"
+category = "moe_routing"
+why = "the sorts and permutes that order tokens by expert"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "linear attention: GDN conv1d kernels"
+family = "fused_convd_gdn.*"
+why = "the Gated DeltaNet fused conv1d + recurrence kernels (src/vllm_torchtpu/kernels/gdn/v3)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "linear attention: other GDN ops"
+category = "linear_attention"
+why = "every other Gated DeltaNet op"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "collective all_reduce"
+family = "all-reduce.*"
+why = "the TP all-reduces XLA emits after attention and MoE"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "SparseCore offload waits"
+family = "async-(start|done|update)|gather_offload_async_.*"
+why = "waits on work offloaded to SparseCore: the hierarchical all-reduce and all-gather offloads"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "collective other"
+category = "collective"
+why = "every other collective"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "XLA matmul fusions"
+category = "matmul"
+why = "the dense projections and other XLA fusions"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "XLA quantize fusions"
+category = "quantize"
+why = "fp8 quantize and dequantize fusions"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "XLA norm and activation fusions"
+category = "norm_act"
+why = "norms, activations and rotary embedding"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "XLA data movement"
+category = "data_movement"
+why = "copies, slices, pads, concatenates, gathers and scatters"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "decode"
+block = "XLA other ops"
+category = "other"
+why = "every op no other rule claims"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "attention: RPAm (batched RPA, chunk with cached prefix)"
+family = "RPAm-.*"
+why = "the batched ragged paged attention kernel's mixed/prefill mode over the paged fp8 KV cache (src/vllm_torchtpu/kernels/experimental/batched_rpa)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "attention: RPAd (batched RPA, decode)"
+family = "RPAd-.*"
+why = "the batched ragged paged attention kernel's decode mode (src/vllm_torchtpu/kernels/experimental/batched_rpa)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "attention: RPA metadata schedule"
+family = "rpa_metadata_schedule"
+why = "the batched RPA schedule kernel (src/vllm_torchtpu/kernels/experimental/batched_rpa/schedule.py)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "MoE grouped matmul: gmm_v2"
+family = "gmm_v.*"
+why = "the routed experts' gate_up and down grouped matmuls (pallas gmm_v2, src/vllm_torchtpu/kernels/megablox)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "MoE EP combine: sc_ragged_gather_reduce_v3"
+family = "sc_ragged_gather_reduce_v.*"
+why = "SparseCore combine of the experts' outputs (src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v3.py)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "MoE EP dispatch: sc_ragged_gather_v2"
+family = "sc_ragged_gather_v.*"
+why = "SparseCore gather of the tokens each local expert reads (src/vllm_torchtpu/kernels/sparse_core/ragged_gather_v2.py)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "MoE SparseCore other"
+category = "moe_sparsecore"
+why = "every other SparseCore op of the MoE dispatch and combine"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "MoE routing"
+family = "router_topk"
+why = "the router top-k kernel (src/vllm_torchtpu/kernels/router_topk.py)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "MoE routing"
+category = "moe_routing"
+why = "the sorts and permutes that order tokens by expert"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "linear attention: GDN conv1d kernels"
+family = "fused_convd_gdn.*"
+why = "the Gated DeltaNet fused conv1d + recurrence kernels (src/vllm_torchtpu/kernels/gdn/v3)"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "linear attention: other GDN ops"
+category = "linear_attention"
+why = "every other Gated DeltaNet op"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "collective all_reduce"
+family = "all-reduce.*"
+why = "the TP all-reduces XLA emits after attention and MoE"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "SparseCore offload waits"
+family = "async-(start|done|update)|gather_offload_async_.*"
+why = "waits on work offloaded to SparseCore: the hierarchical all-reduce and all-gather offloads"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "collective other"
+category = "collective"
+why = "every other collective"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "XLA matmul fusions"
+category = "matmul"
+why = "the dense projections and other XLA fusions"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "XLA quantize fusions"
+category = "quantize"
+why = "fp8 quantize and dequantize fusions"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "XLA norm and activation fusions"
+category = "norm_act"
+why = "norms, activations and rotary embedding"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "XLA data movement"
+category = "data_movement"
+why = "copies, slices, pads, concatenates, gathers and scatters"
+
+[[rule]]
+cell = "7f7b02900fa6"
+phase = "prefill"
+block = "XLA other ops"
+category = "other"
+why = "every op no other rule claims"
