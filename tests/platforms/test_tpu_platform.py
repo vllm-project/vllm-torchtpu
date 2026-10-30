@@ -486,6 +486,45 @@ class TestTpuPlatform:
         else:
             TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize("batched_rpa", [True, False])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_registered_attention_backend_class_sets_the_kv_cache_layout(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        batched_rpa,
+    ):
+        from vllm_torchtpu.layers.adapter import attention_backend
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasBatchedRPAAttentionBackend,
+            PallasMLAttentionBackend,
+        )
+
+        # Only batched RPA lays out HND, so passing shows its layouts were used.
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+        monkeypatch.setattr(attention_backend, "_REGISTERED_BACKENDS", {"tpu_test"})
+        backend = (
+            PallasBatchedRPAAttentionBackend
+            if batched_rpa
+            else PallasMLAttentionBackend
+        )
+        vllm_config.attention_config.backend = SimpleNamespace(
+            name="TPU_TEST", get_class=lambda: backend
+        )
+        vllm_config.model_config.get_head_size = lambda: 128
+
+        if batched_rpa:
+            TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            with pytest.raises(TypeError, match="not a PallasAttentionBackend"):
+                TpuPlatform.check_and_update_config(vllm_config)
+
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(

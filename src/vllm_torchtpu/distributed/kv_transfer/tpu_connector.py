@@ -3249,12 +3249,14 @@ class TPURaidenConnectorWorker:
             )
         interleave = _raiden_dst_interleave_tokens(self.vllm_config)
         page_tokens = int(self.vllm_config.cache_config.block_size)
-        # Every GLM cache row packs at most one 32-bit word's worth of tokens.
-        if page_tokens % interleave or interleave % 4:
+        # SparseCore RoPE packs eight 64-byte tokens per 512-byte row;
+        # TensorCore caches and the DSA indexer pack four tokens per row.
+        min_interleave = 8 if tpu_envs.TPU_SPARSE_MLA_ROPE_LAYOUT == "sparsecore" else 4
+        if page_tokens % interleave or interleave % min_interleave:
             raise ValueError(
                 "destination_cp_kv_cache_interleave_size must be a multiple "
-                f"of 4 that divides the page: interleave={interleave}, "
-                f"page_tokens={page_tokens}"
+                f"of {min_interleave} that divides the page: "
+                f"interleave={interleave}, page_tokens={page_tokens}"
             )
 
     def _admit_raiden_dsv4_kv_cache(self, runner: TPUModelRunner) -> None:
