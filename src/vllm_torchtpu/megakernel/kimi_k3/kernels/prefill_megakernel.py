@@ -3888,7 +3888,7 @@ SCALE = 192.0**-0.5
 SCALE_LOG2 = SCALE * 1.4426950408889634
 
 
-def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, prefixed=False):
+def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, prefixed=False, prefix_tile=None):
     """Causal MLA flash attention over a packed window of ``count``
     sequences, per (head, ``q_tile``-row query tile), with ``tile``-row
     key/value blocks double-buffered from HBM.
@@ -3902,7 +3902,8 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
     one-layer arena (keys ``[1, 3, T, 256]``, values transposed
     ``[1, 3, 128, T]``). Offsets are multiples of 256."""
     if prefixed:
-        layer_ref, q_ref, k_hbm, v_hbm, prefix_k_hbm, prefix_v_hbm, out_ref, k_buf, v_buf, sems = refs
+        (layer_ref, q_ref, k_hbm, v_hbm, prefix_k_hbm, prefix_v_hbm, out_ref, k_buf, v_buf, sems,
+         pk_buf, pv_buf, psems) = refs
     else:
         q_ref, k_hbm, v_hbm, out_ref, k_buf, v_buf, sems = refs
     head, query_block = pl.program_id(0), pl.program_id(1)
@@ -3948,7 +3949,7 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
     if prefixed:
         carry = _prefix_phase(
             carry, q, segment_ref, layer_ref[0], head, first_row, rows, first_row < length,
-            prefix_k_hbm, prefix_v_hbm, k_buf, v_buf, sems, tile=tile, q_tile=q_tile,
+            prefix_k_hbm, prefix_v_hbm, pk_buf, pv_buf, psems, tile=prefix_tile, q_tile=q_tile,
             count=count)
 
     # Blocks [a, b) see every row and need no mask: past the sequence start,
@@ -4493,23 +4494,34 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
         raise ValueError(f"segments must be [{fields} * count]")
     length = jnp.asarray(length, jnp.int32).reshape((1,))
     q_tile, k_tile = _tiles(tokens, tokens, tile)
+    # A window under mla_flash_qtile rows is one query tile when the fragment
+    # loop covers it (at most FRAGMENT rows, or a multiple of it).
+    if (_config().mla_flash_prefix_tiles and tokens < _config().mla_flash_qtile and tokens % 256 == 0
+            and (tokens <= FRAGMENT or tokens % FRAGMENT == 0)):
+        q_tile = tokens
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     scalars = (length, segments.astype(jnp.int32))
     operands = (query, key[None], jnp.swapaxes(value, 1, 2)[None])  # the window as a one-layer arena
     in_specs = (pl.BlockSpec((1, q_tile, 256), lambda h, i, *_: (h, i, 0)), hbm, hbm)
+    # Prefix keys stream in mla_flash_ktile tiles (the arena capacity, not
+    # the window, bounds them) when the capacity divides into them.
+    p_tile = k_tile
+    if (arena is not None and _config().mla_flash_prefix_tiles and arena[0].ndim == 4
+            and arena[0].shape[2] % _config().mla_flash_ktile == 0):
+        p_tile = _config().mla_flash_ktile
     if arena is not None:
         arena_keys, arena_values = arena
         if (arena_keys.ndim != 4 or arena_keys.shape[1:] != (heads, arena_keys.shape[2], 256)
                 or arena_values.shape != (*arena_keys.shape[:2], 128, arena_keys.shape[2])
-                or arena_keys.shape[2] % k_tile):
-            raise ValueError(f"arena must be [L,{heads},C,256] / [L,{heads},128,C] with C a multiple of {k_tile}")
+                or arena_keys.shape[2] % p_tile):
+            raise ValueError(f"arena must be [L,{heads},C,256] / [L,{heads},128,C] with C a multiple of {p_tile}")
         scalars += (jnp.asarray(layer, jnp.int32).reshape((1,)),)
         operands += (arena_keys, arena_values)
         in_specs += (hbm, hbm)
     name = "kimi_mla_flash_prefill_packed" + ("_prefixed" if arena is not None else "")
     return pl.pallas_call(
         functools.partial(_flash_kernel_packed, tile=k_tile, q_tile=q_tile, count=count,
-                          prefixed=arena is not None),
+                          prefixed=arena is not None, prefix_tile=p_tile),
         out_shape=jax.ShapeDtypeStruct((heads, tokens, 128), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalars),
@@ -4520,7 +4532,11 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
                 pltpu.VMEM((2, k_tile, 256), jnp.bfloat16),
                 pltpu.VMEM((2, 128, k_tile), jnp.bfloat16),
                 pltpu.SemaphoreType.DMA((2, 2)),
-            ),
+            ) + ((
+                pltpu.VMEM((2, p_tile, 256), jnp.bfloat16),
+                pltpu.VMEM((2, 128, p_tile), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((2, 2)),
+            ) if arena is not None else ()),
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel"), vmem_limit_bytes=64 * 1024**2,
