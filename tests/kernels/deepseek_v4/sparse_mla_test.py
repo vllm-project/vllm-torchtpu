@@ -355,8 +355,13 @@ class CorrectnessTest(parameterized.TestCase):
         print(f"Max Diff Out: {np.max(diff_out)}")
         np.testing.assert_allclose(out_base, out_agent, rtol=0.1, atol=0.1)
 
-    def test_dense_single_request_chunks(self):
-        """Chunks of one request take the dense path; a mixed chunk does not."""
+    # Chunk 0 holds both requests. With [120, 108] its last block is mixed,
+    # so the gather path takes all of it; with [40, 188] it takes blocks 0
+    # and 1 and blocks 2 and 3 are dense. Chunk 1 holds only request 1 plus
+    # padding (dense), chunk 2 only padding.
+    @parameterized.parameters(([120, 108],), ([40, 188],))
+    def test_dense_blocks(self, q_lens):
+        """Blocks of one request take the dense path; a mixed block does not."""
         topk = 512
         rng = np.random.default_rng(0)
         num_heads = 64
@@ -366,9 +371,7 @@ class CorrectnessTest(parameterized.TestCase):
         batch_size = 2
         chunk_size = 128
 
-        # Chunk 0 mixes both requests (gather path). Chunk 1 holds only
-        # request 1 plus padding, chunk 2 only padding (dense path, grids 0).
-        q_lens = jnp.array([120, 108], dtype=jnp.int32)
+        q_lens = jnp.array(q_lens, dtype=jnp.int32)
         cu_q_lens = jnp.concatenate(
             [jnp.array([0]), jnp.cumulative_sum(q_lens, dtype=jnp.int32)]
         )

@@ -553,11 +553,11 @@ def _attention_kernel(
 # step; every KV page pushed to the MXU serves DENSE_BLOCK_TOKENS *
 # num_q_heads query rows.
 DENSE_BLOCK_TOKENS = 32
-# The dense path reads every KV page up to the chunk's largest selected
+# The dense path reads every KV page up to the block's largest selected
 # position, so its cost grows with the request's compressed length while the
-# gather path's does not. Past this many pages a chunk keeps the gather path.
+# gather path's does not. Past this many pages a block keeps the gather path.
 # Empirical, to be tuned by measurement: by static LLO cycle counts a dense
-# chunk over 8 pages of 256 rows costs about what the gather path measures.
+# block over 8 pages of 256 rows costs about what the gather path measures.
 DENSE_MAX_KV_PAGES = 8
 # KV pages per grid step: the f32 PV output and the running max, sum and
 # accumulator are read and written once per step, whatever its key count.
@@ -790,13 +790,13 @@ def _dense_attention(
     sm_scale: float,
     vmem_limit_bytes: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Runs every dense chunk of the step in one call.
+    """Runs every dense block of the step in one call.
 
-    A chunk of `chunk_size` tokens is dense when its valid tokens all belong
-    to one request and read at most DENSE_MAX_KV_PAGES pages. The grid walks
-    the dense chunks' valid 32-token blocks only. Returns q with those rows
-    attended, and per chunk the token where its gather-path range ends: the
-    chunk's start for a dense chunk, its end otherwise.
+    A 32-token block is eligible when its valid tokens all belong to one
+    request and read at most DENSE_MAX_KV_PAGES pages. In each chunk of
+    `chunk_size` tokens the valid blocks after the last ineligible one are
+    dense, and the grid walks those only. Returns q with their rows
+    attended, and per chunk the token where its gather-path range ends.
     """
     bq_sz = DENSE_BLOCK_TOKENS
     kv_group = DENSE_KV_PAGES_PER_STEP
@@ -819,15 +819,24 @@ def _dense_attention(
     kv_bounds = jnp.max(token_bound.reshape(num_blocks, bq_sz), axis=1)
     block_pages = jnp.maximum(1, cdiv(kv_bounds, page_size))
 
-    chunk_start = jnp.arange(num_chunks) * chunk_size
-    chunk_valid = jnp.clip(num_valid_tokens - chunk_start, 0, chunk_size)
-    chunk_last = chunk_start + jnp.maximum(chunk_valid - 1, 0)
-    one_seq = seq_ids_segment[chunk_start] == seq_ids_segment[chunk_last]
-    chunk_pages = jnp.max(block_pages.reshape(num_chunks, chunk_blocks), axis=1)
-    use_dense = (chunk_valid > 0) & one_seq & (chunk_pages <= max_kv_pages)
-
-    block_valid = jnp.arange(num_blocks) * bq_sz < num_valid_tokens
-    is_dense = jnp.repeat(use_dense, chunk_blocks) & block_valid
+    block_start = jnp.arange(num_blocks) * bq_sz
+    block_valid = block_start < num_valid_tokens
+    block_last = jnp.clip(num_valid_tokens - 1, block_start, block_start + bq_sz - 1)
+    one_seq = seq_ids_segment[block_start] == seq_ids_segment[block_last]
+    eligible = one_seq & (block_pages <= max_kv_pages)
+    # The gather path walks a prefix of each chunk, up to the end of the
+    # chunk's last valid block that is not eligible; the blocks after it
+    # are dense.
+    gather_blocks = jnp.max(
+        jnp.where(
+            (block_valid & ~eligible).reshape(num_chunks, chunk_blocks),
+            jnp.arange(1, chunk_blocks + 1),
+            0,
+        ),
+        axis=1,
+    )
+    block_in_chunk = jnp.arange(num_blocks) % chunk_blocks
+    is_dense = block_valid & (block_in_chunk >= jnp.repeat(gather_blocks, chunk_blocks))
     # The dense blocks' ids, in order, at the front.
     slot = jnp.where(is_dense, jnp.cumsum(is_dense) - 1, num_blocks)
     block_ids = (
@@ -921,7 +930,7 @@ def _dense_attention(
         swa_l,
         swa_m,
     )
-    gather_end = jnp.where(use_dense, chunk_start, chunk_start + chunk_size)
+    gather_end = jnp.arange(num_chunks) * chunk_size + gather_blocks * bq_sz
     return q, gather_end
 
 
@@ -1229,6 +1238,11 @@ def sparse_ragged_paged_attention(
     dense_path = (
         gather_and_attention_chunk_size >= DENSE_MIN_CHUNK_TOKENS
         and gather_and_attention_chunk_size % DENSE_BLOCK_TOKENS == 0
+        # The gather range ends on a block boundary and its grid walks
+        # whole kernel batches.
+        and DENSE_BLOCK_TOKENS
+        % _largest_divisor(gather_and_attention_chunk_size, attention_kernel_batch_size)
+        == 0
         and q.shape[0] % gather_and_attention_chunk_size == 0
         and page_size % _MASK_LANES == 0
     )
@@ -1278,7 +1292,7 @@ def sparse_ragged_paged_attention(
             * kernel_batch_size
         )
         if dense_path:
-            # The gather path's grid and gather are empty for a dense chunk.
+            # Rows past the gather range were attended by the dense path.
             batch_end = jnp.minimum(batch_end, gather_ends[i])
         num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
@@ -1287,7 +1301,7 @@ def sparse_ragged_paged_attention(
         # would have large overlap. This causes gather read hotspotting. We've seen
         # 30%+ performance degradation compared to the no-duplicate-indices case.
         #
-        # Chunks of a single request with few KV pages take the dense path
+        # Blocks of a single request with few KV pages take the dense path
         # above (`_dense_attention`) and skip this gather.
         gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
             cache_kv_nope,
