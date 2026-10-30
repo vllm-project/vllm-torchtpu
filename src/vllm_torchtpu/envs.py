@@ -680,9 +680,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run the fused MoE decode kernel's routing prologue (row padding, route
     # weights to per-expert coefficients, active experts, shared-gate
     # broadcast) inside the kernel instead of as ~8 XLA ops per layer (fold=True
-    # in fused_moe_decode_kernel.py). Bitwise the same output. "xla" keeps the
-    # shared gate's dot + sigmoid in XLA; "kernel" also moves it into the
-    # kernel. "off": the unfolded call.
+    # in fused_moe_decode_kernel.py). "xla" keeps the shared gate's dot +
+    # sigmoid in XLA and returns bitwise the same output as "off"; "kernel"
+    # also moves that dot + sigmoid into the kernel (broadcast MXU dot, so
+    # gate rounding is not guaranteed bitwise identical on TPU). "off": the
+    # unfolded call.
     "FUSED_MOE_DECODE_KERNEL_FOLD": env_with_choices(
         "FUSED_MOE_DECODE_KERNEL_FOLD", "off", ["off", "xla", "kernel"]
     ),
