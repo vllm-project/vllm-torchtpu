@@ -1132,6 +1132,9 @@ HEADS_GATHER_UNROLL = 8
 HEADS_QUANT_PER_TILE = 32
 # Rows per pass of a quantizing `quantized_matmul_heads`' epilogue.
 HEADS_QUANT_PASS_ROWS = 64
+# Rows per sub-block of a quantizing `quantized_matmul_heads` step, whose rope
+# + quantize passes overlap the next sub-block's dots.
+HEADS_QUANT_SUB_ROWS = 128
 
 
 def _quantized_matmul_heads_kernel(
@@ -1296,42 +1299,48 @@ def _quantized_matmul_heads_kernel(
     else:
         words_ref = stage_buf.bitcast(jnp.uint32)
     words_ref = words_ref.reshape(lane_blocks, block_rows * words_per_row, LANE)
-    x_scale = xs_ref[rows, 0:1]
     chunk_rows = math.gcd(HEADS_EPILOGUE_ROWS, block_rows)
-    for p in range(words_per_row):
-        cols = slice(2 * p * head_dim, (2 * p + 2) * head_dim)
-        # xla_quantized_matmul's dot and epilogue, rounded to its output.
-        acc = jnp.dot(
-            xq_ref[rows, :], w_buf[w_slot, :, cols], preferred_element_type=jnp.float32
-        )
-        acc = acc * x_scale
-        acc = acc * ws_buf[w_slot, :, cols]
-        if quant_dtype is None:
-            acc = acc.astype(jnp.bfloat16).astype(jnp.float32)
-        # The epilogue goes over row chunks, so each chunk's norm, RoPE and
-        # stores need only its own rows of the product.
-        for r0 in range(0, block_rows, chunk_rows):
-            heads_of_pair = [
-                acc[r0 : r0 + chunk_rows, h * head_dim : (h + 1) * head_dim]
-                for h in range(2)
-            ]
+
+    def pair_products(r_lo, r_hi):
+        """Every head pair's product for rows [r_lo, r_hi) of the block, put
+        through ``head_fn`` (unless quantizing) and stored as packed words."""
+        span = pl.ds(pl.multiple_of(i * block_rows + r_lo, r_hi - r_lo), r_hi - r_lo)
+        x_scale = xs_ref[span, 0:1]
+        for p in range(words_per_row):
+            cols = slice(2 * p * head_dim, (2 * p + 2) * head_dim)
+            # xla_quantized_matmul's dot and epilogue, rounded to its output.
+            acc = jnp.dot(
+                xq_ref[span, :],
+                w_buf[w_slot, :, cols],
+                preferred_element_type=jnp.float32,
+            )
+            acc = acc * x_scale
+            acc = acc * ws_buf[w_slot, :, cols]
             if quant_dtype is None:
-                chunk = pl.ds(pl.multiple_of(i * block_rows + r0, chunk_rows), chunk_rows)
-                row_values = [ref[chunk, :] for ref in row_refs]
-                pair = [head_fn(head, *row_values) for head in heads_of_pair]
-            else:  # rounded to bf16 by the pack
-                pair = heads_of_pair
-            words = pltpu.pack_elementwise(pair, packed_dtype=jnp.bfloat16)
-            dst = pl.ds(r0 * words_per_row + p, chunk_rows, stride=words_per_row)
-            for c in range(lane_blocks):
-                words_ref.at[c][dst, :] = words[:, c * LANE : (c + 1) * LANE]
+                acc = acc.astype(jnp.bfloat16).astype(jnp.float32)
+            # The epilogue goes over row chunks, so each chunk's norm, RoPE and
+            # stores need only its own rows of the product.
+            for c0 in range(0, r_hi - r_lo, chunk_rows):
+                r0 = r_lo + c0
+                heads_of_pair = [
+                    acc[c0 : c0 + chunk_rows, h * head_dim : (h + 1) * head_dim]
+                    for h in range(2)
+                ]
+                if quant_dtype is None:
+                    row0 = pl.multiple_of(i * block_rows + r0, chunk_rows)
+                    chunk = pl.ds(row0, chunk_rows)
+                    row_values = [ref[chunk, :] for ref in row_refs]
+                    pair = [head_fn(head, *row_values) for head in heads_of_pair]
+                else:  # rounded to bf16 by the pack
+                    pair = heads_of_pair
+                words = pltpu.pack_elementwise(pair, packed_dtype=jnp.bfloat16)
+                dst = pl.ds(r0 * words_per_row + p, chunk_rows, stride=words_per_row)
+                for c in range(lane_blocks):
+                    words_ref.at[c][dst, :] = words[:, c * LANE : (c + 1) * LANE]
 
-    if quant_dtype is not None:
-        pass_rows = min(HEADS_QUANT_PASS_ROWS, block_rows)
-
-        @pl.loop(0, block_rows, step=pass_rows)
-        def _(r):
-            r = pl.multiple_of(r, pass_rows)
+    def rope_quant_passes(r_lo, r_hi):
+        """``head_fn`` and the per-row quantize on staged rows [r_lo, r_hi)."""
+        for r in range(r_lo, r_hi, pass_rows):
             tokens = pl.ds(r, pass_rows)
             row = pl.multiple_of(i * block_rows + r, pass_rows)
             values = [ref[pl.ds(row, pass_rows), :][:, None, :] for ref in row_refs]
@@ -1339,6 +1348,22 @@ def _quantized_matmul_heads_kernel(
             q, scale = _quantize_lanes(y, quant_dtype)
             o_buf[o_slot, tokens] = q
             s_buf[o_slot, tokens] = scale.reshape(pass_rows, heads)
+
+    if quant_dtype is None:
+        pair_products(0, block_rows)
+    else:
+        # Rows go in sub-blocks, and each sub-block's rope + quantize passes
+        # sit in one basic block with the next sub-block's dots, so the
+        # scheduler can overlap them: they touch disjoint rows of stage_buf.
+        pass_rows = min(HEADS_QUANT_PASS_ROWS, block_rows)
+        sub_rows = math.gcd(math.lcm(HEADS_QUANT_SUB_ROWS, pass_rows), block_rows)
+        chunk_rows = math.gcd(chunk_rows, sub_rows)
+        subs = [(r, r + sub_rows) for r in range(0, block_rows, sub_rows)]
+        pair_products(*subs[0])
+        for prev, sub in zip(subs, subs[1:]):
+            pair_products(*sub)
+            rope_quant_passes(*prev)
+        rope_quant_passes(*subs[-1])
 
     for copy in out_copies(o_slot):
         copy.start()
