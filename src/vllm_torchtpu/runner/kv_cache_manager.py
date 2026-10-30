@@ -1378,10 +1378,6 @@ class KVCacheManager:
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
-        if self.model_adapter is not None:
-            caches = self.model_adapter.initialize_kv_cache(kv_cache_config)
-            self._register_kv_connector(caches)
-            return
         assert kv_cache_config.num_blocks is not None, (
             "KVCacheConfig.num_blocks must be resolved by the scheduler"
         )
@@ -1389,7 +1385,8 @@ class KVCacheManager:
         # Mirror GPUModelRunner.initialize_kv_cache: needed by inherited
         # _update_states -> _may_reorder_batch which reads kv_cache_config.
         self.runner.kv_cache_config = kv_cache_config
-        self._maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        if self.model_adapter is None:
+            self._maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
 
         # Dummy slot mapping, not used anywhere in the TPU code flow. But needed
         #  for upstream `_build_attention_metadata` call.
@@ -1397,6 +1394,10 @@ class KVCacheManager:
             gid: torch.empty(0, device=self.runner.device)
             for gid in range(len(self.runner.kv_cache_config.kv_cache_groups))
         }
+        if self.model_adapter is not None:
+            caches = self.model_adapter.initialize_kv_cache(kv_cache_config)
+            self._register_kv_connector(caches)
+            return
         if self.runner._unified_kv_layout:
             self._initialize_unified_kv_cache(kv_cache_config)
             return

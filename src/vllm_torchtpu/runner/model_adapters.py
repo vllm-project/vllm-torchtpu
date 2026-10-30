@@ -33,7 +33,7 @@ class ModelInputSnapshot:
     num_requests: int
     num_tokens: int
     attention_metadata: dict[str, Any]
-    input_ids: torch.Tensor
+    input_ids: torch.Tensor | None
 
 
 class ModelAdapter(Protocol):
@@ -59,7 +59,15 @@ class ModelAdapter(Protocol):
         ...
 
     def dummy_run(
-        self, num_tokens, num_reqs, profile_prefix=None, *, dp_lockstep=False
+        self,
+        num_tokens,
+        num_reqs,
+        profile_prefix=None,
+        *,
+        num_blocks=None,
+        use_max_model_len=True,
+        dp_lockstep=False,
+        through_handoff=False,
     ) -> float | None:
         """Exercise the model with the same kwargs contract as ``prepare_inputs``.
 
@@ -77,11 +85,7 @@ class ModelAdapter(Protocol):
 
 
 def select_model_adapter(runner) -> ModelAdapter | None:
-    if runner.model_config.architecture in (
-        "Qwen4ExpForCausalLM",
-        "Qwen4ExpForConditionalGeneration",
-    ):
-        from vllm_torchtpu.models.vllm.qwen4_exp.inputs import Qwen4ExpAdapter
+    from vllm_torchtpu.models.model_hooks import MODEL_ADAPTERS
 
-        return Qwen4ExpAdapter(runner)
-    return None
+    factory = MODEL_ADAPTERS.get(runner.model_config.architecture)
+    return None if factory is None else factory(runner)

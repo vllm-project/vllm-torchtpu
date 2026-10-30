@@ -161,6 +161,7 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
+from vllm_torchtpu.runner.model_adapters import ModelAdapter
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -632,6 +633,7 @@ class TPUModelRunner(GPUModelRunner):
     # Default for a runner built without __init__.
     _pp_wave: PPWave | None = None
     _dp_step_other_decode: bool = False
+    model_adapter: ModelAdapter | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -4060,7 +4062,6 @@ class TPUModelRunner(GPUModelRunner):
                     chunk_embeds = []
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
-            self._record_input_staging_fence()
             if self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(
                     input_ids, chunk_mm_inputs
@@ -4115,17 +4116,17 @@ class TPUModelRunner(GPUModelRunner):
             if self.model_adapter is not None:
                 from vllm_torchtpu.runner.model_adapters import ModelInputSnapshot
 
-                assert input_ids is not None
                 model_kwargs = self.model_adapter.prepare_inputs(
                     ModelInputSnapshot(
-                        step_context,
-                        start_index,
-                        num_reqs,
-                        num_tokens_padded,
-                        attn_metadata,
-                        input_ids,
+                        step_context=step_context,
+                        row_start=start_index,
+                        num_requests=num_reqs,
+                        num_tokens=num_tokens_padded,
+                        attention_metadata=attn_metadata,
+                        input_ids=input_ids,
                     )
                 )
+            self._record_input_staging_fence()
 
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
             if "min_kv_len" in trace_kwargs:
@@ -5766,9 +5767,15 @@ class TPUModelRunner(GPUModelRunner):
         # Same fence discipline as a serving chunk: release the previous
         # chunk's host sources before an adapter or generic dummy forward.
         self._wait_input_staging_fence()
-        if (adapter := getattr(self, "model_adapter", None)) is not None:
+        if (adapter := self.model_adapter) is not None:
             return adapter.dummy_run(
-                num_tokens, num_reqs, profile_prefix, dp_lockstep=dp_lockstep
+                num_tokens,
+                num_reqs,
+                profile_prefix,
+                num_blocks=num_blocks,
+                use_max_model_len=use_max_model_len,
+                dp_lockstep=dp_lockstep,
+                through_handoff=through_handoff,
             )
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
@@ -7976,7 +7983,13 @@ class TPUModelRunner(GPUModelRunner):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         kwargs = {} if model_kwargs is None else dict(model_kwargs)
+        assert not {"input_ids", "positions", "inputs_embeds"}.intersection(kwargs), (
+            "Model adapter kwargs overlap explicit model inputs"
+        )
         if intermediate_tensors is not None:
+            assert "intermediate_tensors" not in kwargs, (
+                "Model adapter kwargs overlap pipeline intermediate_tensors"
+            )
             kwargs["intermediate_tensors"] = intermediate_tensors
         out = self.model(
             input_ids=input_ids,

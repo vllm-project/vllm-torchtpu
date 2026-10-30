@@ -908,6 +908,9 @@ class TpuPlatform(Platform):
                 if (op := f"pallas::{prefix}_{i}")
                 not in compilation_config.splitting_ops
             )
+        logger.info(
+            "TPU compilation splitting_ops=%s", compilation_config.splitting_ops
+        )
 
         # Disable inductor-specific fusion passes (only available on CUDA).
         compilation_config.pass_config.fuse_norm_quant = False

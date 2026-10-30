@@ -67,6 +67,9 @@ def test_reordered_history_slots_and_group_tables_are_independent(
     )
     runner = NS(
         device="cpu",
+        _pp_is_first=True,
+        supports_mm_inputs=False,
+        _record_input_staging_fence=lambda: None,
         _attn_metadata_builder_ctx=ctx,
         input_batch=NS(
             num_reqs=2, token_ids_cpu_tensor=store, num_computed_tokens_cpu=[3, 1]
@@ -208,6 +211,9 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     monkeypatch.setattr(inputs, "synchronize_tensors", lambda tensor: None)
     runner = NS(
         device="cpu",
+        _pp_is_first=True,
+        supports_mm_inputs=False,
+        _record_input_staging_fence=lambda: None,
         parallel_config=NS(tensor_parallel_size=tp),
         scheduler_config=NS(max_num_seqs=1),
         input_batch=NS(
@@ -228,12 +234,14 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
         allocate=lambda: allocations.append(True),
         pages=44,
         specs={"gdn": None, "qsa": None, "ple": None},
-        dummy_metadata=lambda metadata, active: {
+        dummy_metadata=lambda metadata, active, *, use_max_model_len=True: {
             name: metadata for name in ("gdn", "qsa", "ple")
         },
     )
-    adapter.dummy_run(128, 8)
+    runner.most_model_len = 384
+    adapter.dummy_run(128, 8, num_blocks=3, use_max_model_len=False)
     kwargs = captured["model_kwargs"]
+    assert kwargs["main_block_table"].shape == (8, 3)
     assert allocations == [True]
     assert captured["positions"].dtype == torch.int32
     assert captured["input_ids"].dtype == torch.int32
@@ -256,7 +264,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     before = adapter.ngram_context
     before.fill_(123)
     adapter.cache.allocate = lambda: pytest.fail("idle must not allocate/rebind cache")
-    adapter.dummy_run(128, 8, dp_lockstep=True)
+    adapter.dummy_run(128, 8, num_blocks=3, use_max_model_len=False, dp_lockstep=True)
     # Idle TP groups must also issue the LM-head collective before returning
     # to DP coordination, or busy ranks cannot materialize their sample.
     if tp > 1:
@@ -330,6 +338,7 @@ def test_native_kwargs_match_warmup_profile_and_idle(monkeypatch, tokens, live_c
     )
     monkeypatch.setattr(inputs, "synchronize_tensors", lambda tensor: None)
     runner.forward_model = forward
+    runner._record_input_staging_fence = Mock()
     runner.parallel_config.tensor_parallel_size = 1
     runner.scheduler_config.max_num_seqs = cfg.scheduler_config.max_num_seqs
     runner._dp_num_tokens_across_dp = lambda n: torch.full((8,), n, dtype=torch.int32)
@@ -339,7 +348,9 @@ def test_native_kwargs_match_warmup_profile_and_idle(monkeypatch, tokens, live_c
     adapter.cache = NS(
         allocate=allocate,
         pages=plan.num_blocks,
-        dummy_metadata=lambda metadata, active: {name: metadata for name in specs},
+        dummy_metadata=lambda metadata, active, *, use_max_model_len=True: {
+            name: metadata for name in specs
+        },
     )
     runner.input_batch.num_reqs = 0
     adapter.dummy_run(tokens, padded_rows)
@@ -391,6 +402,9 @@ def test_async_history_reads_committed_prefix_after_reorder_and_row_reuse():
     order = torch.tensor([1, 2, 0])
     runner = NS(
         device="cpu",
+        _pp_is_first=True,
+        supports_mm_inputs=False,
+        _record_input_staging_fence=lambda: None,
         input_batch=NS(
             num_reqs=3,
             token_ids_cpu_tensor=host[order],
@@ -418,6 +432,9 @@ def test_empty_request_snapshot_preserves_padded_input_contract(
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
     runner = NS(
         device="cpu",
+        _pp_is_first=True,
+        supports_mm_inputs=False,
+        _record_input_staging_fence=lambda: None,
         cache_config=NS(block_size=128),
         model_config=NS(hf_text_config=q4exp_text_config(ngram_size=ngram_size)),
         input_batch=NS(
@@ -506,6 +523,9 @@ def test_step_snapshot_is_bounded_and_shared_across_chunks(ngram_size, has_ple):
     context = [0, 1, 9, 4, 17]
     runner = NS(
         device="cpu",
+        _pp_is_first=True,
+        supports_mm_inputs=False,
+        _record_input_staging_fence=lambda: None,
         cache_config=NS(block_size=128),
         model_config=NS(
             hf_text_config=q4exp_text_config(

@@ -1150,8 +1150,11 @@ def test_check_and_update_config_preserves_declared_splitting_ops(
     assert vllm_config.model_config is None
     assert vllm_config.parallel_config.is_moe_model is None
     assert vllm_config.compilation_config.splitting_ops == expected
+    info = Mock()
+    monkeypatch.setattr(tpu_platform.logger, "info", info)
     TpuPlatform.check_and_update_config(vllm_config)
     assert vllm_config.compilation_config.splitting_ops == expected
+    info.assert_any_call("TPU compilation splitting_ops=%s", expected)
     # Explicit boundaries affect upstream fusion defaults before this hook.
     # The resulting configuration must initialize compilation on TPU too.
     from vllm.compilation.passes.pass_manager import PostGradPassManager
