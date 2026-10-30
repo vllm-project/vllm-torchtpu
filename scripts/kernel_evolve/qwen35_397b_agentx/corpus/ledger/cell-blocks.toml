@@ -56,7 +56,7 @@ cell = "7f7b02900fa6"
 phase = "decode"
 block = "MoE routing"
 family = "router_topk"
-why = "the router top-k kernel (src/vllm_torchtpu/kernels/router_topk.py)"
+why = "the router top-k kernel (src/vllm_torchtpu/kernels/router_topk/kernel.py)"
 
 [[rule]]
 cell = "7f7b02900fa6"
@@ -189,7 +189,7 @@ cell = "7f7b02900fa6"
 phase = "prefill"
 block = "MoE routing"
 family = "router_topk"
-why = "the router top-k kernel (src/vllm_torchtpu/kernels/router_topk.py)"
+why = "the router top-k kernel (src/vllm_torchtpu/kernels/router_topk/kernel.py)"
 
 [[rule]]
 cell = "7f7b02900fa6"
@@ -395,7 +395,7 @@ floor_note = """\
 Derived: the sum of the block's priced op floors from `perfkit profile price`, \
 from operand bytes and FLOPs at the hardware's constants. 0.5953 ms of the \
 block's time is in ops with no floor, so this is a lower bound."""
-kernel_files = ["src/vllm_torchtpu/kernels/router_topk.py"]
+kernel_files = ["src/vllm_torchtpu/kernels/router_topk/kernel.py"]
 measured_from = "zsbz502r"
 measured_on = "2026-10-30"
 measured_tree = "754626417"
@@ -786,7 +786,7 @@ floor_note = """\
 Derived: the sum of the block's priced op floors from `perfkit profile price`, \
 from operand bytes and FLOPs at the hardware's constants. 2.2424 ms of the \
 block's time is in ops with no floor, so this is a lower bound."""
-kernel_files = ["src/vllm_torchtpu/kernels/router_topk.py"]
+kernel_files = ["src/vllm_torchtpu/kernels/router_topk/kernel.py"]
 measured_from = "zsbz502r"
 measured_on = "2026-10-30"
 measured_tree = "754626417"

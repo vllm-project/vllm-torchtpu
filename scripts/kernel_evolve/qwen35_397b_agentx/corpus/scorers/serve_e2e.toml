@@ -60,3 +60,40 @@ warmup = 0
 weights = "gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.5-397B-A17B-FP8"
 decode_share = 0.8217
 cut_env = {MODEL_URI = "gs://forge-gcs-tpu/forge/perfkit-cluster/checkpoints/Qwen3.5-397B-A17B-FP8-L8"}
+
+# The router top-k segment's score: the 4-layer cut's steps that carry a 16k-token prefill
+# chunk alone. The kernel spends about four fifths of its weighted time in those steps (0.749
+# of 33.6 ms of op time a chunk step on golden's cut, against 0.040 of 2.9 ms a decode-only
+# step, weighed 0.18 to 0.82), and the decode-only figure moves by about 30% between jobs of
+# one tree: the step window of `perfkit profile blocks --own-windows` holds the decode step's
+# one or two forward programs depending on host pacing (campaign cmp-4073a5b7, segment 1:
+# 2.01 vs 2.87 ms decode-only, 0.0230 vs 0.0397 ms of MoE routing, on golden). Chunk steps
+# read 33.51-33.68 ms over the same jobs. The full config it names is the base config's
+# serve point, unchanged; it exists so the record's full-model check serves that.
+[configs."qwen3.5-397b-fp8-tp8-dp1-ep-agentx-prefill"]
+config = "qwen3.5-397b-fp8-tp8-dp1-ep-agentx"
+target = "vllm-torchtpu-qwen35-agentx"
+cell = "7f7b02900fa6"
+remote = "cdk"
+score_phase = "prefill"
+
+[configs."qwen3.5-397b-fp8-tp8-dp1-ep-agentx-prefill@layers"]
+config = "qwen3.5-397b-fp8-tp8-dp1-ep-agentx"
+target = "vllm-torchtpu-qwen35-agentx"
+cell = "7f7b02900fa6"
+remote = "cdk"
+layers = "auto"
+repeats = 1
+warmup = 0
+score_phase = "prefill"
+weights = "gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.5-397B-A17B-FP8"
+cut_env = {MODEL_URI = "gs://forge-gcs-tpu/forge/perfkit-cluster/checkpoints/Qwen3.5-397B-A17B-FP8-L4"}
+
+# The full model with the phased profiler armed, for scoping only: a job of golden alone
+# reads its decode-only and prefill captures, which rank the cell's kernels.
+[configs."qwen3.5-397b-fp8-tp8-dp1-ep-agentx-profiled"]
+config = "qwen3.5-397b-fp8-tp8-dp1-ep-agentx"
+target = "vllm-torchtpu-qwen35-agentx"
+cell = "7f7b02900fa6"
+remote = "cdk"
+profile = true
