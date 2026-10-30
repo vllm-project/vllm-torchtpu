@@ -40,7 +40,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
-from .config import gdn_cache_spec, require_unified_pool
+from .config import Qwen4ExpEngramConfig, gdn_cache_spec, require_unified_pool
 from .gdn import Qwen4ExpGatedDeltaNetAttention
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .parallel import PLEParallel
@@ -79,13 +79,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
         t = cfg.model_config.hf_text_config
         tp = get_tp_group()
         engram = cfg.additional_config.get("qwen4_exp", {}).get("engram_config", {})
-        shared = (
-            shared_ple_options(
-                cfg.model_config, prefix + ".ple", tp.rank_in_group, tp.world_size
+        shared = None
+        if index + 1 in t.ple_layer_ids and engram.get("dp_shared_memory", False):
+            assert isinstance(cfg.engram_config, Qwen4ExpEngramConfig)
+            launch = cfg.engram_config.host_launch
+            assert launch is not None
+            shared = shared_ple_options(
+                launch, prefix + ".ple", tp.rank_in_group, tp.world_size
             )
-            if index + 1 in t.ple_layer_ids and engram.get("dp_shared_memory", False)
-            else None
-        )
         self.ple = (
             Qwen4ExpPooledPLE(
                 config=t,

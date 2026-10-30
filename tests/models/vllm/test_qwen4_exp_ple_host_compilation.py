@@ -17,6 +17,7 @@ import copy
 import dataclasses
 import pickle
 from types import SimpleNamespace as NS
+from typing import cast
 
 import pytest
 import torch
@@ -31,7 +32,7 @@ def bare_config(config_type):
     return cfg
 
 
-def launch_config(monkeypatch, instance, *, offload=True):
+def launch_config(monkeypatch, instance, *, offload=True, engram=None):
     from transformers import PretrainedConfig
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.aux_output import AuxOutputConfig
@@ -51,6 +52,7 @@ def launch_config(monkeypatch, instance, *, offload=True):
     model.dtype = torch.bfloat16
     cfg = NS(
         model_config=model,
+        engram_config=engram,
         instance_id=instance,
         parallel_config=NS(data_parallel_size=8, tensor_parallel_size=1),
         scheduler_config=NS(max_num_seqs=8),
@@ -72,6 +74,7 @@ def launch_config(monkeypatch, instance, *, offload=True):
     hashed = bare_config(VllmConfig)
     hashed.aux_output_config = AuxOutputConfig()
     hashed.model_config = model
+    hashed.engram_config = cfg.engram_config
     hashed.additional_config = cfg.additional_config
     hashed.observability_config = NS(compute_hash=lambda: "observability")
     return cfg, hashed
@@ -83,8 +86,8 @@ def test_launch_identity_keeps_compile_cache_stable_and_storage_distinct(monkeyp
     first, first_hash = launch_config(monkeypatch, "service-a")
     second, second_hash = launch_config(monkeypatch, "service-b")
     assert first_hash.compute_hash() == second_hash.compute_hash()
-    a = shared_ple_options(first.model_config, "ple", 0, 1)
-    b = shared_ple_options(second.model_config, "ple", 0, 1)
+    a = shared_ple_options(first.engram_config.host_launch, "ple", 0, 1)
+    b = shared_ple_options(second.engram_config.host_launch, "ple", 0, 1)
     assert a.key != b.key and a.identity != b.identity
     before = second_hash.compute_hash()
     second_hash.additional_config["qwen4_exp"]["engram_config"].update(
@@ -109,7 +112,7 @@ def test_launch_identity_survives_config_transport_and_dp_collapse(
         restored = codec.loads(codec.dumps(original))
     restored.instance_id += "_dp3"
     restored.parallel_config.data_parallel_size = 1
-    options = shared_ple_options(restored.model_config, "ple", 0, 1)
+    options = shared_ple_options(restored.engram_config.host_launch, "ple", 0, 1)
     assert options.participants == 8
     assert options.identity["instance"] == "service-a"
     before = hashed.compute_hash()
@@ -121,7 +124,10 @@ def test_launch_identity_survives_config_transport_and_dp_collapse(
 @pytest.mark.parametrize("fp8", [False, True])
 def test_host_boundary_preserves_bits_dp_axis_and_current_ids(monkeypatch, dp, fp8):
     from vllm.compilation.backends import split_graph
-    from vllm.forward_context import override_forward_context
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbeddingShardIndices,
+    )
 
     from vllm_torchtpu.models.vllm.qwen4_exp.ple_offload import host_lookup
     from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import HostPLETable
@@ -137,8 +143,15 @@ def test_host_boundary_preserves_bits_dp_axis_and_current_ids(monkeypatch, dp, f
     torch.nn.Module.__init__(embedding)
     embedding._finalized = True
     embedding.storage_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
-    embedding.shard_indices = NS(
-        org_vocab_start_index=start, org_vocab_end_index=start + rows
+    embedding.shard_indices = VocabParallelEmbeddingShardIndices(
+        start,
+        start + rows,
+        0,
+        0,
+        start,
+        start + rows,
+        0,
+        0,
     )
     embedding.embedding_dim = width
     embedding._shared_table = None
@@ -181,7 +194,7 @@ def test_host_boundary_preserves_bits_dp_axis_and_current_ids(monkeypatch, dp, f
                 for i, token in enumerate(tokens.tolist()):
                     if start <= token < start + rows:
                         expected[:, i, :, :] = bits[token - start]
-                with override_forward_context(context):
+                with override_forward_context(cast(ForwardContext, context)):
                     actual = compiled(tokens)
                 assert actual.shape == (dp, count, heads * width)
                 assert actual.dtype == bits.dtype
@@ -198,3 +211,54 @@ def test_model_declares_host_boundary_only_for_offload(monkeypatch, offload):
     assert cfg.compilation_config.splitting_ops == (
         ["qwen4_exp::host_lookup"] if offload else None
     )
+
+
+@pytest.mark.parametrize(
+    "cpu,across,shared,thp",
+    [
+        (False, True, False, False),
+        (True, False, False, True),
+        (True, False, None, False),
+    ],
+)
+def test_typed_launch_preserves_existing_engram_policy_hash(
+    monkeypatch, cpu, across, shared, thp
+):
+    from vllm.config.engram import EngramConfig
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import (
+        Qwen4ExpEngramConfig,
+        TPUQwen4ExpConfig,
+    )
+
+    original = EngramConfig(
+        cpu_offload=cpu,
+        embedding_across_dp=across,
+        dp_shared_memory=shared,
+        use_thp=thp,
+    )
+    cfg, hashed = launch_config(monkeypatch, "origin", engram=original)
+    actual = cfg.engram_config
+    assert isinstance(actual, Qwen4ExpEngramConfig)
+    assert (
+        actual.cpu_offload,
+        actual.embedding_across_dp,
+        actual.dp_shared_memory,
+        actual.use_thp,
+    ) == (cpu, across, shared, thp)
+    assert actual.compute_hash() == original.compute_hash()
+    descriptor = actual.host_launch
+    assert (
+        descriptor is not None
+        and descriptor.instance == "origin"
+        and descriptor.participants == 8
+    )
+    cfg.instance_id = "origin_dp3"
+    cfg.parallel_config.data_parallel_size = 1
+    TPUQwen4ExpConfig.verify_and_update_config(cfg)
+    assert cfg.engram_config is actual and cfg.engram_config.host_launch is descriptor
+
+
+def test_disabled_offload_keeps_absent_engram_configuration(monkeypatch):
+    cfg, _ = launch_config(monkeypatch, "disabled", offload=False)
+    assert cfg.engram_config is None

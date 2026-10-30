@@ -14,6 +14,7 @@
 """PLE embedding ownership and physical DP slots; groups are borrowed."""
 
 import torch
+import torch.nn.functional as F
 
 
 class PLEParallel:
@@ -40,17 +41,22 @@ class PLEParallel:
         return ids
 
     def combine(self, raw_embeddings, local_tokens):
-        # Raw lookup emits 16 rows of 160 INT8/INT16 elements per token.
-        # Each INT32 word stays within one row, hence has exactly one owner:
-        # integer SUM preserves its bits and sends the same number of bytes.
-        # The mixed TP/DP path needs word carriers and an independent local
-        # slice: compiled narrow-type reductions or an aliased second in-place
-        # reduction corrupt small/odd buckets on TPU.
-        packed = self.across_dp and self.tp_group.world_size > 1
+        # Disjoint owner bytes sum without carries in INT32 carriers.
+        packed = self.group.world_size > 1
         carrier = raw_embeddings.dtype
-        result = self.group.all_reduce(
-            raw_embeddings.view(torch.int32) if packed else raw_embeddings
-        )
+        width = raw_embeddings.shape[-1]
+        if packed:
+            word_elements = torch.iinfo(torch.int32).bits // torch.iinfo(carrier).bits
+            padding = -width % word_elements
+            if padding:
+                raw_embeddings = F.pad(raw_embeddings, (0, padding))
+            word_shape = raw_embeddings.shape[:-1] + (
+                (width + padding) // word_elements,
+            )
+            raw_embeddings = (
+                raw_embeddings.reshape(-1).view(torch.int32).reshape(word_shape)
+            )
+        result = self.group.all_reduce(raw_embeddings)
         if self.across_dp:
             # Counts describe physical buckets, never cumulative live tokens.
             result = result.narrow(
@@ -62,4 +68,4 @@ class PLEParallel:
                 result = result.clone()
             # TP1 all_reduce is a no-op.
             result = self.tp_group.all_reduce(result)
-        return result.view(carrier) if packed else result
+        return result.view(carrier)[..., :width] if packed else result
