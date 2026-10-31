@@ -6122,13 +6122,23 @@ class TPUModelRunner(GPUModelRunner):
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
         if (
-            envs.TPU_GREEDY_TOP_TOKENS
+            (envs.TPU_GREEDY_TOP_TOKENS or envs.VLLM_TPU_SHARDED_LOCAL_ARGMAX)
             and self._pp_is_last
             and not self.is_pooling_model
         ):
-            self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
-                self.model, self._dp_lockstep_enabled()
-            )
+            try:
+                self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
+                    self.model, self._dp_lockstep_enabled()
+                )
+            except NotImplementedError as exc:
+                if envs.TPU_GREEDY_TOP_TOKENS:
+                    raise
+                logger.warning_once(
+                    "VLLM_TPU_SHARDED_LOCAL_ARGMAX: target model %s keeps "
+                    "full-logits greedy path (%s)",
+                    type(self.model).__name__,
+                    exc,
+                )
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).

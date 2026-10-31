@@ -191,6 +191,131 @@ def _selection_bitset(
     )(first, end, layout(word, -1), layout(bit, 0))
 
 
+def _bitset_kernel_fast(
+    group_counts_ref,
+    active_groups_ref,
+    clo_ref,
+    chi_ref,
+    sel_ref,
+    out_ref,
+):
+    """Fill one query block's ``[words, width]`` bitset visiting only active
+    eight-word groups and only selection chunks whose word range covers them.
+
+    Passing ``selected`` once instead of ``(word, bit)`` halves HBM layout/DMA
+    traffic, and ``(word, bit)`` are derived in VMEM registers only for chunks
+    whose ``[clo, chi)`` interval contains the active group ``index``.
+    """
+    block = pl.program_id(0)
+    rows, width = sel_ref.shape[1:]
+    nchunks = rows // 8
+    out_ref[...] = jnp.zeros(out_ref.shape, jnp.int32)
+    sublane = lax.broadcasted_iota(jnp.int32, (8, width), 0)
+
+    def visit_group(slot, _):
+        index = active_groups_ref[block, slot]
+        base = index * 8
+
+        def accumulate(chunk, accs):
+            hit = (clo_ref[block, chunk] <= index) & (index < chi_ref[block, chunk])
+
+            def do_chunk(accs):
+                start = pl.multiple_of(chunk * 8, 8)
+                sel = sel_ref[0, pl.ds(start, 8), :]
+                word = lax.shift_right_arithmetic(sel, 5)
+                bit = jnp.where(sel >= 0, lax.shift_left(jnp.int32(1), sel & 31), 0)
+                return tuple(
+                    acc + jnp.where(word == base + k, bit, 0)
+                    for k, acc in enumerate(accs)
+                )
+
+            return lax.cond(hit, do_chunk, lambda a: a, accs)
+
+        accs = lax.fori_loop(
+            0,
+            nchunks,
+            accumulate,
+            tuple(jnp.zeros((8, width), jnp.int32) for _ in range(8)),
+        )
+        slab = jnp.zeros((8, width), jnp.int32)
+        for k, acc in enumerate(accs):
+            for shift in (4, 2, 1):
+                acc = acc + pltpu.roll(acc, shift, 0)
+            slab = jnp.where(sublane == k, acc, slab)
+        out_ref[0, pl.ds(pl.multiple_of(base, 8), 8), :] = slab
+        return None
+
+    lax.fori_loop(0, group_counts_ref[block], visit_group, None)
+
+
+def _selection_bitset_fast(
+    blocks,
+    lengths,
+    *,
+    ratio,
+    groups,
+    words,
+    query_block,
+    width,
+    owned_words=None,
+    interpret=False,
+):
+    """Exact fast path for ``_selection_bitset`` (VLLM_TPU_QSA_FAST_SELECTION_BITSET):
+    fuses optional DCP ``owned_words`` filtering before layout, halves HBM input
+    bytes via single ``selected`` layout, compacts active eight-word groups per
+    query block, and skips non-overlapping 8-row selection chunks."""
+    tokens = blocks.shape[0]
+    nblocks = tokens // query_block
+    tail = lengths // ratio
+    selected = jnp.concatenate((blocks, tail[:, None]), axis=1)
+    valid = jnp.concatenate(
+        (
+            (blocks >= 0) & (blocks < groups),
+            ((lengths > 0) & (lengths % ratio != 0) & (tail < groups))[:, None],
+        ),
+        axis=1,
+    )
+    if owned_words is not None:
+        safe_word = jnp.clip(lax.shift_right_arithmetic(selected, 5), 0, words - 1)
+        valid = valid & (owned_words[safe_word] != 0)
+    sel_valid = jnp.where(valid, selected, -1).astype(jnp.int32)
+    rows = (sel_valid.shape[1] + 7) // 8 * 8
+    nchunks = rows // 8
+    sel_layout = sel_valid.reshape(nblocks, query_block, -1).transpose(0, 2, 1)
+    sel_layout = jnp.pad(
+        sel_layout,
+        ((0, 0), (0, rows - sel_layout.shape[1]), (0, width - query_block)),
+        constant_values=-1,
+    )
+    word_chunks = lax.shift_right_arithmetic(sel_layout, 5).reshape(
+        nblocks, nchunks, 8 * width
+    )
+    c_min = jnp.min(jnp.where(word_chunks >= 0, word_chunks, words), axis=2)
+    c_max = jnp.max(word_chunks, axis=2)
+    clo = lax.shift_right_arithmetic(c_min, 3)
+    chi = jnp.where(c_max >= 0, lax.shift_right_arithmetic(c_max, 3) + 1, 0)
+    ngroups = words // 8
+    g_iota = jnp.arange(ngroups, dtype=jnp.int32)[None, None, :]
+    group_hit = jnp.any(
+        (clo[:, :, None] <= g_iota) & (g_iota < chi[:, :, None]), axis=1
+    )
+    active_groups = _compact_active(group_hit)
+    group_counts = jnp.sum(group_hit, axis=1, dtype=jnp.int32)
+    return pl.pallas_call(
+        _bitset_kernel_fast,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            grid=(nblocks,),
+            in_specs=[pl.BlockSpec((1, rows, width), lambda b, *_: (b, 0, 0))],
+            out_specs=pl.BlockSpec((1, words, width), lambda b, *_: (b, 0, 0)),
+        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        out_shape=jax.ShapeDtypeStruct((nblocks, words, width), jnp.int32),
+        interpret=interpret,
+        name="qsa_prefill_selection_bitset_fast",
+    )(group_counts, active_groups, clo, chi, sel_layout)
+
+
 def _kernel(
     table_ref,
     active_tiles_ref,
@@ -611,17 +736,29 @@ def block_sparse_gqa_prefill(
             == jnp.asarray(dcp_rank, jnp.int32).reshape(-1)[0]
         ).astype(jnp.int32)
     if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
-        block_bits_native = _selection_bitset(
-            blocks,
-            lengths,
-            ratio=ratio,
-            groups=groups,
-            words=words,
-            query_block=query_block // parts,
-            width=part_width,
-        )
-        if owned_words is not None:
-            block_bits_native = block_bits_native * owned_words[None, :, None]
+        if envs.VLLM_TPU_QSA_FAST_SELECTION_BITSET:
+            block_bits_native = _selection_bitset_fast(
+                blocks,
+                lengths,
+                ratio=ratio,
+                groups=groups,
+                words=words,
+                query_block=query_block // parts,
+                width=part_width,
+                owned_words=owned_words,
+            )
+        else:
+            block_bits_native = _selection_bitset(
+                blocks,
+                lengths,
+                ratio=ratio,
+                groups=groups,
+                words=words,
+                query_block=query_block // parts,
+                width=part_width,
+            )
+            if owned_words is not None:
+                block_bits_native = block_bits_native * owned_words[None, :, None]
         part_bits = block_bits_native.reshape(nblocks, parts, words, part_width)
         if paired_pages:
             active = jnp.any(

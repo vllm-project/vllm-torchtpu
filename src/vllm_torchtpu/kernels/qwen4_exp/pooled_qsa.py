@@ -2539,17 +2539,57 @@ def pooled_qsa_shard_attend_dcp_step(
     )
 
 
+def _compact_kept_blocks(keep: jax.Array, pos_pair: jax.Array, block_topk: int) -> jax.Array:
+    """Compact kept ``[D, T, k]`` positions to ``[T, block_topk]`` without sorting.
+
+    Each kept entry at column ``c`` shifts left by ``s = c - slot`` (the count
+    of preceding dropped entries). Because ``s`` is monotonically non-decreasing
+    and ``c - s`` is strictly increasing across kept entries, routing bit-by-bit
+    from ``2**0`` to ``2**(m-1)`` is provably collision-free and lowers to pure
+    pad/slice/select vector ops with zero XLA ``sort`` or ``scatter`` ops.
+    """
+    keep_flat = jnp.moveaxis(keep, 0, 1).reshape(keep.shape[1], -1)
+    pos_flat = jnp.moveaxis(pos_pair, 0, 1).reshape(pos_pair.shape[1], -1).astype(jnp.int32)
+    _, width = keep_flat.shape
+    num_bits = (max(width, 2) - 1).bit_length()
+    padded_w = 1 << num_bits
+    if padded_w > width:
+        keep_flat = jnp.pad(keep_flat, ((0, 0), (0, padded_w - width)))
+        pos_flat = jnp.pad(
+            pos_flat, ((0, 0), (0, padded_w - width)), constant_values=-1
+        )
+    slots = jnp.cumsum(keep_flat, axis=1, dtype=jnp.int32) - 1
+    shift = jnp.where(
+        keep_flat, jnp.arange(padded_w, dtype=jnp.int32)[None, :] - slots, 0
+    )
+    active = keep_flat
+    vals = jnp.where(active, pos_flat, -1)
+    for b in range(num_bits):
+        step = 1 << b
+        move = active & ((shift & step) != 0)
+        stay = active & ~move
+        move_in = jnp.pad(move[:, step:], ((0, 0), (0, step)))
+        vals_in = jnp.pad(vals[:, step:], ((0, 0), (0, step)), constant_values=-1)
+        shift_in = jnp.pad(shift[:, step:], ((0, 0), (0, step)))
+        active = stay | move_in
+        vals = jnp.where(move_in, vals_in, jnp.where(stay, vals, -1))
+        shift = jnp.where(move_in, shift_in, jnp.where(stay, shift, 0))
+    return vals[:, :block_topk]
+
+
 def compressed_dcp_blocks(vals_pair, pos_pair, block_topk, *, topk=None):
-    """The global selection ``[T, block_topk]`` (ascending group ids, -1 padded)
-    from a DCP pair's owned local top-k lists ``[2, T, k]``: the entries of
-    both lists that ``dcp_select.keep_mask`` keeps. Every rank gets the same
-    blocks; the DCP attention drops the groups another rank owns."""
+    """The global selection ``[T, block_topk]`` (-1 padded) from a DCP pair's
+    owned local top-k lists ``[2, T, k]``: the entries of both lists that
+    ``dcp_select.keep_mask`` keeps. Every rank gets the same blocks; the DCP
+    attention drops the groups another rank owns."""
     from vllm_torchtpu.kernels.qwen4_exp import dcp_select
 
     thr_val, thr_pos = dcp_select.merge_threshold(vals_pair, pos_pair, block_topk, topk=topk)
     keep = jax.vmap(dcp_select.keep_mask, in_axes=(0, 0, None, None))(
         vals_pair, pos_pair, thr_val, thr_pos
     )
+    if envs.VLLM_TPU_QSA_FAST_SELECTION_BITSET:
+        return _compact_kept_blocks(keep, pos_pair, block_topk)
     kept = jnp.where(keep, pos_pair, dcp_select.EMPTY)
     kept = jnp.moveaxis(kept, 0, 1).reshape(kept.shape[1], -1)
     kept = jnp.sort(kept, axis=1)[:, :block_topk]

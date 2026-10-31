@@ -29,6 +29,7 @@ from vllm.forward_context import get_forward_context
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.runner import greedy_top_tokens
 
 
 class MtpDraftModel(Protocol):
@@ -48,12 +49,15 @@ class _MtpFusedLoop(nn.Module):
         prefix: str = "",
         mtp: MtpDraftModel,
         num_steps: int,
+        head_owner: nn.Module | None = None,
     ) -> None:
         super().__init__()
         # Own compile-cache folder, as in MtpLoopStepModel.
         self.prefix = prefix
         self.mtp = mtp
         self.num_steps = num_steps
+        # Keep out of nn.Module._modules when head_owner is `mtp` itself.
+        object.__setattr__(self, "_head_owner", head_owner)
         # VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS: advance seq_lens by rebinding the
         # draft metadata's field to `seq_lens + i` in the graph instead of
         # `seq_lens.add_(1)`, so the program mutates no input and AOT emits no
@@ -97,9 +101,14 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = (
-                self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
-            )
+            if self._head_owner is not None:
+                input_ids = greedy_top_tokens.draft_top_token_ids(
+                    self._head_owner, last_hidden
+                )
+            else:
+                input_ids = (
+                    self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
+                )
             tokens.append(input_ids)
         return tuple(tokens)
 
@@ -111,6 +120,7 @@ def build_mtp_fused_loop(
     mtp: MtpDraftModel,
     num_steps: int,
     dynamic_arg_dims: dict,
+    head_owner: nn.Module | None = None,
 ) -> nn.Module:
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
@@ -123,4 +133,10 @@ def build_mtp_fused_loop(
     cls = support_torch_compile(dynamic_arg_dims=dims)(
         type("MtpFusedLoop", (_MtpFusedLoop,), {})
     )
-    return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps)
+    return cls(
+        vllm_config=vllm_config,
+        prefix=prefix,
+        mtp=mtp,
+        num_steps=num_steps,
+        head_owner=head_owner,
+    )

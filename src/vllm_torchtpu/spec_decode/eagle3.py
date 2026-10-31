@@ -33,7 +33,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
-from vllm_torchtpu.runner import host_phases
+from vllm_torchtpu.runner import greedy_top_tokens, host_phases
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -405,6 +405,8 @@ class Eagle3Proposer:
         # Draft step 0 evaluated at each request's last token only
         # (VLLM_TPU_MTP_DRAFT_ROWS). Resolved in load_model.
         self._draft_rows = False
+        # Optional TP-local sharded argmax head owner (VLLM_TPU_SHARDED_LOCAL_ARGMAX).
+        self._draft_head_owner: torch.nn.Module | None = None
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -476,6 +478,14 @@ class Eagle3Proposer:
             target_model, self.vllm_config.scheduler_config.max_num_batched_tokens
         ):
             logger.info("MTP draft attends the target's last QSA selection.")
+        if envs.VLLM_TPU_SHARDED_LOCAL_ARGMAX:
+            self._draft_head_owner = greedy_top_tokens.resolve_draft_head_owner(
+                self.draft_model, self.runner._dp_lockstep_enabled()
+            )
+            if self._draft_head_owner is not None:
+                logger.info(
+                    "MTP/Eagle draft token proposal uses TP-local sharded argmax."
+                )
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
@@ -807,13 +817,19 @@ class Eagle3Proposer:
             ):
                 self._mtp_fused_loop = build_mtp_fused_loop(
                     vllm_config=self.draft_vllm_config,
-                    # Separate compile-cache folder per seq_lens mode, so a
-                    # cached in-place-add graph is never loaded for rebind.
+                    # Separate compile-cache folder per seq_lens / argmax mode,
+                    # so cached graphs never alias across modes.
                     prefix=f"mtp_fused_loop_k{K}"
-                    + ("_rebind" if envs.VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS else ""),
+                    + ("_rebind" if envs.VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS else "")
+                    + (
+                        "_sharded_argmax"
+                        if self._draft_head_owner is not None
+                        else ""
+                    ),
                     mtp=draft_model,
                     num_steps=K - 1,
                     dynamic_arg_dims=draft_dims,
+                    head_owner=self._draft_head_owner,
                 )
         except Exception:
             logger.warning(
@@ -1333,6 +1349,10 @@ class Eagle3Proposer:
         # the K-step propose loop -> a fresh fused program per context. Enclosing
         # them makes a fixed, bucketed program per [n, hidden] shape.
         assert self.draft_model is not None
+        if self._draft_head_owner is not None:
+            return greedy_top_tokens.draft_top_token_ids(
+                self._draft_head_owner, hidden
+            )
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
         if d2t is None:
             # No draft->target mapping table. Upstream compute_logits then asserts
@@ -1405,6 +1425,11 @@ class Eagle3Proposer:
         assert self.draft_model is not None
         indices = indices.clamp_min(0)
         positions_carry = torch.index_select(positions, positions.ndim - 1, indices)
+        if self._draft_head_owner is not None:
+            token = greedy_top_tokens.draft_top_token_ids(
+                self._draft_head_owner, last_hidden
+            )
+            return positions_carry, token
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
         if d2t is None:
             token = (

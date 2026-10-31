@@ -108,6 +108,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFIX_SLICE: bool = False
     VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
+    VLLM_TPU_QSA_FAST_SELECTION_BITSET: bool = False
+    VLLM_TPU_SHARDED_LOCAL_ARGMAX: bool = False
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_INDEXER_REQ_SHARD: bool = False
@@ -752,6 +754,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scatter-add, which XLA:TPU lowers to a global sort of every selection.
     "VLLM_TPU_QSA_PREFILL_BITSET_KERNEL": env_bool(
         "VLLM_TPU_QSA_PREFILL_BITSET_KERNEL", default=True
+    ),
+    # Qwen4-exp QSA prefill: fast single-input selection bitset with compacted
+    # active word-groups, per-chunk interval skipping, fused DCP owned-word
+    # filtering, and sort-free prefix-sum compaction in compressed_dcp_blocks.
+    "VLLM_TPU_QSA_FAST_SELECTION_BITSET": env_bool(
+        "VLLM_TPU_QSA_FAST_SELECTION_BITSET", default=False
+    ),
+    # Vocabulary-parallel TP-local argmax across MTP/Eagle3 draft steps (and
+    # eligible greedy target steps), exchanging tiny (max, id) pairs instead of
+    # all-gathering full [rows, vocab] logits.
+    "VLLM_TPU_SHARDED_LOCAL_ARGMAX": env_bool(
+        "VLLM_TPU_SHARDED_LOCAL_ARGMAX", default=False
     ),
     # Qwen4-exp QSA prefill attention: feed the MXU BF16 operands (exact
     # queries and keys, probabilities split into two BF16 terms) instead of

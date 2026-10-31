@@ -85,6 +85,33 @@ def top_tokens(owner: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Ten
     return tokens.to(torch.int64).view(-1, 1)
 
 
+def resolve_draft_head_owner(
+    draft_model: torch.nn.Module, dp_lockstep: bool
+) -> torch.nn.Module | None:
+    """Resolve the head owner for greedy MTP/Eagle3 draft token proposal, or
+    return ``None`` when the draft uses a draft->target ID map or custom head."""
+    if getattr(draft_model, "draft_id_to_target_id", None) is not None:
+        return None
+    try:
+        return resolve_head_owner(draft_model, dp_lockstep)
+    except NotImplementedError as exc:
+        logger.warning_once(
+            "VLLM_TPU_SHARDED_LOCAL_ARGMAX: draft model %s keeps full-logits "
+            "proposal (%s)",
+            type(draft_model).__name__,
+            exc,
+        )
+        return None
+
+
+def draft_top_token_ids(
+    owner: torch.nn.Module, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """The greedy draft token id of each row, ``[rows]`` int32 like
+    ``draft_model.compute_logits(hidden_states).argmax(dim=-1).to(torch.int32)``."""
+    return top_tokens(owner, hidden_states).view(-1).to(torch.int32)
+
+
 def log_step_path(is_spec_step: bool, req_ids: Sequence[str | None]) -> None:
     """Logs, once per path, that a step's tokens came from the top tokens.
 

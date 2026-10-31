@@ -11,7 +11,9 @@ import pytest
 from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
     _scatter_bitset,
     _selection_bitset,
+    _selection_bitset_fast,
 )
+from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import _compact_kept_blocks
 
 
 def _expected(blocks, lengths, *, ratio, groups, words, query_block, width):
@@ -30,6 +32,15 @@ def _actual(blocks, lengths, **kwargs):
     return np.asarray(
         jax.jit(functools.partial(_selection_bitset, interpret=True, **kwargs))(
             jnp.asarray(blocks), jnp.asarray(lengths)
+        )
+    )
+
+
+def _actual_fast(blocks, lengths, owned_words=None, **kwargs):
+    ow = None if owned_words is None else jnp.asarray(owned_words, jnp.int32)
+    return np.asarray(
+        jax.jit(functools.partial(_selection_bitset_fast, interpret=True, **kwargs))(
+            jnp.asarray(blocks), jnp.asarray(lengths), owned_words=ow
         )
     )
 
@@ -81,9 +92,9 @@ def test_indexer_like_selections_match_scatter(
     kwargs = dict(
         ratio=ratio, groups=groups, words=words, query_block=query_block, width=width
     )
-    np.testing.assert_array_equal(
-        _actual(blocks, lengths, **kwargs), _expected(blocks, lengths, **kwargs)
-    )
+    expected = _expected(blocks, lengths, **kwargs)
+    np.testing.assert_array_equal(_actual(blocks, lengths, **kwargs), expected)
+    np.testing.assert_array_equal(_actual_fast(blocks, lengths, **kwargs), expected)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
@@ -107,9 +118,9 @@ def test_adversarial_selections_match_scatter(seed):
     kwargs = dict(
         ratio=ratio, groups=groups, words=words, query_block=query_block, width=128
     )
-    np.testing.assert_array_equal(
-        _actual(blocks, lengths, **kwargs), _expected(blocks, lengths, **kwargs)
-    )
+    expected = _expected(blocks, lengths, **kwargs)
+    np.testing.assert_array_equal(_actual(blocks, lengths, **kwargs), expected)
+    np.testing.assert_array_equal(_actual_fast(blocks, lengths, **kwargs), expected)
 
 
 def test_word_carries_match_scatter_add():
@@ -123,8 +134,11 @@ def test_word_carries_match_scatter_add():
     kwargs = dict(
         ratio=ratio, groups=groups, words=words, query_block=query_block, width=128
     )
+    expected = _expected(blocks, lengths, **kwargs)
     actual = _actual(blocks, lengths, **kwargs)
-    np.testing.assert_array_equal(actual, _expected(blocks, lengths, **kwargs))
+    actual_fast = _actual_fast(blocks, lengths, **kwargs)
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(actual_fast, expected)
     # Three copies of bit 3, and two of bit 31 that carry out of the word.
     assert actual[0, 0, 0] == 3 * (1 << 3)
     assert actual[0, 6, 0] == 1 << (200 % 32)
@@ -135,5 +149,91 @@ def test_empty_input():
     blocks = np.full((16, 4), -1, np.int32)
     lengths = np.zeros((16,), np.int32)
     actual = _actual(blocks, lengths, **kwargs)
+    actual_fast = _actual_fast(blocks, lengths, **kwargs)
     assert actual.shape == (2, 128, 128)
+    assert actual_fast.shape == (2, 128, 128)
     assert not actual.any()
+    assert not actual_fast.any()
+
+
+@pytest.mark.parametrize("dcp_rank", [None, 0, 1])
+def test_fast_bitset_sparse_long_context_and_dcp_owned_words(dcp_rank):
+    """Sparse 256K-token word space (words=2048) + fused DCP owned_words filter."""
+    ratio, groups, words, query_block, width = 4, 65536, 2048, 256, 256
+    tokens, k = 512, 32
+    rng = np.random.default_rng(42)
+    lengths = rng.integers(1024, groups * ratio, tokens).astype(np.int32)
+    lengths[128:256] = 0
+    # Sparse active clusters far apart in the 2048-word space, sorted ascending
+    # per row like SparseCoreTopK.
+    hot_words = np.array([0, 1, 17, 18, 511, 512, 1400, 2046], dtype=np.int32)
+    pool = (hot_words[:, None] * 32 + np.arange(32, dtype=np.int32)[None, :]).reshape(-1)
+    blocks = np.full((tokens, k), -1, np.int32)
+    for r in range(tokens):
+        valid_pool = pool[pool < lengths[r] // ratio]
+        cnt = min(k, valid_pool.size)
+        if cnt > 0:
+            blocks[r, :cnt] = np.sort(rng.choice(valid_pool, cnt, replace=False))
+    owned_words = None
+    if dcp_rank is not None:
+        word_tokens = np.arange(words, dtype=np.int32) * (ratio * 32)
+        owned_words = ((word_tokens // 128) % 2 == dcp_rank).astype(np.int32)
+    kwargs = dict(
+        ratio=ratio, groups=groups, words=words, query_block=query_block, width=width
+    )
+    expected = _expected(blocks, lengths, **kwargs)
+    if owned_words is not None:
+        expected = expected * owned_words[None, :, None]
+    got = _actual_fast(blocks, lengths, owned_words=owned_words, **kwargs)
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_compact_kept_blocks_sort_free_exact_set_parity():
+    """Prefix-sum compaction matches sorted kept blocks as sets with zero sort ops."""
+    rng = np.random.default_rng(7)
+    rows, block_topk = 128, 512
+    pos_pair = np.stack(
+        [
+            np.broadcast_to(
+                np.arange(0, 2 * block_topk, 2, dtype=np.int32)[None, :],
+                (rows, block_topk),
+            ).copy(),
+            np.broadcast_to(
+                np.arange(1, 2 * block_topk, 2, dtype=np.int32)[None, :],
+                (rows, block_topk),
+            ).copy(),
+        ],
+        axis=0,
+    )
+    keep = np.zeros((2, rows, block_topk), dtype=bool)
+    for r in range(rows):
+        if r == 0:
+            cnt = 0
+        elif r == 1:
+            cnt = block_topk
+        else:
+            cnt = int(rng.integers(1, block_topk + 1))
+        if cnt:
+            flat_cols = rng.choice(2 * block_topk, cnt, replace=False)
+            for fc in flat_cols:
+                keep[fc // block_topk, r, fc % block_topk] = True
+
+    jit_compact = jax.jit(
+        functools.partial(_compact_kept_blocks, block_topk=block_topk)
+    )
+    hlo = jit_compact.lower(jnp.asarray(keep), jnp.asarray(pos_pair)).as_text("hlo")
+    assert "sort(" not in hlo
+
+    compacted = np.asarray(jit_compact(jnp.asarray(keep), jnp.asarray(pos_pair)))
+    assert compacted.shape == (rows, block_topk)
+    sentinel = 2 * block_topk + 1
+    kept_flat = np.moveaxis(np.where(keep, pos_pair, sentinel), 0, 1).reshape(
+        rows, 2 * block_topk
+    )
+    ref = np.sort(kept_flat, axis=1)[:, :block_topk]
+    ref = np.where(ref < sentinel, ref, -1)
+    compacted_sorted = np.sort(
+        np.where(compacted >= 0, compacted, sentinel), axis=1
+    )
+    compacted_sorted = np.where(compacted_sorted < sentinel, compacted_sorted, -1)
+    np.testing.assert_array_equal(compacted_sorted, ref)

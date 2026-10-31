@@ -371,3 +371,157 @@ def test_log_step_path_logs_each_path_once():
         "TPU_GREEDY_TOP_TOKENS: a speculative verify step took the top tokens",
         "TPU_GREEDY_TOP_TOKENS: a non-speculative step took the top tokens",
     ]
+
+
+def test_qwen4_exp_mtp_declares_plain_compute_logits():
+    from vllm_torchtpu.models.vllm.qwen4_exp.mtp import Qwen4ExpMTP
+
+    assert Qwen4ExpMTP.plain_compute_logits is True
+
+
+def test_resolve_draft_head_owner_handles_plain_and_mapped_drafts():
+    class PlainMtpDraft(_Owner):
+        plain_compute_logits = True
+
+        def compute_logits(self, hidden_states):
+            return self.logits_processor(self.lm_head, hidden_states)
+
+    PlainMtpDraft.compute_logits.__module__ = "vllm_torchtpu.models.vllm.qwen4_exp.mtp"
+    draft = PlainMtpDraft(_shards(torch.zeros(16, 4), 2)[0])
+    assert greedy_top_tokens.resolve_draft_head_owner(draft, False) is draft
+
+    mapped = PlainMtpDraft(_shards(torch.zeros(16, 4), 2)[0])
+    mapped.draft_id_to_target_id = torch.arange(16, dtype=torch.int32)
+    assert greedy_top_tokens.resolve_draft_head_owner(mapped, False) is None
+
+    # Unsupported custom drafts return None gracefully instead of raising.
+    assert greedy_top_tokens.resolve_draft_head_owner(torch.nn.Linear(2, 2), False) is None
+
+
+def test_draft_top_token_ids_8rank_large_vocab_and_ties(monkeypatch):
+    """8-rank TP sharded argmax at large vocab indices (> bf16 2^8 precision)
+    preserves exact global token IDs and lowest-ID tie breaking."""
+    tp_size = 8
+    vocab = 248_320
+    per_rank = vocab // tp_size
+    hidden = 8
+    gen = torch.Generator().manual_seed(19)
+    # Build synthetic per-rank shards with exact ties at large token IDs
+    # (e.g., 217_285 vs 248_319) that would collide if indices were cast to bf16.
+    hidden_states = torch.zeros((4, hidden), dtype=torch.bfloat16)
+    hidden_states[0, 0] = 1.0
+    shards = []
+    full_weights = []
+    for rank in range(tp_size):
+        w = torch.full((per_rank, hidden), -1.0, dtype=torch.bfloat16)
+        start = rank * per_rank
+        if rank == 6:
+            w[5, 0] = 3.5  # global 6 * 31040 + 5 = 186245
+        if rank == 7:
+            w[5, 0] = 3.5  # tie on row 0 -> rank 6 (186245) must win
+            w[per_rank - 1, 1] = 4.0  # global 248319 (row 1)
+            w[per_rank - 2, 2] = 2.0  # global 248318 (row 2)
+            w[per_rank - 1, 2] = 2.0  # intra-rank tie -> 248318 wins
+        shards.append(_HeadShard(w, start, tp_size, 0))
+        full_weights.append(w)
+    hidden_states[1, 1] = 1.0
+    hidden_states[2, 2] = 1.0
+    hidden_states[3, :] = 0.0  # all zeros across all 248,320 tokens -> 0 wins
+    full_argmax = (hidden_states @ torch.cat(full_weights, dim=0).T).argmax(dim=-1).to(
+        torch.int32
+    )
+
+    pairs = []
+
+    def record(pair, dim):
+        pairs.append(pair)
+        return pair.repeat(1, tp_size)
+
+    monkeypatch.setattr(lp_module, "tensor_model_parallel_all_gather", record)
+    for shard in shards:
+        greedy_top_tokens.draft_top_token_ids(_Owner(shard), hidden_states)
+    monkeypatch.setattr(
+        lp_module,
+        "tensor_model_parallel_all_gather",
+        lambda pair, dim: torch.cat(pairs, dim=-1),
+    )
+    got = greedy_top_tokens.draft_top_token_ids(_Owner(shards[0]), hidden_states)
+    assert got.dtype == torch.int32 and got.shape == (4,)
+    assert got.tolist() == [186_245, 248_319, 248_318, 0]
+    assert torch.equal(got, full_argmax)
+
+
+def test_mtp_fused_loop_and_proposer_use_sharded_local_argmax():
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+    from vllm_torchtpu.spec_decode.mtp_fused_loop import _MtpFusedLoop
+
+    gen = torch.Generator().manual_seed(11)
+    weight = torch.randn(64, 8, generator=gen)
+    owner = _Owner(_shards(weight, 1)[0])
+
+    class FakeMtp(torch.nn.Module):
+        def __init__(self, forbid_full_logits: bool):
+            super().__init__()
+            self.forbid_full_logits = forbid_full_logits
+
+        def forward(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            *,
+            spec_step_idx: int = 0,
+        ):
+            scale = (input_ids.float().unsqueeze(-1) + 1.0) * 0.05
+            out = hidden_states + scale + positions.float().unsqueeze(-1) * 0.01
+            return out, out * 0.5
+
+        def compute_logits(self, hidden_states):
+            if self.forbid_full_logits:
+                raise AssertionError("full compute_logits should not be called")
+            return hidden_states @ weight.T
+
+    input_ids = torch.tensor([2, 5, 7], dtype=torch.int32)
+    positions = torch.tensor([10, 20, 30], dtype=torch.int32)
+    hidden = torch.randn(3, 8, generator=gen)
+    seq_lens_ref = torch.tensor([11, 21, 31], dtype=torch.int32)
+    seq_lens_opt = seq_lens_ref.clone()
+    fake_cfg = SimpleNamespace()
+
+    ref_loop = _MtpFusedLoop(
+        vllm_config=fake_cfg, mtp=FakeMtp(False), num_steps=2
+    )
+    opt_loop = _MtpFusedLoop(
+        vllm_config=fake_cfg, mtp=FakeMtp(True), num_steps=2, head_owner=owner
+    )
+    assert "head_owner" not in dict(opt_loop.named_modules())
+    ref_tokens = ref_loop(input_ids, positions, hidden, seq_lens_ref)
+    opt_tokens = opt_loop(input_ids, positions, hidden, seq_lens_opt)
+    for r_tok, o_tok in zip(ref_tokens, opt_tokens):
+        assert torch.equal(r_tok, o_tok)
+        assert o_tok.dtype == torch.int32
+
+    proposer_ref = object.__new__(Eagle3Proposer)
+    proposer_ref.draft_model = FakeMtp(False)
+    proposer_ref._draft_head_owner = None
+
+    proposer_opt = object.__new__(Eagle3Proposer)
+    proposer_opt.draft_model = FakeMtp(True)
+    proposer_opt._draft_head_owner = owner
+
+    with torch.compiler.set_stance("force_eager"):
+        t_ref = Eagle3Proposer._draft_propose_token(proposer_ref, hidden)
+        t_opt = Eagle3Proposer._draft_propose_token(proposer_opt, hidden)
+        assert torch.equal(t_ref, t_opt) and t_opt.dtype == torch.int32
+
+        idx = torch.tensor([2, 0], dtype=torch.int64)
+        pos_ref, tok_ref = Eagle3Proposer._draft_rows_carry_and_token(
+            proposer_ref, positions, idx, hidden[:2]
+        )
+        pos_opt, tok_opt = Eagle3Proposer._draft_rows_carry_and_token(
+            proposer_opt, positions, idx, hidden[:2]
+        )
+        assert torch.equal(pos_ref, pos_opt)
+        assert torch.equal(tok_ref, tok_opt) and tok_opt.dtype == torch.int32

@@ -281,6 +281,7 @@ class Qwen4ExpMTP(nn.Module):
     # draft then writes its QSA caches for every token but evaluates the
     # layer, and returns both outputs, at those rows only.
     supports_draft_rows = True
+    plain_compute_logits = True
     # Identical to the target's: vLLM writes this onto the shared quant config.
     packed_modules_mapping = Qwen4ExpForCausalLM.packed_modules_mapping
 
