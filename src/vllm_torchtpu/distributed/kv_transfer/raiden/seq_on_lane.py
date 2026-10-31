@@ -70,6 +70,22 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.tags import (
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 
+
+def _libtpu_key(package_version: Callable[[str], str] | None) -> str:
+    """libtpu identity for a layout fingerprint.
+
+    An injected ``package_version`` (tests) is used as given; otherwise the
+    build actually loaded, which may come from ``TPU_LIBRARY_PATH`` rather than
+    the pip package (see ``tpu_info.get_libtpu_cache_key``).
+    """
+    if package_version is not None:
+        return package_version("libtpu")
+    # Deferred so that importing this module does not import tpu_info.
+    from vllm_torchtpu.tpu_info import get_libtpu_cache_key
+
+    return get_libtpu_cache_key()
+
+
 # One vreg lane row: the DMA / tile granule of the layout.
 LANE_WIDTH = 128
 # fp8 packs four head-dim elements per 32-bit word.
@@ -959,7 +975,7 @@ def measured_sol_layout_fingerprint(
     payload: dict[str, Any] = {
         "schema": SOL_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
+        "libtpu": _libtpu_key(package_version),
         "minor_to_major": list(minor_to_major),
         "tiles": [list(tile) for tile in tiles],
         "element_size_in_bits": element_bits,

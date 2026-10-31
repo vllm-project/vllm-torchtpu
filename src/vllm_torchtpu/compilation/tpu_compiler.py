@@ -409,6 +409,9 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
 
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
+    # Deferred: tpu_info imports Pallas, which this module otherwise avoids.
+    from vllm_torchtpu.tpu_info import get_libtpu_cache_key
+
     cache_config = vllm_config.cache_config
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
@@ -417,7 +420,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "torch_tpu": importlib_metadata.version("torch-tpu"),
         "jax": importlib_metadata.version("jax"),
         "jaxlib": importlib_metadata.version("jaxlib"),
-        "libtpu": importlib_metadata.version("libtpu"),
+        "libtpu": get_libtpu_cache_key(),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         "parallel": {
