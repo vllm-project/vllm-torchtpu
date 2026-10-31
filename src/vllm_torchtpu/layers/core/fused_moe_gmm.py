@@ -91,15 +91,17 @@ _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 # routing tables) against ~90 us of SparseCore v2 plus convert; decode at the
 # 1024-token bucket keeps v2. A decode step of 2048 tokens takes it too.
 TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
-# From this EP token count, the SparseCore dispatch gathers only the first
-# DISPATCH_HEAD_ROWS routed rows, and the expert MLP reads the rest straight
-# from the tokens' rows (gmm_v2_fused_mlp's token_rows) while it runs the
-# head. Below it the gather is short and the TensorCore has other work to
-# hide it behind.
+# From this EP token count, the expert MLP reads the routed rows straight
+# from the tokens' rows (gmm_v2_fused_mlp's token_rows), past the first
+# DISPATCH_HEAD_ROWS that the SparseCore gathers ahead. Below it the full
+# SparseCore gather is short and the TensorCore has other work to hide it
+# behind.
 DISPATCH_SPLIT_MIN_TOKENS = 4096
 # Whole 2048-row ragged_gather_v2 blocks, and whole 16-row sublane blocks as
-# gmm_v2_fused_mlp's head must be.
-DISPATCH_HEAD_ROWS = 4096
+# gmm_v2_fused_mlp's head must be, or 0 (the default): no SparseCore gather,
+# the MLP fetches every row. A head can only start once the dispatch
+# all-gather lands, so it sits between the two with nothing to hide it.
+DISPATCH_HEAD_ROWS = 0
 # The dtype an EP batch's rows may arrive quantized to, as int32 words
 # (quantize_dispatch_rows), as the fused MLP's gate/up leg quantizes them.
 DISPATCH_QUANT_DTYPE = jnp.float8_e4m3fn
@@ -977,8 +979,8 @@ def fused_moe_func(
 
     num_routes = num_tokens * topk
     # Large batches (prefill chunks; the count is of tokens gathered across
-    # EP ranks): the SparseCore gathers only the head of the routed rows and
-    # the fused MLP starts on it as soon as it lands, fetching the rest itself.
+    # EP ranks): the fused MLP fetches the routed rows itself, past a head of
+    # DISPATCH_HEAD_ROWS the SparseCore gathers first if that is not 0.
     dispatch_head_only = (
         use_ep
         and use_sparse_core
@@ -1026,7 +1028,10 @@ def fused_moe_func(
         skip_padded_tokens=skip_padded_tokens,
         gather_rows=not dispatch_head_only,
     )
-    if dispatch_head_only:
+    if dispatch_head_only and DISPATCH_HEAD_ROWS == 0:
+        # No head rows: gmm_v2_fused_mlp then takes no lhs operand.
+        x = hidden_states[:0]
+    elif dispatch_head_only:
         valid_count = group_sizes.sum(dtype=jnp.int32)
         x = ragged_gather_v2(
             hidden_states,
