@@ -905,6 +905,11 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
             self.model.embed_tokens = embedding_rows.packed_embedding(embed)
             logger.info("DeepSeek-V4: embedding lookups read the packed-row table")
 
+        if not isinstance(self.lm_head, PPMissingLayer) and (
+            streamed_logits.pack_head_blocks(self.logits_processor, self.lm_head)
+        ):
+            logger.info("DeepSeek-V4: LM head streams from transposed vocab blocks")
+
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

@@ -13,8 +13,9 @@
 # limitations under the License.
 """Streamed LM-head kernel vs XLA's dot.
 
-Interpret mode gates the slab ring (which block lands in which slot) on the
-host; on a TPU the real head shape must match the dot bit for bit.
+Interpret mode gates the slab ring (which block lands in which slot) and the
+packed head layout on the host; on a TPU the real head shape must match the
+dot bit for bit.
 """
 
 import jax
@@ -27,6 +28,7 @@ from vllm_torchtpu.kernels.streamed_logits import (
     _streamed_logits,
     _streamed_logits_shard,
     block_rows,
+    pack_head,
     streamed_logits,
     vocab_shard_columns,
     vocab_shard_layout,
@@ -53,6 +55,14 @@ def test_block_rows_tiles_vocab():
     assert block_rows(129280, _TILING) == 1280
     assert block_rows(640, _TILING) == 640
     assert block_rows(100, _TILING) == 0
+    assert block_rows(320, _TILING) == 0
+
+
+def test_pack_head_transposes_blocks():
+    w = jnp.arange(6 * 4, dtype=jnp.float32).reshape(6, 4)
+    packed = np.asarray(pack_head(w, 3))
+    assert packed.shape == (2, 4, 3)
+    np.testing.assert_array_equal(packed[1], np.asarray(w)[3:6].T)
 
 
 @pytest.mark.parametrize(
@@ -61,12 +71,12 @@ def test_block_rows_tiles_vocab():
         (8, 2560, 256, 640),
         (5, 3840, 128, 1280),
         (24, 640, 256, 640),
-        (8, 320, 128, 320),
+        (8, 384, 128, 128),
     ],
 )
 def test_interpret_matches_dot(m, vocab, hidden, rows):
     x, w = _inputs(m, vocab, hidden, m + vocab)
-    got = _streamed_logits(x, w, rows=rows, tiling=_TILING, interpret=True)
+    got = _streamed_logits(x, pack_head(w, rows), tiling=_TILING, interpret=True)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(_dot(x, w)))
 
 
@@ -86,7 +96,7 @@ def test_vocab_shard_layout_covers_head():
     [
         (16, 5120, 256, 8, 640),
         (8, 5760, 128, 4, 640),
-        (24, 4160, 128, 8, 320),
+        (24, 4224, 128, 8, 384),
     ],
 )
 def test_interpret_shards_concatenate_to_dot(m, vocab, hidden, shards, rows):
@@ -94,14 +104,14 @@ def test_interpret_shards_concatenate_to_dot(m, vocab, hidden, shards, rows):
     x, w = _inputs(m, vocab, hidden, m + vocab)
     want = np.asarray(_dot(x, w))
     rows, per_shard, first = vocab_shard_layout(vocab, shards, tiling)
+    packed = pack_head(w, rows)
     parts = []
     for f, (lo, hi) in zip(first, vocab_shard_columns(vocab, shards, tiling)):
         got = np.asarray(
             _streamed_logits_shard(
                 x,
-                w,
+                packed,
                 jnp.array([f], jnp.int32),
-                rows=rows,
                 num_blocks=per_shard,
                 tiling=tiling,
                 interpret=True,
@@ -116,8 +126,10 @@ def test_interpret_shards_concatenate_to_dot(m, vocab, hidden, shards, rows):
 @pytest.mark.parametrize("m", [8, 128])
 def test_tpu_bit_exact_at_head_shape(m):
     x, w = _inputs(m, 129280, 4096, m)
+    packed = pack_head(w, block_rows(129280, _TILING))
     np.testing.assert_array_equal(
-        np.asarray(streamed_logits(x, w, _TILING)), np.asarray(jax.jit(_dot)(x, w))
+        np.asarray(streamed_logits(x, packed, _TILING)),
+        np.asarray(jax.jit(_dot)(x, w)),
     )
 
 
@@ -127,12 +139,12 @@ def test_tpu_shards_bit_exact_at_head_shape(m):
     x, w = _inputs(m, 129280, 4096, m)
     want = np.asarray(jax.jit(_dot)(x, w))
     rows, per_shard, first = vocab_shard_layout(129280, 8, _TILING)
+    packed = pack_head(w, rows)
     for f in first:
         got = _streamed_logits_shard(
             x,
-            w,
+            packed,
             jnp.array([f], jnp.int32),
-            rows=rows,
             num_blocks=per_shard,
             tiling=_TILING,
         )

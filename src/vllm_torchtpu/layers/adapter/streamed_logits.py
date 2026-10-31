@@ -34,6 +34,7 @@ from vllm_torchtpu.kernels.streamed_logits import (
     vocab_shard_layout,
 )
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.utils import synchronize_tensors
 
 
 def _tiling() -> LogitsTiling:
@@ -49,7 +50,8 @@ def _logits(x: jax.Array, w: jax.Array) -> jax.Array:
 
 
 def _fake_streamed_logits(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    return torch.empty((x.shape[0], w.shape[0]), dtype=x.dtype, device=x.device)
+    cols = w.shape[0] * w.shape[2]
+    return torch.empty((x.shape[0], cols), dtype=x.dtype, device=x.device)
 
 
 # Registered at import: compute_logits runs inside a compiled graph.
@@ -66,8 +68,8 @@ def _logits_shard(
 def _fake_streamed_logits_shard(
     x: torch.Tensor, w: torch.Tensor, first_block: torch.Tensor, num_shards: int
 ) -> torch.Tensor:
-    _, per_shard, _ = vocab_shard_layout(w.shape[0], num_shards, _tiling())
-    cols = per_shard * block_rows(w.shape[0], _tiling())
+    _, per_shard, _ = vocab_shard_layout(w.shape[0] * w.shape[2], num_shards, _tiling())
+    cols = per_shard * w.shape[2]
     return torch.empty((x.shape[0], cols), dtype=x.dtype, device=x.device)
 
 
@@ -82,6 +84,8 @@ _SHARD_RANK: torch.Tensor | None = None
 _SHARD_FIRST_BLOCKS: torch.Tensor | None = None
 # Lane-aligned width of the rank tag appended to each rank's gathered rows.
 _RANK_TAG_COLS = 128
+# Head buffer holding the weight as `kernels.streamed_logits.pack_head` stores it.
+_PACKED = "streamed_logits_blocks"
 
 
 def _is_plain_head(processor: LogitsProcessor, head: VocabParallelEmbedding) -> bool:
@@ -115,13 +119,38 @@ def _is_plain_matmul(
     )
 
 
+def pack_head_blocks(processor: LogitsProcessor, head: VocabParallelEmbedding) -> bool:
+    """Store a copy of a plain head's weight in the kernel's blocked transposed
+    layout, which `compute_logits` then streams; returns whether it did. Call
+    once after the weights load, outside any trace. The original weight stays
+    for any other reader of the head."""
+    if not _is_plain_head(processor, head):
+        return False
+    w = head.weight.data
+    vocab, hidden = w.shape
+    rows = block_rows(vocab, _tiling())
+    # `kernels.streamed_logits.pack_head`, in torch.
+    blocks = w.view(vocab // rows, rows, hidden).transpose(1, 2).contiguous()
+    # A fresh buffer, so torch_tpu does not keep `blocks` as a view chain on
+    # the weight and re-materialize it every step (as in transpose_wkv_wgate).
+    packed = torch.empty(blocks.shape, dtype=w.dtype, device=w.device).copy_(blocks)
+    synchronize_tensors([packed])
+    head.register_buffer(_PACKED, packed, persistent=False)
+    return True
+
+
+def _packed(head: VocabParallelEmbedding) -> torch.Tensor | None:
+    return getattr(head, _PACKED, None)
+
+
 def compute_logits(
     processor: LogitsProcessor, head: VocabParallelEmbedding, hidden: torch.Tensor
 ) -> torch.Tensor | None:
     """``processor(head, hidden)``, through the streamed kernel when it is a
-    plain bf16 head matmul."""
-    if _is_plain_matmul(processor, head, hidden):
-        return _op(hidden, head.weight)
+    plain bf16 head matmul and `pack_head_blocks` packed the head."""
+    packed = _packed(head)
+    if packed is not None and _is_plain_matmul(processor, head, hidden):
+        return _op(hidden, packed)
     return processor(head, hidden)
 
 
@@ -132,7 +161,7 @@ def prepare_vocab_shard(
     coordinator whose ranks all hold the same head); returns whether it is
     armed. Call once after the weights load, outside any trace."""
     global _SHARD_GROUP, _SHARD_RANK, _SHARD_FIRST_BLOCKS
-    if not _is_plain_head(processor, head):
+    if _packed(head) is None or not _is_plain_head(processor, head):
         return False
     _, per_shard, first = vocab_shard_layout(
         head.weight.shape[0], group.world_size, _tiling()
@@ -172,7 +201,7 @@ def compute_logits_vocab_sharded(
     position = (ranks == _SHARD_RANK).float().argmax().view(1)
     first_block = torch.index_select(_SHARD_FIRST_BLOCKS, 0, position)
     x = gathered[:, :hidden_size].contiguous()
-    part = _shard_op(x, head.weight, first_block, world)
+    part = _shard_op(x, _packed(head), first_block, world)
     # Block p of the leading axis (position p's rows) goes to position p;
     # block p of the result is position p's shard for this rank's rows.
     received = funcol.all_to_all_single(part, None, None, _SHARD_GROUP.device_group)
