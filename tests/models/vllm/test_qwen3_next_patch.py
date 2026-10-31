@@ -24,7 +24,6 @@ from vllm.model_executor.models import qwen3_5, qwen3_next
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.models.vllm import qwen3_next_patch as patch_mod
-from vllm_torchtpu.models.vllm.qwen3_5_mtp import UPSTREAM_PREDICTOR_FORWARD
 from vllm_torchtpu.models.vllm.qwen3_next_patch import (
     UPSTREAM_DECODER_LAYER_FORWARD,
     UPSTREAM_MODEL_FORWARD,
@@ -40,12 +39,6 @@ PINNED_DECODER_LAYER_HASH = (
 )
 PINNED_MODEL_FORWARD_HASH = (
     "a9c1265f14e88e54138394b9038db621813bb6357a9077ad50d1691db0ac4398"
-)
-# qwen3_5_mtp.py replaces this upstream drafter forward with a copy that
-# keeps its SP chunk before the MTP layer and all-gather after the final
-# norm, which is what lets tpu_platform admit MTP under SP.
-PINNED_QWEN3_5_MTP_FORWARD_HASH = (
-    "af988ccd1ba49bf2953bb9858d7a2082c405d260d2ebb64413c6707c34a80d22"
 )
 requires_pinned_vllm = pytest.mark.skipif(
     vllm.__version__ != PINNED_VLLM_VERSION,
@@ -70,19 +63,6 @@ def test_upstream_qwen3_next_forward_unchanged():
     assert actual_model_hash == PINNED_MODEL_FORWARD_HASH, (
         "Upstream Qwen3NextModel.forward has drifted. "
         "Re-sync src/vllm_torchtpu/models/vllm/qwen3_next_patch.py."
-    )
-
-
-@requires_pinned_vllm
-def test_upstream_qwen3_5_mtp_forward_unchanged():
-    """Pin the upstream Qwen3.5 drafter forward that qwen3_5_mtp.py copies."""
-    source = inspect.getsource(UPSTREAM_PREDICTOR_FORWARD)
-    actual_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    assert actual_hash == PINNED_QWEN3_5_MTP_FORWARD_HASH, (
-        "Upstream Qwen3_5MultiTokenPredictor.forward has drifted. Re-sync "
-        "src/vllm_torchtpu/models/vllm/qwen3_5_mtp.py and re-check that it "
-        "still chunks and all-gathers under SP before admitting MTP in "
-        "tpu_platform.py."
     )
 
 

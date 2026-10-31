@@ -12,76 +12,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""The Qwen3.5 MTP drafts come from upstream; the sharded loader reads them."""
+
 from vllm.model_executor.models import ModelRegistry
-from vllm.model_executor.models.interfaces import supports_pp
+from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MoeMTP, Qwen3_5MTP
 
+from vllm_torchtpu.model_loader_patches import _unused_checkpoint_tensor_predicate
 from vllm_torchtpu.models.vllm import register_models
-from vllm_torchtpu.models.vllm.qwen3_5_mtp import Qwen3_5MoeMTP, Qwen3_5MTP
 
 
-def test_qwen35_mtp_drafts_declare_pipeline_support():
-    assert supports_pp(Qwen3_5MTP)
-    assert supports_pp(Qwen3_5MoeMTP)
-
-
-def test_qwen35_mtp_drafts_accept_the_upstream_constructor_assignment():
-    """Upstream's `__init__` sets `make_empty_intermediate_tensors` on the
-    instance; a read-only property on the subclass would make every Qwen3.5
-    MTP draft fail to construct ("property ... has no setter")."""
-    import torch
-
-    for cls in (Qwen3_5MTP, Qwen3_5MoeMTP):
-        draft = cls.__new__(cls)
-        torch.nn.Module.__init__(draft)
-        draft.make_empty_intermediate_tensors = lambda *args: None
-        assert callable(draft.make_empty_intermediate_tensors)
-
-
-def test_qwen35_mtp_drafts_are_registered_over_upstream():
+def test_qwen35_mtp_drafts_resolve_to_upstream():
+    """No local override: upstream supports PP and the checkpoint filter."""
     register_models()
     for arch, cls in (("Qwen3_5MTP", Qwen3_5MTP), ("Qwen3_5MoeMTP", Qwen3_5MoeMTP)):
         assert ModelRegistry.models[arch].load_model_cls() is cls
 
 
-def test_predictor_forward_embeds_on_a_non_first_pipeline_rank(monkeypatch):
-    """The embedding branch runs whenever no intermediate tensors are given,
-    on a stage whose PP group says it is not the first rank."""
-    from types import SimpleNamespace
-
+def test_sharded_loader_fetches_what_upstream_load_weights_reads(monkeypatch):
+    """The fetch plan built from upstream's ``is_unused_checkpoint_weight``
+    keeps exactly the tensors upstream's ``load_weights`` reads."""
     import torch
     from vllm.model_executor.models import qwen3_5_mtp as upstream
 
-    import vllm_torchtpu.models.vllm.qwen3_5_mtp as ours
-
-    monkeypatch.setattr(
-        ours,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=False, is_last_rank=True),
+    names = (
+        "mtp.fc.weight",
+        "mtp.layers.0.mlp.experts.3.up_proj.weight",
+        "mtp.layers.0.mlp.experts.3.up_proj.weight_scale_inv",
+        "mtp.norm.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.91.mlp.gate.weight",
+        "model.norm.weight",
+        "model.embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
+        "lm_head.weight",
     )
-    calls = []
+    read: list[str] = []
 
-    class Layer:
-        use_attn_reduce_scatter_for_moe = False
+    class RecordingLoader:
+        def __init__(self, module):
+            pass
 
-        def __call__(self, *, positions, hidden_states, residual):
-            calls.append(("layer", residual))
-            return hidden_states, hidden_states
+        def load_weights(self, weights, mapper=None):
+            read.extend(name for name, _ in weights)
 
-    predictor = SimpleNamespace(
-        embed_input_ids=lambda ids: torch.ones(ids.shape[0], 2),
-        pre_fc_norm_embedding=lambda x: x,
-        pre_fc_norm_hidden=lambda x: x,
-        fc=lambda x: x[:, :2] + x[:, 2:],
-        num_mtp_layers=1,
-        layers=[Layer()],
-        norm=lambda h, r: (h + r, None),
-    )
-    out = upstream.Qwen3_5MultiTokenPredictor.forward(
-        predictor,
-        input_ids=torch.zeros(3, dtype=torch.long),
-        positions=torch.arange(3),
-        hidden_states=torch.full((3, 2), 2.0),
-    )
-    assert calls == [("layer", None)]
-    # fc adds embedding (1) and hidden (2); norm adds the residual again.
-    assert torch.equal(out, torch.full((3, 2), 6.0))
+    monkeypatch.setattr(upstream, "AutoWeightsLoader", RecordingLoader)
+    for cls in (Qwen3_5MTP, Qwen3_5MoeMTP):
+        draft = cls.__new__(cls)
+        torch.nn.Module.__init__(draft)
+        is_unused = _unused_checkpoint_tensor_predicate(draft)
+        assert is_unused is not None
+        for name in names:
+            read.clear()
+            draft.load_weights([(name, None)])
+            assert is_unused(name) == (not read), (cls.__name__, name)
