@@ -52,6 +52,7 @@ import sympy
 import torch
 import torch.fx as fx
 
+from vllm_torchtpu.distributed import ep_mesh
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -161,7 +162,25 @@ def _signature(graph: fx.GraphModule) -> tuple:
         )
         return (str(value.dtype), dims)
 
-    return tuple(shape(value) for value in _placeholder_values(graph))
+    placeholders = tuple(shape(value) for value in _placeholder_values(graph))
+    order = ep_mesh.ep_rank_order(cached_only=True)
+    if order is not None:
+        # Fused EP MoE ops close over `ep_rank_order()` and `ep_device_ids()`
+        # inside their Pallas lowering callback rather than passing them as FX
+        # placeholders. On multi-host TPU slices (e.g. 2-host v7x-16), GKE pod
+        # placement can swap which host is Ray rank 0..7 vs 8..15 across runs,
+        # permuting `ep_rank_order()`. Including it in the graph signature
+        # prevents `TpuCompilerAdaptor._replay` from replaying a cached PjRt
+        # executable whose baked-in expert routing matches a different host order.
+        device_ids = ep_mesh.ep_device_ids(cached_only=True)
+        if device_ids is not None:
+            return (
+                *placeholders,
+                ("ep_rank_order", order),
+                ("ep_device_ids", device_ids),
+            )
+        return (*placeholders, ("ep_rank_order", order))
+    return placeholders
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:

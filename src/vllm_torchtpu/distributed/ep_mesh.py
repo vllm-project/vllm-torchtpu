@@ -56,6 +56,7 @@ logger = init_logger(__name__)
 EP_AXIS_NAME = "d"
 
 _MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
+_DEVICE_IDS_CACHE: dict[tuple[int, tuple[int, ...], int], tuple[int, ...]] = {}
 _TOKEN_GROUP_CACHE: dict[tuple, tuple[tuple[int, ...], ...]] = {}
 _SORTED_GATHER_CACHE: dict[tuple, tuple[Any, tuple[int, ...]]] = {}
 
@@ -129,27 +130,37 @@ def get_ep_group() -> Any | None:
     return group if group is not None and int(group.world_size) > 1 else None
 
 
-def ep_device_ids() -> tuple[int, ...] | None:
+def ep_device_ids(*, cached_only: bool = False) -> tuple[int, ...] | None:
     """Global TPU device ids of the EP group, in EP-rank order.
 
     This is the natural order -- mesh index i would be EP rank i -- but it is
     NOT the order `build_ep_mesh` uses; see `ep_rank_order` for why. Returns
     None when EP is off.
+
+    When `cached_only=True`, returns the cached device ids populated at weight
+    load without triggering a `torch.distributed.all_gather_object` collective
+    (returning None if no EP mesh was built for this model).
     """
     group = get_ep_group()
     if group is None:
         return None
     ranks = tuple(int(r) for r in group.ranks)
-    rank_to_device_id = _collect_rank_to_device_id(
-        group, _get_current_global_rank(), _get_tpu_global_device_id()
-    )
+    global_rank = _get_current_global_rank()
+    device_id = _get_tpu_global_device_id()
+    cache_key = (global_rank, ranks, device_id)
+    cached = _DEVICE_IDS_CACHE.get(cache_key)
+    if cached is not None or cached_only:
+        return cached
+    rank_to_device_id = _collect_rank_to_device_id(group, global_rank, device_id)
     missing = [r for r in ranks if r not in rank_to_device_id]
     if missing:
         raise RuntimeError(
             "Could not map all EP ranks to TPU global device ids: "
             f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}"
         )
-    return tuple(rank_to_device_id[r] for r in ranks)
+    device_ids = tuple(rank_to_device_id[r] for r in ranks)
+    _DEVICE_IDS_CACHE[cache_key] = device_ids
+    return device_ids
 
 
 def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
@@ -195,7 +206,7 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
 
 
-def ep_rank_order() -> tuple[int, ...] | None:
+def ep_rank_order(*, cached_only: bool = False) -> tuple[int, ...] | None:
     """EP rank at each mesh index, or None when EP is off.
 
     With the mesh in ascending device-id order (PCP and DCP off; see
@@ -208,7 +219,7 @@ def ep_rank_order() -> tuple[int, ...] | None:
     expert id as `mesh_index * experts_per_shard + j`. With PCP or DCP on it is
     the identity.
     """
-    device_ids = ep_device_ids()
+    device_ids = ep_device_ids(cached_only=cached_only)
     if device_ids is None:
         return None
     return _ep_mesh_order(device_ids)
