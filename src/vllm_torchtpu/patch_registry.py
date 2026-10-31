@@ -146,6 +146,14 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    # Chat-template rendering in the API server.
+    # TODO(https://github.com/vllm-project/vllm/pull/62622): Remove this patch
+    # once the pinned vLLM follows Jinja namespace aliases in content-format
+    # detection.
+    Patch(
+        "vllm_torchtpu.renderer_patches:patch_chat_template_namespace_aliases",
+        _ACTIVE,
+    ),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
