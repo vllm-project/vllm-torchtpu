@@ -57,6 +57,10 @@ def register_tpu_platform() -> str:
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     _log_tpu_info()
+    try:
+        import vllm_torchtpu.layers.adapter.quantization  # noqa: F401
+    except Exception:
+        pass
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"
 
 
