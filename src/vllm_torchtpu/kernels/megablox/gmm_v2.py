@@ -1045,6 +1045,10 @@ def fused_mlp_inner_kernel(
 
 # Token rows one DMA wait covers before the last few, a multiple of 8.
 TOKEN_ROW_WAIT = 8
+# Most SMEM token_rows' word ids (one per row) and halves masks (one per
+# sublane block) may take, leaving headroom for the kernel's other scalars;
+# a larger batch keeps its rows gathered.
+TOKEN_ROWS_SMEM_BUDGET_BYTES = 512 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2028,6 +2032,11 @@ def can_fuse_mlp(
     """
     if token_rows and (lhs.dtype.itemsize != 2 or _padded_size_m(lhs) != lhs.shape[0]):
         return False
+    if token_rows:
+        size_m = lhs.shape[0]
+        sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
+        if 4 * (size_m + size_m // sublane) > TOKEN_ROWS_SMEM_BUDGET_BYTES:
+            return False
     if not _fused_mlp_widths_match(rhs1, rhs2, rhs_quant_dtype):
         return False
     cfgs = make_fused_mlp_configs(
