@@ -76,6 +76,7 @@ from vllm_torchtpu.tracing.annotation import TraceAnnotation
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_manager import KVCacheManager as VllmKVCacheManager
     from vllm.v1.request import Request
 
 import vllm_torchtpu.distributed.utils as dist_utils
@@ -782,6 +783,9 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         self._connector_metadata: TPUConnectorMetadata | None = None
+        # Scheduler side: see `bind_kv_cache_manager`.
+        self._refusal_reasons: dict[str, str] = {}
+        self._num_refusals: dict[str, int] = {}
         use_raiden = self.force_raiden_connector or _use_raiden_connector(vllm_config)
         self.use_raiden = use_raiden
         self._stage3_fa_group_index = 0
@@ -875,6 +879,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
+        self._refusal_reasons.pop(request.request_id, None)
         return self.connector_scheduler.request_finished(request, block_ids)
 
     def request_finished_all_groups(
@@ -883,6 +888,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
+        self._refusal_reasons.pop(request.request_id, None)
 
         if self.use_raiden and _use_raiden_stage3_transport():
             for transfer_group in self._stage3_transfer_groups:
@@ -946,8 +952,54 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         Get the KV transfer stats for the connector.
         """
         if self.connector_worker is None:
-            return None
+            return self._take_scheduler_stats()
         return self.connector_worker.get_kv_connector_stats()
+
+    def bind_kv_cache_manager(self, kv_cache_manager: "VllmKVCacheManager") -> None:
+        """Count why the scheduler's KV cache manager refuses admissions.
+
+        Wraps `allocate_slots`, and the coordinator's block count it uses, on
+        this manager instance only. A waiting request counts once per reason
+        while it keeps being refused (the queue head is retried every step).
+        """
+        super().bind_kv_cache_manager(kv_cache_manager)
+        coordinator = kv_cache_manager.coordinator
+        orig_get_num_blocks = coordinator.get_num_blocks_to_allocate
+        orig_allocate_slots = kv_cache_manager.allocate_slots
+        num_required = 0
+
+        def get_num_blocks_to_allocate(*args, **kwargs) -> int:
+            nonlocal num_required
+            num_required = orig_get_num_blocks(*args, **kwargs)
+            return num_required
+
+        def allocate_slots(request: "Request", *args, **kwargs):
+            blocks = orig_allocate_slots(request, *args, **kwargs)
+            if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                req_id = request.request_id
+                if blocks is not None:
+                    self._refusal_reasons.pop(req_id, None)
+                else:
+                    reason = _refusal_reason(kv_cache_manager, num_required, kwargs)
+                    if self._refusal_reasons.get(req_id) != reason:
+                        self._refusal_reasons[req_id] = reason
+                        self._num_refusals[reason] = (
+                            self._num_refusals.get(reason, 0) + 1
+                        )
+            return blocks
+
+        coordinator.get_num_blocks_to_allocate = get_num_blocks_to_allocate  # type: ignore[method-assign]
+        kv_cache_manager.allocate_slots = allocate_slots  # type: ignore[method-assign]
+
+    def _take_scheduler_stats(self) -> TpuKVConnectorStats | None:
+        """Refusals since the last step; vLLM merges scheduler-side connector
+        stats into the step's stats."""
+        if not self._num_refusals:
+            return None
+        stats = TpuKVConnectorStats()
+        stats.record_admission_refusals(self._num_refusals)
+        self._num_refusals = {}
+        return stats
 
     @classmethod
     def build_kv_connector_stats(
@@ -1042,6 +1094,28 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         scheduler = self.connector_scheduler
         if scheduler is not None and hasattr(scheduler, "update_connector_output"):
             scheduler.update_connector_output(connector_output)
+
+
+def _refusal_reason(
+    manager: "VllmKVCacheManager", num_required: int, kwargs: dict[str, Any]
+) -> str:
+    """Why `allocate_slots` refused `num_required` blocks, as in its checks.
+
+    The most fundamental reason wins: one refused for the watermark would fit
+    without it, and one refused for the in-flight load reserve (the
+    `reserved_blocks` of async-load admissions) would fit without that.
+    """
+    num_free = manager.block_pool.get_num_free_blocks()
+    watermark = (
+        manager.watermark_blocks if kwargs.get("has_scheduled_reqs", True) else 0
+    )
+    if num_required > manager.block_pool.num_gpu_blocks - 1:
+        return "exceeds_pool_capacity"
+    if num_required > num_free:
+        return "insufficient_free_blocks"
+    if num_required + watermark > num_free:
+        return "watermark"
+    return "inflight_load_reserve"
 
 
 class TPURaidenConnector(TPUConnector):
