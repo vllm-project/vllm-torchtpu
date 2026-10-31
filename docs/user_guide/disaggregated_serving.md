@@ -173,3 +173,26 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 | `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of concurrent DMA transfer streams per worker. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | KV resharding implementation (`controller` or `host`) when Prefill and Decode shardings differ. |
 | `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol for host-side KV resharding (`zmq` or `tcp`). |
+
+---
+
+## 7. Raiden P/D Completion Signaling & Failure Handling
+
+### Producer Send-Completion Signaling (`raiden_pd_send_completion`)
+
+By default, a Prefill (`kv_producer`) instance finishes the HTTP request as soon as prefill token generation completes and the KV blocks are registered with the Raiden controller, while the actual P-to-D transfer proceeds asynchronously before P frees its KV blocks.
+
+Routers and proxies that want the Prefill response to stay open until the KV transfer reaches a terminal state can opt in via `--additional-config '{"raiden_pd_send_completion": true}'` (supported on Stage-3 `TPU_KV_RESHARD_TRANSPORT=raiden` `kv_producer` instances with `TP=1, DP=1, PP=1` and a single `TPURaidenConnector`):
+
+* **Initial prefill completion (`kv_transfer_pending`)**: When prefill finishes on P, `kv_transfer_params` includes `"kv_transfer_pending": true` alongside the transfer routing metadata (`uuid`, `req_id`, `num_tokens`, `src_controller_address`, etc.). In streaming mode (`stream=True`), this is emitted as an unfinished chunk so the router can immediately dispatch the Decode request in parallel.
+* **Successful transfer completion (`kv_transfer_done`)**: Once all producer ranks report `finished_sending` with a successful transfer outcome, P closes the request with its original `finish_reason` (`length` or `stop`) and `kv_transfer_params` containing the transfer metadata plus `"kv_transfer_done": true`.
+* **Producer transfer failure (`kv_transfer_error`)**: If any producer rank fails to send or the registration expires unclaimed before Decode pulls it (`TPU_KVCACHE_P2P_WAIT_PULL_TIMEOUT`), P terminates the request with `finish_reason="error"` and a structured `kv_transfer_error` payload:
+  * `model.KVTPrefillWriteFailure`: P-side failed to write KV cache data (or reached the completion barrier without a sender outcome).
+  * `model.KVTPrefillTransferTimeout`: P-side timed out waiting for KV cache transfer completion before the registration was claimed.
+
+### Decode Load-Failure Policy (`kv_load_failure_policy`)
+
+On the Decode (`kv_consumer`) side, Raiden reports asynchronous KV load failures (`TPU_RAIDEN_INLINE_LOAD=0`) per request through `KVConnectorTransferResults.failed_recving` (supporting both single-group and hybrid multi-group KV caches) and synchronous inline load failures (`TPU_RAIDEN_INLINE_LOAD=1`) through `invalid_block_ids`. Behavior is controlled by `kv_transfer_config.kv_load_failure_policy`:
+
+* `"recompute"` (default): Releases the failed remote KV blocks and recomputes the prompt locally on the Decode instance.
+* `"fail"`: Immediately terminates the affected Decode request with `finish_reason="error"` while retaining its allocated HBM receive buffers until the connector's `finished_recving` barrier completes.
