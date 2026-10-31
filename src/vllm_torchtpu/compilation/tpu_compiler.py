@@ -92,6 +92,12 @@ _tpu_backend = TpuBackend()
 # than stalling startup for an hour.
 PEER_WAIT_S = 600.0
 _PEER_POLL_S = 0.5
+# Suffix of the marker a rank leaves next to an artifact it compiled but could
+# not save (save failed, nothing serializable), so the ranks waiting for that
+# artifact stop waiting at once instead of after PEER_WAIT_S. Markers older
+# than this process are left over from an earlier run and are ignored.
+_FAILED_SUFFIX = ".failed"
+_PROCESS_START = time.time()
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
 # weights rather than constants, by dtype and shape.
 _FINGERPRINT_MAX_NUMEL = 1 << 16
@@ -733,6 +739,36 @@ class TpuCompilerAdaptor(CompilerInterface):
         mine = os.path.join(own, key)
         return sorted(p for p in glob.glob(pattern) if p != mine)
 
+    def _mark_failed(self, key: str) -> None:
+        """Tell this host's waiting ranks that this rank will not save `key`."""
+        assert self.cache_dir is not None
+        marker = os.path.join(self.cache_dir, key + _FAILED_SUFFIX)
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with open(marker, "w"):
+                pass
+        except OSError as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Could not write %s; ranks waiting for this "
+                "range will wait out PEER_WAIT_S: %s",
+                marker,
+                e,
+            )
+
+    def _clear_failed(self, key: str) -> None:
+        """Drop a marker an earlier run left for `key`, now that it is saved."""
+        assert self.cache_dir is not None
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(self.cache_dir, key + _FAILED_SUFFIX))
+
+    def _peer_failed(self, key: str) -> str | None:
+        """A marker another rank left this run for `key`, if any."""
+        for path in self._peer_paths(key + _FAILED_SUFFIX):
+            with contextlib.suppress(OSError):
+                if os.path.getmtime(path) >= _PROCESS_START:
+                    return path
+        return None
+
     def _replay_from_peer(
         self,
         key: str,
@@ -744,12 +780,21 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         Waits for one to appear inside `wait_for_peer_artifact`. Returns the
         runnable and the peer's path, or None to compile: nothing appeared in
-        time, or what appeared was built from a different graph -- then the
-        ranks do not trace the same program and waiting on would not help.
+        time, the rank compiling it left a marker saying it will not save it,
+        or what appeared was built from a different graph -- then the ranks do
+        not trace the same program and waiting on would not help.
         """
         deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
         paths = self._peer_paths(key)
         while not paths and time.monotonic() < deadline:
+            failed = self._peer_failed(key)
+            if failed is not None:
+                logger.info(
+                    "[TpuCompilerAdaptor] %s: its owner could not save it; "
+                    "compiling it here instead of waiting",
+                    failed,
+                )
+                return None
             time.sleep(_PEER_POLL_S)
             paths = self._peer_paths(key)
         if not paths:
@@ -892,6 +937,14 @@ class TpuCompilerAdaptor(CompilerInterface):
                 "it will be recompiled on the next start",
                 compile_range,
             )
+        # Under peer replay, other ranks of the host may be waiting for this
+        # artifact: say so when it will not come, so they compile it now.
+        if fingerprint is not None:
+            assert key is not None
+            if handle is None:
+                self._mark_failed(key)
+            else:
+                self._clear_failed(key)
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
