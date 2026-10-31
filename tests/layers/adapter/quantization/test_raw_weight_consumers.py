@@ -33,7 +33,13 @@ making the consumer consistent rather than by exempting the layer:
                    now. This is the one remaining marker.
 """
 
+import pytest
 import torch
+from vllm.model_executor.model_loader.reload import (
+    finalize_layerwise_reload,
+    initialize_layerwise_reload,
+    record_metadata_for_reloading,
+)
 
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
@@ -110,6 +116,28 @@ def test_double_processing_is_idempotent_on_a_square_weight():
 
     torch.testing.assert_close(once, original.transpose(0, 1).contiguous())
     torch.testing.assert_close(twice, once), "second call must be a no-op"
+
+
+@pytest.mark.parametrize("n_out", [16, 32], ids=["square", "non_square"])
+def test_layerwise_reload_flips_the_reloaded_weight(n_out):
+    """Layerwise reload rebuilds the weight in `[n_out, n_in]` from pre-load
+    metadata and runs the hook again, while the layer keeps its attributes."""
+    method = VllmUnquantizedLinearMethod()
+    model = torch.nn.Module()
+    model.proj = _linear(n_in=16, n_out=n_out)
+    model.proj.quant_method = method
+    record_metadata_for_reloading(model)
+    method.process_weights_after_loading(model.proj)
+    live = model.proj.weight
+
+    new_weight = torch.randn(n_out, 16)
+    initialize_layerwise_reload(model)
+    model.proj.weight.weight_loader(model.proj.weight, new_weight)
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert model.proj.weight is live
+    x = torch.randn(4, 16)
+    torch.testing.assert_close(method.apply(model.proj, x), x @ new_weight.T)
 
 
 def test_marked_layer_is_never_flipped_even_twice():

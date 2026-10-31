@@ -1305,6 +1305,37 @@ class TestFp8LinearRuntimeQuant:
             _quantized_matmul_jax(x, w_q, w_scale)
 
 
+def test_dense_layerwise_reload_flips_the_reloaded_weight_once():
+    """The last hook call stands in for an MTP draft re-running it on a head it
+    borrows from the target."""
+    from vllm.model_executor.model_loader.reload import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    generator = torch.Generator().manual_seed(0)
+    first = torch.randn(128, 128, generator=generator).to(torch.bfloat16)
+    source = torch.randn(128, 128, generator=generator).to(torch.bfloat16)
+    method = VllmFp8LinearMethodTPU(FakeQuant(is_checkpoint_fp8_serialized=False))
+    model = torch.nn.Module()
+    model.proj = torch.nn.Module()
+    model.proj.quant_method = method
+    model.proj.weight = torch.nn.Parameter(first, requires_grad=False)
+    record_metadata_for_reloading(model)
+    method.process_weights_after_loading(model.proj)
+
+    initialize_layerwise_reload(model)
+    model.proj.weight.weight_loader(model.proj.weight, source)
+    finalize_layerwise_reload(model, model_config=None)
+    method.process_weights_after_loading(model.proj)
+
+    weight, scale = model.proj.weight, model.proj.weight_scale
+    dequantized = (weight.float() * scale[None, :]).t()
+    relative_error = (dequantized - source.float()).norm() / source.float().norm()
+    assert relative_error < 0.04
+
+
 @pytest.mark.tpu_test
 class TestFp8WeightTranspose:
     """Tests for weight transpose in MoE processing."""
