@@ -59,6 +59,12 @@ def patch_decode_priority() -> None:
             prefill = sum(n for n in out.num_scheduled_tokens.values() if n > decode)
             if prefill >= threshold:
                 self._tpu_decode_only_left = window
+                n = getattr(self, "_tpu_decode_windows", 0) + 1
+                self._tpu_decode_windows = n
+                if n in (1, 1000, 10000):  # path proof in the engine-core process
+                    logger.info(
+                        "Decode priority: window %d opened after %d prefill tokens", n, prefill
+                    )
         return out
 
     schedule._tpu_decode_priority = True
