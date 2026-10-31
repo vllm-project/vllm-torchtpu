@@ -318,6 +318,25 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
     )
 
 
+def _validate_peer_replay_config() -> None:
+    """Fail fast on TPU_PRECOMPILE_PEER_REPLAY with vLLM's compile cache off.
+
+    Peer replay hands a compiled range to the host's other ranks through the
+    compile cache (TpuCompilerAdaptor saves and replays the cache artifact),
+    so with VLLM_DISABLE_COMPILE_CACHE=1 there is nothing to replay.
+    """
+    if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
+        return
+    if vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
+        raise ValueError(
+            "TPU_PRECOMPILE_PEER_REPLAY=1 needs vLLM's compile cache: peer ranks "
+            "share compiled ranges through it, so it does nothing with "
+            "VLLM_DISABLE_COMPILE_CACHE=1. Unset VLLM_DISABLE_COMPILE_CACHE "
+            "(point VLLM_CACHE_ROOT at a temporary directory for a cold start "
+            "with nothing kept across runs) or set TPU_PRECOMPILE_PEER_REPLAY=0."
+        )
+
+
 def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
     """Fail fast on phased-profiling settings that would silently do nothing.
 
@@ -342,8 +361,8 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
 def _validate_lora_config(vllm_config: "VllmConfig") -> None:
     """Rejects LoRA settings that the TPU LoRA path does not support yet.
 
-    LoRA runs on a single chip with a dense model without speculative decoding.
-    Other settings fail here with the reason.
+    LoRA runs on a single chip with a dense generative model without
+    speculative decoding. Other settings fail here with the reason.
     """
     lora_config = vllm_config.lora_config
     if lora_config is None:
@@ -374,6 +393,10 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
         # FusedMoEWithLoRA requires a non-monolithic MoE; every TPU MoE method
         # is monolithic.
         "MoE models": model_config.is_moe,
+        # The runner pads the request mapping to its bucket, but a pooler
+        # hands vLLM's classification head one row per request, so the head
+        # rejects the mapping. Embedding models are untested.
+        "pooling models": model_config.runner_type == "pooling",
         # Only meaningful with tensor parallelism.
         "fully_sharded_loras": lora_config.fully_sharded_loras,
         # The TPU runner never sets the tower or connector mappings.
@@ -762,6 +785,7 @@ class TpuPlatform(Platform):
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
         _validate_phased_profiling_config(vllm_config)
+        _validate_peer_replay_config()
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "

@@ -103,6 +103,14 @@ def format_status(raw: str) -> str:
     return raw
 
 
+def is_soft_failed(prefix: str, name: str, stage: str) -> bool:
+    """Returns True when a stage recorded a non-blocking soft_failed outcome."""
+    return (
+        get_buildkite_metadata(f"{prefix}{name}:{stage}:soft_failed", default="false")
+        == "true"
+    )
+
+
 def main() -> None:
     tpu_version = os.environ.get("TPU_VERSION", "tpu6e")
     if tpu_version.startswith("v7") or "7x" in tpu_version or "tpu7" in tpu_version:
@@ -116,6 +124,7 @@ def main() -> None:
     print(f"Output directory set to: {tpu_dir} (Prefix: '{tpu_metadata_prefix}')")
 
     any_failed = False
+    soft_failed_cells: list[str] = []
 
     # 1. Process Models
     raw_models = get_buildkite_metadata("model-list", "")
@@ -149,8 +158,12 @@ def main() -> None:
                     f"{tpu_metadata_prefix}{model}:{stage}", default="❓ Untested"
                 )
                 row[stage] = result
+                # Only a failing cell needs the soft_failed lookup.
                 if result not in valid_outcomes:
-                    any_failed = True
+                    if is_soft_failed(tpu_metadata_prefix, model, stage):
+                        soft_failed_cells.append(f"{model}:{stage}")
+                    else:
+                        any_failed = True
 
             model_rows.append(row)
 
@@ -268,7 +281,10 @@ def main() -> None:
                     formatted_res = format_status(raw_res)
                     row[stage] = formatted_res
                     if formatted_res not in valid_feature_outcomes:
-                        any_failed = True
+                        if is_soft_failed(tpu_metadata_prefix, feature, stage):
+                            soft_failed_cells.append(f"{feature}:{stage}")
+                        else:
+                            any_failed = True
 
             rows.append(row)
 
@@ -367,6 +383,10 @@ def main() -> None:
     # 5. Record overall failure status for notify_test_results.sh
     failure_str = "true" if any_failed else "false"
     set_buildkite_metadata(f"{tpu_metadata_prefix}_CI_TESTS_FAILED", failure_str)
+    # Non-blocking soft_fail cells, listed by notify_test_results.sh.
+    set_buildkite_metadata(
+        f"{tpu_metadata_prefix}_CI_SOFT_FAILED", ", ".join(soft_failed_cells)
+    )
     print(f"Support matrix generation finished. ANY_FAILED={failure_str}")
 
     # Cleanup

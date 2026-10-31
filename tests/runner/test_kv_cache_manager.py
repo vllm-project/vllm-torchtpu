@@ -279,6 +279,11 @@ class TestKVCacheManager:
         self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        # No LoRA, so adapter swaps reserve no HBM.
+        self.runner.lora_slot_write_hbm_bytes.return_value = 0
+        self.runner.post_profile_hbm_reserves = (
+            TPUModelRunner.post_profile_hbm_reserves.__get__(self.runner)
+        )
         # Slots per request in the mamba pool (1 without spec decode).
         self.runner._mamba_slot_stride = 1
 
@@ -456,6 +461,35 @@ class TestKVCacheManager:
         #   avail = 10 GiB * 0.9 - 1 GiB = 8,589,934,592
         #   attn_num_blocks = (8,589,934,592 - 3 * 17 * 66560) // 4096
         #                   = 2,096,323  (vs 2,358,467 with no reserve)
+        assert self.runner.cache_config.num_gpu_blocks_override == 2096323
+
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_lora_slot_write_shrinks_num_blocks_override(
+        self, mock_mem_info, mock_get_page_size
+    ):
+        """The HBM an adapter swap holds while it runs must come out of the
+        budget the block-count overrides size against, as the KV-connector
+        reserve does, or the pinned blocks leave no room for the swap."""
+        self.runner.lora_slot_write_hbm_bytes.return_value = utils.GBYTES
+
+        layers = {}
+        mock_attn = _attention_layer_mock()
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        layers["attn_0"] = mock_attn
+        for i in range(3):
+            layers[f"mamba_{i}"] = DummyMamba()
+
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+
+        # Same 1 GiB cut as test_kv_connector_reserve_shrinks_num_blocks_override.
         assert self.runner.cache_config.num_gpu_blocks_override == 2096323
 
     @patch(
