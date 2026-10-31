@@ -360,6 +360,20 @@ class TestTpuCompilerCache:
             )
             assert self._sc_offload_flags() == expected
 
+    def test_env_override_tpu7x_offloads_all_gathers_from_half_vmem(self):
+        env_mock = {"TPU_ACCELERATOR_TYPE": "tpu7x-8"}
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+            vmem = _TPU_VMEM_BYTES_PER_TENSOR_CORE["tpu7x"]
+            assert self._sc_offload_flags() == [
+                f"--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes={vmem}",
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes="
+                f"{vmem // 2}",
+            ]
+
     @pytest.mark.parametrize("value", ["banana", "-1"])
     def test_env_override_sc_offload_bad_value_raises(self, value):
         """A value that is not "auto" or a non-negative integer stops the
