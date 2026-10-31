@@ -24,6 +24,7 @@ from torch_tpu._internal import pallas
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
+    pin_dispatch_layout,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
@@ -218,6 +219,26 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
     )
+
+
+_pin_dispatch_layout_op = pallas.jax_op(
+    "pallas::moe_pin_dispatch_layout", pin_dispatch_layout
+)
+
+
+def _fake_pin_dispatch_layout(hidden_states: torch.Tensor, topk: int) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+_pin_dispatch_layout_op.register_fake(_fake_pin_dispatch_layout)
+
+
+def pin_moe_dispatch_layout(hidden_states: torch.Tensor, topk: int) -> torch.Tensor:
+    """Same values as ``hidden_states``; on TPU, laid out as the EP SparseCore
+    dispatch reads them (``fused_moe_gmm.pin_dispatch_layout``)."""
+    if hidden_states.device.type != "tpu" or hidden_states.dim() != 2:
+        return hidden_states
+    return _pin_dispatch_layout_op(hidden_states, topk)
 
 
 def prebuild_fused_moe_kernel(

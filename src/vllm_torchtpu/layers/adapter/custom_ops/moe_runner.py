@@ -22,6 +22,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
+from vllm_torchtpu.layers.adapter.fused_moe import pin_moe_dispatch_layout
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
@@ -65,6 +66,16 @@ class VllmMoERunner(MoERunner):
             upstream_init()
 
         routed_experts._ensure_moe_quant_config_init = ensure_moe_quant_config_init
+
+    def forward(self, hidden_states, router_logits, *args, **kwargs):
+        # The router gate, the shared expert and the EP SparseCore dispatch all
+        # read these hidden states; give them the dispatch gather's layout up
+        # front rather than have XLA relayout a copy for the gather.
+        if envs.USE_MOE_SPARSE_CORE and self.moe_config.moe_parallel_config.use_ep:
+            hidden_states = pin_moe_dispatch_layout(
+                hidden_states, self.moe_config.experts_per_token
+            )
+        return super().forward(hidden_states, router_logits, *args, **kwargs)
 
     def _select_forward(self) -> Callable:
         # Upstream takes the direct path only when is_tpu(), which is False

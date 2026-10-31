@@ -42,7 +42,10 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     ragged_gather_reduce as ragged_gather_reduce_v3,
 )
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
+    pin_gather_layout,
+    ragged_gather_v2,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -95,6 +98,18 @@ def resolve_onehot_permute_threshold() -> int:
     threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
 
     return threshold
+
+
+def pin_dispatch_layout(hidden_states: jax.Array, topk: int) -> jax.Array:
+    """``hidden_states`` in the layout the EP SparseCore dispatch gathers from,
+    when this many tokens take that path (see ``prepare_routed_gmm_inputs``).
+
+    Applied before the router gate and the shared expert read the hidden
+    states, so they read that layout too instead of XLA copying the array.
+    """
+    if hidden_states.shape[0] * topk <= resolve_onehot_permute_threshold():
+        return hidden_states
+    return pin_gather_layout(hidden_states)
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:

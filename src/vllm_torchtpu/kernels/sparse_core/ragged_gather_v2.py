@@ -209,6 +209,28 @@ def main_kernel_v2(
     )(indices_hbm_ref)
 
 
+def _pin_kernel(x_hbm_ref, out_hbm_ref):
+    del x_hbm_ref, out_hbm_ref
+
+
+def pin_gather_layout(x: jax.Array) -> jax.Array:
+    """Returns ``x`` unchanged, in the HBM layout ``ragged_gather_v2`` reads.
+
+    XLA tiles a bf16 array that its own fusions read as (16, 128) and inserts
+    a full relayout copy in front of the gather, whose operand is (8, 128). An
+    aliased no-op kernel fixes the layout at the producer instead, and every
+    later reader of the result takes it as is.
+    """
+    return pl.pallas_call(
+        _pin_kernel,
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
+        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        input_output_aliases={0: 0},
+        name="pin_gather_layout",
+    )(x)
+
+
 @jax.jit
 def ragged_gather_v2(
     x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
