@@ -318,6 +318,7 @@ def test_sp_sharded_attention_input_projections_match_tp(monkeypatch, has_source
             head_dim=head_dim,
             q_lora_rank=q_lora,
             _sp_sharded_input=sp_sharded,
+            _fused_preprocess=False,
             _ced_global_from_encoder=False,
             _all_indices_fit=False,
             compressor=(
@@ -442,6 +443,7 @@ def test_write_encoder_global_kv_sp_sharded_matches_tp(monkeypatch):
         return h.float() @ w_comp
 
     attn: Any = SimpleNamespace(
+        _fused_preprocess=False,
         kv_cache=torch.ones(1),
         compressor=SimpleNamespace(project=fake_project),
         _write_global_kv=lambda kv_score, pos: (recorded_kv_scores.append(kv_score)),
