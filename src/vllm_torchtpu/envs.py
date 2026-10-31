@@ -85,6 +85,9 @@ if TYPE_CHECKING:
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
     MIXED_NUM_KV_PAGES_PER_BLOCK: int | None = None
+    TPU_MLA_SPARSE_CHUNK_FORI: bool = False
+    TPU_MLA_SPARSE_CHUNK_FORI_MIN_CHUNKS: int = 2
+    TPU_MLA_SPARSE_CHUNK_FORI_UNROLL: int = 1
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
@@ -703,6 +706,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
     "MIXED_NUM_QUERIES_PER_BLOCK": env_optional_int("MIXED_NUM_QUERIES_PER_BLOCK"),
     "MIXED_NUM_KV_PAGES_PER_BLOCK": env_optional_int("MIXED_NUM_KV_PAGES_PER_BLOCK"),
+    # Run the sparse MLA gather + attention chunk loop as a lax.fori_loop
+    # (kernels/mla/sparse/kernel.py run_chunk_loop), so compile time stops
+    # growing with the token bucket; the loop costs prefill runtime. Only from
+    # MIN_CHUNKS full chunks up, with UNROLL chunks per iteration (a bucket of
+    # at most UNROLL chunks stays fully unrolled). All three change the
+    # program, so they enter the compile hash.
+    # Added for Hy4-preview's compile time: the saving is largest with the
+    # TensorCore cache layout and masked-dense routing, many sparse MLA layers
+    # and a large max-num-batched-tokens. Elsewhere (e.g. the SparseCore
+    # layout) it saves much less, so measure the compile time saved against
+    # the prefill cost before enabling it.
+    "TPU_MLA_SPARSE_CHUNK_FORI": env_bool("TPU_MLA_SPARSE_CHUNK_FORI", default=False),
+    "TPU_MLA_SPARSE_CHUNK_FORI_MIN_CHUNKS": env_int(
+        "TPU_MLA_SPARSE_CHUNK_FORI_MIN_CHUNKS", 2
+    ),
+    "TPU_MLA_SPARSE_CHUNK_FORI_UNROLL": env_int("TPU_MLA_SPARSE_CHUNK_FORI_UNROLL", 1),
     # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
     # Off by default until the model and hardware scope of the cost model is
     # broadened or selected automatically from an explicit model profile.
