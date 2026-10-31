@@ -187,6 +187,7 @@ if TYPE_CHECKING:
     TPU_LOCAL_RANK_OFFSET: int = 0
     VLLM_TPU_DEVICE_ORDER: str = ""
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
+    TPU_VLLM_EMBEDDED_ENGINE: bool = False
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
@@ -1106,6 +1107,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DEVICE_ORDER": lambda: os.getenv("VLLM_TPU_DEVICE_ORDER", ""),
     # Same offset for the legacy worker init path; debug only.
     "DEBUG_TPU_LOCAL_RANK_OFFSET": env_int("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
+    # The engine runs inside a process that already owns the TPU runtime and
+    # torch.distributed, e.g. an RL trainer that builds an in-process LLM
+    # (VLLM_ENABLE_V1_MULTIPROCESSING=0) on its own chips. The process-global
+    # TorchTPU eager mode, the TORCH_TPU_* bootstrap env and the torchrun
+    # RANK/LOCAL_RANK/WORLD_SIZE/LOCAL_WORLD_SIZE env are then left as the
+    # host set them; the host scopes the eager mode around engine calls.
+    "TPU_VLLM_EMBEDDED_ENGINE": env_bool("TPU_VLLM_EMBEDDED_ENGINE"),
     # First slicebuilder port; each chip on a host takes base + local rank.
     "TORCH_TPU_BASE_PORT": env_int("TORCH_TPU_BASE_PORT", 8070),
     # TCPStore port for the mp multihost rendezvous; unset means the vLLM

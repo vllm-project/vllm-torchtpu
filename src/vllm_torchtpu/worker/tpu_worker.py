@@ -72,6 +72,9 @@ def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
 def _configure_tpu_process_env(
     rank: int, local_rank: int, world_size: int, local_world_size: int
 ) -> None:
+    # An embedded engine's host owns these torchrun variables.
+    if envs.TPU_VLLM_EMBEDDED_ENGINE:
+        return
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
