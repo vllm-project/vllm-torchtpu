@@ -1625,7 +1625,7 @@ class KVCacheManager:
                     f"required={required_bytes}, budget={budget}"
                 )
             caches = tuple(
-                torch.zeros(shape, dtype=dtype).to(self.runner.device)
+                torch.zeros(shape, dtype=dtype, device=self.runner.device)
                 for shape, dtype in geometry
             )
             if native_caches is not None:
