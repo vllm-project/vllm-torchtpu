@@ -54,9 +54,13 @@ _HIGH_HALF = 0xFFFF0000
 # Packed list entry: destination slot row in the low bits, the route's index
 # in the (slot, token) tables above them.
 _DST_BITS = 12
-# Rows of the per-token tables: one per slot, the last holds the route count.
+# Rows of the per-token weight table, one per slot.
 _TABLE_ROWS = 8
-_COUNT_ROW = _TABLE_ROWS - 1
+# Rows of the per-token route table: the route count, then a bit per slot set
+# when the slot's row is even.
+_COUNT_ROW = 0
+_EVEN_ROW = 1
+_ROUTE_ROWS = 2
 _VMEM_LIMIT_BYTES = 48 * 1024 * 1024
 _SMEM_BUDGET_BYTES = 512 * 1024
 
@@ -71,12 +75,13 @@ def _spare_row(topk: int) -> int:
 
 
 def can_use_gather_unpermute(
-    route_output: jax.Array, num_tokens: int, topk: int
+    route_output: jax.Array, topk_weights: jax.Array, num_tokens: int, topk: int
 ) -> bool:
     """Whether this combine shape fits the kernel."""
     num_routes, hidden_size = route_output.shape
     return (
         route_output.dtype == jnp.bfloat16
+        and topk_weights.dtype == jnp.bfloat16
         and num_routes == num_tokens * topk
         and num_routes % 2 == 0
         and hidden_size % _LANES == 0
@@ -84,7 +89,7 @@ def can_use_gather_unpermute(
         and TOKEN_BLOCK % LIST_TOKENS == 0
         and TOKEN_BLOCK % SUM_GROUP == 0
         and (LIST_TOKENS * topk) % ISSUE_UNROLL == 0
-        and topk <= _COUNT_ROW
+        and topk <= _TABLE_ROWS
         and _spare_row(topk) < (1 << _DST_BITS)
         and _TABLE_ROWS * num_tokens < (1 << (31 - _DST_BITS))
         # The row and entry tables in SMEM.
@@ -93,7 +98,7 @@ def can_use_gather_unpermute(
         and 4
         * hidden_size
         * (2 * (_slot_rows(topk) + _SUBLANES) + TOKEN_BLOCK + SUM_GROUP)
-        + 4 * _LANES * TOKEN_BLOCK * (2 * topk + 1)
+        + 4 * _LANES * TOKEN_BLOCK * (topk + 2)
         <= _VMEM_LIMIT_BYTES - 8 * 1024 * 1024
     )
 
@@ -128,9 +133,8 @@ def _route_tables(
         weight_table = jnp.where(sel, weight[j][None, :], weight_table)
 
     # Even rows sit in the low half of their 32-bit pair word.
-    token_table = jnp.where(
-        rows == _COUNT_ROW, count[None, :], jnp.where(slot_src % 2 == 0, 16, 0)
-    )
+    even_bits = jnp.left_shift((slot_src % 2 == 0).astype(jnp.int32), rows).sum(axis=0)
+    route_table = jnp.stack([count, even_bits])
     pair_rows = (slot_src // 2).reshape(-1)
 
     # Row-DMA lists: the i-th valid (slot, token) of each list of LIST_TOKENS
@@ -165,7 +169,7 @@ def _route_tables(
         block_rows,
         group_max,
         weight_table,
-        token_table,
+        route_table,
     )
 
 
@@ -178,15 +182,15 @@ def _kernel(
     group_max_ref,
     # In
     weight_ref,
-    token_ref,
+    route_ref,
     rows_hbm_ref,
     # Out
     out_ref,
     # Scratch
     slots_ref,
     weight_lanes_ref,
-    shift_lanes_ref,
     count_lanes_ref,
+    even_lanes_ref,
     acc_ref,
     sems,
     *,
@@ -226,19 +230,27 @@ def _kernel(
     def _():
         fetch(block + 1, 1 - buf)
 
-    # Per-token tables with tokens along sublanes, broadcast across lanes.
-    weights = weight_ref[...].T
-    tokens = token_ref[...].T
+    # Per-token tables with tokens along sublanes, broadcast across lanes by
+    # a matmul with one-hot rows. Every entry is exact in bf16 (a bf16 weight,
+    # a count or a bit mask below 256), so the f32 results are exact.
+    def broadcast_rows(table, num_rows):
+        shape = (table.shape[0], num_rows * _LANES)
+        one_hot = lax.broadcasted_iota(jnp.int32, shape, 0) == (
+            lax.broadcasted_iota(jnp.int32, shape, 1) // _LANES
+        )
+        return jnp.dot(
+            table.T.astype(jnp.bfloat16),
+            one_hot.astype(jnp.bfloat16),
+            preferred_element_type=jnp.float32,
+        )
+
+    weights = broadcast_rows(weight_ref[...], topk)
     for k in range(topk):
-        weight_lanes_ref[k] = jnp.broadcast_to(
-            weights[:, k : k + 1], (TOKEN_BLOCK, _LANES)
-        )
-        shift_lanes_ref[k] = jnp.broadcast_to(
-            tokens[:, k : k + 1], (TOKEN_BLOCK, _LANES)
-        )
-    count_lanes_ref[...] = jnp.broadcast_to(
-        tokens[:, _COUNT_ROW : _COUNT_ROW + 1], (TOKEN_BLOCK, _LANES)
-    )
+        weight_lanes_ref[k] = weights[:, k * _LANES : (k + 1) * _LANES]
+    routes = broadcast_rows(route_ref[...].astype(jnp.float32), _ROUTE_ROWS)
+    routes = routes.astype(jnp.int32)
+    count_lanes_ref[...] = routes[:, _COUNT_ROW * _LANES : (_COUNT_ROW + 1) * _LANES]
+    even_lanes_ref[...] = routes[:, _EVEN_ROW * _LANES : (_EVEN_ROW + 1) * _LANES]
 
     # DMA semaphores count bytes, so a wait for 8 rows covers any 8 of the
     # block's rows. A wait's row count must be static and tile aligned.
@@ -260,10 +272,11 @@ def _kernel(
         rows = pl.ds(row0, SUM_GROUP)
         group_max = group_max_ref[block * (TOKEN_BLOCK // SUM_GROUP) + g]
         count = count_lanes_ref[rows, :]
+        even = even_lanes_ref[rows, :]
 
         def slot_pass(k, *, first: bool, last: bool):
             weight = weight_lanes_ref[k, rows, :]
-            shift = shift_lanes_ref[k, rows, :].astype(jnp.uint32)
+            shift = (jnp.right_shift(even, k) & 1).astype(jnp.uint32) * 16
             valid = count > k
             slot_row0 = pl.multiple_of(k * TOKEN_BLOCK + row0, SUM_GROUP)
             for c in range(hidden_size // _LANES):
@@ -324,12 +337,15 @@ def gather_unpermute(
     Args:
       route_output: bf16 ``[num_tokens * topk, hidden]`` routed rows.
       indices: ``[num_tokens * topk]`` row of each (token, route).
-      topk_weights: ``[num_tokens * topk]`` weight of each (token, route).
+      topk_weights: bf16 ``[num_tokens * topk]`` weight of each (token, route).
       valid_rows_mask: ``[num_tokens * topk]`` whether the route's row is valid.
 
     Returns:
       bf16 ``[num_tokens, hidden]``.
     """
+    # The kernel broadcasts the weights through a bf16 matmul.
+    if topk_weights.dtype != jnp.bfloat16:
+        raise ValueError(f"topk_weights must be bf16, got {topk_weights.dtype}")
     hidden_size = route_output.shape[-1]
     (
         pair_rows,
@@ -338,7 +354,7 @@ def gather_unpermute(
         block_rows,
         group_max,
         weight_table,
-        token_table,
+        route_table,
     ) = _route_tables(
         indices,
         topk_weights,
@@ -357,14 +373,14 @@ def gather_unpermute(
             grid=(num_blocks,),
             in_specs=[
                 pl.BlockSpec((_TABLE_ROWS, TOKEN_BLOCK), token_columns),
-                pl.BlockSpec((_TABLE_ROWS, TOKEN_BLOCK), token_columns),
+                pl.BlockSpec((_ROUTE_ROWS, TOKEN_BLOCK), token_columns),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             ],
             out_specs=pl.BlockSpec((TOKEN_BLOCK, hidden_size), token_block),
             scratch_shapes=[
                 pltpu.VMEM((2, _slot_rows(topk) + _SUBLANES, hidden_size), jnp.uint32),
                 pltpu.VMEM((topk, TOKEN_BLOCK, _LANES), jnp.float32),
-                pltpu.VMEM((topk, TOKEN_BLOCK, _LANES), jnp.int32),
+                pltpu.VMEM((TOKEN_BLOCK, _LANES), jnp.int32),
                 pltpu.VMEM((TOKEN_BLOCK, _LANES), jnp.int32),
                 pltpu.VMEM((SUM_GROUP, hidden_size), jnp.float32),
                 pltpu.SemaphoreType.DMA((2,)),
@@ -385,6 +401,6 @@ def gather_unpermute(
         block_rows,
         group_max,
         weight_table,
-        token_table,
+        route_table,
         route_output,
     )

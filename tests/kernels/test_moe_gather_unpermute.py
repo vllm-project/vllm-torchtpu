@@ -74,7 +74,9 @@ def test_matches_sparsecore_order_bit_for_bit(
     rows, indices, weights, valid = _routes(
         num_tokens, hidden_size, local_fraction, seed
     )
-    assert moe_gather_unpermute.can_use_gather_unpermute(rows, num_tokens, _TOPK)
+    assert moe_gather_unpermute.can_use_gather_unpermute(
+        rows, weights, num_tokens, _TOPK
+    )
     # The generic Pallas interpreter: it checks the tables and the sum but does
     # not model the HBM pairing of bf16 rows or the DMA semaphores (see the TPU
     # test below). The TPU interpreter cannot follow the kernel's 32-bit view.

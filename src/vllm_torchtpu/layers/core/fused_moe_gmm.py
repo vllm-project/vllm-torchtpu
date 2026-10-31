@@ -607,7 +607,7 @@ def moe_gmm(
         if (
             ragged_gather_reduce is ragged_gather_reduce_v2
             and 0 < TC_COMBINE_MIN_TOKENS <= num_tokens
-            and can_use_gather_unpermute(gmm2_res, num_tokens, topk)
+            and can_use_gather_unpermute(gmm2_res, topk_weights_flat, num_tokens, topk)
         ):
             # Same result as v2's SparseCore kernel (v2 falls back to XLA only
             # for inputs far smaller than this). The TensorCore would otherwise
