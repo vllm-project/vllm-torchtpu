@@ -268,6 +268,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # Host-side decode input preparation and shadow verification; the compiled
+    # graph is unchanged.
+    "TPU_STATIC_DECODE_INPUTS",
+    "TPU_STATIC_DECODE_INPUTS_VERIFY",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

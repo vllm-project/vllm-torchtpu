@@ -198,6 +198,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    TPU_STATIC_DECODE_INPUTS: bool = False
+    TPU_STATIC_DECODE_INPUTS_VERIFY: bool = False
 
 
 def env_with_choices(
@@ -1172,6 +1174,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Reuse host input-staging buffers and unchanged attention/block-table
+    # metadata across steady-state decode and uniform spec-verify steps.
+    "TPU_STATIC_DECODE_INPUTS": env_bool("TPU_STATIC_DECODE_INPUTS", default=False),
+    # Shadow-verify that every tensor produced by the static decode path
+    # matches a freshly computed reference on each step.
+    "TPU_STATIC_DECODE_INPUTS_VERIFY": env_bool(
+        "TPU_STATIC_DECODE_INPUTS_VERIFY", default=False
     ),
 }
 
