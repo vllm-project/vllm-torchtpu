@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3 as a megakernel program: the prefill role's :class:`KimiPrefiller`
-or the decode role's :class:`KimiDecoder`, and what they support.
+"""Kimi-K3 as a megakernel program: the prefill role's :class:`KimiPrefiller`,
+the decode role's :class:`KimiDecoder`, or both on one engine
+(:class:`KimiAggregate`), and what they support.
 
 The K3 programs have no vLLM dependencies; ``megakernel.runner`` builds them
 from vLLM's configuration and the standalone tools build them directly.
@@ -68,7 +69,7 @@ def spec_tokens_per_batch(config: MegakernelEngineConfig) -> tuple[int, ...] | N
     and without a schedule every batch size gets ``num_speculative_tokens``.
     Raises ``NotImplementedError`` for a schedule the kernels can't run.
     """
-    if config.role != "decode" or not config.num_speculative_tokens:
+    if config.role not in ("decode", "aggregate") or not config.num_speculative_tokens:
         return None
     schedule = config.num_speculative_tokens_per_batch_size
     num_spec, max_seqs = config.num_speculative_tokens, config.max_num_seqs
@@ -152,15 +153,19 @@ def check(config: MegakernelEngineConfig) -> None:
     """Raise ``NotImplementedError`` for a configuration the K3 programs
     do not implement."""
     recurrent_state_dtype(config.mamba_ssm_cache_dtype)
-    if config.role == "prefill" and config.mamba_ssm_cache_dtype == "bfloat16":
+    if (
+        config.role in ("prefill", "aggregate")
+        and config.mamba_ssm_cache_dtype == "bfloat16"
+    ):
         raise NotImplementedError(
             "K3 megakernel --mamba-ssm-cache-dtype bfloat16 is decode-only; "
             "the prefill worker requires auto or float32 for its FP32 state "
             "and transfer format"
         )
-    if config.role not in ("prefill", "decode"):
+    if config.role not in ("prefill", "decode", "aggregate"):
         raise NotImplementedError(
-            f"the K3 megakernel serves one role of a P/D pair, not {config.role!r}"
+            "the K3 megakernel serves prefill, decode or aggregate, "
+            f"not {config.role!r}"
         )
     if config.tensor_parallel_size != TP_SIZE:
         raise NotImplementedError(
@@ -196,7 +201,7 @@ def check(config: MegakernelEngineConfig) -> None:
             f"the K3 prefill takes at most {MAX_STEP_TOKENS} tokens per step: "
             f"--max-num-batched-tokens <= {MAX_STEP_TOKENS}"
         )
-    if config.role == "decode" and config.num_speculative_tokens not in (
+    if config.role in ("decode", "aggregate") and config.num_speculative_tokens not in (
         0,
         3,
         DRAFT_TOKENS,
@@ -221,7 +226,7 @@ def check(config: MegakernelEngineConfig) -> None:
                 f"rates {list(own)} differ from --speculative-config's "
                 f"{list(config.synthetic_acceptance_rates or ())}"
             )
-    if config.role == "decode" and not config.async_scheduling:
+    if config.role in ("decode", "aggregate") and not config.async_scheduling:
         raise NotImplementedError(
             "the K3 decoder needs async scheduling (it keeps each request's next "
             "input on the device)"
@@ -232,16 +237,19 @@ def capabilities(config: MegakernelEngineConfig) -> Capabilities:
     check(config)
     dense = spec_tokens_per_batch(config)
     speculating = dense is not None and any(dense)
+    aggregate = config.role == "aggregate"
     return Capabilities(
-        roles=frozenset({config.role}),
+        roles=frozenset({"prefill", "decode"})
+        if aggregate
+        else frozenset({config.role}),
         sampling=SAMPLING,
         speculation="dspark" if speculating else None,
         num_speculative_tokens=config.num_speculative_tokens if speculating else 0,
         max_step_tokens=MAX_STEP_TOKENS
         if config.role == "prefill"
         else config.max_num_batched_tokens,
-        page_aligned_chunks=config.role == "prefill",
-        block_copies=config.role == "prefill",
+        page_aligned_chunks=config.role in ("prefill", "aggregate"),
+        block_copies=config.role in ("prefill", "aggregate"),
         # The decoder's plain op masks its logits (the prefill discards its
         # first tokens, so it only accepts the requests). DSpark's verify ops
         # do not mask: a step with a structured request runs plain instead.
@@ -265,6 +273,21 @@ def build(
         from vllm_torchtpu.megakernel.kimi_k3.prefill import KimiPrefiller
 
         return KimiPrefiller(config, presharded, draft_checkpoint, tp_rank=tp_rank)
+    if config.role == "aggregate":
+        from vllm_torchtpu.megakernel.kimi_k3.aggregate import KimiAggregate
+
+        return KimiAggregate(config, presharded, draft_checkpoint, tp_rank=tp_rank)
+    return build_decoder(config, presharded, draft_checkpoint, tp_rank=tp_rank)
+
+
+def build_decoder(
+    config: MegakernelEngineConfig,
+    presharded: Path,
+    draft_checkpoint: Path | None = None,
+    *,
+    tp_rank: int,
+):
+    """The decode role's :class:`KimiDecoder` (``config.role`` decode)."""
     from vllm_torchtpu.megakernel.kimi_k3.decode import KimiDecoder
     from vllm_torchtpu.megakernel.kimi_k3.decode_ops import (
         Control,

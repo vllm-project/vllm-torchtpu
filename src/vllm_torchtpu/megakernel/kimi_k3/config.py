@@ -11,9 +11,9 @@ the standalone tools install overrides before building the program.
 import dataclasses
 import hashlib
 import json
-import os
 from typing import Any
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
 
 
@@ -64,18 +64,18 @@ class KernelConfig:
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
     # Prefix keys in mla_flash_ktile tiles and a whole-window query tile under
-    # mla_flash_qtile rows (False: the window's key tile, as before).
+    # mla_flash_qtile rows. False: prefix keys use the window's key tile.
     mla_flash_prefix_tiles: bool = True
     # Cached-prefix attention in FP8 (E4M3FN keys/values from the expansion, FP8
     # queries, probabilities x16 in E4M3FN, FP32 statistics); the window's own
     # keys stay BF16. K3_PREFILL_PREFIX_FP8=1 turns it on.
     prefill_prefix_fp8: bool = dataclasses.field(
-        default_factory=lambda: os.environ.get("K3_PREFILL_PREFIX_FP8", "") == "1"
+        default_factory=lambda: envs.K3_PREFILL_PREFIX_FP8
     )
     # Prefill MoE route counts (diagnostic): each fused MoE call also returns its
     # chip's 56 local expert counts; the prefiller saves cumulative snapshots.
     prefill_route_counts: bool = dataclasses.field(
-        default_factory=lambda: os.environ.get("K3_PREFILL_ROUTE_COUNTS", "") == "1"
+        default_factory=lambda: envs.K3_PREFILL_ROUTE_COUNTS
     )
     prefill_route_counts_every: int = 200
     # Prefill EP16 expert placement (empty: the pre-shard's): an npz whose
@@ -83,18 +83,16 @@ class KernelConfig:
     # slots 56c..56c+55); the router columns and expert weights are loaded in
     # that order. A bare name loads from kimi_k3/data.
     prefill_expert_plan: str = dataclasses.field(
-        default_factory=lambda: os.environ.get("K3_PREFILL_EXPERT_PLAN", "")
+        default_factory=lambda: envs.K3_PREFILL_EXPERT_PLAN
     )
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
     prefill_expert_parallel: int = 16
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
-    # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
+    # EP16: all serving windows (FP32 reduce-scatter).
     # False: the unfused SparseCore gather/combine.
     prefill_fused_moe: bool = True
-    # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
-    moe_reduce_dtype: str = "float32"
     # Weight loading.
     read_streams: int = 4
     load_inflight_gb: float = 16.0
@@ -107,9 +105,7 @@ class KernelConfig:
     # Hot-expert fp8 copies (off when empty): an npz whose ``experts``
     # [92, 8, S] holds the global expert id in copy slot j of EP group g
     # per MoE layer (-1: empty). A bare name loads from kimi_k3/data.
-    kd_hot_plan: str = dataclasses.field(
-        default_factory=lambda: os.environ.get("K3_HOT_PLAN", "")
-    )
+    kd_hot_plan: str = dataclasses.field(default_factory=lambda: envs.K3_HOT_PLAN)
     # A hot expert's routes use its fp8 copy from this many rows.
     hot_min_rows: int = 9
     # Hot-expert MXFP4 replicas on other EP groups (off when empty; exclusive
@@ -120,15 +116,13 @@ class KernelConfig:
     # whichever gives the lowest modeled slowest-group expert time. A bare
     # name loads from kimi_k3/data.
     kd_replica_plan: str = dataclasses.field(
-        default_factory=lambda: os.environ.get("K3_REPLICA_PLAN", "")
+        default_factory=lambda: envs.K3_REPLICA_PLAN
     )
     # FP8 wires for attention DP's hidden-row gathers (off when empty): "t0"
     # the attention input, "t10" the MoE input. Rows travel as e4m3 with one
     # FP32 scale each; every rank uses the dequantized rows.
     fp8_wires: tuple[str, ...] = dataclasses.field(
-        default_factory=lambda: tuple(
-            filter(None, os.environ.get("K3_FP8_WIRES", "").split(","))
-        )
+        default_factory=lambda: tuple(filter(None, envs.K3_FP8_WIRES.split(",")))
     )
     pool_report: bool = False
     vmem_report: bool = False
@@ -141,8 +135,6 @@ class KernelConfig:
             raise ValueError("fp8_wires holds t0 and/or t10")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
-        if self.moe_reduce_dtype not in ("float32", "bfloat16"):
-            raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):
             raise ValueError("mla_decode_ktile supports 1024 or experimental 2048")
         if self.mla_decode_ktile == 2048 and (

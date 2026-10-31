@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from ...config import active as _config
 from ..prefill_megakernel import (
     MOE_FAMILIES,
     _moe_sp_shared_rows,
@@ -61,7 +60,7 @@ def routed_experts(
     Resident MXFP4 families use the runtime layer index. Inactive routes sort
     beyond the counted expert prefix; no routing capacity or token dropping
     is imposed. The output contains this rank's reduced token rows, in the
-    ring's dtype (``moe_reduce_dtype``).
+    ring's dtype (FP32).
     """
     tokens, _, half = latent.shape
     input_width = 2 * half
@@ -89,7 +88,9 @@ def routed_experts(
         global_keys = jnp.where(topk_probabilities != 0, topk_ids, 896).reshape(-1)
         _, global_counts = counting_positions(global_keys, 897)
         counts = jax.lax.dynamic_slice(global_counts, (first_expert,), (local_experts,))
-        global_route_max = global_counts[:896].reshape(16, 56).sum(axis=1).max()
+        global_route_max = (
+            global_counts[:896].reshape(896 // local_experts, local_experts).sum(axis=1).max()
+        )
     else:
         _, all_counts = counting_positions(keys, local_experts + 1)
         counts = all_counts[:local_experts]
@@ -142,7 +143,7 @@ def routed_experts_prepared(
     options = dict(
         tokens=tokens,
         layer=expert_layer,
-        ring_dtype=jnp.dtype(_config().moe_reduce_dtype),
+        ring_dtype=jnp.dtype(jnp.float32),
     )
     if tokens == 8192:
         return down_valu_compact(
@@ -187,8 +188,8 @@ def moe_local_routed(
     if weights["latent_down"].shape[-2:] != (7168, 4096):
         raise ValueError("latent projection weights must use replicated SP layout")
     local_experts = weights["expert_gu"].shape[-3]
-    if local_experts != 56:
-        raise ValueError("Packed prefill MoE requires EP16/TP2 expert weights")
+    if local_experts not in (56, 112):
+        raise ValueError("Packed prefill MoE requires EP16/TP2 or EP8/TP4 expert weights")
     expert_tp = 32 * local_experts // 896
     tokens = local_tokens * 32
     logits = jax.lax.dot_general(
@@ -246,7 +247,7 @@ def make_moe_fused_sp_repacked(
     mesh, *, seq_len, eps=1e-5, collective_id=42, token_ranks=None
 ):
     """Build the TP32 MoE layer for repacked projection weights: the local
-    routed partials, their reduce-scatter ring (``moe_reduce_dtype``), then
+    routed partials, their reduce-scatter ring (FP32), then
     the latent-up and shared-expert tail on each rank's rows."""
     if (
         tuple(mesh.axis_names) != ("k3_sp",)

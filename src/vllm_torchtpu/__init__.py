@@ -117,8 +117,29 @@ def _disable_partial_hits_without_block_copies(scheduler) -> bool:
     return True
 
 
+def _cache_only_prefill_tokens(scheduler) -> bool:
+    """On a megakernel aggregate engine, cache a request's blocks only up to
+    the tokens its prefill computed (``num_prompt_tokens - 1``): the decoder
+    keeps KDA state in its own slots, so the pool's state blocks past that
+    hold none. Returns whether it changed anything."""
+    from vllm_torchtpu.megakernel import backend
+
+    if backend.role(scheduler.vllm_config) != "aggregate":
+        return False
+    coordinator = scheduler.kv_cache_manager.coordinator
+    original = coordinator.cache_blocks
+
+    def cache_blocks(request, num_computed_tokens):
+        limit = max(request.num_prompt_tokens - 1, 0)
+        original(request, min(num_computed_tokens, limit))
+
+    coordinator.cache_blocks = cache_blocks
+    return True
+
+
 def _patch_vllm_megakernel_prefix_hits() -> None:
-    """Apply ``_disable_partial_hits_without_block_copies`` to every scheduler."""
+    """Apply ``_disable_partial_hits_without_block_copies`` and
+    ``_cache_only_prefill_tokens`` to every scheduler."""
     from functools import wraps
 
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -136,8 +157,68 @@ def _patch_vllm_megakernel_prefix_hits() -> None:
                 "program does not apply block copies.",
                 self.kv_cache_manager.coordinator.scheduler_block_size,
             )
+        if _cache_only_prefill_tokens(self):
+            logger.info(
+                "Prefix caching covers prompt tokens only: the megakernel "
+                "aggregate decoder writes no KDA state blocks."
+            )
+        if _model_needs_page_aligned_chunks(self.vllm_config):
+            self.need_mamba_block_aligned_split = True
+            self._tpu_step_prefill_req_id = None
+            original_schedule = self.schedule
+
+            @wraps(original_schedule)
+            def _schedule_with_prefill_tracking(*s_args, **s_kwargs):
+                active_req_id = None
+                for req in getattr(self, "running", ()):
+                    prefill_end = max(req.num_prompt_tokens, req.num_tokens - 1)
+                    if req.num_computed_tokens < prefill_end:
+                        active_req_id = req.request_id
+                        break
+                self._tpu_step_prefill_req_id = active_req_id
+                return original_schedule(*s_args, **s_kwargs)
+
+            self.schedule = _schedule_with_prefill_tracking
 
     init._tpu_megakernel_prefix_hits_patch = True
+    Scheduler.__init__ = init
+
+
+def _patch_vllm_prefill_sjf_queue() -> None:
+    """``K3_PREFILL_SJF=1``: a KV producer's or aggregate engine's waiting queue
+    admits the request with the fewest uncached prompt tokens first, with aging
+    (``vllm_torchtpu.core.sjf_queue``). Other engines are unchanged."""
+    from functools import wraps
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    original_init = Scheduler.__init__
+    if getattr(original_init, "_tpu_prefill_sjf_patch", False):
+        return
+
+    @wraps(original_init)
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        from vllm_torchtpu.core import sjf_queue
+        from vllm_torchtpu.megakernel import backend
+
+        transfer = getattr(self.vllm_config, "kv_transfer_config", None)
+        producer = getattr(transfer, "kv_role", None) == "kv_producer"
+        aggregate = backend.role(self.vllm_config) == "aggregate"
+        if not (sjf_queue.enabled() and (producer or aggregate)):
+            return
+        if self.waiting:
+            raise RuntimeError("K3_PREFILL_SJF: the waiting queue is not empty at init")
+        self.waiting = sjf_queue.SJFRequestQueue(
+            sjf_queue.uncached_estimator(self), sjf_queue.aging()
+        )
+        logger.info(
+            "Prefill waiting queue: shortest uncached prompt first, "
+            "aging %.0f tokens/s",
+            sjf_queue.aging(),
+        )
+
+    init.__dict__["_tpu_prefill_sjf_patch"] = True
     Scheduler.__init__ = init
 
 
@@ -169,6 +250,25 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         num_new_local_computed_tokens=0,
         num_external_computed_tokens=0,
     ):
+        needs_pages = getattr(self, "_tpu_page_aligned_chunks", None)
+        if needs_pages is None:
+            needs_pages = _model_needs_page_aligned_chunks(self.vllm_config)
+            self._tpu_page_aligned_chunks = needs_pages
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if needs_pages and start < prefill_end:
+            if envs.K3_SERIAL_PREFILL:
+                active_id = getattr(self, "_tpu_step_prefill_req_id", None)
+                req_id = getattr(request, "request_id", None)
+                if active_id is not None and active_id != req_id:
+                    return 0
+            max_step = envs.K3_MAX_PREFILL_STEP_TOKENS
+            if max_step > 0:
+                num_new_tokens = min(num_new_tokens, max_step)
         args = (
             request,
             num_new_tokens,
@@ -177,42 +277,38 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         )
         physical_cache_config = self.cache_config
         if physical_cache_config.block_size == self.block_size:
-            return original_split(self, *args)
-
-        scheduler_cache_config = copy.copy(physical_cache_config)
-        scheduler_cache_config.block_size = self.block_size
-        # schedule() calls this method synchronously on the EngineCore thread,
-        # and the upstream implementation contains no callback or await point.
-        self.cache_config = scheduler_cache_config
-        try:
+            if not needs_pages:
+                return original_split(self, *args)
             num_new_tokens = original_split(self, *args)
-        finally:
-            self.cache_config = physical_cache_config
+        else:
+            scheduler_cache_config = copy.copy(physical_cache_config)
+            scheduler_cache_config.block_size = self.block_size
+            # schedule() calls this method synchronously on the EngineCore thread,
+            # and the upstream implementation contains no callback or await point.
+            self.cache_config = scheduler_cache_config
+            try:
+                num_new_tokens = original_split(self, *args)
+            finally:
+                self.cache_config = physical_cache_config
         # A scheduler block wider than the prefill budget (DCP/PCP: 256 x
         # ranks tokens) leaves chunks inside it wherever the shared token
         # budget cuts them. A program that declares ``page_aligned_chunks``
         # keeps those ends on the physical block; the prompt's last chunk stays
         # exempt, as upstream.
-        needs_pages = getattr(self, "_tpu_page_aligned_chunks", None)
-        if needs_pages is None:
-            needs_pages = _model_needs_page_aligned_chunks(self.vllm_config)
-            self._tpu_page_aligned_chunks = needs_pages
         if not needs_pages:
             return num_new_tokens
         page = physical_cache_config.block_size
-        start = (
-            request.num_computed_tokens
-            + num_new_local_computed_tokens
-            + num_external_computed_tokens
-        )
         end = start + num_new_tokens
-        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
         if start < prefill_end and end < prefill_end and end % page:
             aligned = end // page * page
             if aligned > start:
-                return aligned - start
-            if start % page == 0:
-                return 0  # less than a page of budget left: next step
+                num_new_tokens = aligned - start
+            elif start % page == 0:
+                num_new_tokens = 0  # less than a page of budget left: next step
+        if num_new_tokens > 0 and start < prefill_end and envs.K3_SERIAL_PREFILL:
+            req_id = getattr(request, "request_id", None)
+            if req_id is not None:
+                self._tpu_step_prefill_req_id = req_id
         return num_new_tokens
 
     split_with_scheduler_block_size._tpu_scheduler_block_size_patch = True

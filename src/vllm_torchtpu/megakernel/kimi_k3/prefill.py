@@ -37,6 +37,7 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.bridge import (
     hbm,
@@ -303,15 +304,24 @@ class PrefillProgram:
         self._state_ops: dict[tuple[str, int], Any] = {}
 
     # ------------------------------------------------------------ weights
-    def load_weights(self, presharded) -> None:
+    def load_weights(
+        self, presharded, shared: Mapping[str, torch.Tensor] | None = None
+    ) -> None:
+        """Stream this rank's weights; families in ``shared`` (the decode's
+        device tensors, ``rank_loader.PREFILL_SHARED``) are used as they are."""
         cache = presharded / "prefill-sp-cache"
         from .config import active
 
+        shared = dict(shared or {})
         iterator = self._rank_loader.iter_prefill_rank(
-            presharded, cache, self.rank, split_experts=True
+            presharded, cache, self.rank, split_experts=True, skip=frozenset(shared)
         )
         self._expert_banks = []
-        if active().prefill_fused_moe and active().prefill_expert_parallel == 16:
+        if (
+            active().prefill_fused_moe
+            and active().prefill_expert_parallel in (8, 16)
+            and not (set(_EXPERT_FAMILIES) & set(shared))
+        ):
             self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
             iterator = _bank_expert_weights(iterator)
 
@@ -328,6 +338,10 @@ class PrefillProgram:
             self.weights.setdefault(group, {})[name] = tensor
 
         stats = stream_to_device(iterator, store)
+        for group, names in self.names.items():
+            for name in names:
+                if name in shared:
+                    self.weights.setdefault(group, {})[name] = shared[name]
         if self._expert_banks and any(
             set(bank) != set(_EXPERT_FAMILIES) for bank in self._expert_banks
         ):
@@ -425,6 +439,7 @@ class PrefillProgram:
         weight_groups = ("common", "kda", "mla", "moe")
         state_sharding = jax.sharding.NamedSharding(mesh, sharded)
         counting = bool(active().prefill_route_counts)
+        local_experts = 896 // active().prefill_expert_parallel
         nroute = 1 if counting else 0
 
         def zeros(shape, dtype):
@@ -451,7 +466,9 @@ class PrefillProgram:
             latents = zeros((MLA_LAYERS, window, 576), jnp.bfloat16)
             rec_at = zeros((KDA_LAYERS, count, 3, 128, 128), jnp.float32)
             hist_at = zeros((KDA_LAYERS, count, 3, 3, 3, 128), jnp.bfloat16)
-            route = zeros((NUM_LAYERS - 1, 56), jnp.int32) if counting else None
+            route = (
+                zeros((NUM_LAYERS - 1, local_experts), jnp.int32) if counting else None
+            )
             prefix, blocks, kda_state, mla_state, tap, *routes = first(
                 hidden,
                 w["common"],
@@ -588,10 +605,17 @@ class PrefillProgram:
 
     def _export_key(self, op: str, window: int) -> str:
         """The static configuration a window op's trace bakes in (export cache)."""
+        cfg = active()
+        fused_moe = (
+            cfg.prefill_fused_moe
+            and cfg.prefill_expert_parallel in (8, 16)
+            and window in (512, 1024, 2048, 4096, 8192)
+        )
         return repr(
             (
                 "prefill",
                 "moe-bank8" if self._expert_banks else "moe-global",
+                "moe-fused" if fused_moe else "moe-ref",
                 op,
                 window,
                 self.capacity,
@@ -929,23 +953,38 @@ class PoolWriter:
                         jax.lax.ppermute(x, AXIS, perm)
                         for x in (recurrent, conv, recurrent_at, conv_at)
                     )
+                # This rank owns at most ceil(pages / DCP) pages of each live
+                # sequence (global page k lives on rank k % DCP); the rest of its
+                # table is the null block. Write only those pages: owned ones
+                # first, any spare entries again aim at the null block.
+                writes = min(pages, count * -(-pages // DCP_SIZE))
+                if writes < pages:
+                    order = jnp.argsort((table == 0).astype(jnp.int32), stable=True)[
+                        :writes
+                    ]
+                    targets = table[order]
+                else:
+                    order, targets = None, table
                 for m in range(MLA_LAYERS):
                     index = mla_raw[m]
+                    page_rows = latents[m].reshape(pages, -1, latents.shape[-1])
+                    if order is not None:
+                        page_rows = jnp.take(page_rows, order, axis=0)
                     rows = (
-                        jnp.pad(latents[m], ((0, 0), (0, 64)))
+                        jnp.pad(page_rows, ((0, 0), (0, 0), (0, 64)))
                         .astype(raws[index].dtype)
-                        .reshape(pages, *self.layout.block_shape)
+                        .reshape(writes, *self.layout.block_shape)
                     )
 
                     def write_page(p, pool, rows=rows):
                         return jax.lax.dynamic_update_index_in_dim(
                             pool,
                             jax.lax.dynamic_index_in_dim(rows, p, keepdims=False),
-                            table[p],
+                            targets[p],
                             axis=0,
                         )
 
-                    raws[index] = jax.lax.fori_loop(0, pages, write_page, raws[index])
+                    raws[index] = jax.lax.fori_loop(0, writes, write_page, raws[index])
                 # Checkpoints first (a sequence without one aims it at the null block).
                 raws = self._write_kda(raws, recurrent_at, conv_at, blocks_at, count)
                 raws = self._write_kda(raws, recurrent, conv, kda_blocks, count)
@@ -960,7 +999,7 @@ class PoolWriter:
                 donate_argnums=tuple(range(5, 5 + num_raw)),
                 export_key=repr(
                     (
-                        "write_pool_packed",
+                        "write_pool_packed_owned",
                         self.layout,
                         window,
                         slots,
@@ -1235,11 +1274,13 @@ class KimiPrefiller:
                     self.presharded,
                 )
 
-    def load_weights(self) -> None:
+    def load_weights(self, shared: Mapping[str, torch.Tensor] | None = None) -> None:
+        """Load once; ``shared``: device tensors to use instead of reading
+        those families (see :meth:`PrefillProgram.load_weights`)."""
         if self._loaded:
             return
         started = time.perf_counter()
-        self.program.load_weights(self.presharded)
+        self.program.load_weights(self.presharded, shared)
         if self.ring is not None:
             self.ring.load_weights()
         if self.draft_latents is not None:
@@ -1654,21 +1695,26 @@ class KimiPrefiller:
         ([1, 92, 56] per rank: its chip's local experts per MoE layer) and
         have each chip's even rank save a cumulative snapshot every
         ``prefill_route_counts_every`` windows under
-        ``$K3_PREFILL_ROUTE_COUNTS_DIR`` (default ``$CDK_OUTPUT_DIR/
-        prefill_route_counts``)."""
+        ``$K3_PREFILL_ROUTE_COUNTS_DIR`` (default
+        ``/tmp/prefill_route_counts``)."""
         routes = getattr(self.program, "last_routes", None)
         if routes is None:
             return
         total = getattr(self, "_route_total", None)
         self._route_total = routes if total is None else total + routes
         self._route_windows = getattr(self, "_route_windows", 0) + 1
-        if self._route_windows % active().prefill_route_counts_every or self.rank % 2:
+        ep_tp = 32 // active().prefill_expert_parallel
+        local_experts = 896 // active().prefill_expert_parallel
+        if (
+            self._route_windows % active().prefill_route_counts_every
+            or self.rank % ep_tp
+        ):
             return
-        directory = os.environ.get("K3_PREFILL_ROUTE_COUNTS_DIR") or os.path.join(
-            os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "prefill_route_counts"
-        )
+        directory = envs.K3_PREFILL_ROUTE_COUNTS_DIR or "/tmp/prefill_route_counts"
         os.makedirs(directory, exist_ok=True)
-        counts = np.asarray(self._route_total.cpu()).reshape(NUM_LAYERS - 1, 56)
+        counts = np.asarray(self._route_total.cpu()).reshape(
+            NUM_LAYERS - 1, local_experts
+        )
         name = f"prefill-r{self.rank:02d}-w{self._route_windows:07d}.npy"
         np.save(os.path.join(directory, name), counts)
 
@@ -1748,8 +1794,9 @@ class KimiPrefiller:
                 (1, KDA_LAYERS, count, 3, 3, 3, 128), dtype=torch.bfloat16
             )
             latents = torch.empty((1, MLA_LAYERS, window, 576), dtype=torch.bfloat16)
+            local_experts = 896 // active().prefill_expert_parallel
             routes = (
-                (torch.empty((1, NUM_LAYERS - 1, 56), dtype=torch.int32),)
+                (torch.empty((1, NUM_LAYERS - 1, local_experts), dtype=torch.int32),)
                 if active().prefill_route_counts
                 else ()
             )
