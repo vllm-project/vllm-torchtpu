@@ -1120,7 +1120,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # [tokens, routes] combine matrix from the permute's sorted token ids, one
     # entry per route, instead of a one-hot over [tokens, topk, routes] summed
     # over topk (topk times the elementwise work, written to HBM and read back
-    # by the matmul). Same matrix entries.
+    # by the matmul). Same matrix entries. Also gives the one-hot unpermute
+    # (this path and TPU_MOE_OWNER_OUTPUT_MODE) its sorted route weights from a
+    # key-value sort instead of a scatter.
     "TPU_MOE_ONEHOT_COMBINE_SORTED": env_bool(
         "TPU_MOE_ONEHOT_COMBINE_SORTED", default=False
     ),

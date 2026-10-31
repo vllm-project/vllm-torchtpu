@@ -19,7 +19,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.layers.core.fused_moe_gmm import onehot_combine_from_sorted
+from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    onehot_combine_from_sorted,
+    sorted_route_weights,
+)
 
 LOCAL_EXPERTS, TOPK, HIDDEN = 16, 8, 128
 
@@ -87,3 +90,12 @@ def test_positive_control_swapped_tokens_is_caught():
         num_tokens=num_tokens,
     )
     assert not np.allclose(np.asarray(got, np.float64), want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("num_tokens", [4, 48, 384])
+def test_sorted_route_weights_match_scatter(num_tokens):
+    weights, _, revert, _, w_sorted, _ = _routing(num_tokens + 1, num_tokens, 0)
+    got = sorted_route_weights(
+        jnp.asarray(revert, jnp.int32), jnp.asarray(weights.reshape(-1))
+    )
+    np.testing.assert_array_equal(np.asarray(got), w_sorted)
