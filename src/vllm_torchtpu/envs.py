@@ -318,6 +318,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM_SLICES: int = 0
     TPU_PREFILL_SEQ_PARALLEL: bool = False
     TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS: int = 256
+    TPU_MOE_PREFILL_GATHER_ONCE: bool = False
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_MTP_ONEHOT_AR: bool = True
     TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: int = 0
@@ -2303,6 +2304,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS": env_int(
         "TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS", 256
     ),
+    # TPU_PREFILL_SEQ_PARALLEL: the split MoE op all-gathers each core's rows
+    # once, in core order, instead of once per combine chunk: the routes, their
+    # weights and the row scales as one int32 all-gather with one value per
+    # word, the fp8 rows as one more, and no concatenate of the chunks' rows.
+    # The routing plan and the expert kernel take the rows in core order; the
+    # combine reads its row tables back in token order by a reshape. Same rows,
+    # same sums, bit for bit.
+    "TPU_MOE_PREFILL_GATHER_ONCE": env_bool("TPU_MOE_PREFILL_GATHER_ONCE"),
     # RMSNorm (and fused add + RMSNorm) on >= MIN_TOKENS rows of a >= MIN_HIDDEN
     # residual stream runs as one Pallas pass (layers/adapter/rmsnorm.py) instead of
     # XLA's reduce + re-read apply. Decode-sized batches are unchanged. Residual

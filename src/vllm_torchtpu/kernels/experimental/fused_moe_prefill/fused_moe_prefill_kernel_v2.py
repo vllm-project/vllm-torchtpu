@@ -1607,6 +1607,47 @@ def gather_rows(x, axis_name):
     return outs[0] if chunks == 1 else jnp.concatenate(outs, 0)
 
 
+def in_token_order(x, ranks):
+    """Rows x [tokens, ...] gathered in core order (core 0's `own_rows`, then
+    core 1's, ...) put back in token order, by a reshape and an axis swap (no
+    gather; the identity when the step has one combine chunk)."""
+    tokens = x.shape[0]
+    chunks = token_chunks(tokens)
+    blocks = x.reshape(ranks, chunks, tokens // (chunks * ranks), *x.shape[1:])
+    return jnp.swapaxes(blocks, 0, 1).reshape(x.shape)
+
+
+def _as_words(x):
+    """x [n, k] of a 32-bit type, or of bf16 (widened to f32 exactly), as int32
+    [n, k] with one value per word."""
+    if x.dtype == jnp.bfloat16:
+        x = x.astype(jnp.float32)
+    return lax.bitcast_convert_type(x, jnp.int32)
+
+
+def _from_words(w, dtype):
+    """The inverse of _as_words: int32 words as `dtype` values."""
+    if jnp.dtype(dtype) == jnp.bfloat16:
+        return lax.bitcast_convert_type(w, jnp.float32).astype(jnp.bfloat16)
+    return lax.bitcast_convert_type(w, dtype)
+
+
+def gather_routes(weights, ids, scale, axis_name):
+    """Every core's routing weights [n, k], expert ids [n, k] and row scales [n]
+    in core order, from one all-gather of int32 rows that hold one value per
+    word (2 k + 1 words)."""
+    k = ids.shape[1]
+    packed = jnp.concatenate(
+        [ids.astype(jnp.int32), _as_words(weights), _as_words(scale.reshape(-1, 1))], 1
+    )
+    packed = lax.all_gather(packed, axis_name, axis=0, tiled=True)
+    return (
+        _from_words(packed[:, k : 2 * k], weights.dtype),
+        packed[:, :k],
+        _from_words(packed[:, 2 * k], scale.dtype),
+    )
+
+
 def combine(slab, slab_row, coeff, axis_name, flat=False, scatter=False):
     tokens, slots = slab_row.shape
     h = slab.shape[1] * _LANES
@@ -1685,6 +1726,7 @@ def fused_moe_prefill(
     sum_overlap_adds=False,
     row_tokens_resident_max_tokens=0,
     scatter=False,
+    core_major=False,
 ):
     """fused_moe_prefill_kernel.fused_moe_prefill's op with per-row activation
     scales and the stage-A levers as arguments (the defaults are the per-row
@@ -1699,7 +1741,13 @@ def fused_moe_prefill(
     copied window of it: the same row DMAs, the same output (the in-kernel sum
     builds read it from SMEM already). With `scatter` it returns this core's
     rows of the sum only (`scatter_rows`); x may then be None when x_q is given
-    and there is no shared expert gate."""
+    and there is no shared expert gate. With `core_major` (and `scatter`) the
+    rows arrive gathered in core order (`in_token_order`, TPU_MOE_PREFILL_GATHER_ONCE):
+    the routing plan and the expert kernel take them so, the combine reads its
+    row tables back in token order, and an in-kernel sum, whose rows stay in
+    core order, ends in one reduce-scatter that leaves each core its own rows."""
+    if core_major and not scatter:
+        raise ValueError("core-major rows are only reduce-scattered back to their cores")
     if x_q is None:
         tokens, h = x.shape
     else:
@@ -1828,18 +1876,18 @@ def fused_moe_prefill(
         shared_w1_scale.reshape(1, 1, 2 * i_s).astype(jnp.float32),
         shared_w2_scale.reshape(1, 1, h).astype(jnp.float32),
     )
+    if sum_cols and core_major:
+        return lax.psum_scatter(out, axis_name, scatter_dimension=0, tiled=True)
     if sum_cols:
         return scatter_rows(out, axis_name) if scatter else _psum_rows(out, axis_name)
     shared_row = routes + jnp.arange(tokens, dtype=jnp.int32)[:, None]
     slab_row = jnp.where(route_valid, slab_row, shared_row)
-    return combine(
-        out,
-        jnp.concatenate([slab_row, shared_row], 1),
-        jnp.concatenate([coeff, gate], 1),
-        axis_name,
-        flat=flat,
-        scatter=scatter,
-    )
+    slab_row = jnp.concatenate([slab_row, shared_row], 1)
+    coeff = jnp.concatenate([coeff, gate], 1)
+    if core_major:
+        ranks = lax.axis_size(axis_name)
+        slab_row, coeff = in_token_order(slab_row, ranks), in_token_order(coeff, ranks)
+    return combine(out, slab_row, coeff, axis_name, flat=flat, scatter=scatter)
 
 
 def fused_moe_prefill_stage_a(*args, **kwargs):
