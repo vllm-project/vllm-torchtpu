@@ -506,6 +506,111 @@ def _single_size(compile_range: Range) -> int | None:
     return compile_range.start if compile_range.is_single_size() else None
 
 
+_SHAPE_ONLY_TARGETS = None
+
+
+def _is_shape_only(node: fx.Node) -> bool:
+    """True for nodes that only read sizes or do scalar arithmetic."""
+    global _SHAPE_ONLY_TARGETS
+    if _SHAPE_ONLY_TARGETS is None:
+        import operator
+
+        _SHAPE_ONLY_TARGETS = {
+            torch.ops.aten.sym_size.int,
+            torch.ops.aten.sym_size.default,
+            torch.ops.aten.sym_numel.default,
+            torch.sym_int,
+            torch.sym_max,
+            torch.sym_min,
+            operator.add,
+            operator.sub,
+            operator.mul,
+            operator.floordiv,
+            operator.truediv,
+            operator.mod,
+            operator.neg,
+            operator.getitem,
+        }
+    if node.op in ("placeholder", "output"):
+        return True
+    if node.op == "call_method":
+        return node.target in ("size", "numel", "dim")
+    if node.op == "call_function":
+        return node.target in _SHAPE_ONLY_TARGETS
+    return False
+
+
+def _split_non_tensor_outputs(graph: fx.GraphModule):
+    """Moves scalar outputs (ints / SymInts) of `graph` to a side graph.
+
+    A piecewise-split graph (e.g. split at the TPUC_MOE op) can return sizes
+    such as the token count to the next piece; aot_autograd only accepts
+    Tensor / None outputs. Returns `(graph, None)` when there is nothing to
+    move, else `(tensor_graph, (indices, side_graph, n_outputs))`.
+
+    The tensor graph only loses those outputs (no dead-code elimination, which
+    could drop ops with side effects such as KV-cache writes). The side graph
+    is evaluated eagerly per call, so it must only read sizes / do scalar
+    arithmetic; otherwise the outputs are taken as constants (exact for the
+    single-size compile ranges used on TPU).
+    """
+    out_node = next(n for n in graph.graph.nodes if n.op == "output")
+    outs = out_node.args[0]
+    if not isinstance(outs, (tuple, list)):
+        return graph, None
+
+    def scalar_val(a):
+        if isinstance(a, fx.Node):
+            val = a.meta.get("val", a.meta.get("example_value"))
+            return val if isinstance(val, (int, float, bool, torch.SymInt)) else None
+        return a if isinstance(a, (int, float, bool)) else None
+
+    moved = [i for i, a in enumerate(outs) if scalar_val(a) is not None]
+    if not moved:
+        return graph, None
+    side = copy.deepcopy(graph)
+    side_out = next(n for n in side.graph.nodes if n.op == "output")
+    side_outs = side_out.args[0]
+    side_out.args = (tuple(side_outs[i] for i in moved),)
+    side.graph.eliminate_dead_code()
+    side.recompile()
+    if not all(_is_shape_only(n) for n in side.graph.nodes):
+        consts = []
+        for i in moved:
+            val = scalar_val(outs[i])
+            if isinstance(val, torch.SymInt):
+                hint = val.node.hint
+                if hint is None:
+                    raise RuntimeError(
+                        "split graph returns a data-dependent size; cannot compile"
+                    )
+                val = int(hint)
+            consts.append(val)
+        const_tuple = tuple(consts)
+
+        def side(*args):  # noqa: F811
+            del args
+            return const_tuple
+
+    out_node.args = (tuple(a for i, a in enumerate(outs) if i not in moved),)
+    graph.recompile()
+    return graph, (moved, side, len(outs))
+
+
+def _merge_non_tensor_outputs(compiled_fn, split):
+    moved, side, n_outputs = split
+    moved_set = set(moved)
+
+    def fn(*args):
+        tensors = iter(compiled_fn(*args))
+        others = iter(side(*args))
+        return tuple(
+            next(others) if i in moved_set else next(tensors) for i in range(n_outputs)
+        )
+
+    return fn
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -818,9 +923,18 @@ class TpuCompilerAdaptor(CompilerInterface):
         # moves, so the placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
+        # Pieces of a split graph may return ints (see
+        # _split_non_tensor_outputs); those are compiled without the ints and
+        # not persisted (the on-disk handle has no place for the side graph).
+        non_tensor_split = None
+        if envs.TPUC_MOE:
+            graph, non_tensor_split = _split_non_tensor_outputs(graph)
 
         caching = (
-            key is not None and self.cache_dir is not None and not self._disable_cache
+            key is not None
+            and self.cache_dir is not None
+            and not self._disable_cache
+            and non_tensor_split is None
         )
 
         # Another rank of this host compiled, or is compiling, this bucket:
@@ -860,6 +974,9 @@ class TpuCompilerAdaptor(CompilerInterface):
             return compiled_fn, handle
 
         compiled_fn, entry = self._run_backend(graph, example_inputs)
+        if non_tensor_split is not None:
+            compiled_fn = _merge_non_tensor_outputs(compiled_fn, non_tensor_split)
+            entry = None
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the

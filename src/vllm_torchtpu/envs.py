@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
+    TPUC_MOE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -673,6 +674,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # once the path is the default for these layers or is replaced by another
     # fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    # Run the routed experts of FP8 MoE layers on the TPU-C Ghostfish MoE
+    # kernel (layers/adapter/tpuc_moe.py) instead of `fused_moe_gmm`. Takes
+    # the plain GMM path's place (vLLM's MoE runner does the collectives), so
+    # the fused-EP, pipelined, FP8-all-gather and decode MoE kernels must stay
+    # off. Needs the TPU-C bundle (`<repo>/tpuc_bundle` or TPUC_BUNDLE_DIR),
+    # MoE dims (hidden, intermediate) of (4096, 1024) or (2048, 512) and
+    # per-channel FP8 MoE weights. The op runs eagerly between compiled
+    # pieces (it is added to splitting_ops).
+    "TPUC_MOE": env_bool("TPUC_MOE"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
