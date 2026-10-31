@@ -319,6 +319,8 @@ if TYPE_CHECKING:
     TPU_PREFILL_SEQ_PARALLEL: bool = False
     TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS: int = 256
     TPU_MOE_PREFILL_GATHER_ONCE: bool = False
+    TPU_MOE_PREFILL_ROTATED_COLLECTIVES: bool = False
+    TPU_MOE_PREFILL_COMBINE_SCATTER: bool = False
     TPU_PREFILL_ROTATED_COLLECTIVES: bool = False
     TPU_PREFILL_LATENT_NORMS_LOCAL: bool = False
     TPU_PREFILL_FUSED_OPROJ_RS: bool = False
@@ -2316,6 +2318,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # combine reads its row tables back in token order by a reshape. Same rows,
     # same sums, bit for bit.
     "TPU_MOE_PREFILL_GATHER_ONCE": env_bool("TPU_MOE_PREFILL_GATHER_ONCE"),
+    # With TPU_MOE_PREFILL_GATHER_ONCE on a 2x2x2 slice of 2-core chips: the
+    # split MoE op's fp8 row all-gather and its last MoE output reduce-scatter
+    # (the last combine chunk's, or the one after the in-kernel sum) run as
+    # rotated halving-doubling by remote DMAs on the TensorCore
+    # (fused_moe_prefill/row_all_gather.py, rotated_collectives.py). The
+    # earlier chunks' reduce-scatters stay XLA's on the SparseCore, beside the
+    # next chunk's combine, and so does the routes' gather. The all-gather is
+    # bitwise XLA's; the reduce-scatter adds the same bf16 terms in another
+    # order. Another mesh, or a shape the kernels do not take, keeps XLA's.
+    "TPU_MOE_PREFILL_ROTATED_COLLECTIVES": env_bool(
+        "TPU_MOE_PREFILL_ROTATED_COLLECTIVES"
+    ),
+    # With TPU_MOE_PREFILL_ROTATED_COLLECTIVES: every combine chunk of the split
+    # MoE op runs its combine and its reduce-scatter in one kernel
+    # (fused_moe_prefill/combine_scatter.py): each row block enters the rotated
+    # halving-doubling as soon as it is summed, so the chip links work beside
+    # the combine. Bitwise the combine followed by the rotated reduce-scatter.
+    "TPU_MOE_PREFILL_COMBINE_SCATTER": env_bool("TPU_MOE_PREFILL_COMBINE_SCATTER"),
     # With TPU_PREFILL_SEQ_PARALLEL on a 2x2x2 slice of 2-core chips: o_proj's
     # reduce-scatter and the latents' all-gather run as rotated
     # halving-doubling by remote DMAs (kernels/experimental/

@@ -80,6 +80,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.experimental import rotated_collectives
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill import combine_scatter
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel import (  # noqa: E501
     _GATHER_UNROLL,
     _LANES,
@@ -1648,14 +1650,58 @@ def gather_routes(weights, ids, scale, axis_name):
     )
 
 
-def combine(slab, slab_row, coeff, axis_name, flat=False, scatter=False):
+def reduce_scatter_rows(y, axis_name, rank=None, rs_table=None):
+    """lax.psum_scatter(y, tiled=True) over `axis_name`: this core's block of the
+    sum of y [rows, h] bf16. With `rs_table` (rotated_collectives.peer_table
+    "reduce_scatter") and `rank` (this core's mesh index, int32 [1]) it runs as
+    rotated_collectives.reduce_scatter on the TensorCore when that takes y's
+    shape (TPU_MOE_PREFILL_ROTATED_COLLECTIVES); the same bf16 terms, added in
+    another order."""
+    if (
+        rs_table is not None
+        and y.dtype == jnp.bfloat16
+        and rotated_collectives.reduce_scatter_supports(*y.shape)
+    ):
+        return rotated_collectives.reduce_scatter(
+            y, rank, jnp.asarray(rs_table), axis=axis_name
+        )
+    return lax.psum_scatter(y, axis_name, scatter_dimension=0, tiled=True)
+
+
+def combine(
+    slab,
+    slab_row,
+    coeff,
+    axis_name,
+    flat=False,
+    scatter=False,
+    rank=None,
+    rs_table=None,
+    cs_table=None,
+):
+    """Each token's sum of its slab rows times their coefficients, over the
+    cores: all-reduced, or with `scatter` this core's rows only, one
+    reduce-scatter per combine chunk. With `rs_table` and `rank` the last
+    chunk's reduce-scatter is reduce_scatter_rows' rotated one; the earlier
+    chunks' stay XLA's, which run beside the next chunk's combine. With
+    `cs_table` (combine_scatter.scatter_table) every chunk the fused kernel
+    takes runs its combine and reduce-scatter as combine_scatter."""
     tokens, slots = slab_row.shape
     h = slab.shape[1] * _LANES
     chunks = token_chunks(tokens)
     chunk = tokens // chunks
+    fused = scatter and cs_table is not None and combine_scatter.supports(chunk, h)
     outs = []
     for c in range(chunks):
         rows = slice(c * chunk, (c + 1) * chunk)
+        if fused:
+            y = combine_scatter.combine_scatter(
+                slab, coeff[rows], slab_row[rows], rank, jnp.asarray(cs_table), axis=axis_name
+            )
+            if outs:
+                y, _ = lax.optimization_barrier((y, outs[-1]))
+            outs.append(y)
+            continue
         if combine_step_tokens(chunk):
             y = build_combine(
                 t_local=chunk,
@@ -1671,7 +1717,9 @@ def combine(slab, slab_row, coeff, axis_name, flat=False, scatter=False):
             y = jnp.sum(gathered * coeff[rows][..., None], axis=1).astype(jnp.bfloat16)
         if outs:
             y, _ = lax.optimization_barrier((y, outs[-1]))
-        if scatter:
+        if scatter and c == chunks - 1:
+            outs.append(reduce_scatter_rows(y, axis_name, rank, rs_table))
+        elif scatter:
             outs.append(
                 lax.psum_scatter(y, axis_name, scatter_dimension=0, tiled=True)
             )
@@ -1727,6 +1775,9 @@ def fused_moe_prefill(
     row_tokens_resident_max_tokens=0,
     scatter=False,
     core_major=False,
+    rank=None,
+    rs_table=None,
+    cs_table=None,
 ):
     """fused_moe_prefill_kernel.fused_moe_prefill's op with per-row activation
     scales and the stage-A levers as arguments (the defaults are the per-row
@@ -1745,9 +1796,15 @@ def fused_moe_prefill(
     rows arrive gathered in core order (`in_token_order`, TPU_MOE_PREFILL_GATHER_ONCE):
     the routing plan and the expert kernel take them so, the combine reads its
     row tables back in token order, and an in-kernel sum, whose rows stay in
-    core order, ends in one reduce-scatter that leaves each core its own rows."""
+    core order, ends in one reduce-scatter that leaves each core its own rows.
+    With core_major, `rs_table` (rotated_collectives.peer_table
+    "reduce_scatter") and `rank` (this core's mesh index, int32 [1]) the last
+    combine chunk's reduce-scatter, or the one after an in-kernel sum, runs as
+    rotated_collectives.reduce_scatter (TPU_MOE_PREFILL_ROTATED_COLLECTIVES)."""
     if core_major and not scatter:
         raise ValueError("core-major rows are only reduce-scattered back to their cores")
+    if rs_table is not None and (not core_major or rank is None):
+        raise ValueError("the rotated reduce-scatter needs core-major rows and a rank")
     if x_q is None:
         tokens, h = x.shape
     else:
@@ -1877,7 +1934,7 @@ def fused_moe_prefill(
         shared_w2_scale.reshape(1, 1, h).astype(jnp.float32),
     )
     if sum_cols and core_major:
-        return lax.psum_scatter(out, axis_name, scatter_dimension=0, tiled=True)
+        return reduce_scatter_rows(out, axis_name, rank, rs_table)
     if sum_cols:
         return scatter_rows(out, axis_name) if scatter else _psum_rows(out, axis_name)
     shared_row = routes + jnp.arange(tokens, dtype=jnp.int32)[:, None]
@@ -1887,7 +1944,17 @@ def fused_moe_prefill(
     if core_major:
         ranks = lax.axis_size(axis_name)
         slab_row, coeff = in_token_order(slab_row, ranks), in_token_order(coeff, ranks)
-    return combine(out, slab_row, coeff, axis_name, flat=flat, scatter=scatter)
+    return combine(
+        out,
+        slab_row,
+        coeff,
+        axis_name,
+        flat=flat,
+        scatter=scatter,
+        rank=rank,
+        rs_table=rs_table,
+        cs_table=cs_table,
+    )
 
 
 def fused_moe_prefill_stage_a(*args, **kwargs):
