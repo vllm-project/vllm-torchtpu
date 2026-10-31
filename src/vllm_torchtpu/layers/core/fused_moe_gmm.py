@@ -395,15 +395,17 @@ def onehot_combine_from_sorted(
     puts after every valid one. So `combine[t, p]` is that weight when the
     token matches and `p < valid_count`, else 0 -- the same entries as the
     one-hot over `[tokens, topk, routes]` summed over topk, with one entry per
-    route instead of `topk`. Contracting the routes axis of the transposed
-    one-hot lets XLA build it inside the matmul, as for the permute.
+    route instead of `topk`. The matrix is laid out `[tokens, routes]` by an
+    iota compare, so the matmul contracts its minor axis with no transpose.
     """
     routes = jnp.arange(token_indices_sorted.shape[0], dtype=jnp.int32)
-    weights = jnp.where(
-        routes < valid_count.reshape(()), topk_weights_sorted, 0
-    ).astype(topk_weights_sorted.dtype)
-    onehot = jax.nn.one_hot(token_indices_sorted, num_tokens, dtype=gmm2_res.dtype)
-    return jnp.einsum("pt,pd->td", onehot * weights[:, None], gmm2_res)
+    weights = jnp.where(routes < valid_count.reshape(()), topk_weights_sorted, 0)
+    tokens = jnp.arange(num_tokens, dtype=jnp.int32)
+    dtype = jnp.result_type(gmm2_res.dtype, topk_weights_sorted.dtype)
+    combine = jnp.where(
+        tokens[:, None] == token_indices_sorted[None, :], weights[None, :], 0
+    ).astype(dtype)
+    return combine @ gmm2_res
 
 
 def prepare_routed_gmm_inputs(
