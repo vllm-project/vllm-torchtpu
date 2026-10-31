@@ -103,7 +103,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
     map_online_fp8,
     quantize_online_fp8,
 )
-from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
+from vllm_torchtpu.layers.core.quant_methods import FP8, FP8_MOE, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
@@ -765,6 +765,78 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         if isinstance(layer, Attention):
             return None
 
+        return None
+
+
+@register_quantization_config(FP8_MOE)
+@register_quantization_config(get_tpu_quant_method(FP8_MOE))
+class VllmFp8MoEConfig(VllmFp8Config):
+    """TPU FP8 MoE quantization configuration.
+
+    Quantizes only MoE routed experts to FP8 online from BF16 checkpoints,
+    leaving dense linear layers and attention unquantized.
+    """
+
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        activation_scheme: str = "dynamic",
+        ignored_layers: list[str] | None = None,
+        weight_block_size: list[int] | None = None,
+        store_dtype: str | None = None,
+    ) -> None:
+        super().__init__(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            activation_scheme=activation_scheme,
+            ignored_layers=ignored_layers,
+            weight_block_size=weight_block_size,
+            store_dtype=store_dtype,
+        )
+
+    @classmethod
+    def get_name(cls) -> str:
+        return FP8_MOE
+
+    @classmethod
+    def from_config(cls, config: dict) -> VllmFp8MoEConfig:
+        weight_block_size = config.get("weight_block_size")
+        activation_scheme = config.get("activation_scheme", "dynamic")
+        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        store_dtype = cls.get_from_keys_or(config, ["store_dtype"], None)
+        if not ignored_layers:
+            ignored_layers = cls.get_from_keys_or(
+                config, ["modules_to_not_convert"], None
+            )
+        is_checkpoint_fp8_serialized = config.get(
+            "is_checkpoint_fp8_serialized", False
+        )
+        return cls(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            activation_scheme=activation_scheme,
+            weight_block_size=weight_block_size,
+            ignored_layers=ignored_layers,
+            store_dtype=store_dtype,
+        )
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
+        if isinstance(layer, RoutedExperts):
+            if is_layer_skipped(
+                prefix=prefix,
+                ignored_layers=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+                    VllmUnquantizedFusedMoEMethod,
+                )
+
+                moe_config = self.get_moe_config(layer)
+                return VllmUnquantizedFusedMoEMethod(moe_config)
+            moe_config = self.get_moe_config(layer)
+            return VllmFp8MoEMethodTPU(self, moe_config)
+
+        # All non-MoE layers (LinearBase, Attention) remain unquantized
         return None
 
 
