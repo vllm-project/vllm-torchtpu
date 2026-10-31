@@ -15,6 +15,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.utils import replace_parameter
 from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
@@ -24,6 +25,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
+from vllm_torchtpu.utils import synchronize_tensors
 
 from . import csa2_adapter, preprocess_ops
 from .attention_kernels import (
@@ -2014,6 +2016,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         self._init_local_q_weights()
         self._q_projection_rope_op = None
         if self._fused_preprocess:
+            self._flip_compressor_weight()
             self._check_fused_weights()
             # Register before TorchDynamo captures the first model forward.
             eps = self.kv_norm.variance_epsilon
@@ -2041,6 +2044,19 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             self._q_projection_rope_op = initialize_projection_rope()
         if self.wo_a.weight.device.type == "tpu":
             _ = self.o_proj_op
+
+    def _flip_compressor_weight(self):
+        """Store the compressor projection as (k, n) for the fused kernel.
+
+        It is built with ``quant_config=None``, so no TPU linear method flips
+        it; ``DeepseekCompressor.project`` accepts either layout."""
+        layer = getattr(self.compressor, "fused_wkv_wgate", None)
+        if layer is None or getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            return
+        replace_parameter(layer, "weight", layer.weight.data.t().contiguous())
+        setattr(layer, WEIGHT_FLIPPED_ATTR, True)
+        if layer.weight.device.type == "tpu":
+            synchronize_tensors([layer.weight])
 
     def _check_fused_weights(self):
         """The fused kernels' weight layouts; anything else is a load error."""
