@@ -59,7 +59,9 @@ from vllm.model_executor.models import deepseek_v2
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
-from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import grouped_shared_expert
+from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
+    grouped_shared_expert_sharded,
+)
 from vllm_torchtpu.layers.adapter import fused_moe_ep
 from vllm_torchtpu.layers.adapter.attention import _retain_buffers
 from vllm_torchtpu.layers.adapter.linear_common import (
@@ -217,15 +219,13 @@ def _build_shared_op(group: int) -> Any:
     if key in _SHARED_OPS:
         return _SHARED_OPS[key]
     mesh = build_ep_mesh()
-    n = mesh.shape[EP_AXIS_NAME]
-    groups = tuple(tuple(range(g, g + group)) for g in range(0, n, group))
+    # jax_op hands fn the global arrays: the per-rank body goes under shard_map.
+    sharded = grouped_shared_expert_sharded(mesh, EP_AXIS_NAME, group)
 
     def fn(
         x: jax.Array, w13: jax.Array, s13: jax.Array, w2: jax.Array, s2: jax.Array
     ) -> jax.Array:
-        return grouped_shared_expert(
-            x, w13, s13, w2, s2, axis=EP_AXIS_NAME, groups=groups
-        )
+        return sharded(x, w13, s13, w2, s2)
 
     spec = PartitionSpec(EP_AXIS_NAME)
     op = jax_op(

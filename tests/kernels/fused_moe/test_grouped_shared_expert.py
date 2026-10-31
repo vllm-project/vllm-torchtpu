@@ -23,11 +23,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
     blocked_down,
-    grouped_shared_expert,
+    grouped_shared_expert_sharded,
     silu_and_mul,
 )
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
@@ -69,16 +68,8 @@ def test_each_rank_gets_the_whole_expert_on_its_rows(group):
     stacked = [
         jnp.concatenate([members[r % group][i] for r in range(n)]) for i in range(4)
     ]
-    groups = tuple(tuple(range(g, g + group)) for g in range(0, n, group))
-    got = jax.jit(
-        jax.shard_map(
-            lambda *a: grouped_shared_expert(*a, axis=AX, groups=groups),
-            mesh=mesh,
-            in_specs=(P(AX),) * 5,
-            out_specs=P(AX),
-            check_vma=False,
-        )
-    )(x, *stacked)
+    # As the served op calls it: global arrays, sharded on the mesh axis.
+    got = jax.jit(grouped_shared_expert_sharded(mesh, AX, group))(x, *stacked)
     got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
     # Same arithmetic up to fusion (group 1) and the members' bf16 partials
     # being summed in bf16 (group > 1).

@@ -29,6 +29,7 @@ the arithmetic of the TP shard it came from.
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
@@ -76,3 +77,20 @@ def grouped_shared_expert(
             out, axis, scatter_dimension=0, tiled=True, axis_index_groups=groups
         )
     return out
+
+
+def grouped_shared_expert_sharded(mesh, axis: str, group: int):
+    """`grouped_shared_expert` on global arrays sharded on `axis` (rows of `x`
+    and each rank's weight slice), with groups of `group` consecutive mesh
+    indices."""
+    n = mesh.shape[axis]
+    if n % group:
+        raise ValueError(f"{n} ranks do not split into groups of {group}")
+    groups = tuple(tuple(range(g, g + group)) for g in range(0, n, group))
+    return jax.shard_map(
+        lambda *a: grouped_shared_expert(*a, axis=axis, groups=groups),
+        mesh=mesh,
+        in_specs=(P(axis),) * 5,
+        out_specs=P(axis),
+        check_vma=False,
+    )
