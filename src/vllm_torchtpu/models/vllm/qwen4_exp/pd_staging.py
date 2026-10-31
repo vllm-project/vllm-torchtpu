@@ -223,8 +223,7 @@ def make_repack(
     layer, in the same order. Returns the updated pool.
 
     ``fn.rows(staging, main_src, copy_src, gdn_src)`` returns only the rows to
-    write (uint8 ``[n, 4, 256]`` each), so a caller can scatter them into a
-    pool in place; ``fn.gdn_rows`` is the destination row count per GDN page.
+    write (uint8 ``[n, 4, 256]`` each).
     """
     import jax
     import jax.numpy as jnp
@@ -232,13 +231,17 @@ def make_repack(
 
     chan = np.asarray(channels, dtype=np.int32)
 
-    # Carriers are indexed as flat token rows, whatever their kernel-page
-    # shape (the pools hold one kernel page per manager page).
+    # Rows are addressed flat (page * B + row), whatever the carrier's
+    # kernel-page shape (the pools hold one kernel page per manager page).
     def rows_of(rows, flat):
         return rows[flat]
 
-    def put(rows, flat, values):
-        return rows.at[flat].set(values)
+    def put(pool, flat, values):
+        # Index the donated pool in its own shape and dtype, so XLA updates
+        # it in place rather than materializing a reshaped copy.
+        kernel_rows = pool.shape[1]
+        values = jax.lax.bitcast_convert_type(values, pool.dtype)
+        return pool.at[flat // kernel_rows, flat % kernel_rows, 0].set(values)
 
     def gdn_page(page, s: GdnGeometry, d: GdnGeometry):
         """One producer GDN page -> this rank's page rows ``[ssm + conv]``."""
@@ -280,19 +283,25 @@ def make_repack(
             gdn = jnp.zeros((0, ROW_SUBLANES, ROW_LANES), jnp.uint8)
         return main, copies, gdn
 
-    def fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst):
-        dtype, shape = pool.dtype, pool.shape
-        out = jax.lax.bitcast_convert_type(pool, jnp.uint8).reshape(-1, ROW_SUBLANES, ROW_LANES)
+    def fn(
+        pool: jax.Array,
+        staging: jax.Array,
+        main_src: jax.Array,
+        main_dst: jax.Array,
+        copy_src: jax.Array,
+        copy_dst: jax.Array,
+        gdn_src: jax.Array,
+        gdn_dst: jax.Array,
+    ) -> jax.Array:
         main, copies, gdn = rows(staging, main_src, copy_src, gdn_src)
-        out = put(out, main_dst, main)
+        out = put(pool, main_dst, main)
         out = put(out, copy_dst, copies)
         if has_gdn:
             dst_flat = (gdn_dst[:, None] * dst_block + jnp.arange(d_rows)).reshape(-1)
             out = put(out, dst_flat, gdn)
-        return jax.lax.bitcast_convert_type(out.reshape(shape), dtype)
+        return out
 
     fn.rows = rows
-    fn.gdn_rows = d_rows
     return fn
 
 
@@ -485,29 +494,19 @@ class StagedConsumer:
             return torch.tensor(_pad(values, size), dtype=torch.int32).to(device)
 
         msize, csize = bucket(len(main_s)), bucket(len(copy_s))
-        ngdn = max(1, len(gdn_s))
+        args = (
+            tensor(main_s, msize), tensor(main_d, msize),
+            tensor(copy_s, csize), tensor(copy_d, csize),
+            tensor(gdn_s or [0], max(1, len(gdn_s))), tensor(gdn_d or [0], max(1, len(gdn_d))),
+        )
         if self._op is None:
             from torch_tpu._internal import pallas
 
-            # Only the rows to write leave the op; the pool is written in
-            # place below rather than copied whole through JAX.
-            self._op = pallas.jax_op("pallas::qwen4_pd_staged_repack", self._fn.rows)
-            d_rows = self._fn.gdn_rows
-
-            def fake(staging, main_src, copy_src, gdn_src):
-                def empty(n):
-                    return staging.new_empty((n, ROW_SUBLANES, ROW_LANES), dtype=torch.uint8)
-
-                return empty(len(main_src)), empty(len(copy_src)), empty(len(gdn_src) * d_rows)
-
-            self._op.register_fake(fake)
-        main, copies, gdn = self._op(
-            self.staging, tensor(main_s, msize), tensor(copy_s, csize), tensor(gdn_s or [0], ngdn)
-        )
-        rows = self.pool.view(torch.uint8).view(-1, ROW_SUBLANES, ROW_LANES)
-        rows[tensor(main_d, msize).long()] = main
-        rows[tensor(copy_d, csize).long()] = copies
-        if gdn_s:
-            d_rows = self._fn.gdn_rows
-            gdn_dst = [p * self.dst_block + r for p in gdn_d for r in range(d_rows)]
-            rows[tensor(gdn_dst, len(gdn_dst)).long()] = gdn
+            # Donation + copy_ writeback, as the runner's pool block copies
+            # (mamba_state_copy_op): XLA aliases the pool and updates it in
+            # place; a torch view or index write would copy the whole pool.
+            self._op = pallas.jax_op(
+                "pallas::qwen4_pd_staged_repack", self._fn, donate_argnums=(0,)
+            )
+            self._op.register_fake(lambda pool, *rest: torch.empty_like(pool))
+        self.pool.copy_(self._op(self.pool, self.staging, *args))
