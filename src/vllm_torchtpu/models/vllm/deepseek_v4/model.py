@@ -198,8 +198,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_base,
             )
 
-        x = self.attn_norm(x)
-        x = self.attn(positions, x)
+        x = self.attn(positions, x, input_norm=self.attn_norm)
 
         residual, post_mix, res_mix, x = self.mhc_ops.fused(
             x,

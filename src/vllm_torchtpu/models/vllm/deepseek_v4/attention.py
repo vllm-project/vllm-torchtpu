@@ -29,6 +29,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
@@ -57,6 +58,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
     VllmDeepseekV4Indexer,
     static_verify_q_len,
 )
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -126,6 +128,16 @@ def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
 def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty((x.shape[0], wo_a.shape[-1]), dtype=x.dtype, device=x.device)
+
+
+def _plain_rms_norm(norm: RMSNorm) -> bool:
+    """Whether `norm` is a weighted RMSNorm over its whole input width."""
+    return norm.has_weight and norm.variance_size_override is None
+
+
+def _rms_norm_rstd(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """The `rsqrt(mean(x**2) + eps)` vLLM's `rms_norm` scales `x` by."""
+    return torch.rsqrt(x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True) + eps)
 
 
 def _name_float(value: float) -> str:
@@ -462,16 +474,39 @@ class VllmDeepseekV4MLAAttention(
         return attn_jax_op, built_from_real_caches
 
     def attn_gemm(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        self, hidden_states: torch.Tensor, input_norm: RMSNorm | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Project the layer input; returns `(qr_kv, indexer_weights, x)`.
+
+        `input_norm`, when given, is the RMSNorm `hidden_states` still owes,
+        and `x` is its output, or None when no consumer below needs it.
+        """
+        method = self.fused_wqa_wkv.quant_method
+        if input_norm is None:
+            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        elif isinstance(method, VllmFp8LinearMethodTPU) and _plain_rms_norm(input_norm):
+            # The compressors and the indexer read the normalized input; on a
+            # layer with neither, it never leaves the matmul.
+            compressor = getattr(self.mla_attn, "compressor", None)
+            emit_normed = self.indexer is not None or compressor is not None
+            out = method.apply_rms_norm(
+                self.fused_wqa_wkv,
+                hidden_states,
+                _rms_norm_rstd(hidden_states, input_norm.variance_epsilon),
+                input_norm.weight,
+                emit_normed=emit_normed,
+            )
+            qr_kv, hidden_states = out if emit_normed else (out, None)
+        else:
+            hidden_states = input_norm(hidden_states)
+            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
 
         if self.indexer is not None:
             indexer_weights, _ = self.indexer.weights_proj(hidden_states)
         else:
             indexer_weights = None
 
-        return qr_kv, indexer_weights
+        return qr_kv, indexer_weights, hidden_states
 
     @property
     def qnorm_rope_op(self):
@@ -558,7 +593,7 @@ class VllmDeepseekV4MLAAttention(
 
     def attention_impl(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
         qr: torch.Tensor,
         kv: torch.Tensor,
         indexer_weights: torch.Tensor | None,
@@ -904,12 +939,19 @@ class VllmDeepseekV4MLAAttention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        input_norm: RMSNorm | None = None,
     ) -> torch.Tensor:
-        """Forward pass for DeepSeek-V4 attention layer."""
+        """Forward pass for DeepSeek-V4 attention layer.
+
+        `input_norm` is an RMSNorm still owed by `hidden_states`, applied
+        inside the input projection when its kernel can take it.
+        """
         if positions.ndim > 1:
             positions = positions.flatten()
 
-        qr_kv, indexer_weights = self.attn_gemm(hidden_states)
+        qr_kv, indexer_weights, hidden_states = self.attn_gemm(
+            hidden_states, input_norm
+        )
 
         qr, kv = qr_kv.split(
             [self.mla_attn.q_lora_rank, self.mla_attn.head_dim], dim=-1
