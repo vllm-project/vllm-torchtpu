@@ -55,7 +55,7 @@ def test_all2all_probe_manager(monkeypatch, use_all2all):
 
 
 @pytest.mark.parametrize(
-    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2), ("combine", 1)]
+    "method,count", [("dispatch_router_logits", 2), ("combine", 1)]
 )
 @pytest.mark.parametrize("dp_size", [1, 2])
 def test_dispatch_and_combine_use_dp_group(
@@ -123,7 +123,7 @@ def test_moe_group_without_sequence_parallel(monkeypatch, communicator):
 
 
 @pytest.mark.parametrize(
-    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2), ("combine", 1)]
+    "method,count", [("dispatch_router_logits", 2), ("combine", 1)]
 )
 def test_dispatch_and_combine_with_sequence_parallel(
     monkeypatch, communicator, method, count
@@ -149,6 +149,87 @@ def test_dispatch_and_combine_with_sequence_parallel(
             assert invocation.kwargs == {"dim": 0}
         assert ep_group.all_gather.call_count == count
         ep_group.reduce_scatter.assert_not_called()
+
+
+def _rank_offset_all_gather(world):
+    """all_gather where rank r contributes the caller's tensor plus r."""
+    return lambda x, dim: torch.cat([x + r for r in range(world)], dim=dim)
+
+
+@pytest.mark.parametrize("is_sequence_parallel", [False, True])
+@pytest.mark.parametrize(
+    "weights_dtype,ids_dtype",
+    [
+        (torch.bfloat16, torch.int32),
+        (torch.float32, torch.int32),
+        (torch.float32, torch.int64),
+    ],
+)
+def test_dispatch_gathers_routes_in_one_packed_gather(
+    monkeypatch, communicator, is_sequence_parallel, weights_dtype, ids_dtype
+):
+    world, tokens, topk = 4, 5, 6
+    group = Mock(world_size=world)
+    group.all_gather.side_effect = _rank_offset_all_gather(world)
+    getter = "get_ep_group" if is_sequence_parallel else "get_dp_group"
+    monkeypatch.setattr(comm, getter, lambda: group)
+    hidden = torch.zeros(tokens, 8)
+    weights = torch.randn(tokens, topk).to(weights_dtype)
+    weights[0, 0] = float("nan")
+    ids = torch.randint(0, 256, (tokens, topk), dtype=ids_dtype)
+
+    out_hidden, out_weights, out_ids = communicator.dispatch(
+        hidden, weights, ids, is_sequence_parallel=is_sequence_parallel
+    )
+
+    assert group.all_gather.call_count == 2
+    assert group.all_gather.call_args_list[0].args[0] is hidden
+    packed = group.all_gather.call_args_list[1].args[0]
+    assert packed.dtype == torch.int32 and packed.dim() == 1
+    torch.testing.assert_close(
+        out_hidden, torch.cat([hidden + r for r in range(world)])
+    )
+    assert out_weights.shape == (world * tokens, topk)
+    assert out_ids.shape == (world * tokens, topk)
+    assert out_weights.dtype == weights_dtype and out_ids.dtype == ids_dtype
+    # Rank 0 sent its routes unchanged: they must arrive bit for bit.
+    words = torch.int16 if weights_dtype == torch.bfloat16 else torch.int32
+    assert torch.equal(out_weights[:tokens].view(words), weights.view(words))
+    assert torch.equal(out_ids[:tokens], ids)
+    # Every other rank's rows are its own, in rank order.
+    for r in range(1, world):
+        assert not torch.equal(out_ids[r * tokens : (r + 1) * tokens], ids)
+
+
+def test_dispatch_single_rank_returns_inputs(monkeypatch, communicator):
+    group = Mock(world_size=1)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    tensors = (torch.ones(2, 4), torch.ones(2, 6), torch.zeros(2, 6, dtype=torch.int32))
+    result = communicator.dispatch(*tensors)
+    assert all(a is b for a, b in zip(result, tensors))
+    group.all_gather.assert_not_called()
+
+
+def test_dispatch_keeps_a_dynamic_token_count_dynamic(monkeypatch, communicator):
+    """The packed gather reshapes by the traced token count."""
+
+    class Group:  # Dynamo does not trace into a Mock
+        world_size = 8
+        all_gather = staticmethod(_rank_offset_all_gather(8))
+
+    monkeypatch.setattr(comm, "get_dp_group", lambda: Group)
+    torch._dynamo.reset()
+    inputs = (
+        torch.ones(1024, 4),
+        torch.ones(1024, 6, dtype=torch.bfloat16),
+        torch.zeros(1024, 6, dtype=torch.int32),
+    )
+    for tensor in inputs:
+        torch._dynamo.mark_dynamic(tensor, 0)
+    result = torch.compile(communicator.dispatch, backend="eager", fullgraph=True)(
+        *inputs
+    )
+    assert [t.shape for t in result] == [(8192, 4), (8192, 6), (8192, 6)]
 
 
 def _replicated_reduce_scatter(world, rank):
