@@ -27,6 +27,10 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 # accumulation pattern every larger block repeats per 32 rows.
 MIN_TOKEN_BLOCK = 32
 
+# Position of the optional next-sublayer RMSNorm weight among the kernel's
+# refs, counting the shared-expert slot.
+_NORM_REF_INDEX = 10
+
 
 def _fused_kernel(
     x_ref,
@@ -39,6 +43,7 @@ def _fused_kernel(
     fn_lo_ref,
     sc_ref,
     hb_ref,
+    norm_w_ref,
     newres_ref,
     mix_a_ref,
     mix_b_ref,
@@ -51,6 +56,7 @@ def _fused_kernel(
     hc_pre_eps,
     routed_scale,
     gates,
+    norm_eps,
 ):
     """One token block: recombine, store once, 3-pass GEMM, collapse.
 
@@ -60,7 +66,8 @@ def _fused_kernel(
     expert's matmul epilogue. Without ``gates``, ``mix_a_ref``/``mix_b_ref``
     take the raw mixes and squared sums for the XLA gates; with them, the
     kernel stages the gate logits and, on its last step, writes the post
-    and comb gates there instead (``gates_kernel``).
+    and comb gates there instead (``gates_kernel``). With ``norm_w_ref``,
+    the collapsed layer input is written after the next sublayer's RMSNorm.
     """
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
@@ -145,6 +152,9 @@ def _fused_kernel(
     for i in range(1, m):
         lay = lay + pre_mix[:, i : i + 1] * gf[:, i * h : (i + 1) * h]
     layer_ref[...] = lay.astype(jnp.bfloat16)
+    if norm_w_ref is not None:
+        # Normalize what was stored, as the unfused RMSNorm reads it.
+        layer_ref[...] = utils.rms_norm_rows(layer_ref[...], norm_w_ref[...], norm_eps)
 
     if gates is not None:
         pl.when(pl.program_id(0) == pl.num_programs(0) - 1)(
@@ -165,6 +175,7 @@ def _fused_kernel(
         "gemm_precision",
         "vmem_limit_bytes",
         "gates",
+        "norm_eps",
     ),
 )
 def fused_post_pre_mixes(
@@ -185,6 +196,8 @@ def fused_post_pre_mixes(
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     gates: gates_kernel.GateConsts | None = None,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float = 0.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """The Pallas seam kernel: post recombine fused with pre's mix GEMM
     and in-block collapse.
@@ -221,6 +234,10 @@ def fused_post_pre_mixes(
             collapse then also see the hi-only mixes).
         gates: static; when given, the kernel also runs the post/comb
             gates and returns them in place of mixes and sqrsum.
+        norm_weight: optional (hidden_size,) bfloat16 weight of the RMSNorm
+            the next sublayer applies to layer2d; layer2d is then returned
+            normalized, bit for bit that norm (``utils.rms_norm_rows``).
+        norm_eps: static; that RMSNorm's epsilon.
 
     Returns:
         new_res2d: (num_tokens, hc_mult * hidden_size), bfloat16.
@@ -264,6 +281,13 @@ def fused_post_pre_mixes(
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
+    norm_inputs, norm_specs = [], []
+    if norm_weight is not None:
+        assert norm_weight.shape == (hidden_size,), norm_weight.shape
+        assert norm_weight.dtype == jnp.bfloat16, norm_weight.dtype
+        norm_inputs.append(norm_weight)
+        norm_specs.append(pl.BlockSpec((hidden_size,), lambda i: (0,)))
+
     mix_out = gates_kernel.mix_outputs(tb, padded_tokens, hc_mult, gates)
     compiler_params = pltpu.CompilerParams(
         dimension_semantics=(mix_out.semantics,),
@@ -280,7 +304,10 @@ def fused_post_pre_mixes(
         hc_pre_eps=hc_pre_eps,
         routed_scale=routed_scale,
         gates=gates,
+        norm_eps=norm_eps,
     )
+    if norm_weight is None:
+        kernel = utils.without_ref(kernel, _NORM_REF_INDEX)
     new_res, mixes, sqrsum, layer2d = pl.pallas_call(
         kernel if shared2d is not None else utils.without_shared(kernel),
         grid=(padded_tokens // tb,),
@@ -292,6 +319,7 @@ def fused_post_pre_mixes(
             *fn_specs,
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
+            *norm_specs,
         ],
         out_specs=[
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
@@ -305,7 +333,7 @@ def fused_post_pre_mixes(
         ],
         scratch_shapes=mix_out.scratch,
         compiler_params=compiler_params,
-    )(*x_inputs, res2d, post2d, comb2d, *fn_chunks, sc2d, hb2d)
+    )(*x_inputs, res2d, post2d, comb2d, *fn_chunks, sc2d, hb2d, *norm_inputs)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],
@@ -333,6 +361,8 @@ def mhc_fused_post_pre(
     min_grid_steps: int = 1,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float = 0.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Fused seam op: Pallas post+GEMM+collapse kernel with the gates
     epilogue in the same kernel.
@@ -341,6 +371,8 @@ def mhc_fused_post_pre(
     its hc_mult streams are copies of one stream (the chain's first seam).
     With ``shared`` (f32, x's shape), x is the routed experts' unscaled sum
     and the MoE output bf16(shared + x * routed_scale) is formed in-kernel.
+    With ``norm_weight``, layer_input_cur comes out after the next
+    sublayer's RMSNorm (see ``fused_post_pre_mixes``).
     Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur).
     """
     assert residual.dtype == jnp.bfloat16
@@ -373,6 +405,8 @@ def mhc_fused_post_pre(
         gates=gates_kernel.GateConsts(
             hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         ),
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
     return (

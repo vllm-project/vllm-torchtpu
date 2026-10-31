@@ -199,6 +199,7 @@ def _mhc_fused_post_pre_shared_jax(
     fn: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
+    norm_weight: jax.Array,
     *,
     rms_eps: float,
     hc_pre_eps: float,
@@ -208,6 +209,7 @@ def _mhc_fused_post_pre_shared_jax(
     routed_scale: float,
     token_block_size: int,
     min_grid_steps: int,
+    norm_eps: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """The seam op on an MoE output given as (routed, shared)."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
@@ -227,6 +229,8 @@ def _mhc_fused_post_pre_shared_jax(
         routed_scale=routed_scale,
         token_block_size=token_block_size,
         min_grid_steps=min_grid_steps,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
@@ -238,6 +242,7 @@ def _mhc_fused_post_pre_jax(
     fn: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
+    norm_weight: jax.Array,
     *,
     rms_eps: float,
     hc_pre_eps: float,
@@ -246,8 +251,10 @@ def _mhc_fused_post_pre_jax(
     sinkhorn_repeat: int,
     token_block_size: int,
     min_grid_steps: int,
+    norm_eps: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """One layer's post and the next layer's pre as a single kernel."""
+    """One layer's post and the next layer's pre as a single kernel, its
+    layer input returned after the next sublayer's RMSNorm."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
         x,
         residual,
@@ -263,6 +270,8 @@ def _mhc_fused_post_pre_jax(
         sinkhorn_repeat,
         token_block_size=token_block_size,
         min_grid_steps=min_grid_steps,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
@@ -506,14 +515,16 @@ def _mhc_fused_post_pre_shared_op(
     routed_scale: float,
     token_block_size: int,
     min_grid_steps: int,
+    norm_eps: float,
 ):
     op_name = (
-        "pallas::deepseek_v4_mhc_fused_post_pre_shared_v1"
+        "pallas::deepseek_v4_mhc_fused_post_pre_shared_norm_v1"
         + _gate_suffix(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         )
         + f"_rs{_name_float(routed_scale)}"
         + _block_suffix(token_block_size, min_grid_steps)
+        + f"_n{_name_float(norm_eps)}"
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
@@ -529,6 +540,7 @@ def _mhc_fused_post_pre_shared_op(
                 routed_scale=routed_scale,
                 token_block_size=token_block_size,
                 min_grid_steps=min_grid_steps,
+                norm_eps=norm_eps,
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
@@ -540,6 +552,7 @@ def _mhc_fused_post_pre_shared_op(
                 P(),  # fn
                 P(),  # hc_scale
                 P(),  # hc_base
+                P(),  # norm_weight
             ),
         )
         op.register_fake(_fake_mhc_fused_post_pre_shared)
@@ -555,16 +568,18 @@ def _mhc_fused_post_pre_op(
     sinkhorn_repeat: int,
     token_block_size: int,
     min_grid_steps: int,
+    norm_eps: float,
     *,
     single_stream_residual: bool = False,
 ):
     variant = "_res1" if single_stream_residual else ""
     op_name = (
-        f"pallas::deepseek_v4_mhc_fused_post_pre{variant}_v1"
+        f"pallas::deepseek_v4_mhc_fused_post_pre{variant}_norm_v1"
         + _gate_suffix(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         )
         + _block_suffix(token_block_size, min_grid_steps)
+        + f"_n{_name_float(norm_eps)}"
     )
     residual_spec = (
         P(ATTN_DATA_AXIS, None)
@@ -584,6 +599,7 @@ def _mhc_fused_post_pre_op(
                 sinkhorn_repeat=sinkhorn_repeat,
                 token_block_size=token_block_size,
                 min_grid_steps=min_grid_steps,
+                norm_eps=norm_eps,
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
@@ -594,6 +610,7 @@ def _mhc_fused_post_pre_op(
                 P(),  # fn
                 P(),  # hc_scale
                 P(),  # hc_base
+                P(),  # norm_weight
             ),
         )
         op.register_fake(_fake_mhc_fused_post_pre)
@@ -614,9 +631,11 @@ class MHCOps(NamedTuple):
         layer_input (..., hidden_size) bf16 out.
     ``post(x, residual, post_layer_mix, comb_res_mix)``
         (..., hc_mult, hidden_size) bf16 out.
-    ``fused(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base)``
+    ``fused(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base,
+    norm_weight)``
         residual_cur -- the ``post`` output -- then ``pre``'s three outputs
-        computed from it.
+        computed from it, the layer input after the next sublayer's RMSNorm
+        (weight ``norm_weight``, epsilon ``norm_eps``).
     ``pre_single_stream(x, fn, hc_scale, hc_base)`` / ``fused_from_single_stream``
         ``pre`` / ``fused`` for a residual whose hc_mult streams are copies
         of one (..., hidden_size) stream, which is passed instead;
@@ -644,6 +663,7 @@ def get_mhc_ops(
     *,
     seam_token_block: int,
     seam_min_grid_steps: int,
+    norm_eps: float,
 ) -> MHCOps:
     """Build (or fetch) every mHC op for these gate constants.
 
@@ -653,9 +673,10 @@ def get_mhc_ops(
     the returned ops and invoke them directly, keeping the op lookup out of
     the traced graph entirely. ``seam_token_block`` and
     ``seam_min_grid_steps`` set the seam kernel's grid (see
-    ``fused_post_pre_mixes``).
+    ``fused_post_pre_mixes``); ``norm_eps`` is the epsilon of the RMSNorm the
+    seam ops apply to their layer input.
     """
-    seam_grid = (seam_token_block, seam_min_grid_steps)
+    seam_consts = (seam_token_block, seam_min_grid_steps, norm_eps)
     return MHCOps(
         pre=_mhc_pre_op(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
@@ -666,7 +687,7 @@ def get_mhc_ops(
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
-            *seam_grid,
+            *seam_consts,
         ),
         post=get_mhc_post_op(),
         pre_single_stream=_mhc_pre_single_stream_op(
@@ -678,7 +699,7 @@ def get_mhc_ops(
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
-            *seam_grid,
+            *seam_consts,
             single_stream_residual=True,
         ),
         fused_with_shared=_mhc_fused_post_pre_shared_op(
@@ -688,6 +709,6 @@ def get_mhc_ops(
             hc_post_mult_value,
             sinkhorn_repeat,
             routed_scale,
-            *seam_grid,
+            *seam_consts,
         ),
     )

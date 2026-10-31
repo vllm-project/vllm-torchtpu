@@ -204,6 +204,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.ffn.routed_scaling_factor,
                 seam_token_block=MHC_SEAM_TOKEN_BLOCK,
                 seam_min_grid_steps=MHC_SEAM_MIN_GRID_STEPS,
+                norm_eps=self.rms_norm_eps,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops
@@ -259,13 +260,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_scale,
                 self.hc_attn_base,
             )
+            x = self.attn_norm(x)
         elif residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
                 x, self.hc_attn_fn_chunks, self.hc_attn_scale, self.hc_attn_base
             )
+            x = self.attn_norm(x)
         else:
+            # The seam kernel applies attn_norm to the layer input it writes.
             seam_args = (
                 residual,
                 post_mix,
@@ -273,6 +277,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn_chunks,
                 self.hc_attn_scale,
                 self.hc_attn_base,
+                self.attn_norm.weight,
             )
             if isinstance(x, tuple):
                 residual, post_mix, res_mix, x = self.mhc_ops.fused_with_shared(
@@ -281,7 +286,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 residual, post_mix, res_mix, x = self.mhc_ops.fused(x, *seam_args)
 
-        x = self.attn_norm(x)
         x = self.attn(positions, x)
 
         fused = (
@@ -297,8 +301,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_fn_chunks,
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            self.ffn_norm.weight,
         )
-        x = self.ffn_norm(x)
         routed, shared = self.ffn.forward_parts(x, input_ids)
         if shared is None:
             return routed, residual, post_mix, res_mix

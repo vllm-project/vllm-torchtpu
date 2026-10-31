@@ -18,6 +18,7 @@ from typing import cast
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
@@ -65,6 +66,16 @@ def without_shared(kernel: Callable) -> Callable:
     return body
 
 
+def without_ref(kernel: Callable, index: int) -> Callable:
+    """A kernel body for a call that omits the optional ref at ``index``
+    (counted with every optional ref present): it gets None there."""
+
+    def body(*refs):
+        return kernel(*refs[:index], None, *refs[index:])
+
+    return body
+
+
 def pad_to(padded_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
     """Zero-pad the leading (token) axis of each array to ``padded_tokens``."""
     pad = padded_tokens - arrays[0].shape[0]
@@ -78,6 +89,36 @@ def trim_to(num_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
     if arrays[0].shape[0] == num_tokens:
         return arrays
     return tuple(a[:num_tokens] for a in arrays)
+
+
+def rms_norm_rows(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:
+    """RMSNorm of a (tb, hidden) bf16 block inside a kernel, bit for bit the
+    XLA fusions torch's RMSNorm compiles to on TPU.
+
+    XLA reduces each row's squares in a fixed order: the 128-lane column
+    tiles in sequence, then (after a transpose) the 16 eight-lane groups in
+    sequence, then a sublane rotate-add tree by 4, 2, 1; the rsqrt is one
+    instruction, and the weight multiply stays in f32 (excess precision) with
+    one bf16 rounding. This writes that order out explicitly.
+    ``weight`` is (hidden,) bf16; tb must be a multiple of 8.
+    """
+    lanes, sublanes = 128, 8
+    xf = x.astype(jnp.float32)
+    sq = xf * xf
+    acc = sq[:, :lanes]
+    for j in range(1, xf.shape[1] // lanes):
+        acc = acc + sq[:, j * lanes : (j + 1) * lanes]
+    acc_t = acc.T  # (lanes, tb): rows on lanes
+    tot = acc_t[:sublanes]
+    for k in range(1, lanes // sublanes):
+        tot = tot + acc_t[k * sublanes : (k + 1) * sublanes]
+    # Mosaic's roll by s rotates the sublanes the other way from XLA's
+    # rotate by s, so these shifts emit XLA's rotates by 4, 2, 1.
+    for shift in (4, 6, 7):
+        tot = pltpu.roll(tot, shift, 0) + tot
+    inv = jax.lax.rsqrt(tot[:1] * (1.0 / xf.shape[1]) + eps)  # (1, tb)
+    inv_col = jnp.broadcast_to(inv, (sublanes, inv.shape[1])).T[:, :1]  # (tb, 1)
+    return ((xf * inv_col) * weight.astype(jnp.float32)).astype(jnp.bfloat16)
 
 
 def hc_mult_of(hc_mult3: int) -> int:
