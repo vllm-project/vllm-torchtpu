@@ -162,7 +162,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         The gate constants are baked into the op, so only the tensors are
         passed; this just puts `layer_input` first for the caller.
         """
-        post_mix, res_mix, layer_input = self.mhc_ops.pre(x, hc_fn, hc_scale, hc_base)
+        pre = self.mhc_ops.pre_single_stream if x.dim() == 2 else self.mhc_ops.pre
+        post_mix, res_mix, layer_input = pre(x, hc_fn, hc_scale, hc_base)
         return layer_input, post_mix, res_mix
 
     def forward(
@@ -201,7 +202,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self.attn_norm(x)
         x = self.attn(positions, x)
 
-        residual, post_mix, res_mix, x = self.mhc_ops.fused(
+        fused = (
+            self.mhc_ops.fused_from_single_stream
+            if residual.dim() == x.dim()
+            else self.mhc_ops.fused
+        )
+        residual, post_mix, res_mix, x = fused(
             x,
             residual,
             post_mix,
@@ -433,7 +439,6 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = typing.cast(
