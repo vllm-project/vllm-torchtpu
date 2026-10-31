@@ -2228,16 +2228,17 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # only the rows this rank attends (`dcp_token_parallel_op.q_rows`).
         q_rows = None
         tp_op = getattr(self.mla_attn, "sparse_mla_tp_op", None)
-        if (
-            tp_op is not None
-            and tp_op.q_replicated
-            and dcp_token_parallel_op.applies(hidden_states.shape[0])
-        ):
-            if self.kimi_preprocess is not None or getattr(self, "qb_overlap", False):
+        if tp_op is not None and tp_op.q_replicated:
+            if not dcp_token_parallel_op.applies(hidden_states.shape[0]):
+                # Lift the rank operand here too: the warmup hands buckets
+                # over only between traces that lift the same buffers.
+                hidden_states = _retain_buffers(hidden_states, tp_op.rank)
+            elif self.kimi_preprocess is not None or getattr(self, "qb_overlap", False):
                 raise NotImplementedError(
                     "TPU_DCP_PREFILL_TOKEN_PARALLEL: no fused q preprocessing"
                 )
-            q_rows = dcp_token_parallel_op.q_rows(tp_op, hidden_states.shape[0])
+            else:
+                q_rows = dcp_token_parallel_op.q_rows(tp_op, hidden_states.shape[0])
 
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
