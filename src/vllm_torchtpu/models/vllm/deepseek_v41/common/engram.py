@@ -626,6 +626,11 @@ class Engram(upstream.Engram):
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
         self._prepared_uploads: dict[int, list[PreparedEngramUpload]] | None = None
         self._active_upload: PreparedEngramUpload | None = None
+        # TPU_DEEPSEEK_V41_ENGRAM_HBM state (``engram_hbm``), set on first use.
+        self._uses_hbm: bool | None = None
+        self._hbm_table: tuple | None = None
+        self._hbm_rank: torch.Tensor | None = None
+        self._hbm_rows: torch.Tensor | None = None
         if getattr(self.embed_tokens, "host_offload", False):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
@@ -797,22 +802,24 @@ class Engram(upstream.Engram):
 
     @property
     def uses_hbm_lookup(self) -> bool:
-        """``TPU_DSV41_ENGRAM_HBM``: rows come from the HBM copy of the host
-        head shard through ``engram_hbm`` instead of the host exchange."""
-        from .engram_hbm import should_use_hbm_lookup
+        """``TPU_DEEPSEEK_V41_ENGRAM_HBM``: rows come from the HBM copy of the host
+        head shard through ``engram_hbm`` instead of the host exchange.
+        Decided once, after staging and the EP group exist."""
+        if self._uses_hbm is None:
+            from .engram_hbm import should_use_hbm_lookup
 
-        return should_use_hbm_lookup(
-            staged_raw=self._staged_raw,
-            dp_size=int(self.embed_tokens.dp_size),
-            layer_hash_index=int(getattr(self, "layer_hash_index", -1)),
-        )
+            self._uses_hbm = should_use_hbm_lookup(
+                staged_raw=self._staged_raw,
+                dp_size=int(self.embed_tokens.dp_size),
+                layer_hash_index=int(self.layer_hash_index),
+            )
+        return self._uses_hbm
 
     def upload_hbm_table(self):
         """Copy this rank's host head shard to HBM once; returns
         (table, scales, shard metadata, rows per rank)."""
-        state = getattr(self, "_hbm_table", None)
-        if state is not None:
-            return state
+        if self._hbm_table is not None:
+            return self._hbm_table
         from .engram_hbm import gather_shard_meta, upload_table
 
         emb = self.embed_tokens
@@ -881,12 +888,11 @@ class Engram(upstream.Engram):
             int(emb.dp_size),
             meta,
         )
-        rank = getattr(self, "_hbm_rank", None)
-        if rank is None:
-            rank = torch.tensor(
+        if self._hbm_rank is None:
+            self._hbm_rank = torch.tensor(
                 [[cast(int, ep_mesh_index())]], dtype=torch.int32, device=table.device
             )
-            self._hbm_rank = rank
+        rank = self._hbm_rank
         hashes = hash_ids.to(device=table.device, dtype=torch.int32)
         embedded = op(hashes, table, table_scales, rank)
         if num_tokens >= 2:
@@ -897,8 +903,9 @@ class Engram(upstream.Engram):
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._staged_raw is None:
             return super()._ready_rows(num_tokens)
-        # Set only by ``_hbm_prepare``; read as a plain attribute so the
-        # compiled stage does not trace the env/EP-mesh gating.
+        # Set only by ``_hbm_prepare``; a plain attribute read keeps the gating
+        # out of the compiled stage. getattr: the packed-scale parity test calls
+        # this on a bare holder without HBM state.
         hbm_rows = getattr(self, "_hbm_rows", None)
         if hbm_rows is not None:
             # The device lookup already dequantized this step's rows.

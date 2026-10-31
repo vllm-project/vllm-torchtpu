@@ -321,7 +321,7 @@ class DeepseekV41DecoderStage(_StageBase):
 
 
 class _StepHashes:
-    """A step's Engram hashes for ``TPU_DSV41_ENGRAM_HBM``: device hashes for
+    """A step's Engram hashes for ``TPU_DEEPSEEK_V41_ENGRAM_HBM``: device hashes for
     HBM layers, the host path's downloaded and gathered ones for the rest,
     produced on first use."""
 
@@ -331,7 +331,7 @@ class _StepHashes:
         self._host: torch.Tensor | None = None
 
     def for_layer(self, engram) -> torch.Tensor:
-        if getattr(engram, "uses_hbm_lookup", False):
+        if isinstance(engram, Engram) and engram.uses_hbm_lookup:
             return self.hashes
         if self._host is None:
             self._host = self._gather_host(self.hashes)
@@ -348,6 +348,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     _engram_prefetch: _EngramPrefetch | None = None
     _current_host_inputs: HostEngramInputs | None = None
     _prefetched_uploads: dict[int, "PreparedEngramUpload"] | None = None
+    _hbm_engram_cached: bool | None = None
 
     @cached_property
     def _hash_download(self) -> "EngramHashDownload":
@@ -356,7 +357,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         return EngramHashDownload()
 
     def _hbm_engrams(self) -> list:
-        """Engram layers served from HBM (``TPU_DSV41_ENGRAM_HBM``)."""
+        """Engram layers served from HBM (``TPU_DEEPSEEK_V41_ENGRAM_HBM``)."""
         return [
             layer.engram
             for layer in islice(self.layers, self.start_layer, self.end_layer)
@@ -365,11 +366,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         ]
 
     def _uses_hbm_engram(self) -> bool:
-        cached = getattr(self, "_hbm_engram_cached", None)
-        if cached is None:
-            cached = bool(self._hbm_engrams())
-            self._hbm_engram_cached = cached
-        return cached
+        if self._hbm_engram_cached is None:
+            self._hbm_engram_cached = bool(self._hbm_engrams())
+        return self._hbm_engram_cached
 
     def _has_cpu_offloaded_engram(self) -> bool:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -1364,7 +1363,7 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
-        # TPU_DSV41_ENGRAM_HBM: place the host Engram head shards in HBM
+        # TPU_DEEPSEEK_V41_ENGRAM_HBM: place the host Engram head shards in HBM
         # before the KV cache is sized from what remains.
         for engram in self.model._hbm_engrams():
             engram.upload_hbm_table()

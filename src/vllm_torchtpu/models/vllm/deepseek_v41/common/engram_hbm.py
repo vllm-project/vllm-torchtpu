@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Engram tables in HBM, looked up on device across the node-local DP group.
 
-With ``TPU_DSV41_ENGRAM_HBM=first`` (default: only the first Engram layer,
+With ``TPU_DEEPSEEK_V41_ENGRAM_HBM=first`` (default: only the first Engram layer,
 which only layer 0 can hide; later layers keep the host path, overlapped with
 the layers before them) or ``all``, each DP rank uploads the head shard of the
 node-local Engram table that the host-offload path already loads into its host
@@ -20,11 +20,11 @@ The host path's D2H of the hashes, its two gloo collectives (hash all-gather,
 row all-to-all), the host gather and the H2D upload all leave the step; the
 device lookup costs ~0.1 ms per Engram layer at 288 decode tokens per rank.
 The tables take HBM away from the KV cache (~11.8 GiB per DeepSeek-V4.1-Flash
-Engram layer per rank with an 8-rank node), so recipes raise
-``--gpu-memory-utilization`` accordingly.
+Engram layer per rank with an 8-rank node).
 """
 
-from functools import lru_cache
+import os
+from functools import cache
 
 import jax
 import jax.numpy as jnp
@@ -35,12 +35,22 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
+from .engram import _INVALID_SCALE
+
 logger = init_logger(__name__)
 
 # Single character: torch_tpu's local-shape helper iterates a spec entry.
 _AXIS = "d"
-# E8M0 byte 255 never occurs in a real table; it marks rows outside a shard.
-_INVALID_SCALE = 255
+_ENV = "TPU_DEEPSEEK_V41_ENGRAM_HBM"
+
+
+def _tp_size() -> int:
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    try:
+        return int(get_tensor_model_parallel_world_size())
+    except AssertionError:  # parallel state not initialised (unit tests)
+        return 1
 
 
 def should_use_hbm_lookup(
@@ -49,20 +59,36 @@ def should_use_hbm_lookup(
     dp_size: int,
     layer_hash_index: int,
 ) -> bool:
-    """Whether an Engram layer should serve its rows from HBM."""
-    mode = (envs.TPU_DSV41_ENGRAM_HBM or "first").lower()
-    if (
-        mode == "off"
-        or staged_raw is None
-        or staged_raw.device.type != "tpu"
-        or dp_size <= 1
-    ):
+    """Whether an Engram layer should serve its rows from HBM.
+
+    Engram layers call this once and cache the answer. A mode that cannot
+    apply falls back to the host path with a warning naming the reason.
+    """
+    mode = envs.TPU_DEEPSEEK_V41_ENGRAM_HBM.lower()
+    if mode == "off" or (mode == "first" and layer_hash_index != 0):
         return False
     from vllm_torchtpu.distributed.ep_mesh import get_ep_group
 
-    if get_ep_group() is None:
-        return False
-    return mode == "all" or layer_hash_index == 0
+    if staged_raw is None or staged_raw.device.type != "tpu":
+        reason = "Engram CPU offload with TPU staging is not active"
+    elif dp_size <= 1:
+        reason = (
+            "the host tables are not head-sharded across a node-local DP "
+            "group (e.g. dp_shared_memory)"
+        )
+    elif _tp_size() != 1:
+        # The lookup groups blocks of dp_size consecutive EP mesh indices as
+        # one node; that layout is only established for TP1 (DP == EP).
+        reason = "tensor parallelism is > 1"
+    elif get_ep_group() is None:
+        reason = "there is no expert-parallel group"
+    else:
+        return True
+    # Expected for non-offload deployments under the default; worth flagging
+    # only when an operator asked for HBM explicitly.
+    log = logger.warning_once if _ENV in os.environ else logger.debug
+    log("[DSV41] %s=%s ignored: %s; using the host lookup", _ENV, mode, reason)
+    return False
 
 
 def gather_shard_meta(
@@ -186,7 +212,9 @@ def make_lookup(
     return lookup
 
 
-@lru_cache(maxsize=16)
+# One entry per (layer, token bucket); never evict, or a rebuilt op would
+# re-register the same op name while serving.
+@cache
 def build_lookup_op(
     layer: int,
     num_tokens: int,

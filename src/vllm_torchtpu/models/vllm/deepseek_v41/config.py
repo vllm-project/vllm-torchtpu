@@ -126,7 +126,11 @@ def validate_environment(policy: DeepseekV41Config) -> None:
         if (
             name.startswith("TPU_DEEPSEEK_V41_")
             and name not in aliases
-            and name != "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD"
+            and name
+            not in (
+                "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD",
+                "TPU_DEEPSEEK_V41_ENGRAM_HBM",
+            )
         ):
             logger.warning_once(
                 "[DSV41] %s no longer selects a serving route; "
