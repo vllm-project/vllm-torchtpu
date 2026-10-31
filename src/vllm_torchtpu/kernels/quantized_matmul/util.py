@@ -22,6 +22,17 @@ from jax._src import dtypes
 
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import TunedValue
 
+# Tiles of `fused_quantize_kernel.fused_quantized_matmul`, which computes
+# `xla_quantized_matmul` with the activation quantize kept in VMEM: rows and
+# weight columns per grid step.
+FUSED_QUANTIZE_TOKEN_BLOCK = 512
+FUSED_QUANTIZE_OUT_BLOCK = 1024
+# The fused kernel takes a shape only while n / k is below this: the in-VMEM
+# quantize saves work that grows with m * k, and the kernel's epilogue overlaps
+# the MXU less than XLA's output fusion does, which costs work that grows with
+# m * n.
+FUSED_QUANTIZE_MAX_OUT_PER_IN = 1.0
+
 
 def unfold_args(
     conditions: tuple[jax.Array | bool, ...],

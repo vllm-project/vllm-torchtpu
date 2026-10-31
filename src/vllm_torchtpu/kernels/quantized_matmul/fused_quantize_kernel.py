@@ -28,32 +28,29 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-# Rows, and weight columns, per grid step.
-TOKEN_BLOCK = 512
-OUT_BLOCK = 1024
+from vllm_torchtpu.kernels.quantized_matmul import util
+
+# Tile sizes and the shape gate are tunables in `util` (FUSED_QUANTIZE_*), read
+# at trace time.
 # Columns per quantize step; rows per step are one fp8 vreg's 32 sublanes.
 QUANT_COLS = 512
 QUANT_ROWS = 32
-# Taken only while n / k is below this: the in-VMEM quantize saves work that
-# grows with m * k, and the kernel's epilogue overlaps the MXU less than XLA's
-# output fusion does, which costs work that grows with m * n.
-MAX_OUT_PER_IN = 1.0
 VMEM_LIMIT_BYTES = 48 * 1024 * 1024
 
 
 def _out_block(n: int) -> int | None:
-    for block in (OUT_BLOCK, 512, 256):
+    for block in (util.FUSED_QUANTIZE_OUT_BLOCK, 512, 256):
         if n % block == 0:
             return block
     return None
 
 
-def _vmem_bytes(m: int, k: int, tn: int) -> int:
-    x = 2 * TOKEN_BLOCK * k * 2  # bf16, double-buffered
+def _vmem_bytes(m: int, k: int, tm: int, tn: int) -> int:
+    x = 2 * tm * k * 2  # bf16, double-buffered
     x_q = m * k + m * 128 * 4  # fp8 rows and their lane-padded f32 scales
     w = 2 * k * tn
-    out = 2 * TOKEN_BLOCK * tn * 2
-    acc = 2 * TOKEN_BLOCK * tn * 4  # f32 dot result and its scaled copy
+    out = 2 * tm * tn * 2
+    acc = 2 * tm * tn * 4  # f32 dot result and its scaled copy
     return x + x_q + w + out + acc
 
 
@@ -61,16 +58,16 @@ def supports(x: jax.Array, w_q: jax.Array, w_scale: jax.Array) -> bool:
     """Whether `fused_quantized_matmul` should take these operands."""
     m, k = x.shape
     n = w_q.shape[1]
-    tn = _out_block(n)
+    tm, tn = util.FUSED_QUANTIZE_TOKEN_BLOCK, _out_block(n)
     return (
         x.dtype == jnp.bfloat16
         and w_q.dtype == jnp.float8_e4m3fn
         and w_scale.shape == (n,)
-        and m % TOKEN_BLOCK == 0
+        and m % tm == 0
         and k % QUANT_COLS == 0
         and tn is not None
-        and n < MAX_OUT_PER_IN * k
-        and _vmem_bytes(m, k, tn) <= VMEM_LIMIT_BYTES
+        and n < util.FUSED_QUANTIZE_MAX_OUT_PER_IN * k
+        and _vmem_bytes(m, k, tm, tn) <= VMEM_LIMIT_BYTES
     )
 
 
@@ -133,7 +130,7 @@ def fused_quantized_matmul(
     """`xla_quantized_matmul(x, w_q, w_scale)` with the quantize kept in VMEM."""
     m, k = x.shape
     n = w_q.shape[1]
-    tm, tn = TOKEN_BLOCK, _out_block(n)
+    tm, tn = util.FUSED_QUANTIZE_TOKEN_BLOCK, _out_block(n)
     num_i, num_j = m // tm, n // tn
     f8_max = float(jnp.finfo(w_q.dtype).max)
 
