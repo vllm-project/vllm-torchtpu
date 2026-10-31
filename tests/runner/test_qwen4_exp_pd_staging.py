@@ -160,3 +160,12 @@ def test_repack_rank_slices(tp, dcp):
         got_conv = read_typed(rows[gb + d.ssm_tokens : gb + d.ssm_tokens + d.conv_tokens],
                               d.conv_width * d.conv_dim, 4, np.float32).reshape(d.conv_width, d.conv_dim)
         np.testing.assert_array_equal(got_conv, conv[:, st.conv_channels(s, d, rank)])
+
+
+def test_pad_of_a_rank_without_rows_writes_the_null_row():
+    # A DCP rank of a request shorter than one page owns no main-KV rows.
+    rank = st.RankSlice(tp_size=8, tp_rank=6, num_kv_heads=2, main_dcp=4)
+    src, dst = st.main_rows(24, [3], 384, [1], 128, rank)
+    assert src == [] and dst == []
+    assert st._pad(src, 4) == [0, 0, 0, 0]
+    assert st._pad([5, 7], 4) == [5, 7, 7, 7]
