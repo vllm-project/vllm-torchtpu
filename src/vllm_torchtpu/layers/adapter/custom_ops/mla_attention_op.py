@@ -2179,6 +2179,23 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         permute_linear_output_channels(kv_layer, kv_index)
         self._rope_neox_permuted = True
 
+    def _norm_and_gather_latents(self, qkv_lora, hidden_states, tokens, token_split):
+        """TPU_PREFILL_LATENT_NORMS_LOCAL: the q and kv latent RMSNorms on this
+        core's rows, before the all-gather (they work on each row alone), then
+        one all-gather of the normed q latent, the normed kv latent, k_pe and
+        the indexer keys. Returns q_c, kv_c_normed, k_pe and the indexer's
+        keyword arguments."""
+        q_c, kv_c, k_pe = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        parts = [self.q_a_layernorm(q_c), self.kv_a_layernorm(kv_c), k_pe]
+        if self._reads_indexer_keys():
+            assert self.indexer is not None
+            parts.append(self.indexer.wk_weights_proj(hidden_states)[0])
+        gathered = token_split.gather_columns(tokens, *parts)
+        index_kw = {"kw": gathered[3]} if len(gathered) > 3 else {}
+        return gathered[0], gathered[1], gathered[2], index_kw
+
     def _reads_indexer_keys(self) -> bool:
         """Whether this layer runs its own indexer (and so its key projection)."""
         return self.is_sparse and self.indexer is not None and not self.skip_topk
@@ -2210,6 +2227,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         o_proj sum (a reduce-scatter instead of the all-reduce)."""
         q_c = None
         kv_lora = None
+        kv_c_normed = None
         output_gate = None
         early_topk = None
         index_kw: dict[str, torch.Tensor] = {}
@@ -2240,7 +2258,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
 
                 qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-                if token_split is not None and self._reads_indexer_keys():
+                if (
+                    token_split is not None
+                    and envs.TPU_PREFILL_LATENT_NORMS_LOCAL
+                    and not self.gate_is_fused
+                ):
+                    q_c, kv_c_normed, k_pe, index_kw = self._norm_and_gather_latents(
+                        qkv_lora, hidden_states, positions.shape[0], token_split
+                    )
+                    qkv_lora = None
+                elif token_split is not None and self._reads_indexer_keys():
                     assert self.indexer is not None
                     qkv_lora, index_kw["kw"] = token_split.gather_columns(
                         positions.shape[0],
@@ -2251,7 +2278,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     (qkv_lora,) = token_split.gather_columns(
                         positions.shape[0], qkv_lora
                     )
-                if self.gate_is_fused:
+                if qkv_lora is None:
+                    pass
+                elif self.gate_is_fused:
                     q_c, kv_lora, output_gate = qkv_lora.split(
                         [
                             self.q_lora_rank,
@@ -2265,7 +2294,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                         dim=-1,
                     )
-                q_c = self.q_a_layernorm(q_c)
+                if qkv_lora is not None:
+                    q_c = self.q_a_layernorm(q_c)
                 if (
                     getattr(self, "qb_overlap", False)
                     and self.kimi_preprocess is None
@@ -2295,11 +2325,12 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
                 q = self.q_proj(hidden_states)[0]
 
-            assert kv_lora is not None
-            kv_c, k_pe = kv_lora.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
-            kv_c_normed = self.kv_a_layernorm(kv_c)
+            if kv_c_normed is None:
+                assert kv_lora is not None
+                kv_c, k_pe = kv_lora.split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                )
+                kv_c_normed = self.kv_a_layernorm(kv_c)
 
         # `dcp_group_size` is 1 unless query replication is on, in which case
         # the projection already returned the whole DCP group's heads.
