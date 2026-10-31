@@ -34,10 +34,17 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
+    SupportsPP,
 )
 from vllm.model_executor.models.qwen3_next import Qwen3NextMLP, Qwen3NextSparseMoeBlock
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    WeightsMapper,
+    is_pp_missing_parameter,
+)
 from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
@@ -61,6 +68,7 @@ from .ple_host import shared_ple_options
 from .ple_storage import SharedPLEOptions
 from .pool_layout import POOLED_GDN_CONV_STATE_DTYPE
 from .pooled_ple import Qwen4ExpPooledPLE
+from .pp import is_first_stage, is_last_stage, pipeline_size, stage_layers
 from .qsa import QSAMetadata, Qwen4ExpQSA
 
 
@@ -517,6 +525,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         "input_ids": 0,
         "positions": 0,
         "inputs_embeds": 0,
+        "intermediate_tensors": 0,
         "valid_tokens": 0,
     }
 )
@@ -532,20 +541,30 @@ class Qwen4ExpBackbone(nn.Module):
         # Row multiple the sequence-parallel graph pads its HC streams to;
         # set by Qwen4ExpForCausalLM with QWEN4_EXP_PREFILL_SP_PAD_HC.
         self.sp_pad_rows = 0
-        self.embed_tokens = VocabParallelEmbedding(t.vocab_size, t.hidden_size)
+        # Pipeline stages: this worker builds only its own decoder layers
+        # (the rest are PPMissingLayer placeholders, so every layer keeps its
+        # global index and name); the first stage embeds, the last mixes.
+        self.stage = stage_layers(cfg)
+        self.first_stage, self.last_stage = is_first_stage(cfg), is_last_stage(cfg)
+        self.embed_tokens = (
+            VocabParallelEmbedding(t.vocab_size, t.hidden_size)
+            if self.first_stage
+            else PPMissingLayer()
+        )
         self.layers = nn.ModuleList(
             [
                 Qwen4ExpDecoderLayer(cfg, i, f"model.layers.{i}")
+                if i in self.stage
+                else PPMissingLayer()
                 for i in range(t.num_hidden_layers)
             ]
         )
         self.host_ple_index = next(
             (
                 i
-                for i, layer in enumerate(
-                    cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
-                )
-                if layer.ple is not None and layer.ple.cpu_offload
+                for i in self.stage
+                if (ple := cast(Qwen4ExpDecoderLayer, self.layers[i]).ple) is not None
+                and ple.cpu_offload
             ),
             None,
         )
@@ -554,7 +573,7 @@ class Qwen4ExpBackbone(nn.Module):
         # request-owned KV, ring and tags remain separate for every layer.
         attentions = [
             layer.self_attn
-            for layer in self.layers
+            for layer in (cast(Qwen4ExpDecoderLayer, self.layers[i]) for i in self.stage)
             if layer.layer_type == "full_attention"
         ]
         for attention in attentions[1:]:
@@ -568,12 +587,30 @@ class Qwen4ExpBackbone(nn.Module):
         hc_full_tile = int(
             cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_full_tile", 0)
         )
-        self.hyper_connection_mixer = GatedResidual(
-            hc_config(t),
-            use_combine=False,
-            prefill_up_tile=hc_up_tile,
-            prefill_norm_tile=hc_norm_tile,
-            prefill_full_tile=hc_full_tile,
+        self.hyper_connection_mixer = (
+            GatedResidual(
+                hc_config(t),
+                use_combine=False,
+                prefill_up_tile=hc_up_tile,
+                prefill_norm_tile=hc_norm_tile,
+                prefill_full_tile=hc_full_tile,
+            )
+            if self.last_stage
+            else PPMissingLayer()
+        )
+        self.hidden_width = self.hc_count * t.hidden_size
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        # The multi-stream hidden state [T, hc_count * H] crosses stages
+        # before the final mixer collapses it.
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.hidden_width), dtype=dtype, device=device
+                )
+            }
         )
 
     def forward(
@@ -581,6 +618,7 @@ class Qwen4ExpBackbone(nn.Module):
         input_ids,
         positions,
         inputs_embeds=None,
+        intermediate_tensors: IntermediateTensors | None = None,
         *,
         query_start_loc,
         ngram_context,
@@ -597,6 +635,7 @@ class Qwen4ExpBackbone(nn.Module):
             positions,
             inputs_embeds,
             sequence_parallel=False,
+            intermediate_tensors=intermediate_tensors,
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
             state_slots=state_slots,
@@ -613,6 +652,7 @@ class Qwen4ExpBackbone(nn.Module):
         inputs_embeds,
         *,
         sequence_parallel: bool,
+        intermediate_tensors: IntermediateTensors | None = None,
         query_start_loc,
         ngram_context,
         state_slots,
@@ -631,7 +671,7 @@ class Qwen4ExpBackbone(nn.Module):
             ple_inputs = PLEInputs(input_ids, query_start_loc, ngram_context)
             if (
                 envs.VLLM_TPU_PLE_HOST_OVERLAP
-                and self.host_ple_index > 0
+                and self.host_ple_index > self.stage.start
                 and not sequence_parallel
             ):
                 # Start the ids' copy now; finish it just before the PLE layer
@@ -645,17 +685,25 @@ class Qwen4ExpBackbone(nn.Module):
                 ple_raw_embeddings = ple.lookup_for_model(
                     ple_inputs, query_start_loc[-1:]
                 )
-        hidden = (
-            self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
-        )
         num_tokens = input_ids.shape[0]
         sp_pad = self.sp_pad_rows if sequence_parallel else 0
-        if sequence_parallel:
-            sp.check_divisible(num_tokens)
-            hidden = sp.shard(hidden)
-        rows = hidden.shape[0]
-        hidden = sp.pad_shard(hidden.repeat(1, self.hc_count), sp_pad)
-        for index, layer in enumerate(self.layers):
+        if self.first_stage:
+            hidden = (
+                self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+            )
+            if sequence_parallel:
+                sp.check_divisible(num_tokens)
+                hidden = sp.shard(hidden)
+            rows = hidden.shape[0]
+            hidden = sp.pad_shard(hidden.repeat(1, self.hc_count), sp_pad)
+        else:
+            # A later stage resumes from the previous stage's streams (TP1
+            # stages: no sequence-parallel sharding to undo).
+            assert intermediate_tensors is not None and not sequence_parallel
+            hidden = intermediate_tensors["hidden_states"]
+            rows = hidden.shape[0]
+        for index in self.stage:
+            layer = self.layers[index]
             if ple_token is not None and index == self.host_ple_index:
                 ple_raw_embeddings = ple.lookup_finish(ple_token, ple_inputs, hidden)
             hidden = layer(
@@ -673,6 +721,8 @@ class Qwen4ExpBackbone(nn.Module):
                 sequence_parallel=sequence_parallel,
                 sp_pad=sp_pad,
             )
+        if not self.last_stage:
+            return IntermediateTensors({"hidden_states": hidden})
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
         if sp_pad:
             mixed, hidden = sp.unpad(mixed, rows), sp.unpad(hidden, rows)
@@ -711,6 +761,8 @@ class Qwen4ExpBackbone(nn.Module):
         assert self.host_ple_index is None, "segments need the PLE table on HBM"
         positions64 = positions.to(torch.int64)
         ids64 = input_ids.to(torch.int64)
+        # The segment megakernels walk every decoder layer in one program.
+        assert len(self.stage) == len(self.layers), "megakernels need PP1"
         hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
         qsa_layers = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
@@ -825,6 +877,8 @@ class Qwen4ExpBackbone(nn.Module):
         assert self.host_ple_index is None, "segments need the PLE table on HBM"
         ids64 = input_ids.to(torch.int64)
         positions64 = positions.to(torch.int64)
+        # The segment megakernels walk every decoder layer in one program.
+        assert len(self.stage) == len(self.layers), "megakernels need PP1"
         hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
         for h, group in enumerate(segment_call.head_groups):
@@ -1006,7 +1060,7 @@ class Qwen4ExpWholeStepModel(nn.Module):
         )
 
 
-class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
+class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     requires_raw_input_tokens = True
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={"model.language_model.": "model."}
@@ -1054,10 +1108,21 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             # One rule for the router, both bucket filters and retraces.
             bucket_filter.assign(self.model_sp, eligible)
             bucket_filter.assign(self.model, lambda n: not eligible(n))
-        self.lm_head = ParallelLMHead(
-            self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
+        self.lm_head = (
+            ParallelLMHead(
+                self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
+            )
+            if self.model.last_stage
+            else PPMissingLayer()
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        if pipeline_size(vllm_config) > 1 and self.model_sp is not None:
+            raise NotImplementedError("Qwen4Exp pipeline stages run TP1, without SP")
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
         # The route reads the padded bucket size outside both compiled graphs.
@@ -1155,7 +1220,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             }
         )
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.model.layers)
-        moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in layers]
+        moe_loaders = {i: AutoWeightsLoader(layers[i].mlp) for i in self.model.stage}
         # Exactly the Qwen3.5 checkpoint projection mapping. HC remains
         # separate checkpoint-native parameters (no NVIDIA packed-HC mapper).
         gdn_map = {
@@ -1170,6 +1235,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             name = next(iter(self.hf_to_vllm_mapper.apply([(original, weight)])))[0]
             if name in source:
                 raise ValueError(f"Duplicate checkpoint tensor {original}")
+            # Another pipeline stage's layer, embedding, mixer or LM head.
+            if is_pp_missing_parameter(name, self):
+                continue
             source.add(name)
             if name.startswith("model.layers."):
                 _, _, idx, family, relative = name.split(".", 4)
@@ -1213,7 +1281,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             loader = getattr(param, "weight_loader", default_weight_loader)
             loader(param, weight)
             loaded.add(name)
-        for i, layer in enumerate(layers):
+        for i in self.model.stage:
+            layer = layers[i]
             verify_moe_checkpoint(
                 layer.mlp, f"model.layers.{i}.mlp.", source, moe_mapper, f"layer{i}"
             )

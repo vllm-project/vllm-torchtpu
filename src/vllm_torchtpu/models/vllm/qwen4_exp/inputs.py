@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.forward_context import set_forward_context
+from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kv_cache_materializer import LayerKVCache
@@ -19,6 +20,7 @@ from vllm_torchtpu.utils import synchronize_tensors
 
 from .cache import Qwen4ExpCache
 from .config import mtp_layer_prefixes, num_speculative_tokens, use_unified_pool
+from .pp import stage_layers
 
 if TYPE_CHECKING:
     from .pooled_cache import Qwen4ExpPooledCache
@@ -180,8 +182,12 @@ class Qwen4ExpAdapter:
         self.pooled = use_unified_pool()
         self.config = runner.model_config.hf_text_config
         self.block_size = runner.cache_config.block_size
-        self.attention_prefix = (
-            f"model.layers.{self.config.layer_types.index('full_attention')}"
+        # Every QSA layer reads the same main/compressed block tables (one
+        # scheduler group each); take them from this pipeline stage's first
+        # full-attention layer, whose metadata the stage builds.
+        stage = stage_layers(runner.vllm_config)
+        self.attention_prefix = "model.layers.%d" % next(
+            i for i in stage if self.config.layer_types[i] == "full_attention"
         )
         self.cache: Qwen4ExpCache | Qwen4ExpPooledCache | None = None
         self.token_store = None
@@ -639,10 +645,17 @@ class Qwen4ExpAdapter:
             )
 
     def dummy_run(
-        self, num_tokens, num_reqs, profile_prefix=None, *, dp_lockstep=False
+        self,
+        num_tokens,
+        num_reqs,
+        profile_prefix=None,
+        *,
+        dp_lockstep=False,
+        through_handoff=False,
     ):
         runner = self.runner
         if dp_lockstep:
+            assert not through_handoff
             return self._idle_run(num_tokens, num_reqs)
         assert runner.input_batch.num_reqs == 0, (
             "S1 dummy calls require no live requests"
@@ -756,6 +769,7 @@ class Qwen4ExpAdapter:
             num_tokens,
             profile_prefix,
             active_rows=active,
+            through_handoff=through_handoff,
         )
 
     def _idle_run(self, num_tokens, num_reqs):
@@ -813,9 +827,23 @@ class Qwen4ExpAdapter:
         *,
         dp_lockstep=False,
         active_rows=0,
+        through_handoff=False,
     ):
         runner = self.runner
         assert self.cache is not None
+        # Pipeline stages, as the generic runner's _dummy_run: a hand-off
+        # forward takes its input from the previous stage and passes its
+        # output on; otherwise a later stage runs on stand-in streams.
+        intermediate_tensors = None
+        if through_handoff:
+            assert runner._pp_wave is not None and profile_prefix is None
+            intermediate_tensors = runner._pp_wave.start_forward(num_tokens)
+        elif not runner._pp_is_first:
+            intermediate_tensors = runner._pp_intermediate_tensors(
+                num_tokens,
+                zeros=profile_prefix is None,
+                random=profile_prefix is not None,
+            )
         per_layer = (
             cast("Qwen4ExpPooledCache", self.cache).dummy_metadata(
                 metadata, active_rows
@@ -834,10 +862,37 @@ class Qwen4ExpAdapter:
                 mesh=runner.mesh, vllm_config=runner.vllm_config
             ),
         ):
+            if profile_prefix is not None and intermediate_tensors is not None:
+                # The inputs reach the device before the clock starts.
+                synchronize_tensors(list(intermediate_tensors.tensors.values()))
             started = time.perf_counter()
             out, _ = runner.forward_model(
-                input_ids=ids, positions=positions, model_kwargs=kwargs
+                input_ids=ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=kwargs,
             )
+            if isinstance(out, IntermediateTensors):
+                tensors = list(out.tensors.values())
+                if through_handoff:
+                    # Leaves padded to the hand-off buffer, without waiting,
+                    # as between serving steps.
+                    runner._pp_wave.end_forward(
+                        runner._pp_outgoing_tensors(out.tensors, num_tokens),
+                        num_tokens,
+                    )
+                    synchronize_tensors(None, wait=False)
+                    return None
+                # A stage before the last produces no logits.
+                synchronize_tensors(tensors)
+                runner._hidden_states_dtype = tensors[0].dtype
+                return (
+                    (time.perf_counter() - started) * 1000
+                    if profile_prefix is not None
+                    else None
+                )
+            if through_handoff:
+                runner._pp_wave.end_forward(None, num_tokens)
             if dp_lockstep and runner.parallel_config.tensor_parallel_size > 1:
                 # Match the generic runner's idle-DP protocol. The LM head
                 # has a TP collective even when this DP has no live tokens;

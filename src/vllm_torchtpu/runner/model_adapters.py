@@ -32,7 +32,13 @@ class ModelAdapter(Protocol):
     def prepare_inputs(self, snapshot: ModelInputSnapshot) -> dict[str, Any]: ...
 
     def dummy_run(
-        self, num_tokens, num_reqs, profile_prefix=None, *, dp_lockstep=False
+        self,
+        num_tokens,
+        num_reqs,
+        profile_prefix=None,
+        *,
+        dp_lockstep=False,
+        through_handoff=False,
     ) -> float | None: ...
 
     def get_kv_cache_spec(self) -> dict[str, Any]: ...
