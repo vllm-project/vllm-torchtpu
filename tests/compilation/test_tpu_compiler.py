@@ -737,6 +737,73 @@ class TestTpuCompilerCache:
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
 
+    @staticmethod
+    def _compile_then_move(tmp_path, monkeypatch):
+        """Compile one bucket under cache root `a`, then move the whole root
+        to `b`, as when a cache is copied to another host or mounted at
+        another path. Returns a fresh adaptor on the moved root, the handle
+        vLLM's index recorded, the graph, and the fake backend's records."""
+        import shutil
+
+        import torch
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        (a,), compile, compiled, replayed = TestTpuCompilerCache._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay=None
+        )
+        rank_dir = os.path.join("hash", "rank_0_0", "backbone")
+        a.initialize_cache(cache_dir=str(tmp_path / "a" / rank_dir))
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+        _, handle = compile(a, graph)
+        assert handle[1] == os.path.join(a.cache_dir, handle[0])
+
+        shutil.move(str(tmp_path / "a"), str(tmp_path / "b"))
+        moved = TpuCompilerAdaptor()
+        moved.initialize_cache(cache_dir=str(tmp_path / "b" / rank_dir))
+        return moved, handle, graph, compiled, replayed
+
+    def test_a_moved_cache_root_still_replays(self, tmp_path, monkeypatch):
+        """The handle in vLLM's index names the old absolute path. Loading
+        resolves the artifact under the current cache_dir instead, so the
+        moved cache replays without compiling and nothing is written at the
+        old location."""
+        from vllm.config.utils import Range
+
+        moved, handle, graph, compiled, replayed = self._compile_then_move(
+            tmp_path, monkeypatch
+        )
+        fn = moved.load(handle, graph, [], 0, Range(start=1, end=4096))
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        assert not (tmp_path / "a").exists()
+
+    def test_a_stale_artifact_in_a_moved_root_heals_inside_it(
+        self, tmp_path, monkeypatch
+    ):
+        """An artifact that cannot be replayed is recompiled and rewritten in
+        the current cache, not at the absolute path the handle recorded."""
+        import pickle
+
+        from vllm.config.utils import Range
+
+        moved, handle, graph, compiled, replayed = self._compile_then_move(
+            tmp_path, monkeypatch
+        )
+        artifact = os.path.join(moved.cache_dir, handle[0])
+        with open(artifact, "wb") as f:
+            f.write(b"truncated")
+
+        moved.load(handle, graph, [], 0, Range(start=1, end=4096))
+
+        assert compiled == [0, 0]
+        assert replayed == []
+        with open(artifact, "rb") as f:
+            assert pickle.load(f).entry == "entry-from-rank-0"
+        assert not (tmp_path / "a").exists()
+
 
 def test_deserialize_entry_does_not_copy_the_entry():
     """Replay rebuilds the runnable from the entry itself: a deepcopy would load
