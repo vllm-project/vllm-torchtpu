@@ -253,14 +253,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         if residual is None and x.dim() == 2:
             # Chain start on the embedding: its hc_mult streams are copies
             # of x, so the pre (and the seam below) read x once.
+            # The pre kernel applies attn_norm to the layer input it writes.
             residual = x
             post_mix, res_mix, x = self.mhc_ops.pre_single_stream(
                 x,
                 self.hc_attn_fn_folded_chunks,
                 self.hc_attn_scale,
                 self.hc_attn_base,
+                self.attn_norm.weight,
             )
-            x = self.attn_norm(x)
         elif residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x

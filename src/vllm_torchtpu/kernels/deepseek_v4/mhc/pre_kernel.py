@@ -27,6 +27,10 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 # K=hidden GEMM are a quarter of the full pre's, so it takes larger blocks.
 SINGLE_STREAM_TOKEN_BLOCK = 256
 
+# Position of the optional sublayer RMSNorm weight among the collapse
+# kernel's refs.
+_NORM_REF_INDEX = 6
+
 
 def _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref):
     """3-pass exact GEMM: x is bf16 (its low chunks are zero), so three
@@ -56,6 +60,7 @@ def _mixes_collapse_kernel(
     fn_lo_ref,
     sc_ref,
     hb_ref,
+    norm_w_ref,
     mix_a_ref,
     mix_b_ref,
     layer_ref,
@@ -66,6 +71,7 @@ def _mixes_collapse_kernel(
     hc_pre_eps,
     gates,
     single_stream,
+    norm_eps,
 ):
     """Mixes kernel plus the in-block collapse.
 
@@ -81,6 +87,8 @@ def _mixes_collapse_kernel(
     post) and fn arrives folded over the streams
     (``utils.fold_fn_streams``): the GEMM, the squared sum and the
     collapse run once on the stream instead of on hc_mult copies of it.
+    With ``norm_w_ref``, the layer input is written after the sublayer's
+    RMSNorm.
     """
     m, h = hc_mult, hidden_size
     x = x_ref[...]
@@ -116,6 +124,9 @@ def _mixes_collapse_kernel(
         for i in range(1, m):
             lay = lay + pre_mix[:, i : i + 1] * xf[:, i * h : (i + 1) * h]
     layer_ref[...] = lay.astype(jnp.bfloat16)
+    if norm_w_ref is not None:
+        # Re-read what was stored, as the unfused RMSNorm reads it.
+        layer_ref[...] = utils.rms_norm_rows(layer_ref[...], norm_w_ref[...], norm_eps)
 
     if gates is not None:
         pl.when(pl.program_id(0) == pl.num_programs(0) - 1)(
@@ -209,6 +220,7 @@ def mhc_pre_mixes(
         "vmem_limit_bytes",
         "gates",
         "fn_folded",
+        "norm_eps",
     ),
 )
 def mhc_pre_mixes_collapse(
@@ -223,6 +235,8 @@ def mhc_pre_mixes_collapse(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     gates: gates_kernel.GateConsts | None = None,
     fn_folded: bool = False,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float = 0.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Mixes + in-block collapse: the full memory-bound half of ``mhc_pre``.
 
@@ -234,7 +248,9 @@ def mhc_pre_mixes_collapse(
     sqrsum (T, 1) f32; layer_input2d (T, hidden_size) bf16). With
     ``gates``, post_mix (T, hc_mult) and comb_mix (T, hc_mult**2), row-major
     (i, j), replace mixes and sqrsum. ``fn`` may be given as its bf16
-    chunks, see ``utils.fn_chunk_operands``.
+    chunks, see ``utils.fn_chunk_operands``. With ``norm_weight``
+    ((hidden_size,) bf16), layer_input2d comes out after that RMSNorm
+    (epsilon ``norm_eps``), bit for bit (``utils.rms_norm_rows``).
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
     hc_mult3, hc_hidden = fn.shape[-2:]
@@ -266,6 +282,13 @@ def mhc_pre_mixes_collapse(
     # are sliced off below.
     (x2d,) = utils.pad_to(padded_tokens, x2d)
 
+    norm_inputs, norm_specs = [], []
+    if norm_weight is not None:
+        assert norm_weight.shape == (hidden_size,), norm_weight.shape
+        assert norm_weight.dtype == jnp.bfloat16, norm_weight.dtype
+        norm_inputs.append(norm_weight)
+        norm_specs.append(pl.BlockSpec((hidden_size,), lambda i: (0,)))
+
     mix_out = gates_kernel.mix_outputs(tb, padded_tokens, hc_mult, gates)
     compiler_params = pltpu.CompilerParams(
         dimension_semantics=(mix_out.semantics,),
@@ -273,22 +296,27 @@ def mhc_pre_mixes_collapse(
         disable_bounds_checks=True,
     )
 
+    kernel = functools.partial(
+        _mixes_collapse_kernel,
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        gates=gates,
+        single_stream=fn_folded,
+        norm_eps=norm_eps,
+    )
+    if norm_weight is None:
+        kernel = utils.without_ref(kernel, _NORM_REF_INDEX)
     mixes, sqrsum, layer2d = pl.pallas_call(
-        functools.partial(
-            _mixes_collapse_kernel,
-            hc_mult=hc_mult,
-            hidden_size=hidden_size,
-            rms_eps=rms_eps,
-            hc_pre_eps=hc_pre_eps,
-            gates=gates,
-            single_stream=fn_folded,
-        ),
+        kernel,
         grid=(padded_tokens // tb,),
         in_specs=[
             pl.BlockSpec((tb, x_width), lambda i: (i, 0)),
             *fn_specs,
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
+            *norm_specs,
         ],
         out_specs=[*mix_out.specs, pl.BlockSpec((tb, hidden_size), lambda i: (i, 0))],
         out_shape=[
@@ -297,7 +325,7 @@ def mhc_pre_mixes_collapse(
         ],
         scratch_shapes=mix_out.scratch,
         compiler_params=compiler_params,
-    )(x2d, *fn_chunks, sc2d, hb2d)
+    )(x2d, *fn_chunks, sc2d, hb2d, *norm_inputs)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array],
@@ -367,6 +395,8 @@ def mhc_pre_single_stream(
     *,
     token_block_size: int = SINGLE_STREAM_TOKEN_BLOCK,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float = 0.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``mhc_pre`` of hc_mult identical streams, given the one stream.
 
@@ -375,7 +405,8 @@ def mhc_pre_single_stream(
     streams, (hc_mult3, hidden_size) f32 or its (3, hc_mult3, hidden_size)
     bf16 chunks (``utils.fold_fn_streams``). Same outputs as ``mhc_pre``
     up to f32 reassociation: the stream sums are taken in fn and in the
-    gate weights instead of over hc_mult copies of x.
+    gate weights instead of over hc_mult copies of x. With ``norm_weight``,
+    the layer input comes out after that RMSNorm (``mhc_pre_mixes_collapse``).
     """
     assert x.dtype == jnp.bfloat16
 
@@ -395,6 +426,8 @@ def mhc_pre_single_stream(
             hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         ),
         fn_folded=True,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
     return (
         post_mix.reshape(*outer_shape, hc_mult, 1),

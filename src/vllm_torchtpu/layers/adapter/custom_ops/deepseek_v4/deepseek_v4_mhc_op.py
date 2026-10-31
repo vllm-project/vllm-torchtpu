@@ -102,15 +102,18 @@ def _mhc_pre_single_stream_jax(
     fn: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
+    norm_weight: jax.Array,
     *,
     rms_eps: float,
     hc_pre_eps: float,
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    norm_eps: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``pre`` of hc_mult copies of one stream, reading the stream once;
-    fn is folded over the streams (``utils.fold_fn_streams``)."""
+    fn is folded over the streams (``utils.fold_fn_streams``). The layer
+    input comes out after the sublayer's RMSNorm."""
     return pre_kernel.mhc_pre_single_stream(
         x,
         fn,
@@ -121,6 +124,8 @@ def _mhc_pre_single_stream_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
@@ -394,9 +399,14 @@ def _mhc_pre_single_stream_op(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    norm_eps: float,
 ):
-    op_name = "pallas::deepseek_v4_mhc_pre_single_stream_v2" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    op_name = (
+        "pallas::deepseek_v4_mhc_pre_single_stream_norm_v1"
+        + _gate_suffix(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
+        + f"_n{_name_float(norm_eps)}"
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
@@ -409,6 +419,7 @@ def _mhc_pre_single_stream_op(
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
+                norm_eps=norm_eps,
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
@@ -416,6 +427,7 @@ def _mhc_pre_single_stream_op(
                 P(),  # fn
                 P(),  # hc_scale
                 P(),  # hc_base
+                P(),  # norm_weight
             ),
         )
         op.register_fake(_fake_mhc_pre_single_stream)
@@ -653,10 +665,12 @@ class MHCOps(NamedTuple):
         residual_cur -- the ``post`` output -- then ``pre``'s three outputs
         computed from it, the layer input after the next sublayer's RMSNorm
         (weight ``norm_weight``, epsilon ``norm_eps``).
-    ``pre_single_stream(x, fn, hc_scale, hc_base)`` / ``fused_from_single_stream``
+    ``pre_single_stream(x, fn, hc_scale, hc_base, norm_weight)`` /
+    ``fused_from_single_stream``
         ``pre`` / ``fused`` for a residual whose hc_mult streams are copies
         of one (..., hidden_size) stream, which is passed instead;
-        ``pre_single_stream`` takes fn folded over the streams.
+        ``pre_single_stream`` takes fn folded over the streams and, like
+        ``fused``, normalizes its layer input.
     ``fused_with_shared(routed, shared, residual, ...)``
         ``fused`` on an MoE output given as its routed sum (before the
         routed scale) and its f32 shared-expert output.
@@ -691,7 +705,7 @@ def get_mhc_ops(
     the traced graph entirely. ``seam_token_block`` and
     ``seam_min_grid_steps`` set the seam kernel's grid (see
     ``fused_post_pre_mixes``); ``norm_eps`` is the epsilon of the RMSNorm the
-    seam ops apply to their layer input.
+    seam and single-stream pre ops apply to their layer input.
     """
     seam_consts = (seam_token_block, seam_min_grid_steps, norm_eps)
     return MHCOps(
@@ -708,7 +722,12 @@ def get_mhc_ops(
         ),
         post=get_mhc_post_op(),
         pre_single_stream=_mhc_pre_single_stream_op(
-            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_eps,
         ),
         fused_from_single_stream=_mhc_fused_post_pre_op(
             rms_eps,
