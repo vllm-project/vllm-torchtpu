@@ -13,6 +13,7 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -47,6 +48,12 @@ from .pd_identity import canonical_rank_identity
 from .pd_manifest import build_transfer_manifest, measure_transfer_layout
 
 logger = init_logger(__name__)
+
+# A hybrid pool's block IDs are only unique within a group, so vLLM rejects
+# invalid_block_ids for it; failed loads go back as request-level failures.
+_REQUEST_LEVEL_LOAD_FAILURES = "failed_recving" in getattr(
+    KVConnectorOutput, "__dataclass_fields__", {}
+)
 
 
 class Qwen4ExpRaidenConnector(TPURaidenConnector):
@@ -116,6 +123,28 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
     def supports_divergent_local_hybrid_hits(self) -> bool:
         return False
 
+    if _REQUEST_LEVEL_LOAD_FAILURES:
+
+        def get_transfer_results(self, finished_req_ids: set[str]):
+            from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+                KVConnectorTransferResults,
+            )
+
+            worker = self.connector_worker
+            assert worker is not None
+            sending, recving = worker.get_finished(finished_req_ids)
+            return KVConnectorTransferResults(
+                finished_sending=set(sending or ()),
+                finished_recving=set(recving or ()),
+                failed_recving=set(getattr(worker, "last_failed_recving", ())),
+            )
+
+        def get_block_ids_with_load_errors(self) -> set[int]:
+            # Drained so they do not accumulate; the failure is reported per
+            # request by get_transfer_results instead.
+            super().get_block_ids_with_load_errors()
+            return set()
+
 
 class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
     """Whole-page transport over the shared Stage-3 request lifecycle.
@@ -128,6 +157,22 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         super().__init__(vllm_config)
         self._qwen_page_plan: QwenPagePlan | None = None
         self._qwen_semantics: dict[str, Any] | None = None
+        self.last_failed_recving: set[str] = set()
+
+    def get_finished(self, finished_req_ids: set[str] | None = None):
+        failed_before = set(self._failed_recving)
+        sending, recving = super().get_finished(finished_req_ids)
+        self.last_failed_recving = set(recving) & (
+            failed_before | self._failed_recving
+        )
+        if self.last_failed_recving:
+            logger.warning(
+                "Qwen4ExpRaidenWorker rank%d --> KV loads failed for %s; "
+                "they will be recomputed locally",
+                self.tp_rank,
+                sorted(self.last_failed_recving),
+            )
+        return sending, recving
 
     def register_runner(self, runner) -> None:
         from .inputs import Qwen4ExpAdapter
@@ -313,7 +358,19 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         }
         if len(token_sizes) != 1:
             raise ValueError("Qwen PD requires one native token-page size")
-        return canonical_layout_fingerprint(payload), payload, token_sizes.pop()
+        fingerprint = canonical_layout_fingerprint(payload)
+        # Per-field digests, so a peer mismatch names the field that differs.
+        fields = {
+            f"layout.{k}": v for k, v in payload["layout"].items()
+        } | {f"semantics.{k}": v for k, v in payload["semantics"].items()}
+        logger.info(
+            "Qwen PD rank%d layout fingerprint %s fields %s carriers %s",
+            self.tp_rank,
+            fingerprint[:12],
+            {k: canonical_layout_fingerprint({"v": v})[:12] for k, v in fields.items()},
+            json.dumps(payload["layout"].get("carriers"), sort_keys=True)[:600],
+        )
+        return fingerprint, payload, token_sizes.pop()
 
     def _validate_stage3_transfer_parallelism(self, transfer_parallelism: int) -> None:
         parallel = self.vllm_config.parallel_config
