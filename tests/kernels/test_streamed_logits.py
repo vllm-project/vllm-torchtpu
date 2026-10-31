@@ -22,8 +22,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels import streamed_logits as sl
 from vllm_torchtpu.kernels.streamed_logits import (
+    LogitsTiling,
     _streamed_logits,
     _streamed_logits_shard,
     block_rows,
@@ -31,6 +31,9 @@ from vllm_torchtpu.kernels.streamed_logits import (
     vocab_shard_columns,
     vocab_shard_layout,
 )
+
+# The served tiling (runner/utils.py LOGITS_*).
+_TILING = LogitsTiling(block_rows=1280, block_dmas=2, buffers=3)
 
 
 def _dot(x, w):
@@ -47,9 +50,9 @@ def _inputs(m, vocab, hidden, seed):
 
 
 def test_block_rows_tiles_vocab():
-    assert block_rows(129280) == 1280
-    assert block_rows(640) == 640
-    assert block_rows(100) == 0
+    assert block_rows(129280, _TILING) == 1280
+    assert block_rows(640, _TILING) == 640
+    assert block_rows(100, _TILING) == 0
 
 
 @pytest.mark.parametrize(
@@ -63,17 +66,17 @@ def test_block_rows_tiles_vocab():
 )
 def test_interpret_matches_dot(m, vocab, hidden, rows):
     x, w = _inputs(m, vocab, hidden, m + vocab)
-    got = _streamed_logits(x, w, rows=rows, interpret=True)
+    got = _streamed_logits(x, w, rows=rows, tiling=_TILING, interpret=True)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(_dot(x, w)))
 
 
 def test_vocab_shard_layout_covers_head():
-    assert vocab_shard_layout(129280, 8) == (
+    assert vocab_shard_layout(129280, 8, _TILING) == (
         1280,
         13,
         (0, 13, 26, 39, 52, 65, 78, 88),
     )
-    spans = vocab_shard_columns(129280, 8)
+    spans = vocab_shard_columns(129280, 8, _TILING)
     assert spans[:7] == ((0, 16640),) * 7
     assert spans[7] == (3 * 1280, 16640)
 
@@ -86,15 +89,13 @@ def test_vocab_shard_layout_covers_head():
         (24, 4160, 128, 8, 320),
     ],
 )
-def test_interpret_shards_concatenate_to_dot(
-    m, vocab, hidden, shards, rows, monkeypatch
-):
-    monkeypatch.setattr(sl, "LOGITS_BLOCK_ROWS", rows)
+def test_interpret_shards_concatenate_to_dot(m, vocab, hidden, shards, rows):
+    tiling = _TILING._replace(block_rows=rows)
     x, w = _inputs(m, vocab, hidden, m + vocab)
     want = np.asarray(_dot(x, w))
-    rows, per_shard, first = vocab_shard_layout(vocab, shards)
+    rows, per_shard, first = vocab_shard_layout(vocab, shards, tiling)
     parts = []
-    for f, (lo, hi) in zip(first, vocab_shard_columns(vocab, shards)):
+    for f, (lo, hi) in zip(first, vocab_shard_columns(vocab, shards, tiling)):
         got = np.asarray(
             _streamed_logits_shard(
                 x,
@@ -102,6 +103,7 @@ def test_interpret_shards_concatenate_to_dot(
                 jnp.array([f], jnp.int32),
                 rows=rows,
                 num_blocks=per_shard,
+                tiling=tiling,
                 interpret=True,
             )
         )
@@ -115,7 +117,7 @@ def test_interpret_shards_concatenate_to_dot(
 def test_tpu_bit_exact_at_head_shape(m):
     x, w = _inputs(m, 129280, 4096, m)
     np.testing.assert_array_equal(
-        np.asarray(streamed_logits(x, w)), np.asarray(jax.jit(_dot)(x, w))
+        np.asarray(streamed_logits(x, w, _TILING)), np.asarray(jax.jit(_dot)(x, w))
     )
 
 
@@ -124,10 +126,15 @@ def test_tpu_bit_exact_at_head_shape(m):
 def test_tpu_shards_bit_exact_at_head_shape(m):
     x, w = _inputs(m, 129280, 4096, m)
     want = np.asarray(jax.jit(_dot)(x, w))
-    rows, per_shard, first = vocab_shard_layout(129280, 8)
+    rows, per_shard, first = vocab_shard_layout(129280, 8, _TILING)
     for f in first:
         got = _streamed_logits_shard(
-            x, w, jnp.array([f], jnp.int32), rows=rows, num_blocks=per_shard
+            x,
+            w,
+            jnp.array([f], jnp.int32),
+            rows=rows,
+            num_blocks=per_shard,
+            tiling=_TILING,
         )
         np.testing.assert_array_equal(
             np.asarray(got), want[:, f * rows : (f + per_shard) * rows]

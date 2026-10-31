@@ -36,6 +36,13 @@ MIN_NUM_SEQS = 8
 # LM head's vocab over the DP ranks instead of streaming all of it on each.
 LOGITS_VOCAB_SHARD_MAX_ROWS = 8
 
+# How the streamed LM-head kernel (kernels/streamed_logits.py) moves the head
+# weight: most vocab rows per grid step, DMAs per step's weight slab, and weight
+# slabs resident in VMEM (the one being contracted plus prefetches).
+LOGITS_BLOCK_ROWS = 1280
+LOGITS_BLOCK_DMAS = 2
+LOGITS_BUFFERS = 3
+
 PREFILL_HEAVY_RATIO_THRESHOLD = 0.9
 DECODE_HEAVY_RATIO_THRESHOLD = 0.2
 BALANCED_RATIO_THRESHOLD = (0.4, 0.6)

@@ -15,6 +15,7 @@
 
 from typing import Any
 
+import jax
 import torch
 from torch.distributed import _functional_collectives as funcol
 from torch_tpu._internal import pallas
@@ -25,12 +26,26 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 from vllm_torchtpu.kernels.streamed_logits import (
+    LogitsTiling,
     block_rows,
     streamed_logits,
     streamed_logits_shard,
     vocab_shard_columns,
     vocab_shard_layout,
 )
+from vllm_torchtpu.runner import utils as runner_utils
+
+
+def _tiling() -> LogitsTiling:
+    return LogitsTiling(
+        block_rows=runner_utils.LOGITS_BLOCK_ROWS,
+        block_dmas=runner_utils.LOGITS_BLOCK_DMAS,
+        buffers=runner_utils.LOGITS_BUFFERS,
+    )
+
+
+def _logits(x: jax.Array, w: jax.Array) -> jax.Array:
+    return streamed_logits(x, w, _tiling())
 
 
 def _fake_streamed_logits(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -38,19 +53,25 @@ def _fake_streamed_logits(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 # Registered at import: compute_logits runs inside a compiled graph.
-_op = pallas.jax_op("pallas::streamed_logits", streamed_logits)
+_op = pallas.jax_op("pallas::streamed_logits", _logits)
 _op.register_fake(_fake_streamed_logits)
+
+
+def _logits_shard(
+    x: jax.Array, w: jax.Array, first_block: jax.Array, num_shards: int
+) -> jax.Array:
+    return streamed_logits_shard(x, w, first_block, num_shards, _tiling())
 
 
 def _fake_streamed_logits_shard(
     x: torch.Tensor, w: torch.Tensor, first_block: torch.Tensor, num_shards: int
 ) -> torch.Tensor:
-    _, per_shard, _ = vocab_shard_layout(w.shape[0], num_shards)
-    cols = per_shard * block_rows(w.shape[0])
+    _, per_shard, _ = vocab_shard_layout(w.shape[0], num_shards, _tiling())
+    cols = per_shard * block_rows(w.shape[0], _tiling())
     return torch.empty((x.shape[0], cols), dtype=x.dtype, device=x.device)
 
 
-_shard_op = pallas.jax_op("pallas::streamed_logits_shard", streamed_logits_shard)
+_shard_op = pallas.jax_op("pallas::streamed_logits_shard", _logits_shard)
 _shard_op.register_fake(_fake_streamed_logits_shard)
 
 # Set by `prepare_vocab_shard`: the group the head's vocab is split over, this
@@ -78,7 +99,7 @@ def _is_plain_head(processor: LogitsProcessor, head: VocabParallelEmbedding) -> 
         and processor.scale == 1.0
         and getattr(processor, "head_dtype", None) in (None, w.dtype)
         and processor.org_vocab_size == w.shape[0]
-        and block_rows(w.shape[0]) > 0
+        and block_rows(w.shape[0], _tiling()) > 0
     )
 
 
@@ -113,7 +134,9 @@ def prepare_vocab_shard(
     global _SHARD_GROUP, _SHARD_RANK, _SHARD_FIRST_BLOCKS
     if not _is_plain_head(processor, head):
         return False
-    _, per_shard, first = vocab_shard_layout(head.weight.shape[0], group.world_size)
+    _, per_shard, first = vocab_shard_layout(
+        head.weight.shape[0], group.world_size, _tiling()
+    )
     if per_shard == 0:
         return False
     device = head.weight.device
@@ -156,7 +179,7 @@ def compute_logits_vocab_sharded(
     if isinstance(received, funcol.AsyncCollectiveTensor):
         received = funcol.wait_tensor(received)
     received = received.view(world, rows, part.shape[1])
-    spans = vocab_shard_columns(head.weight.shape[0], world)
+    spans = vocab_shard_columns(head.weight.shape[0], world, _tiling())
     return torch.cat(
         [received[r, :, lo:hi] for r, (lo, hi) in enumerate(spans) if hi > lo], dim=1
     )
