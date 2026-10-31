@@ -173,6 +173,20 @@ def test_fused_weight_layout_is_checked_at_load():
         attn._check_fused_weights()
 
 
+def test_compressor_weight_is_flipped_before_the_check():
+    # quant_config=None leaves the projection in vLLM's [n_out, n_in] layout.
+    attn = _loaded_attn()
+    loaded = torch.randn(1024, 16).bfloat16()
+    attn.compressor.fused_wkv_wgate = SimpleNamespace(weight=loaded)
+    attn._flip_compressor_weight()
+    layer = attn.compressor.fused_wkv_wgate
+    assert getattr(layer, WEIGHT_FLIPPED_ATTR)
+    assert torch.equal(layer.weight, loaded.t())
+    attn._check_fused_weights()
+    attn._flip_compressor_weight()  # idempotent on reload
+    assert torch.equal(layer.weight, loaded.t())
+
+
 def test_bridges_have_fully_annotated_signatures():
     """torch_tpu's ``pallas.jax_op`` rejects ``*args``, keyword parameters and
     unannotated arguments; the mocked ops above cannot see that."""
