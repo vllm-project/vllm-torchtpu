@@ -132,7 +132,7 @@ class Qwen4ExpPoolLayout:
         return self.page_bytes // self.compressed_kernel_bytes
 
 
-def pooled_cache_specs(cfg):
+def pooled_cache_specs(cfg, *, tp: int | None = None, main_dcp: int | None = None):
     """Derive uniform physical pages without widening compressed-key coverage.
 
     Increasing a compressed page's *logical* span merely to fill the pool
@@ -163,7 +163,10 @@ def pooled_cache_specs(cfg):
     KV keep ``B``, so prefix hashing and the draft are unchanged.
     ``VLLM_TPU_QSA_MTP_KV_DCP`` gives the draft's main KV groups ``2 * B`` too.
     """
-    specs = native_cache_specs(cfg)
+    # ``tp`` / ``main_dcp`` describe another engine (a PD peer's geometry,
+    # pd_staging); by default this engine's.
+    tp = cfg.parallel_config.tensor_parallel_size if tp is None else tp
+    specs = native_cache_specs(cfg, tp)
     text = cfg.model_config.hf_text_config
     main = specs[f"model.layers.{text.layer_types.index('full_attention')}.self_attn"]
     token_bytes = main.page_size_bytes // main.block_size
@@ -232,13 +235,13 @@ def pooled_cache_specs(cfg):
                 (name, owner, slot)
                 for slot, name in enumerate(targets[start : start + 2])
             )
-    dcp = main_kv_dcp()
+    dcp = main_kv_dcp() if main_dcp is None else main_dcp
     draft_attention = {prefix + ".self_attn" for prefix in mtp_layer_prefixes(cfg)}
     paired_away = {name for name, owner, _ in main_owners if name != owner}
     dcp_owners: tuple[str, ...] = ()
     if dcp > 1:
         p = cfg.parallel_config
-        if p.tensor_parallel_size < 2 or p.tensor_parallel_size % dcp:
+        if tp < 2 or tp % dcp:
             raise ValueError(
                 f"{MAIN_KV_DCP_ENV}={dcp} splits a KV head's main KV over TP rank "
                 f"pairs; needs an even tensor_parallel_size >= 2, got "
