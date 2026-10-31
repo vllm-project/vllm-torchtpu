@@ -299,14 +299,11 @@ def _sized_gather(
 
 
 def take_pages(cache: jax.Array, page_ids: jax.Array) -> jax.Array:
-    """`cache[page_ids]` as `[len(page_ids) * rows, ...]` rows, by XLA."""
-    rows = cache.shape[1]
-    flat = cache.reshape(cache.shape[0] * rows, *cache.shape[2:])
-    idx = page_ids[:, None] * rows + jnp.arange(rows, dtype=jnp.int32)
-    return jnp.take(flat, idx.reshape(-1), axis=0)
+    """`cache[page_ids]`, one flat row per page, by XLA."""
+    return cache[page_ids].reshape(page_ids.shape[0], -1)
 
 
-# (cache [pages, rows, ...], page ids [n]) -> [n * rows, ...]
+# (cache [pages, ...], page ids [n]) -> the n pages' bytes in page order
 ReadPagesFn = Callable[[jax.Array, jax.Array], jax.Array]
 
 
@@ -317,23 +314,21 @@ def gather_latent(
     page_ids: jax.Array,
     total_pages: jax.Array,
     axis_name: str,
-    read_pages: ReadPagesFn = take_pages,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
 ) -> tuple[jax.Array, jax.Array]:
     """Every rank's `page_ids` pages, rank-major: `[dcp * max_pages, ...]`.
-    `read_pages` reads this rank's pages (`page_gather.gather_pages` on TPU:
-    it reads the cache in the layout the SparseCore cache kernels use)."""
+    `read_pages` reads this rank's (nope, rope) pages (`page_gather` on TPU:
+    it reads each cache in the layout the SparseCore cache kernels use)."""
 
-    def gather(cache: jax.Array) -> jax.Array:
-        rows = cache.shape[1]
-
+    def gather(cache: jax.Array, read: ReadPagesFn) -> jax.Array:
         def pages(cap: int) -> jax.Array:
-            g = lax.all_gather(read_pages(cache, page_ids[:cap]), axis_name)
-            return g.reshape(layout.dcp_size, cap * rows, *g.shape[2:])
+            local = read(cache, page_ids[:cap]).reshape(cap, -1)
+            return lax.all_gather(local, axis_name)
 
-        g = _sized_gather(layout, total_pages, pages, page_axis=1, page_rows=rows)
-        return g.reshape(-1, rows, *g.shape[2:])
+        g = _sized_gather(layout, total_pages, pages, page_axis=1)
+        return g.reshape(-1, *cache.shape[1:])
 
-    return gather(nope_cache), gather(rope_cache)
+    return gather(nope_cache, read_pages[0]), gather(rope_cache, read_pages[1])
 
 
 def gather_index_k(
@@ -431,7 +426,7 @@ def sparse_mla_attention(
     attend: AttendFn,
     rank_ids: jax.Array | None = None,
     q_own_rows: bool = False,
-    read_pages: ReadPagesFn = take_pages,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Token-parallel sparse MLA for one layer (global view).
 

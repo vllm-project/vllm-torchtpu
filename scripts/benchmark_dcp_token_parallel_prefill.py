@@ -30,6 +30,7 @@ Needs a TPU with SparseCores. Usage:
 """
 
 import argparse
+import functools
 import json
 import os
 import time
@@ -64,6 +65,11 @@ IDX_HEADS, IDX_DIM = 32, 128
 PAGE, IL, MAX_REQS = 256, 4, 64
 PREFIX_PIECE = 32768
 SAL = KVLayout.SEQ_ALONG_LANE
+# The cache writer's row views: 128-word nope tokens, 32-word rope tokens.
+READ_PAGES = (
+    functools.partial(page_gather.gather_pages, row_width=128),
+    functools.partial(page_gather.gather_pages, row_width=32),
+)
 
 
 def _timeit(fn, *args, iters):
@@ -503,7 +509,7 @@ def main():
             write_kv=write_kv,
             attend=attend,
             q_replicated=a.q_replicated,
-            read_pages=page_gather.gather_pages,
+            read_pages=READ_PAGES,
         )
     )
     q_tp = _global(NamedSharding(mesh, P()), q) if a.q_replicated else q_sharded
@@ -761,9 +767,7 @@ def main():
         def _l(n, r, sl, bt_, q_, d_):
             pages, offs = tp.step_pages(lay, sl, q_, d_[2])
             ids = tp.gather_page_ids(lay, bt_, pages, offs, n.shape[0])
-            return tp.gather_latent(
-                lay, n, r, ids, jnp.sum(pages), AXIS, page_gather.gather_pages
-            )
+            return tp.gather_latent(lay, n, r, ids, jnp.sum(pages), AXIS, READ_PAGES)
 
         return jax.shard_map(
             _l,

@@ -72,16 +72,17 @@ def _body(
                 copy.wait()
 
 
-def gather_pages(cache: jax.Array, page_ids: jax.Array) -> jax.Array:
-    """`cache[page_ids]` for a uint32 `[pages, rows, width]` SparseCore cache,
-    as `[len(page_ids) * rows, width]` rows. `page_ids` must be in range."""
-    if cache.dtype != jnp.uint32 or cache.ndim != 3:
-        raise ValueError(f"expected a uint32 [pages, rows, width] cache, got {cache}")
+def gather_pages(cache: jax.Array, page_ids: jax.Array, row_width: int) -> jax.Array:
+    """`cache[page_ids]` for a uint32 `[pages, ...]` SparseCore cache, as
+    `[len(page_ids) * rows, row_width]` rows of the `[-1, row_width]` view its
+    writer uses (one token per row). `page_ids` must be in range."""
+    if cache.dtype != jnp.uint32 or (cache[0].size % row_width):
+        raise ValueError(f"expected uint32 pages of {row_width}-word rows: {cache}")
     sc = pltpu.get_tpu_info().sparse_core
     if sc is None:
         raise NotImplementedError("SparseCore is not available")
     num_pages = page_ids.shape[0]
-    _, rows, width = cache.shape
+    rows, width = cache[0].size // row_width, row_width
     lanes = sc.num_lanes
     if num_pages > lanes * sc.num_cores * sc.num_subcores:
         raise ValueError(f"{num_pages} pages exceed one page per lane per subcore")

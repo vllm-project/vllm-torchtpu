@@ -32,6 +32,7 @@ The choice is static per compiled bucket; a step the gather buffer cannot
 hold raises in the runner (`check_step_capacity`) instead of running.
 """
 
+import functools
 from typing import Any
 
 import jax
@@ -364,7 +365,12 @@ def build_attention_op(
             attend=attend,
             rank_ids=rank_ids,
             q_own_rows=q_replicated,
-            read_pages=page_gather.gather_pages,
+            read_pages=(
+                functools.partial(page_gather.gather_pages, row_width=128),
+                functools.partial(
+                    page_gather.gather_pages, row_width=rope_spec.token_bytes // 4
+                ),
+            ),
         )
 
     # Fixed arity per variant: torch custom-op schemas take no varargs.
