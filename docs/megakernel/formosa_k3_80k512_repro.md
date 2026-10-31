@@ -58,7 +58,12 @@ python -m tools.megakernel preshard prefill --checkpoint /ckpt/Kimi-K3 --output 
 The result is `layout.json` (`format: 1, ranks: 32`), `rank00..rank31/` and
 `prefill-sp-cache/` (~1.7 TB). `/models/k3meta` is the plain HF directory
 (`config.json`, tokenizer) used for `vllm serve <model>` and `--tokenizer`.
-The same directory layout already serves the `tpu-7x-mega-pd` rows.
+The Formosa PoC bucket already holds this exact pre-shard
+(`gs://formosa-poc/kimi-k3/presharded/kimi-k3-tp32/`, built by
+`tools.megakernel preshard` at `3af67bd47` from
+`gs://tpu-commons-ci/moonshootai/kimi/k3`; see its `PROVENANCE.txt`) — the
+measured runs used a byte-for-byte copy of it, and it is the same directory
+that serves the `tpu-7x-mega-pd` rows.
 
 ## 2. Source overlay
 
