@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -59,6 +61,9 @@ class MoEParams:
     # expert paths) for buckets up to `MoETunables.moe_group_rows` rows.
     group_rel: bool
     ecopy_opt: int
+    # Per-expert output accumulation only over the 8-row tiles holding the
+    # expert's routed rows (`MoETunables.row_tiles`, PIPE_EP + local dedup).
+    ROW_TILES: bool
     eps: float
     zero_centered_norm: bool
 
@@ -82,6 +87,9 @@ class MoETunables:
     route_vec: bool = False
     topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
     moe_unroll: bool = False  # Unrolled expert tile loops + grouped expert refills
+    # PIPE_EP: scale/weight/accumulate each expert's output only on the 8-row
+    # tiles that hold its routed rows (other rows add an exact 0)
+    row_tiles: bool = False
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -95,6 +103,7 @@ class MoETunables:
         "route_vec": "approx",  # vectorized routing policy
         "topk_lanes": "approx",  # Batcher odd-even lane top-k
         "moe_unroll": "approx",  # unrolled expert tiles (not exact on TPU, bisect)
+        "row_tiles": "exact",  # skips adding 0 * y on rows the expert did not route
     }
 
 
@@ -188,6 +197,10 @@ def derive_moe_params(
         unroll=bool(tt.moe_unroll or pipe_ep),
         group_rel=tt.moe_group_rows >= ex.B,
         ecopy_opt=tt.ecopy_opt,
+        ROW_TILES=bool(
+            (tt.row_tiles or os.environ.get("VLLM_TPU_MK_MOE_ROW_TILES", "0") == "1")
+            and pipe_ep and not ecopy and not dbg.row_mask and ex.MR % 8 == 0
+        ),
         eps=g.eps,
         zero_centered_norm=bool(getattr(g, "zero_centered_norm", True)),
     )

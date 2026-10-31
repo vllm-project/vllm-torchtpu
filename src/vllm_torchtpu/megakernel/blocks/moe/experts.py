@@ -176,6 +176,29 @@ def experts_piped(m: MoEEmit, l_idx, n_hit):
         egive(m, u2, l_idx, T13)
 
 
+def _accumulate(m: MoEEmit, i, e, acc, es_row, H: int) -> None:
+    """`part += wcol * rnd(acc * es_row)` for expert `e` (elist slot `i`).
+
+    `ROW_TILES`: only on the 8-row tiles holding `e`'s routed rows (`tmask[i]`); the
+    skipped rows have `wcol == 0` and would add an exact zero."""
+    ex, lane_e8, scr = m.ex, m.lane_e8, m.scr
+    MR, part = ex.MR, scr["part"]
+    if not m.mp.ROW_TILES:
+        wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
+        y = rnd(acc[0:MR, :H] * es_row)
+        part[0:MR, :] += wcol * y
+        return
+    tm = scr["tmask"][i]
+    lane = lane_e8[0:8]
+    for t in range(MR // 8):
+
+        @pl.when(lax.bitwise_and(lax.shift_right_logical(tm, t), 1) != 0)
+        def _(t=t):
+            r = slice(8 * t, 8 * t + 8)
+            wcol = jnp.sum(jnp.where(lane == e, scr["wn"][r, :], 0.0), axis=1, keepdims=True)
+            part[r, :] += wcol * rnd(acc[r, :H] * es_row)
+
+
 def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
     ex, lane_e8, mp, scr, stream, tk = m.ex, m.lane_e8, m.mp, m.scr, m.stream, m.tk
     MB, MR = ex.MB, ex.MR
@@ -252,13 +275,7 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 acc13[:, :BN] += stream.mm(xb[:, k13_1 : k13_1 + TK13], w13_1[...])
                 egive(m, u13_1, l_idx, t1)
 
-            wcol = jnp.sum(
-                jnp.where(lane_e8 == e, scr["wn"][...], 0.0),
-                axis=1,
-                keepdims=True,
-            )
-            y = rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
-            part[0:MR, :] += wcol * y
+            _accumulate(m, i, e, acc, scr["es"][s_cur, :, BN:], H)
 
             es_wait(m, i + 1)
             h_nxt = acc13[:, :BN] * scr["es"][s_nxt, :, :BN]
@@ -294,10 +311,4 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                     egive(m, u2, l_idx, T13 + s_step)
             else:
                 egive(m, u2, l_idx, T13 + s_step)
-        wcol_last = jnp.sum(
-            jnp.where(lane_e8 == e_last, scr["wn"][...], 0.0),
-            axis=1,
-            keepdims=True,
-        )
-        y_last = rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
-        part[0:MR, :] += wcol_last * y_last
+        _accumulate(m, i_last, e_last, acc, scr["es"][s_last, :, BN:], H)

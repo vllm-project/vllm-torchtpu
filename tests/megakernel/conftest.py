@@ -420,6 +420,21 @@ EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
         (2, 4),
         {"moe.pipe_ep": True, "ebank": 64 << 10, "nbe": 6, "geom_kw": {"I": 512}},
     ),
+    # PIPE_EP expert outputs accumulated only on the tiles holding routed rows.
+    (
+        "row_tiles-pipe_ep",
+        "moe.row_tiles",
+        True,
+        (2, 4),
+        {"moe.pipe_ep": True, "ebank": 64 << 10, "nbe": 6, "geom_kw": {"I": 512}},
+    ),
+    (
+        "row_tiles-pipe_ep-wide",
+        "moe.row_tiles",
+        True,
+        (4, 24),
+        {"moe.pipe_ep": True, "ebank": 64 << 10, "nbe": 6, "geom_kw": {"I": 512}},
+    ),
     # WIDE verify bucket (chunked GDN states): gdn_bufs only acts here.
     ("gdn_bufs-wide", "gdn.gdn_bufs", 2, (4, 24), {}),
     ("pair_kv-wide", "gqa.pair_kv", True, (4, 24), {}),
