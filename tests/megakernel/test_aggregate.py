@@ -303,3 +303,13 @@ def test_aggregate_caches_prompt_tokens_only():
         kv_cache_manager=types.SimpleNamespace(coordinator=types.SimpleNamespace()),
     )
     assert not _cache_only_prefill_tokens(pair)
+
+
+def test_page_owners_follow_tp_ranks():
+    from vllm_torchtpu.megakernel.kimi_k3.decode import page_owners
+
+    assert page_owners(None) is None
+    # TP rank q's device sits at mesh position 2q mod 7 (a 7-rank stand-in).
+    perm = [((2 * q) % 7, q) for q in range(7)]
+    owners = page_owners(perm)
+    assert all(owners[(2 * q) % 7] == q for q in range(7))

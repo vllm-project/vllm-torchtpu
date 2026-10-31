@@ -72,6 +72,18 @@ from vllm_torchtpu.megakernel.program import (
 logger = init_logger(__name__)
 
 
+def page_owners(perm: list[tuple[int, int]] | None) -> tuple[int, ...] | None:
+    """Each mesh position's DCP page owner when a device's pool holds its vLLM
+    TP rank's pages (``perm``: ``pools.tp_rank_permutation``'s (mesh position
+    of TP rank q, q) pairs; None: the orders coincide)."""
+    if perm is None:
+        return None
+    owners = [0] * len(perm)
+    for position, tp_rank in perm:
+        owners[position] = tp_rank
+    return tuple(owners)
+
+
 class KimiDecoder:
     """The decode role's :class:`MegakernelProgram` over ``ops`` and, when
     ``config`` speculates, the DSpark ``draft`` (None: plain steps only). Slot 0
@@ -88,8 +100,12 @@ class KimiDecoder:
         draft: Any = None,
         *,
         tp_rank: int,
+        pools_in_tp_order: bool = False,
     ) -> None:
         self.config, self.ops, self.draft = config, ops, draft
+        # True: the pools hold what this engine's prefill wrote, in vLLM TP-rank
+        # order (KDA heads and page owners); False: the connector's mesh order.
+        self.pools_in_tp_order = pools_in_tp_order
         self.tp_rank, self.rank = tp_rank, ops.rank
         self.sub_base = 2 * config.max_num_seqs + 1
         needed = Control.total_slots(self.sub_base) if draft else self.sub_base
@@ -196,17 +212,29 @@ class KimiDecoder:
         self.destination_ranks = (
             None if perm is None else tuple(q for _, q in sorted(perm))
         )
+        # Pools in TP-rank order: import each TP rank's heads to its kernel rank.
+        state_perm = perm if self.pools_in_tp_order else None
+        if self.pools_in_tp_order and self.rank == 0:
+            logger.info(
+                "K3 decode: pools in vLLM TP-rank order; mesh positions of TP "
+                "ranks: %s",
+                "identity" if perm is None else [src for src, _ in perm],
+            )
         # One importer per ops (it registers torch ops, whose names are
         # process-global), shared by the decoders over them.
         self._importer = self.ops.cached_op(
-            ("kda_importer", None),
+            ("kda_importer", "tp" if self.pools_in_tp_order else None),
             lambda: KdaImporter(
-                self.ops.mesh, None, self.ops.attention_dp, self.ops.num_slots
+                self.ops.mesh, state_perm, self.ops.attention_dp, self.ops.num_slots
             ),
         )
         num_blocks = self._importer.bind(caches, self.config.kv_cache_dtype)
         self._num_blocks = num_blocks
-        self.ops.use_unified_pools(self._importer.raw_pools, self._importer.mla_raw)
+        self.ops.use_unified_pools(
+            self._importer.raw_pools,
+            self._importer.mla_raw,
+            page_owners(perm) if self.pools_in_tp_order else None,
+        )
         if self.draft is not None and hasattr(self.draft, "bind_pools"):
             assert self.ops.pool_map is not None
             # The MLA draft: the target's LM head and embedding, and pools

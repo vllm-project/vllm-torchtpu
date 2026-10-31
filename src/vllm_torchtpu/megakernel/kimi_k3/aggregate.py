@@ -127,8 +127,13 @@ class KimiAggregate:
                 "the K3 aggregate engine decodes at attention_dp 1"
             )
         self.config = config
+        # The decoder reads the pools as this engine's prefill writes them.
         self.decoder = build_decoder(
-            role_config(config, "decode"), presharded, draft_checkpoint, tp_rank=tp_rank
+            role_config(config, "decode"),
+            presharded,
+            draft_checkpoint,
+            tp_rank=tp_rank,
+            pools_in_tp_order=True,
         )
         self.prefiller = KimiPrefiller(
             role_config(config, "prefill"),

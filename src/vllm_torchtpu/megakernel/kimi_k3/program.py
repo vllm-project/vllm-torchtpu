@@ -286,8 +286,10 @@ def build_decoder(
     draft_checkpoint: Path | None = None,
     *,
     tp_rank: int,
+    pools_in_tp_order: bool = False,
 ):
-    """The decode role's :class:`KimiDecoder` (``config.role`` decode)."""
+    """The decode role's :class:`KimiDecoder` (``config.role`` decode);
+    ``pools_in_tp_order``: see :class:`KimiDecoder`."""
     from vllm_torchtpu.megakernel.kimi_k3.decode import KimiDecoder
     from vllm_torchtpu.megakernel.kimi_k3.decode_ops import (
         Control,
@@ -318,4 +320,6 @@ def build_decoder(
         batch_sizes=decode_batch_sizes(config.max_num_seqs),
         mamba_ssm_cache_dtype=config.mamba_ssm_cache_dtype,
     )
-    return KimiDecoder(config, ops, draft, tp_rank=tp_rank)
+    return KimiDecoder(
+        config, ops, draft, tp_rank=tp_rank, pools_in_tp_order=pools_in_tp_order
+    )
