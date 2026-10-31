@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
+    QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
     QWEN4_EXP_PREFILL_SP_SHARED_LOCAL: bool = False
@@ -1055,6 +1056,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # streams, PLE gate and residual math run on 1/TP of the tokens. Steps
     # below QWEN4_EXP_PREFILL_SP_MIN_TOKENS keep the replicated TP path.
     "QWEN4_EXP_PREFILL_SP": env_bool("QWEN4_EXP_PREFILL_SP"),
+    # A TP>1 Qwen4Exp decode behind TP1 pipeline stages lands each load in a
+    # staging carrier of the producer's page geometry, then repacks it
+    # (models/vllm/qwen4_exp/pd_staging.py). Bytes of that carrier per rank;
+    # a load that does not fit recomputes on the decode.
+    "QWEN4_EXP_PD_STAGING_BYTES": env_int("QWEN4_EXP_PD_STAGING_BYTES", 8 << 30),
     "QWEN4_EXP_PREFILL_SP_MIN_TOKENS": env_int(
         "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024
     ),

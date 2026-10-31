@@ -5784,6 +5784,17 @@ class TPURaidenConnectorWorker:
             self._stage3_load_start_times[destination_req_id] = time.perf_counter()
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
+            if not self._stage3_reserve_destination(
+                destination_req_id, req_meta, tp_group
+            ):
+                # No model-owned destination room: fail the load so vLLM
+                # recomputes the request rather than waiting on it.
+                self._record_stage3_load_failure(destination_req_id, local_blocks)
+                if tp_group is None or self.tp_rank == 0:
+                    self._stage3_release_producer_registration(
+                        destination_req_id, req_meta, synchronous=synchronous
+                    )
+                continue
             if (
                 synchronous
                 and self._stage3_sharded_consumer()
@@ -6471,6 +6482,19 @@ class TPURaidenConnectorWorker:
             for rank in range(int(self.tp_size))
         ]
 
+    def _stage3_reserve_destination(
+        self, destination_req_id: str, req_meta: Any, tp_group: Any
+    ) -> bool:
+        """Reserve model-owned destination storage for one load; every rank
+        of the engine calls it in the same order (``tp_group`` is the
+        sharded consumer's TP group, else None). False fails the load."""
+        return True
+
+    def _stage3_finish_destination(self, destination_req_id: str, ok: bool) -> None:
+        """A load reached its receive terminal (``ok``: its bytes landed),
+        or was cleaned up; idempotent. Runs on the model-runner thread before
+        vLLM learns of the terminal."""
+
     def _stage3_sharded_consumer(self) -> bool:
         """A head-sharded Qwen3.5 decode engine (dp{N}tp{tp}_decode): its TP
         workers are sibling destination units of ONE coordination, submitted
@@ -6682,6 +6706,9 @@ class TPURaidenConnectorWorker:
             for req_id in self._pending_failed_recving
             for block_id in self._load_block_ids.get(req_id, ())
         }
+        # Model-owned destination storage settles before vLLM sees the load.
+        for req_id in done_recving:
+            self._stage3_finish_destination(req_id, req_id not in self._failed_recving)
         if done_recving:
             logger.debug(
                 "TPURaidenConnectorWorker rank%d --> reporting done_recving=%s",
@@ -6694,6 +6721,7 @@ class TPURaidenConnectorWorker:
             )
         )
         for req_id in cleanup_req_ids:
+            self._stage3_finish_destination(req_id, False)
             req_meta = self._stage3_submitted_load_metas.pop(req_id, None)
             if (
                 not self.is_producer

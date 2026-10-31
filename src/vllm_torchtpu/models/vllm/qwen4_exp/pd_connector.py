@@ -17,6 +17,7 @@ from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
     PoolByteSpan,
     PoolSpanRegistration,
@@ -44,6 +45,8 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
 from .pd import TransferExtent, TransferGroup, build_transfer_groups, handoff_block_ids
 from .pd_identity import canonical_rank_identity
 from .pd_manifest import build_transfer_manifest, measure_transfer_layout
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpRaidenConnector(TPURaidenConnector):
@@ -154,16 +157,41 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         if not self._raiden_stage3_enabled():
             raise ValueError("Qwen PD requires the Raiden Stage-3 transport")
         self._validate_stage3_transfer_parallelism(self._raiden_transfer_parallelism())
-        manifest = build_transfer_manifest(cache.native_config, cache.materialized)
-        verify_storage_binding(
-            manifest, self.named_kv_caches, runner.kv_cache_raw_tensors
-        )
-        materialize_storages(manifest)
+        if self._staged_consumer():
+            # A TP-T decode behind TP1 pipeline stages: Raiden lands the
+            # producer's pages in a staging carrier of the producer's geometry
+            # and every load is repacked into this rank's pool (pd_staging).
+            from .pd_staging import RankSlice, StagedConsumer
+
+            parallel = self.vllm_config.parallel_config
+            self._staging = StagedConsumer(
+                self.vllm_config,
+                cache.layout,
+                cache.get_transfer_groups(),
+                runner.kv_cache_raw_tensors[0],
+                RankSlice(
+                    tp_size=int(parallel.tensor_parallel_size),
+                    tp_rank=int(self.tp_rank),
+                    num_kv_heads=int(self.vllm_config.model_config.hf_text_config.num_key_value_heads),
+                    main_dcp=cache.layout.main_dcp,
+                ),
+                staging_bytes=int(envs.QWEN4_EXP_PD_STAGING_BYTES),
+            )
+            manifest = self._staging.manifest
+            materialize_storages(manifest)
+            plan_groups = self._staging.src_groups
+        else:
+            manifest = build_transfer_manifest(cache.native_config, cache.materialized)
+            verify_storage_binding(
+                manifest, self.named_kv_caches, runner.kv_cache_raw_tensors
+            )
+            materialize_storages(manifest)
+            plan_groups = cache.get_transfer_groups()
         semantics = self._collect_pd_semantics(runner)
         # Validate physical geometry before starting any network/native manager.
         measure_transfer_layout(manifest)
         self.runner = runner
-        self._qwen_page_plan = QwenPagePlan(cache.get_transfer_groups(), manifest)
+        self._qwen_page_plan = QwenPagePlan(plan_groups, manifest)
         self._qwen_semantics = semantics
         self._maybe_host_reshard_store()
         address = _resolved_reshard_controller_address(self.dp_rank)
@@ -179,6 +207,39 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         self._raiden_manifest = manifest
         self._raiden_transfer_engine = engine
         self._raiden_admission_summary = summary
+
+    def _staged_consumer(self) -> bool:
+        """A TP>1 consumer of TP1 pipeline stages (per-layer pool tags)."""
+        return (
+            not self.is_producer and _use_per_layer_pool_tags() and int(self.tp_size) > 1
+        )
+
+    def _stage3_reserve_destination(self, destination_req_id, req_meta, tp_group) -> bool:
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return True
+        ok = staging.reserve(int(req_meta.uuid), int(req_meta.num_tokens), tp_group)
+        if not ok:
+            logger.warning(
+                "Qwen PD staging full (%d pages): req=%s recomputes on the decode",
+                staging.pages,
+                destination_req_id,
+            )
+        return ok
+
+    def _stage3_finish_destination(self, destination_req_id, ok) -> None:
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return
+        req_meta = self._stage3_submitted_load_metas.get(destination_req_id)
+        if req_meta is None or int(req_meta.uuid) not in staging.reservations:
+            return
+        uuid = int(req_meta.uuid)
+        try:
+            if ok:
+                staging.repack(uuid, req_meta.group_block_ids, int(req_meta.num_tokens))
+        finally:
+            staging.release(uuid)
 
     def _ensure_raiden_transfer_engine(self):
         if self._raiden_transfer_engine is None:
@@ -261,9 +322,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             # A pipeline producer: one transfer unit per TP1 stage.
             units = self.is_producer and self.tp_size == 1 and transfer_parallelism == pp
         elif _use_per_layer_pool_tags() and not self.is_producer:
-            # A TP1 consumer of a pipeline producer pulls every stage's
-            # layers; or matching TP, as below.
-            units = self.tp_size == 1 or transfer_parallelism == self.tp_size
+            # A consumer of pipeline stages pulls every stage's layers: whole
+            # pages at TP1, through the staging repack at TP>1.
+            units = True
         else:
             # Matching TP: producer rank k ships its pages to decode rank k.
             units = transfer_parallelism == self.tp_size
@@ -326,7 +387,12 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                             dst_block_index=index,
                             dst_offset_bytes=0,
                             size_bytes=pool.block_stride_bytes,
-                            dst_unit_ordinal=self.tp_rank,
+                            # A pipeline stage's pages go to every decode unit
+                            # (a TP>1 decode repacks its slice); matching TP
+                            # sends rank k to rank k.
+                            dst_unit_ordinal=None
+                            if _engine_is_pipeline(self.vllm_config)
+                            else self.tp_rank,
                         )
                         for index in range(len(ids))
                     ),
@@ -343,6 +409,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             req_meta.src_parallelism != self._raiden_transfer_parallelism()
         ):
             raise ValueError("Qwen PD needs a full prefix and the admitted source units")
+        staging = getattr(self, "_staging", None)
+        if staging is not None:
+            return staging.destination(int(req_meta.uuid))
         pages = plan.request_pages(req_meta.group_block_ids, num_tokens)
         if tuple(req_meta.local_block_ids) != pages[0]:
             raise ValueError("Qwen PD primary pages differ from the full group table")
@@ -383,9 +452,11 @@ def _owner_invariant_layout(layout: dict[str, Any]) -> dict[str, Any]:
 def _owner_invariant_semantics(semantics: dict[str, Any]) -> dict[str, Any]:
     """The loaded model state, without rank ownership.
 
-    A pipeline stage and a data-parallel decode differ in rank count, expert
+    A pipeline stage and a decode differ in rank count, TP size, expert
     parallelism and the layers whose KV scales they hold; the scales come from
-    the checkpoint, whose digest is compared.
+    the checkpoint, whose digest is compared, and the page geometry the TP size
+    implies is in the layout half of the fingerprint (a staged TP>1 decode
+    presents the producer's geometry).
     """
     ranks = semantics["ranks"]
     checkpoints = sorted({r["checkpoint"] for r in ranks})
@@ -397,7 +468,6 @@ def _owner_invariant_semantics(semantics: dict[str, Any]) -> dict[str, Any]:
         schema="qwen4-loaded-state-v2",
         checkpoint=checkpoints[0],
         ple_checkpoint=first["ple_checkpoint"],
-        tp_size=first["tp_size"],
         config=first["config"],
         state_flags=flags,
     )

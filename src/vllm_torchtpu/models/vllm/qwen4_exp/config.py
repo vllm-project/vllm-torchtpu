@@ -90,8 +90,12 @@ def max_qsa_speculative_tokens(t) -> int:
     return qsa_ring_rows(t) - int(t.indexer_compress_ratio) + 1
 
 
-def gdn_cache_spec(cfg):
-    """Match the existing TPU GDN adapter's private-cache contract."""
+def gdn_cache_spec(cfg, tp: int | None = None):
+    """Match the existing TPU GDN adapter's private-cache contract.
+
+    ``tp`` describes another engine's ranks (a PD peer's geometry); default
+    this engine's.
+    """
     from vllm.model_executor.layers.mamba.mamba_utils import (
         MambaStateDtypeCalculator,
         MambaStateShapeCalculator,
@@ -106,7 +110,7 @@ def gdn_cache_spec(cfg):
         cfg.cache_config.mamba_ssm_cache_dtype,
     )
     conv_shape, ssm_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
-        cfg.parallel_config.tensor_parallel_size,
+        cfg.parallel_config.tensor_parallel_size if tp is None else tp,
         t.linear_num_key_heads,
         t.linear_num_value_heads,
         t.linear_key_head_dim,
@@ -126,8 +130,12 @@ def gdn_cache_spec(cfg):
     )
 
 
-def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
-    """Describe model-owned caches before allocating any model weights."""
+def native_cache_specs(cfg, tp: int | None = None) -> dict[str, KVCacheSpec]:
+    """Describe model-owned caches before allocating any model weights.
+
+    ``tp`` describes another engine's ranks (a PD peer's geometry).
+    """
+    tp = cfg.parallel_config.tensor_parallel_size if tp is None else tp
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -135,9 +143,7 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
     from .qsa import get_qsa_cache_specs
 
     t = cfg.model_config.hf_text_config
-    main, auxiliary = get_qsa_cache_specs(
-        t, cfg.parallel_config.tensor_parallel_size, cfg.cache_config.cache_dtype
-    )
+    main, auxiliary = get_qsa_cache_specs(t, tp, cfg.cache_config.cache_dtype)
     specs: dict[str, KVCacheSpec] = {}
 
     def add_qsa(prefix):
@@ -149,7 +155,7 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
     for index, layer_type in enumerate(t.layer_types):
         prefix = f"model.layers.{index}"
         if layer_type == "linear_attention":
-            specs[prefix + ".linear_attn"] = gdn_cache_spec(cfg)
+            specs[prefix + ".linear_attn"] = gdn_cache_spec(cfg, tp)
         else:
             add_qsa(prefix)
         if index + 1 in t.ple_layer_ids:

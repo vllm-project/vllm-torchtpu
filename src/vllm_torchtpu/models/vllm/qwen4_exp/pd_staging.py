@@ -272,3 +272,206 @@ def make_repack(
         return jax.lax.bitcast_convert_type(out, dtype)
 
     return fn
+
+
+# ---------------------------------------------------------------------------
+# The consumer: staging carrier, allocator, manifest and the repack call
+# ---------------------------------------------------------------------------
+
+
+def gdn_geometry(cfg, tp: int, layout_token_bytes: int) -> GdnGeometry:
+    """A rank's GDN state page at ``tp`` (``pool_layout.pooled_cache_specs``)."""
+    from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+
+    from .config import gdn_cache_spec
+    from .pool_layout import POOLED_GDN_CONV_STATE_DTYPE
+
+    t = cfg.model_config.hf_text_config
+    spec = gdn_cache_spec(cfg, tp)
+    conv_item = torch.empty((), dtype=POOLED_GDN_CONV_STATE_DTYPE).element_size()
+    ssm_item = torch.empty((), dtype=spec.dtypes[1]).element_size()
+    state = derive_pooled_gdn_state_layout(
+        ssm_bytes=math.prod(spec.shapes[1]) * ssm_item,
+        conv_bytes=math.prod(spec.shapes[0]) * conv_item,
+        token_bytes=layout_token_bytes,
+    )
+    return GdnGeometry(
+        ssm_tokens=state.ssm_tokens,
+        conv_tokens=state.conv_tokens,
+        v_heads=int(t.linear_num_value_heads) // tp,
+        k_heads=int(t.linear_num_key_heads) // tp,
+        head_k_dim=int(t.linear_key_head_dim),
+        head_v_dim=int(t.linear_value_head_dim),
+        conv_width=int(t.linear_conv_kernel_dim) - 1,
+        ssm_itemsize=ssm_item,
+        conv_itemsize=conv_item,
+    )
+
+
+class StagedConsumer:
+    """One TP-T decode rank's staging carrier for TP1 pipeline-producer pages."""
+
+    def __init__(self, cfg, decode_layout, decode_groups, pool, rank: RankSlice, staging_bytes: int):
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+        from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
+            BINDING_ALIASED_RAW,
+            PoolEntry,
+            PoolManifest,
+            RegionSpec,
+        )
+
+        from .pd import TransferExtent, build_transfer_groups
+        from .pool_layout import pack_compressed_k_enabled, pack_main_kv_enabled, pooled_cache_specs
+
+        if pack_compressed_k_enabled() or pack_main_kv_enabled():
+            raise ValueError(
+                "A staged Qwen PD decode needs QWEN4_EXP_PACK_COMPRESSED_K=0 and "
+                "QWEN4_EXP_PACK_MAIN_KV=0 (the pipeline producer's layout)"
+            )
+        self.cfg, self.rank, self.pool = cfg, rank, pool
+        self.dst_layout = decode_layout
+        self.dst_groups = decode_groups
+        # The producer: TP1 stages, no main-KV DCP, the same packing flags.
+        self.src_layout, src_specs = pooled_cache_specs(cfg, tp=1, main_dcp=1)
+        self.src_groups = build_transfer_groups(get_kv_cache_groups(cfg, dict(src_specs)))
+        self.src_block, self.dst_block = self.src_layout.block_size, decode_layout.block_size
+        self.ratio = int(cfg.model_config.hf_text_config.indexer_compress_ratio)
+        self.pages = max(2, staging_bytes // self.src_layout.page_bytes)
+        self.staging = torch.zeros(
+            (self.pages * self.src_block // KERNEL_ROWS, KERNEL_ROWS, 1, ROW_SUBLANES, ROW_LANES),
+            dtype=pool.dtype,
+            device=pool.device,
+        )
+        self.free = torch.ones(self.pages, dtype=torch.int32)
+        self.free[0] = 0  # the null page
+        self.reservations: dict[int, list[list[int]]] = {}
+        self.manifest = PoolManifest(
+            BINDING_ALIASED_RAW,
+            [self.staging],
+            [
+                PoolEntry(
+                    tag=f"qwen4.g{group.group_index}.{name}",
+                    layer_name=name,
+                    storage_index=0,
+                    base_offset_bytes=0,
+                    block_stride_bytes=self.src_layout.page_bytes,
+                    num_blocks=self.pages,
+                    regions=(
+                        RegionSpec("page", 0, self.src_layout.page_bytes, self.src_layout.page_bytes, 1),
+                    ),
+                    dtype_tag="qwen4-whole-fp8-page-v1",
+                )
+                for group in self.src_groups
+                for name in group.layer_names
+            ],
+        )
+        self._src_owner = {n: g.group_index for g in self.src_groups for n in g.layer_names}
+        self._dst_owner = {n: g.group_index for g in self.dst_groups for n in g.layer_names}
+        self._gdn_names = [n for n in self._dst_owner if owner_kind(n) == "gdn"]
+        self._token_extent = TransferExtent.TOKEN_PAGES
+        tp = rank.tp_size
+        src_gdn = gdn_geometry(cfg, 1, self.src_layout.token_bytes) if self._gdn_names else None
+        dst_gdn = gdn_geometry(cfg, tp, decode_layout.token_bytes) if self._gdn_names else None
+        self._fn = make_repack(
+            src_block=self.src_block,
+            dst_block=self.dst_block,
+            src_gdn=src_gdn,
+            dst_gdn=dst_gdn,
+            kv_head=rank.kv_head,
+            v_head_start=rank.tp_rank * (dst_gdn.v_heads if dst_gdn else 0),
+            channels=conv_channels(src_gdn, dst_gdn, rank) if src_gdn else [0],
+        )
+        self._op = None
+
+    # --- allocation (identical on every rank of the engine) ---
+
+    def reserve(self, uuid: int, num_tokens: int, tp_group=None) -> bool:
+        if uuid in self.reservations:
+            return True
+        counts = [g.page_count(num_tokens) for g in self.src_groups]
+        free = self.free.clone()
+        if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+            import torch.distributed as dist
+
+            # Ranks free pages at their own receive terminals; allocate only
+            # pages free on all of them, in the same order everywhere.
+            dist.all_reduce(free, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
+        available = torch.nonzero(free, as_tuple=False).flatten().tolist()
+        if len(available) < sum(counts):
+            return False
+        pages, cursor = [], 0
+        for count in counts:
+            pages.append(available[cursor : cursor + count])
+            cursor += count
+        for group_pages in pages:
+            self.free[group_pages] = 0
+        self.reservations[uuid] = pages
+        return True
+
+    def destination(self, uuid: int) -> tuple[list[str], list[int], list[int]]:
+        pages = self.reservations[uuid]
+        tags, blocks, counts = [], [], []
+        for pool in self.manifest.pools:
+            group_pages = pages[self._src_owner[pool.layer_name]]
+            tags.append(pool.tag)
+            blocks.extend(group_pages)
+            counts.append(len(group_pages))
+        return tags, blocks, counts
+
+    def release(self, uuid: int) -> list[list[int]] | None:
+        pages = self.reservations.pop(uuid, None)
+        if pages is not None:
+            for group_pages in pages:
+                self.free[group_pages] = 1
+        return pages
+
+    # --- the repack ---
+
+    def indices(self, src_pages, dst_tables, num_tokens):
+        main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = [], [], [], [], [], []
+        for name, gi in self._dst_owner.items():
+            kind = owner_kind(name)
+            src = src_pages[self._src_owner[name]]
+            dst = dst_tables[gi]
+            if kind == "main":
+                s, d = main_rows(num_tokens, src, self.src_block, dst, self.dst_block, self.rank)
+                main_s += s
+                main_d += d
+            elif kind == "compressed":
+                s, d = compressed_rows(num_tokens, self.ratio, src, self.src_block, dst, self.dst_block)
+                copy_s += s
+                copy_d += d
+            elif kind in ("ring", "ple"):
+                s, d = page_prefix_rows(src[0], self.src_block, dst[0], self.dst_block,
+                                        min(self.src_block, self.dst_block))
+                copy_s += s
+                copy_d += d
+        for name in self._gdn_names:
+            gdn_s.append(src_pages[self._src_owner[name]][0])
+            gdn_d.append(dst_tables[self._dst_owner[name]][0])
+        return main_s, main_d, copy_s, copy_d, gdn_s, gdn_d
+
+    def repack(self, uuid: int, dst_tables, num_tokens: int) -> None:
+        pages = self.reservations[uuid]
+        main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = self.indices(pages, dst_tables, num_tokens)
+        device = self.pool.device
+
+        def tensor(values, size):
+            return torch.tensor(_pad(values, size), dtype=torch.int32).to(device)
+
+        msize, csize = bucket(len(main_s)), bucket(len(copy_s))
+        args = (
+            tensor(main_s, msize), tensor(main_d, msize),
+            tensor(copy_s, csize), tensor(copy_d, csize),
+            tensor(gdn_s or [0], max(1, len(gdn_s))), tensor(gdn_d or [0], max(1, len(gdn_d))),
+        )
+        if self._op is None:
+            from torch_tpu._internal import pallas
+
+            self._op = pallas.jax_op(
+                "pallas::qwen4_pd_staged_repack", self._fn, donate_argnums=(0,)
+            )
+            self._op.register_fake(lambda pool, *rest: torch.empty_like(pool))
+        new_pool = self._op(self.pool, self.staging, *args)
+        self.pool.copy_(new_pool)
