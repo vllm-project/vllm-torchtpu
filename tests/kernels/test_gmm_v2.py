@@ -19,6 +19,7 @@ test runner.
 """
 
 import collections
+import functools
 from types import SimpleNamespace
 
 import jax
@@ -35,6 +36,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     interleave_lane,
     situ_and_mul,
 )
+from vllm_torchtpu.kernels.megablox.quantized_rows import quantize_rows
 
 _GroupConfig = collections.namedtuple(
     "_GroupConfig", ["num_groups", "group_offset", "num_local_groups"]
@@ -621,6 +623,81 @@ def test_gmm_v2_fused_mlp_token_rows_match_gathered_rows(group_sizes, head_rows)
         group_sizes,
         token_rows=tokens,
         token_row_ids=row_ids,
+        **common,
+    )
+
+    valid = int(group_sizes.sum())
+    np.testing.assert_array_equal(
+        np.asarray(actual[:valid]).view(np.uint16),
+        np.asarray(expected[:valid]).view(np.uint16),
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("head_rows", [32, 256])
+@pytest.mark.parametrize(
+    "group_sizes",
+    [[40, 0, 3, 197, 1, 300, 59], [600], [0, 0, 17, 0, 0, 0, 0, 1]],
+    ids=["mixed", "one-group-many-tiles", "sparse"],
+)
+def test_gmm_v2_fused_mlp_quantized_token_rows_match_bf16_rows(group_sizes, head_rows):
+    """Token rows quantized ahead compute the bits the bf16 rows compute."""
+    _require_tpu()
+
+    num_groups, num_tokens = 8, 256
+    in_size, inter_size, out_size = 1024, 512, 1024
+    quant_block = 512
+    group_sizes = jnp.asarray(
+        group_sizes + [0] * (num_groups - len(group_sizes)), jnp.int32
+    )
+    num_rows = 640
+    keys = jax.random.split(jax.random.key(2), 6)
+    tokens = jax.random.normal(keys[0], (num_tokens, in_size), jnp.bfloat16)
+    # A zero row quantizes with a zero scale.
+    tokens = tokens.at[7].set(0)
+    row_ids = jax.random.randint(keys[5], (num_rows,), 0, num_tokens)
+    w1 = jax.random.randint(
+        keys[1], (num_groups, in_size // 2, 2 * inter_size), 0, 256
+    ).astype(jnp.uint8)
+    w2 = jax.random.randint(
+        keys[2], (num_groups, inter_size // 2, out_size), 0, 256
+    ).astype(jnp.uint8)
+    w1_scale = jax.random.uniform(
+        keys[3], (num_groups, in_size // quant_block, 1, 2 * inter_size)
+    )
+    w2_scale = jax.random.uniform(
+        keys[4], (num_groups, inter_size // quant_block, 1, out_size)
+    )
+    common = dict(
+        rhs1_scale=w1_scale,
+        rhs2_scale=w2_scale,
+        group_offset=jnp.array(0, dtype=jnp.int32),
+        fuse_act="silu_and_mul_with_clamp",
+        preferred_element_type=jnp.bfloat16,
+        maybe_quantize_lhs=True,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+    quantize = functools.partial(
+        quantize_rows, block_size=quant_block, q_dtype=jnp.float8_e4m3fn
+    )
+
+    expected = gmm_v2_fused_mlp(
+        tokens[row_ids[:head_rows]],
+        w1,
+        w2,
+        group_sizes,
+        token_rows=tokens,
+        token_row_ids=row_ids,
+        **common,
+    )
+    actual = gmm_v2_fused_mlp(
+        quantize(tokens[row_ids[:head_rows]]),
+        w1,
+        w2,
+        group_sizes,
+        token_rows=quantize(tokens),
+        token_row_ids=row_ids,
+        quantized_lhs_dtype=jnp.float8_e4m3fn,
         **common,
     )
 
