@@ -65,9 +65,18 @@ _ONEHOT_AUTO_CAP = 512
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
-# Above 2,048 routed rows, the inverse-permutation scatter costs more than
-# the two sorts it replaces when `ragged_permute` is off (e.g. non-EP prefill).
+# Routed-row cap for the one-hot EP permute and non-EP paths. Up to here the
+# counting sort (or, where it declines, the packed single sort) replaces the
+# three-sort form; above it the three sorts stay. Past this point the single
+# sort's inverse-permutation scatter costs more than the sorts it replaces,
+# and the counting sort's rank contraction does too at 256+ local experts.
 _SINGLE_SORT_MAX_ROWS = 2048
+# Up to one counting-sort block (512 rows) on non-ragged paths, scattering
+# token ids through the counting sort's positions is cheaper than the packed
+# value sort it replaces and leaves the decode routing prep with no comparison
+# sort. Ragged permute keeps the packed sort so SparseCore gather overlap is
+# unchanged, and past one block the scatter costs more than that sort.
+_COUNTING_SORT_SCATTER_MAX_ROWS = 512
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -263,8 +272,41 @@ def _counting_sort_positions(
     both = jnp.einsum("ij,bje->bie", lower, onehot, preferred_element_type=jnp.float32)
     hist = both[:, 0, :]
     rank = both[:, 1:, :]
-    counts = hist.sum(axis=0)
-    base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts)
+    # Prefix sums via MXU triangular contractions avoid VPU `reduce-window`
+    # scans (`jnp.cumsum`), and single-block inputs skip the block prefix.
+    upper_buckets = jnp.triu(jnp.ones((num_buckets, num_buckets), jnp.bfloat16), 1)
+    if hist.shape[0] == 1:
+        counts = hist[0]
+        base = jnp.einsum(
+            "e,ef->f",
+            counts,
+            upper_buckets,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )[None, :]
+    else:
+        counts = hist.sum(axis=0)
+        bucket_offset = jnp.einsum(
+            "e,ef->f",
+            counts,
+            upper_buckets,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+        if hist.shape[0] <= _COUNTING_SORT_BLOCK:
+            lower_blocks = jnp.tril(
+                jnp.ones((hist.shape[0], hist.shape[0]), jnp.bfloat16), -1
+            )
+            block_offset = jnp.einsum(
+                "ab,be->ae",
+                lower_blocks,
+                hist,
+                precision=jax.lax.Precision.HIGHEST,
+                preferred_element_type=jnp.float32,
+            )
+        else:
+            block_offset = jnp.cumsum(hist, axis=0) - hist
+        base = block_offset + bucket_offset
     pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
@@ -320,16 +362,23 @@ def prepare_routed_gmm_inputs(
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     # The keys take only `local_num_experts + 1` values, so a counting sort
-    # gives the positions and `group_sizes` without a second comparison sort.
-    # Ragged permute only: under the one-hot permute these positions break MTP.
+    # gives the positions and `group_sizes` without a second comparison sort:
+    # on the ragged permute at any row count (as before), and on the one-hot
+    # and non-EP paths within the single sort's envelope, where it replaces
+    # that sort. On non-ragged paths within `_COUNTING_SORT_SCATTER_MAX_ROWS`,
+    # scattering `token_indices_flat` by those positions also removes the
+    # packed value sort.
     ragged_permute = (
         use_ep
         and use_sparse_core
         and token_indices_flat.shape[0] > onehot_moe_permute_threshold
     )
+    counting_sort = (
+        ragged_permute or token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
+    )
     argsort_revert_indices, bucket_counts = (
         _counting_sort_positions(sort_keys, local_num_experts + 1)
-        if ragged_permute
+        if counting_sort
         else (None, None)
     )
     token_bits = max(1, (num_tokens_local - 1).bit_length())
@@ -337,16 +386,29 @@ def prepare_routed_gmm_inputs(
     flat_bits = max(1, (token_indices_flat.shape[0] - 1).bit_length())
     single_sort = (
         _SINGLE_SORT
+        and argsort_revert_indices is None
         and not ragged_permute
         and token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
         and (local_num_experts + 1).bit_length() + flat_bits < 31
     )
+    token_indices_sorted: jax.Array | None = None
+    if (
+        argsort_revert_indices is not None
+        and not ragged_permute
+        and token_indices_flat.shape[0] <= _COUNTING_SORT_SCATTER_MAX_ROWS
+    ):
+        token_indices_sorted = (
+            jnp.zeros_like(token_indices_flat)
+            .at[argsort_revert_indices]
+            .set(token_indices_flat, unique_indices=True)
+        )
     sorted_indices = (
         jnp.argsort(sort_keys)
-        if not single_sort and (argsort_revert_indices is None or not packable)
+        if token_indices_sorted is None
+        and not single_sort
+        and (argsort_revert_indices is None or not packable)
         else None
     )
-    token_indices_sorted: jax.Array | None = None
 
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
@@ -379,11 +441,27 @@ def prepare_routed_gmm_inputs(
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
-            # Use one-hot matmul for permutation, which can be faster
-            # for small batch size
-            onehot = jax.nn.one_hot(
-                token_indices_sorted, num_tokens_local, dtype=hidden_states_local.dtype
-            )
+            # Use one-hot matmul for permutation, which can be faster for small
+            # batch size. When `argsort_revert_indices` came from the counting
+            # sort, build the `[M, T]` permutation directly from it so
+            # `fused_moe_gmm` does not depend on `token_indices_sorted` (letting
+            # XLA DCE its scatter unless owner-output combine uses it).
+            if bucket_counts is not None:
+                onehot = (
+                    jax.nn.one_hot(
+                        argsort_revert_indices.reshape(num_tokens_local, topk),
+                        argsort_revert_indices.size,
+                        dtype=hidden_states_local.dtype,
+                    )
+                    .sum(axis=1)
+                    .T
+                )
+            else:
+                onehot = jax.nn.one_hot(
+                    token_indices_sorted,
+                    num_tokens_local,
+                    dtype=hidden_states_local.dtype,
+                )
             x = onehot @ hidden_states_local
         else:
             # Match uLLM/reference EP routing: materialize the valid local

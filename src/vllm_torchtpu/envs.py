@@ -660,7 +660,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
-    # one packed sort instead of three. The ragged (counting sort) path ignores it.
+    # one packed sort instead of three (up to 2,048 routed rows on non-ragged
+    # paths). Within that cap the counting sort takes precedence unless it
+    # declines (fewer routed rows than local experts + 1, or local experts >=
+    # 512); above 2,048 rows on non-ragged paths three sorts run.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
