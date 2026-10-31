@@ -48,7 +48,10 @@ def build_transfer_groups(
     seen = set()
     for index, group in enumerate(groups):
         names = tuple(group.layer_names)
-        if not names or len(set(names)) != len(names) or seen.intersection(names):
+        # A pipeline stage's projected plan keeps every whole-model group, in
+        # order, so group indices and the scheduler's block tables line up;
+        # groups whose layers all live on other stages have no local owners.
+        if len(set(names)) != len(names) or seen.intersection(names):
             raise ValueError("Transfer groups must name every cache owner once")
         seen.update(names)
         specs = (
