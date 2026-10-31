@@ -62,7 +62,7 @@ ISSUE_UNROLL = 8
 # inside their vector work. The calls after them start each next block's whole
 # list at the start of a step, a step before its rows are waited for: they run
 # while earlier pieces are reduce-scattered, which hides their time.
-IN_PASS_DMA_PIECES = 1
+IN_PASS_DMA_PIECES = 2
 
 _LANES = 128
 _SUBLANES = 8
