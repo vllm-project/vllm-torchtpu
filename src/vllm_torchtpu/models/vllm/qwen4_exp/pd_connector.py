@@ -5,6 +5,7 @@ Native admission binds the loaded model identity and measured page layout.
 This connector does not borrow another model's native pool admission.
 """
 
+import json
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -33,9 +34,11 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
     SendMeta,
     TPURaidenConnector,
     TPURaidenConnectorWorker,
+    _engine_is_pipeline,
     _resolved_reshard_controller_address,
     _Stage3LoadMeta,
     _Stage3TransferGroup,
+    _use_per_layer_pool_tags,
 )
 
 from .pd import TransferExtent, TransferGroup, build_transfer_groups, handoff_block_ids
@@ -55,11 +58,23 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         if (
             parallel.prefill_context_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
-            or parallel.pipeline_parallel_size != 1
             or vllm_config.speculative_config is not None
             or cache.enable_prefix_caching
         ):
-            raise NotImplementedError("Qwen PD first requires CP1/PP1, APC and MTP off")
+            raise NotImplementedError("Qwen PD first requires CP1, APC and MTP off")
+        # A pipeline producer (Qwen3.5's prefill shape): each TP1 stage ships
+        # its own layers' pages whole, paired with a TP1 consumer's pools by
+        # per-layer tag, so both peers hold the same per-layer page encoding.
+        if parallel.pipeline_parallel_size != 1 and (
+            parallel.tensor_parallel_size != 1
+            or vllm_config.kv_transfer_config is None
+            or not vllm_config.kv_transfer_config.is_kv_producer
+            or not _use_per_layer_pool_tags()
+        ):
+            raise NotImplementedError(
+                "Qwen PD pipeline stages produce only, at TP1, with "
+                "TPU_RAIDEN_POOL_TAGS_PER_LAYER=1 on both peers"
+            )
         if envs.TPU_KV_RESHARD_TRANSPORT != "raiden":
             raise ValueError("Qwen PD requires the Raiden Stage-3 transport")
         if any(
@@ -221,7 +236,13 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         if self._qwen_semantics is None:
             raise RuntimeError("Qwen PD loaded-state identity has not been admitted")
         _, layout = measure_transfer_layout(manifest)
-        payload = dict(layout=layout, semantics=self._qwen_semantics)
+        if _use_per_layer_pool_tags():
+            payload = dict(
+                layout=_owner_invariant_layout(layout),
+                semantics=_owner_invariant_semantics(self._qwen_semantics),
+            )
+        else:
+            payload = dict(layout=layout, semantics=self._qwen_semantics)
         token_sizes = {
             g.block_size
             for g in self._page_plan().groups
@@ -233,15 +254,28 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
 
     def _validate_stage3_transfer_parallelism(self, transfer_parallelism: int) -> None:
         parallel = self.vllm_config.parallel_config
+        pp = int(parallel.pipeline_parallel_size or 1)
+        if pp > 1:
+            # A pipeline producer: one transfer unit per TP1 stage.
+            units = self.is_producer and self.tp_size == 1 and transfer_parallelism == pp
+        elif _use_per_layer_pool_tags() and not self.is_producer:
+            # A TP1 consumer of a pipeline producer pulls every stage's
+            # layers; or matching TP, as below.
+            units = self.tp_size == 1 or transfer_parallelism == self.tp_size
+        else:
+            # Matching TP: producer rank k ships its pages to decode rank k.
+            units = transfer_parallelism == self.tp_size
         if (
-            transfer_parallelism != self.tp_size
+            not units
             or parallel.prefill_context_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
-            or parallel.pipeline_parallel_size != 1
             or self.vllm_config.speculative_config is not None
             or self.vllm_config.cache_config.enable_prefix_caching
         ):
-            raise ValueError("Qwen PD requires matching TP, CP1/PP1 and APC/MTP off")
+            raise ValueError(
+                "Qwen PD requires matching TP (or a TP1 pipeline producer with "
+                "a TP1 consumer), CP1 and APC/MTP off"
+            )
 
     def _raiden_interleave_tokens(
         self, page_tokens: int, transfer_parallelism: int
@@ -254,14 +288,17 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         return True
 
     def _local_raiden_transfer_rank(self) -> int:
+        if _engine_is_pipeline(self.vllm_config):
+            # The stage index (TP1 stages, no PCP).
+            return super()._local_raiden_transfer_rank()
         return int(self.tp_rank)
 
     def _page_plan(self) -> "QwenPagePlan":
         if self._qwen_page_plan is None:
             raise RuntimeError("Qwen PD native page admission has not completed")
-        if (
-            self._raiden_transfer_parallelism() != self.tp_size
-            or self._local_raiden_transfer_rank() != self.tp_rank
+        self._validate_stage3_transfer_parallelism(self._raiden_transfer_parallelism())
+        if not _engine_is_pipeline(self.vllm_config) and (
+            self._local_raiden_transfer_rank() != self.tp_rank
         ):
             raise ValueError("Qwen PD requires matching TP rank ownership")
         return self._qwen_page_plan
@@ -300,8 +337,10 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         self, req_meta: _Stage3LoadMeta, num_tokens: int
     ) -> tuple[list[str], list[int], list[int]]:
         plan = self._page_plan()
-        if req_meta.skip_tokens or req_meta.src_parallelism != self.tp_size:
-            raise ValueError("Qwen PD needs a full prefix and identical source TP")
+        if req_meta.skip_tokens or (
+            req_meta.src_parallelism != self._raiden_transfer_parallelism()
+        ):
+            raise ValueError("Qwen PD needs a full prefix and the admitted source units")
         pages = plan.request_pages(req_meta.group_block_ids, num_tokens)
         if tuple(req_meta.local_block_ids) != pages[0]:
             raise ValueError("Qwen PD primary pages differ from the full group table")
@@ -312,6 +351,54 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             blocks.extend(ids)
             counts.append(len(ids))
         return tags, blocks, counts
+
+
+def _owner_invariant_layout(layout: dict[str, Any]) -> dict[str, Any]:
+    """The page encoding without the owner list or carrier count.
+
+    Under per-layer tags the peers hold different owner subsets of one
+    whole-model plan (a pipeline stage its layers, the decode every layer):
+    carriers and tags differ, while every page must encode the same way. The
+    controller pairs pools by tag; this pins the encoding they share.
+    """
+
+    def unique(items):
+        encoded = {json.dumps(item, sort_keys=True) for item in items}
+        return [json.loads(item) for item in sorted(encoded)]
+
+    return dict(
+        schema="qwen4-whole-fp8-page-layout-v2",
+        torch_tpu=layout["torch_tpu"],
+        libtpu=layout["libtpu"],
+        carriers=unique(layout["carriers"]),
+        pages=unique(
+            dict(block_stride_bytes=p["block_stride_bytes"], dtype_tag=p["dtype_tag"])
+            for p in layout["pools"]
+        ),
+    )
+
+
+def _owner_invariant_semantics(semantics: dict[str, Any]) -> dict[str, Any]:
+    """The loaded model state, without rank ownership.
+
+    A pipeline stage and a data-parallel decode differ in rank count, expert
+    parallelism and the layers whose KV scales they hold; the scales come from
+    the checkpoint, whose digest is compared.
+    """
+    ranks = semantics["ranks"]
+    checkpoints = sorted({r["checkpoint"] for r in ranks})
+    if len(checkpoints) != 1:
+        raise ValueError("Qwen PD ranks loaded different checkpoints")
+    first = ranks[0]
+    flags = {k: v for k, v in first["state_flags"].items() if k != "expert_parallel"}
+    return dict(
+        schema="qwen4-loaded-state-v2",
+        checkpoint=checkpoints[0],
+        ple_checkpoint=first["ple_checkpoint"],
+        tp_size=first["tp_size"],
+        config=first["config"],
+        state_flags=flags,
+    )
 
 
 @dataclass(frozen=True)
