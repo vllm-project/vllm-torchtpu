@@ -604,12 +604,16 @@ class Qwen4ExpBackbone(nn.Module):
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
         # The multi-stream hidden state [T, hc_count * H] crosses stages
-        # before the final mixer collapses it.
+        # before the final mixer collapses it. The TPU hand-off
+        # (distributed/pp_wave.py) sends hidden_states + residual as one
+        # tensor and hands the next stage a zero residual; this model has no
+        # separate residual, so it rides as zeros and the sum is exact.
         return IntermediateTensors(
             {
-                "hidden_states": torch.zeros(
+                key: torch.zeros(
                     (batch_size, self.hidden_width), dtype=dtype, device=device
                 )
+                for key in ("hidden_states", "residual")
             }
         )
 
@@ -722,7 +726,9 @@ class Qwen4ExpBackbone(nn.Module):
                 sp_pad=sp_pad,
             )
         if not self.last_stage:
-            return IntermediateTensors({"hidden_states": hidden})
+            return IntermediateTensors(
+                {"hidden_states": hidden, "residual": torch.zeros_like(hidden)}
+            )
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
         if sp_pad:
             mixed, hidden = sp.unpad(mixed, rows), sp.unpad(hidden, rows)
