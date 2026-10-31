@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Micro-batched hierarchical reduce-scatter on the TensorCores of tpu7x."""
+"""Micro-batched hierarchical reduce-scatter on the TensorCores of tpu7x.
+
+Phase 2 can send FP8 over ICI; accumulation stays BF16.
+"""
 
 import functools
 import math
@@ -23,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.collectives.hierrs_tc.config import (
     _MIN_SAFE_MICRO_BATCHES,
+    SCALE_LANE,
     Config,
     next_multiple_of,
     pick_num_micro_batches,
@@ -56,13 +60,16 @@ def is_supported_by_hierrs_tc(num_devices: int, rows: int, hidden: int) -> bool:
     )
 
 
-_NUM_WORK_BUFFERS = 3  # running_sum, recv_buf, phase-2 landing buffer
-
-
-def _work_set_bytes(local_seq_len, hidden_dim_size, itemsize):
-    return (
-        _NUM_WORK_BUFFERS * _packed_seq_len(local_seq_len) * hidden_dim_size * itemsize
-    )
+def _work_set_bytes(
+    local_seq_len, hidden_dim_size, itemsize, fp8_comm, num_devices, num_scale_slots
+):
+    packed = _packed_seq_len(local_seq_len) * hidden_dim_size
+    running_sum_and_recv_buf = 2 * packed * itemsize
+    if not fp8_comm:
+        return running_sum_and_recv_buf + packed * itemsize  # + landing buffer
+    fp8_send_and_recv = 2 * packed
+    scale_send_and_recv = 2 * num_devices * num_scale_slots * SCALE_LANE * 4
+    return running_sum_and_recv_buf + fp8_send_and_recv + scale_send_and_recv
 
 
 def _packed_seq_len(local_seq_len):
@@ -84,6 +91,9 @@ def _plan_work_scratch(
     local_seq_len,
     hidden_dim_size,
     itemsize,
+    fp8_comm,
+    num_devices,
+    num_scale_slots,
     num_micro_batches,
     vmem_frac,
 ):
@@ -95,7 +105,9 @@ def _plan_work_scratch(
     """
     capacity = pltpu.get_tpu_info().vmem_capacity_bytes
     operand = local_seq_len * hidden_dim_size * itemsize
-    work = _work_set_bytes(local_seq_len, hidden_dim_size, itemsize)
+    work = _work_set_bytes(
+        local_seq_len, hidden_dim_size, itemsize, fp8_comm, num_devices, num_scale_slots
+    )
     scoped = _scoped_need(operand, num_micro_batches)
     need = scoped + work
     if need + operand > capacity * _VMEM_TOTAL_SAFETY:
@@ -137,7 +149,10 @@ def hierarchical_reduce_scatter_local(
     num_devices: int,
     num_micro_batches: int | None = None,
     axis_name: str | tuple[str, ...] = "x",
+    fp8_comm: bool = False,
+    fp8_static_scale: float | None = None,
 ) -> jax.Array:
+    """`fp8_static_scale` None scales each chunk dynamically."""
     num_chips = num_devices // 2
     num_hcube_dims = int(math.log2(num_chips))
     local_seq_len, hidden_dim_size = local_x.shape
@@ -162,14 +177,21 @@ def hierarchical_reduce_scatter_local(
             local_seq_len,
             hidden_dim_size,
             local_x.dtype.itemsize,
+            fp8_comm,
             num_devices=num_devices,
         )
 
+    seq_chunk_size = local_seq_len // num_devices
     vmem_frac = _pick_scoped_claim(
         local_seq_len, hidden_dim_size, local_x.dtype.itemsize, num_micro_batches
     )
-
-    seq_chunk_size = local_seq_len // num_devices
+    num_scale_slots = max(
+        1,
+        num_hcube_dims
+        * num_micro_batches
+        * num_hcube_dims
+        * (1 << max(0, num_hcube_dims - 1)),
+    )
 
     out_shape = jax.ShapeDtypeStruct((seq_chunk_size, hidden_dim_size), local_x.dtype)
     packed_seq_len = _packed_seq_len(local_seq_len)
@@ -181,6 +203,9 @@ def hierarchical_reduce_scatter_local(
         local_seq_len,
         hidden_dim_size,
         local_x.dtype.itemsize,
+        fp8_comm,
+        num_devices,
+        num_scale_slots,
         num_micro_batches,
         vmem_frac,
     )
@@ -192,11 +217,21 @@ def hierarchical_reduce_scatter_local(
     out_shapes = [out_shape]
     out_specs = [pl.BlockSpec(memory_space=pl.ANY)]
     work_scratch = []
-    for _ in range(_NUM_WORK_BUFFERS):
+    # In hier_rs_kernel's parameter order.
+    work_buffers = [work_buffer_shape, work_buffer_shape]
+    if fp8_comm:
+        fp8_shape = jax.ShapeDtypeStruct(work_buffer_shape.shape, jnp.float8_e4m3fn)
+        scale_shape = jax.ShapeDtypeStruct(
+            (num_devices, num_scale_slots * SCALE_LANE), jnp.float32
+        )
+        work_buffers += [fp8_shape, fp8_shape, scale_shape, scale_shape]
+    else:
+        work_buffers.append(work_buffer_shape)
+    for shape in work_buffers:
         if work_set_in_vmem:
-            work_scratch.append(pltpu.VMEM(work_buffer_shape.shape, local_x.dtype))
+            work_scratch.append(pltpu.VMEM(shape.shape, shape.dtype))
         else:
-            out_shapes.append(work_buffer_shape)
+            out_shapes.append(shape)
             out_specs.append(pl.BlockSpec(memory_space=pl.ANY))
 
     config = Config(
@@ -204,6 +239,8 @@ def hierarchical_reduce_scatter_local(
         hidden_dim_size=hidden_dim_size,
         local_seq_len=local_seq_len,
         dtype=local_x.dtype,
+        fp8_comm=fp8_comm,
+        fp8_static_scale=fp8_static_scale,
         _num_micro_batches=num_micro_batches,
     )
 
@@ -223,6 +260,7 @@ def hierarchical_reduce_scatter_local(
                 num_chips,
                 num_hcube_dims,
                 num_micro_batches,
+                fp8_comm=fp8_comm,
             )
         ),
         grid=(1,),
@@ -233,10 +271,12 @@ def hierarchical_reduce_scatter_local(
             hier_rs_kernel,
             config=config,
             axis_name=axis_name,
+            fp8_comm=fp8_comm,
+            fp8_static_scale=fp8_static_scale,
         ),
         out_shape=tuple(out_shapes),
         grid_spec=grid_spec,
-        name=f"hier_rs_kernel.mb{num_micro_batches}",
+        name=f"hier_rs_kernel.mb{num_micro_batches}{'_fp8' if fp8_comm else ''}",
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=int(pltpu.get_tpu_info().vmem_capacity_bytes * vmem_frac),
             disable_bounds_checks=True,
