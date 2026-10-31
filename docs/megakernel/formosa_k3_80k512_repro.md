@@ -173,6 +173,16 @@ lm_eval --tasks mmlu_pro --seed "0,1234,None,1234" --log_samples --limit 100 \
   --gen_kwargs '{"chat_template_kwargs": {"thinking": false}}'
 ```
 
+## Variant: fused EP8/TP4 prefill MoE (`rishabhmanoj/k3-formosa-1030-fused` @ `079b502d6`)
+
+The same recipe with the fused prefill-MoE kernel re-enabled for EP8 (one
+extra commit on top of `f43847168`) measures `+1.9 %` to `+3.2 %` at every
+concurrency — `810 / 932 / 1,007 / 1,088 / 1,121 / 1,151 / 1,152 tok/s/chip`
+for `c = 1 … 64` — with GSM8K `96.59 %` and MMLU-Pro `84.07 %` on the same
+server. It compiles different prefill windows (export key `moe-fused`), so the
+first boot is ~25 min. It has not yet had the independent re-measurement the
+numbers above had.
+
 ## What is in this branch relative to `dev/k3-aggregate`
 
 - `KimiAggregate` passes `tp_rank=self.decoder.rank` to the prefiller so prefill
