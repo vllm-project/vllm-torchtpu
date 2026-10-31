@@ -14,6 +14,7 @@
 """Qwen dispatch preserves fallback paths outside adaptive prefill's envelope."""
 
 import functools
+import math
 from dataclasses import replace
 
 import jax
@@ -29,6 +30,9 @@ from vllm_torchtpu.kernels.qwen4_exp import (
 )
 from vllm_torchtpu.kernels.sparse_gqa_decode import decode
 from vllm_torchtpu.kernels.sparse_gqa_prefill import adaptive
+from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import (
+    SC_GATHER_MAX_CACHE_BYTES,
+)
 
 
 @pytest.mark.parametrize("fp8", [False, True])
@@ -51,14 +55,18 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
     packing = 4 if fp8 else 2
     tokens = 1 if case == "decode" else 8448 if case == "tail" else 256
     page = 128 if case == "page" else 1664
-    pages = 20000 if case == "cache" else 79
+    # "cache" is oversized for SparseCore's 16 GiB per-tensor cap and must
+    # take the block-sparse TC path instead of failing XLA compilation.
+    cache_page = (page, 4 // packing, packing, 256)
+    page_bytes = math.prod(cache_page) * jnp.dtype(dtype).itemsize
+    pages = SC_GATHER_MAX_CACHE_BYTES // page_bytes + 1 if case == "cache" else 79
     shapes = [
         ((tokens, 24, 256), jnp.bfloat16),
         ((tokens, 24, 256), jnp.bfloat16),
         ((tokens, 512), jnp.int32),
         ((tokens,), jnp.int32),
         ((tokens, 79), jnp.int32),
-        ((pages, page, 4 // packing, packing, 256), dtype),
+        ((pages, *cache_page), dtype),
         (((9,) if case == "padded" else (3,) if case == "slots" else (2,)), jnp.int32),
     ]
     args: list[jax.Array | jax.ShapeDtypeStruct] = [
@@ -106,7 +114,7 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
     )
     expected = (
         "adaptive"
-        if case in ("supported", "slots", "tail", "padded", "page", "cache")
+        if case in ("supported", "slots", "tail", "padded", "page")
         else "fused_decode"
         if case == "decode"
         else "prefill"
