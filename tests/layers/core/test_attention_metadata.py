@@ -15,6 +15,7 @@
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
@@ -611,6 +612,125 @@ class TestAttentionMetadataBuilderPlumbing:
             if b.mamba_state_indices is not None:
                 assert torch.equal(a.mamba_state_indices, b.mamba_state_indices)
                 assert torch.equal(a.mamba_ckpt_indices, b.mamba_ckpt_indices)
+
+    @patch.dict(
+        os.environ,
+        {
+            "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1",
+            "VLLM_TPU_BLOCK_TABLE_PACK_DELTA": "1",
+        },
+    )
+    def test_delta_pack_recopies_only_changed_tables(self):
+        """PACK_DELTA: after a mutation only the changed table is re-read, and
+        the staged tables still match the CPU tables; a new window re-packs
+        everything."""
+        from vllm_torchtpu.layers.core import attention_metadata as am
+
+        runner = self._make_runner_mock(num_groups=2)
+        runner._block_table_stage_cpu = None
+        tables = runner.input_batch.block_table
+        for bt in tables:
+            bt._tpu_version = 0
+            bt.get_numpy_array.return_value = bt.get_cpu_tensor.return_value.numpy()
+        builders = [
+            self._make_builder(runner, kv_cache_group_id=gid) for gid in range(2)
+        ]
+        self._make_attn_groups(runner, builders)
+
+        def walk(num_reqs=2):
+            c = AttentionMetadataBuilderContext(
+                num_reqs=num_reqs,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            runner._attn_metadata_builder_ctx = c
+            stage_block_table_uploads(runner, c, 4)
+            for gid, bt in enumerate(tables):
+                want = torch.zeros((4, 4), dtype=torch.int32)
+                want[:num_reqs] = bt.get_cpu_tensor.return_value[:num_reqs]
+                assert torch.equal(c.staged_block_tables[gid], want.reshape(-1))
+            return c
+
+        walk()
+        reads = [bt.get_numpy_array.call_count for bt in tables]
+        am._BLOCK_TABLE_VERSION[0] += 1
+        tables[1]._tpu_version = am._BLOCK_TABLE_VERSION[0]
+        tables[1].get_cpu_tensor.return_value[1, 2] = 999
+        walk()
+        assert tables[0].get_numpy_array.call_count == reads[0]
+        assert tables[1].get_numpy_array.call_count == reads[1] + 1
+        walk(num_reqs=1)  # new window: full re-pack
+        assert tables[0].get_numpy_array.call_count == reads[0] + 1
+
+    @pytest.mark.parametrize("unified", [False, True])
+    def test_fast_staged_build_matches_builder_walk(self, unified):
+        """VLLM_TPU_FAST_METADATA_BUILD: the inlined staged walk returns the
+        same metadata per layer, and the same unified-pool state list, as one
+        build() call per group."""
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
+        runner._unified_kv_layout = unified
+        runner._block_table_stage_cpu = None
+        attn = self._make_builder(runner, kv_cache_group_id=0)
+        mambas = [
+            self._make_mamba_builder(runner, kv_cache_group_id=gid) for gid in (1, 2)
+        ]
+        groups = self._make_attn_groups(runner, [attn] + mambas)
+        for i, (group,) in enumerate(groups):
+            group.layer_names = [f"layer.{i}.a", f"layer.{i}.b"]
+
+        def ctx():
+            c = AttentionMetadataBuilderContext(
+                num_reqs=4,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.tensor([0, 17, 33, 49], dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                mamba_state_indices=None if unified else torch.arange(4),
+                mamba_slot_read_offsets=torch.zeros(8, dtype=torch.int32),
+                mamba_ckpt_window=3 if unified else 1,
+                mamba_request_distribution=torch.tensor([4, 4, 4]),
+                unified_mamba_state_indices=[] if unified else None,
+            )
+            runner._attn_metadata_builder_ctx = c
+            stage_block_table_uploads(runner, c, 4)
+            return c
+
+        c_ref = ctx()
+        ref = {}
+        for (group,) in groups:
+            built = group.metadata_builders[0].build(
+                common_prefix_len=0, common_attn_metadata=self._make_cm(4)
+            )
+            for name in group.layer_names:
+                ref[name] = built
+        c_fast = ctx()
+        fast = TPUModelRunner._build_attention_metadata_staged(runner, c_fast)
+        assert fast is not None and fast.keys() == ref.keys()
+        for name in ref:
+            a, b = fast[name], ref[name]
+            for f in (
+                "input_positions", "block_tables", "seq_lens", "query_start_loc",
+                "request_distribution", "mamba_state_indices",
+                "mamba_slot_read_offsets", "mamba_ckpt_indices",
+                "mamba_request_distribution",
+            ):
+                x, y = getattr(a, f), getattr(b, f)
+                assert (x is None) == (y is None), (name, f)
+                if x is not None:
+                    assert torch.equal(x, y), (name, f)
+            assert a.sequence_layout_kind == b.sequence_layout_kind
+        if unified:
+            assert len(c_fast.unified_mamba_state_indices) == 2
+            for x, y in zip(
+                c_fast.unified_mamba_state_indices, c_ref.unified_mamba_state_indices
+            ):
+                assert torch.equal(x, y)
 
     def test_block_table_mutations_bump_the_version(self):
         import numpy as np

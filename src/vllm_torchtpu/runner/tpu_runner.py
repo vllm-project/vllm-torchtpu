@@ -358,7 +358,8 @@ def _verify_fused_impl(
     max_draft_tokens: int,
     synthetic_mode: bool,
     topk_candidates: int,
-) -> torch.Tensor:
+    num_reqs: torch.Tensor | None = None,
+):
     """Non-greedy spec verify of one chunk as one program
     (VLLM_TPU_VERIFY_FUSED): the bonus/target logit gathers, the bonus-token
     sample, the per-position sampling-parameter gathers and the rejection
@@ -370,7 +371,7 @@ def _verify_fused_impl(
     bonus_token_ids = _sample_from_logits_impl(
         bonus_logits, temperatures, bonus_u, top_k, top_p, topk_candidates
     ).view(-1)
-    return _random_rejection_sample_impl(
+    next_tokens = _random_rejection_sample_impl(
         draft_token_ids,
         target_logits,
         draft_lengths,
@@ -387,6 +388,14 @@ def _verify_fused_impl(
         synthetic_mode,
         topk_candidates,
     )
+    if num_reqs is None:
+        return next_tokens
+    # Per-row read offsets (`_update_read_offsets_impl` before its group
+    # pad/scatter): rows past num_reqs take 0.
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    valid = torch.arange(next_tokens.shape[0], device=next_tokens.device) < num_reqs
+    row_offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0)
+    return next_tokens, row_offsets
 
 
 # Strip any dynamic-dim marks a caller's tensor carries (see eagle3).
@@ -510,6 +519,57 @@ def _substitute_placeholder_token(
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
     return input_ids
+
+
+# VLLM_TPU_SUBST_STATIC_ARGS: the input ids reaching the async substitution can
+# carry the forward's dynamic-dim stamp, so the same shape compiled a second
+# time mid-run (~10 live compiles per run, ~70 ms each); strip it.
+_substitute_placeholder_token_static = _static_shape_args(_substitute_placeholder_token)
+
+
+def _subtract_num_rejected_tokens_compiled(*args):
+    """VLLM_TPU_SUBTRACT_REJECTED_COMPILED: the async-spec rejected-count
+    correction as one program instead of ~10 eager dispatches per step."""
+    global _subtract_num_rejected_tokens_fn
+    if _subtract_num_rejected_tokens_fn is None:
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            subtract_num_rejected_tokens,
+        )
+
+        _subtract_num_rejected_tokens_fn = _static_shape_args(
+            torch.compile(
+                subtract_num_rejected_tokens,
+                backend="tpu",
+                fullgraph=True,
+                dynamic=False,
+            )
+        )
+    return _subtract_num_rejected_tokens_fn(*args)
+
+
+_subtract_num_rejected_tokens_fn = None
+
+
+def _spec_tail(next_tokens, drafts, draft_lengths, rows, num_reqs, bound):
+    """One async-spec step's substitution source, padded to `bound`, and its
+    per-request rejected count: `assemble_spec_next_tokens`,
+    `compute_num_rejected`, the row fits and the source pad in one function."""
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        assemble_spec_next_tokens,
+        compute_num_rejected,
+    )
+    from vllm_torchtpu.spec_decode.utils import fit_rows
+
+    src = assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows), num_reqs)
+    num_rejected = compute_num_rejected(next_tokens, fit_rows(draft_lengths, rows))
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    return src, num_rejected
+
+
+_spec_tail_compiled = _static_shape_args(
+    torch.compile(_spec_tail, backend="tpu", fullgraph=True, dynamic=False)
+)
 
 
 logger = init_logger(__name__)
@@ -1410,7 +1470,10 @@ class TPUModelRunner(GPUModelRunner):
         self._verify_fused_checks_left = envs.VLLM_TPU_VERIFY_FUSED_CHECK
         self._verify_fused_checks_done = 0
         self._verify_fused_mismatches: torch.Tensor | None = None
+        self._verify_fused_ro_mismatches: torch.Tensor | None = None
         self._num_reqs_device: dict[int, torch.Tensor] = {}
+        self._fused_read_offsets: tuple = (None, 0)
+        self._fused_read_offsets_applied = False
         # Drafting and verification happen where sampling happens, on the
         # last pipeline stage; the other stages keep the config for the KV
         # cache spec and the scheduler, and nothing else.
@@ -1745,6 +1808,14 @@ class TPUModelRunner(GPUModelRunner):
             # dummy runs); see `stage_block_table_uploads`.
             stage_block_table_uploads(self, ctx, effective_num_reqs_padded)
 
+        if (
+            envs.VLLM_TPU_FAST_METADATA_BUILD
+            and ctx.staged_block_tables is not None
+            and ctx.position_ids_override is None
+        ):
+            fast = self._build_attention_metadata_staged(ctx)
+            if fast is not None:
+                return fast, None
         common = SimpleNamespace(num_reqs=effective_num_reqs_padded)
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
         for group_list in self.attn_groups:
@@ -1758,6 +1829,72 @@ class TPUModelRunner(GPUModelRunner):
                 for layer_name in group.layer_names:
                     per_layer_attn_metadata[layer_name] = built
         return per_layer_attn_metadata, None
+
+    def _build_attention_metadata_staged(self, ctx):
+        """VLLM_TPU_FAST_METADATA_BUILD: the group walk for a staged chunk with
+        every group's `build()` inlined: the same metadata objects (staged
+        table, shared step tensors, the walk program's mamba indices), without
+        59 builder calls' dispatch and branching per step. None when a group
+        needs `build()`'s per-group fallback (no staged table or mamba
+        products), so the caller runs the ordinary walk."""
+        plan = self.__dict__.get("_fast_metadata_plan")
+        if plan is None or plan[0] is not self.attn_groups:
+            groups = []
+            for group_list in self.attn_groups:
+                for group in group_list:
+                    builder = group.metadata_builders[0]
+                    groups.append(
+                        (
+                            builder.kv_cache_group_id,
+                            builder.is_mamba_group,
+                            tuple(group.layer_names),
+                        )
+                    )
+            plan = self._fast_metadata_plan = (self.attn_groups, groups)
+        staged = ctx.staged_block_tables
+        compact = ctx.mamba_state_indices
+        unified = compact is None and self._unified_kv_layout
+        products = ctx.staged_mamba_products
+        for gid, is_mamba, _ in plan[1]:
+            if gid not in staged or (
+                is_mamba and unified and (products is None or gid not in products)
+            ):
+                return None
+        descriptor = ctx.sequence_layout_descriptor
+        shared = dict(
+            input_positions=self.position_ids,
+            seq_lens=ctx.seq_lens,
+            query_start_loc=ctx.query_start_loc,
+            request_distribution=ctx.request_distribution,
+            sequence_layout_kind=descriptor.kind.value,
+            sequence_layout_protocol=descriptor.protocol,
+            sequence_layout_version=descriptor.version,
+        )
+        per_layer: dict[str, AttentionMetadata] = {}
+        for gid, is_mamba, layer_names in plan[1]:
+            if is_mamba:
+                ckpt = None
+                if compact is not None:
+                    state = compact
+                elif unified:
+                    state, ckpt = products[gid]
+                else:
+                    state = None
+                if unified and ctx.unified_mamba_state_indices is not None:
+                    ctx.unified_mamba_state_indices.append(state)
+                built = AttentionMetadata(
+                    block_tables=staged[gid],
+                    mamba_state_indices=state,
+                    mamba_slot_read_offsets=ctx.mamba_slot_read_offsets,
+                    mamba_ckpt_indices=ckpt,
+                    mamba_request_distribution=ctx.mamba_request_distribution,
+                    **shared,
+                )
+            else:
+                built = AttentionMetadata(block_tables=staged[gid], **shared)
+            for layer_name in layer_names:
+                per_layer[layer_name] = built
+        return per_layer
 
     def build_attention_metadata_for_layers(
         self,
@@ -2532,7 +2669,12 @@ class TPUModelRunner(GPUModelRunner):
                 padded_token_in_tpu_pre_next_tokens_indices
             ).to(self.device, non_blocking=True)
 
-        return _substitute_placeholder_token(
+        substitute = (
+            _substitute_placeholder_token_static
+            if envs.VLLM_TPU_SUBST_STATIC_ARGS
+            else _substitute_placeholder_token
+        )
+        return substitute(
             input_ids,
             cur_input_indices,
             pre_next_tokens_indices,
@@ -2921,6 +3063,32 @@ class TPUModelRunner(GPUModelRunner):
         # Bucketed drafters keep the sampler's padded rows (an exact-count slice
         # would compile a program per request count); others keep exact rows.
         bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        if (
+            envs.VLLM_TPU_SPEC_TAIL_COMPILED
+            and len(next_tokens_per_chunk) == 1
+            and state.spec_decode_metadata_list[0] is not None
+        ):
+            # Steady decode (one chunk, drafts verified): the source and the
+            # rejected count from one program, the source already padded to
+            # the bound `sample_tokens` would pad it to.
+            nt_chunk = next_tokens_per_chunk[0]
+            num_reqs = state.num_reqs_list[0]
+            md = state.spec_decode_metadata_list[0]
+            assert self.speculative_config is not None
+            src, num_rejected = _spec_tail_compiled(
+                nt_chunk,
+                drafts_per_chunk[0],
+                md.draft_lengths,
+                nt_chunk.shape[0] if bucketed else num_reqs,
+                None if bucketed else num_reqs,
+                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens),
+            )
+            return (
+                [src],
+                {r: r for r in range(num_reqs)},
+                num_rejected,
+                {r: int(md.draft_lengths_cpu[r]) for r in range(num_reqs)},
+            )
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
@@ -3288,7 +3456,21 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_np[i] = pos
                     pos_idx_np[acc : acc + n_sched] = pos
                 acc += n_sched
-            seq_lens, self.position_ids = subtract_num_rejected_tokens(
+            # The compiled program only for shapes warmup compiled (steady
+            # decode); prefill/mixed steps keep the eager ops rather than
+            # compiling mid-serve.
+            subtract = (
+                _subtract_num_rejected_tokens_compiled
+                if envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
+                and (
+                    self._pre_async_results.spec_decode_num_rejected_tokens.shape[0],
+                    self.position_ids.shape[-1],
+                    seq_lens.shape[0],
+                )
+                in self.__dict__.get("_subtract_compiled_shapes", ())
+                else subtract_num_rejected_tokens
+            )
+            seq_lens, self.position_ids = subtract(
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
@@ -4024,6 +4206,7 @@ class TPUModelRunner(GPUModelRunner):
                     spec_decode_metadata.upload_deferred_draft_token_ids(self.device)
                 )
             draft_input_ids_src = input_ids
+            host_phases.mark("extract_drafts")
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
             # covers requests [start_index, end_index) in req order). Offsets
@@ -4047,6 +4230,7 @@ class TPUModelRunner(GPUModelRunner):
                     chunk_embeds = []
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
+            host_phases.mark("mm_slice")
             self._record_input_staging_fence()
             if self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(
@@ -4070,6 +4254,7 @@ class TPUModelRunner(GPUModelRunner):
                 intermediate_tensors = self._pp_wave.start_forward(num_tokens_padded)
                 self._pp_take_topk_indices(intermediate_tensors, num_tokens_padded)
 
+            host_phases.mark("model_inputs_padding")
             trace_kwargs: dict[str, Any] = {}
             if TraceAnnotation.is_enabled():
                 trace_kwargs.update(
@@ -4083,6 +4268,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
 
+            host_phases.mark("trace_kwargs")
             if self.phase_based_profiler and batch_composition_stats is not None:
                 stats_map = {
                     "num_prefill_tokens": "num_prefill_tokens",
@@ -4796,7 +4982,54 @@ class TPUModelRunner(GPUModelRunner):
             self.rejection_sampler.synthetic_mode,
             topk_candidates,
         )
-        out = _verify_fused_compiled(*args)
+        ro_groups, ro_num_reqs = self._fused_read_offsets
+        fold_ro = (
+            envs.VLLM_TPU_VERIFY_FUSED_READ_OFFSETS
+            and self.mamba_slot_read_offsets is not None
+            and bool(ro_groups)
+            and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
+            and self.mamba_slot_read_offsets.device.type == "tpu"
+        )
+        if fold_ro:
+            out, row_offsets = _verify_fused_compiled(
+                *args, self._num_reqs_tensor(ro_num_reqs)
+            )
+            # Pad/truncate to the slot groups' width and scatter eagerly, instead
+            # of a compiled program that mutates the slot buffer (and its aot
+            # mutation epilogue). Padded rows' slots are the null block.
+            groups = list(ro_groups)
+            width = groups[0].shape[0]
+            rows = row_offsets.shape[0]
+            vals = (
+                row_offsets[:width]
+                if rows >= width
+                else torch.nn.functional.pad(row_offsets, (0, width - rows))
+            ).to(self.mamba_slot_read_offsets.dtype)
+            if len(groups) > 1:
+                idx = torch.cat(groups, dim=0).long()
+                vals = vals.repeat(len(groups))
+            else:
+                idx = groups[0].long()
+            ref_buf = (
+                self.mamba_slot_read_offsets.clone()
+                if self._verify_fused_checks_left > 0
+                else None
+            )
+            self.mamba_slot_read_offsets.index_put_((idx,), vals)
+            self._fused_read_offsets_applied = True
+            if ref_buf is not None:
+                # Check: the separate program's scatter on a copy must match.
+                _update_read_offsets_impl(
+                    ref_buf, groups, out, self._num_reqs_tensor(ro_num_reqs)
+                )
+                ro_mism = (ref_buf != self.mamba_slot_read_offsets).sum()
+                self._verify_fused_ro_mismatches = (
+                    ro_mism
+                    if self._verify_fused_ro_mismatches is None
+                    else self._verify_fused_ro_mismatches + ro_mism
+                )
+        else:
+            out = _verify_fused_compiled(*args)
         if self._verify_fused_checks_left > 0:
             self._check_verify_fused(out, args)
         return out
@@ -4878,13 +5111,19 @@ class TPUModelRunner(GPUModelRunner):
             or self._verify_fused_checks_left == 0
         ):
             clean, caught = self._verify_fused_mismatches.tolist()
+            ro = (
+                -1
+                if self._verify_fused_ro_mismatches is None
+                else int(self._verify_fused_ro_mismatches.item())
+            )
             logger.info(
                 "VERIFY_FUSED_CHECK checks=%d clean_mismatched_positions=%d "
-                "faulted_checks=%d faulted_caught=%d",
+                "faulted_checks=%d faulted_caught=%d read_offset_mismatches=%d",
                 self._verify_fused_checks_done,
                 clean,
                 min(self._verify_fused_checks_done, envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT),
                 caught,
+                ro,
             )
 
     @_pp_step
@@ -4967,6 +5206,8 @@ class TPUModelRunner(GPUModelRunner):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
                     host_phases.mark("sample_setup")
+                    self._fused_read_offsets = (mamba_indices, num_reqs)
+                    self._fused_read_offsets_applied = False
                     with self._stage_timing.stage("sample"):
                         next_tokens = self._sample_spec_verify_chunk(
                             logits,
@@ -4983,9 +5224,10 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
-                    )
+                    if not self._fused_read_offsets_applied:
+                        self._update_mamba_slot_read_offsets(
+                            mamba_indices, next_tokens, num_reqs
+                        )
                     host_phases.mark("spec_verify_and_read_offsets")
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
@@ -6788,7 +7030,36 @@ class TPUModelRunner(GPUModelRunner):
         candidates = [0]
         if blocks := self._topk_candidate_blocks():
             candidates.append(blocks)
+        # With the read-offset fold on, only the num_reqs variant runs.
+        fold_ro = bool(
+            envs.VLLM_TPU_VERIFY_FUSED_READ_OFFSETS
+            and self.mamba_slot_read_offsets is not None
+        )
         for topk_candidates in candidates:
+            if fold_ro:
+                synchronize_tensors(
+                    _verify_fused_compiled(
+                        dummy_logits,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        temps,
+                        top_k,
+                        top_p,
+                        bonus_u,
+                        warm_accept_u,
+                        warm_recover_u,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                        self.rejection_sampler.synthetic_conditional_rates,
+                        self.speculative_config.num_speculative_tokens,
+                        self.rejection_sampler.synthetic_mode,
+                        topk_candidates,
+                        self._num_reqs_tensor(1),
+                    )
+                )
+                continue
             out = _verify_fused_compiled(
                 dummy_logits,
                 bonus_logits_indices,
@@ -6946,6 +7217,8 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_sampling_subgraphs()
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
+            self._precompile_subtract_rejected()
+            self._precompile_spec_tail()
             precompile_inputs = getattr(
                 self.model_adapter, "precompile_fused_inputs", None
             )
@@ -7267,6 +7540,79 @@ class TPUModelRunner(GPUModelRunner):
                 n *= 4
             for raws in raw_sets.values():
                 synchronize_tensors(raws)
+
+    def _precompile_subtract_rejected(self) -> None:
+        """VLLM_TPU_SUBTRACT_REJECTED_COMPILED: compile the rejected-count
+        correction for steady spec decode at every request count (exact and
+        bucketed source rows), this step's request slots, and the token bucket
+        that holds `rows * (1 + K)` verify tokens. Other shapes (a prefill
+        joining) stay on the eager ops; see `_subtract_compiled_shapes`."""
+        if not (
+            envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
+            and self.speculative_config
+            and self.scheduler_config.async_scheduling
+        ):
+            return
+        width = 1 + self.speculative_config.num_speculative_tokens
+        targets = {
+            n
+            for n in (self.num_reqs_max_model_len, self.num_reqs_most_model_len)
+            if n
+        }
+        shapes: set[tuple[int, int, int]] = set()
+        for n in range(1, self.max_num_reqs + 1):
+            if n * width > self.num_tokens_paddings[-1]:
+                break
+            tokens = _get_padded_token_len(self.num_tokens_paddings, n * width)
+            for rows in {n, _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs)}:
+                for target in targets:
+                    shapes.add((rows, tokens, target))
+        with self._precompile_timed("async-spec rejected-count correction"):
+            for rows, tokens, target in sorted(shapes):
+                synchronize_tensors(
+                    _subtract_num_rejected_tokens_compiled(
+                        torch.zeros(target, dtype=torch.int32).to(self.device),
+                        torch.zeros(tokens, dtype=torch.int32).to(self.device),
+                        torch.zeros(rows, dtype=torch.int32).to(self.device),
+                        torch.full((target,), -1, dtype=torch.int32).to(self.device),
+                        torch.full((tokens,), -1, dtype=torch.int32).to(self.device),
+                    )
+                )
+        self._subtract_compiled_shapes = frozenset(shapes)
+
+    def _precompile_spec_tail(self) -> None:
+        """VLLM_TPU_SPEC_TAIL_COMPILED: compile the one-chunk spec tail for
+        every live request count (exact-count drafts, the sampler's padded
+        rows), so serving never compiles it."""
+        if not (
+            envs.VLLM_TPU_SPEC_TAIL_COMPILED
+            and self.speculative_config
+            and self.scheduler_config.async_scheduling
+        ):
+            return
+        k = self.speculative_config.num_speculative_tokens
+        bound = self.max_num_reqs * (1 + k)
+        bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        with self._precompile_timed("async-spec substitution tail"):
+            for num_reqs in range(1, self.max_num_reqs + 1):
+                rows = _get_padded_num_reqs_with_upper_limit(num_reqs, self.max_num_reqs)
+                next_tokens = torch.full((rows, k + 1), -1, dtype=torch.int32).to(
+                    self.device
+                )
+                drafts = torch.zeros(
+                    (rows if bucketed else num_reqs, k), dtype=torch.int32
+                ).to(self.device)
+                draft_lengths = torch.zeros(rows, dtype=torch.int32).to(self.device)
+                synchronize_tensors(
+                    _spec_tail_compiled(
+                        next_tokens,
+                        drafts,
+                        draft_lengths,
+                        rows if bucketed else num_reqs,
+                        None if bucketed else num_reqs,
+                        bound,
+                    )
+                )
 
     def _precompile_mamba_rollback_helpers(self) -> None:
         """Warm the compiled rollback scatters at every bucket length.

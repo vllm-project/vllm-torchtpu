@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QWEN4_NGRAM_WINDOW: str = ""
     VLLM_TPU_QWEN4_FUSED_PREP: bool = False
     VLLM_TPU_QWEN4_FUSED_PREP_CHECK: str = ""
+    VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFIX_SLICE: bool = False
     VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT: bool = False
@@ -110,6 +111,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
+    VLLM_TPU_QSA_MTP_KV_DCP: bool = False
+    VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -247,15 +250,26 @@ if TYPE_CHECKING:
     VLLM_TPU_SAMPLING_PARAMS_REUSE: bool = False
     VLLM_TPU_PY_SAMPLER_S: float = 0.0
     VLLM_TPU_STAGE_ENTRIES_CACHE: bool = False
+    VLLM_TPU_SUBST_STATIC_ARGS: bool = False
+    VLLM_TPU_SUBTRACT_REJECTED_COMPILED: bool = False
+    VLLM_TPU_SPEC_TAIL_COMPILED: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
     VLLM_TPU_DRAFT_SEED_FUSED: bool = False
+    VLLM_TPU_DRAFT_CARRY_FUSED: bool = False
+    VLLM_TPU_VERIFY_FUSED_READ_OFFSETS: bool = False
+    VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
+    VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
+    VLLM_TPU_BLOCK_TABLE_PACK_DELTA: bool = False
+    VLLM_TPU_TOKEN_PADDING_REUSE: bool = False
+    VLLM_TPU_FAST_METADATA_BUILD: bool = False
+    VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
     VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
@@ -607,6 +621,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QWEN4_FUSED_PREP_CHECK": lambda: os.getenv(
         "VLLM_TPU_QWEN4_FUSED_PREP_CHECK", ""
     ),
+    # The fused program returns the updated speculative record instead of
+    # mutating its inputs (no eager copy-back per record tensor after it).
+    "VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL": env_bool(
+        "VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL"
+    ),
     "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION": env_bool(
         "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"
     ),
@@ -722,6 +741,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.
     "VLLM_TPU_QSA_MAIN_KV_DCP": env_nonnegative_int("VLLM_TPU_QSA_MAIN_KV_DCP", 0),
+    # With VLLM_TPU_QSA_MAIN_KV_DCP: the MTP draft layers' main KV split the
+    # same way (otherwise the draft keeps whole pages).
+    "VLLM_TPU_QSA_MTP_KV_DCP": env_bool("VLLM_TPU_QSA_MTP_KV_DCP"),
+    # With VLLM_TPU_QSA_MAIN_KV_DCP and VLLM_TPU_QSA_MTP_KV_DCP: compressed keys
+    # split the same way; each rank scores its owned groups and the pair merges
+    # the local top-k lists into the exact global selection.
+    "VLLM_TPU_QSA_COMPRESSED_DCP": env_bool("VLLM_TPU_QSA_COMPRESSED_DCP"),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every
@@ -1527,6 +1553,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Keep the per-group (block table, width) list the staged metadata walk
     # builds, instead of re-walking every KV cache group each step.
     "VLLM_TPU_STAGE_ENTRIES_CACHE": env_bool("VLLM_TPU_STAGE_ENTRIES_CACHE"),
+    # Strip dynamic-dim stamps from the async token substitution's inputs so it
+    # does not recompile mid-run (tpu_runner._apply_async_token_substitution).
+    "VLLM_TPU_SUBST_STATIC_ARGS": env_bool("VLLM_TPU_SUBST_STATIC_ARGS"),
+    # Async spec decode: the per-step rejected-count correction of seq_lens and
+    # positions as one compiled program (precompiled per request bucket).
+    "VLLM_TPU_SUBTRACT_REJECTED_COMPILED": env_bool(
+        "VLLM_TPU_SUBTRACT_REJECTED_COMPILED"
+    ),
+    # Async spec decode, one chunk: the next step's substitution source and the
+    # rejected count (with their row fits and the source pad) as one program.
+    "VLLM_TPU_SPEC_TAIL_COMPILED": env_bool("VLLM_TPU_SPEC_TAIL_COMPILED"),
     # Dump all processes' stacks when no step starts for N s with live
     # requests (stall_watchdog.py; read directly there, registered here).
     "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
@@ -1542,6 +1579,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Async draft seed + input shift/scatter + gather pad as one program
     # (eagle3._async_seed_inputs_impl).
     "VLLM_TPU_DRAFT_SEED_FUSED": env_bool("VLLM_TPU_DRAFT_SEED_FUSED"),
+    # Row-selected draft step 0: position carry + first draft token as one
+    # program (eagle3._draft_rows_carry_and_token).
+    "VLLM_TPU_DRAFT_CARRY_FUSED": env_bool("VLLM_TPU_DRAFT_CARRY_FUSED"),
+    # With VLLM_TPU_VERIFY_FUSED: compute the mamba read offsets inside the
+    # fused verify program and apply them with one eager scatter.
+    "VLLM_TPU_VERIFY_FUSED_READ_OFFSETS": env_bool("VLLM_TPU_VERIFY_FUSED_READ_OFFSETS"),
+    # With VLLM_TPU_DRAFT_SEED_FUSED: the fused seed also emits step 0's
+    # draft_rows and the loop's padded rejected counts (no eager pads).
+    "VLLM_TPU_DRAFT_SEED_EXTRAS": env_bool("VLLM_TPU_DRAFT_SEED_EXTRAS"),
+    # Prefill-bootstrap draft seed scatter at the loop bucket width (a
+    # precompiled key) instead of the real request count (mid-serve compiles).
+    "VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD": env_bool("VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD"),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),
@@ -1569,6 +1618,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": env_bool(
         "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", default=False
     ),
+    # With UPLOAD_REUSE: re-pack only the block tables that changed since the
+    # previous pack of the same layout (per-table versions).
+    "VLLM_TPU_BLOCK_TABLE_PACK_DELTA": env_bool("VLLM_TPU_BLOCK_TABLE_PACK_DELTA"),
+    # Skip the token-padding mask's synchronous H2D when its rows are the same
+    # as the last write (layers/adapter/token_padding.py).
+    "VLLM_TPU_TOKEN_PADDING_REUSE": env_bool("VLLM_TPU_TOKEN_PADDING_REUSE"),
+    # Staged metadata walk: build every group's AttentionMetadata inline instead
+    # of one builder call per group (tpu_runner._build_attention_metadata_staged).
+    "VLLM_TPU_FAST_METADATA_BUILD": env_bool("VLLM_TPU_FAST_METADATA_BUILD"),
+    # Freshly AOT-compiled models skip the per-call Dynamo guard check when
+    # vLLM does not evaluate guards (as it already does for cached artifacts).
+    "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
     # Host-path pieces (q38f-int: default off, toggled per arm).
     # Record stage-timing device events only when a KV connector consumes them.
     "VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK": env_bool(
