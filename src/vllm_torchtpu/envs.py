@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
+    TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -660,8 +661,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
-    # one packed sort instead of three. The ragged (counting sort) path ignores it.
+    # one packed sort instead of three (up to 2,048 routed rows on non-ragged
+    # paths). Within that cap the counting sort takes precedence unless it
+    # declines (fewer routed rows than local experts + 1, or local experts >=
+    # 512) or TPU_MOE_COUNTING_SORT is off; above 2,048 rows on non-ragged
+    # paths three sorts run.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    # Derive the MoE routing positions and group sizes on non-ragged paths
+    # (EP one-hot permute and non-EP TP, up to 2,048 routed rows) from the MXU
+    # counting sort instead of comparison sorts. Off, those paths fall back to
+    # the packed single sort (TPU_MOE_SINGLE_SORT) or the three-sort form, as
+    # before the counting sort reached them; the ragged permute path keeps the
+    # counting sort either way. A stand-down knob in case a libtpu release
+    # miscompiles the rank contraction again.
+    "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT", True),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
