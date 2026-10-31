@@ -148,11 +148,13 @@ class Qwen4ExpAdapter:
         context_limit = (
             runner.max_model_len if use_max_model_len else runner.most_model_len
         )
-        columns = (
-            math.ceil(context_limit / self.block_size)
-            if num_blocks is None
-            else num_blocks
-        )
+        # The FA dummy table width follows this model's pooled page geometry
+        # (the same contract as Qwen4ExpPooledCache.dummy_metadata and the
+        # per-group AttentionMetadataBuilder). The runner's generic
+        # num_blocks is the first kv group's block-table width, which for
+        # this hybrid is the 1-slot GDN state table (layer 0 is
+        # linear_attention), not the FA page table.
+        columns = math.ceil(context_limit / self.block_size)
         if dp_lockstep:
             return self._idle_run(
                 num_tokens,
