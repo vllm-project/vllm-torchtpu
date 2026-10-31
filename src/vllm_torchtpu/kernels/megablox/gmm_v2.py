@@ -1043,30 +1043,212 @@ def fused_mlp_inner_kernel(
     lax.switch(m_end_local // cfgs1.tiles.bucket_base, branches)
 
 
+# Token-row DMAs started per iteration of the loop that fetches a gm tile.
+TOKEN_ROW_UNROLL = 8
+# Token rows one DMA wait covers before the last few, a multiple of 8.
+TOKEN_ROW_WAIT = 8
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenRows:
+    """Where gmm_v2_fused_mlp reads lhs rows past its head buffer.
+
+    Row r >= head_rows of the batch is row ``row_ids_ref[r]`` of the token
+    rows. bf16 rows sit in 32-bit words in pairs (row 2w in the low half of
+    word row w), so a token row arrives as the word row holding it, in
+    ``stage_ref``, and its half is picked out into the tile's lhs buffer.
+    """
+
+    row_ids_ref: jax.Array  # int32[size_m], SMEM
+    head_ref: jax.Array  # [head_rows // sublane, sublane, size_k], HBM
+    words_ref: jax.Array  # uint32[num_tokens // 2, size_k], HBM
+    lhs_bufs: jax.Array  # [2, tile_m // sublane, sublane, size_k], VMEM
+    stage_ref: jax.Array  # uint32[2, tile_m // 2, size_k]: even, odd tile rows
+    sems: jax.Array  # DMA[2]: head rows, token rows
+
+    @property
+    def head_rows(self) -> int:
+        return self.head_ref.shape[0] * self.head_ref.shape[1]
+
+    @property
+    def sublane(self) -> int:
+        return self.head_ref.shape[1]
+
+    def tile(self, metadata_ref: MetadataRef, gm_id: jax.Array):
+        """First sublane-block row, end, head blocks and first token row of
+        gm tile gm_id."""
+        m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+        m_offset = m_start - m_start % self.sublane
+        head_end = jnp.minimum(m_end, self.head_rows)
+        head_blocks = pl.cdiv(jnp.maximum(head_end - m_offset, 0), self.sublane)
+        return m_offset, m_end, head_blocks, jnp.maximum(m_start, self.head_rows)
+
+    def start(self, metadata_ref: MetadataRef, gm_id: jax.Array, slot: jax.Array):
+        """Starts the DMAs of gm tile gm_id's lhs rows into buffer slot."""
+        m_offset, m_end, head_blocks, first = self.tile(metadata_ref, gm_id)
+
+        @pl.when(head_blocks > 0)
+        def _():
+            pltpu.make_async_copy(
+                self.head_ref.at[pl.ds(m_offset // self.sublane, head_blocks)],
+                self.lhs_bufs.at[slot, pl.ds(0, head_blocks)],
+                self.sems.at[0],
+            ).start()
+
+        def issue(i, carry):
+            for u in range(TOKEN_ROW_UNROLL):
+                row = first + i * TOKEN_ROW_UNROLL + u
+
+                @pl.when(row < m_end)
+                def _():
+                    local = row - m_offset
+                    pltpu.make_async_copy(
+                        self.words_ref.at[self.row_ids_ref[row] // 2],
+                        self.stage_ref.at[local % 2, local // 2],
+                        self.sems.at[1],
+                    ).start()
+
+            return carry
+
+        steps = pl.cdiv(jnp.maximum(m_end - first, 0), TOKEN_ROW_UNROLL)
+        lax.fori_loop(0, steps, issue, 0)
+
+    def wait(self, metadata_ref: MetadataRef, gm_id: jax.Array, slot: jax.Array):
+        _, m_end, head_blocks, first = self.tile(metadata_ref, gm_id)
+
+        @pl.when(head_blocks > 0)
+        def _():
+            pltpu.make_async_copy(
+                self.head_ref.at[pl.ds(0, head_blocks)],
+                self.lhs_bufs.at[slot, pl.ds(0, head_blocks)],
+                self.sems.at[0],
+            ).wait()
+
+        # DMA semaphores count bytes, so a wait for n word rows covers any n.
+        def wait_rows(rows):
+            ref = self.stage_ref.at[0, pl.ds(0, rows)]
+
+            def body(i, carry):
+                pltpu.make_async_copy(ref, ref, self.sems.at[1]).wait()
+                return carry
+
+            return body
+
+        count = jnp.maximum(m_end - first, 0)
+        lax.fori_loop(0, count // TOKEN_ROW_WAIT, wait_rows(TOKEN_ROW_WAIT), 0)
+        lax.fori_loop(0, count % TOKEN_ROW_WAIT, wait_rows(1), 0)
+
+    def unpack(self, metadata_ref: MetadataRef, gm_id: jax.Array, slot: jax.Array):
+        """Writes gm tile gm_id's token rows into buffer slot, as bf16 words.
+
+        Works on whole sublane blocks: rows of a block outside the tile's
+        token rows get stale words, and the tile masks them out like any row
+        outside its group. The head rows end on a block boundary.
+        """
+        m_offset, m_end, _, first = self.tile(metadata_ref, gm_id)
+        lhs_words = self.lhs_bufs.at[slot].bitcast(jnp.uint32)
+        pairs = self.sublane // 2
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        size_k = lhs_words.shape[-1]
+        word_row = lax.broadcasted_iota(jnp.int32, (pairs, num_lanes), 0)
+
+        def block(b, carry):
+            row0 = m_offset + b * self.sublane
+
+            def shifts(parity: int) -> jax.Array:
+                shift = jnp.zeros((pairs, num_lanes), jnp.uint32)
+                for w in range(pairs):
+                    token = self.row_ids_ref[row0 + 2 * w + parity]
+                    half = (token % 2).astype(jnp.uint32) * 16
+                    shift = jnp.where(word_row == w, half, shift)
+                return shift
+
+            even_shift, odd_shift = shifts(0), shifts(1)
+            words = pl.ds(pl.multiple_of(b * pairs, pairs), pairs)
+            for c in range(0, size_k, num_lanes):
+                cols = pl.ds(c, num_lanes)
+                even = self.stage_ref[0, words, cols] >> even_shift
+                odd = self.stage_ref[1, words, cols] >> odd_shift
+                lhs_words[b, :, cols] = (even & 0xFFFF) | (odd << 16)
+            return carry
+
+        first_block = (first - m_offset) // self.sublane
+        end_block = jnp.where(
+            m_end > first, pl.cdiv(m_end - m_offset, self.sublane), first_block
+        )
+        lax.fori_loop(first_block, end_block, block, 0)
+
+
+def fused_mlp_token_rows_kernel(
+    tiled_rhs1_ref: RhsRef,
+    tiled_rhs2_ref: RhsRef,
+    tiled_out_ref: jax.Array,
+    partial_out_ref: jax.Array,
+    inter_ref: jax.Array,
+    metadata_ref: MetadataRef,
+    *,
+    rows: TokenRows,
+    num_gm: jax.Array,
+    cfgs1: GmmConfigs,
+    cfgs2: GmmConfigs,
+):
+    """fused_mlp_inner_kernel with its lhs tile fetched by TokenRows.
+
+    Tile gm_id's rows were started into buffer gm_id % 2 one step ahead; the
+    next tile's start once this one's token rows have left the stage.
+    """
+    gm_id = pl.program_id(1)
+    slot = gm_id % 2
+    rows.wait(metadata_ref, gm_id, slot)
+    rows.unpack(metadata_ref, gm_id, slot)
+
+    @pl.when(gm_id + 1 < num_gm)
+    def _():
+        rows.start(metadata_ref, gm_id + 1, 1 - slot)
+
+    fused_mlp_inner_kernel(
+        rows.lhs_bufs.at[slot],
+        tiled_rhs1_ref,
+        tiled_rhs2_ref,
+        tiled_out_ref,
+        partial_out_ref,
+        inter_ref,
+        metadata_ref,
+        cfgs1=cfgs1,
+        cfgs2=cfgs2,
+    )
+
+
 def fused_mlp_kernel_main(
     # Scalar prefetch
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
     group_offset_ref: jax.Array,  # int32[1]
-    # In
-    lhs_ref: jax.Array,  # [size_m, size_k]
-    rhs1_ref: WeightsRef,  # [size_group, size_k, 2 * size_inter]
-    rhs2_ref: WeightsRef,  # [size_group, size_inter, size_n]
-    # Out
-    out_ref: jax.Array,  # [size_m, size_n]
-    # Scratch memory
-    partial_out_ref: jax.Array,  # [size_lhs_sublane, size_n]
-    inter_ref: jax.Array,  # [tile_m, size_inter]
-    metadata_ref: MetadataRef,
-    *,
+    *refs,
     cfgs1: GmmConfigs,
     cfgs2: GmmConfigs,
+    token_rows: bool,
 ):
     """Entry point for the fused gate/up -> down kernel.
 
     One pipeline over the gm tiles streams each group's gate/up and down
     weights together. Rows outside every group are left unwritten, as gmm_v2
     leaves them with zero_initialize=False.
+
+    ``refs`` are, in order: the token row ids int32[size_m] (scalar prefetch,
+    with token_rows); lhs [size_m, size_k], or its first rows with
+    token_rows; the token rows [num_tokens, size_k] (with token_rows);
+    gate/up WeightsRef [size_group, size_k, 2 * size_inter] and down
+    WeightsRef [size_group, size_inter, size_n]; out_ref [size_m, size_n];
+    scratch partial_out_ref [size_lhs_sublane, size_n], inter_ref
+    [tile_m, size_inter] and metadata_ref, then with token_rows the lhs
+    buffers, the stage and two DMA semaphores of TokenRows.
     """
+    if token_rows:
+        row_ids_ref, lhs_ref, words_ref, *refs = refs
+    else:
+        lhs_ref, *refs = refs
+    rhs1_ref, rhs2_ref, out_ref, partial_out_ref, inter_ref, metadata_ref, *refs = refs
 
     num_gm = fill_metadata(
         lhs_group_sizes_ref,
@@ -1080,18 +1262,47 @@ def fused_mlp_kernel_main(
     rhs1_in, rhs1_spec_in = prepare_rhs(rhs1_ref, rhs1_spec, cfgs=cfgs1)
     rhs2_in, rhs2_spec_in = prepare_rhs(rhs2_ref, rhs2_spec, cfgs=cfgs2)
 
-    pipeline_fn = pltpu.emit_pipeline(
-        functools.partial(fused_mlp_inner_kernel, cfgs1=cfgs1, cfgs2=cfgs2),
-        grid=(1, num_gm, 1),
-        in_specs=(lhs_spec, rhs1_spec_in, rhs2_spec_in),
-        out_specs=out_spec,
-    )
-
     sublane = cfgs1.dims.size_lhs_sublane
     lhs_in = lhs_ref.reshape(-1, sublane, lhs_ref.shape[-1])
     out_in = out_ref.reshape(-1, sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, inter_ref, metadata_ref]
-    pipeline_fn(lhs_in, rhs1_in, rhs2_in, out_in, scratches=scratches)
+    if not token_rows:
+        pipeline_fn = pltpu.emit_pipeline(
+            functools.partial(fused_mlp_inner_kernel, cfgs1=cfgs1, cfgs2=cfgs2),
+            grid=(1, num_gm, 1),
+            in_specs=(lhs_spec, rhs1_spec_in, rhs2_spec_in),
+            out_specs=out_spec,
+        )
+        pipeline_fn(lhs_in, rhs1_in, rhs2_in, out_in, scratches=scratches)
+        return
+
+    lhs_bufs, stage_ref, sems = refs
+    rows = TokenRows(
+        row_ids_ref=row_ids_ref,
+        head_ref=lhs_in,
+        words_ref=words_ref.bitcast(jnp.uint32),
+        lhs_bufs=lhs_bufs,
+        stage_ref=stage_ref,
+        sems=sems,
+    )
+
+    @pl.when(num_gm > 0)
+    def _():
+        rows.start(metadata_ref, 0, 0)
+
+    pipeline_fn = pltpu.emit_pipeline(
+        functools.partial(
+            fused_mlp_token_rows_kernel,
+            rows=rows,
+            num_gm=num_gm,
+            cfgs1=cfgs1,
+            cfgs2=cfgs2,
+        ),
+        grid=(1, num_gm, 1),
+        in_specs=(rhs1_spec_in, rhs2_spec_in),
+        out_specs=out_spec,
+    )
+    pipeline_fn(rhs1_in, rhs2_in, out_in, scratches=scratches)
 
 
 def gmm_vmem_estimate(
@@ -1709,8 +1920,11 @@ def make_fused_mlp_configs(
     maybe_quantize_lhs: bool,
     fuse_act: str,
     rhs_quant_dtype: jnp.dtype | None,
+    token_rows: bool = False,
 ) -> tuple[GmmConfigs, GmmConfigs] | None:
     """Configs of the gate/up and down legs of gmm_v2_fused_mlp.
+
+    With ``token_rows`` the row tile also leaves room for TokenRows' stage.
 
     Returns None when the pair cannot run fused with the arithmetic of two
     gmm_v2 calls: the down input width must equal the gate/up output width,
@@ -1773,7 +1987,9 @@ def make_fused_mlp_configs(
     max_tile_m = min(FUSED_MLP_MAX_BUCKETS * bucket_base, cfgs1.dims.size_m)
     tile_m = 0
     for tm in range(bucket_base, max_tile_m + 1, bucket_base):
-        if fused_mlp_vmem_estimate(tm, cfgs1, cfgs2) > vmem_limit_bytes:
+        # TokenRows' stage holds a 32-bit word row per tile row.
+        stage_bytes = tm * cfgs1.dims.size_k * 4 if token_rows else 0
+        if fused_mlp_vmem_estimate(tm, cfgs1, cfgs2) + stage_bytes > vmem_limit_bytes:
             break
         tile_m = tm
     if tile_m == 0:
@@ -1798,8 +2014,15 @@ def can_fuse_mlp(
     preferred_element_type: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
     rhs_quant_dtype: jnp.dtype | None = None,
+    token_rows: bool = False,
 ) -> bool:
-    """Whether gmm_v2_fused_mlp takes these operands. Shape arithmetic only."""
+    """Whether gmm_v2_fused_mlp takes these operands. Shape arithmetic only.
+
+    With ``token_rows``, whether it takes them with lhs rows read from token
+    rows (gmm_v2_fused_mlp's token_rows); lhs then stands for all the rows.
+    """
+    if token_rows and (lhs.dtype.itemsize != 2 or _padded_size_m(lhs) != lhs.shape[0]):
+        return False
     if not _fused_mlp_widths_match(rhs1, rhs2, rhs_quant_dtype):
         return False
     cfgs = make_fused_mlp_configs(
@@ -1817,6 +2040,7 @@ def can_fuse_mlp(
         maybe_quantize_lhs=maybe_quantize_lhs,
         fuse_act=fuse_act,
         rhs_quant_dtype=rhs_quant_dtype,
+        token_rows=token_rows,
     )
     return cfgs is not None
 
@@ -1844,6 +2068,8 @@ def gmm_v2_fused_mlp(
     preferred_element_type: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
     rhs_quant_dtype: jnp.dtype | None = None,
+    token_rows: jax.Array | None = None,  # [num_tokens, size_k]
+    token_row_ids: jax.Array | None = None,  # int32[size_m]
 ) -> jax.Array:
     """gmm_v2 down(act(gate/up(lhs))) in one kernel.
 
@@ -1855,16 +2081,43 @@ def gmm_v2_fused_mlp(
     so it never round-trips HBM, and both legs' weights stream through one
     pipeline. Only operands for which can_fuse_mlp holds are accepted.
 
+    With ``token_rows``, lhs holds only the first rows of the batch, a whole
+    number of sublane blocks, and row r past them is row
+    ``token_row_ids[r]`` of the bf16 ``token_rows``: the kernel fetches it
+    itself, so those rows need not be gathered first. A row computes the
+    same bits either way.
+
     Returns:
         Output of shape [size_m, size_n].
     """
 
-    size_m = lhs.shape[0]
+    if (token_rows is None) != (token_row_ids is None):
+        raise ValueError("token_rows and token_row_ids go together")
+    full_lhs = lhs
+    if token_rows is not None:
+        full_lhs = jax.ShapeDtypeStruct(
+            (token_row_ids.shape[0], lhs.shape[1]), lhs.dtype
+        )
+        sublane = _get_lhs_sublane_size(lhs.dtype, full_lhs.shape[0])
+        if (
+            lhs.dtype.itemsize != 2
+            or token_rows.dtype != lhs.dtype
+            or token_rows.shape[1] != lhs.shape[1]
+            or token_rows.shape[0] % 2
+            or lhs.shape[0] % sublane
+            or _padded_size_m(full_lhs) != full_lhs.shape[0]
+            or lhs.shape[0] > full_lhs.shape[0]
+        ):
+            raise ValueError(
+                f"token rows {token_rows.shape} {token_rows.dtype} with head "
+                f"{lhs.shape} {lhs.dtype} and {full_lhs.shape[0]} row ids"
+            )
+    size_m = full_lhs.shape[0]
     lhs, group_offset = _prepare_inputs(lhs, group_offset)
     vmem_limit_bytes = _default_vmem_limit_bytes()
 
     cfgs = make_fused_mlp_configs(
-        lhs,
+        jax.ShapeDtypeStruct((_padded_size_m(full_lhs), lhs.shape[1]), lhs.dtype),
         rhs1,
         rhs1_scale,
         rhs1_bias,
@@ -1878,6 +2131,7 @@ def gmm_v2_fused_mlp(
         maybe_quantize_lhs=maybe_quantize_lhs,
         fuse_act=fuse_act,
         rhs_quant_dtype=rhs_quant_dtype,
+        token_rows=token_rows is not None,
     )
     if cfgs is None:
         raise ValueError(
@@ -1911,6 +2165,21 @@ def gmm_v2_fused_mlp(
             gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
         ),
     ]
+    scalars = [group_sizes, group_offset]
+    inputs = [lhs, rhs1_weights, rhs2_weights]
+    in_specs = [pl.BlockSpec(memory_space=pltpu.HBM), rhs1_specs, rhs2_specs]
+    if token_rows is not None:
+        sublane = dims.size_lhs_sublane
+        scalars.append(token_row_ids.astype(jnp.int32))
+        inputs.insert(1, token_rows)
+        in_specs.insert(1, pl.BlockSpec(memory_space=pltpu.HBM))
+        scratch_shapes += [
+            # TokenRows.lhs_bufs
+            pltpu.VMEM((2, tiles.tile_m // sublane, sublane, dims.size_k), lhs.dtype),
+            # TokenRows.stage_ref
+            pltpu.VMEM((2, tiles.tile_m // 2, dims.size_k), jnp.uint32),
+            pltpu.SemaphoreType.DMA((2,)),
+        ]
 
     # The cost estimates count the intermediate as gate/up's output and as
     # down's lhs; the fused kernel moves neither.
@@ -1920,15 +2189,16 @@ def gmm_v2_fused_mlp(
     inter_bytes = dims.size_m * cfgs1.out_size_n * inter_itemsize
     out_init = jax.ShapeDtypeStruct((dims.size_m, cfgs2.tiles.tile_n), cfgs2.out_dtype)
     return pl.pallas_call(
-        functools.partial(fused_mlp_kernel_main, cfgs1=cfgs1, cfgs2=cfgs2),
+        functools.partial(
+            fused_mlp_kernel_main,
+            cfgs1=cfgs1,
+            cfgs2=cfgs2,
+            token_rows=token_rows is not None,
+        ),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                rhs1_specs,
-                rhs2_specs,
-            ],
+            num_scalar_prefetch=len(scalars),
+            in_specs=in_specs,
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=scratch_shapes,
         ),
@@ -1950,6 +2220,4 @@ def gmm_v2_fused_mlp(
             **{f"gate_up.{k}": v for k, v in get_metadata(cfgs1).items()},
             **{f"down.{k}": v for k, v in get_metadata(cfgs2).items()},
         },
-    )(group_sizes, group_offset, lhs, rhs1_weights, rhs2_weights)[
-        :size_m, : cfgs2.out_size_n
-    ]
+    )(*scalars, *inputs)[:size_m, : cfgs2.out_size_n]

@@ -567,3 +567,65 @@ def test_gmm_v2_fused_mlp_matches_two_calls(group_sizes):
     np.testing.assert_array_equal(
         np.asarray(actual[:num_rows]), np.asarray(expected[:num_rows])
     )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("head_rows", [16, 32, 256])
+@pytest.mark.parametrize(
+    "group_sizes",
+    [[40, 0, 3, 197, 1, 300, 59], [600], [0, 0, 17, 0, 0, 0, 0, 1]],
+    ids=["mixed", "one-group-many-tiles", "sparse"],
+)
+def test_gmm_v2_fused_mlp_token_rows_match_gathered_rows(group_sizes, head_rows):
+    """Rows fetched from token rows by id compute the bits of gathered rows."""
+    _require_tpu()
+
+    num_groups, num_tokens = 8, 250
+    in_size, inter_size, out_size = 1024, 512, 1024
+    quant_block = 512
+    group_sizes = jnp.asarray(
+        group_sizes + [0] * (num_groups - len(group_sizes)), jnp.int32
+    )
+    num_rows = 640
+    keys = jax.random.split(jax.random.key(1), 6)
+    tokens = jax.random.normal(keys[0], (num_tokens, in_size), jnp.bfloat16)
+    row_ids = jax.random.randint(keys[5], (num_rows,), 0, num_tokens)
+    lhs = tokens[row_ids]
+    w1 = jax.random.randint(
+        keys[1], (num_groups, in_size // 2, 2 * inter_size), 0, 256
+    ).astype(jnp.uint8)
+    w2 = jax.random.randint(
+        keys[2], (num_groups, inter_size // 2, out_size), 0, 256
+    ).astype(jnp.uint8)
+    w1_scale = jax.random.uniform(
+        keys[3], (num_groups, in_size // quant_block, 1, 2 * inter_size)
+    )
+    w2_scale = jax.random.uniform(
+        keys[4], (num_groups, inter_size // quant_block, 1, out_size)
+    )
+    common = dict(
+        rhs1_scale=w1_scale,
+        rhs2_scale=w2_scale,
+        group_offset=jnp.array(0, dtype=jnp.int32),
+        fuse_act="silu_and_mul_with_clamp",
+        preferred_element_type=jnp.bfloat16,
+        maybe_quantize_lhs=True,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+
+    expected = gmm_v2_fused_mlp(lhs, w1, w2, group_sizes, **common)
+    actual = gmm_v2_fused_mlp(
+        lhs[:head_rows],
+        w1,
+        w2,
+        group_sizes,
+        token_rows=tokens,
+        token_row_ids=row_ids,
+        **common,
+    )
+
+    valid = int(group_sizes.sum())
+    np.testing.assert_array_equal(
+        np.asarray(actual[:valid]).view(np.uint16),
+        np.asarray(expected[:valid]).view(np.uint16),
+    )
