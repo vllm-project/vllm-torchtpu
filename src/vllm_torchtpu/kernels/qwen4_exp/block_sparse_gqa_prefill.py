@@ -25,7 +25,8 @@ SPARE_QUERY_BLOCKS = 4
 # query blocks for the same online-softmax state.
 PAIRED_PAGE_MAX_QUERY_ROWS = 256 * 24
 # KV tiles spanning several 128-token FP8 mask segments (selection words).
-PAIRED_KV_TILES = (256, 512, 1024)
+# 2048: main-KV DCP4 over TP8's 512-row pages (one table entry per KV tile).
+PAIRED_KV_TILES = (256, 512, 1024, 2048)
 
 
 def default_query_tile(query_block):

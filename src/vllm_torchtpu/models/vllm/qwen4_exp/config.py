@@ -568,12 +568,17 @@ def validate_config(cfg):
     # The QSA main-KV split over TP rank pairs is this model's own path (vLLM's
     # decode_context_parallel_size stays 1, rejected above): it shards the
     # unified pool's main-KV pages, so it needs that pool and pairs of ranks.
-    if main_kv_dcp() > 1 and (
-        not use_unified_pool() or p.tensor_parallel_size < 2 or p.tensor_parallel_size % 2
+    # A DCP group splits one KV head's main KV over the TP ranks that hold
+    # it: the group size divides TP / num_kv_heads (4 at TP8 with 2 heads).
+    dcp = main_kv_dcp()
+    head_ranks = p.tensor_parallel_size // max(int(t.num_key_value_heads), 1)
+    if dcp > 1 and (
+        not use_unified_pool() or head_ranks < dcp or head_ranks % dcp
     ):
         raise ValueError(
-            f"{MAIN_KV_DCP_ENV}=2 needs the unified pool and an even "
-            f"tensor_parallel_size >= 2, got tp={p.tensor_parallel_size}"
+            f"{MAIN_KV_DCP_ENV}={dcp} needs the unified pool and a group of TP "
+            f"ranks sharing one KV head, got tp={p.tensor_parallel_size} with "
+            f"{t.num_key_value_heads} KV heads"
         )
     # SparseCore top-k writes 16-lane vectors; this is a kernel boundary,
     # independent of checkpoint head counts and compression geometry.

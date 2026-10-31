@@ -383,7 +383,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.main_kv_dcp = 1
         dcp = int(envs.VLLM_TPU_QSA_MAIN_KV_DCP or 0)
         if dcp > 1 and pooled and ("mtp" not in prefix or envs.VLLM_TPU_QSA_MTP_KV_DCP):
-            assert dcp == 2 and tp_size % dcp == 0, "main-KV DCP supports pairs only"
+            assert dcp in (2, 4) and tp_size % dcp == 0, "main-KV DCP groups of 2 or 4"
             self.main_kv_dcp = dcp
             self.register_buffer(
                 "dcp_rank",
