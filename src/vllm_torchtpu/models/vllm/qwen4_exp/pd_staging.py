@@ -31,7 +31,6 @@ from collections.abc import Sequence
 
 import torch
 
-KERNEL_ROWS = 128
 ROW_SUBLANES = 4
 ROW_LANES = 256
 
@@ -229,11 +228,13 @@ def make_repack(
 
     chan = np.asarray(channels, dtype=np.int32)
 
-    def rows_of(carrier, flat):
-        return carrier[flat // KERNEL_ROWS, flat % KERNEL_ROWS, 0]
+    # Carriers are indexed as flat token rows, whatever their kernel-page
+    # shape (the pools hold one kernel page per manager page).
+    def rows_of(rows, flat):
+        return rows[flat]
 
-    def put(carrier, flat, values):
-        return carrier.at[flat // KERNEL_ROWS, flat % KERNEL_ROWS, 0].set(values)
+    def put(rows, flat, values):
+        return rows.at[flat].set(values)
 
     def gdn_page(page, s: GdnGeometry, d: GdnGeometry):
         """One producer GDN page -> this rank's page rows ``[ssm + conv]``."""
@@ -251,9 +252,11 @@ def make_repack(
         )
 
     def fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst):
-        dtype = pool.dtype
-        out = jax.lax.bitcast_convert_type(pool, jnp.uint8)
-        stage = jax.lax.bitcast_convert_type(staging, jnp.uint8)
+        dtype, shape = pool.dtype, pool.shape
+        out = jax.lax.bitcast_convert_type(pool, jnp.uint8).reshape(-1, ROW_SUBLANES, ROW_LANES)
+        stage = jax.lax.bitcast_convert_type(staging, jnp.uint8).reshape(
+            -1, ROW_SUBLANES, ROW_LANES
+        )
         # Main KV: the rank's head pair to slot 0, the other slots zero.
         main = rows_of(stage, main_src)
         pair = main[:, 2 * kv_head : 2 * kv_head + 2]
@@ -269,7 +272,7 @@ def make_repack(
             pages = jax.vmap(lambda page: gdn_page(page, s, d))(region)
             dst_flat = (gdn_dst[:, None] * dst_block + jnp.arange(d_rows)).reshape(-1)
             out = put(out, dst_flat, pages.reshape(-1, ROW_SUBLANES, ROW_LANES))
-        return jax.lax.bitcast_convert_type(out, dtype)
+        return jax.lax.bitcast_convert_type(out.reshape(shape), dtype)
 
     return fn
 
@@ -339,7 +342,9 @@ class StagedConsumer:
         self.ratio = int(cfg.model_config.hf_text_config.indexer_compress_ratio)
         self.pages = max(2, staging_bytes // self.src_layout.page_bytes)
         self.staging = torch.zeros(
-            (self.pages * self.src_block // KERNEL_ROWS, KERNEL_ROWS, 1, ROW_SUBLANES, ROW_LANES),
+            # The producer pools' carrier shape, one kernel page per manager
+            # page: the layout fingerprint compares it.
+            (self.pages, self.src_block, 1, ROW_SUBLANES, ROW_LANES),
             dtype=pool.dtype,
             device=pool.device,
         )

@@ -29,7 +29,8 @@ ROWS, LANES = 4, 256
 
 
 def carrier(pages: int, block: int) -> np.ndarray:
-    return np.zeros((pages * block // 128, 128, 1, ROWS, LANES), np.uint8)
+    # As the pools: one kernel page per manager page.
+    return np.zeros((pages, block, 1, ROWS, LANES), np.uint8)
 
 
 def flat_rows(c: np.ndarray) -> np.ndarray:
