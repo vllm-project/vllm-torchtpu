@@ -182,3 +182,51 @@ def test_glm_fallback_scales_routed_only(monkeypatch):
     shared = (np.asarray(jax.nn.silu(gate_up[:, :2])) * gate_up[:, 2:]) @ w2s
     np.testing.assert_allclose(got, 2.5 * x + shared, rtol=1e-4, atol=1e-4)
     assert not np.allclose(got, 2.5 * (x + shared), rtol=1e-2, atol=1e-2)
+
+
+class _Runner:
+    """The parts of the TPU runner arm_runner_models reads."""
+
+    def __init__(self, drafter):
+        self.model = torch.nn.Linear(1, 1)
+        self.drafter = drafter
+
+    @property
+    def _async_drafter(self):
+        # As TPUModelRunner._async_drafter: asserts there is a drafter.
+        assert self.drafter is not None
+        return self.drafter
+
+
+def _record_arms(monkeypatch):
+    armed = []
+    monkeypatch.setattr(
+        bridge,
+        "arm_fused_moe_decode",
+        lambda model, what="model": armed.append(what) or 1,
+    )
+    return armed
+
+
+def test_arm_runner_models_without_a_drafter(monkeypatch):
+    """No spec decoding: only the target is armed, and the runner's asserting
+    _async_drafter property is never touched."""
+    armed = _record_arms(monkeypatch)
+    assert bridge.arm_runner_models(_Runner(drafter=None)) == 1
+    assert armed == ["target model"]
+
+
+def test_arm_runner_models_arms_the_draft_model(monkeypatch):
+    armed = _record_arms(monkeypatch)
+    drafter = SimpleNamespace(draft_model=torch.nn.Linear(1, 1))
+    assert bridge.arm_runner_models(_Runner(drafter)) == 2
+    assert armed == ["target model", "draft model"]
+
+
+def test_arm_runner_models_skips_a_draft_that_is_the_target(monkeypatch):
+    """A drafter sharing the target module is not armed twice."""
+    armed = _record_arms(monkeypatch)
+    runner = _Runner(None)
+    runner.drafter = SimpleNamespace(model=runner.model)
+    assert bridge.arm_runner_models(runner) == 1
+    assert armed == ["target model"]
