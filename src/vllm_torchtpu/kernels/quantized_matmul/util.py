@@ -46,6 +46,9 @@ FUSED_ROPE_QUANT_HEADS_PER_DOT = 8
 # rotation follow it.
 FUSED_QNORM_ROPE_OUT_BLOCK = 2048
 FUSED_QNORM_ROPE_ROWS = 256
+# Weight tiles it keeps in flight, and copies each tile is fetched as.
+FUSED_QNORM_ROPE_WEIGHT_SLOTS = 3
+FUSED_QNORM_ROPE_WEIGHT_COPIES = 2
 
 
 def unfold_args(

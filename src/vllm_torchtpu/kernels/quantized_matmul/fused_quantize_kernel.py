@@ -593,7 +593,7 @@ def _qnorm_rope_vmem_bytes(m: int, k: int, tn: int, head_dim: int) -> int:
     rows = min(util.FUSED_QNORM_ROPE_ROWS, m)
     x = 2 * m * k * 2  # bf16, double-buffered
     x_q = m * k + m * 128 * 4  # fp8 rows and their lane-padded f32 scales
-    w = 2 * k * tn
+    w = util.FUSED_QNORM_ROPE_WEIGHT_SLOTS * k * tn
     out = 2 * m * tn * 2
     cos_sin = 3 * m * rope.LANE * 4  # gathered rows, cos and signed sin
     chunk = 4 * rows * head_dim * 4  # a row chunk of a head through the norm
@@ -612,6 +612,7 @@ def supports_qnorm_rope(
         and w_q.dtype == jnp.float8_e4m3fn
         and w_scale.shape == (n,)
         and k % QUANT_COLS == 0
+        and k % util.FUSED_QNORM_ROPE_WEIGHT_COPIES == 0
         and m > 0
         and m % QUANT_ROWS == 0
         and m % min(util.FUSED_QNORM_ROPE_ROWS, m) == 0
@@ -627,7 +628,7 @@ def _qnorm_rope_kernel(
     positions_ref,
     # inputs
     x_ref,
-    w_ref,
+    w_hbm_ref,
     w_scale_ref,
     cos_sin_cache_ref,
     # output
@@ -639,15 +640,46 @@ def _qnorm_rope_kernel(
     cos_sin_sem,
     cos_ref,
     sin_ref,
+    w_slots_ref,
+    w_sems,
     *,
     f8_max,
     rotary_dim,
     eps,
     head_dim,
+    num_tiles,
 ):
+    j = pl.program_id(0)
     m, tn = out_ref.shape
+    k = x_ref.shape[1]
     lane = rope.LANE
     rows_per_chunk = min(util.FUSED_QNORM_ROPE_ROWS, m)
+    num_slots = w_slots_ref.shape[0]
+    w_ref = w_slots_ref.at[j % num_slots]
+
+    # The weight streams through `num_slots` tiles, each fetched as several
+    # copies: more copies in flight than the pipeline's one per block.
+    def fetch_weight(tile):
+        part = k // util.FUSED_QNORM_ROPE_WEIGHT_COPIES
+        for p in range(util.FUSED_QNORM_ROPE_WEIGHT_COPIES):
+            rows = pl.ds(p * part, part)
+            pltpu.make_async_copy(
+                w_hbm_ref.at[rows, pl.ds(tile * tn, tn)],
+                w_slots_ref.at[tile % num_slots, rows],
+                w_sems.at[tile % num_slots],
+            ).start()
+
+    def wait_weight():
+        pltpu.make_async_copy(w_ref, w_ref, w_sems.at[j % num_slots]).wait()
+
+    @pl.when(j == 0)
+    def _():
+        for tile in range(min(num_slots - 1, num_tiles)):
+            fetch_weight(tile)
+
+    @pl.when(j + num_slots - 1 < num_tiles)
+    def _():
+        fetch_weight(j + num_slots - 1)
 
     def matmul_qnorm_rope():
         # One head of a row chunk at a time, from the MXU result to the output,
@@ -707,10 +739,13 @@ def _qnorm_rope_kernel(
         # is symmetric.
         even = jax.lax.broadcasted_iota(jnp.int32, sin.shape, 1) % 2 == 0
         sin_ref[...] = sin * jnp.where(even, -1.0, 1.0).astype(sin.dtype)
+        # After the quantize, which hides the first tile's fetch.
+        wait_weight()
         matmul_qnorm_rope()
 
     @pl.when(pl.program_id(0) != 0)
     def _later_pass():
+        wait_weight()
         matmul_qnorm_rope()
 
 
@@ -745,7 +780,7 @@ def fused_quantized_matmul_qnorm_rope(
         grid=(n // tn,),
         in_specs=[
             pl.BlockSpec((m, k), lambda j, positions: (0, 0)),
-            pl.BlockSpec((k, tn), lambda j, positions: (0, j)),
+            pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec((1, tn), lambda j, positions: (0, j)),
             pl.BlockSpec(memory_space=pltpu.HBM),
         ],
@@ -757,6 +792,8 @@ def fused_quantized_matmul_qnorm_rope(
             pltpu.SemaphoreType.DMA(()),
             pltpu.VMEM((m, rope.LANE), cos_sin_cache.dtype),
             pltpu.VMEM((m, rope.LANE), cos_sin_cache.dtype),
+            pltpu.VMEM((util.FUSED_QNORM_ROPE_WEIGHT_SLOTS, k, tn), w_q.dtype),
+            pltpu.SemaphoreType.DMA((util.FUSED_QNORM_ROPE_WEIGHT_SLOTS,)),
         ],
     )
     return pl.pallas_call(
@@ -766,6 +803,7 @@ def fused_quantized_matmul_qnorm_rope(
             rotary_dim=rotary_dim,
             eps=eps,
             head_dim=head_dim,
+            num_tiles=n // tn,
         ),
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((m, n), x.dtype),
