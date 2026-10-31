@@ -261,6 +261,12 @@ def outer_kernel(
     )
     num_tiles = metadata_ref.num_tiles[...]
     body = functools.partial(inner_kernel, cfg=cfg)
+    scratches = (
+        metadata_ref,
+        weights_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+    )
     state_allocs = (conv_in_alloc, recurrent_in_alloc)
     out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
     state_out_args = (conv_state_out_ref, recurrent_state_out_ref)
@@ -295,12 +301,7 @@ def outer_kernel(
             recurrent_state_ref,
             out_ref,
             *state_out_args,
-            scratches=(
-                metadata_ref,
-                weights_ref,
-                carry_conv_scratch_ref,
-                carry_recurrent_scratch_ref,
-            ),
+            scratches=scratches,
             allocations=allocations,
         )
 
@@ -343,6 +344,8 @@ def fused_conv1d_gdn(
     seq_lens: jax.Array,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
     ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
+    prefill_ckpt_offsets: jax.Array | None = None,  # [num_seqs]
+    prefill_ckpt_indices: jax.Array | None = None,  # [num_seqs]
     *,
     n_kq: int,
     n_v: int,
@@ -401,6 +404,14 @@ def fused_conv1d_gdn(
             `state_indices[s] + read_offsets[s]` and write one checkpoint
             per window position to `state_indices[s] + t`. Required when
             `num_spec_tokens > 0`.
+        prefill_ckpt_offsets: Optional [num_seqs] int32. Query token offset
+            of each sequence's internal prefill checkpoint (0 for none). When
+            0 < offset < query_len and prefill_ckpt_indices is non-negative,
+            the state after the first offset query tokens is also written,
+            encoded like the final state, to block prefill_ckpt_indices[s].
+            Must be passed together with prefill_ckpt_indices.
+        prefill_ckpt_indices: Optional [num_seqs] int32. Destination state
+            block of each sequence's prefill checkpoint (-1 for none).
         n_kq: Number of key/query heads.
         n_v: Number of value heads.
         d_k: Key/query dimension.
@@ -504,6 +515,15 @@ def fused_conv1d_gdn(
         # Iniitalize the ckpt_indices to default value.
         spec_offset = jnp.arange(num_spec_tokens + 1).reshape(1, -1)
         ckpt_indices = state_indices.reshape(-1, 1) + spec_offset
+    assert (prefill_ckpt_offsets is None) == (prefill_ckpt_indices is None), (
+        "prefill_ckpt_offsets and prefill_ckpt_indices go together"
+    )
+    if prefill_ckpt_offsets is not None:
+        assert prefill_ckpt_indices is not None
+        assert prefill_ckpt_offsets.shape == (num_seqs,), prefill_ckpt_offsets.shape
+        assert prefill_ckpt_indices.shape == (num_seqs,), prefill_ckpt_indices.shape
+        prefill_ckpt_offsets = prefill_ckpt_offsets.astype(jnp.int32)
+        prefill_ckpt_indices = prefill_ckpt_indices.astype(jnp.int32)
 
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
@@ -673,10 +693,13 @@ def fused_conv1d_gdn(
                 start_seq=distribution[0],
                 end_seq=distribution[-1],
                 ckpt_indices=ckpt_indices,
+                prefill_ckpt_offsets=prefill_ckpt_offsets,
+                prefill_ckpt_indices=prefill_ckpt_indices,
             )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
         state_spec = jax.tree.map(lambda _: hbm_spec, in_states)
+        scratch_shapes = cfg.get_scratch_shape_dict()
 
         # Step 7: Handle case where write needs to be done in existing out.
         input_output_aliases = {}
@@ -711,7 +734,7 @@ def fused_conv1d_gdn(
                 weights_spec,
             ),
             out_specs=(hbm_spec, state_spec),
-            scratch_shapes=cfg.get_scratch_shape_dict(),
+            scratch_shapes=scratch_shapes,
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,

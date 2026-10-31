@@ -95,6 +95,11 @@ class MetadataRef:
     # speculative decoding, where the only checkpoint is the slot's own
     # state block (`s_idx_to_state_indices`).
     s_idx_to_ckpt_indices: Any = None
+    # Internal prefill checkpoint (PER_SEQ only): the state after batch row
+    # s_idx_to_prefill_ckpt_row[s] - 1 (-1 if none) is also written to state
+    # block s_idx_to_prefill_ckpt_index[s].
+    s_idx_to_prefill_ckpt_row: Any = None
+    s_idx_to_prefill_ckpt_index: Any = None
 
     @classmethod
     def create(
@@ -110,6 +115,8 @@ class MetadataRef:
         s_idx_to_state_indices: jax.Array,
         s_idx_to_read_offset: jax.Array,
         s_idx_to_ckpt_indices: jax.Array | None = None,
+        s_idx_to_prefill_ckpt_row: jax.Array | None = None,
+        s_idx_to_prefill_ckpt_index: jax.Array | None = None,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -124,7 +131,19 @@ class MetadataRef:
             s_idx_to_state_indices=s_idx_to_state_indices,
             s_idx_to_read_offset=s_idx_to_read_offset,
             s_idx_to_ckpt_indices=s_idx_to_ckpt_indices,
+            s_idx_to_prefill_ckpt_row=s_idx_to_prefill_ckpt_row,
+            s_idx_to_prefill_ckpt_index=s_idx_to_prefill_ckpt_index,
         )
+
+    def is_prefill_ckpt_tile(self, p_id, idx) -> jax.Array:
+        """Returns whether tile (p_id, idx) ends at its prefill checkpoint row.
+
+        The -1 sentinel never matches: tile_end >= 0.
+        """
+        assert self.s_idx_to_prefill_ckpt_row is not None
+        s_idx = self.p_id_to_s_idx[p_id, idx]
+        tile_end = self.p_id_to_r_base[p_id, idx] + self.p_id_to_r_size[p_id, idx]
+        return tile_end == self.s_idx_to_prefill_ckpt_row[s_idx]
 
     def __len__(self) -> int:
         return len(jax.tree_util.tree_leaves(self))
@@ -352,6 +371,12 @@ class StateOutBufferedRef(_GranuleStateRef):
     `min(r_size, window_size)` checkpoints are written back, checkpoint `t`
     to its own source block. Without speculative decoding `window_size` is
     1 and this writes the single state back to `state_indices[s]`.
+
+    A PER_SEQ tile that ends at a sequence's prefill checkpoint row also
+    writes window position 0 to block `s_idx_to_prefill_ckpt_index[s]`.
+    `inner_kernel` leaves every tile's final state in the window, so the
+    copy is the same DMA as a last tile's, and `wait_out` counts it with
+    the others.
     """
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
@@ -388,6 +413,20 @@ class StateOutBufferedRef(_GranuleStateRef):
                     sem,
                 ).start()
 
+            if self.metadata_ref.s_idx_to_prefill_ckpt_row is not None:
+                assert self.cfg.mode == config.GDNMode.PER_SEQ
+                assert self.cfg.window_size == 1
+                is_ckpt_tile = self.metadata_ref.is_prefill_ckpt_tile(p_id, idx)
+                dma_size = jnp.where(is_ckpt_tile, 1, 0)
+                ckpt_idx = self.metadata_ref.s_idx_to_prefill_ckpt_index[s_idx]
+                pltpu.make_async_copy(
+                    vmem_ref.at[pl.ds(idx, dma_size), 0],
+                    dst_ref.at[
+                        pl.ds(ckpt_idx, dma_size), pl.ds(self.offset, num_granules)
+                    ],
+                    sem,
+                ).start()
+
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
@@ -402,6 +441,9 @@ class StateOutBufferedRef(_GranuleStateRef):
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
             dma_size += jnp.where(is_last_tile, num_ckpts, 0)
+            if self.metadata_ref.s_idx_to_prefill_ckpt_row is not None:
+                is_ckpt_tile = self.metadata_ref.is_prefill_ckpt_tile(p_id, idx)
+                dma_size += jnp.where(is_ckpt_tile, 1, 0)
 
         # Each checkpoint moved one window row's worth of bytes; see
         # StateInBufferedRef.wait_in for why this counts them on the typed tile.

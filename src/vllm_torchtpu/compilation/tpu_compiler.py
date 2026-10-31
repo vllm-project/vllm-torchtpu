@@ -259,7 +259,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DEBUG_PCP_LAYOUT",
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
-    # Scheduler prefix-cache hit length only.
+    # Affects only scheduler prefix-cache hit length and runtime GDN checkpoint
+    # offsets.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
@@ -303,6 +304,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
+    # `prefill_checkpoint_enabled` decides whether the GDN op traces with
+    # prefill checkpoint operands or with constant None inputs.
+    "vllm_torchtpu/gdn_pool_layout.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
@@ -434,6 +438,10 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "kv_cache": {
             "gpu_memory_utilization": cache_config.gpu_memory_utilization,
             "num_gpu_blocks": cache_config.num_gpu_blocks,
+            # Upstream CacheConfig.compute_hash ignores it, but it gates GDN
+            # prefill checkpoints (gdn_pool_layout.prefill_checkpoint_enabled),
+            # which changes the traced GDN op inputs.
+            "prefix_match_unit": cache_config.prefix_match_unit,
         },
         "scheduler": {
             "max_model_len": vllm_config.model_config.max_model_len,
