@@ -50,8 +50,7 @@ def _write_main_cache_universal(pool, rows, page, logical, valid):
 
     Complete page-local tiles use one large DMA. Tiles that cross a request or
     page boundary fall back to row DMAs inside the same aliased custom call.
-    An outer ``lax.cond`` cannot be used here: XLA then copies the multi-GiB
-    cache to reconcile the two aliased branch outputs.
+    Keep one aliased writer for both the contiguous and edge cases.
     """
     if len(rows) == 0:
         return pool
@@ -658,7 +657,10 @@ def compact_pooled_qsa_step(
         logical_block_size=main_pool.shape[1],
         vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
     )
-    output, main_pool = qsa_attention(
+    # Read-only attention returns token outputs only; the latest main-pool
+    # owner from write_main_cache passes through linearly so the donated
+    # input_output_alias at the op boundary stays intact.
+    output, _ = qsa_attention(
         q,
         gate,
         blocks,

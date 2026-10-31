@@ -75,6 +75,8 @@ def execute_decode(
     cache: jax.Array,
     *,
     launch: DecodeLaunch,
+    active_tokens: jax.Array | None = None,
+    initial_output: jax.Array | None = None,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> tuple[jax.Array, jax.Array]:
@@ -88,4 +90,6 @@ def execute_decode(
         table,
         cache,
         batch_size=launch.chunk_queries,
+        active_tokens=active_tokens,
+        initial_output=initial_output,
     )

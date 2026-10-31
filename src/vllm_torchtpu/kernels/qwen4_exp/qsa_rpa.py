@@ -118,7 +118,19 @@ def _rpa_attention_batch(
 
 
 def _rpa_attention_in_chunks(
-    q, gate, blocks, lengths, table, cache, *, kv_heads, ratio, k_scale=1.0, v_scale=1.0
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    active_tokens: jax.Array | None = None,
+    initial_output: jax.Array | None = None,
 ):
     attend = functools.partial(
         _rpa_attention_batch,
@@ -135,6 +147,8 @@ def _rpa_attention_in_chunks(
         lengths,
         table,
         cache,
+        active_tokens=active_tokens,
+        initial_output=initial_output,
         batch_size=batching.rpa_query_batch_size(
             blocks.shape[1] + 1,
             query=q,
@@ -157,6 +171,8 @@ def rpa_attention(
     ratio,
     k_scale=1.0,
     v_scale=1.0,
+    active_tokens: jax.Array | None = None,
+    initial_output: jax.Array | None = None,
 ):
     from vllm_torchtpu.kernels.sparse_gqa_decode import plan_decode
     from vllm_torchtpu.kernels.sparse_gqa_decode.decode import execute_decode
@@ -182,6 +198,8 @@ def rpa_attention(
             table,
             cache,
             launch=launch,
+            active_tokens=active_tokens,
+            initial_output=initial_output,
             k_scale=k_scale,
             v_scale=v_scale,
         )
@@ -196,6 +214,8 @@ def rpa_attention(
         ratio=ratio,
         k_scale=k_scale,
         v_scale=v_scale,
+        active_tokens=active_tokens,
+        initial_output=initial_output,
     )
 
 
@@ -262,6 +282,9 @@ def _prefill_attention(
             ratio=ratio,
             k_scale=k_scale,
             v_scale=v_scale,
+            active_tokens=jnp.max(
+                jnp.where(lengths > 0, jnp.arange(len(query)) + 1, 0)
+            ),
         )
 
     query_block, kv_tile = get_sparse_prefill_tiles(
@@ -306,62 +329,32 @@ def qsa_attention(
     prefix_tokens, active_tokens = _request_bounds(starts, request_distribution, tokens)
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
 
-    def decode_batch(_):
-        return rpa_attention(query, gate, blocks, lengths, table, cache, **options)
-
-    def prefill_batch(_):
-        positions = jnp.arange(tokens, dtype=jnp.int32)
-        suffix = (positions >= prefix_tokens) & (positions < active_tokens)
-        output, owner = _prefill_attention(
-            query,
-            gate,
-            blocks,
-            jnp.where(suffix, lengths, 0),
-            table,
-            cache,
-            jnp.clip(starts, prefix_tokens, active_tokens),
-            **options,
-        )
-        batch = min(
-            tokens,
-            batching.rpa_query_batch_size(
-                blocks.shape[1] + 1,
-                query=query,
-                cache=cache,
-                kv_heads=kv_heads,
-                ratio=ratio,
-            ),
-        )
-
-        def prefix(index, state):
-            output, owner = state
-            positions = index * batch + jnp.arange(batch, dtype=jnp.int32)
-            valid = positions < prefix_tokens
-            rows = jnp.minimum(positions, tokens - 1)
-            result, owner = _rpa_attention_batch(
-                jnp.where(valid[:, None, None], query[rows], 0),
-                gate[rows],
-                jnp.where(valid[:, None], blocks[rows], -1),
-                jnp.where(valid, lengths[rows], 0),
-                table[rows],
-                owner,
-                **options,
-            )
-            destination = jnp.where(valid, positions, tokens)
-            return output.at[destination].set(result, mode="drop"), owner
-
-        return jax.lax.fori_loop(
-            0, (prefix_tokens + batch - 1) // batch, prefix, (output, owner)
-        )
-
-    return jax.lax.cond(
-        active_tokens == 0,
-        lambda _: (jnp.zeros_like(query), cache),
-        lambda _: jax.lax.cond(
-            prefix_tokens == active_tokens, decode_batch, prefill_batch, None
-        ),
-        None,
+    positions = jnp.arange(tokens, dtype=jnp.int32)
+    suffix = (positions >= prefix_tokens) & (positions < active_tokens)
+    # Schedule both request segments. The leaves bound attention work using
+    # their live metadata; neither segment owns or updates the written cache.
+    prefill, _ = _prefill_attention(
+        query,
+        gate,
+        blocks,
+        jnp.where(suffix, lengths, 0),
+        table,
+        cache,
+        jnp.clip(starts, prefix_tokens, active_tokens),
+        **options,
     )
+    output, _ = rpa_attention(
+        query,
+        gate,
+        blocks,
+        jnp.where(positions < prefix_tokens, lengths, 0),
+        table,
+        cache,
+        active_tokens=prefix_tokens,
+        initial_output=prefill,
+        **options,
+    )
+    return output, cache
 
 
 def selected_tokens(blocks, lengths, token_topk, compress_ratio):

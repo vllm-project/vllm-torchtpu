@@ -79,7 +79,8 @@ def test_mixed_attention_routes_real_request_lengths(
         result = (
             q.astype(jnp.float32) + pages[:, :1, None] + g.astype(jnp.float32)
         ).astype(jnp.bfloat16)
-        return jnp.where((lens > 0)[:, None, None], result, 0), cache
+        inactive = kw["initial_output"] if kind == "decode" else 0
+        return jnp.where((lens > 0)[:, None, None], result, inactive), cache
 
     monkeypatch.setattr(
         qsa_rpa, "_rpa_attention_batch", lambda *a, **kw: attend("decode", *a, **kw)
@@ -259,7 +260,7 @@ def test_rpa_one_row_exact_capacity_boundary(monkeypatch, lanes, columns):
 
 
 @pytest.mark.parametrize("prefill", [False, True])
-def test_pure_batches_keep_one_original_call(monkeypatch, info, prefill):
+def test_pure_batches_have_only_one_live_segment(monkeypatch, info, prefill):
     tokens = 8192 if prefill else 512
     counts = [3072, 5120, 0] if prefill else [1] * 256 + [0] * 17
     starts = jnp.asarray(np.r_[0, np.cumsum(counts)], jnp.int32)
@@ -268,8 +269,9 @@ def test_pure_batches_keep_one_original_call(monkeypatch, info, prefill):
     pool = jnp.zeros((1, 128, 1, 2, 128), jnp.bfloat16)
 
     def run(kind, query, gate, ids, lengths, table, owner, *args, **kw):
-        seen.append((kind, len(query)))
-        return query, owner
+        seen.extend((kind, int(row)) for row in np.flatnonzero(np.asarray(lengths)))
+        inactive = kw["initial_output"] if kind == "decode" else 0
+        return jnp.where((lengths > 0)[:, None, None], query, inactive), owner
 
     monkeypatch.setattr(
         qsa_rpa, "_prefill_attention", lambda *a, **kw: run("prefill", *a, **kw)
@@ -292,8 +294,10 @@ def test_pure_batches_keep_one_original_call(monkeypatch, info, prefill):
             kv_heads=1,
             ratio=4,
         )
-    assert seen == [("prefill" if prefill else "decode", tokens)]
-    np.testing.assert_array_equal(result, q)
+    live = int(starts[-1])
+    assert seen == [("prefill" if prefill else "decode", row) for row in range(live)]
+    np.testing.assert_array_equal(result[:live], q[:live])
+    np.testing.assert_array_equal(result[live:], 0)
     assert owner is pool
 
 
@@ -322,7 +326,8 @@ def test_suffix_keeps_original_rows_and_prefix_tail_drops(
     def attend(q, g, ids, lens, pages, owner, *args, **kw):
         calls.append(len(q))
         result = q + 2 * g + 3 * pages[:, :1, None]
-        return jnp.where((lens > 0)[:, None, None], result, 0), owner
+        inactive = kw.pop("initial_output", 0)
+        return jnp.where((lens > 0)[:, None, None], result, inactive), owner
 
     def prefill(q, g, ids, lens, pages, owner, local_starts, **kw):
         assert q is query and g is gate and ids is blocks and pages is table
@@ -332,7 +337,7 @@ def test_suffix_keeps_original_rows_and_prefix_tail_drops(
         return attend(q, g, ids, lens, pages, owner, **kw)
 
     monkeypatch.setattr(qsa_rpa, "_prefill_attention", prefill)
-    monkeypatch.setattr(qsa_rpa, "_rpa_attention_batch", attend)
+    monkeypatch.setattr(qsa_rpa, "rpa_attention", attend)
     monkeypatch.setattr(batching, "rpa_query_batch_size", lambda *a, **kw: 3)
     with jax.disable_jit():
         output, owner = qsa_rpa.qsa_attention(
@@ -357,4 +362,4 @@ def test_suffix_keeps_original_rows_and_prefix_tail_drops(
             )
     np.testing.assert_array_equal(output, expected)
     assert owner is pool
-    assert not calls if distribution[2] == 0 else calls[0] == tokens
+    assert all(size == tokens for size in calls)

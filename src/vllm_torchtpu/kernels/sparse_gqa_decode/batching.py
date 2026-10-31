@@ -100,12 +100,45 @@ def attend_in_chunks(
     cache: jax.Array,
     *,
     batch_size: int,
+    active_tokens: jax.Array | None = None,
+    initial_output: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Bound per-launch SMEM use while preserving cache donation and row order."""
+    """Bound per-launch SMEM use while preserving cache donation and row order.
+
+    A runtime prefix requires read-only attention. It updates only prefix rows
+    of initial_output; an empty prefix launches no attention work.
+    """
     if batch_size < 1:
         raise ValueError("Decode batch size must be positive")
     if len(q) == 0:
         return jnp.zeros_like(q), cache
+    if initial_output is not None and active_tokens is None:
+        raise ValueError("An initial output requires a runtime attention prefix")
+    if active_tokens is not None:
+        batch = min(batch_size, len(q))
+
+        def step(index, output):
+            positions = index * batch + jnp.arange(batch, dtype=jnp.int32)
+            live = positions < active_tokens
+            rows = jnp.minimum(positions, len(q) - 1)
+            result, _ = attend(
+                q[rows],
+                gate[rows],
+                jnp.where(live[:, None], blocks[rows], -1),
+                jnp.where(live, lengths[rows], 0),
+                table[rows],
+                cache,
+            )
+            destination = jnp.where(live, positions, len(q))
+            return output.at[destination].set(result, mode="drop")
+
+        # Segment attention is read-only. Only token output belongs in the
+        # loop state; the pooled writer retains the cache owner.
+        output = jnp.zeros_like(q) if initial_output is None else initial_output
+        output = jax.lax.fori_loop(
+            0, (active_tokens + batch - 1) // batch, step, output
+        )
+        return output, cache
     if len(q) <= batch_size:
         return attend(q, gate, blocks, lengths, table, cache)
     padding = (-len(q)) % batch_size

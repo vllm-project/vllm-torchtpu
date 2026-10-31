@@ -527,6 +527,10 @@ def _one_chunk(arrays, cache, starts, model):
         model,
     )
 
+    # Empty TC tiles have zero KV visits. SC gathers a fixed workspace, so
+    # admit it only when this chunk has live attention tasks.
+    choose &= jnp.any(lengths > 0)
+
     def sc(_):
         output, _ = _sc_prefill(
             q,
@@ -609,6 +613,8 @@ def _write_chunk(
             kv_tile=kv_tile,
         )
 
+    local_starts = jnp.clip(starts - offset, 0, size)
+    choose &= local_starts[-1] > local_starts[0]
     chunk_output = lax.cond(choose, sc, tc, initial_window)
     return lax.dynamic_update_slice_in_dim(output, chunk_output, offset, axis=0)
 

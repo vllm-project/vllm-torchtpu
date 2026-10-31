@@ -71,9 +71,10 @@ def test_equal_padded_buckets_follow_request_boundaries(monkeypatch, decode):
     seen = []
 
     def attend(kind, q, g, ids, lens, pages, owner, *args, **kwargs):
-        seen.append(kind)
+        seen.extend([kind] * int(np.count_nonzero(np.asarray(lens))))
         result = q + 2 * g + pages[:, :1, None]
-        return jnp.where((lens > 0)[:, None, None], result, 0), owner
+        inactive = kwargs["initial_output"] if kind == "decode" else 0
+        return jnp.where((lens > 0)[:, None, None], result, inactive), owner
 
     monkeypatch.setattr(
         qsa_rpa,
@@ -99,7 +100,7 @@ def test_equal_padded_buckets_follow_request_boundaries(monkeypatch, decode):
             kv_heads=1,
             ratio=4,
         )
-    assert seen == ["decode" if decode else "prefill"]
+    assert seen == ["decode" if decode else "prefill"] * int(counts.sum())
     expected = np.asarray(query) + 0.5 + np.arange(8)[:, None, None]
     expected[int(counts.sum()) :] = 0
     np.testing.assert_array_equal(output, expected)
