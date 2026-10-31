@@ -188,34 +188,28 @@ def quantized_matmul(
     return out_2d.reshape(orig_out_shape)
 
 
-_rms_norm_quantized_matmul_ops: dict[bool, Callable] = {}
-_rms_norm_quantized_matmul_ops_lock = Lock()
+def _build_rms_norm_quantized_matmul_op(emit_normed: bool) -> Callable:
+    name = "pallas::rms_norm_quantized_matmul" + ("_normed" if emit_normed else "")
+    op = pallas.jax_op(
+        name,
+        functools.partial(_rms_norm_quantized_matmul_jax, emit_normed=emit_normed),
+    )
+
+    def _fake(x, rstd, norm_weight, w_q, w_s):
+        del rstd, norm_weight, w_s
+        out = torch.empty(x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device)
+        return (out, torch.empty_like(x)) if emit_normed else out
+
+    op.register_fake(_fake)
+    return op
 
 
-def _get_rms_norm_quantized_matmul_op(emit_normed: bool) -> Callable:
-    op = _rms_norm_quantized_matmul_ops.get(emit_normed)
-    if op is not None:
-        return op
-
-    with _rms_norm_quantized_matmul_ops_lock:
-        op = _rms_norm_quantized_matmul_ops.get(emit_normed)
-        if op is not None:
-            return op
-
-        name = "pallas::rms_norm_quantized_matmul" + ("_normed" if emit_normed else "")
-        op = pallas.jax_op(
-            name,
-            functools.partial(_rms_norm_quantized_matmul_jax, emit_normed=emit_normed),
-        )
-
-        def _fake(x, rstd, norm_weight, w_q, w_s):
-            del rstd, norm_weight, w_s
-            out = torch.empty(x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device)
-            return (out, torch.empty_like(x)) if emit_normed else out
-
-        op.register_fake(_fake)
-        _rms_norm_quantized_matmul_ops[emit_normed] = op
-        return op
+# Built at import: the forward that calls them runs under Dynamo, which cannot
+# trace a lazy cache's Lock.
+_rms_norm_quantized_matmul_ops: dict[bool, Callable] = {
+    emit_normed: _build_rms_norm_quantized_matmul_op(emit_normed)
+    for emit_normed in (False, True)
+}
 
 
 def rms_norm_quantized_matmul(
@@ -237,9 +231,7 @@ def rms_norm_quantized_matmul(
         raise ValueError(
             f"Expected a 2-D input with hidden dim {w_q.shape[0]}, got {list(x.shape)}."
         )
-    return _get_rms_norm_quantized_matmul_op(emit_normed)(
-        x, rstd, norm_weight, w_q, w_s
-    )
+    return _rms_norm_quantized_matmul_ops[emit_normed](x, rstd, norm_weight, w_q, w_s)
 
 
 def _quantized_matmul_fp4_jax(
