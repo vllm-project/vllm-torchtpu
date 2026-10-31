@@ -565,6 +565,57 @@ class TestTpuPlatform:
         TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
+        "requested,tp_size,expected",
+        [
+            # The launcher already started one process per rank.
+            ("external_launcher", 8, "external_launcher"),
+            # One rank: nothing to launch externally.
+            ("external_launcher", 1, "uni"),
+            ("mp", 8, "TpuMultiprocExecutor"),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_single_host_executor_backend(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        requested,
+        tp_size,
+        expected,
+    ):
+        monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
+        vllm_config.parallel_config.distributed_executor_backend = requested
+        vllm_config.parallel_config.tensor_parallel_size = tp_size
+        vllm_config.parallel_config.world_size = tp_size
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        backend = vllm_config.parallel_config.distributed_executor_backend
+        assert getattr(backend, "__name__", backend) == expected
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_external_launcher_rejects_data_parallelism(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, monkeypatch
+    ):
+        monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
+        monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
+        vllm_config.parallel_config.distributed_executor_backend = "external_launcher"
+        vllm_config.parallel_config.data_parallel_size = 2
+        vllm_config.parallel_config.data_parallel_size_local = 2
+
+        with pytest.raises(NotImplementedError, match="data_parallel_size=1"):
+            TpuPlatform.check_and_update_config(vllm_config)
+        assert "TORCH_TPU_DP_SIZE" not in os.environ
+
+    @pytest.mark.parametrize(
         "connector_name",
         [
             "DecodeBenchConnector",

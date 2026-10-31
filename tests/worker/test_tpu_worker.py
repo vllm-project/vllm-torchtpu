@@ -26,6 +26,7 @@ from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
+from vllm_torchtpu.worker import tpu_worker
 from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
 
 
@@ -276,6 +277,66 @@ class TestProfileCaptureAndMerge:
             worker.profile(is_start=False)
 
         assert not list(tmp_path.iterdir())
+
+
+class _DistributedInitReached(Exception):
+    pass
+
+
+def _init_device_until_distributed_init(monkeypatch, init_method):
+    """Run init_device for rank 3 of a TP=8 engine up to the distributed
+    init and return the arguments it was given."""
+    for name, value in (
+        ("MASTER_ADDR", "10.0.0.1"),
+        ("MASTER_PORT", "29511"),
+        ("RANK", "3"),
+        ("LOCAL_RANK", "3"),
+        ("WORLD_SIZE", "8"),
+        ("LOCAL_WORLD_SIZE", "8"),
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
+    worker = _build_worker(_make_vllm_config(), rank=3)
+    worker.local_rank = 3
+    worker.distributed_init_method = init_method
+    worker.parallel_config = SimpleNamespace(
+        data_parallel_size=1, prefill_context_parallel_size=1, world_size=8
+    )
+    worker.devices = [torch.device("cpu")]
+    monkeypatch.setattr(
+        tpu_worker,
+        "get_tpu_worker_binding",
+        lambda *args, **kwargs: SimpleNamespace(rank=3, world_size=8),
+    )
+    calls = []
+
+    def fake_init_distributed_environment(**kwargs):
+        calls.append(kwargs)
+        raise _DistributedInitReached
+
+    monkeypatch.setattr(
+        tpu_worker, "init_distributed_environment", fake_init_distributed_environment
+    )
+    with pytest.raises(_DistributedInitReached):
+        worker.init_device()
+    return calls[0]
+
+
+def test_init_device_accepts_env_init_method(monkeypatch):
+    """vLLM's external_launcher executor hands each worker env://."""
+    kwargs = _init_device_until_distributed_init(monkeypatch, "env://")
+
+    assert kwargs["distributed_init_method"] == "env://"
+    assert (kwargs["rank"], kwargs["world_size"]) == (3, 8)
+    assert (os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"]) == (
+        "10.0.0.1",
+        "29511",
+    )
+
+
+def test_init_device_rejects_unknown_init_method(monkeypatch):
+    with pytest.raises(ValueError, match="env://"):
+        _init_device_until_distributed_init(monkeypatch, "ftp://10.0.0.1:21")
 
 
 def test_initialize_from_config_updates_num_gpu_blocks():
