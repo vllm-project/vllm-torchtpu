@@ -260,16 +260,6 @@ def dedup_local(m: MoEEmit, stamp: Any) -> Any:
         else:
             scr["seen"][hi, lo] = stamp
         scr["elist"][n] = e
-        if mp.ROW_TILES:
-            # The pick's expert slot: `n` when new, else the slot it got earlier in this
-            # layer. Remote experts (EP) have no slot: their entries are left alone.
-            local = jnp.bool_(True) if mp.moe_tp else lax.div(e, ER) == me
-            slot = jnp.where(new, n, scr["slotof"][hi, lo])
-            slot = jnp.where(local, slot, 0)
-            scr["slotof"][hi, lo] = jnp.where(new, n, scr["slotof"][hi, lo])
-            bit = lax.shift_left(jnp.int32(1), lax.shift_right_logical(b, 3))
-            old_mask = jnp.where(new, 0, scr["tmask"][slot])
-            scr["tmask"][slot] = jnp.where(local, lax.bitwise_or(old_mask, bit), old_mask)
         return n + jnp.where(new, 1, 0).astype(I32)
 
     n_hit = jnp.int32(0)

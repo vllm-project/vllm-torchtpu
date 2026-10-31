@@ -245,11 +245,6 @@ class MoEBlock(Block):
         }
         if mp.PIPE_EP:
             scr["acc13"] = pltpu.VMEM((ex.MB, 2 * mp.IR), F32)
-        if mp.ROW_TILES:
-            # Per routed expert (elist slot): bit t = its rows touch rows [8t, 8t + 8).
-            # `slotof` maps an expert id to its slot (valid once seen this layer).
-            scr["tmask"] = pltpu.SMEM((nb_picks,), I32)
-            scr["slotof"] = pltpu.SMEM((rup(mp.E, 128) // 128, 128), I32)
         if mp.ECOPY:
             scr.update(
                 {
