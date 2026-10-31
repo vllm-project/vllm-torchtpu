@@ -46,11 +46,23 @@ def block_rows(vocab: int) -> int:
     return 0
 
 
-def _kernel(x_ref, w_hbm, o_ref, w_vmem, sems, *, rows: int, num_blocks: int):
+def _kernel(
+    x_ref,
+    w_hbm,
+    o_ref,
+    w_vmem,
+    sems,
+    *,
+    rows: int,
+    num_blocks: int,
+    first_block: jax.Array | None = None,
+):
     i = pl.program_id(0)
     piece = rows // LOGITS_BLOCK_DMAS
 
     def copies(block, slot):
+        if first_block is not None:
+            block = first_block + block
         return [
             pltpu.make_async_copy(
                 w_hbm.at[pl.ds(block * rows + d * piece, piece)],
@@ -84,40 +96,65 @@ def _kernel(x_ref, w_hbm, o_ref, w_vmem, sems, *, rows: int, num_blocks: int):
     ).astype(o_ref.dtype)
 
 
-@functools.partial(jax.jit, static_argnames=("rows", "interpret"))
-def _streamed_logits(
-    x: jax.Array, w: jax.Array, rows: int, interpret: bool = False
+def _shard_kernel(first_ref, *refs, rows: int, num_blocks: int):
+    _kernel(*refs, rows=rows, num_blocks=num_blocks, first_block=first_ref[0])
+
+
+def _pallas_logits(
+    x: jax.Array,
+    w: jax.Array,
+    first_block: jax.Array | None,
+    rows: int,
+    num_blocks: int,
+    interpret: bool,
 ) -> jax.Array:
+    """Logits of ``num_blocks`` consecutive ``rows``-row vocab blocks of ``w``,
+    starting at block ``first_block[0]`` (block 0 when None)."""
     m, hidden = x.shape
-    vocab = w.shape[0]
-    num_blocks = vocab // rows
+    cols = num_blocks * rows
+    sharded = first_block is not None
     w_bytes = LOGITS_BUFFERS * rows * hidden * w.dtype.itemsize
     io_bytes = 2 * m * (hidden + rows) * x.dtype.itemsize
-    return pl.pallas_call(
-        functools.partial(_kernel, rows=rows, num_blocks=num_blocks),
-        out_shape=jax.ShapeDtypeStruct((m, vocab), x.dtype),
+    # Index maps get the scalar-prefetch ref as a trailing argument.
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=int(sharded),
         grid=(num_blocks,),
         in_specs=[
-            pl.BlockSpec((m, hidden), lambda i: (0, 0)),
+            pl.BlockSpec((m, hidden), lambda i, *_: (0, 0)),
             pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
         ],
-        out_specs=pl.BlockSpec((m, rows), lambda i: (0, i)),
+        out_specs=pl.BlockSpec((m, rows), lambda i, *_: (0, i)),
         scratch_shapes=[
             pltpu.VMEM((LOGITS_BUFFERS, rows, hidden), w.dtype),
             pltpu.SemaphoreType.DMA((LOGITS_BUFFERS, LOGITS_BLOCK_DMAS)),
         ],
+    )
+    operands = (first_block, x, w) if sharded else (x, w)
+    return pl.pallas_call(
+        functools.partial(
+            _shard_kernel if sharded else _kernel, rows=rows, num_blocks=num_blocks
+        ),
+        out_shape=jax.ShapeDtypeStruct((m, cols), x.dtype),
+        grid_spec=grid_spec,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=w_bytes + io_bytes + LOGITS_VMEM_SLACK_BYTES,
         ),
         cost_estimate=pl.CostEstimate(
-            flops=2 * m * hidden * vocab,
-            bytes_accessed=(vocab * hidden + m * hidden + m * vocab) * x.dtype.itemsize,
+            flops=2 * m * hidden * cols,
+            bytes_accessed=(cols * hidden + m * hidden + m * cols) * x.dtype.itemsize,
             transcendentals=0,
         ),
         name="streamed_logits",
         interpret=pltpu.InterpretParams() if interpret else False,
-    )(x, w)
+    )(*operands)
+
+
+@functools.partial(jax.jit, static_argnames=("rows", "interpret"))
+def _streamed_logits(
+    x: jax.Array, w: jax.Array, rows: int, interpret: bool = False
+) -> jax.Array:
+    return _pallas_logits(x, w, None, rows, w.shape[0] // rows, interpret)
 
 
 def streamed_logits(x: jax.Array, w: jax.Array) -> jax.Array:
@@ -126,3 +163,59 @@ def streamed_logits(x: jax.Array, w: jax.Array) -> jax.Array:
     if rows == 0:
         raise ValueError(f"no logits block tiles vocab {w.shape[0]}")
     return _streamed_logits(x, w, rows)
+
+
+def vocab_shard_layout(vocab: int, num_shards: int) -> tuple[int, int, tuple[int, ...]]:
+    """How ``num_shards`` ranks split the head's vocab blocks between them.
+
+    Returns ``(rows, blocks_per_shard, first_blocks)``: every shard streams the
+    same number of whole ``rows``-row blocks, so it computes equal-width logits
+    an all-to-all can exchange. When the blocks do not divide evenly, the last
+    shard starts early enough to end on the last block and overlaps the one
+    before it; ``vocab_shard_columns`` says which of its columns are new.
+    Returns ``blocks_per_shard == 0`` when the head cannot be split this way.
+    """
+    rows = block_rows(vocab)
+    if rows == 0:
+        return 0, 0, ()
+    num_blocks = vocab // rows
+    per_shard = -(-num_blocks // num_shards)
+    first = tuple(min(r * per_shard, num_blocks - per_shard) for r in range(num_shards))
+    return rows, per_shard, first
+
+
+def vocab_shard_columns(vocab: int, num_shards: int) -> tuple[tuple[int, int], ...]:
+    """For each shard, the ``[start, stop)`` columns of its logits that
+    concatenate, shard by shard, into the full vocab."""
+    rows, per_shard, first = vocab_shard_layout(vocab, num_shards)
+    num_blocks = vocab // rows
+    spans = []
+    for r, f in enumerate(first):
+        lo = min(r * per_shard, num_blocks)
+        hi = min((r + 1) * per_shard, num_blocks)
+        spans.append(((lo - f) * rows, (max(lo, hi) - f) * rows))
+    return tuple(spans)
+
+
+@functools.partial(jax.jit, static_argnames=("rows", "num_blocks", "interpret"))
+def _streamed_logits_shard(
+    x: jax.Array,
+    w: jax.Array,
+    first_block: jax.Array,
+    rows: int,
+    num_blocks: int,
+    interpret: bool = False,
+) -> jax.Array:
+    return _pallas_logits(x, w, first_block, rows, num_blocks, interpret)
+
+
+def streamed_logits_shard(
+    x: jax.Array, w: jax.Array, first_block: jax.Array, num_shards: int
+) -> jax.Array:
+    """``x @ w[shard].T`` for this rank's shard of ``vocab_shard_layout``:
+    ``first_block`` is int32 ``[1]`` holding the shard's first block, data
+    rather than a constant so every rank compiles the same program."""
+    rows, per_shard, _ = vocab_shard_layout(w.shape[0], num_shards)
+    if per_shard == 0:
+        raise ValueError(f"no logits block tiles vocab {w.shape[0]}")
+    return _streamed_logits_shard(x, w, first_block, rows=rows, num_blocks=per_shard)
