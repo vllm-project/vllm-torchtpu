@@ -98,8 +98,10 @@ def rms_norm_rows(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:
     XLA reduces each row's squares in a fixed order: the 128-lane column
     tiles in sequence, then (after a transpose) the 16 eight-lane groups in
     sequence, then a sublane rotate-add tree by 4, 2, 1; the rsqrt is one
-    instruction, and the weight multiply stays in f32 (excess precision) with
-    one bf16 rounding. This writes that order out explicitly.
+    instruction. The normalized row is rounded to bf16 before the weight
+    multiply, as vLLM's rms_norm writes it: torch_tpu compiles with XLA's
+    excess precision off, so XLA keeps that rounding. This writes that order
+    out explicitly.
     ``weight`` is (hidden,) bf16; tb must be a multiple of 8.
     """
     lanes, sublanes = 128, 8
@@ -118,7 +120,8 @@ def rms_norm_rows(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:
         tot = pltpu.roll(tot, shift, 0) + tot
     inv = jax.lax.rsqrt(tot[:1] * (1.0 / xf.shape[1]) + eps)  # (1, tb)
     inv_col = jnp.broadcast_to(inv, (sublanes, inv.shape[1])).T[:, :1]  # (tb, 1)
-    return ((xf * inv_col) * weight.astype(jnp.float32)).astype(jnp.bfloat16)
+    normed = (xf * inv_col).astype(jnp.bfloat16).astype(jnp.float32)
+    return (normed * weight.astype(jnp.float32)).astype(jnp.bfloat16)
 
 
 def hc_mult_of(hc_mult3: int) -> int:
