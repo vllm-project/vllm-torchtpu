@@ -81,6 +81,10 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PREPROCESS_BACKEND: str = "native"
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    TPU_MOE_EPLB_DYNAMIC: bool = False
+    TPU_MOE_EPLB_WINDOW_STEPS: int = 16
+    TPU_MOE_EPLB_MIN_GAIN: float = 0.005
+    TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 256
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -641,6 +645,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Dynamic expert re-layout (expert_relayout.py): on every clean window of
+    # WINDOW_STEPS coordinated steps, re-solve the layout from the kernel's
+    # load counts, re-lay a layer only when its slowest rank's rows drop by at
+    # least MIN_GAIN (relative), and copy the moved experts into the staging
+    # slots with tpu-sync raw transfers, at most STEP_BUDGET_MB of DMA per
+    # step. Initialized automatically with contiguous blocks + 1 redundant
+    # slot + 2 staging slots per rank when enabled.
+    # NOTE: Enabling this feature requires a tpu-sync-torch build with
+    # major_slice_bytes and FP4 (float4_e2m1fn_x2) raw-transfer support;
+    # otherwise leave this feature disabled (default off).
+    "TPU_MOE_EPLB_DYNAMIC": env_bool("TPU_MOE_EPLB_DYNAMIC"),
+    # Clean decode steps per load window before triggering a re-layout solve.
+    "TPU_MOE_EPLB_WINDOW_STEPS": env_nonnegative_int("TPU_MOE_EPLB_WINDOW_STEPS", 16),
+    # Minimum relative reduction in slowest-rank load required to adopt a plan.
+    "TPU_MOE_EPLB_MIN_GAIN": env_float("TPU_MOE_EPLB_MIN_GAIN", 0.005),
+    # Per-step H2D DMA budget in MiB for staging moved expert slabs (0 = unbounded).
+    "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB": env_nonnegative_int(
+        "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB", 256
+    ),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(

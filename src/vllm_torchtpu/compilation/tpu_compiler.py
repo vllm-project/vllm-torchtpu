@@ -154,6 +154,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # Host-side Dynamic EPLB controller/mover tuning knobs; only
+    # TPU_MOE_EPLB_DYNAMIC alters the compiled program.
+    "TPU_MOE_EPLB_WINDOW_STEPS",
+    "TPU_MOE_EPLB_MIN_GAIN",
+    "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

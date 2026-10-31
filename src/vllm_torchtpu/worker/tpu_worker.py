@@ -715,6 +715,14 @@ class TPUWorker(WorkerBase):
         if self.speculative_config is not None:
             set_torch_threads_for_runtime()
         self.model_runner.capture_model()
+        # Dynamic expert re-layout (TPU_MOE_EPLB_DYNAMIC): armed on every rank
+        # at this same point, after the weights and the compiled programs are
+        # in place; None keeps the static layout.
+        from vllm_torchtpu import expert_relayout
+
+        self.model_runner._expert_relayout = expert_relayout.arm_for_runner(
+            self.model_runner
+        )
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
