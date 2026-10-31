@@ -196,6 +196,7 @@ def _kernel(
     table_ref,
     active_tiles_ref,
     active_counts_ref,
+    dcp_rank_ref,
     query_ref,
     bitset_ref,
     lengths_ref,
@@ -245,7 +246,12 @@ def _kernel(
     if not bf16_mxu:
         q = q * score_scale
     positions = lengths_ref[:, 0] - 1
-    row = jnp.arange(kv_tile, dtype=jnp.int32)
+    # DCP: a KV tile is one table entry, dcp_world pages of tokens, of which
+    # this rank holds the page at token offset dcp_rank * page; only those
+    # rows are copied and attended (the other ranks' rows are masked anyway).
+    tile_rows = kv_tile // dcp_world
+    rank_offset = dcp_rank_ref[0] * tile_rows if dcp_world > 1 else 0
+    row = jnp.arange(tile_rows, dtype=jnp.int32)
     count = active_counts_ref[block]
 
     def active_tile(slot):
@@ -256,12 +262,11 @@ def _kernel(
         copies = []
         # One mask word covers ratio * 32 tokens. Split there because a
         # shared pool page may contain an odd number of these segments.
-        copy_rows = min(kv_tile, physical_page_size, ratio * 32)
-        for offset in range(0, kv_tile, copy_rows):
+        copy_rows = min(tile_rows, physical_page_size, ratio * 32)
+        for offset in range(0, tile_rows, copy_rows):
             logical = tile * kv_tile + offset
             # DCP: a table entry covers dcp_world pages' worth of tokens and
-            # this rank's rows sit in that entry's page at t % page size (the
-            # other ranks' rows of the tile are masked out of the bitset).
+            # this rank's rows sit in that entry's page at t % page size.
             page = logical // (physical_page_size * dcp_world)
             in_page = logical % physical_page_size
             # An odd final logical page has no second half. Its selection
@@ -269,7 +274,7 @@ def _kernel(
             address = block * pages_per_query + jnp.minimum(page, pages_per_query - 1)
             physical = table_ref[address]
             destination = (
-                kv_ref if copy_rows == kv_tile else kv_ref.at[pl.ds(offset, copy_rows)]
+                kv_ref if copy_rows == tile_rows else kv_ref.at[pl.ds(offset, copy_rows)]
             )
             copies.append(
                 pltpu.make_async_copy(
@@ -298,7 +303,7 @@ def _kernel(
             words = utils.strided_load(
                 cache_words,
                 head_axis,
-                kv_tile * head_axes,
+                tile_rows * head_axes,
                 head_axes,
             )
             pairs.extend(
@@ -318,34 +323,35 @@ def _kernel(
     accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
 
     def compute_tile(tile, kv_ref):
-        logical = tile * kv_tile
+        logical = tile * kv_tile + rank_offset
         # Dynamic scalar indexing must address a native 128-wide row.  Keep
         # query bits on that row and slice the statically known live prefix.
         # Query blocks longer than 256 rows store one bitset per 256 rows.
         parts = bitset_ref.shape[0]
         live = query_block // parts
         pieces = []
+        tile_words = tile_rows // (ratio * 32)
+        word_base = (kv_tile // (ratio * 32)) * tile + rank_offset // (ratio * 32)
         for part in range(parts):
-            tile_words = kv_tile // (ratio * 32)
             if tile_words > 1:
                 # Select integer words before extracting bits. A select between
                 # two bool matrices forces an unsupported Mosaic i1->i8 layout.
-                word = bitset_ref[part, tile_words * tile, :live][:, None]
+                word = bitset_ref[part, word_base, :live][:, None]
                 for index in range(1, tile_words):
                     word = jnp.where(
                         row[None, :] < index * ratio * 32,
                         word,
-                        bitset_ref[part, tile_words * tile + index, :live][:, None],
+                        bitset_ref[part, word_base + index, :live][:, None],
                     )
                 pieces.append(((word >> ((row // ratio) % 32)[None, :]) & 1) != 0)
             else:
-                word = bitset_ref[part, tile, :live]
+                word = bitset_ref[part, word_base, :live]
                 group_in_tile = row // ratio
                 pieces.append(((word[:, None] >> group_in_tile[None, :]) & 1) != 0)
         visible = pieces[0] if parts == 1 else jnp.concatenate(pieces, axis=0)
         visible &= logical + row[None, :] <= positions[:, None]
         written = logical + lax.broadcasted_iota(
-            jnp.int32, (kv_tile, head_dim), 0
+            jnp.int32, (tile_rows, head_dim), 0
         ) < jnp.max(lengths_ref[:, 0])
         # Decode each KV head once per tile; every query subtile reuses it.
         key_values = []
@@ -390,8 +396,8 @@ def _kernel(
                 )
                 row_visible = jnp.broadcast_to(
                     tile_visible[None, :, :],
-                    (q_heads_per_kv, query_tile, kv_tile),
-                ).reshape(rows, kv_tile)
+                    (q_heads_per_kv, query_tile, tile_rows),
+                ).reshape(rows, tile_rows)
                 score = jnp.where(
                     row_visible,
                     score * score_scale if bf16_mxu else score,
@@ -734,7 +740,7 @@ def block_sparse_gqa_prefill(
             **({"dcp_world": dcp_world} if dcp else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=4,
             grid=(nblocks,),
             in_specs=[
                 pl.BlockSpec(
@@ -754,8 +760,8 @@ def block_sparse_gqa_prefill(
                 else out_spec
             ),
             scratch_shapes=[
-                pltpu.VMEM((kv_tile, head_axis, packing, head_dim), cache.dtype),
-                pltpu.VMEM((kv_tile, head_axis, packing, head_dim), cache.dtype),
+                pltpu.VMEM((kv_tile // dcp_world, head_axis, packing, head_dim), cache.dtype),
+                pltpu.VMEM((kv_tile // dcp_world, head_axis, packing, head_dim), cache.dtype),
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA,
                 pltpu.VMEM(state_shape, jnp.float32),
@@ -804,6 +810,11 @@ def block_sparse_gqa_prefill(
         table.reshape(-1),
         active_tiles.reshape(-1),
         active_counts,
+        (
+            jnp.asarray(dcp_rank, jnp.int32).reshape(-1)[:1]
+            if dcp
+            else jnp.zeros((1,), jnp.int32)
+        ),
         query.astype(jnp.bfloat16 if bf16_io else jnp.float32),
         block_bits_native,
         lengths[:, None],
