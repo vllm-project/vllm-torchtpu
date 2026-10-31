@@ -65,6 +65,17 @@ def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
     return F.pad(t, pad, value=value)
 
 
+def dp_lockstep_num_reqs(dp_step_max_reqs: int, local_num_reqs: int) -> int:
+    """Per-chunk request count all EP-DP lockstep ranks size the draft to: the
+    step's all-reduced max (_dp_coordinated_step), not the static max_num_reqs."""
+    num_reqs = max(1, dp_step_max_reqs)
+    assert local_num_reqs <= num_reqs, (
+        f"chunk has {local_num_reqs} requests but the DP-coordinated per-chunk "
+        f"bound is {num_reqs}"
+    )
+    return num_reqs
+
+
 @dataclass
 class DraftChunkInputs:
     # Full padded request-major token ids for this draft chunk, captured before a
