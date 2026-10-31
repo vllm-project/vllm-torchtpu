@@ -3311,6 +3311,7 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     """
     from vllm_torchtpu import envs
 
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", True)
     seen = []
@@ -3325,14 +3326,22 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
         lambda model: seen.append(("hash", model)),
     )
     runner = MagicMock(spec=TPUModelRunner)
+    runner._truncate_rope_caches.side_effect = lambda model: seen.append(
+        ("truncate", model)
+    )
     draft_model = object()
 
     TPUModelRunner._relayout_tables(runner, draft_model)
-    assert seen == [("rope", draft_model), ("hash", draft_model)]
+    assert seen == [
+        ("truncate", draft_model),
+        ("rope", draft_model),
+        ("hash", draft_model),
+    ]
 
     # No draft (ngram) or flags off: nothing to relayout.
     seen.clear()
     TPUModelRunner._relayout_tables(runner, None)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", False)
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
     TPUModelRunner._relayout_tables(runner, draft_model)
@@ -3652,3 +3661,174 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def _bare_rope(cls, rows: int) -> torch.nn.Module:
+    """A `cls` instance holding only a `[rows, 8]` cos_sin_cache buffer;
+    `_truncate_rope_caches` dispatches on the type and reads only the buffer."""
+    module = cls.__new__(cls)
+    torch.nn.Module.__init__(module)
+    module.register_buffer("cos_sin_cache", torch.zeros(rows, 8), persistent=False)
+    return module
+
+
+def test_truncate_rope_caches_covers_deepseek_scaling(monkeypatch):
+    """TPU_ROPE_CACHE_TRUNCATE also truncates DeepSeek-scaling caches (MLA
+    YaRN and DeepSeek-V4), preserves shared buffers across both truncation and
+    row-major relayout, and reaches the draft model via `_relayout_tables`."""
+    from vllm.model_executor.layers.rotary_embedding import (
+        DeepseekScalingRotaryEmbedding,
+        RotaryEmbedding,
+    )
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
+    )
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmDeepseekScalingRotaryEmbedding,
+    )
+
+    max_len = 32
+    shared_buf = torch.arange(128 * 8, dtype=torch.float32).reshape(128, 8)
+    shared_a = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    shared_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    shared_a.cos_sin_cache = shared_buf
+    shared_b.cos_sin_cache = shared_buf
+    # Distinct sole-owner buffers stay distinct after truncation + relayout.
+    sole_a = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    sole_a.cos_sin_cache.fill_(1.0)
+    sole_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    sole_b.cos_sin_cache.fill_(2.0)
+    model = torch.nn.ModuleDict(
+        {
+            "rope": _bare_rope(RotaryEmbedding, 128),
+            "deepseek": _bare_rope(DeepseekScalingRotaryEmbedding, 128),
+            "tpu_deepseek": _bare_rope(VllmDeepseekScalingRotaryEmbedding, 128),
+            "deepseek_v4": _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128),
+            "sole_a": sole_a,
+            "sole_b": sole_b,
+            "shared_a": shared_a,
+            "shared_b": shared_b,
+            "short": _bare_rope(DeepseekScalingRotaryEmbedding, 16),
+        }
+    )
+    other = torch.nn.Module()
+    other.register_buffer("cos_sin_cache", torch.zeros(128, 8), persistent=False)
+    model["other"] = other
+
+    draft_shared_buf = torch.ones(128, 8)
+    draft_shared_a = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    draft_shared_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    draft_shared_a.cos_sin_cache = draft_shared_buf
+    draft_shared_b.cos_sin_cache = draft_shared_buf
+    draft_model = torch.nn.ModuleDict(
+        {
+            "draft_rope": _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128),
+            "shared_a": draft_shared_a,
+            "shared_b": draft_shared_b,
+        }
+    )
+
+    relayout_calls = 0
+
+    def fake_to_row_major(t: torch.Tensor) -> torch.Tensor:
+        nonlocal relayout_calls
+        relayout_calls += 1
+        return t.clone()
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+    monkeypatch.setattr(runner_utils_module, "_to_row_major", fake_to_row_major)
+    monkeypatch.setattr(runner_utils_module, "_install_entry_layout_pin", lambda: None)
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.model = model
+    runner.speculative_config = None
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=max_len
+    )
+
+    runner._truncate_rope_caches(model)
+    runner_utils_module.relayout_rope_caches(model)
+    runner._relayout_tables(draft_model)
+
+    for name in (
+        "rope",
+        "deepseek",
+        "tpu_deepseek",
+        "deepseek_v4",
+        "sole_a",
+        "sole_b",
+        "shared_a",
+        "shared_b",
+    ):
+        assert model[name].cos_sin_cache.shape == (max_len, 8), name
+    assert model["sole_a"].cos_sin_cache is not model["sole_b"].cos_sin_cache
+    assert torch.all(model["sole_a"].cos_sin_cache == 1.0)
+    assert torch.all(model["sole_b"].cos_sin_cache == 2.0)
+    assert model["shared_a"].cos_sin_cache is model["shared_b"].cos_sin_cache
+    assert model["short"].cos_sin_cache.shape == (16, 8)
+    assert model["other"].cos_sin_cache.shape == (128, 8)
+    assert draft_model["draft_rope"].cos_sin_cache.shape == (max_len, 8)
+    assert draft_model["shared_a"].cos_sin_cache.shape == (max_len, 8)
+    assert (
+        draft_model["shared_a"].cos_sin_cache is draft_model["shared_b"].cos_sin_cache
+    )
+    # 8 unique RoPE buffers in `model` (shared_a/shared_b share 1, plus short)
+    # + 2 unique RoPE buffers in `draft_model` (draft_rope + shared_a/shared_b).
+    assert relayout_calls == 10
+
+
+def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
+    """Under MTP K > 1, un-clamped draft positions at the end of context reach
+    `max_model_len - 2 + (K - 1) >= max_model_len`; both target and draft RoPE
+    caches keep 8-row-aligned speculative slack so those rows stay in bounds."""
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
+    )
+
+    from vllm_torchtpu import envs
+
+    max_len = 32
+    spec_k = 3
+    # cdiv(32 + 3, 8) * 8 == 40 rows.
+    expected_rows = 40
+    untruncated = torch.arange(128 * 8, dtype=torch.float32).reshape(128, 8)
+
+    target_rope = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    target_rope.cos_sin_cache = untruncated.clone()
+    model = torch.nn.ModuleDict({"rope": target_rope})
+
+    draft_rope = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    draft_rope.cos_sin_cache = untruncated.clone()
+    draft_model = torch.nn.ModuleDict({"draft_rope": draft_rope})
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.model = model
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=spec_k)
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=max_len
+    )
+
+    runner._truncate_rope_caches(model)
+    runner._relayout_tables(draft_model)
+
+    assert model["rope"].cos_sin_cache.shape == (expected_rows, 8)
+    assert draft_model["draft_rope"].cos_sin_cache.shape == (expected_rows, 8)
+
+    # End-of-context request whose last accepted token is at max_model_len - 2:
+    # K = 3 draft steps advance positions [30, 31, 32] (reaching max_model_len).
+    draft_positions = torch.tensor(
+        [max_len - 2 + step for step in range(spec_k)], dtype=torch.long
+    )
+    assert int(draft_positions.max().item()) == max_len
+    torch.testing.assert_close(
+        draft_model["draft_rope"].cos_sin_cache[draft_positions],
+        untruncated[draft_positions],
+    )
