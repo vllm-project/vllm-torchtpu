@@ -3172,15 +3172,6 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
     compressed = _dot(local, weights.key_value_down_projection).astype(
         jnp.bfloat16
     )
-    if sp_axis is not None:
-        width = query_latent.shape[1]
-        both = jax.lax.all_gather(
-            jnp.concatenate((query_latent, compressed), axis=1), sp_axis, tiled=True
-        )
-        query_latent, compressed = both[:, :width], both[:, width:]
-    query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
-    query = query.reshape(tokens, _HEADS, 256)
-
     kv_latent = compressed[:, :512].astype(jnp.float32)
     kv_latent = (
         kv_latent
@@ -3189,12 +3180,24 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
         )
         * weights.key_value_normalization
     ).astype(jnp.bfloat16)
+    rope = compressed[:, 512:576]
+    if sp_axis is not None:
+        width = query_latent.shape[1]
+        both = jax.lax.all_gather(
+            jnp.concatenate((query_latent, kv_latent, rope), axis=1), sp_axis, tiled=True
+        )
+        query_latent = both[:, :width]
+        kv_latent = both[:, width : width + 512]
+        rope = both[:, width + 512 :]
+    query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
+    query = query.reshape(tokens, _HEADS, 256)
+
     expanded = _dot(kv_latent, weights.key_value_up_projection).astype(jnp.bfloat16)
     expanded = expanded.reshape(tokens, _HEADS, 256)
     new_key = jnp.concatenate(
         (
             expanded[:, :, :128],
-            jnp.broadcast_to(compressed[:, None, 512:576], (tokens, _HEADS, 64)),
+            jnp.broadcast_to(rope[:, None, :], (tokens, _HEADS, 64)),
             jnp.zeros((tokens, _HEADS, 64), jnp.bfloat16),
         ),
         axis=2,
@@ -3202,7 +3205,7 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
     new_value = expanded[:, :, 128:]
     output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
     if return_latent:
-        latent = jnp.concatenate((kv_latent, compressed[:, 512:576]), axis=1)
+        latent = jnp.concatenate((kv_latent, rope), axis=1)
         return query, new_key, new_value, output_gate, latent
     return query, new_key, new_value, output_gate
 
@@ -3921,6 +3924,7 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
          pk_buf, pv_buf, psems) = refs
     else:
         q_ref, k_hbm, v_hbm, out_ref, k_buf, v_buf, sems = refs
+        prefix_k_hbm = prefix_v_hbm = pk_buf = pv_buf = psems = None
     head, query_block = pl.program_id(0), pl.program_id(1)
     length = length_ref[0]
     offsets = [segment_ref[s] for s in range(count)]
@@ -3961,7 +3965,7 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
         jnp.full((1, q_tile), -jnp.inf, jnp.float32),
         jnp.zeros((128 + _ONES, q_tile), jnp.float32),
     )
-    fp8 = prefixed and pk_buf.dtype == jnp.float8_e4m3fn
+    fp8 = prefixed and pk_buf is not None and pk_buf.dtype == jnp.float8_e4m3fn
     # FP8 prefix: every probability is 2**PROB_SHIFT larger (exact for BF16 and
     # FP32; the ratio to the ones-row denominator is unchanged).
     pshift = PROB_SHIFT if fp8 else 0.0
@@ -4570,19 +4574,21 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
         raise ValueError(f"segments must be [{fields} * count]")
     length = jnp.asarray(length, jnp.int32).reshape((1,))
     q_tile, k_tile = _tiles(tokens, tokens, tile)
-    # Prefix keys stream in their own tiles (the arena capacity, not the
-    # window, bounds them); a window under 1024 rows is one query tile.
-    if _config().mla_flash_prefix_tiles and tokens < _config().mla_flash_qtile and tokens % 256 == 0:
+    # A window under mla_flash_qtile rows is one query tile when the fragment
+    # loop covers it (at most FRAGMENT rows, or a multiple of it).
+    if (_config().mla_flash_prefix_tiles and tokens < _config().mla_flash_qtile and tokens % 256 == 0
+            and (tokens <= FRAGMENT or tokens % FRAGMENT == 0)):
         q_tile = tokens
-    p_tile = k_tile
-    if arena is not None and _config().mla_flash_prefix_tiles:
-        p_tile = _config().mla_flash_ktile
-        if arena[0].shape[2] % p_tile:
-            p_tile = k_tile
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     scalars = (length, segments.astype(jnp.int32))
     operands = (query, key[None], jnp.swapaxes(value, 1, 2)[None])  # the window as a one-layer arena
     in_specs = (pl.BlockSpec((1, q_tile, 256), lambda h, i, *_: (h, i, 0)), hbm, hbm)
+    # Prefix keys stream in mla_flash_ktile tiles (the arena capacity, not
+    # the window, bounds them) when the capacity divides into them.
+    p_tile = k_tile
+    if (arena is not None and _config().mla_flash_prefix_tiles and arena[0].ndim == 4
+            and arena[0].shape[2] % _config().mla_flash_ktile == 0):
+        p_tile = _config().mla_flash_ktile
     if arena is not None:
         arena_keys, arena_values = arena
         if (arena_keys.ndim != 4 or arena_keys.shape[1:] != (heads, arena_keys.shape[2], 256)
@@ -5342,7 +5348,7 @@ def make_moe_fused_sp_repacked(mesh, *, seq_len, eps=1e-5, collective_id=42,
         partials, shared = partial_op(hidden, prefix, weights, length)
         reduced = ring_reduce_scatter_fp32(
             partials, mesh, tables,
-            collective_id=collective_id, dtype=jnp.dtype(_config().moe_reduce_dtype),
+            collective_id=collective_id, dtype=jnp.float32,
         )
         reduced = reduced.reshape(32, local_tokens, 3584)
         return tail_op(reduced, shared, prefix, weights, length)
@@ -5444,17 +5450,10 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     cfg = active()
     if (
         cfg.prefill_fused_moe
-        and cfg.prefill_expert_parallel == 16
-        and (
-            seq_len in (4096, 8192)
-            or (cfg.moe_reduce_dtype == "float32" and seq_len in (512, 1024, 2048))
-        )
+        and cfg.prefill_expert_parallel in (8, 16)
+        and seq_len in (512, 1024, 2048, 4096, 8192)
     ):
-        if cfg.moe_reduce_dtype == "float32":
-            from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
-        else:
-            # Preserve the supported per-hop BF16 reduction implementation.
-            from .prefill_moe.layer import make_indexed_moe_sp_ring as make_packed_moe
+        from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
         return make_packed_moe(mesh, seq_len=seq_len)
     return _make_indexed_moe_sp_ring_reference(mesh, seq_len=seq_len)
 

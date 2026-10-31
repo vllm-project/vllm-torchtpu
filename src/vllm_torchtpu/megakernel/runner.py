@@ -39,7 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel import (
     backend,
@@ -121,26 +121,29 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
     if spec is not None and spec.method != "dspark":
         raise NotImplementedError("the K3 decoder speculates with DSpark only")
     config = MegakernelEngineConfig.from_vllm_config(vllm_config)
-    moe_reduce_dtype = tpu_envs.TPU_K3_MOE_REDUCE_DTYPE
     if config.attention_dp > 1:
         k3.check(config)
-    if config.attention_dp > 1 or moe_reduce_dtype != "float32":
+    aggregate = config.role == "aggregate"
+    if config.attention_dp > 1 or aggregate:
         from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
 
         # Kernel modules read the config at import: install it before the
         # program imports them.
+        prefill_ep = 16 if (not aggregate or envs.K3_AGGREGATE_EP16) else 8
         kernel_config.install(
             kernel_config.KernelConfig(
                 attention_dp=config.attention_dp,
                 dcp_group=config.decode_context_parallel_size,
-                moe_reduce_dtype=moe_reduce_dtype,
+                # The aggregate prefill shares the decode's EP8 experts unless
+                # K3_AGGREGATE_EP16=1 requests banked EP16 experts.
+                prefill_expert_parallel=prefill_ep,
             )
         )
     # The prefill computes the rings of its loader config's draft; the
     # decoder drafts with the speculative config's model (and imports rings).
     if config.role == "prefill":
         draft = backend.draft(vllm_config)
-    else:
+    else:  # decode, aggregate: the speculative config's model
         draft = Path(str(spec.model)) if spec is not None else None
     return k3.build(config, backend.presharded(vllm_config), draft, tp_rank=tp_rank)
 
@@ -333,6 +336,17 @@ class MegakernelModelRunner(TPUModelRunner):
             for i, request in enumerate(step_input.requests)
         }
 
+    def _num_draft_per_req_scheduled(
+        self, step_input: StepInput, scheduler_output: SchedulerOutput
+    ) -> dict[int, int]:
+        """Drafts each request verifies this step, from the scheduler's draft
+        slots (an aggregate step also holds prompt chunks)."""
+        spec = scheduler_output.scheduled_spec_decode_tokens or {}
+        return {
+            i: len(spec.get(request.req_id, ()))
+            for i, request in enumerate(step_input.requests)
+        }
+
     @torch.no_grad()
     def execute_model(
         self, scheduler_output: SchedulerOutput, intermediate_tensors: Any = None
@@ -359,8 +373,13 @@ class MegakernelModelRunner(TPUModelRunner):
             )
         step_input = self._prepare_step_input(scheduler_output)
         assert self.program is not None
+        drafts = (
+            self._num_draft_per_req_scheduled(step_input, scheduler_output)
+            if self.megakernel_role == "aggregate"
+            else self._num_draft_per_req(step_input)
+        )
         if (
-            self.megakernel_role == "decode"
+            self.megakernel_role in ("decode", "aggregate")
             and scheduler_output.has_structured_output_requests
         ):
             # A structured request decodes this step: the grammar bitmask
@@ -370,15 +389,12 @@ class MegakernelModelRunner(TPUModelRunner):
             # launches ahead of the previous step's host-side output
             # processing).
             self.execute_model_state = MegakernelStepState(
-                scheduler_output,
-                None,
-                self._num_draft_per_req(step_input),
-                step_input,
+                scheduler_output, None, drafts, step_input
             )
             return None
         output = self.program.step(step_input)
         self.execute_model_state = MegakernelStepState(
-            scheduler_output, output.tokens, self._num_draft_per_req(step_input)
+            scheduler_output, output.tokens, drafts
         )
         return None
 

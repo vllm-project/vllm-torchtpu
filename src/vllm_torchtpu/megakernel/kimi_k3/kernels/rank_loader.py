@@ -37,6 +37,12 @@ PREFILL_IO = ("embedding", "lm_head", "output_res", "final_norm")
 PREFILL_KDA = ("k_gate", "k_fb", "k_projection", "k_conv", "k_a_log", "k_dt", "k_norm", "k_o")
 PREFILL_MLA = ("m_qa", "m_qb", "m_ka", "m_kb", "m_gate", "m_qnorm", "m_knorm", "m_o")
 PREFILL_MOE_DENSE = ("router", "router_bias", "latent_norm")
+# Prefill families that are the decode's tensors as loaded (EP8 experts; k_o and
+# m_o differ, and the latent and shared projections come from the SP cache).
+PREFILL_SHARED = (PREFILL_IO + PREFILL_COMMON
+                  + tuple(n for n in PREFILL_KDA if n != "k_o")
+                  + tuple(n for n in PREFILL_MLA if n != "m_o")
+                  + PREFILL_MOE_DENSE + EXPERT_FAMILIES)
 
 
 def _dtype(name: str) -> np.dtype:
@@ -544,13 +550,18 @@ def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
 
 
 def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 93,
-                      split_experts: bool = False) -> Iterator[tuple[str, str, np.ndarray]]:
+                      split_experts: bool = False,
+                      skip: frozenset = frozenset()) -> Iterator[tuple[str, str, np.ndarray]]:
     """The prefill stack's weights for ``rank``.
 
     Yields ``(group, name, array)`` with ``group`` in io/common/kda/mla/moe
     (per-rank arrays, without the rank axis); expert families first
-    (``split_experts``: per file, as in :func:`iter_decode_rank`).
+    (``split_experts``: per file, as in :func:`iter_decode_rank`). Families in
+    ``skip`` (a subset of :data:`PREFILL_SHARED`, EP8 only for the experts)
+    are not read: the caller already holds them.
     """
+    if not skip <= set(PREFILL_SHARED):
+        raise ValueError(f"prefill families {sorted(skip - set(PREFILL_SHARED))} cannot be shared")
     rank_dir = RankDir(presharded, rank, layers)
     peer_dir = RankDir(presharded, rank ^ 1, layers)
     cache = Path(projection_cache)
@@ -570,8 +581,12 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
                 lambda: projection(name))
 
     ep = _config().prefill_expert_parallel
+    if skip & set(EXPERT_FAMILIES) and (ep != 8 or not set(EXPERT_FAMILIES) <= skip):
+        raise ValueError("only all four EP8 prefill expert families are the decode's tensors")
     jobs: list[tuple] = []
-    if ep in (16, 32):  # regrouped from the EP8 group's quarters (same host)
+    if skip & set(EXPERT_FAMILIES):
+        pass  # the decode's EP8 experts
+    elif ep in (16, 32):  # regrouped from the EP8 group's quarters (same host)
         group = 4 * (rank // 4)
         if ep == 32:  # 28 whole experts
             quarters, part, parts = range(4), rank % 4, 4
@@ -599,21 +614,29 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
         families = split_kda_projection(value)
         del value
         for name in PREFILL_IO:
-            yield "io", name, families[name]
+            if name not in skip:
+                yield "io", name, families[name]
         for name in PREFILL_COMMON:
-            yield "common", name, families[name]
+            if name not in skip:
+                yield "common", name, families[name]
         for name in PREFILL_KDA:
+            if name in skip:
+                continue
             family = families[name]
             if name == "k_o":
                 family = _sequence_parallel_output(family, peer_dir, "k_o", rank)
             yield "kda", name, family
         for name in PREFILL_MLA:
+            if name in skip:
+                continue
             family = families[name]
             if name == "m_o":
                 family = _sequence_parallel_output(family, peer_dir, "m_o", rank)
             yield "mla", name, family
         plan = prefill_expert_plan(layers) if ep == 16 else None
         for name in PREFILL_MOE_DENSE:
+            if name in skip:
+                continue
             family = families[name]
             if plan is not None and name in ("router", "router_bias"):
                 # Physical expert p's router column is logical expert order[l, p].

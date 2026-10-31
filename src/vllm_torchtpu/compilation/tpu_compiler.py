@@ -152,6 +152,13 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # Host-side K3 scheduler policy and diagnostic output path; none change
+    # any compiled graph or custom-kernel lowering.
+    "K3_MAX_PREFILL_STEP_TOKENS",
+    "K3_PREFILL_ROUTE_COUNTS_DIR",
+    "K3_PREFILL_SJF",
+    "K3_PREFILL_SJF_AGING",
+    "K3_SERIAL_PREFILL",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
