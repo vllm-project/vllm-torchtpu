@@ -201,7 +201,9 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
     monkeypatch.setattr(current_platform, "device_type", "cpu")
     request.getfixturevalue("dist_ctx")
     # Only skip Pallas op registration, which needs the worker's TPU mesh.
-    monkeypatch.setattr(VllmDeepseekV4Indexer, "_build_indexer_op", lambda self: None)
+    monkeypatch.setattr(
+        VllmDeepseekV4Indexer, "_build_indexer_op", lambda self, from_latent: None
+    )
     hf_config = DeepseekV4Config(
         hidden_size=128,
         num_attention_heads=2,
