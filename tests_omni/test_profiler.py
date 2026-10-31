@@ -224,3 +224,24 @@ def test_tpu_omni_profiler_canonical_ts_sync(tmp_path, tpu_profiler, monkeypatch
         "both ranks of one run must resolve the same canonical ts so their "
         f"XSpaces land in one plugins/profile/<ts> dir, got {ts0} vs {ts1}"
     )
+
+
+def test_tpu_omni_profiler_forwards_profiler_kwargs(tmp_path, tpu_profiler):
+    wrapper = TpuOmniTorchProfilerWrapper(_profiler_config(tmp_path), "w_kwargs", 0)
+    wrapper._profiler_kwargs = {
+        "host_tracer_level": 3,
+        "python_tracer_level": 1,
+        "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+        "e2e_enable_fw_throttle_event": True,
+    }
+
+    wrapper._start()
+
+    _, tpu_kwargs = tpu_profiler.tpu_config.call_args
+    assert tpu_kwargs["host_tracer_level"] == 3
+    assert tpu_kwargs["python_tracer_level"] == 1
+    assert (
+        tpu_kwargs["experimental_options"]["tpu_trace_mode"] == "TRACE_COMPUTE_AND_SYNC"
+    )
+    assert tpu_kwargs["experimental_options"]["e2e_enable_fw_throttle_event"] is True
+    wrapper._stop()
