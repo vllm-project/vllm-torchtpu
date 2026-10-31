@@ -1,0 +1,14 @@
+[
+  {
+    "mode": "aot_tpu7x",
+    "config": "FULL",
+    "R": 16,
+    "L": 78,
+    "TMAX": 16,
+    "vmem_scratch_mib": 55.94,
+    "compile_s": 36.63,
+    "hlo_lines": 444,
+    "n_weights": 164,
+    "n_caches": 5
+  }
+]
