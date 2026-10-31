@@ -59,9 +59,12 @@ from vllm.distributed import parallel_state
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
+from vllm_torchtpu.kernels.experimental import rotated_collectives
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill import combine_scatter
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     fused_moe_prefill,
     plan_blocks,
+    row_all_gather,
 )
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
     _quantize_rows,
@@ -119,6 +122,9 @@ _SELFTEST_OPS: dict[all_reduce.AllReduceSpec, Any] = {}
 _RANK_BUFFER: torch.Tensor | None = None
 # TPU_MOE_TP_DECODE_SHARED_META: one experts_start buffer per (device, value).
 _E0_BUFFERS: dict[tuple[str, int], torch.Tensor] = {}
+# TPU_MOE_PREFILL_ROTATED_COLLECTIVES: (chip coords, core on chip) per mesh
+# index of each op mesh the rotated collectives run over (None: XLA's).
+_ROTATED_PLACES: dict[Any, list | None] = {}
 _SELFTEST_DONE = False
 
 
@@ -593,14 +599,17 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     return body
 
 
-def _split_body(statics: _OpStatics, n_ranks: int, axis: str):
+def _split_body(statics: _OpStatics, n_ranks: int, axis: str, rotated=None):
     """The op's per-rank body for TPU_PREFILL_SEQ_PARALLEL: x, scores and the
     optional x_q / x_scale hold this core's rows of the step (`own_rows`), and
     so does the output. Each core routes and quantizes its own rows, the fp8
     rows, scales and routes are all-gathered, and the fused MoE prefill kernel
     runs as in _prefill_chain, without the all-gather after its
     reduce-scatter. Every row's routing, quantization and sum are the ones
-    _op_body computes for it."""
+    _op_body computes for it. `rotated` (TPU_MOE_PREFILL_ROTATED_COLLECTIVES):
+    the peer tables (all-gather, reduce-scatter, and the fused combine's or None
+    without TPU_MOE_PREFILL_COMBINE_SCATTER) of the rotated collectives
+    over the op's mesh, numpy int32; the core's mesh index comes from `rank`."""
 
     def body(
         x,
@@ -641,7 +650,12 @@ def _split_body(statics: _OpStatics, n_ranks: int, axis: str):
         core_major = envs.TPU_MOE_PREFILL_GATHER_ONCE
         if core_major:
             w, ids, x_scale = gather_routes(w, ids, x_scale, axis)
-            x_q = lax.all_gather(x_q, axis, axis=0, tiled=True)
+            if rotated is not None and row_all_gather.supports(x_q.shape, x_q.dtype):
+                x_q = row_all_gather.all_gather(
+                    x_q, rank.reshape(1), jnp.asarray(rotated[0]), axis=axis
+                )
+            else:
+                x_q = lax.all_gather(x_q, axis, axis=0, tiled=True)
         else:
             x_q, x_scale, w, ids = (
                 gather_rows(a, axis) for a in (x_q, x_scale, w, ids.astype(jnp.int32))
@@ -666,6 +680,9 @@ def _split_body(statics: _OpStatics, n_ranks: int, axis: str):
             x_scale=x_scale,
             scatter=True,
             core_major=core_major,
+            rank=rank.reshape(1) if rotated is not None and core_major else None,
+            rs_table=rotated[1] if rotated is not None and core_major else None,
+            cs_table=rotated[2] if rotated is not None and core_major else None,
         ).astype(x.dtype)
 
     return body
@@ -684,7 +701,10 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False, split: bool = Fal
     # Operands as moe_tp_decode_forward passes them; bias and the padding mask
     # are replicated, everything else is per rank.
     specs = (P(axis), P(axis), P(), P()) + (P(axis),) * (12 if prequant else 10)
-    body = (_split_body if split else _op_body)(statics, int(mesh.size), axis)
+    if split:
+        body = _split_body(statics, int(mesh.size), axis, _rotated_tables(mesh))
+    else:
+        body = _op_body(statics, int(mesh.size), axis)
 
     sharded = jax.shard_map(
         body, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
@@ -879,6 +899,49 @@ def _chip_places(topo: _Topology) -> list[tuple[tuple[int, ...], int | None]]:
     return [(s["coords"], s["core"]) for s in seen]
 
 
+def _rotated_places(topo: _Topology) -> list | None:
+    """TPU_MOE_PREFILL_ROTATED_COLLECTIVES: (chip coords, core on chip) per
+    index of the op's mesh when it is a 2x2x2 slice of 2-core chips, else None
+    with the reason logged (XLA's collectives). Collective: every rank gathers
+    every rank's device, and all get the same answer."""
+    if not envs.TPU_MOE_PREFILL_GATHER_ONCE:
+        raise ValueError(
+            "TPU_MOE_PREFILL_ROTATED_COLLECTIVES needs TPU_MOE_PREFILL_GATHER_ONCE=1"
+        )
+    if int(topo.mesh.size) != rotated_collectives.CORES:
+        reason = f"the mesh has {int(topo.mesh.size)} cores, not 16"
+    else:
+        try:
+            places = _chip_places(topo)
+            rotated_collectives.Layout(places)
+        except (RuntimeError, ValueError) as e:
+            reason = str(e)
+        else:
+            logger.info(
+                "TPU_MOE_PREFILL_ROTATED_COLLECTIVES: the split MoE op's fp8 row "
+                "all-gather and last reduce-scatter run rotated over %s",
+                places,
+            )
+            return places
+    logger.warning("TPU_MOE_PREFILL_ROTATED_COLLECTIVES: %s; XLA's collectives", reason)
+    return None
+
+
+def _rotated_tables(mesh) -> tuple | None:
+    """The rotated collectives' peer tables (all-gather, reduce-scatter) over
+    `mesh`, numpy int32, when arming found it a 2x2x2 slice; else None."""
+    places = _ROTATED_PLACES.get(mesh)
+    if places is None:
+        return None
+    return (
+        rotated_collectives.peer_table(places, "all_gather"),
+        rotated_collectives.peer_table(places, "reduce_scatter"),
+        combine_scatter.scatter_table(places)
+        if envs.TPU_MOE_PREFILL_COMBINE_SCATTER
+        else None,
+    )
+
+
 def _gather(obj) -> list:
     """all_gather_object over the TP group's CPU group."""
     tp = parallel_state.get_tp_group()
@@ -975,6 +1038,10 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
                 for i in range(0, len(ids), 2)
             ),
         )
+    if plan and envs.TPU_MOE_PREFILL_ROTATED_COLLECTIVES:
+        assert not isinstance(topo, str)
+        if topo.mesh not in _ROTATED_PLACES:
+            _ROTATED_PLACES[topo.mesh] = _rotated_places(topo)
     if plan and not _SELFTEST_DONE:
         assert not isinstance(topo, str)
         device = plan[0][0].routed_experts.w13_weight.device
