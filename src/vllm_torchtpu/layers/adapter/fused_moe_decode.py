@@ -97,6 +97,11 @@ _RANK_BUFFER_START = 0
 _RANK_BUFFER_INDEX: int | None = None
 
 
+def rank_operand() -> torch.Tensor | None:
+    """The rank operand armed layers read (a module global), or None."""
+    return _RANK_BUFFER
+
+
 def fused_moe_decode_supported(quant_method: Any) -> bool:
     return getattr(quant_method, FUSED_MOE_DECODE_OP_ATTR, None) is not None
 

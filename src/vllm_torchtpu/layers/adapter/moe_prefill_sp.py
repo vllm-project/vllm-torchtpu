@@ -62,7 +62,7 @@ from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_me
 from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
     grouped_shared_expert_sharded,
 )
-from vllm_torchtpu.layers.adapter import fused_moe_ep
+from vllm_torchtpu.layers.adapter import fused_moe_decode, fused_moe_ep
 from vllm_torchtpu.layers.adapter.attention import _retain_buffers
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
@@ -440,9 +440,13 @@ def _backbone(model: torch.nn.Module) -> Any:
 
 
 def _keep_list(mlp: torch.nn.Module) -> list[torch.Tensor]:
+    """The layer's tensors plus the module-global operands the other buckets'
+    MoE ops read (the decode kernel's rank buffer, when it is armed)."""
     seen: dict[int, torch.Tensor] = {}
-    for t in (*mlp.parameters(), *mlp.buffers(), fused_moe_ep.rank_operand()):
-        seen.setdefault(id(t), t)
+    extra = (fused_moe_ep.rank_operand(), fused_moe_decode.rank_operand())
+    for t in (*mlp.parameters(), *mlp.buffers(), *extra):
+        if t is not None:
+            seen.setdefault(id(t), t)
     return list(seen.values())
 
 
