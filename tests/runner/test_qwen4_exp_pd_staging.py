@@ -79,8 +79,8 @@ def test_typed_view_matches_reference_order():
         np.testing.assert_array_equal(back, rows)
 
 
-@pytest.mark.parametrize("tp,dcp", [(8, 2), (8, 1), (2, 1)])
-def test_repack_rank_slices(tp, dcp):
+@pytest.mark.parametrize("tp,dcp,chunk", [(8, 2, None), (8, 1, None), (2, 1, None), (2, 1, 96)])
+def test_repack_rank_slices(tp, dcp, chunk):
     rng = np.random.default_rng(tp * 10 + dcp)
     # Small stand-ins for the TP1 / TP-T geometries (B multiple of 128).
     src_block, dst_block = 384, 128
@@ -128,19 +128,19 @@ def test_repack_rank_slices(tp, dcp):
         cs, cd = st.compressed_rows(n_tokens, ratio, src_comp_pages, src_block, dst_comp, dst_block)
         rs, rd = st.page_prefix_rows(src_ring_page, src_block, dst_ring, dst_block, dst_block)
         copy_s, copy_d = cs + rs, cd + rd
-        size = st.bucket(len(ms), 16)
         fn = st.make_repack(
             src_block=src_block, dst_block=dst_block, src_gdn=s, dst_gdn=d,
             kv_head=rank.kv_head, v_head_start=r * d.v_heads,
             channels=st.conv_channels(s, d, rank),
         )
-        out = fn(
-            jnp.asarray(pool), jnp.asarray(staging),
-            jnp.asarray(st._pad(ms, size), jnp.int32), jnp.asarray(st._pad(md, size), jnp.int32),
-            jnp.asarray(st._pad(copy_s, st.bucket(len(copy_s), 16)), jnp.int32),
-            jnp.asarray(st._pad(copy_d, st.bucket(len(copy_d), 16)), jnp.int32),
-            jnp.asarray([src_gdn_page], jnp.int32), jnp.asarray([dst_gdn], jnp.int32),
-        )
+        # One program, or the serving path's fixed-size chunks (pool row 0
+        # and staging row 0 are the null pages, as in serving).
+        size = chunk or st.bucket(max(len(ms), len(copy_s)), 16)
+        out = jnp.asarray(pool)
+        plans = list(st.repack_chunks(ms, md, copy_s, copy_d, [src_gdn_page], [dst_gdn], size))
+        assert len(plans) == (-(-max(len(ms), len(copy_s)) // size) if chunk else 1)
+        for plan in plans:
+            out = fn(out, jnp.asarray(staging), *(jnp.asarray(v, jnp.int32) for v in plan))
         rows = flat_rows(np.asarray(out))
         h = rank.kv_head
         for t in range(n_tokens):

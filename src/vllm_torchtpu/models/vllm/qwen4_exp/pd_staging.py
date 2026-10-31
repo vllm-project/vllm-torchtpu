@@ -87,9 +87,34 @@ def owner_kind(name: str) -> str:
     raise ValueError(f"Qwen PD staging has no repack for cache owner {name}")
 
 
+# Rows per repack program. One program for a whole request gathers and
+# scatters every row at once: a 190k-token request at TP2 is millions of 1 KiB
+# rows, multi-GB temporaries beside a pool sized to fill HBM. Fixed chunks
+# bound the footprint (64 MiB of rows) and compile one shape.
+REPACK_CHUNK_ROWS = 1 << 16
+
+
 def bucket(n: int, floor: int = 1024) -> int:
     """Padded index length: few distinct compiled shapes."""
     return max(floor, 1 << max(0, n - 1).bit_length())
+
+
+def repack_chunks(main_s, main_d, copy_s, copy_d, gdn_s, gdn_d, size=REPACK_CHUNK_ROWS):
+    """Padded index lists per repack program, each of one fixed shape.
+
+    GDN pages go with the first chunk; later chunks rewrite the null page in
+    their place.
+    """
+    ngdn = max(1, len(gdn_s))
+    chunks = max(1, -(-len(main_s) // size), -(-len(copy_s) // size))
+    for i in range(chunks):
+        part = slice(i * size, (i + 1) * size)
+        gs, gd = (gdn_s, gdn_d) if i == 0 else ([], [])
+        yield (
+            _pad(main_s[part], size), _pad(main_d[part], size),
+            _pad(copy_s[part], size), _pad(copy_d[part], size),
+            _pad(gs, ngdn), _pad(gd, ngdn),
+        )
 
 
 def _pad(values: list[int], size: int) -> list[int]:
@@ -493,15 +518,6 @@ class StagedConsumer:
         main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = self.indices(pages, dst_tables, num_tokens)
         device = self.pool.device
 
-        def tensor(values, size):
-            return torch.tensor(_pad(values, size), dtype=torch.int32).to(device)
-
-        msize, csize = bucket(len(main_s)), bucket(len(copy_s))
-        args = (
-            tensor(main_s, msize), tensor(main_d, msize),
-            tensor(copy_s, csize), tensor(copy_d, csize),
-            tensor(gdn_s or [0], max(1, len(gdn_s))), tensor(gdn_d or [0], max(1, len(gdn_d))),
-        )
         if self._op is None:
             from torch_tpu._internal import pallas
 
@@ -512,4 +528,6 @@ class StagedConsumer:
                 "pallas::qwen4_pd_staged_repack", self._fn, donate_argnums=(0,)
             )
             self._op.register_fake(lambda pool, *rest: torch.empty_like(pool))
-        self.pool.copy_(self._op(self.pool, self.staging, *args))
+        for chunk in repack_chunks(main_s, main_d, copy_s, copy_d, gdn_s, gdn_d):
+            args = [torch.tensor(v, dtype=torch.int32).to(device) for v in chunk]
+            self.pool.copy_(self._op(self.pool, self.staging, *args))
