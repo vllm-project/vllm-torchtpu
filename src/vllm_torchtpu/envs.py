@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
     TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
     TPU_KV_SHM_POOL_GB: float = 128.0
+    TPU_KV_BLOCK_STATE_INTERVAL_S: float = 10.0
     TPU_KV_TRANSFER_NAMESPACE: str = ""
     TPU_IPC_SOCKET_DIR: str = "/tmp"
     TPU_KV_WARMUP_ENABLED: bool = True
@@ -992,6 +993,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KV_STAGE_WAIT_TIMEOUT_SECS": env_float("TPU_KV_STAGE_WAIT_TIMEOUT_SECS", 30.0),
     # Total GB budget for the per-host shared-memory KV staging pool.
     "TPU_KV_SHM_POOL_GB": env_float("TPU_KV_SHM_POOL_GB", 128.0),
+    # Seconds between scans that classify every HBM KV cache block, for the
+    # vllm:kv_cache_blocks_by_state and vllm:kv_orphan_block_info metrics.
+    "TPU_KV_BLOCK_STATE_INTERVAL_S": env_float("TPU_KV_BLOCK_STATE_INTERVAL_S", 10.0),
     # Optional engine namespace; sanitized at the call site.
     "TPU_KV_TRANSFER_NAMESPACE": env_str("TPU_KV_TRANSFER_NAMESPACE", ""),
     # Directory holding the per-host intra-process IPC socket.
