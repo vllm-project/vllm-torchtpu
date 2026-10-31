@@ -38,11 +38,29 @@ QUANT_ROWS = 32
 VMEM_LIMIT_BYTES = 48 * 1024 * 1024
 
 
-def _out_block(n: int) -> int | None:
-    for block in (util.FUSED_QUANTIZE_OUT_BLOCK, 512, 256):
-        if n % block == 0:
-            return block
-    return None
+def _first_divisor(size: int, blocks: tuple[int, ...]) -> int | None:
+    return next((block for block in blocks if size % block == 0), None)
+
+
+def _tiles(m: int, k: int, n: int) -> tuple[int, int] | None:
+    """(rows, weight columns) per grid step, or None if XLA should keep it."""
+    if n < util.FUSED_QUANTIZE_MAX_OUT_PER_IN * k:
+        tm = util.FUSED_QUANTIZE_TOKEN_BLOCK
+        tm = tm if m % tm == 0 else None
+        tn = _first_divisor(n, (util.FUSED_QUANTIZE_OUT_BLOCK, 512, 256))
+    elif n >= util.FUSED_QUANTIZE_MIN_WIDE_OUT_PER_IN * k:
+        tm = _first_divisor(
+            m, (util.FUSED_QUANTIZE_WIDE_TOKEN_BLOCK, util.FUSED_QUANTIZE_TOKEN_BLOCK)
+        )
+        tn = _first_divisor(
+            n,
+            (util.FUSED_QUANTIZE_WIDE_OUT_BLOCK, util.FUSED_QUANTIZE_OUT_BLOCK, 512),
+        )
+    else:
+        return None
+    if tm is None or tn is None or _vmem_bytes(m, k, tm, tn) > VMEM_LIMIT_BYTES:
+        return None
+    return tm, tn
 
 
 def _vmem_bytes(m: int, k: int, tm: int, tn: int) -> int:
@@ -58,16 +76,12 @@ def supports(x: jax.Array, w_q: jax.Array, w_scale: jax.Array) -> bool:
     """Whether `fused_quantized_matmul` should take these operands."""
     m, k = x.shape
     n = w_q.shape[1]
-    tm, tn = util.FUSED_QUANTIZE_TOKEN_BLOCK, _out_block(n)
     return (
         x.dtype == jnp.bfloat16
         and w_q.dtype == jnp.float8_e4m3fn
         and w_scale.shape == (n,)
-        and m % tm == 0
         and k % QUANT_COLS == 0
-        and tn is not None
-        and n < util.FUSED_QUANTIZE_MAX_OUT_PER_IN * k
-        and _vmem_bytes(m, k, tm, tn) <= VMEM_LIMIT_BYTES
+        and _tiles(m, k, n) is not None
     )
 
 
@@ -130,7 +144,7 @@ def fused_quantized_matmul(
     """`xla_quantized_matmul(x, w_q, w_scale)` with the quantize kept in VMEM."""
     m, k = x.shape
     n = w_q.shape[1]
-    tm, tn = util.FUSED_QUANTIZE_TOKEN_BLOCK, _out_block(n)
+    tm, tn = _tiles(m, k, n)
     num_i, num_j = m // tm, n // tn
     f8_max = float(jnp.finfo(w_q.dtype).max)
 

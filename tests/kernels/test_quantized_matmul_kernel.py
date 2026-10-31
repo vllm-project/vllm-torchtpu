@@ -413,6 +413,8 @@ def test_quantized_matmul_blockwise_int4_fp8(
         (1024, 8192, 4096),
         (1024, 4096, 1536),
         (512, 2048, 768),
+        (1024, 1024, 32768),
+        (512, 512, 8192),
     ],
 )
 def test_fused_quantized_matmul_matches_xla(

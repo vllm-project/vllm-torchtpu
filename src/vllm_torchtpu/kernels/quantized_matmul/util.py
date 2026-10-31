@@ -27,11 +27,15 @@ from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import TunedValue
 # weight columns per grid step.
 FUSED_QUANTIZE_TOKEN_BLOCK = 512
 FUSED_QUANTIZE_OUT_BLOCK = 1024
-# The fused kernel takes a shape only while n / k is below this: the in-VMEM
-# quantize saves work that grows with m * k, and the kernel's epilogue overlaps
-# the MXU less than XLA's output fusion does, which costs work that grows with
-# m * n.
+# The fused kernel takes an input-heavy shape while n / k is below this: there
+# the in-VMEM quantize saves work that grows with m * k.
 FUSED_QUANTIZE_MAX_OUT_PER_IN = 1.0
+# It takes an output-heavy shape from this n / k up, with the wide tiles below,
+# where XLA's dot runs further from the MXU's rate. Shapes in between stay on
+# XLA, whose output fusion can absorb the consumer (a residual add, a relayout).
+FUSED_QUANTIZE_MIN_WIDE_OUT_PER_IN = 16.0
+FUSED_QUANTIZE_WIDE_TOKEN_BLOCK = 1024
+FUSED_QUANTIZE_WIDE_OUT_BLOCK = 2048
 
 
 def unfold_args(
