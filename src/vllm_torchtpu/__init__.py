@@ -159,7 +159,12 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     @wraps(original_split)
     def split_with_scheduler_block_size(self, *args, **kwargs):
         physical_cache_config = self.cache_config
-        if physical_cache_config.block_size == self.block_size:
+        if physical_cache_config.block_size == self.block_size or (
+            # Partial hash hits (QSA DCP fine prefix): Mamba states are
+            # reusable at every physical block, the hash unit.
+            self.kv_cache_manager.coordinator.enable_partial_hash_hits
+            and self.hash_block_size == physical_cache_config.block_size
+        ):
             return original_split(self, *args, **kwargs)
 
         scheduler_cache_config = copy.copy(physical_cache_config)
@@ -1502,6 +1507,157 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
     cls.find_longest_cache_hit = find_longest_cache_hit
     cls._tpu_dcp_fine_prefix_patch = True
     logger.info("Applied TPU patch: DCP single-group fine-grained prefix hits.")
+
+
+def _patch_vllm_qsa_dcp_fine_prefix_hits() -> None:
+    """Hash-unit prefix hits for hybrid models under model-internal DCP.
+
+    ``VLLM_TPU_QSA_MAIN_KV_DCP=D`` gives the main-KV group (and any other
+    token-split group) a block of D*B tokens while the other groups, the
+    Mamba "align" group included, keep B. vLLM sees ``dcp_world_size == 1``,
+    so ``HybridKVCacheCoordinator`` leaves partial hash hits off (it accepts
+    a Mamba block equal to the hash block only for its own DCP) and every hit
+    rounds down to the D*B scheduler block. That is upstream's DCP hybrid
+    layout with the DCP factor inside the spec, so with
+    ``VLLM_TPU_QSA_DCP_FINE_PREFIX=1`` this enables partial hash hits under the
+    same conditions upstream uses for ``dcp_world_size > 1``. Upstream then
+    probes interior hash boundaries of the D*B blocks, registers the prompt-tail
+    partial entry, and copy-on-writes a partially hit block; the runner applies
+    those copies page-locally on every rank, and each rank's page holds that
+    rank's rows of the block.
+    """
+    import functools
+    import inspect
+
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.v1.core import kv_cache_coordinator
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    cls = kv_cache_coordinator.HybridKVCacheCoordinator
+    if getattr(cls, "_tpu_qsa_dcp_fine_prefix_patch", False):
+        return
+    original_init = cls.__init__
+    init_signature = inspect.signature(original_init)
+
+    @functools.wraps(original_init)
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if self.enable_partial_hash_hits or not envs.VLLM_TPU_QSA_DCP_FINE_PREFIX:
+            return
+        bound = init_signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        init_args = bound.arguments
+        vllm_config = get_current_vllm_config_or_none()
+        groups = self.kv_cache_config.kv_cache_groups
+        hash_block_size = self.hash_block_size
+        if (
+            envs.VLLM_TPU_QSA_MAIN_KV_DCP <= 1
+            or not init_args["enable_caching"]
+            or not init_args["allow_partial_hash_hits"]
+            or init_args["dcp_world_size"] != 1
+            or init_args["pcp_world_size"] != 1
+            or self.scheduler_block_size == hash_block_size
+            # Connectors consume block hashes at block granularity.
+            or (vllm_config is not None and vllm_config.kv_transfer_config is not None)
+            or not any(
+                isinstance(g.kv_cache_spec, MambaSpec)
+                and g.kv_cache_spec.mamba_cache_mode == "align"
+                and g.kv_cache_spec.block_size == hash_block_size
+                for g in groups
+            )
+        ):
+            logger.warning(
+                "VLLM_TPU_QSA_DCP_FINE_PREFIX is set but not applied (needs "
+                "VLLM_TPU_QSA_MAIN_KV_DCP > 1, prefix caching, no KV connector, "
+                "and a Mamba align group at the hash block); hits stay "
+                "%d-token aligned.",
+                self.scheduler_block_size,
+            )
+            return
+        unsupported = sorted(
+            {
+                type(manager).__name__
+                for manager, group in zip(self.single_type_managers, groups)
+                if group.kv_cache_spec.prefix_cacheable
+                and not manager.supports_fine_grained_hash_lookup
+                and manager.block_size != hash_block_size
+            }
+        )
+        if unsupported:
+            logger.warning(
+                "VLLM_TPU_QSA_DCP_FINE_PREFIX not applied: these KV cache "
+                "managers need block-aligned lookups: %s.",
+                ", ".join(unsupported),
+            )
+            return
+        self.enable_partial_hash_hits = True
+        for manager in self.single_type_managers:
+            manager.cache_hit_alignment_tokens = hash_block_size
+        logger.info(
+            "QSA DCP fine prefix hits: %d-token hits inside %d-token blocks.",
+            hash_block_size,
+            self.scheduler_block_size,
+        )
+
+    cls.__init__ = __init__
+    cls._tpu_qsa_dcp_fine_prefix_patch = True
+
+    # Sequence-tail entries: upstream registers a partial entry only at the
+    # prompt's last hash boundary. A next turn that resumes past the previous
+    # output needs the boundaries inside the request's last D*B block too; at
+    # free, register each of them up to the computed tokens (metadata only:
+    # the block is append-only below them, and a reuser copies it on write).
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+    original_free = KVCacheManager.free
+    if getattr(original_free, "_tpu_qsa_seq_tail_patch", False):
+        return
+
+    @functools.wraps(original_free)
+    def free(self, request):
+        coordinator = self.coordinator
+        if (
+            envs.VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL
+            and getattr(coordinator, "enable_partial_hash_hits", False)
+            and getattr(cls, "_tpu_qsa_dcp_fine_prefix_patch", False)
+        ):
+            _register_sequence_tail_entries(coordinator, request, FullAttentionManager)
+        return original_free(self, request)
+
+    free._tpu_qsa_seq_tail_patch = True
+    KVCacheManager.free = free
+    logger.info("Applied TPU patch: QSA DCP hash-unit prefix hits.")
+
+
+def _register_sequence_tail_entries(coordinator, request, full_attention_cls) -> None:
+    hash_block_size = coordinator.hash_block_size
+    boundary = request.num_computed_tokens // hash_block_size * hash_block_size
+    boundary = min(boundary, len(request.block_hashes) * hash_block_size)
+    for manager in coordinator.single_type_managers:
+        block_size = manager.block_size
+        if (
+            not isinstance(manager, full_attention_cls)
+            or not manager.enable_caching
+            or manager.use_eagle
+            or block_size <= hash_block_size
+            or boundary % block_size == 0
+        ):
+            continue
+        blocks = manager.req_to_blocks.get(request.request_id)
+        idx = boundary // block_size
+        if not blocks or idx >= len(blocks) or blocks[idx].is_null:
+            continue
+        for tokens in range(
+            idx * block_size + hash_block_size, boundary + 1, hash_block_size
+        ):
+            manager.block_pool.cache_partial_block(
+                request=request,
+                block=blocks[idx],
+                num_tokens=tokens,
+                kv_cache_group_id=manager.kv_cache_group_id,
+                block_size=block_size,
+            )
 
 
 def _patch_vllm_merge_multimodal_embeddings() -> None:

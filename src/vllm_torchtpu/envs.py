@@ -114,6 +114,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
+    VLLM_TPU_QSA_DCP_FINE_PREFIX: bool = False
+    VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -768,6 +770,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split the same way; each rank scores its owned groups and the pair merges
     # the local top-k lists into the exact global selection.
     "VLLM_TPU_QSA_COMPRESSED_DCP": env_bool("VLLM_TPU_QSA_COMPRESSED_DCP"),
+    # Under VLLM_TPU_QSA_MAIN_KV_DCP > 1: prefix-cache hits at the hash unit
+    # (B) instead of the D*B scheduler block, with copy-on-write of a partially
+    # hit block (vllm_torchtpu/__init__.py _patch_vllm_qsa_dcp_fine_prefix_hits).
+    "VLLM_TPU_QSA_DCP_FINE_PREFIX": env_bool("VLLM_TPU_QSA_DCP_FINE_PREFIX"),
+    # With it: at request free, also register partial entries at the hash
+    # boundaries inside the request's last block (next turns resuming past the
+    # previous output), not only at the prompt's last boundary.
+    "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL": env_bool(
+        "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL"
+    ),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every

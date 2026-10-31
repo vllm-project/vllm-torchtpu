@@ -87,6 +87,7 @@ PATCHES = (
         _ENGINE,
         refresh="vllm_torchtpu:_patch_vllm_dcp_fine_prefix_hits",
     ),
+    Patch("vllm_torchtpu:_patch_vllm_qsa_dcp_fine_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offload_all_ranks_kv_bytes", _ENGINE),
