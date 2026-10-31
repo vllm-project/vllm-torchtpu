@@ -95,6 +95,24 @@ def test_matches_sparsecore_order_bit_for_bit(
     )
 
 
+def test_non_finite_weight_stays_with_its_token():
+    num_tokens, hidden_size = 384, 256
+    rows, indices, weights, valid = _routes(num_tokens, hidden_size, 1 / 8, seed=7)
+    route = int(np.flatnonzero(np.asarray(valid))[5])
+    weights = weights.at[route].set(jnp.nan)
+    out = moe_gather_unpermute.gather_unpermute(
+        rows,
+        indices,
+        weights,
+        valid,
+        num_tokens=num_tokens,
+        topk=_TOPK,
+        interpret=True,
+    )
+    nan_tokens = np.flatnonzero(np.isnan(np.asarray(out, np.float32)).any(axis=1))
+    np.testing.assert_array_equal(nan_tokens, [route // _TOPK])
+
+
 @pytest.mark.tpu_test
 def test_matches_ragged_gather_reduce_v2_on_tpu():
     num_tokens, hidden_size = 2048, 2048

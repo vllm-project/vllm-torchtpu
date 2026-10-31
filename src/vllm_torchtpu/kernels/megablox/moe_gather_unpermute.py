@@ -83,9 +83,12 @@ def can_use_gather_unpermute(
         route_output.dtype == jnp.bfloat16
         and topk_weights.dtype == jnp.bfloat16
         and num_routes == num_tokens * topk
+        and num_routes <= 1 << 16
         and num_routes % 2 == 0
         and hidden_size % _LANES == 0
         and num_tokens % TOKEN_BLOCK == 0
+        # _route_major works on 128-token rows.
+        and num_tokens % _LANES == 0
         and TOKEN_BLOCK % LIST_TOKENS == 0
         and TOKEN_BLOCK % SUM_GROUP == 0
         and (LIST_TOKENS * topk) % ISSUE_UNROLL == 0
@@ -103,6 +106,29 @@ def can_use_gather_unpermute(
     )
 
 
+def _route_major(columns: list[jax.Array], *, num_tokens: int, topk: int):
+    """[num_tokens * topk] token-major arrays as f32 [topk, num_tokens] each.
+
+    A matmul with a permutation matrix moves route k of each token to row k,
+    in lane-dense tiles; split [num_tokens, topk] arrays cost far more. Every
+    input value must be a finite, bf16-exact number, so the f32 products and
+    sums are exact.
+    """
+    width = topk * _LANES
+    rows = lax.broadcasted_iota(jnp.int32, (width, width), 0)
+    cols = lax.broadcasted_iota(jnp.int32, (width, width), 1)
+    # Route k of token j of a 128-token row moves to column k * 128 + j.
+    permute = (rows == (cols % _LANES) * topk + cols // _LANES).astype(jnp.bfloat16)
+    stacked = jnp.stack(
+        [c.astype(jnp.bfloat16).reshape(num_tokens // _LANES, width) for c in columns]
+    )
+    moved = jnp.einsum(
+        "nrc,cd->nrd", stacked, permute, preferred_element_type=jnp.float32
+    )
+    moved = moved.reshape(len(columns), num_tokens // _LANES, topk, _LANES)
+    return list(moved.transpose(0, 2, 1, 3).reshape(len(columns), topk, num_tokens))
+
+
 def _route_tables(
     indices: jax.Array,
     topk_weights: jax.Array,
@@ -116,9 +142,29 @@ def _route_tables(
     Built with tokens along lanes and no gathers: slot k of a token holds its
     k-th valid route, so the slots keep the routes' order.
     """
-    valid = valid_rows_mask.reshape(num_tokens, topk).T
-    src = indices.reshape(num_tokens, topk).T
-    weight = topk_weights.astype(jnp.float32).reshape(num_tokens, topk).T
+    # Row indices and weight bits move as bytes, each exact in bf16; a float
+    # weight would spread a NaN to every token of its 128-token row.
+    weight_bits = lax.bitcast_convert_type(topk_weights, jnp.uint16).astype(jnp.int32)
+    src_high, src_low, weight_high, weight_low, valid = _route_major(
+        [
+            indices >> 8,
+            indices & 0xFF,
+            weight_bits >> 8,
+            weight_bits & 0xFF,
+            valid_rows_mask,
+        ],
+        num_tokens=num_tokens,
+        topk=topk,
+    )
+
+    def from_bytes(high, low):
+        return high.astype(jnp.int32) * 256 + low.astype(jnp.int32)
+
+    src = from_bytes(src_high, src_low)
+    weight = lax.bitcast_convert_type(
+        from_bytes(weight_high, weight_low).astype(jnp.uint16), jnp.bfloat16
+    ).astype(jnp.float32)
+    valid = valid > 0
     valid_i = valid.astype(jnp.int32)
     slot_of_route = jnp.cumsum(valid_i, axis=0) - valid_i
     count = valid_i.sum(axis=0)
