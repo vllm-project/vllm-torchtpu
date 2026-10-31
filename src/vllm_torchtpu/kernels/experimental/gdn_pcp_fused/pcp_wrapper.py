@@ -69,6 +69,7 @@ class _ProjectionConfig:
     qkv_dim: int
     full_key_dim: int
     kq_replication_factor: int
+    value_chunk_size: int
 
 
 _TPU_TILE_ROWS = 8
@@ -415,21 +416,45 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         ).wait()
 
     projection_token_block_size = projection_cfg.token_block_size
-    qkv_width = 2 * shard_key_dim + shard_value_dim
+    value_chunk_size = projection_cfg.value_chunk_size
+    value_chunk_blocks = value_chunk_size // _TPU_TILE_COLUMNS
+    num_value_chunks = shard_value_dim // value_chunk_size
+    # A single value chunk keeps one QKV job per destination. A split value
+    # shard gives each destination a Q/K job and then one job per chunk.
+    qkv_jobs_per_destination = 1 if num_value_chunks == 1 else 1 + num_value_chunks
+    qkv_width = 2 * shard_key_dim + (shard_value_dim if num_value_chunks == 1 else 0)
     receive_group_stride = _qkv_receive_group_stride(
         comm_chunk_size,
         cfg.tile_size,
     )
-    num_qkv_out_blocks = pcp_size
-    num_z_out_blocks = pcp_size
+    num_qkv_out_blocks = pcp_size * qkv_jobs_per_destination
+    num_z_out_blocks = pcp_size * num_value_chunks
     num_projection_out_blocks = num_qkv_out_blocks + num_z_out_blocks
     full_key_dim = projection_cfg.full_key_dim
 
     def _projection_job(out_block):
+        # QKV blocks come first, ordered by destination and then QKV part:
+        # part 0 projects Q/K (and the whole value shard when it is a single
+        # chunk), part p > 0 projects value chunk p - 1. Z blocks follow,
+        # ordered by value group and then value chunk.
         is_qkv = out_block < num_qkv_out_blocks
-        destination = out_block
-        z_group = out_block - num_qkv_out_blocks
-        return is_qkv, destination, z_group
+        if num_value_chunks == 1:
+            return is_qkv, out_block, out_block - num_qkv_out_blocks, 0, 0
+        z_block = out_block - num_qkv_out_blocks
+        return (
+            is_qkv,
+            out_block // qkv_jobs_per_destination,
+            z_block // num_value_chunks,
+            lax.rem(out_block, qkv_jobs_per_destination),
+            lax.rem(z_block, num_value_chunks),
+        )
+
+    def _projection_out_view(width: int):
+        # The leading ``width`` columns of the staged QKV output tile.
+        blocks = width // _TPU_TILE_COLUMNS
+        if blocks == projection_out_ref.shape[1]:
+            return projection_out_ref
+        return projection_out_ref.at[:, pl.ds(0, blocks), :, :]
 
     def _start_packed_qkv_copy(
         stage,
@@ -557,7 +582,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
 
     def _start_projection_tile(token_block, out_block) -> None:
         token_row = token_block * projection_token_block_size
-        is_qkv, destination, z_group = _projection_job(out_block)
+        is_qkv, destination, z_group, qkv_part, z_chunk = _projection_job(out_block)
 
         @pl.when(out_block == 0)
         def _start_projection_x() -> None:
@@ -606,30 +631,56 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             q_col = kq_destination * shard_key_dim
             k_col = full_key_dim + kq_destination * shard_key_dim
             v_col = 2 * full_key_dim + destination * shard_value_dim
-            _start_weight_piece(q_col, 0, shard_key_dim)
-            _start_weight_piece(k_col, shard_key_dim, shard_key_dim)
-            _start_weight_piece(
-                v_col,
-                2 * shard_key_dim,
-                shard_value_dim,
-            )
+
+            @pl.when(qkv_part == 0)
+            def _start_first_qkv() -> None:
+                _start_weight_piece(q_col, 0, shard_key_dim)
+                _start_weight_piece(k_col, shard_key_dim, shard_key_dim)
+                if num_value_chunks == 1:
+                    _start_weight_piece(
+                        v_col,
+                        2 * shard_key_dim,
+                        shard_value_dim,
+                    )
+
+            @pl.when(qkv_part > 0)
+            def _start_value_chunk() -> None:
+                _start_weight_piece(
+                    v_col + (qkv_part - 1) * value_chunk_size,
+                    0,
+                    value_chunk_size,
+                )
 
         @pl.when(jnp.logical_not(is_qkv))
         def _start_z_group() -> None:
             z_col = projection_cfg.qkv_dim + z_group * shard_value_dim
-            _start_weight_piece(z_col, 0, shard_value_dim)
+            if num_value_chunks > 1:
+                z_col += z_chunk * value_chunk_size
+            _start_weight_piece(z_col, 0, value_chunk_size)
 
     def _wait_projection_output() -> None:
         pending = projection_pending_out_ref[0]
-        is_qkv, _, _ = _projection_job(pending)
+        is_qkv, _, _, qkv_part, _ = _projection_job(pending)
 
         @pl.when(jnp.logical_and(pending >= 0, is_qkv))
         def _wait_qkv() -> None:
-            pltpu.make_async_copy(
-                src_ref=projection_out_ref,
-                dst_ref=projection_out_ref,
-                sem=projection_out_sem,
-            ).wait()
+            @pl.when(qkv_part == 0)
+            def _wait_first_qkv() -> None:
+                first_out_ref = _projection_out_view(qkv_width)
+                pltpu.make_async_copy(
+                    src_ref=first_out_ref,
+                    dst_ref=first_out_ref,
+                    sem=projection_out_sem,
+                ).wait()
+
+            @pl.when(qkv_part > 0)
+            def _wait_value_chunk() -> None:
+                value_out_ref = _projection_out_view(value_chunk_size)
+                pltpu.make_async_copy(
+                    src_ref=value_out_ref,
+                    dst_ref=value_out_ref,
+                    sem=projection_out_sem,
+                ).wait()
 
         @pl.when(jnp.logical_and(pending >= 0, jnp.logical_not(is_qkv)))
         def _wait_z() -> None:
@@ -678,7 +729,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 # FP8 path does after quantizing its staging tile.
                 projection_x_prepared_ref[...] = x
 
-        is_qkv, destination, z_group = _projection_job(out_block)
+        is_qkv, destination, z_group, qkv_part, z_chunk = _projection_job(out_block)
 
         def _finish_matmul(width: int):
             weight_ref = projection_weight_vmem_ref.at[
@@ -742,18 +793,30 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
 
         @pl.when(is_qkv)
         def _finish_qkv() -> None:
-            projection_out_ref[...] = pltpu.einshape(
-                "(ab)(cd)->acbd",
-                _finish_matmul(qkv_width),
-                b=_TPU_TILE_ROWS,
-                d=_TPU_TILE_COLUMNS,
-                assert_is_tile_preserving=True,
-            )
+            @pl.when(qkv_part == 0)
+            def _finish_first_qkv() -> None:
+                _projection_out_view(qkv_width)[...] = pltpu.einshape(
+                    "(ab)(cd)->acbd",
+                    _finish_matmul(qkv_width),
+                    b=_TPU_TILE_ROWS,
+                    d=_TPU_TILE_COLUMNS,
+                    assert_is_tile_preserving=True,
+                )
+
+            @pl.when(qkv_part > 0)
+            def _finish_value_chunk() -> None:
+                _projection_out_view(value_chunk_size)[...] = pltpu.einshape(
+                    "(ab)(cd)->acbd",
+                    _finish_matmul(value_chunk_size),
+                    b=_TPU_TILE_ROWS,
+                    d=_TPU_TILE_COLUMNS,
+                    assert_is_tile_preserving=True,
+                )
 
         @pl.when(jnp.logical_not(is_qkv))
         def _finish_z() -> None:
-            lanes = shard_value_dim // _TPU_TILE_COLUMNS
-            values = _finish_matmul(shard_value_dim).reshape(
+            lanes = value_chunk_size // _TPU_TILE_COLUMNS
+            values = _finish_matmul(value_chunk_size).reshape(
                 projection_token_block_size,
                 lanes,
                 _TPU_TILE_COLUMNS,
@@ -762,7 +825,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 values,
                 (
                     (0, 0),
-                    (0, _TPU_TILE_ROWS - lanes),
+                    (0, projection_z_out_ref.shape[-2] - lanes),
                     (0, 0),
                 ),
             )
@@ -773,26 +836,58 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         def _write_qkv_projection() -> None:
             group_start = token_row // _TPU_TILE_ROWS
             num_groups = projection_token_block_size // _TPU_TILE_ROWS
-            pltpu.make_async_copy(
-                src_ref=projection_out_ref,
-                dst_ref=projected_qkv_ref.at[
-                    destination,
-                    pl.ds(group_start, num_groups),
-                    :,
-                    :,
-                    :,
-                ],
-                sem=projection_out_sem,
-            ).start()
+
+            @pl.when(qkv_part == 0)
+            def _write_first_qkv() -> None:
+                columns = (
+                    slice(None)
+                    if num_value_chunks == 1
+                    else pl.ds(0, qkv_width // _TPU_TILE_COLUMNS)
+                )
+                pltpu.make_async_copy(
+                    src_ref=_projection_out_view(qkv_width),
+                    dst_ref=projected_qkv_ref.at[
+                        destination,
+                        pl.ds(group_start, num_groups),
+                        columns,
+                        :,
+                        :,
+                    ],
+                    sem=projection_out_sem,
+                ).start()
+
+            @pl.when(qkv_part > 0)
+            def _write_value_chunk() -> None:
+                value_column_block = (
+                    2 * shard_key_dim // _TPU_TILE_COLUMNS
+                    + (qkv_part - 1) * value_chunk_blocks
+                )
+                pltpu.make_async_copy(
+                    src_ref=_projection_out_view(value_chunk_size),
+                    dst_ref=projected_qkv_ref.at[
+                        destination,
+                        pl.ds(group_start, num_groups),
+                        pl.ds(value_column_block, value_chunk_blocks),
+                        :,
+                        :,
+                    ],
+                    sem=projection_out_sem,
+                ).start()
 
         @pl.when(out_block >= num_qkv_out_blocks)
         def _write_z_projection() -> None:
+            z_job_rows = projection_z_out_ref.shape[-2]
+            z_rows = (
+                slice(None)
+                if num_value_chunks == 1
+                else pl.ds(z_chunk * z_job_rows, z_job_rows)
+            )
             pltpu.make_async_copy(
                 src_ref=projection_z_out_ref,
                 dst_ref=z_ref.at[
                     pl.ds(token_row, projection_token_block_size),
                     z_group,
-                    :,
+                    z_rows,
                     :,
                 ],
                 sem=projection_out_sem,
@@ -1421,10 +1516,30 @@ def fused_qkvz_projection_pcp_gdn(
     shard_value_dim = local_n_v * d_v
     local_dim = 2 * shard_key_dim + shard_value_dim
     expected_local_qkv_dim = 2 * full_key_dim + full_value_dim
+    # Each token's Z shard spans whole physical tiles: one tile up to 1024
+    # channels, two for 2048 (e.g. 128 value heads with PCP8).
+    z_tile_rows = (
+        pl.cdiv(shard_value_dim, _TPU_TILE_ROWS * _TPU_TILE_COLUMNS) * _TPU_TILE_ROWS
+    )
     # Two communication chunks keep short ragged batches from doing a large
-    # rounded-up projection while still amortizing the projection loop.
-    projection_token_block_size = 2 * comm_chunk_size
-    projection_out_block_size = local_dim
+    # rounded-up projection while still amortizing the projection loop. A Z
+    # shard wider than one tile projects one chunk at a time to bound the live
+    # input and output tiles in VMEM.
+    projection_token_block_size = (
+        comm_chunk_size if z_tile_rows > _TPU_TILE_ROWS else 2 * comm_chunk_size
+    )
+    # A projection job covers the whole value shard while it fits two Z tiles.
+    # A wider shard projects Q/K in one job and one Z tile of value columns
+    # per later job, which bounds the staged weight rows and output tiles.
+    value_chunk_size = (
+        shard_value_dim
+        if z_tile_rows <= 2 * _TPU_TILE_ROWS
+        else _TPU_TILE_ROWS * _TPU_TILE_COLUMNS
+    )
+    num_value_chunks = pl.cdiv(shard_value_dim, value_chunk_size)
+    projection_out_block_size = (
+        local_dim if num_value_chunks == 1 else max(2 * shard_key_dim, value_chunk_size)
+    )
     expected_qkvz_dim = expected_local_qkv_dim + full_value_dim
     if hidden_states.ndim != 2 or qkvz_weight.ndim != 2:
         raise ValueError(
@@ -1463,8 +1578,8 @@ def fused_qkvz_projection_pcp_gdn(
         )
     if local_num_tokens % projection_token_block_size != 0:
         raise ValueError(
-            "Rank-local tokens must be divisible by two "
-            "communication chunks for projection fusion: "
+            "Rank-local tokens must be divisible by the "
+            "projection token block: "
             f"{local_num_tokens=} "
             f"{projection_token_block_size=}."
         )
@@ -1481,11 +1596,13 @@ def fused_qkvz_projection_pcp_gdn(
     if (
         shard_key_dim % _TPU_TILE_COLUMNS != 0
         or shard_value_dim % _TPU_TILE_COLUMNS != 0
-        or shard_value_dim > _TPU_TILE_ROWS * _TPU_TILE_COLUMNS
+        or shard_value_dim % value_chunk_size != 0
     ):
         raise ValueError(
-            "QKVZ projection requires tile-aligned PCP-local shards and a Z "
-            "shard that fits one physical output tile: "
+            "QKVZ projection requires PCP-local key and value shards that are "
+            f"multiples of {_TPU_TILE_COLUMNS} channels, and value shards wider "
+            "than two Z tiles in multiples of "
+            f"{_TPU_TILE_ROWS * _TPU_TILE_COLUMNS} channels: "
             f"{shard_key_dim=} {shard_value_dim=} "
             f"{projection_out_block_size=}."
         )
@@ -1495,6 +1612,7 @@ def fused_qkvz_projection_pcp_gdn(
         qkv_dim=expected_local_qkv_dim,
         full_key_dim=full_key_dim,
         kq_replication_factor=geometry.kq_replication_factor,
+        value_chunk_size=value_chunk_size,
     )
 
     if b.shape[1] != local_n_v:
@@ -1515,8 +1633,10 @@ def fused_qkvz_projection_pcp_gdn(
             "The global PCP communication stage must be divisible by the GDN "
             f"compute tile: {global_stage_tokens=} {tile_size=}."
         )
-    num_qkv_out_blocks = pcp_size
-    num_z_out_blocks = pcp_size
+    num_qkv_out_blocks = pcp_size * (
+        1 if num_value_chunks == 1 else 1 + num_value_chunks
+    )
+    num_z_out_blocks = pcp_size * num_value_chunks
     num_projection_out_blocks = num_qkv_out_blocks + num_z_out_blocks
 
     act_out_dtype = hidden_states.dtype
@@ -1556,6 +1676,13 @@ def fused_qkvz_projection_pcp_gdn(
         is_shared=True,
     )
     receive_group_stride = _qkv_receive_group_stride(comm_chunk_size, tile_size)
+    # Each GDN tile stores tile_size output rows from its offset inside the
+    # source rank's chunk. A tile taller than the rest of that chunk (e.g. a
+    # 32-token tile over 16-token chunks) reaches past the final rank's rows,
+    # so every output stage slot keeps that overhang inside its own rows.
+    output_stage_rows = global_stage_tokens + (
+        pl.cdiv(comm_chunk_size, tile_size) * tile_size - comm_chunk_size
+    )
 
     # Compact state updates: the first ``state_slices`` dim-1 slices of each
     # logical pool block, which is enough to hold every state granule.
@@ -1664,8 +1791,8 @@ def fused_qkvz_projection_pcp_gdn(
     z_shape = jax.ShapeDtypeStruct(
         (
             local_num_tokens,
-            num_z_out_blocks,
-            _TPU_TILE_ROWS,
+            pcp_size,
+            z_tile_rows,
             _TPU_TILE_COLUMNS,
         ),
         act_out_dtype,
@@ -1715,7 +1842,7 @@ def fused_qkvz_projection_pcp_gdn(
         pltpu.VMEM(
             (
                 projection_cfg.token_block_size,
-                _TPU_TILE_ROWS,
+                z_tile_rows // num_value_chunks,
                 _TPU_TILE_COLUMNS,
             ),
             act_out_dtype,
@@ -1827,7 +1954,7 @@ def fused_qkvz_projection_pcp_gdn(
                 jnp.float32,
             ),
             pltpu.VMEM(
-                (2, global_stage_tokens, local_n_v, d_v),
+                (2, output_stage_rows, local_n_v, d_v),
                 act_out_dtype,
             ),
             *projection_scratch_shapes,

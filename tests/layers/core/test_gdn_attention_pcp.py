@@ -143,6 +143,44 @@ _GDN_PCP_FUSED_PROJECTION_CASES = (
         512,
         id="batch-flat-owner-with-history-bf16-ssm-cache",
     ),
+    # 16 local value heads give each rank a 2048-channel Z shard (two output
+    # tiles per token); 32 give 4096 channels, projected one tile per job.
+    pytest.param(
+        2,
+        4,
+        32,
+        2048,
+        (17, 15, 32),
+        (0, 17, 32),
+        (5, 41, 9),
+        jnp.float32,
+        512,
+        id="wide-z-two-tiles",
+    ),
+    pytest.param(
+        4,
+        16,
+        64,
+        2048,
+        (64, 64),
+        (0, 64),
+        None,
+        jnp.float32,
+        1024,
+        id="wide-z-64-value-heads-pcp4",
+    ),
+    pytest.param(
+        2,
+        8,
+        64,
+        2048,
+        (17, 15, 32),
+        (0, 17, 32),
+        (5, 41, 9),
+        jnp.float32,
+        512,
+        id="wide-z-four-tiles",
+    ),
 )
 # HND (seq-on-lane) is the production layout. With 128 granules per pool
 # block slice it is also what leaves non-state padding in the kernel's
