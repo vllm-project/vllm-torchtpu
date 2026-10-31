@@ -244,6 +244,7 @@ def prepare_capped_window_indices(
     page_size: int,
     total_num_pages: int,
     block_tokens: int | None = None,
+    num_seqs: jax.Array | int | None = None,
 ) -> jax.Array:
     """Launches the TPU kernel to translate logical slots to physical rows.
 
@@ -263,6 +264,8 @@ def prepare_capped_window_indices(
         page_size: Tokens per physical page (e.g. 256).
         total_num_pages: Total physical cache pages allocated.
         block_tokens: Token sub-tile size inside each chunk (e.g. 16 or 32).
+        num_seqs: Active sequence count (`distribution[2]`); when set, trailing
+          slots `>= num_seqs` in `cu_q_lens` are ignored.
 
     Returns:
         Array of shape [num_chunks * num_windows * chunk_size, topk_cap]
@@ -294,9 +297,8 @@ def prepare_capped_window_indices(
         page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
 
     # Associate each token with its sequence ID to look up its page table row.
-    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
-    seq_ids_segment = jnp.repeat(
-        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
+    seq_ids_segment = kv_cache_utils.token_seq_ids(
+        cu_q_lens, num_tokens, num_seqs=num_seqs
     )
     windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
 
@@ -1317,6 +1319,7 @@ def sparse_ragged_paged_attention(
             topk_cap=topk_cap,
             page_size=page_size,
             total_num_pages=cache_kv_nope.shape[0],
+            num_seqs=distribution[2],
         )
     else:
         kv_lens, physical_indices = prepare_gather_indices(
@@ -1325,6 +1328,7 @@ def sparse_ragged_paged_attention(
             cu_q_lens,
             page_size=page_size,
             total_num_pages=cache_kv_nope.shape[0],
+            num_seqs=distribution[2],
         )
 
     # Rows the grid never reaches (padding past `batch_end`) keep this
@@ -1401,6 +1405,7 @@ def prepare_gather_indices(
     *,
     page_size: int,
     total_num_pages: int,
+    num_seqs: jax.Array | int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Per-token valid top-k counts and flat cache row indices to gather.
 
@@ -1421,9 +1426,8 @@ def prepare_gather_indices(
                 f"page_indices size ({num_page_indices}) must be divisible by "
                 f"the sequence count ({max_num_seqs})"
             )
-        tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
-        seq_ids_segment = jnp.repeat(
-            jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
+        seq_ids_segment = kv_cache_utils.token_seq_ids(
+            cu_q_lens, num_tokens, num_seqs=num_seqs
         )
         seq_page_ids = topk_indices // page_size
         token_offset = topk_indices % page_size
