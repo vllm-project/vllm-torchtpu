@@ -22,7 +22,14 @@ import numpy as np
 import pytest
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.ep_combine_layout import (
+    COMBINE_SPLIT_ROWS,
+    combine_piece_rows,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import (
+    _fallback_implementation as reference_ragged_gather_reduce,
+)
 from vllm_torchtpu.layers.core import fused_moe_gmm
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -36,6 +43,27 @@ def test_select_ragged_gather_reduce(version):
     selected = fused_moe_gmm._select_ragged_gather_reduce(version)
     expected = getattr(fused_moe_gmm, f"ragged_gather_reduce_{version}")
     assert selected is expected
+
+
+def test_unpermute_of_piece_major_routes_writes_piece_major_rows():
+    num_tokens, topk, hidden, source_rows = COMBINE_SPLIT_ROWS[0], 6, 128, 5000
+    rng = np.random.default_rng(0)
+    source = jnp.asarray(rng.standard_normal((source_rows, hidden)), jnp.bfloat16)
+    indices = jnp.asarray(rng.integers(0, source_rows, num_tokens * topk), jnp.int32)
+    weights = jnp.asarray(rng.random(num_tokens * topk), jnp.bfloat16)
+    valid = jnp.asarray(rng.random(num_tokens * topk) > 0.3)
+    piece_rows = combine_piece_rows(num_tokens)
+    routes = fused_moe_gmm._piece_major_routes(
+        piece_rows, topk, indices, weights, valid
+    )
+
+    pieces = reference_ragged_gather_reduce(source, *routes, topk)
+
+    whole = reference_ragged_gather_reduce(source, indices, weights, valid, topk)
+    np.testing.assert_array_equal(
+        np.asarray(pieces.view(jnp.uint16)),
+        np.asarray(fused_moe_gmm._piece_major(whole, piece_rows).view(jnp.uint16)),
+    )
 
 
 def test_ragged_gather_reduce_version_defaults_to_v2(monkeypatch):

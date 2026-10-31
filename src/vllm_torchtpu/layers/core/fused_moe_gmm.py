@@ -19,6 +19,10 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.ep_combine_layout import (
+    combine_piece_rows,
+    split_pieces,
+)
 from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
@@ -426,6 +430,25 @@ def prepare_routed_gmm_inputs(
     )
 
 
+def _piece_major(x: jax.Array, piece_rows: tuple[int, ...]) -> jax.Array:
+    """Token-ordered rows of ``x`` reordered piece by piece (ep_combine_layout)."""
+    return jnp.concatenate(split_pieces(x, piece_rows))
+
+
+def _piece_major_routes(
+    piece_rows: tuple[int, ...], topk: int, *routes: jax.Array
+) -> tuple[jax.Array, ...]:
+    """Reorders flat per-route arrays so the unpermute writes piece-major rows.
+
+    The arrays are token-major, so reordering their elements in runs of whole
+    tokens moves the routes of a token together and in order, and every output
+    row is reduced exactly as before. Kept flat (each sub-block's routes are
+    one contiguous run) so the reorder needs no relayout.
+    """
+    route_rows = tuple(rows * topk for rows in piece_rows)
+    return tuple(_piece_major(r, route_rows) for r in routes)
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -447,12 +470,16 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    combine_in_pieces: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
+    ``combine_in_pieces`` says the output is reduce-scattered by the EP
+    combine, which may split it (ep_combine_layout); its rows are then
+    returned piece-major, as the split combine reads them.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
@@ -506,6 +533,17 @@ def moe_gmm(
             rhs_quant_dtype=rhs_quant_dtype,
         )
 
+    piece_rows = combine_piece_rows(num_tokens) if combine_in_pieces else ()
+    if piece_rows:
+        argsort_revert_indices, topk_weights_flat, valid_mask_flat = (
+            _piece_major_routes(
+                piece_rows,
+                topk,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+            )
+        )
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
@@ -565,8 +603,10 @@ def moe_gmm(
                 .set(topk_weights_flat)
             )
             valid_count = group_sizes.sum(dtype=jnp.int32)[None]
+            # The blockwise unpermute writes rows in token order.
             if (
                 envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on"
+                and not piece_rows
                 and can_use_blockwise_onehot_unpermute(
                     gmm2_res,
                     token_indices_sorted,
@@ -646,6 +686,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "combine_in_pieces",
     ),
 )
 def fused_moe_func(
@@ -666,6 +707,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    combine_in_pieces: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -685,6 +727,9 @@ def fused_moe_func(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    With ``combine_in_pieces`` the rows come back piece-major whenever the EP
+    combine splits a batch of this size (see ``moe_gmm``).
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -695,6 +740,8 @@ def fused_moe_func(
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     num_tokens, hidden_size = hidden_states.shape
+    if combine_in_pieces and not use_ep:
+        raise ValueError("combine_in_pieces needs use_ep: only EP combines split")
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
@@ -740,9 +787,11 @@ def fused_moe_func(
         skip_padded_tokens=skip_padded_tokens,
     ):
         logger.info_once("Selected experimental dense-expert decode MoE")
-        return dense_expert_moe(
+        out = dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
+        piece_rows = combine_piece_rows(num_tokens) if combine_in_pieces else ()
+        return _piece_major(out, piece_rows) if piece_rows else out
 
     (
         x,
@@ -783,5 +832,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        combine_in_pieces=combine_in_pieces,
     )
     return x[:num_tokens, :hidden_size]

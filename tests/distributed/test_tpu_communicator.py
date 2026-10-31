@@ -18,6 +18,11 @@ import pytest
 import torch
 
 from vllm_torchtpu.distributed import tpu_communicator as comm
+from vllm_torchtpu.distributed.ep_combine_layout import (
+    COMBINE_SPLIT_ROWS,
+    combine_piece_rows,
+    split_pieces,
+)
 
 
 @pytest.fixture
@@ -143,3 +148,58 @@ def test_dispatch_and_combine_with_sequence_parallel(
             assert invocation.kwargs == {"dim": 0}
         assert ep_group.all_gather.call_count == count
         ep_group.reduce_scatter.assert_not_called()
+
+
+def _replicated_reduce_scatter(world, rank):
+    """reduce_scatter seen by `rank` when every rank holds the same input."""
+    return lambda x, dim: world * x.unflatten(0, (world, -1))[rank]
+
+
+@pytest.mark.parametrize("rank", [0, 5])
+def test_combine_in_pieces_matches_one_reduce_scatter(monkeypatch, communicator, rank):
+    world = 8
+    group = Mock(world_size=world)
+    group.reduce_scatter.side_effect = _replicated_reduce_scatter(world, rank)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: group)
+    hidden = torch.arange(COMBINE_SPLIT_ROWS[0] * 2.0).view(-1, 2)
+
+    piece_rows = combine_piece_rows(hidden.shape[0])
+    result = communicator.combine(torch.cat(split_pieces(hidden, piece_rows)))
+
+    assert group.reduce_scatter.call_count == 2
+    torch.testing.assert_close(result, world * hidden.view(world, -1, 2)[rank])
+
+
+def test_combine_drafter_keeps_one_reduce_scatter(monkeypatch, communicator):
+    monkeypatch.setattr(comm.vllm_compilation_backends, "model_tag", "eagle_head")
+    group = Mock(world_size=8)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    hidden = torch.ones(COMBINE_SPLIT_ROWS[0], 2)
+
+    result = communicator.combine(hidden)
+
+    group.reduce_scatter.assert_called_once_with(hidden, dim=0)
+    assert result is group.reduce_scatter.return_value
+
+
+@pytest.mark.parametrize(
+    "dp,ep,expert_parallel",
+    [(8, 8, True), (16, 16, True), (8, 16, True), (8, 8, False)],
+)
+def test_combine_splits_only_under_ep_with_two_blocks_per_rank_and_equal_groups(
+    monkeypatch, dp, ep, expert_parallel
+):
+    dp_group = Mock(world_size=dp)
+    dp_group.device_communicator.expert_parallel = expert_parallel
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: Mock(world_size=ep))
+    assert comm.combine_splits() == (dp == ep == 8 and expert_parallel)
+
+
+@pytest.mark.parametrize(
+    "rows,expected",
+    [(8192, (128, 384)), (4096, (64, 192)), (6144, ()), (16384, ()), (2048, ())],
+)
+def test_combine_piece_rows(rows, expected):
+    assert combine_piece_rows(rows) == expected
