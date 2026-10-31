@@ -63,6 +63,8 @@ def main():
     ap.add_argument("--phys", action="store_true",
                     help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
+    ap.add_argument("--profile", default="", help="jax.profiler trace dir for --profile-iters calls")
+    ap.add_argument("--profile-iters", type=int, default=5)
     a = ap.parse_args()
     _apply_removals(a.remove)
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
@@ -160,6 +162,10 @@ def main():
         put = lambda x: jax.device_put(jnp.asarray(x), rep)  # noqa: E731
         args = [hidden, *ws, pool, *map(put, meta), *map(put, tabs), put(positions), put(qsl),
                 put(ctx), put(trig), *map(put, norms)]
+        from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
+
+        if main_kv_dcp() > 1:  # the QSA layers' dcp_rank buffer: tp rank % 2, one per rank
+            args.append(jax.device_put(jnp.arange(R, dtype=jnp.int32) % main_kv_dcp(), tp))
         f = jax.jit(call, donate_argnums=donate)
         t0 = time.time()
         res, pool = f(*args)
@@ -173,6 +179,12 @@ def main():
             res, pool = f(*args)
             jax.block_until_ready((res, pool))
             ts.append(time.perf_counter() - t0)
+        if a.profile:
+            with jax.profiler.trace(f"{a.profile}/b{B}"):
+                for _ in range(a.profile_iters):
+                    args[1 + len(ws)] = pool
+                    res, pool = f(*args)
+                jax.block_until_ready((res, pool))
         r32 = res.astype(jnp.float32)
         fin_rows = np.asarray(jnp.isfinite(r32).all(axis=1)).reshape(R, B)
         print(f"B={B} L={L} finite rows per rank:", fin_rows.astype(int).tolist(), flush=True)
