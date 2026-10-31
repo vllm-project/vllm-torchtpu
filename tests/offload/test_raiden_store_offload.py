@@ -2169,6 +2169,61 @@ class TestStorageTierLookups(unittest.TestCase):
         self.assertEqual(self.manager.prepare_store([key], _ctx()).keys_to_store, [key])
 
 
+class TestLocalOnlyLookup(unittest.TestCase):
+    """`lookup(..., local_only=True)` is the scheduler's tier-warmth probe.
+
+    It answers from the host pool alone: it does not ask the global registry,
+    counts neither a peer's block nor a storage-tier block as a hit, and stashes
+    nothing for a `prepare_load` that the probe never makes.
+    """
+
+    def setUp(self):
+        self.store = FakeKVCacheStore()
+        self.manager = make_global_manager(self.store)
+
+    def _probe_enable_global_flags(self) -> list[bool]:
+        return [call.args[1] for call in self.store.calls_named("lookup")]
+
+    def test_peer_block_is_miss_and_registry_is_not_asked(self):
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        self.assertEqual(
+            self.manager.lookup(key, _ctx(), local_only=True), LookupResult.MISS
+        )
+        self.assertEqual(self._probe_enable_global_flags(), [False])
+        self.assertEqual(self.manager._remote_slices, {})
+        # The default lookup of the same key still reaches the peer.
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.assertEqual(self._probe_enable_global_flags(), [False, True])
+        self.assertTrue(self.manager._remote_slices)
+
+    def test_storage_tier_block_is_miss(self):
+        key = _key(2)
+        seed_storage_entries(self.store, key)
+        self.assertEqual(
+            self.manager.lookup(key, _ctx(), local_only=True), LookupResult.MISS
+        )
+        self.assertEqual(self.manager._remote_slices, {})
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+
+    def test_host_prefix_with_storage_remainder_is_miss(self):
+        key = _key(3)
+        for h in sub_hashes(key)[:2]:
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+        seed_storage_entries(self.store, key)
+        self.assertEqual(
+            self.manager.lookup(key, _ctx(), local_only=True), LookupResult.MISS
+        )
+        self.assertEqual(self.manager._remote_slices, {})
+
+    def test_host_pool_hit_needs_no_req_context_and_takes_no_pin(self):
+        key = _key(4)
+        seed_host_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, local_only=True), LookupResult.HIT)
+        self.assertEqual(self.store.pinned_hashes(), {})
+        self.assertEqual(self.manager._remote_slices, {})
+
+
 class TestStorageTierRemoteReads(unittest.TestCase):
     """prepare_load when the storage tier also holds blocks the registry
     names on a peer."""
