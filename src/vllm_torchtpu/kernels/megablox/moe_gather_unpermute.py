@@ -47,6 +47,9 @@ SUM_GROUP = 8
 # their idle scalar slots.
 PROLOGUE_DMAS = 40
 PASS_DMAS = 2
+# Slot passes between a group's first and last pass have the most vector work
+# to hide DMAs under, so they start more.
+MIDDLE_PASS_DMAS = 4
 # Rows one DMA wait covers before the last few, a multiple of 8.
 WAIT_ROWS = 64
 # Row DMAs per iteration of the loops that start the rows the passes left
@@ -77,8 +80,9 @@ def _slot_rows(topk: int) -> int:
 def _list_overrun(topk: int) -> int:
     """Entries the kernel reads past the end of a block's row-DMA list."""
     passes = TOKEN_BLOCK // SUM_GROUP * topk
+    pass_dmas = max(PASS_DMAS, MIDDLE_PASS_DMAS)
     return max(
-        ISSUE_UNROLL - 1, PROLOGUE_DMAS + PASS_DMAS * passes - _slot_rows(topk), 0
+        ISSUE_UNROLL - 1, PROLOGUE_DMAS + pass_dmas * passes - _slot_rows(topk), 0
     )
 
 
@@ -227,8 +231,11 @@ def _route_tables(
     # The first of the next block's DMAs each group's passes start, then the
     # first one left after the block's last pass.
     passes = group_max.reshape(num_blocks, TOKEN_BLOCK // SUM_GROUP)
-    dma_start = PROLOGUE_DMAS + PASS_DMAS * jnp.pad(
-        jnp.cumsum(passes, axis=1), ((0, 0), (1, 0))
+    group_dmas = PASS_DMAS * jnp.minimum(passes, 2) + MIDDLE_PASS_DMAS * jnp.maximum(
+        passes - 2, 0
+    )
+    dma_start = PROLOGUE_DMAS + jnp.pad(
+        jnp.cumsum(group_dmas, axis=1), ((0, 0), (1, 0))
     )
     return (
         pair_rows,
@@ -369,8 +376,15 @@ def _kernel(
             count = count_lanes_ref[rows, :]
             even = even_lanes_ref[rows, :]
 
+            # The next block's DMAs a pass starts: PASS_DMAS in the group's
+            # first and last pass, MIDDLE_PASS_DMAS in each one between.
             def slot_pass(k, *, first: bool, last: bool):
-                start_next(group_dmas + PASS_DMAS * k, PASS_DMAS)
+                if first:
+                    start_next(group_dmas, PASS_DMAS)
+                else:
+                    # Past the first pass's DMAs and k - 1 middle passes' DMAs.
+                    dma_first = group_dmas + PASS_DMAS + MIDDLE_PASS_DMAS * (k - 1)
+                    start_next(dma_first, PASS_DMAS if last else MIDDLE_PASS_DMAS)
                 weight = weight_lanes_ref[k, rows, :]
                 shift = (jnp.right_shift(even, k) & 1).astype(jnp.uint32) * 16
                 valid = count > k
