@@ -69,15 +69,19 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
+    dispatches_quantized,
     fused_moe_gmm,
     prebuild_fused_moe_kernel,
+    quantize_moe_dispatch_rows,
     quantize_native_fp4_kmajor,
+    quantizes_moe_dispatch_rows,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
+from vllm_torchtpu.layers.core.fused_moe_gmm import resolve_onehot_permute_threshold
 from vllm_torchtpu.layers.core.quant_methods import MXFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_mxfp4_packed,
@@ -322,6 +326,11 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         )
 
     rhs_quant_dtype: Any = None
+    # Whether the experts read quantize_moe_dispatch_rows words, so a dispatch
+    # may send its rows quantized, and the one-hot threshold the fused MoE op
+    # was built with; both decided at weight load (dispatches_quantized).
+    _quantized_dispatch: bool = False
+    _onehot_moe_permute_threshold: int = 0
 
     def _forward_monolithic_tpu(
         self,
@@ -352,6 +361,19 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             moe_routing.routes_before_dispatch(self.moe)
         )
         if dispatches_routes:
+            if (
+                self._quantized_dispatch
+                and x.dtype == torch.bfloat16
+                and dispatches_quantized(
+                    x.shape[0],
+                    layer.moe_config.experts_per_token,
+                    self.moe.is_sequence_parallel,
+                    self._onehot_moe_permute_threshold,
+                )
+            ):
+                # Gathered in about half the bytes; the experts compute the
+                # same output from these rows as from the bf16 ones.
+                x = quantize_moe_dispatch_rows(x)
             x, topk_weights, topk_ids = get_ep_group().dispatch(
                 x, topk_weights, topk_ids, self.moe.is_sequence_parallel
             )
@@ -721,6 +743,25 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
             rhs_quant_dtype=jnp.float4_e2m1fn,
         )
+        # The GMM path's EP experts only (fused_moe_gmm's use_ep and
+        # use_sparse_core): an armed fused EP layer gathers on its own.
+        self._quantized_dispatch = (
+            op is None
+            and layer._experts_start is not None
+            and envs.USE_MOE_SPARSE_CORE
+            and quantizes_moe_dispatch_rows(
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                getattr(layer, "w13_bias", None),
+                getattr(layer, "w2_bias", None),
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                rhs_quant_dtype=jnp.float4_e2m1fn,
+            )
+        )
+        self._onehot_moe_permute_threshold = resolve_onehot_permute_threshold()
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:

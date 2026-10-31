@@ -18,14 +18,25 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.tpu_communicator import combine_splits
+from vllm_torchtpu.kernels.megablox.quantized_rows import (
+    ROWS_PER_WORD,
+    quantized_row_width,
+)
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    dispatches_quantized_rows,
     fused_moe_func,
+    quantize_dispatch_rows,
     quantize_to_native_fp4_kmajor,
+    quantizes_dispatch_rows,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
@@ -36,6 +47,18 @@ _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, bool], Callable] 
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
+
+# Registered at import: the EP dispatch quantizes inside the compiled forward,
+# where Dynamo cannot trace a registration.
+_quantize_dispatch_rows_op = pallas.jax_op(
+    "pallas::quantize_dispatch_rows", quantize_dispatch_rows
+)
+_quantize_dispatch_rows_op.register_fake(
+    lambda x: x.new_empty(
+        (x.shape[0] // ROWS_PER_WORD, quantized_row_width(x.shape[1])),
+        dtype=torch.int32,
+    )
+)
 
 
 def _resolve_activation_name(activation: Any) -> str:
@@ -144,6 +167,68 @@ def quantize_native_fp4_kmajor(
     return op(w)
 
 
+def quantizes_moe_dispatch_rows(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    *,
+    topk: int,
+    activation: str,
+    rhs_quant_dtype=None,
+) -> bool:
+    """fused_moe_gmm.quantizes_dispatch_rows for these EP experts' weights.
+
+    Call it at weight load: it asks the TPU, which a traced forward cannot.
+    """
+
+    def shape(t: torch.Tensor | None):
+        if t is None:
+            return None
+        dtype = jnp.dtype(str(t.dtype).removeprefix("torch."))
+        return jax.ShapeDtypeStruct(tuple(t.shape), dtype)
+
+    return quantizes_dispatch_rows(
+        *map(shape, (w1, w2, w1_scale, w2_scale, w1_bias, w2_bias)),
+        topk=topk,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
+def dispatches_quantized(
+    num_tokens: int,
+    topk: int,
+    is_sequence_parallel: bool,
+    onehot_moe_permute_threshold: int,
+) -> bool:
+    """Whether an EP dispatch of num_tokens bf16 rows per rank sends them as
+    quantize_moe_dispatch_rows words, to experts quantizes_moe_dispatch_rows
+    admitted; fused_moe_gmm computes the same output from the words.
+
+    The group is the one TpuDeviceCommunicator.dispatch gathers over, and
+    the threshold the one the fused MoE op was built with
+    (resolve_onehot_permute_threshold). Only the backbone compares its token
+    count: the MTP drafter has one graph for every bucket (see
+    combine_splits). Integer arithmetic only: the count is dynamic in the
+    trace.
+    """
+    group = get_ep_group() if is_sequence_parallel else get_dp_group()
+    return vllm_compilation_backends.model_tag == "backbone" and (
+        dispatches_quantized_rows(
+            num_tokens, group.world_size, topk, onehot_moe_permute_threshold
+        )
+    )
+
+
+def quantize_moe_dispatch_rows(hidden_states: torch.Tensor) -> torch.Tensor:
+    """hidden_states' rows quantized as the experts read them, as int32 words
+    (``ROWS_PER_WORD`` rows each), in about half the bytes."""
+    return _quantize_dispatch_rows_op(hidden_states)
+
+
 def _allocate_kernel_instance_id() -> int:
     global _kernel_instance_counter
     kernel_instance_id = _kernel_instance_counter
@@ -190,7 +275,13 @@ def _build_fused_moe_custom_op(
 
     # We must overwrite the default fake implementation as vLLM uses dynamic
     # dimensions for the hidden_states.
-    def _fake_fused_moe(hidden_states, *args, **kwargs):
+    def _fake_fused_moe(hidden_states, w1, w2, *args, **kwargs):
+        if hidden_states.dtype == torch.int32:
+            # quantize_moe_dispatch_rows words: one bf16 row per token out.
+            topk_ids = args[5]
+            return hidden_states.new_empty(
+                (topk_ids.shape[0], w2.shape[-1]), dtype=torch.bfloat16
+            )
         return torch.empty_like(hidden_states)
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
@@ -281,6 +372,10 @@ def fused_moe_gmm(
     combine_in_pieces: bool | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
+
+    ``hidden_states`` may also be quantize_moe_dispatch_rows words of the
+    gathered rows, where dispatches_quantized holds; the output is the bf16
+    one the rows give.
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see

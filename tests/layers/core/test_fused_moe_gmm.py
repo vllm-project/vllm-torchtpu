@@ -1108,6 +1108,71 @@ def test_fused_moe_func_int4_packed_matches_reference():
     )
 
 
+@pytest.mark.tpu_test
+def test_fused_moe_quantized_dispatch_rows_match_bf16_rows():
+    """quantize_dispatch_rows words give the bf16 rows' output bit for bit."""
+    _require_tpu()
+
+    num_tokens, hidden_size, inter_size = 4096, 1024, 512
+    num_experts, topk, quant_block = 8, 2, 512
+    keys = jax.random.split(jax.random.key(3), 7)
+    hidden_states = jax.random.normal(keys[0], (num_tokens, hidden_size), jnp.bfloat16)
+    hidden_states = hidden_states.at[11].set(0)
+    # Half the routes go to experts of another rank.
+    topk_ids = jax.random.randint(keys[1], (num_tokens, topk), 0, 2 * num_experts)
+    topk_weights = jax.random.uniform(keys[2], (num_tokens, topk), jnp.float32)
+    w1 = jax.random.randint(
+        keys[3], (num_experts, hidden_size // 2, 2 * inter_size), 0, 256
+    ).astype(jnp.uint8)
+    w2 = jax.random.randint(
+        keys[4], (num_experts, inter_size // 2, hidden_size), 0, 256
+    ).astype(jnp.uint8)
+    w1_scale = jax.random.uniform(
+        keys[5], (num_experts, hidden_size // quant_block, 2 * inter_size)
+    )
+    w2_scale = jax.random.uniform(
+        keys[6], (num_experts, inter_size // quant_block, hidden_size)
+    )
+    common = dict(
+        w1=w1,
+        w2=w2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_bias=None,
+        w2_bias=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        experts_start=jnp.array(0, jnp.int32),
+        topk=topk,
+        activation="silu_and_mul_with_clamp",
+        use_ep=True,
+        use_sparse_core=True,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+    assert fused_moe_gmm.quantizes_dispatch_rows(
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        None,
+        None,
+        topk=topk,
+        activation="silu_and_mul_with_clamp",
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+    assert fused_moe_gmm.dispatches_quantized_rows(num_tokens // 8, 8, topk, 0)
+
+    expected = fused_moe_func(hidden_states=hidden_states, **common)
+    actual = fused_moe_func(
+        hidden_states=fused_moe_gmm.quantize_dispatch_rows(hidden_states), **common
+    )
+
+    assert actual.dtype == expected.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
+    )
+
+
 def _fake_tpu_info(sparse_core):
     return types.SimpleNamespace(sparse_core=sparse_core)
 
