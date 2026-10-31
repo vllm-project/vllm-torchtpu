@@ -90,6 +90,26 @@ class TestTpuCompilerCache:
 
         assert unprofiled == phased
 
+    def test_tpu_hash_keys_the_count_tap_on_whether_it_runs(self):
+        """The tap changes every MoE forward, so turning it on must recompile;
+        where its snapshots go and how often must not."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def tap(directory, every):
+            env = {"MOE_EXPERT_COUNT_TAP_DIR": directory}
+            env["MOE_EXPERT_COUNT_TAP_EVERY"] = every
+            with patch.dict(os.environ, env):
+                return compute_tpu_compilation_hash(self._config())
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            off = tap("", "1000")
+            on = tap("/tmp/run_a", "1000")
+            assert on == tap("/tmp/run_b", "50")
+        assert off != on
+
     def test_tpu_hash_covers_native_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
@@ -145,6 +165,21 @@ class TestTpuCompilerCache:
                 dp4 = compute_tpu_compilation_hash(self._config())
 
         assert dp1 != dp4
+
+    def test_tpu_hash_ignores_the_expert_placement(self):
+        """A placement permutes weights and router tables at load and leaves
+        every program as it was, so a placed server reuses the cache."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def placed(value):
+            with patch.dict(os.environ, {"TPU_EXPERT_PLACEMENT": value}):
+                return compute_tpu_compilation_hash(self._config())
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            assert placed("") == placed("/tmp/placement.json")
 
     def test_runtime_hash_covers_custom_op_boundaries(self):
         from vllm_torchtpu.compilation import tpu_compiler
