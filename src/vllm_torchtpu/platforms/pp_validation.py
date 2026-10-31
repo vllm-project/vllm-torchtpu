@@ -41,7 +41,12 @@ _FULL_ATTENTION_LAYER_TYPES = [
 # KV transfer connectors that register each stage's own layers: the
 # disaggregation connector with the stage's peer, the offloading connector
 # with the offload controller.
-_RAIDEN_CONNECTORS = ("TPURaidenConnector", "TPURaidenOffloadingConnector")
+_RAIDEN_CONNECTORS = (
+    "TPURaidenConnector",
+    "TPURaidenOffloadingConnector",
+    # Qwen4Exp's model-owned subclass of TPURaidenConnector.
+    "Qwen4ExpRaidenConnector",
+)
 
 
 def _kv_connector_names(kv_transfer_config: Any) -> list[str]:

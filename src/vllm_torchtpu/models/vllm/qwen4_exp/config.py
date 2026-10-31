@@ -517,8 +517,7 @@ def validate_config(cfg):
     # hook. TPU's existing platform_activation patch disables it afterward;
     # rejecting that intermediate property would block every mixed TP/DP.
     if (
-        p.pipeline_parallel_size != 1
-        or p.prefill_context_parallel_size != 1
+        p.prefill_context_parallel_size != 1
         or p.decode_context_parallel_size != 1
         or p.enable_dbo
         or p.enable_eplb
@@ -526,9 +525,27 @@ def validate_config(cfg):
         or p.enable_elastic_ep
     ):
         raise ValueError(
-            "Qwen4Exp TPU requires PP/CP1, "
+            "Qwen4Exp TPU requires CP1, "
             "linear expert placement and no DBO/EPLB/elastic EP"
         )
+    if p.pipeline_parallel_size > 1:
+        from .pool_layout import pack_compressed_k_enabled
+
+        # Pipeline stages run TP1, as Qwen3.5's PP prefill does (TPU stages
+        # cannot run TP collectives yet, see platforms/pp_validation.py), on
+        # the unified pool, whose packed compressed-key groups would span
+        # stages; the MTP draft would sit on the last stage.
+        if (
+            p.tensor_parallel_size != 1
+            or not use_unified_pool()
+            or pack_compressed_k_enabled()
+            or cfg.speculative_config is not None
+        ):
+            raise ValueError(
+                "Qwen4Exp pipeline parallelism requires TP1 stages, the unified "
+                "pool with QWEN4_EXP_PACK_COMPRESSED_K=0, and speculative "
+                "decoding off"
+            )
     from .pool_layout import MAIN_KV_DCP_ENV, main_kv_dcp
 
     # The QSA main-KV split over TP rank pairs is this model's own path (vLLM's
@@ -589,8 +606,16 @@ def validate_config(cfg):
     elif transfer is not None:
         connector_module = PD_CONNECTOR_MODULE
         if (
-            (p.tensor_parallel_size, p.data_parallel_size) != (1, 8)
-            or not p.enable_expert_parallel
+            # One host per leg: TP x DP x PP covers its 8 cores. TP and DP
+            # engines spread experts (EP); a pipeline stage holds all of its
+            # layers' experts. Producer TP ranks or PP stages are the
+            # transfer units (TPU_RAIDEN_TRANSFER_PARALLELISM).
+            p.tensor_parallel_size * p.data_parallel_size * p.pipeline_parallel_size
+            != 8
+            or (
+                p.tensor_parallel_size * p.data_parallel_size > 1
+                and not p.enable_expert_parallel
+            )
             or transfer.kv_connector != PD_CONNECTOR
             or transfer.kv_connector_module_path not in (None, connector_module)
             or transfer.kv_role not in ("kv_producer", "kv_consumer")
@@ -610,7 +635,7 @@ def validate_config(cfg):
         ):
             raise ValueError(
                 "Qwen4Exp PD requires its model-owned Raiden connector, a producer "
-                "or consumer role, DP8/TP1/EP8, unified FP8 pages, "
+                "or consumer role, TP x DP x PP = 8 (EP across TP x DP), unified FP8 pages, "
                 "BF16/FP32 SSM and APC off"
             )
     if envs.VLLM_TPU_BLOCK_MAJOR_KV:

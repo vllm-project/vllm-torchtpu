@@ -6559,7 +6559,11 @@ class TPUModelRunner(GPUModelRunner):
         self._wait_input_staging_fence()
         if (adapter := getattr(self, "model_adapter", None)) is not None:
             return adapter.dummy_run(
-                num_tokens, num_reqs, profile_prefix, dp_lockstep=dp_lockstep
+                num_tokens,
+                num_reqs,
+                profile_prefix,
+                dp_lockstep=dp_lockstep,
+                through_handoff=through_handoff,
             )
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None

@@ -22,6 +22,8 @@ TEMP_HEADROOM = 8 * 1024**3
 
 class Qwen4ExpCache:
     def __init__(self, runner, model):
+        if runner.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError("Qwen4Exp pipeline stages need the unified pool")
         self.runner, self.model = runner, model
         self.slots = runner.max_num_reqs + 1
         self.owners = {}

@@ -5,8 +5,10 @@ import gc
 from dataclasses import replace
 
 import torch
+from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_bytes_per_block,
+    _project_kv_cache_groups_to_worker,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
 )
@@ -33,6 +35,7 @@ from .config import (
 )
 from .pd import TransferGroup, build_transfer_groups
 from .pool_layout import check_packed_compressed_groups, pooled_cache_specs
+from .pp import is_last_stage, owns_cache, pipeline_size, stage_layers
 from .qsa import Qwen4ExpPooledQSABackend
 
 
@@ -51,17 +54,32 @@ class Qwen4ExpPooledCache:
 
     def __init__(self, runner, model):
         self.runner, self.model = runner, model
-        self.layout, self.specs = pooled_cache_specs(runner.vllm_config)
-        self.groups = get_kv_cache_groups(runner.vllm_config, self.specs)
-        check_packed_compressed_groups(self.layout, self.groups)
+        cfg = runner.vllm_config
+        # The page layout always describes the whole model, so every
+        # pipeline stage shares one page geometry and block ID space.
+        self.layout, model_specs = pooled_cache_specs(cfg)
+        if pipeline_size(cfg) == 1:
+            self.specs = model_specs
+            self.groups = get_kv_cache_groups(cfg, self.specs)
+            check_packed_compressed_groups(self.layout, self.groups)
+        else:
+            # A stage registers its own owners and plans the whole model's
+            # groups projected onto them, exactly as vLLM's planner does for
+            # each worker (get_kv_cache_configs), so the plans agree.
+            layers, last = stage_layers(cfg), is_last_stage(cfg)
+            self.specs = {
+                name: spec
+                for name, spec in model_specs.items()
+                if owns_cache(name, layers, last)
+            }
+            model_groups = get_kv_cache_groups(cfg, dict(model_specs))
+            check_packed_compressed_groups(self.layout, model_groups)
+            self.groups = _project_kv_cache_groups_to_worker(model_groups, self.specs)
         self.block_bytes = _get_kv_cache_bytes_per_block(self.groups)
-        self.hbm_sizing = hbm_pool_sizing(runner.vllm_config)
-        # Pages of the current pool; for static sizing, the fixed capacity.
-        self.pages = (
-            0
-            if self.hbm_sizing
-            else native_cache_capacity(runner.vllm_config, self.specs)
-        )
+        self.hbm_sizing = hbm_pool_sizing(cfg)
+        # Pages of the current pool; for static sizing, the fixed capacity
+        # the config hook planned from the whole model.
+        self.pages = 0 if self.hbm_sizing else native_cache_capacity(cfg, model_specs)
         self.final = False
         self.materialized = None
         self.native_config = None
@@ -171,6 +189,8 @@ class Qwen4ExpPooledCache:
         if self.materialized is None:
             return
         for layer in self.model.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
             if layer.layer_type == "linear_attention":
                 layer.linear_attn.kv_cache = None
             else:
@@ -240,6 +260,8 @@ class Qwen4ExpPooledCache:
         )
         caches = self.materialized.kv_caches
         for i, layer in enumerate(self.model.model.layers):
+            if isinstance(layer, PPMissingLayer):
+                continue
             prefix = f"model.layers.{i}"
             if layer.layer_type == "linear_attention":
                 layer.linear_attn.kv_cache = tuple(caches[prefix + ".linear_attn"])
