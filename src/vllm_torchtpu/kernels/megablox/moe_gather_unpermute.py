@@ -88,7 +88,7 @@ def _smem_words(num_tokens: int, topk: int) -> int:
     entries = topk * num_tokens + _list_overrun(topk)
     list_len = num_blocks + 1
     dma_start = num_blocks * (groups + 1)
-    group_max = num_blocks * groups
+    group_max = num_blocks * groups + 1
     return pair_rows + entries + list_len + dma_start + group_max
 
 
@@ -231,7 +231,8 @@ def _route_tables(
         entries,
         list_len,
         dma_start.reshape(-1),
-        group_max,
+        # The kernel reads one entry past the last group.
+        jnp.pad(group_max, (0, 1)),
         weight_table,
         route_table,
     )
@@ -350,10 +351,15 @@ def _kernel(
         lax.fori_loop(0, lax.rem(block_len, _SUBLANES), wait_rows(slots_ref.at[0]), 0)
 
         def sum_group(g, carry):
+            # This group's table entries were read one iteration ahead, so
+            # the branches on them need not wait for SMEM loads.
+            group_max, group_dmas = carry
+            next_carry = (
+                group_max_ref[block * groups + g + 1],
+                dma_start_ref[block * (groups + 1) + g + 1],
+            )
             row0 = pl.multiple_of(g * SUM_GROUP, SUM_GROUP)
             rows = pl.ds(row0, SUM_GROUP)
-            group_max = group_max_ref[block * groups + g]
-            group_dmas = dma_start_ref[block * (groups + 1) + g]
             count = count_lanes_ref[rows, :]
             even = even_lanes_ref[rows, :]
 
@@ -400,11 +406,15 @@ def _kernel(
                 lax.fori_loop(1, group_max - 1, middle, 0)
                 slot_pass(group_max - 1, first=False, last=True)
 
-            return carry
+            return next_carry
 
-        lax.fori_loop(0, groups, sum_group, 0)
+        first_group = (
+            group_max_ref[block * groups],
+            dma_start_ref[block * (groups + 1)],
+        )
+        _, left_dmas = lax.fori_loop(0, groups, sum_group, first_group)
         # The next block's DMAs the passes did not reach.
-        start_next_from(dma_start_ref[block * (groups + 1) + groups])
+        start_next_from(left_dmas)
 
     @pl.when(block % 2 == 0)
     def _():
