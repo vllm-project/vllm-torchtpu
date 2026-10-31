@@ -180,7 +180,7 @@ def load_activation_as_compact(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Load activations from VMEM as a compact layout."""
 
-    qkv_vmem_ref[...] = qkv_vreg
+    qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
 
     k_offset = cfgs.num_kq_heads * cfgs.kq_head_dim
     v_offset = 2 * k_offset
@@ -211,7 +211,7 @@ def load_activation_as_large(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Load activations from VMEM as a large layout."""
 
-    qkv_vmem_ref[...] = qkv_vreg
+    qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     kq_lanes = cfgs.num_kq_heads * (cfgs.kq_head_dim // num_lanes)
