@@ -4806,7 +4806,7 @@ class TPUModelRunner(GPUModelRunner):
         from, `[padded_logits_length, vocab]`, when the drafter sampled
         probabilistically (DSparkProposer.gather_draft_probs); None for
         greedy drafting, which the sampler verifies as one-hot."""
-        gather = getattr(self.drafter, "gather_draft_probs", None)
+        gather = getattr(getattr(self, "drafter", None), "gather_draft_probs", None)
         if gather is None:
             return None
         req_ids = self.input_batch.req_ids[cur_start_idx:cur_end_idx]
