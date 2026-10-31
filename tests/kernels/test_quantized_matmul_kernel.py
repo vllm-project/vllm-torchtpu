@@ -523,3 +523,39 @@ def test_fused_quantized_matmul_rope_quant_matches_rope_quant(
         np.asarray(actual_scale).view(np.uint32),
         np.asarray(expected_scale).view(np.uint32),
     )
+
+
+@pytest.mark.parametrize(
+    ("bs", "num_heads"),
+    [(1024, 64), (256, 16), (32, 8)],
+)
+def test_fused_quantized_matmul_qnorm_rope_matches_qnorm_rope(
+    bs: int, num_heads: int
+) -> None:
+    """The kernel must reproduce `qnorm_rope` of `xla_quantized_matmul`."""
+    _require_tpu_v7()
+    n_input_features, head_dim, max_position = 1024, 512, 4096
+    kx, kw, ks, kc, kp = jax.random.split(jax.random.key(0), 5)
+    x = jax.random.normal(kx, (bs, n_input_features), jnp.float32) * 3
+    x = x.at[5].set(0).at[7, 3].set(1e4).astype(jnp.bfloat16)
+    # Within e4m3's range, so every head is finite.
+    w_q = (jax.random.normal(kw, (n_input_features, num_heads * head_dim)) * 30).astype(
+        jnp.float8_e4m3fn
+    )
+    w_q = w_q.at[:, head_dim : 2 * head_dim].set(0)  # a head of zero rows
+    w_scale = jax.random.uniform(ks, (num_heads * head_dim,), jnp.float32, 1e-3, 1e-2)
+    cos_sin_cache = jax.random.uniform(kc, (max_position, 64), jnp.float32, -1, 1)
+    positions = jax.random.randint(kp, (bs,), 0, max_position, jnp.int32)
+    assert fused_quantize_kernel.supports_qnorm_rope(x, w_q, w_scale, head_dim)
+
+    q = jax.jit(xla_quantized_matmul)(x, w_q, w_scale)
+    expected = rope.qnorm_rope(
+        q.reshape(bs, num_heads, head_dim), positions, cos_sin_cache, eps=1e-6
+    )
+    actual = fused_quantize_kernel.fused_quantized_matmul_qnorm_rope(
+        x, w_q, w_scale, positions, cos_sin_cache, head_dim=head_dim, eps=1e-6
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint16),
+        np.asarray(expected).reshape(bs, -1).view(np.uint16),
+    )
