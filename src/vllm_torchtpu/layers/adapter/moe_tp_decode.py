@@ -66,6 +66,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
     _quantize_rows,
     fused_moe_prefill_stage_a,
+    gather_routes,
     gather_rows,
     own_rows,
 )
@@ -637,9 +638,14 @@ def _split_body(statics: _OpStatics, n_ranks: int, axis: str):
         is_pad = own_rows(pad_mask[:n], rank.reshape(()), n_ranks)
         w, ids = _route(x, scores, bias, is_pad, statics)
         x_q, x_scale = prequant if prequant else _quantize_rows(x, w13.dtype)
-        x_q, x_scale, w, ids = (
-            gather_rows(a, axis) for a in (x_q, x_scale, w, ids.astype(jnp.int32))
-        )
+        core_major = envs.TPU_MOE_PREFILL_GATHER_ONCE
+        if core_major:
+            w, ids, x_scale = gather_routes(w, ids, x_scale, axis)
+            x_q = lax.all_gather(x_q, axis, axis=0, tiled=True)
+        else:
+            x_q, x_scale, w, ids = (
+                gather_rows(a, axis) for a in (x_q, x_scale, w, ids.astype(jnp.int32))
+            )
         return fused_moe_prefill_stage_a(
             None,
             w13,
@@ -659,6 +665,7 @@ def _split_body(statics: _OpStatics, n_ranks: int, axis: str):
             x_q=x_q,
             x_scale=x_scale,
             scatter=True,
+            core_major=core_major,
         ).astype(x.dtype)
 
     return body

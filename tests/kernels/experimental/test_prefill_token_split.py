@@ -76,6 +76,47 @@ def _contiguous_rows_np(x, index):
     return np.asarray(x[index * rows : (index + 1) * rows])
 
 
+@pytest.mark.parametrize("tokens", [256, 2560, 4096])
+def test_in_token_order_puts_core_gathered_rows_in_token_order(mesh, tokens):
+    h = 128
+    rng = np.random.default_rng(tokens)
+    rows = jnp.asarray(rng.integers(-16, 17, (tokens, h)), jnp.bfloat16)
+    gathered = np.asarray(
+        _per_core(
+            mesh,
+            lambda y: lax.all_gather(
+                v2.own_rows(y, lax.axis_index("d"), RANKS), "d", axis=0, tiled=True
+            ),
+            jnp.tile(rows, (RANKS, 1)),
+        )
+    )[:tokens]
+    back = np.asarray(v2.in_token_order(jnp.asarray(gathered), RANKS))
+    np.testing.assert_array_equal(_bits(back), _bits(rows))
+    if v2.token_chunks(tokens) > 1:
+        assert not np.array_equal(_bits(gathered), _bits(rows))
+
+
+def test_gather_routes_returns_every_cores_bits(mesh):
+    rng = np.random.default_rng(7)
+    weights = jnp.asarray(rng.random((RANKS * 4, 8)), jnp.bfloat16)
+    ids = jnp.asarray(rng.integers(0, 256, (RANKS * 4, 8)), jnp.int32)
+    scale = jnp.asarray(rng.random((RANKS * 4,)), jnp.float32)
+
+    fn = jax.jit(
+        jax.shard_map(
+            lambda w, i, s: v2.gather_routes(w, i, s, "d"),
+            mesh=mesh,
+            in_specs=(P("d"),) * 3,
+            out_specs=P(),
+            check_vma=False,
+        )
+    )
+    w, i, s = (np.asarray(a) for a in fn(weights, ids, scale))
+    np.testing.assert_array_equal(i, np.asarray(ids))
+    np.testing.assert_array_equal(_bits(w), _bits(weights))
+    np.testing.assert_array_equal(_bits(s), _bits(scale))
+
+
 # 256-2048: one combine chunk; 2560 and 4096: two chunks (1280 and 2048 rows).
 @pytest.mark.parametrize("tokens", [256, 1024, 2560, 4096])
 def test_split_collectives_follow_the_moe_reduce_scatter(mesh, tokens):
@@ -248,19 +289,29 @@ def _assert_rows_match(today, mine):
         )
 
 
+@pytest.mark.parametrize("gather_once", [False, True])
 @pytest.mark.parametrize(
     "tokens,chunk_tokens,sum_in_kernel,prequant",
     [
         (256, 2048, 0, False),  # one chunk, slab + combine
         (384, 128, 0, True),  # three combine chunks, the norm's fp8 rows
         (256, 2048, 256, True),  # the in-kernel sum build
+        (384, 128, 384, False),  # the in-kernel sum build over three chunks
     ],
 )
 def test_split_moe_matches_todays_rows_bit_for_bit(
-    mesh, interpret, monkeypatch, tokens, chunk_tokens, sum_in_kernel, prequant
+    mesh,
+    interpret,
+    monkeypatch,
+    tokens,
+    chunk_tokens,
+    sum_in_kernel,
+    prequant,
+    gather_once,
 ):
     monkeypatch.setattr(v2, "_COMBINE_CHUNK_TOKENS", chunk_tokens)
     monkeypatch.setenv("TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS", str(sum_in_kernel))
+    monkeypatch.setenv("TPU_MOE_PREFILL_GATHER_ONCE", "1" if gather_once else "0")
     today, mine = _today_and_split(mesh, tokens, prequant)
     _assert_rows_match(today, mine)
     assert np.isfinite(today.astype(np.float32)).all()
@@ -272,9 +323,11 @@ def _swap_cores(x, index):
     return _own_rows_np(x, swapped)
 
 
+@pytest.mark.parametrize("gather_once", [False, True])
 @pytest.mark.parametrize("split_rows", [_contiguous_rows_np, _swap_cores])
-def test_a_broken_split_fails(mesh, interpret, monkeypatch, split_rows):
+def test_a_broken_split_fails(mesh, interpret, monkeypatch, split_rows, gather_once):
     monkeypatch.setattr(v2, "_COMBINE_CHUNK_TOKENS", 128)
+    monkeypatch.setenv("TPU_MOE_PREFILL_GATHER_ONCE", "1" if gather_once else "0")
     today, mine = _today_and_split(mesh, 384, False, split_rows)
     with pytest.raises(AssertionError):
         _assert_rows_match(today, mine)
