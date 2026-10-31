@@ -600,13 +600,26 @@ def _qnorm_rope_vmem_bytes(m: int, k: int, tn: int, head_dim: int) -> int:
     return x + x_q + w + out + cos_sin + chunk
 
 
+def _qnorm_rope_out_block(m: int, k: int, n: int, head_dim: int) -> int | None:
+    """The widest of the halvings of the out block that fits, in whole heads."""
+    tn = util.FUSED_QNORM_ROPE_OUT_BLOCK
+    while tn >= util.FUSED_QNORM_ROPE_MIN_OUT_BLOCK:
+        if (
+            tn % head_dim == 0
+            and n % tn == 0
+            and _qnorm_rope_vmem_bytes(m, k, tn, head_dim) <= VMEM_LIMIT_BYTES
+        ):
+            return tn
+        tn //= 2
+    return None
+
+
 def supports_qnorm_rope(
     x: jax.Array, w_q: jax.Array, w_scale: jax.Array, head_dim: int
 ) -> bool:
     """Whether `fused_quantized_matmul_qnorm_rope` should take these operands."""
     m, k = x.shape
     n = w_q.shape[1]
-    tn = util.FUSED_QNORM_ROPE_OUT_BLOCK
     return (
         x.dtype == jnp.bfloat16
         and w_q.dtype == jnp.float8_e4m3fn
@@ -617,9 +630,7 @@ def supports_qnorm_rope(
         and m % QUANT_ROWS == 0
         and m % min(util.FUSED_QNORM_ROPE_ROWS, m) == 0
         and head_dim % rope.LANE == 0
-        and tn % head_dim == 0
-        and n % tn == 0
-        and _qnorm_rope_vmem_bytes(m, k, tn, head_dim) <= VMEM_LIMIT_BYTES
+        and _qnorm_rope_out_block(m, k, n, head_dim) is not None
     )
 
 
@@ -772,7 +783,7 @@ def fused_quantized_matmul_qnorm_rope(
     assert rotary_dim % 2 == 0 and rotary_dim <= rope.LANE
     if not supports_qnorm_rope(x, w_q, w_scale, head_dim):
         raise ValueError(f"Unsupported shape {(m, k, n)}; see `supports_qnorm_rope`.")
-    tn = util.FUSED_QNORM_ROPE_OUT_BLOCK
+    tn = _qnorm_rope_out_block(m, k, n, head_dim)
     f8_max = float(jnp.finfo(w_q.dtype).max)
 
     grid_spec = pltpu.PrefetchScalarGridSpec(

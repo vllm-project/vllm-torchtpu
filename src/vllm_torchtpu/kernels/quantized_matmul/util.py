@@ -42,9 +42,11 @@ FUSED_QUANTIZE_WIDE_OUT_BLOCK = 2048
 FUSED_ROPE_QUANT_TOKEN_BLOCK = 256
 FUSED_ROPE_QUANT_HEADS_PER_DOT = 8
 # `fused_quantize_kernel.fused_quantized_matmul_qnorm_rope`: weight columns per
-# grid step (whole heads), and rows per MXU dot of one head, whose norm and
-# rotation follow it.
-FUSED_QNORM_ROPE_OUT_BLOCK = 2048
+# grid step (whole heads; halved until the step fits VMEM, down to the minimum,
+# below which XLA keeps the shape), and rows per MXU dot of one head, whose norm
+# and rotation follow it.
+FUSED_QNORM_ROPE_OUT_BLOCK = 4096
+FUSED_QNORM_ROPE_MIN_OUT_BLOCK = 2048
 FUSED_QNORM_ROPE_ROWS = 256
 # Weight tiles it keeps in flight, and copies each tile is fetched as.
 FUSED_QNORM_ROPE_WEIGHT_SLOTS = 3
