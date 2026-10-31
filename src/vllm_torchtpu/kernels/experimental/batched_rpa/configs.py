@@ -14,6 +14,7 @@
 
 import dataclasses
 import enum
+import math
 
 import jax
 import jax.numpy as jnp
@@ -166,6 +167,7 @@ class ServingConfigs:
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
     smem_fraction_limit_for_schedule_generation: float = 0.33
     max_schedule_size_multiplier: int = 16
+    page_indices_window_size: int = 2048
     decode_query_size: int = 1
     cp_group_size: int | None = None
     attention_scope: AttentionScope = AttentionScope.FULL
@@ -264,7 +266,7 @@ class RpaConfigs:
         fixed_bytes = 0
         fixed_bytes += self.serve.num_seqs  # kv_lens
         fixed_bytes += self.serve.num_seqs + 1  # cu_q_lens
-        fixed_bytes += self.serve.num_seqs * self.serve.pages_per_seq  # page_indices
+        fixed_bytes += 2 * self.page_window_slot_len  # page_indices windows
         fixed_bytes += 3  # distribution
         fixed_bytes += self.block.batch_size  # lane_lengths
         fixed_bytes += 1  # actual_steps
@@ -296,6 +298,29 @@ class RpaConfigs:
         num_lanes = pltpu.get_tpu_info().num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
         return int(max_steps_ub)
+
+    @property
+    def page_window_seqs(self) -> int:
+        """Sequences per page_indices DMA window: a power of two dividing num_seqs."""
+        max_rows = max(
+            1, self.serve.page_indices_window_size // self.serve.pages_per_seq
+        )
+        rows = 1 << (max_rows.bit_length() - 1)
+        return math.gcd(rows, self.serve.num_seqs)
+
+    @property
+    def page_window_entries(self) -> int:
+        return self.page_window_seqs * self.serve.pages_per_seq
+
+    @property
+    def page_window_slot_len(self) -> int:
+        """SMEM entries per window slot: lane-aligned, plus a lane group of slack
+        when the window itself is not."""
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        entries = self.page_window_entries
+        return utils.align_to(entries, num_lanes) + (
+            num_lanes if entries % num_lanes else 0
+        )
 
     @property
     def bkv_p(self) -> int:

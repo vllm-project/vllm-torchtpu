@@ -169,9 +169,9 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         slot: int | jax.Array,
         total_steps: int | jax.Array,
     ):
-        # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref)
+        # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref)
         is_no_op, block_idx = _step_guard(step, total_steps)
-        kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref = self.src_ref
+        kv_cache_hbm, new_kv_hbm, schedule_ref = self.src_ref
         assert self.sem_recvs is not None
         assert self.window_ref is not None
         sem = self.sem_recvs.at[slot]
@@ -179,8 +179,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         num_lanes = pltpu.get_tpu_info().num_lanes
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
-                p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
-                hbm_p_idx = page_indices_ref[p_idx]
+                hbm_p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
                 sz = jnp.where(is_no_op, 0, sz)
                 dst_off = pl.multiple_of(dst_off, num_lanes)
                 sz = pl.multiple_of(sz, num_lanes)
@@ -215,7 +214,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         total_steps: int | jax.Array,
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
-        kv_out_ref, _, schedule_ref, page_indices_ref = self.dst_ref
+        kv_out_ref, _, schedule_ref = self.dst_ref
         assert self.sem_sends is not None
         assert self.window_ref is not None
         sem = self.sem_sends.at[slot]
@@ -226,9 +225,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             for i in range(self.cfgs.bkv_p_new):
                 dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
                 encoded_dst_hbm_off = dma_entry.wb_hbm[...]
-                hbm_p_idx = page_indices_ref[
-                    encoded_dst_hbm_off >> self.cfgs.serve.page_size_log2
-                ]
+                hbm_p_idx = encoded_dst_hbm_off >> self.cfgs.serve.page_size_log2
                 dst_off = pl.multiple_of(
                     encoded_dst_hbm_off & self.cfgs.serve.page_size_mask, num_lanes
                 )
@@ -248,7 +245,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         total_steps: int | jax.Array,
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
-        _, _, schedule_ref, _ = self.src_ref
+        _, _, schedule_ref = self.src_ref
         assert self.sem_recvs is not None
         sem = self.sem_recvs.at[slot]
         wait_lanes = schedule_ref.total_wait_kv_in[block_idx]
@@ -272,7 +269,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         total_steps: int | jax.Array,
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
-        _, _, schedule_ref, _ = self.dst_ref
+        _, _, schedule_ref = self.dst_ref
         assert self.sem_sends is not None
         sem = self.sem_sends.at[slot]
         wait_lanes = schedule_ref.total_wait_kv_out[block_idx]
@@ -325,9 +322,9 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         slot: int | jax.Array,
         total_steps: int | jax.Array,
     ):
-        # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref)
+        # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref)
         is_no_op, block_idx = _step_guard(step, total_steps)
-        kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref = self.src_ref
+        kv_cache_hbm, new_kv_hbm, schedule_ref = self.src_ref
         assert self.sem_recvs is not None
         assert self.window_ref is not None
         sem = self.sem_recvs.at[slot]
@@ -344,7 +341,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
             for i in range(self.cfgs.bkv_p_cache):
                 p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
                 sz = jnp.where(is_no_op, 0, sz)
-                src_off = page_indices_ref[p_idx] * self.cfgs.serve.page_size
+                src_off = p_idx * self.cfgs.serve.page_size
                 pltpu.make_async_copy(
                     kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
                     vmem_dst.at[b, pl.ds(dst_off, sz)],
@@ -373,7 +370,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         total_steps: int | jax.Array,
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
-        kv_out_ref, _, schedule_ref, page_indices_ref = self.dst_ref
+        kv_out_ref, _, schedule_ref = self.dst_ref
         assert self.sem_sends is not None
         assert self.window_ref is not None
         sem = self.sem_sends.at[slot]
@@ -386,14 +383,9 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
             do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
             for i in range(self.cfgs.bkv_p_new):
                 dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
-                encoded_dst_hbm_off = dma_entry.wb_hbm[...]
+                dst_hbm_off = dma_entry.wb_hbm[...]
                 src_vmem_off = dma_entry.wb_vmem[...]
                 new_sz = dma_entry.wb_val
-                global_p_idx = encoded_dst_hbm_off >> self.cfgs.serve.page_size_log2
-                p_off = encoded_dst_hbm_off & self.cfgs.serve.page_size_mask
-                dst_hbm_off = (
-                    page_indices_ref[global_p_idx] << self.cfgs.serve.page_size_log2
-                ) | p_off
                 sz = jnp.where(
                     jnp.logical_or(is_no_op, jnp.logical_not(do_writeback)), 0, new_sz
                 )
@@ -410,7 +402,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         total_steps: int | jax.Array,
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
-        _, _, schedule_ref, _ = self.src_ref
+        _, _, schedule_ref = self.src_ref
         assert self.sem_recvs is not None
         sem = self.sem_recvs.at[slot]
         wait_lanes = schedule_ref.total_wait_kv_in[block_idx]
@@ -433,7 +425,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         total_steps: int | jax.Array,
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
-        _, _, schedule_ref, _ = self.dst_ref
+        _, _, schedule_ref = self.dst_ref
         assert self.sem_sends is not None
         sem = self.sem_sends.at[slot]
         wait_lanes = schedule_ref.total_wait_kv_out[block_idx]

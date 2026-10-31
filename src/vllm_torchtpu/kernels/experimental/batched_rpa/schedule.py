@@ -531,6 +531,9 @@ class BaseMetadataComputer:
         *,
         cfgs: configs.RpaConfigs,
         extra_refs: Sequence[jax.Ref] = (),
+        page_indices_hbm_ref: jax.Ref | None = None,
+        page_indices_ref: jax.Ref | None = None,
+        page_indices_sem: jax.Ref | None = None,
         **kwargs,
     ):
         self.schedule = schedule
@@ -538,6 +541,50 @@ class BaseMetadataComputer:
         self.dma_sem = dma_sem
         self.cfgs = cfgs
         self.extra_refs = extra_refs
+        self.page_indices_hbm_ref: Any = page_indices_hbm_ref
+        self.page_indices_ref: Any = page_indices_ref
+        self.page_indices_sem: Any = page_indices_sem
+
+    def page_window_idx(self, s_idx):
+        """Window holding sequence `s_idx`'s page_indices row."""
+        return s_idx >> (self.cfgs.page_window_seqs.bit_length() - 1)
+
+    def start_page_window(self, win_idx, pred):
+        """Starts the DMA of window `win_idx` into slot `win_idx & 1` when `pred`."""
+        cfgs = self.cfgs
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        slot_len = cfgs.page_window_slot_len
+        start = win_idx * cfgs.page_window_entries
+        if cfgs.page_window_entries % num_lanes:
+            start = start // num_lanes * num_lanes
+        slot = win_idx & 1
+
+        @pl.when(pred)
+        def start_window_copy():
+            pltpu.make_async_copy(
+                self.page_indices_hbm_ref.at[
+                    pl.ds(pl.multiple_of(start, num_lanes), slot_len)
+                ],
+                self.page_indices_ref.at[
+                    pl.ds(pl.multiple_of(slot * slot_len, num_lanes), slot_len)
+                ],
+                self.page_indices_sem.at[slot],
+            ).start()
+
+    def wait_page_window(self, win_idx):
+        """Waits for window `win_idx`; only the semaphore and size matter."""
+        win = self.page_indices_ref.at[pl.ds(0, self.cfgs.page_window_slot_len)]
+        pltpu.make_async_copy(win, win, self.page_indices_sem.at[win_idx & 1]).wait()
+
+    def page_indices_offset(self, s_idx):
+        """Offset in `page_indices_ref` where sequence `s_idx`'s row starts."""
+        cfgs = self.cfgs
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        win_idx = self.page_window_idx(s_idx)
+        offset = (win_idx & 1) * cfgs.page_window_slot_len
+        if cfgs.page_window_entries % num_lanes:
+            offset += (win_idx * cfgs.page_window_entries) & (num_lanes - 1)
+        return offset + (s_idx & (cfgs.page_window_seqs - 1)) * cfgs.serve.pages_per_seq
 
     @jax.named_scope("k_loop")
     def k_loop(
@@ -553,6 +600,7 @@ class BaseMetadataComputer:
         kv_cache_len,
         kv_new_len,
         end_k_idx,
+        p_offset,
     ) -> LoopCarry:
         cfgs = self.cfgs
         schedule = self.schedule
@@ -577,13 +625,13 @@ class BaseMetadataComputer:
             kv_left_frm_cache = kv_left
         else:
             kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
-        p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
         for i in range(cfgs.bkv_p_cache):
             dst_vmem = i << cfgs.serve.page_size_log2
             dma_sz = kv_left_frm_cache - dst_vmem
             dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
 
-            src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+            p_idx = jnp.minimum(kv_p_start + i, cfgs.serve.pages_per_seq - 1)
+            src_hbm = self.page_indices_ref[p_offset + p_idx]
 
             schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
             schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
@@ -626,8 +674,7 @@ class BaseMetadataComputer:
                 p_off = tok_idx & cfgs.serve.page_size_mask
                 dst, lead, wb_val = utils.align_span(p_off, dma_sz, align)
                 dma_entry.wb_hbm[...] = (
-                    (s_idx * cfgs.serve.pages_per_seq + p_idx)
-                    << cfgs.serve.page_size_log2
+                    self.page_indices_ref[p_offset + p_idx] << cfgs.serve.page_size_log2
                 ) | dst
                 dma_entry.wb_vmem[...] = dst_vmem - lead
                 dma_entry.set_flags(fetch_val, jnp.where(dma_sz > 0, wb_val, 0))
@@ -638,8 +685,7 @@ class BaseMetadataComputer:
                 )
                 p_off = (kv_len_start + dst_vmem) & cfgs.serve.page_size_mask
                 dst_hbm = (
-                    (s_idx * cfgs.serve.pages_per_seq + p_idx)
-                    << cfgs.serve.page_size_log2
+                    self.page_indices_ref[p_offset + p_idx] << cfgs.serve.page_size_log2
                 ) | p_off
 
                 dma_entry.fetch_hbm[...] = src_hbm
@@ -705,6 +751,7 @@ class BaseMetadataComputer:
         kv_cache_len,
         kv_new_len,
         num_k,
+        p_offset,
     ) -> LoopCarry:
         cfgs = self.cfgs
         q_src = q_start + q_idx * cfgs.bq_sz
@@ -731,6 +778,7 @@ class BaseMetadataComputer:
             kv_cache_len=kv_cache_len,
             kv_new_len=kv_new_len,
             end_k_idx=end_k_idx,
+            p_offset=p_offset,
         )
         return jax.lax.fori_loop(start_k_idx, end_k_idx, k_loop_fn, carry)
 
@@ -744,6 +792,8 @@ class BaseMetadataComputer:
         q_offsets_ref,
         kv_cache_lens_ref,
         kv_new_lens_ref,
+        start_seq_idx,
+        end_seq_idx,
     ) -> LoopCarry:
         q_start = cu_q_lens_ref[s_idx]
         q_end = cu_q_lens_ref[s_idx + 1]
@@ -754,6 +804,19 @@ class BaseMetadataComputer:
         k_len = kv_cache_len + kv_new_len
         num_q = pl.cdiv(q_len, self.cfgs.bq_sz)
         num_k = pl.cdiv(k_len, self.cfgs.bkv_sz)
+        win_idx = self.page_window_idx(s_idx)
+        win_seqs = self.cfgs.page_window_seqs
+
+        def enter_window():
+            self.start_page_window(win_idx + 1, (win_idx + 1) * win_seqs < end_seq_idx)
+            self.wait_page_window(win_idx)
+
+        if win_seqs == 1:
+            enter_window()
+        else:
+            first_in_window = (s_idx & (win_seqs - 1)) == 0
+            pl.when((s_idx == start_seq_idx) | first_in_window)(enter_window)
+        p_offset = self.page_indices_offset(s_idx)
         q_loop_fn = functools.partial(
             self.q_loop,
             s_idx=s_idx,
@@ -763,6 +826,7 @@ class BaseMetadataComputer:
             kv_cache_len=kv_cache_len,
             kv_new_len=kv_new_len,
             num_k=num_k,
+            p_offset=p_offset,
         )
 
         return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
@@ -776,16 +840,21 @@ class BaseMetadataComputer:
         distribution_ref: jax.Ref,
     ) -> LoopCarry:
         """Generates the metadata schedule across all sequences."""
+        start_seq_idx, end_seq_idx = self.cfgs.seq_range(
+            distribution_ref
+        )  # pytype: disable=bad-argument-type
         seq_loop_fn = functools.partial(
             self.seq_loop,
             cu_q_lens_ref=cu_q_lens_ref,
             q_offsets_ref=q_offsets_ref,
             kv_cache_lens_ref=kv_cache_lens_ref,
             kv_new_lens_ref=kv_new_lens_ref,
+            start_seq_idx=start_seq_idx,
+            end_seq_idx=end_seq_idx,
         )
-        start_seq_idx, end_seq_idx = self.cfgs.seq_range(
-            distribution_ref
-        )  # pytype: disable=bad-argument-type
+        self.start_page_window(
+            self.page_window_idx(start_seq_idx), jax.lax.lt(start_seq_idx, end_seq_idx)
+        )
         init_carry = LoopCarry(0, 0)
         return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop_fn, init_carry)
 
@@ -798,11 +867,14 @@ def rpa_metadata_schedule_kernel(
     kv_new_lens_ref: jax.Ref,
     distribution_ref: jax.Ref,
     extra_scalars_ref: Sequence[jax.Ref],
+    page_indices_hbm_ref: jax.Ref,
     # Outputs.
     schedule_hbm_ref: RpaSchedule,
     # Scratch.
     schedule_ref: RpaSchedule,
     dma_sem: jax.Ref,
+    page_indices_ref: jax.Ref,
+    page_indices_sem: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
@@ -832,9 +904,14 @@ def rpa_metadata_schedule_kernel(
         distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
             mixed
         extra_scalars_ref: Additional scalar refs for custom metadata computers.
+        page_indices_hbm_ref: [max_num_seqs * pages_per_seq + pad]. kv cache page
+            table in HBM.
         schedule_hbm_ref: HBM memory that will store output of the kernel.
         schedule_ref: Scratch memory where schedule results gets written.
         dma_sem: Semaphore used for writing scheduler output to HBM.
+        page_indices_ref: [2 * page_window_slot_len] SMEM scratch; two slots
+            holding the current and the next window of rows, by window parity.
+        page_indices_sem: [2] DMA semaphores, one per slot.
         cfgs: Configuration of the kernel.
         computer_cls: Metadata computer class to use for schedule generation.
     """
@@ -846,6 +923,9 @@ def rpa_metadata_schedule_kernel(
         dma_sem=dma_sem,
         cfgs=cfgs,
         extra_refs=extra_scalars_ref,
+        page_indices_hbm_ref=page_indices_hbm_ref,
+        page_indices_ref=page_indices_ref,
+        page_indices_sem=page_indices_sem,
     )
     loop_carry = computer.compute(
         cu_q_lens_ref=cu_q_lens_ref,
@@ -875,6 +955,7 @@ def generate_rpa_metadata(
     kv_cache_lens: jax.Array,
     kv_new_lens: jax.Array,
     distribution: jax.Array,
+    page_indices: jax.Array,
     cfgs: configs.RpaConfigs,
     *,
     computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
@@ -882,6 +963,8 @@ def generate_rpa_metadata(
     interpret=False,
 ) -> RpaSchedule:
     """Generates RPA metadata schedule using the specified computer_cls."""
+    if pad := cfgs.page_window_slot_len - cfgs.page_window_entries:
+        page_indices = jnp.pad(page_indices, (0, pad))
     schedule_shaped_dtype = computer_cls.get_rpa_schedule(cfgs)
     schedule_hbm = computer_cls.get_rpa_schedule(
         cfgs, multiplier=cfgs.max_schedule_size_multiplier
@@ -895,11 +978,13 @@ def generate_rpa_metadata(
         out_shape=schedule_hbm,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=6,
-            in_specs=[],
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
             out_specs=schedule_hbm.out_specs(),
             scratch_shapes=[
                 schedule_shaped_dtype.scratch_shapes(),
                 pltpu.SemaphoreType.DMA((1,)),
+                pltpu.SMEM((2 * cfgs.page_window_slot_len,), jnp.int32),
+                pltpu.SemaphoreType.DMA((2,)),
             ],
         ),
         interpret=interpret,
@@ -911,4 +996,5 @@ def generate_rpa_metadata(
         kv_new_lens,
         distribution,
         extra_scalars,
+        page_indices,
     )

@@ -203,6 +203,20 @@ class HbmBudget(NamedTuple):
     available: int
 
 
+class HbmReserves(NamedTuple):
+    """HBM allocated after profile_run, which the KV-cache budget must leave
+    free. Its sum is what the budget subtracts.
+
+    All fields are bytes:
+      kv_connector:    what the KV connector allocates, such as the offload
+                       H2D staging pool.
+      lora_slot_write: what an adapter swap holds while it runs.
+    """
+
+    kv_connector: int
+    lora_slot_write: int
+
+
 def compute_hbm_budget(devices: Any, gpu_memory_utilization: float) -> HbmBudget:
     """Compute the HBM budget available for the KV cache."""
     total_limit = total_used = 0

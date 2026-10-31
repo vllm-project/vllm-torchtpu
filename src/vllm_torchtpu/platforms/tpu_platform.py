@@ -361,8 +361,8 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
 def _validate_lora_config(vllm_config: "VllmConfig") -> None:
     """Rejects LoRA settings that the TPU LoRA path does not support yet.
 
-    LoRA runs on a single chip with a dense model without speculative decoding.
-    Other settings fail here with the reason.
+    LoRA runs on a single chip with a dense generative model without
+    speculative decoding. Other settings fail here with the reason.
     """
     lora_config = vllm_config.lora_config
     if lora_config is None:
@@ -393,6 +393,10 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
         # FusedMoEWithLoRA requires a non-monolithic MoE; every TPU MoE method
         # is monolithic.
         "MoE models": model_config.is_moe,
+        # The runner pads the request mapping to its bucket, but a pooler
+        # hands vLLM's classification head one row per request, so the head
+        # rejects the mapping. Embedding models are untested.
+        "pooling models": model_config.runner_type == "pooling",
         # Only meaningful with tensor parallelism.
         "fully_sharded_loras": lora_config.fully_sharded_loras,
         # The TPU runner never sets the tower or connector mappings.

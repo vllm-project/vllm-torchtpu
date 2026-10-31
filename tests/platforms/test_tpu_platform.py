@@ -286,6 +286,8 @@ class TestTpuPlatform:
         vllm_config.model_config.dtype = torch.bfloat16
         vllm_config.model_config.is_hybrid = False
         vllm_config.model_config.hf_config = None
+        # Set in ModelConfig.__post_init__, so the spec has no such attribute.
+        vllm_config.model_config.runner_type = "generate"
         vllm_config.cache_config = CacheConfig()
         vllm_config.cache_config.block_size = None
         vllm_config.cache_config.enable_prefix_caching = False
@@ -1018,17 +1020,26 @@ class TestPhasedProfilingConfigValidation:
 
 
 class TestLoRAConfigValidation:
-    """LoRA runs on a single chip with a dense model and no speculative
-    decoding; any other setting is rejected at startup, by name."""
+    """LoRA runs on a single chip with a dense generative model and no
+    speculative decoding; any other setting is rejected at startup, by name."""
 
     @staticmethod
-    def _config(*, is_moe=False, speculative_config=None, lora=None, **parallel):
+    def _config(
+        *,
+        is_moe=False,
+        runner_type="generate",
+        speculative_config=None,
+        lora=None,
+        **parallel,
+    ):
         # By the time the platform hook runs, verify_with_model_config has
         # resolved lora_dtype "auto" to the model dtype.
         lora = {"lora_dtype": torch.bfloat16, **(lora or {})}
         return SimpleNamespace(
             lora_config=LoRAConfig(**lora),
-            model_config=SimpleNamespace(is_moe=is_moe, dtype=torch.bfloat16),
+            model_config=SimpleNamespace(
+                is_moe=is_moe, runner_type=runner_type, dtype=torch.bfloat16
+            ),
             parallel_config=ParallelConfig(**parallel),
             speculative_config=speculative_config,
         )
@@ -1062,6 +1073,7 @@ class TestLoRAConfigValidation:
             ),
             ({"speculative_config": object()}, "speculative decoding"),
             ({"is_moe": True}, "MoE models"),
+            ({"runner_type": "pooling"}, "pooling models"),
             ({"lora": {"fully_sharded_loras": True}}, "fully_sharded_loras"),
             (
                 {"lora": {"enable_tower_connector_lora": True}},

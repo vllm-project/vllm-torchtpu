@@ -69,6 +69,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
     MRotaryEmbeddingInterleaved,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models import supports_lora
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
@@ -145,6 +146,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     create_sequence_layout_planner,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -3473,15 +3475,22 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         if self.lora_config is not None:
-            # We need to respect padding when activating LoRA adapters
-            padded_num_scheduled_tokens_per_req = np.copy(
-                num_scheduled_tokens_per_req
-            )  # Copying to avoid accidental state corruption bugs
-            padded_num_scheduled_tokens_per_req[-1] += (
-                padded_total_num_scheduled_tokens - total_num_scheduled_tokens
+            # Map this chunk's tokens and logits rows to adapter ids, padded
+            # with 0 (no adapter) to the lengths the compiled graph reads.
+            req_lora_ids = self.input_batch.request_lora_mapping[
+                start_index : start_index + num_reqs
+            ]
+            token_lora_ids = np.repeat(req_lora_ids, num_scheduled_tokens_per_req)
+            token_mapping = np.pad(
+                token_lora_ids,
+                (0, padded_total_num_scheduled_tokens - total_num_scheduled_tokens),
             )
-
-            self.set_active_loras(self.input_batch, padded_num_scheduled_tokens_per_req)
+            prompt_mapping = np.pad(req_lora_ids, (0, padded_num_reqs - num_reqs))
+            self._set_active_loras(
+                tuple(prompt_mapping.tolist()),
+                tuple(token_mapping.tolist()),
+                set(self.input_batch.lora_id_to_lora_request.values()),
+            )
 
         # Prepare token substitution indices
         cur_input_indices, pre_next_tokens_indices = (
@@ -5476,6 +5485,8 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if self.lora_config is not None:
+            self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         if self.is_pooling_model:
             self._resolve_static_pooler()
         if self.parallel_config.pipeline_parallel_size > 1:
@@ -5558,6 +5569,46 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+
+    def load_lora_model(
+        self,
+        model: torch.nn.Module,
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> torch.nn.Module:
+        """Wraps the model's layers for LoRA. load_model calls it when LoRA is
+        enabled. It does what vLLM's runner mixin does, but creates
+        TPUWorkerLoRAManager, so each adapter swap writes its TPU slot with
+        one program."""
+        if not supports_lora(model):
+            raise ValueError(f"{model.__class__.__name__} does not support LoRA yet.")
+        self.lora_manager = TPUWorkerLoRAManager(
+            vllm_config, device, model.embedding_modules, self.max_num_tokens
+        )
+        return self.lora_manager.create_lora_manager(model, vllm_config)
+
+    def lora_slot_write_hbm_bytes(self) -> int:
+        """HBM an adapter swap takes while it runs, which the KV cache budget
+        must leave free; 0 without LoRA."""
+        if self.lora_config is None:
+            return 0
+        lora_manager = self.lora_manager
+        assert isinstance(lora_manager, TPUWorkerLoRAManager)
+        return lora_manager.slot_write_hbm_bytes()
+
+    def post_profile_hbm_reserves(self) -> utils.HbmReserves:
+        """HBM that profile_run does not see, which the KV cache budget must
+        leave free.
+
+        TPUWorker.determine_available_memory and the KV cache manager's
+        block-count overrides both subtract it. Without one shared source, a
+        reserve added to only one of them would let the other fill that HBM
+        with KV blocks.
+        """
+        return utils.HbmReserves(
+            kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
+            lora_slot_write=self.lora_slot_write_hbm_bytes(),
+        )
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
@@ -6813,6 +6864,11 @@ class TPUModelRunner(GPUModelRunner):
             self._pp_wave.warmup()
         if self.enforce_eager:
             return
+        if self.lora_config is not None:
+            lora_manager = self.lora_manager
+            assert isinstance(lora_manager, TPUWorkerLoRAManager)
+            with self._precompile_timed("LoRA adapter activation"):
+                lora_manager.precompile_activation()
         with self.maybe_setup_dummy_loras(self.lora_config):
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()
@@ -7021,36 +7077,73 @@ class TPUModelRunner(GPUModelRunner):
         serve gets a trace of its own and hands its executable back, leaving
         one executable per bucket either way (see
         vllm_torchtpu.compilation.shape_variants).
+
+        With TPU_PRECOMPILE_TRACE_FIRST the ladder first only traces: every
+        bucket group is traced back to back with its compiles deferred, then
+        all buckets of all traces compile in one pass (spread over the host's
+        ranks under peer replay), and a second pass runs each bucket.
         """
+        trace_first = envs.TPU_PRECOMPILE_TRACE_FIRST
+        if trace_first and not envs.TPU_PARALLEL_PRECOMPILE:
+            raise ValueError(
+                "TPU_PRECOMPILE_TRACE_FIRST=1 needs TPU_PARALLEL_PRECOMPILE=1"
+            )
+        if trace_first and vllm_envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+            raise ValueError(
+                "TPU_PRECOMPILE_TRACE_FIRST=1 is incompatible with "
+                "VLLM_USE_MEGA_AOT_ARTIFACT=1: save_aot_compiled_function runs "
+                "before deferred compiles finish, writing an empty artifact. "
+                "Set VLLM_USE_MEGA_AOT_ARTIFACT=0 (the TPU default)."
+            )
         with shape_variants.warmup() as buckets:
-            for num_tokens in self.num_tokens_paddings:
-                logger.info("  -- num_tokens: %d", num_tokens)
-                if buckets.needs_retrace(num_tokens):
-                    shape_variants.retrace(self.model, self.vllm_config)
-                self._dummy_run(
-                    num_tokens,
-                    self.num_reqs_max_model_len,
-                    self.max_num_blocks_per_req,
-                    use_max_model_len=True,
-                )
-                if self.most_model_len is not None:
-                    assert self.num_reqs_most_model_len is not None
-                    assert self.num_blocks_per_most_len_req is not None
-                    self._dummy_run(
-                        num_tokens,
-                        self.num_reqs_most_model_len,
-                        self.num_blocks_per_most_len_req,
-                        use_max_model_len=False,
+            with (
+                shape_variants.trace_only() if trace_first else contextlib.nullcontext()
+            ) as deferred:
+                for num_tokens in self.num_tokens_paddings:
+                    logger.info("  -- num_tokens: %d", num_tokens)
+                    if buckets.needs_retrace(num_tokens):
+                        shape_variants.retrace(self.model, self.vllm_config)
+                    self._backbone_dummy_runs(num_tokens)
+                if buckets.refused:
+                    # A refusal that no trace picked up leaves a raising
+                    # closure in the live graph, which would surface as a
+                    # failed request. Fail the start instead, where it can be
+                    # read.
+                    raise shape_variants.ShapeSpecializationError(
+                        "warmup left token buckets uncompiled: "
+                        f"{sorted(buckets.refused)}"
                     )
-            if buckets.refused:
-                # A refusal that no trace picked up leaves a raising closure in
-                # the live graph, which would surface as a failed request. Fail
-                # the start instead, where it can be read.
-                raise shape_variants.ShapeSpecializationError(
-                    f"warmup left token buckets uncompiled: {sorted(buckets.refused)}"
+            if deferred is not None:
+                started = time.perf_counter()
+                deferred.compile()
+                logger.info(
+                    "Deferred precompile of %d traces took %.1f s",
+                    buckets.traces + 1,
+                    time.perf_counter() - started,
                 )
+        if trace_first:
+            for num_tokens in self.num_tokens_paddings:
+                self._backbone_dummy_runs(num_tokens)
         if self._pp_wave is not None:
             self._warmup_handoff_forwards()
+
+    def _backbone_dummy_runs(self, num_tokens: int) -> None:
+        """One warmup forward of the backbone per context bucket."""
+        self._dummy_run(
+            num_tokens,
+            self.num_reqs_max_model_len,
+            self.max_num_blocks_per_req,
+            use_max_model_len=True,
+        )
+        if self.most_model_len is not None:
+            assert self.num_reqs_most_model_len is not None
+            assert self.num_blocks_per_most_len_req is not None
+            self._dummy_run(
+                num_tokens,
+                self.num_reqs_most_model_len,
+                self.num_blocks_per_most_len_req,
+                use_max_model_len=False,
+            )
 
     def _warmup_handoff_forwards(self) -> None:
         """Run every token bucket once through the pipeline hand-off.
