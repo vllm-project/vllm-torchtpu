@@ -50,7 +50,7 @@ from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter import streamed_logits
+from vllm_torchtpu.layers.adapter import embedding_rows, streamed_logits
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,  # noqa: E501
 )
@@ -885,6 +885,11 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         for module in self.modules():
             if isinstance(module, VllmDeepseekCompressor):
                 module.transpose_wkv_wgate()
+
+        embed = getattr(self.model, "embed_tokens", None)
+        if embedding_rows.is_plain_lookup(embed):
+            self.model.embed_tokens = embedding_rows.packed_embedding(embed)
+            logger.info("DeepSeek-V4: embedding lookups read the packed-row table")
 
         return loaded_params
 
