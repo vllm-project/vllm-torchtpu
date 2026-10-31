@@ -2842,7 +2842,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
             if output is None:
                 # Preserve symbolic token dimensions during the memory probe.
-                template = q_nope.flatten(1)[:, :1].expand(
+                # kv_c_normed has every row; q may hold only some
+                # (`dcp_token_parallel_op.q_rows`).
+                template = kv_c_normed.flatten(1)[:, :1].expand(
                     -1, layer.num_heads * layer.v_head_dim
                 )
                 return torch.ones_like(template)
@@ -2926,7 +2928,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             )
             if getattr(
                 layer, "sparse_mla_tp_op", None
-            ) is not None and dcp_token_parallel_op.applies(ql_nope_flat.shape[0]):
+            ) is not None and dcp_token_parallel_op.applies(kv_c_normed_flat.shape[0]):
                 # TPU_DCP_PREFILL_TOKEN_PARALLEL: the DCP path on the leading
                 # rows, the token-parallel split on the rest; merged outputs.
                 outputs = dcp_token_parallel_op.attention(

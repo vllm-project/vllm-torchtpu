@@ -430,7 +430,7 @@ def sparse_mla_attention(
     write_kv: WriteKVFn,
     attend: AttendFn,
     rank_ids: jax.Array | None = None,
-    q_replicated: bool = False,
+    q_own_rows: bool = False,
     read_pages: ReadPagesFn = take_pages,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Token-parallel sparse MLA for one layer (global view).
@@ -438,8 +438,8 @@ def sparse_mla_attention(
     Args:
       kv_cache_nope, kv_cache_rope: position shards over `axis_name`.
       q: `[dcp * T, h, D]`, each rank's `[T, h, D]` head slice of every row
-        (latent nope and rope concatenated); with `q_replicated`, `[T, H, D]`,
-        every head of every row on every rank (no all-to-all needed).
+        (latent nope and rope concatenated); with `q_own_rows`, `[dcp * R, H,
+        D]`, every head of each rank's own rows (no all-to-all needed).
       kv_c_normed, k_pe: this step's latents, replicated; `write_kv` writes
         every row this rank owns before anything is gathered.
       flat_topk: `[dcp * R, K]`, each rank's rows' top-k as flat buffer rows
@@ -464,11 +464,8 @@ def sparse_mla_attention(
         g_nope, g_rope = gather_latent(
             layout, nope, rope, page_ids, jnp.sum(pages), axis_name, read_pages
         )
-        if q_replicated:
-            q_tok = own_rows(layout, q, rank)
-        else:
-            q_tok = heads_to_tokens(layout, q, axis_name)
-        rr = rank_rows(layout, rank, q.shape[0], seq_lens, qsl, dist[2])
+        q_tok = q if q_own_rows else heads_to_tokens(layout, q, axis_name)
+        rr = rank_rows(layout, rank, kv_c.shape[0], seq_lens, qsl, dist[2])
         out = attend(q_tok, g_nope, g_rope, topk, rr.num_rows)
         return nope, rope, tokens_to_heads(out, axis_name)
 
@@ -476,8 +473,7 @@ def sparse_mla_attention(
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded, sharded, rep if q_replicated else sharded)
-        + (rep, rep, sharded, rep, rep, rep, rep)
+        in_specs=(sharded, sharded, sharded, rep, rep, sharded, rep, rep, rep, rep)
         + (sharded,) * len(extra),
         out_specs=(sharded, sharded, sharded),
         check_vma=False,

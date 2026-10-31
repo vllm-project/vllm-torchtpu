@@ -215,9 +215,9 @@ def _random_topk(rng, pos):
     return np.concatenate([sel, -np.ones(TOPK - n, np.int64)]).astype(np.int32)
 
 
-@pytest.mark.parametrize("q_replicated", [False, True])
+@pytest.mark.parametrize("q_own_rows", [False, True])
 @pytest.mark.parametrize("dcp", sorted(CASES))
-def test_sparse_mla_attention_matches_natural_reference(dcp, q_replicated):
+def test_sparse_mla_attention_matches_natural_reference(dcp, q_own_rows):
     mesh = _mesh(dcp)
     case = CASES[dcp]
     lay, num_tokens = case["layout"], case["num_tokens"]
@@ -248,7 +248,10 @@ def test_sparse_mla_attention_matches_natural_reference(dcp, q_replicated):
 
     # Each rank's head slice of every row, stacked rank-major.
     q_sharded = q_full.reshape(num_tokens, dcp, 2, -1).transpose(1, 0, 2, 3)
-    q_in = q_full if q_replicated else q_sharded.reshape(dcp * num_tokens, 2, -1)
+    # Every head of each rank's rows S + j * R + [0, R) (zero past T).
+    q_rows = np.concatenate([q_full, np.zeros_like(q_full[: lay.split_rows])])
+    q_own = q_rows[lay.split_rows :].reshape(dcp * per, heads, -1)
+    q_in = q_own if q_own_rows else q_sharded.reshape(dcp * num_tokens, 2, -1)
     nope, rope, out = jax.jit(
         lambda *a: tp.sparse_mla_attention(
             lay,
@@ -257,7 +260,7 @@ def test_sparse_mla_attention_matches_natural_reference(dcp, q_replicated):
             *a,
             write_kv=_write_kv_ref(lay, st.num_pages),
             attend=_attend_ref,
-            q_replicated=q_replicated,
+            q_own_rows=q_own_rows,
         )
     )(
         jnp.asarray(st.nope_cache),

@@ -2224,6 +2224,20 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         kv_lora = None
         output_gate = None
         early_topk = None
+        # TPU_DCP_PREFILL_TOKEN_PARALLEL under query replication: project q for
+        # only the rows this rank attends (`dcp_token_parallel_op.q_rows`).
+        q_rows = None
+        tp_op = getattr(self.mla_attn, "sparse_mla_tp_op", None)
+        if (
+            tp_op is not None
+            and tp_op.q_replicated
+            and dcp_token_parallel_op.applies(hidden_states.shape[0])
+        ):
+            if self.kimi_preprocess is not None or getattr(self, "qb_overlap", False):
+                raise NotImplementedError(
+                    "TPU_DCP_PREFILL_TOKEN_PARALLEL: no fused q preprocessing"
+                )
+            q_rows = dcp_token_parallel_op.q_rows(tp_op, hidden_states.shape[0])
 
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
@@ -2279,8 +2293,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     if q is None:
                         q = self.q_b_proj(q_c)[0]
                 else:
-                    q = self.q_b_proj(q_c)[0]
+                    q = self.q_b_proj(
+                        q_c if q_rows is None else q_c.index_select(0, q_rows)
+                    )[0]
             else:
+                assert q_rows is None, "token-parallel rows need the q_lora path"
                 assert self.kv_a_proj_with_mqa is not None, (
                     "kv_a_proj_with_mqa is required when q_lora_rank is None"
                 )
@@ -2322,9 +2339,21 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_pe_dtype = q_pe.dtype
             k_pe_dtype = k_pe.dtype
             if getattr(self, "_rope_neox_permuted", False):
-                q_pe, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+
+                def rope(pos, q_, k_):
+                    return rope_half_split(self.rotary_emb, pos, q_, k_)
             else:
-                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+                rope = self.rotary_emb
+            if q_rows is None:
+                q_pe, k_pe = rope(positions, q_pe, k_pe)
+            else:
+                # q exists for `q_rows` only; k for every row.
+                q_pe = rope(
+                    positions.index_select(0, q_rows),
+                    q_pe,
+                    k_pe.index_select(0, q_rows),
+                )[0]
+                k_pe = rope(positions, k_pe, k_pe)[1]
             # RoPE caches/frequencies can be fp32 and promote the rotated
             # tensors.  Dense MLA requires new KV values to exactly match the
             # cache dtype, and queries should remain in the activation dtype.
@@ -2376,7 +2405,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             (q_nope, q_pe),
             kv_c_normed,
             k_pe,
-            output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
+            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
             q_dcp_replicated=q_dcp_replicated,
         )

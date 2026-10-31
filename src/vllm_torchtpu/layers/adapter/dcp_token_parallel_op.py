@@ -283,7 +283,8 @@ def build_attention_op(
     request_distribution) -> [T, heads, kv_lora_rank]`, row `i` being step row
     `split_rows + i`. `q` is this rank's heads of every row, latent nope and
     rope concatenated -- or, with `q_replicated` (query replication), every
-    head of every row; the op writes every row's latents into the caches."""
+    head of this rank's own rows (`q_rows`); the op writes every row's
+    latents into the caches."""
     mesh = impl._dcp_mesh
     assert mesh is not None
     dcp, il = impl.dcp_size, impl.dcp_interleave_size
@@ -362,7 +363,7 @@ def build_attention_op(
             write_kv=write_kv,
             attend=attend,
             rank_ids=rank_ids,
-            q_replicated=q_replicated,
+            q_own_rows=q_replicated,
             read_pages=page_gather.gather_pages,
         )
 
@@ -425,8 +426,8 @@ def build_attention_op(
         )
 
     sharded, rep = P(DCP_AXIS_NAME), P()
-    in_specs = (sharded, sharded, rep if q_replicated else sharded)
-    in_specs += (rep, rep, sharded, rep, rep, rep, rep, sharded)
+    in_specs = (sharded, sharded, sharded, rep, rep, sharded, rep, rep, rep, rep)
+    in_specs += (sharded,)
     if rank_tensor is not None:
         in_specs += (sharded,)
     op = pcp_streaming_jax_op(
@@ -440,12 +441,12 @@ def build_attention_op(
     )
     num_heads, kv_lora_rank = layer.num_heads, layer.kv_lora_rank
 
-    def _fake(kv_cache_nope, kv_cache_rope, q, *rest, **kwargs):
+    def _fake(kv_cache_nope, kv_cache_rope, q, kv_c_normed, *rest, **kwargs):
         del rest, kwargs
         return (
             torch.empty_like(kv_cache_nope),
             torch.empty_like(kv_cache_rope),
-            q.new_empty((q.shape[0], num_heads, kv_lora_rank)),
+            q.new_empty((kv_c_normed.shape[0], num_heads, kv_lora_rank)),
         )
 
     op.register_fake(_fake)
@@ -483,7 +484,24 @@ def build_attention_op(
 
     run.layout = layout  # type: ignore[attr-defined]
     run.q_replicated = q_replicated  # type: ignore[attr-defined]
+    # This rank's DCP index as data, for `q_rows` (built here, outside Dynamo).
+    from vllm_torchtpu.distributed.dcp import dcp_rank_operand
+
+    run.rank = dcp_rank_operand() if q_replicated else None  # type: ignore[attr-defined]
     return run
+
+
+def q_rows(tp_op: Any, num_tokens: int) -> torch.Tensor:
+    """i32[split_rows + T / dcp]: the rows a rank needs every head of under
+    query replication -- the DCP sub-batch's, then its own token-parallel
+    rows (rows past `T` repeat row `T - 1`, padding). Same graph on every
+    rank; only the rank operand's value differs."""
+    layout = tp_op.layout
+    rows = layout.rows_per_rank(num_tokens)
+    rank = tp_op.rank
+    ar = torch.arange(layout.split_rows + rows, dtype=rank.dtype, device=rank.device)
+    own = ar + torch.where(ar >= layout.split_rows, rank * rows, 0)
+    return torch.clamp(own, max=num_tokens - 1)
 
 
 def attention(
@@ -499,7 +517,8 @@ def attention(
 ) -> torch.Tensor:
     """Sparse MLA of a split bucket: `[T, heads, kv_lora_rank]`, this rank's
     heads, merged; what the DCP path returns for the same step. `ql_nope` /
-    `q_pe` hold this rank's heads, or every head under query replication."""
+    `q_pe` hold this rank's heads of every row, or, under query replication,
+    every head of the `q_rows` rows."""
     from vllm_torchtpu.layers.adapter.cp_mla_attention import (
         all_gather_q_nope_pe_heads,
         merge_lse_partials_scatter_heads,
@@ -513,8 +532,10 @@ def attention(
         )
     layout = tp_op.layout
     s = layout.split_rows
-    num_tokens = ql_nope.shape[0]
+    num_tokens = kv_c_normed.shape[0]
     rows = layout.rows_per_rank(num_tokens)
+    if q_replicated and ql_nope.shape[0] != s + rows:
+        raise ValueError(f"q has {ql_nope.shape[0]} rows, not the {s + rows} q_rows")
     md = attn_metadata
     seq_s, qsl_s, dist_s = dcp_rows_metadata(
         md.seq_lens, md.query_start_loc, md.request_distribution, s
@@ -542,9 +563,10 @@ def attention(
     )
     # The token-parallel op rewrites the caches in place; it must not start
     # before the sub-batch has read them (`_after_reads`).
+    q_tp = torch.cat([ql_nope, q_pe], dim=-1)
     tail = tp_op(
         kv_cache,
-        torch.cat([ql_nope, q_pe], dim=-1),
+        q_tp[s:] if q_replicated else q_tp,
         kv_c_normed,
         k_pe,
         topk_rows[s : s + rows],
