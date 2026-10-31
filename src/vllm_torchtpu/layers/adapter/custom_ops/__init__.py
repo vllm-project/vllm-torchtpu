@@ -12,10 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op as gdn_attention_op
-from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op as kda_attention_op
-from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_attention_op
-from vllm_torchtpu.layers.adapter.custom_ops import moe_runner as moe_runner
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    gdn_attention_op as gdn_attention_op,
+)
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    kda_attention_op as kda_attention_op,
+)
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    mamba_mixer2_op as mamba_mixer2_op,
+)
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    mla_attention_op as mla_attention_op,
+)
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    moe_runner as moe_runner,
+)
 
 
 def _register_custom_ops() -> None:
