@@ -55,7 +55,8 @@ out = fused_moe_decode(
 includes the MTP drafter. An armed layer runs this kernel for steps of up to
 `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` tokens (default 256). Larger steps run the
 regular GMM MoE, the shared expert and one all-reduce, inside the same exported
-program.
+program, or, for TP-expert layers with `FUSED_MOE_PREFILL_KERNEL=1`, the fused
+MoE prefill kernel (`../fused_moe_prefill`).
 
 Two shared-expert conventions are served: Qwen3.5's gated shared expert, and
 GLM-5.2's ungated `DeepseekV2MLP` with `routed_scaling_factor` 2.5. For the
