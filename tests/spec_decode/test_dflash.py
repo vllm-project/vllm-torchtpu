@@ -42,6 +42,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_torchtpu import _patch_dflash_drafting_slot_budget
 from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
 from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
@@ -415,8 +416,9 @@ def test_uncharged_draft_stays_in_precompiled_buckets(install_slot_patch):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("write_only", [False, True])
 @pytest.mark.parametrize("has_upstream_hook", [False, True])
-def test_tpu_precompute_context_kv(device, has_upstream_hook):
+def test_tpu_precompute_context_kv(device, has_upstream_hook, write_only):
     # Setup dimension sizes
     L = 2  # layers
     nkv = 2  # KV heads
@@ -425,6 +427,7 @@ def test_tpu_precompute_context_kv(device, has_upstream_hook):
     num_ctx = 3  # token count
 
     proposer = _make_proposer(draft_tp=1)
+    proposer._write_only_context_kv = write_only
 
     # Create random hidden states and positions
     hidden_states = torch.randn(
@@ -505,13 +508,27 @@ def test_tpu_precompute_context_kv(device, has_upstream_hook):
     fn_eager(proposer, hidden_states, positions, tuple([dummy_md] * L))
     upstream_hook.assert_not_called()
 
-    # Extract roped keys and values from the mocked layer forward calls
+    # Extract roped keys and values from the path that stored them: the RPA
+    # forward, or the write-only update into the same cache with the same
+    # metadata.
     roped_k_list = []
     all_v_list = []
     for layer in layers:
-        call_kwargs = layer.self_attn.attn.impl.forward.call_args[1]
-        roped_k_list.append(call_kwargs["key"])
-        all_v_list.append(call_kwargs["value"])
+        attn_obj = layer.self_attn.attn
+        if write_only:
+            attn_obj.impl.forward.assert_not_called()
+            stored_layer, key, value, kv_cache, md = (
+                attn_obj.impl.write_kv_cache.call_args[0]
+            )
+            assert stored_layer is attn_obj
+            assert kv_cache is attn_obj.kv_cache
+            assert md is dummy_md
+        else:
+            attn_obj.impl.write_kv_cache.assert_not_called()
+            key = attn_obj.impl.forward.call_args[1]["key"]
+            value = attn_obj.impl.forward.call_args[1]["value"]
+        roped_k_list.append(key)
+        all_v_list.append(value)
     roped_k_all = torch.stack(roped_k_list, dim=0)
     all_v = torch.stack(all_v_list, dim=0)
 
@@ -538,6 +555,76 @@ def test_tpu_precompute_context_kv(device, has_upstream_hook):
     # 3. Assert exact equality
     assert torch.allclose(roped_k_all, expected_k_all, atol=1e-5)
     assert torch.allclose(all_v, expected_v_all, atol=1e-5)
+
+
+def _draft_with_attn_impls(impls):
+    layers = [
+        SimpleNamespace(self_attn=SimpleNamespace(attn=SimpleNamespace(impl=impl)))
+        for impl in impls
+    ]
+    return SimpleNamespace(model=SimpleNamespace(layers=layers))
+
+
+def _pallas_impl(supports_write: bool):
+    impl = mock.create_autospec(PallasAttentionBackendImpl, instance=True)
+    impl.supports_kv_cache_write.return_value = supports_write
+    return impl
+
+
+@pytest.mark.parametrize(
+    "draft_tp,target_tp,impls,expected",
+    [
+        pytest.param(1, 1, [True, True], True, id="replicated-all-supported"),
+        pytest.param(1, 8, [True, True], True, id="replicated-under-target-tp"),
+        pytest.param(1, 1, [True, False], False, id="one-layer-unsupported"),
+        pytest.param(8, 8, [True, True], False, id="sharded-draft"),
+        pytest.param(1, 1, [True, None], False, id="non-pallas-layer"),
+    ],
+)
+def test_context_kv_write_needs_every_draft_layer_supported(
+    draft_tp, target_tp, impls, expected
+):
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp)
+    proposer.draft_model = _draft_with_attn_impls(
+        [mock.MagicMock() if s is None else _pallas_impl(s) for s in impls]
+    )
+    assert proposer._context_kv_write_supported() is expected
+
+
+@pytest.mark.parametrize(
+    "cache_shapes,write_only,checked",
+    [
+        pytest.param([(4, 16, 2, 2, 128)] * 2, True, True, id="layer-major-pool"),
+        pytest.param(
+            [(4, 16, 2, 2, 128), (4, 16, 2, 256)], False, True, id="shared-packed-pool"
+        ),
+        pytest.param([(0,), (0,)], True, False, id="before-pools-exist"),
+    ],
+)
+def test_write_only_context_kv_falls_back_on_a_packed_pool(
+    cache_shapes, write_only, checked
+):
+    """Pools are allocated after load_model, so a 4-D shared packed pool is
+    only visible at the first context-KV update; it must fall back to RPA."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer._write_only_context_kv = True
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(
+                        attn=SimpleNamespace(kv_cache=torch.empty(shape))
+                    )
+                )
+                for shape in cache_shapes
+            ]
+        )
+    )
+
+    proposer._check_write_only_kv_pools()
+
+    assert proposer._write_only_context_kv is write_only
+    assert proposer._write_only_pools_checked is checked
 
 
 @pytest.mark.tpu_test

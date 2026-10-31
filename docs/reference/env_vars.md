@@ -73,6 +73,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_SPARSE_MLA_NOPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA non-positional (`nope`) KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `VLLM_TPU_DFLASH_WRITE_ONLY_KV` | `False` | DFlash/DSpark: stores the draft's context K/V with a write-only paged-cache update instead of a Ragged Paged Attention call whose output is discarded. The cache contents are the same; the gain grows with context length. Applies to replicated drafts (`draft_tensor_parallel_size=1`) on the layer-major KV pool; other drafts keep the attention call. |
 
 ---
 
