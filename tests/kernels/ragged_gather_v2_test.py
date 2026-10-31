@@ -64,6 +64,36 @@ class GatherTest(jtu.JaxTestCase):
 
         self.assertArraysEqual(actual, desired)
 
+    @parameterized.product(start_end=[(0, 1024), (3, 338), (16, 422)])
+    def test_sc_gather_rows_packed_in_words(self, start_end):
+        """int32 words of four 8-bit rows gather as the rows would."""
+        in_size, out_size, hidden_size = 512, 1024, 4224
+        start, end = start_end
+        key = jax.random.key(1)
+        rows = jax.random.randint(key, (in_size, hidden_size), -128, 128, jnp.int8)
+        indices = jax.random.randint(key, (out_size,), 0, in_size, jnp.int32)
+
+        def pack(r):
+            # Row 4 * w + j in byte j of word row w.
+            r = np.asarray(r).view(np.uint8).astype(np.uint32)
+            r = r.reshape(-1, 4, r.shape[-1])
+            return (r << (8 * np.arange(4, dtype=np.uint32))[:, None]).sum(1)
+
+        actual = ragged_gather_v2(
+            jnp.asarray(pack(rows).view(np.int32)),
+            indices,
+            jnp.array([start], jnp.int32),
+            jnp.array([end], jnp.int32),
+            rows_per_word=4,
+        )
+        actual = np.asarray(actual).view(np.uint32)
+        actual = (
+            actual[:, None] >> (8 * np.arange(4, dtype=np.uint32))[:, None]
+        ) & 0xFF
+        actual = actual.astype(np.uint8).reshape(out_size, hidden_size)
+        desired = np.asarray(rows[indices]).view(np.uint8)
+        np.testing.assert_array_equal(actual[start:end], desired[start:end])
+
     @pytest.mark.nightly
     def test_benchmark(self):
         benchmark_shapes = [
