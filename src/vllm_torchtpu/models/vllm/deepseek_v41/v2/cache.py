@@ -649,10 +649,9 @@ class PagedCacheRows:
     def _write_fp8(self, records, values):
         """Quantize BF16 latents into NoPE rows and their RoPE companion slots."""
         if self.scale is not None:
-            from .csa2_adapter import publish_main
-
-            publish_main(self, records, values.to(torch.bfloat16).reshape(-1, 512))
-            return
+            raise NotImplementedError(
+                "CSA2 main records are published only by the fused compressor"
+            )
         assert self.rope is not None
         if self.raw.device.type == "cpu":
             import numpy as np

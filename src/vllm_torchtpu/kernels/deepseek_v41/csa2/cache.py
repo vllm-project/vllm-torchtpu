@@ -210,16 +210,18 @@ def publish_csa2_kv(
     words: jax.Array | tuple[jax.Array, jax.Array],
     scales: jax.Array | tuple[jax.Array, jax.Array],
     records: jax.Array,
-    latent: jax.Array,
+    encoded_words: jax.Array,
+    encoded_scales: jax.Array,
 ) -> tuple[
     jax.Array | tuple[jax.Array, jax.Array], jax.Array | tuple[jax.Array, jax.Array]
 ]:
-    """Quantize unique current records once and publish words plus scalar scales.
+    """Publish ``encode_csa2_kv``-format words plus scalar scales per record.
 
-    A pair of banks has concatenated record addressing. Negative records skip
-    both stores. Valid record IDs must be unique and in range. Arrays retain
-    their shared owner's physical row geometry; no full-cache concatenation
-    or intermediate expanded KV is produced.
+    The fused compressor encodes each new record once, in its kernel. A pair
+    of banks has concatenated record addressing. Negative records skip both
+    stores. Valid record IDs must be unique and in range. Arrays retain their
+    shared owner's physical row geometry; no full-cache concatenation or
+    intermediate expanded KV is produced.
     """
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
@@ -235,9 +237,16 @@ def publish_csa2_kv(
             raise ValueError("Publication words must be INT32 [records,128]")
         if scale_bank.shape != bank.shape[:1] or scale_bank.dtype != jnp.float32:
             raise ValueError("Publication scales must be FP32 [records]")
-    if records.dtype != jnp.int32 or records.shape != latent.shape[:1]:
-        raise ValueError("Publication records must be INT32 [N]")
-    encoded, encoded_scales = encode_csa2_kv(latent)
+    if (
+        records.ndim != 1
+        or records.dtype != jnp.int32
+        or encoded_words.ndim != 2
+        or encoded_words.shape != (records.shape[0], 128)
+        or encoded_words.dtype != jnp.int32
+        or encoded_scales.shape not in ((records.shape[0],), (records.shape[0], 1))
+        or encoded_scales.dtype != jnp.float32
+    ):
+        raise ValueError("Encoded publication has incompatible shapes")
     if not records.size:
         return words, scales
     info = pltpu.get_tpu_info().sparse_core
@@ -245,8 +254,8 @@ def publish_csa2_kv(
     lanes, cores = info.num_lanes, info.num_cores * info.num_subcores
     padding = -records.size % (lanes * cores)
     ids = jnp.pad(records, (0, padding), constant_values=-1)
-    values = jnp.pad(encoded, ((0, padding), (0, 0)))
-    value_scales = jnp.pad(encoded_scales, (0, padding))
+    values = jnp.pad(encoded_words, ((0, padding), (0, 0)))
+    value_scales = jnp.pad(encoded_scales.reshape(-1), (0, padding))
     mesh = plsc.VectorSubcoreMesh(
         num_cores=info.num_cores,
         num_subcores=info.num_subcores,
@@ -303,7 +312,6 @@ def publish_csa2_kv(
         name="csa2_publish_words_scales",
     )(
         ids,
-        # pyrefly: ignore[bad-argument-count]
         values,
         value_scales,
         word_refs,

@@ -20,9 +20,12 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 
-from . import csa2_adapter
+from . import csa2_adapter, preprocess_ops
 from .attention_kernels import (
     gathered_kv_cache_scope,
     paged_attention,
@@ -498,6 +501,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     # True once `_init_local_q_weights` built the gathered weights.
     _local_q_attn = False
     _q_projection_rope_op: Any = None
+    # TP1 FP8-KV layers run the fused Q-A/KV, Q-B and compressor kernels.
+    _fused_preprocess = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -530,6 +535,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self.n_local_heads == 64
         )
         self._csa2 = bool(self.compress_ratio) and csa2_supported
+        self._fused_preprocess = csa2_supported
         self.swa_cache_layer.native_pages = self._csa2
         if self.compress_ratio:
             logger.info_once(
@@ -617,10 +623,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             .expand(-1, self.padded_heads, self.head_dim)
             .contiguous()
         )
-        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
-            hidden_states
-        )
-        qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+        if self._fused_preprocess:
+            # One kernel projects, normalizes and rotates qr/kv; the
+            # compressor projects inside its own kernel.
+            assert not self._sp_sharded_input  # TP1; SP needs TP > 1
+            qr, kv = self._qa_kv_norm_rope(hidden_states, positions)
+            qr_scale = kv_score = None
+            indexer_weights = (
+                _value(self.indexer.weights_proj(hidden_states))
+                if self.indexer is not None and not self._all_indices_fit
+                else None
+            )
+        else:
+            qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
+                hidden_states
+            )
+            qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
         # This rank's SP token shard of qr, before the gather.
         swa_kv = getattr(getattr(self, "swa_cache_layer", None), "kv_cache", None)
         qr_local = (
@@ -724,6 +742,52 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             self.kv_norm(qr_kv[:, self.q_lora_rank :]),
         )
 
+    def _qa_kv_norm_rope(self, hidden_states, positions, *, emit_qr=True):
+        """Fused ``_fused_wqa_wkv_gemm`` -> ``_split_qkv_and_norm`` -> SWA ``_rotate``.
+
+        Returns ``(qr, kv)``, or the rotated ``kv`` alone without ``emit_qr``.
+        """
+        layer = self.fused_wqa_wkv
+        return preprocess_ops.qa_rope(emit_qr, self.kv_norm.variance_epsilon)(
+            hidden_states,
+            layer.weight,
+            layer.weight_scale,
+            self.q_norm.weight,
+            self.kv_norm.weight,
+            self._rope_rows(positions),
+        )
+
+    def _rope_rows(self, positions, ratio=1):
+        """``_tpu_rope_cache`` rows at ``positions``, gathered once per stage.
+
+        ``ratio`` > 1 marks ``_group_positions(positions)``; ratio-1 groups
+        share the token rows of the Q-A/KV and Q-B kernels.
+        """
+        assert positions.dtype == torch.int32
+        table = self._tpu_rope_cache
+        stage_cache = _active_stage_attn_cache
+        key = ("rope_rows", id(table), ratio)
+        cached = stage_cache.get(key) if stage_cache is not None else None
+        if cached is not None and cached[0] is positions and cached[1] is table:
+            return cached[2]
+        rows = preprocess_ops.rope_rows()(table, positions)
+        if stage_cache is not None:
+            stage_cache[key] = (positions, table, rows)
+        return rows
+
+    def _group_positions(self, positions):
+        if self.compress_ratio == 1:
+            return positions
+        cache = _active_stage_attn_cache
+        key = ("compress_group_positions", self.compress_ratio)
+        previous = cache.get(key) if cache is not None else None
+        if previous is not None and previous[0] is positions:
+            return previous[1]
+        grouped = positions // self.compress_ratio * self.compress_ratio
+        if cache is not None:
+            cache[key] = (positions, grouped)
+        return grouped
+
     @property
     def kv_rope_op(self):
         op = self.__dict__.get("_kv_rope_op_instance")
@@ -758,6 +822,83 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if stage_cache is not None:
             version_key = ("candidate_index_version", indexer.k_cache.prefix)
             stage_cache[version_key] = stage_cache.get(version_key, 0) + 1
+
+    def _write_csa2_global_kv(self, hidden_states, positions):
+        """Fused compressor: one kernel projects, pools (reading and writing the
+        ratio-2 state ring), normalizes, rotates and CSA2-encodes the records."""
+        metadata = get_forward_context().attn_metadata
+        if not isinstance(metadata, dict):
+            return
+        compressor = self.compressor
+        ratio = self.compress_ratio
+        kv_meta = metadata[self.prefix]
+        index_k = self.indexer.k_cache
+        rows = torch.arange(positions.shape[0], device=positions.device)
+        valid = (rows < kv_meta.query_start_loc[-1]) & ((positions + 1) % ratio == 0)
+        starts = _window_starts()
+        if starts is not None:
+            # Shared prefix rows must survive replay unchanged.
+            valid = valid & ~_replayed(kv_meta, positions, starts, self.window_size)
+        compressed_slots = _cache_slots(
+            self.kv_cache, kv_meta, positions, compress_ratio=ratio
+        )
+        index_slots = _cache_slots(
+            index_k.kv_cache,
+            metadata[index_k.prefix],
+            positions,
+            compress_ratio=index_k.compress_ratio,
+        )
+        group_positions = self._group_positions(positions)
+        args = [
+            hidden_states,
+            compressor.fused_wkv_wgate.weight,
+            compressor.norm.weight,
+            self._rope_rows(group_positions, ratio),
+        ]
+        pools = ()
+        if ratio == 1:
+            args += [torch.ones_like(positions[:, None]), valid[:, None].int()]
+        else:
+            state_meta = metadata[compressor.state_cache.prefix]
+            state_cache = compressor.state_cache.kv_cache
+            pools = tuple(
+                p for p in (state_cache.raw, state_cache.raw_hi) if p is not None
+            )
+            starts_loc = state_meta.query_start_loc
+            requests = _token_requests(state_meta, positions).clamp(
+                max=starts_loc.numel() - 2
+            )
+            # A request's first row pools with the ring's stored predecessor;
+            # only its last ring-capacity rows are stored.
+            has_prev = rows != starts_loc[requests]
+            slots = _cache_slots(state_cache, state_meta, positions, ring=True)
+            previous = _cache_slots(state_cache, state_meta, positions - 1, ring=True)
+            stored = (slots >= 0) & (
+                rows >= starts_loc[requests + 1] - state_cache.shape[1]
+            )
+            args += [
+                has_prev[:, None].int(),
+                valid[:, None].int(),
+                *pools,
+                state_cache.row_indices(slots).masked_fill(~stored, -1).int(),
+                state_cache.row_indices(previous)
+                .masked_fill(has_prev | (slots < 0), -1)
+                .int(),
+            ]
+        op = preprocess_ops.compress_rope(ratio, len(pools), compressor.rms_norm_eps)
+        latent, words, scales, *states = op(*args)
+        for pool, state in zip(pools, states, strict=True):
+            pool.copy_(state)
+        records = self.kv_cache.row_indices(compressed_slots.clamp(min=0))
+        csa2_adapter.publish_main(
+            self.kv_cache,
+            records.masked_fill(~valid | (compressed_slots < 0), -1),
+            words,
+            scales,
+        )
+        self._produce_index_k(
+            latent, group_positions, index_k.kv_cache, index_slots, valid
+        )
 
     def _write_global_kv(self, kv_score, positions):
         metadata = get_forward_context().attn_metadata
@@ -890,6 +1031,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or not self.kv_cache.numel():
             return
+        if self._fused_preprocess:
+            assert not sp_sharded  # fused preprocessing is TP1; SP needs TP > 1
+            self._write_csa2_global_kv(hidden_states, positions)
+            return
         kv_score = self.compressor.project(hidden_states)
         if sp_sharded:
             kv_score = sp_all_gather(kv_score)[: positions.shape[0]]
@@ -908,7 +1053,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         qr_local=None,
     ):
         """Attend into ``output``, or return the ``wo_b`` input when the fused
-        q/attention/``wo_a`` op (``qr_local``) ran; else ``None``."""
+        q/attention/``wo_a`` op (``qr_local``) ran; else ``None``.
+
+        With ``_fused_preprocess``, ``kv`` already carries its SWA RoPE."""
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or not self.swa_cache_layer.kv_cache.numel():
             output.zero_()
@@ -1219,7 +1366,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and bool(self.compress_ratio)
         )
         q = None
-        if not fused_qo:
+        if self._fused_preprocess:
+            # Shares the step's gathered rows with the Q-A/KV kernel.
+            q = preprocess_ops.qb_rope()(
+                qr, self.wq_b.weight, self.wq_b.weight_scale, self._rope_rows(positions)
+            )
+        elif not fused_qo:
             # V4.1 normalizes qr before projection; neither route renormalizes q.
             if (
                 self._q_projection_rope_op is not None
@@ -1240,7 +1392,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 q = self._rotate(q, positions)
         # Match upstream's plain BF16 cache selected by this backend. Packed
         # FP8/NVFP4 cache numerics must not be imposed on BF16 cache rows.
-        kv = self._rotate(kv, positions)
+        if not self._fused_preprocess:
+            kv = self._rotate(kv, positions)
         if self._csa2:
             assert csa2_write_records is not None
             csa2_adapter.publish_swa(swa_cache, csa2_write_records, kv.reshape(-1, 512))
@@ -1248,7 +1401,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             _insert(swa_cache, swa_slots, kv, swa_valid)
         weights = None
         if self.compressor is not None and not self._ced_global_from_encoder:
-            self._write_global_kv(kv_score, positions)
+            if self._fused_preprocess:
+                self._write_csa2_global_kv(hidden_states, positions)
+            else:
+                self._write_global_kv(kv_score, positions)
         if self.indexer is not None and not self._all_indices_fit:
             weights = (
                 index_weights.float()
@@ -1857,7 +2013,21 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             self._full_attn_sink.copy_(self.attn_sink.detach().float())
         self._init_local_q_weights()
         self._q_projection_rope_op = None
-        if (
+        if self._fused_preprocess:
+            self._check_fused_weights()
+            # Register before TorchDynamo captures the first model forward.
+            eps = self.kv_norm.variance_epsilon
+            preprocess_ops.rope_rows()
+            preprocess_ops.qa_rope(True, eps)
+            preprocess_ops.qa_rope(False, eps)  # DSpark context KV
+            preprocess_ops.qb_rope()
+            if self.compressor is not None:
+                ratio = self.compress_ratio
+                for banks in (0,) if ratio == 1 else (1, 2):
+                    preprocess_ops.compress_rope(
+                        ratio, banks, self.compressor.rms_norm_eps
+                    )
+        elif (
             tp_size == 1
             and self.wo_a.weight.device.type == "tpu"
             and self.wq_b.weight.shape == (1280, 32768)
@@ -1869,9 +2039,65 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self._config["qk_rope_head_dim"] == 64
         ):
             self._q_projection_rope_op = initialize_projection_rope()
-        # Register before TorchDynamo captures the first model forward.
         if self.wo_a.weight.device.type == "tpu":
             _ = self.o_proj_op
+
+    def _check_fused_weights(self):
+        """The fused kernels' weight layouts; anything else is a load error."""
+
+        def per_channel_fp8(layer, k, n):
+            scale = getattr(layer, "weight_scale", None)
+            return (
+                getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+                and layer.weight.dtype == torch.float8_e4m3fn
+                and layer.weight.shape == (k, n)
+                and scale is not None
+                and scale.dtype == torch.float32
+                and scale.shape == (n,)
+            )
+
+        rotary_dim = self._config["qk_rope_head_dim"]
+        problems = []
+        if not per_channel_fp8(
+            self.fused_wqa_wkv, self.hidden_size, self.q_lora_rank + self.head_dim
+        ):
+            problems.append("fused_wqa_wkv must be per-channel FP8 [hidden, rank+512]")
+        if not per_channel_fp8(
+            self.wq_b, self.q_lora_rank, self.n_local_heads * self.head_dim
+        ):
+            problems.append("wq_b must be per-channel FP8 [rank, heads*512]")
+        if (
+            self.q_norm.weight.dtype != self.kv_norm.weight.dtype
+            or self.q_norm.weight.dtype not in (torch.bfloat16, torch.float32)
+            or self.q_norm.variance_epsilon != self.kv_norm.variance_epsilon
+        ):
+            problems.append("q_norm/kv_norm must share a BF16/FP32 dtype and epsilon")
+        if (
+            self.q_lora_rank % 128
+            or self._tpu_rope_cache.dtype != torch.float32
+            or self._tpu_rope_cache.shape[1] != rotary_dim
+            or not 0 < rotary_dim <= 128
+            or rotary_dim % 2
+        ):
+            problems.append("needs a 128-lane q_lora_rank and FP32 rotary table")
+        if self.compressor is not None:
+            layer = self.compressor.fused_wkv_wgate
+            norm = self.compressor.norm.weight
+            if not (
+                getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+                and layer.weight.dtype == torch.bfloat16
+                and layer.weight.shape == (self.hidden_size, self.compress_ratio * 512)
+                and norm.dtype in (torch.bfloat16, torch.float32)
+                and norm.numel() == 512
+            ):
+                problems.append(
+                    "compressor must be BF16 [hidden, ratio*512] with a 512 norm"
+                )
+        if problems:
+            raise NotImplementedError(
+                f"{self.prefix}: fused DeepSeek-V4.1 attention preprocessing "
+                "(TP1, FP8 KV) " + "; ".join(problems)
+            )
 
     def _o_proj(self, output, positions):
         assert output.dtype == torch.bfloat16
