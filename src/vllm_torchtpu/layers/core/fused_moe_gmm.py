@@ -90,7 +90,7 @@ TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
 DISPATCH_SPLIT_MIN_TOKENS = 4096
 # Whole 2048-row ragged_gather_v2 blocks, and whole 16-row sublane blocks as
 # gmm_v2_fused_mlp's head must be.
-DISPATCH_HEAD_ROWS = 2048
+DISPATCH_HEAD_ROWS = 4096
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Above 2,048 routed rows, the inverse-permutation scatter costs more than
