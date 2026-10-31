@@ -27,7 +27,7 @@ from vllm.config.utils import Range
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu import _patch_vllm_compile_all_ranges
-from vllm_torchtpu.compilation import tpu_compiler
+from vllm_torchtpu.compilation import shape_variants, tpu_compiler
 
 SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
@@ -48,6 +48,9 @@ def compile_all_ranges(monkeypatch):
         piecewise_backend.PiecewiseBackend,
         "compile_all_ranges",
         piecewise_backend.PiecewiseBackend.compile_all_ranges,
+    )
+    monkeypatch.setattr(
+        shape_variants, "_deferred_compiler", shape_variants._deferred_compiler
     )
     _patch_vllm_compile_all_ranges()
     return piecewise_backend.PiecewiseBackend.compile_all_ranges
@@ -272,3 +275,127 @@ def test_peer_replay_is_ignored_with_the_compile_cache_disabled(
         assert all(wait == 0.0 for _, wait in calls)
         assert sorted(end for end, _ in calls) == SIZES
     assert warnings and "VLLM_DISABLE_COMPILE_CACHE" in warnings[0]
+
+
+def _compile_deferred(
+    monkeypatch,
+    local_rank,
+    groups=([16, 32, 64], [128, 256, 512], [1024, 2048, 4096]),
+    ranks_per_host=8,
+    disable_cache=False,
+    num_subgraphs=1,
+):
+    """Run compile_deferred over several traces' accepted buckets."""
+    _host(monkeypatch, ranks_per_host)
+    monkeypatch.setenv("LOCAL_RANK", str(local_rank))
+    calls = []
+
+    def compile(graph, args, *rest, compile_range, graph_index=0, **kwargs):
+        calls.append(
+            (
+                compile_range.end,
+                getattr(tpu_compiler._peer_wait, "timeout_s", 0.0),
+                graph_index,
+            )
+        )
+        return lambda *a: a
+
+    backends = []
+    for trace_idx, group in enumerate(groups):
+        for subgraph_idx in range(num_subgraphs):
+            entries = {}
+            for s in SIZES:
+                entry = piecewise_backend.RangeEntry(compile_range=Range(s, s))
+                entry._tpu_deferred = "compile" if s in group else "hand_over"
+                entries[Range(s, s)] = entry
+            backends.append(
+                SimpleNamespace(
+                    graph=object(),
+                    range_entries=entries,
+                    _tpu_trace=trace_idx,
+                    vllm_backend=SimpleNamespace(
+                        compiler_manager=SimpleNamespace(
+                            compile=compile, disable_cache=disable_cache
+                        ),
+                        inductor_config={},
+                        is_encoder=False,
+                    ),
+                    compilation_config=None,
+                    piecewise_compile_index=subgraph_idx,
+                    total_piecewise_compiles=num_subgraphs,
+                    _log_compile_start=lambda compile_range: None,
+                )
+            )
+    assert shape_variants._deferred_compiler is not None
+    shape_variants._deferred_compiler(backends)
+    return [(end, wait) for end, wait, _ in calls], calls, backends
+
+
+def test_deferred_splits_buckets_across_traces_with_host_slot(
+    compile_all_ranges, monkeypatch
+):
+    """compile_deferred deals owners across all traces' buckets at once, taking
+    TPU_LOCAL_RANK_OFFSET off LOCAL_RANK, and hands refused buckets only to the
+    live trace."""
+    monkeypatch.setenv("TPU_LOCAL_RANK_OFFSET", "4")
+    owned = []
+    for r in range(4, 8):
+        calls, _, backends = _compile_deferred(monkeypatch, r, ranks_per_host=4)
+        # 9 accepted buckets + 6 live-trace hand-overs (earlier traces get stubs).
+        assert len(calls) == 9 + 6
+        owned.append(_owned(calls[:9]))
+        with pytest.raises(shape_variants.ShapeSpecializationError):
+            backends[0].range_entries[Range(4096, 4096)].runnable()
+    assert owned == [[4096, 32, 16], [2048, 64], [1024, 128], [512, 256]]
+
+
+def test_deferred_splits_subgraphs_across_ranks_and_counts_distinct_traces(
+    compile_all_ranges, monkeypatch
+):
+    """With splitting_ops (multiple PiecewiseBackends per trace), every
+    subgraph's accepted buckets are dealt across the host's ranks, and the
+    summary log counts distinct traces rather than backends."""
+    import vllm_torchtpu
+
+    logged = []
+
+    class _Logger:
+        def info(self, msg, *args):
+            logged.append(msg % args if args else msg)
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(vllm_torchtpu, "logger", _Logger())
+    owned_pairs = []
+    for r in range(8):
+        logged.clear()
+        _, full_calls, backends = _compile_deferred(
+            monkeypatch, r, ranks_per_host=8, num_subgraphs=2
+        )
+        # 18 accepted (subgraph, bucket) compiles + 12 live-trace hand-overs.
+        assert len(full_calls) == 18 + 12
+        owned_pairs.extend(
+            (sub, end) for end, wait, sub in full_calls[:18] if wait == 0.0
+        )
+        assert any(
+            "Deferred precompile: 3 traces, 18 buckets to compile, 36 to hand over"
+            in line
+            for line in logged
+        )
+        for sub in (0, 1):
+            with pytest.raises(shape_variants.ShapeSpecializationError):
+                backends[sub].range_entries[Range(4096, 4096)].runnable()
+    assert sorted(owned_pairs) == sorted((sub, s) for sub in (0, 1) for s in SIZES)
+
+
+def test_deferred_falls_back_when_cache_disabled_or_host_unknown(
+    compile_all_ranges, monkeypatch
+):
+    calls, _, _ = _compile_deferred(monkeypatch, 1, ranks_per_host=None)
+    assert all(wait == 0.0 for _, wait in calls[:9])
+    assert sorted(end for end, _ in calls[:9]) == SIZES
+
+    calls_nocache, _, _ = _compile_deferred(monkeypatch, 1, disable_cache=True)
+    assert all(wait == 0.0 for _, wait in calls_nocache[:9])
+    assert sorted(end for end, _ in calls_nocache[:9]) == SIZES

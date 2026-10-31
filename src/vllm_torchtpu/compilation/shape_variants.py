@@ -45,7 +45,7 @@ ShapeEnv, vLLM drops that guard, and nothing here can see it.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 import sympy
@@ -69,12 +69,16 @@ class ShapeSpecializationError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def _placeholder_value(node: fx.Node) -> Any:
+    return node.meta.get("example_value", node.meta.get("val"))
+
+
 def _placeholder_values(graph: fx.GraphModule) -> list[Any]:
     values = []
     for node in graph.graph.nodes:
         if node.op != "placeholder":
             break
-        value = node.meta.get("example_value", node.meta.get("val"))
+        value = _placeholder_value(node)
         if value is not None:
             values.append(value)
     return values
@@ -358,3 +362,168 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
     with set_current_vllm_config(vllm_config):
         reset_compile_wrapper(model)
     config.cache_dir, config.local_cache_dir = saved
+
+
+# ---------------------------------------------------------------------------
+# Tracing every group before compiling any bucket (TPU_PRECOMPILE_TRACE_FIRST)
+# ---------------------------------------------------------------------------
+
+
+class DeferredTraces:
+    """The piecewise backends traced while their compiles are deferred.
+
+    In a :func:`warmup`, each trace compiles the buckets its guards accept
+    before the ladder reaches the next group and traces again, so the groups
+    compile one after another and at most a group's worth of buckets is ever
+    in flight. Under :func:`trace_only` a backend records its buckets instead
+    (:func:`defer`), the ladder traces every group back to back, and
+    :meth:`compile` then compiles every bucket of every trace in one pass.
+    Each bucket still compiles exactly once and is handed between the traces
+    as before.
+    """
+
+    def __init__(self) -> None:
+        self.backends: list[Any] = []
+        # (subgraph index, bucket) pairs some trace already accepted: a later
+        # trace that refuses one does not call for another trace.
+        self.accepted: set[tuple[int, int]] = set()
+
+    def compile(self) -> None:
+        """Compile every deferred bucket (see ``_patch_vllm_compile_all_ranges``)."""
+        if _deferred_compiler is None:
+            raise RuntimeError(
+                "TPU_PRECOMPILE_TRACE_FIRST needs TPU_PARALLEL_PRECOMPILE=1, which "
+                "installs the compiler for deferred traces"
+            )
+        _deferred_compiler(self.backends)
+
+
+_deferred: DeferredTraces | None = None
+_deferred_compiler: Callable[[list[Any]], None] | None = None
+
+
+def register_deferred_compiler(fn: Callable[[list[Any]], None]) -> None:
+    global _deferred_compiler
+    _deferred_compiler = fn
+
+
+@contextlib.contextmanager
+def trace_only() -> Iterator[DeferredTraces]:
+    """Scope in which a traced backend defers its compiles (see DeferredTraces)."""
+    global _deferred
+    assert _session is not None, "trace_only() runs inside warmup()"
+    assert _deferred is None, "nested trace_only()"
+    _deferred = DeferredTraces()
+    try:
+        yield _deferred
+    finally:
+        _deferred = None
+
+
+def deferring() -> bool:
+    """Whether a backend traced now should defer its compiles."""
+    return _deferred is not None
+
+
+def defer(backend: Any) -> None:
+    """Record a freshly traced piecewise backend instead of compiling it.
+
+    A bucket the trace's guards accept is left for :meth:`DeferredTraces.compile`
+    to build; one they refuse is left to be handed over from the trace that
+    builds it, and counts as refused (so the ladder traces again) unless an
+    earlier trace already accepted it. Every entry runs a placeholder until
+    then, so the warmup forward that triggered the trace completes without
+    executing anything on the device.
+    """
+    assert _deferred is not None and _session is not None
+    shape_env = trace_shape_env(backend.graph)
+    placeholder = _placeholder_runnable(backend.graph, backend.sym_shape_indices)
+    for entry in backend.range_entries.values():
+        if entry.compiled:
+            continue
+        size = (
+            entry.compile_range.start if entry.compile_range.is_single_size() else None
+        )
+        subgraph_bucket = (
+            (backend.piecewise_compile_index, size) if size is not None else None
+        )
+        if subgraph_bucket is not None and subgraph_bucket in _deferred.accepted:
+            # An earlier trace builds it; hand it over, as runnable_for does.
+            entry._tpu_deferred = "hand_over"
+        elif size is None or unsupported_reason(shape_env, size) is None:
+            entry._tpu_deferred = "compile"
+            if subgraph_bucket is not None:
+                _deferred.accepted.add(subgraph_bucket)
+        else:
+            entry._tpu_deferred = "hand_over"
+            _session.refused.add(size)
+        entry.runnable = placeholder(size)
+        entry.compiled = True
+    backend._tpu_trace = _session.traces
+    _deferred.backends.append(backend)
+
+
+def refusing_runnable(key: str) -> Callable[..., Any]:
+    """The runnable of a bucket an earlier, replaced trace refused: never run."""
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise ShapeSpecializationError(
+            f"{key} belongs to a replaced trace and was never compiled there"
+        )
+
+    return refuse
+
+
+def _placeholder_runnable(
+    graph: fx.GraphModule, sym_shape_indices: Sequence[int]
+) -> Callable[[int | None], Callable[..., Any]]:
+    """A stand-in for a deferred bucket: zeros in the traced output's shapes.
+
+    The output shapes are the trace's own, with every symbol taking the token
+    count -- the substitution :func:`unsupported_reason` and vLLM's
+    ``create_concrete_args`` use. Only the warmup forward that triggered the
+    trace runs it; its outputs are discarded.
+    """
+    from torch.utils import _pytree as pytree
+
+    output = next(node for node in graph.graph.nodes if node.op == "output")
+    leaves, spec = pytree.tree_flatten(output.args[0])
+    metas = [
+        _placeholder_value(leaf) if isinstance(leaf, fx.Node) else leaf
+        for leaf in leaves
+    ]
+    shape_env = trace_shape_env(graph)
+    symbols = set(shape_env.var_to_range) if shape_env is not None else set()
+
+    def concrete(dim: Any, substitution: dict) -> int:
+        if isinstance(dim, torch.SymInt):
+            value = sympy.sympify(dim.node.expr).xreplace(substitution)
+            try:
+                return int(value)
+            except TypeError as e:
+                raise ShapeSpecializationError(
+                    f"deferred trace output dimension {dim} stays symbolic ({value})"
+                ) from e
+        return int(dim)
+
+    def for_size(size: int | None) -> Callable[..., Any]:
+        def run(*args: Any) -> Any:
+            tokens = int(args[sym_shape_indices[0]]) if sym_shape_indices else size
+            substitution = {symbol: tokens for symbol in symbols}
+            device = next(
+                (arg.device for arg in args if isinstance(arg, torch.Tensor)), None
+            )
+            values: list[Any] = []
+            for meta in metas:
+                if isinstance(meta, torch.Tensor):
+                    shape = [concrete(dim, substitution) for dim in meta.shape]
+                    values.append(torch.zeros(shape, dtype=meta.dtype, device=device))
+                elif isinstance(meta, torch.SymInt):
+                    values.append(concrete(meta, substitution))
+                else:
+                    values.append(meta)
+            return pytree.tree_unflatten(values, spec)
+
+        return run
+
+    return for_size
