@@ -71,7 +71,15 @@ class TpuDeepseekV4Tokenizer(TokenizerLike):
 
 
 def register_tokenizers() -> None:
+    from vllm.reasoning import ReasoningParserManager
+
     from vllm_torchtpu import envs
+
+    ReasoningParserManager.register_lazy_module(
+        "musespark1x",
+        "vllm_torchtpu.models.vllm.muse_spark.reasoning",
+        "MuseSpark1xReasoningParser",
+    )
 
     if not envs.TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE:
         return

@@ -178,6 +178,8 @@ class TestTpuCompilerCache:
         assert {
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
+            "vllm_torchtpu/runner/tpu_runner.py",
+            "vllm_torchtpu/models/vllm/muse_spark/multimodal.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
