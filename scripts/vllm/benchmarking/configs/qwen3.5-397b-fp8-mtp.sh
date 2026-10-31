@@ -15,6 +15,9 @@
 
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Configuration for Qwen3.5-397B-A17B-FP8 MTP Speculative Decoding Benchmark on TPU v7x-8.
+# Note: vllm bench serve (--dataset-name spec_bench) templates prompts on the
+# client without forwarding chat_template_kwargs and posts to /v1/completions,
+# so this sweep runs with Qwen3.5 thinking enabled.
 
 MODEL="Qwen/Qwen3.5-397B-A17B-FP8"
 TENSOR_PARALLELISM=8
@@ -29,7 +32,7 @@ MAX_MODEL_LEN=2048
 MAX_NUM_BATCHED_TOKENS=1024
 
 BENCHMARK_MODE="spec_bench"
-SPEC_METHOD="qwen3_next_mtp"
+SPEC_METHOD="mtp"
 SPEC_DRAFT_MODEL=""
 SPEC_DRAFT_TP=8
 SPEC_K_LIST="0 1 2 3 4 5"
@@ -39,7 +42,7 @@ SPEC_WARMUP_PROMPTS=20
 SPEC_REPS=2
 BENCHMARK_TEMPERATURE=0
 
-EXTRA_SERVE_ARGS="--language-model-only --no-enable-prefix-caching --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
+EXTRA_SERVE_ARGS="--language-model-only --no-enable-prefix-caching --limit-mm-per-prompt {\"image\":0,\"video\":0}"
 
 export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
 export TPU_ACCELERATOR_TYPE=tpu7x

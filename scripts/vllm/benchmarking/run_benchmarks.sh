@@ -209,6 +209,10 @@ source "$CONFIG_FILE"
 if [ -n "${BENCHMARK_MODE_CLI:-}" ]; then
     BENCHMARK_MODE="$BENCHMARK_MODE_CLI"
 fi
+if [ "$BENCHMARK_MODE" != "serving" ] && [ "$BENCHMARK_MODE" != "spec_bench" ]; then
+    echo "ERROR: BENCHMARK_MODE must be 'serving' or 'spec_bench', got '$BENCHMARK_MODE'"
+    exit 1
+fi
 
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
 if [ "$ASYNC_SCHEDULING" != "true" ] && [ "$ASYNC_SCHEDULING" != "false" ]; then
@@ -247,9 +251,43 @@ if [ "$BENCHMARK_MODE" != "spec_bench" ]; then
         echo "ERROR: RANGE_RATIO_STYLE must be 'symmetric' or 'min'"
         exit 1
     fi
-elif [ "$START_SERVER" != "1" ]; then
-    echo "ERROR: --host is not supported in spec_bench mode because each (BS, K) cell restarts vllm serve."
-    exit 1
+else
+    if [ "$START_SERVER" != "1" ]; then
+        echo "ERROR: --host is not supported in spec_bench mode because each (BS, K) cell restarts vllm serve."
+        exit 1
+    fi
+    if [ -z "${SPEC_K_LIST// /}" ]; then
+        echo "ERROR: SPEC_K_LIST must be a non-empty space-separated list of non-negative integers"
+        exit 1
+    fi
+    for k in $SPEC_K_LIST; do
+        if ! [[ "$k" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: SPEC_K_LIST entries must be non-negative integers, got '$k'"
+            exit 1
+        fi
+    done
+    if [ -z "${SPEC_BS_LIST// /}" ]; then
+        echo "ERROR: SPEC_BS_LIST must be a non-empty space-separated list of positive integers"
+        exit 1
+    fi
+    for bs in $SPEC_BS_LIST; do
+        if ! [[ "$bs" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: SPEC_BS_LIST entries must be positive integers, got '$bs'"
+            exit 1
+        fi
+    done
+    if ! [[ "$SPEC_REPS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SPEC_REPS must be a positive integer, got '$SPEC_REPS'"
+        exit 1
+    fi
+    if ! [[ "$SPEC_NUM_PROMPTS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SPEC_NUM_PROMPTS must be a positive integer, got '$SPEC_NUM_PROMPTS'"
+        exit 1
+    fi
+    if ! [[ "$SPEC_WARMUP_PROMPTS" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: SPEC_WARMUP_PROMPTS must be a non-negative integer, got '$SPEC_WARMUP_PROMPTS'"
+        exit 1
+    fi
 fi
 if ! [[ "$BENCHMARK_WARMUP_RUNS" =~ ^[0-9]+$ ]]; then
     echo "ERROR: BENCHMARK_WARMUP_RUNS must be a non-negative integer"
@@ -499,15 +537,7 @@ run_benchmark_once() {
     # TOKENIZER overrides; else with MODEL_URI tokenize from the dir the
     # server pulled from object storage (see "Bench-client tokenizer").
     local tokenizer_arg=()
-    local pulled_tokenizer=""
-    if [ -n "${TOKENIZER:-}" ]; then
-        tokenizer_arg=(--tokenizer "$TOKENIZER")
-    else
-        pulled_tokenizer=$(bench_tokenizer_dir)
-        if [ -n "$pulled_tokenizer" ]; then
-            tokenizer_arg=(--tokenizer "$pulled_tokenizer")
-        fi
-    fi
+    set_tokenizer_arg
 
     local extra_body_arg=()
     if [ -n "$BENCHMARK_EXTRA_BODY" ]; then
@@ -573,15 +603,7 @@ run_spec_bench_client() {
     local bench_log=$5
 
     local tokenizer_arg=()
-    if [ -n "${TOKENIZER:-}" ]; then
-        tokenizer_arg=(--tokenizer "$TOKENIZER")
-    else
-        local pulled_tokenizer
-        pulled_tokenizer=$(bench_tokenizer_dir)
-        if [ -n "$pulled_tokenizer" ]; then
-            tokenizer_arg=(--tokenizer "$pulled_tokenizer")
-        fi
-    fi
+    set_tokenizer_arg
 
     local served_model_arg=()
     if [ -n "${SERVED_MODEL_NAME:-}" ]; then
@@ -602,6 +624,7 @@ run_spec_bench_client() {
         --dataset-path "$SPEC_BENCH_DATASET" \
         --spec-bench-category "$SPEC_BENCH_CATEGORY" \
         --num-prompts "$num_prompts" \
+        --max-concurrency "$bs" \
         --temperature "${BENCHMARK_TEMPERATURE:-0}" \
         --seed 0 \
         --request-rate inf \
@@ -745,6 +768,19 @@ bench_tokenizer_dir() {
         echo "$PULLED_TOKENIZER_DIR"
     elif [ -n "$MODEL_URI" ]; then
         echo "WARNING: pulled dir $PULLED_TOKENIZER_DIR for $MODEL_URI has no config.json; bench client will resolve $MODEL on the hub" >&2
+    fi
+}
+
+set_tokenizer_arg() {
+    tokenizer_arg=()
+    local pulled_tokenizer=""
+    if [ -n "${TOKENIZER:-}" ]; then
+        tokenizer_arg=(--tokenizer "$TOKENIZER")
+    else
+        pulled_tokenizer=$(bench_tokenizer_dir)
+        if [ -n "$pulled_tokenizer" ]; then
+            tokenizer_arg=(--tokenizer "$pulled_tokenizer")
+        fi
     fi
 }
 

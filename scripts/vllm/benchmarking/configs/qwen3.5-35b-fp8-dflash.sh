@@ -18,6 +18,9 @@
 # DP=2 x TP=4 is the topology where the draft and target KV geometry match;
 # a DFlash draft must shard exactly like its target, so SPEC_DRAFT_TP equals
 # TENSOR_PARALLELISM. Block size 16, so K is 15 or nothing (K=0 baseline).
+# Note: vllm bench serve (--dataset-name spec_bench) templates prompts on the
+# client without forwarding chat_template_kwargs and posts to /v1/completions,
+# so this sweep runs with Qwen3.5 thinking enabled.
 
 MODEL="Qwen/Qwen3.5-35B-A3B-FP8"
 TENSOR_PARALLELISM=4
@@ -44,6 +47,6 @@ BENCHMARK_TEMPERATURE=0
 # Qwen3.5 declares a vision modality: run it text-only. Prefix caching stays
 # off (the script default), since TpuPlatform rejects it together with
 # speculative decoding on hybrid models.
-EXTRA_SERVE_ARGS="--language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
+EXTRA_SERVE_ARGS="--language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0}"
 
 export USE_MOE_SPARSE_CORE=1
