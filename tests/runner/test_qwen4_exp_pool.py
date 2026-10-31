@@ -603,7 +603,9 @@ def test_main_kv_dcp_reads_the_flag(monkeypatch, raw, want):
 def test_main_kv_dcp_off_leaves_specs_unchanged(monkeypatch, dcp):
     monkeypatch.delenv("VLLM_TPU_QSA_MAIN_KV_DCP", raising=False)
     default = pooled_cache_specs(packed_config(monkeypatch, True))
-    assert pooled_cache_specs(dcp_config(monkeypatch, compressed=True, dcp=dcp)) == default
+    assert (
+        pooled_cache_specs(dcp_config(monkeypatch, compressed=True, dcp=dcp)) == default
+    )
 
 
 @pytest.mark.parametrize("pair", [False, True])
@@ -613,8 +615,12 @@ def test_main_kv_dcp_doubles_only_target_main_kv_spans(monkeypatch, pair, compre
     in an unchanged page. Compressed keys, rings, GDN, PLE and the MTP draft's
     main KV keep B."""
     monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", "1")
-    off_layout, off = pooled_cache_specs(dcp_config(monkeypatch, pair=pair, compressed=compressed, dcp="1"))
-    layout, specs = pooled_cache_specs(dcp_config(monkeypatch, pair=pair, compressed=compressed))
+    off_layout, off = pooled_cache_specs(
+        dcp_config(monkeypatch, pair=pair, compressed=compressed, dcp="1")
+    )
+    layout, specs = pooled_cache_specs(
+        dcp_config(monkeypatch, pair=pair, compressed=compressed)
+    )
     B = layout.block_size
     assert layout.main_dcp == 2 and layout.main_block_size == 2 * B
     assert replace(layout, main_dcp=1, main_dcp_owners=()) == off_layout
@@ -636,9 +642,13 @@ def test_main_kv_dcp_doubles_only_target_main_kv_spans(monkeypatch, pair, compre
 def test_mtp_kv_dcp_doubles_the_draft_main_kv_span_too(monkeypatch, pair):
     """VLLM_TPU_QSA_MTP_KV_DCP: the MTP draft's main KV splits like the
     target's (2B tokens per entry, B rows per rank); nothing else changes."""
-    _, target_only = pooled_cache_specs(dcp_config(monkeypatch, pair=pair, compressed=True))
+    _, target_only = pooled_cache_specs(
+        dcp_config(monkeypatch, pair=pair, compressed=True)
+    )
     monkeypatch.setenv("VLLM_TPU_QSA_MTP_KV_DCP", "1")
-    layout, specs = pooled_cache_specs(dcp_config(monkeypatch, pair=pair, compressed=True))
+    layout, specs = pooled_cache_specs(
+        dcp_config(monkeypatch, pair=pair, compressed=True)
+    )
     B = layout.block_size
     draft = "mtp.layers.48.self_attn"
     assert draft in layout.main_dcp_owners
@@ -751,25 +761,153 @@ def test_main_kv_dcp_allocation_and_prefix_hits_align_to_scheduler_blocks(
     prompt = list(range(5 * B + 7))
 
     def request(rid):
-        return Request(rid, prompt, SamplingParams(max_tokens=1), None, block_hasher=hasher)
+        return Request(
+            rid, prompt, SamplingParams(max_tokens=1), None, block_hasher=hasher
+        )
 
     first = request("a")
     for offset in range(0, len(prompt), scheduler_block):
         chunk = min(scheduler_block, len(prompt) - offset)
         assert manager.allocate_slots(first, chunk) is not None
         first.num_computed_tokens += chunk
-    for g, m in zip(scheduler.kv_cache_groups, manager.coordinator.single_type_managers):
+    for g, m in zip(
+        scheduler.kv_cache_groups, manager.coordinator.single_type_managers
+    ):
         spec = g.kv_cache_spec
         if isinstance(spec, MambaSpec) or g.layer_names[0].endswith(".raw_ring"):
             continue
         blocks = len(m.req_to_blocks["a"])
         assert blocks == -(-len(prompt) // spec.block_size), g.layer_names
     manager.free(first)
-    # Step boundary: once installed (any TPU VllmConfig in the session runs
-    # platform activation), _patch_vllm_same_step_prefix_hits hides blocks
-    # hashed since the last Scheduler.schedule; no scheduler runs here.
-    manager.block_pool.__dict__.get("_tpu_unwritten_block_ids", set()).clear()
     second = request("b")
     _, hit, *_ = manager.get_computed_blocks(second)
     assert hit > 0 and hit % scheduler_block == 0, (hit, scheduler_block)
     assert hit <= len(prompt) - 1
+
+
+def _full_validate_config(tp: int, num_kv_heads: int):
+    cfg = pool_config(tp=tp, kv="fp8_e4m3")
+    t = cfg.model_config.hf_text_config
+    t.num_key_value_heads = num_kv_heads
+    t.num_attention_heads = max(24, tp * num_kv_heads)
+    t.attention_bias = False
+    cfg.model_config.quantization = "fp8"
+    cfg.model_config.hf_config = NS(
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "activation_scheme": "dynamic",
+        }
+    )
+    cfg.parallel_config.pipeline_parallel_size = 1
+    cfg.parallel_config.data_parallel_size = 1
+    cfg.parallel_config.data_parallel_size_local = 1
+    cfg.parallel_config.nnodes = 1
+    cfg.parallel_config.enable_expert_parallel = False
+    cfg.parallel_config.enable_dbo = False
+    cfg.parallel_config.enable_eplb = False
+    cfg.parallel_config.expert_placement_strategy = "linear"
+    cfg.parallel_config.enable_elastic_ep = False
+    cfg.scheduler_config.max_num_batched_tokens = 2048
+    cfg.lora_config = None
+    return cfg
+
+
+@pytest.mark.parametrize(
+    "tp,num_kv_heads,dcp,should_pass",
+    [
+        # Invalid: each KV head has only 1 TP rank (no pair sharing a KV head).
+        (8, 8, "2", False),
+        (4, 4, "2", False),
+        (2, 2, "2", False),
+        # Lookalike valid controls: DCP off, or >= 2 TP ranks per KV head (even).
+        (8, 8, "1", True),
+        (8, 4, "2", True),
+        (8, 2, "2", True),
+        (4, 2, "2", True),
+    ],
+)
+def test_main_kv_dcp_requires_replicated_kv_head_pairs(
+    monkeypatch, tp, num_kv_heads, dcp, should_pass
+):
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import validate_config
+
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", dcp)
+    monkeypatch.setenv("QWEN4_EXP_UNIFIED_POOL", "1")
+    monkeypatch.delenv("VLLM_TPU_MEGAKERNEL", raising=False)
+    cfg = _full_validate_config(tp=tp, num_kv_heads=num_kv_heads)
+    pattern = r"tensor_parallel_size.*num_key_value_heads"
+    if should_pass:
+        validate_config(cfg)
+        pooled_cache_specs(cfg)
+    else:
+        with pytest.raises(ValueError, match=pattern):
+            validate_config(cfg)
+        with pytest.raises(ValueError, match=pattern):
+            pooled_cache_specs(cfg)
+
+
+@pytest.mark.parametrize("compressed", ["0", "1"])
+@pytest.mark.parametrize("megakernel", ["0", "1"])
+def test_main_kv_dcp_and_megakernel_are_mutually_exclusive(
+    monkeypatch, compressed, megakernel
+):
+    """Both compressed=0 and compressed=1 reject VLLM_TPU_MEGAKERNEL with
+    ValueError (not assert) when main_kv_dcp > 1."""
+    from functools import partial
+
+    from vllm_torchtpu.layers.adapter.custom_ops import qsa_op
+    from vllm_torchtpu.models.vllm.qwen4_exp import qsa as qsa_mod
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import validate_config
+    from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
+
+    monkeypatch.setenv("QWEN4_EXP_UNIFIED_POOL", "1")
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", "2")
+    monkeypatch.setenv("VLLM_TPU_QSA_MTP_KV_DCP", compressed)
+    monkeypatch.setenv("VLLM_TPU_QSA_COMPRESSED_DCP", compressed)
+    monkeypatch.setenv("VLLM_TPU_MEGAKERNEL", megakernel)
+
+    cfg = _full_validate_config(tp=8, num_kv_heads=2)
+    if megakernel == "1":
+        with pytest.raises(ValueError, match="VLLM_TPU_MEGAKERNEL"):
+            validate_config(cfg)
+    else:
+        validate_config(cfg)
+
+    def stub_op(*args, **kwargs):
+        return kwargs
+
+    monkeypatch.setattr(qsa_op, "build_pooled_qsa_op", lambda: stub_op)
+    monkeypatch.setattr(qsa_op, "build_pooled_qsa_rows_op", lambda: stub_op)
+    monkeypatch.setattr(qsa_op, "build_pooled_qsa_select_op", lambda: stub_op)
+    monkeypatch.setattr(qsa_op, "build_pooled_qsa_dcp_op", lambda pair, dcp: stub_op)
+    monkeypatch.setattr(
+        qsa_op, "build_pooled_qsa_compressed_dcp_op", lambda pair, dcp: stub_op
+    )
+    monkeypatch.setattr(qsa_mod, "main_kv_dcp_group", lambda dcp: object())
+    monkeypatch.setattr(
+        "vllm.distributed.get_tp_group",
+        lambda: NS(world_size=8, rank_in_group=0),
+    )
+
+    attention = object.__new__(Qwen4ExpQSA)
+    torch.nn.Module.__init__(attention)
+    attention.prefix = "model.layers.3.self_attn"
+    attention.max_query_len = 1
+    attention.num_kv_heads = 1
+    attention.tp_size = 8
+    attention.tp_rank = 0
+    attention.single_graph = False
+    attention.token_shard = False
+    attention.main_kv_dcp = 2
+    attention.dcp_rank = torch.zeros((1,), dtype=torch.int32)
+    attention._op = partial(stub_op, compress_ratio=4)
+
+    pool = torch.zeros(1)
+    if megakernel == "1":
+        with pytest.raises(ValueError, match="VLLM_TPU_MEGAKERNEL"):
+            attention.bind_pool(pool)
+    else:
+        attention.bind_pool(pool)
+        assert attention._dcp_op is not None
+        assert attention._select_op is None

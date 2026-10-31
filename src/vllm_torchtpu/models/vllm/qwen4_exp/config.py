@@ -517,12 +517,29 @@ def validate_config(cfg):
     # The QSA main-KV split over TP rank pairs is this model's own path (vLLM's
     # decode_context_parallel_size stays 1, rejected above): it shards the
     # unified pool's main-KV pages, so it needs that pool and pairs of ranks.
-    if main_kv_dcp() > 1 and (
-        not use_unified_pool() or p.tensor_parallel_size < 2 or p.tensor_parallel_size % 2
+    dcp = main_kv_dcp()
+    if dcp > 1 and (
+        not use_unified_pool()
+        or p.tensor_parallel_size < dcp * t.num_key_value_heads
+        or p.tensor_parallel_size % (dcp * t.num_key_value_heads)
     ):
         raise ValueError(
-            f"{MAIN_KV_DCP_ENV}=2 needs the unified pool and an even "
-            f"tensor_parallel_size >= 2, got tp={p.tensor_parallel_size}"
+            f"{MAIN_KV_DCP_ENV}={dcp} splits each replicated KV head across "
+            f"{dcp}-rank TP pairs on the unified pool: requires the unified "
+            f"pool and tensor_parallel_size divisible by "
+            f"{dcp} * num_key_value_heads ({dcp * t.num_key_value_heads}), got "
+            f"tensor_parallel_size={p.tensor_parallel_size} and "
+            f"num_key_value_heads={t.num_key_value_heads}; set "
+            f"tensor_parallel_size to a multiple of "
+            f"{dcp * t.num_key_value_heads} or unset {MAIN_KV_DCP_ENV}"
+        )
+    raw_mk = str(envs.VLLM_TPU_MEGAKERNEL or "").strip().lower()
+    if dcp > 1 and raw_mk and raw_mk not in ("0", "false", "off"):
+        raise ValueError(
+            f"{MAIN_KV_DCP_ENV}={dcp} and VLLM_TPU_MEGAKERNEL cannot be "
+            "enabled together: the megakernel's select op and whole-step "
+            "cache writer assume replicated main-KV pages; unset "
+            f"VLLM_TPU_MEGAKERNEL or {MAIN_KV_DCP_ENV}"
         )
     # SparseCore top-k writes 16-lane vectors; this is a kernel boundary,
     # independent of checkpoint head counts and compression geometry.

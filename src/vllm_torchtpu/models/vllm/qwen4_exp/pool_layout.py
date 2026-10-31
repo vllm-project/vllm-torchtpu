@@ -238,11 +238,19 @@ def pooled_cache_specs(cfg):
     dcp_owners: tuple[str, ...] = ()
     if dcp > 1:
         p = cfg.parallel_config
-        if p.tensor_parallel_size < 2 or p.tensor_parallel_size % dcp:
+        t = cfg.model_config.hf_text_config
+        if (
+            p.tensor_parallel_size < dcp * t.num_key_value_heads
+            or p.tensor_parallel_size % (dcp * t.num_key_value_heads)
+        ):
             raise ValueError(
-                f"{MAIN_KV_DCP_ENV}={dcp} splits a KV head's main KV over TP rank "
-                f"pairs; needs an even tensor_parallel_size >= 2, got "
-                f"{p.tensor_parallel_size}"
+                f"{MAIN_KV_DCP_ENV}={dcp} splits a KV head's main KV over TP "
+                f"rank pairs; needs an even tensor_parallel_size divisible by "
+                f"{dcp} * num_key_value_heads ({dcp * t.num_key_value_heads}), "
+                f"got tensor_parallel_size={p.tensor_parallel_size} and "
+                f"num_key_value_heads={t.num_key_value_heads}; set "
+                f"tensor_parallel_size to a multiple of "
+                f"{dcp * t.num_key_value_heads} or unset {MAIN_KV_DCP_ENV}"
             )
         if p.decode_context_parallel_size != 1:
             raise ValueError(
