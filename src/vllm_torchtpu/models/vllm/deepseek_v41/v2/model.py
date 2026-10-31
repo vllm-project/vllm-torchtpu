@@ -321,14 +321,15 @@ class DeepseekV41DecoderStage(_StageBase):
 
 
 class _StepHashes:
-    """A step's Engram hashes for ``TPU_DEEPSEEK_V41_ENGRAM_HBM``: device hashes for
-    HBM layers, the host path's downloaded and gathered ones for the rest,
-    produced on first use."""
+    """A step's Engram hashes: device hashes for HBM layers, the host path's
+    downloaded and gathered ones for the rest. With `eager` (no HBM layer) the
+    host gather runs at construction, before the decoder layers, as it always
+    did; otherwise on the first host layer's use."""
 
-    def __init__(self, hashes: torch.Tensor, gather_host) -> None:
+    def __init__(self, hashes: torch.Tensor, gather_host, *, eager: bool) -> None:
         self.hashes = hashes
         self._gather_host = gather_host
-        self._host: torch.Tensor | None = None
+        self._host: torch.Tensor | None = gather_host(hashes) if eager else None
 
     def for_layer(self, engram) -> torch.Tensor:
         if isinstance(engram, Engram) and engram.uses_hbm_lookup:
@@ -343,7 +344,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     # device; derived from host placement. None runs one encoder graph.
     _engram_split_layer: int | None = None
     _engram_first_split_layer: int | None = None
-    _gathered_engram_hashes: "torch.Tensor | _StepHashes | None" = None
+    _gathered_engram_hashes: _StepHashes | None = None
     _raw_dma_enabled = False
     _engram_prefetch: _EngramPrefetch | None = None
     _current_host_inputs: HostEngramInputs | None = None
@@ -500,25 +501,17 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if engram_hashes is not None and not skip_lookup:
                 # Gather all Engram rows before entering the decoder layers.
                 # One gather feeds every layer sharing the DP-split table.
-                if self._uses_hbm_engram():
-                    # HBM layers take the device hashes (their lookup gathers
-                    # the node's hashes itself). Host layers download and
-                    # gather them only when first staged, i.e. after the
-                    # layers before them are enqueued.
-                    gathered_hashes = _StepHashes(
-                        engram_hashes, self._gather_host_hashes
-                    )
-                else:
-                    if self._has_cpu_offloaded_engram():
-                        # Idle/decode replicas may hash on device while a
-                        # prefill replica hashes on host. All must use the CPU
-                        # collective.
-                        engram_hashes = self._hash_download.copy_to_host(engram_hashes)
-                    gathered_hashes = gather_host_engram_hashes(
-                        engram_hashes,
-                        dp_shared_memory=self.engram_dp_shared_memory,
-                        gather_fn=upstream.gather_engram_hashes,
-                    )
+                # HBM layers take the device hashes (their lookup gathers the
+                # node's hashes itself). Host layers download and gather them
+                # once: up front when no layer is on HBM, else when the first
+                # host layer is staged, after the layers before it are enqueued.
+                # Idle/decode replicas may hash on device while a prefill
+                # replica hashes on host, so all use the CPU collective.
+                gathered_hashes = _StepHashes(
+                    engram_hashes,
+                    self._gather_host_hashes,
+                    eager=not self._uses_hbm_engram(),
+                )
                 end_layer = (
                     getattr(self, "_ced_boundary", self.end_layer)
                     if stage == "encoder"
@@ -548,18 +541,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         self,
         start_layer: int,
         end_layer: int,
-        step_hashes: "torch.Tensor | _StepHashes | None",
+        step_hashes: _StepHashes | None,
     ) -> None:
         """Prepare each Engram in the segment before its graph is dispatched."""
         if step_hashes is not None:
             for layer in islice(self.layers, start_layer, end_layer):
                 engram = getattr(layer, "engram", None)
                 if engram is not None:
-                    gathered_hashes = (
-                        step_hashes.for_layer(engram)
-                        if isinstance(step_hashes, _StepHashes)
-                        else step_hashes
-                    )
+                    gathered_hashes = step_hashes.for_layer(engram)
                     if (
                         isinstance(engram, Engram)
                         and engram.embed_tokens.host_offload

@@ -250,9 +250,25 @@ def test_step_hashes_gathers_host_layers_once():
 
     calls: list[torch.Tensor] = []
     device = torch.arange(4)
-    step = _StepHashes(device, lambda h: calls.append(h) or h + 100)
+    step = _StepHashes(device, lambda h: calls.append(h) or h + 100, eager=False)
     assert step.for_layer(engram(True)) is device
     assert not calls  # no D2H/gather while only HBM layers ran
     host = step.for_layer(engram(False))
     assert torch.equal(host, device + 100)
     assert step.for_layer(engram(False)) is host and len(calls) == 1
+
+
+def test_step_hashes_eager_gathers_up_front():
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import Engram
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import _StepHashes
+
+    host_layer = Engram.__new__(Engram)
+    torch.nn.Module.__init__(host_layer)
+    host_layer._uses_hbm = False
+    calls: list[torch.Tensor] = []
+    device = torch.arange(4)
+    step = _StepHashes(device, lambda h: calls.append(h) or h + 100, eager=True)
+    assert len(calls) == 1  # gathered before any layer is staged
+    host = step.for_layer(host_layer)
+    assert torch.equal(host, device + 100)
+    assert step.for_layer(host_layer) is host and len(calls) == 1
