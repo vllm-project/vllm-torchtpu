@@ -28,6 +28,7 @@ x-kube-plugin: &kube_plugin
 
 x-tpu-step-defaults: &tpu_step
   depends_on: "build_docker"
+  skip: "${CORE_TESTS_SKIP:-}"
   # Covers queueing too: the agent pod starts at once and waits inside the
   # step, so this is the launcher's whole budget, not a test's length.
   timeout_in_minutes: 1440
@@ -42,6 +43,7 @@ x-tpu-step-defaults: &tpu_step
 
 x-cpu-unit-test-defaults: &cpu_unit_test_defaults
   depends_on: "build_docker"
+  skip: "${CORE_TESTS_SKIP:-}"
   # The fleet's cpu queue: a pod with no chip on an autoscaled CPU node, through
   # the same launcher as the TPU steps.
   timeout_in_minutes: 120
@@ -196,7 +198,8 @@ steps:
         key: "unit_tests_omni_pr"
         <<: *tpu_step
         depends_on: "build_docker_omni"
-        if: 'build.env("NIGHTLY") != "1"'
+        skip: "${OMNI_TESTS_SKIP:-}"
+        if: 'build.env("NIGHTLY") != "1" && "${OMNI_FULL_CI:-0}" != "1"'
         env:
           SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
@@ -285,7 +288,8 @@ steps:
         key: "unit_tests_omni_nightly"
         <<: *tpu_step
         depends_on: "build_docker_omni"
-        if: 'build.env("NIGHTLY") == "1"'
+        skip: "${OMNI_TESTS_SKIP:-}"
+        if: 'build.env("NIGHTLY") == "1" || "${OMNI_FULL_CI:-0}" == "1"'
         env:
           SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
@@ -303,7 +307,8 @@ steps:
         key: "unit_tests_omni_multichip_nightly"
         <<: *tpu_step
         depends_on: "build_docker_omni"
-        if: 'build.env("NIGHTLY") == "1"'
+        skip: "${OMNI_TESTS_SKIP:-}"
+        if: 'build.env("NIGHTLY") == "1" || "${OMNI_FULL_CI:-0}" == "1"'
         env:
           SHAPE: *shape_multi
           DOCKER_IMAGE_SUFFIX: "-omni"

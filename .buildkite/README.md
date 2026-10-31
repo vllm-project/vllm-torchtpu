@@ -6,9 +6,15 @@ through `.buildkite/kubernetes/run.sh`.
 
 `pipeline_tests.yml` runs unmarked unit tests in `tests/` in CPU pods and
 tests marked `tpu_test` (or `multichip`) on TPU v7x slices (1x1x1 and 2x2x1).
-PR steps exclude `nightly` tests; nightly steps include them. Both use the CI
-image built by `pipeline_build.yml`. The CPU steps set `JAX_PLATFORMS=cpu` so
-JAX does not look for a TPU.
+PR steps exclude `nightly` tests; nightly steps include them. Core steps use the
+`dev` CI image and `tests_omni/` steps use the `-omni` CI image built in
+parallel from `ci` by `pipeline_build.yml`. On PR and post-merge commits,
+`select_ci_tracks.py` derives the Python import boundary between Core and Omni:
+Core-only diffs skip `build_docker_omni` and `tests_omni/`, Omni-only diffs skip
+`build_docker` and Core lanes, and shared files build and test both tracks. A PR
+labeled `run-omni-full-ci` runs both single-chip and multichip nightly Omni
+suites without forcing Core lanes when the diff is Omni-only. The CPU steps set
+`JAX_PLATFORMS=cpu` so JAX does not look for a TPU.
 
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the

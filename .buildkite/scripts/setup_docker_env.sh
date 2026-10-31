@@ -39,6 +39,7 @@ fi
 
 BASE_TAG="${COMMIT_HASH}-${VLLM_COMMIT_HASH}${IMAGE_SUFFIX}"
 BASE_IMAGE_TAG="${IMAGE_REPO}:${BASE_TAG}"
+CACHE_IMAGE_TAG="${IMAGE_REPO}:cache-${TARGET}"
 
 # CI_IMAGE=<image> (the dev target only): publish that image as this build's
 # and build nothing, as K3_ENGINE_IMAGE does for the Kimi-K3 engine image. The
@@ -73,14 +74,29 @@ fi
 
 if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" ]]; then
   echo "--- Building Docker Image: ${BASE_IMAGE_TAG} (target: ${TARGET})"
-  # Run build_image.sh and pass VLLM_COMMIT_HASH directly as a build argument
-  ./docker/build_image.sh --target "${TARGET}" -t "${BASE_IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
+  # Run build_image.sh with registry inline layer caching against the rolling
+  # main cache tag so fresh builder VMs reuse unchanged tpu-runtime/base/ci layers.
+  ./docker/build_image.sh \
+    --target "${TARGET}" \
+    -t "${BASE_IMAGE_TAG}" \
+    -c "${VLLM_COMMIT_HASH}" \
+    --inline-cache \
+    --cache-from "${CACHE_IMAGE_TAG}"
 
   # Publish image tag metadata for downstream test steps
   buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX:-}" "${BASE_IMAGE_TAG}"
 
   echo "--- Pushing Docker Image to Registry"
   docker push "${BASE_IMAGE_TAG}"
+
+  if [[ "${BUILDKITE_BRANCH:-}" == "main" && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
+    echo "--- Updating rolling registry layer cache tag: ${CACHE_IMAGE_TAG}"
+    if docker tag "${BASE_IMAGE_TAG}" "${CACHE_IMAGE_TAG}" && docker push "${CACHE_IMAGE_TAG}"; then
+      docker rmi "${CACHE_IMAGE_TAG}" || true
+    else
+      echo "WARNING: Failed to push rolling cache tag ${CACHE_IMAGE_TAG}; continuing." >&2
+    fi
+  fi
 
   echo "--- Cleaning up local built image"
   docker rmi "${BASE_IMAGE_TAG}" || true
@@ -95,7 +111,12 @@ fi
 echo "--- Ensuring Base Docker Image is available: ${BASE_IMAGE_TAG}"
 if ! docker pull "${BASE_IMAGE_TAG}" 2>/dev/null; then
   echo "Base image not found in registry. Building base image: ${BASE_IMAGE_TAG}"
-  ./docker/build_image.sh --target "${TARGET}" -t "${BASE_IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
+  ./docker/build_image.sh \
+    --target "${TARGET}" \
+    -t "${BASE_IMAGE_TAG}" \
+    -c "${VLLM_COMMIT_HASH}" \
+    --inline-cache \
+    --cache-from "${CACHE_IMAGE_TAG}"
   echo "Pushing base image to registry..."
   docker push "${BASE_IMAGE_TAG}"
 else

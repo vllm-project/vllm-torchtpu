@@ -62,7 +62,9 @@ for IMG in "${TARGET_IMAGES[@]}"; do
 done
 
 echo "========================================"
-echo "Pruning old Docker build cache..."
-docker builder prune -f >/dev/null 2>&1 || true
+echo "Pruning stale Docker build cache (retaining up to 40GB of recent layers)..."
+docker builder prune -f --keep-storage=40GB --filter "until=72h" >/dev/null 2>&1 \
+  || docker builder prune -f >/dev/null 2>&1 \
+  || true
 
 echo "=== Cleanup complete ==="
