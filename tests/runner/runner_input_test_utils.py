@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
+from vllm_torchtpu.layers.adapter.attention_backend import TPUAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_planner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -53,6 +54,7 @@ def _make_runner(
 
     runner = SimpleNamespace()
     runner._stage_timing = MagicMock()
+    runner.attention_backend = TPUAttentionBackend()
     runner.device = torch.device("cpu")
     runner.most_model_len = None
     runner.num_reqs_max_model_len = target_num_reqs

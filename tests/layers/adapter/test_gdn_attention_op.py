@@ -77,6 +77,7 @@ def _vllm_config(
         ),
         speculative_config=None,
         num_speculative_tokens=0,
+        attention_config=SimpleNamespace(backend=None),
     )
 
 

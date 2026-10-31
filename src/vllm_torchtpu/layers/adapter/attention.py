@@ -1629,6 +1629,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 attn_metadata.query_start_loc,
                 attn_metadata.request_distribution,
                 sink,
+                # A registered backend's own arrays (prepare_step); none for RPA.
+                *(attn_metadata.backend_metadata or ()),
             )
 
         # Drop the padding added above so callers see the layer's own width.
