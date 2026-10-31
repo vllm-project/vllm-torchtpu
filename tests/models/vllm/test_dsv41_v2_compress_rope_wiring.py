@@ -104,9 +104,8 @@ def _torch_op(fn):
 
 
 @pytest.mark.parametrize("ratio,banks", [(1, 1), (1, 2), (2, 1), (2, 2)])
-@pytest.mark.parametrize("defer", [False, True])
 @pytest.mark.parametrize("replay", [False, True])
-def test_fused_compressor_wiring(monkeypatch, ratio, banks, defer, replay):
+def test_fused_compressor_wiring(monkeypatch, ratio, banks, replay):
     attn, positions, state, main = _fixture(monkeypatch, ratio, banks, replay)
     captured = {}
     kernel_banks = banks if ratio == 2 else 0
@@ -159,9 +158,7 @@ def test_fused_compressor_wiring(monkeypatch, ratio, banks, defer, replay):
     monkeypatch.setattr(v2_attn, "_insert", insert)
     with v2_attn.stage_attention_cache_scope():
         result = attn._write_csa2_global_kv(
-            torch.zeros(6, 16, dtype=torch.bfloat16),
-            positions,
-            defer_index_write=defer,
+            torch.zeros(6, 16, dtype=torch.bfloat16), positions
         )
         assert (
             v2_attn._active_stage_attn_cache[("candidate_index_version", "index")] == 1
@@ -183,17 +180,15 @@ def test_fused_compressor_wiring(monkeypatch, ratio, banks, defer, replay):
             assert torch.all(state.raw_hi == 8)
     else:
         np.testing.assert_array_equal(captured["hp"][:, 0], [1] * 6)
-    if defer:
-        insert.assert_not_called()
-        assert torch.equal(
-            result[0],
-            attn.indexer.k_cache.kv_cache.row_indices(expected_slots).masked_fill(
-                ~torch.tensor(valid), -1
-            ),
-        )
-    else:
-        assert result is None
-        insert.assert_called_once()
+    # Index K is written immediately from the pre-RoPE latent.
+    assert result is None
+    insert.assert_called_once()
+    cache, slots, _, index_valid = insert.call_args.args
+    assert cache is attn.indexer.k_cache.kv_cache
+    assert torch.equal(
+        slots.masked_fill(~index_valid, -1),
+        expected_slots.masked_fill(~torch.tensor(valid), -1),
+    )
     attn.compressor.project.assert_not_called()
 
 
@@ -211,9 +206,7 @@ def test_encoder_global_kv_uses_fused_compressor(monkeypatch):
     )
     hidden, positions = torch.zeros(2, 16), torch.arange(2, dtype=torch.int32)
     v2_attn.DeepseekV41Attention.write_encoder_global_kv(attn, hidden, positions)
-    attn._write_csa2_global_kv.assert_called_once_with(
-        hidden, positions, defer_index_write=False
-    )
+    attn._write_csa2_global_kv.assert_called_once_with(hidden, positions)
 
 
 def test_csa2_main_cache_rejects_latent_writes():
