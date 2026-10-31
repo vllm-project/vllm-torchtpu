@@ -1915,7 +1915,7 @@ if "proxy" in envs.JAX_PLATFORMS:
         )
 
         pathwaysutils.initialize()
-        logger.info("Module pathwaysutils is imported.")
+        logger.info("Module pathwaysutils is imported good.")
 
         # Pathways requires eager resolution of vllm.current_platform instead of
         # lazy resolution in the normal code path. Since this part involves
