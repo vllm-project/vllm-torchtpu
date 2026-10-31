@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import jax.numpy as jnp
 import torch
+from vllm.distributed import get_ep_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -227,8 +228,11 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     @property
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
-        # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        # to pipeline them with MoE computation when chunking is enabled, and
+        # to dispatch routes rather than router logits.
+        return enable_pipelined_collective_and_compute() or (
+            moe_routing.routes_before_dispatch(self.moe)
+        )
 
     def __init__(self, moe: FusedMoEConfig):
         # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
@@ -342,6 +346,15 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         topk_weights, topk_ids = moe_routing.route(
             layer, x, router_logits, input_ids=input_ids
         )
+        # vLLM's naive dispatch and combine, moved after the routing so they
+        # carry the routes instead of the router logits.
+        dispatches_routes = not enable_pipelined_collective_and_compute() and (
+            moe_routing.routes_before_dispatch(self.moe)
+        )
+        if dispatches_routes:
+            x, topk_weights, topk_ids = get_ep_group().dispatch(
+                x, topk_weights, topk_ids, self.moe.is_sequence_parallel
+            )
 
         kwargs = {
             "hidden_states": x,
@@ -360,7 +373,10 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
-
+        if dispatches_routes:
+            return get_ep_group().combine(
+                fused_moe_gmm(**kwargs), self.moe.is_sequence_parallel
+            )
         return fused_moe_gmm(**kwargs)
 
 
@@ -378,11 +394,16 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
     @property
     def supports_internal_mk(self) -> bool:
-        # An armed layer owns its own dispatch and combine, so vLLM must not
-        # bracket it with an all-gather/reduce-scatter of its own.
+        # An armed layer owns its own dispatch and combine, as does one that
+        # dispatches its routes, so vLLM must not bracket it with an
+        # all-gather/reduce-scatter of its own.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
-        return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
+        return (
+            enable_pipelined_collective_and_compute()
+            or fused_moe_ep_supported(self)
+            or moe_routing.routes_before_dispatch(self.moe)
+        )
 
     def _prebuild_w4a8(
         self,

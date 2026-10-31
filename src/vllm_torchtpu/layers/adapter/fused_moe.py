@@ -295,10 +295,11 @@ def fused_moe_gmm(
     ``combine_in_pieces`` says the output goes, unchanged, to vLLM's EP combine
     (``TpuDeviceCommunicator.combine``), so its rows are laid out piece-major
     whenever that combine splits (``ep_combine_layout``). By default it does
-    for an EP layer whenever the combine splits, which relies on vLLM's
-    MoERunner passing the routed output to ``_maybe_combine`` with nothing
-    token-wise in between; a caller that consumes the output itself passes
-    False and gets token order.
+    for an EP layer whenever the combine splits, which relies on the routed
+    output reaching that combine (from vLLM's MoERunner ``_maybe_combine`` or
+    from a method that dispatches its routes) with nothing token-wise in
+    between; a caller that consumes the output itself passes False and gets
+    token order.
     """
     use_ep = experts_start is not None
     if combine_in_pieces is None:

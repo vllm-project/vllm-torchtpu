@@ -130,14 +130,15 @@ class DeepseekV4MoE(nn.Module):
 
     @property
     def routes_dp_gathered_tokens(self) -> bool:
-        """Whether the experts see the DP-gathered batch or this rank's rows.
+        """Whether the router sees the DP-gathered batch or this rank's rows.
 
         Hash routing indexes its table by token id, so the ids handed down
-        have to line up row-for-row with the hidden states the experts get.
+        have to line up row-for-row with the hidden states the router gets.
         The runner gathers them only while the quant method does not own its
-        own dispatch; an armed fused-EP layer does, and then the experts --
-        and the ids -- stay local. Asked of the layer rather than assumed,
-        because arming is decided per layer at weight load.
+        own dispatch; an armed fused-EP layer does, and so does a method that
+        routes before it dispatches, and then the router -- and the ids --
+        stay local. Asked of the layer rather than assumed, because arming is
+        decided per layer at weight load.
         """
         return self.experts.do_naive_dispatch_combine
 
