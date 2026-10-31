@@ -305,6 +305,31 @@ def write_main_cache(
     ``slot`` (paired main KV pages only) writes this layer's head pair of
     each row and keeps the other's; ``None`` writes whole rows.
     """
+    if (
+        envs.VLLM_TPU_QSA_MAIN_RUN_WRITE
+        and len(rows) >= envs.VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS
+        and (slot is None or pool.dtype == jnp.float8_e4m3fn)
+    ):
+        from vllm_torchtpu.kernels.qwen4_exp.main_write import write_main_runs
+
+        keep = None
+        if slot is not None:
+            if (
+                pool.shape[2] != 1
+                or rows.shape[1:] != pool.shape[2:]
+                or not 0 <= slot < pool.shape[-2] // 2
+            ):
+                raise ValueError("Paired main KV needs one FP8 head-slot row per token")
+            rows, keep = main_slot_rows(rows, slot), _main_slot_keep_mask(slot)
+        return write_main_runs(
+            pool,
+            rows,
+            page,
+            logical % pool.shape[1],
+            valid,
+            keep=keep,
+            tile=envs.VLLM_TPU_QSA_MAIN_RUN_WRITE_TILE,
+        )
     if slot is not None:
         return _write_main_cache_paired(pool, rows, page, logical, valid, slot)
     tile = 128

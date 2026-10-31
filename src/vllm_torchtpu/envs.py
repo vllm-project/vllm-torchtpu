@@ -116,6 +116,9 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
+    VLLM_TPU_QSA_MAIN_RUN_WRITE: bool = False
+    VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS: int = 512
+    VLLM_TPU_QSA_MAIN_RUN_WRITE_TILE: int = 512
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -782,6 +785,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # previous output), not only at the prompt's last boundary.
     "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL": env_bool(
         "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL"
+    ),
+    # Qwen4-exp prefill main KV write: coalesce contiguous (page, offset) runs
+    # across whole-row and paired-slot FP8 pages via main_write.write_main_runs.
+    "VLLM_TPU_QSA_MAIN_RUN_WRITE": env_bool(
+        "VLLM_TPU_QSA_MAIN_RUN_WRITE", default=False
+    ),
+    # With VLLM_TPU_QSA_MAIN_RUN_WRITE: steps with fewer rows keep tiled writers.
+    "VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS", 512
+    ),
+    "VLLM_TPU_QSA_MAIN_RUN_WRITE_TILE": env_nonnegative_int(
+        "VLLM_TPU_QSA_MAIN_RUN_WRITE_TILE", 512
     ),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
