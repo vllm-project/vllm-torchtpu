@@ -275,17 +275,18 @@ def _sized_gather(
     total_pages: jax.Array,
     gather: Callable[[int], jax.Array],
     page_axis: int,
+    page_rows: int = 1,
 ) -> jax.Array:
     """`gather(cap)` for the smallest cap in `gather_caps` holding
     `total_pages`. Every rank takes the same branch (the metadata is
-    replicated); `page_axis` (`cap` long) is zero-padded to `max_pages` (no
-    flat row reaches the padding)."""
+    replicated); `page_axis` (`cap * page_rows` long) is zero-padded to
+    `max_pages * page_rows` (no flat row reaches the padding)."""
 
     def branch(cap: int) -> Callable[[], jax.Array]:
         def run() -> jax.Array:
             g = gather(cap)
             pad = [(0, 0)] * g.ndim
-            pad[page_axis] = (0, layout.max_pages - cap)
+            pad[page_axis] = (0, (layout.max_pages - cap) * page_rows)
             return jnp.pad(g, pad)
 
         return run
@@ -305,16 +306,25 @@ def gather_latent(
     total_pages: jax.Array,
     axis_name: str,
 ) -> tuple[jax.Array, jax.Array]:
-    """Every rank's `page_ids` pages, rank-major: `[dcp * max_pages, ...]`."""
+    """Every rank's `page_ids` pages, rank-major: `[dcp * max_pages, ...]`.
+
+    The pages are read as rows of the cache's flat `[pages * rows, ...]` view,
+    the view the SparseCore cache writer and gather use: indexing the paged
+    shape instead makes XLA keep a second, page-tiled layout of the whole
+    cache and copy it every layer.
+    """
 
     def gather(cache: jax.Array) -> jax.Array:
-        g = _sized_gather(
-            layout,
-            total_pages,
-            lambda cap: lax.all_gather(cache[page_ids[:cap]], axis_name, axis=0),
-            page_axis=1,
-        )
-        return g.reshape(-1, *g.shape[2:])
+        rows = cache.shape[1]
+        flat = cache.reshape(cache.shape[0] * rows, *cache.shape[2:])
+
+        def pages(cap: int) -> jax.Array:
+            idx = page_ids[:cap, None] * rows + jnp.arange(rows, dtype=jnp.int32)
+            g = lax.all_gather(jnp.take(flat, idx.reshape(-1), axis=0), axis_name)
+            return g.reshape(layout.dcp_size, cap * rows, *g.shape[2:])
+
+        g = _sized_gather(layout, total_pages, pages, page_axis=1, page_rows=rows)
+        return g.reshape(-1, rows, *g.shape[2:])
 
     return gather(nope_cache), gather(rope_cache)
 

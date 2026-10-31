@@ -46,6 +46,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     KVLayout,
     coalesced_kv_append,
     coalesced_kv_append_dcp,
+    cp_local_to_global,
     get_kv_cache_shape,
     streamindex_topk,
     streamindex_topk_dcp,
@@ -189,9 +190,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefix", type=int, default=40960)
     ap.add_argument("--tokens", type=int, default=4096)
+    ap.add_argument("--real-tokens", type=int, default=0, help="0: the whole bucket")
     ap.add_argument("--split-rows", type=int, default=64)
     ap.add_argument("--max-pages", type=int, default=44)
     ap.add_argument("--static-gather", action="store_true")
+    ap.add_argument(
+        "--pages-per-rank", type=int, default=0, help="cache size (0: just enough)"
+    )
+    ap.add_argument(
+        "--q-replicated", action="store_true", help="every head of q on every rank"
+    )
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--check-rows", type=int, default=256)
     ap.add_argument("--out", default="")
@@ -211,7 +219,8 @@ def main():
     mesh = Mesh(np.array(devices), (AXIS,))
     shd = NamedSharding(mesh, P(AXIS))
     T, S, prefix = a.tokens, a.split_rows, a.prefix
-    total = prefix + T
+    real = a.real_tokens or T  # the chunk's real rows; the rest is padding
+    total = prefix + real
     caps = tuple(c for c in tp_op.GATHER_CAPS if c < a.max_pages) + (a.max_pages,)
     if a.static_gather:
         caps = (a.max_pages,)
@@ -219,18 +228,18 @@ def main():
     rows = lay.rows_per_rank(T)
     vps = lay.virtual_page_size
     n_vp = -(-total // vps)
-    pages_per_rank = n_vp + 4
+    pages_per_rank = a.pages_per_rank or n_vp + 4
     k_scale, sm_scale = 0.5, 2.0 / np.sqrt(LKV + ROPE)
     print(f"dcp={dcp} T={T} prefix={prefix} rows/rank={rows} vpages={n_vp}")
 
     keys = jax.random.split(jax.random.key(0), 8)
-    lat = _fp8(keys[0], (total, LKV), 1.0)
-    pe = _fp8(keys[1], (total, ROPE), 1.0)
-    idx_vals = _fp8(keys[2], (total, IDX_DIM), 1.0)
+    lat = _fp8(keys[0], (prefix + T, LKV), 1.0)
+    pe = _fp8(keys[1], (prefix + T, ROPE), 1.0)
+    idx_vals = _fp8(keys[2], (prefix + T, IDX_DIM), 1.0)
     idx_rec = jnp.concatenate(
         [
             lax.bitcast_convert_type(idx_vals, jnp.uint8),
-            jnp.full((total, 1), 127, jnp.uint8),  # e8m0 scale 1.0
+            jnp.full((prefix + T, 1), 127, jnp.uint8),  # e8m0 scale 1.0
         ],
         -1,
     )
@@ -247,7 +256,7 @@ def main():
     # Step metadata: request 0 is the prefill chunk, the rest are padding.
     seq_lens = np.zeros(MAX_REQS, np.int32)
     seq_lens[0] = total
-    qsl = np.full(MAX_REQS + 1, T, np.int32)
+    qsl = np.full(MAX_REQS + 1, real, np.int32)
     qsl[0] = 0
     dist = np.array([0, 0, 1], np.int32)
     perm = np.random.default_rng(0).permutation(pages_per_rank)[:n_vp]
@@ -417,7 +426,7 @@ def main():
     )
     t_tp_idx, flat = _timeit(tp_index, icache, q_idx_g, w_idx_g, *meta, iters=a.iters)
     flat = _host(flat).reshape(dcp, rows, TOPK).reshape(dcp * rows, TOPK)
-    n_tp = T - S
+    n_tp = real - S
     ref_pos = np.asarray(
         jax.jit(
             lambda qi, wi: streamindex_topk(
@@ -434,7 +443,7 @@ def main():
                 num_queries_per_block=128,
                 kv_layout=SAL,
             )
-        )(q_idx[S:], w_idx[S:])
+        )(q_idx[S:real], w_idx[S:real])
     )
     ref_flat = np.asarray(
         tp.flat_rows(lay, jnp.asarray(ref_pos), jnp.zeros((n_tp,), jnp.int32))
@@ -492,13 +501,15 @@ def main():
             *m,
             write_kv=write_kv,
             attend=attend,
+            q_replicated=a.q_replicated,
         )
     )
+    q_tp = _global(NamedSharding(mesh, P()), q) if a.q_replicated else q_sharded
     t_tp_attn, (_, _, out_tp) = _timeit(
         tp_attn,
         nope0,
         rope0,
-        q_sharded,
+        q_tp,
         lat_c,
         pe_c,
         flat_dev,
@@ -523,7 +534,7 @@ def main():
         )[..., :LKV]
     )
     t_single, out_single = _timeit(
-        single, jnp.asarray(q[S:]), jnp.asarray(ref_pos), iters=a.iters
+        single, jnp.asarray(q[S:real]), jnp.asarray(ref_pos), iters=a.iters
     )
     out_single = np.asarray(out_single, np.float32)
     same_topk = np.array(
@@ -624,14 +635,105 @@ def main():
         iters=a.iters,
     )
     out_dcp = _host(out_dcp).astype(np.float32).reshape(dcp, T, h, LKV)
-    out_dcp = out_dcp.transpose(1, 0, 2, 3).reshape(T, HEADS, LKV)[S:]
+    out_dcp = out_dcp.transpose(1, 0, 2, 3).reshape(T, HEADS, LKV)[S:real]
+
+    # ---- the split's DCP sub-batch: rows [0, S), today's ops, cut metadata --
+    # The metadata cut mirrors dcp_token_parallel_op.dcp_rows_metadata.
+    qsl_s = np.minimum(qsl, S)
+    seq_s = seq_lens - (np.diff(qsl) - np.diff(qsl_s))
+    n_s = int(np.sum((qsl[:-1] < S) & (np.arange(MAX_REQS) < dist[2])))
+    dist_s = np.array([min(dist[0], n_s), min(dist[1], n_s), n_s], np.int32)
+    sub_meta = [
+        _global(rep, x.astype(np.int32)) for x in (seq_s, bt.reshape(-1), qsl_s, dist_s)
+    ]
+    bkvp_s, bq_s = _streamidx_block_sizes(S, None, None, 0)
+    sub_index = jax.jit(
+        lambda c, qi, wi, *m: streamindex_topk_dcp(
+            qi,
+            wi,
+            c,
+            *m,
+            mesh=mesh,
+            k=TOPK,
+            compression_ratio=1,
+            dcp_size=dcp,
+            interleave_size=IL,
+            num_kv_pages_per_block=bkvp_s,
+            num_queries_per_block=bq_s,
+            kv_layout=SAL,
+            chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+            hist_merge=True,
+        )
+    )
+    sub_local = sub_index(
+        icache, _global(rep, q_idx[:S]), _global(rep, w_idx[:S]), *sub_meta
+    )
+    sub_local_h = _host(sub_local).reshape(dcp, S, TOPK)
+    sub_ref = np.asarray(
+        jax.jit(
+            lambda qi, wi: streamindex_topk(
+                qi,
+                wi,
+                nat_idx,
+                jnp.array([prefix + S], jnp.int32),
+                nat_bt,
+                jnp.array([0, S], jnp.int32),
+                jnp.array([0, 0, 1], jnp.int32),
+                k=TOPK,
+                compression_ratio=1,
+                num_kv_pages_per_block=2,
+                num_queries_per_block=128,
+                kv_layout=SAL,
+            )
+        )(q_idx[:S], w_idx[:S])
+    )
+    sub_mismatch = 0
+    for t in range(S):
+        got = set()
+        for r in range(dcp):
+            row = sub_local_h[r, t]
+            got |= {
+                int(cp_local_to_global(v, r, dcp, IL)) for v in row[row >= 0].tolist()
+            }
+        sub_mismatch += got != set(sub_ref[t][sub_ref[t] >= 0].tolist())
+    results["dcp_subbatch_indexer_rows_mismatch"] = int(sub_mismatch)
+    q_sub = _global(
+        shd, q[:S].reshape(S, dcp, h, -1).transpose(1, 0, 2, 3).reshape(dcp * S, h, -1)
+    )
+    _, _, out_sub = jax.jit(dcp_attn_fn)(
+        nope0,
+        rope0,
+        q_sub,
+        _global(rep, lat[prefix : prefix + S]),
+        _global(rep, pe[prefix : prefix + S]),
+        sub_local,
+        *sub_meta,
+    )
+    out_sub = _host(out_sub).astype(np.float32).reshape(dcp, S, h, LKV)
+    out_sub = out_sub.transpose(1, 0, 2, 3).reshape(S, HEADS, LKV)
+    sub_err = []
+    lat32_ = np.asarray(lat.astype(jnp.float32)) * k_scale
+    pe32_ = np.asarray(pe.astype(jnp.float32)) * k_scale
+    for t in range(S):
+        sel = sub_ref[t][sub_ref[t] >= 0]
+        kk = np.concatenate([lat32_[sel], pe32_[sel]], -1)
+        sc = np.asarray(q[t].astype(np.float32)) @ kk.T * sm_scale
+        pr = np.exp(sc - sc.max(-1, keepdims=True))
+        pr /= pr.sum(-1, keepdims=True)
+        want = pr @ lat32_[sel]
+        sub_err.append(np.abs(out_sub[t] - want).max() / (np.abs(want).max() + 1e-6))
+    results["dcp_subbatch_vs_f32_max_rel"] = float(np.max(sub_err))
+    print(
+        f"DCP sub-batch (rows [0,{S})): indexer {sub_mismatch}/{S} rows differ, "
+        f"attention vs f32 max rel {np.max(sub_err):.3g}"
+    )
 
     # ---- f32 reference on sampled rows ----------------------------------
     rng = np.random.default_rng(1)
     sample = np.sort(rng.choice(n_tp, min(a.check_rows, n_tp), replace=False))
     lat32 = np.asarray(lat.astype(jnp.float32)) * k_scale
     pe32 = np.asarray(pe.astype(jnp.float32)) * k_scale
-    q32 = np.asarray(q.astype(jnp.float32))[S:]
+    q32 = np.asarray(q.astype(jnp.float32))[S:real]
     errs = {"tp": [], "dcp": []}
     for i in sample:
         sel = ref_pos[i][ref_pos[i] >= 0]
@@ -733,7 +835,7 @@ def main():
         # told apart by their module names.
         with jax.profiler.trace(a.trace_dir):
             for fn, args in (
-                (tp_attn, (nope0, rope0, q_sharded, lat_c, pe_c, flat_dev, *meta)),
+                (tp_attn, (nope0, rope0, q_tp, lat_c, pe_c, flat_dev, *meta)),
                 (tp_index, (icache, q_idx_g, w_idx_g, *meta)),
                 (
                     jax.jit(dcp_attn_fn),
