@@ -25,6 +25,16 @@ _STANDARD_KEYS = frozenset(
     }
 )
 
+_TORCH_PROFILER_KEYS = frozenset(
+    {
+        "record_shapes",
+        "profile_memory",
+        "with_stack",
+        "with_flops",
+        "with_modules",
+    }
+)
+
 _ALLOWED_VALUE_CHARS = re.compile(r"^[a-zA-Z0-9_./,:\-\s]*$")
 _OPTION_PATTERN = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.+)$")
 
@@ -98,6 +108,42 @@ def get_default_advanced_opts() -> dict[str, Any]:
     }
 
 
+def extract_torch_profiler_kwargs(
+    profiler_kwargs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Extracts standard ``torch.profiler.profile`` boolean flags."""
+    if not profiler_kwargs:
+        return {}
+    torch_kwargs: dict[str, Any] = {}
+    for key in _TORCH_PROFILER_KEYS:
+        if key in profiler_kwargs:
+            val = profiler_kwargs[key]
+            if isinstance(val, bool):
+                torch_kwargs[key] = val
+            else:
+                parsed = _parse_option_value(key, str(val))
+                if not isinstance(parsed, bool):
+                    raise ValueError(f"Expected boolean value for '{key}', got '{val}'")
+                torch_kwargs[key] = parsed
+    return torch_kwargs
+
+
+def _merge_profiler_option(
+    key: str,
+    val: Any,
+    standard_opts: dict[str, Any],
+    advanced_opts: dict[str, Any],
+) -> None:
+    if isinstance(val, (bool, int)):
+        parsed_val: Any = val
+    else:
+        parsed_val = _parse_option_value(str(key), str(val))
+    if key in _STANDARD_KEYS:
+        standard_opts[key] = parsed_val
+    else:
+        advanced_opts[key] = parsed_val
+
+
 def resolve_profile_dir_and_opts(
     base_dir: str,
     profile_prefix: str | None = None,
@@ -113,7 +159,7 @@ def resolve_profile_dir_and_opts(
             Otherwise, it acts solely as a subdirectory name appending to base_dir.
         profiler_kwargs: Optional dictionary of profiler options passed via
             start_profile (e.g., {"host_tracer_level": 3,
-            "e2e_enable_fw_throttle": True}).
+            "e2e_enable_fw_throttle_event": True}).
 
     Returns:
         A tuple of (profile_dir, standard_opts, advanced_opts) where the opts
@@ -142,15 +188,14 @@ def resolve_profile_dir_and_opts(
 
     if profiler_kwargs:
         for key, val in profiler_kwargs.items():
-            if key == "profile_prefix":
+            if key == "profile_prefix" or key in _TORCH_PROFILER_KEYS:
                 continue
-            if isinstance(val, (bool, int)):
-                parsed_val: Any = val
-            else:
-                parsed_val = _parse_option_value(str(key), str(val))
-            if key in _STANDARD_KEYS:
-                standard_opts[key] = parsed_val
-            else:
-                advanced_opts[key] = parsed_val
+            if key == "experimental_options" and isinstance(val, dict):
+                for exp_key, exp_val in val.items():
+                    _merge_profiler_option(
+                        str(exp_key), exp_val, standard_opts, advanced_opts
+                    )
+                continue
+            _merge_profiler_option(str(key), val, standard_opts, advanced_opts)
 
     return profile_dir, standard_opts, advanced_opts

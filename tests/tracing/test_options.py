@@ -14,6 +14,7 @@
 import pytest
 
 from vllm_torchtpu.tracing.options import (
+    extract_torch_profiler_kwargs,
     parse_profile_options,
     resolve_profile_dir_and_opts,
 )
@@ -120,3 +121,55 @@ def test_resolve_with_env_vars(monkeypatch):
     assert standard["host_tracer_level"] == 1
     assert standard["device_tracer_level"] == 2
     assert advanced["tpu_trace_mode"] == "TRACE_COMPUTE_AND_SYNC"
+
+
+def test_resolve_with_nested_experimental_options():
+    profile_dir, standard, advanced = resolve_profile_dir_and_opts(
+        "/tmp/base",
+        "nested_run",
+        profiler_kwargs={
+            "host_tracer_level": 3,
+            "experimental_options": {
+                "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+                "tpu_num_sparse_cores_to_trace": 2,
+                "e2e_enable_fw_throttle_event": True,
+            },
+        },
+    )
+    assert profile_dir == "/tmp/base/nested_run"
+    assert standard["host_tracer_level"] == 3
+    assert advanced == {
+        "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+        "tpu_num_sparse_cores_to_trace": 2,
+        "tpu_num_sparse_core_tiles_to_trace": 1,
+        "e2e_enable_fw_throttle_event": True,
+    }
+
+
+def test_extract_torch_profiler_kwargs_and_exclude_from_advanced():
+    kwargs = {
+        "host_tracer_level": 3,
+        "record_shapes": True,
+        "with_stack": "true",
+        "profile_memory": False,
+        "e2e_enable_fw_throttle_event": True,
+    }
+    _, standard, advanced = resolve_profile_dir_and_opts(
+        "/tmp/base", None, profiler_kwargs=kwargs
+    )
+    assert standard["host_tracer_level"] == 3
+    assert "record_shapes" not in advanced
+    assert "with_stack" not in advanced
+    assert "profile_memory" not in advanced
+    assert advanced["e2e_enable_fw_throttle_event"] is True
+
+    torch_kwargs = extract_torch_profiler_kwargs(kwargs)
+    assert torch_kwargs == {
+        "record_shapes": True,
+        "with_stack": True,
+        "profile_memory": False,
+    }
+    assert extract_torch_profiler_kwargs(None) == {}
+
+    with pytest.raises(ValueError, match="Expected boolean value"):
+        extract_torch_profiler_kwargs({"record_shapes": "not_a_bool"})
