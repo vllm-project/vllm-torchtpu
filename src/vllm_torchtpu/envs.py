@@ -261,6 +261,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SUBTRACT_REJECTED_COMPILED: bool = False
     VLLM_TPU_SPEC_TAIL_COMPILED: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
+    VLLM_TPU_LOOP_LAG_WATCHDOG_S: float = 30.0
+    VLLM_TPU_DECODE_PRIORITY: str = ""
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -275,6 +277,7 @@ if TYPE_CHECKING:
     VLLM_TPU_GC_DISABLE_AFTER_S: float = -1.0
     VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS: bool = False
     VLLM_TPU_PAD_EAGER_GLUE: bool = False
+    VLLM_TPU_MAMBA_SEED_NONBLOCKING: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
@@ -1617,6 +1620,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dump all processes' stacks when no step starts for N s with live
     # requests (stall_watchdog.py; read directly there, registered here).
     "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
+    # With the stall watchdog on: dump the API server's stacks when its event
+    # loop blocks for N s (stall_watchdog.py; read directly there).
+    "VLLM_TPU_LOOP_LAG_WATCHDOG_S": env_float("VLLM_TPU_LOOP_LAG_WATCHDOG_S", 30.0),
+    # Scheduler decode priority window after large prefill chunks: N:K or
+    # N:K:scale=S:protect=M:hold=H:deadline=D (core/decode_priority.py).
+    "VLLM_TPU_DECODE_PRIORITY": lambda: os.getenv("VLLM_TPU_DECODE_PRIORITY", ""),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for
@@ -1660,6 +1669,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pad the async-spec rejected-count subtraction and the draft seed glue to
     # precompiled bucket shapes so they stop cold-compiling in serving.
     "VLLM_TPU_PAD_EAGER_GLUE": env_bool("VLLM_TPU_PAD_EAGER_GLUE"),
+    # Near a mamba block edge, pick the async-spec seed copy on device from the
+    # previous step's rejected counts instead of waiting for its tokens on the
+    # host (tpu_runner._collect_mamba_state_seed_copies).
+    "VLLM_TPU_MAMBA_SEED_NONBLOCKING": env_bool("VLLM_TPU_MAMBA_SEED_NONBLOCKING"),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),

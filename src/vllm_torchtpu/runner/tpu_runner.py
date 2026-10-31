@@ -303,12 +303,44 @@ def _spec_seed_rows_impl(
     return src, dst
 
 
+def _spec_seed_rows_cond_impl(
+    read_offsets: torch.Tensor,
+    packed: torch.Tensor,
+    cond: torch.Tensor,
+    num_rejected: torch.Tensor,
+    split: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_rollback_offsets_seed` then `_spec_seed_rows_impl` for crossings whose
+    occurrence hangs on the previous step's acceptance
+    (VLLM_TPU_MAMBA_SEED_NONBLOCKING).
+
+    `cond` is int64 [B, 3] next to `packed`: a conditional flag, the row's
+    index into the previous step's device-resident `num_rejected` (padded),
+    and its slack. A conditional row crosses iff its rejected count is at most
+    the slack -- the host's own test once it has the tokens -- else it becomes
+    padding: no seed copy and no read-offset reset (the null block's offset
+    takes the write, as for bucket padding).
+    """
+    rejected = num_rejected[cond[:, 1]].long()
+    crossed = (cond[:, 0] == 0) | (rejected <= cond[:, 2])
+    valid = (packed[:, 2] != 0) & crossed
+    dst = torch.where(valid, packed[:, 3], 0)
+    read_offsets.index_put_(
+        (dst,), torch.zeros(dst.shape[0], dtype=read_offsets.dtype, device=dst.device)
+    )
+    packed = torch.cat(
+        [packed[:, :2], valid.to(packed.dtype).unsqueeze(1), packed[:, 3:]], dim=1
+    )
+    return _spec_seed_rows_impl(read_offsets, packed, split)
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _update_read_offsets_compiled = _tpu_compile(_update_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
 _spec_seed_rows_compiled = _tpu_compile(_spec_seed_rows_impl)
+_spec_seed_rows_cond_compiled = _tpu_compile(_spec_seed_rows_cond_impl)
 
 
 def _apply_temperature_impl(
@@ -1116,6 +1148,9 @@ class TPUModelRunner(GPUModelRunner):
         # mapping (built in initialize_kv_cache), and the block-seed copies
         # staged by _prepare_inputs and flushed before the forward.
         self._mamba_state_pos: dict[str, int] = {}
+        # VLLM_TPU_MAMBA_SEED_NONBLOCKING: requests whose state column hangs on
+        # the previous step's acceptance -> (lo, hi, slack, row, results).
+        self._mamba_pos_pending: dict[str, tuple[int, int, int, int, Any]] = {}
         self._mamba_copy_plan: list[tuple[int, list[torch.Tensor]]] = []
         # Manager-block -> pool-block split: >1 when the pool is born at a
         # smaller attention-kernel granularity (batched RPA).
@@ -2172,6 +2207,18 @@ class TPUModelRunner(GPUModelRunner):
             else None
         )
         sampled_cpu: torch.Tensor | None = None
+        self._resolve_mamba_state_pos()
+        window = self._mamba_ckpt_window
+        spec_seed = self.mamba_slot_read_offsets is not None and window > 1
+        nonblocking = (
+            envs.VLLM_TPU_MAMBA_SEED_NONBLOCKING
+            and spec_seed
+            and previous is not None
+            and previous.spec_decode_num_rejected_tokens is not None
+            and previous.copy_state is not None
+        )
+        # Conditional crossings: row -> (index into num_rejected, slack).
+        cond_rows: dict[int, tuple[int, int]] = {}
         for i in range(num_reqs):
             row = start_index + i
             req_id = req_ids[row]
@@ -2190,6 +2237,23 @@ class TPUModelRunner(GPUModelRunner):
                 # Only near a block edge can the correction change the seed
                 # destination; reuse the pending sampling copy in that case.
                 if end_position // col_stride != (end_position - drafts) // col_stride:
+                    hi = end_position // col_stride
+                    if (
+                        nonblocking
+                        and previous_row is not None
+                        and self._mamba_state_pos.get(req_id) == hi - 1
+                        and req_id not in self._mamba_pos_pending
+                    ):
+                        # Crosses from hi - 1 into hi iff at most `slack`
+                        # drafts were rejected: decided on device, and the
+                        # host's column resolved on the next step.
+                        slack = end_position - hi * col_stride
+                        cond_rows[row] = (previous_row, slack)
+                        self._mamba_pos_pending[req_id] = (
+                            hi - 1, hi, slack, previous_row, previous
+                        )
+                        crossings.append((row, hi - 1, hi))
+                        continue
                     if sampled_cpu is None:
                         sampled_cpu = previous.wait_for_copy()
                         assert sampled_cpu is not None
@@ -2219,9 +2283,6 @@ class TPUModelRunner(GPUModelRunner):
         # checkpoint 0 of the new group, so the read offset resets to 0.
         # That index lives in the device-resident read-offset buffer, hence
         # the device-side gather in `_spec_seed_copies`.
-        window = self._mamba_ckpt_window
-        spec_seed = self.mamba_slot_read_offsets is not None and window > 1
-
         # Keyed by the set of raw buffers a group lives on; groups sharing
         # the same buffers are seeded by one program.
         per_raw: dict[
@@ -2230,7 +2291,10 @@ class TPUModelRunner(GPUModelRunner):
         # Speculative crossings of every group on the same buffers, as
         # `_spec_seed_rows` rows: one upload and one program per buffer set
         # (per-group eager selection cost ~10 programs per group, c32 g05).
-        per_raw_spec: dict[tuple[int, ...], tuple[list[torch.Tensor], list[list[int]]]] = {}
+        per_raw_spec: dict[
+            tuple[int, ...],
+            tuple[list[torch.Tensor], list[list[int]], list[tuple[int, int] | None]],
+        ] = {}
         # Manager-level (src, dst) block pairs across mamba groups: without
         # spec decoding the per-block read offsets just follow the state to
         # the request's new state block.
@@ -2241,6 +2305,7 @@ class TPUModelRunner(GPUModelRunner):
             row_width = bt.shape[1]
             pairs: list[tuple[int, int]] = []
             spec_rows: list[list[int]] = []
+            spec_conds: list[tuple[int, int] | None] = []
             for row, prev, curr in crossings:
                 src = int(bt[row, prev])
                 dst = int(bt[row, curr])
@@ -2261,12 +2326,15 @@ class TPUModelRunner(GPUModelRunner):
                         ckpt = int(bt[row, col]) if col < row_width else 0
                         row_ckpts.append(ckpt if ckpt != 0 else src)
                     spec_rows.append([src, int(new_owner), 1, dst, *row_ckpts])
+                    spec_conds.append(cond_rows.get(row))
             if not pairs:
                 continue
             if spec_seed:
                 spec_dsts.extend(d for _, d in pairs)
                 key = tuple(id(raw) for raw in raws)
-                per_raw_spec.setdefault(key, (raws, []))[1].extend(spec_rows)
+                entry_spec = per_raw_spec.setdefault(key, (raws, [], []))
+                entry_spec[1].extend(spec_rows)
+                entry_spec[2].extend(spec_conds)
                 continue
             offset_pairs.extend(pairs)
             if self._pool_block_split > 1:
@@ -2282,7 +2350,28 @@ class TPUModelRunner(GPUModelRunner):
             entry[1].extend(p[0] for p in pairs)
             entry[2].extend(p[1] for p in pairs)
 
-        if spec_seed and spec_dsts:
+        use_cond = any(
+            c is not None for _, _, conds in per_raw_spec.values() for c in conds
+        )
+        if use_cond and len(per_raw_spec) > 1:
+            # The read-offset reset must cover every buffer set before any
+            # seed reads an offset; with several sets, decide on the host.
+            assert previous is not None
+            sampled_cpu = previous.wait_for_copy()
+            assert sampled_cpu is not None
+            spec_dsts = []
+            for key, (raws, rows, conds) in list(per_raw_spec.items()):
+                kept = [
+                    (r, c)
+                    for r, c in zip(rows, conds)
+                    if c is None or self._rejected_cpu(previous, sampled_cpu, c[0]) <= c[1]
+                ]
+                per_raw_spec[key] = (raws, [r for r, _ in kept], [None] * len(kept))
+                spec_dsts.extend(r[3] for r, _ in kept)
+            self._resolve_mamba_state_pos()
+            use_cond = False
+
+        if spec_seed and spec_dsts and not use_cond:
             # The seeded checkpoint is checkpoint 0 of the new group.
             dst_t = torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long).to(
                 self.device, non_blocking=True
@@ -2303,8 +2392,12 @@ class TPUModelRunner(GPUModelRunner):
             )
             _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t, dst_t)
 
-        for raws, rows in per_raw_spec.values():
-            src_t, dst_t = self._spec_seed_copies(rows, window)
+        for raws, rows, conds in per_raw_spec.values():
+            if not rows:
+                continue
+            src_t, dst_t = self._spec_seed_copies(
+                rows, window, conds if use_cond else None, previous
+            )
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
         for raws, srcs, dsts in per_raw.values():
@@ -2334,7 +2427,11 @@ class TPUModelRunner(GPUModelRunner):
         return values + [pad] * (cls._bucket_len(len(values)) - len(values))
 
     def _spec_seed_copies(
-        self, rows: list[list[int]], window: int
+        self,
+        rows: list[list[int]],
+        window: int,
+        conds: list[tuple[int, int] | None] | None = None,
+        previous: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Seed-copy (src, dst) for speculative crossings, one program.
 
@@ -2349,12 +2446,68 @@ class TPUModelRunner(GPUModelRunner):
         assert offsets is not None
         rows = self._pad_to_bucket(rows, pad=[0, 1, 0, 0] + [0] * window)
         packed = torch.tensor(rows, dtype=torch.long).to(self.device, non_blocking=True)
+        if conds is not None:
+            # VLLM_TPU_MAMBA_SEED_NONBLOCKING: this program also resets the
+            # read offsets, keeping only the crossings that happened.
+            cond = self._pad_to_bucket(
+                [[0, 0, 0] if c is None else [1, c[0], c[1]] for c in conds],
+                pad=[0, 0, 0],
+            )
+            cond_t = torch.tensor(cond, dtype=torch.long).to(
+                self.device, non_blocking=True
+            )
+            num_rejected = self._padded_num_rejected(
+                previous.spec_decode_num_rejected_tokens
+            )
+            fn_cond = (
+                _spec_seed_rows_cond_compiled
+                if packed.device.type == "tpu"
+                else _spec_seed_rows_cond_impl
+            )
+            return fn_cond(offsets, packed, cond_t, num_rejected, self._pool_block_split)
         fn = (
             _spec_seed_rows_compiled
             if packed.device.type == "tpu"
             else _spec_seed_rows_impl
         )
         return fn(offsets, packed, self._pool_block_split)
+
+    def _num_rejected_width(self) -> int:
+        """Fixed length the previous step's rejected counts are padded to for
+        `_spec_seed_rows_cond_impl`, so its program sees one shape."""
+        return self._bucket_len(2 * self.max_num_reqs)
+
+    def _padded_num_rejected(self, num_rejected: torch.Tensor) -> torch.Tensor:
+        width = self._num_rejected_width()
+        n = num_rejected.shape[0]
+        assert n <= width, (n, width)
+        if n == width:
+            return num_rejected
+        return torch.nn.functional.pad(num_rejected, (0, width - n))
+
+    @staticmethod
+    def _rejected_cpu(previous: Any, sampled_cpu: torch.Tensor, row: int) -> int:
+        """The previous step's rejected-draft count of `row` from its landed
+        tokens (`compute_num_rejected` on the host)."""
+        drafts = previous.num_draft_per_req.get(row, 0)
+        accepted = int((sampled_cpu[row] != INVALID_TOKEN_ID).sum().item())
+        return max(0, drafts + 1 - accepted)
+
+    def _resolve_mamba_state_pos(self) -> None:
+        """Settle the state columns left open by conditional crossings
+        (VLLM_TPU_MAMBA_SEED_NONBLOCKING) from their step's tokens, which
+        have landed by now: the next step's sample_tokens waited on them."""
+        pending = self._mamba_pos_pending
+        if not pending:
+            return
+        for req_id, (lo, hi, slack, row, previous) in list(pending.items()):
+            del pending[req_id]
+            if req_id not in self._mamba_state_pos:
+                continue
+            sampled_cpu = previous.wait_for_copy()
+            assert sampled_cpu is not None
+            rejected = self._rejected_cpu(previous, sampled_cpu, row)
+            self._mamba_state_pos[req_id] = hi if rejected <= slack else lo
 
     def _flush_mamba_state_seed_copies(self) -> None:
         if not self._pending_mamba_state_copies:
@@ -2817,6 +2970,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         for req_id in invalidated_req_ids:
             self._mamba_state_pos.pop(req_id, None)
+            self._mamba_pos_pending.pop(req_id, None)
             slot = self._mamba_slot_by_req_id.pop(req_id, None)
             if slot is not None:
                 self._free_mamba_slots.append(slot)
@@ -7863,12 +8017,27 @@ class TPUModelRunner(GPUModelRunner):
                 else 0,
             )
             limit = self._bucket_len(num_groups * self.max_num_reqs)
+            window = self._mamba_ckpt_window
+            cond_warm = None
+            if envs.VLLM_TPU_MAMBA_SEED_NONBLOCKING and window > 1:
+                cond_warm = torch.zeros(
+                    self._num_rejected_width(), dtype=torch.int32
+                ).to(offsets.device)
             n = 8
             while n <= limit:
                 src = torch.zeros(n, dtype=torch.long).to(offsets.device)
                 dst = torch.zeros(n, dtype=torch.long).to(offsets.device)
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
+                if cond_warm is not None:
+                    # All-zero rows are padding: no copy, null-slot writes.
+                    packed = torch.zeros(n, 4 + window, dtype=torch.long).to(
+                        offsets.device
+                    )
+                    cond = torch.zeros(n, 3, dtype=torch.long).to(offsets.device)
+                    _spec_seed_rows_cond_compiled(
+                        offsets, packed, cond, cond_warm, self._pool_block_split
+                    )
                 n *= 4
 
     def _warmup_spec_decode(self) -> None:

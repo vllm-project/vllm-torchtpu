@@ -408,6 +408,16 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
     # Scheduler prefix-cache hit length only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
+    "VLLM_TPU_QSA_DCP_FINE_PREFIX",
+    "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL",
+    # Scheduler decode priority window and host watchdogs/probes only.
+    "VLLM_TPU_DECODE_PRIORITY",
+    "VLLM_TPU_STALL_WATCHDOG_S",
+    "VLLM_TPU_LOOP_LAG_WATCHDOG_S",
+    "VLLM_TPU_CPU_PIN_RESERVE",
+    "VLLM_TPU_CPU_PROBE_S",
+    "VLLM_TPU_GC_STATS_S",
+    "VLLM_TPU_GC_DISABLE_AFTER_S",
     # Scheduler prefix-cache block lifetime only.
     "VLLM_TPU_MAMBA_CHECKPOINT_RETENTION",
     "VLLM_TPU_MAMBA_DECODE_CHECKPOINT",
@@ -1024,13 +1034,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         # With peer replay off, nothing replays another rank's artifact, so
         # none records a fingerprint either: `load` replays a rank's own
         # artifact without one, and a peer with replay on refuses it.
+        rank_dep = graph_is_rank_dependent(graph)
         peer = None
         fingerprint = (
             _graph_fingerprint(graph)
-            if caching and envs.TPU_PRECOMPILE_PEER_REPLAY
+            if caching and (envs.TPU_PRECOMPILE_PEER_REPLAY or rank_dep)
             else None
         )
-        if fingerprint is not None:
+        if fingerprint is not None and envs.TPU_PRECOMPILE_PEER_REPLAY and not rank_dep:
             assert key is not None
             peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
         if peer is not None:
@@ -1133,10 +1144,22 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        compiled_fn = self._replay(path, graph, was_wrapped)
+        rank_dep = graph_is_rank_dependent(graph)
+        expected_fp = _graph_fingerprint(graph) if rank_dep else None
+        compiled_fn = (
+            None
+            if (rank_dep and expected_fp is None)
+            else self._replay(path, graph, was_wrapped, expected_fp)
+        )
         if compiled_fn is None:
             fingerprint = (
-                _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
+                expected_fp
+                if rank_dep
+                else (
+                    _graph_fingerprint(graph)
+                    if envs.TPU_PRECOMPILE_PEER_REPLAY
+                    else None
+                )
             )
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
