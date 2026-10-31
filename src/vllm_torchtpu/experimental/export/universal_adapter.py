@@ -255,6 +255,9 @@ def build_export_config_from_vllm(
         or 512
     )
     max_num_seqs = int(getattr(sched_cfg, "max_num_seqs", 64) or 64)
+    max_prefill_chunk_size = int(
+        getattr(sched_cfg, "max_num_batched_tokens", 4096) or 4096
+    )
     max_model_len = int(
         getattr(model_cfg, "max_model_len", None)
         or _extract_hf_field(hf_cfg, "max_position_embeddings", default=2048)
@@ -326,6 +329,7 @@ def build_export_config_from_vllm(
         emit_byte_tokenizer=False,
         hf_checkpoint_dir=str(resolved_hf_dir) if resolved_hf_dir else None,
         uses_mrope=uses_mrope,
+        max_prefill_chunk_size=max_prefill_chunk_size,
     )
 
 

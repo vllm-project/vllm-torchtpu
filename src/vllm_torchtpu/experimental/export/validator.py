@@ -403,6 +403,30 @@ def validate_exported_model_dir(output_dir: str) -> None:
                 _check_dtype(m_out, actual_out["dtype"], where)
 
     _check_mtp_draft(meta, functions)
+    _check_serving_config_buckets(meta, functions)
+
+
+def _check_serving_config_buckets(
+    meta: dict[str, Any], functions: dict[str, Any]
+) -> None:
+    """Checks that precomputed runtime buckets in `serving_config` match `functions`."""
+    serving = meta.get("serving_config")
+    if not isinstance(serving, dict):
+        return
+    if "token_buckets" in serving and "forward" in functions:
+        want_tokens = sorted(int(k) for k in functions["forward"])
+        if serving["token_buckets"] != want_tokens:
+            raise ValueError(
+                f"serving_config.token_buckets {serving['token_buckets']} differs "
+                f"from forward buckets {want_tokens}"
+            )
+    if "req_buckets" in serving and "compute_logits" in functions:
+        want_reqs = sorted(int(k) for k in functions["compute_logits"])
+        if serving["req_buckets"] != want_reqs:
+            raise ValueError(
+                f"serving_config.req_buckets {serving['req_buckets']} differs "
+                f"from compute_logits buckets {want_reqs}"
+            )
 
 
 def _check_mtp_draft(meta: dict[str, Any], functions: dict[str, Any]) -> None:

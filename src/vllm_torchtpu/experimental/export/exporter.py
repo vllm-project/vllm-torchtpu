@@ -436,14 +436,17 @@ def _extra_user_inputs(
     return list(extra_fn()) if callable(extra_fn) else []
 
 
-def _recurrent_serving_config(model: api.ExportableTextOnlyLLM) -> dict[str, int]:
-    """`num_state_slots` for a model with recurrent state, else nothing.
+def _recurrent_serving_config(model: api.ExportableTextOnlyLLM) -> dict[str, Any]:
+    """Recurrent state pool and slot layout for a model with recurrent state.
 
     The runtime tells a recurrent state pool (`[num_state_slots, ...]`) from a
-    paged KV pool (`[num_blocks, ...]`) by its leading dimension, so the two must
-    differ.
+    paged KV pool (`[num_blocks, ...]`) by `recurrent_pool_slots` (and leading
+    dimension), so `num_state_slots` and `num_blocks` must differ.
     """
-    if not any(n == "mamba_state_indices" for n, _ in _extra_user_inputs(model)):
+    recurrent_groups = sum(
+        1 for n, _ in _extra_user_inputs(model) if n == "mamba_state_indices"
+    )
+    if recurrent_groups == 0:
         return {}
     cfg = model.export_config
     if cfg.num_state_slots == cfg.num_blocks:
@@ -453,7 +456,18 @@ def _recurrent_serving_config(model: api.ExportableTextOnlyLLM) -> dict[str, int
             "so the runtime could not tell KV pools from recurrent state pools; pass "
             "another --num-blocks"
         )
-    return {"num_state_slots": cfg.num_state_slots}
+    recurrent_pool_slots = [
+        i
+        for i, spec in enumerate(_state_specs(model))
+        if int(spec.shape[0]) == cfg.num_state_slots
+    ]
+    return {
+        "num_state_slots": cfg.num_state_slots,
+        "recurrent_groups": recurrent_groups,
+        "recurrent_window": cfg.recurrent_window,
+        "state_slots_per_seq": recurrent_groups * cfg.recurrent_window,
+        "recurrent_pool_slots": recurrent_pool_slots,
+    }
 
 
 def _main_args_read(mlir_text: str) -> set[int]:
@@ -1002,12 +1016,34 @@ def _emit_model_companion_files(
             f"{cfg.hf_checkpoint_dir!r}; the serving artifact requires one"
         )
 
+    eos_token_ids: list[int] = (
+        [int(cfg.eos_token_id)]
+        if 0 < int(cfg.eos_token_id) < int(cfg.vocab_size)
+        else []
+    )
     if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
         src_gen = os.path.join(cfg.hf_checkpoint_dir, "generation_config.json")
         if os.path.isfile(src_gen):
             dst_gen = os.path.join(output_dir, "generation_config.json")
             shutil.copyfile(src_gen, dst_gen)
             serving_config["generation_config"] = {"path": "generation_config.json"}
+            with open(src_gen) as f:
+                raw_gen_eos = json.load(f).get("eos_token_id")
+            gen_list = (
+                raw_gen_eos
+                if isinstance(raw_gen_eos, list)
+                else [raw_gen_eos]
+                if raw_gen_eos is not None
+                else []
+            )
+            for tok in gen_list:
+                if (
+                    isinstance(tok, int)
+                    and not isinstance(tok, bool)
+                    and 0 <= tok < int(cfg.vocab_size)
+                    and tok not in eos_token_ids
+                ):
+                    eos_token_ids.append(tok)
 
         chat_template = _hf_chat_template(cfg.hf_checkpoint_dir)
         if chat_template is not None:
@@ -1015,6 +1051,7 @@ def _emit_model_companion_files(
                 f.write(chat_template)
             serving_config["chat_template"] = {"path": "chat_template.jinja"}
 
+    serving_config["eos_token_ids"] = eos_token_ids
     return serving_config
 
 
@@ -1128,9 +1165,10 @@ def export(
         mtp_own=frozenset(mtp_own),
     )
     functions_dict.update(llm_funcs)
-    # `serving_config` holds only what the runtime reads: the capacities the
-    # executables were exported with, then the companion files. Token buckets are
-    # the `functions.forward` variants and are not repeated here.
+    # `serving_config` holds the direct runtime parameters for the serving
+    # engine's subsystems (scheduler, KV cache, step pipeline) and companion
+    # files so the runtime does not need to reverse-engineer them from MLIR
+    # names or shapes.
     serving_config = {
         "vocab_size": cfg.vocab_size,
         "eos_token_id": cfg.eos_token_id,
@@ -1139,8 +1177,17 @@ def export(
         "max_cu_seqs": cfg.max_cu_seqs,
         "block_size": cfg.block_size,
         "num_blocks": cfg.num_blocks,
+        "pages_per_seq": cfg.pages_per_seq,
         **_recurrent_serving_config(model),
         "max_model_len": cfg.max_model_len,
+        "max_prefill_chunk_size": min(
+            cfg.max_prefill_chunk_size, max(cfg.token_buckets)
+        ),
+        "token_buckets": [int(b) for b in sorted(cfg.token_buckets)],
+        "req_buckets": [int(r) for r in sorted(cfg.req_buckets)],
+        "positions_sections": cfg.positions_sections,
+        "penalty_history_len": cfg.max_model_len,
+        "mtp_num_drafts": cfg.mtp_num_drafts,
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
         "data_parallel_size": dp_size,

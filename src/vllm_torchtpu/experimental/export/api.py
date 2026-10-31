@@ -104,6 +104,7 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     hf_checkpoint_dir: str | None = None
     uses_mrope: bool = False
     speculative_config: dict[str, Any] | None = None
+    max_prefill_chunk_size: int = 4096
 
     def __post_init__(self) -> None:
         if self.emit_byte_tokenizer and self.vocab_size > 256:
@@ -112,17 +113,32 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
             )
 
     @property
+    def pages_per_seq(self) -> int:
+        """Maximum KV blocks a single sequence can occupy."""
+        return max(1, (self.max_model_len + self.block_size - 1) // self.block_size)
+
+    @property
     def max_num_pages(self) -> int:
         """Size of the flattened block table: max_num_seqs * pages per sequence."""
-        pages_per_seq = max(
-            1, (self.max_model_len + self.block_size - 1) // self.block_size
-        )
-        return self.max_num_seqs * pages_per_seq
+        return self.max_num_seqs * self.pages_per_seq
 
     @property
     def max_cu_seqs(self) -> int:
         """Length of query_start_loc: one cumulative offset per sequence plus 1."""
         return self.max_num_seqs + 1
+
+    @property
+    def positions_sections(self) -> int:
+        """Leading dimension of `positions`: 3 for M-RoPE `[3, B]`, 0 for 1D `[B]`."""
+        return 3 if self.uses_mrope else 0
+
+    @property
+    def mtp_num_drafts(self) -> int:
+        """Draft tokens proposed per MTP step, or 0 when MTP is not declared."""
+        spec = self.speculative_config or {}
+        if spec.get("method") != "mtp":
+            return 0
+        return int(spec["num_speculative_tokens"])
 
     @property
     def recurrent_window(self) -> int:
