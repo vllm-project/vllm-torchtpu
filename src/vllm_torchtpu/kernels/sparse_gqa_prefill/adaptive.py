@@ -13,6 +13,8 @@
 # limitations under the License.
 """Bounded TC/SC prefill with request-local work accounting."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -37,6 +39,7 @@ from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import (
 )
 from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import (
     PREFILL_DISPATCH_CHUNK_QUERIES,
+    SC_GATHER_MAX_CACHE_BYTES,
     sc_chunk_size,
 )
 
@@ -880,6 +883,12 @@ def _has_supported_cache_and_index_metadata(
         or cache.shape[1] % 128
         or cache.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn)
         or cache.shape[0] * cache.shape[1] * cache.shape[2] > jnp.iinfo(jnp.int32).max
+        # The gather hands the whole pool to SparseCore as one parameter; the
+        # backend caps such tensors at SC_GATHER_MAX_CACHE_BYTES, so an
+        # oversized pool must fall back to the TC dispatch path instead of
+        # failing XLA compilation after load.
+        or math.prod(cache.shape) * jnp.dtype(cache.dtype).itemsize
+        > SC_GATHER_MAX_CACHE_BYTES
         or blocks.ndim != 2
         or blocks.shape[0] != len(query)
         or blocks.shape[1] <= 0

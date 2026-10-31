@@ -33,6 +33,9 @@ from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
 )
 from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import prefill_cost_model
 from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
+from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import (
+    SC_GATHER_MAX_CACHE_BYTES,
+)
 
 
 def _abstract_args(dtype=jnp.bfloat16):
@@ -84,16 +87,23 @@ def test_adaptive_envelope_preserves_existing_fallbacks(monkeypatch, fp8, case):
         "heads": (0, (8192, 12, 256)),
         "budget": (2, (8192, 256)),
         "packing": (5, (158, 1664, 1, 2, 256)),
-        "cache_size": (5, (20000, *args[5].shape[1:])),
         "context": (4, (8192, 159)),
     }
     if case in replacement:
         index, shape = replacement[case]
         args[index] = jax.ShapeDtypeStruct(shape, args[index].dtype)
+    if case == "cache_size":
+        page_shape = args[5].shape[1:]
+        page_bytes = math.prod(page_shape) * np.dtype(args[5].dtype).itemsize
+        pages = SC_GATHER_MAX_CACHE_BYTES // page_bytes + 1
+        args[5] = jax.ShapeDtypeStruct((pages, *page_shape), args[5].dtype)
     cache = args[5]
     rows_per_page = cache.shape[1] * cache.shape[2]
     if case == "cache_size":
-        assert cache.size * np.dtype(cache.dtype).itemsize > 16 * 1024**3
+        # Larger than SparseCore's per-tensor gather-source cap while
+        # addressable: XLA rejects such a gather parameter at compilation, so
+        # eligibility must route this pool to the TC dispatch path.
+        assert cache.size * np.dtype(cache.dtype).itemsize > SC_GATHER_MAX_CACHE_BYTES
         assert cache.shape[0] * rows_per_page < np.iinfo(np.int32).max
     if case == "address_overflow":
         pages = np.iinfo(np.int32).max // rows_per_page + 1
@@ -106,7 +116,7 @@ def test_adaptive_envelope_preserves_existing_fallbacks(monkeypatch, fp8, case):
     if case == "dynamic_scale":
         kwargs["k_scale"] = cast(float, jax.ShapeDtypeStruct((), jnp.float32))
     assert is_supported_by_adaptive_prefill(*args, **kwargs) == (
-        case in ("supported", "ragged", "page", "context", "budget", "cache_size")
+        case in ("supported", "ragged", "page", "context", "budget")
     )
 
 

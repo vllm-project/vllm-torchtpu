@@ -26,6 +26,14 @@ PREFILL_DISPATCH_CHUNK_QUERIES = 8192
 SC_CHUNK_SIZE = {jnp.dtype(jnp.bfloat16): 32, jnp.dtype(jnp.float8_e4m3fn): 64}
 SC_COMPACT_TARGET_BYTES = 144 * 1024**2
 
+# XLA rejects larger gather sources: "sparseCore only supports 16 GiB of HBM
+# per tensor" (a per-tensor gather-source limit, distinct from total device
+# HBM and from VMEM; the TPU capability interface does not expose it -- jax
+# SparseCoreInfo publishes only cores/lanes/VMEM/dma-granule). The interleaved
+# gather's cache argument is one whole-pool parameter, so pools beyond this
+# bound must stay on the TC dispatch path.
+SC_GATHER_MAX_CACHE_BYTES = 16 * 1024**3
+
 # Bound the word-axis batch used by the exact-union reduction.
 UNION_WORD_BATCH_SIZE = 16
 

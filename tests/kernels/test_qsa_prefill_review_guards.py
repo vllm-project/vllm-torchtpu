@@ -28,6 +28,9 @@ from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as tc
 from vllm_torchtpu.kernels.qwen4_exp import prefill_tiles
 from vllm_torchtpu.kernels.sparse_gqa_prefill import adaptive, grouped
 from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import tc_cost
+from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import (
+    SC_GATHER_MAX_CACHE_BYTES,
+)
 
 
 @pytest.fixture
@@ -538,14 +541,23 @@ def test_ragged_lower_bound_skips_only_resolved_sc_work(
     assert len(calls) == expected_fine_calls
 
 
-@pytest.mark.parametrize("pages,expected", [(200000, True), (2**24, False)])
-def test_sparse_gather_admission_uses_packed_row_address_range(
-    tpu_info, pages, expected
-):
+@pytest.mark.parametrize("case", ["at_capacity", "over_capacity", "address_overflow"])
+def test_sparse_gather_admission_uses_packed_row_address_range(tpu_info, case):
     shape = jax.ShapeDtypeStruct
     q = shape((8, 4, 256), jnp.bfloat16)
+    page_elements = 128 * 4 * 256
+    page_bytes = page_elements * jnp.dtype(jnp.float8_e4m3fn).itemsize
+    pages = SC_GATHER_MAX_CACHE_BYTES // page_bytes
+    if case == "over_capacity":
+        pages += 1
+    elif case == "address_overflow":
+        pages = jnp.iinfo(jnp.int32).max // 128 + 1
+    expected = case == "at_capacity"
     cache = shape((pages, 128, 1, 4, 256), jnp.float8_e4m3fn)
-    assert cache.size * cache.dtype.itemsize > 16 * 1024**3
+    # Admission also respects SparseCore's per-tensor gather-source cap,
+    # so the packed-row range is exercised with the largest in-cap pool.
+    if expected:
+        assert cache.size * cache.dtype.itemsize <= SC_GATHER_MAX_CACHE_BYTES
     assert (
         adaptive.is_supported_by_adaptive_prefill(
             q,
@@ -562,7 +574,7 @@ def test_sparse_gather_admission_uses_packed_row_address_range(
         )
         is expected
     )
-    if not expected:
+    if case == "address_overflow":
         with pytest.raises(ValueError, match="row indices must fit int32"):
             jax.eval_shape(
                 functools.partial(
