@@ -34,6 +34,9 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     WanSelfAttention,
 )
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
+from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+    Qwen3OmniMoeAudioEncoder,
+)
 
 from vllm_torchtpu.omni import patches, register_omni_tpu_platform
 from vllm_torchtpu.omni import rope as omni_rope
@@ -44,6 +47,7 @@ from vllm_torchtpu.omni.attention import (
     TpuSDPAImpl,
 )
 from vllm_torchtpu.omni.patches import (
+    _AUDIO_CHUNK_LENGTHS_PATCHED,
     _BWE_FILTER_CPU_RESTORE_PATCHED,
     _D2H_STREAM_PATCHED,
     _SDPA_FALLBACK_PATCHED,
@@ -53,6 +57,7 @@ from vllm_torchtpu.omni.patches import (
     _patch_diffusion_worker_d2h_stream,
     _patch_ltx2_split_rope,
     _patch_ltx2_vocoder_cpu_init,
+    _patch_qwen3_omni_audio_chunk_lengths,
     _patch_sdpa_fallback_dispatch,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
@@ -451,6 +456,48 @@ def test_omni_tpu_patches_configuration():
         apply_omni_tpu_patches.__wrapped__()
         assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
         assert torch.nn.functional.interpolate is orig
+
+
+def test_qwen3_omni_audio_chunk_lengths_patch(monkeypatch):
+    seen = {}
+
+    def _forward(self, input_features, feature_lens, aftercnn_lens):
+        seen["feature_lens_device"] = feature_lens.device.type
+        return input_features, feature_lens, aftercnn_lens
+
+    # Upstream forward runs the whole encoder. Both class attributes the patch
+    # rebinds are restored after the test.
+    monkeypatch.setattr(Qwen3OmniMoeAudioEncoder, "forward", _forward)
+    monkeypatch.setattr(
+        Qwen3OmniMoeAudioEncoder, "_get_cnn_output_lengths", lambda self, x: x
+    )
+
+    _patch_qwen3_omni_audio_chunk_lengths()
+    patched = Qwen3OmniMoeAudioEncoder.forward
+    assert patched is not _forward
+    assert getattr(patched, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
+
+    class TrackedTensor(torch.Tensor):
+        cpu_called: bool = False
+
+        def cpu(self, *args, **kwargs):
+            self.cpu_called = True
+            return super().cpu(*args, **kwargs)
+
+    enc = SimpleNamespace(conv2d1=SimpleNamespace(weight=torch.empty(0)))
+    lens = torch.tensor([800]).as_subclass(TrackedTensor)
+    _, out_lens, _ = patched(enc, torch.randn(128, 800), lens, torch.tensor([104]))
+    # chunk_num's ceil(feature_lens / window) runs on CPU, where it is exact.
+    assert lens.cpu_called is True
+    assert seen["feature_lens_device"] == "cpu"
+    assert out_lens.device.type == "cpu"
+    # ... and the CNN lengths come back on the encoder's device.
+    out = Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths(enc, torch.tensor([100]))
+    assert out.device == enc.conv2d1.weight.device
+    assert torch.equal(out, torch.tensor([100]))
+
+    _patch_qwen3_omni_audio_chunk_lengths()
+    assert Qwen3OmniMoeAudioEncoder.forward is patched
 
 
 def test_startup_warmup_device_sync(monkeypatch):

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU runtime patches for vLLM-Omni diffusion models.
+"""TPU runtime patches for vLLM-Omni diffusion and audio models.
 
 vLLM-Omni diffusion workers run in separate worker processes spawned by
 vLLM-Omni's DiffusionEngine rather than through TPUWorker's worker_init /
@@ -68,6 +68,67 @@ def apply_omni_tpu_patches() -> None:
 
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
+
+    # Runs here, not in apply_omni_model_specific_patches(): that hook fires on
+    # the diffusion attention-backend path only, while the audio encoder runs
+    # in the autoregressive thinker stage.
+    _patch_qwen3_omni_audio_chunk_lengths()
+
+
+_AUDIO_CHUNK_LENGTHS_PATCHED = "_tpu_audio_chunk_lengths_patched"
+
+
+def _patch_qwen3_omni_audio_chunk_lengths() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni computes chunk_num in
+    # Qwen3OmniMoeAudioEncoder.forward (qwen3_omni_moe_thinker.py) with integer
+    # ceil-division instead of torch.ceil(feature_lens / (n_window * 2)).
+    #
+    # Problem: on TPU, `feature_lens / 100` lowers to a float32 reciprocal
+    #   multiplication (800 * 0.01000000074505806 = 8.000001), so torch.ceil
+    #   rounds 800 / 100 up to 9 instead of 8 and split_with_sizes fails.
+    # Fix: hand `feature_lens` to the original forward on CPU, where the
+    #   division and torch.ceil use exact IEEE-754 math (8.0). Integer
+    #   ceil-division on TPU would need the whole forward re-implemented, as
+    #   the expression is inline upstream.
+    # Effect: `chunk_lengths` is built on CPU, so `_get_cnn_output_lengths`
+    #   returns to the encoder's device to keep the CNN padding mask on the
+    #   same device as the features.
+    # -------------------------------------------------------------------------
+    try:
+        from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+            Qwen3OmniMoeAudioEncoder,
+        )
+    except Exception as e:
+        logger.debug("Skipped Qwen3-Omni audio encoder patch: %s", e)
+        return
+
+    orig_audio_forward = Qwen3OmniMoeAudioEncoder.forward
+    if getattr(orig_audio_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False):
+        return
+    orig_get_cnn_output_lengths = Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths
+
+    def _safe_audio_forward(
+        self: Any,
+        input_features: torch.Tensor,
+        feature_lens: torch.Tensor,
+        aftercnn_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        return orig_audio_forward(
+            self, input_features, feature_lens.cpu(), aftercnn_lens
+        )
+
+    def _safe_get_cnn_output_lengths(
+        self: Any, input_lengths: torch.Tensor
+    ) -> torch.Tensor:
+        return orig_get_cnn_output_lengths(self, input_lengths).to(
+            self.conv2d1.weight.device
+        )
+
+    setattr(_safe_audio_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, True)
+    Qwen3OmniMoeAudioEncoder.forward = _safe_audio_forward
+    Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths = _safe_get_cnn_output_lengths
+    logger.info("Applied TPU patch: Qwen3-Omni audio encoder CPU chunk length math.")
 
 
 @run_once

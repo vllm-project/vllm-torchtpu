@@ -93,6 +93,10 @@ def _release_free_host_heap() -> None:
 
 
 class TPUWorker(WorkerBase):
+    # Runner class to build in init_device(); Omni workers override it with a
+    # runner that adds the stage-specific hooks.
+    model_runner_cls: type[TPUModelRunner] = TPUModelRunner
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -478,7 +482,7 @@ class TPUWorker(WorkerBase):
         # WorkerBase declares `nn.Module | None`; this worker always holds a
         # TPUModelRunner from here on.
         # pyrefly: ignore[bad-override-mutable-attribute]
-        self.model_runner: TPUModelRunner = TPUModelRunner(
+        self.model_runner: TPUModelRunner = self.model_runner_cls(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,

@@ -214,7 +214,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
-        return "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        return "vllm_torchtpu.omni.tpu_ar_worker.TPUARWorker"
 
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
