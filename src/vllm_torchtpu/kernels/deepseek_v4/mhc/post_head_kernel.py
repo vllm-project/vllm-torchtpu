@@ -32,6 +32,10 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 TOKEN_BLOCK = 64
 LANE_CHUNK = 256
 
+# Position of the optional final-RMSNorm weight among the kernel's refs,
+# counting the shared-expert slot.
+_NORM_REF_INDEX = 8
+
 
 def _post_head_kernel(
     x_ref,
@@ -42,6 +46,7 @@ def _post_head_kernel(
     fn_ref,
     sc_ref,
     hb_ref,
+    norm_w_ref,
     out_ref,
     *,
     hc_mult,
@@ -50,13 +55,15 @@ def _post_head_kernel(
     rms_eps,
     hc_eps,
     routed_scale,
+    norm_eps,
 ):
     """One token block: post recombine, then the head collapse in VMEM.
 
     Walks the hidden axis in lane chunks so each chunk's f32 values die
     before the next; only the bf16 streams stay resident between passes.
     With ``shared_ref``, the MoE output is formed first, as the seam kernel
-    forms it (``fused_post_pre_kernel``).
+    forms it (``fused_post_pre_kernel``). With ``norm_w_ref``, the collapsed
+    rows are written after the model's final RMSNorm.
     """
     m, h = hc_mult, hidden_size
     post = post_ref[...]  # (tb, m) f32
@@ -106,6 +113,9 @@ def _post_head_kernel(
         # Pairing and the 0.0 seed follow XLA's reduce over the stream axis.
         y = 0.0 + ((t[0] + t[2]) + (t[1] + t[3]))
         out_ref[:, cols] = y.astype(out_ref.dtype)
+    if norm_w_ref is not None:
+        # Re-read what was stored, as the unfused RMSNorm reads it.
+        out_ref[...] = utils.rms_norm_rows(out_ref[...], norm_w_ref[...], norm_eps)
 
 
 @functools.partial(
@@ -117,6 +127,7 @@ def _post_head_kernel(
         "token_block_size",
         "lane_chunk",
         "vmem_limit_bytes",
+        "norm_eps",
     ),
 )
 def mhc_post_head_2d(
@@ -135,6 +146,8 @@ def mhc_post_head_2d(
     token_block_size: int = TOKEN_BLOCK,
     lane_chunk: int = LANE_CHUNK,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float = 0.0,
 ) -> jax.Array:
     """Fused post + head collapse on the flat stream layout.
 
@@ -147,6 +160,9 @@ def mhc_post_head_2d(
         hc_scale: (1,) float32. hc_base: (hc_mult,) float32.
         shared: optional (num_tokens, hidden_size) float32 shared-expert
             output; x is then the routed sum before ``routed_scale``.
+        norm_weight: optional (hidden_size,) bfloat16 weight of the model's
+            final RMSNorm (epsilon ``norm_eps``); the rows are then returned
+            normalized, bit for bit that norm (``utils.rms_norm_rows``).
 
     Returns:
         (num_tokens, hidden_size) in ``res2d.dtype``.
@@ -177,6 +193,12 @@ def mhc_post_head_2d(
     fn_bf = hc_fn.astype(jnp.bfloat16)
     sc2d = hc_scale.reshape(1, 1).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult).astype(jnp.float32)
+    norm_inputs, norm_specs = [], []
+    if norm_weight is not None:
+        assert norm_weight.shape == (hidden_size,), norm_weight.shape
+        assert norm_weight.dtype == jnp.bfloat16, norm_weight.dtype
+        norm_inputs.append(norm_weight)
+        norm_specs.append(pl.BlockSpec((hidden_size,), lambda i: (0,)))
 
     kernel = functools.partial(
         _post_head_kernel,
@@ -186,7 +208,10 @@ def mhc_post_head_2d(
         rms_eps=rms_eps,
         hc_eps=hc_eps,
         routed_scale=routed_scale,
+        norm_eps=norm_eps,
     )
+    if norm_weight is None:
+        kernel = utils.without_ref(kernel, _NORM_REF_INDEX)
     if shared is None:
         kernel = utils.without_shared(kernel)
     out = pl.pallas_call(
@@ -200,6 +225,7 @@ def mhc_post_head_2d(
             pl.BlockSpec((hc_mult, hc_mult * hidden_size), lambda i: (0, 0)),
             pl.BlockSpec((1, 1), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult), lambda i: (0, 0)),
+            *norm_specs,
         ],
         out_specs=pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
         out_shape=jax.ShapeDtypeStruct((padded_tokens, hidden_size), res2d.dtype),
@@ -208,7 +234,7 @@ def mhc_post_head_2d(
             vmem_limit_bytes=vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-    )(*x_inputs, res2d, post2d, comb2d, fn_bf, sc2d, hb2d)
+    )(*x_inputs, res2d, post2d, comb2d, fn_bf, sc2d, hb2d, *norm_inputs)
 
     (out,) = utils.trim_to(num_tokens, out)
     return out
@@ -227,6 +253,8 @@ def mhc_post_head(
     *,
     shared: jax.Array | None = None,
     routed_scale: float = 1.0,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float = 0.0,
 ) -> jax.Array:
     """``mhc_post`` followed by ``mhc_collapse_head``, as one kernel.
 
@@ -234,7 +262,8 @@ def mhc_post_head(
         x: (..., hidden_size) bfloat16. residual: (..., hc_mult,
             hidden_size) bfloat16. post_layer_mix: (..., hc_mult, 1) and
             comb_res_mix: (..., hc_mult, hc_mult), float32.
-        shared, routed_scale: as in ``mhc_post_head_2d``.
+        shared, routed_scale, norm_weight, norm_eps: as in
+            ``mhc_post_head_2d``.
 
     Returns:
         (..., hidden_size) in ``residual.dtype``.
@@ -253,5 +282,7 @@ def mhc_post_head(
         hc_eps=hc_eps,
         shared=None if shared is None else shared.reshape(-1, hidden_size),
         routed_scale=routed_scale,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
     return out2d.reshape(*outer_shape, hidden_size)

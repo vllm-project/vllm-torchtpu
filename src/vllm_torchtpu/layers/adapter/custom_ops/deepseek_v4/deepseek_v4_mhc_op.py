@@ -142,11 +142,14 @@ def _mhc_post_head_jax(
     hc_fn: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
+    norm_weight: jax.Array,
     *,
     rms_eps: float,
     hc_eps: float,
+    norm_eps: float,
 ) -> jax.Array:
-    """The last layer's post and the hc head collapse as one kernel."""
+    """The last layer's post, the hc head collapse and the model's final
+    RMSNorm as one kernel."""
     return post_head_kernel.mhc_post_head(
         x,
         residual,
@@ -157,6 +160,8 @@ def _mhc_post_head_jax(
         hc_base,
         rms_eps,
         hc_eps,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
@@ -169,10 +174,12 @@ def _mhc_post_head_shared_jax(
     hc_fn: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
+    norm_weight: jax.Array,
     *,
     rms_eps: float,
     hc_eps: float,
     routed_scale: float,
+    norm_eps: float,
 ) -> jax.Array:
     """``_mhc_post_head_jax`` on an MoE output given as (routed, shared)."""
     return post_head_kernel.mhc_post_head(
@@ -187,6 +194,8 @@ def _mhc_post_head_shared_jax(
         hc_eps,
         shared=shared,
         routed_scale=routed_scale,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
@@ -439,20 +448,23 @@ def get_mhc_post_op():
     return op
 
 
-def get_mhc_post_head_op(rms_eps: float, hc_eps: float):
-    """``post`` fused with the model's hc head collapse.
+def get_mhc_post_head_op(rms_eps: float, hc_eps: float, norm_eps: float):
+    """``post`` fused with the model's hc head collapse and final RMSNorm
+    (epsilon ``norm_eps``, weight passed after hc_base).
 
     Same outside-the-trace requirement as ``get_mhc_ops``.
     """
     op_name = (
-        "pallas::deepseek_v4_mhc_post_head_v1"
-        f"_r{_name_float(rms_eps)}_e{_name_float(hc_eps)}"
+        "pallas::deepseek_v4_mhc_post_head_norm_v1"
+        f"_r{_name_float(rms_eps)}_e{_name_float(hc_eps)}_n{_name_float(norm_eps)}"
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
         op = pallas.jax_op(
             op_name,
-            functools.partial(_mhc_post_head_jax, rms_eps=rms_eps, hc_eps=hc_eps),
+            functools.partial(
+                _mhc_post_head_jax, rms_eps=rms_eps, hc_eps=hc_eps, norm_eps=norm_eps
+            ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None),  # x
@@ -462,6 +474,7 @@ def get_mhc_post_head_op(rms_eps: float, hc_eps: float):
                 P(),  # hc_fn
                 P(),  # hc_scale
                 P(),  # hc_base
+                P(),  # norm_weight
             ),
         )
         op.register_fake(_fake_mhc_post_head)
@@ -469,15 +482,17 @@ def get_mhc_post_head_op(rms_eps: float, hc_eps: float):
     return op
 
 
-def get_mhc_post_head_shared_op(rms_eps: float, hc_eps: float, routed_scale: float):
+def get_mhc_post_head_shared_op(
+    rms_eps: float, hc_eps: float, routed_scale: float, norm_eps: float
+):
     """``get_mhc_post_head_op`` taking the MoE output as (routed, shared).
 
     Same outside-the-trace requirement as ``get_mhc_ops``.
     """
     op_name = (
-        "pallas::deepseek_v4_mhc_post_head_shared_v1"
+        "pallas::deepseek_v4_mhc_post_head_shared_norm_v1"
         f"_r{_name_float(rms_eps)}_e{_name_float(hc_eps)}"
-        f"_rs{_name_float(routed_scale)}"
+        f"_rs{_name_float(routed_scale)}_n{_name_float(norm_eps)}"
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
@@ -488,6 +503,7 @@ def get_mhc_post_head_shared_op(rms_eps: float, hc_eps: float, routed_scale: flo
                 rms_eps=rms_eps,
                 hc_eps=hc_eps,
                 routed_scale=routed_scale,
+                norm_eps=norm_eps,
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
@@ -499,6 +515,7 @@ def get_mhc_post_head_shared_op(rms_eps: float, hc_eps: float, routed_scale: flo
                 P(),  # hc_fn
                 P(),  # hc_scale
                 P(),  # hc_base
+                P(),  # norm_weight
             ),
         )
         op.register_fake(_fake_mhc_post_head_shared)
