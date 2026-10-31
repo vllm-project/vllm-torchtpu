@@ -1051,13 +1051,16 @@ TOKEN_ROW_WAIT = 8
 class TokenRows:
     """Where gmm_v2_fused_mlp reads lhs rows past its head buffer.
 
-    Row r >= head_rows of the batch is row ``row_ids_ref[r]`` of the token
-    rows. bf16 rows sit in 32-bit words in pairs (row 2w in the low half of
-    word row w), so a token row arrives as the word row holding it, in
-    ``stage_ref``, and its half is picked out into the tile's lhs buffer.
+    Row r >= head_rows of the batch is row ids[r] of the token rows. bf16
+    rows sit in 32-bit words in pairs (row 2w in the low half of word row w),
+    so a token row arrives as the word row holding it, in ``stage_ref``, and
+    its half is picked out into the tile's lhs buffer.
     """
 
-    row_ids_ref: jax.Array  # int32[size_m], SMEM
+    word_ids_ref: jax.Array  # int32[size_m], SMEM: ids[r] // 2
+    # int32[size_m // sublane], SMEM: bit j of block b is ids[b * sublane + j]
+    # % 2, the half of its word row that row holds.
+    halves_ref: jax.Array
     head_ref: jax.Array  # [head_rows // sublane, sublane, size_k], HBM
     words_ref: jax.Array  # uint32[num_tokens // 2, size_k], HBM
     lhs_bufs: jax.Array  # [2, tile_m // sublane, sublane, size_k], VMEM
@@ -1111,7 +1114,7 @@ class TokenRows:
                 row0 = m_offset + b * self.sublane
                 rows_left = m_end - row0
                 for u in range(self.sublane):
-                    word = lax.shift_right_logical(self.row_ids_ref[row0 + u], 1)
+                    word = self.word_ids_ref[row0 + u]
 
                     @pl.when(u < rows_left)
                     def _(b=b, u=u, word=word):
@@ -1158,20 +1161,15 @@ class TokenRows:
         pairs = self.sublane // 2
         num_lanes = pltpu.get_tpu_info().num_lanes
         size_k = lhs_words.shape[-1]
-        word_row = lax.broadcasted_iota(jnp.int32, (pairs, num_lanes), 0)
+        # Sublane w of a block's even (odd) stage words holds row 2w (2w + 1).
+        even_bit = 2 * lax.broadcasted_iota(jnp.uint32, (pairs, num_lanes), 0)
+        first_tile_block = m_offset // self.sublane
 
         def block(b, carry):
-            row0 = m_offset + b * self.sublane
-
-            def shifts(parity: int) -> jax.Array:
-                shift = jnp.zeros((pairs, num_lanes), jnp.uint32)
-                for w in range(pairs):
-                    token = self.row_ids_ref[row0 + 2 * w + parity]
-                    half = (token % 2).astype(jnp.uint32) * 16
-                    shift = jnp.where(word_row == w, half, shift)
-                return shift
-
-            even_shift, odd_shift = shifts(0), shifts(1)
+            halves = self.halves_ref[first_tile_block + b].astype(jnp.uint32)
+            halves = jnp.full((pairs, num_lanes), halves, jnp.uint32)
+            even_shift = ((halves >> even_bit) & 1) << 4
+            odd_shift = ((halves >> (even_bit + 1)) & 1) << 4
             for c in range(0, size_k, num_lanes):
                 cols = pl.ds(c, num_lanes)
                 even = self.stage_ref[0, b, :, cols] >> even_shift
@@ -1241,7 +1239,7 @@ def fused_mlp_kernel_main(
     weights together. Rows outside every group are left unwritten, as gmm_v2
     leaves them with zero_initialize=False.
 
-    ``refs`` are, in order: the token row ids int32[size_m] (scalar prefetch,
+    ``refs`` are, in order: TokenRows' word ids and halves (scalar prefetch,
     with token_rows); lhs [size_m, size_k], or its first rows with
     token_rows; the token rows [num_tokens, size_k] (with token_rows);
     gate/up WeightsRef [size_group, size_k, 2 * size_inter] and down
@@ -1251,7 +1249,7 @@ def fused_mlp_kernel_main(
     buffers, the stage and two DMA semaphores of TokenRows.
     """
     if token_rows:
-        row_ids_ref, lhs_ref, words_ref, *refs = refs
+        word_ids_ref, halves_ref, lhs_ref, words_ref, *refs = refs
     else:
         lhs_ref, *refs = refs
     rhs1_ref, rhs2_ref, out_ref, partial_out_ref, inter_ref, metadata_ref, *refs = refs
@@ -1284,7 +1282,8 @@ def fused_mlp_kernel_main(
 
     lhs_bufs, stage_ref, sems = refs
     rows = TokenRows(
-        row_ids_ref=row_ids_ref,
+        word_ids_ref=word_ids_ref,
+        halves_ref=halves_ref,
         head_ref=lhs_in,
         words_ref=words_ref.bitcast(jnp.uint32),
         lhs_bufs=lhs_bufs,
@@ -2178,7 +2177,11 @@ def gmm_v2_fused_mlp(
     in_specs = [pl.BlockSpec(memory_space=pltpu.HBM), rhs1_specs, rhs2_specs]
     if token_rows is not None:
         sublane = dims.size_lhs_sublane
-        scalars.append(token_row_ids.astype(jnp.int32))
+        row_ids = token_row_ids.astype(jnp.int32)
+        bits = jnp.arange(sublane, dtype=jnp.int32)
+        halves = jnp.sum((row_ids.reshape(-1, sublane) & 1) << bits, axis=1)
+        # TokenRows.word_ids_ref and TokenRows.halves_ref
+        scalars += [lax.shift_right_logical(row_ids, 1), halves]
         inputs.insert(1, token_rows)
         in_specs.insert(1, pl.BlockSpec(memory_space=pltpu.HBM))
         scratch_shapes += [
