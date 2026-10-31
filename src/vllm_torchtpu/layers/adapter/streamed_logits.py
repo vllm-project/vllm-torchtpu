@@ -53,10 +53,14 @@ def _fake_streamed_logits_shard(
 _shard_op = pallas.jax_op("pallas::streamed_logits_shard", streamed_logits_shard)
 _shard_op.register_fake(_fake_streamed_logits_shard)
 
-# Set by `prepare_vocab_shard`: the group the head's vocab is split over, and
-# this rank's first vocab block as int32 [1] device data.
+# Set by `prepare_vocab_shard`: the group the head's vocab is split over, this
+# rank's index in it as [1] device data in the hidden dtype, and the first
+# vocab block of the shard at each collective position as int32 [world].
 _SHARD_GROUP: Any = None
-_SHARD_FIRST_BLOCK: torch.Tensor | None = None
+_SHARD_RANK: torch.Tensor | None = None
+_SHARD_FIRST_BLOCKS: torch.Tensor | None = None
+# Lane-aligned width of the rank tag appended to each rank's gathered rows.
+_RANK_TAG_COLS = 128
 
 
 def _is_plain_head(processor: LogitsProcessor, head: VocabParallelEmbedding) -> bool:
@@ -106,16 +110,18 @@ def prepare_vocab_shard(
     """Arm `compute_logits_vocab_sharded` over ``group`` (a vLLM group
     coordinator whose ranks all hold the same head); returns whether it is
     armed. Call once after the weights load, outside any trace."""
-    global _SHARD_GROUP, _SHARD_FIRST_BLOCK
+    global _SHARD_GROUP, _SHARD_RANK, _SHARD_FIRST_BLOCKS
     if not _is_plain_head(processor, head):
         return False
     _, per_shard, first = vocab_shard_layout(head.weight.shape[0], group.world_size)
     if per_shard == 0:
         return False
+    device = head.weight.device
     _SHARD_GROUP = group
-    _SHARD_FIRST_BLOCK = torch.tensor(
-        [first[group.rank_in_group]], dtype=torch.int32, device=head.weight.device
+    _SHARD_RANK = torch.tensor(
+        [group.rank_in_group], dtype=head.weight.dtype, device=device
     )
+    _SHARD_FIRST_BLOCKS = torch.tensor(first, dtype=torch.int32, device=device)
     return True
 
 
@@ -130,13 +136,22 @@ def compute_logits_vocab_sharded(
     shard. Every logit is the same full-hidden f32-accumulated dot as
     `compute_logits`, so the result is identical.
     """
-    assert _SHARD_GROUP is not None and _SHARD_FIRST_BLOCK is not None
+    assert _SHARD_GROUP is not None and _SHARD_RANK is not None
+    assert _SHARD_FIRST_BLOCKS is not None
     world = _SHARD_GROUP.world_size
-    rows = hidden.shape[0]
-    gathered = _SHARD_GROUP.all_gather(hidden, dim=0)
-    part = _shard_op(gathered, head.weight, _SHARD_FIRST_BLOCK, world)
-    # Block d of the leading axis (rank d's rows) goes to rank d; block r of
-    # the result is shard r's logits for this rank's rows.
+    rows, hidden_size = hidden.shape
+    # The collectives place ranks in device order, which need not be rank
+    # order, so each rank finds its position from the gathered rank tags and
+    # streams that position's shard.
+    tag = _SHARD_RANK.to(hidden.dtype).expand(rows, _RANK_TAG_COLS)
+    gathered = _SHARD_GROUP.all_gather(torch.cat([hidden, tag], dim=1), dim=0)
+    ranks = gathered[:, hidden_size].view(world, rows)[:, 0]
+    position = (ranks == _SHARD_RANK).float().argmax().view(1)
+    first_block = torch.index_select(_SHARD_FIRST_BLOCKS, 0, position)
+    x = gathered[:, :hidden_size].contiguous()
+    part = _shard_op(x, head.weight, first_block, world)
+    # Block p of the leading axis (position p's rows) goes to position p;
+    # block p of the result is position p's shard for this rank's rows.
     received = funcol.all_to_all_single(part, None, None, _SHARD_GROUP.device_group)
     if isinstance(received, funcol.AsyncCollectiveTensor):
         received = funcol.wait_tensor(received)
