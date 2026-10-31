@@ -95,8 +95,15 @@ def _parse_int(raw: str, key: str) -> int | None:
     return None
 
 
-def _real_traffic(kw: dict) -> bool:
-    """A served step rather than a warmup dummy: some request has more than 64 tokens of context."""
+def _real_traffic(kw: dict, runner: Any = None, n_req: int | None = None) -> bool:
+    """A served step rather than a warmup dummy: some request has more than 64 tokens of context.
+
+    Reads the runner's host-side computed-token counts when it has them: `context_lens`
+    is a device tensor, and `int(ctx.max())` on it is a device program plus a host sync
+    on every megakernel step (~0.65 ms idle per step in serving, j-3f588cde)."""
+    host = getattr(getattr(runner, "input_batch", None), "num_computed_tokens_cpu", None)
+    if host is not None and n_req:
+        return int(host[:n_req].max()) > 64
     ctx = kw.get("context_lens")
     if not isinstance(ctx, torch.Tensor) or ctx.numel() == 0:
         return True
@@ -1767,7 +1774,7 @@ class Qwen38SegmentDriver:
         # Read-only below: no per-step copy.
         kw = model_kwargs if model_kwargs is not None else {}
         if self.segx_left > 0 or getattr(self, "segx_done", False):
-            if self.segx_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw):
+            if self.segx_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw, runner, n_req):
                 self.segx_left -= 1
                 self.segx_done = True
                 try:
@@ -1777,7 +1784,7 @@ class Qwen38SegmentDriver:
                     self.segx_left = 0
             return False, None
         if self.h0check_left > 0 or getattr(self, "h0check_done", False):
-            warm, real = bool(getattr(runner, "warmup_done", False)), _real_traffic(kw)
+            warm, real = bool(getattr(runner, "warmup_done", False)), _real_traffic(kw, runner, n_req)
             want = not getattr(self, "h0rows", 0) or rows == self.h0rows
             seen = self.__dict__.setdefault("_h0_gate_seen", set())
             if self.h0check_left > 0 and (rows, warm, real) not in seen:
@@ -1801,7 +1808,7 @@ class Qwen38SegmentDriver:
         if first_warm:
             self._tp_barrier("before the first (compiling) call")
         try:
-            check_real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw)
+            check_real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw, runner, n_req)
             if (
                 self.check_left > 0
                 and self.shadow is not None
@@ -1818,10 +1825,10 @@ class Qwen38SegmentDriver:
                 and self._whole_eligible(runner, n_req, rows)
                 and (
                     rows not in self.wholecheck_warm
-                    or (getattr(runner, "warmup_done", False) and _real_traffic(kw))
+                    or (getattr(runner, "warmup_done", False) and _real_traffic(kw, runner, n_req))
                 )
             ):
-                real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw)
+                real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw, runner, n_req)
                 self.wholecheck_warm.add(rows)
                 self._note(f"wholecheck_b{rows}" if real else f"wholecheck_warm_b{rows}")
                 out = self._whole_shadow_step(runner, input_ids, positions, kw, rows, real, n_req)
