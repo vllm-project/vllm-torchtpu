@@ -50,8 +50,8 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import grouped_shared_expert
 from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
-from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -61,6 +61,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 AX = "d"
 H, INTER, E, K = 6144, 2048, 256, 8
 ROUTED_SCALE = 2.5
+SHARED_GROUP = 4  # as moe_prefill_sp.SHARED_GROUP
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
 
@@ -139,6 +140,24 @@ def make_weights(mesh, ep, key):
         return w13_tp, s13_tp, w2s.reshape(ep, tp_i, H), s2s
 
     shared_tp = jax.jit(tp_shards, out_shardings=(shd,) * 4)(w13s, s13s, w2s, s2s)
+
+    def group_shards(w13s, s13s, w2s, s2s):
+        # Rank r holds member r % SHARED_GROUP's channels (moe_prefill_sp.member_slice).
+        c, per = INTER // SHARED_GROUP, ep // SHARED_GROUP
+        parts = []
+        for m in (r % SHARED_GROUP for r in range(ep)):
+            cols = jnp.r_[m * c : (m + 1) * c, INTER + m * c : INTER + (m + 1) * c]
+            parts.append(
+                (
+                    w13s[:, cols],
+                    s13s[cols],
+                    w2s[m * c : (m + 1) * c],
+                    s2s[m * per : (m + 1) * per],
+                )
+            )
+        return tuple(jnp.concatenate(p) for p in zip(*parts))
+
+    shared_group = jax.jit(group_shards, out_shardings=(shd,) * 4)(w13s, s13s, w2s, s2s)
     return dict(
         w13=w13,
         w2=w2,
@@ -148,6 +167,7 @@ def make_weights(mesh, ep, key):
         bias=bias,
         shared_rep=(w13s, s13s, w2s, s2s.reshape(1, ep, 1, H)),
         shared_tp=shared_tp,
+        shared_group=shared_group,
     )
 
 
@@ -198,23 +218,13 @@ def today_fn(mesh, ep):
 def split_fn(mesh, ep, *, wire, sharded_plan):
     """The split: own rows in, own rows out (x, logits sharded on rows)."""
 
-    def shared_local(x, w13s, s13s, w2s, s2s):
-        act = _silu_mul(xla_quantized_matmul(x, w13s, s13s))
-        return gmm_v2(
-            lhs=act,
-            rhs=w2s[None],
-            group_sizes=jnp.array([act.shape[0]], jnp.int32),
-            rhs_scale=s2s,
-            group_offset=jnp.array([0], jnp.int32),
-            preferred_element_type=act.dtype,
-            maybe_quantize_lhs=True,
-            zero_initialize=True,
-        )
-
+    groups = tuple(
+        tuple(range(g, g + SHARED_GROUP)) for g in range(0, ep, SHARED_GROUP)
+    )
     shared = jax.shard_map(
-        shared_local,
+        lambda *a: grouped_shared_expert(*a, axis=AX, groups=groups),
         mesh=mesh,
-        in_specs=(P(AX),) + (P(),) * 4,
+        in_specs=(P(AX),) * 5,
         out_specs=P(AX),
         check_vma=False,
     )
@@ -240,7 +250,7 @@ def split_fn(mesh, ep, *, wire, sharded_plan):
             routed_scaling_factor=1.0,
             **kw,
         )
-        return shared(x, *w["shared_rep"]) + routed * ROUTED_SCALE
+        return shared(x, *w["shared_group"]) + routed * ROUTED_SCALE
 
     return fn
 
