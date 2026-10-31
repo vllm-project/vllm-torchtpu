@@ -792,6 +792,15 @@ class TpuPlatform(Platform):
                 "nothing. Unset it; the fused expert-parallel MoE kernel is "
                 "USE_MOE_FUSED_EP_KERNEL=1."
             )
+        additional_config = getattr(vllm_config, "additional_config", None)
+        if isinstance(additional_config, dict):
+            additional_tp_mode = additional_config.get(
+                "mm-encoder-tp-mode"
+            ) or additional_config.get("mm_encoder_tp_mode")
+            if additional_tp_mode and vllm_config.model_config is not None:
+                mm_config = getattr(vllm_config.model_config, "multimodal_config", None)
+                if mm_config is not None:
+                    mm_config.mm_encoder_tp_mode = additional_tp_mode
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
