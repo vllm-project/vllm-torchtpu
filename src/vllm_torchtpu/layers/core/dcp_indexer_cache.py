@@ -29,6 +29,7 @@ def scatter_indexer_k_rows(
     *,
     cp_size: int,
     interleave_size: int,
+    num_seqs: jax.Array | int | None = None,
 ) -> jax.Array:
     """Write the indexer K rows this DCP rank owns (inside a DCP `shard_map`)."""
     _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
@@ -48,7 +49,9 @@ def scatter_indexer_k_rows(
 
     # Same notion of "where does this row belong" as the latent-cache
     # writers, so the two cannot drift apart.
-    _, seq_id, pos, in_batch = _row_positions(k_packed.shape[0], seq_lens, cu_q_lens)
+    _, seq_id, pos, in_batch = _row_positions(
+        k_packed.shape[0], seq_lens, cu_q_lens, num_seqs=num_seqs
+    )
 
     virtual_page_size = jnp.int32(page_size * cp_size)
     cycle = jnp.int32(cp_size * interleave_size)
