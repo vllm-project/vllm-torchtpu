@@ -133,6 +133,12 @@ def test_dispatch_and_combine_with_sequence_parallel(
         ep_group.reduce_scatter.assert_called_once_with(tensors[0], dim=0)
         assert result is ep_group.reduce_scatter.return_value
         ep_group.all_gather.assert_not_called()
+    elif method == "dispatch_router_logits":
+        assert len(result) == 2
+        for actual, expected in zip(result, tensors):
+            torch.testing.assert_close(actual, torch.cat([expected, expected + 10]))
+        assert ep_group.all_gather.call_count == 1
+        ep_group.reduce_scatter.assert_not_called()
     else:
         assert len(result) == count
         for actual, expected, invocation in zip(
