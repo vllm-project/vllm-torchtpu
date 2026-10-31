@@ -368,6 +368,40 @@ def _selection_bitset_chunk(blocks, lengths, *, ratio, groups, words):
     return packed
 
 
+def _metadata_prefix_pages(
+    tokens: int,
+    selected_groups: int,
+    ratio: int,
+    page_size: int,
+    full_pages: int,
+    kv_tile: int,
+) -> int:
+    if min(tokens, selected_groups, ratio, page_size, full_pages, kv_tile) <= 0:
+        return full_pages
+    if kv_tile % (ratio * 32):
+        return full_pages
+    pages = min(
+        full_pages, (max(tokens, selected_groups * ratio) + page_size - 1) // page_size
+    )
+    safe_tokens = pages * page_size // kv_tile * kv_tile
+    if safe_tokens < ratio or safe_tokens > jnp.iinfo(jnp.int32).max:
+        return full_pages
+    return pages
+
+
+def _metadata_prefix_fits(
+    blocks: jax.Array,
+    lengths: jax.Array,
+    *,
+    ratio: int,
+    full_groups: int,
+    prefix_groups: int,
+) -> jax.Array:
+    return jnp.all(
+        (blocks < 0) | (blocks >= full_groups) | (blocks < prefix_groups)
+    ) & jnp.all((lengths >= 0) & (lengths <= prefix_groups * ratio))
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -395,20 +429,43 @@ def block_sparse_gqa_prefill(
     v_scale: float = 1.0,
     bf16_io: bool = False,
 ):
-    return _prefill(
-        query,
-        blocks,
-        lengths,
-        page_table,
-        cache,
+    def run(table):
+        return _prefill(
+            query,
+            blocks,
+            lengths,
+            table,
+            cache,
+            None,
+            ratio=ratio,
+            kv_heads=kv_heads,
+            query_block=query_block,
+            kv_tile=kv_tile,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            bf16_io=bf16_io,
+        )
+
+    full_pages = page_table.shape[1]
+    page_size = cache.shape[1]
+    prefix_pages = _metadata_prefix_pages(
+        len(query), blocks.shape[1], ratio, page_size, full_pages, kv_tile
+    )
+    if prefix_pages >= full_pages:
+        return run(page_table)
+    # A visited KV tile is DMAed in full, including its masked token rows.
+    prefix_groups = prefix_pages * page_size // kv_tile * kv_tile // ratio
+    return lax.cond(
+        _metadata_prefix_fits(
+            blocks,
+            lengths,
+            ratio=ratio,
+            full_groups=full_pages * page_size // ratio,
+            prefix_groups=prefix_groups,
+        ),
+        lambda _: run(page_table[:, :prefix_pages]),
+        lambda _: run(page_table),
         None,
-        ratio=ratio,
-        kv_heads=kv_heads,
-        query_block=query_block,
-        kv_tile=kv_tile,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        bf16_io=bf16_io,
     )
 
 
