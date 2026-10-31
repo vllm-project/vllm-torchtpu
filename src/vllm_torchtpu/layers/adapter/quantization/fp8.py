@@ -357,10 +357,11 @@ def _process_fp8_linear_weights(
         )
         layer.weight_dcp = fresh_buffer(w.transpose(0, 1))  # canonical (k, n)
         layer.weight_scale_dcp = fresh_buffer(s.reshape(-1))
-    if requant_block_size is not None and weight_f.shape[-1] < requant_block_size:
-        # Sub-block TP partition along the contracting dimension (e.g. RowParallel
-        # down_proj with input_size_per_partition=64 < 128 at TP=16) has a single
-        # sub-block per output channel; fall back to per-channel XLA matmul.
+    if requant_block_size is not None and weight_f.shape[-1] % requant_block_size:
+        # A TP partition of the contracting dimension that is not a whole number
+        # of blocks falls back to per-channel XLA matmul: sub-block (RowParallel
+        # down_proj with input_size_per_partition=64 < 128 at TP=16) or
+        # off-multiple (GLM-5.2's dense down_proj, 12288 / TP16 = 768 at 512).
         requant_block_size = None
         blockwise_kernel = False
     weight, weight_scale = quantize_tensor(
@@ -1651,7 +1652,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             if (
                 requant_block_size is not None
                 and isinstance(layer.weight, torch.Tensor)
-                and layer.weight.shape[-1] < requant_block_size
+                and layer.weight.shape[-1] % requant_block_size
             ):
                 requant_block_size = None
                 blockwise_kernel = False
