@@ -31,7 +31,9 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+import os
+
+from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import F32, REC
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_STATS
@@ -137,9 +139,11 @@ def build_wholestep_call(
 ) -> tuple[Any, tuple, tuple, tuple]:
     R = mesh.size
     T = T_VERIFY
+    # VLLM_TPU_MK_SCOPES=N: per-phase named scopes in the kernel (profiling only).
+    scopes = int(os.environ.get("VLLM_TPU_MK_SCOPES", "0") or 0)
     ex = ExecSpec(
         R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, max_groups) if tiles is None else tiles,
-        interpret=interpret,
+        interpret=interpret, debug=DebugOptions(scopes=scopes),
     )
     n_att = L // g.att_every
     n_gdn = L - n_att
