@@ -3122,12 +3122,152 @@ def _kda_chunk_core(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, inv
     return out, new_state, aux
 
 
+_LOG2E = 1.4426950408889634
+
+
+def _kda_chunk_fast(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, block=8):
+    """Inference fast path for one 64-token KDA chunk inside Pallas VMEM.
+
+    Matches ``mega_kda``'s validated Kimi-K3 BF16/DEFAULT-precision formulation:
+    - Sub-block (16-row) ``both`` matmuls run at ``Precision.DEFAULT`` over only
+      the causal ``j_end = (i + 1) * sub_block`` prefix columns without
+      transposing ``k_scaled``.
+    - Two-level (8x8 block) Neumann solve applies ``(I + G)^{-1} P`` directly
+      to ``rhs`` without materializing ``solve = (I + G)^{-1} P``, fusing the
+      doubling steps and ``P @ [F, rhs]``.
+    - Inter-chunk state read/update matmuls fuse ``[w, q_scaled] @ state`` and
+      ``[aqk, kg^T] @ v_new``.
+    """
+    head_count, chunk_size, _ = q.shape
+    value_channels = v.shape[-1]
+    if chunk_size % sub_block or chunk_size % block:
+        raise ValueError("chunk size must be a multiple of sub_block and block")
+    nc = chunk_size // sub_block
+    nc_inv = chunk_size // block
+    gc = _inclusive_cumsum_rows(gate) * _LOG2E  # [H, C, K] in log2 base
+    beta_k = beta[..., None].astype(jnp.float32)
+
+    row_iota = jax.lax.broadcasted_iota(jnp.int32, (sub_block, chunk_size), 0)
+    col_iota = jax.lax.broadcasted_iota(jnp.int32, (sub_block, chunk_size), 1)
+    aqk_parts = []
+    low_parts = []
+    k_eng_prefix = None
+    prev_anchor = None
+    for i in range(nc):
+        i_s = i * sub_block
+        j_end = i_s + sub_block
+        q_i = q[:, i_s:j_end]
+        k_i = k[:, i_s:j_end]
+        g_i = gc[:, i_s:j_end]
+        anchor = g_i[:, sub_block // 2 : sub_block // 2 + 1, :]  # [H, 1, K]
+        diff_i = g_i - anchor
+        row_scale = jnp.exp2(diff_i)
+        k_eng_cur = k_i * jnp.exp2(-diff_i)
+        if i == 0:
+            k_eng_prefix = k_eng_cur
+        else:
+            k_eng_prefix = jnp.concatenate(
+                (k_eng_prefix * jnp.exp2(anchor - prev_anchor), k_eng_cur),
+                axis=1,
+            )
+        prev_anchor = anchor
+        both_valid = jax.lax.dot_general(
+            jnp.concatenate((q_i * row_scale, k_i * row_scale), axis=1),
+            k_eng_prefix,
+            (((2,), (2,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.DEFAULT,
+        )
+        if j_end < chunk_size:
+            both = jnp.concatenate(
+                (
+                    both_valid,
+                    jnp.zeros(
+                        (head_count, 2 * sub_block, chunk_size - j_end),
+                        dtype=jnp.float32,
+                    ),
+                ),
+                axis=2,
+            )
+        else:
+            both = both_valid
+        in_diag = (col_iota >= i_s) & (col_iota < j_end)
+        cl = col_iota - i_s
+        causal_sub = ((~in_diag) | (row_iota >= cl))[None]
+        strict_sub = ((~in_diag) | (row_iota > cl))[None]
+        aqk_parts.append(_mask_where(causal_sub, both[:, :sub_block], jnp.float32(0)))
+        low_parts.append(
+            _mask_where(
+                strict_sub,
+                both[:, sub_block:] * beta_k[:, i_s:j_end],
+                jnp.float32(0),
+            )
+        )
+    aqk = jnp.concatenate(aqk_parts, axis=1)
+    low = jnp.concatenate(low_parts, axis=1)
+
+    eye = jnp.eye(chunk_size, dtype=jnp.float32)[None]
+    idx = jnp.arange(chunk_size, dtype=jnp.int32)
+    same_block = (idx[:, None] // block == idx[None, :] // block).astype(jnp.float32)
+    l_diag = low * same_block[None]
+    f = low - l_diag
+
+    neg_ld = -l_diag
+    p = eye + neg_ld
+    mk = neg_ld
+    diag_steps = block.bit_length() - 2  # block=8 -> 2 doublings
+    if diag_steps > 0:
+        mk = _dot3(mk, mk)
+        for _ in range(diag_steps - 1):
+            merged = _dot3(jnp.concatenate((p, mk), axis=1), mk)
+            p = p + merged[:, :chunk_size]
+            mk = merged[:, chunk_size:]
+        p = p + _dot3(p, mk)
+
+    rhs = jnp.concatenate(
+        (v * beta_k, k * jnp.exp2(gc) * beta_k),
+        axis=-1,
+    )  # [H, C, V + K]
+    if nc_inv == 1:
+        solved = _dot3(p, rhs)
+    else:
+        p_merged = _dot3(p, jnp.concatenate((f, rhs), axis=-1))
+        g = p_merged[:, :, :chunk_size]
+        p_rhs = p_merged[:, :, chunk_size:]
+        h = -g
+        inv_ig = eye + h
+        hk = h
+        off_steps = nc_inv.bit_length() - 2  # nc_inv=8 -> 2 doublings
+        if off_steps > 0:
+            hk = _dot3(hk, hk)
+            for _ in range(off_steps - 1):
+                merged = _dot3(jnp.concatenate((inv_ig, hk), axis=1), hk)
+                inv_ig = inv_ig + merged[:, :chunk_size]
+                hk = merged[:, chunk_size:]
+            inv_ig = inv_ig + _dot3(inv_ig, hk)
+        solved = _dot3(inv_ig, p_rhs)
+
+    u, w = solved[..., :value_channels], solved[..., value_channels:]
+    q_scaled = q * jnp.where(gc > -126.0, jnp.exp2(gc), jnp.float32(0))
+    state_prods = _dot3(jnp.concatenate((w, q_scaled), axis=1), state)
+    v_new = u - state_prods[:, :chunk_size]
+
+    g_last = gc[:, -1, :]  # [H, K]
+    kg = k * jnp.exp2(g_last[:, None, :] - gc)
+    v_prods = _dot3(jnp.concatenate((aqk, kg.transpose(0, 2, 1)), axis=1), v_new)
+    out = state_prods[:, chunk_size:] + v_prods[:, :chunk_size]
+    new_state = state * jnp.exp2(g_last)[:, :, None] + v_prods[:, chunk_size:]
+    return out, new_state
+
+
 def kda_chunk(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, invert=None):
     """One chunk of the Kimi delta rule; returns (out, new_state).
 
     See `_kda_chunk_core` for the full docstring. ``invert`` picks the
-    (I + L)^{-1} routine (default `_invert_delta_rule_two_level`).
+    (I + L)^{-1} routine (default `_kda_chunk_fast` fused two-level Neumann).
     """
+    if invert is None:
+        return _kda_chunk_fast(q, k, v, gate, beta, state, sub_block=sub_block)
     out, new_state, _ = _kda_chunk_core(
         q, k, v, gate, beta, state, sub_block=sub_block, invert=invert
     )

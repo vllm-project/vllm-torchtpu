@@ -28,6 +28,8 @@ from jax.sharding import PartitionSpec as P
 
 from .. import prefill_megakernel as k
 
+_COMPACT_8K_CAPACITY = 65536
+
 
 def _sort_route_steps(keys, probabilities, *, size):
     """Yield after each 4096-route window of the in-place bitonic network.
@@ -954,8 +956,8 @@ def _routed_experts(
     unroll = 8 if tokens < 8192 else 32
     gu_unroll = 4 if tokens < 8192 else 8
     first_down_unroll = 2 if tokens < 8192 else 8
-    metadata_row_capacity = 0 if tokens < 8192 else 32768
-    ring_dtype = jnp.float32
+    metadata_row_capacity = 0 if tokens < 8192 else _COMPACT_8K_CAPACITY
+    ring_dtype = jnp.bfloat16
     assert tokens in (512, 1024, 2048, 4096, 8192)
     gu_width = gu_weights.shape[-1]
     assert gu_width % 2 == 0
@@ -1677,8 +1679,9 @@ def _reduce_step(
             rows=rows, cols=cols, stream=stream, source=source, local_value=local_value
         ):
             payload.at[rows, cols][...] = (
-                local_value() + received.at[(step - 1) % buffers, rows, cols][...]
-            )
+                local_value().astype(jnp.float32)
+                + received.at[(step - 1) % buffers, rows, cols][...].astype(jnp.float32)
+            ).astype(payload.dtype)
             pl.semaphore_signal(
                 credits.at[stream],
                 1,
@@ -1776,7 +1779,7 @@ def _ready_reduce(
             begin, size, col_begin, width = region
             base = (stream % 6) * 34
             rows, cols = pl.ds(begin, size), pl.ds(col_begin, width)
-            units = size * width * 4 // 32
+            units = size * width * jnp.dtype(payload.dtype).itemsize // 32
             step = state[1 + stream]
 
             @pl.when(state[1 + count + stream] == 0)
@@ -1794,8 +1797,9 @@ def _ready_reduce(
                     remote(stream, rows, cols, target, bank).wait()
                     source_rows = pl.ds(pl.multiple_of(ring_meta[base + 2 + step], o_ref.shape[0]) + begin, size)
                     payload.at[rows, cols][...] = (
-                        x_ref.at[source_rows, cols][...].astype(payload.dtype) + received.at[bank, rows, cols][...]
-                    )
+                        x_ref.at[source_rows, cols][...].astype(jnp.float32)
+                        + received.at[bank, rows, cols][...].astype(jnp.float32)
+                    ).astype(payload.dtype)
                     pl.semaphore_signal(
                         credits.at[stream], 1, device_id=(ring_meta[base + 1],), device_id_type=pl.DeviceIdType.MESH
                     )
@@ -1892,7 +1896,7 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
         for panel in (0, 1):
             weight_copy(panel).start()
             prefix_copy(panel).start()
-        routed = reduced[...]
+        routed = reduced[...].astype(jnp.float32)
         mean = jnp.sum(routed * routed, axis=1, keepdims=True) / width
         inverse = jax.lax.rsqrt(mean + 1e-5)
         s["normalized"][...] = ((routed * inverse) * s["norm"][...]).astype(
@@ -1984,7 +1988,7 @@ def _layer_kernel(
     rows = hidden.shape[0]
     tokens = rows * 32
     local_experts = expert_gu.shape[1]
-    capacity = tokens * 16 if tokens < 8192 else 32768
+    capacity = tokens * 16 if tokens < 8192 else _COMPACT_8K_CAPACITY
     shape = (tokens // 8, 128)
     vmem, smem, dma = pltpu.VMEM, pltpu.SMEM, pltpu.SemaphoreType.DMA
 
@@ -2110,7 +2114,7 @@ def _layer_kernel(
         body,
         dict(
             shared=vmem((rows, 7168), jnp.bfloat16),
-            reduced=vmem((rows, 3584), jnp.float32),
+            reduced=vmem((rows, 3584), jnp.bfloat16),
             probs_v=vmem(shape, jnp.float32) if tokens < 8192 else None,
             counts_v=vmem((local_experts,), jnp.int32),
             counts=smem((local_experts,), jnp.int32),
@@ -2257,7 +2261,9 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
                 shared_reduced=True,
             )
 
-        result = jax.lax.cond(maximum[0] <= 32768, lambda: final, overflow)[None]
+        result = jax.lax.cond(
+            maximum[0] <= _COMPACT_8K_CAPACITY, lambda: final, overflow
+        )[None]
         return (result, routes) if counting else result
 
     return jax.jit(local)
