@@ -421,8 +421,13 @@ def test_end_to_end_export_of_a_recurrent_model(tmp_path: Path) -> None:
         ([9, 3, 1, 8], "f32", [None, None, None, "model"]),
         ([9, 2, 4, 4], "f32", [None, "model", None, None]),
     ]
-    # Recurrent state pools hold one slot per sequence plus null slot 0.
+    # Recurrent state pools hold one slot per sequence plus null slot 0, and
+    # `serving_config` declares their group/window/slot layout directly.
     assert meta["serving_config"]["num_state_slots"] == 9
+    assert meta["serving_config"]["recurrent_groups"] == 1
+    assert meta["serving_config"]["recurrent_window"] == 1
+    assert meta["serving_config"]["state_slots_per_seq"] == 1
+    assert meta["serving_config"]["recurrent_pool_slots"] == [1, 2]
     # The recurrent control input follows the state, which keeps its indices.
     last = forward["inputs"][-1]
     assert last["name"] == "mamba_state_indices"
@@ -556,18 +561,34 @@ def test_metadata_has_one_serving_config_with_what_the_runtime_reads(tmp_path) -
     assert set(serving) == {
         "vocab_size",
         "eos_token_id",
+        "eos_token_ids",
         "max_num_seqs",
         "max_num_pages",
         "max_cu_seqs",
         "block_size",
         "num_blocks",
+        "pages_per_seq",
         "max_model_len",
+        "max_prefill_chunk_size",
+        "token_buckets",
+        "req_buckets",
+        "positions_sections",
+        "penalty_history_len",
+        "mtp_num_drafts",
         "tensor_parallel_size",
         "pipeline_parallel_size",
         "data_parallel_size",
         "tokenizer_config",
     }
     assert (serving["vocab_size"], serving["num_blocks"]) == (32, 16)
+    assert serving["eos_token_ids"] == []
+    assert serving["pages_per_seq"] == 8
+    assert serving["max_prefill_chunk_size"] == 8
+    assert serving["token_buckets"] == [8]
+    assert serving["req_buckets"] == [4, 8]
+    assert serving["positions_sections"] == 0
+    assert serving["penalty_history_len"] == 64
+    assert serving["mtp_num_drafts"] == 0
 
 
 def test_metadata_declares_the_speculative_config_it_was_exported_with(
@@ -1149,6 +1170,7 @@ def test_companion_files_are_copied_and_declared_in_serving_config(tmp_path) -> 
         "source": {"TokenizerPath": {"path": "tokenizer.json"}}
     }
     assert serving_config["generation_config"] == {"path": "generation_config.json"}
+    assert serving_config["eos_token_ids"] == [2, 0]
     for name in ("tokenizer.json", "generation_config.json"):
         assert (out_dir / name).read_text() == (hf_dir / name).read_text()
     assert not (out_dir / "config.json").exists()
@@ -2164,6 +2186,7 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     functions = meta["functions"]
     assert set(functions["mtp_draft"]) == set(functions["forward"]) == {"8", "16"}
     assert meta["serving_config"]["speculative_config"]["method"] == "mtp"
+    assert meta["serving_config"]["mtp_num_drafts"] == 1
 
     variant = functions["mtp_draft"]["16"]
     by_name = {i["name"]: i for i in variant["inputs"]}
