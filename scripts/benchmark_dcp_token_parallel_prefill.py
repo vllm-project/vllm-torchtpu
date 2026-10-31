@@ -763,11 +763,13 @@ def main():
     )
 
     # ---- pieces of the token-parallel path ------------------------------
+    cap = min(c for c in lay.gather_caps if c >= n_vp)  # the step's gather size
+
     def gather_only(n, r, *m):
         def _l(n, r, sl, bt_, q_, d_):
             pages, offs = tp.step_pages(lay, sl, q_, d_[2])
             ids = tp.gather_page_ids(lay, bt_, pages, offs, n.shape[0])
-            return tp.gather_latent(lay, n, r, ids, jnp.sum(pages), AXIS, READ_PAGES)
+            return tp.gather_latent(n, r, ids[:cap], AXIS, READ_PAGES)
 
         return jax.shard_map(
             _l,
@@ -867,7 +869,9 @@ def main():
     )(q_sharded)
     kernel_only = jax.jit(
         jax.shard_map(
-            lambda qq, gn, gr, ft: attend(qq, gn, gr, ft, jnp.int32(rows)),
+            lambda qq, gn, gr, ft: attend(
+                qq, gn, gr, tp.restride_flat_rows(lay, ft, cap), jnp.int32(rows)
+            ),
             mesh=mesh,
             in_specs=(P(AXIS),) * 4,
             out_specs=P(AXIS),

@@ -107,8 +107,11 @@ def gather_pages(cache: jax.Array, page_ids: jax.Array, row_width: int) -> jax.A
             pltpu.VMEM((lanes,), jnp.int32),
             pltpu.SemaphoreType.DMA((lanes,)),
         ),
+        # Native SparseCore (linear) operand layout, as the cache writer's.
         compiler_params=pltpu.CompilerParams(
-            needs_layout_passes=True, disable_bounds_checks=True
+            use_tc_tiling_on_sc=False,
+            needs_layout_passes=True,
+            disable_bounds_checks=True,
         ),
         mesh=mesh,
         name=f"page_gather_p{num_pages}_r{rows}",

@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -291,6 +291,16 @@ def _sized_gather(
 
         return run
 
+    return _switch_on_cap(layout, total_pages, branch)
+
+
+def _switch_on_cap(
+    layout: TokenParallelLayout,
+    total_pages: jax.Array,
+    branch: Callable[[int], Callable[[], Any]],
+) -> Any:
+    """`branch(cap)()` for the smallest cap in `gather_caps` holding
+    `total_pages`; every rank takes the same branch (replicated metadata)."""
     caps = layout.gather_caps
     if len(caps) == 1:
         return branch(caps[0])()
@@ -308,27 +318,35 @@ ReadPagesFn = Callable[[jax.Array, jax.Array], jax.Array]
 
 
 def gather_latent(
-    layout: TokenParallelLayout,
     nope_cache: jax.Array,
     rope_cache: jax.Array,
     page_ids: jax.Array,
-    total_pages: jax.Array,
     axis_name: str,
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
 ) -> tuple[jax.Array, jax.Array]:
-    """Every rank's `page_ids` pages, rank-major: `[dcp * max_pages, ...]`.
+    """Every rank's `page_ids` pages, rank-major: `[dcp * len(page_ids), ...]`.
     `read_pages` reads this rank's (nope, rope) pages (`page_gather` on TPU:
-    it reads each cache in the layout the SparseCore cache kernels use)."""
+    it reads each cache in the layout the SparseCore cache kernels use). The
+    pages move flat, so a linear-layout read stays linear up to the kernel."""
 
     def gather(cache: jax.Array, read: ReadPagesFn) -> jax.Array:
-        def pages(cap: int) -> jax.Array:
-            local = read(cache, page_ids[:cap]).reshape(cap, -1)
-            return lax.all_gather(local, axis_name)
-
-        g = _sized_gather(layout, total_pages, pages, page_axis=1)
-        return g.reshape(-1, *cache.shape[1:])
+        local = read(cache, page_ids).reshape(-1)
+        return lax.all_gather(local, axis_name, tiled=True).reshape(
+            -1, *cache.shape[1:]
+        )
 
     return gather(nope_cache, read_pages[0]), gather(rope_cache, read_pages[1])
+
+
+def restride_flat_rows(
+    layout: TokenParallelLayout, flat: jax.Array, cap: int
+) -> jax.Array:
+    """`flat_rows` of a `max_pages`-per-rank buffer -> the same rows of a
+    buffer gathered with `cap` pages per rank (every row a step reaches lies
+    in the first `cap` pages of its rank)."""
+    rank_rows_max = layout.max_pages * layout.page_size
+    owner, rest = flat // rank_rows_max, flat % rank_rows_max
+    return jnp.where(flat >= 0, owner * (cap * layout.page_size) + rest, -1)
 
 
 def gather_index_k(
@@ -456,12 +474,22 @@ def sparse_mla_attention(
         nope, rope = write_kv(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank)
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
         page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
-        g_nope, g_rope = gather_latent(
-            layout, nope, rope, page_ids, jnp.sum(pages), axis_name, read_pages
-        )
         q_tok = q if q_own_rows else heads_to_tokens(layout, q, axis_name)
         rr = rank_rows(layout, rank, kv_c.shape[0], seq_lens, qsl, dist[2])
-        out = attend(q_tok, g_nope, g_rope, topk, rr.num_rows)
+
+        # Gather and attend at the step's page count: the kernel reads a
+        # buffer of `cap` pages per rank, with no padding copy to max_pages.
+        def branch(cap: int) -> Callable[[], jax.Array]:
+            def run() -> jax.Array:
+                g_nope, g_rope = gather_latent(
+                    nope, rope, page_ids[:cap], axis_name, read_pages
+                )
+                flat = restride_flat_rows(layout, topk, cap)
+                return attend(q_tok, g_nope, g_rope, flat, rr.num_rows)
+
+            return run
+
+        out = _switch_on_cap(layout, jnp.sum(pages), branch)
         return nope, rope, tokens_to_heads(out, axis_name)
 
     extra = () if rank_ids is None else (rank_ids,)
