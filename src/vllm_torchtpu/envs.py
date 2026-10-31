@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     TPU_TRACE_MODE: str = "TRACE_COMPUTE"
     TPU_NUM_SPARSE_CORES_TO_TRACE: int = 1
     TPU_NUM_SPARSE_CORE_TILES_TO_TRACE: int = 1
+    TPU_PROFILER_OPTIONS: str = ""
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
@@ -501,6 +502,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_NUM_SPARSE_CORE_TILES_TO_TRACE": lambda: int(
         os.getenv("TPU_NUM_SPARSE_CORE_TILES_TO_TRACE") or "1"
     ),
+    # Profiler options as "key:value;" entries, the format a /start_profile
+    # prefix takes. Applied over the defaults above; a request's own options
+    # still win.
+    "TPU_PROFILER_OPTIONS": env_str("TPU_PROFILER_OPTIONS", ""),
     # Enable/disable Ray usage statistics collection
     "RAY_USAGE_STATS_ENABLED": lambda: os.getenv("RAY_USAGE_STATS_ENABLED", "0"),
     # Ray compiled DAG channel type for TPU
