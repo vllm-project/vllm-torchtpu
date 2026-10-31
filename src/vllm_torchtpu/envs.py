@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
+    TPU_MLA_TC_KV_WRITER: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -467,6 +468,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_ROPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
     ),
+    # Write decode-sized steps into both SparseCore-layout sparse-MLA caches
+    # with one TensorCore kernel instead of two SparseCore offloads.
+    "TPU_MLA_TC_KV_WRITER": env_bool("TPU_MLA_TC_KV_WRITER", default=False),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")
