@@ -366,7 +366,7 @@ def test_moe_gmm_runs_large_v2_combine_on_tensorcore(
 
 @pytest.mark.parametrize(
     "min_tokens,expected",
-    [(2048, ("tensorcore", (128, 128, 256), True)), (0, ("ep", None, False))],
+    [(2048, ("tensorcore", (128, 384), True)), (0, ("ep", None, False))],
     ids=["tensorcore", "sparsecore"],
 )
 def test_moe_gmm_tensorcore_combine_writes_the_pieces_itself(

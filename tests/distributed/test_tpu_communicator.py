@@ -168,7 +168,7 @@ def test_combine_in_pieces_matches_one_reduce_scatter(monkeypatch, communicator,
     piece_rows = combine_piece_rows(hidden.shape[0])
     result = communicator.combine(torch.cat(split_pieces(hidden, piece_rows)))
 
-    assert group.reduce_scatter.call_count == 3
+    assert group.reduce_scatter.call_count == 2
     torch.testing.assert_close(result, world * hidden.view(world, -1, 2)[rank])
 
 
@@ -201,8 +201,8 @@ def test_combine_splits_only_under_ep_with_two_blocks_per_rank_and_equal_groups(
 @pytest.mark.parametrize(
     "rows,expected",
     [
-        (8192, (128, 128, 256)),
-        (12288, (192, 192, 384)),
+        (8192, (128, 384)),
+        (12288, (192, 576)),
         (8200, ()),
         (4096, ()),
         (6144, ()),
@@ -225,4 +225,4 @@ def test_combine_piece_rows_keeps_a_dynamic_row_count_dynamic():
     hidden = torch.ones(COMBINE_SPLIT_MIN_ROWS)
     torch._dynamo.mark_dynamic(hidden, 0)
     result = torch.compile(pieces, backend="eager", fullgraph=True)(hidden)
-    assert [p.shape[0] for p in result] == [2048, 2048, 4096]
+    assert [p.shape[0] for p in result] == [2048, 6144]
