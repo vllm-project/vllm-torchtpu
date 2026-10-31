@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 from collections.abc import Callable
 from threading import Lock
 
@@ -111,6 +112,31 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
     return xla_quantized_matmul(x, w_q, w_s)
 
 
+def _rms_norm_quantized_matmul_jax(
+    x: jax.Array,
+    rstd: jax.Array,
+    norm_weight: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    *,
+    emit_normed: bool,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """`_quantized_matmul_jax` of vLLM's `rms_norm(x)`, given its rsqrt.
+
+    `rstd` is the norm's `rsqrt(mean(x**2) + eps)`, `[m, 1]`; the scaling and
+    weighting it is followed by happen here, inside the fused kernel when it
+    takes the shape. With `emit_normed` the normalized `x` is returned too.
+    """
+    if fused_quantize_kernel.supports_rms_norm(x, norm_weight, w_q, w_s):
+        return fused_quantize_kernel.fused_rms_norm_quantized_matmul(
+            x, rstd, norm_weight, w_q, w_s, emit_normed=emit_normed
+        )
+    x_normed = (x.astype(jnp.float32) * rstd).astype(norm_weight.dtype) * norm_weight
+    x_normed = x_normed.astype(x.dtype)
+    out = _quantized_matmul_jax(x_normed, w_q, w_s)
+    return (out, x_normed) if emit_normed else out
+
+
 _quantized_matmul_kernel_op: Callable | None = None
 _quantized_matmul_kernel_op_lock = Lock()
 
@@ -160,6 +186,60 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+_rms_norm_quantized_matmul_ops: dict[bool, Callable] = {}
+_rms_norm_quantized_matmul_ops_lock = Lock()
+
+
+def _get_rms_norm_quantized_matmul_op(emit_normed: bool) -> Callable:
+    op = _rms_norm_quantized_matmul_ops.get(emit_normed)
+    if op is not None:
+        return op
+
+    with _rms_norm_quantized_matmul_ops_lock:
+        op = _rms_norm_quantized_matmul_ops.get(emit_normed)
+        if op is not None:
+            return op
+
+        name = "pallas::rms_norm_quantized_matmul" + ("_normed" if emit_normed else "")
+        op = pallas.jax_op(
+            name,
+            functools.partial(_rms_norm_quantized_matmul_jax, emit_normed=emit_normed),
+        )
+
+        def _fake(x, rstd, norm_weight, w_q, w_s):
+            del rstd, norm_weight, w_s
+            out = torch.empty(x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device)
+            return (out, torch.empty_like(x)) if emit_normed else out
+
+        op.register_fake(_fake)
+        _rms_norm_quantized_matmul_ops[emit_normed] = op
+        return op
+
+
+def rms_norm_quantized_matmul(
+    x: torch.Tensor,
+    rstd: torch.Tensor,
+    norm_weight: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    *,
+    emit_normed: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """`quantized_matmul` of vLLM's `rms_norm(x, norm_weight)`.
+
+    `x` is the norm's 2-D input and `rstd` its `rsqrt(mean(x**2) + eps)`,
+    `[m, 1]` float32. With `emit_normed`, also returns the normalized `x` for
+    the norm's other consumers.
+    """
+    if x.ndim != 2 or x.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Expected a 2-D input with hidden dim {w_q.shape[0]}, got {list(x.shape)}."
+        )
+    return _get_rms_norm_quantized_matmul_op(emit_normed)(
+        x, rstd, norm_weight, w_q, w_s
+    )
 
 
 def _quantized_matmul_fp4_jax(

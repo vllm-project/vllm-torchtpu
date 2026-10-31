@@ -436,3 +436,46 @@ def test_fused_quantized_matmul_matches_xla(
     np.testing.assert_array_equal(
         np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
     )
+
+
+@pytest.mark.parametrize("emit_normed", [True, False])
+@pytest.mark.parametrize(
+    ("bs", "n_input_features", "n_output_features"),
+    [(1024, 4096, 1536), (512, 2048, 768)],
+)
+def test_fused_rms_norm_quantized_matmul_matches_xla(
+    bs: int, n_input_features: int, n_output_features: int, emit_normed: bool
+) -> None:
+    """The norm-fused kernel must reproduce XLA's RMSNorm, then the matmul."""
+    _require_tpu_v7()
+    kx, kg, kw, ks = jax.random.split(jax.random.key(0), 4)
+    x = jax.random.normal(kx, (bs, n_input_features), jnp.float32) * 3
+    x = x.at[5].set(0).at[7, 3].set(1e4).astype(jnp.bfloat16)
+    gamma = (1 + 0.3 * jax.random.normal(kg, (n_input_features,))).astype(jnp.bfloat16)
+    w_q = (jax.random.normal(kw, (n_input_features, n_output_features)) * 100).astype(
+        jnp.float8_e4m3fn
+    )
+    w_scale = jax.random.uniform(ks, (n_output_features,), jnp.float32, 1e-3, 1e-2)
+    assert fused_quantize_kernel.supports_rms_norm(x, gamma, w_q, w_scale)
+
+    @jax.jit
+    def rms_norm(x):
+        # vLLM's `rms_norm`, as the model's norm runs it.
+        x_f32 = x.astype(jnp.float32)
+        rstd = jax.lax.rsqrt(jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True) + 1e-6)
+        return rstd, (x_f32 * rstd).astype(jnp.bfloat16) * gamma
+
+    rstd, expected_normed = rms_norm(x)
+    expected = jax.jit(xla_quantized_matmul)(expected_normed, w_q, w_scale)
+    actual = fused_quantize_kernel.fused_rms_norm_quantized_matmul(
+        x, rstd, gamma, w_q, w_scale, emit_normed=emit_normed
+    )
+    if emit_normed:
+        actual, actual_normed = actual
+        np.testing.assert_array_equal(
+            np.asarray(actual_normed).view(np.uint16),
+            np.asarray(expected_normed).view(np.uint16),
+        )
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
+    )
