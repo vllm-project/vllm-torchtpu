@@ -1043,8 +1043,6 @@ def fused_mlp_inner_kernel(
     lax.switch(m_end_local // cfgs1.tiles.bucket_base, branches)
 
 
-# Token-row DMAs started per iteration of the loop that fetches a gm tile.
-TOKEN_ROW_UNROLL = 8
 # Token rows one DMA wait covers before the last few, a multiple of 8.
 TOKEN_ROW_WAIT = 8
 
@@ -1063,7 +1061,8 @@ class TokenRows:
     head_ref: jax.Array  # [head_rows // sublane, sublane, size_k], HBM
     words_ref: jax.Array  # uint32[num_tokens // 2, size_k], HBM
     lhs_bufs: jax.Array  # [2, tile_m // sublane, sublane, size_k], VMEM
-    stage_ref: jax.Array  # uint32[2, tile_m // 2, size_k]: even, odd tile rows
+    # uint32[2, tile_m // sublane, sublane // 2, size_k]: even, odd tile rows
+    stage_ref: jax.Array
     sems: jax.Array  # DMA[2]: head rows, token rows
 
     @property
@@ -1076,13 +1075,18 @@ class TokenRows:
 
     def tile(self, metadata_ref: MetadataRef, gm_id: jax.Array):
         """First sublane-block row, end, head blocks and first token row of
-        gm tile gm_id."""
+        gm tile gm_id.
+
+        Token rows start on a sublane block: rows of a block before the
+        tile's own are fetched too and masked out like any row outside its
+        group, so each block's DMAs land at fixed offsets in the stage.
+        """
         m_start = metadata_ref.gm_id_to_m_offset[gm_id]
         m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
         m_offset = m_start - m_start % self.sublane
         head_end = jnp.minimum(m_end, self.head_rows)
         head_blocks = pl.cdiv(jnp.maximum(head_end - m_offset, 0), self.sublane)
-        return m_offset, m_end, head_blocks, jnp.maximum(m_start, self.head_rows)
+        return m_offset, m_end, head_blocks, jnp.maximum(m_offset, self.head_rows)
 
     def start(self, metadata_ref: MetadataRef, gm_id: jax.Array, slot: jax.Array):
         """Starts the DMAs of gm tile gm_id's lhs rows into buffer slot."""
@@ -1096,23 +1100,26 @@ class TokenRows:
                 self.sems.at[0],
             ).start()
 
-        def issue(i, carry):
-            for u in range(TOKEN_ROW_UNROLL):
-                row = first + i * TOKEN_ROW_UNROLL + u
+        # Unrolled over the tile's sublane blocks so each DMA's stage offset
+        # is a constant; a row past the tile only predicates its DMA off.
+        first_block = (first - m_offset) // self.sublane
+        end_block = pl.cdiv(m_end - m_offset, self.sublane)
+        for b in range(self.stage_ref.shape[1]):
 
-                @pl.when(row < m_end)
-                def _():
-                    local = row - m_offset
-                    pltpu.make_async_copy(
-                        self.words_ref.at[self.row_ids_ref[row] // 2],
-                        self.stage_ref.at[local % 2, local // 2],
-                        self.sems.at[1],
-                    ).start()
+            @pl.when((first_block <= b) & (b < end_block))
+            def _(b=b):
+                row0 = m_offset + b * self.sublane
+                rows_left = m_end - row0
+                for u in range(self.sublane):
+                    word = lax.shift_right_logical(self.row_ids_ref[row0 + u], 1)
 
-            return carry
-
-        steps = pl.cdiv(jnp.maximum(m_end - first, 0), TOKEN_ROW_UNROLL)
-        lax.fori_loop(0, steps, issue, 0)
+                    @pl.when(u < rows_left)
+                    def _(b=b, u=u, word=word):
+                        pltpu.make_async_copy(
+                            self.words_ref.at[word],
+                            self.stage_ref.at[u % 2, b, u // 2],
+                            self.sems.at[1],
+                        ).start()
 
     def wait(self, metadata_ref: MetadataRef, gm_id: jax.Array, slot: jax.Array):
         _, m_end, head_blocks, first = self.tile(metadata_ref, gm_id)
@@ -1127,7 +1134,7 @@ class TokenRows:
 
         # DMA semaphores count bytes, so a wait for n word rows covers any n.
         def wait_rows(rows):
-            ref = self.stage_ref.at[0, pl.ds(0, rows)]
+            ref = self.stage_ref.at[0, 0, pl.ds(0, rows)]
 
             def body(i, carry):
                 pltpu.make_async_copy(ref, ref, self.sems.at[1]).wait()
@@ -1165,11 +1172,10 @@ class TokenRows:
                 return shift
 
             even_shift, odd_shift = shifts(0), shifts(1)
-            words = pl.ds(pl.multiple_of(b * pairs, pairs), pairs)
             for c in range(0, size_k, num_lanes):
                 cols = pl.ds(c, num_lanes)
-                even = self.stage_ref[0, words, cols] >> even_shift
-                odd = self.stage_ref[1, words, cols] >> odd_shift
+                even = self.stage_ref[0, b, :, cols] >> even_shift
+                odd = self.stage_ref[1, b, :, cols] >> odd_shift
                 lhs_words[b, :, cols] = (even & 0xFFFF) | (odd << 16)
             return carry
 
@@ -2085,7 +2091,9 @@ def gmm_v2_fused_mlp(
     number of sublane blocks, and row r past them is row
     ``token_row_ids[r]`` of the bf16 ``token_rows``: the kernel fetches it
     itself, so those rows need not be gathered first. A row computes the
-    same bits either way.
+    same bits either way. Every id past the head must index ``token_rows``,
+    rows outside the groups included: a tile also fetches the rows of its
+    first sublane block that come before it.
 
     Returns:
         Output of shape [size_m, size_n].
@@ -2177,7 +2185,9 @@ def gmm_v2_fused_mlp(
             # TokenRows.lhs_bufs
             pltpu.VMEM((2, tiles.tile_m // sublane, sublane, dims.size_k), lhs.dtype),
             # TokenRows.stage_ref
-            pltpu.VMEM((2, tiles.tile_m // 2, dims.size_k), jnp.uint32),
+            pltpu.VMEM(
+                (2, tiles.tile_m // sublane, sublane // 2, dims.size_k), jnp.uint32
+            ),
             pltpu.SemaphoreType.DMA((2,)),
         ]
 
