@@ -36,6 +36,11 @@ FUSED_QUANTIZE_MAX_OUT_PER_IN = 1.0
 FUSED_QUANTIZE_MIN_WIDE_OUT_PER_IN = 16.0
 FUSED_QUANTIZE_WIDE_TOKEN_BLOCK = 1024
 FUSED_QUANTIZE_WIDE_OUT_BLOCK = 2048
+# `fused_quantize_kernel.fused_quantized_matmul_rope_quant`: tokens per grid
+# step (the largest of these halvings that divides the batch) and heads per
+# MXU dot.
+FUSED_ROPE_QUANT_TOKEN_BLOCK = 256
+FUSED_ROPE_QUANT_HEADS_PER_DOT = 8
 
 
 def unfold_args(

@@ -24,15 +24,21 @@ pass reuses.
 activation: the first pass scales the raw rows by their precomputed rsqrt and
 the norm weight in VMEM, so the normalized activation is never read back from
 HBM, and is written there only when the caller asks for it.
+
+`fused_quantized_matmul_rope_quant` takes the consumer instead: it rotates and
+quantizes each 128-channel head of the output in VMEM, as `rope.rope_quant`
+does, and writes the quantized heads in the `[tokens, heads, 128]` layout.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4 import rope
 from vllm_torchtpu.kernels.quantized_matmul import util
 
 # Tile sizes and the shape gate are tunables in `util` (FUSED_QUANTIZE_*), read
@@ -41,6 +47,10 @@ from vllm_torchtpu.kernels.quantized_matmul import util
 QUANT_COLS = 512
 QUANT_ROWS = 32
 VMEM_LIMIT_BYTES = 48 * 1024 * 1024
+# `fused_quantized_matmul_rope_quant` rotates and quantizes this many rows of a
+# head at a time, and swaps the lane pairs of the heads this far ahead of them.
+ROPE_ROWS = 128
+ROTATE_AHEAD = 8
 
 
 def _first_divisor(size: int, blocks: tuple[int, ...]) -> int | None:
@@ -357,3 +367,221 @@ def _normed_in_scratch(kernel):
         return kernel(*ins_out, x_normed_ref, x_q_ref, x_scale_ref)
 
     return wrapped
+
+
+def _rope_quant_token_block(m: int) -> int | None:
+    tm = util.FUSED_ROPE_QUANT_TOKEN_BLOCK
+    while tm >= QUANT_ROWS:
+        if m % tm == 0 and tm % QUANT_ROWS == 0:
+            return tm
+        tm //= 2
+    return None
+
+
+def _rope_quant_vmem_bytes(k: int, num_heads: int, tm: int) -> int:
+    n = num_heads * rope.LANE
+    x = 2 * tm * k * 2  # bf16, double-buffered
+    x_q = tm * k + tm * 128 * 4  # fp8 rows and their lane-padded f32 scales
+    w = 2 * k * n
+    q = 2 * tm * n  # fp8 heads, double-buffered
+    scales = 2 * tm * pl.cdiv(num_heads, 128) * 128 * 4
+    heads = 2 * tm * n * 2  # bf16 heads and their lane-swapped copy
+    stage = tm * (num_heads + 1) * rope.LANE * 4
+    cos_sin = 2 * tm * 128 * 4 + 2 * tm * rope.LANE * 4
+    acc = 2 * tm * util.FUSED_ROPE_QUANT_HEADS_PER_DOT * rope.LANE * 4
+    return x + x_q + w + q + scales + heads + stage + cos_sin + acc
+
+
+def supports_rope_quant(
+    x: jax.Array, w_q: jax.Array, w_scale: jax.Array, num_heads: int
+) -> bool:
+    """Whether `fused_quantized_matmul_rope_quant` should take these operands."""
+    m, k = x.shape
+    n = w_q.shape[1]
+    tm = _rope_quant_token_block(m)
+    return (
+        x.dtype == jnp.bfloat16
+        and w_q.dtype == jnp.float8_e4m3fn
+        and w_scale.shape == (n,)
+        and k % QUANT_COLS == 0
+        and n == num_heads * rope.LANE
+        and num_heads % util.FUSED_ROPE_QUANT_HEADS_PER_DOT == 0
+        and tm is not None
+        and _rope_quant_vmem_bytes(k, num_heads, tm) <= VMEM_LIMIT_BYTES
+    )
+
+
+def _rope_quant_kernel(
+    # scalar prefetch
+    positions_ref,
+    # inputs
+    x_ref,
+    w_ref,
+    w_scale_ref,
+    cos_sin_cache_ref,
+    # outputs
+    q_ref,
+    scale_ref,
+    # scratch
+    x_q_ref,
+    x_scale_ref,
+    cos_sin_ref,
+    cos_sin_sems,
+    cos_ref,
+    sin_ref,
+    heads_ref,
+    swapped_ref,
+    stage_ref,
+    *,
+    f8_max,
+    rotary_dim,
+    quant_dtype,
+):
+    i, num_i = pl.program_id(0), pl.num_programs(0)
+    tm, num_heads = q_ref.shape[:2]
+    lane = rope.LANE
+    heads_per_dot = util.FUSED_ROPE_QUANT_HEADS_PER_DOT
+    rope_rows = math.gcd(ROPE_ROWS, tm)
+
+    def fetch_cos_sin(tile, slot):
+        # One row of the table per token, as `rope.CosSinRef` gathers them.
+        @pl.loop(0, tm, unroll=True)
+        def _(t):
+            position = positions_ref[tile * tm + t]
+            pltpu.make_async_copy(
+                cos_sin_cache_ref.at[position, pl.ds(0, rotary_dim)],
+                cos_sin_ref.at[slot, t, :],
+                cos_sin_sems.at[slot],
+            ).start()
+
+    slot = i % 2
+
+    @pl.when(i == 0)
+    def _():
+        fetch_cos_sin(0, 0)
+
+    @pl.when(i + 1 < num_i)
+    def _():
+        fetch_cos_sin(i + 1, 1 - slot)
+
+    for r in range(0, tm, QUANT_ROWS):
+        _quantize_rows(x_ref, x_q_ref, x_scale_ref, 0, r, f8_max)
+
+    cos_sin = cos_sin_ref.at[slot]
+    pltpu.make_async_copy(cos_sin, cos_sin, cos_sin_sems.at[slot]).wait()
+    cos, sin = rope._cos_sin_lanes(cos_sin[...], rotary_dim=rotary_dim, inverse=False)
+    cos_ref[...] = cos
+    # `rope._rotate_gptj` negates the even lanes of the swapped pairs; negating
+    # sin there instead gives the same products, since rounding is symmetric.
+    even = jax.lax.broadcasted_iota(jnp.int32, sin.shape, 1) % 2 == 0
+    sin_ref[...] = sin * jnp.where(even, -1.0, 1.0).astype(sin.dtype)
+
+    for g in range(num_heads // heads_per_dot):
+        cols = pl.ds(g * heads_per_dot * lane, heads_per_dot * lane)
+        acc = jnp.dot(x_q_ref[0], w_ref[:, cols], preferred_element_type=jnp.float32)
+        acc = acc * x_scale_ref[0]
+        acc = acc * w_scale_ref[:, cols]
+        # rope_quant reads the bf16 heads `xla_quantized_matmul` returns.
+        heads_ref[:, cols] = acc.astype(heads_ref.dtype)
+
+    def swap_lane_pairs(rows, h):
+        # On the packed bf16 words, so one lane permute moves two rows; doing
+        # it ahead keeps it from queueing behind the abs-max lane reductions.
+        head = pl.ds(h * lane, lane)
+        words = pltpu.bitcast(heads_ref[rows, head], jnp.uint32)
+        swapped = rope._lane_gather(words, jnp.arange(lane) ^ 1)
+        swapped_ref[rows, head] = pltpu.bitcast(swapped, heads_ref.dtype)
+
+    # Head h of token t goes to stage row t * stride + h. An odd stride puts the
+    # 8 tokens of a vreg in 8 different sublanes, so each head is one strided
+    # store and each token's heads one contiguous load.
+    stride = num_heads + 1
+    for r in range(0, tm, rope_rows):
+        rows = pl.ds(r, rope_rows)
+        for h in range(min(ROTATE_AHEAD, num_heads)):
+            swap_lane_pairs(rows, h)
+        for h in range(num_heads):
+            if h + ROTATE_AHEAD < num_heads:
+                swap_lane_pairs(rows, h + ROTATE_AHEAD)
+            head = pl.ds(h * lane, lane)
+            x_h = heads_ref[rows, head].astype(jnp.float32)
+            swapped_h = swapped_ref[rows, head].astype(jnp.float32)
+            # `rope._rope_body`'s rotation and quantize, one head at a time.
+            y = x_h * cos_ref[rows, :] + swapped_h * sin_ref[rows, :]
+            y_scaled, scale = rope._quantize_scale_rows(y, quant_dtype)
+            stage_ref[pl.ds(r * stride + h, rope_rows, stride=stride), :] = y_scaled
+            scale_ref[rows, h : h + 1] = scale
+    for t in range(tm):
+        q_ref[t] = stage_ref[pl.ds(t * stride, num_heads), :].astype(quant_dtype)
+
+
+@functools.partial(jax.jit, static_argnames=("quant_dtype",))
+def fused_quantized_matmul_rope_quant(
+    x: jax.Array,  # [m, k] bfloat16
+    w_q: jax.Array,  # [k, num_heads * 128] float8_e4m3fn
+    w_scale: jax.Array,  # [num_heads * 128]
+    positions: jax.Array,  # [m] int32
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    quant_dtype: jnp.dtype = jnp.float8_e4m3fn,
+) -> tuple[jax.Array, jax.Array]:
+    """`rope.rope_quant` of `xla_quantized_matmul(x, w_q, w_scale)` as heads.
+
+    Returns the rotated heads quantized to `quant_dtype`, `[m, num_heads,
+    128]`, and their per-head scales, `[m, num_heads]` float32.
+    """
+    m, k = x.shape
+    n = w_q.shape[1]
+    num_heads = n // rope.LANE
+    rotary_dim = cos_sin_cache.shape[1]
+    # What `rope.rope_quant` asserts, and `rope._cos_sin_lanes` relies on.
+    assert rotary_dim % 2 == 0 and rotary_dim <= rope.LANE
+    tm = _rope_quant_token_block(m)
+    f8_max = float(jnp.finfo(w_q.dtype).max)
+
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=1,
+        grid=(m // tm,),
+        in_specs=[
+            pl.BlockSpec((tm, k), lambda i, positions: (i, 0)),
+            pl.BlockSpec((k, n), lambda i, positions: (0, 0)),
+            pl.BlockSpec((1, n), lambda i, positions: (0, 0)),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+        ],
+        out_specs=[
+            pl.BlockSpec((tm, num_heads, rope.LANE), lambda i, positions: (i, 0, 0)),
+            pl.BlockSpec((tm, num_heads), lambda i, positions: (i, 0)),
+        ],
+        scratch_shapes=[
+            pltpu.VMEM((1, tm, k), w_q.dtype),
+            pltpu.VMEM((1, tm, 1), jnp.float32),
+            pltpu.VMEM((2, tm, rotary_dim), cos_sin_cache.dtype),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.VMEM((tm, rope.LANE), cos_sin_cache.dtype),
+            pltpu.VMEM((tm, rope.LANE), cos_sin_cache.dtype),
+            pltpu.VMEM((tm, n), x.dtype),
+            pltpu.VMEM((tm, n), x.dtype),
+            pltpu.VMEM((tm * (num_heads + 1), rope.LANE), jnp.float32),
+        ],
+    )
+    return pl.pallas_call(
+        functools.partial(
+            _rope_quant_kernel,
+            f8_max=f8_max,
+            rotary_dim=rotary_dim,
+            quant_dtype=quant_dtype,
+        ),
+        grid_spec=grid_spec,
+        out_shape=(
+            jax.ShapeDtypeStruct((m, num_heads, rope.LANE), quant_dtype),
+            jax.ShapeDtypeStruct((m, num_heads), jnp.float32),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=VMEM_LIMIT_BYTES,
+            # The per-token cos/sin row copies are bounds-checked otherwise, at
+            # ~5x the scalar work of issuing them (as in `rope_quant`).
+            disable_bounds_checks=True,
+        ),
+        name="fused_quantized_matmul_rope_quant",
+    )(positions, x, w_q, w_scale.astype(jnp.float32).reshape(1, n), cos_sin_cache)

@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.deepseek_v4 import rope
 from vllm_torchtpu.kernels.quantized_matmul import (
     blockwise_kernel,
     fused_quantize_kernel,
@@ -480,4 +481,45 @@ def test_fused_rms_norm_quantized_matmul_matches_xla(
         )
     np.testing.assert_array_equal(
         np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
+    )
+
+
+@pytest.mark.parametrize(
+    ("bs", "num_heads"),
+    [(1024, 64), (128, 64), (96, 16)],
+)
+def test_fused_quantized_matmul_rope_quant_matches_rope_quant(
+    bs: int, num_heads: int
+) -> None:
+    """The kernel must reproduce `rope_quant` of `xla_quantized_matmul`."""
+    _require_tpu_v7()
+    n_input_features, head_dim, max_position = 1024, 128, 4096
+    kx, kw, ks, kc, kp = jax.random.split(jax.random.key(0), 5)
+    x = jax.random.normal(kx, (bs, n_input_features), jnp.float32) * 3
+    x = x.at[5].set(0).at[7, 3].set(1e4).astype(jnp.bfloat16)
+    w_q = (
+        jax.random.normal(kw, (n_input_features, num_heads * head_dim)) * 100
+    ).astype(jnp.float8_e4m3fn)
+    w_q = w_q.at[:, head_dim : 2 * head_dim].set(0)  # a head of zero rows
+    w_scale = jax.random.uniform(ks, (num_heads * head_dim,), jnp.float32, 1e-3, 1e-2)
+    cos_sin_cache = jax.random.uniform(kc, (max_position, 64), jnp.float32, -1, 1)
+    positions = jax.random.randint(kp, (bs,), 0, max_position, jnp.int32)
+    assert fused_quantize_kernel.supports_rope_quant(x, w_q, w_scale, num_heads)
+
+    q = jax.jit(xla_quantized_matmul)(x, w_q, w_scale)
+    expected_q, expected_scale = rope.rope_quant(
+        q.reshape(bs, num_heads, head_dim),
+        positions,
+        cos_sin_cache,
+        quant_dtype=jnp.float8_e4m3fn,
+    )
+    actual_q, actual_scale = fused_quantize_kernel.fused_quantized_matmul_rope_quant(
+        x, w_q, w_scale, positions, cos_sin_cache
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual_q).view(np.uint8), np.asarray(expected_q).view(np.uint8)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual_scale).view(np.uint32),
+        np.asarray(expected_scale).view(np.uint32),
     )
