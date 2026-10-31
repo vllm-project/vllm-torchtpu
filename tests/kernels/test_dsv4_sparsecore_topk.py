@@ -66,6 +66,7 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 # `align_to(pages_per_seq, bkv_p) * page_size // 128 * 128` with page_size=1024
 # and bkv_p=2 on the GLM path.
 N_SHORT = 10240  # --max-model-len 9216
+N_64K = 65536  # --max-model-len 1048576 over DCP 16, one rank's share
 N_128K = 133120  # --max-model-len 132096
 N_1M = 1048576  # --max-model-len 1048576, the GLM-5.2 DCP=16 shape
 
@@ -185,21 +186,23 @@ def _run(scores: np.ndarray, k: int, row_lengths: np.ndarray) -> np.ndarray:
 # production can reach. The expected `P` is asserted separately, not assumed --
 # see
 # `test_partition_factor_is_what_these_tests_assume`. `P` at the 128K shape is
-# 8 rather than 4 because `MAX_SLICE_WORDS` is the *single-buffer* budget and
-# the resident slice is now double-buffered by `emit_pipeline`, so `p_min`
-# doubled.
+# 4: rows are split by their own length into parts of up to two
+# `MAX_SLICE_WORDS`, which a subcore holds single-buffered.
 SHAPES = [
     pytest.param(64, N_SHORT, 2048, 1, id="p1-b64-n10240"),
+    # GLM-5.2 at --max-model-len 1M over DCP 16: one subcore per row, whose
+    # parts past MAX_SLICE_WORDS fill the whole slice buffer.
+    pytest.param(64, N_64K, 2048, 1, id="p1-b64-n65536"),
     pytest.param(16, N_SHORT, 2048, 2, id="p2-b16-n10240"),
-    pytest.param(16, N_128K, 2048, 8, id="p8-b16-n133120"),
-    pytest.param(64, N_128K, 2048, 8, id="p8-b64-n133120"),
-    pytest.param(16, N_128K, 512, 8, id="p8-b16-n133120-k512"),
+    pytest.param(16, N_128K, 2048, 4, id="p4-b16-n133120"),
+    pytest.param(64, N_128K, 2048, 4, id="p4-b64-n133120"),
+    pytest.param(16, N_128K, 512, 4, id="p4-b16-n133120-k512"),
     # The other end of the production bucket ladder. `_dp_coordinated_step`
     # all-reduce-MAXes the token count across the 16 DP ranks, so a step in
     # which any one rank prefills drags every rank to the top bucket -- 1024 at
     # `--max-num-batched-tokens=1024`. It is as much a production shape as 16
     # is, and it is the one that needs 64x as many stage-1 waves as `b=16`.
-    pytest.param(1024, N_128K, 2048, 8, id="p8-b1024-n133120"),
+    pytest.param(1024, N_128K, 2048, 4, id="p4-b1024-n133120"),
 ]
 
 
@@ -292,6 +295,40 @@ def test_exact_topk_ragged_rows_straddle_partition_boundaries(b, n, k, expected_
 
 
 @pytest.mark.tpu_test
+def test_every_slice_buffer_handoff_between_waves():
+    """Each subcore's parts move through its slice buffer by length.
+
+    A subcore fetches only its row's first `row_length` words. While a wave
+    is selected, the next wave's part lands in the other half of the buffer
+    if both fit a half (MAX_SLICE_WORDS); otherwise the next part waits and
+    starts at 0. Row `f + 32 * w` is subcore f's wave w, so the pattern below
+    walks every handoff: short then exactly half (flip halves), half then
+    long (wait), long then short, short then empty (flip with no fetch),
+    empty then long (wait). A part read from the wrong half, or fetched over
+    one still being selected, selects the wrong scores.
+    """
+    n, k = N_64K, 2048
+    pattern = [
+        lambda f: 5000 + 16 * f,
+        lambda f: MAX_SLICE_WORDS,
+        lambda f: 40000 + 16 * f,
+        lambda f: 7 + f,
+        lambda f: 0,
+        lambda f: n - f,
+    ]
+    b = 32 * len(pattern)
+    assert _pick_partition(b, n, k) == 1
+    row_lengths = np.array(
+        [pattern[w](f) for w in range(len(pattern)) for f in range(32)], np.int32
+    )
+    rng = np.random.default_rng(SEED)
+    for kind in ("random", "heavy_ties"):
+        scores = _scores(kind, b, n, rng)
+        idx = _run(scores, k, row_lengths)
+        assert _mismatch(scores, idx, k, row_lengths) is None, kind
+
+
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
 def test_all_neg_inf_rows_return_no_selection(b, n, k, expected_p):
     """`-inf` is never eligible, so every output slot must be `-1`."""
@@ -311,7 +348,7 @@ def test_topk_concentrated_in_the_last_partition():
     candidate blocks are pure padding and stage 2 has to discard them without
     letting a padded entry outrank a real one.
     """
-    b, n, k, p = 16, N_128K, 2048, 8
+    b, n, k, p = 16, N_128K, 2048, 4
     assert _pick_partition(b, n, k) == p
     rng = np.random.default_rng(SEED)
     scores = np.full((b, n), -1e30, np.float32)
@@ -440,10 +477,10 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
     [
         (SINGLE_STAGE, 1, dict(scheduling_group_id=3), [3]),
         (SINGLE_STAGE, 1, {}, [None]),
-        (COOPERATIVE, 8, dict(scheduling_group_id=3), [3]),
-        (COOPERATIVE, 8, {}, [None]),
+        (COOPERATIVE, 4, dict(scheduling_group_id=3), [3]),
+        (COOPERATIVE, 4, {}, [None]),
     ],
-    ids=["p1", "p1_none", "p8", "p8_none"],
+    ids=["p1", "p1_none", "p4", "p4_none"],
 )
 def test_each_stage_gets_the_group_id_it_was_given(
     monkeypatch, shape, expected_p, kwargs, expected
@@ -459,7 +496,7 @@ def test_scheduling_group_ids_reach_the_lowered_hlo():
     something. The id has to survive as a frontend attribute, or the call is
     annotated only in the source."""
     b, n, k = COOPERATIVE
-    assert _pick_partition(b, n, k) == 8
+    assert _pick_partition(b, n, k) == 4
     scores = jnp.zeros((b, n), jnp.float32)
     row_lengths = jnp.full((b,), n, jnp.int32)
 
