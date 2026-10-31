@@ -47,6 +47,8 @@ SUM_GROUP = 8
 # their idle scalar slots.
 PROLOGUE_DMAS = 40
 PASS_DMAS = 2
+# Rows one DMA wait covers before the last few, a multiple of 8.
+WAIT_ROWS = 64
 # Row DMAs per iteration of the loops that start the rows the passes left
 # over, so the scalar address chains of one iteration overlap.
 ISSUE_UNROLL = 8
@@ -108,6 +110,8 @@ def can_use_gather_unpermute(
         # _route_major works on 128-token rows.
         and num_tokens % _LANES == 0
         and TOKEN_BLOCK % SUM_GROUP == 0
+        and WAIT_ROWS % _SUBLANES == 0
+        and _slot_rows(topk) >= WAIT_ROWS
         and topk <= _TABLE_ROWS
         and _slot_rows(topk) <= (1 << _DST_BITS)
         and _TABLE_ROWS * num_tokens < (1 << (31 - _DST_BITS))
@@ -335,10 +339,9 @@ def _kernel(
         ]
         even_lanes_ref[...] = routes[:, _EVEN_ROW * _LANES : (_EVEN_ROW + 1) * _LANES]
 
-        # DMA semaphores count bytes, so a wait for 8 rows covers any 8 of the
-        # block's rows. A wait's row count must be static and tile aligned.
-        block_len = list_len_ref[block]
-
+        # DMA semaphores count bytes, so a wait for n rows covers any n of the
+        # block's rows. A wait's row count must be static and tile aligned, so
+        # the rows are waited for WAIT_ROWS, then 8, then 1 at a time.
         def wait_rows(rows):
             def wait(i, carry):
                 pltpu.make_async_copy(rows, rows, sem).wait()
@@ -346,9 +349,12 @@ def _kernel(
 
             return wait
 
-        tile_rows = slots_ref.at[pl.ds(0, _SUBLANES)]
-        lax.fori_loop(0, lax.div(block_len, _SUBLANES), wait_rows(tile_rows), 0)
-        lax.fori_loop(0, lax.rem(block_len, _SUBLANES), wait_rows(slots_ref.at[0]), 0)
+        rows_left = list_len_ref[block]
+        for chunk in (WAIT_ROWS, _SUBLANES):
+            chunk_rows = slots_ref.at[pl.ds(0, chunk)]
+            lax.fori_loop(0, lax.div(rows_left, chunk), wait_rows(chunk_rows), 0)
+            rows_left = lax.rem(rows_left, chunk)
+        lax.fori_loop(0, rows_left, wait_rows(slots_ref.at[0]), 0)
 
         def sum_group(g, carry):
             # This group's table entries were read one iteration ahead, so
