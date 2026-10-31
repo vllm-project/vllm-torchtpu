@@ -32,6 +32,10 @@ logger = init_logger(__name__)
 
 MIN_NUM_SEQS = 8
 
+# Largest per-rank logits row count at which an EP-DP lockstep step splits the
+# LM head's vocab over the DP ranks instead of streaming all of it on each.
+LOGITS_VOCAB_SHARD_MAX_ROWS = 8
+
 PREFILL_HEAVY_RATIO_THRESHOLD = 0.9
 DECODE_HEAVY_RATIO_THRESHOLD = 0.2
 BALANCED_RATIO_THRESHOLD = (0.4, 0.6)

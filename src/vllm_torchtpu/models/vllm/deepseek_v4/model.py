@@ -845,6 +845,20 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
             self.logits_processor, self.lm_head, hidden_states
         )
 
+    def prepare_logits_vocab_shard(self, group: typing.Any) -> bool:
+        """Arm `compute_logits_vocab_sharded` over ``group``; see
+        `streamed_logits.prepare_vocab_shard`."""
+        if isinstance(self.lm_head, PPMissingLayer):
+            return False
+        return streamed_logits.prepare_vocab_shard(
+            self.logits_processor, self.lm_head, group
+        )
+
+    def compute_logits_vocab_sharded(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """`compute_logits` with the LM head's vocab split over the armed group;
+        collective, see `streamed_logits.compute_logits_vocab_sharded`."""
+        return streamed_logits.compute_logits_vocab_sharded(self.lm_head, hidden_states)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,

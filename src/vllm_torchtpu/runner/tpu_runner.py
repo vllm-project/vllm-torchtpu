@@ -820,6 +820,10 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
         self._dp_step_has_encoder_inputs = False
+        # Whether the LM head can split its vocab over the DP group, and the
+        # logits row count every rank scores with it this step (0: it does not).
+        self._logits_vocab_shard = False
+        self._dp_step_logits_rows = 0
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3546,6 +3550,30 @@ class TPUModelRunner(GPUModelRunner):
             and self.parallel_config.enable_expert_parallel
         )
 
+    def _arm_logits_vocab_shard(self) -> bool:
+        """Whether lockstep steps may split the LM head's vocab over the DP
+        group (`_vocab_shard_logits_rows`). Decided from the config and the
+        head alone, so every DP rank agrees: the plain sampled-logits path of
+        a single pipeline stage, with no drafter or greedy top-token head."""
+        prepare = getattr(self.model, "prepare_logits_vocab_shard", None)
+        if not (
+            prepare is not None
+            and self._dp_lockstep_enabled()
+            and self.parallel_config.pipeline_parallel_size == 1
+            and not self.is_pooling_model
+            and not self.speculative_config
+            and self._greedy_head_owner is None
+            and not _get_sequence_layout_planner_for_runner(
+                self
+            ).uses_selected_logits_hidden_states
+        ):
+            return False
+        from vllm.distributed.parallel_state import get_dp_group
+
+        armed = bool(prepare(get_dp_group()))
+        logger.info("LM head vocab split over the DP group: %s", armed)
+        return armed
+
     def _count_input_chunks(
         self, scheduler_output: "SchedulerOutput"
     ) -> tuple[int, int]:
@@ -3599,6 +3627,13 @@ class TPUModelRunner(GPUModelRunner):
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
 
+        # The negated padded request count reduces to the smallest busy
+        # rank's; an idle rank (no requests) reports none.
+        neg_local_padded_reqs = (
+            -_get_padded_num_reqs_with_upper_limit(local_num_reqs, self.max_num_reqs)
+            if local_num_reqs > 0
+            else -(1 << 62)
+        )
         # Token/chunk metadata is synchronized on vLLM's CPU DP group. The
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
@@ -3609,6 +3644,7 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_num_chunks),
                 int(local_num_reqs),
                 int(has_encoder_inputs),
+                neg_local_padded_reqs,
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3623,7 +3659,31 @@ class TPUModelRunner(GPUModelRunner):
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
+        self._dp_step_logits_rows = self._vocab_shard_logits_rows(
+            num_chunks=int(t[1].item()),
+            max_padded_reqs=_get_padded_num_reqs_with_upper_limit(
+                self._dp_step_max_reqs, self.max_num_reqs
+            ),
+            min_padded_reqs=-int(t[4].item()),
+        )
         return bucket, int(t[1].item())
+
+    def _vocab_shard_logits_rows(
+        self, num_chunks: int, max_padded_reqs: int, min_padded_reqs: int
+    ) -> int:
+        """The logits row count of a step whose LM head splits its vocab over
+        the DP group, or 0. Every rank derives it from the same reduced
+        values, so all of them take the collective path or none does: the
+        step has one forward and every busy rank scores the same few rows
+        (an idle rank pads to them)."""
+        if (
+            self._logits_vocab_shard
+            and num_chunks == 1
+            and min_padded_reqs == max_padded_reqs
+            and max_padded_reqs <= runner_utils.LOGITS_VOCAB_SHARD_MAX_ROWS
+        ):
+            return max_padded_reqs
+        return 0
 
     def _execute_dp_mm_encoder(
         self, scheduler_output: "SchedulerOutput | None" = None
@@ -4076,6 +4136,14 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if top_tokens:
                         logits = self.compute_selected_top_tokens(
+                            hidden_states, logits_indices
+                        )
+                    elif self._dp_step_logits_rows:
+                        assert logits_indices.shape[0] == self._dp_step_logits_rows, (
+                            logits_indices.shape,
+                            self._dp_step_logits_rows,
+                        )
+                        logits = self.compute_selected_logits_vocab_sharded(
                             hidden_states, logits_indices
                         )
                     else:
@@ -5245,6 +5313,7 @@ class TPUModelRunner(GPUModelRunner):
             self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
                 self.model, self._dp_lockstep_enabled()
             )
+        self._logits_vocab_shard = self._arm_logits_vocab_shard()
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -5687,8 +5756,14 @@ class TPUModelRunner(GPUModelRunner):
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
-                _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
-                _ = self.compute_selected_logits(out, _idx)
+                if self._dp_step_logits_rows:
+                    _idx = torch.zeros(
+                        self._dp_step_logits_rows, dtype=torch.int32, device=out.device
+                    )
+                    _ = self.compute_selected_logits_vocab_sharded(out, _idx)
+                else:
+                    _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
+                    _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -6013,6 +6088,29 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
+
+    def _precompile_compute_selected_logits_vocab_sharded(self) -> None:
+        if not self._logits_vocab_shard:
+            return
+        hsize = self.model_config.get_hidden_size()
+        # Collective: every DP rank compiles and runs the same shapes in order.
+        with self._precompile_timed("compute_selected_logits_vocab_sharded"):
+            for num_tokens in self.num_tokens_paddings:
+                dummy_hidden = torch.zeros(
+                    (num_tokens, hsize),
+                    dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                for num_reqs in self.num_reqs_paddings:
+                    if num_reqs > runner_utils.LOGITS_VOCAB_SHARD_MAX_ROWS:
+                        break
+                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                    out = self.compute_selected_logits_vocab_sharded(
+                        dummy_hidden, indices
+                    )
+                    synchronize_tensors(out)
+                    logger.info(
+                        "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
+                    )
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -6438,6 +6536,7 @@ class TPUModelRunner(GPUModelRunner):
             # Only the last stage holds the lm_head and samples.
             return
         self._precompile_compute_selected_logits()
+        self._precompile_compute_selected_logits_vocab_sharded()
         if _get_sequence_layout_planner_for_runner(
             self
         ).uses_selected_logits_hidden_states:
@@ -7859,6 +7958,15 @@ class TPUModelRunner(GPUModelRunner):
             return torch.empty((0,), device=hidden_states.device)
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_logits_vocab_sharded(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
+        """`compute_selected_logits` with the LM head's vocab split over the DP
+        group; collective, so every DP rank calls it with the same row count."""
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return self.model.compute_logits_vocab_sharded(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(
