@@ -1004,7 +1004,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         layer = cast("TpuRoutedExperts", layer)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
-        self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        # The adaptive fused EP kernel serves expert-parallel layers only; a
+        # layer that holds every expert (a TP1 pipeline stage) keeps the
+        # grouped-matmul path.
+        self._use_adaptive_fused_moe = (
+            envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+            and layer.moe_config.moe_parallel_config.use_ep
+        )
         activation_str = self._set_tpu_activation(layer)
 
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
