@@ -42,6 +42,12 @@
 #   K3_PD_CONFIG    the serve config both engines booted, read here for the cases
 #   ARTIFACTS_DIR   where results go, uploaded as the step's artifacts
 #   AGENTX_CHIPS    physical TPU chips serving the pair; no default
+#   K3_PD_NUM_PREFILL, K3_PD_NUM_DECODE  engines per role (xPyD); default 1.
+#                   Replica 0's head is <name>-<role>-0-0.<name>, replica r's
+#                   <name>-<role><r>-0-0.<name> (one replicated job per engine)
+#   K3_PD_ROUTER_EXTRA  extra vllm-router flags (word-split)
+#   K3_PD_PREFILL_POLICY, K3_PD_DECODE_POLICY  router policy per role; default
+#                   consistent_hash for both
 # The config states the cases and labels: AGENTX_CONC_LIST, AGENTX_MODEL_PREFIX,
 #   AGENTX_PRECISION, and optionally AGENTX_POST_EVAL_SUITES,
 #   AGENTX_EVAL_JOB_SUITES, AGENTX_PROXY,
@@ -68,8 +74,22 @@ PORT=8000
 PROXY_PORT=8100
 
 : "${WORKLOAD_NAME:?the JobSet name is how the engines are addressed}"
-PREFILL_HOST="${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}"
-DECODE_HOST="${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}"
+NUM_PREFILL="${K3_PD_NUM_PREFILL:-1}"
+NUM_DECODE="${K3_PD_NUM_DECODE:-1}"
+for _n in "$NUM_PREFILL" "$NUM_DECODE"; do
+    case "$_n" in ''|*[!0-9]*|0) echo "FATAL: bad K3_PD_NUM_PREFILL/K3_PD_NUM_DECODE '$_n'"; exit 2 ;; esac
+done
+# role_head <role> <replica>: that engine's head host.
+role_head() {
+    local r="$2"; [ "$r" != 0 ] || r=""
+    echo "${WORKLOAD_NAME}-$1${r}-0-0.${WORKLOAD_NAME}"
+}
+PREFILL_HOSTS=() DECODE_HOSTS=()
+for ((_i = 0; _i < NUM_PREFILL; _i++)); do PREFILL_HOSTS+=("$(role_head prefill "$_i")"); done
+for ((_i = 0; _i < NUM_DECODE; _i++)); do DECODE_HOSTS+=("$(role_head decode "$_i")"); done
+PREFILL_HOST="${PREFILL_HOSTS[0]}"
+DECODE_HOST="${DECODE_HOSTS[0]}"
+ALL_HOSTS=("${PREFILL_HOSTS[@]}" "${DECODE_HOSTS[@]}")
 
 # For ix_export_topology; the pod keeps its own log tag.
 # shellcheck source=scripts/vllm/benchmark/inferencex/sweep_lib.sh
@@ -161,7 +181,7 @@ fi
 : "${AGENTX_CHIPS:?the manifest must state the physical chip count (32 for two 2x2x4 slices)}"
 case "$AGENTX_CHIPS" in ''|*[!0-9]*|0) log "FATAL: bad AGENTX_CHIPS '$AGENTX_CHIPS'"; exit 2 ;; esac
 CHIPS="$AGENTX_CHIPS"
-RANKS=$(( CFG_TP * CFG_DP * 2 ))
+RANKS=$(( CFG_TP * CFG_DP * (NUM_PREFILL + NUM_DECODE) ))
 if [ "$RANKS" -ne $(( CHIPS * 2 )) ]; then
     log "WARNING: the pair runs $RANKS ranks on $CHIPS chips, which is not the" \
         "two-per-chip v7x shape; check AGENTX_CHIPS is chips and not ranks"
@@ -201,7 +221,7 @@ if [ "$SMOKE" = 1 ]; then
 fi
 
 log "config=$CONFIG concs=${CONCS[*]} max_num_seqs=$CFG_MAX_NUM_SEQS chips=$CHIPS ranks=$RANKS spec=$CFG_SPEC_METHOD" \
-    "prefill=$PREFILL_HOST decode=$DECODE_HOST proxy=$CFG_PROXY eval_only=$EVAL_ONLY smoke=$SMOKE" \
+    "prefill=${PREFILL_HOSTS[*]} decode=${DECODE_HOSTS[*]} proxy=$CFG_PROXY eval_only=$EVAL_ONLY smoke=$SMOKE" \
     "post_eval_suites=$POST_EVAL_SUITES"
 
 proxy_pid=""
@@ -236,29 +256,60 @@ wait_health() {
     done
     log "$what is ready"
 }
-wait_health "http://${PREFILL_HOST}:${PORT}/health" "the prefill head" || exit 1
-wait_health "http://${DECODE_HOST}:${PORT}/health" "the decode head" || exit 1
+for _h in "${ALL_HOSTS[@]}"; do
+    wait_health "http://${_h}:${PORT}/health" "the head $_h" || exit 1
+done
 
 # The block geometry each engine settled on: the pair only transfers KV when the
 # two agree.
-for url in "http://${PREFILL_HOST}:${PORT}" "http://${DECODE_HOST}:${PORT}"; do
-    log "cache config at $url:"
-    curl -sf --max-time 30 "$url/metrics" | grep -m1 '^vllm:cache_config_info' || true
+_metrics=()
+for _h in "${ALL_HOSTS[@]}"; do
+    log "cache config at http://$_h:$PORT:"
+    curl -sf --max-time 30 "http://$_h:$PORT/metrics" | grep -m1 '^vllm:cache_config_info' || true
+    _metrics+=("http://$_h:$PORT/metrics")
 done
 
-# Both engines, prefill first, as srt_agentic.sh orders them: the proxy fronting
+# Every engine, prefills first, as srt_agentic.sh orders them: the proxy fronting
 # the pair has no /metrics of its own, so aiperf reads each engine's.
-export AIPERF_SERVER_METRICS_URLS="http://${PREFILL_HOST}:${PORT}/metrics,http://${DECODE_HOST}:${PORT}/metrics"
+AIPERF_SERVER_METRICS_URLS=$(IFS=,; echo "${_metrics[*]}")
+export AIPERF_SERVER_METRICS_URLS
 
 log "starting the $CFG_PROXY proxy on port $PROXY_PORT"
 if [ "$CFG_PROXY" = router ]; then
     # The request timeout covers a full decode; retries off so a failed hop
     # fails the request instead of prefilling it twice.
+    # consistent_hash keys on aiperf's x-correlation-id, so a conversation's
+    # turns stay on one prefill and one decode. K3_PD_PREFILL_POLICY and
+    # K3_PD_DECODE_POLICY override it per role.
+    _router_args=()
+    for _h in "${PREFILL_HOSTS[@]}"; do _router_args+=(--prefill "http://${_h}:${PORT}"); done
+    for _h in "${DECODE_HOSTS[@]}"; do _router_args+=(--decode "http://${_h}:${PORT}"); done
+    _router_args+=(--policy consistent_hash)
+    # With several prefills, cache_aware places new conversations on the
+    # least-loaded prefill and keeps a conversation's turns together; the
+    # decode stays consistent_hash (cache_aware pins nearly every request to
+    # one decode, as the AgentX traces share a long prefix).
+    if [ -z "${K3_PD_PREFILL_POLICY:-}" ] && [ "${#PREFILL_HOSTS[@]}" -gt 1 ]; then
+        K3_PD_PREFILL_POLICY=cache_aware
+    fi
+    # With several decodes, power_of_two balances them by load; consistent_hash
+    # left one decode 18-39% above the mean.
+    if [ -z "${K3_PD_DECODE_POLICY:-}" ] && [ "${#DECODE_HOSTS[@]}" -gt 1 ]; then
+        K3_PD_DECODE_POLICY=power_of_two
+    fi
+    if [ -n "${K3_PD_PREFILL_POLICY:-}${K3_PD_DECODE_POLICY:-}" ]; then
+        vllm-router --help 2>&1 | grep -E -- '--(prefill|decode)-policy' \
+            || { log "FATAL: vllm-router has no --prefill-policy/--decode-policy"; exit 2; }
+        _router_args+=(${K3_PD_PREFILL_POLICY:+--prefill-policy "$K3_PD_PREFILL_POLICY"}
+            ${K3_PD_DECODE_POLICY:+--decode-policy "$K3_PD_DECODE_POLICY"})
+    fi
+    # Extra router flags, e.g. cache_aware's --balance-abs-threshold.
+    # shellcheck disable=SC2206
+    [ -z "${K3_PD_ROUTER_EXTRA:-}" ] || _router_args+=(${K3_PD_ROUTER_EXTRA})
+    log "router: ${_router_args[*]}"
     vllm-router --host 0.0.0.0 --port "$PROXY_PORT" \
         --vllm-pd-disaggregation \
-        --prefill "http://${PREFILL_HOST}:${PORT}" \
-        --decode "http://${DECODE_HOST}:${PORT}" \
-        --policy consistent_hash \
+        "${_router_args[@]}" \
         --request-timeout-secs 5000 --worker-startup-timeout-secs 300 \
         --health-check-interval-secs 30 --disable-retries \
         --prometheus-host 0.0.0.0 --prometheus-port $((PROXY_PORT + 1)) \
