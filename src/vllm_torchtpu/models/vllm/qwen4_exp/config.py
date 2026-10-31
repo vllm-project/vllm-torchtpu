@@ -301,7 +301,18 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
     def verify_and_update_config(vllm_config):
         # Reuse upstream's text/config normalization, including removal of
         # mrope even though this class truthfully does not support vision.
-        Qwen4ExpForCausalLMConfig.verify_and_update_config(vllm_config)
+        # Upstream refuses pipeline parallelism because its non-first ranks
+        # never see the raw input_ids the n-gram PLE lookup needs. The TPU
+        # runner passes input_ids to every stage and Qwen4ExpAdapter builds
+        # the n-gram context for every stage, so run its other checks at PP1;
+        # validate_config admits the TPU pipeline shape.
+        parallel = vllm_config.parallel_config
+        stages = parallel.pipeline_parallel_size
+        parallel.pipeline_parallel_size = 1
+        try:
+            Qwen4ExpForCausalLMConfig.verify_and_update_config(vllm_config)
+        finally:
+            parallel.pipeline_parallel_size = stages
         normalize_text_config(vllm_config.model_config.hf_text_config)
         validate_config(vllm_config)
         qwen = vllm_config.additional_config.get("qwen4_exp", {})
