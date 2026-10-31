@@ -82,6 +82,15 @@ _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 # routing tables) against ~90 us of SparseCore v2 plus convert; decode at the
 # 1024-token bucket keeps v2. A decode step of 2048 tokens takes it too.
 TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
+# From this EP token count, the SparseCore dispatch gathers only the first
+# DISPATCH_HEAD_ROWS routed rows, and the expert MLP reads the rest straight
+# from the tokens' rows (gmm_v2_fused_mlp's token_rows) while it runs the
+# head. Below it the gather is short and the TensorCore has other work to
+# hide it behind.
+DISPATCH_SPLIT_MIN_TOKENS = 4096
+# Whole 2048-row ragged_gather_v2 blocks, and whole 16-row sublane blocks as
+# gmm_v2_fused_mlp's head must be.
+DISPATCH_HEAD_ROWS = 2048
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Above 2,048 routed rows, the inverse-permutation scatter costs more than
@@ -318,7 +327,8 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    gather_rows: bool = True,
+) -> tuple[jax.Array | None, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
@@ -326,7 +336,8 @@ def prepare_routed_gmm_inputs(
     mask). For EP, the caller applies the expert-map remap upstream
     (inside this JIT) and marks non-local entries with a negative id which
     the mask filters out. Always running the masked branch keeps a single
-    code path.
+    code path. Without ``gather_rows`` the routed rows are left to the
+    caller and None is returned for them.
     """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
@@ -399,7 +410,9 @@ def prepare_routed_gmm_inputs(
         else:
             token_indices_sorted = token_indices_flat[sorted_indices]
 
-    if use_ep and use_sparse_core:
+    if not gather_rows:
+        x = None
+    elif use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
@@ -466,6 +479,17 @@ def _runs_tc_combine(
     )
 
 
+def _fused_mlp_kwargs(
+    activation: str, dtype: jnp.dtype, w1: jax.Array, rhs_quant_dtype
+) -> dict:
+    return dict(
+        fuse_act=activation,
+        preferred_element_type=dtype,
+        maybe_quantize_lhs=not _is_fp4_weight(w1),
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -488,6 +512,7 @@ def moe_gmm(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     combine_in_pieces: bool = False,
+    token_rows: jax.Array | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -497,18 +522,31 @@ def moe_gmm(
     ``combine_in_pieces`` says the output is reduce-scattered by the EP
     combine, which may split it (ep_combine_layout); its rows are then
     returned piece-major, as the split combine reads them.
+    With ``token_rows`` (the tokens' rows), x holds only the first routed
+    rows and the fused MLP reads the rest from token_rows by
+    token_indices_sorted; the caller has checked that it can.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
     # One kernel for both legs keeps the gate/up output in VMEM instead of
     # writing it to HBM for the down leg to read back.
-    fused_kwargs = dict(
-        fuse_act=activation,
-        preferred_element_type=x.dtype,
-        maybe_quantize_lhs=not _is_fp4_weight(w1),
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    if _is_fp4_weight(w1) == _is_fp4_weight(w2) and can_fuse_mlp(
+    fused_kwargs = _fused_mlp_kwargs(activation, x.dtype, w1, rhs_quant_dtype)
+    if token_rows is not None:
+        gmm2_res = gmm_v2_fused_mlp(
+            x,
+            w1,
+            w2,
+            group_sizes,
+            w1_scale,
+            w1_bias,
+            w2_scale,
+            w2_bias,
+            group_offset[0],
+            token_rows=token_rows,
+            token_row_ids=token_indices_sorted,
+            **fused_kwargs,
+        )
+    elif _is_fp4_weight(w1) == _is_fp4_weight(w2) and can_fuse_mlp(
         x, w1, w2, group_sizes, w1_scale, w1_bias, w2_scale, w2_bias, **fused_kwargs
     ):
         gmm2_res = gmm_v2_fused_mlp(
@@ -818,6 +856,31 @@ def fused_moe_func(
         piece_rows = combine_piece_rows(num_tokens) if combine_in_pieces else ()
         return _piece_major(out, piece_rows) if piece_rows else out
 
+    num_routes = num_tokens * topk
+    # Large batches (prefill chunks; the count is of tokens gathered across
+    # EP ranks): the SparseCore gathers only the head of the routed rows and
+    # the fused MLP starts on it as soon as it lands, fetching the rest itself.
+    dispatch_head_only = (
+        use_ep
+        and use_sparse_core
+        and num_tokens >= DISPATCH_SPLIT_MIN_TOKENS
+        and num_routes > onehot_moe_permute_threshold
+        and padded_hidden_size == hidden_size
+        and num_tokens % 2 == 0
+        and _is_fp4_weight(w1) == _is_fp4_weight(w2)
+        and can_fuse_mlp(
+            jax.ShapeDtypeStruct((num_routes, hidden_size), hidden_states.dtype),
+            w1,
+            w2,
+            jax.ShapeDtypeStruct((w1.shape[0],), jnp.int32),
+            w1_scale,
+            w1_bias,
+            w2_scale,
+            w2_bias,
+            token_rows=True,
+            **_fused_mlp_kwargs(activation, hidden_states.dtype, w1, rhs_quant_dtype),
+        )
+    )
     (
         x,
         group_sizes,
@@ -835,8 +898,18 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        gather_rows=not dispatch_head_only,
     )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    if dispatch_head_only:
+        valid_count = group_sizes.sum(dtype=jnp.int32)
+        x = ragged_gather_v2(
+            hidden_states,
+            token_indices_sorted[:DISPATCH_HEAD_ROWS],
+            jnp.array([0], dtype=jnp.int32),
+            jnp.minimum(valid_count, DISPATCH_HEAD_ROWS)[None],
+        )
+    else:
+        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
         w1,
@@ -858,5 +931,6 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         combine_in_pieces=combine_in_pieces,
+        token_rows=hidden_states if dispatch_head_only else None,
     )
     return x[:num_tokens, :hidden_size]
