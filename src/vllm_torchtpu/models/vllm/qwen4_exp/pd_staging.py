@@ -94,6 +94,9 @@ def bucket(n: int, floor: int = 1024) -> int:
 
 def _pad(values: list[int], size: int) -> list[int]:
     # Repeat the last pair: duplicate writes of identical values are no-ops.
+    # A rank can own no rows (a DCP rank of a request shorter than its page);
+    # row 0 is the null page's on both sides, which nothing reads.
+    values = values or [0]
     return values + [values[-1]] * (size - len(values))
 
 
