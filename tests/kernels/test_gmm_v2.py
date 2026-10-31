@@ -572,7 +572,7 @@ def test_gmm_v2_fused_mlp_matches_two_calls(group_sizes):
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("head_rows", [16, 32, 256])
+@pytest.mark.parametrize("head_rows", [0, 16, 32, 256])
 @pytest.mark.parametrize(
     "group_sizes",
     [[40, 0, 3, 197, 1, 300, 59], [600], [0, 0, 17, 0, 0, 0, 0, 1]],
@@ -634,7 +634,7 @@ def test_gmm_v2_fused_mlp_token_rows_match_gathered_rows(group_sizes, head_rows)
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("head_rows", [32, 256])
+@pytest.mark.parametrize("head_rows", [0, 32, 256])
 @pytest.mark.parametrize(
     "group_sizes",
     [[40, 0, 3, 197, 1, 300, 59], [600], [0, 0, 17, 0, 0, 0, 0, 1]],
@@ -691,7 +691,7 @@ def test_gmm_v2_fused_mlp_quantized_token_rows_match_bf16_rows(group_sizes, head
         **common,
     )
     actual = gmm_v2_fused_mlp(
-        quantize(tokens[row_ids[:head_rows]]),
+        quantize(tokens[row_ids[:head_rows]]) if head_rows else quantize(tokens)[:0],
         w1,
         w2,
         group_sizes,
