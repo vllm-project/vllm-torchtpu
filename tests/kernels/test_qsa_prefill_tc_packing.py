@@ -1079,13 +1079,14 @@ def test_branch_output_only_is_local_with_global_input_references(
             *args[4:],
         )
     initial = jnp.full_like(args[0], 13)
-    original = adaptive._write_sc_chunk if choose_sc else adaptive._write_tc_chunk
+    use_sc = choose_sc and not empty_partition
+    original = adaptive._write_sc_chunk if use_sc else adaptive._write_tc_chunk
     observed = []
 
     def inspect(arrays, cache, *params, **kwargs):
-        output = params[0] if choose_sc else params[1]
+        output = params[0] if use_sc else params[1]
         assert arrays is global_arrays and cache is args[5]
-        if not choose_sc:
+        if not use_sc:
             assert params[0] is args[6]
         observed.append((len(output), kwargs["output_base"]))
         return original(arrays, cache, *params, **kwargs)
@@ -1096,7 +1097,7 @@ def test_branch_output_only_is_local_with_global_input_references(
 
     monkeypatch.setattr(adaptive, "sc_chunk_size", lambda *args, **kwargs: 8)
     monkeypatch.setattr(adaptive, "sc_grouped_attention", sc)
-    name = "_write_sc_chunk" if choose_sc else "_write_tc_chunk"
+    name = "_write_sc_chunk" if use_sc else "_write_tc_chunk"
     monkeypatch.setattr(adaptive, name, inspect)
     global_arrays = args[:5]
     with jax.disable_jit():
@@ -1117,7 +1118,8 @@ def test_branch_output_only_is_local_with_global_input_references(
     local_initial = jnp.full((256, *args[0].shape[1:]), 19, args[0].dtype)
     wanted[17:] = output_window_reference(args, local_initial, 17, 256, 17)
     if empty_partition:
-        # The original aligned TC and SC writers zero inactive rows.
+        # Empty partitions use TC metadata with zero KV visits.
+        assert core_calls and all(not np.any(call[1]) for call in core_calls)
         wanted[17:] = 0
     np.testing.assert_array_equal(actual, wanted)
     assert observed == [(256, 17)]

@@ -218,6 +218,7 @@ def test_prefill_dma_layout_selects_bounded_fallback(monkeypatch, info, page, ro
     def rpa(*args, **kwargs):
         assert len(args) == len(operands)
         assert all(actual is original for actual, original in zip(args, operands))
+        assert int(kwargs.pop("active_tokens")) == 3
         assert kwargs == options
         calls.append("rpa")
         return expected, cache
@@ -335,3 +336,38 @@ def test_vector_gather_rejects_unbounded_footprint(monkeypatch, info, oversized)
     table = jax.ShapeDtypeStruct((8, columns), dtype)
     logical = jax.ShapeDtypeStruct((8, selected), jnp.int32)
     assert metadata._vector_gather_rows(table, logical) is None
+
+
+@pytest.mark.parametrize("active", [0, 1, 7, 13])
+@pytest.mark.parametrize("fill", [0, 19])
+def test_runtime_prefix_skips_empty_chunks_and_preserves_rows(active, fill):
+    from vllm_torchtpu.kernels.sparse_gqa_decode.batching import attend_in_chunks
+
+    query = jnp.arange(13 * 128, dtype=jnp.float32).reshape(13, 1, 128)
+    lengths = jnp.full((13,), 17, jnp.int32)
+    ids = jnp.arange(13, dtype=jnp.int32)[:, None]
+    cache = jnp.arange(256, dtype=jnp.float32).reshape(2, 128)
+    visited = []
+
+    def attend(q, gate, blocks, lens, table, owner):
+        visited.extend(np.asarray(blocks)[np.asarray(lens) > 0, 0].tolist())
+        return jnp.where((lens > 0)[:, None, None], q + table[:, :1, None], 0), owner
+
+    with jax.disable_jit():
+        output, owner = attend_in_chunks(
+            attend,
+            query,
+            query,
+            ids,
+            lengths,
+            ids,
+            cache,
+            batch_size=4,
+            active_tokens=jnp.array(active, jnp.int32),
+            initial_output=jnp.full_like(query, fill),
+        )
+    expected = np.full(query.shape, fill, np.float32)
+    expected[:active] = np.asarray(query[:active]) + np.arange(active)[:, None, None]
+    np.testing.assert_array_equal(output, expected)
+    assert visited == list(range(active))
+    assert owner is cache

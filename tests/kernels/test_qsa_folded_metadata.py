@@ -64,7 +64,8 @@ def test_folded_verify_routes_rows_and_owners(monkeypatch):
             + 2 * weight.astype(jnp.float32)
             + rows[:, :1, None]
         )
-        return jnp.where((lens > 0)[:, None, None], output, 0), owner
+        inactive = kw["initial_output"] if kind == "decode" else 0
+        return jnp.where((lens > 0)[:, None, None], output, inactive), owner
 
     def prefill(query, weight, ids, lens, rows, owner, local_starts, **kw):
         assert int(local_starts[0]) == 253
@@ -72,7 +73,7 @@ def test_folded_verify_routes_rows_and_owners(monkeypatch):
 
     monkeypatch.setattr(qsa_rpa, "_prefill_attention", prefill)
     monkeypatch.setattr(
-        qsa_rpa, "_rpa_attention_batch", lambda *a, **kw: attend("decode", *a, **kw)
+        qsa_rpa, "rpa_attention", lambda *a, **kw: attend("decode", *a, **kw)
     )
     monkeypatch.setattr(qsa_rpa.batching, "rpa_query_batch_size", lambda *a, **kw: 64)
     with jax.disable_jit():

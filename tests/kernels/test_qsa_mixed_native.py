@@ -188,3 +188,46 @@ def test_native_mixed_indexer_and_attention(
         "output_sha256", hashlib.sha256(np.asarray(result[0]).tobytes()).hexdigest()
     )
     record_property("input_cache_repeat_exact", True)
+
+
+@pytest.mark.tpu_test
+def test_zero_active_partition_keeps_donated_cache_with_nonzero_lengths():
+    q, gate, cache, index_args = mixed_inputs(512, 2, False)
+    _, _, lengths, table, req, starts, _, _ = index_args
+    blocks = jnp.zeros((len(q), 16), jnp.int32)
+    before = np.asarray(cache).tobytes()
+
+    def attention(q, gate, blocks, lengths, table, cache, starts, distribution):
+        return qsa_rpa.qsa_attention(
+            q,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            request_distribution=distribution,
+            kv_heads=1,
+            ratio=4,
+        )
+
+    run = jax.jit(attention, donate_argnums=(5,))
+    args = (
+        q,
+        gate,
+        blocks,
+        lengths,
+        table[req],
+        cache,
+        starts,
+        jnp.zeros(3, jnp.int32),
+    )
+    compiled = run.lower(*args).compile()
+    memory = compiled.memory_analysis()
+    assert memory is not None and memory.alias_size_in_bytes >= cache.nbytes
+    for _ in range(2):
+        output, cache = compiled(*args)
+        jax.block_until_ready((output, cache))
+        np.testing.assert_array_equal(output, 0)
+        assert np.asarray(cache).tobytes() == before
+        args = (*args[:5], cache, *args[6:])

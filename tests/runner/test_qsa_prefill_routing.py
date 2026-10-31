@@ -39,8 +39,16 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
 def runner_inputs(
-    monkeypatch, *, tokens=256, context=0, fp8=True, local_heads=24, kv_heads=2
+    monkeypatch,
+    *,
+    tokens=256,
+    context=0,
+    fp8=True,
+    local_heads=24,
+    kv_heads=2,
+    active_tokens=None,
 ):
+    active_tokens = tokens - 3 if active_tokens is None else active_tokens
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
     cfg = pool_config(tp=24 // local_heads, kv="fp8_e4m3" if fp8 else "bfloat16")
     assert (
@@ -54,7 +62,7 @@ def runner_inputs(
     runner = _make_runner(
         num_computed_tokens=[context],
         prompt_tokens=[context + tokens],
-        scheduled_tokens=[tokens - 3],
+        scheduled_tokens=[active_tokens],
         token_paddings=[tokens],
         pcp_size=1,
         block_size=page,
@@ -82,7 +90,7 @@ def runner_inputs(
 
     runner._build_attention_metadata = build
     prepared = TPUModelRunner._prepare_inputs(
-        runner, _scheduler_output([tokens - 3]), 0, 0
+        runner, _scheduler_output([active_tokens]), 0, 0
     )
     runner.test_attention_metadata = prepared[0]
     adapter = Qwen4ExpAdapter(runner)
@@ -96,7 +104,7 @@ def runner_inputs(
             runner.input_ids_cpu[:tokens],
         )
     )
-    assert kwargs["query_start_loc"].tolist() == [0] + [tokens - 3] * 8
+    assert kwargs["query_start_loc"].tolist() == [0] + [active_tokens] * 8
     assert kwargs["context_lens"].tolist() == [context] + [0] * 7
     ring_tables = prepared[0][names[1]].block_tables
     assert isinstance(ring_tables, torch.Tensor)
@@ -110,7 +118,9 @@ def runner_inputs(
     torch.testing.assert_close(main_tables.reshape(8, -1)[0], tables[0][0])
     assert torch.count_nonzero(main_tables.reshape(8, -1)[1:]) == 0
     assert distribution.tolist() == [0, 0, 1]
-    assert kwargs["valid_tokens"].tolist() == [True] * (tokens - 3) + [False] * 3
+    assert kwargs["valid_tokens"].tolist() == (
+        [True] * active_tokens + [False] * (tokens - active_tokens)
+    )
     return runner, kwargs, layout, columns
 
 

@@ -91,22 +91,23 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
         "block_sparse_gqa_attention",
         functools.partial(capture, "prefill"),
     )
-    monkeypatch.setattr(qsa_rpa, "rpa_attention", functools.partial(capture, "decode"))
     monkeypatch.setattr(
         decode,
         "execute_decode",
         functools.partial(capture, "fused_decode"),
     )
     scale = 2.0 if case == "scale" else 1.0
-    distribution = jnp.array([1, 1, 1] if case == "decode" else [0, 0, 1], jnp.int32)
-    with jax.disable_jit():
-        output, cache = qsa_rpa.qsa_attention(
-            *args, request_distribution=distribution, kv_heads=2, ratio=4, v_scale=scale
-        )
+    # Eligibility belongs to the algorithm leaves. Request partition routing
+    # is exercised separately with real row metadata in test_qsa_review_guards.
+    output, cache = (
+        qsa_rpa.rpa_attention(*args[:-1], kv_heads=2, ratio=4, v_scale=scale)
+        if case == "decode"
+        else qsa_rpa._prefill_attention(*args, kv_heads=2, ratio=4, v_scale=scale)
+    )
     expected = (
         "adaptive"
         if case in ("supported", "slots", "tail", "padded", "page", "cache")
-        else "decode"
+        else "fused_decode"
         if case == "decode"
         else "prefill"
     )
