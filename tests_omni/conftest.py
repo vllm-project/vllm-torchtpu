@@ -205,6 +205,19 @@ def omni_runner(
     yield _omni_runner_manager.get_or_create(request.param)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _omni_model_patches() -> None:
+    """Install the TPU model patches that the diffusion worker runs with.
+
+    Production installs them on the first diffusion attention backend lookup,
+    so without this an in-process test runs them only if an earlier test in
+    the session built attention.
+    """
+    from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
+
+    apply_omni_model_specific_patches()
+
+
 @pytest.fixture(autouse=True)
 def _sync_tpu(request: pytest.FixtureRequest) -> Generator[None, None, None]:
     """Flush deferred torch_tpu ops between in-process TPU tests."""
