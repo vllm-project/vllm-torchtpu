@@ -5999,6 +5999,8 @@ class TestTPUConnectorStats(unittest.TestCase):
             "kv_pull_time": [1200.0, 5400.0, 12000.0],
             "mb_transferred": [128.0, 256.0, 2048.0],
             "num_failed_transfers": [0, 1, 2],
+            "reserved_watermark_blocks": [5, 5],
+            "reserved_inflight_load_blocks": [7, 0],
         }
 
         self.metrics.observe(mock_data, engine_idx=0)
@@ -6144,6 +6146,17 @@ class TestTPUConnectorStats(unittest.TestCase):
     def test_prometheus_counter_num_failed_transfers(self):
         counter = self.metrics.counter_tpu_num_failed_transfers[0]
         assert counter._value.get() == 3.0
+
+    def test_prometheus_gauge_kv_admission_reserved_blocks(self):
+        def value(kind):
+            return self.registry.get_sample_value(
+                "vllm:kv_admission_reserved_blocks",
+                {"model_name": "my_model", "engine": "0", "kind": kind},
+            )
+
+        assert value("watermark") == 5
+        # The largest reserve applied since the last export.
+        assert value("inflight_load") == 7
 
     def test_tpu_stats_aggregation_queue_lengths(self):
         stats = TpuKVConnectorStats()
@@ -8229,3 +8242,58 @@ class TestSpecSourceFenceRegisterAhead:
         assert fences == [(2, True)]
         worker.process_send_load(self._meta(c=False))
         assert fences == [(2, True), (2, True)]
+
+
+# ---------------------------------------------------------------------------
+# vllm:kv_admission_reserved_blocks
+# ---------------------------------------------------------------------------
+
+
+@patch(f"{_MOD}.TPUConnectorScheduler")
+class TestAdmissionReservedBlocks:
+    """The scheduler-side connector reports the KV cache manager's reserves."""
+
+    def _bound(self):
+        connector = TPUConnector(
+            _make_vllm_config(is_producer=False),
+            KVConnectorRole.SCHEDULER,
+            _make_test_kv_cache_config(),
+        )
+        calls = []
+        manager = SimpleNamespace(
+            watermark_blocks=5,
+            block_pool=None,
+            allocate_slots=lambda *args, **kwargs: calls.append(kwargs) or "blocks",
+        )
+        connector.bind_kv_cache_manager(manager)  # type: ignore[arg-type]
+        return connector, manager, calls
+
+    @staticmethod
+    def _reserved(connector):
+        stats = connector.get_kv_connector_stats()
+        return (
+            stats.data["reserved_watermark_blocks"],
+            stats.data["reserved_inflight_load_blocks"],
+        )
+
+    def test_no_stats_before_binding(self, _):
+        connector = TPUConnector(
+            _make_vllm_config(is_producer=False),
+            KVConnectorRole.SCHEDULER,
+            _make_test_kv_cache_config(),
+        )
+        assert connector.get_kv_connector_stats() is None
+
+    def test_reports_watermark_and_inflight_reserve(self, _):
+        connector, manager, calls = self._bound()
+        assert self._reserved(connector) == ([5], [0])
+
+        # Async-load admissions pass the in-flight reserve; others pass none.
+        assert manager.allocate_slots("req", 16, reserved_blocks=7) == "blocks"
+        manager.allocate_slots("req", 16, reserved_blocks=3)
+        manager.allocate_slots("req", 16)
+        assert calls[0] == {"reserved_blocks": 7}
+        assert self._reserved(connector) == ([5], [7])
+
+        # Each step reports the reserves applied since the last one.
+        assert self._reserved(connector) == ([5], [0])
