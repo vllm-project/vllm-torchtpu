@@ -11,11 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    MoEActivation,
+    RoutingMethodType,
+)
+from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
 
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     VllmCompressedTensorsConfig,
@@ -29,7 +38,10 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
     VllmCompressedTensorsW4ANMxfp4MoEMethod,
 )
-from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+    VllmFp8Config,
+    VllmFp8MoEMethodTPU,
+)
 
 
 class FakeQuantArgs:
@@ -181,3 +193,111 @@ class TestCompressedTensorsConfigRouting:
             VllmCompressedTensorsMoEMethod.get_moe_method(
                 config, layer, "model.layers.0.block"
             )
+
+
+def _compressed_tensors_fp8_config(weights: dict) -> VllmCompressedTensorsConfig:
+    """llm-compressor FP8 `quantization_config`, reduced to what MoE dispatch reads."""
+    return VllmCompressedTensorsConfig.from_config(
+        {
+            "config_groups": {
+                "group_0": {
+                    "weights": {"type": "float", **weights},
+                    "targets": ["Linear"],
+                }
+            },
+            "format": "float-quantized",
+            "quant_method": "compressed-tensors",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "weights,w13_scale_shape,w2_scale_shape",
+    [
+        # One scale per 128x128 block of the 2 experts' [512, 256] w13 / [256, 256] w2.
+        pytest.param(
+            {"strategy": "block", "block_structure": [128, 128]},
+            (2, 4, 2),
+            (2, 2, 2),
+            id="block",
+        ),
+        # Per-channel already used `weight_scale`; it must keep doing so.
+        pytest.param({"strategy": "channel"}, (2, 512, 1), (2, 256, 1), id="channel"),
+    ],
+)
+def test_fp8_experts_register_compressed_tensors_scale_names(
+    monkeypatch, weights, w13_scale_shape, w2_scale_shape
+):
+    """compressed-tensors names every scale `weight_scale`; expert loaders look
+    parameters up by that name, so the fused layer must not register
+    VllmFp8MoEMethodTPU's default DeepSeek-style `weight_scale_inv` instead."""
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_expert_parallel=False)
+    )
+    monkeypatch.setattr(VllmCompressedTensorsConfig, "vllm_config", vllm_config)
+    monkeypatch.setattr(VllmFp8Config, "vllm_config", vllm_config)
+    # Block-scale geometry asks the TP group for its size; no group exists here.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1
+    )
+    parallel = FusedMoEParallelConfig(
+        tp_size=1,
+        pcp_size=1,
+        dp_size=1,
+        ep_size=1,
+        tp_rank=0,
+        pcp_rank=0,
+        dp_rank=0,
+        ep_rank=0,
+        sp_size=1,
+        use_ep=False,
+        all2all_backend="allgather_reducescatter",
+        enable_eplb=False,
+    )
+    with set_current_vllm_config(vllm_config):
+        layer = RoutedExperts(
+            layer_name="model.layers.0.mlp.experts",
+            params_dtype=torch.bfloat16,
+            moe_config=FusedMoEConfig(
+                num_experts=2,
+                experts_per_token=1,
+                hidden_dim=256,
+                intermediate_size=256,
+                num_local_experts=2,
+                num_logical_experts=2,
+                activation=MoEActivation.SILU,
+                device=torch.device("cpu"),
+                routing_method=RoutingMethodType.Renormalize,
+                moe_parallel_config=parallel,
+                in_dtype=torch.bfloat16,
+            ),
+            quant_config=_compressed_tensors_fp8_config(weights),
+            expert_map_manager=ExpertMapManager(
+                max_num_batched_tokens=16,
+                top_k=1,
+                global_num_experts=2,
+                num_redundant_experts=0,
+                num_expert_group=None,
+                moe_parallel_config=parallel,
+                placement_strategy="linear",
+                enable_eplb=False,
+            ),
+        )
+
+    assert isinstance(layer.quant_method, VllmFp8MoEMethodTPU)
+    params = dict(layer.named_parameters())
+    assert not [name for name in params if name.endswith("weight_scale_inv")]
+    assert params["w13_weight_scale"].shape == w13_scale_shape
+    assert params["w2_weight_scale"].shape == w2_scale_shape
+    # Expert loaders pass the checkpoint's own tensor name to the loader.
+    w2_scale = params["w2_weight_scale"]
+    scales = torch.arange(w2_scale[0].numel(), dtype=torch.float32).reshape(
+        w2_scale.shape[1:]
+    )
+    layer.weight_loader(w2_scale, scales, "w2_weight_scale", "w2", 0)
+    torch.testing.assert_close(w2_scale[0], scales)

@@ -783,14 +783,26 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
 
-    def __init__(self, quant_config: Fp8Config, moe_config):
+    def __init__(
+        self,
+        quant_config: Fp8Config,
+        moe_config,
+        weight_scale_name: str | None = None,
+    ):
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
-        self.weight_scale_name = (
-            "weight_scale_inv" if self.block_quant else "weight_scale"
-        )
+        # Checkpoint name of the expert scales. Native fp8 checkpoints store
+        # block scales as `weight_scale_inv` (DeepSeek) and per-tensor or
+        # per-channel scales as `weight_scale`; callers whose checkpoints use
+        # another convention (compressed-tensors: always `weight_scale`) pass
+        # the name explicitly.
+        if weight_scale_name is None:
+            weight_scale_name = (
+                "weight_scale_inv" if self.block_quant else "weight_scale"
+            )
+        self.weight_scale_name = weight_scale_name
         # Native allocation/loading reads these states in vLLM 0.29.
         # maybe_roundup_sizes refines them when a TP shard is smaller than a
         # checkpoint block.
