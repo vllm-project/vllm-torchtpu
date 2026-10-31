@@ -32,21 +32,32 @@ _SHARE_UNITS = 16
 # Row blocks a piece takes one sub-block of: two per rank of an eight-rank
 # group, so every piece spans both halves of every rank's slice.
 COMBINE_BLOCKS = 16
-# Combine inputs that are split, in rows: prefill-sized batches. Other sizes
-# are left whole: on tpu7x (libtpu 0.0.50) XLA compiled some of their pieces
-# to all-reduces instead of SparseCore reduce-scatters. Re-check the pieces'
-# collectives in the compiled HLO before widening this or on a libtpu bump.
-# 4096-row inputs stay whole as well: their 64-row sub-blocks are not whole
-# blocks of the TensorCore combine, so it cannot write each piece in a call of
-# its own, and a split without that overlap only adds the reassembly.
-COMBINE_SPLIT_ROWS = (8192,)
+# Combine inputs that are split, in rows: prefill-sized batches from
+# COMBINE_SPLIT_MIN_ROWS up to, not including, COMBINE_SPLIT_END_ROWS, in whole
+# tiles of every block. Sizes between 8192 and 16384 rows have not been
+# checked, and the TensorCore combine leaves those whose sub-blocks are not
+# whole 128-token blocks to the SparseCore path (fused_moe_gmm). Other
+# sizes are left whole: on tpu7x (libtpu 0.0.50) XLA compiled some of their
+# pieces to all-reduces instead of SparseCore reduce-scatters (16384 rows among
+# them). Re-check the pieces' collectives in the compiled HLO before widening
+# this or on a libtpu bump. 4096-row inputs stay whole as well: their 64-row
+# sub-blocks are not whole blocks of the TensorCore combine, so it cannot write
+# each piece in a call of its own, and a split without that overlap only adds
+# the reassembly.
+COMBINE_SPLIT_MIN_ROWS = 8192
+COMBINE_SPLIT_END_ROWS = 16384
 # Rows of a bf16 (16, 128) tile; sub-blocks stay tile-aligned.
 _ROW_TILE = 16
 
 
 def combine_piece_rows(num_rows: int) -> tuple[int, ...]:
     """Rows each piece takes from every block; empty when not split."""
-    if num_rows not in COMBINE_SPLIT_ROWS:
+    # A range, not a set of sizes: the combine traces this with the token count
+    # dynamic, and an equality guard on it would pin the trace to one size.
+    if not (
+        COMBINE_SPLIT_MIN_ROWS <= num_rows < COMBINE_SPLIT_END_ROWS
+        and num_rows % (COMBINE_BLOCKS * _ROW_TILE) == 0
+    ):
         return ()
     block_rows = num_rows // COMBINE_BLOCKS
     leading = [

@@ -23,7 +23,7 @@ import pytest
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_combine_layout import (
-    COMBINE_SPLIT_ROWS,
+    COMBINE_SPLIT_MIN_ROWS,
     combine_piece_rows,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
@@ -46,7 +46,7 @@ def test_select_ragged_gather_reduce(version):
 
 
 def test_unpermute_of_piece_major_routes_writes_piece_major_rows():
-    num_tokens, topk, hidden, source_rows = COMBINE_SPLIT_ROWS[0], 6, 128, 5000
+    num_tokens, topk, hidden, source_rows = COMBINE_SPLIT_MIN_ROWS, 6, 128, 5000
     rng = np.random.default_rng(0)
     source = jnp.asarray(rng.standard_normal((source_rows, hidden)), jnp.bfloat16)
     indices = jnp.asarray(rng.integers(0, source_rows, num_tokens * topk), jnp.int32)
@@ -373,7 +373,7 @@ def test_moe_gmm_tensorcore_combine_writes_the_pieces_itself(
     monkeypatch, min_tokens, expected
 ):
     """Only combines other than the TensorCore one get piece-major routes."""
-    num_tokens, topk, hidden = COMBINE_SPLIT_ROWS[0], 6, 256
+    num_tokens, topk, hidden = COMBINE_SPLIT_MIN_ROWS, 6, 256
     routes = num_tokens * topk
     calls = []
     token_order = {}

@@ -19,7 +19,8 @@ import torch
 
 from vllm_torchtpu.distributed import tpu_communicator as comm
 from vllm_torchtpu.distributed.ep_combine_layout import (
-    COMBINE_SPLIT_ROWS,
+    COMBINE_BLOCKS,
+    COMBINE_SPLIT_MIN_ROWS,
     combine_piece_rows,
     split_pieces,
 )
@@ -162,7 +163,7 @@ def test_combine_in_pieces_matches_one_reduce_scatter(monkeypatch, communicator,
     group.reduce_scatter.side_effect = _replicated_reduce_scatter(world, rank)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
     monkeypatch.setattr(comm, "get_ep_group", lambda: group)
-    hidden = torch.arange(COMBINE_SPLIT_ROWS[0] * 2.0).view(-1, 2)
+    hidden = torch.arange(COMBINE_SPLIT_MIN_ROWS * 2.0).view(-1, 2)
 
     piece_rows = combine_piece_rows(hidden.shape[0])
     result = communicator.combine(torch.cat(split_pieces(hidden, piece_rows)))
@@ -175,7 +176,7 @@ def test_combine_drafter_keeps_one_reduce_scatter(monkeypatch, communicator):
     monkeypatch.setattr(comm.vllm_compilation_backends, "model_tag", "eagle_head")
     group = Mock(world_size=8)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
-    hidden = torch.ones(COMBINE_SPLIT_ROWS[0], 2)
+    hidden = torch.ones(COMBINE_SPLIT_MIN_ROWS, 2)
 
     result = communicator.combine(hidden)
 
@@ -199,7 +200,29 @@ def test_combine_splits_only_under_ep_with_two_blocks_per_rank_and_equal_groups(
 
 @pytest.mark.parametrize(
     "rows,expected",
-    [(8192, (128, 384)), (4096, ()), (6144, ()), (16384, ()), (2048, ())],
+    [
+        (8192, (128, 384)),
+        (12288, (192, 576)),
+        (8200, ()),
+        (4096, ()),
+        (6144, ()),
+        (16384, ()),
+        (2048, ()),
+    ],
 )
 def test_combine_piece_rows(rows, expected):
     assert combine_piece_rows(rows) == expected
+
+
+def test_combine_piece_rows_keeps_a_dynamic_row_count_dynamic():
+    """combine reads the row count while vLLM traces the token count dynamic."""
+
+    def pieces(hidden):
+        rows = combine_piece_rows(hidden.shape[0])
+        return hidden.split([COMBINE_BLOCKS * r for r in rows])
+
+    torch._dynamo.reset()
+    hidden = torch.ones(COMBINE_SPLIT_MIN_ROWS)
+    torch._dynamo.mark_dynamic(hidden, 0)
+    result = torch.compile(pieces, backend="eager", fullgraph=True)(hidden)
+    assert [p.shape[0] for p in result] == [2048, 6144]
