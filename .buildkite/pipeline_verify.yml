@@ -18,33 +18,15 @@
 # whose agents hold the GitHub App credentials its pushes use, and pushes
 # nothing until the kube nightly's schedule sets KUBE_OWNS_NIGHTLY=1.
 
-x-run-condition: &run-on-nightly-or-tag
-  if: 'build.env("NIGHTLY") == "1" || build.tag =~ /^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$/'
-
 steps:
-  - label: "Upload Tests for Models & Features"
-    <<: *run-on-nightly-or-tag
-    agents:
-      queue: cpu
-    commands:
-      - bash .buildkite/scripts/upload_models_and_features.sh
-
   - label: "Support matrices and verified commit"
-    <<: *run-on-nightly-or-tag
+    if: 'build.env("NIGHTLY") == "1" || build.tag =~ /^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$/'
     key: "nightly_report"
-    # The suites the matrices are built from, and the nightly tests-lane steps a
-    # verified commit pair also needs passed. It runs whatever their outcome.
+    # Dynamically uploaded by upload_models_and_features.sh; stage-level
+    # dependencies on precheck and tpu are added by render_pipeline.py.
     depends_on:
       - "v6e-group"
       - "v7x-group"
-      - "typecheck_full"
-      - "unit_tests_cpu_nightly"
-      - "unit_tests_general_nightly"
-      - "unit_tests_multichip_nightly"
-      - "unit_tests_spec_decode_nightly"
-      - "unit_tests_spec_decode_multichip_nightly"
-      - "unit_tests_omni_nightly"
-      - "unit_tests_omni_multichip_nightly"
     allow_dependency_failure: true
     agents:
       queue: cpu
