@@ -67,6 +67,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer
 
 logger = init_logger(__name__)
 
@@ -200,7 +201,10 @@ def _group_shared_expert(mlp: Any, tp: int, rank: int) -> None:
         parts,
         (fp8, torch.float32, fp8, torch.float32),
     ):
-        mlp.register_buffer(name, t.to(dtype).contiguous(), persistent=False)
+        # A fresh buffer, not a view of the gathered shards: torch_tpu hands the
+        # executable the buffer behind a tensor, and peer-replayed programs
+        # then disagree with this rank's argument shapes.
+        mlp.register_buffer(name, fresh_buffer(t.to(dtype)), persistent=False)
 
 
 _SHARED_OPS: dict[tuple, Any] = {}
