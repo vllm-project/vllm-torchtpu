@@ -190,7 +190,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         if model.pd_gdn_qk_pair_layout != envs.TPU_GDN_CONV_QK_PAIR_LAYOUT:
             raise ValueError("Qwen PD GDN layout changed since model construction")
         scales = []
-        for index, layer in enumerate(model.model.layers):
+        # This pipeline stage's own layers (all of them without PP).
+        for index in model.model.stage:
+            layer = model.model.layers[index]
             if layer.layer_type == "full_attention":
                 attention = layer.self_attn
                 k, v = attention._k_scale_float, attention._v_scale_float
