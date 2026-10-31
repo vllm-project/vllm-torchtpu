@@ -251,8 +251,8 @@ def _shared_expert(mlp: Any, x: torch.Tensor) -> torch.Tensor:
 
 
 class _OProjReduceScatter:
-    """The MLA op's `prefill_group`: o_proj's partial sums, reduce-scattered to
-    each rank's rows instead of all-reduced."""
+    """The MLA op's `prefill_group` for an input of all rows: o_proj's partial
+    sums, reduce-scattered to each rank's rows instead of all-reduced."""
 
     @staticmethod
     def project_reduce_scatter(x: torch.Tensor, o_proj: Any) -> torch.Tensor:
@@ -260,7 +260,29 @@ class _OProjReduceScatter:
         return tensor_model_parallel_reduce_scatter(partial, 0)
 
 
+class _GatherProjections(_OProjReduceScatter):
+    """The MLA op's `prefill_group` for an input of this rank's rows: the
+    row-local input projections (fused_qkv_a and, on an indexer layer, the
+    indexer's wk/weights) run on the rank's rows and their outputs, 2624 (+160)
+    columns, are all-gathered in place of the 6144-column hidden rows."""
+
+    @staticmethod
+    def project_gather(
+        mla: Any, x: torch.Tensor, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        parts = [mla.fused_qkv_a_proj(x)[0]]
+        indexer = mla.indexer if not mla.skip_topk else None
+        if indexer is not None:
+            parts.append(indexer.wk_weights_proj(x)[0])
+        rows = _all_rows(torch.cat(parts, dim=-1), num_tokens)
+        if indexer is None:
+            return rows, None
+        width = parts[0].shape[-1]
+        return rows[:, :width], rows[:, width:]
+
+
 _O_PROJ_RS = _OProjReduceScatter()
+_GATHER_PROJECTIONS = _GatherProjections()
 
 
 def _check_divides(num_tokens: int) -> int:
@@ -318,10 +340,9 @@ def _sequence_parallel_layer_forward(
         hidden_states = layer.input_layernorm(hidden_states)
     else:
         hidden_states, residual = layer.input_layernorm(hidden_states, residual)
-    if sharded_in:
-        hidden_states = _all_rows(hidden_states, num_tokens)
+    group = _GATHER_PROJECTIONS if sharded_in else _O_PROJ_RS
     hidden_states = layer.self_attn.mla_attn(
-        positions, hidden_states, llama_4_scaling, prefill_group=_O_PROJ_RS
+        positions, hidden_states, llama_4_scaling, prefill_group=group
     )
     if not sharded_in:
         residual = own_rows(residual, fused_moe_ep.rank_operand(), tp)
@@ -471,6 +492,16 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         if "prefill_group" not in inspect.signature(type(mla).forward).parameters:
             raise NotImplementedError(
                 f"the split needs the TPU MLA op's o_proj hook; got {type(mla)}"
+            )
+        if (
+            mla.kimi_preprocess is not None
+            or mla.q_lora_rank is None
+            or mla.g_proj is not None
+            or getattr(mla, "qb_overlap", False)
+        ):
+            raise NotImplementedError(
+                "the split gathers fused_qkv_a outputs: it needs the q_lora MLA "
+                "path without fused preprocessing, g_proj or the q_b overlap"
             )
         mlp = layer.mlp
         experts = mlp.experts.routed_experts

@@ -1406,14 +1406,18 @@ class VllmTPUIndexer(Indexer):
         positions,
         rotary_emb,
         q_b_layer: torch.nn.Module | None = None,
+        kw: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """`q_b_layer` (TPU_INDEXER_QB_OVERLAP): also return `q_b_layer(qr)`,
         run inside the top-k op, as `(topk, q)`; `q` None where the op could
-        not take it (the caller runs `q_b_layer` itself)."""
+        not take it (the caller runs `q_b_layer` itself). `kw`: the
+        `wk_weights_proj` output, when the caller already projected the rows
+        (only their count is then read from `hidden_states`)."""
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         # Fused wk + weights_proj: one GEMM, then split
-        kw, _ = self.wk_weights_proj(hidden_states)
+        if kw is None:
+            kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
 
@@ -2224,6 +2228,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         kv_lora = None
         output_gate = None
         early_topk = None
+        # TPU_MOE_PREFILL_SEQUENCE_PARALLEL: `hidden_states` holds this rank's
+        # rows; the group projects them and gathers the projections instead of
+        # the hidden rows. From here on the gathered fused_qkv_a output stands
+        # in for the step's rows wherever only their count is read.
+        pre_qkv = pre_kw = None
+        project_gather = getattr(prefill_group, "project_gather", None)
+        if project_gather is not None:
+            pre_qkv, pre_kw = project_gather(self, hidden_states, positions.shape[0])
+            hidden_states = pre_qkv
         # TPU_DCP_PREFILL_TOKEN_PARALLEL under query replication: project q for
         # only the rows this rank attends (`dcp_token_parallel_op.q_rows`).
         q_rows = None
@@ -2265,7 +2278,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     "q_b_proj is required when q_lora_rank is not None"
                 )
 
-                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                qkv_lora = (
+                    pre_qkv
+                    if pre_qkv is not None
+                    else self.fused_qkv_a_proj(hidden_states)[0]
+                )
                 if self.gate_is_fused:
                     q_c, kv_lora, output_gate = qkv_lora.split(
                         [
@@ -2367,7 +2384,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 topk_index = early_topk
             elif self.indexer is not None and not self.skip_topk:
                 topk_index = self.indexer(
-                    hidden_states, q_c, positions, self.indexer_rope_emb
+                    hidden_states,
+                    q_c,
+                    positions,
+                    self.indexer_rope_emb,
+                    **({} if pre_kw is None else {"kw": pre_kw}),
                 )
             else:
                 # reuse the indices an earlier layer wrote into the shared buffer.
