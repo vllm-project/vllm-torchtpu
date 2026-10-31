@@ -319,6 +319,10 @@ if TYPE_CHECKING:
     TPU_PREFILL_SEQ_PARALLEL: bool = False
     TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS: int = 256
     TPU_MOE_PREFILL_GATHER_ONCE: bool = False
+    TPU_PREFILL_ROTATED_COLLECTIVES: bool = False
+    TPU_PREFILL_LATENT_NORMS_LOCAL: bool = False
+    TPU_PREFILL_FUSED_OPROJ_RS: bool = False
+    TPU_PREFILL_FUSED_OPROJ_RS_MIN_ROWS: int = 2048
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_MTP_ONEHOT_AR: bool = True
     TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: int = 0
@@ -2312,6 +2316,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # combine reads its row tables back in token order by a reshape. Same rows,
     # same sums, bit for bit.
     "TPU_MOE_PREFILL_GATHER_ONCE": env_bool("TPU_MOE_PREFILL_GATHER_ONCE"),
+    # With TPU_PREFILL_SEQ_PARALLEL on a 2x2x2 slice of 2-core chips: o_proj's
+    # reduce-scatter and the latents' all-gather run as rotated
+    # halving-doubling by remote DMAs (kernels/experimental/
+    # rotated_collectives.py), every chip link busy in every phase, instead of
+    # XLA's one ring. The all-gather is bitwise; the reduce-scatter adds the
+    # same bf16 terms in another order.
+    "TPU_PREFILL_ROTATED_COLLECTIVES": env_bool("TPU_PREFILL_ROTATED_COLLECTIVES"),
+    # With TPU_PREFILL_SEQ_PARALLEL: the q and kv latent RMSNorms run on each
+    # core's rows before the latents' all-gather instead of on every row after
+    # it (1/16 of the rows per core); the norm works on each row alone.
+    "TPU_PREFILL_LATENT_NORMS_LOCAL": env_bool("TPU_PREFILL_LATENT_NORMS_LOCAL"),
+    # With TPU_PREFILL_ROTATED_COLLECTIVES: o_proj's per-channel fp8 matmul runs
+    # inside the rotated reduce-scatter kernel, each row block computed in the
+    # order it is sent and sent while the next is computed, so the matmul
+    # overlaps the transfers and its output never goes to HBM. Same activation
+    # quantization and scale arithmetic as xla_quantized_matmul.
+    "TPU_PREFILL_FUSED_OPROJ_RS": env_bool("TPU_PREFILL_FUSED_OPROJ_RS"),
+    # The fused kernel computes the projection in blocks of chunk/16 rows; below
+    # this many chunk rows the blocks are too short for the matrix unit and the
+    # fused kernel is slower than the separate projection and reduce-scatter
+    # (proxy run vm-02750a1d-03c4-4be0-a6d5: +27 us per 512-row call, -24 us per
+    # 2,048-row call), so smaller chunks keep the two calls.
+    "TPU_PREFILL_FUSED_OPROJ_RS_MIN_ROWS": env_int(
+        "TPU_PREFILL_FUSED_OPROJ_RS_MIN_ROWS", 2048
+    ),
     # RMSNorm (and fused add + RMSNorm) on >= MIN_TOKENS rows of a >= MIN_HIDDEN
     # residual stream runs as one Pallas pass (layers/adapter/rmsnorm.py) instead of
     # XLA's reduce + re-read apply. Decode-sized batches are unchanged. Residual

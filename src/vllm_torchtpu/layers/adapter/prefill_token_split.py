@@ -29,6 +29,11 @@ The layers before the first MoE layer, smaller buckets and the drafter keep
 today's path. Every sum adds the same terms; o_proj's reduce-scatter and the
 norms' kernel (fewer rows per core) may round in another order.
 
+With TPU_PREFILL_ROTATED_COLLECTIVES on a 2x2x2 slice of 2-core chips,
+o_proj's reduce-scatter and the latents' all-gather run as rotated
+halving-doubling (kernels/experimental/rotated_collectives.py), one kernel per
+combine chunk, over the same rows; the final norm's all-gather keeps XLA's.
+
 ``maybe_patch_deepseek_v2`` installs the model forward at platform activation;
 it runs today's forward until ``arm`` (end of TPUModelRunner.load_model, after
 moe_tp_decode and its prequant pairing) has checked the model and given it a
@@ -38,12 +43,14 @@ moe_tp_decode and its prequant pairing) has checked the model and given it a
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import torch
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental import rotated_collectives
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
     gather_rows,
     own_rows,
@@ -93,6 +100,175 @@ def token_fn(mesh, kind: str):
     return fn, specs, rows
 
 
+def rotated_fn(mesh, kind: str, places):
+    """The JAX function of the rotated `kind` ("scatter" or "gather") over the
+    MoE op's mesh: (x, rank) with the core's mesh index as data, one kernel
+    per combine chunk, the rows `scatter_rows` and `gather_rows` give. A shape
+    the kernel does not take keeps XLA's collective."""
+    axis = mesh.axis_names[0]
+    ranks = int(mesh.size)
+    table = rotated_collectives.peer_table(
+        places, "reduce_scatter" if kind == "scatter" else "all_gather"
+    )
+
+    def scatter(x, rank):
+        chunk = x.shape[0] // token_chunks(x.shape[0])
+        if not rotated_collectives.reduce_scatter_supports(chunk, x.shape[1]):
+            return scatter_rows(x, axis)
+        return rotated_collectives.reduce_scatter_chunks(
+            x, rank, jnp.asarray(table), axis=axis, chunk=chunk
+        )
+
+    def gather(x, rank):
+        chunk = x.shape[0] // token_chunks(x.shape[0] * ranks)
+        if not rotated_collectives.all_gather_supports(chunk, x.shape[1]):
+            return gather_rows(x, axis)
+        return rotated_collectives.all_gather_chunks(
+            x, rank, jnp.asarray(table), axis=axis, chunk=chunk
+        )
+
+    local, rows = {
+        "scatter": (scatter, lambda n: n // ranks),
+        "gather": (gather, lambda n: n * ranks),
+    }[kind]
+    specs = (P(axis), P(axis))
+    sharded = jax.shard_map(
+        local, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
+    )
+
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip((x, rank), specs))
+        )
+
+    return fn, specs, rows
+
+
+def fused_projection_fn(mesh, places):
+    """TPU_PREFILL_FUSED_OPROJ_RS: the JAX function (x, w_q, w_s, rank) over
+    the MoE op's mesh -> this core's rows of the sum over the cores of the
+    per-channel fp8 projection of x (``xla_quantized_matmul``), the projection
+    computed block by block inside the rotated reduce-scatter, one kernel per
+    combine chunk. A shape the kernel does not take runs today's projection
+    and the rotated (or XLA's) reduce-scatter."""
+    from vllm_torchtpu.kernels.quantized_matmul.util import (
+        quantize_tensor,
+        xla_quantized_matmul,
+    )
+
+    axis = mesh.axis_names[0]
+    ranks = int(mesh.size)
+    table = rotated_collectives.peer_table(places, "reduce_scatter")
+
+    def local(x, w_q, w_s, rank):
+        chunk = x.shape[0] // token_chunks(x.shape[0])
+        if chunk < envs.TPU_PREFILL_FUSED_OPROJ_RS_MIN_ROWS or not (
+            rotated_collectives.matmul_reduce_scatter_supports(
+                chunk, x.shape[1], w_q.shape[1], w_q.dtype
+            )
+        ):
+            partial = xla_quantized_matmul(x, w_q, w_s)
+            if rotated_collectives.reduce_scatter_supports(chunk, partial.shape[1]):
+                return rotated_collectives.reduce_scatter_chunks(
+                    partial, rank, jnp.asarray(table), axis=axis, chunk=chunk
+                )
+            return scatter_rows(partial, axis)
+        x_q, x_scale = quantize_tensor(x, w_q.dtype)
+        return rotated_collectives.matmul_reduce_scatter_chunks(
+            x_q, x_scale, w_q, w_s, rank, jnp.asarray(table), axis=axis, chunk=chunk
+        )
+
+    specs = (P(axis), P(axis), P(axis), P(axis))
+    sharded = jax.shard_map(
+        local, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
+    )
+
+    def fn(x: jax.Array, w_q: jax.Array, w_s: jax.Array, rank: jax.Array) -> jax.Array:
+        return sharded(
+            *(
+                jax.device_put(a, NamedSharding(mesh, s))
+                for a, s in zip((x, w_q, w_s, rank), specs)
+            )
+        )
+
+    return fn, specs, lambda n: n // ranks
+
+
+def _fused_projection_op(mesh, places):
+    """The torch op of `fused_projection_fn(mesh, places)`."""
+    run, specs, rows = fused_projection_fn(mesh, places)
+    axis = mesh.axis_names[0]
+
+    # torch_tpu reads the operand types from these annotations.
+    def fn(x: jax.Array, w_q: jax.Array, w_s: jax.Array, rank: jax.Array) -> jax.Array:
+        return run(x, w_q, w_s, rank)
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        "pallas::prefill_token_split_fused_projection_scatter",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=P(axis),
+    )
+    op.register_fake(
+        lambda x, w_q, w_s, rank: x.new_empty((rows(x.shape[0]), w_q.shape[1]))
+    )
+    return op
+
+
+def _fused_projection_weights(projection, x: torch.Tensor):
+    """(w_q, w_s) of `projection` when its forward on x is
+    ``xla_quantized_matmul(x, weight, weight_scale)``: a per-channel fp8
+    weight in (k, n) layout, no bias, no activation prequantized upstream,
+    bf16 rows. None otherwise."""
+    from vllm_torchtpu.layers.adapter.linear_common import (
+        KEEP_VLLM_LAYOUT_ATTR,
+        PREQUANT_ATTR,
+    )
+
+    weight = getattr(projection, "weight", None)
+    scale = getattr(projection, "weight_scale", None)
+    if (
+        type(projection.quant_method).__name__ != "VllmFp8LinearMethodTPU"
+        or weight is None
+        or scale is None
+        or weight.dtype != torch.float8_e4m3fn
+        or weight.dim() != 2
+        or scale.dim() != 1
+        or scale.shape[0] != weight.shape[1]
+        or weight.shape[0] != x.shape[-1]
+        or x.dim() != 2
+        or x.dtype != torch.bfloat16
+        or getattr(projection, "bias", None) is not None
+        or getattr(projection, KEEP_VLLM_LAYOUT_ATTR, False)
+        or getattr(projection, PREQUANT_ATTR, None) is not None
+    ):
+        return None
+    return weight, scale
+
+
+def _rotated_op(mesh, kind: str, places):
+    """The torch op of `rotated_fn(mesh, kind, places)`."""
+    run, specs, rows = rotated_fn(mesh, kind, places)
+    axis = mesh.axis_names[0]
+
+    # torch_tpu reads the operand types from these annotations.
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        return run(x, rank)
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        f"pallas::prefill_token_split_rotated_{kind}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=P(axis),
+    )
+    op.register_fake(lambda x, rank: x.new_empty((rows(x.shape[0]), *x.shape[1:])))
+    return op
+
+
 def _token_op(mesh, kind: str):
     """The torch op of `token_fn(mesh, kind)`."""
     run, specs, rows = token_fn(mesh, kind)
@@ -127,12 +303,16 @@ class TokenSplit:
         edge: int,
         moe_slot: PrequantSlot,
         rank_path: str,
+        places=None,
     ):
         """`rank_path`: the attribute path from the first split layer to the
         MoE stage that holds this core's index in `mesh` as int32 [1, 1] data
         (the MoE op's rank operand). The split reads the buffer through that
         path, so the graph lifts it under the name the MoE layer gives it and
-        buckets with and without the split share their compiled pieces."""
+        buckets with and without the split share their compiled pieces.
+        `places` ((chip coords, core on chip) per mesh index) turns on the
+        rotated reduce-scatter and all-gather; they read the core's index from
+        small_all_reduce_op's rank buffer, which o_proj's path already lifts."""
         self.ranks = int(mesh.size)
         self.rank_path = rank_path
         self.first_layer = first_layer
@@ -141,6 +321,13 @@ class TokenSplit:
         self._own = _token_op(mesh, "own")
         self._gather = _token_op(mesh, "gather")
         self._scatter = _token_op(mesh, "scatter")
+        self.rotated = places is not None
+        if self.rotated:
+            self._rotated_scatter = _rotated_op(mesh, "scatter", places)
+            self._rotated_gather = _rotated_op(mesh, "gather", places)
+        self.fused_projection = self.rotated and envs.TPU_PREFILL_FUSED_OPROJ_RS
+        if self.fused_projection:
+            self._fused_projection = _fused_projection_op(mesh, places)
 
     def applies(self, tokens: int) -> bool:
         return tokens > self.edge and tokens % self.ranks == 0
@@ -158,14 +345,36 @@ class TokenSplit:
         return self._gather(x).narrow(0, 0, tokens)
 
     def gather_columns(self, tokens: int, *parts: torch.Tensor):
-        """Every core's rows of `parts`, side by side in one all-gather."""
-        gathered = self.gather(torch.cat(parts, dim=-1), tokens)
-        return gathered.split([part.shape[-1] for part in parts], dim=-1)
+        """Every core's rows of `parts`, side by side in one all-gather. The
+        rotated all-gather moves whole 128-lane tiles: zero columns pad the
+        block to a tile and are dropped after it."""
+        widths = [part.shape[-1] for part in parts]
+        if not self.rotated:
+            gathered = self.gather(torch.cat(parts, dim=-1), tokens)
+            return gathered.split(widths, dim=-1)
+        pad = -sum(widths) % rotated_collectives.LANES
+        if pad:
+            parts = (*parts, parts[0].new_zeros((parts[0].shape[0], pad)))
+        block = torch.cat(parts, dim=-1)
+        gathered = self._rotated_gather(block, small_all_reduce_op._RANK)
+        gathered = gathered.narrow(0, 0, tokens)
+        return gathered.split([*widths, pad] if pad else widths, dim=-1)[: len(widths)]
 
     def project_reduce_scatter(self, x: torch.Tensor, projection) -> torch.Tensor:
         """This core's rows of the row-parallel `projection` of x, summed
         over the cores. `retain` lifts the buffers today's all-reduce lifts."""
+        weights = None
+        if self.fused_projection:
+            weights = _fused_projection_weights(projection, x)
+        if weights is not None:
+            return self._fused_projection(
+                small_all_reduce_op.retain(x), *weights, small_all_reduce_op._RANK
+            )
         partial = projection.quant_method.apply(projection, x, None)
+        if self.rotated:
+            return self._rotated_scatter(
+                small_all_reduce_op.retain(partial), small_all_reduce_op._RANK
+            )
         return self._scatter(small_all_reduce_op.retain(partial))
 
     def moe(self, mlp, x: torch.Tensor) -> torch.Tensor:
@@ -304,6 +513,33 @@ def _refusal(model, mesh_size: int | None = None) -> str | None:
     return None
 
 
+def _rotated_places(mesh):
+    """(chip coords, core on chip) per index of `mesh` when the rotated
+    collectives can run over it, else None with the reason logged. Collective
+    (every rank gathers every rank's device); the same answer on every rank."""
+    from vllm_torchtpu.distributed.ep_mesh import ep_mesh_index
+
+    if small_all_reduce_op._RANK is None:
+        reason = "the small collectives hold no rank buffer (TPU_SMALL_ALL_REDUCE off)"
+    elif int(mesh.size) != rotated_collectives.CORES:
+        reason = f"the mesh has {int(mesh.size)} cores, not {rotated_collectives.CORES}"
+    else:
+        try:
+            places = small_all_reduce_op._chip_places(mesh, ep_mesh_index())
+            rotated_collectives.Layout(places)
+        except (RuntimeError, ValueError) as e:
+            reason = str(e)
+        else:
+            logger.info(
+                "TPU_PREFILL_ROTATED_COLLECTIVES: o_proj's reduce-scatter and the "
+                "latents' all-gather run as rotated halving-doubling over %s",
+                places,
+            )
+            return places
+    logger.warning("TPU_PREFILL_ROTATED_COLLECTIVES: %s; XLA's collectives", reason)
+    return None
+
+
 def arm(model: torch.nn.Module, token_buckets: list[int]) -> bool:
     """Give the target model's DeepseekV2Model a TokenSplit when every MoE
     layer runs moe_tp_decode's stage-A prefill kernel, the attention is the
@@ -367,7 +603,12 @@ def arm(model: torch.nn.Module, token_buckets: list[int]) -> bool:
     assert first is not None
     stage = runners[0].routed_experts
     rank_path = next(n for n, m in backbone.layers[first].named_modules() if m is stage)
-    setattr(backbone, TOKEN_SPLIT_ATTR, TokenSplit(mesh, first, edge, slot, rank_path))
+    places = _rotated_places(mesh) if envs.TPU_PREFILL_ROTATED_COLLECTIVES else None
+    setattr(
+        backbone,
+        TOKEN_SPLIT_ATTR,
+        TokenSplit(mesh, first, edge, slot, rank_path, places),
+    )
     logger.info(
         "TPU_PREFILL_SEQ_PARALLEL: buckets above %d tokens split the residual "
         "stream over %d cores from layer %d of %d",
