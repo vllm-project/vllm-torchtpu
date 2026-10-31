@@ -154,3 +154,45 @@ def test_dispatch_and_combine_with_sequence_parallel(
             assert invocation.kwargs == {"dim": 0}
         assert ep_group.all_gather.call_count == count
         ep_group.reduce_scatter.assert_not_called()
+
+
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_dispatch_gathers_topk_in_one_collective(
+    monkeypatch, communicator, weights_dtype
+):
+    """int32 ids and float weights share one gather and arrive bit for bit."""
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x.flip(0)], dim=dim)
+    weights = torch.tensor([[0.3, -0.0], [float("nan"), 7.5]], dtype=weights_dtype)
+    ids = torch.tensor([[3, 7], [255, 0]], dtype=torch.int32)
+
+    _, gathered_weights, gathered_ids = communicator.dispatch(
+        torch.ones(2, 4), weights, ids
+    )
+
+    assert group.all_gather.call_count == 2  # hidden states, then top-k
+    bits = torch.int16 if weights_dtype == torch.bfloat16 else torch.int32
+    assert gathered_weights.dtype == weights_dtype
+    assert torch.equal(
+        gathered_weights.view(bits), torch.cat([weights, weights.flip(0)]).view(bits)
+    )
+    assert torch.equal(gathered_ids, torch.cat([ids, ids.flip(0)]))
+
+
+def test_gather_topk_carries_row_values_in_the_same_collective():
+    """Extra per-row floats ride in the top-k gather and arrive bit for bit."""
+    group = Mock(world_size=2)
+    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x.flip(0)], dim=dim)
+    weights = torch.tensor([[0.3, -0.0], [float("nan"), 7.5]])
+    ids = torch.tensor([[3, 7], [255, 0]], dtype=torch.int32)
+    scales = torch.tensor([[1e-30, 3.0, 0.5], [2.0**-126, 448.0, 0.0]]).bfloat16()
+
+    gathered = comm.gather_topk(group, weights, ids, scales)
+
+    group.all_gather.assert_called_once()
+    for actual, sent in zip(gathered, (weights, ids, scales)):
+        assert actual.dtype == sent.dtype
+        bits = {torch.bfloat16: torch.int16}.get(sent.dtype, torch.int32)
+        expected = torch.cat([sent, sent.flip(0)])
+        assert torch.equal(actual.view(bits), expected.view(bits))

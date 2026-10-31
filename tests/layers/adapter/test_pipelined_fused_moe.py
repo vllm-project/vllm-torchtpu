@@ -50,6 +50,10 @@ def _make_mock_moe_config():
     )
 
 
+# A method on one rank: no DP/SP gather for a method to claim.
+_SINGLE_RANK_METHOD = SimpleNamespace(_routes_before_dispatch=False)
+
+
 def test_env_var_default_and_override():
     """Verify TPU_MOE_COLLECTION_CHUNK_SIZE default is 0 and parses positive ints."""
     with patch.dict(os.environ, {}, clear=True):
@@ -96,10 +100,34 @@ def test_supports_internal_mk_property(method_cls):
     assert isinstance(prop, property)
 
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
-        assert prop.fget(None) is False
+        assert prop.fget(_SINGLE_RANK_METHOD) is False
 
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384):
-        assert prop.fget(None) is True
+        assert prop.fget(_SINGLE_RANK_METHOD) is True
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "is_sequence_parallel", "pcp_size", "claimed"),
+    [
+        (1, False, 1, False),
+        (8, False, 1, True),
+        (1, True, 1, True),
+        (8, False, 2, False),
+    ],
+)
+def test_mxfp4_routes_before_dispatch(dp_size, is_sequence_parallel, pcp_size, claimed):
+    """MXFP4 claims vLLM's DP/SP dispatch to route first, but not under PCP."""
+    moe = SimpleNamespace(
+        dp_size=dp_size, is_sequence_parallel=is_sequence_parallel, pcp_size=pcp_size
+    )
+    routes_first = VllmMxfp4MoEMethod._routes_before_dispatch.fget(
+        SimpleNamespace(moe=moe)
+    )
+    assert routes_first is claimed
+
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
+        method = SimpleNamespace(_routes_before_dispatch=routes_first)
+        assert VllmMxfp4MoEMethod.supports_internal_mk.fget(method) is claimed
 
 
 def test_calculate_moe_chunks_math():
@@ -337,7 +365,7 @@ def test_fp8_all_gather_alone_claims_the_collectives():
             patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0),
             patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", True),
         ):
-            assert method_cls.supports_internal_mk.fget(None) is False
+            assert method_cls.supports_internal_mk.fget(_SINGLE_RANK_METHOD) is False
 
 
 def _run_with_fp8_all_gather(

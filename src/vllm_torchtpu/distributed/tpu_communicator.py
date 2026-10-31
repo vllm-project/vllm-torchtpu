@@ -49,6 +49,45 @@ def _gather_hidden_states(
     return group.all_gather(_pin_compact_tiling_op(hidden_states), dim=0)
 
 
+def gather_topk(
+    group: GroupCoordinator,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *row_values: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """All-gather the top-k weights and ids, and any other per-row
+    `row_values`, as one int32 collective; returns them in that order.
+
+    Each is a few bytes per row, so each gather costs about its fixed
+    latency; one gather pays it once. Floats ride as f32 bits, which hold
+    any float of at most 32 bits exactly.
+    """
+    tensors = (topk_weights, topk_ids, *row_values)
+    if topk_ids.dtype != torch.int32 or not all(
+        t.shape[:-1] == topk_ids.shape[:-1]
+        and (
+            t.dtype == torch.int32 or (t.is_floating_point() and t.element_size() <= 4)
+        )
+        for t in tensors
+    ):
+        return tuple(group.all_gather(t, dim=0) for t in tensors)
+    words = [
+        t if t.dtype == torch.int32 else t.float().view(torch.int32) for t in tensors
+    ]
+    packed = group.all_gather(torch.cat(words, dim=-1), dim=0)
+    as_float = packed.view(torch.float32)
+    gathered = []
+    start = 0
+    for t in tensors:
+        end = start + t.shape[-1]
+        if t.dtype == torch.int32:
+            gathered.append(packed[..., start:end].contiguous())
+        else:
+            gathered.append(as_float[..., start:end].to(t.dtype))
+        start = end
+    return tuple(gathered)
+
+
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
 
@@ -101,8 +140,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if group is None:
             return hidden_states, topk_weights, topk_ids
         hidden_states = _gather_hidden_states(group, hidden_states)
-        topk_weights = group.all_gather(topk_weights, dim=0)
-        topk_ids = group.all_gather(topk_ids, dim=0)
+        topk_weights, topk_ids = gather_topk(group, topk_weights, topk_ids)
         return hidden_states, topk_weights, topk_ids
 
     def combine(

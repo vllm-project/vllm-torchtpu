@@ -18,13 +18,17 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
+import jax
 import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.megablox.gmm_v2 import LHS_QUANT_BLOCK_SIZE
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
+    quantize_moe_input,
     quantize_to_native_fp4_kmajor,
+    quantized_rows_shape,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
@@ -32,6 +36,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_moe_input_quantizer_cache: dict[tuple[Any, int, int, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -172,23 +177,52 @@ def _build_fused_moe_custom_op(
     # Pass experts_start as a runtime tensor rather than static closure arg so every EP
     # rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
-    wrapped_fn = functools.partial(
-        fused_moe_func,
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+    def wrapped_fn(
+        hidden_states: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
+        w1_bias: jax.Array | None,
+        w2_bias: jax.Array | None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array | None,
+        hidden_scale: jax.Array | None,
+    ) -> jax.Array:
+        return fused_moe_func(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+            hidden_scale=hidden_scale,
+        )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
     # We must overwrite the default fake implementation as vLLM uses dynamic
     # dimensions for the hidden_states.
-    def _fake_fused_moe(hidden_states, *args, **kwargs):
-        return torch.empty_like(hidden_states)
+    def _fake_fused_moe(hidden_states, *args):
+        hidden_scale = args[-1]
+        if hidden_scale is None:
+            return torch.empty_like(hidden_states)
+        # Quantized rows may come as [T, H // 128, 128] row tiles.
+        return hidden_states.new_empty(
+            hidden_states.flatten(1).shape, dtype=hidden_scale.dtype
+        )
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
@@ -253,6 +287,7 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    hidden_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -265,6 +300,10 @@ def fused_moe_gmm(
     program identical across ranks. The kernel remaps global ids to local ids
     with an elementwise subtract and masks non-local experts. When present,
     the sparse-core parity path dispatches ragged gather/gather-reduce.
+
+    With ``hidden_scale``, ``hidden_states`` are rows quantized by the op of
+    ``build_moe_input_quantizer`` and these their scales (see
+    ``fused_moe_func``).
     """
     use_ep = experts_start is not None
     fused_moe = _get_fused_moe_custom_op(
@@ -290,4 +329,52 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        hidden_scale,
     )
+
+
+def build_moe_input_quantizer(
+    *, q_dtype, dispatch_size: int, topk: int, use_ep: bool
+) -> Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    """The op quantizing this rank's MoE rows as ``fused_moe_gmm`` would.
+
+    It returns the rows as int8-carried ``q_dtype`` and their scales, for a
+    dispatch that gathers ``dispatch_size`` ranks' rows and hands them to
+    ``fused_moe_gmm(hidden_scale=...)``; see ``quantize_moe_input``. Build it
+    outside tracing and call the returned op from the forward.
+    """
+    key = (q_dtype, dispatch_size, topk, use_ep)
+    op = _moe_input_quantizer_cache.get(key)
+    if op is not None:
+        return op
+
+    use_sparse_core = envs.USE_MOE_SPARSE_CORE
+
+    def quantize(hidden_states: jax.Array) -> tuple[jax.Array, jax.Array]:
+        return quantize_moe_input(
+            hidden_states,
+            q_dtype=q_dtype,
+            num_dispatched_tokens=hidden_states.shape[0] * dispatch_size,
+            topk=topk,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+        )
+
+    op = pallas.jax_op(
+        f"pallas::quantize_moe_input_{_allocate_kernel_instance_id()}", quantize
+    )
+
+    def _fake_quantize(hidden_states):
+        num_tokens, hidden_size = hidden_states.shape
+        rows_shape = quantized_rows_shape(
+            num_tokens, hidden_size, use_ep=use_ep, use_sparse_core=use_sparse_core
+        )
+        return (
+            hidden_states.new_empty(rows_shape, dtype=torch.int8),
+            hidden_states.new_empty((num_tokens, hidden_size // LHS_QUANT_BLOCK_SIZE)),
+        )
+
+    op.register_fake(_fake_quantize)
+    _moe_input_quantizer_cache[key] = op
+    return op

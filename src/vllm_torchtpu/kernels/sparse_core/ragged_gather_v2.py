@@ -288,3 +288,209 @@ def ragged_gather_v2(
         mesh=vector_mesh,
         name="sc_ragged_gather_v2",
     )(start, end, x, indices)[:out_size, :hidden_size]
+
+
+# Lanes of one row tile: `ragged_gather_rows` takes rows as [N, H // 128, 128].
+ROW_TILE_LANES = 128
+# Unroll factor of `ragged_gather_rows`' repack loop. At 2 the loop spills
+# vector registers to TileSPMEM on tpu7x; at 1 it holds every value in registers.
+ROWS_REPACK_UNROLL = 1
+
+
+def _transpose_bytes(
+    a0: jax.Array, a1: jax.Array, a2: jax.Array, a3: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """4x4 byte transpose of 32-bit words: byte j of output k is byte k of a_j."""
+    srl = lax.shift_right_logical
+    lo16, hi16 = 0x0000FFFF, jnp.int32(-0x10000)
+    b0 = (a0 & lo16) | (a2 << 16)
+    b1 = (a1 & lo16) | (a3 << 16)
+    b2 = (a2 & hi16) | srl(a0, 16)
+    b3 = (a3 & hi16) | srl(a1, 16)
+    even, odd = 0x00FF00FF, jnp.int32(-0xFF0100)
+    return (
+        (b0 & even) | ((b1 & even) << 8),
+        (srl(b0, 8) & even) | (b1 & odd),
+        (b2 & even) | ((b3 & even) << 8),
+        (srl(b2, 8) & even) | (b3 & odd),
+    )
+
+
+def _rows_kernel(
+    start_ref: jax.Ref,
+    end_ref: jax.Ref,
+    in_hbm_ref: jax.Ref,
+    indices_hbm_ref: jax.Ref,
+    out_hbm_ref: jax.Ref,
+    start_vmem_ref: jax.Ref,
+    end_vmem_ref: jax.Ref,
+    idx_vmem_ref: jax.Ref,
+    sem_ref: jax.Ref,
+    *,
+    col_size: int,
+    core_axis_name: str,
+    subcore_axis_name: str,
+):
+    """`main_kernel_v2` for int8 rows held one row per tile.
+
+    Each input row is a whole [H // 128, 128] tile, so a gathered row is one
+    contiguous read; its 32-bit words pack four 128-lane blocks of the row.
+    The output packs four rows per word, as `main_kernel_v2` writes it, so
+    each output word takes one byte from each of four gathered rows.
+    """
+    sc_info = pltpu.get_tpu_info().sparse_core
+    assert sc_info is not None
+    row_subchunk_size = sc_info.num_lanes
+    packing = 4  # int8 in 32-bit words
+    num_cores = jax.lax.axis_size((core_axis_name, subcore_axis_name))
+    recv_sem = sem_ref.at[0]
+
+    copy_start = pltpu.make_async_copy(start_ref, start_vmem_ref.at[:1], recv_sem)
+    copy_end = pltpu.make_async_copy(end_ref, end_vmem_ref.at[:1], recv_sem)
+    copy_start.start()
+    copy_end.start()
+    copy_start.wait()
+    copy_end.wait()
+    start = start_vmem_ref[...][0]
+    end = end_vmem_ref[...][0]
+    core_index = lax.axis_index((core_axis_name, subcore_axis_name))
+
+    subchunk_start = start // row_subchunk_size
+    subchunk_end = pl.cdiv(end, row_subchunk_size)
+    num_subchunks = jnp.where(end <= start, 0, subchunk_end - subchunk_start)
+    subchunks_per_core = pl.cdiv(num_subchunks, num_cores)
+    core_subchunk_start = subchunk_start + core_index * subchunks_per_core
+    core_num_subchunks = jnp.clip(
+        subchunk_end - core_subchunk_start, 0, subchunks_per_core
+    )
+
+    idx_scratch_size = idx_vmem_ref.shape[0]
+    num_indices = indices_hbm_ref.shape[0]
+    idx_copy_start = jnp.minimum(
+        core_subchunk_start * row_subchunk_size, num_indices - idx_scratch_size
+    )
+    idx_copy_start = pl.multiple_of(idx_copy_start, row_subchunk_size)
+    idx_base = core_subchunk_start * row_subchunk_size - idx_copy_start
+    copy_idx = pltpu.make_async_copy(
+        indices_hbm_ref.at[pl.ds(idx_copy_start, idx_scratch_size)],
+        idx_vmem_ref,
+        recv_sem,
+    )
+    copy_idx.start()
+    copy_idx.wait()
+
+    # [N, H // 128, 128] int8 -> [N, H // 512, 128] words of four lane blocks.
+    in_hbm_i32 = in_hbm_ref.bitcast(jnp.int32)
+    out_hbm_i32 = out_hbm_ref.bitcast(jnp.int32)
+    hidden_size = out_hbm_ref.shape[-1]
+    num_cols = hidden_size // col_size
+    words_per_block = col_size // (ROW_TILE_LANES * packing)
+
+    def subchunk_indices(step):
+        offset = pl.multiple_of(idx_base + step * row_subchunk_size, row_subchunk_size)
+        return idx_vmem_ref[pl.ds(offset, row_subchunk_size)]
+
+    def gather_step(gather_ref, out_ref):
+        def word_loop(word):
+            for i in range(row_subchunk_size // packing):
+                rows = [
+                    gather_ref[i * packing + j, pl.ds(word, 1), :]
+                    for j in range(packing)
+                ]
+                for b, packed_row in enumerate(_transpose_bytes(*rows)):
+                    lane_block = word * packing + b
+                    col_slice = pl.ds(
+                        pl.multiple_of(lane_block * ROW_TILE_LANES, ROW_TILE_LANES),
+                        ROW_TILE_LANES,
+                    )
+                    out_ref[pl.ds(i, 1), col_slice] = packed_row
+
+        plsc.parallel_loop(0, words_per_block, unroll=ROWS_REPACK_UNROLL)(word_loop)
+
+    pltpu.emit_pipeline(
+        gather_step,
+        grid=(core_num_subchunks, num_cols),
+        in_specs=pl.BlockSpec(
+            (pl.Indirect(row_subchunk_size), words_per_block, ROW_TILE_LANES),
+            lambda r, col_id: (subchunk_indices(r), col_id, 0),
+        ),
+        out_specs=pl.BlockSpec(
+            (row_subchunk_size // packing, col_size),
+            lambda r, col_id: (core_subchunk_start + r, col_id),
+        ),
+    )(in_hbm_i32, out_hbm_i32)
+
+
+@jax.jit
+def ragged_gather_rows(
+    x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
+) -> jax.Array:
+    """`ragged_gather_v2` of int8 rows given as [N, H // 128, 128] row tiles.
+
+    Returns `x.reshape(N, H)[indices]` rows `start` to `end`, in the layout
+    `ragged_gather_v2` returns; rows outside that range are left unwritten.
+    A row tile is contiguous in HBM, so rows can be written one at a time
+    (by a remote DMA, say) where [N, H] int8 interleaves four rows per word.
+    """
+    if x.ndim != 3 or x.shape[-1] != ROW_TILE_LANES or x.dtype != jnp.int8:
+        raise ValueError(
+            f"expected int8 [N, H // 128, 128] rows, got {x.dtype}{x.shape}"
+        )
+    if indices.ndim != 1:
+        raise ValueError("Ragged gather only supports 1d indices.")
+    start = jnp.atleast_1d(start)
+    end = jnp.atleast_1d(end)
+    num_rows, lane_blocks, _ = x.shape
+    hidden_size = lane_blocks * ROW_TILE_LANES
+    packing = 4
+
+    sc_info = pltpu.get_tpu_info().sparse_core
+    if sc_info is None:
+        return x.reshape(num_rows, hidden_size)[indices]
+
+    out_size = indices.size
+    num_cores = sc_info.num_cores * sc_info.num_subcores
+    block_size = sc_info.num_lanes * num_cores
+    out_pad_size = -out_size % block_size
+    indices = jnp.pad(indices, (0, out_pad_size))
+    idx_scratch_size = (out_size + out_pad_size) // num_cores
+
+    # A column block reads whole words of the row tile: four lane blocks.
+    col_size = calculate_col_size(hidden_size, packing, idx_scratch_size * 4)
+    col_size -= col_size % (ROW_TILE_LANES * packing)
+    while col_size and hidden_size % col_size:
+        col_size -= ROW_TILE_LANES * packing
+    if not col_size:
+        raise ValueError(
+            f"{out_size} indices leave no SparseCore VMEM for a 512-column block "
+            f"of {hidden_size} columns."
+        )
+
+    vector_mesh = plsc.VectorSubcoreMesh(
+        num_cores=sc_info.num_cores,
+        num_subcores=sc_info.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    return core_map_helper.kernel(
+        functools.partial(
+            _rows_kernel,
+            col_size=col_size,
+            core_axis_name=vector_mesh.core_axis_name,
+            subcore_axis_name=vector_mesh.subcore_axis_name,
+        ),
+        out_type=jax.ShapeDtypeStruct((out_size + out_pad_size, hidden_size), x.dtype),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=True,
+            needs_layout_passes=True,
+            disable_bounds_checks=True,
+        ),
+        scratch_types=[
+            pltpu.VMEM((16,), jnp.int32),
+            pltpu.VMEM((16,), jnp.int32),
+            pltpu.VMEM((idx_scratch_size,), jnp.int32),
+            pltpu.SemaphoreType.DMA((1,)),
+        ],
+        mesh=vector_mesh,
+        name="sc_ragged_gather_rows",
+    )(start, end, x, indices)[:out_size]

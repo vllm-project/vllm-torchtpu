@@ -21,7 +21,10 @@ from unittest.mock import patch
 
 import pytest
 
-from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
+from vllm_torchtpu.env_override import (
+    _TPU_SC_ALL_GATHER_OFFLOAD_MIN_BYTES,
+    _TPU_VMEM_BYTES_PER_TENSOR_CORE,
+)
 
 
 class TestTpuCompilerCache:
@@ -359,6 +362,22 @@ class TestTpuCompilerCache:
                 ]
             )
             assert self._sc_offload_flags() == expected
+
+    def test_env_override_sc_offload_tpu7x_all_gather_threshold(self):
+        """On TPU v7 all-gathers offload from their own, lower threshold."""
+        env_mock = {"TPU_ACCELERATOR_TYPE": "tpu7x-8"}
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+            all_reduce = _TPU_VMEM_BYTES_PER_TENSOR_CORE["tpu7x"]
+            all_gather = _TPU_SC_ALL_GATHER_OFFLOAD_MIN_BYTES["tpu7x"]
+            assert all_gather < all_reduce
+            assert self._sc_offload_flags() == [
+                f"--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes={all_reduce}",
+                f"--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes={all_gather}",
+            ]
 
     @pytest.mark.parametrize("value", ["banana", "-1"])
     def test_env_override_sc_offload_bad_value_raises(self, value):

@@ -444,6 +444,7 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
+        _,
     ) = prepare_routed_gmm_inputs(
         hidden_states,
         topk_indices,
@@ -465,6 +466,38 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
     np.testing.assert_array_equal(valid_mask, valid)
     np.testing.assert_array_equal(token_indices_sorted, sorted_indices_expected // 2)
     np.testing.assert_array_equal(group_sizes, np.array([3, 2]))
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32, jnp.float8_e4m3fn])
+def test_prepare_routed_gmm_inputs_sorts_row_scales_with_the_rows(dtype):
+    """Row scales come back in the rows' routed order, bit for bit, from the
+    routing sort itself."""
+    num_tokens, topk, num_experts = 400, 6, 5
+    rng = np.random.default_rng(0)
+    topk_indices = jnp.asarray(
+        rng.integers(-1, num_experts, (num_tokens, topk)), dtype=jnp.int32
+    )
+    scales = rng.standard_normal((num_tokens, 3)).astype(np.float32)
+    scales[0, 0], scales[1, 1] = np.nan, -0.0
+    row_scales = jnp.asarray(scales).astype(dtype)
+
+    *_, token_indices_sorted, x_scale = prepare_routed_gmm_inputs(
+        jnp.zeros((num_tokens, 8), jnp.int8),
+        topk_indices,
+        jnp.ones((num_tokens, topk), jnp.float32),
+        local_num_experts=num_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=False,
+        row_scales=row_scales,
+    )
+
+    bits = {1: np.uint8, 2: np.uint16, 4: np.uint32}[jnp.dtype(dtype).itemsize]
+    assert x_scale.dtype == row_scales.dtype
+    np.testing.assert_array_equal(
+        np.asarray(x_scale).view(bits),
+        np.asarray(row_scales[token_indices_sorted]).view(bits),
+    )
 
 
 @pytest.mark.parametrize(("mode", "owner_called"), [("on", True), ("off", False)])
@@ -945,6 +978,64 @@ def test_fused_moe_func_int4_packed_matches_reference():
     np.testing.assert_allclose(
         np.asarray(actual), np.asarray(expected), atol=8.0, rtol=3e-1
     )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_tokens", [16, 256])  # one-hot, SparseCore permute
+def test_fused_moe_quantized_rows_match_unquantized(num_tokens):
+    """Rows from quantize_moe_input give fused_moe_func's output bit for bit."""
+    _require_tpu()
+    num_experts, hidden_size, intermediate_size, topk = 8, 1024, 512, 4
+    hk, w1k, w2k, idk, wk = jax.random.split(jax.random.key(0), 5)
+    hidden_states = jax.random.normal(hk, (num_tokens, hidden_size), jnp.bfloat16)
+    w1, w1_scale = fused_moe_gmm.quantize_to_native_fp4_kmajor(
+        jax.random.normal(w1k, (num_experts, hidden_size, 2 * intermediate_size)) / 10,
+        block=512,
+    )
+    w2, w2_scale = fused_moe_gmm.quantize_to_native_fp4_kmajor(
+        jax.random.normal(w2k, (num_experts, intermediate_size, hidden_size)) / 10,
+        block=512,
+    )
+    q_dtype = fused_moe_gmm.dispatch_quant_dtype(
+        hidden_size, w1, w1_scale, jnp.float4_e2m1fn
+    )
+    if q_dtype is None:
+        pytest.skip("this TPU's GMM does not quantize rows against fp4 weights")
+    threshold = fused_moe_gmm.resolve_onehot_permute_threshold()
+    kwargs = dict(
+        w1=w1,
+        w2=w2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_bias=None,
+        w2_bias=None,
+        topk_weights=jax.random.uniform(wk, (num_tokens, topk)),
+        topk_ids=jnp.argsort(
+            jax.random.uniform(idk, (num_tokens, num_experts)), axis=-1
+        )[:, :topk].astype(jnp.int32),
+        experts_start=jnp.array(0, dtype=jnp.int32),
+        topk=topk,
+        activation="silu",
+        use_ep=True,
+        onehot_moe_permute_threshold=threshold,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+
+    expected = fused_moe_func(hidden_states=hidden_states, **kwargs)
+    rows, rows_scale = fused_moe_gmm.quantize_moe_input(
+        hidden_states,
+        q_dtype=q_dtype,
+        num_dispatched_tokens=num_tokens,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+    )
+    assert rows.shape == (num_tokens, hidden_size // 128, 128)
+    actual = fused_moe_func(hidden_states=rows, hidden_scale=rows_scale, **kwargs)
+
+    assert actual.dtype == expected.dtype
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 def _fake_tpu_info(sparse_core):
