@@ -43,7 +43,7 @@ TOKEN_BLOCK = 128
 SUM_GROUP = 8
 # Tokens per row-DMA list. Smaller lists cost XLA less to build; each list is
 # one loop in the kernel.
-LIST_TOKENS = 32
+LIST_TOKENS = 128
 # Row DMAs issued per loop iteration. A list is padded to a multiple with DMAs
 # into a spare row, so the scalar address chains of one iteration overlap.
 ISSUE_UNROLL = 8
