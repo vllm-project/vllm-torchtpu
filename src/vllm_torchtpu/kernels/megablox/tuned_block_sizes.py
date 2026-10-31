@@ -338,7 +338,8 @@ def get_default_gmm_block_sizes(m: int, k: int, n: int, g: int) -> tuple[int, in
     # 2m//g can be either greater or less than 512. If there are 32 tokens and
     # topk=2, m=topk * num_tokens=64, in this case, 2*m//g will be less than
     # 512.
-    tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512)
+    effective_g = min(max(g, 1), 64) if g >= 256 else max(g, 1)
+    tm = round_up_to_multiple_of_128_within_limit(2 * m // effective_g, 512)
     # NOTE(catswe): this divisor-search approach may produce suboptimal tile
     # sizes (e.g., num_tokens=64 and topk=5, so m=num_tokens*topk=320, will
     # result in tm=80 and 4 tiles, instead of tm=128 and 3 tiles), though it's
