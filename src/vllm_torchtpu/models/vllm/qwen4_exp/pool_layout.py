@@ -68,8 +68,8 @@ def main_kv_dcp() -> int:
     from vllm_torchtpu import envs
 
     value = envs.VLLM_TPU_QSA_MAIN_KV_DCP
-    if value not in (0, 1, 2):
-        raise ValueError(f"{MAIN_KV_DCP_ENV} must be 0, 1 or 2, got {value}")
+    if value not in (0, 1, 2, 4):
+        raise ValueError(f"{MAIN_KV_DCP_ENV} must be 0, 1, 2 or 4, got {value}")
     return max(value, 1)
 
 
