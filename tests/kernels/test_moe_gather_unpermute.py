@@ -66,6 +66,9 @@ def _reference(rows, indices, weights, valid, num_tokens):
         (256, 384, 0.5, 2),
         # Every route local: six slots per token.
         (256, 128, 1.0, 3),
+        # Several blocks, so both slot buffers take over more than once.
+        (384, 128, 1 / 50, 5),
+        (640, 128, 1 / 5, 6),
     ],
 )
 def test_matches_sparsecore_order_bit_for_bit(
