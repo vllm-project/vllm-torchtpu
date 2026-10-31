@@ -3555,6 +3555,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _build_padded_sampling_params=lambda start, end, logits: sampling_params,
         _sampler_topk_candidates=lambda start, end, grammar: 0,
         _sampler_applies_topk_topp=lambda: True,
+        _gather_spec_draft_probs=lambda md, start, end: None,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )

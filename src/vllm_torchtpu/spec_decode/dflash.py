@@ -651,6 +651,9 @@ class DFlashProposer:
             # The padding mask still describes the target's last chunk; a
             # MoE draft layer would skip real draft rows past its valid count.
             token_padding.mark_padding(chunk.num_reqs * block_size, padded_len)
+            # Sampling inputs are built and materialized here, outside the
+            # forward context, like the token inputs above (see the hook).
+            self._prepare_draft_sampling(chunk, input_ids, block_size)
 
             with (
                 # Precomputed so set_forward_context does not run its
@@ -666,9 +669,11 @@ class DFlashProposer:
                     mesh=self.runner.mesh, vllm_config=self.vllm_config
                 ),
             ):
-                draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                    input_ids, positions, block_size
+                draft_tokens_chunk = self._run_draft_forward(
+                    input_ids, positions, block_size, chunk
                 )
+            # Outside the forward context: a subclass may finish sampling here.
+            draft_tokens_chunk = self._finish_draft_forward(draft_tokens_chunk, chunk)
 
             draft_logits_per_chunk.append(draft_tokens_chunk)
         for _ in range(extra_chunks):
@@ -874,6 +879,7 @@ class DFlashProposer:
         # Every row of a dummy draft forward is padding, as in the runner's
         # warmup steps.
         token_padding.mark_padding(0, num_tokens)
+        self._prepare_draft_sampling(None, input_ids, block_size, warmup=sync)
 
         with (
             # Same contract as propose(): precomputed DP metadata, no
@@ -888,10 +894,13 @@ class DFlashProposer:
                 mesh=self.runner.mesh, vllm_config=self.vllm_config
             ),
         ):
-            draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                input_ids, positions, block_size
+            draft_tokens_chunk = self._run_draft_forward(
+                input_ids, positions, block_size, None, warmup=sync
             )
-            synchronize_tensors(draft_tokens_chunk, wait=sync)
+        draft_tokens_chunk = self._finish_draft_forward(
+            draft_tokens_chunk, None, warmup=sync
+        )
+        synchronize_tensors(draft_tokens_chunk, wait=sync)
 
     def _dp_draft_bucket(self) -> int:
         """Draft-forward token bucket every lockstep rank runs this step."""
@@ -1071,6 +1080,44 @@ class DFlashProposer:
             )
 
         return hidden_states
+
+    def _prepare_draft_sampling(
+        self,
+        chunk: DraftChunkInputs | None,
+        input_ids: torch.Tensor,
+        block_size: int,
+        warmup: bool = False,
+    ) -> None:
+        """Hook before the forward context: build a subclass's sampling
+        inputs. Materialize them here; inside the DP forward context they
+        hang the busy rank under EP-DP lockstep."""
+        return None
+
+    def _finish_draft_forward(
+        self,
+        draft_tokens_chunk: torch.Tensor,
+        chunk: DraftChunkInputs | None,
+        warmup: bool = False,
+    ) -> torch.Tensor:
+        """Hook after the forward context; returns the `[rows, K]` draft
+        tokens. A subclass that samples in a separate program does so here."""
+        return draft_tokens_chunk
+
+    def _run_draft_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+        chunk: DraftChunkInputs | None,
+        warmup: bool = False,
+    ) -> torch.Tensor:
+        """Draft forward + sampling; returns the `[rows, K]` draft tokens.
+        `chunk` is None for a padding forward, where `warmup` marks the
+        precompile pass."""
+        draft_tokens_chunk, _ = self._dflash_forward_and_sample(
+            input_ids, positions, block_size
+        )
+        return draft_tokens_chunk
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
