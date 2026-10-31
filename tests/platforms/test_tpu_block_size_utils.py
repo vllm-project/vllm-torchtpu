@@ -304,6 +304,30 @@ def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):
     assert vllm_config.cache_config.mamba_page_size_padded == 768 * 1024
 
 
+def test_qwen3_5_27b_tp2_startup_fit(vllm_config):
+    """Pins the Qwen3.5/3.6-27B TP=2 hybrid cache layout: 16 K / 48 V linear
+    heads shard to 8 K + 24 V local heads per rank, fitting in a 1792-token
+    cache block."""
+    _configure_hybrid(vllm_config, tp_size=2)
+    vllm_config.model_config.architecture = "Qwen3_5ForConditionalGeneration"
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        linear_num_key_heads=16,
+        linear_num_value_heads=48,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
+
+    _update(vllm_config, model_cls=FakeConfiguredGdnModel)
+
+    # Local SSM: 24*128*128*4 = 1.5 MiB (1536 rows). Local Conv:
+    # 3*(8+8+24)*128*2 = 30720 B = 30 rows, rounded to 32 physical rows.
+    # 1568 aligned to this backend's 256-token kernel block is 1792.
+    assert vllm_config.cache_config.block_size == 1792
+    assert vllm_config.cache_config.mamba_block_size == 1792
+    assert vllm_config.cache_config.mamba_page_size_padded == 1792 * 1024
+
+
 def test_fit_has_no_fixed_16_token_alignment(vllm_config):
     _configure_hybrid(vllm_config)
     # This artificial state shape tests pool alignment, not Qwen's heads.
