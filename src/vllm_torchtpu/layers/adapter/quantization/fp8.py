@@ -1623,6 +1623,15 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 if isinstance(raw_layer_block, (list, tuple))
                 else self.weight_block_size
             )
+            linear_quant_config = self._linear_quant_config
+            if (getattr(layer, "prefix", "") or self.prefix).endswith("kv_b_proj"):
+                # MLA never runs kv_b_proj: upstream dequantizes it once into
+                # W_UK/W_UV through get_and_maybe_dequant_weights, whose
+                # scaled_dequantize reads weight_block_size as an (n, k) pair and
+                # cannot take the int a REQUANTIZE_BLOCK_SIZE requant leaves.
+                # Per-channel loses nothing for a weight that is only dequantized.
+                cfg = linear_quant_config or _get_linear_quant_config(self.linear_config)
+                linear_quant_config = (cfg[0], cfg[1], None, False)
             weight, weight_scale, requant_dtype_name, requant_block_size = (
                 _process_fp8_linear_weights(
                     layer,
@@ -1631,7 +1640,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                     if layer_block_size is not None
                     else None,
                     linear_config=self.linear_config,
-                    linear_quant_config=self._linear_quant_config,
+                    linear_quant_config=linear_quant_config,
                 )
             )
         elif self.online_fp8:
