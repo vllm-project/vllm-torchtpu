@@ -551,7 +551,7 @@ def ragged_paged_attention(
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
-    mask_invalid_v: bool | None = None,
+    mask_invalid_v: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -611,8 +611,7 @@ def ragged_paged_attention(
             output. Defaults to False.
         mask_invalid_v: If True, zero out invalid V token slices before the pv
             matmul so NaNs in unused VMEM or shared new-KV pages cannot propagate via
-            0.0 * NaN. Defaults to None (True for SEQ_ALONG_LANE, False for
-            HEAD_ALONG_SUBLANE).
+            0.0 * NaN. Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
