@@ -3326,9 +3326,12 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
         both = jax.lax.all_gather(
             jnp.concatenate((query_latent, kv_latent, rope), axis=1), sp_axis, tiled=True
         )
+        output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
         query_latent = both[:, :width]
         kv_latent = both[:, width : width + 512]
         rope = both[:, width + 512 :]
+    else:
+        output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
     query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
     query = query.reshape(tokens, _HEADS, 256)
 
@@ -3343,7 +3346,6 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
         axis=2,
     )
     new_value = expanded[:, :, 128:]
-    output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
     if return_latent:
         latent = jnp.concatenate((kv_latent, rope), axis=1)
         return query, new_key, new_value, output_gate, latent
@@ -4617,19 +4619,28 @@ def _expand_pages_kernel(order_ref, pages_hbm, up_ref, keys_hbm, values_hbm, buf
             for copy in writes(c - 2, slot):
                 copy.wait()
 
+        xs = []
         for j in range(pages):
             # Token order within a page is free (a page never spans sequences).
-            x = pltpu.bitcast(words.at[slot, j].reshape(page_rows, lanes)[...], buf.dtype).astype(jnp.bfloat16)
-            x = jnp.where(c * pages + j < total, x, jnp.zeros((), x.dtype))  # stale slots may hold NaN
-            rows = pl.ds(j * page_tokens, page_tokens)
-            rope = x[:, 512:576]
-            for h in range(heads):
-                expanded = jnp.dot(x[:, :512], up_ref[:, h * 256:(h + 1) * 256],
-                                   preferred_element_type=jnp.float32).astype(jnp.bfloat16)
-                kbuf[slot, h, rows, :] = jnp.concatenate(
-                    (expanded[:, :128], rope, jnp.zeros((page_tokens, 64), jnp.bfloat16)),
-                    axis=-1).astype(kbuf.dtype)
-                vbuf[slot, h, :, rows] = expanded[:, 128:].T.astype(vbuf.dtype)
+            xj = pltpu.bitcast(
+                words.at[slot, j].reshape(page_rows, lanes)[...], buf.dtype
+            ).astype(jnp.bfloat16)
+            xj = jnp.where(
+                c * pages + j < total, xj, jnp.zeros((), xj.dtype)
+            )  # stale slots may hold NaN
+            xs.append(xj)
+        x_all = jnp.concatenate(xs, axis=0)
+        rope_all = x_all[:, 512:576]
+        expanded_all = jnp.dot(
+            x_all[:, :512], up_ref[...], preferred_element_type=jnp.float32
+        ).astype(jnp.bfloat16)
+        zeros_all = jnp.zeros((span, 64), jnp.bfloat16)
+        for h in range(heads):
+            eh = expanded_all[:, h * 256 : (h + 1) * 256]
+            kbuf[slot, h, :, :] = jnp.concatenate(
+                (eh[:, :128], rope_all, zeros_all), axis=-1
+            ).astype(kbuf.dtype)
+            vbuf[slot, h, :, :] = eh[:, 128:].T.astype(vbuf.dtype)
         for copy in writes(c, slot):
             copy.start()
         return carry
