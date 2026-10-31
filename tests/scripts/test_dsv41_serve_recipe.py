@@ -46,7 +46,11 @@ def test_cached_recipe_selects_policy_without_kernel_env(tmp_path):
     assert json.loads(argv[argv.index("--additional-config") + 1]) == {
         "deepseek_v41": {"execution": "ced", "moe": "fused_ep_w4a8"}
     }
-    assert json.loads(argv[argv.index("--engram-config") + 1]) == {"cpu_offload": True}
+    # TEMP(CI): head-sharded tables so CI exercises TPU_DEEPSEEK_V41_ENGRAM_HBM.
+    assert json.loads(argv[argv.index("--engram-config") + 1]) == {
+        "cpu_offload": True,
+        "dp_shared_memory": False,
+    }
     assert not any(
         k.startswith(("TPU_DEEPSEEK_V41_", "MOE_", "USE_MOE_")) for k in output["env"]
     )
