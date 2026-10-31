@@ -27,6 +27,7 @@ import pytest
 
 from vllm_torchtpu.kernels.quantized_matmul import (
     blockwise_kernel,
+    fused_quantize_kernel,
     kernel,
     tuned_block_sizes,
     util,
@@ -403,4 +404,33 @@ def test_quantized_matmul_blockwise_int4_fp8(
         tuned_value=TunedValue(512, 512, 512, 2),
         block_size=512,
         x_q_dtype=jnp.float8_e4m3fn,
+    )
+
+
+@pytest.mark.parametrize(
+    ("bs", "n_input_features", "n_output_features"),
+    [
+        (1024, 8192, 4096),
+        (1024, 4096, 1536),
+        (512, 2048, 768),
+    ],
+)
+def test_fused_quantized_matmul_matches_xla(
+    bs: int, n_input_features: int, n_output_features: int
+) -> None:
+    """The fused kernel must reproduce `xla_quantized_matmul` bit for bit."""
+    _require_tpu_v7()
+    kx, kw, ks = jax.random.split(jax.random.key(0), 3)
+    x = jax.random.normal(kx, (bs, n_input_features), jnp.float32) * 3
+    x = x.at[5].set(0).at[7, 3].set(1e4).astype(jnp.bfloat16)
+    w_q = (jax.random.normal(kw, (n_input_features, n_output_features)) * 100).astype(
+        jnp.float8_e4m3fn
+    )
+    w_scale = jax.random.uniform(ks, (n_output_features,), jnp.float32, 1e-3, 1e-2)
+    assert fused_quantize_kernel.supports(x, w_q, w_scale)
+
+    actual = fused_quantize_kernel.fused_quantized_matmul(x, w_q, w_scale)
+    expected = jax.jit(xla_quantized_matmul)(x, w_q, w_scale)
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
     )

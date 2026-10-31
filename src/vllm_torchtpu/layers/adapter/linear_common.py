@@ -23,6 +23,7 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.quantized_matmul import fused_quantize_kernel
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
@@ -70,7 +71,8 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
     rather than the `(m, k) @ (n, k).T` the N-major layout forced. The
     blockwise path routes through `gmm_v2` (single group), which consumes a
     K-major rhs natively; the per-channel path uses the shared
-    `xla_quantized_matmul`, which takes the same (k, n) layout.
+    `xla_quantized_matmul`, which takes the same (k, n) layout, or the
+    kernel that computes it with the activation quantize kept in VMEM.
     """
     if x.shape[1] != w_q.shape[0]:
         raise ValueError(
@@ -104,6 +106,8 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
+    if fused_quantize_kernel.supports(x, w_q, w_s):
+        return fused_quantize_kernel.fused_quantized_matmul(x, w_q, w_s)
     return xla_quantized_matmul(x, w_q, w_s)
 
 
