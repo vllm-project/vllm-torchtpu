@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import functools
 from collections.abc import Callable
 from threading import Lock
 
@@ -137,6 +136,32 @@ def _rms_norm_quantized_matmul_jax(
     return (out, x_normed) if emit_normed else out
 
 
+# `pallas.jax_op` refuses a union return annotation, so each `emit_normed`
+# variant gets its own entry point.
+def _rms_norm_quantized_matmul_out_jax(
+    x: jax.Array,
+    rstd: jax.Array,
+    norm_weight: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+) -> jax.Array:
+    return _rms_norm_quantized_matmul_jax(
+        x, rstd, norm_weight, w_q, w_s, emit_normed=False
+    )
+
+
+def _rms_norm_quantized_matmul_normed_jax(
+    x: jax.Array,
+    rstd: jax.Array,
+    norm_weight: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    return _rms_norm_quantized_matmul_jax(
+        x, rstd, norm_weight, w_q, w_s, emit_normed=True
+    )
+
+
 _quantized_matmul_kernel_op: Callable | None = None
 _quantized_matmul_kernel_op_lock = Lock()
 
@@ -192,7 +217,9 @@ def _build_rms_norm_quantized_matmul_op(emit_normed: bool) -> Callable:
     name = "pallas::rms_norm_quantized_matmul" + ("_normed" if emit_normed else "")
     op = pallas.jax_op(
         name,
-        functools.partial(_rms_norm_quantized_matmul_jax, emit_normed=emit_normed),
+        _rms_norm_quantized_matmul_normed_jax
+        if emit_normed
+        else _rms_norm_quantized_matmul_out_jax,
     )
 
     def _fake(x, rstd, norm_weight, w_q, w_s):
