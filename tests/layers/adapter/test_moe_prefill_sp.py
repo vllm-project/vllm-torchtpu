@@ -248,6 +248,7 @@ def test_op_takes_own_tokens_and_a_bf16_wire_without_arming_the_layer():
     args, kw = seen[0]
     assert kw["token_replica_groups"] == ((0,), (1,))
     assert kw["wire_dtype"] == jnp.bfloat16
+    assert args[5] is True  # sharded routing plan
     assert args[8:11] == ("sigmoid", True, 1.0)  # scoring, bias, routed scale
     # The other buckets keep the grouped-matmul path and its collectives.
     assert not bridge.fused_moe_ep_supported(layer)
