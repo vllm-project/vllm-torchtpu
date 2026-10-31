@@ -19,7 +19,7 @@ import pytest
 
 from vllm_torchtpu.kernels.diffusion_attention import block_sizes as bs
 
-# A 128 MiB-VMEM spec standing in for v6e, which has not been measured.
+# A 128 MiB-VMEM spec for TPU v6e (Trillium).
 _GEN6_SPEC = dataclasses.replace(
     bs.V7_SPEC, name="v6", generation=6, vmem_bytes=128 * 2**20
 )
@@ -53,6 +53,15 @@ def test_block_sizes_fit_vmem(spec, mode, q_len, kv_len, head_dim):
         blocks["block_q"], blocks["block_kv_compute"], head_dim, blocks["block_kv"]
     )
     assert footprint <= spec.vmem_bytes - bs._VMEM_RESERVE_BYTES
+
+
+def test_block_sizes_v6_picks():
+    for seq, block_q in [(32760, 4096), (8190, 4096), (75600, 3840), (18900, 3840)]:
+        assert bs.autotune_block_sizes(seq, 128, 2, _GEN6_SPEC, seq, "fixedm") == {
+            "block_q": block_q,
+            "block_kv": 2048,
+            "block_kv_compute": 2048,
+        }
 
 
 def test_block_sizes_v7_picks():
