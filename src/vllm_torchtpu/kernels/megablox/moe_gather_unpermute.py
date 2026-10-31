@@ -22,9 +22,10 @@ One row DMA per valid route lands the route's gmm2 row in VMEM at (slot k,
 token t), where k is the route's rank among its token's valid routes, so the
 sum is dense vector work over (tokens, hidden) tiles, one pass per slot. The
 next block's rows are fetched while the current block is summed, their DMAs
-started inside the current block's vector work. A call may cover only some
-token blocks (one piece of ``chunk_pieces``): its grid steps then map to those
-blocks, and "next" means the next grid step's block.
+started inside the current block's vector work (in the first
+``IN_PASS_DMA_PIECES`` calls) or at the start of the step. A call may cover
+only some token blocks (one piece of ``chunk_pieces``): its grid steps then map
+to those blocks, and "next" means the next grid step's block.
 
 bf16 rows are packed in pairs into 32-bit words in HBM, so a row is fetched as
 the 32-bit row holding its pair and its half is picked with a per-token shift.
@@ -57,6 +58,11 @@ WAIT_ROWS = 64
 # Row DMAs per iteration of the loops that start the rows the passes left
 # over, so the scalar address chains of one iteration overlap.
 ISSUE_UNROLL = 8
+# Leading piece calls of ``chunk_pieces`` that start the next block's DMAs
+# inside their vector work. The calls after them start each next block's whole
+# list at the start of a step, a step before its rows are waited for: they run
+# while earlier pieces are reduce-scattered, which hides their time.
+IN_PASS_DMA_PIECES = 1
 
 _LANES = 128
 _SUBLANES = 8
@@ -299,6 +305,7 @@ def _kernel(
     hidden_size: int,
     num_blocks: int,
     token_block,
+    next_in_passes: bool,
 ):
     grid_step = pl.program_id(0)
     block = token_block(grid_step)
@@ -350,7 +357,10 @@ def _kernel(
             grid_step + 1 < pl.num_programs(0), token_block(grid_step + 1), num_blocks
         )
         start_next, start_next_from = row_dmas(next_block, next_slots_ref, next_sem)
-        start_next(0, PROLOGUE_DMAS)
+        if next_in_passes:
+            start_next(0, PROLOGUE_DMAS)
+        else:
+            start_next_from(0)
 
         # Per-token tables with tokens along sublanes, broadcast across lanes by
         # a matmul with one-hot rows. Every entry is exact in bf16 (a bf16
@@ -409,9 +419,9 @@ def _kernel(
             # The next block's DMAs a pass starts: PASS_DMAS in the group's
             # first and last pass, MIDDLE_PASS_DMAS in each one between.
             def slot_pass(k, *, first: bool, last: bool):
-                if first:
+                if next_in_passes and first:
                     start_next(group_dmas, PASS_DMAS)
-                else:
+                elif next_in_passes:
                     # Past the first pass's DMAs and k - 1 middle passes' DMAs.
                     dma_first = group_dmas + PASS_DMAS + MIDDLE_PASS_DMAS * (k - 1)
                     start_next(dma_first, PASS_DMAS if last else MIDDLE_PASS_DMAS)
@@ -463,8 +473,9 @@ def _kernel(
             dma_start_ref[block * (groups + 1)],
         )
         _, left_dmas = lax.fori_loop(0, groups, sum_group, first_group)
-        # The next block's DMAs the passes did not reach.
-        start_next_from(left_dmas)
+        if next_in_passes:
+            # The next block's DMAs the passes did not reach.
+            start_next_from(left_dmas)
 
     @pl.when(grid_step % 2 == 0)
     def _():
@@ -525,7 +536,7 @@ def gather_unpermute(
     num_chunks = num_tokens // sum(pieces)
     outputs = []
     first_block = 0
-    for rows in pieces:
+    for piece, rows in enumerate(pieces):
         piece_blocks = rows // TOKEN_BLOCK
         token_block = functools.partial(
             _piece_block,
@@ -540,6 +551,7 @@ def gather_unpermute(
                 topk=topk,
                 token_block=token_block,
                 num_steps=num_chunks * piece_blocks,
+                next_in_passes=piece < IN_PASS_DMA_PIECES,
                 interpret=interpret,
             )
         )
@@ -560,6 +572,7 @@ def _gather_unpermute_piece(
     topk: int,
     token_block,
     num_steps: int,
+    next_in_passes: bool,
     interpret: bool,
 ) -> jax.Array:
     """One kernel call: grid step ``s`` writes token block ``token_block(s)``."""
@@ -573,6 +586,7 @@ def _gather_unpermute_piece(
             hidden_size=hidden_size,
             num_blocks=weight_table.shape[1] // TOKEN_BLOCK,
             token_block=token_block,
+            next_in_passes=next_in_passes,
         ),
         out_shape=jax.ShapeDtypeStruct(
             (num_steps * TOKEN_BLOCK, hidden_size), route_output.dtype
