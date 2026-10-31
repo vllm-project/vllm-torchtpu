@@ -199,7 +199,7 @@ def test_combine_splits_only_under_ep_with_two_blocks_per_rank_and_equal_groups(
 
 @pytest.mark.parametrize(
     "rows,expected",
-    [(8192, (128, 384)), (4096, (64, 192)), (6144, ()), (16384, ()), (2048, ())],
+    [(8192, (128, 384)), (4096, ()), (6144, ()), (16384, ()), (2048, ())],
 )
 def test_combine_piece_rows(rows, expected):
     assert combine_piece_rows(rows) == expected

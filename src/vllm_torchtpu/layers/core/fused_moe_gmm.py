@@ -449,6 +449,23 @@ def _piece_major_routes(
     return tuple(_piece_major(r, route_rows) for r in routes)
 
 
+def _runs_tc_combine(
+    gmm2_res: jax.Array,
+    topk_weights_flat: jax.Array,
+    num_tokens: int,
+    topk: int,
+    chunk_pieces: tuple[int, ...] = (),
+) -> bool:
+    """Whether the EP v2 combine runs as the TensorCore kernel."""
+    return (
+        ragged_gather_reduce is ragged_gather_reduce_v2
+        and 0 < TC_COMBINE_MIN_TOKENS <= num_tokens
+        and can_use_gather_unpermute(
+            gmm2_res, topk_weights_flat, num_tokens, topk, chunk_pieces
+        )
+    )
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -534,7 +551,18 @@ def moe_gmm(
         )
 
     piece_rows = combine_piece_rows(num_tokens) if combine_in_pieces else ()
-    if piece_rows:
+    # The TensorCore combine writes the pieces from token-ordered routes, one
+    # call per piece; any other combine is given the routes piece-major.
+    tc_pieces = (
+        piece_rows
+        if piece_rows
+        and use_ep
+        and use_sparse_core
+        and argsort_revert_indices.size > onehot_moe_permute_threshold
+        and _runs_tc_combine(gmm2_res, topk_weights_flat, num_tokens, topk, piece_rows)
+        else ()
+    )
+    if piece_rows and not tc_pieces:
         argsort_revert_indices, topk_weights_flat, valid_mask_flat = (
             _piece_major_routes(
                 piece_rows,
@@ -644,11 +672,7 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
-        if (
-            ragged_gather_reduce is ragged_gather_reduce_v2
-            and 0 < TC_COMBINE_MIN_TOKENS <= num_tokens
-            and can_use_gather_unpermute(gmm2_res, topk_weights_flat, num_tokens, topk)
-        ):
+        if _runs_tc_combine(gmm2_res, topk_weights_flat, num_tokens, topk):
             # Same result as v2's SparseCore kernel (v2 falls back to XLA only
             # for inputs far smaller than this). The TensorCore would otherwise
             # idle while the SparseCore runs v2, and it sums the rows sooner.
@@ -659,6 +683,7 @@ def moe_gmm(
                 valid_mask_flat,
                 num_tokens=num_tokens,
                 topk=topk,
+                chunk_pieces=tc_pieces,
             ).astype(x.dtype)
         return ragged_gather_reduce(
             gmm2_res,

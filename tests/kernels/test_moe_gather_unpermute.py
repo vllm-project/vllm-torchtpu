@@ -98,6 +98,45 @@ def test_matches_sparsecore_order_bit_for_bit(
     )
 
 
+@pytest.mark.parametrize(
+    "num_tokens,chunk_pieces",
+    [
+        (768, (128, 256)),
+        (1024, (128, 384)),
+        # Calls of 3 and 6 steps: a call ends on either buffer.
+        (1152, (128, 256)),
+    ],
+)
+def test_pieces_are_the_token_order_rows_piece_by_piece(num_tokens, chunk_pieces):
+    hidden_size = 256
+    rows, indices, weights, valid = _routes(num_tokens, hidden_size, 1 / 8, seed=5)
+    assert moe_gather_unpermute.can_use_gather_unpermute(
+        rows, weights, num_tokens, _TOPK, chunk_pieces
+    )
+    kwargs = dict(num_tokens=num_tokens, topk=_TOPK, interpret=True)
+    whole = moe_gather_unpermute.gather_unpermute(
+        rows, indices, weights, valid, **kwargs
+    )
+    pieces = moe_gather_unpermute.gather_unpermute(
+        rows, indices, weights, valid, chunk_pieces=chunk_pieces, **kwargs
+    )
+    chunks = np.asarray(whole).reshape(-1, sum(chunk_pieces), hidden_size)
+    bounds = np.cumsum((0, *chunk_pieces))
+    expected = np.concatenate(
+        [chunks[:, a:b].reshape(-1, hidden_size) for a, b in zip(bounds, bounds[1:])]
+    )
+    np.testing.assert_array_equal(
+        np.asarray(pieces).view(np.uint16), expected.view(np.uint16)
+    )
+
+
+def test_pieces_must_be_whole_token_blocks():
+    rows, _, weights, _ = _routes(4096, 128, 1 / 8, seed=6)
+    assert not moe_gather_unpermute.can_use_gather_unpermute(
+        rows, weights, 4096, _TOPK, (64, 192)
+    )
+
+
 def test_non_finite_weight_stays_with_its_token():
     num_tokens, hidden_size = 384, 256
     rows, indices, weights, valid = _routes(num_tokens, hidden_size, 1 / 8, seed=7)

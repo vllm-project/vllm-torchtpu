@@ -364,6 +364,72 @@ def test_moe_gmm_runs_large_v2_combine_on_tensorcore(
     assert calls == [expected_path]
 
 
+@pytest.mark.parametrize(
+    "min_tokens,expected",
+    [(2048, ("tensorcore", (128, 384), True)), (0, ("ep", None, False))],
+    ids=["tensorcore", "sparsecore"],
+)
+def test_moe_gmm_tensorcore_combine_writes_the_pieces_itself(
+    monkeypatch, min_tokens, expected
+):
+    """Only combines other than the TensorCore one get piece-major routes."""
+    num_tokens, topk, hidden = COMBINE_SPLIT_ROWS[0], 6, 256
+    routes = num_tokens * topk
+    calls = []
+    token_order = {}
+
+    def fake_combine(path):
+        def combine(source, indices, *args, **kwargs):
+            calls.append(
+                (path, kwargs.get("chunk_pieces"), indices is token_order["indices"])
+            )
+            return jnp.zeros((num_tokens, hidden), jnp.bfloat16)
+
+        return combine
+
+    monkeypatch.setattr(fused_moe_gmm, "TC_COMBINE_MIN_TOKENS", min_tokens)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v2", fake_combine("ep"))
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_reduce",
+        fused_moe_gmm._select_ragged_gather_reduce("v2"),
+    )
+    monkeypatch.setattr(fused_moe_gmm, "gather_unpermute", fake_combine("tensorcore"))
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *a, **k: 1)
+
+    def run(source):
+        gmm_outputs = iter([jnp.ones((routes, 4), jnp.bfloat16), source])
+        monkeypatch.setattr(
+            fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(gmm_outputs)
+        )
+        indices = jnp.arange(routes, dtype=jnp.int32)
+        token_order["indices"] = indices
+        return fused_moe_gmm.moe_gmm(
+            x=jnp.ones((routes, 4), jnp.bfloat16),
+            w1=jnp.ones((1, 4, 4), jnp.bfloat16),
+            w1_scale=None,
+            w1_bias=None,
+            w2=jnp.ones((1, 4, hidden), jnp.bfloat16),
+            w2_scale=None,
+            w2_bias=None,
+            group_sizes=jnp.array([routes], dtype=jnp.int32),
+            argsort_revert_indices=indices,
+            topk_weights_flat=jnp.ones((routes,), jnp.bfloat16),
+            valid_mask_flat=jnp.ones((routes,), jnp.bool_),
+            token_indices_sorted=indices // topk,
+            activation="silu",
+            num_tokens=num_tokens,
+            topk=topk,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=0,
+            combine_in_pieces=True,
+        )
+
+    jax.eval_shape(run, jax.ShapeDtypeStruct((routes, hidden), jnp.bfloat16))
+    assert calls == [expected]
+
+
 def _require_tpu() -> None:
     try:
         backend = jax.default_backend()

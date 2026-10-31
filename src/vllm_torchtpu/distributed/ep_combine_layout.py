@@ -36,7 +36,10 @@ COMBINE_BLOCKS = 16
 # are left whole: on tpu7x (libtpu 0.0.50) XLA compiled some of their pieces
 # to all-reduces instead of SparseCore reduce-scatters. Re-check the pieces'
 # collectives in the compiled HLO before widening this or on a libtpu bump.
-COMBINE_SPLIT_ROWS = (4096, 8192)
+# 4096-row inputs stay whole as well: their 64-row sub-blocks are not whole
+# blocks of the TensorCore combine, so it cannot write each piece in a call of
+# its own, and a split without that overlap only adds the reassembly.
+COMBINE_SPLIT_ROWS = (8192,)
 # Rows of a bf16 (16, 128) tile; sub-blocks stay tile-aligned.
 _ROW_TILE = 16
 

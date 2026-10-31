@@ -22,7 +22,9 @@ One row DMA per valid route lands the route's gmm2 row in VMEM at (slot k,
 token t), where k is the route's rank among its token's valid routes, so the
 sum is dense vector work over (tokens, hidden) tiles, one pass per slot. The
 next block's rows are fetched while the current block is summed, their DMAs
-started inside the current block's vector work.
+started inside the current block's vector work. A call may cover only some
+token blocks (one piece of ``chunk_pieces``): its grid steps then map to those
+blocks, and "next" means the next grid step's block.
 
 bf16 rows are packed in pairs into 32-bit words in HBM, so a row is fetched as
 the 32-bit row holding its pair and its half is picked with a per-token shift.
@@ -99,12 +101,19 @@ def _smem_words(num_tokens: int, topk: int) -> int:
 
 
 def can_use_gather_unpermute(
-    route_output: jax.Array, topk_weights: jax.Array, num_tokens: int, topk: int
+    route_output: jax.Array,
+    topk_weights: jax.Array,
+    num_tokens: int,
+    topk: int,
+    chunk_pieces: tuple[int, ...] = (),
 ) -> bool:
-    """Whether this combine shape fits the kernel."""
+    """Whether this combine shape, cut into ``chunk_pieces``, fits the kernel."""
     num_routes, hidden_size = route_output.shape
     return (
-        route_output.dtype == jnp.bfloat16
+        # A piece is whole token blocks of every chunk.
+        all(rows % TOKEN_BLOCK == 0 for rows in chunk_pieces)
+        and (not chunk_pieces or num_tokens % sum(chunk_pieces) == 0)
+        and route_output.dtype == jnp.bfloat16
         and topk_weights.dtype == jnp.bfloat16
         and num_routes == num_tokens * topk
         and num_routes <= 1 << 16
@@ -249,6 +258,21 @@ def _route_tables(
     )
 
 
+def _piece_block(step, *, piece_blocks: int, chunk_blocks: int, first_block: int):
+    """Token block of a piece call's grid step ``step``.
+
+    The piece is the ``piece_blocks`` token blocks from ``first_block`` of every
+    chunk of ``chunk_blocks`` blocks.
+    """
+    if piece_blocks == chunk_blocks:
+        return step + first_block
+    return (
+        lax.div(step, piece_blocks) * chunk_blocks
+        + first_block
+        + lax.rem(step, piece_blocks)
+    )
+
+
 def _kernel(
     # Scalar prefetch
     pair_rows_ref,
@@ -273,9 +297,11 @@ def _kernel(
     *,
     topk: int,
     hidden_size: int,
+    num_blocks: int,
+    token_block,
 ):
-    block = pl.program_id(0)
-    num_blocks = pl.num_programs(0)
+    grid_step = pl.program_id(0)
+    block = token_block(grid_step)
     pair_rows_hbm = rows_hbm_ref.bitcast(jnp.uint32)
     list_entries = TOKEN_BLOCK * topk
     groups = TOKEN_BLOCK // SUM_GROUP
@@ -314,12 +340,16 @@ def _kernel(
     # The two blocks in flight use separate buffers, so the compiler can tell
     # that the next block's DMAs never touch the rows the passes read.
     def step(slots_ref, next_slots_ref, sem, next_sem):
-        @pl.when(block == 0)
+        @pl.when(grid_step == 0)
         def _():
             _, start_from = row_dmas(block, slots_ref, sem)
             start_from(0)
 
-        start_next, start_next_from = row_dmas(block + 1, next_slots_ref, next_sem)
+        # A call's last step reads the empty list after the last block.
+        next_block = jnp.where(
+            grid_step + 1 < pl.num_programs(0), token_block(grid_step + 1), num_blocks
+        )
+        start_next, start_next_from = row_dmas(next_block, next_slots_ref, next_sem)
         start_next(0, PROLOGUE_DMAS)
 
         # Per-token tables with tokens along sublanes, broadcast across lanes by
@@ -436,16 +466,18 @@ def _kernel(
         # The next block's DMAs the passes did not reach.
         start_next_from(left_dmas)
 
-    @pl.when(block % 2 == 0)
+    @pl.when(grid_step % 2 == 0)
     def _():
         step(even_slots_ref, odd_slots_ref, sems.at[0], sems.at[1])
 
-    @pl.when(block % 2 == 1)
+    @pl.when(grid_step % 2 == 1)
     def _():
         step(odd_slots_ref, even_slots_ref, sems.at[1], sems.at[0])
 
 
-@functools.partial(jax.jit, static_argnames=("num_tokens", "topk", "interpret"))
+@functools.partial(
+    jax.jit, static_argnames=("num_tokens", "topk", "chunk_pieces", "interpret")
+)
 def gather_unpermute(
     route_output: jax.Array,
     indices: jax.Array,
@@ -454,6 +486,7 @@ def gather_unpermute(
     *,
     num_tokens: int,
     topk: int,
+    chunk_pieces: tuple[int, ...] = (),
     interpret: bool = False,
 ) -> jax.Array:
     """Sum each token's valid routed rows, weighted, as ragged_gather_reduce_v2.
@@ -463,6 +496,11 @@ def gather_unpermute(
       indices: ``[num_tokens * topk]`` row of each (token, route).
       topk_weights: bf16 ``[num_tokens * topk]`` weight of each (token, route).
       valid_rows_mask: ``[num_tokens * topk]`` whether the route's row is valid.
+      chunk_pieces: when given, the tokens are cut into chunks of
+        ``sum(chunk_pieces)`` and piece ``j`` takes the next ``chunk_pieces[j]``
+        tokens of every chunk. The rows then come back piece-major, each piece
+        written by a kernel call of its own, so a consumer of one piece can
+        start while the next is summed. Empty: token order, one call.
 
     Returns:
       bf16 ``[num_tokens, hidden]``.
@@ -470,37 +508,84 @@ def gather_unpermute(
     # The kernel broadcasts the weights through a bf16 matmul.
     if topk_weights.dtype != jnp.bfloat16:
         raise ValueError(f"topk_weights must be bf16, got {topk_weights.dtype}")
-    hidden_size = route_output.shape[-1]
-    (
-        pair_rows,
-        entries,
-        list_len,
-        dma_start,
-        group_max,
-        weight_table,
-        route_table,
-    ) = _route_tables(
+    tables = _route_tables(
         indices,
         topk_weights,
         valid_rows_mask,
         num_tokens=num_tokens,
         topk=topk,
     )
-    num_blocks = num_tokens // TOKEN_BLOCK
-    token_block = lambda b, *_: (b, 0)  # noqa: E731
-    token_columns = lambda b, *_: (0, b)  # noqa: E731
+    pieces = chunk_pieces or (num_tokens,)
+    if num_tokens % sum(pieces) or any(rows % TOKEN_BLOCK for rows in pieces):
+        raise ValueError(
+            f"pieces {pieces} are not whole {TOKEN_BLOCK}-token blocks of "
+            f"chunks that divide {num_tokens} tokens"
+        )
+    chunk_blocks = sum(pieces) // TOKEN_BLOCK
+    num_chunks = num_tokens // sum(pieces)
+    outputs = []
+    first_block = 0
+    for rows in pieces:
+        piece_blocks = rows // TOKEN_BLOCK
+        token_block = functools.partial(
+            _piece_block,
+            piece_blocks=piece_blocks,
+            chunk_blocks=chunk_blocks,
+            first_block=first_block,
+        )
+        outputs.append(
+            _gather_unpermute_piece(
+                route_output,
+                *tables,
+                topk=topk,
+                token_block=token_block,
+                num_steps=num_chunks * piece_blocks,
+                interpret=interpret,
+            )
+        )
+        first_block += piece_blocks
+    return jnp.concatenate(outputs) if len(outputs) > 1 else outputs[0]
+
+
+def _gather_unpermute_piece(
+    route_output,
+    pair_rows,
+    entries,
+    list_len,
+    dma_start,
+    group_max,
+    weight_table,
+    route_table,
+    *,
+    topk: int,
+    token_block,
+    num_steps: int,
+    interpret: bool,
+) -> jax.Array:
+    """One kernel call: grid step ``s`` writes token block ``token_block(s)``."""
+    hidden_size = route_output.shape[-1]
+    out_block = lambda s, *_: (s, 0)  # noqa: E731
+    token_columns = lambda s, *_: (0, token_block(s))  # noqa: E731
     return pl.pallas_call(
-        functools.partial(_kernel, topk=topk, hidden_size=hidden_size),
-        out_shape=jax.ShapeDtypeStruct((num_tokens, hidden_size), route_output.dtype),
+        functools.partial(
+            _kernel,
+            topk=topk,
+            hidden_size=hidden_size,
+            num_blocks=weight_table.shape[1] // TOKEN_BLOCK,
+            token_block=token_block,
+        ),
+        out_shape=jax.ShapeDtypeStruct(
+            (num_steps * TOKEN_BLOCK, hidden_size), route_output.dtype
+        ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
-            grid=(num_blocks,),
+            grid=(num_steps,),
             in_specs=[
                 pl.BlockSpec((_TABLE_ROWS, TOKEN_BLOCK), token_columns),
                 pl.BlockSpec((_ROUTE_ROWS, TOKEN_BLOCK), token_columns),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             ],
-            out_specs=pl.BlockSpec((TOKEN_BLOCK, hidden_size), token_block),
+            out_specs=pl.BlockSpec((TOKEN_BLOCK, hidden_size), out_block),
             scratch_shapes=[
                 pltpu.VMEM((_slot_rows(topk), hidden_size), jnp.uint32),
                 pltpu.VMEM((_slot_rows(topk), hidden_size), jnp.uint32),
