@@ -43,6 +43,7 @@ from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_reverse_rope_wo_a_projection,
 )
+from vllm_torchtpu.kernels.quantized_matmul import fused_quantize_kernel
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     BATCH_AXIS,
     VllmDeepseekSparseSWABackend,
@@ -57,6 +58,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
     static_verify_q_len,
+)
+from vllm_torchtpu.layers.adapter.linear_common import (
+    WEIGHT_FLIPPED_ATTR,
+    _quantized_matmul_jax,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
@@ -87,6 +92,34 @@ def _qnorm_rope_jax(
 ) -> jax.Array:
     """Per-head RMSNorm (no weight) fused with RoPE on the query heads."""
     return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
+
+
+def _wq_b_qnorm_rope_jax(
+    qr: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    eps: float,
+    head_dim: int,
+) -> jax.Array:
+    """`_qnorm_rope_jax` of the query heads `wq_b` projects from `qr`.
+
+    `w_q` and `w_s` are `wq_b`'s fp8 (k, n) weight and per-channel scale; the
+    heads are returned flat, `[num_tokens, n]`.
+    """
+    if fused_quantize_kernel.supports_qnorm_rope(qr, w_q, w_s, head_dim):
+        # One kernel: the bf16 heads are normalized and rotated in VMEM and
+        # written once, never read back from HBM.
+        return fused_quantize_kernel.fused_quantized_matmul_qnorm_rope(
+            qr, w_q, w_s, positions, cos_sin_cache, head_dim=head_dim, eps=eps
+        )
+    q = _quantized_matmul_jax(qr, w_q, w_s)
+    q = rope_kernel.qnorm_rope(
+        q.reshape(qr.shape[0], -1, head_dim), positions, cos_sin_cache, eps=eps
+    )
+    return q.reshape(q.shape[0], -1)
 
 
 def _rope_jax(
@@ -123,6 +156,11 @@ def _o_proj_jax(
 def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(x)
+
+
+def _fake_wq_b_qnorm_rope(qr, w_q, w_s, positions, cos_sin_cache, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty((qr.shape[0], w_q.shape[-1]), dtype=qr.dtype, device=qr.device)
 
 
 def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args, **kwargs):
@@ -535,6 +573,37 @@ class VllmDeepseekV4MLAAttention(
         return op
 
     @property
+    def wq_b_qnorm_rope_op(self):
+        """`qnorm_rope_op` with `wq_b` folded in. The runner builds it before
+        tracing: building an op is not traceable."""
+        op = self.__dict__.get("_wq_b_qnorm_rope_op_instance")
+        if op is not None:
+            return op
+
+        eps = float(self.mla_attn.eps)
+        head_dim = int(self.mla_attn.head_dim)
+        op_name = f"pallas::deepseek_v4_wq_b_qnorm_rope_e{_name_float(eps)}_d{head_dim}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(_wq_b_qnorm_rope_jax, eps=eps, head_dim=head_dim),
+                mesh=get_pallas_op_mesh(),
+                input_partition_specs=(
+                    P(),  # qr
+                    P(None, "model"),  # wq_b weight, (k, n)
+                    P("model"),  # wq_b weight scale
+                    P(),  # positions
+                    P(),  # cos_sin_cache
+                ),
+                output_partition_specs=P(None, "model"),
+            )
+            op.register_fake(_fake_wq_b_qnorm_rope)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_wq_b_qnorm_rope_op_instance", op)
+        return op
+
+    @property
     def kv_rope_op(self):
         """The RoPE op for the decoupled key states, built lazily."""
         op = self.__dict__.get("_kv_rope_op_instance")
@@ -591,6 +660,29 @@ class VllmDeepseekV4MLAAttention(
             qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
         )
 
+    def _wq_b_operands(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """`wq_b`'s fp8 (k, n) weight and per-channel scale, when
+        `wq_b_qnorm_rope_op` can run the projection itself."""
+        wq_b = self.wq_b
+        if (
+            isinstance(wq_b.quant_method, VllmFp8LinearMethodTPU)
+            and getattr(wq_b, WEIGHT_FLIPPED_ATTR, False)
+            and wq_b.bias is None
+            and wq_b.weight_scale.ndim == 1
+        ):
+            return wq_b.weight, wq_b.weight_scale
+        return None
+
+    def _query_heads(self, qr: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """The normalized and rotated query heads of the q latent."""
+        wq_b_operands = self._wq_b_operands()
+        if wq_b_operands is None:
+            return self.qnorm_rope(self._project_q(qr), positions)
+        q = self.wq_b_qnorm_rope_op(
+            qr, *wq_b_operands, positions, self.mla_attn.rotary_emb.cos_sin_cache
+        )
+        return q.view(qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim)
+
     def attention_impl(
         self,
         hidden_states: torch.Tensor | None,
@@ -601,8 +693,7 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self._project_q(qr)
-        q = self.qnorm_rope(q, positions)
+        q = self._query_heads(qr, positions)
         kv = self.kv_rope(kv, positions)
 
         topk_indices = None
