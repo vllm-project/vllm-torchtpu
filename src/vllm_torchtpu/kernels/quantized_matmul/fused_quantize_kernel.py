@@ -119,19 +119,21 @@ def supports_rms_norm(
     )
 
 
-def _normalize_rows(x_ref, rstd_ref, gamma_ref, x_normed_ref, r):
+def _normalize_rows(x_ref, rstd_ref, gamma_ref, x_normed_ref, r, weight_dtype):
     """Writes the RMSNorm of rows [r, r + QUANT_ROWS) of the x tile.
 
-    The scale and weight multiply in f32 with one rounding to bf16 at the end,
-    which is how XLA compiles vLLM's `rms_norm` after its variance: it keeps
-    the f32 product across the `.to(weight.dtype)` the op spells out.
+    Rounds `x * rstd` to the weight's dtype before the weight multiply, as
+    vLLM's `rms_norm` spells it (`x.to(weight.dtype) * weight`); the served
+    program keeps that rounding. The product of the two rounded factors is
+    exact in f32, so the final cast rounds it once, like a bf16 multiply.
     """
     rows = pl.ds(r, QUANT_ROWS)
     rstd = rstd_ref[rows, :]
     for c in range(x_ref.shape[1] // QUANT_COLS):
         cols = pl.ds(c * QUANT_COLS, QUANT_COLS)
         x = x_ref[rows, cols].astype(jnp.float32)
-        x_normed = x * rstd * gamma_ref[:, cols]
+        x_scaled = (x * rstd).astype(weight_dtype).astype(jnp.float32)
+        x_normed = x_scaled * gamma_ref[:, cols]
         x_normed_ref[rows, cols] = x_normed.astype(x_normed_ref.dtype)
 
 
@@ -181,9 +183,10 @@ def _rms_norm_kernel(
     x_scale_ref,
     *,
     f8_max,
+    weight_dtype,
 ):
     def normalize(r):
-        _normalize_rows(x_ref, rstd_ref, gamma_ref, x_normed_ref, r)
+        _normalize_rows(x_ref, rstd_ref, gamma_ref, x_normed_ref, r, weight_dtype)
 
     _quantized_matmul_body(
         x_normed_ref,
@@ -280,7 +283,7 @@ def fused_rms_norm_quantized_matmul(
     """`xla_quantized_matmul` of `x` normalized in VMEM.
 
     Returns the matmul output, and with `emit_normed` also the normalized
-    activation, `bf16(x * rstd * gamma)`.
+    activation, `bf16(gamma.dtype(x * rstd) * gamma)`.
     """
     m, k = x.shape
     n = w_q.shape[1]
@@ -302,7 +305,9 @@ def fused_rms_norm_quantized_matmul(
         pltpu.VMEM((num_i, tm, k), w_q.dtype),
         pltpu.VMEM((num_i, tm, 1), jnp.float32),
     ]
-    kernel = functools.partial(_rms_norm_kernel, f8_max=f8_max)
+    kernel = functools.partial(
+        _rms_norm_kernel, f8_max=f8_max, weight_dtype=gamma.dtype
+    )
     if emit_normed:
         out_specs = (out_spec, pl.BlockSpec((tm, k), x_index))
         out_shapes = (out_shape, x_normed_shape)

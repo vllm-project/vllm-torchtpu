@@ -460,10 +460,12 @@ def test_fused_rms_norm_quantized_matmul_matches_xla(
 
     @jax.jit
     def rms_norm(x):
-        # vLLM's `rms_norm`, as the model's norm runs it.
+        # vLLM's `rms_norm`, rounding before the weight multiply as the served
+        # program does; reduce_precision keeps XLA from eliding that rounding.
         x_f32 = x.astype(jnp.float32)
         rstd = jax.lax.rsqrt(jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True) + 1e-6)
-        return rstd, (x_f32 * rstd).astype(jnp.bfloat16) * gamma
+        x_scaled = jax.lax.reduce_precision(x_f32 * rstd, 8, 7)
+        return rstd, (x_scaled * gamma.astype(jnp.float32)).astype(jnp.bfloat16)
 
     rstd, expected_normed = rms_norm(x)
     expected = jax.jit(xla_quantized_matmul)(expected_normed, w_q, w_scale)
