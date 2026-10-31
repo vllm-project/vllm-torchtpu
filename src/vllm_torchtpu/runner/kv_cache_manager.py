@@ -32,7 +32,10 @@ from vllm.models.deepseek_v4.attention import (
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionBackend, AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.core.kv_cache_utils import (
+    get_kv_cache_groups,
+    unify_kv_cache_spec_page_size,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -70,6 +73,10 @@ from vllm_torchtpu.layers.adapter.attention import (
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+    DeepseekV41SWASpec,
+    num_physical_blocks,
+)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -119,11 +126,12 @@ def check_kv_caches_cover_block_ids(
             kv_cache = kv_caches.get(layer_name)
             if kv_cache is None:
                 raise ValueError(f"Missing KV cache for attention layer {layer_name}")
-            if kv_cache.shape[0] < num_blocks:
+            required_blocks = num_physical_blocks(spec, num_blocks)
+            if kv_cache.shape[0] < required_blocks:
                 raise ValueError(
                     f"KV cache for {layer_name} holds {kv_cache.shape[0]} "
                     f"blocks, but the scheduler can issue block IDs through "
-                    f"{num_blocks - 1} ({num_blocks} blocks; "
+                    f"{required_blocks - 1} ({required_blocks} physical blocks; "
                     f"{len(kv_cache_tensor.layers)} layer(s) in this "
                     f"{kv_cache_tensor.size}-byte backing allocation). "
                     "TPU kernels do not bounds-check these "
@@ -390,6 +398,10 @@ class KVCacheManager:
             exempt_layers=ds_v4_layers,
             attention_backend=backend_cls,
         )
+        if any(isinstance(spec, DeepseekV41SWASpec) for spec in kv_cache_spec.values()):
+            # SWA pages live in their own pools; only the scheduler's block
+            # geometry must agree across groups.
+            kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
         if (
             hma_enabled
             and has_attention

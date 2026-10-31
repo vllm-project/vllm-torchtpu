@@ -294,6 +294,52 @@ def test_spec_warmup_clamps_circular_buffer_group_blocks():
     assert req1.block_ids == (list(range(10, 19)), [10])
 
 
+def test_spec_warmup_keeps_swa_pool_block_ids_in_range():
+    executed = []
+    attn_group = SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=256))
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+        DeepseekV41SWASpec,
+    )
+
+    # The SWA pool owns 5 pages (page 0 is null); its IDs are local.
+    swa_spec = DeepseekV41SWASpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+        max_num_seqs=1,
+        max_in_flight_tokens=256,
+    )
+    pages = swa_spec.pool_capacity
+    assert pages == 5
+    swa_group = SimpleNamespace(kv_cache_spec=swa_spec)
+    runner = SimpleNamespace(
+        max_model_len=8192,
+        max_num_tokens=2048,
+        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=100,
+            kv_cache_groups=[attn_group, swa_group],
+        ),
+        execute_model=MagicMock(side_effect=lambda so: executed.append(so) and None),
+        sample_tokens=MagicMock(),
+        take_draft_token_ids=MagicMock(return_value=None),
+        _warmup_spec_decode_cleanup=MagicMock(return_value=True),
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 2048, idx=0) is True
+    shared, private = executed[0].scheduled_new_reqs[0].block_ids
+    assert shared == list(range(1, 10))
+    assert all(1 <= block < pages for block in private) and len(private) == 9
+
+    executed.clear()
+    TPUModelRunner._warmup_spec_batch(runner, R=2, P=2048, greedy=True)
+    for so in executed:
+        for request in so.scheduled_new_reqs:
+            assert all(1 <= block < pages for block in request.block_ids[1])
+
+
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
     """Run _prepare_async_token_substitution_indices with a minimal fake self.
     req_id_to_index_copy holds each request's *position*; with spec_k set the

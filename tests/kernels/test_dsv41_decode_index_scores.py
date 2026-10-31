@@ -27,8 +27,9 @@ def _reference_scores(q, weights, pool, pages, lengths):
 
 @pytest.mark.parametrize("requests", [3, 4, 7])
 @pytest.mark.parametrize("block_size", [0, 8])
+@pytest.mark.parametrize("banked", [False, True])
 def test_grouped_decode_scores_preserve_requests_and_causal_lengths(
-    requests, block_size
+    requests, block_size, banked
 ):
     if jax.default_backend() != "tpu":
         pytest.skip("Persistent DMA scoring requires TPU")
@@ -37,7 +38,7 @@ def test_grouped_decode_scores_preserve_requests_and_causal_lengths(
     keys = jnp.asarray(rng.normal(size=(requests * width, 128)), jnp.bfloat16)
     encoded = index_key_layout.encode_records(keys)
     words = (encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)
-    pool = (words[:128], words[128:])
+    pool = (words[:128], words[128:]) if banked else words
     order = rng.permutation(requests * width // 128).reshape(requests, -1)
     pages = jnp.asarray(order * 128, jnp.int32).at[0, 3].set(-1)
     q = jnp.asarray(rng.normal(size=(requests, queries, heads, 128)), jnp.bfloat16)
