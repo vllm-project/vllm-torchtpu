@@ -100,6 +100,9 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE: bool = False
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS: int = 512
+    VLLM_TPU_QSA_MAIN_RUN_WRITE: bool = False
+    VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS: int = 512
+    VLLM_TPU_QSA_MAIN_RUN_WRITE_TILE: int = 512
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
     VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
     VLLM_TPU_QSA_INDEXER_HOIST_META: bool = False
@@ -654,6 +657,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tiled writer (the run writer is slower on decode-sized steps).
     "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS": env_nonnegative_int(
         "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS", 512
+    ),
+    # Qwen4-exp QSA: run-based main KV writer for prefill-sized steps
+    # (kernels/qwen4_exp/main_write.py): one DMA per run of consecutive rows
+    # (power-of-two pieces), all in flight, instead of per-row DMAs in every
+    # 128-token tile that is not page aligned and fully valid.
+    "VLLM_TPU_QSA_MAIN_RUN_WRITE": env_bool("VLLM_TPU_QSA_MAIN_RUN_WRITE", default=False),
+    # With VLLM_TPU_QSA_MAIN_RUN_WRITE: steps with fewer rows keep the tiled writers.
+    "VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS", 512
+    ),
+    # Rows per grid step of the run writer (a power of two); runs never cross a
+    # tile, and a tile's DMAs all complete before the next tile starts.
+    "VLLM_TPU_QSA_MAIN_RUN_WRITE_TILE": env_nonnegative_int(
+        "VLLM_TPU_QSA_MAIN_RUN_WRITE_TILE", 512
     ),
     # Qwen4-exp QSA: round to BF16 with lax.reduce_precision instead of the
     # integer bit trick. Same RNE; the boundary stays observable to XLA and
