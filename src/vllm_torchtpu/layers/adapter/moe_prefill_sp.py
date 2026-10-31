@@ -27,7 +27,7 @@ owning the contiguous rows `[r * T / tp, (r + 1) * T / tp)`:
     fused EP kernel over the rank's own tokens with a bf16 result wire
     (`fused_moe_ep.build_sequence_parallel_op`), so the MoE output needs no
     all-reduce; the shared expert is re-sharded at load to TP within groups
-    of `SHARED_GROUP` ranks (`member_slice`), which exchange their rows
+    of TPU_MOE_PREFILL_SP_SHARED_GROUP ranks (`member_slice`), which exchange their rows
     (`kernels/fused_moe/grouped_shared_expert.py`).
 
 The dense layers in front of the first MoE layer keep the replicated stream,
@@ -107,11 +107,6 @@ def applies(num_tokens: int) -> bool:
 # The shared expert, re-sharded from TP over all ranks to TP within groups
 # ---------------------------------------------------------------------------
 
-# Ranks per shared-expert group (consecutive EP mesh indices). Each rank holds
-# 1/SHARED_GROUP of the expert: replicating it whole (+2.8 GB per core on
-# GLM-5.2) does not fit next to the served KV budget.
-SHARED_GROUP = 4
-
 
 def merge_gate_up(
     weight: torch.Tensor, scale: torch.Tensor, shards: int
@@ -184,7 +179,7 @@ def _per_channel_fp8(linear: Any) -> tuple[torch.Tensor, torch.Tensor]:
     return w.data, s.data
 
 
-def _group_shared_expert(mlp: Any, tp: int, rank: int) -> None:
+def _group_shared_expert(mlp: Any, tp: int, rank: int, group: int) -> None:
     shared = mlp.shared_experts
     w13, s13 = _per_channel_fp8(shared.gate_up_proj)
     w2, s2 = _per_channel_fp8(shared.down_proj)
@@ -195,8 +190,8 @@ def _group_shared_expert(mlp: Any, tp: int, rank: int) -> None:
         _gather(w2, 0),
         _gather(s2[None], 0),
         tp=tp,
-        group=SHARED_GROUP,
-        member=rank % SHARED_GROUP,
+        group=group,
+        member=rank % group,
     )
     for name, t, dtype in zip(
         (SHARED_W13, SHARED_S13, SHARED_W2, SHARED_S2),
@@ -462,6 +457,11 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     layers = list(islice(backbone.layers, backbone.start_layer, backbone.end_layer))
     moe = [isinstance(layer.mlp, deepseek_v2.DeepseekV2MoE) for layer in layers]
     first = moe.index(True)
+    # Ranks per shared-expert group (consecutive EP mesh indices): each holds
+    # 1/group of the expert. A full replica costs +2.8 GB per core on GLM-5.2.
+    group = envs.TPU_MOE_PREFILL_SP_SHARED_GROUP
+    if group < 1 or tp % group:
+        raise ValueError(f"TPU_MOE_PREFILL_SP_SHARED_GROUP={group} must divide tp={tp}")
     if not all(moe[first:]):
         raise NotImplementedError(
             "the split needs every layer after the first MoE layer to be MoE"
@@ -491,8 +491,8 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             )
         setattr(mlp, OP_ATTR, op)
         setattr(mlp, SCALE_ATTR, float(mlp.routed_scaling_factor))
-        _group_shared_expert(mlp, tp, get_tp_group().rank_in_group)
-        setattr(mlp, SHARED_OP, _build_shared_op(SHARED_GROUP))
+        _group_shared_expert(mlp, tp, get_tp_group().rank_in_group, group)
+        setattr(mlp, SHARED_OP, _build_shared_op(group))
         setattr(layer, KEEP_ATTR, _keep_list(mlp))
     setattr(backbone, KEEP_ATTR, True)
     n = len(layers) - first
