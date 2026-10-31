@@ -22,7 +22,14 @@ import numpy as np
 import pytest
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.ep_combine_layout import (
+    COMBINE_SPLIT_MIN_ROWS,
+    combine_piece_rows,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import (
+    _fallback_implementation as reference_ragged_gather_reduce,
+)
 from vllm_torchtpu.layers.core import fused_moe_gmm
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -36,6 +43,27 @@ def test_select_ragged_gather_reduce(version):
     selected = fused_moe_gmm._select_ragged_gather_reduce(version)
     expected = getattr(fused_moe_gmm, f"ragged_gather_reduce_{version}")
     assert selected is expected
+
+
+def test_unpermute_of_piece_major_routes_writes_piece_major_rows():
+    num_tokens, topk, hidden, source_rows = COMBINE_SPLIT_MIN_ROWS, 6, 128, 5000
+    rng = np.random.default_rng(0)
+    source = jnp.asarray(rng.standard_normal((source_rows, hidden)), jnp.bfloat16)
+    indices = jnp.asarray(rng.integers(0, source_rows, num_tokens * topk), jnp.int32)
+    weights = jnp.asarray(rng.random(num_tokens * topk), jnp.bfloat16)
+    valid = jnp.asarray(rng.random(num_tokens * topk) > 0.3)
+    piece_rows = combine_piece_rows(num_tokens)
+    routes = fused_moe_gmm._piece_major_routes(
+        piece_rows, topk, indices, weights, valid
+    )
+
+    pieces = reference_ragged_gather_reduce(source, *routes, topk)
+
+    whole = reference_ragged_gather_reduce(source, indices, weights, valid, topk)
+    np.testing.assert_array_equal(
+        np.asarray(pieces.view(jnp.uint16)),
+        np.asarray(fused_moe_gmm._piece_major(whole, piece_rows).view(jnp.uint16)),
+    )
 
 
 def test_ragged_gather_reduce_version_defaults_to_v2(monkeypatch):
@@ -267,6 +295,139 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
         np.testing.assert_array_equal(args[1], indices)
         np.testing.assert_array_equal(args[2], weights)
         np.testing.assert_array_equal(args[3], valid)
+
+
+@pytest.mark.parametrize(
+    "configured_version,min_tokens,num_tokens,expected_path",
+    [
+        ("v2", 2048, 2048, "tensorcore"),
+        ("v2", 2048, 1024, "ep"),
+        ("v2", 0, 2048, "ep"),
+        ("v3", 2048, 2048, "ep"),
+    ],
+    ids=["v2-prefill", "v2-decode", "v2-disabled", "v3-kept"],
+)
+def test_moe_gmm_runs_large_v2_combine_on_tensorcore(
+    monkeypatch, configured_version, min_tokens, num_tokens, expected_path
+):
+    topk, hidden = 6, 256
+    routes = num_tokens * topk
+    calls = []
+
+    def fake_combine(path):
+        def combine(*args, **kwargs):
+            calls.append(path)
+            return jnp.zeros((num_tokens, hidden), jnp.bfloat16)
+
+        return combine
+
+    monkeypatch.setattr(fused_moe_gmm, "TC_COMBINE_MIN_TOKENS", min_tokens)
+    monkeypatch.setattr(
+        fused_moe_gmm, f"ragged_gather_reduce_{configured_version}", fake_combine("ep")
+    )
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_reduce",
+        fused_moe_gmm._select_ragged_gather_reduce(configured_version),
+    )
+    monkeypatch.setattr(fused_moe_gmm, "gather_unpermute", fake_combine("tensorcore"))
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *a, **k: 1)
+
+    def run(source):
+        gmm_outputs = iter([jnp.ones((routes, 4), jnp.bfloat16), source])
+        monkeypatch.setattr(
+            fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(gmm_outputs)
+        )
+        indices = jnp.arange(routes, dtype=jnp.int32)
+        return fused_moe_gmm.moe_gmm(
+            x=jnp.ones((routes, 4), jnp.bfloat16),
+            w1=jnp.ones((1, 4, 4), jnp.bfloat16),
+            w1_scale=None,
+            w1_bias=None,
+            w2=jnp.ones((1, 4, hidden), jnp.bfloat16),
+            w2_scale=None,
+            w2_bias=None,
+            group_sizes=jnp.array([routes], dtype=jnp.int32),
+            argsort_revert_indices=indices,
+            topk_weights_flat=jnp.ones((routes,), jnp.bfloat16),
+            valid_mask_flat=jnp.ones((routes,), jnp.bool_),
+            token_indices_sorted=indices // topk,
+            activation="silu",
+            num_tokens=num_tokens,
+            topk=topk,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=0,
+        )
+
+    jax.eval_shape(run, jax.ShapeDtypeStruct((routes, hidden), jnp.bfloat16))
+    assert calls == [expected_path]
+
+
+@pytest.mark.parametrize(
+    "min_tokens,expected",
+    [(2048, ("tensorcore", (128, 128, 256), True)), (0, ("ep", None, False))],
+    ids=["tensorcore", "sparsecore"],
+)
+def test_moe_gmm_tensorcore_combine_writes_the_pieces_itself(
+    monkeypatch, min_tokens, expected
+):
+    """Only combines other than the TensorCore one get piece-major routes."""
+    num_tokens, topk, hidden = COMBINE_SPLIT_MIN_ROWS, 6, 256
+    routes = num_tokens * topk
+    calls = []
+    token_order = {}
+
+    def fake_combine(path):
+        def combine(source, indices, *args, **kwargs):
+            calls.append(
+                (path, kwargs.get("chunk_pieces"), indices is token_order["indices"])
+            )
+            return jnp.zeros((num_tokens, hidden), jnp.bfloat16)
+
+        return combine
+
+    monkeypatch.setattr(fused_moe_gmm, "TC_COMBINE_MIN_TOKENS", min_tokens)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v2", fake_combine("ep"))
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_reduce",
+        fused_moe_gmm._select_ragged_gather_reduce("v2"),
+    )
+    monkeypatch.setattr(fused_moe_gmm, "gather_unpermute", fake_combine("tensorcore"))
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *a, **k: 1)
+
+    def run(source):
+        gmm_outputs = iter([jnp.ones((routes, 4), jnp.bfloat16), source])
+        monkeypatch.setattr(
+            fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(gmm_outputs)
+        )
+        indices = jnp.arange(routes, dtype=jnp.int32)
+        token_order["indices"] = indices
+        return fused_moe_gmm.moe_gmm(
+            x=jnp.ones((routes, 4), jnp.bfloat16),
+            w1=jnp.ones((1, 4, 4), jnp.bfloat16),
+            w1_scale=None,
+            w1_bias=None,
+            w2=jnp.ones((1, 4, hidden), jnp.bfloat16),
+            w2_scale=None,
+            w2_bias=None,
+            group_sizes=jnp.array([routes], dtype=jnp.int32),
+            argsort_revert_indices=indices,
+            topk_weights_flat=jnp.ones((routes,), jnp.bfloat16),
+            valid_mask_flat=jnp.ones((routes,), jnp.bool_),
+            token_indices_sorted=indices // topk,
+            activation="silu",
+            num_tokens=num_tokens,
+            topk=topk,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=0,
+            combine_in_pieces=True,
+        )
+
+    jax.eval_shape(run, jax.ShapeDtypeStruct((routes, hidden), jnp.bfloat16))
+    assert calls == [expected]
 
 
 def _require_tpu() -> None:

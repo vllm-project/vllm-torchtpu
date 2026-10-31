@@ -15,11 +15,40 @@ rank.
 """
 
 import torch
+from vllm.compilation import backends as vllm_compilation_backends
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase,
     DeviceCommunicatorBase,
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+
+from vllm_torchtpu.distributed.ep_combine_layout import (
+    COMBINE_BLOCKS,
+    combine_piece_rows,
+)
+
+
+def combine_splits() -> bool:
+    """Whether ``combine`` may split into pieces.
+
+    Needs at least two row blocks per rank, so every piece spans both halves
+    of every rank's slice. Fixed at trace time. Only the backbone is traced
+    once per bucket group; the MTP drafter has one graph for every bucket, so
+    it must not compare its token count and keeps one reduce-scatter. The
+    fused MoE asks the same question to lay out the combine's input, so the
+    DP and EP groups must agree in size: combine reduce-scatters over either.
+    It lays it out only for expert-parallel layers, so the split needs EP.
+    """
+    dp_group = get_dp_group()
+    dp_size = dp_group.world_size
+    return (
+        vllm_compilation_backends.model_tag == "backbone"
+        and dp_size > 1
+        and dp_group.device_communicator.expert_parallel
+        and get_ep_group().world_size == dp_size
+        and COMBINE_BLOCKS % (2 * dp_size) == 0
+    )
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -35,6 +64,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
+        # Read here, under the config the groups are built with, not at trace.
+        config = get_current_vllm_config_or_none()
+        self.expert_parallel = bool(
+            config is not None and config.parallel_config.enable_expert_parallel
+        )
 
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
@@ -84,4 +118,21 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states
-        return group.reduce_scatter(hidden_states, dim=0)
+        piece_rows = combine_piece_rows(hidden_states.shape[0])
+        if not piece_rows or not combine_splits():
+            return group.reduce_scatter(hidden_states, dim=0)
+        # The input is piece-major (ep_combine_layout): each piece is a slice,
+        # and its reduce-scatter can start once the unpermute has written it.
+        scattered = [
+            group.reduce_scatter(part, dim=0)
+            for part in hidden_states.split([COMBINE_BLOCKS * r for r in piece_rows])
+        ]
+        # This rank's rows are its blocks, each one sub-block from every piece.
+        blocks = COMBINE_BLOCKS // group.world_size
+        return torch.cat(
+            [
+                part.unflatten(0, (blocks, -1))[b]
+                for b in range(blocks)
+                for part in scattered
+            ]
+        )

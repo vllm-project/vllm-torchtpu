@@ -294,6 +294,7 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            combine_in_pieces=False,
         )
 
         if parallel_size > 1:
@@ -381,6 +382,7 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            combine_in_pieces=False,
         )
 
         # Reduce-scatter partial output for current chunk

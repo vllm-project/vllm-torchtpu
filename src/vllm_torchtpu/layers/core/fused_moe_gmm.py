@@ -19,6 +19,10 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.ep_combine_layout import (
+    combine_piece_rows,
+    split_pieces,
+)
 from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
@@ -28,6 +32,10 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     get_packing_factor,
     gmm_v2,
     gmm_v2_fused_mlp,
+)
+from vllm_torchtpu.kernels.megablox.moe_gather_unpermute import (
+    can_use_gather_unpermute,
+    gather_unpermute,
 )
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -60,7 +68,8 @@ def _select_ragged_gather_reduce(version: str):
 
 
 # The server sets its environment before importing model code, so the selected
-# EP combine remains fixed for the process lifetime. The default is v2; set
+# EP combine remains fixed for the process lifetime. The default is v2 (run on
+# the TensorCore at TC_COMBINE_MIN_TOKENS tokens and above); set
 # RAGGED_GATHER_REDUCE_VERSION=v3 to select the destination-major kernel for EP.
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
@@ -68,6 +77,20 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+# Smallest EP token count whose v2 combine runs on the TensorCore (0: never).
+# On DSv4-Flash DP8 the static estimate at 2048 tokens is ~45 us (kernel plus
+# routing tables) against ~90 us of SparseCore v2 plus convert; decode at the
+# 1024-token bucket keeps v2. A decode step of 2048 tokens takes it too.
+TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
+# From this EP token count, the SparseCore dispatch gathers only the first
+# DISPATCH_HEAD_ROWS routed rows, and the expert MLP reads the rest straight
+# from the tokens' rows (gmm_v2_fused_mlp's token_rows) while it runs the
+# head. Below it the gather is short and the TensorCore has other work to
+# hide it behind.
+DISPATCH_SPLIT_MIN_TOKENS = 4096
+# Whole 2048-row ragged_gather_v2 blocks, and whole 16-row sublane blocks as
+# gmm_v2_fused_mlp's head must be.
+DISPATCH_HEAD_ROWS = 4096
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Above 2,048 routed rows, the inverse-permutation scatter costs more than
@@ -304,7 +327,8 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    gather_rows: bool = True,
+) -> tuple[jax.Array | None, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
@@ -312,7 +336,8 @@ def prepare_routed_gmm_inputs(
     mask). For EP, the caller applies the expert-map remap upstream
     (inside this JIT) and marks non-local entries with a negative id which
     the mask filters out. Always running the masked branch keeps a single
-    code path.
+    code path. Without ``gather_rows`` the routed rows are left to the
+    caller and None is returned for them.
     """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
@@ -385,7 +410,9 @@ def prepare_routed_gmm_inputs(
         else:
             token_indices_sorted = token_indices_flat[sorted_indices]
 
-    if use_ep and use_sparse_core:
+    if not gather_rows:
+        x = None
+    elif use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
@@ -416,6 +443,53 @@ def prepare_routed_gmm_inputs(
     )
 
 
+def _piece_major(x: jax.Array, piece_rows: tuple[int, ...]) -> jax.Array:
+    """Token-ordered rows of ``x`` reordered piece by piece (ep_combine_layout)."""
+    return jnp.concatenate(split_pieces(x, piece_rows))
+
+
+def _piece_major_routes(
+    piece_rows: tuple[int, ...], topk: int, *routes: jax.Array
+) -> tuple[jax.Array, ...]:
+    """Reorders flat per-route arrays so the unpermute writes piece-major rows.
+
+    The arrays are token-major, so reordering their elements in runs of whole
+    tokens moves the routes of a token together and in order, and every output
+    row is reduced exactly as before. Kept flat (each sub-block's routes are
+    one contiguous run) so the reorder needs no relayout.
+    """
+    route_rows = tuple(rows * topk for rows in piece_rows)
+    return tuple(_piece_major(r, route_rows) for r in routes)
+
+
+def _runs_tc_combine(
+    gmm2_res: jax.Array,
+    topk_weights_flat: jax.Array,
+    num_tokens: int,
+    topk: int,
+    chunk_pieces: tuple[int, ...] = (),
+) -> bool:
+    """Whether the EP v2 combine runs as the TensorCore kernel."""
+    return (
+        ragged_gather_reduce is ragged_gather_reduce_v2
+        and 0 < TC_COMBINE_MIN_TOKENS <= num_tokens
+        and can_use_gather_unpermute(
+            gmm2_res, topk_weights_flat, num_tokens, topk, chunk_pieces
+        )
+    )
+
+
+def _fused_mlp_kwargs(
+    activation: str, dtype: jnp.dtype, w1: jax.Array, rhs_quant_dtype
+) -> dict:
+    return dict(
+        fuse_act=activation,
+        preferred_element_type=dtype,
+        maybe_quantize_lhs=not _is_fp4_weight(w1),
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -437,24 +511,42 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    combine_in_pieces: bool = False,
+    token_rows: jax.Array | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
+    ``combine_in_pieces`` says the output is reduce-scattered by the EP
+    combine, which may split it (ep_combine_layout); its rows are then
+    returned piece-major, as the split combine reads them.
+    With ``token_rows`` (the tokens' rows), x holds only the first routed
+    rows and the fused MLP reads the rest from token_rows by
+    token_indices_sorted; the caller has checked that it can.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
     # One kernel for both legs keeps the gate/up output in VMEM instead of
     # writing it to HBM for the down leg to read back.
-    fused_kwargs = dict(
-        fuse_act=activation,
-        preferred_element_type=x.dtype,
-        maybe_quantize_lhs=not _is_fp4_weight(w1),
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    if _is_fp4_weight(w1) == _is_fp4_weight(w2) and can_fuse_mlp(
+    fused_kwargs = _fused_mlp_kwargs(activation, x.dtype, w1, rhs_quant_dtype)
+    if token_rows is not None:
+        gmm2_res = gmm_v2_fused_mlp(
+            x,
+            w1,
+            w2,
+            group_sizes,
+            w1_scale,
+            w1_bias,
+            w2_scale,
+            w2_bias,
+            group_offset[0],
+            token_rows=token_rows,
+            token_row_ids=token_indices_sorted,
+            **fused_kwargs,
+        )
+    elif _is_fp4_weight(w1) == _is_fp4_weight(w2) and can_fuse_mlp(
         x, w1, w2, group_sizes, w1_scale, w1_bias, w2_scale, w2_bias, **fused_kwargs
     ):
         gmm2_res = gmm_v2_fused_mlp(
@@ -496,6 +588,28 @@ def moe_gmm(
             rhs_quant_dtype=rhs_quant_dtype,
         )
 
+    piece_rows = combine_piece_rows(num_tokens) if combine_in_pieces else ()
+    # The TensorCore combine writes the pieces from token-ordered routes, one
+    # call per piece; any other combine is given the routes piece-major.
+    tc_pieces = (
+        piece_rows
+        if piece_rows
+        and use_ep
+        and use_sparse_core
+        and argsort_revert_indices.size > onehot_moe_permute_threshold
+        and _runs_tc_combine(gmm2_res, topk_weights_flat, num_tokens, topk, piece_rows)
+        else ()
+    )
+    if piece_rows and not tc_pieces:
+        argsort_revert_indices, topk_weights_flat, valid_mask_flat = (
+            _piece_major_routes(
+                piece_rows,
+                topk,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+            )
+        )
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
@@ -555,8 +669,10 @@ def moe_gmm(
                 .set(topk_weights_flat)
             )
             valid_count = group_sizes.sum(dtype=jnp.int32)[None]
+            # The blockwise unpermute writes rows in token order.
             if (
                 envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on"
+                and not piece_rows
                 and can_use_blockwise_onehot_unpermute(
                     gmm2_res,
                     token_indices_sorted,
@@ -594,6 +710,19 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
+        if _runs_tc_combine(gmm2_res, topk_weights_flat, num_tokens, topk):
+            # Same result as v2's SparseCore kernel (v2 falls back to XLA only
+            # for inputs far smaller than this). The TensorCore would otherwise
+            # idle while the SparseCore runs v2, and it sums the rows sooner.
+            return gather_unpermute(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                num_tokens=num_tokens,
+                topk=topk,
+                chunk_pieces=tc_pieces,
+            ).astype(x.dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
@@ -620,6 +749,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "combine_in_pieces",
     ),
 )
 def fused_moe_func(
@@ -640,6 +770,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    combine_in_pieces: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -659,6 +790,9 @@ def fused_moe_func(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    With ``combine_in_pieces`` the rows come back piece-major whenever the EP
+    combine splits a batch of this size (see ``moe_gmm``).
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -669,6 +803,8 @@ def fused_moe_func(
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     num_tokens, hidden_size = hidden_states.shape
+    if combine_in_pieces and not use_ep:
+        raise ValueError("combine_in_pieces needs use_ep: only EP combines split")
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
@@ -714,10 +850,37 @@ def fused_moe_func(
         skip_padded_tokens=skip_padded_tokens,
     ):
         logger.info_once("Selected experimental dense-expert decode MoE")
-        return dense_expert_moe(
+        out = dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
+        piece_rows = combine_piece_rows(num_tokens) if combine_in_pieces else ()
+        return _piece_major(out, piece_rows) if piece_rows else out
 
+    num_routes = num_tokens * topk
+    # Large batches (prefill chunks; the count is of tokens gathered across
+    # EP ranks): the SparseCore gathers only the head of the routed rows and
+    # the fused MLP starts on it as soon as it lands, fetching the rest itself.
+    dispatch_head_only = (
+        use_ep
+        and use_sparse_core
+        and num_tokens >= DISPATCH_SPLIT_MIN_TOKENS
+        and num_routes > onehot_moe_permute_threshold
+        and padded_hidden_size == hidden_size
+        and num_tokens % 2 == 0
+        and _is_fp4_weight(w1) == _is_fp4_weight(w2)
+        and can_fuse_mlp(
+            jax.ShapeDtypeStruct((num_routes, hidden_size), hidden_states.dtype),
+            w1,
+            w2,
+            jax.ShapeDtypeStruct((w1.shape[0],), jnp.int32),
+            w1_scale,
+            w1_bias,
+            w2_scale,
+            w2_bias,
+            token_rows=True,
+            **_fused_mlp_kwargs(activation, hidden_states.dtype, w1, rhs_quant_dtype),
+        )
+    )
     (
         x,
         group_sizes,
@@ -735,8 +898,18 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        gather_rows=not dispatch_head_only,
     )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    if dispatch_head_only:
+        valid_count = group_sizes.sum(dtype=jnp.int32)
+        x = ragged_gather_v2(
+            hidden_states,
+            token_indices_sorted[:DISPATCH_HEAD_ROWS],
+            jnp.array([0], dtype=jnp.int32),
+            jnp.minimum(valid_count, DISPATCH_HEAD_ROWS)[None],
+        )
+    else:
+        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
         w1,
@@ -757,5 +930,7 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        combine_in_pieces=combine_in_pieces,
+        token_rows=hidden_states if dispatch_head_only else None,
     )
     return x[:num_tokens, :hidden_size]

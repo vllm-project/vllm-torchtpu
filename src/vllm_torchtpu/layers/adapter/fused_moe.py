@@ -22,6 +22,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.tpu_communicator import combine_splits
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -31,7 +32,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -157,6 +158,7 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    combine_in_pieces: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -181,6 +183,7 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        combine_in_pieces=combine_in_pieces,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -192,7 +195,14 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        combine_in_pieces,
+    )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -204,10 +214,18 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    combine_in_pieces: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        combine_in_pieces,
+    )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -217,6 +235,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        combine_in_pieces=combine_in_pieces,
     )
 
 
@@ -228,14 +247,20 @@ def prebuild_fused_moe_kernel(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
 ) -> None:
-    """Prebuild and cache fused MoE custom op outside compile-time tracing."""
-    _get_fused_moe_custom_op(
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+    """Prebuild and cache fused MoE custom op outside compile-time tracing.
+
+    An EP layer gets both unpermute variants: which one a forward takes is
+    decided while it is traced (see ``fused_moe_gmm``).
+    """
+    for combine_in_pieces in (False, True) if use_ep else (False,):
+        _get_fused_moe_custom_op(
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+            combine_in_pieces=combine_in_pieces,
+        )
 
 
 def fused_moe_gmm(
@@ -253,6 +278,7 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    combine_in_pieces: bool | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -265,14 +291,25 @@ def fused_moe_gmm(
     program identical across ranks. The kernel remaps global ids to local ids
     with an elementwise subtract and masks non-local experts. When present,
     the sparse-core parity path dispatches ragged gather/gather-reduce.
+
+    ``combine_in_pieces`` says the output goes, unchanged, to vLLM's EP combine
+    (``TpuDeviceCommunicator.combine``), so its rows are laid out piece-major
+    whenever that combine splits (``ep_combine_layout``). By default it does
+    for an EP layer whenever the combine splits, which relies on vLLM's
+    MoERunner passing the routed output to ``_maybe_combine`` with nothing
+    token-wise in between; a caller that consumes the output itself passes
+    False and gets token order.
     """
     use_ep = experts_start is not None
+    if combine_in_pieces is None:
+        combine_in_pieces = use_ep and combine_splits()
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        combine_in_pieces=combine_in_pieces,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
