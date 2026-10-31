@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """TPU_MOE_PREFILL_SEQUENCE_PARALLEL: the bucket gate, the refusals, the
-replicated shared expert's layout and the fused EP op it builds. No TPU."""
+re-sharded shared expert and the fused EP op it builds. No TPU."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -31,7 +31,7 @@ def _shards(full: torch.Tensor, tp: int, dim: int) -> list[torch.Tensor]:
 
 
 @pytest.mark.parametrize("tp", [2, 16])
-def test_replicated_gate_up_undoes_the_merged_column_sharding(tp):
+def test_merge_gate_up_undoes_the_merged_column_sharding(tp):
     k, inter = 8, 4 * tp
     gate, up = torch.randn(k, inter), torch.randn(k, inter)
     g_s, u_s = torch.rand(inter), torch.rand(inter)
@@ -40,26 +40,53 @@ def test_replicated_gate_up_undoes_the_merged_column_sharding(tp):
         [torch.cat(p, 1) for p in zip(_shards(gate, tp, 1), _shards(up, tp, 1))], 1
     )
     s = torch.cat([torch.cat(p) for p in zip(_shards(g_s, tp, 0), _shards(u_s, tp, 0))])
-    w_rep, s_rep = sp.replicated_gate_up(w, s, tp)
+    w_rep, s_rep = sp.merge_gate_up(w, s, tp)
     torch.testing.assert_close(w_rep, torch.cat([gate, up], 1), rtol=0, atol=0)
     torch.testing.assert_close(s_rep, torch.cat([g_s, u_s]), rtol=0, atol=0)
 
 
-def test_blockwise_down_sums_the_shard_partials():
-    tp, i, n, rows = 4, 8, 16, 3
-    q = [torch.randn(i, n) for _ in range(tp)]  # stand-ins for the fp8 values
-    s = [torch.rand(n) for _ in range(tp)]
-    w, scale = sp.blockwise_down(torch.cat(q), torch.stack(s), tp)
-    assert scale.shape == (1, tp, 1, n)
-    act = torch.randn(rows, tp * i)
-    deq = (w.view(tp, i, n) * scale.view(tp, 1, n)).reshape(tp * i, n)
-    partials = sum(a @ (qr * sr) for a, qr, sr in zip(act.chunk(tp, 1), q, s))
-    torch.testing.assert_close(act @ deq, partials)
+def _silu_mul(x):
+    d = x.shape[-1] // 2
+    return torch.nn.functional.silu(x[:, :d]) * x[:, d:]
 
 
-def test_blockwise_down_refuses_mismatched_scales():
+@pytest.mark.parametrize("group", [1, 2, 4])
+def test_member_slices_sum_to_the_tp_sharded_expert(group):
+    tp, k, i, n, rows = 4, 8, 3, 5, 2
+    w13 = torch.randn(k, tp * 2 * i)  # shard r: [gate_r | up_r]
+    s13 = torch.rand(tp * 2 * i)
+    w2, s2 = torch.randn(tp * i, n), torch.rand(tp, n)
+    x = torch.randn(rows, k)
+    # Today: each TP shard's partial, summed (the all-reduce).
+    want = 0
+    for r in range(tp):
+        cols = slice(r * 2 * i, (r + 1) * 2 * i)
+        act = _silu_mul(x @ (w13[:, cols] * s13[cols]))
+        want = want + act @ (w2[r * i : (r + 1) * i] * s2[r])
+    got = 0
+    for m in range(group):
+        gu, gu_s, d, d_s = sp.member_slice(
+            w13, s13, w2, s2, tp=tp, group=group, member=m
+        )
+        act = _silu_mul(x @ (gu * gu_s))
+        per = tp // group
+        assert d_s.shape == (per, n)
+        deq = (d.view(per, i, n) * d_s[:, None, :]).reshape(per * i, n)
+        got = got + act @ deq
+    torch.testing.assert_close(got, want)
+
+
+def test_member_slice_refuses_an_uneven_split():
     with pytest.raises(ValueError):
-        sp.blockwise_down(torch.zeros(8, 4), torch.zeros(4, 4), 2)
+        sp.member_slice(
+            torch.zeros(4, 12),
+            torch.zeros(12),
+            torch.zeros(6, 4),
+            torch.zeros(3, 4),
+            tp=3,
+            group=2,
+            member=0,
+        )
 
 
 @pytest.mark.parametrize("rank", [0, 3])

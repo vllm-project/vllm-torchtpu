@@ -26,9 +26,9 @@ owning the contiguous rows `[r * T / tp, (r + 1) * T / tp)`:
     expert run on the rank's rows only. The routed experts go through the
     fused EP kernel over the rank's own tokens with a bf16 result wire
     (`fused_moe_ep.build_sequence_parallel_op`), so the MoE output needs no
-    all-reduce; the shared expert runs on a replicated copy of its weights,
-    gathered from the TP shards at load (`replicated_gate_up`,
-    `blockwise_down`).
+    all-reduce; the shared expert is re-sharded at load to TP within groups
+    of `SHARED_GROUP` ranks (`member_slice`), which exchange their rows
+    (`kernels/fused_moe/grouped_shared_expert.py`).
 
 The dense layers in front of the first MoE layer keep the replicated stream,
 and the model norm all-gathers the final rows. Buckets below `MIN_TOKENS`
@@ -44,7 +44,10 @@ import inspect
 from itertools import islice
 from typing import Any
 
+import jax
 import torch
+from jax.sharding import PartitionSpec
+from torch_tpu._internal.pallas import jax_op
 from vllm.compilation import backends as vllm_compilation_backends
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
@@ -55,13 +58,13 @@ from vllm.distributed import (
 from vllm.model_executor.models import deepseek_v2
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.ep_mesh import ep_mesh_index
+from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
+from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import grouped_shared_expert
 from vllm_torchtpu.layers.adapter import fused_moe_ep
 from vllm_torchtpu.layers.adapter.attention import _retain_buffers
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
-    quantized_matmul,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -79,6 +82,7 @@ SHARED_W13 = "_tpu_sp_shared_w13"
 SHARED_S13 = "_tpu_sp_shared_s13"
 SHARED_W2 = "_tpu_sp_shared_w2"
 SHARED_S2 = "_tpu_sp_shared_s2"
+SHARED_OP = "_tpu_sp_shared_op"
 OP_ATTR = "_tpu_sp_moe_op"
 SCALE_ATTR = "_tpu_sp_routed_scale"
 
@@ -97,44 +101,61 @@ def applies(num_tokens: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# The replicated shared expert, from its TP shards
+# The shared expert, re-sharded from TP over all ranks to TP within groups
 # ---------------------------------------------------------------------------
 
+# Ranks per shared-expert group (consecutive EP mesh indices). Each rank holds
+# 1/SHARED_GROUP of the expert: replicating it whole (+2.8 GB per core on
+# GLM-5.2) does not fit next to the served KV budget.
+SHARED_GROUP = 4
 
-def replicated_gate_up(
-    weight: torch.Tensor, scale: torch.Tensor, tp: int
+
+def merge_gate_up(
+    weight: torch.Tensor, scale: torch.Tensor, shards: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The merged gate/up projection over all `tp` shards, from the shards'
-    (k, n) weights concatenated on n (`[K, tp * 2i]`, each shard `[gate_r |
-    up_r]`) and their per-channel scales (`[tp * 2i]`). Returns `[K, 2 * tp * i]`
-    as `[gate | up]` and its scales. Each shard's scales already cover the whole
+    """`shards` merged gate/up TP shards side by side (`[K, shards * 2i]`, each
+    `[gate_r | up_r]`) as one `[gate | up]` projection, with their per-channel
+    scales (`[shards * 2i]`). Each shard's scales already cover the whole
     contraction, so this is a column permutation: no value changes."""
     k, n = weight.shape
-    i = n // (2 * tp)
-    if n != 2 * tp * i or scale.shape != (n,):
+    i = n // (2 * shards)
+    if n != 2 * shards * i or scale.shape != (n,):
         raise ValueError(f"gate_up shards {tuple(weight.shape)} / {tuple(scale.shape)}")
-    order = torch.arange(n, device=weight.device).view(tp, 2, i).transpose(0, 1)
+    order = torch.arange(n, device=weight.device).view(shards, 2, i).transpose(0, 1)
     order = order.reshape(n)
     return weight.index_select(1, order), scale.index_select(0, order)
 
 
-def blockwise_down(
-    weight: torch.Tensor, scale: torch.Tensor, tp: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The down projection over all `tp` shards, from the shards' (k, n)
-    weights concatenated on k (`[tp * i, N]`) and their per-channel scales
-    stacked (`[tp, N]`). Each shard was quantized over its own rows, so the
-    whole projection is block-scaled on k with one block per shard
-    (`[1, tp, 1, N]`, the layout `quantized_matmul` takes for blockwise
-    weights): the shards' fp8 values and scales are kept as they are."""
-    k, n = weight.shape
-    if k % tp or scale.shape != (tp, n):
-        raise ValueError(f"down shards {tuple(weight.shape)} / {tuple(scale.shape)}")
-    return weight, scale.reshape(1, tp, 1, n)
+def member_slice(
+    w13: torch.Tensor,
+    s13: torch.Tensor,
+    w2: torch.Tensor,
+    s2: torch.Tensor,
+    *,
+    tp: int,
+    group: int,
+    member: int,
+) -> tuple[torch.Tensor, ...]:
+    """Group member `member`'s share of a shared expert, from all `tp` TP
+    shards gathered: `w13 [K, tp * 2i]` / `s13 [tp * 2i]` (shard r's columns
+    `[gate_r | up_r]`), `w2 [tp * i, N]` / `s2 [tp, N]` (shard r's rows, scaled
+    per shard). The member takes `tp / group` consecutive shards: its merged
+    `[gate | up]` columns and the matching down rows, block-scaled with one
+    block per shard, so every fp8 value and scale is kept as it was."""
+    per = tp // group
+    if per * group != tp or not 0 <= member < group:
+        raise ValueError(f"tp={tp} does not split into {group} groups ({member})")
+    cols = w13.shape[1] // tp
+    lo, hi = member * per, (member + 1) * per
+    gu, gu_s = merge_gate_up(
+        w13[:, lo * cols : hi * cols], s13[lo * cols : hi * cols], per
+    )
+    rows = w2.shape[0] // tp
+    return gu, gu_s, w2[lo * rows : hi * rows], s2[lo:hi]
 
 
 def _gather(t: torch.Tensor, dim: int) -> torch.Tensor:
-    """All-gather over the TP group at load. fp8 is gathered (and permuted by
+    """All-gather over the TP group at load. fp8 is gathered (and sliced by
     the caller) as bf16, which holds every e4m3 value exactly."""
     if t.dtype == torch.float8_e4m3fn:
         t = t.to(torch.bfloat16)
@@ -152,7 +173,7 @@ def _per_channel_fp8(linear: Any) -> tuple[torch.Tensor, torch.Tensor]:
         or getattr(linear, "bias", None) is not None
     ):
         raise NotImplementedError(
-            "TPU_MOE_PREFILL_SEQUENCE_PARALLEL replicates a shared expert held as "
+            "TPU_MOE_PREFILL_SEQUENCE_PARALLEL re-shards a shared expert held as "
             "per-channel fp8 (k, n) linears without bias; got "
             f"{w.dtype} weight {tuple(w.shape)}, scale "
             f"{None if s is None else tuple(s.shape)}"
@@ -160,26 +181,69 @@ def _per_channel_fp8(linear: Any) -> tuple[torch.Tensor, torch.Tensor]:
     return w.data, s.data
 
 
-def _replicate_shared_expert(mlp: Any, tp: int) -> None:
+def _group_shared_expert(mlp: Any, tp: int, rank: int) -> None:
     shared = mlp.shared_experts
     w13, s13 = _per_channel_fp8(shared.gate_up_proj)
     w2, s2 = _per_channel_fp8(shared.down_proj)
     fp8 = w13.dtype
-    w13, s13 = replicated_gate_up(_gather(w13, 1), _gather(s13, 0), tp)
-    w2, s2 = blockwise_down(_gather(w2, 0), _gather(s2[None], 0), tp)
-    for name, t in (
-        (SHARED_W13, w13.to(fp8)),
-        (SHARED_S13, s13),
-        (SHARED_W2, w2.to(fp8)),
-        (SHARED_S2, s2),
+    parts = member_slice(
+        _gather(w13, 1),
+        _gather(s13, 0),
+        _gather(w2, 0),
+        _gather(s2[None], 0),
+        tp=tp,
+        group=SHARED_GROUP,
+        member=rank % SHARED_GROUP,
+    )
+    for name, t, dtype in zip(
+        (SHARED_W13, SHARED_S13, SHARED_W2, SHARED_S2),
+        parts,
+        (fp8, torch.float32, fp8, torch.float32),
     ):
-        mlp.register_buffer(name, t.contiguous(), persistent=False)
+        mlp.register_buffer(name, t.to(dtype).contiguous(), persistent=False)
+
+
+_SHARED_OPS: dict[tuple, Any] = {}
+
+
+def _build_shared_op(group: int) -> Any:
+    """The grouped shared expert as one SPMD op over the EP mesh (built at
+    load, outside Dynamo)."""
+    key = (group,)
+    if key in _SHARED_OPS:
+        return _SHARED_OPS[key]
+    mesh = build_ep_mesh()
+    n = mesh.shape[EP_AXIS_NAME]
+    groups = tuple(tuple(range(g, g + group)) for g in range(0, n, group))
+
+    def fn(
+        x: jax.Array, w13: jax.Array, s13: jax.Array, w2: jax.Array, s2: jax.Array
+    ) -> jax.Array:
+        return grouped_shared_expert(
+            x, w13, s13, w2, s2, axis=EP_AXIS_NAME, groups=groups
+        )
+
+    spec = PartitionSpec(EP_AXIS_NAME)
+    op = jax_op(
+        f"pallas::moe_prefill_sp_shared_g{group}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,) * 5,
+        output_partition_specs=spec,
+    )
+    op.register_fake(lambda x, *_args, **_kw: torch.empty_like(x))
+    _SHARED_OPS[key] = op
+    return op
 
 
 def _shared_expert(mlp: Any, x: torch.Tensor) -> torch.Tensor:
-    gate_up = quantized_matmul(x, getattr(mlp, SHARED_W13), getattr(mlp, SHARED_S13))
-    act = mlp.shared_experts.act_fn(gate_up)
-    return quantized_matmul(act, getattr(mlp, SHARED_W2), getattr(mlp, SHARED_S2))
+    return getattr(mlp, SHARED_OP)(
+        x,
+        getattr(mlp, SHARED_W13),
+        getattr(mlp, SHARED_S13),
+        getattr(mlp, SHARED_W2),
+        getattr(mlp, SHARED_S2),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +483,8 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             )
         setattr(mlp, OP_ATTR, op)
         setattr(mlp, SCALE_ATTR, float(mlp.routed_scaling_factor))
-        _replicate_shared_expert(mlp, tp)
+        _group_shared_expert(mlp, tp, get_tp_group().rank_in_group)
+        setattr(mlp, SHARED_OP, _build_shared_op(SHARED_GROUP))
         setattr(layer, KEEP_ATTR, _keep_list(mlp))
     setattr(backbone, KEEP_ATTR, True)
     n = len(layers) - first
