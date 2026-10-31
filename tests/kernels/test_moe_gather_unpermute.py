@@ -103,6 +103,7 @@ def test_matches_sparsecore_order_bit_for_bit(
     [
         (768, (128, 256)),
         (1024, (128, 384)),
+        (1024, (128, 128, 256)),
         # Calls of 3 and 6 steps: a call ends on either buffer.
         (1152, (128, 256)),
     ],

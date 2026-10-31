@@ -25,9 +25,9 @@ can produce that order.
 """
 
 # Share of every block each piece takes, in _SHARE_UNITS. The first piece is
-# small, so its reduce-scatter starts soon after the unpermute ends, and the
-# rest is finished while it is sent.
-COMBINE_PIECE_SIXTEENTHS = (4, 12)
+# small, so its reduce-scatter starts soon after the unpermute ends, and each
+# later piece is finished while the ones before it are sent.
+COMBINE_PIECE_SIXTEENTHS = (4, 4, 8)
 _SHARE_UNITS = 16
 # Row blocks a piece takes one sub-block of: two per rank of an eight-rank
 # group, so every piece spans both halves of every rank's slice.
