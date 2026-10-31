@@ -38,6 +38,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+from jax import lax
 from jax.sharding import PartitionSpec as P
 from vllm.compilation import backends as vllm_compilation_backends
 
@@ -50,7 +51,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
-from vllm_torchtpu.kernels.mla import dcp_token_parallel
+from vllm_torchtpu.kernels.mla import dcp_token_parallel, page_gather
 from vllm_torchtpu.kernels.mla.kv_cache_utils import update_sparse_mla_kv_cache_dcp
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 
@@ -263,6 +264,14 @@ def make_select_topk(
     return select
 
 
+def _after_reads(*caches: jax.Array, after: jax.Array) -> tuple[jax.Array, ...]:
+    """`caches`, ordered after `after` (a result of the step's DCP sub-batch,
+    which reads the same caches). Without the edge XLA may schedule this op's
+    in-place cache write first and then has to copy the whole cache to keep
+    the value the sub-batch reads."""
+    return lax.optimization_barrier((*caches, after))[:-1]
+
+
 def build_attention_op(
     layer: Any,
     impl: Any,
@@ -297,8 +306,12 @@ def build_attention_op(
         block_tables: jax.Array,
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
+        after: jax.Array,
         rank_ids: jax.Array | None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        kv_cache_nope, kv_cache_rope = _after_reads(
+            kv_cache_nope, kv_cache_rope, after=after
+        )
         nope_spec, rope_spec = layer.mla_kv_spec
         if nope_spec.page_size != layout.page_size:
             raise ValueError(
@@ -350,6 +363,7 @@ def build_attention_op(
             attend=attend,
             rank_ids=rank_ids,
             q_replicated=q_replicated,
+            read_pages=page_gather.gather_pages,
         )
 
     # Fixed arity per variant: torch custom-op schemas take no varargs.
@@ -364,6 +378,7 @@ def build_attention_op(
         block_tables: jax.Array,
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
+        after: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return _run(
             kv_cache_nope,
@@ -376,6 +391,7 @@ def build_attention_op(
             block_tables,
             query_start_loc,
             request_distribution,
+            after,
             None,
         )
 
@@ -390,6 +406,7 @@ def build_attention_op(
         block_tables: jax.Array,
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
+        after: jax.Array,
         rank_ids: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return _run(
@@ -403,12 +420,13 @@ def build_attention_op(
             block_tables,
             query_start_loc,
             request_distribution,
+            after,
             rank_ids,
         )
 
     sharded, rep = P(DCP_AXIS_NAME), P()
     in_specs = (sharded, sharded, rep if q_replicated else sharded)
-    in_specs += (rep, rep, sharded, rep, rep, rep, rep)
+    in_specs += (rep, rep, sharded, rep, rep, rep, rep, sharded)
     if rank_tensor is not None:
         in_specs += (sharded,)
     op = pcp_streaming_jax_op(
@@ -442,6 +460,7 @@ def build_attention_op(
         block_tables: torch.Tensor,
         query_start_loc: torch.Tensor,
         request_distribution: torch.Tensor,
+        after: torch.Tensor,
     ) -> torch.Tensor:
         nope_cache, rope_cache = kv_cache
         new_nope, new_rope, out = op(
@@ -455,6 +474,7 @@ def build_attention_op(
             block_tables,
             query_start_loc,
             request_distribution,
+            after,
             *(() if rank_tensor is None else (rank_tensor,)),
         )
         nope_cache.copy_(new_nope)
@@ -520,6 +540,8 @@ def attention(
     head = merge_lse_partials_scatter_heads(
         partial, lse, is_backbone=True, wire_dtype=partial.dtype, query_start_loc=qsl_s
     )
+    # The token-parallel op rewrites the caches in place; it must not start
+    # before the sub-batch has read them (`_after_reads`).
     tail = tp_op(
         kv_cache,
         torch.cat([ql_nope, q_pe], dim=-1),
@@ -530,6 +552,7 @@ def attention(
         md.block_tables,
         md.query_start_loc,
         md.request_distribution,
+        lse,
     )
     return torch.cat([head, tail[: num_tokens - s]])
 
@@ -572,8 +595,10 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
         distribution: jax.Array,
+        after: jax.Array,
         rank_ids: jax.Array | None,
     ) -> tuple[jax.Array, jax.Array]:
+        (cache_kv,) = _after_reads(cache_kv, after=after)
         writer, kv_layout = mla_op._resolve_indexer_kv_cache_mode(
             cache_kv, k_packed, mode=kv_cache_mode
         )
@@ -641,6 +666,7 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
         distribution: jax.Array,
+        after: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         return _run(
             q_bytes,
@@ -651,6 +677,7 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
             page_indices,
             cu_q_lens,
             distribution,
+            after,
             None,
         )
 
@@ -663,6 +690,7 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
         distribution: jax.Array,
+        after: jax.Array,
         rank_ids: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         return _run(
@@ -674,11 +702,12 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
             page_indices,
             cu_q_lens,
             distribution,
+            after,
             rank_ids,
         )
 
     sharded, rep = P(DCP_AXIS_NAME), P()
-    in_specs = (rep, rep, sharded, rep, rep, rep, rep, rep)
+    in_specs = (rep, rep, sharded, rep, rep, rep, rep, rep, sharded)
     if rank_tensor is not None:
         in_specs += (sharded,)
     op = pcp_streaming_jax_op(
@@ -744,5 +773,6 @@ def indexer_rows(
         page_indices,
         cu_q_lens,
         distribution,
+        head,
     )
     return torch.cat([head, tail])

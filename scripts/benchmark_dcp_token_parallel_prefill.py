@@ -53,6 +53,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 )
 from vllm_torchtpu.kernels.mla import dcp_token_parallel as tp
 from vllm_torchtpu.kernels.mla import kv_cache_utils as kvu
+from vllm_torchtpu.kernels.mla import page_gather
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.adapter import dcp_token_parallel_op as tp_op
 from vllm_torchtpu.layers.core.attention_interface import sparse_mla_attention_dcp
@@ -502,6 +503,7 @@ def main():
             write_kv=write_kv,
             attend=attend,
             q_replicated=a.q_replicated,
+            read_pages=page_gather.gather_pages,
         )
     )
     q_tp = _global(NamedSharding(mesh, P()), q) if a.q_replicated else q_sharded
@@ -759,7 +761,9 @@ def main():
         def _l(n, r, sl, bt_, q_, d_):
             pages, offs = tp.step_pages(lay, sl, q_, d_[2])
             ids = tp.gather_page_ids(lay, bt_, pages, offs, n.shape[0])
-            return tp.gather_latent(lay, n, r, ids, jnp.sum(pages), AXIS)
+            return tp.gather_latent(
+                lay, n, r, ids, jnp.sum(pages), AXIS, page_gather.gather_pages
+            )
 
         return jax.shard_map(
             _l,

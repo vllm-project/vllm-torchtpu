@@ -298,6 +298,18 @@ def _sized_gather(
     return lax.switch(jnp.minimum(idx, len(caps) - 1), [branch(c) for c in caps])
 
 
+def take_pages(cache: jax.Array, page_ids: jax.Array) -> jax.Array:
+    """`cache[page_ids]` as `[len(page_ids) * rows, ...]` rows, by XLA."""
+    rows = cache.shape[1]
+    flat = cache.reshape(cache.shape[0] * rows, *cache.shape[2:])
+    idx = page_ids[:, None] * rows + jnp.arange(rows, dtype=jnp.int32)
+    return jnp.take(flat, idx.reshape(-1), axis=0)
+
+
+# (cache [pages, rows, ...], page ids [n]) -> [n * rows, ...]
+ReadPagesFn = Callable[[jax.Array, jax.Array], jax.Array]
+
+
 def gather_latent(
     layout: TokenParallelLayout,
     nope_cache: jax.Array,
@@ -305,22 +317,17 @@ def gather_latent(
     page_ids: jax.Array,
     total_pages: jax.Array,
     axis_name: str,
+    read_pages: ReadPagesFn = take_pages,
 ) -> tuple[jax.Array, jax.Array]:
     """Every rank's `page_ids` pages, rank-major: `[dcp * max_pages, ...]`.
-
-    The pages are read as rows of the cache's flat `[pages * rows, ...]` view,
-    the view the SparseCore cache writer and gather use: indexing the paged
-    shape instead makes XLA keep a second, page-tiled layout of the whole
-    cache and copy it every layer.
-    """
+    `read_pages` reads this rank's pages (`page_gather.gather_pages` on TPU:
+    it reads the cache in the layout the SparseCore cache kernels use)."""
 
     def gather(cache: jax.Array) -> jax.Array:
         rows = cache.shape[1]
-        flat = cache.reshape(cache.shape[0] * rows, *cache.shape[2:])
 
         def pages(cap: int) -> jax.Array:
-            idx = page_ids[:cap, None] * rows + jnp.arange(rows, dtype=jnp.int32)
-            g = lax.all_gather(jnp.take(flat, idx.reshape(-1), axis=0), axis_name)
+            g = lax.all_gather(read_pages(cache, page_ids[:cap]), axis_name)
             return g.reshape(layout.dcp_size, cap * rows, *g.shape[2:])
 
         g = _sized_gather(layout, total_pages, pages, page_axis=1, page_rows=rows)
@@ -424,6 +431,7 @@ def sparse_mla_attention(
     attend: AttendFn,
     rank_ids: jax.Array | None = None,
     q_replicated: bool = False,
+    read_pages: ReadPagesFn = take_pages,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Token-parallel sparse MLA for one layer (global view).
 
@@ -454,7 +462,7 @@ def sparse_mla_attention(
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
         page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
         g_nope, g_rope = gather_latent(
-            layout, nope, rope, page_ids, jnp.sum(pages), axis_name
+            layout, nope, rope, page_ids, jnp.sum(pages), axis_name, read_pages
         )
         if q_replicated:
             q_tok = own_rows(layout, q, rank)
