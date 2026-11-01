@@ -44,15 +44,14 @@ _BRIDGE_EXPORTS = frozenset(
 )
 _JAX_BRIDGE_EXPORTS = frozenset({"make_typed_step_wrapper", "sharded_jax_callable"})
 
+_WEIGHT_SOURCE_EXPORTS = frozenset(
+    {"TorchArrayOps", "VLLMWeightSource", "WEIGHT_FLIPPED_ATTR", "load_vllm_weights"}
+)
 _COLLECTOR_EXPORTS = frozenset(
     {
-        "TorchArrayOps",
-        "VLLMWeightSource",
-        "WEIGHT_FLIPPED_ATTR",
         "apply_tp_moe_flags",
         "extract_ecopy_layer",
         "get_routed_experts",
-        "load_vllm_weights",
         "reshard_experts_ep_to_tp_local",
         "reshard_layer_experts_ep_to_tp",
     }
@@ -106,6 +105,10 @@ def __getattr__(name: str) -> Any:
         from . import exported_bridge
 
         return getattr(exported_bridge, name)
+    if name in _WEIGHT_SOURCE_EXPORTS:
+        from . import weight_source
+
+        return getattr(weight_source, name)
     if name in _COLLECTOR_EXPORTS:
         from . import weight_collector
 
