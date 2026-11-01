@@ -83,11 +83,13 @@ def indexed_options() -> dict:
 
 
 def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
-    """`_wholestep_tiles`; with main-KV DCP-2 above 16 rows the expert ring drops one more 2 MiB
+    """`_wholestep_tiles`; with main-KV DCP-2 up to 32 rows the expert ring drops one more 2 MiB
     slot: the pair exchange buffers and the doubled-head union attention put b32 (f32 state)
-    over scoped VMEM (tpu_bench_wholestep_call j-677db355: CompileTimeScopedVmemOom)."""
+    over scoped VMEM (tpu_bench_wholestep_call j-677db355: CompileTimeScopedVmemOom), and the
+    owned-only per-rank unions (`qu_id` / `qu_cd` / `qgu_*` x2) b16 too (served j-af65b422:
+    62.49M at qwen38_mk_whole_b16)."""
     t = _wholestep_tiles(B, max_groups)
-    if main_kv_dcp() > 1 and 16 < B <= 32:
+    if main_kv_dcp() > 1 and B <= 32:
         # Above 32 rows the GDN chunk gather (no NS-sized pg_rec) leaves room for the full
         # expert ring: at b48 the trimmed 5 slots cost 0.3-0.4 ms per call vs 6 (j-74ef730a).
         t = dataclasses.replace(t, nbe=t.nbe - 1)
