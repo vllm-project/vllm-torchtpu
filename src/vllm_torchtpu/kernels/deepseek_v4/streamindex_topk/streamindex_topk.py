@@ -1241,9 +1241,13 @@ def streamindex_topk(
                 f"bkv_sz ({page_size} * {bkv_p} = {bkv_sz}) must be a multiple of 128."
             )
 
+    active_bkv_ps = (
+        num_kv_pages_per_blocks
+        if uniform_q_len is not None
+        else (num_kv_pages_per_blocks[0], num_kv_pages_per_blocks[2])
+    )
     num_sublanes_total = max(
-        align_to(pages_per_seq, bkv_p) * page_size // 128
-        for bkv_p in num_kv_pages_per_blocks
+        align_to(pages_per_seq, bkv_p) * page_size // 128 for bkv_p in active_bkv_ps
     )
 
     def _block_sizes(num_queries_per_block, bkv_p, static_q_len):
@@ -1277,6 +1281,7 @@ def streamindex_topk(
         chunk_tokens=None,
         scheduling_group_id=None,
         chunk_idx=0,
+        start_end=None,
     ):
         max_num_tokens, num_q_heads, head_dim = q.shape
         # Only support batching for decode sequences.
@@ -1308,12 +1313,14 @@ def streamindex_topk(
 
         scratch_shapes = []
 
-        chunk_start = 0 if chunk_token_start is None else chunk_token_start
+        if start_end is None:
+            chunk_start = 0 if chunk_token_start is None else chunk_token_start
+            start_end = jnp.array([start_seq_idx, end_seq_idx, chunk_start], jnp.int32)
         scalar_prefetches = (
             seq_lens,
             page_indices,
             cu_q_lens,
-            jnp.array([start_seq_idx, end_seq_idx, chunk_start], jnp.int32),
+            start_end,
             pass_meta,
         )
 
@@ -1481,7 +1488,7 @@ def streamindex_topk(
         # XLA would common the identical per-chunk fills into one buffer then clone
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
         scores = None
-        for spec, pass_meta in passes:
+        for spec, pass_meta, start_ends in passes:
             if (
                 spec["static_q_len"] == 1
                 and chunk_token_start is not None
@@ -1497,6 +1504,7 @@ def streamindex_topk(
                 page_indices,
                 cu_q_lens,
                 pass_meta=pass_meta,
+                start_end=start_ends[chunk_idx],
                 chunk_idx=chunk_idx,
                 chunk_token_start=chunk_token_start,
                 chunk_tokens=chunk_tokens,
@@ -1507,55 +1515,69 @@ def streamindex_topk(
         assert scores is not None
         return scores
 
+    # Hoist all per-step metadata and schedule computations outside `_common_path`
+    # and `_fast_path` so XLA CSEs them across all 21 indexer layers even when
+    # `enable_early_exit=True` wraps the kernel call in `jax.lax.cond`.
+    out_dtype = jnp.int32
+    max_num_tokens = q.shape[0]
+
+    # TODO: we shall sort the sequences by length, so that multiple decode
+    # sequences in one batch have similar lengths to reduce waste of compute.
+    # With the same batch size, the longest sequence will determine number of
+    # blocks to run computation for.
+    decode_batch_end = (
+        jnp.array(0)
+        if max_num_seqs < decode_req_batch_size
+        else distribution[0] // decode_req_batch_size * decode_req_batch_size
+    )
+
+    num_positions = max(num_sublanes_total * 128, k)
+    eff_row_lengths = _effective_row_lengths(
+        seq_lens=seq_lens,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        num_tokens=max_num_tokens,
+        num_positions=num_positions,
+        compression_ratio=compression_ratio,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        interleave_c=interleave_c,
+    )
+
+    if chunk_tokens is None or max_num_tokens % chunk_tokens:
+        num_chunks, chunk_len = 1, max_num_tokens
+    else:
+        num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
+
+    chunk_starts = (
+        (None,) if num_chunks == 1 else tuple(m * chunk_len for m in range(num_chunks))
+    )
+    passes = tuple(
+        (
+            spec,
+            _pass_metadata(spec, chunk_starts, chunk_len),
+            tuple(
+                jnp.array(
+                    [
+                        spec["start_seq_idx"],
+                        spec["end_seq_idx"],
+                        0 if cs is None else cs,
+                    ],
+                    jnp.int32,
+                )
+                for cs in chunk_starts
+            ),
+        )
+        for spec in _pass_specs(decode_batch_end)
+    )
+
     def _common_path(_):
-        # Raw f32 bits, not f32. The SparseCore top-k compares bits, and this is
-        # the dtype it wants to read, so nothing has to reformat HBM scores.
-        out_dtype = jnp.int32
-        max_num_tokens = q.shape[0]
-
-        # TODO: we shall sort the sequences by length, so that multiple decode
-        # sequences in one batch have similar lengths to reduce waste of compute.
-        # With the same batch size, the longest sequence will determine number of
-        # blocks to run computation for.
-        decode_batch_end = (
-            jnp.array(0)
-            if max_num_seqs < decode_req_batch_size
-            else distribution[0] // decode_req_batch_size * decode_req_batch_size
-        )
-
-        num_positions = max(num_sublanes_total * 128, k)
-        eff_row_lengths = _effective_row_lengths(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=max_num_tokens,
-            num_positions=num_positions,
-            compression_ratio=compression_ratio,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-        )
-
-        if chunk_tokens is None or max_num_tokens % chunk_tokens:
-            num_chunks, chunk_len = 1, max_num_tokens
-        else:
-            num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
-
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
         if num_chunks > 1:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
-        chunk_starts = (
-            (None,)
-            if num_chunks == 1
-            else tuple(m * chunk_len for m in range(num_chunks))
-        )
-        passes = tuple(
-            (spec, _pass_metadata(spec, chunk_starts, chunk_len))
-            for spec in _pass_specs(decode_batch_end)
-        )
         topk_idxs = []
         topk_scores_list = []
         for m in range(num_chunks):
@@ -1624,27 +1646,28 @@ def streamindex_topk(
         scores_out = scores_out[:max_num_tokens, :k]
         return out, scores_out
 
-    def _fast_path(_):
-        token_idx = jnp.arange(q.shape[0], dtype=jnp.int32)
-        tok_col = token_idx[:, None]
-        member = (tok_col >= cu_q_lens[None, :-1]) & (tok_col < cu_q_lens[None, 1:])
-        seq_len = jnp.sum(jnp.where(member, seq_lens[None, :], 0), axis=1)
-        pos_offset = seq_lens - cu_q_lens[1:]
-        q_abs_pos = token_idx + jnp.sum(
-            jnp.where(member, pos_offset[None, :], 0), axis=1
-        )
-        max_valid_idx = jnp.minimum(
-            seq_len // compression_ratio - 1,
-            q_abs_pos // compression_ratio,
-        )
-        max_valid_idx = jnp.where(jnp.any(member, axis=1), max_valid_idx, -1)
-        s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
-        return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
-
     if not enable_early_exit:
         return _common_path(None)
+
+    token_idx = jnp.arange(q.shape[0], dtype=jnp.int32)
+    tok_col = token_idx[:, None]
+    member = (tok_col >= cu_q_lens[None, :-1]) & (tok_col < cu_q_lens[None, 1:])
+    seq_len = jnp.sum(jnp.where(member, seq_lens[None, :], 0), axis=1)
+    pos_offset = seq_lens - cu_q_lens[1:]
+    q_abs_pos = token_idx + jnp.sum(jnp.where(member, pos_offset[None, :], 0), axis=1)
+    max_valid_idx = jnp.minimum(
+        seq_len // compression_ratio - 1,
+        q_abs_pos // compression_ratio,
+    )
+    max_valid_idx = jnp.where(jnp.any(member, axis=1), max_valid_idx, -1)
+    s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
+    early_exit_cond = jnp.max(seq_lens) // compression_ratio <= k
+
+    def _fast_path(_):
+        return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
+
     return jax.lax.cond(
-        jnp.max(seq_lens) // compression_ratio <= k,
+        early_exit_cond,
         _fast_path,
         _common_path,
         None,

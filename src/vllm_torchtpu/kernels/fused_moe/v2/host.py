@@ -913,30 +913,50 @@ def build_routing_tables_sharded(
     # The rank pass this consumer needs is the block-wide one restricted to
     # this rank's own blocks, which is that pass over those blocks alone.
     my_rank = _rank_within_block(my_blocks, block)
-    pos = (_lookup_per_pair(pos_table, my_blocks, bins) + my_rank).reshape(t_local, K)
 
     # The mirror position of the same pair: its offset within the run, past
-    # the lane its source tile's sublane starts on. Same shape of lookup as
-    # `pos`, over the one-hot the compiler shares between them.
+    # the lane its source tile's sublane starts on. Because
+    # `mirror_table[b, e] - pos_table[b, e]` depends only on `e`, pack the
+    # sub-tile remainder into the low `shift + 1` bits of `pos_table` so a
+    # single `_lookup_per_pair` pass extracts both `pos` and `mirror_pos`.
     run_tiles = mirror_run_tiles(run_start_aligned, run_rows_aligned, tile_m)
     shift = pow2_shift(tile_m, "tile_m")
     my_run_start = lax.dynamic_slice(run_start_aligned, (0, me), (e_total, 1)).reshape(
         e_total
     )
-    mirror_table = (
-        my_off
-        + (
-            (
-                jnp.right_shift(my_recv_base, shift)
-                + 2 * jnp.arange(e_total, dtype=jnp.int32)
-            )
-            * tile_m
-            + (my_run_start & (tile_m - 1))
-        )[None, :]
-    )
-    mirror_pos = (_lookup_per_pair(mirror_table, my_blocks, bins) + my_rank).reshape(
-        t_local, K
-    )
+    max_pos = n + (ROWBLK - 1) * e_total
+    if max_pos * (2 * tile_m) < 2**31:
+        rem_slot = (
+            (my_run_start & (tile_m - 1)) - (my_recv_base & (tile_m - 1)) + tile_m
+        )
+        packed_pos_table = jnp.left_shift(pos_table, shift + 1) + rem_slot[None, :]
+        packed_lookup = _lookup_per_pair(packed_pos_table, my_blocks, bins)
+        pos_base = jnp.right_shift(packed_lookup, shift + 1)
+        rem_val = packed_lookup & ((2 * tile_m) - 1)
+        pos = (pos_base + my_rank).reshape(t_local, K)
+        mirror_pos = (
+            pos_base
+            + jnp.where(rem_val != 0, (2 * my_blocks - 1) * tile_m + rem_val, 0)
+            + my_rank
+        ).reshape(t_local, K)
+    else:
+        pos = (_lookup_per_pair(pos_table, my_blocks, bins) + my_rank).reshape(
+            t_local, K
+        )
+        mirror_table = (
+            my_off
+            + (
+                (
+                    jnp.right_shift(my_recv_base, shift)
+                    + 2 * jnp.arange(e_total, dtype=jnp.int32)
+                )
+                * tile_m
+                + (my_run_start & (tile_m - 1))
+            )[None, :]
+        )
+        mirror_pos = (
+            _lookup_per_pair(mirror_table, my_blocks, bins) + my_rank
+        ).reshape(t_local, K)
 
     # Across all tokens, compute offsets only for this rank's local experts.
     first = me * g_local

@@ -575,7 +575,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=kv_pages_per_block,
                 num_queries_per_block=queries_per_block,
                 decode_req_batch_size=decode_req_batch_size,
-                enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                enable_early_exit=(
+                    STREAMIDX_ENABLE_EARLY_EXIT
+                    and num_tokens > STREAMIDX_SMALL_DECODE_TOKENS
+                ),
                 kv_layout=kv_layout,
                 chunk_tokens=bucket_chunk_tokens,
             )

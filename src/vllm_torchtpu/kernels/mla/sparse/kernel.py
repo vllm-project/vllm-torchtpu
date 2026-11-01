@@ -30,7 +30,7 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
 SPARSECORE_CACHE_LAYOUT = "sparsecore"
 DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
-DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
+DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 8
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
 
@@ -1266,11 +1266,11 @@ def sparse_ragged_paged_attention(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
-    sparsecore_gather_ring_slots: int = 4,
+    sparsecore_gather_ring_slots: int = 8,
     small_chunk_tokens: int = 64,
     small_chunk_batch_size: int | None = 4,
     small_chunk_live_gather: bool = True,
-    small_chunk_gather_atoms: int = 8,
+    small_chunk_gather_atoms: int = 16,
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
     q_pe: jax.Array | None = None,
