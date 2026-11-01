@@ -11,20 +11,19 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+# One bank's plan: sort order [N], word-row destinations [R], row masks [R]
+# and the same masks broadcast to [R, 512], R = swa_plan_rows(N).
+SwaBankPlan = tuple[jax.Array, jax.Array, jax.Array, jax.Array]
 
-@functools.partial(jax.jit, donate_argnums=(0,))
-def write_swa_pages(
+
+def _check_page_size(page_size: int) -> None:
+    if page_size not in (8, 16, 32, 64) and (page_size < 128 or page_size % 128):
+        raise ValueError("SWA banks need matching page sizes: 8,16,32,64 or 128*n")
+
+
+def _check_owners(
     pages: jax.Array | tuple[jax.Array, jax.Array],
-    records: jax.Array,
-    values: jax.Array,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """Write physical token records, preserving adjacent BF16 rows and null page.
-
-    Records address concatenated banks. Negative and out-of-range records are
-    dropped; page zero is reserved. Valid records must be unique within a call.
-    Each physical word row has one writer, preserving both halves of packed
-    words. The aliased output preserves untouched rows without copying the pool.
-    """
+) -> tuple[jax.Array, ...]:
     banks = pages if isinstance(pages, tuple) else (pages,)
     if (isinstance(pages, tuple) and len(banks) != 2) or any(
         bank.ndim != 3
@@ -34,32 +33,42 @@ def write_swa_pages(
         for bank in banks
     ):
         raise ValueError("SWA owners must be BF16 [pages,page_size,512]")
-    page_size = banks[0].shape[1]
-    if (
-        page_size not in (8, 16, 32, 64) and (page_size < 128 or page_size % 128)
-    ) or any(bank.shape[1] != page_size for bank in banks):
+    _check_page_size(banks[0].shape[1])
+    if any(bank.shape[1] != banks[0].shape[1] for bank in banks):
         raise ValueError("SWA banks need matching page sizes: 8,16,32,64 or 128*n")
-    if values.ndim != 2 or values.shape[1] != 512 or values.dtype != jnp.bfloat16:
-        raise ValueError("SWA values must be BF16 [N,512]")
-    if records.shape != values.shape[:1] or records.dtype != jnp.int32:
-        raise ValueError("SWA records must be INT32 [N]")
-    if not records.size:
-        return pages
+    return banks
+
+
+def swa_plan_rows(count: int) -> int:
+    """Rows of a publication plan: ``count`` padded to whole SparseCore rounds."""
     info = pltpu.get_tpu_info().sparse_core
     assert info is not None, "SWA publication requires SparseCore"
     lanes, cores = info.num_lanes, info.num_cores * info.num_subcores
-    mesh = plsc.VectorSubcoreMesh(
-        num_cores=info.num_cores,
-        num_subcores=info.num_subcores,
-        core_axis_name="core",
-        subcore_axis_name="subcore",
-    )
-    result, base = [], 0
-    for bank in banks:
-        capacity = bank.shape[0] * page_size
+    return count + -count % (lanes * cores)
+
+
+@functools.partial(jax.jit, static_argnames=("page_size", "bank_pages"))
+def plan_swa_pages(
+    records: jax.Array, *, page_size: int, bank_pages: tuple[int, ...]
+) -> tuple[SwaBankPlan, ...]:
+    """Destinations and masks of `write_swa_pages` for owners of this geometry.
+
+    Depends only on the records, so every layer of a stage that publishes the
+    same records shares one plan: sorting, pairing and mask construction run
+    once, and each layer only permutes and packs its own values.
+    """
+    _check_page_size(page_size)
+    if len(bank_pages) not in (1, 2) or min(bank_pages) < 1:
+        raise ValueError("SWA publication requires one or two nonempty banks")
+    if records.ndim != 1 or records.dtype != jnp.int32 or not records.size:
+        raise ValueError("SWA records must be nonempty INT32 [N]")
+    rows = swa_plan_rows(records.size)
+    plans, base = [], 0
+    for pages in bank_pages:
+        capacity = pages * page_size
         valid = (records >= max(base, page_size)) & (records < base + capacity)
         local = jnp.where(valid, records - base, capacity)
-        order = jnp.argsort(local, stable=True)
+        order = jnp.argsort(local, stable=True).astype(jnp.int32)
         ids = local[order]
         next_ids = jnp.concatenate((ids[1:], jnp.array([capacity], jnp.int32)))
         # TC BF16 tiles pack adjacent token rows into one physical word row.
@@ -69,6 +78,58 @@ def write_swa_pages(
         )
         even = ids % 2 == 0
         has_odd = (~even) | (next_ids // 2 == pairs)
+        masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
+            has_odd, jnp.int32(-65536), jnp.int32(0)
+        )
+        padding = rows - records.size
+        destinations = jnp.pad(
+            jnp.where(boundary, pairs, -1), (0, padding), constant_values=-1
+        )
+        masks = jnp.pad(masks, (0, padding))
+        # SC cannot reshape a lane vector for a column broadcast in the kernel.
+        plans.append(
+            (order, destinations, masks, jnp.broadcast_to(masks[:, None], (rows, 512)))
+        )
+        base += capacity
+    return tuple(plans)
+
+
+@functools.partial(jax.jit, donate_argnums=(0,))
+def write_planned_swa_pages(
+    pages: jax.Array | tuple[jax.Array, jax.Array],
+    plan: tuple[SwaBankPlan, ...],
+    values: jax.Array,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Write ``values`` at the records ``plan`` was built from, for these owners."""
+    banks = _check_owners(pages)
+    if values.ndim != 2 or values.shape[1] != 512 or values.dtype != jnp.bfloat16:
+        raise ValueError("SWA values must be BF16 [N,512]")
+    count = values.shape[0]
+    if not count:
+        return pages
+    rows = swa_plan_rows(count)
+    if len(plan) != len(banks) or any(
+        order.shape != (count,)
+        or destinations.shape != (rows,)
+        or row_masks.shape != (rows,)
+        or masks.shape != (rows, 512)
+        for order, destinations, row_masks, masks in plan
+    ):
+        raise ValueError("SWA plan does not match these owners and values")
+    info = pltpu.get_tpu_info().sparse_core
+    assert info is not None, "SWA publication requires SparseCore"
+    lanes, cores = info.num_lanes, info.num_cores * info.num_subcores
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=info.num_cores,
+        num_subcores=info.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    result = []
+    for bank, (order, destinations, row_masks, masks) in zip(banks, plan, strict=True):
+        flags = row_masks[:count]
+        even = (flags & jnp.int32(65535)) != 0
+        has_odd = (flags & jnp.int32(-65536)) != 0
         bits = jax.lax.bitcast_convert_type(values[order], jnp.uint16).astype(
             jnp.uint32
         )
@@ -77,18 +138,7 @@ def write_swa_pages(
         high = jnp.where(even[:, None], next_bits, bits)
         high = jnp.where(has_odd[:, None], high, jnp.uint32(0))
         words = jax.lax.bitcast_convert_type(low | (high << 16), jnp.int32)
-        masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
-            has_odd, jnp.int32(-65536), jnp.int32(0)
-        )
-        padding = -records.size % (lanes * cores)
-        destinations = jnp.pad(
-            jnp.where(boundary, pairs, -1), (0, padding), constant_values=-1
-        )
-        # SC cannot reshape a lane vector for a column broadcast in the kernel.
-        masks = jnp.broadcast_to(
-            jnp.pad(masks, (0, padding))[:, None], (records.size + padding, 512)
-        )
-        words = jnp.pad(words, ((0, padding), (0, 0)))
+        words = jnp.pad(words, ((0, rows - count), (0, 0)))
         # Keep the page-shaped owner: reshaping the whole pool can break aliasing.
         owner = jax.new_ref(bank)
 
@@ -145,7 +195,7 @@ def write_swa_pages(
 
             pltpu.emit_pipeline(
                 body,
-                grid=(destinations.shape[0] // (lanes * cores),),
+                grid=(rows // (lanes * cores),),
                 tiling=pltpu.Tiling.SPARSE_CORE,
                 in_specs=(
                     pl.BlockSpec((lanes,), lambda b: (b * cores + core,)),
@@ -173,5 +223,34 @@ def write_swa_pages(
             ),
         )(destinations, masks, words, owner)
         result.append(jax.freeze(owner))
-        base += capacity
     return (result[0], result[1]) if isinstance(pages, tuple) else result[0]
+
+
+@functools.partial(jax.jit, donate_argnums=(0,))
+def write_swa_pages(
+    pages: jax.Array | tuple[jax.Array, jax.Array],
+    records: jax.Array,
+    values: jax.Array,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Write physical token records, preserving adjacent BF16 rows and null page.
+
+    Records address concatenated banks. Negative and out-of-range records are
+    dropped; page zero is reserved. Valid records must be unique within a call.
+    Each physical word row has one writer, preserving both halves of packed
+    words. The aliased output preserves untouched rows without copying the pool.
+    Callers that publish the same records repeatedly can share
+    `plan_swa_pages` and call `write_planned_swa_pages` instead.
+    """
+    banks = _check_owners(pages)
+    if values.ndim != 2 or values.shape[1] != 512 or values.dtype != jnp.bfloat16:
+        raise ValueError("SWA values must be BF16 [N,512]")
+    if records.shape != values.shape[:1] or records.dtype != jnp.int32:
+        raise ValueError("SWA records must be INT32 [N]")
+    if not records.size:
+        return pages
+    plan = plan_swa_pages(
+        records,
+        page_size=banks[0].shape[1],
+        bank_pages=tuple(bank.shape[0] for bank in banks),
+    )
+    return write_planned_swa_pages(pages, plan, values)
