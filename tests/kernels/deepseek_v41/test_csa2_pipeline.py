@@ -15,7 +15,10 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     prepare_swa_metadata,
 )
 from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
-from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import csa2_pipeline
+from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
+    csa2_gather_chunk_size,
+    csa2_pipeline,
+)
 from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
 
 
@@ -451,3 +454,13 @@ def test_chunked_pipeline_writes_owners_without_joins(sparsecore_device):
         rf"= {owners}\S* (fusion|concatenate|dynamic-update-slice|copy)\(", text
     )
     assert not joins, joins
+
+
+def test_gather_chunk_size_splits_only_measured_small_buckets():
+    # The 288-query decode bucket was measured faster in 96-row chunks; other
+    # buckets up to 512 queries stay one chunk, larger ones use 128 rows.
+    assert csa2_gather_chunk_size(288) == 96
+    for tokens in (1, 6, 128, 144, 287, 289, 512):
+        assert csa2_gather_chunk_size(tokens) == tokens
+    for tokens in (513, 2048, 8192):
+        assert csa2_gather_chunk_size(tokens) == 128

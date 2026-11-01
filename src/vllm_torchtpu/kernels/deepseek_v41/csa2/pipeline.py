@@ -9,13 +9,21 @@ import jax.numpy as jnp
 from .cache import gather_csa2_kv_sc
 from .csa2 import csa2
 
+# Measured v7x TP1, 64 heads, page 64, bq 6: the DSpark K5 decode bucket of
+# 48 x 6 queries takes 257 us in 96-row chunks against 285 us in one chunk,
+# with bitwise-equal results. 144-, 72- and 48-row chunks were all slower
+# than one chunk, so other small buckets keep a single chunk until measured.
+_SMALL_CHUNKS = {288: 96}
+
 
 def csa2_gather_chunk_size(num_tokens: int) -> int:
     # On v7x TP1 with 64 heads, 128-row chunks overlap SC gather with TC
     # attention while retaining full gathered KV for subsequent layers.
-    # Up to 512 queries, launch and concatenation costs erase the stage-level
-    # benefit; use one gather and one attention without extra staging HBM.
-    return num_tokens if num_tokens <= 512 else 128
+    # Up to 512 queries, one gather and one attention is the default; see
+    # `_SMALL_CHUNKS` for the measured exceptions.
+    if num_tokens > 512:
+        return 128
+    return _SMALL_CHUNKS.get(num_tokens, num_tokens)
 
 
 @functools.partial(
