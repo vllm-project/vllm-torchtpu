@@ -67,13 +67,13 @@ def main_kernel_v2(
     core_axis_name: str,
     subcore_axis_name: str,
     num_row_subchunks: int,
+    dtype_bits: int,
 ):
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
     assert sc_info is not None
     num_simd_lanes = sc_info.num_lanes
     hidden_size = in_hbm_ref.shape[-1]
-    dtype_bits = jax.dtypes.itemsize_bits(out_hbm_ref.dtype)
     packing = 32 // dtype_bits
     col_size = calculate_col_size(hidden_size, packing)
 
@@ -105,8 +105,6 @@ def main_kernel_v2(
     num_cols = pl.cdiv(hidden_size, col_size)
 
     dtype = out_hbm_ref.dtype
-    dtype_bits = jax.dtypes.itemsize_bits(dtype)
-    packing = 32 // dtype_bits
 
     core_index = lax.axis_index((core_axis_name, subcore_axis_name))
 
@@ -215,11 +213,21 @@ def main_kernel_v2(
     )(indices_hbm_ref)
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=("rows_per_word",))
 def ragged_gather_v2(
-    x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
+    x: jax.Array,
+    indices: jax.Array,
+    start: jax.Array,
+    end: jax.Array,
+    *,
+    rows_per_word: int = 1,
 ) -> jax.Array:
-    """Perform gather on indices within dynamic array start and end using BlockSpec."""
+    """Perform gather on indices within dynamic array start and end using BlockSpec.
+
+    With ``rows_per_word``, x is int32 words each holding that many rows of
+    a narrower dtype (row ``rows_per_word * w + j`` in part j of word row w),
+    and the gathered rows come back packed the same way.
+    """
 
     assert x.ndim == 2, "Ragged gather only supports 2d inputs."
     assert indices.ndim == 1, "Ragged gather only supports 1d indices."
@@ -230,17 +238,24 @@ def ragged_gather_v2(
         end = end[None]
 
     dtype = x.dtype
-    if dtype not in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4):
+    if rows_per_word > 1:
+        if dtype != jnp.int32 or rows_per_word not in (2, 4, 8):
+            raise ValueError(f"cannot read {rows_per_word} rows per {dtype} word")
+    elif dtype not in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4):
         raise ValueError(f"dtype must be f32, bf16, int8, or int4, but got {dtype}")
 
     sc_info = pltpu.get_tpu_info().sparse_core
     if sc_info is None:
+        if rows_per_word > 1:
+            raise ValueError("packed rows are gathered on the SparseCore only")
         return x[indices]
 
     hidden_size = x.shape[-1]
     out_size = indices.size
+    if out_size % rows_per_word:
+        raise ValueError(f"{out_size} rows do not fill {rows_per_word}-row words")
 
-    dtype_bits = jax.dtypes.itemsize_bits(dtype)
+    dtype_bits = jax.dtypes.itemsize_bits(dtype) // rows_per_word
     packing = 32 // dtype_bits
     col_size = calculate_col_size(hidden_size, packing)
 
@@ -274,9 +289,10 @@ def ragged_gather_v2(
             core_axis_name=vector_mesh.core_axis_name,
             subcore_axis_name=vector_mesh.subcore_axis_name,
             num_row_subchunks=num_row_subchunks,
+            dtype_bits=dtype_bits,
         ),
         out_type=jax.ShapeDtypeStruct(
-            (out_size + out_pad_size, aligned_hidden_size), dtype
+            ((out_size + out_pad_size) // rows_per_word, aligned_hidden_size), dtype
         ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
@@ -290,4 +306,4 @@ def ragged_gather_v2(
         ],
         mesh=vector_mesh,
         name="sc_ragged_gather_v2",
-    )(start, end, x, indices)[:out_size, :hidden_size]
+    )(start, end, x, indices)[: out_size // rows_per_word, :hidden_size]

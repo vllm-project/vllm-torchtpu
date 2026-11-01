@@ -35,11 +35,25 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
     VllmCompressedTensorsW4ANMxfp4MoEMethod,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
-from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4MoEMethod
+from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+    VllmDeepseekV4Mxfp4MoEMethod,
+    VllmMxfp4MoEMethod,
+)
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod,
 )
+
+# A single-rank MoE: no naive dispatch for VllmMxfp4MoEMethod to route ahead
+# of, so its ownership of the collectives rests on chunking alone.
+_SINGLE_RANK_MOE = SimpleNamespace(dp_size=1, pcp_size=1, is_sequence_parallel=False)
+
+
+def _owner(method_cls):
+    """What a method's supports_internal_mk is read on in these tests."""
+    if method_cls is VllmMxfp4MoEMethod:
+        return SimpleNamespace(moe=_SINGLE_RANK_MOE)
+    return None
 
 
 def _make_mock_moe_config():
@@ -96,10 +110,10 @@ def test_supports_internal_mk_property(method_cls):
     assert isinstance(prop, property)
 
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
-        assert prop.fget(None) is False
+        assert prop.fget(_owner(method_cls)) is False
 
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384):
-        assert prop.fget(None) is True
+        assert prop.fget(_owner(method_cls)) is True
 
 
 def test_calculate_moe_chunks_math():
@@ -337,7 +351,7 @@ def test_fp8_all_gather_alone_claims_the_collectives():
             patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0),
             patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", True),
         ):
-            assert method_cls.supports_internal_mk.fget(None) is False
+            assert method_cls.supports_internal_mk.fget(_owner(method_cls)) is False
 
 
 def _run_with_fp8_all_gather(
@@ -643,6 +657,7 @@ class TestMoEForwardPrecisionBranches:
         method = MagicMock()
         method._tpu_activation_str = "silu"
         method.rhs_quant_dtype = None
+        method.moe = _SINGLE_RANK_MOE
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
@@ -681,6 +696,77 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+
+    @pytest.mark.parametrize("is_sequence_parallel", [False, True])
+    def test_mxfp4_routes_before_the_ep_dispatch(self, is_sequence_parallel):
+        """Under DP/EP the method routes its own tokens, gathers the routes
+        with the hidden states, and combines the experts' output, in place of
+        vLLM's dispatch of the router logits."""
+        layer = MagicMock()
+        layer._experts_start = torch.zeros((), dtype=torch.int32)
+        layer.moe_config.experts_per_token = 2
+        method = MagicMock()
+        method._tpu_activation_str = "silu"
+        method.rhs_quant_dtype = None
+        method.moe = SimpleNamespace(
+            dp_size=1 if is_sequence_parallel else 8,
+            pcp_size=1,
+            is_sequence_parallel=is_sequence_parallel,
+        )
+        x, router_logits = torch.randn(4, 64), torch.randn(4, 8)
+        input_ids = torch.arange(4)
+        topk = (torch.ones(4, 2), torch.zeros(4, 2, dtype=torch.int32))
+        gathered = (
+            torch.randn(32, 64),
+            torch.ones(32, 2),
+            torch.zeros(32, 2, dtype=torch.int32),
+        )
+        experts_out, combined = torch.randn(32, 64), torch.randn(4, 64)
+        ep_group = MagicMock()
+        ep_group.dispatch.return_value = gathered
+        ep_group.combine.return_value = combined
+        route = MagicMock(return_value=topk)
+        mock_fused = MagicMock(return_value=experts_out)
+        module = "vllm_torchtpu.layers.adapter.quantization.mxfp4"
+
+        with (
+            patch(f"{module}.moe_routing.route", route),
+            patch(
+                f"{module}.enable_pipelined_collective_and_compute", return_value=False
+            ),
+            patch(f"{module}.get_ep_group", return_value=ep_group),
+            patch(f"{module}.fused_moe_gmm", mock_fused),
+        ):
+            out = VllmMxfp4MoEMethod._forward_monolithic_tpu(
+                method, layer, x, router_logits, input_ids
+            )
+
+        assert route.call_args.args[1:] == (x, router_logits)
+        assert route.call_args.kwargs["input_ids"] is input_ids
+        ep_group.dispatch.assert_called_once_with(x, *topk, is_sequence_parallel)
+        call_kwargs = mock_fused.call_args.kwargs
+        assert call_kwargs["hidden_states"] is gathered[0]
+        assert call_kwargs["topk_weights"] is gathered[1]
+        assert call_kwargs["topk_ids"] is gathered[2]
+        ep_group.combine.assert_called_once_with(experts_out, is_sequence_parallel)
+        assert out is combined
+
+    @pytest.mark.parametrize(
+        "method_cls", [VllmMxfp4MoEMethod, VllmDeepseekV4Mxfp4MoEMethod]
+    )
+    @pytest.mark.parametrize("dp_size", [1, 8])
+    def test_mxfp4_owns_the_ep_collectives_under_dp(self, method_cls, dp_size):
+        owner = SimpleNamespace(
+            moe=SimpleNamespace(dp_size=dp_size, pcp_size=1, is_sequence_parallel=False)
+        )
+        with (
+            patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0),
+            patch(
+                "vllm_torchtpu.layers.adapter.fused_moe_ep.fused_moe_ep_supported",
+                return_value=False,
+            ),
+        ):
+            assert method_cls.supports_internal_mk.fget(owner) is (dp_size > 1)
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_nvfp4_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):

@@ -73,6 +73,25 @@ def test_get_experts_start_matches_determine_expert_map(ep_size, global_num_expe
         )
 
 
+@pytest.mark.parametrize(
+    "dp_size,pcp_size,is_sequence_parallel,expected",
+    [
+        (1, 1, False, False),
+        (8, 1, False, True),
+        (1, 1, True, True),
+        (8, 2, False, False),
+        (1, 2, False, False),
+    ],
+)
+def test_routes_before_dispatch_replaces_naive_dispatch_without_pcp(
+    dp_size, pcp_size, is_sequence_parallel, expected
+):
+    moe_config = SimpleNamespace(
+        dp_size=dp_size, pcp_size=pcp_size, is_sequence_parallel=is_sequence_parallel
+    )
+    assert moe_routing.routes_before_dispatch(moe_config) is expected
+
+
 def test_get_experts_start_returns_none_without_ep():
     assert moe_routing.get_experts_start(_make_layer(use_ep=False)) is None
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 
+import functools
 import os
 
 # envs.py imports nothing from this package, so it is safe to load here,
@@ -119,6 +120,15 @@ _TPU_VMEM_BYTES_PER_TENSOR_CORE = {
     "v7x": 67108864,
 }
 
+# All-gather SC-offload thresholds: the VMEM capacity, except on tpu7x, where
+# all-gathers from half of it up run asynchronously on SparseCore instead of
+# blocking the TensorCore (e.g. the MXFP4 MoE's 33 MiB prefill EP dispatch).
+_SC_ALL_GATHER_OFFLOAD_MIN_BYTES = {
+    **_TPU_VMEM_BYTES_PER_TENSOR_CORE,
+    "tpu7x": 33554432,
+    "v7x": 33554432,
+}
+
 
 def _fetch_tpu_type_from_metadata() -> str | None:
     # Inline the GCE metadata probe instead of delegating to
@@ -141,20 +151,27 @@ def _fetch_tpu_type_from_metadata() -> str | None:
     return None
 
 
-def _resolve_sc_offload_threshold_bytes() -> int | None:
+@functools.cache
+def _resolve_tpu_type() -> str | None:
+    tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
+    if not tpu_type:
+        tpu_type = _fetch_tpu_type_from_metadata()
+    return tpu_type.strip().lower() if tpu_type else None
+
+
+def _resolve_sc_offload_threshold_bytes(
+    bytes_per_family: dict[str, int],
+) -> int | None:
     # An explicit value wins, with 0 meaning no flag. None (the variable
-    # was unset or "auto") falls through to the chip-family table below.
+    # was unset or "auto") falls through to the chip-family table.
     override = envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES
     if override is not None:
         return override if override > 0 else None
 
-    tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
-    if not tpu_type:
-        tpu_type = _fetch_tpu_type_from_metadata()
+    tpu_type = _resolve_tpu_type()
     if not tpu_type:
         return None
-    tpu_type = tpu_type.strip().lower()
-    for prefix, size in _TPU_VMEM_BYTES_PER_TENSOR_CORE.items():
+    for prefix, size in bytes_per_family.items():
         if tpu_type.startswith(prefix):
             return size
     return None
@@ -199,19 +216,25 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
     _libtpu_extra_args.append("--xla_tpu_use_dynamic_smem_negotiation=true")
 
 # --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
-# raise the SC-offload threshold to the per-tensor-core VMEM capacity so
-# typical per-layer AR/AG collectives run on TensorCore instead of being
+# raise the SC-offload threshold (to the per-tensor-core VMEM capacity for
+# all-reduces, see _SC_ALL_GATHER_OFFLOAD_MIN_BYTES for all-gathers) so
+# typical per-layer collectives run on TensorCore and only large ones are
 # offloaded to SparseCore. The chip family is detected from
-# TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
+# TPU_ACCELERATOR_TYPE / GCE metadata and mapped to the constants above;
 # each flag is added only if the user hasn't supplied it explicitly.
-_sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
-if _sc_offload_bytes is not None:
-    for _flag_name in (
+for _flag_name, _bytes_per_family in (
+    (
         "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
+        _TPU_VMEM_BYTES_PER_TENSOR_CORE,
+    ),
+    (
         "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
-    ):
-        if not _user_has_flag(_flag_name):
-            _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
+        _SC_ALL_GATHER_OFFLOAD_MIN_BYTES,
+    ),
+):
+    _sc_offload_bytes = _resolve_sc_offload_threshold_bytes(_bytes_per_family)
+    if _sc_offload_bytes is not None and not _user_has_flag(_flag_name):
+        _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
 
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)

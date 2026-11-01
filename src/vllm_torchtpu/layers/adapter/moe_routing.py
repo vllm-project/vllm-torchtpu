@@ -186,6 +186,22 @@ def route(
     )
 
 
+def routes_before_dispatch(moe_config) -> bool:
+    """Whether the method routes its own tokens, then dispatches the routes.
+
+    True where vLLM would otherwise bracket the method with its naive EP
+    dispatch, which all-gathers the router logits (``[T, experts]`` f32) so
+    every rank routes the whole gathered batch. Routing is per token, so
+    routing the local tokens and gathering ``[T, topk]`` ids and weights
+    (``TpuDeviceCommunicator.dispatch``) hands the experts the same values;
+    a routing step that mixes rows would make this predicate wrong. Under
+    PCP vLLM also gathers over the PCP group, so that stays with vLLM.
+    """
+    return (
+        moe_config.dp_size > 1 or moe_config.is_sequence_parallel
+    ) and moe_config.pcp_size == 1
+
+
 def _apply_scoring_fn(scoring_fn: str, router_logits: torch.Tensor) -> torch.Tensor:
     scores = router_logits.float()
     if scoring_fn == "softmax":

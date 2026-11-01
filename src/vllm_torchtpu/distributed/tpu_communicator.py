@@ -51,6 +51,40 @@ def combine_splits() -> bool:
     )
 
 
+def _to_words(tensor: torch.Tensor) -> torch.Tensor:
+    """The tensor's bits as flat int32, one word per element below 4 bytes."""
+    flat = tensor.reshape(-1)
+    if flat.element_size() >= 4:
+        return flat.view(torch.int32)
+    narrow = {1: torch.int8, 2: torch.int16}[flat.element_size()]
+    return flat.view(narrow).to(torch.int32)
+
+
+def _from_words(words: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """Inverse of ``_to_words``: rows shaped like ``like``'s trailing dims."""
+    if like.element_size() >= 4:
+        flat = words.view(like.dtype)
+    else:
+        narrow = {1: torch.int8, 2: torch.int16}[like.element_size()]
+        flat = words.to(narrow).view(like.dtype)
+    return flat.view(-1, *like.shape[1:])
+
+
+def _all_gather_packed(group, *tensors: torch.Tensor) -> list[torch.Tensor]:
+    """All-gather row-aligned tensors as one flat int32 buffer.
+
+    Narrow ``[T, k]`` routing tensors would pad ``k`` to a full lane row on
+    TPU and take a collective each; flattened side by side they travel
+    lane-dense in one. Bit-exact: only the bits move.
+    """
+    words = [_to_words(t) for t in tensors]
+    gathered = group.all_gather(torch.cat(words), dim=0)
+    per_rank = gathered.view(group.world_size, -1).split(
+        [w.shape[0] for w in words], dim=1
+    )
+    return [_from_words(part.reshape(-1), t) for part, t in zip(per_rank, tensors)]
+
+
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
 
@@ -108,8 +142,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if group is None:
             return hidden_states, topk_weights, topk_ids
         hidden_states = group.all_gather(hidden_states, dim=0)
-        topk_weights = group.all_gather(topk_weights, dim=0)
-        topk_ids = group.all_gather(topk_ids, dim=0)
+        topk_weights, topk_ids = _all_gather_packed(group, topk_weights, topk_ids)
         return hidden_states, topk_weights, topk_ids
 
     def combine(

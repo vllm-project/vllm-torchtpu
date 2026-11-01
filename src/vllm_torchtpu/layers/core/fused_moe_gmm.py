@@ -28,10 +28,12 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    LHS_QUANT_BLOCK_SIZE,
     can_fuse_mlp,
     get_packing_factor,
     gmm_v2,
     gmm_v2_fused_mlp,
+    token_rows_fit_smem,
 )
 from vllm_torchtpu.kernels.megablox.moe_gather_unpermute import (
     can_use_gather_unpermute,
@@ -40,6 +42,13 @@ from vllm_torchtpu.kernels.megablox.moe_gather_unpermute import (
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
+)
+from vllm_torchtpu.kernels.megablox.quantized_rows import (
+    QUANTIZE_ROWS_ALIGN,
+    ROWS_PER_WORD,
+    SOURCE_DTYPE,
+    quantize_rows,
+    quantized_row_width,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
@@ -82,20 +91,115 @@ _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 # routing tables) against ~90 us of SparseCore v2 plus convert; decode at the
 # 1024-token bucket keeps v2. A decode step of 2048 tokens takes it too.
 TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
-# From this EP token count, the SparseCore dispatch gathers only the first
-# DISPATCH_HEAD_ROWS routed rows, and the expert MLP reads the rest straight
-# from the tokens' rows (gmm_v2_fused_mlp's token_rows) while it runs the
-# head. Below it the gather is short and the TensorCore has other work to
-# hide it behind.
+# From this EP token count, the expert MLP reads the routed rows straight
+# from the tokens' rows (gmm_v2_fused_mlp's token_rows), past the first
+# DISPATCH_HEAD_ROWS that the SparseCore gathers ahead. Below it the full
+# SparseCore gather is short and the TensorCore has other work to hide it
+# behind.
 DISPATCH_SPLIT_MIN_TOKENS = 4096
 # Whole 2048-row ragged_gather_v2 blocks, and whole 16-row sublane blocks as
-# gmm_v2_fused_mlp's head must be.
-DISPATCH_HEAD_ROWS = 4096
+# gmm_v2_fused_mlp's head must be, or 0 (the default): no SparseCore gather,
+# the MLP fetches every row. A head can only start once the dispatch
+# all-gather lands, so it sits between the two with nothing to hide it.
+DISPATCH_HEAD_ROWS = 0
+# The dtype an EP batch's rows may arrive quantized to, as int32 words
+# (quantize_dispatch_rows), as the fused MLP's gate/up leg quantizes them.
+DISPATCH_QUANT_DTYPE = jnp.float8_e4m3fn
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Above 2,048 routed rows, the inverse-permutation scatter costs more than
 # the two sorts it replaces when `ragged_permute` is off (e.g. non-EP prefill).
 _SINGLE_SORT_MAX_ROWS = 2048
+
+
+def quantize_dispatch_rows(hidden_states: jax.Array) -> jax.Array:
+    """This rank's rows, quantized as fused_moe_func's expert MLP would.
+
+    For an EP dispatch to move, in about half the bytes, when
+    dispatches_quantized_rows holds for the gathered batch; fused_moe_func
+    computes the same output from them as from the bf16 rows.
+    """
+    return quantize_rows(
+        hidden_states, block_size=LHS_QUANT_BLOCK_SIZE, q_dtype=DISPATCH_QUANT_DTYPE
+    )
+
+
+def quantizes_dispatch_rows(
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    *,
+    topk: int,
+    activation: str,
+    rhs_quant_dtype: jnp.dtype | None,
+) -> bool:
+    """Whether fused_moe_func reads these EP experts' input as
+    quantize_dispatch_rows words at every batch dispatches_quantized_rows
+    admits (with the SparseCore on): the shape checks of its head-gather
+    path that do not depend on the batch. Shapes only, and it asks the TPU,
+    so call it once, outside traced code.
+    """
+    if w1_scale is not None and w1_scale.ndim == 3:
+        w1_scale = jax.ShapeDtypeStruct(
+            (*w1_scale.shape[:2], 1, w1_scale.shape[2]), w1_scale.dtype
+        )
+    if w2_scale is not None and w2_scale.ndim == 3:
+        w2_scale = jax.ShapeDtypeStruct(
+            (*w2_scale.shape[:2], 1, w2_scale.shape[2]), w2_scale.dtype
+        )
+    hidden_size = w2.shape[-1]
+    padded_hidden_size = w1.shape[1] * get_packing_factor(w1.dtype, rhs_quant_dtype)
+    # The smallest batch admitted: the fused MLP's tiles are the same above it.
+    num_routes = DISPATCH_SPLIT_MIN_TOKENS * topk
+    try:
+        return (
+            padded_hidden_size == hidden_size
+            and _is_fp4_weight(w1) == _is_fp4_weight(w2)
+            and can_fuse_mlp(
+                jax.ShapeDtypeStruct(
+                    (num_routes, quantized_row_width(hidden_size)),
+                    DISPATCH_QUANT_DTYPE,
+                ),
+                w1,
+                w2,
+                jax.ShapeDtypeStruct((w1.shape[0],), jnp.int32),
+                w1_scale,
+                w1_bias,
+                w2_scale,
+                w2_bias,
+                token_rows=True,
+                quantized_lhs_dtype=DISPATCH_QUANT_DTYPE,
+                **_fused_mlp_kwargs(activation, SOURCE_DTYPE, w1, rhs_quant_dtype),
+            )
+        )
+    except ValueError:
+        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
+        return False
+
+
+def dispatches_quantized_rows(
+    num_local_tokens: int, world_size: int, topk: int, onehot_moe_permute_threshold: int
+) -> bool:
+    """Whether to EP-dispatch num_local_tokens rows per rank, over world_size
+    ranks, as quantize_dispatch_rows words, to experts for which
+    quantizes_dispatch_rows holds.
+
+    The rest of fused_moe_func's head-gather path, which depends on the
+    batch: it alone reads the words, and fused_moe_func refuses them
+    anywhere else. Integer arithmetic only: callers ask it of a traced
+    token count.
+    """
+    num_tokens = num_local_tokens * world_size
+    num_routes = num_tokens * topk
+    return (
+        num_local_tokens % QUANTIZE_ROWS_ALIGN == 0
+        and num_tokens >= DISPATCH_SPLIT_MIN_TOKENS
+        and num_routes > onehot_moe_permute_threshold
+        and token_rows_fit_smem(num_routes, QUANTIZE_ROWS_ALIGN, ROWS_PER_WORD)
+    )
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -339,7 +443,7 @@ def prepare_routed_gmm_inputs(
     code path. Without ``gather_rows`` the routed rows are left to the
     caller and None is returned for them.
     """
-    num_tokens_local = hidden_states_local.shape[0]
+    num_tokens_local = topk_indices_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
     token_indices_flat = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)
@@ -513,6 +617,7 @@ def moe_gmm(
     rhs_quant_dtype: jnp.dtype | None = None,
     combine_in_pieces: bool = False,
     token_rows: jax.Array | None = None,
+    lhs_quantized: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -524,13 +629,15 @@ def moe_gmm(
     returned piece-major, as the split combine reads them.
     With ``token_rows`` (the tokens' rows), x holds only the first routed
     rows and the fused MLP reads the rest from token_rows by
-    token_indices_sorted; the caller has checked that it can.
+    token_indices_sorted; the caller has checked that it can. With
+    ``lhs_quantized`` both are int32 words of quantize_dispatch_rows rows.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
+    dtype = SOURCE_DTYPE if lhs_quantized else x.dtype
 
     # One kernel for both legs keeps the gate/up output in VMEM instead of
     # writing it to HBM for the down leg to read back.
-    fused_kwargs = _fused_mlp_kwargs(activation, x.dtype, w1, rhs_quant_dtype)
+    fused_kwargs = _fused_mlp_kwargs(activation, dtype, w1, rhs_quant_dtype)
     if token_rows is not None:
         gmm2_res = gmm_v2_fused_mlp(
             x,
@@ -544,6 +651,7 @@ def moe_gmm(
             group_offset[0],
             token_rows=token_rows,
             token_row_ids=token_indices_sorted,
+            quantized_lhs_dtype=DISPATCH_QUANT_DTYPE if lhs_quantized else None,
             **fused_kwargs,
         )
     elif _is_fp4_weight(w1) == _is_fp4_weight(w2) and can_fuse_mlp(
@@ -584,7 +692,7 @@ def moe_gmm(
             group_sizes,
             group_offset,
             zero_initialize=False,
-            preferred_element_type=x.dtype,
+            preferred_element_type=dtype,
             rhs_quant_dtype=rhs_quant_dtype,
         )
 
@@ -656,7 +764,7 @@ def moe_gmm(
                     topk_weights_flat,
                     valid_mask_flat,
                     reduce_group_size=topk,
-                ).astype(x.dtype)
+                ).astype(dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
@@ -694,7 +802,7 @@ def moe_gmm(
                     topk_weights_sorted,
                     valid_count,
                     num_tokens=num_tokens,
-                ).astype(x.dtype)
+                ).astype(dtype)
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
@@ -709,7 +817,7 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
                 axis=1
             )
-            return (combine @ gmm2_res).astype(x.dtype)
+            return (combine @ gmm2_res).astype(dtype)
         if _runs_tc_combine(gmm2_res, topk_weights_flat, num_tokens, topk):
             # Same result as v2's SparseCore kernel (v2 falls back to XLA only
             # for inputs far smaller than this). The TensorCore would otherwise
@@ -722,21 +830,21 @@ def moe_gmm(
                 num_tokens=num_tokens,
                 topk=topk,
                 chunk_pieces=tc_pieces,
-            ).astype(x.dtype)
+            ).astype(dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,
-        ).astype(x.dtype)
+        ).astype(dtype)
 
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return token_topk_hidden.sum(axis=1).astype(x.dtype)
+    return token_topk_hidden.sum(axis=1).astype(dtype)
 
 
 @functools.partial(
@@ -793,6 +901,10 @@ def fused_moe_func(
 
     With ``combine_in_pieces`` the rows come back piece-major whenever the EP
     combine splits a batch of this size (see ``moe_gmm``).
+
+    hidden_states may also be the int32 words of ``quantize_dispatch_rows``
+    rows, for an EP batch for which ``dispatches_quantized_rows`` holds; the
+    output is then the bf16 one the unquantized rows give.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -803,6 +915,15 @@ def fused_moe_func(
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     num_tokens, hidden_size = hidden_states.shape
+    # Rows quantized ahead arrive as int32 words, ROWS_PER_WORD rows each.
+    lhs_quantized = hidden_states.dtype == jnp.int32
+    row_dtype = DISPATCH_QUANT_DTYPE if lhs_quantized else hidden_states.dtype
+    dtype = hidden_states.dtype
+    if lhs_quantized:
+        # The rows end in their block scales; w2 writes the hidden width.
+        num_tokens, hidden_size, dtype = topk_ids.shape[0], w2.shape[-1], SOURCE_DTYPE
+        if hidden_states.shape[0] * ROWS_PER_WORD != num_tokens:
+            raise ValueError(f"{hidden_states.shape} words for {num_tokens} tokens")
     if combine_in_pieces and not use_ep:
         raise ValueError("combine_in_pieces needs use_ep: only EP combines split")
 
@@ -819,7 +940,7 @@ def fused_moe_func(
     # Pin topk_weights to hidden_states.dtype so the EP mask, GMM
     # reduce, and `where` propagate in BF16 — some custom_routing_fn
     # callers return FP32 weights and would otherwise promote downstream.
-    topk_weights = topk_weights.astype(hidden_states.dtype)
+    topk_weights = topk_weights.astype(dtype)
 
     if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
         # The one-hot permute and unpermute are matmuls across all tokens, and
@@ -858,18 +979,19 @@ def fused_moe_func(
 
     num_routes = num_tokens * topk
     # Large batches (prefill chunks; the count is of tokens gathered across
-    # EP ranks): the SparseCore gathers only the head of the routed rows and
-    # the fused MLP starts on it as soon as it lands, fetching the rest itself.
+    # EP ranks): the fused MLP fetches the routed rows itself, past a head of
+    # DISPATCH_HEAD_ROWS the SparseCore gathers first if that is not 0.
     dispatch_head_only = (
         use_ep
         and use_sparse_core
         and num_tokens >= DISPATCH_SPLIT_MIN_TOKENS
         and num_routes > onehot_moe_permute_threshold
         and padded_hidden_size == hidden_size
-        and num_tokens % 2 == 0
+        # Whole 32-bit words of rows (two bf16 or four fp8 rows each).
+        and num_tokens % (4 // jnp.dtype(row_dtype).itemsize) == 0
         and _is_fp4_weight(w1) == _is_fp4_weight(w2)
         and can_fuse_mlp(
-            jax.ShapeDtypeStruct((num_routes, hidden_size), hidden_states.dtype),
+            jax.ShapeDtypeStruct((num_routes, hidden_states.shape[1]), row_dtype),
             w1,
             w2,
             jax.ShapeDtypeStruct((w1.shape[0],), jnp.int32),
@@ -878,9 +1000,15 @@ def fused_moe_func(
             w2_scale,
             w2_bias,
             token_rows=True,
-            **_fused_mlp_kwargs(activation, hidden_states.dtype, w1, rhs_quant_dtype),
+            quantized_lhs_dtype=DISPATCH_QUANT_DTYPE if lhs_quantized else None,
+            **_fused_mlp_kwargs(activation, dtype, w1, rhs_quant_dtype),
         )
     )
+    if lhs_quantized and not dispatch_head_only:
+        raise ValueError(
+            f"{num_tokens} quantized dispatch rows of {hidden_states.shape[1]} "
+            "columns reach no fused MLP that reads them"
+        )
     (
         x,
         group_sizes,
@@ -900,13 +1028,17 @@ def fused_moe_func(
         skip_padded_tokens=skip_padded_tokens,
         gather_rows=not dispatch_head_only,
     )
-    if dispatch_head_only:
+    if dispatch_head_only and DISPATCH_HEAD_ROWS == 0:
+        # No head rows: gmm_v2_fused_mlp then takes no lhs operand.
+        x = hidden_states[:0]
+    elif dispatch_head_only:
         valid_count = group_sizes.sum(dtype=jnp.int32)
         x = ragged_gather_v2(
             hidden_states,
             token_indices_sorted[:DISPATCH_HEAD_ROWS],
             jnp.array([0], dtype=jnp.int32),
             jnp.minimum(valid_count, DISPATCH_HEAD_ROWS)[None],
+            rows_per_word=ROWS_PER_WORD if lhs_quantized else 1,
         )
     else:
         x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
@@ -932,5 +1064,6 @@ def fused_moe_func(
         rhs_quant_dtype=rhs_quant_dtype,
         combine_in_pieces=combine_in_pieces,
         token_rows=hidden_states if dispatch_head_only else None,
+        lhs_quantized=lhs_quantized,
     )
     return x[:num_tokens, :hidden_size]
