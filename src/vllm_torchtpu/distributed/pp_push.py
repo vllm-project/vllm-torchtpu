@@ -258,6 +258,10 @@ def widen_message_rings(vllm_config: Any) -> None:
         _widen_rpc_ring(stages)
 
 
+# Calls the wave itself orders; every other blocking call settles first.
+_STEP_RPCS = frozenset({"execute_model", "sample_tokens", "pp_push", "pp_settle"})
+
+
 def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     """Install the push, the settle and the wider ring buffer on
     ``MultiprocExecutor``.
@@ -277,6 +281,7 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         return
     orig_execute = MultiprocExecutor.execute_model
     orig_sample = MultiprocExecutor.sample_tokens
+    orig_collective_rpc = MultiprocExecutor.collective_rpc
 
     def execute_model(self, scheduler_output, non_block=False):
         state = wave_state(self)
@@ -306,8 +311,20 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         # wait on the step's future sends.
         return None
 
+    def collective_rpc(self, method, *args, non_block=False, **kwargs):
+        # Any other call the engine waits on (profile, cache resets, ...)
+        # reaches every stage while forwards may still sit in a hand-off
+        # that only a later step would issue: the early stages answer, the
+        # later ones never reach it, and the engine waits forever (an xprof
+        # start on a PP8 prefill stalled its engine for an hour). Settle
+        # first, which carries every forward in flight to the last stage.
+        if not non_block and method not in _STEP_RPCS:
+            wave_state(self).settle(self)
+        return orig_collective_rpc(self, method, *args, non_block=non_block, **kwargs)
+
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
+    MultiprocExecutor.collective_rpc = collective_rpc
     MultiprocExecutor.take_draft_token_ids = take_draft_token_ids
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
