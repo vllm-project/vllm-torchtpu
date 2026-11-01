@@ -4445,6 +4445,18 @@ class CpPrefix(NamedTuple):
         return tuple(CpPrefix((pool, ), self.ids, self.local) for pool in self.pools)
 
 
+class DirectPrefix(NamedTuple):
+    """Rank-local expanded MLA prefix arena: ``keys`` ``[32, 24, 3, C, 256]``
+    and ``values`` ``[32, 24, 3, 128, C]`` (rank-sharded), indexed by MLA
+    ``layer`` ``0..23`` without cross-rank page gather or expansion."""
+
+    keys: Any
+    values: Any
+
+    def split(self):
+        return (self, self)
+
+
 GATHER_STREAMS = 6  # the three physical ring cycles, both directions
 GATHER_PARTS = 4  # chunks per page (32 of its 128 rows each)
 
@@ -5059,10 +5071,12 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
                                      collective_id=31, flash_tile=128):
     """One MLA layer over a packed window of ``segments`` sequences.
 
-    ``run(hidden, prefix, weights, segment_desc, length, arena)``:
+    ``run(hidden, prefix, weights, segment_desc, length, arena=None, *, layer=0)``:
     ``hidden`` is the gathered window ([T, 7168] on every rank), ``prefix``
-    the rank's residual rows, ``segment_desc`` the ``[5 * segments]``
-    descriptor (see ``_flash_kernel_packed``) and ``arena`` the layer's
+    the rank's residual rows, ``segment_desc`` the ``[5 * segments]`` (or
+    ``[3 * segments]`` when ``arena is None``) descriptor (see
+    ``_flash_kernel_packed``) and ``arena`` is ``None`` (no cached prefix), a
+    rank-local ``DirectPrefix`` indexed by ``layer``, or the layer's
     ``CpPrefix`` (at most ``prefix_capacity`` prefix tokens). Returns the
     new residual rows and the rank-leading ``[32, T, 576]`` compressed KV
     (identical on every rank). ``output_projection_repacked`` is [384,7168]
@@ -5078,9 +5092,7 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
     tables = ring_tables(list(mesh.devices.flat), token_ranks)
     local_tokens = seq_len // 32
 
-    def local_packed_cp(full_hidden, weights, segment_desc, length, pool, ids, local):
-        """One rank's view: this rank's 3 heads over every rank's prefix
-        pages and the window."""
+    def _project_window(full_hidden, weights, length):
         local_weights = jax.tree.map(lambda value: value[0], weights)
         projections = ProjectionWeights(
             *(local_weights[name] for name in _PROJECTION_NAMES)
@@ -5093,24 +5105,71 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         new_key = jnp.where(real, new_key.transpose(1, 0, 2), 0)
         new_value = jnp.where(real, new_value.transpose(1, 0, 2), 0)
         query = query.transpose(1, 0, 2)  # [3, T, 256]
+        return projections, query, new_key, new_value, output_gate, latent
+
+    def _gate_attended(attended, output_gate, latent, tokens):
+        attended = attended.transpose(1, 0, 2).reshape(tokens, 384)
+        gate = jax.nn.sigmoid(output_gate.astype(jnp.float32)).astype(jnp.bfloat16)
+        return (attended * gate).astype(jnp.bfloat16)[None], latent[None]
+
+    def local_packed_none(full_hidden, weights, segment_desc, length):
+        """One rank's view when every sequence in the window has zero cached prefix."""
+        _, query, new_key, new_value, output_gate, latent = _project_window(
+            full_hidden, weights, length
+        )
+        attended = mla_flash_prefill_packed(
+            query, new_key, new_value, length, segment_desc[:3 * segments], count=segments,
+            tile=flash_tile, arena=None)
+        return _gate_attended(attended, output_gate, latent, query.shape[0])
+
+    def local_packed_direct(full_hidden, weights, segment_desc, length, arena_k, arena_v, layer_idx):
+        """One rank's view reading a persistent rank-local expanded prefix arena."""
+        _, query, new_key, new_value, output_gate, latent = _project_window(
+            full_hidden, weights, length
+        )
+        attended = mla_flash_prefill_packed(
+            query, new_key, new_value, length, segment_desc[:5 * segments], count=segments,
+            tile=flash_tile, arena=(arena_k[0], arena_v[0]), layer=layer_idx)
+        return _gate_attended(attended, output_gate, latent, query.shape[0])
+
+    def local_packed_cp(full_hidden, weights, segment_desc, length, pool, ids, local):
+        """One rank's view: this rank's 3 heads over every rank's prefix
+        pages and the window."""
+        projections, query, new_key, new_value, output_gate, latent = _project_window(
+            full_hidden, weights, length
+        )
         pages, order = gathered_prefix_pages(pool, ids[0], local[0], tables, "k3_sp", count=segments,
                                              capacity=prefix_capacity)
         arena = expand_prefix_pages(pages, order, projections.key_value_up_projection)
         attended = mla_flash_prefill_packed(
             query, new_key, new_value, length, segment_desc[:5 * segments], count=segments,
             tile=flash_tile, arena=arena)
-        attended = attended.transpose(1, 0, 2).reshape(tokens, 384)
-        gate = jax.nn.sigmoid(output_gate.astype(jnp.float32)).astype(jnp.bfloat16)
-        return (attended * gate).astype(jnp.bfloat16)[None], latent[None]
+        return _gate_attended(attended, output_gate, latent, query.shape[0])
 
-    def run(hidden, prefix, weights, segment_desc, length, arena):
-        (pool, ) = arena.pools
-        gated, latent = jax.shard_map(
-            local_packed_cp, mesh=mesh,
-            in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
-            out_specs=(P("k3_sp"), P("k3_sp")),
-            check_vma=False,
-        )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local)
+    def run(hidden, prefix, weights, segment_desc, length, arena=None, *, layer=0):
+        if arena is None:
+            gated, latent = jax.shard_map(
+                local_packed_none, mesh=mesh,
+                in_specs=(P(), P("k3_sp"), P(), P()),
+                out_specs=(P("k3_sp"), P("k3_sp")),
+                check_vma=False,
+            )(hidden, weights, segment_desc, length)
+        elif isinstance(arena, DirectPrefix):
+            layer_arr = jnp.asarray(layer, jnp.int32).reshape((1,))
+            gated, latent = jax.shard_map(
+                local_packed_direct, mesh=mesh,
+                in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P()),
+                out_specs=(P("k3_sp"), P("k3_sp")),
+                check_vma=False,
+            )(hidden, weights, segment_desc, length, arena.keys, arena.values, layer_arr)
+        else:
+            (pool, ) = arena.pools
+            gated, latent = jax.shard_map(
+                local_packed_cp, mesh=mesh,
+                in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
+                out_specs=(P("k3_sp"), P("k3_sp")),
+                check_vma=False,
+            )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local)
         projected = project_reduce_scatter(
             gated, weights["output_projection_repacked"], mesh, tables,
             collective_id=collective_id,
@@ -5596,7 +5655,9 @@ def make_indexed_mla_layer_sp_ring(mesh, *, seq_len=8192, segments, prefix_capac
         }
 
     def run(hidden, prefix, families, segment_desc, length, slot, arena):
-        return base(hidden, prefix, select(families, slot), segment_desc, length, arena)
+        return base(
+            hidden, prefix, select(families, slot), segment_desc, length, arena, layer=slot
+        )
 
     return jax.jit(run)
 
@@ -6145,7 +6206,7 @@ def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
             moe_families, kda_state, mla_state, length, pair, segment_desc, arena, route=None):
         first = jnp.asarray([2 * pair[0] + 1], jnp.int32)
         second = first + 1
-        arenas = arena.split()
+        arenas = (None, None) if arena is None else arena.split()
         middle, blocks, kda_state, mla_state, _, *r1 = group4(
             prefix, blocks, common, kda_families, mla_families,
             moe_families, kda_state, mla_state, length, first,

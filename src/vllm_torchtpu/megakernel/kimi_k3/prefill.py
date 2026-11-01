@@ -405,9 +405,16 @@ class PrefillProgram:
     # end; each rank's share travels in the CP operands, see
     # prefill_megakernel.CpPrefix).
 
-    def _build(self, window: int) -> dict[str, Any]:
-        if window in self._ops:
-            return self._ops[window]
+    def has_mode(self, window: int, prefix_mode: str = "cp") -> bool:
+        key = window if prefix_mode == "cp" else (window, prefix_mode)
+        return key in self._ops
+
+    def _build(self, window: int, prefix_mode: str = "cp") -> dict[str, Any]:
+        if prefix_mode not in ("cp", "none", "direct"):
+            raise ValueError(f"K3 prefill: unknown prefix_mode {prefix_mode!r}")
+        key = window if prefix_mode == "cp" else (window, prefix_mode)
+        if key in self._ops:
+            return self._ops[key]
         if window not in self.windows:
             raise ValueError(f"K3 prefill: window {window} is not among {self.windows}")
         mesh, ops, kernels = self.mesh, {}, self._kernels
@@ -464,11 +471,18 @@ class PrefillProgram:
             )
 
         def prefix_specs(pools: int):
-            """Specs of an op's prefix operands: its MLA layers' pools, then
-            this rank's prefix ids and the local bases/counts."""
+            """Specs of an op's prefix operands."""
+            if prefix_mode == "none":
+                return ()
+            if prefix_mode == "direct":
+                return (sharded, sharded)
             return (sharded,) * (pools + 2)
 
         def split(args, pools: int):
+            if prefix_mode == "none":
+                return None, args
+            if prefix_mode == "direct":
+                return kernels.DirectPrefix(args[0], args[1]), args[2:]
             return (
                 kernels.CpPrefix(tuple(args[:pools]), args[pools], args[pools + 1]),
                 args[pools + 2 :],
@@ -507,7 +521,7 @@ class PrefillProgram:
         state_specs = (sharded,) * (7 + nroute)
         name = f"k3_prefill_packed{count}c"
         ops["first"] = register_global_op(
-            self._op_name(f"{name}_first", window),
+            self._op_name(f"{name}_first", window, prefix_mode),
             mesh,
             run_first,
             (sharded,)
@@ -517,7 +531,7 @@ class PrefillProgram:
             + (sharded,) * self._count("io", *weight_groups),
             state_specs + ((sharded,) if self.has_draft else ()),
             donate_argnums=(3, 4),
-            export_key=self._export_key(f"{name}_first", window),
+            export_key=self._export_key(f"{name}_first", window, prefix_mode),
         )
 
         def run_group(
@@ -555,7 +569,7 @@ class PrefillProgram:
             return (prefix, blocks, *kda_state, *mla_state, *routes)
 
         ops["group"] = register_global_op(
-            self._op_name(f"{name}_group8", window),
+            self._op_name(f"{name}_group8", window, prefix_mode),
             mesh,
             run_group,
             state_specs
@@ -564,7 +578,7 @@ class PrefillProgram:
             + (sharded,) * self._count(*weight_groups),
             state_specs + ((sharded,) * 2 if self.has_draft else ()),
             donate_argnums=tuple(range(7 + nroute)),
-            export_key=self._export_key(f"{name}_group", window),
+            export_key=self._export_key(f"{name}_group", window, prefix_mode),
         )
 
         def run_final(prefix, blocks, latents, *rest):
@@ -605,7 +619,7 @@ class PrefillProgram:
             return (logits, latents, *routes)
 
         ops["final"] = register_global_op(
-            self._op_name(f"{name}_final", window),
+            self._op_name(f"{name}_final", window, prefix_mode),
             mesh,
             run_final,
             (sharded,) * (3 + nroute)
@@ -616,23 +630,24 @@ class PrefillProgram:
             + (sharded,)
             + (sharded,) * nroute,
             donate_argnums=tuple(range(3 + nroute)),
-            export_key=self._export_key(f"{name}_final", window),
+            export_key=self._export_key(f"{name}_final", window, prefix_mode),
         )
         if not self._pairs:
             self._pairs = [
                 torch.tensor([pair], dtype=torch.int32).to("tpu")
                 for pair in range(GROUP_PAIRS)
             ]
-        self._ops[window] = ops
+        self._ops[key] = ops
         return ops
 
-    def _op_name(self, base: str, window: int) -> str:
+    def _op_name(self, base: str, window: int, prefix_mode: str = "cp") -> str:
         suffix = ("" if self.has_draft else "_nd") + (
             "" if self.compute_logits else "_nl"
         )
-        return f"pallas::{base}_w{window}_c{self.capacity}{suffix}"
+        mode_tag = "" if prefix_mode == "cp" else f"_{prefix_mode}"
+        return f"pallas::{base}_w{window}_c{self.capacity}{suffix}{mode_tag}"
 
-    def _export_key(self, op: str, window: int) -> str:
+    def _export_key(self, op: str, window: int, prefix_mode: str = "cp") -> str:
         """The static configuration a window op's trace bakes in (export cache)."""
         cfg = active()
         fused_moe = (
@@ -640,6 +655,7 @@ class PrefillProgram:
             and cfg.prefill_expert_parallel in (8, 16)
             and window in (512, 1024, 2048, 4096, 8192, 16384)
         )
+        extra = () if prefix_mode == "cp" else (prefix_mode,)
         return repr(
             (
                 "prefill",
@@ -651,6 +667,7 @@ class PrefillProgram:
                 window,
                 self.capacity,
                 sorted((g, tuple(n)) for g, n in self.names.items()),
+                *extra,
             )
         )
 
@@ -662,9 +679,12 @@ class PrefillProgram:
         recurrent: torch.Tensor,
         conv: torch.Tensor,
         pools: list[torch.Tensor],
-        ids: torch.Tensor,
-        local: torch.Tensor,
+        ids: torch.Tensor | None = None,
+        local: torch.Tensor | None = None,
         ring: Any = None,
+        *,
+        prefix_mode: str = "cp",
+        direct_arena: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """Prefill a packed window: ``shard`` [1, W/32] this rank's token
         ids (its SP stripes, :meth:`sp_order`), ``extent`` [1] the end of
@@ -679,16 +699,30 @@ class PrefillProgram:
         sequence and at its checkpoint).
         ``ring(blocks, prefix, middle)`` (the DSpark ring's update, if any)
         runs on the residual streams before the final op consumes them."""
-        ops = self._build(int(shard.shape[-1]) * 32)
-        tail = (ids, local)
+        ops = self._build(int(shard.shape[-1]) * 32, prefix_mode)
+        if prefix_mode == "none":
+            first_prefix: tuple[Any, ...] = ()
+            final_prefix: tuple[Any, ...] = ()
+            group_prefixes: list[tuple[Any, ...]] = [() for _ in self._pairs]
+        elif prefix_mode == "direct":
+            assert direct_arena is not None
+            first_prefix = final_prefix = direct_arena
+            group_prefixes = [direct_arena for _ in self._pairs]
+        else:
+            assert ids is not None and local is not None
+            first_prefix = (pools[0], ids, local)
+            final_prefix = (pools[MLA_LAYERS - 1], ids, local)
+            group_prefixes = [
+                (pools[2 * p + 1], pools[2 * p + 2], ids, local)
+                for p in range(len(self._pairs))
+            ]
         first_args = (
             shard,
             extent,
             segments,
             recurrent,
             conv,
-            pools[0],
-            *tail,
+            *first_prefix,
             *self._flat("io", "common", "kda", "mla", "moe"),
         )
         middle = tap3 = tap90 = None
@@ -700,9 +734,7 @@ class PrefillProgram:
                     extent,
                     pair,
                     segments,
-                    pools[2 * p + 1],
-                    pools[2 * p + 2],
-                    *tail,
+                    *group_prefixes[p],
                     *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
                 )
         else:
@@ -713,9 +745,7 @@ class PrefillProgram:
                     extent,
                     pair,
                     segments,
-                    pools[2 * p + 1],
-                    pools[2 * p + 2],
-                    *tail,
+                    *group_prefixes[p],
                     *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
                 )
         prefix, blocks, rec, hist, rec_at, hist_at, latents, *routes = state
@@ -734,8 +764,7 @@ class PrefillProgram:
             *routes,
             extent,
             segments,
-            pools[MLA_LAYERS - 1],
-            *tail,
+            *final_prefix,
             *self._flat(*final_groups, expert_bank=12),
         )
         if self.compute_logits:
@@ -1322,6 +1351,11 @@ class KimiPrefiller:
         self._zero_logits: torch.Tensor | None = None
         self._sampler: Any = None
         self._loaded = False
+        self._direct_capacity = 0
+        self._direct_arena: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._direct_req_id: str | None = None
+        self._direct_upto = 0
+        self._direct_ops: dict[int, Any] = {}
         # With the DSpark speculator: each request's draft ring, computed from
         # the windows' residual streams and written with its KDA state.
         self.ring = None
@@ -1401,6 +1435,105 @@ class KimiPrefiller:
                 f"K3 prefill: KDA layers {missing[:3]}... are in no KV cache group"
             )
         self._kda_groups = [(of[n], int(groups[of[n]].block_size)) for n in kda_names]
+        if (
+            active().prefill_direct_prefix
+            and self.slots == 1
+            and active().prefill_prefix_fp8
+            and self._direct_arena is None
+        ):
+            largest = self.program.windows[-1]
+            self._direct_capacity = max(
+                largest, -(-self.program.capacity // largest) * largest
+            )
+            self._direct_arena = (
+                torch.zeros(
+                    (1, MLA_LAYERS, 3, self._direct_capacity, 256),
+                    dtype=torch.float8_e4m3fn,
+                    device="tpu",
+                ),
+                torch.zeros(
+                    (1, MLA_LAYERS, 3, 128, self._direct_capacity),
+                    dtype=torch.float8_e4m3fn,
+                    device="tpu",
+                ),
+            )
+            self._direct_req_id, self._direct_upto = None, 0
+
+    def _append_direct_op(self, window: int) -> Any:
+        """Append one window's ``latents`` ``[1, 24, W, 576]`` into this rank's
+        persistent expanded prefix arena at ``start``."""
+        if window not in self._direct_ops:
+            assert self._writer is not None
+            pool_dtype = (
+                jnp.float8_e4m3fn
+                if self._writer.raw_pools[self._writer.mla_raw[0]].dtype
+                == torch.float8_e4m3fn
+                else jnp.bfloat16
+            )
+
+            def body(arena_k, arena_v, latents, m_kb, start):
+                pos = start[0]
+
+                def step(m, carry):
+                    ak, av = carry
+                    x = jax.lax.dynamic_index_in_dim(
+                        latents[0], m, axis=0, keepdims=False
+                    )
+                    x = x.astype(pool_dtype).astype(jnp.bfloat16)
+                    up = jax.lax.dynamic_index_in_dim(
+                        m_kb[0], m, axis=0, keepdims=False
+                    )
+                    rope = x[:, 512:576]
+                    expanded = jnp.dot(
+                        x[:, :512], up, preferred_element_type=jnp.float32
+                    ).astype(jnp.bfloat16)
+                    eh = expanded.reshape(window, 3, 256).transpose(1, 0, 2)
+                    k_new = jnp.concatenate(
+                        (
+                            eh[:, :, :128],
+                            jnp.broadcast_to(rope[None], (3, window, 64)),
+                            jnp.zeros((3, window, 64), jnp.bfloat16),
+                        ),
+                        axis=-1,
+                    ).astype(ak.dtype)
+                    v_new = jnp.swapaxes(eh[:, :, 128:], 1, 2).astype(av.dtype)
+                    ak = jax.lax.dynamic_update_slice(
+                        ak, k_new[None, None], (0, m, 0, pos, 0)
+                    )
+                    av = jax.lax.dynamic_update_slice(
+                        av, v_new[None, None], (0, m, 0, 0, pos)
+                    )
+                    return ak, av
+
+                return jax.lax.fori_loop(0, MLA_LAYERS, step, (arena_k, arena_v))
+
+            self._direct_ops[window] = register_op(
+                f"pallas::k3_prefill_append_direct_w{window}_c{self._direct_capacity}",
+                self.program.mesh,
+                body,
+                (P(AXIS),) * 4 + (P(),),
+                (P(AXIS), P(AXIS)),
+                donate_argnums=(0, 1),
+                export_key=repr(
+                    ("append_direct", window, self._direct_capacity, str(pool_dtype))
+                ),
+            )
+        return self._direct_ops[window]
+
+    def _append_direct(self, window: int, latents: torch.Tensor, start: int) -> None:
+        assert self._direct_arena is not None
+        arena_k, arena_v = self._direct_arena
+        new_k, new_v = self._append_direct_op(window)(
+            arena_k,
+            arena_v,
+            latents,
+            self.program.weights["mla"]["m_kb"],
+            _device_i32([start]),
+        )
+        if new_k is not arena_k:
+            arena_k.set_(new_k)
+        if new_v is not arena_v:
+            arena_v.set_(new_v)
 
     def _zeros(self) -> torch.Tensor:
         if self._zero_logits is None:
@@ -1426,6 +1559,8 @@ class KimiPrefiller:
                 self.draft_latents.copy_blocks(pairs, COPY_PAIRS)
         for req in step_input.finished:
             self._requests.pop(req, None)
+            if self._direct_req_id == req:
+                self._direct_req_id, self._direct_upto = None, 0
         largest = self.program.windows[-1]
         work, hits = [], []
         for i, row in enumerate(rows):
@@ -1446,6 +1581,8 @@ class KimiPrefiller:
             if state is None or cached != expected:
                 # New (or resumed after preemption): from a block-aligned hit, else
                 # from token 0.
+                if self._direct_req_id == req and cached != self._direct_upto:
+                    self._direct_req_id, self._direct_upto = None, 0
                 state = _Request(
                     req, cached, cached if cached % self.page_tokens == 0 else 0
                 )
@@ -1675,7 +1812,24 @@ class KimiPrefiller:
         live = live_slots(len(members), count)
         finals += [self._zero_blocks()] * (live - len(members))
         ats += [self._zero_blocks()] * (live - len(members))
-        ids, local_bases, write_table = self._cp_operands(rows, by_row, window, members)
+        if active().prefill_direct_prefix and all(p.start == 0 for p, _ in members):
+            prefix_mode = "none"
+        elif (
+            self._direct_arena is not None
+            and len(members) == 1
+            and members[0][0].start > 0
+            and self._direct_req_id == by_row[members[0][0].row][0].req_id
+            and self._direct_upto == members[0][0].start
+            and members[0][0].start <= self._direct_capacity
+        ):
+            prefix_mode = "direct"
+        else:
+            prefix_mode = "cp"
+        if prefix_mode != "cp" and not self.program.has_mode(window, prefix_mode):
+            prefix_mode = "cp"
+        ids, local_bases, write_table = self._cp_operands(
+            rows, by_row, window, members, need_prefix=(prefix_mode == "cp")
+        )
         order = self.program.sp_order(window)  # the ranks' rows, rank-major
         ring_hook, ring_out = None, {}
         if self.draft_latents is not None:
@@ -1735,8 +1889,31 @@ class KimiPrefiller:
                 ids,
                 local_bases,
                 ring_hook,
+                prefix_mode=prefix_mode,
+                direct_arena=self._direct_arena if prefix_mode == "direct" else None,
             )
         )
+        if self._direct_arena is not None and len(members) == 1:
+            piece0, offset0 = members[0]
+            state0, _ = by_row[piece0.row]
+            row0 = rows[piece0.row]
+            if (
+                piece0.end < row0.num_prompt_tokens
+                and offset0 == 0
+                and piece0.start + window <= self._direct_capacity
+                and (
+                    piece0.start == 0
+                    or (
+                        self._direct_req_id == state0.req_id
+                        and self._direct_upto == piece0.start
+                    )
+                )
+            ):
+                self._append_direct(window, latents, piece0.start)
+                self._direct_req_id = state0.req_id
+                self._direct_upto = piece0.end
+            elif self._direct_req_id == state0.req_id:
+                self._direct_req_id, self._direct_upto = None, 0
         self._count_routes()
         has_ckpt = any(p.stop is not None for p, _ in members)
         self._writer.write_packed(
@@ -1806,8 +1983,14 @@ class KimiPrefiller:
         np.save(os.path.join(directory, name), counts)
 
     def _cp_operands(
-        self, rows: Sequence[RequestInput], by_row, window: int, members
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        rows: Sequence[RequestInput],
+        by_row,
+        window: int,
+        members,
+        *,
+        need_prefix: bool = True,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         """This rank's context parallel operands for a packed window: its own
         prefix pages end to end (``[1, 1 + cp_capacity / page]``: count, then
         the block ids of global pages k with ``k % 32 == cp_rank``, at logical
@@ -1822,17 +2005,20 @@ class KimiPrefiller:
             state, _ = by_row[piece.row]
             row = rows[piece.row].block_tables[self._mla_group]
             first = piece.start // self.page_tokens
-            # Prefix pages: all whole.
-            owned = [int(row[k // cp]) for k in range(rank, first, cp)]
-            bases.append(cursor)
-            counts.append(len(owned) * self.page_tokens)
-            own += owned
-            cursor += len(owned) * self.page_tokens
+            if need_prefix:
+                # Prefix pages: all whole.
+                owned = [int(row[k // cp]) for k in range(rank, first, cp)]
+                bases.append(cursor)
+                counts.append(len(owned) * self.page_tokens)
+                own += owned
+                cursor += len(owned) * self.page_tokens
             # Cached pages: not rewritten.
             skip = max(state.first_cached - piece.start, 0) // self.page_tokens
             for p in range(skip, piece.rows // self.page_tokens):
                 if (first + p) % cp == rank:
                     table[offset // self.page_tokens + p] = int(row[(first + p) // cp])
+        if not need_prefix:
+            return None, None, _device_i32([table])
         unused = self.program.window_slots(window) - len(members)
         if cursor > self.cp_capacity:
             raise RuntimeError(
@@ -1938,6 +2124,95 @@ class KimiPrefiller:
                 ),
                 priority=window,
             )
+            if active().prefill_direct_prefix:
+                ops_none = program._build(window, "none")
+                add(
+                    ops_none["first"],
+                    (
+                        i32(1, rows),
+                        extent,
+                        segments,
+                        recurrent,
+                        conv,
+                        *program._flat("io", "common", "kda", "mla", "moe"),
+                    ),
+                    priority=window,
+                )
+                add(
+                    ops_none["group"],
+                    (
+                        *state,
+                        extent,
+                        i32(1),
+                        segments,
+                        *program._flat("common", "kda", "mla", "moe", expert_bank=1),
+                    ),
+                    priority=window,
+                )
+                add(
+                    ops_none["final"],
+                    (
+                        stream,
+                        blocks,
+                        latents,
+                        *routes,
+                        extent,
+                        segments,
+                        *program._flat(*final_groups, expert_bank=12),
+                    ),
+                    priority=window,
+                )
+                if self._direct_arena is not None:
+                    ak, av = self._direct_arena
+                    ops_direct = program._build(window, "direct")
+                    add(
+                        ops_direct["first"],
+                        (
+                            i32(1, rows),
+                            extent,
+                            segments,
+                            recurrent,
+                            conv,
+                            ak,
+                            av,
+                            *program._flat("io", "common", "kda", "mla", "moe"),
+                        ),
+                        priority=window,
+                    )
+                    add(
+                        ops_direct["group"],
+                        (
+                            *state,
+                            extent,
+                            i32(1),
+                            segments,
+                            ak,
+                            av,
+                            *program._flat(
+                                "common", "kda", "mla", "moe", expert_bank=1
+                            ),
+                        ),
+                        priority=window,
+                    )
+                    add(
+                        ops_direct["final"],
+                        (
+                            stream,
+                            blocks,
+                            latents,
+                            *routes,
+                            extent,
+                            segments,
+                            ak,
+                            av,
+                            *program._flat(*final_groups, expert_bank=12),
+                        ),
+                        priority=window,
+                    )
+                    add(
+                        self._append_direct_op(window),
+                        (ak, av, latents, program.weights["mla"]["m_kb"], i32(1)),
+                    )
             one = (recurrent[:, :, 0], conv[:, :, 0])
             add(
                 program._state_op("stack", count), (one[0],) * count + (one[1],) * count
@@ -2099,8 +2374,49 @@ class KimiPrefiller:
                     _rank_zeros_i32(1 + self.cp_capacity // self.page_tokens),
                     _rank_zeros_i32(2 * count),
                     ring_hook,
+                    prefix_mode="cp",
                 )
             )
+            if active().prefill_direct_prefix:
+                rec_none, conv_none = self.program.stack_states(
+                    [self.program.zero_state() for _ in range(count)]
+                )
+                logits_none, latents_none, *_ = self.program.run_packed(
+                    torch.zeros((1, window // 32), dtype=torch.int32).to("tpu"),
+                    _device_i32([1]),
+                    _device_i32(desc),
+                    rec_none,
+                    conv_none,
+                    writer.mla_pools(),
+                    None,
+                    None,
+                    ring_hook,
+                    prefix_mode="none",
+                )
+                if logits_none is not None:
+                    outputs.append(logits_none)
+                outputs.append(latents_none)
+                if self._direct_arena is not None:
+                    self._append_direct(window, latents_none, 0)
+                    rec_dir, conv_dir = self.program.stack_states(
+                        [self.program.zero_state() for _ in range(count)]
+                    )
+                    logits_dir, latents_dir, *_ = self.program.run_packed(
+                        torch.zeros((1, window // 32), dtype=torch.int32).to("tpu"),
+                        _device_i32([1]),
+                        _device_i32(desc),
+                        rec_dir,
+                        conv_dir,
+                        writer.mla_pools(),
+                        None,
+                        None,
+                        ring_hook,
+                        prefix_mode="direct",
+                        direct_arena=self._direct_arena,
+                    )
+                    if logits_dir is not None:
+                        outputs.append(logits_dir)
+                    outputs.append(latents_dir)
             if logits is not None:
                 outputs.append(logits)
             outputs.append(self.program.split_states(recurrent, conv)[0][0])
@@ -2150,6 +2466,10 @@ class KimiPrefiller:
                 outputs.append(self._sampler_op(sampled)(stacked, params)[0])
         for tensor in outputs:
             materialize(tensor)
+        if self._direct_arena is not None:
+            materialize(self._direct_arena[0])
+            materialize(self._direct_arena[1])
+            self._direct_req_id, self._direct_upto = None, 0
         materialize(writer.raw_pools[0])
         if self.rank == 0:
             logger.info(

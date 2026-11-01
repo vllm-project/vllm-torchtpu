@@ -72,6 +72,11 @@ class KernelConfig:
     prefill_prefix_fp8: bool = dataclasses.field(
         default_factory=lambda: envs.K3_PREFILL_PREFIX_FP8
     )
+    # Zero-prefix MLA fast path (start == 0 skips page gather/expansion) and
+    # persistent rank-local FP8 prefix arena for serial multi-window prefills.
+    prefill_direct_prefix: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_DIRECT_PREFIX
+    )
     # Prefill MoE route counts (diagnostic): each fused MoE call also returns its
     # chip's 56 local expert counts; the prefiller saves cumulative snapshots.
     prefill_route_counts: bool = dataclasses.field(

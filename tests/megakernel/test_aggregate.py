@@ -92,7 +92,7 @@ def test_aggregate_capabilities_and_role_configs():
     assert caps.page_aligned_chunks and caps.block_copies
     assert caps.max_step_tokens == 8256
     prefill = role_config(config, "prefill")
-    assert prefill.role == "prefill" and prefill.max_num_batched_tokens == 8192
+    assert prefill.role == "prefill" and prefill.max_num_batched_tokens == 8256
     assert prefill.num_speculative_tokens == 0
     k3.check(prefill)
     decode = role_config(config, "decode")
@@ -297,8 +297,9 @@ def test_aggregate_aligns_prefiller_pool_order_to_decoder_mesh_rank(
         seen["decoder_tp_rank"] = tp_rank
         return types.SimpleNamespace(rank=8)
 
-    def fake_prefiller(cfg, presharded, draft, *, tp_rank):
+    def fake_prefiller(cfg, presharded, draft, *, tp_rank, compute_logits=True):
         seen["prefiller_tp_rank"] = tp_rank
+        seen["compute_logits"] = compute_logits
         return types.SimpleNamespace(rank=8)
 
     monkeypatch.setattr(
@@ -308,7 +309,11 @@ def test_aggregate_aligns_prefiller_pool_order_to_decoder_mesh_rank(
     monkeypatch.setattr(prefill_mod, "KimiPrefiller", fake_prefiller)
     engine = KimiAggregate(_engine_config(), tmp_path, tp_rank=0)
     assert engine.rank == 8
-    assert seen == {"decoder_tp_rank": 0, "prefiller_tp_rank": 8}
+    assert seen == {
+        "decoder_tp_rank": 0,
+        "prefiller_tp_rank": 8,
+        "compute_logits": False,
+    }
 
 
 def test_aggregate_caches_prompt_tokens_only():
