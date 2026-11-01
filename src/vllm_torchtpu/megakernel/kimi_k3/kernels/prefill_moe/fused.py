@@ -43,9 +43,10 @@ def _sort_route_steps(keys, probabilities, *, size):
     window, rows = 4096, 32
     assert size >= window and size & (size - 1) == 0
     shape = (rows, 128)
-    row = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
-    lane = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
-    positions = row * 128 + lane
+    if size <= 131072:
+        row = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
+        lane = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+        positions = row * 128 + lane
 
     def view(ref, ordinal):
         return ref.at[pl.ds(ordinal * rows, rows), :]
@@ -71,8 +72,11 @@ def _sort_route_steps(keys, probabilities, *, size):
                 axis=1,
                 mode="promise_in_bounds",
             ).reshape(shape)
+        cur_lane = (
+            lane if size <= 131072 else jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+        )
         return jnp.take_along_axis(
-            value, lane ^ distance, axis=1, mode="promise_in_bounds"
+            value, cur_lane ^ distance, axis=1, mode="promise_in_bounds"
         )
 
     pending = []
@@ -103,7 +107,9 @@ def _sort_route_steps(keys, probabilities, *, size):
             def flush_batch(ordinal, *, steps=steps):
                 kr, pr = view(keys, ordinal), view(probabilities, ordinal)
                 x, p = kr[...], pr[...]
-                global_position = positions + ordinal * window
+                r_iota = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
+                l_iota = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+                global_position = r_iota * 128 + l_iota + ordinal * window
                 for distance, group in steps:
                     y, q = partner(x, distance), partner(p, distance)
                     descending = (global_position & group) != 0
@@ -677,40 +683,6 @@ def _prologue(
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
 
     def body(s):
-        own = s["pair"].at[pl.ds(parity * rows, rows), :]
-        if rows >= 256:
-            buffers = tuple(s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4))
-            router_v = s["router_gu"].at[:, :896]
-        else:
-            buffers, router_v = s["gu_buffers"], s["router"]
-        router_copy = pltpu.make_async_copy(router, router_v, s["gu_sems"][0])
-        bias_copy = pltpu.make_async_copy(bias, s["bias"], s["gu_sems"][1])
-        router_copy.start()
-        bias_copy.start()
-        copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
-        copy.start()
-        copy.wait()
-        _enter_mesh()
-        pl.semaphore_signal(
-            s["peer_credit"], 1, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL
-        )
-        pl.semaphore_wait(s["peer_credit"], 1)
-        peer_input = pltpu.make_async_remote_copy(
-            own,
-            own,
-            s["peer_send"],
-            s["peer_recv"],
-            device_id=peer,
-            device_id_type=pl.DeviceIdType.LOGICAL,
-        )
-        peer_input.start()
-        router_copy.wait()
-        bias_copy.wait()
-        gate_buffers, up_buffers = buffers[:2], buffers[2:]
-        gate_sems, up_sems = s["gu_sems"][:2], s["gu_sems"][2:]
-        hx = own[...]
-        logits = jnp.matmul(hx, router_v[...], preferred_element_type=jnp.float32)
-        top = _Top16(logits, s["bias"][...])
         route_steps, metadata_steps = iter(()), iter(())
         route_started = metadata_started = False
 
@@ -731,75 +703,11 @@ def _prologue(
                     local_experts=counts.shape[0],
                 )
 
-        def metadata_progress():
-            for _ in range(2 if rows <= 128 else (4 if rows == 512 else 6)):
+        def metadata_progress(count=None):
+            n = count if count is not None else (2 if rows <= 128 else 6)
+            for _ in range(n):
                 next(metadata_steps, None)
 
-        if rows >= 256:
-            latent_buffers = tuple(
-                s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4)
-            )
-            latent_products = _latent_half_pair_panels(
-                hx, latent_weight, latent_buffers, s["gu_sems"]
-            )
-        else:
-            latent_products = _dense_panels(
-                hx, latent_weight, gate_buffers, gate_sems, columns=4096
-            )
-        first_half = None
-        for col, product in latent_products:
-            if route_started:
-                stage = next(route_steps, None)
-                if rows <= 128 and stage is None:
-                    start_metadata()
-            if rows <= 128 and metadata_started:
-                metadata_progress()
-            if rows >= 256:
-                fragment = product.astype(jnp.bfloat16)
-                if col < 1792:
-                    first_half = fragment
-                else:
-                    # Assemble both halves before writing their packed words.
-                    assert first_half is not None
-                    paired = jnp.concatenate((first_half, fragment), axis=1)
-                    s["latent_payload"][:, :, pl.ds(col - 1792, 256)] = paired.reshape(
-                        rows, 2, 256
-                    )
-            else:
-                s["latent"][:, pl.ds(col, 256)] = product.astype(jnp.bfloat16)
-            for _ in range(min(2, 16 - top.index)):
-                top.step()
-            if top.index == 16 and not route_started:
-                ids, probs = top.finish(valid)
-                if rows < 128:
-                    wire = jnp.concatenate(
-                        (ids, jax.lax.bitcast_convert_type(probs, jnp.int32)), axis=1
-                    )
-                else:
-                    wire = jnp.concatenate(
-                        (
-                            ids.reshape(rows // 8, 128),
-                            jax.lax.bitcast_convert_type(probs, jnp.int32).reshape(
-                                rows // 8, 128
-                            ),
-                        ),
-                        axis=0,
-                    )
-                s["route_payload"][...] = wire.reshape(rows // 4, 128)
-                route_steps = _route_gather_steps(
-                    s["route_payload"],
-                    s["route_wire"],
-                    s["route_send"],
-                    s["route_recv"],
-                    rank=rank,
-                )
-                next(route_steps, None)
-                route_started = True
-        for _ in route_steps:
-            pass
-        start_metadata()
-        if rows <= 128:
-            s["latent_payload"][...] = s["latent"][:, :3584].reshape(rows, 2, 1792)
         if rows >= 256:
             latent_tick = 0
 
@@ -832,130 +740,272 @@ def _prologue(
                     )
                 latent_tick += 1
         else:
-            latent_steps = _latent_gather_steps(
-                tables,
-                s["latent_payload"],
-                s["latent_recv"],
-                latent_hbm,
-                s["latent_send_sems"],
-                s["latent_recv_sems"],
-                s["latent_credits"],
-                s["latent_stores"],
-                rank=rank,
-            )
+            latent_steps = None
 
             def latent_progress(*, drain=False):
+                assert latent_steps is not None
                 if drain:
                     for _ in latent_steps:
                         pass
                 else:
                     next(latent_steps, None)
-        peer_input.wait_send()
-        peer_input.wait_recv()
 
-        def gu_copy(panel, offset, buffers, sems):
-            bank = panel % 2
-            return pltpu.make_async_copy(
-                shared_gu.at[:, pl.ds(offset + panel * 256, 256)],
-                buffers[bank],
-                sems[bank],
-            )
-
-        gu_copy(0, 0, gate_buffers, gate_sems).start()
-        gu_copy(0, 3072, up_buffers, up_sems).start()
-        if rows >= 256:
-            latent_progress()
-        for panel in range(12):
-            if rows <= 128:
-                latent_progress()
-            bank = panel % 2
-            gu_copy(panel, 0, gate_buffers, gate_sems).wait()
-            gu_copy(panel, 3072, up_buffers, up_sems).wait()
-            if panel + 1 < 12:
-                gu_copy(panel + 1, 0, gate_buffers, gate_sems).start()
-                gu_copy(panel + 1, 3072, up_buffers, up_sems).start()
-            for row in (0, rows):
-                lhs = s["pair"][pl.ds(row, rows), :]
-                gate = jnp.matmul(
-                    lhs, gate_buffers[bank][...], preferred_element_type=jnp.float32
+        def run_gu(g):
+            nonlocal route_steps, route_started, latent_steps
+            own = g["pair"].at[pl.ds(parity * rows, rows), :]
+            if rows >= 256:
+                buffers = tuple(
+                    g["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4)
                 )
-                up = jnp.matmul(
-                    lhs, up_buffers[bank][...], preferred_element_type=jnp.float32
-                )
-                metadata_progress()
-                activated = (4.0 * jnp.tanh(gate / 4.0)) * (
-                    1.0 / (1.0 + jnp.exp(-gate))
-                )
-                activated *= 25.0 * jnp.tanh(up / 25.0)
-                s["middle"][pl.ds(row, rows), pl.ds(panel * 256, 256)] = (
-                    activated.astype(jnp.bfloat16)
-                )
-                if rows >= 256:
-                    latent_progress()
-
-        def down_copy(panel):
-            return pltpu.make_async_copy(
-                shared_down.at[:, pl.ds(panel * 256, 256)],
-                s["down_buffers"][panel % 2],
-                s["down_sems"][panel % 2],
-            )
-
-        def shared_hbm_copy(panel):
-            assert shared_hbm is not None
-            return pltpu.make_async_copy(
-                s["shared_out"][panel % 2],
-                shared_hbm.at[:, pl.ds(panel * 256, 256)],
-                s["shared_sems"][panel % 2],
-            )
-
-        def finish_reduction(pending):
-            transfer, bank, panel = pending
-            own = s["partial"][bank][pl.ds(parity * rows, rows), :]
-            transfer.wait_send()
-            transfer.wait_recv()
-            reduced_panel = (own + s["peer_y"][bank][...]).astype(jnp.bfloat16)
-            if shared_hbm is not None:
-                if panel >= 2:
-                    shared_hbm_copy(panel - 2).wait()
-                s["shared_out"][panel % 2][...] = reduced_panel
-                shared_hbm_copy(panel).start()
+                router_v = g["router_gu"].at[:, :896]
             else:
-                shared[:, pl.ds(panel * 256, 256)] = reduced_panel
-
-        down_copy(0).start()
-        pending = None
-        for panel in range(28):
-            bank = panel % 2
-            down_copy(panel).wait()
-            if panel + 1 < 28:
-                down_copy(panel + 1).start()
-            for row in (0, rows):
-                product = jnp.matmul(
-                    s["middle"][pl.ds(row, rows), :],
-                    s["down_buffers"][bank][...],
-                    preferred_element_type=jnp.float32,
+                buffers, router_v = g["gu_buffers"], g["router"]
+            router_copy = pltpu.make_async_copy(router, router_v, s["gu_sems"][0])
+            bias_copy = pltpu.make_async_copy(bias, g["bias"], s["gu_sems"][1])
+            router_copy.start()
+            bias_copy.start()
+            copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
+            copy.start()
+            copy.wait()
+            _enter_mesh()
+            pl.semaphore_signal(
+                s["peer_credit"],
+                1,
+                device_id=peer,
+                device_id_type=pl.DeviceIdType.LOGICAL,
+            )
+            pl.semaphore_wait(s["peer_credit"], 1)
+            peer_input = pltpu.make_async_remote_copy(
+                own,
+                own,
+                s["peer_send"],
+                s["peer_recv"],
+                device_id=peer,
+                device_id_type=pl.DeviceIdType.LOGICAL,
+            )
+            peer_input.start()
+            router_copy.wait()
+            bias_copy.wait()
+            gate_buffers, up_buffers = buffers[:2], buffers[2:]
+            gate_sems, up_sems = s["gu_sems"][:2], s["gu_sems"][2:]
+            hx = own[...]
+            logits = jnp.matmul(hx, router_v[...], preferred_element_type=jnp.float32)
+            top = _Top16(logits, g["bias"][...])
+            if rows >= 256:
+                latent_buffers = tuple(
+                    g["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4)
                 )
-                metadata_progress()
-                s["partial"][bank][pl.ds(row, rows), :] = product
-                if row == rows:
-                    if pending is not None:
-                        finish_reduction(pending)
-                    transfer = pltpu.make_async_remote_copy(
-                        s["partial"][bank].at[pl.ds((1 - parity) * rows, rows), :],
-                        s["peer_y"][bank],
-                        s["reduce_send"][bank],
-                        s["reduce_recv"][bank],
-                        device_id=peer,
-                        device_id_type=pl.DeviceIdType.LOGICAL,
+                latent_products = _latent_half_pair_panels(
+                    hx, latent_weight, latent_buffers, s["gu_sems"]
+                )
+            else:
+                latent_products = _dense_panels(
+                    hx, latent_weight, gate_buffers, gate_sems, columns=4096
+                )
+            first_half = None
+            for col, product in latent_products:
+                if route_started:
+                    stage = next(route_steps, None)
+                    if rows <= 128 and stage is None:
+                        start_metadata()
+                if rows <= 128 and metadata_started:
+                    metadata_progress()
+                if rows >= 256:
+                    fragment = product.astype(jnp.bfloat16)
+                    if col < 1792:
+                        first_half = fragment
+                    else:
+                        # Assemble both halves before writing their packed words.
+                        assert first_half is not None
+                        paired = jnp.concatenate((first_half, fragment), axis=1)
+                        s["latent_payload"][:, :, pl.ds(col - 1792, 256)] = (
+                            paired.reshape(rows, 2, 256)
+                        )
+                else:
+                    s["latent"][:, pl.ds(col, 256)] = product.astype(jnp.bfloat16)
+                for _ in range(min(2, 16 - top.index)):
+                    top.step()
+                if top.index == 16 and not route_started:
+                    ids, probs = top.finish(valid)
+                    if rows < 128:
+                        wire = jnp.concatenate(
+                            (ids, jax.lax.bitcast_convert_type(probs, jnp.int32)),
+                            axis=1,
+                        )
+                    else:
+                        wire = jnp.concatenate(
+                            (
+                                ids.reshape(rows // 8, 128),
+                                jax.lax.bitcast_convert_type(probs, jnp.int32).reshape(
+                                    rows // 8, 128
+                                ),
+                            ),
+                            axis=0,
+                        )
+                    g["route_payload"][...] = wire.reshape(rows // 4, 128)
+                    route_steps = _route_gather_steps(
+                        g["route_payload"],
+                        s["route_wire"],
+                        s["route_send"],
+                        s["route_recv"],
+                        rank=rank,
                     )
-                    transfer.start()
-                    pending = transfer, bank, panel
-                if rows >= 256 or row == rows:
+                    next(route_steps, None)
+                    route_started = True
+            for _ in route_steps:
+                pass
+            start_metadata()
+            if rows <= 128:
+                s["latent_payload"][...] = s["latent"][:, :3584].reshape(rows, 2, 1792)
+                latent_steps = _latent_gather_steps(
+                    tables,
+                    s["latent_payload"],
+                    s["latent_recv"],
+                    latent_hbm,
+                    s["latent_send_sems"],
+                    s["latent_recv_sems"],
+                    s["latent_credits"],
+                    s["latent_stores"],
+                    rank=rank,
+                )
+            peer_input.wait_send()
+            peer_input.wait_recv()
+
+            def gu_copy(panel, offset, bufs, sems):
+                bank = panel % 2
+                return pltpu.make_async_copy(
+                    shared_gu.at[:, pl.ds(offset + panel * 256, 256)],
+                    bufs[bank],
+                    sems[bank],
+                )
+
+            gu_copy(0, 0, gate_buffers, gate_sems).start()
+            gu_copy(0, 3072, up_buffers, up_sems).start()
+            if rows >= 256:
+                latent_progress()
+            for panel in range(12):
+                if rows <= 128:
                     latent_progress()
-        finish_reduction(pending)
-        if shared_hbm is not None:
-            for tail_panel in (26, 27):
-                shared_hbm_copy(tail_panel).wait()
+                bank = panel % 2
+                gu_copy(panel, 0, gate_buffers, gate_sems).wait()
+                gu_copy(panel, 3072, up_buffers, up_sems).wait()
+                if panel + 1 < 12:
+                    gu_copy(panel + 1, 0, gate_buffers, gate_sems).start()
+                    gu_copy(panel + 1, 3072, up_buffers, up_sems).start()
+                for row in (0, rows):
+                    lhs = g["pair"][pl.ds(row, rows), :]
+                    gate = jnp.matmul(
+                        lhs, gate_buffers[bank][...], preferred_element_type=jnp.float32
+                    )
+                    up = jnp.matmul(
+                        lhs, up_buffers[bank][...], preferred_element_type=jnp.float32
+                    )
+                    metadata_progress(6 if rows == 512 else None)
+                    activated = (4.0 * jnp.tanh(gate / 4.0)) * (
+                        1.0 / (1.0 + jnp.exp(-gate))
+                    )
+                    activated *= 25.0 * jnp.tanh(up / 25.0)
+                    s["middle"][pl.ds(row, rows), pl.ds(panel * 256, 256)] = (
+                        activated.astype(jnp.bfloat16)
+                    )
+                    if rows >= 256:
+                        latent_progress()
+
+        def run_down(d):
+            def down_copy(panel):
+                return pltpu.make_async_copy(
+                    shared_down.at[:, pl.ds(panel * 256, 256)],
+                    d["down_buffers"][panel % 2],
+                    s["down_sems"][panel % 2],
+                )
+
+            def shared_hbm_copy(panel):
+                assert shared_hbm is not None
+                return pltpu.make_async_copy(
+                    d["shared_out"][panel % 2],
+                    shared_hbm.at[:, pl.ds(panel * 256, 256)],
+                    s["shared_sems"][panel % 2],
+                )
+
+            def finish_reduction(pending):
+                transfer, bank, panel = pending
+                own_part = d["partial"][bank][pl.ds(parity * rows, rows), :]
+                transfer.wait_send()
+                transfer.wait_recv()
+                reduced_panel = (own_part + d["peer_y"][bank][...]).astype(jnp.bfloat16)
+                if shared_hbm is not None:
+                    if panel >= 2:
+                        shared_hbm_copy(panel - 2).wait()
+                    d["shared_out"][panel % 2][...] = reduced_panel
+                    shared_hbm_copy(panel).start()
+                else:
+                    shared[:, pl.ds(panel * 256, 256)] = reduced_panel
+
+            down_copy(0).start()
+            pending = None
+            for panel in range(28):
+                bank = panel % 2
+                down_copy(panel).wait()
+                if panel + 1 < 28:
+                    down_copy(panel + 1).start()
+                for row in (0, rows):
+                    product = jnp.matmul(
+                        s["middle"][pl.ds(row, rows), :],
+                        d["down_buffers"][bank][...],
+                        preferred_element_type=jnp.float32,
+                    )
+                    metadata_progress(4 if rows == 512 else None)
+                    d["partial"][bank][pl.ds(row, rows), :] = product
+                    if row == rows:
+                        if pending is not None:
+                            finish_reduction(pending)
+                        transfer = pltpu.make_async_remote_copy(
+                            d["partial"][bank].at[pl.ds((1 - parity) * rows, rows), :],
+                            d["peer_y"][bank],
+                            s["reduce_send"][bank],
+                            s["reduce_recv"][bank],
+                            device_id=peer,
+                            device_id_type=pl.DeviceIdType.LOGICAL,
+                        )
+                        transfer.start()
+                        pending = transfer, bank, panel
+                    if rows >= 256 or row == rows:
+                        latent_progress()
+            finish_reduction(pending)
+            if shared_hbm is not None:
+                for tail_panel in (26, 27):
+                    shared_hbm_copy(tail_panel).wait()
+
+        if rows == 512:
+            pl.run_scoped(
+                run_gu,
+                dict(
+                    pair=vmem((2 * rows, hidden_size), jnp.bfloat16),
+                    router=None,
+                    router_gu=vmem((hidden_size, 1024), jnp.bfloat16),
+                    gu_buffers=(),
+                    bias=vmem((1, 896), jnp.float32),
+                    route_payload=vmem((rows // 4, 128), jnp.int32),
+                ),
+            )
+            pl.run_scoped(
+                run_down,
+                dict(
+                    down_buffers=tuple(
+                        vmem((3072, 256), jnp.bfloat16) for _ in range(2)
+                    ),
+                    partial=tuple(vmem((2 * rows, 256), jnp.float32) for _ in range(2)),
+                    peer_y=tuple(vmem((rows, 256), jnp.float32) for _ in range(2)),
+                    shared_out=tuple(
+                        vmem((rows, 256), jnp.bfloat16) for _ in range(2)
+                    )
+                    if shared_hbm is not None
+                    else (),
+                ),
+            )
+        else:
+            run_gu(s)
+            run_down(s)
         if rows >= 256:
             for _ in metadata_steps:
                 latent_progress()
@@ -968,20 +1018,20 @@ def _prologue(
                 pass
 
     scratch = dict(
-        pair=vmem((2 * rows, hidden_size), jnp.bfloat16),
+        pair=vmem((2 * rows, hidden_size), jnp.bfloat16) if rows < 512 else None,
         router=vmem((hidden_size, 896), jnp.bfloat16) if rows <= 128 else None,
-        router_gu=vmem((hidden_size, 1024), jnp.bfloat16) if rows >= 256 else None,
+        router_gu=vmem((hidden_size, 1024), jnp.bfloat16) if rows == 256 else None,
         gu_buffers=tuple(vmem((hidden_size, 256), jnp.bfloat16) for _ in range(4))
         if rows <= 128
         else (),
         gu_sems=tuple(dma for _ in range(4)),
-        bias=vmem((1, 896), jnp.float32),
+        bias=vmem((1, 896), jnp.float32) if rows < 512 else None,
         input_sem=dma,
         peer_send=dma,
         peer_recv=dma,
         peer_credit=pltpu.SemaphoreType.REGULAR,
         latent=vmem((rows, 4096), jnp.bfloat16) if rows <= 128 else None,
-        route_payload=vmem((rows // 4, 128), jnp.int32),
+        route_payload=vmem((rows // 4, 128), jnp.int32) if rows < 512 else None,
         route_wire=vmem((rows * 8, 128), jnp.int32),
         route_send=dma((5,)),
         route_recv=dma((5,)),
@@ -995,14 +1045,20 @@ def _prologue(
         latent_credits=pltpu.SemaphoreType.REGULAR((12,)),
         latent_stores=dma((12,)) if rows <= 128 else dma,
         middle=vmem((2 * rows, 3072), jnp.bfloat16),
-        down_buffers=tuple(vmem((3072, 256), jnp.bfloat16) for _ in range(2)),
+        down_buffers=tuple(vmem((3072, 256), jnp.bfloat16) for _ in range(2))
+        if rows < 512
+        else (),
         down_sems=(dma, dma),
-        partial=tuple(vmem((2 * rows, 256), jnp.float32) for _ in range(2)),
-        peer_y=tuple(vmem((rows, 256), jnp.float32) for _ in range(2)),
+        partial=tuple(vmem((2 * rows, 256), jnp.float32) for _ in range(2))
+        if rows < 512
+        else (),
+        peer_y=tuple(vmem((rows, 256), jnp.float32) for _ in range(2))
+        if rows < 512
+        else (),
         reduce_send=(dma, dma),
         reduce_recv=(dma, dma),
         shared_out=tuple(vmem((rows, 256), jnp.bfloat16) for _ in range(2))
-        if shared_hbm is not None
+        if (shared_hbm is not None and rows < 512)
         else (),
         shared_sems=(dma, dma) if shared_hbm is not None else (),
     )
@@ -2231,7 +2287,7 @@ def _layer_kernel(
             if tokens < 8192:
                 probability_copy(s["probs_v"]).wait()
 
-        def fast():
+        def fast_with_reduced(reduced):
             _routed_experts(
                 latent,
                 expert_gu,
@@ -2245,13 +2301,13 @@ def _layer_kernel(
                 s["family"],
                 s["offset"],
                 middle,
-                s["reduced"],
+                reduced,
                 tokens=tokens,
                 probabilities_ready=probabilities_ready,
             )
             _epilogue(
                 control,
-                s["reduced"],
+                reduced,
                 s["shared"],
                 norm,
                 latent_up,
@@ -2259,6 +2315,12 @@ def _layer_kernel(
                 output,
                 shared_hbm=shared_hbm,
             )
+
+        def fast():
+            if tokens == 16384:
+                pl.run_scoped(fast_with_reduced, vmem((rows, 3584), jnp.bfloat16))
+            else:
+                fast_with_reduced(s["reduced"])
 
         if tokens < 8192:
             fast()
@@ -2272,7 +2334,7 @@ def _layer_kernel(
         body,
         dict(
             shared=vmem((rows, 7168), jnp.bfloat16) if tokens < 16384 else None,
-            reduced=vmem((rows, 3584), jnp.bfloat16),
+            reduced=vmem((rows, 3584), jnp.bfloat16) if tokens < 16384 else None,
             probs_v=vmem(shape, jnp.float32) if tokens < 8192 else None,
             counts_v=vmem((local_experts,), jnp.int32),
             counts=smem((local_experts,), jnp.int32),
