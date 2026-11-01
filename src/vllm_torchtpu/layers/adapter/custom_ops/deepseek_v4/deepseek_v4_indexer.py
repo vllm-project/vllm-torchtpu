@@ -37,9 +37,15 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     get_kv_cache_shape,
     streamindex_topk,
 )
+from vllm_torchtpu.kernels.quantized_matmul import fused_quantize_kernel
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
 )
+from vllm_torchtpu.layers.adapter.linear_common import (
+    WEIGHT_FLIPPED_ATTR,
+    _quantized_matmul_jax,
+)
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -92,6 +98,54 @@ def static_verify_q_len(vllm_config: VllmConfig | Any | None) -> int | None:
 BATCH_AXIS = None
 
 
+def _check_cache_layout(cache_kv: jax.Array) -> None:
+    if cache_kv.shape[1] != compressor_config.SAL_SUBLANE_GROUPS:
+        raise ValueError(
+            f"DeepSeek-V4 indexer cache {cache_kv.shape} does not match the "
+            "SEQ_ALONG_LANE layout "
+            f"(expected {compressor_config.SAL_SUBLANE_GROUPS} rows)."
+        )
+
+
+def _topk_from_quantized_q(
+    q_quant: jax.Array,
+    q_scales: jax.Array,
+    indexer_weights: jax.Array,
+    cache_kv: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    k: int,
+    compression_ratio: int,
+    softmax_scale: float,
+    n_head: int,
+    verify_q_len: int | None,
+) -> jax.Array:
+    # Fold the query quantization scales into the weights.
+    weights = indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
+
+    return streamindex_topk(
+        q=q_quant,
+        indexer_weights=weights,
+        cache_kv=cache_kv,
+        seq_lens=seq_lens,
+        page_indices=page_indices.flatten(),
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        k=k,
+        compression_ratio=compression_ratio,
+        # The following parameters are tuned based on microbenchmark results.
+        num_kv_pages_per_block=(32, 32, 16),
+        num_queries_per_block=(1, 128, 128),
+        decode_req_batch_size=4,
+        chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+        uniform_q_len=verify_q_len,
+    )
+
+
 # Module-level so `pallas.jax_op` can trace and register it as a torch op.
 def _indexer_jax(
     q: jax.Array,
@@ -114,64 +168,86 @@ def _indexer_jax(
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
         # the compiled signature because torch_tpu jits with keep_unused=True.
         return jnp.zeros((q.shape[0], k), dtype=jnp.int32)
-    if cache_kv.shape[1] != compressor_config.SAL_SUBLANE_GROUPS:
-        raise ValueError(
-            f"DeepSeek-V4 indexer cache {cache_kv.shape} does not match the "
-            "SEQ_ALONG_LANE layout "
-            f"(expected {compressor_config.SAL_SUBLANE_GROUPS} rows)."
-        )
-
-    def _indexer_local(
-        q,
-        positions,
-        cos_sin_cache,
+    _check_cache_layout(cache_kv)
+    # One kernel rotates the queries and quantizes each row on the way out.
+    # Note: vLLM's implementation rounds the scale factors up to the next
+    # power of 2, but the plain `abs_max / dtype_max` the kernel returns is
+    # sufficient here.
+    q_quant, q_scales = rope_quant(
+        q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
+    )
+    return _topk_from_quantized_q(
+        q_quant,
+        q_scales,
         indexer_weights,
         cache_kv,
         seq_lens,
         page_indices,
         cu_q_lens,
         distribution,
-    ):
-        # One kernel rotates the queries and quantizes each row on the way out.
-        # Note: vLLM's implementation rounds the scale factors up to the next
-        # power of 2, but the plain `abs_max / dtype_max` the kernel returns is
-        # sufficient here.
+        k=k,
+        compression_ratio=compression_ratio,
+        softmax_scale=softmax_scale,
+        n_head=n_head,
+        verify_q_len=verify_q_len,
+    )
+
+
+# `_indexer_jax` with the query projection folded in: `query` is the latent
+# `wq_b` takes, `w_q` and `w_s` its fp8 (k, n) weight and per-channel scale.
+def _indexer_from_latent_jax(
+    query: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    indexer_weights: jax.Array,
+    cache_kv: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    k: int,
+    compression_ratio: int,
+    softmax_scale: float,
+    n_head: int,
+    head_dim: int,
+    verify_q_len: int | None = None,
+) -> jax.Array:
+    if cache_kv.shape[0] == 0:
+        # Profiling-shape trace, as in `_indexer_jax`.
+        return jnp.zeros((query.shape[0], k), dtype=jnp.int32)
+    _check_cache_layout(cache_kv)
+    num_heads = w_q.shape[1] // head_dim  # this shard's heads
+    if fused_quantize_kernel.supports_rope_quant(query, w_q, w_s, num_heads):
+        # Projection, rope and quantize in one kernel: neither the activation's
+        # fp8 copy nor the bf16 heads reach HBM.
+        q_quant, q_scales = fused_quantize_kernel.fused_quantized_matmul_rope_quant(
+            query, w_q, w_s, positions, cos_sin_cache
+        )
+    else:
+        q = _quantized_matmul_jax(query, w_q, w_s)
         q_quant, q_scales = rope_quant(
-            q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
+            q.reshape(query.shape[0], num_heads, head_dim),
+            positions,
+            cos_sin_cache,
+            quant_dtype=jnp.float8_e4m3fn,
         )
-
-        # Fold the query quantization scales into the weights.
-        weights = indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
-
-        return streamindex_topk(
-            q=q_quant,
-            indexer_weights=weights,
-            cache_kv=cache_kv,
-            seq_lens=seq_lens,
-            page_indices=page_indices.flatten(),
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            k=k,
-            compression_ratio=compression_ratio,
-            # The following parameters are tuned based on microbenchmark results.
-            num_kv_pages_per_block=(32, 32, 16),
-            num_queries_per_block=(1, 128, 128),
-            decode_req_batch_size=4,
-            chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
-            kv_layout=KVLayout.SEQ_ALONG_LANE,
-            uniform_q_len=verify_q_len,
-        )
-
-    return _indexer_local(
-        q,
-        positions,
-        cos_sin_cache,
+    return _topk_from_quantized_q(
+        q_quant,
+        q_scales,
         indexer_weights,
         cache_kv,
         seq_lens,
         page_indices,
         cu_q_lens,
         distribution,
+        k=k,
+        compression_ratio=compression_ratio,
+        softmax_scale=softmax_scale,
+        n_head=n_head,
+        verify_q_len=verify_q_len,
     )
 
 
@@ -209,22 +285,26 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         finally:
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4IndexerCache = orig_cache
-        object.__setattr__(self, "indexer_op", self._build_indexer_op())
+        object.__setattr__(self, "indexer_op", self._build_indexer_op(False))
+        object.__setattr__(self, "indexer_from_latent_op", self._build_indexer_op(True))
         object.__setattr__(self.compressor, "k_cache", self.k_cache)
 
-    def _build_indexer_op(self):
+    def _build_indexer_op(self, from_latent: bool):
+        """The indexer op; `from_latent` takes `wq_b`'s input and weights
+        instead of its output."""
         mesh = get_pallas_op_mesh()
         # Speculative verify windows all hold K + 1 tokens; the runner puts
         # them in `[distribution[0], distribution[1])`.
         verify_q_len = static_verify_q_len(get_current_vllm_config())
 
         wrapped_fn = functools.partial(
-            _indexer_jax,
+            _indexer_from_latent_jax if from_latent else _indexer_jax,
             k=self.topk_tokens,
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
             verify_q_len=verify_q_len,
+            **({"head_dim": self.head_dim} if from_latent else {}),
         )
 
         _scale = (
@@ -236,6 +316,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
             f"{'' if verify_q_len is None else f'_vq{verify_q_len}'}"
+            f"{'_wq_b' if from_latent else ''}"
         )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
@@ -244,12 +325,20 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         attn_data_axis = None
         attn_head_axis = "model"
         batch_axis = BATCH_AXIS
+        if from_latent:
+            q_specs = (
+                P(attn_data_axis, None),  # query
+                P(None, attn_head_axis),  # wq_b weight, (k, n)
+                P(attn_head_axis),  # wq_b weight scale
+            )
+        else:
+            q_specs = (P(attn_data_axis, attn_head_axis, None),)  # q
         indexer_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
             mesh=mesh,
             input_partition_specs=(
-                P(attn_data_axis, attn_head_axis, None),  # q
+                *q_specs,
                 P(attn_data_axis),  # positions
                 P(),  # cos_sin_cache
                 P(attn_data_axis, attn_head_axis),  # indexer_weights
@@ -292,8 +381,10 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
     ) -> torch.Tensor:
         """`forward` once the indexer compressor has stored this step's
         compressed keys."""
-        q, _ = self.wq_b(query)
-        q = q.view(-1, self.n_head, self.head_dim)
+        wq_b_operands = self._wq_b_operands()
+        if wq_b_operands is None:
+            q, _ = self.wq_b(query)
+            q = q.view(-1, self.n_head, self.head_dim)
 
         # No KV cache is bound during the profiling forward; the values are
         # unused, so return correctly-shaped dummies. vLLM binds a numel==0
@@ -301,7 +392,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         kv_cache = getattr(self.k_cache, "kv_cache", None)
         if kv_cache is None or kv_cache.numel() == 0:
             return torch.zeros(
-                (q.shape[0], self.topk_tokens), dtype=torch.int32, device=q.device
+                (query.shape[0], self.topk_tokens),
+                dtype=torch.int32,
+                device=query.device,
             )
 
         # The TPU runner stores its own AttentionMetadata, not the vLLM base class.
@@ -325,8 +418,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         idx_q_start_loc = attn_metadata.query_start_loc
         idx_req_dist = attn_metadata.request_distribution
 
-        return self.indexer_op(
-            q,
+        op_args = (
             positions,
             rotary_emb.cos_sin_cache,
             indexer_weights,
@@ -336,3 +428,19 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             idx_q_start_loc,
             idx_req_dist,
         )
+        if wq_b_operands is None:
+            return self.indexer_op(q, *op_args)
+        return self.indexer_from_latent_op(query, *wq_b_operands, *op_args)
+
+    def _wq_b_operands(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """`wq_b`'s fp8 (k, n) weight and per-channel scale, when the indexer
+        op can run its matmul itself."""
+        wq_b = self.wq_b
+        if (
+            isinstance(wq_b.quant_method, VllmFp8LinearMethodTPU)
+            and getattr(wq_b, WEIGHT_FLIPPED_ATTR, False)
+            and wq_b.bias is None
+            and wq_b.weight_scale.ndim == 1
+        ):
+            return wq_b.weight, wq_b.weight_scale
+        return None

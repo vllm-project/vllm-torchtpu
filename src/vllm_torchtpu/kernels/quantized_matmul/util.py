@@ -22,6 +22,36 @@ from jax._src import dtypes
 
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import TunedValue
 
+# Tiles of `fused_quantize_kernel.fused_quantized_matmul`, which computes
+# `xla_quantized_matmul` with the activation quantize kept in VMEM: rows and
+# weight columns per grid step.
+FUSED_QUANTIZE_TOKEN_BLOCK = 512
+FUSED_QUANTIZE_OUT_BLOCK = 1024
+# The fused kernel takes an input-heavy shape while n / k is below this: there
+# the in-VMEM quantize saves work that grows with m * k.
+FUSED_QUANTIZE_MAX_OUT_PER_IN = 1.0
+# It takes an output-heavy shape from this n / k up, with the wide tiles below,
+# where XLA's dot runs further from the MXU's rate. Shapes in between stay on
+# XLA, whose output fusion can absorb the consumer (a residual add, a relayout).
+FUSED_QUANTIZE_MIN_WIDE_OUT_PER_IN = 16.0
+FUSED_QUANTIZE_WIDE_TOKEN_BLOCK = 1024
+FUSED_QUANTIZE_WIDE_OUT_BLOCK = 2048
+# `fused_quantize_kernel.fused_quantized_matmul_rope_quant`: tokens per grid
+# step (the largest of these halvings that divides the batch) and heads per
+# MXU dot.
+FUSED_ROPE_QUANT_TOKEN_BLOCK = 256
+FUSED_ROPE_QUANT_HEADS_PER_DOT = 8
+# `fused_quantize_kernel.fused_quantized_matmul_qnorm_rope`: weight columns per
+# grid step (whole heads; halved until the step fits VMEM, down to the minimum,
+# below which XLA keeps the shape), and rows per MXU dot of one head, whose norm
+# and rotation follow it.
+FUSED_QNORM_ROPE_OUT_BLOCK = 4096
+FUSED_QNORM_ROPE_MIN_OUT_BLOCK = 2048
+FUSED_QNORM_ROPE_ROWS = 256
+# Weight tiles it keeps in flight, and copies each tile is fetched as.
+FUSED_QNORM_ROPE_WEIGHT_SLOTS = 3
+FUSED_QNORM_ROPE_WEIGHT_COPIES = 2
+
 
 def unfold_args(
     conditions: tuple[jax.Array | bool, ...],

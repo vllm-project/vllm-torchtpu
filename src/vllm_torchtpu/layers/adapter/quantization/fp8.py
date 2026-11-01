@@ -87,6 +87,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     quantized_matmul,
+    rms_norm_quantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -1675,6 +1676,38 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if bias is not None:
             out = out + bias
         return out
+
+    def apply_rms_norm(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        rstd: torch.Tensor,
+        norm_weight: torch.Tensor,
+        *,
+        emit_normed: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """`apply` to vLLM's `rms_norm(x, norm_weight)`, normalizing in the matmul.
+
+        `rstd` is the norm's `rsqrt(mean(x**2) + eps)`. With `emit_normed`,
+        also returns the normalized `x` for the norm's other consumers.
+        """
+        layer = cast("TpuLinear", layer)
+        if (
+            not getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+            or getattr(layer, "bias", None) is not None
+        ):
+            raise ValueError(
+                f"{self.prefix}: the norm-fused matmul needs a bias-free "
+                "linear with its weight in the (k, n) layout."
+            )
+        return rms_norm_quantized_matmul(
+            x,
+            rstd,
+            norm_weight,
+            layer.weight,
+            layer.weight_scale,
+            emit_normed=emit_normed,
+        )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         layer = cast("TpuLinear", layer)

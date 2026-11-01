@@ -195,6 +195,10 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         finally:
             self.n_local_heads, self.n_local_groups = heads, groups
 
+    def _wq_b_operands(self) -> None:
+        # This core's wq_b holds half the heads; `_project_q` exchanges them.
+        return None
+
     def _project_q(self, qr: torch.Tensor) -> torch.Tensor:
         # Each core projects both cores' tokens onto its half of the heads, then
         # the cores swap so each holds all heads for its own tokens.

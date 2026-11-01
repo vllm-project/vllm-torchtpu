@@ -23,6 +23,7 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.quantized_matmul import fused_quantize_kernel
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
@@ -70,7 +71,8 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
     rather than the `(m, k) @ (n, k).T` the N-major layout forced. The
     blockwise path routes through `gmm_v2` (single group), which consumes a
     K-major rhs natively; the per-channel path uses the shared
-    `xla_quantized_matmul`, which takes the same (k, n) layout.
+    `xla_quantized_matmul`, which takes the same (k, n) layout, or the
+    kernel that computes it with the activation quantize kept in VMEM.
     """
     if x.shape[1] != w_q.shape[0]:
         raise ValueError(
@@ -104,7 +106,60 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
+    if fused_quantize_kernel.supports(x, w_q, w_s):
+        return fused_quantize_kernel.fused_quantized_matmul(x, w_q, w_s)
     return xla_quantized_matmul(x, w_q, w_s)
+
+
+def _rms_norm_quantized_matmul_jax(
+    x: jax.Array,
+    rstd: jax.Array,
+    norm_weight: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    *,
+    emit_normed: bool,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """`_quantized_matmul_jax` of vLLM's `rms_norm(x)`, given its rsqrt.
+
+    `rstd` is the norm's `rsqrt(mean(x**2) + eps)`, `[m, 1]`; the scaling and
+    weighting it is followed by happen here, inside the fused kernel when it
+    takes the shape. With `emit_normed` the normalized `x` is returned too.
+    """
+    if fused_quantize_kernel.supports_rms_norm(x, norm_weight, w_q, w_s):
+        return fused_quantize_kernel.fused_rms_norm_quantized_matmul(
+            x, rstd, norm_weight, w_q, w_s, emit_normed=emit_normed
+        )
+    x_normed = (x.astype(jnp.float32) * rstd).astype(norm_weight.dtype) * norm_weight
+    x_normed = x_normed.astype(x.dtype)
+    out = _quantized_matmul_jax(x_normed, w_q, w_s)
+    return (out, x_normed) if emit_normed else out
+
+
+# `pallas.jax_op` refuses a union return annotation, so each `emit_normed`
+# variant gets its own entry point.
+def _rms_norm_quantized_matmul_out_jax(
+    x: jax.Array,
+    rstd: jax.Array,
+    norm_weight: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+) -> jax.Array:
+    return _rms_norm_quantized_matmul_jax(
+        x, rstd, norm_weight, w_q, w_s, emit_normed=False
+    )
+
+
+def _rms_norm_quantized_matmul_normed_jax(
+    x: jax.Array,
+    rstd: jax.Array,
+    norm_weight: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    return _rms_norm_quantized_matmul_jax(
+        x, rstd, norm_weight, w_q, w_s, emit_normed=True
+    )
 
 
 _quantized_matmul_kernel_op: Callable | None = None
@@ -156,6 +211,54 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+def _build_rms_norm_quantized_matmul_op(emit_normed: bool) -> Callable:
+    name = "pallas::rms_norm_quantized_matmul" + ("_normed" if emit_normed else "")
+    op = pallas.jax_op(
+        name,
+        _rms_norm_quantized_matmul_normed_jax
+        if emit_normed
+        else _rms_norm_quantized_matmul_out_jax,
+    )
+
+    def _fake(x, rstd, norm_weight, w_q, w_s):
+        del rstd, norm_weight, w_s
+        out = torch.empty(x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device)
+        return (out, torch.empty_like(x)) if emit_normed else out
+
+    op.register_fake(_fake)
+    return op
+
+
+# Built at import: the forward that calls them runs under Dynamo, which cannot
+# trace a lazy cache's Lock.
+_rms_norm_quantized_matmul_ops: dict[bool, Callable] = {
+    emit_normed: _build_rms_norm_quantized_matmul_op(emit_normed)
+    for emit_normed in (False, True)
+}
+
+
+def rms_norm_quantized_matmul(
+    x: torch.Tensor,
+    rstd: torch.Tensor,
+    norm_weight: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    *,
+    emit_normed: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """`quantized_matmul` of vLLM's `rms_norm(x, norm_weight)`.
+
+    `x` is the norm's 2-D input and `rstd` its `rsqrt(mean(x**2) + eps)`,
+    `[m, 1]` float32. With `emit_normed`, also returns the normalized `x` for
+    the norm's other consumers.
+    """
+    if x.ndim != 2 or x.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Expected a 2-D input with hidden dim {w_q.shape[0]}, got {list(x.shape)}."
+        )
+    return _rms_norm_quantized_matmul_ops[emit_normed](x, rstd, norm_weight, w_q, w_s)
 
 
 def _quantized_matmul_fp4_jax(
