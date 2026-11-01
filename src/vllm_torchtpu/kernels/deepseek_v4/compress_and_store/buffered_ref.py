@@ -177,7 +177,7 @@ class OutputRef(_BufferedRef):
         # Only called in CSA_INDEXER mode (INPUT_OUTPUT)
         assert self.sem_recvs is not None
         assert self.window_ref is not None
-        cache_ref, kv_slot_mapping_ref, *_ = src_ref
+        cache_ref, kv_slot_mapping_ref, is_first_mask_ref, *_ = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         dest_ref = cast(jax.Ref, self.window_ref.at[slot])
@@ -193,9 +193,12 @@ class OutputRef(_BufferedRef):
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
+            is_first = is_first_mask_ref[idx_n]
             valid = kv_slot >= 0
 
-            @pl.when(valid)
+            # Only is_first_mask tokens write their merged row back, so only
+            # their rows need the cache contents.
+            @pl.when(valid & is_first)
             def _read_nope():
                 # we fetch the entire tile (4, 128), with 4 pages per tile
                 src = cache_ref.at[_floor_div(kv_slot, tokens_per_row)]
@@ -433,8 +436,8 @@ def create_allocs_and_specs(
             cache_rows_ref,
             kv_slot_mapping_ref,
             is_first_mask_ref,
-            copy_counts_refs[CopyCount.VALID],
-            copy_counts_refs[CopyCount.FIRST],
+            copy_counts_refs[CopyCount.FIRST],  # reads
+            copy_counts_refs[CopyCount.FIRST],  # writes
         )
     else:
         output_args = (
