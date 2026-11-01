@@ -61,8 +61,9 @@ def should_use_hbm_lookup(
 ) -> bool:
     """Whether an Engram layer should serve its rows from HBM.
 
-    Engram layers call this once and cache the answer. A mode that cannot
-    apply falls back to the host path with a warning naming the reason.
+    Engram layers call this once and cache the answer. An explicitly set mode
+    that cannot apply raises; the default falls back to the host path with a
+    warning naming the reason.
     """
     mode = envs.TPU_DEEPSEEK_V41_ENGRAM_HBM.lower()
     if mode == "off" or (mode == "first" and layer_hash_index != 0):
@@ -84,10 +85,11 @@ def should_use_hbm_lookup(
         reason = "there is no expert-parallel group"
     else:
         return True
-    # Expected for non-offload deployments under the default; worth flagging
-    # only when an operator asked for HBM explicitly.
-    log = logger.warning_once if _ENV in os.environ else logger.debug
-    log("[DSV41] %s=%s ignored: %s; using the host lookup", _ENV, mode, reason)
+    if _ENV in os.environ:
+        raise ValueError(f"{_ENV}={mode} cannot apply: {reason}; set it to 'off'")
+    logger.warning_once(
+        "[DSV41] %s defaults to %s but %s; using the host lookup", _ENV, mode, reason
+    )
     return False
 
 

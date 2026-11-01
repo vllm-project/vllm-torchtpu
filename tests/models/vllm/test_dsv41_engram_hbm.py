@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+import pytest
 import torch
 from jax.sharding import Mesh
 
@@ -147,6 +148,26 @@ def test_default_env_and_uses_hbm_lookup_gating(monkeypatch):
     monkeypatch.setattr(engram_hbm, "_tp_size", lambda: 1)
     monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: None)
     assert _check(0) is False
+
+
+def test_explicit_mode_that_cannot_apply_raises(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.distributed import ep_mesh
+
+    monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: object())
+    monkeypatch.setattr(engram_hbm, "_tp_size", lambda: 1)
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_ENGRAM_HBM", "first")
+    staged: object = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+    kwargs = dict(staged_raw=staged, dp_size=1, layer_hash_index=0)
+    monkeypatch.delenv("TPU_DEEPSEEK_V41_ENGRAM_HBM", raising=False)
+    assert engram_hbm.should_use_hbm_lookup(**kwargs) is False  # default: warn
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HBM", "first")
+    with pytest.raises(ValueError, match="head-sharded"):
+        engram_hbm.should_use_hbm_lookup(**kwargs)
+    # A layer the mode does not select never raises.
+    assert (
+        engram_hbm.should_use_hbm_lookup(**{**kwargs, "layer_hash_index": 1}) is False
+    )
 
 
 def test_upload_table_pads_with_invalid_scale():
