@@ -112,6 +112,7 @@ def store_to_acc_ref(ref, val, half, num_halves, tile_n):
 def kernel(
     # scalar prefetch
     slot_mapping,
+    run_ends,  # [num_tokens]: see `_plan_runs`
     positions,
     # input
     hidden_states,  # [num_tokens, hidden_size]
@@ -125,8 +126,7 @@ def kernel(
     partial_ref,  # (tile_n, tile_m) f32: the k-partial sum of one step
     ape_table_ref,  # (ape_table_rows, state_width) f32: row r is APE row r % ratio
     sem_ref,  # DMA semaphores [2]
-    copies_ref,  # [2, 2]: (runs, accumulator) of the copy on each semaphore
-    runs_ref,  # [2 * 2 * (tile_n + 1)]: see `run_stride`
+    copies_ref,  # [2, 2]: (token tile or -1, accumulator) of each semaphore's copy
     *,
     cfgs: Configs,
 ):
@@ -141,8 +141,8 @@ def kernel(
     acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
     # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
     cache = csa_cache_layout.as_u8_slabs(cache)
-    copies_ref[0, 0] = 0
-    copies_ref[1, 0] = 0
+    copies_ref[0, 0] = -1
+    copies_ref[1, 0] = -1
 
     ratio = cfgs.dims.compress_ratio
 
@@ -171,44 +171,39 @@ def kernel(
             return slot & (page_size - 1)
         return slot % page_size
 
-    # Per semaphore, the runs of the copy in flight: (first token, slot) of
-    # each, then a sentinel first token. A flat SMEM array keeps the
-    # per-token stores free of tiled address arithmetic.
-    run_stride = tile_n + 1
-
-    def _runs_base(sem_idx):
-        return sem_idx * 2 * run_stride
-
-    def _run_copy(sem_idx, buf_idx, r):
-        """The copy of run ``r``: consecutive tokens whose states are
-        consecutive rows of one cache page, written by one DMA."""
-        base = _runs_base(sem_idx)
-        first_token = runs_ref[base + r]
-        slot = runs_ref[base + run_stride + r]
-        rows = (runs_ref[base + r + 1] - first_token) * rows_per_token
+    def _run_copy(sem_idx, token_tile, buf_idx, first_token):
+        """The copy of the run of ``token_tile`` starting at ``first_token``
+        (consecutive tokens whose states are consecutive rows of one cache
+        page, written by one DMA), and the run's end."""
+        token = token_tile * tile_n + first_token
+        end = run_ends[token]
+        slot = slot_mapping[token]
+        rows = (end - first_token) * rows_per_token
         src = acc_ref_u8.at[buf_idx, pl.ds(first_token * rows_per_token, rows), :, :]
         dest = cache.at[slot // page_size, pl.ds(_row_in_page(slot), rows), :, :]
-        return slot >= 0, pltpu.make_async_copy(src, dest, sem_ref.at[sem_idx])
+        return end, slot >= 0, pltpu.make_async_copy(src, dest, sem_ref.at[sem_idx])
 
-    def _for_each_run(sem_idx, buf_idx, num_runs, fn):
+    def _for_each_run(sem_idx, token_tile, buf_idx, fn):
         """Applies ``fn`` to the copy of every run of valid slots."""
 
-        def body(r, carry):
-            valid, copy = _run_copy(sem_idx, buf_idx, r)
+        def body(first_token):
+            end, valid, copy = _run_copy(sem_idx, token_tile, buf_idx, first_token)
             pl.when(valid)(lambda: fn(copy))
-            return carry
+            return end
 
-        lax.fori_loop(0, num_runs, body, 0)
+        lax.while_loop(lambda first_token: first_token < tile_n, body, jnp.int32(0))
 
     def _wait_copy(sem_idx):
         """Waits for the copy in flight on ``sem_idx``, if any."""
-        _for_each_run(
-            sem_idx,
-            copies_ref[sem_idx, 1],
-            copies_ref[sem_idx, 0],
-            lambda copy: copy.wait(),
-        )
-        copies_ref[sem_idx, 0] = 0
+        token_tile = copies_ref[sem_idx, 0]
+
+        @pl.when(token_tile >= 0)
+        def _():
+            _for_each_run(
+                sem_idx, token_tile, copies_ref[sem_idx, 1], lambda copy: copy.wait()
+            )
+
+        copies_ref[sem_idx, 0] = -1
 
     def _copy_index(g_idx_val, n_idx_val):
         return g_idx_val * group_n + n_idx_val
@@ -217,44 +212,17 @@ def kernel(
         """Copies one finished token tile, all output halves, to the cache.
 
         Called on the step after the tile's last step, so the copy
-        overlaps the next tile's matmul. A token whose slot continues the
-        previous token's rows in the same page joins its run, so a prefill
-        tile needs one DMA per page it touches rather than one per token and
-        half; an invalid slot or a page change starts a new run. The two
-        semaphores alternate between tiles, and a tile's copy waits for the
-        copy two tiles back.
+        overlaps the next tile's matmul. A prefill tile needs one DMA per
+        page it touches rather than one per token and half (`_plan_runs`).
+        The two semaphores alternate between tiles, and a tile's copy waits
+        for the copy two tiles back.
         """
         sem_idx = _copy_index(g_idx_val, n_idx_val) % 2
         _wait_copy(sem_idx)
 
         token_tile = _copy_index(g_idx_val, n_idx_val)
-        slots = slot_mapping.at[pl.ds(token_tile * tile_n, tile_n)]
-        base = _runs_base(sem_idx)
-        # The first free entry. Each token is written there, and only a token
-        # that starts a run keeps it.
-        entry = base
-        prev_slot = jnp.int32(-1)
-        for i in range(tile_n):
-            slot = slots[i]
-            runs_ref[entry] = jnp.int32(i)
-            runs_ref[entry + run_stride] = slot
-            # A token joins the previous run if both slots are invalid, or if
-            # its rows follow the previous token's in the same page (the row
-            # test also fails for a valid slot after an invalid one).
-            joins = ((slot & prev_slot) < 0) | (
-                (slot == prev_slot + rows_per_token)
-                & (_row_in_page(slot) >= rows_per_token)
-            )
-            if i > 0:
-                entry = entry + jnp.logical_not(joins).astype(jnp.int32)
-            else:
-                entry = entry + 1
-            prev_slot = slot
-        num_runs = entry - base
-        runs_ref[base + num_runs] = jnp.int32(tile_n)
-
-        _for_each_run(sem_idx, n_idx_val, num_runs, lambda copy: copy.start())
-        copies_ref[sem_idx, 0] = num_runs
+        _for_each_run(sem_idx, token_tile, n_idx_val, lambda copy: copy.start())
+        copies_ref[sem_idx, 0] = token_tile
         copies_ref[sem_idx, 1] = n_idx_val
 
     def inner_kernel(
@@ -401,6 +369,40 @@ def kernel(
     _wait_copy(1)
 
 
+def _plan_runs(slot_mapping, tile_n, rows_per_token, page_size):
+    """The end of the DMA run starting at each token, tile-relative.
+
+    A token joins the previous token's run if both slots are invalid, or if
+    its rows follow the previous token's in the same page (the row test also
+    fails for a valid slot after an invalid one); a tile's first token
+    starts a run. A page holds at most ``page_size // rows_per_token``
+    tokens, so a valid run never spans more; an invalid run is cut there
+    too, which keeps the walk to one elementwise pass of bounded width.
+    Only the entries at run starts are read.
+    """
+    num_tokens = slot_mapping.shape[0]
+    max_run = min(tile_n, page_size // rows_per_token)
+    token = lax.broadcasted_iota(jnp.int32, (num_tokens,), 0)
+    padded = jnp.pad(slot_mapping, (1, max_run), constant_values=-1)
+
+    def joins(d):
+        """Whether token ``i + d`` joins token ``i + d - 1``'s run."""
+        slot = padded[1 + d : 1 + d + num_tokens]
+        prev = padded[d : d + num_tokens]
+        return (
+            ((slot & prev) < 0)
+            | ((slot == prev + rows_per_token) & (slot % page_size >= rows_per_token))
+        ) & ((token + d) % tile_n != 0)
+
+    # Recomputing `joins` per offset keeps the whole walk one fusion.
+    run_end = token % tile_n + 1
+    alive = jnp.ones((num_tokens,), jnp.bool_)
+    for d in range(1, max_run):
+        alive = alive & joins(d)
+        run_end = run_end + alive.astype(jnp.int32)
+    return run_end
+
+
 def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
     """Largest 128-aligned k tile that *divides* ``size_k``."""
     cap = max(align, (min(cap, size_k) // align) * align)
@@ -494,8 +496,8 @@ def proj_and_save_state(
         pltpu.VMEM((ape_table_rows, state_width), jnp.float32),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SMEM((2, 2), jnp.int32),
-        pltpu.SMEM((2 * 2 * (tile_n + 1),), jnp.int32),
     ]
+    run_ends = _plan_runs(slot_mapping, tile_n, state_dim // last_dim, token_page_size)
 
     out_shape = jax.ShapeDtypeStruct(cache.shape, cache.dtype)
 
@@ -503,7 +505,7 @@ def proj_and_save_state(
         functools.partial(kernel, cfgs=cfgs),
         out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=2,
             grid=(),
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # positions
@@ -515,11 +517,11 @@ def proj_and_save_state(
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=scratch_shapes,
         ),
-        input_output_aliases={5: 0},  # Alias output to cache (index 5)
+        input_output_aliases={6: 0},  # Alias output to cache (index 6)
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
             vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
         ),
         interpret=interpret,
         name="proj_and_save_state",
-    )(slot_mapping, positions, hidden_states, wkv_wgate, ape, cache)
+    )(slot_mapping, run_ends, positions, hidden_states, wkv_wgate, ape, cache)
