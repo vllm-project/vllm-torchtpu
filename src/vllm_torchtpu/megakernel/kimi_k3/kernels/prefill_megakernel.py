@@ -1288,6 +1288,7 @@ def _project_ring_kernel(
     reads = []
     rank = lax.axis_index("k3_sp")
     positions = [tables_ref[f, 0, rank] for f in range(3)]
+    local_first = tile * payload.shape[0]
     stripe = window_stripe(o_ref.shape[0])
 
     def ring_coords(pos, family):
@@ -1316,7 +1317,7 @@ def _project_ring_kernel(
                 )
             pl.semaphore_wait(ready, len(peers))
 
-    @pl.when(step == 0)
+    @pl.when((tile == 0) & (step == 0))
     def load_weight():
         pltpu.async_copy(w_ref, weights, weight_sem).wait()
 
@@ -1335,7 +1336,9 @@ def _project_ring_kernel(
         # The window rows of the owner's stripes (``sp_token_index``).
         read = [
             pltpu.make_async_copy(
-                x_ref.at[pl.ds(sp_token_index(owner, row, stripe), count), :],
+                x_ref.at[
+                    pl.ds(sp_token_index(owner, local_first + row, stripe), count), :
+                ],
                 inputs.at[stream, pl.ds(offset, count)],
                 local_sems.at[stream],
             )
@@ -1423,17 +1426,11 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
         raise ValueError("K3 projection/RS requires BF16 operands")
     tokens = x.shape[1]
     rows = tokens // 32
-    if rows == 512:
-        h0 = project_reduce_scatter(
-            x[:, :8192], w, mesh, tables, collective_id=collective_id
-        ).reshape(32, 256, 7168)
-        h1 = project_reduce_scatter(
-            x[:, 8192:], w, mesh, tables, collective_id=collective_id
-        ).reshape(32, 256, 7168)
-        return jnp.concatenate((h0, h1), axis=1).reshape(32 * 512, 7168)
-    if rows > 256:
-        raise ValueError("K3 projection/RS needs at most 256 rows per rank")
-    regions = _regions(rows, 7168)
+    if rows > 512 or (rows > 256 and rows % 256):
+        raise ValueError("K3 projection/RS needs at most 256 rows per tile (<= 512 rows)")
+    tile_rows = min(rows, 256)
+    num_tiles = rows // tile_rows
+    regions = _regions(tile_rows, 7168)
     streams = len(regions)
     chunk = max(size for _, size, _, _ in regions)
 
@@ -1447,9 +1444,9 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
             pltpu.SemaphoreType.DMA((2, streams)),
             pltpu.SemaphoreType.REGULAR((streams,)),
             pltpu.SemaphoreType.DMA,
-            pltpu.VMEM((rows, 7168), jnp.bfloat16),
-            pltpu.VMEM((rows, 7168), jnp.bfloat16),
-            pltpu.VMEM((2, rows, 7168), jnp.bfloat16),
+            pltpu.VMEM((tile_rows, 7168), jnp.bfloat16),
+            pltpu.VMEM((tile_rows, 7168), jnp.bfloat16),
+            pltpu.VMEM((2, tile_rows, 7168), jnp.bfloat16),
             pltpu.VMEM((384, 7168), jnp.bfloat16),
             pltpu.VMEM((streams, chunk, 384), jnp.bfloat16),
             pltpu.SemaphoreType.DMA,
@@ -1462,7 +1459,7 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
                 in_specs=(hbm, hbm),
                 out_specs=hbm,
                 scratch_shapes=scratch,
-                grid=(1, 32),
+                grid=(num_tiles, 32),
             ),
             compiler_params=pltpu.CompilerParams(
                 collective_id=collective_id, vmem_limit_bytes=40 * 1024**2
@@ -4727,6 +4724,102 @@ def expand_prefix_pages(pages, order, key_value_up):
         name="kimi_prefill_expand_prefix_pages",
     )(order.astype(jnp.int32), pages, key_value_up)
     return keys[None], values[None]
+
+
+def _append_direct_prefix_kernel(
+    start_pages_ref,
+    _ak_in,
+    _av_in,
+    latents_ref,
+    up_ref,
+    out_k_hbm,
+    out_v_hbm,
+    kbuf,
+    vbuf,
+    sems,
+    *,
+    pool_dtype,
+    heads,
+    tile,
+):
+    """Expand one ``(layer, tile)`` slice of compressed MLA latents in VMEM and
+    DMA directly into the persistent rank-local HBM prefix arena."""
+    m = pl.program_id(0)
+    t = pl.program_id(1)
+    pos = pl.multiple_of(start_pages_ref[0] * 512, 512) + t * tile
+    x = latents_ref[0, 0].astype(pool_dtype).astype(jnp.bfloat16)
+    rope = x[:, 512:576]
+    expanded = jnp.dot(
+        x[:, :512], up_ref[0, 0], preferred_element_type=jnp.float32
+    ).astype(jnp.bfloat16)
+    zeros = jnp.zeros((tile, 64), jnp.bfloat16)
+    for h in range(heads):
+        eh = expanded[:, h * 256 : (h + 1) * 256]
+        kbuf[h, :, :] = jnp.concatenate((eh[:, :128], rope, zeros), axis=-1).astype(
+            kbuf.dtype
+        )
+        vbuf[h, :, :] = eh[:, 128:].T.astype(vbuf.dtype)
+    rows = pl.ds(pos, tile)
+    wk = pltpu.make_async_copy(kbuf, out_k_hbm.at[0, m, :, rows, :], sems.at[0])
+    wv = pltpu.make_async_copy(vbuf, out_v_hbm.at[0, m, :, :, rows], sems.at[1])
+    wk.start()
+    wv.start()
+    wk.wait()
+    wv.wait()
+
+
+def append_direct_prefix(
+    arena_k,
+    arena_v,
+    latents,
+    m_kb,
+    start,
+    *,
+    pool_dtype=jnp.float8_e4m3fn,
+    interpret=False,
+):
+    """Append one window's ``latents`` ``[1, L, W, 576]`` in-place into rank-local
+    ``arena_k`` ``[1, L, H, C, 256]`` and ``arena_v`` ``[1, L, H, 128, C]`` starting
+    at page-aligned offset ``start`` ``[1]`` (multiples of 512 tokens)."""
+    layers, heads = arena_k.shape[1], arena_k.shape[2]
+    window = latents.shape[2]
+    if window < 512 or window % 512 != 0:
+        raise ValueError(f"append_direct_prefix requires a 512-aligned window, got {window}")
+    tile = min(window, 2048)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    start_pages = jnp.asarray(start, jnp.int32).reshape((1,)) // 512
+    return pl.pallas_call(
+        functools.partial(
+            _append_direct_prefix_kernel,
+            pool_dtype=pool_dtype,
+            heads=heads,
+            tile=tile,
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct(arena_k.shape, arena_k.dtype),
+            jax.ShapeDtypeStruct(arena_v.shape, arena_v.dtype),
+        ),
+        input_output_aliases={1: 0, 2: 1},
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(layers, window // tile),
+            in_specs=(
+                hbm,
+                hbm,
+                pl.BlockSpec((1, 1, tile, 576), lambda m, t, _s: (0, m, t, 0)),
+                pl.BlockSpec((1, 1, 512, heads * 256), lambda m, t, _s: (0, m, 0, 0)),
+            ),
+            out_specs=(hbm, hbm),
+            scratch_shapes=(
+                pltpu.VMEM((heads, tile, 256), arena_k.dtype),
+                pltpu.VMEM((heads, 128, tile), arena_v.dtype),
+                pltpu.SemaphoreType.DMA((2,)),
+            ),
+        ),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024**2),
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="kimi_prefill_append_direct_prefix",
+    )(start_pages, arena_k, arena_v, latents, m_kb)
 
 
 def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile=TILE, arena=None, layer=0):

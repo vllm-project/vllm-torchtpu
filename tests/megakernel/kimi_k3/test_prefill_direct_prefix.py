@@ -25,7 +25,10 @@ if "torch_tpu" not in sys.modules:
     ]
 
 from vllm_torchtpu.megakernel.kimi_k3 import config as k3_config
-from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_megakernel import DirectPrefix
+from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_megakernel import (
+    DirectPrefix,
+    append_direct_prefix,
+)
 from vllm_torchtpu.megakernel.kimi_k3.prefill import (
     KDA_LAYERS,
     MLA_LAYERS,
@@ -109,6 +112,82 @@ def test_append_direct_matches_reference_up_projection_bit_for_bit():
             )
             np.testing.assert_array_equal(
                 np.asarray(out_v[0, m, h, :, 128 : 128 + window].astype(jnp.float32)),
+                np.asarray(ref_v.astype(jnp.float32)),
+            )
+
+
+def test_pallas_append_direct_prefix_interpret_matches_reference():
+    rng = np.random.default_rng(7)
+    window = 512
+    capacity = 1536
+    pool_dtype = jnp.float8_e4m3fn
+    arena_dtype = jnp.float8_e4m3fn
+
+    latents = jnp.asarray(
+        rng.standard_normal((1, MLA_LAYERS, window, 576), dtype=np.float32) * 0.25,
+        dtype=jnp.bfloat16,
+    )
+    m_kb = jnp.asarray(
+        rng.standard_normal((1, MLA_LAYERS, 512, 768), dtype=np.float32) * 0.05,
+        dtype=jnp.bfloat16,
+    )
+    sentinel_k = jnp.asarray(
+        rng.standard_normal((1, MLA_LAYERS, 3, capacity, 256), dtype=np.float32) * 0.1,
+        dtype=arena_dtype,
+    )
+    sentinel_v = jnp.asarray(
+        rng.standard_normal((1, MLA_LAYERS, 3, 128, capacity), dtype=np.float32) * 0.1,
+        dtype=arena_dtype,
+    )
+    start = jnp.array([512], dtype=jnp.int32)
+
+    out_k, out_v = append_direct_prefix(
+        sentinel_k,
+        sentinel_v,
+        latents,
+        m_kb,
+        start,
+        pool_dtype=pool_dtype,
+        interpret=True,
+    )
+
+    # Sentinel regions before 512 and after 1024 must be completely untouched.
+    np.testing.assert_array_equal(
+        np.asarray(out_k[:, :, :, :512, :].astype(jnp.float32)),
+        np.asarray(sentinel_k[:, :, :, :512, :].astype(jnp.float32)),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(out_k[:, :, :, 1024:, :].astype(jnp.float32)),
+        np.asarray(sentinel_k[:, :, :, 1024:, :].astype(jnp.float32)),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(out_v[:, :, :, :, :512].astype(jnp.float32)),
+        np.asarray(sentinel_v[:, :, :, :, :512].astype(jnp.float32)),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(out_v[:, :, :, :, 1024:].astype(jnp.float32)),
+        np.asarray(sentinel_v[:, :, :, :, 1024:].astype(jnp.float32)),
+    )
+
+    for m in range(MLA_LAYERS):
+        x_all = latents[0, m].astype(pool_dtype).astype(jnp.bfloat16)
+        rope_all = x_all[:, 512:576]
+        expanded_all = jnp.dot(
+            x_all[:, :512], m_kb[0, m], preferred_element_type=jnp.float32
+        ).astype(jnp.bfloat16)
+        zeros_all = jnp.zeros((window, 64), jnp.bfloat16)
+        for h in range(3):
+            eh = expanded_all[:, h * 256 : (h + 1) * 256]
+            ref_k = jnp.concatenate((eh[:, :128], rope_all, zeros_all), axis=-1).astype(
+                arena_dtype
+            )
+            ref_v = eh[:, 128:].T.astype(arena_dtype)
+            np.testing.assert_array_equal(
+                np.asarray(out_k[0, m, h, 512:1024].astype(jnp.float32)),
+                np.asarray(ref_k.astype(jnp.float32)),
+            )
+            np.testing.assert_array_equal(
+                np.asarray(out_v[0, m, h, :, 512:1024].astype(jnp.float32)),
                 np.asarray(ref_v.astype(jnp.float32)),
             )
 

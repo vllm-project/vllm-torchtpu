@@ -1499,42 +1499,17 @@ class KimiPrefiller:
                 == torch.float8_e4m3fn
                 else jnp.bfloat16
             )
+            kernels = self.program._kernels
 
             def body(arena_k, arena_v, latents, m_kb, start):
-                pos = start[0]
-
-                def step(m, carry):
-                    ak, av = carry
-                    x = jax.lax.dynamic_index_in_dim(
-                        latents[0], m, axis=0, keepdims=False
-                    )
-                    x = x.astype(pool_dtype).astype(jnp.bfloat16)
-                    up = jax.lax.dynamic_index_in_dim(
-                        m_kb[0], m, axis=0, keepdims=False
-                    )
-                    rope = x[:, 512:576]
-                    expanded = jnp.dot(
-                        x[:, :512], up, preferred_element_type=jnp.float32
-                    ).astype(jnp.bfloat16)
-                    eh = expanded.reshape(window, 3, 256).transpose(1, 0, 2)
-                    k_new = jnp.concatenate(
-                        (
-                            eh[:, :, :128],
-                            jnp.broadcast_to(rope[None], (3, window, 64)),
-                            jnp.zeros((3, window, 64), jnp.bfloat16),
-                        ),
-                        axis=-1,
-                    ).astype(ak.dtype)
-                    v_new = jnp.swapaxes(eh[:, :, 128:], 1, 2).astype(av.dtype)
-                    ak = jax.lax.dynamic_update_slice(
-                        ak, k_new[None, None], (0, m, 0, pos, 0)
-                    )
-                    av = jax.lax.dynamic_update_slice(
-                        av, v_new[None, None], (0, m, 0, 0, pos)
-                    )
-                    return ak, av
-
-                return jax.lax.fori_loop(0, MLA_LAYERS, step, (arena_k, arena_v))
+                return kernels.append_direct_prefix(
+                    arena_k,
+                    arena_v,
+                    latents,
+                    m_kb,
+                    start,
+                    pool_dtype=pool_dtype,
+                )
 
             self._direct_ops[window] = register_op(
                 f"pallas::k3_prefill_append_direct_w{window}_c{self._direct_capacity}",
@@ -1544,7 +1519,12 @@ class KimiPrefiller:
                 (P(AXIS), P(AXIS)),
                 donate_argnums=(0, 1),
                 export_key=repr(
-                    ("append_direct", window, self._direct_capacity, str(pool_dtype))
+                    (
+                        "append_direct_pallas",
+                        window,
+                        self._direct_capacity,
+                        str(pool_dtype),
+                    )
                 ),
             )
         return self._direct_ops[window]
