@@ -769,7 +769,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         assert rope_cache is not None
         cache, indexer_cache = operands[-1], indexer_operands[-1]
         # The indexer's operands but the hidden states and positions it shares.
-        new_cache, new_rope_cache, new_indexer_cache = self._paired_op(
+        new_cache, new_rope_cache, new_indexer_cache = self.paired_op(
             indexer_compressor
         )(
             *operands,
@@ -781,14 +781,22 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         rope_cache.copy_(new_rope_cache)
         indexer_cache.copy_(new_indexer_cache)
 
-    def _paired_op(self, indexer_compressor: "VllmDeepseekCompressor"):
-        """The `forward_with_indexer` op, built on first use like
-        `compressor_op`. A CSA compressor always pairs with its own layer's
-        indexer, so the op is kept on this compressor."""
+    def paired_op(self, indexer_compressor: "VllmDeepseekCompressor"):
+        """The `forward_with_indexer` op, kept on this compressor since a CSA
+        compressor always pairs with its own layer's indexer. Constructing it
+        builds PartitionSpecs, which Dynamo cannot trace, so the runner
+        prebuilds it through `build_paired_op`."""
         op = self.__dict__.get("_paired_op_instance")
         if op is None:
-            op = self._build_paired_op(indexer_compressor)
-            object.__setattr__(self, "_paired_op_instance", op)
+            op = self.build_paired_op(indexer_compressor)
+        return op
+
+    def build_paired_op(self, indexer_compressor: "VllmDeepseekCompressor"):
+        """(Re)builds `paired_op`, which bakes in both state block sizes: the
+        runner calls it again once they are final, as it does for
+        `compressor_op`."""
+        op = self._build_paired_op(indexer_compressor)
+        object.__setattr__(self, "_paired_op_instance", op)
         return op
 
     def _build_paired_op(self, indexer_compressor: "VllmDeepseekCompressor"):
