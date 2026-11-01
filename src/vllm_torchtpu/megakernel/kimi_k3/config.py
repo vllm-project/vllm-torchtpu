@@ -93,6 +93,9 @@ class KernelConfig:
     # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
     # False: the unfused SparseCore gather/combine.
     prefill_fused_moe: bool = True
+    # The fused MoE at prefill_expert_parallel 8 (EP8/TP4), as the aggregate
+    # engine's prefill runs it; off: EP8 takes the unfused path.
+    prefill_fused_moe_ep8: bool = False
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.

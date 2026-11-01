@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused EP16/TP2 prefill MoE for 512- through 8192-token windows.
+"""Fused EP16/TP2 (or EP8/TP4) prefill MoE for 512- through 8192-token windows.
 
 Schedule:
   1. Router/latent/shared projections overlap the incremental Top16, route sort,
@@ -27,6 +27,34 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from .. import prefill_megakernel as k
+
+
+@dataclasses.dataclass(frozen=True)
+class _Experts:
+    """A rank's routed-expert layout: ``local`` experts of a group shared by
+    ``ranks`` ranks, each holding a ``middle``-wide slice of the intermediate."""
+
+    local: int
+    middle: int
+
+    @property
+    def groups(self) -> int:
+        return 896 // self.local
+
+    @property
+    def ranks(self) -> int:
+        return 32 // self.groups
+
+
+EP16 = _Experts(local=56, middle=1536)
+EP8 = _Experts(local=112, middle=768)
+
+
+def experts_for(expert_parallel: int) -> _Experts:
+    """The layout of ``prefill_expert_parallel`` 16 or 8."""
+    if expert_parallel not in (8, 16):
+        raise ValueError("Fused prefill MoE supports EP16/TP2 and EP8/TP4")
+    return EP16 if expert_parallel == 16 else EP8
 
 
 def _sort_route_steps(keys, probabilities, *, size):
@@ -162,6 +190,7 @@ def _metadata_steps(
     tokens,
     rank,
     counts_ready,
+    experts=EP16,
 ):
     """Build stable local routing metadata, yielding one prep/sort chunk at a time.
 
@@ -171,12 +200,13 @@ def _metadata_steps(
     """
     bits = (tokens * 16 - 1).bit_length()
     shape = (128, 16) if tokens < 4096 else (16, 128)
-    expert_index = jnp.arange(56, dtype=jnp.int32)
-    group_index = jnp.arange(16, dtype=jnp.int32)
+    local_experts, groups_count = experts.local, experts.groups
+    expert_index = jnp.arange(local_experts, dtype=jnp.int32)
+    group_index = jnp.arange(groups_count, dtype=jnp.int32)
     lanes = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
     rows = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
-    total_counts = jnp.zeros((56,), jnp.int32)
-    total_groups = jnp.zeros((16,), jnp.int32)
+    total_counts = jnp.zeros((local_experts,), jnp.int32)
+    total_groups = jnp.zeros((groups_count,), jnp.int32)
     for chunk in range(tokens // 128):
         if tokens < 4096:
             records = wire[pl.ds(chunk * 32, 32), :].reshape(128, 32)
@@ -193,9 +223,9 @@ def _metadata_steps(
                 wire[pl.ds(rank_base + tokens // 256 + chunk_base, 16), :],
                 jnp.float32,
             )
-        local = ids - (rank // 2 * 56)
-        valid = (probs != 0) & (local >= 0) & (local < 56)
-        local = jnp.where(valid, local, 56)
+        local = ids - (rank // experts.ranks * local_experts)
+        valid = (probs != 0) & (local >= 0) & (local < local_experts)
+        local = jnp.where(valid, local, local_experts)
         original_position = chunk * 2048 + rows * shape[1] + lanes
         packed = (local << bits) | original_position
         keys[pl.ds(chunk * 16, 16), :] = packed.reshape(16, 128)
@@ -204,15 +234,15 @@ def _metadata_steps(
         local_flat = local.reshape(16, 128)
         ids_flat = ids.reshape(16, 128)
         live_flat = probs.reshape(16, 128) != 0
-        tile_counts = jnp.zeros((56,), jnp.int32)
-        for expert in range(56):
+        tile_counts = jnp.zeros((local_experts,), jnp.int32)
+        for expert in range(local_experts):
             count = jnp.sum((local_flat == expert).astype(jnp.int32))
             tile_counts = jnp.where(expert_index == expert, count, tile_counts)
         total_counts += tile_counts
         if tokens == 8192:
-            tile_groups = jnp.zeros((16,), jnp.int32)
-            groups = ids_flat // 56
-            for group in range(16):
+            tile_groups = jnp.zeros((groups_count,), jnp.int32)
+            groups = ids_flat // local_experts
+            for group in range(groups_count):
                 count = jnp.sum((live_flat & (groups == group)).astype(jnp.int32))
                 tile_groups = jnp.where(group_index == group, count, tile_groups)
             total_groups += tile_groups
@@ -608,6 +638,7 @@ def _prologue(
     *,
     counts_ready,
     metadata_ready,
+    experts=EP16,
 ):
     """Router, latent projection and shared experts, with incremental collectives.
 
@@ -684,6 +715,7 @@ def _prologue(
                     tokens=rows * 32,
                     rank=rank,
                     counts_ready=counts_ready,
+                    experts=experts,
                 )
 
         def metadata_progress():
@@ -943,8 +975,10 @@ def _routed_experts(
     *,
     tokens,
     probabilities_ready,
+    experts=EP16,
 ):
     """Joint GU/SiTU/first-down pipeline followed by remaining columns."""
+    mid = experts.middle
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
@@ -953,7 +987,7 @@ def _routed_experts(
     metadata_row_capacity = 0 if tokens < 8192 else 32768
     ring_dtype = jnp.float32
     assert tokens in (512, 1024, 2048, 4096, 8192)
-    x = jax.ShapeDtypeStruct((tokens * 16, 1536), latent.dtype)
+    x = jax.ShapeDtypeStruct((tokens * 16, mid), latent.dtype)
     rows, width = (metadata_row_capacity or x.shape[0], rhs.shape[-1])
     assert rows <= x.shape[0]
     tm, tn, localrows = (tile, columns, tokens // 32)
@@ -1002,7 +1036,7 @@ def _routed_experts(
     )
     gu_cfg = dataclasses.replace(
         gu_cfg,
-        tiles=dataclasses.replace(gu_cfg.tiles, tile_m=tm, tile_n=1536, tile_k=3584),
+        tiles=dataclasses.replace(gu_cfg.tiles, tile_m=tm, tile_n=mid, tile_k=3584),
     )
     assert gu_cfg.dims.size_lhs_sublane == sub
     for config in (cfg, gu_cfg):
@@ -1044,7 +1078,7 @@ def _routed_experts(
             weight=gu.weight.at[layer[0]].bitcast(jnp.float4_e2m1fn),
             scale=gu.scale.at[layer[0]],
         )
-        gu = k.FusedWeightsRef(gate=gu, up=jax.tree.map(lambda r: r.at[..., 1536:], gu))
+        gu = k.FusedWeightsRef(gate=gu, up=jax.tree.map(lambda r: r.at[..., mid:], gu))
         # Six directed rings: [target, source, 32 local-contribution row bases].
         # One initialization per layer call, reused across all four columns.
         rank = lax.axis_index("k3_sp")
@@ -1117,7 +1151,7 @@ def _routed_experts(
             def tail(i):
                 update(i)
 
-        gu_panels = pl.cdiv(3072, pltpu.get_tpu_info().mxu_column_size)
+        gu_panels = pl.cdiv(2 * mid, pltpu.get_tpu_info().mxu_column_size)
         moved_rows = gu_panels * gu_unroll
 
         def gu_work(g, panel):
@@ -1215,7 +1249,7 @@ def _routed_experts(
 
         @functools.partial(
             pl.run_scoped,
-            gu_partial=pltpu.VMEM((sub, 1536), gu_cfg.out_dtype),
+            gu_partial=pltpu.VMEM((sub, mid), gu_cfg.out_dtype),
             acts=pltpu.VMEM((2, tm, 2, 1792), latent.dtype),
             act_sems=pltpu.SemaphoreType.DMA((2,)),
         )
@@ -1290,7 +1324,7 @@ def _routed_experts(
                 in_specs=(joint_gu_ws, joint_down_ws),
                 out_specs=gu_ys,
             )
-            refs = (gu, w, middle.reshape(-1, sub, 1536))
+            refs = (gu, w, middle.reshape(-1, sub, mid))
             scratches = (metadata, gu_partial, acts, act_sems)
             if tokens == 8192:
                 # The 8K schedule already fills VMEM; retain its compact buffers.
@@ -1367,7 +1401,7 @@ def _routed_experts(
                 grid=(width // tn - 1, ng, 1),
                 in_specs=(xs, shifted_ws),
                 out_specs=(),
-            )(middle.reshape(-1, sub, 1536), w, scratches=(metadata,))
+            )(middle.reshape(-1, sub, mid), w, scratches=(metadata,))
 
     def run(**scratch):
         kernel(
@@ -1964,6 +1998,7 @@ def _layer_kernel(
     fallback_shared=None,
     maximum=None,
     route_counts=None,
+    experts=EP16,
 ):
     """One launch owns all compute, metadata and communication on the fast path.
 
@@ -2025,10 +2060,11 @@ def _layer_kernel(
                 maximum,
                 counts_ready=counts_ready,
                 metadata_ready=metadata_ready,
+                experts=experts,
             )
             count_copy().wait()
             if route_counts is not None:
-                for e in range(56):
+                for e in range(experts.local):
                     route_counts[e] = s["counts"][e]
             if tokens == 8192:
                 maximum_copy().wait()
@@ -2082,6 +2118,7 @@ def _layer_kernel(
                 s["reduced"],
                 tokens=tokens,
                 probabilities_ready=probabilities_ready,
+                experts=experts,
             )
             _epilogue(
                 control, s["reduced"], s["shared"], norm, latent_up, prefix, output
@@ -2101,8 +2138,8 @@ def _layer_kernel(
             shared=vmem((rows, 7168), jnp.bfloat16),
             reduced=vmem((rows, 3584), jnp.float32),
             probs_v=vmem(shape, jnp.float32) if tokens < 8192 else None,
-            counts_v=vmem((56,), jnp.int32),
-            counts=smem((56,), jnp.int32),
+            counts_v=vmem((experts.local,), jnp.int32),
+            counts=smem((experts.local,), jnp.int32),
             maximum=smem((1,), jnp.int32) if tokens == 8192 else None,
             ids=smem((capacity // 128, 128), jnp.int32),
             probs=smem((capacity // 128, 128), jnp.float32),
@@ -2118,7 +2155,8 @@ def _layer_kernel(
 
 
 def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
-    """Build the fused EP16/TP2 prefill MoE for a supported serving window.
+    """Build the fused EP16/TP2 (EP8/TP4: ``prefill_expert_parallel`` 8)
+    prefill MoE for a supported serving window.
 
     Inputs follow the prefill layer interface: rank-sharded normalized hidden
     states, residual prefix, resident weight families, valid length and family
@@ -2137,6 +2175,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
     from .layer import routed_experts_prepared
 
+    experts = experts_for(k._config().prefill_expert_parallel)
     rows = seq_len // 32
     tables = k.ring_tables(list(mesh.devices.flat), tuple(range(32)))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -2145,7 +2184,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     workspace_shapes = [
         ((rows, 7168), bf16),
         ((seq_len, 2, 1792), bf16),
-        ((seq_len * 16, 1536), bf16),
+        ((seq_len * 16, experts.middle), bf16),
     ]
     output_specs = [hbm] * 3
     if seq_len == 8192:
@@ -2154,19 +2193,23 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         workspace_shapes += [
             (shape, jnp.int32),
             (shape, jnp.float32),
-            ((56,), jnp.int32),
+            ((experts.local,), jnp.int32),
             ((rows, 7168), bf16),
             ((1,), jnp.int32),
         ]
         output_specs += [hbm] * 4 + [pl.BlockSpec()]
     counting = k._config().prefill_route_counts
-    body = _layer_kernel
+    body = (
+        _layer_kernel
+        if experts == EP16
+        else functools.partial(_layer_kernel, experts=experts)
+    )
     if counting:
-        workspace_shapes += [((56,), jnp.int32)]
+        workspace_shapes += [((experts.local,), jnp.int32)]
         output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
 
         def body(*refs):
-            return _layer_kernel(*refs[:-1], route_counts=refs[-1])
+            return _layer_kernel(*refs[:-1], route_counts=refs[-1], experts=experts)
     kernel = pl.pallas_call(
         body,
         out_shape=tuple(jax.ShapeDtypeStruct(s, d) for s, d in workspace_shapes),

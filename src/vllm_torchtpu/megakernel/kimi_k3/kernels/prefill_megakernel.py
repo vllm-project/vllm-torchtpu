@@ -5446,6 +5446,16 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     cfg = active()
     if (
         cfg.prefill_fused_moe
+        and cfg.prefill_expert_parallel == 8
+        and cfg.prefill_fused_moe_ep8
+        and cfg.moe_reduce_dtype == "float32"
+        and seq_len in (512, 1024, 2048, 4096, 8192)
+    ):
+        from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
+
+        return make_packed_moe(mesh, seq_len=seq_len)
+    if (
+        cfg.prefill_fused_moe
         and cfg.prefill_expert_parallel == 16
         and (
             seq_len in (4096, 8192)
