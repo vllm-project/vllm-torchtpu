@@ -71,13 +71,32 @@ def _publish_swa_banked(
     return write_swa_pages((raw, high), records, values)
 
 
+# Flat (order, destinations, row masks, masks) per bank. Torch schemas need
+# a fixed number of results, so each bank count has its own bridge.
 def _plan_swa(
     records: jax.Array, page_size: int, low_pages: int, high_pages: int
-) -> tuple[jax.Array, ...]:
-    # Flat (order, destinations, row masks, masks) per bank for the bridge.
-    bank_pages = (low_pages, high_pages) if high_pages else (low_pages,)
-    plan = plan_swa_pages(records, page_size=page_size, bank_pages=bank_pages)
-    return tuple(array for bank in plan for array in bank)
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    del high_pages
+    (plan,) = plan_swa_pages(records, page_size=page_size, bank_pages=(low_pages,))
+    return plan
+
+
+def _plan_swa_banked(
+    records: jax.Array, page_size: int, low_pages: int, high_pages: int
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+]:
+    low, high = plan_swa_pages(
+        records, page_size=page_size, bank_pages=(low_pages, high_pages)
+    )
+    return (*low, *high)
 
 
 def _fake_plan_swa(records, page_size, low_pages, high_pages):
@@ -95,18 +114,37 @@ def _fake_plan_swa(records, page_size, low_pages, high_pages):
     )
 
 
-def _publish_swa_planned(raw: jax.Array, *args: jax.Array) -> jax.Array:
-    *plan, values = args
-    return write_planned_swa_pages(raw, (tuple(plan),), values)
+# Torch schema inference rejects varargs: every bridge parameter is named.
+def _publish_swa_planned(
+    raw: jax.Array,
+    order: jax.Array,
+    destinations: jax.Array,
+    row_masks: jax.Array,
+    masks: jax.Array,
+    values: jax.Array,
+) -> jax.Array:
+    plan = ((order, destinations, row_masks, masks),)
+    return write_planned_swa_pages(raw, plan, values)
 
 
 def _publish_swa_planned_banked(
-    raw: jax.Array, high: jax.Array, *args: jax.Array
+    raw: jax.Array,
+    high: jax.Array,
+    order: jax.Array,
+    destinations: jax.Array,
+    row_masks: jax.Array,
+    masks: jax.Array,
+    high_order: jax.Array,
+    high_destinations: jax.Array,
+    high_row_masks: jax.Array,
+    high_masks: jax.Array,
+    values: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    *plan, values = args
-    return write_planned_swa_pages(
-        (raw, high), (tuple(plan[:4]), tuple(plan[4:])), values
+    plan = (
+        (order, destinations, row_masks, masks),
+        (high_order, high_destinations, high_row_masks, high_masks),
     )
+    return write_planned_swa_pages((raw, high), plan, values)
 
 
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
@@ -306,7 +344,7 @@ def initialize_csa2_ops() -> None:
             lambda r, h, *_: (torch.empty_like(r), torch.empty_like(h)),
         ),
         ("plan_swa", _plan_swa, (P(),) + (None,) * 3, _fake_plan_swa),
-        ("plan_swa_banked", _plan_swa, (P(),) + (None,) * 3, _fake_plan_swa),
+        ("plan_swa_banked", _plan_swa_banked, (P(),) + (None,) * 3, _fake_plan_swa),
         (
             "publish_swa_planned",
             _publish_swa_planned,
