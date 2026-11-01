@@ -456,8 +456,8 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
             self.skipTest("Pallas TPU kernel needs TPU hardware")
 
     @parameterized.product(
-        num_tokens=[16, 17, 128, 2048],
-        token_block_size=[32, 64],
+        num_tokens=[16, 17, 128, 1030, 2048],
+        token_block_size=[32, 64, 128, None],
     )
     def test_matches_sequential_reference(self, num_tokens, token_block_size):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
@@ -491,7 +491,9 @@ class MhcFusedPostPreAddPallasTpuTest(parameterized.TestCase):
         if jax.default_backend() != "tpu":
             self.skipTest("Pallas TPU kernel needs TPU hardware")
 
-    @parameterized.product(num_tokens=[16, 17, 1024], token_block_size=[32])
+    @parameterized.product(
+        num_tokens=[16, 17, 1024, 1030], token_block_size=[32, 128, None]
+    )
     def test_matches_fused_of_bf16_sum(self, num_tokens, token_block_size):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
 
