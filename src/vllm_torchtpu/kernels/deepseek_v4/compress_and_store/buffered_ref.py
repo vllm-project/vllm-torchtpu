@@ -253,38 +253,61 @@ class OutputRef(_BufferedRef):
         global_idx = pid * tile_n
 
         if self.cfgs.dims.mode == config.Mode.CSA_INDEXER:
-            cache_ref, kv_slot_mapping_ref, is_first_mask_ref, *_ = dest_ref
+            cache_ref, kv_slot_mapping_ref, is_first_mask_ref, whole_counts_ref, *_ = (
+                dest_ref
+            )
 
-            @pl.loop(0, tile_n, unroll=True)
-            def loop_body(n):
-                idx_n = global_idx + n
-                kv_slot = kv_slot_mapping_ref[idx_n]
-                is_first = is_first_mask_ref[idx_n]
-                valid = (kv_slot >= 0) & is_first
+            def write_row(n, kv_slot):
+                row = _floor_div(kv_slot, self.cfgs.tokens_in_second_minor)
+                src = src_ref.at[n, 0, :, :]
+                dest = cache_ref.at[row]
+                pltpu.make_async_copy(src, dest, sem).start()
 
-                @pl.when(valid)
-                def _write_nope():
-                    row = _floor_div(kv_slot, self.cfgs.tokens_in_second_minor)
-                    src = src_ref.at[n, 0, :, :]
-                    dest = cache_ref.at[row]
-                    pltpu.make_async_copy(src, dest, sem).start()
+            def write_tokens():
+                @pl.loop(0, tile_n, unroll=True)
+                def loop_body(n):
+                    idx_n = global_idx + n
+                    kv_slot = kv_slot_mapping_ref[idx_n]
+                    is_first = is_first_mask_ref[idx_n]
+                    valid = (kv_slot >= 0) & is_first
+                    pl.when(valid)(lambda: write_row(n, kv_slot))
+
+            def write_whole_rows():
+                # Each row tile is one row; its first token writes it.
+                for n in range(0, tile_n, config.ROW_TILE):
+                    write_row(n, kv_slot_mapping_ref[global_idx + n])
+
         else:
-            cache_ref, kv_slot_mapping_ref, _ = dest_ref
+            cache_ref, kv_slot_mapping_ref, whole_counts_ref, _ = dest_ref
 
             # HCA: [num_pages * kv_block_size * 2, 4, 128] uint8
             # CSA: [num_pages * kv_block_size, 4, 128] uint8
-            @pl.loop(0, tile_n, unroll=True)
-            def loop_body(n):
-                idx_n = global_idx + n
-                kv_slot = kv_slot_mapping_ref[idx_n]
+            def write_tokens():
+                @pl.loop(0, tile_n, unroll=True)
+                def loop_body(n):
+                    idx_n = global_idx + n
+                    kv_slot = kv_slot_mapping_ref[idx_n]
 
-                @pl.when(kv_slot >= 0)
-                def _write_nope():
-                    @pl.loop(0, self.cfgs.record_rows, unroll=True)
-                    def write_loop(o):
-                        src_nope = src_ref.at[n, o, ...]
-                        dest_nope = cache_ref.at[kv_slot + o, ...]
-                        pltpu.make_async_copy(src_nope, dest_nope, sem).start()
+                    @pl.when(kv_slot >= 0)
+                    def _write_nope():
+                        @pl.loop(0, self.cfgs.record_rows, unroll=True)
+                        def write_loop(o):
+                            src_nope = src_ref.at[n, o, ...]
+                            dest_nope = cache_ref.at[kv_slot + o, ...]
+                            pltpu.make_async_copy(src_nope, dest_nope, sem).start()
+
+            def write_whole_rows():
+                # A row tile's records are ROW_TILE consecutive slots.
+                assert self.cfgs.record_rows == 1, self.cfgs.record_rows
+                rows = config.ROW_TILE
+                for n in range(0, tile_n, rows):
+                    kv_slot = kv_slot_mapping_ref[global_idx + n]
+                    src = src_ref.at[pl.ds(n, rows), 0]
+                    dest = cache_ref.at[pl.ds(kv_slot, rows)]
+                    pltpu.make_async_copy(src, dest, sem).start()
+
+        # Both issue the same bytes, so the counted waits are unchanged.
+        by_rows(self.cfgs, whole_counts_ref[pid], write_whole_rows, write_tokens)
 
     def wait_out(self, dest_ref, grid_indices):
         assert self.sem_sends is not None
@@ -353,7 +376,9 @@ class RoPEOutputRef(_BufferedRef):
     def copy_out(self, dest_ref, grid_indices):
         assert self.sem_sends is not None
         assert self.window_ref is not None
-        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref, *_ = dest_ref
+        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref, whole_counts_ref, _ = (
+            dest_ref
+        )
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
 
@@ -363,19 +388,28 @@ class RoPEOutputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
 
-        @pl.loop(0, tile_n, unroll=True)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            is_first = is_first_mask_ref[idx_n]
-            valid = kv_slot >= 0
+        def write_row(n, kv_slot):
+            src_rope = src_ref.at[n, :, :]
+            row = _floor_div(kv_slot, csa_cache_layout.ROPE_TOKENS_PER_ROW)
+            dest_rope = rope_cache_ref.at[row]
+            pltpu.make_async_copy(src_rope, dest_rope, sem).start()
 
-            @pl.when(valid & is_first)
-            def _write_rope():
-                src_rope = src_ref.at[n, :, :]
-                row = _floor_div(kv_slot, csa_cache_layout.ROPE_TOKENS_PER_ROW)
-                dest_rope = rope_cache_ref.at[row]
-                pltpu.make_async_copy(src_rope, dest_rope, sem).start()
+        def write_tokens():
+            @pl.loop(0, tile_n, unroll=True)
+            def loop_body(n):
+                idx_n = global_idx + n
+                kv_slot = kv_slot_mapping_ref[idx_n]
+                is_first = is_first_mask_ref[idx_n]
+                valid = kv_slot >= 0
+                pl.when(valid & is_first)(lambda: write_row(n, kv_slot))
+
+        def write_whole_rows():
+            # Each row tile is one row; its first token writes it.
+            for n in range(0, tile_n, config.ROW_TILE):
+                write_row(n, kv_slot_mapping_ref[global_idx + n])
+
+        # Both issue the same bytes, so the counted waits are unchanged.
+        by_rows(self.cfgs, whole_counts_ref[pid], write_whole_rows, write_tokens)
 
     def wait_out(self, dest_ref, grid_indices):
         assert self.sem_sends is not None
@@ -483,6 +517,7 @@ def create_allocs_and_specs(
         output_args = (
             cache_rows_ref,
             kv_slot_mapping_ref,
+            copy_counts_refs[CopyCount.WHOLE_ROW],
             copy_counts_refs[CopyCount.VALID],
         )
 
