@@ -1080,7 +1080,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if non_causal
             else self.window_size
         )
-        csa2_metadata = csa2_bounds = csa2_write_records = csa2_swa_plan = None
+        csa2_metadata = csa2_bounds = csa2_write_records = None
         if self._csa2:
             if not isinstance(swa_cache, PagedCacheRows):
                 raise ValueError("CSA2 requires a native shared word-row cache")
@@ -1121,21 +1121,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     )
             else:
                 _, csa2_metadata, csa2_bounds, csa2_write_records = cached
-            # Sorting, pairing and masks depend only on the records and owner
-            # geometry; layers of a stage pack only their own values.
-            plan_key = (
-                "csa2_swa_plan",
-                meta_key,
-                tuple(swa_cache.raw.shape),
-                None if swa_cache.raw_hi is None else tuple(swa_cache.raw_hi.shape),
-            )
-            cached_plan = stage_cache.get(plan_key) if stage_cache is not None else None
-            if cached_plan is None or cached_plan[0] is not csa2_write_records:
-                csa2_swa_plan = csa2_adapter.plan_swa(swa_cache, csa2_write_records)
-                if stage_cache is not None:
-                    stage_cache[plan_key] = (csa2_write_records, csa2_swa_plan)
-            else:
-                csa2_swa_plan = cached_plan[1]
             swa_valid = csa2_write_records >= 0
             swa_invalid_3d = (~swa_valid)[:, None, None]
             requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
@@ -1413,12 +1398,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             kv = self._rotate(kv, positions)
         if self._csa2:
             assert csa2_write_records is not None
-            csa2_adapter.publish_swa(
-                swa_cache,
-                csa2_write_records,
-                kv.reshape(-1, 512),
-                plan=csa2_swa_plan,
-            )
+            csa2_adapter.publish_swa(swa_cache, csa2_write_records, kv.reshape(-1, 512))
         else:
             _insert(swa_cache, swa_slots, kv, swa_valid)
         weights = None

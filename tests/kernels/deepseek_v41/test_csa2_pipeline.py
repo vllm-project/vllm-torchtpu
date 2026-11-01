@@ -16,11 +16,7 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
 )
 from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
 from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import csa2_pipeline
-from vllm_torchtpu.kernels.mla.paged_swa import (
-    plan_swa_pages,
-    write_planned_swa_pages,
-    write_swa_pages,
-)
+from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
 
 
 @pytest.mark.parametrize("page_size", [8, 16, 32, 64, 128, 256])
@@ -166,63 +162,6 @@ def test_native_swa_shared_owner_avoids_pool_sized_temporaries():
     np.testing.assert_array_equal(outputs, expected)
     # An attention read followed by another write must reuse the shared owner.
     assert compiled.memory_analysis().temp_size_in_bytes < pool_bytes
-
-
-@pytest.mark.parametrize("page_size", [16, 64])
-@pytest.mark.parametrize("banked", [False, True])
-@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="SparseCore publication")
-def test_planned_swa_publication_matches_direct_writes(page_size, banked):
-    # One plan serves every layer of a stage: three layers publish different
-    # values at the same fragmented records, unaligned on both pair halves.
-    rng = np.random.default_rng(page_size)
-    initial = rng.standard_normal((8, page_size, 512)).astype(np.float32)
-    records = rng.permutation(np.arange(page_size, 8 * page_size))[:45]
-    records = np.concatenate((records, [-1, 0, 8 * page_size])).astype(np.int32)
-
-    def owner():
-        # Separate owners: both writers donate theirs.
-        pages = jnp.asarray(initial, jnp.bfloat16)
-        return (pages[:3], pages[3:]) if banked else pages
-
-    direct, planned = owner(), owner()
-    banks = direct if banked else (direct,)
-    plan = plan_swa_pages(
-        jnp.asarray(records),
-        page_size=page_size,
-        bank_pages=tuple(bank.shape[0] for bank in banks),
-    )
-    for layer in range(3):
-        values = jnp.asarray(
-            rng.standard_normal((records.size, 512)) * (layer + 1), jnp.bfloat16
-        )
-        direct = write_swa_pages(direct, jnp.asarray(records), values)
-        planned = write_planned_swa_pages(planned, plan, values)
-    join = jnp.concatenate if banked else (lambda x: x)
-    np.testing.assert_array_equal(
-        jax.lax.bitcast_convert_type(join(planned), jnp.uint16),
-        jax.lax.bitcast_convert_type(join(direct), jnp.uint16),
-    )
-
-
-@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="SparseCore publication")
-def test_planned_swa_publication_rejects_foreign_plans():
-    records = jnp.arange(32, 64, dtype=jnp.int32)
-    plan = plan_swa_pages(records, page_size=32, bank_pages=(4,))
-    with pytest.raises(ValueError, match="plan"):
-        write_planned_swa_pages(
-            jnp.zeros((4, 32, 512), jnp.bfloat16),
-            plan,
-            jnp.zeros((16, 512), jnp.bfloat16),
-        )
-    with pytest.raises(ValueError, match="plan"):
-        write_planned_swa_pages(
-            (
-                jnp.zeros((2, 32, 512), jnp.bfloat16),
-                jnp.zeros((2, 32, 512), jnp.bfloat16),
-            ),
-            plan,
-            jnp.zeros((32, 512), jnp.bfloat16),
-        )
 
 
 @pytest.fixture

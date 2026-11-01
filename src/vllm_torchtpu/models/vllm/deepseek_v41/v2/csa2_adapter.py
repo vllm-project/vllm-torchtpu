@@ -20,12 +20,7 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
-from vllm_torchtpu.kernels.mla.paged_swa import (
-    plan_swa_pages,
-    swa_plan_rows,
-    write_planned_swa_pages,
-    write_swa_pages,
-)
+from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
 
 if TYPE_CHECKING:
     from .cache import PagedCacheRows
@@ -69,82 +64,6 @@ def _publish_swa_banked(
     values: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
     return write_swa_pages((raw, high), records, values)
-
-
-# Flat (order, destinations, row masks, masks) per bank. Torch schemas need
-# a fixed number of results, so each bank count has its own bridge.
-def _plan_swa(
-    records: jax.Array, page_size: int, low_pages: int, high_pages: int
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    del high_pages
-    (plan,) = plan_swa_pages(records, page_size=page_size, bank_pages=(low_pages,))
-    return plan
-
-
-def _plan_swa_banked(
-    records: jax.Array, page_size: int, low_pages: int, high_pages: int
-) -> tuple[
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-]:
-    low, high = plan_swa_pages(
-        records, page_size=page_size, bank_pages=(low_pages, high_pages)
-    )
-    return (*low, *high)
-
-
-def _fake_plan_swa(records, page_size, low_pages, high_pages):
-    rows = swa_plan_rows(records.shape[0])
-    # Distinct tensors per bank: custom-op outputs must not alias each other.
-    return tuple(
-        array
-        for _ in range(2 if high_pages else 1)
-        for array in (
-            records.new_empty(records.shape),
-            records.new_empty((rows,)),
-            records.new_empty((rows,)),
-            records.new_empty((rows, 512)),
-        )
-    )
-
-
-# Torch schema inference rejects varargs: every bridge parameter is named.
-def _publish_swa_planned(
-    raw: jax.Array,
-    order: jax.Array,
-    destinations: jax.Array,
-    row_masks: jax.Array,
-    masks: jax.Array,
-    values: jax.Array,
-) -> jax.Array:
-    plan = ((order, destinations, row_masks, masks),)
-    return write_planned_swa_pages(raw, plan, values)
-
-
-def _publish_swa_planned_banked(
-    raw: jax.Array,
-    high: jax.Array,
-    order: jax.Array,
-    destinations: jax.Array,
-    row_masks: jax.Array,
-    masks: jax.Array,
-    high_order: jax.Array,
-    high_destinations: jax.Array,
-    high_row_masks: jax.Array,
-    high_masks: jax.Array,
-    values: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    plan = (
-        (order, destinations, row_masks, masks),
-        (high_order, high_destinations, high_row_masks, high_masks),
-    )
-    return write_planned_swa_pages((raw, high), plan, values)
 
 
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
@@ -343,20 +262,6 @@ def initialize_csa2_ops() -> None:
             (P(),) * 4,
             lambda r, h, *_: (torch.empty_like(r), torch.empty_like(h)),
         ),
-        ("plan_swa", _plan_swa, (P(),) + (None,) * 3, _fake_plan_swa),
-        ("plan_swa_banked", _plan_swa_banked, (P(),) + (None,) * 3, _fake_plan_swa),
-        (
-            "publish_swa_planned",
-            _publish_swa_planned,
-            (P(),) * 6,
-            lambda r, *_: torch.empty_like(r),
-        ),
-        (
-            "publish_swa_planned_banked",
-            _publish_swa_planned_banked,
-            (P(),) * 11,
-            lambda r, h, *_: (torch.empty_like(r), torch.empty_like(h)),
-        ),
         (
             "attend",
             _attend,
@@ -381,9 +286,6 @@ def initialize_csa2_ops() -> None:
         "publish_main": 2,
         "publish_main_banked": 4,
         "publish_swa_banked": 2,
-        "plan_swa": 4,
-        "plan_swa_banked": 8,
-        "publish_swa_planned_banked": 2,
         "gather_attend": 4,
     }
     donated = {
@@ -391,8 +293,6 @@ def initialize_csa2_ops() -> None:
         "publish_main_banked": (0, 1, 2, 3),
         "publish_swa": (0,),
         "publish_swa_banked": (0, 1),
-        "publish_swa_planned": (0,),
-        "publish_swa_planned_banked": (0, 1),
     }
     for name, function, specs, fake in definitions:
         count = output_counts.get(name, 1)
@@ -437,38 +337,9 @@ def publish_main(
         cache.scale_hi.copy_(high_scale)
 
 
-def plan_swa(
-    cache: "PagedCacheRows", records: torch.Tensor
-) -> tuple[torch.Tensor, ...]:
-    """Publication plan for ``records`` into SWA owners shaped like ``cache``.
-
-    Layers of a stage share the records, so one plan serves all of them.
-    """
-    high = 0 if cache.raw_hi is None else cache.raw_hi.shape[0]
-    name = "plan_swa" if cache.raw_hi is None else "plan_swa_banked"
-    return tuple(
-        _ops[name](records.int(), cache.raw.shape[1], cache.raw.shape[0], high)
-    )
-
-
 def publish_swa(
-    cache: "PagedCacheRows",
-    records: torch.Tensor,
-    values: torch.Tensor,
-    *,
-    plan: tuple[torch.Tensor, ...] | None = None,
+    cache: "PagedCacheRows", records: torch.Tensor, values: torch.Tensor
 ) -> None:
-    """``plan``, if given, must come from `plan_swa` for these records."""
-    if plan is not None:
-        if cache.raw_hi is None:
-            cache.raw.copy_(_ops["publish_swa_planned"](cache.raw, *plan, values))
-        else:
-            low, high = _ops["publish_swa_planned_banked"](
-                cache.raw, cache.raw_hi, *plan, values
-            )
-            cache.raw.copy_(low)
-            cache.raw_hi.copy_(high)
-        return
     if cache.raw_hi is None:
         cache.raw.copy_(_ops["publish_swa"](cache.raw, records.int(), values))
     else:
