@@ -152,6 +152,28 @@ def test_prequantized_conflict():
 
 
 @pytest.mark.parametrize("kind", ["fp8", "nvfp4"])
+def test_quantize_on_load_conflict_names_env_var(kind, monkeypatch):
+    monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "proj")
+    config = make_config(kind)
+    config.get_linear_config = lambda layer: None
+    with pytest.raises(ValueError, match="QUANTIZE_ON_LOAD_PREFIXES"):
+        linear(config, "proj")
+
+
+@pytest.mark.parametrize("kind", ["fp8", "nvfp4"])
+def test_checkpoint_quantized_conflict_not_blamed_on_quantize_on_load(
+    kind, monkeypatch
+):
+    """A checkpoint-quantized layer matching both QUANTIZE_ON_LOAD_PREFIXES and
+    tpu_online_fp8 must still report the checkpoint conflict, not the env var."""
+    monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "quantized")
+    config = make_config(kind, targets=["quantized"])
+    config.get_linear_config = lambda layer: None
+    with pytest.raises(ValueError, match="already has checkpoint"):
+        linear(config, "quantized")
+
+
+@pytest.mark.parametrize("kind", ["fp8", "nvfp4"])
 def test_checkpoint_method_preserved(kind, monkeypatch):
     config = make_config(kind)
     original = object()

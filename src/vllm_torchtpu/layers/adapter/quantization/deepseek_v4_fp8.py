@@ -76,17 +76,17 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
         prefix: str,
     ) -> vllm_linear.LinearMethodBase | QuantizeMethodBase | None:
         if isinstance(layer, vllm_linear.LinearBase):
-            linear_config = self.get_linear_config(layer)
             if is_layer_skipped(
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):
                 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                    VllmUnquantizedLinearMethod,
+                    VllmUnquantizedConfig,
                 )
 
-                return VllmUnquantizedLinearMethod()
+                return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
+            linear_config = self.get_linear_config(layer)
             return VllmFp8LinearMethodTPU(self, linear_config, prefix=prefix)
         elif isinstance(layer, RoutedExperts):
             if is_layer_skipped(
