@@ -248,6 +248,9 @@ def kernel_fn(
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
+    valid_counts_ref,
+    first_counts_ref,
+    first_rope_counts_ref,
     grid_size_ref,
     rms_weight_ref,
     # HBM inputs (dynamic access)
@@ -275,6 +278,7 @@ def kernel_fn(
         kv_slot_mapping_ref=kv_slot_mapping_ref,
         is_first_mask_ref=is_first_mask_ref,
         is_first_mask_rope_ref=is_first_mask_rope_ref,
+        copy_counts_refs=(valid_counts_ref, first_counts_ref, first_rope_counts_ref),
     )
 
     pipeline_func = pltpu.emit_pipeline(
@@ -462,6 +466,12 @@ def compress_norm_rope_store(
         kv_slot_mapping = jnp.pad(kv_slot_mapping, (0, pad), constant_values=-1)
         is_first_mask = jnp.pad(is_first_mask, (0, pad))
         is_first_mask_rope = jnp.pad(is_first_mask_rope, (0, pad))
+    # Each tile's record copies, by `buffered_ref.CopyCount`.
+    copy_counts = (
+        jnp.stack([kv_slot_mapping >= 0, is_first_mask, is_first_mask_rope])
+        .reshape(len(buffered_ref.CopyCount), -1, cfgs.tile_sizes.tile_n)
+        .sum(axis=-1, dtype=jnp.int32)
+    )
     rows = token_to_req_indices[:, None] * block_table_stride
     # Look up each token's window groups here so the kernel keeps only those
     # entries in SMEM; the full block table does not fit at long context lengths.
@@ -475,6 +485,7 @@ def compress_norm_rope_store(
         kv_slot_mapping,
         is_first_mask,
         is_first_mask_rope,
+        *copy_counts,
         grid_size,
     )
     cos_sin_operand = cos_sin_cache if cfgs.dims.has_rope else None

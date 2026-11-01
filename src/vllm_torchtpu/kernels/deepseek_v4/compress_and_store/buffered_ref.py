@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import enum
 from typing import Any, cast
 
 import jax
@@ -35,6 +36,27 @@ def _flat_rows(ref):
     """(num_pages, rows, ...) -> (num_pages * rows, ...): a slot's row index is
     then its page-major row number."""
     return ref.reshape(ref.shape[0] * ref.shape[1], *ref.shape[2:])
+
+
+class CopyCount(enum.IntEnum):
+    """The per-tile copy counts `compress_norm_rope_store` prefetches."""
+
+    VALID = 0  # tokens with a slot
+    FIRST = 1  # tokens that write their NoPE row (is_first_mask)
+    FIRST_ROPE = 2  # tokens that write their RoPE row (is_first_mask_rope)
+
+
+def _wait_copies(vmem_ref, count, sem):
+    """Waits for ``count`` copies of one leading-dim block of vmem_ref each.
+
+    A DMA wait takes its descriptor's bytes off the semaphore, so the waits
+    need not name the blocks that were copied, only how many.
+    """
+    block = vmem_ref.at[0]
+
+    @pl.loop(0, count)
+    def _wait(_):
+        pltpu.make_async_copy(block, block, sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -153,7 +175,7 @@ class OutputRef(_BufferedRef):
         # Only called in CSA_INDEXER mode (INPUT_OUTPUT)
         assert self.sem_recvs is not None
         assert self.window_ref is not None
-        cache_ref, kv_slot_mapping_ref, _ = src_ref
+        cache_ref, kv_slot_mapping_ref, *_ = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         dest_ref = cast(jax.Ref, self.window_ref.at[slot])
@@ -184,25 +206,8 @@ class OutputRef(_BufferedRef):
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
-        pid = grid_indices[0]
-
-        tile_n = self.cfgs.tile_sizes.tile_n
-        global_idx = pid * tile_n
-        _, kv_slot_mapping_ref, _ = src_ref
-
-        @pl.loop(0, tile_n)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            valid = kv_slot >= 0
-
-            @pl.when(valid)
-            def _wait_nope():
-                pltpu.make_async_copy(
-                    vmem_ref.at[n, 0, :, :],
-                    vmem_ref.at[n, 0, :, :],
-                    sem,
-                ).wait()
+        *_, read_counts_ref, _ = src_ref
+        _wait_copies(vmem_ref, read_counts_ref[grid_indices[0]], sem)
 
     def copy_out(self, dest_ref, grid_indices):
         assert self.sem_sends is not None
@@ -215,7 +220,7 @@ class OutputRef(_BufferedRef):
         global_idx = pid * tile_n
 
         if self.cfgs.dims.mode == config.Mode.CSA_INDEXER:
-            cache_ref, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
+            cache_ref, kv_slot_mapping_ref, is_first_mask_ref, *_ = dest_ref
 
             @pl.loop(0, tile_n)
             def loop_body(n):
@@ -231,7 +236,7 @@ class OutputRef(_BufferedRef):
                     dest = cache_ref.at[row]
                     pltpu.make_async_copy(src, dest, sem).start()
         else:
-            cache_ref, kv_slot_mapping_ref = dest_ref
+            cache_ref, kv_slot_mapping_ref, _ = dest_ref
 
             # HCA: [num_pages * kv_block_size * 2, 4, 128] uint8
             # CSA: [num_pages * kv_block_size, 4, 128] uint8
@@ -254,46 +259,8 @@ class OutputRef(_BufferedRef):
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
-        pid = grid_indices[0]
-        tile_n = self.cfgs.tile_sizes.tile_n
-        global_idx = pid * tile_n
-
-        is_indexer = self.cfgs.dims.mode == config.Mode.CSA_INDEXER
-
-        if is_indexer:
-            _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
-
-            @pl.loop(0, tile_n)
-            def loop_body(n):
-                idx_n = global_idx + n
-                kv_slot = kv_slot_mapping_ref[idx_n]
-                is_first = is_first_mask_ref[idx_n]
-                valid = (kv_slot >= 0) & is_first
-
-                @pl.when(valid)
-                def _wait_nope():
-                    pltpu.make_async_copy(
-                        vmem_ref.at[n, 0, :, :],
-                        vmem_ref.at[n, 0, :, :],
-                        sem,
-                    ).wait()
-        else:
-            _, kv_slot_mapping_ref = dest_ref
-
-            @pl.loop(0, tile_n)
-            def loop_body(n):
-                idx_n = global_idx + n
-                kv_slot = kv_slot_mapping_ref[idx_n]
-
-                @pl.when(kv_slot >= 0)
-                def _wait_nope():
-                    @pl.loop(0, self.cfgs.record_rows, unroll=True)
-                    def wait_loop(o):
-                        pltpu.make_async_copy(
-                            vmem_ref.at[n, o, :, :],
-                            vmem_ref.at[n, o, :, :],
-                            sem,
-                        ).wait()
+        write_counts_ref = dest_ref[-1]
+        _wait_copies(vmem_ref, write_counts_ref[grid_indices[0]], sem)
 
 
 @jax.tree_util.register_dataclass
@@ -306,7 +273,7 @@ class RoPEOutputRef(_BufferedRef):
     def copy_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
-        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref = src_ref
+        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref, _ = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         dest_ref = cast(jax.Ref, self.window_ref.at[slot])
@@ -336,31 +303,13 @@ class RoPEOutputRef(_BufferedRef):
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
-        pid = grid_indices[0]
-
-        tile_n = self.cfgs.tile_sizes.tile_n
-        global_idx = pid * tile_n
-        _, kv_slot_mapping_ref, is_first_mask_ref = src_ref
-
-        @pl.loop(0, tile_n)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            is_first = is_first_mask_ref[idx_n]
-            valid = kv_slot >= 0
-
-            @pl.when(valid & is_first)
-            def _wait_rope():
-                pltpu.make_async_copy(
-                    vmem_ref.at[n, :, :],
-                    vmem_ref.at[n, :, :],
-                    sem,
-                ).wait()
+        row_counts_ref = src_ref[-1]
+        _wait_copies(vmem_ref, row_counts_ref[grid_indices[0]], sem)
 
     def copy_out(self, dest_ref, grid_indices):
         assert self.sem_sends is not None
         assert self.window_ref is not None
-        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
+        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref, _ = dest_ref
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
 
@@ -390,27 +339,8 @@ class RoPEOutputRef(_BufferedRef):
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
-        pid = grid_indices[0]
-
-        tile_n = self.cfgs.tile_sizes.tile_n
-        global_idx = pid * tile_n
-
-        _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
-
-        @pl.loop(0, tile_n)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            is_first = is_first_mask_ref[idx_n]
-            valid = kv_slot >= 0
-
-            @pl.when(valid & is_first)
-            def _wait_rope():
-                pltpu.make_async_copy(
-                    vmem_ref.at[n, :, :],
-                    vmem_ref.at[n, :, :],
-                    sem,
-                ).wait()
+        row_counts_ref = dest_ref[-1]
+        _wait_copies(vmem_ref, row_counts_ref[grid_indices[0]], sem)
 
 
 def create_allocs_and_specs(
@@ -425,6 +355,7 @@ def create_allocs_and_specs(
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
+    copy_counts_refs,
 ) -> tuple[
     tuple[
         CosSinRef | None,
@@ -496,9 +427,19 @@ def create_allocs_and_specs(
         cfgs=cfgs,
     )
     if is_indexer:
-        output_args = (cache_rows_ref, kv_slot_mapping_ref, is_first_mask_ref)
+        output_args = (
+            cache_rows_ref,
+            kv_slot_mapping_ref,
+            is_first_mask_ref,
+            copy_counts_refs[CopyCount.VALID],
+            copy_counts_refs[CopyCount.FIRST],
+        )
     else:
-        output_args = (cache_rows_ref, kv_slot_mapping_ref)
+        output_args = (
+            cache_rows_ref,
+            kv_slot_mapping_ref,
+            copy_counts_refs[CopyCount.VALID],
+        )
 
     # state: each token's window groups
     block_shape = (*cfgs.window_buffer_shape(), *state_row_shape)
@@ -536,6 +477,7 @@ def create_allocs_and_specs(
             _flat_rows(rope_cache_ref),
             kv_slot_mapping_ref,
             is_first_mask_rope_ref,
+            copy_counts_refs[CopyCount.FIRST_ROPE],
         )
     else:
         rope_alloc = rope_spec = rope_args = None
