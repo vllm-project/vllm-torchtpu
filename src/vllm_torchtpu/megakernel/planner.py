@@ -21,7 +21,7 @@ from typing import Any
 
 import jax.numpy as jnp
 
-from . import pool_alias
+from .dma import pool_alias
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .ops import BF16, F32, rup

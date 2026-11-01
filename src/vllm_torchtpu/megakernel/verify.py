@@ -22,8 +22,9 @@ from typing import Any, Literal
 
 import jax
 
-from . import pool, vmem
+from . import pool
 from . import weights as w_mod
+from .dma import vmem
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .geometry import ModelGeometry

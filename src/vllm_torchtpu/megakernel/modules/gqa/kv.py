@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ... import pool_alias
+from ...dma import pool_alias
 from ...ops import U32, bswitch
 from ...pool.config import cache_exec, resolved_max_pages_per_seq
 from .context import GQAEmit

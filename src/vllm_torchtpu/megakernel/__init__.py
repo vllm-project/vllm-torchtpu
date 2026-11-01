@@ -27,6 +27,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         comm,
         decls,
         derive,
+        dma,
         errors,
         exec_spec,
         experimental,
@@ -39,17 +40,14 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         ops,
         planner,
         pool,
-        pool_alias,
         profile,
         profiles,
         reference,
         runtime,
         schedule,
         spec,
-        stream,
         validate,
         verify,
-        vmem,
         weights,
     )
     from .cache import (
@@ -72,6 +70,14 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         make_fused_pooled_step,
     )
     from .comm import AllReduceRing
+    from .dma import (
+        TwoRing,
+        fit_default_tiles,
+        fitted_plan,
+        pool_alias,
+        stream,
+        vmem,
+    )
     from .errors import EligibilityResult, MegakernelConfigError, MegakernelLayoutError
     from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
     from .kernel import (
@@ -166,7 +172,6 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         VLLMAlias,
         WeightDecl,
     )
-    from .stream import TwoRing
     from .verify import (
         ModuleOracle,
         ToleranceSpec,
@@ -175,7 +180,6 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         verify_model,
         verify_module,
     )
-    from .vmem import fit_default_tiles, fitted_plan
     from .weights import (
         ArrayOps,
         JaxArrayOps,
@@ -208,6 +212,7 @@ _SUBMODULES = frozenset(
         "comm",
         "decls",
         "derive",
+        "dma",
         "errors",
         "exec_spec",
         "experimental",
@@ -220,17 +225,14 @@ _SUBMODULES = frozenset(
         "ops",
         "planner",
         "pool",
-        "pool_alias",
         "profile",
         "profiles",
         "reference",
         "runtime",
         "schedule",
         "spec",
-        "stream",
         "validate",
         "verify",
-        "vmem",
         "weights",
     }
 )
@@ -339,15 +341,18 @@ _LAZY: dict[str, str] = {
     "SwitchSlot": ".spec",
     "VLLMAlias": ".spec",
     "WeightDecl": ".spec",
-    "TwoRing": ".stream",
+    "TwoRing": ".dma.stream",
     "ModuleOracle": ".verify",
     "ToleranceSpec": ".verify",
     "VerificationReport": ".verify",
     "auto_model": ".verify",
     "verify_model": ".verify",
     "verify_module": ".verify",
-    "fit_default_tiles": ".vmem",
-    "fitted_plan": ".vmem",
+    "fit_default_tiles": ".dma.vmem",
+    "fitted_plan": ".dma.vmem",
+    "pool_alias": ".dma",
+    "stream": ".dma",
+    "vmem": ".dma",
     "ArrayOps": ".weights",
     "JaxArrayOps": ".weights",
     "MappingWeightSource": ".weights",
@@ -462,6 +467,7 @@ __all__ = [
     "default_tiles",
     "derive",
     "derive_pool_layout",
+    "dma",
     "encode_ecopy",
     "encode_eplb_ecopy",
     "errors",

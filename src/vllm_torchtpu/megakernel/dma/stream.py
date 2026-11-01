@@ -23,8 +23,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..ops import F32
 from . import pool_alias
-from .ops import F32
 from .vmem import StreamParams
 
 NN = (((1,), (0,)), ((), ()))

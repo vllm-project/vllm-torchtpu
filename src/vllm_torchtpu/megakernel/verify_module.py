@@ -25,9 +25,10 @@ from jax.experimental import mesh_utils
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 
-from . import kernel, vmem
+from . import kernel
 from . import weights as w_mod
 from .decls import ModuleBinding
+from .dma import vmem
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .module import Module

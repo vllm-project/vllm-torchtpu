@@ -22,12 +22,15 @@ from pathlib import Path
 import pytest
 
 import vllm_torchtpu.megakernel as mk
+import vllm_torchtpu.megakernel.dma as mk_dma
 import vllm_torchtpu.megakernel.runtime as mk_rt
 
 _SRC = Path(mk.__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize("pkg", [mk, mk_rt], ids=["megakernel", "runtime"])
+@pytest.mark.parametrize(
+    "pkg", [mk, mk_dma, mk_rt], ids=["megakernel", "dma", "runtime"]
+)
 def test_every_public_name_is_in_the_lazy_tables_and_resolves(pkg) -> None:
     lazy, subs = set(pkg._LAZY), set(pkg._SUBMODULES)
     assert not lazy & subs
