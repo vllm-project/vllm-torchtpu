@@ -350,6 +350,26 @@ def test_sharded_indexer_matches_unsharded():
         np.testing.assert_array_equal(shard[i], base[i], err_msg=name)
 
 
+@pytest.mark.parametrize("dcp", [1, 2])
+def test_union_stacked_rows_bit_identical(monkeypatch, dcp):
+    """`union_attn.STACK_ROWS`: a request's rows scored and accumulated as one stacked
+    `[T * nh, 256]` matmul / softmax per tile give bit-identical outputs to the per-row loop,
+    with and without main-KV DCP."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+    from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
+
+    kw = dict(long=True, rank_ids=True, union=True, shard=True, shared_kv=True)
+    if dcp > 1:
+        monkeypatch.setenv(pool_layout.MAIN_KV_DCP_ENV, str(dcp))
+        kw["dcp"] = dcp
+    monkeypatch.setattr(ua, "STACK_ROWS", True)
+    stacked = _run_c(**kw)
+    monkeypatch.setattr(ua, "STACK_ROWS", False)
+    per_row = _run_c(**kw)
+    assert np.isfinite(stacked[0]).all()
+    np.testing.assert_array_equal(stacked[0], per_row[0])
+
+
 def test_union_attention_matches_per_row(monkeypatch):
     """`union_attn`: each request's rows attend one union of their selections (here 229 of a
     possible 256 groups for request 0: four ring tiles instead of one per row). Every row attends

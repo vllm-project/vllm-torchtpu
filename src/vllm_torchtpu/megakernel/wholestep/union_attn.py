@@ -25,6 +25,7 @@ each row masked to its own groups. Every row attends exactly the tokens it atten
 from __future__ import annotations
 
 import contextlib
+import os
 
 from typing import Any
 
@@ -41,6 +42,10 @@ GROUPS_PER_TILE = TILE // MICRO  # one group = one micro-page of 4 tokens
 
 
 UNION_CHUNK = 256  # output slots compacted per pass (bounds the [slots, S] temporaries)
+
+
+# VLLM_TPU_MK_UNION_STACK (default on): stack a request's rows in union attention.
+STACK_ROWS = os.environ.get("VLLM_TPU_MK_UNION_STACK", "1") != "0"
 
 
 def union_consts(S: int, KU: int) -> tuple:
@@ -206,6 +211,11 @@ def attend_request(
     ti = jax.lax.broadcasted_iota(I32, (2 * GROUPS_PER_TILE, TILE), 1)
     expand = [(ti // MICRO == gi - h * GROUPS_PER_TILE).astype(F32).astype(BF16) for h in (0, 1)]
     qf = [q.astype(F32) for q in qs]
+    # The request's T rows stacked: one [T * nh, 256] score / PV matmul and one masked online
+    # softmax per tile (each output row is the same dot and elementwise math as per row).
+    stack = STACK_ROWS
+    qcat = jnp.concatenate(qf, axis=0) if stack else None
+    rowbit = jax.lax.broadcasted_iota(I32, (T * nh, 1), 0) // nh
 
     def tile(t: Any, carry: Any) -> Any:
         s = jax.lax.rem(t, nslots)
@@ -236,6 +246,24 @@ def attend_request(
             value = jnp.where(value == value, value, 0.0)
         value = jnp.where(tok_col < length, value * scale_v, 0.0)
       with sc("u_rows", 3):
+        if stack:
+            m, l, acc = carry
+            valid = (tok < length) & ((jnp.right_shift(tok_code, rowbit) & 1) != 0)
+            score = jax.lax.dot_general(
+                qcat, key, (((1,), (1,)), ((), ())), preferred_element_type=F32
+            )
+            score = jnp.where(valid, score * sm_scale, -jnp.inf)
+            m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
+            safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
+            p = jnp.where(valid, jnp.exp(score - safe), 0.0)
+            alpha = jnp.where(
+                m == -jnp.inf, jnp.where(m_new == -jnp.inf, 1.0, 0.0), jnp.exp(m - safe)
+            )
+            return (
+                m_new,
+                l * alpha + jnp.sum(p, axis=-1, keepdims=True),
+                acc * alpha + jnp.dot(p, value, preferred_element_type=F32),
+            )
         out = []
         for r in range(T):
             m, l, acc = carry[r]
@@ -264,7 +292,17 @@ def attend_request(
         (jnp.full((nh, 1), -jnp.inf, F32), jnp.zeros((nh, 1), F32), jnp.zeros((nh, dim), F32))
         for _ in range(T)
     )
+    if stack:
+        init = (
+            jnp.full((T * nh, 1), -jnp.inf, F32),
+            jnp.zeros((T * nh, 1), F32),
+            jnp.zeros((T * nh, dim), F32),
+        )
     state = jax.lax.fori_loop(0, ntiles, tile, init)
+    if stack:
+        state = tuple(
+            tuple(x[r * nh : (r + 1) * nh] for x in state) for r in range(T)
+        )
     rk, rv, ok_rows, ok_any = recent
     rkey = rk * scale_k
     rval = jnp.where(ok_any, rv * scale_v, 0.0)
