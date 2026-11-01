@@ -318,14 +318,23 @@ def test_pipeline_executor_never_asks_the_workers_for_draft_tokens(monkeypatch, 
     assert executor.calls == []
 
 
-# The ring hand-off (TPU_PP_HANDOFF=ring): no pushes or settles, vLLM's
-# dispatch depth, rings widened as for the wave.
+# The ring hand-off (TPU_PP_HANDOFF=ring): no pushes or settles, half the
+# stages again in flight, rings widened for them.
 
 
 @pytest.fixture
 def ring(monkeypatch):
+    from vllm.config import VllmConfig
+
     monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
     monkeypatch.delenv("TPU_PP_RING_DEPTH", raising=False)
+    # The ring raises vLLM's steps in flight once per process: each test
+    # starts from vLLM's property, unmarked, and both come back afterwards.
+    monkeypatch.setattr(
+        VllmConfig, "max_concurrent_batches", VllmConfig.max_concurrent_batches
+    )
+    monkeypatch.setattr(VllmConfig, "_tpu_pp_extra_steps", None, raising=False)
+    monkeypatch.delattr(VllmConfig, "_tpu_pp_extra_steps")
 
 
 def test_the_hand_off_flags_parse(monkeypatch):
@@ -349,13 +358,78 @@ def test_the_hand_off_flags_parse(monkeypatch):
         _ = envs.TPU_PP_RING_DEPTH
 
 
-def test_the_ring_widens_the_rings_as_the_wave_does(monkeypatch, ring, queue):
+def test_the_ring_keeps_half_the_stages_again_in_flight():
+    assert [pp_push.ring_extra_steps(stages) for stages in (2, 4, 8)] == [1, 2, 4]
+
+
+def test_the_rings_hold_the_extra_steps(monkeypatch, ring, queue):
+    assert pp_push.rpc_ring_chunks(8, 4) == 4 * 12 + 8
+    _bare_executor_cls(monkeypatch)
+    pp_push.patch_executor_for_pp_handoff(_config(8))
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8, 4)
+
+
+def test_the_ring_widens_the_worker_rings_for_its_steps(monkeypatch, ring, queue):
+    from vllm.config import VllmConfig
+
     pp_push.widen_message_rings(_config(4))
-    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(4)
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(
+        4, pp_push.ring_extra_steps(4)
+    )
+    # the worker's config counts the extra steps as the engine's does
+    steps = VllmConfig.max_concurrent_batches.fget
+    assert steps(_engine_config(4, async_scheduling=False)) == 4 + 2
     # the depth caps a stage's send queue, not the engine's steps in flight
     monkeypatch.setenv("TPU_PP_RING_DEPTH", "4")
     pp_push.widen_message_rings(_config(8))
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(
+        8, pp_push.ring_extra_steps(8)
+    )
+    # the wave keeps vLLM's steps in flight
+    monkeypatch.setattr(pp_push, "_ring_chunks_needed", 0)
+    monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
+    pp_push.widen_message_rings(_config(8))
     assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8)
+
+
+def _engine_config(pp, async_scheduling):
+    """A VllmConfig stand-in carrying what vLLM's max_concurrent_batches
+    reads."""
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        use_v2_model_runner=False,
+    )
+
+
+def test_the_ring_keeps_extra_steps_in_flight(monkeypatch, ring, queue):
+    from vllm.config import VllmConfig
+
+    vllm_steps = VllmConfig.max_concurrent_batches.fget
+    _bare_executor_cls(monkeypatch)
+    pp_push.patch_executor_for_pp_handoff(_config(8))
+    steps = VllmConfig.max_concurrent_batches.fget
+    assert steps(_engine_config(8, async_scheduling=False)) == 8 + 4
+    # async scheduling sizes the queue for its own overlap
+    overlapped = _engine_config(8, async_scheduling=True)
+    assert steps(overlapped) == vllm_steps(overlapped) == 8
+    # an engine of one stage keeps vLLM's count
+    single = _engine_config(1, async_scheduling=False)
+    assert steps(single) == vllm_steps(single) == 1
+
+
+def test_the_steps_in_flight_are_raised_once(monkeypatch, ring, queue):
+    from vllm.config import VllmConfig
+
+    _bare_executor_cls(monkeypatch)
+    pp_push.patch_executor_for_pp_handoff(_config(8))
+    raised = VllmConfig.max_concurrent_batches
+    # a later call keeps the one patch and the first call's extra steps
+    pp_push.patch_executor_for_pp_handoff(_config(8))
+    pp_push.patch_executor_for_pp_handoff(_config(4))
+    assert VllmConfig.max_concurrent_batches is raised
+    assert VllmConfig._tpu_pp_extra_steps == 4
+    assert raised.fget(_engine_config(8, async_scheduling=False)) == 12
 
 
 def _bare_executor_cls(monkeypatch):
@@ -399,9 +473,9 @@ def test_the_ring_installs_no_push_or_settle(monkeypatch, ring, queue):
     assert executor.take_draft_token_ids() is None
     assert executor.calls == []
     assert not getattr(executor_cls, "_tpu_pp_wave_patch", False)
-    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(4)
-    # the engine keeps vLLM's steps in flight
-    assert VllmConfig.max_concurrent_batches is dispatch_depth
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(4, 2)
+    # the engine keeps more steps in flight than vLLM's one per stage
+    assert VllmConfig.max_concurrent_batches is not dispatch_depth
 
 
 def test_an_executor_without_a_pipeline_keeps_its_own_calls(monkeypatch, queue):

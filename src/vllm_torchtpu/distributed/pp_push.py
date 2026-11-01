@@ -57,13 +57,16 @@ widest any pipeline in the process asked for.
 
 With ``TPU_PP_HANDOFF=ring`` the stages hand each forward on point to point
 as soon as it is done (``pp_ring``), so no step waits for later ones and
-the engine sends no pushes or settles. The engine keeps vLLM's ``stages``
-steps in flight, and the rings are widened as for the wave.
+the engine sends no pushes or settles. The engine keeps
+``ring_extra_steps`` more steps in flight than the pipeline has stages, so
+stage 0's next forward is already queued while the engine core prepares
+the following step, and the rings are widened for that count.
 ``patch_executor_for_pp_handoff`` installs the engine side the flag
 selects.
 """
 
 import contextlib
+from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any, cast
 
@@ -223,16 +226,31 @@ def wave_state(executor: Any) -> _WaveState:
     return state
 
 
-def rpc_ring_chunks(stages: int) -> int:
+def ring_extra_steps(stages: int) -> int:
+    """Steps the engine keeps in flight beyond the stage count under the
+    ring.
+
+    Stage 0 is the ring's feed: when the last stage samples a step, the
+    step that refills stage 0 reaches it only after the engine core has
+    updated, scheduled and sent it and the worker has prepared its inputs,
+    and stage 0 sits idle for that time every step. Each extra step queues
+    one more forward on stage 0's device, so that time overlaps a forward.
+    Half the stage count reached the floor on an eight-stage prefill
+    engine; one extra step recovered half of the gain.
+    """
+    return max(1, stages // 2)
+
+
+def rpc_ring_chunks(stages: int, extra: int = 0) -> int:
     """Messages each ring buffer between the engine and its workers must hold.
 
-    The engine keeps up to ``stages`` steps in flight, each of them two
-    calls (execute_model and sample_tokens), so a worker reads a step's
+    The engine keeps up to ``stages + extra`` steps in flight, each of them
+    two calls (execute_model and sample_tokens), so a worker reads a step's
     calls up to that many steps late and, with a KV connector, holds up to
     that many unread replies; a wait adds at most ``stages - 2`` pushes
     or one settle.
     """
-    return 4 * stages + 8
+    return 4 * (stages + extra) + 8
 
 
 # Messages every ring created in this process must hold: the widest any
@@ -240,13 +258,13 @@ def rpc_ring_chunks(stages: int) -> int:
 _ring_chunks_needed = 0
 
 
-def _widen_rpc_ring(stages: int) -> None:
+def _widen_rpc_ring(stages: int, extra: int = 0) -> None:
     """Give every ``MessageQueue`` created from now on, the engine's
     broadcast to its workers and each worker's reply ring, at least
-    ``rpc_ring_chunks(stages)`` messages; a deeper pipeline raises the
-    minimum, a shallower one leaves it."""
+    ``rpc_ring_chunks(stages, extra)`` messages; a deeper pipeline raises
+    the minimum, a shallower one leaves it."""
     global _ring_chunks_needed
-    _ring_chunks_needed = max(_ring_chunks_needed, rpc_ring_chunks(stages))
+    _ring_chunks_needed = max(_ring_chunks_needed, rpc_ring_chunks(stages, extra))
     from vllm.distributed.device_communicators import shm_broadcast
 
     cls = shm_broadcast.MessageQueue
@@ -268,13 +286,18 @@ def widen_message_rings(vllm_config: Any) -> None:
     """Widen the message rings this process will create for a pipeline.
 
     A worker calls it before vLLM builds the worker's reply ring; without a
-    pipeline it does nothing.
+    pipeline it does nothing. Under the ring the rings also hold the extra
+    steps the engine keeps in flight (``ring_extra_steps``), and the
+    worker's config counts them as the engine's does.
     """
     if vllm_config is None:
         return
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages > 1:
-        _widen_rpc_ring(stages)
+        extra = ring_extra_steps(stages) if ring_handoff() else 0
+        _widen_rpc_ring(stages, extra)
+        if extra:
+            _raise_steps_in_flight(extra)
 
 
 def ring_handoff() -> bool:
@@ -318,6 +341,39 @@ def _rides_the_wave(executor: Any) -> bool:
     return stages > 1 and not ring_handoff()
 
 
+def _raise_steps_in_flight(extra: int) -> None:
+    """Have ``VllmConfig.max_concurrent_batches`` count ``extra`` more steps
+    for a pipeline, so the engine keeps that many steps in flight beyond
+    its stages.
+
+    The engine core reads the property when it is built, so this runs from
+    the same places as the executor patch, before it. Pipelines of one
+    stage, and engines with async scheduling, which size the queue for
+    their own overlap, keep vLLM's count. Installed once per process: the
+    first call's ``extra`` stands for every engine the process builds.
+    """
+    from vllm.config import VllmConfig
+
+    if getattr(VllmConfig, "_tpu_pp_extra_steps", None) is not None:
+        return
+    original = cast(property, VllmConfig.max_concurrent_batches)
+    original_fget = cast(Callable[[Any], int], original.fget)
+
+    def max_concurrent_batches(self: Any) -> int:
+        steps = original_fget(self)
+        if (
+            self.parallel_config.pipeline_parallel_size > 1
+            and not self.scheduler_config.async_scheduling
+        ):
+            return steps + extra
+        return steps
+
+    VllmConfig.max_concurrent_batches = property(
+        max_concurrent_batches, doc=original.__doc__
+    )
+    VllmConfig._tpu_pp_extra_steps = extra
+
+
 def patch_executor_for_pp_handoff(vllm_config: Any) -> None:
     """Install the engine side of the hand-off ``TPU_PP_HANDOFF`` selects."""
     if ring_handoff():
@@ -327,8 +383,9 @@ def patch_executor_for_pp_handoff(vllm_config: Any) -> None:
 
 
 def patch_executor_for_pp_ring(vllm_config: Any) -> None:
-    """Install the ring hand-off's engine side: the wider ring buffers, and
-    draft tokens taken without asking the workers.
+    """Install the ring hand-off's engine side: the extra steps in flight,
+    the wider ring buffers, and draft tokens taken without asking the
+    workers.
 
     Does nothing without a pipeline; safe to call more than once per
     process.
@@ -338,7 +395,9 @@ def patch_executor_for_pp_ring(vllm_config: Any) -> None:
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages <= 1:
         return
-    _widen_rpc_ring(stages)
+    extra = ring_extra_steps(stages)
+    _widen_rpc_ring(stages, extra)
+    _raise_steps_in_flight(extra)
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
     if getattr(MultiprocExecutor, "_tpu_pp_ring_patch", False):
@@ -346,7 +405,8 @@ def patch_executor_for_pp_ring(vllm_config: Any) -> None:
     _install_take_draft_token_ids(MultiprocExecutor)
     MultiprocExecutor._tpu_pp_ring_patch = True
     logger.info(
-        "PP ring: engine side installed, message ring %d chunks",
+        "PP ring: engine side installed, %d steps in flight, message ring %d chunks",
+        stages + extra,
         _ring_chunks_needed,
     )
 

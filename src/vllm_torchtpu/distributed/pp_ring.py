@@ -67,7 +67,9 @@ that is the credit, a stage cannot send a forward before the next stage has
 taken up its step. At most ``depth`` forwards wait in a stage's queue, the
 one being sent included; end_forward blocks until there is room, which
 bounds the memory a stage that runs ahead holds for its outputs. The engine
-keeps vLLM's ``stages`` steps in flight, as with the wave (``pp_push``).
+keeps more steps in flight than the pipeline has stages
+(``pp_push.ring_extra_steps``), so stage 0 has its next forward queued
+while the engine core prepares the following step.
 
 Unlike the wave, nothing here needs the stages to issue the same launches:
 there is no prologue, the engine sends no pushes and no settles (``push``
@@ -121,8 +123,8 @@ def ring_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
     takes the next. A stage that sends also holds the receives of at most
     ``depth`` earlier forwards: end_forward waits while that many are
     unsent, and a forward is sent only after it has run on the data it
-    received. No stage holds more than the ``stages`` steps the engine keeps
-    in flight.
+    received. No stage holds more than the steps the engine keeps in
+    flight.
 
     At run time every device holds its posted receives to _MAX_RECEIVES,
     whether a step queues them ahead or a forward posts its own, so a step
