@@ -34,6 +34,7 @@ _DATA = (
     "serving/serve.sh",
     "serving/run_real_ckpt_smoke.py",
     "serving/mk-real-ckpt-smoke.yml",
+    "serving/acceptance_benchmark.py",
     "serving/BENCH.md",
 )
 
