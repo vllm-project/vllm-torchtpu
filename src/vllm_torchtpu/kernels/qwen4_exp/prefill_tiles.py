@@ -16,8 +16,9 @@ PAIRED_PAGE_VMEM_MIB = {128: 61, 256: 62}
 #  physical cache page shape, query dtype, cache dtype) -> (query block, KV tile).
 # T8192, contexts 0/8192, uniform/recent selections: Q256/KV256 reduced isolated
 # latency 22-37% relative to Q256/KV128 with FP32 attention accumulation.
-# The unified serving pool uses 1664-token pages (13 mask segments);
-# dedicated attention caches use 128. Both require segment-wise addressing.
+# The unified serving pool uses 1664-token pages (13 mask segments), and a
+# TP1 pipeline stage's 3200-token pages (25 segments); dedicated attention
+# caches use 128. All require segment-wise addressing.
 SPARSE_PREFILL_TILES = {
     (
         pltpu.ChipVersion.TPU_7X,
@@ -30,7 +31,7 @@ SPARSE_PREFILL_TILES = {
         "bfloat16",
         "float8_e4m3fn",
     ): (256, 256)
-    for page_size in (128, 1664)
+    for page_size in (128, 1664, 3200)
 }
 
 # Tensor-parallel ranks hold one KV head and 24 / TP query heads (TP8 Q3,
