@@ -14,12 +14,32 @@
 """Per-bucket sequence-parallel forwards for vLLM's DeepSeek-V2 family
 (TPU_MOE_PREFILL_SEQUENCE_PARALLEL; `layers/adapter/moe_prefill_sp.py`)."""
 
+from typing import TYPE_CHECKING, Optional
+
 import vllm_torchtpu.envs as envs
 
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
 
-def maybe_patch_deepseek_v2(*args: object, **kwargs: object) -> None:
-    """Install the forwards when the flag is set; import nothing otherwise."""
+# The architectures whose backbone is vLLM's DeepseekV2Model.
+DEEPSEEK_V2_BACKBONES = frozenset(
+    {"DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM", "GlmMoeDsaForCausalLM"}
+)
+
+
+def maybe_patch_deepseek_v2(
+    model_config: Optional["ModelConfig"] = None,
+) -> bool | None:
+    """Install the forwards when the flag is set and the model is one of
+    `DEEPSEEK_V2_BACKBONES`; import nothing otherwise. Without a model config
+    yet, decide at model load (False asks the registry to retry). A model the
+    split does not serve is left alone here and refused by `moe_prefill_sp.arm`.
+    """
     if not envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL:
+        return None
+    if model_config is None:
+        return False
+    if not DEEPSEEK_V2_BACKBONES & set(model_config.architectures or ()):
         return None
     from vllm_torchtpu.layers.adapter import moe_prefill_sp
 

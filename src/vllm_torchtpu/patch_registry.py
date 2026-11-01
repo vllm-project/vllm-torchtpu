@@ -154,6 +154,7 @@ PATCHES = (
     Patch(
         "vllm_torchtpu.models.vllm.deepseek_v2_patch:maybe_patch_deepseek_v2",
         ("platform_activation", "model_load"),
+        model_config=True,
     ),
 )
 

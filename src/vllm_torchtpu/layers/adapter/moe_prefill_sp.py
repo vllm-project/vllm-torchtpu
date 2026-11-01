@@ -399,7 +399,10 @@ def patched_model_forward(
 def install_forwards() -> None:
     """Install the per-bucket forwards (`models/vllm/deepseek_v2_patch.py`).
     Before the model is built: the compile wrapper binds the model's forward
-    at construction."""
+    at construction. Upstream's `use_sequence_parallel_moe` cannot be reused:
+    it is fixed per model at construction (it also sets the attention's
+    `reduce_results` and the shared expert's sharding), so it would apply to
+    every bucket, decode included, while the split is chosen per bucket."""
     deepseek_v2.DeepseekV2DecoderLayer.forward = patched_decoder_layer_forward
     deepseek_v2.DeepseekV2Model.forward = patched_model_forward
     logger.info("Applied TPU patch: per-bucket sequence-parallel MoE forwards.")
