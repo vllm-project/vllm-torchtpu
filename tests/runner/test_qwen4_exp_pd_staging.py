@@ -37,6 +37,12 @@ def flat_rows(c: np.ndarray) -> np.ndarray:
     return c.reshape(-1, ROWS, LANES)
 
 
+def scatter(pool, rows, page, logical, valid):
+    """The CPU stand-in for the serving path's aliased DMA scatter."""
+    page = jnp.where(valid, page, pool.shape[0])  # out of range: dropped
+    return pool.at[page, logical % pool.shape[1]].set(rows, mode="drop")
+
+
 def write_typed(rows: np.ndarray, values: np.ndarray, itemsize: int) -> None:
     """Reference writer: element e -> row e // per_row, Mosaic word order."""
     raw = values.view(np.uint8).reshape(-1, itemsize)
@@ -131,7 +137,7 @@ def test_repack_rank_slices(tp, dcp, chunk):
         fn = st.make_repack(
             src_block=src_block, dst_block=dst_block, src_gdn=s, dst_gdn=d,
             kv_head=rank.kv_head, v_head_start=r * d.v_heads,
-            channels=st.conv_channels(s, d, rank),
+            channels=st.conv_channels(s, d, rank), write=scatter,
         )
         # One program, or the serving path's fixed-size chunks (pool row 0
         # and staging row 0 are the null pages, as in serving).
