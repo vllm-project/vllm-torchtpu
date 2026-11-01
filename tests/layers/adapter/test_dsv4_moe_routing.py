@@ -221,6 +221,7 @@ def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
 
     model = DeepseekV4MoE.__new__(DeepseekV4MoE)
     torch.nn.Module.__init__(model)
+    model.defers_output_add = False
     model.gate = Gate(2, 2, bias=False)
     model.gate.weight.data.copy_(torch.tensor([[2.0, 0.0], [0.0, 3.0]]))
     config = VllmConfig(device_config=DeviceConfig(device="cpu"))
@@ -242,8 +243,9 @@ def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
             gate=model.gate,
         )
     with set_forward_context(None, config):
-        output = model(
+        output, routed = model(
             torch.tensor([[1.0, 2.0], [3.0, 4.0]]), input_ids=torch.tensor([1, 0])
         )
+    assert routed is None
     torch.testing.assert_close(output, torch.tensor([[3.0, 5.0], [18.0, 24.0]]))
     assert model.gate.calls == 1

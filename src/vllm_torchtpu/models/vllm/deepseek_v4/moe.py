@@ -95,8 +95,21 @@ class DeepseekV4MoE(nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
         assert config.n_routed_experts % self.tp_size == 0
 
+        # Leave the shared expert's output and the routed one for the consumer
+        # to add (the next mHC seam kernel): added here, the sum is a pass over
+        # both that waits for the routed combine's collective. Needs a shared
+        # output complete on this rank (no TP reduce), and not fp16, for which
+        # the runner scales the shared output instead. The runner then has no
+        # shared expert to fold into a decode kernel (moe_tp_decode, which
+        # needs TP over the whole world, so this only excludes one-chip runs).
+        self.defers_output_add = (
+            self.shared_experts is not None
+            and self.tp_size == 1
+            and vllm_config.model_config.dtype != torch.float16
+        )
+
         self.experts = FusedMoEFactory(
-            shared_experts=self.shared_experts,
+            shared_experts=None if self.defers_output_add else self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -106,7 +119,9 @@ class DeepseekV4MoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             scoring_func=self.scoring_func,
-            routed_scaling_factor=self.routed_scaling_factor,
+            routed_scaling_factor=1.0
+            if self.defers_output_add
+            else self.routed_scaling_factor,
             e_score_correction_bias=cast(
                 torch.Tensor | None, self.gate.e_score_correction_bias
             ),
@@ -143,8 +158,13 @@ class DeepseekV4MoE(nn.Module):
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """Forward pass executing router gate and fused expert computation."""
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Router gate and fused experts, as `(out, routed)`.
+
+        The layer's output is `add_output(out, routed)`: with
+        `defers_output_add`, `out` is the shared expert's output and `routed`
+        the routed experts'; otherwise `out` is the output and `routed` None.
+        """
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
@@ -155,5 +175,17 @@ class DeepseekV4MoE(nn.Module):
             router_logits=hidden_states,
             input_ids=input_ids,
         )
+        if not self.defers_output_add:
+            return final_hidden_states.view(org_shape), None
+        assert self.shared_experts is not None
+        shared_output = self.shared_experts(hidden_states)
+        return shared_output.view(org_shape), final_hidden_states.view(org_shape)
 
-        return final_hidden_states.view(org_shape)
+    def add_output(
+        self, out: torch.Tensor, routed: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The output `forward`'s `(out, routed)` stand for, summed as the MoE
+        runner sums the shared and routed outputs."""
+        if routed is None:
+            return out
+        return out + routed * self.routed_scaling_factor

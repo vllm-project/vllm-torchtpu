@@ -116,15 +116,26 @@ class _StubDecoderLayer(nn.Module):
         self.outputs: list[tuple[torch.Tensor, ...]] = []
 
     def forward(
-        self, x, positions, input_ids=None, post_mix=None, res_mix=None, residual=None
+        self,
+        x,
+        positions,
+        input_ids=None,
+        post_mix=None,
+        res_mix=None,
+        residual=None,
+        routed=None,
     ):
-        del positions, input_ids, post_mix, res_mix, residual
+        del positions, input_ids, post_mix, res_mix, residual, routed
         residual = x
         x = x * (self.idx + 2) + 1.0
         post_mix = torch.full_like(x, 0.5 * (self.idx + 1))
         res_mix = torch.full_like(x, 0.25 * (self.idx + 1))
         self.outputs.append((x, residual, post_mix, res_mix))
-        return x, residual, post_mix, res_mix
+        return x, residual, post_mix, res_mix, None
+
+    def ffn_output(self, x, routed):
+        assert routed is None
+        return x
 
 
 class _FakePostOp:

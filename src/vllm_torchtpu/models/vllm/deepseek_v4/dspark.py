@@ -272,17 +272,23 @@ class DSparkDeepseekV4Model(nn.Module):
         # Expand to hc_mult copies for hyper-connections ([T,H] -> [T,hc,H]).
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
-        residual = post_mix = res_mix = None
+        residual = post_mix = res_mix = routed = None
         for layer in self.layers:
-            hidden_states, residual, post_mix, res_mix = layer(
+            hidden_states, residual, post_mix, res_mix, routed = layer(
                 hidden_states,
                 positions,
                 input_ids,
                 post_mix,
                 res_mix,
                 residual,
+                routed,
             )
-        hidden_states = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
+        hidden_states = self.mhc_post_op(
+            self.layers[-1].ffn_output(hidden_states, routed),
+            residual,
+            post_mix,
+            res_mix,
+        )
         return mhc_collapse_head(
             hidden_states,
             self.hc_head_fn,

@@ -140,12 +140,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         """
         ops = self.__dict__.get("_mhc_ops_instance")
         if ops is None:
+            # `fused_add` adds the previous layer's deferred routed output; every
+            # layer's MoE reads its scale from the same config, so this one's.
             ops = get_mhc_ops(
                 self.rms_norm_eps,
                 self.hc_eps,
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
+                self.ffn.routed_scaling_factor,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops
@@ -173,13 +176,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        routed: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None
+    ]:
         """Defer each post into the next pre so the pair is one kernel.
 
         `x` arrives as the previous sublayer's raw output and the caller
         carries `(residual, post_mix, res_mix)` -- the recombine that output
-        still owes. The chain is opened by the layer-0 attention pre, which
-        has no preceding post, and closed by the caller.
+        still owes -- and `routed`, the routed half of an MoE output whose add
+        was deferred too (`ffn_output`). The chain is opened by the layer-0
+        attention pre, which has no preceding post, and closed by the caller.
         """
         if residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
@@ -187,9 +194,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             x, post_mix, res_mix = self.hc_pre(
                 x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
-        else:
+        elif routed is None:
             residual, post_mix, res_mix, x = self.mhc_ops.fused(
                 x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+            )
+        else:
+            residual, post_mix, res_mix, x = self.mhc_ops.fused_add(
+                x,
+                routed,
                 residual,
                 post_mix,
                 res_mix,
@@ -210,8 +228,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_base,
         )
         x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        return x, residual, post_mix, res_mix
+        x, routed = self.ffn(x, input_ids)
+        return x, residual, post_mix, res_mix, routed
+
+    def ffn_output(self, x: torch.Tensor, routed: torch.Tensor | None) -> torch.Tensor:
+        """The sublayer output that `forward`'s `(x, routed)` stand for."""
+        return self.ffn.add_output(x, routed)
 
 
 class _HostStagedParams:
@@ -445,26 +467,32 @@ class DeepseekV4Model(nn.Module):
         if input_ids is not None and self.start_layer < self.config.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
-        residual, post_mix, res_mix = None, None, None
+        residual, post_mix, res_mix, routed = None, None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states, residual, post_mix, res_mix = layer(
+            hidden_states, residual, post_mix, res_mix, routed = layer(
                 hidden_states,
                 positions,
                 moe_input_ids,
                 post_mix,
                 res_mix,
                 residual,
+                routed,
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the full hc-stream state and collapse it the
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
-                aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
+                aux_recon = self.mhc_post_op(
+                    layer.ffn_output(hidden_states, routed),
+                    residual,
+                    post_mix,
+                    res_mix,
+                )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
 
@@ -477,7 +505,10 @@ class DeepseekV4Model(nn.Module):
             else:
                 # Fused path: settle the post the last layer deferred.
                 hidden_states = self.mhc_post_op(
-                    hidden_states, residual, post_mix, res_mix
+                    self.layers[self.end_layer - 1].ffn_output(hidden_states, routed),
+                    residual,
+                    post_mix,
+                    res_mix,
                 )
 
         if not get_pp_group().is_last_rank:
