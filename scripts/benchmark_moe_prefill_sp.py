@@ -61,7 +61,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 AX = "d"
 H, INTER, E, K = 6144, 2048, 256, 8
 ROUTED_SCALE = 2.5
-SHARED_GROUP = 4  # as moe_prefill_sp.SHARED_GROUP
+SHARED_GROUP = 4  # TPU_MOE_PREFILL_SP_SHARED_GROUP's default
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
 

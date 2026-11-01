@@ -1131,11 +1131,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
     # Per bucket, for the backbone buckets of at least 1024 tokens of a
     # DeepSeek-V2-family MLA model with TP = EP (GLM-5.2): shard the residual
-    # stream over the TP group between attention and the MoE
-    # (`layers/adapter/moe_prefill_sp.py`). o_proj reduce-scatters, each rank
-    # routes only its contiguous 1/tp of the rows through the fused EP kernel
-    # (bf16 result wire) and a replicated shared expert, and the next layer
-    # all-gathers its normed input. Smaller buckets (decode) keep today's graph.
+    # stream over the TP group around the MoE (`layers/adapter/moe_prefill_sp.py`).
+    # o_proj reduce-scatters; each rank runs its contiguous 1/tp of the rows
+    # through the fused EP kernel (bf16 result wire) and a shared expert held
+    # TP within groups of TPU_MOE_PREFILL_SP_SHARED_GROUP ranks; the next layer
+    # all-gathers the outputs of its row-local input projections (fused_qkv_a,
+    # the indexer's wk/weights), not the hidden rows. Smaller buckets (decode)
+    # keep today's graph.
     "TPU_MOE_PREFILL_SEQUENCE_PARALLEL": env_bool(
         "TPU_MOE_PREFILL_SEQUENCE_PARALLEL", default=False
     ),
