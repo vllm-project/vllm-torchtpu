@@ -228,10 +228,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         """This rank's run of requests (`_runs`)."""
         return ctx.me // self.dcp if self.compressed_dcp else ctx.me
 
-    def _gather_runs(self, ctx: Any, send: Any, recv: Any, ssem: Any, rsem: Any) -> None:
+    def _gather_runs(
+        self, ctx: Any, send: Any, recv: Any, ssem: Any, rsem: Any, own_rank: bool = False
+    ) -> None:
         """All-gather every run's `send` into `recv [runs, ...]` (slot = run). Under
         `compressed_dcp` both ranks of a pair hold their run's results; only pair rank 0 sends
-        them, to every rank outside the pair, so `recv` holds one slot per run."""
+        them, to every rank outside the pair, so `recv` holds one slot per run. `own_rank`:
+        each pair rank holds the part for its pair rank (its own union) and sends it to the
+        ranks of the same pair rank."""
         ex, me = ctx.ex, ctx.me
         recv[self._run(ctx)] = send[...]
         if ex.R == 1:
@@ -248,6 +252,15 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             )
             for off in range(D, ex.R)  # me ^ off with off < D is the pair itself
         }
+        if own_rank:
+            mine = [d for off, d in descs.items() if off % D == 0]
+            for d in mine:
+                d.start()
+            for d in mine:
+                d.wait_recv()
+            for d in mine:
+                d.wait_send()
+            return
         lead = jax.lax.rem(me, D) == 0
 
         @pl.when(lead)
@@ -447,12 +460,39 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             )
             if cdcp:
                 ids = self._cdcp_gid(ctx, ids)
-            sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
-            bits = jnp.where(ids < nv, sc, -1)
-            with ctx.stream.sc("qsa_thr", 2):
-                thr, tmax = ix.thresholds(bits, ids, nv, K, G)
-            scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
-            scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
+            if cdcp and n % self.dcp == 0:
+                # Both pair ranks hold every row's scores: each finds the thresholds of its
+                # share of the rows (the bisection is most of the selection) and the pair swaps
+                # them (rows are disjoint across requests: no overwrite hazard).
+                h = n // self.dcp
+                o = jax.lax.rem(ctx.me, self.dcp) * h
+                rid_h = jax.lax.broadcasted_iota(I32, (h, 1, 1), 0)
+                nv_h = jnp.zeros((h, 1, 1), I32)
+                for i in range(h):
+                    nv_h = jnp.where(rid_h == i, ctx.extra[NVIS][lo + o + i], nv_h)
+                ids_h = ids[:h]
+                sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32)
+                with ctx.stream.sc("qsa_thr", 2):
+                    thr, tmax = ix.thresholds(jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G)
+                scr["qi_th"][pl.ds(lo + o, h)] = jnp.broadcast_to(thr, (h, 1, 128))
+                scr["qi_tm"][pl.ds(lo + o, h)] = jnp.broadcast_to(tmax, (h, 1, 128))
+                with ctx.stream.sc("qsa_cdcp_thx", 2):
+                    xs = [
+                        pltpu.make_async_remote_copy(
+                            src_ref=scr[k].at[pl.ds(lo + o, h)], dst_ref=scr[k].at[pl.ds(lo + o, h)],
+                            send_sem=scr["qx_ssem"].at[1], recv_sem=scr["qx_rsem"].at[1],
+                            device_id=(ctx.me ^ 1,), device_id_type=pl.DeviceIdType.MESH,
+                        )
+                        for k in ("qi_th", "qi_tm")
+                    ]
+                    ctx.comm.exchange(xs)
+            else:
+                sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
+                bits = jnp.where(ids < nv, sc, -1)
+                with ctx.stream.sc("qsa_thr", 2):
+                    thr, tmax = ix.thresholds(bits, ids, nv, K, G)
+                scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
+                scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
             scr["qi_nv"][pl.ds(lo, n)] = jnp.broadcast_to(nv, (n, 1, 128))
             consts = ix.compact_consts(S, K)
             lid = consts[-1]
@@ -516,15 +556,19 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     )
                     if cdcp:  # each rank's groups are one ascending half: ids map in order
                         gidx = self._cdcp_gid(ctx, gidx)
-                    for r in range(D):
+                    # Under `compressed_dcp` both pair ranks hold the request: each builds only
+                    # its own union (the one it attends), and `_exchange_unions` sends it to the
+                    # ranks of the same pair rank.
+                    for r in [jax.lax.rem(ctx.me, D)] if cdcp else range(D):
                         code = code_all if D == 1 else jnp.where(
                             jax.lax.rem(gidx // gpp, D) == r, code_all, 0
                         )
                         ids, codes, nu = ua.compact_union(code, KU, ua.union_consts(S, KU))
                         if cdcp:
                             ids = self._cdcp_gid(ctx, ids)
-                        scr["qu_id"][lo // T, :, pl.ds(r * KU, KU)] = ids
-                        scr["qu_cd"][lo // T, :, pl.ds(r * KU, KU)] = codes
+                        at = pl.multiple_of(r * KU, 128) if cdcp else r * KU
+                        scr["qu_id"][lo // T, :, pl.ds(at, KU)] = ids
+                        scr["qu_cd"][lo // T, :, pl.ds(at, KU)] = codes
                         scr["qu_n"][lo // T, r] = jnp.sum(nu)
         self.load_tables(ctx, l)
         npr = self._shard_rows(ex)[0] if self.shard_index else nreq
@@ -700,7 +744,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return carry
 
         jax.lax.fori_loop(0, npr, pack, 0)
-        self._gather_runs(ctx, scr["qgu_send"], scr["qgu_recv"], scr["qgu_ssem"], scr["qgu_rsem"])
+        self._gather_runs(
+            ctx, scr["qgu_send"], scr["qgu_recv"], scr["qgu_ssem"], scr["qgu_rsem"], own_rank=True
+        )
 
         def unpack(q: Any, carry: Any) -> Any:
             o = q // npr

@@ -313,8 +313,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
             ScratchReq("qi_sem", pltpu.SemaphoreType.DMA((3,))),
             *(
                 [
-                    ScratchReq("qx_ssem", pltpu.SemaphoreType.DMA((1,))),
-                    ScratchReq("qx_rsem", pltpu.SemaphoreType.DMA((1,))),
+                    ScratchReq("qx_ssem", pltpu.SemaphoreType.DMA((2,))),
+                    ScratchReq("qx_rsem", pltpu.SemaphoreType.DMA((2,))),
                     ScratchReq("qx_credit", pltpu.SemaphoreType.REGULAR((1,))),
                 ]
                 if self.compressed_dcp
