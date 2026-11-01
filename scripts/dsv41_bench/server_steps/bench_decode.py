@@ -22,6 +22,15 @@ from server_step_worker import SCENARIOS
 _FIXED_ACCEPTED_TOKENS_PER_REQUEST_STEP = 3.47
 
 
+def expected_prefix_hit(prefix_tokens: int, extend_tokens: int, alignment: int) -> int:
+    if alignment <= 0:
+        raise ValueError("Prefix-hit alignment must be positive")
+    # Exact-prefix requests must compute at least their final token. Extensions
+    # may reuse the whole aligned prefix; neither may assume a fixed page size.
+    limit = prefix_tokens if extend_tokens else prefix_tokens - 1
+    return limit // alignment * alignment
+
+
 def client_main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=["decode"], default="decode")
@@ -209,12 +218,21 @@ def client_main(argv: list[str]) -> None:
         ):
             raise ValueError("Missing preemption metric or nonzero preemptions")
         hits = delta.get("vllm:prefix_cache_hits_total", -1)
-        # Hybrid compressed KV groups align cache hits to 256 logical tokens,
-        # despite --block-size 16. An exact-prefix prompt leaves its last hash
-        # unit uncached; an extension can reuse the complete 64k prefix.
-        expected_hit = scenario.prefix_tokens - (0 if scenario.extend_tokens else 256)
+        # Read finalized cache geometry from every worker, not from observed
+        # hit metrics: changing --block-size changes the scheduler alignment.
+        alignments = {
+            rank["prefix_hit_alignment"] for rank in rank_results(setup["results"])
+        }
+        if len(alignments) != 1:
+            raise ValueError(f"DP ranks disagree on prefix-hit alignment: {alignments}")
+        expected_hit = expected_prefix_hit(
+            scenario.prefix_tokens, scenario.extend_tokens, alignments.pop()
+        )
         if hits != scenario.concurrency * expected_hit:
-            raise ValueError(f"Prefix-hit invariant failed: {hits}")
+            raise ValueError(
+                f"Prefix-hit invariant failed: {hits}; "
+                f"expected {scenario.concurrency * expected_hit}"
+            )
         with args.server_log.open() as stream:
             stream.seek(log_offset)
             round_log = stream.read()

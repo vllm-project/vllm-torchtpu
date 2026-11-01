@@ -51,6 +51,7 @@ def test_cached_recipe_selects_policy_without_kernel_env(tmp_path):
         k.startswith(("TPU_DEEPSEEK_V41_", "MOE_", "USE_MOE_")) for k in output["env"]
     )
     assert json.loads(argv[-1])["compile_sizes"] == [24, 128, 256, 2048]
+    assert argv.count("--compilation-config") == 1
 
 
 @pytest.mark.parametrize("model_uri", ["", "gs://test-models/DeepSeek-V4.1-Flash"])

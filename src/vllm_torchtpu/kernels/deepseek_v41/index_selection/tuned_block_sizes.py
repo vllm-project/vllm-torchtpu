@@ -13,6 +13,12 @@ SCORE_WINDOW = 32768
 QUERY_TILE = 128
 KEY_TILE = 2048
 
+# Full-context paged indexer: (key columns, query rows). Two 32K SparseCore
+# slices cover up to 128K uncompressed tokens at compression ratio 2. On v7x,
+# 128 and 256 query rows have comparable latency; 128 uses half the score HBM
+# (32 MiB). Longer contexts retain the bounded 32-row pipeline.
+PAGED_INDEXER_PREFILL_BUCKET = (65536, 128)
+
 # Measured candidate-union and gather policies. Keep these separate from
 # hardware lane widths and the packed-key format.
 CANDIDATE_DENSE_UNION_MAX_BLOCKS = 16384
@@ -55,6 +61,8 @@ class PersistentScoreConfig:
 
 
 PERSISTENT_SCORE_CONFIGS: dict[tuple[int, ...], PersistentScoreConfig] = {
+    (6, 32, 128, 65536, 1): PersistentScoreConfig(99328, 1024, 32),
+    (6, 32, 128, 131072, 1): PersistentScoreConfig(99328, 1024, 32),
     (6, 32, 128, 65536, 2): PersistentScoreConfig(99328, 1024, 32),
     (6, 32, 128, 131072, 2): PersistentScoreConfig(99328, 1024, 32),
 }
@@ -80,6 +88,8 @@ class DecodeTuningKey:
 # Calibrated at R48 on TPU7x, JAX 0.10.2 / libtpu 0.0.47; DSpark K5.
 # Seeds 517/519, effective lengths 49408/98816; all other options default.
 DECODE_REQUEST_TILES: dict[DecodeTuningKey, int] = {
+    DecodeTuningKey("TPU7x", 6, 32, 65536, 128, 512, 1): 12,
+    DecodeTuningKey("TPU7x", 6, 32, 131072, 128, 512, 1): 16,
     DecodeTuningKey("TPU7x", 6, 32, 65536, 128, 512, 2): 12,
     DecodeTuningKey("TPU7x", 6, 32, 131072, 128, 512, 2): 16,
 }

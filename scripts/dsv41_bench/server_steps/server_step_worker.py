@@ -9,6 +9,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import socket
 import time
 from dataclasses import asdict, dataclass
@@ -446,7 +447,21 @@ class ServerStepWorker:
         recorder.in_flight = 0
         recorder.enabled = True
         _ACTIVE = recorder
-        return _gather_dp({"rank": recorder.rank, "scenario": selected.to_dict()})
+        cache = self.model_runner.kv_cache_config
+        if cache is None:
+            raise RuntimeError("Benchmark requires initialized KV cache groups")
+        # TP1/DP8 has no context sharding or Mamba partial hash hits; vLLM
+        # aligns prefix hits to the LCM of the finalized group block sizes.
+        prefix_hit_alignment = math.lcm(
+            *(group.kv_cache_spec.block_size for group in cache.kv_cache_groups)
+        )
+        return _gather_dp(
+            {
+                "rank": recorder.rank,
+                "scenario": selected.to_dict(),
+                "prefix_hit_alignment": prefix_hit_alignment,
+            }
+        )
 
     def benchmark_end(self) -> list[dict]:
         global _ACTIVE

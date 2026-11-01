@@ -20,6 +20,31 @@ pytestmark = pytest.mark.cpu_test
 
 
 @pytest.mark.parametrize(
+    "prefix,extend,alignment,expected",
+    [
+        (98304, 0, 256, 98048),
+        (98304, 0, 512, 97792),
+        (98304, 16384, 512, 98304),
+        (98305, 0, 512, 98304),
+        (98305, 16384, 512, 98304),
+    ],
+)
+def test_decode_prefix_hits_follow_finalized_cache_alignment(
+    prefix, extend, alignment, expected
+):
+    from bench_decode import expected_prefix_hit
+
+    assert expected_prefix_hit(prefix, extend, alignment) == expected
+
+
+def test_decode_prefix_hit_rejects_invalid_alignment():
+    from bench_decode import expected_prefix_hit
+
+    with pytest.raises(ValueError, match="alignment must be positive"):
+        expected_prefix_hit(98304, 0, 0)
+
+
+@pytest.mark.parametrize(
     "scenario,rounds,buckets",
     [("encoder_extend", 5, [128, 2048]), ("decode", 1, [288, 2048])],
 )
@@ -190,7 +215,13 @@ def test_prefill_keeps_formal_warmup_but_skips_duplicate_profile_warmup(
                 }
             )
         controls.append(url)
-        return response({"results": [{"rank": rank} for rank in range(8)]})
+        return response(
+            {
+                "results": [
+                    {"rank": rank, "prefix_hit_alignment": 16} for rank in range(8)
+                ]
+            }
+        )
 
     def metrics(*args, **kwargs):
         hits = sum(16 for r in requests if len(r["prompt"]) == 32)

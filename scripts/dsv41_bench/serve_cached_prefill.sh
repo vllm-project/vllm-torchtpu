@@ -37,9 +37,8 @@ exec vllm serve "$model" \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
   --engram-config '{"cpu_offload":true}' \
   --additional-config '{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}' \
-  --block-size 16 \
+  --block-size 64 \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
   "${server_args[@]}" \
-  --compilation-config "{\"compile_sizes\":[128,256,$chunk]}" \
   --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"model\":\"$model\"}" \
   "$@"
