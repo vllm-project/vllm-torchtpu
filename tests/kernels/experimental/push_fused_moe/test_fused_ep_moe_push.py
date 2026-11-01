@@ -19,10 +19,9 @@ the activation all-gather becomes a SparseCore pre-push of the first
 exchange may run as a TensorCore remote-DMA kernel, and the combine folds
 the arrival-scale lookup in. So the gate is the layer's output against
 `fused_ep_moe_v2` on the same inputs (which tests/kernels/fused_moe holds to
-a dense reference), over every dispatch split, both routing exchanges, both
-slab builds (push from VMEM / through the contribution slab) and both
-served weight formats, with a rotated-expert control so a band this tight
-still means the right experts ran.
+a dense reference), bit for bit, over every dispatch split, both routing
+exchanges, both slab builds (push from VMEM / through the contribution slab)
+and both served weight formats, with a rotated-expert control.
 
 Every test needs the eight-way expert-parallel slice (8 JAX devices, e.g. a
 tpu7x 2x2x1 host); on anything else the module skips at setup.
@@ -60,13 +59,9 @@ FP8 = jnp.float8_e4m3fn
 TOPK = 4
 TOKENS = 256
 
-# Push and v2 run the same plan, FFN and combine on the same quantized rows;
-# what may differ is the combine's f32 association (the push combine folds
-# the arrival scale into its scalar loop). Bands far under the fp8 wire's
-# 0.06 / 0.075 against the dense reference, and the rotated control must sit
-# far outside them.
-PARITY_BOUND = 1e-3
-PARITY_TOKEN_BOUND = 5e-3
+# Push and v2 run the same plan, FFN and combine arithmetic on the same
+# quantized rows, so the outputs must be bit-identical (measured on tpu7x
+# for every case here); the rotated control must sit far from them.
 CONTROL_BOUND = 0.1
 
 
@@ -118,14 +113,6 @@ def _rel(a, b):
     return float(np.linalg.norm(a - b) / np.linalg.norm(b))
 
 
-def _worst_token(a, b):
-    a = np.asarray(a, np.float64)
-    b = np.asarray(b, np.float64)
-    scale = np.linalg.norm(b, axis=-1)
-    per = np.linalg.norm(a - b, axis=-1) / np.where(scale == 0, 1.0, scale)
-    return float(per.max())
-
-
 def _roll(weights):
     w1, w2, s1, s2 = weights
     return (
@@ -153,10 +140,7 @@ def _check_parity(weights, common, *, sc_prepush, tc_exchange, ragged_stride):
     got = fused_ep_moe_push(
         x, *weights, gating, sc_prepush=sc_prepush, tc_exchange=tc_exchange, **kw
     )
-    rel, worst = _rel(got, want), _worst_token(got, want)
-    exact = bool(np.array_equal(np.asarray(got), np.asarray(want)))
-    print(f"push vs v2: rel {rel:.3g} worst token {worst:.3g} bit-exact {exact}")
-    assert rel < PARITY_BOUND and worst < PARITY_TOKEN_BOUND
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     wrong = fused_ep_moe_v2(x, *_roll(weights), gating, **kw)
     assert _rel(got, wrong) > CONTROL_BOUND
 
@@ -297,9 +281,7 @@ def test_expert_layout_serves_the_same_tokens_and_counts_its_rows():
         **common,
     )
     plain = fused_ep_moe_push(x, *logical, gating, **common)
-    rel, worst = _rel(out, plain), _worst_token(out, plain)
-    print(f"layout vs unplaced: rel {rel:.3g} worst token {worst:.3g}")
-    assert rel < PARITY_BOUND and worst < PARITY_TOKEN_BOUND
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(plain))
     wrong = fused_ep_moe_push(x, *_roll(logical), gating, **common)
     assert _rel(out, wrong) > CONTROL_BOUND
     g = np.asarray(gating)
