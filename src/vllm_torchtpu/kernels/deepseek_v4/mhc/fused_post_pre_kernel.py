@@ -24,8 +24,24 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
 
-def _fused_kernel(
-    x_ref,
+def _fused_kernel(x_ref, *refs, **params):
+    """One token block: recombine, store once, 3-pass GEMM, collapse."""
+    _fused_block(x_ref[...], *refs, **params)
+
+
+def _fused_add_kernel(x_ref, addend_ref, *refs, addend_scale, **params):
+    """`_fused_kernel` of the sublayer output `x + addend * addend_scale`.
+
+    Rounds the scaled addend and the sum to bf16, as the bf16 expression does.
+    """
+    f32, bf16 = jnp.float32, jnp.bfloat16
+    scaled = (addend_ref[...].astype(f32) * addend_scale).astype(bf16)
+    x_bf = (x_ref[...].astype(f32) + scaled.astype(f32)).astype(bf16)
+    _fused_block(x_bf, *refs, **params)
+
+
+def _fused_block(
+    x_bf,
     res_ref,
     post_ref,
     comb_ref,
@@ -51,8 +67,8 @@ def _fused_kernel(
     hc_post_mult_value,
     sinkhorn_repeat,
 ):
-    """One token block: recombine, store once, 3-pass GEMM, collapse; the
-    last block then runs the post/comb gates for every token."""
+    """`_fused_kernel`'s body, given the block's (tb, hidden) bf16 sublayer
+    output `x_bf`."""
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
 
@@ -60,7 +76,6 @@ def _fused_kernel(
     # values instead of 4 held f32 copies halves the resident working set,
     # leaving VMEM headroom for the pipeline to prefetch the next block.
     # bf16 -> f32 casts are exact, so results are unchanged.
-    x_bf = x_ref[...]  # (tb, hidden) bf16
     old_bf = [
         res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
     ]
@@ -124,6 +139,7 @@ def _fused_kernel(
         "hc_sinkhorn_eps",
         "hc_post_mult_value",
         "sinkhorn_repeat",
+        "addend_scale",
         "token_block_size",
         "gemm_precision",
         "vmem_limit_bytes",
@@ -143,6 +159,8 @@ def fused_post_pre_gates(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
+    addend: jax.Array | None = None,
+    addend_scale: float = 1.0,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -163,6 +181,10 @@ def fused_post_pre_gates(
         hc_pre_eps: static; additive floor on the sigmoid pre gates.
         hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat: static;
             the post/comb gate constants of ``utils.mhc_pre_gates``.
+        addend: optional (num_tokens, hidden_size), bfloat16. When given,
+            the sublayer output is `x2d + addend * addend_scale`, rounded
+            as that bf16 expression is.
+        addend_scale: static; the addend's scale.
         token_block_size: tokens per grid step. Default 32 keeps the
             worst-case VMEM footprint (f32 old streams + bf16 blocks +
             the three resident bf16 fn chunks) near 12 MB at DeepSeek-V4
@@ -179,6 +201,7 @@ def fused_post_pre_gates(
         layer2d: (num_tokens, hidden_size), bfloat16.
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
+    assert addend is None or addend.dtype == jnp.bfloat16, addend.dtype
     assert res2d.dtype == jnp.bfloat16, res2d.dtype
     assert post2d.dtype == jnp.float32, post2d.dtype
     assert comb2d.dtype == jnp.float32, comb2d.dtype
@@ -189,6 +212,7 @@ def fused_post_pre_gates(
     hc_mult = hc_hidden // hidden_size
     hc_mult3 = fn.shape[0]
     assert res2d.shape == (num_tokens, hc_mult * hidden_size)
+    assert addend is None or addend.shape == x2d.shape, (addend.shape, x2d.shape)
     assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, res2d.shape)
     assert gemm_precision in ("highest", "default"), gemm_precision
 
@@ -196,6 +220,11 @@ def fused_post_pre_gates(
     # budget at DeepSeek-V4 shapes, so there is no vmem_need to shrink by.
     tb, padded_tokens = utils.select_token_block(num_tokens, token_block_size)
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
+    if addend is None:
+        kernel, x_inputs = _fused_kernel, (x2d,)
+    else:
+        kernel = functools.partial(_fused_add_kernel, addend_scale=addend_scale)
+        x_inputs = (x2d, *utils.pad_to(padded_tokens, addend))
 
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
@@ -209,12 +238,13 @@ def fused_post_pre_gates(
     )
 
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
+    x_spec = pl.BlockSpec((tb, hidden_size), lambda i: (i, 0))
     gate_specs, gate_shapes, gate_scratch = utils.post_comb_gates_specs(
         padded_tokens, hc_mult
     )
     new_res, post, comb, layer2d = pl.pallas_call(
         functools.partial(
-            _fused_kernel,
+            kernel,
             hc_mult=hc_mult,
             hidden_size=hidden_size,
             gemm_precision=gemm_precision,
@@ -226,7 +256,7 @@ def fused_post_pre_gates(
         ),
         grid=(padded_tokens // tb,),
         in_specs=[
-            pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
+            *[x_spec] * len(x_inputs),
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
@@ -248,7 +278,7 @@ def fused_post_pre_gates(
         ],
         scratch_shapes=gate_scratch,
         compiler_params=compiler_params,
-    )(x2d, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
+    )(*x_inputs, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],
@@ -270,12 +300,17 @@ def mhc_fused_post_pre(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
+    addend: jax.Array | None = None,
+    addend_scale: float = 1.0,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Fused seam op: one Pallas post+GEMM+collapse+gates kernel.
     Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur).
+
+    With `addend`, the sublayer output is `x + addend * addend_scale`; see
+    `fused_post_pre_gates`.
     """
     assert residual.dtype == jnp.bfloat16
 
@@ -286,6 +321,7 @@ def mhc_fused_post_pre(
     res2d = residual.reshape(-1, hc_mult * hidden_size)
     post2d = post_layer_mix.reshape(-1, hc_mult)
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
+    addend2d = None if addend is None else addend.reshape(-1, hidden_size)
 
     new_res2d, post_mix_cur, comb_mix_cur, layer_input_cur = fused_post_pre_gates(
         x2d,
@@ -300,6 +336,8 @@ def mhc_fused_post_pre(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        addend=addend2d,
+        addend_scale=addend_scale,
         token_block_size=token_block_size,
         gemm_precision=gemm_precision,
         vmem_limit_bytes=vmem_limit_bytes,

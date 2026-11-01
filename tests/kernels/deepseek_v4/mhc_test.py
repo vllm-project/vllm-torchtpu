@@ -477,6 +477,46 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
             np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
 
 
+# DeepSeek-V4's routed_scaling_factor, the scale the model adds with.
+ADDEND_SCALE = 1.5
+
+
+@pytest.mark.tpu_test
+class MhcFusedPostPreAddPallasTpuTest(parameterized.TestCase):
+    """The seam kernel's in-kernel add vs the same kernel on the sum.
+    Needs TPU hardware."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(num_tokens=[16, 17, 1024], token_block_size=[32])
+    def test_matches_fused_of_bf16_sum(self, num_tokens, token_block_size):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        args = _fused_args(np.random.default_rng(11), num_tokens, 4096)
+        x = args[0]
+        addend = jnp.asarray(
+            np.random.default_rng(12).standard_normal(x.shape, dtype=np.float32)
+        ).astype(jnp.bfloat16)
+        # numpy's bfloat16 rounds after every op, like the served bf16 add.
+        x_np, addend_np = np.asarray(x), np.asarray(addend)
+        summed = jnp.asarray(x_np + addend_np * addend_np.dtype.type(ADDEND_SCALE))
+        fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
+
+        want = fused_fn(summed, *args[1:], token_block_size=token_block_size)
+        got = fused_fn(
+            *args,
+            addend=addend,
+            addend_scale=ADDEND_SCALE,
+            token_block_size=token_block_size,
+        )
+
+        for g, w in zip(got, want):
+            np.testing.assert_array_equal(_to_np(g), _to_np(w))
+
+
 @pytest.mark.tpu_test
 class MhcPreMixesPallasSmallShapeTest(parameterized.TestCase):
     """Mix-GEMM kernel vs the jnp oracle at small shapes and ragged
