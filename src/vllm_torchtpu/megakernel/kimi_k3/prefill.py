@@ -81,7 +81,7 @@ from vllm_torchtpu.megakernel.program import (
 logger = init_logger(__name__)
 
 AXIS = "k3_sp"
-WINDOWS = (512, 1024, 2048, 4096, 8192)
+WINDOWS = (512, 1024, 2048, 4096, 8192, 16384)
 PAGE_TOKENS = 256
 SLOTS = 16  # sequences per window, at most (and at most one per page)
 GROUP_PAIRS = 11  # regular 8-layer groups: layers 4..91
@@ -281,10 +281,15 @@ class PrefillProgram:
         capacity: int,
         slots: int,
         page_tokens: int = PAGE_TOKENS,
+        *,
+        has_draft: bool = False,
+        compute_logits: bool = True,
     ) -> None:
         self.windows = tuple(sorted(int(w) for w in windows))
         self.capacity, self.slots = int(capacity), int(slots)
         self.page_tokens = int(page_tokens)
+        self.has_draft = bool(has_draft)
+        self.compute_logits = bool(compute_logits)
         self._kernels, self._rank_loader = kernel_modules(
             "prefill_megakernel", "rank_loader"
         )
@@ -417,7 +422,7 @@ class PrefillProgram:
             unroll=True,
             segments=count,
             prefix_capacity=self.capacity,
-            tap_layer=3,  # the MLA DSpark draft's aux layer 3
+            tap_layer=3 if self.has_draft else None,
         )
         regular = self._kernels.make_regular_group8_sp_indexed(
             mesh,
@@ -425,6 +430,7 @@ class PrefillProgram:
             mla_flash_tile=256,
             segments=count,
             prefix_capacity=self.capacity,
+            with_taps=self.has_draft,
         )
         final = self._kernels.make_final_mla_sp_indexed(
             mesh,
@@ -433,10 +439,19 @@ class PrefillProgram:
             segments=count,
             prefix_capacity=self.capacity,
         )
-        logits_op = self._kernels.make_prefill_logits_sp(
-            mesh, seq_len=window, layers=NUM_LAYERS, segments=count
+        logits_op = (
+            self._kernels.make_prefill_logits_sp(
+                mesh, seq_len=window, layers=NUM_LAYERS, segments=count
+            )
+            if self.compute_logits
+            else None
         )
         weight_groups = ("common", "kda", "mla", "moe")
+        final_groups = (
+            ("io", "common", "mla", "moe")
+            if self.compute_logits
+            else ("common", "mla", "moe")
+        )
         state_sharding = jax.sharding.NamedSharding(mesh, sharded)
         counting = bool(active().prefill_route_counts)
         local_experts = 896 // active().prefill_expert_parallel
@@ -469,7 +484,7 @@ class PrefillProgram:
             route = (
                 zeros((NUM_LAYERS - 1, local_experts), jnp.int32) if counting else None
             )
-            prefix, blocks, kda_state, mla_state, tap, *routes = first(
+            first_out = first(
                 hidden,
                 w["common"],
                 w["kda"],
@@ -482,7 +497,11 @@ class PrefillProgram:
                 arena=arena,
                 route=route,
             )
-            return (prefix, blocks, *kda_state, *mla_state, *routes, tap)
+            if self.has_draft:
+                prefix, blocks, kda_state, mla_state, tap, *routes = first_out
+                return (prefix, blocks, *kda_state, *mla_state, *routes, tap)
+            prefix, blocks, kda_state, mla_state, *routes = first_out
+            return (prefix, blocks, *kda_state, *mla_state, *routes)
 
         # prefix, blocks, rec, hist, rec_at, hist_at, latents[, route counts]
         state_specs = (sharded,) * (7 + nroute)
@@ -496,7 +515,7 @@ class PrefillProgram:
             + (sharded,) * 2
             + prefix_specs(1)
             + (sharded,) * self._count("io", *weight_groups),
-            state_specs + (sharded,),  # then the stream entering layer 3
+            state_specs + ((sharded,) if self.has_draft else ()),
             donate_argnums=(3, 4),
             export_key=self._export_key(f"{name}_first", window),
         )
@@ -514,7 +533,7 @@ class PrefillProgram:
             routes, (length, pair, segments, *args) = rest[:nroute], rest[nroute:]
             arena, args = split(args, 2)
             w, _ = self._unflat(args, *weight_groups)
-            prefix, blocks, kda_state, mla_state, middle, tap, *routes = regular(
+            reg_out = regular(
                 prefix,
                 blocks,
                 w["common"],
@@ -529,7 +548,11 @@ class PrefillProgram:
                 arena=arena,
                 route=routes[0] if routes else None,
             )
-            return (prefix, blocks, *kda_state, *mla_state, *routes, middle, tap)
+            if self.has_draft:
+                prefix, blocks, kda_state, mla_state, middle, tap, *routes = reg_out
+                return (prefix, blocks, *kda_state, *mla_state, *routes, middle, tap)
+            prefix, blocks, kda_state, mla_state, *routes = reg_out
+            return (prefix, blocks, *kda_state, *mla_state, *routes)
 
         ops["group"] = register_global_op(
             self._op_name(f"{name}_group8", window),
@@ -539,9 +562,7 @@ class PrefillProgram:
             + (replicated,) * 3
             + prefix_specs(2)
             + (sharded,) * self._count(*weight_groups),
-            # then the streams between its two groups and entering its last
-            # group's third layer
-            state_specs + (sharded,) * 2,
+            state_specs + ((sharded,) * 2 if self.has_draft else ()),
             donate_argnums=tuple(range(7 + nroute)),
             export_key=self._export_key(f"{name}_group", window),
         )
@@ -549,7 +570,7 @@ class PrefillProgram:
         def run_final(prefix, blocks, latents, *rest):
             routes, (length, segments, *args) = rest[:nroute], rest[nroute:]
             arena, args = split(args, 1)
-            w, _ = self._unflat(args, "io", "common", "mla", "moe")
+            w, _ = self._unflat(args, *final_groups)
             prefix, blocks, (latents,), *routes = final(
                 prefix,
                 blocks,
@@ -562,6 +583,9 @@ class PrefillProgram:
                 arena=arena,
                 route=routes[0] if routes else None,
             )
+            if not self.compute_logits:
+                return (latents, *routes)
+            assert logits_op is not None
             logits = logits_op(
                 prefix,
                 blocks,
@@ -587,8 +611,10 @@ class PrefillProgram:
             (sharded,) * (3 + nroute)
             + (replicated,) * 2
             + prefix_specs(1)
-            + (sharded,) * self._count("io", "common", "mla", "moe"),
-            (replicated, sharded) + (sharded,) * nroute,
+            + (sharded,) * self._count(*final_groups),
+            ((replicated,) if self.compute_logits else ())
+            + (sharded,)
+            + (sharded,) * nroute,
             donate_argnums=tuple(range(3 + nroute)),
             export_key=self._export_key(f"{name}_final", window),
         )
@@ -601,7 +627,10 @@ class PrefillProgram:
         return ops
 
     def _op_name(self, base: str, window: int) -> str:
-        return f"pallas::{base}_w{window}_c{self.capacity}"
+        suffix = ("" if self.has_draft else "_nd") + (
+            "" if self.compute_logits else "_nl"
+        )
+        return f"pallas::{base}_w{window}_c{self.capacity}{suffix}"
 
     def _export_key(self, op: str, window: int) -> str:
         """The static configuration a window op's trace bakes in (export cache)."""
@@ -609,13 +638,15 @@ class PrefillProgram:
         fused_moe = (
             cfg.prefill_fused_moe
             and cfg.prefill_expert_parallel in (8, 16)
-            and window in (512, 1024, 2048, 4096, 8192)
+            and window in (512, 1024, 2048, 4096, 8192, 16384)
         )
         return repr(
             (
                 "prefill",
                 "moe-bank8" if self._expert_banks else "moe-global",
                 "moe-fused" if fused_moe else "moe-ref",
+                "draft" if self.has_draft else "no-draft",
+                "logits" if self.compute_logits else "no-logits",
                 op,
                 window,
                 self.capacity,
@@ -643,14 +674,14 @@ class PrefillProgram:
         24 MLA layers' unified pools (MLA layer m's at m), ``ids`` [1, 1 +
         ...] this rank's prefix page count then its prefix pages end to end
         and ``local`` [1, 2 * slots] each sequence's base and token count in
-        them. Returns ``(logits [slots, VOCAB], latents [1, 24, W, 576],
+        them. Returns ``(logits [slots, VOCAB] | None, latents [1, 24, W, 576],
         recurrent, conv, recurrent_at, conv_at)`` (the states after each
         sequence and at its checkpoint).
         ``ring(blocks, prefix, middle)`` (the DSpark ring's update, if any)
         runs on the residual streams before the final op consumes them."""
         ops = self._build(int(shard.shape[-1]) * 32)
         tail = (ids, local)
-        *state, tap3 = ops["first"](
+        first_args = (
             shard,
             extent,
             segments,
@@ -660,23 +691,43 @@ class PrefillProgram:
             *tail,
             *self._flat("io", "common", "kda", "mla", "moe"),
         )
-        middle = tap90 = None
-        for p, pair in enumerate(self._pairs):
-            *state, middle, tap90 = ops["group"](
-                *state,
-                extent,
-                pair,
-                segments,
-                pools[2 * p + 1],
-                pools[2 * p + 2],
-                *tail,
-                *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
-            )
+        middle = tap3 = tap90 = None
+        if self.has_draft:
+            *state, tap3 = ops["first"](*first_args)
+            for p, pair in enumerate(self._pairs):
+                *state, middle, tap90 = ops["group"](
+                    *state,
+                    extent,
+                    pair,
+                    segments,
+                    pools[2 * p + 1],
+                    pools[2 * p + 2],
+                    *tail,
+                    *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
+                )
+        else:
+            state = ops["first"](*first_args)
+            for p, pair in enumerate(self._pairs):
+                state = ops["group"](
+                    *state,
+                    extent,
+                    pair,
+                    segments,
+                    pools[2 * p + 1],
+                    pools[2 * p + 2],
+                    *tail,
+                    *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
+                )
         prefix, blocks, rec, hist, rec_at, hist_at, latents, *routes = state
         if ring is not None:
             # The last pair's middle: entering layer 88; its tap: entering 90.
             ring(blocks, prefix, middle, tap3, tap90)
-        logits, latents, *routes = ops["final"](
+        final_groups = (
+            ("io", "common", "mla", "moe")
+            if self.compute_logits
+            else ("common", "mla", "moe")
+        )
+        final_args = (
             prefix,
             blocks,
             latents,
@@ -685,8 +736,13 @@ class PrefillProgram:
             segments,
             pools[MLA_LAYERS - 1],
             *tail,
-            *self._flat("io", "common", "mla", "moe", expert_bank=12),
+            *self._flat(*final_groups, expert_bank=12),
         )
+        if self.compute_logits:
+            logits, latents, *routes = ops["final"](*final_args)
+        else:
+            logits = None
+            latents, *routes = ops["final"](*final_args)
         self.last_routes = routes[0] if routes else None
         return logits, latents, rec, hist, rec_at, hist_at
 
@@ -894,6 +950,8 @@ class PoolWriter:
         kda_blocks: torch.Tensor,
         blocks_at: torch.Tensor,
         rings: tuple[list, list] | None = None,
+        *,
+        has_ckpt: bool = True,
     ) -> list[torch.Tensor]:
         """A packed window's writes (:meth:`PrefillProgram.run_packed`'s
         outputs): window page ``p``'s latent rows into block ``table[0, p]``
@@ -909,7 +967,7 @@ class PoolWriter:
         window, slots = int(latents.shape[2]), int(recurrent.shape[2])
         count = int(kda_blocks.shape[0]) // KDA_LAYERS
         self._adopt(
-            self._write_op(window, slots, count)(
+            self._write_op(window, slots, count, has_ckpt=has_ckpt)(
                 latents,
                 recurrent,
                 conv,
@@ -923,14 +981,17 @@ class PoolWriter:
         )
         if rings is not None:
             after, at = rings
-            self._write_rings(at[:count], blocks_at)
+            if has_ckpt:
+                self._write_rings(at[:count], blocks_at)
             self._write_rings(after[:count], kda_blocks)
         return self.raw_pools
 
-    def _write_op(self, window: int, slots: int, count: int) -> Any:
+    def _write_op(
+        self, window: int, slots: int, count: int, *, has_ckpt: bool = True
+    ) -> Any:
         """:meth:`write_packed`'s op for a ``window`` of ``slots`` sequence
         slots writing the first ``count`` of them."""
-        key = ("write", window, slots, count)
+        key = ("write", window, slots, count, has_ckpt)
         if key not in self._ops:
             num_raw, mla_raw, perm, pages = (
                 len(self.raw_pools),
@@ -945,14 +1006,20 @@ class PoolWriter:
                 table = table[0]
                 latents = latents[0]
                 # The live slots only: unused ones would go to the null block.
-                recurrent, conv, recurrent_at, conv_at = (
-                    x[0, :, :count] for x in (recurrent, conv, recurrent_at, conv_at)
-                )
+                recurrent, conv = (x[0, :, :count] for x in (recurrent, conv))
                 if perm is not None:
-                    recurrent, conv, recurrent_at, conv_at = (
-                        jax.lax.ppermute(x, AXIS, perm)
-                        for x in (recurrent, conv, recurrent_at, conv_at)
+                    recurrent, conv = (
+                        jax.lax.ppermute(x, AXIS, perm) for x in (recurrent, conv)
                     )
+                if has_ckpt:
+                    recurrent_at, conv_at = (
+                        x[0, :, :count] for x in (recurrent_at, conv_at)
+                    )
+                    if perm is not None:
+                        recurrent_at, conv_at = (
+                            jax.lax.ppermute(x, AXIS, perm)
+                            for x in (recurrent_at, conv_at)
+                        )
                 # This rank owns at most ceil(pages / DCP) pages of each live
                 # sequence (global page k lives on rank k % DCP); the rest of its
                 # table is the null block. Write only those pages: owned ones
@@ -985,13 +1052,16 @@ class PoolWriter:
                         )
 
                     raws[index] = jax.lax.fori_loop(0, writes, write_page, raws[index])
-                # Checkpoints first (a sequence without one aims it at the null block).
-                raws = self._write_kda(raws, recurrent_at, conv_at, blocks_at, count)
+                if has_ckpt:
+                    raws = self._write_kda(
+                        raws, recurrent_at, conv_at, blocks_at, count
+                    )
                 raws = self._write_kda(raws, recurrent, conv, kda_blocks, count)
                 return tuple(raws)
 
+            ckpt_tag = "" if has_ckpt else "_nockpt"
             self._ops[key] = register_op(
-                f"pallas::k3_prefill_write_pool_packed{slots}_{count}_r{num_raw}_w{window}_ranked",
+                f"pallas::k3_prefill_write_pool_packed{slots}_{count}_r{num_raw}_w{window}_ranked{ckpt_tag}",
                 self.mesh,
                 body,
                 (P(AXIS),) * (6 + num_raw) + (P(),) * 2,
@@ -1004,6 +1074,7 @@ class PoolWriter:
                         window,
                         slots,
                         count,
+                        has_ckpt,
                         self.mla_raw,
                         self._kda_raw,
                         self._perm,
@@ -1213,22 +1284,31 @@ class KimiPrefiller:
         draft_checkpoint: Path | None = None,
         *,
         tp_rank: int,
+        compute_logits: bool = True,
     ) -> None:
         self.config = config
         self.page_tokens = config.block_size
         self.presharded = Path(presharded)
         self.cp_rank = tp_rank % config.decode_context_parallel_size
+        self.compute_logits = bool(compute_logits)
         budget = config.max_num_batched_tokens
         windows = prefill_windows(budget, config.max_model_len)
         # The most prefix tokens a window's sequences may hold in all (a
         # multiple of 4096), and a rank's share of them: 1/32 plus a page of
         # rounding slack per sequence, in multiples of 1024.
         capacity = max(windows[-1], -(-config.max_model_len // 4096) * 4096)
+        self.slots = 1 if envs.K3_SERIAL_PREFILL else min(config.max_num_seqs, SLOTS)
         self.cp_capacity = (
-            -(-(capacity // DCP_SIZE + SLOTS * self.page_tokens) // 1024) * 1024
+            -(-(capacity // DCP_SIZE + self.slots * self.page_tokens) // 1024) * 1024
         )
-        self.slots = min(config.max_num_seqs, SLOTS)
-        self.program = PrefillProgram(windows, capacity, self.slots, self.page_tokens)
+        self.program = PrefillProgram(
+            windows,
+            capacity,
+            self.slots,
+            self.page_tokens,
+            has_draft=(draft_checkpoint is not None),
+            compute_logits=self.compute_logits,
+        )
         self.rank = self.program.rank
         self._requests: dict[str, _Request] = {}
         self._zero_pair: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -1409,13 +1489,16 @@ class KimiPrefiller:
                 pieces, self.program.windows, self.slots, self.program.capacity
             ):
                 out = self._run_window(rows, by_row, window, members)
-                for s, (piece, _) in enumerate(members):
-                    if piece.row in last:
-                        logits[piece.row] = out[s : s + 1]
+                if out is not None:
+                    for s, (piece, _) in enumerate(members):
+                        if piece.row in last:
+                            logits[piece.row] = out[s : s + 1]
         done = {i for i, _, _, _, finishes in work if finishes}
         for i, state, _, _, finishes in work:
             if finishes:
                 del self._requests[state.req_id]
+        if not self.compute_logits:
+            return StepOutput(torch.empty((0, 1), dtype=torch.int32))
         return StepOutput(self._first_tokens(rows, logits, done))
 
     def _blocks(self, values: np.ndarray) -> torch.Tensor:
@@ -1655,6 +1738,7 @@ class KimiPrefiller:
             )
         )
         self._count_routes()
+        has_ckpt = any(p.stop is not None for p, _ in members)
         self._writer.write_packed(
             latents,
             recurrent,
@@ -1665,6 +1749,7 @@ class KimiPrefiller:
             torch.cat(finals),
             torch.cat(ats),
             (ring_out["after"], ring_out["at"]) if "after" in ring_out else None,
+            has_ckpt=has_ckpt,
         )
         if "draft" in ring_out:
             assert self.draft_latents is not None and self._writer is not None
@@ -1833,6 +1918,11 @@ class KimiPrefiller:
                 ),
                 priority=window,
             )
+            final_groups = (
+                ("io", "common", "mla", "moe")
+                if self.compute_logits
+                else ("common", "mla", "moe")
+            )
             add(
                 ops["final"],
                 (
@@ -1844,7 +1934,7 @@ class KimiPrefiller:
                     segments,
                     mla[MLA_LAYERS - 1],
                     *tail,
-                    *program._flat("io", "common", "mla", "moe", expert_bank=12),
+                    *program._flat(*final_groups, expert_bank=12),
                 ),
                 priority=window,
             )
@@ -1870,20 +1960,21 @@ class KimiPrefiller:
                     ),
                 )
             for live in write_sizes(count):
-                add(
-                    writer._write_op(window, count, live),
-                    (
-                        latents,
-                        recurrent,
-                        conv,
-                        recurrent,
-                        conv,
-                        *pools,
-                        i32(1, window // self.page_tokens),
-                        i32(live * KDA_LAYERS),
-                        i32(live * KDA_LAYERS),
-                    ),
-                )
+                for has_ckpt in (False, True):
+                    add(
+                        writer._write_op(window, count, live, has_ckpt=has_ckpt),
+                        (
+                            latents,
+                            recurrent,
+                            conv,
+                            recurrent,
+                            conv,
+                            *pools,
+                            i32(1, window // self.page_tokens),
+                            i32(live * KDA_LAYERS),
+                            i32(live * KDA_LAYERS),
+                        ),
+                    )
                 if ring is not None and live not in ring_writes:  # shared by windows
                     ring_writes.add(live)
                     add(
@@ -1903,9 +1994,13 @@ class KimiPrefiller:
                 (*pools, hit, i32(self.slots)),
             )
         add(writer._copy_op(), (*pools, i32(COPY_PAIRS), i32(COPY_PAIRS)))
-        logits = torch.empty((self.config.max_num_seqs, VOCAB), dtype=torch.float32)
-        for sampled in (False, True):
-            add(self._sampler_op(sampled), (logits, i32(self.config.max_num_seqs, 5)))
+        if self.compute_logits:
+            logits = torch.empty((self.config.max_num_seqs, VOCAB), dtype=torch.float32)
+            for sampled in (False, True):
+                add(
+                    self._sampler_op(sampled),
+                    (logits, i32(self.config.max_num_seqs, 5)),
+                )
         return calls
 
     def _precompile(self) -> None:
@@ -2006,21 +2101,25 @@ class KimiPrefiller:
                     ring_hook,
                 )
             )
-            outputs += [logits, self.program.split_states(recurrent, conv)[0][0]]
+            if logits is not None:
+                outputs.append(logits)
+            outputs.append(self.program.split_states(recurrent, conv)[0][0])
             for live in write_sizes(count):
-                writer.write_packed(
-                    latents,
-                    recurrent,
-                    conv,
-                    recurrent_at,
-                    conv_at,
-                    _rank_zeros_i32(window // self.page_tokens),
-                    _zeros_i32(live * KDA_LAYERS),
-                    _zeros_i32(live * KDA_LAYERS),
-                    (ring_out["after"], ring_out["at"])
-                    if "after" in ring_out
-                    else None,
-                )
+                for has_ckpt in (False, True):
+                    writer.write_packed(
+                        latents,
+                        recurrent,
+                        conv,
+                        recurrent_at,
+                        conv_at,
+                        _rank_zeros_i32(window // self.page_tokens),
+                        _zeros_i32(live * KDA_LAYERS),
+                        _zeros_i32(live * KDA_LAYERS),
+                        (ring_out["after"], ring_out["at"])
+                        if "after" in ring_out
+                        else None,
+                        has_ckpt=has_ckpt,
+                    )
             if "draft" in ring_out:
                 assert self.draft_latents is not None
                 self.draft_latents.write(
@@ -2040,12 +2139,15 @@ class KimiPrefiller:
         writer.copy_blocks([(0, 0)])
         if self.draft_latents is not None:
             self.draft_latents.copy_blocks([(0, 0)], COPY_PAIRS)
-        stacked = torch.zeros(
-            (self.config.max_num_seqs, VOCAB), dtype=torch.float32
-        ).to("tpu")
-        params = torch.zeros((self.config.max_num_seqs, 5), dtype=torch.int32).to("tpu")
-        for sampled in (False, True):
-            outputs.append(self._sampler_op(sampled)(stacked, params)[0])
+        if self.compute_logits:
+            stacked = torch.zeros(
+                (self.config.max_num_seqs, VOCAB), dtype=torch.float32
+            ).to("tpu")
+            params = torch.zeros((self.config.max_num_seqs, 5), dtype=torch.int32).to(
+                "tpu"
+            )
+            for sampled in (False, True):
+                outputs.append(self._sampler_op(sampled)(stacked, params)[0])
         for tensor in outputs:
             materialize(tensor)
         materialize(writer.raw_pools[0])

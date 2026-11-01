@@ -26,7 +26,7 @@ DRAFT_TOKENS = 7  # DSpark: the verify is the anchor and 7 drafts
 SPEC_BATCHES = (1, 2, 4, 8, 16)  # the batched speculation's compiled request counts
 # Attention DP2's compiled request counts: half of each are one group's.
 DP_SPEC_BATCHES = (2, 4, 8, 16, 32)
-MAX_STEP_TOKENS = 8192  # the prefill's largest window
+MAX_STEP_TOKENS = 16384  # the prefill's largest window
 # Sampling parameters the ops implement (beyond greedy): temperature, top-p,
 # top-k and a per-request seed, on both roles.
 SAMPLING = frozenset({"temperature", "top_p", "top_k", "seed"})

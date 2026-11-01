@@ -956,9 +956,9 @@ SMALL_WINDOWS = (512, 1024)
 
 def check_window(seq_len, what):
     """Reject a window the sequence-parallel kernels can't run: 512, 1024,
-    or a multiple of 2048 up to 8192."""
-    if seq_len not in SMALL_WINDOWS and (seq_len % SP_BLOCK or not SP_BLOCK <= seq_len <= 8192):
-        raise ValueError(f"{what} needs T in {SMALL_WINDOWS} or 2048..8192 (a multiple of 2048)")
+    or a multiple of 2048 up to 16384."""
+    if seq_len not in SMALL_WINDOWS and (seq_len % SP_BLOCK or not SP_BLOCK <= seq_len <= 16384):
+        raise ValueError(f"{what} needs T in {SMALL_WINDOWS} or 2048..16384 (a multiple of 2048)")
 
 
 def window_stripe(local_rows):
@@ -1217,7 +1217,7 @@ def _all_gather_kernel(
             return [
                 pltpu.make_async_copy(
                     payload.at[pl.ds(row, count), cols],
-                    out.at[pl.ds(sp_token_index(dest, row, stripe), count), cols],
+                    out.at[pl.ds(sp_token_index(dest, local_first + row, stripe), count), cols],
                     store_sems.at[s],
                 )
                 for _, row, count in _stripe_pieces(begin, size, stripe)
@@ -1423,6 +1423,14 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
         raise ValueError("K3 projection/RS requires BF16 operands")
     tokens = x.shape[1]
     rows = tokens // 32
+    if rows == 512:
+        h0 = project_reduce_scatter(
+            x[:, :8192], w, mesh, tables, collective_id=collective_id
+        ).reshape(32, 256, 7168)
+        h1 = project_reduce_scatter(
+            x[:, 8192:], w, mesh, tables, collective_id=collective_id
+        ).reshape(32, 256, 7168)
+        return jnp.concatenate((h0, h1), axis=1).reshape(32 * 512, 7168)
     if rows > 256:
         raise ValueError("K3 projection/RS needs at most 256 rows per rank")
     regions = _regions(rows, 7168)
@@ -3409,22 +3417,18 @@ def mixture_norm_tiled_body(
     n_tiles = tokens // tile
     active_count = active_ref[0]
 
-    weights = (
-        pltpu.make_async_copy(folded_ref, folded_buf, weight_sems.at[0]),
-        pltpu.make_async_copy(norm_ref, norm_buf, weight_sems.at[1]),
-    )
-    for copy in weights:
-        copy.start()
-    for copy in weights:
-        copy.wait()
-    folded = folded_buf[...]
-    norm = norm_buf[...]
-
     def load_prefix(t, slot):
         return pltpu.make_async_copy(
             prefix_ref.at[pl.ds(t * tile, tile), :],
             prefix_bufs.at[slot],
             prefix_sems.at[slot],
+        )
+
+    def load_block(t, block, b_slot):
+        return pltpu.make_async_copy(
+            blocks_ref.at[block, pl.ds(t * tile, tile), :],
+            block_buf.at[b_slot],
+            block_sem.at[b_slot],
         )
 
     def store_output(t, slot):
@@ -3434,10 +3438,25 @@ def mixture_norm_tiled_body(
             output_sems.at[slot],
         )
 
+    weights = (
+        pltpu.make_async_copy(folded_ref, folded_buf, weight_sems.at[0]),
+        pltpu.make_async_copy(norm_ref, norm_buf, weight_sems.at[1]),
+    )
+    for copy in weights:
+        copy.start()
     load_prefix(0, 0).start()
+    for copy in weights:
+        copy.wait()
+    folded = folded_buf[...]
+    norm = norm_buf[...]
 
     def tile_body(t):
         slot = t % 2
+
+        @pl.when(active_count > 0)
+        def prefetch_first_block():
+            load_block(t, 0, 0).start()
+
         load_prefix(t, slot).wait()
 
         @pl.when(t >= 2)
@@ -3457,15 +3476,15 @@ def mixture_norm_tiled_body(
 
         for block in range(8):
             @pl.when(block < active_count)
-            def include_block():
-                copy = pltpu.make_async_copy(
-                    blocks_ref.at[block, pl.ds(t * tile, tile), :],
-                    block_buf,
-                    block_sem.at[0],
-                )
-                copy.start()
-                copy.wait()
-                values = block_buf[...].astype(jnp.float32)
+            def include_block(*, block=block):
+                b_slot = block % 2
+
+                @pl.when(block + 1 < active_count)
+                def prefetch_next_block(*, block=block, b_slot=b_slot):
+                    load_block(t, block + 1, 1 - b_slot).start()
+
+                load_block(t, block, b_slot).wait()
+                values = block_buf.at[b_slot][...].astype(jnp.float32)
                 score = jnp.sum(values * folded, axis=1)
                 score *= jax.lax.rsqrt(jnp.mean(values * values, axis=1) + eps)
                 old_max = row_max_buf[...]
@@ -3498,7 +3517,7 @@ def mixture_norm_tiled_scratch_shapes(hidden_size, tile):
     """Scratch specs in the order expected by ``mixture_norm_tiled_body``."""
     return (
         pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),
-        pltpu.VMEM((tile, hidden_size), jnp.bfloat16),
+        pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),
         pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),
         pltpu.VMEM((tile, hidden_size), jnp.float32),
         pltpu.VMEM((tile, 1), jnp.float32),
@@ -3506,7 +3525,7 @@ def mixture_norm_tiled_scratch_shapes(hidden_size, tile):
         pltpu.VMEM((1, hidden_size), jnp.float32),
         pltpu.VMEM((1, hidden_size), jnp.bfloat16),
         pltpu.SemaphoreType.DMA((2,)),
-        pltpu.SemaphoreType.DMA((1,)),
+        pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((2,)),
     )
@@ -4834,7 +4853,7 @@ def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, o
         copy = pltpu.make_async_copy(
             local_ref.at[local_rows], window_ref.at[window_rows(0, positions[0])], own_sem)
         copy.start()
-        if local_ref.shape[0] not in (16, 32, 64, 128, 256):
+        if local_ref.shape[0] not in (16, 32, 64, 128, 256, 512):
             copy.wait()
 
     for stream, (family, direction, col, width) in enumerate(_half_ring_streams(local_ref.shape[1])):
@@ -4867,7 +4886,7 @@ def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, o
     # The local destination is disjoint from every remote stripe. Let the
     # copy run while the half rings progress, then join before KDA consumes
     # this block and before own_sem is reused for the next block.
-    if local_ref.shape[0] in (16, 32, 64, 128, 256):
+    if local_ref.shape[0] in (16, 32, 64, 128, 256, 512):
         @pl.when(step == HALF_STEPS - 1)
         def finish_local():
             pltpu.make_async_copy(
@@ -5604,7 +5623,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     if (
         cfg.prefill_fused_moe
         and cfg.prefill_expert_parallel in (8, 16)
-        and seq_len in (512, 1024, 2048, 4096, 8192)
+        and seq_len in (512, 1024, 2048, 4096, 8192, 16384)
     ):
         from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
         return make_packed_moe(mesh, seq_len=seq_len)
@@ -5646,12 +5665,15 @@ def _norm_gather_body(
 ):
     mix_scratch = scratch[:12]
     ring_scratch = scratch[12:]
-    @pl.when(pl.program_id(1) == 0)
+
+    @pl.when((pl.program_id(0) == 0) & (pl.program_id(1) == 0))
     def normalize():
-        mixture_norm_tiled_body(
-            active_ref, prefix_ref, blocks_ref, folded_ref, norm_ref,
-            normalized_ref, *mix_scratch, tile=mix_tile, eps=eps,
-        )
+        for m_idx in range(prefix_ref.shape[0] // mix_tile):
+            r_sl = pl.ds(m_idx * mix_tile, mix_tile)
+            mixture_norm_tiled_body(
+                active_ref, prefix_ref.at[r_sl], blocks_ref.at[:, r_sl], folded_ref, norm_ref,
+                normalized_ref.at[r_sl], *mix_scratch, tile=mix_tile, eps=eps,
+            )
 
     _all_gather_kernel(
         tables_ref, normalized_ref, gathered_ref, *ring_scratch,
@@ -5670,34 +5692,36 @@ def make_norm_gather_sp(mesh, *, seq_len, token_ranks=None,
         raise ValueError("norm/gather requires a flat k3_sp TP32 mesh")
     check_window(seq_len, "fused norm/gather")
     rows, width = seq_len // 32, 7168
+    tile_rows = min(rows, 256)
+    num_tiles = rows // tile_rows
     if token_ranks is None:
         token_ranks = tuple(range(32))
     tables = jnp.asarray(
         ring_tables(list(mesh.devices.flat), token_ranks), jnp.int32,
     )
-    regions = _regions(rows, width)
+    regions = _regions(tile_rows, width)
     streams = len(regions)
-    mix_scratch = mixture_norm_tiled_scratch_shapes(width, rows)
+    mix_scratch = mixture_norm_tiled_scratch_shapes(width, tile_rows)
     ring_scratch = (
         pltpu.SemaphoreType.DMA((streams,)),
         pltpu.SemaphoreType.DMA((streams,)),
         pltpu.SemaphoreType.DMA((2, streams)),
         pltpu.SemaphoreType.REGULAR((streams,)),
         pltpu.SemaphoreType.DMA((streams,)),
-        pltpu.VMEM((rows, width), jnp.bfloat16),
-        pltpu.VMEM((2, rows, width), jnp.bfloat16),
+        pltpu.VMEM((tile_rows, width), jnp.bfloat16),
+        pltpu.VMEM((2, tile_rows, width), jnp.bfloat16),
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     call = pl.pallas_call(
         functools.partial(_norm_gather_body, regions=regions, eps=eps,
-                          mix_tile=rows),
+                          mix_tile=tile_rows),
         out_shape=(
             jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
             jax.ShapeDtypeStruct((seq_len, width), jnp.bfloat16),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            grid=(1, 32),
+            grid=(num_tiles, 32),
             in_specs=(hbm, hbm, hbm, hbm),
             out_specs=(hbm, hbm),
             scratch_shapes=(*mix_scratch, *ring_scratch),
@@ -5811,7 +5835,7 @@ def _kda_layer_body(
 def _kda_mix_shapes(mix_tile):
     return (
         ((2, mix_tile, 7168), jnp.bfloat16),
-        ((mix_tile, 7168), jnp.bfloat16),
+        ((2, mix_tile, 7168), jnp.bfloat16),
         ((2, mix_tile, 7168), jnp.bfloat16),
         ((mix_tile, 7168), jnp.float32),
     )
@@ -6105,12 +6129,12 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
     ))
 
 
-def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, mla_flash_tile=256):
+def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, mla_flash_tile=256, with_taps=True):
     """Two consecutive regular four-layer groups as one executable
     (``pair`` p runs groups 2p + 1 and 2p + 2; ``arena`` carries both
-    groups' MLA pools, in order). Also returns the prefix between the two
-    groups: the residual stream entering layer 8p + 12 (pair 10's is the
-    DSpark draft's aux layer 88)."""
+    groups' MLA pools, in order). When ``with_taps`` is True, also returns
+    the prefix between the two groups (entering layer 8p + 12) and the
+    second group's tap."""
     group4 = make_regular_group4_sp_indexed(
         mesh, seq_len=seq_len, mla_flash_tile=mla_flash_tile, segments=segments,
         prefix_capacity=prefix_capacity,
@@ -6132,12 +6156,15 @@ def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
             moe_families, kda_state, mla_state, length, second,
             segment_desc, arenas[1], r1[0] if r1 else None,
         )
+        taps = (middle, tap) if with_taps else ()
         if r2:
-            return prefix, blocks, kda_state, mla_state, middle, tap, r2[0]
-        return prefix, blocks, kda_state, mla_state, middle, tap
+            return (prefix, blocks, kda_state, mla_state, *taps, r2[0])
+        return (prefix, blocks, kda_state, mla_state, *taps)
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * 4, (sharding,), sharding, sharding, *((sharding,) if _config().prefill_route_counts else ()),
+        sharding, sharding, (sharding,) * 4, (sharding,),
+        *((sharding,) * 2 if with_taps else ()),
+        *((sharding,) if _config().prefill_route_counts else ()),
     ))
 
 

@@ -29,6 +29,7 @@ from jax.sharding import PartitionSpec as P
 from .. import prefill_megakernel as k
 
 _COMPACT_8K_CAPACITY = 65536
+_RMW_BATCH = 2
 
 
 def _sort_route_steps(keys, probabilities, *, size):
@@ -635,14 +636,16 @@ def _prologue(
 
     def body(s):
         own = s["pair"].at[pl.ds(parity * rows, rows), :]
+        if rows == 256:
+            buffers = tuple(s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4))
+            router_v = s["router_gu"].at[:, :896]
+        else:
+            buffers, router_v = s["gu_buffers"], s["router"]
+        router_copy = pltpu.make_async_copy(router, router_v, s["gu_sems"][0])
+        bias_copy = pltpu.make_async_copy(bias, s["bias"], s["gu_sems"][1])
+        router_copy.start()
+        bias_copy.start()
         copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
-        copy.start()
-        copy.wait()
-        if rows <= 128:
-            copy = pltpu.make_async_copy(router, s["router"], s["input_sem"])
-            copy.start()
-            copy.wait()
-        copy = pltpu.make_async_copy(bias, s["bias"], s["input_sem"])
         copy.start()
         copy.wait()
         _enter_mesh()
@@ -659,14 +662,8 @@ def _prologue(
             device_id_type=pl.DeviceIdType.LOGICAL,
         )
         peer_input.start()
-        if rows == 256:
-            buffers = tuple(s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4))
-            router_v = s["router_gu"].at[:, :896]
-            copy = pltpu.make_async_copy(router, router_v, s["gu_sems"][0])
-            copy.start()
-            copy.wait()
-        else:
-            buffers, router_v = s["gu_buffers"], s["router"]
+        router_copy.wait()
+        bias_copy.wait()
         gate_buffers, up_buffers = buffers[:2], buffers[2:]
         gate_sems, up_sems = s["gu_sems"][:2], s["gu_sems"][2:]
         hx = own[...]
@@ -1106,28 +1103,66 @@ def _routed_experts(
         def route(i):
             return (destinations[i], probabilities[i])
 
+        def batched_unclamped(source, begin, base_idx, width_b):
+            idxs = [base_idx + r for r in range(width_b)]
+            routes = [route(i_r) for i_r in idxs]
+            vals = [
+                source.at[pl.ds(i_r - begin, 1)][...].astype(jnp.float32)
+                for i_r in idxs
+            ]
+            olds = [sums.at[pl.ds(d_r, 1)][...] for d_r, _ in routes]
+            accs = [olds[r] + vals[r] * routes[r][1] for r in range(width_b)]
+            for r in range(width_b):
+                sums.at[pl.ds(routes[r][0], 1)][...] = accs[r]
+
+        def batched_clamped(source, begin, base_idx, end, width_b, *, guard):
+            idxs = [base_idx + r for r in range(width_b)]
+            actives = [guard & (idx_r < end) for idx_r in idxs]
+            clamped = [jnp.minimum(idx_r, end - 1) for idx_r in idxs]
+            routes = [route(c_r) for c_r in clamped]
+            dests = [
+                jnp.where(actives[r], routes[r][0], tokens + r)
+                for r in range(width_b)
+            ]
+            weights = [
+                jnp.where(actives[r], routes[r][1], 0.0) for r in range(width_b)
+            ]
+            vals = [
+                source.at[pl.ds(c_r - begin, 1)][...].astype(jnp.float32)
+                for c_r in clamped
+            ]
+            olds = [sums.at[pl.ds(d_r, 1)][...] for d_r in dests]
+            accs = [olds[r] + vals[r] * weights[r] for r in range(width_b)]
+            for r in range(width_b):
+                sums.at[pl.ds(dests[r], 1)][...] = accs[r]
+
         def consume(tile_g, source, first=0, *, loop_unroll=unroll):
             start = metadata.gm_id_to_m_offset[tile_g]
             end = metadata.gm_id_to_m_offset[tile_g + 1]
             begin = start // sub * sub
             start = jnp.minimum(start + first, end)
-
-            def update(i):
-                dest, weight = route(i)
-                value = source.at[pl.ds(i - begin, 1)][...].astype(jnp.float32)
-                target = sums.at[pl.ds(dest, 1)]
-                target[...] = target[...] + value * weight
-
+            step_b = min(_RMW_BATCH, loop_unroll)
             full = (end - start) // loop_unroll
 
             @pl.loop(0, full)
             def chunk(b):
-                for u in range(loop_unroll):
-                    update(start + b * loop_unroll + u)
+                base = start + b * loop_unroll
+                for u in range(0, loop_unroll, step_b):
+                    batched_unclamped(source, begin, base + u, step_b)
 
-            @pl.loop(start + full * loop_unroll, end)
-            def tail(i):
-                update(i)
+            tail_start = start + full * loop_unroll
+            tail_steps = pl.cdiv(end - tail_start, step_b)
+
+            @pl.loop(0, tail_steps)
+            def tail(tb):
+                batched_clamped(
+                    source,
+                    begin,
+                    tail_start + tb * step_b,
+                    end,
+                    step_b,
+                    guard=jnp.bool_(True),
+                )
 
         gu_panels = pl.cdiv(gu_width, pltpu.get_tpu_info().mxu_column_size)
         moved_rows = gu_panels * gu_unroll
@@ -1137,15 +1172,17 @@ def _routed_experts(
             start = metadata.gm_id_to_m_offset[previous_g]
             end = metadata.gm_id_to_m_offset[previous_g + 1]
             begin = start // sub * sub
-            for row in range(gu_unroll):
-                offset = panel * gu_unroll + row
-                i = jnp.minimum(start + offset, end - 1)
-                dest, prob = route(i)
-                weight = jnp.where((g > 0) & (start + offset < end), prob, 0)
-                previous = packed.at[(g + 1) % 2]
-                value = previous.at[pl.ds(i - begin, 1)][...].astype(jnp.float32)
-                target = sums.at[pl.ds(dest, 1)]
-                target[...] = target[...] + value * weight
+            previous = packed.at[(g + 1) % 2]
+            step_b = min(_RMW_BATCH, gu_unroll)
+            for row in range(0, gu_unroll, step_b):
+                batched_clamped(
+                    previous,
+                    begin,
+                    start + panel * gu_unroll + row,
+                    end,
+                    step_b,
+                    guard=(g > 0),
+                )
 
         def inner(x, w, metadata, *, first=False, subtotal_vmem=None):
             g, n = (pl.program_id(1), 0 if first else pl.program_id(0) + 1)
@@ -1167,22 +1204,17 @@ def _routed_experts(
                 start = metadata.gm_id_to_m_offset[previous_g]
                 end = metadata.gm_id_to_m_offset[previous_g + 1]
                 begin = start // sub * sub
-
-                def work():
-                    for row in range(down_unroll):
-                        offset = (
-                            (moved_rows if first else 0) + panel * down_unroll + row
-                        )
-                        i = jnp.minimum(start + offset, end - 1)
-                        dest, prob = route(i)
-                        weight = jnp.where((g > 0) & (start + offset < end), prob, 0)
-                        value = previous.at[pl.ds(i - begin, 1)][...].astype(
-                            jnp.float32
-                        )
-                        target = sums.at[pl.ds(dest, 1)]
-                        target[...] = target[...] + value * weight
-
-                work()
+                base_off = (moved_rows if first else 0) + panel * down_unroll
+                step_b = min(_RMW_BATCH, down_unroll)
+                for row in range(0, down_unroll, step_b):
+                    batched_clamped(
+                        previous,
+                        begin,
+                        start + base_off + row,
+                        end,
+                        step_b,
+                        guard=(g > 0),
+                    )
 
             if not first:
 
@@ -1404,7 +1436,7 @@ def _routed_experts(
             gm_id_to_m_offset=pltpu.SMEM((max_gm + 1,), jnp.int32),
         ),
         packed=pltpu.VMEM((2, tm, 2, packed_half), x.dtype),
-        sums=pltpu.VMEM((tokens, 2, packed_half), jnp.float32),
+        sums=pltpu.VMEM((tokens + _RMW_BATCH, 2, packed_half), jnp.float32),
         cast=pltpu.VMEM((store_tile, tn), x.dtype),
         sends=pltpu.SemaphoreType.DMA((streams,)),
         receives=pltpu.SemaphoreType.DMA((2, streams)),
@@ -2140,9 +2172,23 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     index. All fast-path operations execute in one Pallas kernel. Rare 8K route
     overflow uses the uncapped production expert path with the same metadata.
     """
+    if seq_len == 16384:
+        half = make_indexed_moe_sp_ring(mesh, seq_len=8192)
+        counting = k._config().prefill_route_counts
+
+        def run_16k(hidden, prefix, families, length, slot):
+            len0 = jnp.minimum(length, 8192)
+            len1 = jnp.maximum(length - 8192, 0)
+            r0 = half(hidden[:, :256], prefix[:, :256], families, len0, slot)
+            r1 = half(hidden[:, 256:], prefix[:, 256:], families, len1, slot)
+            if counting:
+                return jnp.concatenate((r0[0], r1[0]), axis=1), r0[1] + r1[1]
+            return jnp.concatenate((r0, r1), axis=1)
+
+        return jax.jit(run_16k)
     if seq_len not in (512, 1024, 2048, 4096, 8192):
         raise ValueError(
-            "Fused prefill MoE supports 512, 1024, 2048, 4096 and 8192 token windows"
+            "Fused prefill MoE supports 512, 1024, 2048, 4096, 8192 and 16384 token windows"
         )
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")

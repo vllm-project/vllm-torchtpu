@@ -11,4 +11,4 @@ src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v3.py: 2
 src/vllm_torchtpu/megakernel/common/vmem_pool.py: 3
 src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py: 10
 src/vllm_torchtpu/megakernel/kimi_k3/kernels/load.py: 2
-src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py: 84
+src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py: 83

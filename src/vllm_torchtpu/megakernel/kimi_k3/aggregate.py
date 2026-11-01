@@ -140,6 +140,7 @@ class KimiAggregate:
             presharded,
             draft_checkpoint,
             tp_rank=self.decoder.rank,
+            compute_logits=False,
         )
         self.rank = self.decoder.rank
         self._prefill_ep = kernel.prefill_expert_parallel
