@@ -21,7 +21,9 @@ import torch
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
-from vllm_torchtpu.distributed.pp_ring import PPRing
+from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
+from vllm_torchtpu.core.pp_chunks import chunk_buckets, chunk_granularity
+from vllm_torchtpu.distributed.pp_ring import PPRing, hbm_reserve_bytes
 from vllm_torchtpu.distributed.pp_wave import PPWave
 from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
 from vllm_torchtpu.runner import tpu_runner
@@ -227,6 +229,9 @@ class TestHandOffConstruction:
             _pp_intermediate_template=None,
             _pp_topk_buffer=None,
             max_num_tokens=64,
+            num_tokens_paddings=[8, 16, 32, 64],
+            cache_config=SimpleNamespace(block_size=16),
+            vllm_config=None,
             device=torch.device("cpu"),
             enforce_eager=True,
         )
@@ -271,6 +276,34 @@ class TestHandOffConstruction:
 
         device = torch.device("cpu")
         assert built == [("PPWave", (device, 64, TEMPLATE), {}), "warmup"]
+
+    def test_only_the_ring_reserves_memory_for_its_buffers(self, monkeypatch):
+        monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+        monkeypatch.setenv("TPU_PP_RING_DEPTH", "3")
+        runner = self._runner()
+
+        reserve = TPUModelRunner.pp_handoff_hbm_reserve_bytes(runner)
+
+        # sized before capture_model builds the ring, from the same template;
+        # the zero residuals count every token bucket
+        assert runner._pp_intermediate_template is TEMPLATE
+        assert reserve == hbm_reserve_bytes(64, TEMPLATE, 3, 8 + 16 + 32 + 64) > 0
+        # with dynamic chunks the chunk buckets join them, at the finest granule
+        runner.vllm_config = SimpleNamespace(
+            parallel_config=runner.parallel_config,
+            scheduler_config=SimpleNamespace(scheduler_cls=SCHEDULER_CLS),
+        )
+        granule = chunk_granularity(16, 64, False)
+        chunk_rows = sum(set(chunk_buckets(64, granule)) - {8, 16, 32, 64})
+        assert TPUModelRunner.pp_handoff_hbm_reserve_bytes(runner) == (
+            hbm_reserve_bytes(64, TEMPLATE, 3, 8 + 16 + 32 + 64 + chunk_rows)
+        )
+        runner.vllm_config = None
+        monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
+        assert TPUModelRunner.pp_handoff_hbm_reserve_bytes(runner) == 0
+        monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+        runner.parallel_config.pipeline_parallel_size = 1
+        assert TPUModelRunner.pp_handoff_hbm_reserve_bytes(runner) == 0
 
 
 class TestRingForwardRows:

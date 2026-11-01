@@ -78,6 +78,7 @@ device nor waits at a world barrier before a hand-off, and the only programs
 a stage runs across its devices are its forwards.
 """
 
+import math
 import threading
 from collections import deque
 from collections.abc import Iterator
@@ -88,6 +89,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu.distributed.pp_push import ring_extra_steps
 from vllm_torchtpu.distributed.pp_wave import HIDDEN_STATES, RESIDUAL, _fence, _flush
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
@@ -124,7 +126,7 @@ def ring_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
     ``depth`` earlier forwards: end_forward waits while that many are
     unsent, and a forward is sent only after it has run on the data it
     received. No stage holds more than the steps the engine keeps in
-    flight.
+    flight: ``stages`` plus ``pp_push.ring_extra_steps``.
 
     At run time every device holds its posted receives to _MAX_RECEIVES,
     whether a step queues them ahead or a forward posts its own, so a step
@@ -132,7 +134,7 @@ def ring_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
     """
     if stages < 2:
         return 0
-    held = 1 if stages == 2 else min(stages, depth + 1)
+    held = 1 if stages == 2 else min(stages + ring_extra_steps(stages), depth + 1)
     return carried * held
 
 
@@ -147,6 +149,34 @@ def check_ring_receives(stages: int, depth: int, carried: int = 1) -> None:
             "at most 8 receives can be outstanding per device, and the ring "
             "keeps one spare. Lower TPU_PP_RING_DEPTH."
         )
+
+
+def hbm_reserve_bytes(
+    max_rows: int,
+    template: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    depth: int,
+    zero_residual_rows: int,
+) -> int:
+    """An upper bound on the device memory a stage's ring holds beyond the
+    model and the KV cache. Outgoing: up to ``depth`` forwards queued for
+    sending plus the one end_forward holds while it waits for room, each
+    the tensors the ring carries at ``max_rows`` rows. Landing: up to
+    _MAX_RECEIVES posted receives, each one carried tensor at ``max_rows``
+    rows. Zero residuals: one per padded row count the runner can hand a
+    forward, ``zero_residual_rows`` rows in all. The first stage posts no
+    receives and the last sends nothing, so they hold less."""
+
+    def row_bytes(key: str) -> int:
+        shape, dtype = template[key]
+        return math.prod(shape) * dtype.itemsize
+
+    carried = [key for key in template if key != RESIDUAL]
+    outgoing = (depth + 1) * max_rows * sum(row_bytes(key) for key in carried)
+    landing = (
+        _MAX_RECEIVES * max_rows * max((row_bytes(key) for key in carried), default=0)
+    )
+    zero = zero_residual_rows * row_bytes(RESIDUAL) if RESIDUAL in template else 0
+    return outgoing + landing + zero
 
 
 def _first_and_last(x: torch.Tensor) -> tuple[float, float]:
@@ -241,7 +271,8 @@ class PPRing:
         # program before every forward. The runner pads every forward to one
         # of its token buckets and its hand-off warmup runs each of them, so
         # this holds sum(buckets) x hidden x dtype size bytes of HBM: about
-        # 64 MiB for buckets of 16 to 8192 rows of 2048 bfloat16 values.
+        # 64 MiB for buckets of 16 to 8192 rows of 2048 bfloat16 values. The
+        # KV-cache budget reserves them (hbm_reserve_bytes).
         self._zero_residuals: dict[int, torch.Tensor] = {}
         logger.info(
             "PP ring: rank %d/%d column %d/%d (global rank %d, from %s, to %s), "

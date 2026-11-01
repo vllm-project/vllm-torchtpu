@@ -685,14 +685,34 @@ def test_each_forward_size_reuses_one_zero_residual(monkeypatch):
     assert sorted(second._zero_residuals) == [8, 16]
 
 
+def test_the_hbm_reserve_covers_every_buffer_the_ring_holds():
+    row = HIDDEN * torch.float32.itemsize
+    side_row = SIDE_WIDTH * torch.int32.itemsize
+    zero_rows = sum(BUCKETS)
+    # depth queued plus one held outgoing forward, seven landing tensors of
+    # the widest carried tensor, and a zero residual per bucket
+    assert pp_ring.hbm_reserve_bytes(MAX_ROWS, _template(False), 2, zero_rows) == (
+        (2 + 1) * MAX_ROWS * row + 7 * MAX_ROWS * row + zero_rows * row
+    )
+    assert pp_ring.hbm_reserve_bytes(MAX_ROWS, _template(True), 3, zero_rows) == (
+        (3 + 1) * MAX_ROWS * (row + side_row) + 7 * MAX_ROWS * row + zero_rows * row
+    )
+    # without a residual in the template there is no zero residual to hold
+    hidden_only = {"hidden_states": ((HIDDEN,), torch.float32)}
+    assert pp_ring.hbm_reserve_bytes(MAX_ROWS, hidden_only, 1, zero_rows) == (
+        (1 + 1 + 7) * MAX_ROWS * row
+    )
+
+
 @pytest.mark.parametrize(
     ("stages", "depth", "carried", "posted"),
     [
         # the last of two stages holds only the step it runs
         (2, 50, 1, 1),
         (2, 50, 2, 2),
-        # no more than the four steps the engine keeps in flight
-        (4, 50, 1, 4),
+        # no more than the six steps the engine keeps in flight: four stages
+        # and two more
+        (4, 50, 1, 6),
         # a stage that sends: the step it begins and ``depth`` unsent forwards
         (8, 2, 1, 3),
         (8, 2, 2, 6),

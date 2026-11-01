@@ -107,7 +107,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
 from vllm_torchtpu.distributed.pp_push import ring_handoff
-from vllm_torchtpu.distributed.pp_ring import PPRing
+from vllm_torchtpu.distributed.pp_ring import PPRing, hbm_reserve_bytes
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
@@ -5644,6 +5644,7 @@ class TPUModelRunner(GPUModelRunner):
         return utils.HbmReserves(
             kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
+            pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
         )
 
     def _initialize_pallas_kernels(self):
@@ -6878,6 +6879,36 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(static_pool(dummy_hidden, inputs, spec))
                 logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs)
+
+    def pp_handoff_hbm_reserve_bytes(self) -> int:
+        """Device memory the ring hand-off's buffers can take beyond the
+        model and the KV cache, allocated after profile_run
+        (``pp_ring.hbm_reserve_bytes``); 0 without a pipeline or with the
+        wave."""
+        if self.parallel_config.pipeline_parallel_size <= 1 or not ring_handoff():
+            return 0
+        from vllm_torchtpu.core.pp_chunk_scheduler import uses_dynamic_chunks
+        from vllm_torchtpu.core.pp_chunks import chunk_buckets, chunk_granularity
+
+        if self._pp_intermediate_template is None:
+            self._pp_intermediate_tensors(1, zeros=True)
+        assert self._pp_intermediate_template is not None
+        # The ring keeps a zero residual per token bucket a forward is padded
+        # to. The chunk buckets join the paddings once the KV block size is
+        # final (_add_pipeline_chunk_buckets); counted at the finest granule
+        # here, they bound that sum from above.
+        rows = set(self.num_tokens_paddings)
+        if uses_dynamic_chunks(self.vllm_config):
+            granularity = chunk_granularity(
+                self.cache_config.block_size, self.max_num_tokens, False
+            )
+            rows |= set(chunk_buckets(self.max_num_tokens, granularity))
+        return hbm_reserve_bytes(
+            self.max_num_tokens,
+            self._pp_intermediate_template,
+            envs.TPU_PP_RING_DEPTH,
+            sum(rows),
+        )
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
