@@ -146,7 +146,7 @@ SERVE_ARGS=(
   --decode-context-parallel-size 32
   --load-format megakernel --model-loader-extra-config "$_loader"
   --max-num-seqs "$AGG_MAX_NUM_SEQS"
-  --max-num-batched-tokens $((8192 + 8 * AGG_MAX_NUM_SEQS))
+  --max-num-batched-tokens $((${AGG_PREFILL_WINDOW:-8192} + 8 * AGG_MAX_NUM_SEQS))
   --kv-cache-memory-bytes "${AGG_KV_BYTES:-15032385536}"
 )
 # AGG_DRAFTS=0: no speculative decoding.
