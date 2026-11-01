@@ -99,6 +99,7 @@ def inner_kernel(
     window_vmem,
     kv_slot_mapping_ref,
     is_first_mask_ref,
+    whole_counts_ref,
     *,
     cfgs: config.Configs,
 ):
@@ -115,15 +116,25 @@ def inner_kernel(
     )
 
     row_tile = config.ROW_TILE
-    for r in range(tile_n // row_tile):
-        rows = pl.ds(r * row_tile, row_tile)
-        fill_window(state_vmem.at[rows], window_vmem, cfgs=cfgs)
-        compress(
-            _rows(cos_sin_vmem, rows),
-            out_vmem.at[rows],
-            _rows(rope_out_vmem, rows),
-            global_idx=global_idx + r * row_tile,
-        )
+
+    def run(whole_rows):
+        for r in range(tile_n // row_tile):
+            rows = pl.ds(r * row_tile, row_tile)
+            fill_window(state_vmem.at[rows], window_vmem, cfgs=cfgs)
+            compress(
+                _rows(cos_sin_vmem, rows),
+                out_vmem.at[rows],
+                _rows(rope_out_vmem, rows),
+                global_idx=global_idx + r * row_tile,
+                whole_rows=whole_rows,
+            )
+
+    buffered_ref.by_rows(
+        cfgs,
+        whole_counts_ref[pl.program_id(0)],
+        functools.partial(run, whole_rows=True),
+        functools.partial(run, whole_rows=False),
+    )
 
 
 def compress_tile(
@@ -137,10 +148,16 @@ def compress_tile(
     kv_slot_mapping_ref,
     is_first_mask_ref,
     global_idx,
+    whole_rows: bool,
     cfgs: config.Configs,
 ):
     """Compresses, normalizes, ropes and packs the tokens whose windows
-    window_vmem holds; the other refs are views of those tokens' rows."""
+    window_vmem holds; the other refs are views of those tokens' rows.
+
+    whole_rows: the tokens fill one packed row in slot order, so the rows
+    they merge into are a fixed placement of their records and were not
+    read back.
+    """
     tile_n = config.ROW_TILE
     window = cfgs.window
     head_tiles = cfgs.head_tiles
@@ -222,15 +239,17 @@ def compress_tile(
                 last_dim_size=cfgs.last_dim_size,
             )
         if cfgs.dims.mode == config.Mode.CSA_INDEXER:
-            kv_slots = [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)]
             # out_vmem: (tile_n, 1, 4, 256) uint8, each token's whole row; a
             # row's sub-slot s is byte s of its words. Only the rows of
             # is_first_mask tokens are written back.
-            rows = pltpu.bitcast(out_vmem[:, 0], jnp.int32)  # (tile_n, 1, 256)
             records = nope_val_padded.astype(jnp.int32)  # (tile_n, 1, 256)
-            out_vmem[:, 0] = pltpu.bitcast(
-                compute.merge_slot_rows(rows, kv_slots, records), jnp.uint8
-            )
+            if whole_rows:
+                merged = compute.place_slot_row(records)
+            else:
+                kv_slots = [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)]
+                rows = pltpu.bitcast(out_vmem[:, 0], jnp.int32)  # (tile_n, 1, 256)
+                merged = compute.merge_slot_rows(rows, kv_slots, records)
+            out_vmem[:, 0] = pltpu.bitcast(merged, jnp.uint8)
 
         else:
             out_vmem[:, 0] = nope_val_padded
@@ -239,13 +258,14 @@ def compress_tile(
             # `csa_cache_layout`); rope_out_vmem holds each row-writer's row.
             words = compute.rope_words_tiled(rope_ropped, cfgs.dims.rope_head_dim)
             rope_lane = config.LANE - cfgs.dims.rope_head_dim
-            kv_slots = [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)]
-            # Only the rows of is_first_mask_rope tokens are written back.
-            rows = pltpu.bitcast(rope_out_vmem[...], jnp.int32)  # (tile_n, 1, 128)
-            rope_out_vmem[...] = pltpu.bitcast(
-                compute.merge_rope_rows(rows, kv_slots, words, rope_lane),
-                jnp.uint8,
-            )
+            if whole_rows:
+                merged = compute.place_rope_row(words, rope_lane)
+            else:
+                kv_slots = [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)]
+                # Only the rows of is_first_mask_rope tokens are written back.
+                rows = pltpu.bitcast(rope_out_vmem[...], jnp.int32)  # (tile_n, 1, 128)
+                merged = compute.merge_rope_rows(rows, kv_slots, words, rope_lane)
+            rope_out_vmem[...] = pltpu.bitcast(merged, jnp.uint8)
 
     else:
         # hca: bitcast bf16 -> uint8 and match the output block shape.
@@ -264,6 +284,7 @@ def kernel_fn(
     valid_counts_ref,
     first_counts_ref,
     first_rope_counts_ref,
+    whole_counts_ref,
     grid_size_ref,
     rms_weight_ref,
     # HBM inputs (dynamic access)
@@ -291,7 +312,12 @@ def kernel_fn(
         kv_slot_mapping_ref=kv_slot_mapping_ref,
         is_first_mask_ref=is_first_mask_ref,
         is_first_mask_rope_ref=is_first_mask_rope_ref,
-        copy_counts_refs=(valid_counts_ref, first_counts_ref, first_rope_counts_ref),
+        copy_counts_refs=(
+            valid_counts_ref,
+            first_counts_ref,
+            first_rope_counts_ref,
+            whole_counts_ref,
+        ),
     )
 
     pipeline_func = pltpu.emit_pipeline(
@@ -311,6 +337,7 @@ def kernel_fn(
                 window_scratch_ref,
                 kv_slot_mapping_ref,
                 is_first_mask_ref,
+                whole_counts_ref,
             ),
             allocations=allocations,
         )
@@ -362,6 +389,19 @@ def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
     is_first = valid & ~has_conflict
 
     return is_first.flatten()[:num_tokens]
+
+
+def compute_whole_row_mask(kv_slot_mapping, pack_factor=4):
+    """Whether each token is token j of an aligned run of pack_factor tokens
+    that fills one packed HBM row in slot order, as a prefill row tile does:
+    sub-slot j, right after token j - 1."""
+    j = jnp.arange(kv_slot_mapping.shape[0]) % pack_factor
+    after_prev = kv_slot_mapping == jnp.roll(kv_slot_mapping, 1) + 1
+    return (
+        (kv_slot_mapping >= 0)
+        & (kv_slot_mapping % pack_factor == j)
+        & ((j == 0) | after_prev)
+    )
 
 
 def window_group_index(positions, rows, block_table, *, cfgs: config.Configs):
@@ -479,9 +519,16 @@ def compress_norm_rope_store(
         kv_slot_mapping = jnp.pad(kv_slot_mapping, (0, pad), constant_values=-1)
         is_first_mask = jnp.pad(is_first_mask, (0, pad))
         is_first_mask_rope = jnp.pad(is_first_mask_rope, (0, pad))
+    # A step whose tokens all fill whole rows merges them by a fixed
+    # placement (see `compress_tile`).
+    whole_row_mask = jnp.zeros_like(is_first_mask)
+    if cfgs.merges_rows:
+        whole_row_mask = compute_whole_row_mask(kv_slot_mapping, config.ROW_TILE)
     # Each tile's record copies, by `buffered_ref.CopyCount`.
     copy_counts = (
-        jnp.stack([kv_slot_mapping >= 0, is_first_mask, is_first_mask_rope])
+        jnp.stack(
+            [kv_slot_mapping >= 0, is_first_mask, is_first_mask_rope, whole_row_mask]
+        )
         .reshape(len(buffered_ref.CopyCount), -1, cfgs.tile_sizes.tile_n)
         .sum(axis=-1, dtype=jnp.int32)
     )

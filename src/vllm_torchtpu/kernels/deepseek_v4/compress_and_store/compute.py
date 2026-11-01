@@ -259,6 +259,25 @@ def merge_rope_rows(
     return jnp.stack(merged)
 
 
+def place_rope_row(
+    words,  # rope_words_tiled(...) of one whole row's tokens, in slot order
+    rope_lane,  # int, lane of RoPE word 0 in `words`
+):
+    """`merge_rope_rows` for a tile that fills one row in slot order: every
+    tile row is that row, token ``j``'s words in window ``j``."""
+    per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
+    width = csa_cache_layout.ROPE_WORDS
+    lanes = words.shape[-1]
+    assert words.shape[0] == per_row, words.shape
+    window = jax.lax.broadcasted_iota(jnp.int32, words.shape[1:], 1) // width
+    row = None
+    for j in range(per_row):
+        shift = (j * width - rope_lane) % lanes
+        placed = pltpu.roll(words[j], shift, 1) if shift else words[j]
+        row = placed if row is None else jnp.where(window == j, placed, row)
+    return jnp.broadcast_to(row, words.shape)
+
+
 def merge_slot_rows(
     rows,  # (tile_n, 1, lanes) int32, each token's cache row as read from HBM
     kv_slots,  # tile_n scalar kv slots, one per token of the tile
@@ -285,3 +304,14 @@ def merge_slot_rows(
             row = jnp.where(hit, placed, row)
         merged.append(row)
     return jnp.stack(merged)
+
+
+def place_slot_row(records):  # (tile_n, 1, lanes) int32, as merge_slot_rows
+    """`merge_slot_rows` for a tile that fills one row in slot order: every
+    tile row is that row, token ``j``'s record in byte ``j`` of each word."""
+    bits = jnp.iinfo(jnp.uint8).bits
+    assert records.shape[0] == jnp.iinfo(jnp.int32).bits // bits, records.shape
+    row = records[0]
+    for j in range(1, records.shape[0]):
+        row = row | jnp.left_shift(records[j], j * bits)
+    return jnp.broadcast_to(row, records.shape)

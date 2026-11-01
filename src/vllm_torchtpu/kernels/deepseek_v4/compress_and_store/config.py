@@ -361,6 +361,12 @@ class Configs:
     def cache_last_dims(self) -> tuple[int, ...]:
         return (self.hbm_pack, self.last_dim_size)
 
+    @property
+    def merges_rows(self) -> bool:
+        """Whether tokens read-modify-write packed rows: CSA's RoPE rows, the
+        indexer's NoPE rows, each ROW_TILE tokens."""
+        return self.dims.has_rope_cache or self.dims.mode == Mode.CSA_INDEXER
+
     # --- slot translation helpers -----------------------------------------
     @property
     def tokens_in_second_minor(self) -> int:
