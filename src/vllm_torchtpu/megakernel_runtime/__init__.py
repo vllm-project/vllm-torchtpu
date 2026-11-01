@@ -40,10 +40,9 @@ _BRIDGE_EXPORTS = frozenset(
         "build_pooled_step_op",
         "execute_pooled_step_inplace",
         "export_pooled_step",
-        "make_typed_step_wrapper",
-        "sharded_jax_callable",
     }
 )
+_JAX_BRIDGE_EXPORTS = frozenset({"make_typed_step_wrapper", "sharded_jax_callable"})
 
 _COLLECTOR_EXPORTS = frozenset(
     {
@@ -99,6 +98,10 @@ def __getattr__(name: str) -> Any:
         from .backbone import find_backbone
 
         return find_backbone
+    if name in _JAX_BRIDGE_EXPORTS:
+        from . import jax_bridge
+
+        return getattr(jax_bridge, name)
     if name in _BRIDGE_EXPORTS:
         from . import exported_bridge
 

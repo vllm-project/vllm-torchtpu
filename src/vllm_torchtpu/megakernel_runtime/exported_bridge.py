@@ -13,7 +13,9 @@
 # limitations under the License.
 """Bridge between `megakernel` (`make_flat_pooled_step`) and PyTorch/vLLM.
 
-Provides:
+The generic torch <-> jax pieces (`sharded_jax_callable`,
+`make_typed_step_wrapper`, the CPU conversions) are in `jax_bridge`; this
+module adds the `cache` / `ModelSpec`-bound pooled-step op. Provides:
 - `build_pooled_step_op`: wraps `cache.make_flat_pooled_step` into a
   `sharded_jax_callable` + `@torch.library.custom_op` (taking `list[Tensor]`
   for `weights` and `pools` to stay under the PyTorch dispatcher's 64-argument
@@ -30,14 +32,11 @@ Provides:
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import jax
-import jax.numpy as jnp
-import numpy as np
 import torch
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -47,75 +46,16 @@ from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.pool.config import cache_exec
 from vllm_torchtpu.megakernel.runtime import build_global_avals
 from vllm_torchtpu.megakernel.spec import ModelSpec
-
-
-def _leaf_output_specs(output_partition_specs: Any) -> list[P]:
-    """Flatten `output_partition_specs` to one `PartitionSpec` per output leaf."""
-    return jax.tree.leaves(output_partition_specs, is_leaf=lambda s: isinstance(s, P))
-
-
-def sharded_jax_callable(
-    name: str,
-    fn: Callable[..., object],
-    *,
-    mesh: jax.sharding.Mesh,
-    input_partition_specs: Sequence[P],
-    output_partition_specs: Any,
-    donate_argnums: Sequence[int] | None = None,
-) -> Any:
-    """Wrap an SPMD JAX function over `mesh` into a `torch_tpu` `JaxCallable`.
-
-    Self-contained so `exported_bridge` does not depend on any `vllm` or
-    `vllm_torchtpu.distributed` modules when extracted to a standalone repo.
-    """
-    from torch_tpu._internal.pallas import pallas as pallas_impl
-
-    if "::" not in name or len(name.split("::")) != 2:
-        raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
-
-    init_sig = inspect.signature(pallas_impl.JaxCallable.__init__)
-    if "output_partition_specs" not in init_sig.parameters:
-        raise RuntimeError(
-            "torch_tpu.JaxCallable.__init__ does not support 'output_partition_specs'; "
-            "upgrade torch_tpu to use sharded_jax_callable."
-        )
-
-    signature = inspect.signature(inspect.unwrap(fn), eval_str=True)
-    pallas_impl._verify_signature(signature)
-    static_argnums = pallas_impl._infer_static_argnums(signature)
-    input_partition_specs = tuple(input_partition_specs)
-    out_shardings = jax.tree.map(
-        lambda s: NamedSharding(mesh, s),
-        output_partition_specs,
-        is_leaf=lambda s: isinstance(s, P),
-    )
-
-    jit_fn = jax.jit(
-        fn,
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums,
-        out_shardings=out_shardings,
-        keep_unused=True,
-    )
-    trace_key = pallas_impl._get_kernel_invocation_key(
-        f"{name}_{id(fn)}",
-        [],
-        {
-            "static_argnums": static_argnums,
-            "donate_argnums": donate_argnums,
-            "output_partition_specs": str(output_partition_specs),
-        },
-    )
-    return pallas_impl.JaxCallable(
-        name=name,
-        jit_fn=jit_fn,
-        trace_key=trace_key,
-        mesh=mesh,
-        input_partition_specs=input_partition_specs,
-        output_partition_specs=tuple(_leaf_output_specs(output_partition_specs)),
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums,
-    )
+from vllm_torchtpu.megakernel_runtime.jax_bridge import (
+    jax_to_torch_cpu as _jax_to_torch_cpu,
+)
+from vllm_torchtpu.megakernel_runtime.jax_bridge import (
+    make_typed_step_wrapper,
+    sharded_jax_callable,
+)
+from vllm_torchtpu.megakernel_runtime.jax_bridge import (
+    torch_cpu_to_jax as _torch_cpu_to_jax,
+)
 
 
 @dataclass(frozen=True)
@@ -132,56 +72,6 @@ class PooledStepExport:
 
 
 _OP_COUNTER = 0
-
-
-def _torch_cpu_to_jax(
-    t: torch.Tensor, sharding: NamedSharding | None = None
-) -> jax.Array:
-    """Convert a CPU `torch.Tensor` to a `jax.Array` without precision loss."""
-    t_c = t.detach().cpu().contiguous()
-    if t_c.dtype == torch.float8_e4m3fn:
-        arr = jnp.asarray(t_c.view(torch.uint8).numpy()).view(jnp.float8_e4m3fn)
-    elif t_c.dtype == torch.bfloat16:
-        arr = jnp.asarray(t_c.view(torch.uint16).numpy()).view(jnp.bfloat16)
-    else:
-        arr = jnp.asarray(t_c.numpy())
-    if sharding is not None:
-        arr = jax.device_put(arr, sharding)
-    return arr
-
-
-def _jax_to_torch_cpu(a: jax.Array, like: torch.Tensor) -> torch.Tensor:
-    """Convert a `jax.Array` to a CPU `torch.Tensor` matching `like.dtype`."""
-    np_arr = np.asarray(a)
-    if like.dtype == torch.float8_e4m3fn:
-        out = torch.from_numpy(np_arr.view(np.uint8).copy()).view(torch.float8_e4m3fn)
-    elif like.dtype == torch.bfloat16:
-        out = torch.from_numpy(np_arr.view(np.uint16).copy()).view(torch.bfloat16)
-    else:
-        out = torch.from_numpy(np_arr.copy()).to(like.dtype)
-    return out
-
-
-def make_typed_step_wrapper(
-    fn_name: str,
-    step_fn: Callable[..., Any],
-    num_inputs: int,
-    num_outputs: int,
-) -> Callable[..., Any]:
-    """Synthesize a fixed-arity `jax.Array`-annotated wrapper for `JaxCallable`.
-
-    `torch_tpu`'s `JaxCallable` inspects the function's explicit positional
-    parameters and rejects `*args` signatures.
-    """
-    args = [f"x{i}" for i in range(num_inputs)]
-    ret = "tuple[" + ", ".join(["jax.Array"] * num_outputs) + "]"
-    src = (
-        f"def {fn_name}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
-        f"    return _step_fn({', '.join(args)})\n"
-    )
-    ns: dict[str, Any] = {"jax": jax, "_step_fn": step_fn}
-    exec(compile(src, f"<{fn_name}>", "exec"), ns)  # noqa: S102
-    return ns[fn_name]
 
 
 def export_pooled_step(
