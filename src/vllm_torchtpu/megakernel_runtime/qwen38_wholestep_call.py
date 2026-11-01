@@ -87,8 +87,15 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     slot: the pair exchange buffers and the doubled-head union attention put b32 (f32 state)
     over scoped VMEM (tpu_bench_wholestep_call j-677db355: CompileTimeScopedVmemOom)."""
     t = _wholestep_tiles(B, max_groups)
-    if main_kv_dcp() > 1 and B > 16:
+    if main_kv_dcp() > 1 and 16 < B <= 32:
+        # Above 32 rows the GDN chunk gather (no NS-sized pg_rec) leaves room for the full
+        # expert ring: at b48 the trimmed 5 slots cost 0.3-0.4 ms per call vs 6 (j-74ef730a).
         t = dataclasses.replace(t, nbe=t.nbe - 1)
+    # VLLM_TPU_MK_RINGS=nbe:nbd (bench sweeps): override the ring depths.
+    rings = os.environ.get("VLLM_TPU_MK_RINGS", "")
+    if rings:
+        nbe, nbd = (int(x) for x in rings.split(":"))
+        t = dataclasses.replace(t, nbe=nbe, nbd=nbd)
     return t
 
 
