@@ -100,6 +100,12 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
         # Above 32 rows the GDN chunk gather (no NS-sized pg_rec) leaves room for the full
         # expert ring: at b48 the trimmed 5 slots cost 0.3-0.4 ms per call vs 6 (j-74ef730a).
         t = dataclasses.replace(t, nbe=t.nbe - 1)
+    # Head-major GDN state update on the chunked (WIDE, > 16 rows) path: per-head states stay
+    # in vregs (same-pod A/B j-ed2d3a52: b32 8.42 -> 8.24 ms, b64 14.28 -> 13.99 ms; gdn_rec was
+    # 1.7x its VPU floor). Reassociates the f32 sums (`GDNTunables` "approx").
+    # VLLM_TPU_MK_GDN_HM=0 restores the whole-state update.
+    if os.environ.get("VLLM_TPU_MK_GDN_HM", "1") not in ("", "0"):
+        t = t.with_blocks({"gdn": {"gdn_head_major": True}})
     # VLLM_TPU_MK_HIER=N (bench sweeps): override the all-reduce hierarchy.
     hier = os.environ.get("VLLM_TPU_MK_HIER", "")
     if hier:
