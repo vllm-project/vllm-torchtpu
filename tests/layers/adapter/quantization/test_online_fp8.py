@@ -151,6 +151,14 @@ def test_prequantized_conflict():
         linear(config, "quantized")
 
 
+def test_quantize_on_load_conflict_names_env_var(monkeypatch):
+    monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "proj")
+    config = make_config("nvfp4")
+    config.get_linear_config = lambda layer: None
+    with pytest.raises(ValueError, match="QUANTIZE_ON_LOAD_PREFIXES"):
+        linear(config, "proj")
+
+
 @pytest.mark.parametrize("kind", ["fp8", "nvfp4"])
 def test_checkpoint_method_preserved(kind, monkeypatch):
     config = make_config(kind)

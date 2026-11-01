@@ -83,10 +83,10 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                    VllmUnquantizedLinearMethod,
+                    VllmUnquantizedConfig,
                 )
 
-                return VllmUnquantizedLinearMethod()
+                return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
             return VllmFp8LinearMethodTPU(self, linear_config, prefix=prefix)
         elif isinstance(layer, RoutedExperts):
             if is_layer_skipped(

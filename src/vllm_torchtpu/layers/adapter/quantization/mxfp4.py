@@ -134,20 +134,20 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                    VllmUnquantizedLinearMethod,
+                    VllmUnquantizedConfig,
                 )
 
-                return VllmUnquantizedLinearMethod()
+                return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
             # MXFP4 linear layer is not implemented - use unquantized
             logger.warning_once(
                 "MXFP4 linear layer is not implemented on TPU - "
                 "using unquantized linear method."
             )
             from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                VllmUnquantizedLinearMethod,
+                VllmUnquantizedConfig,
             )
 
-            return VllmUnquantizedLinearMethod()
+            return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
 
         elif isinstance(layer, RoutedExperts):
             # RoutedExperts is the main use case for MXFP4 (MoE models like GPT-OSS)
