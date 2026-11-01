@@ -21,12 +21,17 @@
   `*args` step function (`JaxCallable` rejects `*args` signatures).
 - `torch_cpu_to_jax` / `jax_to_torch_cpu`: lossless CPU conversions for the
   CPU interpret path of unit tests.
+- `build_jax_step_op`: a JAX step function as a torch callable (a
+  `torch.library` custom op): `sharded_jax_callable` on TPU, the function run
+  by JAX on CPU otherwise, with donated outputs copied back into their input
+  tensors in place.
 """
 
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable, Sequence
+import itertools
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import jax
@@ -156,7 +161,151 @@ def make_typed_step_wrapper(
     return ns[fn_name]
 
 
+_OP_IDS = itertools.count()
+
+_TORCH_TO_JAX_DTYPE: dict[torch.dtype, Any] = {
+    torch.float32: jnp.float32,
+    torch.float16: jnp.float16,
+    torch.bfloat16: jnp.bfloat16,
+    torch.float8_e4m3fn: jnp.float8_e4m3fn,
+    torch.int64: jnp.int64,
+    torch.int32: jnp.int32,
+    torch.int16: jnp.int16,
+    torch.int8: jnp.int8,
+    torch.uint8: jnp.uint8,
+    torch.bool: jnp.bool_,
+}
+_JAX_TO_TORCH_DTYPE = {jnp.dtype(j): t for t, j in _TORCH_TO_JAX_DTYPE.items()}
+
+
+def _jax_to_torch(a: jax.Array) -> torch.Tensor:
+    """A CPU `torch.Tensor` of `a`'s own dtype (bit-exact for bf16 / fp8)."""
+    dtype = _JAX_TO_TORCH_DTYPE[jnp.dtype(a.dtype)]
+    return jax_to_torch_cpu(a, torch.empty((), dtype=dtype))
+
+
+def _eval_shapes(
+    fn: Callable[..., Any], operands: Sequence[torch.Tensor], n_out: int
+) -> list[jax.ShapeDtypeStruct]:
+    structs = [
+        jax.ShapeDtypeStruct(tuple(t.shape), _TORCH_TO_JAX_DTYPE[t.dtype])
+        for t in operands
+    ]
+    outs = jax.tree.leaves(jax.eval_shape(fn, *structs))
+    if len(outs) != n_out:
+        raise ValueError(f"step returned {len(outs)} outputs, out_specs has {n_out}")
+    return outs
+
+
+def build_jax_step_op(
+    fn: Callable[..., Any],
+    *,
+    mesh: jax.sharding.Mesh,
+    in_specs: Sequence[P],
+    out_specs: P | Sequence[P],
+    donate: Mapping[int, int] | None = None,
+    name: str | None = None,
+    interpret_on_cpu: bool = True,
+) -> Callable[..., Any]:
+    """A JAX step function as a torch callable over positional tensors.
+
+    `fn(*arrays)` is an SPMD JAX function over `mesh` whose operands are
+    sharded by `in_specs` and outputs by `out_specs` (one `PartitionSpec`:
+    the callable returns one tensor; a sequence: a tuple). `donate` maps an
+    output index to the input it updates: that input's buffer is donated on
+    TPU, and the output is copied back into the input tensor in place
+    (`data_ptr()` is preserved) and returned as that tensor.
+
+    The callable runs a `torch.library` custom op (a fake kernel from
+    `jax.eval_shape` keeps it traceable by `torch.compile`): with TPU tensors
+    it calls `sharded_jax_callable`, built on first use; with CPU tensors JAX
+    runs `fn` on its CPU devices (`interpret_on_cpu=False` makes that an
+    error). Kernels that need Pallas interpret mode on CPU choose it inside
+    `fn`.
+    """
+    single = isinstance(out_specs, P)
+    outs_specs: tuple[P, ...] = (out_specs,) if single else tuple(out_specs)
+    ins_specs = tuple(in_specs)
+    n_in, n_out = len(ins_specs), len(outs_specs)
+    aliases = dict(donate or {})
+    for o, i in aliases.items():
+        if not (0 <= o < n_out and 0 <= i < n_in):
+            raise ValueError(f"donate maps output {o} to input {i}: out of range")
+    if len(set(aliases.values())) != len(aliases):
+        raise ValueError("donate maps two outputs to one input")
+    op_id = next(_OP_IDS)
+    if name is None:
+        name = f"megakernel_runtime::jax_step_{op_id}"
+    elif "::" not in name:
+        name = f"megakernel_runtime::{name}_{op_id}"
+
+    def tuple_fn(*args: Any) -> tuple[Any, ...]:
+        out = fn(*args)
+        return (out,) if single else tuple(out)
+
+    in_sh = tuple(NamedSharding(mesh, s) for s in ins_specs)
+    out_sh = tuple(NamedSharding(mesh, s) for s in outs_specs)
+    cpu_fn = jax.jit(tuple_fn, in_shardings=in_sh, out_shardings=out_sh)
+    tpu_fn: list[Any] = []
+
+    def tpu_callable() -> Any:
+        if not tpu_fn:
+            typed = make_typed_step_wrapper(
+                name.replace("::", "_"), tuple_fn, n_in, n_out
+            )
+            tpu_fn.append(
+                sharded_jax_callable(
+                    name,
+                    typed,
+                    mesh=mesh,
+                    input_partition_specs=ins_specs,
+                    output_partition_specs=outs_specs,
+                    donate_argnums=tuple(sorted(aliases.values())) or None,
+                )
+            )
+        return tpu_fn[0]
+
+    @torch.library.custom_op(name, mutates_args=())
+    def op(operands: list[torch.Tensor]) -> list[torch.Tensor]:
+        if len(operands) != n_in:
+            raise ValueError(f"{name}: {len(operands)} operands, in_specs has {n_in}")
+        if operands[0].device.type == "cpu":
+            if not interpret_on_cpu:
+                raise RuntimeError(f"{name}: CPU operands with interpret_on_cpu=False")
+            arrays = [
+                torch_cpu_to_jax(t, sh) for t, sh in zip(operands, in_sh, strict=True)
+            ]
+            return [_jax_to_torch(a) for a in cpu_fn(*arrays)]
+        return list(tpu_callable()(*operands))
+
+    @op.register_fake
+    def _(operands: list[torch.Tensor]) -> list[torch.Tensor]:
+        dev = operands[0].device
+        return [
+            torch.empty(
+                s.shape, dtype=_JAX_TO_TORCH_DTYPE[jnp.dtype(s.dtype)], device=dev
+            )
+            for s in _eval_shapes(tuple_fn, operands, n_out)
+        ]
+
+    def step(*operands: torch.Tensor) -> Any:
+        outs = op(list(operands))
+        res = []
+        for o, out in enumerate(outs):
+            i = aliases.get(o)
+            if i is None:
+                res.append(out)
+            else:
+                operands[i].copy_(out)
+                res.append(operands[i])
+        return res[0] if single else tuple(res)
+
+    step.op = op  # type: ignore[attr-defined]
+    return step
+
+
 __all__ = [
+    "build_jax_step_op",
     "jax_to_torch_cpu",
     "make_typed_step_wrapper",
     "sharded_jax_callable",
