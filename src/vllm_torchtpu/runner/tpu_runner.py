@@ -5375,6 +5375,15 @@ class TPUModelRunner(GPUModelRunner):
                 "TPU_FUSED_ADD_RMSNORM_QUANT: %d norm -> fp8 linear pairs", n_pairs
             )
 
+        if envs.TPU_FUSED_ADD_RMSNORM and envs.TPU_FUSED_NORM_QKVA:
+            from vllm_torchtpu.layers.adapter.rmsnorm import arm_norm_qkva
+
+            n_nq = arm_norm_qkva(self.model)
+            logger.info(
+                "TPU_FUSED_NORM_QKVA: %d input norms run the MLA decode prologue",
+                n_nq,
+            )
+
         # Last: arming needs the drafter's MTP layer and the padding mask.
         if envs.USE_MOE_TP_DECODE_KERNEL:
             from vllm_torchtpu.layers.adapter.moe_tp_decode import arm, should_arm

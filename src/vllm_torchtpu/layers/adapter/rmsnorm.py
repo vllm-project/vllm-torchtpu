@@ -24,6 +24,7 @@ Imported only when the flag is set, so the flag-off model builds the stock
 ``RMSNorm`` class.
 """
 
+import contextlib
 from collections.abc import Callable
 from threading import Lock
 from typing import Any
@@ -35,8 +36,11 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import fused_add_rmsnorm as kernel
+from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_N_ATTR,
     FP8_PALLAS_WEIGHT,
+    KEEP_VLLM_LAYOUT_ATTR,
     PREQUANT_ATTR,
     PrequantSlot,
 )
@@ -434,6 +438,248 @@ def arm_prequant_moe(model: torch.nn.Module) -> int:
     return n
 
 
+_norm_qkva_ops: dict[tuple, object] = {}
+# The sequence-parallel prefill runs its layers on each core's share of the
+# step's rows, so a norm there sees 64 rows or fewer of a long step; its
+# attention wrapper projects those rows itself (the token split's gather).
+_norm_qkva_off = False
+
+
+@contextlib.contextmanager
+def norm_qkva_off():
+    """TPU_FUSED_NORM_QKVA's fused prologue stays off inside this block."""
+    global _norm_qkva_off
+    previous, _norm_qkva_off = _norm_qkva_off, True
+    try:
+        yield
+    finally:
+        _norm_qkva_off = previous
+
+
+# `attention._retain_buffers`, bound at arming (outside Dynamo).
+_retain_buffers: Callable[..., torch.Tensor] | None = None
+
+
+def _get_norm_qkva_op(
+    eps: float, q_eps: float, kv_eps: float, q_rank: int, kv_rank: int, emit_q8: bool
+):
+    """The TPU_FUSED_NORM_QKVA torch op (built at arming): returns
+    ``(y, new_residual, q_c, kv_c_normed, k_pe)`` and with ``emit_q8``
+    ``(q_c_fp8, q_c_scale)``."""
+    from vllm_torchtpu.kernels import fused_norm_qkva
+
+    key = (float(eps), float(q_eps), float(kv_eps), q_rank, kv_rank, emit_q8)
+    op = _norm_qkva_ops.get(key)
+    if op is not None:
+        return op
+    with _ops_lock:
+        op = _norm_qkva_ops.get(key)
+        if op is not None:
+            return op
+        tag = "_".join(
+            f"{e:.3e}".replace(".", "p").replace("-", "m").replace("+", "")
+            for e in key[:3]
+        )
+
+        def fn(
+            x: jax.Array,
+            residual: jax.Array,
+            ln_w: jax.Array,
+            w_q: jax.Array,
+            w_s: jax.Array,
+            qa_w: jax.Array,
+            kva_w: jax.Array,
+        ):
+            return fused_norm_qkva.fused_norm_qkva(
+                x,
+                residual,
+                ln_w,
+                w_q,
+                w_s,
+                qa_w,
+                kva_w,
+                eps=float(eps),
+                q_eps=float(q_eps),
+                kv_eps=float(kv_eps),
+                q_rank=q_rank,
+                kv_rank=kv_rank,
+                emit_q8=emit_q8,
+            )
+
+        # jax_op takes a fixed-length tuple return, not tuple[jax.Array, ...].
+        fn.__annotations__["return"] = tuple[(jax.Array,) * (7 if emit_q8 else 5)]
+
+        def fake(x, residual, ln_w, w_q, w_s, qa_w, kva_w):
+            rows = x.shape[0]
+            rope = w_q.shape[1] - q_rank - kv_rank
+            outs = [
+                torch.empty_like(x),
+                torch.empty_like(residual),
+                x.new_empty((rows, q_rank)),
+                x.new_empty((rows, kv_rank)),
+                x.new_empty((rows, rope)),
+            ]
+            if emit_q8:
+                outs.append(
+                    torch.empty((rows, q_rank), dtype=w_q.dtype, device=x.device)
+                )
+                outs.append(
+                    torch.empty((rows, 1), dtype=torch.float32, device=x.device)
+                )
+            return tuple(outs)
+
+        op = pallas.jax_op(
+            f"pallas::fused_norm_qkva_r{q_rank}_{kv_rank}_q{int(emit_q8)}_{tag}", fn
+        )
+        op.register_fake(fake)
+        _norm_qkva_ops[key] = op
+        return op
+
+
+def _plain_norm(norm) -> bool:
+    w = getattr(norm, "weight", None)
+    return (
+        norm is not None
+        and getattr(norm, "has_weight", False)
+        and getattr(norm, "variance_size_override", None) is None
+        and w is not None
+        and w.dtype == torch.bfloat16
+    )
+
+
+def _plain_fp8_weight(linear, prequant_ok: bool) -> bool:
+    """A per-channel FP8 linear whose every call is ``xla_quantized_matmul``
+    (or ``fp8_skinny``, or with a PREQUANT slot ``xla_prequantized_matmul``)
+    on its own canonical ``[k, n]`` weight."""
+    return (
+        _per_channel_fp8_linear(linear)
+        and getattr(linear, FP8_PALLAS_WEIGHT, None) is None
+        and not getattr(linear, KEEP_VLLM_LAYOUT_ATTR, False)
+        and (prequant_ok or getattr(linear, PREQUANT_ATTR, None) is None)
+    )
+
+
+def arm_norm_qkva(model: torch.nn.Module) -> int:
+    """TPU_FUSED_NORM_QKVA: pair each decoder layer's ``input_layernorm`` with
+    its MLA wrapper, so at decode buckets (at most ``fused_norm_qkva.MAX_ROWS``
+    rows) the norm runs ``kernels/fused_norm_qkva`` -- the add + RMSNorm,
+    ``fused_qkv_a_proj`` and the q_a / kv_a latent norms in one call -- and
+    leaves ``(q_c, kv_c_normed, k_pe)`` in a slot the wrapper reads instead of
+    running the three ops. Returns the pair count.
+
+    The norm holds aliases of the four weights it reads (the projection's
+    weight and scale, the two latent norm weights), never the modules. Both
+    sides of the rows branch lift both sets: the side that does not read a set
+    retains it (``attention._retain_buffers``), so the warmup can hand buckets
+    between the traces.
+
+    Where the wrapper calls ``q_b_proj`` itself (no q_b-overlap indexer), the
+    norm also emits q_c's fp8 quant above 16 rows (where ``fp8_skinny`` stops
+    and q_b runs ``xla_quantized_matmul``), handed to ``q_b_proj`` through its
+    PREQUANT slot: the q_b amax and convert passes go away, bit for bit.
+
+    Call on the target model only (the drafter is traced once for every
+    bucket and cannot branch on rows), after the post-load hooks (the rope
+    permutation replaces the projection's parameters).
+    """
+    global _retain_buffers
+    from vllm_torchtpu.kernels import fused_norm_qkva
+    from vllm_torchtpu.layers.adapter.attention import (
+        _retain_buffers as retain_buffers,
+    )
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUMultiHeadLatentAttentionWrapper,
+    )
+    from vllm_torchtpu.layers.adapter.linear_common import get_prequantized_matmul_op
+
+    max_rows = fused_norm_qkva.MAX_ROWS
+    _retain_buffers = retain_buffers
+    n = 0
+    for layer in model.modules():
+        ln_in = getattr(layer, "input_layernorm", None)
+        attn = getattr(layer, "self_attn", None)
+        if (
+            not isinstance(ln_in, TpuRMSNorm)
+            or attn is None
+            or getattr(layer, "use_sequence_parallel_moe", False)
+            or not _plain_norm(ln_in)
+        ):
+            continue
+        wrappers = [
+            m
+            for m in attn.modules()
+            if isinstance(m, VllmTPUMultiHeadLatentAttentionWrapper)
+        ]
+        if len(wrappers) != 1:
+            continue
+        w = wrappers[0]
+        qkv = w.fused_qkv_a_proj
+        if (
+            w.kimi_preprocess is not None
+            or w.q_lora_rank is None
+            or qkv is None
+            or w.gate_is_fused
+            or not _plain_norm(w.q_a_layernorm)
+            or not _plain_norm(w.kv_a_layernorm)
+            # TPU_FUSED_ADD_RMSNORM_QUANT's slot (prefill rows) may be on it.
+            or not _plain_fp8_weight(qkv, prequant_ok=True)
+            or getattr(qkv, FP8_PALLAS_N_ATTR, None) is not None
+        ):
+            continue
+        q_rank, kv_rank = w.q_lora_rank, w.kv_lora_rank
+        rope = w.qk_rope_head_dim
+        hidden = ln_in.hidden_size
+        if tuple(qkv.weight.shape) != (
+            hidden,
+            q_rank + kv_rank + rope,
+        ) or not fused_norm_qkva.supports(
+            max_rows, hidden, qkv.weight.shape[1], q_rank, kv_rank, rope
+        ):
+            continue
+        # The layers whose wrapper runs q_b_proj itself (the forward's
+        # non-overlap branch).
+        direct_qb = not w.qb_overlap or bool(
+            envs.TPU_QB_OVERLAP_HONORS_SKIP_TOPK and w.skip_topk
+        )
+        qb_slot = None
+        if direct_qb and _plain_fp8_weight(w.q_b_proj, prequant_ok=False):
+            get_prequantized_matmul_op()
+            qb_slot = PrequantSlot()
+            setattr(w.q_b_proj, PREQUANT_ATTR, qb_slot)
+        ln_in.register_buffer("_nq_w", qkv.weight.detach(), persistent=False)
+        # The kernel reads the vectors as [1, n] rows. A 1-D vector's layout is
+        # tiled by 1024, so reshaping it per call is a real relayout: 0.6 us
+        # each where XLA puts the result in HBM (16- and 32-row programs,
+        # vm-b9794158-e94e-45e4-9204). Rows built once here need none.
+        for name, t in (
+            ("_nq_lnw", ln_in.weight),
+            ("_nq_ws", qkv.weight_scale.float()),
+            ("_nq_qa", w.q_a_layernorm.weight),
+            ("_nq_kva", w.kv_a_layernorm.weight),
+        ):
+            ln_in.register_buffer(
+                name, t.detach().reshape(1, -1).clone(), persistent=False
+            )
+        ln_in._nq_ops = {
+            emit: _get_norm_qkva_op(
+                ln_in.variance_epsilon,
+                w.q_a_layernorm.variance_epsilon,
+                w.kv_a_layernorm.variance_epsilon,
+                q_rank,
+                kv_rank,
+                emit,
+            )
+            for emit in ((False, True) if qb_slot is not None else (False,))
+        }
+        ln_in._nq_max_rows = max_rows
+        slot = PrequantSlot()
+        ln_in._nq_slot = slot
+        w._nq_slot = slot
+        w._nq_qb_slot = qb_slot
+        n += 1
+    return n
+
+
 def keep_upstream_path(model: torch.nn.Module) -> int:
     """Pin every TpuRMSNorm in ``model`` to the upstream path; returns the count.
 
@@ -472,6 +718,10 @@ class TpuRMSNorm(RMSNorm):
         self._prequant_moe_slot = None
         self._op_quant_moe = None
         self._router_slot = None
+        # TPU_FUSED_NORM_QKVA: set by arm_norm_qkva.
+        self._nq_slot = None
+        self._nq_ops: dict[bool, Any] = {}
+        self._nq_max_rows = 0
         if self._pallas_ok:
             self._op_res = _get_op(self.variance_epsilon, True)
             self._op_nores = _get_op(self.variance_epsilon, False)
@@ -502,7 +752,58 @@ class TpuRMSNorm(RMSNorm):
             self._router_slot.value = torch.nn.functional.linear(y, self._router_weight)
         return out
 
+    def _norm_qkva_applies(
+        self, x: torch.Tensor, residual: torch.Tensor | None
+    ) -> bool:
+        """TPU_FUSED_NORM_QKVA's rows branch: decode buckets (`T <= cap`, a
+        power of 2), below every Pallas norm bucket."""
+        return (
+            self._nq_slot is not None
+            and not _norm_qkva_off
+            and residual is not None
+            and x.dim() == 2
+            and x.device.type == "tpu"
+            and x.dtype == torch.bfloat16
+            and residual.dtype == x.dtype
+            and residual.shape == x.shape
+            and x.shape[-1] == self.hidden_size
+            and x.shape[0] <= self._nq_max_rows
+            and not self._use_pallas(x, residual)
+        )
+
+    def _nq_buffers(self) -> tuple[torch.Tensor, ...]:
+        return self._nq_lnw, self._nq_w, self._nq_ws, self._nq_qa, self._nq_kva
+
     def _forward(self, x: torch.Tensor, residual: torch.Tensor | None):
+        if self._nq_slot is not None:
+            if self._norm_qkva_applies(x, residual):
+                assert residual is not None
+                # q_c's fp8 quant only where q_b_proj runs its XLA matmul.
+                emit_q8 = True in self._nq_ops and x.shape[0] > fp8_skinny.MAX_M
+                outs = self._nq_ops[emit_q8](
+                    x,
+                    residual,
+                    self._nq_lnw,
+                    self._nq_w,
+                    self._nq_ws,
+                    self._nq_qa,
+                    self._nq_kva,
+                )
+                self._nq_slot.value = tuple(outs[2:])
+                # The unfused side reads the norm's own weight; lift it here too.
+                assert _retain_buffers is not None
+                return _retain_buffers(outs[0], self.weight), outs[1]
+            out = self._forward_unfused(x, residual)
+            # The other side of the rows branch reads these; lift them here too.
+            assert _retain_buffers is not None
+            if residual is None:
+                return _retain_buffers(out, *self._nq_buffers())
+            y, new_res = out
+            y = _retain_buffers(y, *self._nq_buffers())
+            return y, new_res
+        return self._forward_unfused(x, residual)
+
+    def _forward_unfused(self, x: torch.Tensor, residual: torch.Tensor | None):
         if not self._use_pallas(x, residual):
             return super().forward(x, residual)
         if self._prequant_slot is not None and residual is not None and x.dim() == 2:
