@@ -50,13 +50,15 @@ def _wait_copies(vmem_ref, count, sem):
     """Waits for ``count`` copies of one leading-dim block of vmem_ref each.
 
     A DMA wait takes its descriptor's bytes off the semaphore, so the waits
-    need not name the blocks that were copied, only how many.
+    need not name the blocks that were copied, only how many: one wait per
+    set bit of ``count``, on that many blocks.
     """
-    block = vmem_ref.at[0]
+    for bit in range(vmem_ref.shape[0].bit_length()):
+        blocks = vmem_ref.at[pl.ds(0, 1 << bit)]
 
-    @pl.loop(0, count)
-    def _wait(_):
-        pltpu.make_async_copy(block, block, sem).wait()
+        @pl.when((count & (1 << bit)) != 0)
+        def _wait():
+            pltpu.make_async_copy(blocks, blocks, sem).wait()
 
 
 @jax.tree_util.register_dataclass
