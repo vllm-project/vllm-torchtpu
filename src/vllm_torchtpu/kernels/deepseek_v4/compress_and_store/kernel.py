@@ -27,8 +27,10 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config,
 )
 
-# Boundary tokens per grid step when the kernel fetches window groups.
-WINDOW_TILE_N = 16
+# Boundary tokens per grid step. An HCA window is 512 KiB of state rows, a
+# CSA one 64 KiB and an indexer one 16 KiB.
+TILE_N = 16
+HCA_TILE_N = 4
 
 
 def _rows(ref, rows):
@@ -53,7 +55,7 @@ def fill_window(state_vmem, window_vmem, *, cfgs: config.Configs):
     )
     for g in range(groups):
         # The first half of an overlapping window reads the prev half of the
-        # state (see `gather_from_page_buffer`).
+        # state.
         is_prev = not cfgs.dims.overlap or g < groups // 2
         window_rows = pl.ds(g * group_positions, group_positions)
         if cfgs.dims.mode == config.Mode.CSA_INDEXER:
@@ -104,28 +106,6 @@ def inner_kernel(
         cfgs=cfgs,
     )
 
-    if not cfgs.fetches_window_groups:
-        window_u8 = window_vmem.bitcast(jnp.uint8).reshape(
-            2, tile_n, cfgs.window, cfgs.head_tiles, 4, 128
-        )
-        compute.gather_from_page_buffer(
-            page_buffer=state_vmem,
-            positions_ref=positions_ref,
-            kv_window_u8=window_u8.at[0],
-            score_window_u8=window_u8.at[1],
-            global_idx=global_idx,
-            num_tokens=cfgs.dims.size_n,
-            window=cfgs.window,
-            block_size=cfgs.state_block_size,
-            pages_to_buffer_per_token=cfgs.pages_to_buffer_per_token,
-            field_rows=cfgs.field_rows,
-            state_rows_per_token=cfgs.state_rows_per_token,
-            overlap=cfgs.dims.overlap,
-            is_indexer=cfgs.dims.mode == config.Mode.CSA_INDEXER,
-        )
-        compress(cos_sin_vmem, out_vmem, rope_out_vmem, global_idx=global_idx)
-        return
-
     row_tile = config.ROW_TILE
     for r in range(tile_n // row_tile):
         rows = pl.ds(r * row_tile, row_tile)
@@ -153,7 +133,7 @@ def compress_tile(
 ):
     """Compresses, normalizes, ropes and packs the tokens whose windows
     window_vmem holds; the other refs are views of those tokens' rows."""
-    tile_n = cfgs.compute_tile_n
+    tile_n = config.ROW_TILE
     window = cfgs.window
     head_tiles = cfgs.head_tiles
 
@@ -449,7 +429,7 @@ def compress_norm_rope_store(
         state_physical_page_size=state_source.shape[1],
         state_block_size=state_block_size,
         rms_eps=rms_eps,
-        tile_n=WINDOW_TILE_N if config.fetches_window_groups(mode) else 4,
+        tile_n=HCA_TILE_N if mode is config.Mode.HCA else TILE_N,
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
@@ -493,17 +473,9 @@ def compress_norm_rope_store(
         is_first_mask = jnp.pad(is_first_mask, (0, pad))
         is_first_mask_rope = jnp.pad(is_first_mask_rope, (0, pad))
     rows = token_to_req_indices[:, None] * block_table_stride
-    # Look up each token's state pages here so the kernel keeps only those
+    # Look up each token's window groups here so the kernel keeps only those
     # entries in SMEM; the full block table does not fit at long context lengths.
-    if cfgs.fetches_window_groups:
-        token_pages = window_group_index(positions, rows, block_table, cfgs=cfgs)
-    else:
-        pages_per_token = cfgs.pages_to_buffer_per_token
-        offsets = jnp.arange(1 - pages_per_token, 1, dtype=positions.dtype)
-        window_blocks = jnp.maximum(
-            positions[:, None] // state_block_size + offsets[None, :], 0
-        )
-        token_pages = block_table[rows + window_blocks].reshape(-1)
+    token_pages = window_group_index(positions, rows, block_table, cfgs=cfgs)
     # Outer pallas_call operands, in call order. Optional operands are passed as
     # None to keep kernel_fn's argument positions fixed; pallas drops the Nones
     # when indexing, so alias indices count only the operands actually present.

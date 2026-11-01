@@ -108,50 +108,6 @@ class CosSinRef(_BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PageBufferRef(_BufferedRef):
-    # VMEM block: cfgs.page_buffer_shape()
-    #   (tile_n, pages_to_buffer_per_token, page_size, hbm_pack, LANE) uint8
-
-    def copy_in(self, src_ref, grid_indices):
-        assert self.sem_recvs is not None
-        assert self.window_ref is not None
-        slot = self.current_copy_in_slot
-        sem = self.sem_recvs.at[slot]
-        pid = grid_indices[0]
-
-        state_cache_ref, token_pages_ref = src_ref
-
-        tile_n = self.cfgs.tile_sizes.tile_n
-        pages_to_buffer_per_token = self.cfgs.pages_to_buffer_per_token
-
-        page_buffer_ref = cast(jax.Ref, self.window_ref.at[slot])
-        global_idx = pid * tile_n
-
-        @pl.loop(0, tile_n * pages_to_buffer_per_token, unroll=True)
-        def loop_body(idx):
-            n = idx // pages_to_buffer_per_token
-            p = idx % pages_to_buffer_per_token
-            idx_n = global_idx + n
-
-            # compress_norm_rope_store looks up each token's window pages,
-            # oldest first.
-            page = token_pages_ref[idx_n * pages_to_buffer_per_token + p]
-
-            src = state_cache_ref.at[page, :, :, :]
-            dest = page_buffer_ref.at[n, p, :, :, :]
-            pltpu.make_async_copy(src, dest, sem).start()
-
-    def wait_in(self, src_ref, grid_indices):
-        assert self.sem_recvs is not None
-        assert self.window_ref is not None
-        slot = self.current_wait_in_slot
-        sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True, kw_only=True)
 class WindowGroupRef(_BufferedRef):
     # VMEM block: cfgs.window_buffer_shape() + the state array's row shape,
     #   (tile_n, window_groups, group_positions, state_rows_per_token, ...),
@@ -473,7 +429,7 @@ def create_allocs_and_specs(
     tuple[
         CosSinRef | None,
         OutputRef,
-        PageBufferRef | WindowGroupRef,
+        WindowGroupRef,
         RoPEOutputRef | None,
     ],
     tuple[pl.BlockSpec | None, pl.BlockSpec, pl.BlockSpec, pl.BlockSpec | None],
@@ -484,23 +440,20 @@ def create_allocs_and_specs(
         tuple[Any, ...] | None,
     ],
 ]:
-    if cfgs.fetches_window_groups:
-        # The window DMAs read the state rows as the array declares them: an
-        # int32 word array's word l of a row is the bits of f32 lane l.
-        state_ref = cache_ref if state_cache_ref is None else state_cache_ref
-        num_pages, _, *state_row_shape = state_ref.shape
-        state_groups_ref = state_ref.reshape(
-            num_pages * cfgs.groups_per_page,
-            *cfgs.window_buffer_shape()[2:],
-            *state_row_shape,
-        )
-    # CSA's int32 NoPE / RoPE arrays (and a state array hosted on one) are
-    # read and written through their uint8 slab view (see `csa_cache_layout`).
+    # The window DMAs read the state rows as the array declares them: an
+    # int32 word array's word l of a row is the bits of f32 lane l.
+    state_ref = cache_ref if state_cache_ref is None else state_cache_ref
+    num_pages, _, *state_row_shape = state_ref.shape
+    state_groups_ref = state_ref.reshape(
+        num_pages * cfgs.groups_per_page,
+        *cfgs.window_buffer_shape()[2:],
+        *state_row_shape,
+    )
+    # CSA's int32 NoPE / RoPE arrays are read and written through their uint8
+    # slab view (see `csa_cache_layout`).
     cache_ref = csa_cache_layout.as_u8_slabs(cache_ref)
     if rope_cache_ref is not None:
         rope_cache_ref = csa_cache_layout.as_u8_slabs(rope_cache_ref)
-    if state_cache_ref is not None:
-        state_cache_ref = csa_cache_layout.as_u8_slabs(state_cache_ref)
     # Records are addressed by slot, so read and write them through flat rows.
     cache_rows_ref = _flat_rows(cache_ref)
 
@@ -547,41 +500,22 @@ def create_allocs_and_specs(
     else:
         output_args = (cache_rows_ref, kv_slot_mapping_ref)
 
-    # state: window groups, or whole pages to gather the window from
-    if cfgs.fetches_window_groups:
-        block_shape = (*cfgs.window_buffer_shape(), *state_row_shape)
-        page_buffer_spec = pl.BlockSpec(
-            block_shape=block_shape,
-            memory_space=pltpu.VMEM,
-            index_map=lambda i: (i,) + (0,) * (len(block_shape) - 1),
-        )
-        page_buffer_alloc = WindowGroupRef.create(
-            spec=page_buffer_spec,
-            dtype_or_type=state_ref.dtype,
-            buffer_type=pltpu.BufferType.INPUT,
-            buffer_count=2,
-            use_lookahead=False,
-            cfgs=cfgs,
-        )
-        page_buffer_args = (state_groups_ref, token_pages_ref)
-    else:
-        page_buffer_spec = pl.BlockSpec(
-            block_shape=cfgs.page_buffer_shape(),
-            memory_space=pltpu.VMEM,
-            index_map=lambda i: (i, 0, 0, 0),
-        )
-        page_buffer_alloc = PageBufferRef.create(
-            spec=page_buffer_spec,
-            dtype_or_type=jnp.uint8,
-            buffer_type=pltpu.BufferType.INPUT,
-            buffer_count=2,
-            use_lookahead=False,
-            cfgs=cfgs,
-        )
-        page_buffer_args = (
-            cache_ref if state_cache_ref is None else state_cache_ref,
-            token_pages_ref,
-        )
+    # state: each token's window groups
+    block_shape = (*cfgs.window_buffer_shape(), *state_row_shape)
+    state_spec = pl.BlockSpec(
+        block_shape=block_shape,
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i,) + (0,) * (len(block_shape) - 1),
+    )
+    state_alloc = WindowGroupRef.create(
+        spec=state_spec,
+        dtype_or_type=state_ref.dtype,
+        buffer_type=pltpu.BufferType.INPUT,
+        buffer_count=2,
+        use_lookahead=False,
+        cfgs=cfgs,
+    )
+    state_args = (state_groups_ref, token_pages_ref)
 
     # rope
     if cfgs.dims.has_rope_cache:
@@ -607,7 +541,7 @@ def create_allocs_and_specs(
         rope_alloc = rope_spec = rope_args = None
 
     return (
-        (cos_sin_alloc, output_alloc, page_buffer_alloc, rope_alloc),
-        (cos_sin_spec, output_spec, page_buffer_spec, rope_spec),
-        (cos_sin_args, output_args, page_buffer_args, rope_args),
+        (cos_sin_alloc, output_alloc, state_alloc, rope_alloc),
+        (cos_sin_spec, output_spec, state_spec, rope_spec),
+        (cos_sin_args, output_args, state_args, rope_args),
     )
