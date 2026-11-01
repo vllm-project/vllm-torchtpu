@@ -43,42 +43,50 @@ def fill_window(state_vmem, window_vmem, *, cfgs: config.Configs):
     state_vmem: (ROW_TILE,) + cfgs.window_buffer_shape()[1:] state rows, as
     `buffered_ref.WindowGroupRef` fetched them: int32 words, or uint8 slabs
     whose (4, lanes) row holds byte s of f32 lane l at [s, l]. Every slice is
-    static.
+    static. window_vmem row n * head_tiles + h holds token n's head tile h.
     """
     group_positions = cfgs.group_positions
     groups = cfgs.window_groups
     field_rows = cfgs.field_rows
     head_tiles = cfgs.head_tiles
     is_words = csa_cache_layout.is_word_array(state_vmem.dtype)
-    window_u8 = window_vmem.bitcast(jnp.uint8).reshape(
-        *window_vmem.shape[:-1], 4, config.LANE
-    )
+
+    def as_f32(rows):
+        if is_words:
+            return jax.lax.bitcast_convert_type(rows, jnp.float32)
+        return pltpu.bitcast(rows, jnp.float32)
+
     for g in range(groups):
         # The first half of an overlapping window reads the prev half of the
         # state.
         is_prev = not cfgs.dims.overlap or g < groups // 2
         window_rows = pl.ds(g * group_positions, group_positions)
-        if cfgs.dims.mode == config.Mode.CSA_INDEXER:
-            # uint8 (4, 256) rows, kv then score; the halves are lanes.
-            lanes = pl.ds(0 if is_prev else config.LANE, config.LANE)
-            for field in range(config.N_FIELDS):
-                window_u8[field, :, window_rows, 0] = state_vmem[
-                    :, g, :, field, :, lanes
-                ]
-            continue
-        if cfgs.dims.overlap:
-            kv_row = 0 if is_prev else field_rows
-            score_row = (2 if is_prev else 3) * field_rows
-        else:
-            kv_row, score_row = 0, field_rows
-        for field, row in ((0, kv_row), (1, score_row)):
-            rows = state_vmem[:, g, :, pl.ds(row, head_tiles)]
-            if is_words:
-                window_vmem[field, :, window_rows] = jax.lax.bitcast_convert_type(
-                    rows, jnp.float32
-                )
+        for n in range(config.ROW_TILE):
+            if cfgs.dims.mode == config.Mode.CSA_INDEXER:
+                # uint8 (4, 256) rows, kv then score; the halves are lanes.
+                lanes = pl.ds(0 if is_prev else config.LANE, config.LANE)
+                for field in range(config.N_FIELDS):
+                    window_vmem[field, window_rows, pl.ds(n, 1)] = as_f32(
+                        state_vmem[n, g, :, field, :, lanes]
+                    )
+                continue
+            if cfgs.dims.overlap:
+                kv_row = 0 if is_prev else field_rows
+                score_row = (2 if is_prev else 3) * field_rows
             else:
-                window_u8[field, :, window_rows] = rows
+                kv_row, score_row = 0, field_rows
+            first = n * head_tiles
+            for field, row in ((0, kv_row), (1, score_row)):
+                if is_words:
+                    rows = state_vmem[n, g, :, pl.ds(row, head_tiles)]
+                    window_vmem[field, window_rows, pl.ds(first, head_tiles)] = as_f32(
+                        rows
+                    )
+                    continue
+                # A uint8 slab row is one f32 row.
+                for h in range(head_tiles):
+                    rows = state_vmem[n, g, :, row + h]
+                    window_vmem[field, window_rows, pl.ds(first + h, 1)] = as_f32(rows)
 
 
 def inner_kernel(
@@ -143,22 +151,27 @@ def compress_tile(
         idx = global_idx + i
         safe_idx = jax.lax.select(idx < cfgs.dims.size_n, idx, 0)
         start_list.append(positions_ref[safe_idx] - window + 1)
-    start = jnp.stack(start_list)  # (tile_n,)
 
-    kv_val = window_vmem.at[0][...]  # (tile_n, window, head_tiles, 128)
-    scores_val = window_vmem.at[1][...]  # (tile_n, window, head_tiles, 128)
     rms_weight_tiled = rms_weight_vmem_ref[...].astype(jnp.float32)  # (head_tiles, 128)
 
     # --- windowed softmax ---
-    curr_pos = start[:, None] + jnp.arange(window)[None, :]  # (tile_n, window)
-    mask = curr_pos >= 0  # (tile_n, window)
+    # (window, tile_n * head_tiles, 128): full vregs, one row per head tile.
+    kv_val = window_vmem[0]
+    scores_val = window_vmem[1]
+    row_shape = (window, tile_n * head_tiles, 1)
+    row_token = jax.lax.broadcasted_iota(jnp.int32, row_shape, 1) // head_tiles
+    row_start = start_list[-1]
+    for i in reversed(range(tile_n - 1)):
+        row_start = jnp.where(row_token == i, start_list[i], row_start)
+    curr_pos = row_start + jax.lax.broadcasted_iota(jnp.int32, row_shape, 0)
+    mask = curr_pos >= 0
     mask_float = mask.astype(scores_val.dtype)
-    mask_float_reshaped = mask_float[:, :, None, None]  # (tile_n, window, 1, 1)
     neg_inf = jnp.array(-jnp.inf, dtype=scores_val.dtype)
-    masked_scores = jnp.where(mask_float_reshaped > 0.5, scores_val, neg_inf)
-    weights = jax.nn.softmax(masked_scores, axis=1)
-    kv_val = jnp.where(mask_float_reshaped > 0.5, kv_val, 0.0)
-    compressed = jnp.sum(weights * kv_val, axis=1)  # (tile_n, head_tiles, 128)
+    masked_scores = jnp.where(mask_float > 0.5, scores_val, neg_inf)
+    weights = jax.nn.softmax(masked_scores, axis=0)
+    kv_val = jnp.where(mask_float > 0.5, kv_val, 0.0)
+    compressed = jnp.sum(weights * kv_val, axis=0)  # (tile_n * head_tiles, 128)
+    compressed = compressed.reshape(tile_n, head_tiles, config.LANE)
 
     # --- rms norm ---
     variance = jnp.mean(jnp.square(compressed), axis=(1, 2), keepdims=True)

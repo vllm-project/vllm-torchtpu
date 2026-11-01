@@ -461,26 +461,8 @@ class Configs:
         return self.tile_sizes.tile_n
 
     def window_shape(self) -> tuple[int, ...]:
-        """f32 window scratch: (fields, tile, window, head_tiles, lane)."""
-        return (N_FIELDS, ROW_TILE, self.window, self.head_tiles, LANE)
-
-    def window_bytes_shape(self) -> tuple[int, ...]:
-        """uint8 view of the window scratch; each f32 lane -> FP32_BYTES rows.
-
-        Note: that trailing FP32_BYTES (4) is bytes-per-f32, NOT the HBM SLOT_PACK
-        (also 4) -- they're numerically equal but mean different things.
-
-        Returns:
-          The shape of the window bytes scratch.
-        """
-        return (
-            N_FIELDS,
-            ROW_TILE,
-            self.window,
-            self.head_tiles,
-            FP32_BYTES,
-            LANE,
-        )
+        """f32 window scratch: (fields, window, tile * head_tiles, lane)."""
+        return (N_FIELDS, self.window, ROW_TILE * self.head_tiles, LANE)
 
     def output_shape(self) -> tuple[int, ...]:
         """Packed output tile / VMEM block: (tile, record_rows) + cache_last_dims."""
