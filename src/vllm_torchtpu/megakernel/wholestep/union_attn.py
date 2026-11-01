@@ -24,6 +24,8 @@ each row masked to its own groups. Every row attends exactly the tokens it atten
 
 from __future__ import annotations
 
+import contextlib
+
 from typing import Any
 
 import jax
@@ -134,6 +136,7 @@ def attend_request(
     recent: tuple[jax.Array, jax.Array, list[jax.Array], jax.Array],
     phys: bool = False,
     dcp: int = 1,
+    sc: Any = None,
 ) -> list[Any]:
     """Gated sparse attention of one request's `T` rows over their union: `T` `[nh, 256]` F32.
 
@@ -151,6 +154,7 @@ def attend_request(
     scored per row (`[nh, 256]` queries, as `attend_row`); scaling follows `attend_row` without
     `fold`: K by `scale_k`, scores by `sm_scale`, V by `scale_v`, per tile.
     """
+    sc = sc or (lambda *_: contextlib.nullcontext())
     per_page = pool.shape[1] // MICRO
     nslots = ring.shape[0]
     ncols = ids.shape[1]
@@ -205,13 +209,18 @@ def attend_request(
 
     def tile(t: Any, carry: Any) -> Any:
         s = jax.lax.rem(t, nslots)
-        wait(t, s)
+        with sc("u_wait", 3):
+            wait(t, s)
         ahead = t + nslots - 1
 
         @pl.when(ahead < ntiles)
         def _():
             start(ahead, jax.lax.rem(ahead, nslots))
 
+        return _tile_body(t, s, carry)
+
+    def _tile_body(t: Any, s: Any, carry: Any) -> Any:
+      with sc("u_unpack", 3):
         win = codes[:, pl.ds(pl.multiple_of((t // 2) * 128, 128), 128)].astype(F32).astype(BF16)
         tok_code = jnp.where(
             jax.lax.rem(t, 2) == 0,
@@ -226,6 +235,7 @@ def attend_request(
         if dcp > 1:  # unowned slots hold the pair rank's rows (FP8: may be NaN)
             value = jnp.where(value == value, value, 0.0)
         value = jnp.where(tok_col < length, value * scale_v, 0.0)
+      with sc("u_rows", 3):
         out = []
         for r in range(T):
             m, l, acc = carry[r]

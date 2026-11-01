@@ -682,7 +682,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     off=self.offset(ctx, l), scale_k=ctx.extra[SCALES][0],
                     scale_v=ctx.extra[SCALES][1], sm_scale=g.HD**-0.5, interpret=ex.interpret,
                     recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any), phys=self.union_phys,
-                    dcp=self.dcp,
+                    dcp=self.dcp, sc=ctx.stream.sc,
                 )
             if self.dcp > 1:
                 for r, (att, lse) in zip(rs, res):
