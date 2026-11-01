@@ -70,6 +70,7 @@ def wholestep_qsa_writes(
     num_requests: int | None = None,
     batched: bool = True,
     dcp: tuple[Any, int] | None = None,
+    compressed_dcp: tuple[Any, int] | None = None,
 ) -> Any:
     """Write every QSA layer's step tokens, in layer order; returns the pool.
 
@@ -84,7 +85,9 @@ def wholestep_qsa_writes(
       token metadata once (`_batched_writes`); same bytes as the per-layer stock sequence.
       The fused-writer path (`VLLM_TPU_QSA_FUSED_KV_WRITE`) keeps the per-layer sequence.
     dcp: `(rank int32 [1], size)` under VLLM_TPU_QSA_MAIN_KV_DCP: main K/V rows go only to
-      their owner rank (`qsa_cache_writes`' rule); compressed keys and rings stay replicated.
+      their owner rank (`qsa_cache_writes`' rule); compressed keys and rings stay replicated
+      unless `compressed_dcp` (VLLM_TPU_QSA_COMPRESSED_DCP, the same pair): then each rank writes
+      only its owned groups' compressed keys.
     """
     n = len(context)
     nreq = n if num_requests is None else min(n, num_requests)
@@ -95,6 +98,7 @@ def wholestep_qsa_writes(
         return _batched_writes(
             pool, rows, norms, tables, layers, positions, trig, starts, context,
             compress_ratio=compress_ratio, norm_eps=norm_eps, rotary_dim=rotary_dim, dcp=dcp,
+            compressed_dcp=compressed_dcp,
         )
     for (key, value, index_k), (nk, nik), (ring, main, comp), lay in zip(
         rows, norms, tables, layers, strict=True
@@ -122,12 +126,13 @@ def wholestep_qsa_writes(
             main_slot=lay.main_slot,
             max_query_len=max_query_len,
             dcp=dcp,
+            compressed_dcp=compressed_dcp,
         )
     return pool
 
 
 def _batched_writes(pool, rows, norms, tables, layers, positions, trig, starts, context, *,
-                    compress_ratio, norm_eps, rotary_dim, dcp=None):
+                    compress_ratio, norm_eps, rotary_dim, dcp=None, compressed_dcp=None):
     """`qsa_cache_writes`' unfused sequence for all layers at once.
 
     Each layer's main K/V and compressed keys still go through their own writer (paired /
@@ -168,6 +173,7 @@ def _batched_writes(pool, rows, norms, tables, layers, positions, trig, starts, 
     completed, complete, _, _, ring, tags = update(raw, ring, tags, jnp.stack([n[1] for n in norms]))
     for o, ((_, _, comp), lay) in enumerate(zip(tables, layers, strict=True)):
         pool = write_compressed(pool, completed[o], complete[o], req, logical, starts, context,
-                                comp, compress_ratio, lay.compressed_slot)
+                                comp, compress_ratio, lay.compressed_slot,
+                                **({"dcp": compressed_dcp} if compressed_dcp is not None else {}))
     ids = jnp.where(jnp.tile(active, L), ids, 0)
     return write_ring_and_tags(pool, ring.reshape(L * nreq, -1), tags.reshape(L * nreq, -1), ids)

@@ -368,8 +368,11 @@ def _flat(x: Any) -> Any:
 def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     pl_ = d.get("per_layer")
+    car = d.get("carrier")
+    if car is not None and car.ndim == 4:  # per-rank carriers (compressed-key DCP) are [R, ...]
+        car = _rep(car, R)
     ck = (
-        (jax.device_put(kernel.fold(_rep(d["carrier"], R)), tp),
+        (jax.device_put(kernel.fold(car), tp),
          jax.device_put(_flat(d["cktab"]) if pl_ else d["cktab"], rep))
         if "carrier" in d
         else (jax.device_put(kernel.fold(_rep(d["ck"], R)), tp),)

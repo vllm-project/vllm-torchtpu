@@ -540,11 +540,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     build_pooled_qsa_compressed_dcp_op,
                 )
 
-                # VLLM_TPU_QSA_COMPRESSED_DCP: owned-group scoring, pair merge.
-                # The megakernel's whole-step writer still writes whole rows.
-                assert self._select_op is None, (
-                    "VLLM_TPU_QSA_COMPRESSED_DCP and VLLM_TPU_MEGAKERNEL are exclusive"
-                )
+                # VLLM_TPU_QSA_COMPRESSED_DCP: owned-group scoring, pair merge. The
+                # whole-step megakernel scores and writes the same split
+                # (`QSAFullIndexedBlock.compressed_dcp`); the segment kernel's
+                # select op does not (`select_for_kernel` refuses).
+                self._compressed_dcp = True
                 self._dcp_op = partial(
                     build_pooled_qsa_compressed_dcp_op(pair, self.main_kv_dcp),
                     kv_heads=self.num_kv_heads,
@@ -914,6 +914,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             raise NotImplementedError(
                 "select_for_kernel on the shared-selection sink layer: the draft's selection "
                 "would not be written (VLLM_TPU_QSA_DRAFT_SHARED_SELECTION)"
+            )
+        if getattr(self, "_compressed_dcp", False):
+            raise NotImplementedError(
+                "select_for_kernel under VLLM_TPU_QSA_COMPRESSED_DCP: the segment select op "
+                "scores whole compressed rows (the whole-step megakernel supports the split)"
             )
         assert self.pooled, "in-kernel QSA attention reads the unified pool"
         per_layer = cast(dict[str, AttentionMetadata], get_forward_context().attn_metadata)
