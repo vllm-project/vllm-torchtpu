@@ -946,31 +946,58 @@ def _routed_experts(
     *,
     tokens,
     probabilities_ready,
+    subtotal_hbm=None,
 ):
     """Joint GU/SiTU/first-down pipeline followed by remaining columns."""
-    columns = 1792 if tokens < 8192 else 896
-    tile = 128 if tokens < 8192 else 256
-    unroll = 8 if tokens < 8192 else 32
-    gu_unroll = 4 if tokens < 8192 else 8
-    first_down_unroll = 2 if tokens < 8192 else 8
-    metadata_row_capacity = 0 if tokens < 8192 else _COMPACT_8K_CAPACITY
-    ring_dtype = jnp.bfloat16
     assert tokens in (512, 1024, 2048, 4096, 8192)
     gu_width = gu_weights.shape[-1]
     assert gu_width % 2 == 0
     mid_width = gu_width // 2
     assert rhs.shape[-2] * 8 == mid_width
+    ep8_8k = tokens == 8192 and mid_width == 768
+    if tokens < 8192:
+        columns = 1792
+        packed_half = 896
+        main_width = rhs.shape[-1]
+        tail_width = 0
+        tile = 128
+        unroll = 8
+        gu_unroll = 4
+        first_down_unroll = 2
+        store_tile = 128
+    elif ep8_8k:
+        assert subtotal_hbm is not None
+        columns = 1280
+        packed_half = 640
+        main_width = 2560
+        tail_width = 1024
+        tile = 256
+        unroll = 20
+        gu_unroll = 16
+        first_down_unroll = 10
+        store_tile = 256
+    else:
+        columns = 896
+        packed_half = 512
+        main_width = rhs.shape[-1]
+        tail_width = 0
+        tile = 256
+        unroll = 32
+        gu_unroll = 8
+        first_down_unroll = 8
+        store_tile = 128
+    metadata_row_capacity = 0 if tokens < 8192 else _COMPACT_8K_CAPACITY
+    ring_dtype = jnp.bfloat16
     x = jax.ShapeDtypeStruct((tokens * 16, mid_width), latent.dtype)
     rows, width = (metadata_row_capacity or x.shape[0], rhs.shape[-1])
     assert rows <= x.shape[0]
     tm, tn, localrows = (tile, columns, tokens // 32)
-    packed_half = 512 if tokens == 8192 else tn // 2
-    assert width % tn == 0
+    assert main_width % tn == 0 and main_width + tail_width == width
     limit = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.98)
     cfg = k.make_gmm_configs(
         jax.ShapeDtypeStruct((rows, x.shape[-1]), x.dtype),
-        jax.ShapeDtypeStruct(rhs.shape[1:], rhs.dtype),
-        jax.ShapeDtypeStruct(scales.shape[1:], scales.dtype),
+        jax.ShapeDtypeStruct((*rhs.shape[1:-1], main_width), rhs.dtype),
+        jax.ShapeDtypeStruct((*scales.shape[1:-1], main_width), scales.dtype),
         None,
         counts,
         offset,
@@ -986,11 +1013,34 @@ def _routed_experts(
     cfg = dataclasses.replace(
         cfg, tiles=dataclasses.replace(cfg.tiles, tile_m=tm, tile_n=tn)
     )
+    cfg_tail = None
+    regions_tail = None
+    if ep8_8k:
+        cfg_tail = k.make_gmm_configs(
+            jax.ShapeDtypeStruct((rows, x.shape[-1]), x.dtype),
+            jax.ShapeDtypeStruct((*rhs.shape[1:-1], tail_width), rhs.dtype),
+            jax.ShapeDtypeStruct((*scales.shape[1:-1], tail_width), scales.dtype),
+            None,
+            counts,
+            offset,
+            tile_info=k.calculate_tiling,
+            vmem_limit_bytes=limit,
+            out_dtype=None,
+            acc_dtype=None,
+            maybe_quantize_lhs=False,
+            zero_initialize=False,
+            fuse_act=None,
+            rhs_quant_dtype=jnp.float4_e2m1fn,
+        )
+        cfg_tail = dataclasses.replace(
+            cfg_tail,
+            tiles=dataclasses.replace(cfg_tail.tiles, tile_m=tm, tile_n=tail_width),
+        )
+        regions_tail = k._regions(localrows, tail_width)
     sub = cfg.dims.size_lhs_sublane
     max_gm = cfg.dims.size_group + pl.cdiv(rows, tm) - 1
     regions = k._regions(localrows, tn)
     streams = len(regions)
-    store_tile = 128
     gu_cfg = k.make_gmm_configs(
         jax.ShapeDtypeStruct((rows, 3584), latent.dtype),
         jax.ShapeDtypeStruct(gu_weights.shape[1:], gu_weights.dtype),
@@ -1082,14 +1132,58 @@ def _routed_experts(
 
         # Real-prompt tuning: short expert loops need all twelve streams per
         # poll; longer loops alternate six-stream groups to bound polling cost.
-        def advance(stop, block, subtotal_vmem, *, drain=False, poll_round=0):
-            _ready_reduce(
-                tables, subtotal_vmem, out.at[:, pl.ds(block * tn, tn)],
-                sends, receives, credits, stores, payload, rx,
-                streams=regions, buffers=2, state=state, ring_meta=ring_meta, drain=drain, poll_round=poll_round, sparse_poll=(ng >= 72),
-            )
+        def advance(
+            stop,
+            block,
+            sub_src,
+            *,
+            drain=False,
+            poll_round=0,
+            local_buf=None,
+            local_sems=None,
+        ):
+            if ep8_8k:
+                _ready_reduce_hbm(
+                    tables,
+                    sub_src,
+                    out.at[:, pl.ds(block * tn, tn)],
+                    sends,
+                    receives,
+                    local_sems,
+                    credits,
+                    stores,
+                    payload,
+                    rx,
+                    local_buf,
+                    streams=regions,
+                    buffers=2,
+                    state=state,
+                    ring_meta=ring_meta,
+                    drain=drain,
+                    poll_round=poll_round,
+                    sparse_poll=(ng >= 72),
+                )
+            else:
+                _ready_reduce(
+                    tables,
+                    sub_src,
+                    out.at[:, pl.ds(block * tn, tn)],
+                    sends,
+                    receives,
+                    credits,
+                    stores,
+                    payload,
+                    rx,
+                    streams=regions,
+                    buffers=2,
+                    state=state,
+                    ring_meta=ring_meta,
+                    drain=drain,
+                    poll_round=poll_round,
+                    sparse_poll=(ng >= 72),
+                )
 
-        def emit_subtotals(subtotal_vmem):
+        def emit_subtotals(sub_dst, emit_sem=None):
             @pl.loop(0, tokens // store_tile)
             def block(b):
                 # Trim the aligned-layout padding before the existing ring.
@@ -1098,7 +1192,16 @@ def _routed_experts(
                     store_tile, 2 * packed_half
                 )
                 cast[...] = values[:, :tn].astype(jnp.bfloat16)
-                subtotal_vmem.at[pl.ds(b * store_tile, store_tile)][...] = cast[...]
+                if ep8_8k:
+                    cp = pltpu.make_async_copy(
+                        cast,
+                        sub_dst.at[pl.ds(b * store_tile, store_tile), pl.ds(0, tn)],
+                        emit_sem,
+                    )
+                    cp.start()
+                    cp.wait()
+                else:
+                    sub_dst.at[pl.ds(b * store_tile, store_tile)][...] = cast[...]
 
         def route(i):
             return (destinations[i], probabilities[i])
@@ -1184,7 +1287,17 @@ def _routed_experts(
                     guard=(g > 0),
                 )
 
-        def inner(x, w, metadata, *, first=False, subtotal_vmem=None):
+        def inner(
+            x,
+            w,
+            metadata,
+            *,
+            first=False,
+            sub_buf=None,
+            local_buf=None,
+            local_sems=None,
+            emit_sem=None,
+        ):
             g, n = (pl.program_id(1), 0 if first else pl.program_id(0) + 1)
             if not first:
 
@@ -1193,7 +1306,14 @@ def _routed_experts(
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
 
             if not first:
-                advance(jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem, poll_round=g)
+                advance(
+                    jnp.minimum(32, (g + 1) * 32 // ng),
+                    n - 1,
+                    sub_buf,
+                    poll_round=g,
+                    local_buf=local_buf,
+                    local_sems=local_sems,
+                )
             current = packed.at[g % 2]
             previous = packed.at[(g + 1) % 2]
             previous_g = jnp.maximum(g - 1, 0)
@@ -1233,26 +1353,43 @@ def _routed_experts(
                     overlap_work=overlap_work,
                 )
 
+            first_tail_unroll = 10 if ep8_8k else 8
+
             @pl.when(g > 0)
             def previous_tail():
                 consume(
                     previous_g,
                     previous,
                     (moved_rows if first else 0) + panel_count * down_unroll,
-                    loop_unroll=8 if first else unroll,
+                    loop_unroll=first_tail_unroll if first else unroll,
                 )
 
             @pl.when(g == ng - 1)
             def finish():
-                consume(g, current, loop_unroll=8 if first else unroll)
+                consume(g, current, loop_unroll=first_tail_unroll if first else unroll)
                 if not first:
-                    advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
-                    emit_subtotals(subtotal_vmem)
+                    advance(
+                        jnp.int32(32),
+                        n - 1,
+                        sub_buf,
+                        drain=True,
+                        local_buf=local_buf,
+                        local_sems=local_sems,
+                    )
+                    emit_subtotals(sub_buf, emit_sem=emit_sem)
                     state[0] = 0
+                    if not ep8_8k:
 
-                    @pl.when(n == width // tn - 1)
-                    def last():
-                        advance(jnp.int32(32), n, subtotal_vmem, drain=True)
+                        @pl.when(n == main_width // tn - 1)
+                        def last():
+                            advance(
+                                jnp.int32(32),
+                                n,
+                                sub_buf,
+                                drain=True,
+                                local_buf=local_buf,
+                                local_sems=local_sems,
+                            )
 
         (_, gu_ws), gu_ys = k.generate_block_specs(metadata, gu_cfg)
         gu_ws = k.FusedWeightsRef(gate=gu_ws, up=gu_ws)
@@ -1334,7 +1471,8 @@ def _routed_experts(
                 in_specs=(joint_gu_ws, joint_down_ws),
                 out_specs=gu_ys,
             )
-            refs = (gu, w, middle.reshape(-1, sub, mid_width))
+            w_main = jax.tree.map(lambda r: r.at[..., :main_width], w) if ep8_8k else w
+            refs = (gu, w_main, middle.reshape(-1, sub, mid_width))
             scratches = (metadata, gu_partial, acts, act_sems)
             if tokens == 8192:
                 # The 8K schedule already fills VMEM; retain its compact buffers.
@@ -1387,10 +1525,16 @@ def _routed_experts(
             pl.run_scoped(run_pipeline, (padded_gu, *allocations[1:]))
 
         @functools.partial(
-            pl.run_scoped, subtotal_vmem=pltpu.VMEM((tokens, tn), x.dtype)
+            pl.run_scoped,
+            subtotal_vmem=None if ep8_8k else pltpu.VMEM((tokens, tn), x.dtype),
+            local_buf=pltpu.VMEM((2, localrows, tn), ring_dtype) if ep8_8k else None,
+            local_sems=pltpu.SemaphoreType.DMA((2, streams)) if ep8_8k else None,
+            emit_sem=pltpu.SemaphoreType.DMA if ep8_8k else None,
         )
-        def remaining_columns(subtotal_vmem):
-            emit_subtotals(subtotal_vmem)
+        def remaining_columns(subtotal_vmem, local_buf, local_sems, emit_sem):
+            sub_buf = subtotal_hbm if ep8_8k else subtotal_vmem
+            assert sub_buf is not None
+            emit_subtotals(sub_buf, emit_sem=emit_sem)
             state[0] = 0
 
             def shifted(spec):
@@ -1403,15 +1547,225 @@ def _routed_experts(
                 shifted, ws, is_leaf=lambda v: isinstance(v, pl.BlockSpec)
             )
 
-            def remaining(x, w, metadata):
-                inner(x, w, metadata, subtotal_vmem=subtotal_vmem)
+            def remaining(x_r, w_r, metadata_r):
+                inner(
+                    x_r,
+                    w_r,
+                    metadata_r,
+                    sub_buf=sub_buf,
+                    local_buf=local_buf,
+                    local_sems=local_sems,
+                    emit_sem=emit_sem,
+                )
 
+            w_rem = jax.tree.map(lambda r: r.at[..., :main_width], w) if ep8_8k else w
             pltpu.emit_pipeline(
                 remaining,
-                grid=(width // tn - 1, ng, 1),
+                grid=(main_width // tn - 1, ng, 1),
                 in_specs=(xs, shifted_ws),
                 out_specs=(),
-            )(middle.reshape(-1, sub, mid_width), w, scratches=(metadata,))
+            )(middle.reshape(-1, sub, mid_width), w_rem, scratches=(metadata,))
+
+            if ep8_8k:
+                assert cfg_tail is not None and regions_tail is not None
+                (xs_tail, ws_tail), _ = k.generate_block_specs(metadata, cfg_tail)
+                w_tail = jax.tree.map(lambda r: r.at[..., main_width:width], w)
+                tail_half = tail_width // 2
+                tail_panels = tail_width // pltpu.get_tpu_info().mxu_column_size
+
+                @functools.partial(
+                    pl.run_scoped,
+                    packed_tail=pltpu.VMEM((2, tm, 2, tail_half), x.dtype),
+                    cast_tail=pltpu.VMEM((store_tile, tail_width), x.dtype),
+                    payload_tail=pltpu.VMEM((localrows, tail_width), ring_dtype),
+                    rx_tail=pltpu.VMEM((2, localrows, tail_width), ring_dtype),
+                )
+                def run_tail(packed_tail, cast_tail, payload_tail, rx_tail):
+                    sums_tail = sums.at[:, :, pl.ds(0, tail_half)]
+
+                    def b_unclamped_t(source, begin, base_idx, width_b):
+                        idxs = [base_idx + r for r in range(width_b)]
+                        routes = [route(i_r) for i_r in idxs]
+                        vals = [
+                            source.at[pl.ds(i_r - begin, 1)][...].astype(jnp.float32)
+                            for i_r in idxs
+                        ]
+                        olds = [sums_tail.at[pl.ds(d_r, 1)][...] for d_r, _ in routes]
+                        accs = [
+                            olds[r] + vals[r] * routes[r][1] for r in range(width_b)
+                        ]
+                        for r in range(width_b):
+                            sums_tail.at[pl.ds(routes[r][0], 1)][...] = accs[r]
+
+                    def b_clamped_t(source, begin, base_idx, end, width_b, *, guard):
+                        idxs = [base_idx + r for r in range(width_b)]
+                        actives = [guard & (idx_r < end) for idx_r in idxs]
+                        clamped = [jnp.minimum(idx_r, end - 1) for idx_r in idxs]
+                        routes = [route(c_r) for c_r in clamped]
+                        dests = [
+                            jnp.where(actives[r], routes[r][0], tokens + r)
+                            for r in range(width_b)
+                        ]
+                        weights_r = [
+                            jnp.where(actives[r], routes[r][1], 0.0)
+                            for r in range(width_b)
+                        ]
+                        vals = [
+                            source.at[pl.ds(c_r - begin, 1)][...].astype(jnp.float32)
+                            for c_r in clamped
+                        ]
+                        olds = [sums_tail.at[pl.ds(d_r, 1)][...] for d_r in dests]
+                        accs = [
+                            olds[r] + vals[r] * weights_r[r] for r in range(width_b)
+                        ]
+                        for r in range(width_b):
+                            sums_tail.at[pl.ds(dests[r], 1)][...] = accs[r]
+
+                    def consume_t(tile_g, source, first=0):
+                        start = metadata.gm_id_to_m_offset[tile_g]
+                        end = metadata.gm_id_to_m_offset[tile_g + 1]
+                        begin = start // sub * sub
+                        start = jnp.minimum(start + first, end)
+                        step_b = min(_RMW_BATCH, unroll)
+                        full = (end - start) // unroll
+
+                        @pl.loop(0, full)
+                        def chunk(b):
+                            base = start + b * unroll
+                            for u in range(0, unroll, step_b):
+                                b_unclamped_t(source, begin, base + u, step_b)
+
+                        tail_start = start + full * unroll
+                        tail_steps = pl.cdiv(end - tail_start, step_b)
+
+                        @pl.loop(0, tail_steps)
+                        def tail(tb):
+                            b_clamped_t(
+                                source,
+                                begin,
+                                tail_start + tb * step_b,
+                                end,
+                                step_b,
+                                guard=jnp.bool_(True),
+                            )
+
+                    prev_main_block = main_width // tn - 1
+
+                    def tail_inner(x_t, w_t, metadata_t):
+                        g = pl.program_id(1)
+
+                        @pl.when(g == 0)
+                        def clear_t():
+                            sums_tail[...] = jnp.zeros(sums_tail.shape, jnp.float32)
+
+                        advance(
+                            jnp.minimum(32, (g + 1) * 32 // ng),
+                            prev_main_block,
+                            sub_buf,
+                            poll_round=g,
+                            local_buf=local_buf,
+                            local_sems=local_sems,
+                        )
+                        cur_t = packed_tail.at[g % 2]
+                        prev_t = packed_tail.at[(g + 1) % 2]
+                        prev_g = jnp.maximum(g - 1, 0)
+
+                        def overlap_t(panel):
+                            start = metadata_t.gm_id_to_m_offset[prev_g]
+                            end = metadata_t.gm_id_to_m_offset[prev_g + 1]
+                            begin = start // sub * sub
+                            base_off = panel * unroll
+                            step_b = min(_RMW_BATCH, unroll)
+                            for row in range(0, unroll, step_b):
+                                b_clamped_t(
+                                    prev_t,
+                                    begin,
+                                    start + base_off + row,
+                                    end,
+                                    step_b,
+                                    guard=(g > 0),
+                                )
+
+                        @pl.when(g == 0)
+                        def init_prev_t():
+                            prev_t[...] = jnp.zeros(prev_t.shape, prev_t.dtype)
+
+                        @pl.when(active_ng > 0)
+                        def prod_t():
+                            _down_inner(
+                                x_t,
+                                w_t,
+                                cur_t,
+                                metadata_t,
+                                cfgs=cfg_tail,
+                                overlap_work=overlap_t,
+                            )
+
+                        @pl.when(g > 0)
+                        def prev_tail_t():
+                            consume_t(prev_g, prev_t, tail_panels * unroll)
+
+                        @pl.when(g == ng - 1)
+                        def finish_t():
+                            consume_t(g, cur_t)
+                            advance(
+                                jnp.int32(32),
+                                prev_main_block,
+                                sub_buf,
+                                drain=True,
+                                local_buf=local_buf,
+                                local_sems=local_sems,
+                            )
+
+                            @pl.loop(0, tokens // store_tile)
+                            def emit_b(b):
+                                vals = sums_tail[
+                                    pl.ds(b * store_tile, store_tile)
+                                ].reshape(store_tile, tail_width)
+                                cast_tail[...] = vals.astype(jnp.bfloat16)
+                                cp = pltpu.make_async_copy(
+                                    cast_tail,
+                                    sub_buf.at[
+                                        pl.ds(b * store_tile, store_tile),
+                                        pl.ds(0, tail_width),
+                                    ],
+                                    emit_sem,
+                                )
+                                cp.start()
+                                cp.wait()
+
+                            state[0] = 0
+                            _ready_reduce_hbm(
+                                tables,
+                                sub_buf,
+                                out.at[:, pl.ds(main_width, tail_width)],
+                                sends,
+                                receives,
+                                local_sems,
+                                credits,
+                                stores,
+                                payload_tail,
+                                rx_tail,
+                                local_buf,
+                                streams=regions_tail,
+                                buffers=2,
+                                state=state,
+                                ring_meta=ring_meta,
+                                drain=True,
+                                poll_round=0,
+                                sparse_poll=False,
+                            )
+
+                    pltpu.emit_pipeline(
+                        tail_inner,
+                        grid=(1, ng, 1),
+                        in_specs=(xs_tail, ws_tail),
+                        out_specs=(),
+                    )(
+                        middle.reshape(-1, sub, mid_width),
+                        w_tail,
+                        scratches=(metadata,),
+                    )
 
     def run(**scratch):
         kernel(
@@ -1503,9 +1857,11 @@ def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
         else rhs.weight.shape[-1]
     )
     block = cfgs.rhs_cfgs.quant_block_size
-    # The 8K window uses a 256-row tile. Smaller windows use 128 rows;
-    # their whole-tile conversion schedules better than panel-local loads.
-    panel_local = cfgs.tiles.tile_m == 256
+    # The 8K window uses a 256-row tile. Smaller windows and EP8 8K down
+    # projections (tile_k=768) convert whole tiles rather than panel-local loads.
+    panel_local = cfgs.tiles.tile_m == 256 and (
+        isinstance(rhs, k.FusedWeightsRef) or cfgs.tiles.tile_k > 768
+    )
     weights = None
     if not panel_local:
         weights = rhs.get_weight()
@@ -1884,6 +2240,195 @@ def _ready_reduce(
                     sweep(group)
 
 
+def _ready_reduce_hbm(
+    tables_ref,
+    x_hbm_ref,
+    o_ref,
+    send_sems,
+    recv_sems,
+    local_sems,
+    credits,
+    store_sem,
+    payload,
+    received,
+    local_buf,
+    *,
+    streams,
+    buffers,
+    state,
+    ring_meta,
+    drain=False,
+    poll_round=0,
+    sparse_poll=True,
+):
+    """12-stream ready-polled ICI ring reading local subtotals from HBM via 2-bank VMEM prefetch."""
+    assert buffers == 2
+    count = len(streams)
+    localrows = o_ref.shape[0]
+
+    def remote(stream, rows, cols, target, bank):
+        return pltpu.make_async_remote_copy(
+            payload.at[rows, cols],
+            received.at[bank, rows, cols],
+            send_sems.at[stream],
+            recv_sems.at[bank, stream],
+            device_id=target,
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    def local_copy(stream, rows, cols, begin, size, base, step_idx):
+        l_bank = step_idx & 1
+        src_rows = pl.ds(
+            pl.multiple_of(ring_meta[base + 2 + step_idx], localrows) + begin, size
+        )
+        return pltpu.make_async_copy(
+            x_hbm_ref.at[src_rows, cols],
+            local_buf.at[l_bank, rows, cols],
+            local_sems.at[l_bank, stream],
+        )
+
+    @pl.when(state[0] == 0)
+    def initialize():
+        for stream, region in enumerate(streams):
+            begin, size, col_begin, width = region
+            base = (stream % 6) * 34
+            rows, cols = pl.ds(begin, size), pl.ds(col_begin, width)
+            local_copy(stream, rows, cols, begin, size, base, jnp.int32(0)).start()
+            local_copy(stream, rows, cols, begin, size, base, jnp.int32(1)).start()
+
+        peers = [(ring_meta[d * 34],) for d in range(6)]
+        sem = pltpu.get_barrier_semaphore()
+        for peer in peers:
+            pl.semaphore_signal(
+                sem, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH
+            )
+        pl.semaphore_wait(sem, len(peers))
+
+        @functools.partial(pl.run_scoped, ready=pltpu.SemaphoreType.REGULAR)
+        def initialized(ready):
+            for peer in peers:
+                pl.semaphore_signal(
+                    ready, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH
+                )
+            pl.semaphore_wait(ready, len(peers))
+
+        for stream, region in enumerate(streams):
+            begin, size, col_begin, width = region
+            base = (stream % 6) * 34
+            rows, cols = pl.ds(begin, size), pl.ds(col_begin, width)
+            target = (ring_meta[base],)
+            local_copy(stream, rows, cols, begin, size, base, jnp.int32(0)).wait()
+            payload.at[rows, cols][...] = local_buf.at[0, rows, cols][...].astype(
+                payload.dtype
+            )
+            remote(stream, rows, cols, target, jnp.int32(0)).start()
+            local_copy(stream, rows, cols, begin, size, base, jnp.int32(2)).start()
+            state[1 + stream] = 1
+            state[1 + count + stream] = 0
+        state[0] = count + 1
+
+    def sweep(selected=None):
+        for stream, region in enumerate(streams):
+            if selected is not None and (stream // 6) != selected:
+                continue
+            begin, size, col_begin, width = region
+            base = (stream % 6) * 34
+            rows, cols = pl.ds(begin, size), pl.ds(col_begin, width)
+            units = size * width * jnp.dtype(payload.dtype).itemsize // 32
+            step = state[1 + stream]
+
+            @pl.when(state[1 + count + stream] == 0)
+            def receive(
+                *,
+                step=step,
+                stream=stream,
+                units=units,
+                base=base,
+                rows=rows,
+                cols=cols,
+                begin=begin,
+                size=size,
+            ):
+                r_bank = (step - 1) & 1
+                l_bank = step & 1
+                ready = (
+                    (pl.semaphore_read(send_sems.at[stream]) >= units)
+                    & (pl.semaphore_read(recv_sems.at[r_bank, stream]) >= units)
+                    & (pl.semaphore_read(local_sems.at[l_bank, stream]) >= units)
+                )
+
+                @pl.when(ready)
+                def reduce():
+                    target = (ring_meta[base],)
+                    remote(stream, rows, cols, target, r_bank).wait()
+                    local_copy(stream, rows, cols, begin, size, base, step).wait()
+                    payload.at[rows, cols][...] = (
+                        local_buf.at[l_bank, rows, cols][...].astype(jnp.float32)
+                        + received.at[r_bank, rows, cols][...].astype(jnp.float32)
+                    ).astype(payload.dtype)
+
+                    @pl.when(step + 2 < 32)
+                    def prefetch_next():
+                        local_copy(
+                            stream, rows, cols, begin, size, base, step + 2
+                        ).start()
+
+                    pl.semaphore_signal(
+                        credits.at[stream],
+                        1,
+                        device_id=(ring_meta[base + 1],),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    state[1 + count + stream] = jnp.where(step == 31, 2, 1)
+
+            @pl.when(state[1 + count + stream] == 1)
+            def forward(*, step=step, stream=stream, rows=rows, cols=cols, base=base):
+                available = (step < buffers) | (
+                    pl.semaphore_read(credits.at[stream]) >= 1
+                )
+
+                @pl.when(available)
+                def send():
+                    @pl.when(step >= buffers)
+                    def acquire():
+                        pl.semaphore_wait(credits.at[stream], 1)
+
+                    remote(stream, rows, cols, (ring_meta[base],), step & 1).start()
+                    state[1 + stream] = step + 1
+                    state[1 + count + stream] = 0
+
+            @pl.when(state[1 + count + stream] == 2)
+            def finish(*, stream=stream):
+                @pl.when(pl.semaphore_read(credits.at[stream]) >= buffers)
+                def release():
+                    pl.semaphore_wait(credits.at[stream], buffers)
+                    state[1 + count + stream] = 3
+                    state[0] = state[0] - 1
+
+    if drain:
+
+        def pending(i):
+            return state[0] != 1
+
+        def iterate(i):
+            sweep()
+            return i + 1
+
+        jax.lax.while_loop(pending, iterate, jnp.int32(0))
+        output = pltpu.make_async_copy(payload, o_ref, store_sem)
+        output.start()
+        output.wait()
+    else:
+
+        @pl.when(state[0] != 1)
+        def progress():
+            for group in range(2):
+
+                @pl.when(((poll_round & 1) == group) | ~sparse_poll)
+                def selected(*, group=group):
+                    sweep(group)
+
+
 def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
     """Normalize routed output and project up with three weight/prefix banks.
 
@@ -2009,6 +2554,7 @@ def _layer_kernel(
     fallback_counts=None,
     fallback_shared=None,
     maximum=None,
+    subtotal_hbm=None,
     route_counts=None,
 ):
     """One launch owns all compute, metadata and communication on the fast path.
@@ -2129,6 +2675,7 @@ def _layer_kernel(
                 s["reduced"],
                 tokens=tokens,
                 probabilities_ready=probabilities_ready,
+                subtotal_hbm=subtotal_hbm,
             )
             _epilogue(
                 control, s["reduced"], s["shared"], norm, latent_up, prefix, output
@@ -2210,6 +2757,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         ((seq_len * 16, mid_width), bf16),
     ]
     output_specs = [hbm] * 3
+    use_hbm_sub = seq_len == 8192 and ep == 8
     if seq_len == 8192:
         # Only 8K can overflow compact SMEM routing capacity. At <=4K every
         # route fits, so omit the unused overflow outputs and maximum DMA.
@@ -2221,6 +2769,9 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             ((1,), jnp.int32),
         ]
         output_specs += [hbm] * 4 + [pl.BlockSpec()]
+        if use_hbm_sub:
+            workspace_shapes += [((seq_len, 1280), bf16)]
+            output_specs += [hbm]
     counting = k._config().prefill_route_counts
     body = _layer_kernel
     if counting:
@@ -2279,7 +2830,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             routes = routes[None]
         if seq_len < 8192:
             return (outputs[0][None], routes) if counting else outputs[0][None]
-        final, latent, _, ids, probs, counts, shared, maximum = outputs
+        final, latent, _, ids, probs, counts, shared, maximum, *_ = outputs
 
         def overflow():
             reduced = routed_experts_prepared(
