@@ -29,6 +29,8 @@ GROUP_TOKENS = 1024
 # A step holds the whole hidden dimension of the weight, double-buffered:
 # 28 MiB for DeepSeek-V4-Pro's CSA compressor, past the default scoped limit.
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# Most tokens per tile: the rows one grid step streams through the MXU.
+TILE_N = 256
 # Compress ratios up to this pick each token's APE row from a table that
 # the one-hot APE product computes once per call; larger ratios run that
 # product on every token tile.
@@ -454,7 +456,7 @@ def proj_and_save_state(
 
     # The token dimension must be an exact multiple of `tile_n`.
     sublane_tile = 8
-    tile_n = min(128, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
+    tile_n = min(TILE_N, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
     num_n = pl.cdiv(num_tokens, tile_n)
     # Equal groups of at most GROUP_TOKENS, padded to whole groups. A group
     # spans at least two tiles, which the accumulator reuse relies on.
