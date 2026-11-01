@@ -19,6 +19,10 @@ Format: ``N:K`` or ``N:K:opt=val:...`` with options
   most M tokens left before its ``max_tokens``, for at most ``hold``
   consecutive steps (default 8). A short request then finishes before the next
   chunk lands in its decode window.
+* ``minb=B``: open a window only when at least B requests are decoding. An
+  inserted decode-only step at a small batch costs nearly a full step for few
+  tokens; the p90 tail decodes in crowded periods, where the step is cheap per
+  token.
 * ``deadline=D``: never defer while a waiting or partially prefilled request
   has waited more than D ms since arrival (TTFT guard).
 
@@ -46,6 +50,7 @@ class _Config:
     protect: int = 0
     hold: int = 8
     deadline_ms: float = 0.0
+    min_decodes: int = 0
 
     def window_for(self, prefill: int) -> int:
         if self.scale <= 0:
@@ -67,12 +72,13 @@ def _parse() -> _Config | None:
             protect=int(opts.pop("protect", 0)),
             hold=int(opts.pop("hold", 8)),
             deadline_ms=float(opts.pop("deadline", 0)),
+            min_decodes=int(opts.pop("minb", 0)),
         )
     except (IndexError, ValueError) as e:
         raise ValueError(f"VLLM_TPU_DECODE_PRIORITY={raw!r}: want N:K[:opt=val...]") from e
     if n <= 0 or k <= 0 or opts or cfg.hold <= 0:
         raise ValueError(f"VLLM_TPU_DECODE_PRIORITY={raw!r}: want N:K with N, K > 0 and "
-                         "options scale/protect/hold/deadline")
+                         "options scale/protect/hold/deadline/minb")
     return cfg
 
 
@@ -134,7 +140,10 @@ def patch_decode_priority() -> None:
             prefill = sum(n for n in out.num_scheduled_tokens.values() if n > decode)
             if prefill > 0:
                 self._tpu_protect_held = 0  # a chunk ran: the next near-done request may hold again
-            if prefill >= cfg.threshold:
+            if prefill >= cfg.threshold and (
+                not cfg.min_decodes
+                or sum(1 for r in self.running if _is_decoding(r)) >= cfg.min_decodes
+            ):
                 self._tpu_decode_only_left = cfg.window_for(prefill)
                 n = getattr(self, "_tpu_decode_windows", 0) + 1
                 self._tpu_decode_windows = n
