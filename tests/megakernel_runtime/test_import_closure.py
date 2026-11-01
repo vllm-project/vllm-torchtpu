@@ -17,8 +17,9 @@ With every `vllm_torchtpu.megakernel` module blocked except the package, its
 errors and the framework-free `runtime.contract` / `runtime.stats`, the
 runtime modules that land first (config, fingerprint, salt, plugin, hooks,
 testing, agreement, guards, driver, the generic jax bridge and weight source,
-the plugin test kit) import fine. The library-bound pieces (`exported_bridge`,
-`weight_collector`, `step_meta_ops`, `pool_facts`) are not covered.
+the plugin test kit and scaffold) import fine. The library-bound pieces
+(`exported_bridge`, `weight_collector`, `step_meta_ops`, `pool_facts`) are not
+covered.
 """
 
 from __future__ import annotations
@@ -57,6 +58,8 @@ _RUNTIME = (
     "vllm_torchtpu.megakernel_runtime.jax_bridge",
     "vllm_torchtpu.megakernel_runtime.weight_source",
     "vllm_torchtpu.megakernel_runtime.testkit",
+    "vllm_torchtpu.megakernel_runtime.provenance",
+    "vllm_torchtpu.megakernel_runtime.new",
 )
 
 
