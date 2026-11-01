@@ -492,6 +492,7 @@ def create_allocs_and_specs(
     is_first_mask_ref,
     is_first_mask_rope_ref,
     copy_counts_refs,
+    input_buffers: int,
 ) -> tuple[
     tuple[
         CosSinRef | None,
@@ -531,12 +532,13 @@ def create_allocs_and_specs(
             block_shape=cfgs.cos_sin_shape(),
             memory_space=pltpu.VMEM,
             index_map=lambda i: (i * tile_n, 0),
+            pipeline_mode=pl.Buffered(input_buffers),
         )
         cos_sin_alloc = CosSinRef.create(
             spec=cos_sin_spec,
             dtype_or_type=cfgs.dims.cos_sin_dtype,
             buffer_type=pltpu.BufferType.INPUT,
-            buffer_count=2,
+            buffer_count=input_buffers,
             use_lookahead=False,
             cfgs=cfgs,
         )
@@ -585,12 +587,13 @@ def create_allocs_and_specs(
         block_shape=block_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i,) + (0,) * (len(block_shape) - 1),
+        pipeline_mode=pl.Buffered(input_buffers),
     )
     state_alloc = WindowGroupRef.create(
         spec=state_spec,
         dtype_or_type=state_ref.dtype,
         buffer_type=pltpu.BufferType.INPUT,
-        buffer_count=2,
+        buffer_count=input_buffers,
         use_lookahead=False,
         cfgs=cfgs,
     )

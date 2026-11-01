@@ -31,6 +31,9 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
 # CSA one 64 KiB and an indexer one 16 KiB.
 TILE_N = 16
 HCA_TILE_N = 4
+# Buffers of the window and cos/sin pipes, so their copies are issued
+# INPUT_BUFFERS - 1 grid steps before the step that reads them.
+INPUT_BUFFERS = 3
 
 
 def _rows(ref, rows):
@@ -323,6 +326,7 @@ def kernel_fn(
             first_rope_counts_ref,
             whole_counts_ref,
         ),
+        input_buffers=INPUT_BUFFERS,
     )
 
     pipeline_func = pltpu.emit_pipeline(
