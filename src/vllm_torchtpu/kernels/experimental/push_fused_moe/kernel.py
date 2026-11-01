@@ -29,7 +29,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2 import host
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     FP4,
@@ -77,14 +76,15 @@ logger = init_logger(__name__)
 N_DISPATCH_TABLES = 2
 
 
-def tile_height_rungs(tile_m):
+def tile_height_rungs(tile_m, override=0):
     """v2's equally spaced tile-height ladder, emitted on every build.
 
     v2 emits the ladder only where a routed expert is expected to fit in one
     tile (rows_alloc <= ep * g_local * tile_m); this build always emits it,
-    which is what the push dispatch was measured with.
+    which is what the push dispatch was measured with. `override` (0 = the
+    default HEIGHT_RUNGS) is the rung count the caller chose.
     """
-    rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
+    rungs = override or HEIGHT_RUNGS
     step = tile_m // rungs
     if rungs < 2 or step % ROWBLK or step * rungs != tile_m:
         return (tile_m,)
@@ -108,6 +108,7 @@ def _build_push_moe_kernel(
     logical_intermediate_size=None,
     push_tokens,
     sc_prepush,
+    height_rungs_override=0,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -359,7 +360,7 @@ def _build_push_moe_kernel(
     # kernel converts between them with a shift.
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
-    height_rungs = tile_height_rungs(tile_m)
+    height_rungs = tile_height_rungs(tile_m, height_rungs_override)
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
     # read straight back out of it by the push that ships it -- two local

@@ -40,7 +40,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
     build_routing_tables_sharded,
     local_sort_activations,
@@ -93,6 +92,9 @@ from vllm_torchtpu.kernels.fused_moe.v2.layer import (
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # The routing payload is padded to whole lane blocks: an unaligned payload
 # (e.g. 192 experts) is lowered as an all-reduce, ~3x slower than the
@@ -199,11 +201,11 @@ def fused_ep_moe_push(
     token_replica_groups=None,
     logical_intermediate_size=None,
     preprocess_topology=None,
-    sc_prepush=None,
-    tc_exchange=None,
+    sc_prepush=2,
+    tc_exchange=False,
+    height_rungs_override=0,
     expert_slot=None,
     expert_load=None,
-    dispatch="all_gather",
 ):
     """Run one MoE layer through the push-dispatch fused EP kernel.
 
@@ -211,19 +213,25 @@ def fused_ep_moe_push(
     fused stage (see its docstring); `preprocess_topology` is accepted for
     call compatibility and unused, since no activation all-gather exists.
 
-    `sc_prepush` (default envs.MOE_FUSED_EP_PUSH_SC_PREPUSH) is how many
-    destination visit positions the SparseCore pushes before the TensorCore
-    kernel, clamped to [1, experts per shard]. `tc_exchange` (default
-    envs.MOE_FUSED_EP_PUSH_TC_EXCHANGE) runs the routing exchange as a
-    TensorCore remote-DMA kernel instead of XLA's all-gather.
+    `sc_prepush` is how many destination visit positions the SparseCore
+    pushes before the TensorCore kernel: at least 1 (a smaller value raises),
+    and a value above the experts per shard is clamped to it with a warning.
+    `tc_exchange` runs the routing exchange as a TensorCore remote-DMA kernel
+    instead of XLA's all-gather. `height_rungs_override` is the tile-height
+    ladder's rung count (0 = the default; see kernel.tile_height_rungs). The
+    caller (layers/adapter/fused_moe_ep.py) reads all three from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
-    replicated, optional) are v2's expert-layout operands with v2's meaning:
-    the weights' expert axis is in slot order, selected global ids map to
-    slots before dispatch (`_to_slots`, or the selector's labels when R == 1),
-    and with `expert_load` the layer returns (output, expert_load + this
-    step's routed rows per physical slot). `dispatch` is accepted for call
-    compatibility and must be "all_gather": the push build has its own.
+    replicated, optional) are the expert-layout operands dynamic EPLB
+    (#2523) passes. With `expert_slot`, the weights' expert axis is in
+    physical slot order (e_total slots over the mesh) while gating and
+    score_bias stay per logical expert: selection runs on logical ids, then
+    each selected id e maps to slot expert_slot[e, (global row) mod
+    (copies of e)] (`_to_slots`), so a replicated expert's rows split evenly
+    over its copies. With `expert_load`, the layer returns (output,
+    expert_load + this step's routed rows per physical slot); the counts are
+    the routing exchange's, identical on every shard. Without either, the
+    program is unchanged.
     """
     del preprocess_topology
     form = weight_form(weight_format)
@@ -246,10 +254,6 @@ def fused_ep_moe_push(
         raise ValueError("both weight scales are supplied together or neither is")
     T, hidden = x.shape
     e_total = w1.shape[0]
-    if dispatch != "all_gather":
-        raise ValueError(
-            f"the push build dispatches by itself; dispatch={dispatch!r} is v2's"
-        )
     has_expert_slot = expert_slot is not None
     has_expert_load = expert_load is not None
     # Global experts the router scores; without a layout, one slot each.
@@ -352,14 +356,22 @@ def fused_ep_moe_push(
             f"hash_topk_ids must be integer expert ids [{x.shape[0]}, {topk}]; "
             f"got {hash_topk_ids.dtype}{tuple(hash_topk_ids.shape)}"
         )
-    if sc_prepush is None:
-        sc_prepush = envs.MOE_FUSED_EP_PUSH_SC_PREPUSH
     # Visit positions [0, n_pre) go out on the SparseCore before the kernel;
     # at least one, so the kernel always starts on rows that have landed.
-    n_pre = max(1, min(int(sc_prepush), g_local))
-    if tc_exchange is None:
-        tc_exchange = envs.MOE_FUSED_EP_PUSH_TC_EXCHANGE
+    n_pre = int(sc_prepush)
+    if n_pre < 1:
+        raise ValueError(f"sc_prepush must be >= 1; got {sc_prepush}")
+    if n_pre > g_local:
+        logger.warning_once(
+            "push fused EP MoE: sc_prepush %d exceeds the %d experts per shard; "
+            "using %d",
+            n_pre,
+            g_local,
+            g_local,
+        )
+        n_pre = g_local
     tc_exchange = bool(tc_exchange)
+    height_rungs_override = int(height_rungs_override)
     kfn = build_push_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -376,6 +388,7 @@ def fused_ep_moe_push(
         logical_intermediate_size=logical_intermediate_size,
         push_tokens=t_local,
         sc_prepush=n_pre,
+        height_rungs_override=height_rungs_override,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -576,7 +589,7 @@ def fused_ep_moe_push(
             v0=0,
             v1=n_pre,
             slab_rows=ragged_stride,
-            name=f"moe_sc_hybrid_2c_s{n_pre}",
+            name=f"moe_sc_prepush_2c_s{n_pre}",
             rank=me,
         )
         plan_kw = dict(
@@ -790,6 +803,7 @@ def fused_ep_moe_push(
         logical_intermediate_size,
         n_pre,
         tc_exchange,
+        height_rungs_override,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

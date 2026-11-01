@@ -190,10 +190,18 @@ def _build_op(
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
     moe_layer = fused_ep_moe_v2
+    impl_kw = {}
     if envs.MOE_FUSED_EP_KERNEL_IMPL == "push":
-        # Same operands and admission as v2; only the dispatch differs.
+        # Same operands and admission as v2; only the dispatch differs. The
+        # push build's own knobs are read here, never inside kernels/.
         from vllm_torchtpu.kernels.experimental.push_fused_moe import (
             fused_ep_moe_push as moe_layer,
+        )
+
+        impl_kw = dict(
+            sc_prepush=envs.MOE_FUSED_EP_PUSH_SC_PREPUSH,
+            tc_exchange=envs.MOE_FUSED_EP_PUSH_TC_EXCHANGE,
+            height_rungs_override=envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)
@@ -213,6 +221,8 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         logical_intermediate_size,
+        envs.MOE_FUSED_EP_KERNEL_IMPL,
+        tuple(sorted(impl_kw.items())),
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -254,6 +264,7 @@ def _build_op(
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
             logical_intermediate_size=logical_intermediate_size,
+            **impl_kw,
             **bias_kw,
             **routing_kw,
         )
