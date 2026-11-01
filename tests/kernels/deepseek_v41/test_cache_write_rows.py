@@ -37,8 +37,9 @@ def test_row_writes_match_reference(sparsecore_device, count):
     rng = np.random.default_rng(count)
     cache = _random_words(rng, (8192, 128))
     rows = rng.permutation(8192)[:count].astype(np.int32)
-    rows[::7] = -1
+    # Offset before dropping: 8192 + (-1) would alias row 8191 several times.
     rows[3::11] = 8192 + rows[3::11]
+    rows[::7] = -1
     words = _random_words(rng, (count, 128))
     got = write_cache_rows(jnp.asarray(cache), jnp.asarray(rows), jnp.asarray(words))
     np.testing.assert_array_equal(got, _expected(cache, rows, words))
