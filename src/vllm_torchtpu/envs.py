@@ -231,6 +231,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_SPARSE_MLA_GATHER_PACKED_ROPE: bool = False
     TPU_SPARSE_MLA_GATHER_PACKED_ROPE_MIN_TOKENS: int = 128
+    TPU_PREFILL_GATHER_WINDOW_CACHE: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -1090,6 +1091,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so by default only the prefill buckets of 128 tokens and up use it.
     "TPU_SPARSE_MLA_GATHER_PACKED_ROPE_MIN_TOKENS": env_nonnegative_int(
         "TPU_SPARSE_MLA_GATHER_PACKED_ROPE_MIN_TOKENS", 128
+    ),
+    # Prefill buckets on the live-group fused prep (TPU_DCP_MLA_MIXED_FUSED_PREP):
+    # each chunk's SparseCore gather copies the request's newest 4096 cache rows
+    # into Spmem once and serves every 16-key stream that lies there from that
+    # copy, so the keys most tokens pick are read from HBM once per call; streams
+    # with no live key are not read. Same bytes on every live key.
+    "TPU_PREFILL_GATHER_WINDOW_CACHE": env_bool(
+        "TPU_PREFILL_GATHER_WINDOW_CACHE", default=False
     ),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),

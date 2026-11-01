@@ -61,6 +61,20 @@ WRITE_NOPE_PART, WRITE_ROPE_PART, WRITE_DST_PART, WRITE_PARTS = 0, 1, 2, 3
 # the second share one semaphore set (`write_semaphore_sets`).
 MAX_WRITE_TOKENS = 4 * NUM_SUBCORES
 MAX_SEPARATE_WRITE_ROUNDS = 2
+# Window cache (`window_cache`, TPU_PREFILL_GATHER_WINDOW_CACHE): each call
+# copies WINDOW_ROWS cache rows (the request's newest) into each SparseCore's
+# Spmem, and lane 0 of each 16-slot stream of the index list picks the
+# stream's source: a cache row reads HBM as today, WINDOW_SPMEM | offset reads
+# the window's copy, WINDOW_SKIP (no live slot) reads nothing.
+WINDOW_ROWS = 4096
+WINDOW_PIECE_ROWS = OCCURRENCES_PER_ATOM
+WINDOW_PIECES = WINDOW_ROWS // WINDOW_PIECE_ROWS
+WINDOW_SPMEM = 1 << 30
+WINDOW_SKIP = -1
+# Rows the window prep appends past the index list: lanes
+# [0, WINDOW_PIECES) of the first hold each window piece's first cache row.
+WINDOW_META_ROWS = 8
+WINDOW_BUFFERS = 4
 
 
 def _delta_swap(x, y, shift, mask):
@@ -439,6 +453,375 @@ def _kernel(
         )
 
 
+def window_cache_supported(
+    atoms_per_batch: int, num_subcores: int = NUM_SUBCORES
+) -> bool:
+    """Whether the window gather serves batches of `atoms_per_batch` atoms."""
+    return (
+        atoms_per_batch % WINDOW_BUFFERS == 0
+        and atoms_per_batch & (atoms_per_batch - 1) == 0
+        and WINDOW_PIECES % num_subcores == 0
+    )
+
+
+def _window_kernel(
+    nope_hbm_ref: Any,
+    rope_hbm_ref: Any,
+    indices_hbm_ref: Any,
+    live_hbm_ref: Any,
+    nope_out_hbm_ref: Any,
+    rope_out_hbm_ref: Any,
+    *,
+    index_vmem_ref: Any,
+    index_sem_ref: Any,
+    piece_vmem_ref: Any,
+    spmem_nope_ref: Any,
+    spmem_rope_ref: Any,
+    nope_vmem_ref: Any,
+    rope_vmem_ref: Any,
+    rope_out_vmem_ref: Any,
+    hbm_sem_ref: Any,
+    spmem_sem_ref: Any,
+    write_sem_ref: Any,
+    live_vmem_ref: Any = None,
+    core_axis_name: str,
+    subcore_axis_name: str,
+    num_owners: int,
+    num_subcores: int,
+    atoms_per_batch: int,
+    batches_per_owner: int,
+    window_offset: int,
+    guard_tail: bool,
+    rope_words: int,
+    packed_out: bool,
+):
+    """The gather with the window cache: same rows on every live slot.
+
+    Every subcore copies its share of the window's 64-row pieces into its
+    SparseCore's Spmem (through its fill buffer), then the subcores meet once.
+    The fill walks the owner's atoms with `WINDOW_BUFFERS` in flight; each
+    16-slot stream reads HBM or Spmem by its list entry, or nothing. Spmem
+    reads signal their own semaphores: an HBM read and a Spmem read in flight
+    on one semaphore fault or hang the SparseCore. A skipped stream's slots
+    keep finite rows (zeroed at entry, then earlier atoms' rows), which the
+    attention masks as past kv_len.
+    """
+    subcore = lax.axis_index(subcore_axis_name)
+    owner = lax.axis_index((core_axis_name, subcore_axis_name))
+    buffers = WINDOW_BUFFERS
+    streams = OCCURRENCES_PER_ATOM // NUM_LANES
+    batch_rows = atoms_per_batch * OCCURRENCES_PER_ATOM
+    batch_shift = atoms_per_batch.bit_length() - 1
+    last_atom = atoms_per_batch - 1
+    rope_rows = PACKED_OUT_ROWS if packed_out else QUADS_PER_ATOM
+
+    if live_hbm_ref is None:
+        live_batches = batches_per_owner * num_owners
+        owner_batches = batches_per_owner
+    else:
+        pltpu.sync_copy(live_hbm_ref, live_vmem_ref)
+        live_batches = live_vmem_ref[pl.ds(0, NUM_LANES)][0]
+        owner_batches = live_vmem_ref[pl.ds(NUM_LANES, NUM_LANES)][0]
+    own_batches = owner_batches
+    if guard_tail:
+        last_batch = owner + (owner_batches - 1) * num_owners
+        own_batches = owner_batches - (last_batch >= live_batches).astype(jnp.int32)
+
+    def index_copy(batch):
+        half = batch & 1
+        return pltpu.make_async_copy(
+            indices_hbm_ref.at[
+                pl.ds((owner + batch * num_owners) * batch_rows, batch_rows)
+            ],
+            index_vmem_ref.at[pl.ds(half * batch_rows, batch_rows)],
+            index_sem_ref.at[half],
+        )
+
+    def stream_rows(atom, stream):
+        start = (
+            (lax.shift_right_logical(atom, batch_shift) & 1) * batch_rows
+            + (atom & last_atom) * OCCURRENCES_PER_ATOM
+            + stream * NUM_LANES
+        )
+        return index_vmem_ref[pl.ds(start, NUM_LANES)]
+
+    def row_copies(rows, slot, stream, nope_src, rope_src, sem_ref):
+        lanes = pl.ds(stream * NUM_LANES, NUM_LANES)
+        return (
+            pltpu.make_async_copy(
+                nope_src.at[rows], nope_vmem_ref.at[slot, lanes], sem_ref.at[slot]
+            ),
+            pltpu.make_async_copy(
+                rope_src.at[rows], rope_vmem_ref.at[slot, lanes], sem_ref.at[slot]
+            ),
+        )
+
+    def each_read(atom, slot, act):
+        for stream in range(streams):
+            rows = stream_rows(atom, stream)
+            first = rows[0]
+
+            @pl.when((first >= 0) & (first < WINDOW_SPMEM))
+            def _hbm(rows=rows, stream=stream):
+                for cp in row_copies(
+                    rows, slot, stream, nope_hbm_ref, rope_hbm_ref, hbm_sem_ref
+                ):
+                    act(cp)
+
+            @pl.when(first >= WINDOW_SPMEM)
+            def _spmem(rows=rows, stream=stream):
+                offsets = rows & (WINDOW_SPMEM - 1)
+                for cp in row_copies(
+                    offsets, slot, stream, spmem_nope_ref, spmem_rope_ref, spmem_sem_ref
+                ):
+                    act(cp)
+
+    def start_atom(atom, slot):
+        each_read(atom, slot, lambda cp: cp.start())
+
+    def wait_atom(atom, slot):
+        each_read(atom, slot, lambda cp: cp.wait())
+
+    def writes(atom, slot):
+        block = (
+            owner + lax.shift_right_logical(atom, batch_shift) * num_owners
+        ) * atoms_per_batch + (atom & last_atom)
+        return (
+            pltpu.make_async_copy(
+                nope_vmem_ref.at[slot],
+                nope_out_hbm_ref.at[
+                    pl.ds(block * OCCURRENCES_PER_ATOM, OCCURRENCES_PER_ATOM)
+                ],
+                write_sem_ref.at[slot],
+            ),
+            pltpu.make_async_copy(
+                rope_out_vmem_ref.at[slot],
+                rope_out_hbm_ref.at[pl.ds(block * rope_rows, rope_rows)],
+                write_sem_ref.at[slot],
+            ),
+        )
+
+    def drain(atom, slot):
+        for cp in writes(atom, slot):
+            cp.wait()
+
+    def pack_rope(slot):
+        for row in range(QUADS_PER_ATOM):
+            data = transpose_quad(
+                [
+                    rope_vmem_ref[slot, row * ROPE_PACKING + t, :]
+                    for t in range(ROPE_PACKING)
+                ]
+            )
+            if packed_out:
+                out_row = row % PACKED_OUT_ROWS
+                first_word = row // PACKED_OUT_ROWS * QUAD_ROPE_WORDS
+                for band in range(QUAD_ROPE_WORDS // rope_words):
+                    rope_out_vmem_ref[
+                        slot, out_row, pl.ds(first_word + band * rope_words, rope_words)
+                    ] = data[band]
+                continue
+            for band in range(ROPE_PACKING):
+                rope_out_vmem_ref[slot, row, pl.ds(band * rope_words, rope_words)] = (
+                    data[band]
+                )
+
+    def load_window():
+        pltpu.sync_copy(
+            indices_hbm_ref.at[pl.ds(window_offset, WINDOW_PIECES)],
+            piece_vmem_ref.at[pl.ds(0, WINDOW_PIECES)],
+        )
+        pieces = WINDOW_PIECES // num_subcores
+        for j in range(pieces):
+            piece = subcore * pieces + j
+            start = pl.multiple_of(
+                piece_vmem_ref[pl.ds(piece, NUM_LANES)][0], WINDOW_PIECE_ROWS
+            )
+            window_rows = pl.ds(
+                pl.multiple_of(piece * WINDOW_PIECE_ROWS, WINDOW_PIECE_ROWS),
+                WINDOW_PIECE_ROWS,
+            )
+            pltpu.sync_copy(
+                nope_hbm_ref.at[pl.ds(start, WINDOW_PIECE_ROWS)], nope_vmem_ref.at[0]
+            )
+            pltpu.sync_copy(
+                rope_hbm_ref.at[pl.ds(start, WINDOW_PIECE_ROWS)], rope_vmem_ref.at[0]
+            )
+            pltpu.sync_copy(nope_vmem_ref.at[0], spmem_nope_ref.at[window_rows])
+            pltpu.sync_copy(rope_vmem_ref.at[0], spmem_rope_ref.at[window_rows])
+        plsc.subcore_barrier()
+
+    def zero_buffers():
+        zero = jnp.zeros((NUM_LANES,), jnp.uint32)
+        nope_vectors = OCCURRENCES_PER_ATOM * 128 // NUM_LANES
+
+        @plsc.parallel_loop(0, buffers * nope_vectors, unroll=8)
+        def _zero_nope(i):
+            slot, rest = i // nope_vectors, i % nope_vectors
+            nope_vmem_ref[
+                slot,
+                rest // (128 // NUM_LANES),
+                pl.ds(rest % (128 // NUM_LANES) * NUM_LANES, NUM_LANES),
+            ] = zero
+
+        @plsc.parallel_loop(0, buffers * OCCURRENCES_PER_ATOM, unroll=8)
+        def _zero_rope(i):
+            for part in range(rope_words // NUM_LANES):
+                rope_vmem_ref[
+                    i // OCCURRENCES_PER_ATOM,
+                    i % OCCURRENCES_PER_ATOM,
+                    pl.ds(part * NUM_LANES, NUM_LANES),
+                ] = zero
+
+        if not packed_out:
+
+            @plsc.parallel_loop(0, buffers * QUADS_PER_ATOM, unroll=8)
+            def _zero_rope_out(i):
+                for part in range(128 // NUM_LANES):
+                    rope_out_vmem_ref[
+                        i // QUADS_PER_ATOM,
+                        i % QUADS_PER_ATOM,
+                        pl.ds(part * NUM_LANES, NUM_LANES),
+                    ] = zero
+
+    def fill():
+        index_copy(0).wait()
+        atoms = own_batches * atoms_per_batch
+        for atom in range(buffers - 1):
+            start_atom(atom, atom)
+
+        def step(group, carry):
+            for slot in range(buffers):
+                atom = group * buffers + slot
+                batch = lax.shift_right_logical(atom, batch_shift)
+                ahead = atom + buffers - 1
+                ahead_slot = (slot + buffers - 1) % buffers
+
+                @pl.when(((atom & last_atom) == 0) & (batch + 1 < own_batches))
+                def _next_indices():
+                    index_copy(batch + 1).start()
+
+                @pl.when(ahead < atoms)
+                def _prefetch():
+                    @pl.when(ahead >= buffers)
+                    def _reuse():
+                        drain(ahead - buffers, ahead_slot)
+
+                    @pl.when((ahead & last_atom) == 0)
+                    def _indices():
+                        index_copy(lax.shift_right_logical(ahead, batch_shift)).wait()
+
+                    start_atom(ahead, ahead_slot)
+
+                wait_atom(atom, slot)
+                pack_rope(slot)
+                for cp in writes(atom, slot):
+                    cp.start()
+            return carry
+
+        lax.fori_loop(0, own_batches * (atoms_per_batch // buffers), step, 0)
+        for slot in range(buffers):
+            drain(atoms - buffers + slot, slot)
+
+    @pl.when(owner_batches > 0)
+    def _serve():
+        pl.when(own_batches > 0)(lambda: index_copy(0).start())
+        load_window()
+        zero_buffers()
+        pl.when(own_batches > 0)(fill)
+
+
+def _window_gather(
+    operands: list[Any],
+    *,
+    out_size: int,
+    num_cores: int,
+    num_subcores: int,
+    atoms_per_batch: int,
+    batches_per_owner: int,
+    guard_tail: bool,
+    rope_words: int,
+    packed_out: bool,
+    live: bool,
+) -> tuple[jax.Array, ...]:
+    """`dsa_gather_native_sc(window_cache=True)`'s kernel call; `operands` are
+    the cache views, the flat index list with the window pieces past
+    `out_size`, and the live vector when `live`."""
+    if not window_cache_supported(atoms_per_batch, num_subcores):
+        raise ValueError(
+            f"window_cache needs a power-of-two multiple of {WINDOW_BUFFERS} atoms "
+            f"per batch (got {atoms_per_batch}) and {WINDOW_PIECES} window pieces "
+            f"split over {num_subcores} subcores"
+        )
+    rope_rows = PACKED_OUT_ROWS if packed_out else QUADS_PER_ATOM
+    vmem, shared = pltpu.VMEM, pltpu.VMEM_SHARED
+    buffers = WINDOW_BUFFERS
+    scratch_types = {
+        "index_vmem_ref": vmem(
+            (2 * atoms_per_batch * OCCURRENCES_PER_ATOM,), jnp.int32
+        ),
+        "index_sem_ref": pltpu.SemaphoreType.DMA((2,)),
+        "piece_vmem_ref": vmem((WINDOW_PIECES + NUM_LANES,), jnp.int32),
+        "spmem_nope_ref": shared((WINDOW_ROWS, 128), jnp.uint32),
+        "spmem_rope_ref": shared((WINDOW_ROWS, rope_words), jnp.uint32),
+        "nope_vmem_ref": vmem((buffers, OCCURRENCES_PER_ATOM, 128), jnp.uint32),
+        "rope_vmem_ref": vmem((buffers, OCCURRENCES_PER_ATOM, rope_words), jnp.uint32),
+        "rope_out_vmem_ref": vmem((buffers, rope_rows, 128), jnp.uint32),
+        "hbm_sem_ref": pltpu.SemaphoreType.DMA((buffers,)),
+        "spmem_sem_ref": pltpu.SemaphoreType.DMA((buffers,)),
+        "write_sem_ref": pltpu.SemaphoreType.DMA((buffers,)),
+    }
+    if live:
+        scratch_types["live_vmem_ref"] = vmem((2 * NUM_LANES,), jnp.int32)
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=num_cores,
+        num_subcores=num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    inner = functools.partial(
+        _window_kernel,
+        core_axis_name=mesh.core_axis_name,
+        subcore_axis_name=mesh.subcore_axis_name,
+        num_owners=num_cores * num_subcores,
+        num_subcores=num_subcores,
+        atoms_per_batch=atoms_per_batch,
+        batches_per_owner=batches_per_owner,
+        window_offset=out_size,
+        guard_tail=guard_tail,
+        rope_words=rope_words,
+        packed_out=packed_out,
+    )
+
+    def body(*refs, **scr):
+        nope, rope, idx = refs[:3]
+        live_ref = refs[3] if live else None
+        nope_o, rope_o = refs[-2:]
+        return inner(nope, rope, idx, live_ref, nope_o, rope_o, **scr)
+
+    return core_map_helper.kernel(
+        body,
+        out_type=(
+            jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
+            jax.ShapeDtypeStruct(
+                (out_size // OCCURRENCES_PER_ATOM * rope_rows, 128), jnp.uint32
+            ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=False,
+            needs_layout_passes=False,
+            disable_bounds_checks=True,
+        ),
+        scratch_types=scratch_types,
+        mesh=mesh,
+        name=(
+            f"sc_native_sc_gather_window_a{atoms_per_batch}{'_live' if live else ''}"
+            f"{'_packedrope' if rope_words == PACKED_ROPE_WORDS else ''}"
+            f"{'_packedout' if packed_out else ''}"
+        ),
+    )(*operands)
+
+
 # Test-only faults of the write phase (positive controls).
 WRITE_FAULTS = (
     None,
@@ -686,6 +1069,7 @@ def live_vec_geometry(out_size: int, atoms_per_batch: int) -> tuple[int, ...]:
         "packed_rope",
         "early_dma",
         "packed_out",
+        "window_cache",
     ),
 )
 def dsa_gather_native_sc(
@@ -709,6 +1093,7 @@ def dsa_gather_native_sc(
     packed_rope: bool = False,
     early_dma: bool = False,
     packed_out: bool = False,
+    window_cache: bool = False,
 ) -> tuple[jax.Array, ...]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -786,6 +1171,14 @@ def dsa_gather_native_sc(
     in 8 rows, row p holding quad p's 64 words then quad p + 8's
     (`expand_packed_rope` restores the padded rows). Half the ROPE bytes
     written here and read by the attention kernel; either cache layout.
+
+    ``window_cache`` (TPU_PREFILL_GATHER_WINDOW_CACHE) takes the window
+    prep's list (`kernel.prepare_capped_window_live_fused(window_cache=True)`):
+    ``linear_indices`` entries in the `WINDOW_SPMEM` / `WINDOW_SKIP` encoding,
+    then `WINDOW_META_ROWS` rows holding the window's pieces. Each call copies
+    the window into Spmem once, reads window streams from there and skips
+    streams without a live slot. Every live slot gets the same bytes; a
+    skipped or window stream's dead slots get other finite rows.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -796,8 +1189,11 @@ def dsa_gather_native_sc(
     if indices.dtype != jnp.int32 or indices.ndim != 2:
         raise ValueError("indices must be int32[query, topk]")
     if live_vec_offset is None:
-        if indices.size != out_size:
-            raise ValueError(f"indices has {indices.size} values, expected {out_size}")
+        expected_size = out_size + (WINDOW_META_ROWS * 128 if window_cache else 0)
+        if indices.size != expected_size:
+            raise ValueError(
+                f"indices has {indices.size} values, expected {expected_size}"
+            )
     else:
         if not linear_indices:
             raise ValueError("live_vec_offset requires linear_indices")
@@ -905,6 +1301,30 @@ def dsa_gather_native_sc(
             ).reshape(-1)
         )
         row_kwargs = dict(row_atoms=row_atoms, rows_per_batch=rows_per_batch)
+    if window_cache:
+        if (
+            not linear_indices
+            or live_vec_offset is not None
+            or row_kwargs
+            or kv_write is not None
+            or is_dcp_mode
+        ):
+            raise ValueError(
+                "window_cache takes linear indices bounded by num_live_indices or "
+                "live_vec, without row_live_atoms, kv_write or is_dcp_mode"
+            )
+        return _window_gather(
+            operands,
+            out_size=out_size,
+            num_cores=num_cores,
+            num_subcores=num_subcores,
+            atoms_per_batch=atoms_per_batch,
+            batches_per_owner=batches_per_owner,
+            guard_tail=guard_tail,
+            rope_words=rope_words,
+            packed_out=packed_out,
+            live=live,
+        )
     mesh = plsc.VectorSubcoreMesh(
         num_cores=num_cores,
         num_subcores=num_subcores,
