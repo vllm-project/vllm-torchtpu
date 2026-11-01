@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CLI entrypoint for solve, plan, and explain subcommands."""
+"""CLI entrypoint for solve, emit, ceiling, plan, and explain subcommands."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import sys
 from dataclasses import asdict, replace
 
 from .chips import CHIPS
+from .emit import emit_ceiling_rows, emit_launch_args
 from .geometry import from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import Dtypes, Parallel, StepShape
@@ -124,6 +125,12 @@ def main(argv: list[str] | None = None) -> int:
     p_solve = sub.add_parser("solve")
     _add_scenario_args(p_solve)
 
+    p_emit = sub.add_parser("emit")
+    _add_scenario_args(p_emit)
+
+    p_ceil = sub.add_parser("ceiling")
+    _add_scenario_args(p_ceil)
+
     p_plan = sub.add_parser("plan")
     _add_common_args(p_plan)
     p_plan.add_argument("--concurrency", default="1,4,16,64")
@@ -142,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     geom = from_hf_config(cfg)
     chip = CHIPS[args.chip]
 
-    if args.cmd == "solve":
+    if args.cmd in ("solve", "emit", "ceiling"):
         concs = (
             tuple(int(x) for x in args.concurrency.split(",") if x.strip())
             if args.concurrency
@@ -199,6 +206,40 @@ def main(argv: list[str] | None = None) -> int:
             max_instances=args.max_instances,
             gpu_memory_utilization=args.gpu_memory_utilization,
         )
+        if args.cmd == "ceiling":
+            rows_ceil = emit_ceiling_rows(splan)
+            if not rows_ceil:
+                for w in splan.warnings:
+                    sys.stderr.write(f"WARNING: {w}\n")
+                if args.json:
+                    sys.stdout.write("[]\n")
+                return 1
+            if args.json:
+                sys.stdout.write(json.dumps(rows_ceil) + "\n")
+                return 0
+            for rc_row in rows_ceil:
+                sys.stdout.write(json.dumps(rc_row) + "\n")
+            return 0
+
+        if args.cmd == "emit":
+            emitted = emit_launch_args(
+                splan,
+                dtypes=dt_auto,
+                model=args.model,
+            )
+            if not emitted["commands"]:
+                for w in emitted["warnings"]:
+                    sys.stderr.write(f"WARNING: {w}\n")
+                if args.json:
+                    sys.stdout.write(json.dumps(emitted) + "\n")
+                return 1
+            if args.json:
+                sys.stdout.write(json.dumps(emitted) + "\n")
+                return 0
+            for cmd_line in emitted["commands"]:
+                sys.stdout.write(cmd_line + "\n")
+            return 0
+
         if args.json:
             sys.stdout.write(json.dumps(asdict(splan)) + "\n")
             return 0

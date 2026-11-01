@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Analytical TPU serving roofline, step floor, and mesh/SLO solver."""
+"""Analytical TPU serving roofline, step floor, mesh solver, and CLI emitter."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from .collectives import (
     submesh_for_group,
     torus_collective_s,
 )
+from .emit import emit_ceiling_rows, emit_launch_args, pool_cli_args
 from .geometry import LAYER_FAMILIES, ModelGeometry, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import (
@@ -71,6 +72,9 @@ __all__ = [
     "StepFloor",
     "StepShape",
     "TrafficScenario",
+    "emit_ceiling_rows",
+    "emit_launch_args",
+    "pool_cli_args",
     "build_example_scenario",
     "dtypes_from_hf_config",
     "ep_busiest_experts",
