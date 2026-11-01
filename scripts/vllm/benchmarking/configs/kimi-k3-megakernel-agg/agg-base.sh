@@ -123,8 +123,9 @@ export K3_PREFILL_PREFIX_FP8=1
 
 # ---- arguments -------------------------------------------------------------------
 _lengths=$(printf '{"%s":%s}' "$AGG_DRAFTS" "$AGG_ACCEPTANCE")
-if [ "$_eval_job" = 1 ]; then
-  # The eval-only job verifies drafts for real and runs the parsers.
+if [ "$_eval_job" = 1 ] || [ "$AGG_DRAFTS" = 0 ]; then
+  # The eval-only job verifies drafts for real and runs the parsers; without
+  # drafts there is nothing to accept.
   _loader=$(printf '{"presharded":"%s"}' "$PRESHARDED_DIR")
   _synthetic=""
 else
