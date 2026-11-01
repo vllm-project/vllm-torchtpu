@@ -259,47 +259,29 @@ def merge_rope_rows(
     return jnp.stack(merged)
 
 
-def merge_slot_updates(
-    slots_val,  # (pack_factor, physical_slot_size) uint8 (the row)
-    kv_slots,  # (tile_n,) int (all slots in tile)
-    val_padded,  # (tile_n, record_subslots, 128) uint8 (all values in tile)
-    n,  # int (current token index)
+def merge_slot_rows(
+    rows,  # (tile_n, 1, lanes) int32, each token's cache row as read from HBM
+    kv_slots,  # tile_n scalar kv slots, one per token of the tile
+    records,  # (tile_n, 1, lanes) int32, each token's record bytes, zero-extended
 ):
-    """multiple KV slots are packed into a single physical 512-byte row in HBM.
+    """Writes every tile token's record into each tile row that holds it.
 
-    Thus, different slots may map to the same tile.
-
-    We only send the DMA from the first tile that updates a physical row,
-    defined by `is_first_mask`.
-
-    In this function, we:
-    1. Read the current value of `slot_val`
-    2. Scan all other tokens in the current tile
-    3. Consolidate all other updates into the single tile.
+    A row packs 4 slots, slot ``s`` in byte ``s`` of every word, so a record
+    replaces one byte of the row's words; a later token of the tile wins. Rows
+    of invalid slots come back merged with nothing.
     """
-    tile_n = kv_slots.shape[0]
-    curr_slot = kv_slots[n]
-    pack_factor = slots_val.shape[0]
+    bits = jnp.iinfo(jnp.uint8).bits
+    per_row = jnp.iinfo(jnp.int32).bits // bits
+    row_ids = [jnp.where(slot >= 0, slot // per_row, -1) for slot in kv_slots]
+    shifts = [(slot % per_row) * bits for slot in kv_slots]
 
-    curr_row = curr_slot // pack_factor
-
-    slots_list = [slots_val[i] for i in range(pack_factor)]
-
-    for i in range(tile_n):
-        slot_i = kv_slots[i]
-        valid_i = slot_i >= 0
-        row_i = slot_i // pack_factor
-        sub_idx = slot_i % pack_factor
-
-        update_cond = valid_i & (row_i == curr_row) & (curr_slot >= 0)
-
-        val = val_padded[i].flatten()
-
-        for target_s in range(pack_factor):
-            slots_list[target_s] = jax.lax.select(
-                update_cond & (sub_idx == target_s),
-                val,
-                slots_list[target_s],
-            )
-
-    return jnp.stack(slots_list)
+    merged = []
+    for n in range(len(kv_slots)):
+        row = rows[n]
+        for i, slot in enumerate(kv_slots):
+            hit = (slot >= 0) & (row_ids[i] == row_ids[n])
+            byte = jnp.left_shift(jnp.int32(0xFF), shifts[i])
+            placed = (row & ~byte) | jnp.left_shift(records[i], shifts[i])
+            row = jnp.where(hit, placed, row)
+        merged.append(row)
+    return jnp.stack(merged)

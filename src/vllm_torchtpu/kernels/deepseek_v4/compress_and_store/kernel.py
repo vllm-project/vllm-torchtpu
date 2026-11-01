@@ -209,25 +209,15 @@ def compress_tile(
                 last_dim_size=cfgs.last_dim_size,
             )
         if cfgs.dims.mode == config.Mode.CSA_INDEXER:
-            kv_slots = []
-            for i in range(tile_n):
-                kv_slots.append(kv_slot_mapping_ref[global_idx + i])
-            kv_slots = jnp.stack(kv_slots)
-
-            for n in range(tile_n):
-                is_first = is_first_mask_ref[global_idx + n]
-
-                @pl.when(is_first)
-                def _merge_nope():
-                    # only applicable to csa-indexer
-                    # out_vmem shape: (tile_n, 1, 4, 256)
-                    slots_val = out_vmem[n, 0]
-                    out_vmem[n, 0] = compute.merge_slot_updates(
-                        slots_val,
-                        kv_slots,
-                        nope_val_padded,
-                        n,
-                    )
+            kv_slots = [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)]
+            # out_vmem: (tile_n, 1, 4, 256) uint8, each token's whole row; a
+            # row's sub-slot s is byte s of its words. Only the rows of
+            # is_first_mask tokens are written back.
+            rows = pltpu.bitcast(out_vmem[:, 0], jnp.int32)  # (tile_n, 1, 256)
+            records = nope_val_padded.astype(jnp.int32)  # (tile_n, 1, 256)
+            out_vmem[:, 0] = pltpu.bitcast(
+                compute.merge_slot_rows(rows, kv_slots, records), jnp.uint8
+            )
 
         else:
             out_vmem[:, 0] = nope_val_padded
