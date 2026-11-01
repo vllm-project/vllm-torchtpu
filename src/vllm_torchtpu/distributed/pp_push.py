@@ -368,6 +368,9 @@ def _raise_steps_in_flight(extra: int) -> None:
             return steps + extra
         return steps
 
+    # vLLM declares the property through its getter; pyrefly types the class
+    # attribute as that function.
+    # pyrefly: ignore[bad-assignment]
     VllmConfig.max_concurrent_batches = property(
         max_concurrent_batches, doc=original.__doc__
     )
