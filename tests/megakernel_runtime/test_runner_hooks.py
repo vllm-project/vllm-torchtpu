@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
+import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
 
 # The order a runner mesh may list 8 devices in (ICI ring order).
@@ -480,8 +481,8 @@ def fake_tp_group(monkeypatch: pytest.MonkeyPatch) -> Any:
         peer_votes: list[int], peer_tokens: list[int] | None = None
     ) -> _FakeTPGroup:
         g = _FakeTPGroup(peer_votes, peer_tokens)
-        monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: g)
-        monkeypatch.setattr(driver_mod, "_all_reduce_max", g.all_reduce_max)
+        monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: g)
+        monkeypatch.setattr(agreement_mod, "_all_reduce_max", g.all_reduce_max)
         return g
 
     return make
@@ -510,7 +511,7 @@ def test_agree_on_decline_is_rank_uniform(fake_tp_group: Any) -> None:
     fake_tp_group([0])
     odd = EligibilityResult(False, "something_new", "x")
     assert driver_mod.agree_on_decline(odd) is odd
-    assert driver_mod._decline_vote(odd) == _vote("other")
+    assert agreement_mod._decline_vote(odd) == _vote("other")
 
 
 def test_agree_on_decline_single_rank_is_local(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -519,8 +520,8 @@ def test_agree_on_decline_single_rank_is_local(monkeypatch: pytest.MonkeyPatch) 
     def no_reduce(*_a: Any) -> None:
         raise AssertionError("no collective on a single rank")
 
-    monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: None)
-    monkeypatch.setattr(driver_mod, "_all_reduce_max", no_reduce)
+    monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: None)
+    monkeypatch.setattr(agreement_mod, "_all_reduce_max", no_reduce)
     mine = EligibilityResult(False, "pallas_mesh_mismatch", "local")
     assert driver_mod.agree_on_decline(mine) is mine
     assert driver_mod.agree_on_decline(None) is None
@@ -575,7 +576,7 @@ def test_bind_and_warmup_votes_before_raising(
         votes.append(int(t[0]))
         orig(t, group)
 
-    monkeypatch.setattr(driver_mod, "_all_reduce_max", spy)
+    monkeypatch.setattr(agreement_mod, "_all_reduce_max", spy)
 
     def bind(runner: Any) -> None:
         raise ValueError("internal bug")
@@ -634,7 +635,7 @@ def test_bind_and_warmup_agreement_error_propagates_after_one_collective(
         raise RuntimeError("gloo timeout")
 
     fake_tp_group([0])
-    monkeypatch.setattr(driver_mod, "_all_reduce_max", boom)
+    monkeypatch.setattr(agreement_mod, "_all_reduce_max", boom)
     drv = _bind_driver(lambda runner: None)
     with pytest.raises(RuntimeError, match="gloo timeout"):
         drv.bind_and_warmup(SimpleNamespace(_megakernel=drv))

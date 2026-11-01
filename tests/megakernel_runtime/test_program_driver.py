@@ -32,7 +32,9 @@ from typing import Any
 import pytest
 import torch
 
+import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
+import vllm_torchtpu.megakernel_runtime.guards as guards_mod
 from vllm_torchtpu import megakernel_runtime as mkr
 from vllm_torchtpu.megakernel import errors as mk_errors
 from vllm_torchtpu.megakernel_runtime import fingerprint as fp
@@ -149,7 +151,7 @@ def toy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 def _no_group(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: None)
+    monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: None)
 
 
 def _runner(options: dict[str, Any] | None = None, **kw: Any) -> Any:
@@ -245,8 +247,8 @@ class _VoteGroup:
 
 def _vote_group(monkeypatch: pytest.MonkeyPatch, *args: Any) -> _VoteGroup:
     g = _VoteGroup(*args)
-    monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: g)
-    monkeypatch.setattr(driver_mod, "_all_reduce_max", g.all_reduce_max)
+    monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: g)
+    monkeypatch.setattr(agreement_mod, "_all_reduce_max", g.all_reduce_max)
     return g
 
 
@@ -599,7 +601,7 @@ def test_dp_and_wide_ep_parallelism(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "data_parallel_size" in res.message
     # An EP group wider than TP is its own kind (EP inside TP is not).
     runner = testing.fake_runner(enable_expert_parallel=True)
-    monkeypatch.setattr(driver_mod, "_ep_group_size", lambda: 2)
+    monkeypatch.setattr(guards_mod, "_ep_group_size", lambda: 2)
     assert driver_mod.detect_parallelism(runner, 1) == ["ep_wider_than_tp"]
     assert driver_mod.detect_parallelism(runner, 2) == ["ep_in_tp"]
     res = _check(runner, parallelism={"tp", "ep_in_tp"})
@@ -793,8 +795,9 @@ def _record_agreements(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[Any]]
         log.append(("all_reduce", g))
 
     monkeypatch.setattr(driver_mod, "agreement_group", resolve)
-    monkeypatch.setattr(driver_mod, "_all_reduce_max", all_reduce_max)
-    monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: None)
+    monkeypatch.setattr(agreement_mod, "agreement_group", resolve)
+    monkeypatch.setattr(agreement_mod, "_all_reduce_max", all_reduce_max)
+    monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: None)
     return group, log
 
 
@@ -815,7 +818,7 @@ def test_agreements_run_over_the_declared_domain_group(
 
 def test_agreement_group_resolves_the_tp_group(monkeypatch: pytest.MonkeyPatch) -> None:
     tp = object()
-    monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: tp)
+    monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: tp)
     assert driver_mod.agreement_group("tp", None) is tp
     for domain in ("tp_x_dcp", "kernel_mesh"):
         with pytest.raises(driver_mod.MegakernelPluginError, match=domain):
@@ -840,7 +843,8 @@ def test_unsupported_collective_domain_declines_before_any_collective(
         raise AssertionError("must decline before resolving an agreement group")
 
     monkeypatch.setattr(driver_mod, "agreement_group", no_group)
-    monkeypatch.setattr(driver_mod, "_tp_cpu_group", no_group)
+    monkeypatch.setattr(agreement_mod, "agreement_group", no_group)
+    monkeypatch.setattr(agreement_mod, "_tp_cpu_group", no_group)
     assert driver_mod.ProgramDriver.maybe_create(_runner()) is None
 
 
@@ -923,12 +927,13 @@ sys.path.insert(0, plugin_dir)
 import torch.distributed as dist
 dist.init_process_group("gloo", init_method=init, rank=rank, world_size=2,
                         timeout=datetime.timedelta(seconds=60))
-from vllm_torchtpu.megakernel_runtime import driver as d, testing
-try:
-    d.logger._resolve()
-except ModuleNotFoundError:
-    d.logger._logger = logging.getLogger("mk")
-d._tp_cpu_group = lambda: dist.group.WORLD
+from vllm_torchtpu.megakernel_runtime import agreement as a, driver as d, testing
+for lazy in (d.logger, a.logger):
+    try:
+        lazy._resolve()
+    except ModuleNotFoundError:
+        lazy._logger = logging.getLogger("mk")
+a._tp_cpu_group = lambda: dist.group.WORLD
 runner = testing.fake_runner(
     tp_size=2,
     megakernel={"plugin": "toy_mk_plugin", "options": json.loads(options)},

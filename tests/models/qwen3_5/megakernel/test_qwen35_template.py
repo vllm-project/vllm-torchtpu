@@ -30,6 +30,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
 from tests.models.qwen3_5.megakernel.test_vllm_qwen35_e2e import (
     _allocate_aliased_pools,
@@ -59,7 +60,7 @@ _MODULE = SHORTHANDS["qwen35"].module
 @pytest.fixture(autouse=True)
 def _no_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VLLM_TPU_MEGAKERNEL", raising=False)
-    monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: None)
+    monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: None)
 
 
 def test_shorthand_table_matches_the_template() -> None:

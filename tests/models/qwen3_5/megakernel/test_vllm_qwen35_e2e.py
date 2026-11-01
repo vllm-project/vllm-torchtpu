@@ -31,6 +31,7 @@ from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.megakernel as mk
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
+import vllm_torchtpu.megakernel_runtime.guards as guards_mod
 from tests.models.qwen3_5.megakernel.test_weight_collector import (
     _jax_to_torch,
     make_synthetic_qwen35_backbone,
@@ -1924,7 +1925,7 @@ def test_maybe_create_declines_data_parallel_before_any_collective(
     else:
         monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
     monkeypatch.setattr(
-        driver_mod, "_ep_group_size", lambda: 16 if why == "ep_wider_than_tp" else 8
+        guards_mod, "_ep_group_size", lambda: 16 if why == "ep_wider_than_tp" else 8
     )
 
     def no_collective(*_a: Any, **_k: Any) -> Any:
