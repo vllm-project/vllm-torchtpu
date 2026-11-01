@@ -654,6 +654,124 @@ def prepare_capped_window_live(
     )(jnp.reshape(live_windows, (1,)).astype(jnp.int32), tab, windows, topk_indices)
 
 
+def gather_window_cache_supported(page_size: int, gather_atoms: int) -> bool:
+    """Whether the window cache serves a page size and gather batch: the
+    window is whole pages of whole 64-row pieces."""
+    return (
+        page_size % native_sc_gather.WINDOW_PIECE_ROWS == 0
+        and native_sc_gather.WINDOW_ROWS % page_size == 0
+        and native_sc_gather.window_cache_supported(gather_atoms)
+    )
+
+
+def _stream_max(x: jax.Array) -> jax.Array:
+    """Each lane's maximum over its aligned 16-lane gather stream.
+
+    A butterfly over lane pairs i, i ^ k; the rolled lane index tells which
+    of the two rolls brought lane i ^ k, whatever the roll direction.
+    """
+    axis = x.ndim - 1
+    lanes = x.shape[axis]
+    lane = lax.broadcasted_iota(jnp.int32, x.shape, axis)
+    k = 1
+    while k < native_sc_gather.NUM_LANES:
+        partner = jnp.where(
+            pltpu.roll(lane, k, axis) == (lane ^ k),
+            pltpu.roll(x, k, axis),
+            pltpu.roll(x, lanes - k, axis),
+        )
+        x = jnp.maximum(x, partner)
+        k *= 2
+    return x
+
+
+def _window_table(
+    newest: jax.Array,
+    page_row: jax.Array,  # i32[1, padded_pps] the window request's page table
+    *,
+    page_size: int,
+    pages_per_seq: int,
+    total_num_pages: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The window cache's window: the `WINDOW_ROWS` logical rows ending at the
+    page of logical row `newest`, through one request's page table.
+
+    Returns the window's first logical row, its pages' first cache rows
+    (lanes [0, WINDOW_ROWS / page_size) of an i32[8, 128] tile) and its 64-row
+    pieces' first cache rows (lanes [0, WINDOW_PIECES), the gather's meta row).
+    """
+    window_pages = native_sc_gather.WINDOW_ROWS // page_size
+    first_page = jnp.maximum(
+        jnp.maximum(newest, 0) // page_size - (window_pages - 1), 0
+    )
+    lane = lax.broadcasted_iota(jnp.int32, (8, 128), 1)
+    logical = jnp.clip(
+        first_page + jnp.minimum(lane, window_pages - 1), 0, pages_per_seq - 1
+    )
+    rows = jnp.broadcast_to(page_row, (8, page_row.shape[1]))
+    page = jnp.zeros_like(logical)
+    for pc in range(rows.shape[1] // _GATHER_PAGE_CHUNK):
+        local = logical - pc * _GATHER_PAGE_CHUNK
+        gathered = jnp.take_along_axis(
+            rows[:, pc * _GATHER_PAGE_CHUNK : (pc + 1) * _GATHER_PAGE_CHUNK],
+            jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1),
+            axis=1,
+        )
+        page = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, page)
+    page_rows = jnp.clip(page, 0, total_num_pages - 1) * page_size
+    piece_page, piece_offset = _floor_divmod_const(
+        lane * native_sc_gather.WINDOW_PIECE_ROWS, page_size
+    )
+    pieces = (
+        jnp.take_along_axis(
+            page_rows, jnp.clip(piece_page, 0, window_pages - 1), axis=1
+        )
+        + piece_offset
+    )
+    return first_page * page_size, page_rows, pieces
+
+
+def _window_stream_rows(
+    idx: jax.Array,  # i32[tokens, 128] logical top-k positions, -1 = empty
+    rows: jax.Array,  # i32[tokens, 128] their cache rows
+    first_row: jax.Array,
+    page_rows: jax.Array,
+    *,
+    page_size: int,
+) -> jax.Array:
+    """One tile of the gather list in the window cache's encoding.
+
+    A 16-slot stream whose live slots all hold the cache row the window holds
+    at their offset reads `WINDOW_SPMEM | offset` (dead slots offset 0); a
+    stream without a live slot is `WINDOW_SKIP`; any other keeps its rows.
+    """
+    window_pages = native_sc_gather.WINDOW_ROWS // page_size
+    live = idx != -1
+    offset = idx - first_row
+    page, in_page = _floor_divmod_const(offset, page_size)
+    window_row = (
+        jnp.take_along_axis(
+            jnp.broadcast_to(page_rows[0:1], idx.shape),
+            jnp.clip(page, 0, window_pages - 1),
+            axis=1,
+        )
+        + in_page
+    )
+    in_window = (
+        (offset >= 0) & (offset < native_sc_gather.WINDOW_ROWS) & (rows == window_row)
+    )
+    source = _stream_max(jnp.where(live, jnp.where(in_window, 1, 2), 0))
+    return jnp.where(
+        source == 0,
+        native_sc_gather.WINDOW_SKIP,
+        jnp.where(
+            source == 1,
+            native_sc_gather.WINDOW_SPMEM | jnp.where(live, offset, 0),
+            rows,
+        ),
+    )
+
+
 def mixed_fused_prep_supported(
     num_tokens: int, topk: int, chunk_size: int, kernel_batch_size: int, topk_cap: int
 ) -> bool:
@@ -682,6 +800,7 @@ def _capped_window_live_fused_kernel(
     total_num_pages: int,
     num_chunks: int,
     fault: str | None,
+    window_cache: bool = False,
 ):
     """kv_lens + `live_group_table` + `prepare_capped_window_live`, one chunk
     per grid step, reading the top-k in its 128-lane row form.
@@ -701,6 +820,12 @@ def _capped_window_live_fused_kernel(
        per-chunk slice copy of the [chunks * W * C * cap / 128, 128] array).
 
     Windows at or past W(c) stay unwritten; the gather never reads them.
+
+    With `window_cache` every window's rows are in the window cache's
+    encoding (`_window_stream_rows`) and each chunk's output ends with the
+    gather's meta rows (`native_sc_gather.WINDOW_META_ROWS`). The window ends
+    at the page of the chunk's newest pick, in the page table of the chunk's
+    last real token.
     """
     outs = refs[:num_chunks]
     kv_ref, tab_ref, live_ref = refs[num_chunks : num_chunks + 3]
@@ -718,6 +843,7 @@ def _capped_window_live_fused_kernel(
     num_groups = num_chunks * gpc
     slot = lax.rem(c, 2)
     token_end = token_end_ref[0]
+    meta_rows = native_sc_gather.WINDOW_META_ROWS
 
     def region_copy(chunk_out, w, slot_, sem):
         return pltpu.make_async_copy(
@@ -726,9 +852,19 @@ def _capped_window_live_fused_kernel(
             sems.at[sem],
         )
 
+    def meta_copy(chunk_out, slot_):
+        meta = pl.ds(num_windows * region_rows, meta_rows)
+        return pltpu.make_async_copy(
+            stage_ref.at[slot_, meta],
+            chunk_out.at[meta],
+            sems.at[2 * num_windows + slot_],
+        )
+
     def wait_chunk(cc, slot_):
         # Waits only need the semaphore and the byte count: any chunk output.
         region_copy(outs[0], 0, slot_, slot_ * num_windows).wait()
+        if window_cache:
+            meta_copy(outs[0], slot_).wait()
         for w in range(1, num_windows):
 
             @pl.when(w < cw_ref[cc])
@@ -787,13 +923,28 @@ def _capped_window_live_fused_kernel(
         (chunk_windows - 1) * chunk_size * topk_cap + grid_rows * topk_cap,
     )
 
+    if window_cache:
+        newest = jnp.full((chunk_size, 128), -1, jnp.int32)
+        for j in range(row_stride):
+            picks = topk_ref[pl.ds(j, chunk_size, stride=row_stride), :]
+            newest = jnp.maximum(newest, jnp.where(local < valid_rows, picks, -1))
+        last_token = jnp.maximum(valid_rows - 1, 0)
+        first_row, page_rows, pieces = _window_table(
+            jnp.max(newest),
+            windows_ref[pl.ds(last_token, 1), :],
+            page_size=page_size,
+            pages_per_seq=pages_per_seq,
+            total_num_pages=total_num_pages,
+        )
+        stage_ref[slot, pl.ds(num_windows * region_rows, meta_rows), :] = pieces
+
     def translate(w, jj):
         # Column tile jj of window w for every token of the chunk: one wide
         # vector pass (tokens on sublanes), not one per 16-token group.
         idx = topk_ref[pl.ds(w * lane_rows + jj, chunk_size, stride=row_stride), :]
         row = chunk_start + lax.broadcasted_iota(jnp.int32, idx.shape, 0)
         col = w * topk_cap + jj * 128 + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
-        return _window_physical_rows(
+        rows = _window_physical_rows(
             idx,
             windows_ref,
             row * topk + col,
@@ -801,6 +952,11 @@ def _capped_window_live_fused_kernel(
             pages_per_seq=pages_per_seq,
             total_num_pages=total_num_pages,
         )
+        if window_cache:
+            return _window_stream_rows(
+                idx, rows, first_row, page_rows, page_size=page_size
+            )
+        return rows
 
     # 3a. Window 0 in live-group order (`_capped_window_live_kernel`); phys
     # column tile jj of token t at row jj * chunk + t.
@@ -858,6 +1014,8 @@ def _capped_window_live_fused_kernel(
         @pl.when(c == cc)
         def _flush():
             region_copy(outs[cc], 0, slot, slot * num_windows).start()
+            if window_cache:
+                meta_copy(outs[cc], slot).start()
             for w in range(1, num_windows):
 
                 @pl.when(w < chunk_windows)
@@ -883,6 +1041,7 @@ def prepare_capped_window_live_fused(
     page_size: int,
     total_num_pages: int,
     _fault: str | None = None,
+    window_cache: bool = False,
 ) -> tuple[tuple[jax.Array, ...], jax.Array, jax.Array, jax.Array]:
     """kv_lens, `live_group_table` and `prepare_capped_window_live` in one call.
 
@@ -897,6 +1056,11 @@ def prepare_capped_window_live_fused(
         (window 0 always; windows < W(c) when the chunk overflows).
       kv_lens: i32[num_tokens], `sum(topk_indices != -1, -1)`.
       tab, num_live: `live_group_table(kv_lens, token_end, ...)`.
+
+    `window_cache` (TPU_PREFILL_GATHER_WINDOW_CACHE) writes the rows in the
+    window cache's encoding, each chunk's array followed by the gather's
+    `native_sc_gather.WINDOW_META_ROWS` meta rows, for
+    `dsa_gather_native_sc(window_cache=True)`.
 
     `_fault` is a test-only positive control ("kv", "off", "win1").
     """
@@ -934,6 +1098,10 @@ def prepare_capped_window_live_fused(
         total_num_pages=total_num_pages,
         num_chunks=num_chunks,
         fault=_fault,
+        **({"window_cache": True} if window_cache else {}),
+    )
+    chunk_rows = num_windows * region_rows + (
+        native_sc_gather.WINDOW_META_ROWS if window_cache else 0
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
@@ -952,19 +1120,18 @@ def prepare_capped_window_live_fused(
                 smem,
             ],
             scratch_shapes=[
-                pltpu.VMEM((2, num_windows * region_rows, 128), jnp.int32),
+                pltpu.VMEM((2, chunk_rows, 128), jnp.int32),
                 pltpu.VMEM((topk_cap // 128 * chunk_size, 128), jnp.int32),
                 pltpu.SMEM((num_chunks,), jnp.int32),
                 pltpu.SMEM((2 * gpc,), jnp.int32),
-                pltpu.SemaphoreType.DMA((2 * num_windows,)),
+                pltpu.SemaphoreType.DMA(
+                    (2 * num_windows + (2 if window_cache else 0),)
+                ),
             ],
             grid=(num_chunks,),
         ),
         out_shape=[
-            *(
-                [jax.ShapeDtypeStruct((num_windows * region_rows, 128), jnp.int32)]
-                * num_chunks
-            ),
+            *([jax.ShapeDtypeStruct((chunk_rows, 128), jnp.int32)] * num_chunks),
             jax.ShapeDtypeStruct((num_tokens // 128, 128), jnp.int32),
             jax.ShapeDtypeStruct((2 * num_tokens // bz,), jnp.int32),
             jax.ShapeDtypeStruct((num_chunks,), jnp.int32),
@@ -3500,6 +3667,7 @@ def prepare_outputs(
         "packed_rope",
         "packed_gather",
         "out_vmem",
+        "gather_window_cache",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -3561,6 +3729,7 @@ def sparse_ragged_paged_attention(
     packed_rope: bool = False,
     packed_gather: bool = False,
     out_vmem: int = 0,
+    gather_window_cache: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -3742,6 +3911,12 @@ def sparse_ragged_paged_attention(
         kernel restores the tail in VMEM (`native_sc_gather.expand_packed_rope`).
         Half the gathered rope bytes cross HBM; every score is unchanged.
         Other chunks keep the padded rows.
+      gather_window_cache: TPU_PREFILL_GATHER_WINDOW_CACHE. On live-group
+        chunks with the fused prep (`mixed_fused_prep`) and no `kv_write`,
+        each chunk's gather copies the request's newest
+        `native_sc_gather.WINDOW_ROWS` cache rows into Spmem once, serves
+        the 16-slot streams whose live keys all lie there from that copy and
+        skips streams without a live key. Every live key's bytes are unchanged.
       out_vmem: TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS. The attention call's scoped
         VMEM in bytes (0 = off). With `return_lse`, `lse_lane_dense` and
         `lse_mask_empty` on a single chunk, and without `lse_in_kernel`
@@ -3947,6 +4122,7 @@ def sparse_ragged_paged_attention(
     )
     window_indices_all: Any = None  # one array, or one per chunk
     chunk_window_rows = 0  # rows of `window_indices_all` per chunk
+    window_cache = False
     group_tab = None
     group_num_live = None
     fused_prep = (
@@ -4033,6 +4209,17 @@ def sparse_ragged_paged_attention(
         if mixed_fused_prep and mixed_fused_prep_supported(
             q.shape[0], topk, uniform_chunk, prep_batch, topk_cap
         ):
+            window_cache = (
+                gather_window_cache
+                and kv_write is None
+                and gather_window_cache_supported(page_size, sparsecore_atoms_per_batch)
+                and not _chunk_kernel_batch_size(
+                    uniform_chunk,
+                    attention_kernel_batch_size,
+                    small_chunk_tokens,
+                    small_chunk_batch_size,
+                )[0]
+            )
             window_indices_all, kv_lens, group_tab, group_num_live = (
                 prepare_capped_window_live_fused(
                     topk_indices,
@@ -4044,6 +4231,7 @@ def sparse_ragged_paged_attention(
                     topk_cap=topk_cap,
                     page_size=page_size,
                     total_num_pages=cache_kv_nope.shape[0],
+                    **({"window_cache": True} if window_cache else {}),
                 )
             )
         else:
@@ -4261,6 +4449,7 @@ def sparse_ragged_paged_attention(
             packed_rope=packed_rope,
             packed_gather=packed_gather and group_tab is not None,
             out_vmem=out_vmem,
+            **({"gather_window_cache": True} if window_cache else {}),
             **extra,
         )
 
@@ -4462,6 +4651,7 @@ def sparse_attention_chunk(
     packed_rope: bool = False,
     packed_gather: bool = False,
     out_vmem: int = 0,
+    gather_window_cache: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -4512,6 +4702,9 @@ def sparse_attention_chunk(
     `packed_gather` (with `group_tab`): the gathered rope buffer holds eight
     keys per row without the zero tail (`dsa_gather_native_sc(packed_out=)`),
     and so does `pre_gathered`'s.
+    `gather_window_cache` (with `group_tab`): `window_indices` is the window
+    prep's list (`prepare_capped_window_live_fused(window_cache=True)`),
+    gathered by `dsa_gather_native_sc(window_cache=True)`.
     `out_vmem` (with `lse`; scoped VMEM bytes): the output and lse are VMEM
     arrays and the output does not alias `q` (see
     `sparse_ragged_paged_attention`).
@@ -4538,6 +4731,10 @@ def sparse_attention_chunk(
         raise ValueError("packed_rope requires the sparsecore cache layout")
     if packed_gather and (group_tab is None or topk_cap is None):
         raise ValueError("packed_gather needs the live-group capped path")
+    if gather_window_cache and (group_tab is None or kv_write is not None):
+        raise ValueError(
+            "gather_window_cache needs the live-group path without kv_write"
+        )
     gathered_rope_keys_per_row = native_sc_gather.ROPE_PACKING * (
         2 if packed_gather else 1
     )
@@ -5074,6 +5271,8 @@ def sparse_attention_chunk(
                 # Live-group prep: 128-lane linear rows, bound from the table.
                 assert window_indices is not None and group_num_live is not None
                 live_kwargs = dict(num_live_indices=group_num_live, linear_indices=True)
+                if gather_window_cache:
+                    live_kwargs["window_cache"] = True
             else:
                 live_tokens = batch_end - start_pos
                 token_windows = jnp.where(

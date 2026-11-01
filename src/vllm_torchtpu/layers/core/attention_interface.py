@@ -1670,6 +1670,11 @@ def sparse_mla_attention_dcp(
                 )
                 else {}
             ),
+            **(
+                {"gather_window_cache": True}
+                if envs.TPU_PREFILL_GATHER_WINDOW_CACHE and not decode_bucket
+                else {}
+            ),
         )
         output, lse = attn[:2]
         if kv_write is not None:
