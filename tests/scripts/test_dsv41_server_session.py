@@ -287,6 +287,7 @@ def test_shell_model_source_and_disabled_compile_cache(tmp_path, model_uri):
     assert "--xla_tpu_dvfs_p_state=7" in compiler_flags
     assert command[:2] == ["serve", model_uri or str(tmp_path)]
     assert command[command.index("--tokenizer") + 1] == str(tmp_path)
+    assert command[command.index("--api-server-count") + 1] == "1"
     draft = json.loads(command[command.index("--speculative-config") + 1])
     assert draft["model"] == command[1]
     assert "--profiler-config" not in command
