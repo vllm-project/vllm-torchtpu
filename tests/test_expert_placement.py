@@ -152,12 +152,114 @@ def test_disabled_when_dynamic_knob_is_off(monkeypatch):
     expert_placement.check_layer_served(layer, fused_armed=False)
 
 
-def test_a_placed_layer_must_be_served_by_the_fused_kernel(dynamic_enabled):
-    layer = _fake_layer("model.layers.3.ffn.experts", rank=0)
-    expert_placement.apply_to_layer(layer)
-    expert_placement.check_layer_served(layer, fused_armed=True)
-    with pytest.raises(RuntimeError, match="not armed"):
-        expert_placement.check_layer_served(layer, fused_armed=False)
+def test_moe_routing_remaps_logical_ids_to_slots_and_accumulates_load(
+    dynamic_enabled, monkeypatch
+):
+    """Non-fused MoE backends route through `moe_routing.route`, which remaps
+    logical expert IDs to physical slot IDs via `_tpu_expert_slot`, sets
+    `_experts_start = ep_rank * local_num_experts`, and accumulates per-slot
+    routed row counts into `_tpu_expert_load`."""
+    from vllm_torchtpu.layers.adapter import expert_load, moe_routing
+
+    monkeypatch.setattr(expert_load, "_REGISTERED", [])
+    layer = _fake_layer("model.layers.3.ffn.experts", rank=1, experts=8, shards=2)
+    layer.global_num_experts = 8
+    layer.renormalize = True
+    layer.scoring_func = "softmax"
+    layer.routed_scaling_factor = 1.0
+    layer.use_grouped_topk = False
+    layer.num_expert_group = None
+    layer.topk_group = None
+    layer.e_score_correction_bias = None
+    layer.custom_routing_function = None
+    layer.moe_config = SimpleNamespace(
+        experts_per_token=2,
+        ep_size=2,
+        ep_rank=1,
+        num_local_experts=4,
+        is_sequence_parallel=False,
+        moe_parallel_config=SimpleNamespace(use_ep=True),
+    )
+
+    assert expert_placement.apply_to_layer(layer)
+    assert layer.moe_config.num_local_experts == 7
+    moe_routing.register_experts_start_buffer(layer, device=torch.device("cpu"))
+    assert int(layer._experts_start.item()) == 7  # rank 1 owns slots [7..13]
+    load_buf = expert_load.operand(layer)
+    assert load_buf is not None and tuple(load_buf.shape) == (14,)
+
+    # Initial layout on 8 experts / 2 shards (slots=7 per rank):
+    # rank 0 slots 0..4 hold [0, 1, 2, 3, 4]; rank 1 slots 7..11 hold [4, 5, 6, 7, 0].
+    # Expert 0 has 2 replicas at slots [0, 11]; expert 5 has 1 replica at slot 8.
+    x = torch.zeros((4, 16), dtype=torch.bfloat16)
+    logits = torch.full((4, 8), -10.0, dtype=torch.float32)
+    logits[:, 0] = 5.0
+    logits[:, 5] = 4.0
+
+    weights, slot_ids = moe_routing.route(layer, x, logits)
+    assert tuple(weights.shape) == (4, 2)
+    # Token rows 0..3 alternate between expert 0's two replicas (slots 0 and 11),
+    # while expert 5 always maps to slot 8.
+    assert slot_ids.tolist() == [[0, 8], [11, 8], [0, 8], [11, 8]]
+    assert load_buf.tolist() == [2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 2, 0, 0]
+
+    # Installing a new slot table redirects subsequent routes without recompiling.
+    new_table = expert_placement.expert_slot_table(layer).clone()
+    new_table[5] = torch.tensor([5, -1], dtype=torch.int32)  # move expert 5 to slot 5
+    expert_placement.install_table(layer, new_table)
+    _, slot_ids_after = moe_routing.route(layer, x, logits)
+    assert slot_ids_after.tolist() == [[0, 5], [11, 5], [0, 5], [11, 5]]
+    assert load_buf[5].item() == 4
+
+
+def test_mover_parts_supports_fp8_and_compressed_tensors_moe_layouts():
+    from vllm_torchtpu import expert_mover
+
+    fp8_layer = torch.nn.Module()
+    fp8_layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((7, 16, 32), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    fp8_layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((7, 16, 16), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    fp8_layer.w13_weight_scale_inv = torch.nn.Parameter(
+        torch.ones((7, 1, 1, 32), dtype=torch.float32), requires_grad=False
+    )
+    fp8_layer.w2_weight_scale_inv = torch.nn.Parameter(
+        torch.ones((7, 1, 1, 16), dtype=torch.float32), requires_grad=False
+    )
+    names = [
+        name for _, name, _, kind in expert_mover._parts(fp8_layer) if kind == "slot"
+    ]
+    assert names == [
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale_inv",
+        "w2_weight_scale_inv",
+    ]
+
+    ct_layer = torch.nn.Module()
+    ct_layer.w13_weight_packed = torch.nn.Parameter(
+        torch.zeros((7, 4, 32), dtype=torch.int32), requires_grad=False
+    )
+    ct_layer.w2_weight_packed = torch.nn.Parameter(
+        torch.zeros((7, 4, 16), dtype=torch.int32), requires_grad=False
+    )
+    ct_layer.w13_weight_scale = torch.nn.Parameter(
+        torch.ones((7, 1, 32), dtype=torch.bfloat16), requires_grad=False
+    )
+    ct_layer.w2_weight_scale = torch.nn.Parameter(
+        torch.ones((7, 1, 16), dtype=torch.bfloat16), requires_grad=False
+    )
+    ct_names = [
+        name for _, name, _, kind in expert_mover._parts(ct_layer) if kind == "slot"
+    ]
+    assert ct_names == [
+        "w13_weight_packed",
+        "w2_weight_packed",
+        "w13_weight_scale",
+        "w2_weight_scale",
+    ]
 
 
 def test_drafter_layers_are_left_unplaced_by_default(dynamic_enabled, monkeypatch):

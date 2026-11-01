@@ -23,8 +23,9 @@ initialized with a blind contiguous-plus-one layout (zero prior profiling):
   * `expert_slot_table` lists, per logical expert, the physical slot ids
     `r * slots + j` holding it, padded with -1 to `replica_cap = EP`.
 
-Only the fused EP kernel reads slot ids, so a placed layer must be armed for
-it; `check_layer_served` refuses anything else.
+Both the fused EP kernel (`fused_moe_ep.py`) and the shared PyTorch routing
+entry point (`moe_routing.route` + `fused_moe_gmm`) consume `expert_slot_table`
+and accumulate per-slot routed row counts into `expert_load`.
 """
 
 import re
@@ -185,13 +186,16 @@ def apply_to_layer(layer) -> bool:
     """Initialize a target RoutedExperts layer with the default Dynamic EPLB
     layout (contiguous block + next rank's first expert + staging slots).
 
-    Must run before the weights load (from the MoE method's create_weights).
-    Registers the slot table the fused EP op takes. Returns whether the layer
-    is placed.
+    Must run before the weights load (from `VllmQuantConfig.get_moe_config` or
+    the MoE method's `create_weights`). Registers the slot table consumed by
+    `fused_moe_ep` and `moe_routing.route`. Idempotent if called more than once
+    on the same layer. Returns whether the layer is placed.
     """
     import torch
 
     global _GROUP
+    if expert_slot_table(layer) is not None:
+        return True
     if not envs.TPU_MOE_EPLB_DYNAMIC or _is_draft_runner():
         return False
     layer_idx = layer_index(layer.layer_name)
@@ -230,6 +234,9 @@ def apply_to_layer(layer) -> bool:
     device = manager.expert_map.device
     manager._expert_map = expert_map.to(device)
     manager._local_num_experts = group.slots
+    moe_config = getattr(layer, "moe_config", None)
+    if moe_config is not None and hasattr(moe_config, "num_local_experts"):
+        moe_config.num_local_experts = group.slots
     layer.update_expert_map_info()
     layer.register_buffer(
         EXPERT_SLOT_ATTR,
@@ -295,11 +302,11 @@ def physical_experts(layer) -> int | None:
     return group.physical if group is not None else None
 
 
-def check_layer_served(layer, fused_armed: bool) -> None:
-    """A placed layer's weights sit in slot order only the fused op undoes."""
+def check_layer_served(layer, fused_armed: bool = True) -> None:
+    """Log when a placed layer is served by the GMM routing path rather than
+    the fused EP kernel."""
     if expert_slot_table(layer) is not None and not fused_armed:
-        raise RuntimeError(
-            f"expert layout covers {layer.layer_name}, but the fused EP "
-            "MoE kernel is not armed for it; the grouped-matmul path reads "
-            "contiguous expert blocks and would run the wrong experts"
+        logger.info_once(
+            "Dynamic EPLB layer %s is served via moe_routing.route + fused_moe_gmm",
+            getattr(layer, "layer_name", "<unnamed>"),
         )

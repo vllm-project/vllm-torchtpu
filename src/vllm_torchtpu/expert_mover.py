@@ -53,10 +53,10 @@ logger = init_logger(__name__)
 # the row-padded flat scale tables (`_tpu_fused_*_scale`, mxfp4.py), not the
 # quantizer's [E, blocks, 1, N] scale Parameters, so those are what move.
 PART_ALIASES = (
-    ("w13_weight",),
-    ("w2_weight",),
-    ("_tpu_fused_w13_scale", "w13_weight_scale"),
-    ("_tpu_fused_w2_scale", "w2_weight_scale"),
+    ("w13_weight", "w13_weight_packed"),
+    ("w2_weight", "w2_weight_packed"),
+    ("_tpu_fused_w13_scale", "w13_weight_scale", "w13_weight_scale_inv"),
+    ("_tpu_fused_w2_scale", "w2_weight_scale", "w2_weight_scale_inv"),
     ("w13_bias",),
     ("w2_bias",),
 )

@@ -45,13 +45,18 @@ def enabled() -> bool:
     return bool(envs.TPU_MOE_EPLB_DYNAMIC)
 
 
-def register(layer, *, physical: int) -> None:
+def register(layer, *, physical: int, device: torch.device | None = None) -> None:
     """Give an armed layer its [physical] accumulator. Call after weight load."""
-    if not enabled():
+    if not enabled() or operand(layer) is not None:
         return
+    if device is None:
+        w = getattr(layer, "w13_weight", None)
+        if w is None:
+            w = getattr(layer, "w13_weight_packed", None)
+        device = w.device if w is not None else torch.device("cpu")
     layer.register_buffer(
         LOAD_ATTR,
-        torch.zeros((physical,), dtype=torch.int32, device=layer.w13_weight.device),
+        torch.zeros((physical,), dtype=torch.int32, device=device),
         persistent=False,
     )
     _REGISTERED.append((layer.layer_name, layer))
