@@ -133,10 +133,6 @@ class _StubDecoderLayer(nn.Module):
         self.outputs.append((x, residual, post_mix, res_mix))
         return x, residual, post_mix, res_mix, None
 
-    def ffn_output(self, x, routed):
-        assert routed is None
-        return x
-
 
 class _FakePostOp:
     """Pure-torch stand-in for the MHC post op; counts its calls."""

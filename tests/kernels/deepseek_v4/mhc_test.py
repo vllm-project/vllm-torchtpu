@@ -518,6 +518,42 @@ class MhcFusedPostPreAddPallasTpuTest(parameterized.TestCase):
 
 
 @pytest.mark.tpu_test
+class MhcPostAddPallasTpuTest(parameterized.TestCase):
+    """The post kernel's in-kernel add vs the same kernel on the sum.
+    Needs TPU hardware."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(num_tokens=[16, 17, 1024], token_block_size=[64])
+    def test_matches_post_of_bf16_sum(self, num_tokens, token_block_size):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
+
+        args = _make_post_inputs(np.random.default_rng(13), num_tokens, 4096)
+        x = args[0]
+        addend = jnp.asarray(
+            np.random.default_rng(14).standard_normal(x.shape, dtype=np.float32)
+        ).astype(jnp.bfloat16)
+        # numpy's bfloat16 rounds after every op, like the served bf16 add.
+        x_np, addend_np = np.asarray(x), np.asarray(addend)
+        summed = jnp.asarray(x_np + addend_np * addend_np.dtype.type(ADDEND_SCALE))
+
+        want = post_kernel.mhc_post(
+            summed, *args[1:], token_block_size=token_block_size
+        )
+        got = post_kernel.mhc_post(
+            *args,
+            addend=addend,
+            addend_scale=ADDEND_SCALE,
+            token_block_size=token_block_size,
+        )
+
+        np.testing.assert_array_equal(_to_np(got), _to_np(want))
+
+
+@pytest.mark.tpu_test
 class MhcPreMixesPallasSmallShapeTest(parameterized.TestCase):
     """Mix-GEMM kernel vs the jnp oracle at small shapes and ragged
     token counts, validating block indexing and padding; needs TPU

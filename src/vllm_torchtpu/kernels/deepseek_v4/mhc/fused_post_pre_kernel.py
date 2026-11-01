@@ -30,14 +30,12 @@ def _fused_kernel(x_ref, *refs, **params):
 
 
 def _fused_add_kernel(x_ref, addend_ref, *refs, addend_scale, **params):
-    """`_fused_kernel` of the sublayer output `x + addend * addend_scale`.
-
-    Rounds the scaled addend and the sum to bf16, as the bf16 expression does.
-    """
-    f32, bf16 = jnp.float32, jnp.bfloat16
-    scaled = (addend_ref[...].astype(f32) * addend_scale).astype(bf16)
-    x_bf = (x_ref[...].astype(f32) + scaled.astype(f32)).astype(bf16)
-    _fused_block(x_bf, *refs, **params)
+    """`_fused_kernel` of the sublayer output `x + addend * addend_scale`."""
+    _fused_block(
+        utils.add_scaled_bf16(x_ref[...], addend_ref[...], addend_scale),
+        *refs,
+        **params,
+    )
 
 
 def _fused_block(

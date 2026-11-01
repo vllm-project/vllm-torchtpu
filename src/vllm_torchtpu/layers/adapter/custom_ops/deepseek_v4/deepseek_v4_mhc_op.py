@@ -100,6 +100,27 @@ def _mhc_post_jax(
     return post_kernel.mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
 
+def _mhc_post_add_jax(
+    x: jax.Array,
+    addend: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    *,
+    addend_scale: float,
+) -> jax.Array:
+    """`_mhc_post_jax` of the sublayer output `x + addend * addend_scale`,
+    added inside the kernel."""
+    return post_kernel.mhc_post(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        addend=addend,
+        addend_scale=addend_scale,
+    )
+
+
 def _mhc_fused_post_pre_jax(
     x: jax.Array,
     residual: jax.Array,
@@ -267,6 +288,32 @@ def get_mhc_post_op():
     return op
 
 
+def _fake_mhc_post_add(x, addend, residual, post_layer_mix, comb_res_mix):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty_like(residual)
+
+
+def _mhc_post_add_op(addend_scale: float):
+    op_name = f"pallas::deepseek_v4_mhc_post_add_v1_k{_name_float(addend_scale)}"
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(_mhc_post_add_jax, addend_scale=addend_scale),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None),  # addend
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+            ),
+        )
+        op.register_fake(_fake_mhc_post_add)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
 def _mhc_fused_post_pre_op(
     rms_eps: float,
     hc_pre_eps: float,
@@ -376,12 +423,15 @@ class MHCOps(NamedTuple):
     hc_scale, hc_base)``
         ``fused`` of the sublayer output ``x + addend * addend_scale``, the
         bf16 expression's roundings kept.
+    ``post_add(x, addend, residual, post_layer_mix, comb_res_mix)``
+        ``post`` of that same sublayer output.
     """
 
     pre: Any
     fused: Any
     post: Any
     fused_add: Any
+    post_add: Any
 
 
 def get_mhc_ops(
@@ -393,7 +443,7 @@ def get_mhc_ops(
     addend_scale: float,
 ) -> MHCOps:
     """Build (or fetch) every mHC op for these gate constants, and
-    ``fused_add`` for this ``addend_scale``.
+    ``fused_add`` and ``post_add`` for this ``addend_scale``.
 
     Must be called outside the compiled region: the builders construct jax
     ``PartitionSpec``s, which Dynamo cannot trace, so a cold cache inside a
@@ -417,4 +467,5 @@ def get_mhc_ops(
             hc_post_mult_value,
             sinkhorn_repeat,
         ),
+        post_add=_mhc_post_add_op(addend_scale),
     )

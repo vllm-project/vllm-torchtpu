@@ -215,10 +215,11 @@ class DSparkDeepseekV4Model(nn.Module):
             prefix=maybe_prefix(prefix, "markov_head"),
         )
 
-    # Borrowed from the target: the lazily built MHC post op, the expert
-    # mapping, and the per-layer loader.
+    # Borrowed from the target: the lazily built MHC post op and its settle,
+    # the expert mapping, and the per-layer loader.
     # The loader expects names already rewritten by ``_rewrite_dspark_name``.
     mhc_post_op = DeepseekV4Model.mhc_post_op
+    settle_post = DeepseekV4Model.settle_post
     get_expert_mapping = DeepseekV4Model.get_expert_mapping
     load_weights = DeepseekV4Model.load_weights
 
@@ -283,11 +284,8 @@ class DSparkDeepseekV4Model(nn.Module):
                 residual,
                 routed,
             )
-        hidden_states = self.mhc_post_op(
-            self.layers[-1].ffn_output(hidden_states, routed),
-            residual,
-            post_mix,
-            res_mix,
+        hidden_states = self.settle_post(
+            self.layers[-1], hidden_states, routed, residual, post_mix, res_mix
         )
         return mhc_collapse_head(
             hidden_states,

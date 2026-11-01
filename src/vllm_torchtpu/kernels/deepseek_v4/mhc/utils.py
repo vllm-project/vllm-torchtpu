@@ -57,6 +57,14 @@ def select_token_block(
     return tb, round_up(num_tokens, tb)
 
 
+def add_scaled_bf16(x: jax.Array, addend: jax.Array, scale: float) -> jax.Array:
+    """`x + addend * scale` of bf16 operands, the scaled addend and the sum
+    each rounded to bf16 as the bf16 expression is."""
+    f32, bf16 = jnp.float32, jnp.bfloat16
+    scaled = (addend.astype(f32) * scale).astype(bf16)
+    return (x.astype(f32) + scaled.astype(f32)).astype(bf16)
+
+
 def pad_to(padded_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
     """Zero-pad the leading (token) axis of each array to ``padded_tokens``."""
     pad = padded_tokens - arrays[0].shape[0]

@@ -161,9 +161,11 @@ class DeepseekV4MoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Router gate and fused experts, as `(out, routed)`.
 
-        The layer's output is `add_output(out, routed)`: with
-        `defers_output_add`, `out` is the shared expert's output and `routed`
-        the routed experts'; otherwise `out` is the output and `routed` None.
+        With `defers_output_add`, `out` is the shared expert's output and
+        `routed` the routed experts', and the layer's output is
+        `out + routed * routed_scaling_factor`, which the consuming mHC kernel
+        adds as the MoE runner would; otherwise `out` is the output and
+        `routed` None.
         """
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
@@ -180,12 +182,3 @@ class DeepseekV4MoE(nn.Module):
         assert self.shared_experts is not None
         shared_output = self.shared_experts(hidden_states)
         return shared_output.view(org_shape), final_hidden_states.view(org_shape)
-
-    def add_output(
-        self, out: torch.Tensor, routed: torch.Tensor | None
-    ) -> torch.Tensor:
-        """The output `forward`'s `(out, routed)` stand for, summed as the MoE
-        runner sums the shared and routed outputs."""
-        if routed is None:
-            return out
-        return out + routed * self.routed_scaling_factor
