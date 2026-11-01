@@ -32,7 +32,6 @@ from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
     prefill_vmem_limit,
     supports_paired_prefill,
 )
-from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
 
 def _kernel(
@@ -711,10 +710,9 @@ def _metadata_from_bits(
 
 
 def _gate_output(output, gate, lengths):
-    output = bf16(
-        bf16(output).astype(jnp.float32)
-        * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
-    )
+    output = (
+        output.astype(jnp.float32) * jax.nn.sigmoid(gate.astype(jnp.float32))
+    ).astype(jnp.bfloat16)
     return jnp.where((lengths > 0)[:, None, None], output, 0)
 
 
