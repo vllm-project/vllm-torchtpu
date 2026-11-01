@@ -33,6 +33,7 @@ for the ep - 1 incoming rows. Bit-exact with
 """
 
 import functools
+import threading
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +46,7 @@ SUBLANES = 8
 COLLECTIVE_ID = 2
 
 _CACHE = {}
+_CACHE_LOCK = threading.Lock()
 
 
 def _double_barrier(ep, me):
@@ -71,12 +73,24 @@ def _double_barrier(ep, me):
 
 
 def build_tc_exchange_all_gather(*, ep, width):
-    """fn(packed i32[width], rank i32 scalar / [1] / [1, 1]) -> i32[ep * width]."""
+    """fn(packed i32[width], rank i32 scalar / [1] / [1, 1]) -> i32[ep * width].
+
+    Memoized per (ep, width) under a lock, like the package's other builders.
+    """
+    key = (ep, width)
+    fn = _CACHE.get(key)
+    if fn is None:
+        with _CACHE_LOCK:
+            fn = _CACHE.get(key)
+            if fn is None:
+                fn = _build_tc_exchange_all_gather(ep=ep, width=width)
+                _CACHE[key] = fn
+    return fn
+
+
+def _build_tc_exchange_all_gather(*, ep, width):
     tile = SUBLANES * LANES
     rows = -(-width // tile) * SUBLANES  # whole (8, 128) tiles
-    key = (ep, width)
-    if key in _CACHE:
-        return _CACHE[key]
 
     def kernel(rank_sm, x_hbm, out_hbm, send_sem, recv_sem, lsem):
         me = rank_sm[0]
@@ -137,5 +151,4 @@ def build_tc_exchange_all_gather(*, ep, width):
         out = call(r, slab)
         return out.reshape(ep, rows * LANES)[:, :width].reshape(-1)
 
-    _CACHE[key] = fn
     return fn

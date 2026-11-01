@@ -52,7 +52,14 @@ def rank_operand(rank):
 def _sc_barrier(me, ep):
     """All-to-all barrier on the collective's barrier semaphore, signalling
     peers in rank-staggered order (me, me + 1, ...): every peer must have
-    entered (allocated its output slab) before any remote row lands."""
+    entered (allocated its output slab) before any remote row lands.
+
+    Per core: Mosaic gives each SparseCore core its own barrier semaphore,
+    and a remote signal without a core axis lands on the same core index of
+    the destination chip, so this is one barrier per core index. Core c only
+    pushes to and waits on core c of its peers (receive counts are per core),
+    and both cores are one kernel launch, so a peer's slab is live once its
+    same-index core has entered."""
     bsem = pltpu.get_barrier_semaphore()
 
     def _sig_b(i, c):

@@ -162,6 +162,12 @@ def push_dispatch_segments(
     ).sum(axis=0)
     n_remote = jnp.sum(jnp.where(d_grid != me, cnt, 0)).astype(jnp.int32).reshape(1)
     n_sent = jnp.sum(cnt).astype(jnp.int32).reshape(1)
+    # Words [0, g_local] are not read by anyone: they are padding that puts
+    # `recv` at g_local + 1 and the two counts at 2 * g_local + 1 / + 2, the
+    # fixed offsets the kernel reads its scalar-prefetched `dmeta_sm` at (and
+    # layer.py slices). Dropping them would mean shifting those offsets in
+    # the kernel, which this table's consumers were compiled and measured
+    # with, so the layout stays as is.
     meta = jnp.concatenate(
         [jnp.zeros((g_local + 1,), jnp.int32), recv, n_remote, n_sent]
     )
