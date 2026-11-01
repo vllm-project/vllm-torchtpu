@@ -11,7 +11,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.common.host_gather import (
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("rows", [0, 1, 17, 1152])
+@pytest.mark.parametrize("rows", [0, 1, 3, 17, 1152])
 @pytest.mark.parametrize("dim,blocks", [(32, 1), (256, 8), (96, 3)])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("layer_slice", [False, True])
