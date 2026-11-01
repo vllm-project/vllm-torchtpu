@@ -99,6 +99,20 @@ def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     )
 
 
+def stack_fn3(fn: jax.Array) -> jax.Array:
+    """``split_fn3``'s chunks stacked on fn's output axis, (3 * rows, K)
+    bf16: one GEMM pass against it yields every chunk's mixes side by
+    side, so the LHS streams through the MXU once instead of three times.
+    ``sum_fn3_mixes`` folds them back."""
+    return jnp.concatenate(split_fn3(fn), axis=0)
+
+
+def sum_fn3_mixes(mixes3: jax.Array) -> jax.Array:
+    """(T, 3 * n) mixes against ``stack_fn3`` -> (T, n): (hi + mid) + lo."""
+    n = mixes3.shape[1] // 3
+    return (mixes3[:, :n] + mixes3[:, n : 2 * n]) + mixes3[:, 2 * n :]
+
+
 def mhc_pre_gates(
     mixes: jax.Array,
     sqrsum: jax.Array,
