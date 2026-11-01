@@ -125,7 +125,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     #     bkv_sem_0_sz, bkv_sem_1_sz)
     bkv_update_ids_ref,
     # Input
-    attention_sinks_ref,  # float32[num_q_heads]
+    attention_sinks_ref,  # float32[num_q_heads, 128], lane-replicated
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
@@ -206,13 +206,17 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         if unnormalized_output:
             return acc.astype(q_dtype)
         num_rows = acc.shape[0] // num_q_heads
+        # Per-row stats as lane-replicated [rows, 128] columns: the layout the
+        # row reductions produce, so no lane-to-sublane relayout is needed.
         attention_sinks = jnp.concat(
-            [attention_sinks_ref[...] for _ in range(num_rows)]
+            [attention_sinks_ref[...] for _ in range(num_rows)], axis=0
         )
-        l = l + jnp.exp(attention_sinks - m)  # noqa: E741
+        l = l[:, None] + jnp.exp(attention_sinks - m[:, None])  # noqa: E741
+        lanes = head_dim // 128
         if q_dtype == jnp.float32:
-            return lax.div(acc, l[:, None])
-        return (acc * pl.reciprocal(l[:, None], approx=True)).astype(q_dtype)
+            return lax.div(acc, jnp.concat([l] * lanes, axis=1))
+        inv_l = pl.reciprocal(l, approx=True)
+        return (acc * jnp.concat([inv_l] * lanes, axis=1)).astype(q_dtype)
 
     def store_stats(bo_sem_idx, row, l, m):  # noqa: E741
         """Write per-row l and m ([n * num_q_heads]) to bl/bm rows [row, row + n)."""
@@ -1760,7 +1764,7 @@ def mla_sliding_window_ragged_paged_attention(
         )
         return kernel(
             *scalar_prefetches,
-            attention_sinks,
+            jnp.broadcast_to(attention_sinks[:, None], (num_q_heads, 128)),
             q,
             new_kv,
             cache_kv,
