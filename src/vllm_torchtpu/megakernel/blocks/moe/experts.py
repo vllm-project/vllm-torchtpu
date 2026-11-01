@@ -20,6 +20,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
+import os
+
 from ...ops import BF16, F32, rnd
 from .context import MoEEmit
 from .ring import egive, egive_group, es_wait, etake
@@ -176,6 +178,19 @@ def experts_piped(m: MoEEmit, l_idx, n_hit):
         egive(m, u2, l_idx, T13)
 
 
+# Timing-only removal arms for the PIPE_EP expert loop (WRONG results; bench attribution only):
+# VLLM_TPU_MK_MOE_ABLATE=acc (skip the part accumulate), mid (skip silu*up), mm (skip the
+# expert matmuls; weight DMAs and ring waits stay).
+_ABLATE = frozenset(x for x in os.environ.get("VLLM_TPU_MK_MOE_ABLATE", "").split(",") if x)
+
+
+def _mm(stream, x, w):
+    """`stream.mm` unless the `mm` removal arm is on (then zeros of the product's shape)."""
+    if "mm" in _ABLATE:
+        return jnp.zeros((x.shape[0], w.shape[1]), F32)
+    return stream.mm(x, w)
+
+
 def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
     ex, lane_e8, mp, scr, stream, tk = m.ex, m.lane_e8, m.mp, m.scr, m.stream, m.tk
     MB, MR = ex.MB, ex.MR
@@ -194,7 +209,7 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
         for t in range(T13):
             w13 = etake(m, "e13", t)
             k0 = t * TK13
-            mm13 = stream.mm(xb[:, k0 : k0 + TK13], w13[...])
+            mm13 = _mm(stream, xb[:, k0 : k0 + TK13], w13[...])
             if DIRECT0 and t == 0:
                 acc13[:, :BN] = mm13
             else:
@@ -207,9 +222,10 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             else:
                 egive(m, t, l_idx, t)
         es_wait(m, 0)
-        h0 = acc13[:, :BN] * scr["es"][0, :, :BN]
-        mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
-        xb2[:, :IR] = mid0.astype(BF16)
+        if "mid" not in _ABLATE:
+            h0 = acc13[:, :BN] * scr["es"][0, :, :BN]
+            mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
+            xb2[:, :IR] = mid0.astype(BF16)
 
         def body_ep(i, _):
             e = scr["elist"][i]
@@ -233,8 +249,8 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 w13_0 = etake(m, "e13", u13_0)
                 k2 = s_step * TK2
                 k13_0 = t0 * TK13
-                mm2 = stream.mm(xb2[:, k2 : k2 + TK2], w2[...])
-                mm13_0 = stream.mm(xb[:, k13_0 : k13_0 + TK13], w13_0[...])
+                mm2 = _mm(stream, xb2[:, k2 : k2 + TK2], w2[...])
+                mm13_0 = _mm(stream, xb[:, k13_0 : k13_0 + TK13], w13_0[...])
                 if DIRECT0 and s_step == 0:
                     acc[:, :H] = mm2
                     acc13[:, :BN] = mm13_0
@@ -249,7 +265,7 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
 
                 w13_1 = etake(m, "e13", u13_1)
                 k13_1 = t1 * TK13
-                acc13[:, :BN] += stream.mm(xb[:, k13_1 : k13_1 + TK13], w13_1[...])
+                acc13[:, :BN] += _mm(stream, xb[:, k13_1 : k13_1 + TK13], w13_1[...])
                 egive(m, u13_1, l_idx, t1)
 
             wcol = jnp.sum(
@@ -258,12 +274,14 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 keepdims=True,
             )
             y = rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
-            part[0:MR, :] += wcol * y
+            if "acc" not in _ABLATE:
+                part[0:MR, :] += wcol * y
 
             es_wait(m, i + 1)
-            h_nxt = acc13[:, :BN] * scr["es"][s_nxt, :, :BN]
-            mid_nxt = rnd(rnd(jax.nn.silu(rnd(h_nxt[:, :IR]))) * rnd(h_nxt[:, IR:]))
-            xb2[:, :IR] = mid_nxt.astype(BF16)
+            if "mid" not in _ABLATE:
+                h_nxt = acc13[:, :BN] * scr["es"][s_nxt, :, :BN]
+                mid_nxt = rnd(rnd(jax.nn.silu(rnd(h_nxt[:, :IR]))) * rnd(h_nxt[:, IR:]))
+                xb2[:, :IR] = mid_nxt.astype(BF16)
             return 0
 
         lax.fori_loop(0, n_hit - 1, body_ep, 0)
@@ -278,7 +296,7 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             u2 = base_last_w2 + s_step
             w2 = etake(m, "e2", u2)
             k2 = s_step * TK2
-            mm2 = stream.mm(xb2[:, k2 : k2 + TK2], w2[...])
+            mm2 = _mm(stream, xb2[:, k2 : k2 + TK2], w2[...])
             if DIRECT0 and s_step == 0:
                 acc[:, :H] = mm2
             else:
@@ -300,4 +318,5 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             keepdims=True,
         )
         y_last = rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
-        part[0:MR, :] += wcol_last * y_last
+        if "acc" not in _ABLATE:
+            part[0:MR, :] += wcol_last * y_last
