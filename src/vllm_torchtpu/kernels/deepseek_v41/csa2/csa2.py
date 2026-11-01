@@ -144,12 +144,14 @@ def _csa2_kernel(
 ) -> None:
     """Persistent attention with four input buffers and two output buffers.
 
-    Output rows land at query_offset onward. With ``owners`` "aliased", the
-    main KV rows are also copied to the matching rows of the aliased
-    [T', 512, 128] owner.
+    Output rows land at query_offset onward. With ``owners`` "new" or
+    "aliased", the main KV rows are also copied to the matching rows of the
+    [T', 512, 128] output, which "aliased" updates in place.
     """
     if owners == "aliased":
         _, _, out_hbm, kv_out_hbm, *scratch = refs
+    elif owners == "new":
+        out_hbm, kv_out_hbm, *scratch = refs
     else:
         out_hbm, *scratch = refs
         kv_out_hbm = None
@@ -692,7 +694,7 @@ def _csa2_kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("scale", "compress_ratio", "bq", "query_offset"),
+    static_argnames=("scale", "compress_ratio", "bq", "query_offset", "new_owners"),
 )
 def csa2(
     q: jax.Array,
@@ -713,6 +715,7 @@ def csa2(
     query_offset: int = 0,
     out: jax.Array | None = None,
     kv_out: jax.Array | None = None,
+    new_owners: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Ragged CSA2 attention with FP32 scales and independent SWA visibility.
 
@@ -725,19 +728,24 @@ def csa2(
     With ``out`` [T',H,512] and ``kv_out`` [T',512,128] (both or neither),
     attention and main KV are written in place to those rows of the two
     owners and ``(out, kv_out)`` is returned, so a chunked caller needs no
-    output update or gathered-KV concatenation.
+    output update or gathered-KV concatenation. ``new_owners`` instead
+    returns two newly allocated owners of those shapes; only this call's rows
+    are written.
     """
     non_causal = swa_bounds is not None
     destinations = out is not None
     if destinations != (kv_out is not None):
         raise ValueError("CSA2 out and kv_out must be given together")
+    if destinations and new_owners:
+        raise ValueError("CSA2 new_owners excludes out and kv_out")
+    owners = "aliased" if destinations else "new" if new_owners else "none"
     if q.ndim != 3 or q.shape[2] != 512:
         raise ValueError("CSA2 q must be [T,H,512]")
     tokens, heads = positions.shape[0], q.shape[1]
     if type(query_offset) is not int or not (0 <= query_offset <= q.shape[0] - tokens):
         raise ValueError("CSA2 query rows must lie within q")
-    if not destinations and q.shape[0] != tokens:
-        raise ValueError("CSA2 query offsets require out and kv_out owners")
+    if owners == "none" and q.shape[0] != tokens:
+        raise ValueError("CSA2 query offsets require out and kv_out or new owners")
     if destinations and (
         out.shape != q.shape
         or out.dtype != q.dtype
@@ -801,6 +809,8 @@ def csa2(
     ):
         raise ValueError("SWA bounds must be INT32 [B,2]")
     if not tokens:
+        if new_owners:
+            return jnp.zeros_like(q), jnp.zeros((q.shape[0], 512, 128), jnp.int32)
         return (out, kv_out) if destinations else jnp.zeros_like(q)
     bq = min(bq, tokens, 128 // (pl.cdiv(heads, 16) * 4))
     fixed_tiles = batch == 1 and tokens % bq == 0
@@ -835,11 +845,15 @@ def csa2(
     out_shape = jax.ShapeDtypeStruct(q.shape, q.dtype)
     out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
     aliases = {}
+    if owners != "none":
+        out_shape = (
+            out_shape,
+            jax.ShapeDtypeStruct((q.shape[0], 512, 128), jnp.int32),
+        )
+        out_specs = (out_specs, out_specs)
     if destinations:
         spaces += (pltpu.HBM, pltpu.HBM)
         inputs += (out, kv_out)
-        out_shape = (out_shape, jax.ShapeDtypeStruct(kv_out.shape, kv_out.dtype))
-        out_specs = (out_specs, out_specs)
         # Operand indices count the five scalar-prefetch operands.
         first = len(scalars) + len(jax.tree.leaves(inputs)) - 2
         aliases = {first: 0, first + 1: 1}
@@ -852,7 +866,7 @@ def csa2(
             scale=scale,
             non_causal=non_causal,
             query_offset=query_offset,
-            owners="aliased" if destinations else "none",
+            owners=owners,
         ),
         out_shape=out_shape,
         input_output_aliases=aliases,

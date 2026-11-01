@@ -82,11 +82,11 @@ def csa2_pipeline(
         return output, gathered_words, gathered_scales
 
     scale_chunks = []
-    # Every row of both owners is written by exactly one chunk.
-    owners = (
-        jax.lax.empty(q.shape, q.dtype),
-        jax.lax.empty((q.shape[0], 512, 128), jnp.int32),
-    )
+    # Every row of both owners is written by exactly one chunk. The first
+    # chunk allocates them as its own outputs: XLA merges identical
+    # `lax.empty` buffers across layers, then copies one layer's owners so
+    # the two in-place writers stay disjoint.
+    owners = None
     previous = None
     current = gather_csa2_kv_sc(words, scales, records[:chunk_size])
     for offset in range(0, q.shape[0], chunk_size):
@@ -107,6 +107,11 @@ def csa2_pipeline(
         )
         chunk_words, chunk_scales = current
         scale_chunks.append(chunk_scales)
+        destinations = (
+            dict(new_owners=True)
+            if owners is None
+            else dict(out=owners[0], kv_out=owners[1])
+        )
         previous = csa2(
             q,
             chunk_words,
@@ -118,8 +123,7 @@ def csa2_pipeline(
             rope[offset:end],
             main_lengths=counts[offset:end],
             query_offset=offset,
-            out=owners[0],
-            kv_out=owners[1],
+            **destinations,
             **kwargs,
         )
         if following is not None:
