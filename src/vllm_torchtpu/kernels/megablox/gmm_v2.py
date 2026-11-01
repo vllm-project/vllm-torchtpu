@@ -1013,6 +1013,15 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m // rhs_mod
     if lhs_cfgs.should_quantize:
         tile_m *= 2
+    elif dims.size_group > 1 and dims.size_m < 24 * dims.size_lhs_group:
+        # For sparse multi-group decode batches where LHS stays in bf16
+        # (e.g. subchannel weight-only quantization with < 24 rows/group on
+        # average across size_lhs_group), start bucket_base at the LHS sublane
+        # size (16) so the 4-bucket ladder {16, 32, 48, 64} avoids padding small
+        # expert groups up to 64-row multiples. Dense/prefill batches (>= 24
+        # rows/group) and single-group calls keep the full 64-row bucket_base so
+        # skewed hot experts do not split across extra M tiles.
+        tile_m = min(tile_m, dims.size_lhs_sublane)
     tile_m = min(tile_m, dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
