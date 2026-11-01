@@ -81,10 +81,19 @@ MIN_TOKENS = 1024
 # On an armed decoder layer: every tensor either branch reads, in a fixed order.
 KEEP_ATTR = "_tpu_sp_keep"
 # On an armed decoder layer's mlp: the replicated shared expert and the op.
-SHARED_W13 = "_tpu_sp_shared_w13"
-SHARED_S13 = "_tpu_sp_shared_s13"
-SHARED_W2 = "_tpu_sp_shared_w2"
-SHARED_S2 = "_tpu_sp_shared_s2"
+# On the backbone: every MoE layer's shared-expert slice, stacked on dim 0
+# (w13, s13, w2, s2). Four model-wide tensors rather than four per layer: the
+# smaller buckets' programs lift them too (bucket hand-over), and each lifted
+# tensor is one more argument of every decode step.
+SHARED_STACK = (
+    "_tpu_sp_shared_w13",
+    "_tpu_sp_shared_s13",
+    "_tpu_sp_shared_w2",
+    "_tpu_sp_shared_s2",
+)
+# On an armed decoder layer's mlp: the stacked tensors, its row in them, the op.
+SHARED_ATTR = "_tpu_sp_shared"
+SHARED_INDEX = "_tpu_sp_shared_index"
 SHARED_OP = "_tpu_sp_shared_op"
 OP_ATTR = "_tpu_sp_moe_op"
 SCALE_ATTR = "_tpu_sp_routed_scale"
@@ -179,12 +188,15 @@ def _per_channel_fp8(linear: Any) -> tuple[torch.Tensor, torch.Tensor]:
     return w.data, s.data
 
 
-def _group_shared_expert(mlp: Any, tp: int, rank: int, group: int) -> None:
+def _group_shared_expert(
+    mlp: Any, tp: int, rank: int, group: int
+) -> tuple[torch.Tensor, ...]:
+    """This rank's member slice of the layer's shared expert (w13, s13, w2,
+    s2); the fp8 weights still as the bf16 they were gathered in (exact)."""
     shared = mlp.shared_experts
     w13, s13 = _per_channel_fp8(shared.gate_up_proj)
     w2, s2 = _per_channel_fp8(shared.down_proj)
-    fp8 = w13.dtype
-    parts = member_slice(
+    return member_slice(
         _gather(w13, 1),
         _gather(s13, 0),
         _gather(w2, 0),
@@ -193,15 +205,23 @@ def _group_shared_expert(mlp: Any, tp: int, rank: int, group: int) -> None:
         group=group,
         member=rank % group,
     )
-    for name, t, dtype in zip(
-        (SHARED_W13, SHARED_S13, SHARED_W2, SHARED_S2),
-        parts,
-        (fp8, torch.float32, fp8, torch.float32),
-    ):
-        # A fresh buffer, not a view of the gathered shards: torch_tpu hands the
-        # executable the buffer behind a tensor, and peer-replayed programs
-        # then disagree with this rank's argument shapes.
-        mlp.register_buffer(name, fresh_buffer(t.to(dtype)), persistent=False)
+
+
+def _stack_shared_experts(
+    backbone: Any, mlps: list[Any], parts: list[tuple[torch.Tensor, ...]]
+) -> None:
+    stacked = []
+    dtypes = (torch.float8_e4m3fn, torch.float32, torch.float8_e4m3fn, torch.float32)
+    for name, column, dtype in zip(SHARED_STACK, zip(*parts), dtypes):
+        # A fresh buffer, not a view: torch_tpu hands the executable the buffer
+        # behind a tensor, and peer-replayed programs then disagree with this
+        # rank's argument shapes. Stacked before the fp8 cast (exact).
+        t = fresh_buffer(torch.stack(column).to(dtype))
+        backbone.register_buffer(name, t, persistent=False)
+        stacked.append(t)
+    for i, mlp in enumerate(mlps):
+        setattr(mlp, SHARED_ATTR, tuple(stacked))
+        setattr(mlp, SHARED_INDEX, i)
 
 
 _SHARED_OPS: dict[tuple, Any] = {}
@@ -236,13 +256,8 @@ def _build_shared_op(group: int) -> Any:
 
 
 def _shared_expert(mlp: Any, x: torch.Tensor) -> torch.Tensor:
-    return getattr(mlp, SHARED_OP)(
-        x,
-        getattr(mlp, SHARED_W13),
-        getattr(mlp, SHARED_S13),
-        getattr(mlp, SHARED_W2),
-        getattr(mlp, SHARED_S2),
-    )
+    i = getattr(mlp, SHARED_INDEX)
+    return getattr(mlp, SHARED_OP)(x, *(t[i] for t in getattr(mlp, SHARED_ATTR)))
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +481,7 @@ def _keep_list(mlp: torch.nn.Module) -> list[torch.Tensor]:
     MoE ops read (the decode kernel's rank buffer, when it is armed)."""
     seen: dict[int, torch.Tensor] = {}
     extra = (fused_moe_ep.rank_operand(), fused_moe_decode.rank_operand())
-    for t in (*mlp.parameters(), *mlp.buffers(), *extra):
+    for t in (*mlp.parameters(), *mlp.buffers(), *getattr(mlp, SHARED_ATTR), *extra):
         if t is not None:
             seen.setdefault(id(t), t)
     return list(seen.values())
@@ -493,6 +508,7 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         raise NotImplementedError(
             "the split needs every layer after the first MoE layer to be MoE"
         )
+    shared_parts = []
     for layer in layers[first:]:
         mla = getattr(layer.self_attn, "mla_attn", None)
         if "prefill_group" not in inspect.signature(type(mla).forward).parameters:
@@ -528,9 +544,16 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             )
         setattr(mlp, OP_ATTR, op)
         setattr(mlp, SCALE_ATTR, float(mlp.routed_scaling_factor))
-        _group_shared_expert(mlp, tp, get_tp_group().rank_in_group, group)
+        shared_parts.append(
+            _group_shared_expert(mlp, tp, get_tp_group().rank_in_group, group)
+        )
         setattr(mlp, SHARED_OP, _build_shared_op(group))
-        setattr(layer, KEEP_ATTR, _keep_list(mlp))
+    _stack_shared_experts(
+        backbone, [layer.mlp for layer in layers[first:]], shared_parts
+    )
+    del shared_parts
+    for layer in layers[first:]:
+        setattr(layer, KEEP_ATTR, _keep_list(layer.mlp))
     setattr(backbone, KEEP_ATTR, True)
     n = len(layers) - first
     logger.info(

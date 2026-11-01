@@ -285,3 +285,37 @@ def test_op_refusals_raise(change, match):
 def test_op_without_an_ep_group_raises():
     with pytest.raises(ValueError, match="EP group"):
         _build(_experts(), mesh=None)
+
+
+def test_shared_slices_are_stacked_into_four_model_wide_tensors():
+    tp, group, k, i, n, layers = 4, 2, 8, 3, 5, 3
+    backbone = torch.nn.Module()
+    mlps = [SimpleNamespace() for _ in range(layers)]
+    parts = [
+        sp.member_slice(
+            torch.randn(k, tp * 2 * i),
+            torch.rand(tp * 2 * i),
+            torch.randn(tp * i, n),
+            torch.rand(tp, n),
+            tp=tp,
+            group=group,
+            member=1,
+        )
+        for _ in range(layers)
+    ]
+    sp._stack_shared_experts(backbone, mlps, parts)
+    assert sorted(name for name, _ in backbone.named_buffers()) == sorted(
+        sp.SHARED_STACK
+    )
+    for idx, mlp in enumerate(mlps):
+        stacked = getattr(mlp, sp.SHARED_ATTR)
+        assert getattr(mlp, sp.SHARED_INDEX) == idx
+        # One set of tensors for every layer: one lifted argument each.
+        assert all(a is b for a, b in zip(stacked, getattr(mlps[0], sp.SHARED_ATTR)))
+        w13, s13, w2, s2 = (t[idx] for t in stacked)
+        assert w13.dtype == w2.dtype == torch.float8_e4m3fn
+        torch.testing.assert_close(s13, parts[idx][1], rtol=0, atol=0)
+        torch.testing.assert_close(s2, parts[idx][3], rtol=0, atol=0)
+        torch.testing.assert_close(
+            w2.float(), parts[idx][2].to(torch.float8_e4m3fn).float(), rtol=0, atol=0
+        )
