@@ -201,6 +201,19 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
 
+    def finalize(acc, l, m):  # noqa: E741
+        """Output rows from the f32 accumulator and the softmax stats."""
+        if unnormalized_output:
+            return acc.astype(q_dtype)
+        num_rows = acc.shape[0] // num_q_heads
+        attention_sinks = jnp.concat(
+            [attention_sinks_ref[...] for _ in range(num_rows)]
+        )
+        l = l + jnp.exp(attention_sinks - m)  # noqa: E741
+        if q_dtype == jnp.float32:
+            return lax.div(acc, l[:, None])
+        return (acc * pl.reciprocal(l[:, None], approx=True)).astype(q_dtype)
+
     def flash_attention(
         q,  # [bq_sz * num_q_heads, head_dim]
         kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_x2_ref
@@ -208,6 +221,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         bq_idx,
         bkv_idx,
         start_offset,
+        bo_sem_idx=None,  # The bo slot to write, iff single_bkv_block.
     ):
         assert len(q.shape) == 2
         assert len(kv.shape) == 2
@@ -278,12 +292,17 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             s = jnp.where(keep, s, jnp.finfo(s.dtype).min)
             s_rowmax = jnp.max(s, axis=1)
             if single_bkv_block:
+                # The whole window is in this kv block, so each chunk's output
+                # is final: write it out without staging pv in acc_ref.
                 m_curr = s_rowmax
                 cm_ref[...] = m_curr
                 p = jnp.exp(s - m_curr[:, None])
                 pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
-                cl_ref[...] = jnp.sum(p, axis=1)
-                cacc_ref[...] = pv
+                l_curr = jnp.sum(p, axis=1)
+                cl_ref[...] = l_curr
+                bo_x2_ref.at[bo_sem_idx][c * chunk_sz : (c + 1) * chunk_sz] = finalize(
+                    pv, l_curr, m_curr
+                ).reshape(chunk_sz, num_q_heads, head_dim)
             else:
                 m_prev = load_with_init(cm_ref, jnp.finfo(jnp.float32).min)
                 m_curr = jnp.maximum(m_prev, s_rowmax)
@@ -685,7 +704,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 sem_ids_ref[0] = next_bq_sem_idx
                 start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
-            def compute_with_bkv(bkv_idx, _):
+            def compute_with_bkv(bkv_idx, _, bo_sem_idx=None):
                 # Get next bkv ids.
                 bkv_sem_idx = sem_ids_ref[1]
                 next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx = (
@@ -749,12 +768,22 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                     bq_idx=bq_idx,
                     bkv_idx=bkv_idx,
                     start_offset=cur_start_offset,
+                    bo_sem_idx=bo_sem_idx,
                 )
+
+            def acquire_bo():
+                # Wait for previous bo to be fully sent before storing new bo.
+                bo_sem_idx = sem_ids_ref[2]
+                sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
+                wait_send_bo(bo_sem_idx)
+                return bo_sem_idx
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
             if single_bkv_block:
-                compute_with_bkv(0, None)
+                # flash_attention writes each chunk's output straight to bo.
+                bo_sem_idx = acquire_bo()
+                compute_with_bkv(0, None, bo_sem_idx=bo_sem_idx)
             else:
                 lax.fori_loop(
                     start_bkv_idx,
@@ -763,31 +792,12 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                     None,
                     unroll=False,
                 )
-
-            # Load acc and calculate final output.
-            acc = acc_ref[...]
-
-            if unnormalized_output:
-                out = acc.astype(q_dtype)
-            else:
-                attention_sinks = jnp.concat(
-                    [attention_sinks_ref[...] for _ in range(bq_sz)]
-                )
-                exp_attention_sinks = jnp.exp(attention_sinks - m_ref[...])
-                l = l_ref[...] + exp_attention_sinks  # noqa: E741
-                out = (
-                    lax.div(acc, l[:, None])
-                    if q_dtype == jnp.float32
-                    else (acc * pl.reciprocal(l[:, None], approx=True)).astype(q_dtype)
+                out = finalize(acc_ref[...], l_ref[...], m_ref[...])
+                bo_sem_idx = acquire_bo()
+                bo_x2_ref.at[bo_sem_idx][...] = out.reshape(
+                    bq_sz, num_q_heads, head_dim
                 )
 
-            # Wait for previous bo to be fully sent before storing new bo.
-            bo_sem_idx = sem_ids_ref[2]
-            sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
-            wait_send_bo(bo_sem_idx)
-
-            # Store output from acc to bo.
-            bo_x2_ref.at[bo_sem_idx][...] = out.reshape(bq_sz, num_q_heads, head_dim)
             if num_q_heads % 128 == 0:
                 bl_x2_ref.at[bo_sem_idx][...] = l_ref[...].reshape(bq_sz, num_q_heads)
                 bm_x2_ref.at[bo_sem_idx][...] = m_ref[...].reshape(bq_sz, num_q_heads)
