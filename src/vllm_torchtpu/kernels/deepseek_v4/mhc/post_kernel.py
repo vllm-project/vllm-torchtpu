@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -22,38 +23,69 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
+# Lanes of hidden recombined per loop step: gcd(hidden, LANE_STRIP), or all
+# of hidden when that is not whole 128-lane tiles. A wide strip keeps the
+# vector units busy; the whole block at once spills most of its f32
+# temporaries.
+LANE_STRIP = 1024
+
+
+def _strip_width(hidden_size: int) -> int:
+    width = math.gcd(hidden_size, LANE_STRIP)
+    return width if width % 128 == 0 else hidden_size
+
 
 def _post_kernel(x_ref, *refs, **params):
     """One token block of the unrolled stream recombine."""
-    _post_block(x_ref[...], *refs, **params)
+    _post_block(lambda lanes: x_ref[:, lanes], *refs, **params)
 
 
 def _post_add_kernel(x_ref, addend_ref, *refs, addend_scale, **params):
     """`_post_kernel` of the sublayer output `x + addend * addend_scale`."""
     _post_block(
-        utils.add_scaled_bf16(x_ref[...], addend_ref[...], addend_scale),
+        lambda lanes: utils.add_scaled_bf16(
+            x_ref[:, lanes], addend_ref[:, lanes], addend_scale
+        ),
         *refs,
         **params,
     )
 
 
-def _post_block(x_bf, res_ref, post_ref, comb_ref, out_ref, *, hc_mult, hidden_size):
-    """`_post_kernel`'s body, given the block's (tb, hidden) bf16 sublayer
-    output `x_bf`."""
-    x = x_bf.astype(jnp.float32)  # (tb, hidden)
+def _post_block(
+    x_lanes, res_ref, post_ref, comb_ref, out_ref, *, hc_mult, hidden_size, strip_width
+):
+    """`_post_kernel`'s body, ``strip_width`` lanes of hidden at a time;
+    `x_lanes(lanes)` gives the block's bf16 sublayer output on a `pl.ds`
+    of hidden's lanes."""
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
 
-    streams = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size].astype(jnp.float32)
-        for i in range(hc_mult)
-    ]
-    for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x
-        for i in range(hc_mult):
-            k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * streams[i]
-        out_ref[:, j * hidden_size : (j + 1) * hidden_size] = acc.astype(out_ref.dtype)
+    def strip(lanes):
+        x = x_lanes(pl.ds(lanes, strip_width)).astype(jnp.float32)
+        streams = [
+            res_ref[:, pl.ds(i * hidden_size + lanes, strip_width)].astype(jnp.float32)
+            for i in range(hc_mult)
+        ]
+        for j in range(hc_mult):
+            acc = post[:, j : j + 1] * x
+            for i in range(hc_mult):
+                k = i * hc_mult + j
+                acc = acc + comb[:, k : k + 1] * streams[i]
+            out_ref[:, pl.ds(j * hidden_size + lanes, strip_width)] = acc.astype(
+                out_ref.dtype
+            )
+
+    num_strips = hidden_size // strip_width
+    if num_strips == 1:
+        # Static offsets: a hidden that is not whole lane tiles stays unaligned.
+        strip(0)
+        return
+
+    def step(s, carry):
+        strip(pl.multiple_of(s * strip_width, strip_width))
+        return carry
+
+    jax.lax.fori_loop(0, num_strips, step, 0)
 
 
 @functools.partial(
@@ -133,7 +165,12 @@ def mhc_post_2d(
     )
 
     out = pl.pallas_call(
-        functools.partial(kernel, hc_mult=hc_mult, hidden_size=hidden_size),
+        functools.partial(
+            kernel,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            strip_width=_strip_width(hidden_size),
+        ),
         grid=(padded_tokens // tb,),
         in_specs=[
             *[pl.BlockSpec((tb, hidden_size), lambda i: (i, 0))] * num_x_inputs,

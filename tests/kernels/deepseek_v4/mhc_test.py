@@ -324,7 +324,7 @@ class MhcPostPallasSmallShapeTest(parameterized.TestCase):
         if jax.default_backend() != "tpu":
             self.skipTest("Pallas TPU kernel needs TPU hardware")
 
-    @parameterized.product(num_tokens=[1, 17, 64, 200], hidden_size=[256])
+    @parameterized.product(num_tokens=[1, 17, 64, 200], hidden_size=[256, 2048])
     def test_matches_reference(self, num_tokens, hidden_size):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
 
