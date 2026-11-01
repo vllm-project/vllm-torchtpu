@@ -57,7 +57,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kern
     scatter_rows,
     token_chunks,
 )
-from vllm_torchtpu.layers.adapter import small_all_reduce_op
+from vllm_torchtpu.layers.adapter import rmsnorm, small_all_reduce_op
 from vllm_torchtpu.layers.adapter.linear_common import PrequantSlot
 from vllm_torchtpu.logger import init_logger
 
@@ -403,19 +403,22 @@ def split_model_forward(model, positions, hidden_states, split: TokenSplit):
     tokens = positions.shape[0]
     torch._check(tokens % split.ranks == 0)
     residual = None
-    for index, layer in enumerate(model.layers):
-        if index < split.first_layer:
-            hidden_states, residual = layer(positions, hidden_states, residual, None)
-            continue
-        if index == split.first_layer:
-            rank = split.rank_of(layer)
-            hidden_states = split.own_rows(hidden_states, rank)
-            if residual is not None:
-                residual = split.own_rows(residual, rank)
-        hidden_states, residual = _layer_forward(
-            layer, positions, hidden_states, residual, split
-        )
-    hidden_states, _ = model.norm(hidden_states, residual)
+    with rmsnorm.norm_qkva_off():
+        for index, layer in enumerate(model.layers):
+            if index < split.first_layer:
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, None
+                )
+                continue
+            if index == split.first_layer:
+                rank = split.rank_of(layer)
+                hidden_states = split.own_rows(hidden_states, rank)
+                if residual is not None:
+                    residual = split.own_rows(residual, rank)
+            hidden_states, residual = _layer_forward(
+                layer, positions, hidden_states, residual, split
+            )
+        hidden_states, _ = model.norm(hidden_states, residual)
     return split.gather(hidden_states, tokens)
 
 
