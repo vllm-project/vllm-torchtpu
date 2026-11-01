@@ -23,7 +23,7 @@ from .chips import TOPOLOGIES, ChipSpec, SliceTopology
 from .collectives import submesh_for_group
 from .geometry import ModelGeometry
 from .modules import Dtypes, Parallel, StepShape
-from .step import spec_cycle_floor, step_floor
+from .step import StepFloor, spec_cycle_floor, step_floor
 
 # vLLM v0.32.0 CacheConfig.gpu_memory_utilization default (https://github.com/vllm-project/vllm):
 DEFAULT_GPU_MEMORY_UTILIZATION: float = 0.92
@@ -181,6 +181,39 @@ def build_example_scenario(
 
 
 @dataclass(frozen=True)
+class HbmBreakdown:
+    """Per-TensorCore HBM bytes split into weights, KV cache, and recurrent state."""
+
+    weights: float
+    kv: float
+    state: float
+    total: float
+
+
+@dataclass(frozen=True)
+class FloorTimes:
+    """Decode-step resource times (ms) behind a point's binding unit."""
+
+    hbm_ms: float
+    matmul_ms: float
+    ici_ms: float
+    chain_ms: float
+    hop_latency_ms: float
+    hard_floor_ms: float
+    binding: str
+
+
+@dataclass(frozen=True)
+class SearchStats:
+    """Search funnel: (layout, concurrency) tuples inside the chip budget."""
+
+    enumerated: int
+    hbm_fit: int
+    slo_met: int
+    frontier: int
+
+
+@dataclass(frozen=True)
 class PoolMeshPlan:
     """Topology, parallelism, and HBM footprint for one serving pool."""
 
@@ -198,6 +231,9 @@ class PoolMeshPlan:
     hbm_used_gb: float
     hbm_limit_gb: float
     moe_dispatch: Literal["allreduce", "a2a_push", "ag_ep", "fused_rs"] = "allreduce"
+    hbm_weights_gb: float = 0.0
+    hbm_kv_gb: float = 0.0
+    hbm_state_gb: float = 0.0
     max_num_seqs: int | None = None
     max_model_len: int | None = None
 
@@ -219,6 +255,7 @@ class ParetoPoint:
     p_mixed: float
     binding: str
     slo_met: bool
+    decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float = 0.0
 
@@ -236,9 +273,10 @@ class ServingPlan:
     warnings: tuple[str, ...]
     candidates: tuple[ParetoPoint, ...] = ()
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
+    search: SearchStats | None = None
 
 
-def hbm_footprint_per_core_bytes(
+def hbm_breakdown_per_core_bytes(
     geom: ModelGeometry,
     dt: Dtypes,
     par: Parallel,
@@ -246,7 +284,7 @@ def hbm_footprint_per_core_bytes(
     context: int,
     *,
     physical_kv_layout: bool = True,
-) -> float:
+) -> HbmBreakdown:
     """Static model weights plus active KV/recurrent state bytes on one TensorCore."""
     tp = max(1, par.tp)
     pp = max(1, par.pp)
@@ -481,7 +519,47 @@ def hbm_footprint_per_core_bytes(
         vd = geom.linear_v_dim or geom.head_dim
         st_bytes += float(seqs_per_dp * n_kda * vh * kd * vd) * dt.state / pp
 
-    return w_attn + w_rec + w_ffn + w_head + w_mtp + kv_gqa + kv_swa + kv_mla + st_bytes
+    weights = w_attn + w_rec + w_ffn + w_head + w_mtp
+    kv = kv_gqa + kv_swa + kv_mla
+    state = st_bytes
+    # Same summation order as before so HBM-fit decisions do not move.
+    total = (
+        w_attn + w_rec + w_ffn + w_head + w_mtp + kv_gqa + kv_swa + kv_mla + st_bytes
+    )
+    return HbmBreakdown(
+        weights=weights,
+        kv=kv,
+        state=state,
+        total=total,
+    )
+
+
+def hbm_footprint_per_core_bytes(
+    geom: ModelGeometry,
+    dt: Dtypes,
+    par: Parallel,
+    seqs_per_dp: int,
+    context: int,
+    *,
+    physical_kv_layout: bool = True,
+) -> float:
+    """Static model weights plus active KV/recurrent state bytes on one TensorCore."""
+    return hbm_breakdown_per_core_bytes(
+        geom, dt, par, seqs_per_dp, context, physical_kv_layout=physical_kv_layout
+    ).total
+
+
+def _floor_times(sf: StepFloor) -> FloorTimes:
+    """Decode-step resource times (ms) behind a point's binding unit."""
+    return FloorTimes(
+        hbm_ms=sf.hbm_s * 1e3,
+        matmul_ms=sf.mm_s * 1e3,
+        ici_ms=sf.ici_s * 1e3,
+        chain_ms=sf.chain_s * 1e3,
+        hop_latency_ms=sf.lat_s * 1e3,
+        hard_floor_ms=sf.hard_floor_s * 1e3,
+        binding=sf.binding,
+    )
 
 
 def _default_rpa_page_size(ctx_tokens: int) -> int:
@@ -779,14 +857,21 @@ def solve_serving_plan(
         t for t in TOPOLOGIES.values() if max_chips is None or t.num_chips <= max_chips
     ]
 
+    enumerated = 0
+    hbm_fit = 0
+
     # Precompute feasible prefill instances per topology and GDN compatibility class.
-    prefill_options: list[tuple[SliceTopology, Parallel, float, float, float]] = []
+    prefill_options: list[
+        tuple[SliceTopology, Parallel, float, float, float, HbmBreakdown]
+    ] = []
     for topo in topos:
         best_by_class: dict[
-            tuple[int, bool], tuple[SliceTopology, Parallel, float, float, float]
+            tuple[int, bool],
+            tuple[SliceTopology, Parallel, float, float, float, HbmBreakdown],
         ] = {}
         for par in _candidate_prefill_parallels(geom, topo, for_disagg=True):
-            hbm_b = hbm_footprint_per_core_bytes(geom, dtypes, par, 1, scenario.isl)
+            hbm_bd = hbm_breakdown_per_core_bytes(geom, dtypes, par, 1, scenario.isl)
+            hbm_b = hbm_bd.total
             if hbm_b > hbm_limit_b:
                 continue
             sf_p = step_floor(
@@ -814,7 +899,14 @@ def solve_serving_plan(
             cls_key = (par.tp * par.pcp, par.pp > 1)
             prev = best_by_class.get(cls_key)
             if prev is None or rate_p > prev[3]:
-                best_by_class[cls_key] = (topo, par, ttft_ms, rate_p, hbm_b / 1e9)
+                best_by_class[cls_key] = (
+                    topo,
+                    par,
+                    ttft_ms,
+                    rate_p,
+                    hbm_b / 1e9,
+                    hbm_bd,
+                )
         prefill_options.extend(best_by_class.values())
 
     candidates: list[ParetoPoint] = []
@@ -878,6 +970,7 @@ def solve_serving_plan(
             )
             dec_steps_per_req = max(1.0, scenario.osl / eff_al)
             for c in scenario.concurrencies:
+                enumerated += 1
                 if b_hbm_max < 1 or b_smem_max < 1:
                     continue
                 b_local = max(1, math.ceil(c / max(1, par.dp)))
@@ -913,14 +1006,19 @@ def solve_serving_plan(
                 b_res = min(b_local, b_hbm_max, b_smem_max)
                 if scenario.max_num_seqs is not None:
                     b_res = min(b_res, scenario.max_num_seqs)
-                hbm_b = hbm_footprint_per_core_bytes(geom, dtypes, par, b_res, ctx_full)
+                hbm_bd = hbm_breakdown_per_core_bytes(
+                    geom, dtypes, par, b_res, ctx_full
+                )
+                hbm_b = hbm_bd.total
                 while b_res > 1 and hbm_b > hbm_limit_b:
                     b_res -= 1
-                    hbm_b = hbm_footprint_per_core_bytes(
+                    hbm_bd = hbm_breakdown_per_core_bytes(
                         geom, dtypes, par, b_res, ctx_full
                     )
+                    hbm_b = hbm_bd.total
                 if hbm_b > hbm_limit_b:
                     continue
+                hbm_fit += 1
                 cap_tok, h_eff = _kv_capacity_and_hit_rate(
                     geom,
                     dtypes,
@@ -1075,6 +1173,9 @@ def solve_serving_plan(
                     hbm_used_gb=hbm_b / 1e9,
                     hbm_limit_gb=hbm_limit_gb,
                     moe_dispatch=par.moe_dispatch,
+                    hbm_weights_gb=hbm_bd.weights / 1e9,
+                    hbm_kv_gb=hbm_bd.kv / 1e9,
+                    hbm_state_gb=hbm_bd.state / 1e9,
                     max_num_seqs=max_seqs_flag,
                     max_model_len=ctx_full,
                 )
@@ -1095,6 +1196,7 @@ def solve_serving_plan(
                         if p_mix > 0.0
                         else sf_dec.binding,
                         slo_met=slo_ok,
+                        decode_floor=_floor_times(sf_dec),
                         kv_cache_capacity_tokens=cap_tok_int,
                         effective_prefix_hit_rate=h_eff,
                     )
@@ -1148,7 +1250,14 @@ def solve_serving_plan(
                         dec_steps_per_req * max(1e-9, sf_d_one.serial_floor_s)
                     )
 
-                    for topo_p, par_p, ttft_ms, rate_p_one, hbm_p_gb in prefill_options:
+                    for (
+                        topo_p,
+                        par_p,
+                        ttft_ms,
+                        rate_p_one,
+                        hbm_p_gb,
+                        hbm_p_bd,
+                    ) in prefill_options:
                         if not _valid_raiden_gdn_pair(geom, par_p, par_d):
                             continue
                         eff_max_inst = (
@@ -1173,6 +1282,7 @@ def solve_serving_plan(
                                 )
                                 if max_chips is not None and total_chips > max_chips:
                                     continue
+                                enumerated += 1
                                 if b_hbm_max_d < 1 or b_smem_max_d < 1:
                                     continue
                                 b_local = max(1, math.ceil(c / max(1, y_d * par_d.dp)))
@@ -1217,16 +1327,19 @@ def solve_serving_plan(
                                 b_res = min(b_local, b_hbm_max_d, b_smem_max_d)
                                 if scenario.max_num_seqs is not None:
                                     b_res = min(b_res, scenario.max_num_seqs)
-                                hbm_d = hbm_footprint_per_core_bytes(
+                                hbm_bd_d = hbm_breakdown_per_core_bytes(
                                     geom, dtypes, par_d, b_res, ctx_full
                                 )
+                                hbm_d = hbm_bd_d.total
                                 while b_res > 1 and hbm_d > hbm_limit_b:
                                     b_res -= 1
-                                    hbm_d = hbm_footprint_per_core_bytes(
+                                    hbm_bd_d = hbm_breakdown_per_core_bytes(
                                         geom, dtypes, par_d, b_res, ctx_full
                                     )
+                                    hbm_d = hbm_bd_d.total
                                 if hbm_d > hbm_limit_b:
                                     continue
+                                hbm_fit += 1
                                 cap_tok, h_eff = _kv_capacity_and_hit_rate(
                                     geom,
                                     dtypes,
@@ -1384,6 +1497,9 @@ def solve_serving_plan(
                                     hbm_used_gb=hbm_p_gb,
                                     hbm_limit_gb=hbm_limit_gb,
                                     moe_dispatch=par_p.moe_dispatch,
+                                    hbm_weights_gb=hbm_p_bd.weights / 1e9,
+                                    hbm_kv_gb=hbm_p_bd.kv / 1e9,
+                                    hbm_state_gb=hbm_p_bd.state / 1e9,
                                     max_model_len=ctx_full,
                                 )
                                 d_pool = PoolMeshPlan(
@@ -1407,6 +1523,9 @@ def solve_serving_plan(
                                     hbm_used_gb=hbm_d / 1e9,
                                     hbm_limit_gb=hbm_limit_gb,
                                     moe_dispatch=par_d.moe_dispatch,
+                                    hbm_weights_gb=hbm_bd_d.weights / 1e9,
+                                    hbm_kv_gb=hbm_bd_d.kv / 1e9,
+                                    hbm_state_gb=hbm_bd_d.state / 1e9,
                                     max_num_seqs=max_seqs_d,
                                     max_model_len=ctx_full,
                                 )
@@ -1425,6 +1544,7 @@ def solve_serving_plan(
                                         p_mixed=0.0,
                                         binding=sf_d.binding,
                                         slo_met=slo_ok,
+                                        decode_floor=_floor_times(sf_d),
                                         kv_cache_capacity_tokens=cap_tok_int,
                                         effective_prefix_hit_rate=h_eff,
                                     )
@@ -1469,4 +1589,10 @@ def solve_serving_plan(
         warnings=tuple(warnings),
         candidates=tuple(pool_for_frontier),
         gpu_memory_utilization=gpu_memory_utilization,
+        search=SearchStats(
+            enumerated=enumerated,
+            hbm_fit=hbm_fit,
+            slo_met=len(slo_candidates),
+            frontier=len(frontier),
+        ),
     )

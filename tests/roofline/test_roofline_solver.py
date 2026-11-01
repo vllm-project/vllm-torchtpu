@@ -40,6 +40,14 @@ except ImportError:
     _smem_max_seqs = None
     _valid_gdn_degree = None
     _valid_raiden_gdn_pair = None
+import math
+
+from vllm_torchtpu.roofline import CHIPS, Dtypes, Parallel
+from vllm_torchtpu.roofline.solver import (
+    hbm_breakdown_per_core_bytes,
+    hbm_footprint_per_core_bytes,
+    solve_serving_plan,
+)
 
 EXAMPLE_ACCEPT_LEN: float = 3.0
 
@@ -687,6 +695,127 @@ def test_engine_memory_utilization_and_explicit_scenario_inputs(tmp_path: Path) 
     assert rc_exp == 0
 
 
+def test_hbm_breakdown_matches_footprint():
+    """HbmBreakdown total matches hbm_footprint_per_core_bytes across geometries."""
+
+    gqa_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    mla_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 30,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "head_dim": 128,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "vocab_size": 32000,
+    }
+
+    geoms = [
+        rf.from_hf_config(gqa_cfg),
+        rf.from_hf_config(mla_cfg),
+        rf.from_hf_config(QWEN35_CFG),
+    ]
+    dt = Dtypes(kv=1.0)
+    par = Parallel(tp=4, dp=1, ep=1, pp=1, pcp=1)
+
+    for geom in geoms:
+        bd = hbm_breakdown_per_core_bytes(geom, dt, par, seqs_per_dp=16, context=2048)
+        footprint = hbm_footprint_per_core_bytes(
+            geom, dt, par, seqs_per_dp=16, context=2048
+        )
+        assert bd.total == footprint
+        assert math.isclose(bd.weights + bd.kv + bd.state, bd.total, rel_tol=1e-9)
+        assert bd.weights > 0
+        assert bd.kv >= 0
+        if geom.linear_k_heads:
+            assert bd.state > 0
+        else:
+            assert bd.state == 0.0
+
+
+@pytest.mark.parametrize("mode", ["mixed", "disagg", "auto"])
+def test_search_stats_funnel_is_monotone(mode: str):
+    """Search funnel is monotonically non-increasing and frontier is positive."""
+
+    chip = CHIPS["tpu7x"]
+    gqa_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    geom = rf.from_hf_config(gqa_cfg)
+    dt = Dtypes(kv=1.0)
+    scenario = dc_replace(
+        rf.EXAMPLE_SCENARIOS["chat-8k1k"],
+        concurrencies=(1, 4),
+        ttft_slo_ms=5000.0,
+        tpot_slo_ms=500.0,
+    )
+    plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        max_chips=4,
+        mode=mode,
+    )
+    assert plan.search is not None
+    s = plan.search
+    assert s.enumerated >= s.hbm_fit >= s.slo_met >= s.frontier >= 1
+    assert s.frontier == len(plan.frontier)
+
+
+def test_decode_floor_matches_binding():
+    """Every candidate has decode_floor matching binding resource."""
+    chip = CHIPS["tpu7x"]
+    gqa_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    geom = rf.from_hf_config(gqa_cfg)
+    dt = Dtypes(kv=1.0)
+    scenario = dc_replace(
+        rf.EXAMPLE_SCENARIOS["chat-8k1k"],
+        concurrencies=(1, 4),
+    )
+    plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        max_chips=4,
+        mode="mixed",
+    )
+    for pt in plan.candidates:
+        assert pt.decode_floor is not None
+        df = pt.decode_floor
+        expected_hard = max(
+            df.hbm_ms, df.matmul_ms, df.ici_ms, df.chain_ms, df.hop_latency_ms
+        )
+        assert math.isclose(df.hard_floor_ms, expected_hard, rel_tol=1e-5)
+        if df.binding == "hbm":
+            assert math.isclose(df.hbm_ms, df.hard_floor_ms, rel_tol=1e-5)
+        elif df.binding == "matmul":
+            assert math.isclose(df.matmul_ms, df.hard_floor_ms, rel_tol=1e-5)
+
+
 def test_runtime_legality_heads_pp_tp_pcp_ep_gdn_and_smem_cap() -> None:
     uneven_geom = rf.from_hf_config(
         {
@@ -866,3 +995,37 @@ def test_disagg_capacity_clamped_hit_rate_and_prefill_dispatch() -> None:
         if p.decode_pool.tp == 2 and p.decode_pool.dp == 1
     )
     assert pt_c64.effective_prefix_hit_rate < pt_c1.effective_prefix_hit_rate
+
+
+def test_hbm_breakdown_dsa_indexer_weights_and_mla_gqa_parity() -> None:
+    dsa_base = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 4,
+        "layer_types": ["dsa"] * 4,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "head_dim": 64,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 1024,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "index_n_heads": 64,
+        "index_head_dim": 128,
+        "index_topk": 2048,
+        "intermediate_size": 8192,
+        "vocab_size": 32000,
+    }
+    geom_idx = rf.from_hf_config(dsa_base)
+    geom_no_idx = dc_replace(geom_idx, index_n_heads=0)
+    geom_gqa_tok = dc_replace(geom_idx, layer_types=("gqa",) * 4)
+    dt = rf.Dtypes(w_dense=1.0, kv=1.0)
+    par = rf.Parallel(tp=4, dp=1, ep=1, pp=1, pcp=1)
+
+    bd_idx = hbm_breakdown_per_core_bytes(geom_idx, dt, par, 4, 2048)
+    bd_no_idx = hbm_breakdown_per_core_bytes(geom_no_idx, dt, par, 4, 2048)
+    bd_gqa_tok = hbm_breakdown_per_core_bytes(geom_gqa_tok, dt, par, 4, 2048)
+
+    expected_idx_w = float(4 * 4096 * (64 // 4) * 128) * 1.0
+    assert bd_idx.weights - bd_no_idx.weights == pytest.approx(expected_idx_w, rel=1e-6)
+    assert bd_gqa_tok == bd_idx
