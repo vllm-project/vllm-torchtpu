@@ -542,15 +542,52 @@ class StagedConsumer:
         device = self.pool.device
 
         if self._op is None:
-            from torch_tpu._internal import pallas
-
-            # Donation + copy_ writeback, as the runner's pool block copies
-            # (mamba_state_copy_op): XLA aliases the pool and updates it in
-            # place; a torch view or index write would copy the whole pool.
-            self._op = pallas.jax_op(
-                "pallas::qwen4_pd_staged_repack", self._fn, donate_argnums=(0,)
-            )
-            self._op.register_fake(lambda pool, *rest: torch.empty_like(pool))
+            self._op = self._build_op()
         for chunk in repack_chunks(main_s, main_d, copy_s, copy_d, gdn_s, gdn_d):
             args = [torch.tensor(v, dtype=torch.int32).to(device) for v in chunk]
-            self.pool.copy_(self._op(self.pool, self.staging, *args))
+            self._op(self.pool, self.staging, *args)
+
+    def _build_op(self):
+        """The repack as the runner's pool row copies run it (mamba_state_copy_op).
+
+        A donating op and its ``copy_`` writeback fuse into one aliased
+        program only inside ``torch.compile``; called eagerly the pool is not
+        donated, and XLA copies it to give the in-place writer a buffer (a
+        second 48 GiB pool: compile HBM OOM). The op is built outside the
+        compiled function, which dynamo cannot trace its construction from.
+        """
+        import jax
+        from torch_tpu._internal import pallas
+
+        fn = self._fn
+
+        def repack_fn(
+            pool: jax.Array,
+            staging: jax.Array,
+            main_src: jax.Array,
+            main_dst: jax.Array,
+            copy_src: jax.Array,
+            copy_dst: jax.Array,
+            gdn_src: jax.Array,
+            gdn_dst: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            out = fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst)
+            return out, main_src[0]
+
+        op = pallas.jax_op("pallas::qwen4_pd_staged_repack", repack_fn, donate_argnums=(0,))
+        op.register_fake(
+            lambda pool, staging, main_src, *rest: (
+                torch.empty_like(pool),
+                torch.empty((), dtype=main_src.dtype, device=main_src.device),
+            )
+        )
+
+        @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+        def run(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst):
+            new_pool, marker = op(
+                pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst
+            )
+            pool.copy_(new_pool)
+            return marker
+
+        return run
