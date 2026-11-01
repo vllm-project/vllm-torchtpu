@@ -46,8 +46,11 @@ def csa2_pipeline(
     attention i-1 bounds the prefetch distance without placing either operation
     behind the other. Gather into independent arrays; a shared destination
     would serialize its writer with the preceding chunk's attention reader.
-    Join the gathered outputs once, after the pipeline, so later layers reuse
-    them with one persistent attention launch rather than one launch per chunk.
+    Each attention chunk writes its output rows and copies its staged KV rows
+    in place into two whole-T owners, so later layers reuse contiguous KV with
+    one persistent attention launch, without a per-chunk output update or a
+    KV-word concatenation after the pipeline. Only the small FP32 scale
+    chunks are still joined.
     Only query boundaries become chunk-relative; SWA metadata and noncausal
     bounds retain their absolute positions, including future draft tokens.
     """
@@ -55,9 +58,35 @@ def csa2_pipeline(
         raise ValueError("CSA2 pipeline requires nonempty queries and positive chunks")
     if records.shape != (q.shape[0], 512) or counts.shape != q.shape[:1]:
         raise ValueError("CSA2 pipeline requires [T,512] records and [T] counts")
+    kwargs = dict(
+        swa_metadata=metadata,
+        swa_bounds=bounds,
+        scale=scale,
+        compress_ratio=compress_ratio,
+        bq=bq,
+    )
+    if q.shape[0] <= chunk_size:
+        gathered_words, gathered_scales = gather_csa2_kv_sc(words, scales, records)
+        output = csa2(
+            q,
+            gathered_words,
+            gathered_scales,
+            swa,
+            starts,
+            positions,
+            sink,
+            rope,
+            main_lengths=counts,
+            **kwargs,
+        )
+        return output, gathered_words, gathered_scales
 
-    word_chunks, scale_chunks = [], []
-    output = jnp.empty_like(q)
+    scale_chunks = []
+    # Every row of both owners is written by exactly one chunk.
+    owners = (
+        jax.lax.empty(q.shape, q.dtype),
+        jax.lax.empty((q.shape[0], 512, 128), jnp.int32),
+    )
     previous = None
     current = gather_csa2_kv_sc(words, scales, records[:chunk_size])
     for offset in range(0, q.shape[0], chunk_size):
@@ -66,11 +95,8 @@ def csa2_pipeline(
         if previous is not None:
             # Consume every barrier result. Gating only the small index array
             # avoids carrying the multi-GiB source pools through the barrier.
-            previous, current, next_ids = jax.lax.optimization_barrier(
+            owners, current, next_ids = jax.lax.optimization_barrier(
                 (previous, current, next_ids)
-            )
-            output = jax.lax.dynamic_update_slice_in_dim(
-                output, previous, offset - chunk_size, axis=0
             )
         elif end < q.shape[0]:
             # Otherwise the scheduler can gather chunk 1 before chunk 0 and
@@ -80,10 +106,9 @@ def csa2_pipeline(
             gather_csa2_kv_sc(words, scales, next_ids) if end < q.shape[0] else None
         )
         chunk_words, chunk_scales = current
-        word_chunks.append(chunk_words)
         scale_chunks.append(chunk_scales)
         previous = csa2(
-            q[offset:end],
+            q,
             chunk_words,
             chunk_scales,
             swa,
@@ -91,16 +116,14 @@ def csa2_pipeline(
             positions[offset:end],
             sink,
             rope[offset:end],
-            swa_metadata=metadata,
-            swa_bounds=bounds,
             main_lengths=counts[offset:end],
-            scale=scale,
-            compress_ratio=compress_ratio,
-            bq=bq,
+            query_offset=offset,
+            out=owners[0],
+            kv_out=owners[1],
+            **kwargs,
         )
         if following is not None:
             current = following
     assert previous is not None
-    last_offset = (q.shape[0] - 1) // chunk_size * chunk_size
-    output = jax.lax.dynamic_update_slice_in_dim(output, previous, last_offset, axis=0)
-    return output, jnp.concatenate(word_chunks), jnp.concatenate(scale_chunks)
+    output, gathered_words = previous
+    return output, gathered_words, jnp.concatenate(scale_chunks)
