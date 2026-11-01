@@ -91,6 +91,10 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
         # Above 32 rows the GDN chunk gather (no NS-sized pg_rec) leaves room for the full
         # expert ring: at b48 the trimmed 5 slots cost 0.3-0.4 ms per call vs 6 (j-74ef730a).
         t = dataclasses.replace(t, nbe=t.nbe - 1)
+    # VLLM_TPU_MK_HIER=N (bench sweeps): override the all-reduce hierarchy.
+    hier = os.environ.get("VLLM_TPU_MK_HIER", "")
+    if hier:
+        t = dataclasses.replace(t, hier=int(hier))
     # VLLM_TPU_MK_RINGS=nbe:nbd (bench sweeps): override the ring depths.
     rings = os.environ.get("VLLM_TPU_MK_RINGS", "")
     if rings:
