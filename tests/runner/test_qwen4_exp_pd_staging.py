@@ -143,7 +143,7 @@ def test_repack_rank_slices(tp, dcp, chunk):
         # and staging row 0 are the null pages, as in serving).
         size = chunk or st.bucket(max(len(ms), len(copy_s)), 16)
         out = jnp.asarray(pool)
-        plans = list(st.repack_chunks(ms, md, copy_s, copy_d, [src_gdn_page], [dst_gdn], size))
+        plans = list(st.repack_chunks(ms, md, copy_s, copy_d, [src_gdn_page], [dst_gdn], size, 1))
         assert len(plans) == (-(-max(len(ms), len(copy_s)) // size) if chunk else 1)
         for plan in plans:
             out = fn(out, jnp.asarray(staging), *(jnp.asarray(v, jnp.int32) for v in plan))
@@ -175,3 +175,11 @@ def test_pad_of_a_rank_without_rows_writes_the_null_row():
     assert src == [] and dst == []
     assert st._pad(src, 4) == [0, 0, 0, 0]
     assert st._pad([5, 7], 4) == [5, 7, 7, 7]
+
+
+def test_chunks_split_gdn_pages_and_pad_with_the_null_page():
+    plans = list(st.repack_chunks([1, 2, 3], [4, 5, 6], [7], [8], [10, 11, 12], [20, 21, 22],
+                                  size=2, gdn_pages=2))
+    assert len(plans) == 2
+    assert plans[0] == ([1, 2], [4, 5], [7, 7], [8, 8], [10, 11], [20, 21])
+    assert plans[1] == ([3, 3], [6, 6], [0, 0], [0, 0], [12, 12], [22, 22])

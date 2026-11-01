@@ -87,11 +87,14 @@ def owner_kind(name: str) -> str:
     raise ValueError(f"Qwen PD staging has no repack for cache owner {name}")
 
 
-# Rows per repack program. One program for a whole request gathers and
-# scatters every row at once: a 190k-token request at TP2 is millions of 1 KiB
-# rows, multi-GB temporaries beside a pool sized to fill HBM. Fixed chunks
-# bound the footprint (64 MiB of rows) and compile one shape.
-REPACK_CHUNK_ROWS = 1 << 16
+# Rows per repack program, by kind. One program for a whole request gathers
+# and scatters every row at once: a 190k-token request at TP2 is millions of
+# 1 KiB rows, multi-GB temporaries beside a pool sized to fill HBM. Fixed
+# chunks bound the footprint and compile one shape. The DMA writer keeps a few
+# int32 scalars per row in SMEM (1 MiB; ~11.5 B/row measured), so a program
+# stays near 40k rows: 16k main, 16k copied, 4 GDN pages (~1.6k rows each).
+REPACK_CHUNK_ROWS = 1 << 14
+REPACK_GDN_PAGES = 4
 
 
 def bucket(n: int, floor: int = 1024) -> int:
@@ -99,21 +102,25 @@ def bucket(n: int, floor: int = 1024) -> int:
     return max(floor, 1 << max(0, n - 1).bit_length())
 
 
-def repack_chunks(main_s, main_d, copy_s, copy_d, gdn_s, gdn_d, size=REPACK_CHUNK_ROWS):
+def repack_chunks(
+    main_s, main_d, copy_s, copy_d, gdn_s, gdn_d,
+    size=REPACK_CHUNK_ROWS, gdn_pages=REPACK_GDN_PAGES,
+):
     """Padded index lists per repack program, each of one fixed shape.
 
-    GDN pages go with the first chunk; later chunks rewrite the null page in
-    their place.
+    A chunk with nothing left of a kind rewrites the null page (row 0, page 0
+    on both sides) in its place.
     """
-    ngdn = max(1, len(gdn_s))
-    chunks = max(1, -(-len(main_s) // size), -(-len(copy_s) // size))
+    chunks = max(
+        1, -(-len(main_s) // size), -(-len(copy_s) // size), -(-len(gdn_s) // gdn_pages)
+    )
     for i in range(chunks):
         part = slice(i * size, (i + 1) * size)
-        gs, gd = (gdn_s, gdn_d) if i == 0 else ([], [])
+        pages = slice(i * gdn_pages, (i + 1) * gdn_pages)
         yield (
             _pad(main_s[part], size), _pad(main_d[part], size),
             _pad(copy_s[part], size), _pad(copy_d[part], size),
-            _pad(gs, ngdn), _pad(gd, ngdn),
+            _pad(gdn_s[pages], gdn_pages), _pad(gdn_d[pages], gdn_pages),
         )
 
 
