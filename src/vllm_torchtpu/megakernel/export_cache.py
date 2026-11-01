@@ -247,11 +247,18 @@ def prepare_distributed(calls: Sequence[Any]) -> None:
                 call.op(*inputs)
     except Exception as exc:
         failure = exc
-    torch.distributed.all_gather_object(
-        gathered, None if failure is None else f"rank {rank}: {failure!r}"
+        logger.exception("distributed export failed on rank %d: %r", rank, exc)
+    msg = (
+        ""
+        if failure is None
+        else f"rank {rank}: {failure!r}".encode("ascii", errors="replace").decode(
+            "ascii"
+        )
     )
-    if any(error is not None for error in gathered):
-        raise RuntimeError(f"distributed export failed: {gathered}") from failure
+    torch.distributed.all_gather_object(gathered, msg[:512].ljust(512))
+    errors = [entry.rstrip() for entry in gathered if entry.strip()]
+    if errors:
+        raise RuntimeError(f"distributed export failed: {errors}") from failure
 
 
 def _atomic_write(path: pathlib.Path, data: bytes) -> None:

@@ -5120,7 +5120,7 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         attended = mla_flash_prefill_packed(
             query, new_key, new_value, length, segment_desc[:3 * segments], count=segments,
             tile=flash_tile, arena=None)
-        return _gate_attended(attended, output_gate, latent, query.shape[0])
+        return _gate_attended(attended, output_gate, latent, full_hidden.shape[0])
 
     def local_packed_direct(full_hidden, weights, segment_desc, length, arena_k, arena_v, layer_idx):
         """One rank's view reading a persistent rank-local expanded prefix arena."""
@@ -5130,7 +5130,7 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         attended = mla_flash_prefill_packed(
             query, new_key, new_value, length, segment_desc[:5 * segments], count=segments,
             tile=flash_tile, arena=(arena_k[0], arena_v[0]), layer=layer_idx)
-        return _gate_attended(attended, output_gate, latent, query.shape[0])
+        return _gate_attended(attended, output_gate, latent, full_hidden.shape[0])
 
     def local_packed_cp(full_hidden, weights, segment_desc, length, pool, ids, local):
         """One rank's view: this rank's 3 heads over every rank's prefix
@@ -5144,7 +5144,7 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         attended = mla_flash_prefill_packed(
             query, new_key, new_value, length, segment_desc[:5 * segments], count=segments,
             tile=flash_tile, arena=arena)
-        return _gate_attended(attended, output_gate, latent, query.shape[0])
+        return _gate_attended(attended, output_gate, latent, full_hidden.shape[0])
 
     def run(hidden, prefix, weights, segment_desc, length, arena=None, *, layer=0):
         if arena is None:
