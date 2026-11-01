@@ -23,14 +23,15 @@ from typing import Any
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from . import exec_spec, pool_alias
-from .comm.params import CommParams, comm_params, ring_scratch, stage_scratch
-from .errors import MegakernelConfigError
-from .exec_spec import ExecSpec
-from .ops import BF16, F32, FP8
-from .planner import Plan, extra_inputs, plan
-from .profiles.default import chip_budget
-from .spec import ModelSpec, ScratchReq
+from .. import exec_spec
+from ..comm.params import CommParams, comm_params, ring_scratch, stage_scratch
+from ..errors import MegakernelConfigError
+from ..exec_spec import ExecSpec
+from ..ops import BF16, F32, FP8
+from ..planner import Plan, extra_inputs, plan
+from ..profiles.default import chip_budget
+from ..spec import ModelSpec, ScratchReq
+from . import pool_alias
 
 U8 = jnp.uint8
 

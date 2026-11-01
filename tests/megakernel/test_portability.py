@@ -61,7 +61,9 @@ def _derive_required_modules(
     return required
 
 
-_LAZY_IMPORTERS = frozenset({"__init__.py", "runtime/__init__.py", "_builtins.py"})
+_LAZY_IMPORTERS = frozenset(
+    {"__init__.py", "dma/__init__.py", "runtime/__init__.py", "_builtins.py"}
+)
 
 
 def test_megakernel_portability_ast_guard():
@@ -71,11 +73,11 @@ def test_megakernel_portability_ast_guard():
     - Zero imports from `vllm`, `vllm_torchtpu`, or `torch`.
     - All absolute (`level == 0`) imports come strictly from Python stdlib, `jax`,
       or `numpy` (enforcing relative imports for all internal modules).
-    - Private `jax._src.*` imports are restricted to `{"pool_alias.py"}`.
+    - Private `jax._src.*` imports are restricted to `{"dma/pool_alias.py"}`.
     - Dynamic import calls (`__import__`, `import_module`) are forbidden.
     """
     pkg_root = Path(megakernel.__file__).resolve().parent
-    jax_src_allowlist = {"pool_alias.py"}
+    jax_src_allowlist = {"dma/pool_alias.py"}
     forbidden_roots = {"vllm", "vllm_torchtpu", "torch"}
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
 

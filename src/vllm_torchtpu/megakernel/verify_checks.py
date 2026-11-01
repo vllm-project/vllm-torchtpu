@@ -26,8 +26,9 @@ import numpy as np
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 
-from . import cache, kernel, pool, vmem
+from . import cache, kernel, pool
 from . import weights as w_mod
+from .dma import vmem
 from .exec_spec import ExecSpec
 from .geometry import ModelGeometry
 from .model_def import ModelDef
