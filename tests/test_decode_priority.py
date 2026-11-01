@@ -152,3 +152,11 @@ def test_option_errors(monkeypatch):
         monkeypatch.setenv("VLLM_TPU_DECODE_PRIORITY", bad)
         with pytest.raises(ValueError):
             decode_priority._parse()
+
+
+def test_min_decodes_gates_the_window(monkeypatch):
+    big = {**DEC, "p": 8192}
+    one = [_req(100, 101, 1, 500)]
+    assert _run_sched(monkeypatch, "512:2:minb=2", [big, DEC, DEC], running=one) == [False] * 3
+    two = [_req(100, 101, 1, 500), _req(100, 101, 1, 500)]
+    assert _run_sched(monkeypatch, "512:2:minb=2", [big, DEC, DEC], running=two) == [False, True, True]
