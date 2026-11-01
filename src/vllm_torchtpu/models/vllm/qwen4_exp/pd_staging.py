@@ -243,6 +243,7 @@ def make_repack(
     kv_head: int,
     v_head_start: int,
     channels: Sequence[int],
+    write=None,
 ):
     """``fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst)``.
 
@@ -252,6 +253,11 @@ def make_repack(
 
     ``fn.rows(staging, main_src, copy_src, gdn_src)`` returns only the rows to
     write (uint8 ``[n, 4, 256]`` each).
+
+    ``write(pool, rows, page, logical, valid)`` stores ``rows`` at
+    ``pool[page, logical % pool.shape[1]]``; by default the forward's aliased
+    Pallas DMA scatter, which writes the pool in place (an XLA scatter on the
+    pool reshaped to rows copied the whole pool).
     """
     import jax
     import jax.numpy as jnp
@@ -264,12 +270,10 @@ def make_repack(
     def rows_of(rows, flat):
         return rows[flat]
 
-    def put(pool, flat, values):
-        # Index the donated pool in its own shape and dtype, so XLA updates
-        # it in place rather than materializing a reshaped copy.
-        kernel_rows = pool.shape[1]
-        values = jax.lax.bitcast_convert_type(values, pool.dtype)
-        return pool.at[flat // kernel_rows, flat % kernel_rows, 0].set(values)
+    if write is None:
+        from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
+            _write_main_cache_universal as write,
+        )
 
     def gdn_page(page, s: GdnGeometry, d: GdnGeometry):
         """One producer GDN page -> this rank's page rows ``[ssm + conv]``."""
@@ -322,12 +326,24 @@ def make_repack(
         gdn_dst: jax.Array,
     ) -> jax.Array:
         main, copies, gdn = rows(staging, main_src, copy_src, gdn_src)
-        out = put(pool, main_dst, main)
-        out = put(out, copy_dst, copies)
+        values = [main, copies]
+        flat = [main_dst, copy_dst]
         if has_gdn:
-            dst_flat = (gdn_dst[:, None] * dst_block + jnp.arange(d_rows)).reshape(-1)
-            out = put(out, dst_flat, gdn)
-        return out
+            values.append(gdn)
+            flat.append((gdn_dst[:, None] * dst_block + jnp.arange(d_rows)).reshape(-1))
+        values = jnp.concatenate(values)
+        flat = jnp.concatenate(flat).astype(jnp.int32)
+        valid = jnp.ones(flat.shape, jnp.bool_)
+        # The writer takes whole 128-row tiles; the tail is masked out.
+        tail = -len(flat) % 128
+        values = jnp.pad(values, ((0, tail), (0, 0), (0, 0)))
+        flat = jnp.pad(flat, (0, tail))
+        valid = jnp.pad(valid, (0, tail))
+        kernel_rows = pool.shape[1]
+        values = jax.lax.bitcast_convert_type(values, pool.dtype).reshape(
+            -1, *pool.shape[2:]
+        )
+        return write(pool, values, flat // kernel_rows, flat, valid)
 
     fn.rows = rows
     return fn
