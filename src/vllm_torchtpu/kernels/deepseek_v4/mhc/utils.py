@@ -106,7 +106,7 @@ def mhc_pre_gates(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Gating / softmax / Sinkhorn on the tiny (T, hc_mult3) mix logits.
 
-    Shared by the Pallas ``pre_kernel`` and the fused seam op.
+    The XLA reference; the kernels run ``post_comb_gates``, its exact twin.
     Returns (pre_mix (T, M), post_mix (T, M), comb_mix (T, M, M)).
     """
     num_tokens = mixes.shape[0]
