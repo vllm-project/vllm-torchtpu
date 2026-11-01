@@ -416,7 +416,8 @@ if [ -n "${CFG_FORMOSA:-}" ]; then
     _out="$RESULTS_DIR/formosa_syn1"
     mkdir -p "$_out"
     _bench() {
-        vllm bench serve --backend openai --base-url "http://127.0.0.1:$PROXY_PORT" \
+        # A chipless pod: an explicit CPU target keeps vLLM from probing libtpu.
+        VLLM_TARGET_DEVICE=cpu vllm bench serve --backend openai --base-url "http://127.0.0.1:$PROXY_PORT" \
             --endpoint /v1/completions --model moonshotai/Kimi-K3 --tokenizer "$_tok" \
             --trust-remote-code --dataset-name timed_trace --timed-trace-chunk-hash-size 512 \
             --no-self-timed --num-warmups 0 --ready-check-timeout-sec 0 --request-rate inf \
