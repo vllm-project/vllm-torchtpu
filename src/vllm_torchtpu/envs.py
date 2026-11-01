@@ -320,6 +320,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM_QUANT: bool = True
     TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = False
     TPU_FUSED_ADD_RMSNORM_SLICES: int = 0
+    TPU_FUSED_NORM_QKVA: bool = False
     TPU_PREFILL_SEQ_PARALLEL: bool = False
     TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS: int = 256
     TPU_MOE_PREFILL_GATHER_ONCE: bool = False
@@ -2440,6 +2441,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_FP8_LINEAR_PALLAS_SITES",
         "q_b_proj,self_attn.o_proj,mlp.gate_up_proj",
     ),
+    # With TPU_FUSED_ADD_RMSNORM: at decode buckets (at most 64 rows) each MLA
+    # layer's input add + RMSNorm, its fused_qkv_a_proj (fp8 weight streamed from
+    # HBM) and the q_a / kv_a latent norms run as one Pallas call
+    # (kernels/fused_norm_qkva.py). Above 16 rows it also emits q_c's per-row fp8
+    # quant for a q_b_proj that runs its own XLA matmul (the layers without the
+    # q_b-overlap indexer). Target model only (the MTP drafter keeps its path).
+    # y and the residual are bit-identical; the latent outputs can differ in the
+    # last bf16 ulp (the kernel's bf16 x fp8 dot accumulates in f32; XLA's fp8 x
+    # fp8 dot below it).
+    "TPU_FUSED_NORM_QKVA": env_bool("TPU_FUSED_NORM_QKVA"),
 }
 
 

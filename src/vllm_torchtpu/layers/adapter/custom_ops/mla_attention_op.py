@@ -2232,6 +2232,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         output_gate = None
         early_topk = None
         index_kw: dict[str, torch.Tensor] = {}
+        # TPU_FUSED_NORM_QKVA: at decode buckets the input norm already ran
+        # fused_qkv_a_proj and the latent norms (rmsnorm.arm_norm_qkva).
+        prologue = None
+        q_c_fp8 = None
+        nq_slot = getattr(self, "_nq_slot", None)
+        if nq_slot is not None and nq_slot.value is not None:
+            prologue = nq_slot.value
+            nq_slot.value = None
 
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
@@ -2258,7 +2266,26 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     "q_b_proj is required when q_lora_rank is not None"
                 )
 
-                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                if prologue is not None:
+                    if token_split is not None or self.gate_is_fused:
+                        raise RuntimeError(
+                            "TPU_FUSED_NORM_QKVA: a decode-bucket prologue met "
+                            "a token split or a fused output gate"
+                        )
+                    q_c, kv_c_normed, k_pe = prologue[:3]
+                    if len(prologue) > 3:
+                        q_c_fp8 = (prologue[3], prologue[4])
+                    # The other side of the rows branch reads these; lift them.
+                    q_c = _retain_buffers(
+                        q_c,
+                        cast(torch.Tensor, self.fused_qkv_a_proj.weight),
+                        cast(torch.Tensor, self.fused_qkv_a_proj.weight_scale),
+                        self.q_a_layernorm.weight,
+                        cast(torch.Tensor, self.kv_a_layernorm.weight),
+                    )
+                    qkv_lora = None
+                else:
+                    qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
                 if (
                     token_split is not None
                     and envs.TPU_PREFILL_LATENT_NORMS_LOCAL
@@ -2315,6 +2342,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     if q is None:
                         q = self.q_b_proj(q_c)[0]
                 else:
+                    qb_slot = getattr(self, "_nq_qb_slot", None)
+                    if q_c_fp8 is not None and qb_slot is not None:
+                        # q_b_proj's XLA matmul takes the norm's fp8 q_c.
+                        qb_slot.value = q_c_fp8
                     q = self.q_b_proj(q_c)[0]
             else:
                 assert self.kv_a_proj_with_mqa is not None, (
