@@ -25,6 +25,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     compute_gdn,
     compute_kda,
     config,
+    conv_input,
     memory_ref,
     metadata,
     tiling,
@@ -451,7 +452,6 @@ def fused_conv1d_gdn(
             f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
-    qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
 
@@ -499,8 +499,8 @@ def fused_conv1d_gdn(
         spec_offset = jnp.arange(num_spec_tokens + 1).reshape(1, -1)
         ckpt_indices = state_indices.reshape(-1, 1) + spec_offset
 
-    act_in_dtype = qkv.dtype
-    assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
+    act_in_dtype = jnp.dtype(jnp.float32)
+    assert a.dtype == b.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
@@ -573,11 +573,10 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    qkv = conv_input.cast_conv_input(qkv, padded_batch_size)
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 
