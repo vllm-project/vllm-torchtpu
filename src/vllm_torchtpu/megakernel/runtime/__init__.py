@@ -19,7 +19,7 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
-    from . import checks, contract, eligibility, layout_facts, policy, step_meta
+    from . import checks, contract, eligibility, layout_facts, policy, stats, step_meta
     from .checks import (
         PoolScheduleInfo,
         SentinelVariantPlan,
@@ -35,6 +35,12 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         verify_sentinel_step,
     )
     from .contract import (
+        DOMAIN_TP,
+        PARALLELISM_UNSUPPORTED,
+        REQUIRES_KEYS,
+        REQUIRES_UNMET,
+        UNSUPPORTED_TP_SIZE,
+        UNSUPPORTED_TPU_CHIP,
         Bucket,
         Decline,
         EligibilityResult,
@@ -46,15 +52,9 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         WarmupCase,
     )
     from .eligibility import (
-        BatchShape,
-        MKABCalibrator,
-        StepMixTracker,
-        check_mrope_uniform,
         check_post_mesh_eligibility,
-        check_qsl_uniform,
         check_startup_eligibility,
         check_step_eligibility,
-        inspect_batch_shape,
     )
     from .layout_facts import (
         PoolLayoutFacts,
@@ -78,6 +78,14 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         resolve_driver_profile,
         select_bucket,
     )
+    from .stats import (
+        BatchShape,
+        MKABCalibrator,
+        StepMixTracker,
+        check_mrope_uniform,
+        check_qsl_uniform,
+        inspect_batch_shape,
+    )
     from .step_meta import (
         JaxStepMetaOps,
         StepMeta,
@@ -88,11 +96,14 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     )
 
 # Public names resolve on first access (PEP 562): importing a submodule
-# (e.g. `runtime.contract`) doesn't import jax through this package.
+# (e.g. `runtime.contract`) doesn't import jax through this package. The
+# framework-free part is `contract` (stdlib) and `stats` (numpy); the rest is
+# policy- / kernel-bound.
 _SUBMODULES = frozenset(
     {
-        "checks",
         "contract",
+        "stats",
+        "checks",
         "eligibility",
         "layout_facts",
         "policy",
@@ -100,6 +111,12 @@ _SUBMODULES = frozenset(
     }
 )
 _LAZY: dict[str, str] = {
+    "DOMAIN_TP": ".contract",
+    "PARALLELISM_UNSUPPORTED": ".contract",
+    "REQUIRES_KEYS": ".contract",
+    "REQUIRES_UNMET": ".contract",
+    "UNSUPPORTED_TP_SIZE": ".contract",
+    "UNSUPPORTED_TPU_CHIP": ".contract",
     "Bucket": ".contract",
     "Decline": ".contract",
     "EligibilityResult": ".contract",
@@ -109,6 +126,12 @@ _LAZY: dict[str, str] = {
     "StepDecision": ".contract",
     "TpuMonoSpec": ".contract",
     "WarmupCase": ".contract",
+    "BatchShape": ".stats",
+    "MKABCalibrator": ".stats",
+    "StepMixTracker": ".stats",
+    "check_mrope_uniform": ".stats",
+    "check_qsl_uniform": ".stats",
+    "inspect_batch_shape": ".stats",
     "PoolScheduleInfo": ".checks",
     "SentinelVariantPlan": ".checks",
     "WarmupStepPlan": ".checks",
@@ -121,15 +144,9 @@ _LAZY: dict[str, str] = {
     "verify_ir_coverage": ".checks",
     "verify_pooled_step_hlo": ".checks",
     "verify_sentinel_step": ".checks",
-    "BatchShape": ".eligibility",
-    "MKABCalibrator": ".eligibility",
-    "StepMixTracker": ".eligibility",
-    "check_mrope_uniform": ".eligibility",
     "check_post_mesh_eligibility": ".eligibility",
-    "check_qsl_uniform": ".eligibility",
     "check_startup_eligibility": ".eligibility",
     "check_step_eligibility": ".eligibility",
-    "inspect_batch_shape": ".eligibility",
     "PoolLayoutFacts": ".layout_facts",
     "compare_layout_facts": ".layout_facts",
     "facts_from_pool_layout": ".layout_facts",
@@ -157,6 +174,12 @@ _LAZY: dict[str, str] = {
 }
 
 __all__ = [
+    "DOMAIN_TP",
+    "PARALLELISM_UNSUPPORTED",
+    "REQUIRES_KEYS",
+    "REQUIRES_UNMET",
+    "UNSUPPORTED_TPU_CHIP",
+    "UNSUPPORTED_TP_SIZE",
     "DEFAULT_BUCKETS",
     "DEFAULT_FUSED_POOL_IO_MAX_B",
     "DEFAULT_FUSED_POOL_IO_MIN_B_HI",
@@ -212,6 +235,7 @@ __all__ = [
     "resolve_driver_profile",
     "resolve_step_positions",
     "select_bucket",
+    "stats",
     "step_meta",
     "verify_compiled_step_ir",
     "verify_ir_coverage",
