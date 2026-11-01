@@ -16,8 +16,9 @@
 The runtime loads `SPEC` by this folder's package name, runs its startup
 checks on a fake runner, and `create` builds a program for a tiny geometry;
 the program loads, binds the runner's raw pools, warms up and serves a decode
-step through the CPU-interpret kernel. Only relative imports of the folder,
-so a copy under another package name runs it unchanged.
+step through the CPU-interpret kernel (the runtime test kit's `run_cpu_e2e`).
+Only relative imports of the folder, so a copy under another package name runs
+it unchanged.
 """
 
 from __future__ import annotations
@@ -32,13 +33,11 @@ import numpy as np
 import pytest
 import torch
 
-import vllm_torchtpu.megakernel_runtime as mkr
 from vllm_torchtpu.megakernel.runtime import (
     EligibilityResult,
-    TpuMonoSpec,
     facts_from_pool_layout,
 )
-from vllm_torchtpu.megakernel_runtime import testing
+from vllm_torchtpu.megakernel_runtime.testkit import check_spec, run_cpu_e2e
 
 from .. import adapter, model, profiles
 from .tiny import (
@@ -50,14 +49,12 @@ from .tiny import (
 )
 
 FOLDER = __package__.rpartition(".")[0]
-_DRIVER = "vllm_torchtpu.megakernel_runtime.driver"
 
 
 @pytest.fixture
-def tiny_runner(monkeypatch: pytest.MonkeyPatch) -> Any:
+def tiny_runner(mk_fake_runner: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     """A fake TP=1 runner over a tiny synthetic backbone, with this folder as
     the megakernel plugin (the exact-numerics profile, one `(1, 2)` bucket)."""
-    monkeypatch.delenv("VLLM_TPU_MEGAKERNEL", raising=False)
     g = tiny_geom(L=4, att_every=4)
     ex = tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=96)
     folder = sys.modules[FOLDER]
@@ -92,7 +89,7 @@ def tiny_runner(monkeypatch: pytest.MonkeyPatch) -> Any:
         "buckets": "2",
         "verify_buckets": "0",
     }
-    return testing.fake_runner(
+    return mk_fake_runner(
         model=SimpleNamespace(model=backbone),
         hf_config=SimpleNamespace(architectures=list(model.Qwen35.hf_architectures)),
         megakernel={"plugin": FOLDER, "options": options, "stats_period_s": 3600},
@@ -128,33 +125,23 @@ def _metadata(prog: Any) -> dict[str, Any]:
 
 
 def test_spec_loads_without_registering_anything() -> None:
-    folder = importlib.import_module(FOLDER)
-    assert isinstance(folder.SPEC, TpuMonoSpec)
-    assert folder.SPEC.create == ".adapter:create"
+    spec = check_spec(FOLDER)
+    assert spec is importlib.import_module(FOLDER).SPEC
+    assert spec.create == ".adapter:create"
     assert profiles.DEFAULT_PROFILE.name in profiles.PROFILES
     assert model.register() is model.Qwen35
     assert model.register() is model.Qwen35  # idempotent
 
 
-def test_serves_a_decode_step_on_cpu(
-    tiny_runner: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    drv = mkr.maybe_create(tiny_runner)
-    assert drv is not None and drv.serving, getattr(drv, "decline", None)
-    prog = drv.program
-    assert prog.profile.name == profiles.baseline.PROFILE.name
-    assert prog.profile.numerics == "exact"
-    tiny_runner._megakernel = drv
-    drv.bind_and_warmup(tiny_runner)
-    assert tiny_runner._megakernel is drv and sorted(drv._steps) == [(1, 2)]
-
-    md = _metadata(prog)
-    monkeypatch.setattr(
-        f"{_DRIVER}.get_forward_context", lambda: SimpleNamespace(attn_metadata=md)
-    )
+def test_serves_a_decode_step_on_cpu(tiny_runner: Any) -> None:
     ids = torch.tensor([5, 12], dtype=torch.int32)
     pos = torch.tensor([5, 9], dtype=torch.int32)
-    hit, out = drv.try_forward(tiny_runner, mkr.StepContext(ids, pos))
-    assert hit and out.shape == (2, 256)
+    res = run_cpu_e2e(None, tiny_runner, [(ids, pos)], metadata=_metadata)
+    prog = res.program
+    assert prog.profile.name == profiles.baseline.PROFILE.name
+    assert prog.profile.numerics == "exact"
+    assert sorted(res.driver._steps) == [(1, 2)]
+    (out,) = res.outputs
+    assert res.hits == [True] and out.shape == (2, 256)
     assert bool(torch.isfinite(out.float()).all())
-    assert drv.step_mix_tracker.counts == {"mk_t1_b2": 1}
+    assert res.step_mix == {"mk_t1_b2": 1}
