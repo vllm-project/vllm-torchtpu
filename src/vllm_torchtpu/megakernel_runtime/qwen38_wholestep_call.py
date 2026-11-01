@@ -33,6 +33,7 @@ from jax.sharding import PartitionSpec as P
 
 import os
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import F32, REC
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
@@ -73,12 +74,18 @@ def union_stats_on() -> bool:
     return UNION_ATTN and UNION_STATS_EVERY > 0
 
 
+def compressed_dcp() -> bool:
+    """VLLM_TPU_QSA_COMPRESSED_DCP under main-KV DCP: compressed keys split like the main KV."""
+    return main_kv_dcp() > 1 and bool(envs.VLLM_TPU_QSA_COMPRESSED_DCP)
+
+
 def indexed_options() -> dict:
     """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union attention,
-    the main-KV DCP size)."""
+    the main-KV DCP size, compressed-key DCP)."""
     return dict(
         LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN, union_stats=union_stats_on(),
         loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS, dcp=main_kv_dcp(),
+        compressed_dcp=compressed_dcp(),
     )
 
 
@@ -241,7 +248,7 @@ def build_wholestep_call(
         return wholestep_qsa_writes(
             pool, rows, norms, tables, qsa_layers, positions, trig, starts, context,
             compress_ratio=4, norm_eps=norm_eps, rotary_dim=rotary_dim, max_query_len=T,
-            num_requests=M // T, dcp=dcp,
+            num_requests=M // T, dcp=dcp, compressed_dcp=dcp if compressed_dcp() else None,
         )
 
     writes = jax.shard_map(
