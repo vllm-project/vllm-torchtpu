@@ -38,21 +38,49 @@ def _flat_rows(ref):
     return ref.reshape(ref.shape[0] * ref.shape[1], *ref.shape[2:])
 
 
+def window_group_slots(cfgs: config.Configs, row_tile: int, runs: bool):
+    """Where `WindowGroupRef` put each window group of one row tile's tokens:
+    slots[j][g] indexes token j's g-th group in the buffer's flat group view.
+
+    By token, each token's groups are its own. As runs (whole-row steps), row
+    tile r holds one run of ROW_TILE + window_groups - 1 groups and token j's
+    groups are the run's [j, j + window_groups).
+    """
+    groups = cfgs.window_groups
+    if runs:
+        run = config.ROW_TILE + groups - 1
+        return [
+            [row_tile * run + j + g for g in range(groups)]
+            for j in range(config.ROW_TILE)
+        ]
+    return [
+        [(row_tile * config.ROW_TILE + j) * groups + g for g in range(groups)]
+        for j in range(config.ROW_TILE)
+    ]
+
+
+def flat_groups(ref):
+    """(tile_n, window_groups, ...) window buffer -> (tile_n * window_groups, ...)."""
+    return ref.reshape(ref.shape[0] * ref.shape[1], *ref.shape[2:])
+
+
 class CopyCount(enum.IntEnum):
     """The per-tile copy counts `compress_norm_rope_store` prefetches."""
 
     VALID = 0  # tokens with a slot
     FIRST = 1  # tokens that write their NoPE row (is_first_mask)
     FIRST_ROPE = 2  # tokens that write their RoPE row (is_first_mask_rope)
-    WHOLE_ROW = 3  # tokens that fill whole rows in slot order (see by_rows)
+    WHOLE_ROW = 3  # tokens of whole rows in slot order and window runs (by_rows)
 
 
 def by_rows(cfgs: config.Configs, whole_row_count, whole_rows, by_tokens):
     """Runs whole_rows (if any) on a whole-row step, by_tokens on any other.
 
     In a whole-row step, every row tile fills one packed row in slot order
-    (all tile_n tokens count as WHOLE_ROW), so its merged rows depend on no
-    row read back. Only modes that merge rows have such steps.
+    and its windows slide over one run of state groups (all tile_n tokens
+    count as WHOLE_ROW), so its merged rows depend on no row read back and
+    its windows are fetched as runs. Only modes that merge rows have such
+    steps.
     """
     if not cfgs.merges_rows:
         by_tokens()
@@ -164,25 +192,55 @@ class WindowGroupRef(_BufferedRef):
         # state_groups_ref: (num_pages * groups_per_page, group_positions,
         # state_rows_per_token, ...); group_index_ref[n * groups + g] is the
         # group holding token n's g-th window group (see `window_group_index`).
-        state_groups_ref, group_index_ref = src_ref
+        state_groups_ref, group_index_ref, whole_counts_ref = src_ref
         groups = self.cfgs.window_groups
         tile_n = self.cfgs.tile_sizes.tile_n
-        buffer_ref = cast(jax.Ref, self.window_ref.at[slot])
+        buffer_ref = flat_groups(cast(jax.Ref, self.window_ref.at[slot]))
         base = pid * tile_n * groups
 
-        for i in range(tile_n * groups):
-            group = group_index_ref[base + i]
-            dest = buffer_ref.at[i // groups, i % groups]
-            pltpu.make_async_copy(state_groups_ref.at[group], dest, sem).start()
+        def copy(group, buffer_slot, size=1):
+            src = state_groups_ref.at[pl.ds(group, size)]
+            dest = buffer_ref.at[pl.ds(buffer_slot, size)]
+            pltpu.make_async_copy(src, dest, sem).start()
+
+        def fetch_tokens():
+            for i in range(tile_n * groups):
+                copy(group_index_ref[base + i], i)
+
+        def fetch_runs():
+            # A row tile's newest ROW_TILE groups are consecutive state groups
+            # (see `kernel.compute_window_run_mask`): one DMA fetches them.
+            for r in range(tile_n // config.ROW_TILE):
+                first = base + r * config.ROW_TILE * groups
+                slots = window_group_slots(self.cfgs, r, runs=True)[0]
+                for g in range(groups - 1):
+                    copy(group_index_ref[first + g], slots[g])
+                copy(group_index_ref[first + groups - 1], slots[-1], config.ROW_TILE)
+
+        by_rows(self.cfgs, whole_counts_ref[pid], fetch_runs, fetch_tokens)
 
     def wait_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        # The copies fill the whole block, so one wait covers their bytes.
-        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
+        vmem_ref = flat_groups(cast(jax.Ref, self.window_ref.at[slot]))
+        *_, whole_counts_ref = src_ref
+        tile_n = self.cfgs.tile_sizes.tile_n
+
+        def wait(num_groups):
+            # The copies fill the first num_groups groups, so one wait covers
+            # their bytes.
+            filled = vmem_ref.at[pl.ds(0, num_groups)]
+            pltpu.make_async_copy(filled, filled, sem).wait()
+
+        run = config.ROW_TILE + self.cfgs.window_groups - 1
+        by_rows(
+            self.cfgs,
+            whole_counts_ref[grid_indices[0]],
+            lambda: wait(tile_n // config.ROW_TILE * run),
+            lambda: wait(vmem_ref.shape[0]),
+        )
 
 
 @jax.tree_util.register_dataclass
@@ -536,7 +594,11 @@ def create_allocs_and_specs(
         use_lookahead=False,
         cfgs=cfgs,
     )
-    state_args = (state_groups_ref, token_pages_ref)
+    state_args = (
+        state_groups_ref,
+        token_pages_ref,
+        copy_counts_refs[CopyCount.WHOLE_ROW],
+    )
 
     # rope
     if cfgs.dims.has_rope_cache:

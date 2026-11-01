@@ -37,19 +37,20 @@ def _rows(ref, rows):
     return None if ref is None else ref.at[rows]
 
 
-def fill_window(state_vmem, window_vmem, *, cfgs: config.Configs):
+def fill_window(groups_vmem, group_slots, window_vmem, *, cfgs: config.Configs):
     """Copies a row tile's window states into the f32 window scratch.
 
-    state_vmem: (ROW_TILE,) + cfgs.window_buffer_shape()[1:] state rows, as
-    `buffered_ref.WindowGroupRef` fetched them: int32 words, or uint8 slabs
-    whose (4, lanes) row holds byte s of f32 lane l at [s, l]. Every slice is
-    static. window_vmem row n * head_tiles + h holds token n's head tile h.
+    groups_vmem: the window buffer's groups of state rows, flat (see
+    `buffered_ref.flat_groups`), as `buffered_ref.WindowGroupRef` fetched
+    them: int32 words, or uint8 slabs whose (4, lanes) row holds byte s of
+    f32 lane l at [s, l]; token n's group g is group_slots[n][g]. Every slice
+    is static. window_vmem row n * head_tiles + h holds token n's head tile h.
     """
     group_positions = cfgs.group_positions
     groups = cfgs.window_groups
     field_rows = cfgs.field_rows
     head_tiles = cfgs.head_tiles
-    is_words = csa_cache_layout.is_word_array(state_vmem.dtype)
+    is_words = csa_cache_layout.is_word_array(groups_vmem.dtype)
 
     def as_f32(rows):
         if is_words:
@@ -62,12 +63,13 @@ def fill_window(state_vmem, window_vmem, *, cfgs: config.Configs):
         is_prev = not cfgs.dims.overlap or g < groups // 2
         window_rows = pl.ds(g * group_positions, group_positions)
         for n in range(config.ROW_TILE):
+            state_vmem = groups_vmem.at[group_slots[n][g]]
             if cfgs.dims.mode == config.Mode.CSA_INDEXER:
                 # uint8 (4, 256) rows, kv then score; the halves are lanes.
                 lanes = pl.ds(0 if is_prev else config.LANE, config.LANE)
                 for field in range(config.N_FIELDS):
                     window_vmem[field, window_rows, pl.ds(n, 1)] = as_f32(
-                        state_vmem[n, g, :, field, :, lanes]
+                        state_vmem[:, field, :, lanes]
                     )
                 continue
             if cfgs.dims.overlap:
@@ -78,14 +80,14 @@ def fill_window(state_vmem, window_vmem, *, cfgs: config.Configs):
             first = n * head_tiles
             for field, row in ((0, kv_row), (1, score_row)):
                 if is_words:
-                    rows = state_vmem[n, g, :, pl.ds(row, head_tiles)]
+                    rows = state_vmem[:, pl.ds(row, head_tiles)]
                     window_vmem[field, window_rows, pl.ds(first, head_tiles)] = as_f32(
                         rows
                     )
                     continue
                 # A uint8 slab row is one f32 row.
                 for h in range(head_tiles):
-                    rows = state_vmem[n, g, :, row + h]
+                    rows = state_vmem[:, row + h]
                     window_vmem[field, window_rows, pl.ds(first + h, 1)] = as_f32(rows)
 
 
@@ -117,10 +119,13 @@ def inner_kernel(
 
     row_tile = config.ROW_TILE
 
+    groups_vmem = buffered_ref.flat_groups(state_vmem)
+
     def run(whole_rows):
         for r in range(tile_n // row_tile):
             rows = pl.ds(r * row_tile, row_tile)
-            fill_window(state_vmem.at[rows], window_vmem, cfgs=cfgs)
+            group_slots = buffered_ref.window_group_slots(cfgs, r, runs=whole_rows)
+            fill_window(groups_vmem, group_slots, window_vmem, cfgs=cfgs)
             compress(
                 _rows(cos_sin_vmem, rows),
                 out_vmem.at[rows],
@@ -404,6 +409,37 @@ def compute_whole_row_mask(kv_slot_mapping, pack_factor=4):
     )
 
 
+def compute_window_run_mask(positions, token_to_req_indices, run_tokens, *, cfgs):
+    """Whether each token is token j of an aligned run of run_tokens tokens
+    whose `window_group_index` groups slide over one run of groups, the last
+    run_tokens of them consecutive, as a prefill row tile's overlapping
+    windows do: token j's groups are token j - 1's shifted by one group.
+
+    Decided on the terms window_group_index derives groups from, not on the
+    groups, so that it stays one elementwise pass over the tokens: token j's
+    window ends one group after token j - 1's in the same request, neither
+    is clamped at the request's start, and both newest groups are in one
+    state block (one page, consecutive groups).
+    """
+    group_positions = cfgs.group_positions
+    if group_positions != cfgs.dims.compress_ratio:
+        return jnp.zeros(positions.shape, jnp.bool_)
+    window_end = (positions // cfgs.dims.compress_ratio + 1) * cfgs.dims.compress_ratio
+    prev_end = jnp.roll(window_end, 1)
+    block_size = cfgs.state_block_size
+    slides = (
+        (token_to_req_indices == jnp.roll(token_to_req_indices, 1))
+        & (window_end == prev_end + group_positions)
+        & (prev_end >= cfgs.window)
+        & (
+            (window_end - group_positions) // block_size
+            == (prev_end - group_positions) // block_size
+        )
+    )
+    j = jnp.arange(positions.shape[0]) % run_tokens
+    return (j == 0) | slides
+
+
 def window_group_index(positions, rows, block_table, *, cfgs: config.Configs):
     """Each token's window groups, oldest first, as indices into the state rows
     viewed as (num_pages * groups_per_page) groups.
@@ -519,11 +555,19 @@ def compress_norm_rope_store(
         kv_slot_mapping = jnp.pad(kv_slot_mapping, (0, pad), constant_values=-1)
         is_first_mask = jnp.pad(is_first_mask, (0, pad))
         is_first_mask_rope = jnp.pad(is_first_mask_rope, (0, pad))
+    rows = token_to_req_indices[:, None] * block_table_stride
+    # Look up each token's window groups here so the kernel keeps only those
+    # entries in SMEM; the full block table does not fit at long context lengths.
+    token_pages = window_group_index(positions, rows, block_table, cfgs=cfgs)
     # A step whose tokens all fill whole rows merges them by a fixed
-    # placement (see `compress_tile`).
+    # placement (see `compress_tile`) and fetches their windows as runs.
     whole_row_mask = jnp.zeros_like(is_first_mask)
     if cfgs.merges_rows:
-        whole_row_mask = compute_whole_row_mask(kv_slot_mapping, config.ROW_TILE)
+        whole_row_mask = compute_whole_row_mask(
+            kv_slot_mapping, config.ROW_TILE
+        ) & compute_window_run_mask(
+            positions, token_to_req_indices, config.ROW_TILE, cfgs=cfgs
+        )
     # Each tile's record copies, by `buffered_ref.CopyCount`.
     copy_counts = (
         jnp.stack(
@@ -532,10 +576,6 @@ def compress_norm_rope_store(
         .reshape(len(buffered_ref.CopyCount), -1, cfgs.tile_sizes.tile_n)
         .sum(axis=-1, dtype=jnp.int32)
     )
-    rows = token_to_req_indices[:, None] * block_table_stride
-    # Look up each token's window groups here so the kernel keeps only those
-    # entries in SMEM; the full block table does not fit at long context lengths.
-    token_pages = window_group_index(positions, rows, block_table, cfgs=cfgs)
     # Outer pallas_call operands, in call order. Optional operands are passed as
     # None to keep kernel_fn's argument positions fixed; pallas drops the Nones
     # when indexing, so alias indices count only the operands actually present.
