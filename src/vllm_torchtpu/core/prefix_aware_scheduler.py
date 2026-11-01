@@ -529,11 +529,10 @@ class PrefixAwareScheduler(AsyncScheduler):
             self.max_num_running_reqs = mk_max_running
         try:
             if not hasattr(super(), "_select_waiting_queue_for_scheduling"):
-                queue = getattr(self, "kv_holding_waiting", None) or getattr(
-                    self, "waiting", None
-                )
-                if queue is not None:
-                    self._promote_warmest(queue)
+                for q_attr in ("kv_holding_waiting", "waiting"):
+                    queue = getattr(self, q_attr, None)
+                    if queue:
+                        self._promote_warmest(queue)
             out = super().schedule(*args, **kwargs)
             if getattr(out, "scheduled_new_reqs", None):
                 self._maybe_pack_prompt_ids(out)

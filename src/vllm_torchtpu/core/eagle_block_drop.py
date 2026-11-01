@@ -97,6 +97,13 @@ def patch_offload_without_eagle_groups() -> None:
     @wraps(original_from_spec)
     def from_spec(spec, vllm_config, kv_cache_config):
         config = original_from_spec(spec, vllm_config, kv_cache_config)
+        clear_retention = getattr(config, "retention_interval", None) == 0
+        if clear_retention:
+            config = config._replace(retention_interval=None)
+            logger.info(
+                "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: cleared "
+                "SchedulerOffloadConfig.retention_interval=0 -> None."
+            )
         if not any(group.is_eagle_group for group in config.kv_group_configs):
             return config
         kv_group_configs = tuple(

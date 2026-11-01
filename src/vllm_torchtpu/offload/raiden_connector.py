@@ -210,9 +210,78 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(spec, vllm_config, kv_cache_config)
+        if getattr(self.config, "retention_interval", None) == 0:
+            self.config = self.config._replace(retention_interval=None)
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+
+    def _make_boundary_key_compat(
+        self, req_status: Any, group_idx: int, boundary: int
+    ) -> OffloadKey:
+        try:
+            return self._make_boundary_key(
+                req_status.req, group_idx, boundary, req_status.req_context
+            )
+        except TypeError:
+            return self._make_boundary_key(  # type: ignore[call-arg]
+                req_status.req, group_idx, boundary
+            )
+
+    def _touch(self, req_status: Any) -> None:
+        """Refresh Raiden LRU order for all active request prefix keys.
+
+        Restores the ``OffloadingConnectorScheduler._touch`` hook removed in
+        upstream vLLM 0.32 (which moved LRU updates internally into
+        ``CPUOffloadingManager``) so ``RaidenOffloadingManager.touch`` keeps
+        active multi-turn conversation prefixes warm in host DRAM even across
+        turns served directly from device HBM.
+        """
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            if group_config.sliding_window_size_in_chunks is None:
+                self._raiden_manager.touch(
+                    group_state.offload_keys, req_status.req_context
+                )
+            else:
+                chunks_to_skip = max(
+                    0,
+                    group_state.num_hit_chunks
+                    - group_config.sliding_window_size_in_chunks,
+                )
+                self._raiden_manager.touch(
+                    group_state.offload_keys[chunks_to_skip:],
+                    req_status.req_context,
+                )
+        if req_status.partial_tail_boundary is not None:
+            self._raiden_manager.touch(
+                tuple(
+                    self._make_boundary_key_compat(
+                        req_status,
+                        group.group_idx,
+                        req_status.partial_tail_boundary,
+                    )
+                    for group in self.config.kv_group_configs
+                ),
+                req_status.req_context,
+            )
+
+    def get_num_new_matched_tokens(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[int | None, bool]:
+        res = super().get_num_new_matched_tokens(
+            request, num_computed_tokens, *args, **kwargs
+        )
+        req_status_map = getattr(self, "_req_status", None)
+        req_status = req_status_map.get(request.request_id) if req_status_map else None
+        if req_status is not None:
+            self._touch(req_status)
+        return res
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -221,6 +290,17 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(meta, OffloadingConnectorMetadata)
 
         manager = self._raiden_manager
+
+        req_status_map = getattr(self, "_req_status", None)
+        if req_status_map:
+            touched_req_ids: set[str] = set()
+            for job in meta.store_jobs.values():
+                req_id = getattr(job, "req_id", None)
+                if req_id and req_id not in touched_req_ids:
+                    touched_req_ids.add(req_id)
+                    req_status = req_status_map.get(req_id)
+                    if req_status is not None:
+                        self._touch(req_status)
 
         # Park new store jobs: wait for all ranks to complete device fence.
         new_fence_ids: set[int] = set()
