@@ -100,6 +100,27 @@ def _mhc_post_jax(
     return post_kernel.mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
 
+def _mhc_post_add_jax(
+    x: jax.Array,
+    addend: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    *,
+    addend_scale: float,
+) -> jax.Array:
+    """`_mhc_post_jax` of the sublayer output `x + addend * addend_scale`,
+    added inside the kernel."""
+    return post_kernel.mhc_post(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        addend=addend,
+        addend_scale=addend_scale,
+    )
+
+
 def _mhc_fused_post_pre_jax(
     x: jax.Array,
     residual: jax.Array,
@@ -114,8 +135,10 @@ def _mhc_fused_post_pre_jax(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    xla_gates: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """One layer's post and the next layer's pre as a single kernel."""
+    """One layer's post and the next layer's pre as a single kernel; with
+    `xla_gates`, the post/comb gates run in XLA after it."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
         x,
         residual,
@@ -129,6 +152,44 @@ def _mhc_fused_post_pre_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        xla_gates=xla_gates,
+    )
+
+
+def _mhc_fused_post_pre_add_jax(
+    x: jax.Array,
+    addend: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    addend_scale: float,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """`_mhc_fused_post_pre_jax` of the sublayer output
+    `x + addend * addend_scale`, added inside the kernel."""
+    return fused_post_pre_kernel.mhc_fused_post_pre(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        addend=addend,
+        addend_scale=addend_scale,
     )
 
 
@@ -230,15 +291,46 @@ def get_mhc_post_op():
     return op
 
 
+def _fake_mhc_post_add(x, addend, residual, post_layer_mix, comb_res_mix):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty_like(residual)
+
+
+def _mhc_post_add_op(addend_scale: float):
+    op_name = f"pallas::deepseek_v4_mhc_post_add_v1_k{_name_float(addend_scale)}"
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(_mhc_post_add_jax, addend_scale=addend_scale),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None),  # addend
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+            ),
+        )
+        op.register_fake(_fake_mhc_post_add)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
 def _mhc_fused_post_pre_op(
     rms_eps: float,
     hc_pre_eps: float,
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    xla_gates: bool = False,
 ):
-    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    op_name = (
+        "pallas::deepseek_v4_mhc_fused_post_pre_v1"
+        + ("_xg" if xla_gates else "")
+        + _gate_suffix(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
@@ -251,6 +343,7 @@ def _mhc_fused_post_pre_op(
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
+                xla_gates=xla_gates,
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
@@ -268,8 +361,59 @@ def _mhc_fused_post_pre_op(
     return op
 
 
+def _fake_mhc_fused_post_pre_add(
+    x, addend, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base
+):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return (torch.empty_like(residual), *_fake_pre_outputs(residual))
+
+
+def _mhc_fused_post_pre_add_op(
+    addend_scale: float,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+):
+    op_name = (
+        f"pallas::deepseek_v4_mhc_fused_post_pre_add_v1_k{_name_float(addend_scale)}"
+        + _gate_suffix(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
+    )
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(
+                _mhc_fused_post_pre_add_jax,
+                addend_scale=addend_scale,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+            ),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None),  # addend
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                P(),  # fn
+                P(),  # hc_scale
+                P(),  # hc_base
+            ),
+        )
+        op.register_fake(_fake_mhc_fused_post_pre_add)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
 class MHCOps(NamedTuple):
-    """The three registered mHC ops for one set of gate constants.
+    """The registered mHC ops for one set of gate constants.
 
     ``pre`` and ``post`` match vLLM's ``mhc_pre_torch`` / ``mhc_post_torch``
     contracts; ``fused`` is the seam op, equivalent to ``post`` followed by
@@ -284,11 +428,23 @@ class MHCOps(NamedTuple):
     ``fused(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base)``
         residual_cur -- the ``post`` output -- then ``pre``'s three outputs
         computed from it.
+    ``fused_add(x, addend, residual, post_layer_mix, comb_res_mix, fn,
+    hc_scale, hc_base)``
+        ``fused`` of the sublayer output ``x + addend * addend_scale``, the
+        bf16 expression's roundings kept.
+    ``post_add(x, addend, residual, post_layer_mix, comb_res_mix)``
+        ``post`` of that same sublayer output.
+    ``fused_xla_gates``
+        ``fused`` with the post/comb gates run in XLA after the kernel, for
+        a seam whose gates XLA can schedule inside a collective's wait.
     """
 
     pre: Any
     fused: Any
     post: Any
+    fused_add: Any
+    post_add: Any
+    fused_xla_gates: Any
 
 
 def get_mhc_ops(
@@ -297,8 +453,10 @@ def get_mhc_ops(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    addend_scale: float,
 ) -> MHCOps:
-    """Build (or fetch) every mHC op for these gate constants.
+    """Build (or fetch) every mHC op for these gate constants, and
+    ``fused_add`` and ``post_add`` for this ``addend_scale``.
 
     Must be called outside the compiled region: the builders construct jax
     ``PartitionSpec``s, which Dynamo cannot trace, so a cold cache inside a
@@ -314,4 +472,21 @@ def get_mhc_ops(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         ),
         post=get_mhc_post_op(),
+        fused_add=_mhc_fused_post_pre_add_op(
+            addend_scale,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        ),
+        post_add=_mhc_post_add_op(addend_scale),
+        fused_xla_gates=_mhc_fused_post_pre_op(
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            xla_gates=True,
+        ),
     )

@@ -324,7 +324,7 @@ class MhcPostPallasSmallShapeTest(parameterized.TestCase):
         if jax.default_backend() != "tpu":
             self.skipTest("Pallas TPU kernel needs TPU hardware")
 
-    @parameterized.product(num_tokens=[1, 17, 64, 200], hidden_size=[256])
+    @parameterized.product(num_tokens=[1, 17, 64, 200], hidden_size=[256, 2048])
     def test_matches_reference(self, num_tokens, hidden_size):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
 
@@ -456,8 +456,8 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
             self.skipTest("Pallas TPU kernel needs TPU hardware")
 
     @parameterized.product(
-        num_tokens=[16, 17, 128, 2048],
-        token_block_size=[32, 64],
+        num_tokens=[16, 17, 128, 1030, 2048],
+        token_block_size=[32, 64, 128, None],
     )
     def test_matches_sequential_reference(self, num_tokens, token_block_size):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
@@ -475,6 +475,97 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
                 else (FUSED_F32_RTOL, FUSED_F32_ATOL)
             )
             np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
+
+    @parameterized.product(num_tokens=[16, 17, 1030])
+    def test_xla_gates_match_in_kernel_gates(self, num_tokens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        args = _fused_args(np.random.default_rng(15), num_tokens, 4096)
+        fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
+
+        want = fused_fn(*args)
+        got = fused_fn(*args, xla_gates=True)
+
+        for g, w in zip(got, want):
+            np.testing.assert_array_equal(_to_np(g), _to_np(w))
+
+
+# DeepSeek-V4's routed_scaling_factor, the scale the model adds with.
+ADDEND_SCALE = 1.5
+
+
+@pytest.mark.tpu_test
+class MhcFusedPostPreAddPallasTpuTest(parameterized.TestCase):
+    """The seam kernel's in-kernel add vs the same kernel on the sum.
+    Needs TPU hardware."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(
+        num_tokens=[16, 17, 1024, 1030], token_block_size=[32, 128, None]
+    )
+    def test_matches_fused_of_bf16_sum(self, num_tokens, token_block_size):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        args = _fused_args(np.random.default_rng(11), num_tokens, 4096)
+        x = args[0]
+        addend = jnp.asarray(
+            np.random.default_rng(12).standard_normal(x.shape, dtype=np.float32)
+        ).astype(jnp.bfloat16)
+        # numpy's bfloat16 rounds after every op, like the served bf16 add.
+        x_np, addend_np = np.asarray(x), np.asarray(addend)
+        summed = jnp.asarray(x_np + addend_np * addend_np.dtype.type(ADDEND_SCALE))
+        fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
+
+        want = fused_fn(summed, *args[1:], token_block_size=token_block_size)
+        got = fused_fn(
+            *args,
+            addend=addend,
+            addend_scale=ADDEND_SCALE,
+            token_block_size=token_block_size,
+        )
+
+        for g, w in zip(got, want):
+            np.testing.assert_array_equal(_to_np(g), _to_np(w))
+
+
+@pytest.mark.tpu_test
+class MhcPostAddPallasTpuTest(parameterized.TestCase):
+    """The post kernel's in-kernel add vs the same kernel on the sum.
+    Needs TPU hardware."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(num_tokens=[16, 17, 1024], token_block_size=[64])
+    def test_matches_post_of_bf16_sum(self, num_tokens, token_block_size):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
+
+        args = _make_post_inputs(np.random.default_rng(13), num_tokens, 4096)
+        x = args[0]
+        addend = jnp.asarray(
+            np.random.default_rng(14).standard_normal(x.shape, dtype=np.float32)
+        ).astype(jnp.bfloat16)
+        # numpy's bfloat16 rounds after every op, like the served bf16 add.
+        x_np, addend_np = np.asarray(x), np.asarray(addend)
+        summed = jnp.asarray(x_np + addend_np * addend_np.dtype.type(ADDEND_SCALE))
+
+        want = post_kernel.mhc_post(
+            summed, *args[1:], token_block_size=token_block_size
+        )
+        got = post_kernel.mhc_post(
+            *args,
+            addend=addend,
+            addend_scale=ADDEND_SCALE,
+            token_block_size=token_block_size,
+        )
+
+        np.testing.assert_array_equal(_to_np(got), _to_np(want))
 
 
 @pytest.mark.tpu_test

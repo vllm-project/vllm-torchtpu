@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from collections.abc import Callable
 from typing import cast
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
@@ -54,6 +57,14 @@ def select_token_block(
     return tb, round_up(num_tokens, tb)
 
 
+def add_scaled_bf16(x: jax.Array, addend: jax.Array, scale: float) -> jax.Array:
+    """`x + addend * scale` of bf16 operands, the scaled addend and the sum
+    each rounded to bf16 as the bf16 expression is."""
+    f32, bf16 = jnp.float32, jnp.bfloat16
+    scaled = (addend.astype(f32) * scale).astype(bf16)
+    return (x.astype(f32) + scaled.astype(f32)).astype(bf16)
+
+
 def pad_to(padded_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
     """Zero-pad the leading (token) axis of each array to ``padded_tokens``."""
     pad = padded_tokens - arrays[0].shape[0]
@@ -88,6 +99,20 @@ def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     )
 
 
+def stack_fn3(fn: jax.Array) -> jax.Array:
+    """``split_fn3``'s chunks stacked on fn's output axis, (3 * rows, K)
+    bf16: one GEMM pass against it yields every chunk's mixes side by
+    side, so the LHS streams through the MXU once instead of three times.
+    ``sum_fn3_mixes`` folds them back."""
+    return jnp.concatenate(split_fn3(fn), axis=0)
+
+
+def sum_fn3_mixes(mixes3: jax.Array) -> jax.Array:
+    """(T, 3 * n) mixes against ``stack_fn3`` -> (T, n): (hi + mid) + lo."""
+    n = mixes3.shape[1] // 3
+    return (mixes3[:, :n] + mixes3[:, n : 2 * n]) + mixes3[:, 2 * n :]
+
+
 def mhc_pre_gates(
     mixes: jax.Array,
     sqrsum: jax.Array,
@@ -103,7 +128,7 @@ def mhc_pre_gates(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Gating / softmax / Sinkhorn on the tiny (T, hc_mult3) mix logits.
 
-    Shared by the Pallas ``pre_kernel`` and the fused seam op.
+    The XLA reference; the kernels run ``post_comb_gates``, its exact twin.
     Returns (pre_mix (T, M), post_mix (T, M), comb_mix (T, M, M)).
     """
     num_tokens = mixes.shape[0]
@@ -131,3 +156,145 @@ def mhc_pre_gates(
             jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps
         )
     return pre_mix, post_mix, comb_mix
+
+
+# In-kernel twin of mhc_pre_gates' post and comb halves. It reproduces, op
+# for op, the program XLA compiles from mhc_pre_gates on TPU, so the gates
+# keep that path's exact bits:
+# - XLA folds the Sinkhorn's chained divisions x/a/b into x/(a*b), so every
+#   step divides the first comb_mix by the running product of the
+#   denominators, multiplied in step order;
+# - x/y lowers to x * reciprocal(y), the same in Mosaic and XLA;
+# - in XLA's (T, M, M) layout a sum over the last axis is a sublane tree,
+#   (a0+a2)+(a1+a3) for M=4, and a sum over the middle axis is a left fold;
+# - the sigmoid is XLA's expansion 1/(1+exp(-x)), not Mosaic's logistic.
+
+
+def gate_logits(scaled: jax.Array, sc_ref, hb_ref, hc_mult: int) -> jax.Array:
+    """(tb, hc_mult3) gate logits from RMS-scaled mixes: each block of
+    columns (pre, post, comb) times its scale, plus hc_base."""
+    lane = jax.lax.broadcasted_iota(jnp.int32, (1, scaled.shape[1]), 1)
+    scale = jnp.where(
+        lane < hc_mult,
+        sc_ref[0, 0],
+        jnp.where(lane < 2 * hc_mult, sc_ref[0, 1], sc_ref[0, 2]),
+    )
+    return scaled * scale + hb_ref[...]
+
+
+def _last_axis_sum(terms: list[jax.Array]) -> jax.Array:
+    assert len(terms) == 4, "the reduction tree is spelled out for hc_mult=4"
+    return (terms[0] + terms[2]) + (terms[1] + terms[3])
+
+
+def _middle_axis_sum(rows: jax.Array) -> jax.Array:
+    total = rows[0:1]
+    for i in range(1, rows.shape[0]):
+        total = total + rows[i : i + 1]
+    return total
+
+
+def post_comb_gates(
+    logits_t_ref,
+    gates_t_ref,
+    *,
+    hc_mult: int,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> None:
+    """post_mix and comb_mix for every token at once, tokens on lanes.
+
+    logits_t_ref: (hc_mult3, T) f32 gate logits, one row per logit.
+    gates_t_ref: (hc_mult + hc_mult**2, T) f32 out: post_mix's hc_mult
+        rows, then comb_mix's rows in row-major (i, j) order.
+    """
+    m = hc_mult
+    z = logits_t_ref[pl.ds(m, m), :]
+    gates_t_ref[pl.ds(0, m), :] = (1.0 / (1.0 + jnp.exp(-z))) * hc_post_mult_value
+
+    # comb logits as one (i, T) array per column j.
+    def rows(first):
+        return [logits_t_ref[pl.ds(first + k * m, 1), :] for k in range(m)]
+
+    logits = [jnp.concatenate(rows(2 * m + j), axis=0) for j in range(m)]
+    row_max = functools.reduce(jnp.maximum, logits)
+    exps = [jnp.exp(lg - row_max) for lg in logits]
+    exp_sum = _last_axis_sum(exps)
+    comb0 = [e / exp_sum + hc_sinkhorn_eps for e in exps]
+
+    col_den = [_middle_axis_sum(c) + hc_sinkhorn_eps for c in comb0]
+    den = [jnp.broadcast_to(d, c.shape) for d, c in zip(col_den, comb0)]
+    for _ in range(sinkhorn_repeat - 1):
+        comb = [c / d for c, d in zip(comb0, den)]
+        row_den = _last_axis_sum(comb) + hc_sinkhorn_eps
+        den = [d * row_den for d in den]
+        comb = [c / d for c, d in zip(comb0, den)]
+        den = [d * (_middle_axis_sum(c) + hc_sinkhorn_eps) for d, c in zip(den, comb)]
+    for j in range(m):
+        comb = comb0[j] / den[j]
+        for i in range(m):
+            gates_t_ref[pl.ds(m + i * m + j, 1), :] = comb[i : i + 1]
+
+
+def post_comb_gates_epilogue(
+    scaled: jax.Array,
+    sc_ref,
+    hb_ref,
+    post_ref,
+    comb_ref,
+    logits_ref,
+    logits_t_ref,
+    gates_t_ref,
+    *,
+    hc_mult: int,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> None:
+    """Gate tail of a token-blocked mHC kernel on a sequential grid.
+
+    Every block stores its gate logits; the last block runs the gates for
+    all tokens at once, so the 2 * sinkhorn_repeat dependent steps are
+    paid once per call, with every token's lanes busy.
+
+    scaled: (tb, hc_mult3) f32 RMS-scaled mixes of this block.
+    post_ref, comb_ref: (T, hc_mult), (T, hc_mult**2) f32 whole-array outs.
+    logits_ref, logits_t_ref, gates_t_ref: f32 VMEM scratch of shapes
+        (T, hc_mult3), (hc_mult3, T), (hc_mult + hc_mult**2, T).
+    """
+    step, tb = pl.program_id(0), scaled.shape[0]
+    rows = pl.ds(pl.multiple_of(step * tb, tb), tb)
+    logits_ref[rows, :] = gate_logits(scaled, sc_ref, hb_ref, hc_mult)
+
+    @pl.when(step == pl.num_programs(0) - 1)
+    def _gates():
+        logits_t_ref[...] = logits_ref[...].T
+        post_comb_gates(
+            logits_t_ref,
+            gates_t_ref,
+            hc_mult=hc_mult,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+        gates = gates_t_ref[...].T
+        post_ref[...] = gates[:, :hc_mult]
+        comb_ref[...] = gates[:, hc_mult:]
+
+
+def post_comb_gates_specs(
+    padded_tokens: int, hc_mult: int
+) -> tuple[list[pl.BlockSpec], list[jax.ShapeDtypeStruct], list]:
+    """(out_specs, out_shape, scratch_shapes) entries that
+    ``post_comb_gates_epilogue`` writes and uses."""
+    hc_mult3 = hc_mult * (hc_mult + 2)
+    widths = (hc_mult, hc_mult * hc_mult)
+    out_specs = [pl.BlockSpec((padded_tokens, w), lambda i: (0, 0)) for w in widths]
+    out_shape = [jax.ShapeDtypeStruct((padded_tokens, w), jnp.float32) for w in widths]
+    scratch_shapes = [
+        pltpu.VMEM((padded_tokens, hc_mult3), jnp.float32),
+        pltpu.VMEM((hc_mult3, padded_tokens), jnp.float32),
+        pltpu.VMEM((sum(widths), padded_tokens), jnp.float32),
+    ]
+    return out_specs, out_shape, scratch_shapes
