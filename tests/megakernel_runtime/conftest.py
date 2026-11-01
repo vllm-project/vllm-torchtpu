@@ -18,6 +18,8 @@ from __future__ import annotations
 import pytest
 
 from tests.megakernel.conftest import register_megakernel_cpu_plugin, route_lazy_loggers
+from vllm_torchtpu.megakernel_runtime.testkit import mk_fake_runner as mk_fake_runner
+from vllm_torchtpu.megakernel_runtime.testkit import mk_toy_plugin as mk_toy_plugin
 
 
 def pytest_configure(config: pytest.Config) -> None:

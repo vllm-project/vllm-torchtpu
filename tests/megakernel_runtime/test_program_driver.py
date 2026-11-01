@@ -19,11 +19,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import importlib
-import json
 import logging
-import os
-import subprocess
-import sys
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,83 +42,13 @@ from vllm_torchtpu.megakernel_runtime.plugin import (
     RunnerView,
     TpuMonoSpec,
 )
+from vllm_torchtpu.megakernel_runtime.testkit import (
+    TOY_PLUGIN,
+    assert_rank_uniform_declines,
+    run_two_ranks,
+)
 
 _SRC = Path(driver_mod.__file__).resolve().parents[2]
-
-TOY_PLUGIN = '''
-"""A toy megakernel plugin: y = x * scale + B, in pure torch."""
-from vllm_torchtpu.megakernel_runtime.plugin import (
-    Bucket, Decline, TpuMonoSpec, WarmupCase,
-)
-
-
-class ToyProgram:
-    display_name = "Toy"
-
-    def __init__(self, view, options):
-        self.scale = float(options.get("scale", 2.0))
-        self.mesh = "unloaded"
-        self.warmed = []
-        self.events = []
-
-    def buckets(self, token_paddings):
-        self.events.append(("buckets", tuple(token_paddings)))
-        return [Bucket(1, 4), Bucket(1, 8, out_rows=8)]
-
-    def load(self, mesh):
-        self.mesh = mesh
-        self.events.append("load")
-
-    def bind(self, view):
-        self.events.append("bind")
-        return None
-
-    def build(self, bucket):
-        scale, b = self.scale, bucket.B
-
-        def step(x):
-            return x * scale + b
-
-        return step
-
-    def warmup_inputs(self, bucket, shape):
-        import torch
-
-        def check(out):
-            self.warmed.append((bucket.key, shape, float(out[0])))
-
-        return WarmupCase((torch.ones(shape.tok_pad),), check)
-
-    def decide(self, ctx, fwd):
-        from vllm_torchtpu.megakernel_runtime.plugin import StepDecision
-
-        n = int(ctx.input_ids.shape[0])
-        b = next((b for b in (4, 8) if b >= n), None)
-        if b is None:
-            return StepDecision(False, "stock_big", n, 1)
-        return StepDecision(True, f"mk_t1_b{b}", n, 1, b)
-
-    def forward(self, decision, ctx, fwd):
-        step = fwd.steps[(1, decision.bucket_t)]
-        return step(ctx.input_ids.float())[: fwd.num_tokens]
-
-    def on_warmup_done(self):
-        self.events.append("warm")
-
-
-def create(view, options):
-    rank = view.tp_rank
-    if options.get("decline") or options.get("decline_rank") == rank:
-        return Decline("toy_declined", "toy says no")
-    if options.get("raise_rank") == rank:
-        raise RuntimeError("toy create bug")
-    return ToyProgram(view, options)
-
-
-SPEC = TpuMonoSpec(
-    "toy", "1", create=create, decline_codes=("toy_declined",)
-)
-'''
 
 
 @pytest.fixture(autouse=True)
@@ -138,16 +64,9 @@ def _std_logger(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def toy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+def toy(mk_toy_plugin: Path) -> Path:
     """The toy plugin as a single-file module `toy_mk_plugin` on `sys.path`."""
-    (tmp_path / "toy_mk_plugin.py").write_text(TOY_PLUGIN, encoding="utf-8")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    sys.modules.pop("toy_mk_plugin", None)
-    importlib.invalidate_caches()
-    fp.clear_caches()
-    yield tmp_path / "toy_mk_plugin.py"
-    sys.modules.pop("toy_mk_plugin", None)
-    fp.clear_caches()
+    return mk_toy_plugin
 
 
 def _no_group(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -919,82 +838,6 @@ def test_runner_shapes_without_paddings() -> None:
 
 # --- 2-rank gloo ----------------------------------------------------------------
 
-_RANK_SCRIPT = """
-import datetime, json, logging, sys
-rank, out, init, plugin_dir, options = sys.argv[1:6]
-rank = int(rank)
-sys.path.insert(0, plugin_dir)
-import torch.distributed as dist
-dist.init_process_group("gloo", init_method=init, rank=rank, world_size=2,
-                        timeout=datetime.timedelta(seconds=60))
-from vllm_torchtpu.megakernel_runtime import agreement as a, driver as d, testing
-for lazy in (d.logger, a.logger):
-    try:
-        lazy._resolve()
-    except ModuleNotFoundError:
-        lazy._logger = logging.getLogger("mk")
-a._tp_cpu_group = lambda: dist.group.WORLD
-runner = testing.fake_runner(
-    tp_size=2,
-    megakernel={"plugin": "toy_mk_plugin", "options": json.loads(options)},
-)
-res = {}
-try:
-    drv = d.ProgramDriver.maybe_create(runner)
-    res["type"] = type(drv).__name__
-    res["code"] = getattr(getattr(drv, "decline", None), "code", None)
-    if isinstance(drv, d.ProgramDriver):
-        runner._megakernel = drv
-        drv.bind_and_warmup(runner)
-        res["warmed"] = len(drv.program.warmed)
-except Exception as exc:
-    res["raised"] = f"{type(exc).__name__}: {exc}"
-json.dump(res, open(out, "w"))
-dist.destroy_process_group()
-"""
-
-
-def _run_two_ranks(
-    tmp_path: Path, options: dict[str, Any], sources: tuple[str, str]
-) -> list[dict[str, Any]]:
-    script = tmp_path / "rank.py"
-    script.write_text(_RANK_SCRIPT, encoding="utf-8")
-    env = {
-        **os.environ,
-        "PYTHONPATH": str(_SRC),
-        "JAX_PLATFORMS": "cpu",
-        "XLA_FLAGS": "--xla_force_host_platform_device_count=2",
-    }
-    env.pop("VLLM_TPU_MEGAKERNEL", None)
-    init = f"file://{tmp_path / 'pg_init'}"
-    procs, outs = [], []
-    for rank in (0, 1):
-        pdir = tmp_path / f"plugin{rank}"
-        pdir.mkdir()
-        (pdir / "toy_mk_plugin.py").write_text(sources[rank], encoding="utf-8")
-        out = tmp_path / f"out{rank}.json"
-        outs.append(out)
-        args = [str(rank), str(out), init, str(pdir), json.dumps(options)]
-        procs.append(
-            subprocess.Popen(
-                [sys.executable, str(script), *args],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-        )
-    logs = []
-    try:
-        for p in procs:
-            logs.append(p.communicate(timeout=240)[0])
-    finally:
-        for p in procs:
-            p.kill()
-    for p, log in zip(procs, logs, strict=True):
-        assert p.returncode == 0, log
-    return [json.loads(o.read_text(encoding="utf-8")) for o in outs]
-
 
 @pytest.mark.parametrize(
     "scenario", ["serve", "decline", "mismatch", "create_error", "import_error"]
@@ -1011,7 +854,10 @@ def test_two_rank_gloo_agreement(tmp_path: Path, scenario: str) -> None:
         options = {"raise_rank": 1}
     elif scenario == "import_error":
         src = (TOY_PLUGIN, 'raise ImportError("plugin missing on this host")\n')
-    r0, r1 = _run_two_ranks(tmp_path, options, src)
+    if scenario == "serve":
+        r0, r1 = run_two_ranks(tmp_path, options=options, sources=src)
+    else:
+        r0, r1 = assert_rank_uniform_declines(tmp_path, options=options, sources=src)
     if scenario == "serve":
         assert r0 == r1 == {"type": "ProgramDriver", "code": None, "warmed": 2}
     elif scenario == "decline":

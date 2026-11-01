@@ -14,6 +14,7 @@
 """Runs the model folder's own CPU end-to-end test
 (`src/vllm_torchtpu/models/qwen3_5/megakernel/tests/`) with this suite."""
 
+from vllm_torchtpu.megakernel_runtime.testkit import mk_fake_runner  # noqa: F401
 from vllm_torchtpu.models.qwen3_5.megakernel.tests.test_cpu_e2e import (  # noqa: F401
     test_serves_a_decode_step_on_cpu,
     test_spec_loads_without_registering_anything,
