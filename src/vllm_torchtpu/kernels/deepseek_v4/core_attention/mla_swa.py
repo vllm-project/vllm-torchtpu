@@ -214,6 +214,23 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             return lax.div(acc, l[:, None])
         return (acc * pl.reciprocal(l[:, None], approx=True)).astype(q_dtype)
 
+    def store_stats(bo_sem_idx, row, l, m):  # noqa: E741
+        """Write per-row l and m ([n * num_q_heads]) to bl/bm rows [row, row + n)."""
+        n = l.shape[0] // num_q_heads
+        bl_ref = bl_x2_ref.at[bo_sem_idx]
+        bm_ref = bm_x2_ref.at[bo_sem_idx]
+        if num_q_heads % 128 == 0:
+            bl_ref[row : row + n] = l.reshape(n, num_q_heads)
+            bm_ref[row : row + n] = m.reshape(n, num_q_heads)
+        else:
+            # if num_q_heads can't be divided by 128, the reshape can't compile,
+            # so we need to loop through and copy row by row.
+            for i in range(n):
+                start = i * num_q_heads
+                end = start + num_q_heads
+                bl_ref.at[row + i][:num_q_heads] = l[start:end]
+                bm_ref.at[row + i][:num_q_heads] = m[start:end]
+
     def flash_attention(
         q,  # [bq_sz * num_q_heads, head_dim]
         kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_x2_ref
@@ -295,11 +312,10 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 # The whole window is in this kv block, so each chunk's output
                 # is final: write it out without staging pv in acc_ref.
                 m_curr = s_rowmax
-                cm_ref[...] = m_curr
                 p = jnp.exp(s - m_curr[:, None])
                 pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
                 l_curr = jnp.sum(p, axis=1)
-                cl_ref[...] = l_curr
+                store_stats(bo_sem_idx, c * chunk_sz, l_curr, m_curr)
                 bo_x2_ref.at[bo_sem_idx][c * chunk_sz : (c + 1) * chunk_sz] = finalize(
                     pv, l_curr, m_curr
                 ).reshape(chunk_sz, num_q_heads, head_dim)
@@ -797,18 +813,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 bo_x2_ref.at[bo_sem_idx][...] = out.reshape(
                     bq_sz, num_q_heads, head_dim
                 )
-
-            if num_q_heads % 128 == 0:
-                bl_x2_ref.at[bo_sem_idx][...] = l_ref[...].reshape(bq_sz, num_q_heads)
-                bm_x2_ref.at[bo_sem_idx][...] = m_ref[...].reshape(bq_sz, num_q_heads)
-            else:
-                # if num_q_heads can't be divided by 128, the reshape can't compile,
-                # so we need to loop through and copy row by row.
-                for i in range(bq_sz):
-                    start = i * num_q_heads
-                    end = start + num_q_heads
-                    bl_x2_ref.at[bo_sem_idx, i][:num_q_heads] = l_ref[start:end]
-                    bm_x2_ref.at[bo_sem_idx, i][:num_q_heads] = m_ref[start:end]
+                store_stats(bo_sem_idx, 0, l_ref[...], m_ref[...])
 
             # Send cur bo
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
