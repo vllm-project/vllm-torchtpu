@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Quantize and publish disjoint 128-key native index-cache slabs."""
+"""Quantize and publish disjoint 128-key native index-cache slabs and word rows."""
 
 import functools
 
@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.experimental.pallas import tpu_sc as plsc
 
 SLAB_KEYS = 128
 INPUT_KEYS = 2 * SLAB_KEYS
@@ -251,3 +252,92 @@ def write_cache_words(
         interpret=interpret,
         name="dsv41_write_packed_cache_rows",
     )(sorted_records, values, cache)
+
+
+@functools.partial(jax.jit, donate_argnums=(0,))
+def write_cache_rows(cache: jax.Array, rows: jax.Array, words: jax.Array) -> jax.Array:
+    """Publish whole 128-word rows by SparseCore row DMAs.
+
+    Negative and out-of-range rows are dropped. Rows sharing a destination
+    must carry identical words (as merged sub-row writes do), so DMA order is
+    harmless. The owner keeps its TensorCore tiling and geometry and is
+    updated in place, off the TensorCore, without a pool-sized copy.
+    """
+    if (
+        cache.ndim != 2
+        or cache.shape[1] != 128
+        or cache.dtype != jnp.int32
+        or rows.ndim != 1
+        or rows.dtype != jnp.int32
+        or words.shape != (rows.shape[0], 128)
+        or words.dtype != jnp.int32
+    ):
+        raise ValueError("Row writes require INT32 [rows,128] owners and words")
+    if not rows.size:
+        return cache
+    info = pltpu.get_tpu_info().sparse_core
+    assert info is not None, "Row writes require SparseCore"
+    lanes, cores = info.num_lanes, info.num_cores * info.num_subcores
+    padding = -rows.size % (lanes * cores)
+    ids = jnp.pad(rows, (0, padding), constant_values=-1)
+    values = jnp.pad(words, ((0, padding), (0, 0)))
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=info.num_cores,
+        num_subcores=info.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    # TensorCore kernels also read these owners. Keep their tiling: an
+    # SC-native layout would relayout the whole pool around this write.
+    owner = jax.new_ref(cache)
+
+    def kernel(ids_ref, values_ref, out_ref, sem):
+        core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
+        num_rows = out_ref.shape[0]
+
+        def store(selected_ref, block_ref):
+            selected = selected_ref[...]
+            copies = []
+            for i in range(lanes):
+                row = selected[i]
+                valid = (row >= 0) & (row < num_rows)
+                copy = pltpu.make_async_copy(
+                    block_ref.at[pl.ds(i, 1)],
+                    out_ref.at[pl.ds(jnp.clip(row, 0, num_rows - 1), 1)],
+                    sem.at[i],
+                )
+                copies.append((valid, copy))
+
+                @pl.when(valid)
+                def _(copy=copy):
+                    copy.start()
+
+            for valid, copy in copies:
+
+                @pl.when(valid)
+                def _(copy=copy):
+                    copy.wait()
+
+        pltpu.emit_pipeline(
+            store,
+            grid=(ids.size // (lanes * cores),),
+            tiling=pltpu.Tiling.SPARSE_CORE,
+            in_specs=(
+                pl.BlockSpec((lanes,), lambda b: (b * cores + core,)),
+                pl.BlockSpec((lanes, 128), lambda b: (b * cores + core, 0)),
+            ),
+        )(ids_ref, values_ref)
+
+    pl.kernel(
+        kernel,
+        mesh=mesh,
+        out_type=(),
+        scratch_types=(pltpu.SemaphoreType.DMA((lanes,)),),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=True,
+            needs_layout_passes=True,
+            disable_bounds_checks=True,
+        ),
+        name="dsv41_write_cache_rows_sc",
+    )(ids, values, owner)
+    return jax.freeze(owner)

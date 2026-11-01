@@ -1475,6 +1475,18 @@ def _pack_bf16_words(values: jax.Array) -> jax.Array:
     )
 
 
+def _sparse_core_rows() -> bool:
+    """Whole-row TPU writes run on SparseCore when the chip has one."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    # Check the device, not only the backend name: host-traced TPU branches
+    # have no TPU device kind to query.
+    return (
+        jax.devices()[0].platform == "tpu"
+        and pltpu.get_tpu_info().sparse_core is not None
+    )
+
+
 def scatter_cache_values(
     cache: jax.Array,
     records: jax.Array,
@@ -1482,9 +1494,10 @@ def scatter_cache_values(
 ) -> jax.Array:
     """Write unique physical records, preserving the shared owner and padding.
 
-    Full word rows use DSV4-style aliased DMA. Sub-row writes use independent
-    (row, lane) coordinates, so two records sharing a row cannot overwrite
-    each other through concurrent read/modify/write of the entire word row.
+    Full word rows use aliased row DMAs, on SparseCore when available, else a
+    TensorCore kernel. Sub-row writes use independent (row, lane) coordinates,
+    so two records sharing a row cannot overwrite each other through
+    concurrent read/modify/write of the entire word row.
     """
     import jax.numpy as jnp
 
@@ -1548,6 +1561,17 @@ def scatter_cache_values(
     from jax.experimental.pallas import tpu as pltpu
 
     chunks = width // ROW_WORDS
+    if _sparse_core_rows():
+        from vllm_torchtpu.kernels.deepseek_v41.cache_write import write_cache_rows
+
+        # Record r owns word rows [r * chunks, (r + 1) * chunks).
+        valid = (records >= 0) & (records < cache.shape[0] // chunks)
+        rows = jnp.where(
+            valid[:, None],
+            records[:, None] * chunks + jnp.arange(chunks, dtype=jnp.int32),
+            -1,
+        )
+        return write_cache_rows(cache, rows.reshape(-1), words.reshape(-1, ROW_WORDS))
     # Records per grid step whose row DMAs are in flight together. A serial
     # start/wait per 512 B row is DMA-latency bound.
     block = 64
