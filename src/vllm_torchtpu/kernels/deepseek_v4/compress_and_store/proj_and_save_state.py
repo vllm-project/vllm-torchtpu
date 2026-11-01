@@ -114,24 +114,27 @@ def store_to_acc_ref(ref, val, half, num_halves, tile_n):
 
 
 def kernel(
-    # scalar prefetch
-    slot_mapping,
-    run_ends,  # [num_tokens]: see `_plan_runs`
     # input
-    positions,  # [num_tokens]
+    slot_mapping_hbm,  # [num_tokens]
+    run_ends_hbm,  # [num_tokens]: see `_plan_runs`
+    positions_hbm,  # [num_tokens]
     hidden_states,  # [num_tokens, hidden_size]
     wkv_wgate,  # [2 * state_width, hidden_size]
-    ape,  # [compress_ratio, state_width]
+    ape_hbm,  # [compress_ratio, state_width]
     cache,  # [num_pages, page_size, 4, 128] uint8 or [..., 128] int32 (aliased)
     # output
     _,  # unused output ref (aliased to cache)
     # scratch_memory
+    slot_mapping,  # SMEM copy of slot_mapping_hbm
+    run_ends,  # SMEM copy of run_ends_hbm
+    positions,  # VMEM copy of positions_hbm
+    ape,  # VMEM copy of ape_hbm
     weight_ref,  # (num_m, hidden_size, tile_m): the whole weight, read once
     hidden_ref,  # (tiles_per_group, tile_n, hidden_size): a group's tokens
     acc_ref,  # (tiles_per_group, tile_n * num_m * slots_per_m_tile, 1, 128)
     partial_ref,  # (tile_n, tile_m) f32: the k-partial sum of one step
     ape_table_ref,  # (ape_table_rows, state_width) f32: row r is APE row r % ratio
-    in_sems,  # DMA semaphores: weight halves, then token slots
+    in_sems,  # DMA semaphores: weight halves, token slots, then small inputs
     sem_ref,  # DMA semaphores [2]
     copies_ref,  # [2, 2]: (token tile or -1, accumulator) of each semaphore's copy
     *,
@@ -165,10 +168,23 @@ def kernel(
             hidden_states.at[rows], hidden_ref.at[slot], in_sems.at[num_m + slot]
         )
 
-    # The first step's operands; the rest stream behind the matmul
+    small_copies = [
+        pltpu.make_async_copy(src, dst, in_sems.at[num_m + group_n])
+        for src, dst in (
+            (slot_mapping_hbm, slot_mapping),
+            (run_ends_hbm, run_ends),
+            (positions_hbm, positions),
+            (ape_hbm, ape),
+        )
+    ]
+    # The first step's operands go first; the rest stream behind the matmul
     # (`_fetch_ahead`), so only the first tile and weight half are exposed.
     _hidden_copy(0, 0).start()
     _weight_copy(0).start()
+    for copy in small_copies:
+        copy.start()
+    for copy in small_copies:
+        copy.wait()
 
     ratio = cfgs.dims.compress_ratio
 
@@ -538,12 +554,16 @@ def proj_and_save_state(
     slots_per_m_tile = tile_m // last_dim
     acc_rows = tile_n * cfgs.num_m * slots_per_m_tile
     scratch_shapes = [
+        pltpu.SMEM((num_tokens,), jnp.int32),  # slot_mapping
+        pltpu.SMEM((num_tokens,), jnp.int32),  # run_ends
+        pltpu.VMEM((num_tokens,), positions.dtype),
+        pltpu.VMEM(ape.shape, ape.dtype),
         pltpu.VMEM((cfgs.num_m, hidden_size, tile_m), wkv_wgate.dtype),
         pltpu.VMEM((tiles_per_group, tile_n, hidden_size), hidden_states.dtype),
         pltpu.VMEM((tiles_per_group, acc_rows, 1, last_dim), jnp.float32),
         pltpu.VMEM((tile_n, tile_m), jnp.float32),
         pltpu.VMEM((ape_table_rows, state_width), jnp.float32),
-        pltpu.SemaphoreType.DMA((cfgs.num_m + tiles_per_group,)),
+        pltpu.SemaphoreType.DMA((cfgs.num_m + tiles_per_group + 1,)),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SMEM((2, 2), jnp.int32),
     ]
@@ -551,22 +571,14 @@ def proj_and_save_state(
 
     out_shape = jax.ShapeDtypeStruct(cache.shape, cache.dtype)
 
+    # Every operand stays in HBM: the kernel copies the small ones itself,
+    # behind the first step's, rather than waiting for them in a prologue.
     return pl.pallas_call(
         functools.partial(kernel, cfgs=cfgs),
         out_shape=out_shape,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            grid=(),
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.VMEM),  # positions
-                pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states
-                pl.BlockSpec(memory_space=pltpu.HBM),  # wkv_wgate
-                pl.BlockSpec(memory_space=pltpu.VMEM),  # ape (prefetch to VMEM)
-                pl.BlockSpec(memory_space=pltpu.HBM),  # cache
-            ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-            scratch_shapes=scratch_shapes,
-        ),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 7,
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        scratch_shapes=scratch_shapes,
         input_output_aliases={6: 0},  # Alias output to cache (index 6)
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
