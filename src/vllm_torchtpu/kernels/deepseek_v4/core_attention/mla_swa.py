@@ -25,6 +25,8 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# Output rows the padding-row zero fill copies per DMA.
+ZERO_FILL_ROWS = 8
 
 
 def cdiv(a, b):
@@ -847,6 +849,55 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             wait_update_kv_cache(i)
 
     ### ------- Kernel end ------- ###
+
+
+def _zero_rows_kernel(ranges_ref, in_ref, out_ref, zeros_ref, sem):
+    """Zeros out_ref rows [ranges[2i], ranges[2i + 1]) for each i."""
+    del in_ref  # Aliased with out_ref.
+    num_rows = out_ref.shape[0]
+    zeros_ref[...] = jnp.zeros(zeros_ref.shape, zeros_ref.dtype)
+    for r in range(ranges_ref.shape[0] // 2):
+        start = jnp.minimum(ranges_ref[2 * r], num_rows)
+        size = jnp.maximum(jnp.minimum(ranges_ref[2 * r + 1], num_rows) - start, 0)
+
+        def body(i, _, start=start, size=size):
+            sz = jnp.minimum(ZERO_FILL_ROWS, size - i * ZERO_FILL_ROWS)
+            pltpu.make_async_copy(
+                zeros_ref.at[pl.ds(0, sz)],
+                out_ref.at[pl.ds(start + i * ZERO_FILL_ROWS, sz)],
+                sem,
+            ).start()
+
+        lax.fori_loop(0, cdiv(size, ZERO_FILL_ROWS), body, None)
+        # One wait for all of this range's copies, by their total size.
+        rows = out_ref.at[pl.ds(start, size)]
+        pltpu.make_async_copy(rows, rows, sem).wait()
+
+
+def zero_rows(out: jax.Array, ranges: jax.Array) -> jax.Array:
+    """Zeros the rows [ranges[2i], ranges[2i + 1]) of `out` in place.
+
+    Costs the bytes of those rows only, where a zero-filled buffer written
+    before the attention kernels costs all of `out`.
+    """
+    return jax.named_scope("SWA-zero-rows")(
+        pl.pallas_call(
+            _zero_rows_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+                grid=(1,),
+                scratch_shapes=[
+                    pltpu.VMEM((ZERO_FILL_ROWS, *out.shape[1:]), out.dtype),
+                    pltpu.SemaphoreType.DMA(()),
+                ],
+            ),
+            out_shape=jax.ShapeDtypeStruct(out.shape, out.dtype),
+            input_output_aliases={1: 0},
+            name="SWA-zero-rows",
+        )
+    )(ranges, out)
 
 
 def prepare_q_inputs(
@@ -1778,7 +1829,8 @@ def mla_sliding_window_ragged_paged_attention(
     m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
     # output of swa attn is consumed by csa, hca attn, padding tokens'
     # data won't be used downstream at all, so un-initialized buffer is fine.
-    in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
+    # The normalized output zeros the rows no kernel writes after the kernels.
+    in_output = jnp.empty_like(q)
 
     bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
     if sliding_window <= bkv_sz:
@@ -1867,6 +1919,21 @@ def mla_sliding_window_ragged_paged_attention(
         unnormalized_output=unnormalized_output,
         case=MlaCase.MIXED,
     )
+    if not unnormalized_output:
+        # Rows of sequences no pass ran (the static-length ones when
+        # chunk_prefill_size is None) and the padding rows after the last one.
+        skipped_end = distribution[1] if chunk_prefill_size is None else distribution[0]
+        output = zero_rows(
+            output,
+            jnp.stack(
+                [
+                    cu_q_lens[distribution[0]],
+                    cu_q_lens[skipped_end],
+                    cu_q_lens[distribution[2]],
+                    q.shape[0],
+                ]
+            ).astype(jnp.int32),
+        )
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
