@@ -271,7 +271,7 @@ class OutputRef(_BufferedRef):
             def loop_body(n):
                 idx_n = global_idx + n
                 kv_slot = kv_slot_mapping_ref[idx_n]
-                is_first = is_first_mask_ref[idx_n]
+                is_first = is_first_mask_ref[idx_n] != 0
                 valid = kv_slot >= 0
 
                 # Only is_first_mask tokens write their merged row back, so
@@ -326,7 +326,7 @@ class OutputRef(_BufferedRef):
                 def loop_body(n):
                     idx_n = global_idx + n
                     kv_slot = kv_slot_mapping_ref[idx_n]
-                    is_first = is_first_mask_ref[idx_n]
+                    is_first = is_first_mask_ref[idx_n] != 0
                     valid = (kv_slot >= 0) & is_first
                     pl.when(valid)(lambda: write_row(n, kv_slot))
 
@@ -403,7 +403,7 @@ class RoPEOutputRef(_BufferedRef):
             def loop_body(n):
                 idx_n = global_idx + n
                 kv_slot = kv_slot_mapping_ref[idx_n]
-                is_first = is_first_mask_ref[idx_n]
+                is_first = is_first_mask_ref[idx_n] != 0
                 valid = kv_slot >= 0
 
                 @pl.when(valid & is_first)
@@ -457,7 +457,7 @@ class RoPEOutputRef(_BufferedRef):
             def loop_body(n):
                 idx_n = global_idx + n
                 kv_slot = kv_slot_mapping_ref[idx_n]
-                is_first = is_first_mask_ref[idx_n]
+                is_first = is_first_mask_ref[idx_n] != 0
                 valid = kv_slot >= 0
                 pl.when(valid & is_first)(lambda: write_row(n, kv_slot))
 

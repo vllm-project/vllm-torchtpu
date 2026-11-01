@@ -283,7 +283,30 @@ def compress_tile(
 
 
 def kernel_fn(
-    # prefetched inputs (scalar)
+    # prefetched input (scalar)
+    grid_size_ref,
+    # HBM inputs (dynamic access)
+    rms_weight_hbm_ref,
+    cos_sin_cache_ref,
+    cache_ref,
+    rope_cache_ref,
+    state_cache_ref,
+    # HBM inputs the kernel copies whole before its pipeline
+    token_pages_hbm_ref,
+    positions_hbm_ref,
+    kv_slot_mapping_hbm_ref,
+    is_first_mask_hbm_ref,
+    is_first_mask_rope_hbm_ref,
+    valid_counts_hbm_ref,
+    first_counts_hbm_ref,
+    first_rope_counts_hbm_ref,
+    whole_counts_hbm_ref,
+    # outputs (aliased)
+    _out_cache_ref,
+    _out_rope_cache_ref,
+    # scratch
+    window_scratch_ref,
+    rms_weight_ref,
     token_pages_ref,
     positions_ref,
     kv_slot_mapping_ref,
@@ -293,21 +316,31 @@ def kernel_fn(
     first_counts_ref,
     first_rope_counts_ref,
     whole_counts_ref,
-    grid_size_ref,
-    rms_weight_ref,
-    # HBM inputs (dynamic access)
-    cos_sin_cache_ref,
-    cache_ref,
-    rope_cache_ref,
-    state_cache_ref,
-    # outputs (aliased)
-    _out_cache_ref,
-    _out_rope_cache_ref,
-    window_scratch_ref,
+    stage_sem,
     *,
     cfgs: config.Configs,
 ):
     """Pallas kernel entry point."""
+    copies = [
+        pltpu.make_async_copy(src, dst, stage_sem)
+        for src, dst in (
+            (token_pages_hbm_ref, token_pages_ref),
+            (positions_hbm_ref, positions_ref),
+            (kv_slot_mapping_hbm_ref, kv_slot_mapping_ref),
+            (is_first_mask_hbm_ref, is_first_mask_ref),
+            (is_first_mask_rope_hbm_ref, is_first_mask_rope_ref),
+            (valid_counts_hbm_ref, valid_counts_ref),
+            (first_counts_hbm_ref, first_counts_ref),
+            (first_rope_counts_hbm_ref, first_rope_counts_ref),
+            (whole_counts_hbm_ref, whole_counts_ref),
+            (rms_weight_hbm_ref, rms_weight_ref),
+        )
+    ]
+    for copy in copies:
+        copy.start()
+    for copy in copies:
+        copy.wait()
+
     grid_size = grid_size_ref[...]
     allocs, in_specs, pipeline_args = buffered_ref.create_allocs_and_specs(
         cfgs=cfgs,
@@ -583,20 +616,30 @@ def compress_norm_rope_store(
     # Outer pallas_call operands, in call order. Optional operands are passed as
     # None to keep kernel_fn's argument positions fixed; pallas drops the Nones
     # when indexing, so alias indices count only the operands actually present.
-    scalar_prefetch = (
-        token_pages,
-        positions,
-        kv_slot_mapping,
-        is_first_mask,
-        is_first_mask_rope,
-        *copy_counts,
-        grid_size,
+    scalar_prefetch = (grid_size,)
+    # The per-token arrays and the norm weight are pinned to HBM, and the
+    # kernel copies them in all at once. As scalar-prefetch and VMEM operands,
+    # XLA staged each through VMEM with its own serial copy before the call.
+    # Bools cannot carry a memory space, so the masks go as int32 words.
+    staged = tuple(
+        pltpu.with_memory_space_constraint(x, pltpu.HBM)
+        for x in (
+            token_pages,
+            positions,
+            kv_slot_mapping,
+            is_first_mask.astype(jnp.int32),
+            is_first_mask_rope.astype(jnp.int32),
+            *copy_counts,
+        )
+    )
+    rms_weight_reshaped = pltpu.with_memory_space_constraint(
+        rms_weight_reshaped, pltpu.HBM
     )
     cos_sin_operand = cos_sin_cache if cfgs.dims.has_rope else None
     rope_operand = rope_cache if cfgs.dims.has_rope_cache else None
 
     in_specs = (
-        pl.BlockSpec(memory_space=pltpu.VMEM),  # rms_weight
+        pl.BlockSpec(memory_space=pltpu.HBM),  # rms_weight
         (
             pl.BlockSpec(memory_space=pltpu.HBM) if cfgs.dims.has_rope else None
         ),  # cos_sin
@@ -607,6 +650,7 @@ def compress_norm_rope_store(
         (
             pl.BlockSpec(memory_space=pltpu.HBM) if state_operand is not None else None
         ),  # state_cache
+        *[pl.BlockSpec(memory_space=pltpu.HBM)] * len(staged),
     )
     out_specs = (
         pl.BlockSpec(memory_space=pltpu.HBM),  # cache
@@ -631,7 +675,12 @@ def compress_norm_rope_store(
         num_scalar_prefetch=len(scalar_prefetch),
         in_specs=in_specs,
         out_specs=out_specs,
-        scratch_shapes=[pltpu.VMEM(cfgs.window_shape(), jnp.float32)],
+        scratch_shapes=[
+            pltpu.VMEM(cfgs.window_shape(), jnp.float32),
+            pltpu.VMEM(rms_weight_reshaped.shape, rms_weight_reshaped.dtype),
+            *[pltpu.SMEM(x.shape, x.dtype) for x in staged],
+            pltpu.SemaphoreType.DMA(()),
+        ],
     )
 
     out_cache, out_rope_cache = pl.pallas_call(
@@ -649,6 +698,7 @@ def compress_norm_rope_store(
         cache,
         rope_operand,
         state_operand,
+        *staged,
     )
 
     return out_cache, out_rope_cache
