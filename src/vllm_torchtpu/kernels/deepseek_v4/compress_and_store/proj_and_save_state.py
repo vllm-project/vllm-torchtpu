@@ -29,6 +29,10 @@ GROUP_TOKENS = 1024
 # A step holds the whole hidden dimension of the weight, double-buffered:
 # 28 MiB for DeepSeek-V4-Pro's CSA compressor, past the default scoped limit.
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# Compress ratios up to this pick each token's APE row from a table that
+# the one-hot APE product computes once per call; larger ratios run that
+# product on every token tile.
+APE_TABLE_MAX_RATIO = 8
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,6 +123,7 @@ def kernel(
     # scratch_memory
     acc_ref,  # (tiles_per_group, tile_n * num_m * slots_per_m_tile, 1, 128)
     partial_ref,  # (tile_n, tile_m) f32: the k-partial sum of one step
+    ape_table_ref,  # (ape_table_rows, state_width) f32: row r is APE row r % ratio
     sem_ref,  # DMA semaphores [2]
     copies_ref,  # [2, 2]: (runs, accumulator) of the copy on each semaphore
     runs_ref,  # [2 * 2 * (tile_n + 1)]: see `run_stride`
@@ -138,6 +143,25 @@ def kernel(
     cache = csa_cache_layout.as_u8_slabs(cache)
     copies_ref[0, 0] = 0
     copies_ref[1, 0] = 0
+
+    ratio = cfgs.dims.compress_ratio
+
+    def _one_hot_ape(ape_rows):
+        """APE row ``ape_rows[i]`` for every i, as a one-hot product."""
+        ape_val = ape[...].astype(jnp.float32)
+        one_hot = (ape_rows[:, None] == jnp.arange(ratio)[None, :]).astype(jnp.float32)
+        return jnp.matmul(
+            one_hot, ape_val, precision=lax.Precision.HIGHEST
+        )  #  (len(ape_rows), state_width)
+
+    # An output row of the one-hot product depends on its own one-hot row
+    # only, so the table holds bit for bit the row a tile's product would.
+    use_ape_table = ratio <= APE_TABLE_MAX_RATIO
+    if use_ape_table:
+        table_rows = ape_table_ref.shape[0]
+        ape_table_ref[...] = _one_hot_ape(
+            lax.broadcasted_iota(jnp.int32, (table_rows,), 0) % ratio
+        )
 
     page_size = cfgs.token_page_size
 
@@ -270,21 +294,17 @@ def kernel(
             return acc_val
 
         def _ape_rows():
-            tile_positions = tiled_positions_ref[...]
-            ape_rows = tile_positions % cfgs.dims.compress_ratio
-            ape_val = ape[...].astype(jnp.float32)
-            # Gather Path: doesn't work for compiler reasons?
-            # gather_indices = jnp.broadcast_to(
-            #     ape_rows[:, None], (tile_n, ape_val.shape[1])
-            # )
-            # ape_selected = jnp.take_along_axis(ape_val, gather_indices, axis=0)
-            # matmul path
-            one_hot = (
-                ape_rows[:, None] == jnp.arange(cfgs.dims.compress_ratio)[None, :]
-            ).astype(jnp.float32)
-            return jnp.matmul(
-                one_hot, ape_val, precision=lax.Precision.HIGHEST
-            )  #  (tile_n, state_width)
+            ape_rows = tiled_positions_ref[...] % ratio
+            if not use_ape_table:
+                return _one_hot_ape(ape_rows)
+            ape_selected = jnp.broadcast_to(
+                ape_table_ref[ratio - 1 : ratio, :], (tile_n, tile_m)
+            )
+            for r in range(ratio - 2, -1, -1):
+                ape_selected = jnp.where(
+                    ape_rows[:, None] == r, ape_table_ref[r : r + 1, :], ape_selected
+                )
+            return ape_selected
 
         def process(copy_dma: bool, add_ape: bool):
             # 1. The previous group's copies still in flight read the last
@@ -462,12 +482,16 @@ def proj_and_save_state(
         tiles_per_group=tiles_per_group,
     )
 
+    ape_table_rows = sublane_tile * pl.cdiv(
+        min(compress_ratio, APE_TABLE_MAX_RATIO), sublane_tile
+    )
     last_dim = cache.shape[-1]
     slots_per_m_tile = tile_m // last_dim
     acc_rows = tile_n * cfgs.num_m * slots_per_m_tile
     scratch_shapes = [
         pltpu.VMEM((tiles_per_group, acc_rows, 1, last_dim), jnp.float32),
         pltpu.VMEM((tile_n, tile_m), jnp.float32),
+        pltpu.VMEM((ape_table_rows, state_width), jnp.float32),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SMEM((2, 2), jnp.int32),
         pltpu.SMEM((2 * 2 * (tile_n + 1),), jnp.int32),
