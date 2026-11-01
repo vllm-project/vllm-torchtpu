@@ -153,9 +153,9 @@ class PageBufferRef(_BufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class WindowGroupRef(_BufferedRef):
-    # VMEM block: cfgs.window_buffer_shape()
-    #   (tile_n, window_groups, group_positions, state_rows_per_token, LANE)
-    # int32, each token's window states in window order.
+    # VMEM block: cfgs.window_buffer_shape() + the state array's row shape,
+    #   (tile_n, window_groups, group_positions, state_rows_per_token, ...),
+    # each token's window states in window order.
 
     def copy_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
@@ -165,7 +165,7 @@ class WindowGroupRef(_BufferedRef):
         pid = grid_indices[0]
 
         # state_groups_ref: (num_pages * groups_per_page, group_positions,
-        # state_rows_per_token, LANE); group_index_ref[n * groups + g] is the
+        # state_rows_per_token, ...); group_index_ref[n * groups + g] is the
         # group holding token n's g-th window group (see `window_group_index`).
         state_groups_ref, group_index_ref = src_ref
         groups = self.cfgs.window_groups
@@ -485,12 +485,14 @@ def create_allocs_and_specs(
     ],
 ]:
     if cfgs.fetches_window_groups:
-        # The window DMAs read the int32 state rows as they are: word l of a
-        # row is the bits of f32 lane l.
-        state_words_ref = cache_ref if state_cache_ref is None else state_cache_ref
-        num_pages = state_words_ref.shape[0]
-        state_groups_ref = state_words_ref.reshape(
-            num_pages * cfgs.groups_per_page, *cfgs.window_buffer_shape()[2:]
+        # The window DMAs read the state rows as the array declares them: an
+        # int32 word array's word l of a row is the bits of f32 lane l.
+        state_ref = cache_ref if state_cache_ref is None else state_cache_ref
+        num_pages, _, *state_row_shape = state_ref.shape
+        state_groups_ref = state_ref.reshape(
+            num_pages * cfgs.groups_per_page,
+            *cfgs.window_buffer_shape()[2:],
+            *state_row_shape,
         )
     # CSA's int32 NoPE / RoPE arrays (and a state array hosted on one) are
     # read and written through their uint8 slab view (see `csa_cache_layout`).
@@ -547,14 +549,15 @@ def create_allocs_and_specs(
 
     # state: window groups, or whole pages to gather the window from
     if cfgs.fetches_window_groups:
+        block_shape = (*cfgs.window_buffer_shape(), *state_row_shape)
         page_buffer_spec = pl.BlockSpec(
-            block_shape=cfgs.window_buffer_shape(),
+            block_shape=block_shape,
             memory_space=pltpu.VMEM,
-            index_map=lambda i: (i, 0, 0, 0, 0),
+            index_map=lambda i: (i,) + (0,) * (len(block_shape) - 1),
         )
         page_buffer_alloc = WindowGroupRef.create(
             spec=page_buffer_spec,
-            dtype_or_type=jnp.int32,
+            dtype_or_type=state_ref.dtype,
             buffer_type=pltpu.BufferType.INPUT,
             buffer_count=2,
             use_lookahead=False,

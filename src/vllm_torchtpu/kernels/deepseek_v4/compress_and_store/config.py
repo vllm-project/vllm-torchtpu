@@ -195,7 +195,7 @@ def fetches_window_groups(mode: Mode) -> bool:
     Otherwise it buffers whole state pages per token and gathers the window
     rows out of them (`compute.gather_from_page_buffer`).
     """
-    return mode is Mode.CSA
+    return mode in (Mode.CSA, Mode.CSA_INDEXER)
 
 
 @jax.tree_util.register_dataclass
@@ -430,7 +430,7 @@ class Configs:
         """Number of physical HBM rows per page in RoPE cache."""
         return self.physical_page_size // self.hbm_pack
 
-    # --- window groups (CSA) ------------------------------------------------
+    # --- window groups (CSA, indexer) ---------------------------------------
     @property
     def fetches_window_groups(self) -> bool:
         return fetches_window_groups(self.dims.mode)
@@ -459,13 +459,13 @@ class Configs:
         return self.state_physical_page_size // group_rows
 
     def window_buffer_shape(self) -> tuple[int, ...]:
-        """Window-group VMEM block: (tile, groups, positions, state rows, lane)."""
+        """Window-group VMEM block: (tile, groups, positions, state rows), then
+        the state array's own row shape."""
         return (
             self._tile_n,
             self.window_groups,
             self.group_positions,
             self.state_rows_per_token,
-            LANE,
         )
 
     @property

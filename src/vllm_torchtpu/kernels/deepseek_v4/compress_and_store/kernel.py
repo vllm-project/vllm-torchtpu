@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     buffered_ref,
     compute,
@@ -37,28 +38,45 @@ def _rows(ref, rows):
 def fill_window(state_vmem, window_vmem, *, cfgs: config.Configs):
     """Copies a row tile's window states into the f32 window scratch.
 
-    state_vmem: (ROW_TILE,) + cfgs.window_buffer_shape()[1:] int32 rows, as
-    `buffered_ref.WindowGroupRef` fetched them. Every slice is static.
+    state_vmem: (ROW_TILE,) + cfgs.window_buffer_shape()[1:] state rows, as
+    `buffered_ref.WindowGroupRef` fetched them: int32 words, or uint8 slabs
+    whose (4, lanes) row holds byte s of f32 lane l at [s, l]. Every slice is
+    static.
     """
     group_positions = cfgs.group_positions
     groups = cfgs.window_groups
     field_rows = cfgs.field_rows
     head_tiles = cfgs.head_tiles
+    is_words = csa_cache_layout.is_word_array(state_vmem.dtype)
+    window_u8 = window_vmem.bitcast(jnp.uint8).reshape(
+        *window_vmem.shape[:-1], 4, config.LANE
+    )
     for g in range(groups):
+        # The first half of an overlapping window reads the prev half of the
+        # state (see `gather_from_page_buffer`).
+        is_prev = not cfgs.dims.overlap or g < groups // 2
+        window_rows = pl.ds(g * group_positions, group_positions)
+        if cfgs.dims.mode == config.Mode.CSA_INDEXER:
+            # uint8 (4, 256) rows, kv then score; the halves are lanes.
+            lanes = pl.ds(0 if is_prev else config.LANE, config.LANE)
+            for field in range(config.N_FIELDS):
+                window_u8[field, :, window_rows, 0] = state_vmem[
+                    :, g, :, field, :, lanes
+                ]
+            continue
         if cfgs.dims.overlap:
-            # The first half of an overlapping window reads the prev half
-            # of the state (see `gather_from_page_buffer`).
-            is_prev = g < groups // 2
             kv_row = 0 if is_prev else field_rows
             score_row = (2 if is_prev else 3) * field_rows
         else:
             kv_row, score_row = 0, field_rows
-        window_rows = pl.ds(g * group_positions, group_positions)
         for field, row in ((0, kv_row), (1, score_row)):
-            words = state_vmem[:, g, :, pl.ds(row, head_tiles), :]
-            window_vmem[field, :, window_rows] = jax.lax.bitcast_convert_type(
-                words, jnp.float32
-            )
+            rows = state_vmem[:, g, :, pl.ds(row, head_tiles)]
+            if is_words:
+                window_vmem[field, :, window_rows] = jax.lax.bitcast_convert_type(
+                    rows, jnp.float32
+                )
+            else:
+                window_u8[field, :, window_rows] = rows
 
 
 def inner_kernel(
