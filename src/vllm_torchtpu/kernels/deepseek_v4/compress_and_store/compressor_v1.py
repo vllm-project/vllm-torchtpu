@@ -282,6 +282,7 @@ def compressor_forward(
 
     is_decode_token = token_index < query_start_loc[distribution[0]]
     is_boundary = (kv_slot_mapping >= 0) & is_real_token
+    mode = config.select_mode(head_dim, overlap)
 
     boundary_positions, boundary_req, boundary_kv_slot = prepare_boundary_batch(
         positions=positions,
@@ -291,6 +292,8 @@ def compressor_forward(
         is_decode_token=is_decode_token,
         compress_ratio=compress_ratio,
         num_reqs=num_reqs,
+        # HCA writes each record whole, so its tokens need no row tiles.
+        rope_pack=1 if mode is config.Mode.HCA else config.ROW_TILE,
     )
 
     cache, rope_cache = compress_kernel.compress_norm_rope_store(
