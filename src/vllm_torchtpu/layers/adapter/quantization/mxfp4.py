@@ -128,27 +128,24 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
         """
         if isinstance(layer, LinearBase):
             # MXFP4 only quantizes MoE layers, not linear layers.
-            # For linear layers (attention projections, etc.), use unquantized method.
-            if self.ignored_layers and is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-            ):
-                from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                    VllmUnquantizedLinearMethod,
-                )
-
-                return VllmUnquantizedLinearMethod()
-            # MXFP4 linear layer is not implemented - use unquantized
-            logger.warning_once(
-                "MXFP4 linear layer is not implemented on TPU - "
-                "using unquantized linear method."
-            )
+            # Delegate to unquantized dispatch (which honors QUANTIZE_ON_LOAD_PREFIXES).
             from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                VllmUnquantizedLinearMethod,
+                VllmUnquantizedConfig,
             )
 
-            return VllmUnquantizedLinearMethod()
+            if not (
+                self.ignored_layers
+                and is_layer_skipped(
+                    prefix=prefix,
+                    ignored_layers=self.ignored_layers,
+                    fused_mapping=self.packed_modules_mapping,
+                )
+            ):
+                logger.warning_once(
+                    "MXFP4 linear layer is not implemented on TPU - "
+                    "falling back to unquantized linear dispatch."
+                )
+            return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
 
         elif isinstance(layer, RoutedExperts):
             # RoutedExperts is the main use case for MXFP4 (MoE models like GPT-OSS)
