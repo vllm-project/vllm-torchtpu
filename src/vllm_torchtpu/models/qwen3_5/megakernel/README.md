@@ -25,15 +25,22 @@ calls it.
 ### 1. Copy (for a new model)
 
 ```bash
-cp -r src/vllm_torchtpu/models/qwen3_5/megakernel \
-  src/vllm_torchtpu/models/<model>/megakernel
+python -m vllm_torchtpu.megakernel_runtime.new --from qwen35 \
+  --dir src/vllm_torchtpu/models/<model>/megakernel --name <model> \
+  [--model-name <ModelDef name>]
 ```
 
-The folder imports its own files relatively, so the copy runs as is under its
-new package name. Then rename `SPEC.name`, the `ModelDef` (`model.py`:
-`name`, `hf_architectures`, `hf_model_type`) and the profile names, and add
-a shorthand to `megakernel_runtime.plugin.SHORTHANDS` if the model should be
-picked from its checkpoint's architecture. See "Adapting this folder" below.
+The scaffold copies this folder and rewrites only the names the library
+registries key on, so the copy and this folder can be registered side by
+side: `SPEC.name` becomes `<model>`, the profile names `qwen35-*` become
+`<model>-*`, and the `ModelDef` name becomes `--model-name` (default
+`<model>`). Every copied `.py` file gets a provenance header (see "Adapting
+this folder"). The folder imports its own files relatively, so the copy runs
+as is under its new package name; the scaffold prints the next steps (run the
+copy's tests, serve it). Then adapt the `ModelDef` (`model.py`:
+`hf_architectures`, `hf_model_type`, geometry), and add a shorthand to
+`megakernel_runtime.plugin.SHORTHANDS` if the model should be picked from its
+checkpoint's architecture. See "Adapting this folder" below.
 
 ### 2. Test (CPU, no TPU)
 
@@ -47,6 +54,25 @@ startup checks pass on a fake runner, `create` builds a program for a tiny
 geometry, and the program binds, warms up and serves a decode step through
 the CPU-interpret kernel. The second is the full suite (bit-exact golden
 hashes, the reference checks, the vLLM integration tests).
+
+The folder's test uses the runtime's plugin test kit,
+`vllm_torchtpu.megakernel_runtime.testkit`:
+
+- `check_spec("<package>")`: `SPEC` is valid, `create` is a lazy
+  `"module:attr"` string, and the package imports with torch / jax / vLLM
+  blocked;
+- `run_cpu_e2e(plugin, runner, steps, metadata=...)`: startup, bind and
+  warmup, then one `try_forward` per step on a fake runner; returns the
+  driver, the per-step outputs and the step mix;
+- `run_two_ranks(...)` / `assert_rank_uniform_declines(...)`: startup on two
+  gloo ranks (a decline on one rank declines both);
+- fixtures `mk_fake_runner` (the `testing.fake_runner` factory) and
+  `mk_toy_plugin`, imported into `tests/conftest.py`.
+
+A program whose steps are JAX functions can build each with
+`megakernel_runtime.jax_bridge.build_jax_step_op(fn, mesh=..., in_specs=...,
+out_specs=..., donate={out: in})`: a torch callable that runs `fn` through
+`torch_tpu` on TPU and through JAX on CPU, so the same test serves on both.
 
 ### 3. Serve (one TPU v7x host)
 
@@ -171,7 +197,7 @@ settings from `SPEC` before `create` runs; the checkpoint checks are
 
 ## Adapting this folder
 
-1. Copy the folder (above) and keep its imports relative.
+1. Copy the folder with the scaffold (above) and keep its imports relative.
 2. `model.py`: describe the new architecture with the library's modules
    (`GQA`, `GDN`, `MoE`, `Norm`, ...) and its geometry from the HF config.
    Keep `register()`; register nothing at import time.
@@ -184,13 +210,14 @@ settings from `SPEC` before `create` runs; the checkpoint checks are
 6. `tests/` and `tests/models/<model>/megakernel/`: adapt the CPU end-to-end
    test and the goldens; `serving/`: the serve flags and the smoke.
 
-Copies made by hand or by the planned scaffold
-(`python -m vllm_torchtpu.megakernel_runtime.new --from qwen3_5 ...`) carry
-a provenance header atop every copied file:
+Copies made by the scaffold (above) or by hand carry a provenance header
+atop every copied `.py` file, after the license header:
 
 ```python
 # Copied from src/vllm_torchtpu/models/qwen3_5/megakernel/<file> @ <commit>
 ```
 
-so a change to this folder can list its copies. Files moved here (not copied)
-carry none.
+so a change to this folder can list its copies:
+`python -m vllm_torchtpu.megakernel_runtime.provenance --base origin/main`
+prints each changed file that has copies, and the copies. Files moved here
+(not copied) carry none.
