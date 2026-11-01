@@ -141,11 +141,13 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     CDK_OUTPUT_DIR: str = "/tmp"
     K3_AGGREGATE_EP16: bool = False
+    K3_DIRECT_PREFIX_CAPACITY: int = 65536
     K3_FP8_WIRES: str = ""
     K3_HOT_PLAN: str = ""
     K3_MAX_PREFILL_STEP_TOKENS: int = 8192
     K3_PREFILL_DIRECT_PREFIX: bool = True
     K3_PREFILL_EXPERT_PLAN: str = ""
+    K3_PREFILL_MOE_16K: bool = True
     K3_PREFILL_PREFIX_FP8: bool = False
     K3_PREFILL_ROUTE_COUNTS: bool = False
     K3_PREFILL_ROUTE_COUNTS_DIR: str = ""
@@ -871,11 +873,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi K3 megakernel and prefill scheduler knobs.
     "CDK_OUTPUT_DIR": env_str("CDK_OUTPUT_DIR", "/tmp"),
     "K3_AGGREGATE_EP16": env_bool("K3_AGGREGATE_EP16", default=False),
+    "K3_DIRECT_PREFIX_CAPACITY": env_int("K3_DIRECT_PREFIX_CAPACITY", 65536),
     "K3_FP8_WIRES": env_str("K3_FP8_WIRES", ""),
     "K3_HOT_PLAN": env_str("K3_HOT_PLAN", ""),
     "K3_MAX_PREFILL_STEP_TOKENS": env_int("K3_MAX_PREFILL_STEP_TOKENS", 8192),
     "K3_PREFILL_DIRECT_PREFIX": env_bool("K3_PREFILL_DIRECT_PREFIX", default=True),
     "K3_PREFILL_EXPERT_PLAN": env_str("K3_PREFILL_EXPERT_PLAN", ""),
+    "K3_PREFILL_MOE_16K": env_bool("K3_PREFILL_MOE_16K", default=True),
     "K3_PREFILL_PREFIX_FP8": env_bool("K3_PREFILL_PREFIX_FP8", default=False),
     "K3_PREFILL_ROUTE_COUNTS": env_bool("K3_PREFILL_ROUTE_COUNTS", default=False),
     "K3_PREFILL_ROUTE_COUNTS_DIR": env_str("K3_PREFILL_ROUTE_COUNTS_DIR", ""),

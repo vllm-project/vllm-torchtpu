@@ -395,6 +395,12 @@ class PrefillProgram:
         page), so a small window carries no state for slots it never fills."""
         return max(1, min(self.slots, window // self.page_tokens))
 
+    def direct_capacity(self) -> int:
+        """Token capacity of the persistent rank-local FP8 prefix arena."""
+        largest = self.windows[-1]
+        cap = min(active().prefill_direct_capacity, self.capacity)
+        return max(largest, -(-cap // largest) * largest)
+
     # ------------------------------------------------------------ ops
     #
     # Sequence s of a window occupies rows [offset_s, offset_s + length_s),
@@ -644,7 +650,15 @@ class PrefillProgram:
         suffix = ("" if self.has_draft else "_nd") + (
             "" if self.compute_logits else "_nl"
         )
-        mode_tag = "" if prefix_mode == "cp" else f"_{prefix_mode}"
+        mode_tag = (
+            ""
+            if prefix_mode == "cp"
+            else (
+                f"_direct{self.direct_capacity()}"
+                if prefix_mode == "direct"
+                else f"_{prefix_mode}"
+            )
+        )
         return f"pallas::{base}_w{window}_c{self.capacity}{suffix}{mode_tag}"
 
     def _export_key(self, op: str, window: int, prefix_mode: str = "cp") -> str:
@@ -655,12 +669,30 @@ class PrefillProgram:
             and cfg.prefill_expert_parallel in (8, 16)
             and window in (512, 1024, 2048, 4096, 8192, 16384)
         )
-        extra = () if prefix_mode == "cp" else (prefix_mode,)
+        moe_mode = (
+            "moe-fused-16k"
+            if (
+                fused_moe
+                and window == 16384
+                and cfg.prefill_moe_16k
+                and cfg.prefill_expert_parallel == 8
+            )
+            else ("moe-fused" if fused_moe else "moe-ref")
+        )
+        extra = (
+            ()
+            if prefix_mode == "cp"
+            else (
+                ("direct", self.direct_capacity())
+                if prefix_mode == "direct"
+                else (prefix_mode,)
+            )
+        )
         return repr(
             (
                 "prefill",
                 "moe-bank8" if self._expert_banks else "moe-global",
-                "moe-fused" if fused_moe else "moe-ref",
+                moe_mode,
                 "draft" if self.has_draft else "no-draft",
                 "logits" if self.compute_logits else "no-logits",
                 op,
@@ -1441,10 +1473,7 @@ class KimiPrefiller:
             and active().prefill_prefix_fp8
             and self._direct_arena is None
         ):
-            largest = self.program.windows[-1]
-            self._direct_capacity = max(
-                largest, -(-self.program.capacity // largest) * largest
-            )
+            self._direct_capacity = self.program.direct_capacity()
             self._direct_arena = (
                 torch.zeros(
                     (1, MLA_LAYERS, 3, self._direct_capacity, 256),
@@ -2377,46 +2406,6 @@ class KimiPrefiller:
                     prefix_mode="cp",
                 )
             )
-            if active().prefill_direct_prefix:
-                rec_none, conv_none = self.program.stack_states(
-                    [self.program.zero_state() for _ in range(count)]
-                )
-                logits_none, latents_none, *_ = self.program.run_packed(
-                    torch.zeros((1, window // 32), dtype=torch.int32).to("tpu"),
-                    _device_i32([1]),
-                    _device_i32(desc),
-                    rec_none,
-                    conv_none,
-                    writer.mla_pools(),
-                    None,
-                    None,
-                    ring_hook,
-                    prefix_mode="none",
-                )
-                if logits_none is not None:
-                    outputs.append(logits_none)
-                outputs.append(latents_none)
-                if self._direct_arena is not None:
-                    self._append_direct(window, latents_none, 0)
-                    rec_dir, conv_dir = self.program.stack_states(
-                        [self.program.zero_state() for _ in range(count)]
-                    )
-                    logits_dir, latents_dir, *_ = self.program.run_packed(
-                        torch.zeros((1, window // 32), dtype=torch.int32).to("tpu"),
-                        _device_i32([1]),
-                        _device_i32(desc),
-                        rec_dir,
-                        conv_dir,
-                        writer.mla_pools(),
-                        None,
-                        None,
-                        ring_hook,
-                        prefix_mode="direct",
-                        direct_arena=self._direct_arena,
-                    )
-                    if logits_dir is not None:
-                        outputs.append(logits_dir)
-                    outputs.append(latents_dir)
             if logits is not None:
                 outputs.append(logits)
             outputs.append(self.program.split_states(recurrent, conv)[0][0])
@@ -2443,6 +2432,60 @@ class KimiPrefiller:
                     _rank_zeros_i32(window // self.page_tokens),
                     writer.layout.block_shape,
                 )
+            for tensor in outputs:
+                materialize(tensor)
+            outputs.clear()
+            materialize(writer.raw_pools[0])
+            ring_out.clear()
+            del latents, logits, recurrent, conv, recurrent_at, conv_at
+            if active().prefill_direct_prefix:
+                rec_none, conv_none = self.program.stack_states(
+                    [self.program.zero_state() for _ in range(count)]
+                )
+                logits_none, latents_none, *_ = self.program.run_packed(
+                    torch.zeros((1, window // 32), dtype=torch.int32).to("tpu"),
+                    _device_i32([1]),
+                    _device_i32(desc),
+                    rec_none,
+                    conv_none,
+                    writer.mla_pools(),
+                    None,
+                    None,
+                    ring_hook,
+                    prefix_mode="none",
+                )
+                if logits_none is not None:
+                    materialize(logits_none)
+                materialize(latents_none)
+                ring_out.clear()
+                if self._direct_arena is not None:
+                    self._append_direct(window, latents_none, 0)
+                    materialize(self._direct_arena[0])
+                    materialize(self._direct_arena[1])
+                    del latents_none, logits_none, rec_none, conv_none
+                    rec_dir, conv_dir = self.program.stack_states(
+                        [self.program.zero_state() for _ in range(count)]
+                    )
+                    logits_dir, latents_dir, *_ = self.program.run_packed(
+                        torch.zeros((1, window // 32), dtype=torch.int32).to("tpu"),
+                        _device_i32([1]),
+                        _device_i32(desc),
+                        rec_dir,
+                        conv_dir,
+                        writer.mla_pools(),
+                        None,
+                        None,
+                        ring_hook,
+                        prefix_mode="direct",
+                        direct_arena=self._direct_arena,
+                    )
+                    if logits_dir is not None:
+                        materialize(logits_dir)
+                    materialize(latents_dir)
+                    ring_out.clear()
+                    del latents_dir, logits_dir, rec_dir, conv_dir
+                else:
+                    del latents_none, logits_none, rec_none, conv_none
         count = self.slots  # a hit-state read's sequences (_read_hit_states)
         outputs.append(writer.read_states(_zeros_i32(count * KDA_LAYERS))[0])
         if self.ring is not None:

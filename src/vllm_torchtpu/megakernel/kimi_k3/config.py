@@ -77,6 +77,9 @@ class KernelConfig:
     prefill_direct_prefix: bool = dataclasses.field(
         default_factory=lambda: envs.K3_PREFILL_DIRECT_PREFIX
     )
+    prefill_direct_capacity: int = dataclasses.field(
+        default_factory=lambda: envs.K3_DIRECT_PREFIX_CAPACITY
+    )
     # Prefill MoE route counts (diagnostic): each fused MoE call also returns its
     # chip's 56 local expert counts; the prefiller saves cumulative snapshots.
     prefill_route_counts: bool = dataclasses.field(
@@ -98,6 +101,10 @@ class KernelConfig:
     # EP16: all serving windows (FP32 reduce-scatter).
     # False: the unfused SparseCore gather/combine.
     prefill_fused_moe: bool = True
+    # Native unified 16384-token EP8/TP4 fused prefill MoE (instead of 2x8192).
+    prefill_moe_16k: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_MOE_16K
+    )
     # Weight loading.
     read_streams: int = 4
     load_inflight_gb: float = 16.0

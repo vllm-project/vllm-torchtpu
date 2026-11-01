@@ -147,7 +147,7 @@ def _make_harness(monkeypatch) -> tuple[KimiPrefiller, list, list]:
     prefiller._mla_group = 0
     prefiller._kda_groups = [(1, 512)] * KDA_LAYERS
     prefiller._zero_logits = None
-    prefiller._direct_capacity = 131072
+    prefiller._direct_capacity = 65536
     prefiller._direct_arena = (torch.zeros(1), torch.zeros(1))
     prefiller._direct_req_id = None
     prefiller._direct_upto = 0

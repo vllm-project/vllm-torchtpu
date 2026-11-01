@@ -29,11 +29,12 @@ from jax.sharding import PartitionSpec as P
 from .. import prefill_megakernel as k
 
 _COMPACT_8K_CAPACITY = 65536
+_COMPACT_16K_CAPACITY = 98304
 _RMW_BATCH = 2
 
 
 def _sort_route_steps(keys, probabilities, *, size):
-    """Yield after each 4096-route window of the in-place bitonic network.
+    """Yield after each 4096-route window (or 8-window batch at 16K) of the bitonic network.
 
     Keys encode (local expert, original route position), so all live keys are
     unique and the result has deterministic expert-major/token-major order.
@@ -79,20 +80,40 @@ def _sort_route_steps(keys, probabilities, *, size):
     def flush():
         if not pending:
             return
-        for ordinal in range(size // window):
-            kr, pr = view(keys, ordinal), view(probabilities, ordinal)
-            x, p = kr[...], pr[...]
-            global_position = positions + ordinal * window
-            for distance, group in pending:
-                y, q = partner(x, distance), partner(p, distance)
-                descending = (global_position & group) != 0
-                upper = (global_position & distance) != 0
-                take_min = ~(descending ^ upper)
-                keep = ~((x < y) ^ take_min)
-                x, p = jnp.where(keep, x, y), jnp.where(keep, p, q)
-            kr[...], pr[...] = x, p
-            yield
+        steps = tuple(pending)
         pending.clear()
+        if size <= 131072:
+            for ordinal in range(size // window):
+                kr, pr = view(keys, ordinal), view(probabilities, ordinal)
+                x, p = kr[...], pr[...]
+                global_position = positions + ordinal * window
+                for distance, group in steps:
+                    y, q = partner(x, distance), partner(p, distance)
+                    descending = (global_position & group) != 0
+                    upper = (global_position & distance) != 0
+                    take_min = ~(descending ^ upper)
+                    keep = ~((x < y) ^ take_min)
+                    x, p = jnp.where(keep, x, y), jnp.where(keep, p, q)
+                kr[...], pr[...] = x, p
+                yield
+            return
+        for batch in range(0, size // window, 8):
+
+            @pl.loop(batch, batch + 8)
+            def flush_batch(ordinal, *, steps=steps):
+                kr, pr = view(keys, ordinal), view(probabilities, ordinal)
+                x, p = kr[...], pr[...]
+                global_position = positions + ordinal * window
+                for distance, group in steps:
+                    y, q = partner(x, distance), partner(p, distance)
+                    descending = (global_position & group) != 0
+                    upper = (global_position & distance) != 0
+                    take_min = ~(descending ^ upper)
+                    keep = ~((x < y) ^ take_min)
+                    x, p = jnp.where(keep, x, y), jnp.where(keep, p, q)
+                kr[...], pr[...] = x, p
+
+            yield
 
     for stage in range(1, size.bit_length()):
         for shift in reversed(range(stage)):
@@ -102,17 +123,37 @@ def _sort_route_steps(keys, probabilities, *, size):
                 continue
             yield from flush()
             stride = distance // window
-            for ordinal in range(size // (2 * window)):
-                low = ordinal // stride * (2 * stride) + ordinal % stride
-                high = low + stride
-                kl, kh = view(keys, low), view(keys, high)
-                plow, phigh = view(probabilities, low), view(probabilities, high)
-                x, y, p, q = kl[...], kh[...], plow[...], phigh[...]
-                ascending = (low * window & group) == 0
-                keep = ~((x < y) ^ ascending)
-                kl[...], kh[...] = jnp.where(keep, x, y), jnp.where(keep, y, x)
-                plow[...], phigh[...] = jnp.where(keep, p, q), jnp.where(keep, q, p)
-                yield
+            if size <= 131072:
+                for ordinal in range(size // (2 * window)):
+                    low = ordinal // stride * (2 * stride) + ordinal % stride
+                    high = low + stride
+                    kl, kh = view(keys, low), view(keys, high)
+                    plow, phigh = view(probabilities, low), view(probabilities, high)
+                    x, y, p, q = kl[...], kh[...], plow[...], phigh[...]
+                    ascending = (low * window & group) == 0
+                    keep = ~((x < y) ^ ascending)
+                    kl[...], kh[...] = jnp.where(keep, x, y), jnp.where(keep, y, x)
+                    plow[...], phigh[...] = jnp.where(keep, p, q), jnp.where(keep, q, p)
+                    yield
+            else:
+                for batch in range(0, size // (2 * window), 8):
+
+                    @pl.loop(batch, batch + 8)
+                    def swap_batch(ordinal, *, stride=stride, group=group):
+                        low = ordinal // stride * (2 * stride) + ordinal % stride
+                        high = low + stride
+                        kl, kh = view(keys, low), view(keys, high)
+                        plow, phigh = view(probabilities, low), view(probabilities, high)
+                        x, y, p, q = kl[...], kh[...], plow[...], phigh[...]
+                        ascending = (low * window & group) == 0
+                        keep = ~((x < y) ^ ascending)
+                        kl[...], kh[...] = jnp.where(keep, x, y), jnp.where(keep, y, x)
+                        plow[...], phigh[...] = (
+                            jnp.where(keep, p, q),
+                            jnp.where(keep, q, p),
+                        )
+
+                    yield
     yield from flush()
 
 
@@ -215,7 +256,7 @@ def _metadata_steps(
             count = jnp.sum((local_flat == expert).astype(jnp.int32))
             tile_counts = jnp.where(expert_index == expert, count, tile_counts)
         total_counts += tile_counts
-        if tokens == 8192:
+        if tokens >= 8192:
             tile_groups = jnp.zeros((ep_groups,), jnp.int32)
             groups = ids_flat // local_experts
             for group in range(ep_groups):
@@ -350,7 +391,7 @@ def _latent_gather_steps(
     not make reusing an unconsumed semaphore safe.
     """
     rows = payload.shape[0]
-    assert rows in (16, 32, 64, 128, 256)
+    assert rows in (16, 32, 64, 128, 256, 512)
     regions = []
     begin = 0
     for stream in range(12):
@@ -465,7 +506,7 @@ def _latent_ready_init(tables, payload, output, send, recv, stores, state, meta,
     its hop and receive/forward/complete phase; state[0] counts active streams.
     """
     rows = payload.shape[0]
-    assert rows == 256
+    assert rows in (256, 512)
     for directed in range(6):
         family, direction = directed // 2, -1 if directed % 2 == 0 else 1
         position = tables[family, 0, rank]
@@ -614,6 +655,7 @@ def _prologue(
     *,
     counts_ready,
     metadata_ready,
+    shared_hbm=None,
 ):
     """Router, latent projection and shared experts, with incremental collectives.
 
@@ -636,7 +678,7 @@ def _prologue(
 
     def body(s):
         own = s["pair"].at[pl.ds(parity * rows, rows), :]
-        if rows == 256:
+        if rows >= 256:
             buffers = tuple(s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4))
             router_v = s["router_gu"].at[:, :896]
         else:
@@ -690,10 +732,10 @@ def _prologue(
                 )
 
         def metadata_progress():
-            for _ in range(2 if rows <= 128 else 6):
+            for _ in range(2 if rows <= 128 else (4 if rows == 512 else 6)):
                 next(metadata_steps, None)
 
-        if rows == 256:
+        if rows >= 256:
             latent_buffers = tuple(
                 s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4)
             )
@@ -712,7 +754,7 @@ def _prologue(
                     start_metadata()
             if rows <= 128 and metadata_started:
                 metadata_progress()
-            if rows == 256:
+            if rows >= 256:
                 fragment = product.astype(jnp.bfloat16)
                 if col < 1792:
                     first_half = fragment
@@ -758,32 +800,50 @@ def _prologue(
         start_metadata()
         if rows <= 128:
             s["latent_payload"][...] = s["latent"][:, :3584].reshape(rows, 2, 1792)
-        latent_steps = _latent_gather_steps(
-            tables,
-            s["latent_payload"],
-            s["latent_recv"],
-            latent_hbm,
-            s["latent_send_sems"],
-            s["latent_recv_sems"],
-            s["latent_credits"],
-            s["latent_stores"],
-            rank=rank,
-        )
-        if rows == 256:
+        if rows >= 256:
             latent_tick = 0
+
             def latent_progress(*, drain=False):
                 nonlocal latent_tick
                 if latent_tick == 0:
-                    _latent_ready_init(tables, s["latent_payload"], latent_hbm,
-                        s["latent_send_sems"], s["latent_recv_sems"], s["latent_stores"],
-                        s["latent_state"], s["latent_meta"], rank=rank)
+                    _latent_ready_init(
+                        tables,
+                        s["latent_payload"],
+                        latent_hbm,
+                        s["latent_send_sems"],
+                        s["latent_recv_sems"],
+                        s["latent_stores"],
+                        s["latent_state"],
+                        s["latent_meta"],
+                        rank=rank,
+                    )
                 else:
-                    _latent_ready_progress(s["latent_payload"], latent_hbm,
-                        s["latent_send_sems"], s["latent_recv_sems"], s["latent_credits"],
-                        s["latent_stores"], s["latent_state"], s["latent_meta"], rank=rank,
-                        drain=drain)
+                    _latent_ready_progress(
+                        s["latent_payload"],
+                        latent_hbm,
+                        s["latent_send_sems"],
+                        s["latent_recv_sems"],
+                        s["latent_credits"],
+                        s["latent_stores"],
+                        s["latent_state"],
+                        s["latent_meta"],
+                        rank=rank,
+                        drain=drain,
+                    )
                 latent_tick += 1
         else:
+            latent_steps = _latent_gather_steps(
+                tables,
+                s["latent_payload"],
+                s["latent_recv"],
+                latent_hbm,
+                s["latent_send_sems"],
+                s["latent_recv_sems"],
+                s["latent_credits"],
+                s["latent_stores"],
+                rank=rank,
+            )
+
             def latent_progress(*, drain=False):
                 if drain:
                     for _ in latent_steps:
@@ -803,7 +863,7 @@ def _prologue(
 
         gu_copy(0, 0, gate_buffers, gate_sems).start()
         gu_copy(0, 3072, up_buffers, up_sems).start()
-        if rows == 256:
+        if rows >= 256:
             latent_progress()
         for panel in range(12):
             if rows <= 128:
@@ -830,7 +890,7 @@ def _prologue(
                 s["middle"][pl.ds(row, rows), pl.ds(panel * 256, 256)] = (
                     activated.astype(jnp.bfloat16)
                 )
-                if rows == 256:
+                if rows >= 256:
                     latent_progress()
 
         def down_copy(panel):
@@ -840,14 +900,27 @@ def _prologue(
                 s["down_sems"][panel % 2],
             )
 
+        def shared_hbm_copy(panel):
+            assert shared_hbm is not None
+            return pltpu.make_async_copy(
+                s["shared_out"][panel % 2],
+                shared_hbm.at[:, pl.ds(panel * 256, 256)],
+                s["shared_sems"][panel % 2],
+            )
+
         def finish_reduction(pending):
             transfer, bank, panel = pending
             own = s["partial"][bank][pl.ds(parity * rows, rows), :]
             transfer.wait_send()
             transfer.wait_recv()
-            shared[:, pl.ds(panel * 256, 256)] = (own + s["peer_y"][bank][...]).astype(
-                jnp.bfloat16
-            )
+            reduced_panel = (own + s["peer_y"][bank][...]).astype(jnp.bfloat16)
+            if shared_hbm is not None:
+                if panel >= 2:
+                    shared_hbm_copy(panel - 2).wait()
+                s["shared_out"][panel % 2][...] = reduced_panel
+                shared_hbm_copy(panel).start()
+            else:
+                shared[:, pl.ds(panel * 256, 256)] = reduced_panel
 
         down_copy(0).start()
         pending = None
@@ -877,10 +950,13 @@ def _prologue(
                     )
                     transfer.start()
                     pending = transfer, bank, panel
-                if rows == 256 or row == rows:
+                if rows >= 256 or row == rows:
                     latent_progress()
         finish_reduction(pending)
-        if rows == 256:
+        if shared_hbm is not None:
+            for tail_panel in (26, 27):
+                shared_hbm_copy(tail_panel).wait()
+        if rows >= 256:
             for _ in metadata_steps:
                 latent_progress()
             # Start compact VMEM-to-SMEM transfers while the latent ring finishes.
@@ -894,7 +970,7 @@ def _prologue(
     scratch = dict(
         pair=vmem((2 * rows, hidden_size), jnp.bfloat16),
         router=vmem((hidden_size, 896), jnp.bfloat16) if rows <= 128 else None,
-        router_gu=vmem((hidden_size, 1024), jnp.bfloat16) if rows == 256 else None,
+        router_gu=vmem((hidden_size, 1024), jnp.bfloat16) if rows >= 256 else None,
         gu_buffers=tuple(vmem((hidden_size, 256), jnp.bfloat16) for _ in range(4))
         if rows <= 128
         else (),
@@ -912,8 +988,8 @@ def _prologue(
         keys=vmem((rows * 4, 128), jnp.int32),
         latent_payload=vmem((rows, 2, 1792), jnp.bfloat16),
         latent_recv=vmem((2, rows, 2, 1792), jnp.bfloat16) if rows <= 128 else None,
-        latent_state=pltpu.SMEM((25,), jnp.int32) if rows == 256 else None,
-        latent_meta=pltpu.SMEM((6 * 34,), jnp.int32) if rows == 256 else None,
+        latent_state=pltpu.SMEM((25,), jnp.int32) if rows >= 256 else None,
+        latent_meta=pltpu.SMEM((6 * 34,), jnp.int32) if rows >= 256 else None,
         latent_send_sems=dma((12,)),
         latent_recv_sems=dma((2, 12)),
         latent_credits=pltpu.SemaphoreType.REGULAR((12,)),
@@ -925,6 +1001,10 @@ def _prologue(
         peer_y=tuple(vmem((rows, 256), jnp.float32) for _ in range(2)),
         reduce_send=(dma, dma),
         reduce_recv=(dma, dma),
+        shared_out=tuple(vmem((rows, 256), jnp.bfloat16) for _ in range(2))
+        if shared_hbm is not None
+        else (),
+        shared_sems=(dma, dma) if shared_hbm is not None else (),
     )
     pl.run_scoped(body, scratch)
 
@@ -948,14 +1028,18 @@ def _routed_experts(
     probabilities_ready,
 ):
     """Joint GU/SiTU/first-down pipeline followed by remaining columns."""
-    columns = 1792 if tokens < 8192 else 896
+    columns = 512 if tokens == 16384 else (1792 if tokens < 8192 else 896)
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
     gu_unroll = 4 if tokens < 8192 else 8
     first_down_unroll = 2 if tokens < 8192 else 8
-    metadata_row_capacity = 0 if tokens < 8192 else _COMPACT_8K_CAPACITY
+    metadata_row_capacity = (
+        0
+        if tokens < 8192
+        else (_COMPACT_8K_CAPACITY if tokens == 8192 else _COMPACT_16K_CAPACITY)
+    )
     ring_dtype = jnp.bfloat16
-    assert tokens in (512, 1024, 2048, 4096, 8192)
+    assert tokens in (512, 1024, 2048, 4096, 8192, 16384)
     gu_width = gu_weights.shape[-1]
     assert gu_width % 2 == 0
     mid_width = gu_width // 2
@@ -1336,8 +1420,8 @@ def _routed_experts(
             )
             refs = (gu, w, middle.reshape(-1, sub, mid_width))
             scratches = (metadata, gu_partial, acts, act_sems)
-            if tokens == 8192:
-                # The 8K schedule already fills VMEM; retain its compact buffers.
+            if tokens >= 8192:
+                # The >=8K schedule already fills VMEM; retain its compact buffers.
                 pltpu.emit_pipeline(joint, **specs)(*refs, scratches=scratches)
                 return
 
@@ -1884,7 +1968,9 @@ def _ready_reduce(
                     sweep(group)
 
 
-def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
+def _epilogue(
+    control, reduced, shared, norm_weight, up_weight, prefix, output, *, shared_hbm=None
+):
     """Normalize routed output and project up with three weight/prefix banks.
 
     Reduced FP32 rows remain in VMEM. Preserve the BF16 boundaries after
@@ -1917,6 +2003,14 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
                 s["prefix_sems"][panel % 3],
             )
 
+        def shared_copy(panel):
+            assert shared_hbm is not None
+            return pltpu.make_async_copy(
+                shared_hbm.at[:, pl.ds(panel * 512, 512)],
+                s["shared_tiles"][panel % 3],
+                s["shared_sems"][panel % 3],
+            )
+
         def output_copy(panel):
             return pltpu.make_async_copy(
                 s["tiles"][panel % 3],
@@ -1928,6 +2022,8 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
         for panel in (0, 1):
             weight_copy(panel).start()
             prefix_copy(panel).start()
+            if shared_hbm is not None:
+                shared_copy(panel).start()
         routed = reduced[...].astype(jnp.float32)
         mean = jnp.sum(routed * routed, axis=1, keepdims=True) / width
         inverse = jax.lax.rsqrt(mean + 1e-5)
@@ -1938,17 +2034,26 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
             bank = panel % 3
             weight_copy(panel).wait()
             prefix_copy(panel).wait()
+            if shared_hbm is not None:
+                shared_copy(panel).wait()
             if panel + 2 < panels:
                 if panel >= 1:
                     output_copy(panel - 1).wait()
                 weight_copy(panel + 2).start()
                 prefix_copy(panel + 2).start()
+                if shared_hbm is not None:
+                    shared_copy(panel + 2).start()
             product = jnp.matmul(
                 s["normalized"][...],
                 s["weights"][bank][...],
                 preferred_element_type=jnp.float32,
             ).astype(jnp.bfloat16)
-            value = product + shared[:, pl.ds(panel * 512, 512)]
+            shared_panel = (
+                s["shared_tiles"][bank][...]
+                if shared_hbm is not None
+                else shared[:, pl.ds(panel * 512, 512)]
+            )
+            value = product + shared_panel
             value = jnp.where(valid, value, 0)
             s["tiles"][bank][...] = s["tiles"][bank][...] + value
             output_copy(panel).start()
@@ -1963,8 +2068,12 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
             normalized=vmem((rows, width), jnp.bfloat16),
             weights=tuple(vmem((width, 512), jnp.bfloat16) for _ in range(3)),
             tiles=tuple(vmem((rows, 512), jnp.bfloat16) for _ in range(3)),
+            shared_tiles=tuple(vmem((rows, 512), jnp.bfloat16) for _ in range(3))
+            if shared_hbm is not None
+            else (),
             weight_sems=(dma, dma, dma),
             prefix_sems=(dma, dma, dma),
+            shared_sems=(dma, dma, dma) if shared_hbm is not None else (),
             output_sems=(dma, dma, dma),
         ),
     )
@@ -2014,13 +2123,19 @@ def _layer_kernel(
     """One launch owns all compute, metadata and communication on the fast path.
 
     Large projection scratch has a shorter lifetime than expert scratch. Only
-    shared output and the scalar routing metadata survive that boundary. At 8K
+    shared output and the scalar routing metadata survive that boundary (at 16K
+    shared output streams through HBM workspace to free 7 MiB of VMEM). At >=8K
     all ranks take the same overflow branch; no routes are dropped to fit SMEM.
     """
     rows = hidden.shape[0]
     tokens = rows * 32
     local_experts = expert_gu.shape[1]
-    capacity = tokens * 16 if tokens < 8192 else _COMPACT_8K_CAPACITY
+    capacity = (
+        tokens * 16
+        if tokens < 8192
+        else (_COMPACT_8K_CAPACITY if tokens == 8192 else _COMPACT_16K_CAPACITY)
+    )
+    shared_hbm = fallback_shared if tokens == 16384 else None
     shape = (tokens // 8, 128)
     vmem, smem, dma = pltpu.VMEM, pltpu.SMEM, pltpu.SemaphoreType.DMA
 
@@ -2039,7 +2154,7 @@ def _layer_kernel(
 
         def counts_ready():
             count_copy().start()
-            if tokens == 8192:
+            if tokens >= 8192:
                 maximum_copy().start()
 
         def probability_copy(probs_v):
@@ -2051,10 +2166,13 @@ def _layer_kernel(
 
         def prepare(ids_v, probs_v):
             indices = pltpu.make_async_copy(
-                ids_v.at[: capacity // 128, :], s["ids"], s["index_sem"])
+                ids_v.at[: capacity // 128, :], s["ids"], s["index_sem"]
+            )
+
             def metadata_ready():
                 indices.start()
                 probability_copy(probs_v).start()
+
             _prologue(
                 tables,
                 control,
@@ -2072,14 +2190,15 @@ def _layer_kernel(
                 maximum,
                 counts_ready=counts_ready,
                 metadata_ready=metadata_ready,
+                shared_hbm=shared_hbm,
             )
             count_copy().wait()
             if route_counts is not None:
                 for e in range(local_experts):
                     route_counts[e] = s["counts"][e]
-            if tokens == 8192:
+            if tokens >= 8192:
                 maximum_copy().wait()
-            if tokens != 8192:
+            if tokens < 8192:
                 metadata_ready()
             if tokens == 8192:
 
@@ -2096,12 +2215,12 @@ def _layer_kernel(
                         copy.wait()
 
             indices.wait()
-            if tokens == 8192:
+            if tokens >= 8192:
                 probability_copy(probs_v).wait()
 
-        if tokens == 8192:
+        if tokens >= 8192:
             # The compact path completes both metadata DMAs before expert work.
-            # Reclaim the full probability array (512 KiB) for expert scratch.
+            # Reclaim the full probability array (512 KiB / 1 MiB) for expert scratch.
             pl.run_scoped(prepare, vmem(shape, jnp.int32), vmem(shape, jnp.float32))
         else:
             pl.run_scoped(
@@ -2131,7 +2250,14 @@ def _layer_kernel(
                 probabilities_ready=probabilities_ready,
             )
             _epilogue(
-                control, s["reduced"], s["shared"], norm, latent_up, prefix, output
+                control,
+                s["reduced"],
+                s["shared"],
+                norm,
+                latent_up,
+                prefix,
+                output,
+                shared_hbm=shared_hbm,
             )
 
         if tokens < 8192:
@@ -2145,62 +2271,29 @@ def _layer_kernel(
     pl.run_scoped(
         body,
         dict(
-            shared=vmem((rows, 7168), jnp.bfloat16),
+            shared=vmem((rows, 7168), jnp.bfloat16) if tokens < 16384 else None,
             reduced=vmem((rows, 3584), jnp.bfloat16),
             probs_v=vmem(shape, jnp.float32) if tokens < 8192 else None,
             counts_v=vmem((local_experts,), jnp.int32),
             counts=smem((local_experts,), jnp.int32),
-            maximum=smem((1,), jnp.int32) if tokens == 8192 else None,
+            maximum=smem((1,), jnp.int32) if tokens >= 8192 else None,
             ids=smem((capacity // 128, 128), jnp.int32),
             probs=smem((capacity // 128, 128), jnp.float32),
             family=smem((1,), jnp.int32),
             offset=smem((1,), jnp.int32),
             count_sem=dma,
-            max_sem=dma if tokens == 8192 else None,
+            max_sem=dma if tokens >= 8192 else None,
             index_sem=dma,
             prob_sem=dma,
-            export_sem=dma,
+            export_sem=dma if tokens == 8192 else None,
         ),
     )
 
 
-def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
-    """Build the fused EP16/TP2 prefill MoE for a supported serving window.
-
-    Inputs follow the prefill layer interface: rank-sharded normalized hidden
-    states, residual prefix, resident weight families, valid length and family
-    index. All fast-path operations execute in one Pallas kernel. Rare 8K route
-    overflow uses the uncapped production expert path with the same metadata.
-    """
-    if seq_len == 16384:
-        half = make_indexed_moe_sp_ring(mesh, seq_len=8192)
-        counting = k._config().prefill_route_counts
-
-        def run_16k(hidden, prefix, families, length, slot):
-            len0 = jnp.minimum(length, 8192)
-            len1 = jnp.maximum(length - 8192, 0)
-            r0 = half(hidden[:, :256], prefix[:, :256], families, len0, slot)
-            r1 = half(hidden[:, 256:], prefix[:, 256:], families, len1, slot)
-            if counting:
-                return jnp.concatenate((r0[0], r1[0]), axis=1), r0[1] + r1[1]
-            return jnp.concatenate((r0, r1), axis=1)
-
-        return jax.jit(run_16k)
-    if seq_len not in (512, 1024, 2048, 4096, 8192):
-        raise ValueError(
-            "Fused prefill MoE supports 512, 1024, 2048, 4096, 8192 and 16384 token windows"
-        )
-    if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
-        raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
-    ep = k._config().prefill_expert_parallel
-    if ep not in (8, 16):
-        raise ValueError("Fused prefill MoE requires prefill_expert_parallel in (8, 16)")
-    from .layer import routed_experts_prepared
-
+def _build_moe_pallas_call(seq_len, ep, counting):
     local_experts = 896 // ep
     mid_width = 3072 // (32 // ep)
     rows = seq_len // 32
-    tables = k.ring_tables(list(mesh.devices.flat), tuple(range(32)))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     shape = (seq_len // 8, 128)
     bf16 = jnp.bfloat16
@@ -2211,7 +2304,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     ]
     output_specs = [hbm] * 3
     if seq_len == 8192:
-        # Only 8K can overflow compact SMEM routing capacity. At <=4K every
+        # Only >=8K can overflow compact SMEM routing capacity. At <=4K every
         # route fits, so omit the unused overflow outputs and maximum DMA.
         workspace_shapes += [
             (shape, jnp.int32),
@@ -2221,15 +2314,40 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             ((1,), jnp.int32),
         ]
         output_specs += [hbm] * 4 + [pl.BlockSpec()]
-    counting = k._config().prefill_route_counts
+    elif seq_len == 16384:
+        workspace_shapes += [
+            ((rows, 7168), bf16),
+            ((1,), jnp.int32),
+        ]
+        output_specs += [hbm, pl.BlockSpec()]
     body = _layer_kernel
-    if counting:
+    if seq_len == 16384:
+        if counting:
+            workspace_shapes += [((local_experts,), jnp.int32)]
+            output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
+
+            def body(*refs):
+                return _layer_kernel(
+                    *refs[:18],
+                    fallback_shared=refs[18],
+                    maximum=refs[19],
+                    route_counts=refs[20],
+                )
+        else:
+
+            def body(*refs):
+                return _layer_kernel(
+                    *refs[:18],
+                    fallback_shared=refs[18],
+                    maximum=refs[19],
+                )
+    elif counting:
         workspace_shapes += [((local_experts,), jnp.int32)]
         output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
 
         def body(*refs):
             return _layer_kernel(*refs[:-1], route_counts=refs[-1])
-    kernel = pl.pallas_call(
+    return pl.pallas_call(
         body,
         out_shape=tuple(jax.ShapeDtypeStruct(s, d) for s, d in workspace_shapes),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -2246,6 +2364,99 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         name=f"fused_moe_pallas_{seq_len}",
     )
 
+
+def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
+    """Build the fused EP16/TP2 or EP8/TP4 prefill MoE for a supported serving window.
+
+    Inputs follow the prefill layer interface: rank-sharded normalized hidden
+    states, residual prefix, resident weight families, valid length and family
+    index. All fast-path operations execute in one Pallas kernel. Rare >=8K route
+    overflow uses a zero-drop fallback path.
+    """
+    if seq_len not in (512, 1024, 2048, 4096, 8192, 16384):
+        raise ValueError(
+            "Fused prefill MoE supports 512, 1024, 2048, 4096, 8192 and 16384 token windows"
+        )
+    if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
+        raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
+    ep = k._config().prefill_expert_parallel
+    if ep not in (8, 16):
+        raise ValueError("Fused prefill MoE requires prefill_expert_parallel in (8, 16)")
+    counting = k._config().prefill_route_counts
+    if seq_len == 16384 and (not k._config().prefill_moe_16k or ep != 8):
+        half = make_indexed_moe_sp_ring(mesh, seq_len=8192)
+
+        def run_16k(hidden, prefix, families, length, slot):
+            len0 = jnp.minimum(length, 8192)
+            len1 = jnp.maximum(length - 8192, 0)
+            r0 = half(hidden[:, :256], prefix[:, :256], families, len0, slot)
+            r1 = half(hidden[:, 256:], prefix[:, 256:], families, len1, slot)
+            if counting:
+                return jnp.concatenate((r0[0], r1[0]), axis=1), r0[1] + r1[1]
+            return jnp.concatenate((r0, r1), axis=1)
+
+        return jax.jit(run_16k)
+    from .layer import routed_experts_prepared
+
+    tables = k.ring_tables(list(mesh.devices.flat), tuple(range(32)))
+    kernel = _build_moe_pallas_call(seq_len, ep, counting)
+    kernel_8k = _build_moe_pallas_call(8192, ep, counting) if seq_len == 16384 else kernel
+
+    def run_8k_local(h, p, w, length, slot):
+        control = jnp.concatenate((length.reshape(1), slot.reshape(1)))
+        outputs = kernel_8k(
+            jnp.asarray(tables),
+            control,
+            h,
+            w["router"],
+            w["router_bias"],
+            w["latent_down"],
+            w["shared_gu"],
+            w["shared_down"],
+            w["expert_gu"],
+            w["expert_gus"],
+            w["expert_down"],
+            w["expert_ds"],
+            w["latent_norm"],
+            w["latent_up"],
+            p,
+        )
+        routes = None
+        if counting:
+            *outputs, routes = outputs
+        final, latent, _, ids, probs, counts, shared, maximum = outputs
+
+        def overflow():
+            reduced = routed_experts_prepared(
+                latent,
+                ids.reshape(-1),
+                probs.reshape(-1),
+                counts,
+                w["expert_gu"],
+                w["expert_gus"],
+                w["expert_down"],
+                w["expert_ds"],
+                reduce_tables=tables,
+                expert_layer=slot,
+                global_route_max=maximum[0],
+            )
+            selected = {name: w[name][slot[0]] for name in ("latent_norm", "latent_up")}
+            return k._moe_sp_tail(
+                reduced,
+                shared,
+                p,
+                length,
+                selected,
+                axis_name="k3_sp",
+                eps=1e-5,
+                shared_reduced=True,
+            )
+
+        result = jax.lax.cond(
+            maximum[0] <= _COMPACT_8K_CAPACITY, lambda: final, overflow
+        )
+        return result, routes
+
     @functools.partial(
         jax.shard_map,
         mesh=mesh,
@@ -2255,6 +2466,12 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     )
     def local(hidden, prefix, families, length, slot):
         w = {name: value[0] for name, value in families.items()}
+        if seq_len == 8192:
+            result, routes = run_8k_local(hidden[0], prefix[0], w, length, slot)
+            if counting:
+                assert routes is not None
+                return result[None], routes[None]
+            return result[None]
         control = jnp.concatenate((length.reshape(1), slot.reshape(1)))
         outputs = kernel(
             jnp.asarray(tables),
@@ -2276,40 +2493,28 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         routes = None
         if counting:
             *outputs, routes = outputs
-            routes = routes[None]
         if seq_len < 8192:
-            return (outputs[0][None], routes) if counting else outputs[0][None]
-        final, latent, _, ids, probs, counts, shared, maximum = outputs
+            if counting:
+                assert routes is not None
+                return outputs[0][None], routes[None]
+            return outputs[0][None]
+        final, _, _, _, maximum = outputs
 
-        def overflow():
-            reduced = routed_experts_prepared(
-                latent,
-                ids.reshape(-1),
-                probs.reshape(-1),
-                counts,
-                w["expert_gu"],
-                w["expert_gus"],
-                w["expert_down"],
-                w["expert_ds"],
-                reduce_tables=tables,
-                expert_layer=slot,
-                global_route_max=maximum[0],
-            )
-            selected = {name: w[name][slot[0]] for name in ("latent_norm", "latent_up")}
-            return k._moe_sp_tail(
-                reduced,
-                shared,
-                prefix[0],
-                length,
-                selected,
-                axis_name="k3_sp",
-                eps=1e-5,
-                shared_reduced=True,
-            )
+        def overflow_16k():
+            len0 = jnp.minimum(length, 8192)
+            len1 = jnp.maximum(length - 8192, 0)
+            r0, c0 = run_8k_local(hidden[0][:256], prefix[0][:256], w, len0, slot)
+            r1, c1 = run_8k_local(hidden[0][256:], prefix[0][256:], w, len1, slot)
+            combined = jnp.concatenate((r0, r1), axis=0)
+            if counting:
+                assert c0 is not None and c1 is not None
+                return combined, c0 + c1
+            return combined
 
-        result = jax.lax.cond(
-            maximum[0] <= _COMPACT_8K_CAPACITY, lambda: final, overflow
-        )[None]
-        return (result, routes) if counting else result
+        fast_out = (final, routes) if counting else final
+        out = jax.lax.cond(
+            maximum[0] <= _COMPACT_16K_CAPACITY, lambda: fast_out, overflow_16k
+        )
+        return (out[0][None], out[1][None]) if counting else out[None]
 
     return jax.jit(local)
