@@ -84,6 +84,9 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
             headers.
         speculative_config: Speculative decoding the runtime runs, recorded as
             `serving_config.speculative_config` (vLLM's field names); None for none.
+        max_verify_tokens: Without speculative decoding, the draft tokens a step can
+            still verify, such as tokens a grammar forces: a recurrent model keeps a
+            checkpoint per verify token, as it does per draft token. 0 for none.
     """
 
     vocab_size: int = 151936
@@ -104,8 +107,18 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     hf_checkpoint_dir: str | None = None
     uses_mrope: bool = False
     speculative_config: dict[str, Any] | None = None
+    max_verify_tokens: int = 0
 
     def __post_init__(self) -> None:
+        if self.max_verify_tokens < 0:
+            raise ValueError(
+                f"max_verify_tokens must be >= 0, got {self.max_verify_tokens}"
+            )
+        if self.max_verify_tokens and self.speculative_config:
+            raise ValueError(
+                "max_verify_tokens is for an export without speculative decoding; "
+                "with it, num_speculative_tokens sets the verify window"
+            )
         if self.emit_byte_tokenizer and self.vocab_size > 256:
             raise ValueError(
                 f"emit_byte_tokenizer requires vocab_size <= 256, got {self.vocab_size}"
@@ -127,11 +140,12 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     @property
     def recurrent_window(self) -> int:
         """Consecutive recurrent state slots a sequence holds: its state slot,
-        then under speculative decoding one checkpoint per draft token, so a
-        verify step that rejects drafts resumes from the accepted token's state.
+        then one checkpoint per draft token a step can verify (the speculative
+        draft tokens, or else `max_verify_tokens`), so a verify step that rejects
+        drafts resumes from the accepted token's state.
         """
         if not self.speculative_config:
-            return 1
+            return self.max_verify_tokens + 1
         return int(self.speculative_config["num_speculative_tokens"]) + 1
 
     @property
