@@ -54,7 +54,9 @@ weight-streaming kernel (TPU_FP8_LINEAR_PALLAS) whose output this all-reduce
 would sum -- attention's o_proj -- takes ``row_parallel_or`` instead: one kernel
 for the matmul and the all-reduce (kernels/quantized_matmul/
 fp8_oproj_all_reduce.py), bitwise the two-call path, for blocks of at most
-16 rows inside the warmup. Everything else keeps the layer's own forward.
+16 rows inside the warmup (TPU_FUSED_OPROJ_AR_MAX_ROWS raises the cap to 32 or
+64 rows, where the two-call path's matmul is XLA's). Everything else keeps the
+layer's own forward.
 """
 
 import faulthandler
@@ -107,6 +109,15 @@ def max_rows() -> int:
     return envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS or MAX_ROWS
 
 
+def fused_max_rows() -> int:
+    """The fused o_proj + all-reduce row cap: TPU_FUSED_OPROJ_AR_MAX_ROWS, at most
+    the kernel's limit."""
+    return min(
+        envs.TPU_FUSED_OPROJ_AR_MAX_ROWS or fp8_oproj_all_reduce.MAX_M,
+        fp8_oproj_all_reduce.LIMIT_M,
+    )
+
+
 _AR_OP = None
 # The all-reduce for traces outside the backbone warmup: the row choice is
 # made per exported bucket inside JAX (TPU_SMALL_ALL_REDUCE_DRAFT).
@@ -128,6 +139,8 @@ _DP_COMBINE = False
 # The fused row-parallel FP8 matmul + all-reduce (TPU_FUSED_OPROJ_AR); built only
 # when the TP group is the mesh (the only group it sums over).
 _MM_AR_OP = None
+# The same kernel with the value up-projection first (TPU_FUSED_UV_OPROJ).
+_UV_MM_AR_OP = None
 
 
 def _build_all_reduce(mesh, psum_above: int | None = None, pair_rows: int = 0):
@@ -199,7 +212,7 @@ def _build_valid_rows_all_reduce(mesh, tile_rows: int):
     )
 
 
-def _build_matmul_all_reduce(mesh, waves: bool):
+def _build_matmul_all_reduce(mesh, waves: bool, max_m: int):
     """The fused op over ``mesh``: fn(x [rows, k] bf16, w [k, n] fp8, w_s [n] f32,
     rank int32 [1]) per core -> the sum over the cores of x @ w * scales, [rows, n]."""
     n = mesh.shape[EP_AXIS_NAME]
@@ -207,7 +220,14 @@ def _build_matmul_all_reduce(mesh, waves: bool):
 
     def body(x, w, w_s, rank):
         return fp8_oproj_all_reduce.fp8_matmul_all_reduce(
-            x, w, w_s, rank, num_cores=n, axis=EP_AXIS_NAME, waves=waves
+            x,
+            w,
+            w_s,
+            rank,
+            num_cores=n,
+            axis=EP_AXIS_NAME,
+            waves=waves,
+            max_m=max_m,
         )
 
     def fn(x: jax.Array, w: jax.Array, w_s: jax.Array, rank: jax.Array) -> jax.Array:
@@ -223,6 +243,51 @@ def _build_matmul_all_reduce(mesh, waves: bool):
         fn,
         mesh=mesh,
         input_partition_specs=(spec,) * 4,
+        output_partition_specs=spec,
+        fake=fake,
+    )
+
+
+def _build_uv_matmul_all_reduce(mesh, waves: bool, max_m: int):
+    """The fused op with W_UV first: fn(x_lat [rows, heads * latent], w_uv [heads,
+    latent, v], w [heads * v, n] fp8, w_s [n] f32, rank int32 [1]) per core -> the
+    sum over the cores of bf16(per-head x_lat @ w_uv) @ w * scales, [rows, n]."""
+    n = mesh.shape[EP_AXIS_NAME]
+    spec = PartitionSpec(EP_AXIS_NAME)
+
+    def body(x_lat, w_uv, w, w_s, rank):
+        return fp8_oproj_all_reduce.fp8_uv_matmul_all_reduce(
+            x_lat,
+            w_uv,
+            w,
+            w_s,
+            rank,
+            num_cores=n,
+            axis=EP_AXIS_NAME,
+            out_dtype=jax.numpy.bfloat16,
+            waves=waves,
+            max_m=max_m,
+        )
+
+    def fn(
+        x_lat: jax.Array,
+        w_uv: jax.Array,
+        w: jax.Array,
+        w_s: jax.Array,
+        rank: jax.Array,
+    ) -> jax.Array:
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(spec,) * 5, out_specs=spec, check_vma=False
+        )(x_lat, w_uv, w, w_s, rank)
+
+    def fake(x_lat, w_uv, w, w_s, rank):
+        return x_lat.new_empty((x_lat.shape[0], w.shape[1]), dtype=torch.bfloat16)
+
+    return sharded_jax_op(
+        "pallas::fp8_uv_matmul_all_reduce",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,) * 5,
         output_partition_specs=spec,
         fake=fake,
     )
@@ -369,7 +434,7 @@ def prebuild(hidden_size: int = 0) -> None:
     the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE.
     hidden_size is the model's, the width of the chip-pair self-test."""
     global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
-    global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP, _PAIR_ROWS
+    global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP, _UV_MM_AR_OP, _PAIR_ROWS
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()
@@ -411,7 +476,13 @@ def prebuild(hidden_size: int = 0) -> None:
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
     tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS
     if envs.TPU_FUSED_OPROJ_AR and tp_all_reduce:
-        _MM_AR_OP = _build_matmul_all_reduce(mesh, envs.TPU_FUSED_OPROJ_AR_WAVES)
+        _MM_AR_OP = _build_matmul_all_reduce(
+            mesh, envs.TPU_FUSED_OPROJ_AR_WAVES, fused_max_rows()
+        )
+        if envs.TPU_FUSED_UV_OPROJ:
+            _UV_MM_AR_OP = _build_uv_matmul_all_reduce(
+                mesh, envs.TPU_FUSED_OPROJ_AR_WAVES, fused_max_rows()
+            )
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
@@ -562,7 +633,50 @@ def row_parallel_or(x: torch.Tensor, layer) -> torch.Tensor:
             w, w_s = weights
             rows, k = x.shape
             if k == w.shape[0] and fp8_oproj_all_reduce.supports(
-                rows, k, w.shape[1], _CORES
+                rows, k, w.shape[1], _CORES, fused_max_rows()
             ):
                 return _MM_AR_OP(retain(x), w, w_s, _RANK)
     return layer(x)[0]
+
+
+def _uv_weight(attn_layer):
+    """W_UV [heads, latent, v] when it is in the activation dtype (no scale)."""
+    w_uv = getattr(attn_layer, "W_UV", None)
+    if (
+        w_uv is None
+        or getattr(attn_layer, "W_UV_scale", None) is not None
+        or w_uv.dim() != 3
+        or w_uv.dtype != torch.bfloat16
+    ):
+        return None
+    return w_uv
+
+
+def uv_oproj_fits(rows, attn_layer, layer) -> bool:
+    """Whether a decode block of ``rows`` takes W_UV + o_proj + all-reduce in one
+    kernel (TPU_FUSED_UV_OPROJ): a warmup trace, the fused o_proj kernel's
+    weights, a bf16 W_UV and a supported block. Static at trace time, so the
+    attention op is told before it runs whether to return the latent."""
+    if _UV_MM_AR_OP is None or not (
+        torch.compiler.is_compiling() and shape_variants.in_warmup()
+    ):
+        return False
+    weights = _fused_layer_weights(layer)
+    w_uv = _uv_weight(attn_layer)
+    if weights is None or w_uv is None:
+        return False
+    w, _ = weights
+    heads, latent, _ = w_uv.shape
+    return fp8_oproj_all_reduce.supports_uv(
+        rows, heads, latent, w.shape[0], w.shape[1], _CORES, fused_max_rows()
+    )
+
+
+def uv_row_parallel(x_lat: torch.Tensor, attn_layer, layer) -> torch.Tensor:
+    """``layer(bmm(x_lat, W_UV))[0]`` in one kernel, for a block ``uv_oproj_fits``
+    passed; the latent rows [rows, heads * latent] come from the attention op."""
+    weights = _fused_layer_weights(layer)
+    w_uv = _uv_weight(attn_layer)
+    assert _UV_MM_AR_OP is not None and weights is not None and w_uv is not None
+    w, w_s = weights
+    return _UV_MM_AR_OP(retain(x_lat), w_uv, w, w_s, _RANK)

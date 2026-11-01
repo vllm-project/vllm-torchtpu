@@ -309,6 +309,8 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_CHIP_PAIRS: int = 0
     TPU_FUSED_OPROJ_AR: bool = True
     TPU_FUSED_OPROJ_AR_WAVES: bool = True
+    TPU_FUSED_OPROJ_AR_MAX_ROWS: int = 16
+    TPU_FUSED_UV_OPROJ: bool = False
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = "self_attn.o_proj,q_b_proj"
     TPU_LM_HEAD_HBM: str = "drafter"
@@ -2196,6 +2198,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of all after the last tile. 0.3-0.7 us/call faster on 2x2x2 tpu7x
     # (t5-oproj-ar probe 02b); 0 keeps every push after the last tile.
     "TPU_FUSED_OPROJ_AR_WAVES": env_bool("TPU_FUSED_OPROJ_AR_WAVES", True),
+    # With TPU_FUSED_OPROJ_AR: the largest decode block, in rows, the fused kernel
+    # takes. Above 16 rows the two-call path is XLA's matmul and its quantize, then
+    # the small all-reduce; the fused kernel streams the weight under the barrier
+    # round there too. A power of 2 (a bucket edge), at most 64.
+    "TPU_FUSED_OPROJ_AR_MAX_ROWS": env_nonnegative_int(
+        "TPU_FUSED_OPROJ_AR_MAX_ROWS", 16
+    ),
+    # With TPU_FUSED_OPROJ_AR: attention's decode blocks that the fused kernel
+    # takes also run the value up-projection (W_UV, bf16) in that kernel: the
+    # attention op returns the merged latent and the kernel projects each head
+    # while the o_proj weight streams. The separate per-head bmm leaves the step.
+    "TPU_FUSED_UV_OPROJ": env_bool("TPU_FUSED_UV_OPROJ", False),
     # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
     # M <= 16 through the weight-streaming Pallas kernel
     # (kernels/quantized_matmul/fp8_skinny.py), XLA otherwise. Outputs differ from

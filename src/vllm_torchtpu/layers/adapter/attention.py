@@ -2843,9 +2843,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
             if output is None:
                 # Preserve symbolic token dimensions during the memory probe.
-                template = q_nope.flatten(1)[:, :1].expand(
-                    -1, layer.num_heads * layer.v_head_dim
+                width = (
+                    layer.kv_lora_rank if kwargs.get("skip_uv") else layer.v_head_dim
                 )
+                template = q_nope.flatten(1)[:, :1].expand(-1, layer.num_heads * width)
                 return torch.ones_like(template)
             output.fill_(1)
             return output
@@ -3162,6 +3163,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             outputs = outputs.to(input_dtype).reshape(
                 -1, layer.num_heads * layer.v_head_dim
             )
+        elif kwargs.get("skip_uv"):
+            # TPU_FUSED_UV_OPROJ: the caller's output projection kernel runs
+            # W_UV on the merged latent itself.
+            outputs = outputs.reshape(-1, layer.num_heads * layer.kv_lora_rank)
         else:
             outputs_t = outputs.reshape(
                 -1, layer.num_heads, layer.kv_lora_rank
