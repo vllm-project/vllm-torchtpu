@@ -33,6 +33,7 @@ from vllm.config import (
 )
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
@@ -394,6 +395,44 @@ class TestKVCacheManager:
         self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
 
         mock_get_page_size.assert_called_once_with(264, 2, 128, torch.bfloat16)
+
+    @patch(
+        "vllm_torchtpu.runner.kv_cache_manager.VllmTPUDeepseekV32IndexerBackend.get_kv_cache_page_size_bytes",
+        return_value=1024,
+    )
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_update_mamba_page_size_padded_counts_indexer_caches(
+        self, mock_mem_info, mock_get_page_size, mock_indexer_page_size
+    ):
+        layers = {"attn_0": _attention_layer_mock()}
+        layers["attn_0"].num_kv_heads = 2
+        layers["attn_0"].head_size = 128
+        indexer = MagicMock(spec=DeepseekV32IndexerCache)
+        indexer.head_dim = 129
+        indexer.dtype = torch.uint8
+        layers["indexer_0"] = indexer
+        for i in range(3):
+            layers[f"mamba_{i}"] = DummyMamba()
+
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+
+        # The indexer caches are their own vLLM group in every region:
+        # uniform = 1 x 4096 (attn) + 1 x 1024 (indexer) + 3 x 66560 (mamba).
+        assert self.runner._hybrid_uniform_page_size_bytes == 204800
+        mock_indexer_page_size.assert_called_once_with(
+            self.runner.vllm_config.cache_config.block_size, 1, 129, torch.uint8
+        )
+        # Attention blocks are sized against both block-indexed layers:
+        #   (9,663,676,416 - 3 * 17 * 66560) // (4096 + 1024) = 1,886,773
+        assert self.runner._mamba_num_blocks == 17
+        assert self.runner.cache_config.num_gpu_blocks_override == 1886773
 
     def test_available_kv_cache_hbm_is_min_across_ep_dp(self, monkeypatch):
         """Pinned block counts must be sized from the DP-wide minimum budget."""

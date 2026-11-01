@@ -156,6 +156,13 @@ def sparse_mla_page_size_bytes(
     )
 
 
+def indexer_page_size_bytes(k_cache: DeepseekV32IndexerCache, block_size: int) -> int:
+    """Page bytes of a DSA indexer K cache in its TPU packed layout."""
+    return VllmTPUDeepseekV32IndexerBackend.get_kv_cache_page_size_bytes(
+        block_size, 1, k_cache.head_dim, torch.uint8
+    )
+
+
 def check_kv_caches_cover_block_ids(
     kv_caches: dict[str, torch.Tensor],
     kv_cache_tensors: Iterable[KVCacheTensor],
@@ -431,9 +438,13 @@ class KVCacheManager:
             elif isinstance(attn_module, DeepseekV32IndexerCache):
                 # DSA indexer K cache: the module declares its own uint8 spec
                 # (head_dim fp8 bytes + 1 e8m0 scale byte per token).
-                kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(
-                    self.runner.vllm_config
-                )
+                indexer_spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
+                if self.runner._hybrid_uniform_page_size_bytes is not None:
+                    indexer_spec = dataclasses.replace(
+                        cast(AttentionSpec, indexer_spec),
+                        page_size_padded=self.runner._hybrid_uniform_page_size_bytes,
+                    )
+                kv_cache_spec[layer_name] = indexer_spec
             else:
                 continue
 
@@ -762,7 +773,8 @@ class KVCacheManager:
         layer position from every group shares each region's block IDs.
         TPU's non-unified path keeps separate typed arrays for those layers.
         Report a uniform page equal to the sum of their physical pages
-        (`num_attn_groups * attn_page + num_mamba_groups * mamba_unpadded`),
+        (`num_attn_groups * attn_page + num_indexer_groups * indexer_page +
+        num_mamba_groups * mamba_unpadded`),
         so the scheduler's block count fits every array within the HBM budget.
         Attention bytes include TPU dtype packing and head/lane padding.
 
@@ -848,10 +860,17 @@ class KVCacheManager:
         # spec creation depends on padding). Keep in sync if that
         # heuristic ever changes — it has been stable since the hybrid
         # allocator landed.
+        # DSA indexer K caches are a third layer type (their own vLLM groups)
+        # sharing each region with the attention and mamba layers.
+        indexer_caches = [
+            m for m in layers.values() if isinstance(m, DeepseekV32IndexerCache)
+        ]
         num_attn = len(attn_modules)
         num_mamba = len(mamba_modules)
-        min_count = min(num_attn, num_mamba)
-        max_count = max(num_attn, num_mamba)
+        num_indexer = len(indexer_caches)
+        counts = [num_attn, num_mamba] + ([num_indexer] if num_indexer else [])
+        min_count = min(counts)
+        max_count = max(counts)
 
         # Match vLLM exactly: float comparison, no int() truncation (matters
         # at e.g. min=3, max=4, where 4 < 4.5 but 4 < int(4.5)==4 differs).
@@ -859,21 +878,34 @@ class KVCacheManager:
 
         num_attn_groups = (num_attn + group_size - 1) // group_size
         num_mamba_groups = (num_mamba + group_size - 1) // group_size
+        num_indexer_groups = (num_indexer + group_size - 1) // group_size
+        indexer_page = (
+            indexer_page_size_bytes(indexer_caches[0], block_size)
+            if indexer_caches
+            else 0
+        )
+        # Bytes per block of every block-table-indexed layer in one region.
+        attn_region_page_size_bytes = (
+            num_attn_groups * attn_page_size_bytes
+            + num_indexer_groups * indexer_page
+        )
 
         uniform_page_size_bytes = (
-            num_attn_groups * attn_page_size_bytes
-            + num_mamba_groups * unpadded_mamba_page_size
+            attn_region_page_size_bytes + num_mamba_groups * unpadded_mamba_page_size
         )
 
         logger.info(
             "Hybrid KV cache: padding every layer spec to %d bytes "
             "(num_attn_groups=%d × attn_page=%d + "
+            "num_indexer_groups=%d × indexer_page=%d + "
             "num_mamba_groups=%d × mamba_unpadded=%d). This makes vLLM's "
             "num_blocks match per-layer TPU allocation when mamba layers "
             "cannot be truly shared.",
             uniform_page_size_bytes,
             num_attn_groups,
             attn_page_size_bytes,
+            num_indexer_groups,
+            indexer_page,
             num_mamba_groups,
             unpadded_mamba_page_size,
         )
@@ -889,9 +921,8 @@ class KVCacheManager:
         # `num_gpu_blocks_override` to the (larger) attention block count and
         # sets `_mamba_num_blocks`.
         self._maybe_set_compact_mamba_num_blocks_override(
-            attn_page_size_bytes,
+            attn_region_page_size_bytes,
             int(unpadded_mamba_page_size),
-            num_attn_groups,
             num_mamba_groups,
             group_size,
         )
@@ -933,9 +964,8 @@ class KVCacheManager:
 
     def _maybe_set_compact_mamba_num_blocks_override(
         self,
-        attn_page_size_bytes: int,
+        attn_region_page_size_bytes: int,
         unpadded_mamba_page_size_bytes: int,
-        num_attn_groups: int,
         num_mamba_groups: int,
         group_size: int,
     ) -> None:
@@ -960,11 +990,13 @@ class KVCacheManager:
         Sizing math
         -----------
         vLLM allocates `group_size` layer regions, each shared across
-        `num_attn_groups` attention layers + `num_mamba_groups` mamba layers.
-        With per-tensor budget `B = avail / group_size` and
-        `N_mamba = max_num_reqs + 1`,
+        `num_attn_groups` attention layers, `num_indexer_groups` DSA indexer
+        K caches and `num_mamba_groups` mamba layers. With per-tensor budget
+        `B = avail / group_size` and `N_mamba = max_num_reqs + 1`,
             N_attn = floor((B - num_mamba_groups × N_mamba × mamba_unpadded)
-                            / (num_attn_groups × attn_page)).
+                            / attn_region_page),
+        where `attn_region_page = num_attn_groups × attn_page +
+        num_indexer_groups × indexer_page`.
 
         We do NOT round to a sharding divisor: our single-process
         TP layout does not shard the mamba/attention block (leading) dim — TP
@@ -972,11 +1004,11 @@ class KVCacheManager:
         count is valid.
 
         Args:
-            attn_page_size_bytes: TPU-actual bytes per block per attention
-                layer (accounts for dtype packing like fp8).
+            attn_region_page_size_bytes: TPU-actual bytes per block of the
+                attention layers and indexer K caches backed by each
+                KVCacheTensor (accounts for dtype packing like fp8).
             unpadded_mamba_page_size_bytes: bytes per slot per mamba layer
                 (`prod(shape) × dtype_size`, no padding).
-            num_attn_groups: # attention layers backed by each KVCacheTensor.
             num_mamba_groups: # mamba layers backed by each KVCacheTensor.
             group_size: # layer regions vLLM allocates (= layers per
                 kv-cache group); the same value passed to
@@ -1027,9 +1059,7 @@ class KVCacheManager:
                 f"`gpu_memory_utilization` or lower `max_num_seqs`."
             )
 
-        attn_num_blocks = attn_per_tensor_avail // (
-            num_attn_groups * attn_page_size_bytes
-        )
+        attn_num_blocks = attn_per_tensor_avail // attn_region_page_size_bytes
         if attn_num_blocks <= 0:
             raise ValueError(
                 f"Compact-mamba KV sizing does not fit: no attention blocks "
@@ -1041,11 +1071,9 @@ class KVCacheManager:
         cache_config.num_gpu_blocks_override = int(attn_num_blocks)
         self.runner._mamba_num_blocks = int(mamba_num_blocks)
 
-        # Total HBM = group_size regions, each holding num_attn_groups
-        # attention blocks + num_mamba_groups mamba slots.
-        attn_bytes = (
-            group_size * num_attn_groups * attn_num_blocks * attn_page_size_bytes
-        )
+        # Total HBM = group_size regions, each holding attention and indexer
+        # blocks + num_mamba_groups mamba slots.
+        attn_bytes = group_size * attn_num_blocks * attn_region_page_size_bytes
         mamba_bytes = (
             group_size
             * num_mamba_groups
