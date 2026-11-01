@@ -71,7 +71,6 @@ def inner_kernel(
     window_vmem,
     kv_slot_mapping_ref,
     is_first_mask_ref,
-    is_first_mask_rope_ref,
     *,
     cfgs: config.Configs,
 ):
@@ -84,7 +83,6 @@ def inner_kernel(
         window_vmem=window_vmem,
         kv_slot_mapping_ref=kv_slot_mapping_ref,
         is_first_mask_ref=is_first_mask_ref,
-        is_first_mask_rope_ref=is_first_mask_rope_ref,
         cfgs=cfgs,
     )
 
@@ -132,7 +130,6 @@ def compress_tile(
     window_vmem,
     kv_slot_mapping_ref,
     is_first_mask_ref,
-    is_first_mask_rope_ref,
     global_idx,
     cfgs: config.Configs,
 ):
@@ -241,20 +238,13 @@ def compress_tile(
             # `csa_cache_layout`); rope_out_vmem holds each row-writer's row.
             words = compute.rope_words_tiled(rope_ropped, cfgs.dims.rope_head_dim)
             rope_lane = config.LANE - cfgs.dims.rope_head_dim
-            kv_slots = []
-            for i in range(tile_n):
-                kv_slots.append(kv_slot_mapping_ref[global_idx + i])
-            kv_slots = jnp.stack(kv_slots)
-            for n in range(tile_n):
-                is_first = is_first_mask_rope_ref[global_idx + n]
-
-                @pl.when(is_first)
-                def _merge_rope():
-                    row = pltpu.bitcast(rope_out_vmem[n], jnp.int32)  # (1, 128)
-                    rope_out_vmem[n] = pltpu.bitcast(
-                        compute.merge_rope_row(row, kv_slots, words, rope_lane, n),
-                        jnp.uint8,
-                    )
+            kv_slots = [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)]
+            # Only the rows of is_first_mask_rope tokens are written back.
+            rows = pltpu.bitcast(rope_out_vmem[...], jnp.int32)  # (tile_n, 1, 128)
+            rope_out_vmem[...] = pltpu.bitcast(
+                compute.merge_rope_rows(rows, kv_slots, words, rope_lane),
+                jnp.uint8,
+            )
 
     else:
         # hca: bitcast bf16 -> uint8 and match the output block shape.
@@ -316,7 +306,6 @@ def kernel_fn(
                 window_scratch_ref,
                 kv_slot_mapping_ref,
                 is_first_mask_ref,
-                is_first_mask_rope_ref,
             ),
             allocations=allocations,
         )

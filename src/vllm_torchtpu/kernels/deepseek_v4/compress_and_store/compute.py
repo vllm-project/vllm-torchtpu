@@ -225,33 +225,39 @@ def rope_words_tiled(rope_slot_ropped, rope_head_dim):
     return bits | (pltpu.roll(bits, bits.shape[-1] - half, 2) << 16)
 
 
-def merge_rope_row(
-    row,  # (1, 128) int32, the RoPE row as read from HBM
-    kv_slots,  # (tile_n,) int, token index of every token in the tile
+def merge_rope_rows(
+    rows,  # (tile_n, 1, 128) int32, each token's RoPE row as read from HBM
+    kv_slots,  # tile_n scalar kv slots, one per token of the tile
     words,  # rope_words_tiled(...)
     rope_lane,  # int, lane of RoPE word 0 in `words`
-    n,  # int, the token whose row this is
 ):
-    """Writes every tile token whose RoPE lands in token n's row into it.
+    """Writes every tile token's RoPE words into each tile row that holds it.
 
     Token ``j`` of a row owns words ``[32 j, 32 j + 32)`` (see
-    `csa_cache_layout`), so one rotation puts a token's words in its window.
+    `csa_cache_layout`), so one rotation puts a token's words in its window;
+    a later token of the tile wins. Rows of invalid slots come back merged
+    with nothing.
     """
     per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
     width = csa_cache_layout.ROPE_WORDS
-    lanes = row.shape[-1]
-    window = jax.lax.broadcasted_iota(jnp.int32, row.shape, 1) // width
-    curr_slot = kv_slots[n]
-    curr_row = curr_slot // per_row
+    lanes = rows.shape[-1]
+    window = jax.lax.broadcasted_iota(jnp.int32, rows.shape[1:], 1) // width
+    row_ids = [jnp.where(slot >= 0, slot // per_row, -1) for slot in kv_slots]
 
-    for i in range(kv_slots.shape[0]):
-        slot_i = kv_slots[i]
-        hit = (slot_i >= 0) & (curr_slot >= 0) & (slot_i // per_row == curr_row)
-        pos_i = slot_i % per_row
-        for j in range(per_row):
-            placed = pltpu.roll(words[i], (j * width - rope_lane) % lanes, 1)
-            row = jnp.where(hit & (pos_i == j) & (window == j), placed, row)
-    return row
+    placed, in_window = [], []
+    for i, slot in enumerate(kv_slots):
+        pos = slot % per_row
+        placed.append(pltpu.roll(words[i], (pos * width - rope_lane) % lanes, 1))
+        in_window.append(window == pos)
+
+    merged = []
+    for n in range(len(kv_slots)):
+        row = rows[n]
+        for i, slot in enumerate(kv_slots):
+            hit = (slot >= 0) & (row_ids[i] == row_ids[n])
+            row = jnp.where(hit & in_window[i], placed[i], row)
+        merged.append(row)
+    return jnp.stack(merged)
 
 
 def merge_slot_updates(
