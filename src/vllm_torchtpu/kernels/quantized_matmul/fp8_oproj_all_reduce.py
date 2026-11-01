@@ -46,15 +46,19 @@ MESH = pl.DeviceIdType.MESH
 COLLECTIVE_ID = 5
 LANES = 128
 MAX_M = 16
+# The largest block any caller may allow (VMEM: the 6 MB weight ring plus 16 receive
+# slots and the output at 64 rows fit the scoped limit).
+LIMIT_M = 64
 # (k, n) -> (tile, nbuf): fp8_skinny's measured o_proj ring ("n", 2048, 3).
 TUNED = {(1024, 6144): (2048, 3)}
 
 
-def supports(m: int, k: int, n: int, num_cores: int) -> bool:
+def supports(m: int, k: int, n: int, num_cores: int, max_m: int = MAX_M) -> bool:
     """Whether a [m, k] x [k, n] row-parallel block over num_cores ranks takes the
-    kernel: a measured (k, n), m <= 16, and owner chunks of whole lane groups."""
+    kernel: a measured (k, n), m <= max_m (16 unless the caller allows up to 64),
+    and owner chunks of whole lane groups."""
     return (
-        m <= MAX_M
+        m <= min(max_m, LIMIT_M)
         and (k, n) in TUNED
         and num_cores >= 2
         and n % num_cores == 0
@@ -75,24 +79,7 @@ def owner_waves(num_cores: int, n: int, tile: int) -> list[list[int]]:
 def _kernel(
     idx_ref,
     rank_ref,
-    x_ref,
-    ws_hbm,
-    w_hbm,
-    o_ref,
-    xq_ref,
-    xs_ref,
-    wbuf,
-    wsem,
-    ws_vmem,
-    ws_sem,
-    recv,
-    red,
-    rs_send,
-    rs_recv,
-    ag_send,
-    ag_recv,
-    loc,
-    *,
+    *refs,
     n,
     axis,
     t,
@@ -100,11 +87,22 @@ def _kernel(
     nbuf,
     q_dtype,
     waves,
+    uv_heads,
 ):
+    if uv_heads:
+        (x_ref, wuv_hbm, ws_hbm, w_hbm, o_ref, xq_ref, xs_ref, wbuf, wsem, ws_vmem,
+         ws_sem, recv, red, rs_send, rs_recv, ag_send, ag_recv, loc, wuv_vmem,
+         wuv_sem, xv_ref) = refs  # fmt: skip
+        wuv_copy = pltpu.make_async_copy(wuv_hbm, wuv_vmem, wuv_sem)
+        wuv_copy.start()
+    else:
+        (x_ref, ws_hbm, w_hbm, o_ref, xq_ref, xs_ref, wbuf, wsem, ws_vmem, ws_sem,
+         recv, red, rs_send, rs_recv, ag_send, ag_recv, loc) = refs  # fmt: skip
     s = idx_ref[0]
     me = rank_ref[0]
     own = o_ref.shape[1] // n
     bsem = pltpu.get_barrier_semaphore()
+    dn = (((1,), (0,)), ((), ()))
 
     ws_copy = pltpu.make_async_copy(ws_hbm, ws_vmem, ws_sem)
     ws_copy.start()
@@ -121,9 +119,27 @@ def _kernel(
             bsem, 1, device_id={axis: jnp.int32(j)}, device_id_type=MESH
         )
 
+    if uv_heads:
+        # The value up-projection of each head, as the bmm it replaces: the
+        # latent in its own dtype times W_UV, f32 accumulation, rounded to the
+        # activation dtype.
+        wuv_copy.wait()
+        c = x_ref.shape[1] // uv_heads
+        v = wuv_vmem.shape[2]
+        for h in range(uv_heads):
+            y_h = jax.lax.dot_general(
+                x_ref[:, h * c : (h + 1) * c],
+                wuv_vmem[h].astype(x_ref.dtype),
+                dn,
+                preferred_element_type=jnp.float32,
+            )
+            xv_ref[:, h * v : (h + 1) * v] = y_h.astype(xv_ref.dtype)
+        x = xv_ref[...]
+    else:
+        x = x_ref[...]
+
     # Activation quant: fp8_skinny._kernel's formula (bit-identical x_q and scale).
     q_max = float(jnp.finfo(q_dtype).max)
-    x = x_ref[...]
     scale = jnp.max(jnp.abs(x), axis=1, keepdims=True).astype(
         jnp.float32
     ) * jnp.float32(1.0 / q_max)
@@ -154,7 +170,6 @@ def _kernel(
             pltpu.make_async_copy(chunk(j), recv.at[j], loc.at[0]).start()
 
     wave_of = owner_waves(n, o_ref.shape[1], t) if waves else None
-    dn = (((1,), (0,)), ((), ()))
     for j in range(n_tiles):
         copy(j).wait()
         y = jax.lax.dot_general(
@@ -207,7 +222,10 @@ def _kernel(
 
 
 @functools.cache
-def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
+def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves, uv=None):
+    """`uv` = (heads, latent width, latent dtype, W_UV dtype): the kernel takes the
+    latent [m, heads * latent width] and W_UV [heads, latent width, k / heads]
+    and projects it first (x_dtype is then the activation dtype)."""
     t, nbuf = TUNED[(k, n_out)]
     n_tiles = n_out // t
     nbuf = max(1, min(nbuf, n_tiles))
@@ -227,6 +245,18 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
         pltpu.SemaphoreType.DMA,  # all-gather receive
         pltpu.SemaphoreType.DMA((2,)),  # local copies
     ]
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    in_specs = [vmem, hbm, hbm]
+    heads = 0
+    if uv is not None:
+        heads, latent, _, wuv_dtype = uv
+        scratch += [
+            pltpu.VMEM((heads, latent, k // heads), wuv_dtype),  # W_UV
+            pltpu.SemaphoreType.DMA,
+            pltpu.VMEM((m, k), x_dtype),  # the projected values
+        ]
+        in_specs = [vmem, hbm, hbm, hbm]
     kern = functools.partial(
         _kernel,
         n=num_cores,
@@ -236,15 +266,11 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
         nbuf=nbuf,
         q_dtype=w_dtype,
         waves=waves,
+        uv_heads=heads,
     )
-    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=2,
-        in_specs=[
-            vmem,
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-        ],
+        in_specs=in_specs,
         out_specs=vmem,
         scratch_shapes=scratch,
     )
@@ -253,7 +279,10 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
         out_shape=jax.ShapeDtypeStruct((m, n_out), x_dtype),
         grid_spec=grid_spec,
         compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
-        name=f"fp8_oproj_all_reduce{'_w' if waves else ''}_m{m}_k{k}_n{n_out}",
+        name=(
+            f"fp8_{'uv_' if uv else ''}oproj_all_reduce{'_w' if waves else ''}"
+            f"_m{m}_k{k}_n{n_out}"
+        ),
     )
 
 
@@ -270,17 +299,17 @@ def _call_constrained(call, idx, rank, x, w_s2, w_stack):
 
 
 def fp8_matmul_all_reduce_stacked(
-    x, w_stack, idx, w_s, rank, *, num_cores, axis, waves=False
+    x, w_stack, idx, w_s, rank, *, num_cores, axis, waves=False, max_m=MAX_M
 ):
     """sum over the num_cores ranks of mesh axis `axis` of
     fp8_skinny(x, w_stack[idx[0]], w_s), inside a shard_map over that axis.
 
-    x bf16 [m <= 16, k]; w_stack fp8_e4m3fn [L, k, n] (K-major); idx, rank int32 [1]
+    x bf16 [m <= max_m, k]; w_stack fp8_e4m3fn [L, k, n] (K-major); idx, rank int32 [1]
     (rank = this core's index on the axis, as data); w_s f32 [n] -> bf16 [m, n].
     """
     m, k = x.shape
     n_stack, _, n_out = w_stack.shape
-    if not supports(m, k, n_out, num_cores):
+    if not supports(m, k, n_out, num_cores, max_m):
         raise ValueError(
             f"[{m}, {k}] x [{k}, {n_out}] over {num_cores} ranks: unsupported"
         )
@@ -291,7 +320,9 @@ def fp8_matmul_all_reduce_stacked(
     )
 
 
-def fp8_matmul_all_reduce(x, w_q, w_s, rank, *, num_cores, axis, waves=False):
+def fp8_matmul_all_reduce(
+    x, w_q, w_s, rank, *, num_cores, axis, waves=False, max_m=MAX_M
+):
     """`fp8_matmul_all_reduce_stacked` on one [k, n] weight."""
     return fp8_matmul_all_reduce_stacked(
         x,
@@ -302,4 +333,63 @@ def fp8_matmul_all_reduce(x, w_q, w_s, rank, *, num_cores, axis, waves=False):
         num_cores=num_cores,
         axis=axis,
         waves=waves,
+        max_m=max_m,
+    )
+
+
+def supports_uv(m, heads, latent, k, n, num_cores, max_m=MAX_M) -> bool:
+    """Whether a latent [m, heads * latent] through W_UV [heads, latent, k / heads]
+    into a [k, n] row-parallel block takes the kernel: `supports` for the block,
+    and lane-aligned head slices on both sides."""
+    return (
+        supports(m, k, n, num_cores, max_m)
+        and heads > 0
+        and k % heads == 0
+        and latent % LANES == 0
+        and (k // heads) % LANES == 0
+    )
+
+
+@functools.partial(jax.jit, static_argnums=(0,))
+def _call_uv_constrained(call, idx, rank, x_lat, w_uv, w_s2, w_stack):
+    return call(
+        idx,
+        rank,
+        x_lat,
+        pltpu.with_memory_space_constraint(w_uv, pltpu.HBM),
+        pltpu.with_memory_space_constraint(w_s2, pltpu.HBM),
+        pltpu.with_memory_space_constraint(w_stack, pltpu.HBM),
+    )
+
+
+def fp8_uv_matmul_all_reduce(
+    x_lat, w_uv, w_q, w_s, rank, *, num_cores, axis, out_dtype, waves=False,
+    max_m=MAX_M,
+):  # fmt: skip
+    """The sum over the num_cores ranks of mesh axis `axis` of fp8_skinny(v, w_q, w_s)
+    with v = the per-head bmm of x_lat [m, heads * latent] and w_uv [heads, latent,
+    k / heads] rounded to out_dtype, inside a shard_map over that axis: the value
+    up-projection, the output projection and its all-reduce in one kernel."""
+    m, width = x_lat.shape
+    heads, latent, v = w_uv.shape
+    k, n_out = w_q.shape
+    if width != heads * latent or heads * v != k:
+        raise ValueError(f"latent {x_lat.shape}, W_UV {w_uv.shape}, w {w_q.shape}")
+    if not supports_uv(m, heads, latent, k, n_out, num_cores, max_m):
+        raise ValueError(
+            f"[{m}, {width}] -> [{k}, {n_out}] over {num_cores} ranks: unsupported"
+        )
+    uv = (heads, latent, jnp.dtype(x_lat.dtype).name, w_uv.dtype)
+    call = _build(
+        m, k, n_out, 1, w_q.dtype, jnp.dtype(out_dtype), num_cores, axis, waves, uv
+    )
+    w_s2 = w_s.reshape(1, n_out).astype(jnp.float32)
+    return _call_uv_constrained(
+        call,
+        jnp.zeros((1,), jnp.int32),
+        rank.astype(jnp.int32),
+        x_lat,
+        w_uv,
+        w_s2,
+        w_q[None],
     )

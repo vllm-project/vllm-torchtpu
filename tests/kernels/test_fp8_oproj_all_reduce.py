@@ -32,6 +32,21 @@ def test_supports(m, kk, n, cores, ok):
     assert k.supports(m, kk, n, cores) is ok
 
 
+@pytest.mark.parametrize(
+    "m,max_m,ok",
+    [
+        (32, 32, True),
+        (33, 32, False),
+        (48, 64, True),
+        (64, 64, True),
+        (65, 64, False),
+        (128, 128, False),  # above the kernel's VMEM limit
+    ],
+)
+def test_supports_raised_row_cap(m, max_m, ok):
+    assert k.supports(m, 1024, 6144, 16, max_m) is ok
+
+
 def test_owner_waves_cover_every_owner_once_after_its_last_column():
     waves = k.owner_waves(16, 6144, 2048)
     assert waves == [list(range(0, 5)), list(range(5, 10)), list(range(10, 16))]

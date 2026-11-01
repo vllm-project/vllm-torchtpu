@@ -1964,6 +1964,7 @@ class VllmTPUMLAAttention(MLAAttention):
             output=output,
             topk_indices=kwargs.get("topk_indices"),
             q_dcp_replicated=kwargs.get("q_dcp_replicated"),
+            skip_uv=kwargs.get("skip_uv", False),
         )
 
 
@@ -2408,6 +2409,17 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 local_view = q_proj_layer._local_view
                 q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
+        uv_in_oproj = (
+            envs.TPU_FUSED_UV_OPROJ
+            and token_split is None
+            and prefill_group is None
+            and output_gate is None
+            and getattr(self, "g_proj", None) is None
+            and getattr(self.mla_attn, "W_O_dcp_qrep", None) is None
+            and small_all_reduce_op.uv_oproj_fits(
+                q.shape[0], self.mla_attn, self.o_proj
+            )
+        )
         attn_out = self.mla_attn(
             (q_nope, q_pe),
             kv_c_normed,
@@ -2415,7 +2427,12 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
             q_dcp_replicated=q_dcp_replicated,
+            skip_uv=uv_in_oproj,
         )
+        if uv_in_oproj:
+            return small_all_reduce_op.uv_row_parallel(
+                attn_out, self.mla_attn, self.o_proj
+            )
 
         if output_gate is not None:
             attn_out *= output_gate.sigmoid()
