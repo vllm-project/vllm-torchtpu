@@ -299,6 +299,35 @@ def test_register_matching_signatures_donations_and_names(monkeypatch):
     assert len(qa) == 4 and len(registered) == 9
 
 
+def test_csa2_bridges_have_schema_compatible_signatures(monkeypatch):
+    # Torch infers each op schema from the bridge signature: varargs are
+    # rejected at model construction, and every parameter needs a spec.
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.models.vllm import vllm_model_wrapper_context as context
+
+    registered = {}
+
+    def register(name, fn, **kwargs):
+        params = list(inspect.signature(fn).parameters.values())
+        assert all(p.kind is p.POSITIONAL_OR_KEYWORD for p in params), name
+        assert len(params) == len(kwargs["input_partition_specs"]), name
+        registered[name] = kwargs["donate_argnums"]
+        return SimpleNamespace(register_fake=lambda fake: None)
+
+    monkeypatch.setattr(csa2_adapter, "_ops", {})
+    monkeypatch.setattr(pallas, "jax_op", register)
+    monkeypatch.setattr(context, "get_pallas_op_mesh", lambda: None)
+    monkeypatch.setattr(
+        context, "get_vllm_model_wrapper_context", lambda: SimpleNamespace(mesh=None)
+    )
+    csa2_adapter.initialize_csa2_ops()
+    prefix = "pallas::dsv41v2_csa2_"
+    assert registered[prefix + "publish_swa_planned"] == (0,)
+    assert registered[prefix + "publish_swa_planned_banked"] == (0, 1)
+    assert registered[prefix + "plan_swa_banked"] == ()
+
+
 @pytest.mark.parametrize("banks", [1, 2])
 def test_publication_preserves_banks_and_rejects_bad_shapes(banks):
     from vllm_torchtpu.kernels.deepseek_v41.csa2 import cache as kernels
