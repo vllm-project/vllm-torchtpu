@@ -105,7 +105,7 @@ def _topk_body(
     """Selects each row's top-k on its subcore (group).
 
     When ``streamed``, ``scores_hbm`` is i32[b * slice_len] and ``lengths_hbm`` is
-    i32[padded_b]: each row is fetched by hand up to its length.
+    i32[padded_b]: wave 0 is fetched whole, later rows by hand up to their length.
     """
     dcp_merge = local_idxs_hbm is not None
     num_subcores = 16
@@ -574,11 +574,13 @@ def _topk_body(
     cores_per_chip = num_sc_cores * num_subcores
     buf_count = _buffer_count(num_waves, slice_len)
     if streamed:
-        # Each row's live words are DMA'd straight from HBM, one wave ahead, so a
-        # row only moves as many words as its length lets the step read.
+        # Rows after wave 0 have only their live words DMA'd straight from HBM,
+        # one wave ahead, so a row moves as many words as the step reads.
         assert buf_count == 2 or num_waves == 1, "prefetch needs a second slot"
-        pltpu.sync_copy(
-            lengths_hbm, lengths_vmem.at[pl.ds(0, num_waves * cores_per_chip)]
+        lengths_copy = pltpu.make_async_copy(
+            lengths_hbm,
+            lengths_vmem.at[pl.ds(0, num_waves * cores_per_chip)],
+            fetch_sems.at[2],
         )
 
         def row_length(w):
@@ -587,12 +589,21 @@ def _topk_body(
         def score_slot(slot):
             return pl.ds(pl.multiple_of(slot * slice_len, LANES), slice_len)
 
-        def row_fetch(w, slot):
-            row = wave_row(w)
-            _, i_hi = live_words(row, row_length(w))
-            words = pl.multiple_of(_cdiv_dyn(i_hi) * LANES, LANES)
+        def first_wave_words():
+            # Wave 0 is fetched whole, so its DMA is issued with the lengths copy
+            # instead of a round trip after it.
+            return jnp.where(wave_row(0) < b, jnp.int32(slice_len), 0)
+
+        def live_fetch_words(w):
+            _, i_hi = live_words(wave_row(w), row_length(w))
+            return _cdiv_dyn(i_hi) * LANES
+
+        def row_fetch(w, slot, words):
+            words = pl.multiple_of(words, LANES)
             copy = pltpu.make_async_copy(
-                scores_hbm.at[pl.ds(pl.multiple_of(row * slice_len, LANES), words)],
+                scores_hbm.at[
+                    pl.ds(pl.multiple_of(wave_row(w) * slice_len, LANES), words)
+                ],
                 score_slots_vmem.at[score_slot(slot)].at[pl.ds(0, words)],
                 fetch_sems.at[slot],
             )
@@ -601,17 +612,22 @@ def _topk_body(
         def wave_slot(w):
             return jnp.bitwise_and(w, buf_count - 1)
 
-        def start_fetch(w):
-            has_words, copy = row_fetch(w, wave_slot(w))
+        def start_fetch(w, words):
+            has_words, copy = row_fetch(w, wave_slot(w), words)
             pl.when(has_words)(copy.start)
 
-        start_fetch(jnp.int32(0))
+        lengths_copy.start()
+        start_fetch(jnp.int32(0), first_wave_words())
+        lengths_copy.wait()
 
         def pipeline_step_streamed(*out_vmems):
             w = pl.program_id(0)
             slot = wave_slot(w)
-            pl.when(w + 1 < num_waves)(lambda: start_fetch(w + 1))
-            has_words, copy = row_fetch(w, slot)
+            pl.when(w + 1 < num_waves)(
+                lambda: start_fetch(w + 1, live_fetch_words(w + 1))
+            )
+            words = jnp.where(w == 0, first_wave_words(), live_fetch_words(w))
+            has_words, copy = row_fetch(w, slot, words)
             pl.when(has_words)(copy.wait)
             _run_step(score_slots_vmem.at[score_slot(slot)], row_length(w), *out_vmems)
 
@@ -816,7 +832,8 @@ def _sc_topk_direct(
         pltpu.VMEM((_buffer_count(num_waves, slice_len) * slice_len,), jnp.int32)
         if streamed
         else None,  # score_slots_vmem
-        pltpu.SemaphoreType.DMA((2,)) if streamed else None,  # fetch_sems
+        # One semaphore per score slot, and one for the lengths copy.
+        pltpu.SemaphoreType.DMA((3,)) if streamed else None,  # fetch_sems
     )
 
     body_fn = functools.partial(
