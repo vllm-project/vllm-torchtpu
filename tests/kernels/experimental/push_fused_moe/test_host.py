@@ -214,3 +214,42 @@ def test_to_slots_splits_rows_over_replicas():
     got = np.asarray(_to_slots(jnp.asarray(ids), jnp.asarray(table), jnp.int32(4)))
     # Row r takes replica (4 + r) mod (copies of its expert).
     np.testing.assert_array_equal(got, [[3, 5], [7, 0], [0, 3]])
+
+
+@pytest.mark.parametrize(
+    "t_local,e_total,topk",
+    [
+        pytest.param(64, 32, 4, id="t64_e32_k4"),
+        pytest.param(288, 384, 6, id="t288_e384_k6"),
+        pytest.param(513, 416, 6, id="t513_e416_k6"),
+        pytest.param(1024, 384, 8, id="t1024_e384_k8"),
+        pytest.param(2048, 416, 6, id="t2048_e416_k6"),
+    ],
+)
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+def test_local_sort_paths_agree(monkeypatch, t_local, e_total, topk, skew):
+    """The prefill argsort path and the decode count path give the same
+    q_sorted (every row, padding included) and seg_start."""
+    rng = np.random.default_rng(t_local + e_total + topk + skew)
+    if skew:
+        hot = rng.choice(e_total, size=max(topk, e_total // 12), replace=False)
+        mine = np.stack(
+            [rng.choice(hot, size=topk, replace=False) for _ in range(t_local)]
+        )
+    else:
+        mine = np.stack([rng.permutation(e_total)[:topk] for _ in range(t_local)])
+    mine[rng.random(t_local) < 0.05] = e_total  # rows that route nowhere
+    counts = np.bincount(mine.reshape(-1), minlength=e_total + 1)[:e_total]
+    rows = np.arange(t_local, dtype=np.float32)[:, None, None] * np.ones((1, 1, 128))
+    args = (jnp.asarray(mine.reshape(-1)), jnp.asarray(counts), jnp.asarray(rows))
+    results = []
+    for threshold in (t_local, t_local - 1):  # count path, then argsort path
+        monkeypatch.setattr(push_host, "ARGSORT_MIN_TOKENS", threshold)
+        results.append(
+            push_host.local_sort_activations(*args, e_total=e_total, topk=topk)
+        )
+    (q_count, s_count), (q_sort, s_sort) = results
+    np.testing.assert_array_equal(np.asarray(q_sort), np.asarray(q_count))
+    np.testing.assert_array_equal(np.asarray(s_sort), np.asarray(s_count))
+    want = [t for e in range(e_total) for t in range(t_local) if e in mine[t]]
+    np.testing.assert_array_equal(np.asarray(q_sort)[: len(want), 0, 0], want)

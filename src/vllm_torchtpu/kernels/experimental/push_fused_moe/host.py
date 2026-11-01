@@ -63,24 +63,16 @@ def _take_small(table, idx):
     return out.astype(jnp.int32).reshape(idx.shape)
 
 
-def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
-    """Sort this shard's rows `q_l` by global expert, tokens ascending within.
+# Above this many local tokens (prefill), local_sort_activations finds each
+# sorted row's token with a stable argsort instead of the one-hot count: the
+# count's [t_local * topk, t_local] matrix and its HIGHEST-precision matmul
+# grow quadratically (~128 MiB at t_local 2048, topk 8), the sort does not.
+ARGSORT_MIN_TOKENS = 512
 
-    `my_pairs` [t_local * topk] are this shard's selections (e_total = routes
-    nowhere) and `my_counts` [e_total] their per-expert counts. Depends only
-    on local routing, so it runs on the TensorCore while the routing
-    exchange is in flight. Returns `(q_sorted, seg_start)`: row j of q_sorted
-    is the j-th routed pair in (expert, token) order and seg_start [e_total]
-    the first row of each expert's run.
-    """
-    n = my_pairs.shape[0]
-    t_local = n // topk
-    my_pairs = my_pairs.astype(jnp.int32)
-    my_counts = my_counts.astype(jnp.int32)
-    valid = my_pairs < e_total
-    pid = jnp.where(valid, my_pairs, e_total)
-    seg_end = jnp.cumsum(my_counts)
-    seg_start_local = seg_end - my_counts
+
+def _sorted_tokens_by_count(pid, seg_start_local, seg_end, *, e_total, t_local, topk):
+    """Token of each expert-sorted row via per-expert running counts (decode)."""
+    n = pid.shape[0]
     sel = jnp.any(
         pid.reshape(t_local, topk)[:, :, None] == jnp.arange(e_total)[None, None, :],
         axis=1,
@@ -99,9 +91,46 @@ def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
     col = jnp.dot(
         onehot, C.T.astype(jnp.float32), precision=lax.Precision.HIGHEST
     ).astype(jnp.int32)  # [n, t_local] = C[:, ge_j]
-    tok_j = jnp.minimum(
+    return jnp.minimum(
         jnp.sum(col <= m_j[:, None], axis=1).astype(jnp.int32), t_local - 1
     )
+
+
+def _sorted_tokens_by_argsort(pid, seg_end, *, t_local, topk):
+    """The same tokens via a stable argsort of the flat (token-major) pairs:
+    sorting by expert keeps tokens ascending within each expert. Rows past
+    the last routed pair take token t_local - 1, as the count path gives."""
+    n = pid.shape[0]
+    order = jnp.argsort(pid, stable=True).astype(jnp.int32)
+    jj = jnp.arange(n, dtype=jnp.int32)
+    return jnp.where(jj < seg_end[-1], order // topk, jnp.int32(t_local - 1))
+
+
+def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
+    """Sort this shard's rows `q_l` by global expert, tokens ascending within.
+
+    `my_pairs` [t_local * topk] are this shard's selections (e_total = routes
+    nowhere) and `my_counts` [e_total] their per-expert counts. Depends only
+    on local routing, so it runs on the TensorCore while the routing
+    exchange is in flight. Returns `(q_sorted, seg_start)`: row j of q_sorted
+    is the j-th routed pair in (expert, token) order and seg_start [e_total]
+    the first row of each expert's run. Decode sizes find each row's token
+    by counting; above ARGSORT_MIN_TOKENS a stable argsort (same result).
+    """
+    n = my_pairs.shape[0]
+    t_local = n // topk
+    my_pairs = my_pairs.astype(jnp.int32)
+    my_counts = my_counts.astype(jnp.int32)
+    valid = my_pairs < e_total
+    pid = jnp.where(valid, my_pairs, e_total)
+    seg_end = jnp.cumsum(my_counts)
+    seg_start_local = seg_end - my_counts
+    if t_local > ARGSORT_MIN_TOKENS:
+        tok_j = _sorted_tokens_by_argsort(pid, seg_end, t_local=t_local, topk=topk)
+    else:
+        tok_j = _sorted_tokens_by_count(
+            pid, seg_start_local, seg_end, e_total=e_total, t_local=t_local, topk=topk
+        )
     q_sorted = q_l[tok_j]
     return q_sorted, seg_start_local
 
