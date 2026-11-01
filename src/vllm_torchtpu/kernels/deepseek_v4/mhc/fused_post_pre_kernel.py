@@ -66,13 +66,10 @@ def _fused_block(
     sc_ref,
     hb_ref,
     newres_ref,
-    post_out_ref,
-    comb_out_ref,
+    gate_out0_ref,
+    gate_out1_ref,
     layer_ref,
-    logits_ref,
-    logits_t_ref,
-    gates_t_ref,
-    *,
+    *gate_scratch,
     hc_mult,
     hidden_size,
     gemm_precision,
@@ -81,9 +78,11 @@ def _fused_block(
     hc_sinkhorn_eps,
     hc_post_mult_value,
     sinkhorn_repeat,
+    xla_gates,
 ):
     """`_fused_kernel`'s body, given the block's (tb, hidden) bf16 sublayer
-    output `x_bf`."""
+    output `x_bf`. `gate_out0_ref, gate_out1_ref` take post_mix and comb_mix,
+    or with `xla_gates` the raw mixes and sqrsum that XLA's gates read."""
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
 
@@ -130,15 +129,17 @@ def _fused_block(
         lay = lay + pre_mix[:, i : i + 1] * gf[:, i * h : (i + 1) * h]
     layer_ref[...] = lay.astype(jnp.bfloat16)
 
+    if xla_gates:
+        gate_out0_ref[...] = acc
+        gate_out1_ref[...] = sqr
+        return
     utils.post_comb_gates_epilogue(
         scaled,
         sc_ref,
         hb_ref,
-        post_out_ref,
-        comb_out_ref,
-        logits_ref,
-        logits_t_ref,
-        gates_t_ref,
+        gate_out0_ref,
+        gate_out1_ref,
+        *gate_scratch,
         hc_mult=m,
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
@@ -155,6 +156,7 @@ def _fused_block(
         "hc_post_mult_value",
         "sinkhorn_repeat",
         "addend_scale",
+        "xla_gates",
         "token_block_size",
         "gemm_precision",
         "vmem_limit_bytes",
@@ -176,6 +178,7 @@ def fused_post_pre_gates(
     *,
     addend: jax.Array | None = None,
     addend_scale: float = 1.0,
+    xla_gates: bool = False,
     token_block_size: int | None = None,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -200,6 +203,8 @@ def fused_post_pre_gates(
             the sublayer output is `x2d + addend * addend_scale`, rounded
             as that bf16 expression is.
         addend_scale: static; the addend's scale.
+        xla_gates: static; leave the post/comb gates out of the kernel and
+            return the raw mixes and sqrsum in place of post2d and comb2d.
         token_block_size: tokens per grid step; None picks
             ``default_token_block(num_tokens)``. Every block size up to
             MAX_TOKEN_BLOCK fits the VMEM budget at DeepSeek-V4 shapes.
@@ -209,9 +214,10 @@ def fused_post_pre_gates(
 
     Returns:
         new_res2d: (num_tokens, hc_mult * hidden_size), bfloat16.
-        post2d: (num_tokens, hc_mult), float32 — post_mix.
+        post2d: (num_tokens, hc_mult), float32 — post_mix; with
+            `xla_gates`, mixes (num_tokens, hc_mult3) — raw, unscaled.
         comb2d: (num_tokens, hc_mult * hc_mult), float32 — comb_mix,
-            row-major (i, j).
+            row-major (i, j); with `xla_gates`, sqrsum (num_tokens, 1).
         layer2d: (num_tokens, hidden_size), bfloat16.
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
@@ -246,18 +252,28 @@ def fused_post_pre_gates(
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
-    # The last block's gates read every block's logits.
+    if xla_gates:
+        gate_specs = [
+            pl.BlockSpec((tb, hc_mult3), lambda i: (i, 0)),
+            pl.BlockSpec((tb, 1), lambda i: (i, 0)),
+        ]
+        gate_shapes = [
+            jax.ShapeDtypeStruct((padded_tokens, w), jnp.float32) for w in (hc_mult3, 1)
+        ]
+        gate_scratch = []
+    else:
+        gate_specs, gate_shapes, gate_scratch = utils.post_comb_gates_specs(
+            padded_tokens, hc_mult
+        )
+    # In-kernel gates: the last block reads every block's logits.
     compiler_params = pltpu.CompilerParams(
-        dimension_semantics=("arbitrary",),
+        dimension_semantics=("parallel",) if xla_gates else ("arbitrary",),
         vmem_limit_bytes=vmem_limit_bytes,
         disable_bounds_checks=True,
     )
 
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     x_spec = pl.BlockSpec((tb, hidden_size), lambda i: (i, 0))
-    gate_specs, gate_shapes, gate_scratch = utils.post_comb_gates_specs(
-        padded_tokens, hc_mult
-    )
     new_res, post, comb, layer2d = pl.pallas_call(
         functools.partial(
             kernel,
@@ -269,6 +285,7 @@ def fused_post_pre_gates(
             hc_sinkhorn_eps=hc_sinkhorn_eps,
             hc_post_mult_value=hc_post_mult_value,
             sinkhorn_repeat=sinkhorn_repeat,
+            xla_gates=xla_gates,
         ),
         grid=(padded_tokens // tb,),
         in_specs=[
@@ -318,6 +335,7 @@ def mhc_fused_post_pre(
     *,
     addend: jax.Array | None = None,
     addend_scale: float = 1.0,
+    xla_gates: bool = False,
     token_block_size: int | None = None,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -326,7 +344,8 @@ def mhc_fused_post_pre(
     Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur).
 
     With `addend`, the sublayer output is `x + addend * addend_scale`; see
-    `fused_post_pre_gates`.
+    `fused_post_pre_gates`. With `xla_gates`, the post/comb gates run in
+    XLA (``utils.mhc_pre_gates``) after the kernel instead of in its tail.
     """
     assert residual.dtype == jnp.bfloat16
 
@@ -339,7 +358,7 @@ def mhc_fused_post_pre(
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
     addend2d = None if addend is None else addend.reshape(-1, hidden_size)
 
-    new_res2d, post_mix_cur, comb_mix_cur, layer_input_cur = fused_post_pre_gates(
+    new_res2d, gates0, gates1, layer_input_cur = fused_post_pre_gates(
         x2d,
         res2d,
         post2d,
@@ -354,10 +373,27 @@ def mhc_fused_post_pre(
         sinkhorn_repeat,
         addend=addend2d,
         addend_scale=addend_scale,
+        xla_gates=xla_gates,
         token_block_size=token_block_size,
         gemm_precision=gemm_precision,
         vmem_limit_bytes=vmem_limit_bytes,
     )
+    if xla_gates:
+        _, post_mix_cur, comb_mix_cur = utils.mhc_pre_gates(
+            gates0,
+            gates1,
+            hc_mult,
+            hidden_size,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+    else:
+        post_mix_cur, comb_mix_cur = gates0, gates1
 
     return (
         new_res2d.reshape(*outer_shape, hc_mult, hidden_size),

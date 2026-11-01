@@ -219,7 +219,9 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         x = self.attn(positions, x, input_norm=self.attn_norm)
 
-        residual, post_mix, res_mix, x = self.mhc_ops.fused(
+        # The gates' outputs are first read after the MoE, so in XLA they can
+        # run inside its reduce-scatter's wait instead of in the kernel's tail.
+        residual, post_mix, res_mix, x = self.mhc_ops.fused_xla_gates(
             x,
             residual,
             post_mix,

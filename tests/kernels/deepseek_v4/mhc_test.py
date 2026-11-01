@@ -476,6 +476,19 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
             )
             np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
 
+    @parameterized.product(num_tokens=[16, 17, 1030])
+    def test_xla_gates_match_in_kernel_gates(self, num_tokens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        args = _fused_args(np.random.default_rng(15), num_tokens, 4096)
+        fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
+
+        want = fused_fn(*args)
+        got = fused_fn(*args, xla_gates=True)
+
+        for g, w in zip(got, want):
+            np.testing.assert_array_equal(_to_np(g), _to_np(w))
+
 
 # DeepSeek-V4's routed_scaling_factor, the scale the model adds with.
 ADDEND_SCALE = 1.5

@@ -135,8 +135,10 @@ def _mhc_fused_post_pre_jax(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    xla_gates: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """One layer's post and the next layer's pre as a single kernel."""
+    """One layer's post and the next layer's pre as a single kernel; with
+    `xla_gates`, the post/comb gates run in XLA after it."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
         x,
         residual,
@@ -150,6 +152,7 @@ def _mhc_fused_post_pre_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        xla_gates=xla_gates,
     )
 
 
@@ -320,9 +323,14 @@ def _mhc_fused_post_pre_op(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    xla_gates: bool = False,
 ):
-    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    op_name = (
+        "pallas::deepseek_v4_mhc_fused_post_pre_v1"
+        + ("_xg" if xla_gates else "")
+        + _gate_suffix(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
@@ -335,6 +343,7 @@ def _mhc_fused_post_pre_op(
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
+                xla_gates=xla_gates,
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
@@ -425,6 +434,9 @@ class MHCOps(NamedTuple):
         bf16 expression's roundings kept.
     ``post_add(x, addend, residual, post_layer_mix, comb_res_mix)``
         ``post`` of that same sublayer output.
+    ``fused_xla_gates``
+        ``fused`` with the post/comb gates run in XLA after the kernel, for
+        a seam whose gates XLA can schedule inside a collective's wait.
     """
 
     pre: Any
@@ -432,6 +444,7 @@ class MHCOps(NamedTuple):
     post: Any
     fused_add: Any
     post_add: Any
+    fused_xla_gates: Any
 
 
 def get_mhc_ops(
@@ -468,4 +481,12 @@ def get_mhc_ops(
             sinkhorn_repeat,
         ),
         post_add=_mhc_post_add_op(addend_scale),
+        fused_xla_gates=_mhc_fused_post_pre_op(
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            xla_gates=True,
+        ),
     )
