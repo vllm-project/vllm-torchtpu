@@ -13,6 +13,8 @@
 # limitations under the License.
 """DeepSeek V4 Compressor Layer forward pass implementation."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 
@@ -222,6 +224,30 @@ def prepare_boundary_batch(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class CompressorInputs:
+    """One compressor's operands to `compressors_forward`, as
+    `compressor_forward` takes them."""
+
+    wkv_wgate: jax.Array
+    ape: jax.Array
+    norm_weight: jax.Array
+    cos_sin_cache: jax.Array
+    block_table: jax.Array
+    query_start_loc: jax.Array
+    kv_block_table: jax.Array
+    cache: jax.Array
+    rope_cache: jax.Array | None
+    distribution: jax.Array
+    state_block_size: int
+    head_dim: int
+    compress_ratio: int
+    overlap: bool
+    rms_eps: float
+    quant_block: int
+    state_cache: jax.Array | None = None
+
+
 def compressor_forward(
     hidden_states: jax.Array,  # [num_tokens, hidden_size] fp32
     wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
@@ -244,45 +270,111 @@ def compressor_forward(
     state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Projects, saves state, then compresses and stores the boundary records."""
+    (result,) = compressors_forward(
+        hidden_states,
+        positions,
+        (
+            CompressorInputs(
+                wkv_wgate=wkv_wgate,
+                ape=ape,
+                norm_weight=norm_weight,
+                cos_sin_cache=cos_sin_cache,
+                block_table=block_table,
+                query_start_loc=query_start_loc,
+                kv_block_table=kv_block_table,
+                cache=cache,
+                rope_cache=rope_cache,
+                distribution=distribution,
+                state_block_size=state_block_size,
+                head_dim=head_dim,
+                compress_ratio=compress_ratio,
+                overlap=overlap,
+                rms_eps=rms_eps,
+                quant_block=quant_block,
+                state_cache=state_cache,
+            ),
+        ),
+    )
+    return result
+
+
+def compressors_forward(
+    hidden_states: jax.Array,  # [num_tokens, hidden_size]
+    positions: jax.Array,  # [num_tokens] int
+    compressors: tuple[CompressorInputs, ...],
+) -> list[tuple[jax.Array, jax.Array, jax.Array]]:
+    """`compressor_forward` for several compressors of the same tokens.
+
+    One `proj_and_save_states` call projects the hidden states for all of
+    them, in the order given (smallest weight first keeps its exposed first
+    weight copy small).
+    """
+    metadata = []
+    projections = []
+    for c in compressors:
+        token_to_req_indices, slot_mapping_slots, kv_slot_mapping = derive_metadata(
+            positions=positions,
+            block_table=c.block_table,
+            query_start_loc=c.query_start_loc,
+            kv_block_table=c.kv_block_table,
+            cache=c.cache,
+            compress_ratio=c.compress_ratio,
+            state_block_size=c.state_block_size,
+            head_dim=c.head_dim,
+            overlap=c.overlap,
+            cos_sin_cache=c.cos_sin_cache,
+            state_cache=c.state_cache,
+        )
+        metadata.append((token_to_req_indices, kv_slot_mapping))
+        is_real_token = (
+            jnp.arange(positions.shape[0]) < (c.query_start_loc[c.distribution[2]])
+        )
+        projections.append(
+            proj_kernel.StateProjection(
+                wkv_wgate=c.wkv_wgate,
+                ape=c.ape,
+                slot_mapping=jnp.where(is_real_token, slot_mapping_slots, -1),
+                cache=c.cache if c.state_cache is None else c.state_cache,
+            )
+        )
+
+    updated_states = proj_kernel.proj_and_save_states(
+        hidden_states,
+        positions,
+        tuple(projections),
+        compress_ratios=tuple(c.compress_ratio for c in compressors),
+    )
+    return [
+        _compress_and_store(c, updated_state, positions, *meta)
+        for c, updated_state, meta in zip(
+            compressors, updated_states, metadata, strict=True
+        )
+    ]
+
+
+def _compress_and_store(
+    c: CompressorInputs,
+    updated_state: jax.Array,
+    positions: jax.Array,
+    token_to_req_indices: jax.Array,
+    kv_slot_mapping: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compresses and stores the boundary records of ``c``, whose state
+    ``proj_and_save_states`` wrote to ``updated_state``."""
     num_tokens = positions.shape[0]
-    num_reqs = query_start_loc.shape[0] - 1
-    shares_buffer = state_cache is None
-
-    token_to_req_indices, slot_mapping_slots, kv_slot_mapping = derive_metadata(
-        positions=positions,
-        block_table=block_table,
-        query_start_loc=query_start_loc,
-        kv_block_table=kv_block_table,
-        cache=cache,
-        compress_ratio=compress_ratio,
-        state_block_size=state_block_size,
-        head_dim=head_dim,
-        overlap=overlap,
-        cos_sin_cache=cos_sin_cache,
-        state_cache=state_cache,
-    )
-
-    token_index = jnp.arange(num_tokens)
-    is_real_token = token_index < query_start_loc[distribution[2]]
-    slot_mapping_slots = jnp.where(is_real_token, slot_mapping_slots, -1)
-
-    updated_state = proj_kernel.proj_and_save_state(
-        hidden_states=hidden_states,
-        wkv_wgate=wkv_wgate,
-        ape=ape,
-        positions=positions,
-        slot_mapping=slot_mapping_slots,
-        cache=cache if shares_buffer else state_cache,
-        compress_ratio=compress_ratio,
-    )
+    num_reqs = c.query_start_loc.shape[0] - 1
+    shares_buffer = c.state_cache is None
+    cache, state_cache = c.cache, c.state_cache
     if shares_buffer:
         cache = updated_state
     else:
         state_cache = updated_state
 
-    is_decode_token = token_index < query_start_loc[distribution[0]]
+    token_index = jnp.arange(num_tokens)
+    is_real_token = token_index < c.query_start_loc[c.distribution[2]]
+    is_decode_token = token_index < c.query_start_loc[c.distribution[0]]
     is_boundary = (kv_slot_mapping >= 0) & is_real_token
-    mode = config.select_mode(head_dim, overlap)
+    mode = config.select_mode(c.head_dim, c.overlap)
 
     boundary_positions, boundary_req, boundary_kv_slot = prepare_boundary_batch(
         positions=positions,
@@ -290,7 +382,7 @@ def compressor_forward(
         kv_slot_mapping=kv_slot_mapping,
         is_boundary=is_boundary,
         is_decode_token=is_decode_token,
-        compress_ratio=compress_ratio,
+        compress_ratio=c.compress_ratio,
         num_reqs=num_reqs,
         # HCA writes each record whole, so its tokens need no row tiles.
         rope_pack=1 if mode is config.Mode.HCA else config.ROW_TILE,
@@ -299,19 +391,19 @@ def compressor_forward(
     cache, rope_cache = compress_kernel.compress_norm_rope_store(
         cache,
         boundary_positions,
-        block_table,
+        c.block_table,
         boundary_req,
         boundary_kv_slot,
-        norm_weight,
-        block_table_stride=block_table_row_stride(block_table, num_reqs),
-        state_block_size=state_block_size,
+        c.norm_weight,
+        block_table_stride=block_table_row_stride(c.block_table, num_reqs),
+        state_block_size=c.state_block_size,
         state_cache=state_cache,
-        rope_cache=rope_cache,
-        cos_sin_cache=cos_sin_cache,
-        compress_ratio=compress_ratio,
-        overlap=overlap,
-        quant_block=quant_block,
-        rms_eps=rms_eps,
+        rope_cache=c.rope_cache,
+        cos_sin_cache=c.cos_sin_cache,
+        compress_ratio=c.compress_ratio,
+        overlap=c.overlap,
+        quant_block=c.quant_block,
+        rms_eps=c.rms_eps,
     )
 
     if shares_buffer:
