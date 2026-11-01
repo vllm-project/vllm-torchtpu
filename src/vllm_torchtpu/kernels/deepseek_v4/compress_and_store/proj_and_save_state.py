@@ -26,6 +26,9 @@ from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 # Tokens whose f32 state is accumulated in VMEM at once; the weight is
 # read from HBM once per group of this many tokens.
 GROUP_TOKENS = 1024
+# A step holds the whole hidden dimension of the weight, double-buffered:
+# 28 MiB for DeepSeek-V4-Pro's CSA compressor, past the default scoped limit.
+DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -33,7 +36,7 @@ class TileSizes:
     """Tile sizes for Pallas kernel."""
 
     tile_m: int  # output dimension
-    tile_k: int  # hidden dimension
+    tile_k: int  # hidden dimension of one partial product
     tile_n: int  # sequence length
 
 
@@ -124,6 +127,7 @@ def kernel(
     _,  # unused output ref (aliased to cache)
     # scratch_memory
     acc_ref,  # (tiles_per_group, tile_n * num_m * slots_per_m_tile, 1, 128)
+    partial_ref,  # (tile_n, tile_m) f32: the k-partial sum of one step
     sem_ref,  # DMA semaphores [2]
     copies_ref,  # [2, 2]: (runs, accumulator) of the copy on each semaphore
     runs_ref,  # [2 * 2 * (tile_n + 1)]: see `run_stride`
@@ -197,7 +201,7 @@ def kernel(
     def _dma_copy_out(g_idx_val, n_idx_val):
         """Copies one finished token tile, all output halves, to the cache.
 
-        Called on the step after the tile's last (m, k) step, so the copy
+        Called on the step after the tile's last step, so the copy
         overlaps the next tile's matmul. A token whose slot continues the
         previous token's rows in the same page joins its run, so a prefill
         tile needs one DMA per page it touches rather than one per token and
@@ -239,14 +243,13 @@ def kernel(
         copies_ref[sem_idx, 1] = n_idx_val
 
     def inner_kernel(
-        tiled_wgate_ref,  # (tile_k, tile_m)
-        tiled_hidden_states_ref,  # (tile_n, tile_k)
+        tiled_wgate_ref,  # (size_k, tile_m)
+        tiled_hidden_states_ref,  # (tile_n, size_k)
         tiled_positions_ref,  # (tile_n,)
     ):
         g_idx = pl.program_id(0)
         m_idx = pl.program_id(1)
-        k_idx = pl.program_id(2)
-        n_idx = pl.program_id(3)
+        n_idx = pl.program_id(2)
         # Every token tile of a group has its own accumulator, holding all
         # output halves of each token; m selects the half.
         acc = acc_ref.at[n_idx]
@@ -254,15 +257,26 @@ def kernel(
         state_width = cfgs.dims.size_m // 2
 
         def _matmul():
-            lhs = tiled_hidden_states_ref[...]
-            rhs = tiled_wgate_ref[...]
-            prod = lax.dot_general(
-                lhs,
-                rhs,
-                (((1,), (0,)), ((), (()))),
-                preferred_element_type=jnp.float32,
-            )
-            return prod
+            """Sums the tile_k-wide partial products in k order.
+
+            Each partial sum goes through ``partial_ref`` and is read back
+            after the next product, then added to the product's popped f32
+            result. The accumulation order within a product is the
+            compiler's, so the sum is not bit-identical to one k per step.
+            """
+            tile_k = cfgs.tile_sizes.tile_k
+            for k in range(cfgs.num_k):
+                ks = pl.ds(k * tile_k, tile_k)
+                prod = lax.dot_general(
+                    tiled_hidden_states_ref[:, ks],
+                    tiled_wgate_ref[ks, :],
+                    (((1,), (0,)), ((), (()))),
+                    preferred_element_type=jnp.float32,
+                )
+                acc_val = prod if k == 0 else partial_ref[...] + prod
+                if k < cfgs.num_k - 1:
+                    partial_ref[...] = acc_val
+            return acc_val
 
         def _add_ape():
             tile_positions = tiled_positions_ref[...]
@@ -289,9 +303,7 @@ def kernel(
         def process(copy_dma: bool, add_ape: bool):
             # 1. The previous group's copies still in flight read the last
             # two accumulators; wait for one before overwriting it.
-            @pl.when(
-                (g_idx > 0) & (m_idx == 0) & (k_idx == 0) & (n_idx >= group_n - 2)
-            )
+            @pl.when((g_idx > 0) & (m_idx == 0) & (n_idx >= group_n - 2))
             def _free_acc():
                 _wait_copy(_copy_index(g_idx - 1, n_idx) % 2)
 
@@ -302,35 +314,22 @@ def kernel(
                 prev_g_idx = lax.select(first_n, g_idx - 1, g_idx)
                 _dma_copy_out(prev_g_idx, prev_n_idx)
 
-            # 3. Matmul
-            prod = _matmul()
+            # 3. Matmul over the whole hidden dimension
+            store_to_acc_ref(acc, _matmul(), m_idx, num_m, tile_n)
 
-            # 4. Unified Accumulate/Assign
-            acc_val = load_from_acc_ref(acc, m_idx, num_m, tile_n, dtype=jnp.float32)
-            old_acc = lax.select(
-                k_idx > 0,
-                acc_val,
-                jnp.zeros_like(acc_val),
-            )
-            new_acc = old_acc + prod
-            store_to_acc_ref(acc, new_acc, m_idx, num_m, tile_n)
-
-            # 5. APE addition if last
+            # 4. APE addition
             if add_ape:
                 _add_ape()
 
         # Select and execute
-        num_k = cfgs.num_k
-        is_last_k = k_idx == (num_k - 1)
         is_score = m_idx * tile_m >= state_width
 
-        # Token tile (g, n) finishes at step (g, num_m - 1, num_k - 1, n); the
-        # next grid step is (g, num_m - 1, num_k - 1, n + 1), or (g + 1, 0, 0, 0)
-        # after the last n.
-        copy_dma = ((m_idx == num_m - 1) & is_last_k & (n_idx > 0)) | (
-            (g_idx > 0) & (m_idx == 0) & (k_idx == 0) & (n_idx == 0)
+        # Token tile (g, n) finishes at step (g, num_m - 1, n); the next grid
+        # step is (g, num_m - 1, n + 1), or (g + 1, 0, 0) after the last n.
+        copy_dma = ((m_idx == num_m - 1) & (n_idx > 0)) | (
+            (g_idx > 0) & (m_idx == 0) & (n_idx == 0)
         )
-        add_ape = is_last_k & is_score
+        add_ape = is_score
 
         @pl.when(jnp.logical_not(copy_dma) & jnp.logical_not(add_ape))
         @jax.named_scope("matmul")
@@ -353,26 +352,27 @@ def kernel(
             process(False, True)
 
     # n innermost: the weight block stays resident across a group's token
-    # tiles, so each weight tile is read from HBM once per group.
+    # tiles, so each weight tile is read from HBM once per group. A step
+    # covers the whole hidden dimension, so a token tile's half is one step.
     wkv_spec = pl.BlockSpec(
-        (cfgs.tile_sizes.tile_k, cfgs.tile_sizes.tile_m),
-        lambda g, m, k, n: (k, m),
+        (cfgs.dims.size_k, cfgs.tile_sizes.tile_m),
+        lambda g, m, n: (0, m),
         memory_space=pltpu.VMEM,
     )
     hidden_states_spec = pl.BlockSpec(
-        (cfgs.tile_sizes.tile_n, cfgs.tile_sizes.tile_k),
-        lambda g, m, k, n: (g * group_n + n, k),
+        (cfgs.tile_sizes.tile_n, cfgs.dims.size_k),
+        lambda g, m, n: (g * group_n + n, 0),
         memory_space=pltpu.VMEM,
     )
     positions_spec = pl.BlockSpec(
         (cfgs.tile_sizes.tile_n,),
-        lambda g, m, k, n: (g * group_n + n,),
+        lambda g, m, n: (g * group_n + n,),
         memory_space=pltpu.VMEM,
     )
 
     pipeline_fn = pltpu.emit_pipeline(
         inner_kernel,
-        grid=(cfgs.num_groups, cfgs.num_m, cfgs.num_k, group_n),
+        grid=(cfgs.num_groups, cfgs.num_m, group_n),
         in_specs=(
             wkv_spec,
             hidden_states_spec,
@@ -478,6 +478,7 @@ def proj_and_save_state(
     acc_rows = tile_n * cfgs.num_m * slots_per_m_tile
     scratch_shapes = [
         pltpu.VMEM((tiles_per_group, acc_rows, 1, last_dim), jnp.float32),
+        pltpu.VMEM((tile_n, tile_m), jnp.float32),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SMEM((2, 2), jnp.int32),
         pltpu.SMEM((2 * 2 * (tile_n + 1),), jnp.int32),
@@ -504,6 +505,7 @@ def proj_and_save_state(
         input_output_aliases={5: 0},  # Alias output to cache (index 5)
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
         ),
         interpret=interpret,
         name="proj_and_save_state",
