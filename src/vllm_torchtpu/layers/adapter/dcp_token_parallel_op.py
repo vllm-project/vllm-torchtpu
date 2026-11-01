@@ -117,6 +117,11 @@ def check_config(vllm_config: Any, *, q_replicate: bool) -> None:
         raise NotImplementedError(
             "TPU_DCP_PREFILL_TOKEN_PARALLEL does not take TPU_INDEXER_QB_OVERLAP."
         )
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise NotImplementedError(
+            "TPU_DCP_PREFILL_TOKEN_PARALLEL does not take prefix caching: the "
+            "gather buffer is sized for the scheduled rows (check_step_capacity)."
+        )
     if vllm_config.scheduler_config.max_num_seqs > MIN_TOKENS // 2:
         raise NotImplementedError(
             "TPU_DCP_PREFILL_TOKEN_PARALLEL: max_num_seqs must leave rows for "
