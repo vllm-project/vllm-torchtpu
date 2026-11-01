@@ -20,7 +20,8 @@ from typing import Any
 from .errors import MegakernelUnsupported
 from .hooks import StepContext, is_suppressed, suppressed
 
-_DRIVER_EXPORTS = frozenset({"ProgramDriver", "TorchStepMetaOps"})
+_DRIVER_EXPORTS = frozenset({"ProgramDriver"})
+_STEP_META_EXPORTS = frozenset({"TorchStepMetaOps"})
 
 # Removed names -> their replacement (an `AttributeError` says where to go).
 _MOVED = {
@@ -51,7 +52,6 @@ _COLLECTOR_EXPORTS = frozenset(
         "WEIGHT_FLIPPED_ATTR",
         "apply_tp_moe_flags",
         "extract_ecopy_layer",
-        "find_backbone",
         "get_routed_experts",
         "load_vllm_weights",
         "reshard_experts_ep_to_tp_local",
@@ -91,6 +91,14 @@ def __getattr__(name: str) -> Any:
         from . import driver
 
         return getattr(driver, name)
+    if name in _STEP_META_EXPORTS:
+        from . import step_meta_ops
+
+        return getattr(step_meta_ops, name)
+    if name == "find_backbone":
+        from .backbone import find_backbone
+
+        return find_backbone
     if name in _BRIDGE_EXPORTS:
         from . import exported_bridge
 

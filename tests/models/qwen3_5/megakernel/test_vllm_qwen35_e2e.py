@@ -60,12 +60,14 @@ from vllm_torchtpu.megakernel_runtime.config import (  # noqa: E402
     collect_config,
     resolve_plugin_ref,
 )
-from vllm_torchtpu.megakernel_runtime.driver import TorchStepMetaOps  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.plugin import (  # noqa: E402
     Bucket,
     LayoutDecline,  # noqa: E402
     RunnerView,
+)
+from vllm_torchtpu.megakernel_runtime.step_meta_ops import (
+    TorchStepMetaOps,  # noqa: E402
 )
 from vllm_torchtpu.megakernel_runtime.weight_collector import (  # noqa: E402
     WEIGHT_FLIPPED_ATTR,

@@ -854,7 +854,7 @@ def test_collective_domain_is_fingerprinted() -> None:
 def test_weight_update_guard() -> None:
     mkr.guard_weight_update(SimpleNamespace(_megakernel=None))
     mkr.guard_weight_update(SimpleNamespace())
-    dd = driver_mod.DeclinedDriver(driver_mod._rt.EligibilityResult(False, "x", "m"))
+    dd = driver_mod.DeclinedDriver(driver_mod.EligibilityResult(False, "x", "m"))
     mkr.guard_weight_update(SimpleNamespace(_megakernel=dd))
     serving = object.__new__(driver_mod.ProgramDriver)
     with pytest.raises(mkr.MegakernelUnsupported, match="weight_update"):

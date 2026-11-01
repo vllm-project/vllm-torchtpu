@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import sys
 
@@ -25,6 +26,8 @@ import pytest
 def _std_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Route the runtime's and this folder's lazy vLLM loggers to `logging`
     when vLLM is absent (CPU)."""
+    # The runtime modules a test will use log through lazy loggers too.
+    importlib.import_module("vllm_torchtpu.megakernel_runtime.driver")
     folder = __package__.rpartition(".")[0]
     prefixes = ("vllm_torchtpu.megakernel_runtime.", f"{folder}.")
     for name in sorted(sys.modules):

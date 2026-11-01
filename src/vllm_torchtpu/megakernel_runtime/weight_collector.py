@@ -49,6 +49,7 @@ from vllm_torchtpu.megakernel.weights import (
     slice_alias_targets,
     target_axis_widths,
 )
+from vllm_torchtpu.megakernel_runtime.backbone import find_backbone
 
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
@@ -160,25 +161,6 @@ class TorchArrayOps:
 
     def own(self, x: torch.Tensor) -> torch.Tensor:
         return _own(x)
-
-
-def find_backbone(model: Any) -> Any:
-    """Locate the decoder backbone (`layers` + `norm`) inside a vLLM model wrapper."""
-    for path in (
-        ("model", "language_model", "model"),
-        ("language_model", "model"),
-        ("model", "model"),
-        ("model",),
-        (),
-    ):
-        cur = model
-        for attr in path:
-            cur = getattr(cur, attr, None)
-            if cur is None:
-                break
-        if cur is not None and hasattr(cur, "layers") and hasattr(cur, "norm"):
-            return cur
-    raise ValueError(f"Cannot locate decoder backbone in {type(model).__name__}")
 
 
 def get_routed_experts(mlp: Any) -> Any:

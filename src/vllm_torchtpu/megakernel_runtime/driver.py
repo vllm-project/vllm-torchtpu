@@ -28,7 +28,6 @@ from typing import Any
 import jax
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 try:
     from vllm.forward_context import get_forward_context
@@ -41,8 +40,8 @@ except ImportError:
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu import _OFFLOADING_CONNECTORS
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel import MegakernelLayoutError
-from vllm_torchtpu.megakernel import runtime as _rt
+from vllm_torchtpu.megakernel.errors import MegakernelLayoutError
+from vllm_torchtpu.megakernel.runtime import stats as _stats
 from vllm_torchtpu.megakernel.runtime.contract import (
     DOMAIN_TP,
     PARALLELISM_UNSUPPORTED,
@@ -50,7 +49,9 @@ from vllm_torchtpu.megakernel.runtime.contract import (
     REQUIRES_UNMET,
     UNSUPPORTED_TP_SIZE,
     UNSUPPORTED_TPU_CHIP,
+    EligibilityResult,
 )
+from vllm_torchtpu.megakernel_runtime.backbone import find_backbone
 from vllm_torchtpu.megakernel_runtime.config import (
     import_plugin,
     missing_template,
@@ -73,7 +74,6 @@ from vllm_torchtpu.megakernel_runtime.plugin import (
     RunnerView,
     StepFn,
 )
-from vllm_torchtpu.megakernel_runtime.weight_collector import find_backbone
 
 logger = init_logger(__name__)
 
@@ -124,10 +124,22 @@ def _get_pallas_mesh_fn() -> Any:
     return get_pallas_mesh
 
 
+def check_mesh_size(tp_size: int, mesh_size: int) -> EligibilityResult | None:
+    """`mesh_size_mismatch` when the TP-rank mesh doesn't hold `tp_size`
+    devices (`None` if it does). The chip and the TP size are `check_spec`'s."""
+    if int(mesh_size) != int(tp_size):
+        msg = (
+            f"Megakernel TP-rank mesh has {mesh_size} devices, "
+            f"expected {tp_size}; skipping."
+        )
+        return EligibilityResult(False, "mesh_size_mismatch", msg)
+    return None
+
+
 class MeshDecline(Exception):
     """`_build_tp_rank_mesh` can't build a correctly ordered TP mesh."""
 
-    def __init__(self, result: _rt.EligibilityResult) -> None:
+    def __init__(self, result: EligibilityResult) -> None:
         super().__init__(result.message)
         self.result = result
 
@@ -152,7 +164,7 @@ def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
         except Exception as exc:
             msg = f"Megakernel: get_pallas_mesh failed ({exc}); skipping."
             raise MeshDecline(
-                _rt.EligibilityResult(False, "pallas_mesh_unavailable", msg)
+                EligibilityResult(False, "pallas_mesh_unavailable", msg)
             ) from exc
         n_dev = int(pallas_mesh.devices.size)
         axes = tuple(pallas_mesh.axis_names)
@@ -161,7 +173,7 @@ def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
                 f"Megakernel: the Pallas mesh has {n_dev} devices on axes {axes}, "
                 f"expected {r_cnt} on ('tp',); skipping."
             )
-            raise MeshDecline(_rt.EligibilityResult(False, "pallas_mesh_mismatch", msg))
+            raise MeshDecline(EligibilityResult(False, "pallas_mesh_mismatch", msg))
         return pallas_mesh
     fb_devs = getattr(fallback_mesh, "devices", None)
     if fb_devs is not None and int(fb_devs.size) == r_cnt:
@@ -169,89 +181,6 @@ def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
             return fallback_mesh
         return jax.sharding.Mesh(np.asarray(fb_devs).reshape(-1), ("tp",))
     return jax.sharding.Mesh(np.asarray(jax.devices()[:r_cnt]), ("tp",))
-
-
-class TorchStepMetaOps:
-    """`StepMetaOps` primitives over `torch.Tensor` (Dynamo `fullgraph=True` safe)."""
-
-    def shape(self, x: torch.Tensor) -> tuple[int, ...]:
-        return tuple(int(d) for d in x.shape)
-
-    def ndim(self, x: torch.Tensor) -> int:
-        return int(x.ndim)
-
-    def numel(self, x: torch.Tensor) -> int:
-        return int(x.numel())
-
-    def reshape(self, x: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
-        return x.reshape(shape)
-
-    def slice_or_pad_1d(self, x: torch.Tensor, target_len: int) -> torch.Tensor:
-        x1 = x.reshape(-1)
-        n = int(x1.shape[0])
-        out = x1[:target_len] if n >= target_len else F.pad(x1, (0, target_len - n))
-        return out.to(torch.int32)
-
-    def slice_or_pad_2d(
-        self, x: torch.Tensor, target_rows: int, target_cols: int
-    ) -> torch.Tensor:
-        r, c = int(x.shape[0]), int(x.shape[1])
-        out = x[: min(r, target_rows), : min(c, target_cols)]
-        pad_r, pad_c = max(0, target_rows - r), max(0, target_cols - c)
-        if pad_r > 0 or pad_c > 0:
-            out = F.pad(out, (0, pad_c, 0, pad_r), value=0)
-        return out.to(torch.int32)
-
-    def zeros_i32(self, shape: tuple[int, ...], *, like: torch.Tensor) -> torch.Tensor:
-        return torch.zeros(shape, dtype=torch.int32, device=like.device)
-
-    def zeros_like_i32(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.zeros_like(x)
-
-    def arange_i32(self, start: int, stop: int, *, like: torch.Tensor) -> torch.Tensor:
-        return torch.arange(start, stop, dtype=torch.int32, device=like.device)
-
-    def clip(self, x: torch.Tensor, lo: int, hi: int | None = None) -> torch.Tensor:
-        return x.clamp(min=lo) if hi is None else x.to(torch.long).clamp(min=lo, max=hi)
-
-    def take_1d(self, table_1d: torch.Tensor, idx_1d: torch.Tensor) -> torch.Tensor:
-        return table_1d[idx_1d].to(torch.int32)
-
-    def take_col_2d(
-        self, table_2d: torch.Tensor, col_idx_1d: torch.Tensor
-    ) -> torch.Tensor:
-        return table_2d.gather(1, col_idx_1d.unsqueeze(1))
-
-    def expand_1d_to_2d(
-        self, x_1d: torch.Tensor, cols: int, *, contiguous: bool = True
-    ) -> torch.Tensor:
-        out = x_1d.unsqueeze(1).expand(int(x_1d.shape[0]), int(cols))
-        return out.contiguous() if contiguous else out
-
-    def concat_cols(self, col0: torch.Tensor, col1: torch.Tensor) -> torch.Tensor:
-        return torch.cat([col0, col1], dim=1)
-
-    def stack_dim0(self, xs: Sequence[torch.Tensor]) -> torch.Tensor:
-        return torch.stack(list(xs), dim=0)
-
-    def where(
-        self, cond: torch.Tensor, x: torch.Tensor, y: torch.Tensor
-    ) -> torch.Tensor:
-        return torch.where(cond, x, y)
-
-    def gt_zero(self, x: torch.Tensor) -> torch.Tensor:
-        return x > 0
-
-    def lt_zero(self, x: torch.Tensor) -> torch.Tensor:
-        return x < 0
-
-    def logical_and(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return a & b
-
-    def check_distinct_cols_2d(self, ckpt_g: torch.Tensor, T: int) -> None:
-        if torch.compiler.is_compiling() or ckpt_g.device.type != "cpu":
-            return
-        _rt.check_ckpt_write_cols_distinct(ckpt_g, T)
 
 
 def _ep_group_size() -> int:
@@ -292,7 +221,7 @@ def vote_codes(extra: Sequence[str] = ()) -> tuple[str, ...]:
 
 
 def _decline_vote(
-    result: _rt.EligibilityResult | None, codes: Sequence[str] = DECLINE_VOTE_CODES
+    result: EligibilityResult | None, codes: Sequence[str] = DECLINE_VOTE_CODES
 ) -> int:
     if result is None:
         return 0
@@ -334,13 +263,13 @@ def buckets_token(keys: Sequence[tuple[int, int]], salt: str = "") -> int:
 
 
 def agree_on_decline(
-    local: _rt.EligibilityResult | None,
+    local: EligibilityResult | None,
     *,
     token: int | None = None,
     group: Any = None,
     mismatch_code: str | None = None,
     codes: Sequence[str] = DECLINE_VOTE_CODES,
-) -> _rt.EligibilityResult | None:
+) -> EligibilityResult | None:
     """Make a megakernel decline rank-uniform across the TP group.
 
     Every rank calls this at the same point with its own decline (`None` when
@@ -369,16 +298,16 @@ def agree_on_decline(
             "Megakernel plugin or runtime source differs across TP ranks "
             f"({mismatch_code}); skipping."
         )
-        return _rt.EligibilityResult(False, mismatch_code, msg)
+        return EligibilityResult(False, mismatch_code, msg)
     if vote != 0:
         if local is not None:
             return local
         code = codes[vote - 1] if vote <= len(codes) else "other"
         msg = f"Megakernel declined on another TP rank ({code}); skipping."
-        return _rt.EligibilityResult(False, f"peer_declined:{code}", msg)
+        return EligibilityResult(False, f"peer_declined:{code}", msg)
     if tok_max != tok_min:
         msg = "Megakernel compiled bucket sets differ across TP ranks; skipping."
-        return _rt.EligibilityResult(False, "bucket_set_mismatch", msg)
+        return EligibilityResult(False, "bucket_set_mismatch", msg)
     return None
 
 
@@ -395,7 +324,7 @@ class DeclinedDriver:
 
     def __init__(
         self,
-        result: _rt.EligibilityResult,
+        result: EligibilityResult,
         *,
         tp_rank: int = 0,
         display_name: str = "megakernel",
@@ -407,7 +336,7 @@ class DeclinedDriver:
         self.tp_rank, self._display_name = int(tp_rank), display_name
         self._codes = tuple(codes)
         self._domain = domain
-        self.step_mix_tracker = _rt.StepMixTracker(period_s=float(stats_period_s))
+        self.step_mix_tracker = _stats.StepMixTracker(period_s=float(stats_period_s))
         self._step_key = f"stock_{result.code}"
 
     def bind_and_warmup(self, runner: Any) -> None:
@@ -446,7 +375,9 @@ class DeclinedDriver:
         return False, None
 
 
-def _inspect_step_detail(attn_md: Any, m0: Any, runner: Any = None) -> _rt.BatchShape:
+def _inspect_step_detail(
+    attn_md: Any, m0: Any, runner: Any = None
+) -> _stats.BatchShape:
     """Return `BatchShape` without host-device synchronization."""
     num_reqs: int | None = None
     has_roff = False
@@ -473,7 +404,7 @@ def _inspect_step_detail(attn_md: Any, m0: Any, runner: Any = None) -> _rt.Batch
             eff_n = comb_wt[1] if num_reqs is None else num_reqs
             runner_decides = comb_wt[1] <= 0 or eff_n <= 0 or comb_wt[0] != comb_wt[1]
         if runner_decides:
-            return _rt.inspect_batch_shape(
+            return _stats.inspect_batch_shape(
                 num_reqs=num_reqs,
                 has_roff=has_roff,
                 decode_and_total_reqs=comb_wt,
@@ -509,7 +440,7 @@ def _inspect_step_detail(attn_md: Any, m0: Any, runner: Any = None) -> _rt.Batch
         if isinstance(qsl_dev, torch.Tensor) and qsl_dev.device.type == "cpu":
             qsl_md = qsl_dev
 
-    return _rt.inspect_batch_shape(
+    return _stats.inspect_batch_shape(
         num_reqs=num_reqs,
         has_roff=has_roff,
         decode_and_total_reqs=comb_wt,
@@ -569,8 +500,8 @@ def _runner_backbone(runner: Any) -> Any:
         return None
 
 
-def _decline(code: str, detail: str) -> _rt.EligibilityResult:
-    return _rt.EligibilityResult(False, code, f"Megakernel {detail}; skipping.")
+def _decline(code: str, detail: str) -> EligibilityResult:
+    return EligibilityResult(False, code, f"Megakernel {detail}; skipping.")
 
 
 def _mm_limit_count(limit: Any) -> int:
@@ -667,9 +598,7 @@ def _requires_value(runner: Any, key: str) -> str:
     return str(value).lower().removeprefix("torch.")
 
 
-def check_spec(
-    runner: Any, spec: Any, *, view: RunnerView
-) -> _rt.EligibilityResult | None:
+def check_spec(runner: Any, spec: Any, *, view: RunnerView) -> EligibilityResult | None:
     """Enforce a spec's declarative fields before `create`: `chips`,
     `tp_sizes`, `collective_domain`, `parallelism`, `features`, then
     `requires`. Returns the first
@@ -686,13 +615,13 @@ def check_spec(
                 f"Megakernel model folder supports chips {spec.chips}, not "
                 f"{kind!r}; skipping."
             )
-            return _rt.EligibilityResult(False, UNSUPPORTED_TPU_CHIP, msg)
+            return EligibilityResult(False, UNSUPPORTED_TPU_CHIP, msg)
     if spec.tp_sizes and tp_size not in spec.tp_sizes:
         msg = (
             f"Megakernel model folder supports TP sizes {spec.tp_sizes}, not "
             f"{tp_size}; skipping."
         )
-        return _rt.EligibilityResult(False, UNSUPPORTED_TP_SIZE, msg)
+        return EligibilityResult(False, UNSUPPORTED_TP_SIZE, msg)
     domain = spec.collective_domain
     if domain != DOMAIN_TP:
         return _decline(
@@ -716,13 +645,13 @@ def check_spec(
                 f"Megakernel model folder requires {key}={want} (this server: "
                 f"{got}); pass --{key.replace('_', '-')} {want}; skipping."
             )
-            return _rt.EligibilityResult(False, f"{REQUIRES_UNMET}:{key}", msg)
+            return EligibilityResult(False, f"{REQUIRES_UNMET}:{key}", msg)
     return None
 
 
 def check_runner_features(
     runner: Any, features: frozenset[str]
-) -> _rt.EligibilityResult | None:
+) -> EligibilityResult | None:
     """The first framework feature that is on but not declared, as a named
     decline (`None` if all are covered). Config only: no collective."""
     caps = frozenset(features)
@@ -873,7 +802,7 @@ def loaded_numerics_note(spec_numerics: str, options: Mapping[str, Any]) -> str:
     return note
 
 
-def _check_create_result(out: Any, ref: Any) -> _rt.EligibilityResult | None:
+def _check_create_result(out: Any, ref: Any) -> EligibilityResult | None:
     """`create`'s decline, or `None` for a program; anything else raises."""
     if isinstance(out, Decline):
         return out.result
@@ -893,7 +822,7 @@ def _vote_startup_failure(
     """Join agreement #1 as `create_error` from a rank that is about to raise."""
     try:
         agree_on_decline(
-            _rt.EligibilityResult(False, "create_error", "startup failed"),
+            EligibilityResult(False, "create_error", "startup failed"),
             group=agreement_group(domain, runner),
             token=token,
             mismatch_code="plugin_mismatch",
@@ -949,8 +878,8 @@ class ProgramDriver:
         self._inspect: Any = None
         self._inspect_runner: Any = None
         self.pool_layout_facts: Any = None
-        self.step_mix_tracker = _rt.StepMixTracker(period_s=float(stats_period_s))
-        self.ab_calibrator = _rt.MKABCalibrator(
+        self.step_mix_tracker = _stats.StepMixTracker(period_s=float(stats_period_s))
+        self.ab_calibrator = _stats.MKABCalibrator(
             enabled=bool(ab), period_s=float(stats_period_s)
         )
 
@@ -1025,10 +954,7 @@ class ProgramDriver:
                 except MeshDecline as exc:
                     decline = exc.result
                 else:
-                    el_mesh = _rt.check_post_mesh_eligibility(
-                        tp_size=tp_size, mesh_size=int(mesh.devices.size)
-                    )
-                    decline = None if el_mesh.eligible else el_mesh
+                    decline = check_mesh_size(tp_size, int(mesh.devices.size))
         except BaseException:
             _vote_startup_failure(token, codes, domain, runner)
             raise
@@ -1067,7 +993,7 @@ class ProgramDriver:
         )
 
     @staticmethod
-    def _log_startup_ineligible(el: _rt.EligibilityResult) -> None:
+    def _log_startup_ineligible(el: EligibilityResult) -> None:
         msg = _VLLM_STARTUP_MESSAGES.get(el.code, el.message)
         if msg:
             (logger.info if el.level == "info" else logger.warning)("%s", msg)
@@ -1138,18 +1064,18 @@ class ProgramDriver:
             else contextlib.nullcontext()
         )
         with ctx:
-            decline: _rt.EligibilityResult | None = None
+            decline: EligibilityResult | None = None
             try:
                 self.bind(runner)
             except MegakernelLayoutError as exc:
-                decline = getattr(exc, "result", None) or _rt.EligibilityResult(
+                decline = getattr(exc, "result", None) or EligibilityResult(
                     False, "cache_layout_incompatible", str(exc)
                 )
             except BaseException:
                 # This rank is raising: still vote, so the others decline
                 # instead of waiting in the agreement.
                 agree_on_decline(
-                    _rt.EligibilityResult(False, "bind_error", "bind failed"),
+                    EligibilityResult(False, "bind_error", "bind failed"),
                     group=agreement_group(self._domain, runner),
                     codes=self._codes,
                 )
@@ -1230,7 +1156,7 @@ class ProgramDriver:
     @classmethod
     def _inspect_step_detail(
         cls, attn_md: Any, m0: Any, runner: Any = None
-    ) -> _rt.BatchShape:
+    ) -> _stats.BatchShape:
         """Return `BatchShape` without host-device synchronization."""
         return _inspect_step_detail(attn_md, m0, runner)
 
