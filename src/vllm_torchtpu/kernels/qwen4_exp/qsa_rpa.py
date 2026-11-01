@@ -552,9 +552,8 @@ def _prefill_attention(
         query, cache, kv_heads=kv_heads, ratio=ratio, with_query_tile=True
     )
     if dcp is not None:
-        # One KV tile per main-KV table entry (dcp pages' worth of tokens); the
-        # paired-page kernel then fetches this rank's page of each tile.
-        kv_tile = dcp[1] * cache.shape[1]
+        # One KV tile per owned page: the kernel walks this rank's pages only.
+        kv_tile = cache.shape[1]
         if query_block % 128 or query_block * query.shape[1] > 256 * 24:
             query_block, query_tile = 256, None
         if query_tile and query_block % query_tile:
