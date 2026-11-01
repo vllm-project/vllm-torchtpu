@@ -150,7 +150,8 @@ _cfg=$(
         "DECODE_DP_ATTN=${AGENTX_DECODE_DP_ATTN:-}" \
         "DECODE_NUM_WORKERS=${AGENTX_DECODE_NUM_WORKERS:-}" \
         "DURATION=${AGENTX_DURATION:-}" \
-        "FAST=${AGENTX_FAST:-}"
+        "FAST=${AGENTX_FAST:-}" \
+        "FORMOSA=${FORMOSA_BENCH:-}"
 ) || { log "FATAL: $CONFIG failed to load; the engines would have failed the same way"; exit 2; }
 while IFS='=' read -r _k _v; do
     printf -v "CFG_${_k}" '%s' "$_v"
@@ -402,6 +403,40 @@ if [ "$EVAL_ONLY" = 1 ]; then
         ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
     rc=$?
     log "the AgentX eval client finished with rc=$rc"
+    exit "$rc"
+fi
+
+if [ -n "${CFG_FORMOSA:-}" ]; then
+    # The Formosa synthetic_v1 timed-trace sweep (a_right_long, N=256) with the
+    # client flags of the GB300 baseline: one disjoint shard per concurrency,
+    # a separate warmup shard, PYTHONHASHSEED=100000+c.
+    _suite=/formosa/datasets/n256/concurrency_shards/a_right_long
+    _tok="$TMPDIR/formosa-tokenizer"
+    cp -r /formosa/tokenizer/Kimi-K3 "$_tok"
+    _out="$RESULTS_DIR/formosa_syn1"
+    mkdir -p "$_out"
+    _bench() {
+        vllm bench serve --backend openai --base-url "http://127.0.0.1:$PROXY_PORT" \
+            --endpoint /v1/completions --model moonshotai/Kimi-K3 --tokenizer "$_tok" \
+            --trust-remote-code --dataset-name timed_trace --timed-trace-chunk-hash-size 512 \
+            --no-self-timed --num-warmups 0 --ready-check-timeout-sec 0 --request-rate inf \
+            --temperature 0.0 "$@"
+    }
+    log "Formosa synthetic_v1: warmup"
+    PYTHONHASHSEED=999999 _bench --dataset-path "$_suite/a_right_long_warmup.jsonl" \
+        --num-prompts 4 --max-concurrency 2 >"$_out/warmup.log" 2>&1
+    rc=0
+    for c in "${CONCS[@]}"; do
+        log "Formosa synthetic_v1: c=$c"
+        PYTHONHASHSEED=$((100000 + c)) _bench --dataset-path "$_suite/a_right_long_c${c}.jsonl" \
+            --num-prompts 256 --max-concurrency "$c" \
+            --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 25,50,75,90,95,99 \
+            --save-result --save-detailed --result-dir "$_out" \
+            --result-filename "k3_agg_tt_c${c}_n256.json" 2>&1 | tee "$_out/c${c}.log" | tail -40
+        [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+        curl -sf --max-time 30 "http://${DECODE_HOST}:${PORT}/metrics" >"$_out/metrics_c${c}.txt" || true
+    done
+    log "the Formosa sweep finished with rc=$rc"
     exit "$rc"
 fi
 

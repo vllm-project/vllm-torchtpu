@@ -51,6 +51,7 @@ AGENTX_POST_EVAL_SUITES=""
 AGENTX_EVAL_JOB_SUITES="gsm8k kimi_tool_call_schema_full"
 AGENTX_GSM8K_LIMIT=0
 AGENTX_SPEC_METHOD=dspark
+[ "$AGG_DRAFTS" != 0 ] || AGENTX_SPEC_METHOD=none
 AGENTX_PREFILL_DCP_SIZE=32
 AGENTX_DURATION=3600
 AGENTX_FAST=0
@@ -146,8 +147,9 @@ SERVE_ARGS=(
   --max-num-seqs "$AGG_MAX_NUM_SEQS"
   --max-num-batched-tokens $((8192 + 8 * AGG_MAX_NUM_SEQS))
   --kv-cache-memory-bytes "${AGG_KV_BYTES:-15032385536}"
-  --speculative-config "$_spec"
 )
+# AGG_DRAFTS=0: no speculative decoding.
+[ "$AGG_DRAFTS" = 0 ] || SERVE_ARGS+=(--speculative-config "$_spec")
 if [ "$_eval_job" = 1 ]; then
   SERVE_ARGS+=(--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3)
 fi

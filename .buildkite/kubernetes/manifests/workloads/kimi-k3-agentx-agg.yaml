@@ -197,6 +197,9 @@ spec:
           completionMode: Indexed
           backoffLimit: 0
           template:
+            metadata:
+              annotations:
+                gke-gcsfuse/volumes: "true"
             spec:
               restartPolicy: Never
               nodeSelector:
@@ -244,3 +247,18 @@ spec:
                       cpu: "12"
                       memory: "32Gi"
                       ephemeral-storage: "30Gi"
+                  volumeMounts:
+                    # The Formosa timed-trace suite (shards and tokenizer) for a
+                    # FORMOSA_BENCH point; unused otherwise.
+                    - name: formosa-suite
+                      mountPath: /formosa
+                      readOnly: true
+              volumes:
+                - name: formosa-suite
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=benchmarks/formosa_timed_trace_suite"
+                      skipCSIBucketAccessCheck: "true"
