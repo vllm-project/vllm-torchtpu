@@ -24,6 +24,19 @@ from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import config
 
 
+def _floor_div(x, divisor: int):
+    """``x // divisor``; a shift when divisor is a power of two."""
+    if divisor & (divisor - 1) == 0:
+        return jax.lax.shift_right_arithmetic(x, divisor.bit_length() - 1)
+    return x // divisor
+
+
+def _flat_rows(ref):
+    """(num_pages, rows, ...) -> (num_pages * rows, ...): a slot's row index is
+    then its page-major row number."""
+    return ref.reshape(ref.shape[0] * ref.shape[1], *ref.shape[2:])
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class _BufferedRef(pltpu.BufferedRef):
@@ -76,7 +89,7 @@ class CosSinRef(_BufferedRef):
         def loop_body(i):
             global_idx = pid * tile_n + i
             position = positions_ref[global_idx]
-            compressed_pos = (position // compress_ratio) * compress_ratio
+            compressed_pos = _floor_div(position, compress_ratio) * compress_ratio
 
             src = cos_sin_cache_ref.at[
                 compressed_pos, pl.ds(0, self.window_ref.shape[-1])
@@ -193,9 +206,8 @@ class OutputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
 
-        # Cache is laid out like this:
-        # [num_page, kv_block_size / 4, 4, 256]
-        page_size = self.cfgs.kv_block_size
+        # cache_ref: [num_pages * kv_block_size / 4, 4, 256], 4 tokens per row
+        tokens_per_row = self.cfgs.tokens_in_second_minor
 
         @pl.loop(0, tile_n)
         def loop_body(n):
@@ -205,10 +217,8 @@ class OutputRef(_BufferedRef):
 
             @pl.when(valid)
             def _read_nope():
-                p = kv_slot // page_size
                 # we fetch the entire tile (4, 128), with 4 pages per tile
-                s_row = (kv_slot % page_size) // (self.cfgs.tokens_in_second_minor)
-                src = cache_ref.at[p, s_row, :, :]
+                src = cache_ref.at[_floor_div(kv_slot, tokens_per_row)]
                 dest = dest_ref.at[n, 0, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
 
@@ -260,18 +270,15 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(valid)
                 def _write_nope():
-                    p = kv_slot // self.cfgs.kv_block_size
-                    s_row = (kv_slot % self.cfgs.kv_block_size) // (
-                        self.cfgs.tokens_in_second_minor
-                    )
+                    row = _floor_div(kv_slot, self.cfgs.tokens_in_second_minor)
                     src = src_ref.at[n, 0, :, :]
-                    dest = cache_ref.at[p, s_row, :, :]
+                    dest = cache_ref.at[row]
                     pltpu.make_async_copy(src, dest, sem).start()
         else:
             cache_ref, kv_slot_mapping_ref = dest_ref
 
-            # HCA: [num_pages, kv_block_size * 2, 4, 128] uint8
-            # CSA: [num_pages, kv_block_size, 4, 128] uint8
+            # HCA: [num_pages * kv_block_size * 2, 4, 128] uint8
+            # CSA: [num_pages * kv_block_size, 4, 128] uint8
             @pl.loop(0, tile_n)
             def loop_body(n):
                 idx_n = global_idx + n
@@ -279,13 +286,10 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(kv_slot >= 0)
                 def _write_nope():
-                    p = kv_slot // self.cfgs.physical_page_size
-                    s = kv_slot % self.cfgs.physical_page_size
-
                     @pl.loop(0, self.cfgs.record_rows, unroll=True)
                     def write_loop(o):
                         src_nope = src_ref.at[n, o, ...]
-                        dest_nope = cache_ref.at[p, s + o, ...]
+                        dest_nope = cache_ref.at[kv_slot + o, ...]
                         pltpu.make_async_copy(src_nope, dest_nope, sem).start()
 
     def wait_out(self, dest_ref, grid_indices):
@@ -364,12 +368,9 @@ class RoPEOutputRef(_BufferedRef):
 
             @pl.when(valid & is_first)
             def _read_rope():
-                # divide by 4 because we pack 4 pages into 1 tile
-                # layout: [num_page, kv_block_size / 4, 4, 256]
-                rope_slot = kv_slot // 4
-                rope_p = rope_slot // self.cfgs.rope_page_size
-                s_row = rope_slot % self.cfgs.rope_page_size
-                src = rope_cache_ref.at[rope_p, s_row, :, :]
+                # layout: [num_pages * kv_block_size / 4, 4, 128], 4 tokens a row
+                row = _floor_div(kv_slot, csa_cache_layout.ROPE_TOKENS_PER_ROW)
+                src = rope_cache_ref.at[row]
                 dest = dest_ref.at[n, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
 
@@ -422,11 +423,9 @@ class RoPEOutputRef(_BufferedRef):
 
             @pl.when(valid & is_first)
             def _write_rope():
-                rope_slot = kv_slot // 4
-                rope_p = rope_slot // self.cfgs.rope_page_size
-                s_row = rope_slot % self.cfgs.rope_page_size
                 src_rope = src_ref.at[n, :, :]
-                dest_rope = rope_cache_ref.at[rope_p, s_row, :, :]
+                row = _floor_div(kv_slot, csa_cache_layout.ROPE_TOKENS_PER_ROW)
+                dest_rope = rope_cache_ref.at[row]
                 pltpu.make_async_copy(src_rope, dest_rope, sem).start()
 
     def wait_out(self, dest_ref, grid_indices):
@@ -500,6 +499,8 @@ def create_allocs_and_specs(
         rope_cache_ref = csa_cache_layout.as_u8_slabs(rope_cache_ref)
     if state_cache_ref is not None:
         state_cache_ref = csa_cache_layout.as_u8_slabs(state_cache_ref)
+    # Records are addressed by slot, so read and write them through flat rows.
+    cache_rows_ref = _flat_rows(cache_ref)
 
     # cos_sin
     if cfgs.dims.has_rope:
@@ -540,9 +541,9 @@ def create_allocs_and_specs(
         cfgs=cfgs,
     )
     if is_indexer:
-        output_args = (cache_ref, kv_slot_mapping_ref, is_first_mask_ref)
+        output_args = (cache_rows_ref, kv_slot_mapping_ref, is_first_mask_ref)
     else:
-        output_args = (cache_ref, kv_slot_mapping_ref)
+        output_args = (cache_rows_ref, kv_slot_mapping_ref)
 
     # state: window groups, or whole pages to gather the window from
     if cfgs.fetches_window_groups:
@@ -594,7 +595,11 @@ def create_allocs_and_specs(
             use_lookahead=False,
             cfgs=cfgs,
         )
-        rope_args = (rope_cache_ref, kv_slot_mapping_ref, is_first_mask_rope_ref)
+        rope_args = (
+            _flat_rows(rope_cache_ref),
+            kv_slot_mapping_ref,
+            is_first_mask_rope_ref,
+        )
     else:
         rope_alloc = rope_spec = rope_args = None
 
