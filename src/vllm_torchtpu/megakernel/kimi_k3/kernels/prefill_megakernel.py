@@ -3759,9 +3759,11 @@ def kda_prefill_tiled_body(
         )
 
     def store_tile(t, buf):
-        copies = [pltpu.make_async_copy(
-            out_bufs.at[buf], out_ref.at[pl.ds(t * tile, tile), :], out_sems.at[buf]
-        )]
+        copies = []
+        if out_ref is not None:
+            copies.append(pltpu.make_async_copy(
+                out_bufs.at[buf], out_ref.at[pl.ds(t * tile, tile), :], out_sems.at[buf]
+            ))
         if projection is not None:
             copies.append(pltpu.make_async_copy(
                 partial_bufs.at[buf], partial_ref.at[pl.ds(t * tile, tile), :],
@@ -3845,25 +3847,6 @@ def kda_prefill_tiled_body(
             )
         filtered = jax.nn.silu(convolved).astype(jnp.bfloat16)
         filtered = _row_where(real_rows, filtered)
-        # The history starts at the end of the real prefix. Mosaic does not
-        # lower dynamic_slice on a value, so only the one partial tile uses a
-        # masked reduction; full tiles use a static slice.
-        real_count = jnp.clip(row_end - t * tile, 0, tile)
-
-        @pl.when(real_count == tile)
-        def carry_full_tile():
-            conv_hist_vmem[...] = window[tile : tile + 3]
-
-        @pl.when((real_count > 0) & (real_count < tile))
-        def carry_partial_tile():
-            rows = jnp.arange(tile + 3, dtype=jnp.int32)
-            picked = []
-            for i in range(3):
-                picked.append(
-                    jnp.sum(_row_where(rows == real_count + i, window), axis=0)
-                )
-            conv_hist_vmem[...] = jnp.stack(picked)
-
         query = filtered[:, 0].astype(jnp.float32)
         key = filtered[:, 1].astype(jnp.float32)
         value = filtered[:, 2].astype(jnp.float32)
@@ -3895,13 +3878,33 @@ def kda_prefill_tiled_body(
             output_gate.astype(jnp.float32)
         ).astype(jnp.bfloat16)
         attended = attended.reshape(tile, width)
-        out_bufs.at[buf][...] = attended
+        if out_bufs is not None:
+            out_bufs.at[buf][...] = attended
         if projection is not None:
             columns = weight_vmem.shape[1] // 4
             for c in range(4):  # in column quarters: bounded temporaries
                 partial_bufs.at[buf, :, pl.ds(c * columns, columns)][...] = _dot(
                     attended, weight_vmem[:, pl.ds(c * columns, columns)]
                 ).astype(jnp.bfloat16)
+
+        # Defer @pl.when conv-history carry until after the entire compute +
+        # projection chain so Mosaic keeps all tile intermediates in VREGs
+        # without flushing across @pl.when basic-block boundaries.
+        real_count = jnp.clip(row_end - t * tile, 0, tile)
+
+        @pl.when(real_count == tile)
+        def carry_full_tile():
+            conv_hist_vmem[...] = window[tile : tile + 3]
+
+        @pl.when((real_count > 0) & (real_count < tile))
+        def carry_partial_tile():
+            rows = jnp.arange(tile + 3, dtype=jnp.int32)
+            picked = []
+            for i in range(3):
+                picked.append(
+                    jnp.sum(_row_where(rows == real_count + i, window), axis=0)
+                )
+            conv_hist_vmem[...] = jnp.stack(picked)
 
         if tile_segment is not None:
             segment, segment_end, current, offset, position = tile_segment
@@ -3959,25 +3962,27 @@ class _Copies:
 
 
 def kda_prefill_tiled_scratch_shapes(
-    hidden_size, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm
+    hidden_size, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm, *, store_out=True
 ):
     """Scratch specs, in the order expected by ``kda_prefill_tiled_body``."""
     width = _HEADS * _CHANNELS
     return (
-        pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),
-        pltpu.VMEM((2, tile, width), jnp.bfloat16),
-        pltpu.VMEM(gate_w.shape, gate_w.dtype),
-        pltpu.VMEM(fb_w.shape, fb_w.dtype),
-        pltpu.VMEM(proj_w.shape, proj_w.dtype),
-        pltpu.VMEM(conv_w.shape, conv_w.dtype),
-        pltpu.VMEM(alog.shape, alog.dtype),
-        pltpu.VMEM(dt.shape, dt.dtype),
-        pltpu.VMEM(norm.shape, norm.dtype),
-        pltpu.VMEM((_HEADS, _CHANNELS, _CHANNELS), jnp.float32),
-        pltpu.VMEM((3, 3, _HEADS, _CHANNELS), jnp.bfloat16),
-        pltpu.SemaphoreType.DMA((2,)),
-        pltpu.SemaphoreType.DMA((2,)),
-        pltpu.SemaphoreType.DMA((16,)),
+        (pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),)
+        + ((pltpu.VMEM((2, tile, width), jnp.bfloat16),) if store_out else ())
+        + (
+            pltpu.VMEM(gate_w.shape, gate_w.dtype),
+            pltpu.VMEM(fb_w.shape, fb_w.dtype),
+            pltpu.VMEM(proj_w.shape, proj_w.dtype),
+            pltpu.VMEM(conv_w.shape, conv_w.dtype),
+            pltpu.VMEM(alog.shape, alog.dtype),
+            pltpu.VMEM(dt.shape, dt.dtype),
+            pltpu.VMEM(norm.shape, norm.dtype),
+            pltpu.VMEM((_HEADS, _CHANNELS, _CHANNELS), jnp.float32),
+            pltpu.VMEM((3, 3, _HEADS, _CHANNELS), jnp.bfloat16),
+            pltpu.SemaphoreType.DMA((2,)),
+        )
+        + ((pltpu.SemaphoreType.DMA((2,)),) if store_out else ())
+        + (pltpu.SemaphoreType.DMA((16,)),)
     )
 
 
@@ -5751,9 +5756,9 @@ def _kda_layer_body(
     gate_family_ref, fb_family_ref, proj_family_ref, conv_family_ref,
     alog_family_ref, dt_family_ref, kda_norm_family_ref,
     rec_in_ref, hist_in_ref, output_family_ref,
-    normalized_ref, gathered_ref, attended_ref, rec_out_ref, hist_out_ref,
+    normalized_ref, gathered_ref, rec_out_ref, hist_out_ref,
     final_ref, rec_checkpoint_ref, hist_checkpoint_ref, partial_ref,
-    pool, *scratch, eps, count, blocks,
+    pool, *scratch, eps, count, blocks, kda_tile=128,
 ):
     """One KDA layer of the family-major weights (``slot_ref``) over a
     packed window of ``count`` sequences, pipelined over its ``blocks`` SP
@@ -5772,7 +5777,7 @@ def _kda_layer_body(
     stripe = window_stripe(prefix_ref.shape[0])
     mix_small, gather_sems = scratch[:8], scratch[8:11]
     reduce_sems, projection_scratch = scratch[11:16], scratch[16:19]
-    kda_scratch = scratch[19:]
+    hidden_bufs, *kda_weights_and_state, hidden_sems, weight_sems = scratch[19:]
 
     def views(shapes):  # the shared pool: the mixture at step 0, then the projection ring
         offset, result = 0, []
@@ -5809,7 +5814,7 @@ def _kda_layer_body(
 
     # One call site for the KDA tile: inlined twice, the layer would no
     # longer fit the instruction memory.
-    block_tiles = 32 * stripe // 128
+    block_tiles = 32 * stripe // kda_tile
     attending = (phase >= 1) & (phase <= blocks)
     first_tile = jnp.where(
         attending, (phase - 1) * block_tiles + ring_step * block_tiles // HALF_STEPS, 0)
@@ -5820,8 +5825,9 @@ def _kda_layer_body(
         proj_family_ref.at[slot], conv_family_ref.at[slot],
         alog_family_ref.at[slot], dt_family_ref.at[slot],
         kda_norm_family_ref.at[slot], rec_in_ref, hist_in_ref,
-        attended_ref, rec_out_ref, hist_out_ref, *kda_scratch,
-        tile=128, decay_lower_bound=-5.0, epsilon=eps,
+        None, rec_out_ref, hist_out_ref,
+        hidden_bufs, None, *kda_weights_and_state, hidden_sems, None, weight_sems,
+        tile=kda_tile, decay_lower_bound=-5.0, epsilon=eps,
         checkpoint=(None, rec_checkpoint_ref, hist_checkpoint_ref),
         segments=(segment_ref, count),
         tiles=(first_tile, end_tile, step == HALF_STEPS,
@@ -5872,6 +5878,7 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
     rows, width = seq_len // 32, 7168
     stripe = window_stripe(rows)
     blocks = rows // stripe
+    kda_tile = 128
     if token_ranks is None:
         token_ranks = tuple(range(32))
     tables = jnp.asarray(
@@ -5905,15 +5912,14 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
         pltpu.SemaphoreType.REGULAR((streams,)),
         pltpu.SemaphoreType.DMA,
         pltpu.VMEM((384, width), jnp.bfloat16),  # the output projection
-        pltpu.VMEM((2, 128, width), jnp.bfloat16),  # its partials
+        pltpu.VMEM((2, kda_tile, width), jnp.bfloat16),  # its partials
         pltpu.SemaphoreType.DMA((2,)),
-        *kda_prefill_tiled_scratch_shapes(width, 128, *shapes),
+        *kda_prefill_tiled_scratch_shapes(width, kda_tile, *shapes, store_out=False),
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     output_shapes = (
         jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
         jax.ShapeDtypeStruct((seq_len, width), jnp.bfloat16),
-        jax.ShapeDtypeStruct((seq_len, 384), jnp.bfloat16),
         jax.ShapeDtypeStruct((*state_lead, 3, 128, 128), jnp.float32),
         jax.ShapeDtypeStruct((*state_lead, 3, 3, 3, 128), jnp.bfloat16),
         jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
@@ -5923,7 +5929,7 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
     )
     call = pl.pallas_call(
         functools.partial(
-            _kda_layer_body, count=segments, eps=eps, blocks=blocks,
+            _kda_layer_body, count=segments, eps=eps, blocks=blocks, kda_tile=kda_tile,
         ),
         out_shape=output_shapes,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -5948,8 +5954,9 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
             w["k_gate"], w["k_fb"], w["k_projection"], w["k_conv"],
             w["k_a_log"], w["k_dt"], w["k_norm"], rec[0], hist[0], w["k_o"],
         )
-        normalized, gathered, attended, new_rec, new_hist, final, rec_at, hist_at, _ = outputs
-        return (normalized[None], gathered, attended[None], new_rec[None],
+        normalized, gathered, new_rec, new_hist, final, rec_at, hist_at, _ = outputs
+        attended_stub = jnp.zeros((1, 0, 384), jnp.bfloat16)
+        return (normalized[None], gathered, attended_stub, new_rec[None],
                 new_hist[None], final[None], rec_at[None], hist_at[None])
 
     return jax.jit(jax.shard_map(

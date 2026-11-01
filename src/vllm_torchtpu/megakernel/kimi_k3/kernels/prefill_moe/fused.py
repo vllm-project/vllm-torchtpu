@@ -30,6 +30,7 @@ from .. import prefill_megakernel as k
 
 _COMPACT_8K_CAPACITY = 65536
 _RMW_BATCH = 2
+_RMW_DUMMY_SLOTS = 16
 
 
 def _sort_route_steps(keys, probabilities, *, size):
@@ -950,16 +951,17 @@ def _routed_experts(
     """Joint GU/SiTU/first-down pipeline followed by remaining columns."""
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
-    unroll = 8 if tokens < 8192 else 32
-    gu_unroll = 4 if tokens < 8192 else 8
-    first_down_unroll = 2 if tokens < 8192 else 8
-    metadata_row_capacity = 0 if tokens < 8192 else _COMPACT_8K_CAPACITY
-    ring_dtype = jnp.bfloat16
     assert tokens in (512, 1024, 2048, 4096, 8192)
     gu_width = gu_weights.shape[-1]
     assert gu_width % 2 == 0
     mid_width = gu_width // 2
     assert rhs.shape[-2] * 8 == mid_width
+    unroll = 8 if tokens < 8192 else (16 if mid_width == 768 else 32)
+    gu_unroll = 4 if tokens < 8192 else 8
+    first_down_unroll = 2 if tokens < 8192 else 8
+    first_tail_unroll = 8 if tokens < 8192 else (16 if mid_width == 768 else 8)
+    metadata_row_capacity = 0 if tokens < 8192 else _COMPACT_8K_CAPACITY
+    ring_dtype = jnp.bfloat16
     x = jax.ShapeDtypeStruct((tokens * 16, mid_width), latent.dtype)
     rows, width = (metadata_row_capacity or x.shape[0], rhs.shape[-1])
     assert rows <= x.shape[0]
@@ -1041,6 +1043,7 @@ def _routed_experts(
         rx,
         state,
         ring_meta,
+        moved_smem,
     ):
         w = dataclasses.replace(
             w, weight=w.weight.at[layer[0]], scale=w.scale.at[layer[0]]
@@ -1115,13 +1118,19 @@ def _routed_experts(
             for r in range(width_b):
                 sums.at[pl.ds(routes[r][0], 1)][...] = accs[r]
 
-        def batched_clamped(source, begin, base_idx, end, width_b, *, guard):
+        def batched_clamped(
+            source, begin, base_idx, end, width_b, *, guard, dummy_base=0
+        ):
             idxs = [base_idx + r for r in range(width_b)]
             actives = [guard & (idx_r < end) for idx_r in idxs]
             clamped = [jnp.minimum(idx_r, end - 1) for idx_r in idxs]
             routes = [route(c_r) for c_r in clamped]
             dests = [
-                jnp.where(actives[r], routes[r][0], tokens + r)
+                jnp.where(
+                    actives[r],
+                    routes[r][0],
+                    tokens + ((dummy_base + r) % _RMW_DUMMY_SLOTS),
+                )
                 for r in range(width_b)
             ]
             weights = [
@@ -1166,23 +1175,33 @@ def _routed_experts(
 
         gu_panels = pl.cdiv(gu_width, pltpu.get_tpu_info().mxu_column_size)
         moved_rows = gu_panels * gu_unroll
+        ep8_8k = tokens == 8192 and mid_width == 768
+        gu_u_by_bucket = (4, 8, 10, 12) if ep8_8k else (gu_unroll,) * 4
+        first_down_u_by_bucket = (
+            (4, 8, 12, 14) if ep8_8k else (first_down_unroll,) * 4
+        )
+        rem_down_u_by_bucket = (8, 16, 24, 24) if ep8_8k else (unroll,) * 4
 
-        def gu_work(g, panel):
+        def gu_work(g, panel, bucket_index=0):
+            gu_u = gu_u_by_bucket[bucket_index]
             previous_g = jnp.maximum(g - 1, 0)
             start = metadata.gm_id_to_m_offset[previous_g]
             end = metadata.gm_id_to_m_offset[previous_g + 1]
             begin = start // sub * sub
             previous = packed.at[(g + 1) % 2]
-            step_b = min(_RMW_BATCH, gu_unroll)
-            for row in range(0, gu_unroll, step_b):
+            step_b = min(_RMW_BATCH, gu_u)
+            for row in range(0, gu_u, step_b):
                 batched_clamped(
                     previous,
                     begin,
-                    start + panel * gu_unroll + row,
+                    start + panel * gu_u + row,
                     end,
                     step_b,
                     guard=(g > 0),
+                    dummy_base=panel * gu_u + row,
                 )
+            if ep8_8k and panel == gu_panels - 1:
+                moved_smem[0] = gu_panels * gu_u
 
         def inner(x, w, metadata, *, first=False, subtotal_vmem=None):
             g, n = (pl.program_id(1), 0 if first else pl.program_id(0) + 1)
@@ -1199,14 +1218,18 @@ def _routed_experts(
             previous_g = jnp.maximum(g - 1, 0)
             panel_count = pl.cdiv(tn, pltpu.get_tpu_info().mxu_column_size)
             down_unroll = first_down_unroll if first else unroll
+            gu_moved = moved_smem[0] if (first and ep8_8k) else (moved_rows if first else 0)
 
-            def overlap_work(panel):
+            def overlap_work(panel, bucket_index=0):
+                down_u = (
+                    first_down_u_by_bucket if first else rem_down_u_by_bucket
+                )[bucket_index]
                 start = metadata.gm_id_to_m_offset[previous_g]
                 end = metadata.gm_id_to_m_offset[previous_g + 1]
                 begin = start // sub * sub
-                base_off = (moved_rows if first else 0) + panel * down_unroll
-                step_b = min(_RMW_BATCH, down_unroll)
-                for row in range(0, down_unroll, step_b):
+                base_off = gu_moved + panel * down_u
+                step_b = min(_RMW_BATCH, down_u)
+                for row in range(0, down_u, step_b):
                     batched_clamped(
                         previous,
                         begin,
@@ -1214,7 +1237,10 @@ def _routed_experts(
                         end,
                         step_b,
                         guard=(g > 0),
+                        dummy_base=panel * down_u + row,
                     )
+                if ep8_8k and panel == panel_count - 1:
+                    moved_smem[0] = gu_moved + panel_count * down_u
 
             if not first:
 
@@ -1238,13 +1264,15 @@ def _routed_experts(
                 consume(
                     previous_g,
                     previous,
-                    (moved_rows if first else 0) + panel_count * down_unroll,
-                    loop_unroll=8 if first else unroll,
+                    moved_smem[0]
+                    if ep8_8k
+                    else ((moved_rows if first else 0) + panel_count * down_unroll),
+                    loop_unroll=first_tail_unroll if first else unroll,
                 )
 
             @pl.when(g == ng - 1)
             def finish():
-                consume(g, current, loop_unroll=8 if first else unroll)
+                consume(g, current, loop_unroll=first_tail_unroll if first else unroll)
                 if not first:
                     advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
                     emit_subtotals(subtotal_vmem)
@@ -1273,20 +1301,21 @@ def _routed_experts(
                 buffering, (gu_ws, ws), is_leaf=lambda v: isinstance(v, pl.BlockSpec)
             )
 
-            def bounds(g):
-                begin = metadata.gm_id_to_m_offset[g] // sub * sub
-                end = pl.cdiv(metadata.gm_id_to_m_offset[g + 1], sub) * sub
-                return (begin, end - begin)
+            def active_bounds(g):
+                raw_start = metadata.gm_id_to_m_offset[g]
+                raw_end = metadata.gm_id_to_m_offset[g + 1]
+                begin = raw_start // sub * sub
+                return (raw_start, raw_start - begin, raw_end - raw_start)
 
             def start(g, bank):
-                begin, nrows = bounds(g)
+                raw_start, first, n_active = active_bounds(g)
 
-                @pl.loop(0, nrows)
+                @pl.loop(0, n_active)
                 def row(i):
-                    source = destinations[begin + i]
+                    source = destinations[raw_start + i]
                     pltpu.make_async_copy(
                         latent.at[pl.ds(source, 1)],
-                        acts.at[bank, pl.ds(i, 1)],
+                        acts.at[bank, pl.ds(first + i, 1)],
                         act_sems.at[bank],
                     ).start()
 
@@ -1302,6 +1331,7 @@ def _routed_experts(
                     probabilities_ready()
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
                     packed.at[1][...] = jnp.zeros(packed.at[1].shape, packed.dtype)
+                    acts[...] = jnp.zeros(acts.shape, acts.dtype)
 
                 @pl.when(active_ng > 0)
                 def gate_up():
@@ -1309,9 +1339,14 @@ def _routed_experts(
                     def initial():
                         start(g, bank)
 
-                    _, nrows = bounds(g)
-                    active = acts.at[bank, pl.ds(0, nrows)]
-                    pltpu.make_async_copy(active, active, act_sems.at[bank]).wait()
+                    _, first, n_active = active_bounds(g)
+
+                    @pl.when(n_active > 0)
+                    def wait_active():
+                        active = acts.at[bank, pl.ds(first, n_active)]
+                        pltpu.make_async_copy(
+                            active, active, act_sems.at[bank]
+                        ).wait()
 
                     @pl.when(g + 1 < ng)
                     def following():
@@ -1324,7 +1359,7 @@ def _routed_experts(
                         gu_partial,
                         metadata,
                         cfgs=gu_cfg,
-                        overlap_work=lambda panel: gu_work(g, panel),
+                        overlap_work=lambda panel, b_idx=0: gu_work(g, panel, b_idx),
                     )
 
                 inner(gy, dw, metadata, first=True)
@@ -1436,7 +1471,7 @@ def _routed_experts(
             gm_id_to_m_offset=pltpu.SMEM((max_gm + 1,), jnp.int32),
         ),
         packed=pltpu.VMEM((2, tm, 2, packed_half), x.dtype),
-        sums=pltpu.VMEM((tokens + _RMW_BATCH, 2, packed_half), jnp.float32),
+        sums=pltpu.VMEM((tokens + _RMW_DUMMY_SLOTS, 2, packed_half), jnp.float32),
         cast=pltpu.VMEM((store_tile, tn), x.dtype),
         sends=pltpu.SemaphoreType.DMA((streams,)),
         receives=pltpu.SemaphoreType.DMA((2, streams)),
@@ -1446,6 +1481,7 @@ def _routed_experts(
         rx=pltpu.VMEM((2, localrows, tn), ring_dtype),
         state=pltpu.SMEM((1 + 2 * streams,), jnp.int32),
         ring_meta=pltpu.SMEM((6 * 34,), jnp.int32),
+        moved_smem=pltpu.SMEM((1,), jnp.int32),
     )
 
 
@@ -1554,7 +1590,11 @@ def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work):
     def product(bucket_index):
         rows = cfgs.tiles.bucket_base * (bucket_index + 1)
         value = _expert_product(
-            lhs, rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=overlap_work
+            lhs,
+            rhs,
+            cfgs=cfgs,
+            bucket_rows=rows,
+            overlap_work=lambda panel: overlap_work(panel, bucket_index),
         )
         value = k.apply_act_fn(value, cfgs.fuse_act)
         row = lax.broadcasted_iota(jnp.int32, value.shape, 0)
@@ -1567,9 +1607,9 @@ def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work):
             last % cfgs.dims.size_lhs_sublane == 0, zeros, output[last_row]
         )
 
-    # At 8K, share the 128-row product for both small buckets.
-    # Keep route order, trading padded work for fewer instruction overlays.
-    first_bucket = 1 if cfgs.tiles.tile_m == 256 else 0
+    # At EP16 (tile_n=1536, 12 GU panels), share the 128-row product to bound
+    # instruction size; at EP8 (tile_n=768, 6 GU panels), keep the 64-row bucket.
+    first_bucket = 1 if (cfgs.tiles.tile_m == 256 and cfgs.tiles.tile_n > 768) else 0
     branches = [
         functools.partial(product, bucket_index=i)
         for i in range(first_bucket, cfgs.tiles.tile_m // cfgs.tiles.bucket_base)
@@ -1593,23 +1633,26 @@ def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
     # GU already masks inactive rows; consume() visits only live routes.
     def product(bucket_index):
         rows = cfgs.tiles.bucket_base * (bucket_index + 1)
-        with jax.named_scope(f"bm{rows}_fragment"):
-            value = _expert_product(
-                lhs, rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=overlap_work
+        value = _expert_product(
+            lhs,
+            rhs,
+            cfgs=cfgs,
+            bucket_rows=rows,
+            overlap_work=lambda panel: overlap_work(panel, bucket_index),
+        )
+        if cfgs.tiles.tile_n == 896:
+            # Keep the half boundary on a complete 128-lane block.
+            # Only the final 128 elements are padding; the consumer trims
+            # them once per subtotal before communicating the 896 columns.
+            value = value.astype(output.dtype)
+            padded = jnp.concatenate(
+                (value, jnp.zeros((rows, 128), output.dtype)), axis=1
             )
-            if cfgs.tiles.tile_n == 896:
-                # Keep the half boundary on a complete 128-lane block.
-                # Only the final 128 elements are padding; the consumer trims
-                # them once per subtotal before communicating the 896 columns.
-                value = value.astype(output.dtype)
-                padded = jnp.concatenate(
-                    (value, jnp.zeros((rows, 128), output.dtype)), axis=1
-                )
-                output[:rows] = padded.reshape(rows, 2, 512)
-            else:
-                output[:rows] = value.astype(output.dtype).reshape(
-                    rows, 2, cfgs.tiles.tile_n // 2
-                )
+            output[:rows] = padded.reshape(rows, 2, 512)
+        else:
+            output[:rows] = value.astype(output.dtype).reshape(
+                rows, 2, cfgs.tiles.tile_n // 2
+            )
 
     branches = [
         functools.partial(product, bucket_index=i)
