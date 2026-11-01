@@ -46,6 +46,9 @@ from jax.experimental import pallas as pl
 
 # --- physical layout constants ------------------------------------------------
 LANE = 128  # bytes per sub-slot / TPU lane width
+# Boundary tokens `prepare_boundary_batch` packs per cache-row tile; tokens
+# sharing a NoPE / RoPE row never straddle two of these.
+ROW_TILE = 4
 SLOT_PACK = 4  # sub-slots packed into one physical HBM slot row
 N_FIELDS = 2  # values stored per token: kv + score
 FP32_BYTES = 4
@@ -184,6 +187,15 @@ def state_block_size(
     if peer_mode is None:
         return own
     return min(own, _state_page_capacity(peer_mode, kv_cache_block_size))
+
+
+def fetches_window_groups(mode: Mode) -> bool:
+    """Whether the kernel DMAs each token's window states in window order.
+
+    Otherwise it buffers whole state pages per token and gathers the window
+    rows out of them (`compute.gather_from_page_buffer`).
+    """
+    return mode is Mode.CSA
 
 
 @jax.tree_util.register_dataclass
@@ -418,6 +430,44 @@ class Configs:
         """Number of physical HBM rows per page in RoPE cache."""
         return self.physical_page_size // self.hbm_pack
 
+    # --- window groups (CSA) ------------------------------------------------
+    @property
+    def fetches_window_groups(self) -> bool:
+        return fetches_window_groups(self.dims.mode)
+
+    @property
+    def group_positions(self) -> int:
+        """Window positions per group: consecutive states one DMA fetches.
+
+        A boundary token's window ends at a multiple of compress_ratio, so its
+        groups start at multiples of this and never cross a state page.
+        """
+        ratio, block_size = self.dims.compress_ratio, self.state_block_size
+        group_positions = min(ratio, block_size)
+        assert max(ratio, block_size) % group_positions == 0, (ratio, block_size)
+        return group_positions
+
+    @property
+    def window_groups(self) -> int:
+        """Groups, and so state DMAs, per token's window."""
+        return self.window // self.group_positions
+
+    @property
+    def groups_per_page(self) -> int:
+        """Groups one state page holds, used and unused rows alike."""
+        group_rows = self.group_positions * self.state_rows_per_token
+        return self.state_physical_page_size // group_rows
+
+    def window_buffer_shape(self) -> tuple[int, ...]:
+        """Window-group VMEM block: (tile, groups, positions, state rows, lane)."""
+        return (
+            self._tile_n,
+            self.window_groups,
+            self.group_positions,
+            self.state_rows_per_token,
+            LANE,
+        )
+
     @property
     def pages_to_buffer_per_token(self) -> int:
         """Pages that must be resident to cover one token's window (+1 guard)."""
@@ -428,9 +478,14 @@ class Configs:
     def _tile_n(self) -> int:
         return self.tile_sizes.tile_n
 
+    @property
+    def compute_tile_n(self) -> int:
+        """Tokens compressed together out of the f32 window scratch."""
+        return ROW_TILE if self.fetches_window_groups else self._tile_n
+
     def window_shape(self) -> tuple[int, ...]:
         """f32 window scratch: (fields, tile, window, head_tiles, lane)."""
-        return (N_FIELDS, self._tile_n, self.window, self.head_tiles, LANE)
+        return (N_FIELDS, self.compute_tile_n, self.window, self.head_tiles, LANE)
 
     def window_bytes_shape(self) -> tuple[int, ...]:
         """uint8 view of the window scratch; each f32 lane -> FP32_BYTES rows.
@@ -443,7 +498,7 @@ class Configs:
         """
         return (
             N_FIELDS,
-            self._tile_n,
+            self.compute_tile_n,
             self.window,
             self.head_tiles,
             FP32_BYTES,

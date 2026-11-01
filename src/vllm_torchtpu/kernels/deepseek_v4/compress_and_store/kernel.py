@@ -26,11 +26,45 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config,
 )
 
+# Boundary tokens per grid step when the kernel fetches window groups.
+WINDOW_TILE_N = 4
+
+
+def _rows(ref, rows):
+    return None if ref is None else ref.at[rows]
+
+
+def fill_window(state_vmem, window_vmem, *, cfgs: config.Configs):
+    """Copies a row tile's window states into the f32 window scratch.
+
+    state_vmem: (ROW_TILE,) + cfgs.window_buffer_shape()[1:] int32 rows, as
+    `buffered_ref.WindowGroupRef` fetched them. Every slice is static.
+    """
+    group_positions = cfgs.group_positions
+    groups = cfgs.window_groups
+    field_rows = cfgs.field_rows
+    head_tiles = cfgs.head_tiles
+    for g in range(groups):
+        if cfgs.dims.overlap:
+            # The first half of an overlapping window reads the prev half
+            # of the state (see `gather_from_page_buffer`).
+            is_prev = g < groups // 2
+            kv_row = 0 if is_prev else field_rows
+            score_row = (2 if is_prev else 3) * field_rows
+        else:
+            kv_row, score_row = 0, field_rows
+        window_rows = pl.ds(g * group_positions, group_positions)
+        for field, row in ((0, kv_row), (1, score_row)):
+            words = state_vmem[:, g, :, pl.ds(row, head_tiles), :]
+            window_vmem[field, :, window_rows] = jax.lax.bitcast_convert_type(
+                words, jnp.float32
+            )
+
 
 def inner_kernel(
     cos_sin_vmem,
     out_vmem,
-    page_buffer_vmem,
+    state_vmem,
     rope_out_vmem,
     positions_ref,
     rms_weight_vmem_ref,
@@ -42,11 +76,71 @@ def inner_kernel(
     cfgs: config.Configs,
 ):
     tile_n = cfgs.tile_sizes.tile_n
+    global_idx = pl.program_id(0) * tile_n
+    compress = functools.partial(
+        compress_tile,
+        positions_ref=positions_ref,
+        rms_weight_vmem_ref=rms_weight_vmem_ref,
+        window_vmem=window_vmem,
+        kv_slot_mapping_ref=kv_slot_mapping_ref,
+        is_first_mask_ref=is_first_mask_ref,
+        is_first_mask_rope_ref=is_first_mask_rope_ref,
+        cfgs=cfgs,
+    )
+
+    if not cfgs.fetches_window_groups:
+        window_u8 = window_vmem.bitcast(jnp.uint8).reshape(
+            2, tile_n, cfgs.window, cfgs.head_tiles, 4, 128
+        )
+        compute.gather_from_page_buffer(
+            page_buffer=state_vmem,
+            positions_ref=positions_ref,
+            kv_window_u8=window_u8.at[0],
+            score_window_u8=window_u8.at[1],
+            global_idx=global_idx,
+            num_tokens=cfgs.dims.size_n,
+            window=cfgs.window,
+            block_size=cfgs.state_block_size,
+            pages_to_buffer_per_token=cfgs.pages_to_buffer_per_token,
+            field_rows=cfgs.field_rows,
+            state_rows_per_token=cfgs.state_rows_per_token,
+            overlap=cfgs.dims.overlap,
+            is_indexer=cfgs.dims.mode == config.Mode.CSA_INDEXER,
+        )
+        compress(cos_sin_vmem, out_vmem, rope_out_vmem, global_idx=global_idx)
+        return
+
+    row_tile = config.ROW_TILE
+    for r in range(tile_n // row_tile):
+        rows = pl.ds(r * row_tile, row_tile)
+        fill_window(state_vmem.at[rows], window_vmem, cfgs=cfgs)
+        compress(
+            _rows(cos_sin_vmem, rows),
+            out_vmem.at[rows],
+            _rows(rope_out_vmem, rows),
+            global_idx=global_idx + r * row_tile,
+        )
+
+
+def compress_tile(
+    cos_sin_vmem,
+    out_vmem,
+    rope_out_vmem,
+    *,
+    positions_ref,
+    rms_weight_vmem_ref,
+    window_vmem,
+    kv_slot_mapping_ref,
+    is_first_mask_ref,
+    is_first_mask_rope_ref,
+    global_idx,
+    cfgs: config.Configs,
+):
+    """Compresses, normalizes, ropes and packs the tokens whose windows
+    window_vmem holds; the other refs are views of those tokens' rows."""
+    tile_n = cfgs.compute_tile_n
     window = cfgs.window
     head_tiles = cfgs.head_tiles
-
-    pid = pl.program_id(0)
-    global_idx = pid * tile_n
 
     # Per-token window start = position - window + 1
     start_list = []
@@ -55,28 +149,6 @@ def inner_kernel(
         safe_idx = jax.lax.select(idx < cfgs.dims.size_n, idx, 0)
         start_list.append(positions_ref[safe_idx] - window + 1)
     start = jnp.stack(start_list)  # (tile_n,)
-
-    window_u8 = window_vmem.bitcast(jnp.uint8).reshape(
-        2, tile_n, window, head_tiles, 4, 128
-    )
-    kv_window_u8 = window_u8.at[0]
-    score_window_u8 = window_u8.at[1]
-
-    compute.gather_from_page_buffer(
-        page_buffer=page_buffer_vmem,
-        positions_ref=positions_ref,
-        kv_window_u8=kv_window_u8,
-        score_window_u8=score_window_u8,
-        global_idx=global_idx,
-        num_tokens=cfgs.dims.size_n,
-        window=window,
-        block_size=cfgs.state_block_size,
-        pages_to_buffer_per_token=cfgs.pages_to_buffer_per_token,
-        field_rows=cfgs.field_rows,
-        state_rows_per_token=cfgs.state_rows_per_token,
-        overlap=cfgs.dims.overlap,
-        is_indexer=cfgs.dims.mode == config.Mode.CSA_INDEXER,
-    )
 
     kv_val = window_vmem.at[0][...]  # (tile_n, window, head_tiles, 128)
     scores_val = window_vmem.at[1][...]  # (tile_n, window, head_tiles, 128)
@@ -298,6 +370,25 @@ def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
     return is_first.flatten()[:num_tokens]
 
 
+def window_group_index(positions, rows, block_table, *, cfgs: config.Configs):
+    """Each token's window groups, oldest first, as indices into the state rows
+    viewed as (num_pages * groups_per_page) groups.
+
+    Valid tokens are compression boundaries, so a window ends at a multiple of
+    compress_ratio and its groups are aligned. Positions before the request's
+    start are clamped to its first group and masked by the kernel.
+    """
+    ratio = cfgs.dims.compress_ratio
+    group_positions = cfgs.group_positions
+    window_end = (positions // ratio + 1) * ratio
+    offsets = group_positions * jnp.arange(cfgs.window_groups, dtype=positions.dtype)
+    starts = jnp.maximum(window_end[:, None] - cfgs.window + offsets[None, :], 0)
+    block_size = cfgs.state_block_size
+    pages = block_table[rows + starts // block_size]
+    groups = pages * cfgs.groups_per_page + (starts % block_size) // group_positions
+    return groups.reshape(-1)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -343,14 +434,15 @@ def compress_norm_rope_store(
     state_operand = None if state_cache is None or state_cache is cache else state_cache
     state_source = cache if state_operand is None else state_operand
 
+    mode = _select_mode(head_dim, overlap)
     cfgs = config.Configs.make(
-        _select_mode(head_dim, overlap),
+        mode,
         size_n=num_tokens,
         physical_page_size=cache.shape[1],
         state_physical_page_size=state_source.shape[1],
         state_block_size=state_block_size,
         rms_eps=rms_eps,
-        tile_n=4,
+        tile_n=WINDOW_TILE_N if config.fetches_window_groups(mode) else 4,
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
@@ -376,24 +468,35 @@ def compress_norm_rope_store(
 
     is_first_mask = compute_is_first_mask(
         kv_slot_mapping,
-        cfgs.tile_sizes.tile_n,
+        config.ROW_TILE,
         pack_factor=cfgs.tokens_in_second_minor,
     )
     is_first_mask_rope = compute_is_first_mask(
         kv_slot_mapping,
-        cfgs.tile_sizes.tile_n,
+        config.ROW_TILE,
         # TODO: this is confusing, should probably find a better name for it
         pack_factor=cfgs.hbm_pack,
     )
+    # The last grid step reads whole tiles of the per-token arrays.
+    pad = (-num_tokens) % cfgs.tile_sizes.tile_n
+    if pad:
+        positions = jnp.pad(positions, (0, pad))
+        token_to_req_indices = jnp.pad(token_to_req_indices, (0, pad))
+        kv_slot_mapping = jnp.pad(kv_slot_mapping, (0, pad), constant_values=-1)
+        is_first_mask = jnp.pad(is_first_mask, (0, pad))
+        is_first_mask_rope = jnp.pad(is_first_mask_rope, (0, pad))
+    rows = token_to_req_indices[:, None] * block_table_stride
     # Look up each token's state pages here so the kernel keeps only those
     # entries in SMEM; the full block table does not fit at long context lengths.
-    pages_per_token = cfgs.pages_to_buffer_per_token
-    offsets = jnp.arange(1 - pages_per_token, 1, dtype=positions.dtype)
-    window_blocks = jnp.maximum(
-        positions[:, None] // state_block_size + offsets[None, :], 0
-    )
-    rows = token_to_req_indices[:, None] * block_table_stride
-    token_pages = block_table[rows + window_blocks].reshape(-1)
+    if cfgs.fetches_window_groups:
+        token_pages = window_group_index(positions, rows, block_table, cfgs=cfgs)
+    else:
+        pages_per_token = cfgs.pages_to_buffer_per_token
+        offsets = jnp.arange(1 - pages_per_token, 1, dtype=positions.dtype)
+        window_blocks = jnp.maximum(
+            positions[:, None] // state_block_size + offsets[None, :], 0
+        )
+        token_pages = block_table[rows + window_blocks].reshape(-1)
     # Outer pallas_call operands, in call order. Optional operands are passed as
     # None to keep kernel_fn's argument positions fixed; pallas drops the Nones
     # when indexing, so alias indices count only the operands actually present.

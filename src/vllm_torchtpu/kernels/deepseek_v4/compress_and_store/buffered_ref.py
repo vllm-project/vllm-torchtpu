@@ -139,6 +139,44 @@ class PageBufferRef(_BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class WindowGroupRef(_BufferedRef):
+    # VMEM block: cfgs.window_buffer_shape()
+    #   (tile_n, window_groups, group_positions, state_rows_per_token, LANE)
+    # int32, each token's window states in window order.
+
+    def copy_in(self, src_ref, grid_indices):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
+        slot = self.current_copy_in_slot
+        sem = self.sem_recvs.at[slot]
+        pid = grid_indices[0]
+
+        # state_groups_ref: (num_pages * groups_per_page, group_positions,
+        # state_rows_per_token, LANE); group_index_ref[n * groups + g] is the
+        # group holding token n's g-th window group (see `window_group_index`).
+        state_groups_ref, group_index_ref = src_ref
+        groups = self.cfgs.window_groups
+        tile_n = self.cfgs.tile_sizes.tile_n
+        buffer_ref = cast(jax.Ref, self.window_ref.at[slot])
+        base = pid * tile_n * groups
+
+        for i in range(tile_n * groups):
+            group = group_index_ref[base + i]
+            dest = buffer_ref.at[i // groups, i % groups]
+            pltpu.make_async_copy(state_groups_ref.at[group], dest, sem).start()
+
+    def wait_in(self, src_ref, grid_indices):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
+        slot = self.current_wait_in_slot
+        sem = self.sem_recvs.at[slot]
+        vmem_ref = self.window_ref.at[slot]
+        # The copies fill the whole block, so one wait covers their bytes.
+        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class OutputRef(_BufferedRef):
     # VMEM block: cfgs.output_shape() -> (tile_n, record_rows, hbm_pack, last_dim_size)
 
@@ -433,7 +471,12 @@ def create_allocs_and_specs(
     is_first_mask_ref,
     is_first_mask_rope_ref,
 ) -> tuple[
-    tuple[CosSinRef | None, OutputRef, PageBufferRef, RoPEOutputRef | None],
+    tuple[
+        CosSinRef | None,
+        OutputRef,
+        PageBufferRef | WindowGroupRef,
+        RoPEOutputRef | None,
+    ],
     tuple[pl.BlockSpec | None, pl.BlockSpec, pl.BlockSpec, pl.BlockSpec | None],
     tuple[
         tuple[Any, ...] | None,
@@ -442,6 +485,14 @@ def create_allocs_and_specs(
         tuple[Any, ...] | None,
     ],
 ]:
+    if cfgs.fetches_window_groups:
+        # The window DMAs read the int32 state rows as they are: word l of a
+        # row is the bits of f32 lane l.
+        state_words_ref = cache_ref if state_cache_ref is None else state_cache_ref
+        num_pages = state_words_ref.shape[0]
+        state_groups_ref = state_words_ref.reshape(
+            num_pages * cfgs.groups_per_page, *cfgs.window_buffer_shape()[2:]
+        )
     # CSA's int32 NoPE / RoPE arrays (and a state array hosted on one) are
     # read and written through their uint8 slab view (see `csa_cache_layout`).
     cache_ref = csa_cache_layout.as_u8_slabs(cache_ref)
@@ -493,24 +544,40 @@ def create_allocs_and_specs(
     else:
         output_args = (cache_ref, kv_slot_mapping_ref)
 
-    # page_buffer
-    page_buffer_spec = pl.BlockSpec(
-        block_shape=cfgs.page_buffer_shape(),
-        memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0, 0, 0),
-    )
-    page_buffer_alloc = PageBufferRef.create(
-        spec=page_buffer_spec,
-        dtype_or_type=jnp.uint8,
-        buffer_type=pltpu.BufferType.INPUT,
-        buffer_count=2,
-        use_lookahead=False,
-        cfgs=cfgs,
-    )
-    page_buffer_args = (
-        cache_ref if state_cache_ref is None else state_cache_ref,
-        token_pages_ref,
-    )
+    # state: window groups, or whole pages to gather the window from
+    if cfgs.fetches_window_groups:
+        page_buffer_spec = pl.BlockSpec(
+            block_shape=cfgs.window_buffer_shape(),
+            memory_space=pltpu.VMEM,
+            index_map=lambda i: (i, 0, 0, 0, 0),
+        )
+        page_buffer_alloc = WindowGroupRef.create(
+            spec=page_buffer_spec,
+            dtype_or_type=jnp.int32,
+            buffer_type=pltpu.BufferType.INPUT,
+            buffer_count=2,
+            use_lookahead=False,
+            cfgs=cfgs,
+        )
+        page_buffer_args = (state_groups_ref, token_pages_ref)
+    else:
+        page_buffer_spec = pl.BlockSpec(
+            block_shape=cfgs.page_buffer_shape(),
+            memory_space=pltpu.VMEM,
+            index_map=lambda i: (i, 0, 0, 0),
+        )
+        page_buffer_alloc = PageBufferRef.create(
+            spec=page_buffer_spec,
+            dtype_or_type=jnp.uint8,
+            buffer_type=pltpu.BufferType.INPUT,
+            buffer_count=2,
+            use_lookahead=False,
+            cfgs=cfgs,
+        )
+        page_buffer_args = (
+            cache_ref if state_cache_ref is None else state_cache_ref,
+            token_pages_ref,
+        )
 
     # rope
     if cfgs.dims.has_rope_cache:
