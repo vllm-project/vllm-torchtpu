@@ -215,7 +215,13 @@ def test_prefill_keeps_formal_warmup_but_skips_duplicate_profile_warmup(
                 }
             )
         controls.append(url)
-        return response({"results": [{"rank": rank} for rank in range(8)]})
+        return response(
+            {
+                "results": [
+                    {"rank": rank, "prefix_hit_alignment": 16} for rank in range(8)
+                ]
+            }
+        )
 
     def metrics(*args, **kwargs):
         hits = sum(16 for r in requests if len(r["prompt"]) == 32)
