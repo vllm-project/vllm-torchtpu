@@ -152,6 +152,40 @@ A generation cap goes in `LM_EVAL_GEN_KWARGS` as `max_gen_toks`: the
 > wants `thinking`. Check the checkpoint's `chat_template.jinja` before assuming
 > the default lands.
 
+## Speculative Decoding (`run_benchmarks.sh --mode spec_bench`)
+
+`run_benchmarks.sh` supports two runner modes via `--mode serving|spec_bench`
+(or `BENCHMARK_MODE=serving|spec_bench`; distinct from `check_regression.py
+--mode perf|eval` above). In `spec_bench` mode, the runner sweeps batch size
+(`SPEC_BS_LIST`) × speculative draft tokens (`SPEC_K_LIST`) on the
+[Spec-Bench](https://github.com/hemingkx/Spec-Bench) dataset:
+
+1. Restarts `vllm serve` per `(BS, K)` cell with `--max-num-seqs <BS>` and
+   `--speculative-config` (`K=0` starts without `--speculative-config` as the
+   no-speculation baseline).
+2. Runs `SPEC_WARMUP_PROMPTS` warmup prompts and `SPEC_REPS` measured passes of
+   `vllm bench serve --dataset-name spec_bench --max-concurrency <BS>`.
+3. Saves per-cell results to `bs<BS>/k<K>_rep<N>.json` and aggregates mean E2E
+   time, speedup vs. `K=0`, and acceptance rate via `summarize_spec_bench.py`
+   into `spec_benchmark_summary.json` and `spec_benchmark_summary.md`.
+
+```bash
+./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-0.6b-ngram
+```
+
+### Spec-Bench Configs
+
+| Config | Model | Method | Draft | K swept | Topology |
+|--------|-------|--------|-------|---------|----------|
+| `qwen3-0.6b-ngram` | Qwen3-0.6B | `ngram` | - | `0 1 2 4` | TP=1 (smoke) |
+| `llama-3-8b-ngram` | Meta-Llama-3-8B-Instruct | `ngram` | - | `0 1 2 4 8` | TP=1 |
+| `llama-3.3-70b-eagle3` | Llama-3.3-70B-Instruct | `eagle3` | `Llama-3.3-70B-Instruct-Eagle3` | `0 1 2 3 4` | TP=8 |
+| `gemma-4-31b-it-mtp` | gemma-4-31B-it | `mtp` | `gemma-4-31B-it-assistant` | `0 1 2 3 4 5` | TP=8 |
+| `qwen3.5-397b-fp8-mtp` | Qwen3.5-397B-A17B-FP8 | `mtp` | built-in MTP head | `0 1 2 3 4 5` | TP=8, EP |
+| `qwen3-4b-dflash` | Qwen3-4B | `dflash` | `Qwen3-4B-DFlash-b16` | `0 15` | TP=1 |
+| `qwen3-4b-dspark` | Qwen3-4B | `dspark` | `dspark_qwen3_4b_block7` | `0 7` | TP=1 |
+| `qwen3.5-35b-fp8-dflash` | Qwen3.5-35B-A3B-FP8 | `dflash` | `Qwen3.5-35B-A3B-DFlash` | `0 15` | DP=2 × TP=4, EP |
+
 ## Prerequisites
 
 - vLLM installed (provides `benchmark_serving.py`)
@@ -164,7 +198,8 @@ A generation cap goes in `LM_EVAL_GEN_KWARGS` as `max_gen_toks`: the
 Results are saved to `benchmark_runs/` (gitignored). Each run creates a directory containing:
 
 - `config.json` — benchmark parameters
-- `isl<N>_osl<N>_c<N>.json` — per-combo results from benchmark_serving.py
+- `isl<N>_osl<N>_c<N>.json` — per-combo results from benchmark_serving.py (`serving` mode)
+- `bs<BS>/k<K>_rep<N>.json`, `spec_benchmark_summary.json`, `spec_benchmark_summary.md` — per-cell results and aggregated speedup/acceptance tables (`spec_bench` mode)
 - `server.log` — vLLM server output
 - `benchmark.log` — run metadata
 
@@ -173,6 +208,14 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8000` | Server port |
+| `BENCHMARK_MODE` | `serving` | Runner mode: `serving` or `spec_bench` (also `--mode`) |
 | `BENCHMARK_WARMUP_RUNS` | `0` | Full benchmark passes to discard before writing each gated result |
 | `EVAL_SOFT_FAIL` | `0` | `1` downgrades an eval regression to a `::warning` instead of failing the step. Perf regressions still fail. For a config whose eval baseline is new and whose run-to-run spread is not yet known — prefer it to `soft_fail` on the Buildkite step, which would mask the perf gate too. Forwarded into the pod by `.buildkite/kubernetes/common.sh` |
 | `RANGE_RATIO_STYLE` (config var) | `symmetric` | How `RANDOM_RANGE_RATIO` is interpreted: `symmetric` = vllm bench serve native `[(1-r)L, (1+r)L]`; `min` = benchmark_serving.py-style `[rL, L]`, translated for vllm bench serve |
+| `SPEC_METHOD` (config var) | (empty) | Speculative decoding method (`ngram`, `eagle3`, `mtp`, `dflash`, `dspark`); required when any `K > 0` |
+| `SPEC_DRAFT_MODEL` / `SPEC_DRAFT_TP` (config var) | (empty) / `TENSOR_PARALLELISM` | Draft model and its TP size for methods that use a separate drafter |
+| `SPEC_K_LIST` (config var) | `0 1 2 3 4 5` | Space-separated non-negative integer `K` values to sweep (`0` = baseline) |
+| `SPEC_BS_LIST` (config var) | `1 4 8` | Space-separated positive integer batch sizes (`--max-num-seqs` and `--max-concurrency`) |
+| `SPEC_BENCH_DATASET` / `SPEC_BENCH_CATEGORY` (config var) | auto-download / `summarization` | Path to Spec-Bench `question.jsonl` and category filter |
+| `SPEC_NUM_PROMPTS` / `SPEC_WARMUP_PROMPTS` / `SPEC_REPS` (config var) | `100` / `20` / `2` | Prompts per measured pass, warmup prompts per cell, and measured repetitions per cell |
+| `SERVED_MODEL_NAME` (config var) | (empty) | Optional `--served-model-name` passed in `spec_bench` mode |
