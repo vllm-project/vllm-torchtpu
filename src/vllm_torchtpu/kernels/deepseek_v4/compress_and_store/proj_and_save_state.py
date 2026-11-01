@@ -97,15 +97,6 @@ def _acc_half_rows(ref, half, num_halves, tile_n):
     ]
 
 
-def load_from_acc_ref(ref, half, num_halves, tile_n, dtype=None):
-    """Loads one output half of every token from the VMEM accumulator."""
-    ref_flat, rows = _acc_half_rows(ref, half, num_halves, tile_n)
-    vec = jnp.concat([ref_flat[r] for r in rows], axis=1)
-    if dtype is not None:
-        return pltpu.bitcast(vec, dtype)
-    return vec
-
-
 def store_to_acc_ref(ref, val, half, num_halves, tile_n):
     """Stores one output half of every token to the VMEM accumulator."""
     num_lanes = 128
@@ -278,7 +269,7 @@ def kernel(
                     partial_ref[...] = acc_val
             return acc_val
 
-        def _add_ape():
+        def _ape_rows():
             tile_positions = tiled_positions_ref[...]
             ape_rows = tile_positions % cfgs.dims.compress_ratio
             ape_val = ape[...].astype(jnp.float32)
@@ -291,14 +282,9 @@ def kernel(
             one_hot = (
                 ape_rows[:, None] == jnp.arange(cfgs.dims.compress_ratio)[None, :]
             ).astype(jnp.float32)
-            ape_selected = jnp.matmul(
+            return jnp.matmul(
                 one_hot, ape_val, precision=lax.Precision.HIGHEST
             )  #  (tile_n, state_width)
-            existing_acc = load_from_acc_ref(
-                acc, m_idx, num_m, tile_n, dtype=jnp.float32
-            )
-            new_acc = existing_acc + ape_selected  # (tile_n, state_width)
-            store_to_acc_ref(acc, new_acc, m_idx, num_m, tile_n)
 
         def process(copy_dma: bool, add_ape: bool):
             # 1. The previous group's copies still in flight read the last
@@ -314,12 +300,15 @@ def kernel(
                 prev_g_idx = lax.select(first_n, g_idx - 1, g_idx)
                 _dma_copy_out(prev_g_idx, prev_n_idx)
 
-            # 3. Matmul over the whole hidden dimension
-            store_to_acc_ref(acc, _matmul(), m_idx, num_m, tile_n)
-
-            # 4. APE addition
+            # 3. Matmul over the whole hidden dimension, plus the APE rows
+            # on the score half, stored once. The APE product is traced
+            # first: a sum defined before it would be folded into its MXU
+            # accumulation (a Mosaic scheduling heuristic, not a guarantee).
+            ape_selected = _ape_rows() if add_ape else None
+            new_acc = _matmul()
             if add_ape:
-                _add_ape()
+                new_acc = new_acc + ape_selected
+            store_to_acc_ref(acc, new_acc, m_idx, num_m, tile_n)
 
         # Select and execute
         is_score = m_idx * tile_m >= state_width
