@@ -418,6 +418,9 @@ def check_config(vllm_config: Any) -> None:
         "needs data_parallel_size 1": parallel.data_parallel_size != 1,
         "needs pipeline_parallel_size 1": parallel.pipeline_parallel_size != 1,
         "needs tensor_parallel_size > 1": parallel.tensor_parallel_size < 2,
+        # Upstream's fp16 overflow rescaling of the residual is not repeated
+        # on the split path.
+        "needs a bfloat16 model": vllm_config.model_config.dtype != torch.bfloat16,
         "does not take speculative decoding (the drafter is traced once for "
         "every bucket)": vllm_config.speculative_config is not None,
         "does not take TPU_MOE_SEQUENCE_PARALLEL": envs.TPU_MOE_SEQUENCE_PARALLEL,

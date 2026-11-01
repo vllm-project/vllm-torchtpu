@@ -116,7 +116,7 @@ def test_applies_only_to_large_backbone_buckets(flag, tag, tokens, want):
         assert sp.applies(tokens) is want
 
 
-def _config(**parallel):
+def _config(dtype=torch.bfloat16, **parallel):
     p = dict(
         enable_expert_parallel=True,
         data_parallel_size=1,
@@ -125,7 +125,9 @@ def _config(**parallel):
     )
     p.update(parallel)
     return SimpleNamespace(
-        parallel_config=SimpleNamespace(**p), speculative_config=None
+        parallel_config=SimpleNamespace(**p),
+        speculative_config=None,
+        model_config=SimpleNamespace(dtype=dtype),
     )
 
 
@@ -172,6 +174,16 @@ def test_unserved_configs_are_refused(parallel, flags, match):
     try:
         with pytest.raises(NotImplementedError, match=match):
             sp.check_config(_config(**parallel))
+    finally:
+        for p in patches:
+            p.stop()
+
+
+def test_non_bf16_models_are_refused():
+    patches = _with_envs()
+    try:
+        with pytest.raises(NotImplementedError, match="bfloat16"):
+            sp.check_config(_config(dtype=torch.float16))
     finally:
         for p in patches:
             p.stop()
