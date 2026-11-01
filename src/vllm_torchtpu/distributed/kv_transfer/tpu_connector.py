@@ -2812,6 +2812,11 @@ class TPURaidenConnectorWorker:
         # Loads parked for per-step re-attempt while their producer
         # request-block registrations are in flight (_Stage3PendingSubmit).
         self._stage3_pending_submits: dict[str, _Stage3PendingSubmit] = {}
+        # Loads waiting for model-owned destination room
+        # (_stage3_reserve_destination), by destination req id -> (metadata,
+        # wall-clock deadline). Every TP rank re-drives them on each submit
+        # pass, in the same order, since the reservation is collective.
+        self._stage3_destination_waits: dict[str, tuple[Any, float]] = {}
         # Collective membership stays identical on every TP rank, including
         # while the leader is between registration retries. Only the leader
         # owns submit tasks, retry clocks and controller RPC deadlines.
@@ -5702,7 +5707,15 @@ class TPURaidenConnectorWorker:
         if self._stage3_sharded_consumer():
             tp_group = get_tp_group() if self._stage3_kimi else self._stage3_tp_group()
 
-        for destination_req_id, req_meta in metadata.reqs_to_load.items():
+        # Loads parked for destination room go first, oldest first, then
+        # this step's new ones.
+        waiting = [(d, meta) for d, (meta, _) in self._stage3_destination_waits.items()]
+        loads = waiting + [
+            (d, meta)
+            for d, meta in metadata.reqs_to_load.items()
+            if d not in self._stage3_destination_waits
+        ]
+        for destination_req_id, req_meta in loads:
             if not isinstance(req_meta, _Stage3LoadMeta):
                 raise TypeError(
                     "Stage-3 consumer requires controller load metadata, got "
@@ -5784,10 +5797,21 @@ class TPURaidenConnectorWorker:
             self._stage3_load_start_times[destination_req_id] = time.perf_counter()
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
-            if not self._stage3_reserve_destination(
+            if self._stage3_reserve_destination(destination_req_id, req_meta, tp_group):
+                self._stage3_destination_waits.pop(destination_req_id, None)
+            elif not self._stage3_destination_wait_expired(
                 destination_req_id, req_meta, tp_group
             ):
-                # No model-owned destination room: fail the load so vLLM
+                # No model-owned destination room yet: park the load and
+                # re-attempt it on the next submit pass. The metadata and
+                # block list stay, so an abort while parked resolves through
+                # get_finished's cleanup like an unsubmitted load.
+                self._stage3_submitted_loads.pop(destination_req_id, None)
+                self._stage3_submitted_load_tokens.pop(destination_req_id, None)
+                self._stage3_load_start_times.pop(destination_req_id, None)
+                continue
+            else:
+                # Still no room after the wait budget: fail the load so vLLM
                 # recomputes the request rather than waiting on it.
                 self._record_stage3_load_failure(destination_req_id, local_blocks)
                 if tp_group is None or self.tp_rank == 0:
@@ -6432,6 +6456,37 @@ class TPURaidenConnectorWorker:
                         time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
                     )
 
+    def _stage3_destination_wait_expired(self, destination_req_id, req_meta, tp_group) -> bool:
+        """Whether a load without destination room has waited long enough.
+
+        Collective over the TP group when there is one (any rank expired
+        expires all), so every rank parks or fails it alike. The budget is
+        half the producer's registration lease, so a parked load never
+        outlives the pages it is waiting to pull.
+        """
+        now = time.time()
+        _, deadline = self._stage3_destination_waits.get(
+            destination_req_id,
+            (req_meta, now + 0.5 * float(dist_utils.get_p2p_wait_pull_timeout())),
+        )
+        self._stage3_destination_waits[destination_req_id] = (req_meta, deadline)
+        expired = now >= deadline
+        if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+            flag = torch.tensor([int(expired)], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=tp_group.cpu_group
+            )
+            expired = bool(flag.item())
+        if expired:
+            self._stage3_destination_waits.pop(destination_req_id, None)
+            logger.warning(
+                "Stage-3 load found no destination room within %.0fs; the decode "
+                "recomputes it destination_req_id=%s",
+                0.5 * float(dist_utils.get_p2p_wait_pull_timeout()),
+                destination_req_id,
+            )
+        return expired
+
     def _drain_stage3_pending_submits(self, finished_req_ids: set[str] | None) -> None:
         """Re-attempts parked Stage-3 loads once per scheduler step, paced
         by the re-attempt interval."""
@@ -6721,6 +6776,7 @@ class TPURaidenConnectorWorker:
             )
         )
         for req_id in cleanup_req_ids:
+            self._stage3_destination_waits.pop(req_id, None)
             self._stage3_finish_destination(req_id, False)
             req_meta = self._stage3_submitted_load_metas.pop(req_id, None)
             if (

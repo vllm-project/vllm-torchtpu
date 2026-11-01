@@ -265,10 +265,10 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             return True
         ok = staging.reserve(int(req_meta.uuid), int(req_meta.num_tokens), tp_group)
         if not ok:
-            logger.warning(
-                "Qwen PD staging full (%d pages): req=%s recomputes on the decode",
-                staging.pages,
-                destination_req_id,
+            # The load parks and is re-attempted each step until room frees
+            # (or the wait budget ends; the connector logs that fallback).
+            logger.debug(
+                "Qwen PD staging full (%d pages): req=%s waits", staging.pages, destination_req_id
             )
         return ok
 
