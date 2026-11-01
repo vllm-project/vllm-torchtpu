@@ -14,7 +14,7 @@ to copy for a new model.
 | `hf_oracle.py` | the Hugging Face `transformers` reference used by verification |
 | `profiles/` | `qwen35-baseline` (`baseline.py`), `qwen35-candidate30[-fused]` (`candidate30.py`); `PROFILES`, `DEFAULT_PROFILE` |
 | `tests/` | the CPU end-to-end test (fake runner, no TPU) |
-| `serving/` | `serve.sh`, `run_real_ckpt_smoke.py`, `mk-real-ckpt-smoke.yml`, `BENCH.md` |
+| `serving/` | `serve.sh`, `run_real_ckpt_smoke.py`, `mk-real-ckpt-smoke.yml`, `acceptance_benchmark.py`, `BENCH.md` |
 
 Importing the folder registers nothing; `model.register()` adds `Qwen35` and
 its profiles to the library registries for by-name lookups, and `create`
@@ -114,7 +114,7 @@ checkout that registers it locally. Optional recipe variables: `IMAGE`, `CPU`,
 
 ### 5. Benchmark
 
-See `serving/BENCH.md`.
+See `serving/BENCH.md` (`serving/acceptance_benchmark.py`).
 
 ## Expected log lines
 
