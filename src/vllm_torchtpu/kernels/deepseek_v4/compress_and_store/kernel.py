@@ -27,7 +27,7 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
 )
 
 # Boundary tokens per grid step when the kernel fetches window groups.
-WINDOW_TILE_N = 4
+WINDOW_TILE_N = 16
 
 
 def _rows(ref, rows):
