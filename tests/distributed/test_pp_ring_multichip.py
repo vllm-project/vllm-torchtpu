@@ -44,7 +44,8 @@ WORLD_SIZE = 2
 HIDDEN = 256
 MAX_ROWS = 64
 BUCKETS = (8, 16, 32, 64)
-LAUNCH_TIMEOUT_SECONDS = 900
+# Stays below the multichip lane's pytest timeout, so _launch stops the group.
+LAUNCH_TIMEOUT_SECONDS = 480
 
 
 SKIP_EXIT_CODE = 75
@@ -218,9 +219,20 @@ def _launch(result_dir: Path) -> subprocess.CompletedProcess[str]:
     try:
         output, _ = process.communicate(timeout=LAUNCH_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as exc:
-        os.killpg(process.pid, signal.SIGTERM)
         output = exc.output or ""
-        process.wait(timeout=60)
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+    finally:
+        # A timeout, or an error such as pytest's own timeout firing inside
+        # communicate, leaves the launcher and its torchrun workers holding
+        # the devices: stop the whole group.
+        if process.returncode is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
     return subprocess.CompletedProcess(process.args, process.returncode, output, "")
 
 
