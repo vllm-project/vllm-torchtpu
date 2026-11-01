@@ -43,10 +43,13 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 LANES = 16
 NUM_BUCKETS = 256
-# Largest per-subcore resident slice, in 32-bit words (128KB; double-buffered by
-# emit_pipeline to 256KB out of the 512KB tile memory). Rows that would need more
+# Largest per-subcore resident slice, in 32-bit words (128KB; double-buffered to
+# 256KB out of the 512KB tile memory). Rows that would need more
 # than 16 slices use slices of up to twice this, single-buffered instead.
 MAX_SLICE_WORDS = 32 * 1024
+# Most rows the single-row path streams: it keeps every row's length resident in
+# tile memory (64KB at this cap) next to its two score slots.
+MAX_STREAMED_ROWS = 16 * 1024
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
 
@@ -84,6 +87,9 @@ def _topk_body(
     shared_counts_vmem,
     shared_idx_vmem,
     shared_key_vmem,
+    lengths_vmem,
+    score_slots_vmem,
+    fetch_sems,
     *,
     b: int,
     n: int,
@@ -93,8 +99,14 @@ def _topk_body(
     num_waves: int,
     write_empty: bool,
     return_scores: bool,
+    streamed: bool,
     local_idxs_hbm: Any = None,
 ):
+    """Selects each row's top-k on its subcore (group).
+
+    When ``streamed``, ``scores_hbm`` is i32[b * slice_len] and ``lengths_hbm`` is
+    i32[padded_b]: each row is fetched by hand up to its length.
+    """
     dcp_merge = local_idxs_hbm is not None
     num_subcores = 16
     num_sc_cores = 2
@@ -203,29 +215,33 @@ def _topk_body(
             body
         )  # pytype: disable=bad-argument-type
 
+    def wave_row(w):
+        if p == 1:
+            return w * (num_sc_cores * num_subcores) + flat
+        return w * groups_per_chip + core * groups_per_core + group_id
+
+    def live_words(row, row_len):
+        """Effective row length and the words of this slice the step reads."""
+        active = row < b
+        row_eff_len = jnp.int32(n) if dcp_merge else jnp.minimum(row_len, n)
+        row_eff_len = jnp.where(active, row_eff_len, 0)
+        if p == 1:
+            i_hi = jnp.where(row_eff_len > 0, jnp.minimum(slice_len, row_eff_len), 0)
+        else:
+            i_hi = jnp.clip(row_eff_len - col_base, 0, slice_len)
+        return row_eff_len, i_hi
+
     def _run_step(
         scores_vmem,
-        len_slice_vmem,
+        row_len,
         out_vmem: Any = None,
         keys_vmem: Any = None,
         local_idxs_vmem: Any = None,
     ):
         w = pl.program_id(0)
-        row = (
-            w * (num_sc_cores * num_subcores) + flat
-            if p == 1
-            else w * groups_per_chip + core * groups_per_core + group_id
-        )
+        row = wave_row(w)
         active = row < b
-        row_eff_len = (
-            jnp.int32(n) if dcp_merge else jnp.minimum(vec_at(len_slice_vmem, 0), n)
-        )
-        row_eff_len = jnp.where(active, row_eff_len, 0)
-
-        if p == 1:
-            i_hi = jnp.where(row_eff_len > 0, jnp.minimum(slice_len, row_eff_len), 0)
-        else:
-            i_hi = jnp.clip(row_eff_len - col_base, 0, slice_len)
+        row_eff_len, i_hi = live_words(row, row_len)
         walk_chunks = _cdiv_dyn(i_hi)
 
         zero_hist(NUM_BUCKETS // LANES)
@@ -358,7 +374,7 @@ def _topk_body(
             whole_bucket = take_all_ties | (my_take <= 0)
 
         if dcp_merge:
-            score_chunk_base = vec_at(len_slice_vmem, 0) * (k // LANES)
+            score_chunk_base = row_len * (k // LANES)
             emit_chunks = jnp.where(active, k // LANES, 0)
 
             def count_prior_ties(i, rank):
@@ -556,9 +572,62 @@ def _topk_body(
                     )
 
     cores_per_chip = num_sc_cores * num_subcores
-    # A slice past MAX_SLICE_WORDS only fits in tile memory single-buffered.
-    buf_count = 1 if (num_waves == 1 or slice_len > MAX_SLICE_WORDS) else 2
-    if p == 1:
+    buf_count = _buffer_count(num_waves, slice_len)
+    if streamed:
+        # Each row's live words are DMA'd straight from HBM, one wave ahead, so a
+        # row only moves as many words as its length lets the step read.
+        assert buf_count == 2 or num_waves == 1, "prefetch needs a second slot"
+        pltpu.sync_copy(
+            lengths_hbm, lengths_vmem.at[pl.ds(0, num_waves * cores_per_chip)]
+        )
+
+        def row_length(w):
+            return vec_at(lengths_vmem, wave_row(w))
+
+        def score_slot(slot):
+            return pl.ds(pl.multiple_of(slot * slice_len, LANES), slice_len)
+
+        def row_fetch(w, slot):
+            row = wave_row(w)
+            _, i_hi = live_words(row, row_length(w))
+            words = pl.multiple_of(_cdiv_dyn(i_hi) * LANES, LANES)
+            copy = pltpu.make_async_copy(
+                scores_hbm.at[pl.ds(pl.multiple_of(row * slice_len, LANES), words)],
+                score_slots_vmem.at[score_slot(slot)].at[pl.ds(0, words)],
+                fetch_sems.at[slot],
+            )
+            return words > 0, copy
+
+        def wave_slot(w):
+            return jnp.bitwise_and(w, buf_count - 1)
+
+        def start_fetch(w):
+            has_words, copy = row_fetch(w, wave_slot(w))
+            pl.when(has_words)(copy.start)
+
+        start_fetch(jnp.int32(0))
+
+        def pipeline_step_streamed(*out_vmems):
+            w = pl.program_id(0)
+            slot = wave_slot(w)
+            pl.when(w + 1 < num_waves)(lambda: start_fetch(w + 1))
+            has_words, copy = row_fetch(w, slot)
+            pl.when(has_words)(copy.wait)
+            _run_step(score_slots_vmem.at[score_slot(slot)], row_length(w), *out_vmems)
+
+        out_spec = pl.BlockSpec(
+            (k,),
+            lambda w: (w * cores_per_chip + flat,),
+            pipeline_mode=pl.Buffered(buf_count),
+        )
+        outs = (out_hbm, keys_hbm) if return_scores else (out_hbm,)
+        pltpu.emit_pipeline(
+            pipeline_step_streamed,
+            grid=(num_waves,),
+            in_specs=(),
+            out_specs=(out_spec,) * len(outs),
+        )(*outs)
+    elif p == 1:
         in_specs = (
             pl.BlockSpec(
                 (slice_len,),
@@ -576,7 +645,7 @@ def _topk_body(
             def pipeline_step_p1_scores(
                 scores_vmem, len_slice_vmem, out_vmem, keys_vmem
             ):
-                _run_step(scores_vmem, len_slice_vmem, out_vmem, keys_vmem)
+                _run_step(scores_vmem, vec_at(len_slice_vmem, 0), out_vmem, keys_vmem)
 
             out_specs = (
                 pl.BlockSpec(
@@ -601,7 +670,7 @@ def _topk_body(
             def pipeline_step_p1_idx(scores_vmem, len_slice_vmem, *rest_vmem):
                 _run_step(
                     scores_vmem,
-                    len_slice_vmem,
+                    vec_at(len_slice_vmem, 0),
                     rest_vmem[-1],
                     None,
                     rest_vmem[0] if dcp_merge else None,
@@ -624,7 +693,7 @@ def _topk_body(
     else:
 
         def pipeline_step_coop(scores_vmem, len_slice_vmem):
-            _run_step(scores_vmem, len_slice_vmem)
+            _run_step(scores_vmem, vec_at(len_slice_vmem, 0))
 
         in_specs = (
             pl.BlockSpec(
@@ -644,6 +713,11 @@ def _topk_body(
             in_specs=in_specs,
             out_specs=(),
         )(scores_hbm, lengths_hbm)
+
+
+def _buffer_count(num_waves: int, slice_len: int) -> int:
+    # A slice past MAX_SLICE_WORDS only fits in tile memory single-buffered.
+    return 1 if (num_waves == 1 or slice_len > MAX_SLICE_WORDS) else 2
 
 
 def _sc_topk_direct(
@@ -683,13 +757,19 @@ def _sc_topk_direct(
     padded_b = num_waves * groups_per_chip
     pad_b = padded_b - b
     pad_n = slice_len * p - n
-    if pad_b > 0 or pad_n > 0:
-        words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
+    streamed = p == 1 and local_idxs is None and padded_b <= MAX_STREAMED_ROWS
+    # A streamed row past b has length 0 and is never fetched, so it needs no words.
+    pad_rows = 0 if streamed else pad_b
+    if pad_rows > 0 or pad_n > 0:
+        words = jnp.pad(words, ((0, pad_rows), (0, pad_n)))
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
-    if p > 1:
-        lengths = jnp.repeat(lengths, p)
-    lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
+    if streamed:
+        lengths_in = lengths
+    else:
+        if p > 1:
+            lengths = jnp.repeat(lengths, p)
+        lengths_in = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1))).reshape(-1)
 
     extra_inputs = ()
     if local_idxs is not None:
@@ -730,6 +810,13 @@ def _sc_topk_direct(
         pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32)
         if (p > 1 and return_scores)
         else None,  # shared_key_vmem
+        pltpu.VMEM((padded_b + LANES,), jnp.int32)
+        if streamed
+        else None,  # lengths_vmem
+        pltpu.VMEM((_buffer_count(num_waves, slice_len) * slice_len,), jnp.int32)
+        if streamed
+        else None,  # score_slots_vmem
+        pltpu.SemaphoreType.DMA((2,)) if streamed else None,  # fetch_sems
     )
 
     body_fn = functools.partial(
@@ -742,6 +829,7 @@ def _sc_topk_direct(
         num_waves=num_waves,
         write_empty=write_empty,
         return_scores=return_scores,
+        streamed=streamed,
     )
     if local_idxs is not None:
         orig_body = body_fn
@@ -758,7 +846,7 @@ def _sc_topk_direct(
         scratch_types=scratch_types,
         mesh=mesh,
         name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}",
-    )(words.reshape(-1), lengths_2d.reshape(-1), *extra_inputs)
+    )(words.reshape(-1), lengths_in, *extra_inputs)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
