@@ -85,31 +85,64 @@ def _ring_all_gather(x: jax.Array, axis_name: str, ring: tuple[int, ...]) -> jax
     return out
 
 
+def _permute_all_gather(x: jax.Array, axis_name: str, n: int) -> jax.Array:
+    """`lax.all_gather(x, axis_name)` by `n - 1` independent collective-
+    permutes (rank r sends to r + k for each k): async on the TensorCores'
+    DMA engines, and no step waits for another."""
+    rank = lax.all_to_all(jnp.arange(n, dtype=jnp.int32), axis_name, 0, 0, tiled=True)
+    out = jnp.zeros((n, *x.shape), x.dtype)
+    out = lax.dynamic_update_index_in_dim(out, x, rank[0], 0)
+    for k in range(1, n):
+        y = lax.ppermute(x, axis_name, [(r, (r + k) % n) for r in range(n)])
+        out = lax.dynamic_update_index_in_dim(out, y, (rank[0] - k) % n, 0)
+    return out
+
+
+# How `gather_shards` moves each of (o_proj, W_UV, scale): all-gathers
+# (offloaded to the SparseCores from the serving offload size up, synchronous
+# on the TensorCores below it), collective-permutes around a ring of the slice,
+# or independent collective-permutes from every rank.
+GATHERS = {
+    "allgather": ("ag", "ag", "ag"),
+    "ring": ("ring", "ring", "ring"),
+    # The 1 MiB-per-rank W_UV and scale shards are below the offload size.
+    "hybrid": ("ag", "permute", "permute"),
+}
+
+
 def gather_shards(
     w_o: jax.Array,
     w_uv: jax.Array,
     w_scale: jax.Array,
     after: jax.Array,
     axis_name: str,
+    mode: str = "allgather",
     ring: tuple[int, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Every rank's shards, inside a `shard_map`: o_proj `[k, n_out]` fp8,
     W_UV `[heads, kv_lora_rank, v_head_dim]` and the o_proj scale `[n_out]`
     become `([shards, k, n_out], [shards * heads, kv_lora_rank, v_head_dim],
-    [shards, n_out] f32)` -- one all-gather of the three (offloaded to the
-    SparseCores), or with `ring` (`ring_order`) collective-permutes around
-    it. The gather starts no earlier than `after` exists: a gather that reads
-    only weights would otherwise be hoisted to the start of the step, every
-    layer's at once."""
-    w_o, w_uv, w_scale, _ = lax.optimization_barrier(
-        (w_o, w_uv, w_scale.astype(jnp.float32), after)
+    [shards, n_out] f32)`, each moved as `GATHERS[mode]` says (`ring`:
+    `ring_order`). The gather starts no earlier than `after` exists: a gather
+    that reads only weights would otherwise be hoisted to the start of the
+    step, every layer's at once."""
+    how = GATHERS[mode]
+    if set(how) - {"ag"} and ring is None:
+        raise ValueError(f"gather mode {mode} needs a ring order")
+    parts = list(
+        lax.optimization_barrier((w_o, w_uv, w_scale.astype(jnp.float32), after))[:3]
     )
-    if ring is None:
-        w_o, w_uv, w_scale = lax.all_gather((w_o, w_uv, w_scale), axis_name)
-    else:
-        w_o, w_uv, w_scale = (
-            _ring_all_gather(t, axis_name, ring) for t in (w_o, w_uv, w_scale)
-        )
+    by_ag = [i for i, h in enumerate(how) if h == "ag"]
+    if by_ag:
+        gathered = lax.all_gather(tuple(parts[i] for i in by_ag), axis_name)
+        for i, g in zip(by_ag, gathered):
+            parts[i] = g
+    for i, h in enumerate(how):
+        if h == "ring":
+            parts[i] = _ring_all_gather(parts[i], axis_name, ring)
+        elif h == "permute":
+            parts[i] = _permute_all_gather(parts[i], axis_name, len(ring))
+    w_o, w_uv, w_scale = parts
     return w_o, w_uv.reshape(-1, *w_uv.shape[2:]), w_scale
 
 

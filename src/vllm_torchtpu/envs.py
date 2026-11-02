@@ -1168,11 +1168,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MLA_PREFILL_SEQUENCE_ROWS": env_bool(
         "TPU_MLA_PREFILL_SEQUENCE_ROWS", default=False
     ),
-    # How TPU_MLA_PREFILL_SEQUENCE_ROWS gathers the o_proj / W_UV shards: one
-    # all-gather (offloaded to the SparseCores) or collective-permutes around a
-    # ring of the slice (TensorCore DMAs).
+    # How TPU_MLA_PREFILL_SEQUENCE_ROWS gathers the o_proj / W_UV / scale
+    # shards (`kernels/mla/rows_oproj.py` GATHERS): all-gathers, collective-
+    # permutes around a ring of the slice, or o_proj by all-gather and the small
+    # W_UV / scale shards by the ring.
     "TPU_MLA_PREFILL_ROWS_GATHER": env_with_choices(
-        "TPU_MLA_PREFILL_ROWS_GATHER", "allgather", ["allgather", "ring"]
+        "TPU_MLA_PREFILL_ROWS_GATHER", "allgather", ["allgather", "ring", "hybrid"]
     ),
     # Smallest bucket TPU_MLA_PREFILL_SEQUENCE_ROWS takes (the shard gather is
     # the same size at every bucket; the collectives it replaces scale with it).

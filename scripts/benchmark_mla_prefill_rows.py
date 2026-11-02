@@ -613,7 +613,7 @@ def today_block(st, o, w, caches, x, md):
     return y, (nope, rope_c, icache), (lat, topk_t)
 
 
-GATHERS = ("allgather", "ring")
+GATHERS = tuple(ro.GATHERS)
 
 
 def prefetch(st, w, after, gather="allgather"):
@@ -623,9 +623,7 @@ def prefetch(st, w, after, gather="allgather"):
     ring = ro.ring_order(st.mesh.devices.reshape(-1))
 
     def local(wo, uv, so, after):
-        return ro.gather_shards(
-            wo, uv, so[0], after, AX, ring if gather == "ring" else None
-        )
+        return ro.gather_shards(wo, uv, so[0], after, AX, gather, ring)
 
     return _smap(local, st.mesh, (P(AX),) * 4, (P(),) * 3)(
         w["o"], w["uv"], w["so"], after

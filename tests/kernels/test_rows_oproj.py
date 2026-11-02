@@ -73,6 +73,12 @@ def test_rows_oproj_matches_reference(rows, block_rows):
     )
 
 
+def test_ring_modes_need_a_ring():
+    w_o, w_uv, w_scale = _shards()
+    with pytest.raises(ValueError, match="ring order"):
+        ro.gather_shards(w_o[0], w_uv[0], w_scale[0], w_o[0], "x", "hybrid")
+
+
 def test_rows_oproj_rejects_mismatched_shards():
     w_o, w_uv, w_scale = _shards()
     lat = _latent(16, 0)
@@ -113,10 +119,11 @@ def test_rows_oproj_matches_per_rank_partials():
     assert np.abs(got - exact).max() / np.abs(exact).max() < 2e-2
 
 
-@pytest.mark.parametrize("ring", [None, (0, 1, 3, 2)])
-def test_gather_shards_stacks_every_rank_in_mesh_order(ring):
-    """Both gathers give every rank every rank's shards, bit for bit, in
-    mesh order (CPU virtual devices; the ring is any cycle of the mesh)."""
+@pytest.mark.parametrize("mode", sorted(ro.GATHERS))
+def test_gather_shards_stacks_every_rank_in_mesh_order(mode):
+    """Every gather mode gives every rank every rank's shards, bit for bit,
+    in mesh order (CPU virtual devices; the ring is any cycle of the mesh)."""
+    ring = (0, 1, 3, 2)
     if jax.device_count() < SHARDS:
         pytest.skip(f"requires {SHARDS} devices; CPU virtual devices are sufficient")
     mesh = jax.sharding.Mesh(np.array(jax.devices()[:SHARDS]), ("x",))
@@ -125,7 +132,7 @@ def test_gather_shards_stacks_every_rank_in_mesh_order(ring):
     spec = jax.sharding.PartitionSpec("x")
 
     def local(w_o, w_uv, w_scale, after):
-        got = ro.gather_shards(w_o[0], w_uv[0], w_scale[0], after, "x", ring)
+        got = ro.gather_shards(w_o[0], w_uv[0], w_scale[0], after, "x", mode, ring)
         return tuple(t[None] for t in got)
 
     got_o, got_uv, got_scale = jax.jit(

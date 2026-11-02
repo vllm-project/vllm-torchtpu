@@ -170,12 +170,14 @@ def _build_ops() -> _Rows:
     if gather in _OPS:
         return _OPS[gather]
     mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
-    ring = rows_oproj.ring_order(mesh.devices.reshape(-1)) if gather == "ring" else None
+    ring = rows_oproj.ring_order(mesh.devices.reshape(-1))
     sharded = P(DCP_AXIS_NAME)
 
     def local(w_o, w_uv, w_scale, after):
         # Each rank's gathered shards stacked along dim 0 of the outputs.
-        return rows_oproj.gather_shards(w_o, w_uv, w_scale, after, DCP_AXIS_NAME, ring)
+        return rows_oproj.gather_shards(
+            w_o, w_uv, w_scale, after, DCP_AXIS_NAME, gather, ring
+        )
 
     def gather_fn(w_o, w_uv, w_scale, after):
         return jax.shard_map(
