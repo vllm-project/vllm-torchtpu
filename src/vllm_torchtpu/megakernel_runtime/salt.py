@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import os
 from typing import Any
+
+import vllm_torchtpu.envs as envs
 
 from .config import import_plugin, missing_template, resolve_callable, select_plugin
 from .fingerprint import canonical_json
@@ -34,7 +35,7 @@ def compile_cache_salt(vllm_config: Any) -> str | None:
     """`sha256(canonical(layout_request(vllm_config, options)))[:16]`, or `None`."""
     model_cfg = getattr(vllm_config, "model_config", None)
     cfg, resolved = select_plugin(
-        os.environ.get("VLLM_TPU_MEGAKERNEL", ""),
+        envs.VLLM_TPU_MEGAKERNEL,
         getattr(vllm_config, "additional_config", None),
         getattr(model_cfg, "hf_config", None),
     )
