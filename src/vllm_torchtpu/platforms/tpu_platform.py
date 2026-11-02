@@ -1072,6 +1072,21 @@ class TpuPlatform(Platform):
             # host owns only a slice of data_parallel_size via
             # --data-parallel-size-local / --data-parallel-start-rank).
             dp_size = parallel_config.data_parallel_size
+            # The caller (torchrun, an RL framework) already started one
+            # process per rank, so vLLM must not spawn workers.
+            external_launcher = (
+                parallel_config.distributed_executor_backend == "external_launcher"
+            )
+            if external_launcher and dp_size > 1:
+                # TODO: support data parallelism under external_launcher. The
+                # DP bootstrap below would pick rendezvous ports in each
+                # launched process independently.
+                raise NotImplementedError(
+                    "distributed_executor_backend='external_launcher' with "
+                    "data_parallel_size > 1 is not supported on TPU. Launch "
+                    "each data-parallel replica as its own engine with "
+                    "data_parallel_size=1."
+                )
             if dp_size > 1:
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
@@ -1134,6 +1149,11 @@ class TpuPlatform(Platform):
                     "single host without tensor/pipeline parallelism."
                 )
                 parallel_config.distributed_executor_backend = "uni"
+            elif external_launcher:
+                logger.info(
+                    "Keeping the requested external_launcher executor for TPU "
+                    "on single host with tensor/pipeline/PCP parallelism."
+                )
             else:
                 logger.info(
                     "Force using TpuMultiprocExecutor for TPU on single host "
