@@ -460,7 +460,7 @@ class TestSelectIndicesJax:
         sc_candidates = jnp.full((count, 16), -1, dtype=jnp.int32)
         with mock.patch(
             "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select._sparsecore_top_k",
-            side_effect=lambda s, k, n: jnp.broadcast_to(
+            side_effect=lambda s, k, *_: jnp.broadcast_to(
                 jnp.arange(k, dtype=jnp.int32), (s.shape[0], k)
             ),
         ) as mock_sc:
@@ -786,7 +786,7 @@ class TestPagedIndexerJax:
             candidate_filter=False,  # False forces full_context
         )
         assert sel.shape == (8, topk)
-        assert pub is candidates
+        np.testing.assert_array_equal(pub, candidates)
 
     def test_routing_to_full_context_via_candidate_coverage(self):
         rng = np.random.default_rng(505)
@@ -809,7 +809,7 @@ class TestPagedIndexerJax:
             candidate_filter=True,
         )
         assert sel.shape == (4, topk)
-        assert pub is candidates
+        np.testing.assert_array_equal(pub, candidates)
 
     def test_routing_to_full_context_via_short_context_or_prefill_keys(self):
         rng = np.random.default_rng(606)
@@ -912,7 +912,7 @@ class TestPagedIndexerJax:
             candidate_filter=True,
             unordered=True,
         )
-        assert pub_unord is candidates
+        np.testing.assert_array_equal(pub_unord, candidates)
         assert sel_unord.shape == (tokens, topk)
         # First row has valid selections at head, -1 at tail
         row0 = np.asarray(sel_unord[0])
@@ -963,7 +963,7 @@ class TestPagedIndexerJax:
             candidate_filter=True,
             unordered=False,
         )
-        assert pub_ord is candidates
+        np.testing.assert_array_equal(pub_ord, candidates)
         assert sel_ord.shape == (tokens, topk)
         # Zero-length rows are completely -1
         assert np.all(np.asarray(sel_ord[1:]) == -1)

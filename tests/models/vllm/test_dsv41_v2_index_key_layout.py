@@ -310,7 +310,7 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
         return jnp.full((q.shape[0] * q.shape[1], topk), -1, jnp.int32)
 
     monkeypatch.setattr(indexer_bf16, "paged_indexer_jax", fallback)
-    monkeypatch.setattr(candidate_cache.candidate, "candidate_indexer", cached)
+    monkeypatch.setattr(candidate_cache.candidates, "candidate_indexer", cached)
     selected = jax.eval_shape(
         lambda q,
         weights,
