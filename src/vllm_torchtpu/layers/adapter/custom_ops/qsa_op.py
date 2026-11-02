@@ -1204,13 +1204,14 @@ def _shard_merge_ops():
     return merge, attend_blocks
 
 
-def _shard_merged_blocks(vals, pos, dcp_rank, tp_group, pair_group, size, tokens, block_topk):
+def _shard_merged_blocks(
+    merge, vals, pos, dcp_rank, tp_group, pair_group, size, tokens, block_topk
+):
     """The global selection [tokens, block_topk] from this pair's shard lists
     ``vals`` / ``pos`` [rows, k]: the pair gathers its shard's lists, rank
     ``dcp_rank`` merges rows [dcp_rank * rows / size, ...) of them, and a TP
     all-gather of the merged rows restores token order (TP rank r = pair
     r // size, DCP rank r % size, holding rows r * rows / size onward)."""
-    merge, _ = _shard_merge_ops()
     rows, k = vals.shape
     part = rows // size
 
@@ -1218,7 +1219,7 @@ def _shard_merged_blocks(vals, pos, dcp_rank, tp_group, pair_group, size, tokens
         pair = pair_group.all_gather(x.unsqueeze(0).contiguous(), dim=0)
         return pair.reshape(size, size, part, k)[:, dcp_rank.reshape(())]
 
-    blocks = merge(mine(vals), mine(pos), block_topk)
+    blocks = merge(mine(vals), mine(pos), block_topk=block_topk)
     gathered = tp_group.all_gather(blocks.unsqueeze(0).contiguous(), dim=0)
     return gathered.reshape(-1, block_topk)[:tokens]
 
@@ -1286,6 +1287,8 @@ def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: i
     world = int(tp_group.world_size)
     _, attend, token_select = _compressed_dcp_ops()
     _, _, _, combine = _dcp_ops()
+    # Built here, outside the traced forward: jax_op inspects the step.
+    merge, attend_blocks = _shard_merge_ops() if envs.VLLM_TPU_QSA_DCP_SHARD_MERGE else (None, None)
 
     def run(*args, shard_index, dcp_rank, kv_heads, **kwargs):
         args = list(args)
@@ -1305,10 +1308,9 @@ def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: i
             for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
             if name in kwargs
         }
-        if envs.VLLM_TPU_QSA_DCP_SHARD_MERGE:
-            _, attend_blocks = _shard_merge_ops()
+        if merge is not None:
             blocks = _shard_merged_blocks(
-                vals, pos, dcp_rank, tp_group, pair_group, size, tokens,
+                merge, vals, pos, dcp_rank, tp_group, pair_group, size, tokens,
                 kwargs["token_topk"] // kwargs["compress_ratio"],
             )
             updated, out, lse, selected = attend_blocks(
