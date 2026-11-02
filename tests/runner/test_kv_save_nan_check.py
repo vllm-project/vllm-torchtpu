@@ -233,7 +233,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     valid_tokens_per_chunk = [2, 1]
 
     runner = SimpleNamespace(
-        _pp_wave=None if pp_is_last else wave,
+        _pp_handoff=None if pp_is_last else wave,
         _dp_step_other_decode=False,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,

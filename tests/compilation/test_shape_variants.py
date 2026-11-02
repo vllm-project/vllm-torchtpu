@@ -677,7 +677,7 @@ def test_precompile_backbone_trace_first_env_guards(
         num_tokens_paddings=[16, 32],
         model=None,
         vllm_config=None,
-        _pp_wave=None,
+        _pp_handoff=None,
         _backbone_dummy_runs=dummy_runs.append,
     )
     if expected_error is not None:

@@ -55,11 +55,11 @@ reply ring, so the widening is installed in the engine process and, through
 ``widen_message_rings``, in every worker process; the ring size is the
 widest any pipeline in the process asked for.
 
-With ``TPU_PP_HANDOFF=ring`` the stages hand each forward on point to point
-as soon as it is done (``pp_ring``), so no step waits for later ones and
-the engine sends no pushes or settles. The engine keeps
-``ring_extra_steps`` more steps in flight than the pipeline has stages, so
-stage 0's next forward is already queued while the engine core prepares
+With ``TPU_PP_HANDOFF=buffered`` the stages hand each forward on point to
+point as soon as it is done (``pp_buffered``), so no step waits for later
+ones and the engine sends no pushes or settles. The engine keeps
+``buffered_extra_steps`` more steps in flight than the pipeline has stages,
+so stage 0's next forward is already queued while the engine core prepares
 the following step, and the rings are widened for that count.
 ``patch_executor_for_pp_handoff`` installs the engine side the flag
 selects.
@@ -226,11 +226,11 @@ def wave_state(executor: Any) -> _WaveState:
     return state
 
 
-def ring_extra_steps(stages: int) -> int:
+def buffered_extra_steps(stages: int) -> int:
     """Steps the engine keeps in flight beyond the stage count under the
-    ring.
+    buffered hand-off.
 
-    Stage 0 is the ring's feed: when the last stage samples a step, the
+    Stage 0 feeds the pipeline: when the last stage samples a step, the
     step that refills stage 0 reaches it only after the engine core has
     updated, scheduled and sent it and the worker has prepared its inputs,
     and stage 0 sits idle for that time every step. Each extra step queues
@@ -286,26 +286,27 @@ def widen_message_rings(vllm_config: Any) -> None:
     """Widen the message rings this process will create for a pipeline.
 
     A worker calls it before vLLM builds the worker's reply ring; without a
-    pipeline it does nothing. Under the ring the rings also hold the extra
-    steps the engine keeps in flight (``ring_extra_steps``), and the
-    worker's config counts them as the engine's does.
+    pipeline it does nothing. Under the buffered hand-off the rings also
+    hold the extra steps the engine keeps in flight
+    (``buffered_extra_steps``), and the worker's config counts them as the
+    engine's does.
     """
     if vllm_config is None:
         return
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages > 1:
-        extra = ring_extra_steps(stages) if ring_handoff() else 0
+        extra = buffered_extra_steps(stages) if buffered_handoff() else 0
         _widen_rpc_ring(stages, extra)
         if extra:
             _raise_steps_in_flight(extra)
 
 
-def ring_handoff() -> bool:
-    """Whether pipeline stages hand forwards on point to point (``pp_ring``)
-    rather than with the collective wave (``pp_wave``)."""
+def buffered_handoff() -> bool:
+    """Whether pipeline stages hand forwards on point to point
+    (``pp_buffered``) rather than in lockstep (``pp_wave``)."""
     from vllm_torchtpu import envs
 
-    return envs.TPU_PP_HANDOFF == "ring"
+    return envs.TPU_PP_HANDOFF == "buffered"
 
 
 def _install_take_draft_token_ids(executor_cls: Any) -> None:
@@ -316,10 +317,10 @@ def _install_take_draft_token_ids(executor_cls: Any) -> None:
     A pipeline admits prefill-only MTP alone (pp_validation): its drafts
     exist to fill the draft layer's KV, and no step consumes them. The
     engine asks with a blocking RPC right after dispatching a step, which
-    the last stage answers only once that step is done; under the wave,
-    asking the workers would also deadlock, as a stage can still sit in that
-    step's hand-off, waiting for a push that only a wait on the step's
-    future sends.
+    the last stage answers only once that step is done; under the lockstep
+    hand-off, asking the workers would also deadlock, as a stage can still
+    sit in that step's hand-off, waiting for a push that only a wait on the
+    step's future sends.
     """
     if getattr(executor_cls, "_tpu_pp_take_draft_patch", False):
         return
@@ -335,10 +336,11 @@ def _install_take_draft_token_ids(executor_cls: Any) -> None:
 
 
 def _rides_the_wave(executor: Any) -> bool:
-    """Whether an executor's steps go through the wave: a pipeline whose
-    stages hand off with it. Executors of other depths share the class."""
+    """Whether an executor's steps go through the lockstep hand-off: a
+    pipeline whose stages hand off with it. Executors of other depths share
+    the class."""
     stages = int(executor.vllm_config.parallel_config.pipeline_parallel_size)
-    return stages > 1 and not ring_handoff()
+    return stages > 1 and not buffered_handoff()
 
 
 def _raise_steps_in_flight(extra: int) -> None:
@@ -379,14 +381,14 @@ def _raise_steps_in_flight(extra: int) -> None:
 
 def patch_executor_for_pp_handoff(vllm_config: Any) -> None:
     """Install the engine side of the hand-off ``TPU_PP_HANDOFF`` selects."""
-    if ring_handoff():
-        patch_executor_for_pp_ring(vllm_config)
+    if buffered_handoff():
+        patch_executor_for_pp_buffered(vllm_config)
     else:
         patch_executor_for_pp_wave(vllm_config)
 
 
-def patch_executor_for_pp_ring(vllm_config: Any) -> None:
-    """Install the ring hand-off's engine side: the extra steps in flight,
+def patch_executor_for_pp_buffered(vllm_config: Any) -> None:
+    """Install the buffered hand-off's engine side: the extra steps in flight,
     the wider ring buffers, and draft tokens taken without asking the
     workers.
 
@@ -398,17 +400,18 @@ def patch_executor_for_pp_ring(vllm_config: Any) -> None:
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages <= 1:
         return
-    extra = ring_extra_steps(stages)
+    extra = buffered_extra_steps(stages)
     _widen_rpc_ring(stages, extra)
     _raise_steps_in_flight(extra)
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
-    if getattr(MultiprocExecutor, "_tpu_pp_ring_patch", False):
+    if getattr(MultiprocExecutor, "_tpu_pp_buffered_patch", False):
         return
     _install_take_draft_token_ids(MultiprocExecutor)
-    MultiprocExecutor._tpu_pp_ring_patch = True
+    MultiprocExecutor._tpu_pp_buffered_patch = True
     logger.info(
-        "PP ring: engine side installed, %d steps in flight, message ring %d chunks",
+        "PP buffered: engine side installed, %d steps in flight, "
+        "message ring %d chunks",
         stages + extra,
         _ring_chunks_needed,
     )

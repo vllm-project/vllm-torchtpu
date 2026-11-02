@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The pipeline ring's point-to-point hand-off, driven on CPU with a fake
+"""The buffered pipeline hand-off, point to point, driven on CPU with a fake
 transport.
 
 Every device runs its own event stream in a thread, the way the runner calls
-the ring. The fake transport behaves like the runtime's point-to-point path:
+the hand-off. The fake transport behaves like the runtime's point-to-point path:
 a send waits until the matching receive is posted and then copies its data
 into the posted tensor, a receive returns at once, and a device reads a
 received tensor only once its data has landed. A schedule whose transfers
@@ -29,7 +29,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_torchtpu.distributed import pp_ring
+from vllm_torchtpu.distributed import pp_buffered
 
 HIDDEN = 8
 MAX_ROWS = 64
@@ -120,7 +120,7 @@ def _template(side):
 
 
 def _build(monkeypatch, stages, columns=1, side=False, depth=2, transport=None):
-    """One PPRing per device of ``stages`` stages of ``columns`` devices,
+    """One PPBuffered per device of ``stages`` stages of ``columns`` devices,
     sharing one fake transport; keyed by (stage, column)."""
     from vllm.distributed import parallel_state
 
@@ -129,15 +129,15 @@ def _build(monkeypatch, stages, columns=1, side=False, depth=2, transport=None):
     transport = transport or _Transport(stride=columns)
     monkeypatch.setattr(torch.distributed, "isend", transport.isend)
     monkeypatch.setattr(torch.distributed, "irecv", transport.irecv)
-    monkeypatch.setattr(pp_ring, "_flush", lambda tensors: None)
-    monkeypatch.setattr(pp_ring, "_fence", _Fence)
-    read = pp_ring._first_and_last
+    monkeypatch.setattr(pp_buffered, "_flush", lambda tensors: None)
+    monkeypatch.setattr(pp_buffered, "_fence", _Fence)
+    read = pp_buffered._first_and_last
 
     def first_and_last(x):
         transport.wait_landed(x)
         return read(x)
 
-    monkeypatch.setattr(pp_ring, "_first_and_last", first_and_last)
+    monkeypatch.setattr(pp_buffered, "_first_and_last", first_and_last)
     current = {}
     monkeypatch.setattr(
         parallel_state,
@@ -153,79 +153,79 @@ def _build(monkeypatch, stages, columns=1, side=False, depth=2, transport=None):
         "get_pcp_group",
         lambda: SimpleNamespace(rank_in_group=current["column"], world_size=columns),
     )
-    rings = {}
+    handoffs = {}
     for stage in range(stages):
         for column in range(columns):
             current.update(stage=stage, column=column)
-            rings[stage, column] = pp_ring.PPRing(
+            handoffs[stage, column] = pp_buffered.PPBuffered(
                 torch.device("cpu"), MAX_ROWS, _template(side), depth=depth
             )
-    return transport, rings
+    return transport, handoffs
 
 
-def _forward(ring, transport, received, rows, g, column):
+def _forward(handoff, transport, received, rows, g, column):
     """One forward: the first stage seeds forward ``g`` with ``g`` plus 100
     per column as hidden states and a residual of 0.5, which every later
     stage must see as part of the sum; later stages add 1. The side tensor
     is seeded by the first stage as a view of a larger table and relayed
     unchanged. Returns what the last stage sees, None elsewhere."""
-    side = SIDE in ring.carried
-    if ring.rank == 0:
+    side = SIDE in handoff.carried
+    if handoff.rank == 0:
         assert received is None
         h = torch.full((rows, HIDDEN), float(g + 100 * column))
         r = torch.full((rows, HIDDEN), 0.5)
         table = torch.full((MAX_ROWS, SIDE_WIDTH), g, dtype=torch.int32)
         extra = table[:rows]
     else:
-        for key in ring.carried:
+        for key in handoff.carried:
             transport.wait_landed(received[key])
         assert torch.equal(received["residual"], torch.zeros(rows, HIDDEN))
         h = received["hidden_states"] + 1
         r = received["residual"]
         extra = received[SIDE] if side else None
-    if ring.rank == ring.last:
-        ring.end_forward(None, rows)
+    if handoff.rank == handoff.last:
+        handoff.end_forward(None, rows)
         return h, r, extra
     outgoing = {"hidden_states": h, "residual": r}
     if side:
         outgoing[SIDE] = extra
-    ring.end_forward(outgoing, rows)
+    handoff.end_forward(outgoing, rows)
     return None
 
 
-def _run_device(ring, transport, steps, results, errors, column):
+def _run_device(handoff, transport, steps, results, errors, column):
     """A device's event stream as the runner drives it: each step is the
     padded token count of each of its forwards and whether the runner posts
     its receives first (serving steps) or not (warmup forwards). A step
     without tokens runs nothing."""
     try:
-        ring.warmup()
+        handoff.warmup()
         g = 0
         for rows_per_forward, ahead in steps:
             if not rows_per_forward:
                 continue
-            if ahead and ring.rank > 0:
-                ring.begin_step(rows_per_forward)
+            if ahead and handoff.rank > 0:
+                handoff.begin_step(rows_per_forward)
             for rows in rows_per_forward:
-                received = ring.start_forward(rows)
-                out = _forward(ring, transport, received, rows, g, column)
+                received = handoff.start_forward(rows)
+                out = _forward(handoff, transport, received, rows, g, column)
                 if out is not None:
                     results.append((column, g, rows, *out))
                 g += 1
-        ring.close()
+        handoff.close()
     except BaseException as exc:  # reported by the test thread
-        errors.append(((ring.rank, column), exc))
+        errors.append(((handoff.rank, column), exc))
 
 
-def _run(rings, transport, steps, timeout=60):
+def _run(handoffs, transport, steps, timeout=60):
     results, errors = [], []
     threads = [
         threading.Thread(
             target=_run_device,
-            args=(ring, transport, steps, results, errors, column),
+            args=(handoff, transport, steps, results, errors, column),
             daemon=True,
         )
-        for (_, column), ring in rings.items()
+        for (_, column), handoff in handoffs.items()
     ]
     for t in threads:
         t.start()
@@ -272,9 +272,9 @@ def _check(results, steps, last, columns=1, side=False):
 @pytest.mark.parametrize("side", [False, True], ids=["activations", "with_side"])
 @pytest.mark.parametrize("stages", [2, 3, 4])
 def test_every_forward_reaches_the_last_stage(monkeypatch, stages, side):
-    transport, rings = _build(monkeypatch, stages, side=side)
+    transport, handoffs = _build(monkeypatch, stages, side=side)
     steps = _steps(random.Random(stages), 24)
-    results = _run(rings, transport, steps)
+    results = _run(handoffs, transport, steps)
     forwards = _check(results, steps, stages - 1, side=side)
     carried = 2 if side else 1
     # The warmup and every forward cross each stage boundary once, with one
@@ -286,32 +286,32 @@ def test_every_forward_reaches_the_last_stage(monkeypatch, stages, side):
     for stage in range(1, stages):
         tags = [tag for _, dst, tag in transport.receives if dst == stage]
         assert tags == list(range(carried, carried * (2 + len(forwards))))
-    for (stage, _), ring in rings.items():
-        assert ring.transfers == 1 + len(forwards)
-        assert ring.forwards == len(forwards)
-        assert ring.sent == (len(forwards) if stage < stages - 1 else 0)
-        assert ring.posted_through == (1 + len(forwards) if stage > 0 else 0)
-        assert ring.landed_through == 1 + len(forwards)
+    for (stage, _), handoff in handoffs.items():
+        assert handoff.transfers == 1 + len(forwards)
+        assert handoff.forwards == len(forwards)
+        assert handoff.sent == (len(forwards) if stage < stages - 1 else 0)
+        assert handoff.posted_through == (1 + len(forwards) if stage > 0 else 0)
+        assert handoff.landed_through == 1 + len(forwards)
 
 
 def test_columns_hand_off_to_the_same_column(monkeypatch):
-    transport, rings = _build(monkeypatch, stages=3, columns=2, side=True)
+    transport, handoffs = _build(monkeypatch, stages=3, columns=2, side=True)
     steps = _steps(random.Random(5), 12)
-    results = _run(rings, transport, steps)
+    results = _run(handoffs, transport, steps)
     _check(results, steps, last=2, columns=2, side=True)
     # Global ranks are stage * 2 + column: every transfer goes two ranks on.
     assert {dst - src for (src, dst, _), _ in transport.sends} == {2}
 
 
 def test_steps_without_tokens_transfer_nothing(monkeypatch):
-    transport, rings = _build(monkeypatch, stages=3)
-    results = _run(rings, transport, [([], True)] * 5)
+    transport, handoffs = _build(monkeypatch, stages=3)
+    results = _run(handoffs, transport, [([], True)] * 5)
     assert results == []
     # the warmup alone
     assert len(transport.sends) == 2
-    for ring in rings.values():
-        ring.begin_step([])
-        assert ring.transfers == 1 and not ring._posted
+    for handoff in handoffs.values():
+        handoff.begin_step([])
+        assert handoff.transfers == 1 and not handoff._posted
 
 
 def _until(predicate, seconds=5.0):
@@ -324,8 +324,8 @@ def _until(predicate, seconds=5.0):
 
 @pytest.mark.parametrize("depth", [1, 2])
 def test_a_stage_that_runs_ahead_holds_at_most_depth_forwards(monkeypatch, depth):
-    transport, rings = _build(monkeypatch, stages=2, side=True, depth=depth)
-    first, second = rings[0, 0], rings[1, 0]
+    transport, handoffs = _build(monkeypatch, stages=2, side=True, depth=depth)
+    first, second = handoffs[0, 0], handoffs[1, 0]
     warmups = [threading.Thread(target=r.warmup, daemon=True) for r in (first, second)]
     for t in warmups:
         t.start()
@@ -375,17 +375,18 @@ def test_the_self_test_catches_data_from_the_wrong_sender(monkeypatch):
         def deliver(self, tensor):
             return tensor + 1
 
-    transport, rings = _build(monkeypatch, stages=2, transport=Misrouting())
+    transport, handoffs = _build(monkeypatch, stages=2, transport=Misrouting())
     errors = []
 
-    def warmup(ring):
+    def warmup(handoff):
         try:
-            ring.warmup()
+            handoff.warmup()
         except RuntimeError as exc:
             errors.append(exc)
 
     threads = [
-        threading.Thread(target=warmup, args=(r,), daemon=True) for r in rings.values()
+        threading.Thread(target=warmup, args=(r,), daemon=True)
+        for r in handoffs.values()
     ]
     for t in threads:
         t.start()
@@ -398,10 +399,10 @@ def test_the_self_test_catches_data_from_the_wrong_sender(monkeypatch):
 
 
 def test_a_transport_that_fails_fails_the_self_test_and_names_libtpu(monkeypatch):
-    transport, rings = _build(monkeypatch, stages=2)
+    transport, handoffs = _build(monkeypatch, stages=2)
     transport.fail_recv = RuntimeError("cross-host receive unsupported")
     with pytest.raises(RuntimeError, match="self-test failed.*libtpu") as info:
-        rings[1, 0].warmup()
+        handoffs[1, 0].warmup()
     assert "unsupported" in str(info.value.__cause__)
 
 
@@ -413,9 +414,9 @@ def _outgoing(rows):
 
 
 def test_a_send_failure_surfaces_on_the_next_call(monkeypatch):
-    transport, rings = _build(monkeypatch, stages=2)
-    first = rings[0, 0]
-    transport.fail_send = ValueError("ring down")
+    transport, handoffs = _build(monkeypatch, stages=2)
+    first = handoffs[0, 0]
+    transport.fail_send = ValueError("transport down")
     first.start_forward(8)
     first.end_forward(_outgoing(8), 8)
     assert _until(lambda: first._error is not None)
@@ -433,16 +434,16 @@ def test_a_send_failure_surfaces_on_the_next_call(monkeypatch):
 def test_a_forward_whose_rows_differ_from_its_posted_receive_is_refused(
     monkeypatch,
 ):
-    _, rings = _build(monkeypatch, stages=2)
-    second = rings[1, 0]
+    _, handoffs = _build(monkeypatch, stages=2)
+    second = handoffs[1, 0]
     second.begin_step([16])
     with pytest.raises(RuntimeError, match="posted for 16 rows"):
         second.start_forward(8)
 
 
 def test_receives_posted_for_forwards_that_never_ran_are_reported(monkeypatch):
-    _, rings = _build(monkeypatch, stages=2)
-    second = rings[1, 0]
+    _, handoffs = _build(monkeypatch, stages=2)
+    second = handoffs[1, 0]
     second.begin_step([16, 16])
     second.start_forward(16)
     second.end_forward(None, 16)
@@ -467,8 +468,8 @@ class _Gated(_Transport):
 
 
 def test_receives_are_posted_off_the_thread_that_runs_the_step(monkeypatch):
-    transport, rings = _build(monkeypatch, stages=2, transport=_Gated())
-    second = rings[1, 0]
+    transport, handoffs = _build(monkeypatch, stages=2, transport=_Gated())
+    second = handoffs[1, 0]
     second.begin_step([16, 8])
     # begin_step has returned while the first receive is still being posted
     assert _until(lambda: len(transport.callers) == 1)
@@ -489,7 +490,9 @@ def test_receives_are_posted_off_the_thread_that_runs_the_step(monkeypatch):
     # in transfer order, from one thread that is not the step's
     assert list(transport.posted) == [(0, 1, 1), (0, 1, 2)]
     (poster,) = set(transport.callers)
-    assert poster is not threading.current_thread() and poster.name == "pp-ring-post"
+    assert (
+        poster is not threading.current_thread() and poster.name == "pp-buffered-post"
+    )
     assert second.start_forward(8)["hidden_states"].shape == (8, HIDDEN)
     second.close()
     assert not poster.is_alive()
@@ -497,16 +500,16 @@ def test_receives_are_posted_off_the_thread_that_runs_the_step(monkeypatch):
 
 class _Watched(_Transport):
     """Records, with each receive posted, the last transfer whose forward
-    on ``ring`` had completed by then."""
+    on ``handoff`` had completed by then."""
 
     def __init__(self):
         super().__init__()
-        self.ring = None
+        self.handoff = None
         self.landed_at_post = []
 
     def irecv(self, tensor, src, tag):
-        transfer, index = divmod(tag, len(self.ring.carried))
-        self.landed_at_post.append((transfer, index, self.ring.landed_through))
+        transfer, index = divmod(tag, len(self.handoff.carried))
+        self.landed_at_post.append((transfer, index, self.handoff.landed_through))
         return super().irecv(tensor, src, tag)
 
 
@@ -526,7 +529,7 @@ class _HeldFence:
 
 
 def _hold_fences(monkeypatch):
-    """Makes every fence the ring records a _HeldFence; returns them in the
+    """Makes every fence the hand-off records a _HeldFence; returns them in the
     order they are recorded."""
     fences = []
 
@@ -534,15 +537,15 @@ def _hold_fences(monkeypatch):
         fences.append(_HeldFence())
         return fences[-1]
 
-    monkeypatch.setattr(pp_ring, "_fence", record_fence)
+    monkeypatch.setattr(pp_buffered, "_fence", record_fence)
     return fences
 
 
 @pytest.mark.parametrize("side", [False, True], ids=["activations", "with_side"])
 def test_a_step_of_many_forwards_keeps_seven_receives_outstanding(monkeypatch, side):
-    transport, rings = _build(monkeypatch, stages=2, side=side, transport=_Watched())
+    transport, handoffs = _build(monkeypatch, stages=2, side=side, transport=_Watched())
     fences = _hold_fences(monkeypatch)
-    second = transport.ring = rings[1, 0]
+    second = transport.handoff = handoffs[1, 0]
     carried = len(second.carried)
     # the transfers whose receive calls fit in seven
     ahead = 7 // carried
@@ -573,9 +576,9 @@ def test_a_step_of_many_forwards_keeps_seven_receives_outstanding(monkeypatch, s
 
 
 def test_forwards_that_post_their_own_receives_keep_seven_outstanding(monkeypatch):
-    transport, rings = _build(monkeypatch, stages=2, transport=_Watched())
+    transport, handoffs = _build(monkeypatch, stages=2, transport=_Watched())
     fences = _hold_fences(monkeypatch)
-    second = transport.ring = rings[1, 0]
+    second = transport.handoff = handoffs[1, 0]
     errors = []
 
     def warmup():
@@ -607,9 +610,9 @@ def test_forwards_that_post_their_own_receives_keep_seven_outstanding(monkeypatc
 
 
 def test_a_send_thread_failure_fails_a_forward_waiting_for_its_receive(monkeypatch):
-    _, rings = _build(monkeypatch, stages=2)
+    _, handoffs = _build(monkeypatch, stages=2)
     fences = _hold_fences(monkeypatch)
-    second = rings[1, 0]
+    second = handoffs[1, 0]
     second.begin_step([8] * 9)
     assert _until(lambda: second.posted_through == 7)
     for _ in range(7):
@@ -640,8 +643,8 @@ def test_a_send_thread_failure_fails_a_forward_waiting_for_its_receive(monkeypat
 
 
 def test_closing_drops_receives_that_wait_for_room(monkeypatch):
-    _, rings = _build(monkeypatch, stages=2)
-    second = rings[1, 0]
+    _, handoffs = _build(monkeypatch, stages=2)
+    second = handoffs[1, 0]
     second.begin_step([8] * 9)
     assert _until(lambda: second.posted_through == 7)
     poster = second._post_thread
@@ -653,8 +656,8 @@ def test_closing_drops_receives_that_wait_for_room(monkeypatch):
 
 
 def test_a_post_failure_surfaces_on_the_forward_that_waits_for_it(monkeypatch):
-    transport, rings = _build(monkeypatch, stages=2)
-    second = rings[1, 0]
+    transport, handoffs = _build(monkeypatch, stages=2)
+    second = handoffs[1, 0]
     transport.fail_recv = ValueError("no receive flag")
     second.begin_step([16, 8])
     with pytest.raises(RuntimeError, match="posting thread failed") as info:
@@ -669,8 +672,8 @@ def test_a_post_failure_surfaces_on_the_forward_that_waits_for_it(monkeypatch):
 
 
 def test_each_forward_size_reuses_one_zero_residual(monkeypatch):
-    _, rings = _build(monkeypatch, stages=2)
-    second = rings[1, 0]
+    _, handoffs = _build(monkeypatch, stages=2)
+    second = handoffs[1, 0]
     second.begin_step([16, 8, 16])
     residuals = []
     for rows in (16, 8, 16):
@@ -685,21 +688,21 @@ def test_each_forward_size_reuses_one_zero_residual(monkeypatch):
     assert sorted(second._zero_residuals) == [8, 16]
 
 
-def test_the_hbm_reserve_covers_every_buffer_the_ring_holds():
+def test_the_hbm_reserve_covers_every_buffer_the_handoff_holds():
     row = HIDDEN * torch.float32.itemsize
     side_row = SIDE_WIDTH * torch.int32.itemsize
     zero_rows = sum(BUCKETS)
     # depth queued plus one held outgoing forward, seven landing tensors of
     # the widest carried tensor, and a zero residual per bucket
-    assert pp_ring.hbm_reserve_bytes(MAX_ROWS, _template(False), 2, zero_rows) == (
+    assert pp_buffered.hbm_reserve_bytes(MAX_ROWS, _template(False), 2, zero_rows) == (
         (2 + 1) * MAX_ROWS * row + 7 * MAX_ROWS * row + zero_rows * row
     )
-    assert pp_ring.hbm_reserve_bytes(MAX_ROWS, _template(True), 3, zero_rows) == (
+    assert pp_buffered.hbm_reserve_bytes(MAX_ROWS, _template(True), 3, zero_rows) == (
         (3 + 1) * MAX_ROWS * (row + side_row) + 7 * MAX_ROWS * row + zero_rows * row
     )
     # without a residual in the template there is no zero residual to hold
     hidden_only = {"hidden_states": ((HIDDEN,), torch.float32)}
-    assert pp_ring.hbm_reserve_bytes(MAX_ROWS, hidden_only, 1, zero_rows) == (
+    assert pp_buffered.hbm_reserve_bytes(MAX_ROWS, hidden_only, 1, zero_rows) == (
         (1 + 1 + 7) * MAX_ROWS * row
     )
 
@@ -722,10 +725,10 @@ def test_the_hbm_reserve_covers_every_buffer_the_ring_holds():
     ],
 )
 def test_receives_a_device_can_have_posted(stages, depth, carried, posted):
-    assert pp_ring.ring_receives_posted(stages, depth, carried) == posted
+    assert pp_buffered.buffered_receives_posted(stages, depth, carried) == posted
 
 
-def test_a_ring_deeper_than_the_receive_flags_is_refused(monkeypatch):
+def test_a_handoff_deeper_than_the_receive_flags_is_refused(monkeypatch):
     with pytest.raises(ValueError, match="at most 8 receives can be outstanding"):
         _build(monkeypatch, stages=4, side=True, depth=3)
     _build(monkeypatch, stages=4, side=True, depth=2)
@@ -733,55 +736,55 @@ def test_a_ring_deeper_than_the_receive_flags_is_refused(monkeypatch):
 
 
 def test_rows_beyond_the_hand_off_are_refused(monkeypatch):
-    _, rings = _build(monkeypatch, stages=2)
+    _, handoffs = _build(monkeypatch, stages=2)
     with pytest.raises(RuntimeError, match="1 to 64"):
-        rings[1, 0].begin_step([MAX_ROWS + 1])
+        handoffs[1, 0].begin_step([MAX_ROWS + 1])
 
 
 def test_a_forward_that_drops_a_side_tensor_is_refused(monkeypatch):
-    _, rings = _build(monkeypatch, stages=3, side=True)
-    first = rings[0, 0]
+    _, handoffs = _build(monkeypatch, stages=3, side=True)
+    first = handoffs[0, 0]
     first.start_forward(8)
     with pytest.raises(RuntimeError, match=f"no \\['{SIDE}'\\]"):
         first.end_forward(_outgoing(8), 8)
 
 
 def test_push_settle_and_step_do_nothing(monkeypatch):
-    transport, rings = _build(monkeypatch, stages=3)
-    for ring in rings.values():
-        with ring.step():
-            ring.push()
-            ring.settle()
-        ring.close()
-        assert ring.transfers == 0
-        assert ring.drain_before_handoff is False
+    transport, handoffs = _build(monkeypatch, stages=3)
+    for handoff in handoffs.values():
+        with handoff.step():
+            handoff.push()
+            handoff.settle()
+        handoff.close()
+        assert handoff.transfers == 0
+        assert handoff.drain_before_handoff is False
     assert transport.sends == [] and transport.posted == {}
 
 
 def test_the_first_and_last_stage_post_and_send_only_what_they_must(monkeypatch):
-    transport, rings = _build(monkeypatch, stages=3)
-    assert (rings[0, 0].prev, rings[0, 0].next) == (None, 1)
-    assert (rings[1, 0].prev, rings[1, 0].next) == (0, 2)
-    assert (rings[2, 0].prev, rings[2, 0].next) == (1, None)
-    rings[0, 0].begin_step([16])
+    transport, handoffs = _build(monkeypatch, stages=3)
+    assert (handoffs[0, 0].prev, handoffs[0, 0].next) == (None, 1)
+    assert (handoffs[1, 0].prev, handoffs[1, 0].next) == (0, 2)
+    assert (handoffs[2, 0].prev, handoffs[2, 0].next) == (1, None)
+    handoffs[0, 0].begin_step([16])
     assert transport.posted == {}
 
 
 def test_tags_differ_per_transfer_and_tensor():
-    ring = SimpleNamespace(carried=("hidden_states", SIDE))
+    handoff = SimpleNamespace(carried=("hidden_states", SIDE))
     tags = {
-        pp_ring.PPRing._tag(ring, transfer, index)
+        pp_buffered.PPBuffered._tag(handoff, transfer, index)
         for transfer in range(1, 100)
         for index in range(2)
     }
     assert len(tags) == 198
-    assert pp_ring.PPRing._tag(ring, pp_ring._TAG_SPAN, 0) == 0
+    assert pp_buffered.PPBuffered._tag(handoff, pp_buffered._TAG_SPAN, 0) == 0
 
 
 def test_the_hand_off_always_carries_hidden_states_and_residual(monkeypatch):
     _build(monkeypatch, stages=2)
     with pytest.raises(ValueError, match="hidden_states and residual"):
-        pp_ring.PPRing(
+        pp_buffered.PPBuffered(
             torch.device("cpu"),
             MAX_ROWS,
             {
@@ -790,4 +793,4 @@ def test_the_hand_off_always_carries_hidden_states_and_residual(monkeypatch):
             },
         )
     with pytest.raises(ValueError, match="depth of at least 1"):
-        pp_ring.PPRing(torch.device("cpu"), MAX_ROWS, _template(False), depth=0)
+        pp_buffered.PPBuffered(torch.device("cpu"), MAX_ROWS, _template(False), depth=0)

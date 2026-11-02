@@ -318,18 +318,19 @@ def test_pipeline_executor_never_asks_the_workers_for_draft_tokens(monkeypatch, 
     assert executor.calls == []
 
 
-# The ring hand-off (TPU_PP_HANDOFF=ring): no pushes or settles, half the
-# stages again in flight, rings widened for them.
+# The buffered hand-off (TPU_PP_HANDOFF=buffered): no pushes or settles, half
+# the stages again in flight, rings widened for them.
 
 
 @pytest.fixture
-def ring(monkeypatch):
+def buffered(monkeypatch):
     from vllm.config import VllmConfig
 
-    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
-    monkeypatch.delenv("TPU_PP_RING_DEPTH", raising=False)
-    # The ring raises vLLM's steps in flight once per process: each test
-    # starts from vLLM's property, unmarked, and both come back afterwards.
+    monkeypatch.setenv("TPU_PP_HANDOFF", "buffered")
+    monkeypatch.delenv("TPU_PP_HANDOFF_DEPTH", raising=False)
+    # The buffered hand-off raises vLLM's steps in flight once per process:
+    # each test starts from vLLM's property, unmarked, and both come back
+    # afterwards.
     monkeypatch.setattr(
         VllmConfig, "max_concurrent_batches", VllmConfig.max_concurrent_batches
     )
@@ -341,53 +342,53 @@ def test_the_hand_off_flags_parse(monkeypatch):
     from vllm_torchtpu import envs
 
     monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
-    monkeypatch.delenv("TPU_PP_RING_DEPTH", raising=False)
-    assert envs.TPU_PP_HANDOFF == "wave" and not pp_push.ring_handoff()
-    assert envs.TPU_PP_RING_DEPTH == 2
-    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
-    monkeypatch.setenv("TPU_PP_RING_DEPTH", "3")
-    assert pp_push.ring_handoff() and envs.TPU_PP_RING_DEPTH == 3
-    monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
-    assert not pp_push.ring_handoff()
-    for value in ("Ring", "p2p"):
+    monkeypatch.delenv("TPU_PP_HANDOFF_DEPTH", raising=False)
+    assert envs.TPU_PP_HANDOFF == "lockstep" and not pp_push.buffered_handoff()
+    assert envs.TPU_PP_HANDOFF_DEPTH == 2
+    monkeypatch.setenv("TPU_PP_HANDOFF", "buffered")
+    monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "3")
+    assert pp_push.buffered_handoff() and envs.TPU_PP_HANDOFF_DEPTH == 3
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
+    assert not pp_push.buffered_handoff()
+    for value in ("Buffered", "ring", "wave"):
         monkeypatch.setenv("TPU_PP_HANDOFF", value)
         with pytest.raises(ValueError, match="TPU_PP_HANDOFF"):
-            pp_push.ring_handoff()
-    monkeypatch.setenv("TPU_PP_RING_DEPTH", "two")
-    with pytest.raises(ValueError, match="TPU_PP_RING_DEPTH"):
-        _ = envs.TPU_PP_RING_DEPTH
+            pp_push.buffered_handoff()
+    monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "two")
+    with pytest.raises(ValueError, match="TPU_PP_HANDOFF_DEPTH"):
+        _ = envs.TPU_PP_HANDOFF_DEPTH
 
 
-def test_the_ring_keeps_half_the_stages_again_in_flight():
-    assert [pp_push.ring_extra_steps(stages) for stages in (2, 4, 8)] == [1, 2, 4]
+def test_the_buffered_handoff_keeps_half_the_stages_again_in_flight():
+    assert [pp_push.buffered_extra_steps(stages) for stages in (2, 4, 8)] == [1, 2, 4]
 
 
-def test_the_rings_hold_the_extra_steps(monkeypatch, ring, queue):
+def test_the_rings_hold_the_extra_steps(monkeypatch, buffered, queue):
     assert pp_push.rpc_ring_chunks(8, 4) == 4 * 12 + 8
     _bare_executor_cls(monkeypatch)
     pp_push.patch_executor_for_pp_handoff(_config(8))
     assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8, 4)
 
 
-def test_the_ring_widens_the_worker_rings_for_its_steps(monkeypatch, ring, queue):
+def test_the_buffered_handoff_widens_the_worker_rings(monkeypatch, buffered, queue):
     from vllm.config import VllmConfig
 
     pp_push.widen_message_rings(_config(4))
     assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(
-        4, pp_push.ring_extra_steps(4)
+        4, pp_push.buffered_extra_steps(4)
     )
     # the worker's config counts the extra steps as the engine's does
     steps = VllmConfig.max_concurrent_batches.fget
     assert steps(_engine_config(4, async_scheduling=False)) == 4 + 2
     # the depth caps a stage's send queue, not the engine's steps in flight
-    monkeypatch.setenv("TPU_PP_RING_DEPTH", "4")
+    monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "4")
     pp_push.widen_message_rings(_config(8))
     assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(
-        8, pp_push.ring_extra_steps(8)
+        8, pp_push.buffered_extra_steps(8)
     )
-    # the wave keeps vLLM's steps in flight
+    # the lockstep hand-off keeps vLLM's steps in flight
     monkeypatch.setattr(pp_push, "_ring_chunks_needed", 0)
-    monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
     pp_push.widen_message_rings(_config(8))
     assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8)
 
@@ -402,7 +403,7 @@ def _engine_config(pp, async_scheduling):
     )
 
 
-def test_the_ring_keeps_extra_steps_in_flight(monkeypatch, ring, queue):
+def test_the_buffered_handoff_keeps_extra_steps_in_flight(monkeypatch, buffered, queue):
     from vllm.config import VllmConfig
 
     vllm_steps = VllmConfig.max_concurrent_batches.fget
@@ -418,7 +419,7 @@ def test_the_ring_keeps_extra_steps_in_flight(monkeypatch, ring, queue):
     assert steps(single) == vllm_steps(single) == 1
 
 
-def test_the_steps_in_flight_are_raised_once(monkeypatch, ring, queue):
+def test_the_steps_in_flight_are_raised_once(monkeypatch, buffered, queue):
     from vllm.config import VllmConfig
 
     _bare_executor_cls(monkeypatch)
@@ -460,7 +461,7 @@ def _bare_executor_cls(monkeypatch):
     return _FakeExecutor
 
 
-def test_the_ring_installs_no_push_or_settle(monkeypatch, ring, queue):
+def test_the_buffered_handoff_installs_no_push_or_settle(monkeypatch, buffered, queue):
     from vllm.config import VllmConfig
 
     dispatch_depth = VllmConfig.max_concurrent_batches
@@ -500,8 +501,8 @@ def test_an_executor_without_a_pipeline_keeps_its_own_calls(monkeypatch, queue):
     assert deep.take_draft_token_ids() is None and asked == [single]
 
 
-def test_the_ring_leaves_an_executor_without_a_pipeline_its_draft_tokens(
-    monkeypatch, ring, queue
+def test_the_buffered_handoff_leaves_a_single_stage_its_draft_tokens(
+    monkeypatch, buffered, queue
 ):
     executor_cls = _bare_executor_cls(monkeypatch)
     executor_cls.take_draft_token_ids = lambda self: "drafts"
@@ -512,7 +513,7 @@ def test_the_ring_leaves_an_executor_without_a_pipeline_its_draft_tokens(
     assert executor_cls().take_draft_token_ids() is None
 
 
-def test_the_wave_flag_installs_the_wave(monkeypatch, queue):
+def test_the_lockstep_flag_installs_the_wave(monkeypatch, queue):
     monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
     executor_cls = _bare_executor_cls(monkeypatch)
     pp_push.patch_executor_for_pp_handoff(_config(4))
@@ -521,5 +522,5 @@ def test_the_wave_flag_installs_the_wave(monkeypatch, queue):
         executor.execute_model(_step(16, 1), non_block=True), pp_push._PushFuture
     )
     assert executor_cls._tpu_pp_wave_patch
-    assert not getattr(executor_cls, "_tpu_pp_ring_patch", False)
+    assert not getattr(executor_cls, "_tpu_pp_buffered_patch", False)
     assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(4)

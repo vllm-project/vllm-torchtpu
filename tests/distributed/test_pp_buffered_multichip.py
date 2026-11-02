@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The pipeline ring's hand-off over the runtime's point-to-point path.
+"""The buffered pipeline hand-off over the runtime's point-to-point path.
 
-`test_pp_ring.py` drives the ring on CPU with a fake transport; this runs a
-two-stage ring on two TPU devices with `torch.distributed` isend/irecv, the
+`test_pp_buffered.py` drives it on CPU with a fake transport; this runs a
+two-stage hand-off on two TPU devices with `torch.distributed` isend/irecv, the
 way a pipeline does: serving steps that post their receives ahead, warmup
 forwards that post their own, forwards of every bucket size, and the sum of
 hidden states and residual arriving as the next stage's hidden states.
@@ -93,7 +93,7 @@ def _launch_torchrun(result_dir: Path) -> None:
     except (ImportError, ValueError) as exc:
         print(f"Two TPU devices are unavailable: {exc}", flush=True)
         sys.exit(SKIP_EXIT_CODE)
-    os.environ["TPU_PP_HANDOFF"] = "ring"
+    os.environ["TPU_PP_HANDOFF"] = "buffered"
     os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
     from torch.distributed.run import main as torchrun_main
 
@@ -141,33 +141,33 @@ def _run_worker(result_dir: Path) -> None:
             distributed_init_method="env://",
             backend="tpu_dist",
         )
-        # The ring reads the pipeline group; one group over both ranks is
+        # The hand-off reads the pipeline group; one group over both ranks is
         # the two-stage pipeline, without a model config to initialize.
         world_group = get_world_group()
         parallel_state._PP = init_model_parallel_group(
             [list(range(world))],
             world_group.local_rank,
             dist.get_backend(world_group.device_group),
-            group_name="pp_ring_test",
+            group_name="pp_buffered_test",
         )
-        from vllm_torchtpu.distributed import pp_ring
+        from vllm_torchtpu.distributed import pp_buffered
 
         template = {
             "hidden_states": ((HIDDEN,), torch.bfloat16),
             "residual": ((HIDDEN,), torch.bfloat16),
         }
-        ring = pp_ring.PPRing(device, MAX_ROWS, template, depth=2)
-        ring.warmup()
+        handoff = pp_buffered.PPBuffered(device, MAX_ROWS, template, depth=2)
+        handoff.warmup()
         seen = []
         for g, (rows, ahead) in enumerate(_forwards()):
             if ahead:
-                ring.begin_step([rows])
-            received = ring.start_forward(rows)
-            if ring.rank == 0:
+                handoff.begin_step([rows])
+            received = handoff.start_forward(rows)
+            if handoff.rank == 0:
                 assert received is None
                 hidden = torch.full((rows, HIDDEN), float(g + 1), dtype=torch.bfloat16)
                 residual = torch.full((rows, HIDDEN), 0.5, dtype=torch.bfloat16)
-                ring.end_forward(
+                handoff.end_forward(
                     {
                         "hidden_states": hidden.to(device),
                         "residual": residual.to(device),
@@ -182,17 +182,17 @@ def _run_worker(result_dir: Path) -> None:
                 seen.append(
                     {
                         "rows": rows,
-                        "hidden": pp_ring._first_and_last(hidden),
-                        "residual": pp_ring._first_and_last(residual),
+                        "hidden": pp_buffered._first_and_last(hidden),
+                        "residual": pp_buffered._first_and_last(residual),
                         "shape": tuple(hidden.shape),
                     }
                 )
-                ring.end_forward(None, rows)
-        ring.close()
+                handoff.end_forward(None, rows)
+        handoff.close()
         result["forwards"] = len(_forwards())
-        result["posted_through"] = ring.posted_through
-        result["landed_through"] = ring.landed_through
-        result["sent"] = ring.sent
+        result["posted_through"] = handoff.posted_through
+        result["landed_through"] = handoff.landed_through
+        result["sent"] = handoff.sent
         result["seen"] = seen
     except Exception:
         result["error"] = traceback.format_exc()
@@ -248,7 +248,7 @@ def _results(result_dir: Path) -> list[dict]:
     return out
 
 
-def assert_ring_results(results: list[dict]) -> None:
+def assert_handoff_results(results: list[dict]) -> None:
     errors = [r for r in results if "error" in r]
     assert not errors, f"worker failures: {errors}"
     first, last = results
@@ -266,7 +266,7 @@ def assert_ring_results(results: list[dict]) -> None:
 
 
 def test_two_stages_hand_off_on_real_devices(tmp_path):
-    result_dir = tmp_path / "pp_ring"
+    result_dir = tmp_path / "pp_buffered"
     result_dir.mkdir()
     completed = _launch(result_dir)
     if completed.returncode == SKIP_EXIT_CODE:
@@ -275,7 +275,7 @@ def test_two_stages_hand_off_on_real_devices(tmp_path):
     assert completed.returncode == 0 or any("error" in r for r in results), (
         completed.stdout[-12000:]
     )
-    assert_ring_results(results)
+    assert_handoff_results(results)
 
 
 def _main() -> None:
