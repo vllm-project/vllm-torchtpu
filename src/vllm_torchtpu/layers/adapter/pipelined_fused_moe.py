@@ -21,10 +21,11 @@ collective communications (AllGather and ReduceScatter) with MoE computation.
 import contextlib
 import math
 from collections.abc import Sequence
+from contextlib import contextmanager
 from typing import cast
 
 import torch
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
@@ -171,16 +172,88 @@ def _get_moe_collective_group():
         )
     if pcp_size > 1:
         return pcp_group, "PCP"
+    if dp_size == 1 and _sequence_parallel_moe.active:
+        # TP sequence parallel at DP1: the runner's naive dispatch/combine
+        # all-gathers and reduce-scatters over the EP group (== TP group).
+        ep_group = get_ep_group()
+        if ep_group is not None and int(ep_group.world_size) > 1:
+            return ep_group, "EP"
     return dp_group, "DP"
 
 
-@torch.compiler.assume_constant_result
-def _log_active_chunk_pipeline() -> None:
-    """Emit trace-time evidence without passing symbolic values to logging."""
-    collective_group, collective_kind = _get_moe_collective_group()
-    parallel_size = (
-        int(collective_group.world_size) if collective_group is not None else 1
+class _SequenceParallelMoE:
+    """Whether the MoE layer being applied is token-sharded (sequence parallel).
+
+    Set per call by the quant method (`set_sequence_parallel_moe`) from the
+    layer's own ``moe_config``: a model can mix SP layers (the main model
+    stack) with replicated ones (a speculative drafter whose MoE output the
+    runner all-reduces), and only the former may be gathered and
+    reduce-scattered over the EP group. A plain Python attribute, constant
+    while a graph is captured.
+    """
+
+    active = False
+
+
+_sequence_parallel_moe = _SequenceParallelMoE()
+
+
+def set_sequence_parallel_moe(active: bool) -> bool:
+    """Set the flag for the enclosing MoE call; returns the previous value."""
+    previous = _sequence_parallel_moe.active
+    _sequence_parallel_moe.active = bool(active)
+    return previous
+
+
+def layer_is_sequence_parallel(layer) -> bool:
+    return layer.moe_config.is_sequence_parallel is True
+
+
+def is_sequence_parallel_moe_active() -> bool:
+    return _sequence_parallel_moe.active
+
+
+@contextmanager
+def sequence_parallel_moe(layer):
+    """Mark whether the enclosing MoE layer is token-sharded (sequence parallel)."""
+    previous = set_sequence_parallel_moe(layer_is_sequence_parallel(layer))
+    try:
+        yield
+    finally:
+        set_sequence_parallel_moe(previous)
+
+
+def _gather_routing(collective_group, topk_weights, topk_ids):
+    """All-gather the routing pair with one collective.
+
+    Weights and ids are packed as f32 (exact for bf16/f32 weights and for
+    expert ids below 2**24): on a decode-sized shard every extra ICI
+    collective costs more than the bytes it moves.
+    """
+    if topk_weights is None or topk_ids is None:
+        ag_topk_weights = (
+            collective_group.all_gather(topk_weights, dim=0)
+            if topk_weights is not None
+            else None
+        )
+        ag_topk_ids = (
+            collective_group.all_gather(topk_ids, dim=0)
+            if topk_ids is not None
+            else None
+        )
+        return ag_topk_weights, ag_topk_ids
+    topk = topk_weights.shape[-1]
+    packed = torch.cat((topk_weights.float(), topk_ids.float()), dim=-1)
+    packed = collective_group.all_gather(packed, dim=0)
+    return (
+        packed[:, :topk].to(topk_weights.dtype),
+        packed[:, topk:].to(topk_ids.dtype),
     )
+
+
+@torch.compiler.assume_constant_result
+def _log_active_chunk_pipeline(collective_kind: str, parallel_size: int) -> None:
+    """Emit trace-time evidence without passing symbolic values to logging."""
     logger.info_once(
         "MoE multi-chunk pipeline branch active: group=%s, world_size=%d, threshold=%d",
         collective_kind,
@@ -241,7 +314,7 @@ def pipelined_fused_moe_gmm(
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
-    collective_group, _ = _get_moe_collective_group()
+    collective_group, collective_kind = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]
     parallel_size = (
@@ -263,15 +336,8 @@ def pipelined_fused_moe_gmm(
                 )
             else:
                 ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
-            ag_topk_weights = (
-                collective_group.all_gather(topk_weights, dim=0)
-                if topk_weights is not None
-                else None
-            )
-            ag_topk_ids = (
-                collective_group.all_gather(topk_ids, dim=0)
-                if topk_ids is not None
-                else None
+            ag_topk_weights, ag_topk_ids = _gather_routing(
+                collective_group, topk_weights, topk_ids
             )
         else:
             ag_hidden_states = hidden_states
@@ -301,7 +367,7 @@ def pipelined_fused_moe_gmm(
             return collective_group.reduce_scatter(out, dim=0)
         return out
 
-    _log_active_chunk_pipeline()
+    _log_active_chunk_pipeline(collective_kind, parallel_size)
     assert collective_group is not None
 
     # Slice local inputs into num_chunks chunks along dim 0
@@ -333,15 +399,8 @@ def pipelined_fused_moe_gmm(
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = _all_gather_hs(hs_slices[0])
-    ag_tw_curr = (
-        collective_group.all_gather(weights_slices[0], dim=0)
-        if weights_slices[0] is not None
-        else None
-    )
-    ag_ti_curr = (
-        collective_group.all_gather(ids_slices[0], dim=0)
-        if ids_slices[0] is not None
-        else None
+    ag_tw_curr, ag_ti_curr = _gather_routing(
+        collective_group, weights_slices[0], ids_slices[0]
     )
 
     rs_outputs = []
@@ -351,18 +410,8 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = _all_gather_hs(hs_slices[i + 1])
-            # Locals let the None checks below narrow; subscripts do not.
-            weights_next = weights_slices[i + 1]
-            ag_tw_next = (
-                collective_group.all_gather(weights_next, dim=0)
-                if weights_next is not None
-                else None
-            )
-            ids_next = ids_slices[i + 1]
-            ag_ti_next = (
-                collective_group.all_gather(ids_next, dim=0)
-                if ids_next is not None
-                else None
+            ag_tw_next, ag_ti_next = _gather_routing(
+                collective_group, weights_slices[i + 1], ids_slices[i + 1]
             )
 
         # Compute MoE kernel for current gathered chunk

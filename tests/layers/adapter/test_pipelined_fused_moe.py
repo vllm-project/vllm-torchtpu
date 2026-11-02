@@ -26,6 +26,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     calculate_moe_chunks,
     enable_pipelined_collective_and_compute,
+    is_sequence_parallel_moe_active,
     pipelined_fused_moe_gmm,
 )
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (  # noqa: E501
@@ -45,6 +46,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 def _make_mock_moe_config():
     return SimpleNamespace(
         experts_per_token=8,
+        is_sequence_parallel=False,
         moe_parallel_config=SimpleNamespace(use_ep=False),
         group_size=32,
     )
@@ -245,12 +247,12 @@ def test_pipelined_moe_execution_flow_and_numerical_parity():
     # Numerical parity check: each token should be exactly hs * 2.0
     torch.testing.assert_close(out, hidden_states * 2.0)
 
-    # Call log should record 2 all-gathers (for hidden_states, topk_weights, topk_ids)
-    # and 2 reduce-scatters
+    # hidden_states and the packed (topk_weights, topk_ids) pair are gathered
+    # per chunk; one reduce-scatter per chunk.
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
-    # 3 tensors gathered per chunk * 2 chunks = 6 all_gather calls
-    assert len(ag_calls) == 6
+    # 2 tensors gathered per chunk * 2 chunks = 4 all_gather calls
+    assert len(ag_calls) == 4
     # 1 tensor reduce-scattered per chunk * 2 chunks = 2 reduce_scatter calls
     assert len(rs_calls) == 2
 
@@ -300,7 +302,7 @@ def test_pcp_uses_chunk_pipeline_and_not_dp_collectives():
         )
 
     torch.testing.assert_close(out, hidden_states * 2.0)
-    assert len([c for c in pcp_group.call_log if c[0] == "all_gather"]) == 6
+    assert len([c for c in pcp_group.call_log if c[0] == "all_gather"]) == 4
     assert len([c for c in pcp_group.call_log if c[0] == "reduce_scatter"]) == 2
     assert dp_group.call_log == []
 
@@ -530,6 +532,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w13_bias = torch.zeros(4, 1, 128, dtype=torch.float32)
         layer.w2_bias = torch.zeros(4, 1, 64, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
+        layer.moe_config.is_sequence_parallel = True
         layer.moe_config.moe_parallel_config.use_ep = False
 
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
@@ -541,8 +544,14 @@ class TestMoEForwardPrecisionBranches:
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
         topk_ids = torch.zeros(4, 2, dtype=torch.int32)
 
+        sp_active: list[bool] = []
         mock_fused = MagicMock(return_value=x)
-        mock_pipelined = MagicMock(return_value=x)
+        mock_pipelined = MagicMock(
+            side_effect=lambda **kw: (
+                sp_active.append(is_sequence_parallel_moe_active()),
+                x,
+            )[1]
+        )
 
         with (
             patch(
@@ -565,6 +574,8 @@ class TestMoEForwardPrecisionBranches:
             out = VllmFp8MoEMethodTPU.apply_monolithic(method, layer, x, router_logits)
 
         assert out is x
+        assert not is_sequence_parallel_moe_active()
+        assert sp_active == ([True] if pipelined else [])
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
@@ -584,6 +595,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w13_bias = torch.zeros(4, 1, 128, dtype=torch.float32)
         layer.w2_bias = torch.zeros(4, 1, 64, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
+        layer.moe_config.is_sequence_parallel = True
 
         method = MagicMock()
         method._tpu_activation_str = "silu"
@@ -592,8 +604,14 @@ class TestMoEForwardPrecisionBranches:
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
         topk_ids = torch.zeros(4, 2, dtype=torch.int32)
 
+        sp_active: list[bool] = []
         mock_fused = MagicMock(return_value=x)
-        mock_pipelined = MagicMock(return_value=x)
+        mock_pipelined = MagicMock(
+            side_effect=lambda **kw: (
+                sp_active.append(is_sequence_parallel_moe_active()),
+                x,
+            )[1]
+        )
 
         with (
             patch(
@@ -618,6 +636,8 @@ class TestMoEForwardPrecisionBranches:
             )
 
         assert out is x
+        assert not is_sequence_parallel_moe_active()
+        assert sp_active == ([True] if pipelined else [])
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
@@ -639,6 +659,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w13_bias = None
         layer.w2_bias = None
         layer.moe_config.experts_per_token = 2
+        layer.moe_config.is_sequence_parallel = True
 
         method = MagicMock()
         method._tpu_activation_str = "silu"
@@ -648,8 +669,14 @@ class TestMoEForwardPrecisionBranches:
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
         topk_ids = torch.zeros(4, 2, dtype=torch.int32)
 
+        sp_active: list[bool] = []
         mock_fused = MagicMock(return_value=x)
-        mock_pipelined = MagicMock(return_value=x)
+        mock_pipelined = MagicMock(
+            side_effect=lambda **kw: (
+                sp_active.append(is_sequence_parallel_moe_active()),
+                x,
+            )[1]
+        )
 
         with (
             patch(
@@ -674,6 +701,8 @@ class TestMoEForwardPrecisionBranches:
             )
 
         assert out is x
+        assert not is_sequence_parallel_moe_active()
+        assert sp_active == ([True] if pipelined else [])
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
@@ -693,6 +722,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w13_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.w2_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
+        layer.moe_config.is_sequence_parallel = True
 
         method = MagicMock(spec=VllmNvfp4MoEMethod)
         # Exercise GMM dispatch; an unset mock attribute would be truthy.
@@ -703,8 +733,14 @@ class TestMoEForwardPrecisionBranches:
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
         topk_ids = torch.zeros(4, 2, dtype=torch.int32)
 
+        sp_active: list[bool] = []
         mock_fused = MagicMock(return_value=x)
-        mock_pipelined = MagicMock(return_value=x)
+        mock_pipelined = MagicMock(
+            side_effect=lambda **kw: (
+                sp_active.append(is_sequence_parallel_moe_active()),
+                x,
+            )[1]
+        )
 
         with (
             patch(
@@ -727,6 +763,8 @@ class TestMoEForwardPrecisionBranches:
             out = VllmNvfp4MoEMethod.apply_monolithic(method, layer, x, router_logits)
 
         assert out is x
+        assert not is_sequence_parallel_moe_active()
+        assert sp_active == ([True] if pipelined else [])
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
@@ -742,6 +780,7 @@ class TestMoEForwardPrecisionBranches:
         layer = MagicMock()
         layer.activation = "silu"
         layer.moe_config = _make_mock_moe_config()
+        layer.moe_config.is_sequence_parallel = True
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight_packed = torch.randn(4, 64, 128, dtype=torch.bfloat16)
         layer.w2_weight_packed = torch.randn(4, 128, 64, dtype=torch.bfloat16)
@@ -754,8 +793,14 @@ class TestMoEForwardPrecisionBranches:
         topk_weights = torch.ones(4, 8, dtype=torch.bfloat16) * 0.125
         topk_ids = torch.zeros(4, 8, dtype=torch.int32)
 
+        sp_active: list[bool] = []
         mock_fused = MagicMock(return_value=x)
-        mock_pipelined = MagicMock(return_value=x)
+        mock_pipelined = MagicMock(
+            side_effect=lambda **kw: (
+                sp_active.append(is_sequence_parallel_moe_active()),
+                x,
+            )[1]
+        )
 
         with (
             patch(
@@ -780,6 +825,8 @@ class TestMoEForwardPrecisionBranches:
             )
 
         assert out is x
+        assert not is_sequence_parallel_moe_active()
+        assert sp_active == ([True] if pipelined else [])
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
@@ -799,6 +846,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w13_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.w2_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
+        layer.moe_config.is_sequence_parallel = True
 
         # Exercise the real apply_with_routing helper, not a MagicMock child.
         method = VllmCompressedTensorsW4ANMxfp4MoEMethod.__new__(
@@ -810,8 +858,14 @@ class TestMoEForwardPrecisionBranches:
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
         topk_ids = torch.zeros(4, 2, dtype=torch.int32)
 
+        sp_active: list[bool] = []
         mock_fused = MagicMock(return_value=x)
-        mock_pipelined = MagicMock(return_value=x)
+        mock_pipelined = MagicMock(
+            side_effect=lambda **kw: (
+                sp_active.append(is_sequence_parallel_moe_active()),
+                x,
+            )[1]
+        )
 
         with (
             patch(
@@ -836,6 +890,8 @@ class TestMoEForwardPrecisionBranches:
             )
 
         assert out is x
+        assert not is_sequence_parallel_moe_active()
+        assert sp_active == ([True] if pipelined else [])
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
@@ -891,11 +947,11 @@ def test_pipelined_moe_single_chunk_dp_greater_than_one():
     assert out.shape == (seq_len, hidden_dim)
     torch.testing.assert_close(out, hidden_states * 3.0)
 
-    # In single-chunk mode (num_chunks=1): 3 all_gathers (hs, weights, ids)
+    # In single-chunk mode (num_chunks=1): 2 all_gathers (hs, packed routing)
     # and 1 reduce_scatter
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
-    assert len(ag_calls) == 3
+    assert len(ag_calls) == 2
     assert len(rs_calls) == 1
 
 
@@ -1078,10 +1134,122 @@ def test_pipelined_moe_four_stage_pipeline():
     torch.testing.assert_close(out, hidden_states * 4.0)
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
-    # 3 tensors * 4 chunks = 12 all_gather calls
-    assert len(ag_calls) == 12
+    # 2 tensors (hidden, packed routing) * 4 chunks = 8 all_gather calls
+    assert len(ag_calls) == 8
     # 4 reduce_scatter calls
     assert len(rs_calls) == 4
+
+
+def test_sequence_parallel_moe_pipelines_over_ep_group():
+    """TP sequence parallel at DP1 chunks the EP-group all-gather/reduce-scatter."""
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    ep_group = _MockCollectiveGroup(world_size=8, rank=0)
+    dp_group = _MockCollectiveGroup(world_size=1, rank=0)
+    seq_len = 1024  # this rank's SP shard of an 8192-token step
+    hidden_dim = 16
+    topk = 2
+    hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+    topk_weights = torch.ones(seq_len, topk, dtype=torch.bfloat16) / topk
+    topk_ids = torch.zeros(seq_len, topk, dtype=torch.int32)
+
+    layer = MagicMock()
+    layer.moe_config.is_sequence_parallel = True
+    assert pfm.layer_is_sequence_parallel(layer)
+    with (
+        pfm.sequence_parallel_moe(layer),
+        patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 2048),
+        patch.object(pfm, "get_pcp_group", return_value=None),
+        patch.object(pfm, "get_dp_group", return_value=dp_group),
+        patch.object(pfm, "get_ep_group", return_value=ep_group),
+        patch.object(
+            pfm,
+            "fused_moe_gmm",
+            side_effect=lambda hidden_states, **kw: hidden_states * 2.0,
+        ),
+    ):
+        assert pfm._get_moe_collective_group()[1] == "EP"
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=torch.empty(0),
+            w2=torch.empty(0),
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+        )
+
+    torch.testing.assert_close(out, hidden_states * 2.0)
+    # 8192 / 2048 = 4 chunks: hidden + packed routing gathered, 1 RS each.
+    assert len([c for c in ep_group.call_log if c[0] == "all_gather"]) == 8
+    assert len([c for c in ep_group.call_log if c[0] == "reduce_scatter"]) == 4
+    assert dp_group.call_log == []
+
+
+def test_replicated_layer_keeps_dp_group_under_sp_model():
+    """A non-SP layer (speculative drafter) in an SP model must not use the EP group."""
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    layer = MagicMock()
+    layer.moe_config.is_sequence_parallel = False
+    assert not pfm.layer_is_sequence_parallel(layer)
+    with (
+        pfm.sequence_parallel_moe(layer),
+        patch.object(pfm, "get_pcp_group", return_value=None),
+        patch.object(pfm, "get_dp_group", return_value=_MockCollectiveGroup(1, 0)),
+        patch.object(pfm, "get_ep_group", return_value=_MockCollectiveGroup(8, 0)),
+    ):
+        assert pfm._get_moe_collective_group()[1] == "DP"
+
+
+def test_sequence_parallel_moe_slices_local_token_padding_mask():
+    """When sequence_parallel_moe is active at DP=1, zero_routing_weights_for_padding
+    with is_local_tensor=True slices this EP rank's shard of the padding mask."""
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    ep_group = _MockCollectiveGroup(world_size=4, rank=2)
+    dp_group = _MockCollectiveGroup(world_size=1, rank=0)
+    state = token_padding.TokenPaddingState.create(12, device="cpu")
+    # 7 valid tokens out of 12 padded across 4 SP ranks (3 tokens/rank):
+    # rank 0: [F, F, F], rank 1: [F, F, F], rank 2: [F, T, T], rank 3: [T, T, T]
+    state.update(local_valid_tokens=7, local_padded_tokens=12)
+    token_padding.set_padding_state(state)
+
+    layer = MagicMock()
+    layer.moe_config.is_sequence_parallel = True
+    topk_ids = torch.arange(6, dtype=torch.int32).reshape(3, 2)
+    topk_weights = torch.ones((3, 2), dtype=torch.float32)
+
+    try:
+        with (
+            pfm.sequence_parallel_moe(layer),
+            patch(
+                "vllm.distributed.parallel_state.get_dp_group",
+                return_value=dp_group,
+            ),
+            patch(
+                "vllm_torchtpu.distributed.pcp.get_pcp_group",
+                return_value=None,
+            ),
+            patch(
+                "vllm.distributed.parallel_state.get_ep_group",
+                return_value=ep_group,
+            ),
+        ):
+            _, masked_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights, is_local_tensor=True
+            )
+        # Rank 2 owns global rows 6, 7, 8 -> row 0 valid, rows 1..2 padded (zeroed).
+        expected = torch.tensor([[1.0, 1.0], [0.0, 0.0], [0.0, 0.0]])
+        torch.testing.assert_close(masked_weights, expected)
+    finally:
+        token_padding.set_padding_state(None)
 
 
 def test_fixed_chunk_count_honors_the_chunk_size_at_the_largest_bucket():
