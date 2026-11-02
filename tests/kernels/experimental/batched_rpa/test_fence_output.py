@@ -11,11 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`fence_output`: the token-major output goes through one optimization barrier.
+"""`fence_output` and `prepared_inputs` of the batched RPA wrapper.
 
-The lowering half runs on CPU (StableHLO lowered for an abstract TPU7x device);
-the kernel half needs a TPU and checks the outputs are bitwise unchanged.
+`fence_output`: the token-major output goes through one optimization barrier.
+`prepared_inputs`: handing the wrapper what prepare_inputs returns launches the
+same kernels. The lowering halves run on CPU (StableHLO lowered for an abstract
+TPU7x device); the kernel half needs a TPU and checks bitwise equality.
 """
+
+import re
 
 import jax
 import jax.numpy as jnp
@@ -57,29 +61,66 @@ def _args():
     )
 
 
-def _call(fence_output, *args):
+def _call(fence_output, *args, prepared=False):
+    q, k, v, cache = args[:4]
+    prepared_inputs = (
+        KB.prepare_inputs(q, k, v, q.dtype, cache.dtype) if prepared else None
+    )
     return KB.ragged_paged_attention(
         *args,
         decode_block_sizes=_DECODE_BLOCKS,
         prefill_block_sizes=_PREFILL_BLOCKS,
         fence_output=fence_output,
+        prepared_inputs=prepared_inputs,
     )
 
 
-@pytest.mark.parametrize("fence_output", [False, True])
-def test_lowering_has_one_output_barrier(fence_output):
+def _lowered_text(fence_output, prepared=False):
     device = jax.sharding.AbstractDevice(
         device_kind="TPU7x", num_cores=1, platform="tpu"
     )
     mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
     with jax.sharding.use_abstract_mesh(mesh):
-        lowered = (
-            jax.jit(_call, static_argnums=0)
-            .trace(fence_output, *_args())
+        return (
+            jax.jit(lambda *a: _call(fence_output, *a, prepared=prepared))
+            .trace(*_args())
             .lower(lowering_platforms=("tpu",))
+            .as_text()
         )
-    barriers = lowered.as_text().count("stablehlo.optimization_barrier")
+
+
+@pytest.mark.parametrize("fence_output", [False, True])
+def test_lowering_has_one_output_barrier(fence_output):
+    barriers = _lowered_text(fence_output).count("stablehlo.optimization_barrier")
     assert barriers == int(fence_output)
+
+
+def test_prepared_inputs_launch_the_same_kernels():
+    def kernels(text):
+        return sorted(re.findall(r"backend_config = \"([^\"]*)\"", text))
+
+    plain, prepared = _lowered_text(False), _lowered_text(False, prepared=True)
+    assert kernels(plain) and kernels(prepared) == kernels(plain)
+
+
+def test_prepared_inputs_must_match_prepare_inputs():
+    device = jax.sharding.AbstractDevice(
+        device_kind="TPU7x", num_cores=1, platform="tpu"
+    )
+    q, k, v, cache, *rest = _args()
+
+    def call(*args):
+        good_q, good_kv = KB.prepare_inputs(q, k, v, q.dtype, cache.dtype)
+        return KB.ragged_paged_attention(
+            *args,
+            decode_block_sizes=_DECODE_BLOCKS,
+            prefill_block_sizes=_PREFILL_BLOCKS,
+            prepared_inputs=(good_q[:, :8], good_kv),
+        )
+
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh), pytest.raises(ValueError, match="prep"):
+        jax.jit(call).trace(q, k, v, cache, *rest)
 
 
 @pytest.mark.tpu_test
