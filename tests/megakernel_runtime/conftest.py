@@ -15,11 +15,14 @@
 
 from __future__ import annotations
 
+import logging
+import sys
+
 import pytest
 
-from tests.megakernel.conftest import register_megakernel_cpu_plugin, route_lazy_loggers
-from vllm_torchtpu.megakernel_runtime.testkit import mk_fake_runner as mk_fake_runner
-from vllm_torchtpu.megakernel_runtime.testkit import mk_toy_plugin as mk_toy_plugin
+from tests.megakernel.conftest import register_megakernel_cpu_plugin
+
+_RUNTIME = "vllm_torchtpu.megakernel_runtime."
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -28,4 +31,13 @@ def pytest_configure(config: pytest.Config) -> None:
 
 @pytest.fixture(autouse=True)
 def _std_megakernel_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
-    route_lazy_loggers(monkeypatch)
+    """Route the lazy vLLM loggers of the imported runtime modules to
+    `logging` when vLLM is absent (CPU)."""
+    for name in sorted(n for n in sys.modules if n.startswith(_RUNTIME)):
+        lazy = getattr(sys.modules[name], "logger", None)
+        if not callable(getattr(lazy, "_resolve", None)):
+            continue
+        try:
+            lazy._resolve()
+        except ModuleNotFoundError:
+            monkeypatch.setattr(lazy, "_logger", logging.getLogger(lazy._name))

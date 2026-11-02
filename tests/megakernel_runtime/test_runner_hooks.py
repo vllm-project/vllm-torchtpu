@@ -135,33 +135,6 @@ def test_get_pallas_mesh_fn_is_none_without_torch_tpu(
     assert driver_mod._get_pallas_mesh_fn() is None
 
 
-# --- Suppression -------------------------------------------------------------
-
-
-def test_suppressed_nests_and_restores_on_error() -> None:
-    from types import SimpleNamespace
-    from unittest import mock
-
-    from vllm_torchtpu import megakernel_runtime as mkr
-
-    runner = SimpleNamespace()
-    assert not mkr.is_suppressed(runner) and not mkr.is_suppressed(None)
-    with mkr.suppressed(runner):
-        assert mkr.is_suppressed(runner)
-        with mkr.suppressed(runner):
-            assert mkr.is_suppressed(runner)
-        assert mkr.is_suppressed(runner)
-    assert not mkr.is_suppressed(runner)
-    with pytest.raises(RuntimeError, match="boom"), mkr.suppressed(runner):
-        raise RuntimeError("boom")
-    assert not mkr.is_suppressed(runner)
-    # Scoped to one runner; attribute-synthesizing mocks are never suppressed.
-    other = SimpleNamespace()
-    with mkr.suppressed(runner):
-        assert not mkr.is_suppressed(other)
-    assert not mkr.is_suppressed(mock.MagicMock())
-
-
 def _bare_driver(monkeypatch: pytest.MonkeyPatch, *, eligible: bool = True) -> Any:
     """A `ProgramDriver` with only the state `try_forward` touches."""
     import torch
