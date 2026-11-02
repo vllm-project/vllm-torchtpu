@@ -49,7 +49,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_pcp_group
+from vllm.distributed import get_pcp_group, get_world_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -109,6 +109,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 from vllm_torchtpu.distributed.pp_push import ring_handoff
 from vllm_torchtpu.distributed.pp_ring import PPRing, hbm_reserve_bytes
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
+from vllm_torchtpu.distributed.rank_agreement import gather_step_reports
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
@@ -613,6 +614,55 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
             f"{shapes}; the pipeline hand-off carries one per stage"
         )
     return next(iter(found.values()))
+
+
+def _warmup_ranks_agree(ok: bool, cleanup_ok: bool, what: str) -> bool:
+    """Whether a warmup attempt succeeded, decided the same way on every rank.
+
+    A warmup step runs collectives, so a rank that failed it alone must not
+    take a different next step (a retry, or the next shape) from its peers:
+    their collectives would no longer match. Every rank of the world group
+    reports the step it is at, whether the attempt succeeded and whether its
+    cleanup removed the synthetic requests. All succeeded -> True; all failed
+    -> False (every rank takes the same fallback); a mix, a rank at another
+    step, or synthetic state left anywhere raises on every rank. One process
+    decides alone, and also refuses to keep synthetic state. A rank whose
+    peers are blocked in a device collective after it failed waits here for
+    the CPU group timeout, then raises.
+    """
+    world = get_world_group() if torch.distributed.is_initialized() else None
+    if world is None or world.world_size == 1:
+        if not cleanup_ok:
+            raise RuntimeError(
+                f"{what}: cleanup left synthetic request state; refusing to "
+                "retry or start with it. The cleanup error is logged above."
+            )
+        return ok
+    reports = gather_step_reports(
+        world,
+        what,
+        (int(ok), int(cleanup_ok)),
+        on_timeout="A rank exited, or is blocked in a device collective after a "
+        "peer failed; check the other ranks' logs. Raise "
+        "--cpu-distributed-timeout-seconds only if a rank is legitimately slow.",
+    )
+    dirty = [r for r, (_, clean) in enumerate(reports) if not clean]
+    if dirty:
+        raise RuntimeError(
+            f"{what}: cleanup left synthetic request state on ranks {dirty}; "
+            "refusing to retry or start with it. The cleanup error is logged on "
+            "those ranks."
+        )
+    failed = [r for r, (succeeded, _) in enumerate(reports) if not succeeded]
+    if not failed:
+        return True
+    if len(failed) == world.world_size:
+        return False
+    raise RuntimeError(
+        f"{what} failed on ranks {failed} of {world.world_size} only; refusing to "
+        "continue with ranks out of step in their collectives. The warmup "
+        "exception is logged on those ranks."
+    )
 
 
 # Recompilation-avoidance contract:
@@ -7036,6 +7086,10 @@ class TPUModelRunner(GPUModelRunner):
         one forward alone has none, so each stage settles the burst right
         after each forward; those launches carry the prefill on to the last
         stage, whose forward waits for it.
+
+        Every rank reports each attempt's outcome before any rank moves on
+        (``_warmup_ranks_agree``): a retry or a stop happens on all ranks or
+        on none, and a failure on only some ranks stops startup.
         """
         if not envs.SPEC_WARMUP:
             return
@@ -7055,20 +7109,23 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_timed("MTP real prefill warmup"),
         ):
             for P in prompt_lens:
+                what = f"MTP prefill warmup P={P}"
                 if pipeline:
                     assert self._pp_wave is not None
                     try:
-                        warmed = self._warmup_one_mtp_prefill(P)
+                        outcome = self._warmup_one_mtp_prefill(P)
                     finally:
                         self._pp_wave.settle()
-                    if not warmed:
+                    if not _warmup_ranks_agree(*outcome, what):
                         raise RuntimeError(
                             f"MTP prefill warmup failed at P={P}; refusing to "
                             "start a producer whose first live proposal would "
                             "hit the same failure"
                         )
-                elif not self._warmup_one_mtp_prefill(P, quiet=True):  # noqa: SIM102 (retry)
-                    if not self._warmup_one_mtp_prefill(P):
+                elif not _warmup_ranks_agree(  # noqa: SIM102 (retry)
+                    *self._warmup_one_mtp_prefill(P, quiet=True), what
+                ):
+                    if not _warmup_ranks_agree(*self._warmup_one_mtp_prefill(P), what):
                         raise RuntimeError(
                             f"MTP prefill warmup failed at P={P} after retry; "
                             "refusing to start a producer whose first live "
@@ -7080,8 +7137,11 @@ class TPUModelRunner(GPUModelRunner):
             self.num_xla_graphs - n0,
         )
 
-    def _warmup_one_mtp_prefill(self, P: int, quiet: bool = False) -> bool:
-        """Run one synthetic prefill through target sampling + K1 propose."""
+    def _warmup_one_mtp_prefill(self, P: int, quiet: bool = False) -> tuple[bool, bool]:
+        """Run one synthetic prefill through target sampling + K1 propose.
+
+        Returns (attempt succeeded, cleanup removed the synthetic request).
+        """
         from vllm.sampling_params import SamplingParams
         from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 
@@ -7128,7 +7188,7 @@ class TPUModelRunner(GPUModelRunner):
             attempt_succeeded = False
             if quiet:
                 logger.warning(
-                    "MTP prefill warmup P=%d first attempt failed; retrying once.",
+                    "MTP prefill warmup P=%d first attempt failed.",
                     P,
                     exc_info=True,
                 )
@@ -7136,13 +7196,7 @@ class TPUModelRunner(GPUModelRunner):
                 logger.exception("MTP prefill warmup P=%d failed", P)
         finally:
             cleanup_succeeded = self._warmup_spec_decode_cleanup(rid)
-
-        if not cleanup_succeeded:
-            raise RuntimeError(
-                "MTP prefill warmup cleanup failed; refusing to retry or "
-                "start with residual synthetic request state"
-            )
-        return attempt_succeeded
+        return attempt_succeeded, cleanup_succeeded
 
     def _precompile_backbone(self) -> None:
         """Compile the backbone for every token bucket.
@@ -7356,9 +7410,11 @@ class TPUModelRunner(GPUModelRunner):
         cross-step chain (step N reads the AsyncPreResults parked by step N-1).
 
         Bounded + value-insensitive: only shapes matter, so token/position VALUES
-        are irrelevant. Wrapped so any failure degrades to "no warmup" (the first
-        request just pays the bounded recompiles, as before) rather than breaking
-        serving.
+        are irrelevant. A failure every rank shares degrades to "no warmup" for
+        that shape (the first request just pays the bounded recompiles) rather
+        than breaking serving; a failure on only some ranks stops startup,
+        because those ranks would no longer run matching collectives
+        (_warmup_ranks_agree).
         """
         if not envs.SPEC_WARMUP:
             return  # escape hatch / A-B toggle
@@ -7394,16 +7450,34 @@ class TPUModelRunner(GPUModelRunner):
                 # Greedy and non-greedy (do_sampling=True) verify+sample are
                 # DISTINCT fused programs, so sweep both at every prompt bucket.
                 for greedy in (True, False):
-                    if not self._warmup_one_spec_request(
-                        int(P), idx=i, quiet=True, greedy=greedy
+                    what = f"spec-decode warmup P={int(P)} greedy={greedy}"
+                    if not _warmup_ranks_agree(
+                        *self._warmup_one_spec_request(
+                            int(P), idx=i, quiet=True, greedy=greedy
+                        ),
+                        what,
                     ):
                         # First attempt cold-compiles the draft forward; a
                         # SymInt from that cold compile can leak into the
                         # dynamic=False gather wrapper on the first bucket. Retry
-                        # once now that the forward is compiled and returns
-                        # concrete-shaped tensors (this attempt logs loudly if it
-                        # also fails).
-                        self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+                        # once, on every rank, now that the forward is compiled
+                        # and returns concrete-shaped tensors (this attempt logs
+                        # loudly if it also fails).
+                        _warmup_ranks_agree(
+                            *self._warmup_one_spec_request(
+                                int(P), idx=i, greedy=greedy
+                            ),
+                            what,
+                        )
+
+            # Batch outcomes are agreed too; a failure every rank shares skips
+            # that count, with no retry.
+            def warm_batch(R: int, P: int, greedy: bool, **kwargs) -> None:
+                _warmup_ranks_agree(
+                    *self._warmup_spec_batch(R, P, greedy=greedy, **kwargs),
+                    f"spec-decode batch warmup R={R} P={P} greedy={greedy}",
+                )
+
             # (2) Batched spec steps. A bucketed-draft proposer depends on no
             # exact request count, so one count per program-bucket combination
             # (`_spec_warmup_bucket_grid`), each with a short decode run and a
@@ -7420,12 +7494,8 @@ class TPUModelRunner(GPUModelRunner):
                     sweep,
                 )
                 for R in sweep:
-                    self._warmup_spec_batch(
-                        int(R), P_small, greedy=True, short=True, mixed=True
-                    )
-                    self._warmup_spec_batch(
-                        int(R), P_small, greedy=False, short=True, mixed=True
-                    )
+                    for greedy in (True, False):
+                        warm_batch(int(R), P_small, greedy, short=True, mixed=True)
             elif self.scheduler_config.max_num_seqs > 1:
                 max_reqs = int(self.scheduler_config.max_num_seqs)
                 prompt_buckets = [
@@ -7442,12 +7512,12 @@ class TPUModelRunner(GPUModelRunner):
                     else paddings
                 )
                 for R in counts:
-                    self._warmup_spec_batch(R, prompt_buckets[0], greedy=True)
-                    self._warmup_spec_batch(R, prompt_buckets[0], greedy=False)
+                    for greedy in (True, False):
+                        warm_batch(R, prompt_buckets[0], greedy)
                 if prompt_buckets[-1] != prompt_buckets[0]:
                     for R in paddings:
-                        self._warmup_spec_batch(R, prompt_buckets[-1], greedy=True)
-                        self._warmup_spec_batch(R, prompt_buckets[-1], greedy=False)
+                        for greedy in (True, False):
+                            warm_batch(R, prompt_buckets[-1], greedy)
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
 
     def _spec_warmup_bucket_grid(self, mixed: bool) -> list[int]:
@@ -7507,9 +7577,12 @@ class TPUModelRunner(GPUModelRunner):
         *,
         short: bool = False,
         mixed: bool = False,
-    ) -> None:
+    ) -> tuple[bool, bool]:
         """Warm an nr=R decode batch: prefill R synthetic requests then decode
         them together so the multi-request fused programs are compiled.
+
+        Returns (attempt succeeded, cleanup removed the synthetic requests); a
+        count skipped for lack of KV blocks counts as succeeded.
 
         greedy=False routes the non-greedy (do_sampling=True) verify+sample
         fusion, which is a distinct set of programs from the greedy path."""
@@ -7539,12 +7612,13 @@ class TPUModelRunner(GPUModelRunner):
         top = int(self.kv_cache_config.num_blocks)
         if top <= R * nblk + 1:
             logger.warning("skip spec-decode warmup R=%d: not enough kv blocks", R)
-            return
+            return True, True
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
         mix_rid = f"__spec_warmup_b{R}_mix"
         mix_ids: list[str] = []
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P, greedy)
+        attempt_ok = True
         try:
             # Match the low-block working set used by the LIFO BlockPool
             # workaround. High physical block ids can trigger the v7x SC2
@@ -7677,16 +7751,20 @@ class TPUModelRunner(GPUModelRunner):
                     nct = [x + 1 for x in nct]
                     prev_ids = [e.req_id for e in extras]
         except Exception:
-            logger.exception("spec-decode warmup R=%d failed; continuing", R)
+            attempt_ok = False
+            logger.exception("spec-decode warmup R=%d failed", R)
         finally:
-            self._warmup_spec_decode_cleanup(rids + mix_ids)
+            cleanup_ok = self._warmup_spec_decode_cleanup(rids + mix_ids)
+        return attempt_ok, cleanup_ok
 
     def _warmup_one_spec_request(
         self, P: int, idx: int, quiet: bool = False, greedy: bool = True
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """Run one synthetic spec-decode request (prefill P + decodes).
 
-        Returns True on success, False if the warmup raised (and was caught).
+        Returns (attempt succeeded, cleanup removed the synthetic request);
+        a bucket skipped for lack of KV blocks counts as succeeded, so it is
+        not retried.
         The caller retries a failed bucket once: the first attempt cold-compiles
         the draft forward, and a SymInt from that cold compile can leak into the
         dynamic=False gather wrapper on the very first bucket; the retry runs with
@@ -7730,9 +7808,10 @@ class TPUModelRunner(GPUModelRunner):
             max_nblk = max(max_nblk, g_nblk)
         if top <= max_nblk + 1:
             logger.warning("skip spec-decode warmup P=%d: not enough kv blocks", P)
-            return False
+            return True, True
         block_ids = tuple(block_ids_per_group)
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
+        attempt_ok = True
         try:
             # ---- prefill ----
             new_req = NewRequestData(
@@ -7776,30 +7855,27 @@ class TPUModelRunner(GPUModelRunner):
                 if d and d.draft_token_ids:
                     cur = d.draft_token_ids[0]
         except Exception:
+            attempt_ok = False
             if quiet:
                 # First attempt: a SymInt from the draft forward's cold compile
                 # can leak into the dynamic=False gather wrapper. The caller
                 # retries once (forward now compiled -> concrete shapes), so log
                 # quietly and let the retry surface a genuine failure.
                 # WARNING, not DEBUG: this except catches a *rank-local*
-                # exception raised inside a *collective* region. The raising
-                # rank unwinds and retries while its peers stay blocked in
-                # the collective, so a swallowed failure here surfaces as a
-                # cluster-wide hang with no log line to explain it. Keep it
-                # visible even on the quiet first attempt.
+                # exception raised inside a *collective* region, so peers may
+                # still be blocked in it; the caller makes every rank agree on
+                # the outcome before anyone retries, and this line is the one
+                # that explains a failure there.
                 logger.warning(
-                    "spec-decode warmup P=%d first attempt failed; retrying. "
-                    "Under DP/EP this can desynchronize ranks — if startup "
-                    "hangs after this line, that is the cause.",
+                    "spec-decode warmup P=%d first attempt failed.",
                     P,
                     exc_info=True,
                 )
             else:
-                logger.exception("spec-decode warmup P=%d failed; continuing", P)
-            return False
+                logger.exception("spec-decode warmup P=%d failed", P)
         finally:
-            self._warmup_spec_decode_cleanup(rid)
-        return True
+            cleanup_ok = self._warmup_spec_decode_cleanup(rid)
+        return attempt_ok, cleanup_ok
 
     def _warmup_spec_decode_cleanup(self, rids) -> bool:
         """Tear down the synthetic warmup request(s) so serving starts clean."""

@@ -121,7 +121,7 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
         _warmup_spec_decode_cleanup=lambda rids: True,
     )
 
-    assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
+    assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0) == (True, True)
 
     (block_ids,) = captured[0].scheduled_new_reqs[0].block_ids
     # Five decode steps of 1 + K tokens follow the 8192-token prefill, so the
@@ -377,8 +377,8 @@ def test_suspend_kv_transfer_group_restores_agent_after_failure():
 @pytest.mark.parametrize(
     ("outcomes", "raises_after_retry"),
     [
-        ([False, True], False),
-        ([False, False], True),
+        ([(False, True), (True, True)], False),
+        ([(False, True), (False, True)], True),
     ],
 )
 def test_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
@@ -426,7 +426,7 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
     # Every stage runs the synthetic prefill through the hand-off in step,
     # so a stage never retries on its own, and settles the burst after its
     # forward so the launches that carry the prefill on are issued.
-    attempts = MagicMock(return_value=succeeds)
+    attempts = MagicMock(return_value=(succeeds, True))
     wave = MagicMock()
     runner = SimpleNamespace(
         enforce_eager=False,
@@ -465,7 +465,7 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
 def test_mtp_prefill_warmup_fills_every_bucket():
     # Buckets are per rank: a PCP8 prompt of 8 x 512 tokens pads to 512 per
     # rank. Prompts above one scheduler step collapse onto its size.
-    attempts = MagicMock(return_value=True)
+    attempts = MagicMock(return_value=(True, True))
     wave = MagicMock()
     runner = SimpleNamespace(
         enforce_eager=False,
@@ -501,8 +501,8 @@ def test_mtp_prefill_warmup_fills_every_bucket():
 def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     async_scheduling,
 ):
-    one = MagicMock(return_value=True)
-    batch = MagicMock()
+    one = MagicMock(return_value=(True, True))
+    batch = MagicMock(return_value=(True, True))
     runner = SimpleNamespace(
         enforce_eager=False,
         _is_async_drafter=True,
@@ -667,7 +667,7 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
 
 
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
-    attempts = MagicMock(side_effect=[False, True, True])
+    attempts = MagicMock(side_effect=[(False, True), (True, True), (True, True)])
     runner = SimpleNamespace(
         enforce_eager=False,
         speculative_config=object(),
@@ -752,6 +752,237 @@ def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
     last._async_drafter.run_dp_dummy_draft.assert_called_once_with(3)
 
 
+def _world(monkeypatch, size, peers=()):
+    """A world group of `size` ranks whose all_gather returns, for the other
+    ranks, `peers`: (ok, cleanup_ok) or (step, ok, cleanup_ok)."""
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        tpu_runner,
+        "get_world_group",
+        lambda: SimpleNamespace(world_size=size, rank_in_group=0, cpu_group=None),
+    )
+
+    def all_gather(reports, mine, group):
+        step = int(mine[0])
+        rows = [mine.tolist()] + [p if len(p) == 3 else (step, *p) for p in peers]
+        for report, row in zip(reports, rows, strict=True):
+            report.copy_(torch.tensor(row, dtype=torch.int64))
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+
+
+@pytest.mark.parametrize(
+    ("ok", "peers", "agreed"),
+    [(True, [(1, 1), (1, 1)], True), (False, [(0, 1), (0, 1)], False)],
+)
+def test_warmup_ranks_agree_when_every_rank_shares_the_outcome(
+    monkeypatch, ok, peers, agreed
+):
+    _world(monkeypatch, 3, peers)
+    assert tpu_runner._warmup_ranks_agree(ok, True, "warmup") is agreed
+
+
+@pytest.mark.parametrize(
+    ("ok", "cleanup_ok", "peers", "match"),
+    [
+        (True, True, [(0, 1), (1, 1)], "failed on ranks .* of 3 only"),
+        (False, True, [(1, 1), (1, 1)], "failed on ranks .* of 3 only"),
+        (True, True, [(1, 0), (1, 1)], "synthetic request state on ranks \\[1\\]"),
+        (False, False, [(0, 1), (0, 1)], "synthetic request state on ranks \\[0\\]"),
+        (True, True, [(7, 1, 1), (1, 1)], "reported from different steps"),
+    ],
+)
+def test_warmup_ranks_agree_raises_when_ranks_diverge(
+    monkeypatch, ok, cleanup_ok, peers, match
+):
+    _world(monkeypatch, 3, peers)
+    with pytest.raises(RuntimeError, match=match):
+        tpu_runner._warmup_ranks_agree(ok, cleanup_ok, "warmup")
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_warmup_ranks_agree_is_local_in_one_process(monkeypatch, ok):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    assert tpu_runner._warmup_ranks_agree(ok, True, "warmup") is ok
+    with pytest.raises(RuntimeError, match="synthetic request state"):
+        tpu_runner._warmup_ranks_agree(ok, False, "warmup")
+
+
+def _gloo_agree_worker(rank, world, port, out):
+    import os
+    from datetime import timedelta
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    torch.distributed.init_process_group(
+        "gloo", rank=rank, world_size=world, timeout=timedelta(seconds=30)
+    )
+    tpu_runner.get_world_group = lambda: SimpleNamespace(
+        world_size=world, rank_in_group=rank, cpu_group=torch.distributed.group.WORLD
+    )
+    results = []
+    for ok, cleanup_ok, what in [
+        (True, True, "step"),
+        (rank == 0, True, "step"),
+        (True, rank == 0, "step"),
+        (True, True, f"step {rank}"),
+    ]:
+        try:
+            results.append(tpu_runner._warmup_ranks_agree(ok, cleanup_ok, what))
+        except RuntimeError as e:
+            results.append(str(e).split(";")[0])
+    out[rank] = results
+    torch.distributed.destroy_process_group()
+
+
+def test_warmup_ranks_agree_over_gloo():
+    """Real all_gather between two processes: every rank reaches the same
+    verdict, including the raises."""
+    import socket
+
+    import torch.multiprocessing as mp
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    with mp.Manager() as manager:
+        out = manager.dict()
+        mp.spawn(_gloo_agree_worker, args=(2, port, out), nprocs=2)
+        r0, r1 = out[0], out[1]
+    assert r0[0] is True and r1[0] is True
+    assert r0[1:3] == r1[1:3]
+    assert "failed on ranks [1] of 2 only" in r0[1]
+    assert "synthetic request state on ranks [1]" in r0[2]
+    assert all("reported from different steps" in r[3] for r in (r0, r1))
+
+
+@pytest.mark.parametrize(
+    ("agreed", "attempts"),
+    [
+        # Every rank's first attempt succeeded: no retry.
+        ([True, True], 2),
+        # Every rank failed the first greedy attempt: every rank retries it.
+        ([False, True, True], 3),
+    ],
+)
+def test_spec_warmup_retries_only_what_every_rank_failed(monkeypatch, agreed, attempts):
+    attempt = MagicMock(return_value=(True, True))
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        _is_async_drafter=True,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[16],
+        max_model_len=1024,
+        num_xla_graphs=0,
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_spec_request=attempt,
+    )
+    monkeypatch.setattr(
+        tpu_runner, "_warmup_ranks_agree", MagicMock(side_effect=agreed)
+    )
+    with (
+        patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        TPUModelRunner._warmup_spec_decode(runner)
+    assert attempt.call_count == attempts
+
+
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_mtp_prefill_warmup_stops_every_rank_on_a_partial_failure(
+    monkeypatch, pipeline
+):
+    # This rank succeeded and its peer failed: neither moves on alone.
+    _world(monkeypatch, 2, [(0, 1)])
+    attempts = MagicMock(return_value=(True, True))
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        speculative_config=object(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2 if pipeline else 1,
+            prefill_context_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+        _pp_wave=MagicMock(),
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[4096],
+        max_model_len=262144,
+        num_xla_graphs=7,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_mtp_prefill=attempts,
+    )
+    with (
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+        pytest.raises(RuntimeError, match="failed on ranks \\[1\\] of 2 only"),
+    ):
+        TPUModelRunner._warmup_mtp_prefill(runner)
+    assert attempts.call_count == 1
+
+
+def _spec_warmup_runner(num_blocks, execute_model, cleanup_ok=True):
+    return SimpleNamespace(
+        max_model_len=64,
+        max_num_tokens=256,
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=num_blocks,
+            kv_cache_groups=[
+                SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(
+                        block_size=16,
+                        num_kv_heads=1,
+                        head_size=128,
+                        dtype=torch.bfloat16,
+                    )
+                )
+            ],
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+        execute_model=execute_model,
+        sample_tokens=MagicMock(),
+        take_draft_token_ids=MagicMock(return_value=None),
+        _warmup_spec_decode_cleanup=MagicMock(return_value=cleanup_ok),
+    )
+
+
+@pytest.mark.parametrize("cleanup_ok", [True, False])
+def test_spec_warmup_attempt_reports_its_cleanup(cleanup_ok):
+    runner = _spec_warmup_runner(100, MagicMock(return_value=None), cleanup_ok)
+    assert TPUModelRunner._warmup_one_spec_request(runner, 16, idx=0) == (
+        True,
+        cleanup_ok,
+    )
+
+
+def test_spec_warmup_skipped_for_kv_blocks_counts_as_succeeded():
+    """A skipped bucket reports success, so no rank retries it."""
+    runner = _spec_warmup_runner(num_blocks=2, execute_model=MagicMock())
+    assert TPUModelRunner._warmup_one_spec_request(runner, 16, idx=0) == (True, True)
+    assert TPUModelRunner._warmup_spec_batch(runner, 4, 16) == (True, True)
+    runner.execute_model.assert_not_called()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_spec_batch_warmup_reports_its_outcome(raises):
+    execute = MagicMock(
+        return_value=None, side_effect=RuntimeError("boom") if raises else None
+    )
+    runner = _spec_warmup_runner(num_blocks=100, execute_model=execute)
+    assert TPUModelRunner._warmup_spec_batch(runner, 2, 16) == (not raises, True)
+    execute.assert_called()
+    runner._warmup_spec_decode_cleanup.assert_called_once()
+
+
 def test_one_mtp_prefill_warmup_builds_prefill_without_decode():
     executed = []
     runner = SimpleNamespace(
@@ -769,7 +1000,7 @@ def test_one_mtp_prefill_warmup_builds_prefill_without_decode():
         _warmup_spec_decode_cleanup=MagicMock(return_value=True),
     )
 
-    assert TPUModelRunner._warmup_one_mtp_prefill(runner, 31) is True
+    assert TPUModelRunner._warmup_one_mtp_prefill(runner, 31) == (True, True)
 
     assert len(executed) == 1
     scheduler_output = executed[0]
