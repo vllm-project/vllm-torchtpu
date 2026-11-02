@@ -129,6 +129,10 @@ def chunked_kda_per_seq(
     # overflows even bounded -- so it needs a guard on
     # `triangular_block_size` as well as on the bound.
     block_size = min(cfg.triangular_block_size, cfg.chunk_size)
+    assert cfg.chunk_size % block_size == 0, (
+        f"chunk_size ({cfg.chunk_size}) must be divisible by "
+        f"triangular block_size ({block_size})"
+    )
     num_blocks = cfg.chunk_size // block_size
 
     identity_chunk = jnp.eye(cfg.chunk_size, dtype=jnp.float32)
