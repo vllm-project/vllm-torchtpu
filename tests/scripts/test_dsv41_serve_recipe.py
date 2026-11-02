@@ -1,17 +1,122 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise emitted serve argv without loading weights or initializing TPU."""
 
+import ast
+import importlib.metadata
 import json
 import os
+import runpy
 import shlex
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
+from threading import Event, Thread
+from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("atomic", [False, True])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_runai_metadata_read_during_download(
+    tmp_path, monkeypatch, atomic, interrupted
+):
+    """Exercise the installed downloader with a transport paused during writing."""
+    dist = importlib.metadata.distribution("runai-model-streamer-gcs")
+    source = Path(
+        dist.locate_file("runai_model_streamer_gcs/files/files.py")
+    ).read_text()
+    candidate = tmp_path / "files.py"
+    candidate.write_text(source)
+    if atomic:
+        # Apply the same installer as CI, to an isolated copy of the dependency.
+        monkeypatch.setattr(
+            importlib.metadata,
+            "distribution",
+            lambda _: SimpleNamespace(
+                version=dist.version, locate_file=lambda _: candidate
+            ),
+        )
+        runpy.run_path(
+            str(ROOT / ".buildkite/scripts/patch_runai_gcs_metadata.py"),
+            run_name="__main__",
+        )
+    functions = [
+        node
+        for node in ast.parse(candidate.read_text()).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("pull_files", "_safe_destination_path")
+    ]
+    assert len(functions) == 2
+    started, release = Event(), Event()
+    errors = []
+    payload = b'{"model_type":"deepseek_v41"}'
+
+    class Blob:
+        def download_to_filename(self, path):
+            with open(path, "wb") as stream:
+                started.set()
+                assert release.wait(10), "reader did not release download"
+                stream.write(payload[:10] if interrupted else payload)
+                if interrupted:
+                    raise OSError("injected download interruption")
+
+    namespace = {
+        "Optional": Optional,
+        "List": list,
+        "os": os,
+        "Path": Path,
+        "tempfile": tempfile,
+        "_create_client": lambda: SimpleNamespace(
+            get_bucket=lambda _: SimpleNamespace(blob=lambda _: Blob())
+        ),
+        "list_files": lambda *a, **kw: ("bucket", "model", ["model/config.json"]),
+    }
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), str(candidate), "exec"),
+        namespace,
+    )
+    config = tmp_path / "config.json"
+    config.write_bytes(payload)
+
+    def download():
+        try:
+            namespace["pull_files"]("gs://test-bucket/model", str(tmp_path), ["*.json"])
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = Thread(target=download, daemon=True)
+    worker.start()
+    try:
+        assert started.wait(10), "download did not start"
+        if atomic:
+            assert json.loads(config.read_text()) == json.loads(payload)
+        else:
+            with pytest.raises(json.JSONDecodeError):
+                json.loads(config.read_text())
+    finally:
+        release.set()
+        worker.join(10)
+    assert not worker.is_alive()
+    if interrupted:
+        assert len(errors) == 1
+        assert isinstance(errors[0], OSError)
+        assert str(errors[0]) == "injected download interruption"
+    else:
+        assert errors == []
+    assert (config.read_bytes() == payload) is (atomic or not interrupted)
+    assert not list(tmp_path.glob(".runai-*"))
+
+
+def test_runai_metadata_patch_rejects_changed_source():
+    patch = runpy.run_path(str(ROOT / ".buildkite/scripts/patch_runai_gcs_metadata.py"))
+    with pytest.raises(RuntimeError, match="source changed"):
+        patch["patch_source"]("different dependency implementation")
 
 
 def test_cached_recipe_selects_policy_without_kernel_env(tmp_path):
