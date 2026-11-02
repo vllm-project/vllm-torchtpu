@@ -434,18 +434,26 @@ def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
         "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
         lambda: events.append("release"),
     )
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker.set_torch_threads_for_runtime",
+        lambda: events.append("serving threads"),
+    )
     worker = SimpleNamespace(
         model_config=config,
         model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
     )
     TPUWorker.load_model(worker)
-    assert events == [("model_load", {"model_config": config}), "load", "release"]
+    assert events == [
+        ("model_load", {"model_config": config}),
+        "load",
+        "release",
+        "serving threads",
+    ]
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
-@pytest.mark.parametrize("speculative", [False, True])
-def test_warmup_restores_runtime_threads_without_overriding_user_choice(
-    monkeypatch, managed_by_vllm, runtime_threads, speculative
+def test_warmup_runs_at_runtime_threads_without_overriding_user_choice(
+    monkeypatch, managed_by_vllm, runtime_threads
 ):
     from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 
@@ -454,20 +462,27 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
         monkeypatch.setenv(OMP_NUM_THREADS_SET_BY_VLLM, "1")
     else:
         monkeypatch.delenv(OMP_NUM_THREADS_SET_BY_VLLM, raising=False)
+    monkeypatch.setattr(patch_registry, "apply", lambda stage, **kwargs: None)
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker._release_free_host_heap", lambda: None
+    )
 
-    warmup_threads = []
+    threads = []
 
-    def capture_model():
-        warmup_threads.append(torch.get_num_threads())
+    def record(stage):
+        return lambda: threads.append((stage, torch.get_num_threads()))
 
     worker = SimpleNamespace(
-        model_runner=SimpleNamespace(capture_model=capture_model),
+        model_config=object(),
+        model_runner=SimpleNamespace(
+            load_model=record("load"), capture_model=record("warm-up")
+        ),
         compilation_config=SimpleNamespace(compilation_time=0.0),
-        speculative_config=object() if speculative else None,
     )
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(2)
+        TPUWorker.load_model(worker)
         with (
             patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
             patch(
@@ -477,9 +492,8 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
             result = TPUWorker.compile_or_warm_up_model(worker)
         freeze.assert_called_once_with()
         gc_debug.assert_called_once_with()
-        # Speculative decoding warms up at the serving thread count; other
-        # models keep the startup count during warm-up.
-        assert warmup_threads == [runtime_threads if speculative else 2]
+        # Weights load at the startup count, warm-up runs at the serving count.
+        assert threads == [("load", 2), ("warm-up", runtime_threads)]
         assert torch.get_num_threads() == runtime_threads
         assert result.language_model == worker.compilation_config.compilation_time
         assert result.encoder == 0.0
