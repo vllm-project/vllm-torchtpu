@@ -96,6 +96,11 @@ class TpuKVConnectorStats(KVConnectorStats):
         """Record a failed KV transfer operation."""
         self.data["num_failed_transfers"].append(1)
 
+    def record_admission_reserved_blocks(self, watermark: int, inflight_load: int):
+        """Record the free blocks held back from admissions."""
+        self.data["reserved_watermark_blocks"].append(watermark)
+        self.data["reserved_inflight_load_blocks"].append(inflight_load)
+
     def record_prefill_queue_length(self, prefill_queue_length: int):
         """Record the prefill (send) queue length."""
         self.data["prefill_queue_length"].append(prefill_queue_length)
@@ -120,6 +125,8 @@ class TpuKVConnectorStats(KVConnectorStats):
             "kv_pull_time": [],
             "mb_transferred": [],
             "num_failed_transfers": [],
+            "reserved_watermark_blocks": [],
+            "reserved_inflight_load_blocks": [],
             "prefill_queue_length": [],
             "decode_queue_length": [],
             "runner_cpu_issue_seconds": [],
@@ -322,6 +329,18 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues
         )
 
+        # Not TPU-specific: named as in the HBM KV cache observability design.
+        self.gauge_kv_admission_reserved_blocks = self._gauge_cls(
+            name="vllm:kv_admission_reserved_blocks",
+            documentation=(
+                "Free KV cache blocks the scheduler holds back from admissions: "
+                "the watermark, and the reserve for in-flight prefills applied "
+                "to async KV load admissions."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=[*labelnames, "kind"],
+        )
+
         self.dynamic_metrics: dict[str, tuple[str, Any, list[str]]] = (
             self._get_raiden_metric_definitions(labelnames)
         )
@@ -441,6 +460,15 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         ):
             for list_item in transfer_stats_data.get(gauge_item_key, []):
                 cast(Gauge, gauge_obj[engine_idx]).set(list_item)
+
+        for kind, key in (
+            ("watermark", "reserved_watermark_blocks"),
+            ("inflight_load", "reserved_inflight_load_blocks"),
+        ):
+            if values := transfer_stats_data.get(key):
+                self.gauge_kv_admission_reserved_blocks.labels(
+                    *engine_labels, kind
+                ).set(max(values))
 
         # Dynamic metric observations
         base_labels = (

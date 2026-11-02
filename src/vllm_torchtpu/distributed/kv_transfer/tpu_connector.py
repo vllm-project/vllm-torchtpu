@@ -76,6 +76,7 @@ from vllm_torchtpu.tracing.annotation import TraceAnnotation
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_manager import KVCacheManager as VllmKVCacheManager
     from vllm.v1.request import Request
 
 import vllm_torchtpu.distributed.utils as dist_utils
@@ -946,8 +947,42 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         Get the KV transfer stats for the connector.
         """
         if self.connector_worker is None:
-            return None
+            return self._take_scheduler_stats()
         return self.connector_worker.get_kv_connector_stats()
+
+    def bind_kv_cache_manager(self, kv_cache_manager: "VllmKVCacheManager") -> None:
+        """Track the free blocks the scheduler holds back from admissions.
+
+        `allocate_slots` keeps `watermark_blocks` free when admitting waiting
+        requests, and an async-load admission must also leave free the
+        `reserved_blocks` the scheduler passes for in-flight prefills. Only
+        this manager instance is wrapped, to see that reserve.
+        """
+        super().bind_kv_cache_manager(kv_cache_manager)
+        self._inflight_reserved_blocks = 0
+        orig_allocate_slots = kv_cache_manager.allocate_slots
+
+        def allocate_slots(*args, **kwargs):
+            reserved_blocks = kwargs.get("reserved_blocks", 0)
+            self._inflight_reserved_blocks = max(
+                self._inflight_reserved_blocks, reserved_blocks
+            )
+            return orig_allocate_slots(*args, **kwargs)
+
+        kv_cache_manager.allocate_slots = allocate_slots  # type: ignore[method-assign]
+
+    def _take_scheduler_stats(self) -> TpuKVConnectorStats | None:
+        """The admission reserves since the last step; vLLM merges
+        scheduler-side connector stats into the step's stats."""
+        manager = getattr(self, "_kv_cache_manager", None)
+        if manager is None:
+            return None
+        stats = TpuKVConnectorStats()
+        stats.record_admission_reserved_blocks(
+            manager.watermark_blocks, self._inflight_reserved_blocks
+        )
+        self._inflight_reserved_blocks = 0
+        return stats
 
     @classmethod
     def build_kv_connector_stats(
