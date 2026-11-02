@@ -1190,13 +1190,18 @@ class TestStartStopPhasedProfiling:
             TPUModelRunner.start_phased_profiling(
                 runner,
                 "decode",
+                delay_iterations=5,
+                max_iterations=15,
                 profiler_kwargs={
                     "host_tracer_level": 3,
                     "e2e_enable_fw_throttle_event": True,
+                    "record_shapes": True,
                 },
             )
 
         assert mock_profiler_cls.call_args.args[0] == "/tmp/phased/decode"
+        assert mock_profiler_cls.call_args.kwargs["num_decode_steps_to_skip"] == 5
+        assert mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"] == 15
         assert (
             mock_profiler_cls.call_args.kwargs["standard_opts"]["host_tracer_level"]
             == 3
@@ -1207,6 +1212,9 @@ class TestStartStopPhasedProfiling:
             ]
             is True
         )
+        assert mock_profiler_cls.call_args.kwargs["torch_profiler_kwargs"] == {
+            "record_shapes": True
+        }
 
     def test_start_twice_is_a_noop(self, monkeypatch):
         """Already armed; a second /start_profile must not replace it and

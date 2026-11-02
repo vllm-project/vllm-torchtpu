@@ -126,7 +126,10 @@ class TestProfileDispatchesToPhasedProfiler:
         worker.profile(is_start=True)
 
         worker.model_runner.start_phased_profiling.assert_called_once_with(
-            None, profiler_kwargs=None
+            None,
+            delay_iterations=None,
+            max_iterations=None,
+            profiler_kwargs=None,
         )
         worker.model_runner.stop_phased_profiling.assert_not_called()
         assert worker.profile_context is None
@@ -141,21 +144,33 @@ class TestProfileDispatchesToPhasedProfiler:
         worker.profile(is_start=True, profile_prefix="decode")
 
         worker.model_runner.start_phased_profiling.assert_called_once_with(
-            "decode", profiler_kwargs=None
+            "decode",
+            delay_iterations=None,
+            max_iterations=None,
+            profiler_kwargs=None,
         )
 
     def test_start_forwards_profiler_kwargs(self, monkeypatch):
-        """profiler_kwargs must be forwarded to start_phased_profiling."""
+        """profiler_kwargs and iteration overrides must be forwarded."""
         monkeypatch.setenv("USE_PHASED_PROFILER", "true")
         cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
         worker = _build_worker(cfg)
         worker.model_runner = MagicMock()
         kwargs = {"host_tracer_level": 2}
 
-        worker.profile(is_start=True, profile_prefix="decode", profiler_kwargs=kwargs)
+        worker.profile(
+            is_start=True,
+            profile_prefix="decode",
+            delay_iterations=4,
+            max_iterations=12,
+            profiler_kwargs=kwargs,
+        )
 
         worker.model_runner.start_phased_profiling.assert_called_once_with(
-            "decode", profiler_kwargs=kwargs
+            "decode",
+            delay_iterations=4,
+            max_iterations=12,
+            profiler_kwargs=kwargs,
         )
 
     def test_stop_disarms_the_model_runners_phased_profiler(self, monkeypatch):
@@ -276,6 +291,42 @@ class TestProfileCaptureAndMerge:
             worker.profile(is_start=False)
 
         assert not list(tmp_path.iterdir())
+
+    def test_profiler_kwargs_forwards_torch_profiler_flags_and_experimental_options(
+        self, tmp_path
+    ):
+        worker = self._make_worker(tmp_path, rank=0, world_size=1)
+
+        with (
+            patch("vllm_torchtpu.worker.tpu_worker.torch.profiler") as mock_profiler,
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.TpuProfilerConfig"
+            ) as mock_config_cls,
+        ):
+            worker.profile(
+                is_start=True,
+                profile_prefix="decode",
+                delay_iterations=2,
+                max_iterations=10,
+                profiler_kwargs={
+                    "host_tracer_level": 3,
+                    "record_shapes": True,
+                    "with_stack": True,
+                    "experimental_options": {
+                        "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+                        "e2e_enable_fw_throttle_event": True,
+                    },
+                },
+            )
+
+        assert mock_config_cls.call_args.kwargs["host_tracer_level"] == 3
+        exp_opts = mock_config_cls.call_args.kwargs["experimental_options"]
+        assert exp_opts["tpu_trace_mode"] == "TRACE_COMPUTE_AND_SYNC"
+        assert exp_opts["e2e_enable_fw_throttle_event"] is True
+        assert "record_shapes" not in exp_opts
+        assert "with_stack" not in exp_opts
+        assert mock_profiler.profile.call_args.kwargs["record_shapes"] is True
+        assert mock_profiler.profile.call_args.kwargs["with_stack"] is True
 
 
 def test_initialize_from_config_updates_num_gpu_blocks():

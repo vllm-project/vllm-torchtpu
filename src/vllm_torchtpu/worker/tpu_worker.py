@@ -668,6 +668,8 @@ class TPUWorker(WorkerBase):
         self,
         is_start: bool = True,
         profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
         profiler_kwargs: dict[str, Any] | None = None,
     ):
         if envs.USE_PHASED_PROFILER:
@@ -677,7 +679,10 @@ class TPUWorker(WorkerBase):
             # arming/disarming it, so both profilers share one trigger.
             if is_start:
                 self.model_runner.start_phased_profiling(
-                    profile_prefix, profiler_kwargs=profiler_kwargs
+                    profile_prefix,
+                    delay_iterations=delay_iterations,
+                    max_iterations=max_iterations,
+                    profiler_kwargs=profiler_kwargs,
                 )
             else:
                 self.model_runner.stop_phased_profiling()
@@ -691,11 +696,15 @@ class TPUWorker(WorkerBase):
             if self.profile_context is not None:
                 logger.warning("Profiler is already running. Ignoring start request.")
                 return
-            from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
+            from vllm_torchtpu.tracing.options import (
+                extract_torch_profiler_kwargs,
+                resolve_profile_dir_and_opts,
+            )
 
             profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
                 self.profile_dir, profile_prefix, profiler_kwargs=profiler_kwargs
             )
+            torch_profiler_kwargs = extract_torch_profiler_kwargs(profiler_kwargs)
             os.makedirs(profile_dir, exist_ok=True)
             # All ranks capture concurrently, so each writes into its own
             # sandbox under a run directory they agree on; stop merges them.
@@ -729,6 +738,7 @@ class TPUWorker(WorkerBase):
                 ],
                 on_trace_ready=handler,
                 experimental_config=config,
+                **torch_profiler_kwargs,
             )
             try:
                 self.profile_context.__enter__()

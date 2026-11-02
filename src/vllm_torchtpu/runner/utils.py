@@ -173,6 +173,7 @@ class PhaseBasedProfiler:
         prefill_kv_len_threshold: int = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD,
         standard_opts: dict[str, Any] | None = None,
         advanced_opts: dict[str, Any] | None = None,
+        torch_profiler_kwargs: dict[str, Any] | None = None,
     ):
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: str | None = None
@@ -189,6 +190,7 @@ class PhaseBasedProfiler:
         self.prefill_kv_len_threshold: int = prefill_kv_len_threshold
         self.standard_opts = standard_opts or {}
         self.advanced_opts = advanced_opts or {}
+        self.torch_profiler_kwargs = torch_profiler_kwargs or {}
         self.profile_dir: str = profile_dir
         self.inference_phase_seen: dict[InferencePhase, bool] = {
             InferencePhase.PREFILL_ONLY: False,
@@ -322,6 +324,7 @@ class PhaseBasedProfiler:
                 ],
                 on_trace_ready=handler,
                 experimental_config=config,
+                **self.torch_profiler_kwargs,
             )
             try:
                 self.profile_context.__enter__()

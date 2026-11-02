@@ -198,7 +198,10 @@ from vllm_torchtpu.spec_decode.utils import (
 )
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
-from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
+from vllm_torchtpu.tracing.options import (
+    extract_torch_profiler_kwargs,
+    resolve_profile_dir_and_opts,
+)
 from vllm_torchtpu.tracing.utils import (
     extract_kv_lens_for_tracing,
     extract_request_ids_for_tracing,
@@ -1156,6 +1159,8 @@ class TPUModelRunner(GPUModelRunner):
     def start_phased_profiling(
         self,
         profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
         profiler_kwargs: dict[str, Any] | None = None,
     ) -> None:
         """Arms the phase-based profiler. Called from TPUWorker.profile()."""
@@ -1183,6 +1188,20 @@ class TPUModelRunner(GPUModelRunner):
         profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
             self.phased_profiling_dir, profile_prefix, profiler_kwargs=profiler_kwargs
         )
+        torch_profiler_kwargs = extract_torch_profiler_kwargs(profiler_kwargs)
+        effective_max_iterations = (
+            max_iterations
+            if max_iterations is not None
+            else profiler_config.max_iterations
+        )
+        effective_delay_iterations = (
+            delay_iterations
+            if delay_iterations is not None
+            else profiler_config.delay_iterations
+        )
+        phase_profiler_extra_kwargs: dict[str, Any] = {}
+        if torch_profiler_kwargs:
+            phase_profiler_extra_kwargs["torch_profiler_kwargs"] = torch_profiler_kwargs
 
         # Deliberately not read from parallel_config: its rank is TPxPP-scoped,
         # so every DP replica would call itself rank 0 and their traces would
@@ -1196,14 +1215,15 @@ class TPUModelRunner(GPUModelRunner):
             # profiling; that's meaningless for the phased profiler, so fall
             # back to its own default when unset.
             num_steps_to_profile_for=(
-                profiler_config.max_iterations
+                effective_max_iterations
                 or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR
             ),
-            num_decode_steps_to_skip=profiler_config.delay_iterations,
+            num_decode_steps_to_skip=effective_delay_iterations,
             decode_kv_len_threshold=decode_kv_len_threshold,
             prefill_kv_len_threshold=prefill_kv_len_threshold,
             standard_opts=standard_opts,
             advanced_opts=advanced_opts,
+            **phase_profiler_extra_kwargs,
         )
 
     def stop_phased_profiling(self) -> None:
