@@ -26,6 +26,7 @@ and uses our native TorchTPU + Pallas kernels.
 - VllmUnquantizedConfig: Quantization config for unquantized models
 - VllmUnquantizedFusedMoEMethod: MoE forward pass using GMM kernel
 - VllmUnquantizedLinearMethod: Linear layer using standard matmul
+- VllmUnquantizedGemmaNormWeightFold: Gemma norm weight folded at load time
 
 == Execution Flow ==
 1. vLLM loads model with quantization=None (unquantized)
@@ -144,6 +145,50 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         orig_out_shape = (*x.shape[:-1], weight.shape[-1])
         x_2d = x.reshape(-1, x.shape[-1])
         return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
+
+
+class VllmUnquantizedGemmaNormWeightFold(QuantizeMethodBase):
+    """Folds Gemma's implicit ``1 +`` into a norm weight once, after loading.
+
+    Gemma normalizes with ``x * (1 + w)``, and `GemmaRMSNorm.forward` rebuilds
+    ``self.weight.float() + 1.0`` on every call. That result is a function of
+    the checkpoint alone, so it belongs in the parameter.
+
+    Subclassing `QuantizeMethodBase` is what gets the fold invoked: vLLM's
+    post-load sweep calls `process_weights_after_loading` on any module
+    carrying a `quant_method`. Every loader runs that sweep, including
+    `load_format=dummy`, so the fold reaches the target model and both
+    speculative-decoding draft models with no call at their load sites.
+
+    Two consequences: `layer.weight` no longer holds the checkpoint value, and
+    carrying a `quant_method` drops the layer from the loader's missing-weight
+    check, so a Gemma norm weight absent from the checkpoint folds to a silent
+    identity norm (``0 + 1``) instead of raising.
+    """
+
+    def create_weights(
+        self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
+    ):
+        # The norm allocates its own parameter; abstract in the base class.
+        raise NotImplementedError(
+            "VllmUnquantizedGemmaNormWeightFold does not create weights; the "
+            "norm layer allocates its own."
+        )
+
+    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
+        # Nothing dispatches through a norm's quant method; abstract in the
+        # base class.
+        raise NotImplementedError(
+            "VllmUnquantizedGemmaNormWeightFold does not implement a forward "
+            "pass; the norm's own forward reads the folded weight."
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Unguarded: every caller has just written the raw checkpoint value,
+        # so a load and its fold always happen together.
+        layer.weight.data.add_(1.0)
+        if layer.weight.device.type == "tpu":
+            synchronize_tensors([layer.weight])
 
 
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
