@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_MLA_LOCAL_Q_GATHER: bool = False
+    TPU_MLA_LOCAL_Q_FUSED_AG: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
@@ -1002,6 +1003,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rank streaming the whole replicated weight. Same columns, same dots:
     # bit-identical q. Needs the fp8 Pallas q_b site (TPU_FP8_LINEAR_PALLAS).
     "TPU_MLA_LOCAL_Q_GATHER": env_bool("TPU_MLA_LOCAL_Q_GATHER", default=False),
+    # With TPU_MLA_LOCAL_Q_GATHER: the window projection and the heads'
+    # all-gather as one Pallas kernel (kernels/quantized_matmul/
+    # fp8_window_all_gather.py): one round of remote copies whose barrier
+    # hides under the window's weight stream, instead of the window kernel
+    # then XLA's all-gather. Bit-identical q.
+    "TPU_MLA_LOCAL_Q_FUSED_AG": env_bool("TPU_MLA_LOCAL_Q_FUSED_AG"),
     # Store each token's 64-byte fp8 RoPE key in 64 bytes instead of a padded
     # 128-byte row (eight tokens per 128-word row), cutting the sparse MLA
     # latent cache from 640 to 576 B/token. SparseCore layouts only; the

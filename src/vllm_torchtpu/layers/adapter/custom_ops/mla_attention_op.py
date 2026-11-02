@@ -86,7 +86,10 @@ from vllm_torchtpu.layers.adapter.attention import (
     VllmTPUDeepseekV32IndexerBackend,
     _retain_buffers,
 )
-from vllm_torchtpu.layers.adapter.cp_mla_attention import all_gather_heads
+from vllm_torchtpu.layers.adapter.cp_mla_attention import (
+    all_gather_heads,
+    local_q_all_gather_op,
+)
 from vllm_torchtpu.layers.adapter.linear_common import (
     DCP_ROWS_ATTR,
     FP8_PALLAS_N_ATTR,
@@ -2262,6 +2265,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # all-gather of the heads (`_project_local_q`).
         self.local_q_op = None
         self.local_q_window = None
+        # TPU_MLA_LOCAL_Q_FUSED_AG: the window and the gather as one kernel.
+        self.local_q_fused_op = None
+        self.local_q_lane = None
         if (
             envs.TPU_MLA_LOCAL_Q_GATHER
             and self.dcp_q_replicate
@@ -2288,6 +2294,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 fp8_skinny_hbm_pin_selected(f"{prefix}.q_b_proj"),
             )
             self.local_q_window = dcp_rank_operand()
+            if envs.TPU_MLA_LOCAL_Q_FUSED_AG:
+                from vllm_torchtpu.distributed.dcp import dcp_lane_operand
+
+                self.local_q_fused_op = local_q_all_gather_op()
+                self.local_q_lane = dcp_lane_operand()
 
         # TPU_MLA_ROPE_NEOX_PERMUTE: set once the q / k_pe projection columns
         # are in half-split order, which is what switches `forward` to NeoX
@@ -2375,6 +2386,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         bytes), all-gathered over the DCP group in head order."""
         operands = _qb_overlap_operands(self.q_b_proj)
         assert operands is not None and self.local_q_op is not None
+        fused = getattr(self, "local_q_fused_op", None)
+        if fused is not None:
+            return fused(q_c, *operands, self.local_q_window, self.local_q_lane)
         local = self.local_q_op(q_c, *operands, self.local_q_window)
         heads = local.view(q_c.shape[0], self.num_heads, self.qk_head_dim)
         return all_gather_heads(heads).reshape(q_c.shape[0], -1)
@@ -2411,7 +2425,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if getattr(self, "local_q_op", None) is not None:
             # Lifted on every bucket, before any token-count branch: the warmup
             # hands buckets only between traces that lift the same buffers.
-            hidden_states = _retain_buffers(hidden_states, self.local_q_window)
+            operands = (self.local_q_window, getattr(self, "local_q_lane", None))
+            hidden_states = _retain_buffers(
+                hidden_states, *(t for t in operands if t is not None)
+            )
         # TPU_DCP_PREFILL_TOKEN_PARALLEL under query replication: project q for
         # only the rows this rank attends (`dcp_token_parallel_op.q_rows`).
         q_rows = None

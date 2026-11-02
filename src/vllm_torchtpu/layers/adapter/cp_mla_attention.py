@@ -71,6 +71,65 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     return group.all_gather(q.contiguous(), dim=1)
 
 
+_LOCAL_Q_ALL_GATHER_OPS: dict = {}
+
+
+def local_q_all_gather_op():
+    """`op(x, w_q, w_s, rank, lane)`: `x @ w_q * scales` on every DCP rank, each
+    rank projecting only its column window (`rank`) and all-gathering the rest
+    in one Pallas kernel (kernels/quantized_matmul/fp8_window_all_gather.py,
+    TPU_MLA_LOCAL_Q_FUSED_AG). `rank` / `lane` are `dcp_rank_operand` /
+    `dcp_lane_operand`. Build it outside Dynamo (load time)."""
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+    from vllm_torchtpu.kernels.quantized_matmul.fp8_window_all_gather import (
+        fp8_window_all_gather,
+    )
+
+    mesh = get_or_create_dcp_mesh()
+    world = int(mesh.shape[DCP_AXIS_NAME])
+    op = _LOCAL_Q_ALL_GATHER_OPS.get(world)
+    if op is not None:
+        return op
+    lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
+    assert len(lane_axes) <= 1, mesh.axis_names
+    lane_axis = lane_axes[0] if lane_axes else None
+    spec = P(DCP_AXIS_NAME)
+
+    def body(x, w_q, w_s, rank, lane):
+        return fp8_window_all_gather(
+            x,
+            w_q,
+            w_s,
+            rank,
+            num_cores=world,
+            axis=DCP_AXIS_NAME,
+            lane_axis=lane_axis,
+            lane=None if lane_axis is None else lane,
+        )
+
+    def fn(x, w_q, w_s, rank, lane):
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(spec,) * 5, out_specs=spec, check_vma=False
+        )(x, w_q, w_s, rank, lane)
+
+    def fake(x, w_q, w_s, rank, lane):
+        return x.new_empty((x.shape[0], w_q.shape[1]))
+
+    op = sharded_jax_op(
+        f"pallas::fp8_window_all_gather_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,) * 5,
+        output_partition_specs=spec,
+        fake=fake,
+    )
+    _LOCAL_Q_ALL_GATHER_OPS[world] = op
+    return op
+
+
 def all_gather_q_nope_pe_heads(
     ql_nope: torch.Tensor,
     q_pe: torch.Tensor,

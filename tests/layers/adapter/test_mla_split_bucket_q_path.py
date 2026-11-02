@@ -181,3 +181,48 @@ def test_decode_buckets_gather_the_local_q_window():
         assert torch.equal(out[name], ref[name]), name
     for a, b in zip(out["rep"], ref["rep"]):
         assert torch.equal(a, b)
+
+
+def test_decode_buckets_run_the_fused_window_all_gather():
+    """TPU_MLA_LOCAL_Q_FUSED_AG: the window and the gather are one op, handed
+    q_c, the q_b operands, the window (rank) and the lane; its output is q. Both
+    buckets lift the window and the lane operands."""
+    hidden, positions = _inputs(16, seed=4)
+    ref = _forward(_flagged(False), hidden, positions, None)
+    w = _flagged(False)
+    seen = {}
+
+    def fused_op(q_c, w_q, w_s, window, lane):
+        seen.update(operands=(w_q, w_s), window=window, lane=lane)
+        return w.q_b_proj(q_c)[0]
+
+    def unfused(*args):
+        raise AssertionError("the fused op serves the bucket")
+
+    w.local_q_op = unfused
+    w.local_q_fused_op = fused_op
+    w.local_q_window = torch.tensor([1], dtype=torch.int32)
+    w.local_q_lane = torch.tensor([0], dtype=torch.int32)
+    lifted = []
+
+    def retain(out, *buffers):
+        lifted.extend(buffers)
+        return out
+
+    wrapper_cls = mla_op.VllmMultiHeadLatentAttentionWrapper
+    with (
+        patch.object(mla_op, "_qb_overlap_operands", lambda layer: ("w", "s")),
+        patch.object(wrapper_cls, "_local_q_serves", lambda self: True),
+        patch.object(mla_op.vllm_compilation_backends, "model_tag", "backbone"),
+        patch.object(mla_op, "_retain_buffers", retain),
+    ):
+        out = _forward(w, hidden, positions, None)
+        assert seen["operands"] == ("w", "s")
+        assert seen["window"] is w.local_q_window and seen["lane"] is w.local_q_lane
+        seen.clear()
+        _forward(w, hidden, positions, "token_parallel")
+        assert not seen  # a split bucket keeps the replicated q_b
+    for t in (w.local_q_window, w.local_q_lane):
+        assert sum(x is t for x in lifted) == 2
+    for name in ("q_nope", "q_pe", "kv_c", "k_pe", "topk"):
+        assert torch.equal(out[name], ref[name]), name
