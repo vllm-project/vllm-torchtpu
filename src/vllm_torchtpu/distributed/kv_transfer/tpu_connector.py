@@ -759,29 +759,6 @@ def _prefix_aware_load_enabled() -> bool:
     return _prefix_aware_load_requested() and _prefix_aware_load_supported()
 
 
-@lru_cache(maxsize=1)
-def _windowed_load_supported() -> bool:
-    """Whether the installed reshard client can request bounded-staging
-    windows (dst_window_blocks: the source controller then pulls a request
-    as a chain of sub-transfers).
-
-    Without it the consumer must keep whole-request staging leases: a
-    window the controller cannot honour would leave a request's lease larger
-    than its arena.
-    """
-    try:
-        from tpu_sync.api.torch import reshard_client as _reshard_client
-
-        return bool(getattr(_reshard_client, "SUPPORTS_DST_WINDOW_BLOCKS", False))
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning(
-            "Could not probe tpu-sync dst_window_blocks support; the pool "
-            "staging arena keeps whole-request leases: %s",
-            exc,
-        )
-        return False
-
-
 def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
     if _use_raiden_stage3_transport():
         return True
@@ -5838,6 +5815,89 @@ class TPURaidenConnectorWorker:
             )
             return skip_tokens * token_bytes
 
+    def _stage3_load_wire_args(
+        self, req_meta: Any, local_blocks: list, num_tokens: int
+    ) -> tuple[list[str], list[int], list[int], dict[str, Any], int, int]:
+        """Builds the destination side of one coordination call.
+
+        Returns ``(transfer_tags, dst_blocks, dst_counts, clip_kwargs,
+        skip_tokens, fa_skip_bytes)``: the tags in H2D order, the destination
+        pages each tag replays over, the per-tag page counts, and the per-tag
+        clip kwargs (``dst_skip_bytes`` for a prefix hit, ``dst_window_blocks``
+        for a bounded-staging window), with the prefix skip in tokens and
+        bytes. The asynchronous submit task and the synchronous leader path
+        both go through here, so the two cannot disagree on what reaches the
+        wire.
+        """
+        # ONE transfer carries every replicated cache class; tag order fixes
+        # the H2D order ranks executor-side (the first tag = group 0 uploads
+        # first). Each tag replays over the same destination pages.
+        if _use_raiden_dsv4_admission():
+            # Each DSv4 tag replays over its own group's pages rather than
+            # one shared list. Disjoint block IDs are the only thing
+            # separating the caches that alias one array.
+            group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
+            transfer_tags: list[str] = []
+            dst_blocks: list[int] = []
+            dst_counts: list[int] = []
+            for pool in self._stage3_dsv4_plan:
+                pages = group_blocks[pool.plan_position].pages
+                transfer_tags.append(pool.tag)
+                dst_blocks.extend(pages)
+                dst_counts.append(len(pages))
+        else:
+            if _use_raiden_glm_admission():
+                transfer_tags = list(self._stage3_row_geometry)
+            else:
+                transfer_tags = self._stage3_fa_registration_tags()
+            dst_blocks = list(local_blocks) * len(transfer_tags)
+            dst_counts = [len(local_blocks)] * len(transfer_tags)
+        fa_tag_count = len(transfer_tags)
+        mamba_state_block_ids = getattr(req_meta, "mamba_state_block_ids", None)
+        if self._stage3_state_group_count:
+            if (
+                not mamba_state_block_ids
+                or len(mamba_state_block_ids) != self._stage3_state_group_count
+            ):
+                raise RuntimeError(
+                    "GDN state load requires one destination state "
+                    "block per mamba group"
+                )
+            for tag, ordinal in self._stage3_state_registration_tags():
+                transfer_tags.append(tag)
+                dst_blocks.append(int(mamba_state_block_ids[ordinal]))
+                dst_counts.append(1)
+        # Prefix-aware suffix pull: clip the FA global destination byte space
+        # at the locally-cached prefix; GDN state classes are not
+        # prefix-decomposable and always transfer whole (skip 0). Omit the
+        # kwarg entirely when there is no clip so skip-free requests stay
+        # byte-identical on the wire.
+        skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
+        fa_skip_bytes = 0
+        clip_kwargs: dict[str, Any] = {}
+        if skip_tokens > 0:
+            fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
+            clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
+                len(transfer_tags) - fa_tag_count
+            )
+        # Bounded-staging window: a request with more FA pages than one lease
+        # holds is pulled as a chain of sub-transfers (the source controller
+        # slices every paged tag identically; state tags ride whole in the
+        # last one). Requests that fit stay byte-identical on the wire.
+        window_blocks = int(self._stage3_fa_window_blocks)
+        if 0 < window_blocks < max(dst_counts[:fa_tag_count], default=0):
+            clip_kwargs["dst_window_blocks"] = [window_blocks] * fa_tag_count + [0] * (
+                len(transfer_tags) - fa_tag_count
+            )
+        return (
+            transfer_tags,
+            dst_blocks,
+            dst_counts,
+            clip_kwargs,
+            skip_tokens,
+            fa_skip_bytes,
+        )
+
     def _stage_stage3_submit_task(
         self, pending: _Stage3PendingSubmit, synchronous: bool
     ) -> _Stage3SubmitTask | None:
@@ -5863,70 +5923,14 @@ class TPURaidenConnectorWorker:
                     src_controller_address
                 )
                 self._stage3_source_facades[src_controller_address] = source_facade
-            # ONE transfer carries every replicated cache class; tag
-            # order fixes the H2D order ranks executor-side (the first
-            # tag = group 0 uploads first). Each tag replays over the
-            # same destination pages.
-            if _use_raiden_dsv4_admission():
-                # Each DSv4 tag replays over its own group's pages rather than
-                # one shared list. Disjoint block IDs are the only thing
-                # separating the caches that alias one array.
-                group_blocks = self._stage3_dsv4_group_blocks(
-                    req_meta, pending.num_tokens
-                )
-                transfer_tags = []
-                dst_blocks = []
-                dst_counts = []
-                for pool in self._stage3_dsv4_plan:
-                    pages = group_blocks[pool.plan_position].pages
-                    transfer_tags.append(pool.tag)
-                    dst_blocks.extend(pages)
-                    dst_counts.append(len(pages))
-            else:
-                if _use_raiden_glm_admission():
-                    transfer_tags = list(self._stage3_row_geometry)
-                else:
-                    transfer_tags = self._stage3_fa_registration_tags()
-                dst_blocks = list(local_blocks) * len(transfer_tags)
-                dst_counts = [len(local_blocks)] * len(transfer_tags)
-            fa_tag_count = len(transfer_tags)
-            mamba_state_block_ids = req_meta.mamba_state_block_ids
-            if self._stage3_state_group_count:
-                if (
-                    not mamba_state_block_ids
-                    or len(mamba_state_block_ids) != self._stage3_state_group_count
-                ):
-                    raise RuntimeError(
-                        "GDN state load requires one destination state "
-                        "block per mamba group"
-                    )
-                for tag, ordinal in self._stage3_state_registration_tags():
-                    transfer_tags.append(tag)
-                    dst_blocks.append(int(mamba_state_block_ids[ordinal]))
-                    dst_counts.append(1)
-            # Prefix-aware suffix pull: clip the FA global destination
-            # byte space at the locally-cached prefix; GDN state classes
-            # are not prefix-decomposable and always transfer whole
-            # (skip 0). Omit the kwarg entirely when there is no clip so
-            # skip-free requests stay byte-identical on the wire.
-            skip_tokens = req_meta.skip_tokens
-            fa_skip_bytes = 0
-            clip_kwargs: dict[str, Any] = {}
-            if skip_tokens > 0:
-                fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
-                    len(transfer_tags) - fa_tag_count
-                )
-            # Bounded-staging window: a request with more FA pages than
-            # one lease holds is pulled as a chain of sub-transfers (the
-            # source controller slices every paged tag identically; state
-            # tags ride whole in the last one). Requests that fit stay
-            # byte-identical on the wire.
-            window_blocks = int(self._stage3_fa_window_blocks)
-            if 0 < window_blocks < max(dst_counts[:fa_tag_count], default=0):
-                clip_kwargs["dst_window_blocks"] = [window_blocks] * fa_tag_count + [
-                    0
-                ] * (len(transfer_tags) - fa_tag_count)
+            (
+                transfer_tags,
+                dst_blocks,
+                dst_counts,
+                clip_kwargs,
+                skip_tokens,
+                fa_skip_bytes,
+            ) = self._stage3_load_wire_args(req_meta, local_blocks, pending.num_tokens)
             dst_mem_type = self._raiden_hbm_memory_type()
         except Exception as exc:  # pylint: disable=broad-except
             # Local staging failed before any controller contact, so no
@@ -6435,45 +6439,14 @@ class TPURaidenConnectorWorker:
             # dispatch). Actual byte completion is deliberately *not*
             # inferred from that acknowledgement; get_finished polls the
             # local manager.
-            # ONE transfer carries every replicated cache class; tag
-            # order fixes the H2D order ranks executor-side (the first
-            # tag = group 0 uploads first). Each tag replays over the
-            # same destination pages.
-            transfer_tags = (
-                list(self._stage3_row_geometry)
-                if _use_raiden_glm_admission()
-                else self._stage3_fa_registration_tags()
-            )
-            fa_tag_count = len(transfer_tags)
-            dst_blocks = list(local_blocks) * len(transfer_tags)
-            dst_counts = [len(local_blocks)] * len(transfer_tags)
-            mamba_state_block_ids = getattr(req_meta, "mamba_state_block_ids", None)
-            if self._stage3_state_group_count:
-                if (
-                    not mamba_state_block_ids
-                    or len(mamba_state_block_ids) != self._stage3_state_group_count
-                ):
-                    raise RuntimeError(
-                        "GDN state load requires one destination state "
-                        "block per mamba group"
-                    )
-                for tag, ordinal in self._stage3_state_registration_tags():
-                    transfer_tags.append(tag)
-                    dst_blocks.append(int(mamba_state_block_ids[ordinal]))
-                    dst_counts.append(1)
-            # Prefix-aware suffix pull: clip the FA global destination
-            # byte space at the locally-cached prefix; GDN state classes
-            # are not prefix-decomposable and always transfer whole
-            # (skip 0). Omit the kwarg entirely when there is no clip so
-            # skip-free requests stay byte-identical on the wire.
-            skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
-            fa_skip_bytes = 0
-            clip_kwargs: dict[str, Any] = {}
-            if skip_tokens > 0:
-                fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
-                    len(transfer_tags) - fa_tag_count
-                )
+            (
+                transfer_tags,
+                dst_blocks,
+                dst_counts,
+                clip_kwargs,
+                skip_tokens,
+                fa_skip_bytes,
+            ) = self._stage3_load_wire_args(req_meta, local_blocks, num_tokens)
             dst_mem_type = self._raiden_hbm_memory_type()
             start_submit = time.perf_counter()
             controller_contacted = True
@@ -7201,10 +7174,11 @@ class TPURaidenConnectorWorker:
         FA pages plus one state block per GDN group sharing the storage, and
         the smallest storage window wins (all FA tags are sliced alike).
         Producers never window: the consumer requests windows, and a
-        producer's arena must hold whatever slice it is asked to send. A
-        window needs the installed reshard client to encode it; otherwise
-        the arena keeps whole-request leases (a shrunk arena with no window
-        would refuse every long request).
+        producer's arena must hold whatever slice it is asked to send. Both
+        peers need a tpu-sync with sub-transfer chains (the source controller
+        slices; a producer without them plans the request whole, which a
+        window-sized arena refuses). Per-layer FA tags are never windowed
+        (see below), so the arena then keeps whole-request leases.
         """
         if self.is_producer:
             return 0
@@ -7213,11 +7187,15 @@ class TPURaidenConnectorWorker:
         if explicit <= 0 and budget_bytes <= 0:
             self._stage3_fa_window_blocks = 0
             return 0
-        if not _windowed_load_supported():
+        if _use_per_layer_pool_tags():
+            # Per-layer FA tags replay one destination list, and the source
+            # controller does not window a tag whose destination ids another
+            # tag also names: it would plan the request whole, which an arena
+            # sized for the window then refuses. Keep whole-request leases.
             logger.warning(
-                "Raiden pool staging budget/window requested but the installed "
-                "tpu_sync cannot chain sub-transfers (no dst_window_blocks); "
-                "keeping whole-request staging leases"
+                "Raiden pool staging budget/window requested under "
+                "TPU_RAIDEN_POOL_TAGS_PER_LAYER=1, which the source controller "
+                "does not window; keeping whole-request staging leases"
             )
             self._stage3_fa_window_blocks = 0
             return 0

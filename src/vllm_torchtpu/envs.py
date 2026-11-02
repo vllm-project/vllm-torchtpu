@@ -1125,7 +1125,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Consumer-side host staging budget (MiB per rank) for the pool-reshard
     # arena: a request larger than the budget allows is pulled as a chain of
-    # sub-transfers. 0 = size the arena for whole max-length requests.
+    # sub-transfers. 0 = size the arena for whole max-length requests. Both
+    # peers need a tpu-sync with sub-transfer chains (tpu-sync-torch from the
+    # 2026-10-26 nightlies on): the source controller slices the request, and
+    # a producer without them plans it whole, which the window-sized arena
+    # refuses. Not honoured under TPU_RAIDEN_POOL_TAGS_PER_LAYER=1.
     "TPU_RAIDEN_POOL_STAGING_BUDGET_MB": env_nonnegative_int(
         "TPU_RAIDEN_POOL_STAGING_BUDGET_MB", 0
     ),

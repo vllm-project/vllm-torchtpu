@@ -3323,7 +3323,6 @@ class TestTPURaidenConnectorWorker:
         # state block, so the window is 2 FA pages (the smallest storage
         # window wins).
         with (
-            patch(f"{_MOD}._windowed_load_supported", return_value=True),
             patch(f"{_MOD}.dist_utils.get_raiden_pool_staging_leases", return_value=2),
             patch(
                 f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
@@ -3334,14 +3333,13 @@ class TestTPURaidenConnectorWorker:
         assert worker._stage3_fa_window_blocks == 2
         assert hints == [3, 3, 3, 2]
 
-    def test_raiden_staging_window_override_and_unsupported_client(self):
+    def test_raiden_staging_window_override(self):
         worker = _make_raiden_worker(
             tp_rank=0, tp_size=1, is_producer=False, block_size=16
         )
         manifest, groups = self._window_manifest()
         # An explicit window overrides the budget-derived one.
         with (
-            patch(f"{_MOD}._windowed_load_supported", return_value=True),
             patch(
                 f"{_MOD}.dist_utils.get_raiden_pool_staging_window_blocks",
                 return_value=3,
@@ -3356,7 +3354,6 @@ class TestTPURaidenConnectorWorker:
         assert hints == [4, 4, 4, 3]
         # A window at least as large as the request is no window at all.
         with (
-            patch(f"{_MOD}._windowed_load_supported", return_value=True),
             patch(
                 f"{_MOD}.dist_utils.get_raiden_pool_staging_window_blocks",
                 return_value=4,
@@ -3365,20 +3362,6 @@ class TestTPURaidenConnectorWorker:
             hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
         assert worker._stage3_fa_window_blocks == 0
         assert hints == [5, 5, 5, 4]
-        # Without client support the arena must keep whole-request leases:
-        # a shrunk arena with no window would refuse every long request.
-        with (
-            patch(f"{_MOD}._windowed_load_supported", return_value=False),
-            patch(
-                f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
-                return_value=12,
-            ),
-            patch(f"{_MOD}.logger.warning") as warning,
-        ):
-            hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
-        assert worker._stage3_fa_window_blocks == 0
-        assert hints == [5, 5, 5, 4]
-        warning.assert_called_once()
 
     def test_raiden_staging_budget_ignored_by_producers_and_fails_when_tiny(self):
         producer = _make_raiden_worker(
@@ -3386,7 +3369,6 @@ class TestTPURaidenConnectorWorker:
         )
         manifest, groups = self._window_manifest()
         with (
-            patch(f"{_MOD}._windowed_load_supported", return_value=True),
             patch(
                 f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
                 return_value=12,
@@ -3402,7 +3384,6 @@ class TestTPURaidenConnectorWorker:
         # 2 MiB over two storages holds one slot each: not even one FA page
         # next to storage 0's state block.
         with (
-            patch(f"{_MOD}._windowed_load_supported", return_value=True),
             patch(f"{_MOD}.dist_utils.get_raiden_pool_staging_leases", return_value=1),
             patch(
                 f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
@@ -3411,6 +3392,82 @@ class TestTPURaidenConnectorWorker:
             pytest.raises(ValueError, match="TPU_RAIDEN_POOL_STAGING_BUDGET_MB"),
         ):
             consumer._raiden_staging_blocks_per_pool(manifest, groups)
+
+    def test_raiden_staging_budget_ignored_under_per_layer_tags(self):
+        """Per-layer FA tags replay one destination list, which the source
+        controller does not window: the arena keeps whole-request leases
+        instead of being sized for a window no request would get."""
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, block_size=16
+        )
+        manifest, groups = self._window_manifest()
+        with (
+            patch(f"{_MOD}._use_per_layer_pool_tags", return_value=True),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
+                return_value=12,
+            ),
+            patch(f"{_MOD}.logger.warning") as warning,
+        ):
+            hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+        assert worker._stage3_fa_window_blocks == 0
+        assert hints == [5, 5, 5, 4]
+        warning.assert_called_once()
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_inline_sharded_leader_path_sends_the_window(self, hybrid):
+        """The synchronous leader submit (TPU_RAIDEN_INLINE_LOAD on a
+        head-sharded consumer) carries the same clip kwargs as the
+        asynchronous task: a request over the window gets it on its FA tags
+        and state tags ride whole."""
+        worker = _make_raiden_worker(
+            is_producer=False, block_size=1024, tp_rank=0, tp_size=2
+        )
+        worker._stage3_state_group_count = 1 if hybrid else 0
+        worker._stage3_fa_window_blocks = 2
+        facade = MagicMock()
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        req_meta = _Stage3LoadMeta(
+            uuid=1999,
+            source_req_id="src-long",
+            local_block_ids=[50, 51, 52, 53],
+            num_tokens=4095,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+            mamba_state_block_ids=[11] if hybrid else None,
+        )
+        with (
+            patch.object(
+                worker, "_stage3_source_work_units", return_value=[MagicMock()]
+            ),
+            patch.object(worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)),
+            patch.object(
+                worker, "_start_stage3_transfer_with_d5_retry", return_value=True
+            ) as start,
+        ):
+            outcome = worker._submit_stage3_load_as_leader(
+                req_meta=req_meta,
+                source_req_id="src-long",
+                destination_req_id="dst-long",
+                uuid=1999,
+                num_tokens=4095,
+                local_blocks=[50, 51, 52, 53],
+                dst_controller_address="10.0.0.2:28000",
+                dst_units=[MagicMock(), MagicMock()],
+            )
+        assert outcome[0] == "accepted"
+        assert start.call_args.args[0] is facade
+        kwargs = start.call_args.kwargs
+        assert kwargs["dst_window_blocks"] == ([2, 0, 0] if hybrid else [2])
+        assert kwargs["dst_device_block_ids"] == (
+            [50, 51, 52, 53, 11, 11] if hybrid else [50, 51, 52, 53]
+        )
+        assert kwargs["dst_block_counts"] == ([4, 1, 1] if hybrid else [4])
+        assert kwargs["transfer_pool_tags"][0] == "fa"
+        assert "dst_skip_bytes" not in kwargs
 
     @pytest.mark.parametrize("hybrid", [False, True])
     def test_stage3_consumer_window_kwarg_only_for_requests_over_the_window(
