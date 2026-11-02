@@ -284,6 +284,24 @@ def _make_scheduler(
         return TPUConnectorScheduler(cfg)
 
 
+@pytest.fixture(autouse=True)
+def _restore_lazy_tpu_env_attributes():
+    # monkeypatch.setattr resolves lazy __getattr__ values and restores them
+    # as concrete attributes. Remove those additions so later setenv-based
+    # connector tests still exercise the environment they configure.
+    original = {
+        key: vars(tpu_envs)[key]
+        for key in tpu_envs.environment_variables
+        if key in vars(tpu_envs)
+    }
+    yield
+    for key in tpu_envs.environment_variables:
+        if key in original:
+            setattr(tpu_envs, key, original[key])
+        else:
+            vars(tpu_envs).pop(key, None)
+
+
 def _make_raiden_scheduler(
     *,
     is_producer: bool = False,
@@ -3282,6 +3300,7 @@ class TestTPURaidenConnectorWorker:
             kv_caches=[storage],
             node_id=3,
             local_control_port=9106,
+            # ceil(max_model_len=64 / (block_size=16 * PCP8)).
             max_blocks=1,
             num_slots=1,
             timeout_s=12.0,
@@ -5181,6 +5200,27 @@ class TestTPURaidenConnectorWorker:
             assert worker._raiden_qwen35_admission_topology() == ("dp4tp2_decode")
             assert worker._local_raiden_transfer_rank() == tp_rank
 
+    def test_dp8tp4_units_are_isolated_between_replicas(self):
+        units = set()
+        for dp_rank in range(8):
+            for tp_rank in range(4):
+                worker = _make_raiden_worker(
+                    tp_rank=tp_rank,
+                    tp_size=4,
+                    is_producer=False,
+                    dp_rank=dp_rank,
+                    dp_size=8,
+                    pcp_size=1,
+                )
+                assert worker._raiden_qwen35_admission_topology() == "dp8tp4_decode"
+                fields = worker._raiden_work_unit_fields(tp_rank)
+                units.add(tuple(sorted(fields.items())))
+                siblings = worker._raiden_destination_work_units()
+                assert len(siblings) == 4
+                assert all(unit.data_replica_idx == dp_rank for unit in siblings)
+                assert len({unit.job_replica_id for unit in siblings}) == 4
+        assert len(units) == 32
+
     def test_tp2_decode_sibling_units_are_distinct_and_enumerable(self):
         # Live pair r1 (2026-08-22) failed with "dst_units must not contain
         # duplicates": both TP workers of a decode engine registered the same
@@ -5247,13 +5287,13 @@ class TestTPURaidenConnectorWorker:
         )
         assert "dst-tp2" in worker._stage3_controller_accepted
 
-    def test_v1_admission_rejects_tp4_decode_topology(self):
+    def test_v1_admission_rejects_tp3_decode_topology(self):
         worker = _make_raiden_worker(
-            tp_rank=0, tp_size=4, is_producer=False, dp_size=2, pcp_size=1
+            tp_rank=0, tp_size=3, is_producer=False, dp_size=2, pcp_size=1
         )
 
         with unittest.TestCase().assertRaisesRegex(
-            ValueError, "dp{N}tp2_decode requires"
+            ValueError, r"dp\{N\}tp\{2,4\}_decode requires"
         ):
             worker._raiden_qwen35_admission_topology()
 
