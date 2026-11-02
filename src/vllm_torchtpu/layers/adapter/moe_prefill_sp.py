@@ -375,7 +375,7 @@ def _rows_layer_forward(
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
-    gathered: torch.Tensor,
+    gathered: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`_sequence_parallel_layer_forward` with the attention block on this
     rank's rows (`mla_prefill_rows`); `gathered` is the layer's

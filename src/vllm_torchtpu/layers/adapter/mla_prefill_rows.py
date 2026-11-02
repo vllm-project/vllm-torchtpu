@@ -70,9 +70,6 @@ logger = init_logger(__name__)
 
 # On an armed MLA wrapper: its `_Rows`.
 ROWS_ATTR = "_tpu_mla_rows"
-# Row tile of the W_UV + o_proj kernel: every shard's o_proj is read once per
-# tile, so a tile of all R rows reads it once.
-OPROJ_BLOCK_ROWS = 512
 
 
 def applies(num_tokens: int) -> bool:
@@ -92,7 +89,6 @@ def applies(num_tokens: int) -> bool:
 class _Rows:
     """What one MLA layer's rows block uses, built at arming."""
 
-    geom: rows_oproj.PackedOProj
     prefetch_op: Any
     oproj_op: Any
 
@@ -164,31 +160,28 @@ def _check_layer(mla: Any) -> None:
         )
 
 
-_OPS: dict[tuple, tuple[Any, Any]] = {}
+_OPS: dict[str, _Rows] = {}
 
 
-def _build_ops(geom: rows_oproj.PackedOProj) -> tuple[Any, Any]:
+def _build_ops() -> _Rows:
     """The shard gather and the W_UV + o_proj ops (shared by every layer)."""
     gather = envs.TPU_MLA_PREFILL_ROWS_GATHER
-    key = (geom, gather)
-    if key in _OPS:
-        return _OPS[key]
+    if gather in _OPS:
+        return _OPS[gather]
     mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
     ring = rows_oproj.ring_order(mesh.devices.reshape(-1)) if gather == "ring" else None
     sharded = P(DCP_AXIS_NAME)
 
     def local(w_o, w_uv, w_scale, after):
-        return rows_oproj.gather_shards(
-            geom, w_o, w_uv, w_scale, after, DCP_AXIS_NAME, ring
-        )
+        # Each rank's gathered shards stacked along dim 0 of the outputs.
+        return rows_oproj.gather_shards(w_o, w_uv, w_scale, after, DCP_AXIS_NAME, ring)
 
     def gather_fn(w_o, w_uv, w_scale, after):
-        # Each rank's [shards, rows, n_out] stacked along dim 0.
         return jax.shard_map(
             local,
             mesh=mesh,
             in_specs=(sharded,) * 4,
-            out_specs=sharded,
+            out_specs=(sharded,) * 3,
             check_vma=False,
         )(w_o, w_uv, w_scale, after)
 
@@ -197,31 +190,30 @@ def _build_ops(geom: rows_oproj.PackedOProj) -> tuple[Any, Any]:
         gather_fn,
         mesh=mesh,
         input_partition_specs=(sharded,) * 4,
-        output_partition_specs=sharded,
+        output_partition_specs=(sharded,) * 3,
     )
-    prefetch_op.register_fake(
-        lambda w_o, *_a, **_k: w_o.new_empty((geom.shards, geom.rows, geom.n_out))
-    )
+    tp = mesh.devices.size
 
-    def oproj_fn(out_latent, gathered):
-        w_o, w_uv, w_scale = rows_oproj.unpack(geom, gathered, out_latent[0, 0])
-        return rows_oproj.rows_oproj(
-            out_latent,
-            w_uv,
-            w_o,
-            w_scale,
-            k_shard=geom.k_shard,
-            block_rows=OPROJ_BLOCK_ROWS,
+    def _gather_fake(w_o, w_uv, w_scale, *_a, **_k):
+        return (
+            w_o.new_empty((tp, *w_o.shape)),
+            w_uv.new_empty((tp * w_uv.shape[0], *w_uv.shape[1:])),
+            w_scale.new_empty((tp, *w_scale.shape), dtype=torch.float32),
         )
 
-    oproj_op = pallas.jax_op(f"pallas::mla_rows_oproj_s{geom.shards}", oproj_fn)
+    prefetch_op.register_fake(_gather_fake)
+
+    def oproj_fn(out_latent, w_uv, w_o, w_scale):
+        return rows_oproj.rows_oproj(out_latent, w_uv, w_o, w_scale)
+
+    oproj_op = pallas.jax_op("pallas::mla_rows_oproj", oproj_fn)
     oproj_op.register_fake(
-        lambda out_latent, gathered: out_latent.new_empty(
-            (out_latent.shape[0], geom.n_out)
+        lambda out_latent, w_uv, w_o, w_scale: out_latent.new_empty(
+            (out_latent.shape[0], w_o.shape[2])
         )
     )
-    _OPS[key] = (prefetch_op, oproj_op)
-    return _OPS[key]
+    _OPS[gather] = _Rows(prefetch_op, oproj_op)
+    return _OPS[gather]
 
 
 def arm(mla: Any) -> None:
@@ -239,17 +231,13 @@ def arm(mla: Any) -> None:
         raise NotImplementedError(
             f"DCP rank {get_dcp_rank()} != TP rank {get_tp_group().rank_in_group}"
         )
-    heads, kv_lora_rank, v_head_dim = attn.W_UV.shape
-    geom = rows_oproj.PackedOProj(
-        shards=tp,
-        k_shard=heads * v_head_dim,
-        n_out=mla.o_proj.weight.shape[1],
-        heads=heads,
-        kv_lora_rank=kv_lora_rank,
-        v_head_dim=v_head_dim,
-    )
-    prefetch_op, oproj_op = _build_ops(geom)
-    setattr(mla, ROWS_ATTR, _Rows(geom, prefetch_op, oproj_op))
+    heads, _, v_head_dim = attn.W_UV.shape
+    if mla.o_proj.weight.shape[0] != heads * v_head_dim:
+        raise NotImplementedError(
+            f"o_proj rows {mla.o_proj.weight.shape[0]} != the rank's heads x "
+            f"v_head_dim {heads * v_head_dim} ({mla.prefix})"
+        )
+    setattr(mla, ROWS_ATTR, _build_ops())
 
 
 def keep_list(mla: Any) -> list[torch.Tensor]:
@@ -284,10 +272,13 @@ def armed(layer: Any) -> bool:
     return getattr(mla, ROWS_ATTR, None) is not None
 
 
-def prefetch(layer: Any, after: torch.Tensor) -> torch.Tensor:
-    """Every rank's o_proj / W_UV shard of `layer`, gathered once `after`
-    (this rank's rows of the layer input before) exists: the gather has no
-    activation input, so it can run under the layers in between."""
+def prefetch(
+    layer: Any, after: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Every rank's o_proj, W_UV and o_proj scale shard of `layer`
+    (`rows_oproj.gather_shards`), gathered once `after` (this rank's rows of
+    the layer input before) exists: the gather has no activation input, so it
+    can run under the layers in between."""
     mla = layer.self_attn.mla_attn
     rows: _Rows = getattr(mla, ROWS_ATTR)
     return rows.prefetch_op(
@@ -329,12 +320,12 @@ def forward(
     mla: Any,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
-    gathered: torch.Tensor,
+    gathered: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     rank: torch.Tensor,
 ) -> torch.Tensor:
     """The attention block of `mla` (an armed MLA wrapper) on this rank's rows
     of the input-normed `hidden_states` `[R, hidden]`; returns this rank's
-    rows of its output `[R, hidden]`. `gathered` is `prefetch`'s buffer of
+    rows of its output `[R, hidden]`. `gathered` is `prefetch`'s shards of
     this layer, `rank` this rank's TP index as an int32 `[1, 1]` operand."""
     from vllm_torchtpu.layers.adapter import moe_prefill_sp
 
@@ -416,4 +407,5 @@ def forward(
             attn_metadata,
             rank,
         )
-    return rows.oproj_op(latent, gathered)
+    w_o, w_uv, w_scale = gathered
+    return rows.oproj_op(latent, w_uv, w_o, w_scale)

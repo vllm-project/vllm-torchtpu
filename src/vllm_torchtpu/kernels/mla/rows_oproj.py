@@ -13,23 +13,21 @@
 # limitations under the License.
 """W_UV and o_proj of an MLA layer on a rank's own rows, every head.
 
-Under tensor parallelism rank `r` holds o_proj's input rows `[r * kb, (r +
-1) * kb)` (its heads x v_head_dim) as per-channel fp8 with its own scale,
-and W_UV for the same heads. A rank whose attention produced every head of
-its own rows (token-parallel attention on sequence-parallel rows) can finish
-the layer with every rank's shard instead of an all-to-all of outputs and a
-reduce-scatter of partial sums. The shards do not depend on the step, so a
-layer's gather can be issued while the layer before it runs.
+Under tensor parallelism rank `r` holds o_proj's input rows `[r * k, (r + 1)
+* k)` (its heads x v_head_dim) as per-channel fp8 with its own scale, and W_UV
+for the same heads. A rank whose attention produced every head of its own rows
+(token-parallel attention on sequence-parallel rows) can finish the layer with
+every rank's shards instead of an all-to-all of outputs and a reduce-scatter
+of partial sums. The shards do not depend on the step, so a layer's gather
+(`gather_shards`) can be issued while the layer before it runs.
 
-A rank's shards travel as one buffer (`PackedOProj`): o_proj's fp8 rows,
-then W_UV and the scale. The product keeps each shard's arithmetic
-(`rows_oproj`): W_UV of the shard's heads, the activation quantized per row
-exactly as each rank quantizes its slice for its partial, and the partial
-scaled by that shard's weight scale. Only the sum over shards moves, from a
-bf16 reduce-scatter into an f32 accumulator.
+The product (`rows_oproj`) keeps each shard's arithmetic: W_UV of the shard's
+heads, the activation quantized per row exactly as each rank quantizes its
+slice for its partial, and the partial scaled by that shard's weight scale.
+Only the sum over shards moves, from a bf16 reduce-scatter into an f32
+accumulator.
 """
 
-import dataclasses
 import functools
 
 import jax
@@ -40,67 +38,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 FP8 = jnp.float8_e4m3fn
 _FP8_MAX = float(jnp.finfo(FP8).max)
-# Row multiple of a packed buffer: the fp8 sublane tile.
-_ROW_ALIGN = 32
-
-
-@dataclasses.dataclass(frozen=True)
-class PackedOProj:
-    """Layout of one rank's packed shards, fp8 `[rows, n_out]`: o_proj's
-    `[k_shard, n_out]` rows, then the bytes of W_UV `[heads, kv_lora_rank,
-    v_head_dim]` bf16 and of the o_proj scale `[n_out]` f32. Every byte
-    travels as fp8: an all-gather of u8 is not offloaded to the SparseCore."""
-
-    shards: int
-    k_shard: int
-    n_out: int
-    heads: int
-    kv_lora_rank: int
-    v_head_dim: int
-
-    def __post_init__(self):
-        if self.k_shard != self.heads * self.v_head_dim:
-            raise ValueError(f"o_proj rows per shard != heads x v_head_dim: {self}")
-        if self.k_shard % _ROW_ALIGN:
-            raise ValueError(f"k_shard must be a multiple of {_ROW_ALIGN}: {self}")
-
-    @property
-    def uv_bytes(self) -> int:
-        return self.heads * self.kv_lora_rank * self.v_head_dim * 2
-
-    @property
-    def scale_bytes(self) -> int:
-        return self.n_out * 4
-
-    @property
-    def rows(self) -> int:
-        tail = -(-(self.uv_bytes + self.scale_bytes) // self.n_out)
-        return self.k_shard + -(-tail // _ROW_ALIGN) * _ROW_ALIGN
-
-
-def pack_shard(
-    geom: PackedOProj, w_o: jax.Array, w_uv: jax.Array, w_scale: jax.Array
-) -> jax.Array:
-    """One rank's shards as `geom`'s fp8 `[rows, n_out]` buffer."""
-    if w_o.shape != (geom.k_shard, geom.n_out) or w_o.dtype != FP8:
-        raise ValueError(f"o_proj shard {w_o.shape} {w_o.dtype} does not fit {geom}")
-    uv = (geom.heads, geom.kv_lora_rank, geom.v_head_dim)
-    if w_uv.shape != uv or w_uv.dtype != jnp.bfloat16:
-        raise ValueError(f"W_UV shard {w_uv.shape} {w_uv.dtype} does not fit {geom}")
-    if w_scale.shape != (geom.n_out,):
-        raise ValueError(f"o_proj scale {w_scale.shape} does not fit {geom}")
-    tail = jnp.concatenate(
-        [
-            lax.bitcast_convert_type(w_uv, jnp.uint8).reshape(-1),
-            lax.bitcast_convert_type(w_scale.astype(jnp.float32), jnp.uint8).reshape(
-                -1
-            ),
-        ]
-    )
-    tail_rows = geom.rows - geom.k_shard
-    tail = jnp.pad(tail, (0, tail_rows * geom.n_out - tail.shape[0]))
-    tail = lax.bitcast_convert_type(tail.reshape(tail_rows, geom.n_out), FP8)
-    return jnp.concatenate([w_o, tail])
 
 
 def ring_order(devices) -> tuple[int, ...]:
@@ -120,12 +57,15 @@ def ring_order(devices) -> tuple[int, ...]:
     return tuple(index[(c, k)] for c in order for k in cores)
 
 
-def _ring_all_gather(
-    packed: jax.Array, axis_name: str, ring: tuple[int, ...]
-) -> jax.Array:
-    """`lax.all_gather(packed, axis_name)` by collective-permutes around
-    `ring`, both ways: the TensorCores' DMA engines move the shards and the
+def _ring_all_gather(x: jax.Array, axis_name: str, ring: tuple[int, ...]) -> jax.Array:
+    """`lax.all_gather(x, axis_name)` by collective-permutes around `ring`,
+    both ways: the TensorCores' DMA engines move the shards and the
     SparseCores stay free."""
+    if x.dtype == FP8:
+        # Stacked as bytes: XLA:TPU builds an fp8 stack through f32 (a
+        # concatenate becomes pad + maximum), which need not keep every byte.
+        out = _ring_all_gather(lax.bitcast_convert_type(x, jnp.uint8), axis_name, ring)
+        return lax.bitcast_convert_type(out, FP8)
     n = len(ring)
     pos = {d: i for i, d in enumerate(ring)}
     to_next = [(d, ring[(pos[d] + 1) % n]) for d in ring]
@@ -133,9 +73,9 @@ def _ring_all_gather(
     rank = lax.all_to_all(jnp.arange(n, dtype=jnp.int32), axis_name, 0, 0, tiled=True)
     me = jnp.asarray([pos[i] for i in range(n)], jnp.int32)[rank[0]]
     ring_arr = jnp.asarray(ring, jnp.int32)
-    out = jnp.zeros((n, *packed.shape), packed.dtype)
-    out = lax.dynamic_update_index_in_dim(out, packed, ring_arr[me], 0)
-    fwd = bwd = packed
+    out = jnp.zeros((n, *x.shape), x.dtype)
+    out = lax.dynamic_update_index_in_dim(out, x, ring_arr[me], 0)
+    fwd = bwd = x
     for k in range(1, n // 2 + 1):
         fwd = lax.ppermute(fwd, axis_name, to_next)
         out = lax.dynamic_update_index_in_dim(out, fwd, ring_arr[(me - k) % n], 0)
@@ -146,50 +86,31 @@ def _ring_all_gather(
 
 
 def gather_shards(
-    geom: PackedOProj,
     w_o: jax.Array,
     w_uv: jax.Array,
     w_scale: jax.Array,
     after: jax.Array,
     axis_name: str,
     ring: tuple[int, ...] | None = None,
-) -> jax.Array:
-    """Every rank's packed shards, `[shards, rows, n_out]` (inside a
-    `shard_map`): one all-gather, or with `ring` (`ring_order`)
-    collective-permutes around it. Packing and gather start no earlier than
-    `after` exists: a gather that reads only weights would otherwise be
-    hoisted to the start of the step, every layer's at once."""
-    w_o, w_uv, w_scale, _ = lax.optimization_barrier((w_o, w_uv, w_scale, after))
-    packed = pack_shard(geom, w_o, w_uv, w_scale)
-    if ring is None:
-        return lax.all_gather(packed, axis_name)
-    return _ring_all_gather(packed, axis_name, ring)
-
-
-def unpack(
-    geom: PackedOProj, gathered: jax.Array, after: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """`(w_o, w_uv, w_scale)` of every rank from `gathered`: w_o is the
-    whole buffer (`rows_oproj` reads each shard's first `k_shard` rows in
-    place), w_uv `[shards * heads, kv_lora_rank, v_head_dim]` bf16 and
-    w_scale `[shards, n_out]` f32. The W_UV / scale copies wait for `after`
-    (the attention output they are applied to): scheduled any earlier, they
-    would make the gather finish early too."""
-    n = geom.shards
-    if gathered.shape != (n, geom.rows, geom.n_out) or gathered.dtype != FP8:
-        raise ValueError(f"gathered {gathered.shape} {gathered.dtype} != {geom}")
-    gathered, _ = lax.optimization_barrier((gathered, after))
-    tail = lax.bitcast_convert_type(gathered[:, geom.k_shard :], jnp.uint8)
-    tail = tail.reshape(n, -1)
-    uv = tail[:, : geom.uv_bytes].reshape(
-        n, geom.heads, geom.kv_lora_rank, geom.v_head_dim, 2
+    """Every rank's shards, inside a `shard_map`: o_proj `[k, n_out]` fp8,
+    W_UV `[heads, kv_lora_rank, v_head_dim]` and the o_proj scale `[n_out]`
+    become `([shards, k, n_out], [shards * heads, kv_lora_rank, v_head_dim],
+    [shards, n_out] f32)` -- one all-gather of the three (offloaded to the
+    SparseCores), or with `ring` (`ring_order`) collective-permutes around
+    it. The gather starts no earlier than `after` exists: a gather that reads
+    only weights would otherwise be hoisted to the start of the step, every
+    layer's at once."""
+    w_o, w_uv, w_scale, _ = lax.optimization_barrier(
+        (w_o, w_uv, w_scale.astype(jnp.float32), after)
     )
-    w_uv = lax.bitcast_convert_type(uv, jnp.bfloat16).reshape(
-        n * geom.heads, geom.kv_lora_rank, geom.v_head_dim
-    )
-    sc = tail[:, geom.uv_bytes : geom.uv_bytes + geom.scale_bytes]
-    w_scale = lax.bitcast_convert_type(sc.reshape(n, geom.n_out, 4), jnp.float32)
-    return gathered, w_uv, w_scale
+    if ring is None:
+        w_o, w_uv, w_scale = lax.all_gather((w_o, w_uv, w_scale), axis_name)
+    else:
+        w_o, w_uv, w_scale = (
+            _ring_all_gather(t, axis_name, ring) for t in (w_o, w_uv, w_scale)
+        )
+    return w_o, w_uv.reshape(-1, *w_uv.shape[2:]), w_scale
 
 
 def _quantize_rows(v: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -261,32 +182,30 @@ def _rows_oproj_kernel(
 _HEAD_TILE = 8
 
 
-@functools.partial(
-    jax.jit, static_argnames=("k_shard", "block_rows", "chunks", "interpret")
-)
+@functools.partial(jax.jit, static_argnames=("block_rows", "chunks", "interpret"))
 def rows_oproj(
     out_latent: jax.Array,
     w_uv: jax.Array,
     w_o: jax.Array,
     w_scale: jax.Array,
     *,
-    k_shard: int,
-    block_rows: int = 256,
+    block_rows: int = 512,
     chunks: int = 4,
     interpret: bool = False,
 ) -> jax.Array:
     """W_UV and o_proj of every head of a rank's rows, one kernel:
     `out_latent` `[R, H, kv_lora_rank]` -> `[R, n_out]` in its dtype.
 
-    w_uv `[H, kv_lora_rank, v_head_dim]`, w_o `[shards, rows >= k_shard,
-    n_out]` fp8 (shard s's o_proj in its first `k_shard` rows, e.g. `unpack`'s
-    view of a gathered buffer), w_scale `[shards, n_out]` f32. For shard s
-    (heads `[s * H / shards, (s + 1) * H / shards)`) the kernel runs what rank
-    s runs for its partial (W_UV of those heads, per-row fp8 quantization,
-    the fp8 product scaled by row and channel) and sums the partials in f32.
+    w_uv `[H, kv_lora_rank, v_head_dim]`, w_o `[shards, k_shard, n_out]` fp8,
+    w_scale `[shards, n_out]` f32 (`gather_shards`). For shard s (heads
+    `[s * H / shards, (s + 1) * H / shards)`) the kernel runs what rank s runs
+    for its partial (W_UV of those heads, per-row fp8 quantization, the fp8
+    product scaled by row and channel) and sums the partials in f32. Every
+    shard's o_proj is read once per row tile: the default tile takes all
+    rows of a rank at the 8192-token bucket on 16 ranks.
     """
     rows, heads_all, kv_lora_rank = out_latent.shape
-    shards, w_rows, n_out = w_o.shape
+    shards, k_shard, n_out = w_o.shape
     heads = heads_all // shards
     v_head_dim = w_uv.shape[-1]
     head_tile = max(heads, _HEAD_TILE)
@@ -296,12 +215,12 @@ def rows_oproj(
         or heads_all % head_tile
         or w_uv.shape != (heads_all, kv_lora_rank, v_head_dim)
         or k_shard != heads * v_head_dim
-        or w_rows < k_shard
+        or w_o.dtype != FP8
         or w_scale.shape != (shards, n_out)
     ):
         raise ValueError(
             f"rows_oproj shapes: latent {out_latent.shape} w_uv {w_uv.shape} "
-            f"w_o {w_o.shape} w_scale {w_scale.shape} k_shard {k_shard}"
+            f"w_o {w_o.shape} {w_o.dtype} w_scale {w_scale.shape}"
         )
     # The largest multiple of 8 up to block_rows that divides the rows.
     block_rows = next(
@@ -350,12 +269,7 @@ def rows_oproj(
 
 
 def rows_oproj_ref(
-    out_latent: jax.Array,
-    w_uv: jax.Array,
-    w_o: jax.Array,
-    w_scale: jax.Array,
-    *,
-    k_shard: int,
+    out_latent: jax.Array, w_uv: jax.Array, w_o: jax.Array, w_scale: jax.Array
 ) -> jax.Array:
     """XLA `rows_oproj` (same arithmetic; f32 out, before the final cast)."""
     heads_all = out_latent.shape[1]
@@ -370,7 +284,7 @@ def rows_oproj_ref(
             heads,
         )
         xq, xs = _quantize_rows(v)
-        part = jnp.dot(xq, w_o[s, :k_shard], preferred_element_type=jnp.float32)
+        part = jnp.dot(xq, w_o[s], preferred_element_type=jnp.float32)
         part = part * xs * w_scale[s][None, :]
         acc = part if acc is None else acc + part
     return acc

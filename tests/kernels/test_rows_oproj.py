@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`kernels/mla/rows_oproj.py`: the packed shard layout and the blocked-scale
+"""`kernels/mla/rows_oproj.py`: the shard gathers and the blocked-scale
 o_proj, against the per-rank partials they replace (Pallas interpret mode on
 CPU)."""
 
@@ -26,56 +26,20 @@ from vllm_torchtpu.kernels.quantized_matmul.util import (
     xla_quantized_matmul,
 )
 
-GEOM = ro.PackedOProj(
-    shards=4, k_shard=128, n_out=256, heads=2, kv_lora_rank=128, v_head_dim=64
-)
+SHARDS, HEADS, KVL, VH, N_OUT = 4, 2, 128, 64, 256
+K_SHARD = HEADS * VH
 
 
 def _shards(seed=0):
+    """Every rank's o_proj `[K_SHARD, N_OUT]` fp8, W_UV and scale, stacked."""
     rng = np.random.default_rng(seed)
-    g = GEOM
-    w_o = (rng.standard_normal((g.shards, g.k_shard, g.n_out)) * 64).astype(np.float32)
+    w_o = (rng.standard_normal((SHARDS, K_SHARD, N_OUT)) * 64).astype(np.float32)
     w_o = jnp.asarray(w_o).astype(ro.FP8)
     w_uv = jnp.asarray(
-        rng.standard_normal(
-            (g.shards, g.heads, g.kv_lora_rank, g.v_head_dim), np.float32
-        )
-        * 0.1
+        rng.standard_normal((SHARDS, HEADS, KVL, VH), np.float32) * 0.1
     ).astype(jnp.bfloat16)
-    w_scale = jnp.asarray(rng.uniform(0.5, 1.5, (g.shards, g.n_out)) / 64, jnp.float32)
+    w_scale = jnp.asarray(rng.uniform(0.5, 1.5, (SHARDS, N_OUT)) / 64, jnp.float32)
     return w_o, w_uv, w_scale
-
-
-def _packed(w_o, w_uv, w_scale):
-    return jnp.stack(
-        [ro.pack_shard(GEOM, w_o[s], w_uv[s], w_scale[s]) for s in range(GEOM.shards)]
-    )
-
-
-def test_pack_unpack_roundtrip():
-    w_o, w_uv, w_scale = _shards()
-    packed = _packed(w_o, w_uv, w_scale)
-    assert packed.shape == (GEOM.shards, GEOM.rows, GEOM.n_out)
-    assert packed.dtype == ro.FP8
-    got_o, got_uv, got_scale = ro.unpack(GEOM, packed, packed)
-    np.testing.assert_array_equal(
-        np.asarray(got_o[:, : GEOM.k_shard]).view(np.uint8),
-        np.asarray(w_o).view(np.uint8),
-    )
-    np.testing.assert_array_equal(
-        np.asarray(got_uv), np.asarray(w_uv.reshape(-1, *w_uv.shape[2:]))
-    )
-    np.testing.assert_array_equal(np.asarray(got_scale), np.asarray(w_scale))
-
-
-def test_pack_rejects_wrong_shapes():
-    w_o, w_uv, w_scale = _shards()
-    with pytest.raises(ValueError):
-        ro.pack_shard(GEOM, w_o[0, :64], w_uv[0], w_scale[0])
-    with pytest.raises(ValueError):
-        ro.pack_shard(GEOM, w_o[0], w_uv[0].astype(jnp.float32), w_scale[0])
-    with pytest.raises(ValueError):
-        ro.PackedOProj(4, 100, 256, 2, 128, 50)
 
 
 def test_quantize_rows_is_quantize_tensor():
@@ -90,30 +54,32 @@ def test_quantize_rows_is_quantize_tensor():
 
 
 def _latent(rows, seed):
-    heads = GEOM.shards * GEOM.heads
     return jax.random.normal(
-        jax.random.key(seed), (rows, heads, GEOM.kv_lora_rank), jnp.float32
+        jax.random.key(seed), (rows, SHARDS * HEADS, KVL), jnp.float32
     ).astype(jnp.bfloat16)
 
 
 @pytest.mark.parametrize(("rows", "block_rows"), [(16, 16), (48, 16), (48, 32)])
 def test_rows_oproj_matches_reference(rows, block_rows):
-    w_view, uv_all, ws = ro.unpack(GEOM, _packed(*_shards(1)), jnp.zeros(()))
+    w_o, w_uv, w_scale = _shards(1)
+    uv_all = w_uv.reshape(-1, KVL, VH)
     lat = _latent(rows, 2)
     got = ro.rows_oproj(
-        lat,
-        uv_all,
-        w_view,
-        ws,
-        k_shard=GEOM.k_shard,
-        block_rows=block_rows,
-        chunks=2,
-        interpret=True,
+        lat, uv_all, w_o, w_scale, block_rows=block_rows, chunks=2, interpret=True
     )
-    want = ro.rows_oproj_ref(lat, uv_all, w_view, ws, k_shard=GEOM.k_shard)
+    want = ro.rows_oproj_ref(lat, uv_all, w_o, w_scale)
     np.testing.assert_array_equal(
         np.asarray(got, np.float32), np.asarray(want.astype(jnp.bfloat16), np.float32)
     )
+
+
+def test_rows_oproj_rejects_mismatched_shards():
+    w_o, w_uv, w_scale = _shards()
+    lat = _latent(16, 0)
+    with pytest.raises(ValueError):  # o_proj rows != heads x v_head_dim
+        ro.rows_oproj(lat, w_uv.reshape(-1, KVL, VH), w_o[:, :64], w_scale)
+    with pytest.raises(ValueError):  # o_proj not fp8
+        ro.rows_oproj(lat, w_uv.reshape(-1, KVL, VH), w_o.astype(jnp.bfloat16), w_scale)
 
 
 def test_rows_oproj_matches_per_rank_partials():
@@ -121,15 +87,14 @@ def test_rows_oproj_matches_per_rank_partials():
     heads, per-row fp8 quant of its slice, per-channel fp8 o_proj); only the
     sum differs: bf16 partials summed vs one f32 sum."""
     w_o, w_uv, w_scale = _shards(3)
-    w_view, uv_all, ws = ro.unpack(GEOM, _packed(w_o, w_uv, w_scale), jnp.zeros(()))
     rows = 24
     lat = _latent(rows, 4)
     got = ro.rows_oproj(
-        lat, uv_all, w_view, ws, k_shard=GEOM.k_shard, chunks=2, interpret=True
+        lat, w_uv.reshape(-1, KVL, VH), w_o, w_scale, chunks=2, interpret=True
     )
     partials = []
-    for s in range(GEOM.shards):
-        h = slice(s * GEOM.heads, (s + 1) * GEOM.heads)
+    for s in range(SHARDS):
+        h = slice(s * HEADS, (s + 1) * HEADS)
         # The per-rank W_UV bmm: f32 accumulation, bf16 out (as on the MXU).
         v = jnp.einsum(
             "rhl,hlv->rhv",
@@ -150,31 +115,33 @@ def test_rows_oproj_matches_per_rank_partials():
 
 @pytest.mark.parametrize("ring", [None, (0, 1, 3, 2)])
 def test_gather_shards_stacks_every_rank_in_mesh_order(ring):
-    """Both gathers give every rank the stack of all ranks' packed shards in
+    """Both gathers give every rank every rank's shards, bit for bit, in
     mesh order (CPU virtual devices; the ring is any cycle of the mesh)."""
-    n = GEOM.shards
-    if jax.device_count() < n:
-        pytest.skip(f"requires {n} devices; CPU virtual devices are sufficient")
-    mesh = jax.sharding.Mesh(np.array(jax.devices()[:n]), ("x",))
+    if jax.device_count() < SHARDS:
+        pytest.skip(f"requires {SHARDS} devices; CPU virtual devices are sufficient")
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:SHARDS]), ("x",))
     w_o, w_uv, w_scale = _shards(6)
-    after = jnp.zeros((n, 8), jnp.float32)
+    after = jnp.zeros((SHARDS, 8), jnp.float32)
     spec = jax.sharding.PartitionSpec("x")
 
     def local(w_o, w_uv, w_scale, after):
-        return ro.gather_shards(GEOM, w_o[0], w_uv[0], w_scale[0], after, "x", ring)[
-            None
-        ]
+        got = ro.gather_shards(w_o[0], w_uv[0], w_scale[0], after, "x", ring)
+        return tuple(t[None] for t in got)
 
-    got = jax.jit(
+    got_o, got_uv, got_scale = jax.jit(
         jax.shard_map(
             local,
             mesh=mesh,
             in_specs=(spec,) * 4,
-            out_specs=spec,
+            out_specs=(spec,) * 3,
             check_vma=False,
         )
     )(w_o, w_uv, w_scale, after)
-    want = np.asarray(_packed(w_o, w_uv, w_scale)).view(np.uint8)
-    got = np.asarray(got).view(np.uint8)
-    for r in range(n):
-        np.testing.assert_array_equal(got[r], want, err_msg=f"rank {r}")
+    # Indexed on the host: indexing a sharded fp8 array may turn -0 into +0.
+    got_o, got_uv, got_scale = (np.asarray(t) for t in (got_o, got_uv, got_scale))
+    for r in range(SHARDS):
+        np.testing.assert_array_equal(
+            got_o[r].view(np.uint8), np.asarray(w_o).view(np.uint8)
+        )
+        np.testing.assert_array_equal(got_uv[r], np.asarray(w_uv.reshape(-1, KVL, VH)))
+        np.testing.assert_array_equal(got_scale[r], np.asarray(w_scale))
