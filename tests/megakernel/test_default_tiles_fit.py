@@ -19,20 +19,18 @@ import dataclasses
 
 import pytest
 
+from tests.megakernel.megakernel_fakes import synth_full_scale_spec, synth_hybrid_spec
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import exec_spec as exec_spec_mod
-from vllm_torchtpu.megakernel import vmem
+from vllm_torchtpu.megakernel.dma import vmem
 from vllm_torchtpu.megakernel.profiles import default as default_chip
-from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
-# Every model in `models/`, tiny and full configs.
-MODEL_CONFIGS = {
-    "qwen35_full": qwen35.FULL,
-    "qwen35_full_ep": qwen35.FULL_EP,
-    "qwen35_tiny": qwen35.TINY,
-    "qwen35_tiny_ep": qwen35.TINY_EP,
+MODEL_SPECS = {
+    "synth_full": synth_full_scale_spec(moe_tp=True),
+    "synth_full_ep": synth_full_scale_spec(moe_tp=False),
+    "synth_tiny": synth_hybrid_spec(moe_tp=True),
+    "synth_tiny_ep": synth_hybrid_spec(moe_tp=False),
 }
-MODEL_SPECS = {"qwen35": qwen35.qwen35_spec}
 
 
 def _buckets() -> list[tuple[int, int]]:
@@ -40,11 +38,10 @@ def _buckets() -> list[tuple[int, int]]:
 
 
 @pytest.mark.parametrize("paged", [False, True])
-@pytest.mark.parametrize("name", sorted(MODEL_CONFIGS))
+@pytest.mark.parametrize("name", sorted(MODEL_SPECS))
 def test_default_tiles_fit_vmem_for_every_model_config(name: str, paged: bool):
     """`fit_default_tiles` gives an in-budget plan on every bucket."""
-    g = MODEL_CONFIGS[name]
-    spec = MODEL_SPECS[name.split("_")[0]](g)
+    spec = MODEL_SPECS[name]
     shrunk = False
     for T, B in _buckets():
         ex = mk.ExecSpec(
@@ -64,12 +61,12 @@ def test_default_tiles_fit_vmem_for_every_model_config(name: str, paged: bool):
         shrunk |= (t.nbd, t.nbe) != (default.nbd, default.nbe)
         core_plan, _ = vmem.build_scratch(spec, fitted)  # raises if over budget
         assert core_plan.vmem_bytes <= vmem.fit_vmem_budget_bytes(t)
-    if name.startswith("qwen35_full"):
+    if name.startswith("synth_full"):
         assert shrunk  # the 64-row buckets need shallower rings
 
 
 def test_fit_leaves_explicit_tiles_alone():
-    spec = qwen35.qwen35_spec(qwen35.FULL_EP)
+    spec = MODEL_SPECS["synth_full_ep"]
     t = mk.default_tiles(64, R=8)
     ex = mk.ExecSpec(B=64, T=1, R=8, ctx=4096, tiles=t)
     assert vmem.fit_default_tiles(spec, ex) is ex
@@ -78,7 +75,7 @@ def test_fit_leaves_explicit_tiles_alone():
 
 
 def test_kernel_build_fits_unset_tiles():
-    spec = qwen35.qwen35_spec(qwen35.FULL_EP)
+    spec = MODEL_SPECS["synth_full_ep"]
     ex = mk.ExecSpec(B=64, T=1, R=8, ctx=4096)
     _, info = mk.build(spec, ex)
     assert info["exec"].tiles == vmem.fit_default_tiles(spec, ex).tiles
@@ -86,7 +83,7 @@ def test_kernel_build_fits_unset_tiles():
 
 
 def test_fit_sizes_default_tiles_for_the_device_chip(monkeypatch):
-    spec = qwen35.qwen35_spec(qwen35.FULL_EP)
+    spec = MODEL_SPECS["synth_full_ep"]
     ex = mk.ExecSpec(B=8, T=1, R=8, ctx=4096)
     chip = default_chip.ChipBudget(name="test_chip", vmem_mib=62, smem_mib=2)
     monkeypatch.setitem(
@@ -96,7 +93,7 @@ def test_fit_sizes_default_tiles_for_the_device_chip(monkeypatch):
 
 
 def test_plan_and_build_scratch_fit_unset_tiles_like_build():
-    spec = qwen35.qwen35_spec(qwen35.FULL_EP)
+    spec = MODEL_SPECS["synth_full_ep"]
     ex = mk.ExecSpec(B=64, T=1, R=8, ctx=4096)
     fitted = vmem.fit_default_tiles(spec, ex)
     assert fitted.tiles != mk.default_tiles(64, R=8)  # the fit shrinks a ring
@@ -108,7 +105,7 @@ def test_plan_and_build_scratch_fit_unset_tiles_like_build():
 
 
 def test_fit_raises_instead_of_returning_an_over_budget_plan(monkeypatch):
-    spec = qwen35.qwen35_spec(qwen35.FULL_EP)
+    spec = MODEL_SPECS["synth_full_ep"]
     tight = dataclasses.replace(mk.default_tiles(4), vmem_mib=4)
     monkeypatch.setattr(exec_spec_mod, "default_tiles", lambda B, **kw: tight)
     ex = mk.ExecSpec(B=4, T=1, R=8, ctx=4096)
@@ -120,14 +117,12 @@ def test_fit_raises_instead_of_returning_an_over_budget_plan(monkeypatch):
 
 def test_tpu_v7x_budget_leaves_llo_spill_and_io_window_headroom():
     """`fit_vmem_budget_bytes` reserves >= 6 MiB below the 62 MiB Mosaic
-    `vmem_limit_bytes` (8 MiB below the 64 MiB TPU v7x VMEM) so 60-layer
-    Qwen3.5 at `(T=4, B=40..64)` fits both Mosaic's 62 MiB scoped VMEM limit
-    (after Pallas I/O window refs and lowered temporaries, up to ~5.0 MiB at
-    B=64) and XLA:TPU's 63.94 MiB VMEM limit (after ~3.70 MiB LLO register
-    spill slots)."""
+    `vmem_limit_bytes` (8 MiB below the 64 MiB TPU v7x VMEM) so a 60-layer
+    hybrid model at `(T=4, B=40..64)` fits both Mosaic's 62 MiB scoped VMEM
+    limit and XLA:TPU's 63.94 MiB VMEM limit."""
     assert default_chip.TPU_V7X.vmem_mib == 62
     assert vmem.fit_vmem_budget_bytes(mk.default_tiles(48)) <= 56 * (1 << 20)
-    spec = qwen35.qwen35_spec(qwen35.FULL_EP)
+    spec = MODEL_SPECS["synth_full_ep"]
     for B in (40, 48, 56, 64):
         ex = mk.ExecSpec(B=B, T=4, R=8, ctx=4096)
         fitted = vmem.fit_default_tiles(spec, ex)

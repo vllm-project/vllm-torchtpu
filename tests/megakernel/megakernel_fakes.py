@@ -57,7 +57,8 @@ class FakeGeometry:
     VD: int = 128
     E: int = 128
     TOPK: int = 2
-    I: int = 256  # noqa: E741
+    __annotations__["I"] = int
+    vars()["I"] = 256
     IS: int = 256
     moe_tp: bool = False
     e_slots: int = 0
@@ -65,6 +66,22 @@ class FakeGeometry:
     gdn_l2_eps: float = 1e-6
     theta: float = 10_000_000.0
     zero_centered_norm: bool = True
+    gdn_gate: str = "silu"
+
+    def vh(self, R: int) -> int:
+        return self.VH // R
+
+    def ER(self, R: int) -> int:
+        return self.E // R
+
+    def EW(self, R: int) -> int:
+        return self.e_slots or (self.E if self.moe_tp else self.ER(R))
+
+    def check(self, ex: ExecSpec) -> None:
+        del ex
+
+
+SynthHybrid = FakeGeometry
 
 
 @dataclass(frozen=True)
@@ -73,7 +90,6 @@ class FakeMixerTunables:
 
     kv_blk: int = 256
     nkv: int = 3
-
     NUMERICS: ClassVar[dict[str, str]] = {"kv_blk": "approx", "nkv": "exact"}
 
 
@@ -94,50 +110,31 @@ class FakeMixerModule(Module):
         ]
 
     def smalls(self, g: FakeGeometry, ex: ExecSpec) -> list[SmallField]:
-        nh = g.NH // ex.R
-        nai = (2 * nh + 2) * g.HD
-        return [
-            SmallField("in_norm", g.H),
-            SmallField("in_s", nai),
-            SmallField("out_s", g.H),
-            SmallField("qn", g.HD),
-            SmallField("kn", g.HD),
-        ]
+        nh, hd = g.NH // ex.R, g.HD
+        nai = (2 * nh + 2) * hd
+        sfs = [("in_norm", g.H), ("in_s", nai), ("out_s", g.H), ("qn", hd), ("kn", hd)]
+        return [SmallField(k, w) for k, w in sfs]
 
     def states(self, g: FakeGeometry, ex: ExecSpec) -> list[StateDecl]:
-        return [
-            StateDecl("kc", (ex.NS, ex.ctx, g.HD), BF16, access="r"),
-            StateDecl("vc", (ex.NS, ex.ctx, g.HD), BF16, access="r"),
-        ]
+        sh = (ex.NS, ex.ctx, g.HD)
+        return [StateDecl("kc", sh, BF16, "r"), StateDecl("vc", sh, BF16, "r")]
 
     def outputs(self, g: FakeGeometry, ex: ExecSpec) -> list[StateDecl]:
-        return [
-            StateDecl("knew", (ex.MR, g.HD), F32, access="w"),
-            StateDecl("vnew", (ex.MR, g.HD), F32, access="w"),
-        ]
+        sh = (ex.MR, g.HD)
+        return [StateDecl("knew", sh, F32, "w"), StateDecl("vnew", sh, F32, "w")]
 
     def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
         nh = g.NH // ex.R
         nai = (2 * nh + 2) * g.HD
-        return {
-            "acc": max(nai, g.H),
-            "ybuf": nai,
-            "xb2": nh * g.HD,
-            "mix": nh * g.HD,
-        }
+        return {"acc": max(nai, g.H), "ybuf": nai, "xb2": nh * g.HD, "mix": nh * g.HD}
 
     def scratch(self, g: FakeGeometry, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
         t = self.tunables(ex)
+        kv_vmem = pltpu.VMEM((t.nkv, t.kv_blk, g.HD), BF16)
         return [
-            ScratchReq(
-                "kbuf", pltpu.VMEM((t.nkv, t.kv_blk, g.HD), BF16), phase="persistent"
-            ),
-            ScratchReq(
-                "vbuf", pltpu.VMEM((t.nkv, t.kv_blk, g.HD), BF16), phase="persistent"
-            ),
-            ScratchReq(
-                "branch_tmp", pltpu.VMEM((ex.MR, g.HD), F32), phase="branch:gqa"
-            ),
+            ScratchReq("kbuf", kv_vmem, phase="persistent"),
+            ScratchReq("vbuf", kv_vmem, phase="persistent"),
+            ScratchReq("branch_tmp", pltpu.VMEM((ex.MR, g.HD), F32), "branch:gqa"),
         ]
 
 
@@ -149,10 +146,8 @@ class FakeAltMixerModule(Module):
     input_norm = "in_norm"
 
     def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
-        kh = g.KH // ex.R
-        vh = g.VH // ex.R
-        qkv = 2 * kh * g.KD + vh * g.VD
-        z = vh * g.VD
+        kh, vh = g.KH // ex.R, g.VH // ex.R
+        qkv, z = 2 * kh * g.KD + vh * g.VD, vh * g.VD
         nli = qkv + z + 128
         return [
             WeightDecl("lin_in", K=g.H, N=nli, dtype=FP8, stream_ring="static"),
@@ -160,43 +155,29 @@ class FakeAltMixerModule(Module):
         ]
 
     def smalls(self, g: FakeGeometry, ex: ExecSpec) -> list[SmallField]:
-        kh = g.KH // ex.R
-        vh = g.VH // ex.R
-        qkv = 2 * kh * g.KD + vh * g.VD
-        z = vh * g.VD
+        kh, vh = g.KH // ex.R, g.VH // ex.R
+        qkv, z = 2 * kh * g.KD + vh * g.VD, vh * g.VD
         nli = qkv + z + 128
-        return [
-            SmallField("in_norm", g.H),
-            SmallField("in_s", nli),
-            SmallField("out_s", g.H),
-            SmallField("conv", 4 * qkv),
-            SmallField("gnorm", g.VD),
+        sfs = [
+            ("in_norm", g.H),
+            ("in_s", nli),
+            ("out_s", g.H),
+            ("conv", 4 * qkv),
+            ("gnorm", g.VD),
         ]
+        return [SmallField(k, w) for k, w in sfs]
 
     def states(self, g: FakeGeometry, ex: ExecSpec) -> list[StateDecl]:
-        vh = g.VH // ex.R
-        return [
-            StateDecl("rec", (ex.NS * vh, g.KD, g.VD), BF16, access="rw"),
-        ]
+        return [StateDecl("rec", (ex.NS * (g.VH // ex.R), g.KD, g.VD), BF16, "rw")]
 
     def outputs(self, g: FakeGeometry, ex: ExecSpec) -> list[StateDecl]:
-        vh = g.VH // ex.R
-        return [
-            StateDecl("rec", (ex.B * vh, g.KD, g.VD), BF16, access="w"),
-        ]
+        return [StateDecl("rec", (ex.B * (g.VH // ex.R), g.KD, g.VD), BF16, "w")]
 
     def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
-        kh = g.KH // ex.R
-        vh = g.VH // ex.R
-        qkv = 2 * kh * g.KD + vh * g.VD
-        z = vh * g.VD
+        kh, vh = g.KH // ex.R, g.VH // ex.R
+        qkv, z = 2 * kh * g.KD + vh * g.VD, vh * g.VD
         nli = qkv + z + 128
-        return {
-            "acc": max(nli, g.H),
-            "ybuf": nli,
-            "xb2": z,
-            "mix": z,
-        }
+        return {"acc": max(nli, g.H), "ybuf": nli, "xb2": z, "mix": z}
 
     def scratch(self, g: FakeGeometry, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
         vh = g.VH // ex.R
@@ -216,64 +197,39 @@ class FakeFFNModule(Module):
     input_norm = "post_norm"
 
     def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
-        isr = g.IS // ex.R
-        ir = g.I // ex.R if g.moe_tp else g.I
-        er = g.E // ex.R
-        ew = g.e_slots if g.e_slots > 0 else (g.E if g.moe_tp else er)
-        lay = "stacked" if ex.stack_e else "per_layer"
+        isr, ir = g.IS // ex.R, (g.I // ex.R if g.moe_tp else g.I)
+        ew, lay = g.EW(ex.R), ("stacked" if ex.stack_e else "per_layer")
+        dyn = dict(dtype=FP8, stream_ring="dynamic", layout=lay, lead_dims=(ew,))
         return [
             WeightDecl("router", K=g.H, N=g.E, dtype=BF16, stream_ring="static"),
             WeightDecl("sh13", K=g.H, N=2 * isr, dtype=FP8, stream_ring="static"),
             WeightDecl("sh2", K=isr, N=g.H, dtype=FP8, stream_ring="static"),
-            WeightDecl(
-                "e13",
-                K=g.H,
-                N=2 * ir,
-                dtype=FP8,
-                stream_ring="dynamic",
-                layout=lay,
-                lead_dims=(ew,),
-            ),
-            WeightDecl(
-                "e2",
-                K=ir,
-                N=g.H,
-                dtype=FP8,
-                stream_ring="dynamic",
-                layout=lay,
-                lead_dims=(ew,),
-            ),
+            WeightDecl("e13", K=g.H, N=2 * ir, **dyn),
+            WeightDecl("e2", K=ir, N=g.H, **dyn),
             WeightDecl(
                 "es", K=1, N=2 * ir + g.H, dtype=F32, stream_ring="hbm", lead_dims=(ew,)
             ),
         ]
 
     def smalls(self, g: FakeGeometry, ex: ExecSpec) -> list[SmallField]:
-        isr = g.IS // ex.R
-        er = g.E // ex.R
-        fields = [
-            SmallField("post_norm", g.H),
-            SmallField("sh13_s", 2 * isr),
-            SmallField("sh2_s", g.H),
-            SmallField("sh_gate", g.H),
+        isr, er = g.IS // ex.R, g.E // ex.R
+        sfs = [
+            ("post_norm", g.H),
+            ("sh13_s", 2 * isr),
+            ("sh2_s", g.H),
+            ("sh_gate", g.H),
         ]
         if not g.moe_tp and g.e_slots > er:
-            fields.append(SmallField("ecopy", g.E))
-        return fields
+            sfs.append(("ecopy", g.E))
+        return [SmallField(k, w) for k, w in sfs]
 
     def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
-        isr = g.IS // ex.R
-        ir = g.I // ex.R if g.moe_tp else g.I
-        return {
-            "acc": max(g.H, g.E, 2 * isr, 2 * ir),
-            "xb2": max(isr, ir),
-        }
+        isr, ir = g.IS // ex.R, (g.I // ex.R if g.moe_tp else g.I)
+        return {"acc": max(g.H, g.E, 2 * isr, 2 * ir), "xb2": max(isr, ir)}
 
     def scratch(self, g: FakeGeometry, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         ir = g.I // ex.R if g.moe_tp else g.I
-        t = ex.resolved_tiles
-        te = plan.nt["e13"] + plan.nt["e2"]
-        nss = 3 + (t.nbe - 1) // te
+        nss = 3 + (ex.resolved_tiles.nbe - 1) // (plan.nt["e13"] + plan.nt["e2"])
         return {
             "wn": pltpu.VMEM((ex.MR, g.E), F32),
             "es": pltpu.VMEM((nss, 1, 2 * ir + g.H), F32),
@@ -290,22 +246,61 @@ def make_fake_model_spec(
 ) -> ModelSpec:
     """Create a `ModelSpec` built from fake mixer and FFN modules."""
     g = FakeGeometry(L=L, att_every=att_every, H=H, moe_tp=moe_tp, e_slots=e_slots)
-    gqa = FakeMixerModule()
-    moe = FakeFFNModule()
-    if att_every == 1:
-        mixer: Module | SwitchSlot = SwitchSlot(
-            "mixer", branches=(gqa,), branch_counts=(1,)
-        )
-    else:
-        gdn = FakeAltMixerModule()
-        mixer = SwitchSlot(
-            "mixer", branches=(gdn, gqa), branch_counts=(att_every - 1, 1)
-        )
-    return ModelSpec(
-        name="fake_model",
-        config=g,
-        layer_type=LayerType("fake_layer", slots=(mixer, moe)),
+    gqa, moe = FakeMixerModule(), FakeFFNModule()
+    br, cnt = (
+        ((gqa,), (1,))
+        if att_every == 1
+        else ((FakeAltMixerModule(), gqa), (att_every - 1, 1))
     )
+    mixer = SwitchSlot("mixer", branches=br, branch_counts=cnt)
+    return ModelSpec(
+        "fake_model", config=g, layer_type=LayerType("fake_layer", slots=(mixer, moe))
+    )
+
+
+def synth_hybrid_spec(
+    g: FakeGeometry | None = None, *, R: int = 8, **overrides: Any
+) -> ModelSpec:
+    """Build a synthetic hybrid `ModelSpec` (`GDN` + `GQA` + `MoE` + `PoolBackend`)."""
+    from vllm_torchtpu.megakernel import pool
+    from vllm_torchtpu.megakernel.modules.gdn import GDNModule
+    from vllm_torchtpu.megakernel.modules.gqa import GQAModule
+    from vllm_torchtpu.megakernel.modules.moe import MoEModule
+
+    if g is None:
+        mtp = bool(overrides.get("moe_tp", False))
+        base = dict(
+            L=4, att_every=2, H=256, NH=max(2, R), NKV=min(2, R), HD=256, ROT=64
+        )
+        base.update(
+            KH=max(2, R), VH=max(2, R), KD=128, VD=128, E=128, TOPK=2, moe_tp=mtp
+        )
+        base.update(
+            {"I": max(256, 128 * R) if mtp else 256, "IS": max(256, 128 * R)}
+            | overrides
+        )
+        g = FakeGeometry(**base)
+    gqa, gdn, moe = GQAModule(), GDNModule(), MoEModule()
+    decls = [
+        gqa.cache_decl(g) if (i + 1) % g.att_every == 0 else gdn.cache_decl(g)
+        for i in range(g.L)
+    ]
+    play = pool.derive_pool_layout(decls, R=R)
+    gqa_p = GQAModule(pool_layout=play)
+    br, cnt = (
+        ((gqa_p,), (1,)) if g.att_every == 1 else ((gdn, gqa_p), (g.att_every - 1, 1))
+    )
+    mixer = SwitchSlot("mixer", br, cnt)
+    pb = pool.make_pool_backend(play, rec_chunk=GDNModule.chunk_rows)
+    return ModelSpec(
+        "synth_hybrid", g, LayerType("synth_layer", (mixer, moe)), cache_backend=pb
+    )
+
+
+def synth_full_scale_spec(*, moe_tp: bool = False, R: int = 8) -> ModelSpec:
+    """Build a 60-layer full-scale synthetic `ModelSpec` for VMEM fitting tests."""
+    kw = dict(L=60, att_every=4, H=4096, NH=32, NKV=2, HD=256, ROT=64, KH=16, VH=64)
+    return synth_hybrid_spec(E=512, TOPK=10, I=1024, IS=1024, moe_tp=moe_tp, R=R, **kw)
 
 
 @dataclass
@@ -318,7 +313,7 @@ class MiniCtx:
     pos_ref: Any
     W: dict[str, Any]
     ST: dict[str, Any]
-    O: dict[str, Any]  # noqa: E741
+    __annotations__["O"] = dict[str, Any]
     scr: dict[str, Any]
     me: Any
     stream: Any
@@ -327,6 +322,7 @@ class MiniCtx:
     skip: frozenset[str] = frozenset()
     sc: Any = lambda *_: contextlib.nullcontext()
     norm_x: Any = None
+    raw_refs: Any = None
 
     def module_params(self, name: str) -> Any:
         return self.core_plan.module(name)
@@ -369,8 +365,6 @@ def tile_field(t: Any, key: str) -> Any:
     return getattr(t.module(module), field)
 
 
-# Exact-class knobs (core `field` or `<module>.<field>`): (id, knob, value off the
-# model default, (T, B), extra knobs).
 EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("nbd", "nbd", 8, (2, 4), {}),
     ("nkv", "gqa.nkv", 4, (2, 4), {}),
@@ -384,7 +378,6 @@ EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("smem_mib", "smem_mib", 2, (2, 4), {}),
     ("collective_id", "collective_id", 47, (2, 4), {}),
     ("moe_group_rows", "moe.moe_group_rows", 0, (2, 4), {"moe.moe_unroll": True}),
-    # PIPE_EP path: I=512 with a 64 KiB expert bank gives T13 = 2 * T2.
     (
         "moe_group_rows-pipe_ep",
         "moe.moe_group_rows",
@@ -392,7 +385,6 @@ EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
         (2, 4),
         {"moe.pipe_ep": True, "ebank": 64 << 10, "nbe": 6, "geom_kw": {"I": 512}},
     ),
-    # WIDE verify bucket (chunked GDN states): gdn_bufs only acts here.
     ("gdn_bufs-wide", "gdn.gdn_bufs", 2, (4, 24), {}),
     ("pair_kv-wide", "gqa.pair_kv", True, (4, 24), {}),
     ("kv_ering-wide", "gqa.kv_ering", True, (4, 24), {}),
