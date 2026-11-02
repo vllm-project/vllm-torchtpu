@@ -556,7 +556,14 @@ def _prefill_attention(
     )
     if dcp is not None:
         # One KV tile per owned page: the kernel walks this rank's pages only.
+        # The owned walk streams half the pages per query block, so a wider
+        # query block amortises them: 1024 / 256 (6 gathered heads) is
+        # bit-identical and 6-11% faster than 512 / 128 at an 8K chunk over
+        # 90K-130K contexts (j-bdd87f65, j-7bedee35).
         kv_tile = cache.shape[1]
+        if envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK:
+            query_block = envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK
+            query_tile = envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE or None
         if query_block % 128 or query_block * query.shape[1] > 256 * 24:
             query_block, query_tile = 256, None
         if query_tile and query_block % query_tile:
