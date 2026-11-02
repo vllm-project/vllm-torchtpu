@@ -87,9 +87,13 @@ nothing (no prefill chunk, no admission from the waiting queue, no solo step)
 and only decodes, so each request's TPOT stays at or below about the cap. A
 request that owes a token is scheduled even if pacing, the decode interval or
 the floor would hold it. Requests resuming from the KV-holding queue (streaming
-input, remote KV) are not held back. Under a closed-loop client the requests
-then finish spread out like their first tokens, as with pacing, and TPOT
-settles below the cap at the cost of prefill time.
+input, remote KV) are not held back. ``VLLM_TPU_DECODE_TPOT_CAP_MS`` also takes
+load tiers ``N:C[,N:C...]``: with ``n`` requests on the engine, ``C`` is that
+of the largest ``N`` not above ``n``, and below every ``N`` the cap is off and
+nothing is owed, so one server can cap only its highest concurrencies, where
+TTFT has the room. Under a closed-loop client the requests then finish spread
+out like their first tokens, as with pacing, and TPOT settles below the cap at
+the cost of prefill time.
 
 Prefill-aware DP load balancing (``VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS=U > 0``).
 vLLM's data-parallel front end sends each new request to the engine with the
@@ -164,7 +168,10 @@ class PrefillFirstScheduler(AsyncScheduler):
         self.min_decode_interval = envs.VLLM_TPU_MIN_DECODE_INTERVAL_MS / 1000
         self.tpot_target = envs.VLLM_TPU_DECODE_TPOT_TARGET_MS / 1000
         self.tpot_per_request = envs.VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST / 1000
-        self.tpot_cap = envs.VLLM_TPU_DECODE_TPOT_CAP_MS / 1000
+        # (min requests on the engine, cap in seconds), ascending.
+        self.tpot_cap_tiers = tuple(
+            (n, cap / 1000) for n, cap in envs.VLLM_TPU_DECODE_TPOT_CAP_MS
+        )
         self.tpot_cap_per_request = envs.VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST / 1000
         if not (
             self.solo_over_tokens
@@ -173,7 +180,7 @@ class PrefillFirstScheduler(AsyncScheduler):
             or self.min_decode_interval
             or self.tpot_target
             or self.tpot_per_request
-            or self.tpot_cap
+            or self.tpot_cap_tiers
             or self.tpot_cap_per_request
         ):
             raise ValueError(
@@ -223,7 +230,7 @@ class PrefillFirstScheduler(AsyncScheduler):
             "max_solo_tokens=%d, solo_max_consecutive=%d, solo_decode_steps=%d, "
             "decode_interval_ms=%g, min_decode_interval_ms=%g, "
             "dp_lb_prefill_unit_tokens=%d, tpot_target_ms=%g, "
-            "tpot_ms_per_request=%g, tpot_cap_ms=%g, tpot_cap_ms_per_request=%g)",
+            "tpot_ms_per_request=%g, tpot_cap_ms=%s, tpot_cap_ms_per_request=%g)",
             self.solo_over_tokens,
             self.max_solo_tokens,
             self.solo_max_consecutive,
@@ -233,7 +240,7 @@ class PrefillFirstScheduler(AsyncScheduler):
             self.lb_prefill_unit,
             self.tpot_target * 1000,
             self.tpot_per_request * 1000,
-            self.tpot_cap * 1000,
+            ",".join(f"{n}:{cap * 1000:g}" for n, cap in self.tpot_cap_tiers) or "0",
             self.tpot_cap_per_request * 1000,
         )
 
@@ -459,15 +466,19 @@ class PrefillFirstScheduler(AsyncScheduler):
         decodes over the time since the previous schedule() call. A request
         starts decoding at once and owes nothing then."""
         pacing = self.tpot_target or self.tpot_per_request
-        capping = self.tpot_cap or self.tpot_cap_per_request
+        capping = self.tpot_cap_tiers or self.tpot_cap_per_request
         if not (pacing or capping):
             return
         now = monotonic()
         elapsed, self._paced_at = now - self._paced_at, now
-        # Both positive whenever there is a decode: the engine holds it.
+        # The interval is positive whenever there is a decode: the engine
+        # holds it. The cap is 0 below every load tier.
         num_held = len(self.running) + len(self.waiting) + len(self.kv_holding_waiting)
         interval = max(self.tpot_target, self.tpot_per_request * num_held)
-        cap = max(self.tpot_cap, self.tpot_cap_per_request * num_held)
+        tier_cap = next(
+            (cap for n, cap in reversed(self.tpot_cap_tiers) if num_held >= n), 0.0
+        )
+        cap = max(tier_cap, self.tpot_cap_per_request * num_held)
         # Requests that stopped decoding (finished, preempted) drop out.
         pace: dict[str, _Pace] = {}
         for r in self.running:
@@ -480,7 +491,8 @@ class PrefillFirstScheduler(AsyncScheduler):
                 if pacing:
                     state.earned += elapsed / interval
                 if capping:
-                    state.owed += elapsed / cap
+                    # Below every load tier nothing is owed.
+                    state.owed = state.owed + elapsed / cap if cap else 0.0
             pace[r.request_id] = state
         self._pace = pace
 

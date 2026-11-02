@@ -221,7 +221,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MIN_DECODE_INTERVAL_MS: int = 0
     VLLM_TPU_DECODE_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST: float = 0.0
-    VLLM_TPU_DECODE_TPOT_CAP_MS: float = 0.0
+    VLLM_TPU_DECODE_TPOT_CAP_MS: tuple[tuple[int, float], ...] = ()
     VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST: float = 0.0
 
 
@@ -369,6 +369,37 @@ def env_nonnegative_float(env_name: str, default: float) -> Callable[[], float]:
         return value
 
     return _get_nonnegative_float_env
+
+
+def env_load_tiers(env_name: str) -> Callable[[], tuple[tuple[int, float], ...]]:
+    """``C`` or ``N:C[,N:C...]``: a positive value ``C`` that applies from
+    ``N`` requests up (a plain ``C`` means ``0:C``), as ``(N, C)`` pairs sorted
+    by ``N``. Unset, empty or 0 means no tiers; a malformed value raises."""
+
+    def _get_load_tiers_env() -> tuple[tuple[int, float], ...]:
+        value = (os.getenv(env_name) or "").strip()
+        if value in ("", "0"):
+            return ()
+        tiers: dict[int, float] = {}
+        for part in value.split(","):
+            min_requests, colon, tier_value = part.strip().rpartition(":")
+            try:
+                n = int(min_requests) if colon else 0
+                v = float(tier_value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid value '{value}' for {env_name}: expected C or "
+                    "N:C[,N:C...]."
+                ) from exc
+            if n < 0 or n in tiers or not 0 < v < float("inf"):
+                raise ValueError(
+                    f"Invalid value '{value}' for {env_name}: each N must be "
+                    "distinct and >= 0, each C finite and > 0."
+                )
+            tiers[n] = v
+        return tuple(sorted(tiers.items()))
+
+    return _get_load_tiers_env
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -1353,11 +1384,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST", 0.0
     ),
     # PrefillFirstScheduler: each running request owes one decode token per
-    # this many milliseconds; while one owes a whole token, steps only decode
-    # (0: off).
-    "VLLM_TPU_DECODE_TPOT_CAP_MS": env_nonnegative_float(
-        "VLLM_TPU_DECODE_TPOT_CAP_MS", 0.0
-    ),
+    # this many milliseconds; while one owes a whole token, steps only decode.
+    # N:C[,N:C...] applies C from N requests on the engine up (0: off).
+    "VLLM_TPU_DECODE_TPOT_CAP_MS": env_load_tiers("VLLM_TPU_DECODE_TPOT_CAP_MS"),
     # PrefillFirstScheduler: raise that cap to this many milliseconds per
     # request the engine holds, running or waiting (0: off).
     "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST": env_nonnegative_float(

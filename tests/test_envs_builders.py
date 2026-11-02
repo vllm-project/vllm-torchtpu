@@ -28,6 +28,7 @@ from vllm_torchtpu.envs import (
     env_bool,
     env_float,
     env_int,
+    env_load_tiers,
     env_nonnegative_float,
     env_nonnegative_int,
     env_nonnegative_int_or_auto,
@@ -285,3 +286,29 @@ def test_spec_warmup_off_spellings(monkeypatch):
     monkeypatch.setenv("SPEC_WARMUP", "nope")
     with pytest.raises(ValueError, match="SPEC_WARMUP"):
         _ = envs.SPEC_WARMUP
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("82", ((0, 82.0),)),
+        ("12:82", ((12, 82.0),)),
+        ("12:82, 6:36.5", ((6, 36.5), (12, 82.0))),
+        ("", ()),
+        ("0", ()),
+    ],
+)
+def test_load_tiers_parse_and_sort(monkeypatch, value, expected):
+    monkeypatch.setenv(VAR, value)
+    assert env_load_tiers(VAR)() == expected
+
+
+def test_load_tiers_unset_is_empty():
+    assert env_load_tiers(VAR)() == ()
+
+
+@pytest.mark.parametrize("value", ["x", "6:", ":5", "6:0", "-1:5", "6:5,6:7", "6:inf"])
+def test_load_tiers_reject_malformed(monkeypatch, value):
+    monkeypatch.setenv(VAR, value)
+    with pytest.raises(ValueError, match=VAR):
+        env_load_tiers(VAR)()

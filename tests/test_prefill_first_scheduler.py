@@ -79,7 +79,7 @@ def _build(
     min_decode_interval_ms: int = 0,
     tpot_target_ms: float = 0,
     tpot_ms_per_request: float = 0,
-    tpot_cap_ms: float = 0,
+    tpot_cap_ms: float | str = 0,
     tpot_cap_ms_per_request: float = 0,
     num_blocks: int = 64,
     max_num_seqs: int = 8,
@@ -826,3 +826,28 @@ def test_tpot_cap_schedules_a_decode_that_pacing_holds(
     assert all(steps)
     expected = [True, False, False, False] + [True, False] * 15
     assert ["d" in s for s in steps] == expected
+
+
+def test_tpot_cap_tier_applies_from_its_request_count(shared_model_config, monkeypatch):
+    clock = _floor_clock(monkeypatch, step_s=_PACE_STEP_S)
+    scheduler, hasher = _build(
+        shared_model_config,
+        monkeypatch,
+        max_num_batched_tokens=32,
+        tpot_cap_ms="3:31.25",
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    _step(scheduler, clock)
+    _add(scheduler, hasher, ("long", 600, 2))
+    _step(scheduler, clock)
+    # Two requests on the engine, below the tier: a stall leaves nothing owed.
+    clock.now += 10 * _PACE_STEP_S
+    assert _step(scheduler, clock) == {"d": 1, "long": 31}
+    # A third request opens the tier; `d` owes from then on, half a token per
+    # step, so after the next stall the steps only decode until it is within
+    # a token again.
+    _add(scheduler, hasher, ("w", 16, 3))
+    assert _step(scheduler, clock) == {"d": 1, "long": 31}
+    clock.now += 10 * _PACE_STEP_S
+    steps = [_step(scheduler, clock) for _ in range(8)]
+    assert steps == [{"d": 1}] * 7 + [{"d": 1, "long": 31}]
