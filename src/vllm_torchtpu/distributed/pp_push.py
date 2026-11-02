@@ -13,7 +13,8 @@
 # limitations under the License.
 """Engine-side part of the pipeline hand-off.
 
-Stages pass activations along with collective launches that all stages issue
+Under the deprecated lockstep hand-off (``TPU_PP_HANDOFF=lockstep``), stages
+pass activations along with collective launches that all stages issue
 together (see ``pp_wave``). Stage 0 launches once after each forward it runs
 and every other stage launches once before each forward it runs, so a
 forward moves one stage further each time the stages run another forward,
@@ -55,9 +56,9 @@ reply ring, so the widening is installed in the engine process and, through
 ``widen_message_rings``, in every worker process; the ring size is the
 widest any pipeline in the process asked for.
 
-With ``TPU_PP_HANDOFF=buffered`` the stages hand each forward on point to
-point as soon as it is done (``pp_buffered``), so no step waits for later
-ones and the engine sends no pushes or settles. The engine keeps
+With ``TPU_PP_HANDOFF=buffered``, the default, the stages hand each forward
+on point to point as soon as it is done (``pp_buffered``), so no step waits
+for later ones and the engine sends no pushes or settles. The engine keeps
 ``buffered_extra_steps`` more steps in flight than the pipeline has stages,
 so stage 0's next forward is already queued while the engine core prepares
 the following step, and the rings are widened for that count.

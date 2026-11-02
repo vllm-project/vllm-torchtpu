@@ -35,6 +35,8 @@ scheduler has nothing to run, it pushes, but only once stage 0 has idled
 for a while: a request that arrives before then takes the push's place in
 the pipeline.
 
+Lazy push serves the lockstep hand-off only and is deprecated with it.
+
 When stage 0 starts to idle: when every stage waits for all workers before
 each hand-off, hand-off ``p`` happens at one moment on every stage, and
 until hand-off ``p + 1`` stage ``r`` runs the forward of the burst's step

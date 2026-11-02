@@ -15,6 +15,10 @@
 
 from typing import Any
 
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 def _legacy_ray_executor() -> bool:
     import vllm.envs as vllm_envs
@@ -101,7 +105,8 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
 
     Raises NotImplementedError naming the unsupported feature, and
     ValueError for a buffered hand-off depth below one or deeper than a
-    device's receive flags allow.
+    device's receive flags allow. Warns about the deprecated lockstep
+    hand-off and lazy push.
     """
     parallel_config = vllm_config.parallel_config
     if parallel_config.pipeline_parallel_size <= 1:
@@ -191,9 +196,9 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
             "gives every stage a full-attention layer."
         )
     elif _legacy_ray_executor():
-        # The pipeline's hand-off pushes go through the executor hook that
-        # the multiprocess executor and the Ray V2 executor share; the
-        # legacy Ray executor has no such hook.
+        # The pipeline's engine side, the draft-token hook and the lockstep
+        # hand-off's pushes, patches the executor class that the multiprocess
+        # and Ray V2 executors share; the legacy Ray executor is not one.
         unsupported = "the legacy Ray executor"
         remedy = " Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1."
     if unsupported is not None:
@@ -203,6 +208,16 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     from vllm_torchtpu import envs
     from vllm_torchtpu.distributed.pp_push import buffered_handoff
 
+    if not buffered_handoff():
+        logger.warning(
+            "TPU_PP_HANDOFF=lockstep is deprecated and will be removed; the "
+            "buffered hand-off is the default."
+        )
+    if envs.TPU_PP_LAZY_PUSH:
+        logger.warning(
+            "TPU_PP_LAZY_PUSH is deprecated: it only applies to the lockstep "
+            "hand-off and will be removed with it."
+        )
     if buffered_handoff():
         if envs.TPU_PP_HANDOFF_DEPTH < 1:
             # A stage queues at most this many forwards for the next one; with

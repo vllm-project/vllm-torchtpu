@@ -272,6 +272,53 @@ def buffered(monkeypatch):
     monkeypatch.delenv("TPU_PP_HANDOFF_DEPTH", raising=False)
 
 
+@pytest.fixture
+def logged(monkeypatch):
+    """The warnings the check logs, formatted; no hand-off flag is set."""
+    warnings = []
+    monkeypatch.setattr(
+        pp_validation,
+        "logger",
+        SimpleNamespace(warning=lambda msg, *args: warnings.append(msg % args)),
+    )
+    monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+    monkeypatch.delenv("TPU_PP_LAZY_PUSH", raising=False)
+    return warnings
+
+
+def test_the_default_checks_the_buffered_handoff(monkeypatch, logged):
+    monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "0")
+    with pytest.raises(ValueError, match="TPU_PP_HANDOFF_DEPTH must be at least 1"):
+        validate_pipeline_parallel_config(_config(pp=2))
+    assert logged == []
+
+
+def test_the_lockstep_handoff_is_deprecated(monkeypatch, logged):
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
+    validate_pipeline_parallel_config(_config(pp=4))
+    assert logged == [
+        "TPU_PP_HANDOFF=lockstep is deprecated and will be removed; the "
+        "buffered hand-off is the default."
+    ]
+    # a single stage hands nothing off
+    logged.clear()
+    validate_pipeline_parallel_config(_config(pp=1))
+    assert logged == []
+
+
+def test_lazy_push_is_deprecated_with_the_lockstep_handoff(monkeypatch, logged):
+    monkeypatch.setenv("TPU_PP_LAZY_PUSH", "1")
+    validate_pipeline_parallel_config(_config(pp=4))
+    assert logged == [
+        "TPU_PP_LAZY_PUSH is deprecated: it only applies to the lockstep "
+        "hand-off and will be removed with it."
+    ]
+    logged.clear()
+    monkeypatch.setenv("TPU_PP_LAZY_PUSH", "0")
+    validate_pipeline_parallel_config(_config(pp=4))
+    assert logged == []
+
+
 def test_the_buffered_handoff_keeps_the_rejections(buffered):
     with pytest.raises(NotImplementedError, match="tensor-parallel-size 1"):
         validate_pipeline_parallel_config(_config(pp=2, tp=4))

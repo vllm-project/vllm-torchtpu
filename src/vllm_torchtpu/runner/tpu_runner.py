@@ -6934,11 +6934,11 @@ class TPUModelRunner(GPUModelRunner):
 
         Under a pipeline every stage runs the synthetic prefills, since the
         last stage's forward takes its input from the hand-off, and there is
-        no retry: a stage retrying alone would leave the others waiting. A
-        stage's output leaves it on its next launch (see ``PPWave``), and
-        one forward alone has none, so each stage settles the burst right
-        after each forward; those launches carry the prefill on to the last
-        stage, whose forward waits for it.
+        no retry: a stage retrying alone would leave the others waiting.
+        Under the lockstep hand-off a stage's output leaves it on its next
+        launch (see ``PPWave``), and one forward alone has none, so each
+        stage settles the burst right after each forward; those launches
+        carry the prefill on to the last stage, whose forward waits for it.
         """
         if not envs.SPEC_WARMUP:
             return

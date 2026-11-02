@@ -216,7 +216,8 @@ def _config(pp):
     return SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=pp))
 
 
-def test_worker_side_widening_follows_the_pipeline_size(queue):
+def test_worker_side_widening_follows_the_pipeline_size(monkeypatch, queue):
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
     pp_push.widen_message_rings(_config(1))
     assert "max_chunks" not in queue(1, 1).kwargs
     pp_push.widen_message_rings(_config(4))
@@ -249,6 +250,7 @@ def _install_on_fake_executor(monkeypatch, stages):
             self.calls.append((method, kwargs))
 
     monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", _FakeExecutor)
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
     pp_push.patch_executor_for_pp_wave(_config(stages))
     return _FakeExecutor()
 
@@ -343,7 +345,7 @@ def test_the_hand_off_flags_parse(monkeypatch):
 
     monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
     monkeypatch.delenv("TPU_PP_HANDOFF_DEPTH", raising=False)
-    assert envs.TPU_PP_HANDOFF == "lockstep" and not pp_push.buffered_handoff()
+    assert envs.TPU_PP_HANDOFF == "buffered" and pp_push.buffered_handoff()
     assert envs.TPU_PP_HANDOFF_DEPTH == 2
     monkeypatch.setenv("TPU_PP_HANDOFF", "buffered")
     monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "3")
@@ -480,7 +482,7 @@ def test_the_buffered_handoff_installs_no_push_or_settle(monkeypatch, buffered, 
 
 
 def test_an_executor_without_a_pipeline_keeps_its_own_calls(monkeypatch, queue):
-    monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
     executor_cls = _bare_executor_cls(monkeypatch)
     asked = []
     executor_cls.take_draft_token_ids = lambda self: asked.append(self) or "drafts"
@@ -513,8 +515,16 @@ def test_the_buffered_handoff_leaves_a_single_stage_its_draft_tokens(
     assert executor_cls().take_draft_token_ids() is None
 
 
+def test_the_default_installs_the_buffered_handoff(monkeypatch, buffered, queue):
+    monkeypatch.delenv("TPU_PP_HANDOFF")
+    executor_cls = _bare_executor_cls(monkeypatch)
+    pp_push.patch_executor_for_pp_handoff(_config(4))
+    assert executor_cls._tpu_pp_buffered_patch
+    assert not getattr(executor_cls, "_tpu_pp_wave_patch", False)
+
+
 def test_the_lockstep_flag_installs_the_wave(monkeypatch, queue):
-    monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
     executor_cls = _bare_executor_cls(monkeypatch)
     pp_push.patch_executor_for_pp_handoff(_config(4))
     executor = executor_cls()

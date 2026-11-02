@@ -108,7 +108,7 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_LAZY_PUSH: bool = False
-    TPU_PP_HANDOFF: str = "lockstep"
+    TPU_PP_HANDOFF: str = "buffered"
     TPU_PP_HANDOFF_DEPTH: int = 2
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -825,16 +825,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pipeline parallelism: spread a lone prompt's prefill over the stages
     # in smaller chunks (core/pp_chunks.py). 0 keeps token budgets.
     "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
-    # Pipeline parallelism over more than two stages: the engine core pushes
-    # the pipeline only when stage 0 would otherwise idle and drops empty
-    # steps, so requests share the pipeline (core/pp_lazy_step.py).
+    # Pipeline parallelism over more than two stages, lockstep hand-off only
+    # and deprecated with it: the engine core pushes the pipeline only when
+    # stage 0 would otherwise idle and drops empty steps, so requests share
+    # the pipeline (core/pp_lazy_step.py).
     "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
-    # How pipeline stages hand activations on: "lockstep" runs one
-    # collective launch on every stage per forward (distributed/pp_wave.py),
-    # "buffered" sends each forward's output point to point
-    # (distributed/pp_buffered.py). Goes once buffered replaces lockstep.
+    # How pipeline stages hand activations on: "buffered" sends each
+    # forward's output point to point (distributed/pp_buffered.py),
+    # "lockstep" runs one collective launch on every stage per forward
+    # (distributed/pp_wave.py). Lockstep is deprecated.
     "TPU_PP_HANDOFF": env_with_choices(
-        "TPU_PP_HANDOFF", "lockstep", ["buffered", "lockstep"]
+        "TPU_PP_HANDOFF", "buffered", ["buffered", "lockstep"]
     ),
     # With TPU_PP_HANDOFF=buffered: the forwards a stage may queue for sending
     # to the next stage before end_forward waits for room.

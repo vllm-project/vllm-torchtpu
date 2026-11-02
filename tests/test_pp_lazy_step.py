@@ -79,8 +79,9 @@ class _Socket:
 
 
 def _executor(monkeypatch, stages=4):
-    """A MultiprocExecutor stand-in with the push and the lazy-push patches;
-    replies are read from the last stage's socket in call order."""
+    """A MultiprocExecutor stand-in with the push and the lazy-push patches
+    under the lockstep hand-off; replies are read from the last stage's
+    socket in call order."""
     from vllm.v1.executor import multiproc_executor
 
     class _Reply(Future):
@@ -153,6 +154,7 @@ def _executor(monkeypatch, stages=4):
             )
 
     monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", _Executor)
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
     pp_push.patch_executor_for_pp_wave(_config(stages))
     pp_lazy_step._patch_collective_rpc()
     return _Executor()

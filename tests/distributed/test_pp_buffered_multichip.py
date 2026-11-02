@@ -93,7 +93,8 @@ def _launch_torchrun(result_dir: Path) -> None:
     except (ImportError, ValueError) as exc:
         print(f"Two TPU devices are unavailable: {exc}", flush=True)
         sys.exit(SKIP_EXIT_CODE)
-    os.environ["TPU_PP_HANDOFF"] = "buffered"
+    # The workers run on the default hand-off.
+    os.environ.pop("TPU_PP_HANDOFF", None)
     os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
     from torch.distributed.run import main as torchrun_main
 
@@ -151,7 +152,10 @@ def _run_worker(result_dir: Path) -> None:
             group_name="pp_buffered_test",
         )
         from vllm_torchtpu.distributed import pp_buffered
+        from vllm_torchtpu.distributed.pp_push import buffered_handoff
 
+        # Built directly below; the default must select it.
+        result["default_is_buffered"] = buffered_handoff()
         template = {
             "hidden_states": ((HIDDEN,), torch.bfloat16),
             "residual": ((HIDDEN,), torch.bfloat16),
@@ -252,6 +256,7 @@ def assert_handoff_results(results: list[dict]) -> None:
     errors = [r for r in results if "error" in r]
     assert not errors, f"worker failures: {errors}"
     first, last = results
+    assert first["default_is_buffered"] and last["default_is_buffered"]
     plan = _forwards()
     assert last["forwards"] == len(plan)
     assert first["sent"] == len(plan)

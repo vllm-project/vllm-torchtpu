@@ -268,8 +268,18 @@ class TestHandOffConstruction:
         assert built == [("PPBuffered", (device, 64, TEMPLATE), {"depth": 3}), "warmup"]
         assert type(runner._pp_handoff).__name__ == "PPBuffered"
 
-    def test_the_default_builds_the_wave(self, monkeypatch, built):
+    def test_the_default_builds_the_buffered_handoff(self, monkeypatch, built):
         monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+        monkeypatch.delenv("TPU_PP_HANDOFF_DEPTH", raising=False)
+        runner = self._runner()
+
+        TPUModelRunner.capture_model(runner)
+
+        device = torch.device("cpu")
+        assert built == [("PPBuffered", (device, 64, TEMPLATE), {"depth": 2}), "warmup"]
+
+    def test_the_lockstep_flag_builds_the_wave(self, monkeypatch, built):
+        monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
         runner = self._runner()
 
         TPUModelRunner.capture_model(runner)
