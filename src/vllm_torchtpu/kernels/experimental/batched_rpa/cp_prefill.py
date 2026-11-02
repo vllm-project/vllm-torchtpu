@@ -40,8 +40,8 @@ must not be reused through prefix caching.
 
 A rank is a Python int or a traced scalar (`jax.lax.axis_index` under
 `shard_map`). This module holds the page arithmetic and what one layer runs
-between the collectives; of those, only the halo permutes (`exchange_halos`,
-under the caller's `shard_map`) are here.
+around its one collective (the all-gather of `pack_kv_rows` rows, or the
+all-to-all of `sliding_exchange_blocks`), which is the caller's.
 """
 
 import dataclasses
@@ -196,6 +196,13 @@ def num_halo_pages(sliding_window: int, page_size: int) -> int:
     return utils.align_to(sliding_window - 1, page_size) // page_size
 
 
+def halo_neighbours(rank: Rank, world: int) -> tuple[Rank, Rank]:
+    """(rank holding the piece before this rank's first piece, rank holding the
+    piece before its second piece): each rank's first-piece tail goes up a
+    rank, its second-piece tail down a rank (`halo_permutations`)."""
+    return (rank - 1) % world, (rank + 1) % world
+
+
 def halo_permutations(world: int) -> tuple[list[tuple[int, int]], ...]:
     """(source, target) rank pairs that send each rank's piece tails on to the
     rank holding the next piece: first-piece tails go up (r -> r + 1),
@@ -231,10 +238,11 @@ def sliding_local_pages(
     buffer for `cp_prefill_attention` with the pieces' K/V as new tokens
     (`ZigzagPlan.sliding_page_tables`).
 
-    `halos` is what `exchange_halos` delivers (fp8). Rank 0's first piece starts
-    the prompt, so its first halo goes unread; the last rank's second piece
-    follows its own first piece, whose tail (from `keys`, `values`, the rank's
-    rows) is used instead of what the permute delivered.
+    `halos` holds the fp8 [first piece's halo | second piece's halo] pages from
+    the exchange (`sliding_exchange_blocks`). Rank 0's first piece starts the
+    prompt, so its first halo goes unread; the last rank's second piece follows
+    its own first piece, whose tail (from `keys`, `values`, the rank's rows) is
+    used instead of what the exchange delivered.
     """
     halo_pages, page_size = halos.shape[0] // 2, halos.shape[1]
     halo_first, halo_second = halos[:halo_pages], halos[halo_pages:]
@@ -645,7 +653,9 @@ def sliding_exchange_blocks(
     tails = pack_piece_tails(keys, values, halo_pages, page_size)
     tails = jax.lax.bitcast_convert_type(tails, jnp.int8).reshape(2, halo_bytes)
     dest = jnp.arange(cfg.world)[:, None]
-    up, down = (cfg.rank + 1) % cfg.world, (cfg.rank - 1) % cfg.world
+    # This rank is the first-piece source of the rank above and the second-piece
+    # source of the rank below.
+    down, up = halo_neighbours(cfg.rank, cfg.world)
     halo = jnp.where(dest == up, tails[0], jnp.where(dest == down, tails[1], 0))
     position_pages, _ = window_position_pages(
         seq_lens[0], cfg.sliding_window, page_size
@@ -697,8 +707,9 @@ def sliding_attention_layer(
             f"Exchange blocks of {received.shape[1]} bytes are not those of "
             f"{page_size}-token pages ({halo_bytes} + {window_bytes})."
         )
-    page = (page_size, 2 * cfg.num_kv_heads // 4, 4, cfg.head_dim)
-    first_src, second_src = (cfg.rank - 1) % cfg.world, (cfg.rank + 1) % cfg.world
+    packing = utils.get_dtype_packing(keys.dtype)
+    page = (page_size, 2 * cfg.num_kv_heads // packing, packing, cfg.head_dim)
+    first_src, second_src = halo_neighbours(cfg.rank, cfg.world)
     halos = jnp.stack(
         [received[first_src, :halo_bytes], received[second_src, :halo_bytes]]
     )
