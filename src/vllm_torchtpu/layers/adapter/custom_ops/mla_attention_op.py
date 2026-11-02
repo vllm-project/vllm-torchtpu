@@ -2254,16 +2254,20 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and self.is_sparse
             and self.q_lora_rank is not None
         ):
-            from vllm_torchtpu.distributed.dcp import get_dcp_rank
+            from vllm_torchtpu.distributed.dcp import get_dcp_rank, get_dcp_world_size
             from vllm_torchtpu.layers.adapter.quantization.fp8 import (
                 fp8_skinny_hbm_pin_selected,
             )
 
-            if get_dcp_rank() != q_proj_layer.rank_in_group:
+            if (get_dcp_rank(), get_dcp_world_size()) != (
+                q_proj_layer.rank_in_group,
+                self.dcp_group_size,
+            ):
                 raise NotImplementedError(
-                    "TPU_MLA_LOCAL_Q_GATHER needs the DCP rank to index the q_b "
-                    f"head windows (DCP rank {get_dcp_rank()}, q_b group rank "
-                    f"{q_proj_layer.rank_in_group})"
+                    "TPU_MLA_LOCAL_Q_GATHER gathers the q_b head windows over the "
+                    f"DCP group: DCP rank/size ({get_dcp_rank()}, "
+                    f"{get_dcp_world_size()}) != q_b group rank/size "
+                    f"({q_proj_layer.rank_in_group}, {self.dcp_group_size})"
                 )
             self.local_q_op = get_fp8_linear_window_op(
                 self.num_heads * self.qk_head_dim,
@@ -2342,6 +2346,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
 
+    def _local_q_serves(self) -> bool:
+        """Whether q_b runs the skinny kernel on its plain weight at decode
+        (`fp8_skinny.supports`: a measured shape), so a window of it is the
+        same arithmetic as the whole call."""
+        operands = _qb_overlap_operands(self.q_b_proj)
+        return operands is not None and fp8_skinny.window_supports(
+            *operands[0].shape, self.num_heads * self.qk_head_dim
+        )
+
     def _project_local_q(self, q_c: torch.Tensor) -> torch.Tensor:
         """`q_b_proj(q_c)` under query replication, bit for bit: this rank's
         heads from its column window of the replicated weight (1/dcp of the
@@ -2381,6 +2394,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if project_gather is not None:
             pre_qkv, pre_kw = project_gather(self, hidden_states, positions.shape[0])
             hidden_states = pre_qkv
+        if getattr(self, "local_q_op", None) is not None:
+            # Lifted on every bucket, before any token-count branch: the warmup
+            # hands buckets only between traces that lift the same buffers.
+            hidden_states = _retain_buffers(hidden_states, self.local_q_window)
         # TPU_DCP_PREFILL_TOKEN_PARALLEL under query replication: project q for
         # only the rows this rank attends (`dcp_token_parallel_op.q_rows`).
         q_rows = None
@@ -2475,7 +2492,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     and not split
                     and vllm_compilation_backends.model_tag == "backbone"
                     and q_c.shape[0] <= fp8_skinny.MAX_M
-                    and _qb_overlap_operands(self.q_b_proj) is not None
+                    and self._local_q_serves()
                 ):
                     q = self._project_local_q(q_c)
                 else:

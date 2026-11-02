@@ -312,6 +312,13 @@ def fp8_skinny_matmul_stacked(
     return out
 
 
+def window_supports(k: int, n: int, width: int) -> bool:
+    """Whether `fp8_skinny_matmul_window` serves `width`-wide windows of a
+    `(k, n)` weight: a measured config whose N tiles divide the window."""
+    config = TUNED.get((k, n))
+    return config is not None and config[0] == "n" and width % config[1] == 0
+
+
 def fp8_skinny_matmul_window(
     x: jax.Array,
     w_q: jax.Array,
@@ -328,9 +335,11 @@ def fp8_skinny_matmul_window(
     each column is the same dot and the values are bit-identical."""
     m, k = x.shape
     n = w_q.shape[1]
-    split, t, nbuf = pick_config(k, n)
-    if split != "n" or width % t:
-        raise ValueError(f"({k}, {n}) config {split}{t} does not tile a {width} window")
+    if not window_supports(k, n, width):
+        raise ValueError(
+            f"({k}, {n}) has no measured config that tiles a {width} window"
+        )
+    split, t, nbuf = TUNED[(k, n)]
     call = _build(m, k, width, 1, w_q.dtype, x.dtype, split, t, nbuf, n_full=n)
     idx = jnp.concatenate(
         [jnp.zeros((1,), jnp.int32), window.reshape(1).astype(jnp.int32)]

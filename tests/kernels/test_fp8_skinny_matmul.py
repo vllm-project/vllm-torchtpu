@@ -396,8 +396,15 @@ def test_window_is_bit_identical_to_the_whole_call(m):
         np.testing.assert_array_equal(y, full[:, r * width : (r + 1) * width])
 
 
+def test_window_supports():
+    assert fp8_skinny.window_supports(2048, 16384, 1024)  # q_b at DCP16
+    assert not fp8_skinny.window_supports(2048, 16384, 512)  # narrower than a tile
+    assert not fp8_skinny.window_supports(6144, 2688, 1344)  # q_a + kv_a tiles K
+    assert not fp8_skinny.window_supports(2048, 4096, 1024)  # unmeasured
+
+
 def test_window_needs_an_n_tiled_config():
     x = _x(16, 6144, 16)
     wq, ws = _w(6144, 2688)  # q_a + kv_a tiles K
-    with pytest.raises(ValueError, match="does not tile"):
+    with pytest.raises(ValueError, match="tiles a 1344 window"):
         fp8_skinny.fp8_skinny_matmul_window(x, wq, ws, jnp.zeros((1,), jnp.int32), 1344)

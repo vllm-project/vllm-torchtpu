@@ -156,16 +156,27 @@ def test_decode_buckets_gather_the_local_q_window():
 
     w.local_q_op = window_op
     w.local_q_window = torch.tensor([1], dtype=torch.int32)
+    lifted = []
+
+    def retain(out, *buffers):
+        lifted.extend(buffers)
+        return out
+
+    wrapper_cls = mla_op.VllmMultiHeadLatentAttentionWrapper
     with (
         patch.object(mla_op, "_qb_overlap_operands", lambda layer: ("w", "s")),
+        patch.object(wrapper_cls, "_local_q_serves", lambda self: True),
         patch.object(mla_op, "all_gather_heads", gather),
         patch.object(mla_op.vllm_compilation_backends, "model_tag", "backbone"),
+        patch.object(mla_op, "_retain_buffers", retain),
     ):
         out = _forward(w, hidden, positions, None)
         assert seen["operands"] == ("w", "s") and seen["window"] is w.local_q_window
         seen.clear()
         _forward(w, hidden, positions, "token_parallel")
         assert not seen  # a split bucket keeps the replicated q_b
+    # Both buckets lift the window operand (the warmup's hand-over rule).
+    assert sum(t is w.local_q_window for t in lifted) == 2
     for name in ("q_nope", "q_pe", "kv_c", "k_pe", "topk"):
         assert torch.equal(out[name], ref[name]), name
     for a, b in zip(out["rep"], ref["rep"]):
