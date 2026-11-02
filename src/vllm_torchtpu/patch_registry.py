@@ -136,6 +136,10 @@ PATCHES = (
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
     # API-server output detokenization (VLLM_TPU_DETOK_SUFFIX_PRIME).
     Patch("vllm_torchtpu.detokenizer_suffix:patch_detokenizer_suffix_prime", _ACTIVE),
+    # API-server prompt id range check (VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK).
+    Patch(
+        "vllm_torchtpu.input_range_check:patch_skip_tokenizer_id_range_check", _ACTIVE
+    ),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
