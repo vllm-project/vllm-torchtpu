@@ -3969,6 +3969,8 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
     sequence return zero and their values are zeroed. The window is a
     one-layer arena (keys ``[1, 3, T, 256]``, values transposed
     ``[1, 3, 128, T]``). Offsets are multiples of 256."""
+    *refs, acc_ref, max_ref = refs
+    state = (max_ref, acc_ref)
     if prefixed:
         (layer_ref, q_ref, k_hbm, v_hbm, prefix_k_hbm, prefix_v_hbm, out_ref, k_buf, v_buf, sems,
          pk_buf, pv_buf, psems) = refs
@@ -4023,7 +4025,7 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
         carry = _prefix_phase(
             carry, pq, segment_ref, layer_ref[0], head, first_row, rows, first_row < length,
             prefix_k_hbm, prefix_v_hbm, pk_buf, pv_buf, psems, tile=prefix_tile, q_tile=q_tile,
-            count=count, pshift=pshift,
+            count=count, state=state, pshift=pshift,
             fragment=FP8_FRAGMENT if fp8 else None, exp_bf16=fp8 and FP8_EXP_BF16)
 
     # Blocks [a, b) see every row and need no mask: past the sequence start,
@@ -4032,7 +4034,7 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
     a = jnp.maximum(first_block, interior)
     a, b = jnp.where(a < b, a, count_blocks), jnp.where(a < b, b, count_blocks)
     loop = functools.partial(_key_loop, q=q, layer=0, head=head, k_hbm=k_hbm, v_hbm=v_hbm, k_buf=k_buf,
-                             v_buf=v_buf, sems=sems, tile=tile, pshift=pshift)
+                             v_buf=v_buf, sems=sems, tile=tile, state=state, pshift=pshift)
     carry = loop(carry, first_block, a, mask=window_mask, value_mask=real)
     carry = loop(carry, a, b, streamed=True)
     carry = loop(carry, b, count_blocks, mask=window_mask, value_mask=real)
@@ -4043,7 +4045,7 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
 
 
 def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_hbm, v_hbm, k_buf, v_buf, sems,
-                  *, tile, q_tile, count, pshift=0.0,
+                  *, tile, q_tile, count, state, pshift=0.0,
                   fragment=None, exp_bf16=False):
     """The cached-prefix part of ``_flash_kernel_packed``: fold each
     sequence's arena rows into the online softmax ``carry`` of the query
@@ -4076,7 +4078,7 @@ def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_h
             return (value_rows >= lo_row) & (value_rows < hi_row)
 
         loop = functools.partial(_key_loop, q=q, layer=layer, head=head, k_hbm=k_hbm, v_hbm=v_hbm,
-                                 k_buf=k_buf, v_buf=v_buf, sems=sems, tile=tile, pshift=pshift,
+                                 k_buf=k_buf, v_buf=v_buf, sems=sems, tile=tile, state=state, pshift=pshift,
                                  fragment=fragment, exp_bf16=exp_bf16)
         # Whole blocks [a, b); without one, [lo, hi) is all edge.
         a, b = (lo_row + tile - 1) // tile, hi_row // tile
@@ -4131,7 +4133,7 @@ FP8_STALE_LIMIT = 4.75
 STALE_LIMIT = 64.0
 
 
-def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems, tile, mask=None,
+def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems, tile, state, mask=None,
               value_mask=None, streamed=False, pshift=0.0, fragment=None,
               exp_bf16=False):
     """Fold key blocks ``[lo, hi)`` of arena layer ``layer`` (keys
@@ -4199,10 +4201,12 @@ def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems
         return exact(carry)
 
     fp8 = v_buf.dtype == jnp.float8_e4m3fn
+    max_ref, acc_ref = state
 
     def stream(c):
-        def body(key_block, state):
-            c, worst = state
+        # A fori_loop carry this size is copied through spill slots every step; VMEM refs are not.
+        def body(key_block, worst):
+            c = (max_ref[...], acc_ref[...])
             k, v = block(key_block)
             stale, gap = _stale_step(q, k, v, c, pshift=pshift,
                                      fragment=fragment, exp_bf16=exp_bf16)
@@ -4214,13 +4218,15 @@ def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems
                     lambda: _exact_step(q, k, v, c, None, pshift=pshift,
                                         fragment=fragment, exp_bf16=exp_bf16),
                     lambda: stale)
-                return stale, worst
-            return stale, jnp.maximum(worst, gap)
+                max_ref[...], acc_ref[...] = stale
+                return worst
+            max_ref[...], acc_ref[...] = stale
+            return jnp.maximum(worst, gap)
 
         prime()
-        first = step(lo, c)
-        worst = jnp.full(c[0].shape, -jnp.inf, jnp.float32)
-        result, worst = jax.lax.fori_loop(lo + 1, hi, body, (first, worst))
+        max_ref[...], acc_ref[...] = step(lo, c)
+        worst = jax.lax.fori_loop(lo + 1, hi, body, jnp.full(c[0].shape, -jnp.inf, jnp.float32))
+        result = (max_ref[...], acc_ref[...])
         limit = FP8_STALE_LIMIT if v_buf.dtype == jnp.float8_e4m3fn else STALE_LIMIT
         return jax.lax.cond(jnp.max(worst) > limit, exact, lambda _: result, c)
 
@@ -4664,7 +4670,10 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
                 pltpu.VMEM((2, p_tile, 256), arena[0].dtype),
                 pltpu.VMEM((2, 128, p_tile), arena[1].dtype),
                 pltpu.SemaphoreType.DMA((2, 2)),
-            ) if arena is not None else ()),
+            ) if arena is not None else ()) + (
+                pltpu.VMEM((128 + _ONES, q_tile), jnp.float32),
+                pltpu.VMEM((1, q_tile), jnp.float32),
+            ),
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel"), vmem_limit_bytes=64 * 1024**2,
