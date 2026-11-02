@@ -49,6 +49,7 @@ from torch.distributed import _functional_collectives as funcol
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import set_current_vllm_config
+from vllm.config.utils import getattr_iter
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -58,6 +59,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers import vocab_parallel_embedding
 from vllm.model_executor.layers.attention.attention import get_attention_context
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -437,7 +439,7 @@ _REPLICA = "cp_replica"
 # The checkpoint tensors (names as Gemma4Model.load_weights receives them) that
 # the replica takes too.
 _REPLICATED_TENSOR = re.compile(
-    r"layers\.\d+\.(self_attn\.[qkvo]_proj|mlp\.(gate|up|down)_proj)\."
+    r"layers\.\d+\.(self_attn\.[qkvo]_proj|mlp\.(gate|up|down)_proj|experts)\."
 )
 
 
@@ -489,7 +491,7 @@ class _ReplicaMLP(nn.Module):
 
 
 class _ReplicaLayer(nn.Module):
-    def __init__(self, layer: Any, quant_config: Any, prefix: str) -> None:
+    def __init__(self, layer: Any, config: Any, quant_config: Any, prefix: str) -> None:
         super().__init__()
         self.self_attn = _ReplicaAttention(
             layer.self_attn, quant_config, f"{prefix}.self_attn"
@@ -497,6 +499,23 @@ class _ReplicaLayer(nn.Module):
         self.mlp = _ReplicaMLP(
             layer.mlp, layer.hidden_size, quant_config, f"{prefix}.mlp"
         )
+        if layer.enable_moe_block:
+            # Upstream's experts (Gemma4DecoderLayer), every one on this rank.
+            self.experts = FusedMoEFactory(
+                num_experts=config.num_experts,
+                top_k=config.top_k_experts,
+                hidden_size=config.hidden_size,
+                intermediate_size=getattr_iter(
+                    config, ("moe_intermediate_size", "expert_intermediate_size")
+                ),
+                renormalize=True,
+                quant_config=quant_config,
+                tp_size=1,
+                dp_size=1,
+                prefix=f"{prefix}.experts",
+                custom_routing_function=layer.router.routing_function,
+                activation="gelu_tanh",
+            )
 
 
 class Gemma4ProjectionReplica(nn.Module):
@@ -510,7 +529,7 @@ class Gemma4ProjectionReplica(nn.Module):
     def __init__(self, model: Gemma4Model, quant_config: Any, prefix: str) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            _ReplicaLayer(layer, quant_config, f"{prefix}.layers.{i}")
+            _ReplicaLayer(layer, model.config, quant_config, f"{prefix}.layers.{i}")
             for i, layer in enumerate(model.layers)
         )
 
@@ -597,6 +616,12 @@ def _context_parallel_layer(
 
     gate_up, _ = replica.mlp.gate_up_proj(layer.pre_feedforward_layernorm(x))
     out, _ = replica.mlp.down_proj(layer.mlp.act_fn(gate_up))
+    if layer.enable_moe_block:
+        experts = replica.experts(
+            layer.pre_feedforward_layernorm_2(residual), layer.router(residual)
+        )
+        out = layer.post_feedforward_layernorm_1(out)
+        out = out + layer.post_feedforward_layernorm_2(experts)
     return (layer.post_feedforward_layernorm(out) + residual) * layer.layer_scalar
 
 
@@ -678,13 +703,16 @@ def _check_context_parallel(model: Gemma4Model, vllm_config: VllmConfig) -> None
         )
         if present
     ]
+    moe = any(layer.enable_moe_block for layer in model.layers)
     for layer in model.layers:
         attn: Any = layer.self_attn
         for name, present in (
-            ("MoE layers", layer.enable_moe_block),
             ("KV sharing", attn.is_kv_shared_layer),
             ("per-layer embeddings", layer.per_layer_input_gate is not None),
             ("attention biases", attn.o_proj.bias is not None),
+            # The replica holds every expert: the loader must read them all.
+            ("the EP weight filter", moe and parallel.enable_ep_weight_filter),
+            ("EPLB", moe and parallel.enable_eplb),
         ):
             if present and name not in unsupported:
                 unsupported.append(name)
@@ -748,16 +776,19 @@ def _patched_causal_lm_init(
         model, vllm_config.quant_config, f"{maybe_prefix(prefix, 'model')}.{_REPLICA}"
     )
     for layer, copied in zip(model.layers, replica.layers):
-        for tp_linear, linear in (
+        pairs = [
             (layer.self_attn.qkv_proj, copied.self_attn.qkv_proj),
             (layer.self_attn.o_proj, copied.self_attn.o_proj),
             (layer.mlp.gate_up_proj, copied.mlp.gate_up_proj),
             (layer.mlp.down_proj, copied.mlp.down_proj),
-        ):
-            if type(linear.quant_method) is not type(tp_linear.quant_method):
+        ]
+        if layer.enable_moe_block:
+            pairs.append((layer.experts.routed_experts, copied.experts.routed_experts))
+        for tp_module, module in pairs:
+            if type(module.quant_method) is not type(tp_module.quant_method):
                 raise ValueError(
-                    f"{linear.prefix} would run {type(linear.quant_method).__name__}"
-                    f", its TP shard {type(tp_linear.quant_method).__name__}"
+                    f"{module.prefix} would run {type(module.quant_method).__name__}"
+                    f", its TP shard {type(tp_module.quant_method).__name__}"
                 )
     setattr(model, _REPLICA, replica)
     # A plain dict: the programs are not submodules, so nothing that walks the

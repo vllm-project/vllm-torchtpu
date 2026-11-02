@@ -936,6 +936,22 @@ def test_vocab_shard_embedding_reads_registered_bounds() -> None:
     )
 
 
+class _AllExperts:
+    """Every expert of _Experts' layout on one rank, nothing reduced."""
+
+    def __init__(self, weights: list[torch.Tensor]) -> None:
+        self.weights = weights
+
+    def __call__(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        gates = torch.softmax(router_logits, dim=-1)
+        return sum(
+            gates[:, e : e + 1] * (hidden_states @ w)
+            for e, w in enumerate(self.weights)
+        )
+
+
 def _replica(model: _Model, index: int) -> SimpleNamespace:
     """The projections of one layer, whole, as Gemma4ProjectionReplica holds them."""
     lw = model.layer_weights[index]
@@ -952,7 +968,23 @@ def _replica(model: _Model, index: int) -> SimpleNamespace:
             gate_up_proj=linear(torch.cat([lw["gate"], lw["up"]], dim=1)),
             down_proj=linear(lw["down"]),
         ),
+        experts=_AllExperts(lw["experts"]) if model.moe else None,
     )
+
+
+def _cp_attention_reference(mock: _TPCollectiveMock, model: _Model, plan: Any):
+    """_causal_mix over the whole prompt, for one rank's zigzag rows."""
+    num_tokens = plan.num_tokens
+    heads, kv_heads, hd = model.heads, model.kv_heads, model.head_dim
+
+    def attention(attn, q, k, v, plan, rank):
+        kv = gemma4_patch._token_order(mock.all_gather(k + v), plan)
+        kv = kv.view(num_tokens, kv_heads, hd).repeat_interleave(heads // kv_heads, 1)
+        prefix = kv.cumsum(0) / torch.arange(1, num_tokens + 1).view(-1, 1, 1)
+        rows = gemma4_patch._rank_rows(torch.arange(num_tokens), plan, rank)
+        return (q.view(-1, heads, hd) * prefix[rows]).flatten(1)
+
+    return attention
 
 
 @pytest.mark.parametrize("world", [3, 4])
@@ -974,14 +1006,7 @@ def test_context_parallel_forward_matches_tp(mock_collectives, world, fp8) -> No
             x, _ = _UPSTREAM_LAYER_FORWARD(layer, positions, x, None)
         return model.final_norm(x)
 
-    def attention(attn, q, k, v, plan, rank):
-        """The prefix-mean stand-in over the whole prompt, for this rank's rows."""
-        kv = gemma4_patch._token_order(mock.all_gather(k + v), plan)
-        heads, kv_heads, hd = model.heads, model.kv_heads, model.head_dim
-        kv = kv.view(num_tokens, kv_heads, hd).repeat_interleave(heads // kv_heads, 1)
-        prefix = kv.cumsum(0) / torch.arange(1, num_tokens + 1).view(-1, 1, 1)
-        rows = gemma4_patch._rank_rows(torch.arange(num_tokens), plan, rank)
-        return (q.view(-1, heads, hd) * prefix[rows]).flatten(1)
+    attention = _cp_attention_reference(mock, model, plan)
 
     def rank_fn(rank: int) -> torch.Tensor:
         fake = SimpleNamespace(
@@ -1008,6 +1033,44 @@ def test_context_parallel_forward_matches_tp(mock_collectives, world, fp8) -> No
         *[(rows, model.kv_heads * model.head_dim)] * num_layers,
         (rows, model.hidden),
     ]
+
+
+def test_context_parallel_moe_forward_matches_tp(mock_collectives) -> None:
+    """MoE layers: dense MLP and every expert local == upstream's TP forward,
+    whose ranks each hold one expert and all-reduce."""
+    world, num_layers, normalizer = 4, 2, torch.tensor(2.0)
+    mock = mock_collectives(world)
+    model = _GqaModel(world, moe=True, fp8=False, num_layers=num_layers)
+    plan = _zigzag_plan(world, 2 * world * 4)
+    input_ids = torch.randint(0, model.embedding.shape[0], (plan.num_tokens,))
+    positions = torch.arange(plan.num_tokens)
+
+    def tp_rank(rank: int) -> torch.Tensor:
+        x = model.embedding[input_ids] * normalizer
+        for i in range(num_layers):
+            layer = model.layer(i, rank, mock.all_reduce)
+            x, _ = _UPSTREAM_LAYER_FORWARD(layer, positions, x, None)
+        return model.final_norm(x)
+
+    expected = _run_ranks(world, tp_rank)[0]
+    attention = _cp_attention_reference(mock, model, plan)
+
+    def cp_rank(rank: int) -> torch.Tensor:
+        fake = SimpleNamespace(
+            embed_tokens=_vocab_shard(model.embedding, rank, world),
+            normalizer=normalizer,
+            layers=[model.layer(i, rank, mock.all_reduce) for i in range(num_layers)],
+            cp_replica=SimpleNamespace(
+                layers=[_replica(model, i) for i in range(num_layers)]
+            ),
+            norm=model.final_norm,
+        )
+        return gemma4_patch._context_parallel_forward(
+            fake, input_ids, positions, plan, rank, attention
+        )
+
+    for out in _run_ranks(world, cp_rank):
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_context_parallel_trace_keeps_the_bucket_symbolic(monkeypatch) -> None:
@@ -1055,7 +1118,11 @@ def test_context_parallel_trace_keeps_the_bucket_symbolic(monkeypatch) -> None:
 def _cp_config(**overrides: Any) -> SimpleNamespace:
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
-            pipeline_parallel_size=1, data_parallel_size=1, tensor_parallel_size=8
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            tensor_parallel_size=8,
+            enable_ep_weight_filter=False,
+            enable_eplb=False,
         ),
         lora_config=None,
         speculative_config=None,
@@ -1132,11 +1199,22 @@ def test_check_context_parallel_bucket_rule(cp_envs, solo, cp_min, ok) -> None:
         ({"fast_prefill_enabled": True}, {}, {}, "kv_sharing_fast_prefill"),
         ({}, {}, {"TPU_PRECOMPILE_PEER_REPLAY": True}, "PEER_REPLAY"),
         ({}, {}, {"VLLM_TPU_MOST_MODEL_LEN": 4096}, "MOST_MODEL_LEN"),
-        ({"layer.enable_moe_block": True}, {}, {}, "MoE"),
         ({"layer.self_attn.is_kv_shared_layer": True}, {}, {}, "KV sharing"),
         ({"layer.per_layer_input_gate": object()}, {}, {}, "per-layer"),
         ({"layer.self_attn.o_proj.bias": object()}, {}, {}, "biases"),
         ({}, {"parallel_config.tensor_parallel_size": 2}, {}, "TP >= 3"),
+        (
+            {"layer.enable_moe_block": True},
+            {"parallel_config.enable_ep_weight_filter": True},
+            {},
+            "EP weight filter",
+        ),
+        (
+            {"layer.enable_moe_block": True},
+            {"parallel_config.enable_eplb": True},
+            {},
+            "EPLB",
+        ),
     ],
 )
 def test_check_context_parallel_refuses(cp_envs, model, config, env, match) -> None:
