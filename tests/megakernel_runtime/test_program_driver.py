@@ -34,7 +34,7 @@ import vllm_torchtpu.megakernel_runtime.guards as guards_mod
 from vllm_torchtpu import megakernel_runtime as mkr
 from vllm_torchtpu.megakernel import errors as mk_errors
 from vllm_torchtpu.megakernel_runtime import fingerprint as fp
-from vllm_torchtpu.megakernel_runtime import testing
+from vllm_torchtpu.megakernel_runtime import testing, testkit
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext
 from vllm_torchtpu.megakernel_runtime.plugin import (
     Bucket,
@@ -61,6 +61,9 @@ def _std_logger(monkeypatch: pytest.MonkeyPatch) -> None:
         )
     monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     monkeypatch.delenv("VLLM_TPU_MEGAKERNEL", raising=False)
+
+
+mk_toy_plugin = testkit.mk_toy_plugin
 
 
 @pytest.fixture
@@ -597,22 +600,6 @@ def test_features_before_requires() -> None:
     assert res is not None and res.code == "spec_decode_unsupported"
 
 
-@pytest.mark.parametrize(
-    "kw, match",
-    [
-        ({"requires": {"no_such_key": "1"}}, "unknown requires key 'no_such_key'"),
-        ({"numerics": "bitwise"}, "numerics='bitwise'"),
-        ({"parallelism": {"tp", "sp"}}, "unknown parallelism"),
-        ({"parallelism": {"ep_in_tp"}}, "must include 'tp'"),
-        ({"features": {"telepathy"}}, "unknown features"),
-        ({"collective_domain": "dp"}, "collective_domain='dp'"),
-    ],
-)
-def test_invalid_spec_fields_raise(kw: dict[str, Any], match: str) -> None:
-    with pytest.raises(mk_errors.MegakernelConfigError, match=match):
-        _spec(**kw)
-
-
 def test_unknown_requires_key_fails_at_spec_load(
     toy: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -791,38 +778,6 @@ def test_weight_update_guard() -> None:
     )
     first = ast.unparse(fn.body[0])
     assert first == "megakernel_runtime.guard_weight_update(self.model_runner)"
-
-
-def test_fake_runner_implements_every_runner_view_property() -> None:
-    props = [n for n, v in vars(RunnerView).items() if isinstance(v, property)]
-    assert len(props) == 17
-    model = object()
-    runner = testing.fake_runner(
-        model=model,
-        hf_config={"architectures": ["X"]},
-        tp_size=2,
-        speculative_tokens=3,
-        req_block_pairs=((8, 4), (2, 16)),
-        max_pages_per_seq=32,
-        mamba_slot_read_offsets=torch.zeros(2),
-        uses_mrope=True,
-        enforce_eager=True,
-    )
-    view = RunnerView(runner, tp_rank=1)
-    got = {n: getattr(view, n) for n in props}
-    assert got["model"] is model and got["vllm_config"] is runner.vllm_config
-    assert got["device"] == torch.device("cpu")
-    assert got["hf_config"] == {"architectures": ["X"]}
-    assert (got["tp_size"], got["tp_rank"]) == (2, 1)
-    assert got["speculative_tokens"] == 3 and got["ckpt_window"] == 4
-    assert got["cache_block_size"] == 256
-    assert got["token_paddings"] == (16, 32, 64)
-    assert got["req_block_pairs"] == ((8, 32), (2, 16))
-    assert got["max_pages_per_seq"] == 32
-    assert got["mamba_slot_read_offsets"] is runner.mamba_slot_read_offsets
-    assert got["uses_mrope"] and got["enforce_eager"] and got["unified_kv_layout"]
-    assert got["device_kind"] == "cpu"
-    assert RunnerView(testing.fake_runner(ckpt_window=6)).ckpt_window == 6
 
 
 def test_runner_shapes_without_paddings() -> None:

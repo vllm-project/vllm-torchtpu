@@ -34,6 +34,9 @@ SPEC = TpuMonoSpec("pkg", "1", create={create!r})
 '''
 _ADAPTER = "def create(view, options):\n    return None\n"
 
+mk_fake_runner = testkit.mk_fake_runner
+mk_toy_plugin = testkit.mk_toy_plugin
+
 
 @pytest.fixture
 def make_pkg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:

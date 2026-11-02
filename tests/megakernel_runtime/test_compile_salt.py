@@ -99,12 +99,9 @@ def _vllm_config(megakernel: Any) -> Any:
 def test_stock_compile_hash_unchanged_with_megakernel_on(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
-
     compute = _compute_hash_fn()
     base = compute(_vllm_config(None))
     for mk in (True, "qwen35", {"plugin": "qwen35", "options": {"mode": "tp"}}):
-        assert compile_cache_salt(_vllm_config(mk)) is None
         assert compute(_vllm_config(mk)) == base
     monkeypatch.setenv("VLLM_TPU_MEGAKERNEL", "1")
     assert compute(_vllm_config(None)) == base
@@ -114,10 +111,9 @@ def test_stock_compile_hash_unchanged_with_megakernel_on(
     monkeypatch.syspath_prepend(str(tmp_path))
     importlib.invalidate_caches()
     try:
-        salt1 = compile_cache_salt(_vllm_config({"plugin": "lay_mk_plugin"}))
-        assert salt1 is not None and len(salt1) == 16
+        lay = compute(_vllm_config({"plugin": "lay_mk_plugin"}))
+        assert lay != base
         mk2 = {"plugin": "lay_mk_plugin", "options": {"n": 2}}
-        assert compile_cache_salt(_vllm_config(mk2)) != salt1
-        assert compute(_vllm_config({"plugin": "lay_mk_plugin"})) != base
+        assert compute(_vllm_config(mk2)) not in (base, lay)
     finally:
         sys.modules.pop("lay_mk_plugin", None)
