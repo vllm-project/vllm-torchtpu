@@ -66,6 +66,8 @@ class KernelConfig:
     # Plain decode without attention DP: the smallest batch that token-scatters
     # rows over the sequence-parallel owners, and the smallest that uses the
     # routed MoE reduce-scatter (the compiled lists still apply).
+    # A singleton expert's output rounds to BF16 with integer ops (same bits).
+    singleton_round_bits: bool = False
     decode_scatter_from: int = 8
     decode_routed_reduce_scatter_from: int = 6
     # Attention DP verifies (sequence_rows > 1) also take these plain B64/B128

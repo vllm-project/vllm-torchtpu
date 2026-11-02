@@ -123,6 +123,16 @@ def _attention_scores(queries, keys):
     )[:row_count]
 
 
+def _round_to_bf16(value):
+    """FP32 ``value`` rounded to BF16 precision (round to nearest even), kept
+    in FP32: the bits of ``value.astype(bfloat16).astype(float32)`` for finite
+    values, with integer ops in the FP32 layout instead of a pack and unpack
+    (which relayout a one-row vector)."""
+    bits = jax.lax.bitcast_convert_type(value, jnp.uint32)
+    bits = (bits + jnp.uint32(0x7FFF) + ((bits >> 16) & jnp.uint32(1))) & jnp.uint32(0xFFFF0000)
+    return jax.lax.bitcast_convert_type(bits, jnp.float32)
+
+
 def _gated_activation(gate, value):
     """Kimi K3 shared/routed expert activation, rounded to BF16."""
     return (
@@ -1283,9 +1293,8 @@ def _run_routed_expert_stream(
             axis=1,
         ) / probability_totals
         singleton_output = (
-            down_accumulator[:1]
-            .astype(jnp.bfloat16)
-            .astype(jnp.float32)
+            _round_to_bf16(down_accumulator[:1]) if SINGLETON_ROUND_BITS
+            else down_accumulator[:1].astype(jnp.bfloat16).astype(jnp.float32)
         )
         row = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
         probability = jnp.sum(
@@ -6433,6 +6442,9 @@ SHARED_EXPERT_FINISHERS = _config().shared_expert_finishers
 # finish overflowing experts in eight-row passes; without the full-batch
 # fallback the expert loop fits in IMEM next to its predecessor.
 COMPACT_OVERFLOW = _config().compact_overflow
+# KernelConfig.singleton_round_bits: a singleton expert's output is rounded
+# to BF16 with integer ops (same bits) instead of a BF16 round trip.
+SINGLETON_ROUND_BITS = _config().singleton_round_bits
 SHARED_SHARDS = _config().shared_shards
 # KernelConfig.kda_staged=True (above B8, no attention DP): stage the KDA input
 # and feature-gate projections in VMEM; with a state stream (above B16) the
