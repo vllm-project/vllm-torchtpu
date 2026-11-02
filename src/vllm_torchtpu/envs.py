@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SOLO_PREFILL_DECODE_STEPS: int = 1
     VLLM_TPU_DECODE_INTERVAL_MS: int = 0
     VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS: int = 0
+    VLLM_TPU_MIN_DECODE_INTERVAL_MS: int = 0
 
 
 def env_with_choices(
@@ -1280,8 +1281,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
-    # PrefillFirstScheduler (installed when this, VLLM_TPU_DECODE_INTERVAL_MS
-    # or VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS is > 0): requests with more than
+    # PrefillFirstScheduler (installed when this, VLLM_TPU_DECODE_INTERVAL_MS,
+    # VLLM_TPU_MIN_DECODE_INTERVAL_MS or VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS is
+    # > 0): requests with more than
     # this many tokens to compute, none computed yet, are prefilled whole, each
     # in a step of its own; every other step schedules at most this many
     # tokens.
@@ -1309,6 +1311,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tokens each request still has to prefill (0: true counts).
     "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS": env_nonnegative_int(
         "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS", 0
+    ),
+    # PrefillFirstScheduler: with nothing left to prefill, a step that would only
+    # decode waits until this many milliseconds have passed since the previous
+    # step that decoded (0: no floor).
+    "VLLM_TPU_MIN_DECODE_INTERVAL_MS": env_nonnegative_int(
+        "VLLM_TPU_MIN_DECODE_INTERVAL_MS", 0
     ),
 }
 

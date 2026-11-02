@@ -76,6 +76,7 @@ def _build(
     decode_steps: int = 1,
     decode_interval_ms: int = 0,
     dp_lb_prefill_unit_tokens: int = 0,
+    min_decode_interval_ms: int = 0,
     num_blocks: int = 64,
     max_num_seqs: int = 8,
     max_num_batched_tokens: int = 128,
@@ -91,6 +92,7 @@ def _build(
     monkeypatch.setenv(
         "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS", str(dp_lb_prefill_unit_tokens)
     )
+    monkeypatch.setenv("VLLM_TPU_MIN_DECODE_INTERVAL_MS", str(min_decode_interval_ms))
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=max_num_seqs,
@@ -326,6 +328,7 @@ def test_flags_stay_out_of_the_compile_key():
         "VLLM_TPU_SOLO_PREFILL_DECODE_STEPS",
         "VLLM_TPU_DECODE_INTERVAL_MS",
         "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS",
+        "VLLM_TPU_MIN_DECODE_INTERVAL_MS",
     ):
         assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
         assert name not in tpu_compiler._tpu_compile_env_factors()
@@ -568,3 +571,74 @@ def test_dp_lb_counts_are_off_without_data_parallelism(
     )
     _add(scheduler, hasher, ("long", 100, 1))
     assert scheduler.get_request_counts() == (0, 1)
+
+
+def _sleeping_clock(monkeypatch, step_s=0.0):
+    """A fake clock that the scheduler's sleeps advance."""
+    clock = _Clock(step_s=step_s)
+    slept = []
+
+    def fake_sleep(seconds):
+        slept.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(prefill_first_scheduler, "monotonic", clock)
+    monkeypatch.setattr(prefill_first_scheduler, "sleep", fake_sleep)
+    return clock, slept
+
+
+def test_decode_only_steps_wait_for_the_interval_floor(
+    shared_model_config, monkeypatch
+):
+    clock, slept = _sleeping_clock(monkeypatch)
+    scheduler, hasher = _build(
+        shared_model_config, monkeypatch, min_decode_interval_ms=5
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    assert scheduler.schedule().num_scheduled_tokens == {"d": 16}
+    assert scheduler.schedule().num_scheduled_tokens == {"d": 1}
+    decoded_at = clock.now
+
+    steps = [scheduler.schedule().num_scheduled_tokens for _ in range(6)]
+    # Four empty steps of one 1 ms sleep each, then the decode at 5 ms.
+    assert steps == [{}, {}, {}, {}, {"d": 1}, {}]
+    assert slept[:5] == pytest.approx([0.001] * 5)
+    assert clock.now - decoded_at == pytest.approx(0.006)
+
+
+def test_a_request_arriving_during_the_hold_is_scheduled_at_once(
+    shared_model_config, monkeypatch
+):
+    clock, slept = _sleeping_clock(monkeypatch)
+    scheduler, hasher = _build(
+        shared_model_config, monkeypatch, min_decode_interval_ms=50
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    scheduler.schedule()
+    scheduler.schedule()
+    assert scheduler.schedule().num_scheduled_tokens == {}
+    _add(scheduler, hasher, ("w", 32, 2))
+    # A prefill is pending, so the floor does not hold the decode either.
+    assert scheduler.schedule().num_scheduled_tokens == {"d": 1, "w": 32}
+    assert len(slept) == 1
+
+
+def test_no_floor_while_a_prefill_chunk_runs(shared_model_config, monkeypatch):
+    clock, slept = _sleeping_clock(monkeypatch)
+    scheduler, hasher = _build(
+        shared_model_config,
+        monkeypatch,
+        min_decode_interval_ms=50,
+        max_num_batched_tokens=32,
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    scheduler.schedule()
+    _add(scheduler, hasher, ("long", 100, 2))
+    steps = [scheduler.schedule().num_scheduled_tokens for _ in range(4)]
+    assert steps == [
+        {"d": 1, "long": 31},
+        {"d": 1, "long": 31},
+        {"d": 1, "long": 31},
+        {"d": 1, "long": 7},
+    ]
+    assert slept == []

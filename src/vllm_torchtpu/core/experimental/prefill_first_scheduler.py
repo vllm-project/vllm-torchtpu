@@ -48,6 +48,15 @@ every step; the other steps carry only prefill. With a closed-loop client,
 TTFT + output_len * TPOT is the time between a user's requests, so raising TPOT
 toward its limit lowers TTFT at the same throughput.
 
+Decode interval floor (``VLLM_TPU_MIN_DECODE_INTERVAL_MS=F > 0``). When nothing
+is left to prefill (no running prefill chunk and no waiting request), a step
+that would only decode waits until ``F`` milliseconds have passed since the
+previous step that decoded: the device would only be decoding, so this raises
+TPOT without taking prefill capacity, and lowers TTFT under a closed-loop
+client the same way. The wait is spent in steps that schedule nothing, each
+sleeping at most ``_HOLD_QUANTUM_S``, so the engine core does not spin and a
+request that arrives meanwhile is scheduled at the next step.
+
 Prefill-aware DP load balancing (``VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS=U > 0``).
 vLLM's data-parallel front end sends each new request to the engine with the
 fewest waiting plus running requests, as each engine's scheduler reports them;
@@ -70,7 +79,7 @@ selects it too.
 import contextlib
 from collections.abc import Iterator
 from itertools import chain
-from time import monotonic
+from time import monotonic, sleep
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
@@ -86,10 +95,14 @@ SCHEDULER_CLS = (
     "vllm_torchtpu.core.experimental.prefill_first_scheduler.PrefillFirstScheduler"
 )
 
+# Longest sleep of a step that holds decodes for the interval floor: the delay a
+# request arriving during the hold can see before it is scheduled.
+_HOLD_QUANTUM_S = 0.001
+
 
 class PrefillFirstScheduler(AsyncScheduler):
-    """Solo whole-prompt prefill steps, decode pacing and prefill-aware DP
-    load-balancing counts (module docstring)."""
+    """Solo whole-prompt prefill steps, decode pacing, a decode interval floor
+    and prefill-aware DP load-balancing counts (module docstring)."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -98,10 +111,17 @@ class PrefillFirstScheduler(AsyncScheduler):
         self.solo_decode_steps = envs.VLLM_TPU_SOLO_PREFILL_DECODE_STEPS
         self.decode_interval = envs.VLLM_TPU_DECODE_INTERVAL_MS / 1000
         self.lb_prefill_unit = envs.VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS
-        if not (self.solo_over_tokens or self.decode_interval or self.lb_prefill_unit):
+        self.min_decode_interval = envs.VLLM_TPU_MIN_DECODE_INTERVAL_MS / 1000
+        if not (
+            self.solo_over_tokens
+            or self.decode_interval
+            or self.lb_prefill_unit
+            or self.min_decode_interval
+        ):
             raise ValueError(
                 "PrefillFirstScheduler needs VLLM_TPU_SOLO_PREFILL_OVER_TOKENS, "
-                "VLLM_TPU_DECODE_INTERVAL_MS or VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS."
+                "VLLM_TPU_DECODE_INTERVAL_MS, VLLM_TPU_MIN_DECODE_INTERVAL_MS or "
+                "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS."
             )
         if self.lb_prefill_unit and self.parallel_config.data_parallel_size == 1:
             logger.warning(
@@ -129,18 +149,22 @@ class PrefillFirstScheduler(AsyncScheduler):
         # nothing).
         self._decode_due = 0.0
         self._force_decode = False
+        # When the last step that decoded was scheduled (interval floor).
+        self._last_decode = float("-inf")
         # Set while the base scheduler's own logic reads the request counts:
         # schedule() and the unfinished-request checks see the true counts.
         self._true_counts = False
         logger.info(
             "PrefillFirstScheduler active (solo_over_tokens=%d, "
             "max_solo_tokens=%d, solo_max_consecutive=%d, solo_decode_steps=%d, "
-            "decode_interval_ms=%g, dp_lb_prefill_unit_tokens=%d)",
+            "decode_interval_ms=%g, min_decode_interval_ms=%g, "
+            "dp_lb_prefill_unit_tokens=%d)",
             self.solo_over_tokens,
             self.max_solo_tokens,
             self.solo_max_consecutive,
             self.solo_decode_steps,
             self.decode_interval * 1000,
+            self.min_decode_interval * 1000,
             self.lb_prefill_unit,
         )
 
@@ -326,7 +350,9 @@ class PrefillFirstScheduler(AsyncScheduler):
 
     def _schedule_regular(self, throttle_prefills: bool) -> SchedulerOutput:
         held = self._held_from_regular()
-        paused = self._paused_decodes()
+        decodes = [r for r in self.running if not r.is_prefill_chunk]
+        below_floor = self._below_decode_floor(decodes)
+        paused = decodes if below_floor else self._paused_decodes()
         budget = self.max_num_scheduled_tokens
         if self.solo_over_tokens:
             self.max_num_scheduled_tokens = min(budget, self.solo_over_tokens)
@@ -335,9 +361,27 @@ class PrefillFirstScheduler(AsyncScheduler):
                 output = super().schedule(throttle_prefills)
         finally:
             self.max_num_scheduled_tokens = budget
-        if paused and not output.total_num_scheduled_tokens:
+        if paused and not below_floor and not output.total_num_scheduled_tokens:
             self._force_decode = True
+        if any(r.request_id in output.num_scheduled_tokens for r in decodes):
+            self._last_decode = monotonic()
         return output
+
+    def _below_decode_floor(self, decodes: list[Request]) -> bool:
+        """Whether a decode-only step still waits for the interval floor; if
+        so, sleeps up to `_HOLD_QUANTUM_S` first (a held step schedules
+        nothing, and the engine core would otherwise call again at once)."""
+        if not (self.min_decode_interval and decodes):
+            return False
+        if any(r.is_prefill_chunk for r in self.running) or (
+            self.waiting or self.kv_holding_waiting
+        ):
+            return False
+        remaining = self._last_decode + self.min_decode_interval - monotonic()
+        if remaining <= 0:
+            return False
+        sleep(min(remaining, _HOLD_QUANTUM_S))
+        return remaining > _HOLD_QUANTUM_S
 
     def _held_from_regular(self) -> list[Request]:
         """The waiting requests a regular step does not admit: the first one a
