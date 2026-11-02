@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CLI entrypoint for plan and explain subcommands."""
+"""CLI entrypoint for solve, plan, and explain subcommands."""
 
 from __future__ import annotations
 
@@ -22,9 +22,18 @@ from dataclasses import asdict, replace
 
 from .chips import CHIPS
 from .geometry import from_hf_config
-from .hf_loader import load_hf_config
+from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import Dtypes, Parallel, StepShape
 from .serving import plan
+from .solver import (
+    DEFAULT_GPU_MEMORY_UTILIZATION,
+    EXAMPLE_CONCURRENCIES,
+    EXAMPLE_SCENARIOS,
+    EXAMPLE_SLO_TIERS,
+    TrafficScenario,
+    build_example_scenario,
+    solve_serving_plan,
+)
 from .step import spec_cycle_floor, step_floor
 
 _WEIGHT_BYTES: dict[str, float] = {"bf16": 2.0, "fp8": 1.0}
@@ -78,11 +87,42 @@ def _add_common_args(p: argparse.ArgumentParser, *, tp_required: bool = True) ->
     p.add_argument("--json", action="store_true")
 
 
+def _add_scenario_args(p: argparse.ArgumentParser) -> None:
+    _add_model_source(p)
+    p.add_argument("--chip", default="tpu7x", choices=sorted(CHIPS))
+    p.add_argument(
+        "--example-scenario", default=None, choices=sorted(EXAMPLE_SCENARIOS)
+    )
+    p.add_argument("--mode", default="auto", choices=("auto", "mixed", "disagg"))
+    p.add_argument("--max-chips", type=int, default=None)
+    p.add_argument("--max-instances", type=int, default=None)
+    p.add_argument(
+        "--example-slo-tier", default="none", choices=sorted(EXAMPLE_SLO_TIERS)
+    )
+    p.add_argument("--ttft-slo-ms", type=float, default=None)
+    p.add_argument("--tpot-slo-ms", type=float, default=None)
+    p.add_argument("--isl", type=int, default=None)
+    p.add_argument("--osl", type=int, default=None)
+    p.add_argument("--concurrency", default=None)
+    p.add_argument("--prefix-hit-rate", type=float, default=None)
+    p.add_argument("--accept-len", type=float, default=None)
+    p.add_argument("--think-time-s", type=float, default=None)
+    p.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=DEFAULT_GPU_MEMORY_UTILIZATION,
+    )
+    p.add_argument("--json", action="store_true")
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the roofline CLI subcommand."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="python -m vllm_torchtpu.roofline")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_solve = sub.add_parser("solve")
+    _add_scenario_args(p_solve)
 
     p_plan = sub.add_parser("plan")
     _add_common_args(p_plan)
@@ -101,6 +141,89 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_hf_config(src)
     geom = from_hf_config(cfg)
     chip = CHIPS[args.chip]
+
+    if args.cmd == "solve":
+        concs = (
+            tuple(int(x) for x in args.concurrency.split(",") if x.strip())
+            if args.concurrency
+            else None
+        )
+        if args.example_scenario is not None:
+            scen = build_example_scenario(
+                args.example_scenario,
+                isl=args.isl,
+                osl=args.osl,
+                concurrencies=concs,
+                prefix_hit_rate=args.prefix_hit_rate,
+                accept_len=args.accept_len,
+                think_time_s=args.think_time_s,
+                slo_tier=args.example_slo_tier,
+                ttft_slo_ms=args.ttft_slo_ms,
+                tpot_slo_ms=args.tpot_slo_ms,
+            )
+        else:
+            if (
+                args.isl is None
+                or args.osl is None
+                or args.prefix_hit_rate is None
+                or args.accept_len is None
+                or args.think_time_s is None
+            ):
+                parser.error(
+                    "Either --example-scenario or all of --isl, --osl, "
+                    "--prefix-hit-rate, --accept-len, and --think-time-s "
+                    "are required."
+                )
+            scen = TrafficScenario(
+                name="custom",
+                isl=args.isl,
+                osl=args.osl,
+                prefix_hit_rate=args.prefix_hit_rate,
+                accept_len=args.accept_len,
+                think_time_s=args.think_time_s,
+                concurrencies=concs if concs is not None else EXAMPLE_CONCURRENCIES,
+                kv_working_set_turns=1.0,
+                ttft_slo_ms=args.ttft_slo_ms,
+                tpot_slo_ms=args.tpot_slo_ms,
+            )
+        if args.max_chips is None and args.max_instances is None:
+            parser.error("Either --max-chips or --max-instances is required.")
+        dt_auto = dtypes_from_hf_config(cfg)
+        splan = solve_serving_plan(
+            geom,
+            dt_auto,
+            chip,
+            scen,
+            mode=args.mode,
+            max_chips=args.max_chips,
+            max_instances=args.max_instances,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
+        if args.json:
+            sys.stdout.write(json.dumps(asdict(splan)) + "\n")
+            return 0
+        for w in splan.warnings:
+            sys.stdout.write(f"WARNING: {w}\n")
+        sys.stdout.write(
+            f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<24}  "
+            f"{'p90_int_tok_s':>13}  {'tok_tput_chip':>13}  {'p90_ttft_ms':>11}  "
+            f"{'p90_tpot_ms':>11}\n"
+        )
+        for pt in splan.frontier:
+            if pt.prefill_pool is not None:
+                pools = (
+                    f"{pt.prefill_pool.instances}x{pt.prefill_pool.topology}P+"
+                    f"{pt.decode_pool.instances}x{pt.decode_pool.topology}D"
+                )
+            else:
+                pools = f"1x{pt.decode_pool.topology}(TP{pt.decode_pool.tp})"
+            sys.stdout.write(
+                f"{pt.mode:<7}  {pt.concurrency:>5}  {pt.total_chips:>5}  "
+                f"{pools:<24}  {pt.p90_interactivity_tok_s:>13.2f}  "
+                f"{pt.token_throughput_per_chip:>13.1f}  "
+                f"{pt.p90_ttft_ms:>11.1f}  {pt.p90_tpot_ms:>11.2f}\n"
+            )
+        return 0
 
     if args.ici_bw_gbps is not None:
         chip = replace(chip, ici_bw=args.ici_bw_gbps * 1e9)
