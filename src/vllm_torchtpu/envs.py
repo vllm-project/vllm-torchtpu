@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
     TPU_MOE_TP_DECODE_AG_PAIRS: int = 0
+    TPU_MOE_TP_DECODE_EXCHANGE_PIECES: int = 0
     TPU_MOE_TP_DECODE_PAD_ROWS: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1398,6 +1399,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # same. Needs mesh indices 2i and 2i + 1 on one chip (checked at arming).
     # Kernel names gain -pairs_<rows>.
     "TPU_MOE_TP_DECODE_AG_PAIRS": env_nonnegative_int("TPU_MOE_TP_DECODE_AG_PAIRS", 0),
+    # moe_tp_decode: the in-kernel all-reduce's trim and full paths that
+    # exchange at least this many rows (0: none) exchange each column chunk
+    # in lane-group pieces (3 at hidden 6144 over 16 ranks):
+    # piece c is summed and its all-gather starts as soon as piece c of the
+    # reduce-scatter has landed from every rank, while the later pieces still
+    # arrive, so the two rounds overlap. Each element gets the same f32 sum in
+    # rank order and lands in the same place, so the output bits are the same.
+    # The fold path stays serial. Works with TPU_MOE_TP_DECODE_AG_PAIRS.
+    # Kernel names gain -pieces_<rows>. Default off.
+    "TPU_MOE_TP_DECODE_EXCHANGE_PIECES": env_nonnegative_int(
+        "TPU_MOE_TP_DECODE_EXCHANGE_PIECES", 0
+    ),
     # moe_tp_decode: a call whose token count lies between two of the kernel's
     # row counts (16, 32, 64), e.g. a 48-token decode bucket from
     # TPU_TOKEN_BUCKET_EXTRA, runs the kernel on the next row count with
