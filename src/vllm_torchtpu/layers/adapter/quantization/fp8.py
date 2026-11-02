@@ -836,7 +836,16 @@ class VllmFp8MoEConfig(VllmFp8Config):
             moe_config = self.get_moe_config(layer)
             return VllmFp8MoEMethodTPU(self, moe_config)
 
-        # All non-MoE layers (LinearBase, Attention) remain unquantized
+        # All dense linear layers remain unquantized. LinearBase requires a
+        # non-None quant method, so return the explicit unquantized method.
+        if isinstance(layer, LinearBase):
+            from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+                VllmUnquantizedLinearMethod,
+            )
+
+            return VllmUnquantizedLinearMethod()
+
+        # Attention and everything else: no quantization.
         return None
 
 
