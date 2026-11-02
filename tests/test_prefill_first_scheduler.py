@@ -785,3 +785,44 @@ def test_tpot_cap_holds_back_a_solo_step(shared_model_config, monkeypatch):
     # then the solo step.
     steps = [_step(scheduler, clock) for _ in range(3)]
     assert steps == [{"d": 1}, {"d": 1}, {"long": 100}]
+
+
+def test_tpot_pacing_run_survives_a_solo_step(shared_model_config, monkeypatch):
+    clock = _floor_clock(monkeypatch, step_s=_PACE_STEP_S)
+    monkeypatch.setattr(prefill_first_scheduler, "_RESUME_AFTER_TOKENS", 3)
+    scheduler, hasher = _build(
+        shared_model_config, monkeypatch, over_tokens=32, tpot_target_ms=31.25
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    _step(scheduler, clock)
+    held, run = [False] * 5, [True] * 5
+    assert _decodes(scheduler, clock, "d", 11) == [True] + held + run
+    # The run spent its last earned token; a solo step comes in between, and
+    # the half token earned since resumes nothing, the next one does.
+    _add(scheduler, hasher, ("long", 100, 2))
+    assert _step(scheduler, clock) == {"long": 100}
+    assert _step(scheduler, clock) == {"d": 1, "long": 1}
+
+
+def test_tpot_cap_schedules_a_decode_that_pacing_holds(
+    shared_model_config, monkeypatch
+):
+    clock = _floor_clock(monkeypatch, step_s=_PACE_STEP_S)
+    # Pacing earns 1/32 token per step, the cap owes half a token per step.
+    scheduler, hasher = _build(
+        shared_model_config,
+        monkeypatch,
+        tpot_target_ms=500,
+        tpot_cap_ms=31.25,
+        max_num_batched_tokens=32,
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    _step(scheduler, clock)
+    _add(scheduler, hasher, ("long", 600, 2))
+    # While `long` prefills: no step is empty, as the decode the cap claims
+    # goes out despite pacing, once per two steps after the first, and the
+    # prefill takes the other steps.
+    steps = [_step(scheduler, clock) for _ in range(34)]
+    assert all(steps)
+    expected = [True, False, False, False] + [True, False] * 15
+    assert ["d" in s for s in steps] == expected

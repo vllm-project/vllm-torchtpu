@@ -84,10 +84,12 @@ pacing with the same accounting: each running request owes one decode token per
 ``max(C, Q * n)`` milliseconds from its first decode step on, each token it
 schedules pays one, and while any request owes a whole token a step prefills
 nothing (no prefill chunk, no admission from the waiting queue, no solo step)
-and only decodes, so each request's TPOT stays at or below about the cap. Under
-a closed-loop client the requests then finish spread out like their first
-tokens, as with pacing, and TPOT settles below the cap at the cost of prefill
-time.
+and only decodes, so each request's TPOT stays at or below about the cap. A
+request that owes a token is scheduled even if pacing, the decode interval or
+the floor would hold it. Requests resuming from the KV-holding queue (streaming
+input, remote KV) are not held back. Under a closed-loop client the requests
+then finish spread out like their first tokens, as with pacing, and TPOT
+settles below the cap at the cost of prefill time.
 
 Prefill-aware DP load balancing (``VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS=U > 0``).
 vLLM's data-parallel front end sends each new request to the engine with the
@@ -137,7 +139,7 @@ _RESUME_AFTER_TOKENS = 16
 
 @dataclasses.dataclass
 class _Pace:
-    """TPOT-pacing state of one decoding request."""
+    """TPOT-pacing and TPOT-cap state of one decoding request."""
 
     # Decode tokens earned and not yet scheduled.
     earned: float = 1.0
@@ -149,7 +151,8 @@ class _Pace:
 
 class PrefillFirstScheduler(AsyncScheduler):
     """Solo whole-prompt prefill steps, decode pacing, a decode interval floor,
-    TPOT pacing and prefill-aware DP load-balancing counts (module docstring)."""
+    TPOT pacing, a TPOT cap and prefill-aware DP load-balancing counts (module
+    docstring)."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -430,6 +433,8 @@ class PrefillFirstScheduler(AsyncScheduler):
         paced = self._tpot_paced(decodes)
         hidden = paused + [r for r in paced if r not in paused]
         if capped:
+            # A decode that owes a token is scheduled whatever would hold it.
+            hidden = [r for r in hidden if self._pace[r.request_id].owed < 1]
             hidden += [r for r in self.running if r.is_prefill_chunk]
         budget = self.max_num_scheduled_tokens
         if self.solo_over_tokens:
@@ -474,9 +479,6 @@ class PrefillFirstScheduler(AsyncScheduler):
             else:
                 if pacing:
                     state.earned += elapsed / interval
-                    state.resumed = state.earned >= (
-                        1 if state.resumed else _RESUME_AFTER_TOKENS
-                    )
                 if capping:
                     state.owed += elapsed / cap
             pace[r.request_id] = state
@@ -485,10 +487,19 @@ class PrefillFirstScheduler(AsyncScheduler):
     def _tpot_paced(self, decodes: list[Request]) -> list[Request]:
         """The decodes that sit this regular step out for TPOT pacing: those
         without an earned token, and, after such a hold, those still short of
-        ``_RESUME_AFTER_TOKENS``."""
+        ``_RESUME_AFTER_TOKENS``. Only regular steps decide this, so a solo
+        step does not end a request's run of decodes."""
         if not (self.tpot_target or self.tpot_per_request):
             return []
-        return [r for r in decodes if not self._pace[r.request_id].resumed]
+        paced = []
+        for r in decodes:
+            state = self._pace[r.request_id]
+            state.resumed = state.earned >= (
+                1 if state.resumed else _RESUME_AFTER_TOKENS
+            )
+            if not state.resumed:
+                paced.append(r)
+        return paced
 
     def _behind_tpot_cap(self) -> bool:
         """Whether a running decode owes a whole token under the TPOT cap."""
