@@ -472,6 +472,12 @@ def sparse_mla_attention(
     def _local(nope, rope, q, kv_c, k_pe, topk, seq_lens, bt, qsl, dist, *rank_ids):
         rank = _rank(rank_ids, axis_name, dcp)
         nope, rope = write_kv(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank)
+        # Hand the cap switch below the caches in their own shapes. Otherwise
+        # XLA moves the writer's row view of the rope cache (32-word rows)
+        # into the switch, whose operand then takes the TensorCore tiled
+        # layout: a whole-cache relayout into the switch and one back out to
+        # the page gather, every layer.
+        nope, rope = lax.optimization_barrier((nope, rope))
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
         page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
         q_tok = q if q_own_rows else heads_to_tokens(layout, q, axis_name)
