@@ -206,6 +206,9 @@ from vllm_torchtpu.tracing.utils import (
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm.distributed.aux_output_connector.worker import (
+        AuxOutputWorkerConnector,
+    )
     from vllm.model_executor.models.interfaces import SupportsPP
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
@@ -652,6 +655,12 @@ class TPUModelRunner(GPUModelRunner):
     # Default for a runner built without __init__.
     _pp_wave: PPWave | PPRing | None = None
     _dp_step_other_decode: bool = False
+    # Routed-experts capture (router replay for RL trainers); bound in
+    # initialize_kv_cache when aux_output_config.enabled. Class defaults so a
+    # runner built without __init__ runs a step without it.
+    aux_output_connector: "AuxOutputWorkerConnector | None" = None
+    _aux_routing_staging: torch.Tensor | None = None
+    _aux_step_num_rows: int = 0
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -893,6 +902,10 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_other_decode = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
+
+        self.aux_output_connector: AuxOutputWorkerConnector | None = None
+        self._aux_routing_staging: torch.Tensor | None = None
+        self._aux_step_num_rows = 0
 
         # XLA graph tracker (TPU-specific debug aid).
         self.enforce_eager = self.model_config.enforce_eager
@@ -1801,13 +1814,86 @@ class TPUModelRunner(GPUModelRunner):
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
             if self.vllm_config.aux_output_config.enabled:
-                from vllm.distributed.aux_output_connector.worker import (
-                    get_aux_output_connector,
-                )
+                self._initialize_aux_output_connector(kv_cache_config)
 
-                self.aux_output_connector = get_aux_output_connector(
-                    self.model, self.vllm_config, kv_cache_config
-                )
+    def _initialize_aux_output_connector(self, kv_cache_config: KVCacheConfig) -> None:
+        """Bind the routed-experts capturer to this runner's MoE routers.
+
+        Capture happens in `moe_routing.route`, so every configuration that
+        routes somewhere else (fused kernels that select top-k internally) is
+        refused up front rather than silently publishing all-zero expert ids.
+        """
+        from vllm.distributed.aux_output_connector.worker import (
+            get_aux_output_connector,
+        )
+
+        fused_routing_flags = [
+            name
+            for name, enabled in (
+                ("USE_MOE_FUSED_EP_KERNEL", envs.USE_MOE_FUSED_EP_KERNEL),
+                ("FUSED_MOE_DECODE_KERNEL", envs.FUSED_MOE_DECODE_KERNEL),
+                ("USE_MOE_TP_DECODE_KERNEL", envs.USE_MOE_TP_DECODE_KERNEL),
+            )
+            if enabled
+        ]
+        if fused_routing_flags:
+            raise NotImplementedError(
+                "Routed-experts capture (aux_output_config) routes through "
+                "moe_routing.route, which the fused MoE kernels bypass; unset "
+                f"{', '.join(fused_routing_flags)} to use it."
+            )
+        if self.speculative_config is not None:
+            # The async output path reports num_rejected=0; rejected draft
+            # rows would be committed as accepted routing.
+            raise NotImplementedError(
+                "Routed-experts capture (aux_output_config) is not supported "
+                "with speculative decoding on TPU."
+            )
+        if self._pcp_enabled:
+            # PARTIAL sequence layouts hold only this rank's shard of each
+            # request's tokens; the step-wide row rebuild assumes ALL.
+            raise NotImplementedError(
+                "Routed-experts capture (aux_output_config) is not supported "
+                "with prefill context parallelism on TPU."
+            )
+
+        self.aux_output_connector = get_aux_output_connector(
+            self.model, self.vllm_config, kv_cache_config
+        )
+        device_buffer = self.aux_output_connector._capturer.device_buffer
+        self._aux_routing_staging = torch.empty_like(device_buffer)
+
+    def _aux_stage_chunk_routing(self, row_offset: int, num_tokens: int) -> None:
+        """Preserve one execution chunk's captured routing across the step.
+
+        The upstream capturer writes every forward's rows from row 0 of its
+        device buffer, which is correct for the GPU runner's single forward
+        per step. This runner may run several forwards per step: the request
+        chunks of `_prepare_inputs` and, under EP-DP lockstep, dummy chunks
+        that pair an idle rank's collectives. Each later forward would clobber
+        the rows of the one before it, so copy each real chunk's rows to
+        their step-wide offset and restore the whole step before the snapshot
+        in `prepare_output` (`_aux_restore_step_routing`).
+        """
+        if self.aux_output_connector is None or num_tokens == 0:
+            return
+        assert self._aux_routing_staging is not None
+        device_buffer = self.aux_output_connector._capturer.device_buffer
+        self._aux_routing_staging[row_offset : row_offset + num_tokens].copy_(
+            device_buffer[:num_tokens]
+        )
+        self._aux_step_num_rows = row_offset + num_tokens
+
+    def _aux_restore_step_routing(self) -> None:
+        """Put the step's staged routing rows back for the snapshot."""
+        aux_output_connector = getattr(self, "aux_output_connector", None)
+        if aux_output_connector is None or self._aux_step_num_rows == 0:
+            return
+        assert self._aux_routing_staging is not None
+        num_rows = self._aux_step_num_rows
+        aux_output_connector._capturer.device_buffer[:num_rows].copy_(
+            self._aux_routing_staging[:num_rows]
+        )
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -3903,10 +3989,12 @@ class TPUModelRunner(GPUModelRunner):
             )
         # Update cached state
         self._update_states(scheduler_output)
-        if getattr(self, "aux_output_connector", None) is not None:
-            self.aux_output_connector.begin_step(
+        aux_output_connector = getattr(self, "aux_output_connector", None)
+        if aux_output_connector is not None:
+            aux_output_connector.begin_step(
                 scheduler_output.aux_output_connector_metadata
             )
+            self._aux_step_num_rows = 0
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
@@ -4219,6 +4307,15 @@ class TPUModelRunner(GPUModelRunner):
                     intermediate_tensors=intermediate_tensors,
                 )
 
+            if getattr(self, "aux_output_connector", None) is not None:
+                # Rows [0, chunk tokens) of the capturer buffer belong to
+                # requests [start_index, end_index); their step-wide offset is
+                # the token count of the chunks before this one.
+                self._aux_stage_chunk_routing(
+                    row_offset=self._aux_step_num_rows,
+                    num_tokens=int(self.query_start_loc_np[num_reqs]),
+                )
+
             if nan_check is not None:
                 assert isinstance(hidden_states, (torch.Tensor, IntermediateTensors)), (
                     "KV store NaN checking requires forward hidden states or "
@@ -4341,6 +4438,11 @@ class TPUModelRunner(GPUModelRunner):
 
             start_index = end_index
             chunk_index += 1
+
+        # Every forward of this step (real and dummy) has run; the capturer
+        # buffer now holds the last one. Put the whole step back.
+        if getattr(self, "aux_output_connector", None) is not None:
+            self._aux_restore_step_routing()
 
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
@@ -5466,27 +5568,37 @@ class TPUModelRunner(GPUModelRunner):
                     pooler_output.extend(out)
 
         pending_aux_output = None
-        if getattr(self, "aux_output_connector", None) is not None:
+        aux_output_connector = getattr(self, "aux_output_connector", None)
+        if aux_output_connector is not None:
             # self.query_start_loc_np is rebuilt per execution chunk in
             # _prepare_inputs and only reflects the last chunk, so rebuild the
             # step-wide boundaries from the scheduler output (mirrors the GPU
-            # model runner's query_start_loc_np).
+            # model runner's query_start_loc_np). The rows were restored to
+            # the same step-wide layout by _aux_restore_step_routing.
             sched_lens = np.array(
                 [scheduler_output.num_scheduled_tokens[r] for r in req_ids],
                 dtype=np.int32,
             )
-            self.input_batch.query_start_loc_np = np.concatenate(
+            query_start_loc_np = np.concatenate(
                 [np.zeros(1, dtype=np.int32), np.cumsum(sched_lens, dtype=np.int32)]
             )
-            self.input_batch.num_computed_tokens_np = np.array(
-                [
-                    getattr(self.requests.get(r), "num_computed_tokens", 0)
-                    for r in req_ids
-                ],
+            assert int(query_start_loc_np[-1]) == self._aux_step_num_rows, (
+                "routed-experts capture staged "
+                f"{self._aux_step_num_rows} rows for a step of "
+                f"{int(query_start_loc_np[-1])} scheduled tokens"
+            )
+            # pyrefly: ignore[missing-attribute]
+            self.input_batch.query_start_loc_np = query_start_loc_np
+            # Pre-step computed tokens: _update_states applied the
+            # scheduler's view and nothing advances it before sampling.
+            num_computed_tokens_np = np.array(
+                [self.requests[r].num_computed_tokens for r in req_ids],
                 dtype=np.int32,
             )
-            pending_aux_output = self.aux_output_connector.prepare_output(
-                self.input_batch
+            # pyrefly: ignore[missing-attribute]
+            self.input_batch.num_computed_tokens_np = num_computed_tokens_np
+            pending_aux_output = aux_output_connector.prepare_output(
+                self.input_batch  # pyrefly: ignore[bad-argument-type]
             )
 
         with self._stage_timing.host_stage("output_assembly"):

@@ -150,3 +150,25 @@ def test_fused_output_is_reduced_under_torch_compile(fused_ep_kernel, armed, exp
         torch._dynamo.reset()
         compiled = torch.compile(reduce_unless_reduced, backend="eager", fullgraph=True)
         torch.testing.assert_close(compiled(x), x if expected else x * 2)
+
+
+def test_runner_is_a_routed_experts_capture_source():
+    """bind_routed_experts_capturer binds through the protocol, so the runner
+    must satisfy it and forward the callback to the layer route() reads."""
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        RoutedExpertsCaptureSource,
+    )
+
+    runner = _runner(_QuantMethod(is_monolithic=True))
+    runner.routed_experts.capture_fn = None
+    runner.layer_name = "model.layers.7.mlp.experts"
+    assert isinstance(runner, RoutedExpertsCaptureSource)
+    assert runner.layer_id == 7
+    assert runner.capture_fn is None
+
+    def capture(topk_ids):
+        pass
+
+    runner.capture_fn = capture
+    assert runner.routed_experts.capture_fn is capture
+    assert runner.capture_fn is capture

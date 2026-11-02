@@ -239,3 +239,80 @@ def test_get_output_attaches_spec_logprobs():
         1,
     ]
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
+
+
+class _PendingAuxOutput:
+    """Stands in for vLLM's PendingAuxOutput: records the per-request counts
+    the runner output hands it and what process_output returned."""
+
+    def __init__(self):
+        self.num_sampled = None
+        self.num_rejected = None
+        self.processed = 0
+
+    def enqueue_cpu_copy(self, num_sampled, num_rejected):
+        self.num_sampled = num_sampled
+        self.num_rejected = num_rejected
+
+    def process_output(self):
+        self.processed += 1
+        return {"aux": self.processed}
+
+
+def _three_request_output():
+    return ModelRunnerOutput(
+        req_ids=["a", "b", "c"],
+        req_id_to_index={"a": 0, "b": 1, "c": 2},
+        sampled_token_ids=[],
+        logprobs=None,
+    )
+
+
+def test_get_output_consumes_pending_aux_output_with_sampled_counts():
+    pending = _PendingAuxOutput()
+    copy_state = AsyncTPUCopyState(
+        chunks_cpu=[torch.tensor(_VERIFY_NEXT_TOKENS, dtype=torch.int32)],
+        chunk_real_lens=[3],
+        copy_ready_event=None,
+        completed=True,
+    )
+    async_output = AsyncTPUModelRunnerOutput(
+        model_runner_output=_three_request_output(),
+        copy_state=copy_state,
+        discard_sampled_tokens_req_indices=[1],
+        pending_aux_output=pending,
+    )
+    out = async_output.get_output()
+    assert out.sampled_token_ids == [[11, 12], [], [31]]
+    # Counts follow the discarded request's cleared tokens; nothing rejected
+    # because spec decode is refused with capture on TPU.
+    assert pending.num_sampled.tolist() == [2, 0, 1]
+    assert pending.num_rejected.tolist() == [0, 0, 0]
+    assert out.aux_output_connector_output == {"aux": 1}
+    # Consumed exactly once; a second get_output does not re-process.
+    assert async_output.pending_aux_output is None
+
+
+def test_get_output_consumes_pending_aux_output_without_sampled_tokens():
+    """The connector consumes step outputs in order, so the no-sample path
+    (prefill-only steps) must still process its pending output."""
+    pending = _PendingAuxOutput()
+    out = AsyncTPUModelRunnerOutput(
+        model_runner_output=_three_request_output(),
+        copy_state=None,
+        discard_sampled_tokens_req_indices=[],
+        pending_aux_output=pending,
+    ).get_output()
+    assert out.sampled_token_ids == []
+    assert pending.num_sampled.tolist() == [0, 0, 0]
+    assert pending.processed == 1
+    assert out.aux_output_connector_output == {"aux": 1}
+
+
+def test_get_output_without_pending_aux_output_leaves_connector_output_unset():
+    out = AsyncTPUModelRunnerOutput(
+        model_runner_output=_three_request_output(),
+        copy_state=None,
+        discard_sampled_tokens_req_indices=[],
+    ).get_output()
+    assert out.aux_output_connector_output is None
