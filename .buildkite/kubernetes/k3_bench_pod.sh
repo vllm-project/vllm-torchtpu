@@ -22,6 +22,8 @@
 #   K3_BENCH_LIBTPU    flags appended to LIBTPU_INIT_ARGS (optional)
 #   K3_BENCH_FRESH     1: compile every command afresh (no compilation caches)
 #   K3_BENCH_TRACE_ALL 1: every rank writes its --trace (not only rank 0)
+#   K3_BENCH_LLO       1: rank 0 dumps the compiled LLO of every op into
+#                      @OUT@/llo-cmd<k> (implies a fresh compile)
 #
 # Pod 0 copies the results and rank-0 logs into ARTIFACTS_DIR; every pod adds
 # its trace and dump directories and uploads them.
@@ -77,7 +79,7 @@ while IFS= read -r line; do
   # Identical on every pod: the pod set's handshake key.
   TP32_SESSION="$(printf '%s-%d' "$session" "$k" | cksum | cut -d' ' -f1)"
   export TP32_SESSION
-  if [ "${K3_BENCH_FRESH:-0}" = 1 ]; then
+  if [ "${K3_BENCH_FRESH:-0}" = 1 ] || [ "${K3_BENCH_LLO:-0}" = 1 ]; then
     fresh="/dev/shm/fresh-cmd$k"; mkdir -p "$fresh"
     export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="$fresh" TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT="$fresh"
     export TORCH_TPU_TIER2_COMPILATION_CACHE="fresh-cmd$k" TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="fresh-cmd$k"
@@ -86,14 +88,25 @@ while IFS= read -r line; do
   if [ -n "${K3_BENCH_LIBTPU:-}" ]; then
     export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }$K3_BENCH_LIBTPU"
   fi
+  llo_env=""
+  if [ "${K3_BENCH_LLO:-0}" = 1 ]; then
+    mkdir -p "$OUT/llo-cmd$k"
+    llo_env="--xla_jf_dump_to=$OUT/llo-cmd$k --xla_jf_dump_llo_text=true --xla_jf_dump_llo_pass_label_regex=(vliw-packed-bundles|final_bundles) --xla_jf_dump_llo_static_gaps=true --xla_mosaic_enable_llo_source_annotations=true"
+  fi
+  saved_libtpu="${LIBTPU_INIT_ARGS-}"
   pids=()
   for l in 0 1 2 3 4 5 6 7; do
     r=$((NODE * 8 + l))
+    # Rank 0 alone carries the dump flags.
+    if [ -n "$llo_env" ] && [ "$r" = 0 ]; then
+      export LIBTPU_INIT_ARGS="${saved_libtpu:+$saved_libtpu }$llo_env"
+    fi
     # shellcheck disable=SC2086  # the command line is split into arguments
     SLURM_PROCID=$r SLURM_LOCALID=$l SLURM_NODEID=$NODE \
       python3 -m tools.megakernel --presharded "$PRESHARDED" --json "$OUT/results-cmd$k.jsonl" $line \
       > "$OUT/cmd$k-node$NODE-rank$(printf '%02d' "$r").log" 2>&1 &
     pids+=($!)
+    if [ -n "$saved_libtpu" ]; then export LIBTPU_INIT_ARGS="$saved_libtpu"; else unset LIBTPU_INIT_ARGS; fi
   done
   rc=0
   for p in "${pids[@]}"; do wait "$p" || rc=1; done

@@ -273,6 +273,7 @@ steps:
   #   K3_BENCH_LIBTPU    flags appended to LIBTPU_INIT_ARGS (optional)
   #   K3_BENCH_FRESH     1: compile every command afresh (optional)
   #   K3_BENCH_TRACE_ALL 1: every rank writes its --trace (optional)
+  #   K3_BENCH_LLO       1: rank 0 dumps every op's LLO (optional)
   # Results (results-cmd*.jsonl, saved tokens, rank-0 logs) are the artifacts.
   # -----------------------------------------------------------------
   - label: ":tpu: Bench: Kimi-K3 megakernel kernels (TPU v7x 2x2x4)"
