@@ -25,6 +25,13 @@ Numerics are the two production kernels': the partial is fp8_skinny's expression
 the f32 sum runs over the same slots in the same (rank) order as the two-shot kernel,
 so the output is bitwise the two-call path's. Every row moves (the two-shot full path).
 
+One-row build (`one_row`, TPU_FUSED_OPROJ_AR_ONE_ROW): the kernel also takes the step's
+valid-row count. With one valid row (a batch-1 decode step) it skips RS and AG: after
+the last tile it folds row 0 into one row tile (16 x n / 16), pushes that to slot `me`
+of every peer and sums the 16 slots itself -- one round instead of two. Each element is
+the same f32 sum in rank order, so row 0 is bitwise the two-shot's; rows >= 1 (padding)
+come out +0. Other counts run the two-shot unchanged.
+
 Safety, as `small_collectives.common.barrier`: a rank writes into a peer only after the
 barrier of this call, which the peer signals at entry, i.e. after it finished the
 previous call; a peer's out[:, chunk me] is overwritten by my all-gather only after I
@@ -41,6 +48,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 MESH = pl.DeviceIdType.MESH
+# The one-row path folds a row into this many rows (the bf16 sublane tiling).
+ROW_TILE = 16
 # The barrier group of the small all-reduce this kernel replaces
 # (small_collectives.all_reduce.COLLECTIVE_ID).
 COLLECTIVE_ID = 5
@@ -62,6 +71,12 @@ def supports(m: int, k: int, n: int, num_cores: int) -> bool:
     )
 
 
+def one_row_supported(n: int) -> bool:
+    """Whether one output row of n columns folds into ROW_TILE rows of whole lane
+    groups (the one-row build)."""
+    return n % (ROW_TILE * LANES) == 0
+
+
 def owner_waves(num_cores: int, n: int, tile: int) -> list[list[int]]:
     """The owner chunks first complete after each tile (owner j after the tile
     holding its last column)."""
@@ -72,27 +87,48 @@ def owner_waves(num_cores: int, n: int, tile: int) -> list[list[int]]:
     return waves
 
 
+def _one_row_exchange(o_ref, one, me, rs_send, rs_recv, *, n, axis):
+    """All-reduce row 0 of o_ref in one round (module docstring): fold it into
+    one[me], push that to every peer's slot `me`, sum the n slots in rank order."""
+    m, n_out = o_ref.shape
+    w = n_out // ROW_TILE
+    row0 = o_ref[pl.ds(0, 1), :].astype(jnp.float32)
+    rows = jax.lax.broadcasted_iota(jnp.int32, (ROW_TILE, w), 0)
+    q1 = jnp.zeros((ROW_TILE, w), jnp.float32)
+    for j in range(ROW_TILE):
+        part = jnp.broadcast_to(row0[:, j * w : (j + 1) * w], (ROW_TILE, w))
+        q1 = jnp.where(rows == j, part, q1)
+    one.at[me][...] = q1.astype(one.dtype)
+    for j in range(n):
+
+        @pl.when(jnp.int32(j) != me)
+        def _(j=j):
+            pltpu.make_async_remote_copy(
+                src_ref=one.at[me],
+                dst_ref=one.at[me],
+                send_sem=rs_send,
+                recv_sem=rs_recv,
+                device_id={axis: jnp.int32(j)},
+                device_id_type=MESH,
+            ).start()
+
+    peers = one.at[pl.ds(0, n - 1)]  # the byte count of n - 1 slots
+    pltpu.make_async_copy(peers, peers, rs_recv).wait()
+    acc = one[0].astype(jnp.float32)
+    for r in range(1, n):
+        acc = acc + one[r].astype(jnp.float32)
+    total = acc.astype(o_ref.dtype).astype(jnp.float32)
+    first = jax.lax.broadcasted_iota(jnp.int32, (m, w), 0) == 0
+    for j in range(ROW_TILE):
+        part = jnp.broadcast_to(total[j : j + 1, :], (m, w))
+        o_ref[:, pl.ds(j * w, w)] = jnp.where(first, part, 0.0).astype(o_ref.dtype)
+    pltpu.make_async_copy(peers, peers, rs_send).wait()
+
+
 def _kernel(
     idx_ref,
     rank_ref,
-    x_ref,
-    ws_hbm,
-    w_hbm,
-    o_ref,
-    xq_ref,
-    xs_ref,
-    wbuf,
-    wsem,
-    ws_vmem,
-    ws_sem,
-    recv,
-    red,
-    rs_send,
-    rs_recv,
-    ag_send,
-    ag_recv,
-    loc,
-    *,
+    *refs,
     n,
     axis,
     t,
@@ -100,11 +136,35 @@ def _kernel(
     nbuf,
     q_dtype,
     waves,
+    one_row,
 ):
+    nv_ref, *refs = refs if one_row else (None, *refs)
+    (
+        x_ref,
+        ws_hbm,
+        w_hbm,
+        o_ref,
+        xq_ref,
+        xs_ref,
+        wbuf,
+        wsem,
+        ws_vmem,
+        ws_sem,
+        recv,
+        red,
+        rs_send,
+        rs_recv,
+        ag_send,
+        ag_recv,
+        loc,
+        *one,
+    ) = refs
     s = idx_ref[0]
     me = rank_ref[0]
     own = o_ref.shape[1] // n
     bsem = pltpu.get_barrier_semaphore()
+    # The one-row path's step: one valid row (data, the same on every rank).
+    single = None if nv_ref is None else nv_ref[0] == 1
 
     ws_copy = pltpu.make_async_copy(ws_hbm, ws_vmem, ws_sem)
     ws_copy.start()
@@ -137,8 +197,12 @@ def _kernel(
     def chunk(j):
         return o_ref.at[:, pl.ds(j * own, own)]
 
+    def two_shot(cond):
+        """cond, and not the one-row path's step."""
+        return jnp.logical_and(jnp.logical_not(single), cond) if one_row else cond
+
     def push_owner(j):
-        @pl.when(jnp.int32(j) != me)
+        @pl.when(two_shot(jnp.int32(j) != me))
         def _():
             pltpu.make_async_remote_copy(
                 src_ref=chunk(j),
@@ -149,7 +213,7 @@ def _kernel(
                 device_id_type=MESH,
             ).start()
 
-        @pl.when(jnp.int32(j) == me)
+        @pl.when(two_shot(jnp.int32(j) == me))
         def _():
             pltpu.make_async_copy(chunk(j), recv.at[j], loc.at[0]).start()
 
@@ -176,6 +240,29 @@ def _kernel(
         for o in range(n):
             push_owner(o)
 
+    tail = functools.partial(
+        _two_shot_tail,
+        o_ref,
+        recv,
+        red,
+        (rs_send, rs_recv, ag_send, ag_recv, loc),
+        me,
+        n=n,
+        axis=axis,
+    )
+    if not one_row:
+        tail()
+        return
+    pl.when(single)(
+        lambda: _one_row_exchange(o_ref, one[0], me, rs_send, rs_recv, n=n, axis=axis)
+    )
+    pl.when(jnp.logical_not(single))(tail)
+
+
+def _two_shot_tail(o_ref, recv, red, sems, me, *, n, axis):
+    """Wait the reduce-scatter's chunks, sum them, all-gather the sum."""
+    rs_send, rs_recv, ag_send, ag_recv, loc = sems
+    own = o_ref.shape[1] // n
     slots = recv.at[pl.ds(0, n - 1)]  # the byte count of 15 chunks
     pltpu.make_async_copy(recv.at[0], recv.at[0], loc.at[0]).wait()
     pltpu.make_async_copy(slots, slots, rs_recv).wait()
@@ -207,7 +294,7 @@ def _kernel(
 
 
 @functools.cache
-def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
+def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves, one_row):
     t, nbuf = TUNED[(k, n_out)]
     n_tiles = n_out // t
     nbuf = max(1, min(nbuf, n_tiles))
@@ -227,6 +314,9 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
         pltpu.SemaphoreType.DMA,  # all-gather receive
         pltpu.SemaphoreType.DMA((2,)),  # local copies
     ]
+    if one_row:
+        # The one-row path's slots, by sender rank: row 0 folded into ROW_TILE rows.
+        scratch.append(pltpu.VMEM((num_cores, ROW_TILE, n_out // ROW_TILE), x_dtype))
     kern = functools.partial(
         _kernel,
         n=num_cores,
@@ -236,10 +326,11 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
         nbuf=nbuf,
         q_dtype=w_dtype,
         waves=waves,
+        one_row=one_row,
     )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=2,
+        num_scalar_prefetch=3 if one_row else 2,
         in_specs=[
             vmem,
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -253,16 +344,18 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
         out_shape=jax.ShapeDtypeStruct((m, n_out), x_dtype),
         grid_spec=grid_spec,
         compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
-        name=f"fp8_oproj_all_reduce{'_w' if waves else ''}_m{m}_k{k}_n{n_out}",
+        name=(
+            f"fp8_oproj_all_reduce{'_w' if waves else ''}{'_1r' if one_row else ''}"
+            f"_m{m}_k{k}_n{n_out}"
+        ),
     )
 
 
 @functools.partial(jax.jit, static_argnums=(0,))
-def _call_constrained(call, idx, rank, x, w_s2, w_stack):
+def _call_constrained(call, scalars, x, w_s2, w_stack):
     # Scale and weight constrained to HBM, as fp8_skinny's scale_dma + hbm_pin.
     return call(
-        idx,
-        rank,
+        *scalars,
         x,
         pltpu.with_memory_space_constraint(w_s2, pltpu.HBM),
         pltpu.with_memory_space_constraint(w_stack, pltpu.HBM),
@@ -270,13 +363,15 @@ def _call_constrained(call, idx, rank, x, w_s2, w_stack):
 
 
 def fp8_matmul_all_reduce_stacked(
-    x, w_stack, idx, w_s, rank, *, num_cores, axis, waves=False
+    x, w_stack, idx, w_s, rank, *, num_cores, axis, waves=False, n_valid=None
 ):
     """sum over the num_cores ranks of mesh axis `axis` of
     fp8_skinny(x, w_stack[idx[0]], w_s), inside a shard_map over that axis.
 
     x bf16 [m <= 16, k]; w_stack fp8_e4m3fn [L, k, n] (K-major); idx, rank int32 [1]
     (rank = this core's index on the axis, as data); w_s f32 [n] -> bf16 [m, n].
+    n_valid int32 [1] (the same on every rank) builds the one-row kernel: rows
+    >= n_valid are padding, and with n_valid == 1 they come out +0.
     """
     m, k = x.shape
     n_stack, _, n_out = w_stack.shape
@@ -284,14 +379,22 @@ def fp8_matmul_all_reduce_stacked(
         raise ValueError(
             f"[{m}, {k}] x [{k}, {n_out}] over {num_cores} ranks: unsupported"
         )
-    call = _build(m, k, n_out, n_stack, w_stack.dtype, x.dtype, num_cores, axis, waves)
-    w_s2 = w_s.reshape(1, n_out).astype(jnp.float32)
-    return _call_constrained(
-        call, idx.astype(jnp.int32), rank.astype(jnp.int32), x, w_s2, w_stack
+    one_row = n_valid is not None
+    if one_row and not one_row_supported(n_out):
+        raise ValueError(f"the one-row build needs n = {n_out} to fill {ROW_TILE} rows")
+    call = _build(
+        m, k, n_out, n_stack, w_stack.dtype, x.dtype, num_cores, axis, waves, one_row
     )
+    w_s2 = w_s.reshape(1, n_out).astype(jnp.float32)
+    scalars = (idx.astype(jnp.int32), rank.astype(jnp.int32))
+    if one_row:
+        scalars += (n_valid.astype(jnp.int32),)
+    return _call_constrained(call, scalars, x, w_s2, w_stack)
 
 
-def fp8_matmul_all_reduce(x, w_q, w_s, rank, *, num_cores, axis, waves=False):
+def fp8_matmul_all_reduce(
+    x, w_q, w_s, rank, *, num_cores, axis, waves=False, n_valid=None
+):
     """`fp8_matmul_all_reduce_stacked` on one [k, n] weight."""
     return fp8_matmul_all_reduce_stacked(
         x,
@@ -302,4 +405,5 @@ def fp8_matmul_all_reduce(x, w_q, w_s, rank, *, num_cores, axis, waves=False):
         num_cores=num_cores,
         axis=axis,
         waves=waves,
+        n_valid=n_valid,
     )

@@ -294,6 +294,7 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_VALID_ROWS: bool = False
     TPU_FUSED_OPROJ_AR: bool = True
     TPU_FUSED_OPROJ_AR_WAVES: bool = True
+    TPU_FUSED_OPROJ_AR_ONE_ROW: bool = False
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = "self_attn.o_proj,q_b_proj"
     TPU_LM_HEAD_HBM: str = "drafter"
@@ -2036,6 +2037,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of all after the last tile. 0.3-0.7 us/call faster on 2x2x2 tpu7x
     # (t5-oproj-ar probe 02b); 0 keeps every push after the last tile.
     "TPU_FUSED_OPROJ_AR_WAVES": env_bool("TPU_FUSED_OPROJ_AR_WAVES", True),
+    # With TPU_FUSED_OPROJ_AR and the token-padding mask (TPU_MOE_SKIP_PADDED_
+    # TOKENS): the fused o_proj kernel takes the step's valid-row count, and a
+    # step with one valid row (batch-1 decode) exchanges that row in one round
+    # -- pushed, folded into one row tile, to every peer, which sums the copies
+    # in rank order -- instead of the reduce-scatter + all-gather. The row is
+    # bit-identical; padding rows come out +0.
+    "TPU_FUSED_OPROJ_AR_ONE_ROW": env_bool("TPU_FUSED_OPROJ_AR_ONE_ROW"),
     # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
     # M <= 16 through the weight-streaming Pallas kernel
     # (kernels/quantized_matmul/fp8_skinny.py), XLA otherwise. Outputs differ from
