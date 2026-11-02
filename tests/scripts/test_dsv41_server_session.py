@@ -6,6 +6,8 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +45,127 @@ def test_decode_prefix_hit_rejects_invalid_alignment():
 
     with pytest.raises(ValueError, match="alignment must be positive"):
         expected_prefix_hit(98304, 0, 0)
+
+
+def test_decode_admission_waits_for_all_current_requests(tmp_path, monkeypatch):
+    import bench_decode as client
+
+    scenario = replace(
+        client.SCENARIOS["decode_dp16"],
+        prefix_tokens=16,
+        dp_size=2,
+        concurrency=4,
+    )
+    monkeypatch.setitem(client.SCENARIOS, "decode_dp16", scenario)
+    inputs = tmp_path / "inputs.json"
+    inputs.write_text(
+        json.dumps(
+            {
+                "prompts": [[i] * 17 for i in range(4)],
+                "prime_suffix": [[99, 100]] * 4,
+                "manifest": {},
+            }
+        )
+    )
+    log = tmp_path / "server.log"
+    log.write_text("Added request cmpl-old-0-01234567.\n" * 4)
+    arrived, resume = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    requests = []
+    acknowledged = set()
+    polls = 0
+
+    def response(value):
+        return SimpleNamespace(
+            content=b"json", json=lambda: value, raise_for_status=lambda: None
+        )
+
+    def post(url, json, **kwargs):
+        if url.endswith("/v1/completions"):
+            with lock:
+                requests.append((json, kwargs["headers"]))
+                if len(requests) == 4:
+                    arrived.set()
+            assert resume.wait(5)
+            return response({"usage": {"prompt_tokens": 16, "completion_tokens": 512}})
+        if url.endswith("/resume"):
+            # HTTP threads starting is not enough: all post-send log records
+            # must have been observed before any request is allowed to execute.
+            assert len(acknowledged) == 4
+            resume.set()
+        return response({})
+
+    def sleep(_):
+        nonlocal polls
+        assert arrived.wait(5)
+        polls += 1
+        with log.open("a") as stream:
+            for payload, _ in requests[: 2 if polls == 1 else 4]:
+                request_id = payload["request_id"]
+                acknowledged.add(request_id)
+                # Duplicate acknowledgements must not satisfy missing IDs.
+                stream.write(f"Added request cmpl-{request_id}-0-01234567.\n" * 2)
+
+    monkeypatch.setattr(client.requests, "post", post)
+    monkeypatch.setattr(client.time, "sleep", sleep)
+    client.client_main(
+        [
+            "--scenario",
+            "decode_dp16",
+            "--input",
+            str(inputs),
+            "--out",
+            str(tmp_path / "profile"),
+            "--server-log",
+            str(log),
+            "--profile-only",
+        ]
+    )
+    assert polls == 2
+    assert len({payload["request_id"] for payload, _ in requests}) == 4
+    assert sorted(headers["X-data-parallel-rank"] for _, headers in requests) == [
+        "0",
+        "0",
+        "1",
+        "1",
+    ]
+
+
+def test_decode_admission_timeout_rejects_old_and_incomplete_logs(tmp_path):
+    from bench_decode import wait_for_admission
+
+    log = tmp_path / "server.log"
+    log.write_text("Added request cmpl-wave-1-0-01234567.\n")
+    offset = log.stat().st_size
+    with log.open("a") as stream:
+        stream.write("Received request cmpl-wave-1-0: params: ...\n")
+        stream.write("Added request cmpl-wave-0-0-01234567.\n" * 2)
+        stream.write("Added request cmpl-wave-1-0-01234567.")
+    with pytest.raises(TimeoutError, match="1/2 requests missing"):
+        wait_for_admission(
+            log, offset, {"cmpl-wave-0-0", "cmpl-wave-1-0"}, [], timeout=0
+        )
+    with log.open("a") as stream:
+        stream.write("\n")
+    wait_for_admission(log, offset, {"cmpl-wave-0-0", "cmpl-wave-1-0"}, [])
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_decode_admission_rejects_early_completion(tmp_path, failed):
+    from bench_decode import wait_for_admission
+
+    log = tmp_path / "server.log"
+    log.touch()
+    future = Future()
+    if failed:
+        future.set_exception(ValueError("request failed"))
+    else:
+        future.set_result({})
+    with pytest.raises(
+        ValueError if failed else RuntimeError,
+        match="request failed" if failed else "scheduler was paused",
+    ):
+        wait_for_admission(log, 0, {"cmpl-wave-0-0"}, [future])
 
 
 @pytest.mark.parametrize(
@@ -116,6 +239,9 @@ def test_ci_launch_and_optional_profile_share_one_server(
         assert env["USE_PHASED_PROFILER"] == "0"
         assert env["TP"] == "1"
         assert env["DP"] == ("16" if scenario == "decode_dp16" else "8")
+        if scenario in ("decode", "decode_dp16"):
+            assert "--enable-log-requests" in command
+            assert command[command.index("--max-log-len") + 1] == "0"
         if scenario == "decode_dp16":
             assert env["HEADLESS"] == "0"
             assert env["HOST"] == "127.0.0.1"

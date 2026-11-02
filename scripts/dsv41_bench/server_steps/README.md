@@ -375,6 +375,7 @@ export PYTHONPATH="$PWD/scripts/dsv41_bench/server_steps${PYTHONPATH:+:$PYTHONPA
 TP=1 DP=8 CHUNK=2048 MAX_SEQS=48 MAX_MODEL_LEN=98816 KV_BYTES=auto \
   bash scripts/dsv41_bench/serve_cached_prefill.sh \
   --worker-extension-cls server_step_worker.ServerStepWorker \
+  --enable-log-requests --max-log-len 0 \
   --compilation-config '{"compile_sizes":[288,2048]}' \
   2>&1 | tee /results/decode-server.log
 ```
@@ -395,6 +396,15 @@ incomplete responses, missing ranks, unexpected prefix hits, preemption and
 logged compilation in formal windows. Compilation
 log checks cannot detect silent runtime compilation; device attribution requires
 a separate profile. Run on an otherwise idle server.
+
+For each decode wave, the client pauses scheduling and waits for the pinned
+vLLM API server's `Added request` log entry for every unique request ID before
+resuming. These entries are written after dispatch to the selected engine;
+the initial five-second settling delay alone does not prove admission of all
+long token-ID requests. Missing entries fail after 120 seconds, and old or
+duplicate entries cannot satisfy the barrier. `run.py` enables request logging
+with prompt logging capped at zero; manual servers need the flags shown above.
+The full-DP shape and consecutive-window checks still apply after admission.
 
 The recorder observes native output consumption without additional device waits.
 The summary retains only consecutive full-C decode observations: 48 requests,

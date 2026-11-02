@@ -11,6 +11,7 @@ import statistics
 import sys
 import threading
 import time
+import uuid
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -20,6 +21,43 @@ from server_step_worker import SCENARIOS
 
 # Hold accepted tokens constant so the primary metric compares step cadence.
 _FIXED_ACCEPTED_TOKENS_PER_REQUEST_STEP = 3.47
+
+
+def wait_for_admission(
+    server_log: Path,
+    offset: int,
+    request_ids: set[str],
+    futures: list[concurrent.futures.Future],
+    timeout: float = 120,
+) -> None:
+    """Wait for pinned vLLM's post-send acknowledgements while paused."""
+    added = re.compile(r"Added request (\S+)-[0-9a-f]{8}\.")
+    pending = set(request_ids)
+    deadline = time.monotonic() + timeout
+    with server_log.open() as stream:
+        stream.seek(offset)
+        while pending:
+            for future in futures:
+                if future.done():
+                    future.result()
+                    raise RuntimeError("Request completed while scheduler was paused")
+            while True:
+                position = stream.tell()
+                line = stream.readline()
+                if not line.endswith("\n"):
+                    stream.seek(position)
+                    break
+                if match := added.search(line):
+                    pending.discard(match[1])
+            if not pending:
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Admission timed out: {len(pending)}/{len(request_ids)} "
+                    "requests missing vLLM Added request acknowledgements; "
+                    "enable --enable-log-requests on the API server"
+                )
+            time.sleep(0.1)
 
 
 def expected_prefix_hit(prefix_tokens: int, extend_tokens: int, alignment: int) -> int:
@@ -88,6 +126,7 @@ def client_main(argv: list[str]) -> None:
         "corpus": data["manifest"],
         "rounds": args.rounds,
         "admission_settle_seconds": args.admission_settle_seconds,
+        "admission_barrier": "vllm_added_request_log",
         "rank_affinity": [i % scenario.dp_size for i in range(len(rows))],
     }
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -128,6 +167,8 @@ def client_main(argv: list[str]) -> None:
 
     def wave(inputs: list, outputs: int) -> list:
         barrier = threading.Barrier(len(inputs) + 1)
+        wave_id = uuid.uuid4().hex
+        request_ids = [f"dsv41-{wave_id}-{i}" for i in range(len(inputs))]
 
         def request(index: int) -> dict:
             payload = {
@@ -137,6 +178,7 @@ def client_main(argv: list[str]) -> None:
                 "temperature": 0,
                 "ignore_eos": True,
                 "stream": False,
+                "request_id": request_ids[index],
             }
             barrier.wait(timeout=120)
             response = requests.post(
@@ -155,15 +197,21 @@ def client_main(argv: list[str]) -> None:
                 raise ValueError(f"Incomplete request {index}: {usage}")
             return result
 
-        # Freeze scheduling while HTTP handlers enqueue this wave. The settling
-        # delay is not proof of admission: strict worker shape/context checks
-        # below still reject a wave whose ranks did not start together.
+        # Pinned vLLM logs Added request only after sending to the chosen engine.
+        # A fixed delay alone can leave long token-ID requests outside the queue.
         post("/pause?mode=keep&clear_cache=false", {})
+        admission_offset = args.server_log.stat().st_size
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(inputs)) as pool:
             futures = [pool.submit(request, i) for i in range(len(inputs))]
             try:
                 barrier.wait(timeout=120)
                 time.sleep(args.admission_settle_seconds)
+                wait_for_admission(
+                    args.server_log,
+                    admission_offset,
+                    {f"cmpl-{request_id}-0" for request_id in request_ids},
+                    futures,
+                )
             finally:
                 post("/resume", {})
             return [future.result() for future in futures]

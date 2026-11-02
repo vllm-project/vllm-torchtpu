@@ -201,6 +201,8 @@ def main() -> None:
         "--compilation-config",
         json.dumps({"compile_sizes": buckets}),
     ]
+    if decode and not worker:
+        server_command += ["--enable-log-requests", "--max-log-len", "0"]
     if multihost:
         # Native MP owns bootstrap; do not inherit a single-host SliceBuilder.
         for key in (
