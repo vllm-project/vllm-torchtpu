@@ -85,7 +85,5 @@ def test_matches_today(rows):
         q8, qs = quantize_tensor(got[2], jnp.float8_e4m3fn)
         assert _bits(got[5]) == _bits(q8)
         assert _bits(got[6]) == _bits(qs)
-    bad = K.reference(
-        *args, eps=EPS, q_eps=Q_EPS, kv_eps=1e-2, q_rank=Q, kv_rank=KV
-    )
+    bad = K.reference(*args, eps=EPS, q_eps=Q_EPS, kv_eps=1e-2, q_rank=Q, kv_rank=KV)
     assert _bits(got[3]) != _bits(bad[3])

@@ -22,7 +22,7 @@ replacement character, as vLLM did before native prefill; a prompt without one
 
 from __future__ import annotations
 
-import msgspec
+import copy
 
 from vllm_torchtpu.logger import init_logger
 
@@ -33,19 +33,28 @@ LONGEST_SUFFIX = 24
 REPLACEMENT_CHARACTER = "�"
 
 
-def prompt_suffix(tokenizer, prompt_token_ids: list[int] | None) -> list[int] | None:
-    """The shortest prompt suffix of 4 to 24 tokens that decodes to whole characters, else the prompt."""
+def prompt_suffix(
+    tokenizer, prompt_token_ids: list[int] | None, skip_special_tokens: bool = False
+) -> list[int] | None:
+    """The shortest prompt suffix of 4 to 24 tokens that decodes, the way the
+    stream will decode it (``skip_special_tokens``), to non-empty whole
+    characters; else the prompt. An empty text (a suffix of special tokens
+    only) would leave the stream at a sequence start, where some decoders drop
+    the first output token's leading space."""
     if prompt_token_ids is None or len(prompt_token_ids) <= SHORTEST_SUFFIX:
         return prompt_token_ids
-    for length in range(SHORTEST_SUFFIX, min(len(prompt_token_ids), LONGEST_SUFFIX) + 1):
+    longest = min(len(prompt_token_ids), LONGEST_SUFFIX)
+    for length in range(SHORTEST_SUFFIX, longest + 1):
         suffix = prompt_token_ids[-length:]
-        if REPLACEMENT_CHARACTER not in tokenizer.decode(suffix, skip_special_tokens=False):
+        text = tokenizer.decode(suffix, skip_special_tokens=skip_special_tokens)
+        if text and REPLACEMENT_CHARACTER not in text:
             return suffix
     return prompt_token_ids
 
 
 def patch_detokenizer_suffix_prime() -> None:
-    """Prime ``FastIncrementalDetokenizer`` with a prompt suffix (VLLM_TPU_DETOK_SUFFIX_PRIME)."""
+    """Prime ``FastIncrementalDetokenizer`` with a prompt suffix
+    (VLLM_TPU_DETOK_SUFFIX_PRIME)."""
     from vllm_torchtpu import envs
 
     if not envs.VLLM_TPU_DETOK_SUFFIX_PRIME:
@@ -58,13 +67,20 @@ def patch_detokenizer_suffix_prime() -> None:
     full_prime_init = cls.__init__
 
     def __init__(self, tokenizer, request) -> None:
-        suffix = prompt_suffix(tokenizer._tokenizer, request.prompt_token_ids)
-        full_prime_init(self, tokenizer, msgspec.structs.replace(request, prompt_token_ids=suffix))
+        suffix = prompt_suffix(
+            tokenizer._tokenizer,
+            request.prompt_token_ids,
+            request.sampling_params.skip_special_tokens,
+        )
+        primed = copy.copy(request)
+        primed.prompt_token_ids = suffix
+        full_prime_init(self, tokenizer, primed)
 
     cls.__init__ = __init__
     cls._tpu_detok_suffix_prime = True
     logger.info(
-        "VLLM_TPU_DETOK_SUFFIX_PRIME: output detokenizers start from the prompt's last %d-%d tokens",
+        "VLLM_TPU_DETOK_SUFFIX_PRIME: output detokenizers start from the "
+        "prompt's last %d-%d tokens",
         SHORTEST_SUFFIX,
         LONGEST_SUFFIX,
     )

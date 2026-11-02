@@ -93,16 +93,14 @@ def _slice_mean_square(x_ref, r_ref, ro_ref, sum_ref, rows):
             sum_ref[:, cols] = s
         for block in _lane_blocks(s * s):
             acc = block if acc is None else acc + block
+    assert acc is not None
     return jnp.sum(acc, axis=-1, keepdims=True) / jnp.float32(x_ref.shape[1])
 
 
 def _slice_norm(x_ref, sum_ref, w_ref, rows, cols, inv_rms, dtype):
     """``y`` of one column group of a slice; ``s`` comes from ``sum_ref``, or
     from ``x`` itself without a residual."""
-    if sum_ref is None:
-        s = x_ref[rows, cols].astype(jnp.float32)
-    else:
-        s = sum_ref[:, cols]
+    s = x_ref[rows, cols].astype(jnp.float32) if sum_ref is None else sum_ref[:, cols]
     normed = (s * inv_rms).astype(dtype)
     return (normed.astype(jnp.float32) * w_ref[:, cols].astype(jnp.float32)).astype(
         dtype
@@ -254,7 +252,9 @@ def _quant_kernel(*refs, eps: float, emit_y: bool, q_max: float):
     q_ref[...] = jnp.clip(yf / scale, -q_max, q_max).astype(q_ref.dtype)
 
 
-def _sliced_quant_kernel(*refs, eps: float, emit_y: bool, q_max: float, slice_rows: int):
+def _sliced_quant_kernel(
+    *refs, eps: float, emit_y: bool, q_max: float, slice_rows: int
+):
     """``_quant_kernel`` computed one ``slice_rows`` slice of the tile at a
     time. The quant pass after the row amax reads ``y`` back from its output
     block, or from a bf16 scratch without one."""
@@ -274,6 +274,7 @@ def _sliced_quant_kernel(*refs, eps: float, emit_y: bool, q_max: float, slice_ro
             y = _slice_norm(x_ref, sum_ref, w_ref, rows, cols, inv_rms, x_ref.dtype)
             y_ref[y_rows, cols] = y
             peak = _row_peak(peak, jnp.abs(y.astype(jnp.float32)))
+        assert peak is not None
         amax = jnp.max(peak, axis=-1, keepdims=True)
         scale = amax / jnp.float32(q_max)
         scale = jnp.where(scale == 0, jnp.float32(1.0), scale)
@@ -470,6 +471,7 @@ def _sliced_moe_quant_kernel(
         sum_ref, y_ref = refs[8:]
     else:
         x_ref, r_ref, w_ref, y_ref, q_ref, s_ref, ro_ref, sum_ref = refs
+        gate_ref = logits_ref = None
 
     lanes = 128
     tile_rows, hidden = x_ref.shape
@@ -487,6 +489,7 @@ def _sliced_moe_quant_kernel(
             y = _slice_norm(x_ref, sum_ref, w_ref, rows, cols, inv_rms, x_ref.dtype)
             y_ref[rows, cols] = y
             peak = _row_peak(peak, jnp.abs(y))
+        assert peak is not None
         amax = jnp.max(peak, axis=-1, keepdims=True)
         scale = amax.astype(jnp.float32) / q_max
         usable = jnp.isfinite(scale) & (scale > 0)
@@ -501,12 +504,13 @@ def _sliced_moe_quant_kernel(
             )
             b = _byte_transpose4(_lane_blocks(pltpu.bitcast(q, jnp.uint32)))
             for t in range(4):
-                q32[
-                    pl.ds(first + t * wpr + k, slice_rows // 4, stride=lane_blocks)
-                ] = b[t]
+                q32[pl.ds(first + t * wpr + k, slice_rows // 4, stride=lane_blocks)] = (
+                    b[t]
+                )
 
     _for_each_slice(tile_rows, slice_rows, body)
     if router:
+        assert gate_ref is not None and logits_ref is not None
         logits_ref[...] = jax.lax.dot_general(
             y_ref[...],
             gate_ref[...],

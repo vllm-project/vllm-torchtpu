@@ -347,6 +347,15 @@ if TYPE_CHECKING:
     TPU_SAMPLER_VERIFY_TRIM_ROWS: list[int] = []
 
 
+def _positive_int_list(env_name: str) -> list[int]:
+    """The distinct comma-separated integers of `env_name`, ascending; raises
+    when one is below 1 (a row count of 0 or less has no meaning)."""
+    values = sorted({int(v) for v in os.getenv(env_name, "").split(",") if v.strip()})
+    if values and values[0] < 1:
+        raise ValueError(f"{env_name} lists row counts below 1: {values}")
+    return values
+
+
 def env_with_choices(
     env_name: str,
     default: str | None,
@@ -1064,9 +1073,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_MLA_DECODE_PROLOGUE: the q absorption reads q_nope's lanes
     # straight from the raw q head the attention kernel already takes, instead
     # of an XLA copy of the q_nope slice (prefill sizes; same bits).
-    "TPU_MLA_ABSORB_Q_FROM_HEAD": env_bool(
-        "TPU_MLA_ABSORB_Q_FROM_HEAD", default=False
-    ),
+    "TPU_MLA_ABSORB_Q_FROM_HEAD": env_bool("TPU_MLA_ABSORB_Q_FROM_HEAD", default=False),
     # DCP sparse MLA, fused-prep decode buckets (TPU_DCP_MLA_FUSED_PREP): the
     # SparseCore gather feeding the attention kernel writes the step's KV rows
     # into both caches itself (then fences), instead of a separate cache
@@ -1088,7 +1095,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_INDEXER_QB_OVERLAP": env_bool("TPU_INDEXER_QB_OVERLAP", default=False),
     # Take the q_b overlap path only in passes that run their own indexer, so an
     # IndexShare draft step traced with skip_topk reads the shared top-k table.
-    "TPU_QB_OVERLAP_HONORS_SKIP_TOPK": env_bool("TPU_QB_OVERLAP_HONORS_SKIP_TOPK", default=False),
+    "TPU_QB_OVERLAP_HONORS_SKIP_TOPK": env_bool(
+        "TPU_QB_OVERLAP_HONORS_SKIP_TOPK", default=False
+    ),
     # Store each token's 64-byte fp8 RoPE key in 64 bytes instead of a padded
     # 128-byte row (eight tokens per 128-word row), cutting the sparse MLA
     # latent cache from 640 to 576 B/token. SparseCore layouts only; the
@@ -1709,9 +1718,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # runs in program order instead of reloading shared functions' overlays.
     # Larger buckets keep the compiler's choice: their code would not fit in
     # HBM beside the KV cache. 0 leaves every program to the compiler.
-    "TPU_NO_CODE_FUNCTIONS_MAX_TOKENS": env_int(
-        "TPU_NO_CODE_FUNCTIONS_MAX_TOKENS", 0
-    ),
+    "TPU_NO_CODE_FUNCTIONS_MAX_TOKENS": env_int("TPU_NO_CODE_FUNCTIONS_MAX_TOKENS", 0),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
@@ -2321,12 +2328,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unfused path that synthetic acceptance takes. The uniforms are drawn at
     # the full shape and sliced in the graph, so the random stream and every
     # real slot's computation are unchanged. Empty (default): off.
-    "TPU_SAMPLER_VERIFY_TRIM_ROWS": lambda: sorted(
-        {
-            int(v)
-            for v in os.getenv("TPU_SAMPLER_VERIFY_TRIM_ROWS", "").split(",")
-            if v.strip()
-        }
+    "TPU_SAMPLER_VERIFY_TRIM_ROWS": lambda: _positive_int_list(
+        "TPU_SAMPLER_VERIFY_TRIM_ROWS"
     ),
     # With TPU_SAMPLER_FUSED_CHAIN: the fused verify chain draws its three
     # uniforms (bonus_u, accept_u, recover_u) inside the compiled program
@@ -2432,8 +2435,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The fused kernel computes the projection in blocks of chunk/16 rows; below
     # this many chunk rows the blocks are too short for the matrix unit and the
     # fused kernel is slower than the separate projection and reduce-scatter
-    # (proxy run vm-02750a1d-03c4-4be0-a6d5: +27 us per 512-row call, -24 us per
-    # 2,048-row call), so smaller chunks keep the two calls.
+    # (+27 us per 512-row call, -24 us per 2,048-row call), so smaller chunks
+    # keep the two calls.
     "TPU_PREFILL_FUSED_OPROJ_RS_MIN_ROWS": env_int(
         "TPU_PREFILL_FUSED_OPROJ_RS_MIN_ROWS", 2048
     ),

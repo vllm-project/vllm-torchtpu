@@ -698,11 +698,11 @@ def _window_kernel(
                 ahead_slot = (slot + buffers - 1) % buffers
 
                 @pl.when(((atom & last_atom) == 0) & (batch + 1 < own_batches))
-                def _next_indices():
+                def _next_indices(*, batch=batch):
                     index_copy(batch + 1).start()
 
                 @pl.when(ahead < atoms)
-                def _prefetch():
+                def _prefetch(*, ahead=ahead, ahead_slot=ahead_slot):
                     @pl.when(ahead >= buffers)
                     def _reuse():
                         drain(ahead - buffers, ahead_slot)

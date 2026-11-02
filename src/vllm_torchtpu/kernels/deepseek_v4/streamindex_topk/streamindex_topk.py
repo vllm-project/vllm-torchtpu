@@ -978,6 +978,8 @@ def kernel(
         Their scalar work then shares the block of the MXU and head-sum work.
         Same operands, same arithmetic, so the same scores as `emit_pipeline`.
         """
+        # decode_ring is nonzero only with page_major, so SEQ_ALONG_LANE.
+        assert kv_sublane_groups is not None
         slots, score_slots = decode_ring, _DECODE_RING_SCORE_SLOTS
         chunk_tokens = scores_hbm_ref.shape[0]
         chunk_start = start_end_seq_idx_ref[2]
@@ -1092,7 +1094,7 @@ def kernel(
                 p_id = num_steps - score_slots + d
 
                 @pl.when(p_id >= 0)
-                def _():
+                def _(*, p_id=p_id):
                     ring.wait_scores_out(scores_dst, p_id, p_id % score_slots)
 
         pl.run_scoped(

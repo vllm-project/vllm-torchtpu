@@ -27,7 +27,7 @@ Imported only when the flag is set, so the flag-off model builds the stock
 import contextlib
 from collections.abc import Callable
 from threading import Lock
-from typing import Any
+from typing import Any, cast
 
 import jax
 import torch
@@ -309,7 +309,9 @@ def _get_quant_moe_router_op(eps: float):
             return (
                 torch.empty_like(x),
                 *_quant_moe_fake(x, residual),
-                torch.empty((x.shape[0], gate.shape[0]), dtype=x.dtype, device=x.device),
+                torch.empty(
+                    (x.shape[0], gate.shape[0]), dtype=x.dtype, device=x.device
+                ),
             )
 
         op = pallas.jax_op(f"pallas::fused_add_rmsnorm_quant_moe_router_{tag}", fn)
@@ -507,7 +509,19 @@ def _get_norm_qkva_op(
             )
 
         # jax_op takes a fixed-length tuple return, not tuple[jax.Array, ...].
-        fn.__annotations__["return"] = tuple[(jax.Array,) * (7 if emit_q8 else 5)]
+        fn.__annotations__["return"] = (
+            tuple[
+                jax.Array,
+                jax.Array,
+                jax.Array,
+                jax.Array,
+                jax.Array,
+                jax.Array,
+                jax.Array,
+            ]
+            if emit_q8
+            else tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
+        )
 
         def fake(x, residual, ln_w, w_q, w_s, qa_w, kva_w):
             rows = x.shape[0]
@@ -626,14 +640,17 @@ def arm_norm_qkva(model: torch.nn.Module) -> int:
             or getattr(qkv, FP8_PALLAS_N_ATTR, None) is not None
         ):
             continue
+        q_norm, kv_norm = w.q_a_layernorm, w.kv_a_layernorm
+        assert q_norm is not None and kv_norm is not None
+        weight = cast(torch.Tensor, qkv.weight)
         q_rank, kv_rank = w.q_lora_rank, w.kv_lora_rank
         rope = w.qk_rope_head_dim
         hidden = ln_in.hidden_size
-        if tuple(qkv.weight.shape) != (
+        if tuple(weight.shape) != (
             hidden,
             q_rank + kv_rank + rope,
         ) or not fused_norm_qkva.supports(
-            max_rows, hidden, qkv.weight.shape[1], q_rank, kv_rank, rope
+            max_rows, hidden, weight.shape[1], q_rank, kv_rank, rope
         ):
             continue
         # The layers whose wrapper runs q_b_proj itself (the forward's
@@ -646,16 +663,16 @@ def arm_norm_qkva(model: torch.nn.Module) -> int:
             get_prequantized_matmul_op()
             qb_slot = PrequantSlot()
             setattr(w.q_b_proj, PREQUANT_ATTR, qb_slot)
-        ln_in.register_buffer("_nq_w", qkv.weight.detach(), persistent=False)
+        ln_in.register_buffer("_nq_w", weight.detach(), persistent=False)
         # The kernel reads the vectors as [1, n] rows. A 1-D vector's layout is
         # tiled by 1024, so reshaping it per call is a real relayout: 0.6 us
-        # each where XLA puts the result in HBM (16- and 32-row programs,
-        # vm-b9794158-e94e-45e4-9204). Rows built once here need none.
+        # each where XLA puts the result in HBM (16- and 32-row programs).
+        # Rows built once here need none.
         for name, t in (
             ("_nq_lnw", ln_in.weight),
-            ("_nq_ws", qkv.weight_scale.float()),
-            ("_nq_qa", w.q_a_layernorm.weight),
-            ("_nq_kva", w.kv_a_layernorm.weight),
+            ("_nq_ws", cast(torch.Tensor, qkv.weight_scale).float()),
+            ("_nq_qa", cast(torch.Tensor, q_norm.weight)),
+            ("_nq_kva", cast(torch.Tensor, kv_norm.weight)),
         ):
             ln_in.register_buffer(
                 name, t.detach().reshape(1, -1).clone(), persistent=False
@@ -663,8 +680,8 @@ def arm_norm_qkva(model: torch.nn.Module) -> int:
         ln_in._nq_ops = {
             emit: _get_norm_qkva_op(
                 ln_in.variance_epsilon,
-                w.q_a_layernorm.variance_epsilon,
-                w.kv_a_layernorm.variance_epsilon,
+                cast(float, q_norm.variance_epsilon),
+                cast(float, kv_norm.variance_epsilon),
                 q_rank,
                 kv_rank,
                 emit,
@@ -749,7 +766,9 @@ class TpuRMSNorm(RMSNorm):
         out = self._forward(x, residual)
         if self._router_slot is not None and self._router_slot.value is None:
             y = out if residual is None else out[0]
-            self._router_slot.value = torch.nn.functional.linear(y, self._router_weight)
+            self._router_slot.value = torch.nn.functional.linear(
+                y, cast(torch.Tensor, self._router_weight)
+            )
         return out
 
     def _norm_qkva_applies(
@@ -772,7 +791,10 @@ class TpuRMSNorm(RMSNorm):
         )
 
     def _nq_buffers(self) -> tuple[torch.Tensor, ...]:
-        return self._nq_lnw, self._nq_w, self._nq_ws, self._nq_qa, self._nq_kva
+        return cast(
+            tuple[torch.Tensor, ...],
+            (self._nq_lnw, self._nq_w, self._nq_ws, self._nq_qa, self._nq_kva),
+        )
 
     def _forward(self, x: torch.Tensor, residual: torch.Tensor | None):
         if self._nq_slot is not None:

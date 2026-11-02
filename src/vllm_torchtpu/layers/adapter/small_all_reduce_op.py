@@ -74,6 +74,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
     get_ep_group,
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+from vllm_torchtpu.kernels.experimental import rotated_collectives
 from vllm_torchtpu.kernels.experimental.moe_tp_decode.all_reduce import (
     check_chip_pairs,
 )
@@ -329,27 +330,56 @@ def _gather(obj) -> list:
     return seen
 
 
-def _chip_places(mesh, mesh_index: int) -> list[tuple[tuple[int, ...], int | None]]:
+def _chip_places(
+    mesh, mesh_index: int, gather=None, who: str = "small all-reduce"
+) -> list[tuple[tuple[int, ...], int]]:
     """(chip coords, core on chip) at each index of ``mesh``. Its devices
     carry ids only (get_pallas_mesh builds them from the process group), so
     every rank reports its own JAX device, the one TPU device its process
     addresses, and it must be the mesh's device at the rank's index.
-    Collective."""
+    ``gather`` all-gathers one object per rank over the process group the
+    mesh was built from (default: the EP group); ``who`` names the caller in
+    the error. The one source of the device-to-chip mapping for every op that
+    addresses peers by chip. Collective."""
     device = jax.local_devices()[0]
     mine = dict(
         mesh_index=mesh_index,
         id=int(device.id),
-        coords=tuple(getattr(device, "coords", None) or ()),
-        core=getattr(device, "core_on_chip", None),
+        coords=tuple(device.coords),
+        core=int(device.core_on_chip),
     )
-    seen = sorted(_gather(mine), key=lambda s: s["mesh_index"])
+    seen = sorted((gather or _gather)(mine), key=lambda s: s["mesh_index"])
     ids = [int(d.id) for d in mesh.devices.flat]
     if [(s["mesh_index"], s["id"]) for s in seen] != list(enumerate(ids)):
         raise RuntimeError(
-            f"small all-reduce: the ranks' JAX devices {seen} are not the "
+            f"{who}: the ranks' JAX devices {seen} are not the "
             f"mesh's devices {ids} in mesh order"
         )
     return [(s["coords"], s["core"]) for s in seen]
+
+
+def rotated_places(
+    mesh, mesh_index: int, flag: str, what: str, gather=None
+) -> list | None:
+    """(chip coords, core on chip) per index of ``mesh`` when the rotated
+    collectives (kernels/experimental/rotated_collectives.py) can run over it,
+    else None with the reason logged under ``flag``; ``what`` names the
+    collectives that run rotated, for the log. Shared by every switch that
+    arms them, so the MoE and attention paths agree on the mapping.
+    Collective (see _chip_places); the same answer on every rank."""
+    if int(mesh.size) != rotated_collectives.CORES:
+        reason = f"the mesh has {int(mesh.size)} cores, not {rotated_collectives.CORES}"
+    else:
+        try:
+            places = _chip_places(mesh, mesh_index, gather, who=flag)
+            rotated_collectives.Layout(places)
+        except (RuntimeError, ValueError) as e:
+            reason = str(e)
+        else:
+            logger.info("%s: %s run rotated over %s", flag, what, places)
+            return places
+    logger.warning("%s: %s; XLA's collectives", flag, reason)
+    return None
 
 
 def _selftest_pairs(mesh, mesh_index: int, rows: int, hidden: int) -> bool:
@@ -384,6 +414,7 @@ def _selftest_pairs(mesh, mesh_index: int, rows: int, hidden: int) -> bool:
     )
     op.register_fake(lambda x, rank: torch.empty_like(x))
     blocks = all_reduce.selftest_blocks(n, rows, hidden)
+    assert _RANK is not None, "the selftest runs after the rank buffer is built"
     mine = torch.from_numpy(blocks[mesh_index]).to(torch.bfloat16).to(_RANK.device)
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
