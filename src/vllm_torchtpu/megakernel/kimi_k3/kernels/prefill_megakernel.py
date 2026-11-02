@@ -3288,7 +3288,7 @@ def kda_chunk(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, invert=No
 
 
 def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query_scale=1.0,
-                    sp_axis=None):
+                    sp_axis=None, gather_tables=None, gather_collective_id=45):
     """MLA Q/K/V projections for a token window (per-rank layout).
 
     ``hidden``: [T, hidden] BF16. Returns (query [T,3,256] times
@@ -3331,13 +3331,25 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
     rope = compressed[:, 512:576]
     if sp_axis is not None:
         width = query_latent.shape[1]
-        both = jax.lax.all_gather(
-            jnp.concatenate((query_latent, kv_latent, rope), axis=1), sp_axis, tiled=True
-        )
-        output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
-        query_latent = both[:, :width]
-        kv_latent = both[:, width : width + 512]
-        rope = both[:, width + 512 :]
+        if gather_tables is not None and sp_axis == "k3_sp" and (width + 576) % 128 == 64:
+            padded_rope = jnp.pad(rope, ((0, 0), (0, 64)))
+            both = _rank_half_gather(
+                jnp.concatenate((query_latent, kv_latent, padded_rope), axis=1),
+                gather_tables,
+                collective_id=gather_collective_id,
+            )
+            output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
+            query_latent = both[:, :width]
+            kv_latent = both[:, width : width + 512]
+            rope = both[:, width + 512 : width + 576]
+        else:
+            both = jax.lax.all_gather(
+                jnp.concatenate((query_latent, kv_latent, rope), axis=1), sp_axis, tiled=True
+            )
+            output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
+            query_latent = both[:, :width]
+            kv_latent = both[:, width : width + 512]
+            rope = both[:, width + 512 :]
     else:
         output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
     query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
@@ -4445,9 +4457,14 @@ class CpPrefix(NamedTuple):
     pools: tuple
     ids: Any
     local: Any
+    counts: Any = None
+    order: Any = None
 
     def split(self):
-        return tuple(CpPrefix((pool, ), self.ids, self.local) for pool in self.pools)
+        return tuple(
+            CpPrefix((pool, ), self.ids, self.local, self.counts, self.order)
+            for pool in self.pools
+        )
 
 
 GATHER_STREAMS = 6  # the three physical ring cycles, both directions
@@ -4546,7 +4563,8 @@ def _prefix_page_gather_kernel(tables, counts_ref, ids_ref, pool_hbm, out_hbm, l
     pl.semaphore_wait(done, len(neighbours))
 
 
-def gathered_prefix_pages(pool, ids, local, tables, axis_name, *, count, capacity):
+def gathered_prefix_pages(pool, ids, local, tables, axis_name, *, count, capacity,
+                          counts=None, order=None):
     """Every rank's cached prefix pages, gathered (inside ``shard_map``):
     ``(pages, order)`` for ``expand_prefix_pages``. ``pool``/``ids``/``local``
     are this rank's view (see ``CpPrefix``). ``pages`` holds every rank's
@@ -4555,9 +4573,14 @@ def gathered_prefix_pages(pool, ids, local, tables, axis_name, *, count, capacit
     the most prefix tokens a window holds."""
     page_tokens = pool.shape[-3] * pool.shape[-2]
     slots = ids.shape[0]  # 1 + P: slot 0 holds the count (never referenced)
-    every = jax.lax.all_gather(local, axis_name)  # [32, 2 * count]: bases, token counts
-    ranks = every.shape[0]
-    counts = jnp.sum(every[:, count:], axis=1) // page_tokens  # pages per rank
+    if counts is None or order is None:
+        every = jax.lax.all_gather(local, axis_name)  # [32, 2 * count]: bases, token counts
+        ranks = every.shape[0]
+        counts = jnp.sum(every[:, count:], axis=1) // page_tokens  # pages per rank
+        order = prefix_page_order(every, count=count, page_tokens=page_tokens, slots=slots,
+                                  capacity=capacity)
+    else:
+        ranks = counts.shape[0]
     pages = pl.pallas_call(
         functools.partial(_prefix_page_gather_kernel, slots=slots),
         out_shape=jax.ShapeDtypeStruct((ranks * slots, *pool.shape[1:]), pool.dtype),
@@ -4571,8 +4594,7 @@ def gathered_prefix_pages(pool, ids, local, tables, axis_name, *, count, capacit
         compiler_params=pltpu.CompilerParams(collective_id=44),
         name="kimi_prefill_prefix_page_gather",
     )(jnp.asarray(tables, jnp.int32), counts.astype(jnp.int32), ids.astype(jnp.int32), pool)
-    return pages, prefix_page_order(every, count=count, page_tokens=page_tokens, slots=slots,
-                                    capacity=capacity)
+    return pages, order
 
 
 def prefix_page_order(every, *, count, page_tokens, slots, capacity):
@@ -5015,6 +5037,288 @@ def _half_reduce_step(
             pl.semaphore_wait(credits.at[stream], 2)
 
 
+def _rank_half_gather_kernel(
+    tables_ref, local_ref, window_ref, send_sems, recv_sems, own_sem, done
+):
+    """Gather rank-major ``local_ref`` ``[rows, width]`` into ``window_ref``
+    ``[32 * rows, width]`` in 17 bidirectional direct-HBM steps."""
+    step = pl.program_id(1)
+    rank = jax.lax.axis_index("k3_sp")
+    rows = local_ref.shape[0]
+    positions = [tables_ref[f, 0, rank] for f in range(3)]
+    neighbours = [
+        tables_ref[f, 1, (positions[f] + d) % 32] for f in range(3) for d in (-1, 1)
+    ]
+
+    def owner_rows(family, position):
+        owner = tables_ref[family, 2, tables_ref[family, 1, position % 32]]
+        return pl.ds(owner * rows, rows)
+
+    pl.when(step == 0)(lambda: _ring_enter(tables_ref, rank))
+
+    @pl.when(step == 0)
+    def own_rows():
+        pltpu.make_async_copy(
+            local_ref, window_ref.at[owner_rows(0, positions[0])], own_sem
+        ).start()
+
+    for stream, (family, direction, col, width) in enumerate(
+        _half_ring_streams(local_ref.shape[1])
+    ):
+        cols = pl.ds(col, width)
+        hops = HALF_HOPS[direction]
+        position = positions[family]
+        target = (tables_ref[family, 1, (position + direction) % 32],)
+
+        def send(
+            index,
+            source,
+            family=family,
+            direction=direction,
+            cols=cols,
+            position=position,
+            target=target,
+            stream=stream,
+        ):
+            r_sl = owner_rows(family, position - direction * index)
+            return pltpu.make_async_remote_copy(
+                source if source is not None else window_ref.at[r_sl, cols],
+                window_ref.at[r_sl, cols],
+                send_sems.at[stream],
+                recv_sems.at[stream, index],
+                device_id=target,
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+
+        own = local_ref.at[:, cols]
+        pl.when(step == 0)(lambda send=send, own=own: send(0, own).start())
+
+        @pl.when((step >= 1) & (step <= hops))
+        def arrived(send=send):
+            copy = send(step - 1, None)
+            copy.wait_recv()
+            copy.wait_send()
+
+        @pl.when((step >= 1) & (step < hops))
+        def forward(send=send):
+            send(step, None).start()
+
+    @pl.when(step == HALF_STEPS - 1)
+    def finish_local():
+        pltpu.make_async_copy(
+            local_ref, window_ref.at[owner_rows(0, positions[0])], own_sem
+        ).wait()
+        for peer in neighbours:
+            pl.semaphore_signal(
+                done, 1, device_id=(peer,), device_id_type=pl.DeviceIdType.MESH
+            )
+        pl.semaphore_wait(done, len(neighbours))
+
+
+def _rank_half_gather(local_arr, tables, *, collective_id):
+    """Gather BF16 ``[rows, width]`` in mesh-rank order on physical half rings."""
+    rows, width = local_arr.shape
+    streams = len(_half_ring_streams(width))
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    return pl.pallas_call(
+        _rank_half_gather_kernel,
+        out_shape=jax.ShapeDtypeStruct((32 * rows, width), local_arr.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1, HALF_STEPS),
+            in_specs=(hbm,),
+            out_specs=hbm,
+            scratch_shapes=(
+                pltpu.SemaphoreType.DMA((streams,)),
+                pltpu.SemaphoreType.DMA((streams, HALF_HOPS[1])),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.REGULAR,
+            ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=collective_id,
+            vmem_limit_bytes=16 * 1024**2,
+        ),
+        name="kimi_prefill_rank_half_ag",
+    )(jnp.asarray(tables, jnp.int32), local_arr)
+
+
+def _rank_half_reduce_kernel(
+    tables_ref,
+    partial_ref,
+    output_ref,
+    read_sems,
+    send_sems,
+    recv_sems,
+    credits,
+    store_sem,
+    local_bufs,
+    payload,
+    received,
+    out_staging,
+):
+    """Reduce-scatter rank-major ``partial_ref`` ``[32 * rows, width]`` into
+    ``output_ref`` ``[rows, width]`` on physical 17-step half rings."""
+    step_all = pl.program_id(1)
+    block, step = step_all // HALF_STEPS, step_all % HALF_STEPS
+    rank = jax.lax.axis_index("k3_sp")
+    positions = [tables_ref[f, 0, rank] for f in range(3)]
+    chunk = payload.shape[1]
+    rows = output_ref.shape[0]
+    local_first = block * chunk
+    streams = _half_ring_streams(partial_ref.shape[1])
+
+    pl.when(step_all == 0)(lambda: _ring_enter(tables_ref, rank))
+
+    for stream, (family, direction, col, width) in enumerate(streams):
+        cols = pl.ds(col, width)
+        hops = HALF_HOPS[direction]
+        position = positions[family]
+        side = 0 if direction == 1 else 1
+        target = (tables_ref[family, 1, (position + direction) % 32],)
+        source = (tables_ref[family, 1, (position - direction) % 32],)
+
+        def read(
+            index,
+            family=family,
+            direction=direction,
+            cols=cols,
+            position=position,
+            hops=hops,
+            side=side,
+            stream=stream,
+        ):
+            peer = tables_ref[family, 1, (position + direction * (hops - index)) % 32]
+            owner = tables_ref[family, 2, peer]
+            return pltpu.make_async_copy(
+                partial_ref.at[pl.ds(owner * rows + local_first, chunk), cols],
+                local_bufs.at[index % 2, side, :, cols],
+                read_sems.at[index % 2, stream],
+            )
+
+        def remote(index, cols=cols, side=side, target=target, stream=stream):
+            return pltpu.make_async_remote_copy(
+                payload.at[side, :, cols],
+                received.at[index % 2, side, :, cols],
+                send_sems.at[stream],
+                recv_sems.at[index % 2, stream],
+                device_id=target,
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+
+        pl.when(step == 0)(lambda read=read: read(0).start())
+
+        @pl.when(step <= hops)
+        def accumulate(
+            read=read,
+            remote=remote,
+            cols=cols,
+            side=side,
+            hops=hops,
+            stream=stream,
+            source=source,
+        ):
+            read(step).wait()
+            pl.when(step < hops)(lambda: read(step + 1).start())
+            local = local_bufs.at[step % 2, side, :, cols][...].astype(payload.dtype)
+
+            @pl.when(step == 0)
+            def seed():
+                payload.at[side, :, cols][...] = local
+
+            @pl.when((step > 0) & (step < hops))
+            def add():
+                remote(step - 1).wait()
+                payload.at[side, :, cols][...] = (
+                    local + received.at[(step - 1) % 2, side, :, cols][...]
+                )
+                pl.semaphore_signal(
+                    credits.at[stream],
+                    1,
+                    device_id=source,
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+
+            @pl.when(step < hops)
+            def forward():
+                pl.when(step >= 2)(lambda: pl.semaphore_wait(credits.at[stream], 1))
+                remote(step).start()
+
+            @pl.when(step == hops)
+            def last():
+                remote(step - 1).wait()
+
+    @pl.when(step == HALF_STEPS - 1)
+    def finish():
+        total = (
+            local_bufs.at[0, 0][...].astype(jnp.float32)
+            + received.at[1, 0][...].astype(jnp.float32)
+            + received.at[0, 1][...].astype(jnp.float32)
+        )
+        out_staging[...] = total.astype(out_staging.dtype)
+        out_copy = pltpu.make_async_copy(
+            out_staging, output_ref.at[pl.ds(local_first, chunk), :], store_sem
+        )
+        out_copy.start()
+        out_copy.wait()
+        for stream in range(len(streams)):
+            pl.semaphore_signal(
+                credits.at[stream],
+                1,
+                device_id=(
+                    tables_ref[
+                        streams[stream][0],
+                        1,
+                        (positions[streams[stream][0]] - streams[stream][1]) % 32,
+                    ],
+                ),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+        for stream in range(len(streams)):
+            pl.semaphore_wait(credits.at[stream], 2)
+
+
+def _rank_half_reduce(
+    partial_local, tables, *, collective_id, acc_dtype=jnp.float32, out_dtype=None
+):
+    """Reduce-scatter rank-major ``[32 * rows, width]`` on physical half rings."""
+    total_rows, width = partial_local.shape
+    rows = total_rows // 32
+    chunk = min(64, rows)
+    blocks = rows // chunk
+    if out_dtype is None:
+        out_dtype = partial_local.dtype
+    streams = len(_half_ring_streams(width))
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    scratch = (
+        pltpu.SemaphoreType.DMA((2, streams)),
+        pltpu.SemaphoreType.DMA((streams,)),
+        pltpu.SemaphoreType.DMA((2, streams)),
+        pltpu.SemaphoreType.REGULAR((streams,)),
+        pltpu.SemaphoreType.DMA,
+        pltpu.VMEM((2, 2, chunk, width), partial_local.dtype),
+        pltpu.VMEM((2, chunk, width), acc_dtype),
+        pltpu.VMEM((2, 2, chunk, width), acc_dtype),
+        pltpu.VMEM((chunk, width), out_dtype),
+    )
+    return pl.pallas_call(
+        _rank_half_reduce_kernel,
+        out_shape=jax.ShapeDtypeStruct((rows, width), out_dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1, blocks * HALF_STEPS),
+            in_specs=(hbm,),
+            out_specs=hbm,
+            scratch_shapes=scratch,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=collective_id,
+            vmem_limit_bytes=64 * 1024**2,
+        ),
+        name="kimi_prefill_rank_half_rs",
+    )(jnp.asarray(tables, jnp.int32), partial_local)
+
+
 # ============================================================================
 # Attention output projection layout
 # ============================================================================
@@ -5081,9 +5385,11 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
     if token_ranks is None:
         token_ranks = tuple(range(32))
     tables = ring_tables(list(mesh.devices.flat), token_ranks)
-    local_tokens = seq_len // 32
+    gather_tables = ring_tables(list(mesh.devices.flat), tuple(range(32)))
 
-    def local_packed_cp(full_hidden, weights, segment_desc, length, pool, ids, local):
+    def local_packed_cp(
+        full_hidden, weights, segment_desc, length, pool, ids, local, counts=None, order=None
+    ):
         """One rank's view: this rank's 3 heads over every rank's prefix
         pages and the window."""
         local_weights = jax.tree.map(lambda value: value[0], weights)
@@ -5092,14 +5398,16 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         )
         query, new_key, new_value, output_gate, latent = mla_projections(
             full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2,
-            sp_axis="k3_sp")
+            sp_axis="k3_sp", gather_tables=gather_tables)
         tokens = query.shape[0]
         real = (jnp.arange(tokens) < length.reshape(()))[None, :, None]
         new_key = jnp.where(real, new_key.transpose(1, 0, 2), 0)
         new_value = jnp.where(real, new_value.transpose(1, 0, 2), 0)
         query = query.transpose(1, 0, 2)  # [3, T, 256]
-        pages, order = gathered_prefix_pages(pool, ids[0], local[0], tables, "k3_sp", count=segments,
-                                             capacity=prefix_capacity)
+        pages, order = gathered_prefix_pages(
+            pool, ids[0], local[0], tables, "k3_sp", count=segments,
+            capacity=prefix_capacity, counts=counts, order=order,
+        )
         arena = expand_prefix_pages(pages, order, projections.key_value_up_projection)
         attended = mla_flash_prefill_packed(
             query, new_key, new_value, length, segment_desc[:5 * segments], count=segments,
@@ -5110,12 +5418,21 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
 
     def run(hidden, prefix, weights, segment_desc, length, arena):
         (pool, ) = arena.pools
-        gated, latent = jax.shard_map(
-            local_packed_cp, mesh=mesh,
-            in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
-            out_specs=(P("k3_sp"), P("k3_sp")),
-            check_vma=False,
-        )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local)
+        if arena.counts is not None and arena.order is not None:
+            gated, latent = jax.shard_map(
+                local_packed_cp, mesh=mesh,
+                in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P()),
+                out_specs=(P("k3_sp"), P("k3_sp")),
+                check_vma=False,
+            )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local, arena.counts, arena.order)
+        else:
+            gated, latent = jax.shard_map(
+                local_packed_cp, mesh=mesh,
+                in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
+                out_specs=(P("k3_sp"), P("k3_sp")),
+                check_vma=False,
+            )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local)
+        local_tokens = prefix.shape[1]
         projected = project_reduce_scatter(
             gated, weights["output_projection_repacked"], mesh, tables,
             collective_id=collective_id,
@@ -5981,6 +6298,12 @@ def make_dense_ffn_sp(mesh, *, seq_len):
         raise ValueError("dense FFN SP requires flat TP32 and T divisible by 32")
     axis_name = mesh.axis_names[0]
     local_tokens = seq_len // 32
+    tables = None
+    if axis_name == "k3_sp" and local_tokens >= 16 and local_tokens % 16 == 0:
+        try:
+            tables = ring_tables(list(mesh.devices.flat), tuple(range(32)))
+        except ValueError:
+            tables = None
 
     def local(hidden, prefix, gate_up, down, length):
         x = hidden[0]
@@ -5992,7 +6315,10 @@ def make_dense_ffn_sp(mesh, *, seq_len):
         # weights are TP32 over the intermediate dimension, so every rank
         # applies its shard to every rank's rows (gathered in rank order) and
         # the partial outputs are reduce-scattered back to their owners.
-        x = jax.lax.all_gather(x, axis_name, tiled=True)
+        if tables is not None:
+            x = _rank_half_gather(x, tables, collective_id=46)
+        else:
+            x = jax.lax.all_gather(x, axis_name, tiled=True)
         gu = jax.lax.dot_general(
             x, gate_up[0], (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
@@ -6004,9 +6330,14 @@ def make_dense_ffn_sp(mesh, *, seq_len):
             middle, down[0], (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
-        reduced = jax.lax.psum_scatter(
-            partial, axis_name, scatter_dimension=0, tiled=True,
-        ).astype(jnp.bfloat16)
+        if tables is not None:
+            reduced = _rank_half_reduce(
+                partial, tables, collective_id=47, acc_dtype=jnp.float32, out_dtype=jnp.bfloat16
+            )
+        else:
+            reduced = jax.lax.psum_scatter(
+                partial, axis_name, scatter_dimension=0, tiled=True,
+            ).astype(jnp.bfloat16)
         rank = jax.lax.axis_index(axis_name)
         valid = sp_token_index(rank, jnp.arange(local_tokens), window_stripe(local_tokens)) < length[0]
         return (prefix[0] + jnp.where(valid[:, None], reduced, 0))[None]
@@ -6148,10 +6479,30 @@ def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
     )
     sharding = NamedSharding(mesh, P("k3_sp"))
 
+    def compute_prefix_meta(local_arr, *, page_tokens, slots):
+        every = jax.lax.all_gather(local_arr[0], "k3_sp")
+        counts = (jnp.sum(every[:, segments:], axis=1) // page_tokens).astype(jnp.int32)
+        order = prefix_page_order(
+            every, count=segments, page_tokens=page_tokens, slots=slots, capacity=prefix_capacity
+        )
+        return counts, order
+
     def run(prefix, blocks, common, kda_families, mla_families,
             moe_families, kda_state, mla_state, length, pair, segment_desc, arena, route=None):
         first = jnp.asarray([2 * pair[0] + 1], jnp.int32)
         second = first + 1
+        if arena.counts is None or arena.order is None:
+            pool0 = arena.pools[0]
+            page_tokens = pool0.shape[-3] * pool0.shape[-2]
+            slots = arena.ids.shape[1]
+            counts, order = jax.shard_map(
+                functools.partial(compute_prefix_meta, page_tokens=page_tokens, slots=slots),
+                mesh=mesh,
+                in_specs=(P("k3_sp"),),
+                out_specs=(P(), P()),
+                check_vma=False,
+            )(arena.local)
+            arena = CpPrefix(arena.pools, arena.ids, arena.local, counts, order)
         arenas = arena.split()
         middle, blocks, kda_state, mla_state, _, *r1 = group4(
             prefix, blocks, common, kda_families, mla_families,
@@ -6402,6 +6753,12 @@ def make_embedding_sp(mesh, *, seq_len, vocab_per_rank=5120):
         raise ValueError("embedding SP requires flat TP32 and T divisible by 32")
     axis_name = mesh.axis_names[0]
     local_tokens = seq_len // 32
+    tables = None
+    if axis_name == "k3_sp" and local_tokens >= 16 and local_tokens % 16 == 0:
+        try:
+            tables = ring_tables(list(mesh.devices.flat), tuple(range(32)))
+        except ValueError:
+            tables = None
 
     def local(tokens, embedding, length):
         rank = jax.lax.axis_index(axis_name)
@@ -6416,9 +6773,14 @@ def make_embedding_sp(mesh, *, seq_len, vocab_per_rank=5120):
         partial = jnp.where(
             matched[:, None], table[jnp.clip(local_ids, 0, vocab_per_rank - 1)], 0
         ).astype(jnp.bfloat16 if EMBED_BF16_REDUCE else jnp.float32)
-        hidden = jax.lax.psum_scatter(
-            partial, axis_name, scatter_dimension=0, tiled=True
-        ).astype(jnp.bfloat16)
+        if tables is not None:
+            hidden = _rank_half_reduce(
+                partial, tables, collective_id=48, acc_dtype=partial.dtype, out_dtype=jnp.bfloat16
+            )
+        else:
+            hidden = jax.lax.psum_scatter(
+                partial, axis_name, scatter_dimension=0, tiled=True
+            ).astype(jnp.bfloat16)
         valid = sp_token_index(rank, jnp.arange(local_tokens), window_stripe(local_tokens)) < length[0]
         return jnp.where(valid[:, None], hidden, 0)[None]
 
