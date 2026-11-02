@@ -956,9 +956,9 @@ SMALL_WINDOWS = (512, 1024)
 
 def check_window(seq_len, what):
     """Reject a window the sequence-parallel kernels can't run: 512, 1024,
-    or a multiple of 2048 up to 8192."""
-    if seq_len not in SMALL_WINDOWS and (seq_len % SP_BLOCK or not SP_BLOCK <= seq_len <= 8192):
-        raise ValueError(f"{what} needs T in {SMALL_WINDOWS} or 2048..8192 (a multiple of 2048)")
+    or a multiple of 2048 up to 16384."""
+    if seq_len not in SMALL_WINDOWS and (seq_len % SP_BLOCK or not SP_BLOCK <= seq_len <= 16384):
+        raise ValueError(f"{what} needs T in {SMALL_WINDOWS} or 2048..16384 (a multiple of 2048)")
 
 
 def window_stripe(local_rows):
@@ -1217,7 +1217,7 @@ def _all_gather_kernel(
             return [
                 pltpu.make_async_copy(
                     payload.at[pl.ds(row, count), cols],
-                    out.at[pl.ds(sp_token_index(dest, row, stripe), count), cols],
+                    out.at[pl.ds(sp_token_index(dest, local_first + row, stripe), count), cols],
                     store_sems.at[s],
                 )
                 for _, row, count in _stripe_pieces(begin, size, stripe)
@@ -1423,6 +1423,14 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
         raise ValueError("K3 projection/RS requires BF16 operands")
     tokens = x.shape[1]
     rows = tokens // 32
+    if rows == 512:
+        h0 = project_reduce_scatter(
+            x[:, :8192], w, mesh, tables, collective_id=collective_id
+        ).reshape(32, 256, 7168)
+        h1 = project_reduce_scatter(
+            x[:, 8192:], w, mesh, tables, collective_id=collective_id
+        ).reshape(32, 256, 7168)
+        return jnp.concatenate((h0, h1), axis=1).reshape(32 * 512, 7168)
     if rows > 256:
         raise ValueError("K3 projection/RS needs at most 256 rows per rank")
     regions = _regions(rows, 7168)
@@ -3122,12 +3130,152 @@ def _kda_chunk_core(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, inv
     return out, new_state, aux
 
 
+_LOG2E = 1.4426950408889634
+
+
+def _kda_chunk_fast(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, block=8):
+    """Inference fast path for one 64-token KDA chunk inside Pallas VMEM.
+
+    Matches ``mega_kda``'s validated Kimi-K3 BF16/DEFAULT-precision formulation:
+    - Sub-block (16-row) ``both`` matmuls run at ``Precision.DEFAULT`` over only
+      the causal ``j_end = (i + 1) * sub_block`` prefix columns without
+      transposing ``k_scaled``.
+    - Two-level (8x8 block) Neumann solve applies ``(I + G)^{-1} P`` directly
+      to ``rhs`` without materializing ``solve = (I + G)^{-1} P``, fusing the
+      doubling steps and ``P @ [F, rhs]``.
+    - Inter-chunk state read/update matmuls fuse ``[w, q_scaled] @ state`` and
+      ``[aqk, kg^T] @ v_new``.
+    """
+    head_count, chunk_size, _ = q.shape
+    value_channels = v.shape[-1]
+    if chunk_size % sub_block or chunk_size % block:
+        raise ValueError("chunk size must be a multiple of sub_block and block")
+    nc = chunk_size // sub_block
+    nc_inv = chunk_size // block
+    gc = _inclusive_cumsum_rows(gate) * _LOG2E  # [H, C, K] in log2 base
+    beta_k = beta[..., None].astype(jnp.float32)
+
+    row_iota = jax.lax.broadcasted_iota(jnp.int32, (sub_block, chunk_size), 0)
+    col_iota = jax.lax.broadcasted_iota(jnp.int32, (sub_block, chunk_size), 1)
+    aqk_parts = []
+    low_parts = []
+    k_eng_prefix = None
+    prev_anchor = None
+    for i in range(nc):
+        i_s = i * sub_block
+        j_end = i_s + sub_block
+        q_i = q[:, i_s:j_end]
+        k_i = k[:, i_s:j_end]
+        g_i = gc[:, i_s:j_end]
+        anchor = g_i[:, sub_block // 2 : sub_block // 2 + 1, :]  # [H, 1, K]
+        diff_i = g_i - anchor
+        row_scale = jnp.exp2(diff_i)
+        k_eng_cur = k_i * jnp.exp2(-diff_i)
+        if i == 0:
+            k_eng_prefix = k_eng_cur
+        else:
+            k_eng_prefix = jnp.concatenate(
+                (k_eng_prefix * jnp.exp2(anchor - prev_anchor), k_eng_cur),
+                axis=1,
+            )
+        prev_anchor = anchor
+        both_valid = jax.lax.dot_general(
+            jnp.concatenate((q_i * row_scale, k_i * row_scale), axis=1),
+            k_eng_prefix,
+            (((2,), (2,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.DEFAULT,
+        )
+        if j_end < chunk_size:
+            both = jnp.concatenate(
+                (
+                    both_valid,
+                    jnp.zeros(
+                        (head_count, 2 * sub_block, chunk_size - j_end),
+                        dtype=jnp.float32,
+                    ),
+                ),
+                axis=2,
+            )
+        else:
+            both = both_valid
+        in_diag = (col_iota >= i_s) & (col_iota < j_end)
+        cl = col_iota - i_s
+        causal_sub = ((~in_diag) | (row_iota >= cl))[None]
+        strict_sub = ((~in_diag) | (row_iota > cl))[None]
+        aqk_parts.append(_mask_where(causal_sub, both[:, :sub_block], jnp.float32(0)))
+        low_parts.append(
+            _mask_where(
+                strict_sub,
+                both[:, sub_block:] * beta_k[:, i_s:j_end],
+                jnp.float32(0),
+            )
+        )
+    aqk = jnp.concatenate(aqk_parts, axis=1)
+    low = jnp.concatenate(low_parts, axis=1)
+
+    eye = jnp.eye(chunk_size, dtype=jnp.float32)[None]
+    idx = jnp.arange(chunk_size, dtype=jnp.int32)
+    same_block = (idx[:, None] // block == idx[None, :] // block).astype(jnp.float32)
+    l_diag = low * same_block[None]
+    f = low - l_diag
+
+    neg_ld = -l_diag
+    p = eye + neg_ld
+    mk = neg_ld
+    diag_steps = block.bit_length() - 2  # block=8 -> 2 doublings
+    if diag_steps > 0:
+        mk = _dot3(mk, mk)
+        for _ in range(diag_steps - 1):
+            merged = _dot3(jnp.concatenate((p, mk), axis=1), mk)
+            p = p + merged[:, :chunk_size]
+            mk = merged[:, chunk_size:]
+        p = p + _dot3(p, mk)
+
+    rhs = jnp.concatenate(
+        (v * beta_k, k * jnp.exp2(gc) * beta_k),
+        axis=-1,
+    )  # [H, C, V + K]
+    if nc_inv == 1:
+        solved = _dot3(p, rhs)
+    else:
+        p_merged = _dot3(p, jnp.concatenate((f, rhs), axis=-1))
+        g = p_merged[:, :, :chunk_size]
+        p_rhs = p_merged[:, :, chunk_size:]
+        h = -g
+        inv_ig = eye + h
+        hk = h
+        off_steps = nc_inv.bit_length() - 2  # nc_inv=8 -> 2 doublings
+        if off_steps > 0:
+            hk = _dot3(hk, hk)
+            for _ in range(off_steps - 1):
+                merged = _dot3(jnp.concatenate((inv_ig, hk), axis=1), hk)
+                inv_ig = inv_ig + merged[:, :chunk_size]
+                hk = merged[:, chunk_size:]
+            inv_ig = inv_ig + _dot3(inv_ig, hk)
+        solved = _dot3(inv_ig, p_rhs)
+
+    u, w = solved[..., :value_channels], solved[..., value_channels:]
+    q_scaled = q * jnp.where(gc > -126.0, jnp.exp2(gc), jnp.float32(0))
+    state_prods = _dot3(jnp.concatenate((w, q_scaled), axis=1), state)
+    v_new = u - state_prods[:, :chunk_size]
+
+    g_last = gc[:, -1, :]  # [H, K]
+    kg = k * jnp.exp2(g_last[:, None, :] - gc)
+    v_prods = _dot3(jnp.concatenate((aqk, kg.transpose(0, 2, 1)), axis=1), v_new)
+    out = state_prods[:, chunk_size:] + v_prods[:, :chunk_size]
+    new_state = state * jnp.exp2(g_last)[:, :, None] + v_prods[:, chunk_size:]
+    return out, new_state
+
+
 def kda_chunk(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, invert=None):
     """One chunk of the Kimi delta rule; returns (out, new_state).
 
     See `_kda_chunk_core` for the full docstring. ``invert`` picks the
-    (I + L)^{-1} routine (default `_invert_delta_rule_two_level`).
+    (I + L)^{-1} routine (default `_kda_chunk_fast` fused two-level Neumann).
     """
+    if invert is None:
+        return _kda_chunk_fast(q, k, v, gate, beta, state, sub_block=sub_block)
     out, new_state, _ = _kda_chunk_core(
         q, k, v, gate, beta, state, sub_block=sub_block, invert=invert
     )
@@ -3140,7 +3288,7 @@ def kda_chunk(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, invert=No
 
 
 def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query_scale=1.0,
-                    sp_axis=None):
+                    sp_axis=None, gather_tables=None, gather_collective_id=45):
     """MLA Q/K/V projections for a token window (per-rank layout).
 
     ``hidden``: [T, hidden] BF16. Returns (query [T,3,256] times
@@ -3183,12 +3331,27 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
     rope = compressed[:, 512:576]
     if sp_axis is not None:
         width = query_latent.shape[1]
-        both = jax.lax.all_gather(
-            jnp.concatenate((query_latent, kv_latent, rope), axis=1), sp_axis, tiled=True
-        )
-        query_latent = both[:, :width]
-        kv_latent = both[:, width : width + 512]
-        rope = both[:, width + 512 :]
+        if gather_tables is not None and sp_axis == "k3_sp" and (width + 576) % 128 == 64:
+            padded_rope = jnp.pad(rope, ((0, 0), (0, 64)))
+            both = _rank_half_gather(
+                jnp.concatenate((query_latent, kv_latent, padded_rope), axis=1),
+                gather_tables,
+                collective_id=gather_collective_id,
+            )
+            output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
+            query_latent = both[:, :width]
+            kv_latent = both[:, width : width + 512]
+            rope = both[:, width + 512 : width + 576]
+        else:
+            both = jax.lax.all_gather(
+                jnp.concatenate((query_latent, kv_latent, rope), axis=1), sp_axis, tiled=True
+            )
+            output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
+            query_latent = both[:, :width]
+            kv_latent = both[:, width : width + 512]
+            rope = both[:, width + 512 :]
+    else:
+        output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
     query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
     query = query.reshape(tokens, _HEADS, 256)
 
@@ -3203,7 +3366,6 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
         axis=2,
     )
     new_value = expanded[:, :, 128:]
-    output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
     if return_latent:
         latent = jnp.concatenate((kv_latent, rope), axis=1)
         return query, new_key, new_value, output_gate, latent
@@ -3267,22 +3429,18 @@ def mixture_norm_tiled_body(
     n_tiles = tokens // tile
     active_count = active_ref[0]
 
-    weights = (
-        pltpu.make_async_copy(folded_ref, folded_buf, weight_sems.at[0]),
-        pltpu.make_async_copy(norm_ref, norm_buf, weight_sems.at[1]),
-    )
-    for copy in weights:
-        copy.start()
-    for copy in weights:
-        copy.wait()
-    folded = folded_buf[...]
-    norm = norm_buf[...]
-
     def load_prefix(t, slot):
         return pltpu.make_async_copy(
             prefix_ref.at[pl.ds(t * tile, tile), :],
             prefix_bufs.at[slot],
             prefix_sems.at[slot],
+        )
+
+    def load_block(t, block, b_slot):
+        return pltpu.make_async_copy(
+            blocks_ref.at[block, pl.ds(t * tile, tile), :],
+            block_buf.at[b_slot],
+            block_sem.at[b_slot],
         )
 
     def store_output(t, slot):
@@ -3292,10 +3450,25 @@ def mixture_norm_tiled_body(
             output_sems.at[slot],
         )
 
+    weights = (
+        pltpu.make_async_copy(folded_ref, folded_buf, weight_sems.at[0]),
+        pltpu.make_async_copy(norm_ref, norm_buf, weight_sems.at[1]),
+    )
+    for copy in weights:
+        copy.start()
     load_prefix(0, 0).start()
+    for copy in weights:
+        copy.wait()
+    folded = folded_buf[...]
+    norm = norm_buf[...]
 
     def tile_body(t):
         slot = t % 2
+
+        @pl.when(active_count > 0)
+        def prefetch_first_block():
+            load_block(t, 0, 0).start()
+
         load_prefix(t, slot).wait()
 
         @pl.when(t >= 2)
@@ -3315,15 +3488,15 @@ def mixture_norm_tiled_body(
 
         for block in range(8):
             @pl.when(block < active_count)
-            def include_block():
-                copy = pltpu.make_async_copy(
-                    blocks_ref.at[block, pl.ds(t * tile, tile), :],
-                    block_buf,
-                    block_sem.at[0],
-                )
-                copy.start()
-                copy.wait()
-                values = block_buf[...].astype(jnp.float32)
+            def include_block(*, block=block):
+                b_slot = block % 2
+
+                @pl.when(block + 1 < active_count)
+                def prefetch_next_block(*, block=block, b_slot=b_slot):
+                    load_block(t, block + 1, 1 - b_slot).start()
+
+                load_block(t, block, b_slot).wait()
+                values = block_buf.at[b_slot][...].astype(jnp.float32)
                 score = jnp.sum(values * folded, axis=1)
                 score *= jax.lax.rsqrt(jnp.mean(values * values, axis=1) + eps)
                 old_max = row_max_buf[...]
@@ -3356,7 +3529,7 @@ def mixture_norm_tiled_scratch_shapes(hidden_size, tile):
     """Scratch specs in the order expected by ``mixture_norm_tiled_body``."""
     return (
         pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),
-        pltpu.VMEM((tile, hidden_size), jnp.bfloat16),
+        pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),
         pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),
         pltpu.VMEM((tile, hidden_size), jnp.float32),
         pltpu.VMEM((tile, 1), jnp.float32),
@@ -3364,7 +3537,7 @@ def mixture_norm_tiled_scratch_shapes(hidden_size, tile):
         pltpu.VMEM((1, hidden_size), jnp.float32),
         pltpu.VMEM((1, hidden_size), jnp.bfloat16),
         pltpu.SemaphoreType.DMA((2,)),
-        pltpu.SemaphoreType.DMA((1,)),
+        pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((2,)),
     )
@@ -3598,9 +3771,11 @@ def kda_prefill_tiled_body(
         )
 
     def store_tile(t, buf):
-        copies = [pltpu.make_async_copy(
-            out_bufs.at[buf], out_ref.at[pl.ds(t * tile, tile), :], out_sems.at[buf]
-        )]
+        copies = []
+        if out_ref is not None:
+            copies.append(pltpu.make_async_copy(
+                out_bufs.at[buf], out_ref.at[pl.ds(t * tile, tile), :], out_sems.at[buf]
+            ))
         if projection is not None:
             copies.append(pltpu.make_async_copy(
                 partial_bufs.at[buf], partial_ref.at[pl.ds(t * tile, tile), :],
@@ -3684,25 +3859,6 @@ def kda_prefill_tiled_body(
             )
         filtered = jax.nn.silu(convolved).astype(jnp.bfloat16)
         filtered = _row_where(real_rows, filtered)
-        # The history starts at the end of the real prefix. Mosaic does not
-        # lower dynamic_slice on a value, so only the one partial tile uses a
-        # masked reduction; full tiles use a static slice.
-        real_count = jnp.clip(row_end - t * tile, 0, tile)
-
-        @pl.when(real_count == tile)
-        def carry_full_tile():
-            conv_hist_vmem[...] = window[tile : tile + 3]
-
-        @pl.when((real_count > 0) & (real_count < tile))
-        def carry_partial_tile():
-            rows = jnp.arange(tile + 3, dtype=jnp.int32)
-            picked = []
-            for i in range(3):
-                picked.append(
-                    jnp.sum(_row_where(rows == real_count + i, window), axis=0)
-                )
-            conv_hist_vmem[...] = jnp.stack(picked)
-
         query = filtered[:, 0].astype(jnp.float32)
         key = filtered[:, 1].astype(jnp.float32)
         value = filtered[:, 2].astype(jnp.float32)
@@ -3734,13 +3890,33 @@ def kda_prefill_tiled_body(
             output_gate.astype(jnp.float32)
         ).astype(jnp.bfloat16)
         attended = attended.reshape(tile, width)
-        out_bufs.at[buf][...] = attended
+        if out_bufs is not None:
+            out_bufs.at[buf][...] = attended
         if projection is not None:
             columns = weight_vmem.shape[1] // 4
             for c in range(4):  # in column quarters: bounded temporaries
                 partial_bufs.at[buf, :, pl.ds(c * columns, columns)][...] = _dot(
                     attended, weight_vmem[:, pl.ds(c * columns, columns)]
                 ).astype(jnp.bfloat16)
+
+        # Defer @pl.when conv-history carry until after the entire compute +
+        # projection chain so Mosaic keeps all tile intermediates in VREGs
+        # without flushing across @pl.when basic-block boundaries.
+        real_count = jnp.clip(row_end - t * tile, 0, tile)
+
+        @pl.when(real_count == tile)
+        def carry_full_tile():
+            conv_hist_vmem[...] = window[tile : tile + 3]
+
+        @pl.when((real_count > 0) & (real_count < tile))
+        def carry_partial_tile():
+            rows = jnp.arange(tile + 3, dtype=jnp.int32)
+            picked = []
+            for i in range(3):
+                picked.append(
+                    jnp.sum(_row_where(rows == real_count + i, window), axis=0)
+                )
+            conv_hist_vmem[...] = jnp.stack(picked)
 
         if tile_segment is not None:
             segment, segment_end, current, offset, position = tile_segment
@@ -3798,25 +3974,27 @@ class _Copies:
 
 
 def kda_prefill_tiled_scratch_shapes(
-    hidden_size, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm
+    hidden_size, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm, *, store_out=True
 ):
     """Scratch specs, in the order expected by ``kda_prefill_tiled_body``."""
     width = _HEADS * _CHANNELS
     return (
-        pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),
-        pltpu.VMEM((2, tile, width), jnp.bfloat16),
-        pltpu.VMEM(gate_w.shape, gate_w.dtype),
-        pltpu.VMEM(fb_w.shape, fb_w.dtype),
-        pltpu.VMEM(proj_w.shape, proj_w.dtype),
-        pltpu.VMEM(conv_w.shape, conv_w.dtype),
-        pltpu.VMEM(alog.shape, alog.dtype),
-        pltpu.VMEM(dt.shape, dt.dtype),
-        pltpu.VMEM(norm.shape, norm.dtype),
-        pltpu.VMEM((_HEADS, _CHANNELS, _CHANNELS), jnp.float32),
-        pltpu.VMEM((3, 3, _HEADS, _CHANNELS), jnp.bfloat16),
-        pltpu.SemaphoreType.DMA((2,)),
-        pltpu.SemaphoreType.DMA((2,)),
-        pltpu.SemaphoreType.DMA((16,)),
+        (pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),)
+        + ((pltpu.VMEM((2, tile, width), jnp.bfloat16),) if store_out else ())
+        + (
+            pltpu.VMEM(gate_w.shape, gate_w.dtype),
+            pltpu.VMEM(fb_w.shape, fb_w.dtype),
+            pltpu.VMEM(proj_w.shape, proj_w.dtype),
+            pltpu.VMEM(conv_w.shape, conv_w.dtype),
+            pltpu.VMEM(alog.shape, alog.dtype),
+            pltpu.VMEM(dt.shape, dt.dtype),
+            pltpu.VMEM(norm.shape, norm.dtype),
+            pltpu.VMEM((_HEADS, _CHANNELS, _CHANNELS), jnp.float32),
+            pltpu.VMEM((3, 3, _HEADS, _CHANNELS), jnp.bfloat16),
+            pltpu.SemaphoreType.DMA((2,)),
+        )
+        + ((pltpu.SemaphoreType.DMA((2,)),) if store_out else ())
+        + (pltpu.SemaphoreType.DMA((16,)),)
     )
 
 
@@ -4279,9 +4457,14 @@ class CpPrefix(NamedTuple):
     pools: tuple
     ids: Any
     local: Any
+    counts: Any = None
+    order: Any = None
 
     def split(self):
-        return tuple(CpPrefix((pool, ), self.ids, self.local) for pool in self.pools)
+        return tuple(
+            CpPrefix((pool, ), self.ids, self.local, self.counts, self.order)
+            for pool in self.pools
+        )
 
 
 GATHER_STREAMS = 6  # the three physical ring cycles, both directions
@@ -4380,7 +4563,8 @@ def _prefix_page_gather_kernel(tables, counts_ref, ids_ref, pool_hbm, out_hbm, l
     pl.semaphore_wait(done, len(neighbours))
 
 
-def gathered_prefix_pages(pool, ids, local, tables, axis_name, *, count, capacity):
+def gathered_prefix_pages(pool, ids, local, tables, axis_name, *, count, capacity,
+                          counts=None, order=None):
     """Every rank's cached prefix pages, gathered (inside ``shard_map``):
     ``(pages, order)`` for ``expand_prefix_pages``. ``pool``/``ids``/``local``
     are this rank's view (see ``CpPrefix``). ``pages`` holds every rank's
@@ -4389,9 +4573,14 @@ def gathered_prefix_pages(pool, ids, local, tables, axis_name, *, count, capacit
     the most prefix tokens a window holds."""
     page_tokens = pool.shape[-3] * pool.shape[-2]
     slots = ids.shape[0]  # 1 + P: slot 0 holds the count (never referenced)
-    every = jax.lax.all_gather(local, axis_name)  # [32, 2 * count]: bases, token counts
-    ranks = every.shape[0]
-    counts = jnp.sum(every[:, count:], axis=1) // page_tokens  # pages per rank
+    if counts is None or order is None:
+        every = jax.lax.all_gather(local, axis_name)  # [32, 2 * count]: bases, token counts
+        ranks = every.shape[0]
+        counts = jnp.sum(every[:, count:], axis=1) // page_tokens  # pages per rank
+        order = prefix_page_order(every, count=count, page_tokens=page_tokens, slots=slots,
+                                  capacity=capacity)
+    else:
+        ranks = counts.shape[0]
     pages = pl.pallas_call(
         functools.partial(_prefix_page_gather_kernel, slots=slots),
         out_shape=jax.ShapeDtypeStruct((ranks * slots, *pool.shape[1:]), pool.dtype),
@@ -4405,8 +4594,29 @@ def gathered_prefix_pages(pool, ids, local, tables, axis_name, *, count, capacit
         compiler_params=pltpu.CompilerParams(collective_id=44),
         name="kimi_prefill_prefix_page_gather",
     )(jnp.asarray(tables, jnp.int32), counts.astype(jnp.int32), ids.astype(jnp.int32), pool)
-    return pages, prefix_page_order(every, count=count, page_tokens=page_tokens, slots=slots,
-                                    capacity=capacity)
+    return pages, order
+
+
+def cp_prefix_meta(mesh, pool, ids, local, *, segments, capacity):
+    """The ``(counts, order)`` of a window's ``CpPrefix`` (see
+    ``gathered_prefix_pages``), replicated: every MLA layer of the window
+    shares them, so they can be computed once and carried on the arena.
+    ``pool`` (any of the window's pools) gives the page size; ``ids``/
+    ``local`` are the global ``[32, 1 + P]`` / ``[32, 2 * segments]``."""
+    page_tokens = pool.shape[-3] * pool.shape[-2]
+    slots = ids.shape[1]
+
+    def local_meta(local_arr):
+        every = jax.lax.all_gather(local_arr[0], "k3_sp")  # [32, 2 * segments]
+        counts = (jnp.sum(every[:, segments:], axis=1) // page_tokens).astype(jnp.int32)
+        order = prefix_page_order(
+            every, count=segments, page_tokens=page_tokens, slots=slots, capacity=capacity
+        )
+        return counts, order
+
+    return jax.shard_map(
+        local_meta, mesh=mesh, in_specs=(P("k3_sp"),), out_specs=(P(), P()), check_vma=False,
+    )(local)
 
 
 def prefix_page_order(every, *, count, page_tokens, slots, capacity):
@@ -4477,19 +4687,28 @@ def _expand_pages_kernel(order_ref, pages_hbm, up_ref, keys_hbm, values_hbm, buf
             for copy in writes(c - 2, slot):
                 copy.wait()
 
+        xs = []
         for j in range(pages):
             # Token order within a page is free (a page never spans sequences).
-            x = pltpu.bitcast(words.at[slot, j].reshape(page_rows, lanes)[...], buf.dtype).astype(jnp.bfloat16)
-            x = jnp.where(c * pages + j < total, x, jnp.zeros((), x.dtype))  # stale slots may hold NaN
-            rows = pl.ds(j * page_tokens, page_tokens)
-            rope = x[:, 512:576]
-            for h in range(heads):
-                expanded = jnp.dot(x[:, :512], up_ref[:, h * 256:(h + 1) * 256],
-                                   preferred_element_type=jnp.float32).astype(jnp.bfloat16)
-                kbuf[slot, h, rows, :] = jnp.concatenate(
-                    (expanded[:, :128], rope, jnp.zeros((page_tokens, 64), jnp.bfloat16)),
-                    axis=-1).astype(kbuf.dtype)
-                vbuf[slot, h, :, rows] = expanded[:, 128:].T.astype(vbuf.dtype)
+            xj = pltpu.bitcast(
+                words.at[slot, j].reshape(page_rows, lanes)[...], buf.dtype
+            ).astype(jnp.bfloat16)
+            xj = jnp.where(
+                c * pages + j < total, xj, jnp.zeros((), xj.dtype)
+            )  # stale slots may hold NaN
+            xs.append(xj)
+        x_all = jnp.concatenate(xs, axis=0)
+        rope_all = x_all[:, 512:576]
+        expanded_all = jnp.dot(
+            x_all[:, :512], up_ref[...], preferred_element_type=jnp.float32
+        ).astype(jnp.bfloat16)
+        zeros_all = jnp.zeros((span, 64), jnp.bfloat16)
+        for h in range(heads):
+            eh = expanded_all[:, h * 256 : (h + 1) * 256]
+            kbuf[slot, h, :, :] = jnp.concatenate(
+                (eh[:, :128], rope_all, zeros_all), axis=-1
+            ).astype(kbuf.dtype)
+            vbuf[slot, h, :, :] = eh[:, 128:].T.astype(vbuf.dtype)
         for copy in writes(c, slot):
             copy.start()
         return carry
@@ -4683,7 +4902,7 @@ def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, o
         copy = pltpu.make_async_copy(
             local_ref.at[local_rows], window_ref.at[window_rows(0, positions[0])], own_sem)
         copy.start()
-        if local_ref.shape[0] not in (16, 32, 64, 128, 256):
+        if local_ref.shape[0] not in (16, 32, 64, 128, 256, 512):
             copy.wait()
 
     for stream, (family, direction, col, width) in enumerate(_half_ring_streams(local_ref.shape[1])):
@@ -4716,7 +4935,7 @@ def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, o
     # The local destination is disjoint from every remote stripe. Let the
     # copy run while the half rings progress, then join before KDA consumes
     # this block and before own_sem is reused for the next block.
-    if local_ref.shape[0] in (16, 32, 64, 128, 256):
+    if local_ref.shape[0] in (16, 32, 64, 128, 256, 512):
         @pl.when(step == HALF_STEPS - 1)
         def finish_local():
             pltpu.make_async_copy(
@@ -4840,6 +5059,288 @@ def _half_reduce_step(
             pl.semaphore_wait(credits.at[stream], 2)
 
 
+def _rank_half_gather_kernel(
+    tables_ref, local_ref, window_ref, send_sems, recv_sems, own_sem, done
+):
+    """Gather rank-major ``local_ref`` ``[rows, width]`` into ``window_ref``
+    ``[32 * rows, width]`` in 17 bidirectional direct-HBM steps."""
+    step = pl.program_id(1)
+    rank = jax.lax.axis_index("k3_sp")
+    rows = local_ref.shape[0]
+    positions = [tables_ref[f, 0, rank] for f in range(3)]
+    neighbours = [
+        tables_ref[f, 1, (positions[f] + d) % 32] for f in range(3) for d in (-1, 1)
+    ]
+
+    def owner_rows(family, position):
+        owner = tables_ref[family, 2, tables_ref[family, 1, position % 32]]
+        return pl.ds(owner * rows, rows)
+
+    pl.when(step == 0)(lambda: _ring_enter(tables_ref, rank))
+
+    @pl.when(step == 0)
+    def own_rows():
+        pltpu.make_async_copy(
+            local_ref, window_ref.at[owner_rows(0, positions[0])], own_sem
+        ).start()
+
+    for stream, (family, direction, col, width) in enumerate(
+        _half_ring_streams(local_ref.shape[1])
+    ):
+        cols = pl.ds(col, width)
+        hops = HALF_HOPS[direction]
+        position = positions[family]
+        target = (tables_ref[family, 1, (position + direction) % 32],)
+
+        def send(
+            index,
+            source,
+            family=family,
+            direction=direction,
+            cols=cols,
+            position=position,
+            target=target,
+            stream=stream,
+        ):
+            r_sl = owner_rows(family, position - direction * index)
+            return pltpu.make_async_remote_copy(
+                source if source is not None else window_ref.at[r_sl, cols],
+                window_ref.at[r_sl, cols],
+                send_sems.at[stream],
+                recv_sems.at[stream, index],
+                device_id=target,
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+
+        own = local_ref.at[:, cols]
+        pl.when(step == 0)(lambda send=send, own=own: send(0, own).start())
+
+        @pl.when((step >= 1) & (step <= hops))
+        def arrived(send=send):
+            copy = send(step - 1, None)
+            copy.wait_recv()
+            copy.wait_send()
+
+        @pl.when((step >= 1) & (step < hops))
+        def forward(send=send):
+            send(step, None).start()
+
+    @pl.when(step == HALF_STEPS - 1)
+    def finish_local():
+        pltpu.make_async_copy(
+            local_ref, window_ref.at[owner_rows(0, positions[0])], own_sem
+        ).wait()
+        for peer in neighbours:
+            pl.semaphore_signal(
+                done, 1, device_id=(peer,), device_id_type=pl.DeviceIdType.MESH
+            )
+        pl.semaphore_wait(done, len(neighbours))
+
+
+def _rank_half_gather(local_arr, tables, *, collective_id):
+    """Gather BF16 ``[rows, width]`` in mesh-rank order on physical half rings."""
+    rows, width = local_arr.shape
+    streams = len(_half_ring_streams(width))
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    return pl.pallas_call(
+        _rank_half_gather_kernel,
+        out_shape=jax.ShapeDtypeStruct((32 * rows, width), local_arr.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1, HALF_STEPS),
+            in_specs=(hbm,),
+            out_specs=hbm,
+            scratch_shapes=(
+                pltpu.SemaphoreType.DMA((streams,)),
+                pltpu.SemaphoreType.DMA((streams, HALF_HOPS[1])),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.REGULAR,
+            ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=collective_id,
+            vmem_limit_bytes=16 * 1024**2,
+        ),
+        name="kimi_prefill_rank_half_ag",
+    )(jnp.asarray(tables, jnp.int32), local_arr)
+
+
+def _rank_half_reduce_kernel(
+    tables_ref,
+    partial_ref,
+    output_ref,
+    read_sems,
+    send_sems,
+    recv_sems,
+    credits,
+    store_sem,
+    local_bufs,
+    payload,
+    received,
+    out_staging,
+):
+    """Reduce-scatter rank-major ``partial_ref`` ``[32 * rows, width]`` into
+    ``output_ref`` ``[rows, width]`` on physical 17-step half rings."""
+    step_all = pl.program_id(1)
+    block, step = step_all // HALF_STEPS, step_all % HALF_STEPS
+    rank = jax.lax.axis_index("k3_sp")
+    positions = [tables_ref[f, 0, rank] for f in range(3)]
+    chunk = payload.shape[1]
+    rows = output_ref.shape[0]
+    local_first = block * chunk
+    streams = _half_ring_streams(partial_ref.shape[1])
+
+    pl.when(step_all == 0)(lambda: _ring_enter(tables_ref, rank))
+
+    for stream, (family, direction, col, width) in enumerate(streams):
+        cols = pl.ds(col, width)
+        hops = HALF_HOPS[direction]
+        position = positions[family]
+        side = 0 if direction == 1 else 1
+        target = (tables_ref[family, 1, (position + direction) % 32],)
+        source = (tables_ref[family, 1, (position - direction) % 32],)
+
+        def read(
+            index,
+            family=family,
+            direction=direction,
+            cols=cols,
+            position=position,
+            hops=hops,
+            side=side,
+            stream=stream,
+        ):
+            peer = tables_ref[family, 1, (position + direction * (hops - index)) % 32]
+            owner = tables_ref[family, 2, peer]
+            return pltpu.make_async_copy(
+                partial_ref.at[pl.ds(owner * rows + local_first, chunk), cols],
+                local_bufs.at[index % 2, side, :, cols],
+                read_sems.at[index % 2, stream],
+            )
+
+        def remote(index, cols=cols, side=side, target=target, stream=stream):
+            return pltpu.make_async_remote_copy(
+                payload.at[side, :, cols],
+                received.at[index % 2, side, :, cols],
+                send_sems.at[stream],
+                recv_sems.at[index % 2, stream],
+                device_id=target,
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+
+        pl.when(step == 0)(lambda read=read: read(0).start())
+
+        @pl.when(step <= hops)
+        def accumulate(
+            read=read,
+            remote=remote,
+            cols=cols,
+            side=side,
+            hops=hops,
+            stream=stream,
+            source=source,
+        ):
+            read(step).wait()
+            pl.when(step < hops)(lambda: read(step + 1).start())
+            local = local_bufs.at[step % 2, side, :, cols][...].astype(payload.dtype)
+
+            @pl.when(step == 0)
+            def seed():
+                payload.at[side, :, cols][...] = local
+
+            @pl.when((step > 0) & (step < hops))
+            def add():
+                remote(step - 1).wait()
+                payload.at[side, :, cols][...] = (
+                    local + received.at[(step - 1) % 2, side, :, cols][...]
+                )
+                pl.semaphore_signal(
+                    credits.at[stream],
+                    1,
+                    device_id=source,
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+
+            @pl.when(step < hops)
+            def forward():
+                pl.when(step >= 2)(lambda: pl.semaphore_wait(credits.at[stream], 1))
+                remote(step).start()
+
+            @pl.when(step == hops)
+            def last():
+                remote(step - 1).wait()
+
+    @pl.when(step == HALF_STEPS - 1)
+    def finish():
+        total = (
+            local_bufs.at[0, 0][...].astype(jnp.float32)
+            + received.at[1, 0][...].astype(jnp.float32)
+            + received.at[0, 1][...].astype(jnp.float32)
+        )
+        out_staging[...] = total.astype(out_staging.dtype)
+        out_copy = pltpu.make_async_copy(
+            out_staging, output_ref.at[pl.ds(local_first, chunk), :], store_sem
+        )
+        out_copy.start()
+        out_copy.wait()
+        for stream in range(len(streams)):
+            pl.semaphore_signal(
+                credits.at[stream],
+                1,
+                device_id=(
+                    tables_ref[
+                        streams[stream][0],
+                        1,
+                        (positions[streams[stream][0]] - streams[stream][1]) % 32,
+                    ],
+                ),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+        for stream in range(len(streams)):
+            pl.semaphore_wait(credits.at[stream], 2)
+
+
+def _rank_half_reduce(
+    partial_local, tables, *, collective_id, acc_dtype=jnp.float32, out_dtype=None
+):
+    """Reduce-scatter rank-major ``[32 * rows, width]`` on physical half rings."""
+    total_rows, width = partial_local.shape
+    rows = total_rows // 32
+    chunk = min(64, rows)
+    blocks = rows // chunk
+    if out_dtype is None:
+        out_dtype = partial_local.dtype
+    streams = len(_half_ring_streams(width))
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    scratch = (
+        pltpu.SemaphoreType.DMA((2, streams)),
+        pltpu.SemaphoreType.DMA((streams,)),
+        pltpu.SemaphoreType.DMA((2, streams)),
+        pltpu.SemaphoreType.REGULAR((streams,)),
+        pltpu.SemaphoreType.DMA,
+        pltpu.VMEM((2, 2, chunk, width), partial_local.dtype),
+        pltpu.VMEM((2, chunk, width), acc_dtype),
+        pltpu.VMEM((2, 2, chunk, width), acc_dtype),
+        pltpu.VMEM((chunk, width), out_dtype),
+    )
+    return pl.pallas_call(
+        _rank_half_reduce_kernel,
+        out_shape=jax.ShapeDtypeStruct((rows, width), out_dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1, blocks * HALF_STEPS),
+            in_specs=(hbm,),
+            out_specs=hbm,
+            scratch_shapes=scratch,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=collective_id,
+            vmem_limit_bytes=64 * 1024**2,
+        ),
+        name="kimi_prefill_rank_half_rs",
+    )(jnp.asarray(tables, jnp.int32), partial_local)
+
+
 # ============================================================================
 # Attention output projection layout
 # ============================================================================
@@ -4906,9 +5407,11 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
     if token_ranks is None:
         token_ranks = tuple(range(32))
     tables = ring_tables(list(mesh.devices.flat), token_ranks)
-    local_tokens = seq_len // 32
+    gather_tables = ring_tables(list(mesh.devices.flat), tuple(range(32)))
 
-    def local_packed_cp(full_hidden, weights, segment_desc, length, pool, ids, local):
+    def local_packed_cp(
+        full_hidden, weights, segment_desc, length, pool, ids, local, counts=None, order=None
+    ):
         """One rank's view: this rank's 3 heads over every rank's prefix
         pages and the window."""
         local_weights = jax.tree.map(lambda value: value[0], weights)
@@ -4917,14 +5420,16 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         )
         query, new_key, new_value, output_gate, latent = mla_projections(
             full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2,
-            sp_axis="k3_sp")
+            sp_axis="k3_sp", gather_tables=gather_tables)
         tokens = query.shape[0]
         real = (jnp.arange(tokens) < length.reshape(()))[None, :, None]
         new_key = jnp.where(real, new_key.transpose(1, 0, 2), 0)
         new_value = jnp.where(real, new_value.transpose(1, 0, 2), 0)
         query = query.transpose(1, 0, 2)  # [3, T, 256]
-        pages, order = gathered_prefix_pages(pool, ids[0], local[0], tables, "k3_sp", count=segments,
-                                             capacity=prefix_capacity)
+        pages, order = gathered_prefix_pages(
+            pool, ids[0], local[0], tables, "k3_sp", count=segments,
+            capacity=prefix_capacity, counts=counts, order=order,
+        )
         arena = expand_prefix_pages(pages, order, projections.key_value_up_projection)
         attended = mla_flash_prefill_packed(
             query, new_key, new_value, length, segment_desc[:5 * segments], count=segments,
@@ -4935,12 +5440,21 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
 
     def run(hidden, prefix, weights, segment_desc, length, arena):
         (pool, ) = arena.pools
-        gated, latent = jax.shard_map(
-            local_packed_cp, mesh=mesh,
-            in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
-            out_specs=(P("k3_sp"), P("k3_sp")),
-            check_vma=False,
-        )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local)
+        if arena.counts is not None and arena.order is not None:
+            gated, latent = jax.shard_map(
+                local_packed_cp, mesh=mesh,
+                in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P()),
+                out_specs=(P("k3_sp"), P("k3_sp")),
+                check_vma=False,
+            )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local, arena.counts, arena.order)
+        else:
+            gated, latent = jax.shard_map(
+                local_packed_cp, mesh=mesh,
+                in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
+                out_specs=(P("k3_sp"), P("k3_sp")),
+                check_vma=False,
+            )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local)
+        local_tokens = prefix.shape[1]
         projected = project_reduce_scatter(
             gated, weights["output_projection_repacked"], mesh, tables,
             collective_id=collective_id,
@@ -5453,7 +5967,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     if (
         cfg.prefill_fused_moe
         and cfg.prefill_expert_parallel in (8, 16)
-        and seq_len in (512, 1024, 2048, 4096, 8192)
+        and seq_len in (512, 1024, 2048, 4096, 8192, 16384)
     ):
         from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
         return make_packed_moe(mesh, seq_len=seq_len)
@@ -5495,12 +6009,15 @@ def _norm_gather_body(
 ):
     mix_scratch = scratch[:12]
     ring_scratch = scratch[12:]
-    @pl.when(pl.program_id(1) == 0)
+
+    @pl.when((pl.program_id(0) == 0) & (pl.program_id(1) == 0))
     def normalize():
-        mixture_norm_tiled_body(
-            active_ref, prefix_ref, blocks_ref, folded_ref, norm_ref,
-            normalized_ref, *mix_scratch, tile=mix_tile, eps=eps,
-        )
+        for m_idx in range(prefix_ref.shape[0] // mix_tile):
+            r_sl = pl.ds(m_idx * mix_tile, mix_tile)
+            mixture_norm_tiled_body(
+                active_ref, prefix_ref.at[r_sl], blocks_ref.at[:, r_sl], folded_ref, norm_ref,
+                normalized_ref.at[r_sl], *mix_scratch, tile=mix_tile, eps=eps,
+            )
 
     _all_gather_kernel(
         tables_ref, normalized_ref, gathered_ref, *ring_scratch,
@@ -5519,34 +6036,36 @@ def make_norm_gather_sp(mesh, *, seq_len, token_ranks=None,
         raise ValueError("norm/gather requires a flat k3_sp TP32 mesh")
     check_window(seq_len, "fused norm/gather")
     rows, width = seq_len // 32, 7168
+    tile_rows = min(rows, 256)
+    num_tiles = rows // tile_rows
     if token_ranks is None:
         token_ranks = tuple(range(32))
     tables = jnp.asarray(
         ring_tables(list(mesh.devices.flat), token_ranks), jnp.int32,
     )
-    regions = _regions(rows, width)
+    regions = _regions(tile_rows, width)
     streams = len(regions)
-    mix_scratch = mixture_norm_tiled_scratch_shapes(width, rows)
+    mix_scratch = mixture_norm_tiled_scratch_shapes(width, tile_rows)
     ring_scratch = (
         pltpu.SemaphoreType.DMA((streams,)),
         pltpu.SemaphoreType.DMA((streams,)),
         pltpu.SemaphoreType.DMA((2, streams)),
         pltpu.SemaphoreType.REGULAR((streams,)),
         pltpu.SemaphoreType.DMA((streams,)),
-        pltpu.VMEM((rows, width), jnp.bfloat16),
-        pltpu.VMEM((2, rows, width), jnp.bfloat16),
+        pltpu.VMEM((tile_rows, width), jnp.bfloat16),
+        pltpu.VMEM((2, tile_rows, width), jnp.bfloat16),
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     call = pl.pallas_call(
         functools.partial(_norm_gather_body, regions=regions, eps=eps,
-                          mix_tile=rows),
+                          mix_tile=tile_rows),
         out_shape=(
             jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
             jax.ShapeDtypeStruct((seq_len, width), jnp.bfloat16),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            grid=(1, 32),
+            grid=(num_tiles, 32),
             in_specs=(hbm, hbm, hbm, hbm),
             out_specs=(hbm, hbm),
             scratch_shapes=(*mix_scratch, *ring_scratch),
@@ -5576,9 +6095,9 @@ def _kda_layer_body(
     gate_family_ref, fb_family_ref, proj_family_ref, conv_family_ref,
     alog_family_ref, dt_family_ref, kda_norm_family_ref,
     rec_in_ref, hist_in_ref, output_family_ref,
-    normalized_ref, gathered_ref, attended_ref, rec_out_ref, hist_out_ref,
+    normalized_ref, gathered_ref, rec_out_ref, hist_out_ref,
     final_ref, rec_checkpoint_ref, hist_checkpoint_ref, partial_ref,
-    pool, *scratch, eps, count, blocks,
+    pool, *scratch, eps, count, blocks, kda_tile=128,
 ):
     """One KDA layer of the family-major weights (``slot_ref``) over a
     packed window of ``count`` sequences, pipelined over its ``blocks`` SP
@@ -5597,7 +6116,7 @@ def _kda_layer_body(
     stripe = window_stripe(prefix_ref.shape[0])
     mix_small, gather_sems = scratch[:8], scratch[8:11]
     reduce_sems, projection_scratch = scratch[11:16], scratch[16:19]
-    kda_scratch = scratch[19:]
+    hidden_bufs, *kda_weights_and_state, hidden_sems, weight_sems = scratch[19:]
 
     def views(shapes):  # the shared pool: the mixture at step 0, then the projection ring
         offset, result = 0, []
@@ -5634,7 +6153,7 @@ def _kda_layer_body(
 
     # One call site for the KDA tile: inlined twice, the layer would no
     # longer fit the instruction memory.
-    block_tiles = 32 * stripe // 128
+    block_tiles = 32 * stripe // kda_tile
     attending = (phase >= 1) & (phase <= blocks)
     first_tile = jnp.where(
         attending, (phase - 1) * block_tiles + ring_step * block_tiles // HALF_STEPS, 0)
@@ -5645,8 +6164,9 @@ def _kda_layer_body(
         proj_family_ref.at[slot], conv_family_ref.at[slot],
         alog_family_ref.at[slot], dt_family_ref.at[slot],
         kda_norm_family_ref.at[slot], rec_in_ref, hist_in_ref,
-        attended_ref, rec_out_ref, hist_out_ref, *kda_scratch,
-        tile=128, decay_lower_bound=-5.0, epsilon=eps,
+        None, rec_out_ref, hist_out_ref,
+        hidden_bufs, None, *kda_weights_and_state, hidden_sems, None, weight_sems,
+        tile=kda_tile, decay_lower_bound=-5.0, epsilon=eps,
         checkpoint=(None, rec_checkpoint_ref, hist_checkpoint_ref),
         segments=(segment_ref, count),
         tiles=(first_tile, end_tile, step == HALF_STEPS,
@@ -5660,7 +6180,7 @@ def _kda_layer_body(
 def _kda_mix_shapes(mix_tile):
     return (
         ((2, mix_tile, 7168), jnp.bfloat16),
-        ((mix_tile, 7168), jnp.bfloat16),
+        ((2, mix_tile, 7168), jnp.bfloat16),
         ((2, mix_tile, 7168), jnp.bfloat16),
         ((mix_tile, 7168), jnp.float32),
     )
@@ -5697,6 +6217,7 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
     rows, width = seq_len // 32, 7168
     stripe = window_stripe(rows)
     blocks = rows // stripe
+    kda_tile = 128
     if token_ranks is None:
         token_ranks = tuple(range(32))
     tables = jnp.asarray(
@@ -5730,15 +6251,14 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
         pltpu.SemaphoreType.REGULAR((streams,)),
         pltpu.SemaphoreType.DMA,
         pltpu.VMEM((384, width), jnp.bfloat16),  # the output projection
-        pltpu.VMEM((2, 128, width), jnp.bfloat16),  # its partials
+        pltpu.VMEM((2, kda_tile, width), jnp.bfloat16),  # its partials
         pltpu.SemaphoreType.DMA((2,)),
-        *kda_prefill_tiled_scratch_shapes(width, 128, *shapes),
+        *kda_prefill_tiled_scratch_shapes(width, kda_tile, *shapes, store_out=False),
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     output_shapes = (
         jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
         jax.ShapeDtypeStruct((seq_len, width), jnp.bfloat16),
-        jax.ShapeDtypeStruct((seq_len, 384), jnp.bfloat16),
         jax.ShapeDtypeStruct((*state_lead, 3, 128, 128), jnp.float32),
         jax.ShapeDtypeStruct((*state_lead, 3, 3, 3, 128), jnp.bfloat16),
         jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
@@ -5748,7 +6268,7 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
     )
     call = pl.pallas_call(
         functools.partial(
-            _kda_layer_body, count=segments, eps=eps, blocks=blocks,
+            _kda_layer_body, count=segments, eps=eps, blocks=blocks, kda_tile=kda_tile,
         ),
         out_shape=output_shapes,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -5773,8 +6293,9 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
             w["k_gate"], w["k_fb"], w["k_projection"], w["k_conv"],
             w["k_a_log"], w["k_dt"], w["k_norm"], rec[0], hist[0], w["k_o"],
         )
-        normalized, gathered, attended, new_rec, new_hist, final, rec_at, hist_at, _ = outputs
-        return (normalized[None], gathered, attended[None], new_rec[None],
+        normalized, gathered, new_rec, new_hist, final, rec_at, hist_at, _ = outputs
+        attended_stub = jnp.zeros((1, 0, 384), jnp.bfloat16)
+        return (normalized[None], gathered, attended_stub, new_rec[None],
                 new_hist[None], final[None], rec_at[None], hist_at[None])
 
     return jax.jit(jax.shard_map(
@@ -5799,6 +6320,12 @@ def make_dense_ffn_sp(mesh, *, seq_len):
         raise ValueError("dense FFN SP requires flat TP32 and T divisible by 32")
     axis_name = mesh.axis_names[0]
     local_tokens = seq_len // 32
+    tables = None
+    if axis_name == "k3_sp" and local_tokens >= 16 and local_tokens % 16 == 0:
+        try:
+            tables = ring_tables(list(mesh.devices.flat), tuple(range(32)))
+        except ValueError:
+            tables = None
 
     def local(hidden, prefix, gate_up, down, length):
         x = hidden[0]
@@ -5810,7 +6337,10 @@ def make_dense_ffn_sp(mesh, *, seq_len):
         # weights are TP32 over the intermediate dimension, so every rank
         # applies its shard to every rank's rows (gathered in rank order) and
         # the partial outputs are reduce-scattered back to their owners.
-        x = jax.lax.all_gather(x, axis_name, tiled=True)
+        if tables is not None:
+            x = _rank_half_gather(x, tables, collective_id=46)
+        else:
+            x = jax.lax.all_gather(x, axis_name, tiled=True)
         gu = jax.lax.dot_general(
             x, gate_up[0], (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
@@ -5822,9 +6352,14 @@ def make_dense_ffn_sp(mesh, *, seq_len):
             middle, down[0], (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
-        reduced = jax.lax.psum_scatter(
-            partial, axis_name, scatter_dimension=0, tiled=True,
-        ).astype(jnp.bfloat16)
+        if tables is not None:
+            reduced = _rank_half_reduce(
+                partial, tables, collective_id=47, acc_dtype=jnp.float32, out_dtype=jnp.bfloat16
+            )
+        else:
+            reduced = jax.lax.psum_scatter(
+                partial, axis_name, scatter_dimension=0, tiled=True,
+            ).astype(jnp.bfloat16)
         rank = jax.lax.axis_index(axis_name)
         valid = sp_token_index(rank, jnp.arange(local_tokens), window_stripe(local_tokens)) < length[0]
         return (prefix[0] + jnp.where(valid[:, None], reduced, 0))[None]
@@ -5854,6 +6389,16 @@ def _route_update(result, route, layer):
         return out, route
     return out, jax.lax.dynamic_update_slice(
         route, counts[:, None, :].astype(route.dtype), (0, jnp.asarray(layer, jnp.int32).reshape(()), 0))
+
+
+def _commit_block(blocks, prefix, index):
+    """Store ``prefix`` as residual block ``index // 12`` when layer ``index``
+    starts one, updating the (donated) ``blocks`` in place: a ``lax.cond``
+    here copies the whole [32, 8, rows, 7168] buffer."""
+    slot = index // 12
+    current = jax.lax.dynamic_index_in_dim(blocks, slot, axis=1, keepdims=False)
+    value = jnp.where(index % 12 == 0, prefix, current)
+    return jax.lax.dynamic_update_index_in_dim(blocks, value, slot, axis=1)
 
 
 def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, mla_flash_tile=256):
@@ -5901,12 +6446,7 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
         mla_cache = tuple(mla_state)
         if len(mla_cache) != 1:
             raise ValueError("mla_state is (latents,)")
-        blocks = jax.lax.cond(
-            base % 12 == 0,
-            lambda x: x.at[:, base // 12].set(prefix),
-            lambda x: x,
-            blocks,
-        )
+        blocks = _commit_block(blocks, prefix, base)
         tap = prefix
         for offset in range(4):
             index = base + offset
@@ -5954,12 +6494,12 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
     ))
 
 
-def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, mla_flash_tile=256):
+def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, mla_flash_tile=256, with_taps=True):
     """Two consecutive regular four-layer groups as one executable
     (``pair`` p runs groups 2p + 1 and 2p + 2; ``arena`` carries both
-    groups' MLA pools, in order). Also returns the prefix between the two
-    groups: the residual stream entering layer 8p + 12 (pair 10's is the
-    DSpark draft's aux layer 88)."""
+    groups' MLA pools, in order). When ``with_taps`` is True, also returns
+    the prefix between the two groups (entering layer 8p + 12) and the
+    second group's tap."""
     group4 = make_regular_group4_sp_indexed(
         mesh, seq_len=seq_len, mla_flash_tile=mla_flash_tile, segments=segments,
         prefix_capacity=prefix_capacity,
@@ -5970,6 +6510,12 @@ def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
             moe_families, kda_state, mla_state, length, pair, segment_desc, arena, route=None):
         first = jnp.asarray([2 * pair[0] + 1], jnp.int32)
         second = first + 1
+        if arena.counts is None or arena.order is None:
+            counts, order = cp_prefix_meta(
+                mesh, arena.pools[0], arena.ids, arena.local,
+                segments=segments, capacity=prefix_capacity,
+            )
+            arena = CpPrefix(arena.pools, arena.ids, arena.local, counts, order)
         arenas = arena.split()
         middle, blocks, kda_state, mla_state, _, *r1 = group4(
             prefix, blocks, common, kda_families, mla_families,
@@ -5981,12 +6527,15 @@ def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
             moe_families, kda_state, mla_state, length, second,
             segment_desc, arenas[1], r1[0] if r1 else None,
         )
+        taps = (middle, tap) if with_taps else ()
         if r2:
-            return prefix, blocks, kda_state, mla_state, middle, tap, r2[0]
-        return prefix, blocks, kda_state, mla_state, middle, tap
+            return (prefix, blocks, kda_state, mla_state, *taps, r2[0])
+        return (prefix, blocks, kda_state, mla_state, *taps)
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * 4, (sharding,), sharding, sharding, *((sharding,) if _config().prefill_route_counts else ()),
+        sharding, sharding, (sharding,) * 4, (sharding,),
+        *((sharding,) * 2 if with_taps else ()),
+        *((sharding,) if _config().prefill_route_counts else ()),
     ))
 
 
@@ -6138,12 +6687,7 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
             prefix, blocks, kda_states, mla_cache, tap, route = carry
             if tap_layer is not None:
                 tap = jnp.where(index == tap_layer, prefix, tap)
-            blocks = jax.lax.cond(
-                index % 12 == 0,
-                lambda x: x.at[:, index // 12].set(prefix),
-                lambda x: x,
-                blocks,
-            )
+            blocks = _commit_block(blocks, prefix, index)
             attn_res = choose(common["attn_res"], index)
             attn_norm = choose(common["attn_norm"], index)
             attn_active = active((index - 1) // 12 + 1)
@@ -6217,6 +6761,12 @@ def make_embedding_sp(mesh, *, seq_len, vocab_per_rank=5120):
         raise ValueError("embedding SP requires flat TP32 and T divisible by 32")
     axis_name = mesh.axis_names[0]
     local_tokens = seq_len // 32
+    tables = None
+    if axis_name == "k3_sp" and local_tokens >= 16 and local_tokens % 16 == 0:
+        try:
+            tables = ring_tables(list(mesh.devices.flat), tuple(range(32)))
+        except ValueError:
+            tables = None
 
     def local(tokens, embedding, length):
         rank = jax.lax.axis_index(axis_name)
@@ -6231,9 +6781,14 @@ def make_embedding_sp(mesh, *, seq_len, vocab_per_rank=5120):
         partial = jnp.where(
             matched[:, None], table[jnp.clip(local_ids, 0, vocab_per_rank - 1)], 0
         ).astype(jnp.bfloat16 if EMBED_BF16_REDUCE else jnp.float32)
-        hidden = jax.lax.psum_scatter(
-            partial, axis_name, scatter_dimension=0, tiled=True
-        ).astype(jnp.bfloat16)
+        if tables is not None:
+            hidden = _rank_half_reduce(
+                partial, tables, collective_id=48, acc_dtype=partial.dtype, out_dtype=jnp.bfloat16
+            )
+        else:
+            hidden = jax.lax.psum_scatter(
+                partial, axis_name, scatter_dimension=0, tiled=True
+            ).astype(jnp.bfloat16)
         valid = sp_token_index(rank, jnp.arange(local_tokens), window_stripe(local_tokens)) < length[0]
         return jnp.where(valid[:, None], hidden, 0)[None]
 

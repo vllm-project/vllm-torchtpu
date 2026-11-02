@@ -28,6 +28,10 @@ from jax.sharding import PartitionSpec as P
 
 from .. import prefill_megakernel as k
 
+_COMPACT_8K_CAPACITY = 65536
+_RMW_BATCH = 2
+_RMW_DUMMY_SLOTS = 16
+
 
 def _sort_route_steps(keys, probabilities, *, size):
     """Yield after each 4096-route window of the in-place bitonic network.
@@ -633,14 +637,16 @@ def _prologue(
 
     def body(s):
         own = s["pair"].at[pl.ds(parity * rows, rows), :]
+        if rows == 256:
+            buffers = tuple(s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4))
+            router_v = s["router_gu"].at[:, :896]
+        else:
+            buffers, router_v = s["gu_buffers"], s["router"]
+        router_copy = pltpu.make_async_copy(router, router_v, s["gu_sems"][0])
+        bias_copy = pltpu.make_async_copy(bias, s["bias"], s["gu_sems"][1])
+        router_copy.start()
+        bias_copy.start()
         copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
-        copy.start()
-        copy.wait()
-        if rows <= 128:
-            copy = pltpu.make_async_copy(router, s["router"], s["input_sem"])
-            copy.start()
-            copy.wait()
-        copy = pltpu.make_async_copy(bias, s["bias"], s["input_sem"])
         copy.start()
         copy.wait()
         _enter_mesh()
@@ -657,14 +663,8 @@ def _prologue(
             device_id_type=pl.DeviceIdType.LOGICAL,
         )
         peer_input.start()
-        if rows == 256:
-            buffers = tuple(s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4))
-            router_v = s["router_gu"].at[:, :896]
-            copy = pltpu.make_async_copy(router, router_v, s["gu_sems"][0])
-            copy.start()
-            copy.wait()
-        else:
-            buffers, router_v = s["gu_buffers"], s["router"]
+        router_copy.wait()
+        bias_copy.wait()
         gate_buffers, up_buffers = buffers[:2], buffers[2:]
         gate_sems, up_sems = s["gu_sems"][:2], s["gu_sems"][2:]
         hx = own[...]
@@ -951,16 +951,17 @@ def _routed_experts(
     """Joint GU/SiTU/first-down pipeline followed by remaining columns."""
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
-    unroll = 8 if tokens < 8192 else 32
-    gu_unroll = 4 if tokens < 8192 else 8
-    first_down_unroll = 2 if tokens < 8192 else 8
-    metadata_row_capacity = 0 if tokens < 8192 else 32768
-    ring_dtype = jnp.float32
     assert tokens in (512, 1024, 2048, 4096, 8192)
     gu_width = gu_weights.shape[-1]
     assert gu_width % 2 == 0
     mid_width = gu_width // 2
     assert rhs.shape[-2] * 8 == mid_width
+    unroll = 8 if tokens < 8192 else (16 if mid_width == 768 else 32)
+    gu_unroll = 4 if tokens < 8192 else 8
+    first_down_unroll = 2 if tokens < 8192 else 8
+    first_tail_unroll = 8 if tokens < 8192 else (16 if mid_width == 768 else 8)
+    metadata_row_capacity = 0 if tokens < 8192 else _COMPACT_8K_CAPACITY
+    ring_dtype = jnp.bfloat16
     x = jax.ShapeDtypeStruct((tokens * 16, mid_width), latent.dtype)
     rows, width = (metadata_row_capacity or x.shape[0], rhs.shape[-1])
     assert rows <= x.shape[0]
@@ -1042,6 +1043,7 @@ def _routed_experts(
         rx,
         state,
         ring_meta,
+        moved_smem,
     ):
         w = dataclasses.replace(
             w, weight=w.weight.at[layer[0]], scale=w.scale.at[layer[0]]
@@ -1104,46 +1106,102 @@ def _routed_experts(
         def route(i):
             return (destinations[i], probabilities[i])
 
+        def batched_unclamped(source, begin, base_idx, width_b):
+            idxs = [base_idx + r for r in range(width_b)]
+            routes = [route(i_r) for i_r in idxs]
+            vals = [
+                source.at[pl.ds(i_r - begin, 1)][...].astype(jnp.float32)
+                for i_r in idxs
+            ]
+            olds = [sums.at[pl.ds(d_r, 1)][...] for d_r, _ in routes]
+            accs = [olds[r] + vals[r] * routes[r][1] for r in range(width_b)]
+            for r in range(width_b):
+                sums.at[pl.ds(routes[r][0], 1)][...] = accs[r]
+
+        def batched_clamped(
+            source, begin, base_idx, end, width_b, *, guard, dummy_base=0
+        ):
+            idxs = [base_idx + r for r in range(width_b)]
+            actives = [guard & (idx_r < end) for idx_r in idxs]
+            clamped = [jnp.minimum(idx_r, end - 1) for idx_r in idxs]
+            routes = [route(c_r) for c_r in clamped]
+            dests = [
+                jnp.where(
+                    actives[r],
+                    routes[r][0],
+                    tokens + ((dummy_base + r) % _RMW_DUMMY_SLOTS),
+                )
+                for r in range(width_b)
+            ]
+            weights = [
+                jnp.where(actives[r], routes[r][1], 0.0) for r in range(width_b)
+            ]
+            vals = [
+                source.at[pl.ds(c_r - begin, 1)][...].astype(jnp.float32)
+                for c_r in clamped
+            ]
+            olds = [sums.at[pl.ds(d_r, 1)][...] for d_r in dests]
+            accs = [olds[r] + vals[r] * weights[r] for r in range(width_b)]
+            for r in range(width_b):
+                sums.at[pl.ds(dests[r], 1)][...] = accs[r]
+
         def consume(tile_g, source, first=0, *, loop_unroll=unroll):
             start = metadata.gm_id_to_m_offset[tile_g]
             end = metadata.gm_id_to_m_offset[tile_g + 1]
             begin = start // sub * sub
             start = jnp.minimum(start + first, end)
-
-            def update(i):
-                dest, weight = route(i)
-                value = source.at[pl.ds(i - begin, 1)][...].astype(jnp.float32)
-                target = sums.at[pl.ds(dest, 1)]
-                target[...] = target[...] + value * weight
-
+            step_b = min(_RMW_BATCH, loop_unroll)
             full = (end - start) // loop_unroll
 
             @pl.loop(0, full)
             def chunk(b):
-                for u in range(loop_unroll):
-                    update(start + b * loop_unroll + u)
+                base = start + b * loop_unroll
+                for u in range(0, loop_unroll, step_b):
+                    batched_unclamped(source, begin, base + u, step_b)
 
-            @pl.loop(start + full * loop_unroll, end)
-            def tail(i):
-                update(i)
+            tail_start = start + full * loop_unroll
+            tail_steps = pl.cdiv(end - tail_start, step_b)
+
+            @pl.loop(0, tail_steps)
+            def tail(tb):
+                batched_clamped(
+                    source,
+                    begin,
+                    tail_start + tb * step_b,
+                    end,
+                    step_b,
+                    guard=jnp.bool_(True),
+                )
 
         gu_panels = pl.cdiv(gu_width, pltpu.get_tpu_info().mxu_column_size)
         moved_rows = gu_panels * gu_unroll
+        ep8_8k = tokens == 8192 and mid_width == 768
+        gu_u_by_bucket = (4, 8, 10, 12) if ep8_8k else (gu_unroll,) * 4
+        first_down_u_by_bucket = (
+            (4, 8, 12, 14) if ep8_8k else (first_down_unroll,) * 4
+        )
+        rem_down_u_by_bucket = (8, 16, 24, 24) if ep8_8k else (unroll,) * 4
 
-        def gu_work(g, panel):
+        def gu_work(g, panel, bucket_index=0):
+            gu_u = gu_u_by_bucket[bucket_index]
             previous_g = jnp.maximum(g - 1, 0)
             start = metadata.gm_id_to_m_offset[previous_g]
             end = metadata.gm_id_to_m_offset[previous_g + 1]
             begin = start // sub * sub
-            for row in range(gu_unroll):
-                offset = panel * gu_unroll + row
-                i = jnp.minimum(start + offset, end - 1)
-                dest, prob = route(i)
-                weight = jnp.where((g > 0) & (start + offset < end), prob, 0)
-                previous = packed.at[(g + 1) % 2]
-                value = previous.at[pl.ds(i - begin, 1)][...].astype(jnp.float32)
-                target = sums.at[pl.ds(dest, 1)]
-                target[...] = target[...] + value * weight
+            previous = packed.at[(g + 1) % 2]
+            step_b = min(_RMW_BATCH, gu_u)
+            for row in range(0, gu_u, step_b):
+                batched_clamped(
+                    previous,
+                    begin,
+                    start + panel * gu_u + row,
+                    end,
+                    step_b,
+                    guard=(g > 0),
+                    dummy_base=panel * gu_u + row,
+                )
+            if ep8_8k and panel == gu_panels - 1:
+                moved_smem[0] = gu_panels * gu_u
 
         def inner(x, w, metadata, *, first=False, subtotal_vmem=None):
             g, n = (pl.program_id(1), 0 if first else pl.program_id(0) + 1)
@@ -1160,27 +1218,29 @@ def _routed_experts(
             previous_g = jnp.maximum(g - 1, 0)
             panel_count = pl.cdiv(tn, pltpu.get_tpu_info().mxu_column_size)
             down_unroll = first_down_unroll if first else unroll
+            gu_moved = moved_smem[0] if (first and ep8_8k) else (moved_rows if first else 0)
 
-            def overlap_work(panel):
+            def overlap_work(panel, bucket_index=0):
+                down_u = (
+                    first_down_u_by_bucket if first else rem_down_u_by_bucket
+                )[bucket_index]
                 start = metadata.gm_id_to_m_offset[previous_g]
                 end = metadata.gm_id_to_m_offset[previous_g + 1]
                 begin = start // sub * sub
-
-                def work():
-                    for row in range(down_unroll):
-                        offset = (
-                            (moved_rows if first else 0) + panel * down_unroll + row
-                        )
-                        i = jnp.minimum(start + offset, end - 1)
-                        dest, prob = route(i)
-                        weight = jnp.where((g > 0) & (start + offset < end), prob, 0)
-                        value = previous.at[pl.ds(i - begin, 1)][...].astype(
-                            jnp.float32
-                        )
-                        target = sums.at[pl.ds(dest, 1)]
-                        target[...] = target[...] + value * weight
-
-                work()
+                base_off = gu_moved + panel * down_u
+                step_b = min(_RMW_BATCH, down_u)
+                for row in range(0, down_u, step_b):
+                    batched_clamped(
+                        previous,
+                        begin,
+                        start + base_off + row,
+                        end,
+                        step_b,
+                        guard=(g > 0),
+                        dummy_base=panel * down_u + row,
+                    )
+                if ep8_8k and panel == panel_count - 1:
+                    moved_smem[0] = gu_moved + panel_count * down_u
 
             if not first:
 
@@ -1204,13 +1264,15 @@ def _routed_experts(
                 consume(
                     previous_g,
                     previous,
-                    (moved_rows if first else 0) + panel_count * down_unroll,
-                    loop_unroll=8 if first else unroll,
+                    moved_smem[0]
+                    if ep8_8k
+                    else ((moved_rows if first else 0) + panel_count * down_unroll),
+                    loop_unroll=first_tail_unroll if first else unroll,
                 )
 
             @pl.when(g == ng - 1)
             def finish():
-                consume(g, current, loop_unroll=8 if first else unroll)
+                consume(g, current, loop_unroll=first_tail_unroll if first else unroll)
                 if not first:
                     advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
                     emit_subtotals(subtotal_vmem)
@@ -1239,20 +1301,21 @@ def _routed_experts(
                 buffering, (gu_ws, ws), is_leaf=lambda v: isinstance(v, pl.BlockSpec)
             )
 
-            def bounds(g):
-                begin = metadata.gm_id_to_m_offset[g] // sub * sub
-                end = pl.cdiv(metadata.gm_id_to_m_offset[g + 1], sub) * sub
-                return (begin, end - begin)
+            def active_bounds(g):
+                raw_start = metadata.gm_id_to_m_offset[g]
+                raw_end = metadata.gm_id_to_m_offset[g + 1]
+                begin = raw_start // sub * sub
+                return (raw_start, raw_start - begin, raw_end - raw_start)
 
             def start(g, bank):
-                begin, nrows = bounds(g)
+                raw_start, first, n_active = active_bounds(g)
 
-                @pl.loop(0, nrows)
+                @pl.loop(0, n_active)
                 def row(i):
-                    source = destinations[begin + i]
+                    source = destinations[raw_start + i]
                     pltpu.make_async_copy(
                         latent.at[pl.ds(source, 1)],
-                        acts.at[bank, pl.ds(i, 1)],
+                        acts.at[bank, pl.ds(first + i, 1)],
                         act_sems.at[bank],
                     ).start()
 
@@ -1268,6 +1331,7 @@ def _routed_experts(
                     probabilities_ready()
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
                     packed.at[1][...] = jnp.zeros(packed.at[1].shape, packed.dtype)
+                    acts[...] = jnp.zeros(acts.shape, acts.dtype)
 
                 @pl.when(active_ng > 0)
                 def gate_up():
@@ -1275,9 +1339,14 @@ def _routed_experts(
                     def initial():
                         start(g, bank)
 
-                    _, nrows = bounds(g)
-                    active = acts.at[bank, pl.ds(0, nrows)]
-                    pltpu.make_async_copy(active, active, act_sems.at[bank]).wait()
+                    _, first, n_active = active_bounds(g)
+
+                    @pl.when(n_active > 0)
+                    def wait_active():
+                        active = acts.at[bank, pl.ds(first, n_active)]
+                        pltpu.make_async_copy(
+                            active, active, act_sems.at[bank]
+                        ).wait()
 
                     @pl.when(g + 1 < ng)
                     def following():
@@ -1290,7 +1359,7 @@ def _routed_experts(
                         gu_partial,
                         metadata,
                         cfgs=gu_cfg,
-                        overlap_work=lambda panel: gu_work(g, panel),
+                        overlap_work=lambda panel, b_idx=0: gu_work(g, panel, b_idx),
                     )
 
                 inner(gy, dw, metadata, first=True)
@@ -1402,7 +1471,7 @@ def _routed_experts(
             gm_id_to_m_offset=pltpu.SMEM((max_gm + 1,), jnp.int32),
         ),
         packed=pltpu.VMEM((2, tm, 2, packed_half), x.dtype),
-        sums=pltpu.VMEM((tokens, 2, packed_half), jnp.float32),
+        sums=pltpu.VMEM((tokens + _RMW_DUMMY_SLOTS, 2, packed_half), jnp.float32),
         cast=pltpu.VMEM((store_tile, tn), x.dtype),
         sends=pltpu.SemaphoreType.DMA((streams,)),
         receives=pltpu.SemaphoreType.DMA((2, streams)),
@@ -1412,6 +1481,7 @@ def _routed_experts(
         rx=pltpu.VMEM((2, localrows, tn), ring_dtype),
         state=pltpu.SMEM((1 + 2 * streams,), jnp.int32),
         ring_meta=pltpu.SMEM((6 * 34,), jnp.int32),
+        moved_smem=pltpu.SMEM((1,), jnp.int32),
     )
 
 
@@ -1520,7 +1590,11 @@ def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work):
     def product(bucket_index):
         rows = cfgs.tiles.bucket_base * (bucket_index + 1)
         value = _expert_product(
-            lhs, rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=overlap_work
+            lhs,
+            rhs,
+            cfgs=cfgs,
+            bucket_rows=rows,
+            overlap_work=lambda panel: overlap_work(panel, bucket_index),
         )
         value = k.apply_act_fn(value, cfgs.fuse_act)
         row = lax.broadcasted_iota(jnp.int32, value.shape, 0)
@@ -1533,9 +1607,9 @@ def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work):
             last % cfgs.dims.size_lhs_sublane == 0, zeros, output[last_row]
         )
 
-    # At 8K, share the 128-row product for both small buckets.
-    # Keep route order, trading padded work for fewer instruction overlays.
-    first_bucket = 1 if cfgs.tiles.tile_m == 256 else 0
+    # At EP16 (tile_n=1536, 12 GU panels), share the 128-row product to bound
+    # instruction size; at EP8 (tile_n=768, 6 GU panels), keep the 64-row bucket.
+    first_bucket = 1 if (cfgs.tiles.tile_m == 256 and cfgs.tiles.tile_n > 768) else 0
     branches = [
         functools.partial(product, bucket_index=i)
         for i in range(first_bucket, cfgs.tiles.tile_m // cfgs.tiles.bucket_base)
@@ -1559,23 +1633,26 @@ def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
     # GU already masks inactive rows; consume() visits only live routes.
     def product(bucket_index):
         rows = cfgs.tiles.bucket_base * (bucket_index + 1)
-        with jax.named_scope(f"bm{rows}_fragment"):
-            value = _expert_product(
-                lhs, rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=overlap_work
+        value = _expert_product(
+            lhs,
+            rhs,
+            cfgs=cfgs,
+            bucket_rows=rows,
+            overlap_work=lambda panel: overlap_work(panel, bucket_index),
+        )
+        if cfgs.tiles.tile_n == 896:
+            # Keep the half boundary on a complete 128-lane block.
+            # Only the final 128 elements are padding; the consumer trims
+            # them once per subtotal before communicating the 896 columns.
+            value = value.astype(output.dtype)
+            padded = jnp.concatenate(
+                (value, jnp.zeros((rows, 128), output.dtype)), axis=1
             )
-            if cfgs.tiles.tile_n == 896:
-                # Keep the half boundary on a complete 128-lane block.
-                # Only the final 128 elements are padding; the consumer trims
-                # them once per subtotal before communicating the 896 columns.
-                value = value.astype(output.dtype)
-                padded = jnp.concatenate(
-                    (value, jnp.zeros((rows, 128), output.dtype)), axis=1
-                )
-                output[:rows] = padded.reshape(rows, 2, 512)
-            else:
-                output[:rows] = value.astype(output.dtype).reshape(
-                    rows, 2, cfgs.tiles.tile_n // 2
-                )
+            output[:rows] = padded.reshape(rows, 2, 512)
+        else:
+            output[:rows] = value.astype(output.dtype).reshape(
+                rows, 2, cfgs.tiles.tile_n // 2
+            )
 
     branches = [
         functools.partial(product, bucket_index=i)
@@ -1677,8 +1754,9 @@ def _reduce_step(
             rows=rows, cols=cols, stream=stream, source=source, local_value=local_value
         ):
             payload.at[rows, cols][...] = (
-                local_value() + received.at[(step - 1) % buffers, rows, cols][...]
-            )
+                local_value().astype(jnp.float32)
+                + received.at[(step - 1) % buffers, rows, cols][...].astype(jnp.float32)
+            ).astype(payload.dtype)
             pl.semaphore_signal(
                 credits.at[stream],
                 1,
@@ -1776,7 +1854,7 @@ def _ready_reduce(
             begin, size, col_begin, width = region
             base = (stream % 6) * 34
             rows, cols = pl.ds(begin, size), pl.ds(col_begin, width)
-            units = size * width * 4 // 32
+            units = size * width * jnp.dtype(payload.dtype).itemsize // 32
             step = state[1 + stream]
 
             @pl.when(state[1 + count + stream] == 0)
@@ -1794,8 +1872,9 @@ def _ready_reduce(
                     remote(stream, rows, cols, target, bank).wait()
                     source_rows = pl.ds(pl.multiple_of(ring_meta[base + 2 + step], o_ref.shape[0]) + begin, size)
                     payload.at[rows, cols][...] = (
-                        x_ref.at[source_rows, cols][...].astype(payload.dtype) + received.at[bank, rows, cols][...]
-                    )
+                        x_ref.at[source_rows, cols][...].astype(jnp.float32)
+                        + received.at[bank, rows, cols][...].astype(jnp.float32)
+                    ).astype(payload.dtype)
                     pl.semaphore_signal(
                         credits.at[stream], 1, device_id=(ring_meta[base + 1],), device_id_type=pl.DeviceIdType.MESH
                     )
@@ -1892,7 +1971,7 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
         for panel in (0, 1):
             weight_copy(panel).start()
             prefix_copy(panel).start()
-        routed = reduced[...]
+        routed = reduced[...].astype(jnp.float32)
         mean = jnp.sum(routed * routed, axis=1, keepdims=True) / width
         inverse = jax.lax.rsqrt(mean + 1e-5)
         s["normalized"][...] = ((routed * inverse) * s["norm"][...]).astype(
@@ -1984,7 +2063,7 @@ def _layer_kernel(
     rows = hidden.shape[0]
     tokens = rows * 32
     local_experts = expert_gu.shape[1]
-    capacity = tokens * 16 if tokens < 8192 else 32768
+    capacity = tokens * 16 if tokens < 8192 else _COMPACT_8K_CAPACITY
     shape = (tokens // 8, 128)
     vmem, smem, dma = pltpu.VMEM, pltpu.SMEM, pltpu.SemaphoreType.DMA
 
@@ -2110,7 +2189,7 @@ def _layer_kernel(
         body,
         dict(
             shared=vmem((rows, 7168), jnp.bfloat16),
-            reduced=vmem((rows, 3584), jnp.float32),
+            reduced=vmem((rows, 3584), jnp.bfloat16),
             probs_v=vmem(shape, jnp.float32) if tokens < 8192 else None,
             counts_v=vmem((local_experts,), jnp.int32),
             counts=smem((local_experts,), jnp.int32),
@@ -2136,9 +2215,11 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     index. All fast-path operations execute in one Pallas kernel. Rare 8K route
     overflow uses the uncapped production expert path with the same metadata.
     """
+    if seq_len == 16384:
+        return _make_moe_16k(mesh)
     if seq_len not in (512, 1024, 2048, 4096, 8192):
         raise ValueError(
-            "Fused prefill MoE supports 512, 1024, 2048, 4096 and 8192 token windows"
+            "Fused prefill MoE supports 512, 1024, 2048, 4096, 8192 and 16384 token windows"
         )
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
@@ -2257,7 +2338,167 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
                 shared_reduced=True,
             )
 
-        result = jax.lax.cond(maximum[0] <= 32768, lambda: final, overflow)[None]
+        result = jax.lax.cond(
+            maximum[0] <= _COMPACT_8K_CAPACITY, lambda: final, overflow
+        )[None]
         return (result, routes) if counting else result
+
+    return jax.jit(local)
+
+
+def _make_moe_16k(mesh):
+    """The 16K window as two 8K fused launches over the full rank rows.
+
+    Each launch reads and writes its 256-row half of the [512, 7168] hidden,
+    residual and output in place (the second aliases the first's output), so
+    the window is never split or concatenated in HBM. Routes that overflow
+    the compact 8K capacity fall back per half, as in the 8K op.
+    """
+    if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
+        raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
+    ep = k._config().prefill_expert_parallel
+    if ep not in (8, 16):
+        raise ValueError("Fused prefill MoE requires prefill_expert_parallel in (8, 16)")
+    from .layer import routed_experts_prepared
+
+    tokens, rows, window_rows = 8192, 256, 512
+    local_experts = 896 // ep
+    mid_width = 3072 // (32 // ep)
+    tables = k.ring_tables(list(mesh.devices.flat), tuple(range(32)))
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    shape = (tokens // 8, 128)
+    bf16 = jnp.bfloat16
+    workspace_shapes = [
+        ((window_rows, 7168), bf16),
+        ((tokens, 2, 1792), bf16),
+        ((tokens * 16, mid_width), bf16),
+        (shape, jnp.int32),
+        (shape, jnp.float32),
+        ((local_experts,), jnp.int32),
+        ((rows, 7168), bf16),
+        ((1,), jnp.int32),
+    ]
+    output_specs = [hbm] * 7 + [pl.BlockSpec()]
+    counting = k._config().prefill_route_counts
+    if counting:
+        workspace_shapes += [((local_experts,), jnp.int32)]
+        output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
+    inputs = 13  # after the two scalar-prefetch operands
+
+    def make_kernel(half):
+        aliased = half == 1
+
+        def body(*refs):
+            refs = list(refs)
+            if aliased:
+                del refs[2 + inputs]  # the first launch's output, aliased below
+            own = pl.ds(half * rows, rows)
+            for index in (2, 1 + inputs, 2 + inputs):  # hidden, prefix, output
+                refs[index] = refs[index].at[own]
+            if counting:
+                return _layer_kernel(*refs[:-1], route_counts=refs[-1])
+            return _layer_kernel(*refs)
+
+        return pl.pallas_call(
+            body,
+            out_shape=tuple(jax.ShapeDtypeStruct(s, d) for s, d in workspace_shapes),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=(hbm,) * (inputs + aliased),
+                out_specs=tuple(output_specs),
+            ),
+            input_output_aliases={2 + inputs: 0} if aliased else {},
+            compiler_params=pltpu.CompilerParams(
+                collective_id=0,
+                vmem_limit_bytes=64 * 1024**2,
+                disable_bounds_checks=True,
+                shape_invariant_numerics=False,
+            ),
+            name="fused_moe_pallas_8192",
+        )
+
+    kernels = (make_kernel(0), make_kernel(1))
+
+    @functools.partial(
+        jax.shard_map,
+        mesh=mesh,
+        in_specs=(P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P()),
+        out_specs=(P("k3_sp"), P("k3_sp")) if counting else P("k3_sp"),
+        check_vma=False,
+    )
+    def local(hidden, prefix, families, length, slot):
+        w = {name: value[0] for name, value in families.items()}
+        lengths = (jnp.minimum(length, tokens), jnp.maximum(length - tokens, 0))
+        operands = (
+            hidden[0],
+            w["router"],
+            w["router_bias"],
+            w["latent_down"],
+            w["shared_gu"],
+            w["shared_down"],
+            w["expert_gu"],
+            w["expert_gus"],
+            w["expert_down"],
+            w["expert_ds"],
+            w["latent_norm"],
+            w["latent_up"],
+            prefix[0],
+        )
+        halves, routes, previous = [], None, ()
+        for half, kernel in enumerate(kernels):
+            control = jnp.concatenate((lengths[half].reshape(1), slot.reshape(1)))
+            outputs = kernel(jnp.asarray(tables), control, *operands, *previous)
+            if counting:
+                *outputs, counted = outputs
+                routes = counted if routes is None else routes + counted
+            halves.append(outputs)
+            previous = (outputs[0],)
+        final = halves[1][0]
+
+        def overflow(half):
+            _, latent, _, ids, probs, counts, shared, maximum = halves[half]
+            reduced = routed_experts_prepared(
+                latent,
+                ids.reshape(-1),
+                probs.reshape(-1),
+                counts,
+                w["expert_gu"],
+                w["expert_gus"],
+                w["expert_down"],
+                w["expert_ds"],
+                reduce_tables=tables,
+                expert_layer=slot,
+                global_route_max=maximum[0],
+            )
+            selected = {name: w[name][slot[0]] for name in ("latent_norm", "latent_up")}
+            return k._moe_sp_tail(
+                reduced,
+                shared,
+                prefix[0, half * rows : (half + 1) * rows],
+                lengths[half],
+                selected,
+                axis_name="k3_sp",
+                eps=1e-5,
+                shared_reduced=True,
+            )
+
+        fits = [h[7][0] <= _COMPACT_8K_CAPACITY for h in halves]
+
+        def fallback():
+            parts = [
+                jax.lax.cond(
+                    fits[half],
+                    lambda half=half: final[half * rows : (half + 1) * rows],
+                    lambda half=half: overflow(half),
+                )
+                for half in range(2)
+            ]
+            return jnp.concatenate(parts, axis=0)
+
+        result = jax.lax.cond(fits[0] & fits[1], lambda: final, fallback)[None]
+        if counting:
+            assert routes is not None
+            return result, routes[None]
+        return result
 
     return jax.jit(local)
