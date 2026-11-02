@@ -475,6 +475,53 @@ class CorrectnessTest(parameterized.TestCase):
         )
         self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens, distribution)
 
+    def test_q_blocks_per_fetch_is_bit_exact(self):
+        """Fetching several query blocks per step computes each one as alone."""
+        # Context first, so the windows below read cached and new tokens.
+        new_kv_lens = jnp.full((self.batch_size,), self.sliding_window, jnp.int32)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
+        self.kv_lens += new_kv_lens
+        total_tokens = jnp.sum(new_kv_lens)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
+        new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
+        distribution = jnp.array([0, 0, self.batch_size], dtype=jnp.int32)
+        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens, distribution)
+
+        # Full and partial fetched steps, and q_len 1 in the mixed kernel.
+        new_kv_lens = jnp.array(
+            [1, 3, 37, 8, 5, 24, 49, 16, 2, 30, 11, 40], dtype=jnp.int32
+        )[: self.batch_size]
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
+        self.kv_lens += new_kv_lens
+        total_tokens = jnp.sum(new_kv_lens)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
+        new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
+
+        def run(q_blocks_per_fetch):
+            return mla_swa.mla_sliding_window_ragged_paged_attention(
+                q,
+                new_kv,
+                self.to_host(jnp.array(self.swc_cache)),
+                self.kv_lens,
+                self.swc_page_indices,
+                cu_q_lens,
+                distribution,
+                self.attention_sinks,
+                sliding_window=self.sliding_window,
+                num_queries_per_block=8,
+                num_kv_pages_per_block=2,
+                q_compute_block_size=2,
+                q_blocks_per_fetch=q_blocks_per_fetch,
+                logical_page_size=self.page_size,
+            )
+
+        for one, fetched in zip(run(1), run(mla_swa.Q_BLOCKS_PER_FETCH), strict=True):
+            np.testing.assert_array_equal(np.asarray(one), np.asarray(fetched))
+
     @parameterized.named_parameters(
         # bq >= block: the block sits in one query block.
         ("one_bq_block", 8, 2),
@@ -570,6 +617,18 @@ class LongPageTableTest(CorrectnessTest):
             self.batch_size, self.ref_pages_per_seq
         )
         self.swc_page_indices = jnp.array(table.reshape(-1))
+
+
+class ZeroRowsFromTest(parameterized.TestCase):
+    @parameterized.parameters(0, 3, 47, 64)
+    def test_zeroes_only_rows_from_first_row(self, first_row):
+        x = jnp.arange(64 * 8 * 512, dtype=jnp.float32).reshape(64, 8, 512)
+        x = (x + 1).astype(jnp.bfloat16)
+
+        out = mla_swa.zero_rows_from(x, jnp.int32(first_row))
+
+        np.testing.assert_array_equal(out[:first_row], x[:first_row])
+        np.testing.assert_array_equal(out[first_row:], 0)
 
 
 class NarrowPageIndicesTest(parameterized.TestCase):

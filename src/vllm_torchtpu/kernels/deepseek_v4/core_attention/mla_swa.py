@@ -25,6 +25,15 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# Query blocks the mixed and prefill kernels fetch and send per step when one
+# kv block covers a query block's window. Each is still computed against its
+# own window, so the output does not depend on this.
+Q_BLOCKS_PER_FETCH = 3
+# Cap on queries x heads per step: the q, output and acc buffers scale with
+# it. 96 x 64 fits VMEM at 1024 tokens; 128 x 64 does not.
+MAX_FETCH_Q_ROWS = 96 * 64
+# Rows per DMA when zeroing the padding rows of a normalized output.
+ZERO_ROWS_PER_COPY = 16
 
 
 def cdiv(a, b):
@@ -80,6 +89,99 @@ def narrow_page_indices(
     table = page_indices.reshape(max_num_seqs, pages_per_seq)
     narrowed = jnp.take_along_axis(table, cols, axis=1).reshape(-1)
     return kv_lens - first_page * logical_page_size, narrowed
+
+
+def fetch_block_sizes(
+    *,
+    num_queries_per_block: int,
+    num_kv_pages_per_block: int,
+    static_q_len: int | None,
+    max_q_len: int,
+    num_q_heads: int,
+    sliding_window: int,
+    logical_page_size: int,
+    q_blocks_per_fetch: int,
+) -> tuple[int, int, int]:
+    """(bq_compute_sz, bq_sz, bkv_p) of the mixed kernel.
+
+    A step fetches `bq_sz` queries and `bkv_p` kv pages, and computes them as
+    `bq_sz // bq_compute_sz` query blocks, each against the
+    `num_kv_pages_per_block` pages its window starts at. Fetching several
+    blocks at once applies only when one kv block covers a block's window:
+    the windows of consecutive blocks then lie in one fetched span.
+    """
+    bq_compute_sz = num_queries_per_block
+    if static_q_len is not None:
+        bq_compute_sz = min(bq_compute_sz, static_q_len)
+    bkv_compute_sz = num_kv_pages_per_block * logical_page_size
+    q_blocks = q_blocks_per_fetch
+    if cdiv(bq_compute_sz + sliding_window - 1, bkv_compute_sz) > 1:
+        q_blocks = 1
+    q_len_bound = max_q_len if static_q_len is None else static_q_len
+    q_blocks = min(q_blocks, cdiv(q_len_bound, bq_compute_sz))
+    q_blocks = max(1, min(q_blocks, MAX_FETCH_Q_ROWS // (bq_compute_sz * num_q_heads)))
+    # Block j's window starts at most j * bq_compute_sz tokens past block 0's.
+    bkv_sz = (q_blocks - 1) * bq_compute_sz + bkv_compute_sz
+    return bq_compute_sz, q_blocks * bq_compute_sz, cdiv(bkv_sz, logical_page_size)
+
+
+def _zero_rows_kernel(first_row_ref, in_ref, out_ref, zeros_ref, sem):
+    del in_ref  # Aliased with out_ref.
+    zeros_ref[...] = jnp.zeros_like(zeros_ref)
+    num_rows = out_ref.shape[0]
+    rows_per_copy = zeros_ref.shape[0]
+    first_row = first_row_ref[0]
+
+    def copy(i):
+        start = first_row + i * rows_per_copy
+        sz = jnp.minimum(rows_per_copy, num_rows - start)
+        return pltpu.make_async_copy(
+            zeros_ref.at[pl.ds(0, sz)], out_ref.at[pl.ds(start, sz)], sem
+        )
+
+    num_copies = cdiv(num_rows - first_row, rows_per_copy)
+    lax.fori_loop(0, num_copies, lambda i, _: copy(i).start(), None)
+    lax.fori_loop(0, num_copies, lambda i, _: copy(i).wait(), None)
+
+
+def zero_rows_from(out: jax.Array, first_row: jax.Array) -> jax.Array:
+    """Zeroes `out[first_row:]` in place, writing only those rows."""
+    return pl.pallas_call(
+        _zero_rows_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            grid=(1,),
+            scratch_shapes=[
+                pltpu.VMEM((ZERO_ROWS_PER_COPY, *out.shape[1:]), out.dtype),
+                pltpu.SemaphoreType.DMA(()),
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct(out.shape, out.dtype),
+        input_output_aliases={1: 0},
+        name="SWA-zero-padding-rows",
+    )(jnp.reshape(first_row, (1,)).astype(jnp.int32), out)
+
+
+def _omit_in_output(body, in_specs, inputs, input_output_aliases, num_scalar_prefetch):
+    """Drops the in_output operand (`inputs[4]`) of a SWA kernel call.
+
+    The call's output then starts uninitialized instead of in place of
+    in_output, which XLA would otherwise have to materialize and copy.
+    """
+    idx = num_scalar_prefetch + 4
+
+    def body_without_in_output(*refs):
+        return body(*refs[:idx], None, *refs[idx:])
+
+    aliases = {i - (i > idx): o for i, o in input_output_aliases.items() if i != idx}
+    return (
+        body_without_in_output,
+        in_specs[:4] + in_specs[5:],
+        inputs[:4] + inputs[5:],
+        aliases,
+    )
 
 
 def get_dtype_bitwidth(dtype):
@@ -159,6 +261,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     q_compute_block_size: int | None,
     bkv_p,
     bq_sz,
+    bq_compute_sz,
+    bkv_compute_sz,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert sliding_window > 0
@@ -192,6 +296,13 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     # need
     max_bkv_blocks = cdiv(bq_sz + sliding_window - 1, bkv_sz)
     single_bkv_block = max_bkv_blocks == 1
+    # A fetched bq block is computed in `q_blocks` sub-blocks of
+    # `bq_compute_sz` queries, each against its own `bkv_compute_sz`-token
+    # window inside the fetched kv block.
+    assert bq_sz % bq_compute_sz == 0
+    q_blocks = bq_sz // bq_compute_sz
+    assert q_blocks == 1 or single_bkv_block
+    assert q_blocks > 1 or bkv_compute_sz == bkv_sz
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
@@ -202,10 +313,11 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     kv_len = kv_lens_ref[seq_idx]
 
     def flash_attention(
-        q,  # [bq_sz * num_q_heads, head_dim]
-        kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_x2_ref
+        q,  # [bq_compute_sz * num_q_heads, head_dim]
+        kv,  # [bkv_compute_sz, head_dim] <- Correspond to data from bkv_x2_ref
         *,
-        bq_idx,
+        q_off,  # Position of the first query in its sequence's chunk.
+        row_off,  # First row of l_ref, m_ref and acc_ref for these queries.
         bkv_idx,
         start_offset,
     ):
@@ -213,7 +325,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         assert len(kv.shape) == 2
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
-        assert kv.shape == (bkv_sz, head_dim)
+        assert kv.shape == (bkv_compute_sz, head_dim)
         n = q.shape[0] // num_q_heads
 
         # split bq into chunks of size q_compute_block_size
@@ -232,8 +344,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         # k_span is shared across all chunks (only depends on the bkv column).
         k_span = (
             start_offset
-            + bkv_idx * bkv_sz
-            + lax.broadcasted_iota(jnp.int32, (1, bkv_sz), 1)
+            + bkv_idx * bkv_compute_sz
+            + lax.broadcasted_iota(jnp.int32, (1, bkv_compute_sz), 1)
         )
 
         # Process the bq rows in `num_chunks` independent slices for better
@@ -244,9 +356,10 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             qc = q[
                 start_row : start_row + chunk_size
             ]  # [chunk_sz * num_q_heads, head_dim]
-            cl_ref = l_ref.at[start_row : start_row + chunk_size]
-            cm_ref = m_ref.at[start_row : start_row + chunk_size]
-            cacc_ref = acc_ref.at[start_row : start_row + chunk_size]
+            rows = pl.ds(row_off + start_row, chunk_size)
+            cl_ref = l_ref.at[rows]
+            cm_ref = m_ref.at[rows]
+            cacc_ref = acc_ref.at[rows]
 
             # Follow FlashAttention-2 forward pass.
             # q_span is per-row (identical across the bkv columns and across the
@@ -254,7 +367,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             q_span = (
                 kv_len
                 - q_len
-                + bq_idx * bq_sz
+                + q_off
                 + (start_row + lax.broadcasted_iota(jnp.int32, (chunk_size, 1), 0))
                 // num_q_heads
             )
@@ -316,20 +429,20 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             0,
         )
 
-    def _start_offset(seq_idx, bq_idx):
-        # Exact start of the sliding window for this (seq, bq) block, in tokens.
-        # The first query row of this bq block sits at position
-        #   q_pos_min = kv_len - q_len + bq_idx * bq_sz
+    def _window_start(seq_idx, q_off):
+        # Exact start of the sliding window for queries from `q_off` on, in tokens.
+        # The query at `q_off` sits at position
+        #   q_pos_min = kv_len - q_len + q_off
         # and attends to keys k with 0 <= q_pos_min - k < sliding_window, so the
         # first key it can ever need is q_pos_min - sliding_window + 1.
         return jnp.maximum(
-            _get_kv_len(seq_idx)
-            - _get_q_len(seq_idx)
-            + bq_idx * bq_sz
-            - sliding_window
-            + 1,
+            _get_kv_len(seq_idx) - _get_q_len(seq_idx) + q_off - sliding_window + 1,
             0,
         )
+
+    def _start_offset(seq_idx, bq_idx):
+        # Start of the window of this (seq, bq) block.
+        return _window_start(seq_idx, bq_idx * bq_sz)
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, start_offset, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
@@ -608,18 +721,20 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             bkv_update_ids_ref[bkv_sem_idx + 4] = 0
             _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, wait=True)
 
-    def load_bq(bq_sem_idx):
-        return bq_x2_ref.at[bq_sem_idx][...].reshape(bq_sz * num_q_heads, head_dim)
+    def load_bq(bq_sem_idx, q_block):
+        rows = pl.ds(q_block * bq_compute_sz, bq_compute_sz)
+        bq = bq_x2_ref.at[bq_sem_idx, rows][...]
+        return bq.reshape(bq_compute_sz * num_q_heads, head_dim)
 
-    def load_bkv(bkv_sem_idx, bkv_idx, start_offset):
-        bkv_u8 = bkv_x2_ref.at[bkv_sem_idx][...]
+    def load_bkv(bkv_sem_idx, kv_off):
+        bkv_u8 = bkv_x2_ref.at[bkv_sem_idx, pl.ds(kv_off, bkv_compute_sz)][...]
         # [bkv_sz, slots_per_token * kv_packing, lkv_dim] -> [bkv_sz, token_bytes]
         # bkv_u8: [bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8. The bytes
         # were stored (see `prepare_kv_inputs`) so that each pair of consecutive
         # sublanes already holds one bf16 value in little-endian order (lo byte then
         # hi byte). `pltpu.bitcast` fuses consecutive sublanes little-endian, so the
         # reconstruction is a plain bitcast + reshape.
-        bkv = pltpu.bitcast(bkv_u8, jnp.bfloat16).reshape(bkv_sz, head_dim)
+        bkv = pltpu.bitcast(bkv_u8, jnp.bfloat16).reshape(bkv_compute_sz, head_dim)
         return bkv
 
     def process():
@@ -673,6 +788,54 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 next_bkv_idx = lax.select(is_last_bkv, 0, next_bkv_idx)
                 next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
                 return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
+
+            def finish_bq():
+                # Load acc and calculate final output.
+                acc = acc_ref[...]
+
+                if unnormalized_output:
+                    out = acc.astype(q_dtype)
+                else:
+                    attention_sinks = jnp.concat(
+                        [attention_sinks_ref[...] for _ in range(bq_sz)]
+                    )
+                    exp_attention_sinks = jnp.exp(attention_sinks - m_ref[...])
+                    l = l_ref[...] + exp_attention_sinks  # noqa: E741
+                    out = (
+                        lax.div(acc, l[:, None])
+                        if q_dtype == jnp.float32
+                        else (acc * pl.reciprocal(l[:, None], approx=True)).astype(
+                            q_dtype
+                        )
+                    )
+
+                # Wait for previous bo to be fully sent before storing new bo.
+                bo_sem_idx = sem_ids_ref[2]
+                sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
+                wait_send_bo(bo_sem_idx)
+
+                # Store output from acc to bo.
+                bo_x2_ref.at[bo_sem_idx][...] = out.reshape(
+                    bq_sz, num_q_heads, head_dim
+                )
+                if num_q_heads % 128 == 0:
+                    bl_x2_ref.at[bo_sem_idx][...] = l_ref[...].reshape(
+                        bq_sz, num_q_heads
+                    )
+                    bm_x2_ref.at[bo_sem_idx][...] = m_ref[...].reshape(
+                        bq_sz, num_q_heads
+                    )
+                else:
+                    # if num_q_heads can't be divided by 128, the reshape can't compile,
+                    # so we need to loop through and copy row by row.
+                    for i in range(bq_sz):
+                        start = i * num_q_heads
+                        end = start + num_q_heads
+                        bl_x2_ref.at[bo_sem_idx, i][:num_q_heads] = l_ref[start:end]
+                        bm_x2_ref.at[bo_sem_idx, i][:num_q_heads] = m_ref[start:end]
+
+                # Send cur bo
+                start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
             bq_sem_idx = sem_ids_ref[0]
             next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
@@ -735,21 +898,50 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 # because the score of invalid Q.K^T pairs are masked (to be zero) in
                 # flash attention, so that the invalid kv entries
                 # (as long as they are not NaN or inf) won't affect to the output.
-                bkv = load_bkv(
-                    bkv_sem_idx,
-                    bkv_idx,
-                    cur_start_offset,
-                )
+                def compute_q_block(q_block):
+                    q_off = bq_idx * bq_sz + q_block * bq_compute_sz
+                    row_off = q_block * bq_compute_sz * num_q_heads
+                    if isinstance(q_block, int):
+                        static_first = q_block == 0
+                    else:
+                        static_first = False
+                        row_off = pl.multiple_of(row_off, bq_compute_sz * num_q_heads)
+                    if static_first:
+                        start_offset, kv_off = cur_start_offset, 0
+                    else:
+                        start_offset = _window_start(seq_idx, q_off)
+                        kv_off = start_offset - cur_start_offset
+                    flash_attention(
+                        load_bq(bq_sem_idx, q_block),
+                        load_bkv(bkv_sem_idx, kv_off),
+                        q_off=q_off,
+                        row_off=row_off,
+                        bkv_idx=bkv_idx,
+                        start_offset=start_offset,
+                    )
 
-                bq = load_bq(bq_sem_idx)
+                if q_blocks == 1:
+                    compute_q_block(0)
+                else:
+                    # A full bq block runs its query blocks as straight-line code
+                    # with the epilogue; a partial one only those it sends.
+                    full = (bq_idx + 1) * bq_sz <= q_len
 
-                flash_attention(
-                    bq,
-                    bkv,
-                    bq_idx=bq_idx,
-                    bkv_idx=bkv_idx,
-                    start_offset=cur_start_offset,
-                )
+                    @pl.when(full)
+                    def _():
+                        for q_block in range(q_blocks):
+                            compute_q_block(q_block)
+                        finish_bq()
+
+                    @pl.when(jnp.logical_not(full))
+                    def _():
+                        lax.fori_loop(
+                            0,
+                            cdiv(q_len - bq_idx * bq_sz, bq_compute_sz),
+                            lambda q_block, _: compute_q_block(q_block),
+                            None,
+                        )
+                        finish_bq()
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
@@ -764,44 +956,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                     unroll=False,
                 )
 
-            # Load acc and calculate final output.
-            acc = acc_ref[...]
-
-            if unnormalized_output:
-                out = acc.astype(q_dtype)
-            else:
-                attention_sinks = jnp.concat(
-                    [attention_sinks_ref[...] for _ in range(bq_sz)]
-                )
-                exp_attention_sinks = jnp.exp(attention_sinks - m_ref[...])
-                l = l_ref[...] + exp_attention_sinks  # noqa: E741
-                out = (
-                    lax.div(acc, l[:, None])
-                    if q_dtype == jnp.float32
-                    else (acc * pl.reciprocal(l[:, None], approx=True)).astype(q_dtype)
-                )
-
-            # Wait for previous bo to be fully sent before storing new bo.
-            bo_sem_idx = sem_ids_ref[2]
-            sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
-            wait_send_bo(bo_sem_idx)
-
-            # Store output from acc to bo.
-            bo_x2_ref.at[bo_sem_idx][...] = out.reshape(bq_sz, num_q_heads, head_dim)
-            if num_q_heads % 128 == 0:
-                bl_x2_ref.at[bo_sem_idx][...] = l_ref[...].reshape(bq_sz, num_q_heads)
-                bm_x2_ref.at[bo_sem_idx][...] = m_ref[...].reshape(bq_sz, num_q_heads)
-            else:
-                # if num_q_heads can't be divided by 128, the reshape can't compile,
-                # so we need to loop through and copy row by row.
-                for i in range(bq_sz):
-                    start = i * num_q_heads
-                    end = start + num_q_heads
-                    bl_x2_ref.at[bo_sem_idx, i][:num_q_heads] = l_ref[start:end]
-                    bm_x2_ref.at[bo_sem_idx, i][:num_q_heads] = m_ref[start:end]
-
-            # Send cur bo
-            start_send_bo(seq_idx, bq_idx, bo_sem_idx)
+            if q_blocks == 1:
+                finish_bq()
 
         lax.fori_loop(0, num_bq, compute_with_bq, None, unroll=False)
 
@@ -1296,7 +1452,8 @@ def run_mla_batched_decode_kernel(
     num_queries_per_block: int,
     start_seq_idx: jax.Array,  # i32
     end_seq_idx: jax.Array,  # i32
-    in_output: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
+    # None: the output starts uninitialized (see `_omit_in_output`).
+    in_output: jax.Array | None,  # [max_num_tokens, actual_num_q_heads, head_dim]
     in_l: jax.Array,  # [max_num_tokens, num_l_heads]
     in_m: jax.Array,  # [max_num_tokens, num_l_heads]
     attention_sinks: jax.Array,  # float32[num_q_heads]
@@ -1402,18 +1559,25 @@ def run_mla_batched_decode_kernel(
         sems,
     ]
 
+    body = functools.partial(
+        _mla_batched_decode_kernel,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        logical_page_size=logical_page_size,
+        unnormalized_output=unnormalized_output,
+        bkv_p=bkv_p,
+        seq_batch_sz=seq_batch_sz,
+    )
+    inputs = [attention_sinks, q, new_kv, cache_kv, in_output, in_l, in_m]
+    if in_output is None:
+        body, in_specs, inputs, input_output_aliases = _omit_in_output(
+            body, in_specs, inputs, input_output_aliases, len(scalar_prefetches)
+        )
+
     scope_name = f"SWA-d-bq_1-bkvp_{bkv_p}"
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
-            functools.partial(
-                _mla_batched_decode_kernel,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                logical_page_size=logical_page_size,
-                unnormalized_output=unnormalized_output,
-                bkv_p=bkv_p,
-                seq_batch_sz=seq_batch_sz,
-            ),
+            body,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
@@ -1431,16 +1595,7 @@ def run_mla_batched_decode_kernel(
             name=scope_name,
         )
     )
-    return kernel(
-        *scalar_prefetches,
-        attention_sinks,
-        q,
-        new_kv,
-        cache_kv,
-        in_output,
-        in_l,
-        in_m,
-    )
+    return kernel(*scalar_prefetches, *inputs)
 
 
 @functools.partial(
@@ -1456,6 +1611,7 @@ def run_mla_batched_decode_kernel(
         "unnormalized_output",
         "non_causal_block",
         "q_compute_block_size",
+        "q_blocks_per_fetch",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1480,6 +1636,7 @@ def mla_sliding_window_ragged_paged_attention(
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     q_compute_block_size: int | None = None,
+    q_blocks_per_fetch: int = Q_BLOCKS_PER_FETCH,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     unnormalized_output: bool = False,
     # Draft (DSpark/DFlash) block mode: the last q_len positions of each
@@ -1523,6 +1680,8 @@ def mla_sliding_window_ragged_paged_attention(
       num_queries_per_block: number of queries to be processed in one flash
         attention block in the pallas kernel. This is a tuple of (decode, prefill,
         mixed) cases.
+      q_blocks_per_fetch: query blocks the prefill and mixed kernels fetch and
+        send at a time, each still computed against its own kv window.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
 
     Returns:
@@ -1588,7 +1747,19 @@ def mla_sliding_window_ragged_paged_attention(
         sliding_window=sliding_window,
         logical_page_size=logical_page_size,
         max_q_len=q.shape[0],
-        max_kv_pages_per_block=max(num_kv_pages_per_blocks),
+        max_kv_pages_per_block=max(
+            fetch_block_sizes(
+                num_queries_per_block=num_queries_per_blocks[i],
+                num_kv_pages_per_block=num_kv_pages_per_blocks[i],
+                static_q_len=None,
+                max_q_len=q.shape[0],
+                num_q_heads=q.shape[1],
+                sliding_window=sliding_window,
+                logical_page_size=logical_page_size,
+                q_blocks_per_fetch=q_blocks_per_fetch,
+            )[2]
+            for i in range(3)
+        ),
     )
 
     def run_mla_kernel(
@@ -1601,7 +1772,8 @@ def mla_sliding_window_ragged_paged_attention(
         cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
         start_seq_idx: jax.Array,  # i32
         end_seq_idx: jax.Array,  # i32
-        in_output: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
+        # None: the output starts uninitialized (see `_omit_in_output`).
+        in_output: jax.Array | None,  # [max_num_tokens, actual_num_q_heads, head_dim]
         in_l: jax.Array,  # [max_num_tokens, num_l_heads]
         in_m: jax.Array,  # [max_num_tokens, num_l_heads]
         attention_sinks: jax.Array,  # float32[num_q_heads]
@@ -1611,11 +1783,16 @@ def mla_sliding_window_ragged_paged_attention(
         num_queries_per_block: int,
         case: MlaCase = MlaCase.MIXED,
     ):
-        bkv_p = num_kv_pages_per_block
-        if static_q_len is not None:
-            bq_sz = min(num_queries_per_block, static_q_len)
-        else:
-            bq_sz = num_queries_per_block
+        bq_compute_sz, bq_sz, bkv_p = fetch_block_sizes(
+            num_queries_per_block=num_queries_per_block,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            static_q_len=static_q_len,
+            max_q_len=q.shape[0],
+            num_q_heads=q.shape[1],
+            sliding_window=sliding_window,
+            logical_page_size=logical_page_size,
+            q_blocks_per_fetch=q_blocks_per_fetch,
+        )
         bkv_sz = bkv_p * logical_page_size
         grid = (end_seq_idx - start_seq_idx,)
 
@@ -1698,20 +1875,34 @@ def mla_sliding_window_ragged_paged_attention(
             f"SWA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
             f"{'-ncb' if non_causal_block else ''}"
         )
+        body = functools.partial(
+            _mla_sliding_window_ragged_paged_attention_kernel,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            static_q_len=static_q_len,
+            bq_sz=bq_sz,
+            bkv_p=bkv_p,
+            bq_compute_sz=bq_compute_sz,
+            bkv_compute_sz=num_kv_pages_per_block * logical_page_size,
+            logical_page_size=logical_page_size,
+            unnormalized_output=unnormalized_output,
+            non_causal_block=non_causal_block,
+            q_compute_block_size=q_compute_block_size,
+        )
+        inputs = [attention_sinks, q, new_kv, cache_kv, in_output, in_l, in_m]
+        input_output_aliases = {
+            11: 0,  # Alias output activation with in_output
+            10: 1,  # Aliasing cache_kv with updated_cache_kv
+            12: 2,  # Alias l with in_l
+            13: 3,  # Alias m with in_m
+        }
+        if in_output is None:
+            body, in_specs, inputs, input_output_aliases = _omit_in_output(
+                body, in_specs, inputs, input_output_aliases, len(scalar_prefetches)
+            )
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
-                functools.partial(
-                    _mla_sliding_window_ragged_paged_attention_kernel,
-                    sm_scale=sm_scale,
-                    sliding_window=sliding_window,
-                    static_q_len=static_q_len,
-                    bq_sz=bq_sz,
-                    bkv_p=bkv_p,
-                    logical_page_size=logical_page_size,
-                    unnormalized_output=unnormalized_output,
-                    non_causal_block=non_causal_block,
-                    q_compute_block_size=q_compute_block_size,
-                ),
+                body,
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
                     in_specs=in_specs,
@@ -1734,32 +1925,19 @@ def mla_sliding_window_ragged_paged_attention(
                         shape=(q.shape[0], num_l_heads), dtype=jnp.float32
                     ),
                 ],
-                input_output_aliases={
-                    11: 0,  # Alias output activation with in_output
-                    10: 1,  # Aliasing cache_kv with updated_cache_kv
-                    12: 2,  # Alias l with in_l
-                    13: 3,  # Alias m with in_m
-                },
+                input_output_aliases=input_output_aliases,
                 name=scope_name,
             )
         )
-        return kernel(
-            *scalar_prefetches,
-            attention_sinks,
-            q,
-            new_kv,
-            cache_kv,
-            in_output,
-            in_l,
-            in_m,
-        )
+        return kernel(*scalar_prefetches, *inputs)
 
     num_l_heads = align_to(num_q_heads, 128)
     l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
     m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
-    # output of swa attn is consumed by csa, hca attn, padding tokens'
-    # data won't be used downstream at all, so un-initialized buffer is fine.
-    in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
+    # The kernels write every token's row, the first of them into a fresh
+    # output. A normalized output's padding rows are zeroed after them (see
+    # `zero_rows_from`); an unnormalized one is consumed by the csa, hca attn,
+    # which never reads padding tokens' rows.
 
     bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
     if sliding_window <= bkv_sz:
@@ -1774,7 +1952,7 @@ def mla_sliding_window_ragged_paged_attention(
             num_queries_per_block=num_queries_per_blocks[0],
             start_seq_idx=jnp.array(0),
             end_seq_idx=distribution[0],
-            in_output=in_output,
+            in_output=None,
             in_l=l,
             in_m=m,
             attention_sinks=attention_sinks,
@@ -1795,7 +1973,7 @@ def mla_sliding_window_ragged_paged_attention(
             cu_q_lens,
             start_seq_idx=jnp.array(0),
             end_seq_idx=distribution[0],
-            in_output=in_output,
+            in_output=None,
             in_l=l,
             in_m=m,
             attention_sinks=attention_sinks,
@@ -1848,6 +2026,8 @@ def mla_sliding_window_ragged_paged_attention(
         unnormalized_output=unnormalized_output,
         case=MlaCase.MIXED,
     )
+    if not unnormalized_output:
+        output = zero_rows_from(output, cu_q_lens[distribution[2]])
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
