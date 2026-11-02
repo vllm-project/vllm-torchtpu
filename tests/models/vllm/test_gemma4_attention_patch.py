@@ -155,3 +155,54 @@ def test_init_names_the_flag_for_unsupported_configs(monkeypatch):
 def test_init_leaves_kv_shared_layers_alone(monkeypatch):
     monkeypatch.setattr(patch, "_orig_attention_init", _fake_init(object(), True))
     patch._patched_attention_init(SimpleNamespace())  # no impl checks
+
+
+def test_init_records_the_epsilon_and_the_backend_builds_before_tracing(monkeypatch):
+    """The op is built in initialize_kernel (before torch.compile), from the
+    epsilon the init patch records; forward_from_qkv refuses an unbuilt op."""
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasAttentionBackendImpl,
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+
+    impl = object.__new__(PallasBatchedRPAAttentionBackendImpl)
+    impl.qkv_prologue_eps, impl._qkv_kernel = None, None
+    monkeypatch.setattr(impl, "qkv_prologue_unsupported", lambda: [])
+
+    def init(self, *args, **kwargs):
+        self.is_kv_shared_layer = False
+        self.attn = SimpleNamespace(layer_name="layers.0.attn", impl=impl)
+        self.rotary_emb = SimpleNamespace(is_neox_style=True)
+        self.q_norm = SimpleNamespace(variance_epsilon=1e-6)
+
+    monkeypatch.setattr(patch, "_orig_attention_init", init)
+    patch._patched_attention_init(SimpleNamespace())
+    assert impl.qkv_prologue_eps == 1e-6
+
+    built = []
+    monkeypatch.setattr(
+        PallasAttentionBackendImpl, "initialize_kernel", lambda self, layer: None
+    )
+    monkeypatch.setattr(
+        impl, "_build_qkv_kernel", lambda ks, vs, eps: built.append(eps) or "op"
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    impl.initialize_kernel(layer)
+    assert built == [1e-6] and impl._qkv_kernel == "op"
+
+
+def test_forward_from_qkv_refuses_an_op_built_for_another_epsilon(monkeypatch):
+    from vllm_torchtpu.layers.adapter import attention as A
+
+    impl = object.__new__(A.PallasBatchedRPAAttentionBackendImpl)
+    impl.qkv_prologue_eps, impl._qkv_kernel = None, None
+    impl.num_heads, impl.head_size = 2, 128
+    monkeypatch.setattr(impl, "qkv_prologue_unsupported", lambda: [])
+    monkeypatch.setattr(
+        A,
+        "get_vllm_model_wrapper_context",
+        lambda: SimpleNamespace(kv_cache_bundle=None),
+    )
+    qkv, kv_cache = torch.zeros(4, 512), torch.zeros(8)
+    with pytest.raises(RuntimeError, match="initialize_kernel"):
+        impl.forward_from_qkv(None, qkv, None, None, None, None, 1e-6, kv_cache, None)
