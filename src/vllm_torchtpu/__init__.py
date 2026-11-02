@@ -2180,3 +2180,9 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         "Applied TPU patch: register shard index bounds as buffers in "
         "VocabParallelEmbedding"
     )
+
+try:
+    import vllm_torchtpu.layers.adapter.quantization  # noqa: F401
+except Exception:
+    pass
+

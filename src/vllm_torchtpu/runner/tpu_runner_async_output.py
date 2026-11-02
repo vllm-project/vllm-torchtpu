@@ -190,10 +190,12 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         copy_state: AsyncTPUCopyState | None,
         discard_sampled_tokens_req_indices: list[int],
+        pending_aux_output: Any | None = None,
     ):
         self._model_runner_output: ModelRunnerOutput = model_runner_output
         self.copy_state = copy_state
         self.discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
+        self.pending_aux_output = pending_aux_output
 
     def get_output(self) -> ModelRunnerOutput:
         if self.copy_state is None:
@@ -227,6 +229,23 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
                 valid_sampled_token_ids[i].clear()
 
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
+
+        if self.pending_aux_output is not None:
+            num_reqs = len(self._model_runner_output.req_ids)
+            num_sampled = np.array(
+                [
+                    len(tokens)
+                    for tokens in valid_sampled_token_ids[:num_reqs]
+                ],
+                dtype=np.int32,
+            )
+            num_rejected = np.zeros(num_reqs, dtype=np.int32)
+            self.pending_aux_output.enqueue_cpu_copy(num_sampled, num_rejected)
+            self._model_runner_output.aux_output_connector_output = (
+                self.pending_aux_output.process_output()
+            )
+            self.pending_aux_output = None
+
         return self._model_runner_output
 
 

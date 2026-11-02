@@ -19,6 +19,11 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
+
+
+def _get_topk_weights_dtype(default_dtype: jnp.dtype) -> jnp.dtype:
+    """Returns jnp.float32 if TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled, else default_dtype."""
+    return jnp.float32 if envs.TPU_MOE_TOPK_WEIGHTS_FLOAT32 else default_dtype
 from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
@@ -728,10 +733,9 @@ def fused_moe_func(
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
 
-    # Pin topk_weights to hidden_states.dtype so the EP mask, GMM
-    # reduce, and `where` propagate in BF16 — some custom_routing_fn
-    # callers return FP32 weights and would otherwise promote downstream.
-    topk_weights = topk_weights.astype(hidden_states.dtype)
+    # Pin topk_weights to hidden_states.dtype (or float32 if TPU_MOE_TOPK_WEIGHTS_FLOAT32
+    # is enabled) so the EP mask, GMM reduce, and `where` propagate appropriately.
+    topk_weights = topk_weights.astype(_get_topk_weights_dtype(hidden_states.dtype))
 
     if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
         # The one-hot permute and unpermute are matmuls across all tokens, and

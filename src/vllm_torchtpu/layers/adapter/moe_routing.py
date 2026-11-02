@@ -27,6 +27,11 @@ logger = init_logger(__name__)
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
 
 
+def _get_topk_weights_dtype(default_dtype: torch.dtype) -> torch.dtype:
+    """Returns torch.float32 if TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled, else default_dtype."""
+    return torch.float32 if envs.TPU_MOE_TOPK_WEIGHTS_FLOAT32 else default_dtype
+
+
 def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-k over the expert axis, by the configured implementation."""
     if _ROUTER_TOPK == "rowmax":
@@ -114,7 +119,7 @@ def _uniform_random_routing(
     topk_weights = torch.ones(
         (router_logits.shape[0], topk), dtype=torch.float32, device=router_logits.device
     )
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(torch.int32)
 
 
 def maybe_simulate_routing(
@@ -144,7 +149,7 @@ def maybe_simulate_routing(
         top_k=topk,
         indices_type=torch.int32,
     )
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(torch.int32)
 
 
 def route(
@@ -166,24 +171,30 @@ def route(
     topk = layer.moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
-        return simulated
-    custom_routing_fn = layer.custom_routing_function
-    if custom_routing_fn is not None:
-        return custom_routing_fn(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=topk,
-            renormalize=layer.renormalize,
-        )
-    return select_experts(
-        hidden_states=hidden_states,
-        router_logits=router_logits,
-        topk=topk,
-        renormalize=layer.renormalize,
-        scoring_fn=layer.scoring_func,
-        layer=layer,
-        input_ids=input_ids,
-    )
+        topk_weights, topk_ids = simulated
+    else:
+        custom_routing_fn = layer.custom_routing_function
+        if custom_routing_fn is not None:
+            topk_weights, topk_ids = custom_routing_fn(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=topk,
+                renormalize=layer.renormalize,
+            )
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk=topk,
+                renormalize=layer.renormalize,
+                scoring_fn=layer.scoring_func,
+                layer=layer,
+                input_ids=input_ids,
+            )
+    capture_fn = getattr(layer, "capture_fn", None)
+    if capture_fn is not None:
+        capture_fn(topk_ids)
+    return topk_weights, topk_ids
 
 
 def _apply_scoring_fn(scoring_fn: str, router_logits: torch.Tensor) -> torch.Tensor:
@@ -271,7 +282,7 @@ def select_experts(
             renormalize,
             routed_scaling_factor,
         )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+        return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(torch.int32)
 
     use_grouped = (
         layer is not None
@@ -296,7 +307,7 @@ def select_experts(
             routed_scaling_factor=layer.routed_scaling_factor,
             e_score_correction_bias=layer.e_score_correction_bias,
         )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+        return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(torch.int32)
 
     scores = _apply_scoring_fn(scoring_fn, router_logits.float())
     e_score_correction_bias = (
@@ -320,7 +331,7 @@ def select_experts(
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(torch.int32)
 
 
 def get_experts_start(layer) -> int | None:

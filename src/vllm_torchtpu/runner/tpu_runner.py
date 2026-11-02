@@ -1783,6 +1783,14 @@ class TPUModelRunner(GPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+            if self.vllm_config.aux_output_config.enabled:
+                from vllm.distributed.aux_output_connector.worker import (
+                    get_aux_output_connector,
+                )
+
+                self.aux_output_connector = get_aux_output_connector(
+                    self.model, self.vllm_config, kv_cache_config
+                )
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -3876,6 +3884,10 @@ class TPUModelRunner(GPUModelRunner):
             )
         # Update cached state
         self._update_states(scheduler_output)
+        if getattr(self, "aux_output_connector", None) is not None:
+            self.aux_output_connector.begin_step(
+                scheduler_output.aux_output_connector_metadata
+            )
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
@@ -5434,6 +5446,30 @@ class TPUModelRunner(GPUModelRunner):
                 elif out is not None:
                     pooler_output.extend(out)
 
+        pending_aux_output = None
+        if getattr(self, "aux_output_connector", None) is not None:
+            # self.query_start_loc_np is rebuilt per execution chunk in
+            # _prepare_inputs and only reflects the last chunk, so rebuild the
+            # step-wide boundaries from the scheduler output (mirrors the GPU
+            # model runner's query_start_loc_np).
+            sched_lens = np.array(
+                [scheduler_output.num_scheduled_tokens[r] for r in req_ids],
+                dtype=np.int32,
+            )
+            self.input_batch.query_start_loc_np = np.concatenate(
+                [np.zeros(1, dtype=np.int32), np.cumsum(sched_lens, dtype=np.int32)]
+            )
+            self.input_batch.num_computed_tokens_np = np.array(
+                [
+                    getattr(self.requests.get(r), "num_computed_tokens", 0)
+                    for r in req_ids
+                ],
+                dtype=np.int32,
+            )
+            pending_aux_output = self.aux_output_connector.prepare_output(
+                self.input_batch
+            )
+
         with self._stage_timing.host_stage("output_assembly"):
             model_runner_output = ModelRunnerOutput(
                 req_ids=req_ids,
@@ -5453,6 +5489,7 @@ class TPUModelRunner(GPUModelRunner):
                 model_runner_output=model_runner_output,
                 copy_state=copy_state,
                 discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                pending_aux_output=pending_aux_output,
             )
 
         if not self.scheduler_config.async_scheduling:

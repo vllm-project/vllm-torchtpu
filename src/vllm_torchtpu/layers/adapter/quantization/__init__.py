@@ -37,7 +37,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
     VllmDeepseekV4Fp8Config,
 )
-from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config, VllmFp8MoEConfig
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import attach_online_fp8
@@ -72,6 +72,7 @@ def get_tpu_quantization_config(
     method_to_config: dict[str | None, type[VllmQuantConfig]] = {
         None: VllmUnquantizedConfig,
         quant_methods.FP8: VllmFp8Config,
+        quant_methods.FP8_MOE: VllmFp8MoEConfig,
         quant_methods.MXFP4: VllmMxfp4Config,
         quant_methods.NVFP4: VllmNvfp4Config,
         quant_methods.COMPRESSED_TENSORS: VllmCompressedTensorsConfig,

@@ -467,6 +467,8 @@ class TpuPlatform(Platform):
         "mxfp4",
         "modelopt_fp4",
         "deepseek_v4_fp8",
+        "fp8_moe",
+        "tpu-fp8_moe",
     ]
 
     additional_env_vars: list[str] = [
