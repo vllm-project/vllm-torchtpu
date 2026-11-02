@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_NORM_WEIGHTS_FP32: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
@@ -836,6 +837,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Store learned RMSNorm weights in float32 at load (runner/utils.py
+    # upcast_norm_weights). The TPU rms_norm providers multiply in float32, so
+    # outputs do not change where every norm goes through them (verified on
+    # Gemma4); code that reads norm weights directly sees float32.
+    "TPU_NORM_WEIGHTS_FP32": env_bool("TPU_NORM_WEIGHTS_FP32"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()

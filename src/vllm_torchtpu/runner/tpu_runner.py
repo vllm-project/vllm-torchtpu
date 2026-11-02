@@ -5504,6 +5504,8 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
+        if envs.TPU_NORM_WEIGHTS_FP32:
+            runner_utils.upcast_norm_weights(self.model)
         if (
             envs.TPU_GREEDY_TOP_TOKENS
             and self._pp_is_last
