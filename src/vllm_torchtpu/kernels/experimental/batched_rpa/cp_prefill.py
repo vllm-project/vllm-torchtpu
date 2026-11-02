@@ -24,8 +24,10 @@ pieces as two sub-requests whose queries sit at their absolute positions:
 * sliding window: each piece's cache is the piece's own pages after a halo of
   the pages that precede it, which the rank holding the preceding piece sends.
 
-All K/V, the pieces' own tokens included, is read from that cache
-(`skip_kv_update`). The serving cache is written separately: each rank keeps
+Full attention reads all K/V, the pieces' own tokens included, from the
+gathered buffer (`skip_kv_update`); a sliding-window layer reads only the halos
+from its buffer and takes the pieces' own K/V as the kernel's new tokens. The
+serving cache is written separately: each rank keeps
 the KV heads it owns under tensor parallelism (`tp_kv_heads`), every position
 of a full-attention layer from the gathered buffer and, of a sliding-window
 layer, the pages the next decode's window reaches, which the ranks holding
@@ -202,26 +204,32 @@ def halo_permutations(world: int) -> tuple[list[tuple[int, int]], ...]:
     return up, down
 
 
-def exchange_halos(
-    keys: jax.Array,
-    values: jax.Array,
-    halo_pages: int,
-    page_size: int,
-    axis_name: str,
-    world: int,
+def pack_piece_tails(
+    keys: jax.Array, values: jax.Array, halo_pages: int, page_size: int
 ) -> jax.Array:
-    """[first piece's halo | second piece's halo] pages of this rank, inside a
-    `shard_map` over `axis_name`: the `halo_permutations` shifts of every rank's
-    piece tails. `keys` and `values` are the rank's rows of its two pieces."""
+    """The last `halo_pages` pages of the rank's first and second piece, packed
+    (`pack_kv_pages`); `keys` and `values` are the rank's rows."""
     piece, halo = keys.shape[0] // 2, halo_pages * page_size
+    return jnp.concatenate(
+        [
+            pack_kv_pages(keys[end - halo : end], values[end - halo : end], page_size)
+            for end in (piece, 2 * piece)
+        ]
+    )
+
+
+def exchange_halos(tails: jax.Array, axis_name: str, world: int) -> jax.Array:
+    """[first piece's halo | second piece's halo] of this rank, inside a
+    `shard_map` over `axis_name`: the `halo_permutations` shifts of every rank's
+    `pack_piece_tails`."""
+    halo_pages = tails.shape[0] // 2
     up, down = halo_permutations(world)
-    shifted = []
-    for end, pairs in ((piece, up), (2 * piece, down)):
-        tail = pack_kv_pages(
-            keys[end - halo : end], values[end - halo : end], page_size
-        )
-        shifted.append(jax.lax.ppermute(tail, axis_name, pairs))
-    return jnp.concatenate(shifted)
+    return jnp.concatenate(
+        [
+            jax.lax.ppermute(tails[:halo_pages], axis_name, up),
+            jax.lax.ppermute(tails[halo_pages:], axis_name, down),
+        ]
+    )
 
 
 def sliding_local_pages(
@@ -235,7 +243,7 @@ def sliding_local_pages(
     the halos in place and the piece pages zero, for `cp_prefill_attention` to
     fill from `keys` and `values` (the rank's rows).
 
-    `halos` is what `exchange_halos` delivers. Rank 0's first piece starts the
+    `halos` is what `exchange_halos` delivers (fp8). Rank 0's first piece starts the
     prompt, so its first halo goes unread; the last rank's second piece
     follows its own first piece, whose tail is used instead of what the
     permute delivered.
@@ -632,7 +640,7 @@ def sliding_attention_layer(
     Args:
         query: [rows, num_heads, head_dim].
         keys, values: [rows, num_kv_heads, head_dim] fp8 K/V of the rank's rows.
-        halos: `exchange_halos` pages.
+        halos: `exchange_halos` pages, as int8.
         seq_lens: The step's sequence lengths (one request).
         cfg: The layer.
 
@@ -645,6 +653,7 @@ def sliding_attention_layer(
     page_size = halos.shape[1]
     plan = cfg.plan(query.shape[0], page_size)
     halo_pages = num_halo_pages(cfg.sliding_window, page_size)
+    halos = jax.lax.bitcast_convert_type(halos, keys.dtype)
     local = sliding_local_pages(halos, keys, values, plan, cfg.rank)
     tables = plan.sliding_page_tables(cfg.rank, halo_pages)
     out = cp_prefill_attention(

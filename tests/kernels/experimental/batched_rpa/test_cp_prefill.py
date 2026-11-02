@@ -176,7 +176,9 @@ def _halo_worker(world: int) -> dict:
     mesh = Mesh(np.array(jax.devices()[:world]), ("x",))
     halos = jax.jit(
         jax.shard_map(
-            lambda kr, vr: cp_prefill.exchange_halos(kr, vr, halo, PAGE, "x", world),
+            lambda kr, vr: cp_prefill.exchange_halos(
+                cp_prefill.pack_piece_tails(kr, vr, halo, PAGE), "x", world
+            ),
             mesh=mesh,
             in_specs=(P("x"), P("x")),
             out_specs=P("x"),
@@ -410,7 +412,7 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
     seq_lens = jnp.array([seq_len], jnp.int32)
     query = jnp.zeros((2 * plan.piece_tokens, 32, 128), jnp.bfloat16)
     halo = cp_prefill.num_halo_pages(window, PAGE)
-    halos = jnp.zeros((2 * halo, PAGE, 2 * num_kv_heads // 4, 4, 128), FP8)
+    halos = jnp.zeros((2 * halo, PAGE, 2 * num_kv_heads // 4, 4, 128), jnp.int8)
     sent, owners = [], None
     for rank in range(plan.world):
         cfg = _layer_config(rank, num_kv_heads, window, layout)
