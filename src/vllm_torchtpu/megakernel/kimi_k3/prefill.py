@@ -1250,6 +1250,14 @@ class KimiPrefiller:
                 "K3 prefill: weights resident in %.1f s",
                 time.perf_counter() - started,
             )
+            from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
+
+            cfg = kernel_config.active()
+            logger.info(
+                "K3 prefill: kernel config %s, non-default fields %s",
+                cfg.key(),
+                kernel_config.non_default_fields(cfg) or "none",
+            )
 
     def bind_kv_caches(
         self, caches: Mapping[str, torch.Tensor], groups: Sequence[KVGroup]

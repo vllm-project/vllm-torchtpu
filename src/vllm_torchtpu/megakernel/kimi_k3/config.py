@@ -210,6 +210,21 @@ def _coerce(config: KernelConfig, name: str, value: Any) -> Any:
     return value
 
 
+def non_default_fields(config: KernelConfig) -> dict[str, Any]:
+    """Fields that differ from a KernelConfig built without any K3_* variable
+    (the code defaults), e.g. for a startup log line."""
+    import unittest.mock
+
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("K3_")}
+    with unittest.mock.patch.dict(os.environ, clean, clear=True):
+        baseline = KernelConfig()
+    return {
+        f.name: getattr(config, f.name)
+        for f in dataclasses.fields(config)
+        if getattr(config, f.name) != getattr(baseline, f.name)
+    }
+
+
 _ACTIVE: KernelConfig | None = None
 
 

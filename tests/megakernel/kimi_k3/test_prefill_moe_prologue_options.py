@@ -29,3 +29,17 @@ def test_env_and_set_overrides(monkeypatch):
 def test_bank_count_validated(banks):
     with pytest.raises(ValueError, match="prefill_moe_dma_banks"):
         config.KernelConfig(prefill_moe_dma_banks=banks)
+
+
+def test_non_default_fields_lists_env_and_overrides(monkeypatch):
+    monkeypatch.setenv("K3_PREFILL_MOE_DMA_BANKS", "3")
+    monkeypatch.setenv("K3_PREFILL_MOE_ONESHOT_MAX", "1024")
+    cfg = config.KernelConfig().replace(mla_flash_qtile="2048")
+    assert config.non_default_fields(cfg) == {
+        "prefill_moe_dma_banks": 3,
+        "prefill_moe_oneshot_max": 1024,
+        "mla_flash_qtile": 2048,
+    }
+    monkeypatch.delenv("K3_PREFILL_MOE_DMA_BANKS")
+    monkeypatch.delenv("K3_PREFILL_MOE_ONESHOT_MAX")
+    assert config.non_default_fields(config.KernelConfig()) == {}
