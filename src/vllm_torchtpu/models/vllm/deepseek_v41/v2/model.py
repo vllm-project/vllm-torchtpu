@@ -344,6 +344,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     _engram_split_layer: int | None = None
     _engram_first_split_layer: int | None = None
     _gathered_engram_hashes: torch.Tensor | None = None
+    # Device hashes whose download waits until the encoder head is dispatched.
+    _pending_engram_hashes: torch.Tensor | None = None
     _raw_dma_enabled = False
     _engram_prefetch: _EngramPrefetch | None = None
     _current_host_inputs: HostEngramInputs | None = None
@@ -483,17 +485,17 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # hash still has to reach them.
                 engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
             if engram_hashes is not None and not skip_lookup:
-                # Gather all Engram rows before entering the decoder layers.
-                # One gather feeds every layer sharing the DP-split table.
-                if self._has_cpu_offloaded_engram():
-                    # Idle/decode replicas may hash on device while a prefill
-                    # replica hashes on host. All must use the CPU collective.
-                    engram_hashes = self._hash_download.copy_to_host(engram_hashes)
-                gathered_hashes = gather_host_engram_hashes(
-                    engram_hashes,
-                    dp_shared_memory=self.engram_dp_shared_memory,
-                    gather_fn=upstream.gather_engram_hashes,
-                )
+                if self._defers_hash_download(engram_hashes, stage):
+                    # Enqueue the device hash, then let the encoder head
+                    # dispatch before the blocking download; the split
+                    # encoder downloads it after the head.
+                    synchronize_tensors((engram_hashes,), wait=False)
+                    self._pending_engram_hashes = engram_hashes
+                    logger.info_once(
+                        "[DSV41] Engram hash download follows the encoder head"
+                    )
+                    return engram_hashes, engram_mask
+                gathered_hashes = self._gather_engram_hashes(engram_hashes)
                 end_layer = (
                     getattr(self, "_ced_boundary", self.end_layer)
                     if stage == "encoder"
@@ -508,6 +510,40 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     end_layer = first_split if first_split is not None else split
                 self._stage_engram_layers(self.start_layer, end_layer, gathered_hashes)
         return engram_hashes, engram_mask
+
+    def _gather_engram_hashes(self, engram_hashes: torch.Tensor) -> torch.Tensor:
+        # Gather all Engram rows before entering the decoder layers.
+        # One gather feeds every layer sharing the DP-split table.
+        if self._has_cpu_offloaded_engram():
+            # Idle/decode replicas may hash on device while a prefill
+            # replica hashes on host. All must use the CPU collective.
+            engram_hashes = self._hash_download.copy_to_host(engram_hashes)
+        return gather_host_engram_hashes(
+            engram_hashes,
+            dp_shared_memory=self.engram_dp_shared_memory,
+            gather_fn=upstream.gather_engram_hashes,
+        )
+
+    def _defers_hash_download(self, engram_hashes: torch.Tensor, stage: str) -> bool:
+        """Whether the split encoder head may dispatch before the hash download.
+
+        Only device hashes of host tables are downloaded, and only a head that
+        stages no Engram layer can run without them. A DP-shared table gathers
+        hashes without a collective, so no replica reorders one.
+        """
+        first_split = self._engram_first_split_layer
+        return (
+            stage == "encoder"
+            and self._engram_split_layer is not None
+            and first_split is not None
+            and engram_hashes.device.type != "cpu"
+            and self.engram_dp_shared_memory
+            and self._has_cpu_offloaded_engram()
+            and all(
+                getattr(layer, "engram", None) is None
+                for layer in islice(self.layers, self.start_layer, first_split)
+            )
+        )
 
     def _stage_engram_layers(
         self,
@@ -716,6 +752,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         finally:
             self._engram_prepared_outside_stage = False
             self._gathered_engram_hashes = None
+            self._pending_engram_hashes = None
         # Match the runner's convention for compiled backends that wrap the
         # model result in a single-element output list.
         if isinstance(encoded, (list, tuple)) and len(encoded) == 1:
@@ -885,6 +922,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         )
         synchronize_tensors(carry, wait=False)
         self._record_engram_consumers(self.start_layer, first_split, carry)
+        if self._pending_engram_hashes is not None:
+            self._gathered_engram_hashes = self._gather_engram_hashes(
+                self._pending_engram_hashes
+            )
+            self._pending_engram_hashes = None
         self._stage_engram_layers(first_split, split, self._gathered_engram_hashes)
         carry = self.encoder_middle_stage(input_ids, positions, *carry)
         synchronize_tensors(carry, wait=False)

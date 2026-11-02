@@ -129,37 +129,52 @@ def _csa2_kernel(
     pages_ref,
     bounds_ref,
     # Inputs
-    q_hbm,  # [T, H, 512], BF16
-    kv_hbm,
+    q_hbm,  # [T', H, 512], BF16; this call's T queries start at query_offset
+    kv_hbm,  # [T, 512, 128], INT32
     scales_hbm,
     swa_hbm,
     sink_ref,
     rope_hbm,
-    # Output
-    out_hbm,  # [T, H, 512], BF16
-    # Scratch
-    q_buf,  # [4, bq, H, 512], BF16
-    kv_buf,
-    scales_buf,
-    rope_buf,
-    rope_saved,
-    swa_buf,
-    outputs,
-    decoded,
-    swa_work,
-    swa_scores,
-    main_p,
-    swa_p,
-    input_sems,
-    swa_sems,
-    output_sems,
-    tile_scratch,
-    *,
+    # Aliased owners (owners == "aliased"), outputs, then scratch
+    *refs,
     scale: float,
     non_causal: bool,
+    query_offset: int,
+    owners: str,
 ) -> None:
-    """Persistent attention with four input buffers and two output buffers."""
-    tokens, heads, _ = q_hbm.shape
+    """Persistent attention with four input buffers and two output buffers.
+
+    Output rows land at query_offset onward. With ``owners`` "new" or
+    "aliased", the main KV rows are also copied to the matching rows of the
+    [T', 512, 128] output, which "aliased" updates in place.
+    """
+    if owners == "aliased":
+        _, _, out_hbm, kv_out_hbm, *scratch = refs
+    elif owners == "new":
+        out_hbm, kv_out_hbm, *scratch = refs
+    else:
+        out_hbm, *scratch = refs
+        kv_out_hbm = None
+    (
+        q_buf,  # [4, bq, H, 512], BF16
+        kv_buf,
+        scales_buf,
+        rope_buf,
+        rope_saved,
+        swa_buf,
+        outputs,
+        decoded,
+        swa_work,
+        swa_scores,
+        main_p,
+        swa_p,
+        input_sems,
+        swa_sems,
+        output_sems,
+        kv_sem,
+        tile_scratch,
+    ) = scratch
+    tokens, heads = positions_ref.shape[0], q_hbm.shape[1]
     bq = q_buf.shape[1]
     batch = pages_ref.shape[0]
     num_banks = len(swa_hbm)
@@ -203,20 +218,27 @@ def _csa2_kernel(
             return min(max(tile, 0), limit - 1)
         return tile
 
-    def rows(tile):
+    def rows(tile, offset=0):
         tile = safe_tile(tile)
         start = jnp.minimum(_tile_field(tiles_ref, tile, 1), tokens - bq)
-        return pl.ds(start, bq)
+        return pl.ds(offset + start, bq)
 
     def input_copies(tile, bank):
-        sources = ((q_hbm, q_buf), (kv_hbm, kv_buf))
+        sources = ((q_hbm, q_buf, query_offset), (kv_hbm, kv_buf, 0))
         if not resident_metadata:
-            sources += ((scales_hbm, scales_buf), (rope_hbm, rope_buf))
+            sources += ((scales_hbm, scales_buf, 0), (rope_hbm, rope_buf, 0))
         return tuple(
             pltpu.make_async_copy(
-                source.at[rows(tile)], target.at[bank], input_sems.at[bank, i]
+                source.at[rows(tile, offset)], target.at[bank], input_sems.at[bank, i]
             )
-            for i, (source, target) in enumerate(sources)
+            for i, (source, target, offset) in enumerate(sources)
+        )
+
+    def kv_copy(tile, bank):
+        # Clamped tiles may rewrite rows of a neighbour with identical values.
+        assert kv_out_hbm is not None
+        return pltpu.make_async_copy(
+            kv_buf.at[bank], kv_out_hbm.at[rows(tile, query_offset)], kv_sem.at[bank]
         )
 
     def swa_copies(tile, bank):
@@ -275,12 +297,14 @@ def _csa2_kernel(
     def output_copy(tile, bank):
         tile = safe_tile(tile)
         if fixed_tiles:
-            source_rows, target_rows = pl.ds(0, bq), pl.ds(tile * bq, bq)
+            source_rows = pl.ds(0, bq)
+            target_rows = pl.ds(query_offset + tile * bq, bq)
         else:
             start = _tile_field(tiles_ref, tile, 1)
             size = _tile_field(tiles_ref, tile, 2)
             offset = start - jnp.minimum(start, tokens - bq)
-            source_rows, target_rows = pl.ds(offset, size), pl.ds(start, size)
+            source_rows = pl.ds(offset, size)
+            target_rows = pl.ds(query_offset + start, size)
         return pltpu.make_async_copy(
             outputs.at[bank, source_rows],
             out_hbm.at[target_rows],
@@ -587,6 +611,8 @@ def _csa2_kernel(
     def step(tile, bank, sb, *, steady=False):
         for copy in input_copies(tile, sb):
             copy.wait()
+        if kv_out_hbm is not None:
+            kv_copy(tile, sb).start()
         if isinstance(tile, int) and tile == 0:
             for copy in swa_copies(tile, sb):
                 copy.wait()
@@ -607,6 +633,9 @@ def _csa2_kernel(
         if not isinstance(tile, int) or tile >= 3:
             output_copy(tile - 3, 1 - bank).wait()
         compute(tile, bank, sb, steady=steady)
+        if kv_out_hbm is not None:
+            # start(tile + 4, sb) below refills this KV buffer.
+            kv_copy(tile, sb).wait()
         if steady:
             start(tile + 4, sb)
         else:
@@ -665,7 +694,7 @@ def _csa2_kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("scale", "compress_ratio", "bq"),
+    static_argnames=("scale", "compress_ratio", "bq", "query_offset", "new_owners"),
 )
 def csa2(
     q: jax.Array,
@@ -683,18 +712,47 @@ def csa2(
     scale: float = 512**-0.5,
     compress_ratio: int = 2,
     bq: int = 8,
-) -> jax.Array:
+    query_offset: int = 0,
+    out: jax.Array | None = None,
+    kv_out: jax.Array | None = None,
+    new_owners: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Ragged CSA2 attention with FP32 scales and independent SWA visibility.
 
     Main KV is query-local packed FP8 [T,512,128], scales are FP32 [T,512].
     SWA uses one or two native BF16 page owners. starts [B+1] describes
     requests; repeated boundaries and output padding are supported.
     Explicit swa_bounds selects visibility independently of model layer stage.
+
+    The T queries are rows [query_offset, query_offset + T) of q [T',H,512].
+    With ``out`` [T',H,512] and ``kv_out`` [T',512,128] (both or neither),
+    attention and main KV are written in place to those rows of the two
+    owners and ``(out, kv_out)`` is returned, so a chunked caller needs no
+    output update or gathered-KV concatenation. ``new_owners`` instead
+    returns two newly allocated owners of those shapes; only this call's rows
+    are written.
     """
     non_causal = swa_bounds is not None
+    destinations = out is not None
+    if destinations != (kv_out is not None):
+        raise ValueError("CSA2 out and kv_out must be given together")
+    if destinations and new_owners:
+        raise ValueError("CSA2 new_owners excludes out and kv_out")
+    owners = "aliased" if destinations else "new" if new_owners else "none"
     if q.ndim != 3 or q.shape[2] != 512:
         raise ValueError("CSA2 q must be [T,H,512]")
-    tokens, heads, _ = q.shape
+    tokens, heads = positions.shape[0], q.shape[1]
+    if type(query_offset) is not int or not (0 <= query_offset <= q.shape[0] - tokens):
+        raise ValueError("CSA2 query rows must lie within q")
+    if owners == "none" and q.shape[0] != tokens:
+        raise ValueError("CSA2 query offsets require out and kv_out or new owners")
+    if destinations and (
+        out.shape != q.shape
+        or out.dtype != q.dtype
+        or kv_out.shape != (q.shape[0], 512, 128)
+        or kv_out.dtype != jnp.int32
+    ):
+        raise ValueError("CSA2 out must match q and kv_out must be INT32 [T',512,128]")
     if heads < 8 or heads > 128 or heads % 8:
         raise ValueError("CSA2 requires H divisible by 8, in [8,128]")
     if type(bq) is not int or not 1 <= bq <= 16:
@@ -731,7 +789,7 @@ def csa2(
     if main_lengths is None:
         main_lengths = jnp.minimum((positions + 1) // compress_ratio, 512)
     specs = (
-        (q, (tokens, heads, 512), jnp.bfloat16),
+        (q, (q.shape[0], heads, 512), jnp.bfloat16),
         (main_kv, (tokens, 512, 128), jnp.int32),
         (main_kv_scale, (tokens, 512), jnp.float32),
         (starts, (batch + 1,), jnp.int32),
@@ -751,7 +809,9 @@ def csa2(
     ):
         raise ValueError("SWA bounds must be INT32 [B,2]")
     if not tokens:
-        return jnp.zeros_like(q)
+        if new_owners:
+            return jnp.zeros_like(q), jnp.zeros((q.shape[0], 512, 128), jnp.int32)
+        return (out, kv_out) if destinations else jnp.zeros_like(q)
     bq = min(bq, tokens, 128 // (pl.cdiv(heads, 16) * 4))
     fixed_tiles = batch == 1 and tokens % bq == 0
     tile_capacity = (
@@ -782,19 +842,41 @@ def csa2(
         metadata_space,
     )
     inputs = (q, main_kv, main_kv_scale[:, None, :], banks, sink[:, None], rope_cache)
+    out_shape = jax.ShapeDtypeStruct(q.shape, q.dtype)
+    out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
+    aliases = {}
+    if owners != "none":
+        out_shape = (
+            out_shape,
+            jax.ShapeDtypeStruct((q.shape[0], 512, 128), jnp.int32),
+        )
+        out_specs = (out_specs, out_specs)
+    if destinations:
+        spaces += (pltpu.HBM, pltpu.HBM)
+        inputs += (out, kv_out)
+        # Operand indices count the five scalar-prefetch operands.
+        first = len(scalars) + len(jax.tree.leaves(inputs)) - 2
+        aliases = {first: 0, first + 1: 1}
     # BlockSpec alone does not prevent an upstream whole-owner memory-space copy.
     inputs = jax.tree.map(pltpu.with_memory_space_constraint, inputs, spaces)
 
     return pl.pallas_call(
-        functools.partial(_csa2_kernel, scale=scale, non_causal=non_causal),
-        out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+        functools.partial(
+            _csa2_kernel,
+            scale=scale,
+            non_causal=non_causal,
+            query_offset=query_offset,
+            owners=owners,
+        ),
+        out_shape=out_shape,
+        input_output_aliases=aliases,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
             grid=(),
             in_specs=jax.tree.map(
                 lambda space: pl.BlockSpec(memory_space=space), spaces
             ),
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            out_specs=out_specs,
             scratch_shapes=(
                 pltpu.VMEM((4, bq, heads, 512), jnp.bfloat16),
                 pltpu.VMEM((4, bq, 512, 128), jnp.int32),
@@ -813,6 +895,7 @@ def csa2(
                 pltpu.SemaphoreType.DMA((4, 2 if resident_metadata else 4)),
                 pltpu.SemaphoreType.DMA((4, num_pages * len(banks))),
                 pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((4,)),
                 pltpu.SMEM((tile_capacity * 3,), jnp.int32),
             ),
         ),
