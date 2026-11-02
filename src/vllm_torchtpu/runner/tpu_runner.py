@@ -271,8 +271,35 @@ def _rollback_offsets_migrate_impl(
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
 
 
+def _update_read_offsets_impl(
+    read_offsets: torch.Tensor,
+    groups: list[torch.Tensor],
+    next_tokens: torch.Tensor,
+    num_reqs: torch.Tensor,
+) -> None:
+    """Post-verify read-offset scatter for every mamba group in one program.
+    Each of `groups` is a [width] slot tensor; `next_tokens` the rejection
+    sampler output ([>= num_reqs, K+1], INVALID_TOKEN_ID-padded); `num_reqs`
+    a 0-d tensor, so it enters as a value, not a shape. Rows past it take
+    offset 0 (their slots are the null block)."""
+    width = groups[0].shape[0]
+    rows = next_tokens.shape[0]
+    if rows >= width:
+        next_tokens = next_tokens[:width]
+    else:
+        next_tokens = torch.nn.functional.pad(
+            next_tokens, (0, 0, 0, width - rows), value=INVALID_TOKEN_ID
+        )
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    valid = torch.arange(width, device=read_offsets.device) < num_reqs
+    offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0).to(read_offsets.dtype)
+    indices = torch.cat(groups, dim=0).long()
+    read_offsets.index_put_((indices,), offsets.repeat(len(groups)))
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
+_update_read_offsets_compiled = _tpu_compile(_update_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
 
@@ -4471,6 +4498,18 @@ class TPUModelRunner(GPUModelRunner):
         its state block (the checkpoint of its last accepted token).
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
+            return
+        if (
+            next_tokens is not None
+            and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
+            and self.mamba_slot_read_offsets.device.type == "tpu"
+        ):
+            _update_read_offsets_compiled(
+                self.mamba_slot_read_offsets,
+                list(indices_per_group),
+                next_tokens,
+                torch.tensor(num_reqs, dtype=torch.int64, device=self.device),
+            )
             return
         offsets = torch.zeros(
             indices_per_group[0].shape[0],

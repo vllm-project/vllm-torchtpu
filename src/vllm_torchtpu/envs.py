@@ -194,6 +194,8 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
+    VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -1155,6 +1157,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # Async spec decode: derive the draft seed (token, position, rejected
+    # count) from the rejection-sampler output in one compiled program per
+    # request-padding bucket instead of ~15 eager ones (eagle3.py
+    # _async_draft_seed). Partial-prefill overrides keep the eager path.
+    "VLLM_TPU_FUSED_ASYNC_DRAFT_SEED": env_bool(
+        "VLLM_TPU_FUSED_ASYNC_DRAFT_SEED", default=True
+    ),
+    # Spec decode on hybrid models: scatter the post-verify mamba read
+    # offsets of all groups in one compiled program instead of ~10 eager ones
+    # (tpu_runner.py _update_read_offsets_impl).
+    "VLLM_TPU_FUSED_READ_OFFSET_UPDATE": env_bool(
+        "VLLM_TPU_FUSED_READ_OFFSET_UPDATE", default=True
+    ),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
