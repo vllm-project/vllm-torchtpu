@@ -32,14 +32,28 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenEmbedRope,
 )
 
-from tests_omni.omni_test_utils import (
-    NUMERIC_MISMATCH_PATTERN,
-    assert_numerical_parity,
-)
+from tests_omni.omni_test_utils import assert_parity
 from vllm_torchtpu.omni.attention import TpuSDPAImpl
 from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
 pytestmark = [pytest.mark.omni]
+
+# assert_parity's numeric-mismatch messages. Must-fail controls match on them so
+# that other AssertionErrors, such as a shape mismatch, do not satisfy them.
+NUMERIC_MISMATCH_PATTERN = r"relative L2 error|max absolute error"
+
+# (max_rel_l2, max_abs) vs the float64 CPU reference, ~3% above the observed
+# values.
+ROPE_FREQS_TXT_MAX_REL_L2 = 4.8e-7
+ROPE_FREQS_TXT_MAX_ABS = 3.5e-6
+ROPE_FREQS_VID_MAX_REL_L2 = 1.3e-7
+ROPE_FREQS_VID_MAX_ABS = 5.0e-7
+ROPE_VID_MAX_REL_L2 = 2.2e-3
+ROPE_VID_MAX_ABS = 3.2e-2
+ROPE_TXT_MAX_REL_L2 = 2.8e-3
+ROPE_TXT_MAX_ABS = 2.6e-2
+JOINT_ATTN_MAX_REL_L2 = 5.4e-3
+JOINT_ATTN_MAX_ABS = 2.0e-3
 
 
 class TestQwenEmbedRopeOnTpu:
@@ -104,18 +118,43 @@ class TestQwenEmbedRopeOnTpu:
         ref_vid, ref_txt = cpu_embedder(
             video_fhw, txt_seq_lens, device=torch.device("cpu")
         )
-        torch.testing.assert_close(
-            txt_real.cpu(), torch.real(ref_txt), atol=1e-5, rtol=1e-5
-        )
-        torch.testing.assert_close(
-            txt_imag.cpu(), torch.imag(ref_txt), atol=1e-5, rtol=1e-5
-        )
-        torch.testing.assert_close(
-            vid_real.cpu(), torch.real(ref_vid), atol=1e-5, rtol=1e-5
-        )
-        torch.testing.assert_close(
-            vid_imag.cpu(), torch.imag(ref_vid), atol=1e-5, rtol=1e-5
-        )
+        for table, actual, reference, max_rel_l2, max_abs in (
+            (
+                "txt",
+                txt_real,
+                torch.real(ref_txt),
+                ROPE_FREQS_TXT_MAX_REL_L2,
+                ROPE_FREQS_TXT_MAX_ABS,
+            ),
+            (
+                "txt",
+                txt_imag,
+                torch.imag(ref_txt),
+                ROPE_FREQS_TXT_MAX_REL_L2,
+                ROPE_FREQS_TXT_MAX_ABS,
+            ),
+            (
+                "vid",
+                vid_real,
+                torch.real(ref_vid),
+                ROPE_FREQS_VID_MAX_REL_L2,
+                ROPE_FREQS_VID_MAX_ABS,
+            ),
+            (
+                "vid",
+                vid_imag,
+                torch.imag(ref_vid),
+                ROPE_FREQS_VID_MAX_REL_L2,
+                ROPE_FREQS_VID_MAX_ABS,
+            ),
+        ):
+            assert_parity(
+                actual,
+                reference,
+                name=f"{rope_cls.__name__} {table} freqs",
+                max_rel_l2=max_rel_l2,
+                max_abs=max_abs,
+            )
 
 
 def _complex_rotary_reference(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -182,18 +221,32 @@ class TestQwenRotaryKernelApplication:
         tpu_q_vid = rope(q_vid_tpu, vid_cos, vid_sin)
         tpu_q_txt = rope(q_txt_tpu, txt_cos, txt_sin)
 
-        assert_numerical_parity(
-            tpu_q_vid.cpu(), ref_q_vid, atol=5e-2, rtol=0.0
-        )  # Measured max abs error: 0.030761
-        assert_numerical_parity(
-            tpu_q_txt.cpu(), ref_q_txt, atol=5e-2, rtol=0.0
-        )  # Measured max abs error: 0.025155
+        assert_parity(
+            tpu_q_vid.cpu(),
+            ref_q_vid,
+            name="RoPE video q",
+            max_rel_l2=ROPE_VID_MAX_REL_L2,
+            max_abs=ROPE_VID_MAX_ABS,
+        )
+        assert_parity(
+            tpu_q_txt.cpu(),
+            ref_q_txt,
+            name="RoPE text q",
+            max_rel_l2=ROPE_TXT_MAX_REL_L2,
+            max_abs=ROPE_TXT_MAX_ABS,
+        )
 
         # Must-fail control: Neox rotation (chunked halves) instead of interleaved pairs
         bad_rope = RotaryEmbedding(is_neox_style=True)
         bad_tpu_q_vid = bad_rope(q_vid_tpu, vid_cos, vid_sin)
         with pytest.raises(AssertionError, match=NUMERIC_MISMATCH_PATTERN):
-            assert_numerical_parity(bad_tpu_q_vid.cpu(), ref_q_vid, atol=5e-2, rtol=0.0)
+            assert_parity(
+                bad_tpu_q_vid.cpu(),
+                ref_q_vid,
+                name="RoPE video q, Neox rotation",
+                max_rel_l2=ROPE_VID_MAX_REL_L2,
+                max_abs=ROPE_VID_MAX_ABS,
+            )
 
 
 def _unmasked_sdpa_reference(q, k, v, scale):
@@ -260,9 +313,13 @@ class TestQwenJointAttention:
         assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
         assert torch.all(torch.isfinite(tpu_out_cpu))
 
-        assert_numerical_parity(
-            tpu_out_cpu, ref_out, atol=1e-3, rtol=1e-2
-        )  # Measured max abs error: 0.000482
+        assert_parity(
+            tpu_out_cpu,
+            ref_out,
+            name="joint attention",
+            max_rel_l2=JOINT_ATTN_MAX_REL_L2,
+            max_abs=JOINT_ATTN_MAX_ABS,
+        )
 
         # Bitwise replay test
         tpu_out_2 = impl.forward(q_tpu, k_tpu, v_tpu, attn_metadata=attn_metadata)
@@ -275,4 +332,10 @@ class TestQwenJointAttention:
         )
         tpu_out_bad = impl_bad.forward(q_tpu, k_tpu, v_tpu, attn_metadata=attn_metadata)
         with pytest.raises(AssertionError, match=NUMERIC_MISMATCH_PATTERN):
-            assert_numerical_parity(tpu_out_bad.cpu(), ref_out, atol=1e-3, rtol=1e-2)
+            assert_parity(
+                tpu_out_bad.cpu(),
+                ref_out,
+                name="joint attention, doubled softmax scale",
+                max_rel_l2=JOINT_ATTN_MAX_REL_L2,
+                max_abs=JOINT_ATTN_MAX_ABS,
+            )
