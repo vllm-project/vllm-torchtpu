@@ -202,58 +202,58 @@ def halo_permutations(world: int) -> tuple[list[tuple[int, int]], ...]:
     return up, down
 
 
-def piece_tails(own_pages: jax.Array, halo_pages: int) -> tuple[jax.Array, jax.Array]:
-    """The last `halo_pages` pages of the rank's first and second piece;
-    `own_pages` holds the two pieces."""
-    pp = own_pages.shape[0] // 2
-    return own_pages[pp - halo_pages : pp], own_pages[2 * pp - halo_pages :]
-
-
 def exchange_halos(
-    own_pages: jax.Array, halo_pages: int, axis_name: str, world: int
+    keys: jax.Array,
+    values: jax.Array,
+    halo_pages: int,
+    page_size: int,
+    axis_name: str,
+    world: int,
 ) -> jax.Array:
-    """[first piece's halo | second piece's halo] of this rank, inside a
-    `shard_map` over `axis_name`: the `halo_permutations` shifts of every
-    rank's `piece_tails`."""
-    first, second = piece_tails(own_pages, halo_pages)
+    """[first piece's halo | second piece's halo] pages of this rank, inside a
+    `shard_map` over `axis_name`: the `halo_permutations` shifts of every rank's
+    piece tails. `keys` and `values` are the rank's rows of its two pieces."""
+    piece, halo = keys.shape[0] // 2, halo_pages * page_size
     up, down = halo_permutations(world)
-    return jnp.concatenate(
-        [
-            jax.lax.ppermute(first, axis_name, up),
-            jax.lax.ppermute(second, axis_name, down),
-        ]
-    )
+    shifted = []
+    for end, pairs in ((piece, up), (2 * piece, down)):
+        tail = pack_kv_pages(
+            keys[end - halo : end], values[end - halo : end], page_size
+        )
+        shifted.append(jax.lax.ppermute(tail, axis_name, pairs))
+    return jnp.concatenate(shifted)
 
 
 def sliding_local_pages(
-    own_pages: jax.Array,
-    halo_first: jax.Array,
-    halo_second: jax.Array,
+    halos: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
     plan: ZigzagPlan,
     rank: Rank,
 ) -> jax.Array:
-    """The rank's [halo | first piece | halo | second piece] page buffer.
+    """The rank's [halo | first piece | halo | second piece] page buffer with
+    the halos in place and the piece pages zero, for `cp_prefill_attention` to
+    fill from `keys` and `values` (the rank's rows).
 
-    Args:
-        own_pages: [2 * piece_pages, ...] pages of the rank's two pieces.
-        halo_first: Tail of the piece before the first piece, as the
-            `halo_permutations` up-shift delivers it (unused on rank 0, whose
-            first piece starts the prompt).
-        halo_second: Tail of the piece before the second piece, as the
-            down-shift delivers it. The last rank's second piece follows its own
-            first piece, whose tail is used instead.
-        plan: The step's zigzag plan.
-        rank: This rank.
+    `halos` is what `exchange_halos` delivers. Rank 0's first piece starts the
+    prompt, so its first halo goes unread; the last rank's second piece
+    follows its own first piece, whose tail is used instead of what the
+    permute delivered.
     """
-    pp, halo_pages = plan.piece_pages, halo_first.shape[0]
-    first, second = own_pages[:pp], own_pages[pp:]
-    own_tail = first[pp - halo_pages :]
+    pp, halo_pages = plan.piece_pages, halos.shape[0] // 2
+    page_size = halos.shape[1]
+    halo_first, halo_second = halos[:halo_pages], halos[halo_pages:]
+    piece, halo = plan.piece_tokens, halo_pages * page_size
+    own_tail = pack_kv_pages(
+        keys[piece - halo : piece], values[piece - halo : piece], page_size
+    )
     last = plan.world - 1
     if isinstance(rank, int):
         halo_second = own_tail if rank == last else halo_second
     else:
         halo_second = jnp.where(rank == last, own_tail, halo_second)
-    return jnp.concatenate([halo_first, first, halo_second, second])
+    zeros = jnp.zeros((pp, *halos.shape[1:]), halos.dtype)
+    return jnp.concatenate([halo_first, zeros, halo_second, zeros])
 
 
 def cp_prefill_attention(
@@ -264,6 +264,8 @@ def cp_prefill_attention(
     rank: Rank,
     *,
     num_kv_heads: int,
+    keys: jax.Array | None = None,
+    values: jax.Array | None = None,
     sliding_window: int | None = None,
     fp8_compute: bool = False,
     sm_scale: float = 1.0,
@@ -283,6 +285,10 @@ def cp_prefill_attention(
         plan: The step's zigzag plan.
         rank: This rank.
         num_kv_heads: KV heads in `kv_pages`.
+        keys, values: [2 * piece_tokens, num_kv_heads, head_dim] K/V of the
+            rank's rows, or None. Given, the pieces' own keys come from them and
+            the kernel writes them into their pages of `kv_pages`; else every
+            key, the pieces' own included, is read from `kv_pages`.
         sliding_window: The layer's window, None for full attention.
         fp8_compute: Run QK^T and PV as fp8 x fp8 (`ragged_paged_attention`).
         sm_scale, k_scale, v_scale: As for `ragged_paged_attention`.
@@ -296,14 +302,16 @@ def cp_prefill_attention(
     """
     cu_q_lens, kv_lens, distribution = plan.sub_request_metadata(rank)
     tables = jnp.broadcast_to(jnp.asarray(page_tables), (2, plan.num_pages))
-    head_dim = kv_pages.shape[-1]
-    # With skip_kv_update the kernel reads every key from the cache; new K/V only
-    # fill the operand slots.
-    new_kv = jnp.zeros((q.shape[0], num_kv_heads, head_dim), kv_pages.dtype)
+    skip_kv_update = keys is None
+    if skip_kv_update:
+        # The kernel reads every key from the cache; new K/V only fill the
+        # operand slots.
+        shape = (q.shape[0], num_kv_heads, kv_pages.shape[-1])
+        keys = values = jnp.zeros(shape, kv_pages.dtype)
     out, _ = wrapper.ragged_paged_attention(
         q,
-        new_kv,
-        new_kv,
+        keys,
+        values,
         kv_pages,
         kv_lens,
         tables.reshape(-1),
@@ -313,7 +321,7 @@ def cp_prefill_attention(
         sliding_window=sliding_window,
         k_scale=k_scale,
         v_scale=v_scale,
-        skip_kv_update=True,
+        skip_kv_update=skip_kv_update,
         # The decode segment is always empty.
         skip_empty_launch=True,
         fp8_compute=fp8_compute,
@@ -454,7 +462,8 @@ def window_page_writes(
 
 
 def window_slots_for_ranks(
-    own_pages: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
     plan: ZigzagPlan,
     rank: Rank,
     position_pages: jax.Array,
@@ -463,15 +472,21 @@ def window_slots_for_ranks(
     """What this rank sends each rank in an all-to-all of the window: per
     destination, the K/V slots of the destination's `tp_kv_heads` in the window
     pages this rank holds; the other pages carry nothing
-    (`window_slots_from_ranks` takes each page from its holder).
+    (`window_slots_from_ranks` takes each page from its holder). `keys` and
+    `values` are the rank's rows.
     [world, len(position_pages), page_size, 2 * heads per rank, d]."""
-    pp = plan.piece_pages
+    pp, ps = plan.piece_pages, plan.page_size
     first, second = plan.rank_pieces(rank)
     piece = position_pages // pp
     local = jnp.where(
         piece == first, position_pages - first * pp, position_pages - second * pp + pp
     )
-    pages = jnp.take(own_pages, jnp.clip(local, 0, 2 * pp - 1), axis=0)
+    rows = jnp.clip(local, 0, 2 * pp - 1)[:, None] * ps + jnp.arange(ps)
+    pages = pack_kv_pages(
+        jnp.take(keys, rows.reshape(-1), axis=0),
+        jnp.take(values, rows.reshape(-1), axis=0),
+        ps,
+    )
     return jnp.stack(
         [
             kv_head_slots(pages, *tp_kv_heads(num_kv_heads, plan.world, r))
@@ -605,7 +620,8 @@ def full_attention_layer(
 
 def sliding_attention_layer(
     query: jax.Array,
-    kv_pages: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
     halos: jax.Array,
     seq_lens: jax.Array,
     *,
@@ -615,8 +631,8 @@ def sliding_attention_layer(
 
     Args:
         query: [rows, num_heads, head_dim].
-        kv_pages: The rank's `pack_kv_pages` pages, as int8.
-        halos: [first piece's halo | second piece's halo] pages, as int8.
+        keys, values: [rows, num_kv_heads, head_dim] fp8 K/V of the rank's rows.
+        halos: `exchange_halos` pages.
         seq_lens: The step's sequence lengths (one request).
         cfg: The layer.
 
@@ -626,20 +642,27 @@ def sliding_attention_layer(
     """
     if cfg.sliding_window is None:
         raise ValueError("sliding_attention_layer needs a sliding window")
-    page_size = kv_pages.shape[1]
+    page_size = halos.shape[1]
     plan = cfg.plan(query.shape[0], page_size)
     halo_pages = num_halo_pages(cfg.sliding_window, page_size)
-    own = jax.lax.bitcast_convert_type(kv_pages, jnp.float8_e4m3fn)
-    halos = jax.lax.bitcast_convert_type(halos, jnp.float8_e4m3fn)
-    local = sliding_local_pages(
-        own, halos[:halo_pages], halos[halo_pages:], plan, cfg.rank
-    )
+    local = sliding_local_pages(halos, keys, values, plan, cfg.rank)
     tables = plan.sliding_page_tables(cfg.rank, halo_pages)
-    out = cp_prefill_attention(query, local, tables, plan, cfg.rank, **cfg.rpa_kwargs())
+    out = cp_prefill_attention(
+        query,
+        local,
+        tables,
+        plan,
+        cfg.rank,
+        keys=keys,
+        values=values,
+        **cfg.rpa_kwargs(),
+    )
     position_pages, _ = window_position_pages(
         seq_lens[0], cfg.sliding_window, page_size
     )
-    send = window_slots_for_ranks(own, plan, cfg.rank, position_pages, cfg.num_kv_heads)
+    send = window_slots_for_ranks(
+        keys, values, plan, cfg.rank, position_pages, cfg.num_kv_heads
+    )
     owners = window_page_owners(plan, position_pages)
     return out, jax.lax.bitcast_convert_type(send, jnp.int8), owners
 

@@ -88,15 +88,21 @@ def _mesh(world: int) -> jax.sharding.Mesh:
 
 def _halo_exchange_fn(mesh: jax.sharding.Mesh, sliding_window: int):
     # A closure, not a partial: sharded_jax_op checks every parameter's type.
-    def halo_exchange(pages: jax.Array) -> jax.Array:
-        halo_pages = cp_prefill.num_halo_pages(sliding_window, pages.shape[1])
+    def halo_exchange(keys: jax.Array, values: jax.Array, page_size: int) -> jax.Array:
+        halo_pages = cp_prefill.num_halo_pages(sliding_window, page_size)
 
-        def exchange(own_pages):
-            return cp_prefill.exchange_halos(own_pages, halo_pages, _AXIS, mesh.size)
+        def exchange(k, v):
+            return cp_prefill.exchange_halos(
+                k, v, halo_pages, page_size, _AXIS, mesh.size
+            )
 
         return jax.shard_map(
-            exchange, mesh=mesh, in_specs=P(_AXIS), out_specs=P(_AXIS), check_vma=False
-        )(pages)
+            exchange,
+            mesh=mesh,
+            in_specs=(P(_AXIS), P(_AXIS)),
+            out_specs=P(_AXIS),
+            check_vma=False,
+        )(keys, values)
 
     return halo_exchange
 
@@ -141,8 +147,8 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> _LayerOps:
             )
         )
 
-    def fake_sliding(query, kv_pages, halos, seq_lens):
-        page_size = kv_pages.shape[1]
+    def fake_sliding(query, keys, values, halos, seq_lens):
+        page_size = halos.shape[1]
         num_window = cp_prefill.num_halo_pages(cfg.sliding_window, page_size) + 1
         send = (cfg.world, num_window, page_size, 2 * local_kv_heads, cfg.head_dim)
         return (
@@ -154,16 +160,17 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> _LayerOps:
     def fake_window(kv_cache, *args):
         return torch.empty_like(kv_cache)
 
-    def fake_halos(pages):
-        halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, pages.shape[1])
-        return pages.new_empty((2 * halo_pages, *pages.shape[1:]))
+    def fake_halos(keys, values, page_size):
+        halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, page_size)
+        page = (page_size, 2 * cfg.num_kv_heads // 4, 4, cfg.head_dim)
+        return keys.new_empty((2 * halo_pages, *page))
 
     mesh = _mesh(cfg.world)
     halo_exchange = sharded_jax_op(
         f"cp_prefill::halo_exchange_{len(_OPS)}",
         _halo_exchange_fn(mesh, cfg.sliding_window),
         mesh=mesh,
-        input_partition_specs=(P(_AXIS),),
+        input_partition_specs=(P(_AXIS), P(_AXIS), P()),
         output_partition_specs=P(_AXIS),
     )
     halo_exchange.register_fake(fake_halos)
@@ -351,23 +358,23 @@ def cp_prefill_attention(
         cfg.k_scale,
         cfg.v_scale,
     )
-    # fp8 crosses the collectives as raw bytes; the layout of
-    # cp_prefill.pack_kv_pages: per token K_0 V_0 K_1 V_1 ... in words of 4.
-    kv = torch.cat([key.view(torch.int8), value.view(torch.int8)], dim=-1)
-    pages = kv.reshape(
-        rows // plan.page_size, plan.page_size, 2 * cfg.num_kv_heads // 4, 4, d
-    )
     query = query.view(rows, cfg.num_heads, d)
     seq_lens = attn_metadata.seq_lens
     block_tables = attn_metadata.block_tables
     if cfg.sliding_window is None:
+        # fp8 crosses the collective as raw bytes, in the layout of
+        # cp_prefill.pack_kv_pages: per token K_0 V_0 K_1 V_1 ... in words of 4.
+        kv = torch.cat([key.view(torch.int8), value.view(torch.int8)], dim=-1)
+        pages = kv.reshape(
+            rows // plan.page_size, plan.page_size, 2 * cfg.num_kv_heads // 4, 4, d
+        )
         gathered = _waited(funcol.all_gather_single(pages, 0, group))
         new_kv_cache, out = ops.full_attention(
             kv_cache, query, gathered, seq_lens, block_tables
         )
     else:
-        halos = ops.halo_exchange(pages)
-        out, send, owners = ops.sliding_attention(query, pages, halos, seq_lens)
+        halos = ops.halo_exchange(key, value, plan.page_size)
+        out, send, owners = ops.sliding_attention(query, key, value, halos, seq_lens)
         received = _all_to_all(send, group)
         new_kv_cache = ops.window_write(
             kv_cache, received, owners, seq_lens, block_tables

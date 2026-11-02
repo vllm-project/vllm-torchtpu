@@ -121,28 +121,39 @@ def test_traced_rank_gives_the_python_rank_metadata():
 def test_halo_exchange_gives_each_piece_its_window(traced):
     halo = 4
     plan = cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
+    pp, ht = plan.piece_pages, halo * PAGE
     k, v = _kv(plan.num_tokens, 16, 128, seed=1)
     in_order = cp_prefill.pack_kv_pages(k, v, PAGE)
-    own = [
-        cp_prefill.pack_kv_pages(_rank_rows(k, plan, r), _rank_rows(v, plan, r), PAGE)
-        for r in range(plan.world)
+    rows = [(_rank_rows(k, plan, r), _rank_rows(v, plan, r)) for r in range(plan.world)]
+    # The tails each rank sends, as exchange_halos packs them.
+    piece = plan.piece_tokens
+    tails = [
+        [
+            cp_prefill.pack_kv_pages(kr[end - ht : end], vr[end - ht : end], PAGE)
+            for end in (piece, 2 * piece)
+        ]
+        for kr, vr in rows
     ]
-    tails = [cp_prefill.piece_tails(pages, halo) for pages in own]
     up, down = cp_prefill.halo_permutations(plan.world)
     received = [[None, None] for _ in range(plan.world)]
     for slot, pairs in enumerate((up, down)):
         for src, dst in pairs:
             received[dst][slot] = tails[src][slot]
     local_pages = jax.jit(cp_prefill.sliding_local_pages, static_argnums=3)
-    pp = plan.piece_pages
     for rank in range(plan.world):
-        args = (own[rank], *received[rank], plan)
+        halos = jnp.concatenate(received[rank])
+        args = (halos, *rows[rank], plan)
         local = (
             local_pages(*args, jnp.int32(rank)) if traced else local_pages(*args, rank)
         )
         tables = plan.sliding_page_tables(rank, halo)
-        for sub, piece in enumerate(plan.rank_pieces(rank)):
-            seen = np.arange(max(piece * pp - halo, 0), (piece + 1) * pp)
+        # What the kernel writes: each piece's own pages, through its table.
+        own = cp_prefill.pack_kv_pages(*rows[rank], PAGE)
+        for sub, p in enumerate(plan.rank_pieces(rank)):
+            pages = np.arange(p * pp, (p + 1) * pp)
+            local = local.at[tables[sub][pages]].set(own[sub * pp : (sub + 1) * pp])
+        for sub, p in enumerate(plan.rank_pieces(rank)):
+            seen = np.arange(max(p * pp - halo, 0), (p + 1) * pp)
             np.testing.assert_array_equal(
                 _bytes(local[tables[sub][seen]]), _bytes(in_order[seen])
             )
@@ -159,23 +170,18 @@ def _halo_worker(world: int) -> dict:
     pp = plan.piece_pages
     k, v = _kv(plan.num_tokens, 8, 128, seed=10)
     in_order = cp_prefill.pack_kv_pages(k, v, PAGE)
-    own = jnp.concatenate(
-        [
-            cp_prefill.pack_kv_pages(
-                _rank_rows(k, plan, r), _rank_rows(v, plan, r), PAGE
-            )
-            for r in range(world)
-        ]
+    order = np.concatenate(
+        [np.arange(s, e) for r in range(world) for s, e in plan.rank_slices(r)]
     )
     mesh = Mesh(np.array(jax.devices()[:world]), ("x",))
     halos = jax.jit(
         jax.shard_map(
-            lambda pages: cp_prefill.exchange_halos(pages, halo, "x", world),
+            lambda kr, vr: cp_prefill.exchange_halos(kr, vr, halo, PAGE, "x", world),
             mesh=mesh,
-            in_specs=P("x"),
+            in_specs=(P("x"), P("x")),
             out_specs=P("x"),
         )
-    )(own)
+    )(k[order], v[order])
     halos = np.asarray(halos).reshape(world, 2 * halo, *in_order.shape[1:])
     ok = []
     for rank in range(world):
@@ -284,9 +290,8 @@ def test_sliding_window_write_caches_the_decode_window(seq_len, layout):
     )
     sent = [
         cp_prefill.window_slots_for_ranks(
-            cp_prefill.pack_kv_pages(
-                _rank_rows(k, plan, r), _rank_rows(v, plan, r), PAGE
-            ),
+            _rank_rows(k, plan, r),
+            _rank_rows(v, plan, r),
             plan,
             r,
             position_pages,
@@ -404,20 +409,18 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
     block_table = _block_table(num_cache_pages, plan.num_pages, seed=9)
     seq_lens = jnp.array([seq_len], jnp.int32)
     query = jnp.zeros((2 * plan.piece_tokens, 32, 128), jnp.bfloat16)
-    own = [
-        _int8(
-            cp_prefill.pack_kv_pages(
-                _rank_rows(k, plan, r), _rank_rows(v, plan, r), PAGE
-            )
-        )
-        for r in range(plan.world)
-    ]
     halo = cp_prefill.num_halo_pages(window, PAGE)
+    halos = jnp.zeros((2 * halo, PAGE, 2 * num_kv_heads // 4, 4, 128), FP8)
     sent, owners = [], None
     for rank in range(plan.world):
         cfg = _layer_config(rank, num_kv_heads, window, layout)
         _, blocks, owners = cp_prefill.sliding_attention_layer(
-            query, own[rank], jnp.zeros_like(own[rank][: 2 * halo]), seq_lens, cfg=cfg
+            query,
+            _rank_rows(k, plan, rank),
+            _rank_rows(v, plan, rank),
+            halos,
+            seq_lens,
+            cfg=cfg,
         )
         sent.append(blocks)
     position_pages, count = cp_prefill.window_position_pages(
