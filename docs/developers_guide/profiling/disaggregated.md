@@ -123,6 +123,7 @@ def post_json(url: str, payload: dict | None = None) -> dict:
 
 
 # 1. Start profiling on both Prefill and Decode clusters
+# (Optionally pass {"profile_prefix": "...", "profiler_kwargs": {...}}; see server.md)
 post_json(f"{PREFILL_HOST}/start_profile")
 post_json(f"{DECODE_HOST}/start_profile")
 time.sleep(1)
