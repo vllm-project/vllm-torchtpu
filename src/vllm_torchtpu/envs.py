@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = True
     TPU_STREAMIDX_DECODE_PACK: bool = True
     TPU_STREAMIDX_SHARED_META: bool = True
+    TPU_STREAMIDX_DECODE_AS_MIXED: bool = False
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = True
     TPU_SC_TOPK_COOP_V2: bool = True
     TPU_SC_TOPK_COOP_MERGE: bool = True
@@ -1665,6 +1666,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # passes are unchanged. Pairs with TPU_STREAMIDX_SMALL_BUCKET_BKVP=32
     # (GLM-5.2 DCP8, 9k-67k keys per rank: -10...-48 % per call).
     "TPU_STREAMIDX_DECODE_PACK": env_bool("TPU_STREAMIDX_DECODE_PACK", default=True),
+    # DCP indexer, buckets that take the MIXED pass's small-bucket sizes
+    # (TPU_STREAMIDX_SMALL_BUCKET_BQ / _TOKENS): score q_len-1 requests in that
+    # MIXED pass (the packed body MTP decode runs) instead of the two DECODE
+    # passes, whose schedules TPU_STREAMIDX_SHARED_META builds per indexer
+    # layer inside the skip-empty branch. Scores can differ in the last f32
+    # bits (head sum order); the top-k is tolerance-tier, not bitwise.
+    "TPU_STREAMIDX_DECODE_AS_MIXED": env_bool("TPU_STREAMIDX_DECODE_AS_MIXED"),
     # StreamIdx per-step inputs built once per step instead of once per
     # indexer layer: the MIXED pass schedule without its empty-pass cond (so
     # XLA CSEs the layers' identical copies), its scalar [start, end, chunk]

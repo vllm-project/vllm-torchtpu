@@ -1684,6 +1684,65 @@ def test_shared_meta_is_bitwise(T_list, S_list, cp_size, cp_rank, bkv_p, chunk):
         err_msg="shared_meta changed scores")
 
 
+# fmt: off
+@pytest.mark.parametrize(
+    "T_list,S_list,cp_size,cp_rank,bkv_p",
+    [
+        # Batch-1 decode in a 4-token bucket: the DECODE passes' work today.
+        pytest.param((1,), (9001,), 1, 0, 32, id="b1"),
+        pytest.param((1, 1, 1, 1), (9001, 2052, 260, 5000), 1, 0, 32, id="b4"),
+        pytest.param((1, 1), (8 * 9000 + 3, 8 * 2047 + 1), 8, 3, 32, id="dcp8_rank3"),
+        # A rank owning nothing of a short sequence, and a decode beside an
+        # MTP-like request.
+        pytest.param((1, 4), (9, 8 * 4000), 8, 5, 16, id="dcp8_rank5_mixed"),
+    ],
+)
+# fmt: on
+def test_decode_as_mixed_scores_decodes_in_the_packed_mixed_pass(
+    T_list, S_list, cp_size, cp_rank, bkv_p
+):
+    """decode_as_mixed builds no DECODE pass and keeps the top-k.
+
+    The DECODE passes sum the heads with one reduction and the MIXED pass head
+    by head, so scores may differ in the last f32 bits: a winner may change
+    only where its score ties the k-th to within that rounding. The HLO kernel
+    census is the positive control.
+    """
+    B = len(T_list)
+    page_size, H_I, D = 256, 32, 128
+    pages_per_seq = 40
+    inputs = _chunk_inputs(
+        T_list, _fragmented_pages(B, pages_per_seq), page_size, H_I, D
+    )
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, 2048, 1, 4, bkv_p, _SAL, None, return_scores=True
+    )
+    kwargs["q"] = kwargs["q"].astype(jnp.float8_e4m3fn)
+    kwargs["distribution"] = jnp.array(kwargs["distribution"], jnp.int32)
+    kwargs.update(skip_empty_decode=True, decode_pack=True, shared_meta=True)
+    if cp_size > 1:
+        kwargs.update(cp_size=cp_size, cp_rank=cp_rank, interleave_size=4)
+    off_hlo = streamindex_topk.lower(**kwargs).as_text()
+    on_hlo = streamindex_topk.lower(**kwargs, decode_as_mixed=True).as_text()
+    assert "StreamIdxTC-d-" in off_hlo, "vacuous: no DECODE pass to replace"
+    assert "StreamIdxTC-d-" not in on_hlo and "-pk-pm" in on_hlo
+
+    off_idx, off_scores = (np.array(a) for a in streamindex_topk(**kwargs))
+    on_idx, on_scores = (
+        np.array(a) for a in streamindex_topk(**kwargs, decode_as_mixed=True)
+    )
+    a, b = off_scores.view(np.float32), on_scores.view(np.float32)
+    np.testing.assert_array_equal(np.isfinite(a), np.isfinite(b))
+    fin = np.isfinite(a)
+    np.testing.assert_allclose(b[fin], a[fin], rtol=1e-5, atol=0)
+    for row in range(sum(T_list)):
+        changed = set(off_idx[row]) ^ set(on_idx[row])
+        kth = np.min(np.where(fin[row], a[row], np.inf))
+        assert not changed or np.allclose(
+            a[row][np.isin(off_idx[row], list(changed))], kth, rtol=1e-5
+        ), f"row {row}: winners changed away from the k-th score"
+
+
 def main(argv):
     del argv
 

@@ -142,6 +142,13 @@ STREAMIDX_PACK_BKVP_CAP_TOKENS = 8
 STREAMIDX_PACK_BKVP = (32, 16)  # (T <= cap, T > cap)
 
 
+def _streamidx_small_bucket(
+    num_tokens: int, small_bucket_bq: int | None, small_bucket_tokens: int
+) -> bool:
+    """Whether a padded token bucket takes the MIXED pass's small-bucket sizes."""
+    return small_bucket_bq is not None and num_tokens <= small_bucket_tokens
+
+
 def _streamidx_block_sizes(
     num_tokens: int,
     small_bucket_bq: int | None,
@@ -158,7 +165,7 @@ def _streamidx_block_sizes(
     buckets take `mixed_bkvp` (TPU_STREAMIDX_MIXED_KV_PAGES) kv pages per MIXED
     block when it is set.
     """
-    if small_bucket_bq is None or num_tokens > small_bucket_tokens:
+    if not _streamidx_small_bucket(num_tokens, small_bucket_bq, small_bucket_tokens):
         if mixed_bkvp is None:
             return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
         return (
@@ -801,6 +808,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        decode_as_mixed = envs.TPU_STREAMIDX_DECODE_AS_MIXED
         shared_meta = self._shared_meta
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
@@ -908,6 +916,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 small_all_gather=small_ag,
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
+                # TPU_STREAMIDX_DECODE_AS_MIXED: small buckets score q_len-1
+                # rows in the MIXED pass's packed small-bucket body.
+                decode_as_mixed=decode_as_mixed
+                and _streamidx_small_bucket(
+                    q.shape[0], small_bucket[0], small_bucket[2]
+                ),
                 **overlap,
             )
             if qb_overlap:

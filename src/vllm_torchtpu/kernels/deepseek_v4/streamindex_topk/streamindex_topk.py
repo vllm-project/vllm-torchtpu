@@ -1295,6 +1295,7 @@ def _effective_row_lengths(
         "decode_page_major",
         "shared_meta",
         "dcp_axis_name",
+        "decode_as_mixed",
     ),
 )
 def streamindex_topk(
@@ -1330,6 +1331,7 @@ def streamindex_topk(
     decode_page_major: bool | None = None,
     shared_meta: bool = False,
     dcp_axis_name: str | None = None,
+    decode_as_mixed: bool = False,
 ) -> jax.Array | tuple[Any, ...]:  # (out, [scores,] [tied])
     """StreamIndex Top-K retrieval.
 
@@ -1431,6 +1433,10 @@ def streamindex_topk(
         ranks), and the result is this rank's share of it, as rank-local
         positions packed into a prefix and `-1` padded. No merge is needed
         afterwards. Needs `return_scores=False`.
+      decode_as_mixed: score q_len-1 sequences in the MIXED pass as well (with
+        `decode_pack`, the packed small-bucket body MTP decode runs) and build
+        no DECODE pass. The DECODE passes sum the heads with one reduction,
+        the MIXED pass head by head, so scores can differ in the last f32 bits.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1505,12 +1511,21 @@ def streamindex_topk(
     # (gamma+1)-token verify requests once reorder_batch_threshold > 1. These
     # decode passes are static_q_len=1, so keep only the leading one-token
     # requests here; the mixed pass takes the rest.
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    one_token = (q_lens == 1) & (jnp.arange(max_num_seqs) < distribution[1])
-    num_one_token = jnp.sum(jnp.cumprod(one_token.astype(jnp.int32)))
-    distribution = jnp.stack(
-        [jnp.minimum(distribution[0], num_one_token), num_one_token, distribution[2]]
-    ).astype(jnp.int32)
+    if decode_as_mixed:
+        # Every sequence is MIXED: the pass covers [0, distribution[2]).
+        zero = jnp.zeros((), jnp.int32)
+        distribution = jnp.stack([zero, zero, distribution[2].astype(jnp.int32)])
+    else:
+        q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+        one_token = (q_lens == 1) & (jnp.arange(max_num_seqs) < distribution[1])
+        num_one_token = jnp.sum(jnp.cumprod(one_token.astype(jnp.int32)))
+        distribution = jnp.stack(
+            [
+                jnp.minimum(distribution[0], num_one_token),
+                num_one_token,
+                distribution[2],
+            ]
+        ).astype(jnp.int32)
 
     original_dtype = q.dtype
     actual_head_dim = q.shape[-1]
@@ -1893,7 +1908,11 @@ def streamindex_topk(
                 return functools.partial(_pass_metadata, spec, chunk_starts, chunk_len)
             return _pass_metadata(spec, chunk_starts, chunk_len)
 
-        passes = tuple((spec, _meta(spec)) for spec in _pass_specs(decode_batch_end))
+        passes = tuple(
+            (spec, _meta(spec))
+            for spec in _pass_specs(decode_batch_end)
+            if not decode_as_mixed or spec["case"] == MlaCase.MIXED
+        )
         topk_idxs = []
         topk_scores_list = []
         tied = ()
@@ -1929,7 +1948,9 @@ def streamindex_topk(
                 scheduling_group_id=tc_group,
             )
             mixed_only = tuple(p for p in chunk_passes if p[0]["case"] == MlaCase.MIXED)
-            if (
+            if decode_as_mixed:
+                scores = scores_for(chunk_passes)
+            elif (
                 skip_empty_decode_chunked
                 and num_chunks > 1
                 and m * chunk_len >= max_num_seqs
@@ -2082,6 +2103,7 @@ SMALL_AG_MAX_TOKENS = 8
         "small_all_gather",
         "decode_pack",
         "shared_meta",
+        "decode_as_mixed",
     ),
 )
 def streamindex_topk_dcp(
@@ -2121,6 +2143,7 @@ def streamindex_topk_dcp(
     small_all_gather: bool | None = None,
     decode_pack: bool = False,
     shared_meta: bool = False,
+    decode_as_mixed: bool = False,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2203,6 +2226,7 @@ def streamindex_topk_dcp(
       skip_empty_decode_chunked: forwarded to `streamindex_topk`; see there.
       decode_pack: forwarded to `streamindex_topk`; see there. Same result.
       shared_meta: forwarded to `streamindex_topk`; see there. Same result.
+      decode_as_mixed: forwarded to `streamindex_topk`; see there.
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
@@ -2384,6 +2408,7 @@ def streamindex_topk_dcp(
             decode_pack=decode_pack,
             shared_meta=shared_meta,
             dcp_axis_name=dcp_axis_name if hist_merge else None,
+            decode_as_mixed=decode_as_mixed,
         )
         scores = None
         if pin:
