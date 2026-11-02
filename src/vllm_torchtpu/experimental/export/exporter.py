@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import fnmatch
 import json
 import math
 import os
@@ -59,6 +60,84 @@ _MESH_AXIS_BY_ALIAS = {"dp": "data", "tp": "model", "ep": "model"}
 _MLIR_SHAPES = "shard_local"
 
 Sharding = list[str | list[str] | None]
+
+# Files outside the serving contract: the runtime reads nothing here unless a
+# debug mode asks for it, and the validator does not check it.
+ASSETS_EXTRA_DIR = "assets.extra"
+# Debug-tap modules and their manifest (`export(debug_taps=...)`).
+DEBUG_TAPS_DIR = f"{ASSETS_EXTRA_DIR}/debug"
+DEBUG_TAPS_MANIFEST = "taps.json"
+
+
+@dataclasses.dataclass
+class _DebugTaps:
+    """Modules whose outputs the debug variants of `forward` and `mtp_draft`
+    return, and the manifest entries those variants add."""
+
+    forward: dict[str, Any]
+    mtp_draft: dict[str, Any]
+    output_dir: str
+    functions: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+
+    def write(
+        self, function: str, bucket: int, mlir: str, names: Sequence[str], base: int
+    ) -> None:
+        """Writes `function`'s debug module for `bucket` and its manifest entry:
+        results from `base` on are the taps `names`."""
+        file = f"{function}_debug_bucket{bucket}.mlir"
+        os.makedirs(os.path.join(self.output_dir, DEBUG_TAPS_DIR), exist_ok=True)
+        with open(os.path.join(self.output_dir, DEBUG_TAPS_DIR, file), "w") as f:
+            f.write(mlir)
+        _, outs = validator.parse_mlir_main_signature(mlir)
+        self.functions.setdefault(function, {})[str(bucket)] = {
+            "file_path": f"{DEBUG_TAPS_DIR}/{file}",
+            "num_outputs": base,
+            "taps": [
+                {
+                    "name": name,
+                    "output_index": base + i,
+                    "shape": [int(d) for d in outs[base + i]["shape"]],
+                    "dtype": tpu_lowering.dtype_name(outs[base + i]["dtype"]),
+                }
+                for i, name in enumerate(names)
+            ],
+        }
+
+
+def _debug_tap_modules(
+    model: api.ExportableTextOnlyLLM, patterns: Sequence[str]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The target's and the MTP draft's modules matching the glob `patterns`.
+
+    Target modules are named as in the wrapped model's `named_modules()`; the
+    draft's as in the checkpoint, `mtp.` for its `model.`.
+    """
+    from vllm_torchtpu.experimental.export import universal_adapter
+
+    target = getattr(model, "model", model)
+    draft = getattr(target, universal_adapter.MTP_DRAFT_ATTR, None)
+    named = {n: m for n, m in target.named_modules() if n}
+    draft_named = (
+        {"mtp." + n.removeprefix("model."): m for n, m in draft.named_modules() if n}
+        if draft is not None
+        else {}
+    )
+    forward: dict[str, Any] = {}
+    mtp: dict[str, Any] = {}
+    for pattern in patterns:
+        hits = {n: m for n, m in named.items() if fnmatch.fnmatchcase(n, pattern)}
+        draft_hits = {
+            n: m for n, m in draft_named.items() if fnmatch.fnmatchcase(n, pattern)
+        }
+        if not hits and not draft_hits:
+            sample = ", ".join(list(named)[:8] + list(draft_named)[:4])
+            raise ValueError(
+                f"debug tap {pattern!r} matches no module; modules are named like "
+                f"{sample}"
+            )
+        forward.update(hits)
+        mtp.update(draft_hits)
+    return forward, mtp
 
 
 def _xla_option_overrides() -> dict[str, bool | int | float | str]:
@@ -575,9 +654,11 @@ def _export_text_only_llm_functions(
     subdir: str = "subgraphs",
     mtp_weight_names: Sequence[str] = (),
     mtp_own: frozenset[str] = frozenset(),
+    debug_taps: _DebugTaps | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Lowers `forward`, `compute_logits`, the samplers and, with MTP drafting,
-    `mtp_draft` across all buckets."""
+    `mtp_draft` across all buckets, plus `debug_taps`' variants of `forward`
+    and `mtp_draft` for the smallest bucket."""
     cfg: api.TextOnlyLLMExportConfig = model.export_config
     act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
     tp_size = cfg.tensor_parallel_size
@@ -633,6 +714,23 @@ def _export_text_only_llm_functions(
         fwd_rel = f"{subdir}/{fwd_file}" if subdir else fwd_file
         with open(os.path.join(target_dir, fwd_file), "w") as f:
             f.write(fwd_mlir)
+        if debug_taps is not None and debug_taps.forward and b_idx == 0:
+            tap_names: list[str] = []
+            debug_mlir = tpu_lowering.lower_torch_forward_to_mlir(
+                model,
+                user_inputs=user_inputs,
+                forward_names=forward_names,
+                params_map=lowered,
+                state_specs=state_specs,
+                bucket_size=bucket_size,
+                weight_reshapes=reshapes,
+                trailing_user_inputs=extra_inputs,
+                taps=debug_taps.forward,
+                tap_names=tap_names,
+            )
+            debug_taps.write(
+                "forward", bucket_size, debug_mlir, tap_names, len(state_specs) + 1
+            )
 
         fwd_inputs: list[dict[str, Any]] = [
             _io_entry(
@@ -805,6 +903,7 @@ def _export_text_only_llm_functions(
             mtp_weight_names=mtp_weight_names,
             first_state_index=len(state_entries),
             constants=constants,
+            debug_taps=debug_taps,
         )
     return functions
 
@@ -820,8 +919,10 @@ def _export_mtp_draft(
     mtp_weight_names: Sequence[str],
     first_state_index: int,
     constants: frozenset[str],
+    debug_taps: _DebugTaps | None = None,
 ) -> dict[str, Any]:
-    """Lowers `mtp_draft_bucket{B}` for every forward bucket.
+    """Lowers `mtp_draft_bucket{B}` for every forward bucket, and `debug_taps`'
+    variant for the smallest.
 
     Inputs: the forward's user inputs with `input_ids` shifted by one token,
     `last_token_indices`, the weights `mtp_draft` reads (shared ones bound to
@@ -865,6 +966,23 @@ def _export_mtp_draft(
         rel = f"{subdir}/{file}" if subdir else file
         with open(os.path.join(target_dir, file), "w") as f:
             f.write(mlir)
+        if debug_taps is not None and debug_taps.mtp_draft and b_idx == 0:
+            tap_names: list[str] = []
+            debug_mlir = tpu_lowering.lower_torch_mtp_draft_to_mlir(
+                model,
+                user_inputs=user_inputs,
+                weight_names=mtp_weight_names,
+                params_map=lowered,
+                state_specs=state_specs,
+                hidden_states=hidden,
+                bucket_size=bucket_size,
+                weight_reshapes=reshapes,
+                taps=debug_taps.mtp_draft,
+                tap_names=tap_names,
+            )
+            debug_taps.write(
+                "mtp_draft", bucket_size, debug_mlir, tap_names, len(state_specs) + 1
+            )
 
         inputs: list[dict[str, Any]] = [
             _io_entry(
@@ -1046,6 +1164,7 @@ def export(
     output_dir: str,
     *,
     subdir: str = "subgraphs",
+    debug_taps: Sequence[str] = (),
 ) -> None:
     """Exports an `ExportableTextOnlyLLM` to a serving artifact directory.
 
@@ -1053,6 +1172,10 @@ def export(
         model: The model to export.
         output_dir: Artifact directory; created if missing.
         subdir: Subdirectory of `output_dir` for `.mlir` files (default `'subgraphs'`).
+        debug_taps: Glob patterns of module names. For the smallest token bucket,
+            `forward` and `mtp_draft` are also exported with the matching
+            modules' outputs as extra results, under `assets.extra/debug/` with a
+            `taps.json` manifest; the serving artifact itself is unchanged.
     """
     if not isinstance(model, api.ExportableTextOnlyLLM):
         raise TypeError(
@@ -1066,6 +1189,11 @@ def export(
             "model.export_config must be a TextOnlyLLMExportConfig; "
             f"got {type(cfg).__name__}"
         )
+
+    taps = None
+    if debug_taps:
+        forward_taps, mtp_taps = _debug_tap_modules(model, debug_taps)
+        taps = _DebugTaps(forward_taps, mtp_taps, output_dir)
 
     tp_size = cfg.tensor_parallel_size
     dp_size = int(getattr(cfg, "data_parallel_size", 1) or 1)
@@ -1127,8 +1255,25 @@ def export(
         subdir=subdir,
         mtp_weight_names=mtp_weight_names,
         mtp_own=frozenset(mtp_own),
+        debug_taps=taps,
     )
     functions_dict.update(llm_funcs)
+    if taps is not None:
+        # Each debug variant takes its serving variant's inputs
+        # (`metadata.json` `functions.<function>.<bucket>.inputs`).
+        os.makedirs(os.path.join(output_dir, DEBUG_TAPS_DIR), exist_ok=True)
+        with open(
+            os.path.join(output_dir, DEBUG_TAPS_DIR, DEBUG_TAPS_MANIFEST), "w"
+        ) as f:
+            json.dump(
+                {
+                    "format_version": 1,
+                    "mlir_shapes": _MLIR_SHAPES,
+                    "functions": taps.functions,
+                },
+                f,
+                indent=2,
+            )
     # `serving_config` holds only what the runtime reads: the capacities the
     # executables were exported with, then the companion files. Token buckets are
     # the `functions.forward` variants and are not repeated here.
