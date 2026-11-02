@@ -79,6 +79,11 @@ def test_the_served_config_is_admitted(monkeypatch):
         (dict(dcp=8), {}, "decode_context_parallel_size"),
         # 128 DCP rows need rank 0 to hold 128 rows from the smallest bucket.
         (dict(max_num_seqs=128), {}, "MIN_TOKENS"),
+        (
+            {},
+            dict(TPU_MLA_PREFILL_SEQUENCE_ROWS=False, TPU_MLA_PREFILL_ROWS_DENSE=True),
+            "needed by TPU_MLA_PREFILL_ROWS_DENSE",
+        ),
     ],
 )
 def test_unserved_configs_are_refused(monkeypatch, config, flags, match):

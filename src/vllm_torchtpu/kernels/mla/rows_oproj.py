@@ -89,6 +89,9 @@ def _permute_all_gather(x: jax.Array, axis_name: str, n: int) -> jax.Array:
     """`lax.all_gather(x, axis_name)` by `n - 1` independent collective-
     permutes (rank r sends to r + k for each k): async on the TensorCores'
     DMA engines, and no step waits for another."""
+    if x.dtype == FP8:  # stacked as bytes, as in `_ring_all_gather`
+        out = _permute_all_gather(lax.bitcast_convert_type(x, jnp.uint8), axis_name, n)
+        return lax.bitcast_convert_type(out, FP8)
     rank = lax.all_to_all(jnp.arange(n, dtype=jnp.int32), axis_name, 0, 0, tiled=True)
     out = jnp.zeros((n, *x.shape), x.dtype)
     out = lax.dynamic_update_index_in_dim(out, x, rank[0], 0)

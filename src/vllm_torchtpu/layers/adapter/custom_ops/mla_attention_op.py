@@ -1854,7 +1854,7 @@ class VllmTPUMLAAttention(MLAAttention):
             dcp_token_parallel_op.check_config(vllm_config)
             self.token_parallel_layout = dcp_token_parallel_op.layout_for(vllm_config)
         if (
-            envs.TPU_MLA_PREFILL_SEQUENCE_ROWS
+            (envs.TPU_MLA_PREFILL_SEQUENCE_ROWS or envs.TPU_MLA_PREFILL_ROWS_DENSE)
             and use_sparse
             and vllm_config is not None
         ):

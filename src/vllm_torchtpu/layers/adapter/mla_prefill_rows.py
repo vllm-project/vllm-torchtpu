@@ -101,6 +101,9 @@ def check_config(vllm_config: Any) -> None:
     tp = int(parallel.tensor_parallel_size)
     split_rows = dcp_token_parallel_op.split_rows_for(vllm_config)
     refusals = {
+        "is needed by TPU_MLA_PREFILL_ROWS_DENSE": (
+            envs.TPU_MLA_PREFILL_ROWS_DENSE and not envs.TPU_MLA_PREFILL_SEQUENCE_ROWS
+        ),
         "needs TPU_MOE_PREFILL_SEQUENCE_PARALLEL": (
             not envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL
         ),
@@ -171,7 +174,9 @@ def _build_ops() -> _Rows:
     if gather in _OPS:
         return _OPS[gather]
     mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
-    ring = rows_oproj.ring_order(mesh.devices.reshape(-1))
+    ring = None
+    if set(rows_oproj.GATHERS[gather]) - {"ag"}:
+        ring = rows_oproj.ring_order(mesh.devices.reshape(-1))
     sharded = P(DCP_AXIS_NAME)
 
     def local(w_o, w_uv, w_scale, after):
