@@ -84,9 +84,9 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
             headers.
         speculative_config: Speculative decoding the runtime runs, recorded as
             `serving_config.speculative_config` (vLLM's field names); None for none.
-        max_verify_tokens: Without speculative decoding, the draft tokens a step can
-            still verify, such as tokens a grammar forces: a recurrent model keeps a
-            checkpoint per verify token, as it does per draft token. 0 for none.
+        max_verify_tokens: The draft tokens a step can verify beyond the drafter's,
+            such as tokens a grammar forces: a recurrent model keeps a checkpoint per
+            verify token, as it does per draft token. 0 for only the drafter's.
     """
 
     vocab_size: int = 151936
@@ -115,10 +115,12 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
                 f"max_verify_tokens must be >= 0, got {self.max_verify_tokens}"
             )
         if self.max_verify_tokens and self.speculative_config:
-            raise ValueError(
-                "max_verify_tokens is for an export without speculative decoding; "
-                "with it, num_speculative_tokens sets the verify window"
-            )
+            k = int(self.speculative_config["num_speculative_tokens"])
+            if self.max_verify_tokens <= k:
+                raise ValueError(
+                    f"max_verify_tokens ({self.max_verify_tokens}) must exceed "
+                    f"num_speculative_tokens ({k}), which the window already covers"
+                )
         if self.emit_byte_tokenizer and self.vocab_size > 256:
             raise ValueError(
                 f"emit_byte_tokenizer requires vocab_size <= 256, got {self.vocab_size}"
@@ -141,12 +143,13 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     def recurrent_window(self) -> int:
         """Consecutive recurrent state slots a sequence holds: its state slot,
         then one checkpoint per draft token a step can verify (the speculative
-        draft tokens, or else `max_verify_tokens`), so a verify step that rejects
-        drafts resumes from the accepted token's state.
+        draft tokens, or `max_verify_tokens` when larger), so a verify step that
+        rejects drafts resumes from the accepted token's state.
         """
-        if not self.speculative_config:
-            return self.max_verify_tokens + 1
-        return int(self.speculative_config["num_speculative_tokens"]) + 1
+        drafted = 0
+        if self.speculative_config:
+            drafted = int(self.speculative_config["num_speculative_tokens"])
+        return max(drafted, self.max_verify_tokens) + 1
 
     @property
     def num_state_slots(self) -> int:

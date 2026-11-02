@@ -183,10 +183,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help=(
-            "Without --speculative-config, the draft tokens a step can still verify "
-            "(e.g. tokens a grammar forces): a recurrent model keeps a state "
-            "checkpoint per verify token, at the cost of that much more recurrent "
-            "state per sequence. Default 0."
+            "The draft tokens a step can verify, such as tokens a grammar forces, "
+            "when more than --speculative-config's num_speculative_tokens (or with "
+            "none): a recurrent model keeps a state checkpoint per verify token, at "
+            "the cost of that much more recurrent state per sequence. Default 0."
         ),
     )
     export_group.add_argument(
@@ -338,13 +338,18 @@ def export_speculative_config(raw: Any) -> dict[str, Any] | None:
     return out
 
 
-def verify_window_speculative_config(max_verify_tokens: int) -> dict[str, Any]:
+def verify_window_speculative_config(
+    max_verify_tokens: int, speculative_config: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """The speculative config vLLM loads a model with for `--max-verify-tokens`.
 
-    vLLM keeps a recurrent layer's checkpoints only under speculative decoding.
-    ngram adds no drafter to the model, so the export lowers nothing more, and the
-    artifact declares no speculative decoding.
+    vLLM keeps a recurrent layer's checkpoints per speculative token, so it loads
+    `speculative_config` (the artifact's, which keeps its own draft count) with
+    `max_verify_tokens` of them. Without one, ngram adds no drafter to the model,
+    and the artifact declares no speculative decoding.
     """
+    if speculative_config is not None:
+        return {**speculative_config, "num_speculative_tokens": max_verify_tokens}
     return {
         "method": "ngram",
         "num_speculative_tokens": max_verify_tokens,
@@ -373,10 +378,13 @@ def run_export_from_args(
     max_verify_tokens = int(getattr(args, "max_verify_tokens", 0) or 0)
     if max_verify_tokens < 0:
         raise ValueError(f"--max-verify-tokens must be >= 0, got {max_verify_tokens}")
-    if max_verify_tokens and speculative_config is not None:
+    drafted = 0
+    if speculative_config is not None:
+        drafted = int(speculative_config["num_speculative_tokens"])
+    if max_verify_tokens and max_verify_tokens <= drafted:
         raise ValueError(
-            "--max-verify-tokens is for an export without --speculative-config; "
-            "with it, num_speculative_tokens sets the verify window"
+            f"--max-verify-tokens ({max_verify_tokens}) must exceed "
+            f"num_speculative_tokens ({drafted}), which the window already covers"
         )
     # vLLM loads the model with the speculative config, so recurrent layers keep
     # a checkpoint per draft token, and builds the MTP draft for `mtp`. ngram
@@ -384,7 +392,7 @@ def run_export_from_args(
     if vllm_config is None and model is None:
         if max_verify_tokens:
             args.speculative_config = verify_window_speculative_config(
-                max_verify_tokens
+                max_verify_tokens, speculative_config
             )
         vllm_config = create_vllm_config_from_args(args)
     if vllm_config is not None:
@@ -416,6 +424,7 @@ def run_export_from_args(
         token_buckets=token_buckets,
         req_buckets=req_buckets,
         max_verify_tokens=max_verify_tokens,
+        num_speculative_tokens=drafted,
     )
     num_blocks_override = getattr(args, "num_blocks", None)
     if num_blocks_override is not None:
