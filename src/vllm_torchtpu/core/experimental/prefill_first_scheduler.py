@@ -23,8 +23,10 @@ programs. Every step then has one of two shapes:
   prefix cache read, and the running requests sit the step out. A solo step is
   only made when the request's KV blocks fit (plus the watermark while other
   requests run) and ``max_num_seqs`` has room for it.
-* regular: at most ``N`` tokens. Requests that a solo step would take are not
-  admitted in it.
+* regular: at most ``N`` tokens. It admits no waiting request from the first
+  one a solo step would take onward, so shorter requests do not pass a long
+  prompt waiting for its solo step (upstream FCFS admission likewise stops at
+  the first request that does not fit).
 
 A context-parallel threshold ``C`` on the padded token bucket agrees with this
 when the bucket that holds ``N`` tokens is below ``C`` and the next bucket is
@@ -179,7 +181,10 @@ class PrefillFirstScheduler(AsyncScheduler):
 
     def _solo_candidate(self) -> Request | None:
         """The first waiting request a solo step takes now, if any."""
-        if self._pause_state != PauseState.UNPAUSED or self.kv_holding_waiting:
+        if self._pause_state != PauseState.UNPAUSED or any(
+            not self._is_blocked_waiting_status(r.status)
+            for r in self.kv_holding_waiting
+        ):
             return None
         if self.running and 0 < self.solo_max_consecutive <= self._solo_run:
             return None
@@ -214,11 +219,15 @@ class PrefillFirstScheduler(AsyncScheduler):
         return free - reserved >= needed
 
     def _schedule_solo(self, request: Request) -> SchedulerOutput:
-        # The step must carry the whole prompt, so no prefix cache hit.
-        request.skip_reading_prefix_cache = True
         others = [r for r in self.waiting if r is not request]
-        with self._hidden_waiting(others), self._hidden_running(self.running[:]):
-            output = super().schedule()
+        # The step must carry the whole prompt, so no prefix cache hit.
+        skip_reading_prefix_cache = request.skip_reading_prefix_cache
+        request.skip_reading_prefix_cache = True
+        try:
+            with self._hidden_waiting(others), self._hidden_running(self.running[:]):
+                output = super().schedule()
+        finally:
+            request.skip_reading_prefix_cache = skip_reading_prefix_cache
         scheduled = output.num_scheduled_tokens
         if not scheduled:
             logger.warning(
@@ -236,19 +245,28 @@ class PrefillFirstScheduler(AsyncScheduler):
         return output
 
     def _schedule_regular(self, throttle_prefills: bool) -> SchedulerOutput:
-        solo = [r for r in self.waiting if self._takes_solo_step(r)]
+        held = self._held_from_regular()
         paused = self._paused_decodes()
         budget = self.max_num_scheduled_tokens
         if self.solo_over_tokens:
             self.max_num_scheduled_tokens = min(budget, self.solo_over_tokens)
         try:
-            with self._hidden_waiting(solo), self._hidden_running(paused):
+            with self._hidden_waiting(held), self._hidden_running(paused):
                 output = super().schedule(throttle_prefills)
         finally:
             self.max_num_scheduled_tokens = budget
         if paused and not output.total_num_scheduled_tokens:
             self._force_decode = True
         return output
+
+    def _held_from_regular(self) -> list[Request]:
+        """The waiting requests a regular step does not admit: the first one a
+        solo step would take, and every request behind it."""
+        waiting = list(self.waiting)
+        for i, r in enumerate(waiting):
+            if self._takes_solo_step(r):
+                return waiting[i:]
+        return []
 
     def _paused_decodes(self) -> list[Request]:
         """The running decodes that sit this regular step out for pacing."""
@@ -287,10 +305,11 @@ class PrefillFirstScheduler(AsyncScheduler):
         if self.solo_over_tokens:
             budget = min(budget, self.solo_over_tokens)
         for r in chain(*queues):
-            if (
-                self._is_blocked_waiting_status(r.status)
-                or (r.num_stale_output_tokens and not r.drop_stale_output)
-                or self._takes_solo_step(r)
+            if self._takes_solo_step(r):
+                # It and the requests behind it wait for its solo step.
+                break
+            if self._is_blocked_waiting_status(r.status) or (
+                r.num_stale_output_tokens and not r.drop_stale_output
             ):
                 continue
             if r.num_computed_tokens:

@@ -215,7 +215,7 @@ def test_solo_steps_interleave_with_decode_steps(
     assert seen == expected
 
 
-def test_regular_step_puts_hidden_requests_back_in_order(
+def test_regular_step_admits_only_requests_ahead_of_a_waiting_solo_prompt(
     shared_model_config, monkeypatch
 ):
     scheduler, hasher = _build(
@@ -223,14 +223,30 @@ def test_regular_step_puts_hidden_requests_back_in_order(
     )
     _add(scheduler, hasher, ("s1", 16, 1))
     scheduler.schedule()
-    _add(scheduler, hasher, ("L1", 100, 2), ("L2", 100, 3), ("s2", 30, 4))
+    _add(scheduler, hasher, ("L1", 100, 2), ("s2", 16, 3), ("L2", 100, 4))
     _add(scheduler, hasher, ("s3", 16, 5))
     assert scheduler.schedule().num_scheduled_tokens == {"L1": 100}
 
-    # Two decodes and s2's 30 tokens fill the 32-token regular budget.
+    # `s2` was ahead of `L2` and is admitted; `s3` waits behind `L2`.
     out = scheduler.schedule()
-    assert out.num_scheduled_tokens == {"s1": 1, "L1": 1, "s2": 30}
+    assert out.num_scheduled_tokens == {"s1": 1, "L1": 1, "s2": 16}
     assert [r.request_id for r in scheduler.waiting] == ["L2", "s3"]
+    assert scheduler.schedule().num_scheduled_tokens == {"L2": 100}
+
+
+def test_blocked_kv_holding_request_does_not_stop_solo_steps(
+    shared_model_config, monkeypatch
+):
+    scheduler, hasher = _build(shared_model_config, monkeypatch, over_tokens=32)
+    # A streaming session waiting for its next input holds KV blocks.
+    session = _request("session", 16, hasher, seed=1)
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.num_computed_tokens = 16
+    scheduler.kv_holding_waiting.add_request(session)
+    _add(scheduler, hasher, ("long", 100, 2))
+
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 100}
+    assert list(scheduler.kv_holding_waiting) == [session]
 
 
 def test_solo_step_skips_the_prefix_cache(shared_model_config, monkeypatch):
@@ -246,6 +262,8 @@ def test_solo_step_skips_the_prefix_cache(shared_model_config, monkeypatch):
     assert scheduler.kv_cache_manager.get_computed_blocks(long_request)[1] == 32
     scheduler.add_request(long_request)
     assert scheduler.schedule().num_scheduled_tokens == {"long": 100}
+    # Only the solo step skipped the read.
+    assert long_request.skip_reading_prefix_cache is False
 
 
 def test_no_solo_step_until_the_prompt_fits(shared_model_config, monkeypatch):
