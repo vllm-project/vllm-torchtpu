@@ -1127,3 +1127,54 @@ def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required):
         else:
             assert method._prebuild_w4a8(layer, "silu", w13, w2, 512) is None
             build.assert_not_called()
+
+
+@pytest.mark.parametrize("impl", ["push", "v2"])
+def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
+    """MOE_FUSED_EP_KERNEL_IMPL=push builds the op around fused_ep_moe_push,
+    with its knobs read from envs here (never inside kernels/) and passed as
+    arguments; v2 gets none of them."""
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.experimental import push_fused_moe
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    closures = []
+
+    def build(name, fn, **kwargs):
+        closures.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    v2_kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    push_kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", v2_kernel)
+    monkeypatch.setattr(push_fused_moe, "fused_ep_moe_push", push_kernel)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_IMPL", impl)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_SC_PREPUSH", 3)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_TC_EXCHANGE", True)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", 4)
+    bridge._build_op(None, 2, True, "silu", None, False)
+    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
+    operands = (
+        x,
+        None,
+        None,
+        None,
+        None,
+        jnp.zeros((8, 4)),
+        jnp.zeros((1, 1), dtype=jnp.int32),
+    )
+    assert closures[0](*operands) is x
+    if impl == "push":
+        v2_kernel.assert_not_called()
+        forwarded = push_kernel.call_args.kwargs
+        assert forwarded["sc_prepush"] == 3
+        assert forwarded["tc_exchange"] is True
+        assert forwarded["height_rungs_override"] == 4
+    else:
+        push_kernel.assert_not_called()
+        forwarded = v2_kernel.call_args.kwargs
+        for knob in ("sc_prepush", "tc_exchange", "height_rungs_override"):
+            assert knob not in forwarded
