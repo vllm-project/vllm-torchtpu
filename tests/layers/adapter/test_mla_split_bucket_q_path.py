@@ -26,6 +26,7 @@ from test_indexer_qb_overlap import _FakeIndexer  # noqa: E402
 from test_mla_rope_neox_permute import V_DIM, _inputs, _wrapper  # noqa: E402
 
 from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
+from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmMultiHeadLatentAttentionWrapper,
 )
@@ -102,3 +103,28 @@ def test_other_buckets_take_both_flags():
     out = _forward(w, hidden, positions, None)
     assert w.indexer.calls == [w.q_b_proj]
     assert len(out["rep"]) == 3  # q_nope, the raw q head, the rope table
+
+
+def test_overlap_reads_the_rope_cache_before_the_indexer():
+    """The split path's q rope reads the rope cache the indexer shares before
+    the indexer runs; the overlap path must lift it first too, or the warmup's
+    traces name it after different modules and the bucket hand-over fails."""
+    hidden, positions = _inputs(16, seed=4)
+    w = _flagged(True)
+    events = []
+    real = w.indexer.forward
+
+    def indexer(*args, **kwargs):
+        events.append("indexer")
+        return real(*args, **kwargs)
+
+    def retain(out, *buffers):
+        events.extend(("retain", b) for b in buffers)
+        return out
+
+    w.indexer.forward = indexer
+    with patch.object(mla_op, "_retain_buffers", retain):
+        _forward(w, hidden, positions, None)
+    cache = w.rotary_emb.cos_sin_cache
+    first = next(i for i, e in enumerate(events) if e[1] is cache)
+    assert first < events.index("indexer")

@@ -2307,6 +2307,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 if qb_overlap and self.kimi_preprocess is None:
                     # The indexer runs on q_c anyway; it returns q too.
                     assert self.indexer is not None
+                    # rotary_emb and indexer_rope_emb share cos_sin_cache, and
+                    # a shared buffer is named after its first access. The
+                    # plain path's q rope reaches it through rotary_emb before
+                    # the indexer, so reach it that way here too, or the
+                    # warmup refuses to hand buckets between the two traces.
+                    q_c = _retain_buffers(
+                        q_c, getattr(self.rotary_emb, "cos_sin_cache", None)
+                    )
                     early_topk, q = self.indexer(
                         hidden_states,
                         q_c,
