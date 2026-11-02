@@ -53,7 +53,34 @@ def reference(packed, hidden, weight, scale, q, k, mask):
     scales = packed[raw_end:].reshape(tokens, width // 32 // 4)
     embedded = dequantize_rows(raw, scales)
     projection = xla_quantized_matmul(embedded, weight, scale)
-    return gated_residual(hidden, projection, q, k, mask, 1e-20, 1e-6)
+    return reference_gate(hidden, projection, q, k, mask)
+
+
+def reference_gate(hidden, projection, q, k, mask):
+    streams, dim = hidden.shape[-2:]
+    keys = projection[:, : streams * dim].reshape(-1, streams, dim).astype(jnp.float32)
+    values = projection[:, streams * dim :].astype(jnp.float32)
+    h = hidden.astype(jnp.float32)
+    dot = jnp.sum(h * q * k * keys, axis=-1)
+    dot *= jax.lax.rsqrt(jnp.mean(h * h, axis=-1) + 1e-20)
+    dot *= jax.lax.rsqrt(jnp.mean(keys * keys, axis=-1) + 1e-20) * dim**-0.5
+    magnitude = jnp.sqrt(jnp.maximum(jnp.abs(dot), 1e-6))
+    gate = jax.nn.sigmoid(jnp.where(dot < 0, -magnitude, magnitude)) * mask[:, None]
+    return (h + gate[..., None] * values[:, None, :]).astype(hidden.dtype)
+
+
+def test_streamwise_gate_matches_the_original_gate():
+    packed, hidden, weight, scale, q, k, mask = inputs(32)
+    projection = xla_quantized_matmul(
+        dequantize_rows(
+            packed[: 32 * 64].reshape(32, 64), packed[32 * 64 :].reshape(32, 2)
+        ),
+        weight,
+        scale,
+    )
+    actual = gated_residual(hidden, projection, q, k, mask, 1e-20, 1e-6)
+    expected = reference_gate(hidden, projection, q, k, mask)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 @pytest.mark.parametrize("tokens", [32, 64, 288])

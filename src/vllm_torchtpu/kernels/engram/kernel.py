@@ -53,16 +53,18 @@ def gated_residual(
 ) -> jax.Array:
     """BF16 [T,S,D] hidden plus gated BF16 [T,(S+1)*D] keys and values."""
     streams, dim = hidden.shape[-2:]
-    keys = projection[:, : streams * dim].reshape(-1, streams, dim).astype(jnp.float32)
     values = projection[:, streams * dim :].astype(jnp.float32)
-    h = hidden.astype(jnp.float32)
-    dot = jnp.sum(h * query_weight * key_weight * keys, axis=-1)
-    dot *= jax.lax.rsqrt(jnp.mean(h * h, axis=-1) + eps)
-    dot *= jax.lax.rsqrt(jnp.mean(keys * keys, axis=-1) + eps) * dim**-0.5
-    magnitude = jnp.sqrt(jnp.maximum(jnp.abs(dot), clamp_value))
-    gate = jax.nn.sigmoid(jnp.where(dot < 0, -magnitude, magnitude))
-    gate *= token_mask[:, None]
-    return (h + gate[..., None] * values[:, None, :]).astype(hidden.dtype)
+    outputs = []
+    for stream in range(streams):
+        h = hidden[:, stream, :].astype(jnp.float32)
+        keys = projection[:, stream * dim : (stream + 1) * dim].astype(jnp.float32)
+        dot = jnp.sum(h * query_weight[stream] * key_weight[stream] * keys, axis=-1)
+        dot *= jax.lax.rsqrt(jnp.mean(h * h, axis=-1) + eps)
+        dot *= jax.lax.rsqrt(jnp.mean(keys * keys, axis=-1) + eps) * dim**-0.5
+        magnitude = jnp.sqrt(jnp.maximum(jnp.abs(dot), clamp_value))
+        gate = jax.nn.sigmoid(jnp.where(dot < 0, -magnitude, magnitude)) * token_mask
+        outputs.append((h + gate[:, None] * values).astype(hidden.dtype))
+    return jnp.stack(outputs, axis=1)
 
 
 def fused_engram(
