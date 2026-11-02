@@ -5242,11 +5242,13 @@ class TPUModelRunner(GPUModelRunner):
         from vllm_torchtpu.layers.adapter.linear_common import (
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
+            _get_quantized_matmul_pair_op,
         )
 
         with set_current_vllm_config(self.vllm_config):
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
             _get_quantized_matmul_op()
+            _get_quantized_matmul_pair_op()
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
 
@@ -7346,6 +7348,7 @@ class TPUModelRunner(GPUModelRunner):
         from vllm_torchtpu.layers.adapter.linear_common import (
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
+            _get_quantized_matmul_pair_op,
         )
 
         # set_current_vllm_config is required for the post-reset compile
@@ -7359,6 +7362,7 @@ class TPUModelRunner(GPUModelRunner):
             self._initialize_attention_kernels()
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
             _get_quantized_matmul_op()
+            _get_quantized_matmul_pair_op()
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
 

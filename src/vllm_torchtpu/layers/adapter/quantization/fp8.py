@@ -49,7 +49,9 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import refine_fp8_moe_block_shape
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     LinearBase,
+    ReplicatedLinear,
     UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method,
 )
@@ -89,6 +91,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     quantized_matmul,
+    quantized_matmul_pair,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -1698,6 +1701,33 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         layer.weight_scale = embed_tokens.weight_scale
         setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
         return layer
+
+
+def apply_fp8_linear_pair(
+    layer_a: torch.nn.Module, layer_b: torch.nn.Module, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """`(layer_a(x), layer_b(x))` with `x` quantized once, or None when either
+    layer's forward is not just `VllmFp8LinearMethodTPU.apply` on a bias-free
+    (k, n) weight."""
+    for layer in (layer_a, layer_b):
+        # Upstream's forward of these two is `quant_method.apply`, nothing more.
+        plain_forward = isinstance(layer, ReplicatedLinear) or (
+            isinstance(layer, ColumnParallelLinear) and not layer.gather_output
+        )
+        if not (
+            plain_forward
+            and isinstance(layer.quant_method, VllmFp8LinearMethodTPU)
+            and getattr(layer, "bias", None) is None
+            and not getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        ):
+            return None
+    return quantized_matmul_pair(
+        x,
+        layer_a.weight,
+        layer_a.weight_scale,
+        layer_b.weight,
+        layer_b.weight_scale,
+    )
 
 
 def resolve_online_fp8(

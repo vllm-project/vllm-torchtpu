@@ -56,6 +56,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
 )
+from vllm_torchtpu.layers.adapter.quantization.fp8 import apply_fp8_linear_pair
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -553,9 +554,18 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self.wq_b(qr).view(
-            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
+        # The indexer projects the same qr: one op quantizes it for both.
+        indexer_q = None
+        pair = (
+            None
+            if self.indexer is None
+            else apply_fp8_linear_pair(self.wq_b, self.indexer.wq_b, qr)
         )
+        if pair is None:
+            q = self.wq_b(qr)
+        else:
+            q, indexer_q = pair
+        q = q.view(qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim)
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
 
@@ -585,6 +595,7 @@ class VllmDeepseekV4MLAAttention(
                 positions,
                 indexer_emb,
                 compress=not paired,
+                projected_q=indexer_q,
             )
         if compressor is not None and not paired:
             compressor(hidden_states, positions, self.mla_attn.rotary_emb)
