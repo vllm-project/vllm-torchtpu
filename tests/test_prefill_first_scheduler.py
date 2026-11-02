@@ -573,58 +573,52 @@ def test_dp_lb_counts_are_off_without_data_parallelism(
     assert scheduler.get_request_counts() == (0, 1)
 
 
-def _sleeping_clock(monkeypatch, step_s=0.0):
-    """A fake clock that the scheduler's sleeps advance."""
+def _floor_clock(monkeypatch, step_s=0.001):
+    """A fake clock advancing step_s per schedule() call, like the engine
+    core's 1 ms yield after a step that schedules nothing."""
     clock = _Clock(step_s=step_s)
-    slept = []
-
-    def fake_sleep(seconds):
-        slept.append(seconds)
-        clock.now += seconds
-
     monkeypatch.setattr(prefill_first_scheduler, "monotonic", clock)
-    monkeypatch.setattr(prefill_first_scheduler, "sleep", fake_sleep)
-    return clock, slept
+    return clock
+
+
+def _step(scheduler, clock):
+    out = scheduler.schedule().num_scheduled_tokens
+    clock.tick()
+    return out
 
 
 def test_decode_only_steps_wait_for_the_interval_floor(
     shared_model_config, monkeypatch
 ):
-    clock, slept = _sleeping_clock(monkeypatch)
+    clock = _floor_clock(monkeypatch)
     scheduler, hasher = _build(
         shared_model_config, monkeypatch, min_decode_interval_ms=5
     )
     _add(scheduler, hasher, ("d", 16, 1))
-    assert scheduler.schedule().num_scheduled_tokens == {"d": 16}
-    assert scheduler.schedule().num_scheduled_tokens == {"d": 1}
-    decoded_at = clock.now
-
-    steps = [scheduler.schedule().num_scheduled_tokens for _ in range(6)]
-    # Four empty steps of one 1 ms sleep each, then the decode at 5 ms.
-    assert steps == [{}, {}, {}, {}, {"d": 1}, {}]
-    assert slept[:5] == pytest.approx([0.001] * 5)
-    assert clock.now - decoded_at == pytest.approx(0.006)
+    assert _step(scheduler, clock) == {"d": 16}
+    # Decodes at 1 ms, then waits until 6 ms.
+    steps = [_step(scheduler, clock) for _ in range(7)]
+    assert steps == [{"d": 1}, {}, {}, {}, {}, {"d": 1}, {}]
 
 
 def test_a_request_arriving_during_the_hold_is_scheduled_at_once(
     shared_model_config, monkeypatch
 ):
-    clock, slept = _sleeping_clock(monkeypatch)
+    clock = _floor_clock(monkeypatch)
     scheduler, hasher = _build(
         shared_model_config, monkeypatch, min_decode_interval_ms=50
     )
     _add(scheduler, hasher, ("d", 16, 1))
-    scheduler.schedule()
-    scheduler.schedule()
-    assert scheduler.schedule().num_scheduled_tokens == {}
+    _step(scheduler, clock)
+    _step(scheduler, clock)
+    assert _step(scheduler, clock) == {}
     _add(scheduler, hasher, ("w", 32, 2))
     # A prefill is pending, so the floor does not hold the decode either.
-    assert scheduler.schedule().num_scheduled_tokens == {"d": 1, "w": 32}
-    assert len(slept) == 1
+    assert _step(scheduler, clock) == {"d": 1, "w": 32}
 
 
 def test_no_floor_while_a_prefill_chunk_runs(shared_model_config, monkeypatch):
-    clock, slept = _sleeping_clock(monkeypatch)
+    clock = _floor_clock(monkeypatch)
     scheduler, hasher = _build(
         shared_model_config,
         monkeypatch,
@@ -632,31 +626,12 @@ def test_no_floor_while_a_prefill_chunk_runs(shared_model_config, monkeypatch):
         max_num_batched_tokens=32,
     )
     _add(scheduler, hasher, ("d", 16, 1))
-    scheduler.schedule()
+    _step(scheduler, clock)
     _add(scheduler, hasher, ("long", 100, 2))
-    steps = [scheduler.schedule().num_scheduled_tokens for _ in range(4)]
+    steps = [_step(scheduler, clock) for _ in range(4)]
     assert steps == [
         {"d": 1, "long": 31},
         {"d": 1, "long": 31},
         {"d": 1, "long": 31},
         {"d": 1, "long": 7},
     ]
-    assert slept == []
-
-
-def test_dp_holds_without_sleeping(shared_model_config, monkeypatch):
-    """Under DP the engine core's dummy forward paces held steps."""
-    clock, slept = _sleeping_clock(monkeypatch)
-    scheduler, hasher = _build(
-        shared_model_config,
-        monkeypatch,
-        min_decode_interval_ms=5,
-        data_parallel_size=2,
-    )
-    _add(scheduler, hasher, ("d", 16, 1))
-    scheduler.schedule()
-    scheduler.schedule()
-    assert scheduler.schedule().num_scheduled_tokens == {}
-    assert slept == []
-    clock.now += 0.005
-    assert scheduler.schedule().num_scheduled_tokens == {"d": 1}

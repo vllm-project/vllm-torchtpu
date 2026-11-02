@@ -53,12 +53,10 @@ is left to prefill (no running prefill chunk and no waiting request), a step
 that would only decode waits until ``F`` milliseconds have passed since the
 previous step that decoded: the device would only be decoding, so this raises
 TPOT without taking prefill capacity, and lowers TTFT under a closed-loop
-client the same way. The wait is spent in steps that schedule nothing; without
-data parallelism each sleeps at most ``_HOLD_QUANTUM_S``, so the engine core
-does not spin and a request that arrives meanwhile is scheduled about that much
-later. With DP > 1 the engine core runs a dummy forward for every step that
-schedules nothing, which paces the loop instead (no sleep), so an arrival can
-wait for one dummy forward. Either way the held decodes leave the runner's
+client the same way. The wait is spent in steps that schedule nothing; the
+engine core yields 1 ms after each (EngineCore._process_engine_step) and, with
+DP > 1, also runs a dummy forward, so it does not spin and a request that
+arrives meanwhile waits about that long. The held decodes leave the runner's
 persistent batch for the hold and are added back when they next decode.
 
 Prefill-aware DP load balancing (``VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS=U > 0``).
@@ -83,7 +81,7 @@ selects it too.
 import contextlib
 from collections.abc import Iterator
 from itertools import chain
-from time import monotonic, sleep
+from time import monotonic
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
@@ -99,10 +97,6 @@ SCHEDULER_CLS = (
     "vllm_torchtpu.core.experimental.prefill_first_scheduler.PrefillFirstScheduler"
 )
 
-# Longest sleep of a step that holds decodes for the interval floor: the delay a
-# request arriving during the hold can see before it is scheduled.
-_HOLD_QUANTUM_S = 0.001
-
 
 class PrefillFirstScheduler(AsyncScheduler):
     """Solo whole-prompt prefill steps, decode pacing, a decode interval floor
@@ -116,10 +110,6 @@ class PrefillFirstScheduler(AsyncScheduler):
         self.decode_interval = envs.VLLM_TPU_DECODE_INTERVAL_MS / 1000
         self.lb_prefill_unit = envs.VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS
         self.min_decode_interval = envs.VLLM_TPU_MIN_DECODE_INTERVAL_MS / 1000
-        # Under DP the engine core's dummy forward paces held steps.
-        self._hold_quantum = (
-            _HOLD_QUANTUM_S if self.parallel_config.data_parallel_size == 1 else 0.0
-        )
         if not (
             self.solo_over_tokens
             or self.decode_interval
@@ -376,21 +366,14 @@ class PrefillFirstScheduler(AsyncScheduler):
         return output
 
     def _below_decode_floor(self, decodes: list[Request]) -> bool:
-        """Whether a decode-only step still waits for the interval floor; if
-        so, sleeps up to the hold quantum first (a held step schedules
-        nothing, and without DP the engine core would call again at once)."""
+        """Whether a decode-only step still waits for the interval floor."""
         if not (self.min_decode_interval and decodes):
             return False
         if any(r.is_prefill_chunk for r in self.running) or (
             self.waiting or self.kv_holding_waiting
         ):
             return False
-        remaining = self._last_decode + self.min_decode_interval - monotonic()
-        if remaining <= 0:
-            return False
-        if self._hold_quantum:
-            sleep(min(remaining, self._hold_quantum))
-        return remaining > self._hold_quantum
+        return monotonic() < self._last_decode + self.min_decode_interval
 
     def _held_from_regular(self) -> list[Request]:
         """The waiting requests a regular step does not admit: the first one a
