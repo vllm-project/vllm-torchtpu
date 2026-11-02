@@ -559,6 +559,7 @@ def _pallas_rpa_kernel_batched(
     cap_sliding_decode_block: bool = False,
     sliding_prefill_max_bkv: int | None = None,
     fp8_compute: bool = False,
+    fence_output: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
@@ -573,6 +574,8 @@ def _pallas_rpa_kernel_batched(
         rpa_kwargs["sliding_prefill_max_bkv"] = sliding_prefill_max_bkv
     if fp8_compute:
         rpa_kwargs["fp8_compute"] = True
+    if fence_output:
+        rpa_kwargs["fence_output"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -1099,6 +1102,17 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if "skip_empty_launch" in entry_params and envs.TPU_RPA_SKIP_EMPTY_LAUNCH:
                 logger.info_once("Batched RPA skips launches with an empty segment.")
                 entry_kwargs["skip_empty_launch"] = True
+            if envs.TPU_RPA_FENCE_OUTPUT:
+                # A layout hint: entries without the fence (the default RPA,
+                # the local draft kernel) run unchanged, and say so.
+                if "fence_output" in entry_params:
+                    logger.info_once("Batched RPA fences its token-major output.")
+                    entry_kwargs["fence_output"] = True
+                else:
+                    logger.info_once(
+                        "TPU_RPA_FENCE_OUTPUT does not apply to kernel entry %s.",
+                        self._kernel_entry.__name__,
+                    )
             if (
                 "cap_sliding_decode_block" in entry_params
                 and envs.TPU_RPA_CAP_SLIDING_DECODE_BLOCK
