@@ -43,7 +43,7 @@ tests_lane_passed() {
     if [[ "${outcome}" != "passed" ]]; then
       passed=false
     fi
-  done < <(grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${file}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -v '_pr$')
+  done < <(grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${file}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -vE '(_pr|^unit_tests_tpu)$')
   [[ "${passed}" == true ]]
 }
 

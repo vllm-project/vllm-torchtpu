@@ -1,8 +1,10 @@
 # Buildkite pipelines
 
-CI runs on the Kueue fleet: `bootstrap.sh` uploads the `pipeline_<lane>.yml`
-lanes (`tests`, `integration`, `perf`, `verify`), and every step runs in a pod
-through `.buildkite/kubernetes/run.sh`.
+CI runs on the Kueue fleet: `bootstrap.py` (invoked by `bootstrap.sh`; pass
+`--pipeline <slug>` for local runs) evaluates `.buildkite/pipelines.yaml` for
+`BUILDKITE_PIPELINE_SLUG`, wires `depends_on` edges across the uploaded step
+files, records a build annotation with condition values and edges, and uploads
+one pipeline. Every pod step runs through `.buildkite/kubernetes/run.sh`.
 
 `pipeline_tests.yml` runs unmarked unit tests in `tests/` in CPU pods and
 tests marked `tpu_test` (or `multichip`) on TPU v7x slices (1x1x1 and 2x2x1).
@@ -17,8 +19,8 @@ runs the full nightly suite across every lane: `tests`, `integration`, `perf`
 and `verify`); adding either label to a PR that already has
 `ready` starts a build that includes them. The 02:00 PT nightly runs
 all of them. Between nightlies, schedules on `vllm-torchtpu-ci` that set
-`CI_LANES=perf` run the perf lane alone; without `NIGHTLY` that is only the
-steps not gated on it. The schedules keep clear of the hours the nightly's
+`CI_VARIANT=perf-only` run the perf suite alone; without `NIGHTLY` that is only
+the steps not gated on it. The schedules keep clear of the hours the nightly's
 perf steps take. The integration pipeline also runs the lane, because its LKG
 promotion waits on two of its steps.
 

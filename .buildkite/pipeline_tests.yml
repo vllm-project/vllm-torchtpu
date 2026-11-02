@@ -113,6 +113,7 @@ steps:
           test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
   - group: "Unit Tests on TPU"
+    key: "unit_tests_tpu"
     # Set by bootstrap.sh for skip-tpu-ci and filled in when this file is
     # uploaded; build.env() would not see it, since it reads only the
     # environment the build was created with.

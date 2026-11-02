@@ -47,6 +47,7 @@ x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
 
 steps:
   - group: "Perf and Eval on TPU"
+    key: "perf_tpu"
     steps:
       - label: "Perf/Eval: General suite (TPU v7x-8)"
         <<: *perf_step

@@ -1,0 +1,83 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Each top-level key is a Buildkite pipeline slug. `files` lists the .buildkite/ step
+# files to upload; `variants` names file subsets picked by CI_VARIANT=<name>.
+#   depends_on: files to wait for (or `- file: X` with `run_if`/`skip_if`); unuploaded files are ignored.
+#   run_if / skip_if: upload only if / unless any listed condition in bootstrap.py CONDITIONS holds.
+#   extends: copy `files`, `variants`, and `vllm_ref` from another pipeline (one level), replacing matching keys.
+
+vllm-torchtpu-ci:
+  files:
+    pipeline_build.yml:
+    pipeline_tests.yml:
+      depends_on:
+        - pipeline_build.yml
+    pipeline_integration.yml:
+      depends_on:
+        - pipeline_build.yml
+      skip_if:
+        - skip-tpu
+    pipeline_perf.yml:
+      depends_on:
+        - pipeline_build.yml
+      run_if:
+        - perf
+      skip_if:
+        - skip-tpu
+    pipeline_models.yml:
+      depends_on:
+        - pipeline_build.yml
+      run_if:
+        - full-suite
+        - release-tag
+      skip_if:
+        - skip-tpu
+    pipeline_verify.yml:
+      depends_on:
+        - pipeline_tests.yml
+        - pipeline_integration.yml
+        - pipeline_perf.yml
+        - pipeline_models.yml
+      run_if:
+        - full-suite
+        - release-tag
+      skip_if:
+        - skip-tpu
+  variants:
+    perf-only:
+      - pipeline_build.yml
+      - pipeline_perf.yml
+
+vllm-torchtpu-torchtpu-nightly:
+  extends: vllm-torchtpu-ci
+
+vllm-torchtpu-integration:
+  extends: vllm-torchtpu-ci
+  vllm_ref: head
+  files:
+    pipeline_perf.yml:
+      depends_on:
+        - pipeline_build.yml
+      skip_if:
+        - skip-tpu
+    pipeline_promote.yml:
+      depends_on:
+        - pipeline_tests.yml
+        - pipeline_integration.yml
+        - pipeline_perf.yml
+        - pipeline_verify.yml
+        - pipeline_build.yml
+      skip_if:
+        - skip-tpu

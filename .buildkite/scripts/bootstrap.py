@@ -14,14 +14,17 @@
 # limitations under the License.
 """Bootstrap the Buildkite CI and dev pipelines, and expose the pinned vLLM ref.
 
-CLI entry points (compatible with Python 3.10+ stdlib on `queue=cpu`):
-- `bootstrap.py`: main CI pipeline bootstrap (invoked by `bootstrap.sh`).
+CLI entry points (`dev` and `vllm-pin` use Python 3.10+ stdlib only; main CI mode
+loads PyYAML lazily on `queue=cpu` to evaluate `.buildkite/pipelines.yaml`):
+- `bootstrap.py [--pipeline <slug>]`: main CI pipeline bootstrap (`bootstrap.sh`).
 - `bootstrap.py dev`: experimental dev pipeline bootstrap (`bootstrap_dev.sh`).
 - `bootstrap.py vllm-pin`: print the pinned upstream vLLM ref from `pyproject.toml`.
 """
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import http.client
 import io
 import json
@@ -32,8 +35,9 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from collections.abc import Container, Mapping, Sequence
+from collections.abc import Callable, Container, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import cap_pr_tpu_concurrency
 
@@ -61,18 +65,11 @@ PRIORITY_KERNEL_TUNING = -9
 # cap.
 PR_TPU_JOBS_PER_AUTHOR = 40
 
-# The suite's lanes, in upload order. Lane <lane> is
-# .buildkite/pipeline_<lane>.yml; no other file is uploaded as a lane. CI_LANES
-# picks a subset - a scheduled pipeline names its own lane. Without it a build
-# runs every lane but perf, which has scheduled builds of its own; nightly
-# builds still run perf, and so does the integration pipeline, whose LKG
-# promotion waits on two perf steps. A PR whose change needs perf/eval coverage
-# asks for it with the run-perf-eval label, or the full nightly suite across
-# every lane with run-full-ci; adding either label to a ready PR starts a build.
-ALL_LANES: tuple[str, ...] = ("verify", "perf", "integration", "tests")
-DEFAULT_LANES: tuple[str, ...] = ("verify", "integration", "tests")
-DEFAULT_INTEGRATION_SLUG = "vllm-torchtpu-integration"
+DEFAULT_PIPELINES_FILE = ".buildkite/pipelines.yaml"
 DEFAULT_DEV_PIPELINE_FILE = ".buildkite/pipeline_dev.yml"
+GITHUB_APP_CREDENTIAL_HELPER = pathlib.Path(
+    "/etc/buildkite-agent/git-credential-github-app"
+)
 VLLM_UPSTREAM_REPO = "https://github.com/vllm-project/vllm.git"
 GITHUB_REPO = "vllm-project/vllm-torchtpu"
 GITHUB_API_BASE_URL = "https://api.github.com"
@@ -88,6 +85,7 @@ _DOCS_ONLY_RE = re.compile(
     r"|^LICENSE$|^\.git-blame-ignore-revs$|^\.pyrefly-baseline\.json$)"
 )
 _MERGED_PR_RE = re.compile(r"\(#([0-9]+)\)$")
+_RELEASE_TAG_RE = re.compile(r"^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$")
 _VLLM_PIN_RE = re.compile(
     r".*vllm @ git\+https://github\.com/vllm-project/vllm\.git@([a-zA-Z0-9.-]+).*"
 )
@@ -95,6 +93,7 @@ _MISSING_VLLM_PIN_ERROR = (
     "ERROR: vLLM commit hash is missing from pyproject.toml. "
     "Cannot proceed without a pinned hash."
 )
+_PIPELINE_KEYS = frozenset({"extends", "vllm_ref", "files", "variants"})
 
 
 class BootstrapError(Exception):
@@ -112,7 +111,7 @@ def _split_labels(raw: str) -> tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Context
+# Context & conditions
 # ---------------------------------------------------------------------------
 
 
@@ -126,26 +125,22 @@ class BuildContext:
     source: str
     tag: str
     pipeline_slug: str
-    integration_slug: str
     pull_request: str | None
     pr_base_branch: str
     pr_labels: tuple[str, ...]
     author_email: str
     nightly_env: bool
     torchtpu_nightly_env: bool
-    ci_lanes_raw: str
+    ci_variant: str
     skip_tpu_ci_env: bool
     vllm_commit_override: str
     pr_tpu_concurrency_group_env: str
     pr_tpu_jobs_per_author: int
+    merged_labels: tuple[str, ...] = ()
 
     @property
     def is_pr(self) -> bool:
         return self.pull_request is not None
-
-    @property
-    def is_integration(self) -> bool:
-        return self.pipeline_slug == self.integration_slug
 
     @property
     def is_post_merge_webhook(self) -> bool:
@@ -166,21 +161,79 @@ class BuildContext:
             source=env.get("BUILDKITE_SOURCE", ""),
             tag=env.get("BUILDKITE_TAG", ""),
             pipeline_slug=env.get("BUILDKITE_PIPELINE_SLUG", ""),
-            integration_slug=_env_or(
-                env, "VLLM_INTEGRATION_PIPELINE_SLUG", DEFAULT_INTEGRATION_SLUG
-            ),
             pull_request=None if pr_raw == "false" else pr_raw,
             pr_base_branch=_env_or(env, "BUILDKITE_PULL_REQUEST_BASE_BRANCH", "main"),
             pr_labels=_split_labels(env.get("BUILDKITE_PULL_REQUEST_LABELS", "")),
             author_email=author,
             nightly_env=_env_or(env, "NIGHTLY", "0") == "1",
             torchtpu_nightly_env=_env_or(env, "TORCHTPU_NIGHTLY", "0") == "1",
-            ci_lanes_raw=env.get("CI_LANES", ""),
+            ci_variant=env.get("CI_VARIANT", "").strip(),
             skip_tpu_ci_env=_env_or(env, "SKIP_TPU_CI", "0") == "1",
             vllm_commit_override=env.get("VLLM_COMMIT_HASH_OVERRIDE", ""),
             pr_tpu_concurrency_group_env=env.get("PR_TPU_CONCURRENCY_GROUP", ""),
             pr_tpu_jobs_per_author=PR_TPU_JOBS_PER_AUTHOR,
         )
+
+
+def _cond_pr(ctx: BuildContext) -> bool:
+    """BUILDKITE_PULL_REQUEST is set (not 'false')."""
+    return ctx.is_pr
+
+
+def _cond_main(ctx: BuildContext) -> bool:
+    """Non-PR build on branch 'main'."""
+    return not ctx.is_pr and ctx.branch == "main"
+
+
+def _cond_scheduled(ctx: BuildContext) -> bool:
+    """BUILDKITE_SOURCE == 'schedule'."""
+    return ctx.source == "schedule"
+
+
+def _cond_release_tag(ctx: BuildContext) -> bool:
+    """BUILDKITE_TAG matches a release version tag."""
+    return bool(_RELEASE_TAG_RE.match(ctx.tag))
+
+
+def _cond_full_suite(ctx: BuildContext) -> bool:
+    """NIGHTLY == '1' or PR label 'run-full-ci'."""
+    return ctx.nightly_env or (ctx.is_pr and "run-full-ci" in ctx.pr_labels)
+
+
+def _cond_perf(ctx: BuildContext) -> bool:
+    """full-suite, PR 'run-perf-eval', or CI_VARIANT == 'perf-only'."""
+    return (
+        _cond_full_suite(ctx)
+        or (ctx.is_pr and "run-perf-eval" in ctx.pr_labels)
+        or ctx.ci_variant == "perf-only"
+    )
+
+
+def _cond_skip_tpu(ctx: BuildContext) -> bool:
+    """SKIP_TPU_CI == '1', or 'skip-tpu-ci' on the PR or merged PR."""
+    labels = (
+        ctx.pr_labels
+        if ctx.is_pr
+        else (ctx.merged_labels if ctx.is_post_merge_webhook else ())
+    )
+    return ctx.skip_tpu_ci_env or "skip-tpu-ci" in labels
+
+
+def _cond_oncall_fix(ctx: BuildContext) -> bool:
+    """PR carries the 'oncall-fix' label."""
+    return ctx.is_pr and "oncall-fix" in ctx.pr_labels
+
+
+CONDITIONS: dict[str, Callable[[BuildContext], bool]] = {
+    "pr": _cond_pr,
+    "main": _cond_main,
+    "scheduled": _cond_scheduled,
+    "release-tag": _cond_release_tag,
+    "full-suite": _cond_full_suite,
+    "perf": _cond_perf,
+    "skip-tpu": _cond_skip_tpu,
+    "oncall-fix": _cond_oncall_fix,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -206,22 +259,6 @@ class PriorityPlan:
     annotation: Annotation | None
     pr_tpu_concurrency_group: str | None
     log_line: str
-
-
-@dataclass(frozen=True)
-class UploadPlan:
-    """Resolved lane selection, exported flags, and annotations for upload."""
-
-    nightly: bool
-    skip_tpu_ci: bool
-    lanes: tuple[str, ...]
-    lane_files: tuple[str, ...]
-    build_file: str
-    omni_image_skip: str
-    pre_lane_annotations: tuple[Annotation, ...]
-    post_lane_annotations: tuple[Annotation, ...]
-    invalid_ci_lanes_error: str | None
-    missing_ci_lanes_error: str | None
 
 
 @dataclass(frozen=True)
@@ -368,130 +405,283 @@ def resolve_vllm_commit_hash(base_hash: str, override: str) -> str:
     return override if override else base_hash
 
 
-def plan_uploads(
-    ctx: BuildContext,
-    *,
-    merged_labels: Sequence[str],
-    existing_lane_files: Container[str],
-) -> UploadPlan:
-    """Decide lanes, annotations, `SKIP_TPU_CI`, and `OMNI_IMAGE_SKIP`."""
-    pre_annotations: list[Annotation] = []
-    nightly = ctx.nightly_env
-    if ctx.is_pr and "run-full-ci" in ctx.pr_labels:
-        nightly = True
-        pre_annotations.append(
-            Annotation(
-                style="info",
-                context="full-ci",
-                body="Runs the full (nightly) suite (`run-full-ci` label).",
-            )
+# ---------------------------------------------------------------------------
+# `.buildkite/pipelines.yaml` & four-step pipeline rendering
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RenderedPipeline:
+    """Rendered Buildkite pipeline document, flags, and annotations."""
+
+    document: dict[str, Any]
+    files: tuple[str, ...]
+    edges: dict[str, tuple[str, ...]]
+    nightly: bool
+    skip_tpu_ci: bool
+    omni_image_skip: str
+    annotations: tuple[Annotation, ...]
+
+
+def _yaml() -> Any:
+    try:
+        import yaml  # pyrefly: ignore[missing-import]
+    except ModuleNotFoundError as exc:
+        raise BootstrapError("ERROR: PyYAML is required for bootstrap.py") from exc
+    return yaml
+
+
+def load_pipeline_spec(
+    slug: str, pipelines_path: pathlib.Path = _REPO_ROOT / DEFAULT_PIPELINES_FILE
+) -> dict[str, Any]:
+    """Load `pipelines.yaml`, select `slug`, and resolve one-level `extends`."""
+    if not pipelines_path.is_file():
+        raise BootstrapError(f"ERROR: missing pipelines config: {pipelines_path}")
+    raw = _yaml().safe_load(pipelines_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not raw:
+        raise BootstrapError(f"ERROR: {pipelines_path.name} must be a mapping")
+    if not slug or slug not in raw or not isinstance(raw[slug], dict):
+        label = (
+            "BUILDKITE_PIPELINE_SLUG unset (use --pipeline)"
+            if not slug
+            else f"unknown pipeline {slug!r}"
         )
-
-    if nightly or ctx.is_integration:
-        default_lanes = ALL_LANES
-    elif ctx.is_pr and "run-perf-eval" in ctx.pr_labels:
-        default_lanes = ALL_LANES
-        if not ctx.ci_lanes_raw:
-            pre_annotations.append(
-                Annotation(
-                    style="info",
-                    context="perf-eval",
-                    body="Runs the perf/eval lane (`run-perf-eval` label).",
-                )
-            )
-    else:
-        default_lanes = DEFAULT_LANES
-
-    # skip-tpu-ci keeps only the tests lane, and SKIP_TPU_CI leaves out its TPU
-    # group (pipeline_tests.yml reads it when the lane is uploaded), so the
-    # image build, the type check and the CPU unit tests still run, on the PR
-    # and again on its post-merge build. It overrides run-perf-eval and
-    # run-full-ci.
-    if ctx.is_pr:
-        skip_labels: Sequence[str] = ctx.pr_labels
-    elif ctx.is_post_merge_webhook:
-        skip_labels = merged_labels
-    else:
-        skip_labels = ()
-
-    skip_tpu_ci = ctx.skip_tpu_ci_env or ("skip-tpu-ci" in skip_labels)
-    if skip_tpu_ci:
-        default_lanes = ("tests",)
-        pre_annotations.append(
-            Annotation(
-                style="info",
-                context="skip-tpu-ci",
-                body=(
-                    "TPU steps not run (`skip-tpu-ci` label); the CPU steps still run."
-                ),
-            )
+        raise BootstrapError(f"ERROR: {label}; pipelines: {', '.join(raw)}")
+    entry = raw[slug]
+    if extra := set(entry) - _PIPELINE_KEYS:
+        raise BootstrapError(f"ERROR: {slug!r} has unknown keys {sorted(extra)}")
+    base = raw.get(entry["extends"]) if "extends" in entry else {}
+    if not isinstance(base, dict) or "extends" in base:
+        raise BootstrapError(
+            f"ERROR: invalid extends {entry.get('extends')!r} on {slug!r}"
         )
+    vllm_ref = entry.get("vllm_ref", base.get("vllm_ref", "pinned"))
+    files = {**(base.get("files") or {}), **(entry.get("files") or {})}
+    variants = {**(base.get("variants") or {}), **(entry.get("variants") or {})}
+    if vllm_ref not in ("pinned", "head") or not files:
+        raise BootstrapError(f"ERROR: invalid vllm_ref or empty files on {slug!r}")
+    if any(
+        not isinstance(v, list) or not all(isinstance(f, str) and f in files for f in v)
+        for v in variants.values()
+    ):
+        raise BootstrapError(f"ERROR: invalid variants in {slug!r}")
+    return {"slug": slug, "vllm_ref": vllm_ref, "files": files, "variants": variants}
 
-    requested_lanes = (
-        tuple(ctx.ci_lanes_raw.split()) if ctx.ci_lanes_raw else default_lanes
+
+def _is_active(cfg: Mapping[str, Any], conds: Mapping[str, bool], owner: str) -> bool:
+    for field in ("run_if", "skip_if"):
+        val = cfg.get(field)
+        if val is not None and (
+            not isinstance(val, list)
+            or not all(isinstance(c, str) and c in conds for c in val)
+        ):
+            raise BootstrapError(
+                f"ERROR: unknown condition in {owner}.{field}: {val!r}"
+            )
+    run_if, skip_if = cfg.get("run_if") or [], cfg.get("skip_if") or []
+    return not any(conds[c] for c in skip_if) and (
+        not run_if or any(conds[c] for c in run_if)
     )
-    invalid_error: str | None = None
-    for lane in requested_lanes:
-        if lane not in ALL_LANES:
-            invalid_error = (
-                f"ERROR: CI_LANES names '{lane}'; lanes are: {' '.join(ALL_LANES)}"
-            )
-            break
 
-    lane_files: list[str] = []
-    missing: list[str] = []
-    if invalid_error is None:
-        for lane in ALL_LANES:
-            if lane not in requested_lanes:
-                continue
-            rel_path = f".buildkite/pipeline_{lane}.yml"
-            if rel_path in existing_lane_files:
-                lane_files.append(rel_path)
-            else:
-                missing.append(rel_path)
 
-    post_annotations: list[Annotation] = []
-    missing_error: str | None = None
-    if missing:
-        # A lane asked for by name has to exist; the whole suite runs the lanes
-        # it has and says what it left out.
-        missing_str = " ".join(missing)
-        if ctx.ci_lanes_raw:
-            missing_error = (
-                f"ERROR: CI_LANES asks for {missing_str}, which does not exist"
-            )
-        else:
-            post_annotations.append(
-                Annotation(
-                    style="warning",
-                    context="lane-gaps",
-                    body=f"Not run: no {missing_str} yet.",
+def _wanted_deps(
+    raw_deps: Any, all_files: Container[str], conds: Mapping[str, bool], owner: str
+) -> list[str]:
+    if raw_deps is None:
+        return []
+    if not isinstance(raw_deps, list):
+        raise BootstrapError(f"ERROR: {owner}.depends_on must be a list")
+    deps: list[str] = []
+    for item in raw_deps:
+        if isinstance(item, dict) and isinstance(item.get("file"), str):
+            if set(item) - {"file", "run_if", "skip_if"}:
+                raise BootstrapError(
+                    f"ERROR: invalid depends_on keys in {owner}: {item!r}"
                 )
+            if not _is_active(item, conds, f"{owner}.depends_on"):
+                continue
+            item = item["file"]
+        if not isinstance(item, str) or item not in all_files:
+            raise BootstrapError(f"ERROR: {owner} depends_on unknown file {item!r}")
+        deps.append(item)
+    return deps
+
+
+def _load_step_file(
+    step_path: pathlib.Path, *, nightly: bool, skip_tpu_ci: bool, omni_skip: str
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if not step_path.is_file():
+        raise BootstrapError(f"ERROR: missing step file: {step_path.name}")
+    doc = _yaml().safe_load(step_path.read_text(encoding="utf-8")) or {}
+    file_env, steps = doc.get("env") or {}, copy.deepcopy(doc.get("steps") or [])
+    keys: list[str] = []
+    for step in steps:
+        top_key = step.get("key") if isinstance(step, dict) else None
+        if (
+            not isinstance(step, dict)
+            or "wait" in step
+            or not isinstance(top_key, str)
+            or not top_key
+        ):
+            raise BootstrapError(
+                f"ERROR: step in {step_path.name} lacks a key: {step!r}"
             )
+        for node in [step, *(step.get("steps") or () if "group" in step else ())]:
+            if isinstance(raw_if := node.get("if"), str):
+                if nightly:
+                    raw_if = raw_if.replace('build.env("NIGHTLY")', '"1"')
+                node["if"] = raw_if.replace(
+                    "${SKIP_TPU_CI:-0}", "1" if skip_tpu_ci else "0"
+                )
+            if node is not step or "group" not in step:
+                if file_env:
+                    node["env"] = {**file_env, **(node.get("env") or {})}
+                if node.get("skip") == "${OMNI_IMAGE_SKIP:-}":
+                    node["skip"] = omni_skip
+                    if not omni_skip:
+                        del node["skip"]
+        keys.append(top_key)
+    return steps, keys
 
-    # pipeline_build.yml skips the -omni image build when this is non-empty.
-    # Buildkite rejects the upload if a skip reason is over 70 characters.
-    if "tests" not in requested_lanes:
-        omni_image_skip = (
-            "Only the tests lane uses the -omni image; this build has none."
+
+def render_pipeline(
+    env: Mapping[str, str],
+    *,
+    repo_root: pathlib.Path = _REPO_ROOT,
+    pipelines_path: pathlib.Path | None = None,
+    spec: Mapping[str, Any] | None = None,
+    merged_labels: Sequence[str] = (),
+    conditions: Mapping[str, Callable[[BuildContext], bool]] = CONDITIONS,
+) -> RenderedPipeline:
+    """Pick active files, load steps, wire `depends_on` keys, and apply priority/cap."""
+    ctx = dataclasses.replace(
+        BuildContext.from_env(env), merged_labels=tuple(merged_labels)
+    )
+    priority_plan = plan_priority(ctx)
+    spec = spec or load_pipeline_spec(
+        ctx.pipeline_slug, pipelines_path or (repo_root / DEFAULT_PIPELINES_FILE)
+    )
+    conds = {name: bool(fn(ctx)) for name, fn in conditions.items()}
+    all_files: dict[str, Any] = spec["files"]
+    if ctx.ci_variant and ctx.ci_variant not in spec["variants"]:
+        known = ", ".join(spec["variants"]) or "none"
+        raise BootstrapError(
+            f"ERROR: unknown CI_VARIANT {ctx.ci_variant!r}; variants: {known}"
         )
-    elif skip_tpu_ci:
-        omni_image_skip = "Only TPU steps use the -omni image; skip-tpu-ci skips them."
-    else:
-        omni_image_skip = ""
+    variant_set = set(spec["variants"][ctx.ci_variant]) if ctx.ci_variant else None
 
-    return UploadPlan(
+    # 1. Pick uploaded files (conditions + optional CI_VARIANT subset).
+    selected: dict[str, list[str]] = {}
+    for fname, raw_cfg in all_files.items():
+        cfg = {} if raw_cfg is None else raw_cfg
+        if not isinstance(cfg, dict) or (
+            set(cfg) - {"depends_on", "run_if", "skip_if"}
+        ):
+            raise BootstrapError(f"ERROR: invalid config on {fname}: {cfg!r}")
+        deps = _wanted_deps(cfg.get("depends_on"), all_files, conds, fname)
+        if (variant_set is None or fname in variant_set) and _is_active(
+            cfg, conds, fname
+        ):
+            selected[fname] = deps
+
+    # pipeline_build.yml skips -omni when set (Buildkite caps skip reasons at 70 chars).
+    nightly, skip_tpu_ci = bool(conds.get("full-suite")), bool(conds.get("skip-tpu"))
+    omni_skip = (
+        "Only TPU steps use the -omni image; skip-tpu-ci skips them."
+        if skip_tpu_ci
+        else (
+            "Only the tests lane uses the -omni image; this build has none."
+            if "pipeline_tests.yml" not in selected
+            else ""
+        )
+    )
+
+    # 2. Load each selected step file.
+    loaded, file_keys = {}, {}
+    for fname in selected:
+        loaded[fname], file_keys[fname] = _load_step_file(
+            repo_root / ".buildkite" / fname,
+            nightly=nightly,
+            skip_tpu_ci=skip_tpu_ci,
+            omni_skip=omni_skip,
+        )
+
+    # 3. Add depends_on = top-level keys of uploaded dependency files (drop unuploaded).
+    steps: list[dict[str, Any]] = []
+    edges = {f: tuple(d for d in ds if d in file_keys) for f, ds in selected.items()}
+    for fname, active_deps in edges.items():
+        dep_keys = [k for d in active_deps for k in file_keys[d]]
+        for step in loaded[fname]:
+            if dep_keys:
+                raw = step.get("depends_on")
+                cur = (
+                    []
+                    if raw is None
+                    else ([raw] if isinstance(raw, str) else list(raw))
+                )
+                seen = {d["step"] if isinstance(d, dict) else d for d in cur}
+                if merged := cur + [k for k in dep_keys if k not in seen]:
+                    step["depends_on"] = merged
+            steps.append(step)
+
+    # 4. Apply job priority and per-author PR TPU concurrency cap.
+    if priority_plan.pr_tpu_concurrency_group:
+        cap_pr_tpu_concurrency.cap(
+            steps, priority_plan.pr_tpu_concurrency_group, ctx.pr_tpu_jobs_per_author
+        )
+
+    notes: list[tuple[str, str]] = []
+    if ctx.is_pr and "run-full-ci" in ctx.pr_labels:
+        notes.append(
+            ("full-ci", "Runs the full (nightly) suite (`run-full-ci` label).")
+        )
+    elif (
+        not nightly
+        and ctx.is_pr
+        and "run-perf-eval" in ctx.pr_labels
+        and not ctx.ci_variant
+    ):
+        notes.append(("perf-eval", "Runs the perf/eval lane (`run-perf-eval` label)."))
+    if skip_tpu_ci:
+        notes.append(
+            (
+                "skip-tpu-ci",
+                "TPU steps not run (`skip-tpu-ci` label); the CPU steps still run.",
+            )
+        )
+    cond_str = ", ".join(f"`{k}={str(v).lower()}`" for k, v in conds.items())
+    files_str = ", ".join(f"`{f}`" for f in file_keys) or "none"
+    edges_str = (
+        ", ".join(f"`{f} -> {', '.join(ds)}`" for f, ds in edges.items() if ds)
+        or "none"
+    )
+    notes.append(
+        (
+            "pipeline-graph",
+            f"**Pipeline:** `{spec['slug']}`\n**Conditions:** {cond_str}\n"
+            f"**Files:** {files_str}\n**Edges:** {edges_str}",
+        )
+    )
+    return RenderedPipeline(
+        document={"priority": priority_plan.job_priority, "steps": steps},
+        files=tuple(file_keys),
+        edges=edges,
         nightly=nightly,
         skip_tpu_ci=skip_tpu_ci,
-        lanes=requested_lanes,
-        lane_files=tuple(lane_files),
-        build_file=".buildkite/pipeline_build.yml",
-        omni_image_skip=omni_image_skip,
-        pre_lane_annotations=tuple(pre_annotations),
-        post_lane_annotations=tuple(post_annotations),
-        invalid_ci_lanes_error=invalid_error,
-        missing_ci_lanes_error=missing_error,
+        omni_image_skip=omni_skip,
+        annotations=tuple(Annotation("info", k, b) for k, b in notes),
     )
+
+
+def dump_pipeline(doc: Mapping[str, Any]) -> str:
+    """Serialize a rendered pipeline dict as YAML without aliases."""
+    yaml = _yaml()
+    dumper = type(
+        "_NoAliasDumper",
+        (yaml.SafeDumper,),
+        {"ignore_aliases": lambda self, data: True},
+    )
+    return str(yaml.dump(dict(doc), Dumper=dumper, sort_keys=False))
 
 
 # ---------------------------------------------------------------------------
@@ -572,9 +762,7 @@ class BootstrapEffects:
     def __init__(
         self,
         repo_root: pathlib.Path = _REPO_ROOT,
-        credential_helper: pathlib.Path = pathlib.Path(
-            "/etc/buildkite-agent/git-credential-github-app"
-        ),
+        credential_helper: pathlib.Path = GITHUB_APP_CREDENTIAL_HELPER,
         credential_timeout: float = 10.0,
         github_api_url: str = GITHUB_API_BASE_URL,
     ) -> None:
@@ -769,13 +957,17 @@ class BootstrapEffects:
 def run_bootstrap(
     env: Mapping[str, str] | None = None,
     *,
+    pipeline_slug: str | None = None,
     repo_root: pathlib.Path = _REPO_ROOT,
     effects: BootstrapEffects | None = None,
 ) -> int:
     """Execute the full Buildkite bootstrap flow and return an exit status."""
     child_env = dict(os.environ if env is None else env)
+    if pipeline_slug is not None:
+        child_env["BUILDKITE_PIPELINE_SLUG"] = pipeline_slug
     effects = BootstrapEffects(repo_root=repo_root) if effects is None else effects
     ctx = BuildContext.from_env(child_env)
+    spec = load_pipeline_spec(ctx.pipeline_slug, repo_root / DEFAULT_PIPELINES_FILE)
 
     print("--- Determining job priority", file=sys.stderr)
     priority_plan = plan_priority(ctx)
@@ -821,7 +1013,7 @@ def run_bootstrap(
         print("Code files changed. Proceeding with pipeline upload.")
 
     print("--- Starting Buildkite Bootstrap")
-    if ctx.is_integration:
+    if spec["vllm_ref"] == "head":
         base_vllm_hash = effects.vllm_upstream_head(env=child_env)
     else:
         base_vllm_hash = read_pinned_vllm_commit(repo_root)
@@ -832,80 +1024,28 @@ def run_bootstrap(
     effects.set_metadata("VLLM_COMMIT_HASH", vllm_commit_hash, env=child_env)
     print(f"Using vLLM commit: {vllm_commit_hash}")
 
-    # Since Buildkite prepends uploaded steps (inserts in reverse order),
-    # uploading the test steps first and build steps last ensures they are
-    # displayed and queued in correct order: Build -> Tests.
-    if ctx.is_integration:
-        # Upload promote step FIRST so Buildkite places it LAST after test steps.
-        print("Uploading Promotion Pipeline Fragment")
-        upload_with_priority(
-            ".buildkite/pipeline_promote.yml",
-            repo_root=repo_root,
-            job_priority=priority_plan.job_priority,
-            nightly=ctx.nightly_env,
-            pr_tpu_concurrency_group=priority_plan.pr_tpu_concurrency_group,
-            pr_tpu_jobs_per_author=ctx.pr_tpu_jobs_per_author,
-            env=child_env,
-            effects=effects,
-        )
-
     merged_labels: tuple[str, ...] = ()
     if ctx.is_post_merge_webhook:
         pr_num = parse_merged_pr_number(ctx.message)
         if pr_num is not None:
             merged_labels = effects.merged_pr_labels(pr_num, env=child_env)
 
-    existing_lanes = {
-        f".buildkite/pipeline_{lane}.yml"
-        for lane in ALL_LANES
-        if (repo_root / f".buildkite/pipeline_{lane}.yml").is_file()
-    }
-    upload_plan = plan_uploads(
-        ctx,
-        merged_labels=merged_labels,
-        existing_lane_files=existing_lanes,
+    rendered = render_pipeline(
+        child_env, repo_root=repo_root, spec=spec, merged_labels=merged_labels
     )
-
-    if upload_plan.nightly:
+    if rendered.nightly:
         child_env["NIGHTLY"] = "1"
-    child_env["SKIP_TPU_CI"] = "1" if upload_plan.skip_tpu_ci else "0"
-    for annotation in upload_plan.pre_lane_annotations:
+    child_env["SKIP_TPU_CI"] = "1" if rendered.skip_tpu_ci else "0"
+    child_env["OMNI_IMAGE_SKIP"] = rendered.omni_image_skip
+    for annotation in rendered.annotations:
         effects.annotate(annotation, env=child_env)
 
-    if upload_plan.invalid_ci_lanes_error is not None:
-        raise BootstrapError(upload_plan.invalid_ci_lanes_error)
-
-    for lane_file in upload_plan.lane_files:
-        print(f"Uploading {lane_file}")
-        upload_with_priority(
-            lane_file,
-            repo_root=repo_root,
-            job_priority=priority_plan.job_priority,
-            nightly=upload_plan.nightly,
-            pr_tpu_concurrency_group=priority_plan.pr_tpu_concurrency_group,
-            pr_tpu_jobs_per_author=ctx.pr_tpu_jobs_per_author,
-            env=child_env,
-            effects=effects,
-        )
-
-    if upload_plan.missing_ci_lanes_error is not None:
-        raise BootstrapError(upload_plan.missing_ci_lanes_error)
-    for annotation in upload_plan.post_lane_annotations:
-        effects.annotate(annotation, env=child_env)
-
-    child_env["OMNI_IMAGE_SKIP"] = upload_plan.omni_image_skip
-    print("Uploading Build Pipeline")
-    upload_with_priority(
-        upload_plan.build_file,
-        repo_root=repo_root,
-        job_priority=priority_plan.job_priority,
-        nightly=upload_plan.nightly,
-        pr_tpu_concurrency_group=priority_plan.pr_tpu_concurrency_group,
-        pr_tpu_jobs_per_author=ctx.pr_tpu_jobs_per_author,
-        env=child_env,
-        effects=effects,
+    print(
+        f"--- :pipeline: Uploading pipeline with priority {priority_plan.job_priority}"
     )
-
+    effects.upload_pipeline(
+        dump_pipeline(rendered.document), no_interpolation=False, env=child_env
+    )
     print("--- Buildkite Bootstrap Finished")
     return 0
 
@@ -954,6 +1094,25 @@ def run_bootstrap_dev(
     return 0
 
 
+def _parse_main_args(args: Sequence[str]) -> tuple[str, str | None]:
+    """Parse CLI arguments into `(mode, pipeline_slug)` without importing PyYAML."""
+    if not args:
+        return "ci", None
+    if args == ["dev"]:
+        return "dev", None
+    if args == ["vllm-pin"]:
+        return "vllm-pin", None
+    if len(args) == 2 and args[0] == "--pipeline" and args[1]:
+        return "ci", args[1]
+    if (
+        len(args) == 1
+        and args[0].startswith("--pipeline=")
+        and (slug := args[0].removeprefix("--pipeline="))
+    ):
+        return "ci", slug
+    raise BootstrapError("Usage: bootstrap.py [--pipeline <slug> | dev | vllm-pin]")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(line_buffering=True)
@@ -962,15 +1121,14 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     args = list(sys.argv[1:] if argv is None else argv)
     try:
-        if not args:
-            rc = run_bootstrap()
-        elif args == ["dev"]:
+        mode, slug = _parse_main_args(args)
+        if mode == "ci":
+            rc = run_bootstrap(pipeline_slug=slug)
+        elif mode == "dev":
             rc = run_bootstrap_dev()
-        elif args == ["vllm-pin"]:
+        else:
             print(read_pinned_vllm_commit(_REPO_ROOT))
             rc = 0
-        else:
-            raise BootstrapError("Usage: bootstrap.py [dev | vllm-pin]")
     except BootstrapError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
