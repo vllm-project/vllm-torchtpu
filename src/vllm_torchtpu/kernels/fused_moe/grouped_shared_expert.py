@@ -90,7 +90,8 @@ def blocked_down_fused(
     per row exactly as there, and each output tile (at most `block_m` rows by
     `block_n` columns) runs all `blocks` slice matmuls and their f32 sum in
     VMEM. Rows split into equal tiles of a multiple of 32 (fp8's sublane
-    tile), the last padded with zero rows when `m` does not divide."""
+    tile), the last padded with zero rows (zero activations and scales, sliced
+    off) when `m` does not divide."""
     blocks, n = s2.shape
     m, k = act.shape
     kb = k // blocks
@@ -100,6 +101,8 @@ def blocked_down_fused(
             f"blocked_down_fused: act {act.shape}, w2 {w2.shape}, s2 {s2.shape}, "
             f"block_n {block_n}"
         )
+    if m == 0:
+        return jnp.zeros((0, n), act.dtype)
     tiles = pl.cdiv(m, block_m)
     tm = m if tiles == 1 else pl.cdiv(pl.cdiv(m, tiles), 32) * 32
     parts = [
