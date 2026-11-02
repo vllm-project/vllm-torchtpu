@@ -303,6 +303,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
+    VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS: bool = False
     VLLM_TPU_DETOK_PRIME_TOKENS: int = 32
     VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
     VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS: int = 0
@@ -2209,6 +2210,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Token budget of that cache (~12 B/token: id pointers plus piece text).
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
+    ),
+    # Encode that cache's missed pieces with fastokens, which reads the same
+    # tokenizer file and returns the same ids, instead of the HF batch encode.
+    "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS": env_bool(
+        "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS"
     ),
     # API server: prime the detokenizer with this many prompt-tail tokens; 0 = off.
     "VLLM_TPU_DETOK_PRIME_TOKENS": env_int("VLLM_TPU_DETOK_PRIME_TOKENS", 32),
