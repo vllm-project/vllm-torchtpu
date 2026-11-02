@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SP_MICROBATCH_OVERLAP: bool = False
     VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF: bool = False
     VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN: bool = False
+    QWEN4_EXP_MAX_STEP_TOKENS: int = 8192
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -1614,6 +1615,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # there, and recomputes the few rows of A it needs. Tiles, internal prefill
     # checkpoints and states then match the whole step's.
     "VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN": env_bool("VLLM_TPU_SP_MICROBATCH_FOLD_ALIGN"),
+    # Largest --max-num-batched-tokens Qwen4Exp admits. The kernels were sized and
+    # tuned at 8192-token steps; a larger step budget (12288 / 16384) is experimental.
+    "QWEN4_EXP_MAX_STEP_TOKENS": env_int("QWEN4_EXP_MAX_STEP_TOKENS", 8192),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
