@@ -129,40 +129,43 @@ def make_layer_weights(mesh, key):
     projections, o_proj / W_UV sharded by heads (TP)."""
     rep, shd = NamedSharding(mesh, P()), NamedSharding(mesh, P(AX))
     dcp = mesh.devices.size
-    ks = iter(jax.random.split(key, 16))
 
     def fp8(k, n_in, n_out):
-        w = (jax.random.normal(k, (n_in, n_out), jnp.float32) * 48).astype(FP8)
-        s = jax.random.uniform(k, (n_out,), jnp.float32, 0.5, 1.5) / (48 * n_in**0.5)
+        kw, ks = jax.random.split(k)
+        w = (jax.random.normal(kw, (n_in, n_out), jnp.float32) * 48).astype(FP8)
+        s = jax.random.uniform(ks, (n_out,), jnp.float32, 0.5, 1.5) / (48 * n_in**0.5)
         return w, s
 
-    def replicated():
-        w = {}
-        w["qkv"] = fp8(next(ks), HID, QKV)
-        w["kw"] = fp8(next(ks), HID, KW)
-        w["qb"] = fp8(next(ks), QL, HEADS * (NOPE + ROPE))
-        w["qbi"] = fp8(next(ks), QL, IDXH * IDXD)
-        w["qn"] = jax.random.uniform(next(ks), (QL,), jnp.float32, 0.5, 1.5)
-        w["kvn"] = jax.random.uniform(next(ks), (KVL,), jnp.float32, 0.5, 1.5)
-        w["kn"] = jax.random.uniform(next(ks), (2, IDXD), jnp.float32, 0.5, 1.5)
-        w["uk"] = (jax.random.normal(next(ks), (HEADS, NOPE, KVL)) * NOPE**-0.5).astype(
-            jnp.bfloat16
-        )
-        return w
+    def replicated(key):
+        ks = jax.random.split(key, 8)
+        return {
+            "qkv": fp8(ks[0], HID, QKV),
+            "kw": fp8(ks[1], HID, KW),
+            "qb": fp8(ks[2], QL, HEADS * (NOPE + ROPE)),
+            "qbi": fp8(ks[3], QL, IDXH * IDXD),
+            "qn": jax.random.uniform(ks[4], (QL,), jnp.float32, 0.5, 1.5),
+            "kvn": jax.random.uniform(ks[5], (KVL,), jnp.float32, 0.5, 1.5),
+            "kn": jax.random.uniform(ks[6], (2, IDXD), jnp.float32, 0.5, 1.5),
+            "uk": (jax.random.normal(ks[7], (HEADS, NOPE, KVL)) * NOPE**-0.5).astype(
+                jnp.bfloat16
+            ),
+        }
 
-    def sharded():
-        uv = (jax.random.normal(next(ks), (HEADS, KVL, VH)) * KVL**-0.5).astype(
+    def sharded(key):
+        ks = jax.random.split(key, 3)
+        uv = (jax.random.normal(ks[0], (HEADS, KVL, VH)) * KVL**-0.5).astype(
             jnp.bfloat16
         )
-        wo, _ = fp8(next(ks), HEADS * VH, HID)
+        wo, _ = fp8(ks[1], HEADS * VH, HID)
         # Per-rank per-channel scale, as each TP shard is requantized.
-        so = jax.random.uniform(next(ks), (dcp, HID), jnp.float32, 0.5, 1.5) / (
+        so = jax.random.uniform(ks[2], (dcp, HID), jnp.float32, 0.5, 1.5) / (
             48 * (HEADS * VH) ** 0.5
         )
         return {"uv": uv, "o": wo, "so": so}
 
-    w = jax.jit(replicated, out_shardings=rep)()
-    w.update(jax.jit(sharded, out_shardings=shd)())
+    k_rep, k_shd = jax.random.split(key)
+    w = jax.jit(replicated, out_shardings=rep)(k_rep)
+    w.update(jax.jit(sharded, out_shardings=shd)(k_shd))
     return w
 
 
@@ -368,13 +371,19 @@ def make_caches(st, md, key):
         _smap(write, mesh, (P(AX),) * 3 + (P(),) * 6, (P(AX),) * 3),
         donate_argnums=(0, 1, 2),
     )
+    rng = np.random.default_rng(int(jax.random.randint(key, (), 0, 2**30)))
     for start in range(0, st.prefix, PREFIX_PIECE):
         end = min(start + PREFIX_PIECE, st.prefix)
         n = end - start
-        k1, k2, k3, key = jax.random.split(key, 4)
-        kv = (jax.random.normal(k1, (n, KVL)) * 2).astype(FP8)
-        kpe = (jax.random.normal(k2, (n, ROPE)) * 2).astype(FP8)
-        kp = quant_index_k(jax.random.normal(k3, (n, IDXD)))
+        # Host values, the same on every process (inputs replicate).
+        kv = np.asarray((rng.standard_normal((n, KVL)) * 2).astype(np.float32))
+        kv = np.asarray(jnp.asarray(kv).astype(FP8))
+        kpe = np.asarray(
+            jnp.asarray(rng.standard_normal((n, ROPE)) * 2, jnp.float32).astype(FP8)
+        )
+        kp = np.asarray(
+            quant_index_k(jnp.asarray(rng.standard_normal((n, IDXD)), jnp.float32))
+        )
         sl = np.zeros(MAX_REQS, np.int32)
         sl[0] = end
         cu = np.full(MAX_REQS + 1, n, np.int32)
