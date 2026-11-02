@@ -3289,6 +3289,25 @@ class TestTPURaidenConnectorWorker:
             parallelism=8,
         )
 
+    @pytest.mark.parametrize(("streams", "expected"), ((0, 8), (1, 1), (4, 4), (16, 8)))
+    def test_stage3_manager_streams_follow_transfer_streams_env(self, streams, expected):
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=True, dp_size=1, pcp_size=8
+        )
+        worker._local_raiden_transfer_rank = MagicMock(return_value=3)
+        engine = _FakeAdmissionRaidenEngine()
+        worker._new_raiden_manager = MagicMock(return_value=engine)
+
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_STREAMS", streams, create=True),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=12.0),
+        ):
+            worker._construct_raiden_transfer_engine([object()], num_slots=1)
+
+        assert worker._new_raiden_manager.call_args.kwargs["parallelism"] == expected
+
     @pytest.mark.parametrize("transfer_rank", (0, 3, 7))
     def test_stage3_gdn_registration_declares_every_pcp_head_shard(self, transfer_rank):
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import PoolByteSpan

@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
+    TPU_RAIDEN_TRANSFER_STREAMS: int = 0
     TPU_RAIDEN_DST_SHARDS: int | None = None
     TPU_RAIDEN_POOL_TAGS_PER_LAYER: bool = False
     TPU_RAIDEN_MAX_TRANSFER_TOKENS: int | None = None
@@ -585,6 +586,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_ENGINE_ID": lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
     "TPU_RAIDEN_TRANSFER_PARALLELISM": lambda: int(
         os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"
+    ),
+    # TCP streams each producer rank opens per (pool, peer) push. 0 (default)
+    # keeps the historical coupling to TPU_RAIDEN_TRANSFER_PARALLELISM (one
+    # stream per source rank); a positive value is clamped to that parallelism.
+    # The source store applies the same value when it plans a transfer, so
+    # export it on the producer role.
+    "TPU_RAIDEN_TRANSFER_STREAMS": env_nonnegative_int(
+        "TPU_RAIDEN_TRANSFER_STREAMS", 0
     ),
     # TP shards in one decode engine, not its DP replica count. Configure
     # both roles alike; the producer uses this to route head-sharded state.
