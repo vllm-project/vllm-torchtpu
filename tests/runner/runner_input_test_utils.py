@@ -26,9 +26,18 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
 class _BlockTable:
-    def __init__(self, table: torch.Tensor):
+    def __init__(
+        self,
+        table: torch.Tensor,
+        num_blocks_per_row: np.ndarray | None = None,
+    ):
         self._table = table
         self.max_num_blocks_per_req = table.shape[1]
+        self.num_blocks_per_row = (
+            num_blocks_per_row
+            if num_blocks_per_row is not None
+            else np.full(table.shape[0], table.shape[1], dtype=np.int32)
+        )
 
     def get_cpu_tensor(self):
         return self._table
@@ -127,6 +136,14 @@ def _make_runner(
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None
     runner._h2d_reuse = {}
+    runner._static_decode_tracker = None
+    runner._pending_static_verify = None
+    runner._last_step_used_static_decode = False
+    runner._num_static_verify_reqs = 0
+    runner._pre_async_results = None
+    runner.requests = {}
+    runner.attn_groups = []
+    runner.num_reqs_paddings = [max_num_reqs]
     runner._upload_unless_unchanged = types.MethodType(
         TPUModelRunner._upload_unless_unchanged, runner
     )
@@ -169,7 +186,8 @@ def _make_runner(
     if uses_mrope:
 
         def make_buffer(rows, cols, *, dtype):
-            return SimpleNamespace(cpu=torch.zeros((rows, cols), dtype=dtype))
+            buf_cpu = torch.zeros((rows, cols), dtype=dtype)
+            return SimpleNamespace(cpu=buf_cpu, np=buf_cpu.numpy())
 
         runner._make_buffer = make_buffer
         runner.mrope_positions = make_buffer(3, max_num_tokens + 1, dtype=torch.int32)
@@ -192,6 +210,7 @@ def _make_runner(
 
     pages_per_req = max(4, (max(prompt_tokens) + block_size - 1) // block_size)
     block_tables = torch.zeros((num_reqs, pages_per_req), dtype=torch.int32)
+    num_blocks_per_row = np.zeros(num_reqs, dtype=np.int32)
     next_block = 0
     for req_idx, seq_len in enumerate(prompt_tokens):
         num_blocks = (
@@ -202,6 +221,7 @@ def _make_runner(
         block_tables[req_idx, :num_blocks] = torch.arange(
             next_block, next_block + num_blocks, dtype=torch.int32
         )
+        num_blocks_per_row[req_idx] = num_blocks
         next_block += num_blocks
 
     input_batch = SimpleNamespace(
@@ -212,7 +232,7 @@ def _make_runner(
         num_prompt_tokens=np.asarray(prompt_tokens, dtype=np.int32),
         token_ids_cpu=token_ids_cpu.numpy(),
         token_ids_cpu_tensor=token_ids_cpu,
-        block_table=[_BlockTable(block_tables)],
+        block_table=[_BlockTable(block_tables, num_blocks_per_row=num_blocks_per_row)],
     )
     runner.input_batch = input_batch
 
@@ -267,4 +287,11 @@ def _scheduler_output(scheduled_tokens):
             f"req{i}": int(n) for i, n in enumerate(scheduled_tokens)
         },
         scheduled_spec_decode_tokens={},
+        scheduled_new_reqs=[],
+        finished_req_ids=set(),
+        kv_cache_block_copies=None,
+        scheduled_cached_reqs=SimpleNamespace(
+            resumed_req_ids=set(),
+            new_block_ids=[],
+        ),
     )
