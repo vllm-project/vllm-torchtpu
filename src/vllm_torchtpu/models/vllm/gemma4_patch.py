@@ -543,14 +543,20 @@ def _token_order(rows: torch.Tensor, plan: Any) -> torch.Tensor:
 def _vocab_shard_embedding(embed: Any, input_ids: torch.Tensor) -> torch.Tensor:
     """VocabParallelEmbedding.forward before its all-reduce: the rows of this
     rank's vocab shard, zero for ids outside it."""
-    shard = embed.shard_indices
+    # The shard bounds as the TPU forward reads them: the buffers the platform
+    # registers (_patch_vllm_vocab_parallel_embedding) where they exist.
+    bounds = [
+        getattr(embed, name, getattr(embed.shard_indices, name))
+        for name in (
+            "org_vocab_start_index",
+            "org_vocab_end_index",
+            "num_org_vocab_padding",
+            "added_vocab_start_index",
+            "added_vocab_end_index",
+        )
+    ]
     ids, outside = vocab_parallel_embedding.get_masked_input_and_mask(
-        input_ids,
-        shard.org_vocab_start_index,
-        shard.org_vocab_end_index,
-        shard.num_org_vocab_padding,
-        shard.added_vocab_start_index,
-        shard.added_vocab_end_index,
+        input_ids, *bounds
     )
     rows = embed.quant_method.embedding(embed, ids.long())
     return rows.masked_fill(outside.unsqueeze(-1), 0)

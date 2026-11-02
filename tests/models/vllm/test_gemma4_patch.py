@@ -914,6 +914,28 @@ def _vocab_shard(embedding: torch.Tensor, rank: int, world: int) -> SimpleNamesp
     )
 
 
+def test_vocab_shard_embedding_reads_registered_bounds() -> None:
+    """Shard bounds come from the TPU platform's buffers where it registers them."""
+    embedding = torch.randn(16, 4)
+    shard = _vocab_shard(embedding, 1, 4)  # ints say rows [4, 8)
+    ids = torch.tensor([0, 5, 9, 15])
+    torch.testing.assert_close(
+        gemma4_patch._vocab_shard_embedding(shard, ids),
+        torch.stack(
+            [embedding[0] * 0, embedding[5], embedding[0] * 0, embedding[0] * 0]
+        ),
+    )
+    shard.org_vocab_start_index = torch.tensor(8)  # buffers say rows [8, 12)
+    shard.org_vocab_end_index = torch.tensor(12)
+    shard.weight = embedding[8:12]
+    torch.testing.assert_close(
+        gemma4_patch._vocab_shard_embedding(shard, ids),
+        torch.stack(
+            [embedding[0] * 0, embedding[0] * 0, embedding[9], embedding[0] * 0]
+        ),
+    )
+
+
 def _replica(model: _Model, index: int) -> SimpleNamespace:
     """The projections of one layer, whole, as Gemma4ProjectionReplica holds them."""
     lw = model.layer_weights[index]
