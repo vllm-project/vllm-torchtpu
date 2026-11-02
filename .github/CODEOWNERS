@@ -46,6 +46,11 @@
 /tests/layers/adapter/ @kyuyeunk @qizzzh @Nanfang-Li
 /tests/layers/core/ @kyuyeunk @qizzzh @Nanfang-Li
 
+# FlyWheel attention backend (--attention-backend flywheel)
+/src/vllm_torchtpu/layers/*/flywheel_*.py @kyuyeunk @qizzzh @Nanfang-Li @lk-chen
+/tests/layers/*/test_flywheel_*.py @kyuyeunk @qizzzh @Nanfang-Li @lk-chen
+/tests/entrypoints/llm/test_flywheel_*.py @qizzzh @angelayi @colin2328 @QiliangCui @caojx-google @Nanfang-Li @yinlin09 @mrjunwan-lang @maxwillzq @lk-chen
+
 # Model Implementations and wrappers
 /src/vllm_torchtpu/models/ @kyuyeunk @qizzzh @Nanfang-Li
 /tests/models/ @kyuyeunk @qizzzh @Nanfang-Li

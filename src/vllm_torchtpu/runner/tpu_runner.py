@@ -25,7 +25,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
@@ -118,6 +118,10 @@ from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasAttentionBackend,
     PallasAttentionBackendImpl,
+)
+from vllm_torchtpu.layers.adapter.attention_backend import (
+    HostStepInputs,
+    create_attention_backend,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     static_verify_q_len,
@@ -741,6 +745,8 @@ class TPUModelRunner(GPUModelRunner):
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
         self.sequence_layout_planner = sequence_layout_planner
+        # The selected attention backend's per-step metadata hooks, if any.
+        self.attention_backend = create_attention_backend(vllm_config)
         _validate_libtpu_version()
         self.is_pooling_model = (
             self.model_config is not None and self.model_config.runner_type == "pooling"
@@ -1721,6 +1727,36 @@ class TPUModelRunner(GPUModelRunner):
                 for layer_name in group.layer_names:
                     per_layer_attn_metadata[layer_name] = built
         return per_layer_attn_metadata, None
+
+    def _attention_kernel_page_sizes(self) -> dict[int, int]:
+        """Tokens per kernel page of each attention KV cache group, by group
+        id: the block size of the spec its metadata builder was given."""
+        page_sizes = {}
+        for group_list in self.attn_groups:
+            for group in group_list:
+                spec = group.metadata_builders[0].kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.first_spec
+                if isinstance(spec, AttentionSpec):
+                    page_sizes[group.kv_cache_group_id] = spec.block_size
+        return page_sizes
+
+    def _upload_backend_metadata(
+        self, metadata: Mapping[int, tuple[np.ndarray, ...]]
+    ) -> dict[int, tuple[torch.Tensor, ...]]:
+        """The attention backend's per-step host arrays on the device, reusing
+        an upload whose values have not changed (every decode step's)."""
+        return {
+            gid: type(arrays)(
+                *(
+                    self._upload_unless_unchanged(
+                        f"attention_backend_{gid}_{i}", torch.from_numpy(array)
+                    )
+                    for i, array in enumerate(arrays)
+                )
+            )
+            for gid, arrays in metadata.items()
+        }
 
     def build_attention_metadata_for_layers(
         self,
@@ -3443,6 +3479,28 @@ class TPUModelRunner(GPUModelRunner):
             mamba_request_distribution = combined_device[3:6]
         assert request_distribution is not None
 
+        backend_metadata = None
+        if self.attention_backend.has_step_metadata:
+            page_sizes = self._attention_kernel_page_sizes()
+            host_metadata = self.attention_backend.prepare_step(
+                HostStepInputs(
+                    num_decode=max(0, min(rpa_num_decode_reqs - start_index, num_reqs)),
+                    query_start_loc=self.query_start_loc_np[: num_reqs + 1],
+                    seq_lens=self.seq_lens_np[:num_reqs],
+                    block_tables={
+                        gid: self.input_batch.block_table[gid].get_numpy_array()[
+                            start_index : start_index + num_reqs
+                        ]
+                        for gid in page_sizes
+                    },
+                    page_sizes=page_sizes,
+                    num_tokens=local_padded_total_num_scheduled_tokens,
+                    max_num_seqs=target_num_reqs,
+                    max_num_tokens=self.max_num_tokens,
+                )
+            )
+            backend_metadata = self._upload_backend_metadata(host_metadata)
+
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -3463,6 +3521,7 @@ class TPUModelRunner(GPUModelRunner):
                 else None
             ),
             sequence_layout_descriptor=layout_plan.descriptor,
+            backend_metadata=backend_metadata,
         )
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
@@ -5920,6 +5979,17 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
+                backend_metadata=(
+                    self._upload_backend_metadata(
+                        self.attention_backend.warmup_metadata(
+                            self._attention_kernel_page_sizes(),
+                            max_num_seqs=num_reqs,
+                            max_num_tokens=self.max_num_tokens,
+                        )
+                    )
+                    if self.attention_backend.has_step_metadata
+                    else None
+                ),
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (

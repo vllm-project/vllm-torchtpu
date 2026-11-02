@@ -50,6 +50,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.layers.adapter.attention_backend import create_attention_backend
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -127,6 +128,7 @@ def gdn_attention_core_tpu(
     d_v: int,
     kernel_size: int,
     num_spec_tokens: int = 0,
+    conv1d_gdn_kernel: Callable[..., Any] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # Speculative decoding: vLLM's MambaSpec widens the conv state by
     # `num_spec` columns per slot. The extra columns are unused on TPU
@@ -162,6 +164,7 @@ def gdn_attention_core_tpu(
         kernel_size=kernel_size,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        conv1d_gdn_kernel=conv1d_gdn_kernel,
     )
     if state_len > kernel_size - 1:
         # Write the kernel result into the first kernel_size - 1 columns of the
@@ -651,6 +654,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 d_v=self.head_v_dim,
                 kernel_size=self.conv_kernel_size,
                 num_spec_tokens=num_spec_tokens,
+                conv1d_gdn_kernel=(
+                    None
+                    if vllm_context.vllm_config is None
+                    else create_attention_backend(
+                        cast(VllmConfig, vllm_context.vllm_config)
+                    ).conv1d_gdn_kernel()
+                ),
             )
             gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, 4))
 

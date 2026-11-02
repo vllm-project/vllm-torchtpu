@@ -112,6 +112,7 @@ class TestTpuCompilerCache:
             "jax": "1",
             "jaxlib": "1",
             "libtpu": "1",
+            "flywheel-tpu": "1",
         }
         with patch(
             "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",

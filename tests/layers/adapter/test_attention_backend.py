@@ -29,6 +29,16 @@ _TEST_PATH = (
 )
 
 
+class _CheckedBackend(ab.TPUAttentionBackend):
+    checked = 0
+
+    def check_config(self, vllm_config) -> None:
+        type(self).checked += 1
+
+
+_CHECKED_PATH = f"{__name__}.{_CheckedBackend.__qualname__}"
+
+
 @pytest.fixture
 def registered():
     """Register _TEST_BACKEND; afterwards remove it from the registry and from
@@ -36,10 +46,12 @@ def registered():
     AttentionBackendEnum.register keeps it for the process, so the cleanup
     edits Enum's private member tables; otherwise the member leaks into later
     tests."""
-    ab.register_attention_backend(_TEST_BACKEND, vllm_backend=_TEST_PATH)
+    ab.register_attention_backend(
+        _TEST_BACKEND, vllm_backend=_TEST_PATH, attention=_CHECKED_PATH
+    )
     member = AttentionBackendEnum[_TEST_BACKEND.upper()]
     yield member
-    ab._REGISTERED_BACKENDS.remove(_TEST_BACKEND)
+    ab._REGISTERED_BACKENDS.pop(_TEST_BACKEND)
     AttentionBackendEnum._member_map_.pop(member.name)
     AttentionBackendEnum._value2member_map_.pop(member.value)
     AttentionBackendEnum._member_names_.remove(member.name)
@@ -61,7 +73,9 @@ def test_register_adds_an_enum_member(registered):
 
 
 def test_register_again_with_the_same_path_is_a_no_op(registered):
-    ab.register_attention_backend(_TEST_BACKEND, vllm_backend=_TEST_PATH)
+    ab.register_attention_backend(
+        _TEST_BACKEND, vllm_backend=_TEST_PATH, attention=_CHECKED_PATH
+    )
 
     assert AttentionBackendEnum[_TEST_BACKEND.upper()] is registered
 
@@ -75,8 +89,17 @@ def test_register_an_existing_name_at_another_path_raises(registered):
     "backend",
     [None, AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.CUSTOM],
 )
-def test_builtin_choices_are_not_registered(backend):
+def test_builtin_choices_get_the_no_op_runner_backend(backend):
     assert not ab.is_registered_attention_backend(backend)
+    runner_backend = ab.create_attention_backend(_vllm_config(backend))
+    assert type(runner_backend) is ab.TPUAttentionBackend
+    assert not runner_backend.has_step_metadata
+
+
+def test_a_registered_name_gets_its_runner_backend(registered):
+    runner_backend = ab.create_attention_backend(_vllm_config(registered))
+
+    assert isinstance(runner_backend, _CheckedBackend)
 
 
 def test_platform_resolves_a_registered_name_to_its_class(registered):
@@ -157,8 +180,11 @@ def test_check_accepts_forked_or_in_process_engines(registered, monkeypatch, env
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
     monkeypatch.setattr(ab, "is_in_ray_actor", lambda: False)
+    _CheckedBackend.checked = 0
 
     ab.check_attention_backend_config(_vllm_config(registered))
+
+    assert _CheckedBackend.checked == 1
 
 
 def test_check_ignores_the_default_backend(monkeypatch):
