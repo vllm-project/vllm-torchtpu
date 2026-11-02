@@ -1567,3 +1567,15 @@ def test_peer_replay_requires_the_compile_cache(
             _validate_peer_replay_config()
     else:
         _validate_peer_replay_config()
+
+
+@pytest.mark.parametrize("wait", ["-1", "nan", "soon"])
+def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
+    """TPU_PRECOMPILE_PEER_WAIT_S is first read by the precompile, after the
+    model has loaded; the startup check parses it so a typo fails the launch."""
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
+    with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
+        _validate_peer_replay_config()

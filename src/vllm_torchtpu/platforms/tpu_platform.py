@@ -327,6 +327,9 @@ def _validate_peer_replay_config() -> None:
     """
     if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
         return
+    # Parse it now, so a bad value fails the launch rather than the precompile
+    # that reads it after the model has loaded.
+    envs.TPU_PRECOMPILE_PEER_WAIT_S  # noqa: B018
     if vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
         raise ValueError(
             "TPU_PRECOMPILE_PEER_REPLAY=1 needs vLLM's compile cache: peer ranks "
