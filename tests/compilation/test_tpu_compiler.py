@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import json
 import os
 import re
 from pathlib import Path
@@ -145,6 +146,67 @@ class TestTpuCompilerCache:
                 dp4 = compute_tpu_compilation_hash(self._config())
 
         assert dp1 != dp4
+
+    @staticmethod
+    def _hash_with_device_assignment(config, device_ids):
+        """Hash `config` as a world of len(device_ids) ranks whose torch_tpu
+        device assignment is `device_ids`; returns (hash, hashed factors)."""
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.distributed import mesh_utils
+
+        group = SimpleNamespace(world_size=len(device_ids), device_group=object())
+        with (
+            patch.object(
+                tpu_compiler, "_iter_runtime_cache_key_files", return_value=[]
+            ),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch(
+                "vllm.distributed.parallel_state.get_world_group", return_value=group
+            ),
+            patch.object(
+                mesh_utils,
+                "_torch_tpu_device_assignment",
+                return_value=list(device_ids),
+            ),
+            patch.object(tpu_compiler.json, "dumps", wraps=json.dumps) as dumps,
+        ):
+            key = tpu_compiler.compute_tpu_compilation_hash(config)
+        return key, dumps.call_args.args[0]
+
+    def test_tpu_hash_covers_rank_to_device_placement(self):
+        """A mesh or subgroup executable is built for specific devices and a
+        warm start loads it as serialized, so binding ranks to other devices
+        must change the key."""
+        first, factors = self._hash_with_device_assignment(self._config(), (0, 1, 2, 3))
+        again, _ = self._hash_with_device_assignment(self._config(), (0, 1, 2, 3))
+        swapped, _ = self._hash_with_device_assignment(self._config(), (2, 3, 0, 1))
+
+        assert factors["placement"] == (0, 1, 2, 3)
+        assert first == again
+        assert first != swapped
+
+    def test_single_process_hash_has_no_placement_factor(self):
+        """One process adds no factor, so its key is the same as before
+        placement was hashed."""
+        _, factors = self._hash_with_device_assignment(self._config(), (5,))
+
+        assert "placement" not in factors
+
+    def test_placement_fails_closed_without_a_full_assignment(self):
+        """torch_tpu answering with fewer ids than ranks must not silently drop
+        placement from the key."""
+        from vllm_torchtpu.distributed import mesh_utils
+
+        group = SimpleNamespace(world_size=4, device_group=object())
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch(
+                "vllm.distributed.parallel_state.get_world_group", return_value=group
+            ),
+            patch.object(mesh_utils, "_torch_tpu_device_assignment", return_value=[]),
+            pytest.raises(RuntimeError, match="device ids for a world of 4"),
+        ):
+            mesh_utils.world_device_assignment()
 
     def test_runtime_hash_covers_custom_op_boundaries(self):
         from vllm_torchtpu.compilation import tpu_compiler

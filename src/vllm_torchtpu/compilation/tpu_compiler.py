@@ -47,6 +47,7 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed.mesh_utils import world_device_assignment
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -416,7 +417,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     cache_config = vllm_config.cache_config
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
-    factors = {
+    factors: dict[str, Any] = {
         "torch": torch.__version__,
         "torch_tpu": importlib_metadata.version("torch-tpu"),
         "jax": importlib_metadata.version("jax"),
@@ -454,6 +455,12 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             else None,
         },
     }
+    # An executable over a mesh or a process subgroup is compiled for a specific
+    # device assignment, and a warm start loads it as serialized, so ranks bound
+    # to other devices must not reuse it. Single-process keys are unchanged.
+    placement = world_device_assignment()
+    if placement is not None:
+        factors["placement"] = placement
 
     repo_root = Path(__file__).resolve().parents[2]
     hash_obj = hashlib.sha256(
