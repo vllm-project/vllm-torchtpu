@@ -22,6 +22,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
+from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
 
 
 def calculate_col_size(hidden_size: int, packing: int) -> int:
@@ -227,7 +228,7 @@ def ragged_gather_v2(
     if dtype not in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4):
         raise ValueError(f"dtype must be f32, bf16, int8, or int4, but got {dtype}")
 
-    sc_info = pltpu.get_tpu_info().sparse_core
+    sc_info = get_sparse_core_info()
     if sc_info is None:
         return x[indices]
 
