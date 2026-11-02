@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from types import SimpleNamespace
 from unittest import mock
 
@@ -21,11 +33,19 @@ class _FakeHFConfig:
         return out
 
 
-def _make_proposer(hf_dict, num_speculative_tokens=4):
+def _make_proposer(hf_dict, num_speculative_tokens=4, **spec_fields):
+    # The vLLM 0.29 drafting fields at their defaults; tests override them.
+    fields = dict(
+        draft_sample_method="greedy",
+        enable_adaptive_verification=False,
+        dspark_draft_topk=None,
+    )
+    fields.update(spec_fields)
     speculative_config = SimpleNamespace(
         num_speculative_tokens=num_speculative_tokens,
         draft_tensor_parallel_size=1,
         draft_model_config=SimpleNamespace(hf_config=_FakeHFConfig(hf_dict)),
+        **fields,
     )
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config,
@@ -80,16 +100,77 @@ def test_bonus_anchor_keeps_dflash_layout():
     assert p.block_size == 5
 
 
-def test_block_size_guard():
-    with pytest.raises(ValueError, match="block size"):
-        _make_proposer(
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("draft_sample_method", "probabilistic"),
+        ("enable_adaptive_verification", True),
+        ("dspark_draft_topk", 8),
+    ],
+)
+def test_warns_on_unsupported_drafting_options(field, value):
+    with mock.patch("vllm_torchtpu.spec_decode.dspark.logger") as log:
+        p = _make_proposer(
             {
                 "dspark_noise_token_id": 7,
-                "dspark_block_size": 7,
+                "dspark_block_size": 4,
                 **_LAYER_IDS,
             },
-            num_speculative_tokens=4,
+            **{field: value},
         )
+    # Drafting falls back to greedy over the fixed K-token block.
+    assert p.block_size == 4
+    log.warning.assert_called_once()
+    assert "does not support" in log.warning.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "sample_from_anchor,trained_block,K,query_block",
+    [
+        (True, 5, 6, 6),  # DeepSeek-V4-Pro-0813 served at K=6
+        (True, 7, 4, 4),
+        (False, 7, 4, 5),  # bonus-anchor layout keeps 1 + K
+    ],
+)
+def test_k_need_not_match_checkpoint_block(
+    sample_from_anchor, trained_block, K, query_block
+):
+    # The query block follows K whatever block the checkpoint was trained
+    # at; the mismatch is allowed but warned about.
+    hf = {
+        "dspark_noise_token_id": 7,
+        "dspark_block_size": trained_block,
+        "sample_from_anchor": sample_from_anchor,
+        **_LAYER_IDS,
+    }
+    with mock.patch("vllm_torchtpu.spec_decode.dspark.logger") as log:
+        p = _make_proposer(hf, num_speculative_tokens=K)
+    assert p.block_size == query_block
+    log.warning.assert_called_once()
+    assert "trained with block size" in log.warning.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "block_key,sample_from_anchor,trained_block,K",
+    [
+        ("dspark_block_size", True, 4, 4),
+        # Speculators-format checkpoints count the bonus anchor in block_size
+        # and draft block_size - 1 tokens (e.g. dspark_qwen3_8b_block7, K=6).
+        ("block_size", False, 7, 6),
+    ],
+)
+def test_matching_checkpoint_block_does_not_warn(
+    block_key, sample_from_anchor, trained_block, K
+):
+    hf = {
+        "dspark_noise_token_id": 7,
+        block_key: trained_block,
+        "sample_from_anchor": sample_from_anchor,
+        **_LAYER_IDS,
+    }
+    with mock.patch("vllm_torchtpu.spec_decode.dspark.logger") as log:
+        _make_proposer(hf, num_speculative_tokens=K)
+    log.warning.assert_not_called()
 
 
 def test_missing_noise_token():

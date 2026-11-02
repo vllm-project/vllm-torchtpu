@@ -52,3 +52,6 @@ fde6c39944a4234e5c45863311df8ae535b9f598
 
 # Apply ruff format to tpu_connector.py and test_check_regression.py
 f005b9f8e5b708cc17da2ba8155d9f394033cc1a
+
+# Wrap comments and strings longer than 88 characters, format benchmark_serving.py, and enforce E501.
+15e5264aaedb3bb5c76e2e7945529b15ce293d4a

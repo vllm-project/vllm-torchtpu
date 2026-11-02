@@ -1,7 +1,20 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -15,6 +28,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
+
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 type LayerKVCache = torch.Tensor | list[torch.Tensor]
@@ -24,6 +39,13 @@ type LayerKVCache = torch.Tensor | list[torch.Tensor]
 class MaterializedKVCache:
     kv_caches: dict[str, LayerKVCache]
     raw_tensors: list[torch.Tensor]
+    # Maps each unified-pool layer to its backing raw pool tensor; empty when
+    # layers use dedicated per-layer caches.
+    layer_to_raw: dict[str, torch.Tensor] = field(default_factory=dict)
+    # Populated when unified pools are merged into a single block-major pool
+    # (see `vllm_torchtpu.block_major_pool`), in which case `raw_tensors`
+    # contains only that merged pool.
+    bm_pool_layout: BlockMajorPoolLayout | None = None
 
 
 def _storage_ptr(tensor: torch.Tensor) -> int:
@@ -140,11 +162,18 @@ def _pool_attention_geometry(
 
 
 def layer_to_pool_index(kv_cache_config: KVCacheConfig) -> dict[str, int]:
-    """Map native layer-compact placements to independently donated TPU pools.
+    """Maps native vLLM layer placements to disjoint TPU pool region indices.
 
     vLLM's descriptors all describe one backing allocation. The TPU runtime
     owns one native attention tensor per disjoint layer region instead; equal
     byte ranges across cache groups must remain the exact same pool object.
+
+    Supports both placement orders emitted by vLLM and resolves them to the
+    same region index:
+    - Layer-outermost (`block_stride == page_bytes`): each region is a
+      contiguous `num_blocks * page_bytes` span.
+    - Block-outermost (`block_stride == num_regions * page_bytes`): each
+      region occupies a `page_bytes` slot within every scheduler block row.
     """
     page_bytes = max(
         group.kv_cache_spec.page_size_bytes for group in kv_cache_config.kv_cache_groups
@@ -154,18 +183,55 @@ def layer_to_pool_index(kv_cache_config: KVCacheConfig) -> dict[str, int]:
     assert len(sizes) == 1, "KV placements must share one backing allocation"
     backing_bytes = sizes.pop()
     assert backing_bytes % pool_bytes == 0, (backing_bytes, pool_bytes)
+    num_regions = backing_bytes // pool_bytes
     result = {}
     for tensor in kv_cache_config.kv_cache_tensors:
-        assert tensor.block_stride == page_bytes, (
-            "Unified TPU pools require layer-compact pages",
-            tensor,
-        )
+        if tensor.block_stride == page_bytes:
+            region_stride = pool_bytes
+        else:
+            assert tensor.block_stride == num_regions * page_bytes, (
+                "Unified TPU pools require layer-compact or block-compact pages",
+                tensor,
+                page_bytes,
+                num_regions,
+            )
+            region_stride = page_bytes
         for index, name in enumerate(tensor.layers):
             offset = tensor.offset + index * tensor.layer_stride
-            assert offset % pool_bytes == 0, (name, offset, pool_bytes)
-            assert 0 <= offset <= backing_bytes - pool_bytes, (name, tensor)
-            result[name] = offset // pool_bytes
+            assert offset % region_stride == 0, (name, offset, region_stride)
+            region = offset // region_stride
+            assert 0 <= region < num_regions, (name, tensor, num_regions)
+            result[name] = region
     return result
+
+
+def resolve_block_major_pool_layout(
+    kv_cache_config: KVCacheConfig, kernel_block_size: int
+) -> BlockMajorPoolLayout:
+    """Derives the merged block-major pool geometry from `KVCacheConfig` alone.
+
+    Shared by buffer materialization, the KV offload contract, and Raiden
+    pool registration so that the scheduler process (which never allocates
+    device memory) and worker processes agree on exact pool geometry.
+    """
+    spec = next(
+        group.kv_cache_spec
+        for group in kv_cache_config.kv_cache_groups
+        if isinstance(group.kv_cache_spec, AttentionSpec)
+    )
+    assert spec.block_size % kernel_block_size == 0, (
+        spec.block_size,
+        kernel_block_size,
+    )
+    pool_indices = layer_to_pool_index(kv_cache_config)
+    num_pools = len(set(pool_indices.values()))
+    assert set(pool_indices.values()) == set(range(num_pools)), pool_indices
+    return BlockMajorPoolLayout(
+        num_blocks=kv_cache_config.num_blocks,
+        num_pools=num_pools,
+        split=spec.block_size // kernel_block_size,
+        pool_index_by_layer=pool_indices,
+    )
 
 
 def allocate_raw_kv_cache_tensors(
@@ -173,7 +239,8 @@ def allocate_raw_kv_cache_tensors(
     device: torch.device,
     pool_geometry: tuple[AttentionSpec, Any, int],
     cache_dtype: str | torch.dtype = "auto",
-) -> tuple[dict[str, torch.Tensor], list[torch.Tensor]]:
+    block_major: bool = False,
+) -> tuple[dict[str, torch.Tensor], list[torch.Tensor], BlockMajorPoolLayout | None]:
     layer_to_raw: dict[str, torch.Tensor] = {}
     raw_tensors: list[torch.Tensor] = []
     pool_page_bytes = max(
@@ -182,48 +249,61 @@ def allocate_raw_kv_cache_tensors(
     pool_indices = layer_to_pool_index(kv_cache_config)
     pool_bytes = kv_cache_config.num_blocks * pool_page_bytes
     num_pools = kv_cache_config.kv_cache_tensors[0].size // pool_bytes
-    for _ in range(num_pools):
-        # The unified pool is born as the stock attention-shaped KV cache.
-        # Attention consumes it natively; Mamba adapters address their byte
-        # regions inside each manager page without creating typed aliases.
-        spec, attn_backend, kernel_block_size = pool_geometry
-        assert spec.block_size % kernel_block_size == 0, (
-            spec.block_size,
-            kernel_block_size,
-        )
-        split = spec.block_size // kernel_block_size
-        num_blocks = kv_cache_config.num_blocks
-        shape = attn_backend.get_kv_cache_shape(
+    # The unified pool is born as the stock attention-shaped KV cache.
+    # Attention consumes it natively; Mamba adapters address their byte
+    # regions inside each manager page without creating typed aliases.
+    spec, attn_backend, kernel_block_size = pool_geometry
+    assert spec.block_size % kernel_block_size == 0, (
+        spec.block_size,
+        kernel_block_size,
+    )
+    split = spec.block_size // kernel_block_size
+    num_blocks = kv_cache_config.num_blocks
+    region_shape = tuple(
+        attn_backend.get_kv_cache_shape(
             num_blocks * split,
             kernel_block_size,
             spec.num_kv_heads,
             spec.head_size,
             cache_dtype_str=cache_dtype,
         )
-        if spec.dtype in _FP8_DTYPES:
-            raw = torch.empty(tuple(shape), dtype=spec.dtype, device=device)
-        else:
-            raw = torch.zeros(tuple(shape), dtype=spec.dtype, device=device)
-        fa_page_bytes = raw.numel() * raw.element_size() // (num_blocks * split)
-        if fa_page_bytes * split != pool_page_bytes:
-            group_pages = [
-                (
-                    type(g.kv_cache_spec).__name__,
-                    g.kv_cache_spec.block_size,
-                    g.kv_cache_spec.page_size_bytes,
-                )
-                for g in kv_cache_config.kv_cache_groups
-            ]
-            raise AssertionError(
-                f"pool page mismatch: fa_page_bytes={fa_page_bytes} "
-                f"split={split} pool_page_bytes={pool_page_bytes} "
-                f"kernel_block_size={kernel_block_size} "
-                f"pool_shape={tuple(raw.shape)} group_pages={group_pages}"
+    )
+    page_shape = region_shape[1:]
+    fa_page_bytes = math.prod(page_shape) * spec.dtype.itemsize
+    if fa_page_bytes * split != pool_page_bytes:
+        group_pages = [
+            (
+                type(g.kv_cache_spec).__name__,
+                g.kv_cache_spec.block_size,
+                g.kv_cache_spec.page_size_bytes,
             )
+            for g in kv_cache_config.kv_cache_groups
+        ]
+        raise AssertionError(
+            f"pool page mismatch: fa_page_bytes={fa_page_bytes} "
+            f"split={split} pool_page_bytes={pool_page_bytes} "
+            f"kernel_block_size={kernel_block_size} "
+            f"region_shape={region_shape} group_pages={group_pages}"
+        )
+    layout = None
+    if block_major:
+        layout = resolve_block_major_pool_layout(kv_cache_config, kernel_block_size)
+        assert layout.num_pools == num_pools, (layout, num_pools)
+        # Merge all `P` region pools into a single `(num_blocks, P * split, *page)`
+        # allocation where row `b` stores scheduler block `b` across all regions
+        # contiguously (see `vllm_torchtpu.block_major_pool`).
+        shapes = [(num_blocks, num_pools * split) + page_shape]
+    else:
+        shapes = [region_shape] * num_pools
+    for shape in shapes:
+        if spec.dtype in _FP8_DTYPES:
+            raw = torch.empty(shape, dtype=spec.dtype, device=device)
+        else:
+            raw = torch.zeros(shape, dtype=spec.dtype, device=device)
         raw_tensors.append(raw)
     for layer_name, pool_index in pool_indices.items():
-        layer_to_raw[layer_name] = raw_tensors[pool_index]
-    return layer_to_raw, raw_tensors
+        layer_to_raw[layer_name] = raw_tensors[0 if block_major else pool_index]
+    return layer_to_raw, raw_tensors, layout
 
 
 def make_attention_cache_tensor(
@@ -387,6 +467,7 @@ def materialize_kv_cache_tensors(
     kernel_block_sizes: Sequence[int],
     device: torch.device,
     cache_dtype: str | torch.dtype,
+    block_major: bool = False,
 ) -> MaterializedKVCache:
     kernel_block_size_by_gid = build_kernel_block_size_by_group_id(
         kv_cache_config=kv_cache_config,
@@ -418,7 +499,7 @@ def materialize_kv_cache_tensors(
                     )
                     if region in region_caches:
                         cache = region_caches[region]
-                        expected_shape = group.backend.get_kv_cache_shape(
+                        expected_shape = cast(Any, group.backend).get_kv_cache_shape(
                             num_blocks * spec.block_size // kernel_block_size,
                             kernel_block_size,
                             spec.num_kv_heads,
@@ -452,8 +533,12 @@ def materialize_kv_cache_tensors(
     )
     if pool_geometry is None:
         raise ValueError("unified hybrid KV layout requires an attention pool")
-    layer_to_raw, raw_tensors = allocate_raw_kv_cache_tensors(
-        kv_cache_config, device, pool_geometry=pool_geometry, cache_dtype=cache_dtype
+    layer_to_raw, raw_tensors, layout = allocate_raw_kv_cache_tensors(
+        kv_cache_config,
+        device,
+        pool_geometry=pool_geometry,
+        cache_dtype=cache_dtype,
+        block_major=block_major,
     )
     kv_caches: dict[str, LayerKVCache] = {}
 
@@ -477,4 +562,9 @@ def materialize_kv_cache_tensors(
                         f"Unsupported KV cache spec: {type(spec)!r}"
                     )
 
-    return MaterializedKVCache(kv_caches=kv_caches, raw_tensors=raw_tensors)
+    return MaterializedKVCache(
+        kv_caches=kv_caches,
+        raw_tensors=raw_tensors,
+        layer_to_raw=layer_to_raw,
+        bm_pool_layout=layout,
+    )

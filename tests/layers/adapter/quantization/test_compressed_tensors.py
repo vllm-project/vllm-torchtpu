@@ -26,12 +26,12 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import get_quantization_config
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsLinearMethod,
     CompressedTensorsScheme,
 )
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     VllmCompressedTensorsConfig,
     _build_fp8_config,
     _build_fp8_linear_method,
@@ -215,7 +215,10 @@ class TestCompressedTensorsHelpers:
     def test_raise_not_implemented(self):
         with pytest.raises(
             NotImplementedError,
-            match="Compressed-tensors scheme 'SampleScheme' is not implemented yet in vllm-torchtpu.",
+            match=(
+                "Compressed-tensors scheme 'SampleScheme' is not implemented yet in "
+                "vllm-torchtpu."
+            ),
         ):
             _raise_not_implemented("SampleScheme")
 
@@ -274,6 +277,7 @@ class TestCompressedTensorsConfig:
         )
         input_quant = QuantizationArgs(
             num_bits=8,
+            type=QuantizationType.FLOAT,
             strategy=QuantizationStrategy.TOKEN,
             symmetric=True,
             dynamic=True,
@@ -287,7 +291,10 @@ class TestCompressedTensorsConfig:
         )
         with pytest.raises(
             NotImplementedError,
-            match="Compressed-tensors scheme 'VllmCompressedTensorsW4A8Fp8' is not implemented yet",
+            match=(
+                "Compressed-tensors scheme 'VllmCompressedTensorsW4A8Fp8' is not "
+                "implemented yet"
+            ),
         ):
             cfg.get_scheme(linear_layer, "proj")
 
@@ -306,7 +313,10 @@ class TestCompressedTensorsConfig:
         )
         with pytest.raises(
             NotImplementedError,
-            match="Compressed-tensors scheme 'VllmCompressedTensorsW4A4Fp4' is not implemented yet",
+            match=(
+                "Compressed-tensors scheme 'VllmCompressedTensorsW4A4Fp4' is not "
+                "implemented yet"
+            ),
         ):
             cfg.get_scheme(linear_layer, "proj")
 
@@ -334,7 +344,10 @@ class TestCompressedTensorsConfig:
         )
         with pytest.raises(
             NotImplementedError,
-            match="Compressed-tensors scheme 'VllmCompressedTensorsW8A8Fp8' is not implemented yet",
+            match=(
+                "Compressed-tensors scheme 'VllmCompressedTensorsW8A8Fp8' is not "
+                "implemented yet"
+            ),
         ):
             cfg.get_scheme(linear_layer, "proj")
 
@@ -362,7 +375,10 @@ class TestCompressedTensorsConfig:
         )
         with pytest.raises(
             NotImplementedError,
-            match="Compressed-tensors scheme 'VllmCompressedTensorsW8A8Int8' is not implemented yet",
+            match=(
+                "Compressed-tensors scheme 'VllmCompressedTensorsW8A8Int8' is not "
+                "implemented yet"
+            ),
         ):
             cfg.get_scheme(linear_layer, "proj")
 

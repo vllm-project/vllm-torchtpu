@@ -48,6 +48,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
+from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (
@@ -55,15 +56,18 @@ from vllm_torchtpu.distributed.ep_mesh import (
     build_ep_mesh,
     ep_mesh_index,
     ep_rank_order,
+    ep_sorted_gather_group,
     ep_token_replica_groups,
 )
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
+    HIDDEN_LANE_BLOCK,
     PACK4,
     U32_SUBLANE_TILE,
     token_gather_smem_bytes,
 )
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -176,8 +180,13 @@ def _build_op(
     has_hash_ids=False,
     *,
     token_replica_groups=None,
+    sorted_gather=None,
 ):
-    """The op for this closure, built once per distinct closure and reused."""
+    """The op for this closure, built once per distinct closure and reused.
+
+    `sorted_gather` is `ep_sorted_gather_group()`'s (group, positions), or
+    None for the single fused program. With it the op is a `_SortedGatherOp`.
+    """
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
     key = (
@@ -193,6 +202,7 @@ def _build_op(
         routed_scaling_factor,
         has_hash_ids,
         token_replica_groups,
+        None if sorted_gather is None else sorted_gather[1],
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -207,7 +217,9 @@ def _build_op(
         scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
     )
 
-    def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
+    # Any: the layer, route or compute result depending on bias_kw's stage;
+    # each wrapper below declares the one it returns.
+    def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw) -> Any:
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -295,26 +307,30 @@ def _build_op(
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
-    # seven are sharded on axis 0. `sharded_jax_op` passes the spec tuple
-    # straight to shard_map, so a heterogeneous tuple is what it wants; the
-    # bias is NOT closed over as a constant because it differs per layer and
-    # `_OPS` would then key one exported program per MoE layer.
+    # The score-correction bias is indexed by GLOBAL expert id and read by
+    # every shard for its own tokens, so it is replicated where the other
+    # seven are sharded on axis 0. The spec tuple goes straight to shard_map,
+    # so a heterogeneous tuple is what it wants; the bias is NOT closed over
+    # as a constant because it differs per layer and `_OPS` would then key one
+    # exported program per MoE layer.
     input_specs = (
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
     )
-    # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
-    # where a shard_map result is recorded as replicated, so this rank's 2048
-    # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
-    # with only that line replaced.
+    # Stock jax_op. It used to size its outputs from the export's avals, where
+    # a shard_map result is recorded as replicated, so this rank's 2048 rows
+    # came back claiming the mesh-wide 16384; `sharded_jax_op`, a local copy of
+    # JaxCallable with that one line replaced, was the way around it. Torchtpu
+    # takes output_partition_specs itself now, which is the same information
+    # without a copy of anyone's source.
     if has_score_bias:
         fn = moe_with_score_bias
     elif has_hash_ids:
         fn = moe_with_hash_ids
     else:
         fn = moe
-    op = sharded_jax_op(
+    op = jax_op(
         name,
         fn,
         mesh=mesh,
@@ -324,16 +340,215 @@ def _build_op(
         output_partition_specs=spec,
     )
 
-    # Deliberately replaces the shard-aware fake `sharded_jax_op` installed,
-    # which resolves the output aval by running a real `jax.export` every time
-    # Dynamo traces the op. This kernel returns the rows it was given, so the
-    # answer is known without exporting for it.
+    # Replaces the fake jax_op installs, which resolves the output aval by
+    # running a real `jax.export` every time Dynamo traces the op. This kernel
+    # returns the rows it was given, so the answer is known without exporting.
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
 
     op.register_fake(_fake)
+    if sorted_gather is not None:
+        op = _build_split_ops(
+            name,
+            call,
+            mesh,
+            input_specs,
+            spec,
+            topk,
+            weight_format,
+            has_score_bias,
+            has_hash_ids,
+            token_replica_groups,
+            sorted_gather,
+        )
     _OPS[key] = op
     return op
+
+
+class _SortedGatherOp:
+    """The fused layer as route, a torch all-gather, compute.
+
+    Called exactly like the single op. The gather runs over
+    `ep_sorted_gather_group`'s device-id ordered group while both programs
+    keep the rank-ordered mesh; compute is told where each rank's rows
+    landed. Holds no mesh, so it is safe to reach from a traced forward.
+    """
+
+    def __init__(self, route, compute, group):
+        self.route = route
+        self.compute = compute
+        self.group = group
+
+    def __call__(self, x, w1, w2, w1_scale, w2_scale, gating, rank, *extra):
+        from torch.distributed import _functional_collectives as funcol
+
+        operands = (x, w1, w2, w1_scale, w2_scale, gating, rank, *extra)
+        q, router_weights, payload = self.route(*operands)
+        q_g = funcol.wait_tensor(funcol.all_gather_tensor(q, 0, self.group))
+        return self.compute(*operands, q_g, router_weights, payload)
+
+
+def _build_split_ops(
+    name,
+    call,
+    mesh,
+    input_specs,
+    spec,
+    topk,
+    weight_format,
+    has_score_bias,
+    has_hash_ids,
+    token_replica_groups,
+    sorted_gather,
+):
+    """`_SortedGatherOp` for the closure `call` was built for."""
+    from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat
+    from vllm_torchtpu.kernels.fused_moe.v2.host import weight_form
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import _exchange_layout
+    from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import replica_wire_rows
+
+    group, positions = sorted_gather
+    ep = mesh.shape[EP_AXIS_NAME]
+    quantized = weight_form(WeightFormat(weight_format)).quantized_activations
+
+    def extra_kw(extra):
+        if has_score_bias:
+            return dict(score_bias=extra.astype(jnp.float32))
+        if has_hash_ids:
+            return dict(hash_topk_ids=extra.astype(jnp.int32))
+        return {}
+
+    def route(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return call(x, w1, w2, w1_scale, w2_scale, gating, rank, stage="route")
+
+    def route_extra(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        extra: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            stage="route",
+            **extra_kw(extra),
+        )
+
+    def compute(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        q_g: jax.Array,
+        router_weights: jax.Array,
+        payload: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            stage="compute",
+            routed=(q_g, router_weights, payload),
+            gather_positions=positions,
+        )
+
+    def compute_extra(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        extra: jax.Array,
+        q_g: jax.Array,
+        router_weights: jax.Array,
+        payload: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            stage="compute",
+            routed=(q_g, router_weights, payload),
+            gather_positions=positions,
+            **extra_kw(extra),
+        )
+
+    has_extra = has_score_bias or has_hash_ids
+    route_op = jax_op(
+        f"{name}_route",
+        route_extra if has_extra else route,
+        mesh=mesh,
+        input_partition_specs=input_specs,
+        output_partition_specs=(spec,) * 3,
+    )
+    # q_g is the whole gather on every rank: one block of mesh-wide rows per
+    # shard, so it is sharded on axis 0 like the rest.
+    compute_op = jax_op(
+        f"{name}_compute",
+        compute_extra if has_extra else compute,
+        mesh=mesh,
+        input_partition_specs=input_specs + (spec,) * 3,
+        output_partition_specs=spec,
+    )
+
+    replica_width = len(token_replica_groups[0]) if token_replica_groups else 1
+
+    # x.shape[0] is symbolic here, and must stay unguarded: see
+    # replica_wire_rows, the padded row count route returns for that reason.
+    def _route_fake(x, w1, *_args, **_kwargs):
+        t_wire = replica_wire_rows(x.shape[0], replica_width, U32_SUBLANE_TILE)
+        width = _exchange_layout(t_wire, topk, w1.shape[0] * ep, quantized)[-1]
+        q_dtype = torch.float8_e4m3fn if quantized else torch.bfloat16
+        return (
+            x.new_empty(
+                (t_wire, x.shape[1] // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
+                dtype=q_dtype,
+            ),
+            x.new_empty((t_wire, topk), dtype=torch.float32),
+            x.new_empty((1, width), dtype=torch.int32),
+        )
+
+    def _compute_fake(x, *_args, **_kwargs):
+        return torch.empty_like(x)
+
+    route_op.register_fake(_route_fake)
+    compute_op.register_fake(_compute_fake)
+    logger.info_once(
+        "Fused EP MoE: activation all-gather runs over the device-id ordered "
+        "group | gather_positions=%s",
+        positions,
+    )
+    return _SortedGatherOp(route_op, compute_op, group)
 
 
 def fused_moe_ep(
@@ -372,8 +587,81 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
+    # Simulate before masking: the padding mask writes NaN rows, which would
+    # make the simulation's mean anchor NaN and leave every row unrouted.
+    router_logits, score_bias, hash_ids = _simulated_routing_operands(
+        router_logits, score_bias, hash_ids
+    )
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+        router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+
+
+def _simulated_routing_operands(
+    router_logits: torch.Tensor,
+    score_bias: torch.Tensor | None,
+    hash_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """The kernel's routing operands, under `uniform_random` routing simulation.
+
+    The fused kernel scores and selects experts itself, so
+    `moe_routing.maybe_simulate_routing` never runs on this path. To make
+    `VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random` mean here what it
+    means on the grouped-matmul path -- every token's experts drawn uniformly
+    at random, so expert load is balanced in expectation -- the kernel is
+    handed operands whose top-k IS that draw:
+
+    - gating: `moe_routing.uniform_random_logits`, the f32 noise anchored to
+      the real logits' mean that `moe_routing._uniform_random_routing` draws
+      from.
+    - score bias: zeros, so the correction bias cannot shift the draw.
+    - hash ids (hash-routed layers): top-k of the same noise.
+
+    The gate weights are the kernel's scoring of the noise rather than the
+    grouped-matmul path's ones; the expert choice, which is what the simulation
+    exists to control, is the same distribution. Profiling only: the model's
+    output is meaningless, as `moe_routing` already warns at import.
+
+    Returns the operands unchanged when no simulation is set.
+    """
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    if not moe_routing.is_uniform_random_simulation():
+        return router_logits, score_bias, hash_ids
+    noise = moe_routing.uniform_random_logits(router_logits)
+    if hash_ids is not None:
+        hash_ids = torch.topk(noise, k=hash_ids.shape[-1], dim=-1).indices.to(
+            torch.int32
+        )
+    if score_bias is not None:
+        score_bias = torch.zeros_like(score_bias)
+    return noise, score_bias, hash_ids
+
+
+def register_fused_scale_buffers(layer) -> None:
+    """Stage the fp4 weight scales as the `[E, K/block, N]` tables the op takes.
+
+    The loader's tables are `[E, K/block, 1, N]`. A squeeze of one is a view,
+    and torch_tpu materializes a view graph input with a program of its own
+    before every step, in a layout the kernel then copies out of again inside
+    the step. So each table is copied once into a base tensor of its own, and
+    the 4-D parameter becomes a view of that copy rather than a second one.
+    The tables are synced here because the loaders' own sync has already run.
+    """
+    tables = []
+    for param, buf in (
+        ("w13_weight_scale", "_tpu_fused_w13_scale"),
+        ("w2_weight_scale", "_tpu_fused_w2_scale"),
+    ):
+        table = fresh_buffer(getattr(layer, param).squeeze(2))
+        layer.register_buffer(buf, table, persistent=False)
+        setattr(
+            layer, param, torch.nn.Parameter(table.unsqueeze(2), requires_grad=False)
+        )
+        tables.append(table)
+    if tables[0].device.type == "tpu":
+        synchronize_tensors(tables)
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -539,6 +827,11 @@ def prebuild_fused_moe_ep(
         )
         return None
     ep = mesh.shape[EP_AXIS_NAME]
+    # Collective over the world, so before any refusal that could differ by
+    # rank; cached after the first layer.
+    sorted_gather = (
+        ep_sorted_gather_group() if envs.MOE_FUSED_EP_SORTED_GATHER else None
+    )
 
     gather_bytes = token_gather_smem_bytes(_TILE_M)
     needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
@@ -557,7 +850,8 @@ def prebuild_fused_moe_ep(
         return None
     global _RANK_BUFFER
     # The kernel's index is this rank's position in the mesh, which is ordered
-    # by device id, not its EP rank.
+    # by device id unless PCP or DCP is on, so it is not necessarily the EP rank;
+    # `ep_rank_order` has the mapping.
     _RANK_BUFFER = torch.tensor(
         [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
     )
@@ -651,6 +945,7 @@ def prebuild_fused_moe_ep(
         routed_scale,
         has_hash_ids,
         token_replica_groups=token_replica_groups,
+        sorted_gather=sorted_gather,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
@@ -674,17 +969,14 @@ def prebuild_fused_moe_ep(
         routed_scale,
         token_replica_groups,
     )
-    # Two knobs stop applying the moment this arms, and neither would say so on
-    # its own: the fused call returns before `apply_monolithic` reaches either
-    # the padding mask or the chunked path. Padding costs expert work and
-    # transport rather than correctness -- and it is not free at warmup, where
-    # `_dummy_run` marks the whole batch as padding.
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS or envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
+    # Chunked collection stops applying the moment this arms: the fused call
+    # returns before `apply_monolithic` reaches the chunked path, and the
+    # kernel exchanges inside its own program.
+    if envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
         logger.warning_once(
-            "Fused EP MoE armed, so TPU_MOE_SKIP_PADDED_TOKENS=%s and "
-            "TPU_MOE_COLLECTION_CHUNK_SIZE=%s are not in effect for this "
-            "layer: the kernel routes and exchanges inside its own program.",
-            envs.TPU_MOE_SKIP_PADDED_TOKENS,
+            "Fused EP MoE armed, so TPU_MOE_COLLECTION_CHUNK_SIZE=%s is not "
+            "in effect for this layer: the kernel routes and exchanges inside "
+            "its own program.",
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
         )
     return op
@@ -840,12 +1132,18 @@ def _unsupported_routing_reason(layer, *, supplies_hash_ids=False) -> str | None
             )
     # The routing simulator replaces the routing output wholesale, so a run
     # that asked for it and got real routing is a profiling result that is
-    # quietly not the thing it claims to measure.
-    if moe_routing._SIMULATION_STRATEGY is not None:
+    # quietly not the thing it claims to measure. The kernel routes by itself,
+    # so it can only honour a strategy whose draw can be handed to it as
+    # routing operands: `uniform_random` can (`_simulated_routing_operands`),
+    # the others are refused.
+    if (
+        moe_routing._SIMULATION_STRATEGY is not None
+        and not moe_routing.is_uniform_random_simulation()
+    ):
         return (
-            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set and the kernel "
-            "does its own routing, so the simulation would not be in "
-            "effect"
+            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set to a strategy other "
+            "than uniform_random and the kernel does its own routing, so the "
+            "simulation would not be in effect"
         )
     return None
 

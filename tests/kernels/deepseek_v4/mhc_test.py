@@ -15,6 +15,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import torch
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from absl.testing import absltest, parameterized
@@ -313,6 +314,7 @@ def _make_post_inputs(rng, num_tokens, hidden_size):
     )
 
 
+@pytest.mark.tpu_test
 class MhcPostPallasSmallShapeTest(parameterized.TestCase):
     """Post kernel vs the jnp oracle at small shapes and ragged token
     counts (block indexing and padding); needs TPU hardware."""
@@ -339,6 +341,7 @@ class MhcPostPallasSmallShapeTest(parameterized.TestCase):
         )
 
 
+@pytest.mark.tpu_test
 class MhcPostPallasTpuTest(parameterized.TestCase):
     """Compiled (Mosaic) post kernel vs the jnp reference. Needs TPU."""
 
@@ -399,6 +402,7 @@ def _fused_args(rng, num_tokens, hidden_size, sinkhorn_repeat=20):
     )
 
 
+@pytest.mark.tpu_test
 class MhcFusedPostPrePallasSmallShapeTest(parameterized.TestCase):
     """Fused seam kernel vs the sequential oracle at small shapes and
     ragged token counts; needs TPU hardware."""
@@ -441,6 +445,7 @@ class MhcFusedPostPrePallasSmallShapeTest(parameterized.TestCase):
         )
 
 
+@pytest.mark.tpu_test
 class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
     """Compiled (Mosaic) fused seam kernel vs the sequential reference.
     Needs TPU hardware."""
@@ -472,6 +477,7 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
             np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
 
 
+@pytest.mark.tpu_test
 class MhcPreMixesPallasSmallShapeTest(parameterized.TestCase):
     """Mix-GEMM kernel vs the jnp oracle at small shapes and ragged
     token counts, validating block indexing and padding; needs TPU
@@ -512,6 +518,7 @@ class MhcPreMixesPallasSmallShapeTest(parameterized.TestCase):
         )
 
 
+@pytest.mark.tpu_test
 class MhcPrePallasTpuTest(parameterized.TestCase):
     """Compiled (Mosaic) kernel vs the jnp reference. Needs TPU hardware."""
 

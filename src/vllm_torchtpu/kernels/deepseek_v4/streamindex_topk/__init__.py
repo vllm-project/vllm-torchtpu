@@ -16,6 +16,8 @@
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     bref_override,
     config,
+    kv_cache_append,
+    kv_cache_utils,
     metadata,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
@@ -23,15 +25,30 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
     KVLayout,
     MlaCase,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_append import (
+    cache_page_size,
+    check_scatter_rows_supported,
+    coalesced_kv_append,
+    coalesced_kv_append_dcp,
+    scatter_rows,
+    scatter_rows_reference,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_utils import (
+    get_dcp_page_and_slot,
+    get_dst_rows,
+    get_page_and_slot,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
     DCP_AXIS_NAME,
     DEFAULT_VMEM_LIMIT_BYTES,
-    _select_owned_winners,
+    convert_cache_to_seq_along_lane,
     cp_global_to_local,
     cp_local_length,
     cp_local_to_global,
     cp_owner_rank,
     cp_rank_as_data,
+    get_kv_cache_shape,
+    indexer_kv_layout,
     streamindex_topk,
     streamindex_topk_dcp,
 )
@@ -39,18 +56,31 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import 
 __all__ = [
     "bref_override",
     "config",
+    "kv_cache_append",
+    "kv_cache_utils",
     "metadata",
     "MlaCase",
     "KVLayout",
     "DEFAULT_BUFFER_COUNT",
     "DEFAULT_VMEM_LIMIT_BYTES",
     "DCP_AXIS_NAME",
+    "cache_page_size",
+    "check_scatter_rows_supported",
+    "coalesced_kv_append",
+    "coalesced_kv_append_dcp",
+    "convert_cache_to_seq_along_lane",
     "cp_local_to_global",
     "cp_local_length",
     "cp_owner_rank",
     "cp_global_to_local",
     "cp_rank_as_data",
-    "_select_owned_winners",
+    "get_dcp_page_and_slot",
+    "get_dst_rows",
+    "get_kv_cache_shape",
+    "get_page_and_slot",
+    "indexer_kv_layout",
+    "scatter_rows",
+    "scatter_rows_reference",
     "streamindex_topk",
     "streamindex_topk_dcp",
 ]

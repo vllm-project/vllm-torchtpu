@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """utilities for collective kernels."""
 
 import functools
@@ -20,13 +32,13 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
     """
     barrier_sem = pltpu.get_barrier_semaphore()
     for neighbor in [left_neighbor, right_neighbor]:
-        pltpu.semaphore_signal(
+        pl.semaphore_signal(
             barrier_sem,
             inc=1,
             device_id=(neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
-    pltpu.semaphore_wait(barrier_sem, 2)
+    pl.semaphore_wait(barrier_sem, 2)
     if double_barrier:
         # The double-barrier prevents a race condition where one neighbor can
         # re-enter the kernel again on a subsequent call and increment the
@@ -37,10 +49,10 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
         @functools.partial(pl.run_scoped, second_barrier=pltpu.SemaphoreType.REGULAR)
         def _(second_barrier):
             for neighbor in [left_neighbor, right_neighbor]:
-                pltpu.semaphore_signal(
+                pl.semaphore_signal(
                     second_barrier,
                     inc=1,
                     device_id=(neighbor,),
-                    device_id_type=pltpu.DeviceIdType.MESH,
+                    device_id_type=pl.DeviceIdType.MESH,
                 )
-            pltpu.semaphore_wait(second_barrier, 2)
+            pl.semaphore_wait(second_barrier, 2)

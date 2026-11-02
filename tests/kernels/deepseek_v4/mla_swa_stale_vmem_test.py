@@ -24,11 +24,14 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import mla_swa
+
+pytestmark = pytest.mark.tpu_test
 
 # DeepSeek-V4-Flash geometry: window 128, page 128, 2 pages per block, so
 # bkv_sz == 256 >= sliding_window selects the batched decode kernel.

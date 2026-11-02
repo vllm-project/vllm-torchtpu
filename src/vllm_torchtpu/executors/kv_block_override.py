@@ -72,7 +72,8 @@ def reconcile_num_gpu_blocks_override(
                 "stage holds both attention and mamba layers, or pin "
                 "--num-gpu-blocks-override."
             )
-        return min(stage_values)
+        # None was rejected above; the filter only narrows the type.
+        return min(value for value in stage_values if value is not None)
     overrides = [ovr for ovr in worker_overrides if ovr is not None]
     if not overrides:
         return None

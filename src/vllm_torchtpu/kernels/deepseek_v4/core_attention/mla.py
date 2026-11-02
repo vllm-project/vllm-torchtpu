@@ -75,11 +75,13 @@ def _mla_ragged_paged_attention_kernel(
     cu_q_lens_ref,  # [max_num_seqs + 1]
     start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-    bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
+    # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
+    bo_ids_ref,
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    cache_kv_hbm_ref,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv_hbm_ref,
     swa_accumution_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     swa_l_hbm_ref,  # [max_num_tokens, num_l_heads]
     swa_m_hbm_ref,  # [max_num_tokens, num_l_heads]
@@ -97,7 +99,7 @@ def _mla_ragged_paged_attention_kernel(
     m_ref,  # [batch_size, bq_sz * num_q_heads],
     acc_ref,  # [batch_size, bq_sz * num_q_heads, head_dim],
     *,
-    static_q_len: int,
+    static_q_len: int | None,
     sm_scale: float,
     bkv_p,
     bq_sz,
@@ -182,10 +184,13 @@ def _mla_ragged_paged_attention_kernel(
         else:
             cp.start()
 
-    def _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
+    def _fetch_bkv(
+        batch_start_seq_idx, bkv_idx, bkv_sem_idx, *, wait=False, enabled=True
+    ):
         for b in range(batch_size):
             sem = sems.at[0, b, bkv_sem_idx]
-            # bkv_x2_ref shape: [2, batch_size, bkv_sz, num_slots_per_token * kv_packing, lkv_dim]
+            # bkv_x2_ref shape:
+            # [2, batch_size, bkv_sz, num_slots_per_token * kv_packing, lkv_dim]
             bkv_vmem_ref = bkv_x2_ref.at[bkv_sem_idx, b]
 
             reshaped_cache_hbm_ref = cache_kv_hbm_ref.reshape(
@@ -194,12 +199,14 @@ def _mla_ragged_paged_attention_kernel(
                 lkv_dim,
             )
 
-            seq_idx = batch_start_seq_idx + b
+            # A disabled fetch may name the sequence past the last one; it reads a
+            # valid one and copies nothing.
+            seq_idx = jnp.minimum(batch_start_seq_idx + b, max_num_seqs - 1)
             kv_len = kv_lens_ref[seq_idx]
             kv_len_start = bkv_idx * bkv_sz
             kv_p_start = bkv_idx * bkv_p
 
-            kv_left = kv_len - kv_len_start
+            kv_left = jnp.where(enabled, kv_len - kv_len_start, 0)
             dma_bkv_sz = jnp.clip(kv_left, 0, bkv_sz)
             page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
@@ -214,8 +221,8 @@ def _mla_ragged_paged_attention_kernel(
                         0,
                         page_size,
                     )
-                    # If the page index is out of bound, we set page_idx to the last page.
-                    # And there will be no copy since sz will be 0.
+                    # If the page index is out of bound, we set page_idx to the last
+                    # page. And there will be no copy since sz will be 0.
                     page_idx = jnp.minimum(
                         page_indices_offset + i, num_page_indices - 1
                     )
@@ -232,8 +239,8 @@ def _mla_ragged_paged_attention_kernel(
                     )
 
             else:
-                # When we wait, we can use a dummy copy to wait for DMAs to complete where
-                # src == dst. However, the dma size must be correct.
+                # When we wait, we can use a dummy copy to wait for DMAs to complete
+                # where src == dst. However, the dma size must be correct.
                 dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
                 _async_copy(
                     src=dst_kv,
@@ -357,8 +364,8 @@ def _mla_ragged_paged_attention_kernel(
             l_ref[...] = jnp.stack(bl_list)
             m_ref[...] = jnp.stack(bm_list)
 
-    def start_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx):
-        return _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
+    def start_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, enabled=True):
+        return _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, enabled=enabled)
 
     def wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx):
         return _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, wait=True)
@@ -504,12 +511,6 @@ def _mla_ragged_paged_attention_kernel(
                     batch_start_seq_idx, bq_idx, bkv_idx, bkv_sem_idx
                 )
 
-                # Prefetch next bkv
-                @pl.when(next_seq_idx < end_seq_idx)
-                def prefetch_next_bkv():
-                    sem_ids_ref[1] = next_bkv_sem_idx
-                    start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
-
                 # Wait for cur bkv
                 wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
 
@@ -527,6 +528,18 @@ def _mla_ragged_paged_attention_kernel(
                     bq_idx=bq_idx,
                     bkv_idx=bkv_idx,
                     kv_lens_to_attend_segment=kv_lens_to_attend_segment,
+                )
+
+                # Prefetch next bkv. Issued after the compute and without a branch, so
+                # the scalar work of the per-page copies is scheduled alongside the
+                # vector work instead of in a region of its own; past the last block
+                # the copies are empty.
+                sem_ids_ref[1] = next_bkv_sem_idx
+                start_fetch_bkv(
+                    next_seq_idx,
+                    next_bkv_idx,
+                    next_bkv_sem_idx,
+                    enabled=next_seq_idx < end_seq_idx,
                 )
                 return (kv_lens_to_attend_segment,)
 
@@ -933,47 +946,60 @@ def mla_ragged_paged_attention(
             swa_m,
         )
 
+    def skip_if_empty(start_seq_idx, end_seq_idx, run):
+        # An empty pass still pays its launch and the page-table copy into
+        # SMEM; with speculative decoding the decode passes are usually empty.
+        return lax.cond(end_seq_idx > start_seq_idx, run, lambda q: q, q)
+
     batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
     # Batched decode
-    q = run_mla_kernel(
-        q,
-        cache_kv,
-        kv_lens,
-        kv_lens_to_attend,
-        page_indices,
-        cu_q_lens,
-        attention_sinks,
-        swa_accumution,
-        swa_l,
-        swa_m,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=jnp.array(0),
-        end_seq_idx=batch_distribution,
-        static_q_len=1,
-        batch_size=decode_batch_size,
-        case=MlaCase.BATCHED_DECODE,
+    q = skip_if_empty(
+        jnp.array(0),
+        batch_distribution,
+        lambda q: run_mla_kernel(
+            q,
+            cache_kv,
+            kv_lens,
+            kv_lens_to_attend,
+            page_indices,
+            cu_q_lens,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=batch_distribution,
+            static_q_len=1,
+            batch_size=decode_batch_size,
+            case=MlaCase.BATCHED_DECODE,
+        ),
     )
 
     # Decode-only
-    q = run_mla_kernel(
-        q,
-        cache_kv,
-        kv_lens,
-        kv_lens_to_attend,
-        page_indices,
-        cu_q_lens,
-        attention_sinks,
-        swa_accumution,
-        swa_l,
-        swa_m,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=batch_distribution,
-        end_seq_idx=distribution[0],
-        static_q_len=1,
-        batch_size=1,
-        case=MlaCase.DECODE,
+    q = skip_if_empty(
+        batch_distribution,
+        distribution[0],
+        lambda q: run_mla_kernel(
+            q,
+            cache_kv,
+            kv_lens,
+            kv_lens_to_attend,
+            page_indices,
+            cu_q_lens,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=batch_distribution,
+            end_seq_idx=distribution[0],
+            static_q_len=1,
+            batch_size=1,
+            case=MlaCase.DECODE,
+        ),
     )
 
     if chunk_prefill_size is not None:

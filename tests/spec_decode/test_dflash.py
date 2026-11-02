@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from types import SimpleNamespace
 from unittest import mock
 
@@ -19,18 +20,49 @@ import numpy as np
 import pytest
 import torch
 import torch._dynamo
+from vllm import SamplingParams
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
+from vllm.v1.request import Request
+from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_torchtpu import _patch_dflash_drafting_slot_budget
+from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
+from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
+from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+from vllm_torchtpu.spec_decode import dflash as dflash_module
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
 
 
-def _make_proposer(draft_tp: int | None = 1, target_tp: int = 1) -> DFlashProposer:
+def _make_proposer(
+    draft_tp: int | None = 1,
+    target_tp: int = 1,
+    target_layer_ids: list[int] | None = None,
+) -> DFlashProposer:
     hf_config_mock = mock.MagicMock()
     hf_config_mock.to_dict.return_value = {
         "dflash_config": {
             "mask_token_id": 0,
-            "target_layer_ids": [1, 2],
+            "target_layer_ids": [1, 2]
+            if target_layer_ids is None
+            else target_layer_ids,
         }
     }
 
@@ -123,7 +155,10 @@ def test_propose_empty_batch():
     assert proposer.propose([], [], None, None) == []
 
 
-def test_precompile_skips_sub_block_draft_forward():
+def _make_precompile_proposer(
+    num_tokens_paddings: list[int], num_reqs_max_model_len: int
+) -> DFlashProposer:
+    """A K=7 (block_size 8) proposer whose precompile records the shapes."""
     proposer = _make_proposer(draft_tp=8, target_tp=8)
     proposer.speculative_config.num_speculative_tokens = 7
     proposer.draft_model = SimpleNamespace(
@@ -133,11 +168,11 @@ def test_precompile_skips_sub_block_draft_forward():
         )
     )
     proposer.runner = SimpleNamespace(
-        num_reqs_max_model_len=8,
+        num_reqs_max_model_len=num_reqs_max_model_len,
         num_reqs_most_model_len=None,
         most_model_len=None,
         max_num_blocks_per_req=4,
-        num_tokens_paddings=[1, 8, 16, 512],
+        num_tokens_paddings=num_tokens_paddings,
         _precompile_timed=mock.MagicMock(
             return_value=mock.MagicMock(
                 __enter__=mock.MagicMock(return_value=None),
@@ -147,21 +182,239 @@ def test_precompile_skips_sub_block_draft_forward():
     )
     proposer._dummy_precompute_and_update_kv_cache = mock.MagicMock()
     proposer._dummy_draft_forward = mock.MagicMock()
+    return proposer
+
+
+def _precompiled_sizes(proposer: DFlashProposer) -> tuple[list[int], list[int]]:
+    """(KV-update sizes, draft-forward sizes) precompile warmed."""
+    return (
+        [
+            call.kwargs["num_tokens"]
+            for call in proposer._dummy_precompute_and_update_kv_cache.call_args_list
+        ],
+        [
+            call.kwargs["num_tokens"]
+            for call in proposer._dummy_draft_forward.call_args_list
+        ],
+    )
+
+
+def test_precompile_skips_sub_block_draft_forward():
+    proposer = _make_precompile_proposer([1, 8, 16, 512], num_reqs_max_model_len=8)
 
     proposer.precompile()
 
-    assert [
-        call.kwargs["num_tokens"]
-        for call in proposer._dummy_precompute_and_update_kv_cache.call_args_list
-    ] == [1, 8, 16, 512]
+    kv_sizes, draft_sizes = _precompiled_sizes(proposer)
+    assert kv_sizes == [1, 8, 16, 512]
     # 1 is skipped (sub-block); 512 stays: _get_padded_len rounds the
     # 8-req * 8-token upper bound (64) up to the next runner bucket.
-    assert [
-        call.kwargs["num_tokens"]
-        for call in proposer._dummy_draft_forward.call_args_list
-    ] == [8, 16, 512]
+    assert draft_sizes == [8, 16, 512]
 
 
+@pytest.mark.parametrize(
+    ("num_tokens_paddings", "num_reqs_max_model_len", "draft_paddings"),
+    [
+        # A full chunk fits the target's buckets: nothing is added.
+        ([16, 32, 64], 4, [16, 32, 64]),
+        # 16 reqs * 8 tokens outgrows the largest target bucket.
+        ([16, 32, 64], 16, [16, 32, 64, 128]),
+        # Doubling stops at the bound, as the target's buckets stop at the
+        # token budget.
+        ([16, 32, 40], 7, [16, 32, 40, 56]),
+        ([16, 32], 32, [16, 32, 64, 128, 256]),
+    ],
+)
+def test_draft_buckets_cover_a_full_chunk(
+    num_tokens_paddings, num_reqs_max_model_len, draft_paddings
+):
+    proposer = _make_precompile_proposer(num_tokens_paddings, num_reqs_max_model_len)
+
+    assert proposer._draft_token_paddings() == draft_paddings
+    with pytest.raises(RuntimeError, match="exceeds the largest draft bucket"):
+        proposer._get_padded_len(draft_paddings[-1] + 1)
+
+
+def test_precompile_warms_draft_only_buckets():
+    proposer = _make_precompile_proposer([16, 32, 64], num_reqs_max_model_len=16)
+
+    proposer.precompile()
+
+    kv_sizes, draft_sizes = _precompiled_sizes(proposer)
+    # The KV-update pass runs at the target's bucket; only the draft forward
+    # runs at the draft-only bucket past it.
+    assert kv_sizes == [16, 32, 64]
+    assert draft_sizes == [16, 32, 64, 128]
+
+
+# Matches _make_precompile_proposer (K=7, block_size 8).
+NUM_SPEC_TOKENS = 7
+
+
+def _spec_config(method: str, parallel_drafting: bool = True) -> SpeculativeConfig:
+    """A real SpeculativeConfig for ``method`` without loading a drafter."""
+    spec = SpeculativeConfig(
+        model="ngram",
+        num_speculative_tokens=NUM_SPEC_TOKENS,
+        prompt_lookup_max=3,
+        prompt_lookup_min=1,
+    )
+    spec.method = method
+    spec.parallel_drafting = parallel_drafting
+    return spec
+
+
+@pytest.fixture
+def install_slot_patch(monkeypatch):
+    # Platform activation in earlier tests may have installed the patch
+    # already, so unwrap to upstream's getter. Teardown restores the property
+    # the test found.
+    prop = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
+    monkeypatch.setattr(
+        SpeculativeConfig,
+        "max_num_new_slots_for_drafting",
+        property(inspect.unwrap(prop.fget)),
+    )
+    return _patch_dflash_drafting_slot_budget
+
+
+def _build_scheduler(max_num_batched_tokens: int, method: str) -> Scheduler:
+    kv_block_size = 16
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=8,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=2048,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+        ),
+        model_config=ModelConfig(
+            model="facebook/opt-125m", dtype="float16", seed=42, max_model_len=2048
+        ),
+        cache_config=CacheConfig(
+            block_size=kv_block_size,
+            gpu_memory_utilization=0.9,
+            cache_dtype="auto",
+            enable_prefix_caching=False,
+        ),
+        parallel_config=ParallelConfig(),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    num_blocks = 32
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
+    register_all_kvcache_specs(vllm_config)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer0"],
+                FullAttentionSpec(
+                    block_size=kv_block_size,
+                    num_kv_heads=1,
+                    head_size=64,
+                    dtype=torch.float16,
+                ),
+            )
+        ],
+    )
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=kv_block_size,
+    )
+    # Scheduler.schedule() reads the drafting slots from the config every step.
+    scheduler.vllm_config.speculative_config = _spec_config(method)
+    return scheduler
+
+
+def _add_request(scheduler: Scheduler, request_id: str, num_prompt_tokens: int):
+    params = SamplingParams(max_tokens=8, ignore_eos=True)
+    params.update_from_generation_config({}, 2)
+    scheduler.add_request(
+        Request(request_id, list(range(num_prompt_tokens)), params, None)
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "parallel_drafting", "upstream_slots", "tpu_slots"),
+    [
+        ("dflash", True, NUM_SPEC_TOKENS, 0),
+        ("dspark", True, NUM_SPEC_TOKENS - 1, 0),
+        # Methods without a TPU block drafter keep upstream's charge.
+        ("eagle3", True, NUM_SPEC_TOKENS - 1, NUM_SPEC_TOKENS - 1),
+        ("draft_model", True, NUM_SPEC_TOKENS, NUM_SPEC_TOKENS),
+        ("draft_model", False, 1, 1),
+        ("ngram", False, 0, 0),
+    ],
+)
+def test_only_tpu_block_drafters_stop_charging_slots(
+    install_slot_patch, method, parallel_drafting, upstream_slots, tpu_slots
+):
+    spec = _spec_config(method, parallel_drafting)
+    assert spec.max_num_new_slots_for_drafting == upstream_slots
+    install_slot_patch()
+    assert spec.max_num_new_slots_for_drafting == tpu_slots
+
+
+def test_slot_patch_installs_once(install_slot_patch):
+    install_slot_patch()
+    installed = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
+    install_slot_patch()
+    assert SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"] is installed
+
+
+@pytest.mark.parametrize(
+    ("method", "expected_prefill"),
+    [
+        # TPU block drafter: its K - 1 drafting slots go to prefill.
+        ("dspark", 40),
+        # PARD has no TPU block drafter and keeps its K-slot charge.
+        ("draft_model", 40 - NUM_SPEC_TOKENS),
+    ],
+)
+def test_tpu_block_drafter_slots_go_to_prefill(
+    install_slot_patch, method, expected_prefill
+):
+    install_slot_patch()
+    scheduler = _build_scheduler(max_num_batched_tokens=40, method=method)
+    _add_request(scheduler, "prefill", 96)
+
+    assert scheduler.schedule().num_scheduled_tokens == {"prefill": expected_prefill}
+
+
+def test_uncharged_draft_stays_in_precompiled_buckets(install_slot_patch):
+    """Without the charge a step's draft outgrows the token budget.
+
+    Each scheduled request drafts a full block however few tokens it was
+    scheduled, so short requests plus one cut off by the budget draft more
+    tokens than max_num_batched_tokens. DFlash must still pad that draft to a
+    bucket precompile warmed.
+    """
+    install_slot_patch()
+    budget = 40
+    scheduler = _build_scheduler(max_num_batched_tokens=budget, method="dflash")
+    for i in range(6):
+        _add_request(scheduler, f"short{i}", 5)
+    _add_request(scheduler, "long", 96)
+
+    scheduled = scheduler.schedule().num_scheduled_tokens
+    # The budget ends partway through "long".
+    assert scheduled["long"] == budget - 6 * 5
+    proposer = _make_precompile_proposer(
+        _get_token_paddings(16, budget),
+        num_reqs_max_model_len=scheduler.vllm_config.scheduler_config.max_num_seqs,
+    )
+    draft_tokens = len(scheduled) * proposer.block_size
+    assert draft_tokens > max(proposer.runner.num_tokens_paddings)
+
+    proposer.precompile()
+
+    _, draft_sizes = _precompiled_sizes(proposer)
+    assert proposer._get_padded_len(draft_tokens) in draft_sizes
+
+
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("has_upstream_hook", [False, True])
 def test_tpu_precompute_context_kv(device, has_upstream_hook):
     # Setup dimension sizes
@@ -287,6 +540,7 @@ def test_tpu_precompute_context_kv(device, has_upstream_hook):
     assert torch.allclose(all_v, expected_v_all, atol=1e-5)
 
 
+@pytest.mark.tpu_test
 def test_tpu_precompute_context_kv_uses_explicit_tpu_hook(device):
     proposer = _make_proposer(draft_tp=1)
     hidden_states = torch.randn(3, 32, device=device)
@@ -326,6 +580,12 @@ def _make_chunk(
         else None
     )
 
+    if aux_hidden_states is None:
+        num_tokens = max(1, int(position_ids.shape[-1]))
+        aux_hidden_states = [
+            torch.zeros((num_tokens, 32), dtype=torch.float32, device=device)
+        ]
+
     return DraftChunkInputs(
         input_ids=None,
         position_ids=position_ids,
@@ -335,6 +595,11 @@ def _make_chunk(
             query_start_loc=query_start_loc,
             use_max_model_len=True,
             position_ids_override=None,
+            # [decode_end, prefill_end, num_reqs]: the compiled input builders
+            # read the live request count from its last entry on device.
+            request_distribution=torch.tensor(
+                [0, 0, num_reqs], dtype=torch.int32, device=device
+            ),
         ),
         start_index=start_index,
         num_reqs=num_reqs,
@@ -348,6 +613,7 @@ def _make_chunk(
     )
 
 
+@pytest.mark.tpu_test
 def test_prepare_dflash_inputs(device):
     proposer = _make_proposer(draft_tp=1)
     K = 3
@@ -356,6 +622,8 @@ def test_prepare_dflash_inputs(device):
         device=device,
         num_tokens_paddings=[8, 16, 32],
         max_num_reqs=8,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
         _dp_lockstep_enabled=lambda: False,
     )
     chunk = _make_chunk(
@@ -390,7 +658,13 @@ def test_prepare_dflash_inputs(device):
     )
 
 
-def test_update_draft_kv_cache_from_target_unit(device):
+def test_missing_target_layer_ids():
+    with pytest.raises(ValueError, match="target layer ids"):
+        _make_proposer(target_layer_ids=[])
+
+
+def test_update_draft_kv_cache_from_target_unit():
+    device = torch.device("cpu")
     proposer = _make_proposer(draft_tp=1)
     proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock(
         return_value=(None, [])
@@ -427,14 +701,36 @@ def test_update_draft_kv_cache_from_target_unit(device):
         device=device,
         query_start_loc_np=np.array([0, 3]),
         position_ids=torch.zeros(3),
-        aux_hidden_states=torch.zeros((3, 32), dtype=torch.float32, device=device),
+        aux_hidden_states=[torch.zeros((3, 32), dtype=torch.float32, device=device)],
     )
 
     proposer._update_draft_kv_cache_from_target(chunk)
 
     proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
 
+    # Empty aux_hidden_states is an invalid DFlash runtime state: fail fast
+    # with RuntimeError (rather than IndexError or silently skipping the write
+    # / dropping an EP-DP collective).
+    proposer._tpu_precompute_and_update_kv_cache.reset_mock()
+    empty = _make_chunk(
+        num_reqs=1,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 3]),
+        position_ids=torch.zeros(3),
+        aux_hidden_states=[],
+    )
+    with pytest.raises(RuntimeError, match="aux_hidden_states"):
+        proposer._update_draft_kv_cache_from_target(empty)
+    proposer._tpu_precompute_and_update_kv_cache.assert_not_called()
 
+    # Multi-chunk steps validate every chunk before chunk 0 executes a KV update.
+    with pytest.raises(RuntimeError, match="aux_hidden_states"):
+        proposer._update_context_kv([chunk, empty])
+    proposer._tpu_precompute_and_update_kv_cache.assert_not_called()
+
+
+@pytest.mark.tpu_test
 def test_propose_unit(device):
     proposer = _make_proposer(draft_tp=1)
     K = 3
@@ -499,6 +795,95 @@ def test_propose_unit(device):
     proposer._dflash_forward_and_sample.assert_called_once()
 
 
+def _padding_mask_at_draft_forward(proposer, run, num_rows: int) -> list[bool]:
+    """Run `run()` with the padding mask left in a target step's state and
+    return the mask the draft forward saw."""
+    state = TokenPaddingState.create(32, torch.device("cpu"))
+    # A target step with 3 real rows of 16: stale for any draft forward.
+    state.update(3, 16)
+    seen = []
+
+    def _forward(input_ids, positions, block_size):
+        seen.append(state.get_local_padding_mask(num_rows).tolist())
+        num_reqs = input_ids.shape[0] // block_size
+        return torch.zeros((num_reqs, block_size - 1), dtype=torch.int64), None
+
+    proposer._dflash_forward_and_sample = _forward
+    token_padding.set_padding_state(state)
+    try:
+        run()
+    finally:
+        token_padding.set_padding_state(None)
+    assert len(seen) == 1
+    return seen[0]
+
+
+def test_propose_marks_padding_for_draft_rows():
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(num_reqs=2),
+        mesh=None,
+        max_num_reqs=8,
+        _dp_lockstep_enabled=lambda: False,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+    )
+    proposer.draft_chunks = [
+        SimpleNamespace(
+            num_reqs=2,
+            start_index=0,
+            aux_hidden_states=[torch.zeros((2, 32))],
+            # The live count reaches the builders as a device scalar.
+            attn_ctx=SimpleNamespace(
+                request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32)
+            ),
+        )
+    ]
+    proposer._update_draft_kv_cache_from_target = mock.MagicMock()
+    # 2 requests x block 4 = 8 real draft rows, padded to a 16-row bucket.
+    proposer._prepare_dflash_inputs = mock.MagicMock(
+        return_value=(
+            torch.zeros(16, dtype=torch.int32),
+            torch.zeros(16, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+        )
+    )
+    proposer._build_draft_attn_metadata = mock.MagicMock(return_value={})
+
+    mask = _padding_mask_at_draft_forward(
+        proposer,
+        lambda: proposer.propose(
+            [], [], None, None, return_device=True, device_seed=[torch.zeros(2)]
+        ),
+        num_rows=16,
+    )
+
+    assert mask == [False] * 8 + [True] * 8
+
+
+def test_dummy_draft_forward_marks_all_rows_padding(monkeypatch):
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        mesh=None,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+    )
+    proposer._build_attn_metadata_for_draft = mock.MagicMock(return_value={})
+    monkeypatch.setattr(dflash_module, "synchronize_tensors", lambda *a, **k: None)
+
+    mask = _padding_mask_at_draft_forward(
+        proposer,
+        lambda: proposer._dummy_draft_forward(
+            num_tokens=8, use_max_model_len=True, sync=False
+        ),
+        num_rows=8,
+    )
+
+    assert mask == [True] * 8
+
+
 def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     """An unnamed draft layer must raise, not borrow another group's metadata.
 
@@ -543,6 +928,7 @@ def test_dp_lockstep_run_dummy_draft():
     assert proposer._dp_dummy_forward.call_count == 2
 
 
+@pytest.mark.tpu_test
 def test_prepare_dflash_inputs_dp_lockstep(device):
     proposer = _make_proposer(draft_tp=8, target_tp=8)
     K = 3
@@ -553,6 +939,8 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
         _dp_lockstep_enabled=lambda: True,
         _dp_step_max_reqs=4,
         max_num_reqs=8,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
     )
     chunk = _make_chunk(
         num_reqs=1,
@@ -572,3 +960,88 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
     # Coordinated reqs = 4 -> 4 * 4 = 16 tokens padded.
     assert input_ids.shape == (16,)
     assert position_ids.shape == (16,)
+
+
+class _FakeMoERunner(torch.nn.Module):
+    pass
+
+
+def _lockstep_proposer(draft_model):
+    """A replicated (tp=1) draft on an EP-DP lockstep runner: the only
+    configuration where the gate depends on detecting MoE in the draft."""
+    proposer = _make_proposer(draft_tp=1, target_tp=1)
+    proposer.draft_model = draft_model
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: True)
+    return proposer
+
+
+def test_dp_lockstep_sharded_detects_moe_draft_without_protocol(monkeypatch):
+    """The TPU DSV4/K3 drafts hold fused-MoE runners but do not implement
+    vLLM's MixtureOfExperts protocol; a replicated such draft must still
+    join the lockstep, or its EP all-to-alls hang against idle ranks."""
+    import vllm.model_executor.layers.fused_moe as fused_moe
+
+    monkeypatch.setattr(fused_moe, "MoERunner", _FakeMoERunner)
+    moe_draft = torch.nn.Module()
+    moe_draft.layer = torch.nn.Module()
+    moe_draft.layer.experts = _FakeMoERunner()
+    assert _lockstep_proposer(moe_draft)._dp_lockstep_sharded() is True
+
+    dense_draft = torch.nn.Module()
+    dense_draft.layer = torch.nn.Linear(2, 2)
+    assert _lockstep_proposer(dense_draft)._dp_lockstep_sharded() is False
+
+
+def test_dp_lockstep_sharded_off_without_lockstep():
+    proposer = _make_proposer(draft_tp=1, target_tp=1)
+    proposer.draft_model = mock.MagicMock()
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
+    assert proposer._dp_lockstep_sharded() is False
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("builder", ["next_tokens", "seed"])
+def test_compiled_input_builders_compile_no_program_per_request_count(device, builder):
+    """The builders take the live request count as a device scalar, so one
+    shape bucket is one program however many requests are live."""
+    if device.type != "tpu":
+        pytest.skip("needs the TPU compile cache")
+    K, block, rows, padded_len = 5, 5, 32, 128
+    proposer = DFlashProposer.__new__(DFlashProposer)
+    proposer._max_model_len = 9216
+    proposer.mask_token_id = 7777
+    # rows verify windows of 1 + K tokens; query_start_loc and positions.
+    qsl = torch.arange(0, (rows + 1) * (1 + K), 1 + K, dtype=torch.int32).to(device)
+    pos = torch.arange(rows * (1 + K), dtype=torch.int32).to(device)
+
+    def run(num_reqs: int):
+        nr = torch.tensor(num_reqs, dtype=torch.int32).to(device)
+        if builder == "seed":
+            seed = torch.ones(rows, dtype=torch.int32).to(device)
+            return proposer._tpu_build_dflash_inputs_seed(
+                seed, qsl, pos, nr, block, padded_len, 7777
+            )
+        next_tokens = torch.ones(rows, K + 1, dtype=torch.int32).to(device)
+        draft_lengths = torch.full((rows,), K, dtype=torch.int32).to(device)
+        return proposer._tpu_build_dflash_inputs_next_tokens(
+            next_tokens,
+            qsl,
+            pos,
+            draft_lengths,
+            nr,
+            block,
+            padded_len,
+            7777,
+            INVALID_TOKEN_ID,
+        )
+
+    def programs() -> int:
+        return len(torch.tpu._get_cache_stats().per_entry_stats)
+
+    run(1)  # the first use of the shape may compile
+    before = programs()
+    for num_reqs in (2, 17, 32):
+        run(num_reqs)
+    assert programs() == before, (
+        f"{builder} builder compiled a program per request count"
+    )

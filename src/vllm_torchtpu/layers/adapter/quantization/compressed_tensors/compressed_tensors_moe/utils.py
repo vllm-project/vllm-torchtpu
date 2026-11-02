@@ -1,14 +1,36 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import ctypes
 import gc
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.nn import Parameter
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    class StagedParameter(Parameter):
+        """Typing-only view of a parameter staged by the CPU weight loader."""
+
+        _cpu_scratch: Parameter
+        _orig_shape: tuple[int, ...]
+
 
 def get_cpu_weight_loader_hook(
-    layer: torch.nn.Module,
+    layer: "RoutedExperts",
     orig_loader: Callable | None,
     tp_size: int,
     tp_rank: int,
@@ -23,7 +45,7 @@ def get_cpu_weight_loader_hook(
     """
 
     def _cpu_weight_loader_hook(
-        param: torch.nn.Parameter,
+        param: "StagedParameter",
         loaded_weight: torch.Tensor,
         weight_name: str,
         shard_id: str,
@@ -133,16 +155,18 @@ def get_cpu_weight_loader_hook(
 
 
 def release_memory_to_os() -> None:
-    """Forces Python GC and instructs the C allocator to return free memory to the OS."""
+    """Forces Python GC and instructs the C allocator to return free memory
+    to the OS."""
     gc.collect()
-    try:
+    try:  # noqa: SIM105 (malloc_trim exists only on glibc)
         ctypes.CDLL(None).malloc_trim(0)
-    except Exception:
+    except Exception:  # noqa: S110
         pass
 
 
 def quantize_to_fp4_e2m1_nibbles(tensor_scaled: torch.Tensor) -> torch.Tensor:
-    """Vectorized projection of scaled float values into 4-bit FP4 E2M1 indices (0..15)."""
+    """Vectorized projection of scaled float values into 4-bit FP4 E2M1
+    indices (0..15)."""
     abs_x = tensor_scaled.abs()
     thresholds = torch.tensor(
         [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
@@ -227,11 +251,13 @@ def requantize_int4_to_fp4_weights(
     in_group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Requantizes INT4 weights [..., N, K/8] to FP4 (E2M1) packed into torch.float8_e4m3fn [..., N, K/2].
+    Requantizes INT4 weights [..., N, K/8] to FP4 (E2M1) packed into
+    torch.float8_e4m3fn [..., N, K/2].
     [..., N, K/8] -> [..., N, K/2] for weights (2 FP4 per byte)
     [..., N, K/in_group] -> [..., N, K/requant_block] for scales
     """
-    # If tensor contains multiple items (e.g. experts along dim 0), process per-expert to keep peak memory minimal
+    # If tensor contains multiple items (e.g. experts along dim 0), process per-expert
+    # to keep peak memory minimal
     if w_packed.dim() >= 3 and w_packed.shape[0] > 1:
         num_items = w_packed.shape[0]
         out_packed_list = []
@@ -301,7 +327,8 @@ def requantize_and_transpose_int4_weights(
     sign_xor_val: int,
     in_group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Requantizes INT4 weights and returns transposed & XORed tensors matching gmm_v2 layout."""
+    """Requantizes INT4 weights and returns transposed & XORed tensors matching
+    gmm_v2 layout."""
     w_req, s_req = requantize_int4_weights(
         w_packed, scale_f, requant_block_size, in_group_size
     )
@@ -317,7 +344,8 @@ def requantize_and_transpose_int4_to_fp4_weights(
     requant_block_size: int,
     in_group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Requantizes INT4 weights to FP4 (torch.float8_e4m3fn carrier) and returns transposed tensors matching gmm_v2 layout."""
+    """Requantizes INT4 weights to FP4 (torch.float8_e4m3fn carrier) and returns
+    transposed tensors matching gmm_v2 layout."""
     w_req, s_req = requantize_int4_to_fp4_weights(
         w_packed, scale_f, requant_block_size, in_group_size
     )

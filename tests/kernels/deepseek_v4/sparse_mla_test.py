@@ -16,10 +16,14 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 
 # Import the kernels
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
+
+pytestmark = pytest.mark.tpu_test
 
 
 def cdiv(a, b):
@@ -56,14 +60,16 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 def ref_implementation(
     q: jax.Array,  # [num_tokens, actual_num_q_heads, actual_lkv_dim]
-    cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
     topk_indices: jax.Array,  # i32[max_num_tokens, topk]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     attention_sinks: jax.Array,  # float32[actual_num_q_heads]
-    swa_accumution: jax.Array,  # float32[num_tokens, actual_num_q_heads, actual_lkv_dim]
+    # float32[num_tokens, actual_num_q_heads, actual_lkv_dim]
+    swa_accumution: jax.Array,
     swa_l: jax.Array,  # float32[num_tokens, actual_num_q_heads]
     swa_m: jax.Array,  # float32[num_tokens, actual_num_q_heads]
     *,
@@ -217,21 +223,19 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
     fp8_uint8 = jax.lax.bitcast_convert_type(
         fp8_quant.reshape(total_pages, page_size, 448), jnp.uint8
     )
-    # De-interleave ROPE cache to High and Low bytes
-    bf16_u16 = jax.lax.bitcast_convert_type(bf16_part, jnp.uint16)
-    hi = (bf16_u16 >> 8).astype(jnp.uint8)
-    lo = (bf16_u16 & 0xFF).astype(jnp.uint8)
-    rope_uint8 = jnp.concatenate([hi, lo], axis=-1)
-
     scales_uint8 = jax.lax.bitcast_convert_type(scales_quant, jnp.uint8)
 
-    # NOPE cache: fp8_uint8 (448) + scales_uint8 (64) = 512
-    cache_kv_nope = jnp.concatenate([fp8_uint8, scales_uint8], axis=-1).reshape(
+    # NOPE cache: fp8_uint8 (448) + scales_uint8 (64) = 512 bytes, one int32
+    # row per token (see csa_cache_layout).
+    nope_slabs = jnp.concatenate([fp8_uint8, scales_uint8], axis=-1).reshape(
         total_pages, page_size, 4, 128
     )
+    cache_kv_nope = csa_cache_layout.slabs_to_words(nope_slabs)
 
-    # ROPE cache: rope_uint8 has shape (total_pages, page_size, 128)
-    cache_kv_rope = rope_uint8.reshape(total_pages, page_size // 4, 4, 128)
+    # ROPE cache: 64 bf16 = 32 int32 words per token, 4 tokens per row.
+    cache_kv_rope = csa_cache_layout.encode_rope(bf16_part.reshape(-1, 64)).reshape(
+        total_pages, page_size // 4, 128
+    )
 
     return cache_kv_base, cache_kv_nope, cache_kv_rope
 

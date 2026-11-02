@@ -36,7 +36,10 @@ Core mechanisms:
 - Completion echoes: Terminal jobs discovered by the scheduler manager ship
   down to workers, which echo them back as `completed_jobs` / `finished_recving`
   to unblock waiting requests and maintain reference counting. Failed loads
-  report their destination blocks for automatic recomputation.
+  are also reported by request as `failed_recving`, so the scheduler
+  recomputes or fails them, per `kv_load_failure_policy`. Block ids would
+  be ambiguous here: each KV cache group numbers its blocks independently,
+  and vLLM rejects block-level failures on multi-group layouts.
 
 - Memory reuse (jobs_to_flush): Handled entirely scheduler-side. Fence-pending
   stores are cancelled before launching, while active transfers are drained
@@ -46,7 +49,9 @@ Core mechanisms:
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
@@ -54,6 +59,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
+    KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     config as offloading_config_module,
@@ -90,6 +96,9 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
 )
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_events import KVCacheEvent
 
 logger = init_logger(__name__)
 
@@ -146,13 +155,16 @@ class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
     finished_store_job_ids: list[int] = field(default_factory=list)
     # Completed load jobs (job_id -> req_id) to echo back and unblock requests.
     finished_load_jobs: dict[int, str] = field(default_factory=dict)
-    # Destination device blocks of failed loads, reported for scheduler recompute.
-    failed_load_device_block_ids: list[int] = field(default_factory=list)
+    # Requests whose load failed, a subset of finished_load_jobs' values,
+    # reported as failed_recving; the scheduler recomputes or fails them per
+    # kv_load_failure_policy.
+    failed_load_req_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
 class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
-    """Worker -> scheduler metadata: contains completed-job echoes and per-rank fence acks."""
+    """Worker -> scheduler metadata: contains completed-job echoes and
+    per-rank fence acks."""
 
     fenced_jobs: dict[int, int] = field(default_factory=dict)
 
@@ -164,8 +176,11 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
         merged_fenced = dict(self.fenced_jobs)
         for job_id, v in other.fenced_jobs.items():
             merged_fenced[job_id] = merged_fenced.get(job_id, 0) + v
+        # completed_jobs and transfer_stats are inherited from vLLM base dataclass.
         return RaidenOffloadingWorkerMetadata(
+            # pyrefly: ignore[unexpected-keyword]
             completed_jobs=merged_completed,
+            # pyrefly: ignore[unexpected-keyword]
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
             fenced_jobs=merged_fenced,
         )
@@ -243,10 +258,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
         # Handle jobs_to_flush (source blocks are about to be recycled):
         # - Cancel fence-pending stores before they start.
-        # - Synchronously drain launched stores so DMA finishes before blocks are overwritten.
+        # - Synchronously drain launched stores so DMA finishes before blocks
+        #   are overwritten.
         finished_store_ids: list[int] = []
         finished_loads: dict[int, str] = {}
-        failed_load_block_ids: list[int] = []
+        failed_load_req_ids: set[str] = set()
         flush_ids = meta.jobs_to_flush or set()
         launched_flush_ids: set[int] = set()
         for job_id in flush_ids:
@@ -257,8 +273,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 # Avoid useless TPU sync if created and cancelled in the same step.
                 new_fence_ids.discard(job_id)
                 logger.debug(
-                    "TPURaidenOffloadingConnector: cancelled fence-pending store job %d "
-                    "(source blocks reused)",
+                    "TPURaidenOffloadingConnector: cancelled fence-pending "
+                    "store job %d (source blocks reused)",
                     job_id,
                 )
             elif manager.is_job_launched(job_id):
@@ -272,7 +288,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             else:
                 assert finished_job.req_id is not None
                 finished_loads[finished_job.job_id] = finished_job.req_id
-                failed_load_block_ids.extend(finished_job.failed_device_block_ids)
+                if not finished_job.success:
+                    failed_load_req_ids.add(finished_job.req_id)
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -283,7 +300,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             fence_job_ids=new_fence_ids,
             finished_store_job_ids=finished_store_ids,
             finished_load_jobs=finished_loads,
-            failed_load_device_block_ids=failed_load_block_ids,
+            failed_load_req_ids=failed_load_req_ids,
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -319,10 +336,29 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
-        # Opt in to uniform cross-layer KV cache allocation when block-major layout is enabled.
-        # Satisfies `KVConnectorModelRunnerMixin.use_uniform_kv_cache()` preconditions to enable
-        # bundled tensor allocation in the TPU model runner.
+        # Opt in to uniform cross-layer KV cache allocation when block-major layout is
+        # enabled. Satisfies `KVConnectorModelRunnerMixin.use_uniform_kv_cache()`
+        # preconditions to enable bundled tensor allocation in the TPU model runner.
         return bool(tpu_envs.VLLM_TPU_BLOCK_MAJOR_KV)
+
+    @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        """Complete a deeper full-attention local hit, behind the Stage-3 flag.
+
+        Upstream offload lookup treats a Mamba group as a one-chunk window, so
+        a hit from this store ends where it holds the recurrent state for its
+        last chunk: a load restores the state the local hit lacks, and a miss
+        lets the scheduler reconcile to the common boundary. Decode composes
+        this connector with TPURaidenConnector in TPUMultiConnector, which
+        needs every child to agree before Stage-3 suffix loads can run. Gated
+        on the prefix-aware flag so standalone offload keeps today's lookup.
+        """
+        # Deferred: tpu_connector is heavy and only this property needs it.
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+            _prefix_aware_load_enabled,
+        )
+
+        return _prefix_aware_load_enabled()
 
     def __init__(
         self,
@@ -354,6 +390,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             offloading_config, vllm_config, kv_cache_config
         )
 
+        # pyrefly: ignore[bad-override-mutable-attribute]
         self.connector_scheduler: TPURaidenOffloadingScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
@@ -361,14 +398,15 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 spec, vllm_config, kv_cache_config
             )
         elif role == KVConnectorRole.WORKER:
-            # Worker wrapper is only used for KV buffer registration; job dicts remain empty.
+            # Worker wrapper is only used for KV buffer registration; job dicts
+            # remain empty.
             self.connector_worker = OffloadingConnectorWorker(
                 spec, vllm_config, kv_cache_config
             )
-            # Track per-step fence acknowledgments and completion echoes for worker metadata.
+            # Track per-step fence acknowledgments and completion echoes for
+            # worker metadata.
             self._fenced_jobs: dict[int, int] = {}
             self._completed_jobs: dict[int, int] = {}
-            self._load_error_block_ids: set[int] = set()
             # Registered KV pool byte views whose deferred writes are dispatched before
             # recording fence events.
             self._pool_sync_tensors: list[torch.Tensor] = []
@@ -379,16 +417,22 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
     # -- scheduler-side hooks ----------------------------------------------
     def reset_cache(self) -> bool | None:
         # External cache reset is unsupported by the Raiden store. Report
-        # failure through the endpoint's documented channel instead of raising an exception here
+        # failure through the endpoint's documented channel instead of raising an
+        # exception here
         logger.warning(
             "TPURaidenOffloadingConnector: external cache reset is not "
             "supported by the Raiden offload store; reporting failure."
         )
         return False
 
+    def take_events(self) -> Iterable[KVCacheEvent]:
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.take_events()
+        return []
+
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(
-        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
+        self, kv_caches: Mapping[str, torch.Tensor | list[torch.Tensor]]
     ):
         """Register the TPU UBP as zero-copy canonical offload tensors.
 
@@ -433,6 +477,8 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # Retain pool tensor references to dispatch their writes during save fences.
         self._pool_sync_tensors = [pool_tensor.tensor for pool_tensor in pool_tensors]
 
+        # One ref list per offloaded group, as vLLM's own registration builds:
+        # groups that are not prefix-cacheable are not offloaded.
         group_data_refs = [
             [
                 CanonicalKVCacheRef(
@@ -440,7 +486,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 )
                 for idx, pool_tensor in enumerate(pool_tensors)
             ]
-            for _ in self.connector_worker.kv_cache_config.kv_cache_groups
+            for _ in offloading_config_module.get_offloading_group_ids(
+                self.connector_worker.kv_cache_config
+            )
         ]
 
         self.connector_worker._init_worker(
@@ -448,6 +496,21 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         )
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        # Load failures only travel in get_transfer_results().failed_recving.
+        # Returning a failed request here would pass its load as a good one,
+        # so refuse loudly; callers must use get_transfer_results().
+        results = self.get_transfer_results(finished_req_ids)
+        if results.failed_recving:
+            raise RuntimeError(
+                "TPURaidenOffloadingConnector.get_finished() cannot report the "
+                f"failed loads of requests {sorted(results.failed_recving)}; "
+                "call get_transfer_results() instead"
+            )
+        return results.finished_sending, results.finished_recving
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
         assert self.connector_worker is not None
         meta = self._get_connector_metadata()
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
@@ -481,14 +544,13 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         for job_id, req_id in meta.finished_load_jobs.items():
             self._completed_jobs[job_id] = 1
             finished_recving.add(req_id)
-        self._load_error_block_ids.update(meta.failed_load_device_block_ids)
 
-        return set(), finished_recving
-
-    def get_block_ids_with_load_errors(self) -> set[int]:
-        block_ids = self._load_error_block_ids
-        self._load_error_block_ids = set()
-        return block_ids
+        # A failed request also stays in finished_recving: that is what
+        # releases it from WAITING_FOR_REMOTE_KVS.
+        return KVConnectorTransferResults(
+            finished_recving=finished_recving,
+            failed_recving=set(meta.failed_load_req_ids),
+        )
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         if not (self._fenced_jobs or self._completed_jobs):

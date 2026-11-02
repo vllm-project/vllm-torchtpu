@@ -1,4 +1,17 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Adapted from the private upstream repository primatrix/pallas-kernel.
 # Upstream contact: @pathfinder-pf.
 """Inference-only native segment-ID KDA forward Pallas kernel.
@@ -8,12 +21,13 @@ optimizations cannot change the training, recompute, or context-parallel paths.
 """
 
 # This file retains the source kernel's compact mathematical notation.
-# ruff: noqa: E702, E731, F841
+# ruff: noqa: E731, F841
 
 from __future__ import annotations
 
 import functools
 import math
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -333,7 +347,7 @@ def _fwd_mega_kernel_native_segids(
             else:
                 ref_decay = jnp.exp2(gn - prev_gn)
                 k_eng_prefix = jnp.concatenate(
-                    [k_eng_prefix * ref_decay, k_eng_current],
+                    [cast(jax.Array, k_eng_prefix) * ref_decay, k_eng_current],
                     axis=1,
                 )
             prev_gn = gn
@@ -365,7 +379,7 @@ def _fwd_mega_kernel_native_segids(
             L_rows.append(Akk_r)
 
         g_last = g_cumsum[:, BT - 1 : BT, :]
-        kg = k_eng_prefix * jnp.exp2(g_last - prev_gn)
+        kg = cast(jax.Array, k_eng_prefix) * jnp.exp2(g_last - prev_gn)
         Aqk = jnp.concatenate(Aqk_rows, axis=1)
         L = jnp.concatenate(L_rows, axis=1)
 
@@ -635,7 +649,7 @@ def _fwd_mega_kernel_native_segids(
             else:
                 ref_decay = jnp.exp2(gn - prev_gn)
                 k_eng_prefix = jnp.concatenate(
-                    [k_eng_prefix * ref_decay, k_eng_current],
+                    [cast(jax.Array, k_eng_prefix) * ref_decay, k_eng_current],
                     axis=1,
                 )
             prev_gn = gn
@@ -936,7 +950,7 @@ def _fwd_mega_kernel_native_segids(
             else:
                 ref_decay = jnp.exp2(gn - prev_gn)
                 k_eng_prefix = jnp.concatenate(
-                    [k_eng_prefix * ref_decay, k_eng_current],
+                    [cast(jax.Array, k_eng_prefix) * ref_decay, k_eng_current],
                     axis=1,
                 )
             prev_gn = gn
@@ -1193,9 +1207,8 @@ def _fwd_mega_kernel_native_segids(
         scratch_ref[...] = h_B_new
         if STORE_FINAL_STATE and MANUAL_HT_DMA and OVERLAP_HT_DMA:
             ht_A_copy.wait()
-        if STORE_FINAL_STATE:
-            if not MANUAL_HT_DMA:
-                ht_ref[last_seg - 1, ...] = h_B_new.astype(ht_ref.dtype)[:, None, :, :]
+        if STORE_FINAL_STATE and not MANUAL_HT_DMA:
+            ht_ref[last_seg - 1, ...] = h_B_new.astype(ht_ref.dtype)[:, None, :, :]
 
         if STORE_RESIDUALS:
             if RESIDUAL_CHUNK_LAYOUT:
@@ -1341,7 +1354,8 @@ def _chunk_kda_fwd_native_segids_impl(
             segment_ids, ((0, 0), (0, T_PAD_S - segment_ids.shape[-1]))
         )
 
-    # Rebuild metadata with padded T (chunk_size still BT, but more chunks now due to padding)
+    # Rebuild metadata with padded T (chunk_size still BT, but more chunks now
+    # due to padding)
     # Metadata arrays need last dim >= 128 or == array dim. Pad NT to 128 if needed.
     NT_meta = T // BT  # original number of chunks
     NT_meta_PAD = max(int(align_up(NT_meta, 128)), 128)  # at least 128
@@ -1419,7 +1433,8 @@ def _chunk_kda_fwd_native_segids_impl(
             h0 = jnp.broadcast_to(h0, (B,) + h0.shape[1:])
 
         # Pass ALL N_max initial states for per-segment loading
-        # h0: [B, N_max, H, K, V] -> [N_max, H, B, K, V] -> pad -> [N_max, H, B, K_PAD, V_ALIGNED]
+        # h0: [B, N_max, H, K, V] -> [N_max, H, B, K, V] -> pad ->
+        #     [N_max, H, B, K_PAD, V_ALIGNED]
         h0 = h0[:, :, :, :, :].transpose(1, 2, 0, 3, 4)  # [N_max, H, B, K, V]
         if K_PAD > K:
             h0 = jnp.pad(h0, ((0, 0), (0, 0), (0, 0), (0, K_PAD - K), (0, 0)))
@@ -1443,6 +1458,7 @@ def _chunk_kda_fwd_native_segids_impl(
         A_scale_in = jnp.zeros((H, 1, 1, 1), dtype=jnp.float32)
 
     if use_gate_in_kernel and dt_bias is not None:
+        assert A_log is not None
         H_A = A_log.shape[0]
         n_rep = H // H_A
         db_2d = dt_bias.reshape(-1)[: H_A * K].reshape(H_A, K).astype(jnp.float32)
@@ -1457,10 +1473,12 @@ def _chunk_kda_fwd_native_segids_impl(
         db_in = jnp.zeros((H, 1, 1, K_PAD), dtype=jnp.float32)
 
     # Block specs -- index maps must accept all prefetch refs as args
-    # Note: index map returns block offset (in units of block size), not array element offset
+    # Note: index map returns block offset (in units of block size), not array
+    # element offset
     def _seg_map(h, b, c, *refs):
         # segment_ids has shape [B, T_PAD_S], block size is [B, 128]
-        # So we need to return (b_offset, seg_offset) where seg_offset is in units of 128
+        # So we need to return (b_offset, seg_offset) where seg_offset
+        # is in units of 128
         block_128 = (c * BT) // 128
         return (0, block_128)
 

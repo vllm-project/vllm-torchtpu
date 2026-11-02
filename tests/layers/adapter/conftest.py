@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Real GDN construction shared by loader and TPU computation tests."""
 
 from types import SimpleNamespace
@@ -25,6 +37,12 @@ from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
+
+
+@pytest.fixture(autouse=True)
+def _empty_shared_gdn_ops(monkeypatch):
+    """Keep an op built from one test's mocks out of every other test."""
+    monkeypatch.setattr(gdn_attention_op, "_shared_gdn_ops", {})
 
 
 @pytest.fixture

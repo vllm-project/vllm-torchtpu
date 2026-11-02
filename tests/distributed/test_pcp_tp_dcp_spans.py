@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """PD byte-copy goldens; no TPU runtime or native transport is mocked in.
 
 The reference enumerates global pages and heads independently of the span
@@ -46,9 +58,12 @@ def _page(heads, page, slab_bytes):
         (1, 1, 1, 1, 4),
         (4, 4, 8, 2, 2),  # Replicas also exist across destination DCP groups.
         (4, 4, 2, 1, 8),  # Multiple producers contribute to a destination page.
+        (1, 8, 8, 1, 2),  # TP8 -> TP8 with 2 KV heads: 4 replicas per head.
     ],
 )
-@pytest.mark.parametrize("tokens", [1, 127, 128, 129, 1023, 4225])
+@pytest.mark.parametrize(
+    "tokens", [1, 64, 127, 128, 129, 1023, 1024, 1025, 3072, 3073, 4225]
+)
 @pytest.mark.parametrize("manager_pages", [1, 3])
 def test_fa_pcp_tp_to_dcp_byte_copy(pcp, tp, dtp, dcp, heads, tokens, manager_pages):
     page_tokens = 128
@@ -61,8 +76,10 @@ def test_fa_pcp_tp_to_dcp_byte_copy(pcp, tp, dtp, dcp, heads, tokens, manager_pa
     dst_pages_per_block = 2
     dst_block_bytes = dst_pages_per_block * dest_page_bytes
     tables, destinations, coverage, expected = [], [], [], []
+    padded_pages = math.ceil(pages / dcp)
     for rank in range(dtp):
         owned = list(range(rank % dcp, pages, dcp))
+        owned += [pages - 1] * (padded_pages - len(owned))
         data = b"".join(
             _page(_heads(heads, dtp, rank), page, geometry.slab_bytes) for page in owned
         )
@@ -100,9 +117,15 @@ def test_fa_pcp_tp_to_dcp_byte_copy(pcp, tp, dtp, dcp, heads, tokens, manager_pa
             )
             assert reg.block_ids == tuple(ids)
             assert reg.dst_space_version == 1
-            # declared_bytes describes the local source, even for a KV
-            # replica that contributes no FA spans (it still owns GDN).
-            assert reg.declared_bytes == len(owned) * geometry.kernel_page_bytes
+            assert reg.declared_bytes == sum(s.size_bytes * s.count for s in reg.spans)
+            # Without DCP a rank ships its local bytes once or not at all, so
+            # KV replicas must not fan out. With DCP the final stripe's tail
+            # padding legitimately ships more than the local pages.
+            if dcp == 1:
+                assert reg.declared_bytes in (
+                    0,
+                    len(owned) * geometry.kernel_page_bytes,
+                )
             for span in reg.spans:
                 rank = span.dst_unit_ordinal or 0
                 assert span.count == 1 and span.dst_block_index == 0

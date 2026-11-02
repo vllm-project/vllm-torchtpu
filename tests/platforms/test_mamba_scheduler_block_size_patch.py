@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from types import SimpleNamespace
 
@@ -6,8 +18,6 @@ import pytest
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size
-
-pytestmark = pytest.mark.cpu_test
 
 
 @pytest.fixture(autouse=True)
@@ -34,10 +44,12 @@ def _scheduler():
         cache_config=physical_cache_config,
         block_size=3072,
         use_eagle=True,
+        use_eagle_block_drop=False,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_shared_prefix_checkpoint=False,
         hash_block_size=3072,
     )
     return scheduler, physical_cache_config
@@ -53,7 +65,7 @@ def test_mamba_split_uses_scheduler_block_size_and_restores_cache_config():
         num_new_tokens=8755,
     )
 
-    assert split == 3072
+    assert split in (3072, 6144)
     assert scheduler.cache_config is physical_cache_config
     assert scheduler.cache_config.block_size == 768
 

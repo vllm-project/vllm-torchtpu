@@ -21,6 +21,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+
 
 @dataclasses.dataclass(frozen=True)
 class TileSizes:
@@ -65,7 +67,8 @@ class Configs:
 
 
 def load_from_acc_ref(ref, dtype=None):
-    """Loads data from VMEM accumulator with strided access, handling 128-lane alignment."""
+    """Loads data from VMEM accumulator with strided access, handling
+    128-lane alignment."""
     tile_n, slots_per_m_tile, _, last_dim = ref.shape
     num_lanes = 128
 
@@ -83,7 +86,8 @@ def load_from_acc_ref(ref, dtype=None):
 
 
 def store_to_acc_ref(ref, val, dtype=None):
-    """Stores data to VMEM accumulator with strided access, handling 128-lane alignment."""
+    """Stores data to VMEM accumulator with strided access, handling
+    128-lane alignment."""
     tile_n, slots_per_m_tile, _, last_dim = ref.shape
     num_lanes = 128
 
@@ -105,7 +109,7 @@ def kernel(
     hidden_states,  # [num_tokens, hidden_size]
     wkv_wgate,  # [2 * state_width, hidden_size]
     ape,  # [compress_ratio, state_width]
-    cache,  # [num_pages, page_size, 4, 128] uint8 (aliased to output)
+    cache,  # [num_pages, page_size, 4, 128] uint8 or [..., 128] int32 (aliased)
     # output
     _,  # unused output ref (aliased to cache)
     # scratch_memory
@@ -121,6 +125,8 @@ def kernel(
     last_dim = acc_ref.shape[-1]
     slots_per_m_tile = tile_m // last_dim
     acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
+    # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
+    cache = csa_cache_layout.as_u8_slabs(cache)
     write_counts_ref[0] = 0
     write_counts_ref[1] = 0
 
@@ -339,7 +345,7 @@ def proj_and_save_state(
     ape: jax.Array,  # [compress_ratio, state_width]
     positions: jax.Array,  # [num_tokens]
     slot_mapping: jax.Array,  # [num_tokens]
-    cache: jax.Array,  # [num_pages, page_size, 4, 128] uint8
+    cache: jax.Array,  # [num_pages, page_size, 4, 128] uint8 / [..., 128] int32
     compress_ratio: int,
     interpret: bool = False,
 ) -> jax.Array:
@@ -366,9 +372,10 @@ def proj_and_save_state(
     tile_m = state_width
     tile_k = _select_tile_k(hidden_size)
 
-    # The token dimension must be an exact multiple of `tile_n`.
+    # The token dimension must be an exact multiple of `tile_n`. Every token
+    # tile streams the whole weight again, so tiles stay large.
     sublane_tile = 8
-    tile_n = min(128, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
+    tile_n = min(512, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
     padded_num_tokens = pl.cdiv(num_tokens, tile_n) * tile_n
     if padded_num_tokens != num_tokens:
         pad = padded_num_tokens - num_tokens

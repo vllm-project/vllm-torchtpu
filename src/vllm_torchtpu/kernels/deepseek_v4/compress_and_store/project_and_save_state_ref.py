@@ -54,9 +54,16 @@ def ref_wkv_proj_and_save_state(
         f"state_block_size {state_block_size} exceeds the {tokens_per_page} "
         f"token states a {page_size}-row page holds"
     )
+    # The states may not fill the whole page. For example, the SEQ_ALONG_LANE
+    # indexer page has 33 rows, but its 16 states only use the first 32. Only
+    # the rows the states use are read and written; the rest are unchanged.
+    used_rows = tokens_per_page * slots_per_token
+    state_rows = cache[:, :used_rows]
 
     # 3. Unpack inline
-    cache_reshaped = cache.reshape(num_pages, tokens_per_page, slots_per_token, d1, d2)
+    cache_reshaped = state_rows.reshape(
+        num_pages, tokens_per_page, slots_per_token, d1, d2
+    )
     cache_t = cache_reshaped.transpose(0, 1, 2, 4, 3)
     cache_bitcast_shape = cache_t.reshape(
         num_pages, tokens_per_page, slots_per_token, (d2 * d1) // 4, 4
@@ -67,7 +74,10 @@ def ref_wkv_proj_and_save_state(
     # 4. Scatter
     num_tokens_flat = num_pages * tokens_per_page
     valid = slot_mapping >= 0
-    slots = jnp.where(valid, slot_mapping // slots_per_token, num_tokens_flat)
+    token_index = (slot_mapping // page_size) * tokens_per_page + (
+        slot_mapping % page_size
+    ) // slots_per_token
+    slots = jnp.where(valid, token_index, num_tokens_flat)
     flat_padded = jnp.concatenate([flat, jnp.zeros((1, state_dim))], axis=0)
     flat_padded = flat_padded.at[slots].set(packed)
     flat = flat_padded[:-1]
@@ -79,8 +89,6 @@ def ref_wkv_proj_and_save_state(
         num_pages, tokens_per_page, slots_per_token, d2, d1
     )
     chunk_bytes_t = chunk_bytes_reshaped.transpose(0, 1, 2, 4, 3)
-    cache_view = cache.reshape(num_pages, tokens_per_page, slots_per_token, d1, d2)
-    cache_view = cache_view.at[:].set(chunk_bytes_t)
-    new_cache = cache_view.reshape(num_pages, page_size, d1, d2)
+    new_state_rows = chunk_bytes_t.reshape(num_pages, used_rows, d1, d2)
 
-    return new_cache
+    return cache.at[:, :used_rows].set(new_state_rows)

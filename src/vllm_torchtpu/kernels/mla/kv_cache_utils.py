@@ -30,6 +30,8 @@ from torch_tpu._internal.pallas import pallas
 # `ref.bitcast(jnp.int32)` folds into one word row inside the kernel.
 WORD_BYTES = 4
 TILE_LANE_BYTES = 128  # lane width of a TensorCore tile, in bytes
+# Minimum SparseCore indirect-gather width: 16 vector lanes of uint32 words.
+SC_ROPE_ALIGN_BYTES = 16 * WORD_BYTES
 
 # Sentinels for tokens that must not be written. JAX drops out-of-bounds
 # scatters; the Pallas writers predicate on the sign instead.
@@ -67,6 +69,11 @@ def align_to(x: int, a: int) -> int:
     return (x + a - 1) // a * a
 
 
+def _xla_unpadded_word_rows(rows: int) -> bool:
+    """Whether `rows` 128-word rows per page avoid XLA `(8, 128)` tile padding."""
+    return rows > 0 and (rows % 8 == 0 or (rows < 8 and (rows & (rows - 1)) == 0))
+
+
 def get_dtype_bitwidth(dtype: jnp.dtype) -> int:
     return jax.dtypes.itemsize_bits(dtype)
 
@@ -83,7 +90,8 @@ def get_kv_cache_shape(
     kv_dtype: jnp.dtype | None = None,
     kv_packing: int | None = None,
 ) -> tuple[int, int, int, int]:
-    """Computes padded 4D shape `(total_num_pages, page_size // kv_packing, kv_packing, kv_dim)`."""
+    """Computes padded 4D shape
+    `(total_num_pages, page_size // kv_packing, kv_packing, kv_dim)`."""
     if kv_packing is None:
         assert kv_dtype is not None, "must pass kv_dtype if kv_packing is None"
         kv_packing = get_dtype_packing(kv_dtype)
@@ -115,19 +123,43 @@ class SparseMLAKVCacheSpec:
         kv_packing: int = 4,
     ) -> "SparseMLAKVCacheSpec":
         """Builds a spec with the kernel's page/head-dim padding applied."""
+        unpadded_head_dim = head_dim
         num_pages, packed_page_size, kv_packing, head_dim = get_kv_cache_shape(
             num_pages, page_size, head_dim, None, kv_packing
         )
         page_size = packed_page_size * kv_packing
+
+        if cache_type is KVCacheType.ROPE and layout is KVCacheLayout.SPARSECORE:
+            # Native SparseCore ROPE packs whole tokens into 128-word (512B)
+            # rows at the 16-lane vector granularity (64B) rather than padding
+            # each token to a 128B TensorCore lane row, whenever the resulting
+            # per-page row count stays unpadded under XLA's (8, 128) HBM tile.
+            row_bytes = WORD_BYTES * TILE_LANE_BYTES
+            sc_head_dim = align_to(unpadded_head_dim, SC_ROPE_ALIGN_BYTES)
+            if (
+                0 < sc_head_dim <= TILE_LANE_BYTES
+                and row_bytes % sc_head_dim == 0
+                and page_size % (row_bytes // sc_head_dim) == 0
+                and _xla_unpadded_word_rows(page_size // (row_bytes // sc_head_dim))
+            ):
+                head_dim = sc_head_dim
 
         if layout is KVCacheLayout.SPARSECORE:
             assert head_dim % WORD_BYTES == 0, (
                 f"head_dim {head_dim} must be a multiple of {WORD_BYTES}"
             )
             if cache_type is KVCacheType.ROPE:
-                assert page_size % WORD_BYTES == 0, (
-                    f"page_size {page_size} must be a multiple of {WORD_BYTES}"
-                )
+                row_bytes = WORD_BYTES * TILE_LANE_BYTES
+                if (
+                    head_dim > TILE_LANE_BYTES
+                    or row_bytes % head_dim
+                    or page_size % (row_bytes // head_dim)
+                ):
+                    raise ValueError(
+                        f"SparseCore ROPE head_dim {head_dim} must not exceed "
+                        f"{TILE_LANE_BYTES} or fail to divide {row_bytes}, and "
+                        f"page_size {page_size} must hold whole {row_bytes}-byte rows"
+                    )
         elif layout is KVCacheLayout.TENSORCORE:
             if cache_type is KVCacheType.NOPE:
                 assert head_dim == WORD_BYTES * TILE_LANE_BYTES, (
@@ -159,6 +191,11 @@ class SparseMLAKVCacheSpec:
         return self.head_dim
 
     @property
+    def tokens_per_row(self) -> int:
+        """Tokens sharing one `TILE_LANE_BYTES`-word row of a ROPE/SC cache."""
+        return WORD_BYTES * TILE_LANE_BYTES // self.token_bytes
+
+    @property
     def shape(self) -> tuple[int, ...]:
         if self.cache_type is KVCacheType.NOPE:
             if self.layout is KVCacheLayout.TENSORCORE:
@@ -177,7 +214,14 @@ class SparseMLAKVCacheSpec:
                     self.kv_packing,
                     self.head_dim,
                 )
-            return (self.num_pages, self.page_size // WORD_BYTES, self.head_dim)
+            # `tokens_per_row` tokens of `head_dim // WORD_BYTES` words each
+            # fill one 128-lane row, so the tiled HBM allocation carries no
+            # per-token padding.
+            return (
+                self.num_pages,
+                self.page_size // self.tokens_per_row,
+                TILE_LANE_BYTES,
+            )
         raise ValueError(f"unsupported cache type {self.cache_type}")
 
 
@@ -263,6 +307,11 @@ def get_dst_rows(
     page, slot = get_page_and_slot(
         num_tokens, seq_lens, block_tables, query_start_loc, page_size
     )
+    return _dst_rows(page, slot, page_size)
+
+
+def _dst_rows(page: jax.Array, slot: jax.Array, page_size: int) -> jax.Array:
+    """(page, slot) -> flattened row, `SKIP_ROW` wherever `page` is `OOB_PAGE`."""
     return jnp.where(page < OOB_PAGE, page * page_size + slot, SKIP_ROW)
 
 
@@ -347,8 +396,10 @@ def update_sparse_mla_kv_cache(
       kv_cache_rope: Rope cache, shaped and typed by `rope_spec`.
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
       k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
-      seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
-      block_tables: Flattened per-sequence-padded page table (`[num_seqs * pages_per_seq]`).
+      seq_lens: Per-sequence total KV length including the tokens being inserted
+        in this step (`[num_seqs]`).
+      block_tables: Flattened per-sequence-padded page table
+        (`[num_seqs * pages_per_seq]`).
       query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`).
       nope_spec: Layout descriptor the nope cache was allocated from.
       rope_spec: Layout descriptor the rope cache was allocated from.
@@ -357,17 +408,46 @@ def update_sparse_mla_kv_cache(
       The updated (nope, rope) kv caches, same shapes/dtypes as the inputs.
     """
     _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
-    # Imported here, not at module scope: `scatter` imports this module back.
-    from vllm_torchtpu.kernels.mla import scatter
-
-    addressing = (
+    page, slot = get_page_and_slot(
         kv_c_normed.shape[0],
         seq_lens,
         block_tables,
         query_start_loc,
         nope_spec.page_size,
     )
-    dst_rows = get_dst_rows(*addressing)
+    return _scatter_caches(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        page,
+        slot,
+        nope_spec,
+        rope_spec,
+    )
+
+
+def _scatter_caches(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    page: jax.Array,
+    slot: jax.Array,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+) -> tuple[jax.Array, jax.Array]:
+    """Write both caches at (`page`, `slot`), with Pallas wherever it can.
+
+    Both nope layouts and rope/SPARSECORE go through the SparseCore Pallas
+    writer; rope/TENSORCORE falls back to the XLA scatter. Shared by the
+    unsharded and DCP writers, which differ only in how they derive
+    (`page`, `slot`).
+    """
+    # Imported here, not at module scope: `scatter` imports this module back.
+    from vllm_torchtpu.kernels.mla import scatter
+
+    dst_rows = _dst_rows(page, slot, nope_spec.page_size)
     kv_cache_nope = scatter.scatter(
         kv_cache_nope, kv_c_normed, nope_spec, dst_rows=dst_rows
     )
@@ -376,7 +456,6 @@ def update_sparse_mla_kv_cache(
             kv_cache_rope, k_pe, rope_spec, dst_rows=dst_rows
         )
     else:
-        page, slot = get_page_and_slot(*addressing)
         kv_cache_rope = _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot)
     return kv_cache_nope, kv_cache_rope
 
@@ -450,7 +529,9 @@ def update_sparse_mla_kv_cache_dcp(
 
     Rows owned by another rank are dropped by aiming them at an out-of-bounds
     page -- the same trick the unsharded scatter uses for padding, and it is
-    why this needs no collective and no branch.
+    why this needs no collective and no branch. The writes then go through the
+    same SparseCore Pallas writer as the unsharded path, so the caches are
+    updated in place in the layout the readers use.
 
     Must be called from inside a `shard_map`; `dcp_rank` is this shard's index
     along the DCP axis as traced data, so one compiled program serves every
@@ -470,8 +551,80 @@ def update_sparse_mla_kv_cache_dcp(
       The updated (nope, rope) shards, same shapes/dtypes as the inputs.
     """
     _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
-    # Asserted equal to the rope page size just above, so one (page, slot)
-    # addresses both caches.
+    page, slot = _get_dcp_page_and_slot(
+        kv_c_normed.shape[0],
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        nope_spec=nope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    return _scatter_caches(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        page,
+        slot,
+        nope_spec,
+        rope_spec,
+    )
+
+
+def update_sparse_mla_kv_cache_dcp_jax(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Pure-XLA `update_sparse_mla_kv_cache_dcp`, for every layout.
+
+    The DCP twin of `update_sparse_mla_kv_cache_jax`: runs on CPU, and is the
+    golden the SparseCore DCP writer is checked against. Same arguments and
+    returns as it.
+    """
+    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
+    page, slot = _get_dcp_page_and_slot(
+        kv_c_normed.shape[0],
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        nope_spec=nope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    return (
+        _scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
+        _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot),
+    )
+
+
+def _get_dcp_page_and_slot(
+    num_tokens: int,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """This rank's (page, slot) per token; `OOB_PAGE` for rows it does not own."""
+    # `_check_inputs` asserts it equal to the rope page size, so one
+    # (page, slot) addresses both caches.
     page_size = nope_spec.page_size
     if interleave_size % WORD_BYTES:
         raise ValueError(
@@ -488,9 +641,7 @@ def update_sparse_mla_kv_cache_dcp(
             "here."
         )
 
-    _, seq_id, pos, in_batch = _row_positions(
-        kv_c_normed.shape[0], seq_lens, query_start_loc
-    )
+    _, seq_id, pos, in_batch = _row_positions(num_tokens, seq_lens, query_start_loc)
 
     virtual_page_size = jnp.int32(page_size * dcp_size)
     cycle = jnp.int32(dcp_size * interleave_size)
@@ -511,8 +662,4 @@ def update_sparse_mla_kv_cache_dcp(
     page = jnp.where(
         valid, local_block_tables[seq_id, virtual_page], jnp.int32(OOB_PAGE)
     )
-
-    return (
-        _scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
-        _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot),
-    )
+    return page, slot

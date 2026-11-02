@@ -1,14 +1,27 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -16,17 +29,23 @@ if TYPE_CHECKING:
 
 @dataclass
 class SpecDecodeMetadata:
-    """Metadata for speculative decoding on Torch/TPU, containing all necessary indices."""
+    """Metadata for speculative decoding on Torch/TPU, containing all
+    necessary indices.
+    """
 
-    # [padded_logits_length] draft token id validated at each target_logits_indices slot.
-    draft_token_ids: torch.Tensor
+    # [padded_logits_length] draft token id validated at each
+    # target_logits_indices slot. None only while deferred (see
+    # `deferred_draft_token_ids_cpu`).
+    draft_token_ids: torch.Tensor | None
     # [padded_num_reqs] per-request draft-token count (device copy).
     draft_lengths: torch.Tensor
     # [num_reqs] per-request draft-token count (host copy, unpadded).
     draft_lengths_cpu: np.ndarray
-    # [padded_logits_length] row into this step's logits/hidden-states for each draft token being validated.
+    # [padded_logits_length] row into this step's logits/hidden-states for each draft
+    # token being validated.
     target_logits_indices: torch.Tensor
-    # [padded_num_reqs] row into this step's logits/hidden-states for each request's bonus (last sampled) token.
+    # [padded_num_reqs] row into this step's logits/hidden-states for each request's
+    # bonus (last sampled) token.
     bonus_logits_indices: torch.Tensor
     # [padded_logits_length] row into the input batch for every draft + bonus
     # position the target model forward needs logits for.
@@ -36,20 +55,32 @@ class SpecDecodeMetadata:
     segment_ids: torch.Tensor
     # [padded_logits_length] within-request draft-slot index of each position.
     group_indices: torch.Tensor
+    # Host copy of draft_token_ids when its upload was deferred: under async
+    # scheduling execute_model re-sources the drafts from the device and
+    # uploads this only for a chunk with nothing substituted.
+    deferred_draft_token_ids_cpu: np.ndarray | None = None
+
+    def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
+        assert self.deferred_draft_token_ids_cpu is not None
+        return torch.from_numpy(self.deferred_draft_token_ids_cpu).to(
+            device, non_blocking=True
+        )
 
 
 class SpeculativeDecodingManager:
-    """Manages speculative decoding operations, including draft proposal and metadata generation."""
+    """Manages speculative decoding operations, including draft proposal and
+    metadata generation.
+    """
 
     def __init__(self, runner: TPUModelRunner):
         self.runner = runner
         # Cached draft tokens.
         self._draft_token_ids: list[list[int]] | None = None
         # For async-scheduling: in-flight D2H copy of drafts on device,
-        # as (cpu_tensor, ready_event, req_ids snapshot). See
-        # stage_draft_token_ids_for_host.
+        # as (per-chunk cpu tensors, per-chunk real row counts, ready_event,
+        # req_ids snapshot). See stage_draft_token_ids_for_host.
         self._staged_draft_copy: (
-            tuple[torch.Tensor, torch.Event | None, list[str]] | None
+            tuple[list[torch.Tensor], list[int], torch.Event | None, list[str]] | None
         ) = None
         self.spec_token_ids: dict[str, list[int]] = {}
         # Content-keyed cache for get_spec_decode_metadata: 7 of its 8 device
@@ -67,11 +98,14 @@ class SpeculativeDecodingManager:
             # For async scheduling: the engine only asks when a step carries
             # structured-output requests, to swap real drafts into the
             # deferred grammar-bitmask computation.
-            drafts_cpu, ready_event, req_ids = self._staged_draft_copy
+            drafts_cpu, real_lens, ready_event, req_ids = self._staged_draft_copy
             self._staged_draft_copy = None
             if ready_event is not None:
                 ready_event.synchronize()
-            return DraftTokenIds(req_ids, drafts_cpu.tolist())
+            # Trim each bucketed chunk to its real rows on the host.
+            rows = [t[:n] for t, n in zip(drafts_cpu, real_lens)]
+            merged = rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
+            return DraftTokenIds(req_ids, merged.tolist())
         if self._draft_token_ids is None:
             return None
         num_reqs = self.runner.input_batch.num_reqs
@@ -80,7 +114,11 @@ class SpeculativeDecodingManager:
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
-    def stage_draft_token_ids_for_host(self, drafts: torch.Tensor) -> None:
+    def stage_draft_token_ids_for_host(
+        self,
+        drafts: torch.Tensor | list[torch.Tensor],
+        real_lens: list[int] | None = None,
+    ) -> None:
         """Starts a non-blocking D2H copy of drafts on device.
 
         Async scheduling keeps drafts on device (return_device=True), but the
@@ -89,18 +127,30 @@ class SpeculativeDecodingManager:
         the next step's forward, so take only waits for the copy itself.
         Note that req_ids must be snapshotted now because take_draft_token_ids()
         is called after the next step's execute_model mutates input_batch.
+
+        `drafts` is either one exact `[num_reqs, K]` tensor (eagle3) or one
+        bucketed `[rows, K]` tensor per chunk with `real_lens` giving each
+        chunk's real request count (bucketed-draft proposer, dflash/dspark).
+        Padded chunks are copied whole and trimmed on the host, so the copy's
+        shapes stay bucketed.
         """
         num_reqs = self.runner.input_batch.num_reqs
-        assert drafts.shape[0] == num_reqs, (
-            f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}"
-        )
+        if isinstance(drafts, torch.Tensor):
+            assert drafts.shape[0] == num_reqs, (
+                f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}"
+            )
+            chunks = [drafts]
+            lens = [num_reqs]
+        else:
+            chunks = list(drafts)
+            lens = [int(n) for n in real_lens or ()]
         req_ids = list(self.runner.input_batch.req_ids[:num_reqs])
-        drafts_cpu = drafts.to("cpu", non_blocking=True)
+        drafts_cpu = [t.to("cpu", non_blocking=True) for t in chunks]
         ready_event = None
-        if drafts.device.type != "cpu":
+        if chunks[0].device.type != "cpu":
             ready_event = torch.tpu.Event()
             ready_event.record()
-        self._staged_draft_copy = (drafts_cpu, ready_event, req_ids)
+        self._staged_draft_copy = (drafts_cpu, lens, ready_event, req_ids)
 
     def propose_draft_token_ids(
         self,
@@ -110,8 +160,8 @@ class SpeculativeDecodingManager:
         scheduler_output=None,
         return_device: bool = False,
         next_tokens_per_chunk: list[torch.Tensor] | None = None,
-        device_seed: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
+        device_seed: torch.Tensor | list[torch.Tensor] | None = None,
+    ) -> torch.Tensor | list[torch.Tensor] | None:
         """Proposes draft token IDs based on the speculative decoding method.
 
         The single dispatch point for all draft proposing. eagle3 is called
@@ -137,15 +187,16 @@ class SpeculativeDecodingManager:
           scheduler_output: vLLM SchedulerOutput; carries the per-step spec
             token budget for ngram and the partial-prefill next-token lookup
             for eagle3.
-          return_device: return the raw ``[num_reqs, K]`` device tensor
-            instead of caching a host list for take_draft_token_ids.
+          return_device: return the device drafts instead of caching a host
+            list: one exact ``[num_reqs, K]`` tensor (eagle3) or one bucketed
+            tensor per chunk (bucketed-draft proposers).
           next_tokens_per_chunk: on-device rejection-sampler output (spec
             verify step).
           device_seed: on-device just-sampled tokens (prefill / non-spec
-            step).
+            step): a flat batch tensor, or one bucketed tensor per chunk.
 
         Returns:
-          The raw device tensor when return_device=True; otherwise None (the
+          The raw device drafts when return_device=True; otherwise None (the
           host list is cached in self._draft_token_ids).
         """
         num_reqs = self.runner.input_batch.num_reqs
@@ -161,9 +212,11 @@ class SpeculativeDecodingManager:
             assert self.runner._is_async_drafter, (
                 "device-seeded draft proposing is only supported with an async drafter"
             )
+        assert self.runner.speculative_config is not None
         if self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
             assert sampled_token_ids is not None
+            assert scheduler_output is not None
             self._draft_token_ids = self.runner.drafter.propose(
                 scheduler_output.num_spec_tokens_to_schedule,
                 sampled_token_ids[:num_reqs],
@@ -172,20 +225,39 @@ class SpeculativeDecodingManager:
             )
             return None
         elif self.runner._is_async_drafter:
-            result = self.runner.drafter.propose(
-                sampled_token_ids[:num_reqs]
-                if sampled_token_ids
-                else sampled_token_ids,
-                discard_sampled_tokens_req_indices or [],
-                num_rejected_tokens_np,
-                scheduler_output,
-                return_device=return_device,
-                next_tokens_per_chunk=next_tokens_per_chunk,
-                device_seed=device_seed,
+            drafter = self.runner._async_drafter
+            sampled = (
+                sampled_token_ids[:num_reqs] if sampled_token_ids else sampled_token_ids
             )
+            discard = discard_sampled_tokens_req_indices or []
+            if isinstance(drafter, DFlashProposer):
+                # Bucketed drafters take one seed tensor per chunk.
+                assert device_seed is None or isinstance(device_seed, list)
+                result = drafter.propose(
+                    sampled,
+                    discard,
+                    num_rejected_tokens_np,
+                    scheduler_output,
+                    return_device=return_device,
+                    next_tokens_per_chunk=next_tokens_per_chunk,
+                    device_seed=device_seed,
+                )
+            else:
+                assert device_seed is None or isinstance(device_seed, torch.Tensor)
+                result = drafter.propose(
+                    sampled,
+                    discard,
+                    num_rejected_tokens_np,
+                    scheduler_output,
+                    return_device=return_device,
+                    next_tokens_per_chunk=next_tokens_per_chunk,
+                    device_seed=device_seed,
+                )
             if return_device:
+                assert isinstance(result, torch.Tensor | list)
                 return result
-            self._draft_token_ids = result
+            assert isinstance(result, list)
+            self._draft_token_ids = cast("list[list[int]]", result)
             return None
         else:
             raise NotImplementedError(
@@ -198,13 +270,18 @@ class SpeculativeDecodingManager:
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
+        defer_draft_token_ids: bool = False,
     ) -> SpecDecodeMetadata:
-        """Calculates indices for speculative decoding forward pass and rejection sampling.
+        """Calculates indices for speculative decoding forward pass and
+        rejection sampling.
 
         Args:
           num_draft_tokens: The number of draft tokens for each request.
           cu_num_scheduled_tokens: The cumulative number of scheduled tokens.
           padded_num_reqs: The padded number of requests.
+          defer_draft_token_ids: Leave `draft_token_ids` None and keep its
+            host copy in `deferred_draft_token_ids_cpu` instead of uploading
+            it; the caller fills it in.
 
         Returns:
           A SpecDecodeMetadata object containing the necessary indices for
@@ -228,8 +305,12 @@ class SpeculativeDecodingManager:
             padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
             padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
             return SpecDecodeMetadata(
-                draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
-                    self.runner.device, non_blocking=True
+                draft_token_ids=(
+                    None
+                    if defer_draft_token_ids
+                    else torch.from_numpy(padded_draft_token_ids).to(
+                        self.runner.device, non_blocking=True
+                    )
                 ),
                 draft_lengths=self._meta_cache.draft_lengths,
                 draft_lengths_cpu=self._meta_cache.draft_lengths_cpu,
@@ -238,6 +319,9 @@ class SpeculativeDecodingManager:
                 final_logits_indices=self._meta_cache.final_logits_indices,
                 segment_ids=self._meta_cache.segment_ids,
                 group_indices=self._meta_cache.group_indices,
+                deferred_draft_token_ids_cpu=(
+                    padded_draft_token_ids if defer_draft_token_ids else None
+                ),
             )
 
         # [num_reqs]
@@ -331,8 +415,12 @@ class SpeculativeDecodingManager:
         device = self.runner.device
 
         metadata = SpecDecodeMetadata(
-            draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
-                device, non_blocking=True
+            draft_token_ids=(
+                None
+                if defer_draft_token_ids
+                else torch.from_numpy(padded_draft_token_ids).to(
+                    device, non_blocking=True
+                )
             ),
             draft_lengths=torch.from_numpy(padded_num_draft_tokens).to(
                 device, non_blocking=True
@@ -352,6 +440,9 @@ class SpeculativeDecodingManager:
             ),
             group_indices=torch.from_numpy(padded_group_indices).to(
                 device, non_blocking=True
+            ),
+            deferred_draft_token_ids_cpu=(
+                padded_draft_token_ids if defer_draft_token_ids else None
             ),
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller

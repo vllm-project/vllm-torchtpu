@@ -1,10 +1,24 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 import zlib
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (  # noqa: E501
     CompressedTensorsW4A4Mxfp4MoEMethod,
 )
 
@@ -21,18 +35,15 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
     get_cpu_weight_loader_hook,
     release_memory_to_os,
 )
-from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32_bits
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
-
-def _fresh(t: torch.Tensor) -> torch.Tensor:
-    """Allocate a fresh contiguous device buffer (breaks view/stride chains so
-    the torch_tpu pallas boundary ships a plain row-major buffer)."""
-    return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 
 class VllmCompressedTensorsW4ANMxfp4MoEMethod(
@@ -65,7 +76,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         scratch = getattr(parameter, "_cpu_scratch", None)
         return parameter.data if scratch is None else scratch.data
 
-    def _initialize_dummy_quantized_weights(self, layer: RoutedExperts) -> None:
+    def _initialize_dummy_quantized_weights(self, layer: "TpuRoutedExperts") -> None:
         """Use finite, nonzero random FP4 weights for meaningful dummy runs.
 
         The upstream dummy loader skips integer checkpoint containers. Encode
@@ -115,7 +126,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
         # Inject our optimized TPU CPU weight loader hook
         extra_weight_attrs["weight_loader"] = get_cpu_weight_loader_hook(
-            layer,
+            cast("RoutedExperts", layer),
             orig_loader,
             self.moe.tp_size,
             self.moe.tp_rank,
@@ -131,7 +142,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             **extra_weight_attrs,
         )
 
-    def _neutralize_padded_scales(self, layer: RoutedExperts) -> None:
+    def _neutralize_padded_scales(self, layer: "TpuRoutedExperts") -> None:
         """Make unloaded E8M0 padding finite without initializing full buffers.
 
         The checkpoint loader only writes the logical intermediate width into
@@ -143,6 +154,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         large models.
         """
         unpadded_size = self.moe.intermediate_size_per_partition_unpadded
+        assert unpadded_size is not None
         padded_size = self.moe.intermediate_size_per_partition
         if unpadded_size >= padded_size:
             return
@@ -160,6 +172,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
+        layer = cast("TpuRoutedExperts", layer)
 
         self._initialize_dummy_quantized_weights(layer)
         self._neutralize_padded_scales(layer)
@@ -171,8 +184,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         w2_weight_scale = self._loaded_data(layer.w2_weight_scale).to("tpu")
 
         # Convert e8m0 scales to fp32
-        w13_scale = e8m0_to_fp32(w13_weight_scale)
-        w2_scale = e8m0_to_fp32(w2_weight_scale)
+        w13_scale = e8m0_to_fp32_bits(w13_weight_scale)
+        w2_scale = e8m0_to_fp32_bits(w2_weight_scale)
 
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
         if requant_block is not None:
@@ -184,30 +197,31 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             if hidden % requant_block != 0 or inter % requant_block != 0:
                 raise ValueError(
                     f"W4A8 requantization needs hidden ({hidden}) and inter ({inter}) "
-                    f"to be divisible by block ({requant_block}). Padding is not yet supported."
+                    f"to be divisible by block ({requant_block}). "
+                    "Padding is not yet supported."
                 )
 
             # Apply XLA fused requantization and kmajor layout shift
             w13_weight, w13_scale_4d = requant_load_kmajor_fp4(
-                _fresh(w13_weight_packed), w13_scale, requant_block
+                fresh_buffer(w13_weight_packed), w13_scale, requant_block
             )
             w2_weight, w2_scale_4d = requant_load_kmajor_fp4(
-                _fresh(w2_weight_packed), w2_scale, requant_block
+                fresh_buffer(w2_weight_packed), w2_scale, requant_block
             )
         else:
 
             def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
                 # scale shape: [E, N, num_blocks]
                 # gmm_v2 scale layout: [E, num_blocks, 1, N]
-                return _fresh(scale.movedim(-1, 1).unsqueeze(-2))
+                return fresh_buffer(scale.movedim(-1, 1).unsqueeze(-2))
 
             w13_scale_4d = _to_kernel_scale(w13_scale)
             w2_scale_4d = _to_kernel_scale(w2_scale)
 
             # Unpack to native fp4 in the kernel's K-major layout once at load
             # [E, N, K/2] uint8 -> [E, K/2, N] torch.float4_e2m1fn_x2
-            w13_weight = load_kmajor_fp4(_fresh(w13_weight_packed))
-            w2_weight = load_kmajor_fp4(_fresh(w2_weight_packed))
+            w13_weight = load_kmajor_fp4(fresh_buffer(w13_weight_packed))
+            w2_weight = load_kmajor_fp4(fresh_buffer(w2_weight_packed))
 
         # Clean up CPU scratchpads
         for parameter in (
@@ -292,6 +306,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         SP callers gather the small top-k tensors instead of full logits.
         Rows here are in the same global token order as ``x``.
         """
+        layer = cast("TpuRoutedExperts", layer)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"

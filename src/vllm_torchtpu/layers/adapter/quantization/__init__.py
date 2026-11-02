@@ -30,7 +30,7 @@ import copy
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     VllmCompressedTensorsConfig,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
@@ -97,4 +97,5 @@ def get_tpu_quantization_config(
         quant_config_cls.get_name()
     )
     config = VllmConfig.get_quantization_config(model_config, vllm_config.load_config)
+    assert config is not None
     return attach_online_fp8(config, vllm_config)

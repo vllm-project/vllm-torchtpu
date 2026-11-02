@@ -1,4 +1,17 @@
 #!/bin/bash
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # shellcheck disable=all
 set -e
@@ -89,6 +102,12 @@ INPUT_LEN=${INPUT_LEN:=512}
 OUTPUT_LEN=${OUTPUT_LEN:=128}
 NUM_PROMPTS=${NUM_PROMPTS:=200}
 REQUEST_RATE=${REQUEST_RATE:=4}
+# Extra `vllm serve` flags per role, word-split into arrays without pathname
+# globbing (supports flags without spaces in their values). Empty by default;
+# CI uses them to stop each role compiling shapes this benchmark never runs
+# (see the disagg-single-host step in .buildkite/pipeline_integration.yml).
+read -ra PREFILL_EXTRA <<< "${PREFILL_EXTRA_ARGS:-}"
+read -ra DECODE_EXTRA <<< "${DECODE_EXTRA_ARGS:-}"
 
 NUM_PREFILL_INSTANCES=1
 NUM_DECODE_INSTANCES=1
@@ -135,6 +154,7 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     --gpu-memory-utilization 0.2 \
     --tensor-parallel-size $PREFILLER_TP_SIZE \
     --attention-backend CUSTOM \
+    "${PREFILL_EXTRA[@]}" \
     --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\"}" \
     > $LOG_DIR/prefill_$i.txt 2>&1 &
 
@@ -166,6 +186,7 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     --gpu-memory-utilization 0.2 \
     --tensor-parallel-size $DECODER_TP_SIZE \
     --attention-backend CUSTOM \
+    "${DECODE_EXTRA[@]}" \
     --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\"}" \
     > $LOG_DIR/decode_$i.txt 2>&1 &
 

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """SPMD TP-replica numerical checks on one host, plus a two-host regression.
 
 Single-host tests use eight local TPU devices, with deliberately permuted mesh
@@ -19,6 +31,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.fused_moe.v2 import AXIS, WeightFormat, fused_ep_moe_v2
 from vllm_torchtpu.kernels.fused_moe.v2.host import U32_SUBLANE_TILE
+from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import replica_wire_rows
 
 pytestmark = pytest.mark.multichip
 
@@ -335,3 +348,52 @@ def test_fp4_replicas_match_original_layer(case, rows):
             json.dumps({"groups": groups, "rows": rows, "results": stats}, indent=2)
             + "\n"
         )
+
+
+@pytest.mark.parametrize(
+    "groups,rows",
+    [
+        pytest.param(((0, 1), (2, 3), (4, 5), (6, 7)), 256, id="tp2-whole-blocks"),
+        pytest.param(_TP4_PERMUTED, 7, id="tp4-wire-padding"),
+        pytest.param(_TP4_PERMUTED, 1, id="tp4-empty-members"),
+    ],
+)
+def test_split_stages_with_replicas_are_bit_exact(single_host_mesh, groups, rows):
+    """route, a reordered gather, compute == fused, with route's padding live.
+
+    Below one block of rows per member, route returns more rows than the
+    layer computes (replica_wire_rows); compute must drop exactly those.
+    """
+    mesh = single_host_mesh
+    ep = mesh.shape[AXIS]
+    rank, inputs = _make_inputs(mesh, groups, rows, WeightFormat.FP8)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=128,
+        weight_format=WeightFormat.FP8,
+        token_replica_groups=groups,
+    )
+    fused = jax.jit(lambda r, *a: fused_ep_moe_v2(*a, rank=r, **common))(rank, *inputs)
+    q, weights, payload = jax.jit(
+        lambda r, *a: fused_ep_moe_v2(*a, rank=r, stage="route", **common)
+    )(rank, *inputs)
+    assert q.shape[0] == ep * replica_wire_rows(rows, len(groups[0]), U32_SUBLANE_TILE)
+
+    order = (0, 1, 6, 7, 2, 3, 4, 5)
+    blocks = np.asarray(q).reshape((ep, -1) + q.shape[1:])
+    gathered = blocks[np.asarray(order)].reshape(q.shape)
+    q_g = jax.device_put(np.concatenate([gathered] * ep), NamedSharding(mesh, P(AXIS)))
+    positions = tuple(order.index(i) for i in range(ep))
+    split = jax.jit(
+        lambda r, routed, *a: fused_ep_moe_v2(
+            *a,
+            rank=r,
+            stage="compute",
+            routed=routed,
+            gather_positions=positions,
+            **common,
+        )
+    )(rank, (q_g, weights, payload), *inputs)
+    np.testing.assert_array_equal(np.asarray(split), np.asarray(fused))

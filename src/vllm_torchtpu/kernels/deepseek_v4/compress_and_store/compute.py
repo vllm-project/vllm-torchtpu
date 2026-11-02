@@ -17,6 +17,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+
 
 def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     """Applies interleaved Rotary Position Embedding (RoPE) to a vector."""
@@ -191,10 +193,7 @@ def pack_nope_tiled(
     scale_flat = scale_bytes.reshape(tile_n, -1)  # (tile_n, S * num_blocks)
 
     # Select NOPE parts
-    if nope_dim < q_flat.shape[1]:
-        q_nope = q_flat[:, :nope_dim]
-    else:
-        q_nope = q_flat
+    q_nope = q_flat[:, :nope_dim] if nope_dim < q_flat.shape[1] else q_flat
 
     nope_blocks = (nope_dim + block_size - 1) // block_size
     if nope_blocks < scale_flat.shape[1]:
@@ -212,30 +211,47 @@ def pack_nope_tiled(
     return nope_record_padded.reshape(tile_n, -1, last_dim_size)
 
 
-def pack_rope_tiled(rope_slot_ropped, rope_head_dim_actual, rope_width=128):
-    # rope_slot_ropped: (tile_n, 1, 128)
-    # TODO: make this a config value rather than inferred
-    start = 128 - rope_head_dim_actual
-    rope_val = rope_slot_ropped[:, :, start:]  # (tile_n, 1, rope_head_dim)
+def rope_words_tiled(rope_slot_ropped, rope_head_dim):
+    """RoPE channels as cache words: low half bf16 ``k``, high half ``k + 32``.
 
-    rope_bf16 = rope_val.astype(jnp.bfloat16)
-    rope_width_bf16 = rope_width // 2
+    rope_slot_ropped: (tile_n, 1, 128) f32 holding the channels in its last
+    ``rope_head_dim`` lanes. Returns (tile_n, 1, 128) int32 with word ``k`` at
+    lane ``128 - rope_head_dim + k``; the lanes around it are junk.
+    """
+    bits = pltpu.bitcast(rope_slot_ropped.astype(jnp.bfloat16), jnp.uint16)
+    bits = bits.astype(jnp.int32)
+    half = rope_head_dim // 2
+    # Lane c picks up channel c + half as its high half.
+    return bits | (pltpu.roll(bits, bits.shape[-1] - half, 2) << 16)
 
-    if rope_head_dim_actual < rope_width_bf16:
-        rope_padded_bf16 = jnp.pad(
-            rope_bf16,
-            ((0, 0), (0, 0), (0, rope_width_bf16 - rope_head_dim_actual)),
-        )
-    else:
-        rope_padded_bf16 = rope_bf16
 
-    rope_u16 = pltpu.bitcast(rope_padded_bf16, jnp.uint16)
-    rope_i32 = rope_u16.astype(jnp.int32)
-    rope_hi = ((rope_i32 >> 8) & 0xFF).astype(jnp.uint8)
-    rope_lo = (rope_i32 & 0xFF).astype(jnp.uint8)
-    rope_uint8_2d = jnp.concatenate([rope_hi, rope_lo], axis=-1)
+def merge_rope_row(
+    row,  # (1, 128) int32, the RoPE row as read from HBM
+    kv_slots,  # (tile_n,) int, token index of every token in the tile
+    words,  # rope_words_tiled(...)
+    rope_lane,  # int, lane of RoPE word 0 in `words`
+    n,  # int, the token whose row this is
+):
+    """Writes every tile token whose RoPE lands in token n's row into it.
 
-    return rope_uint8_2d[:, None, :]
+    Token ``j`` of a row owns words ``[32 j, 32 j + 32)`` (see
+    `csa_cache_layout`), so one rotation puts a token's words in its window.
+    """
+    per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
+    width = csa_cache_layout.ROPE_WORDS
+    lanes = row.shape[-1]
+    window = jax.lax.broadcasted_iota(jnp.int32, row.shape, 1) // width
+    curr_slot = kv_slots[n]
+    curr_row = curr_slot // per_row
+
+    for i in range(kv_slots.shape[0]):
+        slot_i = kv_slots[i]
+        hit = (slot_i >= 0) & (curr_slot >= 0) & (slot_i // per_row == curr_row)
+        pos_i = slot_i % per_row
+        for j in range(per_row):
+            placed = pltpu.roll(words[i], (j * width - rope_lane) % lanes, 1)
+            row = jnp.where(hit & (pos_i == j) & (window == j), placed, row)
+    return row
 
 
 def merge_slot_updates(
@@ -284,13 +300,98 @@ def merge_slot_updates(
     return jnp.stack(slots_list)
 
 
+def stage_sal_columns(
+    records_t_ref,  # (groups, 4, padded_tokens) uint8 VMEM, SEQ_ALONG_LANE
+    records,  # (n, record_bytes) uint8, HEAD_ALONG_SUBLANE records
+    first_token,  # traced int, multiple of n: lane of records[0]
+):
+    """Copies `records` into lanes `[first_token, first_token + n)`.
+
+    In the SEQ_ALONG_LANE layout (`streamindex_topk.KVLayout.SEQ_ALONG_LANE`)
+    each token is one lane: sublane group `g` of lane `t` holds bytes
+    `4g..4g+3` of token `t`'s record. Getting there from one-row-per-token
+    records is a byte transpose, which is slow on TPU, so it is done with two
+    matmuls against 0/1 matrices instead:
+
+    1. `pick @ records^T` selects bytes: row `k * groups_pad + g` gets byte
+       `4g + k` of every record.
+    2. `@ place` moves each record's column to its target lane.
+
+    The result is exact. Every input is either 0/1 or a byte value (0-255),
+    which bf16 represents exactly, and each output element is a single
+    nonzero product, so nothing is rounded.
+    """
+    n, width = records.shape
+    groups = records_t_ref.shape[0]
+    lanes = 128
+    # TPU register tiles have 8 sublanes; pad both matmul dimensions to a
+    # multiple of `sublane_tile`.
+    sublane_tile = 8
+    rows_pad = sublane_tile
+    groups_pad = pl.cdiv(groups, sublane_tile) * sublane_tile
+    assert n <= rows_pad and lanes % n == 0, (n, rows_pad)
+    padded_records = jnp.concatenate(
+        [
+            records.astype(jnp.int32),
+            jnp.zeros((rows_pad - n, width), jnp.int32),
+        ],
+        axis=0,
+    ).astype(jnp.bfloat16)  # (8, width)
+
+    lane_offset = first_token % lanes
+    token_idx = jax.lax.broadcasted_iota(jnp.int32, (rows_pad, lanes), 0)
+    lane_idx = jax.lax.broadcasted_iota(jnp.int32, (rows_pad, lanes), 1)
+    place = ((lane_idx == lane_offset + token_idx) & (token_idx < n)).astype(
+        jnp.bfloat16
+    )  # (8, 128)
+
+    # Row `out_row = byte_in_word * groups_pad + group_idx` picks byte
+    # `4 * group_idx + byte_in_word` (the 4 byte planes stacked).
+    pick_shape = (4 * groups_pad, width)
+    out_row = jax.lax.broadcasted_iota(jnp.int32, pick_shape, 0)
+    byte_idx = jax.lax.broadcasted_iota(jnp.int32, pick_shape, 1)
+    byte_in_word, group_idx = out_row // groups_pad, out_row % groups_pad
+    pick = ((byte_idx == 4 * group_idx + byte_in_word) & (group_idx < groups)).astype(
+        jnp.bfloat16
+    )
+    planes = jax.lax.dot_general(
+        pick,
+        padded_records,
+        (((1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )  # (4 * groups_pad, 8)
+    placed = jnp.dot(
+        planes.astype(jnp.bfloat16), place, preferred_element_type=jnp.float32
+    ).astype(jnp.int32)  # (4 * groups_pad, 128)
+    words = placed[:groups_pad]
+    for byte_pos in range(1, 4):
+        words = words | (
+            placed[byte_pos * groups_pad : (byte_pos + 1) * groups_pad]
+            << (8 * byte_pos)
+        )
+    words = pltpu.bitcast(words[:groups], jnp.uint32)  # (groups, 128)
+
+    tile_start_lane = pl.multiple_of((first_token // lanes) * lanes, lanes)
+    staging_tile = records_t_ref[:, :, pl.ds(tile_start_lane, lanes)]
+    current_words = pltpu.bitcast(staging_tile.reshape(groups * 4, lanes), jnp.uint32)
+    tile_lanes = jax.lax.broadcasted_iota(jnp.int32, (groups, lanes), 1)
+    updated_words = jnp.where(
+        (tile_lanes >= lane_offset) & (tile_lanes < lane_offset + n),
+        words,
+        current_words,
+    )
+    records_t_ref[:, :, pl.ds(tile_start_lane, lanes)] = pltpu.bitcast(
+        updated_words, jnp.uint8
+    ).reshape(groups, 4, lanes)
+
+
 def gather_from_page_buffer(
     page_buffer,
     positions_ref,
     kv_window_u8,
     score_window_u8,
     *,
-    global_idx: int,
+    global_idx: jax.Array,
     num_tokens: int,
     window: int,
     block_size: int,
@@ -298,14 +399,19 @@ def gather_from_page_buffer(
     field_rows: int,
     state_rows_per_token: int,
     overlap: bool,
+    token_valid: list[jax.Array],
     is_indexer: bool = False,
 ):
-    """Extracts kv_window, score_window from page buffer."""
+    """Extracts kv_window, score_window from page buffer.
+
+    Tokens with ``token_valid[n]`` false have no output record, so their
+    window is left as is: their compute lanes are discarded.
+    """
     tile_n = page_buffer.shape[0]
     if is_indexer:
         # CSA_INDEXER (layout 32x4x256)
         # page_buffer shape: (tile_n, pages_to_buffer, 32, 4, 256)
-        for n in range(tile_n):
+        def _gather_indexer_token(n):
             safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
             pos = positions_ref[safe_idx]
 
@@ -353,18 +459,25 @@ def gather_from_page_buffer(
                     kv_window_u8[n, w, 0, :, :] = val_kv
                     score_window_u8[n, w, 0, :, :] = val_score
 
+        for n in range(tile_n):
+
+            @pl.when(token_valid[n])
+            def _(n=n):
+                _gather_indexer_token(n)
     else:
         # Standard HCA/CSA (last dim 128)
         slots_per_part_head = kv_window_u8.shape[2]
 
-        for n in range(tile_n):
+        def _gather_token(n):
             safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
             pos = positions_ref[safe_idx]
 
             block_idx_curr = pos // block_size
             pos_start = pos - window + 1
 
-            @pl.loop(0, window)
+            # Unrolled: the body is a handful of row copies, so the loop's own
+            # scalar overhead per position was most of its cost.
+            @pl.loop(0, window, unroll=min(window, 8))
             def body_w(w):
                 pos_w = pos_start + w
                 block_idx_w = pos_w // block_size
@@ -403,3 +516,9 @@ def gather_from_page_buffer(
                     score_window_u8[n, w, d_idx, :, :] = page_buffer[
                         n, p, score_src_row, :, :
                     ]
+
+        for n in range(tile_n):
+
+            @pl.when(token_valid[n])
+            def _(n=n):
+                _gather_token(n)

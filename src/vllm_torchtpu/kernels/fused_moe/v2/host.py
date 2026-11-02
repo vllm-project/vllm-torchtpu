@@ -18,7 +18,7 @@ fits. Nothing here runs inside the Pallas body."""
 
 import enum
 import math
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -295,7 +295,7 @@ class WeightForm(NamedTuple):
     """
 
     name: WeightFormat
-    weight_dtype: object
+    weight_dtype: jax.typing.DTypeLike
     act_dtype: object
     act_max: object
     scale_layout: str
@@ -615,7 +615,12 @@ def build_routing_tables(
         mirror_blocks, expert_blocks, bins
     ).reshape(-1)
 
-    slab_row = base_of_pair + slot  # always < total
+    on_valid = (expert_of_pair >= 0) & (expert_of_pair < e_total)
+    slab_row = jnp.where(
+        on_valid,
+        base_of_pair + slot,
+        jnp.int32(off_shard_slab_row(shard_stride, ep)),
+    )
 
     return RoutingTables(
         arrival_row=pos.reshape(T, K),
@@ -875,6 +880,7 @@ def build_routing_tables_sharded(
             expert_blocks, (me * blocks_per_dest, 0), (blocks_per_dest, block)
         )
         my_hist = _block_hist(my_blocks, bins)
+        assert all_gather_rows is not None
         rows_by_dest = all_gather_rows(my_hist.sum(axis=0, keepdims=True))
     else:
         my_blocks, my_hist = gathered.local_blocks, gathered.block_hist
@@ -1015,9 +1021,10 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
 
     The kernel fetches an input row by this table value with bounds checks
     off, so the one index that reaches memory is clamped here rather than
-    trusted. An expert id outside [0, e_total) would land two pairs on one
-    row and sum their token numbers; the acceptance check refuses a gating
-    width that could produce one, and this is the backstop for it. Clipped
+    trusted. An expert id outside [0, e_total) is in no expert's count, and
+    both plan builders send its pair to `off_shard_slab_row`, so it never
+    reaches this scatter's live rows; the layer relies on that for the id
+    e_total it gives padding rows. The clamp is the backstop. Clipped
     on BOTH sides, to the bounds gather_clamp_bounds names -- see there for
     why the upper one is floored at zero. build_routing_tables refuses T = 0
     before any of this; the clip is written so that it would hold on its own.
@@ -1472,7 +1479,7 @@ def vmem_tile_body_arrays(
     """
     form = weight_form(weight_format)
     tile_m = capacity
-    arrays = [
+    arrays: list[tuple[str, tuple[int, ...], Any]] = [
         ("acc1", (tile_m, 2 * inter), jnp.float32),
         ("mid_chunks", (tile_m, inter), jnp.bfloat16),
     ]
@@ -1638,4 +1645,5 @@ def fit_weight_slots(
             break
     # The first depth that fits, or distance zero over budget for the
     # caller to refuse by name.
+    assert slots is not None
     return slots

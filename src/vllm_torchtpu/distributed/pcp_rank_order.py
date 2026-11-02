@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Topology-aware ordering of the PCP group's ranks.
 
 The PCP attention kernel is a ring: rank *r* passes its KV block to rank
@@ -164,6 +176,7 @@ def resolve_pcp_topology_order(vllm_config) -> dict[str, list[list[int]]] | None
 @contextlib.contextmanager
 def pcp_topology_order(
     group_ranks_by_name: dict[str, list[list[int]]] | None,
+    preserve_dcp_order: bool = False,
 ) -> Iterator[None]:
     """Install the mesh's groups while model-parallel groups are built.
 
@@ -193,8 +206,8 @@ def pcp_topology_order(
     # while vLLM still derives rank_in_group from the unsorted list it was
     # handed ("ranks.index(self.rank)"). The two then disagree and every shard
     # an all_gather assembles lands in the wrong slot.
-    # The wrapper below turns that sort off, and only for the axes replaced
-    # above.
+    # Disable new_group's default sort_ranks=True only for axes whose rank order
+    # was explicitly replaced or sorted here.
     preserving = False
 
     def patched(group_ranks, local_rank, backend, *args, **kwargs):
@@ -206,11 +219,26 @@ def pcp_topology_order(
             "vLLM layout | %s: vLLM built %s", axis, [list(g) for g in group_ranks]
         )
         replacement = replacements.get(axis) if axis else None
+        reordered = False
         if replacement is not None:
             logger.info("Topology layout | %s: replaced with %s", axis, replacement)
             group_ranks = replacement
+            reordered = True
+        elif axis == "dcp" and preserve_dcp_order:
+            # DCP rank transposition across PCP slices produces unsorted ranks;
+            # sort so GroupCoordinator.ranks matches device_group order.
+            sorted_group_ranks = [sorted(int(r) for r in g) for g in group_ranks]
+            if sorted_group_ranks != [list(g) for g in group_ranks]:
+                logger.info(
+                    "DCP layout | %s: sorted %s -> %s",
+                    axis,
+                    [list(g) for g in group_ranks],
+                    sorted_group_ranks,
+                )
+                group_ranks = sorted_group_ranks
+                reordered = True
 
-        preserving = replacement is not None
+        preserving = reordered
         try:
             return original(group_ranks, local_rank, backend, *args, **kwargs)
         finally:
@@ -223,9 +251,8 @@ def pcp_topology_order(
             kwargs.setdefault("sort_ranks", False)
         return original_new_group(*args, **kwargs)
 
-    # Only installed when there is something to replace, so configurations
-    # that opt out of topology ordering never see it at all.
-    patch_new_group = bool(replacements)
+    # Only wrap new_group when an axis may need its order preserved.
+    patch_new_group = bool(replacements) or preserve_dcp_order
     original_new_group = torch.distributed.new_group
     if patch_new_group:
         if "sort_ranks" not in inspect.signature(original_new_group).parameters:

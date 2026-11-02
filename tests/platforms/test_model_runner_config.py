@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """CPU contracts for TPU's runner selection and native vLLM validation."""
 
 from types import SimpleNamespace
@@ -9,14 +21,13 @@ from vllm.config.compilation import CompilationMode
 
 import vllm_torchtpu as plugin
 
-pytestmark = pytest.mark.cpu_test
-
 
 def _config(device="tpu", method=None, pcp=1):
     # Exercise the native validator/property without loading a model or devices.
     config = object.__new__(VllmConfig)
     config.device_config = SimpleNamespace(device_type=device)
     config.model_config = None
+    config.attention_config = SimpleNamespace(hisparse_config=None)
     config.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp,
         tensor_parallel_size=1,
@@ -25,6 +36,7 @@ def _config(device="tpu", method=None, pcp=1):
         enable_batch_sharded_sampling=False,
         enable_dbo=False,
         enable_elastic_ep=False,
+        use_ubatching=False,
     )
     config.cache_config = CacheConfig()
     config.compilation_config = CompilationConfig(mode=CompilationMode.NONE)
@@ -74,7 +86,7 @@ def test_native_v1_validation_uses_tpu_capabilities(device, method, pcp, reason)
     "feature,reason",
     [
         ("adaptive", "adaptive draft verification"),
-        ("dflash2", "dflash2 drafts"),
+        ("dflash2", r"(?:DFlash candidate-head drafts|dflash2 drafts)"),
         ("diffusion", "diffusion models"),
         ("batch_sharded", "batch-sharded sampling"),
     ],

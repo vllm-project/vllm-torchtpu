@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Strict admission for the future experimental serving path, without a TPU."""
 
 import dataclasses
@@ -10,8 +22,6 @@ import torch
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import vllm_adapter as bridge
-
-pytestmark = pytest.mark.cpu_test
 
 
 def layer(fp4=False):
@@ -186,7 +196,7 @@ def test_built_bridge_calls_experimental_kernel_and_separates_formats(monkeypatc
         built.append((name, fn, op))
         return op
 
-    monkeypatch.setattr(bridge, "sharded_jax_op", create)
+    monkeypatch.setattr(bridge, "jax_op", create)
     mesh = object()
     first = bridge._build_op(mesh, 2, True, "silu", None, "fp4", 64)
     second = bridge._build_op(mesh, 2, True, "silu", None, "fp8", None)
@@ -227,7 +237,7 @@ def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch
         functions.append(fn)
         return Mock()
 
-    monkeypatch.setattr(bridge, "sharded_jax_op", create)
+    monkeypatch.setattr(bridge, "jax_op", create)
     mesh = object()
     groups = ((1, 0),)
     original = bridge._build_op(mesh, 2, True, "silu", None)

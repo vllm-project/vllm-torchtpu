@@ -20,6 +20,7 @@ operations, to match the JAX reference implementation in
 
 Key functions:
 - e8m0_to_fp32: Convert e8m0 (8-bit exponent) scales to float32
+- e8m0_to_fp32_bits: Decode e8m0 scales to CPU-compatible bits on device
 - unpack_uint8_to_fp4: Unpack uint8 to FP4 e2m1 float values
 - dequantize_mxfp4_packed: Dequantize MXFP4 packed weights
 - quantize_tensor_to_fp4: Quantize float tensor to FP4 with block scaling
@@ -32,6 +33,8 @@ Usage in MXFP4 MoE pipeline:
 4. Pack indices using pack_fp4_indices()
 5. Use in GMM kernel with rhs_scale
 """
+
+from collections.abc import Sequence
 
 import jax.numpy as jnp
 import torch
@@ -113,6 +116,7 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
         float32 tensor with actual scale values.
 
     FIXME: TPU-specific behavior difference for large exponents (u8 >= 254).
+        Use `e8m0_to_fp32_bits` for device-safe decoding.
         - u8=254 -> exponent=127 -> 2^127 ≈ 1.7e38
         - On CPU: torch.ldexp correctly returns 1.7e38
         - On TPU: torch.ldexp overflows to inf (due to float32 limits)
@@ -124,6 +128,17 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
     ones = torch.ones_like(u8, dtype=torch.float32)
     result = torch.ldexp(ones, exponents)
     return result
+
+
+def e8m0_to_fp32_bits(u8: torch.Tensor) -> torch.Tensor:
+    """Decode scale bytes on their device with the CPU ldexp result's bits.
+
+    Byte zero is the subnormal 2**-127. Byte 255 retains the existing
+    decoder's infinity result rather than changing its reserved-byte policy.
+    """
+    exponent_bits = u8.to(torch.int32) << 23
+    bits = torch.where(u8 == 0, 1 << 22, exponent_bits)
+    return bits.contiguous().view(torch.float32)
 
 
 def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
@@ -180,7 +195,7 @@ def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
 def dequantize_tensor(
     tensor_q: torch.Tensor,
     scale: torch.Tensor,
-    axis: int = -1,
+    axis: int | Sequence[int] = -1,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Dequantize a quantized tensor with block scaling.
@@ -345,7 +360,7 @@ def dequantize_mxfp4_packed(
 
 def quantize_tensor_to_fp4(
     tensor: torch.Tensor,
-    axis: int = -1,
+    axis: int | Sequence[int] = -1,
     block_size: int = REQUANTIZED_BLOCK_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize float tensor to FP4 with block scaling.
@@ -399,7 +414,8 @@ def quantize_tensor_to_fp4(
         if i in [(a + tensor.ndim) % tensor.ndim for a in axis]:
             if dim % block_size != 0:
                 raise ValueError(
-                    f"Dimension {i} of size {dim} is not divisible by block_size={block_size}"
+                    f"Dimension {i} of size {dim} is not divisible by "
+                    f"block_size={block_size}"
                 )
             num_blocks = dim // block_size
             blocked_shape.extend([num_blocks, block_size])

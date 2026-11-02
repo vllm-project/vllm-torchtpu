@@ -43,6 +43,15 @@ def tensor_parallel_group(monkeypatch):
 
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(parallel_state, "_TP", group)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    monkeypatch.setattr(
+        parallel_state, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr("vllm.distributed.get_tensor_model_parallel_rank", lambda: 0)
     return group
 
 
@@ -301,11 +310,12 @@ def test_existing_jax_matmul_accepts_online_weights(keep_layout, monkeypatch, sc
     from vllm_torchtpu.layers.adapter.quantization import fp8
 
     # Only replace the TorchTPU bridge; execute the existing JAX math on CPU.
-    def cpu_bridge(x, w, scale):
+    def cpu_bridge(x, w, scale, w8a16_max_rows=0):
         result = linear_common._quantized_matmul_jax(
             jnp.asarray(x.float().numpy(), dtype=jnp.bfloat16),
             jnp.asarray(w.float().numpy(), dtype=jnp.float8_e4m3fn),
             jnp.asarray(scale.numpy()),
+            w8a16_max_rows=w8a16_max_rows,
         )
         return torch.from_numpy(np.asarray(result.astype(jnp.float32)).copy()).to(
             x.dtype
@@ -431,6 +441,7 @@ def test_block_must_divide_local_shard():
         layer.quant_method.process_weights_after_loading(layer)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("block", [[1, 128], [128, 128], [128, 512]])
 def test_online_block_matmul_tpu(block):
     import jax

@@ -18,6 +18,7 @@ expert-parallel mesh axis: quantize, dispatch, kernel, combine.
 """
 
 import threading
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -118,7 +119,7 @@ def _combine_arrivals(
         )
         slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
         terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
-    return sum(terms).astype(out_dtype).reshape(t_local, hidden)
+    return cast(jax.Array, sum(terms)).astype(out_dtype).reshape(t_local, hidden)
 
 
 def _exchange_layout(t_local, topk, e_total, quantized):
@@ -248,9 +249,9 @@ def adaptive_fused_moe(
 
     weight_format is inferred from the weight dtype when omitted. An explicit
     format must match both weights. FP4 uses W4A8 without an environment gate.
-    Its contraction block size is inferred from the scale layout when omitted. w1_scale and w2_scale are per
-    output channel for the per-channel forms (fp8 e4m3, int8), [experts,
-    2 * inter] and [experts, hidden], and per contraction block for fp4
+    Its contraction block size is inferred from the scale layout when omitted. w1_scale
+    and w2_scale are per output channel for the per-channel forms (fp8 e4m3, int8),
+    [experts, 2 * inter] and [experts, hidden], and per contraction block for fp4
     e2m1, [experts, blocks, 2 * inter] and [experts, blocks, hidden]; on an
     unquantized weight (bf16) there are no scales and both must be None.
     Both are taken in the kernel's own operand layout, so a table shaped
@@ -577,7 +578,7 @@ def adaptive_fused_moe(
         # dropped; nothing reads them, and the slab's own rows are the same
         # either way.
         if form.quantized_activations:
-            scale_bits = jnp.repeat(scale_bits_g, topk)
+            scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
                 jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)

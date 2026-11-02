@@ -144,6 +144,8 @@ class TpuMMEncoderAttention(MMEncoderAttention):
             return x.permute(0, 2, 1, 3).contiguous()
 
         op = TpuMMEncoderAttention._vision_op
+        # __init__ builds the shared op before any forward runs.
+        assert op is not None
         # Fold sm_scale into q so the op stays scale-agnostic.
         out = op(_prep(q * self.scale), _prep(k), _prep(v), seg, seg)
         out = out.permute(0, 2, 1, 3)  # [b, s_pad, h, d]

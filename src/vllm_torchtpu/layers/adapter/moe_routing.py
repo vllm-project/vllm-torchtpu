@@ -70,6 +70,24 @@ if _strategy_name:
     )
 
 
+def is_uniform_random_simulation() -> bool:
+    """Whether ``VLLM_MOE_ROUTING_SIMULATION_STRATEGY`` is ``uniform_random``."""
+    return _SIMULATION_STRATEGY is not None and _strategy_name == _UNIFORM_RANDOM
+
+
+def uniform_random_logits(router_logits: torch.Tensor) -> torch.Tensor:
+    """f32 uniform noise in ``[m, m + 1)``, ``m`` the mean of ``router_logits``.
+
+    Its top-k is a uniform-random expert draw (see ``_uniform_random_routing``
+    for the mean). The noise stays f32: in bf16, a few hundred experts' values
+    in ``[m, m + 1)`` collide and top-k breaks the ties toward low expert ids.
+    """
+    noise = torch.rand_like(router_logits, dtype=torch.float32)
+    # Anchor the noise to the activations. Uniform shift => same argsort =>
+    # identical expert choice; the point is the graph edge, not the value.
+    return noise + router_logits.float().mean()
+
+
 def _uniform_random_routing(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -92,11 +110,7 @@ def _uniform_random_routing(
     barrier) is deliberate -- it constrains scheduling without blocking
     optimization across the boundary the way ``optimization_barrier`` would.
     """
-    noise = torch.rand_like(router_logits, dtype=torch.float32)
-    # Anchor the noise to the activations. Uniform shift => same argsort =>
-    # identical expert choice; the point is the graph edge, not the value.
-    noise = noise + router_logits.float().mean()
-    _, topk_ids = torch.topk(noise, k=topk, dim=-1)
+    _, topk_ids = torch.topk(uniform_random_logits(router_logits), k=topk, dim=-1)
     topk_weights = torch.ones(
         (router_logits.shape[0], topk), dtype=torch.float32, device=router_logits.device
     )
@@ -122,7 +136,7 @@ def maybe_simulate_routing(
     """
     if _SIMULATION_STRATEGY is None:
         return None
-    if _strategy_name == _UNIFORM_RANDOM:
+    if is_uniform_random_simulation():
         return _uniform_random_routing(hidden_states, router_logits, topk)
     topk_weights, topk_ids = _SIMULATION_STRATEGY.route_tokens(
         hidden_states=hidden_states,
@@ -233,8 +247,8 @@ def select_experts(
     1. DeepSeek-V4 hash routing (if `layer.hash_indices_table` is present).
     2. Grouped top-k routing (if `layer.use_grouped_topk` is enabled AND the group
        config actually requires grouped selection).
-    3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for DeepSeek-V4)
-       and optional `e_score_correction_bias`.
+    3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for
+       DeepSeek-V4) and optional `e_score_correction_bias`.
     """
     # Profiling-only override; a no-op unless a routing-simulation strategy is
     # set. Replaces the whole routing output, so return early.
@@ -247,6 +261,8 @@ def select_experts(
     )
     if hash_indices_table is not None and input_ids is not None:
         scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+        # hash_indices_table is only set when layer is not None.
+        assert layer is not None
         routed_scaling_factor = layer.routed_scaling_factor
         topk_weights, topk_ids = _hash_moe_select(
             scores,
@@ -268,6 +284,7 @@ def select_experts(
             grouped_topk,
         )
 
+        assert layer is not None
         topk_weights, topk_ids = grouped_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,

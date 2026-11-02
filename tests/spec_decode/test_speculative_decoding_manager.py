@@ -26,6 +26,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 
+@pytest.mark.tpu_test
 def test_speculative_decoding_manager_metadata_indices(device):
     # Mock TPUModelRunner
     mock_runner = MagicMock()
@@ -44,7 +45,8 @@ def test_speculative_decoding_manager_metadata_indices(device):
 
     # Mock input batch:
     # num_draft_tokens = [3, 2] (batch_size = 2)
-    # cu_num_scheduled_tokens = [4, 7] (first request has 4 scheduled tokens, second has 3)
+    # cu_num_scheduled_tokens = [4, 7] (first request has 4 scheduled tokens,
+    # second has 3)
     num_draft_tokens = np.array([3, 2], dtype=np.int32)
     cu_num_scheduled_tokens = np.array([4, 7], dtype=np.int32)
     padded_num_reqs = 4
@@ -76,13 +78,15 @@ def test_speculative_decoding_manager_metadata_indices(device):
     )
     assert torch.equal(metadata.draft_lengths, expected_draft_lengths)
 
-    # 2. Bonus Logits Indices: [3, 6] (cu_num_sampled_tokens - 1) padded to padded_num_reqs (4) -> [3, 6, 0, 0]
+    # 2. Bonus Logits Indices: [3, 6] (cu_num_sampled_tokens - 1) padded to
+    # padded_num_reqs (4) -> [3, 6, 0, 0]
     expected_bonus_indices = torch.tensor(
         [3, 6, 0, 0], dtype=torch.int32, device=device
     )
     assert torch.equal(metadata.bonus_logits_indices, expected_bonus_indices)
 
-    # 3. Segment IDs: repeat request indices [0, 0, 0, 1, 1] padded to nearest static token bucket (8)
+    # 3. Segment IDs: repeat request indices [0, 0, 0, 1, 1] padded to nearest
+    # static token bucket (8)
     # Unpadded size: 3 + 2 = 5 tokens. Nearest static padding is 8.
     # Padded with total request count (2) -> [0, 0, 0, 1, 1, 2, 2, 2]
     expected_segment_ids = torch.tensor(
@@ -90,7 +94,8 @@ def test_speculative_decoding_manager_metadata_indices(device):
     )
     assert torch.equal(metadata.segment_ids, expected_segment_ids)
 
-    # 4. Group Indices: range per segment [0, 1, 2, 0, 1] padded to static bucket (8) with 0 -> [0, 1, 2, 0, 1, 0, 0, 0]
+    # 4. Group Indices: range per segment [0, 1, 2, 0, 1] padded to static bucket (8)
+    # with 0 -> [0, 1, 2, 0, 1, 0, 0, 0]
     expected_group_indices = torch.tensor(
         [0, 1, 2, 0, 1, 0, 0, 0], dtype=torch.int32, device=device
     )
@@ -103,6 +108,7 @@ def _make_manager_with_eagle3_drafter(num_reqs=2):
     mock_runner.speculative_config.method = "eagle3"
     mock_drafter = MagicMock(spec=Eagle3Proposer)
     mock_runner.drafter = mock_drafter
+    mock_runner._async_drafter = mock_drafter
     manager = SpeculativeDecodingManager(mock_runner)
     return manager, mock_runner, mock_drafter
 
@@ -261,6 +267,7 @@ def _fresh_metadata_manager(device, input_ids):
     return SpeculativeDecodingManager(mock_runner)
 
 
+@pytest.mark.tpu_test
 def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):
     # Same (num_draft_tokens, cu_num_scheduled_tokens, padded_num_reqs) ->
     # the 7 index tensors are reused (same device objects, no re-transfer),
@@ -292,6 +299,29 @@ def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):
     assert torch.equal(m2.draft_token_ids.cpu(), ref.draft_token_ids.cpu())
 
 
+@pytest.mark.tpu_test
+def test_spec_decode_metadata_deferred_draft_token_ids(device):
+    # Deferral leaves draft_token_ids unset and keeps its host copy, on the
+    # uncached and the cached path; uploading that copy gives the values the
+    # eager path uploads.
+    input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.int32)
+    nd = np.array([3, 2], dtype=np.int32)
+    cu = np.array([4, 7], dtype=np.int32)
+    manager = _fresh_metadata_manager(device, input_ids)
+    for step_ids in (input_ids, input_ids + 100):  # uncached, then cache hit
+        manager.runner.input_ids_cpu = step_ids
+        md = manager.get_spec_decode_metadata(nd, cu, 4, defer_draft_token_ids=True)
+        assert md.draft_token_ids is None
+        ref = _fresh_metadata_manager(device, step_ids).get_spec_decode_metadata(
+            nd, cu, 4
+        )
+        assert ref.deferred_draft_token_ids_cpu is None
+        uploaded = md.upload_deferred_draft_token_ids(device)
+        assert uploaded.device.type == device.type
+        assert torch.equal(uploaded.cpu(), ref.draft_token_ids.cpu())
+
+
+@pytest.mark.tpu_test
 def test_spec_decode_metadata_cache_miss_on_changed_inputs(device):
     # Any change in the key inputs must rebuild, with values matching an
     # uncached build.

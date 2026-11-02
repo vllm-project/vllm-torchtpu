@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[2] / "scripts" / "vllm" / "benchmarking")
 )
-import bq_utils  # noqa: E402
+import bq_utils
 
 
 def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
@@ -47,7 +47,8 @@ def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
         output_len = int(match.group(2))
     else:
         print(
-            f"Warning: Could not parse input/output len from filename: {base_name}. Using None.",
+            f"Warning: Could not parse input/output len from filename: {base_name}. "
+            "Using None.",
             file=sys.stderr,
         )
 
@@ -77,6 +78,9 @@ def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
             # Build configuration & workload payload
             config_dict = {
                 "code_hash": os.getenv("BUILDKITE_COMMIT") or "N/A",
+                # The build number, the key upload_results.py rows carry too;
+                # the launcher forwards BUILDKITE_* into every pod.
+                "job_reference": os.getenv("BUILDKITE_BUILD_NUMBER") or "N/A",
                 "image": os.getenv("DOCKER_IMAGE") or "latest",
                 "created_by": os.getenv("CREATED_BY") or "buildkite",
                 "device_type": os.getenv("TPU_VERSION") or "tpu7x",

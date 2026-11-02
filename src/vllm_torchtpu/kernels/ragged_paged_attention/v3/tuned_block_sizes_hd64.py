@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Auto-tuned block sizes for ragged paged attention."""
 
 import jax.numpy as jnp
@@ -300,7 +313,9 @@ def get_tuned_block_sizes(
             max_model_len
         ]
     except KeyError:
-        print("Couldn`t find tuned sizes for the RPA v3 kernel with %s", keys)
+        logger.warning_once(
+            "Couldn't find tuned sizes for the RPA v3 kernel with %s", keys
+        )
 
     return (min(pages_per_seq, bkv_p), min(max_num_tokens, bq))
 

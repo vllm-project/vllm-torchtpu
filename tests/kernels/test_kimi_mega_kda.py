@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Validation tests for the Kimi K3 mega KDA kernel."""
 
 from __future__ import annotations
@@ -42,10 +53,8 @@ def test_fused_kda_segment_dispatch(
         )
         calls.append(mode)
         increment = 1 if mode == "verify" else 10
-        states = (
-            kwargs["conv_state"] + increment,
-            kwargs["recurrent_state"] + increment,
-        )
+        conv_state, recurrent_state = kwargs["states"]
+        states = (conv_state + increment, recurrent_state + increment)
         return states, jnp.full((8, 2), increment, jnp.float32)
 
     monkeypatch.setattr(kda_attention_op.gdn_wrapper, "fused_conv1d_gdn", fake_kernel)

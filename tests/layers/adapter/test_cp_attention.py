@@ -39,8 +39,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 
-pytestmark = pytest.mark.cpu_test
-
 
 @pytest.fixture
 def cpu_vllm_config_context():
@@ -96,6 +94,7 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
         world_size=2,
         rank_in_group=rank,
         all_gather=lambda tensor, dim: torch.cat([tensor, tensor], dim=dim),
+        reduce_scatter=lambda tensor, dim: (2 * tensor).chunk(2, dim)[rank],
     )
     monkeypatch.setattr(attention, "_get_dcp_group", lambda: group)
     monkeypatch.setattr(cp_attention, "get_dcp_group", lambda: group)

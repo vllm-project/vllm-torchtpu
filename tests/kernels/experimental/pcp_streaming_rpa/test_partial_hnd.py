@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Regression: HND partial PCP prefill/decode must match causal attention.
 
 Eight TorchTPU processes, no model weights, GDN or transfer. The reference
@@ -39,8 +51,10 @@ def _runtime_mesh_and_partition(torch, dist):
         )
     # Main's TorchTPU assigns custom-op partitions in device-id order, not
     # process-rank order. Index inputs and the oracle in that same space.
+    # The shared partition specs also shard along "tp", so give it size 1.
     mesh = jax.sharding.Mesh(
-        np.asarray([devices[i] for i in device_ids]), axis_names=("pcp",)
+        np.asarray([devices[i] for i in device_ids]).reshape(8, 1),
+        axis_names=("pcp", "tp"),
     )
     return mesh, device_ids.index(device_id)
 
@@ -433,9 +447,7 @@ def _extended_cases(out, rank, partition, mesh, rows):
 
 @pytest.mark.nightly
 def test_hnd_partial_prefill_and_decode_preserve_attention_and_cache(tmp_path):
-    from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
-        prepare_tpu_environment,
-    )
+    from tests.distributed.tpu_test_utils import prepare_tpu_environment
 
     keys = (
         "TORCH_TPU_XPROF_SESSION_ID",

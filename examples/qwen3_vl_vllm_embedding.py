@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 This example shows how to use vLLM for running offline embedding inference
 on Qwen3-VL-Embedding models on TPU and optionally verify numerical accuracy
@@ -17,11 +29,11 @@ import numpy as np
 import torch
 
 # --- TPU MODEL REGISTRATION ---
-from vllm.model_executor.models.registry import ModelRegistry  # noqa: E402
+from vllm.model_executor.models.registry import ModelRegistry
 
 try:
     from vllm.model_executor.models.transformers import (
-        TransformersMultiModalEmbeddingModel,  # noqa: E402
+        TransformersMultiModalEmbeddingModel,
     )
 
     # Use generic TransformersMultiModalEmbeddingModel for embedding tasks
@@ -33,9 +45,9 @@ except ImportError:
     pass
 
 # --- MAIN ---
-from vllm import LLM  # noqa: E402
-from vllm.config import PoolerConfig  # noqa: E402
-from vllm.utils.argparse_utils import FlexibleArgumentParser  # noqa: E402
+from vllm import LLM
+from vllm.config import PoolerConfig
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 def parse_args():
@@ -92,6 +104,13 @@ def parse_args():
         type=float,
         default=0.95,
         help="TPU memory utilization ratio (default: 0.95)",
+    )
+    parser.add_argument(
+        "--pooling-type",
+        type=str,
+        default="LAST",
+        choices=["LAST", "MEAN", "CLS"],
+        help="Sequence pooling method (default: LAST for causal decoder models)",
     )
     return parser.parse_args()
 
@@ -175,7 +194,7 @@ def main(args):
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
-        pooler_config=PoolerConfig(task="embed"),
+        pooler_config=PoolerConfig(task="embed", pooling_type=args.pooling_type),
         trust_remote_code=True,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,

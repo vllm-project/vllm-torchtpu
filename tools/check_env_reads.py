@@ -67,6 +67,11 @@ EXEMPT_PATHS = {
 #                           value; the registry has no equivalent.
 #   raiden_store.py         checks whether PYTHONHASHSEED is set, not its
 #                           value, and it is a CPython knob, not one of ours.
+#   omni/platform.py        os.environ["MASTER_PORT"] (exported per worker by
+#                           vLLM-Omni's DiffusionWorker) must raise when unset.
+#   model_loader_patches.py RUNAI_STREAMER_PROCESS_GROUP_SIZE is exported by
+#                           the Run:AI streamer's first host-rank discovery in
+#                           the process; unset means that has not run yet.
 #
 # The TORCH_TPU_* names and TPU_NUM_HOSTS are computed from the slice shape
 # by tpu_platform.py, tpu_mp_multihost.py and the Ray executors, written to
@@ -79,8 +84,10 @@ EXEMPT_PATHS = {
 BOOTSTRAP_VARS = {
     "LOCAL_RANK",
     "LOCAL_WORLD_SIZE",
+    "MASTER_PORT",
     "PYTHONHASHSEED",
     "RANK",
+    "RUNAI_STREAMER_PROCESS_GROUP_SIZE",
     "TORCH_TPU_DP_MASTER_ADDR",
     "TORCH_TPU_DP_MASTER_PORT",
     "TORCH_TPU_DP_SIZE",
@@ -88,6 +95,7 @@ BOOTSTRAP_VARS = {
     "TORCH_TPU_TOPOLOGY",
     "TORCH_TPU_XPROF_SESSION_ID",
     "TPU_NUM_HOSTS",
+    "TPU_VISIBLE_CHIPS",
     "WORLD_SIZE",
 }
 

@@ -1,13 +1,31 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn import Parameter
 from vllm.distributed.parallel_state import get_tp_group
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
@@ -19,6 +37,8 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.model_executor.models.interfaces import SupportsMultiModal
+
     from vllm_torchtpu.layers.core.attention_metadata import (
         AttentionMetadataBuilderContext,
     )
@@ -28,6 +48,32 @@ _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
     num_reqs=0,
     kv_cache_initialized=False,
 )
+
+
+def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
+    """`t` with its leading dim sliced or padded (with `value`) to `rows`.
+
+    `rows` is always a bucket, never the live request count: torch-tpu compiles
+    a program per shape, so an exact-count slice costs a program per count.
+    """
+    n = t.shape[0]
+    if n == rows:
+        return t
+    if n > rows:
+        return t[:rows]
+    pad = [0] * (2 * (t.dim() - 1)) + [0, rows - n]
+    return F.pad(t, pad, value=value)
+
+
+def dp_lockstep_num_reqs(dp_step_max_reqs: int, local_num_reqs: int) -> int:
+    """Per-chunk request count all EP-DP lockstep ranks size the draft to: the
+    step's all-reduced max (_dp_coordinated_step), not the static max_num_reqs."""
+    num_reqs = max(1, dp_step_max_reqs)
+    assert local_num_reqs <= num_reqs, (
+        f"chunk has {local_num_reqs} requests but the DP-coordinated per-chunk "
+        f"bound is {num_reqs}"
+    )
+    return num_reqs
 
 
 @dataclass
@@ -94,13 +140,46 @@ def _force_draft_tp1():
         tp.rank_in_group = saved_rank
 
 
+def handoff_seed_tokens(
+    device_seed: torch.Tensor, req_ids: list[str], metadata: Any
+) -> torch.Tensor:
+    """Seeds a prefill-only draft's boundary row with the consumer's token.
+
+    A Stage-3 producer drops the last prompt token for the decode peer to
+    compute and samples a throwaway token in its place. The draft layer's KV
+    row at the prompt boundary has to be built from the real continuation,
+    which the send published in this step carries as
+    ``SendMeta.next_prompt_token_id``. Requests without such a send keep the
+    sampled seed.
+    """
+    reqs_to_send = getattr(metadata, "reqs_to_send", None)
+    if not reqs_to_send:
+        return device_seed
+    indices: list[int] = []
+    tokens: list[int] = []
+    for index, req_id in enumerate(req_ids):
+        send = reqs_to_send.get(req_id)
+        token = None if send is None else getattr(send, "next_prompt_token_id", None)
+        if token is not None:
+            indices.append(index)
+            tokens.append(int(token))
+    if not indices:
+        return device_seed
+    seed = device_seed.clone()
+    seed[torch.tensor(indices, dtype=torch.long, device=seed.device)] = torch.tensor(
+        tokens, dtype=seed.dtype, device=seed.device
+    )
+    return seed
+
+
 def gather_sharded_weight(
-    sharded_module: torch.nn.Module,
+    sharded_module: VocabParallelEmbedding,
 ) -> tuple[torch.Tensor, int, int, torch.device]:
     """Gathers a sharded weight tensor across TP into a full replicated tensor."""
     tp_group = get_tp_group().cpu_group
     org_vocab = sharded_module.org_vocab_size
     dim = sharded_module.embedding_dim
+    weight = cast(torch.Tensor, sharded_module.weight)
 
     si = sharded_module.shard_indices
     num_added = si.added_vocab_end_index - si.added_vocab_start_index
@@ -111,18 +190,18 @@ def gather_sharded_weight(
 
     num_org = si.org_vocab_end_index - si.org_vocab_start_index
     full = torch.zeros(org_vocab, dim, dtype=torch.float32)
-    my_rows = sharded_module.weight.data[:num_org].to(torch.float32).cpu()
+    my_rows = weight.data[:num_org].to(torch.float32).cpu()
     full[si.org_vocab_start_index : si.org_vocab_end_index] = my_rows
     dist.all_reduce(full, group=tp_group)
 
-    draft_dtype = sharded_module.weight.dtype
-    draft_device = sharded_module.weight.device
+    draft_dtype = weight.dtype
+    draft_device = weight.device
     full_dev = full.to(draft_dtype).to(draft_device)
     return full_dev, org_vocab, dim, draft_device
 
 
 def populate_draft_embed_from_target(
-    draft_model: torch.nn.Module, target_embed: torch.nn.Module
+    draft_model: torch.nn.Module, target_embed: VocabParallelEmbedding
 ) -> None:
     """Fill the draft's own (tp=1, full-vocab) embed_tokens with the
     target's embedding, assembled on the host.
@@ -157,7 +236,7 @@ def maybe_share_embeddings(
     force_share: bool = False,
 ) -> None:
     target_lm = (
-        target_model.get_language_model()
+        cast("SupportsMultiModal", target_model).get_language_model()
         if hasattr(target_model, "get_language_model")
         else target_model
     )
@@ -167,6 +246,24 @@ def maybe_share_embeddings(
         if target_lm_model is not None
         else None
     )
+
+    if isinstance(target_embed, PPMissingLayer):
+        # DeepseekV2-style targets build embed_tokens only on the first PP stage, so
+        # the draft on the last stage keeps its own checkpoint-loaded embedding.
+        draft_embed = getattr(getattr(draft_model, "model", None), "embed_tokens", None)
+        needs_target = force_share or not getattr(
+            draft_model, "has_own_embed_tokens", True
+        )
+        if draft_embed is None or needs_target:
+            raise RuntimeError(
+                "The target's embed_tokens is not on this pipeline stage and the "
+                "draft has no loaded embed_tokens of its own"
+            )
+        logger.info(
+            "Target embed_tokens is not on this pipeline stage; the draft "
+            "keeps its own embed_tokens."
+        )
+        return
 
     if force_share:
         share_embed = True
@@ -186,12 +283,14 @@ def maybe_share_embeddings(
             )
         if tp_layout_matches:
             logger.info(
-                "Sharing the target's embed_tokens with the draft using the same TP layout."
+                "Sharing the target's embed_tokens with the draft using the "
+                "same TP layout."
             )
             draft_model.model.embed_tokens = target_embed
         else:
             logger.info(
-                "Populating draft's own embed_tokens with a host-gathered copy of target embedding."
+                "Populating draft's own embed_tokens with a host-gathered copy of "
+                "target embedding."
             )
             populate_draft_embed_from_target(draft_model, target_embed)
 
@@ -231,7 +330,7 @@ def resolve_draft_logits_processor(draft_model: torch.nn.Module):
 
 
 def populate_draft_lm_head_from_target(
-    draft_model: torch.nn.Module, target_lm_head: torch.nn.Module
+    draft_model: torch.nn.Module, target_lm_head: VocabParallelEmbedding
 ) -> None:
     shared_heads = list(iter_mtp_shared_heads(draft_model))
     if shared_heads:
@@ -282,7 +381,7 @@ def maybe_share_lm_head(
     materialize_if_mismatched: bool = True,
 ) -> None:
     target_lm = (
-        target_model.get_language_model()
+        cast("SupportsMultiModal", target_model).get_language_model()
         if hasattr(target_model, "get_language_model")
         else target_model
     )
@@ -338,8 +437,9 @@ def maybe_share_lm_head(
             )
             populate_draft_lm_head_from_target(draft_model, target_lm_head)
 
-    # We must override _gather_logits for replicated draft models even if we don't share the lm_head,
-    # because the draft model's logits_processor will still try to gather logits across TP=1.
+    # We must override _gather_logits for replicated draft models even if we don't share
+    # the lm_head, because the draft model's logits_processor will still try to gather
+    # logits across TP=1.
     if draft_replicated:
         lp = resolve_draft_logits_processor(draft_model)
         if lp is None:

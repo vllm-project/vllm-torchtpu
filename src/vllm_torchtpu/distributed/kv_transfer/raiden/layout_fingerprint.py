@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Physical-layout identity used by raw Raiden FA transfers.
 
 The Stage-3 data path copies PjRt bytes without materializing a logical torch
@@ -17,15 +29,39 @@ from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 
-from .pool_manifest import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM, TAG_MLA_NOPE, PoolManifest
-from .tags import class_tag
+from .pool_manifest import (
+    TAG_DSA_IDX,
+    TAG_FA,
+    TAG_GDN_CONV,
+    TAG_GDN_SSM,
+    TAG_MLA_NOPE,
+    TAG_MLA_ROPE,
+    PoolManifest,
+    gdn_state_unit_bytes,
+)
+from .tags import class_tag, libtpu_key
 
-EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
+
+def _row_major_minor_to_major(rank: int) -> tuple[int, ...]:
+    """Row-major order for a rank-``rank`` tensor.
+
+    XLA lists dimensions minor to major, so row-major counts down: (1, 0) for
+    a matrix, (3, 2, 1, 0) for the rank-4 page caches. Nothing here is
+    model-specific; the rank picks the value.
+    """
+    return tuple(range(rank - 1, -1, -1))
+
+
+# FA storages are rank 5, the packed-row page caches rank 4. Block-major pools
+# prepend the per-block region axis, adding a 6th major dimension.
+EXPECTED_FA_MINOR_TO_MAJOR = _row_major_minor_to_major(5)
+EXPECTED_BLOCK_MAJOR_FA_MINOR_TO_MAJOR = _row_major_minor_to_major(6)
+ROW_CACHE_MINOR_TO_MAJOR = _row_major_minor_to_major(4)
 EXPECTED_FA_TILES = ((4, 128), (4, 1))
 FA_LAYOUT_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v1"
-GLM_EXPECTED_MINOR_TO_MAJOR = (3, 2, 1, 0)
 GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA = "glm-mla-raw-layout-fingerprint-v1"
 KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA = "kimi-k3-row-layout-fingerprint-v1"
+DSV4_LAYOUT_FINGERPRINT_SCHEMA = "dsv4-raw-layout-fingerprint-v1"
 
 
 def canonical_layout_fingerprint(value: str | Mapping[str, Any]) -> str:
@@ -69,6 +105,18 @@ def fa_page_tokens(manifest: PoolManifest) -> int:
     return next(iter(page_tokens))
 
 
+def expected_fa_minor_to_major(kv_layout: str | None) -> tuple[int, ...]:
+    """Returns the expected FA minor-to-major dimension order for ``kv_layout``.
+
+    The block-major pool adds a leading region dimension while preserving the
+    two minor tiled dimensions, keeping the intra-page byte layout identical to
+    the layer-major pool.
+    """
+    if kv_layout == "block-major":
+        return EXPECTED_BLOCK_MAJOR_FA_MINOR_TO_MAJOR
+    return EXPECTED_FA_MINOR_TO_MAJOR
+
+
 def _default_layout_getter(tensor: Any) -> Any:
     from torch_tpu._internal.compile import tpu_torch_compile
 
@@ -78,10 +126,17 @@ def _default_layout_getter(tensor: Any) -> Any:
 def measured_fa_layout_fingerprint(
     manifest: PoolManifest,
     *,
+    block_major: bool = False,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Measure the admitted FA storage layout and return its E0' identity.
+
+    When ``block_major`` is True, the backing storage is the merged
+    block-major pool (which shares the same intra-page tiling under an extra
+    leading dimension). Recording ``kv_layout`` in the fingerprint payload
+    ensures disaggregated peers with mismatched pool layouts fail closed at
+    plan time.
 
     ``layout_getter`` and ``package_version`` are injectable so the canonical
     payload can be regression-tested on hosts without a TPU runtime.
@@ -105,11 +160,13 @@ def measured_fa_layout_fingerprint(
     minor_to_major = tuple(int(dim) for dim in raw_minor_to_major)
     tiles = tuple(tuple(int(dim) for dim in tile) for tile in raw_tiles)
     element_bits = int(raw_element_bits or 8)
-    if minor_to_major != EXPECTED_FA_MINOR_TO_MAJOR:
+    kv_layout = "block-major" if block_major else "layer-major"
+    expected_minor_to_major = expected_fa_minor_to_major(kv_layout)
+    if minor_to_major != expected_minor_to_major:
         raise RuntimeError(
             "FA layout failed E0' minor-to-major gate: "
             f"measured={minor_to_major} "
-            f"expected={EXPECTED_FA_MINOR_TO_MAJOR}"
+            f"expected={expected_minor_to_major}"
         )
     if tiles != EXPECTED_FA_TILES:
         raise RuntimeError(
@@ -123,34 +180,44 @@ def measured_fa_layout_fingerprint(
         )
 
     version = package_version or importlib.metadata.version
-    payload = {
+    payload: dict[str, Any] = {
         "schema": FA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
+        "libtpu": libtpu_key(package_version),
         "minor_to_major": list(minor_to_major),
         "tiles": [list(tile) for tile in tiles],
         "element_size_in_bits": element_bits,
+        "kv_layout": kv_layout,
         # GDN conv state layout version.  Both sides of a disagg pair must
-        # agree: the byte-span convention (pair-blocked whole-token QK
-        # spans vs the legacy split Q/K) is baked into the transfer plan,
-        # and the geometries are size-identical, so a mixed pair would not
-        # otherwise fail closed.  The controller compares fingerprints
-        # before emitting a plan.
+        # agree: the byte-span convention (segment-major Q/K, or the QK
+        # pair-blocked spans an older build may still emit) is baked into
+        # the transfer plan, and the geometries are size-identical, so a
+        # mixed pair would not otherwise fail closed.  The controller
+        # compares fingerprints before emitting a plan.
         "gdn_conv_layout": (
             "qk-pair-v1" if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT else "legacy-split-qk"
         ),
     }
+    # The conv and SSM state dtypes are not visible in the layout version or
+    # the FA geometry, so a peer on another state dtype would otherwise pair.
+    unit_bytes = gdn_state_unit_bytes(manifest)
+    if unit_bytes:
+        payload["gdn_state_unit_bytes"] = unit_bytes
     return canonical_layout_fingerprint(payload), payload
 
 
 __all__ = [
+    "DSV4_LAYOUT_FINGERPRINT_SCHEMA",
+    "EXPECTED_BLOCK_MAJOR_FA_MINOR_TO_MAJOR",
     "EXPECTED_FA_MINOR_TO_MAJOR",
     "EXPECTED_FA_TILES",
     "FA_LAYOUT_FINGERPRINT_SCHEMA",
     "GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA",
     "KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA",
     "canonical_layout_fingerprint",
+    "expected_fa_minor_to_major",
     "fa_page_tokens",
+    "measured_dsv4_layout_fingerprint",
     "measured_fa_layout_fingerprint",
     "measured_glm_layout_fingerprint",
     "measured_kimi_k3_layout_fingerprint",
@@ -174,10 +241,10 @@ def measured_kimi_k3_layout_fingerprint(
     if not any(pool.tag == TAG_FA for pool in manifest.pools):
         raise ValueError("Kimi layout fingerprint requires an FA pool")
     version = package_version or importlib.metadata.version
-    payload = {
+    payload: dict[str, Any] = {
         "schema": KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
+        "libtpu": libtpu_key(package_version),
         # The planner splits at destination page boundaries, so Kimi compares
         # physical rows independent of the role's page size.
         "layouts": _measure_packed_row_layouts(
@@ -209,7 +276,7 @@ def measured_kimi_k3_layout_fingerprint(
     if set(state_layouts) != {TAG_GDN_CONV, TAG_GDN_SSM}:
         raise ValueError("Kimi layout requires gdn.conv and gdn.ssm pools")
     payload["gdn_state_layouts"] = state_layouts
-    payload["gdn_conv_layout"] = "kda-rank-blocked-tap-qkv-head-dim-bf16-v1"
+    payload["gdn_conv_layout"] = "kda-rank-blocked-tap-qkv-head-dim-fp32-v1"
     payload["state_fragment_heads"] = int(state_fragment_heads)
     return canonical_layout_fingerprint(payload), payload
 
@@ -220,11 +287,17 @@ def measured_glm_layout_fingerprint(
     page_tokens: int,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
+    hash_indexer: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Fingerprint of the admitted GLM cache layout, compared across peers.
 
     Hash per-page geometry only: both peers must agree on it, but they size
     their pools independently.
+
+    ``hash_indexer=False`` leaves the indexer class out of the hash (every
+    pool is still validated): a pipeline stage whose layers reuse an earlier
+    layer's top-k holds no indexer cache, yet must fingerprint identically to
+    a destination holding every layer.
     """
     layouts = _measure_packed_row_layouts(
         manifest,
@@ -232,12 +305,38 @@ def measured_glm_layout_fingerprint(
         layout_getter=layout_getter,
         include_page_shape=True,
     )
+    if not hash_indexer:
+        layouts.pop(TAG_DSA_IDX, None)
     version = package_version or importlib.metadata.version
     payload = {
         "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
+        "libtpu": libtpu_key(package_version),
         "page_tokens": int(page_tokens),
+        "layouts": layouts,
+    }
+    return canonical_layout_fingerprint(payload), payload
+
+
+def measured_dsv4_layout_fingerprint(
+    manifest: PoolManifest,
+    *,
+    layout_getter: Callable[[Any], Any] | None = None,
+    package_version: Callable[[str], str] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Fingerprint of the admitted DeepSeek-V4 cache layout.
+
+    No ``page_tokens``: each DSv4 role pages at its own size, so the page shape
+    is recorded per tag rather than checked against one number.
+    """
+    layouts = _measure_packed_row_layouts(
+        manifest, page_tokens=None, layout_getter=layout_getter, include_page_shape=True
+    )
+    version = package_version or importlib.metadata.version
+    payload = {
+        "schema": DSV4_LAYOUT_FINGERPRINT_SCHEMA,
+        "torch_tpu": version("torch_tpu"),
+        "libtpu": libtpu_key(package_version),
         "layouts": layouts,
     }
     return canonical_layout_fingerprint(payload), payload
@@ -246,7 +345,7 @@ def measured_glm_layout_fingerprint(
 def _measure_packed_row_layouts(
     manifest: PoolManifest,
     *,
-    page_tokens: int,
+    page_tokens: int | None,
     layout_getter: Callable[[Any], Any] | None,
     include_page_shape: bool,
 ) -> dict[str, Any]:
@@ -256,10 +355,14 @@ def _measure_packed_row_layouts(
     prefix of the page. That only holds for the natural
     [blocks, rows, packing, width] physical order, so reject anything else --
     for every pool, since one odd layer would corrupt just that layer.
+
+    Pass ``page_tokens`` when every tag shares one page, which GLM and Kimi do
+    and DSv4 does not. DSv4's CSA arrays are rank-3 int32 word rows instead,
+    checked as packing-1 rows under one full-width tile level.
     """
     if not isinstance(manifest, PoolManifest):
         raise TypeError("manifest must be a PoolManifest")
-    if page_tokens <= 0:
+    if page_tokens is not None and page_tokens <= 0:
         raise ValueError("page_tokens must be positive")
     getter = layout_getter or _default_layout_getter
 
@@ -272,7 +375,8 @@ def _measure_packed_row_layouts(
         tag = class_tag(pool.tag)
         tensor = manifest.storages[pool.storage_index]
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
-        if len(shape) != 4:
+        word_rows = len(shape) == 3 and int(tensor.element_size()) == 4
+        if len(shape) != 4 and not word_rows:
             raise RuntimeError(
                 f"admitted {pool.tag} storage must be rank-4: shape={shape}"
             )
@@ -292,20 +396,38 @@ def _measure_packed_row_layouts(
         # The measured element bits are unreliable (0 for these tensors);
         # the dtype is authoritative.
         element_bits = 8 * int(tensor.element_size())
-        _, rows, packing, width = shape
-        page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
-        if page_rows_tokens != page_tokens:
-            raise RuntimeError(
-                f"{pool.tag} page geometry {rows}x{packing} does not match "
-                f"page_tokens {page_tokens}"
-            )
-        if minor_to_major != GLM_EXPECTED_MINOR_TO_MAJOR:
+        rows, width = shape[1], shape[-1]
+        packing = 1 if word_rows else shape[2]
+        if page_tokens is not None:
+            if tag == TAG_MLA_NOPE:
+                page_rows_tokens = rows
+            elif word_rows and tag == TAG_MLA_ROPE:
+                page_rows_tokens = rows * (page_tokens // rows) if rows else 0
+            else:
+                page_rows_tokens = rows * packing
+            if page_rows_tokens != page_tokens:
+                raise RuntimeError(
+                    f"{pool.tag} page geometry {rows}x{packing} does not "
+                    f"match page_tokens {page_tokens}"
+                )
+        expected_order = (
+            _row_major_minor_to_major(3) if word_rows else ROW_CACHE_MINOR_TO_MAJOR
+        )
+        if minor_to_major != expected_order:
             raise RuntimeError(
                 "Packed-row transfers require the natural physical order: "
                 f"tag={pool.tag}, layer={pool.layer_name}, "
                 f"minor_to_major={minor_to_major}"
             )
-        if tiles != ((packing, 128), (packing, 1)):
+        if word_rows:
+            # A row prefix is a byte prefix only under one tile level that
+            # spans the row and divides the page. XLA shrinks the (8, 128)
+            # tile on pages under 8 rows rather than padding them.
+            tiles_ok = len(tiles) == 1 and tiles[0][1] == width
+            tiles_ok = tiles_ok and rows % tiles[0][0] == 0
+        else:
+            tiles_ok = tiles == ((packing, 128), (packing, 1))
+        if not tiles_ok:
             raise RuntimeError(
                 "Packed-row transfers require the packed tile shape "
                 f"(({packing},128),({packing},1)): tag={pool.tag}, "

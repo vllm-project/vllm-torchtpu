@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 This example shows how to use vLLM for running offline inference with
 the correct prompt format on vision language models for text generation.
@@ -217,11 +228,13 @@ def main(args):
     data = mm_input["data"]
     questions = mm_input["questions"]
 
-    # NOTE: Currently, only Qwen2.5-VL is supported. If later we want to support a model with new chat template, we may need to change this
+    # NOTE: Currently, only Qwen2.5-VL is supported. If later we want to support a model
+    # with new chat template, we may need to change this
     req_data = model_example_map["qwen2_5_vl"](questions, modality, args)
 
     # Disable other modalities to save memory
-    # Initial all modalities to be 0s and add the specifc modality limit later accordingly
+    # Initial all modalities to be 0s and add the specifc modality limit
+    # later accordingly
     default_limits = {"image": 0, "video": 0, "audio": 0}
     req_data.engine_args.limit_mm_per_prompt = default_limits | dict(
         req_data.engine_args.limit_mm_per_prompt or {}

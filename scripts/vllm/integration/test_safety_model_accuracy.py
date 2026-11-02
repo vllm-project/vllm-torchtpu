@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 This test validates the classification accuracy of any safety model configured
 in MODEL_CONFIG_MAP. It dynamically loads the full AILuminate dataset,
@@ -75,7 +86,8 @@ MODEL_CONFIG_MAP = {
 
 
 def load_data_from_csv(file_path: str) -> list[tuple[str, str]]:
-    """Loads AILuminate CSV from GCS or local path and formats into (raw_prompt, expected_output) tuples."""
+    """Loads AILuminate CSV from GCS or local path and formats into
+    (raw_prompt, expected_output) tuples."""
 
     print(f"Loading full dataset from: {file_path}")
 
@@ -83,7 +95,8 @@ def load_data_from_csv(file_path: str) -> list[tuple[str, str]]:
         df = pd.read_csv(file_path)
     except Exception as e:
         pytest.fail(
-            f"Error reading dataset from {file_path}. Ensure file exists and gcsfs is installed: {e}"
+            f"Error reading dataset from {file_path}. "
+            f"Ensure file exists and gcsfs is installed: {e}"
         )
 
     test_cases = []
@@ -117,7 +130,8 @@ def model_config_fixture(request: pytest.FixtureRequest):
 
     if model_name not in MODEL_CONFIG_MAP:
         pytest.fail(
-            f"Configuration not found for model: {model_name}. Please update MODEL_CONFIG_MAP."
+            f"Configuration not found for model: {model_name}. "
+            "Please update MODEL_CONFIG_MAP."
         )
 
     return MODEL_CONFIG_MAP[model_name]
@@ -126,8 +140,8 @@ def model_config_fixture(request: pytest.FixtureRequest):
 @pytest.fixture
 def safety_test_data_loader(request):
     """
-    Dynamically loads the full AILuminate dataset from the CLI-specified path (GCS or local)
-    and provides structured prompts and expected outputs.
+    Dynamically loads the full AILuminate dataset from the CLI-specified path
+    (GCS or local) and provides structured prompts and expected outputs.
     """
     # Get the dynamic dataset path passed via the shell script CLI
     dataset_path = request.config.getoption("--dataset-path")

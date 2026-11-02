@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (  # noqa: E501
     VllmCompressedTensorsW4A16MoEMethod,
 )
 
@@ -141,10 +141,13 @@ class FakeActivation:
 
 
 class FakeRoutedExperts(RoutedExperts):
-    """Subclass RoutedExperts to pass isinstance check without triggering full vLLM config requirements."""
+    """Subclass RoutedExperts to pass isinstance check without triggering full vLLM
+    config requirements.
+    """
 
     def __init__(self, experts_per_token=2):
-        # Call Module.__init__ to initialize parameters dictionary, bypassing RoutedExperts.__init__
+        # Call Module.__init__ to initialize parameters dictionary, bypassing
+        # RoutedExperts.__init__
         torch.nn.Module.__init__(self)
         self.moe_config = MagicMock()
         self.moe_config.experts_per_token = experts_per_token
@@ -159,27 +162,61 @@ class FakeRoutedExperts(RoutedExperts):
 
 
 class TestW4MoEUpstreamHooks:
-    """Inherited hooks must not read state the skipped __init__ never set."""
+    """Inherited hooks must not read state the skipped __init__ never set.
 
-    def test_hooks_do_not_need_upstream_backend(self):
-        # vLLM calls get_fused_moe_quant_config on the first forward pass. Since
-        # v0.29 the inherited version reads self.wna16_backend, which only the
-        # upstream __init__ sets, and Kimi-K2.6 died there at engine start.
+    Regression for Kimi-K2.x (compressed-tensors W4A16 MoE) on vLLM 0.29:
+        AttributeError: 'VllmCompressedTensorsW4A16MoEMethod' object has no
+        attribute 'wna16_backend'
+    """
+
+    @staticmethod
+    def _make():
         layer = FakeRoutedExperts(experts_per_token=2)
-        method = VllmCompressedTensorsW4A16MoEMethod(
+        layer.quant_method = VllmCompressedTensorsW4A16MoEMethod(
             FakeQuantArgs(), None, layer.moe_config
         )
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones(2, 1, 4), requires_grad=False
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.ones(2, 1, 4), requires_grad=False
+        )
+        return layer, layer.quant_method
 
-        assert not hasattr(method, "wna16_backend")
-        assert method.get_fused_moe_quant_config(layer) is None
+    def test_eplb_hook_does_not_need_upstream_backend(self):
+        # RoutedExperts.__init__ reads supports_eplb when EPLB is enabled.
+        _, method = self._make()
         assert method.supports_eplb is False
+
+    def test_quant_config_hook_does_not_need_upstream_backend(self):
+        # MoERunner._forward_impl -> RoutedExperts._ensure_moe_quant_config_init
+        # -> quant_method.get_fused_moe_quant_config on the first forward.
+        # Call the *upstream* RoutedExperts method unbound so the test does not
+        # depend on VllmMoERunner's per-instance override being installed.
+        layer, method = self._make()
+        assert method.get_fused_moe_quant_config(layer) is None
+        RoutedExperts._ensure_moe_quant_config_init(layer)
+        assert method.moe_quant_config is None
+
+    def test_upstream_backend_state_is_defined(self):
+        # Anything else inherited from CompressedTensorsWNA16MoEMethod that
+        # keys on the backend must see an explicit "no upstream backend"
+        # rather than an AttributeError.
+        _, method = self._make()
+        assert method.wna16_backend is None
+        assert method.experts_cls is None
+        assert method.is_marlin is False
+        assert method.moe_kernel is None
+        assert method.is_monolithic is True
 
 
 class TestW4MoEWeightPreprocessing:
     """Verify CPU weight packing and sign-extension logic."""
 
     def test_xor_sign_conversion(self):
-        """Symmetric unsigned INT4 [0, 15] should be converted to signed [-8, 7] via XOR."""
+        """Symmetric unsigned INT4 [0, 15] should be converted
+        to signed [-8, 7] via XOR.
+        """
         layer = FakeRoutedExperts(experts_per_token=2)
         layer.activation = FakeActivation("silu")
 
@@ -234,7 +271,8 @@ class TestW4MoEWeightPreprocessing:
             layer.w2_weight_packed.data.zero_()
 
             # 2. Simulate loading shards using the hook
-            # w13_weight_packed has shape [2, 1, 16] (num_experts, in_dim, out_dim_packed)
+            # w13_weight_packed has shape [2, 1, 16]
+            # (num_experts, in_dim, out_dim_packed)
             # Shards from loader: [weight_shard_size, ...]
             # We load shape [8, 1] filled with initial_carrier
             shard_w1_e0 = torch.tensor([[initial_carrier]] * 8, dtype=torch.int32)
@@ -256,7 +294,8 @@ class TestW4MoEWeightPreprocessing:
                 layer.w13_weight_packed, shard_w3_e1, "w13_weight_packed", "w3", 1
             )
 
-            # Call process_weights_after_loading to perform the H2D copy and cleanup scratchpad
+            # Call process_weights_after_loading to perform the H2D copy and
+            # cleanup scratchpad
             method.process_weights_after_loading(layer)
 
             # Expected output after XORing with 0x88888888: 0xF0F98710
@@ -268,6 +307,7 @@ class TestW4MoEWeightPreprocessing:
             assert layer.w13_weight_packed[1, 0, 0].item() == expected_carrier
 
 
+@pytest.mark.tpu_test
 class TestW4MoECorrectness:
     """Verify computation correctness of W4 MoE."""
 
@@ -437,7 +477,8 @@ class TestW4MoECorrectness:
             activation="silu",
         )
 
-        # 9. Verify close match (allowing small tolerances since dynamic TPU compiles kernel optimizations)
+        # 9. Verify close match (allowing small tolerances since dynamic TPU compiles
+        # kernel optimizations)
         torch.testing.assert_close(result_cpu, expected_cpu, rtol=0.03, atol=0.03)
 
     def test_fused_moe_fp4_requant_correctness(self, device):
@@ -540,8 +581,10 @@ class TestW4MoECorrectness:
 
 
 def test_w4a16_requantize_block():
-    """Verify that INT4 MoE weights are correctly requantized when MOE_REQUANTIZE_BLOCK_SIZE is set."""
-    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+    """Verify that INT4 MoE weights are correctly requantized when
+    MOE_REQUANTIZE_BLOCK_SIZE is set.
+    """
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
         requantize_and_transpose_int4_weights,
     )
 
@@ -669,10 +712,12 @@ def test_w4a16_requantize_block():
 
 
 def test_w4a16_requantize_to_fp4():
-    """Verify that INT4 MoE weights are correctly requantized to FP4 (torch.float8_e4m3fn) when MOE_REQUANTIZE_WEIGHT_DTYPE is set."""
+    """Verify that INT4 MoE weights are correctly requantized to FP4
+    (torch.float8_e4m3fn) when MOE_REQUANTIZE_WEIGHT_DTYPE is set.
+    """
     import jax.numpy as jnp
 
-    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
         requantize_and_transpose_int4_to_fp4_weights,
     )
 

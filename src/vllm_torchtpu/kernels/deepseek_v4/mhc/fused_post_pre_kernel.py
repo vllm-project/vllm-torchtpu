@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -216,7 +217,10 @@ def fused_post_pre_mixes(
         compiler_params=compiler_params,
     )(x2d, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
 
-    return utils.trim_to(num_tokens, new_res, mixes, sqrsum, layer2d)
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        utils.trim_to(num_tokens, new_res, mixes, sqrsum, layer2d),
+    )
 
 
 def mhc_fused_post_pre(

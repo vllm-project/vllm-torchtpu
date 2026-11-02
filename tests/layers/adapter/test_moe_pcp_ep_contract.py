@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as moe_runner_mod
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
 
 
@@ -155,11 +156,11 @@ def _make_rank_zero_runner():
         moe_parallel_config=parallel_config,
     )
 
-    # Construct the upstream operator without its weight-loading and global
+    # Construct the TPU runner without its weight-loading and global
     # registration machinery. All forward-path methods are the real vLLM
-    # MoERunner methods; only the local expert kernel and collectives are small
-    # deterministic CPU substitutes.
-    runner = moe_runner_mod.MoERunner.__new__(moe_runner_mod.MoERunner)
+    # MoERunner methods plus VllmMoERunner's overrides; only the local expert
+    # kernel and collectives are small deterministic CPU substitutes.
+    runner = VllmMoERunner.__new__(VllmMoERunner)
     torch.nn.Module.__init__(runner)
     runner.moe_config = moe_config
     runner.router = object()
@@ -250,7 +251,7 @@ def test_armed_fused_ep_owns_pcp_dispatch_combine(monkeypatch):
     local_router_logits = torch.log(torch.tensor([[0.25, 0.75]]))
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
         # The global config still requests explicit PCP collectives.  The
-        # per-layer runner patch is what transfers ownership to fused EP.
+        # per-layer runner override is what transfers ownership to fused EP.
         assert not runner.moe_config.moe_parallel_config.use_all2all_kernels
         actual = runner(local_hidden_states, local_router_logits)
 

@@ -53,6 +53,25 @@ class TilePlanField:
     HBM_ROW_FIELDS = 128
 
 
+def query_row_positions(
+    q_global_start, q_hbm_offset, row, *, pcp_size, interleave_size
+):
+    """Map compact local Q rows to request-absolute causal positions.
+
+    Batch-flat interleaving packs every rank's rows contiguously in HBM.
+    Its HBM offset modulo interleave_size is therefore the first row's
+    offset within an interleave, even when a request starts mid-interleave.
+    History changes absolute positions, but does not change this offset.
+    """
+    from jax import lax
+
+    # All local coordinates are nonnegative. Truncating division avoids the
+    # signed floor/mod corrections in the per-page Pallas causal mask.
+    offset = lax.rem(q_hbm_offset, interleave_size)
+    crossed_chunks = lax.div(offset + row, interleave_size)
+    return q_global_start + row + crossed_chunks * ((pcp_size - 1) * interleave_size)
+
+
 def _cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
@@ -166,8 +185,6 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     cycle_i32 = pcp_size_i32 * interleave_size_i32
     virtual_page_size_i32 = page_size_i32 * pcp_size_i32
     chunks_per_page_i32 = page_size_i32 // interleave_size_i32
-    group_chunks = max(1, q_block_size // interleave_size)
-    group_chunks_i32 = jnp.asarray(group_chunks, dtype=jnp.int32)
 
     def _local_page_global_start(local_page_idx, src_rank):
         return local_page_idx * virtual_page_size_i32 + src_rank * interleave_size_i32
@@ -188,176 +205,33 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         )
         return jnp.where(kv_len > base, valid_len, 0)
 
-    def _rank_request_layout(q_len, token_owner_start, consumer_rank: int):
-        rank_chunk_offset = jnp.asarray(
-            consumer_rank * interleave_size, dtype=jnp.int32
-        )
-        token_owner_end = token_owner_start + q_len
-        first_chunk = (token_owner_start // cycle_i32) * cycle_i32 + rank_chunk_offset
-        first_chunk = jnp.where(
-            first_chunk + interleave_size_i32 <= token_owner_start,
-            first_chunk + cycle_i32,
-            first_chunk,
-        )
-        has_chunks = jnp.logical_and(q_len > 0, first_chunk < token_owner_end)
-
-        safe_owner_end_minus_one = jnp.where(
-            q_len > 0, token_owner_end - 1, token_owner_start
-        )
-        last_chunk = (
-            safe_owner_end_minus_one // cycle_i32
-        ) * cycle_i32 + rank_chunk_offset
-        last_chunk = jnp.where(
-            last_chunk > safe_owner_end_minus_one, last_chunk - cycle_i32, last_chunk
-        )
-        num_chunks = jnp.where(
-            has_chunks,
-            (last_chunk - first_chunk) // cycle_i32 + 1,
-            0,
-        )
-
-        first_overlap_start = jnp.maximum(first_chunk, token_owner_start)
-        first_overlap_end = jnp.minimum(
-            first_chunk + interleave_size_i32, token_owner_end
-        )
-        first_overlap_len = jnp.where(
-            has_chunks,
-            jnp.maximum(first_overlap_end - first_overlap_start, 0),
-            0,
-        )
-        last_overlap_start = jnp.maximum(last_chunk, token_owner_start)
-        last_overlap_end = jnp.minimum(
-            last_chunk + interleave_size_i32, token_owner_end
-        )
-        last_overlap_len = jnp.where(
-            has_chunks,
-            jnp.maximum(last_overlap_end - last_overlap_start, 0),
-            0,
-        )
-
-        first_partial = jnp.logical_and(
-            has_chunks, first_overlap_len < interleave_size_i32
-        )
-        last_partial = jnp.logical_and(
-            jnp.logical_and(has_chunks, num_chunks > 1),
-            last_overlap_len < interleave_size_i32,
-        )
-        first_partial_i32 = first_partial.astype(jnp.int32)
-        last_partial_i32 = last_partial.astype(jnp.int32)
-        full_chunk_count = num_chunks - first_partial_i32 - last_partial_i32
-        num_full_tiles = (full_chunk_count + group_chunks_i32 - 1) // group_chunks_i32
-        first_full_chunk = first_chunk + jnp.where(first_partial, cycle_i32, 0)
-        first_partial_len = jnp.where(first_partial, first_overlap_len, 0)
-        local_count = (
-            first_partial_len
-            + full_chunk_count * interleave_size_i32
-            + jnp.where(last_partial, last_overlap_len, 0)
-        )
-        num_tiles = first_partial_i32 + num_full_tiles + last_partial_i32
-        return (
-            has_chunks,
-            first_overlap_start,
-            first_overlap_len,
-            first_partial,
-            first_partial_i32,
-            first_partial_len,
-            first_full_chunk,
-            full_chunk_count,
-            num_full_tiles,
-            last_chunk,
-            last_overlap_len,
-            last_partial,
-            num_tiles,
-            local_count,
-        )
-
     def _rank_tile(
         q_len,
         token_owner_start,
         request_absolute_query_start,
         rank_local_prefix,
-        consumer_rank: int,
+        consumer_rank,
         tile_idx,
     ):
-        (
-            has_chunks,
-            first_overlap_start,
-            first_overlap_len,
-            first_partial,
-            first_partial_i32,
-            first_partial_len,
-            first_full_chunk,
-            full_chunk_count,
-            num_full_tiles,
-            last_chunk,
-            last_overlap_len,
-            last_partial,
-            num_tiles,
-            _local_count,
-        ) = _rank_request_layout(q_len, token_owner_start, consumer_rank)
-
-        tile_idx_i32 = jnp.asarray(tile_idx, dtype=jnp.int32)
-        full_tile_idx = tile_idx_i32 - first_partial_i32
-        is_first_partial_tile = jnp.logical_and(first_partial, tile_idx_i32 == 0)
-        is_full_tile = jnp.logical_and(
-            full_tile_idx >= 0, full_tile_idx < num_full_tiles
+        local_begin = _rank_token_count_before(token_owner_start, consumer_rank)
+        local_end = _rank_token_count_before(token_owner_start + q_len, consumer_rank)
+        local_offset = tile_idx * q_block_size
+        q_tile_size = jnp.clip(local_end - local_begin - local_offset, 0, q_block_size)
+        tile_active = q_tile_size > 0
+        # The inverse of batch-flat interleave ownership. Partial first/last
+        # interleaves share the same tile as all other local request rows.
+        local_position = local_begin + local_offset
+        token_owner_tile_start = (
+            (local_position // interleave_size_i32) * cycle_i32
+            + consumer_rank * interleave_size_i32
+            + local_position % interleave_size_i32
         )
-        is_last_partial_tile = jnp.logical_and(
-            last_partial,
-            tile_idx_i32 == first_partial_i32 + num_full_tiles,
-        )
-        remaining_full_chunks = full_chunk_count - full_tile_idx * group_chunks_i32
-        full_chunks_in_tile = jnp.minimum(
-            group_chunks_i32, jnp.maximum(remaining_full_chunks, 0)
-        )
-        full_tile_len = full_chunks_in_tile * interleave_size_i32
-
-        full_tile_global_start = (
-            first_full_chunk + full_tile_idx * group_chunks_i32 * cycle_i32
-        )
-        full_tile_local_offset = (
-            first_partial_len + full_tile_idx * group_chunks_i32 * interleave_size_i32
-        )
-        last_partial_local_offset = (
-            first_partial_len + full_chunk_count * interleave_size_i32
-        )
-
-        tile_active = jnp.logical_and(has_chunks, tile_idx_i32 < num_tiles)
-        token_owner_tile_start = jnp.where(
-            is_first_partial_tile,
-            first_overlap_start,
-            jnp.where(
-                is_full_tile,
-                full_tile_global_start,
-                jnp.where(is_last_partial_tile, last_chunk, 0),
-            ),
-        )
-        q_tile_size = jnp.where(
-            is_first_partial_tile,
-            first_overlap_len,
-            jnp.where(
-                is_full_tile,
-                full_tile_len,
-                jnp.where(is_last_partial_tile, last_overlap_len, 0),
-            ),
-        )
-        local_offset = jnp.where(
-            is_first_partial_tile,
-            0,
-            jnp.where(
-                is_full_tile,
-                full_tile_local_offset,
-                jnp.where(is_last_partial_tile, last_partial_local_offset, 0),
-            ),
-        )
-        q_tile_size = jnp.where(tile_active, q_tile_size, 0)
-        q_hbm_offset = jnp.where(tile_active, rank_local_prefix + local_offset, 0)
-        request_relative_start = token_owner_tile_start - token_owner_start
         q_global_start = jnp.where(
             tile_active,
-            request_absolute_query_start + request_relative_start,
+            request_absolute_query_start + token_owner_tile_start - token_owner_start,
             0,
         )
+        q_hbm_offset = jnp.where(tile_active, rank_local_prefix + local_offset, 0)
         return q_global_start, q_tile_size, q_hbm_offset
 
     def _rank_token_count_before(position, rank):
@@ -392,11 +266,9 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     request_q_len = q_len[:, None]
     request_token_owner_start = token_owner_start[:, None]
     request_ranks = rank_indices[None, :]
-    *_, local_counts = _rank_request_layout(
-        request_q_len,
-        request_token_owner_start,
-        request_ranks,
-    )
+    local_counts = _rank_token_count_before(
+        request_token_owner_start + request_q_len, request_ranks
+    ) - _rank_token_count_before(request_token_owner_start, request_ranks)
     local_counts = jnp.where(req_active[:, None], local_counts, 0)
     rank_local_q_ends = jnp.cumsum(local_counts, axis=0)
     request_rank_local_q_starts = rank_local_q_ends - local_counts
@@ -418,10 +290,12 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         tile_indices[None, :, None],
     )
     q_last_row = jnp.maximum(q_sizes - 1, 0)
-    q_global_last = (
-        q_global_starts
-        + (q_last_row // interleave_size_i32) * cycle_i32
-        + (q_last_row % interleave_size_i32)
+    q_global_last = query_row_positions(
+        q_global_starts,
+        q_hbm_offsets,
+        q_last_row,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
     )
     request_relative_end = (
         q_global_last - request_absolute_query_start[:, None, None] + 1

@@ -1,0 +1,89 @@
+{
+  "structured_outputs": {
+    "json": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[\\w\\d\\s]{1,16}$"
+        },
+        "house": {
+          "type": "string",
+          "enum": [
+            "Gryffindor",
+            "Slytherin",
+            "Ravenclaw",
+            "Hufflepuff"
+          ]
+        },
+        "blood status": {
+          "type": "string",
+          "enum": [
+            "Pure-blood",
+            "Half-blood",
+            "Muggle-born"
+          ]
+        },
+        "occupation": {
+          "type": "string",
+          "enum": [
+            "student",
+            "teacher",
+            "auror",
+            "ministry of magic",
+            "death eater",
+            "order of the phoenix"
+          ]
+        },
+        "wand": {
+          "type": "object",
+          "properties": {
+            "wood": {
+              "type": "string",
+              "pattern": "^[\\w\\d\\s]{1,16}$"
+            },
+            "core": {
+              "type": "string",
+              "pattern": "^[\\w\\d\\s]{1,16}$"
+            },
+            "length": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "wood",
+            "core",
+            "length"
+          ],
+          "additionalProperties": false
+        },
+        "alive": {
+          "type": "string",
+          "enum": [
+            "Alive",
+            "Deceased"
+          ]
+        },
+        "patronus": {
+          "type": "string",
+          "pattern": "^[\\w\\d\\s]{1,16}$"
+        },
+        "bogart": {
+          "type": "string",
+          "pattern": "^[\\w\\d\\s]{1,16}$"
+        }
+      },
+      "required": [
+        "name",
+        "house",
+        "blood status",
+        "occupation",
+        "wand",
+        "alive",
+        "patronus",
+        "bogart"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

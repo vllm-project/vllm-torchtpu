@@ -18,6 +18,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
@@ -32,6 +33,8 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.wrapper import (
     ragged_paged_attention,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 jax.config.parse_flags_with_absl()
 
 
@@ -44,7 +47,8 @@ def pack_fp4_to_uint8(x):
 
 def pack_kv_cache_fp4_to_uint8(kv_cache):
     assert kv_cache.dtype == jnp.float4_e2m1fn
-    # kv_cache shape: (num_pages, num_kv_heads * 2, aligned_kv_head_dim // 8, 8, page_size)
+    # kv_cache shape:
+    # (num_pages, num_kv_heads * 2, aligned_kv_head_dim // 8, 8, page_size)
     # Transpose dim 3 (kv_packing=8) and 4 (page_size)
     kv_cache = kv_cache.transpose(0, 1, 2, 4, 3)
     # Reshape (..., 8) to (..., 4, 2)
@@ -58,7 +62,8 @@ def pack_kv_cache_fp4_to_uint8(kv_cache):
 
 def unpack_kv_cache_uint8_to_fp4(kv_cache):
     assert kv_cache.dtype == jnp.uint8
-    # kv_cache shape: (num_pages, num_kv_heads * 2, aligned_kv_head_dim // 4, 4, page_size)
+    # kv_cache shape:
+    # (num_pages, num_kv_heads * 2, aligned_kv_head_dim // 4, 4, page_size)
     # Transpose dim 3 (kv_packing=4) and 4 (page_size)
     kv_cache = kv_cache.transpose(0, 1, 2, 4, 3)
     # Bitcast to float4
@@ -717,11 +722,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
 
         rpa_bkv_sz = bkv_sz
-        rpa_n_buffer = 3
         rpa_batch_size = 2
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             rpa_bkv_sz = max(bkv_sz, 128)
-            rpa_n_buffer = 2
             rpa_batch_size = 1
 
         decode_block_sizes = configs.BlockSizes(
@@ -729,14 +732,12 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             bq_c_sz=bq_csz,
             bkv_sz=rpa_bkv_sz,
             batch_size=rpa_batch_size,
-            n_buffer=rpa_n_buffer,
         )
         prefill_block_sizes = configs.BlockSizes(
             bq_sz=bq_sz,
             bq_c_sz=bq_csz,
             bkv_sz=rpa_bkv_sz,
             batch_size=rpa_batch_size,
-            n_buffer=rpa_n_buffer,
         )
 
         output, updated_kv_cache = ragged_paged_attention(

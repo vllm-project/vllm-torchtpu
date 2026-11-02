@@ -37,11 +37,9 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as KB
 from vllm_torchtpu.kernels.ragged_paged_attention.v3 import kernel as K
 from vllm_torchtpu.kernels.ragged_paged_attention.v3 import kernel_hd64 as K64
 
-_BATCHED_DECODE_BLOCKS = KBC.BlockSizes(
-    bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8, n_buffer=3
-)
+_BATCHED_DECODE_BLOCKS = KBC.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8)
 _BATCHED_PREFILL_BLOCKS = KBC.BlockSizes(
-    bq_sz=1792, bq_c_sz=28, bkv_sz=256, batch_size=2, n_buffer=3
+    bq_sz=1792, bq_c_sz=28, bkv_sz=256, batch_size=2
 )
 
 # One entry per kernel family. Each kernel family ships its own cache layout
@@ -97,6 +95,7 @@ def _build_packed_cache(
     return flat.reshape(cache_shape)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("cfg", [V3, HD64], ids=lambda c: c["name"])
 @pytest.mark.parametrize("impl", ["pallas", "ref"])
 @pytest.mark.parametrize(
@@ -240,6 +239,7 @@ def _build_batched_cache(
     return np.asarray(cache.astype(jnp.float32))
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "kv_len, q_len, distribution",
     [
@@ -365,6 +365,7 @@ def test_skip_kv_update_batched(kv_len, q_len, distribution):
     )
 
 
+@pytest.mark.tpu_test
 def test_batched_seq_along_lane_matches_head_along_sublane():
     """`kv_layout=SEQ_ALONG_LANE` must be numerically equivalent to the default
     `HEAD_ALONG_SUBLANE` layout for identical logical Q/K/V: layout only

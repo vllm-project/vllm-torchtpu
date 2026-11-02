@@ -84,7 +84,9 @@ class TestUnquantizedConfigQuantizeOnLoadDispatch:
         assert isinstance(method, VllmFp8LinearMethodTPU)
 
     def test_kv_b_proj_is_skipped_for_linear_method(self, monkeypatch, linear_layer):
-        """kv_b_proj must remain unquantized here because MLAAttention slices W_UK_T/W_UV and quantizes them separately."""
+        """kv_b_proj must remain unquantized here because MLAAttention slices
+        W_UK_T/W_UV and quantizes them separately.
+        """
         monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "self_attn")
         cfg = VllmUnquantizedConfig()
         method = cfg.get_quant_method(

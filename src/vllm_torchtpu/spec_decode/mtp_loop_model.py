@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """A second compiled program for an MTP draft's IndexShare loop steps.
 
 vLLM compiles a model once and then drops the guards that would recompile it
@@ -24,7 +36,7 @@ from vllm.sequence import IntermediateTensors
 # What `support_torch_compile` infers for `DeepSeekMTP.forward`: dim 0, the
 # token dimension, of every tensor argument. The proposer checks the draft's
 # own dims against this before building the program.
-MTP_DYNAMIC_ARG_DIMS = {
+MTP_DYNAMIC_ARG_DIMS: dict[str, int | list[int] | dict[int, str]] = {
     "input_ids": 0,
     "positions": 0,
     "hidden_states": 0,

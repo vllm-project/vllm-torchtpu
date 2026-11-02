@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from collections.abc import Callable
 from threading import Lock
 
@@ -11,6 +24,9 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
 # `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
@@ -50,7 +66,12 @@ def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     raise ValueError(f"Unsupported quantized dtype: {w_q_dtype}")
 
 
-def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.Array:
+def _quantized_matmul_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w8a16_max_rows: int = 0,
+) -> jax.Array:
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
     `w_q` is `[n_in, n_out]`, so this is a plain `(m, k) @ (k, n)` contraction
@@ -91,7 +112,20 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
-    return xla_quantized_matmul(x, w_q, w_s)
+    # Rows is static at trace time, so each token bucket picks one path.
+    # W8A16 is only measured with FP8 weights; int8 weights keep W8A8.
+    rows = x.shape[0]
+    use_w8a16 = 0 < rows <= w8a16_max_rows and jnp.issubdtype(w_q.dtype, jnp.floating)
+    if use_w8a16:
+        # Logged at trace time, so absent when executables load from the
+        # compile cache.
+        logger.info_once(
+            "FP8 dense linears use W8A16 (bf16 activations) for the %d-row "
+            "token bucket (TPU_FP8_LINEAR_W8A16_MAX_ROWS=%d).",
+            rows,
+            w8a16_max_rows,
+        )
+    return xla_quantized_matmul(x, w_q, w_s, quantize_activation=not use_w8a16)
 
 
 _quantized_matmul_kernel_op: Callable | None = None
@@ -110,9 +144,12 @@ def _get_quantized_matmul_op() -> Callable:
         op = pallas.jax_op("pallas::quantized_matmul_kernel", _quantized_matmul_jax)
 
         def _fake_quantized_matmul(
-            x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+            x: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+            w8a16_max_rows: int = 0,
         ):
-            del w_s
+            del w_s, w8a16_max_rows
             return torch.empty(
                 x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
             )
@@ -123,7 +160,10 @@ def _get_quantized_matmul_op() -> Callable:
 
 
 def quantized_matmul(
-    x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w8a16_max_rows: int = 0,
 ) -> torch.Tensor:
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
@@ -141,7 +181,7 @@ def quantized_matmul(
 
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
+    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
     return out_2d.reshape(orig_out_shape)
 
 
@@ -246,16 +286,19 @@ def reorder_concatenated_tensor_for_sharding(
     concatenated_tensor: jax.Array, split_sizes: list[int], n_shards: int, dim: int
 ):
     """
-    Reorder a replicated concatenated tensor such that when sharded on multiple chips, each shard is a concatenation of the shards of the individual tensors.
+    Reorder a replicated concatenated tensor such that when sharded on multiple chips,
+    each shard is a concatenation of the shards of the individual tensors.
     For example, let the concatenated_tensor be:
         AAAAAAAAAAAABBBBBBBBCCCC
             12 As     8 Bs  4 Cs
     and let the split_sizes = [12, 8, 4] and n_shards = 4.
     The output is:
         AAABBCAAABBCAAABBCAAABBC
-    In other words, it reorders the input tensor into 4 segements, with each segment corresponding to a shard and being AAABBC.
+    In other words, it reorders the input tensor into 4 segements, with each segment
+    corresponding to a shard and being AAABBC.
     Args:
-        concatenated_tensor: the tensor, concatenated on the dimension specified by `dim`.
+        concatenated_tensor: the tensor, concatenated on the dimension specified
+            by `dim`.
         split_sizes: each individual tensor's size on the dimension specified by `dim`.
         n_shards: num of shards.
         dim: the dimension on which the concatenated_tensor is concatenated.
@@ -282,7 +325,8 @@ def slice_sharded_tensor_for_concatenation(
     sharded_tensor: jax.Array, split_sizes: list[int], n_shards: int
 ):
     """
-    Slice the input tensor which is sharded on multiple chips (on the last dim) into individual tensors with the same sharding.
+    Slice the input tensor which is sharded on multiple chips (on the last dim) into
+    individual tensors with the same sharding.
     For example, let the sharded_tensor be:
         AAABBC | AAABBC | AAABBC | AAABBC
         Shard0   Shard1   Shard2   Shard3
@@ -292,7 +336,8 @@ def slice_sharded_tensor_for_concatenation(
           BB   |   BB   |   BB   |   BB
            C   |    C   |    C   |    C
         Shard0   Shard1   Shard2   Shard3
-    In other words, each individual tensor is a slice of the input tensor with the same sharding.
+    In other words, each individual tensor is a slice of the input tensor with the
+    same sharding.
     Args:
         sharded_tensor: the input tensor, sharded on the last dim.
         split_sizes: each individual tensor's size on the last dim.

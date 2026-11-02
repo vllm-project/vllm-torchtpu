@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Model-specific patches and PyTorch XLA op overrides for Qwen3-VL on TPU."""
 
 import contextlib
@@ -201,7 +213,8 @@ def _scoped_qwen3_vl_torch_ops():
 
 
 def _patch_qwen3_vl_get_rope_index(modeling) -> None:
-    """Patch Qwen3VLModel.get_rope_index with signature binding and CPU RoPE evaluation."""
+    """Patch Qwen3VLModel.get_rope_index with signature binding and
+    CPU RoPE evaluation."""
     target_cls = getattr(modeling, "Qwen3VLModel", None)
     if target_cls is None:
         return
@@ -369,13 +382,15 @@ def maybe_patch_qwen3_vl(model_config: Optional["ModelConfig"] = None) -> bool |
          lowering and device sync errors during 3D RoPE index construction.
     2. Qwen3VLVisionAttention.forward:
        - Moves `cu_seqlens` (cumulative visual patch sequence lengths) to CPU to avoid
-         device mismatch in vision attention kernels without fabricating fallback sequences.
+         device mismatch in vision attention kernels without fabricating
+         fallback sequences.
     3. Vision-encoder scoped PyTorch op overrides:
        - torch.masked_scatter / masked_scatter_: Replaces native TPU masked_scatter
          with strict 1D sequential indexing decomposition, validating source tensor size
          and eliminating unlowered XLA scan HLO nodes.
-       - torch.repeat_interleave & torch.cumsum: Evaluates integer/bool TPU tensors on CPU
-         scoped strictly to vision-encoder execution instead of process-wide mutation.
+       - torch.repeat_interleave & torch.cumsum: Evaluates integer/bool TPU tensors
+         on CPU scoped strictly to vision-encoder execution instead of
+         process-wide mutation.
     """
     if not _is_qwen3_vl_model(model_config):
         return False

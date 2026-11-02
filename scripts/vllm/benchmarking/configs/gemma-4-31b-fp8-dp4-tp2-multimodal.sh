@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Benchmark config: RedHatAI/gemma-4-31B-it-FP8-Dynamic (Dense, TP=2 on v7x-8).
 MODEL="RedHatAI/gemma-4-31B-it-FP8-Dynamic"
@@ -7,9 +21,12 @@ DATA_PARALLELISM=4
 QUANTIZATION=""
 ISL_OSL_CONFIGS="1024:1024"
 CONCURRENCY_OPTIONS="128"
+# Neither the benchmark (128 across 4 DP ranks) nor lm-eval (128 concurrent
+# requests) exceeds 128 sequences, so drop the unused 256 and 512 buckets.
+MAX_NUM_SEQS=128
 RANDOM_RANGE_RATIO="0.8"
 GPU_MEMORY_UTILIZATION=0.90
 ATTENTION_BACKEND="CUSTOM"
 EVAL_TOLERANCE="0.03"
 export VLLM_ENGINE_READY_TIMEOUT_S=1800
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--block-size=256 --max-num-seqs=512 --mm-processor-kwargs {\"size\":{\"longest_edge\":262144,\"shortest_edge\":3136}} --disable-chunked-mm-input --additional_config {\"mm-encoder-tp-mode\":\"data\"} --compilation-config {\"cudagraph_mm_encoder\":true,\"encoder_cudagraph_max_vision_items_per_batch\":8,\"encoder_cudagraph_max_frames_per_batch\":8}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--block-size=256 --mm-processor-kwargs {\"size\":{\"longest_edge\":262144,\"shortest_edge\":3136}} --disable-chunked-mm-input --additional_config {\"mm-encoder-tp-mode\":\"data\"} --compilation-config {\"cudagraph_mm_encoder\":true,\"encoder_cudagraph_max_vision_items_per_batch\":8,\"encoder_cudagraph_max_frames_per_batch\":8}"

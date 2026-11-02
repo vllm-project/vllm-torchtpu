@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 ZmqShmKvConnectorBase: P/D disaggregated serving over a per-host SharedMemory
 pool plus ZMQ ROUTER/DEALER coordination.
@@ -26,6 +38,7 @@ pool plus ZMQ ROUTER/DEALER coordination.
     releases the slot once all ranks have copied.
 """
 
+import contextlib
 import hashlib
 import hmac
 import os
@@ -35,7 +48,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
 import zmq
@@ -76,7 +89,7 @@ def _get_default_ipc_key() -> bytes:
         if os.path.exists("/etc/machine-id"):
             with open("/etc/machine-id") as f:
                 machine_id = f.read().strip()
-    except Exception:
+    except Exception:  # noqa: S110
         pass
     user_id = str(os.getuid()) if hasattr(os, "getuid") else "0"
     base_secret = f"vllm-torchtpu-ipc-auth-{machine_id}-{user_id}".encode()
@@ -87,7 +100,8 @@ _IPC_AUTH_KEY: bytes = _get_default_ipc_key()
 
 
 def _secure_dumps(obj: Any) -> bytes:
-    """Serialize payload with an HMAC-SHA256 signature to prevent untrusted deserialization."""
+    """Serialize payload with an HMAC-SHA256 signature to prevent
+    untrusted deserialization."""
     raw = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     sig = hmac.new(_IPC_AUTH_KEY, raw, hashlib.sha256).digest()
     return sig + raw
@@ -272,7 +286,9 @@ class ZmqShmKvConnectorBase:
         self._coord_threads: list[threading.Thread] = []
         self._coord_pool: HostKVShmPool | None = None
         self.vllm_config = vllm_config
-        self.config = vllm_config.kv_transfer_config
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        self.config = kv_transfer_config
         self.is_producer = self.config.is_kv_producer
 
         self.runner: Any | None = None
@@ -497,6 +513,7 @@ class ZmqShmKvConnectorBase:
     def _extract_kv_layout(self) -> None:
         """Default (uniform) layout: every kv cache layer has the same shape
         and dtype."""
+        assert self.runner is not None
         kv_caches = self.runner.kv_caches
         kv_layer = kv_caches[0]
         self.num_layers = len(kv_caches)
@@ -591,6 +608,7 @@ class ZmqShmKvConnectorBase:
         compiled executable cache hits on first real request. Inlined
         rather than calling the hot path so warmup samples don't leak into
         the latency tracker or emit a stray scatter log line."""
+        assert self.runner is not None
         kv_caches = self.runner.kv_caches
         indices = torch.arange(num_blocks, dtype=torch.int64, device=self.device)
         slot_idx = 0
@@ -602,6 +620,7 @@ class ZmqShmKvConnectorBase:
             # path (batch_transfer_h2d into a pre-allocated torch.empty),
             # so the first real request paid a 3-8s recompile.
             use_kv_scatter = self._kv_scatter_enabled
+            assert self._coord_pool is not None
             src_views = [
                 self._coord_pool.layer_view(
                     slot_idx, self.local_tp_rank, layer_idx, num_blocks
@@ -614,6 +633,7 @@ class ZmqShmKvConnectorBase:
                 new_caches = self._try_fast_scatter(
                     device_shards, list(kv_caches), list(range(num_blocks))
                 )
+                assert new_caches is not None
                 for c in new_caches:
                     self._synchronize_device(c)
                 for i, c in enumerate(new_caches):
@@ -631,11 +651,13 @@ class ZmqShmKvConnectorBase:
         self, req_meta: LoadMeta
     ) -> tuple[str, int, int | None]:
         if isinstance(req_meta.remote_host, list):
+            assert isinstance(req_meta.remote_port, list)
             assert len(req_meta.remote_host) == len(req_meta.remote_port)
             host = req_meta.remote_host[self.node_id]
             port = req_meta.remote_port[self.node_id]
         else:
             host = req_meta.remote_host
+            assert not isinstance(req_meta.remote_port, list)
             port = req_meta.remote_port
         side_channel_port = None
         if req_meta.remote_side_channel_port:
@@ -661,6 +683,7 @@ class ZmqShmKvConnectorBase:
     def _build_pool_spec(self) -> Any:
         """Build the per-host shm pool spec. Subclasses
         override this and return their own spec."""
+        assert self.runner is not None
         kv_layer = self.runner.kv_caches[0]
         block_size = self.vllm_config.cache_config.block_size
         max_model_len = self.vllm_config.model_config.max_model_len
@@ -742,9 +765,9 @@ class ZmqShmKvConnectorBase:
     def _coord_attach_shm_with_retry(self, spec: Any, name: str) -> Any:
         """Non-rank-0 ranks may race ahead of rank 0. Poll the shm name a
         few seconds before giving up."""
-        deadline = time.perf_counter() + 30.0
+        deadline = time.time() + 30.0
         last_err: Exception | None = None
-        while time.perf_counter() < deadline:
+        while time.time() < deadline:
             try:
                 return self._pool_attach(spec, name)
             except FileNotFoundError as e:
@@ -884,6 +907,7 @@ class ZmqShmKvConnectorBase:
         """Pop any pending outbound messages and send them. Called from
         inside the owning IPC loop; must not be called from other threads."""
         sock = self._coord_ipc_sock
+        assert sock is not None
         try:
             while True:
                 ident, tag, data = self._coord_ipc_out.get_nowait()
@@ -909,10 +933,11 @@ class ZmqShmKvConnectorBase:
         self._stop_event.set()
         # Wake the stage waiter so it can observe _stop_event and exit.
         if hasattr(self, "_stage_pending_q"):
-            try:
+            # TODO: The queue is unbounded, so put_nowait cannot raise
+            # queue.Full. Remove this suppress once the teardown test stops
+            # injecting queue.Full.
+            with contextlib.suppress(queue.Full):
                 self._stage_pending_q.put_nowait(None)
-            except Exception:
-                pass
         if hasattr(self, "_coord_executor"):
             self._coord_executor.shutdown(wait=False)
         if hasattr(self, "_coord_channel_executor"):
@@ -1001,6 +1026,7 @@ class ZmqShmKvConnectorBase:
             time.time(),
         )
         try:
+            assert self._coord_pool is not None
             slot_idx = self._coord_pool.acquire_slot(timeout=0.0)
         except Exception:
             # Pool full. Drop request; scheduler will surface a failure.
@@ -1008,7 +1034,7 @@ class ZmqShmKvConnectorBase:
                 send_holders = [
                     f"uuid={u} req={e.req_id} "
                     f"acked={e.pull_acked} "
-                    f"exp_in={max(0.0, e.expiration_time - time.perf_counter()):.1f}s"
+                    f"exp_in={max(0.0, e.expiration_time - time.time()):.1f}s"
                     for u, e in self._coord_send.items()
                 ]
                 recv_holders = [
@@ -1083,11 +1109,11 @@ class ZmqShmKvConnectorBase:
             req_id,
             uuid,
         )
-        deadline = time.perf_counter() + timeout
+        deadline = time.time() + timeout
         info: tuple[int, int, list[int]] | None = None
         with self._worker_pending_stage_cv:
             while uuid not in self._worker_pending_stage:
-                rem = deadline - time.perf_counter()
+                rem = deadline - time.time()
                 if rem <= 0:
                     logger.warning(
                         "TPUConnectorWorker(%d) rank%d --> stage_inline timeout "
@@ -1146,6 +1172,7 @@ class ZmqShmKvConnectorBase:
         the in-flight entry until the future completes, so the source
         device buffer and destination shm backing stay alive across the
         DMA."""
+        assert self.runner is not None
         logger.info(
             "TPUConnectorWorker(%s) rank%d --> stage_shard enqueue "
             "uuid=%s slot=%d blocks=%s layers=%d",
@@ -1217,9 +1244,9 @@ class ZmqShmKvConnectorBase:
                 py_fut = self._coord_stage_waiter_pool.submit(
                     self._coord_stage_wait_worker, entry
                 )
-                in_flight.append((time.monotonic() + timeout_s, entry, py_fut))
+                in_flight.append((time.time() + timeout_s, entry, py_fut))
             if in_flight:
-                now = time.monotonic()
+                now = time.time()
                 kept: list[tuple[float, _StageInFlight, Any]] = []
                 for deadline, ent, fut in in_flight:
                     if fut.done():
@@ -1373,6 +1400,7 @@ class ZmqShmKvConnectorBase:
                 self._coord_broadcast(_IPC_LOAD_SKIP, (req_meta.uuid,))
             return
 
+        assert req_meta.local_block_ids is not None
         num_blocks = self._blocks_token(req_meta.local_block_ids)
         # Preemption dedup: vLLM's scheduler re-emits update_state_after_alloc
         # for requests that were preempted and rescheduled. The LoadMeta
@@ -1383,6 +1411,7 @@ class ZmqShmKvConnectorBase:
         # -- eventually exhausting the pool and hanging the scheduler.
         # Detect the re-emit by uuid and just update local_blocks in
         # place so the in-flight pull targets the new block destinations.
+        pull_in_flight = False
         with self._coord_lock:
             existing = self._coord_recv.get(req_meta.uuid)
             if existing is not None:
@@ -1431,6 +1460,7 @@ class ZmqShmKvConnectorBase:
             return
 
         try:
+            assert self._coord_pool is not None
             slot_idx = self._coord_pool.acquire_slot(timeout=0.0)
         except Exception:
             with self._coord_lock:
@@ -1525,12 +1555,15 @@ class ZmqShmKvConnectorBase:
             port = ports[h] + ch
             host = hosts[h]
             sock_path = make_zmq_path("tcp", host, port)
-            sock = make_zmq_socket(
-                ctx=self.zmq_cxt,
-                path=sock_path,
-                socket_type=zmq.DEALER,
-                bind=False,
-                linger=0,
+            sock = cast(
+                zmq.Socket,
+                make_zmq_socket(
+                    ctx=self.zmq_cxt,
+                    path=sock_path,
+                    socket_type=zmq.DEALER,
+                    bind=False,
+                    linger=0,
+                ),
             )
             timeout_ms = max(1, int(timeout_s * 1000))
             sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
@@ -1545,10 +1578,10 @@ class ZmqShmKvConnectorBase:
                     time.time(),
                 )
                 sock.send_multipart([_MSG_PULL, uuid_bytes, req_blocks_pickle])
-                deadline = t0 + timeout_s
+                deadline = time.time() + timeout_s
                 frames = None
-                while time.perf_counter() < deadline:
-                    remaining_ms = max(1, int((deadline - time.perf_counter()) * 1000))
+                while time.time() < deadline:
+                    remaining_ms = max(1, int((deadline - time.time()) * 1000))
                     if sock.poll(timeout=min(remaining_ms, 1000)) != 0:
                         # copy=False returns zmq.Frame objects whose
                         # .buffer is a readonly memoryview into the ZMQ
@@ -1593,7 +1626,7 @@ class ZmqShmKvConnectorBase:
                 with self._coord_lock:
                     global_to_local = {
                         global_rank: local_rank
-                        for local_rank, global_rank in self._coord_local_to_global_rank.items()
+                        for local_rank, global_rank in self._coord_local_to_global_rank.items()  # noqa: E501
                     }
 
                 for _ in range(n_ranks):
@@ -1606,6 +1639,7 @@ class ZmqShmKvConnectorBase:
 
                     if global_rank in global_to_local:
                         local_rank = global_to_local[global_rank]
+                        assert self._coord_pool is not None
                         self._coord_pool.unpack_rank_layers(
                             entry.slot_idx, local_rank, entry.num_blocks, layer_buffers
                         )
@@ -1717,6 +1751,7 @@ class ZmqShmKvConnectorBase:
                 with self._coord_lock:
                     self._coord_recv.pop(entry.uuid, None)
                     self._coord_done_recving.add(entry.req_id)
+                assert self._coord_pool is not None
                 self._coord_pool.release_slot(entry.slot_idx)
             entry.load_complete.set()
             logger.info(
@@ -1808,6 +1843,8 @@ class ZmqShmKvConnectorBase:
             ``index_put_`` followed by ``_synchronize_device``."""
         if not local_blocks:
             return
+        assert self.runner is not None
+        assert self._coord_pool is not None
         kv_caches = self.runner.kv_caches
         use_fast_scatter = self._kv_scatter_enabled
         h2d_ms_total = 0.0
@@ -1833,6 +1870,7 @@ class ZmqShmKvConnectorBase:
             new_caches = self._try_fast_scatter(
                 device_shards, list(kv_caches), local_blocks
             )
+            assert new_caches is not None
             # Sync every returned cache -- they're independent outputs of the
             # fused kernel and the device may schedule them in parallel, so
             # syncing only the last would race.
@@ -1927,6 +1965,7 @@ class ZmqShmKvConnectorBase:
             try:
                 self._coord_rank0_send_notify(dummy, uuid)
             finally:
+                assert self._coord_pool is not None
                 self._coord_pool.release_slot(entry_for_notify.slot_idx)
                 logger.info(
                     "PERF D scatter_complete req_id=%s uuid=%s ts=%.6f",
@@ -1957,11 +1996,14 @@ class ZmqShmKvConnectorBase:
                 sock = self._coord_notif_sockets.get(sock_path)
                 new_sock = sock is None
                 if new_sock:
-                    sock = make_zmq_socket(
-                        ctx=self.zmq_cxt,
-                        path=sock_path,
-                        socket_type=zmq.DEALER,
-                        bind=False,
+                    sock = cast(
+                        zmq.Socket,
+                        make_zmq_socket(
+                            ctx=self.zmq_cxt,
+                            path=sock_path,
+                            socket_type=zmq.DEALER,
+                            bind=False,
+                        ),
                     )
                     self._coord_notif_sockets[sock_path] = sock
                 sock.send_string(str(uuid))
@@ -1989,10 +2031,10 @@ class ZmqShmKvConnectorBase:
         or None for skip/timeout. The dict stores None as a sentinel set
         by LOAD_SKIP, so we can tell "skip" apart from "not there yet" by
         presence."""
-        deadline = time.perf_counter() + timeout
+        deadline = time.time() + timeout
         with self._worker_pending_load_cv:
             while uuid not in self._worker_pending_load:
-                rem = deadline - time.perf_counter()
+                rem = deadline - time.time()
                 if rem <= 0:
                     return None
                 self._worker_pending_load_cv.wait(timeout=rem)
@@ -2004,6 +2046,7 @@ class ZmqShmKvConnectorBase:
     # =========================================================
     def _coord_rank0_ipc_loop(self) -> None:
         sock = self._coord_ipc_sock
+        assert sock is not None
         while not self._stop_event.is_set():
             # Drain outbound sends from the queue first so notifications
             # don't starve behind inbound polling.
@@ -2052,8 +2095,8 @@ class ZmqShmKvConnectorBase:
                     if len(self._coord_rank_to_identity) == self.ranks_per_host - 1:
                         self._coord_workers_ready.set()
                 logger.info(
-                    "TPUConnectorWorker(%d) rank0 --> HELLO from local_rank=%d global_rank=%d "
-                    "(%d/%d registered)",
+                    "TPUConnectorWorker(%d) rank0 --> HELLO from local_rank=%d "
+                    "global_rank=%d (%d/%d registered)",
                     self.node_id,
                     local_rank,
                     global_rank,
@@ -2129,6 +2172,7 @@ class ZmqShmKvConnectorBase:
                     try:
                         self._coord_rank0_send_notify(dummy, entry_for_notify.uuid)
                     finally:
+                        assert self._coord_pool is not None
                         self._coord_pool.release_slot(entry_for_notify.slot_idx)
                         logger.info(
                             "PERF D scatter_complete req_id=%s uuid=%s ts=%.6f",
@@ -2145,6 +2189,7 @@ class ZmqShmKvConnectorBase:
 
     def _coord_worker_ipc_loop(self) -> None:
         sock = self._coord_ipc_sock
+        assert sock is not None
         while not self._stop_event.is_set():
             self._coord_ipc_drain_outbound()
             try:
@@ -2250,8 +2295,11 @@ class ZmqShmKvConnectorBase:
         N parallel TCP streams end-to-end."""
         port = self._kv_transfer_ports[channel_idx]
         sock_path = make_zmq_path("tcp", "*", port)
-        sock = make_zmq_socket(
-            ctx=self.zmq_cxt, path=sock_path, socket_type=zmq.ROUTER, bind=True
+        sock = cast(
+            zmq.Socket,
+            make_zmq_socket(
+                ctx=self.zmq_cxt, path=sock_path, socket_type=zmq.ROUTER, bind=True
+            ),
         )
         sock.setsockopt(zmq.LINGER, 0)
         sock.setsockopt(zmq.ROUTER_MANDATORY, 0)
@@ -2408,9 +2456,9 @@ class ZmqShmKvConnectorBase:
         # n_channels parallel PULLs the race window is n_channels-fold more
         # likely to fire, so this backoff is required for correctness.
         timeout = dist_utils.get_p2p_wait_pull_timeout()
-        deadline = time.perf_counter() + timeout
+        deadline = time.time() + timeout
         entry = None
-        while time.perf_counter() < deadline:
+        while time.time() < deadline:
             with self._coord_lock:
                 entry = self._coord_send.get(uuid)
                 if entry is not None:
@@ -2418,7 +2466,7 @@ class ZmqShmKvConnectorBase:
                     # Do not let the expiration sweeper release it while this
                     # channel is waiting for staging or queued to send.
                     entry.expiration_time = max(
-                        entry.expiration_time, time.perf_counter() + timeout
+                        entry.expiration_time, time.time() + timeout
                     )
             if entry is not None:
                 break
@@ -2439,7 +2487,7 @@ class ZmqShmKvConnectorBase:
         # n_channels=tp_size (the default) this means each channel waits
         # for exactly one rank.
         for r in ranks_on_channel:
-            rem = max(0.0, deadline - time.perf_counter())
+            rem = max(0.0, deadline - time.time())
             if r >= len(entry.staged_events):
                 # Defensive: should never happen because tp_size sizes the
                 # vector at construction. Fall back to global wait.
@@ -2468,9 +2516,7 @@ class ZmqShmKvConnectorBase:
                 )
                 return None
         with self._coord_lock:
-            entry.expiration_time = max(
-                entry.expiration_time, time.perf_counter() + timeout
-            )
+            entry.expiration_time = max(entry.expiration_time, time.time() + timeout)
             stage_failed = entry.stage_failed
         if stage_failed:
             # Some rank's stage waiter aborted (timeout or wait() raised).
@@ -2503,6 +2549,7 @@ class ZmqShmKvConnectorBase:
         for r in ranks_on_channel:
             global_rank = self._coord_local_to_global_rank[r]
             frames.append(str(global_rank).encode("utf-8"))
+            assert self._coord_pool is not None
             layer_views = self._coord_pool.rank_layer_views(
                 entry.slot_idx, r, entry.num_blocks
             )
@@ -2525,8 +2572,11 @@ class ZmqShmKvConnectorBase:
     # =========================================================
     def _coord_rank0_external_notif_loop(self) -> None:
         sock_path = make_zmq_path("tcp", "*", self.side_channel_port)
-        sock = make_zmq_socket(
-            ctx=self.zmq_cxt, path=sock_path, socket_type=zmq.ROUTER, bind=True
+        sock = cast(
+            zmq.Socket,
+            make_zmq_socket(
+                ctx=self.zmq_cxt, path=sock_path, socket_type=zmq.ROUTER, bind=True
+            ),
         )
         logger.info(
             "TPUConnectorWorker(%d) rank0 --> side channel on %s",
@@ -2575,7 +2625,7 @@ class ZmqShmKvConnectorBase:
         while not self._stop_event.is_set():
             if self._stop_event.wait(timeout=1.0):
                 return
-            now = time.perf_counter()
+            now = time.time()
             expired: list[int] = []
             with self._coord_lock:
                 for uuid, entry in list(self._coord_send.items()):
@@ -2594,6 +2644,7 @@ class ZmqShmKvConnectorBase:
                     if entry is None:
                         continue
                     self._coord_done_sending.add(entry.req_id)
+                assert self._coord_pool is not None
                 self._coord_pool.release_slot(entry.slot_idx)
 
     # =========================================================
@@ -2643,6 +2694,7 @@ class ZmqShmKvConnectorBase:
                 self._coord_done_recving.clear()
         # Free slots outside the lock to avoid nesting lock waits.
         for sidx in released_slots:
+            assert self._coord_pool is not None
             self._coord_pool.release_slot(sidx)
         for req_id, uuid in newly_done_recving:
             logger.info(

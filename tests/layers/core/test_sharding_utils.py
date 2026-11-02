@@ -173,8 +173,9 @@ def test_slice_sharded_tensor_for_concatenation():
 
     assert len(sliced_tensors) == 3
 
-    # The first tensor should contain all '1's from all 4 shards (4 shards * 3 As = 12 As)
-    # and its shape should represent the "global" tensor before physical sharding.
+    # The first tensor should contain all '1's from all 4 shards
+    # (4 shards * 3 As = 12 As) and its shape should represent the "global" tensor
+    # before physical sharding.
     expected_a = jnp.full((12,), 1)
     expected_b = jnp.full((8,), 2)
     expected_c = jnp.full((4,), 3)
@@ -370,7 +371,8 @@ def test_inverse_reorder_2d_dim0():
 
 def test_sharding_utils_indivisible_errors():
     """
-    Verifying that assertion errors are raised when split_sizes are not divisible by n_shards.
+    Verifying that assertion errors are raised when split_sizes are not divisible by
+    n_shards.
     """
     split_sizes = [13, 8, 4]  # 13 is not divisible by 4
     n_shards = 4
@@ -381,13 +383,15 @@ def test_sharding_utils_indivisible_errors():
         inverse_reorder_for_sharding(dummy_reordered, split_sizes, n_shards, dim=0)
 
     # For slice sharded tensor
-    # The last dimension must be a multiple of n_shards (4) so the initial reshape succeeds,
-    # allowing the function to reach the assert split_size % n_shards == 0 check.
+    # The last dimension must be a multiple of n_shards (4) so the initial reshape
+    # succeeds, allowing the function to reach the
+    # assert split_size % n_shards == 0 check.
     dummy_sharded = jnp.zeros((25, 4))
     with pytest.raises(AssertionError):
         slice_sharded_tensor_for_concatenation(dummy_sharded, split_sizes, n_shards)
 
-    # For reorder (JAX raises a reshape error, usually TypeError or ValueError because size mismatches)
+    # For reorder (JAX raises a reshape error, usually TypeError or ValueError because
+    # size mismatches)
     a = jnp.full((13, 2), 1)
     b = jnp.full((8, 2), 2)
     c = jnp.full((4, 2), 3)

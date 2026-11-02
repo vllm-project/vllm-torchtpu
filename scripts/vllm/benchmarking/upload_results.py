@@ -163,14 +163,15 @@ def main():
 
     device = os.getenv("TPU_NAME")
     if not device:
-        queue = os.getenv("BUILDKITE_AGENT_META_DATA_QUEUE")
-        if queue:
-            # map tpu_v7x_8_queue -> tpu7x-8
-            m = re.match(r"tpu_v(\d+x)_(\d+)_queue", queue)
-            if m:
-                device = f"tpu{m.group(1)}-{m.group(2)}"
-            else:
-                device = queue
+        accelerator = os.getenv("TPU_ACCELERATOR_TYPE")
+        topology = os.getenv("TPU_TOPOLOGY")
+        if os.getenv("CI_RUNNER") == "kube" and accelerator and topology:
+            # Every kube step runs off the one "kube" queue, which names no
+            # TPU, so the pod's own TPU says which: GKE sets TPU_TOPOLOGY.
+            # TPU_ACCELERATOR_TYPE is GKE's "tpu7x-8" unless the step forwards
+            # its own "tpu7x" over it; only the generation is taken, so both
+            # give tpu7x-2x2x1.
+            device = f"{accelerator.split('-')[0]}-{topology}"
         else:
             device = "unknown-device"
 
@@ -227,7 +228,7 @@ def main():
         # Populate column dictionary with required fields
         columns = {
             "RecordId": f"'{record_id}'",
-            # run_in_docker.sh exports these as empty strings when unset
+            # CI can pass these through as empty strings when unset
             # upstream; `or` falls back on empty too, unlike os.getenv's
             # unset-only default.
             "RunType": f"'{sql_escape(os.getenv('RUN_TYPE') or 'DAILY')}'",
@@ -236,7 +237,9 @@ def main():
             "TensorParallelSize": str(tensor_parallelism),
             "MaxModelLen": str(max_model_len),
             "Dataset": f"'{sql_escape(dataset)}'",
-            "CreatedBy": f"'{sql_escape(os.getenv('CREATED_BY') or 'buildkite-agent')}'",
+            "CreatedBy": (
+                f"'{sql_escape(os.getenv('CREATED_BY') or 'buildkite-agent')}'"
+            ),
             "InputLen": str(input_len),
             "OutputLen": str(output_len),
             "Device": f"'{sql_escape(device)}'",
@@ -247,7 +250,8 @@ def main():
             "CreatedTime": "CURRENT_TIMESTAMP()",
         }
 
-        # Optional metrics (omit from columns list if missing, so Spanner defaults to NULL)
+        # Optional metrics (omit from columns list if missing,
+        # so Spanner defaults to NULL)
         optional_metrics = {
             "Throughput": res.get("request_throughput"),
             "OutputTokenThroughput": res.get("output_throughput"),
@@ -297,7 +301,8 @@ def main():
         if args.skip_db_upload or args.skip_spanner:
             why = "--skip-db-upload" if args.skip_db_upload else "--skip-spanner"
             print(
-                f"=== Skipping Spanner DB Upload ({why} specified) ===. RecordId: {record_id}"
+                f"=== Skipping Spanner DB Upload ({why} specified) ===. "
+                f"RecordId: {record_id}"
             )
         else:
             cmd = [
@@ -322,7 +327,8 @@ def main():
                 success = False
             else:
                 print(
-                    f"Successfully updated Spanner record for {rf.name}. RecordId: {record_id}"
+                    f"Successfully updated Spanner record for {rf.name}. "
+                    f"RecordId: {record_id}"
                 )
 
         # Dual write to BigQuery while dashboards migrate off Spanner. The

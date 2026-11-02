@@ -63,8 +63,7 @@ IN_POD='
   if [ -n "${ARTIFACTS_DIR:-}" ] && [ -n "$(ls -A "$ARTIFACTS_DIR" 2>/dev/null)" ]; then
     # A rig that points a `latest_*` symlink at a run directory leaves it
     # dangling once that directory is gone, and the upload globs it, opens it
-    # and fails the step over a file the test never meant to keep. The three
-    # bare-metal runners each drop these the same way before uploading.
+    # and fails the step over a file the test never meant to keep.
     find "$ARTIFACTS_DIR" -type l ! -exec test -e {} \; -delete 2>/dev/null || true
     # A lost upload is indistinguishable from a step that produced nothing, so
     # it fails the step - but never masks a failure from the command itself.

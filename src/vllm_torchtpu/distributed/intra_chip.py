@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """A process group spanning the cores of one physical chip.
 
 Collectives over this group stay on-package, so they are far cheaper than the
@@ -47,23 +58,47 @@ def _chip_rank_groups() -> list[list[int]] | None:
     if not (dist.is_available() and dist.is_initialized()):
         return None
 
-    world_size = dist.get_world_size()
-    if world_size != len(topology.device_ids):
-        # `chip_of` indexes the runtime's device order, which only coincides
-        # with the global rank when TP spans every visible device (no DP/PP).
-        # Anything else would silently pair up the wrong cores.
+    return _group_ranks_by_chip(topology, _rank_to_device())
+
+
+def _rank_to_device() -> dict[int, int]:
+    """Global rank -> the TPU device id it runs on. Collective over the world.
+
+    Global rank need not follow the runtime's device order: under DP each
+    engine's workers are placed separately (Ray hands out whole chips in any
+    order), so each rank reports its own device.
+    """
+    from vllm.distributed.parallel_state import get_world_group
+
+    from vllm_torchtpu.distributed.mesh_utils import (
+        _collect_rank_to_device_id,
+        _get_current_global_rank,
+        _get_tpu_global_device_id,
+    )
+
+    return _collect_rank_to_device_id(
+        get_world_group(), _get_current_global_rank(), _get_tpu_global_device_id()
+    )
+
+
+def _group_ranks_by_chip(
+    topology, rank_to_device: dict[int, int]
+) -> list[list[int]] | None:
+    """Ranks grouped by the chip their device sits on, or ``None`` if unusable."""
+    chip_of_device = {d: chip for chip, ids in enumerate(topology.chips) for d in ids}
+    # One rank per device of the topology, no more and no fewer.
+    if sorted(rank_to_device.values()) != sorted(chip_of_device):
         logger.warning(
-            "World size %d does not match the %d visible devices; refusing to "
+            "Ranks run on devices %s, not exactly the devices of %s; refusing to "
             "guess the intra-chip grouping.",
-            world_size,
-            len(topology.device_ids),
+            sorted(rank_to_device.values()),
+            topology.describe(),
         )
         return None
 
     by_chip: dict[int, list[int]] = collections.defaultdict(list)
-    for rank in range(world_size):
-        chip_index, _ = topology.chip_of(rank)
-        by_chip[chip_index].append(rank)
+    for rank, device in rank_to_device.items():
+        by_chip[chip_of_device[device]].append(rank)
 
     groups = [sorted(by_chip[chip]) for chip in sorted(by_chip)]
     sizes = {len(g) for g in groups}
@@ -105,10 +140,11 @@ def get_intra_chip_group():
     )
     logger.info(
         "Intra-chip group ready: %d chip(s) x %d core(s), this rank is "
-        "%d/%d within its chip.",
+        "%d/%d within its chip; rank groups %s.",
         len(groups),
         len(groups[0]),
         _group.rank_in_group,
         _group.world_size,
+        groups,
     )
     return _group

@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for the align-mode Mamba state-block seed copies.
 
 These cover the decision logic in
@@ -52,6 +65,7 @@ def _make_self(
     state_block_size=BLOCK_SIZE,
     ckpt_window=1,
     read_offsets=None,
+    bm_layout=None,
 ):
     """Build a minimal fake runner ``self`` for the collector.
 
@@ -77,10 +91,18 @@ def _make_self(
     ]
     plan = [(gid + 1, [raws[gid]]) for gid in range(len(group_block_rows))]
     ns = SimpleNamespace(
+        requests={rid: object() for rid in req_ids},
         _mamba_copy_plan=plan,
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        speculative_config=None,
+        _pre_async_results=None,
         _mamba_state_pos=dict(state_pos or {}),
+        _mamba_offset_seeded=set(req_ids),
         _mamba_state_block_size=state_block_size,
         _pool_block_split=split,
+        # Merged block-major pool layout (`None` for per-region pools); row seed
+        # copies index directly by manager block ID (`_pool_block_split == 1`).
+        bm_pool_layout=bm_layout,
         # 1 = no speculative checkpoint group; > 1 takes the sliding-group
         # path exercised at the bottom of this file.
         _mamba_ckpt_window=ckpt_window,
@@ -92,6 +114,8 @@ def _make_self(
         device="cpu",
         mamba_slot_read_offsets=read_offsets,
         _pending_mamba_state_copies=[],
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
         input_batch=input_batch,
     )
     # Padding/expansion/source-selection helpers the collector calls on
@@ -99,7 +123,12 @@ def _make_self(
     # class methods are already callable as-is.
     ns._bucket_len = TPUModelRunner._bucket_len
     ns._pad_to_bucket = TPUModelRunner._pad_to_bucket
-    for name in ("_pad_dev_to_bucket", "_expand_pool_split", "_spec_seed_sources"):
+    for name in (
+        "_pad_dev_to_bucket",
+        "_expand_pool_split",
+        "_spec_seed_sources",
+        "_copy_mamba_state_blocks",
+    ):
         setattr(ns, name, getattr(TPUModelRunner, name).__get__(ns))
     return ns, raws
 
@@ -146,10 +175,7 @@ def test_chunk_advance_copies_state():
 
 def test_pcp_uses_rank_local_state_block_size(monkeypatch):
     monkeypatch.setattr(
-        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
-    )
-    monkeypatch.setattr(
-        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=8)
     )
     # A PCP rank's two table columns cover 16 logical manager blocks. The
     # third global chunk is still in local column 0 and must not index column 2.
@@ -161,10 +187,7 @@ def test_pcp_uses_rank_local_state_block_size(monkeypatch):
 
 def test_pcp_local_state_block_crossing_copies(monkeypatch):
     monkeypatch.setattr(
-        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
-    )
-    monkeypatch.setattr(
-        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=8)
     )
     fake, _ = _make_self(["a"], [8 * BLOCK_SIZE], [[[5, 6]]], state_pos={"a": 0})
     _collect(fake, _sched({"a": BLOCK_SIZE}))
@@ -174,10 +197,7 @@ def test_pcp_local_state_block_crossing_copies(monkeypatch):
 
 def test_pcp_disagg_mamba_block_table_dimensions(monkeypatch):
     monkeypatch.setattr(
-        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
-    )
-    monkeypatch.setattr(
-        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=8)
     )
     # Simulate disaggregated serving where Mamba physical block size is 2048
     # (rounded up power-of-two fit size for TP=2 decode).
@@ -206,10 +226,7 @@ def test_pcp_disagg_mamba_block_stride_comparison(monkeypatch):
     installing it as ``_mamba_state_block_size``.
     """
     monkeypatch.setattr(
-        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
-    )
-    monkeypatch.setattr(
-        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=8)
     )
 
     # Wrong stride 1 (pre-PR172): attention block_size=16 with no cp factor,
@@ -291,13 +308,47 @@ def test_decode_boundary_crossing_copies():
 
 
 def test_stale_request_positions_are_forgotten():
-    # A req_id no longer in the batch is dropped from _mamba_state_pos.
+    # Finished requests no longer own KV state.
     fake, _ = _make_self(
         ["live"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"live": 1, "gone": 3}
     )
     _collect(fake, _sched({"live": BLOCK_SIZE}))
     assert "gone" not in fake._mamba_state_pos
     assert "live" in fake._mamba_state_pos
+
+
+@pytest.mark.parametrize("scheduled", [1, 4])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_unscheduled_request_resumes_last_written_checkpoint(scheduled, offset):
+    """Rejection can leave the committed position before the written state column."""
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[6] = offset
+    fake, raws = _make_self(
+        ["a"],
+        [BLOCK_SIZE - 1],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 1},
+        ckpt_window=4,
+        read_offsets=offsets,
+    )
+    # Each offset corresponds to a legal four-token window ending in column 1
+    # and accepting offset + 1 inputs, leaving computed == BLOCK_SIZE - 1.
+    raw = raws[0]
+    raw[5].fill_(float("nan"))
+    raw[6:10] = torch.arange(4).unsqueeze(1).expand(4, STATE_DIM) + 100
+    batch_a = fake.input_batch
+    batch_b, _ = _make_self(["b"], [10], [[[15, 16, 17, 18]]])
+    fake.requests["b"] = object()
+    fake.input_batch = batch_b.input_batch
+    _collect(fake, _sched({"b": 1}))
+    fake.input_batch = batch_a
+    _collect(fake, _sched({"a": scheduled}))
+    for buffers, src, dst in fake._pending_mamba_state_copies:
+        buffers[0][dst.long()] = buffers[0][src.long()].clone()
+    column = (BLOCK_SIZE - 1 + scheduled - 1) // BLOCK_SIZE
+    base = 5 + column
+    actual = raw[base + int(offsets[base])]
+    torch.testing.assert_close(actual, torch.full_like(actual, 100 + offset))
 
 
 def test_start_index_window_skips_other_rows():
@@ -395,6 +446,33 @@ def test_flush_applies_and_clears(monkeypatch):
     assert fake._pending_mamba_state_copies == []
 
 
+def test_flush_block_major_copies_rows(monkeypatch):
+    from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
+
+    calls = []
+    monkeypatch.setattr(
+        runner_mod,
+        "copy_mamba_state_rows",
+        lambda pool, src, dst, num_pools, split: calls.append(
+            (id(pool), src.tolist(), dst.tolist(), (num_pools, split))
+        ),
+    )
+    layout = BlockMajorPoolLayout(
+        num_blocks=NUM_BLOCKS, num_pools=4, split=3, pool_index_by_layer={}
+    )
+    fake, raws = _make_self(
+        ["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"a": 1}, bm_layout=layout
+    )
+    _collect(fake, _sched({"a": BLOCK_SIZE}))
+    TPUModelRunner._flush_mamba_state_seed_copies(fake)
+    assert len(calls) == 1
+    pool_id, src, dst, geometry = calls[0]
+    assert pool_id == id(raws[0])
+    assert geometry == (4, 3)
+    assert (src[0], dst[0]) == (6, 7)
+    assert fake._pending_mamba_state_copies == []
+
+
 # --- split expansion (batched-RPA kernel-granular pool birth, #405) ------
 
 
@@ -413,6 +491,21 @@ def test_split_expansion_fans_out_pairs():
         (19, 22),
         (20, 23),
     ]
+
+
+def test_block_major_pool_keeps_manager_pairs():
+    # Merged block-major pools copy full manager rows (`_pool_block_split == 1`),
+    # keeping manager block pair `(6, 7)` unexpanded despite `layout.split == 3`.
+    from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
+
+    layout = BlockMajorPoolLayout(
+        num_blocks=NUM_BLOCKS, num_pools=4, split=3, pool_index_by_layer={}
+    )
+    fake, _ = _make_self(
+        ["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"a": 1}, bm_layout=layout
+    )
+    _collect(fake, _sched({"a": BLOCK_SIZE}))
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(6, 7)]
 
 
 # --- speculative decoding: the checkpoint group slides with the state ----
@@ -547,8 +640,76 @@ def _copy_plan_split(raw_shape, raw_dtype, manager_tokens, page_bytes):
         _mamba_state_block_size=None,
         _pool_block_split=1,
     )
-    TPUModelRunner._build_mamba_copy_plan(fake, kv_cache_config, [raw])
+    TPUModelRunner._build_mamba_copy_plan(
+        fake, kv_cache_config, {"model.layers.0.lin": raw}, None
+    )
     return fake._pool_block_split
+
+
+def test_copy_plan_block_major_maps_every_region_to_the_merged_pool():
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor, MambaSpec
+
+    from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
+
+    page_bytes = 64 * 1024
+    num_blocks = 4
+    attn = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        page_size_padded=page_bytes,
+    )
+    mamba = MambaSpec(
+        block_size=64,
+        shapes=((2, 8),),
+        dtypes=(torch.bfloat16,),
+        page_size_padded=page_bytes,
+    )
+    pool_bytes = num_blocks * page_bytes
+    kv_cache_config = SimpleNamespace(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=2 * pool_bytes,
+                layers=["a.0", "a.1"],
+                layer_stride=pool_bytes,
+                block_stride=page_bytes,
+            ),
+            KVCacheTensor(
+                size=2 * pool_bytes,
+                layers=["m.0", "m.1"],
+                layer_stride=pool_bytes,
+                block_stride=page_bytes,
+            ),
+        ],
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=attn, layer_names=["a.0", "a.1"]),
+            SimpleNamespace(kv_cache_spec=mamba, layer_names=["m.0", "m.1"]),
+        ],
+    )
+    # Merged pool with 1 row per 64-token manager block
+    # (2 regions x 2 32-token kernel blocks).
+    pool = torch.zeros((num_blocks, 2 * 2, 32, 4, 128), dtype=torch.bfloat16)
+    layout = BlockMajorPoolLayout(
+        num_blocks=num_blocks, num_pools=2, split=2, pool_index_by_layer={}
+    )
+    fake = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        _mamba_copy_plan=None,
+        _mamba_state_block_size=None,
+        _pool_block_split=1,
+    )
+    TPUModelRunner._build_mamba_copy_plan(
+        fake,
+        kv_cache_config,
+        {name: pool for name in ("a.0", "a.1", "m.0", "m.1")},
+        layout,
+    )
+    assert fake._mamba_copy_plan == [(1, [pool])]
+    # Rows correspond to manager blocks, so seed copies use unexpanded
+    # manager block IDs.
+    assert fake._pool_block_split == 1
 
 
 def test_copy_plan_split_is_one_for_token_packed_mla_pool():
@@ -592,3 +753,198 @@ def test_copy_plan_split_for_seq_on_lane_pool():
         page_bytes=2 * kernel_block_bytes,
     )
     assert split == 2
+
+
+@pytest.mark.parametrize("offset", [0, 1, 2, 3])
+@pytest.mark.parametrize("computed,scheduled", [(384, 1), (382, 4)])
+def test_new_owner_crossing_ignores_recycled_checkpoint_offset(
+    offset, computed, scheduled
+):
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[10] = offset
+    offsets[20] = offset
+    fake, raws = _make_self(
+        ["new"],
+        [computed],
+        [[[10, 11, 12, 13, 14]], [[20, 21, 22, 23, 24]]],
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=offsets,
+    )
+    fake._mamba_offset_seeded.clear()
+    for raw in raws:
+        raw.copy_(torch.arange(NUM_BLOCKS).unsqueeze(1).expand_as(raw))
+    _collect(fake, _sched({"new": scheduled}))
+    for staged, src, dst in zip(fake._pending_mamba_state_copies, [10, 20], [11, 21]):
+        assert _real_pairs(staged) == [(src, dst)]
+        buffers, src_t, dst_t = staged
+        buffers[0][dst_t.long()] = buffers[0][src_t.long()]
+        assert torch.all(buffers[0][dst] == src)
+        assert int(offsets[src]) == offset  # Do not mutate shared source metadata.
+        assert int(offsets[dst]) == 0
+    assert fake._mamba_offset_seeded == set()  # First-forward reset owns this mark.
+
+
+@pytest.mark.parametrize("offset", [1, 2, 3])
+def test_new_and_live_owners_share_checkpoint_selection_path(offset):
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[10] = offsets[20] = offset
+    fake, _ = _make_self(
+        ["new", "live"],
+        [384, 384],
+        [[[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]]],
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=offsets,
+    )
+    fake._mamba_offset_seeded.remove("new")
+    _collect(fake, _sched({"new": 1, "live": 1}))
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [
+        (10, 11),
+        (20 + offset, 21),
+    ]
+
+
+def test_new_owner_without_crossing_leaves_source_selection_to_forward_reset():
+    fake, _ = _spec_self(3, window=4, row=(10, 11, 12, 13, 14))
+    fake._mamba_offset_seeded.clear()
+    fake.input_batch.num_computed_tokens_cpu[0] = BLOCK_SIZE - 2
+    _collect(fake, _sched({"a": 1}))
+    assert fake._pending_mamba_state_copies == []
+    assert int(fake.mamba_slot_read_offsets[10]) == 3
+
+
+@pytest.mark.parametrize("rejected", [1, 2, 3])
+@pytest.mark.parametrize("cp_world", [1, 2])
+def test_async_rejections_seed_only_at_actual_state_crossing(
+    monkeypatch, rejected, cp_world
+):
+    """A rejected checkpoint must never become the next block's live state."""
+    monkeypatch.setattr(
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=cp_world)
+    )
+    stride = 384 * cp_world
+    fake, pools = _make_self(
+        ["a"],
+        [stride - 4 + rejected],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 0},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+    )
+    sampled = torch.tensor([[77] * (4 - rejected) + [-1] * rejected])
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        spec_decode_num_rejected_tokens=torch.tensor([rejected]),
+        wait_for_copy=lambda: sampled,
+    )
+    _collect(fake, _sched({"a": 4}))
+    assert fake._pending_mamba_state_copies == []
+    assert fake._mamba_state_pos["a"] == 0
+    for i in range(4):
+        pools[0][5 + i].fill_(1000 + i)
+    fake.mamba_slot_read_offsets[5] = 3 - rejected
+    fake.input_batch.num_computed_tokens_cpu[0] += 4 - rejected
+    _collect(fake, _sched({"a": 4}))
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8 - rejected, 6)]
+    for source, destination in _real_pairs(fake._pending_mamba_state_copies[0]):
+        pools[0][destination].copy_(pools[0][source].clone())
+    assert pools[0][6, 0].item() == 1003 - rejected
+    assert fake.mamba_slot_read_offsets[6].item() == 0
+
+
+def test_async_state_seed_away_from_boundary_does_not_wait():
+    fake, _ = _make_self(
+        ["a"], [100], [[[5, 6, 7, 8]]], state_pos={"a": 0}, state_block_size=384
+    )
+
+    def unexpected_wait():
+        raise AssertionError("Copy must not be awaited away from a boundary")
+
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        spec_decode_num_rejected_tokens=torch.tensor([3]),
+        wait_for_copy=unexpected_wait,
+    )
+    _collect(fake, _sched({"a": 4}))
+    assert fake._pending_mamba_state_copies == []
+
+
+def test_async_state_seed_uses_previous_request_order():
+    fake, _ = _make_self(
+        ["b", "a"],
+        [100, 383],
+        [[[10, 11, 12, 13, 14], [5, 6, 7, 8, 9]]],
+        state_pos={"a": 0, "b": 0},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+    )
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0, "b": 1},
+        num_draft_per_req={0: 3, 1: 3},
+        wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1], [77, 88, 99, 11]]),
+    )
+    before = fake.input_batch.num_computed_tokens_cpu.copy()
+    _collect(fake, _sched({"a": 4, "b": 4}))
+    assert fake._pending_mamba_state_copies == []
+    np.testing.assert_array_equal(fake.input_batch.num_computed_tokens_cpu, before)
+
+
+def test_async_state_seed_can_return_to_previous_column_after_rejection():
+    fake, pools = _make_self(
+        ["a"],
+        [386],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 1},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+    )
+    pools[0][6].fill_(42)
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1]]),
+    )
+    _collect(fake, _sched({"a": 1}))
+    assert fake._mamba_state_pos["a"] == 0
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(6, 5)]
+    for source, destination in _real_pairs(fake._pending_mamba_state_copies[0]):
+        pools[0][destination].copy_(pools[0][source].clone())
+    assert pools[0][5, 0].item() == 42
+
+
+def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[5] = 3
+    fake, _ = _make_self(
+        ["a"],
+        [383],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 0},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=offsets,
+    )
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        wait_for_copy=lambda: torch.tensor([[77, 88, 99, 11]]),
+    )
+    _collect(fake, _sched({"a": 4}))
+    assert fake._mamba_state_pos["a"] == 1
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8, 6)]

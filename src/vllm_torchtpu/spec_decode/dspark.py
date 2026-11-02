@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """DSpark speculative decoding for TPU.
 
 DSpark is semi-autoregressive parallel drafting: one DFlash-style parallel
@@ -32,28 +44,51 @@ logger = init_logger(__name__)
 
 class DSparkProposer(DFlashProposer):
     def __init__(self, runner, vllm_config: VllmConfig):
-        hf_config = vllm_config.speculative_config.draft_model_config.hf_config
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        hf_config = speculative_config.draft_model_config.hf_config
         hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
 
         super().__init__(runner, vllm_config)
 
-        if not self.dflash_config.get("target_layer_ids"):
-            raise ValueError(
-                "DSpark requires target layer ids in the draft config (one of "
-                "eagle_aux_hidden_state_layer_ids, dspark_target_layer_ids, "
-                "target_layer_ids, or dflash_config.target_layer_ids)."
-            )
-
         # Same key/default as upstream DSparkSpeculator: dense checkpoints
         # omit it (-> True); the speculators converter writes it explicitly.
         self.sample_from_anchor = bool(hf_dict.get("sample_from_anchor", True))
-        block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
         K = self.speculative_config.num_speculative_tokens
-        if block is not None and int(block) != K:
-            raise ValueError(
-                f"num_speculative_tokens={K} does not match the DSpark "
-                f"checkpoint's block size {block}; the block/Markov-head "
-                "machinery is trained for exactly that block length."
+        # vLLM 0.29 drafting options this proposer does not implement yet. They
+        # are ignored, not rejected: drafting stays greedy over a fixed block.
+        spec = self.speculative_config
+        if (
+            spec.draft_sample_method != "greedy"
+            or spec.enable_adaptive_verification
+            or spec.dspark_draft_topk is not None
+        ):
+            logger.warning(
+                "DSpark on TPU does not support draft_sample_method=%r, "
+                "enable_adaptive_verification=%s, dspark_draft_topk=%s; "
+                "ignoring them and using greedy drafting of a fixed block.",
+                spec.draft_sample_method,
+                spec.enable_adaptive_verification,
+                spec.dspark_draft_topk,
+            )
+        # The query block follows K, not the block length the checkpoint was
+        # trained at; upstream vLLM likewise only enforces K == block for
+        # Qwen3-Omni DSpark. The checkpoint's block is a query-block length in
+        # both layouts (K for dense, 1 + K for speculators-format), so compare
+        # it to block_size rather than K. In-block attention is non-causal, so
+        # a mismatch shifts every slot's hidden state, not just the slots past
+        # the trained length: outputs stay exact (the target verifies), but
+        # acceptance can drop at every position.
+        trained_block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
+        if trained_block is not None and int(trained_block) != self.block_size:
+            logger.warning(
+                "DSpark: num_speculative_tokens=%d gives a %d-token query "
+                "block, but the checkpoint was trained with block size %s; "
+                "every draft slot is out of the training distribution, so "
+                "check the acceptance rate.",
+                K,
+                self.block_size,
+                trained_block,
             )
         logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
 
@@ -102,6 +137,7 @@ class DSparkProposer(DFlashProposer):
         chain seeds from the anchor input id and runs a static K-iteration
         loop: embedding gather + rank-r bias + argmax.
         """
+        assert self.draft_model is not None
         hidden = self.draft_model.model(
             input_ids=input_ids,
             positions=positions,

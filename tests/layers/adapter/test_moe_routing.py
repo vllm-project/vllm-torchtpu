@@ -164,6 +164,7 @@ def test_router_topk_op_is_registered_at_import():
     assert hasattr(torch.ops.pallas, "moe_router_topk")
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("impl", ["sort", "rowmax"])
 def test_routing_path_compiles_fullgraph(monkeypatch, impl):
     """No graph break, no Dynamo error, on the path vLLM compiles.

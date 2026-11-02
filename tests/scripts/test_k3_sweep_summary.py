@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for scripts/vllm/benchmarking/k3_sweep_summary.py.
+"""Unit tests for scripts/vllm/benchmark/inferencex/sweep_summary.py.
 
 The parsers are pure functions over JSON files, so they are pinned down here
 without a TPU. The AgentX fixture mirrors the layout InferenceX's
@@ -31,10 +31,11 @@ _SCRIPT = (
     pathlib.Path(__file__).resolve().parents[2]
     / "scripts"
     / "vllm"
-    / "benchmarking"
-    / "k3_sweep_summary.py"
+    / "benchmark"
+    / "inferencex"
+    / "sweep_summary.py"
 )
-_spec = importlib.util.spec_from_file_location("k3_sweep_summary", _SCRIPT)
+_spec = importlib.util.spec_from_file_location("ix_sweep_summary", _SCRIPT)
 summary = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(summary)
 
@@ -172,14 +173,17 @@ def test_gsm8k_row(tmp_path):
     )
 
 
-def _aggregate(per_gpu_out, requests_ok):
-    # Shape of InferenceX's aggregate JSON (process_agentic_result.py).
+def _aggregate(per_gpu_out, requests_ok, chips=32, hw="tpu7x-32"):
+    # Shape of InferenceX's aggregate JSON (process_agentic_result.py). Its own
+    # per_gpu is whatever the parallelism it was told implies; the table does not
+    # read it, so the two throughput fields here only have to be a plausible pair.
     return {
         "conc": 1,
+        "hw": hw,
         "num_requests_successful": requests_ok,
         "request_metrics": {
             "throughput": {
-                "output": {"tokens_per_second": per_gpu_out * 32},
+                "output": {"tokens_per_second": per_gpu_out * chips},
                 "per_gpu": {"output_tput_tps": per_gpu_out},
             },
             "latency": {
@@ -195,17 +199,74 @@ def _aggregate(per_gpu_out, requests_ok):
     }
 
 
-def test_agentx_table_reads_per_gpu_throughput(tmp_path):
+def test_agentx_table_rows_and_markers(tmp_path):
     base = "agentx_k3"
     (tmp_path / f"{base}_c1.json").write_text(json.dumps(_aggregate(1.54, 48)))
     (tmp_path / "conc_4").mkdir()
     (tmp_path / "conc_4" / "HARD_TIMEOUT").write_text("")
-    table = summary.agentx_table(str(tmp_path), base, [1, 4, 8])
+    table = summary.agentx_table(str(tmp_path), base, [1, 4, 8], chips=32)
     rows = table.splitlines()
-    assert rows[0].startswith("| conc | out tok/s per chip |")
-    assert rows[2].startswith("| 1 | 1.54 | 49.28 | 48 | 1.5 | 7.2 | 0.0255 | 37 |")
+    assert rows[0].startswith("| conc | out tok/$ | out tok/s total |")
+    # 49.28 tok/s for an hour on 32 chips at 1.2 USD/chip-hour.
+    assert rows[2].startswith("| 1 | 4620 | 49.28 | 48 | 1.5 | 7.2 | 0.0255 | 37 |")
     assert "hard timeout" in rows[3] and rows[3].startswith("| 4 |")
     assert rows[4].startswith("| 8 | (no aggregate:") and "hard timeout" not in rows[4]
+
+
+def test_agentx_table_marks_a_timeout_that_still_wrote_an_aggregate(tmp_path):
+    # The failure the watchdog exists for: aiperf writes the aggregate and then
+    # hangs in shutdown. The numbers are real but the point ran to the cap, so
+    # the row has to say so instead of looking clean.
+    base = "agentx_k3"
+    (tmp_path / f"{base}_c2.json").write_text(json.dumps(_aggregate(1.1, 12)))
+    (tmp_path / "conc_2").mkdir()
+    (tmp_path / "conc_2" / "HARD_TIMEOUT").write_text("")
+    row = summary.agentx_table(str(tmp_path), base, [2], chips=32).splitlines()[2]
+    assert row.startswith("| 2 (HARD_TIMEOUT) | 3300 |")
+
+
+def test_agentx_table_survives_an_unreadable_aggregate(tmp_path):
+    base = "agentx_k3"
+    (tmp_path / f"{base}_c1.json").write_text('{"conc": 1, "request_met')
+    (tmp_path / f"{base}_c2.json").write_text(json.dumps(_aggregate(2.5, 20)))
+    rows = summary.agentx_table(str(tmp_path), base, [1, 2], chips=32).splitlines()
+    assert rows[2].startswith("| 1 | (unreadable: JSONDecodeError)")
+    assert rows[3].startswith("| 2 | 7500 |")
+
+
+def test_agentx_table_costs_the_chips_the_caller_states(tmp_path):
+    # The column is computed here, from --chips, not from anything InferenceX
+    # writes: its own per_gpu divides by the parallelism it was told about.
+    base = "agentx_k3"
+    (tmp_path / f"{base}_c1.json").write_text(json.dumps(_aggregate(3.0, 9, chips=64)))
+    row = summary.agentx_table(str(tmp_path), base, [1], chips=32).splitlines()[2]
+    assert row.startswith("| 1 | 18000 | 192 |")  # 192 tok/s on 32 chips, not 64
+
+
+def test_agentx_table_tok_per_dollar_is_blank_without_a_chip_count(tmp_path):
+    base = "agentx_k3"
+    (tmp_path / f"{base}_c1.json").write_text(json.dumps(_aggregate(1.0, 4)))
+    row = summary.agentx_table(str(tmp_path), base, [1]).splitlines()[2]
+    assert row.startswith("| 1 | - | 32 |")
+
+
+def test_agentx_table_tok_per_dollar_is_blank_for_unpriced_hardware(tmp_path):
+    # Blank beats normalizing by a guess: a row whose hw has no rate yet still
+    # carries every measured column.
+    base = "agentx_k3"
+    (tmp_path / f"{base}_c1.json").write_text(
+        json.dumps(_aggregate(1.0, 4, hw="gb200-72"))
+    )
+    row = summary.agentx_table(str(tmp_path), base, [1], chips=32).splitlines()[2]
+    assert row.startswith("| 1 | - | 32 |")
+
+
+def test_accelerator_rate_matches_the_family_and_nothing_else():
+    assert summary.accelerator_usd_per_hour("tpu7x-32") == 1.2
+    assert summary.accelerator_usd_per_hour("tpu7x") == 1.2
+    assert summary.accelerator_usd_per_hour("tpu7x9-8") is None
+    assert summary.accelerator_usd_per_hour("gb200-72") is None
+    assert summary.accelerator_usd_per_hour(None) is None
 
 
 def test_dotted_get_ignores_bools_and_missing():

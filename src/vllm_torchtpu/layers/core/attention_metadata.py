@@ -1,18 +1,36 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import functools
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import jax
 import torch
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_pcp_group
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import (
     AttentionMetadataBuilder as BaseAttentionMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -20,6 +38,22 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
 )
+
+
+def attention_block_table_width(
+    block_table: Any,
+    spec: KVCacheSpec,
+    vllm_config: Any,
+    model_len: int | None = None,
+) -> int:
+    """Match allocated, rank-local kernel page ordinals, including block splits."""
+    if model_len is None:
+        return block_table.max_num_blocks_per_req
+    pages = spec.max_num_blocks_per_req(vllm_config, model_len)
+    return min(
+        pages * getattr(block_table, "blocks_per_kv_block", 1),
+        block_table.max_num_blocks_per_req,
+    )
 
 
 @functools.partial(
@@ -45,22 +79,22 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 @dataclass
 class AttentionMetadata:
     # (padded_total_num_scheduled_tokens,)
-    input_positions: jax.Array
+    input_positions: jax.Array | torch.Tensor | None
     # (max_num_seqs * max_num_blocks_per_req,)
-    block_tables: jax.Array = None
+    block_tables: jax.Array | torch.Tensor | None = None
     # (max_num_seqs,)
-    seq_lens: jax.Array = None
+    seq_lens: jax.Array | torch.Tensor | None = None
     # (max_num_seqs + 1,)
-    query_start_loc: jax.Array = None
+    query_start_loc: jax.Array | torch.Tensor | None = None
     # (3,)
-    request_distribution: jax.Array = None
+    request_distribution: jax.Array | torch.Tensor | None = None
     # (max_num_seqs,) int32 - physical slot id in the mamba kv-cache for the
     # request currently in each persistent-batch position. Compact-mamba uses
     # an explicit slot from its independent pool; unified align mode derives
     # the slot from the current entry in the device block table. None for
     # attention groups, non-mamba models, and Mamba modes whose native fallback
     # addresses block_tables[:, 0].
-    mamba_state_indices: jax.Array | None = None
+    mamba_state_indices: jax.Array | torch.Tensor | None = None
     # (mamba_num_blocks,) int32 — per-*slot* read offset for speculative
     # decoding with mamba layers. `mamba_slot_read_offsets[base_slot]` is
     # `num_accepted - 1` from the request's most recent verify step: the GDN
@@ -70,11 +104,11 @@ class AttentionMetadata:
     # batch position) so the value survives requests being rescheduled or
     # condensed. Updated on device after each sampling step; None unless the
     # model has mamba layers *and* speculative decoding is enabled.
-    mamba_slot_read_offsets: jax.Array | None = None
+    mamba_slot_read_offsets: jax.Array | torch.Tensor | None = None
     # `(num_reqs, num_spec + 1)` source block per checkpoint. Unified pool
     # with speculative decoding only; None elsewhere, where the sole
     # checkpoint is the request's own state block.
-    mamba_ckpt_indices: jax.Array | None = None
+    mamba_ckpt_indices: jax.Array | torch.Tensor | None = None
     # (3,) int32 — GDN-specific request distribution, same format as
     # `request_distribution` but with the first segment covering all
     # *windowed* sequences (plain decodes and speculative verify windows of
@@ -84,7 +118,7 @@ class AttentionMetadata:
     # decode front segment while the GDN kernel runs its windowed mode over
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
-    mamba_request_distribution: jax.Array | None = None
+    mamba_request_distribution: jax.Array | torch.Tensor | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -209,6 +243,93 @@ def _staged_walk_products_compiled(
     )
 
 
+# Default cap on the number of recycled H2D host buffers registered on a runner.
+# Each metadata walk calls `zeros_h2d_source` at most twice (once for the
+# batched block table in `stage_block_table_uploads` / `build()`, and once for
+# compact Mamba slot indices in `_build_mamba_state_indices`). With MTP /
+# speculative decoding (`num_speculative_tokens` up to ~5), one decode step runs
+# 1 target walk + up to (K + 1) draft walks (+ 1 optional DP dummy walk) ~= 8
+# walks (16 buffers). Because draft walks run after the step's input-staging
+# fence is recorded, two consecutive decode steps can hold buffers in flight or
+# in the free list at once (~32 buffers); 64 gives a 2x generous upper bound.
+#
+# TODO: Extract this non-blocking H2D host-buffer staging, fence-lifetime
+# tracking, and recycling pool into a dedicated standalone class/module in a
+# future refactor instead of spreading the state across `TPUModelRunner` and
+# `attention_metadata`.
+_DEFAULT_MAX_H2D_BUFFERS = 64
+
+
+def _noop_release() -> None:
+    pass
+
+
+def stage_h2d_upload(runner: Any, host: torch.Tensor) -> torch.Tensor:
+    """`host.to(runner.device, non_blocking=True)`, keeping `host` alive until
+    the runner's next input-staging fence has been synchronized.
+
+    TorchTPU reads the CPU source asynchronously without holding a reference
+    to it, so a per-call buffer would otherwise be freed (and its memory
+    reused) while the transfer is still in flight. The runner moves the
+    `(host, release_cb)` entry from `_unfenced_h2d_sources` to
+    `_fenced_h2d_sources` when it records the fence and invokes `release_cb`
+    once that fence has been waited on. Only buffers registered on `runner`
+    by `zeros_h2d_source` are recycled into `_free_h2d_sources`; one-off
+    tensors use a no-op callback and are dropped after synchronization.
+    """
+    assert host.is_contiguous()
+    recycle = id(host) in runner._registered_h2d_sources
+    if recycle:
+        key = (host.numel(), host.dtype)
+
+        def release_cb() -> None:
+            free = runner._free_h2d_sources.pop(key, None)
+            if free is None:
+                free = []
+            free.append(host)
+            runner._free_h2d_sources[key] = free
+    else:
+        release_cb = _noop_release
+    runner._unfenced_h2d_sources.append((host, release_cb))
+    return host.to(runner.device, non_blocking=True)
+
+
+def zeros_h2d_source(
+    runner: Any,
+    numel: int,
+    dtype: torch.dtype = torch.int32,
+    max_buffers: int = _DEFAULT_MAX_H2D_BUFFERS,
+) -> torch.Tensor:
+    """Return a zeroed 1D CPU buffer of `(numel, dtype)`, recycling one
+    released by `_wait_input_staging_fence` when available.
+
+    Buffers up to `max_buffers` are registered in `runner._registered_h2d_sources`
+    so `stage_h2d_upload` recycles them into `runner._free_h2d_sources` once the
+    fence synchronizes. When `max_buffers` is reached, the least-recently-used
+    buffer in `runner._free_h2d_sources` is popped and unregistered before
+    registering the new buffer, bounding both `_registered_h2d_sources` and
+    `_free_h2d_sources`.
+    """
+    free = runner._free_h2d_sources.get((numel, dtype))
+    if free:
+        buf = free.pop().zero_()
+        if id(buf) in runner._registered_h2d_sources:
+            return buf
+    else:
+        buf = torch.zeros((numel,), dtype=dtype, device="cpu", pin_memory=PIN_MEMORY)
+    if len(runner._registered_h2d_sources) >= max_buffers:
+        for old_key, old_free in list(runner._free_h2d_sources.items()):
+            if old_free:
+                evicted = old_free.pop(0)
+                if not old_free:
+                    del runner._free_h2d_sources[old_key]
+                runner._registered_h2d_sources.discard(id(evicted))
+                break
+    if len(runner._registered_h2d_sources) < max_buffers:
+        runner._registered_h2d_sources.add(id(buf))
+    return buf
+
+
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
     """Single shared metadata builder for every TPU attention group."""
 
@@ -222,19 +343,12 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self.target_block_size = self.kv_cache_spec.block_size
         if self.is_mamba_group:
             try:
-                cp_world_size = get_dcp_group().world_size * get_pcp_group().world_size
+                cp_world_size = get_pcp_group().world_size
             except Exception:
                 cp_world_size = 1
             self.target_block_size *= cp_world_size
         # Only mamba/GDN layers consume physical state slot ids; attention
         # groups leave AttentionMetadata.mamba_state_indices None.
-
-        block_table_obj = runner.input_batch.block_table[self.kv_cache_group_id]
-        self.block_tables_cpu = torch.zeros(
-            (runner.max_num_reqs, block_table_obj.max_num_blocks_per_req),
-            dtype=torch.int32,
-            device="cpu",
-        )
 
     def _mamba_row_plan(
         self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
@@ -295,7 +409,19 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             target_num_blocks = block_table_obj.max_num_blocks_per_req
         else:
             assert runner.most_model_len is not None
-            target_num_blocks = cdiv(runner.most_model_len, self.target_block_size)
+            spec = self.kv_cache_spec
+            first_spec = (
+                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            )
+            if isinstance(first_spec, AttentionSpec):
+                target_num_blocks = attention_block_table_width(
+                    block_table_obj,
+                    self.kv_cache_spec,
+                    self.vllm_config,
+                    runner.most_model_len,
+                )
+            else:
+                target_num_blocks = cdiv(runner.most_model_len, self.target_block_size)
             if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
                 # Speculative decoding: the manager appends
                 # `num_speculative_blocks` (= window - 1) checkpoint blocks
@@ -341,17 +467,17 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
-            block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
-            block_tables.zero_()
+            # Per-call buffer: a later chunk or draft walk must not overwrite a
+            # table whose upload is still in flight (see `stage_h2d_upload`).
+            flat = zeros_h2d_source(runner, target_num_reqs * target_num_blocks)
+            block_tables = flat.view(target_num_reqs, target_num_blocks)
             source_block_tables = block_table_obj.get_cpu_tensor()
             block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
                 ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
             ]
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
-            block_tables_dev = block_tables.reshape(-1).to(
-                runner.device, non_blocking=True
-            )
+            block_tables_dev = stage_h2d_upload(runner, flat)
             input_positions = runner.position_ids
 
         mamba_ckpt_indices = None
@@ -398,14 +524,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                     torch.zeros_like(gathered_state_indices),
                 )
                 if ckpt_index is not None:
-                    mamba_ckpt_indices = (
-                        torch.gather(
-                            block_tables_2d,
-                            dim=1,
-                            index=ckpt_index,
-                        )
-                        * ckpt_in_row
-                    )
+                    mamba_ckpt_indices = torch.gather(
+                        block_tables_2d,
+                        dim=1,
+                        index=ckpt_index,
+                    ) * cast(torch.Tensor, ckpt_in_row)
             if ctx.unified_mamba_state_indices is not None:
                 # Spec decode: expose this group's state blocks for the
                 # post-sampling read-offset scatter.
@@ -444,12 +567,12 @@ def stage_block_table_uploads(
 ) -> None:
     """One batched H2D transfer for every block table a walk will build.
 
-    Packs all participating groups' rows into one flat CPU scratch, transfers
-    once, and hands each group's build() a flat view of its region via
-    `ctx.staged_block_tables` (instead of one small per-group H2D per build).
-    `gids` limits staging to a subset of groups; None stages every group.
-    Dummy runs stage the same layout zero-filled so warmup dispatches the
-    program sequence serving will. Views die with the per-chunk context.
+    Packs all participating groups' rows into one CPU buffer owned by this
+    walk, transfers once, and hands each group's build() a flat view of its
+    region via `ctx.staged_block_tables` (instead of one small per-group H2D
+    per build). `gids` limits staging to a subset of groups; None stages every
+    group. Dummy runs stage the same layout zero-filled so warmup dispatches
+    the program sequence serving will. Views die with the per-chunk context.
     """
     if not runner.attn_groups:
         # Pre-initialization dummy runs build metadata before the KV cache
@@ -474,14 +597,10 @@ def stage_block_table_uploads(
         return
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
-    scratch = runner._block_table_stage_cpu
-    if scratch is None or scratch.numel() < total:
-        scratch = torch.zeros(
-            (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
-        )
-        runner._block_table_stage_cpu = scratch
-    flat = scratch[:total]
-    flat.zero_()
+    # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
+    # drains, so a later chunk or draft walk must not refill a shared scratch
+    # (see `stage_h2d_upload`).
+    flat = zeros_h2d_source(runner, total)
 
     if ctx.position_ids_override is None:
         offset = 0
@@ -494,9 +613,9 @@ def stage_block_table_uploads(
                 ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
             ]
             offset += num_reqs_padded * target_num_blocks
-    # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
+    # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
 
-    staged_dev = flat.to(runner.device, non_blocking=True)
+    staged_dev = stage_h2d_upload(runner, flat)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices

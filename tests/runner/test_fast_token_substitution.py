@@ -2,15 +2,28 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner import (
+    TPUModelRunner,
+    _substitute_placeholder_token,
+)
 
 
 def test_env_flag_parsing(monkeypatch):
@@ -76,3 +89,23 @@ def test_substitution_enabled_fast_path():
         # Direct slice returns next_tokens_tpu[:4] without calling kernel
         assert not mock_kernel.called
         assert torch.equal(out, torch.tensor([201, 202, 203, 204], dtype=torch.int32))
+
+
+def test_substitute_placeholder_token_rejects_mismatched_lengths():
+    """The length check names all three lengths."""
+    with (
+        torch.compiler.set_stance("force_eager"),
+        pytest.raises(
+            AssertionError,
+            match=r"placeholder substitution inputs must share one length: "
+            r"input_ids\.shape\[0\]=4, "
+            r"token_in_tpu_cur_input_indices\.shape\[0\]=3, "
+            r"token_in_tpu_pre_next_tokens_indices\.shape\[0\]=4",
+        ),
+    ):
+        _substitute_placeholder_token(
+            torch.zeros(4, dtype=torch.int32),
+            torch.zeros(3, dtype=torch.int32),
+            torch.zeros(4, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+        )

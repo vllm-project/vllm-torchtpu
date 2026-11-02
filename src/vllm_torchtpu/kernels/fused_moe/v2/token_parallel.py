@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Disjoint token ownership within groups of replicated MoE inputs."""
 
 from dataclasses import dataclass
@@ -7,6 +19,22 @@ from typing import Self
 import jax
 import jax.numpy as jnp
 from jax import lax
+
+
+def replica_wire_rows(input_rows, width, row_alignment):
+    """An upper bound on `TokenReplicaLayout.local_rows`, in arithmetic alone.
+
+    The share padded to a whole block even below one, where the layout pads
+    to a power of two instead; equal to it from one block up. Sizing an op's
+    output with this keeps a symbolic `input_rows` free of guards when Dynamo
+    traces the op's fake -- which matters because vLLM traces the MTP drafter
+    once for every token bucket and refuses a graph that assumes any bound on
+    the token count.
+    """
+    if width == 1:
+        return input_rows
+    share = (input_rows + width - 1) // width
+    return (share + row_alignment - 1) // row_alignment * row_alignment
 
 
 @dataclass(frozen=True)

@@ -355,6 +355,64 @@ def test_pcp_token_orders_are_inverses_and_each_request_has_one_owner(
     torch.testing.assert_close(owner_counts, torch.ones_like(owner_counts))
 
 
+@pytest.mark.parametrize(
+    "num_tokens,expected_gathers",
+    [
+        (3, [[0, 1, -1], [-1, -1, -1]]),
+        (5, [[0, 2, -1], [-1, -1, -1]]),
+        (6, [[0, -1, -1], [-1, 2, -1]]),
+    ],
+)
+def test_partial_plan_buckets_mapping_before_device_copy(
+    monkeypatch, num_tokens, expected_gathers
+):
+    packed_to_request, request_to_packed = build_pcp_rank_major_token_order(
+        [1, num_tokens - 1],
+        pcp_size=2,
+        interleave_size=1,
+        padded_num_tokens=6,
+        token_owner_start_offsets_per_req=[0, 1],
+    )
+    original_mapping = request_to_packed.copy()
+    request_tokens = torch.arange(num_tokens, dtype=torch.int32)
+    request_gathers = torch.tensor([0, num_tokens - 1, 0])
+    tensor = torch.tensor
+    host_arrays = []
+
+    def record_tensor(data, *args, **kwargs):
+        if isinstance(data, np.ndarray):
+            host_arrays.append(data.copy())
+        return tensor(data, *args, **kwargs)
+
+    # Observe the actual host-to-device boundary while running the real ops.
+    monkeypatch.setattr(sequence_layout.torch, "tensor", record_tensor)
+    for rank in range(2):
+        local_start = rank * 3
+        plan = SequenceLayoutPlan(
+            descriptor=PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
+            token_slice=slice(local_start, local_start + 3),
+            global_num_tokens=num_tokens,
+            global_padded_num_tokens=6,
+            local_num_tokens=int(
+                np.count_nonzero(packed_to_request[local_start : local_start + 3] >= 0)
+            ),
+            local_padded_num_tokens=3,
+            _packed_to_request_major_token_indices=packed_to_request,
+            _request_major_to_packed_token_indices=request_to_packed,
+        )
+        host_arrays.clear()
+        _, local_gathers = plan.localize_token_tensor_and_gather_indices(
+            request_tokens, request_gathers, num_valid_gathers=2
+        )
+        # Both copies use layout capacities, even when the real token count
+        # changes. Padding on the device would still expose a dynamic input.
+        assert [array.shape for array in host_arrays] == [(3,), (6,)]
+        np.testing.assert_array_equal(host_arrays[1][:num_tokens], original_mapping)
+        np.testing.assert_array_equal(host_arrays[1][num_tokens:], -1)
+        torch.testing.assert_close(local_gathers, tensor(expected_gathers[rank]))
+        np.testing.assert_array_equal(request_to_packed, original_mapping)
+
+
 def test_partial_plan_ignores_padded_request_aligned_gathers():
     packed_to_request, request_to_packed = build_pcp_rank_major_token_order(
         [2, 3],
@@ -550,11 +608,6 @@ def test_evaluate_runner_chunk_rejects_local_bucket_overflow():
     ("eligibility", "error_type", "message"),
     [
         (_eligibility(dcp_size=2), NotImplementedError, "DCP"),
-        (
-            _eligibility(pipeline_parallel_size=2),
-            NotImplementedError,
-            "pipeline parallelism",
-        ),
         (_eligibility(interleave_size=0), ValueError, "interleave_size > 0"),
     ],
 )
@@ -749,3 +802,79 @@ def test_pcp_planner_preinit_and_dummy_share_the_v1_layout_contract():
     assert after_cache.requires_hidden_state_gather is True
 
     assert before_cache == after_cache
+
+
+@pytest.mark.parametrize(
+    "pcp_size, token_paddings, expected",
+    [(2, [256], 256), (1, [32, 64], 32)],
+    ids=["partial", "all"],
+)
+def test_padded_num_tokens_is_the_local_padding_prepare_real_plans(
+    monkeypatch, pcp_size, token_paddings, expected
+):
+    """The pipeline ring sizes its receives with padded_num_tokens before
+    prepare_real runs; the two must agree."""
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank", lambda: 1
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_world_size",
+        lambda: 2,
+    )
+    runner = _planner_runner_stub(
+        scheduled=[25], computed=[0], prompt=[25], token_paddings=token_paddings
+    )
+    planner = PcpSequenceLayoutPlanner(_eligibility(pcp_size=pcp_size))
+    counts = np.asarray([25], dtype=np.int32)
+
+    padded = planner.padded_num_tokens(
+        runner=runner,
+        scheduler_output=_scheduler_output([25]),
+        start_index=0,
+        num_scheduled_tokens_per_req=counts,
+    )
+    plan = planner.prepare_real(
+        runner=runner,
+        scheduler_output=_scheduler_output([25]),
+        start_index=0,
+        num_reqs=1,
+        num_scheduled_tokens_per_req=counts,
+        total_num_scheduled_tokens=25,
+        use_max_model_len=True,
+        target_num_reqs=8,
+        padded_num_reqs=8,
+    )
+
+    assert padded == plan.local_padded_num_tokens == expected
+
+
+@pytest.mark.parametrize("dp_target_bucket, expected", [(None, 32), (64, 64)])
+def test_all_planner_padded_num_tokens_follows_the_dp_bucket(
+    dp_target_bucket, expected
+):
+    runner = _planner_runner_stub(
+        scheduled=[20, 5], computed=[0, 0], prompt=[20, 5], token_paddings=[16, 32, 64]
+    )
+    runner._dp_target_bucket = dp_target_bucket
+    planner = AllSequenceLayoutPlanner()
+    counts = np.asarray([20, 5], dtype=np.int32)
+
+    padded = planner.padded_num_tokens(
+        runner=runner,
+        scheduler_output=_scheduler_output([20, 5]),
+        start_index=0,
+        num_scheduled_tokens_per_req=counts,
+    )
+    plan = planner.prepare_real(
+        runner=runner,
+        scheduler_output=_scheduler_output([20, 5]),
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=counts,
+        total_num_scheduled_tokens=25,
+        use_max_model_len=True,
+        target_num_reqs=8,
+        padded_num_reqs=8,
+    )
+
+    assert padded == plan.local_padded_num_tokens == expected

@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Hierarchical MoE parallelism: EP between chips, TP within a chip."""
 
 from __future__ import annotations
@@ -56,24 +67,26 @@ def align_ep_weight_filter() -> None:
     split = hierarchical_split_or_none()
     if split is None:
         return
-    ep_size, ep_rank, _, _ = split
+    chip_ep_size, chip_ep_rank, _, _ = split
 
     from vllm.model_executor.model_loader import default_loader
 
     original = default_loader.compute_local_expert_ids
 
-    def chip_aware(num_experts, _ep_size, _ep_rank, placement="linear"):
+    def chip_aware(
+        num_experts: int, ep_size: int, ep_rank: int, placement: str = "linear"
+    ) -> set[int] | None:
         # Ignore the caller's rank-derived ownership; the experts this rank
         # needs are its chip's block, shared with the other chiplet.
-        return original(num_experts, ep_size, ep_rank, placement=placement)
+        return original(num_experts, chip_ep_size, chip_ep_rank, placement=placement)
 
     default_loader.compute_local_expert_ids = chip_aware
     _filter_patched = True
     logger.info(
         "EP weight filter realigned to chip-block ownership: ep_size=%d, "
         "ep_rank=%d (was rank-derived).",
-        ep_size,
-        ep_rank,
+        chip_ep_size,
+        chip_ep_rank,
     )
 
 
