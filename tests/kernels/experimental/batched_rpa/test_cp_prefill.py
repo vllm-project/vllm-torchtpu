@@ -18,6 +18,7 @@ against the K/V each position must see, the serving-cache writes against the
 pages `wrapper.prepare_inputs` lays out, and that the kernel lowers for tpu7x.
 """
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -213,6 +214,24 @@ def test_exchange_halos_delivers_the_preceding_tails(world):
     assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
     result = json.loads(lines[-1][len("RESULT ") :])
     assert result == {"checked": 2 * world - 2, "all_equal": True}
+
+
+@pytest.mark.parametrize("halo", [0, 3])
+def test_sliding_page_tables_refuse_halos_outside_one_piece(halo):
+    plan = cp_prefill.make_zigzag_plan(16 * 2 * PAGE, world=8, page_size=PAGE)
+    with pytest.raises(ValueError, match="halo"):
+        plan.sliding_page_tables(0, halo)
+
+
+@pytest.mark.parametrize("fence", [False, True])
+def test_layer_config_passes_the_output_fence(fence):
+    cfg = dataclasses.replace(
+        _layer_config(0, 16, 1024, configs.KVLayout.HEAD_ALONG_SUBLANE),
+        fence_output=fence,
+    )
+    kwargs = cfg.rpa_kwargs()
+    assert kwargs.get("fence_output", False) is fence
+    assert kwargs["sliding_window"] == 1024
 
 
 def test_sub_request_metadata_places_queries_at_absolute_positions():

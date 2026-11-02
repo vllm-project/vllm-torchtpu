@@ -139,7 +139,7 @@ class ZigzagPlan:
         """
         if not 1 <= halo_pages <= self.piece_pages:
             raise ValueError(
-                f"A halo of {halo_pages} pages is not 1 to one piece of "
+                f"A halo of {halo_pages} pages must be between 1 and the piece's "
                 f"{self.piece_pages} pages."
             )
         pieces = jnp.stack(self.rank_pieces(rank)).astype(jnp.int32)
