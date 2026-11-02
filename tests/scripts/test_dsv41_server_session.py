@@ -3,6 +3,7 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from dataclasses import replace
@@ -82,6 +83,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
             "results",
             "--startup-timeout",
             "7200",
+            *(["--head-address", "127.0.0.1"] if scenario == "decode_dp16" else []),
             *(["--profile"] if profile != "disabled" else []),
         ],
     )
@@ -107,7 +109,22 @@ def test_ci_launch_and_optional_profile_share_one_server(
         compiler_roots.append(Path(env["VLLM_CACHE_ROOT"]))
         assert compiler_roots[-1].is_dir()
         assert env["USE_PHASED_PROFILER"] == "0"
-        assert env["TP"] == "1" and env["DP"] == "8"
+        assert env["TP"] == "1"
+        assert env["DP"] == ("16" if scenario == "decode_dp16" else "8")
+        if scenario == "decode_dp16":
+            assert env["HEADLESS"] == "0"
+            assert env["TPU_DEEPSEEK_V41_ENGRAM_HBM"] == "first"
+            assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "v2"
+            assert env["MOE_FUSED_EP_PREPROCESS_BACKEND"] == "topology"
+            assert env["MAX_SEQS"] == "48"
+            assert env["MAX_MODEL_LEN"] == "98816"
+            assert env["LD_PRELOAD"] == ""
+            assert env["TPU_RECLAIM_COMPILE_MEMORY"] == "1"
+            assert json.loads(env["ENGRAM_CONFIG"]) == {
+                "cpu_offload": True,
+                "dp_shared_memory": False,
+            }
+            assert command[command.index("--data-parallel-size-local") + 1] == "8"
         assert env["CHUNK"] == "2048"
         assert env["VLLM_DISABLE_COMPILE_CACHE"] == "1"
         assert env["JAX_ENABLE_COMPILATION_CACHE"] == "false"
@@ -123,6 +140,9 @@ def test_ci_launch_and_optional_profile_share_one_server(
             return
         out = Path(command[command.index("--out") + 1])
         out.mkdir()
+        if scenario == "decode_dp16":
+            assert command[command.index("--scenario") + 1] == "decode_dp16"
+            (out.parent / "shutdown-permitted").touch()
         for i in range(1, rounds + 1):
             (out / f"round-{i}-summary.json").write_text(
                 json.dumps({"audit_wall_interval_ns": [2 * i, 2 * i + 1]})
@@ -165,6 +185,76 @@ def test_ci_launch_and_optional_profile_share_one_server(
     assert status["formal_status"] == "passed"
     assert status["profile_status"] == profile
     assert status["completed"] == (profile != "failed")
+
+
+def test_dp16_ci_launch_keeps_local_shapes_and_selects_hbm(tmp_path, monkeypatch):
+    test_ci_launch_and_optional_profile_share_one_server(
+        tmp_path,
+        monkeypatch,
+        "decode_dp16",
+        1,
+        [288, 2048],
+        "disabled",
+        "gs://test-bucket/checkpoint",
+    )
+
+
+@pytest.mark.parametrize("early_exit", [False, True])
+def test_dp16_worker_waits_for_shutdown_and_never_runs_client(
+    tmp_path, monkeypatch, early_exit
+):
+    monkeypatch.setenv("MODEL_PATH", str(tmp_path))
+    (tmp_path / "config.json").write_text("{}")
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(__file__=__file__))
+    monkeypatch.setattr(launcher, "source_identity", lambda *a, **kw: {})
+    monkeypatch.setattr(launcher.importlib.metadata, "version", lambda _: "1")
+    monkeypatch.setattr(
+        launcher.requests, "get", lambda *a, **kw: SimpleNamespace(ok=False)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run.py",
+            "--scenario",
+            "decode_dp16",
+            "--input",
+            "unused.json",
+            "--out",
+            str(tmp_path / "worker"),
+            "--host-rank",
+            "1",
+            "--head-address",
+            "127.0.0.1",
+        ],
+    )
+    handlers, commands, stopped = {}, [], []
+    monkeypatch.setattr(launcher.signal, "signal", lambda s, f: handlers.update({s: f}))
+    monkeypatch.setattr(
+        launcher.time, "sleep", lambda _: handlers[signal.SIGTERM](signal.SIGTERM, None)
+    )
+    server = SimpleNamespace(poll=lambda: 17 if early_exit else None, returncode=17)
+
+    def start(command, *, env, **kwargs):
+        commands.append(command)
+        assert env["HEADLESS"] == "1" and env["DP"] == "16"
+        assert command[command.index("--data-parallel-start-rank") + 1] == "8"
+        return server
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", start)
+    monkeypatch.setattr(
+        launcher.subprocess, "run", lambda *a, **kw: pytest.fail("worker ran client")
+    )
+    monkeypatch.setattr(launcher, "stop", stopped.append)
+    if early_exit:
+        with pytest.raises(RuntimeError, match="Worker server exited"):
+            launcher.main()
+    else:
+        launcher.main()
+    timing = json.loads((tmp_path / "worker/startup.json").read_text())
+    assert timing["completed"] == (not early_exit)
+    assert timing["formal_status"] == "pending"
+    assert len(commands) == 1 and stopped == [server]
 
 
 @pytest.mark.parametrize("profile_only,waves", [(False, 6), (True, 1)])

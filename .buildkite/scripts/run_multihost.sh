@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Run a command or benchmark across a multi-host TPU slice
-# (e.g. tpu_v7x_16_queue = 2 hosts x 8 chips).
+# (e.g. tpu_v7x_16_queue = 2 hosts x 8 devices / 4 physical chips).
 #
 # Supports two distributed execution backends:
 #   1. ray (default): Starts Ray head on head node and Ray worker on each
@@ -28,6 +28,7 @@
 # Usage:
 #   run_multihost.sh [--backend ray] <command_to_run_in_head_container...>
 #   run_multihost.sh --backend mp <config_name> [extra run_eval_flow.sh args...]
+#   run_multihost.sh --backend mp --dsv41-decode <model_uri> <results_dir>
 # shellcheck disable=SC2034,SC2317,SC1091
 set -euo pipefail
 
@@ -239,9 +240,16 @@ if [ "$BACKEND" = "ray" ]; then
   source "${SCRIPT_DIR}/run_multihost_ray.sh"
   run_ray_multihost "$@" || EXIT_CODE=$?
 elif [ "$BACKEND" = "mp" ]; then
-  # shellcheck source=.buildkite/scripts/run_multihost_mp.sh
-  source "${SCRIPT_DIR}/run_multihost_mp.sh"
-  run_mp_multihost "$@" || EXIT_CODE=$?
+  if [ "$1" = "--dsv41-decode" ]; then
+    shift
+    # shellcheck source=.buildkite/scripts/run_dsv41_dp16_multihost.sh
+    source "${SCRIPT_DIR}/run_dsv41_dp16_multihost.sh"
+    run_dsv41_dp16_multihost "$@" || EXIT_CODE=$?
+  else
+    # shellcheck source=.buildkite/scripts/run_multihost_mp.sh
+    source "${SCRIPT_DIR}/run_multihost_mp.sh"
+    run_mp_multihost "$@" || EXIT_CODE=$?
+  fi
 else
   echo "ERROR: Unknown backend: ${BACKEND}. Supported backends: ray, mp"
   exit 1

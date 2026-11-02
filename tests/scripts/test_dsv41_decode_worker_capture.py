@@ -45,13 +45,16 @@ def test_decode_captures_scheduled_drafts_and_native_prepare_shapes():
     assert len(recorder.stages) == 1
 
 
-def test_synchronized_profile_writes_to_requested_directory(tmp_path, monkeypatch):
+@pytest.mark.parametrize("dp_size", [8, 16])
+def test_synchronized_profile_writes_to_requested_directory(
+    tmp_path, monkeypatch, dp_size
+):
     rank = 0
     calls, barriers, syncs = [], [], []
-    group = SimpleNamespace(world_size=8, cpu_group="cpu")
+    group = SimpleNamespace(world_size=dp_size, cpu_group="cpu")
 
     def gather(target, value, group):
-        target[:] = [{**value, "rank": i} for i in range(8)]
+        target[:] = [{**value, "rank": i} for i in range(dp_size)]
 
     dist = SimpleNamespace(
         all_gather_object=gather, barrier=lambda **kw: barriers.append(kw)
@@ -80,12 +83,38 @@ def test_synchronized_profile_writes_to_requested_directory(tmp_path, monkeypatc
         parallel_config=SimpleNamespace(data_parallel_rank=rank)
     )
     worker.profile = lambda **kw: calls.append(kw)
-    worker.synchronized_profile_arm(output_dir=str(tmp_path))
+    worker.synchronized_profile_arm(
+        output_dir=str(tmp_path), scenario="decode" if dp_size == 8 else "decode_dp16"
+    )
     for _ in range(7):
         assert runner._dp_coordinated_step(288) == "native"
     assert runner._dp_coordinated_step is original
     assert len(calls) == 2
     assert len(barriers) == 4 and len(syncs) == 2
     capture = worker.synchronized_profile_check()
+    assert len(capture) == dp_size
     assert all(r["completed"] and r["captured_steps"] == 6 for r in capture)
     assert (tmp_path / "synchronized-profile" / f"rank-{rank}-capture.json").is_file()
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_dp16_ci_rejects_native_preprocessing_fallback(monkeypatch, supported):
+    from server_step_worker import require_dp16_topology
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_torchtpu.distributed.ep_mesh",
+        SimpleNamespace(build_ep_mesh=lambda: SimpleNamespace(size=16)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_torchtpu.compilation.moe_preprocessing",
+        SimpleNamespace(
+            prepare_moe_preprocessing=lambda _: object() if supported else None
+        ),
+    )
+    if supported:
+        require_dp16_topology()
+    else:
+        with pytest.raises(ValueError, match="#2646"):
+            require_dp16_topology()

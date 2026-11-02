@@ -3,12 +3,12 @@
 set -Eeuo pipefail
 ulimit -c 0
 
-scenario="${1:?scenario is required: encoder_extend or decode}"
+scenario="${1:?scenario is required: encoder_extend, decode or decode_dp16}"
 model_uri="${2:?model GCS URI is required}"
 results="${3:?results directory is required}"
 case "$scenario" in
-  encoder_extend|decode) ;;
-  *) echo "Unsupported DP8 benchmark scenario: $scenario" >&2; exit 2 ;;
+  encoder_extend|decode|decode_dp16) ;;
+  *) echo "Unsupported benchmark scenario: $scenario" >&2; exit 2 ;;
 esac
 if [[ "$model_uri" != gs://*/* ]]; then
   echo "Expected gs://bucket/model-prefix, got: $model_uri" >&2
@@ -20,9 +20,18 @@ export PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
 export PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1
 # The shared CI image preloads tcmalloc; heap trimming requires glibc malloc.
 export TPU_RECLAIM_COMPILE_MEMORY=0
+launch_args=()
+if [[ "$scenario" == decode_dp16 ]]; then
+  # Match the validated EP16 recipe on both hosts, before Python starts.
+  export LD_PRELOAD="" TPU_RECLAIM_COMPILE_MEMORY=1
+  launch_args+=(--host-rank "${DSV41_HOST_RANK:?}" --head-address "${DSV41_HEAD_ADDRESS:?}")
+  if [[ "$DSV41_HOST_RANK" == 1 ]]; then
+    results="$results/worker"
+  fi
+fi
 mkdir -p "$TMPDIR" "$results"
 exec > >(tee "$results/task.log") 2>&1
-scratch=$(mktemp -d "$TMPDIR/dsv41-dp8.XXXXXX")
+scratch=$(mktemp -d "$TMPDIR/dsv41-bench.XXXXXX")
 model_mount="$scratch/model"
 mkdir -p "$model_mount"
 cleanup() {
@@ -36,14 +45,7 @@ uv pip freeze --system > "$results/pip-freeze.txt"
 
 # Each pytest process releases the TPU before the serving process starts.
 if [[ "$scenario" == decode ]]; then
-  python -m pytest -q tests/kernels/test_dsv41_decode_index_scores.py \
-    -k 'grouped_decode or write_flat_rows_with_ragged_lengths' \
-    --junitxml="$results/kernel-scores.xml"
-  python -m pytest -q tests/models/vllm/test_dsv41_decode_indexer_route.py \
-    -k 'decode_route_tpu_matches_existing or candidate_cache_matches_existing_with_fallback or basic_config or long_candidate_cache' \
-    --junitxml="$results/kernel-routes.xml"
-  python -m pytest -q tests/kernels/fused_moe/test_fused_ep_moe_v2.py \
-    -k row_padded_flat_scales --junitxml="$results/kernel-scales.xml"
+  bash .buildkite/scripts/run_dsv41_decode_kernel_checks.sh "$results"
 fi
 
 # Input preparation uses the mount; serving streams weights from the GCS URI.
@@ -54,19 +56,39 @@ gcsfuse --implicit-dirs --only-dir "$prefix" -o ro "$bucket" "$model_mount"
 export MODEL_PATH="$model_mount" MODEL_URI="$model_uri"
 test -f "$MODEL_PATH/config.json"
 
-curl --fail --location --retry 3 \
-  https://huggingface.co/datasets/zai-org/LongBench-v2/resolve/main/data.json \
-  --output "$scratch/longbench.json"
-# prepare checks the dataset SHA and retains the scenario's frozen selection.
-python scripts/dsv41_bench/server_steps/bench_cached_extend.py prepare \
-  --scenario "$scenario" --dataset "$scratch/longbench.json" \
-  --tokenizer "$MODEL_PATH" --out "$results/inputs.json"
-sha256sum "$results/inputs.json" > "$results/input.sha256"
+if [[ "${DSV41_HOST_RANK:-0}" == 0 ]]; then
+  curl --fail --location --retry 3 \
+    https://huggingface.co/datasets/zai-org/LongBench-v2/resolve/main/data.json \
+    --output "$scratch/longbench.json"
+  # prepare checks the dataset SHA and retains the scenario's frozen selection.
+  python scripts/dsv41_bench/server_steps/bench_cached_extend.py prepare \
+    --scenario "$scenario" --dataset "$scratch/longbench.json" \
+    --tokenizer "$MODEL_PATH" --out "$results/inputs.json"
+  sha256sum "$results/inputs.json" > "$results/input.sha256"
+fi
+
+if [[ "$scenario" == decode_dp16 ]]; then
+  # Do not spend the MP rendezvous timeout preparing 768 long prompts or
+  # pulling the peer image. The host coordinator releases both ready hosts.
+  touch "$results/ready-to-launch"
+  deadline=$((SECONDS + 7200))
+  until [[ -f "$results/launch-permitted" ]]; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for both prepared hosts" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+fi
 
 python scripts/dsv41_bench/server_steps/run.py \
   --scenario "$scenario" --input "$results/inputs.json" \
   --out "$results/benchmark" \
-  --startup-timeout 7200
+  --startup-timeout 7200 "${launch_args[@]}"
+
+if [[ "${DSV41_HOST_RANK:-0}" == 1 ]]; then
+  exit 0
+fi
 
 # Raw observations stay in artifacts; print the throughput metrics in the log.
 python - "$results/benchmark/fixed" <<'PY_SUMMARY'
@@ -76,7 +98,7 @@ from pathlib import Path
 
 summaries = sorted(Path(sys.argv[1]).glob("round-*-summary.json"))
 if not summaries:
-    raise RuntimeError("DP8 benchmark completed without a formal round summary")
+    raise RuntimeError("Benchmark completed without a formal round summary")
 for path in summaries:
     report = json.loads(path.read_text())
     metrics = {}
@@ -90,6 +112,6 @@ for path in summaries:
         }
         for category, values in report["categories"].items()
     }
-    print(f"DSV41_DP8_BENCHMARK_SUMMARY {path.name}")
+    print(f"DSV41_BENCHMARK_SUMMARY {path.name}")
     print(json.dumps(metrics, indent=2))
 PY_SUMMARY

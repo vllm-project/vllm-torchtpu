@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.cpu_test
 
 
-def test_cached_recipe_selects_policy_without_kernel_env(tmp_path):
+@pytest.mark.parametrize("headless", [False, True])
+def test_cached_recipe_selects_policy_without_kernel_env(tmp_path, headless):
     vllm = tmp_path / "vllm"
     vllm.write_text(
         "#!/usr/bin/env python3\nimport json,os,sys\n"
@@ -27,6 +28,7 @@ def test_cached_recipe_selects_policy_without_kernel_env(tmp_path):
         if not k.startswith(("TPU_DEEPSEEK_V41_", "MOE_", "USE_MOE_"))
     }
     env["PATH"] = str(tmp_path) + os.pathsep + env["PATH"]
+    env["HEADLESS"] = str(int(headless))
     result = subprocess.run(
         [
             "bash",
@@ -43,6 +45,8 @@ def test_cached_recipe_selects_policy_without_kernel_env(tmp_path):
     )
     output = json.loads(result.stdout)
     argv = output["argv"]
+    assert ("--headless" in argv) == headless
+    assert ("--api-server-count" in argv) != headless
     assert json.loads(argv[argv.index("--additional-config") + 1]) == {
         "deepseek_v41": {"execution": "ced", "moe": "fused_ep_w4a8"}
     }

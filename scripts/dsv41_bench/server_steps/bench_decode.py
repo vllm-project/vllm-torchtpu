@@ -33,7 +33,9 @@ def expected_prefix_hit(prefix_tokens: int, extend_tokens: int, alignment: int) 
 
 def client_main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=["decode"], default="decode")
+    parser.add_argument(
+        "--scenario", choices=["decode", "decode_dp16"], default="decode"
+    )
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
@@ -168,7 +170,11 @@ def client_main(argv: list[str]) -> None:
 
     if args.profile_only:
         post("/pause?mode=keep&clear_cache=false", {})
-        rpc("synchronized_profile_arm", output_dir=str(args.out.resolve()))
+        rpc(
+            "synchronized_profile_arm",
+            output_dir=str(args.out.resolve()),
+            scenario=args.scenario,
+        )
         try:
             wave(prompts, scenario.output_tokens)
             post("/pause?mode=keep&clear_cache=false", {})
@@ -197,7 +203,7 @@ def client_main(argv: list[str]) -> None:
         if sorted(r["rank"] for r in rank_results(setup["results"])) != list(
             range(scenario.dp_size)
         ):
-            raise ValueError("RPC did not configure all eight DP workers")
+            raise ValueError("RPC did not configure all DP workers")
         log_offset = args.server_log.stat().st_size
         audit_start = time.time_ns()
         try:
@@ -284,14 +290,23 @@ def rank_results(value: list) -> list[dict]:
 
 
 def summarize(results: list, scenario_name: str) -> dict:
-    if scenario_name != "decode":
+    if scenario_name not in ("decode", "decode_dp16"):
         raise NotImplementedError("Only the decode scenario is supported")
     scenario = SCENARIOS[scenario_name]
     ranks = sorted(rank_results(results), key=lambda r: r["rank"])
     if [r["rank"] for r in ranks] != list(range(scenario.dp_size)):
         raise ValueError("Expected one result for every DP rank; no duplicate ranks")
-    if len({r["hostname"] for r in ranks}) != 1:
+    hosts = {r["hostname"] for r in ranks}
+    if scenario_name == "decode" and len(hosts) != 1:
         raise ValueError("Server monotonic timestamps require a single node")
+    if scenario_name == "decode_dp16" and (
+        len(hosts) != 2
+        or any(sum(r["hostname"] == host for r in ranks) != 8 for host in hosts)
+    ):
+        raise ValueError("DP16 benchmark requires two hosts with eight ranks each")
+    host_ranks = {
+        host: [r["rank"] for r in ranks if r["hostname"] == host] for host in hosts
+    }
     groups = defaultdict(dict)
     for rank in ranks:
         if rank["scenario"] != scenario.to_dict():
@@ -411,9 +426,13 @@ def summarize(results: list, scenario_name: str) -> dict:
             continue
         usable = segment[:-1]
         for (prev_index, prev_rows), (index, rows) in zip(usable, usable[1:]):
-            begin = max(r["step"]["observed_ns"] for r in prev_rows)
-            end = max(r["step"]["observed_ns"] for r in rows)
-            if end <= begin:
+            host_intervals = {
+                host: max(rows[i]["step"]["observed_ns"] for i in indices)
+                - max(prev_rows[i]["step"]["observed_ns"] for i in indices)
+                for host, indices in host_ranks.items()
+            }
+            begin, end = 0, max(host_intervals.values())
+            if min(host_intervals.values()) <= 0:
                 raise ValueError("Non-positive node observation cadence")
             samples.append(
                 {
@@ -433,36 +452,49 @@ def summarize(results: list, scenario_name: str) -> dict:
                     "stages": [r["step"]["stages"] for r in rows],
                 }
             )
-        # All counters use the SAME host-clock window, despite rank skew.
-        # Cadence samples above are logical cohorts, not a counter denominator.
-        begin = max(r["step"]["observed_ns"] for r in usable[0][1])
-        end = min(r["step"]["observed_ns"] for r in usable[-1][1])
-        if end <= begin:
-            raise ValueError("No common steady observation window across ranks")
-        observations = [
-            r["step"]
-            for _, rows in usable
-            for r in rows
-            if begin < r["step"]["observed_ns"] <= end
-        ]
+        host_windows = []
+        for host, indices in host_ranks.items():
+            begin = max(usable[0][1][i]["step"]["observed_ns"] for i in indices)
+            end = min(usable[-1][1][i]["step"]["observed_ns"] for i in indices)
+            if end <= begin:
+                raise ValueError("No common steady observation window within host")
+            observations = [
+                rows[i]["step"]
+                for _, rows in usable
+                for i in indices
+                if begin < rows[i]["step"]["observed_ns"] <= end
+            ]
+            host_windows.append(
+                {
+                    "hostname": host,
+                    "begin_ns_exclusive": begin,
+                    "end_ns_inclusive": end,
+                    "seconds": (end - begin) / 1e9,
+                    "effective_tokens": sum(
+                        r["accepted_output_tokens"] for r in observations
+                    ),
+                    "request_observations": sum(
+                        r["output_requests"] for r in observations
+                    ),
+                    "per_rank_observations": [
+                        sum(
+                            begin < rows[i]["step"]["observed_ns"] <= end
+                            for _, rows in usable
+                        )
+                        for i in indices
+                    ],
+                }
+            )
         windows.append(
             {
                 "baseline_forward_id": usable[0][0],
                 "last_forward_id": usable[-1][0],
-                "begin_ns_exclusive": begin,
-                "end_ns_inclusive": end,
-                "seconds": (end - begin) / 1e9,
-                "effective_tokens": sum(
-                    r["accepted_output_tokens"] for r in observations
+                "seconds": max(w["seconds"] for w in host_windows),
+                "effective_tokens": sum(w["effective_tokens"] for w in host_windows),
+                "request_observations": sum(
+                    w["request_observations"] for w in host_windows
                 ),
-                "request_observations": sum(r["output_requests"] for r in observations),
-                "per_rank_observations": [
-                    sum(
-                        begin < rows[rank]["step"]["observed_ns"] <= end
-                        for _, rows in usable
-                    )
-                    for rank in range(scenario.dp_size)
-                ],
+                "host_windows": host_windows,
             }
         )
     if len(samples) < 8:
@@ -481,7 +513,11 @@ def summarize(results: list, scenario_name: str) -> dict:
     )
     return {
         "scenario": scenario.to_dict(),
-        "timing": "native_output_observation_cadence",
+        "timing": (
+            "native_output_observation_cadence"
+            if len(hosts) == 1
+            else "max_host_local_cadence_at_matching_forward_ids"
+        ),
         "isolated_stage_device_seconds": None,
         "capacity_scope": "colocated serving; not isolated D-node capacity",
         "context_semantics": (
@@ -498,7 +534,11 @@ def summarize(results: list, scenario_name: str) -> dict:
         "windows": windows,
         "categories": {
             "decode": {
-                "throughput_basis": "observed_window",
+                "throughput_basis": (
+                    "observed_window"
+                    if len(hosts) == 1
+                    else "sum_host_tokens_over_max_host_window"
+                ),
                 "steps": len(samples),
                 "total_seconds": seconds,
                 "median_step_ms": 1000 * median_step_seconds,
@@ -519,7 +559,7 @@ def summarize(results: list, scenario_name: str) -> dict:
 def summarize_main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
-    parser.add_argument("--scenario", choices=["decode"], required=True)
+    parser.add_argument("--scenario", choices=["decode", "decode_dp16"], required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     result = summarize(json.loads(args.input.read_text())["results"], args.scenario)

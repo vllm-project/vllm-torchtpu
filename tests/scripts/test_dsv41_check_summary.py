@@ -19,7 +19,7 @@ _SPEC.loader.exec_module(summary)
 pytestmark = pytest.mark.cpu_test
 
 
-def write_result(root, scenario):
+def write_result(root, scenario, dp_size=8):
     """Use skewed rounds to distinguish median from mean aggregation."""
     (root / "fixed").mkdir(parents=True)
     timing = dict(
@@ -33,12 +33,32 @@ def write_result(root, scenario):
     (root / "manifest.json").write_text(
         json.dumps({"identity": {"torchtpu": {"commit": "abc"}}})
     )
-    spec = dict(name=scenario, dp_size=8, concurrency=384, physical_chips=4)
+    spec = dict(
+        name=scenario,
+        dp_size=dp_size,
+        concurrency=48 * dp_size,
+        physical_chips=dp_size // 2,
+    )
+    if dp_size == 16:
+        (root / "multihost-audit.json").write_text(
+            json.dumps(
+                {
+                    "completed": True,
+                    "commit": "abc",
+                    "rounds": 3,
+                    "hosts": ["head", "worker"],
+                    "ranks": list(range(16)),
+                }
+            )
+        )
     (root / "fixed/manifest.json").write_text(
         json.dumps({"rounds": 3, "scenario": spec})
     )
     for i, rate in enumerate([400, 800, 8000], 1):
-        metric = dict(global_tokens_s=rate, per_physical_chip_tokens_s=rate / 4)
+        metric = dict(
+            global_tokens_s=rate,
+            per_physical_chip_tokens_s=rate / spec["physical_chips"],
+        )
         report = dict(
             warmup=False,
             scenario=spec,
@@ -51,7 +71,7 @@ def write_result(root, scenario):
                 "encoder_middle": metric,
                 "decode": dict(
                     global_tokens_s=200,
-                    per_physical_chip_tokens_s=50,
+                    per_physical_chip_tokens_s=200 / spec["physical_chips"],
                     median_step_ms=384 * 3.47 / rate * 1000,
                 ),
             },
@@ -118,9 +138,9 @@ def test_host_hook_publishes_and_preserves_command_failure(
 ):
     (tmp_path / ".buildkite").symlink_to(_REPO / ".buildkite", target_is_directory=True)
     root = (
-        tmp_path / "perf_eval_results/deepseek-v41-flash-dp8-96k-c384-decode/benchmark"
+        tmp_path / "perf_eval_results/deepseek-v41-flash-dp16-96k-c768-decode/benchmark"
     )
-    write_result(root, "decode")
+    write_result(root, "decode", dp_size=16)
     agent = tmp_path / "buildkite-agent"
     agent.write_text(
         '#!/bin/sh\nprintf "%s\\n" "$@" > agent-args\ncat > published.md\n'
@@ -130,7 +150,7 @@ def test_host_hook_publishes_and_preserves_command_failure(
     env = {
         **os.environ,
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
-        "BUILDKITE_STEP_KEY": "dsv41_flash_dp8_c384_decode",
+        "BUILDKITE_STEP_KEY": "dsv41_flash_dp16_c768_decode",
         "BUILDKITE_COMMAND_EXIT_STATUS": str(command_status),
         "BUILDKITE_COMMIT": "abc",
         "BUILDKITE_BUILD_URL": "https://buildkite.com/test/1",
@@ -162,3 +182,29 @@ def test_host_hook_ignores_unrelated_steps(tmp_path):
     )
     assert result.returncode == 0
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("invalid", ["missing", "failed", "wrong_commit", "partial"])
+def test_dp16_requires_both_host_audits(tmp_path, invalid):
+    write_result(tmp_path, "decode", dp_size=16)
+    path = tmp_path / "multihost-audit.json"
+    data = json.loads(path.read_text())
+    if invalid == "missing":
+        path.unlink()
+    else:
+        if invalid == "failed":
+            data["completed"] = False
+        elif invalid == "wrong_commit":
+            data["commit"] = "old"
+        else:
+            data["ranks"] = list(range(8))
+        path.write_text(json.dumps(data))
+    with pytest.raises((ValueError, OSError)):
+        summary.render_summary(tmp_path, "abc")
+
+
+def test_dp16_check_reports_eight_physical_chips(tmp_path):
+    write_result(tmp_path, "decode", dp_size=16)
+    rendered = summary.render_summary(tmp_path, "abc")
+    assert "| 800.00 | 100.00 |" in rendered
+    assert "DP16, C768, 8 physical chips" in rendered
