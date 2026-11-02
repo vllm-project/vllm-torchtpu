@@ -32,10 +32,10 @@ class StepContext:
     """The inputs of one runner forward, exactly as the stock model gets them.
 
     `model_kwargs` are the extra keyword arguments the runner passes to the
-    stock model's forward; a driver that can't consume them declines the step.
-    A driver that handles the step returns what the stock model would: hidden
-    states, or `(hidden_states, aux_hidden_states)`; the runner normalizes
-    both paths the same way.
+    stock model's forward; a megakernel that can't consume them declines the
+    step. A megakernel that handles the step returns what the stock model
+    would: hidden states, or `(hidden_states, aux_hidden_states)`; the runner
+    normalizes both paths the same way.
     """
 
     input_ids: Any
@@ -51,7 +51,7 @@ class StepContext:
 
 @contextlib.contextmanager
 def suppressed(runner: Any) -> Iterator[None]:
-    """Force the stock model forward for every `try_forward` in this scope.
+    """Force the stock model forward for every step of `runner` in this scope.
 
     The runner wraps its dummy / precompile / profile forwards in this, so
     every stock graph those runs compile is compiled at startup even when the

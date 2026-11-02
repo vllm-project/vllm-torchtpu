@@ -13,7 +13,7 @@
 # limitations under the License.
 """Framework-free step statistics: batch-shape inspection from host metadata,
 the periodic step-mix tracker and the A/B latency calibrator (stdlib + numpy;
-no jax, no policy or profile imports)."""
+no jax)."""
 
 from __future__ import annotations
 

@@ -261,7 +261,7 @@ def test_plugin_key_and_arch_resolution() -> None:
     assert cfg_mod.resolve_plugin_ref(on, SimpleNamespace(architectures=["X"])) is None
     by_type = SimpleNamespace(architectures=None, model_type=_ENTRY.model_types[0])
     assert cfg_mod.resolve_plugin_ref(on, by_type)[0].shorthand == _SHORTHAND
-    # Only the HF config resolves the arch (the compile-cache salt has no model).
+    # Only the HF config resolves the arch.
     assert cfg_mod.resolve_plugin_ref(on, None) is None
     with pytest.raises(MegakernelConfigError, match="invalid plugin"):
         cfg_mod.parse_config({"plugin": "a.b:not an attr"})

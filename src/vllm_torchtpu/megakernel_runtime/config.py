@@ -267,8 +267,8 @@ def resolve_plugin_ref(
 def select_plugin(
     env_raw: Any, additional_config: Any, hf_config: Any
 ) -> tuple[MegakernelConfig, tuple[PluginRef, dict[str, Any]] | None]:
-    """The config and the resolved plugin: the one resolution both the driver
-    and the compile-cache salt use."""
+    """The config and the resolved plugin (`None` when the megakernel is off
+    or no shorthand claims the checkpoint)."""
     cfg = collect_config(env_raw, additional_config)
     return cfg, (resolve_plugin_ref(cfg, hf_config) if cfg.enabled else None)
 
