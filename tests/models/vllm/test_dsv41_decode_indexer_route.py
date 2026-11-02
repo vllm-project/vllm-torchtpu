@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_bf16, indexer_select
 
 
 @pytest.mark.cpu_test
@@ -57,7 +57,7 @@ def test_decode_route(monkeypatch, width, mode, banked):
         np.testing.assert_array_equal(pages[:, : width // 128], records[:, ::128])
         np.testing.assert_array_equal(pages[:, width // 128 :], -1)
         np.testing.assert_array_equal(
-            grouped_q.reshape(q.shape), indexer_ops.split_halves(q)
+            grouped_q.reshape(q.shape), indexer_bf16.split_halves(q)
         )
         assert grouped_weights.shape == (count, queries, heads)
         np.testing.assert_array_equal(grouped_weights.reshape(weights.shape), weights)
@@ -77,11 +77,11 @@ def test_decode_route(monkeypatch, width, mode, banked):
         result = jnp.where(lengths[:, None] > 0, scores[:, :topk].astype(jnp.int32), -1)
         return result, candidates
 
-    monkeypatch.setattr(indexer_ops, "_decode_select", new_select)
-    monkeypatch.setattr(indexer_ops, "paged_index_scores_jax", old_score)
-    monkeypatch.setattr(indexer_ops, "select_indices_jax", old_select)
+    monkeypatch.setattr(indexer_bf16, "_decode_select", new_select)
+    monkeypatch.setattr(indexer_bf16, "paged_index_scores_jax", old_score)
+    monkeypatch.setattr(indexer_select, "select_indices_jax", old_select)
     with jax.disable_jit():
-        selected, published = indexer_ops.paged_indexer_jax(
+        selected, published = indexer_bf16.paged_indexer_jax(
             q,
             pool,
             records,
@@ -131,7 +131,7 @@ def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count, 
     candidates = jnp.zeros((count * queries, candidate_count), jnp.int32)
 
     def run(q, pool, records, weights, lengths, candidates, requests):
-        return indexer_ops.paged_indexer_jax(
+        return indexer_bf16.paged_indexer_jax(
             q,
             pool,
             records,
@@ -150,7 +150,7 @@ def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count, 
     args = (q, pool, records, weights, lengths, candidates, requests)
     candidate = jax.tree.map(np.asarray, jax.jit(run)(*args))
     monkeypatch.setattr(
-        indexer_ops.decode_index_selection, "supports_decode", lambda *a: False
+        indexer_bf16.decode_index_selection, "supports_decode", lambda *a: False
     )
     baseline = jax.tree.map(np.asarray, jax.jit(lambda *a: run(*a))(*args))
     np.testing.assert_array_equal(candidate[0], baseline[0])
@@ -267,7 +267,7 @@ def _check_candidate_cache(mode, *, groups, width, capacity, queries=6):
         128,
         None,
     )
-    expected, _ = indexer_ops.paged_indexer_jax(
+    expected, _ = indexer_bf16.paged_indexer_jax(
         q,
         pool,
         records,

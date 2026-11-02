@@ -148,7 +148,7 @@ def select_candidate_cache_jax(
     request_tile: int | None,
     topk: int = 512,
 ) -> jax.Array:
-    from .indexer_impl import paged_indexer_jax
+    from .indexer_bf16 import paged_indexer_jax
 
     groups = records.shape[0]
     queries = candidates.request_query_count(q.shape[0], groups)

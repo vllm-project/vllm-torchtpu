@@ -21,7 +21,7 @@ from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.prefill_scores import (
     supports_chunked_prefill,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import paged_indexer_jax
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_bf16 import paged_indexer_jax
 
 
 def main():

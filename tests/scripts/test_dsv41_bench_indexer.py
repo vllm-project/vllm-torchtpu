@@ -32,11 +32,13 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (  # noq
     _pad_compacted_records,
     compact_records,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (  # noqa: E402  # noqa: E402
-    _compact_selected,
-    _visible_top_k,
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_bf16 import (  # noqa: E402
     paged_indexer_jax,
     write_index_keys,
+)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select import (  # noqa: E402
+    _compact_selected,
+    _visible_top_k,
 )
 
 

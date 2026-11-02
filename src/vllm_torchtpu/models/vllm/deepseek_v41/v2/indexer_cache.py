@@ -14,7 +14,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
     PackedFP8Layout,
 )
 
-from . import indexer_impl as indexer_ops
+from . import indexer_fp8
 from .cache import IndexCacheRows, NativeCacheView, PagedCacheRows, RawCachePool
 
 logger = init_logger(__name__)
@@ -73,8 +73,8 @@ class PackedFP8IndexCacheRows(PagedCacheRows):
     def __getitem__(self, indices: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         blocks, rows = indices
         records = (blocks * self.layout.page_size + rows).int()
-        assert indexer_ops._read_op is not None
-        values = indexer_ops._read_op(
+        assert indexer_fp8._read_op is not None
+        values = indexer_fp8._read_op(
             self.banks, records.flatten(), self._layout_args()
         )
         return values.reshape(*records.shape, 128)
@@ -98,8 +98,8 @@ class PackedFP8IndexCacheRows(PagedCacheRows):
         after: torch.Tensor | None = None,
     ) -> None:
         after = values.new_empty((0,)) if after is None else after
-        assert indexer_ops._write_op is not None
-        updated = indexer_ops._write_op(
+        assert indexer_fp8._write_op is not None
+        updated = indexer_fp8._write_op(
             self.banks, slots.int(), values, after, self._layout_args()
         )
         for bank, value in zip(self.banks, updated):
@@ -141,7 +141,7 @@ class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
         kwargs["dtype"] = torch.uint8 if self.packed_fp8 else torch.bfloat16
         super().__init__(*args, **kwargs)
         if self.packed_fp8:
-            indexer_ops.initialize_fp8_indexer()
+            indexer_fp8.initialize_fp8_indexer()
             logger.info_once(
                 "DSV4.1 indexer backend=packed_fp8: transposed FP8 cache, "
                 "BF16 weighted products and rounded head sums; model quality "

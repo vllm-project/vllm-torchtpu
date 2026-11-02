@@ -292,13 +292,15 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         _pad_compacted_records,
         compact_records,
     )
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
-        _compact_selected,
-        _visible_top_k,
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_bf16 import (
         initialize_indexer,
         paged_indexer,
         paged_indexer_jax,
         write_index_keys,
+    )
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select import (
+        _compact_selected,
+        _visible_top_k,
     )
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
         get_vllm_model_wrapper_context,

@@ -75,7 +75,7 @@ def load_kernels(root: Path):
         ),
         namespace,
     )
-    indexer = ast.parse((source / "indexer_impl.py").read_text())
+    indexer = ast.parse((source / "indexer_bf16.py").read_text())
     definitions = [
         node
         for node in indexer.body
@@ -91,7 +91,7 @@ def load_kernels(root: Path):
     exec(
         compile(
             ast.Module(body=definitions, type_ignores=[]),
-            str(source / "indexer_impl.py"),
+            str(source / "indexer_bf16.py"),
             "exec",
         ),
         namespace,

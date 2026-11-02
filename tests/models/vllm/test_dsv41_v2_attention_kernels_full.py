@@ -23,8 +23,11 @@ from jax.sharding import Mesh
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+    attention_kernels,
+    indexer_bf16,
+    indexer_select,
+)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     _attend,
     _attend_window,
@@ -46,19 +49,21 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     sparse_ragged_paged_attention_union_gather,
     unpack_union_rope_words,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
-    _compact_selected,
-    _prefix_count,
-    _sparsecore_top_k,
-    _threshold_top_k,
-    _visible_top_k,
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_bf16 import (
     initialize_indexer,
     paged_index_scores_jax,
     paged_indexer,
     paged_indexer_jax,
     select_indexer_jax,
-    select_indices_jax,
     write_index_keys,
+)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select import (
+    _compact_selected,
+    _prefix_count,
+    _sparsecore_top_k,
+    _threshold_top_k,
+    _visible_top_k,
+    select_indices_jax,
 )
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -1405,7 +1410,7 @@ class TestIndexerKernelsAndSelection:
         scores2048 = jnp.zeros((16, 2048), dtype=jnp.float32)
         lengths = jnp.full((16,), 2048, dtype=jnp.int32)
         with mock.patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl._sparsecore_top_k",
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select._sparsecore_top_k",
             return_value=jnp.zeros((16, 16), dtype=jnp.int32),
         ) as mock_sc:
             out_fast = _visible_top_k(
@@ -1532,7 +1537,7 @@ class TestIndexerKernelsAndSelection:
         scores_2048 = jnp.zeros((4, 2048), dtype=jnp.float32).at[:, :16].set(1.0)
         lengths_2048 = jnp.full((4,), 2048, dtype=jnp.int32)
         with mock.patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl._sparsecore_top_k",
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select._sparsecore_top_k",
             return_value=jnp.broadcast_to(jnp.arange(16, dtype=jnp.int32), (4, 16)),
         ) as mock_sc_sel:
             selected_sc, _ = select_indices_jax(
@@ -1642,13 +1647,13 @@ class TestIndexerKernelsAndSelection:
         )
         with (
             mock.patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl.paged_index_scores_jax",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_bf16.paged_index_scores_jax",
                 side_effect=lambda q, pool, rec, *a, **kw: jnp.zeros(
                     (q.shape[0], rec.shape[1]), dtype=jnp.float32
                 ),
             ),
             mock.patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl._sparsecore_top_k",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select._sparsecore_top_k",
                 return_value=picked_16,
             ) as mock_sc_cand,
         ):
@@ -1679,7 +1684,7 @@ class TestIndexerKernelsAndSelection:
             )
             np.testing.assert_array_equal(
                 np.asarray(sel_cand_sc),
-                np.asarray(indexer_ops._compact_selected(want_sel)),
+                np.asarray(indexer_select._compact_selected(want_sel)),
             )
 
     def test_write_index_keys_then_select(self):
@@ -1729,7 +1734,7 @@ class TestIndexerKernelsAndSelection:
         assert pub.shape == (4, 2)
 
         # 5. select_indexer_2bank_jax
-        sel_2b, pub_2b = indexer_ops.select_indexer_2bank_jax(
+        sel_2b, pub_2b = indexer_bf16.select_indexer_2bank_jax(
             q,
             updated[:32],
             updated[32:],
@@ -1766,7 +1771,7 @@ class TestIndexerKernelsAndSelection:
             mock.patch("torch_tpu._internal.pallas.jax_op", side_effect=mock_jax_op),
         ):
             # Reset
-            indexer_ops._indexer_op = None
+            indexer_bf16._indexer_op = None
             initialize_indexer()
             assert "pallas::dsv41v2_exact_indexer" in captured_fake
             fake_fn = captured_fake["pallas::dsv41v2_exact_indexer"]
@@ -1814,9 +1819,9 @@ class TestIndexerKernelsAndSelection:
             assert f_cands_2b.shape == cands.shape
 
             # Test early return idempotency
-            saved = indexer_ops._indexer_op
+            saved = indexer_bf16._indexer_op
             initialize_indexer()
-            assert indexer_ops._indexer_op is saved
+            assert indexer_bf16._indexer_op is saved
 
         # Test paged_indexer wrapper with batch_max=None and batch_max provided
         mock_idx_op = mock.MagicMock(
@@ -1828,8 +1833,8 @@ class TestIndexerKernelsAndSelection:
                 torch.zeros(4, 2),
             )
         )
-        monkeypatch.setattr(indexer_ops, "_indexer_op", mock_idx_op)
-        monkeypatch.setattr(indexer_ops, "_indexer_2bank_op", mock_idx_2b_op)
+        monkeypatch.setattr(indexer_bf16, "_indexer_op", mock_idx_op)
+        monkeypatch.setattr(indexer_bf16, "_indexer_2bank_op", mock_idx_2b_op)
 
         cache = SimpleNamespace(raw=torch.zeros(64, 64))
         paged_indexer(
@@ -1923,13 +1928,13 @@ def test_paged_indexer_query_tiles_preserve_selection(
         unordered,
     )
     score_rows = []
-    original = indexer_ops.paged_index_scores_jax
+    original = indexer_bf16.paged_index_scores_jax
 
     def record_shape(queries, *args, **kwargs):
         score_rows.append(queries.shape[0])
         return original(queries, *args, **kwargs)
 
-    monkeypatch.setattr(indexer_ops, "paged_index_scores_jax", record_shape)
+    monkeypatch.setattr(indexer_bf16, "paged_index_scores_jax", record_shape)
     actual = jax.jit(
         lambda: paged_indexer_jax(
             q,
@@ -1948,7 +1953,7 @@ def test_paged_indexer_query_tiles_preserve_selection(
     )()
     for result, reference in zip(actual, expected, strict=True):
         np.testing.assert_array_equal(result, reference)
-    assert score_rows and max(score_rows) <= indexer_ops.indexer.QUERY_TILE
+    assert score_rows and max(score_rows) <= indexer_bf16.indexer.QUERY_TILE
 
 
 @pytest.mark.parametrize(
@@ -2014,8 +2019,8 @@ def test_paged_indexer_query_tiles_share_request_keys(
         scores, lengths, candidates, topk, page, mode == "publish", mode == "filter"
     )
     gathered_keys, score_rows = [], []
-    original_gather = indexer_ops.gather_cache_page_words
-    original_score = indexer_ops.paged_index_scores_jax
+    original_gather = indexer_bf16.gather_cache_page_words
+    original_score = indexer_bf16.paged_index_scores_jax
 
     def record_gather(pool, first_records, page_records, dim):
         jax.debug.callback(
@@ -2029,8 +2034,8 @@ def test_paged_indexer_query_tiles_share_request_keys(
         score_rows.append(queries.shape[0])
         return original_score(queries, *args, **kwargs)
 
-    monkeypatch.setattr(indexer_ops, "gather_cache_page_words", record_gather)
-    monkeypatch.setattr(indexer_ops, "paged_index_scores_jax", record_score)
+    monkeypatch.setattr(indexer_bf16, "gather_cache_page_words", record_gather)
+    monkeypatch.setattr(indexer_bf16, "paged_index_scores_jax", record_score)
     actual = jax.jit(
         lambda: paged_indexer_jax(
             q,
@@ -2050,10 +2055,10 @@ def test_paged_indexer_query_tiles_share_request_keys(
     for result, reference in zip(actual, expected, strict=True):
         np.testing.assert_array_equal(result, reference)
     jax.effects_barrier()
-    assert score_rows and max(score_rows) <= indexer_ops.indexer.QUERY_TILE
+    assert score_rows and max(score_rows) <= indexer_bf16.indexer.QUERY_TILE
     if layout != "uneven":
         # One key stream per request, including the final padded request tile.
-        request_tile = indexer_ops.indexer.QUERY_TILE // 8
+        request_tile = indexer_bf16.indexer.QUERY_TILE // 8
         padded_requests = -(-request_count // request_tile) * request_tile
         assert sum(gathered_keys) <= padded_requests * width
 
@@ -2067,7 +2072,7 @@ def test_paged_indexer_context_bucket_preserves_boundary_and_fallback(
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import scatter_index_keys
 
     monkeypatch.setattr(
-        indexer_ops.tuned_block_sizes, "PAGED_INDEXER_PREFILL_BUCKET", (128, 64)
+        indexer_bf16.tuned_block_sizes, "PAGED_INDEXER_PREFILL_BUCKET", (128, 64)
     )
     rng = np.random.default_rng(23)
     rows, width, topk = 129, 256, 16
@@ -2090,13 +2095,13 @@ def test_paged_indexer_context_bucket_preserves_boundary_and_fallback(
         scores, lengths, candidates, topk, 16, False, False, True
     )
     shapes = []
-    original = indexer_ops.paged_index_scores_jax
+    original = indexer_bf16.paged_index_scores_jax
 
     def record_shape(queries, pool, records, *args, **kwargs):
         shapes.append((queries.shape[0], records.shape[1]))
         return original(queries, pool, records, *args, **kwargs)
 
-    monkeypatch.setattr(indexer_ops, "paged_index_scores_jax", record_shape)
+    monkeypatch.setattr(indexer_bf16, "paged_index_scores_jax", record_shape)
     actual = jax.jit(
         lambda: paged_indexer_jax(
             q,
@@ -2390,13 +2395,13 @@ def test_paged_indexer_decode_rows_skip_query_tiles(monkeypatch, banks):
         scores, lengths, candidates, topk, 16, False, False, True
     )
     score_rows = []
-    original = indexer_ops.paged_index_scores_jax
+    original = indexer_bf16.paged_index_scores_jax
 
     def record_shape(queries, *args, **kwargs):
         score_rows.append(queries.shape[0])
         return original(queries, *args, **kwargs)
 
-    monkeypatch.setattr(indexer_ops, "paged_index_scores_jax", record_shape)
+    monkeypatch.setattr(indexer_bf16, "paged_index_scores_jax", record_shape)
     actual = jax.jit(
         lambda: paged_indexer_jax(
             q,
@@ -2415,5 +2420,5 @@ def test_paged_indexer_decode_rows_skip_query_tiles(monkeypatch, banks):
     )()
     for result, reference in zip(actual, expected, strict=True):
         np.testing.assert_array_equal(result, reference)
-    assert rows > indexer_ops.indexer.QUERY_TILE
+    assert rows > indexer_bf16.indexer.QUERY_TILE
     assert score_rows == [rows]
