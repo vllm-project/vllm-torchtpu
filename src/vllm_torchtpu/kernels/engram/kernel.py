@@ -171,11 +171,17 @@ def fused_engram(
                 scale_bytes = pltpu.bitcast(scale_ref[tile, :].T, jnp.uint8).T
                 values = pltpu.bitcast(raw_bytes, jnp.float8_e4m3fn).astype(jnp.float32)
                 block = embedding_block_size
-                powers = jax.lax.bitcast_convert_type(
-                    scale_bytes.astype(jnp.int32) << 23, jnp.float32
+                scale_columns = scale_bytes.astype(jnp.int32).T
+                expanded_scale = (
+                    jnp.broadcast_to(
+                        scale_columns[:, None, :],
+                        (in_features // block, block, vector_m),
+                    )
+                    .reshape(in_features, vector_m)
+                    .T
                 )
-                power = jnp.repeat(powers, block, axis=1)
-                invalid = jnp.repeat(scale_bytes == 255, block, axis=1)
+                power = jax.lax.bitcast_convert_type(expanded_scale << 23, jnp.float32)
+                invalid = expanded_scale == 255
                 embedded = jnp.where(invalid, 0.0, values * power).astype(jnp.bfloat16)
                 quantized, activation_scale = quantize_tensor(embedded, weight.dtype)
                 tile = pl.ds(index * vector_m, vector_m)
