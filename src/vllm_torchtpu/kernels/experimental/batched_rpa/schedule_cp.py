@@ -111,6 +111,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         kv_cache_len,
         kv_new_len,
         end_k_idx,
+        p_offset,
     ) -> schedule.LoopCarry:
         cfgs = self.cfgs
         sched = self.schedule
@@ -132,7 +133,6 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         k_len = kv_cache_len + kv_new_len
         kv_left = k_len - kv_len_start
         kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
-        p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
 
         cp_group_size = cfgs.serve.cp_group_size
         assert cp_group_size is not None
@@ -146,21 +146,22 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                 if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
                     p_idx = kv_p_start + i
                     local_page_i = jnp.minimum(
-                        p_idx // cp_group_size,
-                        cfgs.serve.pages_per_seq - 1,
+                        p_idx // cp_group_size, cfgs.serve.pages_per_seq - 1
                     )
-                    src_hbm_cp = s_idx * cfgs.serve.pages_per_seq + local_page_i
+                    src_hbm_cp = self.page_indices_ref[p_offset + local_page_i]
                     dma_sz = jnp.where(p_idx % cp_group_size == self.rank, dma_sz, 0)
                     sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm_cp
                 else:  # CACHE_ONLY
-                    src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+                    p_idx = jnp.minimum(kv_p_start + i, cfgs.serve.pages_per_seq - 1)
+                    src_hbm = self.page_indices_ref[p_offset + p_idx]
                     sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
                 sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
                 sched.dma_kv_cache[step, target_lane, i, 2] = utils.align_to(
                     dma_sz, cfgs.kv_token_align
                 )
             else:
-                src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+                p_idx = jnp.minimum(kv_p_start + i, cfgs.serve.pages_per_seq - 1)
+                src_hbm = self.page_indices_ref[p_offset + p_idx]
                 sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
                 sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
                 if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
@@ -205,7 +206,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                 p_off = tok_idx & cfgs.serve.page_size_mask
                 dst, lead, wb_val = utils.align_span(p_off, dma_sz, align)
                 dma_entry.wb_hbm[...] = (
-                    (s_idx * cfgs.serve.pages_per_seq + p_idx // cp_group_size)
+                    self.page_indices_ref[p_offset + p_idx // cp_group_size]
                     << cfgs.serve.page_size_log2
                 ) | dst
                 dma_entry.wb_vmem[...] = dst_vmem - lead
@@ -224,7 +225,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                 p_off = tok_idx & cfgs.serve.page_size_mask
                 local_slot = p_idx // cp_group_size
                 dst_hbm = (
-                    (s_idx * cfgs.serve.pages_per_seq + local_slot)
+                    self.page_indices_ref[p_offset + local_slot]
                     << cfgs.serve.page_size_log2
                 ) | p_off
                 wb_val = jnp.where(

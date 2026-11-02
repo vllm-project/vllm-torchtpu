@@ -99,7 +99,9 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
 def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     """Reject configurations the TPU pipeline-parallel path does not serve.
 
-    Raises NotImplementedError naming the unsupported feature.
+    Raises NotImplementedError naming the unsupported feature, and
+    ValueError for a ring hand-off depth below one or deeper than a
+    device's receive flags allow.
     """
     parallel_config = vllm_config.parallel_config
     if parallel_config.pipeline_parallel_size <= 1:
@@ -197,4 +199,24 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     if unsupported is not None:
         raise NotImplementedError(
             f"Pipeline parallelism on TPU does not support {unsupported} yet.{remedy}"
+        )
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.distributed.pp_push import ring_handoff
+
+    if ring_handoff():
+        if envs.TPU_PP_RING_DEPTH < 1:
+            # A stage queues at most this many forwards for the next one; with
+            # none it could hand nothing on.
+            raise ValueError(
+                f"TPU_PP_RING_DEPTH must be at least 1, got {envs.TPU_PP_RING_DEPTH}."
+            )
+        # Counts the activations and, for a model whose layers share a top-k
+        # index table, that table; the ring checks again with the tensors
+        # the model hands on.
+        from vllm_torchtpu.distributed.pp_ring import check_ring_receives
+
+        hf_config = vllm_config.model_config.hf_text_config
+        carried = 2 if getattr(hf_config, "index_topk", None) is not None else 1
+        check_ring_receives(
+            parallel_config.pipeline_parallel_size, envs.TPU_PP_RING_DEPTH, carried
         )

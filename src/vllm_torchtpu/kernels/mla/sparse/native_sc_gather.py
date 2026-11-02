@@ -39,6 +39,7 @@ NUM_LANES = 16
 ROPE_PACKING = 4
 QUADS_PER_ATOM = 16
 OCCURRENCES_PER_ATOM = QUADS_PER_ATOM * ROPE_PACKING
+ROPE_WORDS = 32  # max words per rope token (128B padded view)
 
 
 def _delta_swap(x, y, shift, mask):
@@ -47,6 +48,25 @@ def _delta_swap(x, y, shift, mask):
         jnp.bitwise_xor(x, jnp.left_shift(tmp, shift)),
         jnp.bitwise_xor(y, tmp),
     )
+
+
+def transpose_quad(data: list[Any]) -> list[Any]:
+    """Four tokens' banded words -> four bands of token-interleaved words.
+
+    In: `data[t]` word `w` byte `b` is token `t`'s byte `b * n + w` (the
+    `pack_tokens` banding, `n` words per token: 32 padded, 16 packed). Out:
+    `data[b]` word `w` byte `t` is that same byte, which bitcasts to the
+    four-token uint8 tile the TensorCore consumer reads. Pure jnp, so tests
+    run it on CPU too.
+    """
+    data = list(data)
+    low_16 = jnp.uint32(0x0000FFFF)
+    low_byte_each_half = jnp.uint32(0x00FF00FF)
+    data[0], data[2] = _delta_swap(data[0], data[2], 16, low_16)
+    data[1], data[3] = _delta_swap(data[1], data[3], 16, low_16)
+    data[0], data[1] = _delta_swap(data[0], data[1], 8, low_byte_each_half)
+    data[2], data[3] = _delta_swap(data[2], data[3], 8, low_byte_each_half)
+    return data
 
 
 def _kernel(
@@ -68,6 +88,7 @@ def _kernel(
     serve_pipelined: bool,
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
+    rope_words: int = ROPE_WORDS,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
@@ -124,17 +145,25 @@ def _kernel(
                     input_stream = logical_rank // NUM_LANES
                     input_lane = logical_rank % NUM_LANES
                     data.append(
-                        rope_inputs[input_stream][pl.ds(input_lane, 1), pl.ds(0, 32)]
+                        rope_inputs[input_stream][
+                            pl.ds(input_lane, 1), pl.ds(0, rope_words)
+                        ]
                     )
 
-                low_16 = jnp.uint32(0x0000FFFF)
-                low_byte_each_half = jnp.uint32(0x00FF00FF)
-                data[0], data[2] = _delta_swap(data[0], data[2], 16, low_16)
-                data[1], data[3] = _delta_swap(data[1], data[3], 16, low_16)
-                data[0], data[1] = _delta_swap(data[0], data[1], 8, low_byte_each_half)
-                data[2], data[3] = _delta_swap(data[2], data[3], 8, low_byte_each_half)
+                data = transpose_quad(data)
                 for band in range(ROPE_PACKING):
-                    rope_output[pl.ds(row, 1), pl.ds(band * 32, 32)] = data[band]
+                    rope_output[pl.ds(row, 1), pl.ds(band * rope_words, rope_words)] = (
+                        data[band]
+                    )
+                # Packed rope fills only the first ROPE_PACKING * rope_words
+                # lanes; zero the rest, which the consumer reads as the
+                # (zero-padded) rope tail, as the padded cache stores it.
+                # Garbage there could decode to fp8 NaN, and NaN * 0 poisons
+                # the score against q's zero pad.
+                for band in range(ROPE_PACKING, 128 // rope_words):
+                    rope_output[pl.ds(row, 1), pl.ds(band * rope_words, rope_words)] = (
+                        jnp.zeros((1, rope_words), jnp.uint32)
+                    )
 
             if wait_mode == "overlap_rope":
                 for copy in nope_copies:
@@ -149,7 +178,7 @@ def _kernel(
         )
         rope_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(NUM_LANES), 32),
+                (pl.Indirect(NUM_LANES), rope_words),
                 lambda atom, stream=stream: (values(atom, stream), 0),
             )
             for stream in range(ROPE_PACKING)
@@ -233,10 +262,12 @@ def dsa_gather_native_sc(
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
-    ``nope_cache`` has one 128-word row per token. ``rope_cache`` has one
-    128-word row per group of four tokens; each token owns a consecutive
-    32-word quarter. The returned ROPE is register-transposed into the grouped
-    TensorCore format expected by the shared attention consumer.
+    ``nope_cache`` has one 128-word row per token. ``rope_cache`` packs
+    ``128 // rope_words`` tokens into each 128-word row (e.g. eight 16-word
+    64B tokens or four 32-word 128B tokens), with ``rope_words`` derived from
+    the cache shapes. The returned ROPE is register-transposed into the grouped
+    TensorCore format expected by the shared attention consumer, with any lanes
+    past ``4 * rope_words`` zeroed.
 
     ``num_live_indices`` (traced i32 scalar, optional) gathers only the logical
     batches covering the first ``num_live_indices`` rows; later rows are left
@@ -249,11 +280,31 @@ def dsa_gather_native_sc(
     if nope_cache.dtype != jnp.uint32 or nope_cache.shape[-1] != 128:
         raise ValueError("native-SC NOPE must be explicit uint32[...,128]")
     if rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128:
-        raise ValueError("native-SC ROPE must be quarter-major uint32[...,128]")
+        raise ValueError("native-SC ROPE must be banded uint32[...,128]")
     if indices.dtype != jnp.int32 or indices.ndim != 2:
         raise ValueError("indices must be int32[query, topk]")
     if indices.size != out_size:
         raise ValueError(f"indices has {indices.size} values, expected {out_size}")
+
+    nope_rows_view = nope_cache.reshape(-1, 128)
+    num_tokens = nope_rows_view.shape[0]
+    if num_tokens <= 0 or rope_cache.size % num_tokens != 0:
+        raise ValueError(
+            f"ROPE cache ({rope_cache.size} words) must divide evenly across "
+            f"NOPE tokens ({num_tokens})"
+        )
+    rope_words = rope_cache.size // num_tokens
+    if (
+        rope_words <= 0
+        or rope_words % NUM_LANES != 0
+        or ROPE_PACKING * rope_words > 128
+        or 128 % rope_words != 0
+    ):
+        raise ValueError(
+            f"derived rope_words ({rope_words}) must be a positive multiple of "
+            f"{NUM_LANES} dividing 128 with {ROPE_PACKING} * rope_words <= 128"
+        )
+    rope_rows_view = rope_cache.reshape(-1, rope_words)
 
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core if tpu_info is not None else None
@@ -282,8 +333,8 @@ def dsa_gather_native_sc(
     live = num_live_indices is not None
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
     operands = [
-        nope_cache.reshape(-1, 128),
-        rope_cache.reshape(-1, 32),
+        nope_rows_view,
+        rope_rows_view,
         indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
     ]
     guard_tail = False
@@ -328,6 +379,7 @@ def dsa_gather_native_sc(
         wait_mode=wait_mode,
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
+        rope_words=rope_words,
     )
     if live:
         inner = body
@@ -349,7 +401,7 @@ def dsa_gather_native_sc(
         scratch_types=scratch_types,
         mesh=mesh,
         name=(
-            f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
+            f"sc_native_sc_gather_a{atoms_per_batch}_rw{rope_words}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
         ),
     )(*operands)

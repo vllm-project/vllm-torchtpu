@@ -75,8 +75,8 @@ def fetch_oidc_audience(index_base: str) -> None:
     print(audience)
 
 
-def verify_gcp_oidc_token() -> None:
-    """Read OIDC JWT from stdin, verify Google Cloud issuer,
+def verify_gcp_oidc_token(expected_aud: str) -> None:
+    """Read OIDC JWT from stdin, verify Google Cloud issuer and audience,
     and log structural claims."""
     token = sys.stdin.read().strip()
     payload = token.split(".")[1]
@@ -85,6 +85,11 @@ def verify_gcp_oidc_token() -> None:
         sys.exit(
             f"ERROR: identity token is from {claims.get('iss')!r}, not Google Cloud. "
             "Run this step on a GCE VM agent with a service account."
+        )
+    if claims.get("aud") != expected_aud:
+        sys.exit(
+            f"ERROR: identity token audience is {claims.get('aud')!r}, "
+            f"expected {expected_aud!r}."
         )
     print("Verified GCP OIDC Token Structural Claims (redacted identity):")
     print(

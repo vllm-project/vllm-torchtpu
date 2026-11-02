@@ -51,12 +51,18 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
 
 
-def _make_proposer(draft_tp: int | None = 1, target_tp: int = 1) -> DFlashProposer:
+def _make_proposer(
+    draft_tp: int | None = 1,
+    target_tp: int = 1,
+    target_layer_ids: list[int] | None = None,
+) -> DFlashProposer:
     hf_config_mock = mock.MagicMock()
     hf_config_mock.to_dict.return_value = {
         "dflash_config": {
             "mask_token_id": 0,
-            "target_layer_ids": [1, 2],
+            "target_layer_ids": [1, 2]
+            if target_layer_ids is None
+            else target_layer_ids,
         }
     }
 
@@ -574,6 +580,12 @@ def _make_chunk(
         else None
     )
 
+    if aux_hidden_states is None:
+        num_tokens = max(1, int(position_ids.shape[-1]))
+        aux_hidden_states = [
+            torch.zeros((num_tokens, 32), dtype=torch.float32, device=device)
+        ]
+
     return DraftChunkInputs(
         input_ids=None,
         position_ids=position_ids,
@@ -646,8 +658,13 @@ def test_prepare_dflash_inputs(device):
     )
 
 
-@pytest.mark.tpu_test
-def test_update_draft_kv_cache_from_target_unit(device):
+def test_missing_target_layer_ids():
+    with pytest.raises(ValueError, match="target layer ids"):
+        _make_proposer(target_layer_ids=[])
+
+
+def test_update_draft_kv_cache_from_target_unit():
+    device = torch.device("cpu")
     proposer = _make_proposer(draft_tp=1)
     proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock(
         return_value=(None, [])
@@ -684,12 +701,33 @@ def test_update_draft_kv_cache_from_target_unit(device):
         device=device,
         query_start_loc_np=np.array([0, 3]),
         position_ids=torch.zeros(3),
-        aux_hidden_states=torch.zeros((3, 32), dtype=torch.float32, device=device),
+        aux_hidden_states=[torch.zeros((3, 32), dtype=torch.float32, device=device)],
     )
 
     proposer._update_draft_kv_cache_from_target(chunk)
 
     proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
+
+    # Empty aux_hidden_states is an invalid DFlash runtime state: fail fast
+    # with RuntimeError (rather than IndexError or silently skipping the write
+    # / dropping an EP-DP collective).
+    proposer._tpu_precompute_and_update_kv_cache.reset_mock()
+    empty = _make_chunk(
+        num_reqs=1,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 3]),
+        position_ids=torch.zeros(3),
+        aux_hidden_states=[],
+    )
+    with pytest.raises(RuntimeError, match="aux_hidden_states"):
+        proposer._update_draft_kv_cache_from_target(empty)
+    proposer._tpu_precompute_and_update_kv_cache.assert_not_called()
+
+    # Multi-chunk steps validate every chunk before chunk 0 executes a KV update.
+    with pytest.raises(RuntimeError, match="aux_hidden_states"):
+        proposer._update_context_kv([chunk, empty])
+    proposer._tpu_precompute_and_update_kv_cache.assert_not_called()
 
 
 @pytest.mark.tpu_test
@@ -795,6 +833,7 @@ def test_propose_marks_padding_for_draft_rows():
         SimpleNamespace(
             num_reqs=2,
             start_index=0,
+            aux_hidden_states=[torch.zeros((2, 32))],
             # The live count reaches the builders as a device scalar.
             attn_ctx=SimpleNamespace(
                 request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32)

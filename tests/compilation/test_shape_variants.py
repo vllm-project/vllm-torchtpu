@@ -72,6 +72,13 @@ torch.library.register_fake(
 )
 WAVE = torch.ops.tpu_shape_variants_test.wave
 
+_lib.define("split(Tensor x) -> Tensor")
+_lib.impl("split", lambda x: x + 1.0, "CPU")
+torch.library.register_fake(
+    "tpu_shape_variants_test::split", lambda x: torch.empty_like(x)
+)
+SPLIT = torch.ops.tpu_shape_variants_test.split
+
 
 @support_torch_compile(dynamic_arg_dims={"x": 0})
 class WaveModel(nn.Module):
@@ -81,6 +88,19 @@ class WaveModel(nn.Module):
         super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        waves = (x.shape[0] + 2047) // 2048
+        return torch.cat([WAVE(chunk) for chunk in torch.chunk(x, waves)])
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class SplitWaveModel(nn.Module):
+    """Two subgraphs separated by a fixed split op; the second specializes."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = SPLIT(x + 1.0)
         waves = (x.shape[0] + 2047) // 2048
         return torch.cat([WAVE(chunk) for chunk in torch.chunk(x, waves)])
 
@@ -482,9 +502,14 @@ def test_a_refused_bucket_nobody_retraced_raises(tmp_path):
 
 def test_warmup_scope_survives_a_failure():
     """A failed warmup must not leave the session pinned for the next one."""
-    with pytest.raises(RuntimeError), shape_variants.warmup():
+    with (
+        pytest.raises(RuntimeError),
+        shape_variants.warmup(),
+        shape_variants.trace_only(),
+    ):
         raise RuntimeError("boom")
     assert shape_variants._session is None
+    assert shape_variants._deferred is None
 
 
 def test_a_guard_the_range_cannot_express_still_refuses():
@@ -523,3 +548,147 @@ def test_missing_guard_field_cannot_accept_a_bucket(field):
     delattr(env if field == "guards" else guard, field)
     with pytest.raises(AttributeError, match=field):
         unsupported_reason(env, 2048)
+
+
+def _trace_first_compiles_after_every_trace(cache_root):
+    os.environ.update(
+        TPU_PARALLEL_PRECOMPILE="1",
+        TPU_PRECOMPILE_BIGGEST_FIRST="1",
+        TPU_PRECOMPILE_PEER_REPLAY="0",
+        LOCAL_RANK="0",
+    )
+    buckets = [16, 2048, 4096, 8192]
+    config, backend = prepare(cache_root)
+    config.compilation_config.compile_sizes = buckets
+    vllm_torchtpu._patch_vllm_compile_all_ranges()
+    model = build(TieredModel, config)
+
+    retraces = 0
+    with set_current_vllm_config(config), shape_variants.warmup() as tracked:
+        with shape_variants.trace_only() as deferred:
+            for num_tokens in buckets:
+                if tracked.needs_retrace(num_tokens):
+                    shape_variants.retrace(model, config)
+                    retraces += 1
+                # The warmup forward runs the placeholder: right shape, zeros.
+                out = run(model, config, num_tokens)
+                assert out.shape == (num_tokens, HIDDEN)
+            assert not tracked.refused
+        # Every trace exists before anything compiles.
+        assert retraces == 2
+        assert backend.compiled == []
+        deferred.compile()
+
+    # One compile per bucket, biggest first, each with its own trace's structure.
+    assert backend.compiled == [(8192, 4), (4096, 2), (2048, 1), (16, 1)]
+    CALLS.clear()
+    for num_tokens in buckets:
+        assert run(model, config, num_tokens).shape[0] == num_tokens
+    assert CALLS == [(16, 1), (2048, 1), (4096, 2), (8192, 4)]
+
+
+def test_trace_first_compiles_every_bucket_once_after_all_traces(tmp_path):
+    """TPU_PRECOMPILE_TRACE_FIRST: the same executables as the serial ladder,
+    built in one pass once every bucket group has been traced."""
+    in_child(partial(_trace_first_compiles_after_every_trace, str(tmp_path)))
+
+
+def _trace_first_compiles_every_subgraph_across_traces(cache_root):
+    os.environ.update(
+        TPU_PARALLEL_PRECOMPILE="1",
+        TPU_PRECOMPILE_BIGGEST_FIRST="1",
+        TPU_PRECOMPILE_PEER_REPLAY="0",
+        LOCAL_RANK="0",
+    )
+    config, backend = prepare(
+        cache_root, splitting_ops=["tpu_shape_variants_test::split"]
+    )
+    vllm_torchtpu._patch_vllm_compile_all_ranges()
+    model = build(SplitWaveModel, config)
+
+    retraces = 0
+    with set_current_vllm_config(config), shape_variants.warmup() as tracked:
+        with shape_variants.trace_only() as deferred:
+            for num_tokens in BUCKETS:
+                if tracked.needs_retrace(num_tokens):
+                    shape_variants.retrace(model, config)
+                    retraces += 1
+                out = run(model, config, num_tokens)
+                assert out.shape == (num_tokens, HIDDEN)
+            assert not tracked.refused
+        assert retraces == 1
+        assert backend.compiled == []
+        deferred.compile()
+
+    # Subgraph 0 has 0 waves; subgraph 1 has 1 wave up to 2048 and 2 at 4096.
+    assert backend.compiled == [
+        (4096, 0),
+        (4096, 2),
+        (2048, 0),
+        (2048, 1),
+        (16, 0),
+        (16, 1),
+    ]
+    CALLS.clear()
+    for num_tokens in BUCKETS:
+        assert run(model, config, num_tokens).shape[0] == num_tokens
+    assert CALLS == [(16, 0), (16, 1), (2048, 0), (2048, 1), (4096, 0), (4096, 2)]
+
+    # Repeat session on a fresh model: no stale accepted/refused state carries over.
+    backend.compiled.clear()
+    flat = build(FlatModel, config)
+    with set_current_vllm_config(config), shape_variants.warmup() as tracked:
+        with shape_variants.trace_only() as deferred:
+            for num_tokens in BUCKETS[:2]:
+                run(flat, config, num_tokens)
+            assert not tracked.refused
+        deferred.compile()
+    assert backend.compiled == [(4096, 1), (2048, 1), (16, 1)]
+
+
+def test_trace_first_splits_each_subgraph_across_traces(tmp_path):
+    """DeferredTraces.accepted is keyed by (piecewise_compile_index, size), so
+    splitting_ops subgraphs do not mask one another across or within traces."""
+    in_child(partial(_trace_first_compiles_every_subgraph_across_traces, str(tmp_path)))
+
+
+@pytest.mark.parametrize(
+    "trace_first, parallel, mega_aot, expected_error",
+    [
+        ("1", "0", "0", "TPU_PARALLEL_PRECOMPILE=1"),
+        ("1", "1", "1", "VLLM_USE_MEGA_AOT_ARTIFACT"),
+        ("0", "0", "1", None),
+        ("1", "1", "0", None),
+    ],
+)
+def test_precompile_backbone_trace_first_env_guards(
+    monkeypatch, trace_first, parallel, mega_aot, expected_error
+):
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    monkeypatch.setenv("TPU_PRECOMPILE_TRACE_FIRST", trace_first)
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", parallel)
+    monkeypatch.setenv("VLLM_USE_MEGA_AOT_ARTIFACT", mega_aot)
+    compiled_batches = []
+    monkeypatch.setattr(shape_variants, "_deferred_compiler", compiled_batches.append)
+
+    dummy_runs = []
+    runner = SimpleNamespace(
+        num_tokens_paddings=[16, 32],
+        model=None,
+        vllm_config=None,
+        _pp_wave=None,
+        _backbone_dummy_runs=dummy_runs.append,
+    )
+    if expected_error is not None:
+        with pytest.raises(ValueError, match=expected_error):
+            TPUModelRunner._precompile_backbone(runner)
+        assert dummy_runs == []
+    else:
+        TPUModelRunner._precompile_backbone(runner)
+        if trace_first == "1":
+            assert dummy_runs == [16, 32, 16, 32]
+            assert compiled_batches == [[]]
+        else:
+            assert dummy_runs == [16, 32]
+            assert compiled_batches == []

@@ -41,6 +41,7 @@ from .config import (
     resolved_max_pages_per_seq,
     with_cache,
 )
+from .derive import derive_pool_layout
 from .gather import gather_gdn_states
 from .layout import PoolLayout
 from .pack import (
@@ -75,6 +76,7 @@ __all__ = [
     "can_pool_gather",
     "check_ckpt_bounds",
     "conv_to_raw_page",
+    "derive_pool_layout",
     "gather_gdn_states",
     "kv_to_raw_page",
     "make_pool_backend",

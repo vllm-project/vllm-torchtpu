@@ -54,9 +54,19 @@ creates its own rings, the engine its broadcast ring and every worker its
 reply ring, so the widening is installed in the engine process and, through
 ``widen_message_rings``, in every worker process; the ring size is the
 widest any pipeline in the process asked for.
+
+With ``TPU_PP_HANDOFF=ring`` the stages hand each forward on point to point
+as soon as it is done (``pp_ring``), so no step waits for later ones and
+the engine sends no pushes or settles. The engine keeps
+``ring_extra_steps`` more steps in flight than the pipeline has stages, so
+stage 0's next forward is already queued while the engine core prepares
+the following step, and the rings are widened for that count.
+``patch_executor_for_pp_handoff`` installs the engine side the flag
+selects.
 """
 
 import contextlib
+from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any, cast
 
@@ -216,16 +226,31 @@ def wave_state(executor: Any) -> _WaveState:
     return state
 
 
-def rpc_ring_chunks(stages: int) -> int:
+def ring_extra_steps(stages: int) -> int:
+    """Steps the engine keeps in flight beyond the stage count under the
+    ring.
+
+    Stage 0 is the ring's feed: when the last stage samples a step, the
+    step that refills stage 0 reaches it only after the engine core has
+    updated, scheduled and sent it and the worker has prepared its inputs,
+    and stage 0 sits idle for that time every step. Each extra step queues
+    one more forward on stage 0's device, so that time overlaps a forward.
+    Half the stage count reached the floor on an eight-stage prefill
+    engine; one extra step recovered half of the gain.
+    """
+    return max(1, stages // 2)
+
+
+def rpc_ring_chunks(stages: int, extra: int = 0) -> int:
     """Messages each ring buffer between the engine and its workers must hold.
 
-    The engine keeps up to ``stages`` steps in flight, each of them two
-    calls (execute_model and sample_tokens), so a worker reads a step's
+    The engine keeps up to ``stages + extra`` steps in flight, each of them
+    two calls (execute_model and sample_tokens), so a worker reads a step's
     calls up to that many steps late and, with a KV connector, holds up to
     that many unread replies; a wait adds at most ``stages - 2`` pushes
     or one settle.
     """
-    return 4 * stages + 8
+    return 4 * (stages + extra) + 8
 
 
 # Messages every ring created in this process must hold: the widest any
@@ -233,13 +258,13 @@ def rpc_ring_chunks(stages: int) -> int:
 _ring_chunks_needed = 0
 
 
-def _widen_rpc_ring(stages: int) -> None:
+def _widen_rpc_ring(stages: int, extra: int = 0) -> None:
     """Give every ``MessageQueue`` created from now on, the engine's
     broadcast to its workers and each worker's reply ring, at least
-    ``rpc_ring_chunks(stages)`` messages; a deeper pipeline raises the
-    minimum, a shallower one leaves it."""
+    ``rpc_ring_chunks(stages, extra)`` messages; a deeper pipeline raises
+    the minimum, a shallower one leaves it."""
     global _ring_chunks_needed
-    _ring_chunks_needed = max(_ring_chunks_needed, rpc_ring_chunks(stages))
+    _ring_chunks_needed = max(_ring_chunks_needed, rpc_ring_chunks(stages, extra))
     from vllm.distributed.device_communicators import shm_broadcast
 
     cls = shm_broadcast.MessageQueue
@@ -261,13 +286,132 @@ def widen_message_rings(vllm_config: Any) -> None:
     """Widen the message rings this process will create for a pipeline.
 
     A worker calls it before vLLM builds the worker's reply ring; without a
-    pipeline it does nothing.
+    pipeline it does nothing. Under the ring the rings also hold the extra
+    steps the engine keeps in flight (``ring_extra_steps``), and the
+    worker's config counts them as the engine's does.
     """
     if vllm_config is None:
         return
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages > 1:
-        _widen_rpc_ring(stages)
+        extra = ring_extra_steps(stages) if ring_handoff() else 0
+        _widen_rpc_ring(stages, extra)
+        if extra:
+            _raise_steps_in_flight(extra)
+
+
+def ring_handoff() -> bool:
+    """Whether pipeline stages hand forwards on point to point (``pp_ring``)
+    rather than with the collective wave (``pp_wave``)."""
+    from vllm_torchtpu import envs
+
+    return envs.TPU_PP_HANDOFF == "ring"
+
+
+def _install_take_draft_token_ids(executor_cls: Any) -> None:
+    """Have a pipeline executor's ``take_draft_token_ids`` return None
+    without asking the workers; an executor without a pipeline keeps the
+    class's own method.
+
+    A pipeline admits prefill-only MTP alone (pp_validation): its drafts
+    exist to fill the draft layer's KV, and no step consumes them. The
+    engine asks with a blocking RPC right after dispatching a step, which
+    the last stage answers only once that step is done; under the wave,
+    asking the workers would also deadlock, as a stage can still sit in that
+    step's hand-off, waiting for a push that only a wait on the step's
+    future sends.
+    """
+    if getattr(executor_cls, "_tpu_pp_take_draft_patch", False):
+        return
+    orig = getattr(executor_cls, "take_draft_token_ids", None)
+
+    def take_draft_token_ids(self: Any) -> Any:
+        if int(self.vllm_config.parallel_config.pipeline_parallel_size) > 1:
+            return None
+        return orig(self) if orig is not None else None
+
+    executor_cls.take_draft_token_ids = take_draft_token_ids
+    executor_cls._tpu_pp_take_draft_patch = True
+
+
+def _rides_the_wave(executor: Any) -> bool:
+    """Whether an executor's steps go through the wave: a pipeline whose
+    stages hand off with it. Executors of other depths share the class."""
+    stages = int(executor.vllm_config.parallel_config.pipeline_parallel_size)
+    return stages > 1 and not ring_handoff()
+
+
+def _raise_steps_in_flight(extra: int) -> None:
+    """Have ``VllmConfig.max_concurrent_batches`` count ``extra`` more steps
+    for a pipeline, so the engine keeps that many steps in flight beyond
+    its stages.
+
+    The engine core reads the property when it is built, so this runs from
+    the same places as the executor patch, before it. Pipelines of one
+    stage, and engines with async scheduling, which size the queue for
+    their own overlap, keep vLLM's count. Installed once per process: the
+    first call's ``extra`` stands for every engine the process builds.
+    """
+    from vllm.config import VllmConfig
+
+    if getattr(VllmConfig, "_tpu_pp_extra_steps", None) is not None:
+        return
+    original = cast(property, VllmConfig.max_concurrent_batches)
+    original_fget = cast(Callable[[Any], int], original.fget)
+
+    def max_concurrent_batches(self: Any) -> int:
+        steps = original_fget(self)
+        if (
+            self.parallel_config.pipeline_parallel_size > 1
+            and not self.scheduler_config.async_scheduling
+        ):
+            return steps + extra
+        return steps
+
+    # vLLM declares the property through its getter; pyrefly types the class
+    # attribute as that function.
+    # pyrefly: ignore[bad-assignment]
+    VllmConfig.max_concurrent_batches = property(
+        max_concurrent_batches, doc=original.__doc__
+    )
+    VllmConfig._tpu_pp_extra_steps = extra
+
+
+def patch_executor_for_pp_handoff(vllm_config: Any) -> None:
+    """Install the engine side of the hand-off ``TPU_PP_HANDOFF`` selects."""
+    if ring_handoff():
+        patch_executor_for_pp_ring(vllm_config)
+    else:
+        patch_executor_for_pp_wave(vllm_config)
+
+
+def patch_executor_for_pp_ring(vllm_config: Any) -> None:
+    """Install the ring hand-off's engine side: the extra steps in flight,
+    the wider ring buffers, and draft tokens taken without asking the
+    workers.
+
+    Does nothing without a pipeline; safe to call more than once per
+    process.
+    """
+    if vllm_config is None:
+        return
+    stages = int(vllm_config.parallel_config.pipeline_parallel_size)
+    if stages <= 1:
+        return
+    extra = ring_extra_steps(stages)
+    _widen_rpc_ring(stages, extra)
+    _raise_steps_in_flight(extra)
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+    if getattr(MultiprocExecutor, "_tpu_pp_ring_patch", False):
+        return
+    _install_take_draft_token_ids(MultiprocExecutor)
+    MultiprocExecutor._tpu_pp_ring_patch = True
+    logger.info(
+        "PP ring: engine side installed, %d steps in flight, message ring %d chunks",
+        stages + extra,
+        _ring_chunks_needed,
+    )
 
 
 def patch_executor_for_pp_wave(vllm_config: Any) -> None:
@@ -291,6 +435,8 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     orig_sample = MultiprocExecutor.sample_tokens
 
     def execute_model(self, scheduler_output, non_block=False):
+        if not _rides_the_wave(self):
+            return orig_execute(self, scheduler_output, non_block=non_block)
         state = wave_state(self)
         if scheduler_output.total_num_scheduled_tokens <= 0:
             return orig_execute(self, scheduler_output, non_block=non_block)
@@ -302,6 +448,8 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         return future if non_block else future.result()
 
     def sample_tokens(self, grammar_output, non_block=False):
+        if not _rides_the_wave(self):
+            return orig_sample(self, grammar_output, non_block=non_block)
         state = wave_state(self)
         inner = cast(Future, orig_sample(self, grammar_output, non_block=True))
         # Sampling belongs to the last dispatched step, whatever pushes
@@ -309,18 +457,9 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         future = _PushFuture(inner, self, state, state.last_step, state.real_steps)
         return future if non_block else future.result()
 
-    def take_draft_token_ids(self):
-        # A pipeline admits prefill-only MTP alone (pp_validation): its
-        # drafts exist to fill the draft layer's KV, and no step consumes
-        # them. Asking the workers would also deadlock. The engine asks with
-        # a blocking RPC right after dispatching a step, while a stage can
-        # still sit in that step's hand-off, waiting for a push that only a
-        # wait on the step's future sends.
-        return None
-
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
-    MultiprocExecutor.take_draft_token_ids = take_draft_token_ids
+    _install_take_draft_token_ids(MultiprocExecutor)
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
         "PP wave: engine push and settle installed, message ring %d chunks",

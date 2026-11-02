@@ -14,10 +14,11 @@
 # limitations under the License.
 
 # The report a nightly or release-tag build ends with, once its suites have
-# run: the support matrix for each TPU generation, committed; a failure if any
-# model or feature failed; and, on a main nightly where every model, feature
-# and nightly tests-lane step passed, the vLLM / vllm-torchtpu commit pair
-# recorded as verified.
+# run: the support matrix for each TPU generation, committed (with soft-failed
+# stages still shown as ❌ Failing); a failure if any non-soft_fail model or
+# feature stage failed; and, on a main nightly where every non-soft_fail model
+# or feature stage and every nightly tests-lane step passed, the vLLM /
+# vllm-torchtpu commit pair recorded as verified.
 #
 # Only the scheduled nightly pushes: its schedule sets KUBE_OWNS_NIGHTLY=1, and
 # a manual or validation build with NIGHTLY=1 leaves it unset so it never

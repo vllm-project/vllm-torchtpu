@@ -392,15 +392,12 @@ class PcpSequenceLayoutPlanner:
         target_num_reqs: int,
         padded_num_reqs: int,
     ) -> SequenceLayoutPlan:
-        decision = self.eligibility.evaluate_runner_chunk(
-            input_batch=runner.input_batch,
-            scheduler_output=scheduler_output,
-            start_index=start_index,
-            num_reqs=num_reqs,
-            num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
-            num_tokens_paddings=runner.num_tokens_paddings,
-            max_num_tokens=runner.max_num_tokens,
-            dp_target_bucket=runner._dp_target_bucket,
+        decision = self._decide(
+            runner,
+            scheduler_output,
+            start_index,
+            num_reqs,
+            num_scheduled_tokens_per_req,
         )
         if decision.mode is PcpSequenceLayoutMode.DISABLED:
             return self._all_planner.prepare_real(
@@ -444,6 +441,52 @@ class PcpSequenceLayoutPlanner:
                 prepared.request_major_to_packed_token_indices
             ),
         )
+
+    def _decide(
+        self,
+        runner: Any,
+        scheduler_output: Any,
+        start_index: int,
+        num_reqs: int,
+        num_scheduled_tokens_per_req: np.ndarray,
+    ) -> PcpSequenceLayoutDecision:
+        return self.eligibility.evaluate_runner_chunk(
+            input_batch=runner.input_batch,
+            scheduler_output=scheduler_output,
+            start_index=start_index,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
+            num_tokens_paddings=runner.num_tokens_paddings,
+            max_num_tokens=runner.max_num_tokens,
+            dp_target_bucket=runner._dp_target_bucket,
+        )
+
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+        start_index: int,
+        num_scheduled_tokens_per_req: np.ndarray,
+    ) -> int:
+        """The ``local_padded_num_tokens`` of the plan ``prepare_real``
+        builds for this chunk, computed without staging anything."""
+        decision = self._decide(
+            runner,
+            scheduler_output,
+            start_index,
+            len(num_scheduled_tokens_per_req),
+            num_scheduled_tokens_per_req,
+        )
+        if decision.mode is PcpSequenceLayoutMode.DISABLED:
+            return self._all_planner.padded_num_tokens(
+                runner=runner,
+                scheduler_output=scheduler_output,
+                start_index=start_index,
+                num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
+            )
+        assert decision.local_padded_tokens is not None
+        return int(decision.local_padded_tokens)
 
     def prepare_dummy(
         self,

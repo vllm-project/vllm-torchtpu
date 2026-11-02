@@ -29,6 +29,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
 import torch
+from vllm.lora.layers import LogitsProcessorWithLoRA
 
 from vllm_torchtpu.logger import init_logger
 
@@ -58,7 +59,15 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
     for module in model.modules():
         processor = getattr(module, "logits_processor", None)
         head = getattr(module, "lm_head", None)
-        if hasattr(processor, "get_top_tokens") and hasattr(head, "shard_indices"):
+        # vLLM's LoRA wrappers forward attribute lookups to the layer they
+        # wrap, so checking the instance would find the base layer's
+        # get_top_tokens and drop the wrapper's change to the logits. Checking
+        # the class makes such a wrapper fail here; top_tokens handles the
+        # LoRA one.
+        has_top_tokens = isinstance(processor, LogitsProcessorWithLoRA) or hasattr(
+            type(processor), "get_top_tokens"
+        )
+        if has_top_tokens and hasattr(head, "shard_indices"):
             break
     else:
         raise NotImplementedError(
@@ -86,8 +95,15 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
 def top_tokens(owner: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     """The greedy token of each row, ``[rows, 1]`` int64 like
     ``torch.argmax(logits, dim=-1, keepdim=True)``."""
-    processor = cast("LogitsProcessor", owner.logits_processor)
+    processor = cast(
+        "LogitsProcessor | LogitsProcessorWithLoRA", owner.logits_processor
+    )
     head = cast("VocabParallelEmbedding", owner.lm_head)
+    if isinstance(processor, LogitsProcessorWithLoRA):
+        # The LoRA wrapper has no get_top_tokens, so the call would reach the
+        # base layer and drop the lm_head LoRA delta. Take the argmax of the
+        # wrapper's logits, which include the delta.
+        return torch.argmax(processor(head, hidden_states), dim=-1, keepdim=True)
     tokens = processor.get_top_tokens(head, hidden_states)
     return tokens.to(torch.int64).view(-1, 1)
 

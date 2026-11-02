@@ -254,6 +254,15 @@ class SequenceLayoutPlanner(Protocol):
         padded_num_reqs: int,
     ) -> SequenceLayoutPlan: ...
 
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+        start_index: int,
+        num_scheduled_tokens_per_req: Any,
+    ) -> int: ...
+
     def prepare_dummy(
         self,
         *,
@@ -285,6 +294,18 @@ def _first_ge(paddings: list[int] | tuple[int, ...], value: int) -> int:
             f"max_compile_bucket={paddings[-1] if paddings else None}."
         )
     return int(paddings[index])
+
+
+def _all_padded_num_tokens(runner: Any, total_num_scheduled_tokens: int) -> int:
+    """The token bucket of a chunk every device holds whole, raised to the
+    data-parallel step's bucket."""
+    padded_num_tokens = _first_ge(
+        runner.num_tokens_paddings, int(total_num_scheduled_tokens)
+    )
+    dp_target_bucket = runner._dp_target_bucket
+    if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
+        padded_num_tokens = int(dp_target_bucket)
+    return padded_num_tokens
 
 
 class AllSequenceLayoutPlanner:
@@ -328,12 +349,9 @@ class AllSequenceLayoutPlanner:
             target_num_reqs,
             padded_num_reqs,
         )
-        padded_num_tokens = _first_ge(
-            runner.num_tokens_paddings, int(total_num_scheduled_tokens)
+        padded_num_tokens = _all_padded_num_tokens(
+            runner, int(total_num_scheduled_tokens)
         )
-        dp_target_bucket = runner._dp_target_bucket
-        if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
-            padded_num_tokens = int(dp_target_bucket)
 
         return SequenceLayoutPlan(
             descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -343,6 +361,19 @@ class AllSequenceLayoutPlanner:
             local_num_tokens=int(total_num_scheduled_tokens),
             local_padded_num_tokens=padded_num_tokens,
         )
+
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+        start_index: int,
+        num_scheduled_tokens_per_req: Any,
+    ) -> int:
+        """The ``local_padded_num_tokens`` of the plan ``prepare_real``
+        builds for this chunk, computed without staging anything."""
+        del scheduler_output, start_index
+        return _all_padded_num_tokens(runner, int(num_scheduled_tokens_per_req.sum()))
 
     def prepare_dummy(
         self,

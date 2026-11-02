@@ -44,11 +44,13 @@ gather / scatter kernels see the per-rank values `kh // R`, `vh // R`
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import jax.numpy as jnp
 
+from ..decls import KVCacheDecl, RecurrentCacheDecl
 from ..errors import MegakernelConfigError
 from ..ops import BF16, FP8, rup
 from .config import cache_exec
@@ -257,12 +259,19 @@ class PoolLayout:
             )
         if not self.has_recurrent:
             return
+        rec_hint = (
+            "; per-rank recurrent state exceeds 4 pages, increase tensor-parallel R"
+            if self.rec_pages_per_slot > VALIDATED_REC_PAGES_PER_SLOT
+            else ""
+        )
         _need(
             self.rec_pages_per_slot == VALIDATED_REC_PAGES_PER_SLOT
             and self.conv_pages_per_slot == VALIDATED_CONV_PAGES_PER_SLOT,
             "pool kernels are only validated for "
             f"{VALIDATED_REC_PAGES_PER_SLOT} recurrent + "
-            f"{VALIDATED_CONV_PAGES_PER_SLOT} conv page(s) per slot",
+            f"{VALIDATED_CONV_PAGES_PER_SLOT} conv page(s) per slot "
+            f"(got rec_pages_per_slot={self.rec_pages_per_slot}, "
+            f"conv_pages_per_slot={self.conv_pages_per_slot}{rec_hint})",
         )
         _need(
             self.KD == LANES and self.VD == LANES,
@@ -320,6 +329,29 @@ class PoolLayout:
             not cache_exec(ex).FUSED or rows <= self.conv_page_rows,
             f"fused pool I/O conv window ({rows} rows at T={ex.T}) exceeds one "
             f"conv page ({self.conv_page_rows} rows)",
+        )
+
+    @classmethod
+    def from_cache_decls(
+        cls,
+        decls_or_kv: Sequence[KVCacheDecl | RecurrentCacheDecl | Any | None]
+        | KVCacheDecl
+        | Any,
+        rec_decl: RecurrentCacheDecl | Any | None = None,
+        *,
+        num_pools: int | None = None,
+        slots_per_pool: int | None = None,
+        R: int | None = None,
+    ) -> PoolLayout:
+        """Construct a `PoolLayout` from per-layer `cache_decl()` descriptors."""
+        from .derive import derive_pool_layout
+
+        return derive_pool_layout(
+            decls_or_kv,
+            rec_decl,
+            num_pools=num_pools,
+            slots_per_pool=slots_per_pool,
+            R=R,
         )
 
 

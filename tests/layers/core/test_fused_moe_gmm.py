@@ -1197,3 +1197,185 @@ def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     )
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+def _count_primitive(jaxpr, name: str) -> int:
+    """Occurrences of primitive `name` in `jaxpr`, including nested jaxprs
+    (jnp.argsort is jit-wrapped, so its sort sits one level down)."""
+    count = 0
+    for eqn in jaxpr.eqns:
+        count += eqn.primitive.name == name
+        for param in eqn.params.values():
+            inner = getattr(param, "jaxpr", param)
+            if hasattr(inner, "eqns"):
+                count += _count_primitive(inner, name)
+    return count
+
+
+@pytest.mark.parametrize("routing", ["uniform", "skewed"])
+@pytest.mark.parametrize("skip_padded_tokens", [False, True])
+@pytest.mark.parametrize(
+    ("num_tokens", "use_ep", "use_sparse_core", "threshold", "expected_sorts"),
+    [
+        # Ragged permute keeps its single packed sort so SparseCore gather
+        # async overlap is preserved.
+        (32, True, True, 511, 1),
+        (32, True, True, 512, 0),
+        (32, False, False, 0, 0),
+        # 2,048 rows: last shape inside the single-sort envelope, so the
+        # counting sort still replaces it; only the packed value sort remains.
+        (128, False, False, 0, 1),
+        # 2,560 rows: outside it, the three-sort form is untouched.
+        (160, False, False, 0, 3),
+    ],
+)
+def test_prepare_routed_counting_sort_eliminates_redundant_sorts(
+    monkeypatch,
+    num_tokens,
+    use_ep,
+    use_sparse_core,
+    threshold,
+    expected_sorts,
+    skip_padded_tokens,
+    routing,
+):
+    topk, hidden, local_num_experts = 16, 16, 56
+    k_h, k_idx, k_mask = jax.random.split(jax.random.key(42), 3)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden), dtype=jnp.bfloat16)
+    if routing == "skewed":
+        # Every route lands on one expert, so a single bucket holds all M
+        # rows (512 at 32 tokens, 2,048 at 128): the f32 rank prefixes exceed
+        # 256, where a precision downgrade of the counting sort's einsums
+        # would round them and the positions would stop being a permutation.
+        raw_idx = jnp.full((num_tokens, topk), 3, dtype=jnp.int32)
+    else:
+        raw_idx = jax.random.randint(
+            k_idx,
+            (num_tokens, topk),
+            minval=0,
+            maxval=local_num_experts,
+            dtype=jnp.int32,
+        )
+        # Include duplicate (token, expert) routes (MTP-style) and masked EP routes.
+        raw_idx = raw_idx.at[:, 1].set(raw_idx[:, 0])
+    is_local = jax.random.bernoulli(k_mask, p=0.25, shape=(num_tokens, topk))
+    topk_indices = jnp.where(is_local, raw_idx, -1) if use_ep else raw_idx
+    topk_weights = jnp.linspace(
+        0.01, 0.2, num_tokens * topk, dtype=jnp.bfloat16
+    ).reshape(num_tokens, topk)
+    if skip_padded_tokens:
+        # The last two tokens are padding: zero routing weight drops them.
+        topk_weights = topk_weights.at[-2:].set(0.0)
+
+    # Mock ragged_gather_v2 on non-TPU hosts so EP ragged_permute traces cleanly.
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_v2",
+        lambda hs, idx, _off, _cnt: hs[idx],
+    )
+
+    common = dict(
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=threshold,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    cs_out = prepare_routed_gmm_inputs(
+        hidden_states, topk_indices, topk_weights, **common
+    )
+
+    with monkeypatch.context() as m:
+        m.setattr(fused_moe_gmm, "_COUNTING_SORT_SCATTER_MAX_ROWS", 0)
+        m.setattr(
+            fused_moe_gmm, "_counting_sort_positions", lambda *a, **kw: (None, None)
+        )
+        ref_out = prepare_routed_gmm_inputs(
+            hidden_states, topk_indices, topk_weights, **common
+        )
+
+    for got, want in zip(cs_out, ref_out):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    if routing == "skewed":
+        # Pin the permutation property directly on the rank contraction, not
+        # just through the end-to-end comparison above.
+        flat = topk_indices.reshape(-1)
+        sort_keys = jnp.where(flat >= 0, flat, local_num_experts)
+        positions, counts = fused_moe_gmm._counting_sort_positions(
+            sort_keys, local_num_experts + 1
+        )
+        assert positions is not None and counts is not None
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(positions)), np.arange(sort_keys.shape[0])
+        )
+        assert int(np.asarray(counts).sum()) == sort_keys.shape[0]
+        assert int(np.asarray(counts).max()) > fused_moe_gmm._COUNTING_SORT_BLOCK // 2
+
+    jaxpr = jax.make_jaxpr(
+        lambda h, idx, w: prepare_routed_gmm_inputs(h, idx, w, **common)
+    )(hidden_states, topk_indices, topk_weights)
+    num_sorts = _count_primitive(jaxpr.jaxpr, "sort")
+    assert num_sorts == expected_sorts, (
+        f"Expected {expected_sorts} comparison sort ops, got {num_sorts}"
+    )
+    assert _count_primitive(jaxpr.jaxpr, "cumsum") == 0
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "use_ep", "use_sparse_core", "threshold", "expected_sorts"),
+    [
+        # Non-EP TP and EP one-hot inside the single-sort envelope: with the
+        # counting sort stood down they return to the packed single sort.
+        (32, False, False, 0, 1),
+        (32, True, True, 512, 1),
+        # Ragged permute keeps the counting sort regardless of the knob.
+        (32, True, True, 511, 1),
+    ],
+)
+def test_prepare_routed_counting_sort_env_gate_restores_sorts(
+    monkeypatch, num_tokens, use_ep, use_sparse_core, threshold, expected_sorts
+):
+    topk, hidden, local_num_experts = 16, 16, 56
+    k_h, k_idx, k_mask = jax.random.split(jax.random.key(7), 3)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden), dtype=jnp.bfloat16)
+    raw_idx = jax.random.randint(
+        k_idx, (num_tokens, topk), minval=0, maxval=local_num_experts, dtype=jnp.int32
+    )
+    is_local = jax.random.bernoulli(k_mask, p=0.25, shape=(num_tokens, topk))
+    topk_indices = jnp.where(is_local, raw_idx, -1) if use_ep else raw_idx
+    topk_weights = jnp.linspace(
+        0.01, 0.2, num_tokens * topk, dtype=jnp.bfloat16
+    ).reshape(num_tokens, topk)
+    monkeypatch.setattr(
+        fused_moe_gmm, "ragged_gather_v2", lambda hs, idx, _off, _cnt: hs[idx]
+    )
+    common = dict(
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=threshold,
+        skip_padded_tokens=False,
+    )
+    on_out = prepare_routed_gmm_inputs(
+        hidden_states, topk_indices, topk_weights, **common
+    )
+
+    with monkeypatch.context() as m:
+        m.setattr(fused_moe_gmm, "_COUNTING_SORT", False)
+        m.setattr(fused_moe_gmm, "_SINGLE_SORT", True)
+        off_out = prepare_routed_gmm_inputs(
+            hidden_states, topk_indices, topk_weights, **common
+        )
+        jaxpr = jax.make_jaxpr(
+            lambda h, idx, w: prepare_routed_gmm_inputs(h, idx, w, **common)
+        )(hidden_states, topk_indices, topk_weights)
+
+    for got, want in zip(off_out, on_out):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    num_sorts = _count_primitive(jaxpr.jaxpr, "sort")
+    assert num_sorts == expected_sorts, (
+        f"Expected {expected_sorts} comparison sort ops, got {num_sorts}"
+    )

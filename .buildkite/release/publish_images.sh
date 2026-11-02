@@ -43,18 +43,22 @@ if [[ "${OVERWRITE}" != "yes" ]] && docker manifest inspect "${DEST}:${TAG}" >/d
     die "${DEST}:${TAG} is already on Docker Hub; approve with overwrite to replace it."
 fi
 
-TAGS=(--tag "${DEST}:${TAG}")
-[[ "${MOVE_LATEST}" == "yes" ]] && TAGS+=(--tag "${DEST}:latest")
-echo "--- :docker: Copying ${PROD} to ${TAGS[*]//--tag /}"
+TAGS=("${DEST}:${TAG}")
+[[ "${MOVE_LATEST}" == "yes" ]] && TAGS+=("${DEST}:latest")
+TAG_ARGS=()
+for t in "${TAGS[@]}"; do
+    TAG_ARGS+=(--tag "${t}")
+done
+echo "--- :docker: Copying ${PROD} to ${TAGS[*]}"
 # --prefer-index=false copies the manifest as it is, so the digest on Docker
 # Hub is the staged one.
-docker buildx imagetools create --prefer-index=false "${TAGS[@]}" "${PROD}"
+docker buildx imagetools create --prefer-index=false "${TAG_ARGS[@]}" "${PROD}"
 
 echo "--- :mag: Checking the digest on Docker Hub"
 got="$(docker buildx imagetools inspect "${DEST}:${TAG}" --format '{{json .Manifest}}' \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["digest"])')"
 [[ "${got}" == "$(digest_of "${PROD}")" ]] \
     || die "${DEST}:${TAG} is ${got}, not the staged $(digest_of "${PROD}")."
-buildkite-agent meta-data set release-dockerhub-tags "${TAGS[*]//--tag /}"
+buildkite-agent meta-data set release-dockerhub-tags "${TAGS[*]}"
 buildkite-agent annotate --style success --context release-dockerhub \
     "Published \`${DEST}:${TAG}\`$([[ "${MOVE_LATEST}" == "yes" ]] && echo " and \`:latest\`") = \`${got}\`."
