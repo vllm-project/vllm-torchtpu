@@ -63,6 +63,11 @@ class KernelConfig:
     # Prefill MLA flash tiles (queries x keys per step).
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
+    # Plain decode without attention DP: the smallest batch that token-scatters
+    # rows over the sequence-parallel owners, and the smallest that uses the
+    # routed MoE reduce-scatter (the compiled lists still apply).
+    decode_scatter_from: int = 8
+    decode_routed_reduce_scatter_from: int = 6
     # Attention DP verifies (sequence_rows > 1) also take these plain B64/B128
     # overlaps: "shared128" (shared-expert reduction at 128 rows), "router"
     # (router latent, 128 rows), "dense" (dense scatter rows), "sp8" (SP8

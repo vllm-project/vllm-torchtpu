@@ -99,7 +99,10 @@ def decode_options(batch_size: int) -> dict:
     routed reduce-scatter); the MLA cache tile is the whole batch up to B8, 4
     below B32, 2 from B32."""
     dp = kernel_config.active().attention_dp
-    scatter = dp > 1 or batch_size in (8, 12, 16, 20, 24, 28, 32, 64, 96, 128)
+    scatter_from = kernel_config.active().decode_scatter_from
+    scatter = dp > 1 or (batch_size in (8, 12, 16, 20, 24, 28, 32, 64, 96, 128)
+                         and batch_size >= scatter_from)
+    routed_from = kernel_config.active().decode_routed_reduce_scatter_from
     tile = (
         batch_size
         if batch_size <= 8
@@ -128,7 +131,7 @@ def decode_options(batch_size: int) -> dict:
         "attention_token_scatter": scatter,
         "moe_token_scatter_output": scatter,
         "moe_routed_reduce_scatter": batch_size
-        in (6, 8, 12, 16, 20, 24, 28, 32, 64, 96, 128),
+        in (6, 8, 12, 16, 20, 24, 28, 32, 64, 96, 128) and batch_size >= routed_from,
         "sequence_parallel_pre_attention": scatter,
     }
 
