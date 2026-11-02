@@ -8,7 +8,6 @@ import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu import envs
-
 from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     pooled_qsa_rows_step,
     pooled_qsa_shard_attend_rows_step,
@@ -1217,7 +1216,9 @@ def _shard_merged_blocks(
 
     def mine(x):
         pair = pair_group.all_gather(x.unsqueeze(0).contiguous(), dim=0)
-        return pair.reshape(size, size, part, k)[:, dcp_rank.reshape(())]
+        # index_select keeps the traced graph free of a data-dependent index.
+        pair = pair.reshape(size, size, part, k)
+        return torch.index_select(pair, 1, dcp_rank.reshape(1).long()).squeeze(1)
 
     blocks = merge(mine(vals), mine(pos), block_topk=block_topk)
     gathered = tp_group.all_gather(blocks.unsqueeze(0).contiguous(), dim=0)
