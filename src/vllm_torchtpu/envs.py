@@ -374,12 +374,15 @@ def env_nonnegative_float(env_name: str, default: float) -> Callable[[], float]:
 def env_load_tiers(env_name: str) -> Callable[[], tuple[tuple[int, float], ...]]:
     """``C`` or ``N:C[,N:C...]``: a positive value ``C`` that applies from
     ``N`` requests up (a plain ``C`` means ``0:C``), as ``(N, C)`` pairs sorted
-    by ``N``. Unset, empty or 0 means no tiers; a malformed value raises."""
+    by ``N``. Unset, empty or a plain zero means no tiers; a malformed value
+    raises."""
+    parse_plain = env_nonnegative_float(env_name, 0.0)
 
     def _get_load_tiers_env() -> tuple[tuple[int, float], ...]:
         value = (os.getenv(env_name) or "").strip()
-        if value in ("", "0"):
-            return ()
+        if ":" not in value and "," not in value:
+            plain = parse_plain()
+            return ((0, plain),) if plain else ()
         tiers: dict[int, float] = {}
         for part in value.split(","):
             min_requests, colon, tier_value = part.strip().rpartition(":")

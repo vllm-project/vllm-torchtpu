@@ -296,6 +296,7 @@ def test_spec_warmup_off_spellings(monkeypatch):
         ("12:82, 6:36.5", ((6, 36.5), (12, 82.0))),
         ("", ()),
         ("0", ()),
+        ("0.0", ()),
     ],
 )
 def test_load_tiers_parse_and_sort(monkeypatch, value, expected):
