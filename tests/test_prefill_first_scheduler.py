@@ -642,3 +642,21 @@ def test_no_floor_while_a_prefill_chunk_runs(shared_model_config, monkeypatch):
         {"d": 1, "long": 7},
     ]
     assert slept == []
+
+
+def test_dp_holds_without_sleeping(shared_model_config, monkeypatch):
+    """Under DP the engine core's dummy forward paces held steps."""
+    clock, slept = _sleeping_clock(monkeypatch)
+    scheduler, hasher = _build(
+        shared_model_config,
+        monkeypatch,
+        min_decode_interval_ms=5,
+        data_parallel_size=2,
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    scheduler.schedule()
+    scheduler.schedule()
+    assert scheduler.schedule().num_scheduled_tokens == {}
+    assert slept == []
+    clock.now += 0.005
+    assert scheduler.schedule().num_scheduled_tokens == {"d": 1}

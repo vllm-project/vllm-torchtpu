@@ -1129,17 +1129,25 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
 
 
 @pytest.mark.parametrize(
-    ("over_tokens", "interval_ms", "lb_unit", "initial_cls", "expected_cls"),
+    (
+        "over_tokens",
+        "interval_ms",
+        "lb_unit",
+        "floor_ms",
+        "initial_cls",
+        "expected_cls",
+    ),
     [
-        (0, 0, 0, None, None),
-        (16384, 0, 0, None, "PrefillFirstScheduler"),
-        (0, 40, 0, None, "PrefillFirstScheduler"),
-        (0, 0, 8192, None, "PrefillFirstScheduler"),
-        (16384, 0, 0, "PrefillFirstScheduler", "PrefillFirstScheduler"),
+        (0, 0, 0, 0, None, None),
+        (16384, 0, 0, 0, None, "PrefillFirstScheduler"),
+        (0, 40, 0, 0, None, "PrefillFirstScheduler"),
+        (0, 0, 8192, 0, None, "PrefillFirstScheduler"),
+        (0, 0, 0, 20, None, "PrefillFirstScheduler"),
+        (16384, 0, 0, 0, "PrefillFirstScheduler", "PrefillFirstScheduler"),
     ],
 )
 def test_prefill_first_scheduler_is_installed_by_its_flags(
-    monkeypatch, over_tokens, interval_ms, lb_unit, initial_cls, expected_cls
+    monkeypatch, over_tokens, interval_ms, lb_unit, floor_ms, initial_cls, expected_cls
 ):
     from vllm_torchtpu.core.experimental.prefill_first_scheduler import (
         SCHEDULER_CLS,
@@ -1155,6 +1163,7 @@ def test_prefill_first_scheduler_is_installed_by_its_flags(
     monkeypatch.setattr(
         tpu_platform.envs, "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS", lb_unit
     )
+    monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_MIN_DECODE_INTERVAL_MS", floor_ms)
     vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(scheduler_cls=resolve(initial_cls))
     )
