@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
+    TPU_GEMMA4_SEQUENCE_PARALLEL: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -418,6 +419,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # post-attention norm and router gate on the token shard, and fold the
     # attention partial sum into the MoE all-reduce. Default MoE path only.
     "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
+    # Gemma4 at TP > 1: large token buckets keep the residual stream
+    # token-sharded (reduce-scatter instead of all-reduce, norms on T/tp rows,
+    # FP8 all-gather into the next projection); decode-sized buckets keep the
+    # all-reduces. Not with drafters that read auxiliary hidden states (EAGLE3,
+    # DFlash, DSpark). See models/vllm/gemma4_patch.py.
+    "TPU_GEMMA4_SEQUENCE_PARALLEL": env_bool(
+        "TPU_GEMMA4_SEQUENCE_PARALLEL", default=False
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and
