@@ -229,17 +229,16 @@ _TPU_COMPILE_ENV_IGNORED = {
     # The HBM reserve that feeds block-count sizing comes from
     # kv_transfer_config, not from this variable.
     "TPU_USE_RAIDEN_CONNECTOR",
-    # Pipeline chunk sizing: scheduling and the extra token buckets, which
+    # Selects the pipeline chunk scheduler and the extra token buckets, which
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
-    "TPU_PP_CHUNK_SLACK",
     # Engine-side timing of the pipeline pushes; the workers' programs are
     # the same either way.
     "TPU_PP_LAZY_PUSH",
     # The hand-off between pipeline stages and its depth: it runs outside
     # the compiled forwards, which take the same inputs either way.
     "TPU_PP_HANDOFF",
-    "TPU_PP_RING_DEPTH",
+    "TPU_PP_HANDOFF_DEPTH",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the

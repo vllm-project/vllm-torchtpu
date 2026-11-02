@@ -281,7 +281,7 @@ class TestKVCacheManager:
         self.runner.speculative_config = None
         # No LoRA, so adapter swaps reserve no HBM.
         self.runner.lora_slot_write_hbm_bytes.return_value = 0
-        # No ring hand-off, so no buffers are reserved for it.
+        # No buffered hand-off, so no buffers are reserved for it.
         self.runner.pp_handoff_hbm_reserve_bytes.return_value = 0
         self.runner.post_profile_hbm_reserves = (
             TPUModelRunner.post_profile_hbm_reserves.__get__(self.runner)

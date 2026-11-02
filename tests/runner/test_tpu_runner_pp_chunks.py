@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Timed prefill-shaped dummy runs behind the pipeline chunk scheduler."""
+"""Runner side of the pipeline chunk scheduler: chunk buckets, chunk limits
+and the batched attention kernel's schedule capacity."""
 
 import contextlib
 import importlib
@@ -22,7 +23,6 @@ import numpy as np
 import pytest
 import torch
 from vllm.config import CacheConfig
-from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
@@ -33,7 +33,7 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 _harness = importlib.import_module("test_pcp_runner_integration")
 
 
-def _profile_run(monkeypatch, runner, num_tokens, prefix, first_stage=True):
+def _plain_dummy_run(monkeypatch, runner, num_tokens):
     _harness._fake_tpu_events(monkeypatch)
     seen = {}
 
@@ -50,39 +50,24 @@ def _profile_run(monkeypatch, runner, num_tokens, prefix, first_stage=True):
     )
     monkeypatch.setattr(
         "vllm_torchtpu.runner.tpu_runner.synchronize_tensors",
-        lambda tensors=None, **_kwargs: seen.setdefault("synced", []).append(tensors),
+        lambda tensors=None, **_kwargs: None,
     )
     runner.maybe_select_dummy_loras = lambda *_args, **_kwargs: contextlib.nullcontext()
-    runner._pp_is_first = first_stage
-    runner.vocab_size = 1000
-    runner._profile_inputs = {}
-    runner._profile_input = TPUModelRunner._profile_input.__get__(runner)
-    runner._pp_intermediate_template = {
-        "hidden_states": ((4,), torch.float32),
-        "residual": ((4,), torch.float32),
-    }
-    runner._pp_intermediate_tensors = TPUModelRunner._pp_intermediate_tensors.__get__(
-        runner
-    )
+    runner._pp_is_first = True
 
     def forward(input_ids, positions, inputs_embeds, intermediate_tensors):
         seen["input_ids"] = input_ids
-        seen["intermediate"] = intermediate_tensors
-        rows = positions.shape[-1]
-        if first_stage:
-            return torch.zeros((rows, 4)), None
-        return IntermediateTensors({"hidden_states": torch.zeros((rows, 4))}), None
+        return torch.zeros((positions.shape[-1], 4)), None
 
     runner.forward_model = MagicMock(side_effect=forward)
-    elapsed = TPUModelRunner._dummy_run(
+    result = TPUModelRunner._dummy_run(
         runner,
         num_tokens,
         runner.num_reqs_max_model_len,
         runner.input_batch.block_table[0].max_num_blocks_per_req,
         use_max_model_len=True,
-        profile_prefix=prefix,
     )
-    return elapsed, seen["metadata"]["layer.0"], seen
+    return result, seen["metadata"]["layer.0"], seen
 
 
 def _runner(max_model_len=4096):
@@ -99,54 +84,20 @@ def _runner(max_model_len=4096):
     return runner
 
 
-def test_profile_run_is_one_prefill_request_behind_the_prefix(monkeypatch):
-    elapsed, md, seen = _profile_run(monkeypatch, _runner(), 256, 512)
-
-    assert isinstance(elapsed, float) and elapsed >= 0.0
-    assert md.query_start_loc.tolist() == [0] + [256] * 8
-    assert md.seq_lens.tolist() == [768] + [1] * 7
-    assert md.request_distribution.tolist() == [0, 0, 1]
-    # Token ids vary so rows route on their own.
-    assert len(set(seen["input_ids"].tolist())) > 1
-
-
-def test_profile_run_marks_every_row_valid(monkeypatch):
+def test_plain_dummy_run_keeps_the_decode_shape_and_returns_none(monkeypatch):
     runner = _runner()
     runner._token_padding_state = SimpleNamespace(
         update=MagicMock(), local_padding_mask=torch.zeros(256)
     )
-    _profile_run(monkeypatch, runner, 256, 0)
-    runner._token_padding_state.update.assert_called_once_with(256, 256)
-    _profile_run(monkeypatch, runner, 256, None)
-    runner._token_padding_state.update.assert_called_with(0, 256)
+    result, md, seen = _plain_dummy_run(monkeypatch, runner, 256)
 
-
-def test_profile_run_splits_a_bucket_longer_than_the_model(monkeypatch):
-    elapsed, md, _ = _profile_run(monkeypatch, _runner(max_model_len=100), 256, 0)
-    assert isinstance(elapsed, float)
-    assert md.query_start_loc.tolist() == [0, 100, 200, 256] + [256] * 5
-    assert md.seq_lens.tolist() == [100, 100, 56] + [1] * 5
-    assert md.request_distribution.tolist() == [0, 0, 3]
-
-
-def test_profile_run_on_a_later_stage_times_random_hidden_states(monkeypatch):
-    elapsed, _, seen = _profile_run(monkeypatch, _runner(), 256, 512, first_stage=False)
-    assert isinstance(elapsed, float) and elapsed >= 0.0
-    hidden = seen["intermediate"]["hidden_states"]
-    assert hidden.shape == (256, 4) and hidden.abs().sum() > 0
-    # Inputs are materialized before the clock starts; the hand-off output
-    # is synchronized after the forward.
-    assert [len(t) for t in seen["synced"]] == [3, 1]
-
-
-def test_plain_dummy_run_keeps_the_decode_shape_and_returns_nothing(monkeypatch):
-    elapsed, md, seen = _profile_run(monkeypatch, _runner(), 256, None)
-
-    assert elapsed is None
+    assert result is None
     assert md.query_start_loc.tolist() == list(range(9))
     assert md.seq_lens.tolist() == [1] * 8
     assert md.request_distribution.tolist() == [8, 8, 8]
     assert seen["input_ids"].abs().sum() == 0
+    # Every row of a dummy step is padding.
+    runner._token_padding_state.update.assert_called_once_with(0, 256)
 
 
 def _bucket_runner(paddings, block_size, mamba_layers, mode, pp=8, cls=None, pcp=1):
@@ -316,99 +267,39 @@ def test_chunk_buckets_are_skipped_without_dynamic_chunks():
     assert runner.num_tokens_paddings == [16, 16384]
 
 
-def test_profile_pipeline_chunks_times_every_point_twice_and_keeps_faster():
+def _limits_runner(max_tokens, capacity, pcp=1):
     runner = MagicMock(spec=TPUModelRunner)
-    runner.num_tokens_paddings = [16, 4096, 8192, 16384]
-    runner.max_num_tokens = 16384
-    runner.max_model_len = 65536
-    runner.num_reqs_max_model_len = 8
-    runner.max_num_blocks_per_req = 16
-    runner._pp_chunk_granularity = 2048
-    runner.parallel_config = SimpleNamespace(prefill_context_parallel_size=1)
-    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=16384)
-    calls = []
-
-    def dummy_run(tokens, num_reqs, num_blocks, use_max_model_len, profile_prefix):
-        calls.append((tokens, profile_prefix))
-        return 100.0 - (len(calls) % 2 == 0)
-
-    runner._dummy_run = dummy_run
-    runner._attention_schedule_capacity = lambda: None
-    report = TPUModelRunner.profile_pipeline_chunks(runner)
-
-    points = [(t, p) for t, p, _ in report["samples"]]
-    assert points == [
-        (16, 0),
-        (4096, 0),
-        (4096, 16384),
-        (4096, 32768),
-        (8192, 0),
-        (8192, 16384),
-        (8192, 32768),
-        (16384, 0),
-        (16384, 16384),
-        (16384, 32768),
-    ]
-    assert calls == [p for p in points for _ in range(2)]
-    assert report["samples"][0][:2] == (16, 0)
-    # The faster of the two runs is kept.
-    assert report["samples"][0][2] == 99.0
-    assert report["granularity"] == 2048
-    assert report["schedule"] is None
-
-
-def _profile_runner(paddings, max_tokens, capacity, pcp=1):
-    runner = MagicMock(spec=TPUModelRunner)
-    runner.num_tokens_paddings = paddings
     runner.max_num_tokens = max_tokens
     runner.parallel_config = SimpleNamespace(prefill_context_parallel_size=pcp)
-    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=max_tokens * pcp)
-    runner.max_model_len = 262144
-    runner.num_reqs_max_model_len = 64
-    runner.max_num_blocks_per_req = 64
     runner._pp_chunk_granularity = max_tokens // 8
-    runner._dummy_run = lambda *args, **kwargs: 1.0
     runner._attention_schedule_capacity = lambda: capacity
     return runner
 
 
-def test_profile_skips_points_past_the_schedule_capacity():
+def test_chunk_limits_report_the_granularity_and_the_mixed_schedule():
     capacity = {"decode": (3912, 1, 1792), "mixed": (13436, 256, 256)}
-    runner = _profile_runner([16, 8192, 16384, 32768], 32768, capacity)
-    report = TPUModelRunner.profile_pipeline_chunks(runner)
-    points = [(t, p) for t, p, _ in report["samples"]]
-    # 16K behind 32K needs 10,272 pairs of 256x256 tiles; behind 64K it
-    # needs 18,464, and any 32K chunk behind a prefix needs more.
-    assert points == [
-        (16, 0),
-        (8192, 0),
-        (8192, 32768),
-        (8192, 65536),
-        (16384, 0),
-        (16384, 32768),
-        (32768, 0),
-    ]
-    assert report["schedule"] == (13436, 256, 256)
+    runner = _limits_runner(16384, capacity)
+    report = TPUModelRunner.pipeline_chunk_limits(runner)
+    assert report == {"granularity": 2048, "schedule": (13436, 256, 256)}
+    # Without the batched kernel there is no schedule to bound.
+    runner = _limits_runner(16384, None)
+    report = TPUModelRunner.pipeline_chunk_limits(runner)
+    assert report == {"granularity": 2048, "schedule": None}
 
 
-def test_profile_reports_step_tokens_under_context_parallelism():
-    """A bucket counts one rank's rows, the scheduler counts tokens: a bucket
-    of 4096 rows on each of two ranks is a step of 8192 tokens."""
-    runner = _profile_runner([512, 4096, 8192], 8192, None, pcp=2)
-    # The largest bucket is a spare: two ranks of 8192 rows exceed the step.
-    runner.scheduler_config.max_num_batched_tokens = 8192
-    calls = []
-    runner._dummy_run = lambda tokens, *args, **kwargs: calls.append(tokens) or 1.0
-    report = TPUModelRunner.profile_pipeline_chunks(runner)
-    assert sorted(set(calls)) == [512, 4096]
-    assert sorted({t for t, _, _ in report["samples"]}) == [1024, 8192]
+def test_chunk_limits_report_step_tokens_under_context_parallelism():
+    """A bucket counts one rank's rows, the scheduler counts tokens: a
+    granule of 1024 rows on each of two ranks is 2048 tokens."""
+    runner = _limits_runner(8192, None, pcp=2)
+    report = TPUModelRunner.pipeline_chunk_limits(runner)
+    assert report["granularity"] == 2048
 
 
-def test_profile_refuses_a_step_one_request_cannot_run():
+def test_chunk_limits_refuse_a_step_one_request_cannot_run():
     capacity = {"decode": (3912, 1, 1792), "mixed": (13436, 256, 256)}
-    runner = _profile_runner([16, 32768, 65536], 65536, capacity)
+    runner = _limits_runner(65536, capacity)
     with pytest.raises(RuntimeError, match="32896 .* holds 13436"):
-        TPUModelRunner.profile_pipeline_chunks(runner)
+        TPUModelRunner.pipeline_chunk_limits(runner)
 
 
 def _capacity_runner():

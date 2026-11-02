@@ -318,7 +318,7 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     worker.vllm_config = SimpleNamespace(kv_transfer_config=None)
     worker.devices = []
     worker.model_runner = MagicMock(is_pooling_model=False)
-    # No KV connector, no LoRA and no ring hand-off, so nothing is reserved.
+    # No KV connector, no LoRA and no buffered hand-off, so nothing is reserved.
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
         kv_connector=0, lora_slot_write=0, pp_handoff=0
     )
@@ -368,7 +368,7 @@ def test_determine_available_memory_leaves_room_for_lora_slot_write(monkeypatch)
 
 
 def test_determine_available_memory_reserves_the_pp_hand_off_buffers(monkeypatch):
-    """The ring hand-off allocates its buffers after profile_run, so the KV
+    """The buffered hand-off allocates its buffers after profile_run, so the KV
     cache leaves room for them."""
     worker = _ep_dp_worker(
         monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0

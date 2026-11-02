@@ -527,7 +527,7 @@ class TPUWorker(WorkerBase):
         # Some KV connectors allocate HBM AFTER profile_run completes — e.g.,
         # an offload spec with a host<->device transfer staging buffer, or a
         # P/D disagg connector with NCCL receive buffers. An adapter swap
-        # holds HBM only while it runs, and the pipeline ring hand-off
+        # holds HBM only while it runs, and the buffered pipeline hand-off
         # allocates its buffers after profile_run too. vLLM's normal
         # accounting misses those bytes, so subtract them from the KV-cache
         # budget.
@@ -636,11 +636,11 @@ class TPUWorker(WorkerBase):
     def pp_drains_before_handoff(self) -> bool:
         """Whether this worker's stage drains the slice before each hand-off
         launch."""
-        wave = self.model_runner._pp_wave
-        return bool(getattr(wave, "drain_before_handoff", False))
+        handoff = self.model_runner._pp_handoff
+        return bool(getattr(handoff, "drain_before_handoff", False))
 
-    def profile_pipeline_chunks(self) -> dict:
-        return self.model_runner.profile_pipeline_chunks()
+    def pipeline_chunk_limits(self) -> dict:
+        return self.model_runner.pipeline_chunk_limits()
 
     def take_draft_token_ids(self):
         return self.model_runner.take_draft_token_ids()

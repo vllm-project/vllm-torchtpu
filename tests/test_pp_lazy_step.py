@@ -79,8 +79,9 @@ class _Socket:
 
 
 def _executor(monkeypatch, stages=4):
-    """A MultiprocExecutor stand-in with the push and the lazy-push patches;
-    replies are read from the last stage's socket in call order."""
+    """A MultiprocExecutor stand-in with the push and the lazy-push patches
+    under the lockstep hand-off; replies are read from the last stage's
+    socket in call order."""
     from vllm.v1.executor import multiproc_executor
 
     class _Reply(Future):
@@ -153,15 +154,15 @@ def _executor(monkeypatch, stages=4):
             )
 
     monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", _Executor)
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
     pp_push.patch_executor_for_pp_wave(_config(stages))
     pp_lazy_step._patch_collective_rpc()
     return _Executor()
 
 
 class _Scheduler:
-    def __init__(self, *steps, estimate_ms=125.0):
+    def __init__(self, *steps):
         self.steps = deque(steps)
-        self.estimate_ms = estimate_ms
         self.grammar_compile_error_reqs = set()
         self.idle = False
         self.schedules = 0
@@ -175,9 +176,6 @@ class _Scheduler:
 
     def get_grammar_bitmask(self, scheduler_output):
         return None
-
-    def step_estimate_ms(self, scheduler_output):
-        return self.estimate_ms
 
     def update_from_output(self, scheduler_output, model_output):
         return {0: scheduler_output}
@@ -206,11 +204,13 @@ class _Core:
         pass
 
 
-def _stepper(monkeypatch, *steps, estimate_ms=125.0):
+def _stepper(monkeypatch, *steps, measured=0.125):
     executor = _executor(monkeypatch)
-    scheduler = _Scheduler(*steps, estimate_ms=estimate_ms)
+    scheduler = _Scheduler(*steps)
     stepper = pp_lazy_step.LazyPushStepper(_Core(executor, scheduler))
     stepper.wave.lazy = True
+    # The forward time measured before these steps, in seconds.
+    stepper.measured = measured
     return stepper, executor, scheduler
 
 
@@ -283,7 +283,7 @@ def test_a_lone_step_is_pushed_when_stage_0_would_idle(monkeypatch, clock):
     clock.now = 64.65625
     executor.socket.arrived = 1
     assert stepper.step() == ({0: step}, False)
-    assert stepper.ratio == 1.0625
+    assert stepper.measured == 0.1328125
     # nothing with tokens is in flight any more: the burst settles
     assert executor.calls[-1] == "pp_settle" and not stepper.wave.open
 
@@ -298,7 +298,7 @@ def test_a_measurement_counts_within_a_band_of_the_estimate(monkeypatch, clock):
     clock.now = 70.5
     executor.socket.arrived = 1
     stepper.step()
-    assert stepper.ratio == 1.25
+    assert stepper.measured == 0.15625
 
 
 def test_a_long_burst_keeps_only_the_newest_slots(monkeypatch, clock):
@@ -413,7 +413,7 @@ def test_a_blocking_call_settles_and_reads_every_step(monkeypatch, clock):
     assert stepper.step()[0] is not None
     assert stepper.step()[0] is not None
     assert not stepper.in_flight and "pp_push" not in executor.calls
-    assert stepper.ratio == 1.0
+    assert stepper.measured == 0.125
 
 
 def test_executors_without_lazy_pushes_call_through(monkeypatch):
@@ -455,7 +455,7 @@ def test_a_new_burst_counts_its_steps_from_zero(monkeypatch, clock):
     assert stepper.step()[0] == {0: first}
     assert executor.calls[-1] == "pp_settle"
     # replies read together measure nothing
-    assert stepper.ratio == 1.0
+    assert stepper.measured == 0.125
     clock.now = 65.0
     scheduler.steps.append(_output(4096))
     stepper.step()
@@ -463,10 +463,8 @@ def test_a_new_burst_counts_its_steps_from_zero(monkeypatch, clock):
     assert stepper.slots[0].dispatched == 65.0
 
 
-def test_without_the_cost_model_the_measured_forward_is_expected(monkeypatch, clock):
-    stepper, executor, scheduler = _stepper(
-        monkeypatch, _output(4096), estimate_ms=None
-    )
+def test_the_measured_forward_is_expected(monkeypatch, clock):
+    stepper, executor, scheduler = _stepper(monkeypatch, _output(4096), measured=0.0)
     # nothing measured yet: the push goes out at once
     stepper.step()
     assert executor.calls == ["execute_model", "sample_tokens", "pp_push"]
@@ -556,7 +554,7 @@ def test_the_patch_needs_the_flag_and_more_than_two_stages(monkeypatch):
     assert not hasattr(FakeCore, "_tpu_pp_lazy_patch")
 
 
-def test_the_ring_hand_off_never_installs_the_lazy_loop(monkeypatch):
+def test_the_buffered_hand_off_never_installs_the_lazy_loop(monkeypatch):
     from vllm.v1.engine import core as engine_core
 
     class FakeCore:
@@ -570,14 +568,14 @@ def test_the_ring_hand_off_never_installs_the_lazy_loop(monkeypatch):
     )
     monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
     monkeypatch.setattr(pp_lazy_step.envs, "TPU_PP_LAZY_PUSH", True)
-    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+    monkeypatch.setenv("TPU_PP_HANDOFF", "buffered")
     pp_lazy_step.patch_engine_core_for_lazy_push(_config(4))
     assert not hasattr(FakeCore, "_tpu_pp_lazy_patch")
     # the flag the user set is reported, not dropped
     assert warnings == [
         (
             "PP lazy push is off: the stages hand off point to point "
-            "(TPU_PP_HANDOFF=ring).",
+            "(TPU_PP_HANDOFF=buffered).",
         )
     ]
 

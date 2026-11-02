@@ -23,7 +23,7 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
 from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
 from vllm_torchtpu.core.pp_chunks import chunk_buckets, chunk_granularity
-from vllm_torchtpu.distributed.pp_ring import PPRing, hbm_reserve_bytes
+from vllm_torchtpu.distributed.pp_buffered import PPBuffered, hbm_reserve_bytes
 from vllm_torchtpu.distributed.pp_wave import PPWave
 from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
 from vllm_torchtpu.runner import tpu_runner
@@ -225,7 +225,7 @@ class TestHandOffConstruction:
         runner = SimpleNamespace(
             _add_pipeline_chunk_buckets=lambda: None,
             parallel_config=SimpleNamespace(pipeline_parallel_size=4),
-            _pp_wave=None,
+            _pp_handoff=None,
             _pp_intermediate_template=None,
             _pp_topk_buffer=None,
             max_num_tokens=64,
@@ -253,23 +253,33 @@ class TestHandOffConstruction:
             def warmup(self):
                 built.append("warmup")
 
-        monkeypatch.setattr(tpu_runner, "PPRing", type("PPRing", (Fake,), {}))
+        monkeypatch.setattr(tpu_runner, "PPBuffered", type("PPBuffered", (Fake,), {}))
         monkeypatch.setattr(tpu_runner, "PPWave", type("PPWave", (Fake,), {}))
         return built
 
-    def test_the_ring_flag_builds_the_ring_with_its_depth(self, monkeypatch, built):
-        monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
-        monkeypatch.setenv("TPU_PP_RING_DEPTH", "3")
+    def test_the_buffered_flag_builds_it_with_its_depth(self, monkeypatch, built):
+        monkeypatch.setenv("TPU_PP_HANDOFF", "buffered")
+        monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "3")
         runner = self._runner()
 
         TPUModelRunner.capture_model(runner)
 
         device = torch.device("cpu")
-        assert built == [("PPRing", (device, 64, TEMPLATE), {"depth": 3}), "warmup"]
-        assert type(runner._pp_wave).__name__ == "PPRing"
+        assert built == [("PPBuffered", (device, 64, TEMPLATE), {"depth": 3}), "warmup"]
+        assert type(runner._pp_handoff).__name__ == "PPBuffered"
 
-    def test_the_default_builds_the_wave(self, monkeypatch, built):
+    def test_the_default_builds_the_buffered_handoff(self, monkeypatch, built):
         monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+        monkeypatch.delenv("TPU_PP_HANDOFF_DEPTH", raising=False)
+        runner = self._runner()
+
+        TPUModelRunner.capture_model(runner)
+
+        device = torch.device("cpu")
+        assert built == [("PPBuffered", (device, 64, TEMPLATE), {"depth": 2}), "warmup"]
+
+    def test_the_lockstep_flag_builds_the_wave(self, monkeypatch, built):
+        monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
         runner = self._runner()
 
         TPUModelRunner.capture_model(runner)
@@ -277,14 +287,14 @@ class TestHandOffConstruction:
         device = torch.device("cpu")
         assert built == [("PPWave", (device, 64, TEMPLATE), {}), "warmup"]
 
-    def test_only_the_ring_reserves_memory_for_its_buffers(self, monkeypatch):
-        monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
-        monkeypatch.setenv("TPU_PP_RING_DEPTH", "3")
+    def test_only_the_buffered_handoff_reserves_memory(self, monkeypatch):
+        monkeypatch.setenv("TPU_PP_HANDOFF", "buffered")
+        monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "3")
         runner = self._runner()
 
         reserve = TPUModelRunner.pp_handoff_hbm_reserve_bytes(runner)
 
-        # sized before capture_model builds the ring, from the same template;
+        # sized before capture_model builds the hand-off, from the same template;
         # the zero residuals count every token bucket
         assert runner._pp_intermediate_template is TEMPLATE
         assert reserve == hbm_reserve_bytes(64, TEMPLATE, 3, 8 + 16 + 32 + 64) > 0
@@ -299,14 +309,14 @@ class TestHandOffConstruction:
             hbm_reserve_bytes(64, TEMPLATE, 3, 8 + 16 + 32 + 64 + chunk_rows)
         )
         runner.vllm_config = None
-        monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
+        monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
         assert TPUModelRunner.pp_handoff_hbm_reserve_bytes(runner) == 0
-        monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+        monkeypatch.setenv("TPU_PP_HANDOFF", "buffered")
         runner.parallel_config.pipeline_parallel_size = 1
         assert TPUModelRunner.pp_handoff_hbm_reserve_bytes(runner) == 0
 
 
-class TestRingForwardRows:
+class TestBufferedForwardRows:
     def _runner(self, scheduled, *, max_reqs=8, most_model_len=None, most_reqs=None):
         req_ids = [f"r{i}" for i in range(len(scheduled))]
         runner = SimpleNamespace(
@@ -353,10 +363,10 @@ class _Stop(Exception):
     pass
 
 
-class TestRingStepPosting:
+class TestBufferedStepPosting:
     """execute_model posts a step's receives before preparing any forward."""
 
-    def _run(self, wave, *, first=False, tokens=37):
+    def _run(self, handoff, *, first=False, tokens=37):
         def stop():
             raise _Stop
 
@@ -369,7 +379,7 @@ class TestRingStepPosting:
             _count_input_chunks=lambda _so: (2, 1),
             _any_decode=lambda _so: False,
             _dp_coordinated_step=lambda *_a, **_kw: (None, 2),
-            _pp_wave=wave,
+            _pp_handoff=handoff,
             _pp_is_first=first,
             _pp_forward_rows=lambda _so: [32, 16],
             supports_mm_inputs=False,
@@ -389,33 +399,33 @@ class TestRingStepPosting:
         return None
 
     def test_a_later_stage_posts_every_forward_of_the_step(self):
-        ring = MagicMock(spec=PPRing)
-        self._run(ring)
-        ring.begin_step.assert_called_once_with([32, 16])
+        handoff = MagicMock(spec=PPBuffered)
+        self._run(handoff)
+        handoff.begin_step.assert_called_once_with([32, 16])
 
     def test_the_first_stage_posts_nothing(self):
-        ring = MagicMock(spec=PPRing)
-        self._run(ring, first=True)
-        ring.begin_step.assert_not_called()
+        handoff = MagicMock(spec=PPBuffered)
+        self._run(handoff, first=True)
+        handoff.begin_step.assert_not_called()
 
     def test_a_step_without_tokens_posts_nothing(self):
-        ring = MagicMock(spec=PPRing)
-        assert self._run(ring, tokens=0) is EMPTY_MODEL_RUNNER_OUTPUT
-        ring.begin_step.assert_not_called()
+        handoff = MagicMock(spec=PPBuffered)
+        assert self._run(handoff, tokens=0) is EMPTY_MODEL_RUNNER_OUTPUT
+        handoff.begin_step.assert_not_called()
 
     def test_the_wave_has_no_step_to_begin(self):
-        # The wave has no begin_step: reaching for it would raise.
+        # The lockstep hand-off has no begin_step: reaching for it would raise.
         wave = MagicMock(spec=PPWave)
         self._run(wave)
         assert wave.step.call_count == 1
 
 
-class TestRingPushAndSettle:
+class TestBufferedPushAndSettle:
     def test_push_and_settle_hand_nothing_on(self, monkeypatch):
         from vllm.distributed import parallel_state
 
         def no_transfer(*args, **kwargs):
-            raise AssertionError("the ring transferred something")
+            raise AssertionError("the hand-off transferred something")
 
         monkeypatch.setattr(torch.distributed, "isend", no_transfer)
         monkeypatch.setattr(torch.distributed, "irecv", no_transfer)
@@ -424,8 +434,8 @@ class TestRingPushAndSettle:
             "get_pp_group",
             lambda: SimpleNamespace(rank_in_group=1, world_size=4, ranks=[0, 1, 2, 3]),
         )
-        ring = PPRing(torch.device("cpu"), 64, TEMPLATE)
-        runner = _runner(_pp_wave=ring)
+        handoff = PPBuffered(torch.device("cpu"), 64, TEMPLATE)
+        runner = _runner(_pp_handoff=handoff)
         for name in ("pp_push", "pp_settle"):
             getattr(TPUModelRunner, name)(runner)
-        assert ring.transfers == 0 and not ring._sends
+        assert handoff.transfers == 0 and not handoff._sends

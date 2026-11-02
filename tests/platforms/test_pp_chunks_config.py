@@ -34,10 +34,9 @@ def _config(dp=1, cls=None, chunked=True):
     )
 
 
-def _env(monkeypatch, dynamic=True, dp_sched=False, slack=0.1):
+def _env(monkeypatch, dynamic=True, dp_sched=False):
     monkeypatch.setattr(tpu_platform.envs, "TPU_PP_DYNAMIC_CHUNKS", dynamic)
     monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", dp_sched)
-    monkeypatch.setattr(tpu_platform.envs, "TPU_PP_CHUNK_SLACK", slack)
 
 
 def _configure(config):
@@ -94,13 +93,6 @@ def test_custom_scheduler_logs_configured_scheduler_when_dp_sched_env_set(
     assert "the DP scheduler is enabled" not in caplog.text
 
 
-def test_negative_slack_fails_at_config_time(monkeypatch):
-    _env(monkeypatch, slack=-0.5)
-    with pytest.raises(ValueError, match="TPU_PP_CHUNK_SLACK"):
-        _configure(_config())
-
-
 def test_pipeline_knobs_do_not_change_the_compile_cache_key():
     assert "TPU_PP_DYNAMIC_CHUNKS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
-    assert "TPU_PP_CHUNK_SLACK" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     assert "TPU_PP_LAZY_PUSH" in tpu_compiler._TPU_COMPILE_ENV_IGNORED

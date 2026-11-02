@@ -107,10 +107,9 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
-    TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_LAZY_PUSH: bool = False
-    TPU_PP_HANDOFF: str = "wave"
-    TPU_PP_RING_DEPTH: int = 2
+    TPU_PP_HANDOFF: str = "buffered"
+    TPU_PP_HANDOFF_DEPTH: int = 2
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -823,24 +822,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Add linear token buckets above a quarter of the token budget, for
     # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
     "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
-    # Pipeline parallelism: size prefill chunks by a per-step time budget
-    # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
+    # Pipeline parallelism: spread a lone prompt's prefill over the stages
+    # in smaller chunks (core/pp_chunks.py). 0 keeps token budgets.
     "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
-    # Fraction above the time of a full prefix-free step that a step may
-    # take before its chunks are shortened.
-    "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
-    # Pipeline parallelism over more than two stages: the engine core pushes
-    # the pipeline only when stage 0 would otherwise idle and drops empty
-    # steps, so requests share the pipeline (core/pp_lazy_step.py).
+    # Pipeline parallelism over more than two stages, lockstep hand-off only
+    # and deprecated with it: the engine core pushes the pipeline only when
+    # stage 0 would otherwise idle and drops empty steps, so requests share
+    # the pipeline (core/pp_lazy_step.py).
     "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
-    # How pipeline stages hand activations on: "wave" runs one collective
-    # launch on every stage per forward (distributed/pp_wave.py), "ring"
-    # sends each forward's output point to point (distributed/pp_ring.py).
-    # Goes once the ring replaces the wave.
-    "TPU_PP_HANDOFF": env_with_choices("TPU_PP_HANDOFF", "wave", ["wave", "ring"]),
-    # With TPU_PP_HANDOFF=ring: the forwards a stage may queue for sending
+    # How pipeline stages hand activations on: "buffered" sends each
+    # forward's output point to point (distributed/pp_buffered.py),
+    # "lockstep" runs one collective launch on every stage per forward
+    # (distributed/pp_wave.py). Lockstep is deprecated.
+    "TPU_PP_HANDOFF": env_with_choices(
+        "TPU_PP_HANDOFF", "buffered", ["buffered", "lockstep"]
+    ),
+    # With TPU_PP_HANDOFF=buffered: the forwards a stage may queue for sending
     # to the next stage before end_forward waits for room.
-    "TPU_PP_RING_DEPTH": env_int("TPU_PP_RING_DEPTH", 2),
+    "TPU_PP_HANDOFF_DEPTH": env_int("TPU_PP_HANDOFF_DEPTH", 2),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
