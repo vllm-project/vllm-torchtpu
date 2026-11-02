@@ -363,6 +363,8 @@ def expert_ffn_blockscale(
     qb=QB4,
     act_fn="silu",
     w1b=None,
+    after_gate_up=None,
+    after_down_dot=None,
     logical_intermediate_size=None,
 ):
     """One expert's FFN on block-scaled weights: the same body as
@@ -413,6 +415,8 @@ def expert_ffn_blockscale(
                     DN,
                     preferred_element_type=jnp.float32,
                 )
+                if down and after_down_dot is not None and b == 0:
+                    after_down_dot(n_start // FP4_OUTPUT_CHUNK)
                 part = part * scales[b : (b + 1), n_start:n_end]
                 acc = part if acc is None else acc + part
             assert acc is not None
@@ -420,6 +424,8 @@ def expert_ffn_blockscale(
         return jnp.concatenate(chunks, axis=-1)
 
     acc1 = contract(act_q, w1_block, w1s_blocks, n_blocks1, 2 * inter)
+    if after_gate_up is not None:
+        after_gate_up()
     mid_q, mid_scale = _intermediate_rows(
         acc1,
         act_scale,
@@ -826,10 +832,56 @@ def _build_fused_ep_moe_kernel(
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
     push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
+    interleave_inputs = (
+        rhs_packed4
+        and not push_from_vmem
+        and tile_m == 128
+        and hidden >= 4096
+        and host.TOKEN_GATHER_TILES_PER_WINDOW == 1
+    )
+    input_slots = 3 if interleave_inputs else OUT_PARITIES
+    tile_plan_capacity = ragged_rows_alloc // tile_m + g_local + 3
     ls_window_rows = host.act_scale_window_rows(tile_m)
     gather_tiles = host.TOKEN_GATHER_TILES_PER_WINDOW
     gather_payload_rows = gather_tiles * tile_m
     gather_window_rows = host.token_gather_window_rows(tile_m)
+    declared_vmem_arrays = host.vmem_scratch_arrays(
+        g_local,
+        capacity,
+        hidden,
+        inter,
+        nbuf=nbuf,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        has_w1_bias=has_w1_bias,
+        has_w2_bias=has_w2_bias,
+        pad_scale_rows=pad_scale_rows,
+    )
+    if interleave_inputs:
+        info = pltpu.get_tpu_info()
+        original_arrays = declared_vmem_arrays
+        declared_vmem_arrays = [
+            (
+                name,
+                (input_slots,) + shape[1:] if name in ("lhs_vm", "ls_vm") else shape,
+                dtype,
+            )
+            for name, shape, dtype in original_arrays
+        ]
+        old_scratch = sum(
+            host.array_vmem_bytes(shape, dtype, info)
+            for _, shape, dtype in original_arrays
+        )
+        new_scratch = sum(
+            host.array_vmem_bytes(shape, dtype, info)
+            for _, shape, dtype in declared_vmem_arrays
+        )
+        unrefined_budget = slots.vmem_bytes + new_scratch - old_scratch
+        if unrefined_budget > slots.limit:
+            raise ValueError(
+                f"three input slots need {unrefined_budget} conservative VMEM bytes, "
+                f"limit {slots.limit}; weight nbuf remains {nbuf}"
+            )
 
     def kernel(*refs):
         it = iter(refs)
@@ -922,10 +974,17 @@ def _build_fused_ep_moe_kernel(
         # for their row geometry, which the send waits count bytes against.
         contrib_hbm = next(it)
         cscl_hbm = next(it)
-        # Two independent refs (rather than a leading slot dimension) let the
-        # scalar core branch once per activation tile and then use static SMEM
-        # indexing for all of that tile's token rows.
-        token_gather_sm0, token_gather_sm1 = (next(it) for _ in range(2))
+        # Legacy builds use separate refs. The continuous input stream uses
+        # two indexed SMEM windows plus a separate flat tile plan.
+        if interleave_inputs:
+            token_gather_sm = next(it)
+            tile_plan_sm = next(it)
+            token_gather_sm0 = token_gather_sm.at[pl.ds(0, gather_window_rows)]
+            token_gather_sm1 = token_gather_sm.at[
+                pl.ds(gather_window_rows, gather_window_rows)
+            ]
+        else:
+            token_gather_sm0, token_gather_sm1 = (next(it) for _ in range(2))
         # In vmem_scratch_arrays order, which is what the scratch list is
         # built from: staging, weights, scale tables where they exist, the
         # bias tables each build asked for, the activation row scale where
@@ -937,8 +996,15 @@ def _build_fused_ep_moe_kernel(
         w2b_vm = next(it) if has_w2_bias else None
         ls_vm = next(it) if has_act_scale else None
         out_vm = next(it)
-        oscl_vm = next(it)  # [parities, tile blocks, ROWBLK] f32
-        token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
+        oscl_vm = next(it)  # [parities, 1, capacity] f32
+        if interleave_inputs:
+            token_gather_sems = next(it)
+            token_gather_sem0, token_gather_sem1 = (
+                token_gather_sems.at[0],
+                token_gather_sems.at[1],
+            )
+        else:
+            token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
         lhs_sems, w1_sems, w2_sems = (next(it) for _ in range(3))
         w1s_sems = next(it) if has_scales else None
         w2s_sems = next(it) if has_scales else None
@@ -1182,6 +1248,16 @@ def _build_fused_ep_moe_kernel(
             """Start one fixed token-index window in SMEM slot ``slot``."""
             dma_base, _ = gather_dma_coords(logical_base)
 
+            if interleave_inputs:
+                pltpu.make_async_copy(
+                    token_gather_hbm.at[pl.ds(dma_base, gather_window_rows)],
+                    token_gather_sm.at[
+                        pl.ds(slot * gather_window_rows, gather_window_rows)
+                    ],
+                    token_gather_sems.at[slot],
+                ).start(priority=0)
+                return
+
             @pl.when(slot == 0)
             def _():
                 pltpu.make_async_copy(
@@ -1201,6 +1277,16 @@ def _build_fused_ep_moe_kernel(
         def wait_gather_window(logical_base, slot):
             """Wait for the fixed token-index window in ``slot``."""
             dma_base, _ = gather_dma_coords(logical_base)
+
+            if interleave_inputs:
+                pltpu.make_async_copy(
+                    token_gather_hbm.at[pl.ds(dma_base, gather_window_rows)],
+                    token_gather_sm.at[
+                        pl.ds(slot * gather_window_rows, gather_window_rows)
+                    ],
+                    token_gather_sems.at[slot],
+                ).wait()
+                return
 
             @pl.when(slot == 0)
             def _():
@@ -1225,7 +1311,12 @@ def _build_fused_ep_moe_kernel(
                 def issue_block(i, _):
                     """Fetch eight token rows of block i by their numbers."""
                     for r in range(ROWBLK):
-                        token = gather_smem[gather_offset + i * ROWBLK + r]
+                        source_row = i * ROWBLK + r
+                        if interleave_inputs:
+                            source_row = jnp.minimum(
+                                source_row, live_blocks * ROWBLK - 1
+                            )
+                        token = gather_smem[gather_offset + source_row]
                         pltpu.make_async_copy(
                             lhs_hbm.at[token],
                             lhs_vm.at[slot, i * ROWBLK + r],
@@ -1233,7 +1324,12 @@ def _build_fused_ep_moe_kernel(
                         ).start()
                     return _
 
-                lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
+                lax.fori_loop(
+                    0,
+                    tile_blocks if interleave_inputs else live_blocks,
+                    issue_block,
+                    jnp.int32(0),
+                )
 
             @pl.when(gather_slot == 0)
             def _():
@@ -1566,6 +1662,9 @@ def _build_fused_ep_moe_kernel(
                 live_blocks = live_rows // ROWBLK
                 tile_block_base = t * tile_blocks  # expert-local block base
                 parity = lax.rem(tile_count, jnp.int32(OUT_PARITIES))
+                input_slot = (
+                    tile_plan_sm[(tile_count) * 3 + 2] if interleave_inputs else parity
+                )
 
                 # out_vm[parity] reuse guard. Predicated on the outstanding
                 # count rather than on the tile count, because the drain
@@ -1583,57 +1682,105 @@ def _build_fused_ep_moe_kernel(
                     def _():
                         wait_commits(parity, pending)
 
-                # Wait this tile's stream, then issue tile t+1's into the other
-                # slot before compute, so the fetch runs under the MXU window.
-                lhs_ready_tile(live_rows, parity)
+                # Consume the current input. The three-slot stream issues i+2
+                # during down; the legacy path below issues i+1 at tile head.
+                lhs_ready_tile(tile_m if interleave_inputs else live_rows, input_slot)
                 other_parity = jnp.int32(1) - parity
 
-                @pl.when(t + 1 < n_tiles)
-                def _():
-                    next_t = t + 1
-                    next_group = next_t // gather_tiles
-                    next_within = lax.rem(next_t, jnp.int32(gather_tiles))
-                    next_group_slot = lax.rem(wslot + next_group, jnp.int32(2))
-                    next_group_base = slab_base + next_group * gather_payload_rows
-
-                    # The next group's window was issued when the previous
-                    # group became current. Wait only at the boundary, then
-                    # reuse the retired slot for the following group before
-                    # issuing this activation tile.
-                    @pl.when(next_within == 0)
-                    def _():
-                        wait_gather_window(next_group_base, next_group_slot)
-                        following = next_group + 1
-
-                        @pl.when(following * gather_tiles < n_tiles)
-                        def _():
-                            issue_gather_window(
-                                slab_base + following * gather_payload_rows,
-                                jnp.int32(1) - next_group_slot,
-                            )
-
-                    _, next_shift = gather_dma_coords(next_group_base)
-                    next_rows = jnp.minimum(rows - next_t * tile_m, tile_m)
-                    lhs_issue_tile(
-                        slab_base + next_t * tile_m,
-                        next_rows // ROWBLK,
-                        other_parity,
-                        next_group_slot,
-                        next_shift + next_within * tile_m,
-                    )
-
-                # The penultimate tile has issued the last tile's rows, so
-                # neither needs the retired index window again.
-                @pl.when(jnp.logical_and(t + 2 == n_tiles, visit_i + 1 < n_visit))
-                def _():
+                if interleave_inputs:
+                    next_index = tile_count + 2
+                    ahead_index = tile_count + 3
+                    copy_base = tile_plan_sm[(next_index) * 3 + 0]
+                    copy_rows = tile_plan_sm[(next_index) * 3 + 1]
+                    copy_slot = parity
+                    copy_input_slot = tile_plan_sm[(next_index) * 3 + 2]
+                    _, copy_offset = gather_dma_coords(copy_base)
                     issue_gather_window(
-                        expert_base_sm[visit_sm[visit_i + 1]], next_wslot
+                        tile_plan_sm[(ahead_index) * 3 + 0], other_parity
                     )
+                else:
+
+                    @pl.when(t + 1 < n_tiles)
+                    def _():
+                        next_t = t + 1
+                        next_group = next_t // gather_tiles
+                        next_within = lax.rem(next_t, jnp.int32(gather_tiles))
+                        next_group_slot = lax.rem(wslot + next_group, jnp.int32(2))
+                        next_group_base = slab_base + next_group * gather_payload_rows
+
+                        # The next group's window was issued when the previous
+                        # group became current. Wait only at the boundary, then
+                        # reuse the retired slot for the following group before
+                        # issuing this activation tile.
+                        @pl.when(next_within == 0)
+                        def _():
+                            wait_gather_window(next_group_base, next_group_slot)
+                            following = next_group + 1
+
+                            @pl.when(following * gather_tiles < n_tiles)
+                            def _():
+                                issue_gather_window(
+                                    slab_base + following * gather_payload_rows,
+                                    jnp.int32(1) - next_group_slot,
+                                )
+
+                        _, next_shift = gather_dma_coords(next_group_base)
+                        next_rows = jnp.minimum(rows - next_t * tile_m, tile_m)
+                        lhs_issue_tile(
+                            slab_base + next_t * tile_m,
+                            next_rows // ROWBLK,
+                            other_parity,
+                            next_group_slot,
+                            next_shift + next_within * tile_m,
+                        )
+
+                    # The penultimate tile retires this index window; the
+                    # next expert is primed before the final tile's compute.
+                    @pl.when(jnp.logical_and(t + 2 == n_tiles, visit_i + 1 < n_visit))
+                    def _():
+                        issue_gather_window(
+                            expert_base_sm[visit_sm[visit_i + 1]], next_wslot
+                        )
+
+                def wait_next_input_index():
+                    wait_gather_window(copy_base, copy_slot)
+
+                def issue_input_chunk(column):
+                    # Static slices, no runtime branch/fori_loop in the DMA path.
+                    # Source groups occupy the first tile_m // 16 columns. Final LLO
+                    # must confirm their issue positions and available runway.
+                    if column < tile_m // 16:
+                        for r in range(16):
+                            dst_row = column * 16 + r
+                            src_row = jnp.minimum(jnp.int32(dst_row), copy_rows - 1)
+                            token = token_gather_sm[
+                                copy_slot * gather_window_rows + copy_offset + src_row
+                            ]
+                            pltpu.make_async_copy(
+                                lhs_hbm.at[token],
+                                lhs_vm.at[copy_input_slot, dst_row],
+                                lhs_sems.at[copy_input_slot],
+                            ).start()
+                        if column == 0 and has_act_scale:
+                            pltpu.make_async_copy(
+                                ls_hbm.at[
+                                    pl.ds(
+                                        copy_base // HIDDEN_LANE_BLOCK, ls_window_rows
+                                    )
+                                ],
+                                ls_vm.at[copy_input_slot],
+                                lhs_sems.at[copy_input_slot],
+                            ).start()
 
                 # The alternate activation slot has retired its previous tile.
                 # Fill the next expert's first tile before this final FFN so
                 # its token rows and row scales travel under current compute.
-                @pl.when(jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit))
+                @pl.when(
+                    jnp.logical_and(
+                        jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit),
+                        jnp.bool_(not interleave_inputs),
+                    )
+                )
                 def _():
                     nxt = visit_sm[visit_i + 1]
                     prime_expert(
@@ -1649,10 +1796,14 @@ def _build_fused_ep_moe_kernel(
                     """
                     full = height == tile_m
                     act_rows = (
-                        lhs_vm[parity] if full else lhs_vm[parity, pl.ds(0, height)]
+                        lhs_vm[input_slot]
+                        if full
+                        else lhs_vm[input_slot, pl.ds(0, height)]
                     ).reshape(height, hidden)
                     act_scales = (
-                        _tile_row_scales(cast(jax.Ref, ls_vm)[parity], row_base, height)
+                        _tile_row_scales(
+                            cast(jax.Ref, ls_vm)[input_slot], row_base, height
+                        )
                         if has_act_scale
                         else None
                     )
@@ -1696,6 +1847,12 @@ def _build_fused_ep_moe_kernel(
                             qb=rhs_qb,
                             act_fn=act_fn,
                             w1b=w1b_row,
+                            after_gate_up=(
+                                wait_next_input_index if interleave_inputs else None
+                            ),
+                            after_down_dot=(
+                                issue_input_chunk if interleave_inputs else None
+                            ),
                             logical_intermediate_size=(
                                 effective_inter if trim_gate_up_padding else None
                             ),
@@ -1863,11 +2020,68 @@ def _build_fused_ep_moe_kernel(
             for p in range(host.OUT_PARITIES):
                 wait_shipped(p, carried[1 + p], carried[3 + p])
 
-        @pl.when(n_visit > 0)
-        def _():
-            prime_expert(
-                visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False), jnp.int32(0)
-            )
+        if interleave_inputs:
+
+            def build_tile_plan():
+                def add_expert(v, cursor):
+                    expert = visit_sm[v]
+                    count_rows = expert_rows_sm[expert]
+                    base_row = expert_base_sm[expert]
+                    count_tiles = -(-count_rows // tile_m)
+
+                    def add_tile(t, unused):
+                        tile_plan_sm[(cursor + t) * 3 + 0] = base_row + t * tile_m
+                        tile_plan_sm[(cursor + t) * 3 + 1] = jnp.minimum(
+                            count_rows - t * tile_m, tile_m
+                        )
+                        tile_plan_sm[(cursor + t) * 3 + 2] = lax.rem(
+                            cursor + t, jnp.int32(input_slots)
+                        )
+                        return unused
+
+                    lax.fori_loop(0, count_tiles, add_tile, jnp.int32(0))
+                    return cursor + count_tiles
+
+                return lax.fori_loop(0, n_visit, add_expert, jnp.int32(0))
+
+            total_tiles = build_tile_plan()
+
+            @pl.when(total_tiles > 0)
+            def prime_input_stream():
+                last_base, last_rows = (
+                    tile_plan_sm[(total_tiles - 1) * 3 + 0],
+                    tile_plan_sm[(total_tiles - 1) * 3 + 1],
+                )
+                for j in range(3):
+                    tile_plan_sm[(total_tiles + j) * 3 + 0] = last_base
+                    tile_plan_sm[(total_tiles + j) * 3 + 1] = last_rows
+                    tile_plan_sm[(total_tiles + j) * 3 + 2] = lax.rem(
+                        total_tiles + j, jnp.int32(input_slots)
+                    )
+                for j in range(2):
+                    base_row = tile_plan_sm[(j) * 3 + 0]
+                    issue_gather_window(base_row, jnp.int32(j))
+                    wait_gather_window(base_row, jnp.int32(j))
+                    _, offset = gather_dma_coords(base_row)
+                    lhs_issue_tile(
+                        base_row,
+                        tile_plan_sm[(j) * 3 + 1] // ROWBLK,
+                        jnp.int32(j),
+                        jnp.int32(j),
+                        offset,
+                    )
+                issue_gather_window(tile_plan_sm[(2) * 3 + 0], jnp.int32(0))
+        else:
+
+            @pl.when(n_visit > 0)
+            def _():
+                prime_expert(
+                    visit_sm[0],
+                    jnp.int32(0),
+                    jnp.int32(0),
+                    jnp.bool_(False),
+                    jnp.int32(0),
+                )
 
         def push_expert(e):
             """Push expert e's remote regions and hop its own-dest region."""
@@ -1974,6 +2188,17 @@ def _build_fused_ep_moe_kernel(
             _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
 
         drain_transport()
+        if interleave_inputs:
+
+            @pl.when(n_visit > 0)
+            def drain_last_input():
+                for j in range(2):
+                    lhs_ready_tile(tile_m, tile_plan_sm[(total_tiles + j) * 3 + 2])
+                wait_gather_window(
+                    tile_plan_sm[(total_tiles + 2) * 3 + 0],
+                    lax.rem(carry_end[0], jnp.int32(2)),
+                )
+
         _all_pairs_barrier(ep)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
@@ -1983,33 +2208,33 @@ def _build_fused_ep_moe_kernel(
     # ls_vm where the activations are quantized, out_vm, oscl_vm.
     scratch = (
         [
-            # Two independent scalar-memory windows keep dynamic slot selection
-            # out of the per-token loop. Their total is fixed at 5 KiB for the
-            # 128-row, four-tile schedule, regardless of request size.
-            pltpu.SMEM((gather_window_rows,), jnp.int32),
-            pltpu.SMEM((gather_window_rows,), jnp.int32),
+            # Window size follows host.TOKEN_GATHER_TILES_PER_WINDOW.
+            # Input3 uses two views of one allocation plus a flat tile plan.
+            *(
+                [
+                    pltpu.SMEM((2 * gather_window_rows,), jnp.int32),
+                    pltpu.SMEM((tile_plan_capacity * 3,), jnp.int32),
+                ]
+                if interleave_inputs
+                else [
+                    pltpu.SMEM((gather_window_rows,), jnp.int32),
+                    pltpu.SMEM((gather_window_rows,), jnp.int32),
+                ]
+            ),
         ]
+        + [pltpu.VMEM(shape, dtype) for _, shape, dtype in declared_vmem_arrays]
         + [
-            pltpu.VMEM(shape, dtype)
-            for _, shape, dtype in host.vmem_scratch_arrays(
-                g_local,
-                capacity,
-                hidden,
-                inter,
-                nbuf=nbuf,
-                weight_format=weight_format,
-                rhs_qb=rhs_qb,
-                has_w1_bias=has_w1_bias,
-                has_w2_bias=has_w2_bias,
-                pad_scale_rows=pad_scale_rows,
-            )
-        ]
-        + [
-            pltpu.SemaphoreType.DMA,  # token_gather_sem0
-            pltpu.SemaphoreType.DMA,  # token_gather_sem1
-            # lhs_sems. Parity-deep, not nbuf-deep: every index into it, and into
-            # the lhs_vm and ls_vm buffers it guards, is an out-parity.
-            pltpu.SemaphoreType.DMA((OUT_PARITIES,)),
+            *(
+                [pltpu.SemaphoreType.DMA((2,))]
+                if interleave_inputs
+                else [
+                    pltpu.SemaphoreType.DMA,
+                    pltpu.SemaphoreType.DMA,
+                ]
+            ),  # two gather semaphores, unified or independent
+            # Input DMA semaphores follow input_slots (three for i+2),
+            # independently of output parities and weight nbuf.
+            pltpu.SemaphoreType.DMA((input_slots,)),
             pltpu.SemaphoreType.DMA((nbuf,)),  # w1_sems
             pltpu.SemaphoreType.DMA((nbuf,)),  # w2_sems
         ]
@@ -2104,6 +2329,8 @@ def _build_fused_ep_moe_kernel(
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
+            f"{'_i3' if interleave_inputs else ''}"
+            f"{'_li' + str(effective_inter) + 'gud' if trim_gate_up_padding else ''}"
         )
         return pl.pallas_call(
             kernel,
