@@ -4597,6 +4597,28 @@ def gathered_prefix_pages(pool, ids, local, tables, axis_name, *, count, capacit
     return pages, order
 
 
+def cp_prefix_meta(mesh, pool, ids, local, *, segments, capacity):
+    """The ``(counts, order)`` of a window's ``CpPrefix`` (see
+    ``gathered_prefix_pages``), replicated: every MLA layer of the window
+    shares them, so they can be computed once and carried on the arena.
+    ``pool`` (any of the window's pools) gives the page size; ``ids``/
+    ``local`` are the global ``[32, 1 + P]`` / ``[32, 2 * segments]``."""
+    page_tokens = pool.shape[-3] * pool.shape[-2]
+    slots = ids.shape[1]
+
+    def local_meta(local_arr):
+        every = jax.lax.all_gather(local_arr[0], "k3_sp")  # [32, 2 * segments]
+        counts = (jnp.sum(every[:, segments:], axis=1) // page_tokens).astype(jnp.int32)
+        order = prefix_page_order(
+            every, count=segments, page_tokens=page_tokens, slots=slots, capacity=capacity
+        )
+        return counts, order
+
+    return jax.shard_map(
+        local_meta, mesh=mesh, in_specs=(P("k3_sp"),), out_specs=(P(), P()), check_vma=False,
+    )(local)
+
+
 def prefix_page_order(every, *, count, page_tokens, slots, capacity):
     """The arena order of ``gathered_prefix_pages``: ``[1 + capacity / page]``
     int32, the total page count, then the gathered slot of each arena page.
@@ -6369,6 +6391,16 @@ def _route_update(result, route, layer):
         route, counts[:, None, :].astype(route.dtype), (0, jnp.asarray(layer, jnp.int32).reshape(()), 0))
 
 
+def _commit_block(blocks, prefix, index):
+    """Store ``prefix`` as residual block ``index // 12`` when layer ``index``
+    starts one, updating the (donated) ``blocks`` in place: a ``lax.cond``
+    here copies the whole [32, 8, rows, 7168] buffer."""
+    slot = index // 12
+    current = jax.lax.dynamic_index_in_dim(blocks, slot, axis=1, keepdims=False)
+    value = jnp.where(index % 12 == 0, prefix, current)
+    return jax.lax.dynamic_update_index_in_dim(blocks, value, slot, axis=1)
+
+
 def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, mla_flash_tile=256):
     """One runtime-indexed group at layers 4g..4g+3 (g = 1..22) over a
     packed window: three KDA layers and one MLA layer, each followed by its
@@ -6414,12 +6446,7 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
         mla_cache = tuple(mla_state)
         if len(mla_cache) != 1:
             raise ValueError("mla_state is (latents,)")
-        blocks = jax.lax.cond(
-            base % 12 == 0,
-            lambda x: x.at[:, base // 12].set(prefix),
-            lambda x: x,
-            blocks,
-        )
+        blocks = _commit_block(blocks, prefix, base)
         tap = prefix
         for offset in range(4):
             index = base + offset
@@ -6479,29 +6506,15 @@ def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
     )
     sharding = NamedSharding(mesh, P("k3_sp"))
 
-    def compute_prefix_meta(local_arr, *, page_tokens, slots):
-        every = jax.lax.all_gather(local_arr[0], "k3_sp")
-        counts = (jnp.sum(every[:, segments:], axis=1) // page_tokens).astype(jnp.int32)
-        order = prefix_page_order(
-            every, count=segments, page_tokens=page_tokens, slots=slots, capacity=prefix_capacity
-        )
-        return counts, order
-
     def run(prefix, blocks, common, kda_families, mla_families,
             moe_families, kda_state, mla_state, length, pair, segment_desc, arena, route=None):
         first = jnp.asarray([2 * pair[0] + 1], jnp.int32)
         second = first + 1
         if arena.counts is None or arena.order is None:
-            pool0 = arena.pools[0]
-            page_tokens = pool0.shape[-3] * pool0.shape[-2]
-            slots = arena.ids.shape[1]
-            counts, order = jax.shard_map(
-                functools.partial(compute_prefix_meta, page_tokens=page_tokens, slots=slots),
-                mesh=mesh,
-                in_specs=(P("k3_sp"),),
-                out_specs=(P(), P()),
-                check_vma=False,
-            )(arena.local)
+            counts, order = cp_prefix_meta(
+                mesh, arena.pools[0], arena.ids, arena.local,
+                segments=segments, capacity=prefix_capacity,
+            )
             arena = CpPrefix(arena.pools, arena.ids, arena.local, counts, order)
         arenas = arena.split()
         middle, blocks, kda_state, mla_state, _, *r1 = group4(
@@ -6674,12 +6687,7 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
             prefix, blocks, kda_states, mla_cache, tap, route = carry
             if tap_layer is not None:
                 tap = jnp.where(index == tap_layer, prefix, tap)
-            blocks = jax.lax.cond(
-                index % 12 == 0,
-                lambda x: x.at[:, index // 12].set(prefix),
-                lambda x: x,
-                blocks,
-            )
+            blocks = _commit_block(blocks, prefix, index)
             attn_res = choose(common["attn_res"], index)
             attn_norm = choose(common["attn_norm"], index)
             attn_active = active((index - 1) // 12 + 1)

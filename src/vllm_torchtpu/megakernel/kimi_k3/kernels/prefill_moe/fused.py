@@ -2216,19 +2216,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     overflow uses the uncapped production expert path with the same metadata.
     """
     if seq_len == 16384:
-        half = make_indexed_moe_sp_ring(mesh, seq_len=8192)
-        counting = k._config().prefill_route_counts
-
-        def run_16k(hidden, prefix, families, length, slot):
-            len0 = jnp.minimum(length, 8192)
-            len1 = jnp.maximum(length - 8192, 0)
-            r0 = half(hidden[:, :256], prefix[:, :256], families, len0, slot)
-            r1 = half(hidden[:, 256:], prefix[:, 256:], families, len1, slot)
-            if counting:
-                return jnp.concatenate((r0[0], r1[0]), axis=1), r0[1] + r1[1]
-            return jnp.concatenate((r0, r1), axis=1)
-
-        return jax.jit(run_16k)
+        return _make_moe_16k(mesh)
     if seq_len not in (512, 1024, 2048, 4096, 8192):
         raise ValueError(
             "Fused prefill MoE supports 512, 1024, 2048, 4096, 8192 and 16384 token windows"
@@ -2354,5 +2342,163 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             maximum[0] <= _COMPACT_8K_CAPACITY, lambda: final, overflow
         )[None]
         return (result, routes) if counting else result
+
+    return jax.jit(local)
+
+
+def _make_moe_16k(mesh):
+    """The 16K window as two 8K fused launches over the full rank rows.
+
+    Each launch reads and writes its 256-row half of the [512, 7168] hidden,
+    residual and output in place (the second aliases the first's output), so
+    the window is never split or concatenated in HBM. Routes that overflow
+    the compact 8K capacity fall back per half, as in the 8K op.
+    """
+    if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
+        raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
+    ep = k._config().prefill_expert_parallel
+    if ep not in (8, 16):
+        raise ValueError("Fused prefill MoE requires prefill_expert_parallel in (8, 16)")
+    from .layer import routed_experts_prepared
+
+    tokens, rows, window_rows = 8192, 256, 512
+    local_experts = 896 // ep
+    mid_width = 3072 // (32 // ep)
+    tables = k.ring_tables(list(mesh.devices.flat), tuple(range(32)))
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    shape = (tokens // 8, 128)
+    bf16 = jnp.bfloat16
+    workspace_shapes = [
+        ((window_rows, 7168), bf16),
+        ((tokens, 2, 1792), bf16),
+        ((tokens * 16, mid_width), bf16),
+        (shape, jnp.int32),
+        (shape, jnp.float32),
+        ((local_experts,), jnp.int32),
+        ((rows, 7168), bf16),
+        ((1,), jnp.int32),
+    ]
+    output_specs = [hbm] * 7 + [pl.BlockSpec()]
+    counting = k._config().prefill_route_counts
+    if counting:
+        workspace_shapes += [((local_experts,), jnp.int32)]
+        output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
+    inputs = 13  # after the two scalar-prefetch operands
+
+    def make_kernel(half):
+        aliased = half == 1
+
+        def body(*refs):
+            refs = list(refs)
+            if aliased:
+                del refs[2 + inputs]  # the first launch's output, aliased below
+            own = pl.ds(half * rows, rows)
+            for index in (2, 1 + inputs, 2 + inputs):  # hidden, prefix, output
+                refs[index] = refs[index].at[own]
+            if counting:
+                return _layer_kernel(*refs[:-1], route_counts=refs[-1])
+            return _layer_kernel(*refs)
+
+        return pl.pallas_call(
+            body,
+            out_shape=tuple(jax.ShapeDtypeStruct(s, d) for s, d in workspace_shapes),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=(hbm,) * (inputs + aliased),
+                out_specs=tuple(output_specs),
+            ),
+            input_output_aliases={2 + inputs: 0} if aliased else {},
+            compiler_params=pltpu.CompilerParams(
+                collective_id=0,
+                vmem_limit_bytes=64 * 1024**2,
+                disable_bounds_checks=True,
+                shape_invariant_numerics=False,
+            ),
+            name="fused_moe_pallas_8192",
+        )
+
+    kernels = (make_kernel(0), make_kernel(1))
+
+    @functools.partial(
+        jax.shard_map,
+        mesh=mesh,
+        in_specs=(P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P()),
+        out_specs=(P("k3_sp"), P("k3_sp")) if counting else P("k3_sp"),
+        check_vma=False,
+    )
+    def local(hidden, prefix, families, length, slot):
+        w = {name: value[0] for name, value in families.items()}
+        lengths = (jnp.minimum(length, tokens), jnp.maximum(length - tokens, 0))
+        operands = (
+            hidden[0],
+            w["router"],
+            w["router_bias"],
+            w["latent_down"],
+            w["shared_gu"],
+            w["shared_down"],
+            w["expert_gu"],
+            w["expert_gus"],
+            w["expert_down"],
+            w["expert_ds"],
+            w["latent_norm"],
+            w["latent_up"],
+            prefix[0],
+        )
+        halves, routes, previous = [], None, ()
+        for half, kernel in enumerate(kernels):
+            control = jnp.concatenate((lengths[half].reshape(1), slot.reshape(1)))
+            outputs = kernel(jnp.asarray(tables), control, *operands, *previous)
+            if counting:
+                *outputs, counted = outputs
+                routes = counted if routes is None else routes + counted
+            halves.append(outputs)
+            previous = (outputs[0],)
+        final = halves[1][0]
+
+        def overflow(half):
+            _, latent, _, ids, probs, counts, shared, maximum = halves[half]
+            reduced = routed_experts_prepared(
+                latent,
+                ids.reshape(-1),
+                probs.reshape(-1),
+                counts,
+                w["expert_gu"],
+                w["expert_gus"],
+                w["expert_down"],
+                w["expert_ds"],
+                reduce_tables=tables,
+                expert_layer=slot,
+                global_route_max=maximum[0],
+            )
+            selected = {name: w[name][slot[0]] for name in ("latent_norm", "latent_up")}
+            return k._moe_sp_tail(
+                reduced,
+                shared,
+                prefix[0, half * rows : (half + 1) * rows],
+                lengths[half],
+                selected,
+                axis_name="k3_sp",
+                eps=1e-5,
+                shared_reduced=True,
+            )
+
+        fits = [h[7][0] <= _COMPACT_8K_CAPACITY for h in halves]
+
+        def fallback():
+            parts = [
+                jax.lax.cond(
+                    fits[half],
+                    lambda half=half: final[half * rows : (half + 1) * rows],
+                    lambda half=half: overflow(half),
+                )
+                for half in range(2)
+            ]
+            return jnp.concatenate(parts, axis=0)
+
+        result = jax.lax.cond(fits[0] & fits[1], lambda: final, fallback)[None]
+        if counting:
+            assert routes is not None
+            return result, routes[None]
+        return result
 
     return jax.jit(local)

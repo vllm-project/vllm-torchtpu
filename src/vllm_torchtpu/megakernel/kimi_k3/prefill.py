@@ -464,15 +464,32 @@ class PrefillProgram:
             )
 
         def prefix_specs(pools: int):
-            """Specs of an op's prefix operands: its MLA layers' pools, then
-            this rank's prefix ids and the local bases/counts."""
-            return (sharded,) * (pools + 2)
+            """Specs of an op's prefix operands: its MLA layers' pools, this
+            rank's prefix ids and the local bases/counts, then the window's
+            replicated page counts and arena order (the ``meta`` op's)."""
+            return (sharded,) * (pools + 2) + (replicated,) * 2
 
         def split(args, pools: int):
             return (
-                kernels.CpPrefix(tuple(args[:pools]), args[pools], args[pools + 1]),
-                args[pools + 2 :],
+                kernels.CpPrefix(tuple(args[:pools]), *args[pools : pools + 4]),
+                args[pools + 4 :],
             )
+
+        def run_meta(pool, ids, local):
+            return kernels.cp_prefix_meta(
+                mesh, pool, ids, local, segments=count, capacity=self.capacity
+            )
+
+        name = f"k3_prefill_packed{count}c"
+        # Once per window: every MLA layer's prefix gather shares them.
+        ops["meta"] = register_global_op(
+            self._op_name(f"{name}_meta", window),
+            mesh,
+            run_meta,
+            (sharded,) * 3,
+            (replicated,) * 2,
+            export_key=self._export_key(f"{name}_meta", window),
+        )
 
         def run_first(tokens, length, segments, rec, hist, *args):
             arena, args = split(args, 1)
@@ -505,7 +522,6 @@ class PrefillProgram:
 
         # prefix, blocks, rec, hist, rec_at, hist_at, latents[, route counts]
         state_specs = (sharded,) * (7 + nroute)
-        name = f"k3_prefill_packed{count}c"
         ops["first"] = register_global_op(
             self._op_name(f"{name}_first", window),
             mesh,
@@ -680,7 +696,7 @@ class PrefillProgram:
         ``ring(blocks, prefix, middle)`` (the DSpark ring's update, if any)
         runs on the residual streams before the final op consumes them."""
         ops = self._build(int(shard.shape[-1]) * 32)
-        tail = (ids, local)
+        tail = (ids, local, *ops["meta"](pools[0], ids, local))
         first_args = (
             shard,
             extent,
@@ -1889,7 +1905,13 @@ class KimiPrefiller:
             )
             state = (stream, blocks, recurrent, conv, recurrent, conv, latents, *routes)
             extent, segments = i32(1), i32(5 * count)
-            tail = (i32(1, 1 + self.cp_capacity // self.page_tokens), i32(1, 2 * count))
+            tail = (
+                i32(1, 1 + self.cp_capacity // self.page_tokens),
+                i32(1, 2 * count),
+                i32(32),
+                i32(1 + program.capacity // program.page_tokens),
+            )
+            add(ops["meta"], (mla[0], *tail[:2]), priority=window)
             add(
                 ops["first"],
                 (
