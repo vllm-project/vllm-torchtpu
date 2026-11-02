@@ -130,23 +130,25 @@ class ZigzagPlan:
 
     def sliding_page_tables(self, rank: Rank, halo_pages: int) -> jax.Array:
         """Per sub-request position page -> page of the rank's local buffer
-        [halo | first piece | halo | second piece]; [2, num_pages].
+        [first piece's halo | second piece's halo | scratch]; [2, num_pages].
 
-        Pages a piece's window never reaches map to its first halo page, whose
-        contents are finite and fully masked wherever a KV block reaches them.
+        The pieces' own pages map to the scratch page: the kernel reads their
+        keys from its new-token operand and only writes them there. Pages
+        before the halo map to its first page, finite and fully masked
+        wherever a KV block reaches them.
         """
         if halo_pages > self.piece_pages:
             raise ValueError(
                 f"A halo of {halo_pages} pages spans more than one piece of "
                 f"{self.piece_pages} pages."
             )
-        pp = self.piece_pages
         pieces = jnp.stack(self.rank_pieces(rank)).astype(jnp.int32)
         local = jnp.arange(self.num_pages, dtype=jnp.int32) - (
-            pieces[:, None] * pp - halo_pages
+            pieces[:, None] * self.piece_pages - halo_pages
         )
-        base = jnp.arange(2, dtype=jnp.int32)[:, None] * (halo_pages + pp)
-        return base + jnp.clip(local, 0, halo_pages + pp - 1)
+        base = jnp.arange(2, dtype=jnp.int32)[:, None] * halo_pages
+        halo = base + jnp.clip(local, 0, halo_pages - 1)
+        return jnp.where(local < halo_pages, halo, 2 * halo_pages)
 
     def sub_request_metadata(self, rank: Rank) -> tuple[jax.Array, ...]:
         """(cu_q_lens, kv_lens, distribution) of the rank's two sub-requests."""
@@ -239,17 +241,16 @@ def sliding_local_pages(
     plan: ZigzagPlan,
     rank: Rank,
 ) -> jax.Array:
-    """The rank's [halo | first piece | halo | second piece] page buffer with
-    the halos in place and the piece pages zero, for `cp_prefill_attention` to
-    fill from `keys` and `values` (the rank's rows).
+    """The rank's [first piece's halo | second piece's halo | scratch] page
+    buffer for `cp_prefill_attention` with the pieces' K/V as new tokens
+    (`ZigzagPlan.sliding_page_tables`).
 
-    `halos` is what `exchange_halos` delivers (fp8). Rank 0's first piece starts the
-    prompt, so its first halo goes unread; the last rank's second piece
-    follows its own first piece, whose tail is used instead of what the
-    permute delivered.
+    `halos` is what `exchange_halos` delivers (fp8). Rank 0's first piece starts
+    the prompt, so its first halo goes unread; the last rank's second piece
+    follows its own first piece, whose tail (from `keys`, `values`, the rank's
+    rows) is used instead of what the permute delivered.
     """
-    pp, halo_pages = plan.piece_pages, halos.shape[0] // 2
-    page_size = halos.shape[1]
+    halo_pages, page_size = halos.shape[0] // 2, halos.shape[1]
     halo_first, halo_second = halos[:halo_pages], halos[halo_pages:]
     piece, halo = plan.piece_tokens, halo_pages * page_size
     own_tail = pack_kv_pages(
@@ -260,8 +261,8 @@ def sliding_local_pages(
         halo_second = own_tail if rank == last else halo_second
     else:
         halo_second = jnp.where(rank == last, own_tail, halo_second)
-    zeros = jnp.zeros((pp, *halos.shape[1:]), halos.dtype)
-    return jnp.concatenate([halo_first, zeros, halo_second, zeros])
+    scratch = jnp.zeros((1, *halos.shape[1:]), halos.dtype)
+    return jnp.concatenate([halo_first, halo_second, scratch])
 
 
 def cp_prefill_attention(

@@ -146,17 +146,15 @@ def test_halo_exchange_gives_each_piece_its_window(traced):
         local = (
             local_pages(*args, jnp.int32(rank)) if traced else local_pages(*args, rank)
         )
-        tables = plan.sliding_page_tables(rank, halo)
-        # What the kernel writes: each piece's own pages, through its table.
-        own = cp_prefill.pack_kv_pages(*rows[rank], PAGE)
+        tables = np.asarray(plan.sliding_page_tables(rank, halo))
         for sub, p in enumerate(plan.rank_pieces(rank)):
-            pages = np.arange(p * pp, (p + 1) * pp)
-            local = local.at[tables[sub][pages]].set(own[sub * pp : (sub + 1) * pp])
-        for sub, p in enumerate(plan.rank_pieces(rank)):
-            seen = np.arange(max(p * pp - halo, 0), (p + 1) * pp)
+            # The halo pages the window reads before the piece...
+            seen = np.arange(max(p * pp - halo, 0), p * pp)
             np.testing.assert_array_equal(
                 _bytes(local[tables[sub][seen]]), _bytes(in_order[seen])
             )
+            # ...and the piece's own pages, which the kernel only writes.
+            assert (tables[sub][p * pp : (p + 1) * pp] == 2 * halo).all()
 
 
 def _halo_worker(world: int) -> dict:
@@ -465,13 +463,15 @@ def test_cp_prefill_attention_lowers_for_tpu7x(heads, head_dim, window, fp8_comp
     if window is None:
         num_pages, tables = plan.num_pages, plan.gathered_page_table()
     else:
-        num_pages = 2 * (4 + plan.piece_pages)
+        num_pages = 2 * 4 + 1
         tables = plan.sliding_page_tables(1, 4)
     with use_abstract_mesh(TPU7X):
         q = jax.ShapeDtypeStruct((rows, num_q_heads, head_dim), jnp.bfloat16)
         pages = jax.ShapeDtypeStruct((num_pages, PAGE, slots, 4, head_dim), FP8)
+        kv = jax.ShapeDtypeStruct((rows, num_kv_heads, head_dim), FP8)
 
-        def call(q, pages):
+        def call(q, pages, k, v):
+            new_kv = {} if window is None else dict(keys=k, values=v)
             return cp_prefill.cp_prefill_attention(
                 q,
                 pages,
@@ -481,9 +481,12 @@ def test_cp_prefill_attention_lowers_for_tpu7x(heads, head_dim, window, fp8_comp
                 num_kv_heads=num_kv_heads,
                 sliding_window=window,
                 fp8_compute=fp8_compute,
+                **new_kv,
             )
 
-        lowered = jax.jit(call).trace(q, pages).lower(lowering_platforms=("tpu",))
+        lowered = (
+            jax.jit(call).trace(q, pages, kv, kv).lower(lowering_platforms=("tpu",))
+        )
     assert "RPAm-snh-p256" in lowered.as_text()
 
 
