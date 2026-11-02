@@ -617,6 +617,10 @@ def _context_parallel_layer(
     gate_up, _ = replica.mlp.gate_up_proj(layer.pre_feedforward_layernorm(x))
     out, _ = replica.mlp.down_proj(layer.mlp.act_fn(gate_up))
     if layer.enable_moe_block:
+        # Under TPU_MOE_SKIP_PADDED_TOKENS the experts read the runner's
+        # token-order padding mask, which flags row i when i >= the prompt
+        # length: every such zigzag row is padding too (its position is >= i),
+        # and with prompts over the solo threshold no row of a rank is flagged.
         experts = replica.experts(
             layer.pre_feedforward_layernorm_2(residual), layer.router(residual)
         )

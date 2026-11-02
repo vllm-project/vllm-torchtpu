@@ -1258,6 +1258,10 @@ def test_load_weights_tees_the_projections(monkeypatch) -> None:
         "layers.10.mlp.gate_proj.weight",
         "layers.10.mlp.down_proj.weight_scale",
         "layers.10.input_layernorm.weight",
+        "layers.3.experts.7.gate_proj.weight",
+        "layers.3.experts.7.down_proj.weight_scale",
+        "layers.3.router.proj.weight",
+        "layers.3.router.per_expert_scale",
         "norm.weight",
     ]
     weights = [(name, torch.zeros(1)) for name in names]
@@ -1270,9 +1274,59 @@ def test_load_weights_tees_the_projections(monkeypatch) -> None:
     expected = []
     for name in names:
         expected.append(name)
-        if "_proj." in name:
+        if "_proj." in name and ".router." not in name:
             expected.append(f"cp_replica.{name}")
     assert seen == expected
+
+
+def test_replica_layer_builds_upstreams_experts_unsharded(monkeypatch) -> None:
+    """A MoE layer's replica: upstream's FusedMoEFactory arguments, tp=dp=1."""
+
+    class _Recorded(torch.nn.Module):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__()
+            self.args, self.kwargs = args, kwargs
+
+    for name in (
+        "QKVParallelLinear",
+        "RowParallelLinear",
+        "MergedColumnParallelLinear",
+        "FusedMoEFactory",
+    ):
+        monkeypatch.setattr(gemma4_patch, name, _Recorded)
+    router = SimpleNamespace(routing_function=object())
+    layer = SimpleNamespace(
+        hidden_size=32,
+        enable_moe_block=True,
+        router=router,
+        self_attn=SimpleNamespace(
+            hidden_size=32, head_dim=8, total_num_heads=8, total_num_kv_heads=4
+        ),
+        mlp=SimpleNamespace(down_proj=SimpleNamespace(input_size=64)),
+    )
+    config = SimpleNamespace(
+        num_experts=16, top_k_experts=4, hidden_size=32, moe_intermediate_size=48
+    )
+    replica = gemma4_patch._ReplicaLayer(
+        layer, config, "qc", "model.cp_replica.layers.3"
+    )
+    assert replica.experts.kwargs == dict(
+        num_experts=16,
+        top_k=4,
+        hidden_size=32,
+        intermediate_size=48,
+        renormalize=True,
+        quant_config="qc",
+        tp_size=1,
+        dp_size=1,
+        prefix="model.cp_replica.layers.3.experts",
+        custom_routing_function=router.routing_function,
+        activation="gelu_tanh",
+    )
+    assert replica.self_attn.qkv_proj.kwargs["disable_tp"] is True
+    assert replica.mlp.down_proj.args == (64, 32)
+    layer.enable_moe_block = False
+    assert not hasattr(gemma4_patch._ReplicaLayer(layer, config, "qc", "p"), "experts")
 
 
 def test_maybe_patch_context_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
