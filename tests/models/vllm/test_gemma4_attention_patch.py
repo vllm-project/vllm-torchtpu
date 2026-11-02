@@ -129,3 +129,29 @@ def test_non_neox_rotary_is_refused(monkeypatch):
     monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_ATTN_PROLOGUE", True)
     with pytest.raises(NotImplementedError, match="neox"):
         patch.attention_from_qkv(attn, torch.arange(2), torch.randn(2, 32))
+
+
+def _fake_init(impl, shared=False, neox=True):
+    def init(self, *args, **kwargs):
+        self.is_kv_shared_layer = shared
+        self.attn = SimpleNamespace(layer_name="layers.0.attn", impl=impl)
+        self.rotary_emb = SimpleNamespace(is_neox_style=neox)
+
+    return init
+
+
+def test_init_names_the_flag_for_unsupported_configs(monkeypatch):
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+
+    impl = object.__new__(PallasBatchedRPAAttentionBackendImpl)
+    monkeypatch.setattr(impl, "qkv_prologue_unsupported", lambda: ["attention sinks"])
+    monkeypatch.setattr(patch, "_orig_attention_init", _fake_init(impl))
+    with pytest.raises(NotImplementedError, match="TPU_GEMMA4_FUSED_ATTN_PROLOGUE"):
+        patch._patched_attention_init(SimpleNamespace())
+
+
+def test_init_leaves_kv_shared_layers_alone(monkeypatch):
+    monkeypatch.setattr(patch, "_orig_attention_init", _fake_init(object(), True))
+    patch._patched_attention_init(SimpleNamespace())  # no impl checks

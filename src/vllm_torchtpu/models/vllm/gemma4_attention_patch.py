@@ -34,7 +34,6 @@ from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.models.gemma4 import Gemma4Attention
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter.attention import PallasBatchedRPAAttentionBackendImpl
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -106,6 +105,10 @@ def _patched_attention_forward(
 def _patched_attention_init(self: Gemma4Attention, *args: Any, **kwargs: Any) -> None:
     """Upstream's init, then a refusal of what forward_from_qkv cannot run,
     so it surfaces at model build rather than at the first trace."""
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+
     _orig_attention_init(self, *args, **kwargs)
     if self.is_kv_shared_layer:
         return

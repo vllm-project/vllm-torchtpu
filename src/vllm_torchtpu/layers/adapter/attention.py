@@ -1821,6 +1821,12 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         super().__init__(*args, **kwargs)
         vllm_config = get_current_vllm_config_or_none()
         spec = vllm_config.speculative_config if vllm_config else None
+        # Read here: compiled forwards have no active vLLM config.
+        parallel = vllm_config.parallel_config if vllm_config else None
+        self._context_parallel = (
+            getattr(parallel, "prefill_context_parallel_size", 1) > 1
+            or getattr(parallel, "decode_context_parallel_size", 1) > 1
+        )
         # Run K + 1 verify tokens in the DECODE stage.
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
@@ -1852,14 +1858,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
             reasons.append("KV sharing")
         if self._bm_kernel:
             reasons.append("the block-major KV pool")
-        vllm_config = get_current_vllm_config_or_none()
-        parallel = vllm_config.parallel_config if vllm_config else None
-        if (
-            self._pcp_streaming
-            or self.dcp_world_size > 1
-            or getattr(parallel, "prefill_context_parallel_size", 1) > 1
-            or getattr(parallel, "decode_context_parallel_size", 1) > 1
-        ):
+        if self._context_parallel or self._pcp_streaming or self.dcp_world_size > 1:
             reasons.append("context parallelism (PCP/DCP)")
         if self.head_size % 128 or (self.num_heads // self.num_kv_heads) % 2:
             reasons.append(
