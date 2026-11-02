@@ -1330,16 +1330,36 @@ class TpuPlatform(Platform):
         params: Union["SamplingParams", PoolingParams],
     ) -> None:
         """Raises if this request is unsupported on this platform"""
+        # VLLMValidationError, not ValueError: AsyncLLM.generate passes a
+        # VLLMClientError through as a 400 but wraps anything else in an empty
+        # EngineGenerateError, which the client sees as a 500 with no message.
+        from vllm.exceptions import VLLMValidationError
         from vllm.sampling_params import SamplingParams, SamplingType
 
         del processed_inputs
-        if isinstance(params, SamplingParams):
-            if params.sampling_type == SamplingType.RANDOM_SEED:
-                raise ValueError("JAX does not support per-request seed.")
-            if params.sampling_type not in (SamplingType.GREEDY, SamplingType.RANDOM):
-                raise ValueError(
-                    f"Sampling type {params.sampling_type} is not supported on TPU."
-                )
+        if not isinstance(params, SamplingParams):
+            return
+        if params.sampling_type == SamplingType.RANDOM_SEED:
+            raise VLLMValidationError(
+                "Per-request seed is not supported on TPU; omit seed.",
+                parameter="seed",
+                value=params.seed,
+            )
+        if params.sampling_type not in (SamplingType.GREEDY, SamplingType.RANDOM):
+            raise VLLMValidationError(
+                f"Sampling type {params.sampling_type} is not supported on TPU.",
+                parameter="sampling_type",
+                value=params.sampling_type,
+            )
+        # Reachable with --max-logprobs -1; the runner would raise inside the
+        # engine step, which stops EngineCore and every request in flight.
+        if params.logprobs == -1:
+            raise VLLMValidationError(
+                "Full logprobs (logprobs=-1) are not supported on TPU; request a "
+                "fixed number, e.g. logprobs=20.",
+                parameter="logprobs",
+                value=params.logprobs,
+            )
 
     @classmethod
     def is_kv_cache_dtype_supported(
