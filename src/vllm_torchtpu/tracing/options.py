@@ -122,6 +122,10 @@ def resolve_profile_dir_and_opts(
     """
     standard_opts = get_default_standard_opts()
     advanced_opts = get_default_advanced_opts()
+    if envs.TPU_PROFILER_OPTIONS:
+        env_standard, env_advanced = parse_profile_options(envs.TPU_PROFILER_OPTIONS)
+        standard_opts.update(env_standard)
+        advanced_opts.update(env_advanced)
     profile_dir = base_dir
 
     effective_prefix = profile_prefix
