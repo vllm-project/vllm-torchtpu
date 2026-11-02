@@ -20,7 +20,8 @@ MoE layer's attention then all-gathers fused_qkv_a's output of every row,
 runs the per-row work (norms, rope, q, index q) on every row, attends rows
 `split_rows + r * R + [0, R)`, returns the outputs to head sharding by an
 all-to-all and reduce-scatters o_proj's partial sums back to the own rows. On
-a bucket `applies` takes, each MoE layer instead (`forward`):
+a bucket `applies` takes, each MoE layer instead (`forward`; with
+TPU_MLA_PREFILL_ROWS_DENSE the dense layers in front of them too):
 
   * runs every per-row op on its own rows and all-gathers only what the other
     ranks write into their cache shards: the fp8 latent, rope and index-K rows;

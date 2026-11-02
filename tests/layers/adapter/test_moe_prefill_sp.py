@@ -319,7 +319,8 @@ def test_op_without_an_ep_group_raises():
         _build(_experts(), mesh=None)
 
 
-def test_shared_slices_are_stacked_into_four_model_wide_tensors():
+@pytest.mark.parametrize("names", [sp.SHARED_STACK, sp.DENSE_STACK])
+def test_group_slices_are_stacked_into_four_model_wide_tensors(names):
     tp, group, k, i, n, layers = 4, 2, 8, 3, 5, 3
     backbone = torch.nn.Module()
     mlps = [SimpleNamespace() for _ in range(layers)]
@@ -335,10 +336,8 @@ def test_shared_slices_are_stacked_into_four_model_wide_tensors():
         )
         for _ in range(layers)
     ]
-    sp._stack_shared_experts(backbone, mlps, parts)
-    assert sorted(name for name, _ in backbone.named_buffers()) == sorted(
-        sp.SHARED_STACK
-    )
+    sp._stack_group_slices(backbone, mlps, parts, names)
+    assert sorted(name for name, _ in backbone.named_buffers()) == sorted(names)
     for idx, mlp in enumerate(mlps):
         stacked = getattr(mlp, sp.SHARED_ATTR)
         assert getattr(mlp, sp.SHARED_INDEX) == idx
@@ -351,3 +350,27 @@ def test_shared_slices_are_stacked_into_four_model_wide_tensors():
         torch.testing.assert_close(
             w2.float(), parts[idx][2].to(torch.float8_e4m3fn).float(), rtol=0, atol=0
         )
+
+
+def test_a_dense_layer_keeps_the_replicated_stream_on_a_split_bucket():
+    """A dense layer armed for the rows block (it has a keep list) on a split
+    bucket that does not take the rows block runs today's forward."""
+    calls = []
+    layer = SimpleNamespace(mlp=SimpleNamespace())
+    setattr(layer, sp.KEEP_ATTR, [])
+    with (
+        patch.object(sp, "applies", lambda n: True),
+        patch.object(sp, "_retain_buffers", lambda h, *keep: h),
+        patch.object(
+            sp,
+            "UPSTREAM_DECODER_LAYER_FORWARD",
+            lambda *a: calls.append("upstream") or ("h", "r"),
+        ),
+        patch.object(
+            sp,
+            "_sequence_parallel_layer_forward",
+            lambda *a: calls.append("split") or ("h", "r"),
+        ),
+    ):
+        sp.patched_decoder_layer_forward(layer, torch.zeros(2048), "h", None)
+    assert calls == ["upstream"]

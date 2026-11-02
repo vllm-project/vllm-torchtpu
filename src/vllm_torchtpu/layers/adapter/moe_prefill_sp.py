@@ -30,9 +30,11 @@ owning the contiguous rows `[r * T / tp, (r + 1) * T / tp)`:
     of TPU_MOE_PREFILL_SP_SHARED_GROUP ranks (`member_slice`), which exchange their rows
     (`kernels/fused_moe/grouped_shared_expert.py`).
 
-The dense layers in front of the first MoE layer keep the replicated stream,
-and the model norm all-gathers the final rows. Buckets below `MIN_TOKENS`
-(decode) trace today's forward unchanged.
+The dense layers in front of the first MoE layer keep the replicated stream
+(with TPU_MLA_PREFILL_ROWS_DENSE they run on their rows too: the rows attention
+block, and their MLP re-sharded like a shared expert), and the model norm
+all-gathers the final rows. Buckets below `MIN_TOKENS` (decode) trace
+today's forward unchanged.
 
 The backbone warmup hands a bucket between traces only when they lift the same
 buffers, so both branches of every MoE layer first route the layer's input
@@ -96,7 +98,16 @@ SHARED_STACK = (
     "_tpu_sp_shared_w2",
     "_tpu_sp_shared_s2",
 )
-# On an armed decoder layer's mlp: the stacked tensors, its row in them, the op.
+# With TPU_MLA_PREFILL_SEQUENCE_ROWS, the dense layers in front of the first MoE
+# layer run their MLP on their rows too, re-sharded and stacked the same way.
+DENSE_STACK = (
+    "_tpu_sp_dense_w13",
+    "_tpu_sp_dense_s13",
+    "_tpu_sp_dense_w2",
+    "_tpu_sp_dense_s2",
+)
+# On an armed decoder layer's mlp (a MoE layer's or, with the rows block, a
+# dense layer's): the stacked tensors, its row in them, the op.
 SHARED_ATTR = "_tpu_sp_shared"
 SHARED_INDEX = "_tpu_sp_shared_index"
 SHARED_OP = "_tpu_sp_shared_op"
@@ -193,14 +204,12 @@ def _per_channel_fp8(linear: Any) -> tuple[torch.Tensor, torch.Tensor]:
     return w.data, s.data
 
 
-def _group_shared_expert(
-    mlp: Any, tp: int, rank: int, group: int
-) -> tuple[torch.Tensor, ...]:
-    """This rank's member slice of the layer's shared expert (w13, s13, w2,
-    s2); the fp8 weights still as the bf16 they were gathered in (exact)."""
-    shared = mlp.shared_experts
-    w13, s13 = _per_channel_fp8(shared.gate_up_proj)
-    w2, s2 = _per_channel_fp8(shared.down_proj)
+def _group_mlp(mlp: Any, tp: int, rank: int, group: int) -> tuple[torch.Tensor, ...]:
+    """This rank's member slice of a TP-sharded gate_up / down MLP (a shared
+    expert, or a dense layer's MLP): w13, s13, w2, s2, the fp8 weights still
+    as the bf16 they were gathered in (exact)."""
+    w13, s13 = _per_channel_fp8(mlp.gate_up_proj)
+    w2, s2 = _per_channel_fp8(mlp.down_proj)
     return member_slice(
         _gather(w13, 1),
         _gather(s13, 0),
@@ -212,12 +221,15 @@ def _group_shared_expert(
     )
 
 
-def _stack_shared_experts(
-    backbone: Any, mlps: list[Any], parts: list[tuple[torch.Tensor, ...]]
+def _stack_group_slices(
+    backbone: Any,
+    mlps: list[Any],
+    parts: list[tuple[torch.Tensor, ...]],
+    names: tuple[str, ...] = SHARED_STACK,
 ) -> None:
     stacked = []
     dtypes = (torch.float8_e4m3fn, torch.float32, torch.float8_e4m3fn, torch.float32)
-    for name, column, dtype in zip(SHARED_STACK, zip(*parts), dtypes):
+    for name, column, dtype in zip(names, zip(*parts), dtypes):
         # A fresh buffer, not a view: torch_tpu hands the executable the buffer
         # behind a tensor, and peer-replayed programs then disagree with this
         # rank's argument shapes. Stacked before the fp8 cast (exact).
@@ -397,7 +409,10 @@ def _rows_layer_forward(
         layer.self_attn.mla_attn, positions, hidden_states, gathered, rank
     )
     hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
-    return _moe(layer.mlp, hidden_states), residual
+    if isinstance(layer.mlp, deepseek_v2.DeepseekV2MoE):
+        return _moe(layer.mlp, hidden_states), residual
+    # A dense layer's MLP, re-sharded like a shared expert.
+    return _shared_expert(layer.mlp, hidden_states), residual
 
 
 def patched_decoder_layer_forward(
@@ -413,7 +428,11 @@ def patched_decoder_layer_forward(
             self, positions, hidden_states, residual, llama_4_scaling
         )
     hidden_states = _retain_buffers(hidden_states, *keep)
-    if not applies(positions.shape[0]):
+    # A dense layer here (armed for the rows block, on a bucket that does not
+    # take it) keeps the replicated stream.
+    if not applies(positions.shape[0]) or not isinstance(
+        self.mlp, deepseek_v2.DeepseekV2MoE
+    ):
         return UPSTREAM_DECODER_LAYER_FORWARD(
             self, positions, hidden_states, residual, llama_4_scaling
         )
@@ -598,30 +617,49 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         setattr(mlp, OP_ATTR, op)
         setattr(mlp, SCALE_ATTR, float(mlp.routed_scaling_factor))
         shared_parts.append(
-            _group_shared_expert(mlp, tp, get_tp_group().rank_in_group, group)
+            _group_mlp(mlp.shared_experts, tp, get_tp_group().rank_in_group, group)
         )
         setattr(mlp, SHARED_OP, _build_shared_op(group))
-    _stack_shared_experts(
-        backbone, [layer.mlp for layer in layers[first:]], shared_parts
-    )
+    _stack_group_slices(backbone, [layer.mlp for layer in layers[first:]], shared_parts)
     del shared_parts
+    # TPU_MLA_PREFILL_SEQUENCE_ROWS: which layers take the rows block; with
+    # TPU_MLA_PREFILL_ROWS_DENSE the dense layers in front of the MoE layers too
+    # (their MLP then runs on the rows, re-sharded like a shared expert).
     rows = envs.TPU_MLA_PREFILL_SEQUENCE_ROWS
-    rows_armed = mla_prefill_rows.rows_layers(
-        [bool(layer.self_attn.mla_attn.skip_topk) for layer in layers[first:]]
+    lo = 0 if envs.TPU_MLA_PREFILL_ROWS_DENSE else first
+    rows_armed = [False] * lo + mla_prefill_rows.rows_layers(
+        [bool(layer.self_attn.mla_attn.skip_topk) for layer in layers[lo:]]
     )
-    for layer, rows_layer in zip(layers[first:], rows_armed):
+    if not rows:
+        rows_armed = [False] * len(layers)
+    dense = [layer for layer, r in zip(layers[:first], rows_armed) if r]
+    if dense:
+        rank = get_tp_group().rank_in_group
+        _stack_group_slices(
+            backbone,
+            [layer.mlp for layer in dense],
+            [_group_mlp(layer.mlp, tp, rank, group) for layer in dense],
+            DENSE_STACK,
+        )
+        for layer in dense:
+            setattr(layer.mlp, SHARED_OP, _build_shared_op(group))
+    for i, layer in enumerate(layers):
+        if i < first and not rows_armed[i]:
+            continue
         keep = _keep_list(layer.mlp)
-        if rows and rows_layer:
+        if rows_armed[i]:
             mla_prefill_rows.arm(layer.self_attn.mla_attn)
             keep += mla_prefill_rows.keep_list(layer.self_attn.mla_attn)
         setattr(layer, KEEP_ATTR, keep)
     setattr(backbone, KEEP_ATTR, True)
     if rows:
         logger.info(
-            "TPU_MLA_PREFILL_SEQUENCE_ROWS: %d of %d MoE layers take the rows "
-            "block, buckets >= %d tokens, shards gathered by %s",
-            sum(rows_armed),
-            len(rows_armed),
+            "TPU_MLA_PREFILL_SEQUENCE_ROWS: %d of %d MoE layers and %d of %d dense "
+            "layers take the rows block, buckets >= %d tokens, shards gathered by %s",
+            sum(rows_armed[first:]),
+            len(layers) - first,
+            len(dense),
+            first,
             envs.TPU_MLA_PREFILL_ROWS_MIN_TOKENS,
             envs.TPU_MLA_PREFILL_ROWS_GATHER,
         )
