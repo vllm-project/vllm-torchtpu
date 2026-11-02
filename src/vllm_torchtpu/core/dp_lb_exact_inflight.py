@@ -22,7 +22,8 @@ requests finishes within a few tens of milliseconds, an engine that just freed
 up then ties with busy ones and the rotating tie-break can stack the next
 requests on one engine. With one API server the client's own in-flight counts
 are exact, so ``VLLM_TPU_DP_LB_EXACT_INFLIGHT`` has the upstream scan rank
-engines by those alone. vLLM exposes no hook for this score.
+engines by those alone; upstream's penalty on an engine's waiting queue under
+KV-cache pressure goes with the snapshot. vLLM exposes no hook for this score.
 """
 
 from vllm_torchtpu import envs

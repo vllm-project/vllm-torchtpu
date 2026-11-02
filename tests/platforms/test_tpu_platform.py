@@ -547,6 +547,20 @@ class TestTpuPlatform:
         with pytest.raises(NotImplementedError, match="unified KV pool"):
             TpuPlatform.check_and_update_config(vllm_config)
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_refuses_exact_inflight_with_api_servers(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, monkeypatch
+    ):
+        monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_DP_LB_EXACT_INFLIGHT", True)
+        vllm_config.parallel_config._api_process_count = 4
+
+        with pytest.raises(ValueError, match="--api-server-count=1"):
+            TpuPlatform.check_and_update_config(vllm_config)
+        mock_apply_patches.assert_not_called()
+
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
