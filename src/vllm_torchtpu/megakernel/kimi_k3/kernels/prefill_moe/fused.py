@@ -1101,7 +1101,21 @@ def _routed_experts(
 
         # Real-prompt tuning: short expert loops need all twelve streams per
         # poll; longer loops alternate six-stream groups to bound polling cost.
+        poll_mode = k._config().prefill_moe_poll
+        sparse = {"sparse": jnp.bool_(True), "dense": jnp.bool_(False)}.get(poll_mode, ng >= 72)
+
         def advance(stop, block, subtotal_vmem, *, drain=False, poll_round=0):
+            if poll_mode == "half" and not drain:
+                # Poll on every other expert only.
+                @pl.when(lax.rem(poll_round, 2) == 0)
+                def poll():
+                    _ready_reduce(
+                        tables, subtotal_vmem, out.at[:, pl.ds(block * tn, tn)],
+                        sends, receives, credits, stores, payload, rx,
+                        streams=regions, buffers=2, state=state, ring_meta=ring_meta,
+                        poll_round=poll_round // 2, sparse_poll=sparse,
+                    )
+                return
             if oneshot:
                 if drain:
                     _oneshot_finish(
@@ -1112,7 +1126,7 @@ def _routed_experts(
             _ready_reduce(
                 tables, subtotal_vmem, out.at[:, pl.ds(block * tn, tn)],
                 sends, receives, credits, stores, payload, rx,
-                streams=regions, buffers=2, state=state, ring_meta=ring_meta, drain=drain, poll_round=poll_round, sparse_poll=(ng >= 72),
+                streams=regions, buffers=2, state=state, ring_meta=ring_meta, drain=drain, poll_round=poll_round, sparse_poll=sparse,
             )
 
         def emit_subtotals(subtotal_vmem):
