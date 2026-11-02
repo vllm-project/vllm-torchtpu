@@ -31,7 +31,9 @@ def _use_prefill_compact_swa_layout() -> bool:
     a tail partition of the shared block pool, a separate per-layer compressor state
     cache, and the UE8M0 scale init limited to [1, main_end).
     """
-    return bool(envs.VLLM_DSV41_PURE_20L_PREFILL)
+    return bool(
+        envs.VLLM_DSV41_PURE_20L_PREFILL and not envs.TPU_RAIDEN_DSV4_ADMISSION
+    )
 
 
 def _apply_compact_swa_block_pool_patch() -> None:
@@ -512,9 +514,13 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             1152 if num_blocks >= 16384 else (1056 if num_blocks >= 4096 else max(16, num_blocks // 40))
         )
         num_swa_aux = (
-            2816 if num_blocks >= 16384 else (800 if num_blocks >= 4096 else max(32, num_blocks // 11))
+            2816 if num_blocks >= 16384 else (800 if num_blocks >= 2048 else max(32, num_blocks // 11))
         )
-        main_end = max(1, num_blocks - num_state_aux - num_swa_aux)
+        main_end = (
+            num_blocks
+            if envs.VLLM_DSV41_PURE_20L_PREFILL
+            else max(1, num_blocks - num_state_aux - num_swa_aux)
+        )
 
         def _create_cache(
             shape: tuple[int, ...],
@@ -596,18 +602,33 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
                 )
             return hosts[position]
 
-        overlay_hosts = list(csa_nope_hosts)
-        n_csa_hosts = len(csa_nope_hosts)
-        for group_idx, group_swa_layers in enumerate(swa_layer_groups):
-            for position, layer_name in enumerate(group_swa_layers):
-                host_pos = (
-                    (position + group_idx) % n_csa_hosts
-                    if n_csa_hosts > 1 and position < n_csa_hosts
-                    else position
-                )
-                kv_caches[layer_name] = _host_at(
-                    overlay_hosts, host_pos, swa_overflow_shape
-                )
+        if envs.VLLM_DSV41_PURE_20L_PREFILL:
+            overlay_hosts: list[torch.Tensor] = []
+            n_csa_hosts = len(csa_nope_hosts)
+            csa_host_shape = tuple(csa_nope_hosts[0].shape)
+            for group_swa_layers in swa_layer_groups:
+                for position, layer_name in enumerate(group_swa_layers):
+                    alloc_shape = (
+                        csa_host_shape
+                        if position < n_csa_hosts
+                        else swa_overflow_shape
+                    )
+                    kv_caches[layer_name] = _host_at(
+                        overlay_hosts, len(overlay_hosts), alloc_shape
+                    )
+        else:
+            overlay_hosts = list(csa_nope_hosts)
+            n_csa_hosts = len(csa_nope_hosts)
+            for group_idx, group_swa_layers in enumerate(swa_layer_groups):
+                for position, layer_name in enumerate(group_swa_layers):
+                    host_pos = (
+                        (position + group_idx) % n_csa_hosts
+                        if n_csa_hosts > 1 and position < n_csa_hosts
+                        else position
+                    )
+                    kv_caches[layer_name] = _host_at(
+                        overlay_hosts, host_pos, swa_overflow_shape
+                    )
 
         for position, layer_name in enumerate(state_layer_names):
             kv_layer_name = self._ds_v4_compressed_kv_layer_name(layer_name)

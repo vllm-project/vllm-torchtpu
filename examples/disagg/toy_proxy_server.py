@@ -171,7 +171,7 @@ async def _post_with_retries(
 
 
 def _render_endpoint_for_api(api: str) -> str | None:
-    if api == "/v1/completions":
+    if api == "/v1/completions" and os.environ.get("PROXY_ENABLE_RENDER", "0") == "1":
         return "/v1/completions/render"
     return None
 
@@ -269,6 +269,8 @@ async def lifespan(app: FastAPI):
                 "host": host,
                 "port": port,
                 "id": i,
+                "inflight": 0,
+                "last_seq": 0,
                 "dp_inflight": [0] * max(0, int(global_args.prefiller_dp_size)),
                 "dp_rr": itertools.count(),
             }
@@ -285,6 +287,8 @@ async def lifespan(app: FastAPI):
                 "host": host,
                 "port": port,
                 "id": i,
+                "inflight": 0,
+                "last_seq": 0,
                 "dp_inflight": [0] * max(0, int(global_args.decoder_dp_size)),
                 "dp_rr": itertools.count(),
             }
@@ -293,6 +297,7 @@ async def lifespan(app: FastAPI):
     # Initialize round-robin iterators
     app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
     app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
+    app.state.client_seq = itertools.count(1)
 
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
@@ -363,20 +368,20 @@ def parse_args():
     return args
 
 
-def get_next_client(app, service_type: str):
+def get_next_client(app, service_type: str, requested_dp_rank: int | None = None):
     """
-    Get the next client in round-robin fashion.
-
-    Args:
-        app: The FastAPI app instance
-        service_type: Either 'prefill' or 'decode'
-
-    Returns:
-        The next client to use
+    Get the next client using least-in-flight with round-robin tie-breaking
+    (or deterministic rank pinning when requested_dp_rank is provided across
+    multiple prefill instances).
     """
     if service_type == "prefill":
-        client_idx = next(app.state.prefill_iterator)
-        return app.state.prefill_clients[client_idx]
+        clients = app.state.prefill_clients
+        if len(clients) > 1 and requested_dp_rank is not None:
+            chosen = clients[int(requested_dp_rank) % len(clients)]
+        else:
+            chosen = min(clients, key=lambda c: (c.get("inflight", 0), c.get("last_seq", 0)))
+        chosen["last_seq"] = next(app.state.client_seq)
+        return chosen
     elif service_type == "decode":
         client_idx = next(app.state.decode_iterator)
         return app.state.decode_clients[client_idx]
@@ -404,6 +409,8 @@ async def send_request_to_prefill(
         req_data["min_tokens"] = min(int(req_data["min_tokens"]), 1)
     if "stream_options" in req_data:
         del req_data["stream_options"]
+    if "tools" in req_data and req_data.get("tools"):
+        req_data["tool_choice"] = "none"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
@@ -416,8 +423,6 @@ async def send_request_to_prefill(
             dp_rank = int(requested_dp_rank) % len(inflight)
             inflight[dp_rank] += 1
             headers["X-data-parallel-rank"] = str(dp_rank)
-        else:
-            headers["X-data-parallel-rank"] = str(int(requested_dp_rank))
     elif inflight:
         rr = next(client_info["dp_rr"])
         n_dp = len(inflight)
@@ -540,48 +545,56 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
 
-        # Get the next prefill client in round-robin fashion
-        prefill_client_info = get_next_client(request.app, "prefill")
-        prompt_val = req_data.get("prompt")
-        already_token_ids = (
-            isinstance(prompt_val, list)
-            and bool(prompt_val)
-            and (
-                isinstance(prompt_val[0], int)
-                or (
-                    isinstance(prompt_val[0], list)
-                    and bool(prompt_val[0])
-                    and isinstance(prompt_val[0][0], int)
+        # Get the next prefill client (least-inflight or pinned by requested_dp_rank)
+        prefill_client_info = get_next_client(
+            request.app, "prefill", requested_dp_rank=requested_dp_rank
+        )
+        prefill_client_info["inflight"] = prefill_client_info.get("inflight", 0) + 1
+        try:
+            prompt_val = req_data.get("prompt")
+            already_token_ids = (
+                isinstance(prompt_val, list)
+                and bool(prompt_val)
+                and (
+                    isinstance(prompt_val[0], int)
+                    or (
+                        isinstance(prompt_val[0], list)
+                        and bool(prompt_val[0])
+                        and isinstance(prompt_val[0][0], int)
+                    )
                 )
             )
-        )
-        render_endpoint = None if already_token_ids else _render_endpoint_for_api(api)
-        if render_endpoint is not None:
-            try:
-                render_response = await render_completion_prompt(
-                    prefill_client_info, render_endpoint, req_data, request_id
-                )
-                req_data = _replace_prompt_with_rendered_token_ids(
-                    req_data, render_response.json()
-                )
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code != 404:
-                    raise
+            render_endpoint = None if already_token_ids else _render_endpoint_for_api(api)
+            if render_endpoint is not None:
+                try:
+                    render_response = await render_completion_prompt(
+                        prefill_client_info, render_endpoint, req_data, request_id
+                    )
+                    req_data = _replace_prompt_with_rendered_token_ids(
+                        req_data, render_response.json()
+                    )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code != 404:
+                        raise
 
-        # Send request to prefill service
-        t_prefill_send = time.time()
-        t_prefill_send_perf = time.perf_counter()
-        print(
-            f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
-            flush=True,
-        )
-        response = await send_request_to_prefill(
-            prefill_client_info,
-            api,
-            req_data,
-            request_id,
-            requested_dp_rank=requested_dp_rank,
-        )
+            # Send request to prefill service
+            t_prefill_send = time.time()
+            t_prefill_send_perf = time.perf_counter()
+            print(
+                f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
+                flush=True,
+            )
+            response = await send_request_to_prefill(
+                prefill_client_info,
+                api,
+                req_data,
+                request_id,
+                requested_dp_rank=requested_dp_rank,
+            )
+        finally:
+            prefill_client_info["inflight"] = max(
+                0, prefill_client_info.get("inflight", 1) - 1
+            )
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
         prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
@@ -686,6 +699,41 @@ async def reset_prefix_cache(request: Request):
     return {"status": "ok", "results": results}
 
 
+@app.post("/tokenize")
+async def handle_tokenize(request: Request):
+    req_data = await request.json()
+    c = get_next_client(request.app, "prefill")
+    resp = await c["client"].post("/tokenize", json=req_data)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@app.post("/detokenize")
+async def handle_detokenize(request: Request):
+    req_data = await request.json()
+    c = get_next_client(request.app, "prefill")
+    resp = await c["client"].post("/detokenize", json=req_data)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@app.get("/v1/models")
+async def handle_models(request: Request):
+    c = request.app.state.prefill_clients[0]
+    resp = await c["client"].get("/v1/models")
+    resp.raise_for_status()
+    return resp.json()
+
+
+@app.get("/version")
+async def handle_version(request: Request):
+    c = request.app.state.prefill_clients[0]
+    resp = await c["client"].get("/version")
+    resp.raise_for_status()
+    return resp.json()
+
+
+@app.get("/health")
 @app.get("/healthcheck")
 async def healthcheck():
     """Simple endpoint to check if the server is running."""

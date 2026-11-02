@@ -5,10 +5,20 @@
 # (examples/disagg/launch_dsv41_disagg_role.sh) exports every flag explicitly and
 # this file only fills defaults (setdefault), keeps the HBM log hook and NUMA pin.
 import os, sys
-import os, sys
-os.environ.setdefault("VLLM_DSV41_CSA_UNION", "1")
-os.environ.setdefault("VLLM_TPU_FAST_TOKEN_SUBSTITUTION", "1")
-os.environ.setdefault("VLLM_DSV41_ENGRAM_H2D_PREFIX", "1")
+os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
+os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
+if os.environ.get("VLLM_DSV41_PURE_20L_PREFILL") != "1":
+    os.environ.setdefault("VLLM_DSV41_CSA_UNION", "1")
+    os.environ.setdefault("VLLM_TPU_FAST_TOKEN_SUBSTITUTION", "1")
+    os.environ.setdefault("VLLM_DSV41_ENGRAM_H2D_PREFIX", "1")
+if "POD_G_CHIP_ID" in os.environ and "_PODJ_NUMA_PIN" not in os.environ:
+    os.environ["_PODJ_NUMA_PIN"] = "1"
+    try:
+        _cid = int(os.environ["POD_G_CHIP_ID"])
+        if 0 <= _cid <= 3:
+            os.sched_setaffinity(0, set(range(_cid * 48, (_cid + 1) * 48)))
+    except Exception:
+        pass
 os.environ.setdefault(
     "LIBTPU_INIT_ARGS",
     "--xla_tpu_enable_diagnostic_coordinator=false --xla_tpu_no_crash_on_oom=false --xla_tpu_scheduler_percent_shared_memory_limit=100 --xla_tpu_enable_scheduler_memory_pressure_tracking=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_sparse_core_compute_offload=false --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_enable_offloading_gather_to_sparsecore=false --xla_tpu_offload_all_supported_gathers_to_sparsecore=false --xla_tpu_enable_offloading_scatter_to_sparsecore=false --xla_tpu_enable_offloading_sort_to_sparsecore=false --xla_tpu_enable_offloading_copy_to_sparsecore=false --xla_tpu_enable_offloading_reshape_to_sparsecore=false --xla_tpu_enable_offloading_reduce_to_sparsecore=false --xla_tpu_num_sparse_cores_for_gather_offloading=0 --xla_tpu_num_sparse_cores_for_scatter_offloading=0 --xla_tpu_num_sparse_cores_for_sort_offloading=0 --xla_tpu_enable_sparse_core_collective_offload_all_gather=false --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=false --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=false --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=false --xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all=false --xla_tpu_enable_sparse_core_collective_offload_ragged_all_to_all=false --xla_tpu_enable_sparse_core_async_all_to_all=false --xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false",

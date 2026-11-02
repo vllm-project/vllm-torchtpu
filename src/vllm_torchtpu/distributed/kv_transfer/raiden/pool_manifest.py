@@ -67,6 +67,7 @@ from .tags import (
     class_tag,
     dsv4_group_tag,
     layer_tag,
+    split_layer_tag,
 )
 
 if TYPE_CHECKING:
@@ -1639,6 +1640,7 @@ def build_dsv4_pool_manifest(
     named_kv_caches: Mapping[str, Any],
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
+    per_layer_tags: bool = False,
 ) -> PoolManifest:
     """Builds the Pool Manifest for DeepSeek-V4, one pool per (layer, array).
 
@@ -1745,6 +1747,9 @@ def build_dsv4_pool_manifest(
         page_shapes.append((tag_base, group_index, (rows, packing, width)))
 
     _dsv4_split_tags_by_page_shape(pools, page_shapes)
+    if per_layer_tags:
+        for pool in pools:
+            pool.tag = layer_tag(pool.tag, layer_index_from_name(pool.layer_name))
     manifest = PoolManifest(binding=binding, storages=storages.storages, pools=pools)
     block_counts = {pool.num_blocks for pool in manifest.pools}
     if len(block_counts) != 1:
