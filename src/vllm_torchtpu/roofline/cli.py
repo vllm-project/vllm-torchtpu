@@ -21,7 +21,7 @@ import sys
 from dataclasses import asdict, replace
 
 from .chips import CHIPS
-from .emit import emit_ceiling_rows, emit_launch_args
+from .emit import build_solve_payload, emit_ceiling_rows, emit_launch_args
 from .geometry import from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import Dtypes, Parallel, StepShape
@@ -241,7 +241,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.json:
-            sys.stdout.write(json.dumps(asdict(splan)) + "\n")
+            payload = build_solve_payload(splan, chip=chip, dtypes=dt_auto, model=src)
+            sys.stdout.write(json.dumps(payload) + "\n")
             return 0
         for w in splan.warnings:
             sys.stdout.write(f"WARNING: {w}\n")
