@@ -1487,6 +1487,115 @@ class TestChunkedPipelining:
             "an indivisible chunk_tokens emitted more than one chunk; the"
             " fallback that the cases above rely on has changed")
 
+    @pytest.mark.parametrize("kv_layout", [_HAS, _SAL], ids=["has", "sal"])
+    @pytest.mark.parametrize(
+        "num_decodes, prefill_len, chunk_tokens",
+        [
+            # max_num_seqs (35) < chunk_tokens (128): only chunk 0 runs the
+            # static_q_len == 1 decode passes; chunks 1..3 skip them.
+            (34, 478, 128),
+            # max_num_seqs (141) > chunk_tokens (128): chunks 0 and 1 run the
+            # static_q_len == 1 decode passes; chunks 2..3 skip them.
+            (140, 372, 128),
+        ],
+        ids=["seqs_within_first_chunk", "seqs_spanning_two_chunks"],
+    )
+    def test_mixed_decode_prefill_skips_dead_decode_chunks(
+        self, num_decodes, prefill_len, chunk_tokens, kv_layout
+    ):
+        """Mixed decode+prefill with `chunk_tokens=128` omits `static_q_len==1`
+        kernel calls on chunks starting at or past `max_num_seqs` while keeping
+        selections identical to the unchunked pass."""
+        T_list = (1,) * num_decodes + (prefill_len,)
+        B = len(T_list)
+        S_list = (512,) * B
+        inputs = _chunk_inputs(T_list, _fragmented_pages(B), 128, 4, 128)
+        common = (inputs, T_list, S_list, 128, 1, 8, 2, kv_layout)
+        chunked_kwargs = _chunk_call_kwargs(*common, chunk_tokens)
+
+        hlo = streamindex_topk.lower(**chunked_kwargs).as_text()
+        assert "_scheduling_group_id" in hlo
+        num_chunks = sum(T_list) // chunk_tokens
+        expected_decode_chunks = (B + chunk_tokens - 1) // chunk_tokens
+        custom_calls = hlo.count('custom_call_target="tpu_custom_call"')
+        assert custom_calls < 4 * num_chunks, (
+            f"expected dead decode chunks to be omitted, got {custom_calls} "
+            f"tpu_custom_call sites across {num_chunks} chunks "
+            f"(expected_decode_chunks={expected_decode_chunks})"
+        )
+
+        chunked = np.array(streamindex_topk(**chunked_kwargs))
+        unchunked = np.array(
+            streamindex_topk(**_chunk_call_kwargs(*common, None))
+        )
+        _verify_padding_at_end(chunked)
+        np.testing.assert_array_equal(
+            np.sort(chunked, axis=-1),
+            np.sort(unchunked, axis=-1),
+        )
+
+    def test_early_exit_hoists_schedule_metadata_outside_cond(self, monkeypatch):
+        """With `enable_early_exit=True`, per-pass schedule metadata and
+        effective row lengths are hoisted outside the `jax.lax.cond` branches
+        so multi-layer callers can CSE them across layers."""
+        if jax.default_backend() != "tpu":
+            monkeypatch.setattr(
+                "jax._src.pallas.mosaic.tpu_info.get_device_kind",
+                lambda *args, **kwargs: "TPU7x",
+            )
+            monkeypatch.setattr(
+                "jax._src.pallas.mosaic.tpu_info.get_num_device_cores",
+                lambda *args, **kwargs: 2,
+            )
+        T_list, S_list = (1, 1, 1, 1), (512, 512, 512, 512)
+        inputs = _chunk_inputs(T_list, _fragmented_pages(4), 128, 4, 128)
+        kwargs = _chunk_call_kwargs(
+            inputs, T_list, S_list, 128, 1, 8, 2, _HAS, None
+        )
+
+        closed_jaxpr = jax.make_jaxpr(
+            lambda q, w, kv, sl, pi, cu, dist: streamindex_topk(
+                q=q,
+                indexer_weights=w,
+                cache_kv=kv,
+                seq_lens=sl,
+                page_indices=pi,
+                cu_q_lens=cu,
+                distribution=dist,
+                k=kwargs["k"],
+                compression_ratio=kwargs["compression_ratio"],
+                num_kv_pages_per_block=kwargs["num_kv_pages_per_block"],
+                num_queries_per_block=kwargs["num_queries_per_block"],
+                enable_early_exit=True,
+                kv_layout=_HAS,
+                chunk_tokens=None,
+            )
+        )(
+            kwargs["q"],
+            kwargs["indexer_weights"],
+            kwargs["cache_kv"],
+            kwargs["seq_lens"],
+            kwargs["page_indices"],
+            kwargs["cu_q_lens"],
+            kwargs["distribution"],
+        )
+
+        jit_eqn = next(
+            e for e in closed_jaxpr.jaxpr.eqns if e.primitive.name == "jit"
+        )
+        inner_jaxpr = jit_eqn.params["jaxpr"].jaxpr
+        outer_prims = {e.primitive.name for e in inner_jaxpr.eqns}
+        assert {"scatter-add", "cummax", "cond"} <= outer_prims
+
+        cond_eqn = next(
+            e for e in inner_jaxpr.eqns if e.primitive.name == "cond"
+        )
+        for branch in cond_eqn.params["branches"]:
+            branch_prims = {e.primitive.name for e in branch.jaxpr.eqns}
+            assert "scatter-add" not in branch_prims
+            assert "cummax" not in branch_prims
+            assert "gather" not in branch_prims
+
 
 def main(argv):
     del argv
