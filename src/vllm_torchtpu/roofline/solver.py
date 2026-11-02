@@ -296,24 +296,36 @@ def hbm_breakdown_per_core_bytes(
     n_dsa = 0
     n_gdn = 0
     n_kda = 0
-    for tok in geom.layer_types:
+    kv_n_gqa = 0.0
+    kv_n_swa = 0.0
+    kv_n_mla = 0.0
+    for idx, tok in enumerate(geom.layer_types):
+        r_i = geom.compress_ratios[idx] if idx < len(geom.compress_ratios) else 1.0
+        kv_ret = (1.0 / r_i) if r_i > 1.0 else r_i
         if tok in ("mla", "mla_attention"):
             n_mla += 1
+            kv_n_mla += kv_ret
         elif tok in ("dsa", "dsa_attention", "sparse_mla"):
             n_mla += 1
             n_dsa += 1
+            kv_n_mla += kv_ret
         elif tok in ("sliding_attention", "swa", "sliding_window_attention"):
             n_swa += 1
+            kv_n_swa += kv_ret
         elif tok in ("kda", "kimi_linear", "kda_attention"):
             n_kda += 1
         elif tok in ("linear_attention", "gdn", "gated_deltanet", "mamba"):
             n_gdn += 1
+        elif tok == "ffn_only":
+            continue
         elif geom.kv_lora_rank > 0:
             n_mla += 1
+            kv_n_mla += kv_ret
             if geom.index_topk > 0:
                 n_dsa += 1
         else:
             n_gqa += 1
+            kv_n_gqa += kv_ret
 
     q_mult = 2 if geom.attn_output_gate else 1
     kv_div = min(tp, max(1, geom.num_kv_heads))
@@ -340,7 +352,7 @@ def hbm_breakdown_per_core_bytes(
             raise ValueError("MLA layer requires config field 'kv_lora_rank'")
         if geom.qk_nope_head_dim <= 0:
             raise ValueError("MLA layer requires config field 'qk_nope_head_dim'")
-        if geom.qk_rope_head_dim <= 0:
+        if geom.qk_rope_head_dim < 0:
             raise ValueError("MLA layer requires config field 'qk_rope_head_dim'")
         kv_lora = geom.kv_lora_rank
         nope_d = geom.qk_nope_head_dim
@@ -445,7 +457,9 @@ def hbm_breakdown_per_core_bytes(
     if geom.mtp_layers > 0:
         mtp_fc = float(2 * geom.hidden * geom.hidden) * dt.w_aux / tp
         mtp_att = (w_attn / float(max(1, n_gqa + n_swa + n_mla))) * float(pp)
-        if geom.num_experts > 0:
+        if geom.mtp_inter > 0:
+            mtp_ffn = float(3 * geom.hidden * geom.mtp_inter) * dt.w_dense / tp
+        elif geom.num_experts > 0:
             n_moe_layers = max(
                 1, geom.num_layers - min(geom.num_layers, geom.first_k_dense_replace)
             )
@@ -458,7 +472,7 @@ def hbm_breakdown_per_core_bytes(
     if n_mla > 0:
         if geom.kv_lora_rank <= 0:
             raise ValueError("MLA layer requires config field 'kv_lora_rank'")
-        if geom.qk_rope_head_dim <= 0:
+        if geom.qk_rope_head_dim < 0:
             raise ValueError("MLA layer requires config field 'qk_rope_head_dim'")
     raw_latent_w = geom.kv_lora_rank + geom.qk_rope_head_dim
     if physical_kv_layout:
@@ -483,19 +497,25 @@ def hbm_breakdown_per_core_bytes(
             if (geom.index_topk > 0 and geom.index_head_dim > 0)
             else 0.0
         )
+    eff_n_gqa = kv_n_gqa if geom.compress_ratios else float(n_gqa)
+    eff_n_swa = kv_n_swa if geom.compress_ratios else float(n_swa)
+    eff_n_mla = kv_n_mla if geom.compress_ratios else float(n_mla)
     kv_gqa = (
-        float(seqs_per_dp * n_gqa * context)
+        float(seqs_per_dp * context)
+        * eff_n_gqa
         * gqa_kv_b_per_tok
         / (par.kv_split * par.pcp * pp)
     )
     sw_ctx = min(context, geom.sliding_window) if geom.sliding_window > 0 else context
     kv_swa = (
-        float(seqs_per_dp * n_swa * sw_ctx)
+        float(seqs_per_dp * sw_ctx)
+        * eff_n_swa
         * gqa_kv_b_per_tok
         / (par.kv_split * par.pcp * pp)
     )
     kv_mla = (
-        float(seqs_per_dp * n_mla * context)
+        float(seqs_per_dp * context)
+        * eff_n_mla
         * (mla_latent_b + dsa_idx_b)
         / (par.kv_split * par.pcp * pp)
     )

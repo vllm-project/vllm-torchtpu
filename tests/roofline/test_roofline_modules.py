@@ -539,3 +539,98 @@ def test_pcp_moe_global_rows_and_flops_conservation() -> None:
     exp_ed = rf.ep_busiest_experts(64, 8, (4 + 8 * 2) * 2, 8)
     exp_w_bytes = exp_ed * float(4 * 3 * 2048 * 1024) * 1.0 + router_elems * 1.0
     assert moe_mix.hbm_bytes == pytest.approx(exp_w_bytes, rel=1e-6)
+
+
+def test_nope_mla_zero_rope_dim_and_compress_ratios() -> None:
+    nope_mla_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 4,
+        "layer_types": ["mla"] * 4,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "q_lora_rank": 1024,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 0,
+        "v_head_dim": 128,
+        "intermediate_size": 8192,
+        "vocab_size": 64000,
+    }
+    geom_uncomp = rf.from_hf_config(nope_mla_cfg)
+    assert geom_uncomp.qk_rope_head_dim == 0
+    # Mix both divisor (> 1.0) and retention-fraction (< 1.0) conventions:
+    # [4.0, 0.5, 1.0, 1.0] -> retention [0.25, 0.5, 1.0, 1.0], sum = 2.75 / 4.0.
+    geom_comp = rf.from_hf_config(
+        {**nope_mla_cfg, "compress_ratios": [4.0, 0.5, 1.0, 1.0]}
+    )
+    assert geom_comp.compress_ratios == (4.0, 0.5, 1.0, 1.0)
+
+    par = Parallel(tp=4)
+    dt = Dtypes(kv=1.0)
+    shape = StepShape(batch=4, rows_per_seq=1, context=4096)
+    mods_u = {m.name: m for m in pass_costs(geom_uncomp, par, shape, dt)}
+    mods_c = {m.name: m for m in pass_costs(geom_comp, par, shape, dt)}
+    mods_ctx0 = {
+        m.name: m
+        for m in pass_costs(
+            geom_uncomp, par, StepShape(batch=4, rows_per_seq=1, context=0), dt
+        )
+    }
+    kv_traffic_u = mods_u["mla"].hbm_bytes - mods_ctx0["mla"].hbm_bytes
+    kv_traffic_c = mods_c["mla"].hbm_bytes - mods_ctx0["mla"].hbm_bytes
+    assert kv_traffic_c == pytest.approx(kv_traffic_u * (2.75 / 4.0), rel=1e-9)
+
+    bd_u = rf.hbm_breakdown_per_core_bytes(geom_uncomp, dt, par, 4, 4096)
+    bd_c = rf.hbm_breakdown_per_core_bytes(geom_comp, dt, par, 4, 4096)
+    assert bd_c.kv == pytest.approx(bd_u.kv * (2.75 / 4.0), rel=1e-9)
+
+    with pytest.raises(ValueError, match="compress_ratios"):
+        rf.from_hf_config({**nope_mla_cfg, "compress_ratios": [2.0, 2.0]})
+    with pytest.raises(ValueError, match="compress_ratios"):
+        rf.from_hf_config({**nope_mla_cfg, "compress_ratios": [2.0, 0.0, 1.0, 1.0]})
+
+    with pytest.raises(ValueError, match="qk_rope_head_dim"):
+        pass_costs(
+            rf.from_hf_config({**nope_mla_cfg, "qk_rope_head_dim": -1}),
+            par,
+            shape,
+            dt,
+        )
+    with pytest.raises(ValueError, match="qk_rope_head_dim"):
+        rf.hbm_breakdown_per_core_bytes(
+            rf.from_hf_config({**nope_mla_cfg, "qk_rope_head_dim": -1}),
+            dt,
+            par,
+            1,
+            1024,
+        )
+
+
+def test_mxu_m_tile_systolic_duty_cycle_on_sparse_moe() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    par = Parallel(tp=8)
+    dt = Dtypes(w_expert=1.0, act="a8")
+    shape = StepShape(batch=1, rows_per_seq=1, context=0)
+    mods_unpad = {m.name: m for m in pass_costs(geom, par, shape, dt, mxu_m_tile=1)}
+    mods_pad = {m.name: m for m in pass_costs(geom, par, shape, dt, mxu_m_tile=256)}
+    # HBM bytes remain exact; only touched experts (10 of 512) are padded to 256 rows.
+    assert mods_pad["moe"].hbm_bytes == pytest.approx(
+        mods_unpad["moe"].hbm_bytes, rel=1e-12
+    )
+    shared_fp8 = 2.0 * 1.0 * float(60 * 3 * 4096 * (1024 // 8))
+    routed_unpad = mods_unpad["moe"].fp8_flops - shared_fp8
+    routed_pad = mods_pad["moe"].fp8_flops - shared_fp8
+    assert routed_pad == pytest.approx(routed_unpad * 256.0, rel=1e-9)
+    # Charging all 512 experts would be 51.2x higher than charging
+    # the 10 touched experts.
+    assert routed_pad < routed_unpad * 256.0 * (20.0 / 10.0)
+
+    # Under EP (moe="ep", ep=8, tp=8), global touched experts ed_global = 10 are split
+    # across 8 EP ranks (10 / 8 = 1.25 touched local experts per rank, NOT 64 local).
+    par_ep = Parallel(tp=8, ep=8, moe="ep")
+    ep_unpad = {m.name: m for m in pass_costs(geom, par_ep, shape, dt, mxu_m_tile=1)}
+    ep_pad = {m.name: m for m in pass_costs(geom, par_ep, shape, dt, mxu_m_tile=256)}
+    ep_routed_unpad = ep_unpad["moe"].fp8_flops - shared_fp8
+    ep_routed_pad = ep_pad["moe"].fp8_flops - shared_fp8
+    # Unpadded per-rank routed tokens = 10 / 8 = 1.25; padded = (10 / 8) * 256 = 320.0.
+    assert ep_routed_pad == pytest.approx(ep_routed_unpad * 256.0, rel=1e-9)

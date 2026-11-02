@@ -31,7 +31,13 @@ from .emit import (
     pool_cli_args,
     top_layouts,
 )
-from .geometry import LAYER_FAMILIES, ModelGeometry, from_hf_config
+from .geometry import (
+    LAYER_FAMILIES,
+    ModelGeometry,
+    UnsupportedArchitectureError,
+    from_hf_config,
+    supports,
+)
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import (
     Dtypes,
@@ -76,6 +82,7 @@ __all__ = [
     "ConcurrencyRow",
     "Dtypes",
     "ModelGeometry",
+    "UnsupportedArchitectureError",
     "ModuleCost",
     "Parallel",
     "ParetoPoint",
@@ -103,6 +110,7 @@ __all__ = [
     "ep_busiest_experts",
     "experts_touched",
     "from_hf_config",
+    "supports",
     "hbm_breakdown_per_core_bytes",
     "hbm_footprint_per_core_bytes",
     "load_hf_config",
