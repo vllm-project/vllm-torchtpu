@@ -18,7 +18,10 @@ the logs. With N > 0:
   VLLM_TPU_LOOP_LAG_WATCHDOG_S (default 30) dumps its stacks once per stall,
   even when the blocking code holds the GIL. The block length is logged when
   the loop resumes. The engine can be idle during such a stall (outputs pile
-  up unread), so the step watch above cannot see it.
+  up unread), so the step watch above cannot see it;
+- both watches also write heartbeats for the out-of-process py-spy monitor
+  (freeze_spy.py, VLLM_TPU_FREEZE_PYSPY_S, default 120), which dumps native
+  stacks when a heartbeat stops (a C call holding the GIL) or progress stops.
 """
 
 import asyncio
@@ -30,7 +33,7 @@ import sys
 import threading
 import time
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, freeze_spy
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -65,8 +68,11 @@ def install_signal_dump() -> None:
     # Plugins load before vLLM configures logging; write directly to stderr.
     sys.stderr.write(f"Stall watchdog: SIGUSR2 dumps the stacks of pid {os.getpid()}\n")
     sys.stderr.flush()
+    freeze_spy.allow_ptrace()
     # Engine core and workers are multiprocessing children; the API server
     # is the process `vllm serve` started.
+    if freeze_spy.seconds() > 0 and multiprocessing.parent_process() is None:
+        freeze_spy.launch(freeze_spy.seconds())
     if _loop_lag_seconds() > 0 and multiprocessing.parent_process() is None:
         threading.Thread(
             target=_hook_api_server_loop, name="loop-lag-hook", daemon=True
@@ -121,6 +127,7 @@ def _watch(limit: float, rank: int) -> None:
         if not _armed or not _last_step:
             continue
         idle = time.monotonic() - _last_step
+        freeze_spy.heartbeat(f"rank{rank}", _live_reqs, time.time() - idle)
         if idle < limit or _live_reqs == 0:
             dumped = False
             continue
@@ -225,6 +232,7 @@ async def _loop_watch(limit: float) -> None:
             start = time.monotonic()
             await asyncio.sleep(period)
             lag = time.monotonic() - start - period
+            freeze_spy.heartbeat("api", 0, 0.0)
             if lag >= limit:
                 logger.warning(
                     "LOOP STALL pid=%d: event loop was blocked for %.1f s (stacks dumped above)",

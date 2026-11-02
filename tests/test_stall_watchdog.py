@@ -8,6 +8,9 @@ from vllm_torchtpu import stall_watchdog
 
 def test_signal_handler_is_visible_in_sigcgt(monkeypatch):
     monkeypatch.setenv("VLLM_TPU_STALL_WATCHDOG_S", "60")
+    # No freeze-spy monitor or loop hook from the test process.
+    monkeypatch.setenv("VLLM_TPU_FREEZE_PYSPY_S", "0")
+    monkeypatch.setenv("VLLM_TPU_LOOP_LAG_WATCHDOG_S", "0")
     stall_watchdog.install_signal_dump()
     assert stall_watchdog._catches_sigusr2(os.getpid())
     assert not stall_watchdog._catches_sigusr2(1) or os.getpid() == 1
