@@ -85,8 +85,13 @@ def test_calculate_block_sizes_generation(
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
 
 
-@pytest.mark.parametrize("sliding_window", [1024, None])
-def test_sliding_decode_max_bkv_caps_only_sliding_decode(sliding_window):
+@pytest.mark.parametrize(
+    "sliding_window, capped_decode_bkv",
+    [(1024, 512), (128, 256), (None, None)],  # 256: the first block searched
+)
+def test_sliding_decode_block_cap_applies_only_to_sliding_decode(
+    sliding_window, capped_decode_bkv
+):
     # Gemma4 31B TP8 sliding-layer shapes, where the default decode block is 1792.
     model_cfg = configs.ModelConfigs(
         num_q_heads=4,
@@ -111,10 +116,10 @@ def test_sliding_decode_max_bkv_caps_only_sliding_decode(sliding_window):
     ):
         default = wrapper.calculate_block_sizes(model_cfg, serve_cfg, vmem_limit)
         capped = wrapper.calculate_block_sizes(
-            model_cfg, serve_cfg, vmem_limit, sliding_decode_max_bkv=512
+            model_cfg, serve_cfg, vmem_limit, cap_sliding_decode_block=True
         )
     assert default[0].bkv_sz > 512
-    expected_decode_bkv = 512 if sliding_window else default[0].bkv_sz
+    expected_decode_bkv = capped_decode_bkv or default[0].bkv_sz
     assert capped[0] == dataclasses.replace(default[0], bkv_sz=expected_decode_bkv)
     assert capped[1] == default[1]
 

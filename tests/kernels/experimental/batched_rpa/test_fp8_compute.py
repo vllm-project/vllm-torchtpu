@@ -18,6 +18,8 @@ side: the block geometry, the call validation, the query cast, and that the
 mixed kernel still lowers for tpu7x with fp8 queries.
 """
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -65,6 +67,22 @@ def test_fp8_prefill_block_sizes(heads, expected):
     with use_abstract_mesh(mesh):
         blocks = wrapper.fp8_prefill_block_sizes(*_cfgs(*heads), 64 * 1024 * 1024)
     assert blocks == expected
+
+
+@pytest.mark.parametrize("sliding_window", [1024, None])
+def test_fp8_prefill_block_sizes_take_the_sliding_cap(sliding_window):
+    model, serve = _cfgs(4, 1)
+    model = dataclasses.replace(model, sliding_window=sliding_window)
+    mesh = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(mesh):
+        blocks = wrapper.fp8_prefill_block_sizes(
+            model, serve, 64 * 1024 * 1024, sliding_prefill_max_bkv=300
+        )
+    if sliding_window:
+        # 300 rounds down to the 256-token MXU column stride and the 64-token chunk.
+        assert blocks == configs.BlockSizes(256, 64, 256, 1)
+    else:
+        assert blocks == configs.BlockSizes(2048, 64, 512, 1)
 
 
 def test_fp8_prefill_block_sizes_shrink_to_fit_vmem():
