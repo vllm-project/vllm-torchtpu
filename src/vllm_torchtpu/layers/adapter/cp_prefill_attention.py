@@ -199,8 +199,8 @@ def _layer_config(
     if impl.rpa_kernel is None and impl.rpa_dcp_cache_kernel is None:
         # initialize_kernel decides DCP and PCP, which the checks below read.
         raise RuntimeError(
-            f"{attn.layer_name}: prepare_cp_prefill_attention runs after the "
-            "backend's initialize_kernel."
+            f"{attn.layer_name}: prepare_cp_prefill_attention needs the backend's "
+            "kernels, which initialize_kernel builds; this layer has none."
         )
     if impl.kv_cache_quantized_dtype != torch.float8_e4m3fn:
         raise NotImplementedError(

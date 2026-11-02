@@ -18,6 +18,11 @@ against the K/V each position must see, the serving-cache writes against the
 pages `wrapper.prepare_inputs` lays out, and that the kernel lowers for tpu7x.
 """
 
+import json
+import os
+import subprocess
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -122,7 +127,7 @@ def test_halo_exchange_gives_each_piece_its_window(traced):
         cp_prefill.pack_kv_pages(_rank_rows(k, plan, r), _rank_rows(v, plan, r), PAGE)
         for r in range(plan.world)
     ]
-    tails = [cp_prefill.piece_tails(pages, plan, halo) for pages in own]
+    tails = [cp_prefill.piece_tails(pages, halo) for pages in own]
     up, down = cp_prefill.halo_permutations(plan.world)
     received = [[None, None] for _ in range(plan.world)]
     for slot, pairs in enumerate((up, down)):
@@ -141,6 +146,67 @@ def test_halo_exchange_gives_each_piece_its_window(traced):
             np.testing.assert_array_equal(
                 _bytes(local[tables[sub][seen]]), _bytes(in_order[seen])
             )
+
+
+def _halo_worker(world: int) -> dict:
+    """Runs `exchange_halos` under shard_map on `world` host devices and checks
+    every rank's halos against the pages of the pieces before its two."""
+    from jax.sharding import Mesh
+    from jax.sharding import PartitionSpec as P
+
+    halo = 4
+    plan = cp_prefill.make_zigzag_plan(world * 2 * 8 * PAGE, world, PAGE)
+    pp = plan.piece_pages
+    k, v = _kv(plan.num_tokens, 8, 128, seed=10)
+    in_order = cp_prefill.pack_kv_pages(k, v, PAGE)
+    own = jnp.concatenate(
+        [
+            cp_prefill.pack_kv_pages(
+                _rank_rows(k, plan, r), _rank_rows(v, plan, r), PAGE
+            )
+            for r in range(world)
+        ]
+    )
+    mesh = Mesh(np.array(jax.devices()[:world]), ("x",))
+    halos = jax.jit(
+        jax.shard_map(
+            lambda pages: cp_prefill.exchange_halos(pages, halo, "x", world),
+            mesh=mesh,
+            in_specs=P("x"),
+            out_specs=P("x"),
+        )
+    )(own)
+    halos = np.asarray(halos).reshape(world, 2 * halo, *in_order.shape[1:])
+    ok = []
+    for rank in range(world):
+        for slot, piece in enumerate(plan.rank_pieces(rank)):
+            if (slot, rank) in ((0, 0), (1, world - 1)):
+                continue  # what the wrap delivers is unused (sliding_local_pages)
+            want = np.asarray(in_order[piece * pp - halo : piece * pp])
+            got = halos[rank, slot * halo : (slot + 1) * halo]
+            ok.append(bool((got.view(np.uint8) == want.view(np.uint8)).all()))
+    return {"checked": len(ok), "all_equal": all(ok)}
+
+
+@pytest.mark.parametrize("world", [2, 8])
+def test_exchange_halos_delivers_the_preceding_tails(world):
+    flags = os.environ.get("XLA_FLAGS", "")
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count={world}",
+    )
+    proc = subprocess.run(
+        [sys.executable, __file__, str(world)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
+    result = json.loads(lines[-1][len("RESULT ") :])
+    assert result == {"checked": 2 * world - 2, "all_equal": True}
 
 
 def test_sub_request_metadata_places_queries_at_absolute_positions():
@@ -414,3 +480,7 @@ def test_cp_prefill_attention_lowers_for_tpu7x(heads, head_dim, window, fp8_comp
 
         lowered = jax.jit(call).trace(q, pages).lower(lowering_platforms=("tpu",))
     assert "RPAm-snh-p256" in lowered.as_text()
+
+
+if __name__ == "__main__":
+    print("RESULT " + json.dumps(_halo_worker(int(sys.argv[1]))))

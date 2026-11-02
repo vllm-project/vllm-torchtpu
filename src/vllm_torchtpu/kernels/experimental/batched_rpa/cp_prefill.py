@@ -201,11 +201,10 @@ def halo_permutations(world: int) -> tuple[list[tuple[int, int]], ...]:
     return up, down
 
 
-def piece_tails(
-    own_pages: jax.Array, plan: ZigzagPlan, halo_pages: int
-) -> tuple[jax.Array, jax.Array]:
-    """The last `halo_pages` pages of the rank's first and second piece."""
-    pp = plan.piece_pages
+def piece_tails(own_pages: jax.Array, halo_pages: int) -> tuple[jax.Array, jax.Array]:
+    """The last `halo_pages` pages of the rank's first and second piece;
+    `own_pages` holds the two pieces."""
+    pp = own_pages.shape[0] // 2
     return own_pages[pp - halo_pages : pp], own_pages[2 * pp - halo_pages :]
 
 
@@ -214,13 +213,13 @@ def exchange_halos(
 ) -> jax.Array:
     """[first piece's halo | second piece's halo] of this rank, inside a
     `shard_map` over `axis_name`: the `halo_permutations` shifts of every
-    rank's piece tails. `own_pages` holds the rank's two pieces."""
-    pp = own_pages.shape[0] // 2
+    rank's `piece_tails`."""
+    first, second = piece_tails(own_pages, halo_pages)
     up, down = halo_permutations(world)
     return jnp.concatenate(
         [
-            jax.lax.ppermute(own_pages[pp - halo_pages : pp], axis_name, up),
-            jax.lax.ppermute(own_pages[2 * pp - halo_pages :], axis_name, down),
+            jax.lax.ppermute(first, axis_name, up),
+            jax.lax.ppermute(second, axis_name, down),
         ]
     )
 
