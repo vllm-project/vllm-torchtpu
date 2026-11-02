@@ -49,7 +49,3 @@ automatic_reviews: on
 # "draft" at the start or in brackets ([WIP], Draft:, (draft)), or with
 # "do not review", "do not merge" or "do not submit" anywhere.
 title_keywords_to_skip:
-
-# How the bot uses REVIEW.md: bot keeps the bot's own review format, repo lets
-# REVIEW.md also set the format and verdict.
-review_format: bot

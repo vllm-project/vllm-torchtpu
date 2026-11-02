@@ -34,7 +34,6 @@ The values in `config.yaml` today are the defaults.
 | `cooldown_minutes` | Whole number, 15 to 1440 | `60` | Shortest time between two reviews of one PR. A request that comes sooner waits until the time is up. |
 | `automatic_reviews` | `on`, `off` | `on` | `on`: the bot reviews a PR once without being asked, when the PR is ready (see below). `off`: it reviews only when someone asks. |
 | `title_keywords_to_skip` | Words in double quotes, separated by commas, or empty | empty | More words that stop an automatic review when they appear anywhere in a PR title, ignoring case. They add to the built-in markers below. Asking for a review still works. |
-| `review_format` | `bot`, `repo` | `bot` | How the bot uses `REVIEW.md`. `bot`: `REVIEW.md` says what to check, and the bot keeps its own review format, including the "Looks good." line. `repo`: `REVIEW.md` also sets the review's format and verdict and wins over the bot's own rules, and the bot also sees CI status, merge conflicts and linked issues. |
 
 ### Format
 
@@ -107,17 +106,16 @@ Later reviews happen only on request.
 `REVIEW.md` is the guide the bot follows when it reviews a PR here: the review
 passes, the rules for each folder, how to comment, and what not to flag. Its
 rule IDs point to `docs/developers_guide/coding_guidance.md` and
-`docs/developers_guide/optimization_best_practices.md`. Edit it to change what
-the bot checks.
+`docs/developers_guide/optimization_best_practices.md`. Edit it to change how
+the bot reviews.
 
+- Its instructions win over the bot's own rules, except that inline comments
+  still go only on lines the PR changes. `AGENTS.md` still wins on code rules.
 - The bot reads it from `main`, like the settings, so a PR cannot change the
   guide for its own review.
-- With `review_format: bot`, the bot's own rules still apply on top of it:
-  inline comments only for real problems on changed lines, and its summary
-  format with the "Looks good." line.
-- With `review_format: repo`, the guide also sets the review's format and
-  verdict. Its instructions then win over the bot's own rules, except that
-  inline comments still go only on lines the PR changes.
+- If it defines a review format and a verdict line, the bot uses them.
+  Otherwise the bot keeps its own format, which starts a clean review with
+  "Looks good.".
 - If the file is deleted, the bot falls back to a built-in guide kept in its
   own code.
 
