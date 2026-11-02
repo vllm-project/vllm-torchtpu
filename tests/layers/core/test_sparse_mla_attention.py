@@ -1326,7 +1326,7 @@ class MaskedDenseRouteCompositionTest(parameterized.TestCase):
             jnp.asarray([num_decode, num_decode, num_seqs], jnp.int32),
         )
 
-    def _route(self):
+    def _route(self, **loop_options):
         def fn(*operands_and_tier):
             *operands, forced = operands_and_tier
             with (
@@ -1355,7 +1355,7 @@ class MaskedDenseRouteCompositionTest(parameterized.TestCase):
                 ),
             ):
                 return mla_dispatch.attention_from_parts(
-                    *operands, sm_scale=1.0, k_scale=1.0
+                    *operands, sm_scale=1.0, k_scale=1.0, **loop_options
                 )
 
         return fn
@@ -1391,6 +1391,29 @@ class MaskedDenseRouteCompositionTest(parameterized.TestCase):
         )
 
     @parameterized.named_parameters(
+        (f"{name}_tier{tier}", tier, q_lens, seq_lens, num_decode)
+        for name, q_lens, seq_lens, num_decode in ROUTE_COMPOSITIONS
+        for tier in (0, 1, 2)
+    )
+    def test_fori_routes_match_unrolled(self, tier, q_lens, seq_lens, num_decode):
+        operands = self._operands(q_lens, seq_lens, num_decode)
+        forced = jnp.asarray(tier, jnp.int32)
+        # 16-row chunks, so the 64 rows make four chunks and the loop applies.
+        with mock.patch.object(
+            sparse_mla_kernel, "DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE", 16
+        ):
+            unrolled_fn, looped_fn = self._route(), self._route(fori_min_chunks=2)
+            unrolled = jax.jit(unrolled_fn)(*operands, forced)
+            looped = jax.jit(looped_fn)(*operands, forced)
+            texts = [
+                jax.jit(f).lower(*operands, forced).as_text()
+                for f in (unrolled_fn, looped_fn)
+            ]
+        np.testing.assert_array_equal(np.asarray(looped), np.asarray(unrolled))
+        self.assertEqual(texts[0].count("stablehlo.while"), 0)
+        self.assertGreater(texts[1].count("stablehlo.while"), 0)
+
+    @parameterized.named_parameters(
         (name, q_lens, seq_lens, num_decode)
         for name, q_lens, seq_lens, num_decode in ROUTE_COMPOSITIONS
     )
@@ -1421,17 +1444,21 @@ class SparsePrefixTest(parameterized.TestCase):
 
     NUM_ROWS = 128
 
-    @parameterized.parameters(1, 15, 16, 17, 63, 64, 65, 100, 113, 127)
-    def test_suffix_rows_are_preserved(self, split_token):
+    @parameterized.product(
+        split_token=(1, 15, 16, 17, 63, 64, 65, 100, 113, 127),
+        fori_min_chunks=(None, 2),
+    )
+    def test_suffix_rows_are_preserved(self, split_token, fori_min_chunks):
         q = jnp.asarray(
             np.random.default_rng(3).standard_normal((self.NUM_ROWS, 2, 8)), jnp.float32
         )
 
-        def run_chunk(q, start_pos, token_end):
+        def run_chunk(q, start_pos, chunk_size, token_end, caches):
+            del caches
             return MaskedDenseRouteCompositionTest._fake_sparse_chunk(
                 q,
                 start_pos=start_pos,
-                end_pos=min(start_pos + 64, self.NUM_ROWS),
+                end_pos=start_pos + chunk_size,
                 token_end=token_end,
                 preserve_suffix=True,
             )
@@ -1439,7 +1466,9 @@ class SparsePrefixTest(parameterized.TestCase):
         with mock.patch.object(mla_dispatch, "MASKED_DENSE_MIN_SUFFIX_TOKENS", 0):
             out = np.asarray(
                 jax.jit(
-                    lambda q, split: mla_dispatch._sparse_prefix(q, split, run_chunk)
+                    lambda q, split: mla_dispatch._sparse_prefix(
+                        q, split, run_chunk, (), fori_min_chunks=fori_min_chunks
+                    )
                 )(q, jnp.asarray(split_token, jnp.int32))
             )
         expected = np.asarray(q).copy()
@@ -1449,10 +1478,30 @@ class SparsePrefixTest(parameterized.TestCase):
     def test_chunks_in_the_minimum_suffix_are_not_emitted(self):
         q = jnp.zeros((1024, 2, 8), jnp.float32)
         jaxpr = jax.make_jaxpr(
-            lambda q, split: mla_dispatch._sparse_prefix(q, split, lambda q, **k: q)
+            lambda q, split: mla_dispatch._sparse_prefix(q, split, lambda q, **k: q, ())
         )(q, jnp.asarray(1, jnp.int32))
         conds = [e for e in jaxpr.jaxpr.eqns if e.primitive.name == "cond"]
         self.assertLen(conds, (1024 - 512) // 64)
+
+    def test_fori_prefix_holds_one_chunk(self):
+        q = jnp.zeros((1024, 2, 8), jnp.float32)
+
+        def prefix(**loop_options):
+            return (
+                jax.jit(
+                    lambda q, split: mla_dispatch._sparse_prefix(
+                        q, split, lambda q, **k: q * 2, (), **loop_options
+                    )
+                )
+                .lower(q, jnp.asarray(1, jnp.int32))
+                .as_text()
+            )
+
+        unrolled, looped = prefix(), prefix(fori_min_chunks=2)
+        self.assertEqual(unrolled.count("stablehlo.while"), 0)
+        self.assertEqual(unrolled.count("stablehlo.case"), (1024 - 512) // 64)
+        self.assertEqual(looped.count("stablehlo.while"), 1)
+        self.assertEqual(looped.count("stablehlo.case"), 1)
 
     @parameterized.parameters(
         (0, 64, 17, 32),
@@ -1895,3 +1944,33 @@ class MaskedDenseAdmissionTest(parameterized.TestCase):
         self.assertFalse(self._admit(runner, num_heads=16).allow_masked_dense)
         self.assertTrue(self._admit(runner).allow_masked_dense)
         self.assertIs(runner._masked_dense_groups_requests, False)
+
+
+class SparseMlaChunkLoopOptionsTest(parameterized.TestCase):
+    """TPU_MLA_SPARSE_CHUNK_FORI* reach the kernel and the router as fori options."""
+
+    def test_off_by_default_passes_nothing(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TPU_MLA_SPARSE_CHUNK_FORI", None)
+            self.assertEqual(attention_interface.sparse_mla_chunk_loop_options(), {})
+
+    def test_on_passes_min_chunks_and_unroll(self):
+        env = {
+            "TPU_MLA_SPARSE_CHUNK_FORI": "1",
+            "TPU_MLA_SPARSE_CHUNK_FORI_MIN_CHUNKS": "4",
+            "TPU_MLA_SPARSE_CHUNK_FORI_UNROLL": "16",
+        }
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(
+                attention_interface.sparse_mla_chunk_loop_options(),
+                {"fori_min_chunks": 4, "fori_unroll": 16},
+            )
+
+    def test_on_uses_the_defaults(self):
+        with mock.patch.dict(os.environ, {"TPU_MLA_SPARSE_CHUNK_FORI": "1"}):
+            os.environ.pop("TPU_MLA_SPARSE_CHUNK_FORI_MIN_CHUNKS", None)
+            os.environ.pop("TPU_MLA_SPARSE_CHUNK_FORI_UNROLL", None)
+            self.assertEqual(
+                attention_interface.sparse_mla_chunk_loop_options(),
+                {"fori_min_chunks": 2, "fori_unroll": 1},
+            )
