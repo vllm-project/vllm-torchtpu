@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: int = 0
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -1155,6 +1156,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # MTP draft (DeepSeek-V3.2 / GLM-5.2 DSA): draft step 0 of a chunk with at
+    # least this many (padded) tokens runs in two passes. Pass 1 only writes the
+    # MTP layer's KV and indexer-K caches for every row; pass 2 runs the full
+    # layer on one row per request, the only rows a draft token is read from.
+    # Same draft tokens and caches, without the indexer, sparse attention, MoE
+    # and DCP merge of every other prefill row (spec_decode/mtp_kv_only.py).
+    # 0 (default) keeps the single full pass.
+    "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", 0
+    ),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
