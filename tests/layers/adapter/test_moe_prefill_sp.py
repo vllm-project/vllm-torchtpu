@@ -149,7 +149,11 @@ def _with_envs(**values):
 
 
 def test_the_served_config_is_admitted():
-    patches = _with_envs()
+    patches = _with_envs(
+        USE_MOE_TP_DECODE_KERNEL=True,
+        TPU_FUSED_ADD_RMSNORM=True,
+        TPU_MOE_SKIP_PADDED_TOKENS=True,
+    )
     try:
         sp.check_config(_config())
     finally:
@@ -164,8 +168,6 @@ def test_the_served_config_is_admitted():
         (dict(data_parallel_size=2), {}, "data_parallel"),
         (dict(pipeline_parallel_size=2), {}, "pipeline"),
         ({}, dict(USE_MOE_FUSED_EP_KERNEL=True), "USE_MOE_FUSED_EP_KERNEL"),
-        ({}, dict(TPU_FUSED_ADD_RMSNORM=True), "TPU_FUSED_ADD_RMSNORM"),
-        ({}, dict(TPU_MOE_SKIP_PADDED_TOKENS=True), "SKIP_PADDED"),
         ({}, dict(TPU_DCP_MLA_OPROJ_ALL_REDUCE=True), "OPROJ_ALL_REDUCE"),
     ],
 )

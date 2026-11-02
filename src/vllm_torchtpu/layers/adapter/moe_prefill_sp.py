@@ -508,7 +508,6 @@ def check_config(vllm_config: Any) -> None:
         "does not take USE_MOE_FUSED_EP_KERNEL (it owns every bucket)": (
             envs.USE_MOE_FUSED_EP_KERNEL
         ),
-        "does not take USE_MOE_TP_DECODE_KERNEL": envs.USE_MOE_TP_DECODE_KERNEL,
         "does not take TPU_DCP_MLA_OPROJ_ALL_REDUCE": envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE,
     }
     bad = [why for why, hit in refusals.items() if hit]
