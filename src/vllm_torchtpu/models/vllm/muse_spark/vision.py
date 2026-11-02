@@ -33,8 +33,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
-
-from .config import MuseSparkVisionConfig
+from vllm.transformers_utils.configs.muse_spark import MuseSparkVisionConfig
 
 
 def _precompute_rope_freqs_cis(

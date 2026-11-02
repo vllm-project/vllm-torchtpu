@@ -167,8 +167,9 @@ def image_model(monkeypatch, cpu_vllm_config_context):
     # Keep graph specializations independent across fixtures.
     torch._dynamo.reset()
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+    from vllm.transformers_utils.configs.muse_spark import MuseSparkVisionConfig
+
     from vllm_torchtpu.models.vllm.muse_spark import vision
-    from vllm_torchtpu.models.vllm.muse_spark.config import MuseSparkVisionConfig
     from vllm_torchtpu.models.vllm.muse_spark.multimodal import (
         MuseSparkForConditionalGeneration,
     )

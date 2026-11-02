@@ -19,8 +19,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from vllm.transformers_utils.configs.muse_spark import MuseSparkTextConfig
 
-from vllm_torchtpu.models.vllm.muse_spark.config import MuseSparkTextConfig
 from vllm_torchtpu.models.vllm.muse_spark.layers import (
     MuseResidual,
     MuseRMSNorm,

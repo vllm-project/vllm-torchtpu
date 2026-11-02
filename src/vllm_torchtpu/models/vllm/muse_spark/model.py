@@ -64,8 +64,9 @@ from .weights import (
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.transformers_utils.configs.muse_spark import MuseSparkTextConfig
+
     from .audio import AutoEncoder
-    from .config import MuseSparkTextConfig
     from .vision import NaViT, NaViTAdapter
 
 

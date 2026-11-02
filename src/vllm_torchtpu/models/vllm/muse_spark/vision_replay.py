@@ -35,7 +35,8 @@ from .vision import (
 )
 
 if TYPE_CHECKING:
-    from .config import MuseSparkTextConfig
+    from vllm.transformers_utils.configs.muse_spark import MuseSparkTextConfig
+
     from .layers import MuseRMSNorm
     from .model import _MuseModelComponents
 

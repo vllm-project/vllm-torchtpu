@@ -185,6 +185,7 @@ class MuseSparkForConditionalGeneration(
         )
         self._vision_output_dim = hf_config.out_hidden_size
 
+    # pyrefly: ignore[bad-override]
     def get_language_model(self) -> MuseSparkForCausalLM:
         return self
 
