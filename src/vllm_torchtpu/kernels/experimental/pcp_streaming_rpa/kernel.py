@@ -447,18 +447,21 @@ def _consume_scheduled_kv_page_multi_head(
     compute_dtype = q_vmem_ref.dtype
 
     def _consume_kv_head(k, v, kv_head_idx):
-        if k_scale is not None:
-            k = (k.astype(jnp.float32) * k_scale).astype(compute_dtype)
-        if v_scale is not None:
-            v = (v.astype(jnp.float32) * v_scale).astype(compute_dtype)
-        if not causal:
+        k, v = (
+            x.astype(compute_dtype)
+            if scale in (None, 1.0)
+            else (x.astype(jnp.float32) * scale).astype(compute_dtype)
+            for x, scale in ((k, k_scale), (v, v_scale))
+        )
+        if not causal and sm_scale != 1.0:
             k = k * sm_scale
 
-        def _q_compute_loop(q_compute_idx, carry):
-            del carry
+        def _update(q_start, masked):
+            """Fold the block into the Q rows from ``q_start``; ``masked``
+            applies the causal, validity and padding masks (without them, a
+            block every row sees whole)."""
             k_compute = k
             v_compute = v
-            q_start = pl.multiple_of(q_compute_idx * q_compute_size, q_compute_size)
             q_slice = q_vmem_ref.at[
                 pl.ds(q_start, q_compute_size),
                 kv_head_idx,
@@ -484,7 +487,7 @@ def _consume_scheduled_kv_page_multi_head(
                 :,
             ][...]
 
-            if causal:
+            if masked:
                 q_row = q_start + lax.broadcasted_iota(
                     jnp.int32, (q_compute_size, q_per_kv, 1), 0
                 )
@@ -512,8 +515,9 @@ def _consume_scheduled_kv_page_multi_head(
                 preferred_element_type=jnp.float32,
             )
 
-            if causal:
+            if causal and sm_scale != 1.0:
                 scores = scores * sm_scale
+            if masked:
                 q_interleave = interleave_size
                 q_pos = query_row_positions(
                     q_global_start,
@@ -538,14 +542,14 @@ def _consume_scheduled_kv_page_multi_head(
                 scores = jnp.where(row_active, scores, 0.0)
 
             m_curr = jnp.max(scores, axis=2, keepdims=True)
-            if causal:
+            if masked:
                 m_next = jnp.where(row_active, jnp.maximum(m_head, m_curr), m_head)
             else:
                 m_next = jnp.maximum(m_head, m_curr)
             m_next_broadcast = broadcast_minor(m_next, scores.shape)
             p = jnp.exp(scores - m_next_broadcast)
             alpha = jnp.exp(m_head - m_next)
-            if causal:
+            if masked:
                 p = jnp.where(row_active, p, 0.0)
                 alpha = jnp.where(row_active, alpha, 1.0)
             l_next = alpha * l_head + jnp.sum(p, axis=2, keepdims=True)
@@ -580,6 +584,36 @@ def _consume_scheduled_kv_page_multi_head(
                 :,
                 :,
             ][...] = acc_next
+
+        def _q_compute_loop(q_compute_idx, carry):
+            del carry
+            q_start = pl.multiple_of(q_compute_idx * q_compute_size, q_compute_size)
+            if not causal:
+                _update(q_start, masked=False)
+                return jnp.array(0, dtype=jnp.int32)
+            # A block every row sees whole (all rows and keys valid, the last key
+            # at or before the first row) skips the masks.
+            last_kv = kv_valid_len - 1
+            last_kv_pos = (
+                kv_global_start
+                + lax.div(last_kv, interleave_size) * pcp_size * interleave_size
+                + lax.rem(last_kv, interleave_size)
+            )
+            first_q_pos = query_row_positions(
+                q_global_start,
+                q_hbm_offset,
+                q_start,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+            )
+            whole = jnp.logical_and(
+                jnp.logical_and(req_id != -1, q_start + q_compute_size <= q_tile_size),
+                jnp.logical_and(
+                    kv_valid_len == kv_block_tokens, last_kv_pos <= first_q_pos
+                ),
+            )
+            pl.when(whole)(functools.partial(_update, q_start, False))
+            pl.when(jnp.logical_not(whole))(functools.partial(_update, q_start, True))
             return jnp.array(0, dtype=jnp.int32)
 
         lax.fori_loop(
@@ -1169,8 +1203,9 @@ def _normalize_q_compute_size(q_block_size: int, q_compute_size: int | None) -> 
 
 
 def _load_compact_q_tile_multi_head(
-    q_ref, q_vmem_ref, local_dma_sem, q_hbm_offset, q_tile_size
+    q_ref, q_vmem_ref, local_dma_sem, q_hbm_offset, q_tile_size, scale=None
 ):
+    """The Q tile into VMEM (zero past its rows), times ``scale`` if given."""
     q_vmem_ref[...] = jnp.zeros_like(q_vmem_ref)
 
     @pl.when(q_tile_size > 0)
@@ -1192,6 +1227,14 @@ def _load_compact_q_tile_multi_head(
         )
         q_load.start()
         q_load.wait()
+        if scale is not None:
+            q_vmem_ref[...] = q_vmem_ref[...] * scale
+
+
+def _exact_q_scale(sm_scale):
+    """``sm_scale`` when scaling the BF16 queries by it is exact (a power of
+    two): the kernels then scale each Q tile once instead of every score."""
+    return sm_scale if math.frexp(sm_scale)[0] == 0.5 else None
 
 
 def _store_compact_output_tile_multi_head(
@@ -1475,6 +1518,7 @@ def _run_pcp_page_groups_multi_head(
                 local_dma_sem,
                 q_hbm_offset,
                 q_tile_size,
+                scale=_exact_q_scale(sm_scale),
             )
 
         _stage_schedule_step_from_tile_plan(
@@ -1622,7 +1666,7 @@ def _run_pcp_page_groups_multi_head(
                 m_scratch_ref,
                 l_scratch_ref,
                 acc_scratch_ref,
-                sm_scale=sm_scale,
+                sm_scale=1.0 if _exact_q_scale(sm_scale) else sm_scale,
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
                 q_compute_size=q_compute_size,
