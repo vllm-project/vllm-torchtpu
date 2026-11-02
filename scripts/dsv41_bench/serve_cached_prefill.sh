@@ -27,11 +27,14 @@ fi
 if [[ -n "${MAX_MODEL_LEN:-}" ]]; then
   server_args+=(--max-model-len "$MAX_MODEL_LEN")
 fi
+# One API server: with the default of one per DP rank, every server pulls
+# config.json from object storage into the same unlocked cache directory, and
+# a concurrent reader can parse a still-empty file.
 exec vllm serve "$model" \
   --tokenizer "$model_path" \
   --load-format runai_streamer --served-model-name deepseek-v41 \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" \
-  --tensor-parallel-size "$tp" --data-parallel-size "$dp" \
+  --tensor-parallel-size "$tp" --data-parallel-size "$dp" --api-server-count 1 \
   --enable-expert-parallel --enable-ep-weight-filter --language-model-only \
   --async-scheduling --enable-prefix-caching --kv-cache-dtype fp8 \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
