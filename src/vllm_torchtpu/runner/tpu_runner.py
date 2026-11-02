@@ -6947,8 +6947,9 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, self.max_num_tokens, self._pp_intermediate_template
             )
             self._pp_wave.warmup()
-        if self._megakernel is not None:
-            self._megakernel.bind_and_warmup(self)
+        megakernel = getattr(self, "_megakernel", None)
+        if megakernel is not None:
+            megakernel.bind_and_warmup(self)
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
@@ -6958,9 +6959,8 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_sampling_subgraphs()
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
-            precompile_inputs = getattr(
-                self.model_adapter, "precompile_fused_inputs", None
-            )
+            model_adapter = getattr(self, "model_adapter", None)
+            precompile_inputs = getattr(model_adapter, "precompile_fused_inputs", None)
             if precompile_inputs is not None:
                 with self._precompile_timed("fused model-adapter inputs"):
                     precompile_inputs(
@@ -8059,13 +8059,14 @@ class TPUModelRunner(GPUModelRunner):
         intermediate_tensors=None,
         model_kwargs=None,
     ):
-        if self._megakernel is not None:
+        megakernel = getattr(self, "_megakernel", None)
+        if megakernel is not None:
             extra = (
                 {"model_kwargs": model_kwargs}
-                if getattr(self._megakernel, "takes_model_kwargs", False)
+                if getattr(megakernel, "takes_model_kwargs", False)
                 else {}
             )
-            hit, out = self._megakernel.try_forward(
+            hit, out = megakernel.try_forward(
                 self, input_ids, positions, inputs_embeds, intermediate_tensors, **extra
             )
             if hit:

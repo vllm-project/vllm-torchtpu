@@ -94,6 +94,43 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
 
 
+_CPU_JAX_TESTS_SINCE_CLEAR = 0
+
+
+def _maybe_clear_cpu_jax_caches() -> None:
+    if os.path.exists("/dev/vfio") or "jax" not in sys.modules:
+        return
+    import gc
+
+    from jax._src import xla_bridge
+
+    if xla_bridge.backends_are_initialized():
+        sys.modules["jax"].clear_caches()
+        gc.collect()
+
+
+@pytest.fixture(autouse=True)
+def _periodic_cpu_jax_cache_gc():
+    """Bound peak RSS across heavy CPU Pallas interpret suites without touching TPU."""
+    global _CPU_JAX_TESTS_SINCE_CLEAR
+    yield
+    if os.path.exists("/dev/vfio") or "jax" not in sys.modules:
+        return
+    _CPU_JAX_TESTS_SINCE_CLEAR += 1
+    if _CPU_JAX_TESTS_SINCE_CLEAR >= 8:
+        _CPU_JAX_TESTS_SINCE_CLEAR = 0
+        _maybe_clear_cpu_jax_caches()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _module_cpu_jax_cache_gc():
+    """Reclaim compiled CPU JAX/Pallas executables at every module boundary."""
+    global _CPU_JAX_TESTS_SINCE_CLEAR
+    yield
+    _CPU_JAX_TESTS_SINCE_CLEAR = 0
+    _maybe_clear_cpu_jax_caches()
+
+
 @pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""

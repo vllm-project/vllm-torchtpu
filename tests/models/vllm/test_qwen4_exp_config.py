@@ -218,3 +218,32 @@ def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role, ssm_dtype):
         with pytest.raises(ValueError):
             validate_config(cfg)
         setattr(target, field, original)
+
+
+def test_get_qsa_kv_cache_bytes_per_block_supports_1arg_and_2arg_vllm(monkeypatch):
+    from vllm.v1.core import kv_cache_utils
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import (
+        get_qsa_kv_cache_bytes_per_block,
+        resolve_qsa_kv_cache_layout,
+    )
+
+    cfg = config()
+    seen = []
+
+    def one_arg(kv_cache_groups):
+        seen.append(("1arg", kv_cache_groups))
+        return 4096
+
+    def two_arg(kv_cache_groups, kv_cache_layout=None):
+        seen.append(("2arg", kv_cache_groups, kv_cache_layout))
+        return 8192
+
+    monkeypatch.setattr(kv_cache_utils, "_get_kv_cache_bytes_per_block", one_arg)
+    assert get_qsa_kv_cache_bytes_per_block(["g0"], cfg) == 4096
+    monkeypatch.setattr(kv_cache_utils, "_get_kv_cache_bytes_per_block", two_arg)
+    assert get_qsa_kv_cache_bytes_per_block(["g0"], cfg) == 8192
+    assert seen == [
+        ("1arg", ["g0"]),
+        ("2arg", ["g0"], resolve_qsa_kv_cache_layout(cfg)),
+    ]
