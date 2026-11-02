@@ -166,11 +166,7 @@ def test_runtime_src_hash_covers_the_runtime_sources() -> None:
     assert len(h) == 64
     pkg = _SRC / "vllm_torchtpu"
     for sub in ("megakernel", "megakernel_runtime"):
-        files += [
-            (f"{sub}/{rel}", p)
-            for rel, p in fp._walk_py(pkg / sub, sub)
-            if not (sub == "megakernel_runtime" and rel.startswith("models/"))
-        ]
+        files += [(f"{sub}/{rel}", p) for rel, p in fp._walk_py(pkg / sub, sub)]
     assert fp.hash_files(files) == h
 
 
