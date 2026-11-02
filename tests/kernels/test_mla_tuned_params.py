@@ -61,6 +61,53 @@ def _k3_tp32_fp8_8k_page256_mixed_key() -> TuningKey:
     )
 
 
+def _k3_tp32_fp8_unified_pool_key(
+    max_num_tokens: int, pages_per_seq: int
+) -> TuningKey:
+    # The unified pool page holds one KDA state slot: 77 SSM + 8 FP32 conv
+    # packed rows, i.e. 85 rows x 4 = 340 FP8 tokens at TP32.
+    return replace(
+        _k3_tp32_fp8_8k_mixed_key(),
+        max_num_tokens=max_num_tokens,
+        page_size_per_kv_packing=85,
+        pages_per_seq=pages_per_seq,
+    )
+
+
+@pytest.mark.parametrize(
+    "max_num_tokens,pages_per_seq,kv_pages_per_block",
+    [
+        (8192, 32, 8),
+        (1024, 32, 4),
+        (2048, 32, 8),
+        (4096, 32, 8),
+        (1024, 64, 4),
+        (2048, 64, 8),
+        (4096, 64, 8),
+        (8192, 64, 8),
+        (8192, 3104, 8),
+        (16384, 64, 8),
+    ],
+)
+def test_k3_tp32_fp8_unified_pool_tuned_params(
+    monkeypatch: pytest.MonkeyPatch,
+    max_num_tokens: int,
+    pages_per_seq: int,
+    kv_pages_per_block: int,
+) -> None:
+    logger = MagicMock()
+    monkeypatch.setattr(tuned_params, "logger", logger)
+
+    tuned = get_tuned_params(
+        _k3_tp32_fp8_unified_pool_key(max_num_tokens, pages_per_seq)
+    )
+
+    logger.warning.assert_not_called()
+    assert tuned.num_kv_pages_per_block == kv_pages_per_block
+    assert tuned.num_queries_per_block == 512
+    assert tuned.q_split == 2
+
+
 def test_k3_mixed_tuned_params() -> None:
     tuned = get_tuned_params(_k3_mixed_key())
 
