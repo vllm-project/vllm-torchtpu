@@ -88,6 +88,8 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    prequantized_matmul,
+    quantize_activation,
     quantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -1688,6 +1690,34 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if bias is not None:
             out = out + bias
         return out
+
+    def supports_quantized_input(self, layer: torch.nn.Module, rows: int) -> bool:
+        """Whether `apply` on `rows` rows quantizes them per token itself.
+
+        Then a caller may run `quantize_input` where the rows live and
+        `apply_quantized_input` where they are consumed, with the same result
+        as `apply`: per-channel scales, bf16 activations, the canonical (k, n)
+        weight, and a bucket above the W8A16 cutoff.
+        """
+        return (
+            layer.weight_scale.dim() == 1
+            and not getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+            and not isinstance(layer, VocabParallelEmbedding)
+            and layer.params_dtype == torch.bfloat16
+            and rows > self.w8a16_max_rows
+        )
+
+    def quantize_input(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The rows `apply` would quantize and their f32 `[rows, 1]` scales."""
+        return quantize_activation(x, layer.weight)
+
+    def apply_quantized_input(
+        self, layer: torch.nn.Module, x_q: torch.Tensor, x_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """`apply` on rows `quantize_input` produced (see supports_quantized_input)."""
+        return prequantized_matmul(x_q, x_scale, layer.weight, layer.weight_scale)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         layer = cast("TpuLinear", layer)
