@@ -243,6 +243,7 @@ def test_manifest_preserves_lifecycle_dependencies():
     )
     assert stages["model_load"] == [
         "maybe_patch_qwen3_vl",
+        "maybe_patch_gemma4_mm",
         "maybe_patch_qwen3_next",
         "maybe_patch_qwen2",
         "maybe_patch_qwen3_5_attn_moe_overlap",

@@ -1588,9 +1588,13 @@ def get_default_block_sizes(
                 bq_csz = 1
                 bkv_csz = min(min_bkv_sz_to_peak, max_kv)
             else:
-                bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
-                bkv_sz = min(2048, max_kv)
-                bq_csz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
+                # When head_dim >= 256 (e.g. Gemma 4 hybrid sliding/global attention),
+                # large tiles (bq=1024, bkv=2048) exceed TPU v7's 64 MiB VMEM limit.
+                # Halving the tiles keeps scratch buffers comfortably within VMEM.
+                tile_scale = 2 if head_dim < 256 else 1
+                bq_sz = min((1024 * tile_scale) // num_q_heads_per_kv_head, max_q // 2)
+                bkv_sz = min(1024 * tile_scale, max_kv)
+                bq_csz = min((512 * tile_scale) // num_q_heads_per_kv_head, max_q // 2)
                 bkv_csz = min(512, align_to(max_kv // 2, page_size))
         case _:
             raise NotImplementedError(f"Unsupported {tpu_version=}.")

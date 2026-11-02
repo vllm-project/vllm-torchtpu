@@ -895,6 +895,27 @@ class TestTpuPlatform:
 
         assert vllm_config.scheduler_config.scheduler_cls == expected_cls
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_propagates_mm_encoder_tp_mode(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        vllm_config.additional_config = {"mm-encoder-tp-mode": "data"}
+        vllm_config.model_config.multimodal_config = SimpleNamespace(
+            mm_encoder_tp_mode="weights"
+        )
+        vllm_config.cache_config.block_size = 16
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.model_config.multimodal_config.mm_encoder_tp_mode == "data"
+
+        # Verify additional_config without mm-encoder-tp-mode does not raise error
+        vllm_config.additional_config = {}
+        TpuPlatform.check_and_update_config(vllm_config)
+
     def test_get_tpu_multihost_topology(self, monkeypatch):
         # Test env override via TORCH_TPU_TOPOLOGY
         monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "4,4,1")
