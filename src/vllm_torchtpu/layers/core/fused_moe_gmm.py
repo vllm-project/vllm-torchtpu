@@ -570,6 +570,25 @@ def _gather_routing(
     packed sort. Routes with no row (negative ids, skipped padded tokens) sort
     last and get position -1 when ``masked``.
     """
+    if not _COUNTING_SORT:
+        # TPU_MOE_COUNTING_SORT stands the rank contraction down: take the
+        # comparison sorts of the grouped-matmul path, minus its row gather.
+        _, group_sizes, positions, _, valid, token_indices_sorted = (
+            prepare_routed_gmm_inputs(
+                jnp.zeros((topk_ids.shape[0], 1), jnp.bfloat16),
+                topk_ids,
+                topk_weights,
+                local_num_experts=local_num_experts,
+                topk=topk,
+                use_ep=False,
+                use_sparse_core=False,
+                skip_padded_tokens=skip_padded_tokens,
+                permute=False,
+            )
+        )
+        if masked:
+            positions = jnp.where(valid, positions, -1)
+        return token_indices_sorted, group_sizes, positions
     flat_ids = topk_ids.reshape(-1)
     valid = flat_ids >= 0
     if skip_padded_tokens:

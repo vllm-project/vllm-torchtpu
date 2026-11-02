@@ -485,6 +485,51 @@ def test_prepare_routed_gmm_inputs_permute_false_skips_only_the_rows():
         np.testing.assert_array_equal(want, got)
 
 
+@pytest.mark.parametrize("counting_sort", [True, False])
+@pytest.mark.parametrize(
+    ("tokens", "masked", "skip_padded"),
+    [(256, False, False), (1088, True, False), (512, True, True)],
+)
+def test_gather_routing_matches_prepare_routed_gmm_inputs(
+    monkeypatch, counting_sort, tokens, masked, skip_padded
+):
+    """Same stable (expert, route) order as the grouped-matmul path."""
+    monkeypatch.setattr(fused_moe_gmm, "_COUNTING_SORT", counting_sort)
+    experts, topk = 16, 8
+    key = jax.random.PRNGKey(tokens)
+    ids = jax.random.randint(key, (tokens, topk), 0, 2 * experts, jnp.int32)
+    weights = jax.random.uniform(key, (tokens, topk)).astype(jnp.bfloat16)
+    # Masked: this rank owns experts [0, experts) and the others are remote.
+    ids = jnp.where(ids < experts, ids, -1) if masked else ids % experts
+    if skip_padded:
+        weights = weights.at[-16:].set(0)
+    tis, group_sizes, positions = fused_moe_gmm._gather_routing(
+        ids,
+        weights,
+        local_num_experts=experts,
+        topk=topk,
+        skip_padded_tokens=skip_padded,
+        masked=masked,
+    )
+    _, want_sizes, want_positions, _, valid, want_tis = prepare_routed_gmm_inputs(
+        jnp.zeros((tokens, 128), jnp.bfloat16),
+        ids,
+        weights,
+        local_num_experts=experts,
+        topk=topk,
+        use_ep=False,
+        use_sparse_core=False,
+        skip_padded_tokens=skip_padded,
+        permute=False,
+    )
+    n_valid = int(want_sizes.sum())
+    np.testing.assert_array_equal(group_sizes, want_sizes)
+    np.testing.assert_array_equal(tis[:n_valid], want_tis[:n_valid])
+    if masked:
+        want_positions = np.where(np.asarray(valid), want_positions, -1)
+    np.testing.assert_array_equal(positions, want_positions)
+
+
 def _gather_gmm_case(**overrides):
     """can_use_gather_gmm arguments for Gemma4-26B TP2, as abstract shapes."""
     e, h, inter = 128, 2816, 384
