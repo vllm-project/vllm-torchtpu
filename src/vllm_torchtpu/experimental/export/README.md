@@ -86,7 +86,12 @@ request's recurrent state. With `--speculative-config` each request holds
 (`num_state_slots = max_num_seqs * (K + 1) + 1`), and the forward also takes
 `mamba_slot_read_offsets[num_state_slots]`, the checkpoint each request resumes
 from after a verify step, and `mamba_ckpt_indices[max_num_seqs, K + 1]`, its
-`K + 1` slots. These layers keep this per-layer layout rather than
+`K + 1` slots. Without `--speculative-config`, `--max-verify-tokens K` gives
+the same windows for tokens a step verifies without a drafter, such as tokens a
+grammar forces: vLLM loads the model under an ngram config of `K` tokens, which
+adds no drafter, and the artifact declares no speculative decoding. Each window
+costs `K` more recurrent states per request. These layers keep this per-layer
+layout rather than
 vLLM's unified KV block pool, and the export runs with prefix caching off. The
 recurrent state bytes come off the KV budget before it is divided among KV
 blocks.

@@ -173,8 +173,14 @@ def build_export_config_from_vllm(
     target_tpu: str | None = None,
     token_buckets: Sequence[int] | None = None,
     req_buckets: Sequence[int] | None = None,
+    max_verify_tokens: int = 0,
 ) -> api.TextOnlyLLMExportConfig:
-    """Derives a `TextOnlyLLMExportConfig` from a `VllmConfig` (or mock config)."""
+    """Derives a `TextOnlyLLMExportConfig` from a `VllmConfig` (or mock config).
+
+    With `max_verify_tokens`, the export verifies tokens without speculative
+    decoding; `vllm_config` then carries only the speculative config that makes
+    vLLM keep the recurrent checkpoints (`verify_window_speculative_config`).
+    """
     model_cfg = getattr(vllm_config, "model_config", None)
     cache_cfg = getattr(vllm_config, "cache_config", None)
     sched_cfg = getattr(vllm_config, "scheduler_config", None)
@@ -287,7 +293,8 @@ def build_export_config_from_vllm(
         # the step's tokens, so no more than its largest token bucket.
         spec = getattr(vllm_config, "speculative_config", None)
         rows = max_num_seqs
-        if spec is not None:
+        # Tokens verified without a drafter are forced, and skip the LM head.
+        if spec is not None and not max_verify_tokens:
             verify_rows = max_num_seqs * (spec.num_speculative_tokens + 1)
             rows = max(rows, min(verify_rows, max(token_buckets)))
         req_buckets = default_req_buckets(rows)
@@ -326,6 +333,7 @@ def build_export_config_from_vllm(
         emit_byte_tokenizer=False,
         hf_checkpoint_dir=str(resolved_hf_dir) if resolved_hf_dir else None,
         uses_mrope=uses_mrope,
+        max_verify_tokens=max_verify_tokens,
     )
 
 
