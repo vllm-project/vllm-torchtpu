@@ -196,7 +196,7 @@ def test_gather_combine_matches_reference():
     acc = jnp.zeros((tokens, hidden), jnp.float32)
     for k in range(topk):
         prod = gathered[:, k] * weights[:, k : k + 1].astype(jnp.float32)
-        acc = acc + prod.astype(jnp.bfloat16).astype(jnp.float32)
+        acc = acc + prod
     want = acc.astype(jnp.bfloat16)
     np.testing.assert_array_equal(np.asarray(out), np.asarray(want))
 
@@ -234,5 +234,5 @@ def test_routed_moe_end_to_end():
     acc = jnp.zeros((tokens, hidden), jnp.float32)
     for k in range(topk):
         prod = gathered[:, k] * weights[:, k : k + 1].astype(jnp.float32)
-        acc = acc + prod.astype(jnp.bfloat16).astype(jnp.float32)
+        acc = acc + prod
     np.testing.assert_array_equal(np.asarray(out), np.asarray(acc.astype(jnp.bfloat16)))

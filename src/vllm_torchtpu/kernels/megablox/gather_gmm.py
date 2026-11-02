@@ -154,10 +154,11 @@ def quantize_pack_rows(
     s = packed_sublanes(h)
     if pl.cdiv(h, QUANT_BLOCK) > LANES:
         raise ValueError(f"hidden size {h} has more than {LANES} quantization blocks")
-    # Any token bucket: the largest tile dividing n (>= 8 for 8-aligned n).
-    tile_tokens = math.gcd(n, tile_tokens)
-    if tile_tokens % 8:
-        raise ValueError(f"{n=} tokens is not a multiple of 8")
+    # Any token bucket: the largest tile that divides both n and tile_tokens.
+    tile = math.gcd(n, tile_tokens)
+    if tile % 8:
+        raise ValueError(f"gcd({n=}, {tile_tokens=}) = {tile} is not a multiple of 8")
+    tile_tokens = tile
     return pl.pallas_call(
         functools.partial(_quantize_pack_kernel, s=s, tt=tile_tokens, hidden=h),
         out_shape=jax.ShapeDtypeStruct((n * (s + 1), LANES), jnp.uint32),
@@ -566,20 +567,16 @@ def _combine_kernel(pos_smem, w_ref, y_hbm, out_ref, buf, sem, *, tt, topk, s):
         issue(i + 1, 1 - slot)
 
     pltpu.make_async_copy(buf.at[slot], buf.at[slot], sem.at[slot]).wait()
+    # BF16 rows times BF16 weights are exact in F32; sum in F32, round once.
     w = w_ref[...].astype(jnp.float32)
-
-    def weighted(v, wk):
-        # BF16 * BF16 rounded to BF16, as the grouped-matmul combine's multiply.
-        return (v * wk).astype(jnp.bfloat16).astype(jnp.float32)
-
     for j in range(s):
         acc_lo = jnp.zeros((tt, LANES), jnp.float32)
         acc_hi = jnp.zeros((tt, LANES), jnp.float32)
         for k in range(topk):
             lo, hi = _unpack_lane_block(buf[slot, k, pl.ds(j, tt, stride=s), :])
             wk = w[:, k : k + 1]
-            acc_lo += weighted(lo, wk)
-            acc_hi += weighted(hi, wk)
+            acc_lo += lo * wk
+            acc_hi += hi * wk
         out_ref[:, PACKED_COLUMNS * j : PACKED_COLUMNS * j + LANES] = acc_lo.astype(
             out_ref.dtype
         )
