@@ -46,6 +46,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.gemma4_attention_patch import attention_from_qkv
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -185,14 +186,7 @@ def _token_chunks(x: torch.Tensor, chunks: int) -> list[torch.Tensor]:
     return list(x.view(chunks, -1, *x.shape[1:]).unbind(0)) if chunks > 1 else [x]
 
 
-def _attention(attn: Any, positions: torch.Tensor, qkv: torch.Tensor) -> torch.Tensor:
-    """``Gemma4Attention.forward`` between the qkv and the o projection."""
-    q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
-    q = attn.q_norm(q.unflatten(-1, (attn.num_heads, attn.head_dim))).flatten(-2, -1)
-    k = attn.k_norm(k.unflatten(-1, (attn.num_kv_heads, attn.head_dim)))
-    q, k = attn.rotary_emb(positions, q, k.flatten(-2, -1))
-    v = attn.v_norm(v.unflatten(-1, (attn.num_kv_heads, attn.head_dim)))
-    return attn.attn(q, k, v.flatten(-2, -1))
+_attention = attention_from_qkv
 
 
 def _sequence_parallel_layer(

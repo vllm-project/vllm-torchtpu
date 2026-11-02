@@ -248,6 +248,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_5_attn_moe_overlap",
         "maybe_patch_gemma4_routing",
         "maybe_patch_gemma4_sequence_parallel",
+        "maybe_patch_gemma4_attention",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):
