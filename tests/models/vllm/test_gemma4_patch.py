@@ -41,6 +41,7 @@ from vllm.model_executor.models.interfaces import EagleModelMixin
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.models.vllm import gemma4_patch
 
 _UPSTREAM_LAYER_FORWARD = Gemma4DecoderLayer.forward
@@ -141,8 +142,11 @@ class _Bf16Method:
         return x @ layer.weight
 
 
-class _PerTokenFp8Method(_Bf16Method):
-    """Per-token FP8 activations, split the way VllmFp8LinearMethodTPU is."""
+class _PerTokenFp8Method(VllmFp8LinearMethodTPU):
+    """VllmFp8LinearMethodTPU's per-token split, emulated in plain torch."""
+
+    def __init__(self) -> None:  # no quant config: only the split is used
+        pass
 
     def supports_quantized_input(self, layer: Any, rows: int) -> bool:
         return True
@@ -171,7 +175,7 @@ class _Linear:
         self,
         weight: torch.Tensor,
         tp_size: int,
-        method: _Bf16Method,
+        method: _Bf16Method | _PerTokenFp8Method,
         all_reduce: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
         self.weight = weight
@@ -195,7 +199,9 @@ class _Experts:
     def __init__(self, rank: int, weight: torch.Tensor, all_reduce: Callable) -> None:
         self.rank = rank
         self.weight = weight
-        self.moe_config = SimpleNamespace(dp_size=1, skip_final_all_reduce=False)
+        self.moe_config = SimpleNamespace(
+            dp_size=1, is_sequence_parallel=False, skip_final_all_reduce=False
+        )
         self._all_reduce = all_reduce
 
     def __call__(
@@ -385,8 +391,11 @@ class _CallableLayer(SimpleNamespace):
 @pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize("moe", [False, True])
 @pytest.mark.parametrize("fp8", [False, True])
-def test_layer_matches_upstream(mock_collectives, tp: int, moe: bool, fp8: bool):
-    """Both branches reproduce upstream's layer; SP on this rank's rows."""
+@pytest.mark.parametrize("chunks", [1, 2])
+def test_layer_matches_upstream(
+    mock_collectives, tp: int, moe: bool, fp8: bool, chunks: int
+):
+    """Both branches reproduce upstream's layer; SP on this rank's chunk rows."""
     mock = mock_collectives(tp)
     model = _Model(tp, moe, fp8)
     num_tokens = 16
@@ -399,14 +408,14 @@ def test_layer_matches_upstream(mock_collectives, tp: int, moe: bool, fp8: bool)
         gemma4_patch._configure_layer(ours)
         up, _ = _UPSTREAM_LAYER_FORWARD(upstream, positions, x.clone(), None)
         ar = gemma4_patch._all_reduce_layer(ours, positions, x.clone())
-        sp = gemma4_patch._sequence_parallel_layer(
-            ours, positions, x.chunk(tp)[rank].clone()
-        )
+        rows = [c.chunk(tp)[rank].clone() for c in x.chunk(chunks)]
+        sp = gemma4_patch._sequence_parallel_layer(ours, positions, rows)
         return up, ar, sp
 
     results = _run_ranks(tp, rank_fn)
     upstream = results[0][0]
-    sp = torch.cat([r[2] for r in results])
+    # Chunk-major, then rank-major: the token order the model forward restores.
+    sp = torch.cat([r[2][c] for c in range(chunks) for r in results])
     for up, ar, _ in results:
         torch.testing.assert_close(up, upstream, rtol=0, atol=0)
         torch.testing.assert_close(ar, upstream, rtol=0, atol=0)
@@ -424,7 +433,7 @@ def test_sequence_parallel_layer_collectives(mock_collectives):
         layer = model.layer(0, rank, mock.all_reduce)
         gemma4_patch._configure_layer(layer)
         return gemma4_patch._sequence_parallel_layer(
-            layer, torch.arange(16), x.chunk(tp)[rank]
+            layer, torch.arange(16), [x.chunk(tp)[rank]]
         )
 
     _run_ranks(tp, rank_fn)
@@ -439,7 +448,8 @@ def test_sequence_parallel_layer_collectives(mock_collectives):
     ]
 
 
-def test_model_forward_matches_all_reduce(mock_collectives, monkeypatch):
+@pytest.mark.parametrize("chunks", [1, 2])
+def test_model_forward_matches_all_reduce(mock_collectives, monkeypatch, chunks):
     """Embedding shard -> SP layers -> final norm -> gather == upstream."""
     tp, num_layers, num_tokens = 4, 3, 32
     mock = mock_collectives(tp)
@@ -487,9 +497,11 @@ def test_model_forward_matches_all_reduce(mock_collectives, monkeypatch):
     reference = _run_ranks(tp, forward)
     assert {c[2] for c in mock.calls} == {(num_tokens, model.hidden)}
     mock.calls.clear()
-    monkeypatch.setattr(gemma4_patch, "_MIN_SHARD_BYTES", shard_bytes)
+    monkeypatch.setattr(gemma4_patch, "_MIN_SHARD_BYTES", shard_bytes // chunks)
+    monkeypatch.setattr(gemma4_patch, "_microbatches", chunks)
     sp = _run_ranks(tp, forward)
-    assert (num_tokens // tp, model.hidden) in {c[2] for c in mock.calls}
+    shard_rows = num_tokens // tp // chunks
+    assert (shard_rows, model.hidden) in {c[2] for c in mock.calls}
     for out in sp:
         torch.testing.assert_close(out, reference[0], rtol=2e-5, atol=2e-5)
 
@@ -529,6 +541,21 @@ def test_use_sequence_parallel(num_tokens, hidden, tp, expected) -> None:
     assert gemma4_patch._use_sequence_parallel(num_tokens, row_bytes, tp) is expected
 
 
+@pytest.mark.parametrize(
+    ("setting", "num_tokens", "expected"),
+    [
+        (1, 16384, 1),
+        (2, 16384, 2),
+        (2, 1024, 1),  # a half would be 0.66 MiB per rank
+        (2, 2048, 2),
+        (4, 16384, 4),
+    ],
+)
+def test_num_microbatches(monkeypatch, setting, num_tokens, expected) -> None:
+    monkeypatch.setattr(gemma4_patch, "_microbatches", setting)
+    assert gemma4_patch._num_microbatches(num_tokens, 5376 * 2, 8) == expected
+
+
 def test_sequence_parallel_only_in_backbone_warmup_when_compiling(monkeypatch) -> None:
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     assert not gemma4_patch._use_sequence_parallel(16384, 5376 * 2, 8)
@@ -547,7 +574,9 @@ def _layer_for_configure(**overrides: Any) -> SimpleNamespace:
         mlp=SimpleNamespace(gate_up_proj=linear(), down_proj=linear()),
         per_layer_input_gate=None,
         experts=SimpleNamespace(
-            moe_config=SimpleNamespace(dp_size=1, skip_final_all_reduce=False)
+            moe_config=SimpleNamespace(
+                dp_size=1, is_sequence_parallel=False, skip_final_all_reduce=False
+            )
         ),
     )
     for key, value in overrides.items():
@@ -580,6 +609,7 @@ def test_configure_layer() -> None:
         ({"mlp.down_proj.bias": torch.zeros(1)}, "biases"),
         ({"self_attn.o_proj.tp_size": 1}, "TP > 1"),
         ({"experts.moe_config.dp_size": 2}, "DP > 1"),
+        ({"experts.moe_config.is_sequence_parallel": True}, "sequence parallelism"),
     ],
 )
 def test_configure_layer_refuses(override: dict, match: str) -> None:
@@ -625,13 +655,19 @@ def test_maybe_patch_waits_for_gemma4(monkeypatch: pytest.MonkeyPatch) -> None:
         for cls in (Gemma4DecoderLayer, Gemma4Model)
         for name in ("__init__", "forward")
     }
+    monkeypatch.setattr(gemma4_patch, "_microbatches", gemma4_patch._microbatches)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_SP_MICROBATCHES", 0)
+    cfg = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="gemma4_text"))
+    with pytest.raises(ValueError, match="TPU_GEMMA4_SP_MICROBATCHES"):
+        gemma4_patch.maybe_patch_gemma4_sequence_parallel(cfg)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_SP_MICROBATCHES", 2)
     try:
-        cfg = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="gemma4_text"))
         assert gemma4_patch.maybe_patch_gemma4_sequence_parallel(cfg) is None
         assert Gemma4DecoderLayer.__init__ is gemma4_patch._patched_layer_init
         assert Gemma4DecoderLayer.forward is gemma4_patch._patched_layer_forward
         assert Gemma4Model.__init__ is gemma4_patch._patched_model_init
         assert Gemma4Model.forward is gemma4_patch._patched_model_forward
+        assert gemma4_patch._microbatches == 2
     finally:
         for (cls, name), value in saved.items():
             setattr(cls, name, value)

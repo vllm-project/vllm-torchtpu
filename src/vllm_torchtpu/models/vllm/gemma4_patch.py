@@ -44,6 +44,7 @@ from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4Model
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -59,16 +60,34 @@ _orig_model_forward = Gemma4Model.forward
 # all-gather that replace an all-reduce are latency-bound and cost more than it.
 _MIN_SHARD_BYTES = 1 << 20
 
+# TPU_GEMMA4_SP_MICROBATCHES, read when the patch is applied: the traced
+# forward branches on it, and Dynamo guards on a module global by value.
+_microbatches = 1
+
+
+def _shards_fit(num_tokens: int, row_bytes: int, num_shards: int) -> bool:
+    return (
+        num_tokens % num_shards == 0
+        and num_tokens // num_shards * row_bytes >= _MIN_SHARD_BYTES
+    )
+
 
 def _use_sequence_parallel(num_tokens: int, row_bytes: int, tp_size: int) -> bool:
     # Only the backbone warmup gives each side of this branch its own trace
     # (shape_variants); a graph compiled outside it keeps the all-reduces.
     if torch.compiler.is_compiling() and shape_variants.aot_cache_tag() is None:
         return False
-    return (
-        num_tokens % tp_size == 0
-        and num_tokens // tp_size * row_bytes >= _MIN_SHARD_BYTES
-    )
+    return _shards_fit(num_tokens, row_bytes, tp_size)
+
+
+def _num_microbatches(num_tokens: int, row_bytes: int, tp_size: int) -> int:
+    """Token chunks a sequence-parallel step runs as independent dataflows.
+
+    With two, one chunk's reduce-scatters and all-gathers have the other
+    chunk's projections and norms to overlap with; attention still takes all T.
+    """
+    chunks = _microbatches
+    return chunks if _shards_fit(num_tokens, row_bytes, chunks * tp_size) else 1
 
 
 def _configure_layer(layer: Gemma4DecoderLayer) -> None:
@@ -90,10 +109,11 @@ def _configure_layer(layer: Gemma4DecoderLayer) -> None:
     mlp.down_proj.reduce_results = False
     if layer.experts is not None:
         experts: Any = layer.experts
-        if experts.moe_config.dp_size > 1:
-            # The runner would gather tokens over DP around the experts.
+        if experts.moe_config.dp_size > 1 or experts.moe_config.is_sequence_parallel:
+            # The runner would gather tokens around the experts itself.
             raise ValueError(
-                "TPU_GEMMA4_SEQUENCE_PARALLEL does not support MoE with DP > 1"
+                "TPU_GEMMA4_SEQUENCE_PARALLEL does not support MoE with DP > 1 or "
+                "with the MoE's own sequence parallelism"
             )
         experts.moe_config.skip_final_all_reduce = True
 
@@ -130,8 +150,9 @@ def _gathered_projection(linear: Any, x_local: torch.Tensor) -> torch.Tensor:
     """Column-parallel ``linear`` on the all-gather of token-sharded rows."""
     method = linear.quant_method
     rows = x_local.shape[0] * linear.tp_size
-    supports = getattr(method, "supports_quantized_input", None)
-    if supports is not None and supports(linear, rows):
+    if isinstance(method, VllmFp8LinearMethodTPU) and method.supports_quantized_input(
+        linear, rows
+    ):
         x_q, x_scale = method.quantize_input(linear, x_local)
         # Collectives move FP8 as raw bytes.
         rows_q = tensor_model_parallel_all_gather(x_q.view(torch.int8), 0)
@@ -141,36 +162,53 @@ def _gathered_projection(linear: Any, x_local: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _attention_partial(
-    attn: Any, positions: torch.Tensor, qkv: torch.Tensor
-) -> torch.Tensor:
-    """``Gemma4Attention.forward`` from the qkv projection on; o_proj partial."""
+def _attention(attn: Any, positions: torch.Tensor, qkv: torch.Tensor) -> torch.Tensor:
+    """``Gemma4Attention.forward`` between the qkv and the o projection."""
     q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
     q = attn.q_norm(q.unflatten(-1, (attn.num_heads, attn.head_dim))).flatten(-2, -1)
     k = attn.k_norm(k.unflatten(-1, (attn.num_kv_heads, attn.head_dim)))
     q, k = attn.rotary_emb(positions, q, k.flatten(-2, -1))
     v = attn.v_norm(v.unflatten(-1, (attn.num_kv_heads, attn.head_dim)))
-    out, _ = attn.o_proj(attn.attn(q, k, v.flatten(-2, -1)))
-    return out
+    return attn.attn(q, k, v.flatten(-2, -1))
 
 
 def _sequence_parallel_layer(
-    self: Gemma4DecoderLayer, positions: torch.Tensor, hidden_states: torch.Tensor
-) -> torch.Tensor:
-    """One decoder layer on this rank's rows of the residual stream."""
+    self: Gemma4DecoderLayer,
+    positions: torch.Tensor,
+    hidden_states: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """One decoder layer on this rank's rows of each contiguous token chunk.
+
+    Chunks share only the attention call; the rest of the layer is one
+    independent dataflow per chunk, so the scheduler may overlap one chunk's
+    collectives with another chunk's projections.
+    """
+    attn: Any = self.self_attn
+    mlp: Any = self.mlp
     residual = hidden_states
-    qkv = _gathered_projection(self.self_attn.qkv_proj, self.input_layernorm(residual))
-    attn_out = tensor_model_parallel_reduce_scatter(
-        _attention_partial(self.self_attn, positions, qkv), 0
+    qkv = torch.cat(
+        [_gathered_projection(attn.qkv_proj, self.input_layernorm(h)) for h in residual]
     )
-    hidden_states = self.post_attention_layernorm(attn_out) + residual
+    attn_out = _attention(attn, positions, qkv).chunk(len(residual))
+    hidden_states = [
+        self.post_attention_layernorm(
+            tensor_model_parallel_reduce_scatter(attn.o_proj(a)[0], 0)
+        )
+        + r
+        for a, r in zip(attn_out, residual)
+    ]
     residual = hidden_states
 
-    mlp: Any = self.mlp
-    gate_up = _gathered_projection(
-        mlp.gate_up_proj, self.pre_feedforward_layernorm(hidden_states)
-    )
-    mlp_out, _ = mlp.down_proj(mlp.act_fn(gate_up))
+    mlp_out = [
+        mlp.down_proj(
+            mlp.act_fn(
+                _gathered_projection(
+                    mlp.gate_up_proj, self.pre_feedforward_layernorm(h)
+                )
+            )
+        )[0]
+        for h in hidden_states
+    ]
     if self.enable_moe_block:
         assert self.post_feedforward_layernorm_1 is not None
         assert self.pre_feedforward_layernorm_2 is not None
@@ -178,21 +216,31 @@ def _sequence_parallel_layer(
         assert self.experts is not None
         assert self.post_feedforward_layernorm_2 is not None
         # gmm_v2 quantizes its lhs per 512-column block, so the experts take
-        # bf16 rows; every rank routes all T tokens, as upstream does.
-        experts_in = tensor_model_parallel_all_gather(
-            self.pre_feedforward_layernorm_2(residual), 0
-        )
-        router_logits = tensor_model_parallel_all_gather(self.router(residual), 0)
-        experts_out = self.experts(experts_in, router_logits)
-        hidden_states = self.post_feedforward_layernorm_1(
-            tensor_model_parallel_reduce_scatter(mlp_out, 0)
-        ) + self.post_feedforward_layernorm_2(
-            tensor_model_parallel_reduce_scatter(experts_out, 0)
-        )
+        # bf16 rows; every rank routes all of a chunk's tokens, as upstream does.
+        experts_out = [
+            self.experts(
+                tensor_model_parallel_all_gather(
+                    self.pre_feedforward_layernorm_2(r), 0
+                ),
+                tensor_model_parallel_all_gather(self.router(r), 0),
+            )
+            for r in residual
+        ]
+        hidden_states = [
+            self.post_feedforward_layernorm_1(
+                tensor_model_parallel_reduce_scatter(m, 0)
+            )
+            + self.post_feedforward_layernorm_2(
+                tensor_model_parallel_reduce_scatter(e, 0)
+            )
+            for m, e in zip(mlp_out, experts_out)
+        ]
     else:
-        hidden_states = tensor_model_parallel_reduce_scatter(mlp_out, 0)
-    hidden_states = self.post_feedforward_layernorm(hidden_states) + residual
-    return hidden_states * self.layer_scalar
+        hidden_states = [tensor_model_parallel_reduce_scatter(m, 0) for m in mlp_out]
+    return [
+        (self.post_feedforward_layernorm(h) + r) * self.layer_scalar
+        for h, r in zip(hidden_states, residual)
+    ]
 
 
 def _all_reduce_layer(
@@ -236,12 +284,14 @@ def _all_reduce_layer(
 def _patched_layer_forward(
     self: Gemma4DecoderLayer,
     positions: torch.Tensor,
-    hidden_states: torch.Tensor,
+    hidden_states: Any,
     residual: torch.Tensor | None,
     per_layer_input: torch.Tensor | None = None,
     sequence_parallel: bool = False,
     **kwargs: Any,
-) -> tuple[torch.Tensor, None]:
+) -> tuple[Any, None]:
+    """Upstream's signature; with ``sequence_parallel``, ``hidden_states`` is
+    the list of this rank's rows of each token chunk (see the model forward)."""
     # Gemma4 carries the residual inside hidden_states (residual is always
     # None), and _configure_layer refused per-layer embeddings.
     del residual, per_layer_input
@@ -278,12 +328,18 @@ def _patched_model_forward(
         )
     if inputs_embeds is None:
         inputs_embeds = self.embed_input_ids(input_ids)
-    hidden_states = _local_rows(inputs_embeds, self._tpu_sp_rank, tp_size)
+    chunks = _num_microbatches(positions.shape[-1], row_bytes, tp_size)
+    hidden_states = [
+        _local_rows(chunk, self._tpu_sp_rank, tp_size)
+        for chunk in inputs_embeds.chunk(chunks)
+    ]
     for layer in islice(self.layers, self.start_layer, self.end_layer):
         hidden_states, _ = layer(
             positions, hidden_states, None, sequence_parallel=True, **kwargs
         )
-    return tensor_model_parallel_all_gather(self.norm(hidden_states), 0)
+    return torch.cat(
+        [tensor_model_parallel_all_gather(self.norm(h), 0) for h in hidden_states]
+    )
 
 
 def maybe_patch_gemma4_sequence_parallel(
@@ -294,14 +350,20 @@ def maybe_patch_gemma4_sequence_parallel(
         return None
     if model_config is None or model_config.hf_text_config.model_type != "gemma4_text":
         return False
+    microbatches = envs.TPU_GEMMA4_SP_MICROBATCHES
+    if microbatches < 1:
+        raise ValueError(f"TPU_GEMMA4_SP_MICROBATCHES must be >= 1, got {microbatches}")
+    global _microbatches
+    _microbatches = microbatches
     Gemma4DecoderLayer.__init__ = _patched_layer_init
     Gemma4DecoderLayer.forward = _patched_layer_forward
     Gemma4Model.__init__ = _patched_model_init
     Gemma4Model.forward = _patched_model_forward
     logger.info(
         "Applied TPU patch: Gemma4 sequence-parallel residual stream for token "
-        "buckets whose per-rank shard is at least %d bytes; FP8 per-token "
-        "projections all-gather FP8 rows, the rest bf16.",
+        "buckets whose per-rank shard is at least %d bytes, in up to %d token "
+        "chunks; FP8 per-token projections all-gather FP8 rows, the rest bf16.",
         _MIN_SHARD_BYTES,
+        _microbatches,
     )
     return None
