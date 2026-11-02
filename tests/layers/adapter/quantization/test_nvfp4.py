@@ -97,6 +97,14 @@ class TestNvfp4Helpers:
         assert f.dtype == t.dtype
         assert f.device == t.device
 
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_fresh_float8(self, dtype):
+        t = torch.randn(4, 8, dtype=torch.float32).to(dtype)
+        f = fresh_buffer(t)
+        assert torch.equal(f.view(torch.uint8), t.view(torch.uint8))
+        assert f.data_ptr() != t.data_ptr()
+        assert f.dtype == dtype
+
     def test_to_kernel_scale_2d(self):
         out_dim, num_blocks = 32, 4
         s = torch.randn(out_dim, num_blocks, dtype=torch.float32)
