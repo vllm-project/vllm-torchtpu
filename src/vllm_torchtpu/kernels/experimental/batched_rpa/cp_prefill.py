@@ -37,8 +37,9 @@ layer's earlier pages are left unwritten, so the cache blocks of such a prompt
 must not be reused through prefix caching.
 
 A rank is a Python int or a traced scalar (`jax.lax.axis_index` under
-`shard_map`). This module holds the page arithmetic; moving pages between ranks
-is the caller's.
+`shard_map`). This module holds the page arithmetic and what one layer runs
+between the collectives; of those, only the halo permutes (`exchange_halos`,
+under the caller's `shard_map`) are here.
 """
 
 import dataclasses
