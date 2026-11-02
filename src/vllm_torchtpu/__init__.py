@@ -744,9 +744,9 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     patch_registry.apply("engine_core")
     from vllm_torchtpu.core.pp_chunk_scheduler import patch_engine_core_for_pp_chunks
     from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
-    from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
+    from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
 
-    patch_executor_for_pp_wave(kwargs.get("vllm_config"))
+    patch_executor_for_pp_handoff(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
     patch_engine_core_for_lazy_push(kwargs.get("vllm_config"))
 

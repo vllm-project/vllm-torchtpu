@@ -211,10 +211,12 @@ class HbmReserves(NamedTuple):
       kv_connector:    what the KV connector allocates, such as the offload
                        H2D staging pool.
       lora_slot_write: what an adapter swap holds while it runs.
+      pp_handoff:      what the pipeline ring hand-off's buffers take.
     """
 
     kv_connector: int
     lora_slot_write: int
+    pp_handoff: int
 
 
 def compute_hbm_budget(devices: Any, gpu_memory_utilization: float) -> HbmBudget:
