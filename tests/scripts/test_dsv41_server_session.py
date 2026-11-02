@@ -133,6 +133,9 @@ def test_ci_launch_and_optional_profile_share_one_server(
                 "dp_shared_memory": False,
             }
             assert command[command.index("--data-parallel-size-local") + 1] == "8"
+            # An explicit start rank would make vLLM infer hybrid LB, which
+            # rejects the headless worker used by this single-API deployment.
+            assert "--data-parallel-start-rank" not in command
         assert env["CHUNK"] == "2048"
         assert env["VLLM_DISABLE_COMPILE_CACHE"] == "1"
         assert env["JAX_ENABLE_COMPILATION_CACHE"] == "false"

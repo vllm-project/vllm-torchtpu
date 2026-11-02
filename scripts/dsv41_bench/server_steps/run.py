@@ -240,9 +240,11 @@ def main() -> None:
             head,
             "--data-parallel-rpc-port",
             "19500",
-            "--data-parallel-start-rank",
-            str(args.host_rank * 8),
         ]
+        # On the API host, even start-rank=0 selects hybrid LB and rejects
+        # headless remote engines. Only the headless worker needs the offset.
+        if worker:
+            server_command += ["--data-parallel-start-rank", "8"]
     if args.profile:
         server_command += [
             "--profiler-config",
