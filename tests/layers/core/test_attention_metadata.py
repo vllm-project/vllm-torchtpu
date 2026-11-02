@@ -55,6 +55,8 @@ class TestAttentionMetadataBuilderPlumbing:
         runner._registered_h2d_sources = set()
         runner.attn_groups = []
         runner._unified_kv_layout = False
+        runner._reuse_staged_block_tables = False
+        runner._staged_block_table_reuse = {}
 
         block_tables = []
         for gid in range(num_groups):
@@ -487,6 +489,45 @@ class TestAttentionMetadataBuilderPlumbing:
                     meta_staged.mamba_ckpt_indices.dtype
                     == meta_plain.mamba_ckpt_indices.dtype
                 )
+
+    @pytest.mark.parametrize("num_groups", [1, 3])
+    def test_unchanged_rows_reuse_the_staged_tables(self, num_groups):
+        """With reuse on, a walk whose staged rows all repeat hands out the
+        previous walk's device tables without a new upload; a changed row
+        uploads again."""
+        runner = self._make_runner_mock(num_groups=num_groups)
+        runner._reuse_staged_block_tables = True
+        self._make_attn_groups(
+            runner, [self._make_builder(runner, gid) for gid in range(num_groups)]
+        )
+
+        def walk():
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=2,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            runner._attn_metadata_builder_ctx = ctx
+            stage_block_table_uploads(runner, ctx, 4)
+            assert ctx.staged_block_tables is not None
+            return ctx.staged_block_tables
+
+        first = walk()
+        uploads = len(runner._unfenced_h2d_sources)
+        second = walk()
+        assert len(runner._unfenced_h2d_sources) == uploads
+        assert second is not first
+        assert all(second[gid] is first[gid] for gid in first)
+
+        table = runner.input_batch.block_table[0].get_cpu_tensor.return_value
+        table[1, 0] += 1000
+        third = walk()
+        assert len(runner._unfenced_h2d_sources) == uploads + 1
+        rows = third[0].view(4, -1)
+        assert torch.equal(rows[:2], table[:2, : rows.shape[1]])
 
     def test_single_group_fast_path(self):
         """Single-group pure attention must stage directly without mamba derivation."""

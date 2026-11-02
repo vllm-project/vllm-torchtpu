@@ -665,6 +665,32 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         )
 
 
+# Walk geometries remembered for reuse: a step's target walk plus, e.g., a
+# drafter's walk over a subset of groups. A step with more distinct walks
+# than this evicts its own entries and never reuses.
+_MAX_REUSED_WALKS = 4
+
+
+def _remember_staged_block_tables(
+    runner: Any,
+    reuse_key: tuple | None,
+    sources: list[torch.Tensor] | None,
+    ctx: AttentionMetadataBuilderContext,
+) -> None:
+    """Keep this walk's device tables and a copy of the rows they came from."""
+    if reuse_key is None:
+        return
+    assert sources is not None and ctx.staged_block_tables is not None
+    cache = runner._staged_block_table_reuse
+    cache.pop(reuse_key, None)
+    if len(cache) >= _MAX_REUSED_WALKS:
+        del cache[next(iter(cache))]
+    cache[reuse_key] = (
+        [source.clone() for source in sources],
+        dict(ctx.staged_block_tables),
+    )
+
+
 def stage_block_table_uploads(
     runner: Any,
     ctx: AttentionMetadataBuilderContext,
@@ -701,6 +727,35 @@ def stage_block_table_uploads(
             entry_builders.append(builder)
     if not entries:
         return
+
+    # Decode steps mostly repeat the previous step's tables (a row changes
+    # once per page of new tokens): reuse its device tables when every staged
+    # row is unchanged. Mamba groups also derive per-step state indices.
+    reuse_key = None
+    sources: list[torch.Tensor] | None = None
+    if (
+        getattr(runner, "_reuse_staged_block_tables", False) is True
+        and ctx.position_ids_override is None
+        and not any(builder.is_mamba_group for builder in entry_builders)
+    ):
+        sources = [
+            block_table_obj.get_cpu_tensor()[
+                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+            ]
+            for _, block_table_obj, target_num_blocks in entries
+        ]
+        reuse_key = (
+            num_reqs_padded,
+            ctx.start_index,
+            ctx.num_reqs,
+            tuple((gid, target_num_blocks) for gid, _, target_num_blocks in entries),
+        )
+        cached = runner._staged_block_table_reuse.get(reuse_key)
+        if cached is not None and all(
+            torch.equal(a, b) for a, b in zip(cached[0], sources, strict=True)
+        ):
+            ctx.staged_block_tables = dict(cached[1])
+            return
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
     # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
@@ -758,6 +813,7 @@ def stage_block_table_uploads(
         gid, _, target_num_blocks = entries[0]
         length = num_reqs_padded * target_num_blocks
         ctx.staged_block_tables = {gid: staged_dev[:length]}
+        _remember_staged_block_tables(runner, reuse_key, sources, ctx)
         return
 
     walk = (
@@ -779,6 +835,7 @@ def stage_block_table_uploads(
     ctx.staged_block_tables = {
         gid: products[i] for i, (gid, _, _) in enumerate(entries)
     }
+    _remember_staged_block_tables(runner, reuse_key, sources, ctx)
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]
         rest = products[n_tables + n_mamba :]

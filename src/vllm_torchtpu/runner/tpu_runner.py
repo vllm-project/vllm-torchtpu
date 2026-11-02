@@ -929,6 +929,18 @@ class TPUModelRunner(GPUModelRunner):
         self._fast_token_substitution: bool = bool(
             envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
         )
+        # Read by stage_block_table_uploads (layers/core/attention_metadata.py).
+        # A reused step skips the staged split program, and each DP rank would
+        # decide that from its own requests, so DP > 1 keeps the upload.
+        self._reuse_staged_block_tables: bool = (
+            envs.TPU_REUSE_STAGED_BLOCK_TABLES
+            and vllm_config.parallel_config.data_parallel_size == 1
+        )
+        if envs.TPU_REUSE_STAGED_BLOCK_TABLES and not self._reuse_staged_block_tables:
+            logger.warning(
+                "TPU_REUSE_STAGED_BLOCK_TABLES is ignored with data parallelism."
+            )
+        self._staged_block_table_reuse: dict[tuple, tuple] = {}
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req
@@ -5686,6 +5698,8 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
+        if envs.TPU_NORM_WEIGHTS_FP32:
+            runner_utils.upcast_norm_weights(self.model)
         if (
             envs.TPU_GREEDY_TOP_TOKENS
             and self._pp_is_last

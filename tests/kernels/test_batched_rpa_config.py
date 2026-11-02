@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for batched RPA config and block size calculations across TPU generations."""
 
+import dataclasses
 from unittest.mock import MagicMock, patch
 
 import jax.numpy as jnp
@@ -82,3 +83,37 @@ def test_calculate_block_sizes_generation(
         )
         assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+
+
+@pytest.mark.parametrize("sliding_window", [1024, None])
+def test_sliding_decode_max_bkv_caps_only_sliding_decode(sliding_window):
+    # Gemma4 31B TP8 sliding-layer shapes, where the default decode block is 1792.
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_dim=256,
+        sliding_window=sliding_window,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=64,
+        page_size=256,
+        total_q_tokens=16,
+        num_page_indices=64 * 640,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+    )
+    vmem_limit = 64 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        default = wrapper.calculate_block_sizes(model_cfg, serve_cfg, vmem_limit)
+        capped = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, vmem_limit, sliding_decode_max_bkv=512
+        )
+    assert default[0].bkv_sz > 512
+    expected_decode_bkv = 512 if sliding_window else default[0].bkv_sz
+    assert capped[0] == dataclasses.replace(default[0], bkv_sz=expected_decode_bkv)
+    assert capped[1] == default[1]

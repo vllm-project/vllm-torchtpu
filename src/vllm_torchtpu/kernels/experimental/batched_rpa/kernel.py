@@ -1032,7 +1032,11 @@ def rpa_kernel(
 
                 execute_schedule_chunk(start, size)
 
-        _run()
+        if cfgs.serve.skip_empty_launch:
+            # Zero steps read and write nothing, so the zero-fill is dead work.
+            pl.when(actual_steps > 0)(_run)
+        else:
+            _run()
 
     scalar_prefetches = (
         cu_q_lens,

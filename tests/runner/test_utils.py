@@ -14,6 +14,9 @@
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
+import torch
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.layernorm import RMSNorm
 
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.runner.utils import (
@@ -21,6 +24,7 @@ from vllm_torchtpu.runner.utils import (
     InferencePhase,
     PhaseBasedProfiler,
     determine_phase_from_batch_composition_stats,
+    upcast_norm_weights,
 )
 
 
@@ -591,3 +595,21 @@ def test_merge_profile_directories_multiworker(tmp_path):
         ).read_text() == f"rank_{rank}_xplane"
         rank_dir = phase_dir / f"rank_{rank}"
         assert not (rank_dir / "plugins").exists()
+
+
+def test_upcast_norm_weights_stores_learned_rms_norm_weights_in_fp32():
+    model = torch.nn.Module()
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig("cpu"))):
+        model.norm = RMSNorm(8, dtype=torch.bfloat16)
+        model.weightless = RMSNorm(8, has_weight=False, dtype=torch.bfloat16)
+    model.norm.weight.data = torch.linspace(-2, 2, 8).to(torch.bfloat16)
+    model.linear = torch.nn.Linear(8, 8, dtype=torch.bfloat16)
+    expected = model.norm.weight.detach().clone()
+
+    upcast_norm_weights(model)
+
+    assert isinstance(model.norm.weight, torch.nn.Parameter)
+    assert model.norm.weight.dtype == torch.float32
+    torch.testing.assert_close(model.norm.weight.data, expected.float(), rtol=0, atol=0)
+    assert model.weightless.weight.dtype == torch.bfloat16
+    assert model.linear.weight.dtype == torch.bfloat16
