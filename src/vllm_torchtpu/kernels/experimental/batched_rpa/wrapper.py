@@ -14,6 +14,7 @@
 """Wrapper for RPA kernel to match expected interface."""
 
 import dataclasses
+import functools
 import math
 from typing import cast
 
@@ -717,6 +718,7 @@ def ragged_paged_attention(
     sliding_prefill_max_bkv: int | None = None,
     fp8_compute: bool = False,
     fence_output: bool = False,
+    prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -798,6 +800,10 @@ def ragged_paged_attention(
         fence_output: If True, the token-major output is materialized behind
             an optimization barrier instead of its transpose being fused into
             the consumer. Outputs are identical either way.
+        prepared_inputs: `(q_hbm, new_kv_hbm)` as `prepare_inputs` returns them
+            for these queries, keys and values (e.g. from
+            `prologue.qkv_to_rpa_inputs`). Then only the shapes and dtypes of
+            `queries`, `keys` and `values` are read.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -887,17 +893,25 @@ def ragged_paged_attention(
         skip_empty_launch=skip_empty_launch,
     )
 
-    q_hbm, new_kv_hbm = prepare_inputs(
-        queries,
-        keys,
-        values,
-        queries.dtype,
-        kv_cache.dtype,
-        k_scale_tensor,
-        v_scale_tensor,
+    prepare = functools.partial(
+        prepare_inputs,
+        q_dtype=queries.dtype,
+        kv_dtype=kv_cache.dtype,
+        k_scale=k_scale_tensor,
+        v_scale=v_scale_tensor,
         kv_layout=kv_layout,
         page_size=page_size,
     )
+    if prepared_inputs is None:
+        q_hbm, new_kv_hbm = prepare(queries, keys, values)
+    else:
+        expected = [
+            (a.shape, a.dtype) for a in jax.eval_shape(prepare, queries, keys, values)
+        ]
+        got = [(a.shape, a.dtype) for a in prepared_inputs]
+        if got != expected:
+            raise ValueError(f"prepared_inputs {got} != prepare_inputs {expected}")
+        q_hbm, new_kv_hbm = prepared_inputs
 
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs,
