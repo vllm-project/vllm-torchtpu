@@ -552,7 +552,7 @@ def test_the_patch_needs_the_flag_and_more_than_two_stages(monkeypatch):
     assert not hasattr(FakeCore, "_tpu_pp_lazy_patch")
 
 
-def test_the_ring_hand_off_never_installs_the_lazy_loop(monkeypatch):
+def test_the_buffered_hand_off_never_installs_the_lazy_loop(monkeypatch):
     from vllm.v1.engine import core as engine_core
 
     class FakeCore:
@@ -566,14 +566,14 @@ def test_the_ring_hand_off_never_installs_the_lazy_loop(monkeypatch):
     )
     monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
     monkeypatch.setattr(pp_lazy_step.envs, "TPU_PP_LAZY_PUSH", True)
-    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+    monkeypatch.setenv("TPU_PP_HANDOFF", "buffered")
     pp_lazy_step.patch_engine_core_for_lazy_push(_config(4))
     assert not hasattr(FakeCore, "_tpu_pp_lazy_patch")
     # the flag the user set is reported, not dropped
     assert warnings == [
         (
             "PP lazy push is off: the stages hand off point to point "
-            "(TPU_PP_HANDOFF=ring).",
+            "(TPU_PP_HANDOFF=buffered).",
         )
     ]
 

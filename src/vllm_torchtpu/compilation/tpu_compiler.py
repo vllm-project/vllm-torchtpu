@@ -238,7 +238,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # The hand-off between pipeline stages and its depth: it runs outside
     # the compiled forwards, which take the same inputs either way.
     "TPU_PP_HANDOFF",
-    "TPU_PP_RING_DEPTH",
+    "TPU_PP_HANDOFF_DEPTH",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the

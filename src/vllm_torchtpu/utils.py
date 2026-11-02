@@ -211,7 +211,7 @@ class HbmReserves(NamedTuple):
       kv_connector:    what the KV connector allocates, such as the offload
                        H2D staging pool.
       lora_slot_write: what an adapter swap holds while it runs.
-      pp_handoff:      what the pipeline ring hand-off's buffers take.
+      pp_handoff:      what the buffered pipeline hand-off's buffers take.
     """
 
     kv_connector: int

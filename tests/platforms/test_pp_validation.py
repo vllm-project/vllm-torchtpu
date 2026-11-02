@@ -267,50 +267,52 @@ def test_raiden_accepts_stages_of_sparse_attention_layers(monkeypatch):
 
 
 @pytest.fixture
-def ring(monkeypatch):
-    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
-    monkeypatch.delenv("TPU_PP_RING_DEPTH", raising=False)
+def buffered(monkeypatch):
+    monkeypatch.setenv("TPU_PP_HANDOFF", "buffered")
+    monkeypatch.delenv("TPU_PP_HANDOFF_DEPTH", raising=False)
 
 
-def test_the_ring_keeps_the_rejections(ring):
+def test_the_buffered_handoff_keeps_the_rejections(buffered):
     with pytest.raises(NotImplementedError, match="tensor-parallel-size 1"):
         validate_pipeline_parallel_config(_config(pp=2, tp=4))
     with pytest.raises(NotImplementedError, match="async scheduling"):
         validate_pipeline_parallel_config(_config(pp=2, async_scheduling=True))
 
 
-def test_the_ring_accepts_context_parallel_stages_and_raiden(ring, stage_meshes):
+def test_the_buffered_handoff_accepts_pcp_stages_and_raiden(buffered, stage_meshes):
     validate_pipeline_parallel_config(_config(pp=4, pcp=8, kv_transfer=RAIDEN))
     validate_pipeline_parallel_config(_config(pp=8, kv_transfer=OFFLOAD))
 
 
-def test_the_ring_needs_a_depth_of_at_least_one(monkeypatch, ring):
-    monkeypatch.setenv("TPU_PP_RING_DEPTH", "0")
-    with pytest.raises(ValueError, match="TPU_PP_RING_DEPTH must be at least 1"):
+def test_the_buffered_handoff_needs_a_depth_of_at_least_one(monkeypatch, buffered):
+    monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "0")
+    with pytest.raises(ValueError, match="TPU_PP_HANDOFF_DEPTH must be at least 1"):
         validate_pipeline_parallel_config(_config(pp=2))
-    # the wave has no depth to check
-    monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
+    # the lockstep hand-off has no depth to check
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
     validate_pipeline_parallel_config(_config(pp=2))
 
 
-def test_the_ring_depth_stays_within_the_receive_flags(monkeypatch, ring):
-    monkeypatch.setenv("TPU_PP_RING_DEPTH", "6")
+def test_the_handoff_depth_stays_within_the_receive_flags(monkeypatch, buffered):
+    monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "6")
     validate_pipeline_parallel_config(_config(pp=8))
-    monkeypatch.setenv("TPU_PP_RING_DEPTH", "7")
+    monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "7")
     with pytest.raises(ValueError, match="at most 8 receives can be outstanding"):
         validate_pipeline_parallel_config(_config(pp=8))
     # four stages keep four steps in flight; the last of two holds one
     validate_pipeline_parallel_config(_config(pp=4))
     validate_pipeline_parallel_config(_config(pp=2))
-    # the wave posts no receives
-    monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
+    # the lockstep hand-off posts no receives
+    monkeypatch.setenv("TPU_PP_HANDOFF", "lockstep")
     validate_pipeline_parallel_config(_config(pp=8))
 
 
-def test_a_model_with_a_top_k_table_hands_on_two_tensors_per_forward(monkeypatch, ring):
-    monkeypatch.setenv("TPU_PP_RING_DEPTH", "3")
+def test_a_model_with_a_top_k_table_hands_on_two_tensors_per_forward(
+    monkeypatch, buffered
+):
+    monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "3")
     validate_pipeline_parallel_config(_config(pp=4))
     with pytest.raises(ValueError, match="2 per forward"):
         validate_pipeline_parallel_config(_config(pp=4, index_topk=2048))
-    monkeypatch.setenv("TPU_PP_RING_DEPTH", "2")
+    monkeypatch.setenv("TPU_PP_HANDOFF_DEPTH", "2")
     validate_pipeline_parallel_config(_config(pp=4, index_topk=2048))
