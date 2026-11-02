@@ -1078,11 +1078,10 @@ def _pack_lane_dense(values: jax.Array, token_bytes: int) -> jax.Array:
     """`kv_cache_utils.pack_tokens`, bit for bit, as 128-lane u32 rows.
 
     Word `w` = byte `w` of each `token_bytes / 4`-byte band (the SparseCore
-    cache word). Built from lane slices of the 1-byte values, so XLA emits one
-    lane-dense fusion; `pack_tokens`' [T, 4, band] reshape costs ~0.6 us of
-    relayout per layer at decode sizes. Rows narrower than 128 words (rope:
-    32, or 16 under packed rope) are zero-padded to 128 lanes; the gather
-    writes only the token's words.
+    cache word), from lane slices of the 1-byte values as in `pack_tokens`;
+    bands past the values' width are skipped rather than OR'd in as zeros.
+    Rows narrower than 128 words (rope: 32, or 16 under packed rope) are
+    zero-padded to 128 lanes; the gather writes only the token's words.
     """
     u8 = jax.lax.bitcast_convert_type(values, jnp.uint8)
     band = token_bytes // kv_cache_utils.WORD_BYTES
