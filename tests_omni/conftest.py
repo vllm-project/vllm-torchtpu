@@ -218,6 +218,18 @@ def _omni_model_patches() -> None:
     apply_omni_model_specific_patches()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _torchtpu_eager_mode() -> None:
+    """Run in-process tests in production's torch_tpu eager mode (DEFER_AND_FUSE).
+
+    Production sets it when a VllmConfig is built, so without this an in-process
+    test's numerics depend on whether an earlier test in the session built one.
+    """
+    from vllm_torchtpu.platforms.tpu_platform import _configure_torchtpu_eager_mode
+
+    _configure_torchtpu_eager_mode()
+
+
 @pytest.fixture(autouse=True)
 def _sync_tpu(request: pytest.FixtureRequest) -> Generator[None, None, None]:
     """Flush deferred torch_tpu ops between in-process TPU tests."""

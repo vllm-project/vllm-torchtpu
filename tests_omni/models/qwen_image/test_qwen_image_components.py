@@ -44,10 +44,10 @@ NUMERIC_MISMATCH_PATTERN = r"relative L2 error|max absolute error"
 
 # (max_rel_l2, max_abs) vs the float64 CPU reference, ~3% above the observed
 # values.
-ROPE_FREQS_TXT_MAX_REL_L2 = 4.8e-7
-ROPE_FREQS_TXT_MAX_ABS = 3.5e-6
-ROPE_FREQS_VID_MAX_REL_L2 = 1.3e-7
-ROPE_FREQS_VID_MAX_ABS = 5.0e-7
+ROPE_FREQS_TXT_MAX_REL_L2 = 9.5e-7
+ROPE_FREQS_TXT_MAX_ABS = 7.3e-6
+ROPE_FREQS_VID_MAX_REL_L2 = 2.3e-7
+ROPE_FREQS_VID_MAX_ABS = 9.8e-7
 ROPE_VID_MAX_REL_L2 = 2.2e-3
 ROPE_VID_MAX_ABS = 3.2e-2
 ROPE_TXT_MAX_REL_L2 = 2.8e-3

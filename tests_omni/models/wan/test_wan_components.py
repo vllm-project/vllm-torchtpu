@@ -237,8 +237,8 @@ def _to_omni(inputs: dict, dtype) -> dict:
 FUSED_ATTN_MAX_REL_L2 = 6.7e-3
 FUSED_ATTN_MAX_ABS = 2.1e-3
 # TPU float32 vs diffusers CPU float64 RoPE frequency tables, worst table.
-ROPE_FREQS_MAX_REL_L2 = 3.0e-7
-ROPE_FREQS_MAX_ABS = 1.7e-6
+ROPE_FREQS_MAX_REL_L2 = 4.1e-7
+ROPE_FREQS_MAX_ABS = 2.5e-6
 
 
 def test_wan_rotary_embedding_pair_swap_bit_exact_on_tpu() -> None:
