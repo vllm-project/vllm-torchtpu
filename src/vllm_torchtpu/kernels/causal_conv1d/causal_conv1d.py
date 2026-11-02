@@ -149,8 +149,12 @@ class ConvStateBuffer(BufferWrapper):
             s_idx = self.metadata_ref.b_idx_to_s_idx[b_idx]
             state_idx = self.metadata_ref.s_idx_to_state_idx[s_idx]
             sz_from_old = self.metadata_ref.b_idx_to_sz_from_old[b_idx]
-            start_from_old = self.cfgs.prev_kernel_size - sz_from_old
             sz_from_old = jnp.where(is_no_op, 0, sz_from_old)
+            # A row that needs no old state still issues a zero-length copy;
+            # keep its offset inside the state rows.
+            start_from_old = jnp.where(
+                sz_from_old > 0, self.cfgs.prev_kernel_size - sz_from_old, 0
+            )
 
             pltpu.make_async_copy(
                 self.hbm_ref.at[state_idx, pl.ds(start_from_old, sz_from_old)],
