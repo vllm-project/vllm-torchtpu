@@ -516,8 +516,10 @@ def _compute_num_reqs_in_chunk(
         # num_reqs - start_index is not the local chunks number.
         rows = slice(start_index, num_reqs)
         num_computed = runner.input_batch.num_computed_tokens_cpu[rows]
-        is_prefilling = num_computed < runner.input_batch.num_prompt_tokens[rows]
-        seq_lens = num_computed + np.asarray(num_scheduled_tokens)
+        q_lens = np.asarray(num_scheduled_tokens)
+        # Same rule as the sharding plan's `prepare_real`.
+        is_prefilling = q_lens > 1
+        seq_lens = num_computed + q_lens
         return pcp_manager.num_reqs_in_chunk(is_prefilling, seq_lens, capacity)
 
 

@@ -471,10 +471,10 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         q_lens = [int(n) for n in num_scheduled_tokens_per_req[:num_reqs]]
         rows = slice(start_index, start_index + num_reqs)
         num_computed = runner.input_batch.num_computed_tokens_cpu[rows].astype(np.int64)
-        num_prompt = np.asarray(
-            runner.input_batch.num_prompt_tokens[rows], dtype=np.int64
-        )
-        is_prefilling = [bool(c < p) for c, p in zip(num_computed, num_prompt)]
+        # Split a request iff it schedules more than one token
+        # TODO(weiyulin): Spec decode verify windows also schedule several
+        # tokens; tell them apart here once PCP x DCP supports spec decode.
+        is_prefilling = [q > 1 for q in q_lens]
 
         # Every rank pads its local batch to the same compile bucket.
         rank_counts = pcp_rank_token_counts(q_lens, is_prefilling, self.pcp_size)

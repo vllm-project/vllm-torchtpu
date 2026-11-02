@@ -125,6 +125,47 @@ def test_decode_window_is_capped_at_max_num_seqs(pcp_size, num_prefills):
     assert dummy.host_metadata["rep_request_distribution"].max() <= MAX_NUM_SEQS
 
 
+@pytest.mark.parametrize("pcp_size", [2, 4])
+def test_resumed_request_is_split(pcp_size):
+    """A request resumed after preemption recomputes its output tokens, so
+    it is past `num_prompt_tokens` with several tokens scheduled; it must
+    be split, not replicated as a decode."""
+    q_lens = [300, 1, 1]
+    num_computed = [520, 700, 900]
+    num_prompt = [500, 700, 900]
+    target = 8 * _manager(pcp_size).local_reqs_per_req
+    plan = _manager(pcp_size)
+    plan.prepare_real(
+        runner=_runner(num_computed, num_prompt, q_lens, target),
+        scheduler_output=None,
+        start_index=0,
+        num_reqs=len(q_lens),
+        num_scheduled_tokens_per_req=q_lens,
+        total_num_scheduled_tokens=sum(q_lens),
+        use_max_model_len=False,
+        target_num_reqs=target,
+        padded_num_reqs=len(q_lens),
+    )
+    assert plan.local_num_split_reqs == 2
+    assert plan.rep_num_reqs == 2
+
+
+def test_chunk_counts_a_resumed_request_as_split():
+    from vllm_torchtpu.runner.tpu_runner import _compute_num_reqs_in_chunk
+
+    q_lens = [300, 300, 1]
+    runner = SimpleNamespace(
+        pcp_manager=_manager(2),
+        input_batch=SimpleNamespace(
+            num_computed_tokens_cpu=np.asarray([520, 0, 900], dtype=np.int32),
+            num_prompt_tokens=np.asarray([500, 1000, 900], dtype=np.int32),
+        ),
+    )
+    # Two split requests are 4 local requests, past a bucket of 3.
+    assert _compute_num_reqs_in_chunk(runner, 0, 3, 3, q_lens) == 1
+    assert _compute_num_reqs_in_chunk(runner, 0, 3, 5, q_lens) == 3
+
+
 @pytest.fixture
 def small_chunks(monkeypatch):
     # 2-page gather chunks, so the workspace is not rounded up to 128 pages.
