@@ -76,9 +76,10 @@ def test_fp8_prefill_block_sizes_take_the_sliding_cap(sliding_window):
     mesh = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(mesh):
         blocks = wrapper.fp8_prefill_block_sizes(
-            model, serve, 64 * 1024 * 1024, sliding_prefill_max_bkv=256
+            model, serve, 64 * 1024 * 1024, sliding_prefill_max_bkv=300
         )
     if sliding_window:
+        # 300 rounds down to the 256-token MXU column stride and the 64-token chunk.
         assert blocks == configs.BlockSizes(256, 64, 256, 1)
     else:
         assert blocks == configs.BlockSizes(2048, 64, 512, 1)

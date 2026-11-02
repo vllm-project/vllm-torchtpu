@@ -586,13 +586,17 @@ def fp8_prefill_block_sizes(
     )
     bq_c = max(1, FP8_PREFILL_CHUNK_ROWS // rows_per_token)
     bkv = FP8_PREFILL_KV_BLOCK
-    bq = FP8_PREFILL_STEP_ROWS // (rows_per_token * model_cfgs.num_kv_heads)
-    if model_cfgs.sliding_window is not None and sliding_prefill_max_bkv is not None:
-        bkv = min(bkv, sliding_prefill_max_bkv)
-        bq = min(bq, sliding_prefill_max_bkv)
     if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         bkv = utils.align_to(bkv, serve_cfgs.page_size)
-    bq = max(bq // bq_c, 1) * bq_c
+    bq = FP8_PREFILL_STEP_ROWS // (rows_per_token * model_cfgs.num_kv_heads)
+    bq = utils.align_to(max(bq, bq_c), bq_c)
+    if model_cfgs.sliding_window is not None and sliding_prefill_max_bkv is not None:
+        # Round down to the granularity the default path steps in, with a floor.
+        stride = pltpu.get_tpu_info().mxu_column_size
+        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            stride = utils.align_to(stride, serve_cfgs.page_size)
+        bkv = max(min(bkv, sliding_prefill_max_bkv) // stride, 1) * stride
+        bq = max(min(bq, sliding_prefill_max_bkv) // bq_c, 1) * bq_c
     while True:
         blocks = configs.BlockSizes(bq_sz=bq, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=1)
         cfgs = configs.RpaConfigs(
