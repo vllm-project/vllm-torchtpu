@@ -109,9 +109,8 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
         # 3. Dispatch FP8 MoE
         if _is_weight_fp8(weight_quant):
             fp8_config = _build_fp8_config(weight_quant, input_quant)
-            # compressed-tensors names every expert scale `weight_scale`, block
-            # scales included; VllmFp8MoEMethodTPU would otherwise register
-            # block scales under DeepSeek's `weight_scale_inv`.
+            # compressed-tensors names block scales `weight_scale`, not
+            # `weight_scale_inv`.
             return VllmFp8MoEMethodTPU(
                 fp8_config,
                 fp8_config.get_moe_config(layer),

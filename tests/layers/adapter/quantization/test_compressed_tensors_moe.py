@@ -228,9 +228,8 @@ def _compressed_tensors_fp8_config(weights: dict) -> VllmCompressedTensorsConfig
 def test_fp8_experts_register_compressed_tensors_scale_names(
     monkeypatch, weights, w13_scale_shape, w2_scale_shape
 ):
-    """compressed-tensors names every scale `weight_scale`; expert loaders look
-    parameters up by that name, so the fused layer must not register
-    VllmFp8MoEMethodTPU's default DeepSeek-style `weight_scale_inv` instead."""
+    """compressed-tensors names every scale `weight_scale`; the fused layer must
+    register that name, not the DeepSeek-style `weight_scale_inv`."""
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(enable_expert_parallel=False)
     )

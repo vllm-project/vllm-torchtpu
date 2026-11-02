@@ -793,11 +793,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
-        # Checkpoint name of the expert scales. Native fp8 checkpoints store
-        # block scales as `weight_scale_inv` (DeepSeek) and per-tensor or
-        # per-channel scales as `weight_scale`; callers whose checkpoints use
-        # another convention (compressed-tensors: always `weight_scale`) pass
-        # the name explicitly.
+        # Native fp8 checkpoints name block scales `weight_scale_inv`; other
+        # formats pass their own name (compressed-tensors: `weight_scale`).
         if weight_scale_name is None:
             weight_scale_name = (
                 "weight_scale_inv" if self.block_quant else "weight_scale"
