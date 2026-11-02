@@ -136,14 +136,18 @@ def _patched_model_init(self: Gemma4Model, *args: Any, **kwargs: Any) -> None:
 # Functional collectives: vLLM's all_gather and reduce_scatter allocate their
 # output with torch.empty at the traced token count, which torch_tpu cannot
 # lower while that count is symbolic (the fused EP MoE gathers the same way).
+# A traced funcol call already ends in its wait_tensor, and torch_tpu refuses a
+# wait on a wait; only an eager AsyncCollectiveTensor is waited here.
+def _waited(t: torch.Tensor) -> torch.Tensor:
+    return funcol.wait_tensor(t) if isinstance(t, funcol.AsyncCollectiveTensor) else t
+
+
 def _all_gather_rows(x: torch.Tensor) -> torch.Tensor:
-    return funcol.wait_tensor(
-        funcol.all_gather_single(x, 0, get_tp_group().device_group)
-    )
+    return _waited(funcol.all_gather_single(x, 0, get_tp_group().device_group))
 
 
 def _reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
-    return funcol.wait_tensor(
+    return _waited(
         funcol.reduce_scatter_single(x, "sum", 0, get_tp_group().device_group)
     )
 

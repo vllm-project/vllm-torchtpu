@@ -643,6 +643,28 @@ def _collectives_worker(rank: int, world: int, port: int) -> None:
             gathered.view(torch.float8_e4m3fn).float(),
             (rows / 16).to(torch.float8_e4m3fn).float(),
         )
+
+        # Traced, every wait_tensor must consume a collective, not another wait
+        # (torch_tpu's split compiler refuses a wait on a wait).
+        graphs = []
+
+        def backend(gm, example_inputs):
+            graphs.append(gm)
+            return gm.forward
+
+        def step(x):
+            return gemma4_patch._all_gather_rows(gemma4_patch._reduce_scatter_rows(x))
+
+        traced = torch.compile(step, backend=backend, fullgraph=True)(partial)
+        torch.testing.assert_close(traced, step(partial), rtol=0, atol=0)
+        wait = torch.ops._c10d_functional.wait_tensor
+
+        def is_wait(node: Any) -> bool:
+            return getattr(node.target, "overloadpacket", node.target) is wait
+
+        waits = [node for node in graphs[0].graph.nodes if is_wait(node)]
+        assert len(waits) == 2, graphs[0].code
+        assert not any(is_wait(node.args[0]) for node in waits), graphs[0].code
     finally:
         dist.destroy_process_group()
 
