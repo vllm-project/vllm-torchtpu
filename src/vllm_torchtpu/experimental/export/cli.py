@@ -190,6 +190,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     export_group.add_argument(
+        "--debug-taps",
+        default="",
+        help=(
+            "Comma-separated glob patterns of module names (e.g. "
+            "'model.layers.3.self_attn,mtp.fc'; MTP draft modules start with "
+            "'mtp.'). Also exports forward and mtp_draft for the smallest token "
+            "bucket with those modules' outputs as extra results, under "
+            "assets.extra/debug/, for comparing intermediates against vLLM. The "
+            "serving artifact is unchanged."
+        ),
+    )
+    export_group.add_argument(
         "--export-mode",
         choices=EXPORT_MODES,
         default="all",
@@ -460,7 +472,8 @@ def run_export_from_args(
         if export_mode == "all"
         else None
     )
-    exporter.export(exportable, args.output_dir)
+    debug_taps = [p for p in (getattr(args, "debug_taps", "") or "").split(",") if p]
+    exporter.export(exportable, args.output_dir, debug_taps=debug_taps)
     if weights is not None:
         checkpoint.save_model_checkpoint(
             weights,

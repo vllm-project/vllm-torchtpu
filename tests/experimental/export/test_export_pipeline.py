@@ -2322,6 +2322,72 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     assert draft[0]["shape"] == [8, 1] and draft[0]["dtype"] == "i32"
 
 
+class _TappableMtpExportableLLM(_TinyMtpExportableLLM):
+    """`_TinyMtpExportableLLM` whose forward and draft run modules a debug tap
+    can hook: the target's `final` and the draft's `fc_act`, which the chain
+    would call once per draft."""
+
+    def __init__(self, cfg: api.TextOnlyLLMExportConfig) -> None:
+        super().__init__(cfg)
+        self.model = nn.Module()
+        self.model.final = nn.Tanh()
+        draft = nn.Module()
+        draft.model = nn.Module()
+        draft.model.fc_act = nn.Tanh()
+        object.__setattr__(self.model, universal_adapter.MTP_DRAFT_ATTR, draft)
+
+    def forward(self, weights, kv_caches, **controls):  # type: ignore[override]
+        kvs, hidden = super().forward(weights, kv_caches, **controls)
+        return kvs, self.model.final(hidden)
+
+    def mtp_draft(self, weights, kv_caches, **controls):  # type: ignore[override]
+        draft = getattr(self.model, universal_adapter.MTP_DRAFT_ATTR)
+        hidden = draft.model.fc_act(controls.pop("hidden_states"))
+        draft.model.fc_act(hidden)
+        return super().mtp_draft(weights, kv_caches, hidden_states=hidden, **controls)
+
+
+def test_debug_taps_export_tapped_variants_under_assets_extra(tmp_path) -> None:
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_reading_used_args,
+    ):
+        exporter.export(
+            _TappableMtpExportableLLM(_mtp_config()),
+            out_dir,
+            debug_taps=["final", "mtp.fc_*"],
+        )
+    manifest = json.loads(Path(out_dir, "assets.extra/debug/taps.json").read_text())
+    functions = manifest["functions"]
+    # The smallest token bucket only, after the serving variant's own results:
+    # the forward's one state and hidden_states, the draft's state and drafts.
+    forward = functions["forward"]["8"]
+    assert set(functions["forward"]) == set(functions["mtp_draft"]) == {"8"}
+    assert forward["num_outputs"] == 2
+    assert forward["taps"] == [
+        {"name": "final", "output_index": 2, "shape": [8, 16], "dtype": "bf16"}
+    ]
+    assert Path(out_dir, forward["file_path"]).is_file()
+    assert forward["file_path"].startswith("assets.extra/debug/")
+    # A module the chain calls twice records each call.
+    draft_taps = [t["name"] for t in functions["mtp_draft"]["8"]["taps"]]
+    assert draft_taps == ["mtp.fc_act", "mtp.fc_act#1"]
+    # The serving artifact does not name the debug modules.
+    meta = Path(out_dir, "metadata.json").read_text()
+    assert "assets.extra" not in meta and "_debug_" not in meta
+
+
+def test_a_debug_tap_must_match_a_module(tmp_path) -> None:
+    with pytest.raises(ValueError, match="matches no module"):
+        exporter.export(
+            _TappableMtpExportableLLM(_mtp_config()),
+            str(tmp_path / "out"),
+            debug_taps=["no.such.module"],
+        )
+
+
 def test_a_speculative_export_needs_request_buckets_for_every_verify_row(
     tmp_path,
 ) -> None:
