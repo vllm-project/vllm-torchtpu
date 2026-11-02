@@ -1296,9 +1296,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DECODE_INTERVAL_MS": env_nonnegative_int(
         "VLLM_TPU_DECODE_INTERVAL_MS", 0
     ),
-    # PrefillFirstScheduler, with DP > 1: the request counts it publishes for
-    # data-parallel load balancing add one running request per this many tokens
-    # each request still has to prefill (0: true counts).
+    # PrefillFirstScheduler, with DP > 1: the request counts published to the
+    # DP coordinator for load balancing add one running request per this many
+    # tokens each request still has to prefill (0: true counts).
     "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS": env_nonnegative_int(
         "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS", 0
     ),

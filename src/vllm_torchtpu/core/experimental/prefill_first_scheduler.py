@@ -53,10 +53,10 @@ vLLM's data-parallel front end sends each new request to the engine with the
 fewest waiting plus running requests, as each engine's scheduler reports them;
 a replica that still has a long prompt to prefill then looks no busier than one
 that only decodes, and a request routed there waits for that prefill. With
-DP > 1, the counts this scheduler publishes (for the front end and its logged
-stats) add, to the running requests, one per U tokens (rounded up) that each
-running prefill chunk and waiting request still has to prefill; its own
-scheduling and the engine's unfinished-request checks keep the true counts.
+DP > 1, the counts the engine core publishes to the DP coordinator add, to the
+running requests, one per U tokens (rounded up) that each running prefill chunk
+and waiting request still has to prefill; scheduling, the logged stats and the
+engine's unfinished-request checks keep the true counts.
 
 Requests that sit a step out are resent with only the output tokens the model
 runner reads (see ``_make_cached_request_data``).
@@ -204,10 +204,16 @@ class PrefillFirstScheduler(AsyncScheduler):
         with self._reading_true_counts():
             return super().has_finished_requests()
 
+    def make_stats(self, *args, **kwargs):
+        # Loggers and metrics count requests; only the coordinator's copy, which
+        # EngineCore._maybe_publish_request_counts sends, carries the units.
+        with self._reading_true_counts():
+            return super().make_stats(*args, **kwargs)
+
     def get_request_counts(self) -> tuple[int, int]:
         """With prefill-aware load balancing, outside the base scheduler's own
-        logic (so for the DP stats publisher and make_stats), running also
-        counts the units of prefill still pending."""
+        logic (so for the DP stats publisher), running also counts the units of
+        prefill still pending."""
         num_running, num_waiting = super().get_request_counts()
         if not self.lb_prefill_unit or self._true_counts:
             return num_running, num_waiting
@@ -216,6 +222,7 @@ class PrefillFirstScheduler(AsyncScheduler):
             self.kv_holding_waiting,
             self.waiting,
         )
+        # Prefix-cache hits a waiting request will get are not subtracted.
         pending_units = sum(
             -(-(r.num_tokens - r.num_computed_tokens) // self.lb_prefill_unit)
             for r in prefilling

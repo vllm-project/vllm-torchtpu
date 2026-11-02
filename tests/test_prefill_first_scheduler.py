@@ -81,6 +81,7 @@ def _build(
     max_num_batched_tokens: int = 128,
     long_prefill_token_threshold: int = 0,
     data_parallel_size: int = 1,
+    log_stats: bool = False,
     policy: str = "fcfs",
 ):
     monkeypatch.setenv("VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", str(over_tokens))
@@ -134,6 +135,7 @@ def _build(
         kv_cache_config=kv_cache_config,
         structured_output_manager=StructuredOutputManager(vllm_config),
         block_size=BLOCK_SIZE,
+        log_stats=log_stats,
     )
     init_none_hash(sha256)
     return scheduler, get_request_block_hasher(BLOCK_SIZE, sha256)
@@ -541,6 +543,20 @@ def test_unfinished_requests_are_true_counts_while_paused(
     # A pause drains running requests only; the queued one is not counted.
     assert scheduler.get_num_unfinished_requests() == 0
     assert not scheduler.has_requests()
+    assert scheduler.get_request_counts() == (4, 1)
+
+
+def test_logged_stats_count_requests(shared_model_config, monkeypatch):
+    scheduler, hasher = _build(
+        shared_model_config,
+        monkeypatch,
+        dp_lb_prefill_unit_tokens=32,
+        data_parallel_size=2,
+        log_stats=True,
+    )
+    _add(scheduler, hasher, ("queued", 100, 1))
+    stats = scheduler.make_stats()
+    assert (stats.num_running_reqs, stats.num_waiting_reqs) == (0, 1)
     assert scheduler.get_request_counts() == (4, 1)
 
 
