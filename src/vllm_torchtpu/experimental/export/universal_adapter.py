@@ -1155,7 +1155,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         cfg = self._export_config
         if not self._has_recurrent_layers():
             return []
-        inputs = [("mamba_state_indices", (cfg.max_num_seqs,))]
+        inputs: list[tuple[str, tuple[int, ...]]] = [
+            ("mamba_state_indices", (cfg.max_num_seqs,))
+        ]
         if cfg.recurrent_window > 1:
             # Speculative verify windows: each request's `recurrent_window`
             # consecutive slots, and per slot the checkpoint to resume from.
