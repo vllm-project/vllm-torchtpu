@@ -63,19 +63,20 @@ TPOT pacing (``VLLM_TPU_DECODE_TPOT_TARGET_MS=T`` or
 ``VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST=P`` > 0, or both). Each running request
 earns one decode token per ``max(T, P * n)`` milliseconds, ``n`` being the
 requests the engine holds (running and waiting) at the time, and a regular step
-schedules its decode only while it holds an earned token. A request that fell
-behind (in long prefill steps, say) holds several and decodes in every step
-until it is back on schedule, so each request's TPOT tends to the target and
-its decode ends about ``output_len`` intervals after it began. A held request
-resumes once it holds ``_RESUME_AFTER_TOKENS``. Prefill chunks are never held
-back; a step with no earned decode and nothing to prefill schedules nothing
-(the engine core then yields 1 ms and, with DP > 1, runs a dummy forward). With
-a closed-loop client a request's completion sends the user's next one, so
-decodes paced to a target finish spread out like their first tokens instead of
-together, and the next requests do not queue behind each other's prefills;
-under open-loop arrivals this only raises TPOT. ``P`` caps the engine's decode
-rate at ``1000 / P`` tokens per second shared equally by its requests, so the
-target follows the load.
+schedules its decode only while it holds an earned token. Each token scheduled
+spends one (drafts included, so with speculative decoding TPOT runs above the
+target). A request that fell behind (in long prefill steps, say) holds several
+and decodes in every step until it is back on schedule, so each request's TPOT
+tends to the target and its decode ends about ``output_len`` intervals after it
+began. A held request resumes once it holds ``_RESUME_AFTER_TOKENS``. Prefill
+chunks are never held back; a step with no earned decode and nothing to prefill
+schedules nothing (the engine core then yields 1 ms and, with DP > 1, runs a
+dummy forward). With a closed-loop client a request's completion sends the
+user's next one, so decodes paced to a target finish spread out like their
+first tokens instead of together, and the next requests do not queue behind
+each other's prefills; under open-loop arrivals this only raises TPOT. ``P``
+caps the engine's decode rate at ``1000 / P`` tokens per second shared equally
+by its requests, so the target follows the load.
 
 Prefill-aware DP load balancing (``VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS=U > 0``).
 vLLM's data-parallel front end sends each new request to the engine with the
@@ -117,8 +118,9 @@ SCHEDULER_CLS = (
 )
 
 # Every resume puts a request back into the model runner's persistent batch,
-# which rewrites its whole token row: ~2 ms of host time per 80K-token prompt,
-# so TPOT pacing resumes a request once per this many tokens, not every token.
+# which rewrites its whole token row (2.25 ms of host time measured for an
+# 80K-token prompt; shorter prompts resume cheaper), so TPOT pacing resumes a
+# request once per this many tokens, not every token.
 _RESUME_AFTER_TOKENS = 16
 
 
@@ -424,10 +426,8 @@ class PrefillFirstScheduler(AsyncScheduler):
         now = monotonic()
         elapsed, self._paced_at = now - self._paced_at, now
         # Positive whenever there is a decode: the engine holds it.
-        interval = max(
-            self.tpot_target,
-            self.tpot_per_request * (len(self.running) + len(self.waiting)),
-        )
+        num_held = len(self.running) + len(self.waiting) + len(self.kv_holding_waiting)
+        interval = max(self.tpot_target, self.tpot_per_request * num_held)
         # Requests that stopped decoding (finished, preempted) drop out.
         pace: dict[str, _Pace] = {}
         paced = []
