@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Runtime config parsing (`VLLM_TPU_MEGAKERNEL` / `additional_config`),
-plugin resolution and import, plugin source hashes and fingerprints, and the
-compile-cache salt."""
+plugin resolution and import, and plugin source hashes and fingerprints."""
 
 from __future__ import annotations
 
@@ -35,7 +34,6 @@ from vllm_torchtpu.megakernel_runtime import config as cfg_mod
 from vllm_torchtpu.megakernel_runtime import fingerprint as fp
 from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
 from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
-from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
 
 _SRC = Path(plugin_mod.__file__).resolve().parents[2]
 # A built-in shorthand and a checkpoint arch it claims.
@@ -207,9 +205,7 @@ import vllm_torchtpu.megakernel.errors as errors
 import vllm_torchtpu.megakernel_runtime.plugin as p
 import vllm_torchtpu.megakernel_runtime.config as c
 import vllm_torchtpu.megakernel_runtime.fingerprint as f
-import vllm_torchtpu.megakernel_runtime.salt as s
 assert p.TpuMonoSpec and c.parse_config and f.source_hash
-assert s.compile_cache_salt
 assert p.TpuMonoSpec is contract.TpuMonoSpec
 assert issubclass(p.LayoutDecline, errors.MegakernelLayoutError)
 assert errors.EligibilityResult is contract.EligibilityResult
@@ -217,7 +213,7 @@ print("OK")
 """
 
 
-def test_plugin_and_config_import_without_torch_jax_or_vllm() -> None:
+def test_plugin_config_and_fingerprint_import_without_torch_jax_or_vllm() -> None:
     out = subprocess.run(
         [sys.executable, "-c", _FRESH_IMPORT],
         capture_output=True,
@@ -324,12 +320,12 @@ def test_import_plugin_errors(mod_dir: Path) -> None:
         cfg_mod.resolve_callable("noattr", pkg, what="create")
 
 
-def test_missing_shorthand_template_is_named_and_unsalted(
+def test_missing_shorthand_template_is_named(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Shorthands are imported by string: without the model folder installed,
-    the config names it and the compile-cache salt is `None`; an explicit
-    plugin reference that doesn't import is an error."""
+    the config names it; an explicit plugin reference that doesn't import is
+    an error."""
     gone = _ENTRY._replace(module="no_such_mk_folder.megakernel")
     monkeypatch.setitem(plugin_mod.SHORTHANDS, _SHORTHAND, gone)
     ref, _ = cfg_mod.resolve_plugin_ref(cfg_mod.parse_config("1"), _ARCH_HF)
@@ -342,47 +338,3 @@ def test_missing_shorthand_template_is_named_and_unsalted(
     with pytest.raises(MegakernelConfigError, match="failed to import"):
         cfg_mod.import_plugin(explicit)
     assert cfg_mod.missing_template(cfg_mod.PluginRef("json", shorthand="x")) is None
-    vcfg = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=_ARCH_HF),
-        additional_config={"megakernel": True},
-    )
-    assert compile_cache_salt(vcfg) is None
-
-
-# --- Compile-cache salt -------------------------------------------------------------
-
-_LAYOUT_PLUGIN = """
-from vllm_torchtpu.megakernel_runtime.plugin import TpuMonoSpec
-
-def layout_request(vllm_config, options):
-    return {"kv": "stacked", "n": options.get("n", 1)}
-
-SPEC = TpuMonoSpec("lay", "1", create="lay_mk_plugin:create",
-                          layout_request=layout_request)
-"""
-
-
-def _salt_config(megakernel: Any) -> Any:
-    return SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=_ARCH_HF),
-        additional_config={} if megakernel is None else {"megakernel": megakernel},
-    )
-
-
-def test_compile_cache_salt_digests_the_layout_request_only(
-    mod_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("VLLM_TPU_MEGAKERNEL", raising=False)
-    shorthand_cfg = {"plugin": _SHORTHAND, "options": {"mode": "tp"}}
-    for mk in (None, False, True, _SHORTHAND, shorthand_cfg):
-        assert compile_cache_salt(_salt_config(mk)) is None
-    _write(mod_dir / "lay_mk_plugin.py", _LAYOUT_PLUGIN)
-    salt1 = compile_cache_salt(_salt_config({"plugin": "lay_mk_plugin"}))
-    assert salt1 is not None and len(salt1) == 16
-    mk2 = {"plugin": "lay_mk_plugin", "options": {"n": 2}}
-    assert compile_cache_salt(_salt_config(mk2)) not in (None, salt1)
-    # Only the request counts: editing the plugin's source doesn't re-key.
-    _write(mod_dir / "lay_mk_plugin.py", _LAYOUT_PLUGIN + "\n# edited\n")
-    sys.modules.pop("lay_mk_plugin", None)
-    fp.clear_caches()
-    assert compile_cache_salt(_salt_config({"plugin": "lay_mk_plugin"})) == salt1
