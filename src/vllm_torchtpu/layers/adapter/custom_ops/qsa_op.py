@@ -7,6 +7,8 @@ from collections.abc import Callable
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
+
 from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     pooled_qsa_rows_step,
     pooled_qsa_shard_attend_rows_step,
@@ -1164,6 +1166,63 @@ def _compressed_dcp_ops():
     return select, attend, token_select
 
 
+@functools.cache
+def _shard_merge_ops():
+    """VLLM_TPU_QSA_DCP_SHARD_MERGE: the pair merge of a subset of rows and
+    the attend step from the merged selection."""
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
+        pooled_qsa_compressed_dcp_attend_blocks_step,
+        pooled_qsa_compressed_dcp_merge_step,
+    )
+
+    merge = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_compressed_dcp_merge", pooled_qsa_compressed_dcp_merge_step
+    )
+
+    @merge.register_fake
+    def merge_fake(vals_pair, pos_pair, block_topk):
+        return pos_pair.new_empty((pos_pair.shape[1], block_topk), dtype=torch.int32)
+
+    attend_blocks = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_compressed_dcp_attend_blocks",
+        pooled_qsa_compressed_dcp_attend_blocks_step,
+        donate_argnums=(7,),
+    )
+
+    @attend_blocks.register_fake
+    def attend_blocks_fake(q, gate, lengths, req, starts, main_table, context, pool, blocks,
+                           dcp_rank, kv_heads, compress_ratio, token_topk, dcp_size=2,
+                           k_scale=1.0, v_scale=1.0, main_slot=-1, max_query_len=1):
+        tokens = q.shape[0]
+        return (
+            torch.empty_like(pool),
+            q.new_empty((tokens, q.shape[1], q.shape[2]), dtype=torch.float32),
+            q.new_empty((tokens, q.shape[1]), dtype=torch.float32),
+            lengths.new_empty((tokens, token_topk + compress_ratio - 1), dtype=torch.int32),
+        )
+
+    return merge, attend_blocks
+
+
+def _shard_merged_blocks(vals, pos, dcp_rank, tp_group, pair_group, size, tokens, block_topk):
+    """The global selection [tokens, block_topk] from this pair's shard lists
+    ``vals`` / ``pos`` [rows, k]: the pair gathers its shard's lists, rank
+    ``dcp_rank`` merges rows [dcp_rank * rows / size, ...) of them, and a TP
+    all-gather of the merged rows restores token order (TP rank r = pair
+    r // size, DCP rank r % size, holding rows r * rows / size onward)."""
+    merge, _ = _shard_merge_ops()
+    rows, k = vals.shape
+    part = rows // size
+
+    def mine(x):
+        pair = pair_group.all_gather(x.unsqueeze(0).contiguous(), dim=0)
+        return pair.reshape(size, size, part, k)[:, dcp_rank.reshape(())]
+
+    blocks = merge(mine(vals), mine(pos), block_topk)
+    gathered = tp_group.all_gather(blocks.unsqueeze(0).contiguous(), dim=0)
+    return gathered.reshape(-1, block_topk)[:tokens]
+
+
 def _gathered_lists(vals, pos, group, size, tokens):
     """``[size, tokens, k]`` lists per pair rank from a ``group`` all-gather:
     rank ``r`` = pair ``r // size``'s DCP rank ``r % size``, each holding its
@@ -1241,17 +1300,30 @@ def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: i
             shard_size=world // size, dcp_size=size, **kwargs,
         )
         pool.copy_(updated)
-        vals_pair, pos_pair = _gathered_lists(vals, pos, tp_group, size, tokens)
         attend_kwargs = {
             name: kwargs[name]
             for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
             if name in kwargs
         }
-        updated, out, lse, selected = attend(
-            q, gate, lengths, req, starts, args[14], args[12], pool, vals_pair, pos_pair,
-            dcp_rank, kv_heads=kv_heads, compress_ratio=kwargs["compress_ratio"],
-            token_topk=kwargs["token_topk"], dcp_size=size, **attend_kwargs,
-        )
+        if envs.VLLM_TPU_QSA_DCP_SHARD_MERGE:
+            _, attend_blocks = _shard_merge_ops()
+            blocks = _shard_merged_blocks(
+                vals, pos, dcp_rank, tp_group, pair_group, size, tokens,
+                kwargs["token_topk"] // kwargs["compress_ratio"],
+            )
+            updated, out, lse, selected = attend_blocks(
+                q, gate, lengths, req, starts, args[14], args[12], pool, blocks,
+                dcp_rank, kv_heads=kv_heads, compress_ratio=kwargs["compress_ratio"],
+                token_topk=kwargs["token_topk"], dcp_size=size, **attend_kwargs,
+            )
+        else:
+            vals_pair, pos_pair = _gathered_lists(vals, pos, tp_group, size, tokens)
+            updated, out, lse, selected = attend(
+                q, gate, lengths, req, starts, args[14], args[12], pool, vals_pair,
+                pos_pair, dcp_rank, kv_heads=kv_heads,
+                compress_ratio=kwargs["compress_ratio"], token_topk=kwargs["token_topk"],
+                dcp_size=size, **attend_kwargs,
+            )
         pool.copy_(updated)
         return _dcp_finish(out, lse, qgate, head_dim, dcp_rank, pair_group, combine), selected
 
