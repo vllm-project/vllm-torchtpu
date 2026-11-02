@@ -137,3 +137,54 @@ def test_independent_multicore_gather_finishes_before_split_moe(gather_first):
     for n in instructions:
         for dependency in (*n.operand_ids, *n.control_predecessor_ids):
             assert positions[dependency] < positions[n.id]
+
+
+def _xla_activation_graph(*, split_branch):
+    """A 16-device graph: the activation is a plain all_gather, not the kernel."""
+    module = Module(entry_computation_id=1)
+    comp = module.computations.add(id=1)
+
+    def node(id, opcode, operands=(), marker="", cores=()):
+        instruction = comp.instructions.add(id=id, name=str(id), opcode=opcode)
+        instruction.operand_ids.extend(operands)
+        instruction.metadata.op_name = marker
+        if cores:
+            instruction.backend_config = json.dumps(
+                {"sparse_core_config": {"core_ids": list(cores)}}
+            ).encode()
+
+    node(1, "parameter")
+    node(2, "async-start", [1], "all_gather", ("0", "1"))
+    node(3, "async-done", [2], "all_gather")
+    node(4, "custom-call", [1], "moe_early_ag_route" if split_branch else "router")
+    node(5, "async-start", [4], "all_gather", ("0",))
+    node(6, "async-done", [5], "all_gather")
+    operands = [1] * 17
+    operands[10], operands[11] = 6, 3
+    node(7, "custom-call", operands, "fused_ep_moe_v2_fp4w_test")
+    node(8, "tuple", [7])
+    comp.root_id = 8
+    return module
+
+
+@pytest.mark.cpu_test
+def test_plain_all_gather_activation_is_pinned_when_the_split_branch_built_it():
+    module = _xla_activation_graph(split_branch=True)
+    rewritten = rewrite_moe_schedule(module.SerializeToString())
+    assert rewritten is not None
+    by_id = {n.id: n for n in Module.FromString(rewritten).computations[0].instructions}
+    assert json.loads(by_id[2].backend_config)["sparse_core_config"]["core_ids"] == [
+        "1"
+    ]
+    assert json.loads(by_id[5].backend_config)["sparse_core_config"]["core_ids"] == [
+        "0"
+    ]
+    # Activation submission goes before the router and the metadata gather.
+    assert 2 in by_id[4].control_predecessor_ids
+    assert 2 in by_id[5].control_predecessor_ids
+
+
+@pytest.mark.cpu_test
+def test_native_fallback_graph_with_plain_all_gathers_is_left_unchanged():
+    module = _xla_activation_graph(split_branch=False)
+    assert rewrite_moe_schedule(module.SerializeToString()) is None

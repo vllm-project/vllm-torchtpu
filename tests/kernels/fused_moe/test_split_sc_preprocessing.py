@@ -14,9 +14,9 @@
 """Which MoE calls take the split-SparseCore preprocessing, at 8 and 16 devices.
 
 `split_sc_plan` is the decision `fused_ep_moe_v2` makes before tracing. The
-DSV4.1 decode step must take the split path at 16 devices without the SC
-scatter (which does not fit there), and larger prefill buckets inside a decode
-server must keep the native path.
+DSV4.1 decode step must take the split path at 16 devices with XLA's scatter
+(the SC scatter does not fit there and was not measured where it would), and
+larger prefill buckets inside a decode server must keep the native path.
 """
 
 import pytest
@@ -60,10 +60,11 @@ def test_sixteen_device_decode_takes_split_path_without_sc_scatter():
 
 
 @pytest.mark.cpu_test
-def test_sixteen_device_uses_sc_scatter_when_it_fits():
-    (_, sc_scatter, split), _ = plan(SIXTEEN, t_local=64, fits=True)
+def test_sixteen_device_keeps_xla_scatter_even_when_the_sc_scatter_fits():
+    (_, sc_scatter, split), calls = plan(SIXTEEN, t_local=64, fits=True)
     assert split is True
-    assert sc_scatter is True
+    assert sc_scatter is False
+    assert calls == 0
 
 
 @pytest.mark.cpu_test

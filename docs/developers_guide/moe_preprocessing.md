@@ -3,10 +3,11 @@
 The fused EP FP4 MoE adapter supports an opt-in `topology` preprocessing
 backend for TPU7x with eight or sixteen EP ranks. Eight ranks need an affine
 rank mapping over a 2x2x1 chip topology with both dies and use the three-phase
-activation all-gather kernel below. Sixteen ranks (two hosts, 2x2x2) use XLA's
-own all-gather for the activation, see "Sixteen EP ranks". Unsupported
-topology, shape, or scratch-memory requirements retain native preprocessing.
-Other weight formats retain the native path.
+activation all-gather kernel below. Sixteen ranks use XLA's own all-gather for
+the activation, see "Sixteen EP ranks"; it was validated on two hosts with a
+2x2x2 topology, and the adapter checks only the device count and kind.
+Unsupported topology, shape, or scratch-memory requirements retain native
+preprocessing. Other weight formats retain the native path.
 
 ## Enablement
 
@@ -58,20 +59,26 @@ returns a topology with `custom_gather=False` and the activation gather is
 `lax.all_gather` under `compute_on(tpu_sparsecore, core_ids=[1])`, submitted
 before the router like the kernel above. The schedule transformation matches it
 by its `all_gather` operation name, pins it to SC1 and the metadata gather to
-SC0, and orders them as for eight ranks.
+SC0, and orders them as for eight ranks. A plain `all_gather` also matches the
+activation marker in a call that went back to native preprocessing, so the
+transformation rewrites a graph only when it has the `moe_early_ag_route` scope
+that the split branch alone emits; native fallbacks keep their schedule.
 
-The SC scatter's scratch grows with the global routed rows and has to fit in
-half a subcore's VMEM, 256 KiB on TPU7x. At 4608 global tokens and top-k 6 it
-needs about 346 KB, so the scatter keeps XLA's implementation and only the
-gather placement and submission order change. `split_sc_plan` also bounds the
-path to `XLA_GATHER_MAX_LOCAL_TOKENS` (512) local tokens: it was measured at 288
-(48 requests x 6 speculative tokens), and larger prefill buckets in a decode
-server keep native preprocessing, as the resource guards do for eight ranks.
-The libtpu flags above are required here too.
+The SC scatter is not used at sixteen ranks: its scratch grows with the global
+routed rows and has to fit in half a subcore's VMEM, 256 KiB on TPU7x, and at
+4608 global tokens x top-k 6 it needs about 346 KB by the scratch formula. The
+shapes where it would fit were not measured with it, so the scatter keeps XLA's
+implementation and only the gather placement and submission order change.
+`split_sc_plan` also bounds the path to `XLA_GATHER_MAX_LOCAL_TOKENS` (512)
+local tokens: it was measured at 288 (48 requests x (5 speculative + 1)), and
+larger prefill buckets in a decode server keep native preprocessing, as the
+resource guards do for eight ranks. The libtpu flags above are required here
+too.
 
-Measured on two v7x 2x2x2 hosts with the whole-layer benchmark
-(`scripts/dsv41_bench/bench_moe_full.py`, 288 local tokens, DSV4.1 shapes; each
-value is the maximum over TensorCores, then the median over three calls):
+Measured on two v7x 2x2x2 hosts with a whole-layer benchmark (not in this
+repository) at 288 local tokens with DSV4.1 shapes, synthetic FP4 weights and
+uniform routing; each value is the maximum over TensorCores, then the median
+over three calls:
 
 | Metric | Native | Split SC |
 | --- | ---: | ---: |

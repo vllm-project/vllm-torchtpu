@@ -68,9 +68,10 @@ def supports_activation_gather(local_bytes: int) -> bool:
 
 
 # The 16-device path (XLA activation gather on SC1) is validated at 288 local
-# tokens, the DSV4.1 decode step of 48 requests x (5 speculative + 1). It has no
-# scratch guard of its own, so larger prefill buckets inside a decode server are
-# bounded here and keep the native path, as the 8-device guards do for them.
+# tokens, the DSV4.1 decode step of 48 requests x (5 speculative + 1), with
+# XLA's scatter. It has no scratch guard of its own, so larger prefill buckets
+# inside a decode server are bounded here and keep the native path, as the
+# 8-device guards do for them.
 XLA_GATHER_MAX_LOCAL_TOKENS = 512
 
 
@@ -88,9 +89,10 @@ def split_sc_plan(
     Returns (topology, use_sc_scatter, use_split_sc). The topology is None where
     the call keeps native preprocessing. The 8-device topology kernel needs both
     its SPMEM scratch and the SC scatter to fit. The 16-device XLA gather only
-    needs the SC placement and early submission, so it does not depend on the
-    scatter fitting, which scales with the global routed rows and does not at
-    4608 tokens x top-k 6; the scatter then falls back to XLA's.
+    needs the SC placement and early submission and always keeps XLA's scatter:
+    the SC scatter's scratch grows with the global routed rows and does not fit
+    at the decode step (4608 tokens x top-k 6), and the shapes where it would
+    fit were not measured with it.
     """
     if topology is None or not fused or not fp4:
         return None, False, False
@@ -102,4 +104,4 @@ def split_sc_plan(
         return topology, True, True
     if t_local > XLA_GATHER_MAX_LOCAL_TOKENS:
         return None, False, False
-    return topology, scatter_fits(), True
+    return topology, False, True
