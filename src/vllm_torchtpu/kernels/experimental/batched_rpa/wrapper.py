@@ -509,6 +509,7 @@ def calculate_block_sizes(
         "attention_scope",
         "return_lse",
         "mask_invalid_v",
+        "skip_empty_launch",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -552,6 +553,7 @@ def ragged_paged_attention(
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
     mask_invalid_v: bool | None = None,
+    skip_empty_launch: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -613,6 +615,9 @@ def ragged_paged_attention(
             matmul so NaNs in unused VMEM or shared new-KV pages cannot propagate via
             0.0 * NaN. Defaults to None (True for SEQ_ALONG_LANE, False for
             HEAD_ALONG_SUBLANE).
+        skip_empty_launch: If True, the decode or mixed kernel call whose segment
+            of `distribution` is empty returns at entry, and its schedule writes
+            only `actual_steps`. Outputs are identical either way.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -699,6 +704,7 @@ def ragged_paged_attention(
         return_lse=return_lse,
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
+        skip_empty_launch=skip_empty_launch,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(

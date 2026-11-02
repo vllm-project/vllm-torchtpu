@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_RPA_SKIP_EMPTY_LAUNCH: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -709,6 +710,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # Batched RPA launches its decode and its mixed kernel on every step. With
+    # this on, a launch whose batch segment is empty (the mixed kernel of a
+    # decode-only step, the decode kernel of a prefill-only step) skips its
+    # VMEM zero-fill and its schedule's HBM write-back instead of running
+    # zero steps on initialized buffers. Outputs are unchanged.
+    "TPU_RPA_SKIP_EMPTY_LAUNCH": env_bool("TPU_RPA_SKIP_EMPTY_LAUNCH"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.

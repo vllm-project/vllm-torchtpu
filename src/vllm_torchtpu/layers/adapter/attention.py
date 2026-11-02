@@ -519,9 +519,15 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
     block_major: bool = False,
+    skip_empty_launch: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
+    rpa_kwargs: dict[str, Any] = {}
+    if decode_query_size > 1:
+        rpa_kwargs["decode_query_size"] = decode_query_size
+    if skip_empty_launch:
+        rpa_kwargs["skip_empty_launch"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -539,10 +545,8 @@ def _pallas_rpa_kernel_batched(
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
         rpa_func=(
-            functools.partial(
-                ragged_paged_attention_batched, decode_query_size=decode_query_size
-            )
-            if decode_query_size > 1
+            functools.partial(ragged_paged_attention_batched, **rpa_kwargs)
+            if rpa_kwargs
             else ragged_paged_attention_batched
         ),
         sm_scale=sm_scale,
@@ -1043,6 +1047,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
+            if "skip_empty_launch" in entry_params and envs.TPU_RPA_SKIP_EMPTY_LAUNCH:
+                logger.info_once("Batched RPA skips launches with an empty segment.")
+                entry_kwargs["skip_empty_launch"] = True
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
