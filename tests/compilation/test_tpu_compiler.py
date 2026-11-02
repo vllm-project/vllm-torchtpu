@@ -26,12 +26,20 @@ from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
 
 class TestTpuCompilerCache:
     @staticmethod
-    def _config(*, max_num_seqs=16, num_gpu_blocks=1024):
+    def _config(
+        *,
+        max_num_seqs=16,
+        num_gpu_blocks=1024,
+        enable_prefix_caching=False,
+        mamba_cache_mode="none",
+    ):
         return SimpleNamespace(
             cache_config=SimpleNamespace(
                 gpu_memory_utilization=0.9,
                 num_gpu_blocks=num_gpu_blocks,
                 num_gpu_blocks_override=None,
+                enable_prefix_caching=enable_prefix_caching,
+                mamba_cache_mode=mamba_cache_mode,
             ),
             model_config=SimpleNamespace(max_model_len=4096),
             scheduler_config=SimpleNamespace(
@@ -56,9 +64,17 @@ class TestTpuCompilerCache:
             different_kv = compute_tpu_compilation_hash(
                 self._config(num_gpu_blocks=2048)
             )
+            different_prefix = compute_tpu_compilation_hash(
+                self._config(enable_prefix_caching=True)
+            )
+            different_mamba = compute_tpu_compilation_hash(
+                self._config(mamba_cache_mode="align")
+            )
 
         assert base != different_batch
         assert base != different_kv
+        assert base != different_prefix
+        assert base != different_mamba
 
     def test_tpu_hash_covers_plugin_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash

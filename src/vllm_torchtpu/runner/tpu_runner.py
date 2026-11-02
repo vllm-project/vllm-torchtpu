@@ -790,6 +790,7 @@ class TPUModelRunner(GPUModelRunner):
         # override runs (and stays None if it is skipped, e.g. CPU-only tests
         # or a user-pinned num_gpu_blocks_override) — in which case mamba and
         # attention share the uniform `num_blocks` as before.
+        self.model_adapter = None
         self._mamba_num_blocks: int | None = None
         # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
         # allocated when a request first appears and retained until its KV
@@ -3939,6 +3940,10 @@ class TPUModelRunner(GPUModelRunner):
                 if has_encoder_inputs:
                     synchronize_tensors()
 
+        step_context = (
+            self.model_adapter.begin_step() if self.model_adapter is not None else None
+        )
+
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
         batch_composition_stats = None
@@ -4152,6 +4157,22 @@ class TPUModelRunner(GPUModelRunner):
                         src_key, "UNKNOWN" if src_key == "phase" else 0
                     )
 
+            model_kwargs = None
+            if self.model_adapter is not None:
+                from vllm_torchtpu.runner.model_adapters import ModelInputSnapshot
+
+                assert input_ids is not None
+                model_kwargs = self.model_adapter.prepare_inputs(
+                    ModelInputSnapshot(
+                        step_context,
+                        start_index,
+                        num_reqs,
+                        num_tokens_padded,
+                        attn_metadata,
+                        input_ids,
+                    )
+                )
+
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
             if "min_kv_len" in trace_kwargs:
                 trace_name += (
@@ -4186,6 +4207,7 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
+                    model_kwargs=model_kwargs,
                 )
 
             if nan_check is not None:
@@ -5492,9 +5514,13 @@ class TPUModelRunner(GPUModelRunner):
         return async_output
 
     def load_model(self) -> None:
+        from vllm_torchtpu.runner.model_adapters import select_model_adapter
+
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
+        self.model_adapter = select_model_adapter(self)
+        self.kv_cache_manager.model_adapter = self.model_adapter
 
         # Set TPU-specific quantization config before model loading.
         # This ensures that TPU-compatible quantization methods are used
@@ -5534,6 +5560,8 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
+        if self.model_adapter is not None:
+            self.model_adapter.bind_model(model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
@@ -5825,8 +5853,12 @@ class TPUModelRunner(GPUModelRunner):
         settles the hand-off afterwards.
         """
         # Same fence discipline as a serving chunk: release the previous
-        # chunk's host sources, then fence this one's before its forward.
+        # chunk's host sources before an adapter or generic dummy forward.
         self._wait_input_staging_fence()
+        if (adapter := getattr(self, "model_adapter", None)) is not None:
+            return adapter.dummy_run(
+                num_tokens, num_reqs, profile_prefix, dp_lockstep=dp_lockstep
+            )
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
@@ -8103,11 +8135,16 @@ class TPUModelRunner(GPUModelRunner):
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(
-        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        intermediate_tensors=None,
+        model_kwargs=None,
     ):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
-        kwargs = {}
+        kwargs = {} if model_kwargs is None else dict(model_kwargs)
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
         out = self.model(
