@@ -1417,12 +1417,13 @@ def _project_oneshot_kernel(x_ref, w_ref, o_ref, partial_ref, slots, weights, tm
     partials in FP32 in rank order."""
     rank = lax.axis_index("k3_sp")
     rows = o_ref.shape[0]
+    n = slots.shape[0]
     barrier = pltpu.get_barrier_semaphore()
-    for peer in range(32):
+    for peer in range(n):
         pl.semaphore_signal(barrier, 1, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL)
     pltpu.async_copy(w_ref, weights, weight_sem).wait()
-    pl.semaphore_wait(barrier, 32)
-    for owner in range(32):
+    pl.semaphore_wait(barrier, n)
+    for owner in range(n):
         bank = owner % 2
         if owner >= 2:
             pltpu.make_async_copy(tmp.at[bank], partial_ref.at[pl.ds((owner - 2) * rows, rows)],
@@ -1432,7 +1433,7 @@ def _project_oneshot_kernel(x_ref, w_ref, o_ref, partial_ref, slots, weights, tm
         ).astype(jnp.bfloat16)
         pltpu.make_async_copy(tmp.at[bank], partial_ref.at[pl.ds(owner * rows, rows)],
                               local_sem).start()
-    for owner in (30, 31):
+    for owner in (n - 2, n - 1):
         pltpu.make_async_copy(tmp.at[owner % 2], partial_ref.at[pl.ds(owner * rows, rows)],
                               local_sem).wait()
 
@@ -1441,14 +1442,14 @@ def _project_oneshot_kernel(x_ref, w_ref, o_ref, partial_ref, slots, weights, tm
             partial_ref.at[pl.ds(peer * rows, rows)], slots.at[rank], send_sem, recv_sem,
             device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL)
 
-    @pl.loop(1, 32)
+    @pl.loop(1, n)
     def send(d):
-        remote(lax.rem(rank + d, 32)).start()
+        remote(lax.rem(rank + d, n)).start()
 
     own = pltpu.make_async_copy(partial_ref.at[pl.ds(rank * rows, rows)], slots.at[rank], local_sem)
     own.start()
 
-    @pl.loop(1, 32)
+    @pl.loop(1, n)
     def wait(d):
         remote(rank).wait_send()
         remote(rank).wait_recv()
@@ -1458,13 +1459,13 @@ def _project_oneshot_kernel(x_ref, w_ref, o_ref, partial_ref, slots, weights, tm
     for col in range(0, o_ref.shape[1], width):
         cols = pl.ds(col, width)
         copies = [pltpu.make_async_copy(slots.at[r, :, cols], gather.at[r], local_sem)
-                  for r in range(32)]
+                  for r in range(n)]
         for copy in copies:
             copy.start()
         for copy in copies:
             copy.wait()
         total = gather[0].astype(jnp.float32)
-        for r in range(1, 32):
+        for r in range(1, n):
             total = total + gather[r].astype(jnp.float32)
         tmp.at[0, :, cols][...] = total.astype(jnp.bfloat16)
     out = pltpu.make_async_copy(tmp.at[0], o_ref, local_sem)
@@ -5717,6 +5718,7 @@ def _kda_oneshot_gather(normalized_ref, gathered_ref, send, recv, local, *, step
     step 0 copies this rank's rows to every peer's window rows, step
     HALF_STEPS - 1 waits for the 31 incoming copies."""
     rank = jax.lax.axis_index("k3_sp")
+    n = gathered_ref.shape[0] // stripe
     rows = pl.ds(rank * stripe, stripe)
 
     def remote(peer):
@@ -5728,14 +5730,14 @@ def _kda_oneshot_gather(normalized_ref, gathered_ref, send, recv, local, *, step
 
     @pl.when(step == 0)
     def start():
-        @pl.loop(1, 32)
+        @pl.loop(1, n)
         def send_all(d):
-            remote(jax.lax.rem(rank + d, 32)).start()
+            remote(jax.lax.rem(rank + d, n)).start()
         own.start()
 
     @pl.when(step == HALF_STEPS - 1)
     def finish():
-        @pl.loop(1, 32)
+        @pl.loop(1, n)
         def wait_all(d):
             remote(rank).wait_send()
             remote(rank).wait_recv()
@@ -5749,6 +5751,7 @@ def _kda_oneshot_reduce(tables_ref, length_ref, partial_ref, prefix_ref, output_
     [rank] on rank d; the last step sums the 32 BF16 slots in FP32 in rank
     order and adds the residual."""
     rank = jax.lax.axis_index("k3_sp")
+    n = slots.shape[0]
 
     def remote(peer):
         return pltpu.make_async_remote_copy(
@@ -5759,14 +5762,14 @@ def _kda_oneshot_reduce(tables_ref, length_ref, partial_ref, prefix_ref, output_
 
     @pl.when(step == 0)
     def start():
-        @pl.loop(1, 32)
+        @pl.loop(1, n)
         def send_all(d):
-            remote(jax.lax.rem(rank + d, 32)).start()
+            remote(jax.lax.rem(rank + d, n)).start()
         own.start()
 
     @pl.when(step == HALF_STEPS - 1)
     def finish():
-        @pl.loop(1, 32)
+        @pl.loop(1, n)
         def wait_all(d):
             remote(rank).wait_send()
             remote(rank).wait_recv()
@@ -5777,13 +5780,13 @@ def _kda_oneshot_reduce(tables_ref, length_ref, partial_ref, prefix_ref, output_
         for col in range(0, partial_ref.shape[1], width):
             cols = pl.ds(col, width)
             copies = [pltpu.make_async_copy(slots.at[r, :, cols], gather.at[r], local)
-                      for r in range(32)]
+                      for r in range(n)]
             for copy in copies:
                 copy.start()
             for copy in copies:
                 copy.wait()
             total = gather[0].astype(jnp.float32)
-            for r in range(1, 32):
+            for r in range(1, n):
                 total = total + gather[r].astype(jnp.float32)
             prefix_copy = pltpu.make_async_copy(prefix_ref.at[pl.ds(0, stripe), cols], staging, local)
             prefix_copy.start()
