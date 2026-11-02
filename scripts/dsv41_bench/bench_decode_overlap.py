@@ -75,10 +75,10 @@ def load_kernels(root: Path):
         ),
         namespace,
     )
-    attention = ast.parse((source / "attention_kernels.py").read_text())
+    indexer = ast.parse((source / "indexer_impl.py").read_text())
     definitions = [
         node
-        for node in attention.body
+        for node in indexer.body
         if (isinstance(node, ast.FunctionDef) and node.name == "paged_index_scores_jax")
         or (
             isinstance(node, ast.Assign)
@@ -91,7 +91,7 @@ def load_kernels(root: Path):
     exec(
         compile(
             ast.Module(body=definitions, type_ignores=[]),
-            str(source / "attention_kernels.py"),
+            str(source / "indexer_impl.py"),
             "exec",
         ),
         namespace,

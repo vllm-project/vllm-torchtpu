@@ -143,20 +143,24 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
     from torch_tpu._internal import pallas
     from vllm.distributed import get_tp_group
 
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
-        paged_indexer_jax,
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+        indexer_impl as indexer_ops,
     )
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import paged_indexer_jax
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
         get_vllm_model_wrapper_context,
     )
 
     if args.keys_per_iter is not None:
-        ak._INDEX_KEYS_PER_ITER = args.keys_per_iter
+        indexer_ops._INDEX_KEYS_PER_ITER = args.keys_per_iter
     if args.max_tile is not None:
-        ak._INDEX_MAX_TILE = args.max_tile
-    current = (ak._INDEX_KEYS_PER_ITER, ak._INDEX_MAX_TILE, ak._visible_top_k)
-    src_visible = ak._visible_top_k
+        indexer_ops._INDEX_MAX_TILE = args.max_tile
+    current = (
+        indexer_ops._INDEX_KEYS_PER_ITER,
+        indexer_ops._INDEX_MAX_TILE,
+        indexer_ops._visible_top_k,
+    )
+    src_visible = indexer_ops._visible_top_k
 
     def legacy_visible(scores, k, bound, lengths=None, unordered=False):
         # Baseline: fewer than 16 rows skipped SparseCore (bucketed XLA top_k).
@@ -167,7 +171,11 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
     def use(config: str) -> None:
         """Set module state read at trace time (ops trace on first call)."""
         state = current if config == "src" else (*LEGACY_TILE, legacy_visible)
-        ak._INDEX_KEYS_PER_ITER, ak._INDEX_MAX_TILE, ak._visible_top_k = state
+        (
+            indexer_ops._INDEX_KEYS_PER_ITER,
+            indexer_ops._INDEX_MAX_TILE,
+            indexer_ops._visible_top_k,
+        ) = state
 
     use("legacy" if args.legacy else "src")
     geo = common.Dsv41Geometry()
@@ -221,7 +229,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                 def body(_, carry):
                     q_i, acc = jax.lax.optimization_barrier((q, carry))
                     if args.stage == "scores":
-                        scores = ak.paged_index_scores_jax(
+                        scores = indexer_ops.paged_index_scores_jax(
                             q_i, p, r, w, lengths, req, page_records=args.page_records
                         )
                         hit = (scores.max(axis=1, keepdims=True) > 0).astype(acc.dtype)
@@ -231,7 +239,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         s_i = jax.lax.optimization_barrier(
                             q_i[:, :1, 0].astype(jax.numpy.float32) * 0 + base
                         )
-                        sel, pub = ak.select_indices_jax(
+                        sel, pub = indexer_ops.select_indices_jax(
                             s_i,
                             lengths,
                             cand,
@@ -263,7 +271,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
 
                 base = None
                 if args.stage == "select":
-                    base = ak.paged_index_scores_jax(q, p, r, w, lengths, req)
+                    base = indexer_ops.paged_index_scores_jax(q, p, r, w, lengths, req)
                     base = jax.numpy.where(
                         jax.numpy.take(r >= 0, req, axis=0), base, -jax.numpy.inf
                     )
@@ -323,8 +331,8 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
             ) -> jax.Array:
                 return jax.numpy.stack(
                     [
-                        ak.paged_index_scores_jax(q, p, r, w, lengths, req),
-                        ak.paged_index_scores_jax(
+                        indexer_ops.paged_index_scores_jax(q, p, r, w, lengths, req),
+                        indexer_ops.paged_index_scores_jax(
                             q, p, r, w, lengths, req, page_records=args.page_records
                         ),
                     ]

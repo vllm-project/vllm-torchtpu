@@ -167,6 +167,7 @@ def _rope_body(
     inverse: bool,
     out_dtype: jnp.dtype,
     quant_dtype: jnp.dtype | None,
+    power_of_two: bool = False,
 ) -> None:
     """Process one ``(tile_n, [num_heads,] LANE)`` chunk.
 
@@ -189,6 +190,15 @@ def _rope_body(
 
     q_ref, scale_ref = out_refs
     qmax = dtype_max(quant_dtype)
+    if power_of_two:
+        # Match a standalone RoPE output followed by the Indexer quantizer.
+        y = y.astype(out_dtype).astype(jnp.float32)
+        amax = jnp.maximum(jnp.max(jnp.abs(y), axis=-1, keepdims=True), 1e-4)
+        scale = jnp.exp2(jnp.ceil(jnp.log2(amax / qmax)))
+        q_ref[...] = (y / scale).astype(quant_dtype)
+        scale_ref[...] = scale.reshape(scale_ref.shape)
+        return
+
     # One scale per row, i.e. over the whole ``LANE``-wide channel axis.
     abs_max = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
     scale = abs_max / qmax
@@ -216,6 +226,7 @@ def _kernel(
     out_dtype: jnp.dtype,
     cos_sin_dtype: jnp.dtype,
     quant_dtype: jnp.dtype | None,
+    power_of_two: bool = False,
 ) -> None:
     def x_index_map(i):
         if len(x_block_shape) == 3:
@@ -273,6 +284,7 @@ def _kernel(
             inverse=inverse,
             out_dtype=out_dtype,
             quant_dtype=quant_dtype,
+            power_of_two=power_of_two,
         ),
         grid=(num_tiles,),
         in_specs=[x_spec, cos_sin_spec],
@@ -391,6 +403,7 @@ def _rope_call(
     *,
     inverse: bool,
     quant_dtype: jnp.dtype | None,
+    power_of_two: bool = False,
     name: str,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Builds the ``pallas_call``; see the public wrappers for the contract."""
@@ -431,6 +444,7 @@ def _rope_call(
         out_dtype=x.dtype,
         cos_sin_dtype=cos_sin_cache.dtype,
         quant_dtype=quant_dtype,
+        power_of_two=power_of_two,
     )
 
     if quant_dtype is None:
@@ -570,7 +584,9 @@ def qnorm_rope(
     )(positions, x, cos_sin_cache)
 
 
-@functools.partial(jax.jit, static_argnames=("inverse", "quant_dtype", "name"))
+@functools.partial(
+    jax.jit, static_argnames=("inverse", "quant_dtype", "power_of_two", "name")
+)
 def rope_quant(
     x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
     positions: jax.Array,  # [num_tokens] int
@@ -578,12 +594,14 @@ def rope_quant(
     *,
     inverse: bool = False,
     quant_dtype: jnp.dtype = jnp.float8_e4m3fn,
+    power_of_two: bool = False,
     name: str = "rope_quant",
 ) -> tuple[jax.Array, jax.Array]:
     """RoPE fused with per-row dynamic quantization of the rotated values.
 
     Same rotation as ``rope``, but the result is quantized to ``quant_dtype``
-    inside the kernel.
+    inside the kernel. ``power_of_two`` preserves input-dtype rounding after
+    rotation, then uses the V4.1 Indexer E4M3 power-of-two scale contract.
     """
     return _rope_call(
         x,
@@ -591,5 +609,6 @@ def rope_quant(
         cos_sin_cache,
         inverse=inverse,
         quant_dtype=quant_dtype,
+        power_of_two=power_of_two,
         name=name,
     )

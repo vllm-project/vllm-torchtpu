@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 import requests
+from bench_decode import expected_prefix_hit
 from prometheus_client.parser import text_string_to_metric_families
 from server_step_worker import SCENARIO, SCENARIOS, token_counts
 
@@ -548,10 +549,16 @@ def client_main(argv: list[str]) -> None:
         ):
             raise ValueError("Missing preemption metric or nonzero preemptions")
         hits = delta.get("vllm:prefix_cache_hits_total", -1)
-        # Hybrid compressed KV groups align cache hits to 256 logical tokens,
-        # despite --block-size 16. An exact-prefix prompt leaves its last hash
-        # unit uncached; an extension can reuse the complete prefix.
-        expected_hit = scenario.prefix_tokens - (0 if scenario.extend_tokens else 256)
+        # Read finalized cache geometry from every worker, not from observed
+        # hit metrics: changing --block-size changes the scheduler alignment.
+        alignments = {
+            rank["prefix_hit_alignment"] for rank in rank_results(setup["results"])
+        }
+        if len(alignments) != 1:
+            raise ValueError(f"DP ranks disagree on prefix-hit alignment: {alignments}")
+        expected_hit = expected_prefix_hit(
+            scenario.prefix_tokens, scenario.extend_tokens, alignments.pop()
+        )
         if hits != scenario.concurrency * expected_hit:
             raise ValueError(f"Prefix-hit invariant failed: {hits}")
         report = summarize_extend(rank_results(records["results"]))

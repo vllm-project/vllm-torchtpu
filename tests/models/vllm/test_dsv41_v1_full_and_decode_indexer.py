@@ -45,7 +45,9 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v1 import (
 from vllm_torchtpu.models.vllm.deepseek_v41.v1 import (
     replay_plan as v1_replay_plan,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+    indexer_impl as v2_indexer_ops,
+)
 
 # ==============================================================================
 # Helper Mock Objects
@@ -2068,7 +2070,7 @@ class TestDecodeIndexerCandidateContext:
         requests = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
 
         # 1. pages = True (page_records=16, tile multiple of 16)
-        scores_pages = attention_kernels.paged_index_scores_jax(
+        scores_pages = v2_indexer_ops.paged_index_scores_jax(
             q,
             pool,
             records,
@@ -2080,7 +2082,7 @@ class TestDecodeIndexerCandidateContext:
         assert scores_pages.shape == (tokens, width)
 
         # 2. pages = False (page_records=None)
-        scores_nopages = attention_kernels.paged_index_scores_jax(
+        scores_nopages = v2_indexer_ops.paged_index_scores_jax(
             q,
             pool,
             records,
@@ -2111,9 +2113,9 @@ class TestDecodeIndexerCandidateContext:
         def _mock_sc_topk(scores, k, lengths):
             return jnp.full((scores.shape[0], k), 0, dtype=jnp.int32)
 
-        monkeypatch.setattr(attention_kernels, "_sparsecore_top_k", _mock_sc_topk)
+        monkeypatch.setattr(v2_indexer_ops, "_sparsecore_top_k", _mock_sc_topk)
 
-        selected_uo, cand_uo = attention_kernels.paged_indexer_jax(
+        selected_uo, cand_uo = v2_indexer_ops.paged_indexer_jax(
             q,
             pool,
             records,
@@ -2131,7 +2133,7 @@ class TestDecodeIndexerCandidateContext:
         assert selected_uo.shape == (tokens, topk)
         assert cand_uo is candidates
 
-        selected_ord, cand_ord = attention_kernels.paged_indexer_jax(
+        selected_ord, cand_ord = v2_indexer_ops.paged_indexer_jax(
             q,
             pool,
             records,

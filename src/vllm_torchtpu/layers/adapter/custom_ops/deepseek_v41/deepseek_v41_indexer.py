@@ -9,6 +9,9 @@ from vllm.config import get_current_vllm_config
 from vllm.models.deepseek_v41 import attention as upstream
 
 from vllm_torchtpu.kernels.deepseek_v41.cache_write import write_index_cache
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+    quantize_index_rows,
+)
 from vllm_torchtpu.kernels.deepseek_v41.indexer import (
     QUERY_TILE,
     native_paged_scores,
@@ -99,21 +102,6 @@ def index_record_layout(raw, scales, layout):
     if shape[0] * page_size > torch.iinfo(torch.int32).max:
         raise ValueError("Index record addresses must fit int32")
     return RecordLayout(page_size, page_size, 0, INDEX_HEAD_DIM, dtype)
-
-
-def quantize_index_rows(values: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """One power-of-two scale for all 128 post-RoPE channels of each Q/K."""
-    if values.shape[-1] != INDEX_HEAD_DIM:
-        raise ValueError("V4.1 FP8 index vectors must have 128 channels")
-    values = values.astype(jnp.float32)
-    amax = jnp.maximum(jnp.abs(values).max(axis=-1), 1e-4)
-    exponent = jnp.ceil(jnp.log2(amax / 448.0)).astype(jnp.int32)
-    scale_bytes = (exponent + 127).astype(jnp.uint8)
-    scales = jax.lax.bitcast_convert_type(
-        scale_bytes.astype(jnp.uint32) << 23, jnp.float32
-    )
-    quantized = (values / scales[..., None]).astype(jnp.float8_e4m3fn)
-    return quantized, scales, scale_bytes
 
 
 def pack_index_keys(keys: jax.Array) -> tuple[jax.Array, jax.Array]:

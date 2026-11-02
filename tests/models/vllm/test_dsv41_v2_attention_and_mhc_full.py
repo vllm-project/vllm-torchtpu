@@ -937,7 +937,7 @@ class TestAttentionHelperFunctions:
         cfg_other = SimpleNamespace(
             attention_config=SimpleNamespace(resolve_indexer_kv_dtype=lambda x: "fp4")
         )
-        with pytest.raises(ValueError, match="TPU V4.1 indexer requires fp8"):
+        with pytest.raises(ValueError, match="TPU V4.1 indexer requires bf16 or fp8"):
             v2_attn.indexer_uses_fp4(cfg_other)
 
         # 2. AttentionBackend
@@ -968,11 +968,15 @@ class TestAttentionHelperFunctions:
         assert idx_cache.get_attn_backend() is v2_attn.AttentionBackend
         with (
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention.get_current_vllm_config",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache.get_current_vllm_config",
                 return_value=SimpleNamespace(
+                    cache_config=SimpleNamespace(),
+                    attention_config=SimpleNamespace(
+                        resolve_indexer_kv_dtype=lambda _: "bf16"
+                    ),
                     model_config=SimpleNamespace(
                         hf_config=SimpleNamespace(index_head_dim=128)
-                    )
+                    ),
                 ),
             ),
             patch(

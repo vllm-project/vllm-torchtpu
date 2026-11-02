@@ -29,10 +29,12 @@ import bench_indexer as bi  # noqa: E402
 import common  # noqa: E402
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (  # noqa: E402
-    _compact_selected,
     _pad_compacted_records,
-    _visible_top_k,
     compact_records,
+)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (  # noqa: E402  # noqa: E402
+    _compact_selected,
+    _visible_top_k,
     paged_indexer_jax,
     write_index_keys,
 )

@@ -101,9 +101,9 @@ def validate_environment(policy: DeepseekV41Config) -> None:
                 name,
             )
     if policy.moe == MoEBackend.FUSED_EP_W4A8:
-        if envs.MOE_FUSED_EP_KERNEL_IMPL not in (None, "v2"):
+        if envs.MOE_FUSED_EP_KERNEL_IMPL not in (None, "v2", "push"):
             raise ValueError(
-                "DSV41 fused_ep_w4a8 uses v2; remove MOE_FUSED_EP_KERNEL_IMPL"
+                "DSV41 fused_ep_w4a8 uses v2 or push; remove MOE_FUSED_EP_KERNEL_IMPL"
             )
         if envs.MOE_REQUANTIZE_BLOCK_SIZE not in (None, 0, 512):
             raise ValueError(
@@ -126,7 +126,11 @@ def validate_environment(policy: DeepseekV41Config) -> None:
         if (
             name.startswith("TPU_DEEPSEEK_V41_")
             and name not in aliases
-            and name != "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD"
+            and name
+            not in (
+                "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD",
+                "TPU_DEEPSEEK_V41_ENGRAM_HBM",
+            )
         ):
             logger.warning_once(
                 "[DSV41] %s no longer selects a serving route; "

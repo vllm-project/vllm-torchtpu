@@ -21,23 +21,26 @@ from jax.sharding import Mesh
 
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     _pad_compacted_records,
+    initialize_paged_attention,
+    paged_attention,
+    slice_token_parallel_attention_inputs,
+    sparse_fp8_attention,
+    sparse_fp8_attention_jax,
+)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
     _prefix_count,
     _sparsecore_top_k,
     _threshold_top_k,
     _visible_top_k,
     initialize_indexer,
-    initialize_paged_attention,
-    paged_attention,
     paged_index_scores_jax,
     paged_indexer,
     paged_indexer_jax,
+    select_indexer_jax,
     select_indices_jax,
-    slice_token_parallel_attention_inputs,
-    sparse_fp8_attention,
-    sparse_fp8_attention_jax,
-    update_and_select_jax,
     write_index_keys,
 )
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -451,7 +454,7 @@ class TestSelectIndicesJax:
         sc_lengths = jnp.array([1024, 2048, 4096, 8192], dtype=jnp.int32)
         sc_candidates = jnp.full((count, 16), -1, dtype=jnp.int32)
         with mock.patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels._sparsecore_top_k",
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl._sparsecore_top_k",
             side_effect=lambda s, k, n: jnp.broadcast_to(
                 jnp.arange(k, dtype=jnp.int32), (s.shape[0], k)
             ),
@@ -648,7 +651,7 @@ class TestThresholdAndVisibleTopK:
         scores_large = jnp.asarray(rng.standard_normal((16, 2048)), dtype=jnp.float32)
         lengths_large = jnp.full((16,), 2048, dtype=jnp.int32)
         with mock.patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels._sparsecore_top_k",
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl._sparsecore_top_k",
             return_value=jnp.zeros((16, 64), dtype=jnp.int32),
         ) as mock_sc:
             res_sc = _visible_top_k(
@@ -919,7 +922,7 @@ class TestPagedIndexerJax:
         records_large = jnp.zeros((16, 4096), dtype=jnp.int32)
         lengths_large = jnp.full((tokens,), 3000, dtype=jnp.int32)
         with mock.patch.object(
-            attention_kernels,
+            indexer_ops,
             "_sparsecore_top_k",
             return_value=jnp.zeros((tokens, topk), dtype=jnp.int32),
         ) as mock_sc_topk:
@@ -961,8 +964,8 @@ class TestPagedIndexerJax:
         assert np.all(np.asarray(sel_ord[1:]) == -1)
 
 
-class TestWriteIndexKeysAndUpdateSelect:
-    """Tests for write_index_keys and update_and_select_jax."""
+class TestWriteIndexKeysAndSelect:
+    """Tests for write_index_keys and select_indexer_jax."""
 
     def test_write_index_keys_validation(self):
         pool = jnp.zeros((64, 128), dtype=jnp.int32)
@@ -983,34 +986,32 @@ class TestWriteIndexKeysAndUpdateSelect:
         ):
             write_index_keys(pool, records, keys_bf16.reshape(2, 2, 128))
 
-    def test_write_index_keys_and_update_select_execution(self):
-        rng = np.random.default_rng(808)
-        width, topk, block_size = 128, 16, 16
-        pool, records, requests, lengths, q, weights = _request_inputs(rng, 2, 4, width)
-        candidates = jnp.zeros((4, 2), dtype=jnp.int32)
-        write_recs = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
-        keys = jnp.zeros((4, 128), dtype=jnp.bfloat16)
-
-        up_pool, sel, pub = update_and_select_jax(
-            q,
-            pool,
-            jnp.asarray(records),
-            weights,
-            jnp.asarray(lengths),
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("two_banks", [False, True])
+    def test_select_reads_previously_written_index_keys(self, two_banks):
+        pool = jnp.zeros((4, 128), jnp.int32)
+        banks = (pool[:2], pool[2:]) if two_banks else pool
+        # The larger key crosses the bank boundary; a masked write must not win.
+        keys = jnp.broadcast_to(jnp.array([2, 4, 8], jnp.bfloat16)[:, None], (3, 128))
+        updated = write_index_keys(banks, jnp.array([1, 6, -1]), keys)
+        candidates = jnp.empty((2, 0), jnp.int32)
+        sel, pub = select_indexer_jax(
+            jnp.ones((2, 1, 128), jnp.bfloat16),
+            updated,
+            jnp.arange(8, dtype=jnp.int32)[None, :],
+            jnp.ones((2, 1), jnp.float32),
+            jnp.array([8, 0], jnp.int32),
             candidates,
-            write_recs,
-            keys,
-            jnp.asarray(requests),
-            batch_max=jnp.array([width], dtype=jnp.int32),
-            topk=topk,
-            block_size=block_size,
+            jnp.zeros(2, jnp.int32),
+            batch_max=jnp.array([8], jnp.int32),
+            topk=2,
+            block_size=1,
             candidate_write=False,
             candidate_filter=False,
             unordered=False,
         )
-        assert up_pool.shape == pool.shape
-        assert sel.shape == (4, topk)
-        assert pub is candidates
+        np.testing.assert_array_equal(sel, [[1, 6], [-1, -1]])
+        np.testing.assert_array_equal(pub, candidates)
 
 
 class TestIndexerOpAndWrapper:
@@ -1019,13 +1020,13 @@ class TestIndexerOpAndWrapper:
     def test_initialize_indexer_and_fake(self):
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
         with set_vllm_model_wrapper_context(mesh=mesh):
-            attention_kernels._indexer_op = None
+            indexer_ops._indexer_op = None
             initialize_indexer()
-            assert attention_kernels._indexer_op is not None
+            assert indexer_ops._indexer_op is not None
             # Test early return branch
-            saved_op = attention_kernels._indexer_op
+            saved_op = indexer_ops._indexer_op
             initialize_indexer()
-            assert attention_kernels._indexer_op is saved_op
+            assert indexer_ops._indexer_op is saved_op
 
         # Verify fake registration by calling op with meta device tensors
         q = torch.empty((4, 4, 128), dtype=torch.bfloat16, device="meta")
@@ -1034,20 +1035,16 @@ class TestIndexerOpAndWrapper:
         weights = torch.empty((4, 4), dtype=torch.float32, device="meta")
         lengths = torch.empty((4,), dtype=torch.int32, device="meta")
         candidates = torch.empty((4, 2), dtype=torch.int32, device="meta")
-        write_recs = torch.empty((4,), dtype=torch.int32, device="meta")
-        keys = torch.empty((4, 128), dtype=torch.bfloat16, device="meta")
         requests = torch.empty((4,), dtype=torch.int32, device="meta")
         batch_max = torch.empty((1,), dtype=torch.int32, device="meta")
 
-        f_pool, f_sel, f_pub = attention_kernels._indexer_op(
+        f_sel, f_pub = indexer_ops._indexer_op(
             q,
             pool,
             records,
             weights,
             lengths,
             candidates,
-            write_recs,
-            keys,
             requests,
             batch_max,
             16,
@@ -1057,7 +1054,6 @@ class TestIndexerOpAndWrapper:
             False,
             0,
         )
-        assert f_pool.shape == pool.shape
         assert f_sel.shape == (4, 16)
         assert f_pub.shape == candidates.shape
 
@@ -1072,15 +1068,13 @@ class TestIndexerOpAndWrapper:
         weights = torch.zeros((4, 4), dtype=torch.float32)
         lengths = torch.tensor([50, 60, 70, 80], dtype=torch.int32)
         candidates = torch.zeros((4, 2), dtype=torch.int32)
-        write_recs = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
-        keys = torch.zeros((4, 128), dtype=torch.bfloat16)
         requests = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
 
         # 1) batch_max is None (default)
         with mock.patch.object(
-            attention_kernels,
+            indexer_ops,
             "_indexer_op",
-            return_value=(mock_cache.raw, records, candidates),
+            return_value=(records, candidates),
         ) as mock_op:
             res = paged_indexer(
                 q,
@@ -1089,24 +1083,22 @@ class TestIndexerOpAndWrapper:
                 weights,
                 lengths,
                 candidates,
-                write_recs,
-                keys,
                 requests,
                 topk=16,
                 block_size=16,
                 candidate_write=False,
                 candidate_filter=False,
             )
-            assert len(res) == 3
+            assert len(res) == 2
             mock_op.assert_called_once()
             # Verify batch_max argument defaulted to lengths.max() = 80
-            assert mock_op.call_args[0][9].item() == 80
+            assert mock_op.call_args[0][7].item() == 80
 
         # 2) explicit batch_max
         with mock.patch.object(
-            attention_kernels,
+            indexer_ops,
             "_indexer_op",
-            return_value=(mock_cache.raw, records, candidates),
+            return_value=(records, candidates),
         ) as mock_op:
             res2 = paged_indexer(
                 q,
@@ -1115,8 +1107,6 @@ class TestIndexerOpAndWrapper:
                 weights,
                 lengths,
                 candidates,
-                write_recs,
-                keys,
                 requests,
                 topk=16,
                 block_size=16,
@@ -1124,5 +1114,5 @@ class TestIndexerOpAndWrapper:
                 candidate_filter=False,
                 batch_max=torch.tensor([120], dtype=torch.int32),
             )
-            assert len(res2) == 3
-            assert mock_op.call_args[0][9].item() == 120
+            assert len(res2) == 2
+            assert mock_op.call_args[0][7].item() == 120

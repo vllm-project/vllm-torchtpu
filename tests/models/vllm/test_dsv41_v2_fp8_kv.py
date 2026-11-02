@@ -140,9 +140,9 @@ def test_compact_records_moves_invalid_to_tail():
 
 def test_pad_compacted_records_matches_compact_records():
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
-        _compact_selected,
         _pad_compacted_records,
     )
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import _compact_selected
 
     for width in (5, 128, 300, 512):
         rng = np.random.default_rng(width)

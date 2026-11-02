@@ -5,21 +5,19 @@ from dataclasses import dataclass, replace
 import torch
 from vllm.distributed import get_dp_group
 
-from ..config import DeepseekV41Config, ExecutionMode
-
 
 def prefix_replay_enabled(vllm_config) -> bool:
-    """Whether CED runs with prefix caching through SWA bounded replay.
+    """Whether prefix caching runs through SWA bounded replay.
 
     Upstream's contract: the SWA group leaves prefix caching, and the
-    scheduler resumes each hit one window early so replay rebuilds it. CED
-    requires unsharded token rows, so prefill context parallelism stays out.
+    scheduler resumes each hit one window early so replay rebuilds it. This
+    holds for CED and full execution alike. Replay requires unsharded token
+    rows, so prefill context parallelism stays out.
     """
     cache_config = getattr(vllm_config, "cache_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)
     return bool(
-        (DeepseekV41Config.from_vllm_config(vllm_config).execution == ExecutionMode.CED)
-        and getattr(cache_config, "enable_prefix_caching", False)
+        getattr(cache_config, "enable_prefix_caching", False)
         and getattr(cache_config, "swa_bounded_replay", False)
         and getattr(parallel_config, "prefill_context_parallel_size", 1) == 1
     )

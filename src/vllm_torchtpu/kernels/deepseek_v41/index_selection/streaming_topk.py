@@ -22,6 +22,11 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
+    STREAMING_TOPK_CONFIG,
+    StreamingTopKConfig,
+)
+
 # Byte-wise radix passes over IEEE FP32 keys. These describe the representation,
 # independently of TensorCore/SparseCore lane counts.
 RADIX_BITS = jnp.iinfo(jnp.uint8).bits
@@ -29,6 +34,9 @@ RADIX_BUCKETS = 1 << RADIX_BITS
 RADIX_MASK = RADIX_BUCKETS - 1
 FP32_BITS = jnp.finfo(jnp.float32).bits
 FP32_SIGN_BIT = 1 << (FP32_BITS - 1)
+FP32_EXPONENT_MASK = ((1 << jnp.finfo(jnp.float32).nexp) - 1) << jnp.finfo(
+    jnp.float32
+).nmant
 UINT32_MAX = jnp.iinfo(jnp.uint32).max
 FP32_NEG_INF_BITS = 0xFF800000
 ORDERED_NEG_INF = UINT32_MAX ^ FP32_NEG_INF_BITS
@@ -51,6 +59,70 @@ def _ordered_bits(keys: jax.Array) -> jax.Array:
     return bits ^ (sign | jnp.uint32(FP32_SIGN_BIT))
 
 
+class _BufferSizes(NamedTuple):
+    output_width: int
+    bootstrap_width: int
+    chunk_size: int
+    capacity: int
+    id_capacity: int
+    resident_bytes: int
+    order_width: int
+
+
+def _buffer_sizes(k, width, block_size, threshold, mapping_width, info, sc):
+    config = STREAMING_TOPK_CONFIG.get(
+        (info.generation, width, k), StreamingTopKConfig()
+    )
+    blocks = pl.cdiv(width, block_size)
+    order_width = pl.cdiv(blocks, info.num_lanes) * info.num_lanes if blocks > 2 else 0
+    output_width = pl.cdiv(k, info.num_lanes) * info.num_lanes
+    bootstrap_width = min(block_size, config.bootstrap_multiplier * k)
+    chunk_size = math.gcd(block_size, bootstrap_width)
+    capacity = max(k + threshold + chunk_size, bootstrap_width, output_width)
+    id_capacity = max(capacity, output_width + mapping_width)
+    word_bytes = jnp.dtype(jnp.int32).itemsize
+    resident_bytes = word_bytes * (
+        capacity + id_capacity + 2 * k + RADIX_BUCKETS + sc.num_lanes + order_width
+    )
+    return _BufferSizes(
+        output_width,
+        bootstrap_width,
+        chunk_size,
+        capacity,
+        id_capacity,
+        resident_bytes,
+        order_width,
+    )
+
+
+def is_supported(
+    width: int,
+    k: int,
+    *,
+    block_size: int = 8192,
+    reconstruct_threshold: int = 8192,
+    logical_block_count: int = 0,
+) -> bool:
+    """Check lane alignment and the minimum per-subcore scratch footprint."""
+    if jax.default_backend() != "tpu" or not 0 < k <= width:
+        return False
+    info = pltpu.get_tpu_info()
+    sc = info.sparse_core
+    if sc is None or any(
+        value <= 0 or value % sc.num_lanes
+        for value in (k, block_size, reconstruct_threshold)
+    ):
+        return False
+    mapping_width = pl.cdiv(logical_block_count, info.num_lanes) * info.num_lanes
+    sizes = _buffer_sizes(
+        k, width, block_size, reconstruct_threshold, mapping_width, info, sc
+    )
+    return (
+        sizes.resident_bytes + jnp.dtype(jnp.float32).itemsize * block_size
+        <= sc.vmem_capacity_bytes
+    )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -58,6 +130,7 @@ def _ordered_bits(keys: jax.Array) -> jax.Array:
         "block_size",
         "reconstruct_threshold",
         "exclude_neg_inf",
+        "unordered",
         "scheduling_group_id",
     ),
 )
@@ -69,24 +142,32 @@ def streaming_topk(
     block_size: int = 8192,
     reconstruct_threshold: int = 8192,
     exclude_neg_inf: bool = False,
+    unordered: bool = False,
     logical_blocks: jax.Array | None = None,
     start_request: jax.Array | None = None,
     scheduling_group_id: int | None = None,
 ) -> jax.Array:
-    """Return Top-K IDs for 2-D score rows, ascending then -1 padded.
+    """Return exact Top-K token IDs for each score row.
 
-    Scores follow exact FP32 radix order (+0 above -0); equal bit patterns
-    prefer smaller logical indices regardless of block visitation order.
-    The reproducible block shuffle is input-independent, not a fresh random
-    permutation per invocation. NaNs are unsupported. Negative infinity is
-    eligible unless exclude_neg_inf is set. Lengths are clipped to [0, N].
-    Scores have shape [rows, N] in request-major order.
+    Args:
+        scores: Float32 [rows, N], request-major; NaNs are unsupported.
+        valid_lengths: Optional int32 [rows], clipped to [0, N]; None uses N.
+            With logical_blocks, use [requests, queries], whose product is rows.
+        k: Number of selected tokens per row.
+        block_size: Scores per streaming scan block, not candidate block size.
+        reconstruct_threshold: Candidate count beyond k that triggers compaction.
+        exclude_neg_inf: Exclude negative infinity from selection.
+        unordered: Allow arbitrary output order and equal-score winners.
+            Otherwise, IDs are ascending and ties prefer smaller logical IDs.
+        logical_blocks: Optional int32 [all_requests, blocks] mapping compact
+            blocks to logical blocks; blocks must divide N. IDs must increase
+            unless unordered=True; padded blocks must have ineligible scores.
+        start_request: Optional scalar request offset in logical_blocks; default 0.
+        scheduling_group_id: Optional XLA scheduling-group ID.
 
-    Optional int32 logical_blocks [all_requests, blocks] maps compact slots
-    to token IDs. It requires request/query valid_lengths and a block count dividing N.
-    Valid blocks must be increasing, padded blocks must have ineligible scores,
-    and mapped IDs must fit int32. start_request addresses a valid request
-    window in that metadata (default zero). Only final winners are mapped.
+    Returns:
+        Int32 [rows, k] token IDs, padded with -1. IDs are score-column indices
+        unless logical_blocks supplies a logical token mapping.
     """
     if scores.ndim != 2 or scores.dtype != jnp.float32:
         raise ValueError("scores must be a rank-2 float32 array")
@@ -137,6 +218,10 @@ def streaming_topk(
         )
         width += padding
     info = plsc.get_sparse_core_info()
+    config = STREAMING_TOPK_CONFIG.get(
+        (pltpu.get_tpu_info().generation, valid_width, k), StreamingTopKConfig()
+    )
+    loop_unroll = config.loop_unroll
     lanes = info.num_lanes
     if any(n % lanes for n in (k, block_size, reconstruct_threshold)):
         raise ValueError("k, block_size and reconstruct_threshold must be lane-aligned")
@@ -145,29 +230,40 @@ def streaming_topk(
         if valid_lengths is None
         else jnp.clip(valid_lengths.reshape(-1), 0, valid_width)
     )
-    lengths = jnp.broadcast_to(lengths[:, None], (batch_size, lanes))
+    lengths = jnp.pad(lengths, (0, -batch_size % hbm_alignment))
     num_blocks = pl.cdiv(width, block_size)
-    order_width = pl.cdiv(num_blocks, hbm_alignment) * hbm_alignment
-    order = list(range(1, num_blocks))
-    random.Random(0).shuffle(order)
-    order.insert(0, 0)
-    order.extend([0] * (order_width - num_blocks))
-    block_order = jnp.asarray(order, jnp.int32)
-    output_width = pl.cdiv(k, hbm_alignment) * hbm_alignment
-    # Retaining a quarter of the bootstrap establishes an exact cutoff without
-    # radix-selecting a full large DMA block. This is a tuned scan policy, not
-    # a sampled estimate: bootstrap winners remain resident throughout the pass.
-    bootstrap_width = min(block_size, 4 * k)
-    chunk_size = math.gcd(block_size, bootstrap_width)
-    capacity = max(
-        k + reconstruct_threshold + chunk_size, bootstrap_width, output_width
+    # One or two blocks have fixed order; no visit table or DMA is needed.
+    order_width = (
+        pl.cdiv(num_blocks, hbm_alignment) * hbm_alignment if num_blocks > 2 else 0
     )
+    block_order = ()
+    if order_width:
+        order = list(range(1, num_blocks))
+        random.Random(0).shuffle(order)
+        order.insert(0, 0)
+        order.extend([0] * (order_width - num_blocks))
+        block_order = (jnp.asarray(order, jnp.int32),)
+    sizes = _buffer_sizes(
+        k,
+        valid_width,
+        block_size,
+        reconstruct_threshold,
+        mapping_width,
+        pltpu.get_tpu_info(),
+        info,
+    )
+    (
+        output_width,
+        bootstrap_width,
+        chunk_size,
+        capacity,
+        id_capacity,
+        resident_bytes,
+        _,
+    ) = sizes
     histogram_size = RADIX_BUCKETS
     id_digits = max(1, pl.cdiv((valid_width - 1).bit_length(), RADIX_BITS))
-    id_capacity = max(capacity, output_width + mapping_width)
     score_bytes, id_bytes = scores.dtype.itemsize, jnp.dtype(jnp.int32).itemsize
-    resident_bytes = score_bytes * (capacity + k) + id_bytes * (id_capacity + k)
-    resident_bytes += id_bytes * (histogram_size + lanes + order_width)
     candidate_bytes = score_bytes * capacity + id_bytes * id_capacity
     # A second candidate bank removes compaction's read/write alias. Keep the
     # ordered in-place path when the caller's capacity exhausts VMEM.
@@ -203,15 +299,22 @@ def streaming_topk(
             pltpu.VMEM((k,), jnp.int32),
             pltpu.VMEM((histogram_size,), jnp.int32),
             pltpu.VMEM((lanes,), jnp.int32),
-            pltpu.VMEM((order_width,), jnp.int32),
+            (pltpu.VMEM((order_width,), jnp.int32),) if order_width else (),
             pltpu.SemaphoreType.DMA((buffers,)),
             pltpu.SemaphoreType.DMA,
         ),
         compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
         name="streaming_topk",
     )
-    def kernel(scores_ref, lengths_ref, order_ref, *refs):
-        out_indices_ref, *scratch = refs[2:] if mapped else refs
+    def kernel(
+        scores_ref,
+        lengths_ref,
+        order_refs,
+        mapping_refs,
+        start_refs,
+        out_indices_ref,
+        *scratch,
+    ):
         (
             blocks,
             candidate_banks,
@@ -220,36 +323,40 @@ def streaming_topk(
             selected_ids,
             histogram,
             row_length,
-            visit_order,
+            order_scratch,
             block_sems,
             sem,
         ) = scratch
         candidates = candidate_banks.at[pl.ds(0, capacity)]
         candidate_ids = id_banks.at[pl.ds(0, id_capacity)]
         lane_ids = jnp.arange(lanes, dtype=jnp.int32)
-        pltpu.async_copy(order_ref, visit_order, sem).wait()
+        if order_width:
+            visit_order = order_scratch[0]
+            pltpu.async_copy(order_refs[0], visit_order, sem).wait()
+        request_start = 0
         if mapped:
-            logical_blocks_ref, start_ref = refs[:2]
-            pltpu.async_copy(start_ref, row_length, sem).wait()
-            request_start = row_length[...][0]
+            logical_blocks_ref = mapping_refs[0]
+            if start_request is not None:
+                pltpu.async_copy(start_refs[0], row_length, sem).wait()
+                request_start = row_length[...][0]
 
         def store_candidates(count, keys, ids, mask):
             plsc.store_compressed(candidates.at[pl.ds(count, lanes)], keys, mask=mask)
             plsc.store_compressed(candidate_ids.at[pl.ds(count, lanes)], ids, mask=mask)
 
         def clear_histogram():
-            @plsc.parallel_loop(0, histogram_size, lanes)
+            @plsc.parallel_loop(0, histogram_size, lanes, unroll=loop_unroll)
             def clear(i):
                 histogram[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
 
-        def sort_selected():
+        def sort_selected_radix():
             # Reuse selection scratch. Stable byte passes keep padding behind
             # valid IDs even when their low bytes coincide with the sentinel.
 
             def sort_digit(digit):
                 clear_histogram()
 
-                @plsc.parallel_loop(0, k, lanes)
+                @plsc.parallel_loop(0, k, lanes, unroll=loop_unroll)
                 def count_keys(i):
                     bits = candidate_ids[pl.ds(i, lanes)].astype(jnp.uint32)
                     digits = (
@@ -259,7 +366,11 @@ def streaming_topk(
                     plsc.addupdate_scatter(histogram, [digits], counts, mask=last)
 
                 @plsc.parallel_loop(
-                    0, histogram_size, lanes, carry=jnp.asarray(0, jnp.int32)
+                    0,
+                    histogram_size,
+                    lanes,
+                    carry=jnp.asarray(0, jnp.int32),
+                    unroll=loop_unroll,
                 )
                 def prefix(i, total):
                     counts = histogram[pl.ds(i, lanes)]
@@ -282,17 +393,54 @@ def streaming_topk(
 
                 jax.lax.fori_loop(0, k // lanes, scatter, ())
 
-                @plsc.parallel_loop(0, k, lanes)
+                @plsc.parallel_loop(0, k, lanes, unroll=loop_unroll)
                 def copy_sorted(i):
                     candidate_ids[pl.ds(i, lanes)] = selected_ids[pl.ds(i, lanes)]
 
             for digit in range(id_digits):
                 sort_digit(digit)
 
-        def compact(num_candidates):
-            """Radix-select the lexicographic (score, -logical ID) winners."""
+        def sort_selected():
+            if not config.bitonic_ids:
+                sort_selected_radix()
+                return
+            vectors = k // lanes
+            # Unsigned -1 sorts behind valid IDs. Alternate vector directions
+            # to form bitonic runs, then merge across vectors before sorting
+            # each vector with the native SparseCore instruction.
+            for stage in range(vectors.bit_length()):
+                span = 1 << stage
+                for bit in reversed(range(stage)):
+                    distance = 1 << bit
+                    for group in range(vectors):
+                        partner = group ^ distance
+                        if partner <= group:
+                            continue
+                        left = candidate_ids[pl.ds(group * lanes, lanes)].view(
+                            jnp.uint32
+                        )
+                        right = candidate_ids[pl.ds(partner * lanes, lanes)].view(
+                            jnp.uint32
+                        )
+                        low, high = jnp.minimum(left, right), jnp.maximum(left, right)
+                        descending = bool(group & span)
+                        candidate_ids[pl.ds(group * lanes, lanes)] = (
+                            high if descending else low
+                        ).view(jnp.int32)
+                        candidate_ids[pl.ds(partner * lanes, lanes)] = (
+                            low if descending else high
+                        ).view(jnp.int32)
+                for group in range(vectors):
+                    ids = candidate_ids[pl.ds(group * lanes, lanes)].view(jnp.uint32)
+                    ordered, _ = plsc.sort_key_val(
+                        ids, ids, descending=bool(group & span)
+                    )
+                    candidate_ids[pl.ds(group * lanes, lanes)] = ordered.view(jnp.int32)
 
-            @plsc.parallel_loop(0, k, lanes)
+        def compact(num_candidates):
+            """Select by exact score bits, optionally breaking ties by index."""
+
+            @plsc.parallel_loop(0, k, lanes, unroll=loop_unroll)
             def clear_selected(i):
                 selected[pl.ds(i, lanes)] = jnp.full(lanes, -jnp.inf, jnp.float32)
                 selected_ids[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
@@ -322,7 +470,7 @@ def streaming_topk(
                         RADIX_MASK
                     )
 
-                @plsc.parallel_loop(0, limit, lanes)
+                @plsc.parallel_loop(0, limit, lanes, unroll=loop_unroll)
                 def fill_histogram(i):
                     bits = (
                         ~source_ids[pl.ds(i, lanes)].astype(jnp.uint32)
@@ -337,7 +485,9 @@ def streaming_topk(
                 below = remaining - (k - found)
                 init = (jnp.zeros(lanes, jnp.int32), jnp.zeros(lanes, jnp.int32))
 
-                @plsc.parallel_loop(0, histogram_size, lanes, carry=init)
+                @plsc.parallel_loop(
+                    0, histogram_size, lanes, carry=init, unroll=loop_unroll
+                )
                 def find_pivot(i, carry):
                     pivot, prefix = carry
                     cumulative = jnp.cumsum(histogram[pl.ds(i, lanes)])
@@ -375,7 +525,7 @@ def streaming_topk(
                 initial = (jnp.asarray(0, jnp.int32), found)
                 if candidate_buffers == 2:
                     survivors, outputs = plsc.parallel_loop(
-                        0, limit, lanes, carry=initial
+                        0, limit, lanes, carry=initial, unroll=loop_unroll
                     )(filter_candidates)
                 else:
                     survivors, outputs = jax.lax.fori_loop(
@@ -397,14 +547,17 @@ def streaming_topk(
                 ),
             )
             score_ties = remaining > k - found
-            _, remaining, found, bank = jax.lax.while_loop(
-                cond,
-                functools.partial(radix_pass, by_id=True),
-                (jnp.int32(id_digits - 1), remaining, found, bank),
-            )
+            if not unordered:
+                _, remaining, found, bank = jax.lax.while_loop(
+                    cond,
+                    functools.partial(radix_pass, by_id=True),
+                    (jnp.int32(id_digits - 1), remaining, found, bank),
+                )
             needed = jnp.minimum(remaining, k - found)
 
-            @plsc.parallel_loop(0, pl.cdiv(needed, lanes) * lanes, lanes)
+            @plsc.parallel_loop(
+                0, pl.cdiv(needed, lanes) * lanes, lanes, unroll=loop_unroll
+            )
             def postfill(i):
                 mask = i + lane_ids < needed
                 plsc.store_compressed(
@@ -424,7 +577,7 @@ def streaming_topk(
                 jnp.zeros(lanes, jnp.int32),
             )
 
-            @plsc.parallel_loop(0, k, lanes, carry=initial)
+            @plsc.parallel_loop(0, k, lanes, carry=initial, unroll=loop_unroll)
             def retain_topk(i, carry):
                 minimum, last_id, multiplicity = carry
                 keys = selected[pl.ds(i, lanes)]
@@ -432,24 +585,28 @@ def streaming_topk(
                 candidates[pl.ds(i, lanes)] = keys
                 candidate_ids[pl.ds(i, lanes)] = ids
                 bits = jnp.where(ids >= 0, _ordered_bits(keys), jnp.uint32(UINT32_MAX))
-                last_id = jnp.where(
-                    bits < minimum,
-                    ids,
-                    jnp.where(bits == minimum, jnp.maximum(last_id, ids), last_id),
-                )
-                multiplicity = jnp.where(
-                    bits < minimum,
-                    1,
-                    multiplicity + (bits == minimum).astype(jnp.int32),
-                )
+                if not unordered:
+                    last_id = jnp.where(
+                        bits < minimum,
+                        ids,
+                        jnp.where(bits == minimum, jnp.maximum(last_id, ids), last_id),
+                    )
+                    multiplicity = jnp.where(
+                        bits < minimum,
+                        1,
+                        multiplicity + (bits == minimum).astype(jnp.int32),
+                    )
                 return (jnp.minimum(minimum, bits), last_id, multiplicity)
 
             minimum, last_id, multiplicity = retain_topk
             threshold = jnp.min(minimum)
-            threshold_id = jnp.max(jnp.where(minimum == threshold, last_id, -1))
-            boundary_ties = score_ties | (
-                jnp.sum(jnp.where(minimum == threshold, multiplicity, 0)) > 1
-            )
+            threshold_id = jnp.int32(-1)
+            boundary_ties = score_ties
+            if not unordered:
+                threshold_id = jnp.max(jnp.where(minimum == threshold, last_id, -1))
+                boundary_ties |= (
+                    jnp.sum(jnp.where(minimum == threshold, multiplicity, 0)) > 1
+                )
             return _Selection(
                 jnp.minimum(num_candidates, k),
                 threshold,
@@ -463,6 +620,9 @@ def streaming_topk(
             return plsc.load_gather(visit_order, [indices])[0]
 
         def next_valid(position, length):
+            if not order_width:
+                return position, jnp.minimum(position, num_blocks - 1)
+
             def cond(state):
                 step, block_id = state
                 return (step < num_blocks) & (block_id * block_size >= length)
@@ -510,8 +670,10 @@ def streaming_topk(
 
         @pl.loop(first_row, batch_size, step=row_stride)
         def process_row(row):
-            pltpu.async_copy(lengths_ref.at[row], row_length, sem).wait()
-            length = jnp.min(row_length[:])
+            pltpu.async_copy(
+                lengths_ref.at[pl.ds(row // lanes * lanes, lanes)], row_length, sem
+            ).wait()
+            length = plsc.load_gather(row_length, [jnp.full((lanes,), row % lanes)])[0]
             row_blocks = pl.cdiv(length, block_size)
 
             def prime():
@@ -523,7 +685,7 @@ def streaming_topk(
                 row_blocks > 0, prime, lambda: (jnp.int32(0), jnp.int32(0))
             )
 
-            @plsc.parallel_loop(0, output_width, lanes)
+            @plsc.parallel_loop(0, output_width, lanes, unroll=loop_unroll)
             def clear_outputs(i):
                 candidates[pl.ds(i, lanes)] = jnp.full(lanes, -jnp.inf, jnp.float32)
                 candidate_ids[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
@@ -578,7 +740,9 @@ def streaming_topk(
                     # and use inclusive comparisons so the screen cannot lose
                     # a winner. The final radix selection remains exact.
                     def append_packed(inclusive, full_block, count: jax.Array):
-                        @plsc.parallel_loop(0, paired_size, 2 * lanes, carry=count)
+                        @plsc.parallel_loop(
+                            0, paired_size, 2 * lanes, carry=count, unroll=loop_unroll
+                        )
                         def append_pairs(i, count):
                             keys0 = blocks[slot, pl.ds(chunk * chunk_size + i, lanes)]
                             keys1 = blocks[
@@ -641,18 +805,32 @@ def streaming_topk(
                             lambda: append_packed(inclusive, False, count),
                         )
 
-                    def append_exact():
+                    def append_exact(use_float):
                         def append(full_block):
-                            @plsc.parallel_loop(0, chunk_size, lanes, carry=count)
+                            @plsc.parallel_loop(
+                                0, chunk_size, lanes, carry=count, unroll=loop_unroll
+                            )
                             def append_candidates(i, count):
                                 keys = blocks[
                                     slot, pl.ds(chunk * chunk_size + i, lanes)
                                 ]
                                 ids = offset + i + lane_ids
-                                bits = _ordered_bits(keys)
-                                accept = (bits > threshold) | (bits == threshold) & (
-                                    ids < threshold_id
-                                )
+                                if use_float:
+                                    cutoff = jnp.full(
+                                        lanes, cutoff_raw, jnp.uint32
+                                    ).view(jnp.float32)
+                                    accept = keys > cutoff
+                                    if not unordered:
+                                        accept |= (keys == cutoff) & (
+                                            ids < threshold_id
+                                        )
+                                else:
+                                    bits = _ordered_bits(keys)
+                                    accept = bits > threshold
+                                    if not unordered:
+                                        accept |= (bits == threshold) & (
+                                            ids < threshold_id
+                                        )
                                 if not full_block:
                                     accept = accept & (ids < length)
                                 store_candidates(count, keys, ids, accept)
@@ -670,7 +848,13 @@ def streaming_topk(
 
                     count = jax.lax.cond(
                         boundary_ties,
-                        append_exact,
+                        # Zero and subnormal thresholds need bit ordering;
+                        # ordinary FP32 comparisons may flush tiny values.
+                        lambda: jax.lax.cond(
+                            (cutoff_raw & jnp.uint32(FP32_EXPONENT_MASK)) == 0,
+                            lambda: append_exact(False),
+                            lambda: append_exact(True),
+                        ),
                         lambda: jax.lax.cond(
                             have_threshold,
                             lambda: packed_mode(True),
@@ -716,7 +900,11 @@ def streaming_topk(
                 transfer(row, block_id, jnp.int32(0), wait=True)
 
                 @plsc.parallel_loop(
-                    0, bootstrap_width, lanes, carry=jnp.asarray(0, jnp.int32)
+                    0,
+                    bootstrap_width,
+                    lanes,
+                    carry=jnp.asarray(0, jnp.int32),
+                    unroll=loop_unroll,
                 )
                 def bootstrap(i, count):
                     keys = blocks[0, pl.ds(i, lanes)]
@@ -748,40 +936,38 @@ def streaming_topk(
             if bootstrap_width < valid_width:
                 jax.lax.fori_loop(0, row_blocks, scan_block, (seed, position, block_id))
             if mapped:
-                # Selection is finished: reuse the ID tail for metadata.
-                # Sorting touches only the first k entries and overlaps this DMA.
-                mapping_copy = pltpu.make_async_copy(
-                    logical_blocks_ref.at[request_start + row // queries],
-                    candidate_ids.at[pl.ds(output_width, mapping_width)],
-                    sem,
+                mapping = candidate_ids.at[pl.ds(output_width, mapping_width)]
+                copy = pltpu.make_async_copy(
+                    logical_blocks_ref.at[request_start + row // queries], mapping, sem
                 )
-                mapping_copy.start()
-                sort_selected()
-                mapping_copy.wait()
+                copy.start()
+                if not unordered:
+                    sort_selected()
+                copy.wait()
 
-                @plsc.parallel_loop(0, k, lanes)
-                def map_selected(i):
+                @plsc.parallel_loop(0, k, lanes, unroll=loop_unroll)
+                def map_winners(i):
                     slots = candidate_ids[pl.ds(i, lanes)]
                     blocks = plsc.load_gather(
-                        candidate_ids,
-                        [output_width + jnp.maximum(slots, 0) // records_per_block],
+                        mapping,
+                        [jnp.clip(slots, 0, valid_width - 1) // records_per_block],
                     )
                     logical = blocks * records_per_block + slots % records_per_block
                     candidate_ids[pl.ds(i, lanes)] = jnp.where(slots >= 0, logical, -1)
-            else:
+            elif not unordered:
                 sort_selected()
             pltpu.async_copy(
                 candidate_ids.at[:output_width], out_indices_ref.at[row], sem
             ).wait()
 
-    if logical_blocks is not None:
-        start = jnp.broadcast_to(
-            jnp.asarray(0 if start_request is None else start_request, jnp.int32),
-            (lanes,),
-        )
-        result = kernel(scores, lengths, block_order, logical_blocks, start)
-    else:
-        result = kernel(scores, lengths, block_order)
+    start = (
+        (jnp.broadcast_to(jnp.asarray(start_request, jnp.int32), (lanes,)),)
+        if mapped and start_request is not None
+        else ()
+    )
+    result = kernel(
+        scores, lengths, block_order, (logical_blocks,) if mapped else (), start
+    )
     if output_width != k:
         result = result[:, :k]
     if scheduling_group_id is not None:

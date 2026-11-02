@@ -11,9 +11,10 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, ROW_WORDS, SLOTS
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     candidate,
+    streaming_topk,
     tuned_block_sizes,
 )
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.gather import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.gather_index_keys import (
     gather_packed_candidate_keys,
     is_supported_by_gather_packed_candidate_keys,
 )
@@ -145,8 +146,9 @@ def select_candidate_cache_jax(
     block_size: int,
     page_records: int,
     request_tile: int | None,
+    topk: int = 512,
 ) -> jax.Array:
-    from .attention_kernels import paged_indexer_jax
+    from .indexer_impl import paged_indexer_jax
 
     groups = records.shape[0]
     queries = candidate.request_query_count(q.shape[0], groups)
@@ -162,6 +164,7 @@ def select_candidate_cache_jax(
             lengths.reshape(groups, queries),
             block_size=block_size,
             request_tile=request_tile,
+            k=topk,
         )
 
     def fallback():
@@ -173,7 +176,7 @@ def select_candidate_cache_jax(
             lengths,
             candidate_block_ids,
             requests,
-            512,
+            topk,
             block_size,
             False,
             True,
@@ -182,12 +185,14 @@ def select_candidate_cache_jax(
             page_records,
         )[0]
 
-    if queries is None:
+    if queries is None or not streaming_topk.is_supported(
+        union_block_ids.shape[1] * block_size, topk
+    ):
         return fallback()
 
     # Preserve the old batch-wide short-context bypass. The fallback retains
     # ragged/mixed request ownership and all candidates on union overflow.
-    use_cache = usable[0] & (batch_max.max() > 512)
+    use_cache = usable[0] & (batch_max.max() > topk)
     return jax.lax.cond(use_cache, cached, fallback)
 
 
@@ -208,6 +213,7 @@ def select_candidate_cache_2bank_jax(
     block_size: int,
     page_records: int,
     request_tile: int | None,
+    topk: int = 512,
 ) -> jax.Array:
     return select_candidate_cache_jax(
         q,
@@ -225,6 +231,7 @@ def select_candidate_cache_2bank_jax(
         block_size,
         page_records,
         request_tile,
+        topk,
     )
 
 
@@ -302,7 +309,7 @@ def initialize_candidate_cache() -> None:
         select_candidate_cache_jax,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 12 + (None,) * 3)
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 12 + (None,) * 4)
         ),
     )
     _select_2bank_op = pallas.jax_op(
@@ -310,7 +317,7 @@ def initialize_candidate_cache() -> None:
         select_candidate_cache_2bank_jax,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 13 + (None,) * 3)
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 13 + (None,) * 4)
         ),
     )
 
@@ -330,8 +337,9 @@ def initialize_candidate_cache() -> None:
         block_size: int,
         page_records: int,
         request_tile: int | None,
+        topk: int = 512,
     ) -> torch.Tensor:
-        return records.new_empty((q.shape[0], 512))
+        return records.new_empty((q.shape[0], min(topk, records.shape[1])))
 
     def fake_select_2bank(
         q: torch.Tensor,
@@ -350,6 +358,7 @@ def initialize_candidate_cache() -> None:
         block_size: int,
         page_records: int,
         request_tile: int | None,
+        topk: int = 512,
     ) -> torch.Tensor:
         return fake_select(
             q,
@@ -367,6 +376,7 @@ def initialize_candidate_cache() -> None:
             block_size,
             page_records,
             request_tile,
+            topk,
         )
 
     _select_op.register_fake(fake_select)
@@ -416,6 +426,7 @@ def select_candidate_cache(
     block_size: int,
     page_records: int,
     request_tile: int | None,
+    topk: int = 512,
 ) -> torch.Tensor:
     assert _select_op is not None and _select_2bank_op is not None
     args = (
@@ -432,6 +443,7 @@ def select_candidate_cache(
         block_size,
         page_records,
         request_tile,
+        topk,
     )
     return (
         _select_2bank_op(q, cache.raw, cache.raw_hi, *args)

@@ -107,7 +107,7 @@ def test_replayed_marks_only_the_hit_window():
     "ced,caching,bounded,pcp,expected",
     [
         (True, True, True, 1, True),
-        (False, True, True, 1, False),
+        (False, True, True, 1, True),
         (True, False, True, 1, False),
         (True, True, False, 1, False),
         (True, True, True, 2, False),

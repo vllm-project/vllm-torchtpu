@@ -41,7 +41,7 @@ from .attention import (
     _cache_slots,
     stage_attention_cache_scope,
 )
-from .attention_kernels import initialize_indexer, initialize_paged_attention
+from .attention_kernels import initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import (
     coordinate_decoder_replay,
@@ -55,6 +55,7 @@ from .host_engram import (
     gather_host_engram_hashes,
     install_host_engram_inputs,
 )
+from .indexer_impl import initialize_indexer
 from .ops import bind_device_ops, compact_rope_caches, device_hooks
 
 logger = init_logger(__name__)
@@ -92,6 +93,24 @@ def _ced_config(
     assert hf_config is not None
     ced_boundary = hf_config.num_hidden_layers // 2
     return ced_enabled, ced_boundary
+
+
+def _with_window_starts(context, first, positions):
+    """Publish each request's SWA bounded replay start to the attention layers."""
+    requests = first.seq_lens.shape[0] if first is not None else 1
+    hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
+    window_starts = torch.tensor(
+        hits + (0,) * (requests - len(hits)),
+        dtype=positions.dtype,
+        device=positions.device,
+    )
+    return replace(
+        context,
+        additional_kwargs={
+            **context.additional_kwargs,
+            "deepseek_v41_window_starts": window_starts,
+        },
+    )
 
 
 def _scatter_decoder_rows(
@@ -319,22 +338,56 @@ class DeepseekV41DecoderStage(_StageBase):
         )
 
 
+class _StepHashes:
+    """A step's Engram hashes: device hashes for HBM layers, the host path's
+    downloaded and gathered ones for the rest. With `eager` (no HBM layer) the
+    host gather runs at construction, before the decoder layers, as it always
+    did; otherwise on the first host layer's use."""
+
+    def __init__(self, hashes: torch.Tensor, gather_host, *, eager: bool) -> None:
+        self.hashes = hashes
+        self._gather_host = gather_host
+        self._host: torch.Tensor | None = gather_host(hashes) if eager else None
+
+    def for_layer(self, engram) -> torch.Tensor:
+        if isinstance(engram, Engram) and engram.uses_hbm_lookup:
+            return self.hashes
+        if self._host is None:
+            self._host = self._gather_host(self.hashes)
+        return self._host
+
+
 class DeepseekV41Model(upstream.DeepseekV4Model):
     # Encoder layer whose host Engram staging overlaps the encoder head on
     # device; derived from host placement. None runs one encoder graph.
     _engram_split_layer: int | None = None
     _engram_first_split_layer: int | None = None
-    _gathered_engram_hashes: torch.Tensor | None = None
+    _gathered_engram_hashes: _StepHashes | None = None
     _raw_dma_enabled = False
     _engram_prefetch: _EngramPrefetch | None = None
     _current_host_inputs: HostEngramInputs | None = None
     _prefetched_uploads: dict[int, "PreparedEngramUpload"] | None = None
+    _hbm_engram_cached: bool | None = None
 
     @cached_property
     def _hash_download(self) -> "EngramHashDownload":
         from ..common.host_transfer import EngramHashDownload
 
         return EngramHashDownload()
+
+    def _hbm_engrams(self) -> list:
+        """Engram layers served from HBM (``TPU_DEEPSEEK_V41_ENGRAM_HBM``)."""
+        return [
+            layer.engram
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if isinstance(getattr(layer, "engram", None), Engram)
+            and layer.engram.uses_hbm_lookup
+        ]
+
+    def _uses_hbm_engram(self) -> bool:
+        if self._hbm_engram_cached is None:
+            self._hbm_engram_cached = bool(self._hbm_engrams())
+        return self._hbm_engram_cached
 
     def _has_cpu_offloaded_engram(self) -> bool:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -466,14 +519,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if engram_hashes is not None and not skip_lookup:
                 # Gather all Engram rows before entering the decoder layers.
                 # One gather feeds every layer sharing the DP-split table.
-                if self._has_cpu_offloaded_engram():
-                    # Idle/decode replicas may hash on device while a prefill
-                    # replica hashes on host. All must use the CPU collective.
-                    engram_hashes = self._hash_download.copy_to_host(engram_hashes)
-                gathered_hashes = gather_host_engram_hashes(
+                # HBM layers take the device hashes (their lookup gathers the
+                # node's hashes itself). Host layers download and gather them
+                # once: up front when no layer is on HBM, else when the first
+                # host layer is staged, after the layers before it are enqueued.
+                # Idle/decode replicas may hash on device while a prefill
+                # replica hashes on host, so all use the CPU collective.
+                gathered_hashes = _StepHashes(
                     engram_hashes,
-                    dp_shared_memory=self.engram_dp_shared_memory,
-                    gather_fn=upstream.gather_engram_hashes,
+                    self._gather_host_hashes,
+                    eager=not self._uses_hbm_engram(),
                 )
                 end_layer = (
                     getattr(self, "_ced_boundary", self.end_layer)
@@ -490,17 +545,28 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 self._stage_engram_layers(self.start_layer, end_layer, gathered_hashes)
         return engram_hashes, engram_mask
 
+    def _gather_host_hashes(self, engram_hashes: torch.Tensor) -> torch.Tensor:
+        """The host Engram path's hashes: downloaded and node-gathered."""
+        if self._has_cpu_offloaded_engram():
+            engram_hashes = self._hash_download.copy_to_host(engram_hashes)
+        return gather_host_engram_hashes(
+            engram_hashes,
+            dp_shared_memory=self.engram_dp_shared_memory,
+            gather_fn=upstream.gather_engram_hashes,
+        )
+
     def _stage_engram_layers(
         self,
         start_layer: int,
         end_layer: int,
-        gathered_hashes: torch.Tensor | None,
+        step_hashes: _StepHashes | None,
     ) -> None:
         """Prepare each Engram in the segment before its graph is dispatched."""
-        if gathered_hashes is not None:
+        if step_hashes is not None:
             for layer in islice(self.layers, start_layer, end_layer):
                 engram = getattr(layer, "engram", None)
                 if engram is not None:
+                    gathered_hashes = step_hashes.for_layer(engram)
                     if (
                         isinstance(engram, Engram)
                         and engram.embed_tokens.host_offload
@@ -630,27 +696,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # Enqueue the lookup without blocking CPU Engram preparation behind
             # the previous chunk. The compiled stage consumes its device buffer.
             synchronize_tensors((inputs_embeds,), wait=False)
-        if self._ced_enabled:
+        if self._ced_enabled or getattr(self, "_prefix_replay", False):
             context = upstream.get_forward_context()
             metadata = context.attn_metadata
             first = (
                 next(iter(metadata.values())) if isinstance(metadata, dict) else None
             )
             # Upload window bounds before Engram's blocking hash D2H.
-            requests = first.seq_lens.shape[0] if first is not None else 1
-            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
-            window_starts = torch.tensor(
-                hits + (0,) * (requests - len(hits)),
-                dtype=positions.dtype,
-                device=positions.device,
-            )
-            encoder_context = replace(
-                context,
-                additional_kwargs={
-                    **context.additional_kwargs,
-                    "deepseek_v41_window_starts": window_starts,
-                },
-            )
+            encoder_context = _with_window_starts(context, first, positions)
         offload_engram = self._has_cpu_offloaded_engram()
         if offload_engram:
             input_ids_prep = (
@@ -668,7 +721,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             )
             self._engram_prepared_outside_stage = True
         try:
-            if not self._ced_enabled:
+            if not self._ced_enabled and not getattr(self, "_prefix_replay", False):
                 return self.full_stage(
                     input_ids,
                     positions,
@@ -676,7 +729,18 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     inputs_embeds,
                     lookback_token_ids,
                 )
-            # CED locals are initialized above; the non-CED path returns early.
+            if not self._ced_enabled:
+                # Full forward uses the same bounded-replay window upload.
+                # pyrefly: ignore[unbound-name]
+                with override_forward_context(encoder_context):
+                    return self.full_stage(
+                        input_ids,
+                        positions,
+                        intermediate_tensors,
+                        inputs_embeds,
+                        lookback_token_ids,
+                    )
+            # CED/replay locals are initialized before Engram preparation.
             # pyrefly: ignore[unbound-name]
             with override_forward_context(encoder_context):
                 if getattr(self, "_engram_split_layer", None) is None:
@@ -1184,6 +1248,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         self._ced_enabled, self._ced_boundary = _ced_config(
             vllm_config, warn_prefix_caching=True, fallback_config=self.config
         )
+        self._prefix_replay = prefix_replay_enabled(vllm_config)
         self._ced_window = self.layers[self._ced_boundary].attn.window_size
         self._ced_compile_sizes = tuple(
             n
@@ -1301,6 +1366,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
 class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
     model_cls = DeepseekV41Model
+
+    def load_weights(self, weights):
+        loaded = super().load_weights(weights)
+        # TPU_DEEPSEEK_V41_ENGRAM_HBM: place the host Engram head shards in HBM
+        # before the KV cache is sized from what remains.
+        for engram in self.model._hbm_engrams():
+            engram.upload_hbm_table()
+        return loaded
 
     def forward(self, *args, **kwargs):
         # Materialize upstream's persistent history outside the compiled model.

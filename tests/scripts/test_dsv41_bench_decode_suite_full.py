@@ -58,7 +58,7 @@ sys.modules["bench_indexer"] = bi
 sys.modules.setdefault("bench_sparse_mla_swa", bs)
 sys.modules["bench_sparse_mla_swa"] = bs
 
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (  # noqa: E402
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (  # noqa: E402
     paged_indexer_jax,
     write_index_keys,
 )
@@ -1071,10 +1071,10 @@ class TestBenchIndexerFull:
             patch.object(common, "verify_outputs", return_value={"ok": True}),
             patch("torch_tpu._internal.pallas.jax_op", side_effect=dummy_jax_op),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.initialize_indexer"
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl.initialize_indexer"
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.paged_indexer",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl.paged_indexer",
                 return_value=(
                     torch.zeros((128, 128)),
                     torch.zeros((1024, 512)),

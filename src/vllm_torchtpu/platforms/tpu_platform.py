@@ -360,6 +360,14 @@ def _register_tpu_kv_connectors() -> None:
 
 
 class TpuPlatform(Platform):
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config) -> None:
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+            register_swa_specs,
+        )
+
+        register_swa_specs()
+
     # Registered via the `vllm.platform_plugins` entry point in pyproject.toml.
     _enum = PlatformEnum.OOT
     device_name: str = "tpu"
@@ -410,6 +418,8 @@ class TpuPlatform(Platform):
         "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "MOE_FUSED_EP_PUSH_SC_PREPUSH",
+        "MOE_FUSED_EP_PUSH_TC_EXCHANGE",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

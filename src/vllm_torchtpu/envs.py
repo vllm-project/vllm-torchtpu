@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -85,6 +86,8 @@ if TYPE_CHECKING:
     TPU_MOE_EPLB_WINDOW_STEPS: int = 16
     TPU_MOE_EPLB_MIN_GAIN: float = 0.005
     TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 256
+    MOE_FUSED_EP_PUSH_SC_PREPUSH: int = 2
+    MOE_FUSED_EP_PUSH_TC_EXCHANGE: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -375,6 +378,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in (default False) to trade a small host-staging overhead for HBM.
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
+    ),
+    # With Engram CPU offload and head-sharded host tables (dp_shared_memory
+    # off, or its /dev/shm fallback), serve Engram layers from an HBM copy of
+    # each rank's host head shard, looked up on device across the node-local
+    # DP group (common/engram_hbm.py), instead of the per-step host gather and
+    # gloo exchange. DP-shared host tables need no exchange and keep the host
+    # path. "first": only the first Engram layer (layer 1, which only layer 0
+    # can hide; later layers keep the host path, overlapped with the layers
+    # before them); "all": every Engram layer; "off": keep all layers on the
+    # host path; "auto" (default): "first" when the EP group has >= 16 ranks,
+    # else "off". Each HBM layer costs ~11.8 GiB per rank at 8 ranks per node.
+    "TPU_DEEPSEEK_V41_ENGRAM_HBM": env_with_choices(
+        "TPU_DEEPSEEK_V41_ENGRAM_HBM",
+        "auto",
+        ["auto", "off", "first", "all"],
+        case_sensitive=False,
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
@@ -681,8 +700,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
+    # "push" is v2 with the activation all-gather replaced by point-to-point
+    # push dispatch (kernels/experimental/push_fused_moe), same admission.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive", "push"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -710,6 +731,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
     ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: how many destination expert-visit
+    # positions the SparseCore pushes before the TensorCore MoE kernel starts
+    # (clamped to [1, experts per shard]); the kernel pushes the rest.
+    "MOE_FUSED_EP_PUSH_SC_PREPUSH": env_int("MOE_FUSED_EP_PUSH_SC_PREPUSH", 2),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: run the routing-metadata exchange as a
+    # TensorCore remote-DMA kernel instead of XLA's (SparseCore-offloaded)
+    # all-gather, keeping it off the SparseCore queue.
+    "MOE_FUSED_EP_PUSH_TC_EXCHANGE": env_bool("MOE_FUSED_EP_PUSH_TC_EXCHANGE"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
