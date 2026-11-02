@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.v1.metrics.utils import create_metric_per_engine
 
 import vllm_torchtpu.distributed.utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer import kv_cache_memory_stats
 from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
     normalize_raiden_metric_name,
     parse_raiden_metric_key,
@@ -96,6 +97,14 @@ class TpuKVConnectorStats(KVConnectorStats):
         """Record a failed KV transfer operation."""
         self.data["num_failed_transfers"].append(1)
 
+    def record_evicted_blocks(self, num_evicted_blocks: int):
+        """Record cached HBM blocks evicted to make room for new blocks."""
+        self.data["num_evicted_blocks"].append(num_evicted_blocks)
+
+    def record_load_failed_tokens(self, num_tokens: int):
+        """Record claimed external tokens whose KV load failed."""
+        self.data["num_load_failed_tokens"].append(num_tokens)
+
     def record_prefill_queue_length(self, prefill_queue_length: int):
         """Record the prefill (send) queue length."""
         self.data["prefill_queue_length"].append(prefill_queue_length)
@@ -120,6 +129,9 @@ class TpuKVConnectorStats(KVConnectorStats):
             "kv_pull_time": [],
             "mb_transferred": [],
             "num_failed_transfers": [],
+            "num_evicted_blocks": [],
+            "num_load_failed_tokens": [],
+            **{key: [] for key in kv_cache_memory_stats.STATS_KEYS},
             "prefill_queue_length": [],
             "decode_queue_length": [],
             "runner_cpu_issue_seconds": [],
@@ -304,6 +316,29 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             counter_tpu_num_failed_transfers, self.per_engine_labelvalues
         )
 
+        # Not TPU-specific: named as in the HBM KV cache observability design.
+        counter_kv_cache_evictions = self._counter_cls(
+            name="vllm:kv_cache_evictions",
+            documentation="Cached KV blocks evicted to make room for new blocks.",
+            labelnames=labelnames,
+        )
+        self.counter_kv_cache_evictions = create_metric_per_engine(
+            counter_kv_cache_evictions, self.per_engine_labelvalues
+        )
+
+        counter_kv_load_failed_tokens = self._counter_cls(
+            name="vllm:kv_load_failed_tokens",
+            documentation=(
+                "Externally computed tokens a KV connector claimed but failed "
+                "to load; vLLM recomputes or fails them per "
+                "kv_load_failure_policy."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_kv_load_failed_tokens = create_metric_per_engine(
+            counter_kv_load_failed_tokens, self.per_engine_labelvalues
+        )
+
         gauge_tpu_prefill_queue_length = self._gauge_cls(
             name="vllm:tpu_prefill_kv_queue_length",
             documentation="Current length of the TPU KV transfer prefill queue.",
@@ -320,6 +355,10 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         )
         self.gauge_tpu_decode_queue_length = create_metric_per_engine(
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues
+        )
+
+        self.kv_cache_memory = kv_cache_memory_stats.KVCacheMemoryProm(
+            self._gauge_cls, self._counter_cls, labelnames, self.per_engine_labelvalues
         )
 
         self.dynamic_metrics: dict[str, tuple[str, Any, list[str]]] = (
@@ -423,8 +462,10 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         for counter_obj, counter_item_key in zip(
             [
                 self.counter_tpu_num_failed_transfers,
+                self.counter_kv_cache_evictions,
+                self.counter_kv_load_failed_tokens,
             ],
-            ["num_failed_transfers"],
+            ["num_failed_transfers", "num_evicted_blocks", "num_load_failed_tokens"],
         ):
             for list_item in transfer_stats_data.get(counter_item_key, []):
                 cast(Counter, counter_obj[engine_idx]).inc(list_item)
@@ -441,6 +482,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         ):
             for list_item in transfer_stats_data.get(gauge_item_key, []):
                 cast(Gauge, gauge_obj[engine_idx]).set(list_item)
+
+        self.kv_cache_memory.observe(transfer_stats_data, engine_idx)
 
         # Dynamic metric observations
         base_labels = (

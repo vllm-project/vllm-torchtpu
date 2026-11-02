@@ -2048,6 +2048,38 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     )
 
 
+def _patch_vllm_scheduler_binds_kv_connector() -> None:
+    """Hand the vLLM scheduler to KV connectors that collect its metrics.
+
+    `TPUConnector.bind_scheduler` reads the scheduler's request tables and
+    queues for the HBM KV cache memory metrics (block states, admission
+    refusals and reserves, token slots). vLLM binds only the KV cache manager
+    to a connector, so the scheduler is bound once it is constructed; children
+    of a `MultiConnector` are bound too. Connectors without `bind_scheduler`
+    are untouched.
+    """
+    import functools
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    original_init = Scheduler.__init__
+    if getattr(original_init, "_tpu_binds_kv_connector", False):
+        return
+
+    @functools.wraps(original_init)
+    def __init__(self, *args, **kwargs) -> None:
+        original_init(self, *args, **kwargs)
+        connector = getattr(self, "connector", None)
+        for child in getattr(connector, "_connectors", (connector,)):
+            bind_scheduler = getattr(child, "bind_scheduler", None)
+            if bind_scheduler is not None:
+                bind_scheduler(self)
+
+    __init__.__dict__["_tpu_binds_kv_connector"] = True
+    Scheduler.__init__ = __init__
+    logger.info("Applied TPU patch: bind the scheduler to KV connectors.")
+
+
 def _patch_vllm_vocab_parallel_embedding() -> None:
     """Register shard index bounds as module buffers in VocabParallelEmbedding.
 

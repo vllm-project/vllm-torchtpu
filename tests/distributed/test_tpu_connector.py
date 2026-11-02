@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu import envs as tpu_envs
@@ -5999,6 +6000,8 @@ class TestTPUConnectorStats(unittest.TestCase):
             "kv_pull_time": [1200.0, 5400.0, 12000.0],
             "mb_transferred": [128.0, 256.0, 2048.0],
             "num_failed_transfers": [0, 1, 2],
+            "num_evicted_blocks": [2, 5],
+            "num_load_failed_tokens": [32, 16],
         }
 
         self.metrics.observe(mock_data, engine_idx=0)
@@ -6144,6 +6147,14 @@ class TestTPUConnectorStats(unittest.TestCase):
     def test_prometheus_counter_num_failed_transfers(self):
         counter = self.metrics.counter_tpu_num_failed_transfers[0]
         assert counter._value.get() == 3.0
+
+    def test_prometheus_counter_kv_cache_evictions(self):
+        counter = self.metrics.counter_kv_cache_evictions[0]
+        assert counter._value.get() == 7.0
+
+    def test_prometheus_counter_kv_load_failed_tokens(self):
+        counter = self.metrics.counter_kv_load_failed_tokens[0]
+        assert counter._value.get() == 48.0
 
     def test_tpu_stats_aggregation_queue_lengths(self):
         stats = TpuKVConnectorStats()
@@ -8229,3 +8240,103 @@ class TestSpecSourceFenceRegisterAhead:
         assert fences == [(2, True)]
         worker.process_send_load(self._meta(c=False))
         assert fences == [(2, True), (2, True)]
+
+
+# ---------------------------------------------------------------------------
+# vllm:kv_load_failed_tokens
+# ---------------------------------------------------------------------------
+
+
+@patch(f"{_MOD}.TPUConnectorScheduler")
+class TestLoadFailedTokens:
+    """Claimed external tokens are counted when their load fails."""
+
+    BLOCK_SIZE = 16  # _make_test_kv_cache_config()
+
+    def _connector(self) -> TPUConnector:
+        return TPUConnector(
+            _make_vllm_config(is_producer=False),
+            KVConnectorRole.SCHEDULER,
+            _make_test_kv_cache_config(),
+        )
+
+    def _admit(self, connector, req_id, num_external_tokens, block_ids):
+        request = SimpleNamespace(request_id=req_id)
+        blocks = SimpleNamespace(get_block_ids=lambda: (list(block_ids),))
+        connector.update_state_after_alloc(request, blocks, num_external_tokens)
+        return request
+
+    @staticmethod
+    def _drain(connector) -> list[int] | None:
+        stats = connector.get_kv_connector_stats()
+        return None if stats is None else stats.data["num_load_failed_tokens"]
+
+    def test_invalid_blocks_fail_their_claimed_tokens(self, _):
+        connector = self._connector()
+        self._admit(connector, "r", 48, [5, 6, 7])
+
+        connector.update_connector_output(
+            KVConnectorOutput(invalid_block_ids={6, 7}, finished_recving={"r"})
+        )
+
+        assert self._drain(connector) == [2 * self.BLOCK_SIZE]
+        assert self._drain(connector) is None
+
+    def test_count_is_capped_at_the_claim(self, _):
+        connector = self._connector()
+        # The last block is partial: 20 tokens claimed over 2 blocks.
+        self._admit(connector, "r", 20, [5, 6])
+
+        connector.update_connector_output(KVConnectorOutput(invalid_block_ids={5, 6}))
+
+        assert self._drain(connector) == [20]
+
+    def test_failed_recving_fails_the_whole_claim(self, _):
+        connector = self._connector()
+        self._admit(connector, "r", 48, [5, 6, 7])
+
+        connector.update_connector_output(KVConnectorOutput(failed_recving={"r"}))
+
+        assert self._drain(connector) == [48]
+
+    def test_successful_load_drops_the_claim(self, _):
+        connector = self._connector()
+        self._admit(connector, "r", 48, [5, 6, 7])
+        connector.update_connector_output(KVConnectorOutput(finished_recving={"r"}))
+
+        # The blocks are later reused by another request's failed load.
+        connector.update_connector_output(KVConnectorOutput(invalid_block_ids={5}))
+
+        assert self._drain(connector) is None
+
+    def test_request_failed_before_the_output_is_counted(self, _):
+        # Under kv_load_failure_policy=fail the scheduler finishes the request
+        # before it hands the connector the step's output.
+        connector = self._connector()
+        request = self._admit(connector, "r", 48, [5, 6, 7])
+        connector.request_finished(request, [5, 6, 7])
+
+        connector.update_connector_output(KVConnectorOutput(invalid_block_ids={5}))
+        assert self._drain(connector) == [self.BLOCK_SIZE]
+
+        # The finished request's claim is gone afterwards.
+        connector.update_connector_output(KVConnectorOutput(invalid_block_ids={6}))
+        assert self._drain(connector) is None
+
+    def test_finished_request_claim_is_dropped(self, _):
+        connector = self._connector()
+        request = self._admit(connector, "r", 48, [5, 6, 7])
+        connector.request_finished(request, [5, 6, 7])
+        connector.update_connector_output(KVConnectorOutput())
+
+        connector.update_connector_output(KVConnectorOutput(invalid_block_ids={5}))
+
+        assert self._drain(connector) is None
+
+    def test_no_claim_without_external_tokens(self, _):
+        connector = self._connector()
+        self._admit(connector, "r", 0, [5, 6, 7])
+
+        connector.update_connector_output(KVConnectorOutput(invalid_block_ids={5}))
+
+        assert self._drain(connector) is None
