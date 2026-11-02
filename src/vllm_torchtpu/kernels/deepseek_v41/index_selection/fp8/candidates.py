@@ -118,10 +118,15 @@ def prepare_candidate_metadata(
     paired = valid & ((end - first) % 2 == 0)
     starts = ~paired | ((rows - first) % 2 == 0)
     groups = jnp.cumsum(starts.astype(jnp.int32)) - 1
-    # One fused comparison; the default scan search lowers to a serial loop.
-    offsets = jnp.searchsorted(
-        groups, jnp.arange(tokens + 1), side="left", method="compare_all"
-    )
+    if tokens <= 4096:
+        # Decode sizes: (tokens + 1) x tokens compares fuse into one cheap op.
+        offsets = jnp.searchsorted(
+            groups, jnp.arange(tokens + 1), side="left", method="compare_all"
+        )
+    else:
+        # Group g begins at the g-th start row; trailing groups are empty at
+        # tokens. Linear in tokens, where compare_all grows quadratically.
+        (offsets,) = jnp.nonzero(starts, size=tokens + 1, fill_value=tokens)
     sizes = jnp.diff(offsets)
 
     direct = False
