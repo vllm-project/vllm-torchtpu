@@ -121,3 +121,53 @@ def test_megakernel_portability_ast_guard():
                         f"{rel}:{node.lineno} imports private JAX API '{mod}', "
                         f"which is restricted to allowlist {sorted(jax_src_allowlist)}."
                     )
+
+
+def _assert_package_is_framework_free(pkg: str) -> None:
+    """`megakernel/<pkg>/` imports only stdlib, jax, numpy and core spec modules."""
+    pkg_root = Path(megakernel.__file__).resolve().parent / pkg
+    py_files = sorted(pkg_root.rglob("*.py"))
+    rel_paths = {p.relative_to(pkg_root).as_posix() for p in py_files}
+    required_modules = _derive_required_modules(pkg_root, py_files, rel_paths)
+    assert len(required_modules) > 1
+    assert required_modules <= rel_paths, required_modules - rel_paths
+    allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
+    allowed_core = {"ops", "errors", "spec", "module", "decls", "exec_spec"}
+    for path in py_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".")[0]
+                    assert root in allowed_external_roots, (
+                        f"{pkg}/{path.name}:{node.lineno} imports '{alias.name}'"
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if node.level == 0:
+                    assert mod.split(".")[0] in allowed_external_roots, (
+                        f"{pkg}/{path.name}:{node.lineno} imports '{mod}'"
+                    )
+                elif node.level == 2:
+                    names = [mod] if mod else [a.name for a in node.names]
+                    for name in names:
+                        assert name.split(".")[0] in allowed_core, (
+                            f"{pkg}/{path.name}:{node.lineno} imports '..{name}'; "
+                            f"{pkg}/ may only use {sorted(allowed_core)} from core "
+                            "(never models/, modules/, kernel or cache)"
+                        )
+                else:
+                    assert node.level == 1, (
+                        f"{pkg}/{path.name}:{node.lineno} relative import level "
+                        f"{node.level} leaves the megakernel package"
+                    )
+
+
+def test_comm_package_is_framework_free():
+    """`megakernel/comm/` imports only stdlib, jax, numpy and core spec modules.
+
+    Collectives stay model-free and below the kernel builder: no `models/`,
+    `modules/`, `vmem`, `kernel` or cache imports, so any model or runtime can
+    reuse them.
+    """
+    _assert_package_is_framework_free("comm")

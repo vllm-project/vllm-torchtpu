@@ -14,6 +14,7 @@
 """Core declarations, execution config, VMEM pool aliasing, and numeric primitives."""
 
 from . import (
+    comm,
     decls,
     errors,
     exec_spec,
@@ -25,6 +26,7 @@ from . import (
     profiles,
     spec,
 )
+from .comm import AllReduceRing
 from .errors import MegakernelConfigError, MegakernelLayoutError
 from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
 from .ops import rup
@@ -53,6 +55,7 @@ from .spec import (
 
 __all__ = [
     "REQUIRED",
+    "AllReduceRing",
     "DebugOptions",
     "ExecSpec",
     "ExtraInput",
@@ -76,6 +79,7 @@ __all__ = [
     "Tiles",
     "VLLMAlias",
     "WeightDecl",
+    "comm",
     "decls",
     "default_tiles",
     "encode_ecopy",
