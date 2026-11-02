@@ -59,35 +59,75 @@ def _head_order(x, queries, sublanes):
     return pltpu.bitcast(ordered, jnp.bfloat16) if x.dtype == jnp.float32 else ordered
 
 
-def _reduce_heads(products, selector, *, sublanes, use_mxu):
+def _head_columns(queries, heads, sublanes):
+    """Head index of each head-ordered row, matching `_head_order`.
+
+    Built from iota arithmetic so Pallas kernels capture no constants.
+    """
+    j = lax.broadcasted_iota(jnp.int32, (1, queries * heads), 1)
+    columns = jnp.zeros_like(j)
+    for start, count, groups, copies in _head_groups(queries, heads, sublanes):
+        # Part rows follow (group, copy, query, half) of a [count, 2, groups,
+        # copies] block; the head is half * groups * copies + group * copies + copy.
+        local = j - start * heads
+        half, copy = local % 2, local // (2 * count) % copies
+        group = local // (2 * count * copies)
+        inside = (local >= 0) & (local < count * heads)
+        head = half * (groups * copies) + group * copies + copy
+        columns = jnp.where(inside, head, columns)
+    return columns
+
+
+def _weighted_selector(selector, weights, rows, *, sublanes):
+    """Fold per-query head weights into the MXU head-reduction selector."""
+    queries, heads = selector.shape[0], weights.shape[-1]
+    columns = _head_columns(queries, heads, sublanes)
+    spread = lax.broadcasted_iota(jnp.int32, (heads, queries * heads), 0) == columns
+    # Row i holds query i's weights at its head-ordered product columns. The
+    # one-hot BF16 pass is exact for the BF16 weights the selector keeps.
+    rows = jnp.concatenate([weights[r][None, :] for r in rows])
+    expanded = lax.dot(
+        rows.astype(jnp.bfloat16),
+        spread.astype(jnp.bfloat16),
+        preferred_element_type=jnp.float32,
+    )
+    return (selector.astype(jnp.float32) * expanded).astype(jnp.bfloat16)
+
+
+def _reduce_on_mxu(fragment, stage, count, *, every, drain=0):
+    """Every `every`-th fragment, and the first `drain` drain stages, use the MXU."""
+    if stage < count:
+        return fragment % every == every - 1
+    return stage - count < drain
+
+
+def _reduce_heads(products, weights, selector, *, sublanes, use_mxu):
+    """Weighted head sums; MXU fragments take weights from ``selector``."""
+    if use_mxu:
+        return lax.dot(selector, products, preferred_element_type=jnp.float32)
     unpack = partial(
         pltpu.unpack_elementwise, packed_dtype=jnp.bfloat16, unpacked_dtype=jnp.float32
     )
-    if use_mxu:
-        values = lax.dot(selector, products, preferred_element_type=jnp.float32)
-    else:
-        queries, width = selector.shape[0], products.shape[-1]
-        heads = products.shape[0] // queries
-        values = None
-        for start, count, groups, _ in _head_groups(queries, heads, sublanes):
-            packed = pltpu.bitcast(
-                products[start * heads : (start + count) * heads], jnp.uint32
-            ).reshape(groups, sublanes, width)
-            summed = reduce(
-                jnp.add,
-                (unpack(packed[g], index=h) for g in range(groups) for h in range(2)),
-            )
-            offset = sublanes // 2
-            while offset >= count:
-                summed = summed + pltpu.roll(summed, offset, axis=0)
-                offset //= 2
-            values = (
-                summed
-                if values is None
-                else jnp.where(jnp.arange(sublanes)[:, None] < start, values, summed)
-            )
-        values = cast(jax.Array, values)[:queries]
-    return values.astype(jnp.bfloat16).astype(jnp.float32)
+    products = products * weights
+    queries, width = selector.shape[0], products.shape[-1]
+    heads = products.shape[0] // queries
+    values = None
+    for start, count, groups, _ in _head_groups(queries, heads, sublanes):
+        rows = products[start * heads : (start + count) * heads]
+        # Sum head pairs in packed BF16, unpacking once per vector.
+        total = reduce(jnp.add, list(rows.reshape(groups, 2 * sublanes, width)))
+        packed = pltpu.bitcast(total, jnp.uint32)
+        summed = unpack(packed, index=0) + unpack(packed, index=1)
+        offset = sublanes // 2
+        while offset >= count:
+            summed = summed + pltpu.roll(summed, offset, axis=0)
+            offset //= 2
+        values = (
+            summed
+            if values is None
+            else jnp.where(jnp.arange(sublanes)[:, None] < start, values, summed)
+        )
+    return cast(jax.Array, values)[:queries]
 
 
 def _dma_rows(src, dst, sem, count, wait=False, src_start=0, dst_start=0):

@@ -30,8 +30,10 @@ class PagedMQAConfig:
 
 
 # TPU v7, H32/D128, transposed packed FP8 pages.
-PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 65536, 8, 4)
-PACKED_FP8_PREPARED_MQA_CONFIG = PagedMQAConfig(2, 32768, 16, 4)
+PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 65536, 10, 4)
+PACKED_FP8_PREPARED_MQA_CONFIG = PagedMQAConfig(2, 32768, 12, 6)
+# Query pairs per gathered-scorer iteration; they share one MXU issue window.
+PACKED_FP8_PREPARED_PAIRS = 2
 
 # v7 H32/D128: fully static prefixes avoid dynamic per-fragment addresses.
 # A 4K step bounds inactive computation while retaining a long scheduling window.

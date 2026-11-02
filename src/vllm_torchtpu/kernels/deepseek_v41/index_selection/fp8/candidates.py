@@ -111,14 +111,17 @@ def prepare_candidate_metadata(
     boundary = requests[1:] != requests[:-1]
     begin_mask = jnp.concatenate((jnp.ones(1, jnp.bool_), boundary))
     end_mask = jnp.concatenate((boundary, jnp.ones(1, jnp.bool_)))
-    first = lax.associative_scan(jnp.maximum, jnp.where(begin_mask, rows, 0))
-    end = lax.associative_scan(
-        jnp.minimum, jnp.where(end_mask, rows + 1, tokens), reverse=True
-    )
+    # cummax/cummin lower to one reduce-window; associative_scan unrolls into
+    # log2(tokens) levels of tiny serial slice/pad ops.
+    first = lax.cummax(jnp.where(begin_mask, rows, 0))
+    end = lax.cummin(jnp.where(end_mask, rows + 1, tokens), reverse=True)
     paired = valid & ((end - first) % 2 == 0)
     starts = ~paired | ((rows - first) % 2 == 0)
     groups = jnp.cumsum(starts.astype(jnp.int32)) - 1
-    offsets = jnp.searchsorted(groups, jnp.arange(tokens + 1), side="left")
+    # One fused comparison; the default scan search lowers to a serial loop.
+    offsets = jnp.searchsorted(
+        groups, jnp.arange(tokens + 1), side="left", method="compare_all"
+    )
     sizes = jnp.diff(offsets)
 
     direct = False

@@ -122,7 +122,12 @@ def _threshold_top_k(scores: jax.Array, k: int) -> jax.Array:
     ).astype(jnp.int32)
 
 
-def _sparsecore_top_k(scores: jax.Array, k: int, lengths: jax.Array) -> jax.Array:
+def _sparsecore_top_k(
+    scores: jax.Array,
+    k: int,
+    lengths: jax.Array,
+    scheduling_group_id: int | None = None,
+) -> jax.Array:
     """V4's SparseCore top-k (`kernels/deepseek_v4/sparsecore_topk.py`).
 
     Same set as ``jax.lax.top_k`` over the finite scores (ties at the k-th
@@ -145,7 +150,9 @@ def _sparsecore_top_k(scores: jax.Array, k: int, lengths: jax.Array) -> jax.Arra
         )
         values, ids = jax.lax.top_k(masked, k)
         return jnp.where(values > -jnp.inf, ids, -1)
-    select = functools.partial(sparsecore_topk, k=k)
+    select = functools.partial(
+        sparsecore_topk, k=k, scheduling_group_id=scheduling_group_id
+    )
     try:
         mesh = get_vllm_model_wrapper_context().mesh
     except Exception:  # Standalone (tests): one device, no mesh.
@@ -212,7 +219,14 @@ def _visible_top_k(
 
 
 def _publish_candidate_blocks(
-    scores, lengths, count, block_size, unordered, *, block_scores=None
+    scores,
+    lengths,
+    count,
+    block_size,
+    unordered,
+    *,
+    block_scores=None,
+    scheduling_group_id=None,
 ):
     """Match vLLM candidate_blocks.py: per-query block maxima and newest block."""
     rows, width = scores.shape
@@ -226,7 +240,10 @@ def _publish_candidate_blocks(
     if unordered and blocks >= 2048 and blocks % 16 == 0 and cand_k % 16 == 0:
         block_lengths = (lengths + block_size - 1) // block_size
         published = _sparsecore_top_k(
-            block_scores, cand_k, jnp.minimum(block_lengths, blocks)
+            block_scores,
+            cand_k,
+            jnp.minimum(block_lengths, blocks),
+            scheduling_group_id,
         ).astype(jnp.int32)
     else:
         values, ids = jax.lax.top_k(block_scores, cand_k)
@@ -1870,7 +1887,12 @@ def _select_fp8_indexer_jax(
     inputs = tuple(
         jnp.pad(x, ((0, padded - tokens),) + ((0, 0),) * (x.ndim - 1)) for x in inputs
     )
-    counts = jnp.bincount(inputs[-1], length=page_table.shape[0])
+    # A TensorCore comparison; bincount lowers to a SparseCore scatter offload.
+    counts = jnp.sum(
+        inputs[-1][:, None] == jnp.arange(page_table.shape[0], dtype=jnp.int32),
+        axis=0,
+        dtype=jnp.int32,
+    )
     query_offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(counts)))
     stream_select = (
         unordered
@@ -2010,6 +2032,7 @@ def _select_fp8_indexer_jax(
                     block_size,
                     unordered,
                     block_scores=block_scores,
+                    scheduling_group_id=group,
                 )
             return selected
 
