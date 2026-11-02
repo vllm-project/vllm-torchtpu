@@ -180,6 +180,8 @@ class Split(prefill_token_split.TokenSplit):
         self.first_layer = DENSE
         self.edge = 128
         self.moe_slot = slot
+        self.rotated = False
+        self.fused_projection = False
         self._rank = rank
         self._own = take
         self._gather = lambda x: put_back(group.exchange(rank, x))
