@@ -1410,6 +1410,68 @@ def _project_ring_kernel(
             output.wait()
 
 
+def _project_oneshot_kernel(x_ref, w_ref, o_ref, partial_ref, slots, weights, tmp, gather,
+                            weight_sem, local_sem, send_sem, recv_sem):
+    """One-block windows: project every owner's rows into HBM partials, send
+    each owner its rows (one direct copy per peer), and sum the 32 BF16
+    partials in FP32 in rank order."""
+    rank = lax.axis_index("k3_sp")
+    rows = o_ref.shape[0]
+    barrier = pltpu.get_barrier_semaphore()
+    for peer in range(32):
+        pl.semaphore_signal(barrier, 1, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL)
+    pltpu.async_copy(w_ref, weights, weight_sem).wait()
+    pl.semaphore_wait(barrier, 32)
+    for owner in range(32):
+        bank = owner % 2
+        if owner >= 2:
+            pltpu.make_async_copy(tmp.at[bank], partial_ref.at[pl.ds((owner - 2) * rows, rows)],
+                                  local_sem).wait()
+        tmp.at[bank][...] = jnp.dot(
+            x_ref[pl.ds(owner * rows, rows), :], weights[...], preferred_element_type=jnp.float32
+        ).astype(jnp.bfloat16)
+        pltpu.make_async_copy(tmp.at[bank], partial_ref.at[pl.ds(owner * rows, rows)],
+                              local_sem).start()
+    for owner in (30, 31):
+        pltpu.make_async_copy(tmp.at[owner % 2], partial_ref.at[pl.ds(owner * rows, rows)],
+                              local_sem).wait()
+
+    def remote(peer):
+        return pltpu.make_async_remote_copy(
+            partial_ref.at[pl.ds(peer * rows, rows)], slots.at[rank], send_sem, recv_sem,
+            device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL)
+
+    @pl.loop(1, 32)
+    def send(d):
+        remote(lax.rem(rank + d, 32)).start()
+
+    own = pltpu.make_async_copy(partial_ref.at[pl.ds(rank * rows, rows)], slots.at[rank], local_sem)
+    own.start()
+
+    @pl.loop(1, 32)
+    def wait(d):
+        remote(rank).wait_send()
+        remote(rank).wait_recv()
+
+    own.wait()
+    width = gather.shape[2]
+    for col in range(0, o_ref.shape[1], width):
+        cols = pl.ds(col, width)
+        copies = [pltpu.make_async_copy(slots.at[r, :, cols], gather.at[r], local_sem)
+                  for r in range(32)]
+        for copy in copies:
+            copy.start()
+        for copy in copies:
+            copy.wait()
+        total = gather[0].astype(jnp.float32)
+        for r in range(1, 32):
+            total = total + gather[r].astype(jnp.float32)
+        tmp.at[0, :, cols][...] = total.astype(jnp.bfloat16)
+    out = pltpu.make_async_copy(tmp.at[0], o_ref, local_sem)
+    out.start()
+    out.wait()
+
+
 def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
     """Fuse a three-head BF16 attention projection with SP32 RS."""
     if (
@@ -1428,6 +1490,34 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
     regions = _regions(rows, 7168)
     streams = len(regions)
     chunk = max(size for _, size, _, _ in regions)
+    if rows <= STRIPE and tokens <= _config().prefill_mla_oneshot_max:
+        def local_oneshot(x, w):
+            hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+            dma = pltpu.SemaphoreType.DMA
+            out, _, _ = pl.pallas_call(
+                _project_oneshot_kernel,
+                out_shape=(jax.ShapeDtypeStruct((rows, 7168), jnp.bfloat16),
+                           jax.ShapeDtypeStruct((tokens, 7168), jnp.bfloat16),
+                           jax.ShapeDtypeStruct((32, rows, 7168), jnp.bfloat16)),
+                in_specs=(pl.BlockSpec(memory_space=pltpu.VMEM), hbm),
+                out_specs=(hbm, hbm, hbm),
+                scratch_shapes=(
+                    pltpu.VMEM((384, 7168), jnp.bfloat16),
+                    pltpu.VMEM((2, rows, 7168), jnp.bfloat16),
+                    pltpu.VMEM((32, rows, 512), jnp.bfloat16),
+                    dma, dma, dma, dma,
+                ),
+                compiler_params=pltpu.CompilerParams(
+                    collective_id=collective_id, vmem_limit_bytes=40 * 1024**2),
+                name="kimi_attention_project_oneshot_rs",
+            )(x.reshape(tokens, 384), w.reshape(384, 7168))
+            return out
+
+        return jax.shard_map(
+            local_oneshot, mesh=mesh,
+            in_specs=(P("k3_sp", None, None), P("k3_sp", None, None)),
+            out_specs=P("k3_sp", None), check_vma=False,
+        )(x, w)
 
     def local(x, w):
         x = x.reshape(tokens, 384)
@@ -5502,7 +5592,7 @@ def _make_indexed_moe_sp_ring_reference(mesh, *, seq_len=8192):
 
 def _norm_gather_body(
     active_ref, tables_ref, prefix_ref, blocks_ref, folded_ref, norm_ref,
-    normalized_ref, gathered_ref, *scratch, regions, eps, mix_tile,
+    normalized_ref, gathered_ref, *scratch, regions, eps, mix_tile, oneshot=False,
 ):
     mix_scratch = scratch[:12]
     ring_scratch = scratch[12:]
@@ -5512,6 +5602,37 @@ def _norm_gather_body(
             active_ref, prefix_ref, blocks_ref, folded_ref, norm_ref,
             normalized_ref, *mix_scratch, tile=mix_tile, eps=eps,
         )
+
+    if oneshot:
+        # One-block windows: this rank's rows straight to every peer's window.
+        rank = lax.axis_index("k3_sp")
+        rows = normalized_ref.shape[0]
+        send, recv, local = ring_scratch[1], ring_scratch[2].at[0], ring_scratch[4]
+        dest = gathered_ref.at[pl.ds(rank * rows, rows)]
+
+        def remote(peer):
+            return pltpu.make_async_remote_copy(
+                normalized_ref, dest, send.at[0], recv.at[0], device_id=peer,
+                device_id_type=pl.DeviceIdType.LOGICAL)
+
+        @pl.when(pl.program_id(1) == 0)
+        def gather():
+            _oneshot_barrier()
+
+            @pl.loop(1, 32)
+            def start(d):
+                remote(lax.rem(rank + d, 32)).start()
+
+            own = pltpu.make_async_copy(normalized_ref, dest, local.at[0])
+            own.start()
+
+            @pl.loop(1, 32)
+            def wait(d):
+                remote(rank).wait_send()
+                remote(rank).wait_recv()
+
+            own.wait()
+        return
 
     _all_gather_kernel(
         tables_ref, normalized_ref, gathered_ref, *ring_scratch,
@@ -5532,6 +5653,8 @@ def make_norm_gather_sp(mesh, *, seq_len, token_ranks=None,
     rows, width = seq_len // 32, 7168
     if token_ranks is None:
         token_ranks = tuple(range(32))
+    oneshot = (rows <= STRIPE and seq_len <= _config().prefill_mla_oneshot_max
+               and tuple(token_ranks) == tuple(range(32)))
     tables = jnp.asarray(
         ring_tables(list(mesh.devices.flat), token_ranks), jnp.int32,
     )
@@ -5550,7 +5673,7 @@ def make_norm_gather_sp(mesh, *, seq_len, token_ranks=None,
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     call = pl.pallas_call(
         functools.partial(_norm_gather_body, regions=regions, eps=eps,
-                          mix_tile=rows),
+                          mix_tile=rows, oneshot=oneshot),
         out_shape=(
             jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
             jax.ShapeDtypeStruct((seq_len, width), jnp.bfloat16),

@@ -464,6 +464,32 @@ def _latent_local_steps(payload, output, store, *, rank):
     copy.wait()
 
 
+def _latent_oneshot_steps(payload, output, send, recv, store, *, rank):
+    """Latent all-gather as one direct copy of this rank's rows to every peer."""
+    rows = payload.shape[0]
+    dest = output.at[pl.ds(rank * rows, rows), :, :]
+
+    def remote(peer):
+        return pltpu.make_async_remote_copy(
+            payload, dest, send, recv, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL
+        )
+
+    @pl.loop(1, 32)
+    def start(d):
+        remote(lax.rem(rank + d, 32)).start()
+
+    own = pltpu.make_async_copy(payload, dest, store)
+    own.start()
+    yield
+
+    @pl.loop(1, 32)
+    def wait(d):
+        remote(rank).wait_send()
+        remote(rank).wait_recv()
+
+    own.wait()
+
+
 def _latent_ready_init(tables, payload, output, send, recv, stores, state, meta, *, rank):
     """Seed twelve independently progressing streams of the 8K latent gather.
 
@@ -655,6 +681,7 @@ def _prologue(
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
     banks = k._config().prefill_moe_dma_banks if rows <= 128 else 2
     skip_latent_ring = "moe_latent_ring" in k._config().debug_skip
+    latent_oneshot = rows <= 128 and rows * 32 <= k._config().prefill_moe_latent_oneshot_max
     phase = _Phases()
 
     def body(s):
@@ -801,7 +828,10 @@ def _prologue(
         latent_steps = _latent_local_steps(
             s["latent_payload"], latent_hbm,
             s["latent_stores"].at[0] if rows <= 128 else s["latent_stores"], rank=rank,
-        ) if skip_latent_ring else _latent_gather_steps(
+        ) if skip_latent_ring else _latent_oneshot_steps(
+            s["latent_payload"], latent_hbm, s["latent_send_sems"].at[0],
+            s["latent_recv_sems"].at[0, 0], s["latent_stores"].at[0], rank=rank,
+        ) if latent_oneshot else _latent_gather_steps(
             tables,
             s["latent_payload"],
             s["latent_recv"],

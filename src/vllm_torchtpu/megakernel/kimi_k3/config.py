@@ -106,6 +106,18 @@ class KernelConfig:
     prefill_moe_oneshot_max: int = dataclasses.field(
         default_factory=lambda: int(os.environ.get("K3_PREFILL_MOE_ONESHOT_MAX", "0"))
     )
+    # Fused prefill MoE prologue: windows up to this many tokens (at most 4K)
+    # all-gather the latent with one direct copy per peer instead of the
+    # 32-step ring (0: ring). Same values.
+    prefill_moe_latent_oneshot_max: int = dataclasses.field(
+        default_factory=lambda: int(os.environ.get("K3_PREFILL_MOE_LATENT_ONESHOT_MAX", "0"))
+    )
+    # Prefill MLA layer, windows of one SP block (512-2048) up to this many
+    # tokens: direct norm all-gather and one-shot output-projection
+    # reduce-scatter (FP32 sum of the 32 BF16 partials) instead of the rings.
+    prefill_mla_oneshot_max: int = dataclasses.field(
+        default_factory=lambda: int(os.environ.get("K3_PREFILL_MLA_ONESHOT_MAX", "0"))
+    )
     # Prefill KDA layer, windows of one SP block (512-2048) up to this many
     # tokens: direct window all-gather and one-shot reduce-scatter (FP32 sum of
     # the 32 BF16 partials) instead of the 17-step half rings (0: rings).
