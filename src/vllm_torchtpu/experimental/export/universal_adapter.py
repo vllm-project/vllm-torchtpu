@@ -119,6 +119,39 @@ def _min_smem_page_size(
     return 1 << (min_page - 1).bit_length()
 
 
+def _kernel_block_size(vllm_config: Any, block_size: int) -> int:
+    """The page size the attention kernels run at for KV blocks of `block_size`.
+
+    Mirrors the runner's `prepare_kernel_block_sizes`: a hybrid model's unified
+    block pool sizes its blocks to hold a recurrent state (e.g. 1152 tokens), and
+    the runner splits each into pages the attention backend supports (128 or 256
+    for RPA) before the kernel sees them. The export keeps recurrent states in
+    their own pools, so it pages its KV caches at the kernel's size directly; the
+    RPA kernel does not reject an unsupported page size, it computes wrong
+    attention.
+    """
+    from vllm.model_executor.layers.attention import Attention
+
+    ctx = getattr(
+        getattr(vllm_config, "compilation_config", None), "static_forward_context", {}
+    )
+    backends = list(
+        {
+            layer.attn_backend
+            for layer in (ctx or {}).values()
+            if isinstance(layer, Attention) and getattr(layer, "attn_backend", None)
+        }
+    )
+    if not backends:
+        return block_size
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.worker.utils import select_common_block_size
+
+    # Backends read their supported sizes from the current config.
+    with set_current_vllm_config(vllm_config):
+        return select_common_block_size(block_size, backends)
+
+
 def check_supported_parallelism(parallel_cfg: Any) -> tuple[int, int]:
     """Returns `(dp, pp)` after rejecting data or pipeline parallel sizes above 1.
 
@@ -270,6 +303,9 @@ def build_export_config_from_vllm(
     block_size = max(
         block_size, _min_smem_page_size(parallel_cfg, max_num_seqs, max_model_len)
     )
+    kernel_block_size = _kernel_block_size(vllm_config, block_size)
+    num_blocks *= block_size // kernel_block_size
+    block_size = kernel_block_size
 
     raw_eos = _extract_hf_field(hf_cfg, "eos_token_id", default=151645)
     if isinstance(raw_eos, (list, tuple)):

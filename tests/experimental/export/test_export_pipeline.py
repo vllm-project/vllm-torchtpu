@@ -928,6 +928,47 @@ def test_build_export_config_raises_block_size_to_fit_smem(tmp_path: Path) -> No
     assert big.max_num_pages * 4 <= 1024 * 1024 // 2
 
 
+def test_build_export_config_pages_kv_at_the_attention_kernels_block_size(
+    tmp_path: Path,
+) -> None:
+    from vllm.model_executor.layers.attention import Attention
+
+    class RpaBackend:
+        @staticmethod
+        def get_supported_kernel_block_sizes(kv_cache_spec: Any = None) -> list[int]:
+            return [128, 256]
+
+        @staticmethod
+        def get_name() -> str:
+            return "RPA"
+
+    attn = object.__new__(Attention)
+    attn.attn_backend = RpaBackend
+
+    def cfg(block_size: int) -> Any:
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                model=str(tmp_path), dtype="bfloat16", max_model_len=2048
+            ),
+            cache_config=SimpleNamespace(block_size=block_size, num_gpu_blocks=100),
+            scheduler_config=SimpleNamespace(max_num_seqs=64),
+            compilation_config=SimpleNamespace(
+                static_forward_context={"layers.3.self_attn.attn": attn}
+            ),
+        )
+
+    build = universal_adapter.build_export_config_from_vllm
+    # A unified block pool sizes a hybrid model's blocks to hold a recurrent
+    # state; the runner splits each into kernel pages, the largest that divides.
+    paged = build(cfg(1152))
+    assert (paged.block_size, paged.num_blocks) == (128, 900)
+    paged = build(cfg(1280))
+    assert (paged.block_size, paged.num_blocks) == (256, 500)
+    assert build(cfg(256)).block_size == 256
+    with pytest.raises(ValueError, match="No common block size"):
+        build(cfg(1000))
+
+
 def test_build_export_config_req_buckets_cover_speculative_verify_rows(
     tmp_path: Path,
 ) -> None:
