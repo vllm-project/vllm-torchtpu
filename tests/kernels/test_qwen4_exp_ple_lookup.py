@@ -108,7 +108,8 @@ def test_compact_last_row_has_no_out_of_bounds_segment(dtype):
 
 
 @pytest.mark.parametrize("fp8", [False, True])
-def test_decode_embeddings_preserves_bits_and_nonfinite_contract(fp8):
+@pytest.mark.parametrize("scale", [0.375, 1.0, 0.0, -1.0])
+def test_decode_embeddings_preserves_bits_and_nonfinite_contract(fp8, scale):
     patterns = np.asarray(
         [0, 0x8000, 0x3F80, 0x3F81, 0xBF80, 0x7F80, 0xFF80, 0x7FC0], np.uint16
     )
@@ -116,14 +117,14 @@ def test_decode_embeddings_preserves_bits_and_nonfinite_contract(fp8):
         patterns = np.arange(256, dtype=np.uint8)
         raw = patterns.view(np.int8)
         values = patterns.view(ml_dtypes.float8_e4m3fn).astype(ml_dtypes.bfloat16)
-        expected = (values.astype(np.float32) * np.float32(0.375)).astype(
+        expected = (values.astype(np.float32) * np.float32(scale)).astype(
             ml_dtypes.bfloat16
         )
     else:
         raw = patterns.view(np.int16)
         expected = patterns.view(ml_dtypes.bfloat16)
     actual = np.asarray(
-        jax.jit(decode_embeddings)(jnp.asarray(raw), jnp.float32(0.375))
+        jax.jit(decode_embeddings)(jnp.asarray(raw), jnp.float32(scale))
     )
     finite = ~np.isnan(expected.astype(np.float32))
     np.testing.assert_array_equal(

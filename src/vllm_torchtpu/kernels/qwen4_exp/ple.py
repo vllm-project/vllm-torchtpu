@@ -75,7 +75,8 @@ def decode_embeddings(raw_embeddings, scale):
     if raw_embeddings.dtype == jnp.int16:
         return jax.lax.bitcast_convert_type(raw_embeddings, jnp.bfloat16)
     values = jax.lax.bitcast_convert_type(raw_embeddings, jnp.float8_e4m3fn)
-    return bf16(bf16(values) * scale.astype(jnp.bfloat16))
+    # FP8 values are exactly representable in BF16 before scaling.
+    return bf16(values.astype(jnp.bfloat16) * scale.astype(jnp.bfloat16))
 
 
 def resident_lookup(
