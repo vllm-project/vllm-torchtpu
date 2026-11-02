@@ -23,6 +23,7 @@ from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 
 def _spec_and_exec() -> tuple[mk.ModelSpec, mk.ExecSpec]:
+    assert fused_io_hook.fused_io_available()
     spec = qwen35.qwen35_spec(qwen35.TINY_EP)
     return spec, mk.ExecSpec(
         R=2, B=8, T=1, ctx=256, cache=mk.CacheExec(paged_kv=True, num_pages=512)
