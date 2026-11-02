@@ -1536,6 +1536,54 @@ class TestKVCacheManager:
         caches["attn.0"][kv_cache_config.num_blocks - 1].fill_(1)
         assert torch.all(caches["attn.1"][-1] == 1)
 
+    def test_initialize_kv_cache_allocates_attention_caches_on_device(self):
+        """Attention caches are created on the device, not on the host first."""
+        from torch.utils._python_dispatch import TorchDispatchMode
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+
+        class RecordHostTensors(TorchDispatchMode):
+            def __init__(self):
+                super().__init__()
+                self.numels = []
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                out = func(*args, **(kwargs or {}))
+                if isinstance(out, torch.Tensor) and out.device.type == "cpu":
+                    self.numels.append(out.numel())
+                return out
+
+        spec = PallasAttentionBackend.customize_spec(
+            FullAttentionSpec(
+                block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+            )
+        )
+        groups = [
+            KVCacheGroupSpec(layer_names=["attn.0", "attn.1"], kv_cache_spec=spec)
+        ]
+        config = get_kv_cache_config_from_groups(
+            self.runner.vllm_config, groups, 2 * 4 * spec.page_size_bytes
+        )
+        self.runner.device = torch.device("meta")
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        table = MagicMock()
+        table.get_cpu_tensor.return_value = self.runner.block_table_cpu
+        self.runner.input_batch = SimpleNamespace(block_table=[table])
+
+        with (
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=False,
+            ),
+            RecordHostTensors() as host,
+        ):
+            self.runner.initialize_kv_cache(config)
+
+        caches = bind.call_args.args[0]
+        assert {cache.device.type for cache in caches.values()} == {"meta"}
+        assert caches["attn.0"].numel() not in host.numels
+
     def test_initialize_kv_cache_composite_specs(self):
         """Verify composite kv_cache_specs unpacking when a group's spec wraps
         a dictionary of individual per-layer specs."""
