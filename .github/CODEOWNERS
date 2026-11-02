@@ -74,8 +74,8 @@
 /tests/models/vllm/test_dsv4_*.py @gxd3 @patemotter @gpolovets1 @inucool12
 
 # Platform Support
-/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw
-/tests/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw
+/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @brianseung-google
+/tests/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @brianseung-google
 
 # Structured Decoding
 /src/vllm_torchtpu/structured_decoding/ @maxwillzq @silkyarora
