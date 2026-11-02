@@ -167,7 +167,7 @@ def test_sliding_exchange_refuses_pieces_shorter_than_the_halo():
     rows = jnp.zeros((2 * plan.piece_tokens, 4, 128), jnp.float8_e4m3fn)
     cfg = _layer_config(4, 1024, configs.KVLayout.HEAD_ALONG_SUBLANE)
     with pytest.raises(ValueError, match="halo"):
-        cp_prefill.sliding_exchange_blocks(
+        cp_prefill.sliding_exchange_row(
             rows,
             rows,
             jnp.array([plan.num_pages * PAGE], jnp.int32),
@@ -261,17 +261,14 @@ def test_sliding_window_write_caches_the_decode_window(seq_len, layout):
     position_pages, count = cp_prefill.window_position_pages(
         jnp.int32(seq_len), window, PAGE
     )
-    sent = [
-        cp_prefill.window_slots_for_ranks(
-            _rank_rows(k, plan, r),
-            _rank_rows(v, plan, r),
-            plan,
-            r,
-            position_pages,
-            num_kv_heads,
-        )
-        for r in range(plan.world)
-    ]
+    held = jnp.stack(
+        [
+            cp_prefill.window_pages_held(
+                _rank_rows(k, plan, r), _rank_rows(v, plan, r), plan, r, position_pages
+            )
+            for r in range(plan.world)
+        ]
+    )
     block_table = _block_table(num_cache_pages, plan.num_pages, seed=5)
     src, dst, count = cp_prefill.window_page_writes(block_table, position_pages, count)
     first_page = max(seq_len - window + 1, 0) // PAGE
@@ -282,10 +279,9 @@ def test_sliding_window_write_caches_the_decode_window(seq_len, layout):
         heads = slice(first, first + num_heads)
         expected = _serving_pages(k[:, heads], v[:, heads], layout)
         cache = jnp.full((num_cache_pages, *expected.shape[1:]), 7, FP8)
-        # The all-to-all: rank `rank` receives slice `rank` of what every rank sent.
-        received = jnp.stack([x[rank] for x in sent])
         owners = cp_prefill.window_page_owners(plan, position_pages)
-        slots = cp_prefill.window_slots_from_ranks(received, owners)
+        window = cp_prefill.window_pages_from_ranks(held, owners)
+        slots = cp_prefill.kv_head_slots(window, first, num_heads)
         pages = cp_prefill.cache_pages_from_slots(slots, layout)
         with pltpu.force_tpu_interpret_mode():
             cache = cp_prefill.write_kv_pages(cache, pages, src, dst, count)
@@ -383,31 +379,34 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
     query = jnp.zeros((2 * plan.piece_tokens, 32, 128), jnp.bfloat16)
     rows = [(_rank_rows(k, plan, r), _rank_rows(v, plan, r)) for r in range(plan.world)]
     cfg = _layer_config(num_kv_heads, window, layout)
-    sent = [
-        cp_prefill.sliding_exchange_blocks(
-            *rows[r], seq_lens, jnp.array([r], jnp.int32), PAGE, cfg=cfg
-        )
-        for r in range(plan.world)
-    ]
+    # The all-gather: every rank's row, in rank order.
+    gathered = jnp.concatenate(
+        [
+            cp_prefill.sliding_exchange_row(
+                *rows[r], seq_lens, jnp.array([r], jnp.int32), PAGE, cfg=cfg
+            )
+            for r in range(plan.world)
+        ]
+    )
     position_pages, count = cp_prefill.window_position_pages(
         jnp.int32(seq_len), window, PAGE
     )
     needed = np.asarray(position_pages)[: int(count)]
     halo = cp_prefill.num_halo_pages(window, PAGE)
-    halo_bytes = halo * PAGE * 2 * num_kv_heads * 128
+    tail_bytes = halo * PAGE * 2 * num_kv_heads * 128
     pp = plan.piece_pages
     for rank in range(plan.world):
-        # The all-to-all: rank `rank` receives block `rank` of what every rank sent.
-        received = jnp.stack([x[rank] for x in sent])
-        # Its halos: the tails of the pieces before its two (where they exist).
-        for src, piece in (
-            ((rank - 1) % 8, plan.rank_pieces(rank)[0]),
-            ((rank + 1) % 8, plan.rank_pieces(rank)[1]),
+        # Its halos: the tails of the pieces before its two (where they exist),
+        # the first-piece tail of the rank below and the second-piece tail of
+        # the rank above.
+        for slot, src, piece in (
+            (0, (rank - 1) % 8, plan.rank_pieces(rank)[0]),
+            (1, (rank + 1) % 8, plan.rank_pieces(rank)[1]),
         ):
             if piece == 0 or (rank == 7 and src == 0):
                 continue
             np.testing.assert_array_equal(
-                _bytes(received[src, :halo_bytes]),
+                _bytes(gathered[src, slot * tail_bytes : (slot + 1) * tail_bytes]),
                 _bytes(in_order[piece * pp - halo : piece * pp]).reshape(-1),
             )
         first, num_heads = cp_prefill.tp_kv_heads(num_kv_heads, plan.world, rank)
@@ -420,7 +419,7 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
                 cache,
                 query,
                 *rows[rank],
-                received,
+                gathered,
                 seq_lens,
                 block_table,
                 jnp.array([rank], jnp.int32),

@@ -38,10 +38,12 @@ every real query's keys, and the cache writes skip their pages. A sliding-window
 layer's earlier pages are left unwritten, so the cache blocks of such a prompt
 must not be reused through prefix caching.
 
-A rank is a Python int or a traced scalar (`jax.lax.axis_index` under
-`shard_map`). This module holds the page arithmetic and what one layer runs
-around its one collective (the all-gather of `pack_kv_rows` rows, or the
-all-to-all of `sliding_exchange_blocks`), which is the caller's.
+The page helpers take a rank as a Python int or a traced scalar
+(`jax.lax.axis_index` under `shard_map`); the layer functions take it as a [1]
+int32 array, which a torch caller passes as a device tensor so that every rank
+runs one program. This module holds the page arithmetic and what one layer runs
+around its one collective (an all-gather of `pack_kv_rows` rows, or of
+`sliding_exchange_row` rows), which is the caller's.
 """
 
 import dataclasses
@@ -243,7 +245,7 @@ def sliding_local_pages(
     (`ZigzagPlan.sliding_page_tables`).
 
     `halos` holds the fp8 [first piece's halo | second piece's halo] pages from
-    the exchange (`sliding_exchange_blocks`). Rank 0's first piece starts the
+    the exchange (`sliding_exchange_row`). Rank 0's first piece starts the
     prompt, so its first halo goes unread; the last rank's second piece follows
     its own first piece, whose tail (from `keys`, `values`, the rank's rows) is
     used instead of what the exchange delivered.
@@ -468,20 +470,17 @@ def window_page_writes(
     return src, jnp.take(block_table, position_pages, mode="clip"), count
 
 
-def window_slots_for_ranks(
+def window_pages_held(
     keys: jax.Array,
     values: jax.Array,
     plan: ZigzagPlan,
     rank: Rank,
     position_pages: jax.Array,
-    num_kv_heads: int,
 ) -> jax.Array:
-    """What this rank sends each rank in an all-to-all of the window: per
-    destination, the K/V slots of the destination's `tp_kv_heads` in the window
-    pages this rank holds; the other pages carry nothing
-    (`window_slots_from_ranks` takes each page from its holder). `keys` and
-    `values` are the rank's rows.
-    [world, len(position_pages), page_size, 2 * heads per rank, d]."""
+    """The window pages this rank holds, every KV head (`pack_kv_pages`); the
+    other pages carry whatever the clipped rows hold (`window_pages_from_ranks`
+    takes each page from its holder). `keys` and `values` are the rank's rows.
+    [len(position_pages), page_size, slot rows, packing, d]."""
     pp, ps = plan.piece_pages, plan.page_size
     first, second = plan.rank_pieces(rank)
     piece = position_pages // pp
@@ -489,16 +488,10 @@ def window_slots_for_ranks(
         piece == first, position_pages - first * pp, position_pages - second * pp + pp
     )
     rows = jnp.clip(local, 0, 2 * pp - 1)[:, None] * ps + jnp.arange(ps)
-    pages = pack_kv_pages(
+    return pack_kv_pages(
         jnp.take(keys, rows.reshape(-1), axis=0),
         jnp.take(values, rows.reshape(-1), axis=0),
         ps,
-    )
-    return jnp.stack(
-        [
-            kv_head_slots(pages, *tp_kv_heads(num_kv_heads, plan.world, r))
-            for r in range(plan.world)
-        ]
     )
 
 
@@ -508,11 +501,10 @@ def window_page_owners(plan: ZigzagPlan, position_pages: jax.Array) -> jax.Array
     return jnp.where(piece < plan.world, piece, plan.num_pieces - 1 - piece)
 
 
-def window_slots_from_ranks(received: jax.Array, owners: jax.Array) -> jax.Array:
-    """The window from what every rank sent this one (`window_slots_for_ranks`
-    after an all-to-all, sources along axis 0): each page from its
-    `window_page_owners` rank."""
-    return received[owners, jnp.arange(owners.shape[0])]
+def window_pages_from_ranks(gathered: jax.Array, owners: jax.Array) -> jax.Array:
+    """The window from every rank's `window_pages_held` (sources along axis 0):
+    each page from its `window_page_owners` rank."""
+    return gathered[owners, jnp.arange(owners.shape[0])]
 
 
 CacheView = Callable[
@@ -546,6 +538,7 @@ class LayerConfig:
 
     @property
     def local_kv_heads(self) -> int:
+        # The count is the same on every rank; only the first head depends on it.
         return tp_kv_heads(self.num_kv_heads, self.world, 0)[1]
 
     def plan(self, num_rows: int, page_size: int) -> ZigzagPlan:
@@ -624,18 +617,16 @@ def full_attention_layer(
 
 
 def _sliding_exchange_sizes(cfg: LayerConfig, page_size: int) -> tuple[int, ...]:
-    """(halo pages, window pages, halo bytes, window bytes) of one block of a
-    sliding-window layer's all-to-all."""
+    """(halo pages, window pages, tail bytes, window bytes) of a sliding-window
+    layer's `sliding_exchange_row`: two piece tails, then the window pages."""
     assert cfg.sliding_window is not None
     halo_pages = num_halo_pages(cfg.sliding_window, page_size)
     window_pages = halo_pages + 1
-    local_heads = cfg.local_kv_heads
-    halo_bytes = halo_pages * page_size * 2 * cfg.num_kv_heads * cfg.head_dim
-    window_bytes = window_pages * page_size * 2 * local_heads * cfg.head_dim
-    return halo_pages, window_pages, halo_bytes, window_bytes
+    page_bytes = page_size * 2 * cfg.num_kv_heads * cfg.head_dim
+    return halo_pages, window_pages, halo_pages * page_bytes, window_pages * page_bytes
 
 
-def sliding_exchange_blocks(
+def sliding_exchange_row(
     keys: jax.Array,
     values: jax.Array,
     seq_lens: jax.Array,
@@ -644,39 +635,28 @@ def sliding_exchange_blocks(
     *,
     cfg: LayerConfig,
 ) -> jax.Array:
-    """What this rank sends each rank in a sliding-window layer's one
-    all-to-all: [world, halo bytes + window bytes] int8. Block d carries the
-    tail of the piece before rank d's first or second piece when this rank
-    holds it (`halo_permutations`; zeros otherwise), then the decode window's
-    K/V slots of rank d's heads (`window_slots_for_ranks`).
+    """This rank's row of a sliding-window layer's one all-gather:
+    [1, 2 * tail bytes + window bytes] int8. It holds the tails of the rank's
+    first and second piece (`pack_piece_tails`: the halos of the ranks holding
+    the next pieces, `halo_neighbours`), then the decode window's pages where
+    this rank holds them (`window_pages_held`), every KV head.
 
     `keys` and `values` are the rank's fp8 rows, `rank` [1] int32 this rank and
-    `page_size` the KV cache's. Needs world >= 3, so the two tails go to
-    different ranks.
+    `page_size` the KV cache's. An all-gather moves the halos to every rank,
+    eight times what they need, yet measured faster than an all-to-all that
+    sends each tail to one rank in blocks of one size.
     """
     rank = rank[0]
-    if cfg.world < 3:
-        raise ValueError(
-            f"The sliding-window exchange needs 3 or more ranks, got {cfg.world}"
-        )
     plan = cfg.plan(keys.shape[0], page_size)
-    halo_pages, _, halo_bytes, _ = _sliding_exchange_sizes(cfg, page_size)
+    halo_pages, _, _, _ = _sliding_exchange_sizes(cfg, page_size)
     plan.check_halo_pages(halo_pages)
     tails = pack_piece_tails(keys, values, halo_pages, page_size)
-    tails = jax.lax.bitcast_convert_type(tails, jnp.int8).reshape(2, halo_bytes)
-    dest = jnp.arange(cfg.world)[:, None]
-    # This rank is the first-piece source of the rank above and the second-piece
-    # source of the rank below.
-    down, up = halo_neighbours(rank, cfg.world)
-    halo = jnp.where(dest == up, tails[0], jnp.where(dest == down, tails[1], 0))
     position_pages, _ = window_position_pages(
         seq_lens[0], cfg.sliding_window, page_size
     )
-    window = window_slots_for_ranks(
-        keys, values, plan, rank, position_pages, cfg.num_kv_heads
-    )
-    window = jax.lax.bitcast_convert_type(window, jnp.int8).reshape(cfg.world, -1)
-    return jnp.concatenate([halo.astype(jnp.int8), window], axis=1)
+    window = window_pages_held(keys, values, plan, rank, position_pages)
+    row = jnp.concatenate([tails.reshape(-1), window.reshape(-1)])
+    return jax.lax.bitcast_convert_type(row, jnp.int8).reshape(1, -1)
 
 
 def sliding_attention_layer(
@@ -684,7 +664,7 @@ def sliding_attention_layer(
     query: jax.Array,
     keys: jax.Array,
     values: jax.Array,
-    received: jax.Array,
+    gathered: jax.Array,
     seq_lens: jax.Array,
     block_tables: jax.Array,
     rank: jax.Array,
@@ -699,8 +679,8 @@ def sliding_attention_layer(
         kv_cache: The layer's serving cache; `cache_view` gives its native pages.
         query: [rows, num_heads, head_dim].
         keys, values: [rows, num_kv_heads, head_dim] fp8 K/V of the rank's rows.
-        received: What every rank sent this one (`sliding_exchange_blocks` after
-            an all-to-all, block s from rank s).
+        gathered: Every rank's `sliding_exchange_row`, all-gathered in rank
+            order: [world, row bytes] int8.
         seq_lens, block_tables: The step's attention metadata (one request).
         rank: [1] int32, this rank.
         cfg: The layer.
@@ -714,19 +694,22 @@ def sliding_attention_layer(
     rank = rank[0]
     native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
     plan = cfg.plan(query.shape[0], page_size)
-    halo_pages, window_pages, halo_bytes, window_bytes = _sliding_exchange_sizes(
+    halo_pages, window_pages, tail_bytes, window_bytes = _sliding_exchange_sizes(
         cfg, page_size
     )
-    if received.shape[1] != halo_bytes + window_bytes:
+    if gathered.shape != (cfg.world, 2 * tail_bytes + window_bytes):
         raise ValueError(
-            f"Exchange blocks of {received.shape[1]} bytes are not those of "
-            f"{page_size}-token pages ({halo_bytes} + {window_bytes})."
+            f"Exchange rows {gathered.shape} are not {cfg.world} rows of "
+            f"{page_size}-token pages (2 x {tail_bytes} + {window_bytes} bytes)."
         )
     packing = utils.get_dtype_packing(keys.dtype)
     page = (page_size, 2 * cfg.num_kv_heads // packing, packing, cfg.head_dim)
     first_src, second_src = halo_neighbours(rank, cfg.world)
     halos = jnp.stack(
-        [received[first_src, :halo_bytes], received[second_src, :halo_bytes]]
+        [
+            gathered[first_src, :tail_bytes],
+            gathered[second_src, tail_bytes : 2 * tail_bytes],
+        ]
     )
     halos = jax.lax.bitcast_convert_type(halos, keys.dtype).reshape(-1, *page)
     local = sliding_local_pages(halos, keys, values, plan, rank)
@@ -741,15 +724,14 @@ def sliding_attention_layer(
         values=values,
         **cfg.rpa_kwargs(),
     )
-    local_heads = cfg.local_kv_heads
-    window = jax.lax.bitcast_convert_type(received[:, halo_bytes:], native.dtype)
-    window = window.reshape(
-        cfg.world, window_pages, page_size, 2 * local_heads, cfg.head_dim
-    )
+    window = jax.lax.bitcast_convert_type(gathered[:, 2 * tail_bytes :], native.dtype)
+    window = window.reshape(cfg.world, window_pages, *page)
     position_pages, count = window_position_pages(
         seq_lens[0], cfg.sliding_window, page_size
     )
-    slots = window_slots_from_ranks(window, window_page_owners(plan, position_pages))
+    pages = window_pages_from_ranks(window, window_page_owners(plan, position_pages))
+    first, num_heads = tp_kv_heads(cfg.num_kv_heads, cfg.world, rank)
+    slots = kv_head_slots(pages, first, num_heads)
     table = _request_block_table(block_tables, seq_lens) * page_stride
     writes = window_page_writes(table, position_pages, count)
     mine = cache_pages_from_slots(slots, cfg.kv_layout)

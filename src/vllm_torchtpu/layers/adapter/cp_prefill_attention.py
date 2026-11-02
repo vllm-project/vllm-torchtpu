@@ -21,9 +21,10 @@ tensor-parallel KV cache as decode steps read it:
 
 * full attention: the ranks all-gather their fp8 K/V rows, attend through the
   zigzag page table and cache their own KV head(s) of every prompt position;
-* sliding window: one all-to-all brings each rank the pages before its two
-  pieces (from the ranks holding them) and its heads of the pages the next
-  decode's window reaches; it attends within [halo | piece] and caches those.
+* sliding window: the ranks all-gather their pieces' tails and the pages the
+  next decode's window reaches; each attends within [halo | piece], the halos
+  being the tails of the pieces before its own, and caches its heads of the
+  window.
 
 vllm-torchtpu compiles functional collectives into the program and so needs
 every rank to run the same program: the rank reaches the ops as a device
@@ -118,16 +119,11 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
         )
 
     def fake_exchange(keys, values, seq_lens, rank, page_size):
+        # Two piece tails of halo pages, then halo + 1 window pages.
         halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, page_size)
-        block = (
-            page_size
-            * cfg.head_dim
-            * (
-                halo_pages * 2 * cfg.num_kv_heads
-                + (halo_pages + 1) * 2 * local_kv_heads
-            )
-        )
-        return keys.new_empty((cfg.world, block), dtype=torch.int8)
+        page_bytes = page_size * 2 * cfg.num_kv_heads * cfg.head_dim
+        row = (3 * halo_pages + 1) * page_bytes
+        return keys.new_empty((1, row), dtype=torch.int8)
 
     def fake_sliding(kv_cache, query, *args):
         return torch.empty_like(kv_cache), torch.empty_like(query)
@@ -135,7 +131,7 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
     return LayerOps(
         sliding_exchange=_register(
             "sliding_exchange",
-            cp_prefill.sliding_exchange_blocks,
+            cp_prefill.sliding_exchange_row,
             fake_exchange,
             donate=False,
             cfg=cfg,
@@ -199,19 +195,13 @@ def _layer_config(
         raise ValueError(
             f"{num_heads} query heads are not {world} ranks x {impl.num_heads}."
         )
-    _, local_kv_heads = cp_prefill.tp_kv_heads(num_kv_heads, world, 0)
-    if local_kv_heads != impl.num_kv_heads:
-        raise ValueError(
-            f"{num_kv_heads} KV heads on {world} ranks give {local_kv_heads} per "
-            f"rank; the layer's cache holds {impl.num_kv_heads}."
-        )
     if impl.fp8_compute and (num_heads // num_kv_heads) % 4:
         raise ValueError(
             f"TPU_FP8_ATTENTION: {num_heads} query heads per {num_kv_heads} KV heads "
             "are not whole fp8 packing groups."
         )
     sliding = impl.sliding_window is not None
-    return cp_prefill.LayerConfig(
+    cfg = cp_prefill.LayerConfig(
         world=world,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -228,6 +218,12 @@ def _layer_config(
         ),
         fence_output=envs.TPU_RPA_FENCE_OUTPUT,
     )
+    if cfg.local_kv_heads != impl.num_kv_heads:
+        raise ValueError(
+            f"{num_kv_heads} KV heads on {world} ranks give {cfg.local_kv_heads} per "
+            f"rank; the layer's cache holds {impl.num_kv_heads}."
+        )
+    return cfg
 
 
 def prepare_cp_prefill_attention(
@@ -265,12 +261,6 @@ def prepare_cp_prefill_attention(
 
 def _waited(t: torch.Tensor) -> torch.Tensor:
     return funcol.wait_tensor(t) if isinstance(t, funcol.AsyncCollectiveTensor) else t
-
-
-def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
-    """Block d of x's leading axis goes to rank d; block s of the result came
-    from rank s."""
-    return _waited(funcol.all_to_all_single(x.contiguous(), None, None, group))
 
 
 def _int8_rows(key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
@@ -365,10 +355,10 @@ def cp_layer(
             kv_cache, query, gathered, seq_lens, block_tables, rank
         )
     else:
-        send = ops.sliding_exchange(key, value, seq_lens, rank, plan.page_size)
-        received = _all_to_all(send, group)
+        row = ops.sliding_exchange(key, value, seq_lens, rank, plan.page_size)
+        gathered = _waited(funcol.all_gather_single(row, 0, group))
         new_kv_cache, out = ops.sliding_attention(
-            kv_cache, query, key, value, received, seq_lens, block_tables, rank
+            kv_cache, query, key, value, gathered, seq_lens, block_tables, rank
         )
     # The ops donate the cache; the copy_ folds into that alias when compiled.
     kv_cache.copy_(new_kv_cache)
