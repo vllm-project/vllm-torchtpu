@@ -165,3 +165,52 @@ CPU, one process per rank. Either way, one process per rank saves that rank's
 shards: the processes join a JAX distributed runtime and Orbax writes each array's
 chunks from the host memory of the rank that holds them, so the host needs
 roughly the model size in free RAM.
+
+## Debugging: `--debug-taps`
+
+To find where an exported artifact and the vLLM runner diverge numerically,
+`--debug-taps` exports the intermediates of chosen modules. It takes
+comma-separated glob patterns of module names:
+
+- the target's modules are named as in the wrapped model's `named_modules()`,
+  e.g. `language_model.model.layers.3.self_attn`;
+- the MTP draft's are named as in the checkpoint, e.g. `mtp.fc`.
+
+A pattern that matches no module fails, and the error lists example names.
+
+For the smallest token bucket, `forward` and `mtp_draft` are also exported with
+the matching modules' outputs as extra results, after the variant's own:
+
+```bash
+python -m vllm_torchtpu.experimental.export ... \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}' \
+  --debug-taps '*model.norm,mtp.fc,mtp.layers.0,mtp.pre_fc_norm_*'
+```
+
+```text
+<output-dir>/assets.extra/debug/
+  forward_debug_bucket16.mlir
+  mtp_draft_debug_bucket16.mlir
+  taps.json
+```
+
+`taps.json` lists, per function and bucket:
+
+- the module's `file_path`;
+- `num_outputs`, the serving variant's result count;
+- for each tap, its `name`, `output_index`, `shape` and `dtype`.
+
+Shapes are shard-local, as in the other modules. Tap names follow these rules:
+
+- a module returning several tensors records `name.{i}` (a decoder layer's
+  hidden states and residual are `.0` and `.1`);
+- a module called more than once (the MTP layer in the draft chain) records
+  `name#{call}` from its second call on.
+
+Each debug module takes exactly the inputs of its serving variant
+(`functions.<function>.<bucket>.inputs` in `metadata.json`), so a runtime can run
+it in place of that variant for a step and read the taps back.
+
+`assets.extra/` holds files outside the serving contract. `metadata.json` does
+not name them, so a runtime reads nothing there unless a debug mode asks for it,
+and the serving artifact is the same with or without `--debug-taps`.
