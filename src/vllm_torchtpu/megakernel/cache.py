@@ -67,9 +67,14 @@ def _resolve_pool_layout(g_or_lay: Any, ex: ExecSpec) -> pool.PoolLayout:
         return g_or_lay
     ms = resolve_model_spec(g_or_lay)
     # A geometry derived from a `ModelDef` names it (`_model_def`), so an
-    # unregistered model folder's geometry resolves too.
-    m_def = find_model(g_or_lay) or get_model(ms.name)
-    return m_def.pool_layout(ms.config, R=ex.R)
+    # unregistered model folder's geometry resolves too; a standalone
+    # `ModelSpec` with a `cache_backend` resolves directly from its backend.
+    m_def = find_model(g_or_lay) or find_model(ms.name)
+    if m_def is not None:
+        return m_def.pool_layout(ms.config, R=ex.R)
+    if ms.cache_backend is not None and ms.cache_backend.layout is not None:
+        return ms.cache_backend.layout
+    return get_model(ms.name).pool_layout(ms.config, R=ex.R)
 
 
 def default_pool_layout(g: Any, ex: ExecSpec) -> tuple[Any, ...]:
