@@ -78,32 +78,60 @@ def test_each_rank_gets_the_whole_expert_on_its_rows(group):
     assert np.linalg.norm(got - want) / np.linalg.norm(want) < tol
 
 
-@pytest.mark.parametrize(
-    "m, blocks, block_m",
-    # One tile; even row tiles; 640 rows at 512 (two 320-row tiles, a linear
-    # bucket's share); 536 rows at 512 (two 288-row tiles, 40 padded rows).
-    [(64, 16, 512), (256, 4, 128), (32, 2, 512), (640, 2, 512), (536, 2, 512)],
-)
-def test_fused_down_is_bitwise_blocked_down(m, blocks, block_m):
-    # The served shapes' structure: 128-channel blocks, rows tiled or not.
-    k, n = blocks * 128, 256
-    ks = jax.random.split(jax.random.key(1), 3)
+def _down_case(m, blocks, n=256, seed=1):
+    k = blocks * 128  # the served shapes' 128-channel blocks
+    ks = jax.random.split(jax.random.key(seed), 3)
     act = (jax.random.normal(ks[0], (m, k)) * 3).astype(jnp.bfloat16)
-    act = act.at[0].set(0)  # a zero row: scale 1, zero partials
     w2 = (jax.random.normal(ks[1], (k, n)) * 32).astype(FP8)
     s2 = jax.random.uniform(ks[2], (blocks, n), minval=0.5, maxval=1.5) / 32
-    want = jax.jit(blocked_down)(act, w2, s2)
-    got = jax.jit(
-        lambda a, w, s: blocked_down_fused(
-            a, w, s, block_m=block_m, block_n=128, interpret=True
-        )
+    return act, w2, s2
+
+
+def _unquantized(act, w2, s2):
+    """The f32 product the fp8 weights stand for."""
+    kb = w2.shape[0] // s2.shape[0]
+    w = w2.astype(jnp.float32) * jnp.repeat(s2, kb, axis=0)
+    return act.astype(jnp.float32) @ w
+
+
+def _rel(a, b):
+    a, b = np.asarray(a, np.float32), np.asarray(b, np.float32)
+    return np.linalg.norm(a - b) / np.linalg.norm(b)
+
+
+@pytest.mark.parametrize("m, blocks", [(64, 16), (256, 4)])
+def test_fused_down_is_closer_to_the_unquantized_product(m, blocks):
+    act, w2, s2 = _down_case(m, blocks)
+    exact = _unquantized(act, w2, s2)
+    got = jax.jit(lambda *a: blocked_down_fused(*a, interpret=True))(act, w2, s2)
+    xla = jax.jit(blocked_down)(act, w2, s2)
+    # Only bf16 roundings left (weights after scaling, the output) vs the
+    # fp8 rounding of every activation column in blocked_down.
+    assert _rel(got, exact) < 4e-3
+    assert _rel(got, exact) < _rel(xla, exact) / 4
+
+
+@pytest.mark.parametrize(
+    "m, block_m",
+    # Even row tiles; 640 rows at 512 (two 320-row tiles, a linear bucket's
+    # share); 536 rows at 512 (two 288-row tiles, 40 padded rows).
+    [(256, 128), (640, 512), (536, 512)],
+)
+def test_fused_down_row_tiles_do_not_change_a_row(m, block_m):
+    act, w2, s2 = _down_case(m, 2)
+    act = act.at[0].set(0)
+    one = jax.jit(
+        lambda *a: blocked_down_fused(*a, block_m=1024, block_n=128, interpret=True)
+    )(act, w2, s2)
+    tiled = jax.jit(
+        lambda *a: blocked_down_fused(*a, block_m=block_m, block_n=128, interpret=True)
     )(act, w2, s2)
     bits = jax.lax.bitcast_convert_type
-    assert np.array_equal(bits(got, jnp.uint16), bits(want, jnp.uint16))
+    assert np.array_equal(bits(tiled, jnp.uint16), bits(one, jnp.uint16))
 
 
 @pytest.mark.parametrize("group", [1, 4])
-def test_sharded_fused_down_matches_the_xla_down(group):
+def test_sharded_fused_down_is_close_to_the_xla_down(group):
     n = len(jax.devices())
     if n < 4 or n % group:
         pytest.skip("needs 4+ devices divisible by the group")
@@ -123,7 +151,5 @@ def test_sharded_fused_down_matches_the_xla_down(group):
     got = jax.jit(
         grouped_shared_expert_sharded(mesh, AX, group, fused_down=True, interpret=True)
     )(x, *stacked)
-    got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
-    # Bitwise on its own (above); here XLA:CPU may sum a dot's 128 products in
-    # another order inside the larger program, which flips a rare bf16 ulp.
-    assert np.linalg.norm(got - want) / np.linalg.norm(want) < 1e-3
+    # The two downs differ by blocked_down's fp8 rounding of the activation.
+    assert _rel(got, want) < 3e-2

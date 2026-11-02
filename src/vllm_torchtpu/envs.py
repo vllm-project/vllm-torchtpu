@@ -1186,8 +1186,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the same size at every bucket; the collectives it replaces scale with it).
     "TPU_MLA_PREFILL_ROWS_MIN_TOKENS": env_int("TPU_MLA_PREFILL_ROWS_MIN_TOKENS", 2048),
     # With TPU_MOE_PREFILL_SEQUENCE_PARALLEL: run the shared expert's
-    # block-scaled down projection as one kernel (`blocked_down_fused`), the
-    # per-block partials summed in VMEM rather than in HBM. Same values.
+    # block-scaled down projection as one kernel (`blocked_down_fused`): the
+    # weight blocks dequantized in VMEM and one dot over the unquantized
+    # activation, instead of a matmul and an HBM partial per block. Not the
+    # same values (no fp8 rounding of the activation).
     "TPU_MOE_PREFILL_SP_SHARED_FUSED_DOWN": env_bool(
         "TPU_MOE_PREFILL_SP_SHARED_FUSED_DOWN", default=False
     ),

@@ -24,8 +24,11 @@ The down projection arrives as `blocks` k-slices, each with its own
 per-channel scale (a TP shard's quantization, kept as it was); each slice is
 contracted on its own, quantizing its activation columns per row, which is
 the arithmetic of the TP shard it came from. `blocked_down` writes every
-slice's partial to HBM before summing them (one small matmul per slice);
-`blocked_down_fused` keeps the partials of an output tile in VMEM.
+slice's partial to HBM before summing them (one small matmul per slice).
+`blocked_down_fused` instead dequantizes each weight slice with its scales
+to the activation dtype in VMEM and contracts the unquantized activation
+over the whole `k` at once: no per-slice partials, and no fp8 rounding of
+the activation (so not the same values: closer to the unquantized product).
 """
 
 import functools
@@ -37,10 +40,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.quantized_matmul.util import (
-    quantize_tensor,
-    xla_quantized_matmul,
-)
+from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 
 def silu_and_mul(x: jax.Array) -> jax.Array:
@@ -60,20 +60,20 @@ def blocked_down(act: jax.Array, w2: jax.Array, s2: jax.Array) -> jax.Array:
     return out.astype(act.dtype)
 
 
-def _blocked_down_kernel(q_ref, xs_ref, w_ref, s_ref, out_ref, *, blocks, kb):
-    # blocked_down's arithmetic per block, in its order: the f32 dot scaled by
-    # the row's activation scale, then the channel's; rounded to the output
-    # dtype; summed in f32 from block 0 up.
-    acc = None
-    for b in range(blocks):
-        cols = slice(b * kb, (b + 1) * kb)
-        part = jnp.dot(
-            q_ref[:, cols], w_ref[cols, :], preferred_element_type=jnp.float32
-        )
-        part = part * xs_ref[:, b : b + 1]
-        part = part * s_ref[b : b + 1, :]
-        part = part.astype(out_ref.dtype).astype(jnp.float32)
-        acc = part if acc is None else acc + part
+def _blocked_down_kernel(act_ref, w_ref, s_ref, out_ref, *, blocks, kb):
+    # Each k-slice of the weight tile times its per-channel scales (in f32),
+    # rounded to the activation dtype; then one f32-accumulated dot over k.
+    w = jnp.concatenate(
+        [
+            (
+                w_ref[b * kb : (b + 1) * kb, :].astype(jnp.float32)
+                * s_ref[b : b + 1, :]
+            ).astype(act_ref.dtype)
+            for b in range(blocks)
+        ],
+        axis=0,
+    )
+    acc = jnp.dot(act_ref[...], w, preferred_element_type=jnp.float32)
     out_ref[...] = acc.astype(out_ref.dtype)
 
 
@@ -86,12 +86,12 @@ def blocked_down_fused(
     block_n: int = 512,
     interpret: bool = False,
 ) -> jax.Array:
-    """`blocked_down` as one kernel: the activation's k-slices are quantized
-    per row exactly as there, and each output tile (at most `block_m` rows by
-    `block_n` columns) runs all `blocks` slice matmuls and their f32 sum in
-    VMEM. Rows split into equal tiles of a multiple of 32 (fp8's sublane
-    tile), the last padded with zero rows (zero activations and scales, sliced
-    off) when `m` does not divide."""
+    """`act [m, k] @ (w2 [k, n] scaled per k-block by s2 [blocks, n])` as
+    one kernel: each output tile (at most `block_m` rows by `block_n`
+    columns) dequantizes its weight columns to `act.dtype` and runs a single
+    dot over `k`, accumulated in f32. The activation is not quantized. Rows
+    split into equal tiles of a multiple of 32, the last padded with zero rows
+    (sliced off) when `m` does not divide."""
     blocks, n = s2.shape
     m, k = act.shape
     kb = k // blocks
@@ -105,21 +105,14 @@ def blocked_down_fused(
         return jnp.zeros((0, n), act.dtype)
     tiles = pl.cdiv(m, block_m)
     tm = m if tiles == 1 else pl.cdiv(pl.cdiv(m, tiles), 32) * 32
-    parts = [
-        quantize_tensor(act[:, b * kb : (b + 1) * kb], w2.dtype) for b in range(blocks)
-    ]
-    q = jnp.concatenate([p[0] for p in parts], axis=1)
-    xs = jnp.concatenate([p[1] for p in parts], axis=1)  # [m, blocks] f32
     pad = tiles * tm - m
     if pad:
-        q = jnp.pad(q, ((0, pad), (0, 0)))
-        xs = jnp.pad(xs, ((0, pad), (0, 0)))
+        act = jnp.pad(act, ((0, pad), (0, 0)))
     out = pl.pallas_call(
         functools.partial(_blocked_down_kernel, blocks=blocks, kb=kb),
         grid=(tiles, n // tn),
         in_specs=[
             pl.BlockSpec((tm, k), lambda i, j: (i, 0)),
-            pl.BlockSpec((tm, blocks), lambda i, j: (i, 0)),
             pl.BlockSpec((k, tn), lambda i, j: (0, j)),
             pl.BlockSpec((blocks, tn), lambda i, j: (0, j)),
         ],
@@ -130,7 +123,7 @@ def blocked_down_fused(
         ),
         interpret=interpret,
         name="shared_expert_blocked_down",
-    )(q, xs, w2, s2.astype(jnp.float32))
+    )(act, w2, s2.astype(jnp.float32))
     return out[:m] if pad else out
 
 
@@ -151,7 +144,8 @@ def grouped_shared_expert(
     [2c]`, `w2 [c, H]` with `s2 [blocks, H]`. Returns `[t, H]`, the whole
     expert on the own rows. `groups` lists the members of each group in the
     order their rows are gathered. `fused_down` runs the down projection as
-    `blocked_down_fused` (same values; `interpret` runs it on the host)."""
+    `blocked_down_fused` (an unquantized activation, so not the same values;
+    `interpret` runs it on the host)."""
     if len(groups[0]) > 1:
         rows = lax.all_gather(x, axis, axis=0, tiled=True, axis_index_groups=groups)
     else:
