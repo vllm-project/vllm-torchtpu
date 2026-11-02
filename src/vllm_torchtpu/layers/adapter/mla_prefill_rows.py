@@ -160,6 +160,7 @@ def _check_layer(mla: Any) -> None:
         )
 
 
+# By gather mode only: both ops take every shape from their operands.
 _OPS: dict[str, _Rows] = {}
 
 
