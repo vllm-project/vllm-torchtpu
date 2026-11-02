@@ -11,17 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MOE_EXPERT_COUNT_TAP_DIR: per-layer routed-expert counts from a live server.
-
-Split out of #1408 (Inho Hwang), where it is the count tap behind the static
-expert placement builder; here it stands alone, for any MoE model and kernel.
+"""TPU_MOE_EXPERT_COUNT_TAP_DIR: per-layer routed-expert counts from a live server.
 
 An expert placement is only as good as the routing statistics it is built
 from, and a fused kernel selects inside its own program, so its choices never
 reach the host. With the tap on, every MoE layer, whatever its kernel, re-runs
-the same selection in the traced forward (`moe_routing.select_experts`: hash
-table or scored top-k) and accumulates, on the device, per global expert and
-per step phase:
+the same selection in the traced forward (`moe_routing.route`: simulated
+routing, the model's custom routing function, a hash table or scored top-k)
+and accumulates, on the device, per global expert and per step phase:
 
     row 0: routed pairs           sum over steps of c
     row 1: squared per-step count sum over steps of c * c
@@ -30,8 +27,8 @@ per step phase:
 where c is this rank's per-step count of valid (non-padding) tokens that
 selected the expert. Rows 0-1 give the mean and the step-to-step variance of
 each expert's load from this rank. Valid rows come from the runner's token
-padding mask, which the runner keeps whenever the tap is on; warmup steps are
-all padding, so they add nothing.
+padding mask, which the runner keeps whenever the tap is on (a forward without
+one is refused); warmup steps are all padding, so they add nothing.
 
 Phase 0 ("decode") holds the steps whose valid tokens fit a pure decode step,
 max_num_seqs * (1 + num_speculative_tokens); phase 1 ("prefill") the rest. A
@@ -39,19 +36,21 @@ decode-sized step may still carry a short prefill chunk. The phase is decided
 on the device from the valid-token count, so it adds no shape guard.
 
 The device buffers are f32 and only ever hold the steps since the last
-snapshot: every MOE_EXPERT_COUNT_TAP_EVERY steps the runner copies them to the
-host, adds them to this process's running totals and zeroes them, so no sum
-outgrows its type however long the server runs (an int32 sum of squares of a
-hot expert's count wraps within the hour at 1024-token steps). The snapshot is
-the running total, never overwritten:
+snapshot: every TPU_MOE_EXPERT_COUNT_TAP_EVERY steps with tokens the runner
+copies them to the host, adds them to this process's running totals and zeroes
+them, so no sum outgrows its type however long the server runs (an int32 sum of
+squares of a hot expert's count wraps within the hour at 1024-token steps). The
+snapshot is the running total, never overwritten:
 
-    <dir>/counts_ep<rank>_<seq>.npz
+    <dir>/counts_rank<global rank>_ep<EP rank>_<seq>.npz
         counts           [layers, 3, experts] i64, both phases summed
         counts_by_phase  [layers, 2, 3, experts] i64
         phases           ["decode", "prefill"]
         decode_max_tokens, layer_names, step, wall
 
-<rank> is the layer's EP rank. Each token is counted once over the ranks'
+The global rank keeps every process's files apart (DP ranks without expert
+parallelism share EP rank 0, and PP stages repeat EP ranks); the EP rank names
+which experts the process serves. Each token is counted once over the ranks'
 snapshots: where the MoE input is replicated over a TP group (the fused
 kernel's token replica groups), only TP rank 0 records, and where the MoE
 runner has gathered the rows over DP or PCP, each rank counts only its own.
@@ -98,6 +97,7 @@ def _fresh_state() -> dict:
         "steps": 0,
         "seq": None,
         "rank": None,
+        "global_rank": None,
         "total": None,
         "decode_max_tokens": None,
     }
@@ -107,18 +107,23 @@ _STATE = _fresh_state()
 
 
 def enabled() -> bool:
-    return bool(envs.MOE_EXPERT_COUNT_TAP_DIR)
+    return bool(envs.TPU_MOE_EXPERT_COUNT_TAP_DIR)
 
 
 def _directory() -> str:
-    # Pod specs pass env values verbatim, e.g. "$CDK_OUTPUT_DIR/moe_counts".
-    directory = os.path.expandvars(envs.MOE_EXPERT_COUNT_TAP_DIR)
+    # envs expands variables; a "$" left over names an unset one.
+    directory = envs.TPU_MOE_EXPERT_COUNT_TAP_DIR
     if "$" in directory:
         raise ValueError(
-            f"MOE_EXPERT_COUNT_TAP_DIR={envs.MOE_EXPERT_COUNT_TAP_DIR!r} references "
-            "an unset variable"
+            f"TPU_MOE_EXPERT_COUNT_TAP_DIR={directory!r} references an unset variable"
         )
     return directory
+
+
+def _global_rank() -> int:
+    import torch.distributed as dist
+
+    return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
 
 
 def _tp_rank() -> int:
@@ -156,16 +161,17 @@ def register(layer) -> None:
     if not enabled():
         return
     _directory()  # an unresolvable directory fails at load, not hours later
-    if envs.MOE_EXPERT_COUNT_TAP_EVERY <= 0:
+    if envs.TPU_MOE_EXPERT_COUNT_TAP_EVERY <= 0:
         raise ValueError(
-            "MOE_EXPERT_COUNT_TAP_EVERY must be a positive step count; got "
-            f"{envs.MOE_EXPERT_COUNT_TAP_EVERY}"
+            "TPU_MOE_EXPERT_COUNT_TAP_EVERY must be a positive step count; got "
+            f"{envs.TPU_MOE_EXPERT_COUNT_TAP_EVERY}"
         )
     if _repeats_another_rank(layer):
         return
     if _STATE["decode_max_tokens"] is None:
         _STATE["decode_max_tokens"] = _decode_max_tokens()
     _STATE["rank"] = layer.expert_map_manager.ep_rank
+    _STATE["global_rank"] = _global_rank()
     experts = layer.global_num_experts
     weight = next(layer.parameters(), None)
     device = None if weight is None else weight.device
@@ -225,11 +231,13 @@ def _counted_rows(
         )
     local = rows // shares
     padding = token_padding.local_padding_mask(local)
-    valid = (
-        torch.ones((local,), dtype=torch.bool, device=device)
-        if padding is None
-        else ~padding
-    )
+    if padding is None:
+        # Without the mask every bucket-padding row would count as a token.
+        raise RuntimeError(
+            "expert count tap: the runner keeps no token padding mask, so "
+            "padding rows cannot be told from tokens"
+        )
+    valid = ~padding
     if shares == 1:
         return valid
     dp_rank, pcp_rank = getattr(layer, RANKS_ATTR).unbind(0)
@@ -242,6 +250,7 @@ def _counted_rows(
 
 def record(
     layer,
+    hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     input_ids,
     *,
@@ -256,15 +265,8 @@ def record(
     counts = getattr(layer, COUNTS_ATTR, None)
     if counts is None:
         return
-    _, topk_ids = moe_routing.select_experts(
-        hidden_states=router_logits,
-        router_logits=router_logits,
-        topk=layer.moe_config.experts_per_token,
-        renormalize=layer.renormalize,
-        scoring_fn=layer.scoring_func,
-        layer=layer,
-        input_ids=input_ids,
-    )
+    # The quant methods' own entry point, so the counts are what they route.
+    _, topk_ids = moe_routing.route(layer, hidden_states, router_logits, input_ids)
     experts = counts.shape[-1]
     device = router_logits.device
     valid = _counted_rows(layer, router_logits.shape[0], over_dp, over_pcp, device)
@@ -289,31 +291,36 @@ def record(
     counts.copy_(counts + phase[:, None, None] * step)
 
 
-def _first_seq(directory: str, rank: int) -> int:
-    """One past the last snapshot this rank already has in `directory`."""
+def _prefix() -> str:
+    return f"counts_rank{_STATE['global_rank']}_ep{_STATE['rank']}_"
+
+
+def _first_seq(directory: str) -> int:
+    """One past the last snapshot this process already has in `directory`."""
+    prefix = _prefix()
     seqs = [
         int(m.group(1))
-        for path in glob.glob(os.path.join(directory, f"counts_ep{rank}_*.npz"))
-        if (m := re.search(rf"counts_ep{rank}_(\d+)\.npz$", path))
+        for path in glob.glob(os.path.join(directory, f"{prefix}*.npz"))
+        if (m := re.search(rf"{re.escape(prefix)}(\d+)\.npz$", path))
     ]
     if not seqs:
         return 0
     logger.warning(
-        "Expert count tap: %s already holds snapshots of EP rank %d from an "
-        "earlier run; numbering this run's after them. Their step count "
-        "starts over, which tells the runs apart.",
+        "Expert count tap: %s already holds %s* snapshots from an earlier "
+        "run; numbering this run's after them. Their step count starts over, "
+        "which tells the runs apart.",
         directory,
-        rank,
+        prefix,
     )
     return max(seqs) + 1
 
 
 def maybe_dump() -> None:
-    """Called once per runner step on the host; writes every N steps."""
+    """Called once per runner step with tokens, on the host; writes every N."""
     if not _TAPPED:
         return
     _STATE["steps"] += 1
-    if _STATE["steps"] % envs.MOE_EXPERT_COUNT_TAP_EVERY:
+    if _STATE["steps"] % envs.TPU_MOE_EXPERT_COUNT_TAP_EVERY:
         return
     import numpy as np
 
@@ -325,13 +332,13 @@ def maybe_dump() -> None:
     _STATE["total"] = interval if total is None else total + interval
     directory = _directory()
     os.makedirs(directory, exist_ok=True)
-    rank = _STATE["rank"]
     if _STATE["seq"] is None:
-        _STATE["seq"] = _first_seq(directory, rank)
-    path = os.path.join(directory, f"counts_ep{rank}_{_STATE['seq']:04d}.npz")
+        _STATE["seq"] = _first_seq(directory)
+    path = os.path.join(directory, f"{_prefix()}{_STATE['seq']:04d}.npz")
+    temporary = f"{path}.{os.getpid()}.tmp"
     by_phase = np.rint(_STATE["total"]).astype(np.int64)
     # Written aside and renamed, so a reader never opens half a snapshot.
-    with open(path + ".tmp", "wb") as f:
+    with open(temporary, "wb") as f:
         np.savez(
             f,
             counts=by_phase.sum(axis=1),
@@ -342,6 +349,6 @@ def maybe_dump() -> None:
             step=_STATE["steps"],
             wall=time.time(),
         )
-    os.replace(path + ".tmp", path)
+    os.replace(temporary, path)
     _STATE["seq"] += 1
     logger.info_once("Expert count tap writing snapshots to %s", directory)

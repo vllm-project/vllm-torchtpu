@@ -57,6 +57,8 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_FP8_LINEAR_W8A16_MAX_ROWS` | `0` | Opt-in. FP8 dense-linear steps whose padded token bucket has at most this many rows keep bf16 activations (W8A16) instead of quantizing them to FP8. Per-channel path with FP8 weights only; measured on v7x. |
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time MoE expert weight requantization (e.g., `"fp4"`). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |
+| `TPU_MOE_EXPERT_COUNT_TAP_DIR` | `""` | Directory for per-layer routed-expert count snapshots (`counts_rank<global>_ep<ep>_<seq>.npz`, decode and prefill apart). Empty disables the tap; set, it adds work to every MoE forward and keys its own compile cache, so a tapped run is a diagnostic. `$VAR`s expand. |
+| `TPU_MOE_EXPERT_COUNT_TAP_EVERY` | `1000` | Steps with tokens between expert count tap snapshots. |
 | `VLLM_TPU_MXFP4_DEVICE_DEQUANT` | `True` | Performs MXFP4 weight dequantization on TPU device during load rather than on CPU. |
 
 ---

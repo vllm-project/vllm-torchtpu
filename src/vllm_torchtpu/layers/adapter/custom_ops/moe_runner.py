@@ -183,6 +183,7 @@ class VllmMoERunner(MoERunner):
             over_dp, over_pcp = self._rows_gathered()
             expert_count_tap.record(
                 self.routed_experts,
+                hidden_states,
                 router_logits,
                 input_ids,
                 over_dp=over_dp,
