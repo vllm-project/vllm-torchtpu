@@ -12,15 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bootstrap the Buildkite CI pipeline: priority, skip checks, lanes, and upload.
+"""Bootstrap the Buildkite CI and dev pipelines, and expose the pinned vLLM ref.
 
-Structured in four layers (compatible with Python 3.10+ stdlib on `queue=cpu`):
-- `BuildContext`: reads environment variables and PR labels once.
-- Pure planning functions: priority, skip/docs-only checks, vLLM pin, and lanes.
-- `upload_with_priority`: injects priority, substitutes `NIGHTLY`, and caps PR
-  TPU concurrency via `cap_pr_tpu_concurrency` (also exposed as
-  `bootstrap.py upload <file> [priority]` for `configs/pipeline_config.sh`).
-- `BootstrapEffects`: thin boundary for `buildkite-agent`, `git`, and GitHub IO.
+CLI entry points (compatible with Python 3.10+ stdlib on `queue=cpu`):
+- `bootstrap.py`: main CI pipeline bootstrap (invoked by `bootstrap.sh`).
+- `bootstrap.py dev`: experimental dev pipeline bootstrap (`bootstrap_dev.sh`).
+- `bootstrap.py vllm-pin`: print the pinned upstream vLLM ref from `pyproject.toml`.
 """
 
 from __future__ import annotations
@@ -43,54 +40,26 @@ import cap_pr_tpu_concurrency
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parents[1]
 
+# Priority constants for pipeline jobs.
+# On-call fix > Post-merge > Pre-merge > Integration pipeline > Benchmark >
+# Other/Default > Nightly
+PRIORITY_ONCALL_FIX = 12
+PRIORITY_POST_MERGE = 11
+PRIORITY_PRE_MERGE = 6
+PRIORITY_INTEGRATION = 4
+PRIORITY_BENCHMARK = 3
+PRIORITY_DEFAULT = 2
+PRIORITY_NIGHTLY = 1
+PRIORITY_KERNEL_TUNING = -9
 
-class BootstrapError(Exception):
-    """Fatal configuration or git/pin lookup error that exits bootstrap with 1."""
-
-
-_EXPORT_INT_RE = re.compile(r"^export\s+([A-Z0-9_]+)=(-?[0-9]+)(?:\s+#.*)?$")
-_REQUIRED_CONFIG_KEYS = (
-    "PRIORITY_ONCALL_FIX",
-    "PRIORITY_POST_MERGE",
-    "PRIORITY_PRE_MERGE",
-    "PRIORITY_INTEGRATION",
-    "PRIORITY_BENCHMARK",
-    "PRIORITY_DEFAULT",
-    "PRIORITY_NIGHTLY",
-    "PRIORITY_KERNEL_TUNING",
-    "PR_TPU_JOBS_PER_AUTHOR",
-)
-
-
-def _load_pipeline_config(
-    path: pathlib.Path,
-    required: Sequence[str] = _REQUIRED_CONFIG_KEYS,
-) -> dict[str, int]:
-    """Load integer constants from `configs/pipeline_config.sh` (single source)."""
-    values: dict[str, int] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        match = _EXPORT_INT_RE.match(line.strip())
-        if match:
-            values[match.group(1)] = int(match.group(2))
-    missing = [key for key in required if key not in values]
-    if missing:
-        raise BootstrapError(
-            f"ERROR: missing constant(s) {', '.join(missing)} in {path}"
-        )
-    return values
-
-
-_PIPELINE_CONFIG = _load_pipeline_config(_SCRIPT_DIR / "configs" / "pipeline_config.sh")
-PRIORITY_ONCALL_FIX: int = _PIPELINE_CONFIG["PRIORITY_ONCALL_FIX"]
-PRIORITY_POST_MERGE: int = _PIPELINE_CONFIG["PRIORITY_POST_MERGE"]
-PRIORITY_PRE_MERGE: int = _PIPELINE_CONFIG["PRIORITY_PRE_MERGE"]
-PRIORITY_INTEGRATION: int = _PIPELINE_CONFIG["PRIORITY_INTEGRATION"]
-PRIORITY_BENCHMARK: int = _PIPELINE_CONFIG["PRIORITY_BENCHMARK"]
-PRIORITY_DEFAULT: int = _PIPELINE_CONFIG["PRIORITY_DEFAULT"]
-PRIORITY_NIGHTLY: int = _PIPELINE_CONFIG["PRIORITY_NIGHTLY"]
-PRIORITY_KERNEL_TUNING: int = _PIPELINE_CONFIG["PRIORITY_KERNEL_TUNING"]
-
-PR_TPU_JOBS_PER_AUTHOR: int = _PIPELINE_CONFIG["PR_TPU_JOBS_PER_AUTHOR"]
+# How many TPU jobs on the kube fleet one author's pull-request builds may have
+# in flight at once, waiting in Kueue or running. The rest wait in Buildkite as
+# `limited`, holding no agent pod and no place in Kueue's queue, so one author's
+# burst of PRs does not queue ahead of everyone else's. A PR build runs about
+# 19, so this is two PRs at a time; 40 capped 6 of 45 authors in the week to
+# 10-16. Nightly, post-merge and release builds are not PR builds and have no
+# cap.
+PR_TPU_JOBS_PER_AUTHOR = 40
 
 # The suite's lanes, in upload order. Lane <lane> is
 # .buildkite/pipeline_<lane>.yml; no other file is uploaded as a lane. CI_LANES
@@ -103,6 +72,7 @@ PR_TPU_JOBS_PER_AUTHOR: int = _PIPELINE_CONFIG["PR_TPU_JOBS_PER_AUTHOR"]
 ALL_LANES: tuple[str, ...] = ("verify", "perf", "integration", "tests")
 DEFAULT_LANES: tuple[str, ...] = ("verify", "integration", "tests")
 DEFAULT_INTEGRATION_SLUG = "vllm-torchtpu-integration"
+DEFAULT_DEV_PIPELINE_FILE = ".buildkite/pipeline_dev.yml"
 VLLM_UPSTREAM_REPO = "https://github.com/vllm-project/vllm.git"
 GITHUB_REPO = "vllm-project/vllm-torchtpu"
 GITHUB_API_BASE_URL = "https://api.github.com"
@@ -121,6 +91,14 @@ _MERGED_PR_RE = re.compile(r"\(#([0-9]+)\)$")
 _VLLM_PIN_RE = re.compile(
     r".*vllm @ git\+https://github\.com/vllm-project/vllm\.git@([a-zA-Z0-9.-]+).*"
 )
+_MISSING_VLLM_PIN_ERROR = (
+    "ERROR: vLLM commit hash is missing from pyproject.toml. "
+    "Cannot proceed without a pinned hash."
+)
+
+
+class BootstrapError(Exception):
+    """Fatal configuration or git/pin lookup error that exits bootstrap with 1."""
 
 
 def _env_or(env: Mapping[str, str], key: str, default: str) -> str:
@@ -246,6 +224,18 @@ class UploadPlan:
     missing_ci_lanes_error: str | None
 
 
+@dataclass(frozen=True)
+class DevBootstrapPlan:
+    """Resolved settings for the `vllm-torchtpu-dev` experimental pipeline."""
+
+    raw_job_priority: str
+    pipeline_file: str
+    branch: str
+    commit: str
+    nightly: bool
+    pr_tpu_concurrency_group: str | None
+
+
 def plan_priority(ctx: BuildContext) -> PriorityPlan:
     """Compute Buildkite job priority, Kueue class, and PR concurrency group."""
     workload_priority: str | None = None
@@ -289,9 +279,9 @@ def plan_priority(ctx: BuildContext) -> PriorityPlan:
         log_line = f"Build type: General - Priority: {priority}"
 
     # One concurrency group per author for the TPU steps of their PR builds; see
-    # PR_TPU_JOBS_PER_AUTHOR in pipeline_config.sh. Keyed on the commit author's
-    # email, which every webhook build carries: the Buildkite creator is missing
-    # whenever the GitHub account is not linked to a Buildkite user.
+    # PR_TPU_JOBS_PER_AUTHOR. Keyed on the commit author's email, which every
+    # webhook build carries: the Buildkite creator is missing whenever the GitHub
+    # account is not linked to a Buildkite user.
     if ctx.is_pr and ctx.author_email:
         concurrency_group: str | None = f"tpu-pr/{ctx.author_email.lower()}"
     elif ctx.pr_tpu_concurrency_group_env:
@@ -306,6 +296,33 @@ def plan_priority(ctx: BuildContext) -> PriorityPlan:
         pr_tpu_concurrency_group=concurrency_group,
         log_line=log_line,
     )
+
+
+def plan_dev_bootstrap(env: Mapping[str, str]) -> DevBootstrapPlan:
+    """Compute priority and target pipeline file for `vllm-torchtpu-dev`."""
+    # Dev builds are experiments — they must never outrank real CI on a shared
+    # queue. Default to PRIORITY_DEFAULT; override per build with
+    # DEV_JOB_PRIORITY if an experiment needs to jump ahead of nightlies only.
+    # No WORKLOAD_PRIORITY either: on kube an unclassed workload is ordered at 0,
+    # ahead of the nightlies and behind every other kind of build.
+    return DevBootstrapPlan(
+        raw_job_priority=_env_or(env, "DEV_JOB_PRIORITY", str(PRIORITY_DEFAULT)),
+        pipeline_file=_env_or(env, "DEV_PIPELINE_FILE", DEFAULT_DEV_PIPELINE_FILE),
+        branch=_env_or(env, "BUILDKITE_BRANCH", "unknown"),
+        commit=_env_or(env, "BUILDKITE_COMMIT", "unknown"),
+        nightly=_env_or(env, "NIGHTLY", "0") == "1",
+        pr_tpu_concurrency_group=env.get("PR_TPU_CONCURRENCY_GROUP") or None,
+    )
+
+
+def parse_dev_job_priority(raw_priority: str) -> int:
+    """Validate `DEV_JOB_PRIORITY` as an integer at upload time."""
+    try:
+        return int(raw_priority)
+    except ValueError as exc:
+        raise BootstrapError(
+            f"ERROR: invalid DEV_JOB_PRIORITY '{raw_priority}'; expected an integer."
+        ) from exc
 
 
 def has_skip_ci_marker(message: str) -> bool:
@@ -333,10 +350,17 @@ def parse_pinned_vllm_commit(pyproject_text: str) -> str:
         match = _VLLM_PIN_RE.match(line)
         if match:
             return match.group(1)
-    raise BootstrapError(
-        "ERROR: vLLM commit hash is missing from pyproject.toml. "
-        "Cannot proceed without a pinned hash."
-    )
+    raise BootstrapError(_MISSING_VLLM_PIN_ERROR)
+
+
+def read_pinned_vllm_commit(repo_root: pathlib.Path = _REPO_ROOT) -> str:
+    """Read `pyproject.toml` under `repo_root` and return the pinned vLLM ref."""
+    pyproject_path = repo_root / "pyproject.toml"
+    try:
+        pyproject_text = pyproject_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BootstrapError(f"ERROR: could not read {pyproject_path}: {exc}") from exc
+    return parse_pinned_vllm_commit(pyproject_text)
 
 
 def resolve_vllm_commit_hash(base_hash: str, override: str) -> str:
@@ -800,8 +824,7 @@ def run_bootstrap(
     if ctx.is_integration:
         base_vllm_hash = effects.vllm_upstream_head(env=child_env)
     else:
-        pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
-        base_vllm_hash = parse_pinned_vllm_commit(pyproject_text)
+        base_vllm_hash = read_pinned_vllm_commit(repo_root)
 
     vllm_commit_hash = resolve_vllm_commit_hash(
         base_vllm_hash, ctx.vllm_commit_override
@@ -887,34 +910,47 @@ def run_bootstrap(
     return 0
 
 
-def run_upload_cli(
-    yaml_file: str,
-    priority_arg: str = "",
-    *,
+def run_bootstrap_dev(
     env: Mapping[str, str] | None = None,
-    cwd: pathlib.Path | None = None,
+    *,
+    repo_root: pathlib.Path = _REPO_ROOT,
     effects: BootstrapEffects | None = None,
 ) -> int:
-    """CLI handler for `bootstrap.py upload <yaml_file> [priority]`."""
+    """Execute the `vllm-torchtpu-dev` bootstrap flow (`bootstrap_dev.sh`)."""
     child_env = dict(os.environ if env is None else env)
-    work_dir = pathlib.Path.cwd() if cwd is None else cwd
-    effects = BootstrapEffects(repo_root=work_dir) if effects is None else effects
-    priority = int(priority_arg) if priority_arg else PRIORITY_DEFAULT
-    nightly = _env_or(child_env, "NIGHTLY", "0") == "1"
-    concurrency_group = child_env.get("PR_TPU_CONCURRENCY_GROUP") or None
-    jobs_per_author = int(
-        _env_or(child_env, "PR_TPU_JOBS_PER_AUTHOR", str(PR_TPU_JOBS_PER_AUTHOR))
-    )
+    effects = BootstrapEffects(repo_root=repo_root) if effects is None else effects
+
+    vllm_commit_hash = read_pinned_vllm_commit(repo_root)
+    effects.set_metadata("VLLM_COMMIT_HASH", vllm_commit_hash, env=child_env)
+    print(f"Using vLLM commit: {vllm_commit_hash}")
+
+    dev_plan = plan_dev_bootstrap(child_env)
+    child_env["JOB_PRIORITY"] = dev_plan.raw_job_priority
+    effects.set_metadata("JOB_PRIORITY", dev_plan.raw_job_priority, env=child_env)
+    print(f"--- Dev build priority: {dev_plan.raw_job_priority}")
+
+    if not (repo_root / dev_plan.pipeline_file).is_file():
+        print(
+            f"ERROR: dev pipeline file '{dev_plan.pipeline_file}' not found on "
+            f"branch '{dev_plan.branch}' at commit {dev_plan.commit}. "
+            "Create it on your branch, or point DEV_PIPELINE_FILE at an existing "
+            "file."
+        )
+        return 1
+
+    print(f"--- :pipeline: Uploading {dev_plan.pipeline_file}")
+    job_priority = parse_dev_job_priority(dev_plan.raw_job_priority)
     upload_with_priority(
-        yaml_file,
-        repo_root=work_dir,
-        job_priority=priority,
-        nightly=nightly,
-        pr_tpu_concurrency_group=concurrency_group,
-        pr_tpu_jobs_per_author=jobs_per_author,
+        dev_plan.pipeline_file,
+        repo_root=repo_root,
+        job_priority=job_priority,
+        nightly=dev_plan.nightly,
+        pr_tpu_concurrency_group=dev_plan.pr_tpu_concurrency_group,
+        pr_tpu_jobs_per_author=PR_TPU_JOBS_PER_AUTHOR,
         env=child_env,
         effects=effects,
     )
+    print("--- Buildkite Dev Bootstrap Finished")
     return 0
 
 
@@ -928,12 +964,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     try:
         if not args:
             rc = run_bootstrap()
-        elif args[0] == "upload" and 2 <= len(args) <= 3:
-            rc = run_upload_cli(args[1], args[2] if len(args) == 3 else "")
+        elif args == ["dev"]:
+            rc = run_bootstrap_dev()
+        elif args == ["vllm-pin"]:
+            print(read_pinned_vllm_commit(_REPO_ROOT))
+            rc = 0
         else:
-            raise BootstrapError(
-                "Usage: bootstrap.py [upload <yaml_file> [job_priority]]"
-            )
+            raise BootstrapError("Usage: bootstrap.py [dev | vllm-pin]")
     except BootstrapError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)

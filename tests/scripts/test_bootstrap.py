@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for `.buildkite/scripts/bootstrap.py` and `pipeline_config.sh`."""
+"""Unit tests for `.buildkite/scripts/bootstrap.py` and its shell wrappers."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import importlib
 import json
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import sys
@@ -48,7 +49,10 @@ import yaml
 
 log_path = pathlib.Path(os.environ["TEST_UPLOAD_LOG"])
 args = sys.argv[1:]
-if args[:2] == ["pipeline", "upload"]:
+if args[:2] == ["meta-data", "set"]:
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"meta": [args[2], args[3]]}) + "\\n")
+elif args[:2] == ["pipeline", "upload"]:
     content = sys.stdin.read()
     if "--dry-run" in args:
         if os.environ.get("TEST_DRY_RUN_FAIL") == "1":
@@ -331,33 +335,64 @@ class TestBootstrapUnits(unittest.TestCase):
                 )
                 self.assertEqual(err_effects.merged_pr_labels("42", env={}), ())
 
-    def test_upload_cli_and_pipeline_config_delegation(self) -> None:
-        config_sh = _SCRIPTS_DIR / "configs" / "pipeline_config.sh"
-        names = (
-            "PRIORITY_ONCALL_FIX",
-            "PRIORITY_POST_MERGE",
-            "PRIORITY_PRE_MERGE",
-            "PRIORITY_INTEGRATION",
-            "PRIORITY_BENCHMARK",
-            "PRIORITY_DEFAULT",
-            "PRIORITY_NIGHTLY",
-            "PRIORITY_KERNEL_TUNING",
-            "PR_TPU_JOBS_PER_AUTHOR",
+    def test_dev_mode_vllm_pin_and_shell_wrappers(self) -> None:
+        bp = self.bp
+        dev_default = bp.plan_dev_bootstrap({})
+        self.assertEqual(dev_default.raw_job_priority, str(bp.PRIORITY_DEFAULT))
+        self.assertEqual(dev_default.pipeline_file, ".buildkite/pipeline_dev.yml")
+        self.assertEqual(dev_default.branch, "unknown")
+        self.assertEqual(dev_default.commit, "unknown")
+
+        dev_custom = bp.plan_dev_bootstrap(
+            {
+                "DEV_JOB_PRIORITY": "4",
+                "DEV_PIPELINE_FILE": ".buildkite/exp.yml",
+                "BUILDKITE_BRANCH": "exp/test",
+                "BUILDKITE_COMMIT": "abc1234",
+                "NIGHTLY": "1",
+            }
         )
-        prints = "; ".join(f'printf "%s=%s\\n" {n} "${n}"' for n in names)
-        proc = subprocess.run(
-            ["bash", "-c", f'source "{config_sh}" && {prints}'],
+        self.assertEqual(bp.parse_dev_job_priority(dev_custom.raw_job_priority), 4)
+        self.assertEqual(dev_custom.pipeline_file, ".buildkite/exp.yml")
+        self.assertTrue(dev_custom.nightly)
+        with self.assertRaises(bp.BootstrapError):
+            bp.parse_dev_job_priority("not-an-int")
+
+        # `bootstrap.py vllm-pin` prints the pin and reports missing/read errors.
+        good_cli = subprocess.run(
+            [sys.executable, str(_SCRIPTS_DIR / "bootstrap.py"), "vllm-pin"],
             capture_output=True,
             text=True,
             check=True,
         )
-        shell_vals = {
-            k: int(v)
-            for k, v in (line.split("=", 1) for line in proc.stdout.splitlines())
-        }
-        self.assertEqual({name: getattr(self.bp, name) for name in names}, shell_vals)
+        self.assertEqual(
+            good_cli.stdout.strip(), bp.read_pinned_vllm_commit(_REPO_ROOT)
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
+            tmp_repo = pathlib.Path(tmp) / "repo"
+            shutil.copytree(_SCRIPTS_DIR, tmp_repo / ".buildkite" / "scripts")
+            with self.assertRaisesRegex(bp.BootstrapError, "No such file"):
+                bp.read_pinned_vllm_commit(tmp_repo)
+            (tmp_repo / "pyproject.toml").write_text(
+                "[project]\nname = 'empty'\n", encoding="utf-8"
+            )
+            bad_cli = subprocess.run(
+                [
+                    sys.executable,
+                    str(tmp_repo / ".buildkite" / "scripts" / "bootstrap.py"),
+                    "vllm-pin",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(bad_cli.returncode, 1)
+            self.assertIn(
+                "ERROR: vLLM commit hash is missing from pyproject.toml.",
+                bad_cli.stderr,
+            )
+
             tmp_path = pathlib.Path(tmp)
             bin_dir = tmp_path / "bin"
             bin_dir.mkdir()
@@ -381,54 +416,65 @@ class TestBootstrapUnits(unittest.TestCase):
                 "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
                 "HOME": str(tmp_path),
                 "TEST_UPLOAD_LOG": str(log_path),
+                "DEV_PIPELINE_FILE": str(sample_yaml),
                 "NIGHTLY": "1",
                 "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/dev@example.com",
             }
-            # Shell `upload_with_priority` delegates to `bootstrap.py upload` and
-            # flushes the `---` group header before child output over a pipe.
+            # 1. `bootstrap.sh` wrapper execs `bootstrap.py`.
+            ci_proc = subprocess.run(
+                ["bash", str(_SCRIPTS_DIR / "bootstrap.sh")],
+                cwd=_REPO_ROOT,
+                env={**env, "BUILDKITE_MESSAGE": "chore [skip ci]"},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("Commit message contains [skip ci].", ci_proc.stdout)
+
+            # 2. `bootstrap_dev.sh` capped upload with unbuffered `---` headers.
             capped = subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    f'source "{config_sh}" && upload_with_priority "{sample_yaml}"',
-                ],
-                cwd=tmp_path,
-                env=env,
+                ["bash", str(_SCRIPTS_DIR / "bootstrap_dev.sh")],
+                cwd=_REPO_ROOT,
+                env={**env, "DEV_JOB_PRIORITY": "3"},
                 capture_output=True,
                 text=True,
                 check=True,
             )
-            self.assertEqual(
-                capped.stdout.splitlines(),
-                [
-                    f"--- :pipeline: Uploading {sample_yaml} with priority 2",
-                    "agent: pipeline upload",
-                ],
-            )
+            lines = capped.stdout.splitlines()
+            hdr = lines.index(f"--- :pipeline: Uploading {sample_yaml} with priority 3")
+            self.assertEqual(lines[hdr + 1], "agent: pipeline upload")
+            self.assertEqual(lines[-1], "--- Buildkite Dev Bootstrap Finished")
 
-            # Dry-run failure warns on stderr and uploads uncapped with priority.
-            uncapped = subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    f'source "{config_sh}" && upload_with_priority "{sample_yaml}" 9',
-                ],
-                cwd=tmp_path,
-                env={**env, "TEST_DRY_RUN_FAIL": "1"},
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            self.assertIn("WARNING: could not put", uncapped.stderr)
+            # 3. Dry-run exit!=0 and malformed/non-dict JSON warn and upload uncapped.
+            for extra_env in (
+                {"TEST_DRY_RUN_FAIL": "1"},
+                {"TEST_DRY_RUN_RAW": "{not-json"},
+                {"TEST_DRY_RUN_RAW": "[1, 2]"},
+                {
+                    "TEST_DRY_RUN_RAW": (
+                        '{"steps": [{"agents": {"queue": "kube"}, "env": ["bad"]}]}'
+                    )
+                },
+            ):
+                uncapped = subprocess.run(
+                    ["bash", str(_SCRIPTS_DIR / "bootstrap_dev.sh")],
+                    cwd=_REPO_ROOT,
+                    env={**env, "DEV_JOB_PRIORITY": "9", **extra_env},
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("WARNING: could not put", uncapped.stderr)
 
-            uploads = [
+            events = [
                 json.loads(line)
                 for line in log_path.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(uploads), 2)
+            uploads = [e for e in events if "args" in e]
+            self.assertEqual(len(uploads), 5)
             self.assertEqual(uploads[0]["args"], ["--no-interpolation"])
             parsed = json.loads(uploads[0]["content"])
-            self.assertEqual(parsed["priority"], 2)
+            self.assertEqual(parsed["priority"], 3)
             self.assertEqual(parsed["steps"][0]["if"], '"1" == "1"')
             self.assertEqual(
                 parsed["steps"][0]["concurrency_group"], "tpu-pr/dev@example.com"
@@ -436,36 +482,44 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertEqual(uploads[1]["args"], [])
             self.assertTrue(uploads[1]["content"].startswith("priority: 9\n"))
 
-            # Non-dict / malformed dry-run JSON also warns and falls back uncapped.
-            for raw_bad in (
-                "{not-json",
-                "[1, 2]",
-                '{"steps": [{"agents": {"queue": "kube"}, "env": ["bad"]}]}',
-            ):
-                cmd = f'source "{config_sh}" && upload_with_priority "{sample_yaml}" 7'
-                bad_run = subprocess.run(
-                    ["bash", "-c", cmd],
-                    cwd=tmp_path,
-                    env={**env, "TEST_DRY_RUN_RAW": raw_bad},
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                self.assertIn("WARNING: could not put", bad_run.stderr)
+            # 4. Invalid DEV_JOB_PRIORITY sets metadata first (parity), then fails.
+            log_path.unlink()
+            bad_prio = subprocess.run(
+                ["bash", str(_SCRIPTS_DIR / "bootstrap_dev.sh")],
+                cwd=_REPO_ROOT,
+                env={**env, "DEV_JOB_PRIORITY": "not-an-int"},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(bad_prio.returncode, 1)
+            self.assertIn("invalid DEV_JOB_PRIORITY 'not-an-int'", bad_prio.stderr)
+            bad_events = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertIn({"meta": ["JOB_PRIORITY", "not-an-int"]}, bad_events)
 
-            # _load_pipeline_config tolerates trailing comments and names missing keys.
-            cfg_file = tmp_path / "pipeline_config.sh"
-            cfg_file.write_text(
-                "export PRIORITY_DEFAULT=2  # inline note\n", encoding="utf-8"
+            # 5. Missing DEV_PIPELINE_FILE exits 1 with branch/commit message.
+            missing = subprocess.run(
+                ["bash", str(_SCRIPTS_DIR / "bootstrap_dev.sh")],
+                cwd=_REPO_ROOT,
+                env={
+                    **env,
+                    "DEV_PIPELINE_FILE": ".buildkite/missing_dev.yml",
+                    "BUILDKITE_BRANCH": "exp/missing",
+                    "BUILDKITE_COMMIT": "deadbeef",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
             )
-            self.assertEqual(
-                self.bp._load_pipeline_config(cfg_file, required=("PRIORITY_DEFAULT",)),
-                {"PRIORITY_DEFAULT": 2},
+            self.assertEqual(missing.returncode, 1)
+            self.assertIn(
+                "dev pipeline file '.buildkite/missing_dev.yml' not found on "
+                "branch 'exp/missing' at commit deadbeef.",
+                missing.stdout,
             )
-            with self.assertRaisesRegex(self.bp.BootstrapError, "PRIORITY_NIGHTLY"):
-                self.bp._load_pipeline_config(
-                    cfg_file, required=("PRIORITY_DEFAULT", "PRIORITY_NIGHTLY")
-                )
 
     def test_run_bootstrap_orchestration(self) -> None:
         import yaml  # pyrefly: ignore[missing-import]
