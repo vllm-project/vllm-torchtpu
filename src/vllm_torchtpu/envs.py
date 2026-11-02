@@ -142,7 +142,7 @@ if TYPE_CHECKING:
     K3_AGGREGATE_EP16: bool = False
     K3_FP8_WIRES: str = ""
     K3_HOT_PLAN: str = ""
-    K3_MAX_PREFILL_STEP_TOKENS: int = 8192
+    K3_MAX_PREFILL_STEP_TOKENS: int = 16384
     K3_PREFILL_EXPERT_PLAN: str = ""
     K3_PREFILL_PREFIX_FP8: bool = True
     K3_PREFILL_ROUTE_COUNTS: bool = False
@@ -870,7 +870,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "K3_AGGREGATE_EP16": env_bool("K3_AGGREGATE_EP16", default=False),
     "K3_FP8_WIRES": env_str("K3_FP8_WIRES", ""),
     "K3_HOT_PLAN": env_str("K3_HOT_PLAN", ""),
-    "K3_MAX_PREFILL_STEP_TOKENS": env_int("K3_MAX_PREFILL_STEP_TOKENS", 8192),
+    "K3_MAX_PREFILL_STEP_TOKENS": env_int("K3_MAX_PREFILL_STEP_TOKENS", 16384),
     "K3_PREFILL_EXPERT_PLAN": env_str("K3_PREFILL_EXPERT_PLAN", ""),
     "K3_PREFILL_PREFIX_FP8": env_bool("K3_PREFILL_PREFIX_FP8", default=True),
     "K3_PREFILL_ROUTE_COUNTS": env_bool("K3_PREFILL_ROUTE_COUNTS", default=False),
