@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from collections.abc import Callable
-from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -69,30 +68,17 @@ def trim_to(num_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
     return tuple(a[:num_tokens] for a in arrays)
 
 
-def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """3-chunk bf16 split of fn (8 mantissa bits each = f32's 24).
+def stack_fn3(fn: jax.Array) -> jax.Array:
+    """3-chunk bf16 split of fn (8 mantissa bits each = f32's 24), chunks
+    stacked along the output dim: (3 * N, K), hi rows first, then mid, lo.
 
-    Computed in XLA outside the kernel; the chunks are what stays
+    Computed in XLA outside the kernel; the stack is what stays
     VMEM-resident. Chunks MUST be built with reduce_precision, not dtype
     round-trips: XLA's excess-precision simplification folds
     f32->bf16->f32 into the identity, which silently zeroes the mid/lo
-    chunks.
-    """
-    fn_hi = jax.lax.reduce_precision(fn, 8, 7)
-    rem = fn - fn_hi
-    fn_mid = jax.lax.reduce_precision(rem, 8, 7)
-    fn_lo = jax.lax.reduce_precision(rem - fn_mid, 8, 7)
-    return cast(
-        tuple[jax.Array, jax.Array, jax.Array],
-        tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo)),
-    )
-
-
-def stack_fn3(fn: jax.Array) -> jax.Array:
-    """``split_fn3``'s chunks stacked along the output dim: (3 * N, K).
-
-    Built elementwise over three row-stacked copies of fn rather than as a
-    concatenation of the chunks, which XLA leaves as a second fusion.
+    chunks. Built elementwise over three row-stacked copies of fn rather
+    than as a concatenation of the chunks, which XLA leaves as a second
+    fusion.
     """
     n = fn.shape[0]
     x = jnp.tile(fn, (3, 1))

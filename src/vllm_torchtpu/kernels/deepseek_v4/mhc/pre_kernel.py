@@ -24,35 +24,21 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
 
-def _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref):
-    """3-pass exact GEMM: x is bf16 (its low chunks are zero), so three
-    bf16 passes against the resident fn chunks reproduce HIGHEST. The
-    dimension numbers contract x dim 1 with fn dim 1 (i.e. x @ fn.T) so
-    fn needs no transpose on the host side."""
-    dn = (((1,), (1,)), ((), ()))
-    acc = jax.lax.dot_general(x, fn_hi_ref[...], dn, preferred_element_type=jnp.float32)
-    acc = acc + jax.lax.dot_general(
-        x, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
-    )
-    acc = acc + jax.lax.dot_general(
-        x, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
-    )
-    return acc
+def _mixes_kernel(x_ref, fn_ref, mixes_ref, sqrsum_ref):
+    """One token block: exact GEMM against the resident stacked fn chunks.
 
-
-def _mixes_kernel(x_ref, fn_hi_ref, fn_mid_ref, fn_lo_ref, mixes_ref, sqrsum_ref):
-    """One token block: 3-pass exact GEMM against resident fn chunks."""
+    x is bf16 (its low chunks are zero), so its products with fn's three
+    bf16 chunks reproduce HIGHEST.
+    """
     x = x_ref[...]
-    mixes_ref[...] = _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref)
+    mixes_ref[...] = utils.dot_fn_chunks(x, fn_ref[...], mixes_ref.shape[1])
     xf = x.astype(jnp.float32)  # f32 needed only for the squared sum
     sqrsum_ref[...] = jnp.sum(xf * xf, axis=-1, keepdims=True)
 
 
 def _mixes_collapse_kernel(
     x_ref,
-    fn_hi_ref,
-    fn_mid_ref,
-    fn_lo_ref,
+    fn_ref,
     sc_ref,
     hb_ref,
     mixes_ref,
@@ -73,7 +59,7 @@ def _mixes_collapse_kernel(
     """
     m, h = hc_mult, hidden_size
     x = x_ref[...]
-    acc = _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref)
+    acc = utils.dot_fn_chunks(x, fn_ref[...], mixes_ref.shape[1])
     mixes_ref[...] = acc
     xf = x.astype(jnp.float32)
     sqr = jnp.sum(xf * xf, axis=-1, keepdims=True)
@@ -130,7 +116,7 @@ def mhc_pre_mixes(
     # off below.
     (x2d,) = utils.pad_to(padded_tokens, x2d)
 
-    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
+    fn_chunks = utils.stack_fn3(fn)
 
     compiler_params = pltpu.CompilerParams(
         dimension_semantics=("parallel",),
@@ -138,14 +124,12 @@ def mhc_pre_mixes(
         disable_bounds_checks=True,
     )
 
-    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
+    resident = pl.BlockSpec(fn_chunks.shape, lambda i: (0, 0))
     mixes, sqrsum = pl.pallas_call(
         _mixes_kernel,
         grid=(padded_tokens // tb,),
         in_specs=[
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
-            resident,
-            resident,
             resident,
         ],
         out_specs=[
@@ -157,7 +141,7 @@ def mhc_pre_mixes(
             jax.ShapeDtypeStruct((padded_tokens, 1), jnp.float32),
         ],
         compiler_params=compiler_params,
-    )(x2d, fn_hi, fn_mid, fn_lo)
+    )(x2d, fn_chunks)
 
     return cast(tuple[jax.Array, jax.Array], utils.trim_to(num_tokens, mixes, sqrsum))
 
@@ -191,7 +175,7 @@ def mhc_pre_mixes_collapse(
     hc_mult = next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
     hidden_size = hc_hidden // hc_mult
 
-    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
+    fn_chunks = utils.stack_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
@@ -220,7 +204,7 @@ def mhc_pre_mixes_collapse(
         disable_bounds_checks=True,
     )
 
-    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
+    resident = pl.BlockSpec(fn_chunks.shape, lambda i: (0, 0))
     mixes, sqrsum, layer2d = pl.pallas_call(
         functools.partial(
             _mixes_collapse_kernel,
@@ -232,8 +216,6 @@ def mhc_pre_mixes_collapse(
         grid=(padded_tokens // tb,),
         in_specs=[
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
-            resident,
-            resident,
             resident,
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
@@ -249,7 +231,7 @@ def mhc_pre_mixes_collapse(
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
         ],
         compiler_params=compiler_params,
-    )(x2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
+    )(x2d, fn_chunks, sc2d, hb2d)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array],
