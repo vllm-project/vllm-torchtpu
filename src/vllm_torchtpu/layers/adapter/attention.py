@@ -556,7 +556,7 @@ def _pallas_rpa_kernel_batched(
     decode_query_size: int = 1,
     block_major: bool = False,
     skip_empty_launch: bool = False,
-    sliding_decode_max_bkv: int | None = None,
+    cap_sliding_decode_block: bool = False,
     sliding_prefill_max_bkv: int | None = None,
     fp8_compute: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
@@ -567,8 +567,8 @@ def _pallas_rpa_kernel_batched(
         rpa_kwargs["decode_query_size"] = decode_query_size
     if skip_empty_launch:
         rpa_kwargs["skip_empty_launch"] = True
-    if sliding_decode_max_bkv is not None:
-        rpa_kwargs["sliding_decode_max_bkv"] = sliding_decode_max_bkv
+    if cap_sliding_decode_block:
+        rpa_kwargs["cap_sliding_decode_block"] = True
     if sliding_prefill_max_bkv is not None:
         rpa_kwargs["sliding_prefill_max_bkv"] = sliding_prefill_max_bkv
     if fp8_compute:
@@ -1099,17 +1099,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if "skip_empty_launch" in entry_params and envs.TPU_RPA_SKIP_EMPTY_LAUNCH:
                 logger.info_once("Batched RPA skips launches with an empty segment.")
                 entry_kwargs["skip_empty_launch"] = True
-            max_bkv = envs.TPU_RPA_SLIDING_DECODE_MAX_BKV
             if (
-                "sliding_decode_max_bkv" in entry_params
-                and max_bkv
+                "cap_sliding_decode_block" in entry_params
+                and envs.TPU_RPA_CAP_SLIDING_DECODE_BLOCK
                 and self.sliding_window is not None
             ):
                 logger.info_once(
-                    "Batched RPA sliding-window decode KV blocks of at most %d tokens.",
-                    max_bkv,
+                    "Batched RPA caps sliding-window decode KV blocks at half "
+                    "the window."
                 )
-                entry_kwargs["sliding_decode_max_bkv"] = max_bkv
+                entry_kwargs["cap_sliding_decode_block"] = True
             max_prefill_bkv = envs.TPU_RPA_SLIDING_PREFILL_MAX_BKV
             if (
                 "sliding_prefill_max_bkv" in entry_params

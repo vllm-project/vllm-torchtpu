@@ -21,6 +21,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
 | `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
 | `TPU_LIBRARY_PATH` | `None` | `libtpu.so` loaded by the TPU runtime. `import libtpu` sets it to the pip package's own library. A custom path (any other file) takes precedence over an installed `libtpu` package: a fingerprint of that file replaces the package version in the compile and Raiden layout cache keys, and the minimum libtpu version check is skipped. |
+| `TPU_NORM_WEIGHTS_FP32` | `True` | Stores learned RMSNorm weights in float32 at load, removing a per-norm weight convert from every step. Outputs are unchanged where every norm goes through the TPU `rms_norm` providers (verified on Gemma4); code that reads norm weights directly sees float32. |
 
 ---
 
@@ -64,6 +65,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_GEMMA4_SP_MICROBATCHES` | `1` | With `TPU_GEMMA4_SEQUENCE_PARALLEL`: run a large bucket as this many contiguous token chunks, one dataflow each outside attention, so one chunk's collectives can overlap another's projections. Applied only while every chunk keeps >= 1 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
+| `TPU_GEMMA4_TOPK_SOFTMAX_ROUTING` | `True` | Gemma4 MoE routing as a softmax over the top-k router logits, with `per_expert_scale` selected without a gather, instead of upstream's full softmax, one-hot renormalization and two gathers. Same top-k ids; weights match to float32 rounding for float32 logits. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
 | `QUANTIZE_ON_LOAD_PREFIXES` | `[]` | Comma-separated dot-bounded module prefix names to quantize to FP8 on load (e.g., `"self_attn,shared_experts,layers.0.mlp"`), including `VocabParallelEmbedding` and `ParallelLMHead`. |
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |
@@ -80,6 +82,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
+| `TPU_FP8_ATTENTION` | `True` | Batched RPA (`--attention-backend CUSTOM`) runs the mixed (prefill) kernel's QK^T and PV as fp8 x fp8 matmuls on layers with an e4m3 KV cache and a multiple of 4 query heads per KV head (Gemma4's full-attention layers): queries are cast to the KV dtype at scale 1.0 and the softmax probabilities are cast as well. The decode kernel is unchanged. Changes numerics (tolerance level). |
+| `TPU_RPA_SLIDING_PREFILL_MAX_BKV` | `0` | Opt-in. Largest batched-RPA mixed-kernel KV and query block (tokens) on sliding-window layers, rounded down to the block stride and no smaller than the default minimum block. The VMEM-filling default (1024 tokens on Gemma4-31B at TP8, 1536 on Gemma4-26B) computes 2-4x the window per query. 0 keeps the default. Changes the online-softmax block order. |
 | `VLLM_TPU_BLOCK_MAJOR_KV` | `False` | Selects the block-major KV cache memory layout for Ragged Paged Attention. |
 | `TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL` | `None` | Enables the unified KV cache block pool across hybrid attention layers (e.g., GDN + Full Attention or MLA). |
 | `TPU_SKIP_MAMBA_SCHEDULER_BLOCKS` | `True` | On the compact-mamba layout (`TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0`) with prefix caching off, GDN layers take no blocks from the attention pool: the runner keeps their state in its own per-request slots. Applies only to GDN layers without speculative decoding or a KV connector; elsewhere it has no effect. Set `0` to restore vLLM's stock accounting (one block per GDN group per request) for debugging. |
@@ -89,6 +93,9 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `TPU_RPA_SKIP_EMPTY_LAUNCH` | `True` | Batched RPA (`--attention-backend CUSTOM`) does no work for a decode or mixed kernel whose batch segment is empty: the kernel returns at entry, its schedule writes only the step count, and on buckets of at most `max_num_seqs` (times the decode query size) tokens an XLA conditional skips the launch. Outputs are unchanged. |
+| `TPU_RPA_CAP_SLIDING_DECODE_BLOCK` | `True` | Caps the batched-RPA decode KV block of sliding-window layers at half the window (rounded down to the block stride) instead of filling VMEM (1792 tokens for Gemma4's 1024-token window), so decode launches zero-fill and compute less. Changes the online-softmax block order. |
+| `TPU_REUSE_STAGED_BLOCK_TABLES` | `True` | Reuses the previous step's staged device block tables when every staged row is unchanged (most decode steps), skipping the host-side pack, upload and split. Not applied to dummy runs or mamba groups. |
 
 ---
 
