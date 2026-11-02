@@ -125,11 +125,12 @@ def pack_spec_logical_weights(
                     if l_key not in logical_weights:
                         raise ValueError(f"Missing {l_key!r} for {sm_field!r}")
                     arr = logical_weights[l_key]
-                    set_sm(
-                        sm_field,
-                        arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx],
-                        lyr=lyr,
+                    sl_l = (
+                        (arr[lyr] if arr.shape[0] == L else arr[ord_idx])
+                        if arr.ndim == 2
+                        else (arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx])
                     )
+                    set_sm(sm_field, sl_l, lyr=lyr)
                     populated_sm.add(sm_field)
 
     for mod in ms.all_modules():
