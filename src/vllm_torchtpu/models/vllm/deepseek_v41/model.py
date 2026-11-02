@@ -15,6 +15,7 @@
 
 import copy
 import dataclasses
+import os
 import re
 import typing
 from collections.abc import Callable, Iterable
@@ -1424,6 +1425,10 @@ class DeepseekV41Model(nn.Module):
             if (
                 not self._ced_enabled or envs.VLLM_DSV41_HYBRID_CED_DECODE
             ) and not envs.VLLM_DSV41_PURE_20L_PREFILL:
+                if os.environ.get("TPU_RAIDEN_DSV4_MAX_TRANSFER_LAYER", "").strip() == str(ced_boundary):
+                    for lid in range(ced_boundary, self.end_layer):
+                        self.layers[lid].attn._ced_decoder = True
+                        self.layers[lid].attn._supports_ced_decoder = True
                 self.full_stage = DeepseekV41FullStage(
                     vllm_config=vllm_config,
                     prefix=prefix,

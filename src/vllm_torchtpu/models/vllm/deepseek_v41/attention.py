@@ -129,6 +129,9 @@ _TOKEN_SHARD_MIN_TOKENS: int = int(envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS)
 # wo_a+wo_b, alias-aware main-cache dummy, ...) is gated on it; when 0 the
 # code reproduces the deployed decode stack exactly.
 _PREFILL_ROLE: bool = bool(envs.VLLM_DSV41_PURE_20L_PREFILL)
+_COMPACT_SWA_LAYOUT: bool = bool(
+    _PREFILL_ROLE and not envs.TPU_RAIDEN_DSV4_ADMISSION
+)
 VllmDeepseekV4SWACache = _dsv4_attn_op.VllmDeepseekV4SWACache
 _attention_csa = _deepseek_v41_flash_attn_op._attention_csa
 _attention_swa = _deepseek_v41_flash_attn_op._attention_swa
@@ -684,7 +687,7 @@ class VllmDeepseekV41MLAAttention(
         array, where following the leader group's table is self-consistent,
         so the prefill role keeps cd4eedb's group-agnostic sharing.
         """
-        if _PREFILL_ROLE:
+        if _COMPACT_SWA_LAYOUT:
             return None
         swa_layer = getattr(self, "swa_cache_layer", None)
         return getattr(swa_layer, "_dsv41_kv_cache_group_id", None)
@@ -695,7 +698,7 @@ class VllmDeepseekV41MLAAttention(
         cache_attr = (
             "_cached_swa_group_bounds_ced" if eff_ced else "_cached_swa_group_bounds"
         )
-        if not _PREFILL_ROLE:
+        if not _COMPACT_SWA_LAYOUT:
             # The group id is only known after KV-cache init; key the memo on
             # it so bounds computed earlier (profiling) are not reused.
             cache_attr += f"_g{my_group}"
@@ -723,7 +726,7 @@ class VllmDeepseekV41MLAAttention(
             if (
                 (mod.compress_ratio > 0) == is_csa
                 and mod.window_size == self.window_size
-                and (_PREFILL_ROLE or mod._swa_kv_cache_group_id() == my_group)
+                and (_COMPACT_SWA_LAYOUT or mod._swa_kv_cache_group_id() == my_group)
             ):
                 lid = extract_layer_index(mod.prefix)
                 if eff_ced and lid < ced_boundary:
@@ -814,7 +817,7 @@ class VllmDeepseekV41MLAAttention(
         if cache_dict is None or my_lid == extract_layer_index(first_leader.prefix):
             cache_dict = {}
             first_leader._step_swa_win_metadata_by_pages = cache_dict
-        page_key = sw_cache_num_pages if _PREFILL_ROLE else 0
+        page_key = sw_cache_num_pages if _COMPACT_SWA_LAYOUT else 0
         cached = cache_dict.get(page_key)
         if cached is None:
             mapped = self._get_swa_metadata_op(
@@ -935,12 +938,16 @@ class VllmDeepseekV41MLAAttention(
         swa_tensor = self._as_kernel_cache_view(
             _live_cache(getattr(self.swa_cache_layer, "kv_cache", None))
         )
-        num_pages = int(swa_tensor.shape[0]) if swa_tensor is not None else 0
+        page_key = (
+            (int(swa_tensor.shape[0]), int(swa_tensor.shape[1]))
+            if swa_tensor is not None
+            else (0, 0)
+        )
         cache_dict = getattr(first_leader, "_step_tp_swa_metadata_by_pages", None)
         if cache_dict is None or my_lid == extract_layer_index(first_leader.prefix):
             cache_dict = {}
             first_leader._step_tp_swa_metadata_by_pages = cache_dict
-        cached = cache_dict.get(num_pages)
+        cached = cache_dict.get(page_key)
         if cached is None:
             meta = self._get_tp_swa_step_metadata_op()(
                 kv,
@@ -951,7 +958,7 @@ class VllmDeepseekV41MLAAttention(
                 self._tp_attn_rank_i32,
             )
             if last_lid > my_lid:
-                cache_dict[num_pages] = meta
+                cache_dict[page_key] = meta
             return meta
         if my_lid == last_lid:
             first_leader._step_tp_swa_metadata_by_pages = None

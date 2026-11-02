@@ -22,6 +22,7 @@ import asyncio
 import copy
 import json
 import lzma
+import os
 from pathlib import Path
 import statistics
 import time
@@ -212,7 +213,11 @@ def build_trunk_chat_payload(
   max_eff = 0.985 if cache_hit_ratio >= 0.90 else 0.92
   eff_ratio = min(max_eff, (eff_target_tok * cache_hit_ratio + quant_offset) / max(1, eff_target_tok))
   prefix_budget = int(total_chars * eff_ratio)
-  suffix_budget = max(256, total_chars - prefix_budget)
+  suffix_budget = (
+      256
+      if (is_warmup and os.environ.get("COMPACT_WARMUP_SUFFIX", "0") == "1")
+      else max(256, total_chars - prefix_budget)
+  )
 
   trunk_tag = f"[trunk_key={trunk_namespace}_k{trunk_id:04d}_b{bucket_idx}_dp{dp_rank:02d}] "
   raw_tools = copy.deepcopy(orig_req.get("tools") or [])

@@ -2,12 +2,12 @@
 
 Self-contained runbook to reproduce the **Prefill-Only**, **Decode-Only**, and **1P1D Disaggregated** benchmarks and accuracy gates for **DeepSeek-V4.1-Flash** on `tpu7x-8` (`2x2x1` = 4 physical TPU7x chips / 8 TensorCores per node) from a single unified branch.
 
-* **Unified `vllm-torchtpu` Branch**: `cpk/dsv41-combined` (commit `ea0984d1f` / code commit `13e0b9cd0`)
+* **Unified `vllm-torchtpu` Branch**: `cpk/dsv41-combined`
   * **GitHub Branch**: https://github.com/vllm-project/vllm-torchtpu/tree/cpk/dsv41-combined
   * **Bundled Harness Path in Repo**: [`benchmarks/dsv41_tpu7x/`](https://github.com/vllm-project/vllm-torchtpu/tree/cpk/dsv41-combined/benchmarks/dsv41_tpu7x)
-* **GCS Archive (Bundles, Tarballs, Wheels, Patches & Verified Run Logs)**:
+* **GCS Archives (Bundles, Tarballs, Wheels, Patches & Verified Run Logs)**:
   * **Browser URL**: https://console.cloud.google.com/storage/browser/chaitanyapk-data/dsv4.1_opt/dsv4.1
-  * **GCS URI**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/`
+  * **GCS URI**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/` & `gs://chaitanyapk-data/atlas/dsv4.1_vllm_torchtpu/phase2_4xtp2_1p1d_20261030/`
 * **Model Checkpoint (`48` shards, `~476 GiB`)**: `gs://rsinghc-storage/DeepSeek-V4.1-Flash/`
 
 ---
@@ -40,13 +40,13 @@ gcloud storage cp "gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/whls/*.whl" whls/
 
 # 3. Restore the unified vllm-torchtpu and vllm worktrees from GCS git bundles
 mkdir -p repos
-gcloud storage cp gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-torchtpu-combined-ea0984d1f.bundle repos/
+gcloud storage cp gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-torchtpu-combined-latest.bundle repos/
 gcloud storage cp gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-prefill-a8cb9ec41.bundle repos/
-gcloud storage cp gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-decode-afbcce3152.bundle repos/
+gcloud storage cp gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-decode-51e61e3bf0.bundle repos/
 
-git clone -b cpk/dsv41-combined repos/vllm-torchtpu-combined-ea0984d1f.bundle repos/vtt-combined
+git clone -b cpk/dsv41-combined repos/vllm-torchtpu-combined-latest.bundle repos/vtt-combined
 git clone -b dsv41-vllm-prefill repos/vllm-prefill-a8cb9ec41.bundle repos/vllm-prefill
-git clone -b cpk/dsv41-vllm-decode repos/vllm-decode-afbcce3152.bundle repos/vllm-decode
+git clone -b cpk/dsv41-vllm-decode repos/vllm-decode-51e61e3bf0.bundle repos/vllm-decode
 ```
 
 ### 1.3 Option B — Clone Directly from GitHub (`cpk/dsv41-combined`)
@@ -58,13 +58,14 @@ mkdir -p ~/dsv41_repro/repos && cd ~/dsv41_repro
 git clone -b cpk/dsv41-combined https://github.com/vllm-project/vllm-torchtpu.git repos/vtt-combined
 cp -r repos/vtt-combined/benchmarks/dsv41_tpu7x/* .
 
-# Build the patched vllm trees from upstream f9ad9dd6b495 + patches/0001..0003
+# Build the patched vllm trees from upstream f9ad9dd6b495 + patches/0001..0004
 git clone --filter=blob:none https://github.com/vllm-project/vllm.git repos/vllm-base
 git -C repos/vllm-base worktree add -b dsv41-vllm-prefill ../vllm-prefill f9ad9dd6b495f7492fa975e0ac48164b090d99ad
 git -C repos/vllm-prefill apply ../../patches/0001-vllm-common-f9ad9dd6b4.patch && git -C repos/vllm-prefill commit -qam common
 git -C repos/vllm-base worktree add -b cpk/dsv41-vllm-decode ../vllm-decode dsv41-vllm-prefill
 git -C repos/vllm-decode apply ../../patches/0002-vllm-decode-runtime-v2.patch && git -C repos/vllm-decode commit -qam decode-v2
 git -C repos/vllm-decode apply ../../patches/0003-vllm-tpu-spec-chunk-align.patch && git -C repos/vllm-decode commit -qam spec-chunk-align
+git -C repos/vllm-decode apply ../../patches/0004-vllm-disjoint-kv-partitions.patch && git -C repos/vllm-decode commit -qam disjoint-kv-partitions
 
 # Fetch the 14 TPU wheels from GCS
 gcloud storage cp "gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/whls/*.whl" whls/
@@ -148,44 +149,68 @@ Results are saved to `runs/combined/<timestamp>_decode_dp8_all_dc1/`:
 
 ### What It Runs
 * Provisions **2 `tpu7x-8` (`2x2x1`) pods** on the same cluster (`<user>-dsv41-pd-pf-<suffix>` and `<user>-dsv41-pd-dc-<suffix>`):
-  * **Prefill Node (`1P`, `:8400`)**: `DP=8, TP=1, EP=8`, `VLLM_DSV41_CED=1` (20L Context Encoder + 128-token SWA tail), `MAX_NUM_BATCHED_TOKENS=8192`, `COMPILE_SIZES=[512, 2048, 8192]`, `TPURaidenConnector` (`kv_producer`).
-  * **Decode Node (`1D`, `:9400`)**: `DP=8, TP=1, EP=8`, `VLLM_DSV41_CED=0`, **DSpark $K=5$** (`ENABLE_DSPARK=1`), `--async-scheduling`, `MAX_NUM_BATCHED_TOKENS=384`, `COMPILE_SIZES=[16, 40, 48, 64, 96, 192, 384]`, `TPURaidenConnector` (`kv_consumer`).
-  * **Disagg Proxy (`:8000` on `1P`)**: [`toy_proxy_server.py`](file:///usr/local/google/home/chaitanyapk/projects/glm_torchtpu/dsv41/repos/vtt-combined/examples/disagg/toy_proxy_server.py) with `--prefiller-dp-size 8 --decoder-dp-size 8` least-inflight + round-robin DP rank pinning.
+  * **Prefill Node (`1P`, ports `:8400..8403`, `--prefill-mode 4x_tp2`)**: **4 independent `TP=2, EP=2` servers** (`1` chip per server), `VLLM_DSV41_CED=1`, `VLLM_DSV41_PURE_20L_PREFILL=1` (20-layer Context Encoder + 128-token SWA tail), `VLLM_DISJOINT_KV_PARTITIONS=1`, `PREFILL_4X_TP2_GPU_MEM=0.92` (`1,659` blocks/partition = `212,352` tokens/chip = `849,408` tokens/node per partition across disjoint `main`, `state`, `swa_0`, `swa_1`, `swa_2` `BlockPool` queues), `MAX_NUM_BATCHED_TOKENS=16384`, `COMPILE_SIZES=[512, 2048, 8192, 16384]`, `TPURaidenConnector` (`kv_producer`) with `TP=2 → TP=1` Stage-3 KV resharding.
+  * **Decode Node (`1D`, `:9400`)**: `DP=8, TP=1, EP=8`, `VLLM_DSV41_CED=0`, **DSpark $K=5$** (`ENABLE_DSPARK=1`), `--async-scheduling`, `VLLM_DISJOINT_KV_PARTITIONS=1` (`720` blocks/partition = `92,160` tokens/rank = `737,280` tokens/node per partition), `MAX_NUM_BATCHED_TOKENS=96`, `COMPILE_SIZES=[16, 40, 48, 64, 96, 128, 192, 384]`, `TPURaidenConnector` (`kv_consumer`).
+  * **Disagg Proxy (`:8000` on `1P`)**: [`toy_proxy_server.py`](file:///usr/local/google/home/chaitanyapk/projects/glm_torchtpu/dsv41/repos/vtt-combined/examples/disagg/toy_proxy_server.py) with `--prefiller-ports 8400,8401,8402,8403 --prefiller-dp-size 1 --decoder-ports 9400 --decoder-dp-size 8` deterministic DP rank routing + least-inflight load balancing and multi-producer `/reset_prefix_cache` broadcast.
 * Executes [`pd_gates.py`](file:///usr/local/google/home/chaitanyapk/projects/glm_torchtpu/dsv41/scripts/pd/pd_gates.py) and the Stage-3 transfer audit (`check_dsv4_stage3_log.py`):
   1. **`[GATE-2+2]`**: 16 concurrent math prompts (`pd` vs. `local`).
-  2. **`[GATE-USA]`**: 512-token greedy generation on the 50-states prompt (`pd_states=50/50`, `pd==local=True`).
+  2. **`[GATE-USA]`**: 512-token greedy generation on the 50-states prompt (`pd_states=50/50`, `pd==local`).
   3. **`[GATE-EQ]`**: Bitwise greedy 64-token equality (`pd == local`) + NIAH passkey (`739204`) across `n = 64, 700, 1500, 5000, 20000` input tokens.
   4. **`[BENCH-PD]` & `[BENCH-LOCAL]`**: `n=16, c=8, input=8192, output=128` end-to-end disaggregated vs. co-located benchmark.
   5. **`[BENCH-PD-C64]`**: `n=64, c=64, input=1024, output=512` high-concurrency steady-state disaggregated decode benchmark.
 
-### Command
+### 4.1 Command — Launch `1P1D` (`4 × TP=2, EP=2` 20L CED `1P`) & Run Gates
 
 ```bash
-python3 -u scripts/pd/run_pd.py \
+PREFILL_4X_TP2_GPU_MEM=0.92 python3 -u scripts/pd/run_pd.py \
   --ctx "$CTX" \
-  --suffix opt1 \
-  --tag dspark_opt \
+  --suffix p2 \
+  --tag dsv41_pd_4xtp2_20l_disjoint \
   --vtt repos/vtt-combined \
   --vllm repos/vllm-decode \
+  --prefill-mode 4x_tp2 \
   --prefill-ced 1 \
-  --prefill-mnbt 8192 \
-  --decode-mnbt 384 \
+  --prefill-mnbt 16384 \
+  --decode-mnbt 96 \
   --enable-dspark 1 \
-  --allow-foreign
+  --allow-foreign \
+  --keep-pods
 ```
-*(Optional: pass `--keep-pods` to keep both pods alive after the run, and re-run only the proxy + gates in ~4 mins via `--gates-only`.)*
+*(Note: Pass `--prefill-mode dp8` if you want to run the single-server `DP=8, TP=1, EP=8` `1P` mode instead.)*
 
-### Expected Results & Verification
+### 4.2 Command — Reproduce 1P1D Empirical ISL (`50:20:12:9:9`, 95% Prefix Cache Hit) Sweep
 
-Results are saved to `runs/pd/<timestamp>_dspark_opt_opt1/summary.json` and `pd_gates.json`:
+With the pods running from Step 4.1, execute [`bench_empirical_isl_dsv41.py`](file:///usr/local/google/home/chaitanyapk/projects/glm_torchtpu/dsv41/scripts/pd/bench_empirical_isl_dsv41.py) on the `1P` pod:
 
-| Gate / Benchmark | Expected Result | Reference Archive Run |
+```bash
+COMPACT_WARMUP_SUFFIX=1 python3 -u /tmp/bench_empirical_isl_dsv41.py \
+  --base-url http://127.0.0.1:8000 \
+  --prefill-url http://127.0.0.1:8400,http://127.0.0.1:8401,http://127.0.0.1:8402,http://127.0.0.1:8403 \
+  --decode-url http://<DECODE_POD_IP>:9400 \
+  --dataset /data/requests_mocked.jsonl.xz \
+  --sessions 8,16,32,64,128 \
+  --duration-per-n 180 \
+  --cache-hit-rate 0.95 \
+  --max-tokens 1024 \
+  --ignore-eos \
+  --dp-size 8 \
+  --trunks-above-n16 40 \
+  --warmup-pass-s 30 \
+  --output-json /tmp/dsv41_pd_empirical_isl_95_summary.json
+```
+
+### 4.3 Expected Results & Verification
+
+Results are saved to `runs/pd/<timestamp>_dsv41_pd_4xtp2_20l_disjoint_p2/` (see [`EMPIRICAL_ISL_1P1D_REPORT.md`](file:///usr/local/google/home/chaitanyapk/projects/glm_torchtpu/dsv41/repos/vtt-combined/benchmarks/dsv41_tpu7x/EMPIRICAL_ISL_1P1D_REPORT.md) and [`UNCACHED_PREFILL_BENCHMARK_SUMMARY.md`](file:///usr/local/google/home/chaitanyapk/projects/glm_torchtpu/dsv41/repos/vtt-combined/benchmarks/dsv41_tpu7x/UNCACHED_PREFILL_BENCHMARK_SUMMARY.md)):
+
+| Gate / Benchmark | Expected Result (`--prefill-mode 4x_tp2`) | Reference Archive Run |
 | :--- | :--- | :--- |
-| **`[GATE-2+2]` & `[GATE-USA]`** | `pd=16/16`, `local=16/16`; `USA`: **`pd=50/50`, `local=50/50`, `pd==local=True`** ($\tau \approx 3.95$) | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/pd/20261026-154717_dspark_opt_full_opt/` |
-| **`[GATE-EQ]` (`64, 700, 1.5K, 5K, 20K`)** | **5/5 `equal=True` (`first_div=None`)**, **5/5 NIAH needle `739204` recovered** | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/pd/20261026-154717_dspark_opt_full_opt/` |
-| **Raiden Stage-3 Audit (`stage3_check.txt`)** | `STAGE3_REGISTERED_SENDS 204`, `STAGE3_COMPLETED_SENDS 204`, `STAGE3_SKIPPED_SENDS 0`, **`STAGE3_CHECK_OK 1`** | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/pd/20261026-154717_dspark_opt_full_opt/` |
-| **`[BENCH-PD]` (`8K` in / `128` out, `c=8`)** | **TTFT**: `~1.12 s` (`p50 ~1.21 s`, **`3.0×` faster** vs. `BENCH-LOCAL` `3.36 s`)<br>**TPOT**: **`~11.40–11.48 ms`** (**`2.24×` faster** vs. `DSpark=0` `25.74 ms`)<br>**Output Throughput**: **`~355.5 tok/s`** (`+81.3%` vs. `DSpark=0`, `2.57×` vs. `BENCH-LOCAL`)<br>**Active Input Rate**: `~30,467 tok/s` (`~58,629 tok/s` E2E Wave-1 rate) | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/pd/20261026-161733_dspark_opt_warm_opt/` |
-| **`[BENCH-PD-C64]` (`1K` in / `512` out, `c=64`)** | **Step Time**: **`~15.03–31.34 ms/step`** (`8.21–13.62 ms` TPOT)<br>**Decode Throughput @ $\tau=3.5$**: **`~7,148–14,905 tok/s/D-node`** (`3,574–7,453 tok/s/node` across `1P+1D`)<br>**Natural Interior / E2E Wall**: **`~5,026–9,916 tok/s/D-node`** / **`~3,076 tok/s/D-node` wall** | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/pd/20261026-141011_dspark_opt_opt/` & `20261026-161733_dspark_opt_warm_opt/` |
+| **`[GATE-2+2]` & `[GATE-USA]`** | `pd=16/16`, `local=16/16`; `USA`: **`pd=50/50`, `local=50/50`** ($\tau \approx 3.95$) | `gs://chaitanyapk-data/atlas/dsv4.1_vllm_torchtpu/phase2_4xtp2_1p1d_20261030/20261030-204736_dsv41_pd_4xtp2_20l_disjoint_p2/` |
+| **`[GATE-EQ]` (`64, 700, 1.5K, 5K, 20K`)** | **5/5 `equal=True` (`first_div=None`)**, **5/5 NIAH needle `739204` recovered** | `gs://chaitanyapk-data/atlas/dsv4.1_vllm_torchtpu/phase2_4xtp2_1p1d_20261030/20261030-204736_dsv41_pd_4xtp2_20l_disjoint_p2/` |
+| **Raiden Stage-3 Audit (`stage3_check.txt`)** | `STAGE3_REGISTERED_SENDS 110`, `STAGE3_COMPLETED_SENDS 110`, `STAGE3_SKIPPED_SENDS 0`, **`STAGE3_CHECK_OK 1`** | `gs://chaitanyapk-data/atlas/dsv4.1_vllm_torchtpu/phase2_4xtp2_1p1d_20261030/20261030-204736_dsv41_pd_4xtp2_20l_disjoint_p2/` |
+| **Uncached Prefill (`0%` Cache Hit, `output_len = 1`)** | **`32K` (`c=8`)**: **`193,402.4 tok/s` (`1P`)** / **`184,322.3 tok/s` (`1P1D` E2E)**<br>**`128K` (`c=8`)**: **`191,583.0 tok/s` (`1P`)** / **`180,350.6 tok/s` (`1P1D` E2E)**<br>**`100K` (`c=8`)**: **`190,141.7 tok/s` (`1P`)** / **`179,012.2 tok/s` (`1P1D` E2E)** | `gs://chaitanyapk-data/atlas/dsv4.1_vllm_torchtpu/phase2_4xtp2_1p1d_20261030/20261030-074500_dsv41_pd_4xtp2_20l_phase2/` |
+| **`[BENCH-PD-C64]` (`1K` in / `512` out, `c=64`)** | **E2E Wall Output Throughput**: **`1,710.88 out tok/s`** (`4,623.34 int tok/s`, **`23.13 ms` TPOT**) | `gs://chaitanyapk-data/atlas/dsv4.1_vllm_torchtpu/phase2_4xtp2_1p1d_20261030/20261030-204736_dsv41_pd_4xtp2_20l_disjoint_p2/` |
+| **Empirical ISL (`50:20:12:9:9`, `95%` Cache Hit)** | **Cache Hit Rate**: **`93.08%–94.22%`** across `n = 8..128`<br>**`n = 8`**: `908.7 out tok/s`, `91.23 tok/s/stream` (`10.96 ms` ITL), **`0.60 s` med TTFT**<br>**`n = 32`**: `2,852.1 out tok/s`, `78.71 tok/s/stream` (`12.71 ms` ITL), **`0.53 s` med TTFT**<br>**`n = 64`**: `5,001.6 out tok/s`, `69.72 tok/s/stream` (`14.34 ms` ITL), **`0.59 s` med TTFT**<br>**`n = 128`**: **`6,197.7 out tok/s`**, **`116,289.2 in tok/s`** (`122,486.9 total tok/s`), `46.44 tok/s/stream` (`21.53 ms` ITL), **`0.76 s` med TTFT** (`0.89 s` med on `64K+`) | `gs://chaitanyapk-data/atlas/dsv4.1_vllm_torchtpu/phase2_4xtp2_1p1d_20261030/20261030-204736_dsv41_pd_4xtp2_20l_disjoint_p2/` |
 
 ---
 

@@ -548,7 +548,10 @@ class TPUWorker(WorkerBase):
         # pool instead, whose size does not scale with num_blocks.
         if (
             any("DeepseekV41" in a for a in hf_arch)
-            and not envs.VLLM_DSV41_PURE_20L_PREFILL
+            and not (
+                envs.VLLM_DSV41_PURE_20L_PREFILL
+                and not envs.TPU_RAIDEN_DSV4_ADMISSION
+            )
         ):
             from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
@@ -559,7 +562,8 @@ class TPUWorker(WorkerBase):
                 + (page_size // csa_cache_layout.ROPE_TOKENS_PER_ROW) * row_bytes
                 + 33 * 4 * page_size
             )
-            swa_extra_bpb = (15 - 3) * page_size * row_bytes
+            n_extra = 9 if envs.VLLM_DSV41_PURE_20L_PREFILL else (15 - 3)
+            swa_extra_bpb = n_extra * page_size * row_bytes
             available = (available * mla_bpb) // (mla_bpb + swa_extra_bpb)
         return available
 

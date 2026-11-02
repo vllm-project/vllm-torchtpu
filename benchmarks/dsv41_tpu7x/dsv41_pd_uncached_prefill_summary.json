@@ -1,0 +1,255 @@
+{
+  "model": "DeepSeek-V4.1-Flash (FP8 / MXFP4 MoE, 20L CED + 20L Decoder + DSpark K=5)",
+  "hardware": {
+    "standalone_prefill_only": "1x tpu7x-8 (2x2x1 = 4 chips / 8 TensorCores), 4 x (TP=2, EP=2), VLLM_DSV41_CED=1, VLLM_DSV41_PURE_20L_PREFILL=1, MNBT=16384",
+    "1p1d_disaggregated": {
+      "1P": "1x tpu7x-8 (4 x TP=2, EP=2, ports 8400..8403), VLLM_DSV41_CED=1, VLLM_DSV41_PURE_20L_PREFILL=1, VLLM_DISJOINT_KV_PARTITIONS=1, PREFILL_4X_TP2_GPU_MEM=0.92, MNBT=16384, TPURaidenConnector (kv_producer)",
+      "1D": "1x tpu7x-8 (DP=8, TP=1, EP=8, port 9400), VLLM_DSV41_CED=0, ENABLE_DSPARK=1 (K=5), VLLM_DISJOINT_KV_PARTITIONS=1, MNBT=96, TPURaidenConnector (kv_consumer)"
+    }
+  },
+  "standalone_prefill_only_0pct_cache": {
+    "128K_c8_n32": {
+      "input_len": 131072,
+      "concurrency": 8,
+      "num_prompts": 32,
+      "node_input_tok_s": 198541.3,
+      "chip_input_tok_s": 49635.3,
+      "mean_ttft_ms": 4946.6,
+      "median_ttft_ms": 4844.5,
+      "p99_ttft_ms": 7909.6
+    },
+    "128K_c16_n32": {
+      "input_len": 131072,
+      "concurrency": 16,
+      "num_prompts": 32,
+      "node_input_tok_s": 197890.9,
+      "chip_input_tok_s": 49472.7,
+      "mean_ttft_ms": 8610.3,
+      "median_ttft_ms": 8154.0,
+      "p99_ttft_ms": 13264.8
+    },
+    "100K_c8_n32": {
+      "input_len": 102400,
+      "concurrency": 8,
+      "num_prompts": 32,
+      "node_input_tok_s": 196644.1,
+      "chip_input_tok_s": 49161.0,
+      "mean_ttft_ms": 3809.7,
+      "median_ttft_ms": 3692.4,
+      "p99_ttft_ms": 5995.1
+    },
+    "100K_c16_n32": {
+      "input_len": 102400,
+      "concurrency": 16,
+      "num_prompts": 32,
+      "node_input_tok_s": 195839.8,
+      "chip_input_tok_s": 48960.0,
+      "mean_ttft_ms": 6648.6,
+      "median_ttft_ms": 6352.9,
+      "p99_ttft_ms": 10200.5
+    },
+    "32K_c8_n64": {
+      "input_len": 32768,
+      "concurrency": 8,
+      "num_prompts": 64,
+      "node_input_tok_s": 189563.0,
+      "chip_input_tok_s": 47390.8,
+      "mean_ttft_ms": 1334.5,
+      "median_ttft_ms": 1313.8,
+      "p99_ttft_ms": 2033.2
+    },
+    "128K_c4_n16": {
+      "input_len": 131072,
+      "concurrency": 4,
+      "num_prompts": 16,
+      "node_input_tok_s": 186703.4,
+      "chip_input_tok_s": 46675.9,
+      "mean_ttft_ms": 2795.4,
+      "median_ttft_ms": 2766.8,
+      "p99_ttft_ms": 3251.9
+    }
+  },
+  "1p1d_synthetic_uncached_prefill_0pct_cache": {
+    "32K_c8_n64": {
+      "input_len": 32768,
+      "concurrency": 8,
+      "num_prompts": 64,
+      "1p_node_tok_s": 193402.4,
+      "1p_chip_tok_s": 48350.6,
+      "1p1d_e2e_node_tok_s": 184322.3,
+      "1p1d_e2e_chip_tok_s": 46080.6,
+      "1p_median_lat_s": 1.34,
+      "1p1d_e2e_median_ttft_s": 1.42
+    },
+    "128K_c8_n32": {
+      "input_len": 131072,
+      "concurrency": 8,
+      "num_prompts": 32,
+      "1p_node_tok_s": 191583.0,
+      "1p_chip_tok_s": 47895.8,
+      "1p1d_e2e_node_tok_s": 180350.6,
+      "1p1d_e2e_chip_tok_s": 45087.7,
+      "1p_median_lat_s": 5.12,
+      "1p1d_e2e_median_ttft_s": 5.58
+    },
+    "128K_c16_n32": {
+      "input_len": 131072,
+      "concurrency": 16,
+      "num_prompts": 32,
+      "1p_node_tok_s": 190910.4,
+      "1p_chip_tok_s": 47727.6,
+      "1p1d_e2e_node_tok_s": 181104.2,
+      "1p1d_e2e_chip_tok_s": 45276.1,
+      "1p_median_lat_s": 8.48,
+      "1p1d_e2e_median_ttft_s": 9.12
+    },
+    "100K_c8_n32": {
+      "input_len": 102400,
+      "concurrency": 8,
+      "num_prompts": 32,
+      "1p_node_tok_s": 190141.7,
+      "1p_chip_tok_s": 47535.4,
+      "1p1d_e2e_node_tok_s": 179012.2,
+      "1p1d_e2e_chip_tok_s": 44753.1,
+      "1p_median_lat_s": 3.98,
+      "1p1d_e2e_median_ttft_s": 4.35
+    },
+    "100K_c16_n32": {
+      "input_len": 102400,
+      "concurrency": 16,
+      "num_prompts": 32,
+      "1p_node_tok_s": 189420.5,
+      "1p_chip_tok_s": 47355.1,
+      "1p1d_e2e_node_tok_s": 179884.0,
+      "1p1d_e2e_chip_tok_s": 44971.0,
+      "1p_median_lat_s": 6.84,
+      "1p1d_e2e_median_ttft_s": 7.39
+    },
+    "128K_c4_n16": {
+      "input_len": 131072,
+      "concurrency": 4,
+      "num_prompts": 16,
+      "1p_node_tok_s": 182415.2,
+      "1p_chip_tok_s": 45603.8,
+      "1p1d_e2e_node_tok_s": 171890.4,
+      "1p1d_e2e_chip_tok_s": 42972.6,
+      "1p_median_lat_s": 2.86,
+      "1p1d_e2e_median_ttft_s": 3.24
+    }
+  },
+  "1p1d_empirical_isl_uncached_0pct_cache": {
+    "per_bucket_c8": {
+      "64K+": {
+        "bucket": "64K+",
+        "n_reqs": 8,
+        "mean_isl": 84536.1,
+        "wave_tokens": 676289,
+        "pf_wall_s": 4.344,
+        "e2e_wall_s": 6.096,
+        "pf_lat_med_s": 2.703,
+        "pf_lat_mean_s": 2.803,
+        "kv_xfer_1d_med_s": 1.487,
+        "e2e_ttft_med_s": 3.951,
+        "e2e_ttft_p90_s": 5.677,
+        "pf_node_tok_s": 155684.8,
+        "pf_chip_tok_s": 38921.2,
+        "e2e_node_tok_s": 110942.6,
+        "e2e_chip_tok_s": 27735.7
+      },
+      "32-64K": {
+        "bucket": "32-64K",
+        "n_reqs": 8,
+        "mean_isl": 53798.6,
+        "wave_tokens": 430389,
+        "pf_wall_s": 2.65,
+        "e2e_wall_s": 2.97,
+        "pf_lat_med_s": 1.91,
+        "pf_lat_mean_s": 1.822,
+        "kv_xfer_1d_med_s": 0.29,
+        "e2e_ttft_med_s": 2.186,
+        "e2e_ttft_p90_s": 2.859,
+        "pf_node_tok_s": 162424.4,
+        "pf_chip_tok_s": 40606.1,
+        "e2e_node_tok_s": 144910.0,
+        "e2e_chip_tok_s": 36227.5
+      },
+      "16-32K": {
+        "bucket": "16-32K",
+        "n_reqs": 8,
+        "mean_isl": 26048.4,
+        "wave_tokens": 208387,
+        "pf_wall_s": 1.618,
+        "e2e_wall_s": 3.83,
+        "pf_lat_med_s": 1.159,
+        "pf_lat_mean_s": 1.155,
+        "kv_xfer_1d_med_s": 0.337,
+        "e2e_ttft_med_s": 1.439,
+        "e2e_ttft_p90_s": 3.812,
+        "pf_node_tok_s": 128776.9,
+        "pf_chip_tok_s": 32194.2,
+        "e2e_node_tok_s": 54412.6,
+        "e2e_chip_tok_s": 13603.2
+      },
+      "8-16K": {
+        "bucket": "8-16K",
+        "n_reqs": 8,
+        "mean_isl": 12921.9,
+        "wave_tokens": 103375,
+        "pf_wall_s": 1.003,
+        "e2e_wall_s": 1.31,
+        "pf_lat_med_s": 0.701,
+        "pf_lat_mean_s": 0.668,
+        "kv_xfer_1d_med_s": 0.307,
+        "e2e_ttft_med_s": 0.977,
+        "e2e_ttft_p90_s": 1.297,
+        "pf_node_tok_s": 103050.4,
+        "pf_chip_tok_s": 25762.6,
+        "e2e_node_tok_s": 78933.8,
+        "e2e_chip_tok_s": 19733.5
+      },
+      "1-8K": {
+        "bucket": "1-8K",
+        "n_reqs": 8,
+        "mean_isl": 7095.6,
+        "wave_tokens": 56765,
+        "pf_wall_s": 0.742,
+        "e2e_wall_s": 2.985,
+        "pf_lat_med_s": 0.555,
+        "pf_lat_mean_s": 0.552,
+        "kv_xfer_1d_med_s": 2.242,
+        "e2e_ttft_med_s": 2.913,
+        "e2e_ttft_p90_s": 2.976,
+        "pf_node_tok_s": 76494.8,
+        "pf_chip_tok_s": 19123.7,
+        "e2e_node_tok_s": 19018.6,
+        "e2e_chip_tok_s": 4754.6
+      }
+    },
+    "mixed_sweeps_c8": {
+      "mixed_40_reqs": {
+        "label": "mixed_40_reqs",
+        "n_reqs": 40,
+        "mean_isl": 36876.3,
+        "total_tokens": 1475051,
+        "pf_wall_s": 11.603,
+        "e2e_wall_s": 11.773,
+        "pf_node_tok_s": 127123.0,
+        "pf_chip_tok_s": 31780.8,
+        "e2e_node_tok_s": 125287.6,
+        "e2e_chip_tok_s": 31321.9
+      },
+      "mixed_128_reqs": {
+        "label": "mixed_128_reqs",
+        "n_reqs": 128,
+        "mean_isl": 21230.7,
+        "total_tokens": 2717527,
+        "pf_wall_s": 19.59,
+        "e2e_wall_s": 19.947,
+        "pf_node_tok_s": 138722.9,
+        "pf_chip_tok_s": 34680.7,
+        "e2e_node_tok_s": 136240.2,
+        "e2e_chip_tok_s": 34060.1
+      }
+    }
+  }
+}

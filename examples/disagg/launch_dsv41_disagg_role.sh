@@ -60,7 +60,11 @@ case "${ROLE}" in
     CED="${CED_PREFILL:-1}"
     ENABLE_DSPARK="${ENABLE_DSPARK:-0}"
     DSPARK_TOKENS="${DSPARK_TOKENS:-5}"
-    ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
+    if [[ "${PREFILL_MODE:-dp8}" == "4x_tp2" ]]; then
+      ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-1}"
+    else
+      ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
+    fi
     ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
     PREFIX_CACHE_RETENTION_INTERVAL="${PREFIX_CACHE_RETENTION_INTERVAL:-1024}"
     MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
@@ -214,6 +218,175 @@ export TPU_RAIDEN_ADVERTISE_HOST="${ADVERTISE_HOST}"
 export TPU_RAIDEN_RESHARD_PORT_BASE="${CTRL_PORT}"
 export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=$((CTRL_PORT + 100))
 export TPU_KV_TRANSFER_PORT="${KV_TRANSFER_PORT}"
+if [[ "${PREFILL_MODE:-dp8}" == "4x_tp2" ]]; then
+  export TPU_RAIDEN_POOL_TAGS_PER_LAYER="${TPU_RAIDEN_POOL_TAGS_PER_LAYER:-1}"
+  export TPU_RAIDEN_DSV4_MAX_TRANSFER_LAYER="${TPU_RAIDEN_DSV4_MAX_TRANSFER_LAYER:-20}"
+  export VLLM_DSV41_PD_HANDOFF_TAIL_TOKENS="${VLLM_DSV41_PD_HANDOFF_TAIL_TOKENS:-128}"
+fi
+
+if [[ "${ROLE}" == "prefill" && "${PREFILL_MODE:-dp8}" == "4x_tp2" ]]; then
+  # Phase 2 high-throughput prefill mode: 4 independent 1-chip TP=2, EP=2, DP=1
+  # servers (20-layer Context Encoder + L20 global KV write + Raiden Stage-3).
+  # Matches scripts/prefill/in_pod_driver_clean_flags.py + Raiden Stage-3 env.
+  unset TPU_MOE_COLLECTION_CHUNK_SIZE VLLM_TPU_MOE_FP8_DISPATCH \
+    VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS TPU_MOE_SKIP_PADDED_TOKENS \
+    VLLM_DSV41_L2_CAND_K_MIN_TOKENS VLLM_DSV41_ULYSSES_MIN_TOKENS \
+    VLLM_DSV41_HOIST_CSA_GATHER VLLM_DSV41_HOIST_CSA_MAX_TOKENS \
+    VLLM_DSV41_TP_SHARD_ENGRAM VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT \
+    VLLM_DSV41_CSA_UNION_VERIFY_BQ VLLM_DSV41_CSA_UNION_BQ \
+    VLLM_DSV41_CSA_UNION_M VLLM_DSV41_CSA_UNION_MAX_TOKENS \
+    VLLM_DSV41_INDEXER_CAND_READ_16K VLLM_DSV41_DECODER_TP_ATTN_VERIFY \
+    VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS \
+    VLLM_DSV41_MOE_FP4_GMM1_FP8 VLLM_DSV41_MOE_EP_V2_ALL39 \
+    VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS
+
+  # (1) Fused MoE EP v2 config
+  export USE_MOE_FUSED_EP_KERNEL="1"
+  export MOE_FUSED_EP_KERNEL_IMPL="v2"
+  export MOE_FUSED_EP_ENABLE_W4A8="1"
+  export MOE_FUSED_EP_V2_SHARDED_PLAN="1"
+  export MOE_REQUANTIZE_BLOCK_SIZE="512"
+  export VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS="0"
+  export VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8="0"
+  export VLLM_DSV41_MOE_V2_REQUANTIZE="1"
+  export VLLM_DSV41_REPL_SHARED_EXPERTS="1"
+
+  # (2) CED Disaggregated Prefill + TP=2 Attention/Indexer config
+  export VLLM_DSV41_CED="1"
+  export VLLM_DSV41_PURE_20L_PREFILL="1"
+  export VLLM_DSV41_CSA_UNION="0"
+  export VLLM_DSV41_TP_ATTN="1"
+  export VLLM_DSV41_TP_ATTN_MIN_TOKENS="0"
+  export VLLM_DSV41_TP_ATTN_LOCAL_TOPK="1"
+  export VLLM_DSV41_TP_INDEXER="1"
+  export VLLM_DSV41_TP_INDEXER_MIN_TOKENS="16"
+  export VLLM_DSV41_FUSED_Q_ROPE="1"
+  export VLLM_DSV41_FUSED_SEAM_QUANT="1"
+  unset VLLM_DSV41_ENGRAM_H2D_PREFIX VLLM_TPU_FAST_TOKEN_SUBSTITUTION
+  export TPU_RAIDEN_POOL_TAGS_PER_LAYER="${TPU_RAIDEN_POOL_TAGS_PER_LAYER:-1}"
+  export TPU_RAIDEN_DSV4_MAX_TRANSFER_LAYER="${TPU_RAIDEN_DSV4_MAX_TRANSFER_LAYER:-20}"
+  export VLLM_DSV41_PD_HANDOFF_TAIL_TOKENS="${VLLM_DSV41_PD_HANDOFF_TAIL_TOKENS:-128}"
+
+  # (3) RoPE / XLA runtime args
+  export TPU_ROPE_CACHE_TRUNCATE="1"
+  export TPU_ROPE_CACHE_ROW_MAJOR="1"
+  export OMP_NUM_THREADS="4"
+  export GOMP_SPINCOUNT="100"
+  export LIBTPU_INIT_ARGS="--xla_tpu_no_crash_on_oom=false --xla_tpu_scheduler_percent_shared_memory_limit=100 --xla_tpu_enable_scheduler_memory_pressure_tracking=true --xla_tpu_scheduling_annotation_deannotate_unsupported_groups=true --xla_tpu_offload_gather_to_sparsecore=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true --xla_tpu_sparse_core_reduce_scatter_offload_min_size_in_bytes=524288 --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true --xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=true"
+
+  MAX_NUM_BATCHED_TOKENS="16384"
+  COMPILE_SIZES="[16384]"
+  GPU_MEMORY_UTILIZATION="${PREFILL_4X_TP2_GPU_MEM:-0.94}"
+  MAX_NUM_SEQS="64"
+  API_SERVER_COUNT="4"
+  TOTAL_CPUS=$(nproc)
+  CPUS_PER_REP=$(( TOTAL_CPUS / 4 ))
+  SHARED_XLA_CACHE="${CACHE_ROOT}/xla_shared_4xtp2"
+  mkdir -p "${SHARED_XLA_CACHE}"
+  ln -sfn "${SHARED_XLA_CACHE}" /tmp/xla_cache
+
+  launch_one_chip() {
+    local idx="$1"
+    local p_port=$((PORT + idx))
+    local p_ctrl=$((CTRL_PORT + idx * 10))
+    local p_kvt=$((KV_TRANSFER_PORT + idx * 10))
+    local p_side=$((SIDE_CHANNEL_PORT + idx * 10))
+    local p_kv_port=$((KV_PORT + idx * 10))
+    local p_mport=$((19800 + idx * 20))
+    local p_sb0=$((23500 + idx * 10))
+    local p_sb1=$((23501 + idx * 10))
+    local cpu_start=$((idx * CPUS_PER_REP))
+    local cpu_end=$(((idx + 1) * CPUS_PER_REP - 1))
+    local p_cache="${CACHE_ROOT}_c${idx}"
+    mkdir -p "${p_cache}/vllm/torch_compile_cache" "${p_cache}/inductor" "${p_cache}/tmp" "${p_cache}/plan_dump"
+    local kv_cfg_i='{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"'"${KV_ROLE}"'","kv_port":'"${p_kv_port}"'}'
+    (
+      unset TPU_VISIBLE_DEVICES TPU_VISIBLE_CHIPS TPU_CHIPS_PER_HOST_BOUNDS CHIPS_PER_HOST_BOUNDS \
+        TPU_TOPOLOGY TOPOLOGY TPU_HOST_BOUNDS HOST_BOUNDS TPU_PROCESS_ADDRESSES TPU_PROCESS_PORT \
+        TPU_WORKER_ID TPU_SKIP_MDS_QUERY VBAR_CONTROL_SERVICE_URL TORCH_TPU_DP_MASTER_PORT
+      [ -S /var/run/tpu-plugin/vbar.sock ] && export VBAR_CONTROL_SERVICE_URL="unix:///var/run/tpu-plugin/vbar.sock"
+      export POD_G_CHIP_ID="${idx}"
+      export ALLOW_MULTIPLE_LIBTPU_LOAD="1"
+      export TORCH_TPU_TOPOLOGY="1,1,1,2"
+      export TPU_ACCELERATOR_TYPE="tpu7x-8"
+      export TPU_RUNTIME_METRICS_PORTS="$((8531 + idx * 2)),$((8532 + idx * 2))"
+      export MASTER_ADDR="127.0.0.1"
+      export MASTER_PORT="${p_mport}"
+      export TORCH_TPU_SLICEBUILDER_ADDRESSES="localhost:${p_sb0},localhost:${p_sb1}"
+      export XLA_PERSISTENT_CACHE_PATH="${SHARED_XLA_CACHE}"
+      export VLLM_XLA_CACHE_PATH="${SHARED_XLA_CACHE}"
+      export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${SHARED_XLA_CACHE}"
+      export VLLM_CACHE_ROOT="${p_cache}/vllm"
+      export TORCHINDUCTOR_CACHE_DIR="${p_cache}/inductor"
+      export TMPDIR="${p_cache}/tmp"
+      export TPU_RAIDEN_PLAN_DUMP_DIR="${p_cache}/plan_dump"
+      export TPU_RAIDEN_ENGINE_ID="${ROLE}-c${idx}-engine-${RUN_ID}"
+      export TPU_RAIDEN_RESHARD_PORT_BASE="${p_ctrl}"
+      export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=$((p_ctrl + 100))
+      export TPU_KV_TRANSFER_PORT="${p_kvt}"
+      export TPU_SIDE_CHANNEL_PORT="${p_side}"
+
+      if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then
+        prefix_cache_flags=(--enable-prefix-caching --prefix-cache-retention-interval "${PREFIX_CACHE_RETENTION_INTERVAL}")
+      else
+        prefix_cache_flags=(--no-enable-prefix-caching)
+      fi
+
+      if [[ "${ASYNC_SCHEDULING:-1}" == "1" ]]; then
+        async_flag="--async-scheduling"
+      else
+        async_flag="--no-async-scheduling"
+      fi
+
+      p_args=(
+        serve "${MODEL_PATH}"
+        --host 0.0.0.0 --port "${p_port}"
+        --served-model-name "${SERVED_MODEL_NAME}"
+        --trust-remote-code
+        --api-server-count "${API_SERVER_COUNT}"
+        --renderer-num-workers 4
+        --prefill-schedule-interval 1
+        --data-parallel-size 1
+        --tensor-parallel-size 2
+        --enable-expert-parallel
+        --kv-cache-dtype fp8
+        --max-model-len "${MAX_MODEL_LEN}"
+        --max-num-seqs "${MAX_NUM_SEQS}"
+        --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
+        --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
+        --no-disable-hybrid-kv-cache-manager
+        --enable-prompt-tokens-details
+        --enable-auto-tool-choice
+        --tool-call-parser deepseek_v32
+        --reasoning-parser deepseek_v3
+        "${prefix_cache_flags[@]}"
+        "${async_flag}"
+        --kv-transfer-config "${kv_cfg_i}"
+        --compilation-config "{\"compile_sizes\": ${COMPILE_SIZES}}"
+      )
+      echo "[PD-LAUNCH] role=${ROLE} chip=${idx} port=${p_port} ctrl=${p_ctrl} kvt=${p_kvt} engine_id=${TPU_RAIDEN_ENGINE_ID}"
+      if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        printf '[PD-LAUNCH] cmd: vllm'; printf ' %q' "${p_args[@]}"; echo
+        exit 0
+      fi
+      exec taskset -c "${cpu_start}-${cpu_end}" vllm "${p_args[@]}" 2>&1 | tee "/dev/shm/vllm_chip${idx}.log"
+    ) &
+  }
+
+  echo "[PD-LAUNCH] Launching Chip 0 (port ${PORT}) first to populate shared XLA cache..."
+  launch_one_chip 0
+  if [[ "${DRY_RUN:-0}" != "1" ]]; then
+    while ! curl -sf --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; do
+      sleep 5
+    done
+    echo "[PD-LAUNCH] Chip 0 healthy on :${PORT}; launching Chips 1, 2, 3 concurrently with warm XLA cache..."
+  fi
+  for idx in 1 2 3; do
+    launch_one_chip "${idx}"
+  done
+  wait
+  exit 0
+fi
 
 kv_cfg='{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"'"${KV_ROLE}"'","kv_port":'"${KV_PORT}"'}'
 

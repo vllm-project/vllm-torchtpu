@@ -20,6 +20,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 import dataclasses
 import importlib
 import json
+import os
 import queue
 import threading
 import time
@@ -1082,9 +1083,24 @@ class TPUConnectorScheduler:
             return
         if request.prompt_token_ids is None:
             return
-        request.prompt_token_ids.pop()
-        request._all_token_ids.pop()
-        request.num_prompt_tokens -= 1
+        tail_tokens = max(
+            1, int(os.environ.get("VLLM_DSV41_PD_HANDOFF_TAIL_TOKENS", "1") or "1")
+        )
+        if tail_tokens > 1:
+            # Align Producer transfer prefix to even token boundaries for
+            # compress_ratio=2 layers (L2, L8, L14). Short prompts (<= tail_tokens + 1)
+            # keep 1 token on Producer so Stage-3 transfer & unpin still complete,
+            # while Decode rewinds num_computed_tokens=0 after Stage-3 pull.
+            keep_tokens = max(
+                1, ((request.num_prompt_tokens - tail_tokens) // 2) * 2
+            )
+            drop_count = request.num_prompt_tokens - keep_tokens
+        else:
+            drop_count = min(request.num_prompt_tokens - 1, tail_tokens)
+        for _ in range(drop_count):
+            request.prompt_token_ids.pop()
+            request._all_token_ids.pop()
+        request.num_prompt_tokens -= drop_count
         if request.kv_transfer_params is None:
             request.kv_transfer_params = {}
         request.kv_transfer_params["_p_side_truncated"] = True
@@ -1741,6 +1757,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if (
                 self._stage3_prefix_aware_load_enabled
                 and int(request.num_computed_tokens) == 0
+                and not (
+                    request.kv_transfer_params
+                    and request.kv_transfer_params.get("_remote_kv_processed")
+                )
             ):
                 self._enqueue_stage3_release(request)
                 if request.kv_transfer_params is not None:
@@ -2318,6 +2338,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return int(
                 parallel_config.tensor_parallel_size or 1
             ) * _pipeline_parallel_size(self.vllm_config)
+        if _use_raiden_dsv4_admission():
+            return 1
         if _uses_tp_stage3_source(self.vllm_config):
             return int(parallel_config.tensor_parallel_size or 1)
         if _engine_is_pipeline(self.vllm_config):
@@ -2569,7 +2591,7 @@ class TPURaidenConnectorWorker:
 
     def _admit_raiden_hybrid_kv_cache(self, runner: TPUModelRunner) -> None:
         """Construct the Raiden engine over the model's hybrid pools."""
-        if self._raiden_transfer_engine is not None:
+        if self._raiden_transfer_engine is not None or self._raiden_manifest is not None:
             return
 
         stage3_enabled = self._raiden_stage3_enabled()
@@ -2768,7 +2790,7 @@ class TPURaidenConnectorWorker:
     def _admit_raiden_glm_kv_cache(self, runner: TPUModelRunner) -> None:
         """Constructs Raiden engine over the GLM MLA cache classes
         (MLA latent + DSA indexer)."""
-        if self._raiden_transfer_engine is not None:
+        if self._raiden_transfer_engine is not None or self._raiden_manifest is not None:
             return
         if not self._raiden_stage3_enabled():
             raise RuntimeError(
@@ -2898,18 +2920,11 @@ class TPURaidenConnectorWorker:
         states on their own compressed-KV array. So every pool tag names its
         cache group, and every transfer carries that group's block table.
         """
-        if self._raiden_transfer_engine is not None:
+        if self._raiden_transfer_engine is not None or self._raiden_manifest is not None:
             return
         if not self._raiden_stage3_enabled():
             raise RuntimeError(
                 "TPU_RAIDEN_DSV4_ADMISSION requires TPU_KV_RESHARD_TRANSPORT=raiden"
-            )
-        self._maybe_host_reshard_store()
-        controller_address = _resolved_reshard_controller_address(self.dp_rank)
-        if not controller_address:
-            raise ValueError(
-                "TPU_RAIDEN_CONTROLLER_ADDRESS is required when "
-                "TPU_KV_RESHARD_TRANSPORT=raiden"
             )
 
         from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
@@ -2924,19 +2939,31 @@ class TPURaidenConnectorWorker:
             )
         kv_cache_groups = tuple(runner.kv_cache_config.kv_cache_groups or ())
         raw_tensors = tuple(runner.kv_cache_raw_tensors or ())
+        max_layer_env = os.environ.get("TPU_RAIDEN_DSV4_MAX_TRANSFER_LAYER", "").strip()
+        max_transfer_layer = int(max_layer_env) if max_layer_env else None
         draft_layer_names = set(
             getattr(getattr(runner, "drafter", None), "_draft_attn_layer_names", ())
             or ()
         )
-        if draft_layer_names:
+
+        def _keep_dsv4_manifest_layer(ln: str) -> bool:
+            if ln in draft_layer_names:
+                return False
+            if max_transfer_layer is not None:
+                lidx = rpm.layer_index_from_name(ln)
+                if lidx is not None and lidx > max_transfer_layer:
+                    return False
+            return True
+
+        if draft_layer_names or max_transfer_layer is not None:
             named_kv_caches = {
-                k: v for k, v in named_kv_caches.items() if k not in draft_layer_names
+                k: v for k, v in named_kv_caches.items() if _keep_dsv4_manifest_layer(k)
             }
             kv_cache_groups = tuple(
                 dataclasses.replace(
                     g,
                     layer_names=[
-                        ln for ln in g.layer_names if ln not in draft_layer_names
+                        ln for ln in g.layer_names if _keep_dsv4_manifest_layer(ln)
                     ],
                 )
                 for g in kv_cache_groups
@@ -2946,6 +2973,7 @@ class TPURaidenConnectorWorker:
             named_kv_caches=named_kv_caches,
             kv_cache_groups=kv_cache_groups,
             raw_tensors=raw_tensors,
+            per_layer_tags=_use_per_layer_pool_tags(),
         )
         rpm.verify_storage_binding(
             manifest=manifest,
@@ -2953,6 +2981,17 @@ class TPURaidenConnectorWorker:
             raw_tensors=raw_tensors,
         )
         rpm.materialize_storages(manifest)
+        if self.is_producer and int(self.tp_rank) > 0:
+            self._raiden_manifest = manifest
+            return
+
+        self._maybe_host_reshard_store()
+        controller_address = _resolved_reshard_controller_address(self.dp_rank)
+        if not controller_address:
+            raise ValueError(
+                "TPU_RAIDEN_CONTROLLER_ADDRESS is required when "
+                "TPU_KV_RESHARD_TRANSPORT=raiden"
+            )
 
         storages = list(manifest.storages)
         engine = self._construct_raiden_transfer_engine(storages, num_slots=1)
@@ -3000,7 +3039,7 @@ class TPURaidenConnectorWorker:
                 pool.page_tokens,
                 pool.live_bytes_per_block,
                 pool.row_bytes,
-                counts[pool.tag],
+                counts.get(pool.tag, counts.get(rpm.class_tag(pool.tag), 1)),
                 pool.whole_tail_page,
             )
 
@@ -3016,7 +3055,12 @@ class TPURaidenConnectorWorker:
         from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
             DSV4_REGION_PAGES,
         )
+        from vllm_torchtpu.distributed.kv_transfer.raiden.tags import (
+            split_layer_tag,
+        )
 
+        max_layer_env = os.environ.get("TPU_RAIDEN_DSV4_MAX_TRANSFER_LAYER", "").strip()
+        max_transfer_layer = int(max_layer_env) if max_layer_env else None
         transfer_groups = _stage3_transfer_groups(kv_cache_groups, multi_group=True)
         plan_position_by_group = {
             group.cache_group_index: position
@@ -3029,8 +3073,18 @@ class TPURaidenConnectorWorker:
             tag = str(pool.tag)
             if tag in seen:
                 continue
+            base_tag, layer_idx = split_layer_tag(tag)
+            if max_transfer_layer is not None and layer_idx is not None:
+                if layer_idx > max_transfer_layer:
+                    continue
+                if (
+                    layer_idx == max_transfer_layer
+                    and max_transfer_layer == 20
+                    and base_tag.startswith("dsv4.swa.")
+                ):
+                    continue
             seen.add(tag)
-            group_index = int(tag.rsplit(".g", 1)[1])
+            group_index = int(base_tag.rsplit(".g", 1)[1])
             position = plan_position_by_group.get(group_index)
             if position is None:
                 raise RuntimeError(
@@ -3046,7 +3100,9 @@ class TPURaidenConnectorWorker:
                     page_tokens=int(
                         kv_cache_groups[group_index].kv_cache_spec.block_size
                     ),
-                    live_bytes_per_block=int(geometry[tag]["live_bytes_per_block"]),
+                    live_bytes_per_block=int(
+                        geometry[base_tag]["live_bytes_per_block"]
+                    ),
                     row_bytes=int(region.unit_bytes),
                     whole_tail_page=region.name == DSV4_REGION_PAGES,
                 )
@@ -3063,10 +3119,11 @@ class TPURaidenConnectorWorker:
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         tp_size = int(self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
-        if pcp_size != 1 or tp_size != 1:
+        allowed_tp = (1, 2) if self.is_producer else (1,)
+        if pcp_size != 1 or tp_size not in allowed_tp:
             raise ValueError(
                 "Raiden DSv4 admission supports DP attention only "
-                f"(tp1/pcp1); got tensor_parallel_size={tp_size}, "
+                f"(tp in {allowed_tp}, pcp1); got tensor_parallel_size={tp_size}, "
                 f"prefill_context_parallel_size={pcp_size}"
             )
         return f"dp{dp_size}_prefill" if self.is_producer else f"dp{dp_size}_decode"
@@ -3665,6 +3722,12 @@ class TPURaidenConnectorWorker:
         wait_for_completion: bool = False,
         report_completion: bool = True,
     ) -> None:
+        if (
+            self.is_producer
+            and _use_raiden_dsv4_admission()
+            and int(self.tp_rank) > 0
+        ):
+            return
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
             if (
@@ -5850,6 +5913,12 @@ class TPURaidenConnectorWorker:
     def get_finished(
         self, finished_req_ids: set[str] | None = None
     ) -> tuple[set[str], set[str]]:
+        if (
+            self.is_producer
+            and _use_raiden_dsv4_admission()
+            and int(self.tp_rank) > 0
+        ):
+            return set(), set()
         engine = self._ensure_raiden_transfer_engine()
         # A request aborted in WAITING_FOR_REMOTE_KVS is scheduler-finished,
         # but vLLM deliberately delays freeing its blocks until this connector
@@ -6276,7 +6345,7 @@ class TPURaidenConnectorWorker:
         return flat
 
     def _ensure_raiden_transfer_engine(self) -> "KVCacheManager":
-        if self._raiden_transfer_engine is not None:
+        if self._raiden_transfer_engine is not None or self._raiden_manifest is not None:
             return self._raiden_transfer_engine
         if self.runner is None:
             raise RuntimeError("register_runner must be called before transfer")

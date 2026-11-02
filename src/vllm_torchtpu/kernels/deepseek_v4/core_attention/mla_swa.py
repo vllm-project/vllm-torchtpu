@@ -432,7 +432,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             0,
         )
         min_start = (
-            jnp.where(eff_q_span_s > 1, kv_len_s - eff_q_span_s, 0)
+            jnp.where(eff_q_span_s > 8, kv_len_s - eff_q_span_s, 0)
             if ced_decoder
             else 0
         )
@@ -2548,7 +2548,7 @@ def mla_sliding_window_ragged_paged_attention(
                 vmem_limit_bytes=vmem_limit_bytes,
                 unnormalized_output=unnormalized_output,
                 static_q_len=eff_verify_q_len,
-                ced_decoder=ced_decoder,
+                ced_decoder=False,
                 skip_kv_update=skip_kv_update,
                 non_causal_block=non_causal_block,
             )

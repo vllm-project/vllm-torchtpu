@@ -340,7 +340,13 @@ def main() -> None:
                             tail = k.exec_sh(f"tail -n 80 /dev/shm/pd_{r}.log", capture=True)
                             (out / f"{r}_boot_failure_tail.txt").write_text(tail)
                             raise RuntimeError(f"[{r}] server failed during boot:\n{fails[-2000:]}\n--- tail ---\n{tail[-6000:]}")
-                        if healthy(k, PORTS[r]):
+                        is_4x_tp2 = any(x == "PREFILL_MODE=4x_tp2" for x in a.env)
+                        role_healthy = (
+                            all(healthy(k, PORTS["prefill"] + idx) for idx in range(4))
+                            if (r == "prefill" and is_4x_tp2)
+                            else healthy(k, PORTS[r])
+                        )
+                        if role_healthy:
                             ready[r] = True
                             L.log(f"[{r}] HEALTHY after {time.time() - t0:.0f}s")
                     except subprocess.CalledProcessError as e:
@@ -357,11 +363,17 @@ def main() -> None:
             summary["boot_s"] = round(time.time() - t0, 1)
 
         # Proxy on the prefill pod.
+        is_4x_tp2 = any(x == "PREFILL_MODE=4x_tp2" for x in a.env)
+        pf_proxy_flags = (
+            "--prefiller-hosts 127.0.0.1 127.0.0.1 127.0.0.1 127.0.0.1 "
+            "--prefiller-ports 8400 8401 8402 8403 --prefiller-dp-size 0"
+            if is_4x_tp2
+            else f"--prefiller-hosts 127.0.0.1 --prefiller-ports {PORTS['prefill']} --prefiller-dp-size {a.proxy_dp_size}"
+        )
         if not healthy(kp, PROXY_PORT, "/healthcheck"):
             L.start_detached(kp, (
                 "cd /workspace/vllm-torchtpu && exec python3 examples/disagg/toy_proxy_server.py "
-                f"--host 0.0.0.0 --port {PROXY_PORT} --prefiller-hosts 127.0.0.1 --prefiller-ports {PORTS['prefill']} "
-                f"--prefiller-dp-size {a.proxy_dp_size} "
+                f"--host 0.0.0.0 --port {PROXY_PORT} {pf_proxy_flags} "
                 f"--decoder-hosts {ips['decode']} --decoder-ports {PORTS['decode']} --decoder-dp-size {a.proxy_dp_size} "
                 "> /dev/shm/pd_proxy.log 2>&1"),
                 "toy_proxy_server.py")
