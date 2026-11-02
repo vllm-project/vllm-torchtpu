@@ -24,7 +24,10 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import fused_quantize_matmul
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    xla_prequantized_matmul,
+    xla_quantized_matmul,
+)
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
 # `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
@@ -161,6 +164,93 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+def _quantized_matmul_pair_jax(
+    x: jax.Array,
+    w_q_a: jax.Array,
+    w_s_a: jax.Array,
+    w_q_b: jax.Array,
+    w_s_b: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """`_quantized_matmul_jax` of one activation by two weights.
+
+    Where the first matmul takes the fused kernel, the kernel hands back the
+    activation it quantized and the second matmul skips its own quantize, as
+    XLA does when it shares one `xla_quantized_matmul` quantize between two
+    dots. Either way both outputs are what two separate calls compute.
+    """
+    if (
+        w_s_a.ndim == 1
+        and w_s_b.ndim == 1
+        and w_q_b.dtype == w_q_a.dtype
+        and fused_quantize_matmul.applies(x, w_q_a, w_s_a)
+    ):
+        out_a, x_q, x_scale = fused_quantize_matmul.fused_quantize_matmul(
+            x, w_q_a, w_s_a, return_quantized=True
+        )
+        return out_a, xla_prequantized_matmul(x_q, x_scale, w_q_b, w_s_b, x.dtype)
+    return _quantized_matmul_jax(x, w_q_a, w_s_a), _quantized_matmul_jax(
+        x, w_q_b, w_s_b
+    )
+
+
+_quantized_matmul_pair_op: Callable | None = None
+_quantized_matmul_pair_op_lock = Lock()
+
+
+def _get_quantized_matmul_pair_op() -> Callable:
+    global _quantized_matmul_pair_op
+    if _quantized_matmul_pair_op is not None:
+        return _quantized_matmul_pair_op
+
+    with _quantized_matmul_pair_op_lock:
+        if _quantized_matmul_pair_op is not None:
+            return _quantized_matmul_pair_op
+
+        op = pallas.jax_op(
+            "pallas::quantized_matmul_pair_kernel", _quantized_matmul_pair_jax
+        )
+
+        def _fake_quantized_matmul_pair(
+            x: torch.Tensor,
+            w_q_a: torch.Tensor,
+            w_s_a: torch.Tensor,
+            w_q_b: torch.Tensor,
+            w_s_b: torch.Tensor,
+        ):
+            del w_s_a, w_s_b
+            return tuple(
+                torch.empty(x.shape[0], w.shape[-1], dtype=x.dtype, device=x.device)
+                for w in (w_q_a, w_q_b)
+            )
+
+        op.register_fake(_fake_quantized_matmul_pair)
+        _quantized_matmul_pair_op = op
+        return op
+
+
+def quantized_matmul_pair(
+    x: torch.Tensor,
+    w_q_a: torch.Tensor,
+    w_s_a: torch.Tensor,
+    w_q_b: torch.Tensor,
+    w_s_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`(quantized_matmul(x, w_q_a, w_s_a), quantized_matmul(x, w_q_b, w_s_b))`
+    with `x` quantized once."""
+    for w_q in (w_q_a, w_q_b):
+        if x.shape[-1] != w_q.shape[0]:
+            raise ValueError(
+                f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
+                f"{w_q.shape[0]}."
+            )
+    x_2d = x.reshape(-1, x.shape[-1])
+    out_a, out_b = _get_quantized_matmul_pair_op()(x_2d, w_q_a, w_s_a, w_q_b, w_s_b)
+    return (
+        out_a.reshape(*x.shape[:-1], w_q_a.shape[-1]),
+        out_b.reshape(*x.shape[:-1], w_q_b.shape[-1]),
+    )
 
 
 def _quantized_matmul_fp4_jax(

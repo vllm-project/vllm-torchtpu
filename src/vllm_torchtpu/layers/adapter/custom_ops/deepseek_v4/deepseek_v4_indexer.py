@@ -217,11 +217,14 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         rotary_emb: nn.Module,
         slot_mapping: torch.Tensor | None = None,
         compress: bool = True,
+        projected_q: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``compress=False`` when the caller already ran this indexer's
-        compressor (`VllmDeepseekCompressor.forward_with_indexer`)."""
-        q, _ = self.wq_b(query)
-        q = q.view(-1, self.n_head, self.head_dim)
+        compressor (`VllmDeepseekCompressor.forward_with_indexer`), and
+        ``projected_q`` is ``wq_b(query)`` when the caller already ran it."""
+        if projected_q is None:
+            projected_q, _ = self.wq_b(query)
+        q = projected_q.view(-1, self.n_head, self.head_dim)
 
         if compress:
             self.compressor(hidden_states, positions, rotary_emb)

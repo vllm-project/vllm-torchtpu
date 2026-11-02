@@ -25,11 +25,16 @@ Run on TPU (when available):
     pytest tests/layers/adapter/quantization/test_fp8.py -v --use-tpu
 """
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
+from vllm_torchtpu.layers.adapter.linear_common import (
+    _quantized_matmul_jax,
+    _quantized_matmul_pair_jax,
+)
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
     VllmFp8Config,
     VllmFp8LinearMethodTPU,
@@ -1123,6 +1128,39 @@ class TestFp8LinearRuntimeQuant:
 
         with pytest.raises(ValueError, match="divisible by block scale count"):
             _quantized_matmul_jax(x, w_q, w_scale)
+
+
+def _pair_operands(m: int, k: int, n_a: int, n_b: int):
+    kx, ka, kb, ksa, ksb = jax.random.split(jax.random.key(0), 5)
+    x = jax.random.normal(kx, (m, k), jnp.bfloat16)
+    w_q_a = jax.random.normal(ka, (k, n_a)).astype(jnp.float8_e4m3fn)
+    w_q_b = jax.random.normal(kb, (k, n_b)).astype(jnp.float8_e4m3fn)
+    w_s_a = jax.random.uniform(ksa, (n_a,), minval=1e-3, maxval=1e-2)
+    w_s_b = jax.random.uniform(ksb, (n_b,), minval=1e-3, maxval=1e-2)
+    return x, w_q_a, w_s_a, w_q_b, w_s_b
+
+
+def _assert_pair_matches_two_calls(x, w_q_a, w_s_a, w_q_b, w_s_b) -> None:
+    got = _quantized_matmul_pair_jax(x, w_q_a, w_s_a, w_q_b, w_s_b)
+    expected = (
+        _quantized_matmul_jax(x, w_q_a, w_s_a),
+        _quantized_matmul_jax(x, w_q_b, w_s_b),
+    )
+    for g, e in zip(got, expected, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(g).view(np.uint16), np.asarray(e).view(np.uint16)
+        )
+
+
+def test_quantized_matmul_pair_matches_two_calls():
+    """Below the fused kernel's rows both outputs take the XLA path."""
+    _assert_pair_matches_two_calls(*_pair_operands(16, 256, 384, 128))
+
+
+@pytest.mark.tpu_test
+def test_quantized_matmul_pair_shares_fused_quantize():
+    """The second matmul of the fused kernel's quantized activation."""
+    _assert_pair_matches_two_calls(*_pair_operands(1024, 1024, 32768, 8192))
 
 
 @pytest.mark.tpu_test
