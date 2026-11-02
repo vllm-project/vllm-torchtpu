@@ -1435,8 +1435,10 @@ def streamindex_topk(
         afterwards. Needs `return_scores=False`.
       decode_as_mixed: score q_len-1 sequences in the MIXED pass as well (with
         `decode_pack`, the packed small-bucket body MTP decode runs) and build
-        no DECODE pass. The DECODE passes sum the heads with one reduction,
-        the MIXED pass head by head, so scores can differ in the last f32 bits.
+        no DECODE pass, so `skip_empty_decode`, `skip_empty_decode_chunked`
+        and `shared_meta`'s lazy DECODE schedules have nothing to act on. The
+        DECODE passes sum the heads with one reduction, the MIXED pass head by
+        head, so scores can differ in the last f32 bits.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions

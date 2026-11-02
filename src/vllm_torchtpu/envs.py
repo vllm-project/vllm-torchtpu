@@ -1677,8 +1677,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (TPU_STREAMIDX_SMALL_BUCKET_BQ / _TOKENS): score q_len-1 requests in that
     # MIXED pass (the packed body MTP decode runs) instead of the two DECODE
     # passes, whose schedules TPU_STREAMIDX_SHARED_META builds per indexer
-    # layer inside the skip-empty branch. Scores can differ in the last f32
-    # bits (head sum order); the top-k is tolerance-tier, not bitwise.
+    # layer inside the skip-empty branch. The packed body needs
+    # TPU_STREAMIDX_SMALL_BUCKET_BQ=4 (the default); another BQ scores the
+    # decodes in the blocked body, one sequence per block. Scores can differ in
+    # the last f32 bits (head sum order); the top-k is tolerance-tier, not
+    # bitwise.
     "TPU_STREAMIDX_DECODE_AS_MIXED": env_bool("TPU_STREAMIDX_DECODE_AS_MIXED"),
     # StreamIdx per-step inputs built once per step instead of once per
     # indexer layer: the MIXED pass schedule without its empty-pass cond (so

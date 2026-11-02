@@ -23,7 +23,8 @@ tile_rows < m):
         rank pushes its q1 into slot `me` of every peer, and each rank sums the n
         slots itself. Each element is the same f32 sum in rank order as the
         two-shot's, so the row is bitwise the other paths'.
-  fold  1 <= n_valid <= fold_rows: the valid rows are folded into one
+  fold  1 <= n_valid <= fold_rows (2 <= with spec.one_shot): the valid rows are
+        folded into one
         [tile_rows, h / k] matrix, q[j * fold_rows + r, x] = p[r, j * h / k + x]
         (k = lane groups per chunk), and that is all-reduced instead.
   trim  above the fold range, n_valid <= tile_rows: rows [0, tile_rows) only.

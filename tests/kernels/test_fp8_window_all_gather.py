@@ -134,5 +134,66 @@ def test_gathered_windows_are_the_replicated_projection(on_16_devices, rows, lan
     assert on_16_devices[f"{rows}:{int(lanes)}"]
 
 
+@pytest.fixture(scope="module")
+def host_mesh():
+    """The eight cores of one host (a fixture, not a `skipif`: asking JAX for
+    devices at collection would claim the chip for the pytest parent)."""
+    import jax
+    from jax.sharding import Mesh
+
+    if jax.default_backend() != "tpu" or jax.device_count() < 8:
+        pytest.skip("needs the 8 TPU cores of one host")
+    return Mesh(np.array(jax.devices()[:8]), ("d",))
+
+
+@pytest.mark.tpu_test
+@pytest.mark.multichip
+@pytest.mark.parametrize("rows", ROWS)
+def test_on_device_gathered_windows_are_the_replicated_projection(host_mesh, rows):
+    """The Mosaic build on 8 cores (1024-column windows of the tuned 2048 x 8192
+    q_b twin): every core's output bitwise fp8_skinny's on the whole weight."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
+
+    cores, k, n = 8, 2048, 8192
+    k1, k2, k3 = jax.random.split(jax.random.key(rows), 3)
+    x = (jax.random.normal(k1, (rows, k)) * 2).astype(jnp.bfloat16)
+    w = (jax.random.normal(k2, (k, n)) * 0.5).astype(jnp.float8_e4m3fn)
+    ws = jax.random.uniform(k3, (n,), jnp.float32, 0.5, 1.5)
+    ref = np.asarray(fp8_skinny.fp8_skinny_matmul(x, w, ws)).view(np.uint16)
+
+    def body(x, w, ws, r):
+        return wag.fp8_window_all_gather(
+            x, w, ws, r.reshape(1), num_cores=cores, axis="d"
+        )
+
+    spec = NamedSharding(host_mesh, P("d"))
+    args = [
+        jax.device_put(a, spec)
+        for a in (
+            jnp.tile(x, (cores, 1)),
+            jnp.tile(w, (cores, 1)),
+            jnp.tile(ws, (cores,)),
+            jnp.arange(cores, dtype=jnp.int32).reshape(cores, 1),
+        )
+    ]
+    fn = jax.jit(
+        jax.shard_map(
+            body,
+            mesh=host_mesh,
+            in_specs=(P("d"),) * 4,
+            out_specs=P("d"),
+            check_vma=False,
+        )
+    )
+    out = np.asarray(fn(*args)).reshape(cores, rows, n).view(np.uint16)
+    for core in range(cores):
+        np.testing.assert_array_equal(out[core], ref, err_msg=f"core {core}")
+
+
 if __name__ == "__main__":
     _worker()
