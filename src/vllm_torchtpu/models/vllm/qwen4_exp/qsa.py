@@ -425,8 +425,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         keywords.pop("compressed_slot", None)
         keywords.pop("main_slot", None)
         keywords.pop("max_query_len", None)
-        if self.max_query_len > 1:
-            keywords["max_query_len"] = self.max_query_len
+        max_query_len = getattr(self, "max_query_len", 1)
+        if max_query_len > 1:
+            keywords["max_query_len"] = max_query_len
         if slot:
             keywords["compressed_slot"] = slot
         if main_slot >= 0:

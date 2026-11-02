@@ -649,7 +649,15 @@ def test_draft_rows_match_all_token_step_at_those_rows(monkeypatch):
     attention = draft.model.layers[0].self_attn
     attended = []
 
-    def forward_with_indices(hidden, positions, metadata, rows=None, reduce=True):
+    def forward_with_indices(
+        hidden,
+        positions,
+        metadata,
+        rows=None,
+        reduce=True,
+        replicated_indexer=False,
+        token_shard=False,
+    ):
         attended.append((len(hidden), None if rows is None else rows.tolist()))
         output = torch.sin(hidden.float() * 3 + positions[:, None].float() / 7)
         output = output.to(hidden.dtype)

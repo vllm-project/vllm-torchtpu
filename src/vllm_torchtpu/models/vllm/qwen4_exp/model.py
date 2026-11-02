@@ -233,7 +233,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
         if self.ple is not None and engram.get("cpu_offload", False):
             cfg.compilation_config.static_forward_context[prefix + ".ple"] = self.ple
-        self.layer_type = layer_type or t.layer_types[index]
+        raw_layer_type = layer_type or t.layer_types[index]
+        self.layer_type = (
+            "linear_attention"
+            if raw_layer_type == "linear_attention"
+            else "full_attention"
+        )
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen4ExpGatedDeltaNetAttention(
                 t,
@@ -249,6 +254,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             if out_proj is not None:
                 out_proj.reduce_results = False
         else:
+            scheduler_cfg = getattr(cfg, "scheduler_config", None)
             self.self_attn = Qwen4ExpQSA(
                 config=t,
                 max_model_len=cfg.model_config.max_model_len,
@@ -259,7 +265,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=prefix + ".self_attn",
                 pooled=use_unified_pool(),
                 max_query_len=num_speculative_tokens(cfg) + 1,
-                max_num_seqs=cfg.scheduler_config.max_num_seqs,
+                max_num_seqs=scheduler_cfg.max_num_seqs
+                if scheduler_cfg is not None
+                else 0,
             )
             cfg.compilation_config.static_forward_context[prefix + ".self_attn"] = (
                 self.self_attn
@@ -601,7 +609,8 @@ class Qwen4ExpBackbone(nn.Module):
     ):
         """The replicated-TP backbone; sequence-parallel steps go to
         ``Qwen4ExpBackboneSP``, a separate compiled graph over the same layers."""
-        return self._forward_impl(
+        return Qwen4ExpBackbone._forward_impl(
+            self,
             input_ids,
             positions,
             inputs_embeds,

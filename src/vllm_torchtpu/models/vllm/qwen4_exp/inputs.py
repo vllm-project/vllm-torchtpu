@@ -18,7 +18,12 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.utils import synchronize_tensors
 
 from .cache import Qwen4ExpCache
-from .config import mtp_layer_prefixes, num_speculative_tokens, use_unified_pool
+from .config import (
+    first_qsa_layer_index,
+    mtp_layer_prefixes,
+    num_speculative_tokens,
+    use_unified_pool,
+)
 
 if TYPE_CHECKING:
     from .pooled_cache import Qwen4ExpPooledCache
@@ -196,7 +201,7 @@ class Qwen4ExpAdapter:
         self.config = runner.model_config.hf_text_config
         self.block_size = runner.cache_config.block_size
         self.attention_prefix = (
-            f"model.layers.{self.config.layer_types.index('full_attention')}"
+            f"model.layers.{first_qsa_layer_index(self.config.layer_types)}"
         )
         self.cache: Qwen4ExpCache | Qwen4ExpPooledCache | None = None
         self.token_store = None

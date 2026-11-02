@@ -42,7 +42,11 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
 )
 from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding
-from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
+
+try:
+    from transformers import Qwen4ExpTextConfig
+except ImportError:
+    from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 _MASK64 = (1 << 64) - 1
 _MAX_INT64 = (1 << 63) - 1
@@ -515,7 +519,11 @@ class Qwen4ExpPLELayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
         hc_hidden_size = config.hidden_size * config.hc_count
-        embed_dim = config.ple_embed_dim
+        embed_dim = (
+            config.hidden_size
+            if config.ple_embed_dim is None
+            else int(config.ple_embed_dim)
+        )
         self.conv_dilation = config.ngram_size
         self.conv_state_len = (config.ple_conv_kernel_size - 1) * self.conv_dilation
         self.ple_embedding = Qwen4ExpNGramEmbedding(

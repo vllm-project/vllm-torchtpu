@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
-from .config import mtp_layer_prefixes, native_cache_specs
+from .config import first_qsa_layer_index, mtp_layer_prefixes, native_cache_specs
 from .qsa import QSA_BLOCK_SIZE
 
 # Explicit physical format shared by this model's page planner and GDN ops.
@@ -123,7 +123,7 @@ def pooled_cache_specs(cfg):
     specs = native_cache_specs(cfg)
     text = cfg.model_config.hf_text_config
     main: Any = specs[
-        f"model.layers.{text.layer_types.index('full_attention')}.self_attn"
+        f"model.layers.{first_qsa_layer_index(text.layer_types)}.self_attn"
     ]
     token_bytes = main.page_size_bytes // main.block_size
     gdn = specs[
