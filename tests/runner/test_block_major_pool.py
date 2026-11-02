@@ -231,7 +231,7 @@ def test_pcp_streaming_entry_folds_the_merged_pool(block_major):
         q_scale=None,
         k_scale=None,
         v_scale=None,
-        mesh=None,
+        mesh=SimpleNamespace(shape={"pcp": 1, "tp": 1}),
         sliding_window=None,
         skip_kv_update=False,
         cp_kv_cache_interleave_size=BLOCK,
