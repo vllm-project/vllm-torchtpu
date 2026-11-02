@@ -625,6 +625,7 @@ def _collectives_worker(rank: int, world: int, port: int) -> None:
     )
     try:
         group = SimpleNamespace(device_group=dist.group.WORLD)
+        # A spawned process of its own: the rebinding cannot leak into other tests.
         gemma4_patch.get_tp_group = lambda: group
         rows = torch.arange(world * 4 * 3, dtype=torch.float32).view(world * 4, 3)
         partial = rows + 100 * rank
@@ -780,10 +781,22 @@ def test_patched_model_init_refuses_pp_and_fast_prefill(monkeypatch) -> None:
     )
     model = torch.nn.Module()
     model.fast_prefill_enabled = False
+    model.vllm_config = SimpleNamespace(speculative_config=None)
     gemma4_patch._patched_model_init(model)
     # Nothing is added to the model: both branches must trace the same inputs.
     assert list(model.state_dict()) == [] and list(model.buffers()) == []
 
+    model.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="mtp")
+    )
+    gemma4_patch._patched_model_init(model)
+    model.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="eagle3")
+    )
+    with pytest.raises(ValueError, match="eagle3"):
+        gemma4_patch._patched_model_init(model)
+
+    model.vllm_config = SimpleNamespace(speculative_config=None)
     model.fast_prefill_enabled = True
     with pytest.raises(ValueError, match="kv_sharing_fast_prefill"):
         gemma4_patch._patched_model_init(model)

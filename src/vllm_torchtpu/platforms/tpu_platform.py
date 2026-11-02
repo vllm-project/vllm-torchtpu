@@ -1273,6 +1273,8 @@ class TpuPlatform(Platform):
                     scheduler_config.scheduler_cls,
                 )
 
+        _configure_prefill_first_scheduler(vllm_config)
+
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
@@ -1501,6 +1503,32 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
             len(paddings),
         )
     return paddings
+
+
+def _configure_prefill_first_scheduler(vllm_config: VllmConfig) -> None:
+    """Install PrefillFirstScheduler when VLLM_TPU_SOLO_PREFILL_OVER_TOKENS is
+    positive. Solo prefill steps are a layout the model's programs rely on, so a
+    different configured scheduler is an error rather than a warning."""
+    if not envs.VLLM_TPU_SOLO_PREFILL_OVER_TOKENS:
+        return
+    from vllm_torchtpu.core.experimental.prefill_first_scheduler import SCHEDULER_CLS
+
+    scheduler_config = vllm_config.scheduler_config
+    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+        installed_by = ""
+        if (
+            scheduler_config.scheduler_cls
+            == "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
+            and envs.DP_SCHED_ENABLED
+            and vllm_config.parallel_config.data_parallel_size > 1
+        ):
+            installed_by = " (DP_SCHED_ENABLED=1 installs it for DP > 1; unset it)"
+        raise ValueError(
+            "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS needs PrefillFirstScheduler, but "
+            f"{scheduler_config.scheduler_cls} is configured{installed_by}."
+        )
+    scheduler_config.scheduler_cls = SCHEDULER_CLS
+    logger.info("Enabled PrefillFirstScheduler.")
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:

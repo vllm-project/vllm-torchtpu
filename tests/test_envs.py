@@ -64,5 +64,7 @@ def test_startup_accepts_the_knob_unset(
     mock_prepare_env, mock_apply_patches, monkeypatch, vllm_config
 ):
     monkeypatch.delenv(REMOVED, raising=False)
+    # The mocked config names a scheduler of its own.
+    monkeypatch.setenv("VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", "0")
 
     TpuPlatform.check_and_update_config(vllm_config)

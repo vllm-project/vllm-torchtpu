@@ -217,6 +217,9 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_SOLO_PREFILL_OVER_TOKENS: int = 8192
+    VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE: int = 0
+    VLLM_TPU_SOLO_PREFILL_DECODE_STEPS: int = 1
 
 
 def env_with_choices(
@@ -1338,6 +1341,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # PrefillFirstScheduler (installed when > 0): requests with more than this
+    # many tokens to compute, none computed yet, are prefilled whole, each in
+    # a step of its own; every other step schedules at most this many tokens.
+    "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", 8192
+    ),
+    # PrefillFirstScheduler: solo prefill steps in a row while requests are
+    # running (0: no limit).
+    "VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE": env_nonnegative_int(
+        "VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE", 0
+    ),
+    # PrefillFirstScheduler: regular steps that schedule tokens between two
+    # runs of VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE solo steps.
+    "VLLM_TPU_SOLO_PREFILL_DECODE_STEPS": env_nonnegative_int(
+        "VLLM_TPU_SOLO_PREFILL_DECODE_STEPS", 1
     ),
 }
 
