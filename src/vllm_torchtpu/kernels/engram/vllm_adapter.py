@@ -1,13 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Torch boundary for the TP1 packed Engram kernel (PR #1853 adaptation)."""
 
+import jax
 import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.engram.kernel import fused_engram
 
 
-def _engram_jax(packed, hidden, weight, scale, query, key, mask, eps, clamp):
+def _engram_jax(
+    packed: jax.Array,
+    hidden: jax.Array,
+    weight: jax.Array,
+    scale: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    mask: jax.Array,
+    eps: float,
+    clamp: float,
+) -> jax.Array:
     return fused_engram(packed, hidden, weight, scale, query, key, mask, eps, clamp)
 
 

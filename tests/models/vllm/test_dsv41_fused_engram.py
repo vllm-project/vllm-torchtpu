@@ -15,6 +15,15 @@ SOURCE = (
 pytestmark = pytest.mark.cpu_test
 
 
+def test_fused_bridge_has_annotations_for_torch_tpu_schema_inference():
+    path = SOURCE.parents[4] / "kernels/engram/vllm_adapter.py"
+    tree = ast.parse(path.read_text())
+    bridge = next(n for n in tree.body if getattr(n, "name", None) == "_engram_jax")
+    assert all(arg.annotation is not None for arg in bridge.args.args)
+    assert bridge.returns is not None
+    assert len(bridge.args.args) == 9
+
+
 def methods(**namespace):
     tree = ast.parse(SOURCE.read_text())
     cls = next(n for n in tree.body if getattr(n, "name", None) == "Engram")
