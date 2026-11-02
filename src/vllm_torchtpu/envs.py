@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
     TPU_RPA_SKIP_EMPTY_LAUNCH: bool = True
+    TPU_RPA_FENCE_OUTPUT: bool = True
     TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = True
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
     DP_SCHED_ENABLED: bool = False
@@ -828,6 +829,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VMEM zero-fill and its schedule's HBM write-back instead of running
     # zero steps on initialized buffers. Outputs are unchanged.
     "TPU_RPA_SKIP_EMPTY_LAUNCH": env_bool("TPU_RPA_SKIP_EMPTY_LAUNCH", default=True),
+    # Batched RPA writes its output head-major and transposes it to token-major
+    # for the caller. Without a fence XLA fuses that transpose into the
+    # consumer, the o_proj's FP8 activation quantization, and moves the output
+    # twice in f32. With it the transpose is one bf16 copy and the quantization
+    # reads token-major rows. Outputs are unchanged.
+    "TPU_RPA_FENCE_OUTPUT": env_bool("TPU_RPA_FENCE_OUTPUT", default=True),
     # Cap the batched-RPA decode KV block of sliding-window layers at half the
     # window, rounded down to the block stride. The default block fills VMEM
     # (1792 tokens for a 1024-token window on Gemma4), and each decode launch
