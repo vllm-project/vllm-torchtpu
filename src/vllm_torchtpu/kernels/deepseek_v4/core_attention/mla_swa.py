@@ -32,6 +32,8 @@ Q_BLOCKS_PER_FETCH = 3
 # Cap on queries x heads per step: the q, output and acc buffers scale with
 # it. 96 x 64 fits VMEM at 1024 tokens; 128 x 64 does not.
 MAX_FETCH_Q_ROWS = 96 * 64
+# Rows per DMA when zeroing the padding rows of a normalized output.
+ZERO_ROWS_PER_COPY = 16
 
 
 def cdiv(a, b):
@@ -121,6 +123,45 @@ def fetch_block_sizes(
     # Block j's window starts at most j * bq_compute_sz tokens past block 0's.
     bkv_sz = (q_blocks - 1) * bq_compute_sz + bkv_compute_sz
     return bq_compute_sz, q_blocks * bq_compute_sz, cdiv(bkv_sz, logical_page_size)
+
+
+def _zero_rows_kernel(first_row_ref, in_ref, out_ref, zeros_ref, sem):
+    del in_ref  # Aliased with out_ref.
+    zeros_ref[...] = jnp.zeros_like(zeros_ref)
+    num_rows = out_ref.shape[0]
+    rows_per_copy = zeros_ref.shape[0]
+    first_row = first_row_ref[0]
+
+    def copy(i):
+        start = first_row + i * rows_per_copy
+        sz = jnp.minimum(rows_per_copy, num_rows - start)
+        return pltpu.make_async_copy(
+            zeros_ref.at[pl.ds(0, sz)], out_ref.at[pl.ds(start, sz)], sem
+        )
+
+    num_copies = cdiv(num_rows - first_row, rows_per_copy)
+    lax.fori_loop(0, num_copies, lambda i, _: copy(i).start(), None)
+    lax.fori_loop(0, num_copies, lambda i, _: copy(i).wait(), None)
+
+
+def zero_rows_from(out: jax.Array, first_row: jax.Array) -> jax.Array:
+    """Zeroes `out[first_row:]` in place, writing only those rows."""
+    return pl.pallas_call(
+        _zero_rows_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            grid=(1,),
+            scratch_shapes=[
+                pltpu.VMEM((ZERO_ROWS_PER_COPY, *out.shape[1:]), out.dtype),
+                pltpu.SemaphoreType.DMA(()),
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct(out.shape, out.dtype),
+        input_output_aliases={1: 0},
+        name="SWA-zero-padding-rows",
+    )(jnp.reshape(first_row, (1,)).astype(jnp.int32), out)
 
 
 def get_dtype_bitwidth(dtype):
@@ -1875,9 +1916,10 @@ def mla_sliding_window_ragged_paged_attention(
     num_l_heads = align_to(num_q_heads, 128)
     l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
     m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
-    # output of swa attn is consumed by csa, hca attn, padding tokens'
-    # data won't be used downstream at all, so un-initialized buffer is fine.
-    in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
+    # The kernels write every token's row. A normalized output's padding rows
+    # are zeroed after them (see `zero_rows_from`); an unnormalized one is
+    # consumed by the csa, hca attn, which never reads padding tokens' rows.
+    in_output = jnp.empty_like(q)
 
     bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
     if sliding_window <= bkv_sz:
@@ -1966,6 +2008,8 @@ def mla_sliding_window_ragged_paged_attention(
         unnormalized_output=unnormalized_output,
         case=MlaCase.MIXED,
     )
+    if not unnormalized_output:
+        output = zero_rows_from(output, cu_q_lens[distribution[2]])
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]

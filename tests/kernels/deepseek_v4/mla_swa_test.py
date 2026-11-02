@@ -619,6 +619,18 @@ class LongPageTableTest(CorrectnessTest):
         self.swc_page_indices = jnp.array(table.reshape(-1))
 
 
+class ZeroRowsFromTest(parameterized.TestCase):
+    @parameterized.parameters(0, 3, 47, 64)
+    def test_zeroes_only_rows_from_first_row(self, first_row):
+        x = jnp.arange(64 * 8 * 512, dtype=jnp.float32).reshape(64, 8, 512)
+        x = (x + 1).astype(jnp.bfloat16)
+
+        out = mla_swa.zero_rows_from(x, jnp.int32(first_row))
+
+        np.testing.assert_array_equal(out[:first_row], x[:first_row])
+        np.testing.assert_array_equal(out[first_row:], 0)
+
+
 class NarrowPageIndicesTest(parameterized.TestCase):
     def test_keeps_window_pages_and_shifts_kv_lens(self):
         # 2 sequences, 8 pages each of 4 tokens; page i of sequence s is 10*s+i.
