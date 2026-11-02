@@ -168,6 +168,12 @@ def _gathered_projection(linear: Any, x_local: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _token_chunks(x: torch.Tensor, chunks: int) -> list[torch.Tensor]:
+    # Not x.chunk: a split takes the symbolic chunk length as an argument,
+    # which torch_tpu cannot lower; a view and integer selects need none.
+    return list(x.view(chunks, -1, *x.shape[1:]).unbind(0)) if chunks > 1 else [x]
+
+
 def _attention(attn: Any, positions: torch.Tensor, qkv: torch.Tensor) -> torch.Tensor:
     """``Gemma4Attention.forward`` between the qkv and the o projection."""
     q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
@@ -195,7 +201,7 @@ def _sequence_parallel_layer(
     qkv = torch.cat(
         [_gathered_projection(attn.qkv_proj, self.input_layernorm(h)) for h in residual]
     )
-    attn_out = _attention(attn, positions, qkv).chunk(len(residual))
+    attn_out = _token_chunks(_attention(attn, positions, qkv), len(residual))
     hidden_states = [
         self.post_attention_layernorm(_reduce_scatter_rows(attn.o_proj(a)[0])) + r
         for a, r in zip(attn_out, residual)
@@ -335,7 +341,9 @@ def _patched_model_forward(
     if inputs_embeds is None:
         inputs_embeds = self.embed_input_ids(input_ids)
     chunks = _num_microbatches(num_tokens, row_bytes, tp_size)
-    hidden_states = [sequence_parallel_chunk(c) for c in inputs_embeds.chunk(chunks)]
+    hidden_states = [
+        sequence_parallel_chunk(c) for c in _token_chunks(inputs_embeds, chunks)
+    ]
     for layer in islice(self.layers, self.start_layer, self.end_layer):
         hidden_states, _ = layer(
             positions, hidden_states, None, sequence_parallel=True, **kwargs
