@@ -117,3 +117,40 @@ def test_sliding_decode_max_bkv_caps_only_sliding_decode(sliding_window):
     expected_decode_bkv = 512 if sliding_window else default[0].bkv_sz
     assert capped[0] == dataclasses.replace(default[0], bkv_sz=expected_decode_bkv)
     assert capped[1] == default[1]
+
+
+@pytest.mark.parametrize("sliding_window", [1024, None])
+def test_sliding_prefill_max_bkv_caps_only_sliding_prefill(sliding_window):
+    # Gemma4 31B TP8 sliding-layer shapes, where the default prefill block is 1024.
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_dim=256,
+        sliding_window=sliding_window,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=8,
+        page_size=256,
+        total_q_tokens=16384,
+        num_page_indices=8 * 640,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+    )
+    vmem_limit = 64 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        default = wrapper.calculate_block_sizes(model_cfg, serve_cfg, vmem_limit)
+        capped = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, vmem_limit, sliding_prefill_max_bkv=512
+        )
+    assert default[1].bkv_sz == default[1].bq_sz == 1024
+    assert capped[0] == default[0]
+    if sliding_window:
+        assert capped[1].bkv_sz == capped[1].bq_sz == 512
+        assert capped[1].batch_size == default[1].batch_size
+    else:
+        assert capped[1] == default[1]

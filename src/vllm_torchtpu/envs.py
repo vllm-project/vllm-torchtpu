@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_GREEDY_TOP_TOKENS: bool = False
     TPU_RPA_SKIP_EMPTY_LAUNCH: bool = False
     TPU_RPA_SLIDING_DECODE_MAX_BKV: int = 0
+    TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -731,6 +732,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it. 0 (default) keeps that block.
     "TPU_RPA_SLIDING_DECODE_MAX_BKV": env_nonnegative_int(
         "TPU_RPA_SLIDING_DECODE_MAX_BKV", 0
+    ),
+    # Largest batched-RPA mixed (prefill) KV and query block (tokens) on
+    # sliding-window layers. Blocks start at multiples of the KV block, so each
+    # query block computes about (block + window) / block + 1 whole KV blocks;
+    # the VMEM-filling default (1024 tokens on Gemma4-31B at TP8, 1536 on
+    # Gemma4-26B) computes 2-4x the window. 0 (default) keeps that block.
+    "TPU_RPA_SLIDING_PREFILL_MAX_BKV": env_nonnegative_int(
+        "TPU_RPA_SLIDING_PREFILL_MAX_BKV", 0
     ),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),

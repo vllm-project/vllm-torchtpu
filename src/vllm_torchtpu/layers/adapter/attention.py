@@ -522,6 +522,7 @@ def _pallas_rpa_kernel_batched(
     block_major: bool = False,
     skip_empty_launch: bool = False,
     sliding_decode_max_bkv: int | None = None,
+    sliding_prefill_max_bkv: int | None = None,
     fp8_compute: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
@@ -533,6 +534,8 @@ def _pallas_rpa_kernel_batched(
         rpa_kwargs["skip_empty_launch"] = True
     if sliding_decode_max_bkv is not None:
         rpa_kwargs["sliding_decode_max_bkv"] = sliding_decode_max_bkv
+    if sliding_prefill_max_bkv is not None:
+        rpa_kwargs["sliding_prefill_max_bkv"] = sliding_prefill_max_bkv
     if fp8_compute:
         rpa_kwargs["fp8_compute"] = True
     return _pallas_rpa_kernel_impl(
@@ -1072,6 +1075,17 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     max_bkv,
                 )
                 entry_kwargs["sliding_decode_max_bkv"] = max_bkv
+            max_prefill_bkv = envs.TPU_RPA_SLIDING_PREFILL_MAX_BKV
+            if (
+                "sliding_prefill_max_bkv" in entry_params
+                and max_prefill_bkv
+                and self.sliding_window is not None
+            ):
+                logger.info_once(
+                    "Batched RPA sliding-window prefill blocks of at most %d tokens.",
+                    max_prefill_bkv,
+                )
+                entry_kwargs["sliding_prefill_max_bkv"] = max_prefill_bkv
             if self.fp8_compute:
                 if "fp8_compute" not in entry_params:
                     raise NotImplementedError(
