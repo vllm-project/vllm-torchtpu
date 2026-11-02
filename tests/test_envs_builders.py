@@ -28,6 +28,7 @@ from vllm_torchtpu.envs import (
     env_bool,
     env_float,
     env_int,
+    env_nonnegative_float,
     env_nonnegative_int,
     env_nonnegative_int_or_auto,
     env_str,
@@ -53,6 +54,7 @@ def _clear(monkeypatch):
         (env_int, 7),
         (env_nonnegative_int, 7),
         (env_float, 1.5),
+        (env_nonnegative_float, 2.5),
     ],
 )
 def test_unset_reads_as_the_default(builder, default):
@@ -66,6 +68,7 @@ def test_unset_reads_as_the_default(builder, default):
         (env_int, 7),
         (env_nonnegative_int, 7),
         (env_float, 1.5),
+        (env_nonnegative_float, 2.5),
     ],
 )
 @pytest.mark.parametrize("value", ["", "   "])
@@ -158,6 +161,18 @@ def test_float_rejects_non_numbers(monkeypatch):
     monkeypatch.setenv(VAR, "soon")
     with pytest.raises(ValueError, match=VAR):
         env_float(VAR, 1.0)()
+
+
+def test_nonnegative_float_parses_fractions(monkeypatch):
+    monkeypatch.setenv(VAR, "2.5")
+    assert env_nonnegative_float(VAR, 0.0)() == 2.5
+
+
+@pytest.mark.parametrize("value", ["-0.5", "inf", "nan"])
+def test_nonnegative_float_rejects_negative_or_non_finite(monkeypatch, value):
+    monkeypatch.setenv(VAR, value)
+    with pytest.raises(ValueError, match="must be finite and >= 0"):
+        env_nonnegative_float(VAR, 0.0)()
 
 
 @pytest.mark.parametrize("value", [None, "", "  ", "auto", "AUTO", " Auto "])

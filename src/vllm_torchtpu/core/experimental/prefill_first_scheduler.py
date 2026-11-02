@@ -59,6 +59,24 @@ DP > 1, also runs a dummy forward, so it does not spin and a request that
 arrives meanwhile waits about that long. The held decodes leave the runner's
 persistent batch for the hold and are added back when they next decode.
 
+TPOT pacing (``VLLM_TPU_DECODE_TPOT_TARGET_MS=T`` or
+``VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST=P`` > 0, or both). Each running request
+earns one decode token per ``max(T, P * n)`` milliseconds, ``n`` being the
+requests the engine holds (running and waiting) at the time, and a regular step
+schedules its decode only while it holds an earned token. A request that fell
+behind (in long prefill steps, say) holds several and decodes in every step
+until it is back on schedule, so each request's TPOT tends to the target and
+its decode ends about ``output_len`` intervals after it began. A held request
+resumes once it holds ``_RESUME_AFTER_TOKENS``. Prefill chunks are never held
+back; a step with no earned decode and nothing to prefill schedules nothing
+(the engine core then yields 1 ms and, with DP > 1, runs a dummy forward). With
+a closed-loop client a request's completion sends the user's next one, so
+decodes paced to a target finish spread out like their first tokens instead of
+together, and the next requests do not queue behind each other's prefills;
+under open-loop arrivals this only raises TPOT. ``P`` caps the engine's decode
+rate at ``1000 / P`` tokens per second shared equally by its requests, so the
+target follows the load.
+
 Prefill-aware DP load balancing (``VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS=U > 0``).
 vLLM's data-parallel front end sends each new request to the engine with the
 fewest waiting plus running requests, as each engine's scheduler reports them;
@@ -79,6 +97,7 @@ selects it too.
 """
 
 import contextlib
+import dataclasses
 from collections.abc import Iterator
 from itertools import chain
 from time import monotonic
@@ -97,10 +116,25 @@ SCHEDULER_CLS = (
     "vllm_torchtpu.core.experimental.prefill_first_scheduler.PrefillFirstScheduler"
 )
 
+# Every resume puts a request back into the model runner's persistent batch,
+# which rewrites its whole token row: ~2 ms of host time per 80K-token prompt,
+# so TPOT pacing resumes a request once per this many tokens, not every token.
+_RESUME_AFTER_TOKENS = 16
+
+
+@dataclasses.dataclass
+class _Pace:
+    """TPOT-pacing state of one decoding request."""
+
+    # Decode tokens earned and not yet scheduled.
+    earned: float = 1.0
+    # Decoding in every step until back on schedule.
+    resumed: bool = True
+
 
 class PrefillFirstScheduler(AsyncScheduler):
-    """Solo whole-prompt prefill steps, decode pacing, a decode interval floor
-    and prefill-aware DP load-balancing counts (module docstring)."""
+    """Solo whole-prompt prefill steps, decode pacing, a decode interval floor,
+    TPOT pacing and prefill-aware DP load-balancing counts (module docstring)."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -110,16 +144,21 @@ class PrefillFirstScheduler(AsyncScheduler):
         self.decode_interval = envs.VLLM_TPU_DECODE_INTERVAL_MS / 1000
         self.lb_prefill_unit = envs.VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS
         self.min_decode_interval = envs.VLLM_TPU_MIN_DECODE_INTERVAL_MS / 1000
+        self.tpot_target = envs.VLLM_TPU_DECODE_TPOT_TARGET_MS / 1000
+        self.tpot_per_request = envs.VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST / 1000
         if not (
             self.solo_over_tokens
             or self.decode_interval
             or self.lb_prefill_unit
             or self.min_decode_interval
+            or self.tpot_target
+            or self.tpot_per_request
         ):
             raise ValueError(
                 "PrefillFirstScheduler needs VLLM_TPU_SOLO_PREFILL_OVER_TOKENS, "
-                "VLLM_TPU_DECODE_INTERVAL_MS, VLLM_TPU_MIN_DECODE_INTERVAL_MS or "
-                "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS."
+                "VLLM_TPU_DECODE_INTERVAL_MS, VLLM_TPU_MIN_DECODE_INTERVAL_MS, "
+                "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS, VLLM_TPU_DECODE_TPOT_TARGET_MS "
+                "or VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST."
             )
         if self.lb_prefill_unit and self.parallel_config.data_parallel_size == 1:
             logger.warning(
@@ -149,6 +188,9 @@ class PrefillFirstScheduler(AsyncScheduler):
         self._force_decode = False
         # When the last step that decoded was scheduled (interval floor).
         self._last_decode = float("-inf")
+        # TPOT pacing: per decoding request, and when tokens were last earned.
+        self._pace: dict[str, _Pace] = {}
+        self._paced_at = 0.0
         # Set while the base scheduler's own logic reads the request counts:
         # schedule() and the unfinished-request checks see the true counts.
         self._true_counts = False
@@ -156,7 +198,8 @@ class PrefillFirstScheduler(AsyncScheduler):
             "PrefillFirstScheduler active (solo_over_tokens=%d, "
             "max_solo_tokens=%d, solo_max_consecutive=%d, solo_decode_steps=%d, "
             "decode_interval_ms=%g, min_decode_interval_ms=%g, "
-            "dp_lb_prefill_unit_tokens=%d)",
+            "dp_lb_prefill_unit_tokens=%d, tpot_target_ms=%g, "
+            "tpot_ms_per_request=%g)",
             self.solo_over_tokens,
             self.max_solo_tokens,
             self.solo_max_consecutive,
@@ -164,6 +207,8 @@ class PrefillFirstScheduler(AsyncScheduler):
             self.decode_interval * 1000,
             self.min_decode_interval * 1000,
             self.lb_prefill_unit,
+            self.tpot_target * 1000,
+            self.tpot_per_request * 1000,
         )
 
     def _check_solo_config(self) -> None:
@@ -350,20 +395,56 @@ class PrefillFirstScheduler(AsyncScheduler):
         held = self._held_from_regular()
         decodes = [r for r in self.running if not r.is_prefill_chunk]
         below_floor = self._below_decode_floor(decodes)
-        paused = decodes if below_floor else self._paused_decodes()
+        interval_paused = [] if below_floor else self._paused_decodes()
+        paused = decodes if below_floor else interval_paused
+        paced = self._tpot_paced(decodes)
+        hidden = paused + [r for r in paced if r not in paused]
         budget = self.max_num_scheduled_tokens
         if self.solo_over_tokens:
             self.max_num_scheduled_tokens = min(budget, self.solo_over_tokens)
         try:
-            with self._hidden_waiting(held), self._hidden_running(paused):
+            with self._hidden_waiting(held), self._hidden_running(hidden):
                 output = super().schedule(throttle_prefills)
         finally:
             self.max_num_scheduled_tokens = budget
-        if paused and not below_floor and not output.total_num_scheduled_tokens:
+        if interval_paused and not output.total_num_scheduled_tokens:
             self._force_decode = True
+        for req_id, pace in self._pace.items():
+            pace.earned -= output.num_scheduled_tokens.get(req_id, 0)
         if any(r.request_id in output.num_scheduled_tokens for r in decodes):
             self._last_decode = monotonic()
         return output
+
+    def _tpot_paced(self, decodes: list[Request]) -> list[Request]:
+        """The decodes that sit this regular step out for TPOT pacing: those
+        without an earned token, and, after such a hold, those still short of
+        ``_RESUME_AFTER_TOKENS``. A request starts decoding at once."""
+        if not (self.tpot_target or self.tpot_per_request):
+            return []
+        now = monotonic()
+        elapsed, self._paced_at = now - self._paced_at, now
+        # Positive whenever there is a decode: the engine holds it.
+        interval = max(
+            self.tpot_target,
+            self.tpot_per_request * (len(self.running) + len(self.waiting)),
+        )
+        # Requests that stopped decoding (finished, preempted) drop out.
+        pace: dict[str, _Pace] = {}
+        paced = []
+        for r in decodes:
+            state = self._pace.get(r.request_id)
+            if state is None:
+                state = _Pace()
+            else:
+                state.earned += elapsed / interval
+                state.resumed = state.earned >= (
+                    1 if state.resumed else _RESUME_AFTER_TOKENS
+                )
+            pace[r.request_id] = state
+            if not state.resumed:
+                paced.append(r)
+        self._pace = pace
+        return paced
 
     def _below_decode_floor(self, decodes: list[Request]) -> bool:
         """Whether a decode-only step still waits for the interval floor."""

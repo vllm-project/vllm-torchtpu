@@ -219,6 +219,8 @@ if TYPE_CHECKING:
     VLLM_TPU_DECODE_INTERVAL_MS: int = 0
     VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS: int = 0
     VLLM_TPU_MIN_DECODE_INTERVAL_MS: int = 0
+    VLLM_TPU_DECODE_TPOT_TARGET_MS: float = 0.0
+    VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST: float = 0.0
 
 
 def env_with_choices(
@@ -350,6 +352,21 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
             ) from exc
 
     return _get_float_env
+
+
+def env_nonnegative_float(env_name: str, default: float) -> Callable[[], float]:
+    """Float knob that must be finite and not negative; a bad value raises."""
+    parse_float = env_float(env_name, default)
+
+    def _get_nonnegative_float_env() -> float:
+        value = parse_float()
+        if not 0 <= value < float("inf"):
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be finite and >= 0."
+            )
+        return value
+
+    return _get_nonnegative_float_env
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -1288,9 +1305,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
-    # PrefillFirstScheduler (installed when this, VLLM_TPU_DECODE_INTERVAL_MS,
-    # VLLM_TPU_MIN_DECODE_INTERVAL_MS or VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS is
-    # > 0): requests with more than this many tokens to compute, none computed
+    # PrefillFirstScheduler (installed when this or another of its policies
+    # below is > 0): requests with more than this many tokens to compute, none computed
     # yet, are prefilled whole, each in a step of its own; every other step
     # schedules at most this many tokens.
     "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS": env_nonnegative_int(
@@ -1323,6 +1339,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # step that decoded (0: no floor).
     "VLLM_TPU_MIN_DECODE_INTERVAL_MS": env_nonnegative_int(
         "VLLM_TPU_MIN_DECODE_INTERVAL_MS", 0
+    ),
+    # PrefillFirstScheduler: each running request earns one decode token per
+    # this many milliseconds and decodes only while it holds one (0: off).
+    "VLLM_TPU_DECODE_TPOT_TARGET_MS": env_nonnegative_float(
+        "VLLM_TPU_DECODE_TPOT_TARGET_MS", 0.0
+    ),
+    # PrefillFirstScheduler: raise that interval to this many milliseconds per
+    # request the engine holds, running or waiting (0: off).
+    "VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST": env_nonnegative_float(
+        "VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST", 0.0
     ),
 }
 
