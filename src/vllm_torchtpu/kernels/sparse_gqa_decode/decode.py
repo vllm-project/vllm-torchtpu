@@ -26,6 +26,7 @@ from vllm_torchtpu.kernels.sparse_gqa_decode.batching import attend_in_chunks
 from vllm_torchtpu.kernels.sparse_gqa_decode.fused_kernel import decode_kernel
 from vllm_torchtpu.kernels.sparse_gqa_decode.metadata import virtual_page_metadata
 from vllm_torchtpu.kernels.sparse_gqa_decode.planning import DecodeLaunch
+from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import prepare_query
 
 
 def _attend(q, gate, blocks, lengths, table, cache, *, launch, k_scale, v_scale):
@@ -39,8 +40,7 @@ def _attend(q, gate, blocks, lengths, table, cache, *, launch, k_scale, v_scale)
         cfgs, serve=dataclasses.replace(cfgs.serve, scale_k=k_scale, scale_v=v_scale)
     )
     # Keep request order; the compact schedule omits inactive requests.
-    query = jnp.where((lengths > 0)[:, None, None], q, 0).astype(jnp.float32)
-    query = query.reshape(batch, kv_heads, heads // kv_heads, 1, dim).swapaxes(0, 1)
+    query = prepare_query(q, lengths, kv_heads)
     virtual_cache = cache.reshape(-1, ratio, *cache.shape[2:])
     # RPA's buffer binding accepts a new-KV operand even when cache updates and
     # new-KV DMAs are disabled. No dummy K/V preparation or concatenation needed.

@@ -72,9 +72,15 @@ def produce(
     qgate = qgate.reshape(len(qgate), qgate.shape[1] // (2 * head_dim), 2 * head_dim)
     key = key.reshape(len(key), key.shape[1] // head_dim, head_dim)
     value = value.reshape(len(value), value.shape[1] // head_dim, head_dim)
-    q = main_rope(
-        gemma_norm(qgate[..., :head_dim], nq, norm_eps), positions, trig, rotary_dim
-    )
+    from .query_prepare import prepare_query_values
+    from .tuned_block_sizes import use_query_prepare
+
+    if use_query_prepare(qgate, nq, trig, rotary_dim):
+        q = prepare_query_values(qgate, nq, positions, trig, norm_eps, rotary_dim)
+    else:
+        q = main_rope(
+            gemma_norm(qgate[..., :head_dim], nq, norm_eps), positions, trig, rotary_dim
+        )
     key = main_rope(gemma_norm(key, nk, norm_eps), positions, trig, rotary_dim)
     index_heads = index_qk.shape[1] // index_dim - 1
     iq = index_rope(

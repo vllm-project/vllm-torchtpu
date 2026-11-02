@@ -21,12 +21,112 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import KVLayout
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     SparseCoreTopK,
 )
 from vllm_torchtpu.kernels.qwen4_exp import decode_indexer, pooled_qsa
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 from vllm_torchtpu.kernels.qwen4_exp.qsa import _token_metadata
+
+
+@pytest.mark.parametrize("case", ["wide", "chip", "batch", "topk", "carrier"])
+def test_decode_reader_view_preserves_page_ids_and_native_keys(monkeypatch, case):
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.qwen4_exp import tuned_block_sizes
+
+    chip = pltpu.ChipVersion.TPU_V5P if case == "chip" else pltpu.ChipVersion.TPU_7X
+    monkeypatch.setattr(
+        tuned_block_sizes.pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(chip, 1),
+    )
+    batch = 9 if case == "batch" else 16
+    k = 16 if case == "topk" else 512
+    native = (jnp.arange(4 * 416 * 128) % 113).astype(jnp.bfloat16)
+    cache = native.reshape(4, 208, 2, 128)
+    if case == "carrier":
+        cache = jax.lax.bitcast_convert_type(cache, jnp.uint8)
+        cache = cache.transpose(0, 1, 2, 4, 3).reshape(4, 208, 4, 128)
+    pages = jnp.arange(32 * 41, dtype=jnp.int32).reshape(32, 41) % 4
+    requests = jnp.arange(batch, dtype=jnp.int32)[::-1]
+    calls = []
+
+    def inspect(q, weights, read_cache, lengths, read_pages, cu, dist, **kwargs):
+        reader = kwargs["components"].keys
+        reader.validate(read_cache, 128, KVLayout.HEAD_ALONG_SUBLANE)
+        calls.append(reader.packing)
+        np.testing.assert_array_equal(read_pages, pages[requests].reshape(-1))
+        if case != "carrier":
+            np.testing.assert_array_equal(read_cache.reshape(-1), native)
+            assert read_cache.shape[1] * reader.packing == 416
+        assert cu is None and dist is None
+        return jnp.full((len(q), k), -1, jnp.int32)
+
+    monkeypatch.setattr(decode_indexer, "streamindex_topk", inspect)
+    decode_indexer.select_index_blocks(
+        jnp.zeros((batch, 4, 128), jnp.bfloat16),
+        cache,
+        jnp.full((batch,), 65536, jnp.int32),
+        pages,
+        requests,
+        starts=None,
+        context=None,
+        ratio=4,
+        block_topk=k,
+    )
+    assert calls == [16 if case == "wide" else 2]
+
+
+@pytest.mark.parametrize("case", ["decode", "prefill", "padding", "backend", "chip"])
+def test_sidecar_page_coalescing_preserves_owned_key_addresses(monkeypatch, case):
+    """Large pages must preserve physical ownership and exclude sidecar padding."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.qwen4_exp import tuned_block_sizes
+
+    chip = pltpu.ChipVersion.TPU_V5P if case == "chip" else pltpu.ChipVersion.TPU_7X
+    monkeypatch.setattr(
+        tuned_block_sizes.pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(chip, 1),
+    )
+    physical_rows = 448 if case == "padding" else 416
+    pool = (jnp.arange(4 * physical_rows * 128) % 127).astype(jnp.bfloat16)
+    pool = pool.reshape(4, physical_rows // 2, 1, 2, 128)
+    requests = 8 if case == "prefill" else 16
+    table = jnp.asarray(np.random.default_rng(52).integers(4, size=(requests, 41)))
+    req = jnp.arange(16, dtype=jnp.int32)[::-1] % requests
+    columns = jnp.array([0, 31, 32, 415, 416, 17055])
+    observed = []
+
+    def read(q, cache, lengths, pages, request_ids, **kwargs):
+        page_size = cache.shape[1] * 2
+        observed.append(page_size)
+        keys = cache.reshape(-1, page_size, 128)
+        ids = pages[request_ids[:, None], columns[None] // page_size]
+        return keys[ids, columns[None] % page_size]
+
+    monkeypatch.setattr(pooled_qsa, "select_index_blocks", read)
+    actual = pooled_qsa.select_blocks(
+        jnp.zeros((16, 4, 128), jnp.bfloat16),
+        pool,
+        jnp.full((16,), 67584, jnp.int32),
+        table,
+        req,
+        jnp.arange(requests + 1, dtype=jnp.int32),
+        jnp.zeros((requests,), jnp.int32),
+        ratio=4,
+        block_topk=512,
+        topk_backend=ReferenceTopK() if case == "backend" else None,
+        logical_block_size=1664,
+    )
+    expected = pool.reshape(4, physical_rows, 128)[
+        table[req[:, None], columns[None] // 416], columns[None] % 416
+    ]
+    np.testing.assert_array_equal(actual, expected)
+    assert observed == [416 if case == "decode" else 32]
 
 
 @dataclass(frozen=True)
@@ -86,6 +186,9 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
     def record(q, weights, cache, lengths, pages, cu, distribution, **kwargs):
         assert kwargs["topk_backend"] is backend
         assert kwargs["scheduling_group_namespace"] == namespace
+        if cu is None:
+            assert distribution is None
+            cu = jnp.arange(len(q) + 1, dtype=jnp.int32)
         seen.append((np.asarray(lengths), np.asarray(cu), kwargs))
         # Independently reconstruct each query's visible complete groups.
         rq = jnp.minimum(
@@ -288,8 +391,18 @@ def test_pooled_step_forwards_geometry_and_backend_before_attention(
     monkeypatch.setattr(pooled_qsa, "select_blocks", select)
     monkeypatch.setattr(pooled_qsa, "write_main_cache", lambda pool, *a: pool)
 
-    def write_compressed(pool, *args, logical_block_size):
+    def write_compressed(
+        pool,
+        *args,
+        logical_block_size,
+        batch_pairs,
+        trig_rows,
+        trig_cache,
+        positions,
+    ):
         assert logical_block_size == 128
+        assert not batch_pairs
+        assert trig_rows is None and trig_cache is None and positions is None
         return pool
 
     monkeypatch.setattr(pooled_qsa, "write_compressed", write_compressed)
@@ -408,10 +521,16 @@ def test_production_compact_factory_exposes_compiler_owned_namespace(monkeypatch
     op, options = registrations[0]
     assert options["donate_argnums"] == (10, 11)
     schema = op._opoverload._schema
-    assert schema.arguments[-1].name == "scheduling_group_namespace"
-    assert schema.arguments[-1].default_value == 0
+    namespace_index = next(
+        i
+        for i, argument in enumerate(schema.arguments)
+        if argument.name == "scheduling_group_namespace"
+    )
+    assert schema.arguments[namespace_index].default_value == 0
     graph = torch.fx.Graph()
-    args = tuple(graph.placeholder(arg.name) for arg in schema.arguments[:-1])
+    args = tuple(
+        graph.placeholder(arg.name) for arg in schema.arguments[:namespace_index]
+    )
     first = graph.call_function(op._opoverload, args)
     second = graph.call_function(op._opoverload, args)
     graph.output((first, second))

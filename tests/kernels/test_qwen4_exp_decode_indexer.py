@@ -17,6 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    SparseCoreTopK,
+)
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import (
     select_decode_blocks,
 )
@@ -71,6 +74,47 @@ def test_decode_indexer_rejects_quantized_index_cache():
             table,
             jnp.arange(len(query), dtype=jnp.int32),
         )
+
+
+class _AlignedScoreTopK(SparseCoreTopK):
+    def select(self, score_bits, k, row_lengths, *, scheduling_group_id, return_scores):
+        # The flat reader must not compact a partial physical int32 tile.
+        from jax.experimental.pallas import tpu as pltpu
+
+        tile = pltpu.get_tpu_info().get_sublane_tiling(jnp.int32) * 128
+        assert score_bits.shape[1] % tile == 0
+        return super().select(
+            score_bits,
+            k,
+            row_lengths,
+            scheduling_group_id=scheduling_group_id,
+            return_scores=return_scores,
+        )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("ties", [False, True])
+def test_decode_score_pitch_alignment_preserves_remainder_and_padding(ties):
+    """A 768-column score row has physical padding before flat top-k reads."""
+    query, cache, lengths, table = _inputs(batch=9)
+    if ties:
+        query = jnp.zeros_like(query)
+    actual = np.asarray(
+        select_decode_blocks(
+            query,
+            cache,
+            lengths,
+            table,
+            jnp.arange(len(query), dtype=jnp.int32),
+            topk_backend=_AlignedScoreTopK(),
+        )
+    )
+    scores = _reference(query, cache, lengths, table)
+    for row, length in enumerate(np.asarray(lengths)):
+        count = min(512, length // 4)
+        wanted = np.argsort(-scores[row], kind="stable")[:count]
+        np.testing.assert_array_equal(np.sort(actual[row, :count]), np.sort(wanted))
+        np.testing.assert_array_equal(actual[row, count:], -1)
 
 
 @pytest.mark.tpu_test

@@ -65,6 +65,12 @@ def virtual_page_metadata(
     """
     if ratio <= 0 or page_size <= 0 or page_size % ratio:
         raise ValueError("Physical page size must be positive and divisible by ratio")
+    from .tuned_block_sizes import use_fused_page_metadata
+
+    if use_fused_page_metadata(blocks, lengths, table, ratio, page_size):
+        return fused_virtual_page_metadata(
+            blocks, lengths, table, ratio=ratio, page_size=page_size
+        )
     batch, budget = blocks.shape
     if table.ndim != 2 or table.shape[0] != batch or table.shape[1] == 0:
         raise ValueError("Page tables must have one nonempty row per query")
@@ -95,4 +101,55 @@ def virtual_page_metadata(
         valid, physical * (page_size // ratio) + safe % (page_size // ratio), 0
     )
     kv_lens = count * ratio + lengths % ratio
+    return pages, kv_lens
+
+
+def fused_virtual_page_metadata(blocks, lengths, table, *, ratio=4, page_size=1664):
+    """Prepare the existing reader ABI without intermediate virtual-page owners."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    batch, budget = blocks.shape
+    padded = jnp.pad(table, ((0, 0), (0, 128 - table.shape[1])))
+    per_page = page_size // ratio
+
+    def kernel(selected, length, physical_table, pages):
+        n = length[...]
+        complete = n // ratio
+        count = jnp.minimum(complete, budget)
+        columns = jnp.arange(budget + 1)[None, :]
+        groups = jnp.concatenate(
+            (selected[...], jnp.zeros((batch, 1), jnp.int32)), axis=1
+        )
+        groups = jnp.where(columns == count[:, None], complete[:, None], groups)
+        live = (columns < count[:, None]) | (
+            (columns == count[:, None]) & ((n % ratio)[:, None] > 0)
+        )
+        safe = jnp.where(live, groups, 0)
+        physical = jnp.take_along_axis(
+            physical_table[...],
+            jnp.clip(safe // per_page, 0, table.shape[1] - 1),
+            axis=1,
+        )
+        pages[...] = jnp.where(live, physical * per_page + safe % per_page, 0)
+
+    pages = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            grid=(1,),
+            in_specs=[
+                pl.BlockSpec((batch, budget), lambda t: (0, 0)),
+                pl.BlockSpec((batch,), lambda t: (0,)),
+                pl.BlockSpec((batch, 128), lambda t: (0, 0)),
+            ],
+            out_specs=pl.BlockSpec((batch, budget + 1), lambda t: (0, 0)),
+        ),
+        out_shape=jax.ShapeDtypeStruct((batch, budget + 1), jnp.int32),
+        name="qsa_virtual_page_prepare",
+    )(blocks, lengths, padded)
+    # Keep schedule lengths independent of per-layer selected blocks. Returning
+    # them from the opaque page kernel defeats cross-layer CSE and duplicates
+    # the shared decode schedule twelve times in the production chain.
+    kv_lens = jnp.minimum(lengths // ratio, budget) * ratio + lengths % ratio
     return pages, kv_lens

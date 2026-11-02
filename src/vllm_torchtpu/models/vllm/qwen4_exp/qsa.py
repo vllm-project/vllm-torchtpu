@@ -26,7 +26,10 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.utils.torch_utils import set_default_torch_dtype
@@ -45,6 +48,9 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_compact_pooled_qsa_op
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedLinearMethod,
+)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import require_unified_pool
@@ -178,19 +184,8 @@ class Qwen4ExpPooledQSABackend(PallasAttentionBackend):
 
 
 class _Indexer(nn.Module):
-    def __init__(self, config, prefix):
+    def __init__(self, config):
         super().__init__()
-        self.index_qk_proj = ReplicatedLinear(
-            config.hidden_size,
-            (config.indexer_n_heads + config.indexer_kv_heads)
-            * config.indexer_head_dim,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            quant_config=None,
-            prefix=prefix + ".index_qk_proj",
-            return_bias=False,
-            disable_tp=True,
-        )
         self.q_layernorm = GemmaRMSNorm(
             config.indexer_head_dim, eps=config.rms_norm_eps
         )
@@ -198,6 +193,13 @@ class _Indexer(nn.Module):
             config.indexer_head_dim, eps=config.rms_norm_eps
         )
 
+
+_INPUT_PROJECTION_NAMES = (
+    "q_proj.weight",
+    "k_proj.weight",
+    "v_proj.weight",
+    "indexer.index_qk_proj.weight",
+)
 
 class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     """Config-derived gated attention with a fully replicated MQA indexer.
@@ -209,8 +211,6 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     """
 
     supports_dcp = False
-    k_proj: ColumnParallelLinear
-    v_proj: ColumnParallelLinear
     _k_scale: torch.Tensor
     _v_scale: torch.Tensor
     _k_scale_cpu: torch.Tensor
@@ -253,41 +253,34 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.compress_ratio = int(config.indexer_compress_ratio)
         self.token_topk = int(config.indexer_budget)
         self.max_selected_tokens = self.token_topk + self.compress_ratio - 1
-        kv_size = min(tp_size, self.total_num_kv_heads)
-        kv_rank = tp_rank // max(tp_size // self.total_num_kv_heads, 1)
+        self.input_sizes = (
+            2 * self.num_heads * self.head_dim,
+            self.num_kv_heads * self.head_dim,
+            self.num_kv_heads * self.head_dim,
+            (self.index_n_heads + 1) * self.index_head_dim,
+        )
         with torch.device(device or "cpu"), set_default_torch_dtype(torch.bfloat16):
-            self.q_proj = ColumnParallelLinear(
+            # Keep Q independent so its MXU work can overlap asynchronous
+            # index selection. Only the small K/V/index projections are packed.
+            self.q_proj = ReplicatedLinear(
                 self.hidden_size,
-                2 * self.total_num_heads * self.head_dim,
+                self.input_sizes[0],
                 bias=False,
                 params_dtype=torch.bfloat16,
                 quant_config=None,
                 prefix=prefix + ".q_proj",
                 return_bias=False,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
+                disable_tp=True,
             )
-            self.k_proj = ColumnParallelLinear(
+            self.input_proj = MergedColumnParallelLinear(
                 self.hidden_size,
-                self.total_num_kv_heads * self.head_dim,
+                list(self.input_sizes[1:]),
                 bias=False,
                 params_dtype=torch.bfloat16,
                 quant_config=None,
-                prefix=prefix + ".k_proj",
+                prefix=prefix + ".input_proj",
                 return_bias=False,
-                tp_rank=kv_rank,
-                tp_size=kv_size,
-            )
-            self.v_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.total_num_kv_heads * self.head_dim,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                quant_config=None,
-                prefix=prefix + ".v_proj",
-                return_bias=False,
-                tp_rank=kv_rank,
-                tp_size=kv_size,
+                disable_tp=True,
             )
             # Upstream RowParallelLinear cannot take explicit TP geometry.
             # Reuse its constituent mechanisms: local unquantized linear and
@@ -304,12 +297,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             )
             self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.indexer = _Indexer(config, prefix + ".indexer")
+            self.indexer = _Indexer(config)
         self.register_buffer(
             "rope_cache",
             make_rope_cache(
                 max_model_len,
-                rotary_dim=int(self.head_dim * config.partial_rotary_factor),
+                rotary_dim=int(self.head_dim * self.config.partial_rotary_factor),
                 theta=float(config.rope_parameters["rope_theta"]),
             ).to(device=device),
             persistent=False,
@@ -317,6 +310,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         with torch.device(device or "cpu"):
             set_default_quant_scales(self, register_buffer=True)
         self.cache_owners: tuple[torch.Tensor, ...] = ()
+        self.register_buffer("output_weight_tiles", None, persistent=False)
         self._loaded: set[str] = set()
         self._op = partial(
             build_compact_pooled_qsa_op(
@@ -325,8 +319,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             compress_ratio=self.compress_ratio,
             token_topk=self.token_topk,
             norm_eps=float(self.q_norm.variance_epsilon),
-            rotary_dim=int(self.head_dim * config.partial_rotary_factor),
+            rotary_dim=int(self.head_dim * self.config.partial_rotary_factor),
         )
+        self._projected_op = None
 
     def get_attn_backend(self):
         return Qwen4ExpPooledQSABackend
@@ -391,39 +386,133 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 or weight.dtype != torch.bfloat16
             ):
                 raise ValueError(f"Invalid BF16 QSA checkpoint tensor: {name}")
-            parameter = parameters[name]
             with torch.no_grad():
-                if name in ("q_proj.weight", "k_proj.weight", "v_proj.weight"):
-                    cast(BasevLLMParameter, parameter).weight_loader(parameter, weight)
+                if name in _INPUT_PROJECTION_NAMES:
+                    shard = _INPUT_PROJECTION_NAMES.index(name)
+                    width = self.input_sizes[shard]
+                    if shard == 0:
+                        rank = self.tp_rank
+                    elif shard in (1, 2):
+                        rank = self.tp_rank // max(
+                            self.tp_size // self.total_num_kv_heads, 1
+                        )
+                    else:
+                        rank = 0
+                    local_weight = weight.narrow(0, rank * width, width)
+                    if shard == 0:
+                        self.q_proj.weight_loader(self.q_proj.weight, local_weight)
+                    else:
+                        parameter = self.input_proj.weight
+                        cast(BasevLLMParameter, parameter).weight_loader(
+                            parameter, local_weight, shard - 1
+                        )
                 elif name == "o_proj.weight":
+                    parameter = parameters[name]
                     width = self.num_heads * self.head_dim
                     self.o_proj.weight_loader(
                         parameter,
                         weight[:, self.tp_rank * width : (self.tp_rank + 1) * width],
                     )
                 else:
-                    parameter.copy_(weight)
+                    parameters[name].copy_(weight)
             loaded.add(name)
         self._loaded.update(loaded)
         return loaded
 
     def finalize_weights(self):
-        missing = set(dict(self.named_parameters())) - self._loaded
+        expected = set(dict(self.named_parameters())) - {"input_proj.weight"}
+        expected.update(_INPUT_PROJECTION_NAMES)
+        missing = expected - self._loaded
         if missing:
             raise ValueError(f"Missing QSA checkpoint tensors: {sorted(missing)}")
+        # Shard checkpoint columns before preparing the existing K-major BF16
+        # linear path. Its idempotent hook also handles the loader's later pass.
+        self.o_proj.quant_method = VllmUnquantizedLinearMethod()
+        self.o_proj.quant_method.process_weights_after_loading(self.o_proj)
+        from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
+            output_projection_tile,
+        )
 
-    def forward_with_indices(self, hidden, positions, metadata: QSAMetadata):
+        weight = self.o_proj.weight
+        tile = (
+            output_projection_tile(tuple(weight.shape)) if self.tp_size == 1 else None
+        )
+        if tile is not None and self.output_weight_tiles is None:
+            self.output_weight_tiles = (
+                weight.detach()
+                .reshape(weight.shape[0], weight.shape[1] // tile, tile)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+
+        if self.output_weight_tiles is not None and self._projected_op is None:
+            self._projected_op = partial(
+                build_compact_pooled_qsa_op(
+                    topk_backend=self.topk_backend,
+                    topk_backend_key=self.topk_backend_key,
+                    project_output=True,
+                ),
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+                norm_eps=float(self.q_norm.variance_epsilon),
+                rotary_dim=int(self.head_dim * self.config.partial_rotary_factor),
+            )
+
+    def can_prefetch_output(self, hidden: torch.Tensor) -> bool:
+        """Use a stable Torch ABI; select the measured shape inside JAX."""
+        return (
+            self.output_weight_tiles is not None
+            and hidden.device.type == "tpu"
+            and hidden.ndim == 2
+            and hidden.shape[1] == self.hidden_size
+            and hidden.dtype == torch.bfloat16
+            and self.fp8_kv
+            and self.num_heads == 24
+            and self.head_dim == 256
+            and self.num_kv_heads == 2
+            and self.compress_ratio == 4
+            and self.token_topk == 2048
+            and len(self.cache_owners) == 2
+            and self.cache_owners[0].shape[1] == 1664
+        )
+
+    def forward_with_indices(
+        self,
+        hidden,
+        positions,
+        metadata: QSAMetadata,
+        residual=None,
+        hc_gate=None,
+        hc_token_tile=0,
+        hc_min_tokens=1024,
+    ):
         assert len(self.cache_owners) == 2, (
             "Bind main and index pools before QSA execution"
         )
         per_layer = cast(
             dict[str, AttentionMetadata], get_forward_context().attn_metadata
         )
-        output, selected = self._op(
-            self.q_proj(hidden),
-            self.k_proj(hidden),
-            self.v_proj(hidden),
-            self.indexer.index_qk_proj(hidden),
+        small_projections = self.input_proj(hidden).split(self.input_sizes[1:], dim=-1)
+        projections = (self.q_proj(hidden), *small_projections)
+        projected = residual is not None
+        if projected:
+            assert hc_gate is not None and self.can_prefetch_output(hidden)
+        op = self._projected_op if projected else self._op
+        projection_args = (
+            {
+                "output_weight": self.output_weight_tiles,
+                "residual": residual,
+                "hc_gate": hc_gate,
+                "original_output_weight": self.o_proj.weight,
+                "hc_token_tile": hc_token_tile,
+                "hc_min_tokens": hc_min_tokens,
+            }
+            if projected
+            else {}
+        )
+        assert op is not None
+        output, selected = op(
+            *projections,
             self.q_norm.weight,
             self.k_norm.weight,
             self.indexer.q_layernorm.weight,
@@ -437,13 +526,27 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             cast(torch.Tensor, per_layer[self.prefix].block_tables),
             cast(torch.Tensor, per_layer[self.prefix].block_tables),
             cast(torch.Tensor, per_layer[self.prefix].request_distribution),
+            **projection_args,
             k_scale=cast(float, self._k_scale_float) if self.fp8_kv else 1.0,
             v_scale=cast(float, self._v_scale_float) if self.fp8_kv else 1.0,
         )
+        if projected:
+            return output, selected
         output = self.o_proj(output)
         if self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output, selected
 
-    def forward(self, hidden, positions, metadata: QSAMetadata):
-        return self.forward_with_indices(hidden, positions, metadata)[0]
+    def forward(
+        self,
+        hidden,
+        positions,
+        metadata: QSAMetadata,
+        residual=None,
+        hc_gate=None,
+        hc_token_tile=0,
+        hc_min_tokens=1024,
+    ):
+        return self.forward_with_indices(
+            hidden, positions, metadata, residual, hc_gate, hc_token_tile, hc_min_tokens
+        )[0]

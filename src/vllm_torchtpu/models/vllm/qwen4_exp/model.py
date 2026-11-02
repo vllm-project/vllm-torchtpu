@@ -45,6 +45,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention,
 )
+from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import AUTO_MIN_TOKENS
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.model_hooks import qwen4_options
 
@@ -172,7 +173,29 @@ class Qwen4ExpDecoderLayer(nn.Module):
         block, residual = self.attn_hyper_connection.mix(hidden)
         if self.layer_type == "linear_attention":
             block = self.linear_attn(block)
+            hidden = self.attn_hyper_connection.combine(block, residual)
         else:
+            fused_output = self.self_attn.can_prefetch_output(block)
+            projection_args = {}
+            if fused_output:
+                hyper_input, hyper_norm = residual
+                injection = torch.nn.functional.linear(
+                    hyper_norm, self.attn_hyper_connection.block_inject_weight.weight
+                )
+                injection = 2.0 * torch.sigmoid(
+                    injection.float() / self.attn_hyper_connection.hc_count
+                )
+                connection = self.attn_hyper_connection
+                projection_args = {
+                    "residual": hyper_input,
+                    "hc_gate": injection,
+                    "hc_token_tile": connection._combine_token_tile
+                    if connection._prefill_combine_op is not None
+                    else 0,
+                    "hc_min_tokens": AUTO_MIN_TOKENS
+                    if connection.prefill_combine_tile == "auto"
+                    else 0,
+                }
             block = self.self_attn(
                 block,
                 positions,
@@ -180,8 +203,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     query_start_loc,
                     context_lens,
                 ),
+                **projection_args,
             )
-        hidden = self.attn_hyper_connection.combine(block, residual)
+            hidden = (
+                block
+                if fused_output
+                else self.attn_hyper_connection.combine(block, residual)
+            )
         block, residual = self.mlp_hyper_connection.mix(hidden)
         # GDN may leave padded rows unwritten; MoE dispatch requires finite inputs.
         block = torch.where(valid_tokens[:, None], block, 0)

@@ -1122,8 +1122,8 @@ def streamindex_topk(
     cache_kv: jax.Array,
     seq_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    distribution: jax.Array,  # i32[3]
+    cu_q_lens: jax.Array | None,  # i32[max_num_seqs + 1]
+    distribution: jax.Array | None,  # i32[3]
     *,
     k: int,
     compression_ratio: int,
@@ -1164,10 +1164,13 @@ def streamindex_topk(
       seq_lens: the length of each sequence in the kv cache (uncompressed).
       page_indices: flattened page indices look-up table by (seq_id, page_id).
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
-        kv_lens, only the first num_seqs+1 values are valid.
+        kv_lens, only the first num_seqs+1 values are valid. Together with
+        distribution=None, declares exactly one query per sequence, including
+        zero-length padding rows, and derives the decode-only schedule.
       distribution: (i, j, k) represents that sequences[0:i] are decode-only,
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
-        k is also the total number of sequences.
+        k is also the total number of sequences. Must be None iff cu_q_lens is
+        None; this static per-query contract omits empty prefill/mixed passes.
       k: Number of top-K elements to retrieve.
       compression_ratio: KV cache compression ratio.
       num_kv_pages_per_block: number of kv pages to be processed in one block in
@@ -1237,6 +1240,17 @@ def streamindex_topk(
     # `cache_kv`, keeping HBM transactions fused.
 
     kv_layout = KVLayout.parse(kv_layout)
+    per_query = cu_q_lens is None and distribution is None
+    if (cu_q_lens is None) != (distribution is None):
+        raise ValueError("cu_q_lens and distribution must both be supplied or omitted")
+    if per_query:
+        if q.shape[0] != seq_lens.shape[0]:
+            raise ValueError("Omitted query metadata requires one query per sequence")
+        if uniform_q_len not in (None, 1):
+            raise ValueError("Per-query decode requires uniform_q_len=None or 1")
+        cu_q_lens = jnp.arange(q.shape[0] + 1, dtype=jnp.int32)
+        distribution = jnp.full((3,), q.shape[0], jnp.int32)
+    assert cu_q_lens is not None and distribution is not None
     if prefix_capacity is not None and prefix_capacity < 1:
         raise ValueError("prefix_capacity must be positive compressed KV columns")
     if scheduling_group_namespace is not None and scheduling_group_namespace < 0:
@@ -1357,6 +1371,12 @@ def streamindex_topk(
         align_to(pages_per_seq, bkv_p) * page_size // 128
         for bkv_p in num_kv_pages_per_blocks
     )
+    if per_query and components is not None and cache_kv.dtype == jnp.bfloat16:
+        # A partial physical sublane tile forces a full score-buffer compaction
+        # before the flat top-k reader. Row lengths exclude the added columns.
+        num_sublanes_total = align_to(
+            num_sublanes_total, pltpu.get_tpu_info().get_sublane_tiling(jnp.int32)
+        )
 
     def _block_sizes(num_queries_per_block, bkv_p, static_q_len):
         """Query and KV block sizes a pass runs with."""
@@ -1513,6 +1533,18 @@ def streamindex_topk(
                 ),
             )
         )
+        if per_query:
+            if max_num_seqs % decode_req_batch_size == 0:
+                return batched_decode
+            return (
+                *batched_decode,
+                dict(
+                    start_seq_idx=decode_batch_end,
+                    end_seq_idx=distribution[0],
+                    seq_batch_size=1,
+                    **decode_cfg,
+                ),
+            )
         uniform = (
             ()
             if uniform_q_len is None

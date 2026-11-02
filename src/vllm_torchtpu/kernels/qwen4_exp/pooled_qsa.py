@@ -15,6 +15,7 @@
 
 import functools
 import math
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +26,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     TopKBackend,
 )
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import select_index_blocks
+from vllm_torchtpu.kernels.qwen4_exp.decode_state import update_decode_state
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _indexer_updates,
     _token_metadata,
@@ -41,7 +43,12 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
 )
 from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
     _COMPILER_SMEM_RESERVE,
+    get_decode_index_page_group,
     get_main_kv_dma_batch,
+    get_main_kv_tile,
+    use_completed_rope_dma,
+    use_compressed_preparation,
+    use_decode_state_fusion,
 )
 
 
@@ -146,10 +153,14 @@ def write_main_cache(
     """Batch independent row DMAs while preserving duplicate write order."""
     if len(rows) == 0:
         return pool
-    tile = 128
+    tile = get_main_kv_tile(rows)
     batch = get_main_kv_dma_batch(pool, rows)
     if batch == 1:
         return _write_main_cache_universal(pool, rows, page, logical, valid)
+    if tile < 128:
+        from vllm_torchtpu.kernels.qwen4_exp.decode_main_write import write_decode_rows
+
+        return write_decode_rows(pool, rows, page, logical, valid)
     if len(rows) % tile or pool.shape[1] % tile:
         return _write_main_cache_universal(pool, rows, page, logical, valid)
     offsets = logical % pool.shape[1]
@@ -296,6 +307,10 @@ def write_compressed(
     ratio,
     *,
     logical_block_size=None,
+    batch_pairs=False,
+    trig_rows=None,
+    trig_cache=None,
+    positions=None,
 ):
     """One writer per BF16 pair, preserving the other half of partial pairs.
 
@@ -325,8 +340,44 @@ def write_compressed(
         - context[req, None]
     )
     mask = (local >= starts[req, None]) & (local < starts[req + 1, None])
+    if batch_pairs and trig_cache is not None:
+        from .compressed_prepare_dma import write_prepared_pairs_dma
+
+        return write_prepared_pairs_dma(
+            pool,
+            keys,
+            pair,
+            write,
+            mask,
+            local=jnp.clip(local, 0, len(keys) - 1),
+            trig_cache=trig_cache,
+            positions=positions,
+        )
+    if batch_pairs and trig_rows is not None:
+        from vllm_torchtpu.kernels.qwen4_exp.compressed_prepare import (
+            write_prepared_pairs,
+        )
+
+        assert len(keys) == 16 and keys.shape[-1] == width == 128
+        return write_prepared_pairs(
+            pool,
+            keys,
+            pair,
+            write,
+            mask,
+            local=jnp.clip(local, 0, len(keys) - 1),
+            trig_rows=trig_rows,
+        )
+
     values = keys[jnp.clip(local, 0, len(keys) - 1)]
     values = jnp.pad(values, ((0, 0), (0, 0), (0, width - keys.shape[-1])))
+
+    if batch_pairs:
+        from vllm_torchtpu.kernels.qwen4_exp.compressed_prepare import (
+            write_prepared_pairs,
+        )
+
+        return write_prepared_pairs(pool, values, pair, write, mask)
 
     tile = 128
     word_bytes = jnp.dtype(jnp.int32).itemsize
@@ -509,6 +560,23 @@ def select_blocks(
     logical_pages = (
         pool.shape[1] if logical_block_size is None else logical_block_size
     ) // 128
+    per_query = (starts is None and context is None) or (
+        starts is not None and context is not None and len(query) <= len(context)
+    )
+    if per_query and topk_backend is None:
+        page_group = get_decode_index_page_group(
+            query,
+            pool,
+            logical_pages=logical_pages,
+            pages_per_query=table.shape[1],
+            ratio=ratio,
+            topk=block_topk,
+        )
+        # Keep the original pool at the Torch/JAX boundary. This internal view
+        # is a bitcast feeding the reader, not an escaping full-cache output.
+        rows *= page_group
+        physical_pages //= page_group
+        logical_pages //= page_group
     cache = pool.reshape(-1, rows // 2, packing, width)
     resource_options = (
         {} if vmem_limit_bytes is None else {"vmem_limit_bytes": vmem_limit_bytes}
@@ -562,6 +630,12 @@ def compact_pooled_qsa_step(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     scheduling_group_namespace: int = 0,
+    output_weight: jax.Array | None = None,
+    residual: jax.Array | None = None,
+    hc_gate: jax.Array | None = None,
+    original_output_weight: jax.Array | None = None,
+    hc_token_tile: int = 0,
+    hc_min_tokens: int = 1024,
     *,
     topk_backend: TopKBackend | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -571,7 +645,9 @@ def compact_pooled_qsa_step(
         return (
             main_pool,
             index_pool,
-            jnp.empty((0, qgate.shape[1] // 2), jnp.bfloat16),
+            jnp.empty_like(residual)
+            if residual is not None
+            else jnp.empty((0, qgate.shape[1] // 2), jnp.bfloat16),
             jnp.empty((0, token_topk + compress_ratio - 1), jnp.int32),
         )
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
@@ -607,23 +683,62 @@ def compact_pooled_qsa_step(
     # VMEM padding of those typed views is independently handled by lowering.
     ring_rows = (compress_ratio + 7) // 8 * 8
     ring_elements = ring_rows * raw.shape[-1]
-    ring, tags = read_ring_and_tags(index_pool, ring_ids, ring_elements, ring_rows * 2)
-    ring = ring.reshape(len(ring_ids), ring_rows, -1)
-    tags = tags.reshape(len(ring_ids), ring_rows, 2)
-    completed, complete, req, logical, ring, tags = _indexer_updates(
-        raw,
-        positions,
-        ring,
-        tags,
-        nik,
-        trig,
-        starts,
-        context,
-        slots,
-        compress_ratio,
-        norm_eps,
-        rotary_dim,
+    fused_state = use_decode_state_fusion(
+        raw, index_pool, requests=len(context), ratio=compress_ratio
     )
+    pending_state = None
+    trig_rows = None
+    compressed_positions = None
+    defer_rope = use_compressed_preparation(
+        raw, context, trig, compress_ratio, rotary_dim
+    )
+    if fused_state:
+        state_result = update_decode_state(
+            index_pool,
+            raw,
+            positions,
+            ring_ids,
+            starts,
+            context,
+            nik,
+            trig,
+            ratio=compress_ratio,
+            norm_eps=norm_eps,
+            rotary_dim=rotary_dim,
+            rotate=not defer_rope,
+        )
+        if defer_rope:
+            assert len(state_result) == 3
+            index_pool, completed, first_positions = state_result
+            if use_completed_rope_dma(trig, first_positions):
+                compressed_positions = first_positions
+            else:
+                trig_rows = jax.lax.optimization_barrier(trig[first_positions])
+        else:
+            assert len(state_result) == 2
+            index_pool, completed = state_result
+        complete = valid & (logical % compress_ratio == compress_ratio - 1)
+    else:
+        ring, tags = read_ring_and_tags(
+            index_pool, ring_ids, ring_elements, ring_rows * 2
+        )
+        ring = ring.reshape(len(ring_ids), ring_rows, -1)
+        tags = tags.reshape(len(ring_ids), ring_rows, 2)
+        completed, complete, req, logical, ring, tags = _indexer_updates(
+            raw,
+            positions,
+            ring,
+            tags,
+            nik,
+            trig,
+            starts,
+            context,
+            slots,
+            compress_ratio,
+            norm_eps,
+            rotary_dim,
+        )
+        pending_state = (ring, tags)
     index_pool = write_compressed(
         index_pool,
         completed,
@@ -635,11 +750,17 @@ def compact_pooled_qsa_step(
         compressed_table,
         compress_ratio,
         logical_block_size=main_pool.shape[1],
+        batch_pairs=fused_state,
+        trig_rows=trig_rows,
+        trig_cache=trig if compressed_positions is not None else None,
+        positions=compressed_positions,
     )
-    ids = jnp.where(active, ring_ids, 0)
-    index_pool = write_ring_and_tags(
-        index_pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
-    )
+    if pending_state is not None:
+        ring, tags = pending_state
+        ids = jnp.where(active, ring_ids, 0)
+        index_pool = write_ring_and_tags(
+            index_pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
+        )
     lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
     blocks = select_blocks(
         iq,
@@ -657,10 +778,23 @@ def compact_pooled_qsa_step(
         logical_block_size=main_pool.shape[1],
         vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
     )
-    # Read-only attention returns token outputs only; the latest main-pool
-    # owner from write_main_cache passes through linearly so the donated
-    # input_output_alias at the op boundary stays intact.
-    output, _ = qsa_attention(
+    attention: Callable[..., tuple[jax.Array, jax.Array]] = qsa_attention
+    projection_args: tuple[jax.Array, ...] = ()
+    projection_options = {}
+    if output_weight is not None:
+        from vllm_torchtpu.kernels.sparse_gqa_decode.projection import (
+            projected_attention,
+        )
+
+        assert residual is not None and hc_gate is not None
+        attention = projected_attention
+        projection_args = (output_weight, residual, hc_gate)
+        projection_options = {
+            "original_weight": original_output_weight,
+            "hc_token_tile": hc_token_tile,
+            "hc_min_tokens": hc_min_tokens,
+        }
+    output, _ = attention(
         q,
         gate,
         blocks,
@@ -668,6 +802,8 @@ def compact_pooled_qsa_step(
         main_table[req],
         main_pool,
         starts,
+        *projection_args,
+        **projection_options,
         request_distribution=request_distribution,
         kv_heads=k.shape[1],
         ratio=compress_ratio,
