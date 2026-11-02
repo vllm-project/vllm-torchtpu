@@ -19,13 +19,15 @@
 
 `--from` is a shorthand (`megakernel_runtime.plugin.SHORTHANDS`), a package
 name or a folder. The folder imports its own files relatively, so the copy
-runs as is under the package its directory gives it. Only the names the
-library registries key on are rewritten, so the copy and the template can be
-registered side by side: `SPEC.name` -> `--name`, profile names
-`<old spec name>-*` -> `<name>-*`, and the `ModelDef` name -> `--model-name`
-(default `--name`). Strings are rewritten in code only (not in comments,
-docstrings or other files). Every copied `.py` file gets a provenance header
-(`megakernel_runtime.provenance`). Stdlib only.
+runs as is under the package its directory gives it. The names the library
+registries key on by name are rewritten: `SPEC.name` -> `--name`, profile
+names `<old spec name>-*` -> `<name>-*`, and the `ModelDef` name ->
+`--model-name` (default `--name`). The HF architectures and model type are
+not rewritten, so the copy and the template can't both be registered in one
+process until you adapt those (the printed next steps say so). Strings are
+rewritten in code only (not in comments, docstrings or other files). Every
+copied `.py` file gets a provenance header (`megakernel_runtime.provenance`).
+Stdlib only.
 """
 
 from __future__ import annotations
