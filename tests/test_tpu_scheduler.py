@@ -19,7 +19,11 @@ import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 
-from vllm_torchtpu.core.tpu_scheduler import TpuDpScheduler
+from vllm_torchtpu.core.tpu_scheduler import (
+    TPU_DP_SCHEDULER_CLS,
+    TpuDpScheduler,
+    warn_if_prefill_wave_inactive,
+)
 
 
 def _make_scheduler(waiting=(), drain_prefill=False):
@@ -144,6 +148,7 @@ def _make_wave_harness(
     scheduler._prefill_wave_enabled = True
     scheduler._decode_wave_locked = False
     scheduler._wave_peak_running = 0
+    scheduler._straggler_req_ids = set()
     scheduler.prefill_capacity_bound = False
     scheduler.current_step = 0
     scheduler.max_num_active_reqs = max_num_seqs
@@ -201,7 +206,8 @@ def _make_wave_harness(
             while (
                 budget > 0
                 and scheduler.waiting
-                and len(scheduler.running) < scheduler.max_num_active_reqs
+                and len(scheduler.running) + scheduler.num_waiting_for_streaming_input
+                < min(scheduler.max_num_active_reqs, scheduler.max_num_running_reqs)
             ):
                 r = scheduler.waiting[0]
                 need_now = math.ceil(min(r.num_tokens, budget) / block_size)
@@ -398,9 +404,99 @@ def test_prefill_wave_releases_lock_for_straggler_tail():
         assert scheduler._decode_wave_locked is True
         assert len(scheduler.waiting) == 4
 
-        # Only one straggler left (1/4 of the peak): the next wave starts.
+        # Only one straggler left (1/4 of the peak): the next wave starts, and
+        # the remaining straggler (r3) stays exempt from the hold so it keeps
+        # decoding alongside Wave 2's prefill instead of stalling for Wave 2.
         allocated.pop(scheduler.running.pop(0).request_id)
+        straggler_id = scheduler.running[0].request_id
         out = scheduler.schedule()
         assert scheduler._decode_wave_locked is False
+        assert straggler_id in out.num_scheduled_tokens
+        assert out.num_scheduled_tokens[straggler_id] == 1
         assert "r4" in out.num_scheduled_tokens
         assert len(scheduler.waiting) == 3
+
+        # Next step: r4 completed its 1024-token prefill on the step above (with
+        # 1023 tokens scheduled, 1 token left -> completes here while r5 admits),
+        # and straggler_id continues advancing every step while r4 is held.
+        out2 = scheduler.schedule()
+        assert straggler_id in out2.num_scheduled_tokens
+        assert "r5" in out2.num_scheduled_tokens
+
+
+def test_prefill_wave_caps_multi_request_single_step_admission():
+    # 64 short-prompt requests (100 prompt tokens, max_tokens=2048 -> 3 blocks
+    # worst-case wave demand each). With chunk_size=1024, an uncapped step would
+    # admit ~10 requests (30 wave blocks > 15 usable blocks). Cumulative wave
+    # budgeting caps admission to 5 requests (15 wave blocks <= 15 usable).
+    reqs = [_FakeReq(f"s{i}", isl=100, osl=2048) for i in range(64)]
+    scheduler, _allocated, fake_super = _make_wave_harness(
+        total_blocks=16,
+        waiting=reqs,
+        block_size=1024,
+        chunk_size=1024,
+        watermark_blocks=1,
+    )
+
+    with patch.object(AsyncScheduler, "schedule", side_effect=fake_super):
+        out = scheduler.schedule(throttle_prefills=False)
+        assert len(scheduler.running) == 5
+        assert len(scheduler.waiting) == 59
+        assert out.total_num_scheduled_tokens == 500
+        total_wave_blocks = sum(
+            math.ceil(scheduler._max_wave_tokens(r) / 1024) for r in scheduler.running
+        )
+        assert total_wave_blocks <= 15
+
+        # Drain in-flight placeholders and release the 5-request wave cleanly.
+        scheduler.schedule(throttle_prefills=False)
+        decode_out = scheduler.schedule(throttle_prefills=False)
+        assert decode_out.total_num_scheduled_tokens == 5
+        assert scheduler._decode_wave_locked is True
+        assert scheduler.max_num_running_reqs == 64
+        assert scheduler.max_num_active_reqs == 64
+
+
+def test_prefill_wave_streaming_slot_cap_does_not_fire_kv_warning():
+    reqs = [_FakeReq("r0", isl=1024, osl=64)]
+    scheduler, _allocated, fake_super = _make_wave_harness(
+        total_blocks=64, waiting=reqs, max_num_seqs=4
+    )
+    scheduler.num_waiting_for_streaming_input = 4
+
+    with (
+        patch.object(AsyncScheduler, "schedule", side_effect=fake_super),
+        patch("vllm_torchtpu.core.tpu_scheduler.logger.warning_once") as mock_warn_once,
+    ):
+        out = scheduler.schedule(throttle_prefills=False)
+    assert out.total_num_scheduled_tokens == 0
+    mock_warn_once.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "dp_sched_enabled,dp_size,scheduler_cls,expected_substr",
+    [
+        ("0", 4, None, "DP_SCHED_ENABLED=1"),
+        ("1", 1, None, "data_parallel_size > 1"),
+        ("1", 4, "custom.Scheduler", "scheduler_cls=None"),
+    ],
+)
+def test_warn_if_prefill_wave_inactive(
+    monkeypatch, dp_sched_enabled, dp_size, scheduler_cls, expected_substr
+):
+    monkeypatch.setenv("TPU_DP_SCHED_PREFILL_WAVE", "1")
+    monkeypatch.setenv("DP_SCHED_ENABLED", dp_sched_enabled)
+
+    with patch(
+        "vllm_torchtpu.core.tpu_scheduler.logger.warning_once"
+    ) as mock_warn_once:
+        warn_if_prefill_wave_inactive(dp_size, scheduler_cls)
+        mock_warn_once.assert_called_once()
+        rendered = mock_warn_once.call_args.args[0] % mock_warn_once.call_args.args[1:]
+        assert expected_substr in rendered
+
+    with patch(
+        "vllm_torchtpu.core.tpu_scheduler.logger.warning_once"
+    ) as mock_warn_once:
+        warn_if_prefill_wave_inactive(4, TPU_DP_SCHEDULER_CLS)
+        mock_warn_once.assert_not_called()
