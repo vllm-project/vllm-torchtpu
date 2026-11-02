@@ -1,10 +1,12 @@
 # Split-SparseCore MoE preprocessing
 
 The fused EP FP4 MoE adapter supports an opt-in `topology` preprocessing
-backend for TPU7x, eight EP ranks, and an affine rank mapping over a 2x2x1
-chip topology with both dies. Unsupported topology, shape, or scratch-memory
-requirements retain native preprocessing. Other weight formats retain the
-native path.
+backend for TPU7x with eight or sixteen EP ranks. Eight ranks need an affine
+rank mapping over a 2x2x1 chip topology with both dies and use the three-phase
+activation all-gather kernel below. Sixteen ranks (two hosts, 2x2x2) use XLA's
+own all-gather for the activation, see "Sixteen EP ranks". Unsupported
+topology, shape, or scratch-memory requirements retain native preprocessing.
+Other weight formats retain the native path.
 
 ## Enablement
 
@@ -48,6 +50,46 @@ Unrelated compilations and ambiguous patterns are left unchanged; final HLO and
 trace inspection are required when upgrading the compiler. The transformation
 preserves protobuf fields it does not inspect and retains other backend options.
 There is no JAX lowering monkeypatch or scheduling-group dependency.
+
+## Sixteen EP ranks
+
+With sixteen devices there is no topology kernel: `prepare_moe_preprocessing`
+returns a topology with `custom_gather=False` and the activation gather is
+`lax.all_gather` under `compute_on(tpu_sparsecore, core_ids=[1])`, submitted
+before the router like the kernel above. The schedule transformation matches it
+by its `all_gather` operation name, pins it to SC1 and the metadata gather to
+SC0, and orders them as for eight ranks.
+
+The SC scatter's scratch grows with the global routed rows and has to fit in
+half a subcore's VMEM, 256 KiB on TPU7x. At 4608 global tokens and top-k 6 it
+needs about 346 KB, so the scatter keeps XLA's implementation and only the
+gather placement and submission order change. `split_sc_plan` also bounds the
+path to `XLA_GATHER_MAX_LOCAL_TOKENS` (512) local tokens: it was measured at 288
+(48 requests x 6 speculative tokens), and larger prefill buckets in a decode
+server keep native preprocessing, as the resource guards do for eight ranks.
+The libtpu flags above are required here too.
+
+Measured on two v7x 2x2x2 hosts with the whole-layer benchmark
+(`scripts/dsv41_bench/bench_moe_full.py`, 288 local tokens, DSV4.1 shapes; each
+value is the maximum over TensorCores, then the median over three calls):
+
+| Metric | Native | Split SC |
+| --- | ---: | ---: |
+| Module body | 408.3 us | 364.8 us |
+| Before the fused kernel | 190.1 us | 162.1 us |
+| Fused EP kernel | 196.3 us | 180.6 us |
+| After the fused kernel | 22.7 us | 22.7 us |
+
+Outputs are bitwise equal on all sixteen ranks. The gain is smaller than the
+activation gather's earlier submission suggests (it is ready at 5 us instead of
+61 us): the metadata gather runs on SC0 while the activation gather is in flight
+and stretches from about 26 us to about 100 us, so both finish near 126 us,
+matching the standalone all-gather microbenchmark where the two gathers run
+back to back. The scatters, which wait for the metadata, then run after it. The
+fused kernel is also 15.7 us shorter on every TensorCore; that is not explained.
+This is a single-layer benchmark, not serving. Only SC0 was traced, so the
+activation gather's SC1 execution is inferred from SC0 showing one collective
+instead of two.
 
 ## Validation and limits
 

@@ -231,7 +231,7 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
             activation = _nearest(
                 by_id[kernel.operand_ids[11]],
                 by_id,
-                ("moe_activation_ag", "topology_three_phase_ag"),
+                ("moe_activation_ag", "topology_three_phase_ag", "all_gather"),
                 "async-start",
                 stop_at_other_starts=True,
             )
