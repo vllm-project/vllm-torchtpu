@@ -208,6 +208,10 @@ class _Stage3TransferGroup:
     page_tokens: int
     window_tokens: int | None = None
     request_state: bool = False
+    # A request-state group whose block table is indexed by block column
+    # (align-mode Mamba under prefix caching): the running state is the last
+    # of ``ceil(num_tokens / page_tokens)`` entries, and only it moves.
+    positional_state: bool = False
 
     def page_count(self, num_tokens: int) -> int:
         if num_tokens < 0:
@@ -215,6 +219,20 @@ class _Stage3TransferGroup:
         if self.request_state:
             return int(num_tokens > 0)
         return (num_tokens + self.page_tokens - 1) // self.page_tokens
+
+    def transfer_pages(self, ids: Sequence[int], num_tokens: int) -> list[int] | None:
+        """The pages of this group's table that a transfer of ``num_tokens``
+        moves: the live state page of a positional state table (None if the
+        table is not a committed prefix of that length), the table otherwise.
+        """
+        if not self.positional_state:
+            return list(ids)
+        pages = list(ids)
+        if num_tokens <= 0 or len(pages) != (
+            num_tokens + self.page_tokens - 1
+        ) // self.page_tokens:
+            return None
+        return pages[-1:]
 
 
 # vLLM reserves block 0 as the null block and points every freed sliding-window
@@ -783,6 +801,11 @@ def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
 
 class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     force_raiden_connector = False
+    # Whether this connector's worker plans suffix-only loads per cache group
+    # (_stage3_grouped_destination_pages and _stage3_dst_skip_bytes honour
+    # skip_tokens). Takes effect only with TPU_RAIDEN_PREFIX_AWARE_LOAD and a
+    # reshard client that encodes destination clips.
+    supports_stage3_grouped_prefix_loads = False
 
     @staticmethod
     def _build_stage3_transfer_groups(
@@ -876,6 +899,10 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 raiden_scheduler._stage3_mamba_num_speculative_blocks = (
                     stage3_mamba_num_speculative_blocks
+                )
+                raiden_scheduler._stage3_grouped_prefix_loads = bool(
+                    self.supports_stage3_grouped_prefix_loads
+                    and raiden_scheduler._stage3_prefix_aware_load_enabled
                 )
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
@@ -1548,6 +1575,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self._stage3_prefix_aware_load_enabled = (
             stage3_consumer and _prefix_aware_load_enabled()
         )
+        # Suffix-only loads for a multi-group plan whose request-state groups
+        # always move whole (set by the connector when its worker plans
+        # per-group suffix pages; see supports_stage3_grouped_prefix_loads).
+        self._stage3_grouped_prefix_loads = False
         if (
             stage3_consumer
             and bool(vllm_config.cache_config.enable_prefix_caching)
@@ -1948,8 +1979,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         request_state_groups = any(
             group.request_state for group in self._stage3_transfer_groups
         )
+        multi_group = len(self._stage3_transfer_groups) > 1
+        external_tokens = int(num_external_tokens)
+        # A grouped prefix-aware load (see _stage3_grouped_prefix_loads): the
+        # decode-local prefix cache holds the first num_tokens - external
+        # tokens of every token group; request-state pages always move whole.
+        grouped_prefix = (
+            multi_group
+            and self._stage3_grouped_prefix_loads
+            and not self._stage3_mamba_group_indices
+            and 0 < external_tokens < num_tokens
+        )
         if request_state_groups and (
-            dcp_size != 1 or int(num_external_tokens) != num_tokens
+            dcp_size != 1 or (external_tokens != num_tokens and not grouped_prefix)
         ):
             self._fail_load(
                 request,
@@ -1957,7 +1999,6 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "Stage-3 request-state pages require CP1 and the complete prefix",
             )
             return
-        multi_group = len(self._stage3_transfer_groups) > 1
         primary_group = (
             self._stage3_transfer_groups[0]
             if multi_group
@@ -1982,6 +2023,26 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"num_tokens={num_tokens}, page_tokens={group.page_tokens}"
             )
 
+        def _destination(group: _Stage3TransferGroup) -> list[int] | None:
+            # A positional state table reduces to its running-state page, the
+            # page the producer's state lands in; prefix-cache checkpoint
+            # entries before it are never transfer targets.
+            return group.transfer_pages(
+                list(grouped_block_ids[group.cache_group_index]), num_tokens
+            )
+
+        primary_ids = (
+            _destination(primary_group) if multi_group else local_block_ids
+        )
+        if primary_ids is None:
+            self._fail_load(
+                request,
+                local_block_ids,
+                "Stage-3 positional state table is not a committed prefix of "
+                f"{num_tokens} tokens",
+            )
+            return
+        local_block_ids = primary_ids
         expected_pages = primary_group.page_count(num_tokens)
         reason = _incomplete_pages(local_block_ids, primary_group)
         if reason is not None:
@@ -1991,19 +2052,73 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if multi_group:
             group_block_ids = []
             for group in self._stage3_transfer_groups:
-                ids = list(grouped_block_ids[group.cache_group_index])
-                reason = _incomplete_pages(ids, group)
+                ids = _destination(group)
+                reason = (
+                    "Stage-3 positional state table is not a committed prefix "
+                    f"of {num_tokens} tokens"
+                    if ids is None
+                    else _incomplete_pages(ids, group)
+                )
                 if reason is not None:
                     self._fail_load(request, local_block_ids, reason)
                     return
+                assert ids is not None
                 group_block_ids.append(ids)
-        external_tokens = int(num_external_tokens)
         if external_tokens > num_tokens:
             self._fail_load(
                 request,
                 local_block_ids,
                 "External token count exceeds the published reshard payload: "
                 f"external={external_tokens}, num_tokens={num_tokens}",
+            )
+            return
+        if grouped_prefix:
+            assert group_block_ids is not None
+            skip_tokens = num_tokens - external_tokens
+            # Every token group's local prefix must end on one of its page
+            # boundaries: those pages are shared prefix-cache pages, adopted
+            # as they are, and the suffix starts on a fresh page.
+            misaligned = [
+                (group.cache_group_index, group.page_tokens)
+                for group in self._stage3_transfer_groups
+                if not group.request_state and skip_tokens % group.page_tokens
+            ]
+            if misaligned:
+                self._fail_load(
+                    request,
+                    local_block_ids,
+                    "Grouped prefix hits must end on every token group's page "
+                    f"boundary: skip_tokens={skip_tokens}, (group, page_tokens)="
+                    f"{misaligned}",
+                )
+                return
+            # group_block_ids keep the full tables (the model's worker repacks
+            # by absolute token position); skip_tokens names the local prefix.
+            self.reqs_to_load[request.request_id] = _Stage3LoadMeta(
+                uuid=uuid,
+                source_req_id=source_req_id,
+                local_block_ids=local_block_ids,
+                num_tokens=num_tokens,
+                src_controller_address=src_controller_address,
+                src_job_name=params["src_job_name"],
+                src_engine_id=params["src_engine_id"],
+                src_data_replica_idx=params["src_data_replica_idx"],
+                src_parallelism=params["src_parallelism"],
+                mamba_state_block_ids=None,
+                group_block_ids=group_block_ids,
+                skip_tokens=skip_tokens,
+            )
+            params["_remote_kv_processed"] = True
+            logger.info(
+                "TPURaidenConnectorScheduler Stage-3 grouped prefix load "
+                "req_id=%s source_req_id=%s uuid=%d num_tokens=%d "
+                "skip_tokens=%d source_controller=%s",
+                request.request_id,
+                source_req_id,
+                uuid,
+                num_tokens,
+                skip_tokens,
+                src_controller_address,
             )
             return
         # TODO: turn on prefix-aware loads for DSv4. The current path assumes
@@ -2451,8 +2566,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             ids: Sequence[int], group: _Stage3TransferGroup
         ) -> tuple[int, ...] | None:
             if request_state_groups:
-                pages = tuple(ids)
-                if (
+                # A positional state table (prefix caching) reduces to its
+                # running-state page; cached prefix pages of token groups are
+                # ordinary (shared) pages and move like any other.
+                selected = group.transfer_pages(ids, num_tokens)
+                pages = tuple(ids) if selected is None else tuple(selected)
+                if selected is None or (
                     len(pages) != group.page_count(num_tokens)
                     or any(type(page) is not int or page <= 0 for page in pages)
                     or len(set(pages)) != len(pages)
@@ -5969,6 +6088,16 @@ class TPURaidenConnectorWorker:
         if tp_group is not None and synchronous:
             self._drain_stage3_submit_outcomes()
 
+    def _stage3_dst_skip_bytes(
+        self, req_meta: Any, skip_tokens: int, num_tags: int, fa_tag_count: int
+    ) -> list[int]:
+        """Per-tag destination clips of a prefix-aware load, in transfer-tag
+        order: the FA classes skip the locally cached prefix, GDN state classes
+        always transfer whole. Models with grouped pages override this."""
+        del req_meta
+        fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
+        return [fa_skip_bytes] * fa_tag_count + [0] * (num_tags - fa_tag_count)
+
     def _stage3_fa_skip_bytes(self, skip_tokens: int) -> int:
         """Use the same destination byte space for inline and queued submits."""
         if _raiden_seq_on_lane_layout():
@@ -6059,10 +6188,11 @@ class TPURaidenConnectorWorker:
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
             if skip_tokens > 0:
-                fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
-                    len(transfer_tags) - fa_tag_count
+                dst_skip_bytes = self._stage3_dst_skip_bytes(
+                    req_meta, skip_tokens, len(transfer_tags), fa_tag_count
                 )
+                fa_skip_bytes = max(dst_skip_bytes, default=0)
+                clip_kwargs["dst_skip_bytes"] = dst_skip_bytes
             dst_mem_type = self._raiden_hbm_memory_type()
         except Exception as exc:  # pylint: disable=broad-except
             # Local staging failed before any controller contact, so no
@@ -6650,10 +6780,11 @@ class TPURaidenConnectorWorker:
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
             if skip_tokens > 0:
-                fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
-                    len(transfer_tags) - fa_tag_count
+                dst_skip_bytes = self._stage3_dst_skip_bytes(
+                    req_meta, skip_tokens, len(transfer_tags), fa_tag_count
                 )
+                fa_skip_bytes = max(dst_skip_bytes, default=0)
+                clip_kwargs["dst_skip_bytes"] = dst_skip_bytes
             dst_mem_type = self._raiden_hbm_memory_type()
             start_submit = time.perf_counter()
             controller_contacted = True

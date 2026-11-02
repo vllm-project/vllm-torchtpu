@@ -40,8 +40,8 @@ def stage3(monkeypatch):
         monkeypatch.setenv(name, value)
 
 
-def connector(config, *, state_first=False):
-    groups = cache_groups()
+def connector(config, *, state_first=False, groups=None):
+    groups = cache_groups() if groups is None else groups
     if state_first:
         groups = groups[2:] + groups[:2]
     caches = KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=groups)
@@ -85,12 +85,10 @@ def test_constructor_routes_every_group_without_checkpoint_tag_shortcut(
     assert send.mamba_state_block_ids is None
 
 
-@pytest.mark.parametrize("option", ["pcp", "dcp", "pp", "apc", "mtp"])
+@pytest.mark.parametrize("option", ["pcp", "dcp", "pp", "mtp"])
 def test_constructor_rejects_unimplemented_state_lifecycles(option):
     cfg = _make_vllm_config()
-    if option == "apc":
-        cfg.cache_config.enable_prefix_caching = True
-    elif option == "mtp":
+    if option == "mtp":
         cfg.speculative_config = object()
     else:
         name = {
@@ -99,8 +97,112 @@ def test_constructor_rejects_unimplemented_state_lifecycles(option):
             "pp": "pipeline_parallel_size",
         }[option]
         setattr(cfg.parallel_config, name, 2)
-    with pytest.raises(NotImplementedError, match="CP1/PP1"):
+    # A PP engine is admitted only as a TP1 producer with per-layer pool tags.
+    match = "pipeline stages produce only" if option == "pp" else "CP1 and MTP off"
+    with pytest.raises(NotImplementedError, match=match):
         connector(cfg)
+
+
+def apc_connector(*, producer=True):
+    from tests.runner.test_qwen4_exp_pd import align_cache_groups
+
+    cfg = _make_vllm_config(is_producer=producer)
+    cfg.cache_config.enable_prefix_caching = True
+    return connector(cfg, groups=align_cache_groups())
+
+
+def test_producer_with_prefix_caching_publishes_running_state_pages():
+    obj = apc_connector()
+    scheduler = obj.connector_scheduler
+    assert [g.positional_state for g in obj._stage3_transfer_groups] == [
+        False,
+        False,
+        False,
+        True,
+        True,
+    ]
+    # 300 committed tokens span 3 columns. Token pages 1-3 may be shared
+    # prefix-cache pages; state tables hold a checkpoint, a null gap and the
+    # running state, of which only the running state moves.
+    tables = ([1, 2, 3], [11, 12, 13], [21], [31, 0, 33], [41, 0, 43])
+    req = SimpleNamespace(
+        request_id="apc-send",
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        num_prompt_tokens=300,
+        num_computed_tokens=300,
+        kv_transfer_params={"_p_side_truncated": True},
+    )
+    delay, params = obj.request_finished_all_groups(req, tables)
+    assert delay and params["num_tokens"] == 300
+    send = scheduler.build_connector_meta().reqs_to_send[req.request_id]
+    assert send.group_block_ids == [[1, 2, 3], [11, 12, 13], [21], [33], [43]]
+
+
+@pytest.mark.parametrize("gdn", [[31, 33], [31, 0, 0, 34], [31, 32, 0]])
+def test_producer_skips_a_state_table_that_is_not_the_committed_prefix(gdn):
+    # Too short, too long, or no running state in the last column.
+    obj = apc_connector()
+    req = SimpleNamespace(
+        request_id="apc-bad",
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        num_prompt_tokens=300,
+        num_computed_tokens=300,
+        kv_transfer_params={"_p_side_truncated": True},
+    )
+    delay, params = obj.request_finished_all_groups(
+        req, ([1, 2, 3], [11, 12, 13], [21], gdn, [41, 0, 43])
+    )
+    assert not delay and params == {}
+    assert not obj.connector_scheduler.build_connector_meta().reqs_to_send
+
+
+def consumer_params():
+    return {
+        "req_id": "src",
+        "uuid": 9,
+        "num_tokens": 300,
+        "src_controller_address": "source:27000",
+        "src_job_name": "prefill",
+        "src_engine_id": "source-engine",
+        "src_data_replica_idx": 0,
+        "src_parallelism": 1,
+    }
+
+
+@pytest.mark.parametrize("prefix_loads", [False, True])
+@pytest.mark.parametrize("external", [300, 44, 50])
+def test_consumer_grouped_prefix_load_pulls_the_suffix(
+    prefix_loads, external, monkeypatch
+):
+    monkeypatch.setattr(f"{_MOD}._prefix_aware_load_enabled", lambda: prefix_loads)
+    obj = apc_connector(producer=False)
+    scheduler = obj.connector_scheduler
+    assert scheduler._stage3_grouped_prefix_loads is prefix_loads
+    # A local hit of 300 - external tokens: pages 1-2 of each token group are
+    # adopted prefix-cache pages, the state tables end in fresh pages.
+    tables = ([1, 2, 3], [11, 12, 13], [21], [31, 0, 33], [41, 0, 43])
+    req = SimpleNamespace(
+        request_id="apc-load",
+        num_computed_tokens=0,
+        kv_transfer_params=consumer_params(),
+    )
+    scheduler._update_stage3_state_after_alloc(
+        req, SimpleNamespace(get_block_ids=lambda: tables), external
+    )
+    meta = scheduler.reqs_to_load[req.request_id]
+    if external == 300:
+        # A complete pull, as without a local prefix: states land in the
+        # running-state page of each positional table.
+        assert not meta.fail_only and meta.skip_tokens == 0
+        assert meta.group_block_ids == [[1, 2, 3], [11, 12, 13], [21], [33], [43]]
+    elif prefix_loads and external == 44:
+        assert not meta.fail_only and meta.skip_tokens == 256
+        assert meta.local_block_ids == [1, 2, 3]
+        assert meta.group_block_ids == [[1, 2, 3], [11, 12, 13], [21], [33], [43]]
+    else:
+        # Off: request-state pages need the whole prefix. On but misaligned
+        # (a 250-token prefix splits a page): not a suffix any group can take.
+        assert meta.fail_only
 
 
 @pytest.mark.parametrize("admission", ["QWEN35", "KIMIK3", "GLM", "DSV4"])
@@ -305,7 +407,7 @@ def test_qwen_consumer_stages_every_tag_with_its_own_pages(monkeypatch, fault):
     request = send_pages()
     request.src_controller_address = "source:27000"
     request.src_parallelism = 2 if fault == "tp" else 1
-    request.skip_tokens = 1 if fault == "prefix" else 0
+    request.skip_tokens = 1 if fault == "prefix" else 0  # unaligned, and off
     request.mamba_state_block_ids = None
     if fault == "primary":
         request.local_block_ids = [3, 4]
@@ -576,3 +678,46 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
         assert (
             "moe_combine_dtype" not in payload["semantics"]["ranks"][0]["state_flags"]
         )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_qwen_consumer_suffix_load_lists_suffix_pages_and_clips_each_tag(
+    monkeypatch, enabled
+):
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import _Stage3PendingSubmit
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_connector import Qwen4ExpRaidenWorker
+
+    monkeypatch.setattr(
+        Qwen4ExpRaidenWorker, "_prefix_loads_supported", staticmethod(lambda: enabled)
+    )
+    worker = qwen_worker(monkeypatch, producer=False)
+    request = send_pages(num_tokens=300)
+    request.src_controller_address = "source:27000"
+    request.src_parallelism = 1
+    request.skip_tokens = 256
+    request.mamba_state_block_ids = None
+    worker._stage3_source_facades["source:27000"] = worker._raiden_controller_facade
+    monkeypatch.setattr(worker, "_stage3_source_work_units", lambda _: ["source"])
+    monkeypatch.setattr(worker, "_raiden_hbm_memory_type", lambda: "HBM")
+    pending = _Stage3PendingSubmit(
+        req_meta=request,
+        source_req_id="src",
+        destination_req_id="dst",
+        uuid=7,
+        num_tokens=300,
+        local_blocks=request.local_block_ids,
+        dst_controller_address="dest:27000",
+        dst_units=["dest"],
+        defer_deadline=None,
+        first_attempt_s=time.perf_counter(),
+    )
+    task = worker._stage_stage3_submit_task(pending, synchronous=True)
+    if not enabled:
+        assert task is None
+        return
+    # Token groups keep their third page (tokens 256-299); states move whole.
+    assert task.call_kwargs["dst_block_counts"] == [1, 1, 1, 1, 1]
+    assert task.call_kwargs["dst_device_block_ids"] == [3, 72, 140, 141, 142]
+    # Two whole 4096-byte source pages of each token pool stay local.
+    assert task.call_kwargs["dst_skip_bytes"] == [8192, 8192, 0, 0, 0]
+    assert task.skip_tokens == 256

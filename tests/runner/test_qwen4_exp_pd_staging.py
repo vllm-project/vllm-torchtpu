@@ -183,3 +183,54 @@ def test_chunks_split_gdn_pages_and_pad_with_the_null_page():
     assert len(plans) == 2
     assert plans[0] == ([1, 2], [4, 5], [7, 7], [8, 8], [10, 11], [20, 21])
     assert plans[1] == ([3, 3], [6, 6], [0, 0], [0, 0], [12, 12], [22, 22])
+
+
+def _rank_tokens(num_tokens, rank, dst_block, start=0):
+    d = rank.main_dcp
+    return [t for t in range(start, num_tokens)
+            if d == 1 or (t // dst_block) % d == rank.dcp_rank]
+
+
+@pytest.mark.parametrize("tp,rank_index,dcp", [(1, 0, 1), (8, 5, 2), (8, 7, 4)])
+@pytest.mark.parametrize("num_tokens,skip", [(2000, 1024), (3072, 2048), (1025, 1024)])
+def test_prefix_aware_main_rows_are_the_full_repack_tail(
+    tp, rank_index, dcp, num_tokens, skip
+):
+    # A decode-local prefix of `skip` tokens: the staged suffix starts at the
+    # first producer page not wholly inside it, and the repack writes exactly
+    # the rows the full repack writes for tokens from `skip` on.
+    rank = st.RankSlice(tp_size=tp, tp_rank=rank_index, num_kv_heads=2, main_dcp=dcp)
+    src_block, dst_block = 384, 128
+    src = list(range(10, 10 + -(-num_tokens // src_block)))
+    dst = list(range(50, 50 + -(-num_tokens // (dcp * dst_block))))
+    full_s, full_d = st.main_rows(num_tokens, src, src_block, dst, dst_block, rank)
+    tokens = _rank_tokens(num_tokens, rank, dst_block)
+    keep = [i for i, t in enumerate(tokens) if t >= skip]
+    first = skip // src_block
+    s, d = st.main_rows(num_tokens, src[first:], src_block, dst, dst_block, rank,
+                        start=skip, src_first=first)
+    # The staged suffix lists the same source pages from `first` on.
+    assert s == [full_s[i] for i in keep]
+    assert d == [full_d[i] for i in keep]
+    assert all(row // dst_block in dst[skip // (dcp * dst_block):] for row in d)
+
+
+@pytest.mark.parametrize("num_tokens,skip", [(2000, 1024), (1030, 1024), (4096, 256)])
+def test_prefix_aware_compressed_rows_are_the_full_repack_tail(num_tokens, skip):
+    ratio, src_block, dst_block = 4, 384, 128
+    src = list(range(10, 10 + -(-num_tokens // src_block)))
+    dst = list(range(50, 50 + -(-num_tokens // dst_block)))
+    full_s, full_d = st.compressed_rows(
+        num_tokens, ratio, src, src_block, dst, dst_block
+    )
+    first_pair = skip // (2 * ratio)
+    first = skip // src_block
+    s, d = st.compressed_rows(num_tokens, ratio, src[first:], src_block, dst, dst_block,
+                              start=skip, src_first=first)
+    assert s == full_s[first_pair:]
+    assert d == full_d[first_pair:]
+
+
+def test_prefix_aware_compressed_rows_refuse_a_split_pair():
+    with pytest.raises(ValueError, match="compressed pair"):
+        st.compressed_rows(100, 4, [1], 384, [1], 128, start=12)

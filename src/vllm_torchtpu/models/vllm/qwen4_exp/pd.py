@@ -29,6 +29,11 @@ class TransferGroup:
     layer_names: tuple[str, ...]
     block_size: int
     extent: TransferExtent
+    # A request-state group whose scheduler table is indexed by block column
+    # (align-mode Mamba under prefix caching): one entry per ``block_size``
+    # tokens, null or checkpoint entries before the last, and the running
+    # state in the last entry. Only that entry is transferred.
+    positional_state: bool = False
 
     def page_count(self, committed_tokens: int) -> int:
         if committed_tokens < 0:
@@ -38,6 +43,39 @@ class TransferGroup:
         if self.extent is TransferExtent.REQUEST_STATE:
             return 1
         return (committed_tokens + self.block_size - 1) // self.block_size
+
+
+def skipped_source_pages(group: TransferGroup, skip_tokens: int) -> int:
+    """Source pages of ``group`` wholly inside a ``skip_tokens`` local prefix.
+
+    Request-state pages are not prefix-decomposable and always move whole.
+    """
+    if skip_tokens < 0:
+        raise ValueError("A local prefix cannot be negative")
+    if group.extent is TransferExtent.REQUEST_STATE:
+        return 0
+    return skip_tokens // group.block_size
+
+
+def suffix_pages(
+    group: TransferGroup, pages: Sequence[int], skip_tokens: int
+) -> tuple[int, ...]:
+    """The destination pages a prefix-aware load fills: a token group's pages
+    after a page-aligned local prefix, a request-state group's page whole."""
+    pages = tuple(pages)
+    if group.extent is TransferExtent.REQUEST_STATE or skip_tokens == 0:
+        return pages
+    if skip_tokens % group.block_size:
+        raise ValueError(
+            f"Group {group.group_index}'s local prefix of {skip_tokens} tokens "
+            f"does not end on a {group.block_size}-token page"
+        )
+    skipped = skip_tokens // group.block_size
+    if skipped >= len(pages):
+        raise ValueError(
+            f"Group {group.group_index}'s local prefix covers the whole transfer"
+        )
+    return pages[skipped:]
 
 
 def build_transfer_groups(
@@ -60,25 +98,46 @@ def build_transfer_groups(
             else (group.kv_cache_spec,)
         )
         extents = set()
+        positional = set()
         for spec in specs:
             if isinstance(spec, MambaSpec):
-                if spec.mamba_cache_mode != "none" or spec.num_speculative_blocks:
+                # "none": one persistent state block per request. "align"
+                # (prefix caching): one state block per block column, the
+                # running state in the last; the transfer still carries one.
+                if spec.num_speculative_blocks or spec.mamba_cache_mode not in (
+                    "none",
+                    "align",
+                ):
                     raise NotImplementedError(
-                        "Qwen PD request-state transfer requires APC and MTP off"
+                        "Qwen PD request-state transfer requires MTP off and "
+                        "the none or align Mamba cache mode"
                     )
                 extents.add(TransferExtent.REQUEST_STATE)
+                positional.add(spec.mamba_cache_mode == "align")
             elif isinstance(spec, CircularBufferSpec):
                 extents.add(TransferExtent.REQUEST_STATE)
+                positional.add(False)
             elif isinstance(spec, FullAttentionSpec):
                 extents.add(TransferExtent.TOKEN_PAGES)
+                positional.add(False)
             else:
                 raise NotImplementedError(
                     f"Qwen PD has no transfer extent for {type(spec).__name__}"
                 )
         sizes = {spec.block_size for spec in specs}
-        if len(extents) != 1 or len(sizes) != 1 or min(sizes) <= 0:
-            raise ValueError("A transfer group needs one extent and positive page size")
-        result.append(TransferGroup(index, names, sizes.pop(), extents.pop()))
+        if (
+            len(extents) != 1
+            or len(positional) != 1
+            or len(sizes) != 1
+            or min(sizes) <= 0
+        ):
+            raise ValueError(
+                "A transfer group needs one extent, one state indexing and a "
+                "positive page size"
+            )
+        result.append(
+            TransferGroup(index, names, sizes.pop(), extents.pop(), positional.pop())
+        )
     if not result:
         raise ValueError("Qwen PD requires a nonempty cache-group plan")
     return tuple(result)
@@ -91,11 +150,14 @@ def handoff_block_ids(
     committed_tokens: int,
     computed_tokens: int,
 ) -> tuple[tuple[int, ...], ...]:
-    """Validate a complete CP1/APC-off prefix before publishing its pages.
+    """Validate a complete CP1 prefix before publishing its pages.
 
     The caller must use the producer's actual computed length. In particular,
     an N-token state cannot be published as N-1 for decoder recomputation.
     Scheduler block tables are unpadded; device table padding is not accepted.
+    Request-state groups carry exactly one page: a positional (align-mode)
+    state table must already be reduced to its live page (the Stage-3
+    scheduler does so when it records the send).
     """
     if committed_tokens != computed_tokens:
         raise ValueError(

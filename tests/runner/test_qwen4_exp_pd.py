@@ -21,6 +21,8 @@ from vllm_torchtpu.models.vllm.qwen4_exp.pd import (
     TransferExtent,
     build_transfer_groups,
     handoff_block_ids,
+    skipped_source_pages,
+    suffix_pages,
 )
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
@@ -126,18 +128,60 @@ def test_reject_duplicate_pages_and_reordered_groups():
         )
 
 
-def test_refuse_unimplemented_align_state_and_duplicate_owners():
+def align_cache_groups():
+    """The groups under prefix caching: align-mode state tables paged like KV."""
     groups = cache_groups()
+    for index in (3, 4):
+        groups[index] = replace(
+            groups[index],
+            kv_cache_spec=replace(
+                groups[index].kv_cache_spec, mamba_cache_mode="align", block_size=128
+            ),
+        )
+    return groups
+
+
+def test_align_state_tables_are_positional_single_page_states():
+    plan = build_transfer_groups(align_cache_groups())
+    assert [g.positional_state for g in plan] == [False, False, False, True, True]
+    assert [g.extent for g in plan[2:]] == [TransferExtent.REQUEST_STATE] * 3
+    # One page moves per state group however many block columns the table has.
+    assert [g.page_count(1000) for g in plan] == [8, 8, 1, 1, 1]
+    assert not any(g.positional_state for g in build_transfer_groups(cache_groups()))
+
+
+def test_refuse_speculative_state_and_duplicate_owners():
+    groups = align_cache_groups()
     groups[3] = replace(
         groups[3],
-        kv_cache_spec=replace(groups[3].kv_cache_spec, mamba_cache_mode="align"),
+        kv_cache_spec=replace(groups[3].kv_cache_spec, num_speculative_blocks=1),
     )
-    with pytest.raises(NotImplementedError, match="APC and MTP off"):
+    with pytest.raises(NotImplementedError, match="MTP off"):
         build_transfer_groups(groups)
     groups = cache_groups()
     groups.append(groups[0])
     with pytest.raises(ValueError, match="every cache owner once"):
         build_transfer_groups(groups)
+
+
+@pytest.mark.parametrize("skip", [0, 128, 256, 896])
+def test_prefix_suffix_pages_skip_whole_token_pages_and_keep_states(skip):
+    plan = build_transfer_groups(align_cache_groups())
+    tables = [list(range(1, 9)), list(range(11, 19)), [21], [31], [41]]
+    pages = [suffix_pages(g, ids, skip) for g, ids in zip(plan, tables)]
+    assert pages[0] == tuple(range(1 + skip // 128, 9))
+    assert pages[1] == tuple(range(11 + skip // 128, 19))
+    assert pages[2:] == [(21,), (31,), (41,)]
+    assert [skipped_source_pages(g, skip) for g in plan] == [skip // 128] * 2 + [0] * 3
+
+
+@pytest.mark.parametrize(
+    "skip,reason", [(100, "does not end"), (1024, "whole transfer")]
+)
+def test_prefix_suffix_pages_refuse_a_split_page_or_no_suffix(skip, reason):
+    group = build_transfer_groups(align_cache_groups())[0]
+    with pytest.raises(ValueError, match=reason):
+        suffix_pages(group, list(range(1, 9)), skip)
 
 
 def test_pool_exposes_only_the_bound_transfer_plan():
