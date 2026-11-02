@@ -247,11 +247,12 @@ EAGLE3_PERF_MAX_TOKENS = 16
 
 
 def _make_sampling_config(
-    temperature: float = 0, max_tokens: int = 200
+    temperature: float = 0, max_tokens: int = 200, top_k: int = 0
 ) -> SamplingParams:
     return SamplingParams(
         temperature=temperature,
         max_tokens=max_tokens,
+        top_k=top_k,
         ignore_eos=True,
         repetition_penalty=1,
         frequency_penalty=0,
@@ -398,7 +399,11 @@ class _InProcessEngine:
         outputs = self._llm.generate(prompts, sampling_config)
         return [output.outputs[0].text for output in outputs]
 
-    def generate_outputs(self, prompts: list[str], sampling_config: SamplingParams):
+    def generate_outputs(
+        self,
+        prompts: list[str],
+        sampling_config: SamplingParams | list[SamplingParams],
+    ):
         """The full RequestOutputs, for callers that need more than text."""
         return self._llm.generate(prompts, sampling_config)
 
@@ -606,6 +611,84 @@ def test_dspark_correctness_greedy(
         max_num_seqs=max_num_seqs,
         async_scheduling=async_scheduling,
         extra_kwargs={"gpu_memory_utilization": 0.6},
+    )
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "min_acceptance_rate",
+    # Measured 94.3-95.3% (mean 94.8%) over 5 runs at engine seeds 0-4. The
+    # floor is 0.9 x mean, the margin upstream's GPU DSpark test uses.
+    [0.85],
+)
+def test_dspark_probabilistic_mixed_batch(
+    monkeypatch: pytest.MonkeyPatch, min_acceptance_rate: float
+):
+    """Probabilistic DSpark drafting in a batch of greedy and sampled rows.
+
+    Sampled rows (temperature 1, top_k 1) take the probabilistic path end to
+    end: the drafter samples at temperature 1 (top-k is not applied to the
+    draft), q is kept per request, and verification runs the min(1, p / q)
+    accept test and the max(0, p - q) recovery. With top_k 1 the target p is
+    one-hot at its argmax, so the output is still deterministic: every row
+    must match a no-spec reference, and a mismatch means the probabilistic
+    path corrupted a row. The sampled rows' acceptance rate is then the
+    drafter's hit rate on fixed text, stable enough to catch a NaN q (every
+    draft rejected) or broken draft sampling.
+    """
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+    model_name = "Qwen/Qwen3-4B"
+    prompts = get_dspark_test_prompts()
+    # Alternate greedy and sampled rows so every step's batch mixes both.
+    greedy_rows = list(range(0, len(prompts), 2))
+    sampled_rows = list(range(1, len(prompts), 2))
+    params = [
+        _make_sampling_config(temperature=0)
+        if i in greedy_rows
+        else _make_sampling_config(temperature=1.0, top_k=1)
+        for i in range(len(prompts))
+    ]
+    kwargs = {
+        "max_model_len": 256,
+        "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+        "max_num_seqs": len(prompts),
+        "tensor_parallel_size": _get_tensor_parallel_size(),
+        "async_scheduling": True,
+        "disable_log_stats": False,
+        "gpu_memory_utilization": 0.6,
+    }
+    speculative_config = {
+        "method": "dspark",
+        "model": "deepseek-ai/dspark_qwen3_4b_block7",
+        "num_speculative_tokens": 7,
+        "draft_tensor_parallel_size": 1,
+        "draft_sample_method": "probabilistic",
+    }
+    with monkeypatch.context():
+        with _engine(model_name, None, kwargs) as ref_engine:
+            ref_outputs = ref_engine.generate_outputs(prompts, params)
+        with _engine(model_name, speculative_config, kwargs) as spec_engine:
+            spec_outputs = spec_engine.generate_outputs(prompts, params)
+            # The sampled rows' acceptance on their own: the greedy rows'
+            # would mask a collapse in the counters of the mixed run.
+            drafted_before, accepted_before, _ = spec_engine.spec_counters()
+            spec_engine.generate_outputs(
+                [prompts[i] for i in sampled_rows], [params[i] for i in sampled_rows]
+            )
+            drafted, accepted, _ = spec_engine.spec_counters()
+
+    _assert_acceptance_rate(
+        drafted - drafted_before,
+        accepted - accepted_before,
+        min_acceptance_rate,
+        "dspark (probabilistic)",
+    )
+    # Greedy and sampled rows vote separately: their params differ.
+    _assert_no_spec_divergence(
+        prompts,
+        [o.outputs[0].text for o in ref_outputs],
+        [o.outputs[0].text for o in spec_outputs],
+        group_keys=[(prompts[i], i in greedy_rows) for i in range(len(prompts))],
     )
 
 

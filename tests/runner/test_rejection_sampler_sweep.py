@@ -63,9 +63,11 @@ def _runner():
         spec_bonus_and_target_logits=_logits,
         spec_gather_bonus_and_target_logits=_logits,
         _precompile_timed=lambda name: contextlib.nullcontext(),
-        # The greedy top-token verify and top-k candidate warmups are off.
+        # The greedy top-token verify and top-k candidate warmups are off,
+        # and the drafter is greedy (no draft-probs variants).
         _greedy_head_owner=None,
         _topk_candidate_blocks=lambda: 0,
+        drafter=None,
     )
     runner._spec_verify_bucket_reachable = functools.partial(
         TPUModelRunner._spec_verify_bucket_reachable, runner
@@ -188,6 +190,7 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         # The top-k candidate path needs whole CANDIDATE_BLOCKs of vocab.
         vocab_size=2 * CANDIDATE_BLOCK if optional_paths else 16,
         _greedy_head_owner=object() if optional_paths else None,
+        drafter=None,
         _hidden_states_dtype=torch.float32,
         device="cpu",
         _precompile_timed=lambda name: contextlib.nullcontext(),
