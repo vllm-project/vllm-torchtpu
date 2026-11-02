@@ -18,6 +18,8 @@ steps:
     steps:
       - label: ":docker: Build and Push CI Image"
         key: "build_docker"
+        # Empty unless select_ci_tracks.py selects the Omni-only track.
+        skip: "${CORE_IMAGE_SKIP:-}"
         agents:
           queue: cpu_64_core
         commands:
@@ -31,8 +33,8 @@ steps:
 
       - label: ":docker: Build and Push Omni CI Image"
         key: "build_docker_omni"
-        # Empty, and so not skipped, unless bootstrap.sh uploads no tests lane,
-        # the only lane that runs on this image.
+        # Empty unless select_ci_tracks.py skips the Omni track (Core-only diff,
+        # skip-tpu-ci, non-tests CI_LANES, or Core LKG integration pipeline).
         skip: "${OMNI_IMAGE_SKIP:-}"
         agents:
           queue: cpu_64_core

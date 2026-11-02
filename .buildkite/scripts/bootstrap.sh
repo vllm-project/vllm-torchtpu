@@ -107,42 +107,52 @@ only_docs_changed() {
 }
 
 FILES_CHANGED=""
+DIFF_BASE=""
+DIFF_HEAD="${BUILDKITE_COMMIT:-HEAD}"
 if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
   BASE_BRANCH=${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-"main"}
   echo "PR detected. Target branch: ${BASE_BRANCH}"
 
   git fetch origin "${BASE_BRANCH}" --depth=20 --quiet || echo "Base fetch failed"
-  git fetch origin "${BUILDKITE_COMMIT:-HEAD}" --depth=20 --quiet || true
+  git fetch origin "${DIFF_HEAD}" --depth=20 --quiet || true
 
-  FILES_CHANGED=$(git diff --name-only origin/"${BASE_BRANCH}"..."${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null || true)
+  DIFF_BASE=$(git merge-base "origin/${BASE_BRANCH}" "${DIFF_HEAD}" 2>/dev/null || echo "origin/${BASE_BRANCH}")
+  FILES_CHANGED=$(git diff --name-only origin/"${BASE_BRANCH}"..."${DIFF_HEAD}" 2>/dev/null || true)
   if [[ -z "${FILES_CHANGED}" ]]; then
-    FILES_CHANGED=$(git diff-tree --no-commit-id --name-only -r -m "${BUILDKITE_COMMIT:-HEAD}")
+    DIFF_BASE="${DIFF_HEAD}^"
+    FILES_CHANGED=$(git diff-tree --no-commit-id --name-only -r -m "${DIFF_HEAD}")
   fi
 elif [[ "${BUILDKITE_SOURCE:-}" != "schedule" ]]; then
   # Any other build is of a commit, which on main is the squash merge of one PR,
   # so its diff against its parent is the whole change. Not a scheduled build:
   # the nightly tests main as it stands, whatever its last commit touched.
-  git fetch origin "${BUILDKITE_COMMIT:-HEAD}" --depth=2 --quiet || true
-  FILES_CHANGED=$(git diff --name-only "${BUILDKITE_COMMIT:-HEAD}^" "${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null || true)
+  DIFF_BASE="${DIFF_HEAD}^"
+  git fetch origin "${DIFF_HEAD}" --depth=2 --quiet || true
+  FILES_CHANGED=$(git diff --name-only "${DIFF_BASE}" "${DIFF_HEAD}" 2>/dev/null || true)
 fi
+
+INTEGRATION_SLUG="${VLLM_INTEGRATION_PIPELINE_SLUG:-vllm-torchtpu-integration}"
 
 if [[ -n "${FILES_CHANGED}" ]]; then
   echo "Files changed:"
   echo "${FILES_CHANGED}"
 
-  if only_docs_changed "${FILES_CHANGED}"; then
-    echo "Only documentation/non-code files changed. Skipping CI build."
-    exit 0
-  else
-    echo "Code files changed. Proceeding with pipeline upload."
+  if [[ "${NIGHTLY:-0}" != "1" && "${TORCHTPU_NIGHTLY:-0}" != "1" \
+      && "${BUILDKITE_PIPELINE_SLUG:-}" != "${INTEGRATION_SLUG}" \
+      && -z "${CI_LANES:-}" && -z "${BUILDKITE_TAG:-}" ]] \
+      && only_docs_changed "${FILES_CHANGED}"; then
+    pr_lbls="${BUILDKITE_PULL_REQUEST_LABELS:-}"
+    if ! grep -qxE "run-full-ci|run-omni-full-ci|run-perf-eval" <<< "${pr_lbls//,/$'\n'}"; then
+      echo "Only documentation/non-code files changed. Skipping CI build."
+      exit 0
+    fi
   fi
+  echo "Code files changed. Proceeding with pipeline upload."
 fi
 
 echo "--- Starting Buildkite Bootstrap"
 
 # Resolve and Publish Version Metadata
-INTEGRATION_SLUG="${VLLM_INTEGRATION_PIPELINE_SLUG:-vllm-torchtpu-integration}"
-
 if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   # Integration pipeline tests upstream HEAD
   VLLM_COMMIT_HASH=$(git ls-remote "https://github.com/vllm-project/vllm.git" HEAD | awk '{ print $1 }')
@@ -166,33 +176,6 @@ if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
 fi
 
-# The suite's lanes, in upload order. Lane <lane> is
-# .buildkite/pipeline_<lane>.yml; no other file is uploaded as a lane. CI_LANES
-# picks a subset - a scheduled pipeline names its own lane. Without it a build runs every lane but
-# perf, which has scheduled builds of its own; nightly builds still run perf,
-# and so does the integration pipeline, whose LKG promotion waits on two perf
-# steps. A PR whose change needs perf/eval coverage asks for it with the
-# run-perf-eval label, or the full nightly suite across every lane with
-# run-full-ci; adding either label to a ready PR starts a build.
-ALL_LANES="verify perf integration tests"
-default_lanes="verify integration tests"
-pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
-if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
-    && grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
-  export NIGHTLY=1
-  buildkite-agent annotate --style info --context full-ci \
-    "Runs the full (nightly) suite (\`run-full-ci\` label)."
-fi
-if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
-  default_lanes="${ALL_LANES}"
-elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
-    && grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
-  default_lanes="${ALL_LANES}"
-  if [[ -z "${CI_LANES:-}" ]]; then
-    buildkite-agent annotate --style info --context perf-eval \
-      "Runs the perf/eval lane (\`run-perf-eval\` label)."
-  fi
-fi
 # Echoes the labels of the PR a post-merge build on main merged, comma-separated
 # like BUILDKITE_PULL_REQUEST_LABELS. They do not reach the build, so they are
 # read from GitHub by the PR number GitHub puts at the end of a squash commit's
@@ -214,29 +197,57 @@ merged_pr_labels() {
       2>/dev/null || true
 }
 
-# skip-tpu-ci keeps only the tests lane, and SKIP_TPU_CI leaves out its TPU group
-# (pipeline_tests.yml reads it when the lane is uploaded), so the image build,
-# the type check and the CPU unit tests still run, on the PR and again on its
-# post-merge build. It overrides run-perf-eval and run-full-ci.
+pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
 if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
-  skip_labels="${pr_labels}"
+  effective_labels="${pr_labels}"
 elif [[ "${BUILDKITE_BRANCH:-}" == "main" && "${BUILDKITE_SOURCE:-}" == "webhook" ]]; then
-  skip_labels="$(merged_pr_labels)"
+  effective_labels="$(merged_pr_labels)"
 else
-  skip_labels=""
+  effective_labels=""
 fi
-if grep -qx "skip-tpu-ci" <<< "${skip_labels//,/$'\n'}"; then
-  SKIP_TPU_CI=1
+
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
+    && grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
+  export NIGHTLY=1
+  buildkite-agent annotate --style info --context full-ci \
+    "Runs the full (nightly) suite (\`run-full-ci\` label)."
 fi
-if [[ "${SKIP_TPU_CI:-0}" == "1" ]]; then
-  export SKIP_TPU_CI
-  default_lanes="tests"
+
+# Resolve track selection (core-only, omni-only, both, or skip-all), default
+# lanes, and Buildkite step skip reasons (all <= 70 chars) via select_ci_tracks.py.
+ALL_LANES="verify perf integration tests"
+track_plan="$(python3 "${SCRIPT_DIR}/select_ci_tracks.py" \
+  --repo-root "${SCRIPT_DIR}/../.." \
+  --base-ref "${DIFF_BASE}" \
+  --head-ref "${DIFF_HEAD}" \
+  --labels "${effective_labels}" \
+  --format shell <<< "${FILES_CHANGED}")"
+eval "${track_plan}"
+export CI_TRACK_SELECTION CORE_IMAGE_SKIP CORE_TESTS_SKIP OMNI_IMAGE_SKIP OMNI_TESTS_SKIP OMNI_FULL_CI NIGHTLY SKIP_TPU_CI
+
+if [[ "${CI_TRACK_SELECTION}" == "skip-all" ]]; then
+  echo "Only documentation/non-code files changed. Skipping CI build."
+  exit 0
+fi
+
+echo "Selected CI track: ${CI_TRACK_SELECTION} (default lanes: ${TRACK_DEFAULT_LANES})"
+
+if [[ "${SKIP_TPU_CI}" == "1" ]]; then
   buildkite-agent annotate --style info --context skip-tpu-ci \
     "TPU steps not run (\`skip-tpu-ci\` label); the CPU steps still run."
 else
-  export SKIP_TPU_CI=0
+  if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
+      && grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}" && [[ -z "${CI_LANES:-}" ]]; then
+    buildkite-agent annotate --style info --context perf-eval \
+      "Runs the perf/eval lane (\`run-perf-eval\` label)."
+  fi
+  if [[ -n "${TRACK_ANNOTATION}" ]]; then
+    buildkite-agent annotate --style info --context ci-track-selection \
+      "${TRACK_ANNOTATION}"
+  fi
 fi
-lanes="${CI_LANES:-${default_lanes}}"
+
+lanes="${CI_LANES:-${TRACK_DEFAULT_LANES}}"
 for lane in ${lanes}; do
   if [[ " ${ALL_LANES} " != *" ${lane} "* ]]; then
     echo "ERROR: CI_LANES names '${lane}'; lanes are: ${ALL_LANES}" >&2
@@ -266,16 +277,6 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   buildkite-agent annotate --style warning --context lane-gaps \
     "Not run: no ${missing[*]} yet."
 fi
-
-# pipeline_build.yml skips the -omni image build when this is non-empty.
-# Buildkite rejects the upload if a skip reason is over 70 characters.
-OMNI_IMAGE_SKIP=""
-if [[ " ${lanes} " != *" tests "* ]]; then
-  OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
-elif [[ "${SKIP_TPU_CI}" == "1" ]]; then
-  OMNI_IMAGE_SKIP="Only TPU steps use the -omni image; skip-tpu-ci skips them."
-fi
-export OMNI_IMAGE_SKIP
 
 echo "Uploading Build Pipeline"
 upload_with_priority .buildkite/pipeline_build.yml "$JOB_PRIORITY"

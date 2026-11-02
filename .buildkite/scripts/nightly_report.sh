@@ -31,10 +31,12 @@ meta() {
   buildkite-agent meta-data get "$1" --default "$2"
 }
 
-# Every tests-lane step a nightly runs (every key but the (PR) ones') passed.
-# A step the report did not wait for may have no outcome yet, which counts as
-# not passed: a nightly test missing from the step's depends_on can stop a
-# pair being recorded, never let one through.
+# Every Core tests-lane step a nightly runs (every key except `(PR)` steps and
+# `_omni_` steps, which validate vLLM-Omni diffusion models rather than the Core
+# vLLM / vllm-torchtpu commit pair recorded in verified_commit_hashes.csv)
+# passed. A step the report did not wait for may have no outcome yet, which
+# counts as not passed: a nightly test missing from the step's depends_on can
+# stop a pair being recorded, never let one through.
 tests_lane_passed() {
   local file=".buildkite/pipeline_tests.yml" key outcome passed=true
   while IFS= read -r key; do
@@ -43,7 +45,7 @@ tests_lane_passed() {
     if [[ "${outcome}" != "passed" ]]; then
       passed=false
     fi
-  done < <(grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${file}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -v '_pr$')
+  done < <(grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${file}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -vE '(_pr$|_omni_)')
   [[ "${passed}" == true ]]
 }
 
