@@ -120,8 +120,13 @@ def fused_engram(
     chunks = tile_m // vector_m
     buffer_count = min(2, chunks)
 
+    raw_end = tokens * raw_words
+    raw = packed[:raw_end].reshape(tokens, raw_words)
+    scales = packed[raw_end:].reshape(tokens, scale_words)
+
     def kernel(
-        packed_ref,
+        raw_ref,
+        scale_ref,
         h_ref,
         w_ref,
         ws_ref,
@@ -161,21 +166,9 @@ def fused_engram(
             hidden_copy(0).start()
 
             def prepare_rows(index, unused):
-                first = token_start + index * vector_m
-                raw = packed_ref[pl.ds(first * raw_words, vector_m * raw_words)]
-                scales = packed_ref[
-                    pl.ds(
-                        tokens * raw_words + first * scale_words, vector_m * scale_words
-                    )
-                ]
-                # Put packed bytes on the sublane axis before widening them;
-                # appending a trailing size-4 axis is not a legal TPU layout.
-                raw_bytes = pltpu.bitcast(
-                    raw.reshape(vector_m, raw_words).T, jnp.uint8
-                ).T
-                scale_bytes = pltpu.bitcast(
-                    scales.reshape(vector_m, scale_words).T, jnp.uint8
-                ).T
+                tile = pl.ds(index * vector_m, vector_m)
+                raw_bytes = pltpu.bitcast(raw_ref[tile, :].T, jnp.uint8).T
+                scale_bytes = pltpu.bitcast(scale_ref[tile, :].T, jnp.uint8).T
                 values = pltpu.bitcast(raw_bytes, jnp.float8_e4m3fn).astype(jnp.float32)
                 block = embedding_block_size
                 powers = jax.lax.bitcast_convert_type(
@@ -250,7 +243,8 @@ def fused_engram(
         kernel,
         grid=(tokens // tile_m, streams + 1, steps),
         in_specs=[
-            pl.BlockSpec(packed.shape, lambda i, j, k: (0,)),
+            pl.BlockSpec((tile_m, raw_words), lambda i, j, k: (i, 0)),
+            pl.BlockSpec((tile_m, scale_words), lambda i, j, k: (i, 0)),
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec((tile_k, dim), lambda i, j, k: (k, projection_index(j))),
             pl.BlockSpec((dim,), lambda i, j, k: (projection_index(j),)),
@@ -281,7 +275,8 @@ def fused_engram(
         interpret=interpret,
         name="engram_offload_fused",
     )(
-        packed,
+        raw,
+        scales,
         hidden,
         weight,
         weight_scale,
