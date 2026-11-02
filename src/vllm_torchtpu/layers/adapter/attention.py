@@ -520,6 +520,7 @@ def _pallas_rpa_kernel_batched(
     decode_query_size: int = 1,
     block_major: bool = False,
     skip_empty_launch: bool = False,
+    sliding_decode_max_bkv: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
@@ -528,6 +529,8 @@ def _pallas_rpa_kernel_batched(
         rpa_kwargs["decode_query_size"] = decode_query_size
     if skip_empty_launch:
         rpa_kwargs["skip_empty_launch"] = True
+    if sliding_decode_max_bkv is not None:
+        rpa_kwargs["sliding_decode_max_bkv"] = sliding_decode_max_bkv
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -1050,6 +1053,17 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if "skip_empty_launch" in entry_params and envs.TPU_RPA_SKIP_EMPTY_LAUNCH:
                 logger.info_once("Batched RPA skips launches with an empty segment.")
                 entry_kwargs["skip_empty_launch"] = True
+            max_bkv = envs.TPU_RPA_SLIDING_DECODE_MAX_BKV
+            if (
+                "sliding_decode_max_bkv" in entry_params
+                and max_bkv
+                and self.sliding_window is not None
+            ):
+                logger.info_once(
+                    "Batched RPA sliding-window decode KV blocks of at most %d tokens.",
+                    max_bkv,
+                )
+                entry_kwargs["sliding_decode_max_bkv"] = max_bkv
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(

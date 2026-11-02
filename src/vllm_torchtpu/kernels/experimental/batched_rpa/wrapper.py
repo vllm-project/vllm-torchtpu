@@ -223,13 +223,23 @@ def _is_sfs(tpu_info) -> bool:
     )
 
 
+# Largest KV block calculate_block_sizes grows to.  # TEMP PATCH
+_MAX_BKV_SZ = 4096
+
+
 def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
     decode_query_size: int = 1,
+    sliding_decode_max_bkv: int | None = None,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
-    """Calculate optimal block size for decode and prefill."""
+    """Calculate optimal block size for decode and prefill.
+
+    `sliding_decode_max_bkv` caps the decode KV block of a sliding-window layer.
+    The VMEM-filling default grows it far past the window, and every decode
+    launch zero-fills and computes all lanes of that block.
+    """
 
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
@@ -370,7 +380,9 @@ def calculate_block_sizes(
         return batch_size * num_muls
 
     def find_best_block_sizes(
-        max_batch_size: int, fixed_bq_sz: int | None = None
+        max_batch_size: int,
+        fixed_bq_sz: int | None = None,
+        max_bkv_sz: int = _MAX_BKV_SZ,
     ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
@@ -415,7 +427,7 @@ def calculate_block_sizes(
         while (
             calculate_vmem_usage(batch_size, bq_sz, bkv_sz) < capped_vmem_limit_bytes
             and bkv_sz <= max_seq_len
-            and bkv_sz <= 4096  # TEMP PATCH
+            and bkv_sz <= max_bkv_sz
         ):
             # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
             # size. When using causal masking, if bq size is larger than bkv size,
@@ -477,7 +489,12 @@ def calculate_block_sizes(
     decode_batch_size = 8
     prefill_batch_size = 2
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
+    decode_max_bkv_sz = _MAX_BKV_SZ
+    if model_cfgs.sliding_window is not None and sliding_decode_max_bkv is not None:
+        decode_max_bkv_sz = min(decode_max_bkv_sz, sliding_decode_max_bkv)
+    decode_block_sizes = find_best_block_sizes(
+        decode_batch_size, decode_query_size, decode_max_bkv_sz
+    )
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
 
     return decode_block_sizes, prefill_block_sizes
@@ -510,6 +527,7 @@ def calculate_block_sizes(
         "return_lse",
         "mask_invalid_v",
         "skip_empty_launch",
+        "sliding_decode_max_bkv",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -554,6 +572,7 @@ def ragged_paged_attention(
     return_lse: bool = False,
     mask_invalid_v: bool | None = None,
     skip_empty_launch: bool = False,
+    sliding_decode_max_bkv: int | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -618,6 +637,8 @@ def ragged_paged_attention(
         skip_empty_launch: If True, the decode or mixed kernel call whose segment
             of `distribution` is empty returns at entry, and its schedule writes
             only `actual_steps`. Outputs are identical either way.
+        sliding_decode_max_bkv: Largest default decode KV block (tokens) when
+            `sliding_window` is set. None keeps the VMEM-filling default.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -724,6 +745,7 @@ def ragged_paged_attention(
         serve_cfgs,
         vmem_limit_bytes,
         decode_query_size=decode_query_size,
+        sliding_decode_max_bkv=sliding_decode_max_bkv,
     )
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None

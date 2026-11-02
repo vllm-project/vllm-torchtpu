@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
     TPU_RPA_SKIP_EMPTY_LAUNCH: bool = False
+    TPU_RPA_SLIDING_DECODE_MAX_BKV: int = 0
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -717,6 +718,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VMEM zero-fill and its schedule's HBM write-back instead of running
     # zero steps on initialized buffers. Outputs are unchanged.
     "TPU_RPA_SKIP_EMPTY_LAUNCH": env_bool("TPU_RPA_SKIP_EMPTY_LAUNCH"),
+    # Largest batched-RPA decode KV block (tokens) on sliding-window layers.
+    # The default block fills VMEM (1792 tokens for a 1024-token window on
+    # Gemma4), and each decode launch zero-fills and computes every lane of
+    # it. 0 (default) keeps that block.
+    "TPU_RPA_SLIDING_DECODE_MAX_BKV": env_nonnegative_int(
+        "TPU_RPA_SLIDING_DECODE_MAX_BKV", 0
+    ),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
