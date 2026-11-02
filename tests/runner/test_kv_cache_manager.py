@@ -1269,7 +1269,10 @@ class TestKVCacheManager:
     @pytest.mark.parametrize("alias_head_size", [128, 256])
     def test_default_attention_hma_preserves_native_pool_budget(self, alias_head_size):
         """Full/SWA overlays share storage while retaining the last block ID."""
-        from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+        try:
+            from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+        except ImportError:
+            from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
         from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
         def spec(cls, head_size=128, **kwargs):
@@ -1341,10 +1344,16 @@ class TestKVCacheManager:
         self, sliding_heads, sliding_page_bytes, shared
     ):
         """Compatible shapes share regions; other shapes retain native arrays."""
-        from vllm.v1.core.kv_cache_utils import (
-            get_kv_cache_config_from_groups,
-            get_kv_cache_groups,
-        )
+        try:
+            from vllm.v1.core.kv_cache_planning import (
+                get_kv_cache_config_from_groups,
+                get_kv_cache_groups,
+            )
+        except ImportError:
+            from vllm.v1.core.kv_cache_utils import (
+                get_kv_cache_config_from_groups,
+                get_kv_cache_groups,
+            )
         from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
         self.runner.block_size = 256
@@ -1943,7 +1952,10 @@ def test_dsv4_groups_are_uniform_type_with_mixed_block_sizes():
     spec must be unwrapped before any `isinstance` type test, and block size is
     not uniform across groups, so it cannot be asserted equal.
     """
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    try:
+        from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
+    except ImportError:
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
         MambaSpec,
