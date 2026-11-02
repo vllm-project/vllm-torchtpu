@@ -79,6 +79,8 @@ def _build(
     min_decode_interval_ms: int = 0,
     tpot_target_ms: float = 0,
     tpot_ms_per_request: float = 0,
+    tpot_cap_ms: float = 0,
+    tpot_cap_ms_per_request: float = 0,
     num_blocks: int = 64,
     max_num_seqs: int = 8,
     max_num_batched_tokens: int = 128,
@@ -97,6 +99,10 @@ def _build(
     monkeypatch.setenv("VLLM_TPU_MIN_DECODE_INTERVAL_MS", str(min_decode_interval_ms))
     monkeypatch.setenv("VLLM_TPU_DECODE_TPOT_TARGET_MS", str(tpot_target_ms))
     monkeypatch.setenv("VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST", str(tpot_ms_per_request))
+    monkeypatch.setenv("VLLM_TPU_DECODE_TPOT_CAP_MS", str(tpot_cap_ms))
+    monkeypatch.setenv(
+        "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST", str(tpot_cap_ms_per_request)
+    )
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=max_num_seqs,
@@ -335,6 +341,8 @@ def test_flags_stay_out_of_the_compile_key():
         "VLLM_TPU_MIN_DECODE_INTERVAL_MS",
         "VLLM_TPU_DECODE_TPOT_TARGET_MS",
         "VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST",
+        "VLLM_TPU_DECODE_TPOT_CAP_MS",
+        "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST",
     ):
         assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
         assert name not in tpu_compiler._tpu_compile_env_factors()
@@ -428,13 +436,22 @@ def test_resent_requests_carry_only_their_output_tokens(
 
 
 @pytest.mark.parametrize(
-    ("over_tokens", "max_consecutive", "decode_interval_ms", "num_blocks", "tpot_ms"),
+    (
+        "over_tokens",
+        "max_consecutive",
+        "decode_interval_ms",
+        "num_blocks",
+        "tpot_ms",
+        "tpot_cap_ms",
+    ),
     [
-        (32, 0, 0, 64, 0),
-        (32, 1, 30, 40, 0),
-        (0, 0, 30, 24, 0),
-        (0, 0, 0, 24, 30),
-        (32, 1, 0, 40, 30),
+        (32, 0, 0, 64, 0, 0),
+        (32, 1, 30, 40, 0, 0),
+        (0, 0, 30, 24, 0, 0),
+        (0, 0, 0, 24, 30, 0),
+        (32, 1, 0, 40, 30, 0),
+        (0, 0, 0, 24, 0, 25),
+        (32, 1, 0, 40, 0, 25),
     ],
 )
 def test_random_workload_keeps_step_shapes_and_finishes(
@@ -445,6 +462,7 @@ def test_random_workload_keeps_step_shapes_and_finishes(
     decode_interval_ms,
     num_blocks,
     tpot_ms,
+    tpot_cap_ms,
 ):
     """Async steps (one in flight) over random arrivals: every step is solo or
     within the threshold, and every request finishes."""
@@ -458,6 +476,7 @@ def test_random_workload_keeps_step_shapes_and_finishes(
         max_consecutive=max_consecutive,
         decode_interval_ms=decode_interval_ms,
         tpot_target_ms=tpot_ms,
+        tpot_cap_ms=tpot_cap_ms,
         num_blocks=num_blocks,
         max_num_seqs=6,
         max_num_batched_tokens=256 if over_tokens else 48,
@@ -716,3 +735,53 @@ def test_tpot_pacing_interval_follows_the_requests_held(
     steps = [_step(scheduler, clock) for _ in range(40)]
     assert sum("a" in s for s in steps) == 20
     assert sum("b" in s for s in steps) == 20
+
+
+@pytest.mark.parametrize(
+    "cap", [{"tpot_cap_ms": 31.25}, {"tpot_cap_ms_per_request": 15.625}]
+)
+def test_tpot_cap_only_decodes_while_a_decode_owes_a_token(
+    shared_model_config, monkeypatch, cap
+):
+    clock = _floor_clock(monkeypatch, step_s=_PACE_STEP_S)
+    # Half a token owed per step (per request: two requests on the engine).
+    scheduler, hasher = _build(
+        shared_model_config, monkeypatch, max_num_batched_tokens=32, **cap
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    _step(scheduler, clock)
+    _add(scheduler, hasher, ("long", 160, 2))
+    assert _step(scheduler, clock) == {"d": 1, "long": 31}
+    # An 11-step stall leaves `d` owing four and a half tokens: steps only
+    # decode until it owes less than one, then the prefill resumes.
+    clock.now += 10 * _PACE_STEP_S
+    steps = [_step(scheduler, clock) for _ in range(9)]
+    assert steps == [{"d": 1}] * 8 + [{"d": 1, "long": 31}]
+
+
+def test_tpot_cap_admits_nothing_while_behind(shared_model_config, monkeypatch):
+    clock = _floor_clock(monkeypatch, step_s=_PACE_STEP_S)
+    scheduler, hasher = _build(shared_model_config, monkeypatch, tpot_cap_ms=31.25)
+    _add(scheduler, hasher, ("d", 16, 1))
+    _step(scheduler, clock)
+    _step(scheduler, clock)
+    clock.now += 4 * _PACE_STEP_S
+    _add(scheduler, hasher, ("w", 16, 2))
+    assert _step(scheduler, clock) == {"d": 1}
+    assert [r.request_id for r in scheduler.waiting] == ["w"]
+
+
+def test_tpot_cap_holds_back_a_solo_step(shared_model_config, monkeypatch):
+    clock = _floor_clock(monkeypatch, step_s=_PACE_STEP_S)
+    scheduler, hasher = _build(
+        shared_model_config, monkeypatch, over_tokens=32, tpot_cap_ms=31.25
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    _step(scheduler, clock)
+    _step(scheduler, clock)
+    clock.now += 4 * _PACE_STEP_S
+    _add(scheduler, hasher, ("long", 100, 2))
+    # The stall leaves `d` owing one and a half tokens: two decode-only steps,
+    # then the solo step.
+    steps = [_step(scheduler, clock) for _ in range(3)]
+    assert steps == [{"d": 1}, {"d": 1}, {"long": 100}]

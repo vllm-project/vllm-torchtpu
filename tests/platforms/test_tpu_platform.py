@@ -1128,38 +1128,32 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
         assert cls.__name__ == name
 
 
+_PREFILL_FIRST_FLAGS = (
+    "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS",
+    "VLLM_TPU_DECODE_INTERVAL_MS",
+    "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS",
+    "VLLM_TPU_MIN_DECODE_INTERVAL_MS",
+    "VLLM_TPU_DECODE_TPOT_TARGET_MS",
+    "VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST",
+    "VLLM_TPU_DECODE_TPOT_CAP_MS",
+    "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST",
+)
+
+
 @pytest.mark.parametrize(
-    (
-        "over_tokens",
-        "interval_ms",
-        "lb_unit",
-        "floor_ms",
-        "tpot_ms",
-        "tpot_per_req_ms",
-        "initial_cls",
-        "expected_cls",
-    ),
+    ("flags", "initial_cls", "expected_cls"),
     [
-        (0, 0, 0, 0, 0, 0, None, None),
-        (16384, 0, 0, 0, 0, 0, None, "PrefillFirstScheduler"),
-        (0, 40, 0, 0, 0, 0, None, "PrefillFirstScheduler"),
-        (0, 0, 8192, 0, 0, 0, None, "PrefillFirstScheduler"),
-        (0, 0, 0, 20, 0, 0, None, "PrefillFirstScheduler"),
-        (0, 0, 0, 0, 15.0, 0, None, "PrefillFirstScheduler"),
-        (0, 0, 0, 0, 0, 2.5, None, "PrefillFirstScheduler"),
-        (16384, 0, 0, 0, 0, 0, "PrefillFirstScheduler", "PrefillFirstScheduler"),
+        ({}, None, None),
+        *[({name: 20}, None, "PrefillFirstScheduler") for name in _PREFILL_FIRST_FLAGS],
+        (
+            {"VLLM_TPU_SOLO_PREFILL_OVER_TOKENS": 16384},
+            "PrefillFirstScheduler",
+            "PrefillFirstScheduler",
+        ),
     ],
 )
 def test_prefill_first_scheduler_is_installed_by_its_flags(
-    monkeypatch,
-    over_tokens,
-    interval_ms,
-    lb_unit,
-    floor_ms,
-    tpot_ms,
-    tpot_per_req_ms,
-    initial_cls,
-    expected_cls,
+    monkeypatch, flags, initial_cls, expected_cls
 ):
     from vllm_torchtpu.core.experimental.prefill_first_scheduler import (
         SCHEDULER_CLS,
@@ -1168,18 +1162,8 @@ def test_prefill_first_scheduler_is_installed_by_its_flags(
     def resolve(name):
         return SCHEDULER_CLS if name == "PrefillFirstScheduler" else name
 
-    monkeypatch.setattr(
-        tpu_platform.envs, "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", over_tokens
-    )
-    monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_DECODE_INTERVAL_MS", interval_ms)
-    monkeypatch.setattr(
-        tpu_platform.envs, "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS", lb_unit
-    )
-    monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_MIN_DECODE_INTERVAL_MS", floor_ms)
-    monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_DECODE_TPOT_TARGET_MS", tpot_ms)
-    monkeypatch.setattr(
-        tpu_platform.envs, "VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST", tpot_per_req_ms
-    )
+    for name in _PREFILL_FIRST_FLAGS:
+        monkeypatch.setattr(tpu_platform.envs, name, flags.get(name, 0))
     vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(scheduler_cls=resolve(initial_cls))
     )

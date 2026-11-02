@@ -221,6 +221,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MIN_DECODE_INTERVAL_MS: int = 0
     VLLM_TPU_DECODE_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST: float = 0.0
+    VLLM_TPU_DECODE_TPOT_CAP_MS: float = 0.0
+    VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST: float = 0.0
 
 
 def env_with_choices(
@@ -1349,6 +1351,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request the engine holds, running or waiting (0: off).
     "VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST": env_nonnegative_float(
         "VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST", 0.0
+    ),
+    # PrefillFirstScheduler: each running request owes one decode token per
+    # this many milliseconds; while one owes a whole token, steps only decode
+    # (0: off).
+    "VLLM_TPU_DECODE_TPOT_CAP_MS": env_nonnegative_float(
+        "VLLM_TPU_DECODE_TPOT_CAP_MS", 0.0
+    ),
+    # PrefillFirstScheduler: raise that cap to this many milliseconds per
+    # request the engine holds, running or waiting (0: off).
+    "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST": env_nonnegative_float(
+        "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST", 0.0
     ),
 }
 

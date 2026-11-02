@@ -78,6 +78,17 @@ each other's prefills; under open-loop arrivals this only raises TPOT. ``P``
 caps the engine's decode rate at ``1000 / P`` tokens per second shared equally
 by its requests, so the target follows the load.
 
+TPOT cap (``VLLM_TPU_DECODE_TPOT_CAP_MS=C`` or
+``VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST=Q`` > 0, or both), the converse of
+pacing with the same accounting: each running request owes one decode token per
+``max(C, Q * n)`` milliseconds from its first decode step on, each token it
+schedules pays one, and while any request owes a whole token a step prefills
+nothing (no prefill chunk, no admission from the waiting queue, no solo step)
+and only decodes, so each request's TPOT stays at or below about the cap. Under
+a closed-loop client the requests then finish spread out like their first
+tokens, as with pacing, and TPOT settles below the cap at the cost of prefill
+time.
+
 Prefill-aware DP load balancing (``VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS=U > 0``).
 vLLM's data-parallel front end sends each new request to the engine with the
 fewest waiting plus running requests, as each engine's scheduler reports them;
@@ -132,6 +143,8 @@ class _Pace:
     earned: float = 1.0
     # Decoding in every step until back on schedule.
     resumed: bool = True
+    # TPOT cap: decode tokens due at the cap and not yet scheduled.
+    owed: float = 0.0
 
 
 class PrefillFirstScheduler(AsyncScheduler):
@@ -148,6 +161,8 @@ class PrefillFirstScheduler(AsyncScheduler):
         self.min_decode_interval = envs.VLLM_TPU_MIN_DECODE_INTERVAL_MS / 1000
         self.tpot_target = envs.VLLM_TPU_DECODE_TPOT_TARGET_MS / 1000
         self.tpot_per_request = envs.VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST / 1000
+        self.tpot_cap = envs.VLLM_TPU_DECODE_TPOT_CAP_MS / 1000
+        self.tpot_cap_per_request = envs.VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST / 1000
         if not (
             self.solo_over_tokens
             or self.decode_interval
@@ -155,12 +170,15 @@ class PrefillFirstScheduler(AsyncScheduler):
             or self.min_decode_interval
             or self.tpot_target
             or self.tpot_per_request
+            or self.tpot_cap
+            or self.tpot_cap_per_request
         ):
             raise ValueError(
                 "PrefillFirstScheduler needs VLLM_TPU_SOLO_PREFILL_OVER_TOKENS, "
                 "VLLM_TPU_DECODE_INTERVAL_MS, VLLM_TPU_MIN_DECODE_INTERVAL_MS, "
-                "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS, VLLM_TPU_DECODE_TPOT_TARGET_MS "
-                "or VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST."
+                "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS, VLLM_TPU_DECODE_TPOT_TARGET_MS, "
+                "VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST, VLLM_TPU_DECODE_TPOT_CAP_MS or "
+                "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST."
             )
         if self.lb_prefill_unit and self.parallel_config.data_parallel_size == 1:
             logger.warning(
@@ -190,7 +208,8 @@ class PrefillFirstScheduler(AsyncScheduler):
         self._force_decode = False
         # When the last step that decoded was scheduled (interval floor).
         self._last_decode = float("-inf")
-        # TPOT pacing: per decoding request, and when tokens were last earned.
+        # TPOT pacing and cap: per decoding request, and when their clocks last
+        # advanced.
         self._pace: dict[str, _Pace] = {}
         self._paced_at = 0.0
         # Set while the base scheduler's own logic reads the request counts:
@@ -201,7 +220,7 @@ class PrefillFirstScheduler(AsyncScheduler):
             "max_solo_tokens=%d, solo_max_consecutive=%d, solo_decode_steps=%d, "
             "decode_interval_ms=%g, min_decode_interval_ms=%g, "
             "dp_lb_prefill_unit_tokens=%d, tpot_target_ms=%g, "
-            "tpot_ms_per_request=%g)",
+            "tpot_ms_per_request=%g, tpot_cap_ms=%g, tpot_cap_ms_per_request=%g)",
             self.solo_over_tokens,
             self.max_solo_tokens,
             self.solo_max_consecutive,
@@ -211,6 +230,8 @@ class PrefillFirstScheduler(AsyncScheduler):
             self.lb_prefill_unit,
             self.tpot_target * 1000,
             self.tpot_per_request * 1000,
+            self.tpot_cap * 1000,
+            self.tpot_cap_per_request * 1000,
         )
 
     def _check_solo_config(self) -> None:
@@ -299,8 +320,14 @@ class PrefillFirstScheduler(AsyncScheduler):
         return num_running + pending_units, num_waiting
 
     def _schedule(self, throttle_prefills: bool) -> SchedulerOutput:
+        self._advance_decode_clocks()
         request = None
-        if self.solo_over_tokens and not throttle_prefills and not self._skip_solo:
+        if (
+            self.solo_over_tokens
+            and not throttle_prefills
+            and not self._skip_solo
+            and not self._behind_tpot_cap()
+        ):
             request = self._solo_candidate()
         self._skip_solo = False
         if request is not None:
@@ -394,13 +421,16 @@ class PrefillFirstScheduler(AsyncScheduler):
         return output
 
     def _schedule_regular(self, throttle_prefills: bool) -> SchedulerOutput:
-        held = self._held_from_regular()
+        capped = self._behind_tpot_cap()
+        held = list(self.waiting) if capped else self._held_from_regular()
         decodes = [r for r in self.running if not r.is_prefill_chunk]
         below_floor = self._below_decode_floor(decodes)
-        interval_paused = [] if below_floor else self._paused_decodes()
+        interval_paused = [] if below_floor or capped else self._paused_decodes()
         paused = decodes if below_floor else interval_paused
         paced = self._tpot_paced(decodes)
         hidden = paused + [r for r in paced if r not in paused]
+        if capped:
+            hidden += [r for r in self.running if r.is_prefill_chunk]
         budget = self.max_num_scheduled_tokens
         if self.solo_over_tokens:
             self.max_num_scheduled_tokens = min(budget, self.solo_over_tokens)
@@ -412,39 +442,57 @@ class PrefillFirstScheduler(AsyncScheduler):
         if interval_paused and not output.total_num_scheduled_tokens:
             self._force_decode = True
         for req_id, pace in self._pace.items():
-            pace.earned -= output.num_scheduled_tokens.get(req_id, 0)
+            num_tokens = output.num_scheduled_tokens.get(req_id, 0)
+            pace.earned -= num_tokens
+            pace.owed -= num_tokens
         if any(r.request_id in output.num_scheduled_tokens for r in decodes):
             self._last_decode = monotonic()
         return output
 
-    def _tpot_paced(self, decodes: list[Request]) -> list[Request]:
-        """The decodes that sit this regular step out for TPOT pacing: those
-        without an earned token, and, after such a hold, those still short of
-        ``_RESUME_AFTER_TOKENS``. A request starts decoding at once."""
-        if not (self.tpot_target or self.tpot_per_request):
-            return []
+    def _advance_decode_clocks(self) -> None:
+        """Earn TPOT-pacing tokens and accrue TPOT-cap tokens for the running
+        decodes over the time since the previous schedule() call. A request
+        starts decoding at once and owes nothing then."""
+        pacing = self.tpot_target or self.tpot_per_request
+        capping = self.tpot_cap or self.tpot_cap_per_request
+        if not (pacing or capping):
+            return
         now = monotonic()
         elapsed, self._paced_at = now - self._paced_at, now
-        # Positive whenever there is a decode: the engine holds it.
+        # Both positive whenever there is a decode: the engine holds it.
         num_held = len(self.running) + len(self.waiting) + len(self.kv_holding_waiting)
         interval = max(self.tpot_target, self.tpot_per_request * num_held)
+        cap = max(self.tpot_cap, self.tpot_cap_per_request * num_held)
         # Requests that stopped decoding (finished, preempted) drop out.
         pace: dict[str, _Pace] = {}
-        paced = []
-        for r in decodes:
+        for r in self.running:
+            if r.is_prefill_chunk:
+                continue
             state = self._pace.get(r.request_id)
             if state is None:
                 state = _Pace()
             else:
-                state.earned += elapsed / interval
-                state.resumed = state.earned >= (
-                    1 if state.resumed else _RESUME_AFTER_TOKENS
-                )
+                if pacing:
+                    state.earned += elapsed / interval
+                    state.resumed = state.earned >= (
+                        1 if state.resumed else _RESUME_AFTER_TOKENS
+                    )
+                if capping:
+                    state.owed += elapsed / cap
             pace[r.request_id] = state
-            if not state.resumed:
-                paced.append(r)
         self._pace = pace
-        return paced
+
+    def _tpot_paced(self, decodes: list[Request]) -> list[Request]:
+        """The decodes that sit this regular step out for TPOT pacing: those
+        without an earned token, and, after such a hold, those still short of
+        ``_RESUME_AFTER_TOKENS``."""
+        if not (self.tpot_target or self.tpot_per_request):
+            return []
+        return [r for r in decodes if not self._pace[r.request_id].resumed]
+
+    def _behind_tpot_cap(self) -> bool:
+        """Whether a running decode owes a whole token under the TPOT cap."""
+        return any(pace.owed >= 1 for pace in self._pace.values())
 
     def _below_decode_floor(self, decodes: list[Request]) -> bool:
         """Whether a decode-only step still waits for the interval floor."""

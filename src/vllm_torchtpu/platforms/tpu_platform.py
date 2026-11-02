@@ -1436,6 +1436,8 @@ def _configure_prefill_first_scheduler(vllm_config: VllmConfig) -> None:
         or envs.VLLM_TPU_MIN_DECODE_INTERVAL_MS
         or envs.VLLM_TPU_DECODE_TPOT_TARGET_MS
         or envs.VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST
+        or envs.VLLM_TPU_DECODE_TPOT_CAP_MS
+        or envs.VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST
     ):
         return
     from vllm_torchtpu.core.experimental.prefill_first_scheduler import SCHEDULER_CLS
@@ -1453,7 +1455,8 @@ def _configure_prefill_first_scheduler(vllm_config: VllmConfig) -> None:
         raise ValueError(
             "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS, VLLM_TPU_DECODE_INTERVAL_MS, "
             "VLLM_TPU_MIN_DECODE_INTERVAL_MS, VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS, "
-            "VLLM_TPU_DECODE_TPOT_TARGET_MS and VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST "
+            "VLLM_TPU_DECODE_TPOT_TARGET_MS, VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST, "
+            "VLLM_TPU_DECODE_TPOT_CAP_MS and VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST "
             "need PrefillFirstScheduler, but "
             f"{scheduler_config.scheduler_cls} is configured{installed_by}."
         )
