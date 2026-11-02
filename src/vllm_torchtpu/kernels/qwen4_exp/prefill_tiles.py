@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """QSA prefill tile choices."""
 
+from typing import Literal, overload
+
 import jax
 from jax.experimental.pallas import tpu as pltpu
 
@@ -65,6 +67,39 @@ SHARD_PREFILL_TILES = {
 }
 
 
+@overload
+def get_sparse_prefill_tiles(
+    query: jax.Array,
+    cache: jax.Array,
+    *,
+    kv_heads: int,
+    ratio: int,
+    with_query_tile: Literal[False] = ...,
+) -> tuple[int, int]: ...
+
+
+@overload
+def get_sparse_prefill_tiles(
+    query: jax.Array,
+    cache: jax.Array,
+    *,
+    kv_heads: int,
+    ratio: int,
+    with_query_tile: Literal[True],
+) -> tuple[int, int, int | None]: ...
+
+
+@overload
+def get_sparse_prefill_tiles(
+    query: jax.Array,
+    cache: jax.Array,
+    *,
+    kv_heads: int,
+    ratio: int,
+    with_query_tile: bool,
+) -> tuple[int | None, ...]: ...
+
+
 def get_sparse_prefill_tiles(
     query: jax.Array,
     cache: jax.Array,
@@ -72,7 +107,7 @@ def get_sparse_prefill_tiles(
     kv_heads: int,
     ratio: int,
     with_query_tile: bool = False,
-) -> tuple[int, ...]:
+) -> tuple[int | None, ...]:
     """Select measured tiles, otherwise use one 32-group selection word.
 
     ``with_query_tile`` appends the query subtile, or None for the kernel's

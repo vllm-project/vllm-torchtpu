@@ -11,17 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""QSA decode indexer on the TensorCore: score, exact top-K, compaction (no scalar loop).
+"""QSA decode indexer on the TensorCore: score, exact top-K, compaction (no scalar
+loop).
 
 Stock semantics (`kernels/qwen4_exp`, `streamindex_topk` decode path):
 
-  iq      = index_rope(gemma_norm(mixed @ W_idx[:, :512] per head, idx_q_ln))   [rows, 4, 128]
-  score_g = sum_h relu(iq_h . ck_g) * 128^-0.5     over complete groups g < n_vis = len // 4
-  sel     = top-K of score (ties -> lower group id); n_vis <= K selects every visible group
+  iq      = index_rope(gemma_norm(mixed @ W_idx[:, :512] per head, idx_q_ln))   [rows,
+  4, 128]
+  score_g = sum_h relu(iq_h . ck_g) * 128^-0.5     over complete groups g < n_vis = len
+  // 4
+  sel     = top-K of score (ties -> lower group id); n_vis <= K selects every visible
+  group
 
 Selection (measured exact on every row, ~2 µs/row, P1b j-988c4e1c): bisection on the f32
-bit pattern with per-row counts as a vector, a tie-break bisection on ids, then compaction
-by matmuls: in-row ranks `P = sel @ U`, row offsets `O = c @ Us`, the row of output slot j by
+bit pattern with per-row counts as a vector, a tie-break bisection on ids, then
+compaction
+by matmuls: in-row ranks `P = sel @ U`, row offsets `O = c @ Us`, the row of output slot
+j by
 a compare-and-count, that row's ranks by a one-hot matmul, the lane by another count.
 """
 
@@ -33,32 +39,43 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..ops import BF16, F32, I32, rnd, rmsnorm
+from ..ops import BF16, F32, I32, rmsnorm, rnd
 
 IDX_HEADS, IDX_DIM = 4, 128
 
 
 def _next_toward(x: jax.Array, up: jax.Array, bitcast: Any) -> jax.Array:
-    """`nextafter(x, +inf if up else -inf)` for finite nonzero f32 `x`, by bit arithmetic."""
+    """`nextafter(x, +inf if up else -inf)` for finite nonzero f32 `x`, by bit
+    arithmetic."""
     b = bitcast(x, I32)
-    pos = x > 0  # magnitude grows toward +inf for x > 0 (logic ops: Mosaic rejects bool selects)
+    pos = (
+        x > 0
+    )  # magnitude grows toward +inf for x > 0 (logic ops: Mosaic rejects bool selects)
     inc = (pos & up) | (~pos & ~up)
     return bitcast(jnp.where(inc, b + 1, b - 1), F32)
 
 
 def fma_bf16(a: jax.Array, b: jax.Array, c: jax.Array, bitcast: Any) -> jax.Array:
-    """Stock `_fma`: BF16 of the exact `a * b + c` (two-sum residual breaks BF16 ties)."""
+    """Stock `_fma`: BF16 of the exact `a * b + c` (two-sum residual breaks BF16
+    ties).
+    """
     product = a * b
     high = product + c
     z = high - product
     residual = (product - (high - z)) + (c - z)
     tie = (bitcast(high, I32) & 0xFFFF) == 0x8000
-    adj = jnp.where(tie & (residual != 0), _next_toward(high, residual > 0, bitcast), high)
+    adj = jnp.where(
+        tie & (residual != 0), _next_toward(high, residual > 0, bitcast), high
+    )
     return rnd(adj)
 
 
-def index_rope(x: jax.Array, cos: jax.Array, sin: jax.Array, rot: int, bitcast: Any) -> jax.Array:
-    """Stock `index_rope`: `[B(a c - B(b s)), B(a s + B(b c)), x[rot:]]` on rows of `x`."""
+def index_rope(
+    x: jax.Array, cos: jax.Array, sin: jax.Array, rot: int, bitcast: Any
+) -> jax.Array:
+    """Stock `index_rope`: `[B(a c - B(b s)), B(a s + B(b c)), x[rot:]]` on rows
+    of `x`.
+    """
     half = rot // 2
     a, b = x[:, :half], x[:, half:rot]
     y1 = fma_bf16(a, cos, -rnd(b * sin), bitcast)
@@ -66,8 +83,12 @@ def index_rope(x: jax.Array, cos: jax.Array, sin: jax.Array, rot: int, bitcast: 
     return jnp.concatenate((y1, y2, x[:, rot:]), axis=-1)
 
 
-def index_query(y: jax.Array, iqn: jax.Array, cos, sin, rot: int, eps: float, bitcast) -> list:
-    """Per head `[rows, 128]` BF16-valued queries from the projection `y [rows, >=512]`."""
+def index_query(
+    y: jax.Array, iqn: jax.Array, cos, sin, rot: int, eps: float, bitcast
+) -> list:
+    """Per head `[rows, 128]` BF16-valued queries from the projection `y [rows,
+    >=512]`.
+    """
     out = []
     for h in range(IDX_HEADS):
         q = rmsnorm(y[:, h * IDX_DIM : (h + 1) * IDX_DIM], iqn, eps, zero_centered=True)
@@ -76,14 +97,18 @@ def index_query(y: jax.Array, iqn: jax.Array, cos, sin, rot: int, eps: float, bi
 
 
 def score_rows(qr: jax.Array, ck: jax.Array) -> jax.Array:
-    """`[T, G]` scores of `T` rows: `qr [T*4, 128]` (row-major over heads), `ck [G, 128]`."""
-    st = jax.lax.dot_general(qr, ck, (((1,), (1,)), ((), ())), preferred_element_type=F32)
+    """`[T, G]` scores of `T` rows: `qr [T*4, 128]` (row-major over heads), `ck [G,
+    128]`."""
+    st = jax.lax.dot_general(
+        qr, ck, (((1,), (1,)), ((), ())), preferred_element_type=F32
+    )
     T = qr.shape[0] // IDX_HEADS
     return (jnp.maximum(st, 0.0) * IDX_DIM**-0.5).reshape(T, IDX_HEADS, -1).sum(axis=1)
 
 
 def thresholds(bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int):
-    """Per-row `(thr, tmax)` [R, 1, 1] for bit patterns `bits [R, S, 128]` (-1 = invisible)."""
+    """Per-row `(thr, tmax)` [R, 1, 1] for bit patterns `bits [R, S, 128]` (-1 =
+    invisible)."""
     cnt = lambda m: jnp.sum(m.astype(I32), axis=(1, 2), keepdims=True)  # noqa: E731
     over = nv > K
     lo = jnp.zeros(nv.shape, I32)
@@ -102,7 +127,8 @@ def thresholds(bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int):
 
 
 def compact_row(b, th, tm, nv, K: int, consts: tuple) -> jax.Array:
-    """Selected group ids of one row as a lane-major `[1, K]` int32 (slots past the count: 0).
+    """Selected group ids of one row as a lane-major `[1, K]` int32 (slots past the
+    count: 0).
 
     `b [S, 128]` bit patterns (-1 = invisible), `th / tm / nv` `[1, 1]`.
     """
@@ -117,7 +143,9 @@ def compact_row(b, th, tm, nv, K: int, consts: tuple) -> jax.Array:
     jf = jcol.astype(F32)
     r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
     oh = srow == r_j
-    Pg = jnp.dot(oh.astype(F32).astype(BF16), P.astype(BF16), preferred_element_type=F32)
+    Pg = jnp.dot(
+        oh.astype(F32).astype(BF16), P.astype(BF16), preferred_element_type=F32
+    )
     O_rj = jnp.sum(jnp.where(oh, O_row, 0.0), axis=1, keepdims=True)
     lane_j = jnp.sum((Pg <= jf - O_rj).astype(I32), axis=1, keepdims=True)
     # Slots past the row's count hold group 0, so DMAs issued for them stay in bounds.
@@ -126,16 +154,22 @@ def compact_row(b, th, tm, nv, K: int, consts: tuple) -> jax.Array:
 
 
 def exclusive_prefix(c_row: jax.Array, us: jax.Array) -> jax.Array:
-    """Exclusive prefix sum `[1, S]` of the per-sublane-row counts `c_row [1, S]` (each <= 128,
-    exact in BF16): one `[1, 128] x [128, 128]` strict-triangular matmul per 128-lane chunk plus
-    the running total of the chunks before it (f32 integers: exact). Replaces the `[S, S]` strict
-    triangle, whose VMEM grows with S^2 (0.5 MiB at S = 512, 262K contexts). An S that is not a
+    """Exclusive prefix sum `[1, S]` of the per-sublane-row counts `c_row [1, S]` (each
+    <= 128,
+    exact in BF16): one `[1, 128] x [128, 128]` strict-triangular matmul per 128-lane
+    chunk plus
+    the running total of the chunks before it (f32 integers: exact). Replaces the `[S,
+    S]` strict
+    triangle, whose VMEM grows with S^2 (0.5 MiB at S = 512, 262K contexts). An S that
+    is not a
     multiple of 128 (small test / 32K-cap shapes) keeps the one `[S, S]` matmul."""
     S = c_row.shape[1]
     if S % 128:
         si = jax.lax.broadcasted_iota(I32, (S, S), 0)
         sj = jax.lax.broadcasted_iota(I32, (S, S), 1)
-        return jnp.dot(c_row.astype(BF16), (si < sj).astype(BF16), preferred_element_type=F32)
+        return jnp.dot(
+            c_row.astype(BF16), (si < sj).astype(BF16), preferred_element_type=F32
+        )
     out, carry = [], jnp.zeros((1, 1), F32)
     for c in range(c_row.shape[1] // 128):
         x = c_row[:, c * 128 : (c + 1) * 128]

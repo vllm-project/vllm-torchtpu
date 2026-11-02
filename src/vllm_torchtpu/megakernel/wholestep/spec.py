@@ -28,8 +28,8 @@ from typing import Any
 from ..blocks.hc import HCSublayer
 from ..models.qwen38 import (
     QWEN38_SEGMENT,
-    Qwen38Geometry,
     Qwen38GDN,
+    Qwen38Geometry,
     Qwen38MoE,
     Qwen38ResidualGeometry,
 )
@@ -51,9 +51,11 @@ def wholestep_spec(
     first: str = "gdn",
     tail: dict[str, Any] | None = None,
 ) -> ModelSpec:
-    """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 = GDN).
+    """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 =
+    GDN).
 
-    `indexed`: `QSAFullIndexedBlock` options (`max_groups`, `pages_per_seq`) — the indexer,
+    `indexed`: `QSAFullIndexedBlock` options (`max_groups`, `pages_per_seq`) — the
+    indexer,
     top-K and compaction run in-kernel instead of taking a selection as input.
     """
     assert L % g.att_every == 0 or (L == 1 and first == "qsa"), (L, g.att_every)
@@ -75,18 +77,28 @@ def wholestep_spec(
     else:
         qsa_block = QSAFullBlock(**(qsa or {}))
     attn = HCSublayer(qsa_block, ar_slot=0, **hc)
-    # Counts are per cycle (period = att_every): branch 0 runs at l % period < c0. `first="qsa"`
-    # starts the kernel at a QSA layer (model layers 3 .. 3+L-1: the cycle QSA, GDN, GDN, GDN),
+    # Counts are per cycle (period = att_every): branch 0 runs at l % period < c0.
+    # `first="qsa"`
+    # starts the kernel at a QSA layer (model layers 3 .. 3+L-1: the cycle QSA, GDN,
+    # GDN, GDN),
     # so the head (layers 0-2, with PLE before layer 1) can stay a separate call.
     if L == 1:  # the last model layer (47): QSA only
         mixer: Any = attn
     elif first == "qsa":
-        mixer = SwitchSlot("mixer", branches=(attn, gdn), branch_counts=(1, g.att_every - 1))
+        mixer = SwitchSlot(
+            "mixer", branches=(attn, gdn), branch_counts=(1, g.att_every - 1)
+        )
     else:
-        mixer = SwitchSlot("mixer", branches=(gdn, attn), branch_counts=(g.att_every - 1, 1))
-    moe = HCSublayer(Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hc)
+        mixer = SwitchSlot(
+            "mixer", branches=(gdn, attn), branch_counts=(g.att_every - 1, 1)
+        )
+    moe = HCSublayer(
+        Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hc
+    )
     slots: tuple = (mixer, moe)
-    if tail is not None:  # + final HC mixer, lm_head, per-rank greedy top token (L = 1 only)
+    if (
+        tail is not None
+    ):  # + final HC mixer, lm_head, per-rank greedy top token (L = 1 only)
         from .tail import GreedyHead
 
         assert L == 1, L

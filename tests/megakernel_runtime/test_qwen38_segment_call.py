@@ -51,7 +51,9 @@ from vllm_torchtpu.megakernel.models.qwen38_inputs import (  # noqa: E402
     pack_segment,
     random_segment_inputs,
 )
-from vllm_torchtpu.megakernel.models.qwen38_reference import segment_reference  # noqa: E402
+from vllm_torchtpu.megakernel.models.qwen38_reference import (
+    segment_reference,  # noqa: E402
+)
 from vllm_torchtpu.megakernel_runtime import qwen38_gdn_state as gs  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.qwen38_segment_call import (  # noqa: E402
     T_VERIFY,
@@ -59,7 +61,8 @@ from vllm_torchtpu.megakernel_runtime.qwen38_segment_call import (  # noqa: E402
 )
 
 _spec = importlib.util.spec_from_file_location(
-    "gdn_state_test", os.path.join(os.path.dirname(__file__), "test_qwen38_gdn_state.py")
+    "gdn_state_test",
+    os.path.join(os.path.dirname(__file__), "test_qwen38_gdn_state.py"),
 )
 _gst = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_gst)
@@ -77,9 +80,9 @@ def _blocks(NL):
     """ckpt [NL, NS, T] distinct per (layer, request, token); reads at offset 2."""
     ck = 1 + np.arange(NL * NS * T_VERIFY, dtype=np.int32).reshape(NL, NS, T_VERIFY)
     off = np.zeros((NL, NMB), np.int32)
-    for l in range(NL):
+    for ln in range(NL):
         for s in range(NS):
-            off[l, ck[l, s, 0]] = 2
+            off[ln, ck[ln, s, 0]] = 2
     return ck, off
 
 
@@ -95,7 +98,9 @@ def _blocks(NL):
         (2, True, True, 128, True),
     ],
 )
-def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn, kb, flat_smalls):
+def test_segment_call_matches_reference_and_writes_checkpoints(
+    L, head, pool_gdn, kb, flat_smalls
+):
     POOL_SHAPE = (NMB * (512 // kb), kb, 1, 4, 256)  # served: 128- or 512-row blocks
     NL = L if head else L - 1
     rng = np.random.default_rng(0)
@@ -119,11 +124,14 @@ def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn
     conv0 = np.zeros((R, NL, NS, 3, 1280), np.float32)
     rec0 = np.zeros((R, NL, NS, 6, 128, 128), np.float32)
     for r in range(R):
-        for l in range(NL):
+        for ln in range(NL):
             for s in range(NS):
-                ssm, conv = _gst.ref_read(raws[r], ck[l, s, 2])
-                rec0[r, l, s], conv0[r, l, s] = ssm, conv
-    inp.st_l = {"conv": jnp.asarray(conv0), "rec": jnp.asarray(rec0).astype(jnp.bfloat16)}
+                ssm, conv = _gst.ref_read(raws[r], ck[ln, s, 2])
+                rec0[r, ln, s], conv0[r, ln, s] = ssm, conv
+    inp.st_l = {
+        "conv": jnp.asarray(conv0),
+        "rec": jnp.asarray(rec0).astype(jnp.bfloat16),
+    }
     ref, ref_states = segment_reference(
         G, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L, head=head
     )
@@ -140,7 +148,8 @@ def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn
     if flat_smalls:
         # The packer's `boundary` layout: "smalls" as [L * S / 128, 128] per rank.
         names = [
-            n for n in kernel.build(spec, ex)[1]["plan"].w_names
+            n
+            for n in kernel.build(spec, ex)[1]["plan"].w_names
             for _ in range(len(w_mk[n]) if isinstance(w_mk[n], tuple) else 1)
         ]
         k = names.index("smalls")
@@ -148,15 +157,13 @@ def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn
     flat = [jax.device_put(x, tp) for x in flat]
     hidden = jax.device_put(jnp.tile(inp.x, (R, 1)), tp)
     attn = jax.device_put(inp.attn.reshape(R * B, -1), tp)
-    pool = jax.device_put(
-        jnp.concatenate([_gst._to_pool(r) for r in raws], axis=0), tp
-    )
+    pool = jax.device_put(jnp.concatenate([_gst._to_pool(r) for r in raws], axis=0), tp)
     meta = []
-    for l in range(NL):
+    for ln in range(NL):
         meta += [
-            jnp.asarray(ck[l, :, 0]),  # state ids
-            jnp.asarray(off[l]),
-            jnp.asarray(ck[l]),
+            jnp.asarray(ck[ln, :, 0]),  # state ids
+            jnp.asarray(off[ln]),
+            jnp.asarray(ck[ln]),
             jnp.arange(NS + 1, dtype=jnp.int32) * T_VERIFY,
             jnp.full((NS,), 100, jnp.int32),
         ]
@@ -164,7 +171,15 @@ def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn
 
     layout = gs.Qwen38GdnPoolLayout(pool_shape=POOL_SHAPE, pool_dtype="float8_e4m3fn")
     fn, in_specs, out_specs, donate = build_segment_call(
-        mesh, G, L, B, layout, interpret=True, tiles=TILES, head=head, pool_gdn=pool_gdn,
+        mesh,
+        G,
+        L,
+        B,
+        layout,
+        interpret=True,
+        tiles=TILES,
+        head=head,
+        pool_gdn=pool_gdn,
         flat_smalls=flat_smalls,
     )
     lead = (hidden,) if head else (hidden, attn)
@@ -185,15 +200,18 @@ def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn
     new_raw = np.asarray(jax.lax.bitcast_convert_type(new_pool, jnp.uint8)).reshape(
         R, *POOL_SHAPE
     )
-    for l in range(NL):
-        rec_ck = np.asarray(ref_states[l]["rec_ckpt"], np.float32).reshape(
+    for ln in range(NL):
+        rec_ck = np.asarray(ref_states[ln]["rec_ckpt"], np.float32).reshape(
             R, NS, T_VERIFY, 6, 128, 128
         )
         for r in range(R):
             for s in range(NS):
                 for t in range(T_VERIFY):
-                    ssm, _ = _gst.ref_read(new_raw[r], ck[l, s, t])
+                    ssm, _ = _gst.ref_read(new_raw[r], ck[ln, s, t])
                     np.testing.assert_allclose(
-                        ssm, rec_ck[r, s, t], atol=2e-2, rtol=2e-2,
-                        err_msg=f"layer {l} rank {r} req {s} token {t}",
+                        ssm,
+                        rec_ck[r, s, t],
+                        atol=2e-2,
+                        rtol=2e-2,
+                        err_msg=f"layer {ln} rank {r} req {s} token {t}",
                     )

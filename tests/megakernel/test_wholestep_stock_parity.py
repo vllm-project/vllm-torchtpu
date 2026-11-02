@@ -13,9 +13,11 @@
 # limitations under the License.
 """Whole-step kernel math vs the stock qwen4_exp writers, on identical inputs (CPU).
 
-The kernel computes the completed group's compressed key and the new ring rows itself (it
+The kernel computes the completed group's compressed key and the new ring rows itself
+(it
 must score that key in the same step); the served cache keeps being written by the stock
-`_indexer_updates` / writers. These must agree bit for bit, or the cache and the kernel's own
+`_indexer_updates` / writers. These must agree bit for bit, or the cache and the
+kernel's own
 selection diverge.
 """
 
@@ -45,7 +47,8 @@ def _trig(max_pos: int) -> jax.Array:
 
 
 def _kernel_completed(raw_q, ring, c0, ikn, rope_row):
-    """The kernel's arithmetic (`QSAFullStepBlock._new_group`): sequential f32 member sum."""
+    """The kernel's arithmetic (`QSAFullStepBlock._new_group`): sequential f32 member
+    sum."""
     p3 = c0 + (3 - c0 % 4) % 4
     acc = None
     for j in range(4):
@@ -54,8 +57,13 @@ def _kernel_completed(raw_q, ring, c0, ikn, rope_row):
         acc = m if acc is None else acc + m
     pooled = rnd(acc * 0.25)
     cos, sin = rope_row[:, : ROT // 2], rope_row[:, ROT // 2 : ROT]
-    return index_rope(rmsnorm(pooled, ikn, EPS, zero_centered=True), cos, sin, ROT,
-                      jax.lax.bitcast_convert_type).astype(BF16), p3
+    return index_rope(
+        rmsnorm(pooled, ikn, EPS, zero_centered=True),
+        cos,
+        sin,
+        ROT,
+        jax.lax.bitcast_convert_type,
+    ).astype(BF16), p3
 
 
 @pytest.mark.parametrize("ctx", [[3001, 100], [3000, 101], [2999, 102], [7, 4097]])
@@ -64,7 +72,8 @@ def test_completed_key_and_ring_match_stock(ctx):
     nreq = len(ctx)
     raw = jnp.asarray(rng.standard_normal((nreq * T, D)), BF16)
     ring = jnp.asarray(rng.standard_normal((nreq, 8, D)), BF16)
-    # Tags hold the position each ring lane last stored (the 8 positions before the step).
+    # Tags hold the position each ring lane last stored (the 8 positions before the
+    # step).
     tags = np.zeros((nreq, 8, 2), np.int32)
     for q, c in enumerate(ctx):
         for p in range(c - 8, c):
@@ -76,18 +85,33 @@ def test_completed_key_and_ring_match_stock(ctx):
     slots = jnp.arange(nreq, dtype=jnp.int32)
     trig = _trig(max(ctx) + 16)
     completed, complete, req, logical, ring_new, tags_new = _indexer_updates(
-        raw, positions, ring, jnp.asarray(tags), ikn, trig, starts, context, slots,
-        RATIO, EPS, ROT, rows_are_slots=True,
+        raw,
+        positions,
+        ring,
+        jnp.asarray(tags),
+        ikn,
+        trig,
+        starts,
+        context,
+        slots,
+        RATIO,
+        EPS,
+        ROT,
+        rows_are_slots=True,
     )
     completed, complete = np.asarray(completed.astype(F32)), np.asarray(complete)
     for q, c in enumerate(ctx):
         rows = slice(q * T, (q + 1) * T)
         p3 = c + (3 - c % 4) % 4
         rope_row = trig[p3 - 3][None].astype(F32)
-        mine, _ = _kernel_completed(raw[rows].astype(F32), ring[q].astype(F32), c, ikn, rope_row)
+        mine, _ = _kernel_completed(
+            raw[rows].astype(F32), ring[q].astype(F32), c, ikn, rope_row
+        )
         t = p3 - c  # the verify row whose token completes the group
         assert complete[q * T + t]
-        np.testing.assert_array_equal(np.asarray(mine.astype(F32))[0], completed[q * T + t])
+        np.testing.assert_array_equal(
+            np.asarray(mine.astype(F32))[0], completed[q * T + t]
+        )
         # Ring: lane l keeps the newest position = l (mod 8) below ctx + T.
         end = c + T
         want = np.asarray(ring[q].astype(F32)).copy()

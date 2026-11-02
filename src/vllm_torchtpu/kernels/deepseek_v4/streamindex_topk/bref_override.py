@@ -203,7 +203,6 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             )
         )
         max_hbm_pages = reshaped_cache_hbm_ref.shape[0]
-        num_page_indices = page_indices_ref.shape[0]
         effective_seq_idx = batch_tile_idx
 
         expansion = self.table_expansion[0]

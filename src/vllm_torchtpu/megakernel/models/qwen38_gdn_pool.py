@@ -284,6 +284,7 @@ class Qwen38PoolGDN(Qwen38GDN):
         pending = self._copies(ctx, o, 0, 0, ssm)
         for c in pending:
             c.start()
+        nxt = pending
         for s in range(NS):
             buf = s % 2
             if s + 1 < NS:
@@ -327,4 +328,7 @@ class Qwen38PoolGDN(Qwen38GDN):
         return super().emit(dataclasses.replace(ctx, ST=st), l, slot)
 
     def host_update_states(self, g, ex, pos, states, raw_outputs):
-        return {"conv_ckpt": raw_outputs["conv_ckpt"], "rec_ckpt": raw_outputs["rec_ckpt"]}
+        return {
+            "conv_ckpt": raw_outputs["conv_ckpt"],
+            "rec_ckpt": raw_outputs["rec_ckpt"],
+        }

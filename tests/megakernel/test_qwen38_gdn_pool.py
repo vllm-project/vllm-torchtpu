@@ -26,7 +26,10 @@ from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.blocks.hc import RESIDUAL_OUT
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen38
-from vllm_torchtpu.megakernel.models.qwen38_inputs import pack_segment, random_segment_inputs
+from vllm_torchtpu.megakernel.models.qwen38_inputs import (
+    pack_segment,
+    random_segment_inputs,
+)
 from vllm_torchtpu.megakernel.models.qwen38_pack import shard_step_inputs
 from vllm_torchtpu.megakernel.models.qwen38_reference import segment_reference
 
@@ -36,11 +39,16 @@ LANES = 256
 
 
 def _write_f32_rows(block: np.ndarray, rows: np.ndarray) -> None:
-    """f32 typed rows -> one kernel block's bytes `[128, 1, 4, 256]` (4 pack rows per word,
+    """f32 typed rows -> one kernel block's bytes `[128, 1, 4, 256]` (4 pack rows per
+    word,
     little-endian, row 0 in the low byte), starting at typed row 0."""
     kb, h2p, pack, lanes = block.shape
     words = np.zeros((kb * h2p * pack // 4, lanes), np.uint32)
-    old = np.moveaxis(block.reshape(kb, h2p, pack // 4, 4, lanes), 3, -1).copy().view(np.uint32)
+    old = (
+        np.moveaxis(block.reshape(kb, h2p, pack // 4, 4, lanes), 3, -1)
+        .copy()
+        .view(np.uint32)
+    )
     words[...] = old.reshape(-1, lanes)
     words[: rows.shape[0]] = rows.view(np.uint32)
     b = words.reshape(kb, h2p, pack // 4, lanes, 1).view(np.uint8)
@@ -64,18 +72,25 @@ def test_pool_gdn_segment_matches_reference(fresh: bool):
     rng = np.random.default_rng(1)
     nmb = 1 + NL * NS
     rb = 1 + np.arange(NL * NS, dtype=np.int32).reshape(NL, NS)
-    raws, conv0, rec0 = [], np.zeros((R, NL, NS, 3, 1280), np.float32), np.zeros((R, NL, NS, 6, 128, 128), np.float32)
+    raws, conv0, rec0 = (
+        [],
+        np.zeros((R, NL, NS, 3, 1280), np.float32),
+        np.zeros((R, NL, NS, 6, 128, 128), np.float32),
+    )
     for r in range(R):
         raw = np.zeros((nmb * 4, 128, 1, 4, LANES), np.uint8)
-        for l in range(NL):
+        for ln in range(NL):
             for s in range(NS):
                 ssm = rng.standard_normal((6, 128, 128)).astype(np.float32) * 0.05
                 conv = rng.standard_normal((3, 1280)).astype(np.float32) * 0.05
-                _encode(raw, rb[l, s], ssm, conv)
+                _encode(raw, rb[ln, s], ssm, conv)
                 if not fresh:
-                    rec0[r, l, s], conv0[r, l, s] = ssm, conv
+                    rec0[r, ln, s], conv0[r, ln, s] = ssm, conv
         raws.append(raw)
-    inp.st_l = {"conv": jnp.asarray(conv0), "rec": jnp.asarray(rec0).astype(jnp.bfloat16)}
+    inp.st_l = {
+        "conv": jnp.asarray(conv0),
+        "rec": jnp.asarray(rec0).astype(jnp.bfloat16),
+    }
     ref, ref_states = segment_reference(
         G, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L
     )
@@ -84,7 +99,9 @@ def test_pool_gdn_segment_matches_reference(fresh: bool):
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pos, hid, w_mk, st = shard_step_inputs(mesh, ex, inp.pos, inp.x, w_mk, {})
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
-    pool = jnp.concatenate([jax.lax.bitcast_convert_type(jnp.asarray(r), jnp.float8_e4m3fn) for r in raws])
+    pool = jnp.concatenate(
+        [jax.lax.bitcast_convert_type(jnp.asarray(r), jnp.float8_e4m3fn) for r in raws]
+    )
     extras = (
         jax.device_put(kernel.fold(attn), tp),
         jax.device_put(pool, tp),

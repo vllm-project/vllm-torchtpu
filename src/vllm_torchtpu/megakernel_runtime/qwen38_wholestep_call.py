@@ -14,10 +14,14 @@
 """One Qwen3.8 whole-step call (model layers 3..46) as a single SPMD JAX function.
 
 `build_wholestep_call` returns `(fn, in_specs, out_specs, donate_argnums)` at one row
-count `B`. `fn(hidden, *weights, pool, *gdn_meta, *qsa_tables, positions, starts, context,
-trig)`: pads rows to the kernel's `M`, derives the GDN read / write blocks (as the segment
-call) and the QSA layers' extras with the stock addressing (`qwen38_wholestep_inputs`), runs
-the kernel, then — in the same function, on the donated pool — scatters the GDN checkpoints
+count `B`. `fn(hidden, *weights, pool, *gdn_meta, *qsa_tables, positions, starts,
+context,
+trig)`: pads rows to the kernel's `M`, derives the GDN read / write blocks (as the
+segment
+call) and the QSA layers' extras with the stock addressing (`qwen38_wholestep_inputs`),
+runs
+the kernel, then — in the same function, on the donated pool — scatters the GDN
+checkpoints
 and writes every QSA layer's step tokens through the stock writer sequence
 (`qwen38_wholestep_cache`). Returns `(residual, pool)`.
 """
@@ -37,8 +41,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import F32, REC
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
-from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_STATS
 from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
+from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_STATS
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 
 from .qwen38_scatter import scatter_gdn_ckpts_fast
@@ -49,25 +53,36 @@ from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
 from .qwen38_wholestep_inputs import qsa_step_inputs
 
 QSA_TABLES = 3  # per QSA layer: ring ids, main table, compressed table
-# Served indexer options: page tables in HBM with per-layer SMEM windows, one request's scores
-# at a time, and only the key chunks a request's rows can see (exact vs the stock selection,
+# Served indexer options: page tables in HBM with per-layer SMEM windows, one request's
+# scores
+# at a time, and only the key chunks a request's rows can see (exact vs the stock
+# selection,
 # tests/megakernel/test_wholestep.py long mode). Without the last, every request streams
 # max_groups keys per QSA layer: 22.4 ms at 64 rows for max_groups 8192 (j-dcafcac7).
 LONG_CONTEXT = dict(hbm_tables=True, per_request_scores=True, bounded_chunks=True)
-# `VLLM_TPU_MEGAKERNEL=...,wholeshard=1`: each rank scores and selects its own run of requests and
-# the ranks exchange the selections in-kernel (`QSAFullIndexedBlock.shard_index`; exact).
-SHARD_INDEX = False
-# `...,wholeunion=1`: each request's verify rows attend one union of their selections, streamed
-# once (`QSAFullIndexedBlock.union_attn`; same tokens per row, f32 order of the softmax tiles).
-UNION_ATTN = False
-# `...,wholestats=N` (with `wholeunion=1`): the call also returns per QSA layer and request the
-# union size vs the rows' selections (`qsa_union_stats`); the runner logs them every N calls.
-UNION_STATS_EVERY = 0
-# `...,wholeloop=1`: a QSA layer's per-request work in a fori_loop (compile size flat in B).
-LOOP_REQUESTS = False
-# `...,wholephys=1` (with `wholeunion=1`): union ids -> physical micro-page ids in one vector pass
-# per request, so each attention copy issues from one SMEM load (same addresses; RPAd's recipe).
-UNION_PHYS = False
+# `VLLM_TPU_MEGAKERNEL=...,wholeshard=1`: each rank scores and selects its own run of
+# requests and
+# the ranks exchange the selections in-kernel (`QSAFullIndexedBlock.shard_index`;
+# exact).
+SHARD_INDEX: bool = False
+# `...,wholeunion=1`: each request's verify rows attend one union of their selections,
+# streamed
+# once (`QSAFullIndexedBlock.union_attn`; same tokens per row, f32 order of the softmax
+# tiles).
+UNION_ATTN: bool = False
+# `...,wholestats=N` (with `wholeunion=1`): the call also returns per QSA layer and
+# request the
+# union size vs the rows' selections (`qsa_union_stats`); the runner logs them every N
+# calls.
+UNION_STATS_EVERY: int = 0
+# `...,wholeloop=1`: a QSA layer's per-request work in a fori_loop (compile size flat in
+# B).
+LOOP_REQUESTS: bool = False
+# `...,wholephys=1` (with `wholeunion=1`): union ids -> physical micro-page ids in one
+# vector pass
+# per request, so each attention copy issues from one SMEM load (same addresses; RPAd's
+# recipe).
+UNION_PHYS: bool = False
 
 
 def union_stats_on() -> bool:
@@ -176,16 +191,32 @@ def build_wholestep_call(
     assert len(qsa_layers) == n_att, (len(qsa_layers), n_att)
     pps = max_groups * 4 // 128
     spec = wholestep_spec(
-        g, R, L=L, first="qsa", pool_gdn=True, qsa=dict(budget=budget), step=True,
-        indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att, **indexed_options()),
+        g,
+        R,
+        L=L,
+        first="qsa",
+        pool_gdn=True,
+        qsa=dict(budget=budget),
+        step=True,
+        indexed=dict(
+            max_groups=max_groups,
+            pages_per_seq=pps,
+            carrier="fp8",
+            n_layers=n_att,
+            **indexed_options(),
+        ),
     )
     stats = union_stats_on()
     fn, k_specs, _, n_w = make_flat_segment_step(
-        mesh, spec, ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW) + ((UNION_STATS,) if stats else ())
+        mesh,
+        spec,
+        ex,
+        extra_outs=(KV_NEW, KR_NEW, IR_NEW) + ((UNION_STATS,) if stats else ()),
     )
     M, NS = ex.M, B // T
     tp, rep = P("tp"), P()
-    # Planned global weight shapes: the packer hands tiled operands over 3-D ([L*nt, tk, N],
+    # Planned global weight shapes: the packer hands tiled operands over 3-D ([L*nt, tk,
+    # N],
     # the same bytes) and they are reshaped to [L, nt, tk, N] here, under jit, for free.
     # Every 4-D operand is re-laid out by an execute_as_strided program per call at the
     # torch_tpu boundary (q32/q40: all copied operands are 4-D, no 3-D one is).
@@ -203,28 +234,58 @@ def build_wholestep_call(
     hbm = {x for x, s in zip(fn.extra_names, x_specs) if s == tp}
 
     pad = jax.shard_map(
-        lambda h: jnp.pad(h, ((0, M - B), (0, 0))), mesh=mesh, in_specs=tp, out_specs=tp,
+        lambda h: jnp.pad(h, ((0, M - B), (0, 0))),
+        mesh=mesh,
+        in_specs=tp,
+        out_specs=tp,
         check_vma=False,
     )
-    unpad = jax.shard_map(lambda r: r[:B], mesh=mesh, in_specs=tp, out_specs=tp, check_vma=False)
+    unpad = jax.shard_map(
+        lambda r: r[:B], mesh=mesh, in_specs=tp, out_specs=tp, check_vma=False
+    )
     pos0 = jnp.zeros((B,), jnp.int32)
     n_meta = GDN_META * n_gdn
     n_tab = QSA_TABLES * n_att
     slots = [(lay.main_slot, lay.compressed_slot) for lay in qsa_layers]
     scales = (qsa_layers[0].k_scale, qsa_layers[0].v_scale)
-    assert all((lay.k_scale, lay.v_scale) == scales for lay in qsa_layers), "one KV scale pair"
+    assert all((lay.k_scale, lay.v_scale) == scales for lay in qsa_layers), (
+        "one KV scale pair"
+    )
 
     names = (
-        "qsa_pool", "qsa_ck", "qsa_cktab", "qsa_nvis", "qsa_tail", "qsa_mtab", "qsa_off",
-        "qsa_scales", "qsa_rope", "qsa_ctx", "qsa_ring", "qsa_rope_ck",
+        "qsa_pool",
+        "qsa_ck",
+        "qsa_cktab",
+        "qsa_nvis",
+        "qsa_tail",
+        "qsa_mtab",
+        "qsa_off",
+        "qsa_scales",
+        "qsa_rope",
+        "qsa_ctx",
+        "qsa_ring",
+        "qsa_rope_ck",
     )
     out_specs_in = tuple(tp if n in hbm else rep for n in names)
 
     def per_rank_inputs(pool, tables_flat, positions, starts, context, trig):
-        tables = [tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)]
+        tables = [
+            tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)
+        ]
         d = qsa_step_inputs(
-            pool, tables, slots, trig, positions, starts, context, M=M, T=T,
-            pages_per_seq=pps, max_groups=max_groups, k_scale=scales[0], v_scale=scales[1],
+            pool,
+            tables,
+            slots,
+            trig,
+            positions,
+            starts,
+            context,
+            M=M,
+            T=T,
+            pages_per_seq=pps,
+            max_groups=max_groups,
+            k_scale=scales[0],
+            v_scale=scales[1],
             layer_major_tables=LONG_CONTEXT["hbm_tables"],
         )
         return tuple(d[n] for n in names)
@@ -245,7 +306,10 @@ def build_wholestep_call(
         if not write:
             return pool
         Bq = len(positions)
-        rows = [(kr[o, :Bq], kv[o, :Bq, kv.shape[-1] // 2 :], ir[o, :Bq]) for o in range(n_att)]
+        rows = [
+            (kr[o, :Bq], kv[o, :Bq, kv.shape[-1] // 2 :], ir[o, :Bq])
+            for o in range(n_att)
+        ]
         norms = [tuple(norms_flat[2 * o : 2 * o + 2]) for o in range(n_att)]
         tables = [tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)]
         # Main-KV DCP: this rank's pair rank, the QSA layers' `dcp_rank` buffer (int32 [1] per
@@ -296,4 +360,3 @@ def build_wholestep_call(
         + (rep,) * (2 * n_att) + ((tp,) if dcp_size > 1 else ())
     )
     return call, in_specs, (tp, tp, tp) if stats else (tp, tp), (1 + n_w,)
-

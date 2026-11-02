@@ -35,6 +35,7 @@ Derived from moe_dense_expert.py, which targets i % 512 == 0 (EP layouts).
 """
 
 import functools
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -535,13 +536,15 @@ def _folded_kernel(
     the output is bitwise the same; only rows past `tokens`, which no caller
     reads, differ.
     """
-    gate_ref, refs = (refs[0], refs[1:]) if gate else (None, refs)
-    hbm, out_ref, scratch = refs[:8], refs[8], refs[9:]
+    refs_any: Any = refs
+    gate_ref, refs_any = (refs_any[0], refs_any[1:]) if gate else (None, refs_any)
+    hbm, out_ref, scratch = refs_any[:8], refs_any[8], refs_any[9:]
     pad = m - tokens
+    xpad_ref: Any = None
     if pad:
-        *scratch, coeff_ref, shared_gate_ref, xpad_ref = scratch
+        *scratch_list, coeff_ref, shared_gate_ref, xpad_ref = scratch
     else:
-        *scratch, coeff_ref, shared_gate_ref = scratch
+        *scratch_list, coeff_ref, shared_gate_ref = scratch
     f32 = jnp.float32
     h = x_ref.shape[1]
     if pad:
@@ -584,12 +587,14 @@ def _folded_kernel(
     if gate is None:
         g = jnp.ones((m, 1), f32)
     elif gate == "xla":
+        assert gate_ref is not None
         g = gate_ref[...]
         if pad:
             g = jnp.concatenate([g, jnp.ones((pad, 1), f32)], axis=0)
     else:
         # w_g repeated over 128 rows, so the MXU returns the gate already
         # broadcast over lanes (an N=1 dot does not lower).
+        assert gate_ref is not None
         wg = gate_ref[...].astype(x_ref.dtype)
         wg = wg if wg.shape[0] == 1 else wg.T
         g = jax.nn.sigmoid(
@@ -602,7 +607,7 @@ def _folded_kernel(
         )
     shared_gate_ref[...] = jnp.broadcast_to(g, (m, 128))
 
-    _kernel(
+    cast(Any, _kernel)(
         _ActiveBits(groups),
         rank_ref,
         x_src,
@@ -610,7 +615,7 @@ def _folded_kernel(
         shared_gate_ref,
         *hbm,
         out_ref,
-        *scratch,
+        *scratch_list,
         m=m,
         experts=experts,
         folded=True,
@@ -816,6 +821,12 @@ def fused_moe_decode(
     experts, i, _ = w2.shape
     pad = (-tokens) % 16
     m = tokens + pad
+    expert_parallel = False
+    gate: str | None = None
+    gate_operands: list[Any] = []
+    active: Any = None
+    coeff: Any = None
+    shared_gate: Any = None
     if fold:
         expert_parallel = expert_start is not None
         if rows is not None:

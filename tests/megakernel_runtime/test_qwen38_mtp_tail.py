@@ -51,7 +51,9 @@ from vllm_torchtpu.megakernel.models.qwen38_inputs import (  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (  # noqa: E402
     make_typed_step_wrapper,
 )
-from vllm_torchtpu.megakernel_runtime.qwen38_mtp_tail import build_tail_call  # noqa: E402
+from vllm_torchtpu.megakernel_runtime.qwen38_mtp_tail import (
+    build_tail_call,  # noqa: E402
+)
 from vllm_torchtpu.megakernel_runtime.qwen38_segment_call import (  # noqa: E402
     T_VERIFY,
     build_segment_call,

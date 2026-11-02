@@ -130,8 +130,15 @@ def test_mtp_verify_steps_stay_on_rpa(monkeypatch, max_query_len, want_rpa):
     static = tuple(_OPTIONS) + ("max_query_len",)
     run = jax.jit(qsa_rpa.qsa_attention, static_argnames=static)
     output, _ = run(
-        query, gate, blocks, lengths, table, cache, starts,
-        max_query_len=max_query_len, **_OPTIONS,
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        starts,
+        max_query_len=max_query_len,
+        **_OPTIONS,
     )
     rpa, _ = _fake_rpa(query, gate, blocks, lengths, table, cache)
     assert np.allclose(np.asarray(output), np.asarray(rpa), rtol=1e-5) == want_rpa

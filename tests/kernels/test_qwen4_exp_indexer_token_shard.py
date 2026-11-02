@@ -13,12 +13,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import test_qwen4_exp_mtp_draft_rows as mtp_rows
-from test_qwen4_exp_mtp_draft_rows import rowwise_attention  # noqa: F401
 from test_qwen4_exp_indexer_shard import (  # noqa: F401 (fixtures)
     assert_same_selection,
     reference_kernel,
     select,
 )
+from test_qwen4_exp_mtp_draft_rows import rowwise_attention  # noqa: F401
 from test_qwen4_exp_shared_stream_indexer import (  # noqa: F401 (fixtures)
     inputs,
     interpret,
@@ -58,7 +58,11 @@ def token_sharded(args, size):
     ],
 )
 def test_token_shards_match_replicated(
-    reference_kernel, q_lens, context, tokens, size
+    reference_kernel,  # noqa: F811
+    q_lens,
+    context,
+    tokens,
+    size,
 ):
     args = inputs(5, q_lens, context, tokens, "integer")
     expected = select(args)
@@ -78,7 +82,10 @@ def test_shard_step_layout():
 
 
 @pytest.mark.parametrize("size", [2, 4, 8])
-def test_token_shard_steps_compose_to_the_pooled_step(rowwise_attention, size):
+def test_token_shard_steps_compose_to_the_pooled_step(
+    rowwise_attention,  # noqa: F811
+    size,
+):
     """select on every token shard -> gather -> attend equals the replicated
     step. The stand-in indexer shifts its blocks when the shard's ragged
     batch (starts, context) disagrees with the rows' lengths and requests."""
@@ -111,7 +118,8 @@ def test_token_shard_steps_compose_to_the_pooled_step(rowwise_attention, size):
 
 
 @pytest.mark.parametrize(
-    "min_tokens,max_num_seqs,active", [(1024, 32, True), (1024, 128, False), (4096, 256, True)]
+    "min_tokens,max_num_seqs,active",
+    [(1024, 32, True), (1024, 128, False), (4096, 256, True)],
 )
 def test_mode_is_decided_once_for_the_smallest_sp_bucket(
     monkeypatch, min_tokens, max_num_seqs, active

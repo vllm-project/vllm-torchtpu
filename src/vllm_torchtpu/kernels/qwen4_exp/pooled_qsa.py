@@ -12,12 +12,12 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import BITS_NEG_INF
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
-    SparseCoreTopK,
-)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     cp_local_to_global,
     streamindex_topk,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    SparseCoreTopK,
 )
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
 from vllm_torchtpu.kernels.qwen4_exp.fused_kv_write import (
@@ -512,9 +512,9 @@ def write_compressed(
     ):
         from vllm_torchtpu.kernels.qwen4_exp.compressed_write import write_runs
 
-        return write_runs(
-            view, pair, write, mask, values, len(context), ratio
-        ).reshape(pool.shape)
+        return write_runs(view, pair, write, mask, values, len(context), ratio).reshape(
+            pool.shape
+        )
     tile = 128
     if len(keys) >= tile and len(keys) % tile == 0:
         # A complete ratio-4 prefill page contains sixteen adjacent carrier
@@ -954,17 +954,24 @@ def token_shard_step(starts, context, shard_index, rows):
     return base, sub_starts, (context + before).astype(context.dtype)
 
 
-def compressed_kernel_pages(pages: jax.Array, pool: jax.Array, slot: int = 0, ratio: int = 4) -> jax.Array:
+def compressed_kernel_pages(
+    pages: jax.Array, pool: jax.Array, slot: int = 0, ratio: int = 4
+) -> jax.Array:
     """Flat kernel-page ids of compressed block-table columns `pages`.
 
-    Each column (a pool block of `pool.shape[1]` tokens) holds `pool.shape[1] // 128` kernel
-    pages of `128 // ratio` compressed keys for this layer, at `slot` times that within the
-    block's physical pages: column `c` -> `c * physical_pages + slot * logical_pages + j`. The
+    Each column (a pool block of `pool.shape[1]` tokens) holds `pool.shape[1] // 128`
+    kernel
+    pages of `128 // ratio` compressed keys for this layer, at `slot` times that within
+    the
+    block's physical pages: column `c` -> `c * physical_pages + slot * logical_pages +
+    j`. The
     one addressing of compressed keys, shared by the stock selection and the whole-step
     megakernel's page tables.
     """
     rows = 128 // ratio
-    physical_pages = math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * pool.shape[-1] * 2)
+    physical_pages = (
+        math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * pool.shape[-1] * 2)
+    )
     logical_pages = pool.shape[1] // 128
     scaled = pages[..., None] * physical_pages
     first = jnp.arange(logical_pages)
@@ -1551,7 +1558,9 @@ def _pooled_qsa(
     # rows take the row-wise decode indexer and RPA.
     keep = None if rows is None else rows >= 0
     picked = None if rows is None else jnp.clip(rows, 0, len(q) - 1)
+    req_rows = req
     if rows is not None and len(rows) <= len(context):
+        assert keep is not None
         q, gate, iq, req = q[picked], gate[picked], iq[picked], req[picked]
         lengths = jnp.where(keep, lengths[picked], 0)
         # Present the rows as their own decode batch: row i is a one-token
@@ -1677,7 +1686,11 @@ def _pooled_qsa(
     if select_only:
         assert rows is None, "select_only covers the all-token decode/verify path"
         pages, kv_lens, _, _ = virtual_page_metadata(
-            blocks, lengths, main_table[req], ratio=compress_ratio, page_size=pool.shape[1]
+            blocks,
+            lengths,
+            main_table[req],
+            ratio=compress_ratio,
+            page_size=pool.shape[1],
         )
         heads = q.shape[1]
         return (

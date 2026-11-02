@@ -537,7 +537,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def _pooled_conv_weight(self) -> torch.Tensor:
         """The conv weight in the layout the pooled GDN op was built for."""
         if envs.VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR:
-            return self.conv_weight_kmajor
+            w = self.conv_weight_kmajor
+            assert isinstance(w, torch.Tensor)
+            return w
         return self.conv1d.weight
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:

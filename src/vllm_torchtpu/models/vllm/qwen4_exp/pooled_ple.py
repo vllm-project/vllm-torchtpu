@@ -8,7 +8,11 @@ import torch
 from vllm.distributed import GroupCoordinator
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
-from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
+
+try:
+    from transformers import Qwen4ExpTextConfig
+except ImportError:
+    from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
     build_pooled_short_conv_op,
@@ -141,7 +145,9 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             self.prefix,
         )
 
-    def lookup_start(self, inputs: PLEInputs, valid_tokens: torch.Tensor) -> torch.Tensor:
+    def lookup_start(
+        self, inputs: PLEInputs, valid_tokens: torch.Tensor
+    ) -> torch.Tensor:
         """Device ids, then start their copy to the host (see ple_offload)."""
         assert self.cpu_offload
         return host_lookup_start(self._lookup_ids(inputs, valid_tokens), self.prefix)

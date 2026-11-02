@@ -161,6 +161,7 @@ def conv_step(ctx: Any, gp: GDNParams, o: Any, slot: Any, ybuf: Any) -> Any:
                 sem.at[2],
             ).start()
         if GCH:
+            assert u is not None
             b_pad = rup(B, 8)
             u_pad = jnp.pad(u, ((0, b_pad - B), (0, 0))) if b_pad > B else u
             ybuf[0:b_pad, 0:QKV] = u_pad

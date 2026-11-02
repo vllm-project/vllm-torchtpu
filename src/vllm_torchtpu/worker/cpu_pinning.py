@@ -177,7 +177,8 @@ def apply(rank: int, local_rank: int) -> None:
     cpus = plan(mode, node, slot, slots, envs.VLLM_TPU_CPU_PIN_RESERVE)
     n = pin_all_threads(cpus)
     logger.info(
-        "CPU pin: rank %d local_rank %d node %d mode %s slot %d/%d cpus %s (%d threads)",
+        "CPU pin: rank %d local_rank %d node %d mode %s slot %d/%d "
+        "cpus %s (%d threads)",
         rank,
         local_rank,
         node,

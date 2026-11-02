@@ -7,7 +7,8 @@ waits out. Server logs say nothing about them by default, so once warmup is
 done each later compile logs one WARNING line naming its count, duration
 and the vllm_torchtpu frame that triggered it:
 
-    Post-warmup compile #3 (12/76, 219 ms) from tpu_runner.py:2746 _apply_async_token_substitution
+    Post-warmup compile #3 (12/76, 219 ms) from tpu_runner.py:2746
+    _apply_async_token_substitution
 
 Off by default; ``VLLM_TPU_LOG_POST_WARMUP_COMPILES=1`` turns it on.
 """

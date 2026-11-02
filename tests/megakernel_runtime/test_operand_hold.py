@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""host_round_trip_small: small operands go through the host (values unchanged), big ones stay."""
+"""host_round_trip_small: small operands go through the host (values unchanged), big
+ones stay."""
 
 import torch
 
@@ -32,10 +33,16 @@ def test_small_operands_are_fresh_copies_with_equal_values():
 
 
 def test_fresh_copy_is_an_op_result_with_equal_values():
-    """`own_operand` of a reshaped stack: equal values, a contiguous base tensor (no view), and
-    not built by `copy_` (a `copy_` into the result would be caught: its grad_fn-free result
-    still has `_base is None`, so the check is that `cat` produced it: version counter 0)."""
-    from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_weights import fresh_copy, own_operand
+    """`own_operand` of a reshaped stack: equal values, a contiguous base tensor (no
+    view), and
+    not built by `copy_` (a `copy_` into the result would be caught: its grad_fn-free
+    result
+    still has `_base is None`, so the check is that `cat` produced it: version counter
+    0)."""
+    from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_weights import (
+        fresh_copy,
+        own_operand,
+    )
 
     stack = torch.stack([torch.randn(6, 8, 16) for _ in range(3)])
     view = stack.reshape(-1, 8, 16)
@@ -43,18 +50,26 @@ def test_fresh_copy_is_an_op_result_with_equal_values():
         out = own_operand(t)
         assert torch.equal(out, t) and out.shape == t.shape
         assert out._base is None and out.is_contiguous() and out.storage_offset() == 0
-        assert out._version == 0  # no in-place write after creation (empty_like().copy_() is 1)
-    assert torch.empty_like(view).copy_(view)._version == 1  # positive control of the check
+        assert (
+            out._version == 0
+        )  # no in-place write after creation (empty_like().copy_() is 1)
+    assert (
+        torch.empty_like(view).copy_(view)._version == 1
+    )  # positive control of the check
     assert own_operand(stack) is stack  # fresh stack: passed as is
     assert fresh_copy(torch.tensor(3.0)).shape == ()
 
 
 def test_hbm_summary_counts_only_copies_as_own():
-    """Packed operands: a parameter view is shared (total only), a fresh tensor is own; a storage
+    """Packed operands: a parameter view is shared (total only), a fresh tensor is own;
+    a storage
     counted once even when two operands view it."""
     from vllm_torchtpu.megakernel_runtime.operand_hold import hbm_summary
 
     model = torch.nn.Linear(256, 256, bias=False)  # 256 KiB fp32 weight
     fresh = torch.zeros(512, 512)  # 1 MiB
     ops = [model.weight.view(-1), fresh, fresh[:10]]
-    assert hbm_summary(ops, model) == f"{(256 * 256 * 4 + 512 * 512 * 4) / 2**30:.2f} GiB, {512 * 512 * 4 / 2**30:.2f} GiB not shared with model parameters"
+    assert hbm_summary(ops, model) == (
+        f"{(256 * 256 * 4 + 512 * 512 * 4) / 2**30:.2f} GiB, "
+        f"{512 * 512 * 4 / 2**30:.2f} GiB not shared with model parameters"
+    )

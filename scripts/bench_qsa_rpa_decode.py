@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """QSA sparse decode attention microbench at the Qwen3.8-Flash TP8 geometry.
 
 Per rank: 3 Q heads, 1 KV head (d 256), FP8 main KV rows (1, 4, 256) with a
@@ -150,7 +163,12 @@ def bench_step(attend, layer_inputs, cache, trace=None):
             cache, acc = carry
             for layer in range(len(layer_inputs)):
                 out, cache = attend(
-                    qs[layer], gates[layer], blocks[layer], lengths, table, cache,
+                    qs[layer],
+                    gates[layer],
+                    blocks[layer],
+                    lengths,
+                    table,
+                    cache,
                     layer % 2,
                 )
                 acc = acc + out.astype(jnp.float32).sum()
@@ -178,6 +196,7 @@ def main_step(cache, results):
     rng = np.random.default_rng(1)
     cases = os.environ.get("BENCH_CASES", "2x64,4x64,6x24,8x32").split(",")
     patterns = os.environ.get("BENCH_PATTERNS", "random").split(",")
+
     def parse(arm):
         # "fslr[/bkv/lanes]": fused, shared, lean, slot read digits, then an
         # optional compact schedule with that KV block and lanes.
@@ -196,17 +215,35 @@ def main_step(cache, results):
         for _ in range(12):
             q = rng.standard_normal((rows, Q_HEADS, D)).astype(np.float32)
             g = rng.standard_normal((rows, Q_HEADS, D)).astype(np.float32)
-            layers.append((
-                jnp.asarray(q, jnp.bfloat16), jnp.asarray(g, jnp.bfloat16),
-                jnp.asarray(pick_blocks(rng, lengths, pattern)), base[3], base[4],
-            ))
+            layers.append(
+                (
+                    jnp.asarray(q, jnp.bfloat16),
+                    jnp.asarray(g, jnp.bfloat16),
+                    jnp.asarray(pick_blocks(rng, lengths, pattern)),
+                    base[3],
+                    base[4],
+                )
+            )
         for fused, shared, kv_fetch, *rest in arms:
             fused, shared = bool(fused), bool(shared)
             slot = rest[0] if rest else 0
             bkv, lanes = rest[1:3] if len(rest) >= 3 else (0, 0)
 
-            def attend(q, g, b, lens, t, cache, offset, fused=fused, shared=shared,
-                       kv_fetch=kv_fetch, slot=slot, bkv=bkv, lanes=lanes):
+            def attend(
+                q,
+                g,
+                b,
+                lens,
+                t,
+                cache,
+                offset,
+                fused=fused,
+                shared=shared,
+                kv_fetch=kv_fetch,
+                slot=slot,
+                bkv=bkv,
+                lanes=lanes,
+            ):
                 os.environ["VLLM_TPU_QSA_DECODE_LEAN_FETCH"] = str(kv_fetch)
                 os.environ["VLLM_TPU_QSA_DECODE_SLOT_READ"] = str(slot)
                 os.environ["VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE"] = str(int(bkv > 0))
@@ -214,15 +251,26 @@ def main_step(cache, results):
                     os.environ["VLLM_TPU_QSA_DECODE_RPA_BKV"] = str(bkv)
                     os.environ["VLLM_TPU_QSA_DECODE_RPA_LANES"] = str(lanes)
                 return qsa_rpa.decode_attention(
-                    q, g, b, lens, t, cache, kv_heads=1, ratio=RATIO,
-                    k_scale=1.0, v_scale=1.0, fused=fused, shared_schedule=shared,
+                    q,
+                    g,
+                    b,
+                    lens,
+                    t,
+                    cache,
+                    kv_heads=1,
+                    ratio=RATIO,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    fused=fused,
+                    shared_schedule=shared,
                     **({"kv_head_offset": 1} if offset else {}),
                 )
 
             trace = None
             if os.environ.get("BENCH_XPROF"):
                 trace = os.path.join(
-                    os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "xprof",
+                    os.environ.get("CDK_OUTPUT_DIR", "/tmp"),
+                    "xprof",
                     f"r{reqs}x{rows}_{pattern}_f{int(fused)}_s{int(shared)}"
                     f"_k{kv_fetch}_r{slot}_b{bkv}x{lanes}",
                 )
@@ -230,10 +278,19 @@ def main_step(cache, results):
                 us, cache = bench_step(attend, layers, cache, trace)
             except Exception as e:  # noqa: BLE001
                 us = repr(e)[:200]
-            row = dict(mode="step", requests=reqs, rows=rows, pattern=pattern,
-                       fused=fused, shared=shared, kv_fetch=kv_fetch, slot=slot,
-                       bkv=bkv, lanes=lanes,
-                       us_per_step=us)
+            row = dict(
+                mode="step",
+                requests=reqs,
+                rows=rows,
+                pattern=pattern,
+                fused=fused,
+                shared=shared,
+                kv_fetch=kv_fetch,
+                slot=slot,
+                bkv=bkv,
+                lanes=lanes,
+                us_per_step=us,
+            )
             print("STEP", json.dumps(row), flush=True)
             results.append(row)
     return cache
@@ -256,8 +313,16 @@ def main():
         (2, 64, 0.0),
         (8, 32, 0.9),
     ]
-    blocks_cfg = [(256, 8), (512, 8), (1024, 8), (2048, 8), (256, 16), (512, 16),
-                  (256, 4), (128, 8)]
+    blocks_cfg = [
+        (256, 8),
+        (512, 8),
+        (1024, 8),
+        (2048, 8),
+        (256, 16),
+        (512, 16),
+        (256, 4),
+        (128, 8),
+    ]
     for (reqs, rows, overlap), offset in itertools.product(cases, (0, 1)):
         inputs = make_inputs(rng, requests=reqs, rows=rows, overlap=overlap)
         common = dict(kv_heads=1, ratio=RATIO, k_scale=1.0, v_scale=1.0)
@@ -285,8 +350,15 @@ def main():
                 err = float(np.max(np.abs(out - ref)))
             except Exception as e:  # noqa: BLE001
                 us, err = None, repr(e)[:200]
-            row = dict(requests=reqs, rows=rows, overlap=overlap, offset=offset,
-                       arm=name, us=us, max_err_vs_first=err)
+            row = dict(
+                requests=reqs,
+                rows=rows,
+                overlap=overlap,
+                offset=offset,
+                arm=name,
+                us=us,
+                max_err_vs_first=err,
+            )
             print("BENCH", json.dumps(row), flush=True)
             results.append(row)
     out_dir = os.environ.get("CDK_OUTPUT_DIR", "/tmp")
@@ -311,17 +383,27 @@ def check_exact(cache):
         for kv_fetch in (0, 1):
             attend = jax.jit(
                 functools.partial(
-                    qsa_rpa.rpa_attention, kv_heads=1, ratio=RATIO, k_scale=0.375,
-                    v_scale=2.5, lean_fetch=bool(kv_fetch), decode_only=True,
+                    qsa_rpa.rpa_attention,
+                    kv_heads=1,
+                    ratio=RATIO,
+                    k_scale=0.375,
+                    v_scale=2.5,
+                    lean_fetch=bool(kv_fetch),
+                    decode_only=True,
                     **({"kv_head_offset": 1} if offset else {}),
                 ),
                 donate_argnums=(5,),
             )
             out, cache = attend(q, gate, blocks, lengths, table, cache)
             outs.append(np.asarray(out.astype(jnp.float32)))
-        row = dict(mode="exact", pattern=pattern, rows=rows, offset=offset,
-                   max_abs=max(float(np.max(np.abs(outs[0] - o))) for o in outs),
-                   nonzero=float(np.abs(outs[0]).max()))
+        row = dict(
+            mode="exact",
+            pattern=pattern,
+            rows=rows,
+            offset=offset,
+            max_abs=max(float(np.max(np.abs(outs[0] - o))) for o in outs),
+            nonzero=float(np.abs(outs[0]).max()),
+        )
         print("EXACT", json.dumps(row), flush=True)
         results.append(row)
         assert row["max_abs"] == 0 and row["nonzero"] > 0
@@ -342,8 +424,13 @@ def check_slot_exact(cache):
         for slot_read in (False, True):
             attend = jax.jit(
                 functools.partial(
-                    qsa_rpa.rpa_attention, kv_heads=1, ratio=RATIO, k_scale=0.375,
-                    v_scale=2.5, lean_fetch=True, decode_only=True,
+                    qsa_rpa.rpa_attention,
+                    kv_heads=1,
+                    ratio=RATIO,
+                    k_scale=0.375,
+                    v_scale=2.5,
+                    lean_fetch=True,
+                    decode_only=True,
                     slot_read=slot_read,
                     **({"kv_head_offset": 1} if offset else {}),
                 ),
@@ -351,9 +438,14 @@ def check_slot_exact(cache):
             )
             out, cache = attend(q, gate, blocks, lengths, table, cache)
             outs.append(np.asarray(out.astype(jnp.float32)))
-        row = dict(mode="slot_exact", pattern=pattern, rows=rows, offset=offset,
-                   max_abs=float(np.max(np.abs(outs[0] - outs[1]))),
-                   nonzero=float(np.abs(outs[0]).max()))
+        row = dict(
+            mode="slot_exact",
+            pattern=pattern,
+            rows=rows,
+            offset=offset,
+            max_abs=float(np.max(np.abs(outs[0] - outs[1]))),
+            nonzero=float(np.abs(outs[0]).max()),
+        )
         print("EXACT", json.dumps(row), flush=True)
         results.append(row)
         assert row["max_abs"] == 0 and row["nonzero"] > 0
@@ -435,9 +527,15 @@ def check_compact_exact(cache):
         ):
             attend = jax.jit(
                 functools.partial(
-                    qsa_rpa._rpa_attention_batch, kv_heads=1, ratio=RATIO,
-                    k_scale=0.375, v_scale=2.5, lean_fetch=True, decode_only=True,
-                    slot_read=True, **kw,
+                    qsa_rpa._rpa_attention_batch,
+                    kv_heads=1,
+                    ratio=RATIO,
+                    k_scale=0.375,
+                    v_scale=2.5,
+                    lean_fetch=True,
+                    decode_only=True,
+                    slot_read=True,
+                    **kw,
                     **({"kv_head_offset": 1} if offset else {}),
                 ),
                 donate_argnums=(5,),
@@ -448,9 +546,13 @@ def check_compact_exact(cache):
             except Exception as e:  # noqa: BLE001
                 print("COMPACT_FAIL", name, repr(e)[:300], flush=True)
         base = outs["base"]
-        row = dict(mode="compact_exact", rows=rows, offset=offset,
-                   nonzero=float(np.abs(base).max()),
-                   **{k: float(np.max(np.abs(v - base))) for k, v in outs.items()})
+        row = dict(
+            mode="compact_exact",
+            rows=rows,
+            offset=offset,
+            nonzero=float(np.abs(base).max()),
+            **{k: float(np.max(np.abs(v - base))) for k, v in outs.items()},
+        )
         print("EXACT", json.dumps(row), flush=True)
         results.append(row)
         assert row.get("c256x8", 1) == 0
@@ -522,8 +624,8 @@ def _no_convert_strided_load_bkv(kv_in_vref, b_idx, start, *, cfgs):
     from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 
     start //= cfgs.serve.packing_kv
-    kv_ref = kv_in_vref.at[b_idx].bitcast(jnp.uint32).reshape(
-        -1, cfgs.aligned_kv_head_dim
+    kv_ref = (
+        kv_in_vref.at[b_idx].bitcast(jnp.uint32).reshape(-1, cfgs.aligned_kv_head_dim)
     )
     kv_ref = pltpu.annotate(kv_ref, no_hazard_no_deps=True)
     kv = utils.strided_load(
@@ -564,17 +666,29 @@ def check_fast_exact(cache):
         for fast in (False, True):
             attend = jax.jit(
                 functools.partial(
-                    qsa_rpa.rpa_attention, kv_heads=1, ratio=RATIO, k_scale=0.375,
-                    v_scale=2.5, lean_fetch=True, decode_only=True, slot_read=True,
-                    fast_fetch=fast, **({"kv_head_offset": 1} if offset else {}),
+                    qsa_rpa.rpa_attention,
+                    kv_heads=1,
+                    ratio=RATIO,
+                    k_scale=0.375,
+                    v_scale=2.5,
+                    lean_fetch=True,
+                    decode_only=True,
+                    slot_read=True,
+                    fast_fetch=fast,
+                    **({"kv_head_offset": 1} if offset else {}),
                 ),
                 donate_argnums=(5,),
             )
             out, cache = attend(q, gate, blocks, lengths, table, cache)
             outs.append(np.asarray(out.astype(jnp.float32)))
-        row = dict(mode="fast_exact", pattern=pattern, rows=rows, offset=offset,
-                   max_abs=float(np.max(np.abs(outs[0] - outs[1]))),
-                   nonzero=float(np.abs(outs[0]).max()))
+        row = dict(
+            mode="fast_exact",
+            pattern=pattern,
+            rows=rows,
+            offset=offset,
+            max_abs=float(np.max(np.abs(outs[0] - outs[1]))),
+            nonzero=float(np.abs(outs[0]).max()),
+        )
         print("EXACT", json.dumps(row), flush=True)
         results.append(row)
         assert row["max_abs"] == 0 and row["nonzero"] > 0
@@ -616,9 +730,7 @@ def test_diag_combined(monkeypatch):
         ("both", _no_convert_strided_load_bkv, _one_dma_copy_in),
     ):
         monkeypatch.setattr(kernel, "strided_load_bkv", unpack)
-        monkeypatch.setattr(
-            bref_override.KVBufferedRefHeadAlongSublane, "copy_in", dma
-        )
+        monkeypatch.setattr(bref_override.KVBufferedRefHeadAlongSublane, "copy_in", dma)
         # ragged_paged_attention is a module-level jax.jit with the same static
         # arguments in every arm: without this its cached executable (traced
         # with the unpatched kernel) would be reused.

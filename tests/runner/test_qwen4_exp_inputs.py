@@ -295,9 +295,12 @@ def test_ngram_history_uses_configured_width_and_eos():
 
 @pytest.mark.parametrize("spec", [0, 3])
 def test_ngram_window_matches_full_store(spec):
-    """VLLM_TPU_QWEN4_NGRAM_WINDOW: the per-row host window (width spec + ngram - 1 before the host
-    context) gives the full-store n-gram context for every device context the async rejection
-    correction can produce (host context minus 0..spec), incl. contexts shorter than the n-gram;
+    """VLLM_TPU_QWEN4_NGRAM_WINDOW: the per-row host window (width spec + ngram - 1
+    before the host
+    context) gives the full-store n-gram context for every device context the async
+    rejection
+    correction can produce (host context minus 0..spec), incl. contexts shorter than the
+    n-gram;
     a window one token too narrow is caught."""
     import numpy as np
 
@@ -311,20 +314,32 @@ def test_ngram_window_matches_full_store(spec):
     store = rng.integers(100, 999, (8, 64)).astype(np.int32)
     host_ctx = np.array([0, 0, 1, 2, 30, 63, 5, 9], dtype=np.int64)
     width = spec + ngram - 1
-    window = torch.from_numpy(ngram_window_from_host(store, host_ctx, start, n, rows, width, eos))
+    window = torch.from_numpy(
+        ngram_window_from_host(store, host_ctx, start, n, rows, width, eos)
+    )
     row_ids = torch.arange(rows, dtype=torch.int64) + start
     for r in range(spec + 1):
         dev_ctx = torch.zeros(rows, dtype=torch.int64)
         dev_ctx[:n] = torch.from_numpy(np.maximum(host_ctx[start : start + n] - r, 0))
-        ref = ngram_context_from_store(torch.from_numpy(store), row_ids, dev_ctx, eos, ngram)
+        ref = ngram_context_from_store(
+            torch.from_numpy(store), row_ids, dev_ctx, eos, ngram
+        )
         got = ngram_context_from_window(window, dev_ctx, eos, ngram)
         assert torch.equal(got[:n], ref[:n]), (r, got[:n], ref[:n])
     if spec:
-        narrow = torch.from_numpy(ngram_window_from_host(store, host_ctx, start, n, rows, width - 1, eos))
+        narrow = torch.from_numpy(
+            ngram_window_from_host(store, host_ctx, start, n, rows, width - 1, eos)
+        )
         dev_ctx = torch.zeros(rows, dtype=torch.int64)
-        dev_ctx[:n] = torch.from_numpy(np.maximum(host_ctx[start : start + n] - spec, 0))
-        ref = ngram_context_from_store(torch.from_numpy(store), row_ids, dev_ctx, eos, ngram)
-        assert not torch.equal(ngram_context_from_window(narrow, dev_ctx, eos, ngram)[:n], ref[:n])
+        dev_ctx[:n] = torch.from_numpy(
+            np.maximum(host_ctx[start : start + n] - spec, 0)
+        )
+        ref = ngram_context_from_store(
+            torch.from_numpy(store), row_ids, dev_ctx, eos, ngram
+        )
+        assert not torch.equal(
+            ngram_context_from_window(narrow, dev_ctx, eos, ngram)[:n], ref[:n]
+        )
 
 
 @pytest.mark.parametrize("functional", [False, True])
@@ -365,7 +380,9 @@ def test_fused_prepare_inputs_matches_eager(
 
     r_eager, a_eager = make()
     r_fused, a_fused = make()
-    r_fused.input_batch.token_ids_cpu_tensor.copy_(r_eager.input_batch.token_ids_cpu_tensor)
+    r_fused.input_batch.token_ids_cpu_tensor.copy_(
+        r_eager.input_batch.token_ids_cpu_tensor
+    )
     monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_NGRAM_WINDOW", window, raising=False)
     monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_FUSED_PREP_CHECK", check, raising=False)
     monkeypatch.setattr(
@@ -380,7 +397,11 @@ def test_fused_prepare_inputs_matches_eager(
         a_eager._compressed_owner(attention): NS(block_tables=compressed),
     }
     for step, (req_ids, lengths) in enumerate(
-        [(["a", "b", "c"], [4, 1, 4]), (["c", "a"], [4, 4]), (["c", "d", "a"], [1, 4, 4])]
+        [
+            (["a", "b", "c"], [4, 1, 4]),
+            (["c", "a"], [4, 4]),
+            (["c", "d", "a"], [1, 4, 4]),
+        ]
     ):
         n = len(req_ids)
         ctx_lens = rng.integers(5, max_len - 8, n)
@@ -391,7 +412,10 @@ def test_fused_prepare_inputs_matches_eager(
         seq_lens[:n] = torch.tensor(ctx_lens + np.array(lengths), dtype=torch.int32)
         ids = torch.from_numpy(rng.integers(100, 999, num_tokens).astype(np.int32))
         outs = []
-        for runner, adapter, fused in ((r_eager, a_eager, False), (r_fused, a_fused, True)):
+        for runner, adapter, fused in (
+            (r_eager, a_eager, False),
+            (r_fused, a_fused, True),
+        ):
             monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_FUSED_PREP", fused, raising=False)
             runner.input_batch.req_ids = req_ids
             runner.input_batch.num_computed_tokens_cpu[:n] = ctx_lens
@@ -402,7 +426,9 @@ def test_fused_prepare_inputs_matches_eager(
             )
             store = adapter.begin_step()
             outs.append(
-                adapter.prepare_inputs(ModelInputSnapshot(store, 0, n, num_tokens, tables, ids))
+                adapter.prepare_inputs(
+                    ModelInputSnapshot(store, 0, n, num_tokens, tables, ids)
+                )
             )
         eager, fused = outs
         if check == "fault":

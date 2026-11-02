@@ -14,7 +14,6 @@
 """Single admission boundary for the FP8, text-only TPU S1 implementation."""
 
 import math
-import os
 
 import torch
 from vllm.model_executor.models.config import (
@@ -169,6 +168,25 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
     return specs
 
 
+QSA_LAYER_TYPES = ("full_attention", "qwen_sparse_attention", "indexed_attention")
+
+
+def first_qsa_layer_index(layer_types) -> int:
+    """Return the 0-based index of the first QSA attention layer."""
+    return next(i for i, kind in enumerate(layer_types) if kind in QSA_LAYER_TYPES)
+
+
+def resolve_qsa_kv_cache_layout(cfg):
+    """Return the resolved KV cache layout, defaulting to QSA's BLHNC layout."""
+    from vllm.v1.kv_cache_interface import KVCacheLayout
+
+    cache_cfg = getattr(cfg, "cache_config", None)
+    get_layout = getattr(cache_cfg, "get_resolved_kv_cache_layout", None)
+    if get_layout is not None and getattr(cache_cfg, "kv_cache_layout", None):
+        return get_layout()
+    return KVCacheLayout.BLHNC
+
+
 def native_cache_capacity(cfg, specs=None):
     """Size scheduler block IDs with the same upstream planner used at runtime."""
     from vllm.v1.core.kv_cache_utils import (
@@ -185,8 +203,14 @@ def native_cache_capacity(cfg, specs=None):
     )
     # One null block is reserved by the scheduler's pool.
     pages = 1 + cfg.scheduler_config.max_num_seqs * blocks_per_request
-    bytes_per_block = _get_kv_cache_bytes_per_block(groups)
-    max_pool_bytes = int(os.environ.get("QWEN4_EXP_MAX_POOL_BYTES", str(48 * 1024**3)))
+    bytes_per_block = _get_kv_cache_bytes_per_block(
+        groups, resolve_qsa_kv_cache_layout(cfg)
+    )
+    max_pool_bytes = (
+        envs.QWEN4_EXP_MAX_POOL_BYTES
+        if envs.QWEN4_EXP_MAX_POOL_BYTES is not None
+        else 48 * 1024**3
+    )
     if bytes_per_block > 0 and max_pool_bytes > 0:
         max_pages = max_pool_bytes // bytes_per_block
         if max_pages > 1:
@@ -200,11 +224,6 @@ def native_cache_capacity(cfg, specs=None):
 # one graph copy this plans ~36.6 GiB on v7x, the 36 GiB pool already
 # serving AgentX.
 POOL_HEADROOM_BYTES = 6 * 1024**3
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name, "").strip()
-    return int(value) if value else default
 
 
 def hbm_pool_sizing(cfg) -> bool:
@@ -223,7 +242,7 @@ def hbm_pool_sizing(cfg) -> bool:
             or host_offload_enabled(cfg)
         )
         and getattr(cfg.cache_config, "num_gpu_blocks_override", None) is None
-        and os.environ.get("QWEN4_EXP_POOL_SIZING", "hbm").strip().lower() != "static"
+        and envs.QWEN4_EXP_POOL_SIZING.lower() != "static"
     )
 
 
@@ -238,11 +257,11 @@ def pool_graph_copies() -> int:
     needed 96.89 GiB = 15.6 GiB resident + 40 + 40). Set
     ``QWEN4_EXP_POOL_GRAPH_COPIES=1`` to reserve such a copy again.
     """
-    return max(0, _env_int("QWEN4_EXP_POOL_GRAPH_COPIES", 0))
+    return max(0, envs.QWEN4_EXP_POOL_GRAPH_COPIES)
 
 
 def pool_headroom_bytes() -> int:
-    return max(0, _env_int("QWEN4_EXP_POOL_HEADROOM_BYTES", POOL_HEADROOM_BYTES))
+    return max(0, envs.QWEN4_EXP_POOL_HEADROOM_BYTES)
 
 
 def pooled_pool_blocks(
@@ -265,7 +284,7 @@ def pooled_pool_blocks(
         cap_available - headroom,
         (physical_available - headroom) // (1 + pool_graph_copies()),
     )
-    cap = _env_int("QWEN4_EXP_MAX_POOL_BYTES", 0)
+    cap = envs.QWEN4_EXP_MAX_POOL_BYTES or 0
     if cap > 0:
         budget = min(budget, cap)
     blocks = max(0, budget) // bytes_per_block
@@ -392,9 +411,9 @@ def validate_config(cfg):
     if (
         len(t.layer_types) != t.num_hidden_layers
         or any(
-            kind not in ("full_attention", "linear_attention") for kind in t.layer_types
+            kind not in (*QSA_LAYER_TYPES, "linear_attention") for kind in t.layer_types
         )
-        or "full_attention" not in t.layer_types
+        or not any(kind in QSA_LAYER_TYPES for kind in t.layer_types)
         or any(not 1 <= layer <= t.num_hidden_layers for layer in t.ple_layer_ids)
     ):
         raise ValueError(
@@ -684,9 +703,9 @@ def validate_host_offload_config(cfg):
             "kv_role='kv_both', the unified pool, prefix caching, "
             "mamba_cache_mode='align' and PP1"
         )
-    cpu_bytes = extra.get("cpu_bytes_to_use")
+    raw_cpu_bytes = extra.get("cpu_bytes_to_use")
     try:
-        cpu_bytes = int(cpu_bytes)
+        cpu_bytes = 0 if raw_cpu_bytes is None else int(raw_cpu_bytes)
     except (TypeError, ValueError):
         cpu_bytes = 0
     if cpu_bytes <= 0:
@@ -724,9 +743,11 @@ def validate_mtp_config(cfg):
         )
     if not use_unified_pool():
         raise ValueError("Qwen4Exp MTP requires the unified block pool")
-    if int(getattr(t, "mtp_num_hidden_layers", 0) or 0) != 1 or mtp_types != [
-        "full_attention"
-    ]:
+    if (
+        int(getattr(t, "mtp_num_hidden_layers", 0) or 0) != 1
+        or len(mtp_types) != 1
+        or mtp_types[0] not in QSA_LAYER_TYPES
+    ):
         raise ValueError(
             "Qwen4Exp TPU MTP requires exactly one full-attention MTP layer"
         )

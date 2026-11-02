@@ -199,13 +199,17 @@ def make_layer(tp, layer_type, attn_hc, mlp_hc, attn_weight, moe_weight):
 
 
 @pytest.mark.parametrize("sp_pad", [0, 24])
-@pytest.mark.parametrize("split_moe,shared_local", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "split_moe,shared_local", [(False, False), (True, False), (True, True)]
+)
 @pytest.mark.parametrize("layer_type", ["linear_attention", "full_attention"])
 def test_decoder_layer_sequence_parallel_matches_tp(
     tp2, monkeypatch, layer_type, split_moe, shared_local, sp_pad
 ):
-    """shared_local: QWEN4_EXP_PREFILL_SP_SHARED_LOCAL, the shared expert's replicated copy on
-    this rank's rows (no gather / reduce); one bf16 sum instead of the TP partials' reduce."""
+    """shared_local: QWEN4_EXP_PREFILL_SP_SHARED_LOCAL, the shared expert's replicated
+    copy on
+    this rank's rows (no gather / reduce); one bf16 sum instead of the TP partials'
+    reduce."""
     from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
         vllm_adapter as adaptive_moe,
     )
@@ -233,11 +237,16 @@ def test_decoder_layer_sequence_parallel_matches_tp(
         layer = make_layer(tp2, layer_type, attn_hc, mlp_hc, attn_w, moe_w)
         layer.mlp = SplitMoE(tp2, moe_w)
         if shared_local and sequence_parallel:
+
             def gathered_shared(block):
-                raise AssertionError("shared_expert_local must replace the gathered TP call")
+                raise AssertionError(
+                    "shared_expert_local must replace the gathered TP call"
+                )
 
             layer.mlp.shared_expert = gathered_shared
-            layer.mlp.shared_expert_local = lambda b: torch.sin(b.float() @ moe_w).to(b.dtype)
+            layer.mlp.shared_expert_local = lambda b: torch.sin(b.float() @ moe_w).to(
+                b.dtype
+            )
         layers[rank] = layer
         x = tp2.shard(hidden) if sequence_parallel else hidden
         pad = sp_pad if sequence_parallel else 0

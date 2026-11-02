@@ -35,7 +35,10 @@ def test_admission_rejects_unrepresentable_gdn_head_tiles(field, value):
 
 
 def test_admission_accepts_upstream_optional_ple_shard_default():
-    from vllm.models.qwen4_exp.config import Qwen4ExpTextConfig
+    try:
+        from transformers import Qwen4ExpTextConfig
+    except ImportError:
+        from vllm.models.qwen4_exp.config import Qwen4ExpTextConfig
 
     from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
 

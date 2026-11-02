@@ -37,9 +37,16 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     write_compressed,
     write_main_cache,
 )
-from vllm_torchtpu.kernels.qwen4_exp.qsa import _indexer_updates, _token_metadata, produce_kv
+from vllm_torchtpu.kernels.qwen4_exp.qsa import (
+    _indexer_updates,
+    _token_metadata,
+    produce_kv,
+)
 from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import pack_rows
-from vllm_torchtpu.kernels.qwen4_exp.qsa_state import read_ring_and_tags, write_ring_and_tags
+from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
+    read_ring_and_tags,
+    write_ring_and_tags,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,8 +85,10 @@ def wholestep_qsa_writes(
       `[T, index_dim]` (the raw indexer key: `index_qk[:, -index_dim:]`).
     norms[i]: `(k_norm, index_k_norm)` weights. tables[i]: the runner's flat
       `(ring_ids, main_table, compressed_table)` of layer i's cache groups.
-    num_requests: the kernel's static request count (`M // T`). Requests past it are idle
-      padding (the driver calls the kernel only for steps that fit its bucket), so they are
+    num_requests: the kernel's static request count (`M // T`). Requests past it are
+    idle
+      padding (the driver calls the kernel only for steps that fit its bucket), so they
+      are
       cropped before the writers rather than read, merged and written back as no-ops.
     batched: one ring read / write and one (vmapped) indexer update for all layers, the
       token metadata once (`_batched_writes`); same bytes as the per-layer stock sequence.
@@ -92,8 +101,10 @@ def wholestep_qsa_writes(
     n = len(context)
     nreq = n if num_requests is None else min(n, num_requests)
     context, starts = context[:nreq], starts[: nreq + 1]
-    tables = [(r.reshape(n, -1)[:nreq, 0], m.reshape(n, -1)[:nreq], c.reshape(n, -1)[:nreq])
-              for r, m, c in tables]
+    tables = [
+        (r.reshape(n, -1)[:nreq, 0], m.reshape(n, -1)[:nreq], c.reshape(n, -1)[:nreq])
+        for r, m, c in tables
+    ]
     if batched and not envs.VLLM_TPU_QSA_FUSED_KV_WRITE:
         return _batched_writes(
             pool, rows, norms, tables, layers, positions, trig, starts, context,
@@ -135,10 +146,14 @@ def _batched_writes(pool, rows, norms, tables, layers, positions, trig, starts, 
                     compress_ratio, norm_eps, rotary_dim, dcp=None, compressed_dcp=None):
     """`qsa_cache_writes`' unfused sequence for all layers at once.
 
-    Each layer's main K/V and compressed keys still go through their own writer (paired /
-    packed slots of shared pages need the stock writers' read-modify-write), but the ring
-    rows (one page per layer and request, disjoint) are read and written by one call each,
-    and the indexer update runs once over a stacked layer axis. No layer reads what another
+    Each layer's main K/V and compressed keys still go through their own writer (paired
+    /
+    packed slots of shared pages need the stock writers' read-modify-write), but the
+    ring
+    rows (one page per layer and request, disjoint) are read and written by one call
+    each,
+    and the indexer update runs once over a stacked layer axis. No layer reads what
+    another
     layer writes in a step, so the pool ends with the stock per-layer bytes.
     """
     nreq, L = len(context), len(layers)
@@ -166,14 +181,28 @@ def _batched_writes(pool, rows, norms, tables, layers, positions, trig, starts, 
     tags = tags.reshape(L, nreq, ring_rows, 2)
     update = jax.vmap(
         lambda raw, ring, tags, nik: _indexer_updates(
-            raw, positions, ring, tags, nik, trig, starts, context, slots, compress_ratio,
-            norm_eps, rotary_dim,
+            raw,
+            positions,
+            ring,
+            tags,
+            nik,
+            trig,
+            starts,
+            context,
+            slots,
+            compress_ratio,
+            norm_eps,
+            rotary_dim,
         )
     )
-    completed, complete, _, _, ring, tags = update(raw, ring, tags, jnp.stack([n[1] for n in norms]))
+    completed, complete, _, _, ring, tags = update(
+        raw, ring, tags, jnp.stack([n[1] for n in norms])
+    )
     for o, ((_, _, comp), lay) in enumerate(zip(tables, layers, strict=True)):
         pool = write_compressed(pool, completed[o], complete[o], req, logical, starts, context,
                                 comp, compress_ratio, lay.compressed_slot,
                                 **({"dcp": compressed_dcp} if compressed_dcp is not None else {}))
     ids = jnp.where(jnp.tile(active, L), ids, 0)
-    return write_ring_and_tags(pool, ring.reshape(L * nreq, -1), tags.reshape(L * nreq, -1), ids)
+    return write_ring_and_tags(
+        pool, ring.reshape(L * nreq, -1), tags.reshape(L * nreq, -1), ids
+    )

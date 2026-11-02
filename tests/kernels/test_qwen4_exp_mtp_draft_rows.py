@@ -150,7 +150,9 @@ def rowwise_attention(monkeypatch):
     def qsa_attention(q, gate, blocks, lengths, table, cache, starts, **kw):
         attended.append(len(q))
         value = q.astype(jnp.float32) * jax.nn.sigmoid(gate.astype(jnp.float32))
-        value = value + (blocks[:, :1, None] + table[:, :1, None] + lengths[:, None, None])
+        value = value + (
+            blocks[:, :1, None] + table[:, :1, None] + lengths[:, None, None]
+        )
         return jnp.where((lengths > 0)[:, None, None], value, 0), cache
 
     for name, fake in (
@@ -217,9 +219,7 @@ def test_rows_present_their_own_decode_batch(rowwise_attention, rows):
 @pytest.mark.parametrize("fp8", [False, True])
 def test_rows_step_matches_full_step_on_tpu(fp8, rows):
     kwargs = dict(k_scale=0.375, v_scale=2.5) if fp8 else {}
-    out, want, selected, want_selected = _run_both(
-        fp8, STARTS, CONTEXT, rows, **kwargs
-    )
+    out, want, selected, want_selected = _run_both(fp8, STARTS, CONTEXT, rows, **kwargs)
     # The rows take RPA where the all-token step takes block-sparse prefill.
     np.testing.assert_allclose(out, want, rtol=0.05, atol=0.03)
     for got, expected in zip(np.asarray(selected), want_selected):

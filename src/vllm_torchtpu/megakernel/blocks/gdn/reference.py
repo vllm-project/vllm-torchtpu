@@ -64,7 +64,9 @@ def gdn_reference(
     expand = vh // kh
     eps = float(getattr(g, "eps", 1e-6))
     l2_eps = float(getattr(g, "gdn_l2_eps", 1e-6))
-    gate = {"silu": jax.nn.silu, "sigmoid": jax.nn.sigmoid}[str(getattr(g, "gdn_gate", "silu"))]
+    gate = {"silu": jax.nn.silu, "sigmoid": jax.nn.sigmoid}[
+        str(getattr(g, "gdn_gate", "silu"))
+    ]
     xb = x[:B].astype(BF16).astype(F32)
 
     def _slice_sm(arr: Any) -> Any:

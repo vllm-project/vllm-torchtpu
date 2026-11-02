@@ -2296,10 +2296,11 @@ class MegakernelDriver:
         """Execute one full-backbone decode (`T=1`) or MTP verify (`T=4`) step."""
         prepared = self._prepared_step
         self._prepared_step = None
+        attn_md: Any
         if prepared is not None:
             step_fn, attn_md, m0, m1, m2, num_reqs, tokens_per_seq, _ = prepared
         else:
-            md = get_forward_context().attn_metadata
+            md: Any = get_forward_context().attn_metadata
             attn_md = md[self.attn_layer_name]
             m0 = md[self.mamba_layer_names[0]]
             m1 = md[self.mamba_layer_names[1]]

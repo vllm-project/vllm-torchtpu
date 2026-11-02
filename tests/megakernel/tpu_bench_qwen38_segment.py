@@ -56,24 +56,25 @@ def tile_profile(name: str, B: int = 8) -> Any:
 
     if name == "default":
         return None
-    if name in ("pipe_ep", "pipe_ep_h1"):  # e13 T=2, e2 T=1: software-pipelined EP experts
+    if name in (
+        "pipe_ep",
+        "pipe_ep_h1",
+    ):  # e13 T=2, e2 T=1: software-pipelined EP experts
         hier = 1 if (name == "pipe_ep_h1" or B > 32) else 0
         nbe, nbd = (12, 10) if B <= 16 else ((6, 10) if B <= 32 else (3, 6))
-        return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=hier).with_blocks(
-            {"moe": {"pipe_ep": True, "moe_unroll": True}}
-        )
+        return Tiles(
+            ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=hier
+        ).with_blocks({"moe": {"pipe_ep": True, "moe_unroll": True}})
     if name == "pipe":  # single-tile experts
-        return Tiles(ebank=3584 << 10, nbe=6 if B <= 16 else 4, nbd=10, vmem_mib=62).with_blocks(
-            {"moe": {"pipe": True}}
-        )
+        return Tiles(
+            ebank=3584 << 10, nbe=6 if B <= 16 else 4, nbd=10, vmem_mib=62
+        ).with_blocks({"moe": {"pipe": True}})
     raise ValueError(name)
 
 
 def _shardings(tree: Any, R: int, mesh: Mesh) -> Any:
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
-    return jax.tree.map(
-        lambda s: tp if len(s.shape) and s.shape[0] == R else rep, tree
-    )
+    return jax.tree.map(lambda s: tp if len(s.shape) and s.shape[0] == R else rep, tree)
 
 
 def _fold_put(x: Any, mesh: Mesh) -> Any:
@@ -122,7 +123,15 @@ def run_bucket(
     # must not be less precise than the kernel it checks.
     with jax.default_matmul_precision(ref_precision):
         ref, _ = segment_reference(
-            g, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L,
+            g,
+            ex,
+            inp.x,
+            inp.hc,
+            inp.w_l,
+            inp.st_l,
+            inp.attn,
+            inp.o_proj,
+            L=L,
             moe_inputs=moe_in,
         )
     # Per token, the smallest gap between the TOPK-th and next router logit over
@@ -130,8 +139,11 @@ def run_bucket(
     gaps = []
     for j, m in enumerate(moe_in):
         r = inp.w_l["router"][j] if inp.w_l["router"].ndim == 3 else inp.w_l["router"]
-        lg = jnp.dot(m.astype(jnp.bfloat16), r.astype(jnp.bfloat16),
-                     preferred_element_type=jnp.float32)
+        lg = jnp.dot(
+            m.astype(jnp.bfloat16),
+            r.astype(jnp.bfloat16),
+            preferred_element_type=jnp.float32,
+        )
         top = jax.lax.top_k(lg, g.TOPK + 1)[0]
         gaps.append(top[:, g.TOPK - 1] - top[:, g.TOPK])
     min_gap = np.asarray(jnp.min(jnp.stack(gaps), axis=0), np.float32)
@@ -149,7 +161,24 @@ def run_bucket(
 
     step, info = kernel.make_step(mesh, spec, ex)
     mp = planner.plan(spec, info["exec"]).block_params["moe"]
-    moe_path = {k: getattr(mp, k) for k in ("T13", "T2", "TE", "NBE", "PIPE", "PIPE_EP", "CH", "IR", "ISR", "LAZY_MOE", "topk_packed", "route_vec", "unroll")}
+    moe_path = {
+        k: getattr(mp, k)
+        for k in (
+            "T13",
+            "T2",
+            "TE",
+            "NBE",
+            "PIPE",
+            "PIPE_EP",
+            "CH",
+            "IR",
+            "ISR",
+            "LAZY_MOE",
+            "topk_packed",
+            "route_vec",
+            "unroll",
+        )
+    }
     t0 = time.perf_counter()
     _, outs = step(pos, hid, w_mk, states, attn)
     res = outs[RESIDUAL_OUT].block_until_ready()
@@ -168,29 +197,44 @@ def run_bucket(
         "max_rel": float(d.max() / scale),
         "row_max_rel": [round(float(v), 3) for v in row_max],
         "rows_over_10pct": int((row_max > 0.1).sum()),
-        "min_gap_outlier_rows": [round(float(v), 4) for v in min_gap[row_max > 0.1]][:16],
-        "min_gap_good_rows_p10": round(float(np.quantile(min_gap[row_max <= 0.1], 0.1)), 4)
-        if (row_max <= 0.1).any() else None,
+        "min_gap_outlier_rows": [round(float(v), 4) for v in min_gap[row_max > 0.1]][
+            :16
+        ],
+        "min_gap_good_rows_p10": round(
+            float(np.quantile(min_gap[row_max <= 0.1], 0.1)), 4
+        )
+        if (row_max <= 0.1).any()
+        else None,
         "moved_std": float(np.std(ref - np.asarray(inp.x, np.float32))),
     }
-    parity["ok"] = parity["mean_rel"] < 1e-2 and parity["rows_over_10pct"] <= max(1, B // 32)
+    parity["ok"] = parity["mean_rel"] < 1e-2 and parity["rows_over_10pct"] <= max(
+        1, B // 32
+    )
     # Where an outlier row deviates: per residual stream, and the last MoE
     # layer's routed experts (with owner ranks) for that row.
     h = g.H
     diag = []
     r_last = inp.w_l["router"][-1] if inp.w_l["router"].ndim == 3 else inp.w_l["router"]
-    lg = jnp.dot(moe_in[-1].astype(jnp.bfloat16), r_last.astype(jnp.bfloat16),
-                 preferred_element_type=jnp.float32)
+    lg = jnp.dot(
+        moe_in[-1].astype(jnp.bfloat16),
+        r_last.astype(jnp.bfloat16),
+        preferred_element_type=jnp.float32,
+    )
     top = np.asarray(jax.lax.top_k(lg, g.TOPK)[1])
     for i in np.nonzero(row_max > 0.1)[0][:6]:
-        per_stream = [round(float(d[i, b * h : (b + 1) * h].max() / scale), 3) for b in range(g.NHC)]
-        diag.append({
-            "row": int(i),
-            "streams": per_stream,
-            "experts": [int(e) for e in top[i]],
-            "ranks": sorted({int(e) // (g.E // R) for e in top[i]}),
-            "ranks_peak": int(np.bincount(top[i] // (g.E // R), minlength=R).max()),
-        })
+        per_stream = [
+            round(float(d[i, b * h : (b + 1) * h].max() / scale), 3)
+            for b in range(g.NHC)
+        ]
+        diag.append(
+            {
+                "row": int(i),
+                "streams": per_stream,
+                "experts": [int(e) for e in top[i]],
+                "ranks": sorted({int(e) // (g.E // R) for e in top[i]}),
+                "ranks_peak": int(np.bincount(top[i] // (g.E // R), minlength=R).max()),
+            }
+        )
     good = [i for i in range(B) if row_max[i] <= 0.1]
     parity["outlier_diag"] = diag
     parity["good_rows_ranks_peak"] = [
@@ -261,7 +305,11 @@ def run_bucket(
         "intercept_us": round(icpt * 1e6, 1),
         "fit_resid_us": round(float(np.std(resid)) * 1e6, 1),
         "hoist_ratio": round(
-            float(np.median(t_arr[n_arr == max(chains)]) / np.median(t_arr[n_arr == min(chains)])), 2
+            float(
+                np.median(t_arr[n_arr == max(chains)])
+                / np.median(t_arr[n_arr == min(chains)])
+            ),
+            2,
         ),
     }
 
@@ -276,9 +324,15 @@ def main() -> None:
     ap.add_argument("--gain", type=float, nargs="+", default=[1.0])
     ap.add_argument("--zero", nargs="+", default=["none"], help="none | gdn | moe")
     ap.add_argument("--router-gain", type=float, nargs="+", default=[1.0])
-    ap.add_argument("--geom", nargs="+", default=["2560:640"], help="H:I geometry overrides")
-    ap.add_argument("--profile", nargs="+", default=["default"], help="default | pipe_ep | pipe")
-    ap.add_argument("--ref-precision", nargs="+", default=["highest"], help="highest | default")
+    ap.add_argument(
+        "--geom", nargs="+", default=["2560:640"], help="H:I geometry overrides"
+    )
+    ap.add_argument(
+        "--profile", nargs="+", default=["default"], help="default | pipe_ep | pipe"
+    )
+    ap.add_argument(
+        "--ref-precision", nargs="+", default=["highest"], help="highest | default"
+    )
     ap.add_argument("--same-experts", nargs="+", type=int, default=[0], help="0 | 1")
     args = ap.parse_args()
     g, tiny_tiles = qwen38.FULL, None
@@ -291,31 +345,53 @@ def main() -> None:
     print("devices", len(devs), devs[0].device_kind, "jax", jax.__version__, flush=True)
     mesh = Mesh(np.array(devs), ("tp",))
     out = []
-    arms = [(gn, z, rg) for gn in args.gain for z in args.zero for rg in args.router_gain]
+    arms = [
+        (gn, z, rg) for gn in args.gain for z in args.zero for rg in args.router_gain
+    ]
     geoms = []
     for gi_ in args.geom:
         h_, i_ = (int(v) for v in gi_.split(":"))
-        geoms.append(g if (h_, i_) == (g.H, g.I) or args.tiny else dataclasses.replace(g, H=h_, I=i_))
+        geoms.append(
+            g
+            if (h_, i_) == (g.H, g.I) or args.tiny
+            else dataclasses.replace(g, H=h_, I=i_)
+        )
     for g in geoms:
-      for L in args.layers:
-        for B in args.rows:
-          for (gn, z, rg), prof, rp, se in [
-              (a, pr, rp, se)
-              for a in arms
-              for pr in args.profile
-              for rp in args.ref_precision
-              for se in args.same_experts
-          ]:
-            tiles = tiny_tiles if args.tiny else tile_profile(prof, B)
-            try:
-                r = run_bucket(
-                    g, B, args.T, L, mesh, args.chains, tiles, gn,
-                    () if z == "none" else (z,), rg, args.tiny, prof, rp, bool(se),
-                )
-            except Exception as e:  # noqa: BLE001 — report and continue to the next bucket
-                r = {"rows": B, "L": L, "error": f"{type(e).__name__}: {e}"[:2000]}
-            print("RESULT", json.dumps(r), flush=True)
-            out.append(r)
+        for L in args.layers:
+            for B in args.rows:
+                for (gn, z, rg), prof, rp, se in [
+                    (a, pr, rp, se)
+                    for a in arms
+                    for pr in args.profile
+                    for rp in args.ref_precision
+                    for se in args.same_experts
+                ]:
+                    tiles = tiny_tiles if args.tiny else tile_profile(prof, B)
+                    try:
+                        r = run_bucket(
+                            g,
+                            B,
+                            args.T,
+                            L,
+                            mesh,
+                            args.chains,
+                            tiles,
+                            gn,
+                            () if z == "none" else (z,),
+                            rg,
+                            args.tiny,
+                            prof,
+                            rp,
+                            bool(se),
+                        )
+                    except Exception as e:  # noqa: BLE001 — report and continue to the next bucket
+                        r = {
+                            "rows": B,
+                            "L": L,
+                            "error": f"{type(e).__name__}: {e}"[:2000],
+                        }
+                    print("RESULT", json.dumps(r), flush=True)
+                    out.append(r)
     dst = os.environ.get("CDK_OUTPUT_DIR")
     if dst:
         with open(os.path.join(dst, "qwen38_segment_bench.json"), "w") as f:

@@ -132,7 +132,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, host_phases
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -145,7 +145,6 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
-from vllm_torchtpu.runner import host_phases
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -268,9 +267,7 @@ def _update_read_offsets_impl(
         )
     num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
     valid = torch.arange(width, device=read_offsets.device) < num_reqs
-    offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0).to(
-        read_offsets.dtype
-    )
+    offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0).to(read_offsets.dtype)
     indices = torch.cat(groups, dim=0).long() if len(groups) > 1 else groups[0].long()
     read_offsets.index_put_((indices,), offsets.repeat(len(groups)))
 
@@ -773,6 +770,7 @@ class TPUModelRunner(GPUModelRunner):
     empty_slot_mappings: dict[int, torch.Tensor]
     # Default for a runner built without __init__.
     _pp_wave: PPWave | None = None
+    warmup_done: bool = False
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -2226,7 +2224,9 @@ class TPUModelRunner(GPUModelRunner):
         # Speculative crossings of every group on the same buffers, as
         # `_spec_seed_rows` rows: one upload and one program per buffer set
         # (per-group eager selection cost ~10 programs per group, c32 g05).
-        per_raw_spec: dict[tuple[int, ...], tuple[list[torch.Tensor], list[list[int]]]] = {}
+        per_raw_spec: dict[
+            tuple[int, ...], tuple[list[torch.Tensor], list[list[int]]]
+        ] = {}
         # Manager-level (src, dst) block pairs across mamba groups: without
         # spec decoding the per-block read offsets just follow the state to
         # the request's new state block.
@@ -3720,7 +3720,9 @@ class TPUModelRunner(GPUModelRunner):
             fence.synchronize()
             self._input_staging_fence = None
 
-    def _upload_keyed(self, slot: str, host: torch.Tensor, values: bytes) -> torch.Tensor:
+    def _upload_keyed(
+        self, slot: str, host: torch.Tensor, values: bytes
+    ) -> torch.Tensor:
         """`_upload_unless_unchanged` with the caller's value key (for dtypes
         numpy cannot view)."""
         key = (host.dtype, tuple(host.shape), values)
@@ -4942,7 +4944,9 @@ class TPUModelRunner(GPUModelRunner):
         temps, top_k, top_p = self._padded_sampling_params(
             cur_start_idx, cur_end_idx, padded_num_reqs, logits.dtype, logits.device
         )
-        topk_candidates = self._sampler_topk_candidates(cur_start_idx, cur_end_idx, None)
+        topk_candidates = self._sampler_topk_candidates(
+            cur_start_idx, cur_end_idx, None
+        )
         host_phases.mark("vfy_params")
         bonus_u = torch.rand(
             (padded_num_reqs, vocab),
@@ -5089,7 +5093,9 @@ class TPUModelRunner(GPUModelRunner):
             do_sampling=True,
             topk_candidates=topk_candidates,
         )
-        faulted = self._verify_fused_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
+        faulted = (
+            self._verify_fused_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
+        )
         compared = fused
         if faulted:
             compared = fused.clone()
@@ -5097,7 +5103,10 @@ class TPUModelRunner(GPUModelRunner):
         mismatches = (compared != ref).sum().to(torch.int64)
         # [clean mismatched positions, faulted checks that were caught]
         delta = torch.stack(
-            [mismatches * (0 if faulted else 1), (mismatches > 0).to(torch.int64) * (1 if faulted else 0)]
+            [
+                mismatches * (0 if faulted else 1),
+                (mismatches > 0).to(torch.int64) * (1 if faulted else 0),
+            ]
         )
         self._verify_fused_mismatches = (
             delta
@@ -5121,7 +5130,10 @@ class TPUModelRunner(GPUModelRunner):
                 "faulted_checks=%d faulted_caught=%d read_offset_mismatches=%d",
                 self._verify_fused_checks_done,
                 clean,
-                min(self._verify_fused_checks_done, envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT),
+                min(
+                    self._verify_fused_checks_done,
+                    envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT,
+                ),
                 caught,
                 ro,
             )
@@ -8338,7 +8350,9 @@ class TPUModelRunner(GPUModelRunner):
         self._decode_device_cache_key = None
 
     def may_reinitialize_input_batch(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int] | None = None,
     ) -> None:
         """Override to keep TPUModelRunner block accounting in sync with upstream.
 
@@ -8352,7 +8366,9 @@ class TPUModelRunner(GPUModelRunner):
         resize `block_table_cpu` so TPU staging and spec-decode warmup block
         allocations perfectly match the new underlying `BlockTable` capacity.
         """
-        super().may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+        cast(Any, super()).may_reinitialize_input_batch(
+            kv_cache_config, kernel_block_sizes
+        )
         if self.input_batch.block_table:
             self.max_num_blocks_per_req = self.input_batch.block_table[
                 0

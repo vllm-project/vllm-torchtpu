@@ -115,7 +115,9 @@ class Qwen38Geometry:
         """Shared-expert width padded so each rank's slice is a 128 multiple."""
         return rup(self.IS, 128 * R)
 
-    def inner(self, R: int, L: int = SEGMENT_LAYERS, head: bool = False) -> Qwen35Geometry:
+    def inner(
+        self, R: int, L: int = SEGMENT_LAYERS, head: bool = False
+    ) -> Qwen35Geometry:
         """Sublayer geometry seen by the GDN / MoE / o_proj blocks.
 
         A one-layer (tail) segment has no GDN layer (`att_every=1`); a head

@@ -30,6 +30,7 @@ from .config import (
     pool_graph_copies,
     pool_headroom_bytes,
     pooled_pool_blocks,
+    resolve_qsa_kv_cache_layout,
 )
 from .pd import TransferGroup, build_transfer_groups
 from .pool_layout import check_packed_compressed_groups, pooled_cache_specs
@@ -54,7 +55,9 @@ class Qwen4ExpPooledCache:
         self.layout, self.specs = pooled_cache_specs(runner.vllm_config)
         self.groups = get_kv_cache_groups(runner.vllm_config, self.specs)
         check_packed_compressed_groups(self.layout, self.groups)
-        self.block_bytes = _get_kv_cache_bytes_per_block(self.groups)
+        self.block_bytes = _get_kv_cache_bytes_per_block(
+            self.groups, resolve_qsa_kv_cache_layout(runner.vllm_config)
+        )
         self.hbm_sizing = hbm_pool_sizing(runner.vllm_config)
         # Pages of the current pool; for static sizing, the fixed capacity.
         self.pages = (
@@ -357,6 +360,7 @@ class Qwen4ExpPooledCache:
         # must trace the same checkpoint/read-offset branches serving takes.
         window = num_speculative_tokens(self.runner.vllm_config) + 1
         read_offsets = None
+        mamba_distribution = None
         if window > 1:
             read_offsets = torch.zeros(
                 self.pages, dtype=torch.int32, device=self.runner.device

@@ -11,18 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-rank operands of the Qwen3.8 whole-step kernel from loaded vLLM `qwen4_exp` modules.
+"""Per-rank operands of the Qwen3.8 whole-step kernel from loaded vLLM `qwen4_exp`
+modules.
 
 The whole-step spec (`wholestep.spec.wholestep_spec(first="qsa")`) runs model layers
-`first_layer .. first_layer + L - 1` with kernel layer `j` a QSA layer when `j % att_every == 0`
-and a GDN layer otherwise; every layer has the MoE sublayer. GDN / MoE / HC operands are the
-segment packer's (`qwen38_weights`); the QSA layer adds `qkvg` (`[q_h | gate_h]` per local head
+`first_layer .. first_layer + L - 1` with kernel layer `j` a QSA layer when `j %
+att_every == 0`
+and a GDN layer otherwise; every layer has the MoE sublayer. GDN / MoE / HC operands are
+the
+segment packer's (`qwen38_weights`); the QSA layer adds `qkvg` (`[q_h | gate_h]` per
+local head
 then the rank's K and V head, the stock `q_proj` / `k_proj` / `v_proj` views), `idx_w`
 (`indexer.index_qk_proj`), `o_proj` and its norms.
 
-Every operand is returned as its own freshly allocated base tensor unless it already is a
-whole contiguous parameter (the routed experts): a view (a `reshape` of a stack, a transposed
-weight) reaches the torch_tpu bridge through `execute_as_strided`, a full copy on every call
+Every operand is returned as its own freshly allocated base tensor unless it already is
+a
+whole contiguous parameter (the routed experts): a view (a `reshape` of a stack, a
+transposed
+weight) reaches the torch_tpu bridge through `execute_as_strided`, a full copy on every
+call
 (q32: 1.8 ms/step).
 """
 
@@ -46,9 +53,12 @@ from .weight_collector import pack_expert_views_layer
 def own_operand(t: torch.Tensor) -> torch.Tensor:
     """`t` itself if the bridge can pass it as is, else a fresh contiguous base tensor.
 
-    Passed as is: a contiguous, offset-0 tensor that is a base (e.g. a fresh stack) or a whole
-    parameter (the routed-expert `w13` / `w2`). Any view — including a transposed parameter
-    (`kn` of an `[n, k]` weight) — reaches torch_tpu through `execute_as_strided`, a copy on
+    Passed as is: a contiguous, offset-0 tensor that is a base (e.g. a fresh stack) or a
+    whole
+    parameter (the routed-expert `w13` / `w2`). Any view — including a transposed
+    parameter
+    (`kn` of an `[n, k]` weight) — reaches torch_tpu through `execute_as_strided`, a
+    copy on
     every call (agent-1a, q39: parameter views are part of the leftover copies).
     """
     plain = t.is_contiguous() and t.storage_offset() == 0
@@ -58,10 +68,14 @@ def own_operand(t: torch.Tensor) -> torch.Tensor:
 
 
 def fresh_copy(t: torch.Tensor) -> torch.Tensor:
-    """A copy of `t` that is the fresh result of an op (`cat` of two halves along dim 0), in
-    `t`'s shape. `empty_like().copy_()` writes the new base in place, the history class torch_tpu
-    re-materialises per call (w10 c1: the 32 MiB host round-trip covered 7 of 114 operands; the
-    ~18 big reshaped stacks still went through `copy_`). 0-d tensors are host round-tripped."""
+    """A copy of `t` that is the fresh result of an op (`cat` of two halves along dim
+    0), in
+    `t`'s shape. `empty_like().copy_()` writes the new base in place, the history class
+    torch_tpu
+    re-materialises per call (w10 c1: the 32 MiB host round-trip covered 7 of 114
+    operands; the
+    ~18 big reshaped stacks still went through `copy_`). 0-d tensors are host
+    round-tripped."""
     if t.dim() == 0:
         return t.cpu().to(t.device)
     if t.shape[0] < 2:
@@ -70,7 +84,8 @@ def fresh_copy(t: torch.Tensor) -> torch.Tensor:
 
 
 def qkvg_operand(attn: Any, g: Any, R: int) -> torch.Tensor:
-    """`[H, nh * 2 * HD + 2 * HD]`: the rank's `q_proj` columns (per head `[q | gate]`), K, V."""
+    """`[H, nh * 2 * HD + 2 * HD]`: the rank's `q_proj` columns (per head `[q | gate]`),
+    K, V."""
     nh, hd = g.NH // R, g.HD
     q = kn(attn.q_proj, g.H, nh * 2 * hd)
     k = kn(attn.k_proj, g.H, hd)
@@ -93,9 +108,15 @@ def pack_wholestep_operands(
     att = [j for j in range(L) if j % g.att_every == 0]
     gdn_j = [j for j in range(L) if j % g.att_every != 0]
     for j in att:
-        assert layers[j].layer_type == "full_attention", (layer_ids[j], layers[j].layer_type)
+        assert layers[j].layer_type == "full_attention", (
+            layer_ids[j],
+            layers[j].layer_type,
+        )
     for j in gdn_j:
-        assert layers[j].layer_type == "linear_attention", (layer_ids[j], layers[j].layer_type)
+        assert layers[j].layer_type == "linear_attention", (
+            layer_ids[j],
+            layers[j].layer_type,
+        )
     gi = g.inner(ex.R, L)
     lay = GDNBlock.lin_in_layout(gi, ex) if gdn_j else None
     dev = layers[0].mlp.gate.weight.device
@@ -105,7 +126,9 @@ def pack_wholestep_operands(
 
     def row(name: str, j: int, val: torch.Tensor) -> None:
         if name not in sm:
-            sm[name] = torch.zeros((L, p.smalls_layout[name][1]), dtype=torch.float32, device=dev)
+            sm[name] = torch.zeros(
+                (L, p.smalls_layout[name][1]), dtype=torch.float32, device=dev
+            )
         sm[name][j, : val.numel()] = val.reshape(-1).float()
 
     # QSA layers: HC(attention) mix, projections, indexer, o_proj, norms.
@@ -130,13 +153,16 @@ def pack_wholestep_operands(
 
     # GDN layers (as the segment packer).
     if gdn_j:
+        assert lay is not None
         gl = [layers[j] for j in gdn_j]
         hcs = [_hc_mix_operands(layer.attn_hyper_connection, g) for layer in gl]
         w["gdn_hdn"] = torch.stack([h[0] for h in hcs])
         for b in range(g.NHC):
             w[f"gdn_hup{b}"] = torch.stack([h[1][b] for h in hcs])
         w["lin_in"] = torch.stack([_lin_in(layer.linear_attn, gi, ex) for layer in gl])
-        w["lin_out"] = torch.stack([kn(layer.linear_attn.out_proj, lay.Z, g.H) for layer in gl])
+        w["lin_out"] = torch.stack(
+            [kn(layer.linear_attn.out_proj, lay.Z, g.H) for layer in gl]
+        )
         for j in gdn_j:
             la = layers[j].linear_attn
             row("gdn_hcn", j, layers[j].attn_hyper_connection.hc_norm.weight.data)
@@ -181,7 +207,9 @@ def pack_wholestep_operands(
             out.append(torch.zeros((1, g.NHC * g.H), dtype=torch.float32, device=dev))
         elif name in ("e13", "e2"):
             out.extend(w[name])
-        elif name == "es":  # [L, EW, 1, X] -> 3-D [L*EW, 1, X]; the call reshapes it back
+        elif (
+            name == "es"
+        ):  # [L, EW, 1, X] -> 3-D [L*EW, 1, X]; the call reshapes it back
             out.append(w[name].reshape(-1, *w[name].shape[2:]))
         else:
             nt, tk = p.nt[name], p.tk[name]
@@ -189,7 +217,8 @@ def pack_wholestep_operands(
             k_in = t.shape[-2]
             if k_in < nt * tk:
                 t = F.pad(t, (0, 0, 0, nt * tk - k_in))
-            # 3-D [L*nt, tk, N] (the call reshapes to [L, nt, tk, N]): torch_tpu re-lays out
+            # 3-D [L*nt, tk, N] (the call reshapes to [L, nt, tk, N]): torch_tpu re-lays
+            # out
             # 4-D operands through execute_as_strided on every call.
             out.append(t.reshape(-1, tk, t.shape[-1]))
     return [own_operand(t) for t in out]

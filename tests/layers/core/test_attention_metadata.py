@@ -558,9 +558,7 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, c2, 4)
         assert source.call_count == calls  # reused, not re-packed
         for gid in (0, 1):
-            assert torch.equal(
-                c1.staged_block_tables[gid], c2.staged_block_tables[gid]
-            )
+            assert torch.equal(c1.staged_block_tables[gid], c2.staged_block_tables[gid])
 
         am._BLOCK_TABLE_VERSION[0] += 1  # any BlockTable mutation
         stage_block_table_uploads(runner, ctx(), 4)
@@ -733,9 +731,9 @@ class TestAttentionMetadataBuilderPlumbing:
                 assert torch.equal(x, y)
 
     def test_block_table_mutations_bump_the_version(self):
-        import numpy as np
         from types import SimpleNamespace
 
+        import numpy as np
         from vllm.v1.worker.block_table import BlockTable
 
         from vllm_torchtpu.layers.core import attention_metadata as am

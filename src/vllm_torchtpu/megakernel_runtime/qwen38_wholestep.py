@@ -13,13 +13,19 @@
 # limitations under the License.
 """Torch side of the Qwen3.8 whole-step megakernel (`VLLM_TPU_MEGAKERNEL=...,whole=1`).
 
-`Qwen38WholeStep` owns the packed operands of model layers 3..46 (one kernel call per step)
-and the torch op around `build_wholestep_call`. The head groups (layers 0..2) and the last
-QSA layer (47) stay on the segment driver's calls (`Qwen38Segments.head` / the last segment).
+`Qwen38WholeStep` owns the packed operands of model layers 3..46 (one kernel call per
+step)
+and the torch op around `build_wholestep_call`. The head groups (layers 0..2) and the
+last
+QSA layer (47) stay on the segment driver's calls (`Qwen38Segments.head` / the last
+segment).
 
-Bridge rules (q32/q35, measured): every operand is a base tensor (no `execute_as_strided`
-copy per call), one custom call per step for layers 3..46, the pool donated and written in
-place inside that call, and no per-step Python work beyond collecting the runner's tensors.
+Bridge rules (q32/q35, measured): every operand is a base tensor (no
+`execute_as_strided`
+copy per call), one custom call per step for layers 3..46, the pool donated and written
+in
+place inside that call, and no per-step Python work beyond collecting the runner's
+tensors.
 """
 
 from __future__ import annotations
@@ -54,14 +60,32 @@ def qsa_layer_cache(attn: Any) -> QSALayerCache:
 
 
 class _WholeKind:
-    """The torch op of the whole-step call; buckets resolve on the concrete row count."""
+    """The torch op of the whole-step call; buckets resolve on the concrete row
+    count.
+    """
 
-    def __init__(self, mesh: Any, g: Any, layout: Any, qsa: list[QSALayerCache], *,
-                 budget: int, max_groups: int, norm_eps: float, rotary_dim: int, write: bool,
-                 tag: str) -> None:
+    def __init__(
+        self,
+        mesh: Any,
+        g: Any,
+        layout: Any,
+        qsa: list[QSALayerCache],
+        *,
+        budget: int,
+        max_groups: int,
+        norm_eps: float,
+        rotary_dim: int,
+        write: bool,
+        tag: str,
+    ) -> None:
         self.mesh, self.g, self.layout, self.qsa = mesh, g, layout, qsa
-        self.kw = dict(budget=budget, max_groups=max_groups, norm_eps=norm_eps,
-                       rotary_dim=rotary_dim, write=write)
+        self.kw = dict(
+            budget=budget,
+            max_groups=max_groups,
+            norm_eps=norm_eps,
+            rotary_dim=rotary_dim,
+            write=write,
+        )
         self._calls: dict[int, Any] = {}
         self.tag = tag
         name = f"qwen38_mk::{tag}"
@@ -74,7 +98,8 @@ class _WholeKind:
         def _(hidden, args):
             out = [torch.empty_like(hidden), torch.empty_like(args[self.pool_index])]
             if union_stats_on():  # this rank's [QSA layers, UNION_STATS_REQS, 1, 128]
-                # Torch sees each rank's shard (w08: a buffer sized for all ranks failed the
+                # Torch sees each rank's shard (w08: a buffer sized for all ranks failed
+                # the
                 # copy, [11, 16, 1, 128] -> [88, 16, 1, 128]); bucket-independent.
                 shape = (len(qsa), UNION_STATS_REQS, 1, 128)
                 out.append(hidden.new_empty(shape, dtype=torch.int32))
@@ -89,8 +114,17 @@ class _WholeKind:
             from .qwen38_wholestep_call import build_wholestep_call
 
             full, in_specs, outs, donate = build_wholestep_call(
-                self.mesh, self.g, B, self.layout, self.qsa, L=L_WHOLE,
-                tiles=wholestep_tiles(B, self.kw["max_groups"]), **self.kw,
+                self.mesh,
+                self.g,
+                B,
+                self.layout,
+                self.qsa,
+                L=L_WHOLE,
+                tiles=wholestep_tiles(B, self.kw["max_groups"]),
+                **self.kw,
+            )
+            typed = make_typed_step_wrapper(
+                f"qwen38_mk_whole_b{B}", full, len(in_specs), len(outs)
             )
             # Program names carry the tag: the write-free shadow and the served program
             # of one bucket are different programs and must never share a name.
@@ -104,11 +138,23 @@ class _WholeKind:
 
 
 class Qwen38WholeStep(nn.Module):
-    """Layers 3..46 in one whole-step kernel call; owns the packed operands as buffers."""
+    """Layers 3..46 in one whole-step kernel call; owns the packed operands as
+    buffers.
+    """
 
-    def __init__(self, model: Any, g: Any, mesh: Any, buckets: tuple[int, ...], *,
-                 budget: int, max_groups: int, write: bool = True, tag: str = "whole",
-                 hold: str = "buffer") -> None:
+    def __init__(
+        self,
+        model: Any,
+        g: Any,
+        mesh: Any,
+        buckets: tuple[int, ...],
+        *,
+        budget: int,
+        max_groups: int,
+        write: bool = True,
+        tag: str = "whole",
+        hold: str = "buffer",
+    ) -> None:
         super().__init__()
         from vllm_torchtpu.megakernel.exec_spec import ExecSpec
         from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
@@ -119,31 +165,58 @@ class Qwen38WholeStep(nn.Module):
         self.layers = list(model.model.layers)  # plain list: the model owns its layers
         ids = list(range(FIRST_LAYER, LAST_LAYER))
         self.qsa_ids = [i for i in ids if self.layers[i].layer_type == "full_attention"]
-        self.gdn_ids = [i for i in ids if self.layers[i].layer_type == "linear_attention"]
+        self.gdn_ids = [
+            i for i in ids if self.layers[i].layer_type == "linear_attention"
+        ]
         R = mesh.size
         n_att = len(self.qsa_ids)
         pps = max_groups * 4 // 128
         spec = wholestep_spec(
-            g, R, L=L_WHOLE, first="qsa", pool_gdn=True, qsa=dict(budget=budget), step=True,
-            indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att, **indexed_options()),
+            g,
+            R,
+            L=L_WHOLE,
+            first="qsa",
+            pool_gdn=True,
+            qsa=dict(budget=budget),
+            step=True,
+            indexed=dict(
+                max_groups=max_groups,
+                pages_per_seq=pps,
+                carrier="fp8",
+                n_layers=n_att,
+                **indexed_options(),
+            ),
         )
-        ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=wholestep_tiles(buckets[0], max_groups))
+        ex = ExecSpec(
+            R=R,
+            B=buckets[0],
+            T=T_VERIFY,
+            ctx=128,
+            tiles=wholestep_tiles(buckets[0], max_groups),
+        )
         ops = pack_wholestep_operands(model, g, spec, ex, ids)
-        # Host round-trip of the small packed operands (operand_hold): w08r c1's whole-step
-        # steps ran 18 per-call execute_as_strided programs more than stock (+0.85 ms/step).
+        # Host round-trip of the small packed operands (operand_hold): w08r c1's
+        # whole-step
+        # steps ran 18 per-call execute_as_strided programs more than stock (+0.85
+        # ms/step).
         from .operand_hold import host_round_trip_small
 
         n_trip = host_round_trip_small(ops)
-        logger.info("Qwen3.8 whole-step: %d of %d operands host round-tripped", n_trip, len(ops))
+        logger.info(
+            "Qwen3.8 whole-step: %d of %d operands host round-tripped", n_trip, len(ops)
+        )
         from .operand_hold import hbm_summary
 
         logger.info("Qwen3.8 whole-step: packed operands %s", hbm_summary(ops, model))
         self.n_w = len(ops)
         # How the operands are held decides what the compiled program sees: registered
-        # buffers are re-materialised by `execute_as_strided` every step in the served segment
-        # MK (agent-1a, q32/q39), parameters passing the same op are not; the Qwen3.5 driver
+        # buffers are re-materialised by `execute_as_strided` every step in the served
+        # segment
+        # MK (agent-1a, q32/q39), parameters passing the same op are not; the Qwen3.5
+        # driver
         # keeps a plain list. `hold`: "buffer" | "param" | "list".
         self.hold = hold
+        self._ops: list[torch.Tensor] = []
         if hold == "list":
             object.__setattr__(self, "_ops", ops)
         for i, t in enumerate(ops if hold != "list" else ()):
@@ -154,32 +227,56 @@ class Qwen38WholeStep(nn.Module):
         attn0 = self.layers[self.qsa_ids[0]].self_attn
         self.norm_eps = float(attn0.q_norm.variance_epsilon)
         self.rotary_dim = int(attn0._select_keywords.get("rotary_dim", 64))
-        self.budget, self.max_groups, self.write, self.tag = budget, max_groups, write, tag
-        self.pool = None
+        self.budget, self.max_groups, self.write, self.tag = (
+            budget,
+            max_groups,
+            write,
+            tag,
+        )
+        self.pool: torch.Tensor | None = None
         self.kind: _WholeKind | None = None
 
     def bind_pool(self, pool: torch.Tensor, layout: Any) -> None:
         self.pool = pool
-        # Union stats land here inside the compiled call (in place, like the pool); the driver
-        # reads them outside it (`log_union_stats`). Room for the largest bucket's requests.
+        # Union stats land here inside the compiled call (in place, like the pool); the
+        # driver
+        # reads them outside it (`log_union_stats`). Room for the largest bucket's
+        # requests.
         self.union_stats = (
-            torch.zeros((len(self.qsa_ids), UNION_STATS_REQS, 1, 128),
-                        dtype=torch.int32, device=pool.device)
-            if union_stats_on() else None
+            torch.zeros(
+                (len(self.qsa_ids), UNION_STATS_REQS, 1, 128),
+                dtype=torch.int32,
+                device=pool.device,
+            )
+            if union_stats_on()
+            else None
         )
         self.kind = _WholeKind(
-            self.mesh, self.g, layout,
+            self.mesh,
+            self.g,
+            layout,
             [qsa_layer_cache(self.layers[i].self_attn) for i in self.qsa_ids],
-            budget=self.budget, max_groups=self.max_groups, norm_eps=self.norm_eps,
-            rotary_dim=self.rotary_dim, write=self.write, tag=self.tag,
+            budget=self.budget,
+            max_groups=self.max_groups,
+            norm_eps=self.norm_eps,
+            rotary_dim=self.rotary_dim,
+            write=self.write,
+            tag=self.tag,
         )
         self.kind.pool_index = self.n_w
 
-    def forward(self, hidden: torch.Tensor, positions: torch.Tensor, query_start_loc: torch.Tensor,
-                context_lens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> torch.Tensor:
         from vllm.forward_context import get_forward_context
 
-        md = get_forward_context().attn_metadata
+        assert self.pool is not None
+        assert self.kind is not None
+        md: Any = get_forward_context().attn_metadata
         meta: list[torch.Tensor] = []
         for i in self.gdn_ids:
             m = md[self.layers[i].linear_attn.prefix]
@@ -193,7 +290,7 @@ class Qwen38WholeStep(nn.Module):
         tables: list[torch.Tensor] = []
         norms: list[torch.Tensor] = []
         for i in self.qsa_ids:
-            a = self.layers[i].self_attn
+            a: Any = self.layers[i].self_attn
             tables += [
                 md[a.prefix + ".raw_ring"].block_tables.to(torch.int32),
                 md[a.main_cache_name].block_tables.to(torch.int32),
@@ -211,13 +308,16 @@ class Qwen38WholeStep(nn.Module):
         self.pool.copy_(pool)
         if len(outs) > 2 and self.union_stats is not None:
             # Python control flow or a host read here would be traced into the compiled
-            # program (w06g j-b1a76c09: ShapeSpecializationError at bucket 32); only copy.
+            # program (w06g j-b1a76c09: ShapeSpecializationError at bucket 32); only
+            # copy.
             self.union_stats.copy_(outs[2])
         return res
 
     def log_union_stats(self, calls: int) -> None:
-        """How much a request's verify rows share (rank 0's rows; the selection is replicated),
-        from the last whole-step call. Called by the driver outside the compiled program; the
+        """How much a request's verify rows share (rank 0's rows; the selection is
+        replicated),
+        from the last whole-step call. Called by the driver outside the compiled
+        program; the
         host read syncs that one step only."""
         if self.union_stats is None:
             return
@@ -231,8 +331,15 @@ class Qwen38WholeStep(nn.Module):
         share = t / u  # 1 = disjoint rows, rows-per-request = identical selections
         q = torch.quantile(share, torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64))
         logger.info(
-            "Qwen3.8 whole-step union stats (call %d, %d layer-requests): rows' groups / union "
-            "p10 %.2f p50 %.2f p90 %.2f; union / max row p50 %.2f; mean union %.0f groups",
-            self._stat_calls, int(live.sum()), q[0], q[1], q[2],
-            float(torch.quantile(u / m, 0.5)), float(u.mean()),
+            "Qwen3.8 whole-step union stats (call %d, %d layer-requests): rows' "
+            "groups / union "
+            "p10 %.2f p50 %.2f p90 %.2f; union / max row p50 %.2f; mean union %.0f "
+            "groups",
+            self._stat_calls,
+            int(live.sum()),
+            q[0],
+            q[1],
+            q[2],
+            float(torch.quantile(u / m, 0.5)),
+            float(u.mean()),
         )

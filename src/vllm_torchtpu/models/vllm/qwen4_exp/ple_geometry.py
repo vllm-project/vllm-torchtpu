@@ -2,14 +2,19 @@
 """PLE cache and storage planning using the common layer's vocabulary geometry."""
 
 import math
+from typing import cast
 
-from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
+try:
+    from transformers import Qwen4ExpTextConfig
+except ImportError:
+    from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 from .ple import head_vocab_sizes
 
 
 def ple_vocab_rows(config: Qwen4ExpTextConfig, layer_idx: int) -> int:
-    dense_index = sorted(set(config.ple_layer_ids)).index(layer_idx + 1)
+    ple_layer_ids = cast(list[int], config.ple_layer_ids)
+    dense_index = sorted(set(ple_layer_ids)).index(layer_idx + 1)
     sizes = head_vocab_sizes(
         config.ngram_vocab_size_base,
         (config.ngram_size - 1) * config.heads_per_ngram,
