@@ -1827,6 +1827,10 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
             getattr(parallel, "prefill_context_parallel_size", 1) > 1
             or getattr(parallel, "decode_context_parallel_size", 1) > 1
         )
+        # Set by a model that hands this layer fused qkv rows (the q/k norm
+        # epsilon); initialize_kernel then builds forward_from_qkv's op.
+        self.qkv_prologue_eps: float | None = None
+        self._qkv_kernel: Callable[..., torch.Tensor] | None = None
         # Run K + 1 verify tokens in the DECODE stage.
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
@@ -1842,6 +1846,13 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
                 self.head_size,
                 self.sliding_window,
                 self.kv_cache_quantized_dtype,
+            )
+
+    def initialize_kernel(self, layer: AttentionLayer) -> None:
+        super().initialize_kernel(layer)
+        if self.qkv_prologue_eps is not None:
+            self._qkv_kernel = self._build_qkv_kernel(
+                layer._k_scale_float, layer._v_scale_float, self.qkv_prologue_eps
             )
 
     def qkv_prologue_unsupported(self) -> list[str]:
@@ -1897,8 +1908,14 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
                 "forward_from_qkv does not support "
                 + ", ".join(unsupported or ["the bundled KV cache"])
             )
-        kernel = self._build_qkv_kernel(layer._k_scale_float, layer._v_scale_float, eps)
-        outputs = kernel(
+        if self._qkv_kernel is None or eps != self.qkv_prologue_eps:
+            # Building a torch op cannot be traced; initialize_kernel does it.
+            raise RuntimeError(
+                f"forward_from_qkv(eps={eps}) on a layer prepared for "
+                f"{self.qkv_prologue_eps}: set qkv_prologue_eps before "
+                "initialize_kernel"
+            )
+        outputs = self._qkv_kernel(
             kv_cache,
             qkv,
             cos,

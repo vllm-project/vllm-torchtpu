@@ -65,7 +65,8 @@ def _fused_attention(
     # The rotary cache rows of the tokens, in the activation dtype as the
     # upstream rotary reads them.
     cos_sin = rope._match_cos_sin_cache_dtype(qkv).index_select(0, positions.flatten())
-    cos, sin = cos_sin.chunk(2, dim=-1)
+    # Contiguous: the op's operands are dense buffers, not strided views.
+    cos, sin = (half.contiguous() for half in cos_sin.chunk(2, dim=-1))
     attn_metadata, layer, kv_cache, _ = get_attention_context(attn.attn.layer_name)
     return layer.impl.forward_from_qkv(
         layer,
@@ -127,6 +128,9 @@ def _patched_attention_init(self: Gemma4Attention, *args: Any, **kwargs: Any) ->
             f"TPU_GEMMA4_FUSED_ATTN_PROLOGUE does not support {', '.join(unsupported)}"
             f" ({self.attn.layer_name}); unset it for this configuration"
         )
+    # The backend builds forward_from_qkv's op in initialize_kernel, before
+    # the forward is traced.
+    impl.qkv_prologue_eps = self.q_norm.variance_epsilon
 
 
 def maybe_patch_gemma4_attention(model_config: ModelConfig | None) -> bool | None:
