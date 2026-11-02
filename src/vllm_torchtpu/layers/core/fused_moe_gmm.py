@@ -516,24 +516,19 @@ def can_use_gather_gmm(
     w2_bias: jax.Array | None,
     *,
     topk: int,
-    use_ep: bool,
     rhs_quant_dtype: jnp.dtype | None,
-    skip_padded_tokens: bool,
 ) -> bool:
     """Shapes and formats `gather_gmm_moe` serves (trace-time predicate).
 
-    Skipped padded tokens leave sorted rows the kernels never write, which the
-    combine would read, so that mode keeps the grouped-matmul path. The
-    kernels always run FP8 x FP8 dots, so chips where gmm_v2 would keep BF16
-    activations keep the grouped-matmul path too.
+    The kernels always run FP8 x FP8 dots, so chips where gmm_v2 would keep
+    BF16 activations keep the grouped-matmul path. EP and skipped padded
+    tokens are both served: the combine masks the routes with no row.
     """
     num_tokens, hidden = hidden_states.shape
     num_experts, w1_k, n1 = w1.shape
     inter = n1 // 2
     return (
-        not use_ep
-        and not skip_padded_tokens
-        and rhs_quant_dtype is None
+        rhs_quant_dtype is None
         and w1_bias is None
         and w2_bias is None
         and num_tokens >= max(_GATHER_GMM_MIN_TOKENS, 1)
@@ -545,7 +540,6 @@ def can_use_gather_gmm(
         and w1_k == hidden
         and hidden % gather_gmm.PACKED_COLUMNS == 0
         and inter % gather_gmm.LANES == 0
-        and inter <= gather_gmm.QUANT_BLOCK
         and w2.shape == (num_experts, inter, hidden)
         # Per-channel weight scales: one quantization block along K.
         and w1_scale is not None
@@ -567,15 +561,20 @@ def gather_gmm_moe(
     *,
     topk: int,
     activation: str,
+    skip_padded_tokens: bool,
+    masked: bool,
 ) -> jax.Array:
-    """Non-EP MoE with the gather-fused expert kernels (no routed-row copies).
+    """MoE with the gather-fused expert kernels (no routed-row copies).
 
     Same routing permutation as the grouped-matmul path; the expert kernel
     gathers token rows itself and the combine gathers each token's top-k
     expert outputs, so only the expert-order down rows are written to HBM.
+    ``topk_ids`` are local expert ids, negative for routes this rank does not
+    compute (expert parallelism); with ``masked`` the combine skips those and
+    skipped padded tokens, whose rows the expert kernel never writes.
     """
     num_tokens, hidden = hidden_states.shape
-    _, group_sizes, argsort_revert_indices, _, _, token_indices_sorted = (
+    _, group_sizes, argsort_revert_indices, _, valid_mask, token_indices_sorted = (
         prepare_routed_gmm_inputs(
             hidden_states,
             topk_ids,
@@ -584,9 +583,13 @@ def gather_gmm_moe(
             topk=topk,
             use_ep=False,
             use_sparse_core=False,
+            skip_padded_tokens=skip_padded_tokens,
             permute=False,
         )
     )
+    positions = argsort_revert_indices
+    if masked:
+        positions = jnp.where(valid_mask, positions, -1)
     down_rows = gather_gmm.gather_fused_moe(
         gather_gmm.quantize_pack_rows(hidden_states),
         token_indices_sorted,
@@ -599,10 +602,11 @@ def gather_gmm_moe(
     )
     return gather_gmm.gather_combine(
         down_rows,
-        argsort_revert_indices.reshape(num_tokens, topk),
+        positions.reshape(num_tokens, topk),
         topk_weights,
         hidden_size=hidden,
         tile_tokens=_GATHER_COMBINE_TILE_TOKENS,
+        masked=masked,
     )
 
 
@@ -892,9 +896,7 @@ def fused_moe_func(
         w1_bias,
         w2_bias,
         topk=topk,
-        use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
     ):
         logger.info_once(
             "Selected gather-fused MoE expert kernels (TPU_MOE_GATHER_GMM)"
@@ -909,6 +911,8 @@ def fused_moe_func(
             topk_ids,
             topk=topk,
             activation=activation,
+            skip_padded_tokens=skip_padded_tokens,
+            masked=use_ep or skip_padded_tokens,
         )
 
     (

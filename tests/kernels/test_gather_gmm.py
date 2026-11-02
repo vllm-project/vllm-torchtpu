@@ -66,9 +66,13 @@ def _expert_rows(xs, w1, w1s, w2, w2s, act):
             acc = acc.at[:, n0 : n0 + 256].add(prod)
     inter = n1 // 2
     mid = apply_gated_act(acc[:, :inter], acc[:, inter:], act)
-    q, sc = _quantize(mid)
-    out = jnp.dot(q, w2, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
-    return out * sc * w2s.astype(jnp.bfloat16)
+    out = jnp.zeros((xs.shape[0], w2.shape[1]), jnp.bfloat16)
+    for k0 in range(0, inter, G.QUANT_BLOCK):
+        k1 = min(inter, k0 + G.QUANT_BLOCK)
+        q, sc = _quantize(mid[:, k0:k1])
+        prod = jnp.dot(q, w2[k0:k1], preferred_element_type=jnp.float32)
+        out = out + prod.astype(jnp.bfloat16) * sc * w2s.astype(jnp.bfloat16)
+    return out
 
 
 def _reference(x, token_ids, group_sizes, w1, w1s, w2, w2s, act):
@@ -143,15 +147,16 @@ def test_quantize_pack_rows_layout(tokens):
 
 
 @pytest.mark.parametrize(
-    "tokens,experts,topk,tile_m,skew",
+    "tokens,experts,topk,tile_m,skew,inter",
     [
-        (64, 8, 2, 64, 0.0),  # several tiles per expert, partial last tiles
-        (48, 8, 4, 64, 0.5),  # skewed routing: empty and multi-tile experts
-        (32, 4, 1, 32, 3.0),  # one expert takes nearly every row
+        (64, 8, 2, 64, 0.0, 128),  # several tiles per expert, partial last tiles
+        (48, 8, 4, 64, 0.5, 128),  # skewed routing: empty and multi-tile experts
+        (32, 4, 1, 32, 3.0, 128),  # one expert takes nearly every row
+        (64, 8, 2, 64, 0.0, 640),  # intermediate of 1.25 quantization blocks
     ],
 )
-def test_gather_fused_moe_matches_reference(tokens, experts, topk, tile_m, skew):
-    hidden, inter = 768, 128  # 1.5 quantization blocks, like hidden 2816
+def test_gather_fused_moe_matches_reference(tokens, experts, topk, tile_m, skew, inter):
+    hidden = 768  # 1.5 quantization blocks, like hidden 2816
     kx, kr, kw = jax.random.split(jax.random.PRNGKey(1), 3)
     x = (jax.random.normal(kx, (tokens, hidden)) * 2.0).astype(jnp.bfloat16)
     token_ids, group_sizes, _, _ = _routing(kr, tokens, experts, topk, skew)
@@ -236,3 +241,35 @@ def test_routed_moe_end_to_end():
         prod = gathered[:, k] * weights[:, k : k + 1].astype(jnp.float32)
         acc = acc + prod
     np.testing.assert_array_equal(np.asarray(out), np.asarray(acc.astype(jnp.bfloat16)))
+
+
+def test_gather_combine_masked_routes():
+    """Negative positions contribute zero, even when the buffer slot is stale NaN."""
+    tokens, topk, hidden, tt = 48, 4, 768, 16  # three tiles: slots 0, 1, 0
+    kr, ky, km = jax.random.split(jax.random.PRNGKey(6), 3)
+    _, _, positions, weights = _routing(kr, tokens, 16, topk, 0.0)
+    valid = jax.random.bernoulli(km, 0.5, (tokens, topk))
+    # Route (t=0, k=0) of tile 0 is valid and reads a NaN row; the same slot
+    # position in tile 2 (t=32, k=0) is skipped, so that slot is stale there.
+    valid = valid.at[0, 0].set(True).at[2 * tt, 0].set(False)
+    y = jax.random.normal(ky, (tokens * topk, hidden)).astype(jnp.bfloat16)
+    y = y.at[positions[0, 0]].set(jnp.nan)
+    out = G.gather_combine(
+        _pack_rows(y),
+        jnp.where(valid, positions, -1),
+        weights,
+        hidden_size=hidden,
+        tile_tokens=tt,
+        masked=True,
+        interpret=True,
+    )
+    gathered = (
+        y[positions.reshape(-1)].reshape(tokens, topk, hidden).astype(jnp.float32)
+    )
+    prod = gathered * weights[..., None].astype(jnp.float32)
+    want = jnp.where(valid[..., None], prod, 0.0).sum(axis=1).astype(jnp.bfloat16)
+    got = np.asarray(out, np.float32)
+    assert np.isnan(got[0]).all() and np.isfinite(np.delete(got, 0, axis=0)).all()
+    np.testing.assert_allclose(
+        got[1:], np.asarray(want, np.float32)[1:], rtol=8e-3, atol=1e-2
+    )

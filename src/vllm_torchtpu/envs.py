@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MOE_GATHER_GMM: bool = False
     TPU_MOE_GATHER_GMM_MIN_TOKENS: int = 1024
+    TPU_MOE_TP_EXPERT_SPLIT: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -692,6 +693,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_GATHER_GMM_MIN_TOKENS": env_nonnegative_int(
         "TPU_MOE_GATHER_GMM_MIN_TOKENS", 1024
     ),
+    # MoE layers that run without expert parallelism (no
+    # --enable-expert-parallel) on a tensor-parallel group, with no data,
+    # pipeline-context or sequence parallelism inside the engine: give each TP
+    # rank whole experts (expert parallelism over the TP group) instead of a
+    # slice of every expert's intermediate dimension. Each rank then computes
+    # only the routes to its own experts; the MoE output is still summed by
+    # the TP all-reduce. Data-parallel replicas stay independent.
+    "TPU_MOE_TP_EXPERT_SPLIT": env_bool("TPU_MOE_TP_EXPERT_SPLIT"),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after

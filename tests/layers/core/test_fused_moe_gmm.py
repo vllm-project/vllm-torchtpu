@@ -498,9 +498,7 @@ def _gather_gmm_case(**overrides):
         w1_bias=None,
         w2_bias=None,
         topk=8,
-        use_ep=False,
         rhs_quant_dtype=None,
-        skip_padded_tokens=False,
     )
     case.update(overrides)
     return case
@@ -511,8 +509,6 @@ def _gather_gmm_case(**overrides):
     [
         ({}, True, True),
         ({}, False, False),
-        ({"use_ep": True}, True, False),
-        ({"skip_padded_tokens": True}, True, False),
         ({"w1_bias": jax.ShapeDtypeStruct((128, 1, 768), jnp.float32)}, True, False),
         # 512-row weight-scale blocks instead of one per channel.
         (
@@ -527,8 +523,8 @@ def _gather_gmm_case(**overrides):
                 "w1_scale": jax.ShapeDtypeStruct((128, 1, 1, 1536), jnp.float32),
             },
             True,
-            False,
-        ),  # intermediate 768 > one quantization block
+            True,
+        ),  # intermediate 768: two quantization blocks
         (
             {"hidden_states": jax.ShapeDtypeStruct((512, 2816), jnp.bfloat16)},
             True,

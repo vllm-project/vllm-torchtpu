@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Gather-fused MoE expert kernels for the non-EP TensorCore path.
+"""Gather-fused MoE expert kernels for the TensorCore grouped-matmul MoE path.
 
 The grouped-matmul path materializes every routed row twice in HBM: once in
 expert order before the first matmul (``hidden[token_indices_sorted]``) and
@@ -369,21 +369,29 @@ def _fused_moe_kernel(
             gate_up[:, : cfg.inter_size], gate_up[:, cfg.inter_size :], cfg.act
         )
 
-        # down: the intermediate is one quantization block (inter <= 512).
-        mid_q, mid_scale = _quantize_rows(mid)
-        mid_scale = mid_scale.astype(jnp.bfloat16)
+        # down: per 512-column block of the intermediate, as gmm_v2 does.
+        mid_blocks = []
+        for k0 in range(0, cfg.inter_size, QUANT_BLOCK):
+            k1 = min(cfg.inter_size, k0 + QUANT_BLOCK)
+            mid_q, mid_scale = _quantize_rows(mid[:, k0:k1])
+            mid_blocks.append((k0, k1, mid_q, mid_scale.astype(jnp.bfloat16)))
         for j in range(s):
             n0 = j * PACKED_COLUMNS
             halves = []
             for h0 in range(n0, n0 + PACKED_COLUMNS, cfg.mxu_cols):
-                prod = jnp.dot(
-                    mid_q,
-                    w2_vm[wslot, :, h0 : h0 + cfg.mxu_cols],
-                    preferred_element_type=jnp.float32,
-                ).astype(jnp.bfloat16)
-                prod *= mid_scale
-                prod *= w2s_vm[wslot, :, h0 : h0 + cfg.mxu_cols].astype(jnp.bfloat16)
-                halves.append(prod)
+                down_acc = jnp.zeros((height, cfg.mxu_cols), jnp.bfloat16)
+                for k0, k1, mid_q, mid_scale in mid_blocks:
+                    prod = jnp.dot(
+                        mid_q,
+                        w2_vm[wslot, k0:k1, h0 : h0 + cfg.mxu_cols],
+                        preferred_element_type=jnp.float32,
+                    ).astype(jnp.bfloat16)
+                    prod *= mid_scale
+                    prod *= w2s_vm[wslot, :, h0 : h0 + cfg.mxu_cols].astype(
+                        jnp.bfloat16
+                    )
+                    down_acc += prod
+                halves.append(down_acc)
             down = jnp.concatenate(halves, axis=1)
             y_vm[slot, pl.ds(j, height, stride=s), :] = _pack_lane_block(
                 down[:, :LANES], down[:, LANES:]
@@ -476,10 +484,12 @@ def gather_fused_moe(
     """Expert-order packed down-projection rows ``[rows * S, 128]``.
 
     Row ``r`` is the down projection of token ``token_indices_sorted[r]``
-    through the expert that owns sorted position ``r`` (``group_sizes`` gives
-    each expert's contiguous run of sorted positions and must sum to
-    ``len(token_indices_sorted)``). ``w1`` holds gate and up as contiguous
-    halves, the layout gmm_v2's fused-activation path reads.
+    through the expert that owns sorted position ``r``: ``group_sizes`` gives
+    each expert's contiguous run of sorted positions, from position 0. Only
+    that prefix (``sum(group_sizes)`` rows) is written; rows past it (routes to
+    other ranks' experts, skipped padded tokens) are left uninitialized and
+    must not be read (``gather_combine(masked=True)``). ``w1`` holds gate and
+    up as contiguous halves, the layout gmm_v2's fused-activation path reads.
     """
     num_experts, hidden, n1 = w1.shape
     inter = n1 // 2
@@ -487,10 +497,8 @@ def gather_fused_moe(
     s = packed_sublanes(hidden)
     if w2.shape != (num_experts, inter, hidden):
         raise ValueError(f"w2 {w2.shape} does not match w1 {w1.shape}")
-    if inter % LANES or inter > QUANT_BLOCK:
-        raise ValueError(
-            f"intermediate {inter} must be a multiple of {LANES} and <= {QUANT_BLOCK}"
-        )
+    if inter % LANES:
+        raise ValueError(f"intermediate {inter} must be a multiple of {LANES}")
     if tile_m % height_step or tile_m % issue_group:
         raise ValueError(
             f"{tile_m=} is not a multiple of {height_step=} and {issue_group=}"
@@ -553,21 +561,34 @@ def gather_fused_moe(
 # ---------------------------------------------------------------- combine
 
 
-def _combine_kernel(pos_smem, w_ref, y_hbm, out_ref, buf, sem, *, tt, topk, s):
+def _combine_kernel(pos_smem, w_ref, *rest, tt, topk, s, masked):
+    if masked:
+        pos_ref, y_hbm, out_ref, buf, sem, count = rest
+    else:
+        y_hbm, out_ref, buf, sem = rest
     i = pl.program_id(0)
 
     def issue(tile, slot):
-        def body(t, carry):
+        def body(t, issued):
             for k in range(topk):
                 row = pos_smem[(tile * tt + t) * topk + k]
-                pltpu.make_async_copy(
+                copy = pltpu.make_async_copy(
                     y_hbm.at[pl.ds(row * s, s)],
-                    buf.at[slot, k, pl.ds(t * s, s)],
+                    buf.at[slot, pl.ds((k * tt + t) * s, s)],
                     sem.at[slot],
-                ).start()
-            return carry
+                )
+                if masked:
+                    # A negative position is a route this call has no row
+                    # for (another rank's expert, a skipped padded token).
+                    pl.when(row >= 0)(copy.start)
+                    issued += (row >= 0).astype(jnp.int32)
+                else:
+                    copy.start()
+            return issued
 
-        lax.fori_loop(0, tt, body, 0)
+        issued = lax.fori_loop(0, tt, body, jnp.int32(0))
+        if masked:
+            count[slot] = issued
 
     @pl.when(i == 0)
     def _():
@@ -579,17 +600,36 @@ def _combine_kernel(pos_smem, w_ref, y_hbm, out_ref, buf, sem, *, tt, topk, s):
     def _():
         issue(i + 1, 1 - slot)
 
-    pltpu.make_async_copy(buf.at[slot], buf.at[slot], sem.at[slot]).wait()
+    if masked:
+        # Waits count bytes: one descriptor the size of the issued rows.
+        rows = pl.ds(0, count[slot] * s)
+
+        @pl.when(count[slot] > 0)
+        def _():
+            pltpu.make_async_copy(
+                buf.at[slot, rows], buf.at[slot, rows], sem.at[slot]
+            ).wait()
+
+    else:
+        pltpu.make_async_copy(buf.at[slot], buf.at[slot], sem.at[slot]).wait()
     # BF16 rows times BF16 weights are exact in F32; sum in F32, round once.
     w = w_ref[...].astype(jnp.float32)
+    if masked:
+        valid = pos_ref[...] >= 0
     for j in range(s):
         acc_lo = jnp.zeros((tt, LANES), jnp.float32)
         acc_hi = jnp.zeros((tt, LANES), jnp.float32)
         for k in range(topk):
-            lo, hi = _unpack_lane_block(buf[slot, k, pl.ds(j, tt, stride=s), :])
+            words = buf[slot, pl.ds(k * tt * s + j, tt, stride=s), :]
+            lo, hi = _unpack_lane_block(words)
             wk = w[:, k : k + 1]
-            acc_lo += lo * wk
-            acc_hi += hi * wk
+            lo, hi = lo * wk, hi * wk
+            if masked:
+                # Rows of skipped routes are stale buffer contents.
+                lo = jnp.where(valid[:, k : k + 1], lo, 0.0)
+                hi = jnp.where(valid[:, k : k + 1], hi, 0.0)
+            acc_lo += lo
+            acc_hi += hi
         out_ref[:, PACKED_COLUMNS * j : PACKED_COLUMNS * j + LANES] = acc_lo.astype(
             out_ref.dtype
         )
@@ -598,7 +638,9 @@ def _combine_kernel(pos_smem, w_ref, y_hbm, out_ref, buf, sem, *, tt, topk, s):
         )
 
 
-@functools.partial(jax.jit, static_argnames=("hidden_size", "tile_tokens", "interpret"))
+@functools.partial(
+    jax.jit, static_argnames=("hidden_size", "tile_tokens", "masked", "interpret")
+)
 def gather_combine(
     y_packed: jax.Array,  # uint32 [rows * S, 128] (gather_fused_moe)
     positions: jax.Array,  # int32 [tokens, topk]: expert-order row of each route
@@ -606,34 +648,47 @@ def gather_combine(
     *,
     hidden_size: int,
     tile_tokens: int = 64,
+    masked: bool = False,
     interpret: bool = False,
 ) -> jax.Array:
-    """BF16 ``out[t] = sum_k weights[t, k] * row(positions[t, k])``."""
+    """BF16 ``out[t] = sum_k weights[t, k] * row(positions[t, k])``.
+
+    ``masked=True`` admits negative positions: those routes contribute zero
+    and are never read.
+    """
     tokens, topk = weights.shape
     s = packed_sublanes(hidden_size)
     if tokens % tile_tokens:
         raise ValueError(f"{tokens=} is not a multiple of {tile_tokens=}")
+    positions = positions.astype(jnp.int32)
+    route_block = pl.BlockSpec((tile_tokens, topk), lambda i, pos: (i, 0))
+    in_specs = [route_block]
+    operands = [weights]
+    scratch = [
+        pltpu.VMEM((2, topk * tile_tokens * s, LANES), jnp.uint32),
+        pltpu.SemaphoreType.DMA((2,)),
+    ]
+    if masked:
+        in_specs.append(route_block)
+        operands.append(positions)
+        scratch.append(pltpu.SMEM((2,), jnp.int32))
     return pl.pallas_call(
-        functools.partial(_combine_kernel, tt=tile_tokens, topk=topk, s=s),
+        functools.partial(
+            _combine_kernel, tt=tile_tokens, topk=topk, s=s, masked=masked
+        ),
         out_shape=jax.ShapeDtypeStruct((tokens, s * PACKED_COLUMNS), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             grid=(tokens // tile_tokens,),
-            in_specs=[
-                pl.BlockSpec((tile_tokens, topk), lambda i, pos: (i, 0)),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-            ],
+            in_specs=[*in_specs, pl.BlockSpec(memory_space=pltpu.HBM)],
             out_specs=pl.BlockSpec(
                 (tile_tokens, s * PACKED_COLUMNS), lambda i, pos: (i, 0)
             ),
-            scratch_shapes=[
-                pltpu.VMEM((2, topk, tile_tokens * s, LANES), jnp.uint32),
-                pltpu.SemaphoreType.DMA((2,)),
-            ],
+            scratch_shapes=scratch,
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",), disable_bounds_checks=True
         ),
-        name=f"gather_combine-k_{topk}-s_{s}-tt_{tile_tokens}",
+        name=f"gather_combine-k_{topk}-s_{s}-tt_{tile_tokens}-m{int(masked)}",
         interpret=pltpu.InterpretParams() if interpret else False,
-    )(positions.reshape(-1).astype(jnp.int32), weights, y_packed)
+    )(positions.reshape(-1), *operands, y_packed)
