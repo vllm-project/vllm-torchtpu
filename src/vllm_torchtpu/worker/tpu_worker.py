@@ -527,8 +527,10 @@ class TPUWorker(WorkerBase):
         # Some KV connectors allocate HBM AFTER profile_run completes — e.g.,
         # an offload spec with a host<->device transfer staging buffer, or a
         # P/D disagg connector with NCCL receive buffers. An adapter swap
-        # holds HBM only while it runs. vLLM's normal accounting misses those
-        # bytes, so subtract them from the KV-cache budget.
+        # holds HBM only while it runs, and the pipeline ring hand-off
+        # allocates its buffers after profile_run too. vLLM's normal
+        # accounting misses those bytes, so subtract them from the KV-cache
+        # budget.
         reserves = self.model_runner.post_profile_hbm_reserves()
         available = utils.min_across_ep_dp(
             self.parallel_config, budget.available - sum(reserves)
@@ -539,6 +541,7 @@ class TPUWorker(WorkerBase):
         total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
         kv_connector_hbm_reserve_gb = round(reserves.kv_connector / utils.GBYTES, 2)
         lora_slot_write_hbm_gb = round(reserves.lora_slot_write / utils.GBYTES, 2)
+        pp_handoff_hbm_reserve_gb = round(reserves.pp_handoff / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
             "Memory statistics | "
@@ -547,12 +550,14 @@ class TPUWorker(WorkerBase):
             "total_hbm_used_gb=%rGiB | "
             "kv_connector_hbm_reserve_gb=%rGiB | "
             "lora_slot_write_hbm_gb=%rGiB | "
+            "pp_handoff_hbm_reserve_gb=%rGiB | "
             "total_hbm_avail_gb=%rGiB",
             total_hbm_limit_gb,
             total_hbm_limit_cap_gb,
             total_hbm_used_gb,
             kv_connector_hbm_reserve_gb,
             lora_slot_write_hbm_gb,
+            pp_handoff_hbm_reserve_gb,
             total_hbm_avail_gb,
         )
 
@@ -566,7 +571,8 @@ class TPUWorker(WorkerBase):
             raise ValueError(
                 f"{total_hbm_used_gb=}GiB plus the HBM reserved after the "
                 f"memory profile ({kv_connector_hbm_reserve_gb=}GiB, "
-                f"{lora_slot_write_hbm_gb=}GiB) exceeds "
+                f"{lora_slot_write_hbm_gb=}GiB, "
+                f"{pp_handoff_hbm_reserve_gb=}GiB) exceeds "
                 f"{total_hbm_limit_cap_gb=}GiB by "
                 f"{-total_hbm_avail_gb}GiB. Please consider {fix}."
             )

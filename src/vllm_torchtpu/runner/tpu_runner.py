@@ -106,6 +106,8 @@ from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
+from vllm_torchtpu.distributed.pp_push import ring_handoff
+from vllm_torchtpu.distributed.pp_ring import PPRing, hbm_reserve_bytes
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
@@ -631,7 +633,7 @@ class TPUModelRunner(GPUModelRunner):
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
     # Default for a runner built without __init__.
-    _pp_wave: PPWave | None = None
+    _pp_wave: PPWave | PPRing | None = None
     _dp_step_other_decode: bool = False
 
     @property
@@ -1099,8 +1101,8 @@ class TPUModelRunner(GPUModelRunner):
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
 
-        # Hand-off wave over ICI; built in capture_model, where every stage
-        # reaches the same point.
+        # Hand-off between stages (TPU_PP_HANDOFF); built in capture_model,
+        # where every stage reaches the same point.
         self._pp_wave = None
         # A sparse model's shared top-k index table, when this stage's layers
         # cannot all recompute it; set at load time under a pipeline.
@@ -3676,6 +3678,36 @@ class TPUModelRunner(GPUModelRunner):
             num_chunks += 1
         return num_chunks, max_chunk_reqs
 
+    def _pp_forward_rows(self, scheduler_output: "SchedulerOutput") -> list[int]:
+        """The padded token count of each forward this step runs, in order,
+        as _prepare_inputs sizes them, without staging any tensors."""
+        planner = _get_sequence_layout_planner_for_runner(self)
+        num_reqs = self.input_batch.num_reqs
+        rows: list[int] = []
+        all_counts = [
+            scheduler_output.num_scheduled_tokens[self.input_batch.req_ids[i]]
+            for i in range(num_reqs)
+        ]
+        start_index = 0
+        while start_index < num_reqs:
+            counts = all_counts[start_index:]
+            if self.most_model_len is None or max(counts) > self.most_model_len:
+                chunk_reqs = self.num_reqs_max_model_len
+            else:
+                assert self.num_reqs_most_model_len is not None
+                chunk_reqs = self.num_reqs_most_model_len
+            counts = counts[:chunk_reqs]
+            rows.append(
+                planner.padded_num_tokens(
+                    runner=self,
+                    scheduler_output=scheduler_output,
+                    start_index=start_index,
+                    num_scheduled_tokens_per_req=np.array(counts, dtype=np.int32),
+                )
+            )
+            start_index += len(counts)
+        return rows
+
     def _dp_coordinated_step(
         self,
         local_num_tokens: int,
@@ -3887,6 +3919,10 @@ class TPUModelRunner(GPUModelRunner):
             local_any_decode=self._any_decode(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
+        if isinstance(self._pp_wave, PPRing) and not self._pp_is_first:
+            # Post this step's receives first, so the previous stage can send
+            # while this one prepares its inputs.
+            self._pp_wave.begin_step(self._pp_forward_rows(scheduler_output))
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
@@ -5608,6 +5644,7 @@ class TPUModelRunner(GPUModelRunner):
         return utils.HbmReserves(
             kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
+            pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
         )
 
     def _initialize_pallas_kernels(self):
@@ -6843,6 +6880,36 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(static_pool(dummy_hidden, inputs, spec))
                 logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs)
 
+    def pp_handoff_hbm_reserve_bytes(self) -> int:
+        """Device memory the ring hand-off's buffers can take beyond the
+        model and the KV cache, allocated after profile_run
+        (``pp_ring.hbm_reserve_bytes``); 0 without a pipeline or with the
+        wave."""
+        if self.parallel_config.pipeline_parallel_size <= 1 or not ring_handoff():
+            return 0
+        from vllm_torchtpu.core.pp_chunk_scheduler import uses_dynamic_chunks
+        from vllm_torchtpu.core.pp_chunks import chunk_buckets, chunk_granularity
+
+        if self._pp_intermediate_template is None:
+            self._pp_intermediate_tensors(1, zeros=True)
+        assert self._pp_intermediate_template is not None
+        # The ring keeps a zero residual per token bucket a forward is padded
+        # to. The chunk buckets join the paddings once the KV block size is
+        # final (_add_pipeline_chunk_buckets); counted at the finest granule
+        # here, they bound that sum from above.
+        rows = set(self.num_tokens_paddings)
+        if uses_dynamic_chunks(self.vllm_config):
+            granularity = chunk_granularity(
+                self.cache_config.block_size, self.max_num_tokens, False
+            )
+            rows |= set(chunk_buckets(self.max_num_tokens, granularity))
+        return hbm_reserve_bytes(
+            self.max_num_tokens,
+            self._pp_intermediate_template,
+            envs.TPU_PP_RING_DEPTH,
+            sum(rows),
+        )
+
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
         self._add_pipeline_chunk_buckets()
@@ -6858,9 +6925,17 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self._pp_topk_buffer.shape[0]} rows, fewer than the "
                     f"{self.max_num_tokens} tokens a hand-off carries"
                 )
-            self._pp_wave = PPWave(
-                self.device, self.max_num_tokens, self._pp_intermediate_template
-            )
+            if ring_handoff():
+                self._pp_wave = PPRing(
+                    self.device,
+                    self.max_num_tokens,
+                    self._pp_intermediate_template,
+                    depth=envs.TPU_PP_RING_DEPTH,
+                )
+            else:
+                self._pp_wave = PPWave(
+                    self.device, self.max_num_tokens, self._pp_intermediate_template
+                )
             self._pp_wave.warmup()
         if self.enforce_eager:
             return
@@ -7077,36 +7152,73 @@ class TPUModelRunner(GPUModelRunner):
         serve gets a trace of its own and hands its executable back, leaving
         one executable per bucket either way (see
         vllm_torchtpu.compilation.shape_variants).
+
+        With TPU_PRECOMPILE_TRACE_FIRST the ladder first only traces: every
+        bucket group is traced back to back with its compiles deferred, then
+        all buckets of all traces compile in one pass (spread over the host's
+        ranks under peer replay), and a second pass runs each bucket.
         """
+        trace_first = envs.TPU_PRECOMPILE_TRACE_FIRST
+        if trace_first and not envs.TPU_PARALLEL_PRECOMPILE:
+            raise ValueError(
+                "TPU_PRECOMPILE_TRACE_FIRST=1 needs TPU_PARALLEL_PRECOMPILE=1"
+            )
+        if trace_first and vllm_envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+            raise ValueError(
+                "TPU_PRECOMPILE_TRACE_FIRST=1 is incompatible with "
+                "VLLM_USE_MEGA_AOT_ARTIFACT=1: save_aot_compiled_function runs "
+                "before deferred compiles finish, writing an empty artifact. "
+                "Set VLLM_USE_MEGA_AOT_ARTIFACT=0 (the TPU default)."
+            )
         with shape_variants.warmup() as buckets:
-            for num_tokens in self.num_tokens_paddings:
-                logger.info("  -- num_tokens: %d", num_tokens)
-                if buckets.needs_retrace(num_tokens):
-                    shape_variants.retrace(self.model, self.vllm_config)
-                self._dummy_run(
-                    num_tokens,
-                    self.num_reqs_max_model_len,
-                    self.max_num_blocks_per_req,
-                    use_max_model_len=True,
-                )
-                if self.most_model_len is not None:
-                    assert self.num_reqs_most_model_len is not None
-                    assert self.num_blocks_per_most_len_req is not None
-                    self._dummy_run(
-                        num_tokens,
-                        self.num_reqs_most_model_len,
-                        self.num_blocks_per_most_len_req,
-                        use_max_model_len=False,
+            with (
+                shape_variants.trace_only() if trace_first else contextlib.nullcontext()
+            ) as deferred:
+                for num_tokens in self.num_tokens_paddings:
+                    logger.info("  -- num_tokens: %d", num_tokens)
+                    if buckets.needs_retrace(num_tokens):
+                        shape_variants.retrace(self.model, self.vllm_config)
+                    self._backbone_dummy_runs(num_tokens)
+                if buckets.refused:
+                    # A refusal that no trace picked up leaves a raising
+                    # closure in the live graph, which would surface as a
+                    # failed request. Fail the start instead, where it can be
+                    # read.
+                    raise shape_variants.ShapeSpecializationError(
+                        "warmup left token buckets uncompiled: "
+                        f"{sorted(buckets.refused)}"
                     )
-            if buckets.refused:
-                # A refusal that no trace picked up leaves a raising closure in
-                # the live graph, which would surface as a failed request. Fail
-                # the start instead, where it can be read.
-                raise shape_variants.ShapeSpecializationError(
-                    f"warmup left token buckets uncompiled: {sorted(buckets.refused)}"
+            if deferred is not None:
+                started = time.perf_counter()
+                deferred.compile()
+                logger.info(
+                    "Deferred precompile of %d traces took %.1f s",
+                    buckets.traces + 1,
+                    time.perf_counter() - started,
                 )
+        if trace_first:
+            for num_tokens in self.num_tokens_paddings:
+                self._backbone_dummy_runs(num_tokens)
         if self._pp_wave is not None:
             self._warmup_handoff_forwards()
+
+    def _backbone_dummy_runs(self, num_tokens: int) -> None:
+        """One warmup forward of the backbone per context bucket."""
+        self._dummy_run(
+            num_tokens,
+            self.num_reqs_max_model_len,
+            self.max_num_blocks_per_req,
+            use_max_model_len=True,
+        )
+        if self.most_model_len is not None:
+            assert self.num_reqs_most_model_len is not None
+            assert self.num_blocks_per_most_len_req is not None
+            self._dummy_run(
+                num_tokens,
+                self.num_reqs_most_model_len,
+                self.num_blocks_per_most_len_req,
+                use_max_model_len=False,
+            )
 
     def _warmup_handoff_forwards(self) -> None:
         """Run every token bucket once through the pipeline hand-off.
