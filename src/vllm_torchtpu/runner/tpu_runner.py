@@ -5539,7 +5539,13 @@ class TPUModelRunner(GPUModelRunner):
             )
             for module in self.model.modules()
         )
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
+        # The count tap reads the mask to skip bucket-padding rows; every other
+        # reader is gated on TPU_MOE_SKIP_PADDED_TOKENS or is the mxfp4 method.
+        if (
+            envs.TPU_MOE_SKIP_PADDED_TOKENS
+            or uses_mxfp4_moe
+            or expert_count_tap.enabled()
+        ):
             max_padded_tokens = self.max_num_tokens
             if isinstance(self.drafter, DFlashProposer):
                 # A DFlash draft forward can outgrow the largest target

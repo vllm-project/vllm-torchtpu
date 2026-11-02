@@ -242,3 +242,11 @@ def test_steps_are_split_by_valid_tokens_into_decode_and_prefill(tap_env):
     assert counts[PREFILL, 0].tolist() == [prefill, 0, prefill, 0, 0, 0, 0, 0]
     assert counts[PREFILL, 1, 2] == prefill * prefill
     assert counts[PREFILL, 2, :2].tolist() == [1, prefill]
+
+
+def test_a_forward_of_only_padding_is_not_a_step(tap_env):
+    layer = _Layer()
+    counts = _tapped(layer)
+    with _padding(valid=0, padded=4):
+        expert_count_tap.record(layer, _selecting(1, 2, 3, 4), None)
+    assert not counts.any()

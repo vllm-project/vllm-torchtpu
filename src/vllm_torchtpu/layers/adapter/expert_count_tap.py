@@ -25,11 +25,13 @@ per step phase:
 
     row 0: routed pairs           sum over steps of c
     row 1: squared per-step count sum over steps of c * c
-    row 2: [steps, valid tokens, 0, ...]
+    row 2: [steps with a valid token, valid tokens, 0, ...]
 
 where c is this rank's per-step count of valid (non-padding) tokens that
 selected the expert. Rows 0-1 give the mean and the step-to-step variance of
-each expert's load from this rank.
+each expert's load from this rank. Valid rows come from the runner's token
+padding mask, which the runner keeps whenever the tap is on; warmup steps are
+all padding, so they add nothing.
 
 Phase 0 ("decode") holds the steps whose valid tokens fit a pure decode step,
 max_num_seqs * (1 + num_speculative_tokens); phase 1 ("prefill") the rest. A
@@ -274,7 +276,8 @@ def record(
     tokens = valid.sum(dtype=torch.float32).reshape(1)
     meta = torch.cat(
         [
-            torch.ones((1,), dtype=torch.float32, device=device),
+            # A forward of only padding (warmup, an idle DP rank) is no step.
+            (tokens > 0).to(torch.float32),
             tokens,
             torch.zeros((experts - 2,), dtype=torch.float32, device=device),
         ]
