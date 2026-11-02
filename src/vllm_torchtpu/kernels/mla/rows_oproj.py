@@ -305,11 +305,7 @@ def rows_oproj(
         )
     # The largest multiple of 8 up to block_rows that divides the rows.
     block_rows = next(
-        (
-            b
-            for b in range(min(block_rows, rows), 0, -8)
-            if rows % b == 0 and b % 8 == 0
-        ),
+        (b for b in range(min(block_rows, rows) // 8 * 8, 0, -8) if rows % b == 0),
         0,
     )
     if not block_rows or n_out % (chunks * 128):

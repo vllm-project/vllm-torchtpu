@@ -96,7 +96,7 @@ def _latent(rows, seed):
     ).astype(jnp.bfloat16)
 
 
-@pytest.mark.parametrize(("rows", "block_rows"), [(16, 16), (48, 16)])
+@pytest.mark.parametrize(("rows", "block_rows"), [(16, 16), (48, 16), (48, 32)])
 def test_rows_oproj_matches_reference(rows, block_rows):
     w_view, uv_all, ws = ro.unpack(GEOM, _packed(*_shards(1)), jnp.zeros(()))
     lat = _latent(rows, 2)

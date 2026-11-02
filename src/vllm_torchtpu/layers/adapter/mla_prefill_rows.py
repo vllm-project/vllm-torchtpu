@@ -113,7 +113,7 @@ def check_config(vllm_config: Any) -> None:
             parallel.decode_context_parallel_size != parallel.tensor_parallel_size
         ),
         f"needs every bucket it takes to give rank 0 at least the {split_rows} "
-        "DCP rows (TPU_MLA_PREFILL_ROWS_MIN_TOKENS)": (
+        "DCP rows (raise TPU_MLA_PREFILL_ROWS_MIN_TOKENS)": (
             (envs.bucket_gate_edge(envs.TPU_MLA_PREFILL_ROWS_MIN_TOKENS) + 1) // tp
             < split_rows
         ),
@@ -266,6 +266,17 @@ def keep_list(mla: Any) -> list[torch.Tensor]:
         mla.mla_attn.sparse_mla_tp_op.rank,
     )
     return [t for t in tensors if t is not None]
+
+
+def rows_layers(skip_topk: list[bool]) -> list[bool]:
+    """Which of a model's MoE layers (in order; `skip_topk[i]`: layer i reuses
+    the top-k rows of the indexer layer before it) take the rows block: a
+    layer that reuses top-k rows only after one that took it (the rows are in
+    its order), so the first is an indexer layer."""
+    out: list[bool] = []
+    for reuses in skip_topk:
+        out.append(not reuses or bool(out and out[-1]))
+    return out
 
 
 def armed(layer: Any) -> bool:

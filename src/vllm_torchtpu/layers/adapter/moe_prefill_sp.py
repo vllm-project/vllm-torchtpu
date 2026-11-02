@@ -606,19 +606,14 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     )
     del shared_parts
     rows = envs.TPU_MLA_PREFILL_SEQUENCE_ROWS
-    rows_armed = []
-    for layer in layers[first:]:
+    rows_armed = mla_prefill_rows.rows_layers(
+        [bool(layer.self_attn.mla_attn.skip_topk) for layer in layers[first:]]
+    )
+    for layer, rows_layer in zip(layers[first:], rows_armed):
         keep = _keep_list(layer.mlp)
-        mla = layer.self_attn.mla_attn
-        # A layer that reuses the top-k rows of the indexer layer before it
-        # takes the rows block only if that layer did (the rows are in its
-        # order), so the first rows layer is an indexer layer.
-        if rows and (not mla.skip_topk or (rows_armed and rows_armed[-1])):
-            mla_prefill_rows.arm(mla)
-            keep += mla_prefill_rows.keep_list(mla)
-            rows_armed.append(True)
-        else:
-            rows_armed.append(False)
+        if rows and rows_layer:
+            mla_prefill_rows.arm(layer.self_attn.mla_attn)
+            keep += mla_prefill_rows.keep_list(layer.self_attn.mla_attn)
         setattr(layer, KEEP_ATTR, keep)
     setattr(backbone, KEEP_ATTR, True)
     if rows:
