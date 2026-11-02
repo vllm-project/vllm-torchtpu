@@ -1077,6 +1077,56 @@ def test_a_speculating_recurrent_model_keeps_a_checkpoint_per_draft_token() -> N
     assert exporter._req_dist_len(plain) == 3
 
 
+def test_a_recurrent_model_verifying_without_a_drafter_keeps_its_checkpoints() -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", num_layers=1, max_num_seqs=8, max_verify_tokens=3
+    )
+    assert (cfg.recurrent_window, cfg.num_state_slots) == (4, 8 * 4 + 1)
+    adapter = _adapter_without_model(cfg)
+    adapter._has_recurrent_layers = lambda: True
+    assert adapter.extra_user_inputs() == [
+        ("mamba_state_indices", (8,)),
+        ("mamba_slot_read_offsets", (33,)),
+        ("mamba_ckpt_indices", (8, 4)),
+    ]
+    assert exporter._req_dist_len(adapter) == 6
+    with pytest.raises(ValueError, match="without speculative decoding"):
+        dataclasses.replace(
+            cfg, speculative_config={"method": "mtp", "num_speculative_tokens": 2}
+        )
+    with pytest.raises(ValueError, match=">= 0"):
+        dataclasses.replace(cfg, max_verify_tokens=-1)
+
+
+def test_max_verify_tokens_loads_vllm_with_a_drafterless_speculative_config(
+    tmp_path: Path,
+) -> None:
+    spec = cli.verify_window_speculative_config(3)
+    assert spec["method"] == "ngram" and spec["num_speculative_tokens"] == 3
+    assert cli.export_speculative_config(spec) == spec
+    # The artifact declares none, and its forced verify rows skip the LM head, so
+    # the request buckets cover one row per request.
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model=str(tmp_path), dtype="bfloat16", max_model_len=128
+        ),
+        cache_config=SimpleNamespace(block_size=16),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+    )
+    cfg = universal_adapter.build_export_config_from_vllm(
+        vllm_config, token_buckets=(16, 256), max_verify_tokens=3
+    )
+    assert (cfg.speculative_config, cfg.max_verify_tokens) == (None, 3)
+    assert cfg.req_buckets == (8,)
+    args = SimpleNamespace(
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+        max_verify_tokens=2,
+    )
+    with pytest.raises(ValueError, match="without --speculative-config"):
+        cli.run_export_from_args(args, vllm_config=vllm_config)
+
+
 def _target_with_mtp_draft() -> nn.Module:
     """A target with a tied LM head, and an MTP draft sharing its embedding and
     LM head, with its own `fc` and a buffer."""
