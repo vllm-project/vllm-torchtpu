@@ -39,6 +39,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_torchtpu.compilation import tpu_compiler
 from vllm_torchtpu.core.experimental import prefill_first_scheduler
 from vllm_torchtpu.core.experimental.prefill_first_scheduler import (
     PrefillFirstScheduler,
@@ -294,6 +295,17 @@ def test_rejects_a_threshold_at_the_step_budget(shared_model_config, monkeypatch
 def test_needs_a_policy(shared_model_config, monkeypatch):
     with pytest.raises(ValueError, match="needs"):
         _build(shared_model_config, monkeypatch)
+
+
+def test_flags_stay_out_of_the_compile_key():
+    for name in (
+        "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS",
+        "VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE",
+        "VLLM_TPU_SOLO_PREFILL_DECODE_STEPS",
+        "VLLM_TPU_DECODE_INTERVAL_MS",
+    ):
+        assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+        assert name not in tpu_compiler._tpu_compile_env_factors()
 
 
 def test_decodes_are_paced_while_a_prefill_is_pending(shared_model_config, monkeypatch):
