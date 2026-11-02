@@ -206,9 +206,18 @@ pip install \
 | :--- | :--- |
 | `--group vllm` | Installs pinned upstream `vllm` (`v0.32.0`) from source. |
 | `--group test` | Installs `pytest`, `pytest-mock`, `pytest-cov`, `parameterized`, and `vllm_test_utils`. |
+| `--extra multimodal` | Installs PyAV, SciPy, SoundFile, and TorchAudio for video decoding and audio decoding/resampling. |
 | `--extra benchmarking` | Installs `lm-eval`, `evalscope`, `datasets`, and `runai-model-streamer[gcs]`. |
 | `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX, Wan2.2). |
 | `--group omni-git` | Installs `vllm-omni` 0.32.0rc1 from its git tag for `--extra omni`, until that release is on PyPI. |
+
+For audio or video serving, add the multimodal extra to the install:
+
+```bash
+VLLM_TARGET_DEVICE=empty uv sync --group vllm --extra multimodal
+```
+
+Like `torch` and `torchvision`, TorchAudio must come from the PyTorch CPU index, since the default PyPI wheel requires CUDA libraries: `pyproject.toml` routes it there for `uv`, and `pip` needs `--extra-index-url https://download.pytorch.org/whl/cpu`. [TorchAudio 2.11 supports PyTorch 2.11 and newer through its stable ABI](https://github.com/pytorch/audio/blob/main/docs/source/installation.rst).
 
 ---
 
