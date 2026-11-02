@@ -66,8 +66,13 @@ until curl -sf "localhost:$PORT/health" >/dev/null; do
   sleep 10
 done
 
+# With GDN internal prefill checkpoints, cold requests prefill the full prompt
+# in one chunk while warm requests compute only the uncached tail from the
+# saved checkpoint state. This chunking difference shifts logprobs by ~1e-3 on
+# confident tokens (whereas a wrong state drifts by >0.1), so use a 1e-2 atol.
 python3 "$HERE/smoke_prefix_cache_e2e_divergence.py" \
-  --host localhost --port "$PORT" --model "$MODEL"
+  --host localhost --port "$PORT" --model "$MODEL" \
+  --logprob-atol "${PREFIX_E2E_DIVERGENCE_LOGPROB_ATOL:-1e-2}"
 python3 "$HERE/smoke_prefix_cache_correctness.py" \
   --host localhost --port "$PORT" --model "$MODEL"
 # The one above repeat a single prompt, so a resumed request gets back a slot

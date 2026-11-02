@@ -109,6 +109,10 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 from vllm_torchtpu.distributed.pp_push import ring_handoff
 from vllm_torchtpu.distributed.pp_ring import PPRing, hbm_reserve_bytes
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
+from vllm_torchtpu.gdn_pool_layout import (
+    PrefillCheckpointUnits,
+    prefill_checkpoint_enabled,
+)
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
@@ -817,6 +821,11 @@ class TPUModelRunner(GPUModelRunner):
         self._mamba_ckpt_window: int = (
             num_ckpts if unified_kv_layout_enabled(self.vllm_config) else 1
         )
+        # Set by initialize_kv_cache when Mamba groups declare prefill
+        # checkpoint blocks.
+        self._prefill_ckpt_units: PrefillCheckpointUnits | None = None
+        self._prefill_ckpt_offsets_cpu: torch.Tensor | None = None
+        self._prefill_ckpt_zero_offsets: dict[int, torch.Tensor] = {}
         # True once the slot pool is initialized (hybrid model with mamba
         # layers); gates per-step mamba_state_indices construction.
         self._has_mamba_state: bool = False
@@ -1781,8 +1790,86 @@ class TPUModelRunner(GPUModelRunner):
             return self.kv_cache_manager.get_kv_cache_spec()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        self._init_prefill_checkpoint_units(kv_cache_config)
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+
+    def _init_prefill_checkpoint_units(self, kv_cache_config: KVCacheConfig) -> None:
+        """Initializes the units the worker places prefill checkpoints with.
+
+        They must match the engine core's: the hash block and cache-hit
+        alignment it resolved into kv_cache_config, the Mamba block at the
+        column stride the metadata builder reads the block table with, and the
+        eagle bit including the TPU override.
+        """
+        self._prefill_ckpt_units = None
+        self._prefill_ckpt_offsets_cpu = None
+        self._prefill_ckpt_zero_offsets = {}
+        if not prefill_checkpoint_enabled(self.vllm_config):
+            return
+        specs = [
+            group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+        ]
+        if not specs:
+            return
+        alignments = {spec.prefill_checkpoint_alignment for spec in specs}
+        block_sizes = {spec.block_size for spec in specs}
+        if len(alignments) != 1 or len(block_sizes) != 1:
+            raise ValueError(
+                "Mamba groups with prefill checkpoint blocks must share one "
+                f"alignment and block size: alignments={alignments}, "
+                f"block sizes={block_sizes}."
+            )
+        (alignment,) = alignments
+        assert alignment is not None
+        hash_block_size = kv_cache_config.hash_block_size
+        cache_hit_alignment_tokens = kv_cache_config.cache_hit_alignment_tokens
+        if hash_block_size is None or cache_hit_alignment_tokens is None:
+            # MambaManager reserves a checkpoint block either way; a worker
+            # that skipped the export would leave it hashed but unwritten.
+            raise ValueError(
+                "GDN prefill checkpoints need the hash_block_size and "
+                "cache_hit_alignment_tokens the engine core resolves into "
+                f"kv_cache_config; got {hash_block_size=} "
+                f"{cache_hit_alignment_tokens=}."
+            )
+        speculative_config = self.vllm_config.speculative_config
+        units = PrefillCheckpointUnits(
+            hash_block_size=hash_block_size,
+            cache_hit_alignment_tokens=cache_hit_alignment_tokens,
+            mamba_block_size=specs[0].block_size * get_pcp_group().world_size,
+            alignment=alignment,
+            drop_eagle_block=(
+                speculative_config is not None
+                and speculative_config.use_eagle_block_drop()
+            ),
+        )
+        self._prefill_ckpt_units = units
+        self._prefill_ckpt_offsets_cpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+        )
+        logger.info(
+            "GDN internal prefill checkpoints enabled: hash_block_size=%d "
+            "cache_hit_alignment_tokens=%d mamba_block_size=%d alignment=%d "
+            "drop_eagle_block=%s",
+            units.hash_block_size,
+            units.cache_hit_alignment_tokens,
+            units.mamba_block_size,
+            units.alignment,
+            units.drop_eagle_block,
+        )
+
+    def _dummy_prefill_ckpt_offsets(self, num_reqs: int) -> torch.Tensor:
+        """Returns cached all-zero prefill checkpoint offsets for a dummy batch
+        bucket of size num_reqs."""
+        offsets = self._prefill_ckpt_zero_offsets.get(num_reqs)
+        if offsets is None:
+            offsets = torch.zeros((num_reqs,), dtype=torch.int32).to(self.device)
+            self._prefill_ckpt_zero_offsets[num_reqs] = offsets
+        return offsets
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -3154,6 +3241,13 @@ class TPUModelRunner(GPUModelRunner):
             ]
             + num_scheduled_tokens_per_req
         )
+        if self._prefill_ckpt_units is not None:
+            assert self._prefill_ckpt_offsets_cpu is not None
+            self._prefill_ckpt_units.fill_offsets(
+                self._prefill_ckpt_offsets_cpu.numpy(),
+                self.seq_lens_np[:num_reqs],
+                num_scheduled_tokens_per_req,
+            )
         self._check_attention_schedule(
             num_reqs,
             num_scheduled_tokens_per_req,
@@ -3443,6 +3537,16 @@ class TPUModelRunner(GPUModelRunner):
             mamba_request_distribution = combined_device[3:6]
         assert request_distribution is not None
 
+        prefill_ckpt_offsets = None
+        if self._prefill_ckpt_units is not None:
+            # Always pass an offsets tensor (including all-zeros during decode)
+            # to keep the GDN op signature static across steps.
+            assert self._prefill_ckpt_offsets_cpu is not None
+            prefill_ckpt_offsets = self._upload_unless_unchanged(
+                "prefill_ckpt_offsets",
+                self._prefill_ckpt_offsets_cpu[:target_num_reqs],
+            )
+
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -3454,6 +3558,7 @@ class TPUModelRunner(GPUModelRunner):
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
             mamba_request_distribution=mamba_request_distribution,
+            mamba_prefill_ckpt_offsets=prefill_ckpt_offsets,
             # Unified pool + spec decode: the mamba group builders append
             # their per-request state block ids here for the post-sampling
             # read-offset scatter.
@@ -5907,6 +6012,11 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 request_distribution = combined_device[0:3]
                 dummy_mamba_request_distribution = combined_device[3:6]
+            dummy_prefill_ckpt_offsets = (
+                self._dummy_prefill_ckpt_offsets(num_reqs)
+                if self._prefill_ckpt_units is not None
+                else None
+            )
             self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,
                 start_index=0,
@@ -5919,6 +6029,7 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
+                mamba_prefill_ckpt_offsets=dummy_prefill_ckpt_offsets,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )
             slot_mappings = self.empty_slot_mappings
