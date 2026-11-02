@@ -16,6 +16,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import importlib.util
 import os
 import time
 from typing import TYPE_CHECKING, Protocol, Union, cast
@@ -777,6 +778,55 @@ class TpuPlatform(Platform):
                     # Frozen dataclass fallback.
                     object.__setattr__(dp_metadata, "num_tokens_across_dp_cpu", tpu_t)
         return {}
+
+    @classmethod
+    def external_env_var_prefixes(cls) -> tuple[str, ...]:
+        """Prefixes owned by a reader that has no registry to check against."""
+        # vLLM-Omni reads its VLLM_OMNI_* knobs directly and has no registry.
+        # Its stages call EngineArgs.create_engine_config with this class as
+        # vLLM's current_platform (OmniTpuPlatform is only
+        # current_omni_platform), so the prefix must be known here.
+        if importlib.util.find_spec("vllm_omni") is not None:
+            return ("VLLM_OMNI_",)
+        return ()
+
+    @classmethod
+    def known_env_var_names(cls) -> set[str]:
+        """Names this package reads or writes. Subclasses may extend it."""
+        from vllm_torchtpu.env_validation import PACKAGE_WRITTEN_ENV_VARS
+
+        return (
+            set(envs.environment_variables)
+            | set(cls.additional_env_vars)
+            | PACKAGE_WRITTEN_ENV_VARS
+        )
+
+    @classmethod
+    def validate_environ(cls, hard_fail: bool) -> None:
+        """Reports set env vars that neither vLLM nor this package reads.
+
+        Replaces vLLM's check, which flags every VLLM_* name missing from
+        vLLM's registry, including this package's VLLM_TPU_* knobs.
+        EngineArgs calls it once, in the front-end process; hard_fail is
+        vLLM's --fail-on-environ-validation.
+        """
+        from vllm_torchtpu.env_validation import find_unread_env_vars
+
+        unread = find_unread_env_vars(
+            os.environ,
+            cls.known_env_var_names(),
+            vllm_envs.environment_variables,
+            cls.external_env_var_prefixes(),
+        )
+        if not unread:
+            return
+        message = (
+            "Environment variables that nothing reads (unset them, or fix the "
+            "name): " + ", ".join(str(u) for u in unread)
+        )
+        if hard_fail:
+            raise ValueError(message)
+        logger.warning(message)
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
