@@ -22,12 +22,14 @@ timeout instead of passing by accident.
 
 import random
 import threading
+from collections import deque
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_torchtpu.distributed import pp_wave
+from vllm_torchtpu.distributed import pp_push, pp_wave
 
 HIDDEN = 8
 MAX_ROWS = 64
@@ -580,3 +582,167 @@ def test_only_a_first_stage_of_several_chips_launches_from_the_helper_thread(
     assert not wave.async_handoff
     wave, _ = _column_wave(monkeypatch, stage=1, column=0, received=1, chips=2)
     assert not wave.async_handoff
+
+
+@pytest.fixture
+def message_queue(monkeypatch):
+    """A stand-in for vLLM's MessageQueue, so widening it leaves the real
+    class untouched."""
+    from vllm.distributed.device_communicators import shm_broadcast
+
+    class _Queue:
+        def __init__(self, n_reader, n_local_reader, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(shm_broadcast, "MessageQueue", _Queue)
+    monkeypatch.setattr(pp_push, "_ring_chunks_needed", 0)
+
+
+def _engine(monkeypatch, waves):
+    """vLLM's executor as the engine side of the wave sees it: every call
+    goes to every stage in order, the last stage answers a call once it has
+    processed it, and a future reads the answers in call order, as vLLM's
+    ``FutureWrapper`` does. A wait for an answer that never comes fails
+    instead of hanging."""
+    from vllm.v1.executor import multiproc_executor
+
+    class _Answer(Future):
+        def __init__(self, engine, index):
+            super().__init__()
+            self.engine = engine
+            self.index = index
+
+        def result(self, timeout=None):
+            while not self.done():
+                self.engine.unread.pop()._read()
+            return super().result()
+
+        def _read(self):
+            if self.engine.answered[self.index].wait(10):
+                self.set_result(self.index)
+            else:
+                self.set_exception(
+                    TimeoutError(f"call {self.index} was never answered")
+                )
+
+    class _Engine:
+        def __init__(self):
+            self.vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(pipeline_parallel_size=len(waves))
+            )
+            self.output_rank = len(waves) - 1
+            self.calls = []
+            self.answered = []
+            self.unread = deque()
+            self.cv = threading.Condition()
+            self.closed = False
+
+        def _send(self, method, rows=0):
+            with self.cv:
+                self.calls.append((method, rows))
+                self.answered.append(threading.Event())
+                self.cv.notify_all()
+            answer = _Answer(self, len(self.calls) - 1)
+            self.unread.appendleft(answer)
+            return answer
+
+        def execute_model(self, scheduler_output, non_block=False):
+            answer = self._send(
+                "execute_model", scheduler_output.total_num_scheduled_tokens
+            )
+            return answer if non_block else answer.result()
+
+        def sample_tokens(self, grammar_output, non_block=False):
+            raise NotImplementedError
+
+        def collective_rpc(self, method, non_block=False, unique_reply_rank=None):
+            answer = self._send(method)
+            return answer if non_block else answer.result()
+
+        def serve(self, wave, errors):
+            """One stage's worker thread: processes the calls in order."""
+            try:
+                wave.warmup()
+                i = 0
+                while True:
+                    with self.cv:
+                        self.cv.wait_for(lambda i=i: len(self.calls) > i or self.closed)
+                        if len(self.calls) <= i:
+                            return
+                        method, rows = self.calls[i]
+                    if method == "execute_model" and rows:
+                        wave.start_forward(rows)
+                        out = None
+                        if wave.rank != wave.last:
+                            out = {
+                                "hidden_states": torch.zeros(rows, HIDDEN),
+                                "residual": torch.zeros(rows, HIDDEN),
+                            }
+                        wave.end_forward(out, rows)
+                    elif method == "pp_push":
+                        wave.push()
+                    elif method == "pp_settle":
+                        wave.settle()
+                    if wave.rank == wave.last:
+                        self.answered[i].set()
+                    i += 1
+            except BaseException as exc:  # reported by the test thread
+                errors.append((wave.rank, exc))
+
+    monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", _Engine)
+    engine = _Engine()
+    pp_push.patch_executor_for_pp_wave(engine.vllm_config)
+    return engine
+
+
+def test_engine_waits_on_an_empty_step_behind_a_push(monkeypatch, message_queue):
+    """The engine's wait for a step without tokens dispatched behind a push
+    must send what that push still lacks: the last stage answers the empty
+    step only after the push, and the push's launch pairs only once the
+    stages before it have launched as often, which they do on later calls
+    alone. Three single-step prefills arriving one by one, four stages."""
+    _, waves = _build_stages(monkeypatch, _template(False), size=4)
+    engine = _engine(monkeypatch, waves)
+    errors = []
+    threads = [
+        threading.Thread(target=engine.serve, args=(w, errors), daemon=True)
+        for w in waves
+    ]
+    for t in threads:
+        t.start()
+
+    def step(rows):
+        return SimpleNamespace(total_num_scheduled_tokens=rows)
+
+    try:
+        # requests A and B; the batch queue fills with empty steps
+        a = engine.execute_model(step(16), non_block=True)
+        e0 = engine.execute_model(step(0), non_block=True)
+        b = engine.execute_model(step(16), non_block=True)
+        e1 = engine.execute_model(step(0), non_block=True)
+        a.result()  # one push for A; e2 is dispatched behind it
+        e2 = engine.execute_model(step(0), non_block=True)
+        e0.result()
+        c = engine.execute_model(step(16), non_block=True)  # request C
+        b.result()
+        e3 = engine.execute_model(step(0), non_block=True)
+        e1.result()
+        e4 = engine.execute_model(step(0), non_block=True)
+        e2.result()  # hung while the wait for an empty step sent nothing
+        c.result()
+        e3.result()
+        e4.result()
+    finally:
+        with engine.cv:
+            engine.closed = True
+            engine.cv.notify_all()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "a stage never finished"
+    assert not errors, errors
+    assert [m for m, _ in engine.calls if m != "execute_model"] == [
+        "pp_push",
+        "pp_push",
+        "pp_settle",
+    ]
+    assert all(w.launches == waves[0].launches for w in waves)

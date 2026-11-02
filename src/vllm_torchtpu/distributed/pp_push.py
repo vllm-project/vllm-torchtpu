@@ -29,9 +29,12 @@ in that case, the engine first tells every worker to issue them, one
 ``pp_push`` per missing step (sent without waiting for a reply), and then
 waits. A push is a forward that carries nothing, so the forwards in flight
 keep their places and the next real step follows them; nothing drains and
-nothing restarts. With ``TPU_PP_LAZY_PUSH`` the engine core sends the
-pushes itself, each at the moment stage 0 would otherwise sit idle
-(``core/pp_lazy_step.py``), and a wait only settles.
+nothing restarts. A step without tokens runs no forward, but the workers
+answer it only after every call before it, so a wait for it sends what the
+last step with tokens dispatched before it still lacks. With
+``TPU_PP_LAZY_PUSH`` the engine core sends the pushes itself, each at the
+moment stage 0 would otherwise sit idle (``core/pp_lazy_step.py``), and a
+wait only settles.
 
 The engine and its workers exchange messages through shared-memory ring
 buffers, vLLM's ``MessageQueue``, which hold ten messages by default. The
@@ -90,6 +93,8 @@ class _WaveState:
         self.open = False
         self.pushes = 0
         self.settles = 0
+        # Steps the last settle covered: every launch up to it has paired.
+        self.settled = 0
         # The engine core times the pushes itself (core/pp_lazy_step.py).
         self.lazy = False
 
@@ -121,6 +126,7 @@ class _WaveState:
             return None
         self.open = False
         self.settles += 1
+        self.settled = self.steps
         if self.settles <= 5 or self.settles % 100 == 0:
             logger.debug(
                 "PP wave settle %d after step %d", self.settles, self.last_step
@@ -136,8 +142,8 @@ class _WaveState:
         afterwards; otherwise one ``pp_push`` for every later step it still
         lacks, counting the pushes as later steps for the waits that
         follow. With lazy pushes the engine core sends the pushes, and a
-        wait settles."""
-        if not self.open:
+        wait settles. Nothing is sent for a step a settle has carried."""
+        if not self.open or step <= self.settled:
             return
         # With two stages the launches pair without pushes; the settle still
         # goes out and issues stage 0's queued hand-off.
@@ -164,7 +170,7 @@ class _WaveState:
 
 
 class _PushFuture(Future):
-    """The result of one forward or sampling call.
+    """The result of one forward, sampling or empty-step call.
 
     Every method forwards to the executor's own future. The two that wait
     for it, ``result`` and ``exception``, first send what carries this
@@ -439,7 +445,11 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
             return orig_execute(self, scheduler_output, non_block=non_block)
         state = wave_state(self)
         if scheduler_output.total_num_scheduled_tokens <= 0:
-            return orig_execute(self, scheduler_output, non_block=non_block)
+            # No forward, but the workers answer it after every earlier
+            # call: the wait carries the last step with tokens so far.
+            inner = cast(Future, orig_execute(self, scheduler_output, non_block=True))
+            future = _PushFuture(inner, self, state, state.steps, state.real_steps)
+            return future if non_block else future.result()
         step = state.dispatched()
         # For pooling models and for steps without sampling the engine
         # waits on this future directly, so it pushes like the sampling one.

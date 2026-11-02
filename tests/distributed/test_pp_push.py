@@ -290,13 +290,55 @@ def test_blocking_forward_call_returns_the_output(monkeypatch, queue):
     assert [c[0] for c in executor.calls] == ["pp_settle"]
 
 
-def test_empty_steps_do_not_join_the_wave(monkeypatch, queue):
+def test_an_empty_step_alone_sends_nothing(monkeypatch, queue):
     executor = _install_on_fake_executor(monkeypatch, stages=4)
     future = executor.execute_model(_step(0, 1), non_block=True)
-    assert not isinstance(future, pp_push._PushFuture)
+    assert isinstance(future, pp_push._PushFuture)
     assert future.result() == ("forward", 1)
     assert executor.calls == []
     assert executor._tpu_wave_state.steps == 0
+
+
+def test_an_empty_step_carries_the_steps_dispatched_before_it(monkeypatch, queue):
+    # The workers answer a call only after every call before it, so a wait
+    # for an empty step must send what the steps before it still lack.
+    executor = _install_on_fake_executor(monkeypatch, stages=4)
+    first = executor.execute_model(_step(16, 1), non_block=True)
+    empty_a = executor.execute_model(_step(0, 2), non_block=True)
+    second = executor.execute_model(_step(16, 3), non_block=True)
+    empty_b = executor.execute_model(_step(0, 4), non_block=True)
+    wave = executor._tpu_wave_state
+    assert wave.steps == 2 and wave.real_steps == 2
+    # step 1 with step 2 behind it: one push, step 3
+    assert first.result() == ("forward", 1)
+    assert [c[0] for c in executor.calls] == ["pp_push"]
+    # an empty step dispatched behind the push
+    empty_c = executor.execute_model(_step(0, 5), non_block=True)
+    # empty steps dispatched before the push lack nothing
+    assert empty_a.result() == ("forward", 2)
+    third = executor.execute_model(_step(16, 6), non_block=True)
+    assert second.result() == ("forward", 3)
+    assert empty_b.result() == ("forward", 4)
+    assert len(executor.calls) == 1
+    # the push behind which the empty step waits (step 3) needs two later
+    # steps and has step 4: one more push before the wait
+    assert empty_c.result() == ("forward", 5)
+    assert [c[0] for c in executor.calls] == ["pp_push", "pp_push"]
+    assert wave.steps == 5
+    # step 4 is the newest the scheduler produced: the settle carries it
+    assert third.result() == ("forward", 6)
+    assert [c[0] for c in executor.calls] == ["pp_push", "pp_push", "pp_settle"]
+    assert wave.settled == 5
+    # an empty step dispatched before the settle sends nothing, even once
+    # a later step has opened the next burst
+    empty_d = executor.execute_model(_step(0, 7), non_block=True)
+    fourth = executor.execute_model(_step(16, 8), non_block=True)
+    assert wave.open
+    assert empty_d.result() == ("forward", 7)
+    assert len(executor.calls) == 3
+    assert fourth.result() == ("forward", 8)
+    assert [c[0] for c in executor.calls][-1] == "pp_settle"
+    assert not wave.open
 
 
 def test_each_executor_pushes_for_its_own_pipeline_size(monkeypatch, queue):
