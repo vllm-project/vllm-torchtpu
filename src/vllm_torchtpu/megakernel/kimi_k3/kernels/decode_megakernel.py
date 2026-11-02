@@ -2513,7 +2513,6 @@ def moe(
     overlap_router_latent: bool = False,
     overlap_shared_reduction: bool = False,
     prepare_weights_vmem=None,
-    oneshot_vmem=None,
     shared_gate_up_stream=None,
     token_scatter_owners: int = 4,
     owned_hidden_ref=None,
@@ -3080,33 +3079,6 @@ def moe(
     # The routed payload is eight contiguous token shards: each local lane
     # reduces one, then a local all-gather restores the batch for latent-up.
     reduce_scatter_routed_output = routed_reduce_scatter
-    # KernelConfig.oneshot_reduce_max_batch: the unscattered routed and shared
-    # reductions send each rank's partial to all 31 peers at once and sum the
-    # 32 locally (one exchange instead of a local and a host stage).
-    oneshot = (oneshot_vmem is not None and not reduce_scatter_routed_output
-               and not reduce_scatter_shared_output)
-    if oneshot:
-        oneshot_routed_vmem, oneshot_shared_vmem = oneshot_vmem
-
-    def oneshot_copies(buffer, payload, send, receive):
-        """This rank's slot of ``buffer`` to the same slot on every peer."""
-        view = buffer.at[rank, :payload, :]
-        return [
-            (peer, tpu.make_async_remote_copy(view, view, send, receive,
-                                              device_id=(peer,), device_id_type=pl.DeviceIdType.MESH))
-            for peer in range(32)
-        ]
-
-    def oneshot_start(buffer, payload, send, receive):
-        for peer, copy in oneshot_copies(buffer, payload, send, receive):
-            pl.when(rank != peer)(copy.start)
-
-    def oneshot_wait(buffer, payload, send, receive):
-        # Byte-counting semaphores: 31 slots' worth sent and received.
-        others = buffer.at[pl.ds(0, 31), :payload, :]
-        tpu.make_async_copy(others, others, send).wait()
-        tpu.make_async_copy(others, others, receive).wait()
-
     shared_shard_width = 1024
     shared_shard_rows = shared_shard_width // 128
     shared_shard_payload = shared_shard_rows // 2
@@ -3297,11 +3269,6 @@ def moe(
 
         else:
             payload = local_shared_outputs.shape[0] * shared_payload
-            if oneshot:
-                encode_shared(local_shared_outputs, oneshot_shared_vmem.at[rank])
-                oneshot_start(oneshot_shared_vmem, payload,
-                              shared_send_semaphores.at[0], shared_receive_semaphores.at[0])
-                return
             assert payload <= shared_local_reduction_vmem.shape[1]
             encode_shared(
                 local_shared_outputs,
@@ -3311,8 +3278,6 @@ def moe(
                 shared_copy(payload, offset).start()
 
     def finish_shared_reduction(payload):
-        if oneshot:
-            return
         if reduce_scatter_shared_output:
             for offset in range(7, 0, -1):
                 shared_shard_copy(offset).wait()
@@ -3335,11 +3300,6 @@ def moe(
             shared_copy(payload, offset, True).start()
 
     def finish_shared_host_reduction(payload, reduced_shared_outputs):
-        if oneshot:
-            oneshot_wait(oneshot_shared_vmem, payload,
-                         shared_send_semaphores.at[0], shared_receive_semaphores.at[0])
-            reduced_shared_outputs[...] = decode_shared(oneshot_shared_vmem[:, :payload, :])
-            return
         for offset in range(3, 0, -1):
             shared_copy(payload, offset, True).wait()
         if reduce_scatter_shared_output:
@@ -3388,10 +3348,6 @@ def moe(
             for offset in range(7, 0, -1):
                 expert_shard_copy(offset).start()
             _phase_end(t1)
-        elif oneshot:
-            encode_expert(local_expert_outputs, oneshot_routed_vmem.at[rank])
-            oneshot_start(oneshot_routed_vmem, expert_transport_payload,
-                          send_semaphores.at[0], receive_semaphores.at[0])
         else:
             encode_expert(
                 local_expert_outputs,
@@ -3498,16 +3454,6 @@ def moe(
                         shared_transport_payload, reduced_shared_outputs
                     )
                     _phase_end(t6)
-            reduction_phase[0] += 2
-            return
-        if oneshot:
-            oneshot_wait(oneshot_routed_vmem, expert_transport_payload,
-                         send_semaphores.at[0], receive_semaphores.at[0])
-            reduced_expert_outputs[...] = jnp.zeros(reduced_expert_outputs.shape, jnp.float32)
-            reduced_expert_outputs[:, :expert_output_size] = decode_expert(
-                oneshot_routed_vmem[:, :expert_transport_payload, :]
-            )
-            finish_shared_host_reduction(shared_transport_payload, reduced_shared_outputs)
             reduction_phase[0] += 2
             return
         for offset in range(7, 0, -1):
@@ -7004,9 +6950,6 @@ def stack(
     if batch_size % commit_rows:
         raise ValueError("mla_commit_tile_size must divide the batch")
     group_rows = batch_size // attention_dp
-    # KernelConfig.oneshot_reduce_max_batch: one-shot unscattered MoE reductions.
-    oneshot_reduce = (attention_dp == 1 and not moe_routed_reduce_scatter and not moe_token_scatter_output
-                      and 1 <= batch_size <= _config().oneshot_reduce_max_batch)
     # The B64/B128 MoE overlaps and SP8 residual rows; verifies take those
     # named in KernelConfig.verify_overlaps.
     verify_overlaps = set(_config().verify_overlaps)
@@ -7216,10 +7159,6 @@ def stack(
             common = common[5:]
         dcp_persistent = common[: len(mla_dcp.PERSISTENT_NAMES)]
         common = common[len(mla_dcp.PERSISTENT_NAMES) :]
-        oneshot_vmem = None
-        if oneshot_reduce:
-            oneshot_vmem = tuple(common[-2:])
-            common = common[:-2]
         if _config().vmem_pad_kb:
             headroom_pad = common[-1]
             headroom_pad[...] = jnp.zeros(headroom_pad.shape, jnp.float32)
@@ -9020,7 +8959,6 @@ def stack(
                         if POOLED_WEIGHTS
                         else None
                     ),
-                    oneshot_vmem=oneshot_vmem,
                     shared_gate_up_stream=(
                         weight_stream(
                             "shared_gu",
@@ -9567,14 +9505,6 @@ def stack(
             if _config().vmem_pad_kb
             else ()
         ),
-        # One-shot MoE reductions: a slot per rank for the routed (14 FP32
-        # transport rows per token) and shared (28) partials.
-        *(
-            (tpu.VMEM((32, -(-14 * batch_size // 8) * 8, 128), jnp.float32),
-             tpu.VMEM((32, -(-28 * batch_size // 8) * 8, 128), jnp.float32))
-            if oneshot_reduce
-            else ()
-        ),
     )
     scratch_names = (
         "prefix", "blocks", "normalized", "attention", "mixture", *NORMS,
@@ -9594,8 +9524,7 @@ def stack(
         "receive_semaphores", "reduction_phase", "latent_gather",
         *(("projection_staging", "routed_send") if batch_size > 32 else ()),
         *(("attention_gather",) if b4_attention_gather else ()),
-        *(("headroom_pad",) if _config().vmem_pad_kb else ()),
-        *(("oneshot_routed", "oneshot_shared") if oneshot_reduce else ()),
+        "headroom_pad",
     )
     persistent = [
         ("output window 1", tpu.VMEM(output_shapes[1].shape, output_shapes[1].dtype)),
