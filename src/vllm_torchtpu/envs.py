@@ -137,6 +137,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
+    TPU_SPARSE_MLA_SC_GATHER_RING: bool = True
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -469,6 +470,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_SPARSE_MLA_ROPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
+    ),
+    # Serve the sparse MLA SparseCore KV gather with the K-deep DMA ring
+    # (`dsa_gather_native_sc(ring_slots=...)`). Off stands it down to the
+    # nested emit_pipeline gather; outputs are bit-identical either way. A
+    # debug escape hatch for the new kernel: delete once the ring has shipped
+    # a release without needing it.
+    "TPU_SPARSE_MLA_SC_GATHER_RING": env_bool(
+        "TPU_SPARSE_MLA_SC_GATHER_RING", default=True
     ),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
