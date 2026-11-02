@@ -88,6 +88,39 @@ def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     )
 
 
+def stack_fn3(fn: jax.Array) -> jax.Array:
+    """``split_fn3``'s chunks stacked along the output dim: (3 * N, K).
+
+    Built elementwise over three row-stacked copies of fn rather than as a
+    concatenation of the chunks, which XLA leaves as a second fusion.
+    """
+    n = fn.shape[0]
+    x = jnp.tile(fn, (3, 1))
+    row = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+    hi = jax.lax.reduce_precision(x, 8, 7)
+    rem = x - hi
+    mid = jax.lax.reduce_precision(rem, 8, 7)
+    lo = jax.lax.reduce_precision(rem - mid, 8, 7)
+    return jnp.where(row < n, hi, jnp.where(row < 2 * n, mid, lo)).astype(jnp.bfloat16)
+
+
+def dot_fn_chunks(x: jax.Array, fn_chunks: jax.Array, n: int) -> jax.Array:
+    """In-kernel ``x @ fn.T`` (f32) from ``fn``'s bf16 chunks stacked along
+    the output dim (``stack_fn3``, or the hi chunk alone).
+
+    At DeepSeek-V4 shapes the chunks' columns fit one MXU tile, so one dot
+    streams ``x`` once for all of them; the per-chunk column blocks are
+    then added in chunk order.
+    """
+    assert fn_chunks.shape[0] % n == 0, (fn_chunks.shape, n)
+    dn = (((1,), (1,)), ((), ()))
+    prod = jax.lax.dot_general(x, fn_chunks, dn, preferred_element_type=jnp.float32)
+    acc = prod[:, :n]
+    for c in range(1, fn_chunks.shape[0] // n):
+        acc = acc + prod[:, c * n : (c + 1) * n]
+    return acc
+
+
 def mhc_pre_gates(
     mixes: jax.Array,
     sqrsum: jax.Array,

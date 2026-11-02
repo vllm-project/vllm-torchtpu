@@ -29,9 +29,7 @@ def _fused_kernel(
     res_ref,
     post_ref,
     comb_ref,
-    fn_hi_ref,
-    fn_mid_ref,
-    fn_lo_ref,
+    fn_ref,
     sc_ref,
     hb_ref,
     newres_ref,
@@ -41,11 +39,10 @@ def _fused_kernel(
     *,
     hc_mult,
     hidden_size,
-    gemm_precision,
     rms_eps,
     hc_pre_eps,
 ):
-    """One token block: recombine, store once, 3-pass GEMM, collapse."""
+    """One token block: recombine, store once, GEMM, collapse."""
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
 
@@ -71,17 +68,7 @@ def _fused_kernel(
         streams_bf.append(new_bf)
 
     g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
-    dn = (((1,), (1,)), ((), ()))
-    acc = jax.lax.dot_general(
-        g_bf, fn_hi_ref[...], dn, preferred_element_type=jnp.float32
-    )
-    if gemm_precision == "highest":
-        acc = acc + jax.lax.dot_general(
-            g_bf, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
-        )
-        acc = acc + jax.lax.dot_general(
-            g_bf, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
-        )
+    acc = utils.dot_fn_chunks(g_bf, fn_ref[...], mixes_ref.shape[1])
     mixes_ref[...] = acc
     gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
     sqr = jnp.sum(gf * gf, axis=-1, keepdims=True)
@@ -140,7 +127,7 @@ def fused_post_pre_mixes(
             worst-case VMEM footprint (f32 old streams + bf16 blocks +
             the three resident bf16 fn chunks) near 12 MB at DeepSeek-V4
             shapes; 64 also fits.
-        gemm_precision: "highest" (3-pass exact decomposition, the
+        gemm_precision: "highest" (3-chunk exact decomposition, the
             default) or "default" (hi-chunk pass only; pre_mix and the
             collapse then also see the hi-only mixes).
 
@@ -170,7 +157,9 @@ def fused_post_pre_mixes(
     tb, padded_tokens = utils.select_token_block(num_tokens, token_block_size)
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
-    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
+    fn_chunks = utils.stack_fn3(fn)
+    if gemm_precision == "default":
+        fn_chunks = fn_chunks[:hc_mult3]
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
@@ -180,13 +169,11 @@ def fused_post_pre_mixes(
         disable_bounds_checks=True,
     )
 
-    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     new_res, mixes, sqrsum, layer2d = pl.pallas_call(
         functools.partial(
             _fused_kernel,
             hc_mult=hc_mult,
             hidden_size=hidden_size,
-            gemm_precision=gemm_precision,
             rms_eps=rms_eps,
             hc_pre_eps=hc_pre_eps,
         ),
@@ -196,9 +183,7 @@ def fused_post_pre_mixes(
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
-            resident,
-            resident,
-            resident,
+            pl.BlockSpec(fn_chunks.shape, lambda i: (0, 0)),
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
         ],
@@ -215,7 +200,7 @@ def fused_post_pre_mixes(
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
         ],
         compiler_params=compiler_params,
-    )(x2d, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
+    )(x2d, res2d, post2d, comb2d, fn_chunks, sc2d, hb2d)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],
