@@ -1170,6 +1170,62 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
         assert cls.__name__ == name
 
 
+@pytest.mark.parametrize(
+    ("over_tokens", "initial_cls", "expected_cls"),
+    [
+        (0, None, None),
+        (16384, None, "PrefillFirstScheduler"),
+        (16384, "PrefillFirstScheduler", "PrefillFirstScheduler"),
+    ],
+)
+def test_prefill_first_scheduler_is_installed_by_its_flags(
+    monkeypatch, over_tokens, initial_cls, expected_cls
+):
+    from vllm_torchtpu.core.experimental.prefill_first_scheduler import (
+        SCHEDULER_CLS,
+    )
+
+    def resolve(name):
+        return SCHEDULER_CLS if name == "PrefillFirstScheduler" else name
+
+    monkeypatch.setattr(
+        tpu_platform.envs, "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", over_tokens
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(scheduler_cls=resolve(initial_cls))
+    )
+
+    tpu_platform._configure_prefill_first_scheduler(vllm_config)
+
+    assert vllm_config.scheduler_config.scheduler_cls == resolve(expected_cls)
+
+
+def test_prefill_first_flags_refuse_another_scheduler(monkeypatch):
+    monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", 16384)
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            scheduler_cls="vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
+        )
+    )
+
+    with pytest.raises(ValueError, match="needs PrefillFirstScheduler"):
+        tpu_platform._configure_prefill_first_scheduler(vllm_config)
+
+
+def test_prefill_first_flags_name_the_dp_scheduler_as_the_conflict(monkeypatch):
+    monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", 16384)
+    monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", True)
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            scheduler_cls="vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
+        ),
+        parallel_config=SimpleNamespace(data_parallel_size=4),
+    )
+
+    with pytest.raises(ValueError, match="DP_SCHED_ENABLED=1 installs it"):
+        tpu_platform._configure_prefill_first_scheduler(vllm_config)
+
+
 def _device_left_unset():
     """Stop ``DeviceConfig`` building ``torch.device("tpu")`` off a TPU."""
     return patch.object(TpuPlatform, "uses_host_device_handling", return_value=True)
