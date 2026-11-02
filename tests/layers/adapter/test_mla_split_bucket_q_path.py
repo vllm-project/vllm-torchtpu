@@ -115,7 +115,7 @@ def test_overlap_reads_the_rope_cache_before_the_indexer():
     real = w.indexer.forward
 
     def indexer(*args, **kwargs):
-        events.append("indexer")
+        events.append(("indexer", None))
         return real(*args, **kwargs)
 
     def retain(out, *buffers):
@@ -127,4 +127,4 @@ def test_overlap_reads_the_rope_cache_before_the_indexer():
         _forward(w, hidden, positions, None)
     cache = w.rotary_emb.cos_sin_cache
     first = next(i for i, e in enumerate(events) if e[1] is cache)
-    assert first < events.index("indexer")
+    assert first < events.index(("indexer", None))

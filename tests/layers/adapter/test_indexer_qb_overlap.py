@@ -35,7 +35,10 @@ import torch
 from test_mla_rope_neox_permute import _inputs, _run, _wrapper  # noqa: E402
 
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
-from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import VllmTPUIndexer
+from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+    VllmTPUIndexer,
+    VllmTPUSparseAttnIndexer,
+)
 from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_WEIGHT,
@@ -184,3 +187,38 @@ def test_indexer_hands_the_op_q_c_and_the_q_b_weights():
     )
     assert out == ("topk", None)
     assert "qb_overlap" not in op.call_args.kwargs
+
+
+def test_dcp_op_serves_both_variants_from_one_function():
+    """With the q_b overlap the DCP indexer is ONE function over both jax ops:
+    the rank and lane operands it appends live in that function's closure,
+    so a bucket running either variant lifts them under the same name (the
+    bucket warmup hands buckets only between traces that do)."""
+    rank, lane = torch.zeros(1, dtype=torch.int32), torch.ones(1, dtype=torch.int32)
+    calls = []
+
+    def jax_op(qb):
+        def run(*args):
+            calls.append((qb, args))
+            cache = torch.full_like(args[2], 7)
+            return (cache, "topk", "q") if qb else (cache, "topk")
+
+        return run
+
+    stub = MagicMock()
+    stub._build_streamidx_dcp_jax_op = lambda d, i, qb_overlap: (
+        jax_op(qb_overlap),
+        rank,
+        lane,
+    )
+    op = VllmTPUSparseAttnIndexer._build_streamidx_dcp_op(stub, 16, 4, qb_overlap=True)
+    assert op.takes_qb
+    cache = torch.zeros(4)
+    args = ("q", "w", cache, "k", "s", "p", "c", "d")
+    assert op(*args) == "topk"
+    assert op(*args, qb=("x", "wq", "ws")) == ("topk", "q")
+    assert calls[0] == (False, (*args, rank, lane))
+    assert calls[1] == (True, (*args, "x", "wq", "ws", rank, lane))
+    assert torch.all(cache == 7)  # the op writes the new cache back
+    plain = VllmTPUSparseAttnIndexer._build_streamidx_dcp_op(stub, 16, 4)
+    assert not plain.takes_qb

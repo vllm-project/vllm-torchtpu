@@ -558,22 +558,17 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                     "once."
                 )
             assert parallel_config is not None
+            # TPU_INDEXER_QB_OVERLAP: the op also runs the MLA q_b projection
+            # under the SparseCore top-k (see `forward_oot`).
             self.topk_op_dcp = self._build_streamidx_dcp_op(
-                dcp_size, parallel_config.cp_kv_cache_interleave_size
+                dcp_size,
+                parallel_config.cp_kv_cache_interleave_size,
+                qb_overlap=envs.TPU_INDEXER_QB_OVERLAP,
             )
             self.topk_op_tp = None
             if envs.TPU_DCP_PREFILL_TOKEN_PARALLEL:
                 self.topk_op_tp = dcp_token_parallel_op.build_indexer_op(
                     self, dcp_token_parallel_op.layout_for(vllm_config)
-                )
-            # TPU_INDEXER_QB_OVERLAP: the same op, also running the MLA q_b
-            # projection under the SparseCore top-k (see `forward_oot`).
-            self.topk_op_dcp_qb = None
-            if envs.TPU_INDEXER_QB_OVERLAP:
-                self.topk_op_dcp_qb = self._build_streamidx_dcp_op(
-                    dcp_size,
-                    parallel_config.cp_kv_cache_interleave_size,
-                    qb_overlap=True,
                 )
 
     def _build_streamidx_op(self):
@@ -716,7 +711,39 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def _build_streamidx_dcp_op(
         self, dcp_size: int, interleave_size: int, qb_overlap: bool = False
     ):
-        """The DCP twin of `_build_streamidx_op`.
+        """The DCP indexer op: `op(*args)` for the top-k and, with `qb_overlap`
+        (TPU_INDEXER_QB_OVERLAP), `op(*args, qb=(x, w_q, w_s))` for the top-k
+        and the MLA q_b projection (`_build_streamidx_dcp_jax_op`). One
+        function serves both variants: the rank and lane operands are lifted
+        through its closure whichever variant a bucket runs, so the bucket
+        warmup's traces name them alike."""
+        jax_ops = {}
+        for qb in (False, True) if qb_overlap else (False,):
+            jax_ops[qb], rank_tensor, lane_tensor = self._build_streamidx_dcp_jax_op(
+                dcp_size, interleave_size, qb_overlap=qb
+            )
+
+        def op(*args, qb: tuple[torch.Tensor, ...] | None = None):
+            if qb is not None:
+                args = (*args, *qb)
+            if rank_tensor is not None:
+                args = (*args, rank_tensor)
+            if lane_tensor is not None:
+                args = (*args, lane_tensor)
+            new_cache, local_topk, *rest = jax_ops[qb is not None](*args)
+            args[2].copy_(new_cache)
+            if qb is not None:
+                return local_topk, rest[0]
+            return local_topk
+
+        op.takes_qb = qb_overlap  # type: ignore[attr-defined]
+        return op
+
+    def _build_streamidx_dcp_jax_op(
+        self, dcp_size: int, interleave_size: int, qb_overlap: bool = False
+    ):
+        """The DCP twin of `_build_streamidx_op`, as `(jax_op, rank operand,
+        lane operand)`; the operands are None unless the op takes them.
 
         DCP shards the KV cache and leaves the *queries*
         replicated, so there is no rank-major token packing to undo. Every
@@ -1096,18 +1123,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
         jax_op.register_fake(_fake_streamidx_topk_dcp)
 
-        def op(*args):
-            if rank_tensor is not None:
-                args = (*args, rank_tensor)
-            if lane_tensor is not None:
-                args = (*args, lane_tensor)
-            new_cache, local_topk, *rest = jax_op(*args)
-            args[2].copy_(new_cache)
-            if qb_overlap:
-                return local_topk, rest[0]
-            return local_topk
-
-        return op
+        return jax_op, rank_tensor, lane_tensor
 
     def forward_oot(
         self,
@@ -1168,10 +1184,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
         q_b_out = None
         num_rows = hidden_states.shape[0]
-        topk_op_dcp_qb = getattr(self, "topk_op_dcp_qb", None)
-        if qb_overlap is not None and topk_op_dcp_qb is not None:
+        if qb_overlap is not None and getattr(self.topk_op_dcp, "takes_qb", False):
             # Same op plus the MLA q_b projection, run under the top-k.
-            topk_indices, q_b_out = topk_op_dcp_qb(
+            topk_indices, q_b_out = self.topk_op_dcp(
                 q_values.view(torch.uint8),
                 weights,
                 kv_cache,
@@ -1180,7 +1195,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 page_indices,
                 cu_q_lens,
                 distribution,
-                *qb_overlap,
+                qb=qb_overlap,
             )
         elif getattr(
             self, "topk_op_tp", None

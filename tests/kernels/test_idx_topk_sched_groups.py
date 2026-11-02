@@ -171,7 +171,7 @@ def _topk_group_ids(monkeypatch, group, chunk_tokens=256):
         compression_ratio=1,
         dcp_size=DCP,
         interleave_size=4,
-        # As VllmTPUSparseAttnIndexer._build_streamidx_dcp_op builds it.
+        # As VllmTPUSparseAttnIndexer._build_streamidx_dcp_jax_op builds it.
         num_kv_pages_per_block=(2, 2, 2),
         num_queries_per_block=(1, 128, 128),
         chunk_tokens=chunk_tokens,

@@ -372,7 +372,9 @@ def test_indexer_dcp_op_schema(qb, rank, small_ag):
     ):
         if not rank:
             os.environ.pop("TPU_DCP_RANK_OPERAND", None)
-        mop.VllmTPUSparseAttnIndexer._build_streamidx_dcp_op(stub, 8, 4, qb_overlap=qb)
+        mop.VllmTPUSparseAttnIndexer._build_streamidx_dcp_jax_op(
+            stub, 8, 4, qb_overlap=qb
+        )
     op = f"streamidx_topk_dcp_{name}" + ("_qb" if qb else "")
     schema = getattr(torch.ops.pallas, op).default._schema
     print(schema)
