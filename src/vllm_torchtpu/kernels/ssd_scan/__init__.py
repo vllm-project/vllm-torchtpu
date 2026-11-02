@@ -14,9 +14,6 @@
 """Pallas TPU kernels for Mamba-2 Selective State Space (SSD) scan."""
 
 from vllm_torchtpu.kernels.ssd_scan.ssd_scan import (
-    _segsum_jax as _segsum_jax,
-)
-from vllm_torchtpu.kernels.ssd_scan.ssd_scan import (
     chunk_scan_pallas,
     chunk_state_pallas,
     ssd_minimal_discrete_hybrid,

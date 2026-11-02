@@ -174,11 +174,9 @@ def test_ssd_scan_validates_input_shapes():
 
     # chunk_scan_pallas shape validation
     with pytest.raises(ValueError, match="Expected 4D C_c"):
-        chunk_scan_pallas(C_c[0], states, decay_states, interpret=True)
+        chunk_scan_pallas(C_c[0], states, interpret=True)
     with pytest.raises(ValueError, match="Expected 4D states with shape"):
-        chunk_scan_pallas(C_c, states[:, :2], decay_states, interpret=True)
-    with pytest.raises(ValueError, match="Expected decay_states shape"):
-        chunk_scan_pallas(C_c, states, decay_states[..., 0], interpret=True)
+        chunk_scan_pallas(C_c, states[:, :2], interpret=True)
 
     # ssd_minimal_discrete_hybrid shape validation
     with pytest.raises(ValueError, match="Expected A_c shape"):
@@ -260,6 +258,18 @@ def test_ssd_scan_correctness(
     )
 
 
+def test_ssd_scan_defaults_start_one_sequence_from_zero_state():
+    X_c, A_c, B_c, C_c, last_chunk_indices, _, _ = _make_ssd_inputs(1, 64, 16, 4, 16, 8)
+    y_ref, final_state_ref = ssd_sequential_reference(
+        X_c, A_c, B_c, C_c, last_chunk_indices
+    )
+    y, final_state = ssd_minimal_discrete_hybrid(
+        X_c, A_c, B_c, C_c, last_chunk_indices, interpret=True
+    )
+    np.testing.assert_allclose(y, y_ref, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(final_state, final_state_ref, rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.parametrize(
     ("batch", "seqlen", "block_len", "n_heads", "d_head", "d_state"),
     [
@@ -286,10 +296,20 @@ def test_ssd_scan_bfloat16_inputs_preserve_float32_state_carry(
     states_c = chunk_state_pallas(B_c, decay_states, X_c, interpret=True)
     assert states_c.dtype == jnp.float32
 
-    y_out_pallas = chunk_scan_pallas(
-        C_c, states_c, jnp.exp(A_cumsum)[..., None], interpret=True
-    )
+    y_out_pallas = chunk_scan_pallas(C_c, states_c, interpret=True)
     assert y_out_pallas.dtype == jnp.bfloat16
+    y_out_expected = jnp.einsum(
+        "chln,chpn->chlp",
+        C_c.astype(jnp.float32),
+        states_c,
+        precision=jax.lax.Precision.HIGHEST,
+    ).astype(jnp.bfloat16)
+    np.testing.assert_allclose(
+        np.asarray(y_out_pallas.astype(jnp.float32)),
+        np.asarray(y_out_expected.astype(jnp.float32)),
+        rtol=1e-2,
+        atol=1e-2,
+    )
 
     y_ref, final_state_ref = ssd_sequential_reference(
         X_c, A_c, B_c, C_c, last_chunk_indices, initial_states, reset_mask

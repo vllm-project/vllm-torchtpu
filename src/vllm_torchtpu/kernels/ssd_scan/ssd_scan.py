@@ -24,9 +24,9 @@ from vllm_torchtpu.utils import largest_divisor
 
 # Maximum number of SSM heads blocked per Pallas grid step. At `head_block=8`,
 # `block_len=64`, `d_head=64`, and `d_state=128` (or even `block_len=256`),
-# double-buffered VMEM blocks for `B_c`/`C_c`, `X_c`/`out`, `states`, and the
-# 128-lane padded `(block_len, 1)` decay vector consume ~1.6 MiB (~5.5 MiB at
-# `block_len=256` in float32), fitting comfortably within TPU scoped VMEM.
+# double-buffered VMEM blocks for `B_c`/`C_c`, `X_c`/`out`, `states`, and
+# `chunk_state_pallas`'s 128-lane padded `(block_len, 1)` decay vector consume
+# ~1.6 MiB (~5.5 MiB at `block_len=256` in float32), fitting within scoped VMEM.
 _MAX_HEAD_BLOCK_SIZE = 8
 
 
@@ -141,7 +141,6 @@ def chunk_state_pallas(
 def chunk_scan_pallas(
     C_c: jax.Array,
     states: jax.Array,
-    decay_states: jax.Array,
     *,
     out_dtype: jax.typing.DTypeLike | None = None,
     interpret: bool = False,
@@ -149,12 +148,13 @@ def chunk_scan_pallas(
     """Pallas kernel for Step 4 of 4 of SSD scan (state-to-output conversion).
 
     Computes:
-      Y_off = jnp.einsum("chln,chpn,chl->chlp", C_c, states, decay_states[..., 0])
+      Y_off = jnp.einsum("chln,chpn->chlp", C_c, states)
+
+    The caller applies the per-position decay `exp(A_cumsum)` to the result.
 
     Args:
       C_c: (n_chunks, n_heads, block_len, d_state)
       states: (n_chunks, n_heads, d_head, d_state)
-      decay_states: (n_chunks, n_heads, block_len, 1)
       out_dtype: Output dtype; defaults to `C_c.dtype` when omitted.
       interpret: Run Pallas in host interpret mode (for CPU unit tests only).
 
@@ -176,19 +176,13 @@ def chunk_scan_pallas(
             f"({n_chunks}, {n_heads}, d_head, {d_state}), "
             f"got {states.shape}."
         )
-    if decay_states.shape != (n_chunks, n_heads, block_len, 1):
-        raise ValueError(
-            f"Expected decay_states shape {(n_chunks, n_heads, block_len, 1)}, "
-            f"got {decay_states.shape}."
-        )
     d_head = states.shape[-2]
     head_block = largest_divisor(n_heads, _MAX_HEAD_BLOCK_SIZE)
     resolved_out_dtype = jnp.dtype(C_c.dtype if out_dtype is None else out_dtype)
 
-    def kernel(C_ref, states_ref, decay_ref, out_ref):
+    def kernel(C_ref, states_ref, out_ref):
         C_val = jnp.squeeze(C_ref[...], axis=0).astype(jnp.float32)
         states_val = jnp.squeeze(states_ref[...], axis=0).astype(jnp.float32)
-        decay_val = jnp.squeeze(decay_ref[...], axis=0).astype(jnp.float32)
 
         # Keep Precision.HIGHEST so TPU Mosaic preserves the float32 inter-chunk
         # carry `states_val` during MXU contraction instead of truncating it to
@@ -201,8 +195,7 @@ def chunk_scan_pallas(
             precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
-        out = (prod * decay_val).astype(resolved_out_dtype)
-        out_ref[...] = jnp.expand_dims(out, axis=0)
+        out_ref[...] = jnp.expand_dims(prod.astype(resolved_out_dtype), axis=0)
 
     grid = (n_chunks, n_heads // head_block)
 
@@ -216,11 +209,6 @@ def chunk_scan_pallas(
             memory_space=pltpu.VMEM,
             index_map=lambda c, h_blk: (c, h_blk, 0, 0),
             block_shape=(1, head_block, d_head, d_state),
-        ),
-        pl.BlockSpec(
-            memory_space=pltpu.VMEM,
-            index_map=lambda c, h_blk: (c, h_blk, 0, 0),
-            block_shape=(1, head_block, block_len, 1),
         ),
     ]
 
@@ -246,7 +234,7 @@ def chunk_scan_pallas(
             ),
             interpret=interpret,
             name="ssd_chunk_scan_pallas",
-        )(C_c, states, decay_states),
+        )(C_c, states),
     )
 
 
@@ -391,17 +379,13 @@ def ssd_minimal_discrete_hybrid(
 
     # 4. State to output conversion (Pallas). Keep Y_off in float32 until it is
     # summed with Y_diag so opposite-sign terms do not suffer pre-cancellation
-    # bfloat16 rounding before the single output cast.
-    state_decay_out = jnp.exp(A_cumsum)[..., None]
+    # bfloat16 rounding before the single output cast. The decay from the chunk
+    # start is applied here, where XLA fuses it into the sum.
     Y_off = chunk_scan_pallas(
-        C_c,
-        states_incoming,
-        state_decay_out,
-        out_dtype=jnp.float32,
-        interpret=interpret,
+        C_c, states_incoming, out_dtype=jnp.float32, interpret=interpret
     )
-
-    Y = (Y_diag.astype(jnp.float32) + Y_off).astype(X_c.dtype)
+    state_decay_out = jnp.exp(A_cumsum)[..., None]
+    Y = (Y_diag.astype(jnp.float32) + Y_off * state_decay_out).astype(X_c.dtype)
 
     # Extract final states for each sequence using `last_chunk_indices`. In
     # static-shape ragged batches (`mamba_mixer2.py`), inactive/padded sequence
