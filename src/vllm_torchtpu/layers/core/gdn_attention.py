@@ -1262,6 +1262,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    recurrent_state_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN PCP prefill over the unified block pool.
 
@@ -1428,6 +1429,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
             d_v=d_v,
             kernel_size=kernel_size,
             pool_block_tokens=pool_block_tokens,
+            recurrent_state_dtype=recurrent_state_dtype,
         )
 
         seq_output_shard = seq_output_shard.reshape(
