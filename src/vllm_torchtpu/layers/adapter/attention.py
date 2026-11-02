@@ -221,6 +221,56 @@ def _reshape_packed_kv_cache(kv_cache: jax.Array, shape: tuple[int, ...]) -> jax
     return packed.reshape(packed_shape).transpose(1, 2, 3, 0, 4)
 
 
+def native_kv_cache_view(
+    kv_cache: jax.Array,
+    num_kv_heads: int,
+    head_dim: int,
+    kv_layout: batched_rpa_configs.KVLayout | None,
+) -> tuple[jax.Array, int, Callable[[jax.Array], jax.Array]]:
+    """A layer's KV cache as the kernel's native pages.
+
+    A 4-D shared packed pool `[num_blocks, block_size, kv_packing,
+    words_per_token]` is viewed as this layer's native pages; any other cache
+    is already native. Returns the native view, the native pages per cache
+    block (block table entries scale by it) and the inverse of the view.
+    """
+    if kv_cache.ndim != 4:
+        return kv_cache, 1, lambda native: native
+    pool_shape = kv_cache.shape
+    if kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE and head_dim != 64:
+        native_shape = rpa_batched_wrapper.get_kv_cache_shape(
+            total_num_pages=1,
+            page_size=pool_shape[1],
+            actual_num_kv_heads=num_kv_heads,
+            actual_head_dim=head_dim,
+            kv_dtype=kv_cache.dtype,
+            kv_layout=kv_layout,
+            chip_version=get_chip_version(),
+        )
+    else:
+        native_shape = PallasAttentionBackend.get_kv_cache_shape(
+            1,
+            pool_shape[1],
+            num_kv_heads,
+            head_dim,
+            pallas.pallas.JAX_TO_TORCH_DTYPE_MAP[kv_cache.dtype],
+        )
+    native_page_elements = math.prod(native_shape[1:])
+    # A padded pool page can span several of this layer's native pages.
+    page_stride = math.prod(pool_shape[1:]) // native_page_elements
+    packing = native_shape[3]
+    packed_pool_shape = (pool_shape[0], pool_shape[1], 1, packing, pool_shape[3])
+    native = _reshape_packed_kv_cache(
+        kv_cache.reshape(packed_pool_shape),
+        (pool_shape[0] * page_stride, *native_shape[1:]),
+    )
+
+    def restore(native: jax.Array) -> jax.Array:
+        return _reshape_packed_kv_cache(native, packed_pool_shape).reshape(pool_shape)
+
+    return native, page_stride, restore
+
+
 def _pallas_rpa_kernel_impl(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -253,38 +303,11 @@ def _pallas_rpa_kernel_impl(
     # zero-copy bitcasts on the donated buffer, preserving in-place updates.
     if block_major:
         kv_cache = kernel_view(kv_cache)
-    packed_pool_shape = None
-    if kv_cache.ndim == 4:
-        if (
-            kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-            and query.shape[2] != 64
-        ):
-            native_shape = rpa_batched_wrapper.get_kv_cache_shape(
-                total_num_pages=1,
-                page_size=pool_shape[1],
-                actual_num_kv_heads=key.shape[1],
-                actual_head_dim=query.shape[2],
-                kv_dtype=kv_cache.dtype,
-                kv_layout=kv_layout,
-                chip_version=get_chip_version(),
-            )
-        else:
-            native_shape = PallasAttentionBackend.get_kv_cache_shape(
-                1,
-                pool_shape[1],
-                key.shape[1],
-                query.shape[2],
-                pallas.pallas.JAX_TO_TORCH_DTYPE_MAP[kv_cache.dtype],
-            )
-        native_page_elements = math.prod(native_shape[1:])
-        # A padded pool page can span several of this layer's native pages.
-        page_stride = math.prod(pool_shape[1:]) // native_page_elements
-        packing = native_shape[3]
-        packed_pool_shape = (pool_shape[0], pool_shape[1], 1, packing, pool_shape[3])
-        kv_cache = _reshape_packed_kv_cache(
-            kv_cache.reshape(packed_pool_shape),
-            (pool_shape[0] * page_stride, *native_shape[1:]),
-        )
+    # A block-major pool is never 4-D, so this leaves it as folded above.
+    kv_cache, page_stride, restore_pool = native_kv_cache_view(
+        kv_cache, key.shape[1], query.shape[2], kv_layout
+    )
+    if page_stride != 1:
         block_tables = block_tables * page_stride
     metadata = AttentionMetadata(
         # NOTE: vLLM applies RoPE before attention,
@@ -316,12 +339,7 @@ def _pallas_rpa_kernel_impl(
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
     )
-    if len(pool_shape) == 4:
-        # A 4-D pool is never block-major, so the ndim == 4 branch set this.
-        assert packed_pool_shape is not None
-        new_kv_cache = _reshape_packed_kv_cache(
-            new_kv_cache, packed_pool_shape
-        ).reshape(pool_shape)
+    new_kv_cache = restore_pool(new_kv_cache)
     if block_major:
         new_kv_cache = new_kv_cache.reshape(pool_shape)
     return new_kv_cache, outputs
