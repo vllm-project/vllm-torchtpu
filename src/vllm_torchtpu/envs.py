@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: int = 1
     TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = True
     TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: int = 4
+    TPU_MLA_FUSED_XCHG_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MIB: int = 32
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
@@ -750,6 +751,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS": env_int(
         "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", 4
     ),
+    # With TPU_MLA_FUSED_SMALL_A2A and _MERGE: buckets above the decode step
+    # ("step8") and up to this many tokens also run the exchange and the merge
+    # in the kernel, over its 8-token grid steps (each step's partial rows
+    # pushed right after its body, the merge in the last step), instead of
+    # the kernel then the small all-to-all with merge. Their scoped VMEM is
+    # TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB with only the gathered KV pinned, unless
+    # TPU_MLA_FUSED_SMALL_A2A_BUCKETS lists them. 0 = off.
+    "TPU_MLA_FUSED_XCHG_MAX_TOKENS": env_int("TPU_MLA_FUSED_XCHG_MAX_TOKENS", 0),
     # DCP sparse MLA buckets of at most this many tokens that return the
     # partial and its lse to the merge (no send layout, one chunk, no merge
     # pieces; the 64-token decode bucket): the kernel writes both into VMEM

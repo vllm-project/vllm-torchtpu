@@ -1099,7 +1099,10 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
     small-chunk path; buckets above the step and within the small
     all-to-all's cap keep the small all-to-all after the kernel. The cap is
     the one that applies at this DCP size (`dcp_mla_topk_cap`: the auto
-    default caps only at DCP >= 8)."""
+    default caps only at DCP >= 8). With TPU_MLA_FUSED_XCHG_MAX_TOKENS (and
+    _MERGE) the cap rises to it, within the small all-to-all's cap: buckets
+    above the step run the exchange and the merge over the kernel's grid
+    steps."""
     from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
     from vllm_torchtpu.layers.core.attention_interface import dcp_mla_topk_cap
 
@@ -1121,10 +1124,19 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
             v.strip() for v in (value or "").split(",") if v.strip() and v != "0"
         )
     )
-    cap = min(
-        envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS,
-        sparse_kernel.decode_step_tokens(levers),
-    )
+    step = sparse_kernel.decode_step_tokens(levers)
+    cap = min(envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS, step)
+    if (
+        step
+        and envs.TPU_MLA_FUSED_XCHG_MAX_TOKENS
+        and envs.TPU_MLA_FUSED_SMALL_A2A_MERGE
+    ):
+        steps_cap = min(
+            envs.TPU_MLA_FUSED_XCHG_MAX_TOKENS,
+            envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS,
+            sparse_kernel.FUSED_PREP_MAX_TOKENS,
+        )
+        cap = max(cap, steps_cap)
     return bool(
         cap
         and dcp_mla_topk_cap(dcp_size)
