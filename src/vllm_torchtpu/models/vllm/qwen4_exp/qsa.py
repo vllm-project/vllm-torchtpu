@@ -530,7 +530,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             )
         self._dcp_op = None
         self._token_shard_dcp_op = None
-        if self.main_kv_dcp > 1:
+        main_kv_dcp = getattr(self, "main_kv_dcp", 1)
+        if main_kv_dcp > 1:
             if self._select_op is not None:
                 raise ValueError(
                     "VLLM_TPU_QSA_MAIN_KV_DCP and VLLM_TPU_MEGAKERNEL cannot "
@@ -545,9 +546,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 build_pooled_qsa_token_shard_dcp_op,
             )
 
-            pair = main_kv_dcp_group(self.main_kv_dcp)
+            pair = main_kv_dcp_group(main_kv_dcp)
             self._dcp_op = partial(
-                build_pooled_qsa_dcp_op(pair, self.main_kv_dcp), **keywords
+                build_pooled_qsa_dcp_op(pair, main_kv_dcp), **keywords
             )
             compressed = bool(envs.VLLM_TPU_QSA_COMPRESSED_DCP)
             if compressed:
@@ -557,7 +558,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
 
                 # VLLM_TPU_QSA_COMPRESSED_DCP: owned-group scoring, pair merge.
                 self._dcp_op = partial(
-                    build_pooled_qsa_compressed_dcp_op(pair, self.main_kv_dcp),
+                    build_pooled_qsa_compressed_dcp_op(pair, main_kv_dcp),
                     kv_heads=self.num_kv_heads,
                     **keywords,
                 )
@@ -571,7 +572,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 def draft(shared, with_rows):
                     return partial(
                         build_pooled_qsa_draft_dcp_op(
-                            pair, self.main_kv_dcp, shared=shared, with_rows=with_rows
+                            pair, main_kv_dcp, shared=shared, with_rows=with_rows
                         ),
                         dcp_rank=self.dcp_rank,
                         **({"compressed_dcp": True} if compressed and shared else {}),
@@ -596,7 +597,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                         build_pooled_qsa_token_shard_compressed_dcp_op as build,
                     )
                 self._token_shard_dcp_op = partial(
-                    build(get_tp_group(), pair, self.main_kv_dcp),
+                    build(get_tp_group(), pair, main_kv_dcp),
                     kv_heads=self.num_kv_heads,
                     **keywords,
                 )
@@ -605,11 +606,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         # keeps the replicated indexer: it cannot pick per bucket.
         if (
             envs.VLLM_TPU_QSA_INDEXER_SHARD
-            and self.tp_size > 1
+            and getattr(self, "tp_size", 1) > 1
             and not (self.single_graph and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP)
             # The key-sharded ops attend whole main-KV pages; under DCP they
             # would take a DCP draft's rows path.
-            and self.main_kv_dcp == 1
+            and main_kv_dcp == 1
         ):
             from vllm.distributed import get_tp_group
 
