@@ -45,6 +45,7 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
+    dp_lockstep_num_reqs,
     iter_mtp_shared_heads,
     maybe_share_embeddings,
     maybe_share_lm_head,
@@ -465,10 +466,8 @@ class Eagle3Proposer:
         # max_num_batched_tokens >= max_num_seqs to hold: if it does not, the
         # compaction store and the loop-step read both run off the end of the
         # buffer.
-        # `_loop_bucket` is the same function with a DP-lockstep branch that
-        # is a no-op at this input (it clamps num_reqs up to max_num_reqs,
-        # which is what is already being asked for), so call the padding
-        # helper straight and keep load-time out of `_draft_has_moe`.
+        # Call the padding helper straight: `_loop_bucket`'s DP-lockstep branch
+        # needs per-step state and `_draft_has_moe`, neither valid at load time.
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
 
         required_rows = _get_padded_token_len(
@@ -2234,7 +2233,7 @@ class Eagle3Proposer:
 
         runner = self.runner
         if self._dp_lockstep_sharded():
-            num_reqs = runner.max_num_reqs
+            num_reqs = dp_lockstep_num_reqs(runner._dp_step_max_reqs, num_reqs)
         return _get_padded_token_len(runner.num_tokens_paddings, num_reqs)
 
     def _precompile_combine_hidden_states(self) -> None:
@@ -2405,7 +2404,10 @@ class Eagle3Proposer:
             num_reqs=num_reqs,
             aux_hidden_states=[],
         )
-        p = self._loop_bucket(num_reqs)
+        # A padding chunk has no real requests; its loop step must stay within
+        # the peers' coordinated bucket p, which can be below num_reqs.
+        p = self._loop_bucket(0)
+        loop_num_reqs = min(actual_num_reqs, p)
         draft_hidden = self._draft_hidden_size()
         dtype = runner._hidden_states_dtype
         # Mirror propose()'s branch exactly: only eagle3 runs the plain
@@ -2451,10 +2453,10 @@ class Eagle3Proposer:
             ),
             # Loop-step metadata mirrors propose()'s per-chunk loop tensors.
             loop_query_start_loc=torch.from_numpy(
-                np.minimum(np.arange(num_reqs + 1, dtype=np.int32), actual_num_reqs)
+                np.minimum(np.arange(num_reqs + 1, dtype=np.int32), loop_num_reqs)
             ).to(runner.device),
             loop_request_distribution=torch.tensor(
-                [actual_num_reqs] * 3, dtype=torch.int32, device=runner.device
+                [loop_num_reqs] * 3, dtype=torch.int32, device=runner.device
             ),
             combine_aux=combine_aux,
             combine_plain=combine_plain,
