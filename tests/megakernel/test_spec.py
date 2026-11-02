@@ -317,3 +317,24 @@ def test_kernel_per_module_profiling_scopes(monkeypatch):
 
     s_l3, _ = _trace_scopes(3)
     assert {"scoped_mod/emit", "inner_l2", "inner_l3", "dwait"} <= set(s_l3)
+
+
+def test_resolve_pool_layout_from_standalone_model_spec():
+    """`cache._resolve_pool_layout` falls back to `ms.cache_backend.layout`."""
+    from tests.megakernel.megakernel_fakes import make_fake_model_spec
+    from vllm_torchtpu.megakernel import cache, pool
+
+    play = pool.derive_pool_layout(
+        [decls.KVCacheDecl(hd=256, kvh=1, page_size=128)], R=2
+    )
+    pb = pool.make_pool_backend(play)
+    ms = dataclasses.replace(
+        make_fake_model_spec(L=1, att_every=1),
+        name="unregistered_standalone_spec",
+        cache_backend=pb,
+    )
+    ex = ExecSpec(B=4, T=1, R=2, ctx=256)
+    assert cache._resolve_pool_layout(ms, ex) is play
+    pt, ckpt, roff, min_pages = cache.default_pool_layout(ms, ex)
+    assert pt.shape == (4, 2) and ckpt.shape == (1, 4, 1) and roff.shape == (1, 4)
+    assert min_pages >= 8
