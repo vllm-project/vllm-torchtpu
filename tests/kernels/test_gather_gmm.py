@@ -165,3 +165,40 @@ def test_gather_combine_matches_reference():
         acc = acc + prod.astype(jnp.bfloat16).astype(jnp.float32)
     want = acc.astype(jnp.bfloat16)
     np.testing.assert_array_equal(np.asarray(out), np.asarray(want))
+
+
+def test_routed_moe_end_to_end():
+    """Routing permutation -> gather_fused_moe -> gather_combine vs the reference."""
+    tokens, experts, topk, hidden, inter = 64, 8, 4, 768, 128
+    kx, kr, kw = jax.random.split(jax.random.PRNGKey(3), 3)
+    x = jax.random.normal(kx, (tokens, hidden)).astype(jnp.bfloat16)
+    token_ids, group_sizes, positions, weights = _routing(
+        kr, tokens, experts, topk, 0.3
+    )
+    w1, w1s, w2, w2s = _weights(kw, experts, hidden, inter)
+    rows = G.gather_fused_moe(
+        G.pack_rows(x),
+        token_ids,
+        group_sizes,
+        w1,
+        w1s,
+        w2,
+        w2s,
+        act="gelu_tanh",
+        tile_m=64,
+        height_step=32,
+        vmem_limit_bytes=_VMEM,
+        interpret=True,
+    )
+    out = G.gather_combine(
+        rows, positions, weights, hidden_size=hidden, tile_tokens=16, interpret=True
+    )
+    y = _reference(x, token_ids, group_sizes, w1, w1s, w2, w2s, "gelu_tanh")
+    gathered = (
+        y[positions.reshape(-1)].reshape(tokens, topk, hidden).astype(jnp.float32)
+    )
+    acc = jnp.zeros((tokens, hidden), jnp.float32)
+    for k in range(topk):
+        prod = gathered[:, k] * weights[:, k : k + 1].astype(jnp.float32)
+        acc = acc + prod.astype(jnp.bfloat16).astype(jnp.float32)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(acc.astype(jnp.bfloat16)))

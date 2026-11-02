@@ -362,10 +362,10 @@ def gather_fused_moe(
     x_packed: jax.Array,  # uint32 [tokens * S, 128] (pack_rows)
     token_indices_sorted: jax.Array,  # int32 [rows]
     group_sizes: jax.Array,  # int32 [E]
-    w1: jax.Array,  # fp8 [E, H, 2I]
-    w1_scale: jax.Array,  # f32 [E, 1, 1, 2I] or [E, 1, 2I]
+    w1: jax.Array,  # fp8 [E, H, 2I]: gate columns [0, I), up columns [I, 2I)
+    w1_scale: jax.Array,  # f32 per-channel [E, 1, 1, 2I] or [E, 1, 2I]
     w2: jax.Array,  # fp8 [E, I, H]
-    w2_scale: jax.Array,  # f32 [E, 1, 1, H] or [E, 1, H]
+    w2_scale: jax.Array,  # f32 per-channel [E, 1, 1, H] or [E, 1, H]
     *,
     act: str,
     tile_m: int = 512,
@@ -377,7 +377,9 @@ def gather_fused_moe(
 
     Row ``r`` is the down projection of token ``token_indices_sorted[r]``
     through the expert that owns sorted position ``r`` (``group_sizes`` gives
-    each expert's contiguous run of sorted positions).
+    each expert's contiguous run of sorted positions and must sum to
+    ``len(token_indices_sorted)``). ``w1`` holds gate and up as contiguous
+    halves, the layout gmm_v2's fused-activation path reads.
     """
     num_experts, hidden, n1 = w1.shape
     inter = n1 // 2

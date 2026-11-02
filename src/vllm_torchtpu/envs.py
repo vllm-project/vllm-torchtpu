@@ -74,6 +74,8 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    TPU_MOE_GATHER_GMM: bool = False
+    TPU_MOE_GATHER_GMM_MIN_TOKENS: int = 1024
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -679,6 +681,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the original GMM path. This counts tokens, not tokens * topk.
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
+    ),
+    # Non-EP MoE with FP8 per-channel weights: run the experts with the
+    # gather-fused kernels (kernels/megablox/gather_gmm.py) instead of the
+    # routed-row gather, two gmm_v2 calls and the gather + top-k sum, so the
+    # [tokens * topk, hidden] permuted activations never reach HBM. Applies to
+    # batches of at least TPU_MOE_GATHER_GMM_MIN_TOKENS tokens; smaller
+    # batches and unsupported layouts keep the grouped-matmul path.
+    "TPU_MOE_GATHER_GMM": env_bool("TPU_MOE_GATHER_GMM"),
+    "TPU_MOE_GATHER_GMM_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_GATHER_GMM_MIN_TOKENS", 1024
     ),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
