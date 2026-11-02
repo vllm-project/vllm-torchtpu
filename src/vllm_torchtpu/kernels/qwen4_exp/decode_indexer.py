@@ -36,6 +36,21 @@ def _request_bounds(starts, distribution, tokens):
     )
 
 
+def _prefill_visible_groups(starts, context, tokens, ratio):
+    """Count complete causal groups, excluding empty requests and padded rows."""
+    rows = jnp.arange(tokens, dtype=jnp.int32)
+    owners = jnp.minimum(
+        jnp.sum(rows[:, None] >= starts[None, 1:], axis=1), len(context) - 1
+    )
+    lengths = context[owners] + rows - starts[owners] + 1
+    return jnp.where(rows < starts[-1], jnp.maximum(lengths // ratio, 0), 0)
+
+
+def _enumerate_groups(visible, block_topk):
+    groups = jnp.arange(block_topk, dtype=jnp.int32)[None, :]
+    return jnp.where(groups < visible[:, None], groups, -1)
+
+
 def decode_query_chunk_size(pages_per_query: int) -> int:
     """Bound scalar-prefetched page tables with room for scoring metadata."""
     if pages_per_query < 1:
@@ -185,24 +200,36 @@ def select_index_blocks(
 
     def select_chunk(q, lens, req):
         size = len(q)
-        return streamindex_topk(
-            q,
-            jnp.full(q.shape[:2], scale, jnp.float32),
-            cache,
-            lens,
-            table[req].reshape(-1),
-            jnp.arange(size + 1, dtype=jnp.int32),
-            jnp.full((3,), size, jnp.int32),
-            k=block_topk,
-            compression_ratio=ratio,
-            num_kv_pages_per_block=max(1, 256 // page_size),
-            num_queries_per_block=1,
-            decode_req_batch_size=8 if size >= 8 else 4,
-            enable_early_exit=True,
-            components=qsa_indexing(),
-            topk_backend=topk_backend,
-            scheduling_group_namespace=scheduling_group_namespace,
-            **resource_options,
+
+        def score(_):
+            return streamindex_topk(
+                q,
+                jnp.full(q.shape[:2], scale, jnp.float32),
+                cache,
+                lens,
+                table[req].reshape(-1),
+                jnp.arange(size + 1, dtype=jnp.int32),
+                jnp.full((3,), size, jnp.int32),
+                k=block_topk,
+                compression_ratio=ratio,
+                num_kv_pages_per_block=max(1, 256 // page_size),
+                num_queries_per_block=1,
+                decode_req_batch_size=8 if size >= 8 else 4,
+                enable_early_exit=True,
+                components=qsa_indexing(),
+                topk_backend=topk_backend,
+                scheduling_group_namespace=scheduling_group_namespace,
+                **resource_options,
+            )
+
+        if not default_backend:
+            return score(None)
+        visible = jnp.maximum(lens // ratio, 0)
+        return jax.lax.cond(
+            jnp.all(visible <= block_topk),
+            lambda _: _enumerate_groups(visible, block_topk),
+            score,
+            None,
         )
 
     def per_query():
@@ -230,7 +257,7 @@ def select_index_blocks(
     if prefix_capacity is None and default_backend:
         prefix_capacity = max(block_topk, (batch + ratio - 1) // ratio)
 
-    def prefill_query(q, cu, history):
+    def score_prefill(q, cu, history):
         counts = cu[1:] - cu[:-1]
         num_seqs = jnp.max(
             jnp.where(counts > 0, jnp.arange(len(counts), dtype=jnp.int32) + 1, 0)
@@ -255,6 +282,49 @@ def select_index_blocks(
             topk_backend=topk_backend,
             scheduling_group_namespace=scheduling_group_namespace,
             **resource_options,
+        )
+
+    def prefill_query(q, cu, history):
+        if not default_backend:
+            return score_prefill(q, cu, history)
+        visible = _prefill_visible_groups(cu, history, len(q), ratio)
+
+        def score_suffix(_):
+            prefix = block_topk * ratio
+            if len(q) <= prefix:
+                return score_prefill(q, cu, history)
+
+            # Full and suffix routes share one score body. Request metadata
+            # excludes padded rows and preserves each window's causal history.
+            window = max(prefix, len(q) - prefix)
+            padded_tokens = (len(q) + window - 1) // window * window
+            padded_query = jnp.pad(q, ((0, padded_tokens - len(q)), (0, 0), (0, 0)))
+            first = jnp.where(jnp.all(visible[:prefix] <= block_topk), prefix, 0)
+            output = jnp.full((padded_tokens, block_topk), -1, jnp.int32)
+            output = jax.lax.dynamic_update_slice(
+                output, _enumerate_groups(visible[:prefix], block_topk), (0, 0)
+            )
+
+            def score_window(index, output):
+                offset = first + index * window
+                local_starts = jnp.clip(cu - offset, 0, window)
+                progress = jnp.clip(offset - cu[:-1], 0, cu[1:] - cu[:-1])
+                query_window = jax.lax.dynamic_slice_in_dim(
+                    padded_query, offset, window
+                )
+                selected = score_prefill(query_window, local_starts, history + progress)
+                return jax.lax.dynamic_update_slice(output, selected, (offset, 0))
+
+            output = jax.lax.fori_loop(
+                0, (len(q) - first + window - 1) // window, score_window, output
+            )
+            return output[: len(q)]
+
+        return jax.lax.cond(
+            jnp.all(visible <= block_topk),
+            lambda _: _enumerate_groups(visible, block_topk),
+            score_suffix,
+            None,
         )
 
     def mixed():

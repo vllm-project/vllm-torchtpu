@@ -331,8 +331,7 @@ def qsa_attention(
 
     positions = jnp.arange(tokens, dtype=jnp.int32)
     suffix = (positions >= prefix_tokens) & (positions < active_tokens)
-    # Schedule both request segments. The leaves bound attention work using
-    # their live metadata; neither segment owns or updates the written cache.
+    # Neither request segment owns or updates the written cache.
     prefill, _ = _prefill_attention(
         query,
         gate,
@@ -343,17 +342,22 @@ def qsa_attention(
         jnp.clip(starts, prefix_tokens, active_tokens),
         **options,
     )
-    output, _ = rpa_attention(
-        query,
-        gate,
-        blocks,
-        jnp.where(positions < prefix_tokens, lengths, 0),
-        table,
-        cache,
-        active_tokens=prefix_tokens,
-        initial_output=prefill,
-        **options,
-    )
+
+    def decode(_: None) -> jax.Array:
+        output, _cache = rpa_attention(
+            query,
+            gate,
+            blocks,
+            jnp.where(positions < prefix_tokens, lengths, 0),
+            table,
+            cache,
+            active_tokens=prefix_tokens,
+            initial_output=prefill,
+            **options,
+        )
+        return output
+
+    output = jax.lax.cond(prefix_tokens == 0, lambda _: prefill, decode, None)
     return output, cache
 
 
