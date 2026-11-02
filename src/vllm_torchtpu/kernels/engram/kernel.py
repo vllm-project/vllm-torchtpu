@@ -168,10 +168,22 @@ def fused_engram(
                         tokens * raw_words + first * scale_words, vector_m * scale_words
                     )
                 ]
-                embedded = dequantize_rows(
-                    raw.reshape(vector_m, raw_words),
-                    scales.reshape(vector_m, scale_words),
+                # Put packed bytes on the sublane axis before widening them;
+                # appending a trailing size-4 axis is not a legal TPU layout.
+                raw_bytes = pltpu.bitcast(
+                    raw.reshape(vector_m, raw_words).T, jnp.uint8
+                ).T
+                scale_bytes = pltpu.bitcast(
+                    scales.reshape(vector_m, scale_words).T, jnp.uint8
+                ).T
+                values = pltpu.bitcast(raw_bytes, jnp.float8_e4m3fn).astype(jnp.float32)
+                block = embedding_block_size
+                powers = jax.lax.bitcast_convert_type(
+                    scale_bytes.astype(jnp.int32) << 23, jnp.float32
                 )
+                power = jnp.repeat(powers, block, axis=1)
+                invalid = jnp.repeat(scale_bytes == 255, block, axis=1)
+                embedded = jnp.where(invalid, 0.0, values * power).astype(jnp.bfloat16)
                 quantized, activation_scale = quantize_tensor(embedded, weight.dtype)
                 tile = pl.ds(index * vector_m, vector_m)
                 x_scratch[tile, :] = quantized
