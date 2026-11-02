@@ -1,0 +1,62 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: CI Command
+
+# Handles `/ci` (`precheck`, `run`, `merge`, `cancel`, `help`) PR comments and
+# posts a one-time CI guide on ready PRs. Only `.github/scripts` from the default
+# branch is checked out (never PR code), and untrusted event fields use `env`.
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, ready_for_review]
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  ci-command:
+    name: Handle /ci command
+    if: >-
+      github.repository == 'vllm-project/vllm-torchtpu' &&
+      ((github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        github.event.sender.type != 'Bot' &&
+        contains(github.event.comment.body, '/ci')) ||
+       (github.event_name == 'pull_request_target' &&
+        !github.event.pull_request.draft &&
+        github.event.pull_request.user.type != 'Bot'))
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Run /ci handler
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILDKITE_API_TOKEN: ${{ github.event_name == 'issue_comment' && secrets.BUILDKITE_API_TOKEN || '' }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          ACTOR_LOGIN: ${{ github.event.comment.user.login || github.event.pull_request.user.login }}
+          ACTOR_TYPE: ${{ github.event.comment.user.type || github.event.pull_request.user.type }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: python3 .github/scripts/ci_command.py
