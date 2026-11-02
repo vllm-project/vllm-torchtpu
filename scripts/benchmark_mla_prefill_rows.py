@@ -613,40 +613,29 @@ def today_block(st, o, w, caches, x, md):
     return y, (nope, rope_c, icache), (lat, topk_t)
 
 
-def rows_geom(dcp):
-    return ro.PackedOProj(
-        shards=dcp,
-        k_shard=HEADS * VH // dcp,
-        n_out=HID,
-        heads=HEADS // dcp,
-        kv_lora_rank=KVL,
-        v_head_dim=VH,
-    )
-
-
 GATHERS = ("allgather", "ring")
 
 
 def prefetch(st, w, after, gather="allgather"):
-    """Gather a layer's o_proj / W_UV shards, starting once `after` exists:
-    one all-gather (offloaded to the SparseCores) or collective-permutes
-    around a ring of the slice (TensorCore DMAs)."""
-    geom = rows_geom(st.dcp)
+    """Gather a layer's o_proj / W_UV / o_proj scale shards, starting once
+    `after` exists: one all-gather (offloaded to the SparseCores) or
+    collective-permutes around a ring of the slice (TensorCore DMAs)."""
     ring = ro.ring_order(st.mesh.devices.reshape(-1))
 
     def local(wo, uv, so, after):
         return ro.gather_shards(
-            geom, wo, uv, so[0], after, AX, ring if gather == "ring" else None
+            wo, uv, so[0], after, AX, ring if gather == "ring" else None
         )
 
-    return _smap(local, st.mesh, (P(AX),) * 4, P())(w["o"], w["uv"], w["so"], after)
+    return _smap(local, st.mesh, (P(AX),) * 4, (P(),) * 3)(
+        w["o"], w["uv"], w["so"], after
+    )
 
 
 def rows_block(st, o, w, caches, x, md, gathered):
-    """The split on own rows; `gathered` is `prefetch`'s buffer."""
+    """The split on own rows; `gathered` is `prefetch`'s shards."""
     mesh, dcp, s, rows = st.mesh, st.dcp, SPLIT, st.rows
     lay = dataclasses.replace(st.lay, rows_aligned=True)
-    geom = rows_geom(dcp)
     nope, rope_c, icache = caches
 
     def prep(x, pos, w):
@@ -687,18 +676,16 @@ def rows_block(st, o, w, caches, x, md, gathered):
     )
     nope, rope_c, lat = o["tp_attend"](lay, nope, rope_c, ql, qpe, kv, kpe, topk, md)
 
-    def out(head, lat, gathered):
+    def out(head, lat, w_o, w_uv, w_scale):
         rank = _rank(dcp)
         head = lax.all_gather(head, AX, axis=1, tiled=True)  # [S, H, KVL]
         first = jnp.where(rank == 0, head, lat[:s])
         lat = lax.dynamic_update_slice(lat, first, (0, 0, 0))
-        # Unpack once this layer's attention is out (a row of it: no layout
-        # constraint on the rest).
-        w_o, w_uv, w_scale = ro.unpack(geom, gathered, lat[0, 0])
-        y = ro.rows_oproj(lat, w_uv, w_o, w_scale, k_shard=geom.k_shard)
-        return y, lat
+        return ro.rows_oproj(lat, w_uv, w_o, w_scale), lat
 
-    y, lat = _smap(out, mesh, (P(AX), P(AX), P()), (P(AX), P(AX)))(head, lat, gathered)
+    y, lat = _smap(out, mesh, (P(AX), P(AX)) + (P(),) * 3, (P(AX), P(AX)))(
+        head, lat, *gathered
+    )
     return y, (nope, rope_c, icache), (lat, topk)
 
 
@@ -707,18 +694,22 @@ def rows_block(st, o, w, caches, x, md, gathered):
 # ---------------------------------------------------------------------------
 
 
-def make_moe(mesh, kind):
+def make_moe(mesh, kind, avals=False):
     """What runs between two attention blocks: nothing, a TensorCore-only
-    stand-in, or the served MoE split (scripts/benchmark_moe_prefill_sp.py)."""
+    stand-in, or the served MoE split (scripts/benchmark_moe_prefill_sp.py).
+    With `avals`, the weights as abstract values (`--aot`)."""
     if kind == "none":
         return None, None
+    build = jax.eval_shape if avals else (lambda f: f())
     if kind == "standin":
-        w = jax.jit(
-            lambda: (
-                jax.random.normal(jax.random.key(7), (HID, HID)) * HID**-0.5
-            ).astype(jnp.bfloat16),
-            out_shardings=NamedSharding(mesh, P()),
-        )()
+        w = build(
+            jax.jit(
+                lambda: (
+                    jax.random.normal(jax.random.key(7), (HID, HID)) * HID**-0.5
+                ).astype(jnp.bfloat16),
+                out_shardings=NamedSharding(mesh, P()),
+            )
+        )
 
         def standin(x, w):
             def body(_, y):
@@ -729,7 +720,8 @@ def make_moe(mesh, kind):
         return _smap(standin, mesh, (P(AX), P()), P(AX)), w
     import benchmark_moe_prefill_sp as bm
 
-    w = bm.make_weights(mesh, mesh.devices.size, jax.random.key(8))
+    bm.AX = AX  # its shard_maps name the mesh axis at call time
+    w = build(lambda: bm.make_weights(mesh, mesh.devices.size, jax.random.key(8)))
     moe = bm.split_fn(mesh, mesh.devices.size, wire="bf16", sharded_plan=True)
 
     def run(x, w):
@@ -788,11 +780,31 @@ def compare(st, o, w, caches, x, md):
     y_t, c_t, (lat_t, topk_t) = jax.jit(
         lambda w, c, x, md: today_block(st, o, w, c, x, md)
     )(w, copy(caches), x, md)
-    g = jax.jit(lambda w, x: prefetch(st, w, x))(w, x)
-    y_r, c_r, (lat_r, topk_r) = jax.jit(
-        lambda w, c, x, md, g: rows_block(st, o, w, c, x, md, g)
-    )(w, copy(caches), x, md, g)
     res = {}
+    # Every rank's shards, as each gather leaves them on this process's first
+    # and last device, against the weights themselves.
+    want = (
+        _host(w["o"]).reshape(dcp, -1, HID).view(np.uint8),
+        _host(w["uv"]),
+        _host(w["so"]),
+    )
+    ys = {}
+    for gather in GATHERS:
+        g = jax.jit(lambda w, x, gather=gather: prefetch(st, w, x, gather))(w, x)
+        for name, got, ref in zip(("w_o", "w_uv", "w_scale"), g, want):
+            shards = got.addressable_shards
+            res[f"gather_{gather}_{name}_differ"] = int(
+                sum(
+                    np.sum(
+                        np.asarray(sh.data).view(ref.dtype).reshape(ref.shape) != ref
+                    )
+                    for sh in (shards[0], shards[-1])
+                )
+            )
+        y_r, c_r, (lat_r, topk_r) = jax.jit(
+            lambda w, c, x, md, g: rows_block(st, o, w, c, x, md, g)
+        )(w, copy(caches), x, md, g)
+        ys[gather] = _host(y_r).astype(np.float32)
     for name, a, b in zip(("nope", "rope", "index_k"), c_t, c_r):
         res[f"cache_{name}_bitwise"] = bool(np.array_equal(_host(a), _host(b)))
     # Attention latent outputs in step row order; today's are [rank, T, 4, L].
@@ -811,10 +823,13 @@ def compare(st, o, w, caches, x, md):
     res["topk_rows_differ"] = int(
         sum(set(a[a >= 0].tolist()) != set(b[b >= 0].tolist()) for a, b in zip(kt, kr))
     )
-    yt, yr = _host(y_t).astype(np.float32), _host(y_r).astype(np.float32)
-    res["out_max_rel"] = float(np.abs(yt - yr).max() / np.abs(yt).max())
-    res["out_rel_l2"] = float(np.linalg.norm(yt - yr) / np.linalg.norm(yt))
-    res["out_finite"] = bool(np.isfinite(yr).all())
+    yt = _host(y_t).astype(np.float32)
+    for gather, yr in ys.items():
+        res[f"out_{gather}_max_rel"] = float(np.abs(yt - yr).max() / np.abs(yt).max())
+        res[f"out_{gather}_rel_l2"] = float(
+            np.linalg.norm(yt - yr) / np.linalg.norm(yt)
+        )
+        res[f"out_{gather}_finite"] = bool(np.isfinite(yr).all())
     return res
 
 
@@ -860,23 +875,35 @@ def aot(a):
         shd = NamedSharding(mesh, P(AX))
         x = jax.ShapeDtypeStruct((tokens, HID), jnp.bfloat16, sharding=shd)
         ws, cs = [weight_avals(mesh)] * a.chain, [cache_avals(st)] * a.chain
-        for path, gather in (("today", None), *(("rows", g) for g in a.gather)):
+        for kind, path, gather in (
+            (kind, path, gather)
+            for kind in a.moe
+            for path, gather in (("today", None), *(("rows", g) for g in a.gather))
+        ):
+            moe_fn, moe_w = make_moe(mesh, kind, avals=True)
             t0 = time.time()
             with jax.default_device(devices[0]):
                 g0 = None
                 if path == "rows":
-                    geom = rows_geom(st.dcp)
-                    g0 = jax.ShapeDtypeStruct(
-                        (st.dcp, geom.rows, geom.n_out),
-                        FP8,
-                        sharding=NamedSharding(mesh, P()),
+                    rep = NamedSharding(mesh, P())
+                    g0 = (
+                        jax.ShapeDtypeStruct(
+                            (st.dcp, HEADS * VH // st.dcp, HID), FP8, sharding=rep
+                        ),
+                        jax.ShapeDtypeStruct(
+                            (HEADS, KVL, VH), jnp.bfloat16, sharding=rep
+                        ),
+                        jax.ShapeDtypeStruct((st.dcp, HID), jnp.float32, sharding=rep),
                     )
                 c = (
-                    chain_fn(st, o, path, None, gather)
-                    .lower(ws, cs, x, step_avals(st), None, g0)
+                    chain_fn(st, o, path, moe_fn, gather)
+                    .lower(ws, cs, x, step_avals(st), moe_w, g0)
                     .compile()
                 )
-            name = f"T{tokens}_{path}{'_' + gather if gather else ''}_chain{a.chain}"
+            name = (
+                f"T{tokens}_{kind}_{path}{'_' + gather if gather else ''}"
+                f"_chain{a.chain}"
+            )
             with open(os.path.join(a.out, name + ".hlo"), "w") as f:
                 f.write(c.as_text())
             ma = c.memory_analysis()
