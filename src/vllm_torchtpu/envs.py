@@ -299,6 +299,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DETOK_SUFFIX_PRIME: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
     VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK: bool = False
+    VLLM_TPU_SEND_NEW_PROMPT_IDS: int = 0
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = True
@@ -2165,6 +2166,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK": env_bool(
         "VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK"
     ),
+    # API server and engine core: the number of recent prompts both keep, so a
+    # request carries only the ids after those it shares with one of them
+    # (core/send_new_prompt_ids.py). Exact; 0 keeps none and sends every id.
+    "VLLM_TPU_SEND_NEW_PROMPT_IDS": env_int("VLLM_TPU_SEND_NEW_PROMPT_IDS", 0),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
