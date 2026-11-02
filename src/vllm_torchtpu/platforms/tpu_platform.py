@@ -18,7 +18,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import TYPE_CHECKING, Protocol, Union, cast
+from typing import TYPE_CHECKING, Any, Protocol, Union, cast
 
 import portpicker
 import torch
@@ -447,6 +447,101 @@ def _register_tpu_kv_connectors() -> None:
         KVConnectorFactory.register_connector(name, module_path, name)
 
 
+_EMPTY_KV_TRANSFER_METRICS_INFO: dict[str, str] = {
+    "kv_connector": "",
+    "kv_connectors": "",
+    "kv_role": "",
+    "kv_load_failure_policy": "",
+}
+
+
+def _get_kv_transfer_metrics_info(
+    vllm_config: "VllmConfig | None",
+) -> dict[str, str]:
+    """Extract KV transfer configuration labels for ``vllm:cache_config_info``."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    kv_connector = (
+        str(getattr(kv_transfer_config, "kv_connector", None) or "")
+        if kv_transfer_config is not None
+        else ""
+    )
+    if not kv_connector:
+        return dict(_EMPTY_KV_TRANSFER_METRICS_INFO)
+
+    extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None)
+    child_specs = (
+        extra_config.get("connectors", ()) if isinstance(extra_config, dict) else ()
+    )
+    kv_connectors = (
+        ",".join(
+            str(spec["kv_connector"])
+            for spec in child_specs
+            if isinstance(spec, dict) and spec.get("kv_connector")
+        )
+        if isinstance(child_specs, (list, tuple))
+        else ""
+    )
+    return {
+        "kv_connector": kv_connector,
+        "kv_connectors": kv_connectors,
+        "kv_role": str(getattr(kv_transfer_config, "kv_role", None) or ""),
+        "kv_load_failure_policy": str(
+            getattr(kv_transfer_config, "kv_load_failure_policy", None) or ""
+        ),
+    }
+
+
+class _CacheConfigMetricsInfoView:
+    """Augments ``CacheConfig.metrics_info()`` with KV transfer labels."""
+
+    def __init__(
+        self,
+        cache_config: Any,
+        kv_transfer_labels: dict[str, str],
+    ) -> None:
+        self._cache_config = cache_config
+        self._kv_transfer_labels = kv_transfer_labels
+
+    def metrics_info(self) -> dict[str, str]:
+        info = dict(self._cache_config.metrics_info())
+        info.update(self._kv_transfer_labels)
+        return info
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cache_config, name)
+
+
+def _register_cache_config_kv_metrics_info() -> None:
+    """Include KV transfer labels in ``PrometheusStatLogger``'s ``cache_config`` info.
+
+    Invoked from ``check_and_update_config()`` alongside
+    ``_register_tpu_kv_connectors()`` so ``vllm:cache_config_info`` exports
+    ``kv_connector``, ``kv_connectors``, ``kv_role``, and
+    ``kv_load_failure_policy`` labels without mutating ``CacheConfig`` fields.
+    """
+    from functools import wraps
+
+    from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+    original_log_metrics_info = PrometheusStatLogger.log_metrics_info
+    if getattr(original_log_metrics_info, "_tpu_kv_metrics_info_registered", False):
+        return
+
+    @wraps(original_log_metrics_info)
+    def log_metrics_info_with_kv_transfer(
+        self: Any, metric_type: str, config_obj: Any
+    ) -> None:
+        if metric_type == "cache_config":
+            kv_transfer_labels = _get_kv_transfer_metrics_info(
+                getattr(self, "vllm_config", None)
+            )
+            config_obj = _CacheConfigMetricsInfoView(config_obj, kv_transfer_labels)
+        original_log_metrics_info(self, metric_type, config_obj)
+
+    log_metrics_info_with_kv_transfer.__dict__["_tpu_kv_metrics_info_registered"] = True
+    PrometheusStatLogger.log_metrics_info = log_metrics_info_with_kv_transfer
+
+
 class TpuPlatform(Platform):
     # Registered via the `vllm.platform_plugins` entry point in pyproject.toml.
     _enum = PlatformEnum.OOT
@@ -796,6 +891,7 @@ class TpuPlatform(Platform):
             "platform_activation", model_config=vllm_config.model_config
         )
         _register_tpu_kv_connectors()
+        _register_cache_config_kv_metrics_info()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
