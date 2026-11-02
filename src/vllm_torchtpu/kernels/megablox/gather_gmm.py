@@ -54,6 +54,11 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_gated_act
 
 LANES = 128
+# 640 rows hold a typical 128-expert, top-8 group of an 8192-token step in one
+# tile (fewer tail tiles than 512; 617 vs 678 us at Gemma4-26B TP2).
+DEFAULT_TILE_M = 640
+# Share of the core's VMEM gather_fused_moe asks the compiler for by default.
+VMEM_LIMIT_FRACTION = 0.85
 # BF16 columns one packed uint32 lane block carries (low and high halves).
 PACKED_COLUMNS = 2 * LANES
 # gmm_v2's activation quantization block (per row, per this many columns).
@@ -169,6 +174,32 @@ def quantize_pack_rows(
         name=f"quantize_pack_rows-h_{h}-tt_{tile_tokens}",
         interpret=pltpu.InterpretParams() if interpret else False,
     )(x)
+
+
+def gather_fused_moe_vmem_bytes(
+    hidden: int, inter: int, tile_m: int = DEFAULT_TILE_M
+) -> int:
+    """Upper estimate of the VMEM gather_fused_moe compiles into.
+
+    Double-buffered whole-expert weights and scales, double-buffered input and
+    output row tiles, and the body's live values (gate_up accumulator, one
+    activation block in BF16 and FP8, the intermediate in BF16 and FP8, and an
+    F32 down-projection block), which the compiler places in the same memory.
+    At hidden 2816 and tile_m 640 it is 0.7 to 1.7 MiB above the smallest
+    vmem_limit_bytes the kernel compiles under on tpu7x (intermediates 384,
+    768 and 1536).
+    """
+    s = packed_sublanes(hidden)
+    row_bytes = LANES * 4
+    buffers = (
+        2 * tile_m * (2 * s + 1) * row_bytes  # x rows (S + 1 sublanes) + y rows (S)
+        + 2 * (hidden * 2 * inter + inter * hidden)  # fp8 w1, w2
+        + 2 * 8 * (2 * inter + hidden) * 4  # f32 scales, sublane-padded
+    )
+    body = tile_m * (
+        2 * inter * 2 + QUANT_BLOCK * 3 + inter * 3 + PACKED_COLUMNS * 4 * 2
+    )
+    return buffers + body
 
 
 @dataclasses.dataclass(frozen=True)
@@ -475,9 +506,7 @@ def gather_fused_moe(
     w2_scale: jax.Array,  # f32 per-channel [E, 1, 1, H] or [E, 1, H]
     *,
     act: str,
-    # 640 rows hold a typical 128-expert, top-8 group of an 8192-token step
-    # in one tile (fewer tail tiles than 512; 617 vs 678 us at Gemma4-26B TP2).
-    tile_m: int = 640,
+    tile_m: int = DEFAULT_TILE_M,
     height_step: int = 128,
     issue_group: int = 16,
     vmem_limit_bytes: int | None = None,
@@ -552,7 +581,7 @@ def gather_fused_moe(
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=vmem_limit_bytes
-            or int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.85),
+            or int(pltpu.get_tpu_info().vmem_capacity_bytes * VMEM_LIMIT_FRACTION),
             disable_bounds_checks=True,
         ),
         name=f"gather_fused_moe-e_{num_experts}-h_{hidden}-i_{inter}-tm_{tile_m}",

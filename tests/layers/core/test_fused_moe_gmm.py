@@ -530,6 +530,17 @@ def test_gather_routing_matches_prepare_routed_gmm_inputs(
     np.testing.assert_array_equal(positions, want_positions)
 
 
+def _gather_gmm_weights(inter, num_experts=32, hidden=2816):
+    """can_use_gather_gmm weight overrides for another intermediate size."""
+    f8 = jnp.float8_e4m3fn
+    return {
+        "w1": jax.ShapeDtypeStruct((num_experts, hidden, 2 * inter), f8),
+        "w2": jax.ShapeDtypeStruct((num_experts, inter, hidden), f8),
+        "w1_scale": jax.ShapeDtypeStruct((num_experts, 1, 1, 2 * inter), jnp.float32),
+        "w2_scale": jax.ShapeDtypeStruct((num_experts, 1, 1, hidden), jnp.float32),
+    }
+
+
 def _gather_gmm_case(**overrides):
     """can_use_gather_gmm arguments for Gemma4-26B TP2, as abstract shapes."""
     e, h, inter = 128, 2816, 384
@@ -595,11 +606,17 @@ def _gather_gmm_case(**overrides):
             True,
             True,
         ),
+        # Whole-expert weights in the expert kernel's VMEM: intermediate 1536
+        # compiles under its limit on tpu7x, 2048 runs out of VMEM.
+        (_gather_gmm_weights(1536), True, True),
+        (_gather_gmm_weights(2048), True, False),
     ],
 )
 def test_can_use_gather_gmm(monkeypatch, overrides, fp8_mxu, expected):
     monkeypatch.setattr(fused_moe_gmm, "_GATHER_GMM_MIN_TOKENS", 1024)
     monkeypatch.setattr(fused_moe_gmm, "_tpu_has_fp8_matmul", lambda: fp8_mxu)
+    # tpu7x: 64 MiB of VMEM per core.
+    monkeypatch.setattr(fused_moe_gmm, "_tpu_vmem_capacity_bytes", lambda: 64 << 20)
     assert fused_moe_gmm.can_use_gather_gmm(**_gather_gmm_case(**overrides)) is expected
 
 

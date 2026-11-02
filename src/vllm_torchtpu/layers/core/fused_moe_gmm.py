@@ -506,6 +506,10 @@ def _tpu_has_fp8_matmul() -> bool:
     return pltpu.get_tpu_info().fp8_ops_per_second > 0
 
 
+def _tpu_vmem_capacity_bytes() -> int:
+    return pltpu.get_tpu_info().vmem_capacity_bytes
+
+
 def can_use_gather_gmm(
     hidden_states: jax.Array,
     w1: jax.Array,
@@ -551,6 +555,9 @@ def can_use_gather_gmm(
         and w2_scale is not None
         and w2_scale.size == num_experts * hidden
         and _tpu_has_fp8_matmul()
+        # Whole-expert weights must fit the expert kernel's VMEM limit.
+        and gather_gmm.gather_fused_moe_vmem_bytes(hidden, inter)
+        <= _tpu_vmem_capacity_bytes() * gather_gmm.VMEM_LIMIT_FRACTION
     )
 
 
