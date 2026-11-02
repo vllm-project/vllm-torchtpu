@@ -259,6 +259,7 @@ def _layer_config(
         sliding_prefill_max_bkv=(
             envs.TPU_RPA_SLIDING_PREFILL_MAX_BKV if sliding else None
         ),
+        fence_output=envs.TPU_RPA_FENCE_OUTPUT,
     )
 
 
@@ -306,20 +307,30 @@ def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
     return _waited(funcol.all_to_all_single(x.contiguous(), None, None, group))
 
 
+def _int8_pages(key: torch.Tensor, value: torch.Tensor, page_size: int) -> torch.Tensor:
+    """fp8 [n, kv, d] K/V as int8 `cp_prefill.pack_kv_pages` pages: per token
+    K_0 V_0 K_1 V_1 ... in words of 4 (`_layer_config` refuses padding slots)."""
+    n, num_kv_heads, head_dim = key.shape
+    kv = torch.cat([key.view(torch.int8), value.view(torch.int8)], dim=-1)
+    return kv.reshape(n // page_size, page_size, 2 * num_kv_heads // 4, 4, head_dim)
+
+
 def _pack_piece_tails(
     key: torch.Tensor,
     value: torch.Tensor,
     cfg: cp_prefill.LayerConfig,
     plan: cp_prefill.ZigzagPlan,
 ) -> torch.Tensor:
-    """`cp_prefill.pack_piece_tails` of fp8 [rows, kv, d] K/V, as int8."""
+    """`cp_prefill.pack_piece_tails`, as int8."""
     assert cfg.sliding_window is not None
-    halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, plan.page_size)
-    halo, piece = halo_pages * plan.page_size, plan.piece_tokens
-    kv = torch.cat([key.view(torch.int8), value.view(torch.int8)], dim=-1)
-    tails = torch.cat([kv[piece - halo : piece], kv[2 * piece - halo :]])
-    return tails.reshape(
-        2 * halo_pages, plan.page_size, 2 * cfg.num_kv_heads // 4, 4, cfg.head_dim
+    halo = cp_prefill.num_halo_pages(cfg.sliding_window, plan.page_size)
+    halo *= plan.page_size
+    piece = plan.piece_tokens
+    return torch.cat(
+        [
+            _int8_pages(key[end - halo : end], value[end - halo : end], plan.page_size)
+            for end in (piece, 2 * piece)
+        ]
     )
 
 
@@ -396,16 +407,8 @@ def cp_layer(
     """`cp_prefill_attention` past the forward context: [rows, heads, d] query,
     fp8 [rows, kv_heads, d] K/V; writes `kv_cache` in place."""
     if cfg.sliding_window is None:
-        # fp8 crosses the collective as raw bytes, in the layout of
-        # cp_prefill.pack_kv_pages: per token K_0 V_0 K_1 V_1 ... in words of 4.
-        kv = torch.cat([key.view(torch.int8), value.view(torch.int8)], dim=-1)
-        pages = kv.reshape(
-            query.shape[0] // plan.page_size,
-            plan.page_size,
-            2 * cfg.num_kv_heads // 4,
-            4,
-            cfg.head_dim,
-        )
+        # fp8 crosses the collectives as raw bytes.
+        pages = _int8_pages(key, value, plan.page_size)
         gathered = _waited(funcol.all_gather_single(pages, 0, group))
         new_kv_cache, out = ops.full_attention(
             kv_cache, query, gathered, seq_lens, block_tables

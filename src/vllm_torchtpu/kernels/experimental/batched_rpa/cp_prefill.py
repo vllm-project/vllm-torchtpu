@@ -137,9 +137,9 @@ class ZigzagPlan:
         before the halo map to its first page, finite and fully masked
         wherever a KV block reaches them.
         """
-        if halo_pages > self.piece_pages:
+        if not 1 <= halo_pages <= self.piece_pages:
             raise ValueError(
-                f"A halo of {halo_pages} pages spans more than one piece of "
+                f"A halo of {halo_pages} pages is not 1 to one piece of "
                 f"{self.piece_pages} pages."
             )
         pieces = jnp.stack(self.rank_pieces(rank)).astype(jnp.int32)
@@ -543,6 +543,7 @@ class LayerConfig:
     fp8_compute: bool
     kv_layout: configs.KVLayout
     sliding_prefill_max_bkv: int | None = None
+    fence_output: bool = False
 
     @property
     def tp_kv_heads(self) -> tuple[int, int]:
@@ -565,6 +566,8 @@ class LayerConfig:
             kwargs["sliding_window"] = self.sliding_window
             if self.sliding_prefill_max_bkv:
                 kwargs["sliding_prefill_max_bkv"] = self.sliding_prefill_max_bkv
+        if self.fence_output:
+            kwargs["fence_output"] = True
         return kwargs
 
 
