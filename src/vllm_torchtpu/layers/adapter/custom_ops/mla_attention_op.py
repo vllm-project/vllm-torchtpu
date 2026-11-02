@@ -2163,7 +2163,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         )
         self._dcp_rank_keep = (
             dcp_rank_operand()
-            if self.qb_overlap
+            if self.is_sparse
+            and self.indexer is not None
+            and not self.skip_topk
             and (self.dcp_group_size > 1 or dcp_indexer)
             and envs.TPU_DCP_RANK_OPERAND
             else None
@@ -2267,7 +2269,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         kv_lora = None
         output_gate = None
         early_topk = None
-        if getattr(self, "qb_overlap", False):
+        if (
+            self.is_sparse
+            and self.indexer is not None
+            and not self.skip_topk
+            and (
+                getattr(self, "qb_overlap", False)
+                or getattr(self, "_dcp_rank_keep", None) is not None
+            )
+        ):
             cos_sin = (
                 getattr(self.rotary_emb, "cos_sin_cache", None)
                 if self.rotary_emb is not None
