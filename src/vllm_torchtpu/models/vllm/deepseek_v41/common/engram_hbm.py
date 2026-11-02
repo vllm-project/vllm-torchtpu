@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Engram tables in HBM, looked up on device across the node-local DP group.
 
-With ``TPU_DEEPSEEK_V41_ENGRAM_HBM=first`` (default: only the first Engram layer,
-which only layer 0 can hide; later layers keep the host path, overlapped with
-the layers before them) or ``all``, each DP rank uploads the head shard of the
+With ``TPU_DEEPSEEK_V41_ENGRAM_HBM=first`` (only the first Engram layer, which
+only layer 0 can hide; later layers keep the host path, overlapped with the
+layers before them; the default ``auto`` selects it on EP groups of >= 16
+ranks) or ``all``, each DP rank uploads the head shard of the
 node-local Engram table that the host-offload path already loads into its host
 memory (``ParallelEngramEmbedding`` with ``dp_size`` = node-local Engram DP
 size) into HBM once, and every step's lookup becomes one SPMD op over the EP
@@ -42,6 +43,9 @@ logger = init_logger(__name__)
 # Single character: torch_tpu's local-shape helper iterates a spec entry.
 _AXIS = "d"
 _ENV = "TPU_DEEPSEEK_V41_ENGRAM_HBM"
+# ``auto`` enables ``first`` from this EP size: measured faster at EP16; at EP8
+# the 11.8 GiB table costs ~37% of the KV pool.
+AUTO_MIN_EP_SIZE = 16
 
 
 def _tp_size() -> int:
@@ -61,14 +65,23 @@ def should_use_hbm_lookup(
 ) -> bool:
     """Whether an Engram layer should serve its rows from HBM.
 
-    Engram layers call this once and cache the answer. An explicitly set mode
-    that cannot apply raises; the default falls back to the host path with a
-    warning naming the reason.
+    Engram layers call this once and cache the answer. ``auto`` acts as
+    ``first`` on EP groups of at least ``AUTO_MIN_EP_SIZE`` ranks and as
+    ``off`` otherwise. An explicitly set mode that cannot apply raises; the
+    default falls back to the host path with a warning naming the reason.
     """
     mode = envs.TPU_DEEPSEEK_V41_ENGRAM_HBM.lower()
+    explicit = _ENV in os.environ and mode != "auto"
+    from vllm_torchtpu.distributed.ep_mesh import get_ep_group
+
+    group = get_ep_group()
+    if mode == "auto":
+        ep_size = int(group.world_size) if group is not None else 1
+        if ep_size < AUTO_MIN_EP_SIZE:
+            return False
+        mode = "first"
     if mode == "off" or (mode == "first" and layer_hash_index != 0):
         return False
-    from vllm_torchtpu.distributed.ep_mesh import get_ep_group
 
     if staged_raw is None or staged_raw.device.type != "tpu":
         reason = "Engram CPU offload with TPU staging is not active"
@@ -81,14 +94,17 @@ def should_use_hbm_lookup(
         # The lookup groups blocks of dp_size consecutive EP mesh indices as
         # one node; that layout is only established for TP1 (DP == EP).
         reason = "tensor parallelism is > 1"
-    elif get_ep_group() is None:
+    elif group is None:
         reason = "there is no expert-parallel group"
     else:
         return True
-    if _ENV in os.environ:
+    if explicit:
         raise ValueError(f"{_ENV}={mode} cannot apply: {reason}; set it to 'off'")
     logger.warning_once(
-        "[DSV41] %s defaults to %s but %s; using the host lookup", _ENV, mode, reason
+        "[DSV41] %s=auto selected %s but %s; using the host lookup",
+        _ENV,
+        mode,
+        reason,
     )
     return False
 

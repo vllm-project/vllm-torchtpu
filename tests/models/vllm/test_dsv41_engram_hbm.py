@@ -112,61 +112,52 @@ def test_dequant_matches_reference():
     assert (same | both_nan).all()
 
 
-def test_default_env_and_uses_hbm_lookup_gating(monkeypatch):
+def _gate(monkeypatch, mode, *, ep=16, explicit=False, tp=1, **kw):
     from vllm_torchtpu import envs
     from vllm_torchtpu.distributed import ep_mesh
 
-    monkeypatch.delenv("TPU_DEEPSEEK_V41_ENGRAM_HBM", raising=False)
-    assert envs.environment_variables["TPU_DEEPSEEK_V41_ENGRAM_HBM"]() == "first"
-
-    def _check(layer_idx: int, *, dev_type: str = "tpu", dp_size: int = 8) -> bool:
-        staged: object = SimpleNamespace(device=SimpleNamespace(type=dev_type))
-        return engram_hbm.should_use_hbm_lookup(
-            staged_raw=staged,  # type: ignore[arg-type]
-            dp_size=dp_size,
-            layer_hash_index=layer_idx,
-        )
-
-    monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: object())
-    monkeypatch.setattr(engram_hbm, "_tp_size", lambda: 1)
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_ENGRAM_HBM", "first")
-    assert _check(0) is True
-    assert _check(1) is False
-    assert _check(0, dev_type="cpu") is False
-    assert _check(0, dp_size=1) is False
-
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_ENGRAM_HBM", "all")
-    assert _check(0) is True
-    assert _check(1) is True
-
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_ENGRAM_HBM", "off")
-    assert _check(0) is False
-
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_ENGRAM_HBM", "first")
-    monkeypatch.setattr(engram_hbm, "_tp_size", lambda: 2)
-    assert _check(0) is False
-    monkeypatch.setattr(engram_hbm, "_tp_size", lambda: 1)
-    monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: None)
-    assert _check(0) is False
+    group = SimpleNamespace(world_size=ep) if ep else None
+    monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: group)
+    monkeypatch.setattr(engram_hbm, "_tp_size", lambda: tp)
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_ENGRAM_HBM", mode)
+    if explicit:
+        monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HBM", mode)
+    else:
+        monkeypatch.delenv("TPU_DEEPSEEK_V41_ENGRAM_HBM", raising=False)
+    staged = SimpleNamespace(device=SimpleNamespace(type=kw.pop("dev", "tpu")))
+    args = dict(staged_raw=staged, dp_size=8, layer_hash_index=0) | kw
+    return engram_hbm.should_use_hbm_lookup(**args)
 
 
-def test_explicit_mode_that_cannot_apply_raises(monkeypatch):
+def test_default_is_auto_and_enables_first_from_ep16(monkeypatch):
     from vllm_torchtpu import envs
-    from vllm_torchtpu.distributed import ep_mesh
 
-    monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: object())
-    monkeypatch.setattr(engram_hbm, "_tp_size", lambda: 1)
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_ENGRAM_HBM", "first")
-    staged: object = SimpleNamespace(device=SimpleNamespace(type="tpu"))
-    kwargs = dict(staged_raw=staged, dp_size=1, layer_hash_index=0)
     monkeypatch.delenv("TPU_DEEPSEEK_V41_ENGRAM_HBM", raising=False)
-    assert engram_hbm.should_use_hbm_lookup(**kwargs) is False  # default: warn
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HBM", "first")
-    with pytest.raises(ValueError, match="head-sharded"):
-        engram_hbm.should_use_hbm_lookup(**kwargs)
+    assert envs.environment_variables["TPU_DEEPSEEK_V41_ENGRAM_HBM"]() == "auto"
+    assert engram_hbm.AUTO_MIN_EP_SIZE == 16
+    assert _gate(monkeypatch, "auto", ep=16) is True
+    assert _gate(monkeypatch, "auto", ep=32) is True
+    assert _gate(monkeypatch, "auto", ep=16, layer_hash_index=1) is False
+    assert _gate(monkeypatch, "auto", ep=8) is False
+    assert _gate(monkeypatch, "auto", ep=None) is False
+    # auto falls back (warns) instead of raising when the layout cannot apply.
+    assert _gate(monkeypatch, "auto", ep=16, dp_size=1) is False
+    assert _gate(monkeypatch, "auto", ep=16, explicit=True, dp_size=1) is False
+
+
+def test_explicit_modes_and_gating(monkeypatch):
+    assert _gate(monkeypatch, "first", ep=8, explicit=True) is True
+    assert _gate(monkeypatch, "first", explicit=True, layer_hash_index=1) is False
+    assert _gate(monkeypatch, "all", ep=8, explicit=True) is True
+    assert _gate(monkeypatch, "all", explicit=True, layer_hash_index=1) is True
+    assert _gate(monkeypatch, "off", explicit=True) is False
+    for kw in ({"dev": "cpu"}, {"dp_size": 1}, {"tp": 2}, {"ep": None}):
+        with pytest.raises(ValueError, match="cannot apply"):
+            _gate(monkeypatch, "first", explicit=True, **kw)
     # A layer the mode does not select never raises.
     assert (
-        engram_hbm.should_use_hbm_lookup(**{**kwargs, "layer_hash_index": 1}) is False
+        _gate(monkeypatch, "first", explicit=True, dp_size=1, layer_hash_index=1)
+        is False
     )
 
 

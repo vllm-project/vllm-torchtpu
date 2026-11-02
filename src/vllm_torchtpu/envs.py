@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
-    TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "first"
+    TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -378,15 +378,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each rank's host head shard, looked up on device across the node-local
     # DP group (common/engram_hbm.py), instead of the per-step host gather and
     # gloo exchange. DP-shared host tables need no exchange and keep the host
-    # path. "first" (default): only the first Engram layer (layer 1,
-    # which only layer 0 can hide; later layers keep the host path, overlapped
-    # with the layers before them); "all": every Engram layer; "off": keep all
-    # layers on the host path. Each HBM layer costs ~11.8 GiB per rank at 8
-    # ranks per node.
+    # path. "first": only the first Engram layer (layer 1, which only layer 0
+    # can hide; later layers keep the host path, overlapped with the layers
+    # before them); "all": every Engram layer; "off": keep all layers on the
+    # host path; "auto" (default): "first" when the EP group has >= 16 ranks,
+    # else "off". Each HBM layer costs ~11.8 GiB per rank at 8 ranks per node.
     "TPU_DEEPSEEK_V41_ENGRAM_HBM": env_with_choices(
         "TPU_DEEPSEEK_V41_ENGRAM_HBM",
-        "first",
-        ["off", "first", "all"],
+        "auto",
+        ["auto", "off", "first", "all"],
         case_sensitive=False,
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
