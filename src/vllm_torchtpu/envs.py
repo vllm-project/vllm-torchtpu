@@ -330,6 +330,7 @@ if TYPE_CHECKING:
     TPU_MOE_PREFILL_COMBINE_SCATTER: bool = False
     TPU_PREFILL_ROTATED_COLLECTIVES: bool = False
     TPU_PREFILL_LATENT_NORMS_LOCAL: bool = False
+    TPU_PREFILL_LATENT_GATHER_FP8: bool = False
     TPU_PREFILL_FUSED_OPROJ_RS: bool = False
     TPU_PREFILL_FUSED_OPROJ_RS_MIN_ROWS: int = 2048
     TPU_MTP_EH_PROJ_TP: bool = False
@@ -2399,6 +2400,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # core's rows before the latents' all-gather instead of on every row after
     # it (1/16 of the rows per core); the norm works on each row alone.
     "TPU_PREFILL_LATENT_NORMS_LOCAL": env_bool("TPU_PREFILL_LATENT_NORMS_LOCAL"),
+    # With TPU_PREFILL_LATENT_NORMS_LOCAL, in layers where q_b_proj is the only
+    # reader of the normed q latent: each core quantizes its rows of it to fp8
+    # with an fp32 scale per row (q_b_proj's own activation quantization, which
+    # works on each row alone) and the all-gather moves the fp8 bytes and the
+    # scales instead of bf16, 1,026 instead of 2,048 bf16 columns. q_b_proj
+    # then runs on the gathered quantization: bit for bit today's q.
+    "TPU_PREFILL_LATENT_GATHER_FP8": env_bool("TPU_PREFILL_LATENT_GATHER_FP8"),
     # With TPU_PREFILL_ROTATED_COLLECTIVES: o_proj's per-channel fp8 matmul runs
     # inside the rotated reduce-scatter kernel, each row block computed in the
     # order it is sent and sent while the next is computed, so the matmul
