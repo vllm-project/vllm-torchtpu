@@ -47,14 +47,26 @@ SCENARIOS["decode_dp16"] = Scenario(
 )
 
 
-def require_dp16_topology() -> None:
-    """Do not publish a native fallback as the split-SparseCore CI baseline."""
-    from vllm_torchtpu.compilation.moe_preprocessing import prepare_moe_preprocessing
+def require_dp16_push() -> None:
+    """Check the push recipe in every worker before measuring decode."""
     from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
+    from vllm_torchtpu.envs import (
+        MOE_FUSED_EP_KERNEL_IMPL,
+        MOE_FUSED_EP_PUSH_SC_PREPUSH,
+        MOE_FUSED_EP_PUSH_TC_EXCHANGE,
+    )
 
     mesh = build_ep_mesh()
-    if mesh is None or mesh.size != 16 or prepare_moe_preprocessing(mesh) is None:
-        raise ValueError("DP16 decode CI requires EP16 topology support from #2646")
+    if mesh is None or mesh.size != 16:
+        raise ValueError("DP16 decode CI requires an EP16 mesh")
+    if (
+        MOE_FUSED_EP_KERNEL_IMPL,
+        MOE_FUSED_EP_PUSH_SC_PREPUSH,
+        MOE_FUSED_EP_PUSH_TC_EXCHANGE,
+    ) != ("push", 2, True):
+        raise ValueError(
+            "DP16 decode CI requires push with SC_PREPUSH=2, TC_EXCHANGE=1"
+        )
 
 
 def classify_rows(starts: list[int], ends: list[int], prompts: list[int]) -> str:
@@ -402,7 +414,7 @@ class ServerStepWorker:
             raise ValueError(f"Unknown scenario: {scenario}")
         selected = SCENARIOS[scenario]
         if scenario == "decode_dp16":
-            require_dp16_topology()
+            require_dp16_push()
         config = self.vllm_config.parallel_config
         if (
             config.tensor_parallel_size,

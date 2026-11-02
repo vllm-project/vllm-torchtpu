@@ -100,6 +100,10 @@ def test_ci_launch_and_optional_profile_share_one_server(
     )
     for key in inherited_roots:
         monkeypatch.setenv(key, str(tmp_path / "persistent-cache"))
+    if scenario == "decode_dp16":
+        monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
+        monkeypatch.setenv("MOE_FUSED_EP_PUSH_SC_PREPUSH", "1")
+        monkeypatch.setenv("MOE_FUSED_EP_PUSH_TC_EXCHANGE", "0")
     compiler_roots = []
     starts, clients, stopped, audits = [], [], [], []
     server = SimpleNamespace(poll=lambda: None)
@@ -114,7 +118,9 @@ def test_ci_launch_and_optional_profile_share_one_server(
         if scenario == "decode_dp16":
             assert env["HEADLESS"] == "0"
             assert env["TPU_DEEPSEEK_V41_ENGRAM_HBM"] == "first"
-            assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "v2"
+            assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
+            assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
+            assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"
             assert env["MOE_FUSED_EP_PREPROCESS_BACKEND"] == "topology"
             assert env["MAX_SEQS"] == "48"
             assert env["MAX_MODEL_LEN"] == "98816"
@@ -164,6 +170,10 @@ def test_ci_launch_and_optional_profile_share_one_server(
     assert all(not root.exists() for root in compiler_roots)
     manifest = json.loads((tmp_path / "results/manifest.json").read_text())
     assert manifest["cache_mode"] == "disabled"
+    if scenario == "decode_dp16":
+        assert manifest["moe_kernel"] == "push"
+        assert manifest["moe_push_sc_prepush"] == 2
+        assert manifest["moe_push_tc_exchange"] is True
     assert manifest["serialization"] == "enabled"
     assert manifest["engram_transfer"] == "raw_dma"
     assert manifest["identity"]["engram_transfer"] == "raw_dma"
@@ -238,6 +248,9 @@ def test_dp16_worker_waits_for_shutdown_and_never_runs_client(
     def start(command, *, env, **kwargs):
         commands.append(command)
         assert env["HEADLESS"] == "1" and env["DP"] == "16"
+        assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
+        assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
+        assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"
         assert command[command.index("--data-parallel-start-rank") + 1] == "8"
         return server
 

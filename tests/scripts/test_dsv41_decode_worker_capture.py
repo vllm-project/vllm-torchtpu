@@ -97,24 +97,43 @@ def test_synchronized_profile_writes_to_requested_directory(
     assert (tmp_path / "synchronized-profile" / f"rank-{rank}-capture.json").is_file()
 
 
-@pytest.mark.parametrize("supported", [False, True])
-def test_dp16_ci_rejects_native_preprocessing_fallback(monkeypatch, supported):
-    from server_step_worker import require_dp16_topology
+@pytest.mark.parametrize(
+    "mesh_size,impl,prepush,exchange,error",
+    [
+        (16, "push", 2, True, None),
+        (None, "push", 2, True, "EP16 mesh"),
+        (8, "push", 2, True, "EP16 mesh"),
+        (16, "v2", 2, True, "requires push"),
+        (16, "push", 1, True, "SC_PREPUSH=2"),
+        (16, "push", 2, False, "TC_EXCHANGE=1"),
+    ],
+)
+def test_dp16_ci_requires_push_without_split_topology(
+    monkeypatch, mesh_size, impl, prepush, exchange, error
+):
+    from server_step_worker import require_dp16_push
 
+    mesh = None if mesh_size is None else SimpleNamespace(size=mesh_size)
     monkeypatch.setitem(
         sys.modules,
         "vllm_torchtpu.distributed.ep_mesh",
-        SimpleNamespace(build_ep_mesh=lambda: SimpleNamespace(size=16)),
+        SimpleNamespace(build_ep_mesh=lambda: mesh),
     )
     monkeypatch.setitem(
         sys.modules,
-        "vllm_torchtpu.compilation.moe_preprocessing",
+        "vllm_torchtpu.envs",
         SimpleNamespace(
-            prepare_moe_preprocessing=lambda _: object() if supported else None
+            MOE_FUSED_EP_KERNEL_IMPL=impl,
+            MOE_FUSED_EP_PUSH_SC_PREPUSH=prepush,
+            MOE_FUSED_EP_PUSH_TC_EXCHANGE=exchange,
         ),
     )
-    if supported:
-        require_dp16_topology()
+    # Push works without #2646: no topology preprocessing is required.
+    monkeypatch.setitem(
+        sys.modules, "vllm_torchtpu.compilation.moe_preprocessing", None
+    )
+    if error is None:
+        require_dp16_push()
     else:
-        with pytest.raises(ValueError, match="#2646"):
-            require_dp16_topology()
+        with pytest.raises(ValueError, match=error):
+            require_dp16_push()

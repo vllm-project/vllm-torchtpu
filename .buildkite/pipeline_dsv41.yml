@@ -177,7 +177,7 @@ steps:
       - label: "DeepSeek-V4.1-Flash: DP16 C768 steady DSpark decode (8 chips)"
         key: "dsv41_flash_dp16_c768_decode"
         depends_on: "dsv41_decode_kernel_parity"
-        # Two hosts, eight devices/four physical chips each. Merge after #2646.
+        # Two hosts, eight devices/four physical chips each, using push dispatch.
         notify:
           - github_check:
               name: "DeepSeek-V4.1 DP16 Decode throughput"
