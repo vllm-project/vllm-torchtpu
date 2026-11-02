@@ -2698,11 +2698,14 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     weights stream in, and only the checkpoint copies of borrowed modules are
     skipped: a draft that keeps its own lm_head still loads it. A
     DeepSeek-style draft keeps its head at ``model.layers.<N>.shared_head.head``
-    and must not load that checkpoint copy over the borrowed target head."""
+    and must not load that checkpoint copy over the borrowed target head.
+    The sharded Run:AI loader's fetch plan skips the same borrowed tensors,
+    on top of what the draft's own ``is_unused_checkpoint_weight`` rejects."""
     import vllm.model_executor.model_loader.utils as loader_utils
     from vllm.model_executor.model_loader import base_loader
 
     import vllm_torchtpu.spec_decode.eagle3 as e3
+    from vllm_torchtpu.model_loader_patches import _unused_checkpoint_tensor_predicate
 
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.runner = SimpleNamespace(mesh=object())
@@ -2745,8 +2748,16 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
                 return self.lm_head
             return self.model.layers["92"].shared_head.head
 
+        def is_unused_checkpoint_weight(self, name: str) -> bool:
+            """Upstream's hook: an MTP draft reads none of the target's layers."""
+            return name.startswith("model.layers.0.")
+
         def load_weights(self, weights):
-            seen["names"] = [name for name, _ in weights]
+            seen["names"] = [
+                name
+                for name, _ in weights
+                if not self.is_unused_checkpoint_weight(name)
+            ]
             seen["embed_is_target"] = self.model.embed_tokens is target_embed
             seen["head_is_target"] = self._head() is target_head
             return set(seen["names"])
@@ -2759,13 +2770,16 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
 
     class _Loader:
         def load_weights(self, model, model_config):
-            model.load_weights(
-                [
-                    ("model.embed_tokens.weight", 1),
-                    (head_name, 2),
-                    ("model.layers.92.mlp.gate.weight", 3),
-                ]
-            )
+            weights = [
+                ("model.embed_tokens.weight", 1),
+                (head_name, 2),
+                ("model.layers.0.self_attn.q_proj.weight", 3),
+                ("model.layers.92.mlp.gate.weight", 4),
+            ]
+            is_unused = _unused_checkpoint_tensor_predicate(model)
+            assert is_unused is not None
+            seen["fetched"] = [name for name, _ in weights if not is_unused(name)]
+            model.load_weights(weights)
 
     processed = []
     monkeypatch.setattr(loader_utils, "initialize_model", lambda **kw: Draft())
@@ -2795,5 +2809,9 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     if own_lm_head:
         expected = [head_name] + expected
     assert seen["names"] == expected
+    assert seen["fetched"] == expected
     assert processed == [proposer.draft_model]
+    # The load-time overrides are gone; the draft's own hook is back in charge.
     assert "load_weights" not in proposer.draft_model.__dict__
+    assert "is_unused_checkpoint_weight" not in proposer.draft_model.__dict__
+    assert not proposer.draft_model.is_unused_checkpoint_weight(head_name)
