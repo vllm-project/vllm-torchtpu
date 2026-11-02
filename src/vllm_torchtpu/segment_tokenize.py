@@ -26,14 +26,29 @@ only new pieces -- in one ``encode_batch`` call, so a cold long prompt is
 also encoded across cores. Tokenizers that do not satisfy the conditions
 above, or requests that need offsets, special-token insertion or tokenizer
 truncation, take vLLM's original path unchanged.
+
+Prefix reuse (``VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS=N``): the split, the
+piece slicing, hashing and lookup and the id copy above still run over the
+whole prompt in Python, ~0.05 ms per 1,000 tokens the previous turn already
+had. With N > 0 the tokenizer keeps the ids of the N most recent prompts and
+where each added token ends in them. A new prompt takes the ids of the longest
+recent prompt it shares text with, up to the last added token inside the
+shared text, and splits and encodes only the rest. The split up to the end
+``e`` of an added token that starts at ``s`` is the same in both texts unless
+an added token could match across ``e``: that needs ``text[p:e]`` to be a
+proper prefix of an added token for some ``p <= s``, which is checked, and
+such an end is not reused. The ids before ``e`` are then those of the same
+pieces, and the rest is split from ``e`` as the full scan would.
 """
 
 from __future__ import annotations
 
+import bisect
 import copy
 import re
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any
 
 from vllm_torchtpu.logger import init_logger
@@ -44,11 +59,144 @@ logger = init_logger(__name__)
 # cached, so the cache holds message bodies, not template glue.
 _MIN_CACHED_CHARS = 64
 
+_FIRST_COMPARED_CHARS = 4096
+# Texts that differ in the last chars before a position cannot share a prefix
+# up to it; comparing this many first skips most prompts of other conversations.
+_AGREEING_CHARS = 64
+
+
+@dataclass
+class TokenizedPrompt:
+    """A prompt's ids and, per added token, where it starts and ends and the ids up to its end."""
+
+    text: str
+    ids: list[int]
+    token_starts: list[int]
+    token_ends: list[int]
+    ids_through_token: list[int]
+
+
+@dataclass
+class SharedPrefix:
+    prompt: TokenizedPrompt
+    tokens: int
+
+    @property
+    def end(self) -> int:
+        return self.prompt.token_ends[self.tokens - 1]
+
+    @property
+    def ids(self) -> int:
+        return self.prompt.ids_through_token[self.tokens - 1]
+
+    @property
+    def whole(self) -> bool:
+        """Whether the new prompt extends this prompt through its last added token, so it replaces it."""
+        return self.tokens == len(self.prompt.token_ends)
+
+    def join(self, rest: TokenizedPrompt, text: str) -> TokenizedPrompt:
+        end, ids, tokens = self.end, self.ids, self.tokens
+        prompt = self.prompt
+        joined = prompt.ids[:ids]
+        joined.extend(rest.ids)
+        return TokenizedPrompt(
+            text=text,
+            ids=joined,
+            token_starts=prompt.token_starts[:tokens] + [s + end for s in rest.token_starts],
+            token_ends=prompt.token_ends[:tokens] + [e + end for e in rest.token_ends],
+            ids_through_token=prompt.ids_through_token[:tokens]
+            + [n + ids for n in rest.ids_through_token],
+        )
+
+
+def _agree_before(a: str, b: str, end: int) -> bool:
+    start = max(0, end - _AGREEING_CHARS)
+    return a[start:end] == b[start:end]
+
+
+def shared_prefix_length(a: str, b: str) -> int:
+    if len(b) <= len(a) and a.startswith(b):
+        return len(b)
+    if len(a) < len(b) and b.startswith(a):
+        return len(a)
+    n = min(len(a), len(b))
+    lo, step = 0, _FIRST_COMPARED_CHARS
+    while lo < n:
+        hi = min(n, lo + step)
+        if a[lo:hi] != b[lo:hi]:
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if a[lo:mid] == b[lo:mid]:
+                    lo = mid
+                else:
+                    hi = mid
+            return lo
+        lo, step = hi, step * 2
+    return n
+
+
+class RecentPrompts:
+    """The most recent tokenized prompts, searched for the longest prefix a new prompt can reuse."""
+
+    def __init__(self, added_tokens: list[str], max_prompts: int):
+        self._max_prompts = max_prompts
+        self._prompts: OrderedDict[int, TokenizedPrompt] = OrderedDict()
+        self._longest_token = max((len(t) for t in added_tokens), default=0)
+        self._token_prefixes = {t[:i] for t in added_tokens for i in range(1, len(t))}
+
+    def longest_prefix(self, text: str) -> SharedPrefix | None:
+        best: SharedPrefix | None = None
+        for prompt in reversed(self._prompts.values()):
+            if self._may_start(text, prompt):
+                best = self._longer(best, prompt, len(prompt.text))
+        for prompt in reversed(self._prompts.values()):
+            if best is None or (
+                prompt.token_ends
+                and prompt.token_ends[-1] > best.end
+                and _agree_before(text, prompt.text, best.end)
+            ):
+                best = self._longer(best, prompt, shared_prefix_length(text, prompt.text))
+        return best
+
+    @staticmethod
+    def _may_start(text: str, prompt: TokenizedPrompt) -> bool:
+        n = len(prompt.text)
+        return (
+            n <= len(text)
+            and _agree_before(text, prompt.text, n)
+            and text.startswith(prompt.text)
+        )
+
+    def _longer(
+        self, best: SharedPrefix | None, prompt: TokenizedPrompt, shared: int
+    ) -> SharedPrefix | None:
+        if best is not None and shared <= best.end:
+            return best
+        tokens = bisect.bisect_right(prompt.token_ends, shared)
+        while tokens > 0 and not self._split_ends_at(prompt, tokens - 1):
+            tokens -= 1
+        if tokens > 0 and (best is None or prompt.token_ends[tokens - 1] > best.end):
+            return SharedPrefix(prompt, tokens)
+        return best
+
+    def _split_ends_at(self, prompt: TokenizedPrompt, token: int) -> bool:
+        start, end = prompt.token_starts[token], prompt.token_ends[token]
+        first = max(0, end - self._longest_token + 1)
+        text = prompt.text
+        return not any(text[p:end] in self._token_prefixes for p in range(first, start + 1))
+
+    def add(self, prompt: TokenizedPrompt, replaces: TokenizedPrompt | None) -> None:
+        if replaces is not None:
+            self._prompts.pop(id(replaces), None)
+        self._prompts[id(prompt)] = prompt
+        while len(self._prompts) > self._max_prompts:
+            self._prompts.popitem(last=False)
+
 
 class SegmentTokenizer:
     """Encodes text exactly as ``backend.encode(text, add_special_tokens=False)``."""
 
-    def __init__(self, backend: Any, max_cached_tokens: int):
+    def __init__(self, backend: Any, max_cached_tokens: int, max_prompts: int = 0):
         # Private copy: transformers mutates truncation/padding on the shared
         # backend per call, which must not leak into these encodes.
         self._backend = copy.deepcopy(backend)
@@ -73,6 +221,7 @@ class SegmentTokenizer:
         self._cached_tokens = 0
         self._max_cached_tokens = max_cached_tokens
         self._lock = threading.Lock()
+        self._recent = RecentPrompts(alts, max_prompts) if max_prompts > 0 else None
         self.hits = 0
         self.misses = 0
 
@@ -87,13 +236,37 @@ class SegmentTokenizer:
         return None
 
     def encode(self, text: str) -> list[int]:
+        return self.encode_reusing(text)[0]
+
+    def encode_reusing(self, text: str) -> tuple[list[int], int]:
+        """The ids of ``text`` and how many of them came from a recent prompt."""
+        if self._recent is None:
+            return self.encode_pieces(text).ids, 0
+        with self._lock:
+            prefix = self._recent.longest_prefix(text)
+        if prefix is None:
+            prompt = self.encode_pieces(text)
+            reused = 0
+        else:
+            prompt = prefix.join(self.encode_pieces(text[prefix.end :]), text)
+            reused = prefix.ids
+        with self._lock:
+            self._recent.add(prompt, replaces=prefix.prompt if prefix and prefix.whole else None)
+        return prompt.ids, reused
+
+    def encode_pieces(self, text: str) -> TokenizedPrompt:
         pieces: list[tuple[bool, str]] = []  # (is_added_token, text)
+        token_starts: list[int] = []
+        token_ends: list[int] = []
         pos = 0
         for m in self._split.finditer(text):
-            if m.start() > pos:
-                pieces.append((False, text[pos : m.start()]))
+            start, end = m.span()
+            if start > pos:
+                pieces.append((False, text[pos:start]))
             pieces.append((True, m.group()))
-            pos = m.end()
+            token_starts.append(start)
+            token_ends.append(end)
+            pos = end
         if pos < len(text):
             pieces.append((False, text[pos:]))
 
@@ -121,12 +294,14 @@ class SegmentTokenizer:
                         self._insert(piece, ids)
 
         out: list[int] = []
+        ids_through_token: list[int] = []
         for is_added, piece in pieces:
             if is_added:
                 out.append(self._added_id[piece])
+                ids_through_token.append(len(out))
             else:
                 out.extend(found[piece])
-        return out
+        return TokenizedPrompt(text, out, token_starts, token_ends, ids_through_token)
 
     def _insert(self, piece: str, ids: list[int]) -> None:
         if len(ids) > self._max_cached_tokens:
@@ -153,7 +328,7 @@ _INSTANCES: dict[int, SegmentTokenizer | None] = {}
 _INSTANCES_LOCK = threading.Lock()
 
 
-def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int):
+def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int, max_prompts: int = 0):
     """One ``SegmentTokenizer`` per vLLM tokenizer object, or None if ineligible."""
     key = id(tokenizer)
     with _INSTANCES_LOCK:
@@ -168,12 +343,14 @@ def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int):
         else:
             reason = SegmentTokenizer.eligible(backend)
         if reason is None:
-            seg = SegmentTokenizer(backend, max_cached_tokens)
+            seg = SegmentTokenizer(backend, max_cached_tokens, max_prompts)
             logger.info(
                 "VLLM_TPU_SEGMENT_TOKENIZE: piecewise prompt tokenization on "
-                "(%d added tokens, cache %d tokens, ~12 B/token).",
+                "(%d added tokens, cache %d tokens, ~12 B/token, prefix reuse "
+                "over %d recent prompts).",
                 len(seg._added_id),
                 max_cached_tokens,
+                max_prompts,
             )
         else:
             logger.warning(
@@ -201,12 +378,13 @@ def patch_renderer_segment_tokenize() -> None:
         return
     orig = cls._tokenize_prompt
     max_cached = envs.VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS
+    max_prompts = envs.VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS
 
     def _tokenize_prompt(self, prompt, params):
         kwargs = params.get_encode_kwargs()
         if kwargs.get("add_special_tokens") or self._wants_offsets(prompt, params):
             return orig(self, prompt, params)
-        seg = get_segment_tokenizer(self.get_tokenizer(), max_cached)
+        seg = get_segment_tokenizer(self.get_tokenizer(), max_cached, max_prompts)
         if seg is None:
             return orig(self, prompt, params)
         ids = seg.encode(prompt["prompt"])
@@ -222,4 +400,8 @@ def patch_renderer_segment_tokenize() -> None:
 
     cls._tokenize_prompt = _tokenize_prompt
     cls._tpu_segment_tokenize = True
-    logger.info("VLLM_TPU_SEGMENT_TOKENIZE: patched BaseRenderer._tokenize_prompt")
+    logger.info(
+        "VLLM_TPU_SEGMENT_TOKENIZE: patched BaseRenderer._tokenize_prompt "
+        "(prefix reuse over %d recent prompts)",
+        max_prompts,
+    )

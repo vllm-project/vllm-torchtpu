@@ -297,6 +297,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_DETOK_SUFFIX_PRIME: bool = False
+    VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = True
@@ -2151,6 +2152,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # last 4-24 tokens instead of the whole prompt (detokenizer_suffix.py).
     # Exact; a prompt that ends inside a character keeps the full prime.
     "VLLM_TPU_DETOK_SUFFIX_PRIME": env_bool("VLLM_TPU_DETOK_SUFFIX_PRIME"),
+    # Recent prompts whose ids a new prompt reuses up to the last added token
+    # they share (segment_tokenize.py). 0 keeps no prompts: every prompt is
+    # split and looked up piece by piece.
+    "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_int(
+        "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS", 0
+    ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
