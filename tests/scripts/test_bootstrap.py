@@ -11,242 +11,426 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for .buildkite/scripts/bootstrap.sh and pipeline_config.sh."""
+"""Unit tests for `.buildkite/scripts/bootstrap.py` and `pipeline_config.sh`."""
 
+from __future__ import annotations
+
+import http.client
+import http.server
+import importlib
 import json
 import os
 import pathlib
 import stat
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
-
-import yaml
+from typing import Any
+from unittest import mock
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_BOOTSTRAP = _REPO_ROOT / ".buildkite" / "scripts" / "bootstrap.sh"
+_SCRIPTS_DIR = _REPO_ROOT / ".buildkite" / "scripts"
 
-_FAKE_AGENT = """#!/usr/bin/env bash
-set -euo pipefail
-echo "$*" >> "${TEST_AGENT_LOG}/calls.log"
-if [[ "$1" == "pipeline" && "$2" == "upload" ]]; then
-  shopt -s nullglob
-  if [[ "${3:-}" == "--dry-run" ]]; then
-    dfiles=("${TEST_AGENT_LOG}"/dry_run_*.yml)
-    cat > "${TEST_AGENT_LOG}/dry_run_${#dfiles[@]}.yml"
-    echo '{"steps": [{"label": "stub", "agents": {"queue": "kube"}}]}'
-  else
-    ufiles=("${TEST_AGENT_LOG}"/upload_*.yml)
-    cat > "${TEST_AGENT_LOG}/upload_${#ufiles[@]}.yml"
-  fi
-fi
-"""
+_ALL_LANE_FILES = frozenset(
+    f".buildkite/pipeline_{lane}.yml"
+    for lane in ("verify", "perf", "integration", "tests")
+)
 
-_FAKE_GIT = """#!/usr/bin/env bash
-if [[ "${1:-}" == "fetch" ]]; then
-  exit 0
-fi
-if [[ "${1:-}" == "diff" || "${1:-}" == "diff-tree" ]]; then
-  echo "src/vllm_torchtpu/runner/tpu_runner.py"
-  exit 0
-fi
-exec /usr/bin/git "$@"
-"""
+_FAKE_AGENT_BODY = """
+import json
+import os
+import pathlib
+import sys
+import yaml
 
-# GitHub's labels API for a merged PR: TEST_GITHUB_LABELS, or a failed request.
-_FAKE_CURL = """#!/usr/bin/env bash
-if [[ -z "${TEST_GITHUB_LABELS:-}" ]]; then
-  exit 22
-fi
-echo "${TEST_GITHUB_LABELS}"
+log_path = pathlib.Path(os.environ["TEST_UPLOAD_LOG"])
+args = sys.argv[1:]
+if args[:2] == ["pipeline", "upload"]:
+    content = sys.stdin.read()
+    if "--dry-run" in args:
+        if os.environ.get("TEST_DRY_RUN_FAIL") == "1":
+            sys.exit(1)
+        doc = yaml.safe_load(content) or {}
+        clean = {k: v for k, v in doc.items() if not k.startswith("x-")}
+        json.dump(clean, sys.stdout)
+    else:
+        print("agent: pipeline upload", flush=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"args": args[2:], "content": content}) + "\\n")
 """
 
 
-def run_bootstrap(
-    **env: str,
-) -> tuple[list[str], list[str], list[str], dict[str, str]]:
-    """Run bootstrap.sh against a stub buildkite-agent."""
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = pathlib.Path(tmp)
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        for name, script in (
-            ("buildkite-agent", _FAKE_AGENT),
-            ("git", _FAKE_GIT),
-            ("curl", _FAKE_CURL),
-        ):
-            path = bin_dir / name
-            path.write_text(script)
-            path.chmod(path.stat().st_mode | stat.S_IEXEC)
+def _install_upload_stubs(bin_dir: pathlib.Path) -> None:
+    agent = bin_dir / "buildkite-agent"
+    agent.write_text(
+        f"#!{sys.executable}\n{_FAKE_AGENT_BODY.lstrip()}", encoding="utf-8"
+    )
+    agent.chmod(agent.stat().st_mode | stat.S_IEXEC)
+    py3_link = bin_dir / "python3"
+    if not py3_link.exists():
+        py3_link.symlink_to(sys.executable)
 
-        # Provide a clean base environment so host Buildkite vars never leak in.
-        run_env = {
-            "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-            "HOME": str(tmp_path),
-            "TEST_AGENT_LOG": str(tmp_path),
-            "BUILDKITE_COMMIT": "HEAD",
-            "BUILDKITE_BRANCH": "feature-branch",
-            "BUILDKITE_PULL_REQUEST": "false",
-            "BUILDKITE_PULL_REQUEST_LABELS": "",
-            "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-ci",
-            **env,
-        }
+
+class TestBootstrapUnits(unittest.TestCase):
+    """Focused unit tests for planning helpers, effects resilience, and upload CLI."""
+
+    bp: Any
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        had_bp = "bootstrap" in sys.modules
+        had_cap = "cap_pr_tpu_concurrency" in sys.modules
+        with mock.patch.object(sys, "path", [str(_SCRIPTS_DIR), *sys.path]):
+            cls.bp = importlib.import_module("bootstrap")
+
+        def _cleanup_modules() -> None:
+            if not had_bp:
+                sys.modules.pop("bootstrap", None)
+            if not had_cap:
+                sys.modules.pop("cap_pr_tpu_concurrency", None)
+
+        cls.addClassCleanup(_cleanup_modules)
+
+    def test_plan_priority_and_concurrency_group(self) -> None:
+        bp = self.bp
+        nightly = bp.plan_priority(bp.BuildContext.from_env({"NIGHTLY": "1"}))
+        self.assertEqual(nightly.job_priority, bp.PRIORITY_NIGHTLY)
+        self.assertIsNone(nightly.workload_priority)
+        self.assertIsNone(nightly.pr_tpu_concurrency_group)
+
+        pr = bp.plan_priority(
+            bp.BuildContext.from_env(
+                {
+                    "BUILDKITE_PULL_REQUEST": "123",
+                    "BUILDKITE_BUILD_AUTHOR_EMAIL": "Alice@Example.com",
+                }
+            )
+        )
+        self.assertEqual(pr.job_priority, bp.PRIORITY_PRE_MERGE)
+        self.assertEqual(pr.workload_priority, "pre-merge")
+        self.assertEqual(pr.pr_tpu_concurrency_group, "tpu-pr/alice@example.com")
+
+        oncall = bp.plan_priority(
+            bp.BuildContext.from_env(
+                {
+                    "BUILDKITE_PULL_REQUEST": "123",
+                    "BUILDKITE_PULL_REQUEST_LABELS": "ready,oncall-fix",
+                    "BUILDKITE_BUILD_CREATOR_EMAIL": "Oncall@Example.com",
+                }
+            )
+        )
+        self.assertEqual(oncall.job_priority, bp.PRIORITY_ONCALL_FIX)
+        self.assertEqual(oncall.workload_priority, "oncall-fix")
+        self.assertEqual(oncall.annotation.context, "oncall-fix")
+        self.assertEqual(oncall.pr_tpu_concurrency_group, "tpu-pr/oncall@example.com")
+
+        post_merge = bp.plan_priority(
+            bp.BuildContext.from_env({"BUILDKITE_BRANCH": "main"})
+        )
+        self.assertEqual(post_merge.job_priority, bp.PRIORITY_POST_MERGE)
+        self.assertEqual(post_merge.workload_priority, "post-merge")
+
+        general = bp.plan_priority(
+            bp.BuildContext.from_env({"BUILDKITE_BRANCH": "release/v1"})
+        )
+        self.assertEqual(general.job_priority, bp.PRIORITY_DEFAULT)
+        self.assertIsNone(general.workload_priority)
+
+    def test_skip_docs_vllm_pin_and_merged_pr_parsing(self) -> None:
+        bp = self.bp
+        self.assertTrue(bp.has_skip_ci_marker("chore: note [skip ci]"))
+        self.assertTrue(bp.has_skip_ci_marker("chore: note [ci skip]"))
+        self.assertFalse(bp.has_skip_ci_marker("feat: normal change"))
+
+        self.assertFalse(bp.only_docs_changed([]))
+        self.assertTrue(
+            bp.only_docs_changed(
+                ["README.md", "docs/guide.md", ".pyrefly-baseline.json"]
+            )
+        )
+        self.assertFalse(
+            bp.only_docs_changed([".pyrefly-baseline-full.json", "README.md"])
+        )
+        self.assertFalse(bp.only_docs_changed(["src/vllm_torchtpu/envs.py"]))
+
+        pyproject = (
+            "[dependency-groups]\nvllm = [\n"
+            '  "vllm @ git+https://github.com/vllm-project/vllm.git@abc123def",\n]\n'
+        )
+        self.assertEqual(bp.parse_pinned_vllm_commit(pyproject), "abc123def")
+        self.assertEqual(
+            bp.resolve_vllm_commit_hash("abc123def", "override99"), "override99"
+        )
+        with self.assertRaises(bp.BootstrapError):
+            bp.parse_pinned_vllm_commit("[project]\nname = 'vllm-torchtpu'\n")
+
+        self.assertEqual(
+            bp.parse_merged_pr_number("feat: add kernel (#789)\nbody (#999)"), "789"
+        )
+        self.assertIsNone(bp.parse_merged_pr_number("chore: direct commit"))
+
+    def test_plan_uploads_lanes_overrides_and_skip_reasons(self) -> None:
+        bp = self.bp
+        default_plan = bp.plan_uploads(
+            bp.BuildContext.from_env({"BUILDKITE_PULL_REQUEST": "10"}),
+            merged_labels=(),
+            existing_lane_files=_ALL_LANE_FILES,
+        )
+        self.assertEqual(default_plan.lanes, ("verify", "integration", "tests"))
+        self.assertEqual(default_plan.omni_image_skip, "")
+
+        # run-full-ci + oncall-fix turns on NIGHTLY and all four lanes.
+        full_plan = bp.plan_uploads(
+            bp.BuildContext.from_env(
+                {
+                    "BUILDKITE_PULL_REQUEST": "10",
+                    "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-full-ci,oncall-fix",
+                }
+            ),
+            merged_labels=(),
+            existing_lane_files=_ALL_LANE_FILES,
+        )
+        self.assertTrue(full_plan.nightly)
+        self.assertEqual(full_plan.lanes, bp.ALL_LANES)
+        self.assertEqual(full_plan.pre_lane_annotations[0].context, "full-ci")
+
+        # skip-tpu-ci overrides run-full-ci and run-perf-eval; skip reason <= 70 chars.
+        skip_plan = bp.plan_uploads(
+            bp.BuildContext.from_env(
+                {
+                    "BUILDKITE_PULL_REQUEST": "10",
+                    "BUILDKITE_PULL_REQUEST_LABELS": (
+                        "run-full-ci,run-perf-eval,skip-tpu-ci"
+                    ),
+                }
+            ),
+            merged_labels=(),
+            existing_lane_files=_ALL_LANE_FILES,
+        )
+        self.assertTrue(skip_plan.skip_tpu_ci)
+        self.assertEqual(skip_plan.lanes, ("tests",))
+        self.assertLessEqual(len(skip_plan.omni_image_skip), 70)
+
+        # Post-merge webhook honors merged PR's skip-tpu-ci label; CI_LANES=perf
+        # skips the -omni image.
+        post_merge_skip = bp.plan_uploads(
+            bp.BuildContext.from_env(
+                {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"}
+            ),
+            merged_labels=("skip-tpu-ci",),
+            existing_lane_files=_ALL_LANE_FILES,
+        )
+        self.assertTrue(post_merge_skip.skip_tpu_ci)
+        self.assertEqual(post_merge_skip.lanes, ("tests",))
+
+        perf_only = bp.plan_uploads(
+            bp.BuildContext.from_env({"CI_LANES": "perf"}),
+            merged_labels=(),
+            existing_lane_files=_ALL_LANE_FILES,
+        )
+        self.assertEqual(perf_only.lanes, ("perf",))
+        self.assertLessEqual(len(perf_only.omni_image_skip), 70)
+
+        # Invalid CI_LANES and missing lane handling (warn by default, fail when named).
+        invalid = bp.plan_uploads(
+            bp.BuildContext.from_env({"CI_LANES": "bogus"}),
+            merged_labels=(),
+            existing_lane_files=_ALL_LANE_FILES,
+        )
+        self.assertIsNotNone(invalid.invalid_ci_lanes_error)
+
+        gap_warn = bp.plan_uploads(
+            bp.BuildContext.from_env({}),
+            merged_labels=(),
+            existing_lane_files={".buildkite/pipeline_tests.yml"},
+        )
+        self.assertIsNone(gap_warn.missing_ci_lanes_error)
+        self.assertEqual(gap_warn.post_lane_annotations[0].context, "lane-gaps")
+
+        gap_err = bp.plan_uploads(
+            bp.BuildContext.from_env({"CI_LANES": "perf"}),
+            merged_labels=(),
+            existing_lane_files={".buildkite/pipeline_tests.yml"},
+        )
+        self.assertIsNotNone(gap_err.missing_ci_lanes_error)
+
+        rendered = bp.prepare_upload_yaml(
+            'if: \'build.env("NIGHTLY") == "1"\'\n', job_priority=12, nightly=True
+        )
+        self.assertEqual(rendered, 'priority: 12\nif: \'"1" == "1"\'\n')
+
+    def test_effects_github_error_resilience(self) -> None:
+        bp = self.bp
+        seen_auth: list[str | None] = []
+
+        class AuthHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                seen_auth.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'[{"name": "skip-tpu-ci"}]')
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            helper = tmp_path / "git-credential-github-app"
+            helper.write_text(
+                "#!/usr/bin/env bash\necho password=ghs_tok\n", encoding="utf-8"
+            )
+            helper.chmod(helper.stat().st_mode | stat.S_IEXEC)
+
+            slow_helper = tmp_path / "slow-credential-helper"
+            slow_helper.write_text("#!/usr/bin/env bash\nsleep 5\n", encoding="utf-8")
+            slow_helper.chmod(slow_helper.stat().st_mode | stat.S_IEXEC)
+
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), AuthHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                api_url = f"http://127.0.0.1:{server.server_address[1]}"
+                ok_effects = bp.BootstrapEffects(
+                    repo_root=_REPO_ROOT,
+                    credential_helper=helper,
+                    github_api_url=api_url,
+                )
+                timeout_effects = bp.BootstrapEffects(
+                    repo_root=_REPO_ROOT,
+                    credential_helper=slow_helper,
+                    credential_timeout=0.05,
+                    github_api_url=api_url,
+                )
+                self.assertEqual(
+                    ok_effects.merged_pr_labels("42", env={}), ("skip-tpu-ci",)
+                )
+                self.assertEqual(
+                    timeout_effects.merged_pr_labels("42", env={}), ("skip-tpu-ci",)
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+
+            self.assertEqual(seen_auth, ["token ghs_tok", None])
+
+            with mock.patch(
+                "urllib.request.urlopen",
+                side_effect=http.client.IncompleteRead(b"partial", 10),
+            ):
+                err_effects = bp.BootstrapEffects(
+                    repo_root=_REPO_ROOT,
+                    credential_helper=tmp_path / "missing",
+                )
+                self.assertEqual(err_effects.merged_pr_labels("42", env={}), ())
+
+    def test_upload_cli_and_pipeline_config_delegation(self) -> None:
+        config_sh = _SCRIPTS_DIR / "configs" / "pipeline_config.sh"
+        names = (
+            "PRIORITY_ONCALL_FIX",
+            "PRIORITY_POST_MERGE",
+            "PRIORITY_PRE_MERGE",
+            "PRIORITY_INTEGRATION",
+            "PRIORITY_BENCHMARK",
+            "PRIORITY_DEFAULT",
+            "PRIORITY_NIGHTLY",
+            "PRIORITY_KERNEL_TUNING",
+            "PR_TPU_JOBS_PER_AUTHOR",
+        )
+        prints = "; ".join(f'printf "%s=%s\\n" {n} "${n}"' for n in names)
         proc = subprocess.run(
-            ["bash", str(_BOOTSTRAP)],
-            cwd=_REPO_ROOT,
-            env=run_env,
+            ["bash", "-c", f'source "{config_sh}" && {prints}'],
             capture_output=True,
             text=True,
             check=True,
         )
-        calls_file = tmp_path / "calls.log"
-        calls = calls_file.read_text().splitlines() if calls_file.exists() else []
-        uploads = [p.read_text() for p in sorted(tmp_path.glob("upload_*.yml"))]
-        dry_runs = [p.read_text() for p in sorted(tmp_path.glob("dry_run_*.yml"))]
-        return (
-            calls,
-            uploads,
-            dry_runs,
-            {"stdout": proc.stdout, "stderr": proc.stderr},
-        )
+        shell_vals = {
+            k: int(v)
+            for k, v in (line.split("=", 1) for line in proc.stdout.splitlines())
+        }
+        self.assertEqual({name: getattr(self.bp, name) for name in names}, shell_vals)
 
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            _install_upload_stubs(bin_dir)
+            log_path = tmp_path / "uploads.jsonl"
 
-class TestBootstrap(unittest.TestCase):
-    """Verify lane selection, priority, and NIGHTLY substitution in bootstrap.sh."""
-
-    def test_plain_pr_skips_perf_and_keeps_nightly_unset(self) -> None:
-        calls, uploads, _, out = run_bootstrap(
-            BUILDKITE_PULL_REQUEST="123",
-            BUILDKITE_PULL_REQUEST_LABELS="ready",
-        )
-        # 3 lane files (verify, integration, tests) + pipeline_build.yml
-        self.assertEqual(len(uploads), 4)
-        self.assertNotIn("Uploading .buildkite/pipeline_perf.yml", out["stdout"])
-        self.assertIn("meta-data set JOB_PRIORITY 6", calls)
-        self.assertIn("meta-data set WORKLOAD_PRIORITY pre-merge", calls)
-        for content in uploads:
-            self.assertTrue(content.startswith("priority: 6\n"))
-        for content in uploads[:-1]:
-            self.assertIn('build.env("NIGHTLY")', content)
-        self.assertFalse(any("annotate" in c for c in calls))
-
-    def test_run_perf_eval_adds_perf_lane_without_nightly(self) -> None:
-        calls, uploads, _, out = run_bootstrap(
-            BUILDKITE_PULL_REQUEST="123",
-            BUILDKITE_PULL_REQUEST_LABELS="ready,run-perf-eval",
-        )
-        # 4 lane files (verify, perf, integration, tests) + pipeline_build.yml
-        self.assertEqual(len(uploads), 5)
-        self.assertIn("Uploading .buildkite/pipeline_perf.yml", out["stdout"])
-        self.assertTrue(any("--context perf-eval" in c for c in calls))
-        self.assertFalse(any("--context full-ci" in c for c in calls))
-        for content in uploads[:-1]:
-            self.assertIn('build.env("NIGHTLY")', content)
-
-    def test_run_full_ci_enables_all_lanes_and_substitutes_nightly(self) -> None:
-        calls, uploads, _, out = run_bootstrap(
-            BUILDKITE_PULL_REQUEST="123",
-            BUILDKITE_PULL_REQUEST_LABELS="ready,run-full-ci",
-        )
-        self.assertEqual(len(uploads), 5)
-        self.assertIn("Uploading .buildkite/pipeline_perf.yml", out["stdout"])
-        # Priority remains pre-merge (6), not nightly (1).
-        self.assertIn("meta-data set JOB_PRIORITY 6", calls)
-        self.assertIn("meta-data set WORKLOAD_PRIORITY pre-merge", calls)
-        self.assertTrue(any("--context full-ci" in c for c in calls))
-        self.assertFalse(any("--context perf-eval" in c for c in calls))
-        for content in uploads:
-            self.assertTrue(content.startswith("priority: 6\n"))
-            self.assertNotIn('build.env("NIGHTLY")', content)
-            parsed = yaml.safe_load(content)
-            self.assertIsInstance(parsed, dict)
-            self.assertIn("steps", parsed)
-
-    def test_run_full_ci_with_oncall_fix_keeps_oncall_priority(self) -> None:
-        calls, uploads, _, _ = run_bootstrap(
-            BUILDKITE_PULL_REQUEST="123",
-            BUILDKITE_PULL_REQUEST_LABELS="ready,run-full-ci,oncall-fix",
-        )
-        self.assertEqual(len(uploads), 5)
-        self.assertIn("meta-data set JOB_PRIORITY 12", calls)
-        self.assertIn("meta-data set WORKLOAD_PRIORITY oncall-fix", calls)
-        self.assertTrue(any("--context full-ci" in c for c in calls))
-        for content in uploads:
-            self.assertTrue(content.startswith("priority: 12\n"))
-            self.assertNotIn('build.env("NIGHTLY")', content)
-
-    def test_run_full_ci_with_author_caps_tpu_concurrency_with_nightly_substituted(
-        self,
-    ) -> None:
-        _, uploads, dry_runs, _ = run_bootstrap(
-            BUILDKITE_PULL_REQUEST="123",
-            BUILDKITE_PULL_REQUEST_LABELS="ready,run-full-ci",
-            BUILDKITE_BUILD_AUTHOR_EMAIL="Alice@example.com",
-        )
-        self.assertEqual(len(uploads), 5)
-        self.assertEqual(len(dry_runs), 5)
-        for raw_yaml in dry_runs:
-            self.assertNotIn('build.env("NIGHTLY")', raw_yaml)
-        for content in uploads:
-            doc = json.loads(content)
+            sample_yaml = tmp_path / "sample.yml"
+            sample_yaml.write_text(
+                "steps:\n"
+                '  - label: "TPU step"\n'
+                '    if: \'build.env("NIGHTLY") == "1"\'\n'
+                "    agents:\n"
+                '      queue: "kube"\n'
+                "    env:\n"
+                '      SHAPE: "tpu7x-standard-1t/1x1x1"\n'
+                "    commands:\n"
+                "      - echo hi\n",
+                encoding="utf-8",
+            )
+            env = {
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "HOME": str(tmp_path),
+                "TEST_UPLOAD_LOG": str(log_path),
+                "NIGHTLY": "1",
+                "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/dev@example.com",
+            }
+            # Shell `upload_with_priority` delegates to `bootstrap.py upload` and
+            # flushes the `---` group header before child output over a pipe.
+            capped = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'source "{config_sh}" && upload_with_priority "{sample_yaml}"',
+                ],
+                cwd=tmp_path,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
             self.assertEqual(
-                doc["steps"][0]["concurrency_group"],
-                "tpu-pr/alice@example.com",
+                capped.stdout.splitlines(),
+                [
+                    f"--- :pipeline: Uploading {sample_yaml} with priority 2",
+                    "agent: pipeline upload",
+                ],
             )
 
-    def test_skip_tpu_ci_runs_only_the_tests_lane(self) -> None:
-        calls, uploads, _, out = run_bootstrap(
-            BUILDKITE_PULL_REQUEST="123",
-            BUILDKITE_PULL_REQUEST_LABELS="ready,run-full-ci,skip-tpu-ci",
-        )
-        # pipeline_tests.yml + pipeline_build.yml
-        self.assertEqual(len(uploads), 2)
-        self.assertIn("Uploading .buildkite/pipeline_tests.yml", out["stdout"])
-        for lane in ("verify", "perf", "integration"):
-            self.assertNotIn(f"Uploading .buildkite/pipeline_{lane}.yml", out["stdout"])
-        self.assertTrue(any("--context skip-tpu-ci" in c for c in calls))
-        # The TPU group's condition, filled in from SKIP_TPU_CI at upload.
-        self.assertIn('"${SKIP_TPU_CI:-0}" != "1"', uploads[0])
-
-    def test_post_merge_of_a_skip_tpu_ci_pr_runs_only_the_tests_lane(self) -> None:
-        calls, uploads, _, out = run_bootstrap(
-            BUILDKITE_BRANCH="main",
-            BUILDKITE_PULL_REQUEST="false",
-            BUILDKITE_SOURCE="webhook",
-            BUILDKITE_MESSAGE="[CI/Build] Fix a script (#123)",
-            TEST_GITHUB_LABELS='[{"name": "ready"}, {"name": "skip-tpu-ci"}]',
-        )
-        self.assertEqual(len(uploads), 2)
-        self.assertNotIn("Uploading .buildkite/pipeline_integration.yml", out["stdout"])
-        self.assertTrue(any("--context skip-tpu-ci" in c for c in calls))
-
-    def test_post_merge_runs_everything_without_the_label_or_the_lookup(
-        self,
-    ) -> None:
-        for labels in ('[{"name": "ready"}]', ""):
-            calls, uploads, _, _ = run_bootstrap(
-                BUILDKITE_BRANCH="main",
-                BUILDKITE_PULL_REQUEST="false",
-                BUILDKITE_SOURCE="webhook",
-                BUILDKITE_MESSAGE="[Core] Change something (#124)",
-                TEST_GITHUB_LABELS=labels,
+            # Dry-run failure warns on stderr and uploads uncapped with priority.
+            uncapped = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'source "{config_sh}" && upload_with_priority "{sample_yaml}" 9',
+                ],
+                cwd=tmp_path,
+                env={**env, "TEST_DRY_RUN_FAIL": "1"},
+                capture_output=True,
+                text=True,
+                check=True,
             )
-            self.assertEqual(len(uploads), 4)
-            self.assertFalse(any("--context skip-tpu-ci" in c for c in calls))
+            self.assertIn("WARNING: could not put", uncapped.stderr)
 
-    def test_scheduled_nightly_keeps_nightly_priority(self) -> None:
-        calls, uploads, _, _ = run_bootstrap(
-            BUILDKITE_BRANCH="main",
-            BUILDKITE_PULL_REQUEST="false",
-            NIGHTLY="1",
-        )
-        self.assertEqual(len(uploads), 5)
-        self.assertIn("meta-data set JOB_PRIORITY 1", calls)
-        self.assertFalse(any("WORKLOAD_PRIORITY" in c for c in calls))
-        self.assertFalse(any("--context full-ci" in c for c in calls))
-        for content in uploads:
-            self.assertTrue(content.startswith("priority: 1\n"))
-            self.assertNotIn('build.env("NIGHTLY")', content)
+            uploads = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(uploads), 2)
+            self.assertEqual(uploads[0]["args"], ["--no-interpolation"])
+            parsed = json.loads(uploads[0]["content"])
+            self.assertEqual(parsed["priority"], 2)
+            self.assertEqual(parsed["steps"][0]["if"], '"1" == "1"')
+            self.assertEqual(
+                parsed["steps"][0]["concurrency_group"], "tpu-pr/dev@example.com"
+            )
+            self.assertEqual(uploads[1]["args"], [])
+            self.assertTrue(uploads[1]["content"].startswith("priority: 9\n"))
 
 
 if __name__ == "__main__":
