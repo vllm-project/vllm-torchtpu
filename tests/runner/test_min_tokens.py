@@ -34,6 +34,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
 )
 
+pytestmark = pytest.mark.usefixtures("default_on_knobs_off")
+
 NEG_INF = float("-inf")
 
 

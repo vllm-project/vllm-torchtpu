@@ -84,6 +84,8 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_RPA_SKIP_EMPTY_LAUNCH: bool = True
+    TPU_RPA_SLIDING_DECODE_MAX_BKV: int = 0
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -98,6 +100,7 @@ if TYPE_CHECKING:
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_GEMMA4_TOPK_SOFTMAX_ROUTING: bool = True
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
@@ -120,6 +123,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_NORM_WEIGHTS_FP32: bool = True
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
@@ -200,6 +204,7 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    TPU_REUSE_STAGED_BLOCK_TABLES: bool = True
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -773,6 +778,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # Batched RPA launches its decode and its mixed kernel on every step. With
+    # this on, a launch whose batch segment is empty (the mixed kernel of a
+    # decode-only step, the decode kernel of a prefill-only step) skips its
+    # VMEM zero-fill and its schedule's HBM write-back instead of running
+    # zero steps on initialized buffers. Outputs are unchanged.
+    "TPU_RPA_SKIP_EMPTY_LAUNCH": env_bool("TPU_RPA_SKIP_EMPTY_LAUNCH", default=True),
+    # Largest batched-RPA decode KV block (tokens) on sliding-window layers.
+    # The default block fills VMEM (1792 tokens for a 1024-token window on
+    # Gemma4), and each decode launch zero-fills and computes every lane of
+    # it. 0 (default) keeps that block.
+    "TPU_RPA_SLIDING_DECODE_MAX_BKV": env_nonnegative_int(
+        "TPU_RPA_SLIDING_DECODE_MAX_BKV", 0
+    ),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
@@ -808,6 +826,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # Gemma4 MoE routing as a softmax over the top-k router logits times
+    # per_expert_scale selected without a gather (models/vllm/gemma4_routing_patch.py),
+    # instead of upstream's full softmax, one-hot renormalization and two
+    # gathers. Same top-k ids; weights equal up to float32 rounding for the
+    # float32 logits the TPU gate emits (bf16 logits differ at bf16 precision).
+    "TPU_GEMMA4_TOPK_SOFTMAX_ROUTING": env_bool(
+        "TPU_GEMMA4_TOPK_SOFTMAX_ROUTING", default=True
+    ),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -884,6 +910,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Store learned RMSNorm weights in float32 at load (runner/utils.py
+    # upcast_norm_weights). The TPU rms_norm providers multiply in float32, so
+    # outputs do not change where every norm goes through them (verified on
+    # Gemma4); code that reads norm weights directly sees float32.
+    "TPU_NORM_WEIGHTS_FP32": env_bool("TPU_NORM_WEIGHTS_FP32", default=True),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
@@ -1224,6 +1255,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # Reuse the previous step's staged device block tables when every row the
+    # step stages is unchanged (most decode steps), instead of packing,
+    # uploading and splitting them again on the host path. Skipped for
+    # dummy runs and mamba groups.
+    "TPU_REUSE_STAGED_BLOCK_TABLES": env_bool(
+        "TPU_REUSE_STAGED_BLOCK_TABLES", default=True
+    ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:

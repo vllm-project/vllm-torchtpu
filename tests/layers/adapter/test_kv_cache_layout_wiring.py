@@ -37,6 +37,8 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasBatchedRPAAttentionBackend,
 )
 
+pytestmark = pytest.mark.usefixtures("default_on_knobs_off")
+
 BF16 = torch.bfloat16
 FP8 = torch.float8_e4m3fn
 KVLayout = batched_rpa_configs.KVLayout

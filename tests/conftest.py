@@ -84,6 +84,26 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
 
 
+# Knobs that are on when unset.
+DEFAULT_ON_KNOBS = (
+    "TPU_GEMMA4_TOPK_SOFTMAX_ROUTING",
+    "TPU_NORM_WEIGHTS_FP32",
+    "TPU_REUSE_STAGED_BLOCK_TABLES",
+    "TPU_RPA_SKIP_EMPTY_LAUNCH",
+)
+
+
+@pytest.fixture
+def default_on_knobs_off(monkeypatch):
+    """Turn every default-on knob off through the environment.
+
+    For test modules that enable these knobs one at a time: a test then turns
+    on exactly the ones it exercises.
+    """
+    for name in DEFAULT_ON_KNOBS:
+        monkeypatch.setenv(name, "0")
+
+
 @pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""

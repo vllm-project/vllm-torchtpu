@@ -22,6 +22,7 @@ from typing import Any
 import torch
 import torch.profiler
 from torch_tpu._internal.profiler import TpuProfilerConfig
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
@@ -472,6 +473,29 @@ def relayout_rope_caches(model: torch.nn.Module):
     if num_changed:
         _install_entry_layout_pin()
     logger.info("Row-major relayouted %d rope caches", num_changed)
+
+
+def upcast_norm_weights(model: torch.nn.Module) -> None:
+    """Store every learned RMSNorm weight in float32.
+
+    The TPU rms_norm providers (layers/adapter/ir_ops.py) multiply by
+    ``weight.to(float32)``, which on a bf16 weight is a convert op per norm
+    per step. A bf16 -> float32 copy is exact, so outputs of norms that go
+    through those providers do not change; code that reads ``norm.weight``
+    directly gets float32.
+    """
+    num_changed = 0
+    for module in model.modules():
+        weight = getattr(module, "weight", None)
+        if (
+            isinstance(module, RMSNorm)
+            and module.has_weight
+            and isinstance(weight, torch.nn.Parameter)
+            and weight.dtype != torch.float32
+        ):
+            weight.data = weight.data.to(torch.float32)
+            num_changed += 1
+    logger.info("Stored %d RMSNorm weights in float32", num_changed)
 
 
 def relayout_hash_tables(model: torch.nn.Module):

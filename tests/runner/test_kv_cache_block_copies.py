@@ -28,6 +28,8 @@ from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import tpu_bind_kv_cache
 
+pytestmark = pytest.mark.usefixtures("default_on_knobs_off")
+
 
 def _runner_with_raw_tensors(raw_tensors):
     runner = object.__new__(TPUModelRunner)

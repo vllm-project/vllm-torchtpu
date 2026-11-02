@@ -39,6 +39,8 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 
+pytestmark = pytest.mark.usefixtures("default_on_knobs_off")
+
 
 @pytest.fixture
 def cpu_vllm_config_context():

@@ -174,6 +174,9 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
+    # Skip a launch whose segment of the batch has no work (no VMEM zero-fill,
+    # no schedule write-back beyond actual_steps).
+    skip_empty_launch: bool = False
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
