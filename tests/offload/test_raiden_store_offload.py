@@ -2099,6 +2099,63 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.assertEqual(self.manager.lookup(local_key, _ctx("r1")), LookupResult.HIT)
         self.assertEqual(self.manager.lookup(remote_key, _ctx("r1")), LookupResult.MISS)
 
+    def _store_during_peer_read(self, read_first):
+        # Request B reads `key` from a peer. Request A then stores the same
+        # key: a peer read leaves no local entry, so A's prepare_store offers
+        # it. Whatever order the two transfers land in, B's load must finish.
+        key, other = _key(1), _key(2)
+        seed_global_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx("B")), LookupResult.HIT)
+        self.manager.prepare_load([key], _ctx("B"))
+        self.manager.submit_load_job(7, [key], [5], "B")
+        out = self.manager.prepare_store([key, other], _ctx("A"))
+        self.assertEqual(out.keys_to_store, [key, other])
+        self.manager.submit_store_job(8, [key, other], [6, 9])
+        # Only the key no load holds is admitted and saved.
+        (save,) = self.store.calls_named("save")
+        self.assertEqual(save.args[0], sub_hashes(other))
+        for h in sub_hashes(key):
+            self.assertNotIn(h, self.store.entries)
+
+        landings = [
+            lambda: self.store.complete_remote_read(sub_hashes(key)),
+            lambda: self.store.complete_save(sub_hashes(other)),
+        ]
+        finished = {}
+        for land in landings if read_first else landings[::-1]:
+            land()
+            for job in self.manager.poll_finished_jobs():
+                finished[job.job_id] = job
+        self.assertEqual(sorted(finished), [7, 8])
+        self.assertTrue(finished[7].success)
+        self.assertEqual(finished[7].req_id, "B")
+        self.assertTrue(finished[8].success)
+        self.assertFalse(self.manager.has_pending_work())
+        self.assertEqual(self.manager._inflight_store_keys, set())
+        self.assertEqual(self.manager._hash_to_admission, {})
+
+    def test_store_of_key_under_peer_read_read_lands_first(self):
+        self._store_during_peer_read(read_first=True)
+
+    def test_store_of_key_under_peer_read_save_lands_first(self):
+        self._store_during_peer_read(read_first=False)
+
+    def test_store_of_only_keys_under_peer_read_finishes_without_save(self):
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        self.manager.lookup(key, _ctx("B"))
+        self.manager.prepare_load([key], _ctx("B"))
+        self.manager.submit_load_job(7, [key], [5], "B")
+        self.manager.prepare_store([key], _ctx("A"))
+        self.manager.submit_store_job(8, [key], [6])
+        self.assertEqual(self.store.calls_named("insert"), [])
+        self.assertEqual(self.store.calls_named("save"), [])
+        (store_job,) = self.manager.poll_finished_jobs()
+        self.assertEqual((store_job.job_id, store_job.success), (8, True))
+        self.store.complete_remote_read(sub_hashes(key))
+        (load_job,) = self.manager.poll_finished_jobs()
+        self.assertEqual((load_job.job_id, load_job.success), (7, True))
+
     def test_stale_stash_degenerates_to_local_load(self):
         # Keys promoted to local before prepare_load are routed to load() instead of
         # read_remote().

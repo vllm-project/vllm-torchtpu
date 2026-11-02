@@ -922,6 +922,34 @@ class RaidenOffloadingManager(OffloadingManager):
         account for fails the job closed (rollback + recompute).
         """
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        # A peer read leaves no local entry, so `prepare_store` can offer a
+        # key that another request is still reading from a peer. That load
+        # owns the key's sub-hashes in `_hash_to_admission`; admitting them
+        # here would take over its completions and the load would never
+        # finish. Leave such keys to the load; they are offered again on
+        # their next appearance.
+        held_keys = {
+            key
+            for key in keys
+            if any(
+                sub_hash in self._hash_to_admission
+                for sub_hash in self._sub_hashes(key)
+            )
+        }
+        if held_keys:
+            self._inflight_store_keys.difference_update(held_keys)
+            kept = [
+                (key, block_id)
+                for key, block_id in zip(keys, device_block_ids)
+                if key not in held_keys
+            ]
+            keys = [key for key, _ in kept]
+            device_block_ids = [block_id for _, block_id in kept]
+            if not keys:
+                self._finished.append(
+                    FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
+                )
+                return
         with self._eviction_lock:
             for key in keys:
                 self._evicted_sub_hashes.pop(key, None)
