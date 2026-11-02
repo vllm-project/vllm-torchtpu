@@ -180,8 +180,15 @@ def reduce_scatter_supports(rows, hidden):
     return rows % (CORES * 16) == 0 and hidden % (len(ROTATIONS) * LANES) == 0
 
 
-def all_gather_supports(rows, hidden):
-    return rows % 16 == 0 and hidden % LANES == 0 and hidden >= len(ROTATIONS) * LANES
+def all_gather_supports(rows, hidden, dtype=jnp.bfloat16):
+    """Whether all_gather takes [rows, hidden] of `dtype`: whole packed row
+    tiles (16 bf16 rows, 32 fp8 rows) and at least one lane tile per part."""
+    tile_rows = 8 * 4 // jnp.dtype(dtype).itemsize
+    return (
+        rows % max(tile_rows, 16) == 0
+        and hidden % LANES == 0
+        and hidden >= len(ROTATIONS) * LANES
+    )
 
 
 def _peer(p, axis, dict_ids):
@@ -344,88 +351,124 @@ def all_gather(x, rank, table, *, axis, dict_ids=True, interpret=None, name=None
     """x [r, hidden] bf16 (this core's shard) -> [16 r, hidden] bf16, row
     block m the shard of mesh index m. rank int32 [1] (this core's mesh index),
     table int32 [CORES * TABLE_WIDTH] (peer_table "all_gather")."""
-    r, H = x.shape
-    if not all_gather_supports(r, H):
-        raise ValueError(f"all_gather does not take [{r}, {H}]")
+    (out,) = all_gather_many(
+        (x.astype(jnp.bfloat16),),
+        rank,
+        table,
+        axis=axis,
+        dict_ids=dict_ids,
+        interpret=interpret,
+        name=name,
+    )
+    return out
+
+
+def all_gather_many(xs, rank, table, *, axis, dict_ids=True, interpret=None, name=None):
+    """`all_gather` of several arrays of the same row count, each in its own
+    type, in one kernel: xs [r, hidden_i] -> [16 r, hidden_i], every array
+    sent part by part along the same rotations as one block would be."""
+    r = xs[0].shape[0]
+    for x in xs:
+        if x.shape[0] != r or not all_gather_supports(r, x.shape[1], x.dtype):
+            raise ValueError(f"all_gather does not take {x.dtype}[{x.shape[0]}, {x.shape[1]}]")
     T = CORES * r
     nsub = len(ROTATIONS)
-    widths = part_widths(H, nsub)
-    starts = [sum(widths[:j]) for j in range(nsub)]
+    count = len(xs)
+    widths = [part_widths(x.shape[1], nsub) for x in xs]
+    starts = [[sum(w[:j]) for j in range(nsub)] for w in widths]
 
-    def blk(ref, block, j):
-        return ref.at[pl.ds(block * r, r), pl.ds(starts[j], widths[j])]
-
-    def kernel(rank_ref, t_ref, x_ref, o_ref, stage, lsem, send, recv, msend, mrecv):
+    def kernel(rank_ref, t_ref, *refs):
+        x_refs, o_refs = refs[:count], refs[count : 2 * count]
+        stages = refs[2 * count : 3 * count]
+        lsem, send, recv, msend, mrecv = refs[3 * count :]
         me = rank_ref[0]
         base = me * TABLE_WIDTH
 
         def at(column):
             return t_ref[base + column]
 
+        def blk(a, block, j):
+            return o_refs[a].at[pl.ds(block * r, r), pl.ds(starts[a][j], widths[a][j])]
+
+        def own(a, j):
+            return x_refs[a].at[:, pl.ds(starts[a][j], widths[a][j])]
+
         mate = at(_MATE)
         peers = [at(_PARTNER + j * 3 + k) for j in range(nsub) for k in range(3)]
         _barrier([mate] + peers[:3], axis, dict_ids)
 
-        local_in = pltpu.make_async_copy(x_ref, stage, lsem)
-        local_in.start()
+        local_in = [
+            pltpu.make_async_copy(x_refs[a], stages[a], lsem.at[a]) for a in range(count)
+        ]
+        for copy in local_in:
+            copy.start()
 
         def remote(src, dst, s, rv, p):
             pltpu.make_async_remote_copy(
                 src, dst, s, rv, device_id=_peer(p, axis, dict_ids), device_id_type=MESH
             ).start()
 
-        def own(j):
-            return x_ref.at[:, pl.ds(starts[j], widths[j])]
-
         for j in range(nsub):
-            remote(own(j), blk(o_ref, me, j), msend, mrecv, mate)
+            for a in range(count):
+                remote(own(a, j), blk(a, me, j), msend, mrecv, mate)
         for k in range(4):
             for j in range(nsub):
                 if k > 0:
                     for i in range(2 ** (k - 1)):
                         n = j * 7 + 2 ** (k - 1) - 1 + i
                         block = at(_AG_RECV + n)
-                        _wait(blk(o_ref, block, j), recv.at[n])
-                        remote(blk(o_ref, block, j), blk(o_ref, block, j), msend, mrecv, mate)
+                        for a in range(count):
+                            _wait(blk(a, block, j), recv.at[a * 7 * nsub + n])
+                        for a in range(count):
+                            remote(blk(a, block, j), blk(a, block, j), msend, mrecv, mate)
                 if k < 3:
                     partner = peers[j * 3 + k]
                     for i in range(2**k):
                         n = j * 7 + 2**k - 1 + i
                         block = at(_AG_SEND + n)
-                        src = own(j) if i == 0 else blk(o_ref, block, j)
-                        remote(src, blk(o_ref, block, j), send, recv.at[n], partner)
-        local_in.wait()
-        local_out = pltpu.make_async_copy(stage, o_ref.at[pl.ds(me * r, r)], lsem)
-        local_out.start()
-        _wait(o_ref.at[pl.ds(0, 7 * r)], send)
-        _wait(o_ref.at[pl.ds(0, 8 * r)], msend)
-        _wait(o_ref.at[pl.ds(0, 8 * r)], mrecv)
-        local_out.wait()
+                        for a in range(count):
+                            src = own(a, j) if i == 0 else blk(a, block, j)
+                            remote(src, blk(a, block, j), send, recv.at[a * 7 * nsub + n], partner)
+        local_out = []
+        for a in range(count):
+            local_in[a].wait()
+            copy = pltpu.make_async_copy(
+                stages[a], o_refs[a].at[pl.ds(me * r, r)], lsem.at[count + a]
+            )
+            copy.start()
+            local_out.append(copy)
+        for a in range(count):
+            _wait(o_refs[a].at[pl.ds(0, 7 * r)], send)
+            _wait(o_refs[a].at[pl.ds(0, 8 * r)], msend)
+            _wait(o_refs[a].at[pl.ds(0, 8 * r)], mrecv)
+        for copy in local_out:
+            copy.wait()
 
     kw = {"interpret": interpret} if interpret is not None else {}
+    hidden = "_".join(str(x.shape[1]) for x in xs)
     return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((T, H), jnp.bfloat16),
+        out_shape=tuple(jax.ShapeDtypeStruct((T, x.shape[1]), x.dtype) for x in xs),
         in_specs=[
             pl.BlockSpec(memory_space=pltpu.SMEM),
             pl.BlockSpec(memory_space=pltpu.SMEM),
-            pl.BlockSpec(memory_space=pl.ANY),
+            *(pl.BlockSpec(memory_space=pl.ANY) for _ in xs),
         ],
-        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        out_specs=tuple(pl.BlockSpec(memory_space=pl.ANY) for _ in xs),
         scratch_shapes=[
-            pltpu.VMEM((r, H), jnp.bfloat16),
+            *(pltpu.VMEM(x.shape, x.dtype) for x in xs),
+            pltpu.SemaphoreType.DMA((2 * count,)),
             pltpu.SemaphoreType.DMA,
-            pltpu.SemaphoreType.DMA,
-            pltpu.SemaphoreType.DMA((7 * nsub,)),
+            pltpu.SemaphoreType.DMA((7 * nsub * count,)),
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
             collective_id=COLLECTIVE_ID, vmem_limit_bytes=32 << 20
         ),
-        name=name or f"rotated_all_gather_t{T}_h{H}",
+        name=name or f"rotated_all_gather_t{T}_h{hidden}",
         **kw,
-    )(rank.reshape(1).astype(jnp.int32), table, x.astype(jnp.bfloat16))
+    )(rank.reshape(1).astype(jnp.int32), table, *xs)
 
 
 def _chunked(x, rows, call):
@@ -448,6 +491,24 @@ def all_gather_chunks(x, rank, table, *, axis, chunk, dict_ids=True):
     return _chunked(
         x, chunk, lambda c: all_gather(c, rank, table, axis=axis, dict_ids=dict_ids)
     )
+
+
+def all_gather_many_chunks(xs, rank, table, *, axis, chunk, dict_ids=True):
+    """`all_gather_chunks` of several arrays of the same rows in one kernel
+    per chunk: the outputs of each array in chunk order."""
+    calls = [
+        all_gather_many(
+            [x[c * chunk : (c + 1) * chunk] for x in xs],
+            rank,
+            table,
+            axis=axis,
+            dict_ids=dict_ids,
+        )
+        for c in range(xs[0].shape[0] // chunk)
+    ]
+    if len(calls) == 1:
+        return calls[0]
+    return tuple(jnp.concatenate(parts, 0) for parts in zip(*calls))
 
 
 _FUSED_VMEM_MAX = 56 << 20

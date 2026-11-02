@@ -100,6 +100,17 @@ def token_fn(mesh, kind: str):
     return fn, specs, rows
 
 
+def _rotated_gather(x, rank, table, axis, ranks):
+    """This core's rows x of every core, one rotated all-gather per combine
+    chunk; a shape the kernel does not take keeps XLA's all-gather."""
+    chunk = x.shape[0] // token_chunks(x.shape[0] * ranks)
+    if not rotated_collectives.all_gather_supports(chunk, x.shape[1]):
+        return gather_rows(x, axis)
+    return rotated_collectives.all_gather_chunks(
+        x, rank, jnp.asarray(table), axis=axis, chunk=chunk
+    )
+
+
 def rotated_fn(mesh, kind: str, places):
     """The JAX function of the rotated `kind` ("scatter" or "gather") over the
     MoE op's mesh: (x, rank) with the core's mesh index as data, one kernel
@@ -120,12 +131,7 @@ def rotated_fn(mesh, kind: str, places):
         )
 
     def gather(x, rank):
-        chunk = x.shape[0] // token_chunks(x.shape[0] * ranks)
-        if not rotated_collectives.all_gather_supports(chunk, x.shape[1]):
-            return gather_rows(x, axis)
-        return rotated_collectives.all_gather_chunks(
-            x, rank, jnp.asarray(table), axis=axis, chunk=chunk
-        )
+        return _rotated_gather(x, rank, table, axis, ranks)
 
     local, rows = {
         "scatter": (scatter, lambda n: n // ranks),
@@ -142,6 +148,149 @@ def rotated_fn(mesh, kind: str, places):
         )
 
     return fn, specs, rows
+
+
+def _bf16_parts(x):
+    """x f32 [rows, 1] as 2 bf16 columns holding its high and low 16 bits."""
+    bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
+    halves = [(bits >> 16).astype(jnp.uint16), (bits & 0xFFFF).astype(jnp.uint16)]
+    return jnp.concatenate(
+        [jax.lax.bitcast_convert_type(h, jnp.bfloat16) for h in halves], axis=1
+    )
+
+
+def _from_bf16_parts(parts):
+    """The f32 column whose bits `_bf16_parts` split."""
+    halves = jax.lax.bitcast_convert_type(parts, jnp.uint16).astype(jnp.uint32)
+    bits = (halves[:, 0:1] << 16) | halves[:, 1:2]
+    return jax.lax.bitcast_convert_type(bits, jnp.float32)
+
+
+def quantized_gather_fn(mesh, places, projections: int = 1):
+    """TPU_PREFILL_LATENT_GATHER_FP8: the JAX function (q, rest, w_q_1, w_s_1,
+    ..., rank) over the MoE op's mesh -> every core's rows of
+    (``xla_quantized_matmul(q, w_q_i, w_s_i)`` for each of the `projections`
+    weights, rest). Each core quantizes its own rows of q (``quantize_tensor``
+    works on each row alone), and one rotated all-gather per combine chunk
+    moves the fp8 rows in their own type beside a bf16 block of rest and the
+    fp32 row scales' bits in 2 bf16 columns. Several chunks are joined into one
+    buffer before the projections, so each matmul reads its fp8 tiles as they
+    are. A chunk whose rows are not whole fp8 tiles gathers q in bf16 and
+    quantizes it after the gather, as today."""
+    from vllm_torchtpu.kernels.quantized_matmul.util import (
+        quantize_tensor,
+        xla_prequantized_matmul,
+        xla_quantized_matmul,
+    )
+
+    axis = mesh.axis_names[0]
+    ranks = int(mesh.size)
+    table = rotated_collectives.peer_table(places, "all_gather")
+
+    def padded(columns, rows):
+        used = sum(c.shape[1] for c in columns)
+        pad = -used % rotated_collectives.LANES
+        if pad:
+            columns = [*columns, jnp.zeros((rows, pad), jnp.bfloat16)]
+        return jnp.concatenate(columns, axis=1)
+
+    def local(q, rest, *operands):
+        weights, rank = list(zip(operands[:-1:2], operands[1:-1:2])), operands[-1]
+        rows, width = q.shape
+        rest_width = rest.shape[1]
+        chunk = rows // token_chunks(rows * ranks)
+        block_width = rest_width + 2 + (-(rest_width + 2) % rotated_collectives.LANES)
+        if not (
+            rotated_collectives.all_gather_supports(chunk, width, weights[0][0].dtype)
+            and rotated_collectives.all_gather_supports(chunk, block_width)
+        ):
+            block = _rotated_gather(padded([q, rest], rows), rank, table, axis, ranks)
+            return (
+                *(xla_quantized_matmul(block[:, :width], w_q, w_s) for w_q, w_s in weights),
+                block[:, width : width + rest_width],
+            )
+        q_q, q_scale = quantize_tensor(q, weights[0][0].dtype)
+        block = padded([rest, _bf16_parts(q_scale)], rows)
+        gathered_q, block = rotated_collectives.all_gather_many_chunks(
+            (q_q, block), rank, jnp.asarray(table), axis=axis, chunk=chunk
+        )
+        scale = _from_bf16_parts(block[:, rest_width : rest_width + 2])
+        if chunk < rows:
+            gathered_q, scale = jax.lax.optimization_barrier((gathered_q, scale))
+        return (
+            *(
+                xla_prequantized_matmul(gathered_q, scale, w_q, w_s, jnp.bfloat16)
+                for w_q, w_s in weights
+            ),
+            block[:, :rest_width],
+        )
+
+    specs = (P(axis),) * (3 + 2 * projections)
+    sharded = jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=specs,
+        out_specs=(P(axis),) * (projections + 1),
+        check_vma=False,
+    )
+
+    def fn(*args: jax.Array) -> tuple[jax.Array, ...]:
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    return fn, specs, lambda n: n * ranks
+
+
+def _quantized_gather_op(mesh, places, projections: int):
+    """The torch op of `quantized_gather_fn(mesh, places, projections)`."""
+    run, specs, rows = quantized_gather_fn(mesh, places, projections)
+    axis = mesh.axis_names[0]
+
+    # torch_tpu reads the operand types from these annotations; torch custom-op
+    # schemas take no varargs, so each projection count has its own signature.
+    if projections == 1:
+
+        def fn(
+            q: jax.Array, rest: jax.Array, w_q: jax.Array, w_s: jax.Array, rank: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            return run(q, rest, w_q, w_s, rank)
+
+        name = "pallas::prefill_token_split_quantized_gather"
+    else:
+        assert projections == 2
+
+        def fn(
+            q: jax.Array,
+            rest: jax.Array,
+            w_q: jax.Array,
+            w_s: jax.Array,
+            w_q_2: jax.Array,
+            w_s_2: jax.Array,
+            rank: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return run(q, rest, w_q, w_s, w_q_2, w_s_2, rank)
+
+        name = "pallas::prefill_token_split_quantized_gather_2"
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        name,
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=(P(axis),) * (projections + 1),
+    )
+    op.register_fake(
+        lambda q, rest, *operands: (
+            *(
+                q.new_empty((rows(q.shape[0]), w_q.shape[1]))
+                for w_q in operands[:-1:2]
+            ),
+            rest.new_empty((rows(rest.shape[0]), rest.shape[1])),
+        )
+    )
+    return op
 
 
 def fused_projection_fn(mesh, places):
@@ -326,6 +475,11 @@ class TokenSplit:
             self._rotated_scatter = _rotated_op(mesh, "scatter", places)
             self._rotated_gather = _rotated_op(mesh, "gather", places)
         self.fused_projection = self.rotated and envs.TPU_PREFILL_FUSED_OPROJ_RS
+        self.quantized_gather = self.rotated and envs.TPU_PREFILL_LATENT_GATHER_FP8
+        if self.quantized_gather:
+            self._quantized_gather = {
+                n: _quantized_gather_op(mesh, places, n) for n in (1, 2)
+            }
         if self.fused_projection:
             self._fused_projection = _fused_projection_op(mesh, places)
 
@@ -359,6 +513,25 @@ class TokenSplit:
         gathered = self._rotated_gather(block, small_all_reduce_op._RANK)
         gathered = gathered.narrow(0, 0, tokens)
         return gathered.split([*widths, pad] if pad else widths, dim=-1)[: len(widths)]
+
+    def gather_quantized_columns(
+        self, tokens: int, projections, q: torch.Tensor, *parts
+    ) -> tuple[torch.Tensor, ...]:
+        """Every core's rows of (projection(q) for each per-channel fp8
+        projection, *parts), in one all-gather that moves q as fp8 rows with
+        an fp32 scale per row (``quantize_tensor``) beside the bf16 `parts`."""
+        widths = [part.shape[-1] for part in parts]
+        *projected, rest = self._quantized_gather[len(projections)](
+            q,
+            torch.cat(parts, dim=-1),
+            *(w for p in projections for w in (p.weight, p.weight_scale)),
+            small_all_reduce_op._RANK,
+        )
+        rest = rest.narrow(0, 0, tokens)
+        return (
+            *(p.narrow(0, 0, tokens) for p in projected),
+            *rest.split(widths, dim=-1),
+        )
 
     def project_reduce_scatter(self, x: torch.Tensor, projection) -> torch.Tensor:
         """This core's rows of the row-parallel `projection` of x, summed
@@ -543,6 +716,31 @@ def _rotated_places(mesh):
     return None
 
 
+def _arm_quantized_gather(backbone) -> None:
+    """TPU_PREFILL_LATENT_GATHER_FP8: give each MLA wrapper the number of
+    projections that read its normed q latent when its split buckets can
+    gather the latent in fp8; the decision is made here, at load, outside
+    Dynamo."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUMultiHeadLatentAttentionWrapper,
+    )
+
+    wrappers = [
+        m
+        for m in backbone.modules()
+        if isinstance(m, VllmTPUMultiHeadLatentAttentionWrapper)
+    ]
+    for wrapper in wrappers:
+        wrapper.fp8_q_latent_projections = wrapper.q_latent_projections()
+    logger.info(
+        "TPU_PREFILL_LATENT_GATHER_FP8: %d of %d MLA layers gather the q latent "
+        "in fp8, %d of them with their own indexer's projection",
+        sum(w.fp8_q_latent_projections > 0 for w in wrappers),
+        len(wrappers),
+        sum(w.fp8_q_latent_projections == 2 for w in wrappers),
+    )
+
+
 def arm(model: torch.nn.Module, token_buckets: list[int]) -> bool:
     """Give the target model's DeepseekV2Model a TokenSplit when every MoE
     layer runs moe_tp_decode's stage-A prefill kernel, the attention is the
@@ -607,11 +805,10 @@ def arm(model: torch.nn.Module, token_buckets: list[int]) -> bool:
     stage = runners[0].routed_experts
     rank_path = next(n for n, m in backbone.layers[first].named_modules() if m is stage)
     places = _rotated_places(mesh) if envs.TPU_PREFILL_ROTATED_COLLECTIVES else None
-    setattr(
-        backbone,
-        TOKEN_SPLIT_ATTR,
-        TokenSplit(mesh, first, edge, slot, rank_path, places),
-    )
+    split = TokenSplit(mesh, first, edge, slot, rank_path, places)
+    setattr(backbone, TOKEN_SPLIT_ATTR, split)
+    if split.quantized_gather:
+        _arm_quantized_gather(backbone)
     logger.info(
         "TPU_PREFILL_SEQ_PARALLEL: buckets above %d tokens split the residual "
         "stream over %d cores from layer %d of %d",
