@@ -138,13 +138,13 @@ def _patched_model_init(self: Gemma4Model, *args: Any, **kwargs: Any) -> None:
 # lower while that count is symbolic (the fused EP MoE gathers the same way).
 def _all_gather_rows(x: torch.Tensor) -> torch.Tensor:
     return funcol.wait_tensor(
-        funcol.all_gather_tensor(x, 0, get_tp_group().device_group)
+        funcol.all_gather_single(x, 0, get_tp_group().device_group)
     )
 
 
 def _reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
     return funcol.wait_tensor(
-        funcol.reduce_scatter_tensor(x, "sum", 0, get_tp_group().device_group)
+        funcol.reduce_scatter_single(x, "sum", 0, get_tp_group().device_group)
     )
 
 

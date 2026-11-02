@@ -615,6 +615,46 @@ def test_bf16_gather_when_method_cannot_take_quantized_rows(mock_collectives):
     assert out[0].shape[0] == 8
 
 
+def _collectives_worker(rank: int, world: int, port: int) -> None:
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world
+    )
+    try:
+        group = SimpleNamespace(device_group=dist.group.WORLD)
+        gemma4_patch.get_tp_group = lambda: group
+        rows = torch.arange(world * 4 * 3, dtype=torch.float32).view(world * 4, 3)
+        partial = rows + 100 * rank
+        expected_sum = sum(rows + 100 * r for r in range(world))
+        torch.testing.assert_close(
+            gemma4_patch._reduce_scatter_rows(partial),
+            expected_sum.chunk(world)[rank],
+            rtol=0,
+            atol=0,
+        )
+        shard = rows.chunk(world)[rank]
+        torch.testing.assert_close(
+            gemma4_patch._all_gather_rows(shard), rows, rtol=0, atol=0
+        )
+        fp8 = (shard / 16).to(torch.float8_e4m3fn)
+        gathered = gemma4_patch._all_gather_rows(fp8.view(torch.int8))
+        assert torch.equal(
+            gathered.view(torch.float8_e4m3fn).float(),
+            (rows / 16).to(torch.float8_e4m3fn).float(),
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sequence_parallel_collectives_on_a_process_group() -> None:
+    """Rank-ordered gathers (FP8 rows as int8 too) and sum-and-chunk scatters."""
+    import portpicker
+    import torch.multiprocessing as mp
+
+    mp.spawn(_collectives_worker, args=(2, portpicker.pick_unused_port()), nprocs=2)
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "hidden", "tp", "expected"),
     [
