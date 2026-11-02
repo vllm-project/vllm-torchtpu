@@ -639,11 +639,13 @@ def validate_config(cfg):
     if (
         m.dtype != torch.bfloat16
         or c.block_size != 128
-        or not 1 <= s.max_num_batched_tokens <= 8192
+        or not 1 <= s.max_num_batched_tokens <= envs.QWEN4_EXP_MAX_STEP_TOKENS
         or s.max_num_seqs < 1
     ):
         raise ValueError(
-            "Qwen4Exp TPU S1 requires BF16/P128, step<=8192 and positive max_num_seqs"
+            "Qwen4Exp TPU S1 requires BF16/P128, step<="
+            f"{envs.QWEN4_EXP_MAX_STEP_TOKENS} (QWEN4_EXP_MAX_STEP_TOKENS) and "
+            "positive max_num_seqs"
         )
     if m.max_model_len < 128:
         raise ValueError(
