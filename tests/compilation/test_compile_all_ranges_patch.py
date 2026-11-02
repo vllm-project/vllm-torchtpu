@@ -348,14 +348,14 @@ def test_graph_is_rank_dependent_reads_submodule_code(monkeypatch):
     assert not tpu_compiler.graph_is_rank_dependent(object())
 
 
-def _agree_worker(rank, port, oks, out):
+def _agree_worker(rank, port, oks, queue):
     import torch.distributed as dist
 
     dist.init_process_group(
         "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=len(oks)
     )
     try:
-        out[rank] = tpu_compiler.agree_all_ranks(oks[rank])
+        queue.put((rank, tpu_compiler.agree_all_ranks(oks[rank])))
     finally:
         dist.destroy_process_group()
 
@@ -369,8 +369,9 @@ def test_agree_all_ranks_is_a_min_over_ranks(oks):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    out = mp.Manager().dict()
-    mp.spawn(_agree_worker, args=(port, oks, out), nprocs=len(oks), join=True)
+    queue = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(_agree_worker, args=(port, oks, queue), nprocs=len(oks), join=True)
+    out = dict(queue.get() for _ in range(len(oks)))
     assert [out[r] for r in range(len(oks))] == [all(oks)] * len(oks)
 
 

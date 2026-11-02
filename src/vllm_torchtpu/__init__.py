@@ -959,7 +959,9 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     FullAttentionSpec.max_memory_usage_bytes = full_attention_max_memory_usage_bytes
 
     already_patched = getattr(
-        kv_cache_utils, "_tpu_hybrid_pcp_block_sizes_patch", False
+        kv_cache_utils.resolve_kv_cache_block_sizes,
+        "_tpu_hybrid_pcp_block_sizes_patch",
+        False,
     )
     original_resolve = getattr(
         kv_cache_utils,
@@ -1069,6 +1071,9 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     )
     if not already_patched:
         kv_cache_utils._tpu_original_resolve_kv_cache_block_sizes = original_resolve
+        resolve_kv_cache_block_sizes.__dict__["_tpu_hybrid_pcp_block_sizes_patch"] = (
+            True
+        )
         kv_cache_utils.resolve_kv_cache_block_sizes = patched_resolve
         kv_cache_utils._tpu_hybrid_pcp_block_sizes_patch = True
 
