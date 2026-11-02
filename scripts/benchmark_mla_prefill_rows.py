@@ -124,9 +124,10 @@ def _rank(dcp):
 # ---------------------------------------------------------------------------
 
 
-def make_layer_weights(mesh, key):
+def make_layer_weights(mesh, seed):
     """Random weights of one MLA block in the served layouts: replicated
-    projections, o_proj / W_UV sharded by heads (TP)."""
+    projections, o_proj / W_UV sharded by heads (TP). Keys are made inside
+    the jitted builders from the int `seed`, the same on every process."""
     rep, shd = NamedSharding(mesh, P()), NamedSharding(mesh, P(AX))
     dcp = mesh.devices.size
 
@@ -163,9 +164,16 @@ def make_layer_weights(mesh, key):
         )
         return {"uv": uv, "o": wo, "so": so}
 
-    k_rep, k_shd = jax.random.split(key)
-    w = jax.jit(replicated, out_shardings=rep)(k_rep)
-    w.update(jax.jit(sharded, out_shardings=shd)(k_shd))
+    w = jax.jit(
+        lambda: replicated(jax.random.fold_in(jax.random.key(seed), 0)),
+        out_shardings=rep,
+    )()
+    w.update(
+        jax.jit(
+            lambda: sharded(jax.random.fold_in(jax.random.key(seed), 1)),
+            out_shardings=shd,
+        )()
+    )
     return w
 
 
@@ -328,7 +336,7 @@ def step_avals(st):
     )
 
 
-def make_caches(st, md, key):
+def make_caches(st, md, seed):
     """DCP-sharded caches holding a random `prefix`-token context."""
     mesh, dcp = st.mesh, st.dcp
     shd = NamedSharding(mesh, P(AX))
@@ -371,19 +379,17 @@ def make_caches(st, md, key):
         _smap(write, mesh, (P(AX),) * 3 + (P(),) * 6, (P(AX),) * 3),
         donate_argnums=(0, 1, 2),
     )
-    rng = np.random.default_rng(int(jax.random.randint(key, (), 0, 2**30)))
+    rng = np.random.default_rng(seed)
     for start in range(0, st.prefix, PREFIX_PIECE):
         end = min(start + PREFIX_PIECE, st.prefix)
         n = end - start
         # Host values, the same on every process (inputs replicate).
-        kv = np.asarray((rng.standard_normal((n, KVL)) * 2).astype(np.float32))
-        kv = np.asarray(jnp.asarray(kv).astype(FP8))
-        kpe = np.asarray(
-            jnp.asarray(rng.standard_normal((n, ROPE)) * 2, jnp.float32).astype(FP8)
+        kv, kpe, k = (
+            jnp.asarray(rng.standard_normal((n, d)), jnp.float32)
+            for d in (KVL, ROPE, IDXD)
         )
-        kp = np.asarray(
-            quant_index_k(jnp.asarray(rng.standard_normal((n, IDXD)), jnp.float32))
-        )
+        kv, kpe = (np.asarray((v * 2).astype(FP8)) for v in (kv, kpe))
+        kp = np.asarray(quant_index_k(k))
         sl = np.zeros(MAX_REQS, np.int32)
         sl[0] = end
         cu = np.full(MAX_REQS + 1, n, np.int32)
@@ -890,8 +896,8 @@ def run_tokens(a, mesh, tokens):
     md = step_data(st)
     o = ops(st)
     print(f"T={tokens} prefix={a.prefix} dcp={dcp} rows/rank={st.rows}", flush=True)
-    ws = [make_layer_weights(mesh, jax.random.key(10 + i)) for i in range(a.chain)]
-    caches = [make_caches(st, md, jax.random.key(20 + i)) for i in range(a.chain)]
+    ws = [make_layer_weights(mesh, 10 + i) for i in range(a.chain)]
+    caches = [make_caches(st, md, 20 + i) for i in range(a.chain)]
     x = jax.jit(
         lambda: jax.random.normal(jax.random.key(3), (tokens, HID)).astype(
             jnp.bfloat16
