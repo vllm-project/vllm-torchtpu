@@ -33,6 +33,10 @@ which sets how many rows travel (all_reduce: zero, fold, trim, full).
 ag_pairs (TPU_MOE_TP_DECODE_AG_PAIRS): the trim and full paths that exchange
 at least this many rows all-gather by chip pairs (all_reduce._exchange_pairs);
 the same output bits, and the kernel name gains -pairs_<rows>.
+exchange_pieces (TPU_MOE_TP_DECODE_EXCHANGE_PIECES): the trim and full paths
+that exchange at least this many rows exchange by lane-group piece, so the
+reduce-scatter and the all-gather overlap (all_reduce._exchange_pieces); the
+same output bits, and the kernel name gains -pieces_<rows>.
 
 Fast schedule (fast=True, TPU_MOE_TP_DECODE_FAST): the same arithmetic and the
 same output bits, scheduled for the hardware. Routing reduces one per-row
@@ -167,6 +171,7 @@ def kernel_name(
     num_experts=None,
     fast=False,
     pair_rows=0,
+    piece_rows=0,
 ) -> str:
     name = (
         f"moe_tp_decode-e_{experts}-m_{m}-h_{h}-i_{i}-fs_{shared_inter}"
@@ -181,6 +186,8 @@ def kernel_name(
         name += "-fast"
     if pair_rows:
         name += f"-pairs_{pair_rows}"
+    if piece_rows:
+        name += f"-pieces_{piece_rows}"
     return name
 
 
@@ -742,6 +749,7 @@ def _kernel(
         "fast",
         "hbm_operands",
         "ag_pairs",
+        "exchange_pieces",
     ),
 )
 def moe_tp_decode(
@@ -766,6 +774,7 @@ def moe_tp_decode(
     fast: bool = False,
     hbm_operands: bool = False,
     ag_pairs: int = 0,
+    exchange_pieces: int = 0,
 ):
     """The layer's bf16 [N, D] output, summed over the n_ranks TP ranks.
 
@@ -798,6 +807,9 @@ def moe_tp_decode(
         this many rows all-gather by chip pairs (0: none); needs mesh
         indices 2i and 2i + 1 on one chip (all_reduce.check_chip_pairs).
         Same output bits.
+      exchange_pieces: the all-reduce's trim and full paths that exchange at
+        least this many rows exchange by lane-group piece, overlapping the
+        reduce-scatter and the all-gather (0: none). Same output bits.
 
     Returns:
       bf16(sum over ranks of each rank's shared + routed_scale * routed),
@@ -814,7 +826,7 @@ def moe_tp_decode(
     num_experts = scores.shape[1]
     shared_inter = shared_w2.shape[0]
     info = pltpu.get_tpu_info()
-    ar_spec = all_reduce.make_spec(n_ranks, m, h, ag_pairs)
+    ar_spec = all_reduce.make_spec(n_ranks, m, h, ag_pairs, exchange_pieces)
     ic = _i_chunk(i)
     plan = _vmem_plan(m, h, ic, num_experts, shared_inter, info, ar_spec)
     if plan is None:
@@ -915,6 +927,7 @@ def moe_tp_decode(
             num_experts,
             fast,
             ar_spec.pair_rows,
+            ar_spec.piece_rows,
         ),
     )(
         *metas,
