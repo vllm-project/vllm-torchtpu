@@ -516,6 +516,17 @@ class VllmDeepseekV4MLAAttention(
         object.__setattr__(self, "_kv_rope_op_instance", op)
         return op
 
+    @property
+    def compressor_with_indexer_op(self):
+        """The op that runs a CSA layer's compressor and its indexer's
+        together (`VllmDeepseekCompressor.forward_with_indexer`); None on a
+        layer without both. Rebuilt on every read: the runner reads it to
+        prebuild it, again once the KV cache's block sizes are final."""
+        compressor = getattr(self.mla_attn, "compressor", None)
+        if self.indexer is None or compressor is None:
+            return None
+        return compressor.build_paired_op(self.indexer.compressor)
+
     def qnorm_rope(
         self,
         q: torch.Tensor,
@@ -550,16 +561,32 @@ class VllmDeepseekV4MLAAttention(
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
+        # A CSA layer's compressor and its indexer's compress the same hidden
+        # states: one op projects both, before the indexer reads its cache.
+        paired = self.indexer is not None and compressor is not None
         if self.indexer is not None:
             indexer_emb = getattr(
                 self.mla_attn,
                 "indexer_rotary_emb",
                 getattr(self.mla_attn, "rotary_emb", None),
             )
+            if paired:
+                compressor.forward_with_indexer(
+                    self.indexer.compressor,
+                    hidden_states,
+                    positions,
+                    self.mla_attn.rotary_emb,
+                    indexer_emb,
+                )
             topk_indices = self.indexer(
-                hidden_states, qr, indexer_weights, positions, indexer_emb
+                hidden_states,
+                qr,
+                indexer_weights,
+                positions,
+                indexer_emb,
+                compress=not paired,
             )
-        if compressor is not None:
+        if compressor is not None and not paired:
             compressor(hidden_states, positions, self.mla_attn.rotary_emb)
 
         res = self.forward_mqa(

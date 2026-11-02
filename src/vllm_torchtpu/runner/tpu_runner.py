@@ -5355,6 +5355,7 @@ class TPUModelRunner(GPUModelRunner):
                         "qnorm_rope_op",
                         "kv_rope_op",
                         "o_proj_op",
+                        "compressor_with_indexer_op",
                     ):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)

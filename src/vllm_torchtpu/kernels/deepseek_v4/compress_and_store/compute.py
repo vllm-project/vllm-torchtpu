@@ -14,7 +14,6 @@
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
@@ -225,197 +224,94 @@ def rope_words_tiled(rope_slot_ropped, rope_head_dim):
     return bits | (pltpu.roll(bits, bits.shape[-1] - half, 2) << 16)
 
 
-def merge_rope_row(
-    row,  # (1, 128) int32, the RoPE row as read from HBM
-    kv_slots,  # (tile_n,) int, token index of every token in the tile
+def merge_rope_rows(
+    rows,  # (tile_n, 1, 128) int32, each token's RoPE row as read from HBM
+    kv_slots,  # tile_n scalar kv slots, one per token of the tile
     words,  # rope_words_tiled(...)
     rope_lane,  # int, lane of RoPE word 0 in `words`
-    n,  # int, the token whose row this is
 ):
-    """Writes every tile token whose RoPE lands in token n's row into it.
+    """Writes every tile token's RoPE words into each tile row that holds it.
 
     Token ``j`` of a row owns words ``[32 j, 32 j + 32)`` (see
-    `csa_cache_layout`), so one rotation puts a token's words in its window.
+    `csa_cache_layout`), so one rotation puts a token's words in its window;
+    a later token of the tile wins. Rows of invalid slots come back merged
+    with nothing.
     """
     per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
     width = csa_cache_layout.ROPE_WORDS
-    lanes = row.shape[-1]
-    window = jax.lax.broadcasted_iota(jnp.int32, row.shape, 1) // width
-    curr_slot = kv_slots[n]
-    curr_row = curr_slot // per_row
+    lanes = rows.shape[-1]
+    window = jax.lax.broadcasted_iota(jnp.int32, rows.shape[1:], 1) // width
+    row_ids = [jnp.where(slot >= 0, slot // per_row, -1) for slot in kv_slots]
 
-    for i in range(kv_slots.shape[0]):
-        slot_i = kv_slots[i]
-        hit = (slot_i >= 0) & (curr_slot >= 0) & (slot_i // per_row == curr_row)
-        pos_i = slot_i % per_row
-        for j in range(per_row):
-            placed = pltpu.roll(words[i], (j * width - rope_lane) % lanes, 1)
-            row = jnp.where(hit & (pos_i == j) & (window == j), placed, row)
-    return row
+    placed, in_window = [], []
+    for i, slot in enumerate(kv_slots):
+        pos = slot % per_row
+        placed.append(pltpu.roll(words[i], (pos * width - rope_lane) % lanes, 1))
+        in_window.append(window == pos)
+
+    merged = []
+    for n in range(len(kv_slots)):
+        row = rows[n]
+        for i, slot in enumerate(kv_slots):
+            hit = (slot >= 0) & (row_ids[i] == row_ids[n])
+            row = jnp.where(hit & in_window[i], placed[i], row)
+        merged.append(row)
+    return jnp.stack(merged)
 
 
-def merge_slot_updates(
-    slots_val,  # (pack_factor, physical_slot_size) uint8 (the row)
-    kv_slots,  # (tile_n,) int (all slots in tile)
-    val_padded,  # (tile_n, record_subslots, 128) uint8 (all values in tile)
-    n,  # int (current token index)
+def place_rope_row(
+    words,  # rope_words_tiled(...) of one whole row's tokens, in slot order
+    rope_lane,  # int, lane of RoPE word 0 in `words`
 ):
-    """multiple KV slots are packed into a single physical 512-byte row in HBM.
+    """`merge_rope_rows` for a tile that fills one row in slot order: every
+    tile row is that row, token ``j``'s words in window ``j``."""
+    per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
+    width = csa_cache_layout.ROPE_WORDS
+    lanes = words.shape[-1]
+    assert words.shape[0] == per_row, words.shape
+    window = jax.lax.broadcasted_iota(jnp.int32, words.shape[1:], 1) // width
+    row = None
+    for j in range(per_row):
+        shift = (j * width - rope_lane) % lanes
+        placed = pltpu.roll(words[j], shift, 1) if shift else words[j]
+        row = placed if row is None else jnp.where(window == j, placed, row)
+    return jnp.broadcast_to(row, words.shape)
 
-    Thus, different slots may map to the same tile.
 
-    We only send the DMA from the first tile that updates a physical row,
-    defined by `is_first_mask`.
+def merge_slot_rows(
+    rows,  # (tile_n, 1, lanes) int32, each token's cache row as read from HBM
+    kv_slots,  # tile_n scalar kv slots, one per token of the tile
+    records,  # (tile_n, 1, lanes) int32, each token's record bytes, zero-extended
+):
+    """Writes every tile token's record into each tile row that holds it.
 
-    In this function, we:
-    1. Read the current value of `slot_val`
-    2. Scan all other tokens in the current tile
-    3. Consolidate all other updates into the single tile.
+    A row packs 4 slots, slot ``s`` in byte ``s`` of every word, so a record
+    replaces one byte of the row's words; a later token of the tile wins. Rows
+    of invalid slots come back merged with nothing.
     """
-    tile_n = kv_slots.shape[0]
-    curr_slot = kv_slots[n]
-    pack_factor = slots_val.shape[0]
+    bits = jnp.iinfo(jnp.uint8).bits
+    per_row = jnp.iinfo(jnp.int32).bits // bits
+    row_ids = [jnp.where(slot >= 0, slot // per_row, -1) for slot in kv_slots]
+    shifts = [(slot % per_row) * bits for slot in kv_slots]
 
-    curr_row = curr_slot // pack_factor
-
-    slots_list = [slots_val[i] for i in range(pack_factor)]
-
-    for i in range(tile_n):
-        slot_i = kv_slots[i]
-        valid_i = slot_i >= 0
-        row_i = slot_i // pack_factor
-        sub_idx = slot_i % pack_factor
-
-        update_cond = valid_i & (row_i == curr_row) & (curr_slot >= 0)
-
-        val = val_padded[i].flatten()
-
-        for target_s in range(pack_factor):
-            slots_list[target_s] = jax.lax.select(
-                update_cond & (sub_idx == target_s),
-                val,
-                slots_list[target_s],
-            )
-
-    return jnp.stack(slots_list)
+    merged = []
+    for n in range(len(kv_slots)):
+        row = rows[n]
+        for i, slot in enumerate(kv_slots):
+            hit = (slot >= 0) & (row_ids[i] == row_ids[n])
+            byte = jnp.left_shift(jnp.int32(0xFF), shifts[i])
+            placed = (row & ~byte) | jnp.left_shift(records[i], shifts[i])
+            row = jnp.where(hit, placed, row)
+        merged.append(row)
+    return jnp.stack(merged)
 
 
-def gather_from_page_buffer(
-    page_buffer,
-    positions_ref,
-    kv_window_u8,
-    score_window_u8,
-    *,
-    global_idx: int,
-    num_tokens: int,
-    window: int,
-    block_size: int,
-    pages_to_buffer_per_token: int,
-    field_rows: int,
-    state_rows_per_token: int,
-    overlap: bool,
-    is_indexer: bool = False,
-):
-    """Extracts kv_window, score_window from page buffer."""
-    tile_n = page_buffer.shape[0]
-    if is_indexer:
-        # CSA_INDEXER (layout 32x4x256)
-        # page_buffer shape: (tile_n, pages_to_buffer, 32, 4, 256)
-        for n in range(tile_n):
-            safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
-            pos = positions_ref[safe_idx]
-
-            block_idx_curr = pos // block_size
-            pos_start = pos - window + 1
-
-            for w in range(window):
-                pos_w = pos_start + w
-                block_idx_w = pos_w // block_size
-                p = block_idx_w - block_idx_curr + pages_to_buffer_per_token - 1
-
-                offset_in_block = pos_w % block_size
-                token_row_start = offset_in_block * 2
-
-                kv_row = token_row_start + 0
-                score_row = token_row_start + 1
-
-                valid_w = pos_w >= 0
-
-                @pl.when(valid_w)
-                def _():
-                    row_kv = page_buffer[n, p, kv_row][...]  # shape (4, 256)
-                    row_score = page_buffer[n, p, score_row][...]  # shape (4, 256)
-
-                    # `proj_and_save_state` stores the f32 state byte-transposed
-                    # (u8[s, l] == byte s of f32 l), so one (4, 256) row holds
-                    # 256 floats across its LANES. The prev/curr halves of the
-                    # overlapping state are therefore lanes 0:128 and 128:256.
-                    if overlap:
-                        is_prev = w < (window // 2)
-                        val_kv = jax.lax.select(
-                            is_prev,
-                            row_kv[:, 0:128],
-                            row_kv[:, 128:256],
-                        )
-                        val_score = jax.lax.select(
-                            is_prev,
-                            row_score[:, 0:128],
-                            row_score[:, 128:256],
-                        )
-                    else:
-                        val_kv = row_kv[:, 0:128]
-                        val_score = row_score[:, 0:128]
-
-                    kv_window_u8[n, w, 0, :, :] = val_kv
-                    score_window_u8[n, w, 0, :, :] = val_score
-
-    else:
-        # Standard HCA/CSA (last dim 128)
-        slots_per_part_head = kv_window_u8.shape[2]
-
-        for n in range(tile_n):
-            safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
-            pos = positions_ref[safe_idx]
-
-            block_idx_curr = pos // block_size
-            pos_start = pos - window + 1
-
-            @pl.loop(0, window)
-            def body_w(w):
-                pos_w = pos_start + w
-                block_idx_w = pos_w // block_size
-                p = block_idx_w - block_idx_curr + pages_to_buffer_per_token - 1
-
-                slots_per_part_row = field_rows
-                slots_per_token_row = state_rows_per_token
-                if overlap:
-                    is_prev = w < (window // 2)
-                    kv_slot_start_row = jax.lax.select(is_prev, 0, slots_per_part_row)
-                    score_slot_start_row = jax.lax.select(
-                        is_prev, 2 * slots_per_part_row, 3 * slots_per_part_row
-                    )
-                else:
-                    kv_slot_start_row = 0
-                    score_slot_start_row = slots_per_part_row
-
-                offset_in_block = pos_w % block_size
-
-                @pl.loop(0, slots_per_part_head, unroll=True)
-                def gather_loop(d_idx):
-                    kv_src_row = (
-                        offset_in_block * slots_per_token_row
-                        + kv_slot_start_row
-                        + d_idx
-                    )
-                    score_src_row = (
-                        offset_in_block * slots_per_token_row
-                        + score_slot_start_row
-                        + d_idx
-                    )
-
-                    kv_window_u8[n, w, d_idx, :, :] = page_buffer[
-                        n, p, kv_src_row, :, :
-                    ]
-                    score_window_u8[n, w, d_idx, :, :] = page_buffer[
-                        n, p, score_src_row, :, :
-                    ]
+def place_slot_row(records):  # (tile_n, 1, lanes) int32, as merge_slot_rows
+    """`merge_slot_rows` for a tile that fills one row in slot order: every
+    tile row is that row, token ``j``'s record in byte ``j`` of each word."""
+    bits = jnp.iinfo(jnp.uint8).bits
+    assert records.shape[0] == jnp.iinfo(jnp.int32).bits // bits, records.shape
+    row = records[0]
+    for j in range(1, records.shape[0]):
+        row = row | jnp.left_shift(records[j], j * bits)
+    return jnp.broadcast_to(row, records.shape)

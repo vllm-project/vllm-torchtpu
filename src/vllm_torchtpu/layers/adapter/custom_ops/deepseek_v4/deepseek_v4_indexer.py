@@ -216,11 +216,15 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
         slot_mapping: torch.Tensor | None = None,
+        compress: bool = True,
     ) -> torch.Tensor:
+        """``compress=False`` when the caller already ran this indexer's
+        compressor (`VllmDeepseekCompressor.forward_with_indexer`)."""
         q, _ = self.wq_b(query)
         q = q.view(-1, self.n_head, self.head_dim)
 
-        self.compressor(hidden_states, positions, rotary_emb)
+        if compress:
+            self.compressor(hidden_states, positions, rotary_emb)
 
         # No KV cache is bound during the profiling forward; the values are
         # unused, so return correctly-shaped dummies. vLLM binds a numel==0

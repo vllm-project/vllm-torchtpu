@@ -46,6 +46,9 @@ from jax.experimental import pallas as pl
 
 # --- physical layout constants ------------------------------------------------
 LANE = 128  # bytes per sub-slot / TPU lane width
+# Boundary tokens `prepare_boundary_batch` packs per cache-row tile; tokens
+# sharing a NoPE / RoPE row never straddle two of these.
+ROW_TILE = 4
 SLOT_PACK = 4  # sub-slots packed into one physical HBM slot row
 N_FIELDS = 2  # values stored per token: kv + score
 FP32_BYTES = 4
@@ -358,6 +361,12 @@ class Configs:
     def cache_last_dims(self) -> tuple[int, ...]:
         return (self.hbm_pack, self.last_dim_size)
 
+    @property
+    def merges_rows(self) -> bool:
+        """Whether tokens read-modify-write packed rows: CSA's RoPE rows, the
+        indexer's NoPE rows, each ROW_TILE tokens."""
+        return self.dims.has_rope_cache or self.dims.mode == Mode.CSA_INDEXER
+
     # --- slot translation helpers -----------------------------------------
     @property
     def tokens_in_second_minor(self) -> int:
@@ -418,10 +427,39 @@ class Configs:
         """Number of physical HBM rows per page in RoPE cache."""
         return self.physical_page_size // self.hbm_pack
 
+    # --- window groups ---------------------------------------------------------
     @property
-    def pages_to_buffer_per_token(self) -> int:
-        """Pages that must be resident to cover one token's window (+1 guard)."""
-        return pl.cdiv(self.window, self.state_block_size) + 1
+    def group_positions(self) -> int:
+        """Window positions per group: consecutive states one DMA fetches.
+
+        A boundary token's window ends at a multiple of compress_ratio, so its
+        groups start at multiples of this and never cross a state page.
+        """
+        ratio, block_size = self.dims.compress_ratio, self.state_block_size
+        group_positions = min(ratio, block_size)
+        assert max(ratio, block_size) % group_positions == 0, (ratio, block_size)
+        return group_positions
+
+    @property
+    def window_groups(self) -> int:
+        """Groups, and so state DMAs, per token's window."""
+        return self.window // self.group_positions
+
+    @property
+    def groups_per_page(self) -> int:
+        """Groups one state page holds, used and unused rows alike."""
+        group_rows = self.group_positions * self.state_rows_per_token
+        return self.state_physical_page_size // group_rows
+
+    def window_buffer_shape(self) -> tuple[int, ...]:
+        """Window-group VMEM block: (tile, groups, positions, state rows), then
+        the state array's own row shape."""
+        return (
+            self._tile_n,
+            self.window_groups,
+            self.group_positions,
+            self.state_rows_per_token,
+        )
 
     # --- shapes (single source of truth for every reshape / BlockSpec) ---------
     @property
@@ -429,42 +467,12 @@ class Configs:
         return self.tile_sizes.tile_n
 
     def window_shape(self) -> tuple[int, ...]:
-        """f32 window scratch: (fields, tile, window, head_tiles, lane)."""
-        return (N_FIELDS, self._tile_n, self.window, self.head_tiles, LANE)
-
-    def window_bytes_shape(self) -> tuple[int, ...]:
-        """uint8 view of the window scratch; each f32 lane -> FP32_BYTES rows.
-
-        Note: that trailing FP32_BYTES (4) is bytes-per-f32, NOT the HBM SLOT_PACK
-        (also 4) -- they're numerically equal but mean different things.
-
-        Returns:
-          The shape of the window bytes scratch.
-        """
-        return (
-            N_FIELDS,
-            self._tile_n,
-            self.window,
-            self.head_tiles,
-            FP32_BYTES,
-            LANE,
-        )
+        """f32 window scratch: (fields, window, tile * head_tiles, lane)."""
+        return (N_FIELDS, self.window, ROW_TILE * self.head_tiles, LANE)
 
     def output_shape(self) -> tuple[int, ...]:
         """Packed output tile / VMEM block: (tile, record_rows) + cache_last_dims."""
         return (self._tile_n, self.record_rows) + self.cache_last_dims
-
-    def page_buffer_shape(self) -> tuple[int, ...]:
-        """Page-buffer VMEM block: (tile, pages, state page rows) + cache_last_dims.
-
-        Pages are DMA'd whole out of the *state* array, so this is sized by
-        `state_physical_page_size`, not by the compressed-KV page.
-        """
-        return (
-            self._tile_n,
-            self.pages_to_buffer_per_token,
-            self.state_physical_page_size,
-        ) + self.cache_last_dims
 
     def rope_output_shape(self) -> tuple[int, ...]:
         """RoPE output VMEM block: (tile, 4, lane)."""
