@@ -100,6 +100,12 @@ class KernelConfig:
     prefill_moe_dma_banks: int = dataclasses.field(
         default_factory=lambda: int(os.environ.get("K3_PREFILL_MOE_DMA_BANKS", "2"))
     )
+    # Fused prefill MoE: windows up to this many tokens reduce each output
+    # column with one direct BF16 send per owner and an FP32 sum at the owner,
+    # instead of the 31-hop FP32 ring (0: always the ring).
+    prefill_moe_oneshot_max: int = dataclasses.field(
+        default_factory=lambda: int(os.environ.get("K3_PREFILL_MOE_ONESHOT_MAX", "0"))
+    )
     # Prefill KDA layer: start the weight copies with the window all-gather
     # instead of at the first KDA tile.
     prefill_kda_early_weights: bool = dataclasses.field(

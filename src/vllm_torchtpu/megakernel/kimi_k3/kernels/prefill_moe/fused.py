@@ -997,8 +997,14 @@ def _routed_experts(
     *,
     tokens,
     probabilities_ready,
+    slots=None,
 ):
-    """Joint GU/SiTU/first-down pipeline followed by remaining columns."""
+    """Joint GU/SiTU/first-down pipeline followed by remaining columns.
+
+    ``slots`` (HBM [columns, 32, rows, tn] BF16): reduce each column with one
+    direct send per owner instead of the ring (the one-shot reduce-scatter).
+    """
+    oneshot = slots is not None
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
@@ -1088,6 +1094,10 @@ def _routed_experts(
         rx,
         state,
         ring_meta,
+        os_send=None,
+        os_recv=None,
+        os_local=None,
+        os_gather=None,
     ):
         w = dataclasses.replace(
             w, weight=w.weight.at[layer[0]], scale=w.scale.at[layer[0]]
@@ -1128,6 +1138,13 @@ def _routed_experts(
         # Real-prompt tuning: short expert loops need all twelve streams per
         # poll; longer loops alternate six-stream groups to bound polling cost.
         def advance(stop, block, subtotal_vmem, *, drain=False, poll_round=0):
+            if oneshot:
+                if drain:
+                    _oneshot_finish(
+                        subtotal_vmem, slots, block, out.at[:, pl.ds(block * tn, tn)],
+                        os_send, os_recv, os_local, os_gather, rows=localrows,
+                    )
+                return
             _ready_reduce(
                 tables, subtotal_vmem, out.at[:, pl.ds(block * tn, tn)],
                 sends, receives, credits, stores, payload, rx,
@@ -1258,6 +1275,9 @@ def _routed_experts(
                 if not first:
                     advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
                     emit_subtotals(subtotal_vmem)
+                    if oneshot:
+                        _oneshot_start(subtotal_vmem, slots, n, os_send, os_recv, os_local,
+                                       rows=localrows)
                     state[0] = 0
 
                     @pl.when(n == width // tn - 1)
@@ -1401,6 +1421,8 @@ def _routed_experts(
         )
         def remaining_columns(subtotal_vmem):
             emit_subtotals(subtotal_vmem)
+            if oneshot:
+                _oneshot_start(subtotal_vmem, slots, 0, os_send, os_recv, os_local, rows=localrows)
             state[0] = 0
 
             def shifted(spec):
@@ -1439,6 +1461,20 @@ def _routed_experts(
             **scratch,
         )
 
+    ring_scratch = dict(
+        payload=pltpu.VMEM((localrows, tn), ring_dtype),
+        rx=pltpu.VMEM((2, localrows, tn), ring_dtype),
+    )
+    if oneshot:
+        chunk = min(localrows, 16 if tn > 896 else 32)
+        ring_scratch = dict(
+            payload=None,
+            rx=None,
+            os_send=pltpu.SemaphoreType.DMA((width // tn,)),
+            os_recv=pltpu.SemaphoreType.DMA((width // tn,)),
+            os_local=pltpu.SemaphoreType.DMA,
+            os_gather=pltpu.VMEM((32, chunk, tn), x.dtype),
+        )
     pl.run_scoped(
         run,
         metadata=k.MetadataRef(
@@ -1452,10 +1488,9 @@ def _routed_experts(
         receives=pltpu.SemaphoreType.DMA((2, streams)),
         credits=pltpu.SemaphoreType.REGULAR((streams,)),
         stores=pltpu.SemaphoreType.DMA,
-        payload=pltpu.VMEM((localrows, tn), ring_dtype),
-        rx=pltpu.VMEM((2, localrows, tn), ring_dtype),
         state=pltpu.SMEM((1 + 2 * streams,), jnp.int32),
         ring_meta=pltpu.SMEM((6 * 34,), jnp.int32),
+        **ring_scratch,
     )
 
 
@@ -1897,6 +1932,73 @@ def _ready_reduce(
                     sweep(group)
 
 
+def _oneshot_descriptor(subtotal, slots, column, send_sems, recv_sems, peer, *, rows):
+    rank = lax.axis_index("k3_sp")
+    return pltpu.make_async_remote_copy(
+        subtotal.at[pl.ds(peer * rows, rows), :],
+        slots.at[column, rank],
+        send_sems.at[column],
+        recv_sems.at[column],
+        device_id=peer,
+        device_id_type=pl.DeviceIdType.LOGICAL,
+    )
+
+
+def _oneshot_start(subtotal, slots, column, send_sems, recv_sems, local_sem, *, rows):
+    ranks = slots.shape[1]
+    """Send every owner's rows of one column's BF16 subtotal straight to its slot.
+
+    Each rank owns slot [column, rank] on every peer, so no slot is written twice
+    in a layer; the call-entry barrier orders reuse across layers.
+    """
+    rank = lax.axis_index("k3_sp")
+
+    @pl.loop(1, ranks)
+    def send(d):
+        peer = lax.rem(rank + d, ranks)
+        _oneshot_descriptor(subtotal, slots, column, send_sems, recv_sems, peer, rows=rows).start()
+
+    pltpu.make_async_copy(
+        subtotal.at[pl.ds(rank * rows, rows), :], slots.at[column, rank], local_sem
+    ).start()
+
+
+def _oneshot_finish(subtotal, slots, column, out, send_sems, recv_sems, local_sem, gather, *, rows):
+    """Wait for one column's 31 sends and receives, then sum the 32 slots in FP32.
+
+    Every owner sums the same 32 BF16 subtotals in rank order (exact inputs, one
+    FP32 accumulation), so the result does not depend on arrival order.
+    """
+    rank = lax.axis_index("k3_sp")
+    ranks = slots.shape[1]
+    descriptor = _oneshot_descriptor(subtotal, slots, column, send_sems, recv_sems, rank, rows=rows)
+
+    @pl.loop(1, ranks)
+    def wait(d):
+        descriptor.wait_send()
+        descriptor.wait_recv()
+
+    pltpu.make_async_copy(
+        subtotal.at[pl.ds(rank * rows, rows), :], slots.at[column, rank], local_sem
+    ).wait()
+    chunk = gather.shape[1]
+    for begin in range(0, rows, chunk):
+        copies = [
+            pltpu.make_async_copy(
+                slots.at[column, r, pl.ds(begin, chunk), :], gather.at[r], local_sem
+            )
+            for r in range(ranks)
+        ]
+        for copy in copies:
+            copy.start()
+        for copy in copies:
+            copy.wait()
+        total = gather[0].astype(jnp.float32)
+        for r in range(1, ranks):
+            total = total + gather[r].astype(jnp.float32)
+        out.at[pl.ds(begin, chunk), :][...] = total.astype(out.dtype)
+
+
 def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
     """Normalize routed output and project up with three weight/prefix banks.
 
@@ -2023,6 +2125,7 @@ def _layer_kernel(
     fallback_shared=None,
     maximum=None,
     route_counts=None,
+    slots=None,
 ):
     """One launch owns all compute, metadata and communication on the fast path.
 
@@ -2146,6 +2249,7 @@ def _layer_kernel(
                 s["reduced"],
                 tokens=tokens,
                 probabilities_ready=probabilities_ready,
+                slots=slots,
             )
             phase("m_epilogue")
             _epilogue(
@@ -2226,13 +2330,20 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         ]
         output_specs += [hbm] * 4 + [pl.BlockSpec()]
     counting = k._config().prefill_route_counts
-    body = _layer_kernel
+    oneshot = 0 < seq_len <= k._config().prefill_moe_oneshot_max
+    if oneshot:
+        tn = 1792 if seq_len < 8192 else 896
+        workspace_shapes += [((3584 // tn, 32, rows, tn), bf16)]
+        output_specs += [hbm]
     if counting:
         workspace_shapes += [((56,), jnp.int32)]
         output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
 
-        def body(*refs):
-            return _layer_kernel(*refs[:-1], route_counts=refs[-1])
+    def body(*refs):
+        refs = list(refs)
+        routes = refs.pop() if counting else None
+        slots = refs.pop() if oneshot else None
+        return _layer_kernel(*refs, route_counts=routes, slots=slots)
     kernel = pl.pallas_call(
         body,
         out_shape=tuple(jax.ShapeDtypeStruct(s, d) for s, d in workspace_shapes),
@@ -2280,6 +2391,8 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         if counting:
             *outputs, routes = outputs
             routes = routes[None]
+        if oneshot:
+            *outputs, _ = outputs
         if seq_len < 8192:
             return (outputs[0][None], routes) if counting else outputs[0][None]
         final, latent, _, ids, probs, counts, shared, maximum = outputs
