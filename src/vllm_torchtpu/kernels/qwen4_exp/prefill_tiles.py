@@ -31,8 +31,24 @@ SPARSE_PREFILL_TILES = {
         "bfloat16",
         "float8_e4m3fn",
     ): (256, 256)
-    for page_size in (128, 1664, 3200)
+    for page_size in (128, 1664)
 }
+# A TP1 pipeline stage's 3200-token pages: Q256/KV512 instead of Q256/KV256. A longer KV tile
+# amortizes the per-tile FP32 accumulator rescale and KV decode over more keys (as the TP-shard
+# tiles below found); one paired QSA call is still ~35 ms of the odd/even stage gap at 256k.
+SPARSE_PREFILL_TILES.update({
+    (
+        pltpu.ChipVersion.TPU_7X,
+        8192,
+        24,
+        2,
+        256,
+        4,
+        (3200, 1, 4, 256),
+        "bfloat16",
+        "float8_e4m3fn",
+    ): (256, 512)
+})
 
 # Tensor-parallel ranks hold one KV head and 24 / TP query heads (TP8 Q3,
 # TP4 Q6, TP2 Q12), which missed the table above and fell back to Q256/KV128.
