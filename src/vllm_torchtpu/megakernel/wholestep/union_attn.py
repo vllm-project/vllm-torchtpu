@@ -350,10 +350,10 @@ def attend_request(
         alpha = jnp.where(m == -jnp.inf, 0.0, jnp.exp(m - safe))
         l_sum = l_sum * alpha + jnp.sum(p, axis=-1, keepdims=True)
         acc = acc * alpha + jnp.dot(p, rval, preferred_element_type=F32)
-        attn = acc / jnp.where(l > 0, l, 1.0)
+        attn = acc / jnp.where(l_sum > 0, l_sum, 1.0)
         if dcp > 1:
-            lse = jnp.where(l > 0, m_new + jnp.log(jnp.where(l > 0, l, 1.0)), -jnp.inf)
-            partial.append((jnp.where(l > 0, attn, 0.0), lse))
+            lse = jnp.where(l_sum > 0, m_new + jnp.log(jnp.where(l_sum > 0, l_sum, 1.0)), -jnp.inf)
+            partial.append((jnp.where(l_sum > 0, attn, 0.0), lse))
             continue
         gated = (
             (

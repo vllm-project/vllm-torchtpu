@@ -336,7 +336,7 @@ class BucketExecutables:
             _check_identities(key, identities, _identities(graph), perm)
             moved = [
                 (o, n, sources[o]) if sources[o] is not None else (o, n)
-                for o, n in enumerate(perm_)
+                for o, n in enumerate(perm)
                 if o != n
             ]
             logger.info(
@@ -348,7 +348,7 @@ class BucketExecutables:
             )
 
             def adopted(*args: Any, **kwargs: Any) -> Any:
-                return runnable(*[args[n] for n in perm_], **kwargs)
+                return runnable(*[args[n] for n in perm], **kwargs)
 
             return adopted
         raise ShapeSpecializationError(
