@@ -16,9 +16,11 @@
 # the bot's default, so this file changes nothing until someone edits it.
 # README.md in this folder explains each setting.
 #
-# Format: one `setting: value` per line. A list is comma-separated on one
-# line (`a, b`), not a YAML list. An empty value is an empty list. `#` starts
-# a comment. Edits take effect once they merge into main.
+# Format: one `setting: value` per line. A list goes on one line, separated
+# by commas, in double quotes ("a, b"), not as a YAML list. An empty value
+# is an empty list. `#` starts a comment. The file must stay valid YAML,
+# because the check-yaml pre-commit hook checks it. Edits take effect once
+# they merge into main.
 
 # Where nits (optional polish) go: summary, inline or off.
 nits: summary
@@ -30,9 +32,9 @@ questions: summary
 max_inline_comments: 15
 
 # Problem labels that get inline comments: "blocking, should-fix" or "blocking".
-inline_labels: blocking, should-fix
+inline_labels: "blocking, should-fix"
 
-# Files the bot does not review: comma-separated glob patterns.
+# Files the bot does not review: glob patterns, for example "docs/**, **/*.md".
 ignore_paths:
 
 # Shortest time between two reviews of one PR: 15 to 1440 minutes.
@@ -41,5 +43,8 @@ cooldown_minutes: 60
 # Review ready PRs without being asked: on or off.
 automatic_reviews: on
 
-# More title words that stop an automatic review: comma-separated.
+# More title words that stop an automatic review, for example "experimental, on hold".
+# Already skipped without listing them: draft PRs, and titles with "WIP" or
+# "draft" at the start or in brackets ([WIP], Draft:, (draft)), or with
+# "do not review", "do not merge" or "do not submit" anywhere.
 title_keywords_to_skip:
