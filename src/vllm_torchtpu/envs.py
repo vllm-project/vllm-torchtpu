@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     VLLM_TPU_HC_PREFILL_TILE: int | None = None
+    VLLM_TPU_HC_PACKED_MIX: bool = True
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -417,6 +418,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # HC debug override: auto/unset uses the kernel policy, 0 uses Torch,
     # positive multiples of 128 override tile/profitability for both components.
     "VLLM_TPU_HC_PREFILL_TILE": env_nonnegative_int_or_auto("VLLM_TPU_HC_PREFILL_TILE"),
+    # HC packed prefill mix: project injection gates inside the mix kernel
+    # and carry logits instead of the full-width norm tensor. Resource
+    # admission still falls back to the norm-carrier path; False forces it.
+    "VLLM_TPU_HC_PACKED_MIX": env_bool("VLLM_TPU_HC_PACKED_MIX", default=True),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many

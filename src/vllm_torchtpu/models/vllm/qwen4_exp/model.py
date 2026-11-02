@@ -16,10 +16,11 @@
 from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
 from itertools import chain
-from typing import cast
+from typing import NamedTuple, cast
 
 import torch
 from torch import nn
+from torch.nn.modules import module as nn_module_registry
 from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.forward_context import get_forward_context
@@ -49,7 +50,13 @@ from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.model_hooks import qwen4_options
 
 from .config import Qwen4ExpEngramConfig, gdn_cache_spec, require_unified_pool
-from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .hyperconnection import (
+    GatedResidual,
+    HcPackedMixState,
+    HyperConnectionConfig,
+    combine_then_mix_packed,
+    combine_then_mix_terminal,
+)
 from .parallel import PLEParallel
 from .pd_identity import LoadedWeightIdentity
 from .ple import PLEInputs
@@ -76,6 +83,43 @@ def hc_config(config):
         hc_lowrank=config.hc_lowrank,
         rms_norm_eps=config.rms_norm_eps,
         hc_per_branch_norm=True,
+    )
+
+
+class HcCrossLayerMix(NamedTuple):
+    """Cross-layer carrier for a fused combine into the next attention mix.
+
+    ``combined`` is the genuine combined value the producing layer's public
+    contract returns; ``mixed`` and ``residuals`` are the following layer's
+    attention-mix results when the producer fused its MLP combine into that
+    mix, so the next layer consumes them through the explicit internal
+    ``attention_mix`` entry instead of re-reading ``combined``.
+    """
+
+    combined: torch.Tensor
+    mixed: torch.Tensor
+    residuals: HcPackedMixState | tuple[torch.Tensor, torch.Tensor]
+
+
+def _module_call_observed(module):
+    """Whether a registered module hook would observe this module's call.
+
+    These are the same registries ``nn.Module._call_impl`` consults: a forward
+    hook reads the module's return value and a forward pre-hook reads its
+    arguments, locally on the module or globally through
+    ``register_module_forward_hook``. A decoder layer's public contract is a
+    plain combined tensor in and out, so the internal cross-layer carrier and
+    the terminal mix output may only cross a boundary whose modules no hook
+    observes. The registries are read before the module call, so the decision
+    precedes any hook, and eager calls re-read them on every forward; a traced
+    graph fixes the decision for its hook state exactly like the module's own
+    ``_call_impl`` dispatch.
+    """
+    return bool(
+        module._forward_hooks
+        or module._forward_pre_hooks
+        or nn_module_registry._global_forward_hooks
+        or nn_module_registry._global_forward_pre_hooks
     )
 
 
@@ -154,22 +198,56 @@ class Qwen4ExpDecoderLayer(nn.Module):
         context_lens,
         valid_tokens,
         ple_raw_embeddings=None,
+        terminal_mixer=None,
+        attention_mix=None,
+        next_attention_mixer=None,
+        initial_embedding=None,
     ):
-        if self.ple is not None:
-            per_layer = cast(
-                dict[str, AttentionMetadata], get_forward_context().attn_metadata
+        if initial_embedding is not None:
+            # The explicit ``initial_embedding`` entry is the caller's
+            # statement that this attention mix is the chain's first mix and
+            # its hyper input is the un-expanded embedding: every branch slice
+            # of the expanded plane would carry the same value, so the mix
+            # broadcasts it in kernel and the expanded plane never
+            # materializes. A PLE-owning layer adds its output to the expanded
+            # value first, so it never receives one (the backbone wiring
+            # below); ``hidden`` holds the same un-expanded tensor.
+            assert self.ple is None, (
+                "a PLE-owning layer adds its output to the expanded embedding"
             )
-            ple_slots = per_layer[self.ple.prefix].mamba_state_indices
-            assert isinstance(ple_slots, torch.Tensor)
-            hidden = hidden + self.ple.forward_with_history(
-                hidden,
-                PLEInputs(input_ids, query_start_loc, ngram_context),
-                ple_slots,
-                context_lens > 0,
-                query_start_loc[-1:],
-                ple_raw_embeddings,
+            assert attention_mix is None, (
+                "an initial broadcast mix has no preceding owner to fuse"
             )
-        block, residual = self.attn_hyper_connection.mix(hidden)
+            block, residual = self.attn_hyper_connection.mix_packed_broadcast(
+                initial_embedding
+            )
+        elif attention_mix is None:
+            if self.ple is not None:
+                per_layer = cast(
+                    dict[str, AttentionMetadata], get_forward_context().attn_metadata
+                )
+                ple_slots = per_layer[self.ple.prefix].mamba_state_indices
+                assert isinstance(ple_slots, torch.Tensor)
+                hidden = hidden + self.ple.forward_with_history(
+                    hidden,
+                    PLEInputs(input_ids, query_start_loc, ngram_context),
+                    ple_slots,
+                    context_lens > 0,
+                    query_start_loc[-1:],
+                    ple_raw_embeddings,
+                )
+            block, residual = self.attn_hyper_connection.mix_packed(hidden)
+        else:
+            # The explicit ``attention_mix`` entry is the caller's statement
+            # that the preceding owner's combine was fused into this
+            # attention mix, so the combined value never reaches the
+            # ``hidden`` argument and no reader may run before the mix. A
+            # layer whose PLE reads the combined value first never receives
+            # one (the backbone wiring below).
+            assert self.ple is None, (
+                "a PLE-owning layer reads the combined value before its mix"
+            )
+            block, residual = attention_mix.mixed, attention_mix.residuals
         if self.layer_type == "linear_attention":
             block = self.linear_attn(block)
         else:
@@ -181,11 +259,41 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     context_lens,
                 ),
             )
-        hidden = self.attn_hyper_connection.combine(block, residual)
-        block, residual = self.mlp_hyper_connection.mix(hidden)
+        hidden, block, residual = combine_then_mix_packed(
+            self.attn_hyper_connection,
+            self.mlp_hyper_connection,
+            block,
+            residual,
+        )
         # GDN may leave padded rows unwritten; MoE dispatch requires finite inputs.
         block = torch.where(valid_tokens[:, None], block, 0)
-        return self.mlp_hyper_connection.combine(self.mlp(block), residual)
+        block = self.mlp(block)
+        if terminal_mixer is not None:
+            # The explicit ``terminal_mixer`` argument is the caller's statement
+            # that this layer's combined value feeds that mix-only owner alone
+            # (the backbone wiring below): the combine then fuses into the mix
+            # and the combined value never reaches HBM. Every other caller
+            # keeps the default public contract and receives the combined
+            # tensor.
+            assert next_attention_mixer is None, (
+                "terminal and cross-layer mixes would consume one combine twice"
+            )
+            return combine_then_mix_terminal(
+                self.mlp_hyper_connection, terminal_mixer, block, residual
+            )
+        if next_attention_mixer is None:
+            return self.mlp_hyper_connection.combine(block, residual)
+        # The explicit ``next_attention_mixer`` argument is the caller's
+        # statement that this layer's combined value feeds that attention mix
+        # alone (the backbone wiring below): the combine then fuses into the
+        # mix, and the carrier holds the genuine combined tensor for the
+        # public flow together with the next layer's mix results. Every other
+        # caller keeps the default public contract and receives the combined
+        # tensor.
+        combined, mixed, residuals = combine_then_mix_packed(
+            self.mlp_hyper_connection, next_attention_mixer, block, residual
+        )
+        return HcCrossLayerMix(combined, mixed, residuals)
 
 
 @support_torch_compile(
@@ -255,9 +363,57 @@ class Qwen4ExpBackbone(nn.Module):
         hidden = (
             self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         )
-        hidden = hidden.repeat(1, self.hc_count)
-        for layer in self.layers:
-            hidden = layer(
+        # The first attention mix's hyper input is this embedding expanded
+        # across branches: every branch slice of the expanded plane carries
+        # the same value. When no PLE adds to the expanded value first and no
+        # registered hook observes the first layer's call -- its arguments are
+        # the public expanded plane -- the backbone hands that layer the
+        # un-expanded embedding, the mix broadcasts it in kernel, and the
+        # expanded plane never materializes. Every other distribution keeps
+        # the public repeat exactly.
+        first_layer = next(iter(self.layers), None)
+        initial_embedding = None
+        if (
+            first_layer is not None
+            and cast(Qwen4ExpDecoderLayer, first_layer).ple is None
+            and not _module_call_observed(first_layer)
+        ):
+            initial_embedding = hidden
+        else:
+            hidden = hidden.repeat(1, self.hc_count)
+        # Each layer's attention mix consumes the previous layer's combined
+        # value. When the next layer reads that value through its attention
+        # mix alone -- no PLE addition intervenes between the two -- the
+        # producing layer fuses its MLP combine into that mix and hands the
+        # next layer the cross-layer carrier; the genuine combined tensor
+        # stays the carrier's first field. Every PLE-owning boundary keeps the
+        # public tensor flow, and only the final layer's combined output feeds
+        # the mix-only terminal hyper-connection.
+        # The internal carrier and the terminal mix output are legal only
+        # across boundaries no registered module hook observes: a forward hook
+        # reads the producing layer's return value and a pre-hook reads the
+        # consuming layer's arguments, and both contracts are the public
+        # combined tensor. Any observed boundary keeps the public tensor flow,
+        # so the carrier never crosses a hook. This holds for every fallback
+        # too (packed mix disabled or ragged token counts): the wiring simply
+        # never hands the internal entries to an observed module.
+        attention_mix = None
+        terminal_mixer = None
+        last = len(self.layers) - 1
+        for index, layer in enumerate(self.layers):
+            following = None
+            if index < last:
+                following_layer = cast(Qwen4ExpDecoderLayer, self.layers[index + 1])
+                if (
+                    following_layer.ple is None
+                    and not _module_call_observed(layer)
+                    and not _module_call_observed(following_layer)
+                ):
+                    following = following_layer.attn_hyper_connection
+            terminal_mixer = None
+            if index == last and not _module_call_observed(layer):
+                terminal_mixer = self.hyper_connection_mixer
+            result = layer(
                 hidden,
                 positions.to(torch.int64),
                 input_ids.to(torch.int64),
@@ -266,8 +422,28 @@ class Qwen4ExpBackbone(nn.Module):
                 context_lens,
                 valid_tokens,
                 ple_raw_embeddings,
+                terminal_mixer=terminal_mixer,
+                attention_mix=attention_mix,
+                next_attention_mixer=following,
+                initial_embedding=initial_embedding,
             )
-        return self.hyper_connection_mixer.mix(hidden)[0]
+            initial_embedding = None
+            if isinstance(result, HcCrossLayerMix):
+                hidden = result.combined
+                attention_mix = result
+            else:
+                hidden = result
+                attention_mix = None
+        if terminal_mixer is None:
+            # No terminal fusion ran: an empty backbone has no layer to fuse
+            # into (config validation requires a positive layer count, so
+            # production always does), or the final layer's call is observed
+            # by a registered hook and returned its genuine public combined
+            # tensor. The terminal mix runs here over that tensor exactly like
+            # the pre-fusion production loop, never in the raw
+            # hyper-connection layout.
+            return self.hyper_connection_mixer.mix(hidden)[0]
+        return hidden
 
 
 class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):

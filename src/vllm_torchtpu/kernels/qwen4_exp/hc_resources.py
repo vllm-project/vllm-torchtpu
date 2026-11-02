@@ -75,6 +75,31 @@ def _plane(rows: int, columns: int, row_tile: int, lanes: int, item: int) -> int
 
 
 @dataclasses.dataclass(frozen=True)
+class CombineMixMemory:
+    """Sizing for the boundary kernel fusing one combine with the next mix.
+
+    The staged residual tile becomes the normalization target in place, the
+    combined value lives in one single-buffered full-width ring whose output
+    copy drains during each tile's projections, and the combine pre-stage adds
+    a block ring, an incoming-logit ring, and their FP32 conversion planes.
+    """
+
+    resident_bytes: int
+    buffer_bytes: int
+    working_bytes: int
+    headroom_bytes: int
+
+    @property
+    def total_bytes(self) -> int:
+        return (
+            self.resident_bytes
+            + self.buffer_bytes
+            + self.working_bytes
+            + self.headroom_bytes
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class FullMixMemory:
     resident_bytes: int
     buffer_bytes: int
@@ -89,6 +114,72 @@ class FullMixMemory:
             + self.working_bytes
             + self.headroom_bytes
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class InjectMixMemory:
+    """Sizing for the mix variant that also projects injection gates.
+
+    The normalized hyper input is consumed in vector memory in place of the
+    staged input tile, so the kernel drops the full-width normalized output
+    ring and adds the resident injection weight plus the per-token logit
+    planes instead.
+    """
+
+    resident_bytes: int
+    buffer_bytes: int
+    working_bytes: int
+    headroom_bytes: int
+
+    @property
+    def total_bytes(self) -> int:
+        return (
+            self.resident_bytes
+            + self.buffer_bytes
+            + self.working_bytes
+            + self.headroom_bytes
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class TerminalMixMemory:
+    """Sizing for the boundary variant fusing the final combine with the
+    terminal mix.
+
+    The terminal consumer has no combine and no inject projection of its own,
+    so the combined value needs no HBM stream and no combined ring: it is
+    formed in place over the staged residual tile, which then carries the
+    normalized value. The mix reduction is strip-scheduled like the boundary
+    kernel, so no [tile, width] FP32 plane exists.
+    """
+
+    resident_bytes: int
+    buffer_bytes: int
+    working_bytes: int
+    headroom_bytes: int
+
+    @property
+    def total_bytes(self) -> int:
+        return (
+            self.resident_bytes
+            + self.buffer_bytes
+            + self.working_bytes
+            + self.headroom_bytes
+        )
+
+
+def packed_projection_rows(
+    lowrank: int, branches: int, hardware: HcHardware
+) -> tuple[int, int]:
+    """Row boundary and total rows of the packed down+inject resident plane.
+
+    The down rows occupy ``[0, lowrank)``; the inject rows start at the first
+    hardware row boundary at or after ``lowrank`` so their DMA destination
+    begins on a physical sublane-tile row of the shared plane. The boundary
+    rows in between belong to no DMA range.
+    """
+    inject_row = _align(lowrank, hardware.row_alignment)
+    return inject_row, inject_row + branches
 
 
 def full_mix_memory(
@@ -129,6 +220,380 @@ def full_mix_memory(
         + lowrank_accumulator
     )
     return FullMixMemory(resident, buffers, working, normalization)
+
+
+def inject_mix_memory(
+    branches: int, hidden: int, lowrank: int, tile: int, hardware: HcHardware
+) -> InjectMixMemory:
+    """Size the inject-projecting mix kernel with the same conservative policy.
+
+    Relative to ``full_mix_memory`` the normalized-value output ring is
+    replaced by in-place reuse of the staged input tile, the injection weight
+    becomes resident, and the logits add one small BF16 ring plus one FP32
+    working plane. The down and inject weights share one resident plane: the
+    down rows run to the row-aligned boundary and the inject rows follow, so
+    the two DMA ranges tile the plane without overlap and the two projections
+    contract in one fullK dot. The remaining normalization/dot working-set
+    headroom is unchanged.
+    """
+    if min(branches, hidden, lowrank, tile) <= 0 or not hardware.supported:
+        raise ValueError("HC sizing requires positive geometry and known layout")
+    width = branches * hidden
+    inject_row, packed_rows = packed_projection_rows(lowrank, branches, hardware)
+
+    def bf(rows, cols):
+        return _plane(rows, cols, hardware.bf16_rows, hardware.lanes, 2)
+
+    def fp(rows, cols):
+        return _plane(rows, cols, hardware.fp32_rows, hardware.lanes, 4)
+
+    resident = (
+        _align(width, hardware.lanes) * 2 + bf(packed_rows, width) + bf(width, lowrank)
+    )
+    # One staged input ring (normalized in place) instead of separate input
+    # and normalized-value rings, plus the mixed output and logit rings.
+    buffers = 2 * bf(tile, width) + 2 * bf(tile, hidden) + 2 * bf(tile, branches)
+    normalization = (
+        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
+    )
+    packed_accumulator = _plane(
+        tile, packed_rows, hardware.fp32_rows, hardware.mxu_columns, 4
+    )
+    working = (
+        2 * fp(tile, width)
+        + 2 * fp(tile, hidden)
+        + bf(tile, packed_rows)
+        + packed_accumulator
+        + fp(tile, branches)
+    )
+    return InjectMixMemory(resident, buffers, working, normalization)
+
+
+def supports_inject_mix(
+    branches: int,
+    hidden: int,
+    lowrank: int,
+    tile: int,
+    hardware: HcHardware | None,
+) -> bool:
+    if (
+        hardware is None
+        or not hardware.supported
+        or hardware.mxu_columns <= 0
+        or hardware.mxu_columns % hardware.lanes
+        or 32 % hardware.bf16_rows
+        or 32 % hardware.fp32_rows
+        or min(branches, hidden, lowrank, tile) <= 0
+        or hidden % hardware.lanes
+        or tile % 128
+        or max(branches * hidden, lowrank, tile) > 2**31 - 1
+    ):
+        return False
+    return inject_mix_memory(branches, hidden, lowrank, tile, hardware).total_bytes <= (
+        hardware.vmem_bytes
+    )
+
+
+def inject_broadcast_mix_memory(
+    branches: int, hidden: int, lowrank: int, tile: int, hardware: HcHardware
+) -> InjectMixMemory:
+    """Size the broadcast-input variant of the inject-projecting mix.
+
+    The caller hands this kernel the un-expanded ``[tokens, hidden]`` residual
+    whose expanded plane would repeat every branch slice, so the input ring
+    stages ``hidden`` columns instead of the full width. The normalized dot
+    operand stays full-width — the packed down+inject projection contracts the
+    whole width — but it is no longer the DMA target: it is written by the
+    in-kernel broadcast normalization and read only within the same token tile,
+    so a single plane replaces the double-buffered input ring.
+    """
+    if min(branches, hidden, lowrank, tile) <= 0 or not hardware.supported:
+        raise ValueError("HC sizing requires positive geometry and known layout")
+    width = branches * hidden
+    inject_row, packed_rows = packed_projection_rows(lowrank, branches, hardware)
+
+    def bf(rows, cols):
+        return _plane(rows, cols, hardware.bf16_rows, hardware.lanes, 2)
+
+    def fp(rows, cols):
+        return _plane(rows, cols, hardware.fp32_rows, hardware.lanes, 4)
+
+    resident = (
+        _align(width, hardware.lanes) * 2 + bf(packed_rows, width) + bf(width, lowrank)
+    )
+    buffers = (
+        2 * bf(tile, hidden)
+        + bf(tile, width)
+        + 2 * bf(tile, hidden)
+        + 2 * bf(tile, branches)
+    )
+    normalization = (
+        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
+    )
+    packed_accumulator = _plane(
+        tile, packed_rows, hardware.fp32_rows, hardware.mxu_columns, 4
+    )
+    working = (
+        2 * fp(tile, width)
+        + 2 * fp(tile, hidden)
+        + bf(tile, packed_rows)
+        + packed_accumulator
+        + fp(tile, branches)
+    )
+    return InjectMixMemory(resident, buffers, working, normalization)
+
+
+def supports_inject_broadcast_mix(
+    branches: int,
+    hidden: int,
+    lowrank: int,
+    tile: int,
+    hardware: HcHardware | None,
+) -> bool:
+    if (
+        hardware is None
+        or not hardware.supported
+        or hardware.mxu_columns <= 0
+        or hardware.mxu_columns % hardware.lanes
+        or 32 % hardware.bf16_rows
+        or 32 % hardware.fp32_rows
+        or min(branches, hidden, lowrank, tile) <= 0
+        or hidden % hardware.lanes
+        or tile % 128
+        or max(branches * hidden, lowrank, tile) > 2**31 - 1
+    ):
+        return False
+    memory = inject_broadcast_mix_memory(branches, hidden, lowrank, tile, hardware)
+    return memory.total_bytes <= hardware.vmem_bytes
+
+
+def combine_broadcast_mix_memory(
+    branches: int, hidden: int, lowrank: int, tile: int, hardware: HcHardware
+) -> CombineMixMemory:
+    """Size the broadcast-residual variant of the boundary kernel.
+
+    The prior owner's residual arrives un-expanded — every branch slice of the
+    expanded plane carries the same ``[tokens, hidden]`` value — so the residual
+    ring stages ``hidden`` columns instead of the full width. The combined
+    value is formed from that ring per branch as before, and the normalized dot
+    operand moves from the residual ring to a single full-width plane written
+    by the strip normalization and read only within the same token tile.
+    """
+    if min(branches, hidden, lowrank, tile) <= 0 or not hardware.supported:
+        raise ValueError("HC sizing requires positive geometry and known layout")
+    width = branches * hidden
+    inject_row, packed_rows = packed_projection_rows(lowrank, branches, hardware)
+
+    def bf(rows, cols):
+        return _plane(rows, cols, hardware.bf16_rows, hardware.lanes, 2)
+
+    def fp(rows, cols):
+        return _plane(rows, cols, hardware.fp32_rows, hardware.lanes, 4)
+
+    resident = (
+        _align(width, hardware.lanes) * 2 + bf(packed_rows, width) + bf(width, lowrank)
+    )
+    buffers = (
+        2 * bf(tile, hidden)
+        + bf(tile, width)
+        + 2 * bf(tile, hidden)
+        + 2 * bf(tile, branches)
+        + bf(tile, width)
+        + 2 * bf(tile, hidden)
+        + 2 * bf(tile, branches)
+    )
+    normalization = (
+        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
+    )
+    packed_accumulator = _plane(
+        tile, packed_rows, hardware.fp32_rows, hardware.mxu_columns, 4
+    )
+    working = (
+        4 * fp(tile, hidden)
+        + 2 * fp(tile, branches)
+        + bf(tile, packed_rows)
+        + packed_accumulator
+    )
+    return CombineMixMemory(resident, buffers, working, normalization)
+
+
+def supports_combine_broadcast_mix(
+    branches: int,
+    hidden: int,
+    lowrank: int,
+    tile: int,
+    hardware: HcHardware | None,
+) -> bool:
+    if (
+        hardware is None
+        or not hardware.supported
+        or hardware.mxu_columns <= 0
+        or hardware.mxu_columns % hardware.lanes
+        or 32 % hardware.bf16_rows
+        or 32 % hardware.fp32_rows
+        or min(branches, hidden, lowrank, tile) <= 0
+        or hidden % hardware.lanes
+        or tile % 128
+        or max(branches * hidden, lowrank, tile) > 2**31 - 1
+    ):
+        return False
+    memory = combine_broadcast_mix_memory(branches, hidden, lowrank, tile, hardware)
+    return memory.total_bytes <= hardware.vmem_bytes
+
+
+def terminal_mix_memory(
+    branches: int, hidden: int, lowrank: int, tile: int, hardware: HcHardware
+) -> TerminalMixMemory:
+    """Size the terminal boundary kernel with the same conservative policy.
+
+    Relative to ``combine_mix_memory`` the combined value never streams to
+    HBM (no following combine exists) so its single-buffered ring and the
+    outgoing logit ring disappear, and the resident weight plane holds only
+    the down rows. The remaining combine pre-stage, normalization, and
+    strip-scheduled reduction working sets are unchanged.
+    """
+    if min(branches, hidden, lowrank, tile) <= 0 or not hardware.supported:
+        raise ValueError("HC sizing requires positive geometry and known layout")
+    width = branches * hidden
+
+    def bf(rows, cols):
+        return _plane(rows, cols, hardware.bf16_rows, hardware.lanes, 2)
+
+    def fp(rows, cols):
+        return _plane(rows, cols, hardware.fp32_rows, hardware.lanes, 4)
+
+    resident = (
+        _align(width, hardware.lanes) * 2 + bf(lowrank, width) + bf(width, lowrank)
+    )
+    buffers = (
+        2 * bf(tile, width)
+        + 2 * bf(tile, hidden)
+        + 2 * bf(tile, branches)
+        + 2 * bf(tile, hidden)
+    )
+    normalization = (
+        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
+    )
+    lowrank_accumulator = _plane(
+        tile, lowrank, hardware.fp32_rows, hardware.mxu_columns, 4
+    )
+    # Combine pre-stage plus strip-scheduled reduction: the peak concurrent
+    # set matches the boundary kernel minus the inject logit planes.
+    working = (
+        4 * fp(tile, hidden)
+        + 2 * fp(tile, branches)
+        + bf(tile, lowrank)
+        + lowrank_accumulator
+    )
+    return TerminalMixMemory(resident, buffers, working, normalization)
+
+
+def supports_terminal_mix(
+    branches: int,
+    hidden: int,
+    lowrank: int,
+    tile: int,
+    hardware: HcHardware | None,
+) -> bool:
+    if (
+        hardware is None
+        or not hardware.supported
+        or hardware.mxu_columns <= 0
+        or hardware.mxu_columns % hardware.lanes
+        or 32 % hardware.bf16_rows
+        or 32 % hardware.fp32_rows
+        or min(branches, hidden, lowrank, tile) <= 0
+        or hidden % hardware.lanes
+        or tile % 128
+        or max(branches * hidden, lowrank, tile) > 2**31 - 1
+    ):
+        return False
+    return terminal_mix_memory(
+        branches, hidden, lowrank, tile, hardware
+    ).total_bytes <= (hardware.vmem_bytes)
+
+
+def combine_mix_memory(
+    branches: int, hidden: int, lowrank: int, tile: int, hardware: HcHardware
+) -> CombineMixMemory:
+    """Size the boundary kernel with the same conservative policy.
+
+    Relative to ``inject_mix_memory`` the combine pre-stage adds the
+    single-buffered combined ring, a double-buffered block ring and incoming
+    logit ring, and the FP32 planes for the block operand and the injection
+    gates. The down and inject weights share one resident plane: the down rows
+    run to the row-aligned boundary and the inject rows follow, so the two DMA
+    ranges tile the plane without overlap and the two projections contract in
+    one fullK dot. The mix reduction runs one branch strip at a time, so its
+    dot outputs, sigmoid-weighted products, and the branch accumulator hold
+    ``[tile, hidden]`` planes reused strip-to-strip instead of the full-width
+    FP32 gate planes of the wide reduction; no ``[tile, width]`` FP32 plane
+    exists in this kernel.
+    """
+    if min(branches, hidden, lowrank, tile) <= 0 or not hardware.supported:
+        raise ValueError("HC sizing requires positive geometry and known layout")
+    width = branches * hidden
+    inject_row, packed_rows = packed_projection_rows(lowrank, branches, hardware)
+
+    def bf(rows, cols):
+        return _plane(rows, cols, hardware.bf16_rows, hardware.lanes, 2)
+
+    def fp(rows, cols):
+        return _plane(rows, cols, hardware.fp32_rows, hardware.lanes, 4)
+
+    resident = (
+        _align(width, hardware.lanes) * 2 + bf(packed_rows, width) + bf(width, lowrank)
+    )
+    buffers = (
+        2 * bf(tile, width)
+        + 2 * bf(tile, hidden)
+        + 2 * bf(tile, branches)
+        + bf(tile, width)
+        + 2 * bf(tile, hidden)
+        + 2 * bf(tile, branches)
+    )
+    normalization = (
+        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
+    )
+    packed_accumulator = _plane(
+        tile, packed_rows, hardware.fp32_rows, hardware.mxu_columns, 4
+    )
+    # Strip-scheduled mix reduction plus the combine stage's residual/block
+    # strips: the peak concurrent set is four [tile, hidden] FP32 planes (dot
+    # output, sigmoid product, accumulator, block conversion), the two small
+    # gate/logit planes, and the packed projection's lowrank+branch planes.
+    working = (
+        4 * fp(tile, hidden)
+        + 2 * fp(tile, branches)
+        + bf(tile, packed_rows)
+        + packed_accumulator
+    )
+    return CombineMixMemory(resident, buffers, working, normalization)
+
+
+def supports_combine_mix(
+    branches: int,
+    hidden: int,
+    lowrank: int,
+    tile: int,
+    hardware: HcHardware | None,
+) -> bool:
+    if (
+        hardware is None
+        or not hardware.supported
+        or hardware.mxu_columns <= 0
+        or hardware.mxu_columns % hardware.lanes
+        or 32 % hardware.bf16_rows
+        or 32 % hardware.fp32_rows
+        or min(branches, hidden, lowrank, tile) <= 0
+        or hidden % hardware.lanes
+        or tile % 128
+        or max(branches * hidden, lowrank, tile) > 2**31 - 1
+    ):
+        return False
+    return combine_mix_memory(
+        branches, hidden, lowrank, tile, hardware
+    ).total_bytes <= (hardware.vmem_bytes)
 
 
 def supports_full_mix(

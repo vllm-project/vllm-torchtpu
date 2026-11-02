@@ -22,7 +22,16 @@ from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
+from vllm_torchtpu.kernels.qwen4_exp.hc_combine_mix import (
+    combine_mix_inject,
+    combine_mix_inject_broadcast,
+    combine_mix_terminal,
+)
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
+from vllm_torchtpu.kernels.qwen4_exp.hc_inject_mix import (
+    full_mix_inject,
+    full_mix_inject_broadcast,
+)
 from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
 
 
@@ -93,5 +102,246 @@ def build_full_mix_op(
             x.new_empty((x.shape[0], hidden), dtype=torch.bfloat16),
             x.new_empty(x.shape, dtype=torch.bfloat16),
         )
+
+    return op
+
+
+@functools.cache
+def build_full_mix_inject_op(
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    hardware: HcHardware | None = None,
+):
+    eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+
+    def core(
+        x: jax.Array,
+        weight: jax.Array,
+        down: jax.Array,
+        up: jax.Array,
+        inject: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return full_mix_inject(
+            x,
+            weight,
+            down,
+            up,
+            inject,
+            branches=branches,
+            hidden=hidden,
+            eps=eps,
+            token_tile=token_tile,
+            hardware=hardware,
+        )
+
+    op = pallas.jax_op(
+        f"qwen4_exp::hc_inject_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"_l{_hardware_tag(hardware)}_v1",
+        core,
+    )
+
+    @op.register_fake
+    def fake(x, weight, down, up, inject):
+        return (
+            x.new_empty((x.shape[0], hidden), dtype=torch.bfloat16),
+            x.new_empty((x.shape[0], branches), dtype=torch.bfloat16),
+        )
+
+    return op
+
+
+@functools.cache
+def build_full_mix_inject_broadcast_op(
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    hardware: HcHardware | None = None,
+):
+    eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+
+    def core(
+        x: jax.Array,
+        weight: jax.Array,
+        down: jax.Array,
+        up: jax.Array,
+        inject: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return full_mix_inject_broadcast(
+            x,
+            weight,
+            down,
+            up,
+            inject,
+            branches=branches,
+            hidden=hidden,
+            eps=eps,
+            token_tile=token_tile,
+            hardware=hardware,
+        )
+
+    op = pallas.jax_op(
+        f"qwen4_exp::hc_inject_bcast_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"_l{_hardware_tag(hardware)}_v1",
+        core,
+    )
+
+    @op.register_fake
+    def fake(x, weight, down, up, inject):
+        return (
+            x.new_empty((x.shape[0], hidden), dtype=torch.bfloat16),
+            x.new_empty((x.shape[0], branches), dtype=torch.bfloat16),
+        )
+
+    return op
+
+
+@functools.cache
+def build_combine_mix_broadcast_op(
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    hardware: HcHardware | None = None,
+):
+    eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+
+    def core(
+        residual: jax.Array,
+        block: jax.Array,
+        in_logits: jax.Array,
+        weight: jax.Array,
+        down: jax.Array,
+        up: jax.Array,
+        inject: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return combine_mix_inject_broadcast(
+            residual,
+            block,
+            in_logits,
+            weight,
+            down,
+            up,
+            inject,
+            branches=branches,
+            hidden=hidden,
+            eps=eps,
+            token_tile=token_tile,
+            hardware=hardware,
+        )
+
+    op = pallas.jax_op(
+        f"qwen4_exp::hc_combine_bcast_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"_l{_hardware_tag(hardware)}_v1",
+        core,
+    )
+
+    @op.register_fake
+    def fake(residual, block, in_logits, weight, down, up, inject):
+        return (
+            residual.new_empty(
+                (residual.shape[0], branches * hidden), dtype=torch.bfloat16
+            ),
+            residual.new_empty((residual.shape[0], hidden), dtype=torch.bfloat16),
+            residual.new_empty((residual.shape[0], branches), dtype=torch.bfloat16),
+        )
+
+    return op
+
+
+@functools.cache
+def build_combine_mix_op(
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    hardware: HcHardware | None = None,
+):
+    eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+
+    def core(
+        residual: jax.Array,
+        block: jax.Array,
+        in_logits: jax.Array,
+        weight: jax.Array,
+        down: jax.Array,
+        up: jax.Array,
+        inject: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return combine_mix_inject(
+            residual,
+            block,
+            in_logits,
+            weight,
+            down,
+            up,
+            inject,
+            branches=branches,
+            hidden=hidden,
+            eps=eps,
+            token_tile=token_tile,
+            hardware=hardware,
+        )
+
+    op = pallas.jax_op(
+        f"qwen4_exp::hc_combine_mix_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"_l{_hardware_tag(hardware)}_v2",
+        core,
+    )
+
+    @op.register_fake
+    def fake(residual, block, in_logits, weight, down, up, inject):
+        return (
+            residual.new_empty(residual.shape, dtype=torch.bfloat16),
+            residual.new_empty((residual.shape[0], hidden), dtype=torch.bfloat16),
+            residual.new_empty((residual.shape[0], branches), dtype=torch.bfloat16),
+        )
+
+    return op
+
+
+@functools.cache
+def build_combine_mix_terminal_op(
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    hardware: HcHardware | None = None,
+):
+    eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+
+    def core(
+        residual: jax.Array,
+        block: jax.Array,
+        in_logits: jax.Array,
+        weight: jax.Array,
+        down: jax.Array,
+        up: jax.Array,
+    ) -> jax.Array:
+        return combine_mix_terminal(
+            residual,
+            block,
+            in_logits,
+            weight,
+            down,
+            up,
+            branches=branches,
+            hidden=hidden,
+            eps=eps,
+            token_tile=token_tile,
+            hardware=hardware,
+        )
+
+    op = pallas.jax_op(
+        f"qwen4_exp::hc_combine_mix_terminal_c{branches}_h{hidden}_m{token_tile}"
+        f"_e{eps_tag}_l{_hardware_tag(hardware)}_v1",
+        core,
+    )
+
+    @op.register_fake
+    def fake(residual, block, in_logits, weight, down, up):
+        return residual.new_empty((residual.shape[0], hidden), dtype=torch.bfloat16)
 
     return op

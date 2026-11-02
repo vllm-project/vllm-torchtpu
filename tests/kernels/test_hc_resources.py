@@ -25,11 +25,27 @@ from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_resources import (
     RESIDUAL_PIPELINE,
     HcHardware,
+    combine_broadcast_mix_memory,
+    combine_mix_memory,
     full_mix_memory,
+    inject_broadcast_mix_memory,
+    inject_mix_memory,
+    packed_projection_rows,
+    supports_combine_broadcast_mix,
+    supports_combine_mix,
     supports_full_mix,
+    supports_inject_broadcast_mix,
     supports_residual,
+    supports_terminal_mix,
+    terminal_mix_memory,
 )
-from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_full_mix_op
+from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
+    build_combine_mix_broadcast_op,
+    build_combine_mix_op,
+    build_combine_mix_terminal_op,
+    build_full_mix_inject_broadcast_op,
+    build_full_mix_op,
+)
 
 
 def hardware(capacity=64 << 20):
@@ -89,6 +105,114 @@ def test_unknown_or_unqualified_layout():
         replace(hardware(), mxu_columns=0),
     ]:
         assert not supports_full_mix(4, 128, 128, 128, info)
+
+
+def test_combine_mix_budget_boundary_and_cache_identity():
+    info = hardware()
+    needed = combine_mix_memory(4, 2560, 320, 128, info).total_bytes
+    assert not supports_combine_mix(
+        4, 2560, 320, 128, replace(info, vmem_bytes=needed - 1)
+    )
+    assert supports_combine_mix(4, 2560, 320, 128, replace(info, vmem_bytes=needed))
+    a = build_combine_mix_op(4, 128, 1e-6, 128, info)
+    assert build_combine_mix_op(4, 128, 1e-6, 128, info) is a
+    assert (
+        build_combine_mix_op(4, 128, 1e-6, 128, replace(info, vmem_bytes=128 << 20))
+        is not a
+    )
+
+
+def test_combine_mix_packs_down_and_inject_on_one_resident_plane():
+    info = hardware()
+    width = 4 * 2560
+    # 320 down rows already sit on the 16-row boundary, so the four inject
+    # rows follow directly and the single packed plane costs exactly the two
+    # separate planes it replaces.
+    assert packed_projection_rows(320, 4, info) == (320, 324)
+    estimate = combine_mix_memory(4, 2560, 320, 256, info)
+    assert estimate.resident_bytes == width * 2 + 336 * width * 2 + 384 * width * 2
+    # The inject mix stages the same two projections on one resident plane,
+    # so its residency carries the same packed rows instead of two planes.
+    assert inject_mix_memory(4, 2560, 320, 256, info).resident_bytes == (
+        width * 2 + 336 * width * 2 + 384 * width * 2
+    )
+    # An off-boundary lowrank pads the inject rows to the next row boundary;
+    # the boundary rows belong to no DMA range and the estimate carries them.
+    assert packed_projection_rows(40, 4, info) == (48, 52)
+    wider = replace(hardware(), bf16_rows=32, fp32_rows=16)
+    assert packed_projection_rows(40, 4, wider) == (64, 68)
+    assert packed_projection_rows(40, 4, wider)[0] % wider.row_alignment == 0
+
+
+def test_combine_mix_tile_admission_is_resource_derived():
+    # The strip-scheduled mix reduction holds no [tile, width] FP32 plane, so
+    # at this fixture geometry the 256-row tile fits the 64MiB capacity while
+    # the 512-row tile exceeds it: the boundary tracks the plane budget, not a
+    # tile whitelist.
+    assert supports_combine_mix(4, 2560, 320, 128, hardware())
+    assert supports_combine_mix(4, 2560, 320, 256, hardware())
+    needed = combine_mix_memory(4, 2560, 320, 256, hardware()).total_bytes
+    assert not supports_combine_mix(4, 2560, 320, 512, hardware())
+    assert supports_combine_mix(4, 2560, 320, 256, hardware(needed))
+    assert not supports_combine_mix(
+        4, 2560, 320, 256, replace(hardware(), vmem_bytes=needed - 1)
+    )
+    assert not supports_combine_mix(4, 129, 320, 128, hardware())
+    assert not supports_combine_mix(4, 2560, 320, 96, hardware())
+    assert not supports_combine_mix(4, 2560, 320, 128, None)
+
+
+def test_terminal_mix_budget_boundary_and_cache_identity():
+    info = hardware()
+    needed = terminal_mix_memory(4, 2560, 320, 128, info).total_bytes
+    assert not supports_terminal_mix(
+        4, 2560, 320, 128, replace(info, vmem_bytes=needed - 1)
+    )
+    assert supports_terminal_mix(4, 2560, 320, 128, replace(info, vmem_bytes=needed))
+    a = build_combine_mix_terminal_op(4, 128, 1e-6, 128, info)
+    assert build_combine_mix_terminal_op(4, 128, 1e-6, 128, info) is a
+    assert (
+        build_combine_mix_terminal_op(
+            4, 128, 1e-6, 128, replace(info, vmem_bytes=128 << 20)
+        )
+        is not a
+    )
+
+
+def test_terminal_mix_drops_combined_stream_and_inject_residency():
+    info = hardware()
+    width = 4 * 2560
+    # The resident plane holds only the terminal down rows; the boundary's
+    # packed plane carried the 16 alignment rows the inject range added.
+    estimate = terminal_mix_memory(4, 2560, 320, 256, info)
+    assert estimate.resident_bytes == width * 2 + 320 * width * 2 + 384 * width * 2
+    boundary = combine_mix_memory(4, 2560, 320, 256, info)
+    assert estimate.resident_bytes == boundary.resident_bytes - 16 * width * 2
+    # The combined single ring and the outgoing logit ring disappear; the
+    # staged residual, block, incoming logit, and mixed rings are unchanged.
+    assert estimate.buffer_bytes == boundary.buffer_bytes - (
+        256 * width * 2 + 2 * 256 * 128 * 2
+    )
+    # Same strip-scheduled reduction working set as the boundary kernel.
+    assert estimate.working_bytes == boundary.working_bytes
+
+
+def test_terminal_mix_tile_admission_is_resource_derived():
+    # The terminal kernel stages the same tile rings as the boundary minus the
+    # combined/logit planes, so the 256-row tile fits the 64MiB capacity while
+    # the 512-row tile exceeds it: the admission tracks the plane budget, not
+    # a tile whitelist.
+    assert supports_terminal_mix(4, 2560, 320, 128, hardware())
+    assert supports_terminal_mix(4, 2560, 320, 256, hardware())
+    needed = terminal_mix_memory(4, 2560, 320, 256, hardware()).total_bytes
+    assert not supports_terminal_mix(4, 2560, 320, 512, hardware())
+    assert supports_terminal_mix(4, 2560, 320, 256, hardware(needed))
+    assert not supports_terminal_mix(
+        4, 2560, 320, 256, replace(hardware(), vmem_bytes=needed - 1)
+    )
+    assert not supports_terminal_mix(4, 129, 320, 128, hardware())
+    assert not supports_terminal_mix(4, 2560, 320, 96, hardware())
+    assert not supports_terminal_mix(4, 2560, 320, 128, None)
 
 
 @pytest.mark.parametrize("tile", [16, 32, 64, 128])
@@ -404,3 +528,85 @@ def test_hardware_discovery_propagates_other_errors(
     with pytest.raises(type(error)) as caught:
         adapter.current_hc_hardware()
     assert caught.value is error
+
+
+def test_broadcast_mix_swaps_full_width_ring_for_unexpanded_ring():
+    info = hardware()
+    # The un-expanded residual ring plus the single normalized operand plane
+    # replace each base kernel's double-buffered full-width input/residual
+    # ring, so the broadcast variants buffer exactly 2*tile*hidden words
+    # fewer at this fixture geometry; residency and the projection/reduction
+    # working sets are unchanged.
+    inject = inject_mix_memory(4, 2560, 320, 256, info)
+    inject_bcast = inject_broadcast_mix_memory(4, 2560, 320, 256, info)
+    assert inject_bcast.resident_bytes == inject.resident_bytes
+    assert inject_bcast.working_bytes == inject.working_bytes
+    assert inject_bcast.buffer_bytes == inject.buffer_bytes - 2 * 256 * 2560 * 2
+    combine = combine_mix_memory(4, 2560, 320, 256, info)
+    combine_bcast = combine_broadcast_mix_memory(4, 2560, 320, 256, info)
+    assert combine_bcast.resident_bytes == combine.resident_bytes
+    assert combine_bcast.working_bytes == combine.working_bytes
+    assert combine_bcast.buffer_bytes == combine.buffer_bytes - 2 * 256 * 2560 * 2
+
+
+def test_broadcast_mix_budget_boundary_and_cache_identity():
+    info = hardware()
+    needed = inject_broadcast_mix_memory(4, 2560, 320, 256, info).total_bytes
+    assert not supports_inject_broadcast_mix(
+        4, 2560, 320, 256, replace(info, vmem_bytes=needed - 1)
+    )
+    assert supports_inject_broadcast_mix(
+        4, 2560, 320, 256, replace(info, vmem_bytes=needed)
+    )
+    a = build_full_mix_inject_broadcast_op(4, 128, 1e-6, 128, info)
+    assert build_full_mix_inject_broadcast_op(4, 128, 1e-6, 128, info) is a
+    assert (
+        build_full_mix_inject_broadcast_op(
+            4, 128, 1e-6, 128, replace(info, vmem_bytes=128 << 20)
+        )
+        is not a
+    )
+    # The broadcast registrations bind separately from the expanded-input ops
+    # they sit beside: distinct factory entries, never a shared cache slot.
+    assert a is not build_full_mix_op(4, 128, 1e-6, 128, info)
+    needed = combine_broadcast_mix_memory(4, 2560, 320, 128, info).total_bytes
+    assert not supports_combine_broadcast_mix(
+        4, 2560, 320, 128, replace(info, vmem_bytes=needed - 1)
+    )
+    assert supports_combine_broadcast_mix(
+        4, 2560, 320, 128, replace(info, vmem_bytes=needed)
+    )
+    b = build_combine_mix_broadcast_op(4, 128, 1e-6, 128, info)
+    assert build_combine_mix_broadcast_op(4, 128, 1e-6, 128, info) is b
+    assert (
+        build_combine_mix_broadcast_op(
+            4, 128, 1e-6, 128, replace(info, vmem_bytes=128 << 20)
+        )
+        is not b
+    )
+    assert b is not build_combine_mix_op(4, 128, 1e-6, 128, info)
+
+
+def test_broadcast_mix_tile_admission_is_resource_derived():
+    # The broadcast variants track the same plane budget as their base
+    # kernels: the 256-row tile fits the 64MiB capacity, the 512-row tile
+    # exceeds it, and no tile whitelist or token-count gate is involved.
+    info = hardware()
+    assert supports_inject_broadcast_mix(4, 2560, 320, 128, info)
+    assert supports_inject_broadcast_mix(4, 2560, 320, 256, info)
+    assert not supports_inject_broadcast_mix(4, 2560, 320, 512, info)
+    assert supports_combine_broadcast_mix(4, 2560, 320, 128, info)
+    assert supports_combine_broadcast_mix(4, 2560, 320, 256, info)
+    assert not supports_combine_broadcast_mix(4, 2560, 320, 512, info)
+    needed = combine_broadcast_mix_memory(4, 2560, 320, 256, info).total_bytes
+    assert supports_combine_broadcast_mix(4, 2560, 320, 256, hardware(needed))
+    assert not supports_combine_broadcast_mix(
+        4, 2560, 320, 256, replace(info, vmem_bytes=needed - 1)
+    )
+    for supports in (supports_inject_broadcast_mix, supports_combine_broadcast_mix):
+        assert not supports(4, 129, 320, 128, info)
+        assert not supports(4, 2560, 320, 96, info)
+        assert not supports(4, 2560, 320, 128, None)
+        assert not supports(4, 0, 320, 128, info)
+        assert not supports(0, 2560, 320, 128, info)
+        assert not supports(4, 2560, 0, 128, info)

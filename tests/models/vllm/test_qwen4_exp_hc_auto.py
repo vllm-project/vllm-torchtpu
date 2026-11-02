@@ -23,6 +23,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
 from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
     GatedResidual,
+    HcPackedMixState,
     HyperConnectionConfig,
 )
 
@@ -74,6 +75,9 @@ def route_view(module):
         prefill_combine_tile=module.prefill_combine_tile,
         _prefill_full_ops=module._prefill_full_ops,
         _prefill_combine_op=module._prefill_combine_op,
+        _prefill_inject_ops=module._prefill_inject_ops,
+        _prefill_boundary_ops=module._prefill_boundary_ops,
+        _prefill_terminal_ops=module._prefill_terminal_ops,
         _combine_token_tile=module._combine_token_tile,
     )
 
@@ -417,6 +421,150 @@ def test_forced_tiles_override_only_minimum_tokens(boundaries):
     assert combine_selected(module, block, x, x)
 
 
+@pytest.fixture
+def fused_boundary_ops(monkeypatch):
+    """Fill the packed-mix/boundary registries with ops that must not run."""
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
+
+    def build(branches, hidden, eps, tile, hardware):
+        def op(*operands):
+            pytest.fail("fused boundary kernel dispatched from a policy test")
+
+        return op
+
+    monkeypatch.setattr(vllm_adapter, "build_full_mix_inject_op", build)
+    monkeypatch.setattr(vllm_adapter, "build_combine_mix_op", build)
+
+
+def boundary_inputs(tokens):
+    device = SimpleNamespace(type="tpu", index=0)
+
+    def metadata(shape):
+        return SimpleNamespace(
+            shape=shape, ndim=len(shape), dtype=torch.bfloat16, device=device
+        )
+
+    return (
+        metadata((tokens, 10240)),
+        metadata((tokens, 2560)),
+        metadata((tokens, 4)),
+    )
+
+
+def boundary_selected(prior, following, x, block, logits):
+    """Run the production boundary admission over pure tensor metadata."""
+    from vllm_torchtpu.models.vllm.qwen4_exp import hyperconnection as hc
+
+    state = HcPackedMixState(x, logits, prior._hc_owner_id)
+    return hc._use_boundary_mix(route_view(prior), route_view(following), block, state)
+
+
+def packed_selected(module, x):
+    view = route_view(module)
+    return GatedResidual._use_packed_mix(view, x)
+
+
+def test_boundary_fusion_respects_prior_combine_component_override(
+    boundaries, fused_boundary_ops
+):
+    following = meta_module()
+    assert tuple(following._prefill_boundary_ops) == (256, 128)
+    x, block, logits = boundary_inputs(2048)
+
+    # Auto prior: the boundary admission owns the combine tiling, unchanged.
+    assert boundary_selected(meta_module(), following, x, block, logits)
+
+    # A forced combine tile equal to the fused tile still fuses.
+    matched = meta_module(prefill_full_tile=256)
+    assert matched._combine_token_tile == 256
+    assert boundary_selected(matched, following, x, block, logits)
+
+    # A forced combine tile different from the fused tile keeps the unfused
+    # public sequence: the prior owner's explicit component override wins.
+    mismatched = meta_module(prefill_full_tile=128)
+    assert mismatched._combine_token_tile == 128
+    assert not boundary_selected(mismatched, following, x, block, logits)
+    # The same forced tile fuses again at a token count that selects it, so
+    # this is a tile contract, not a shape gate.
+    short_x, short_block, short_logits = boundary_inputs(1152)
+    assert boundary_selected(mismatched, following, short_x, short_block, short_logits)
+
+    # Tile 0 disables the prior's combine component; the fused kernel embeds
+    # that combine, so only the unfused public sequence may run.
+    disabled = meta_module(prefill_combine_tile=0)
+    assert disabled._combine_token_tile == 0
+    assert not boundary_selected(disabled, following, x, block, logits)
+    assert not boundary_selected(
+        disabled, following, short_x, short_block, short_logits
+    )
+
+
+@pytest.mark.parametrize("tokens", [128, 256, 512, 640, 896, 1024, 1152, 2048])
+def test_auto_packed_mix_admits_whole_tile_counts(
+    tokens, boundaries, fused_boundary_ops
+):
+    """Auto packed-mix admission follows the actual tile geometry.
+
+    The staged tile is the kernel's unit of work, so any token count the
+    resource-built op set covers in whole tiles is legal: compact tile-aligned
+    prefill chunks and tile-multiple decode batches dispatch the packed kernel
+    exactly like large prefills, with no separate token floor.
+    """
+    module = meta_module()
+    x, _ = route_inputs(tokens)
+    assert packed_selected(module, x)
+    # The original full-mix admission keeps its own profitability floor, so the
+    # same counts below it stay on the public Torch path.
+    if tokens < 1024:
+        assert not mix_selected(module, x)
+
+
+@pytest.mark.parametrize("tokens", [1, 32, 127, 129, 600, 1023, 1025])
+def test_auto_packed_mix_falls_back_off_tile_counts(
+    tokens, boundaries, fused_boundary_ops
+):
+    """Sub-tile and ragged counts keep the public mix in auto mode."""
+    module = meta_module()
+    x, _ = route_inputs(tokens)
+    assert not packed_selected(module, x)
+
+
+@pytest.mark.parametrize("tokens", [128, 256, 512, 640, 896, 1152])
+def test_auto_boundary_mix_admits_whole_tile_counts(
+    tokens, boundaries, fused_boundary_ops
+):
+    """Auto boundary admission follows the same whole-tile geometry."""
+    following = meta_module()
+    x, block, logits = boundary_inputs(tokens)
+    assert boundary_selected(meta_module(), following, x, block, logits)
+
+
+@pytest.mark.parametrize("tokens", [1, 32, 127, 129, 600, 1023])
+def test_auto_boundary_mix_falls_back_off_tile_counts(
+    tokens, boundaries, fused_boundary_ops
+):
+    """Sub-tile and ragged counts keep the unfused public sequence."""
+    following = meta_module()
+    x, block, logits = boundary_inputs(tokens)
+    assert not boundary_selected(meta_module(), following, x, block, logits)
+
+
+@pytest.mark.parametrize("tokens", [256, 512])
+def test_auto_small_token_admission_keeps_dtype_and_rank_guards(
+    tokens, boundaries, fused_boundary_ops
+):
+    """The compact auto admission still requires TPU BF16 rank-2 operands."""
+    module = meta_module()
+    following = meta_module()
+    x32, _ = route_inputs(tokens, dtype=torch.float32)
+    rank3, _ = route_inputs(tokens, shape=(tokens, 1, 10240))
+    assert not packed_selected(module, x32)
+    assert not packed_selected(module, rank3)
+    block, logits = boundary_inputs(tokens)[1:]
+    assert not boundary_selected(module, following, x32, block, logits)
+    assert not boundary_selected(module, following, rank3, block, logits)
+
+
 def test_combine_does_not_read_unused_norm_or_mix_fields(boundaries):
     with torch.device("meta"):
         module = GatedResidual(
@@ -677,3 +825,110 @@ def test_both_disabled_components_do_not_discover_hardware(mode, monkeypatch):
     assert not module._prefill_full_ops and module._prefill_combine_op is None
     assert not module._use_prefill_mix(object())
     assert not module._use_prefill_combine(object(), object(), object())
+
+
+@pytest.fixture
+def fused_terminal_ops(monkeypatch):
+    """Fill the terminal registry with ops that must not run."""
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
+
+    def build(branches, hidden, eps, tile, hardware):
+        def op(*operands):
+            pytest.fail("fused terminal kernel dispatched from a policy test")
+
+        return op
+
+    monkeypatch.setattr(vllm_adapter, "build_combine_mix_terminal_op", build)
+
+
+def terminal_selected(prior, terminal, x, block, logits):
+    """Run the production terminal admission over pure tensor metadata."""
+    from vllm_torchtpu.models.vllm.qwen4_exp import hyperconnection as hc
+
+    state = HcPackedMixState(x, logits, prior._hc_owner_id)
+    return hc._use_terminal_mix(route_view(prior), route_view(terminal), block, state)
+
+
+def test_terminal_fusion_requires_mix_only_terminal(boundaries, fused_terminal_ops):
+    # A combine-owning consumer still needs the raw combined value as its own
+    # residual operand, so only the mix-only owner admits the fused terminal.
+    combining = meta_module()
+    x, block, logits = boundary_inputs(2048)
+    assert not terminal_selected(meta_module(), combining, x, block, logits)
+    assert terminal_selected(
+        meta_module(), meta_module(use_combine=False), x, block, logits
+    )
+
+
+def test_terminal_fusion_respects_prior_combine_component_override(
+    boundaries, fused_terminal_ops
+):
+    terminal = meta_module(use_combine=False)
+    assert tuple(terminal._prefill_terminal_ops) == (256, 128)
+    x, block, logits = boundary_inputs(2048)
+
+    # Auto prior: the terminal admission owns the combine tiling, unchanged.
+    assert terminal_selected(meta_module(), terminal, x, block, logits)
+
+    # A forced combine tile equal to the fused tile still fuses.
+    matched = meta_module(prefill_full_tile=256)
+    assert matched._combine_token_tile == 256
+    assert terminal_selected(matched, terminal, x, block, logits)
+
+    # A forced combine tile different from the fused tile keeps the unfused
+    # public sequence: the prior owner's explicit component override wins.
+    mismatched = meta_module(prefill_full_tile=128)
+    assert mismatched._combine_token_tile == 128
+    assert not terminal_selected(mismatched, terminal, x, block, logits)
+    # The same forced tile fuses again at a token count that selects it, so
+    # this is a tile contract, not a shape gate.
+    short_x, short_block, short_logits = boundary_inputs(1152)
+    assert terminal_selected(mismatched, terminal, short_x, short_block, short_logits)
+
+    # Tile 0 disables the prior's combine component; the fused kernel embeds
+    # that combine, so only the unfused public sequence may run.
+    disabled = meta_module(prefill_combine_tile=0)
+    assert disabled._combine_token_tile == 0
+    assert not terminal_selected(disabled, terminal, x, block, logits)
+    assert not terminal_selected(disabled, terminal, short_x, short_block, short_logits)
+
+
+@pytest.mark.parametrize("tokens", [128, 256, 512, 640, 896, 1024, 1152, 2048])
+def test_auto_terminal_mix_admits_whole_tile_counts(
+    tokens, boundaries, fused_terminal_ops
+):
+    """Auto terminal admission follows the actual tile geometry.
+
+    The staged tile is the kernel's unit of work, so any token count the
+    resource-built op set covers in whole tiles is legal: compact tile-aligned
+    prefill chunks and tile-multiple decode batches dispatch the fused
+    terminal kernel exactly like large prefills, with no separate token
+    floor.
+    """
+    terminal = meta_module(use_combine=False)
+    x, block, logits = boundary_inputs(tokens)
+    assert terminal_selected(meta_module(), terminal, x, block, logits)
+
+
+@pytest.mark.parametrize("tokens", [1, 32, 127, 129, 600, 1023, 1025])
+def test_auto_terminal_mix_falls_back_off_tile_counts(
+    tokens, boundaries, fused_terminal_ops
+):
+    """Sub-tile and ragged counts keep the unfused public sequence."""
+    terminal = meta_module(use_combine=False)
+    x, block, logits = boundary_inputs(tokens)
+    assert not terminal_selected(meta_module(), terminal, x, block, logits)
+
+
+@pytest.mark.parametrize("tokens", [256, 512])
+def test_auto_terminal_admission_keeps_dtype_and_rank_guards(
+    tokens, boundaries, fused_terminal_ops
+):
+    """The compact auto admission still requires TPU BF16 rank-2 operands."""
+    module = meta_module()
+    terminal = meta_module(use_combine=False)
+    x32, _ = route_inputs(tokens, dtype=torch.float32)
+    rank3, _ = route_inputs(tokens, shape=(tokens, 1, 10240))
+    block, logits = boundary_inputs(tokens)[1:]
+    assert not terminal_selected(module, terminal, x32, block, logits)
+    assert not terminal_selected(module, terminal, rank3, block, logits)
