@@ -95,9 +95,12 @@ def _kernel(
     nbuf,
     q_dtype,
     scale_dma,
+    window=False,
 ):
     # Weight slice: 0 in production (a [1, ...] view); a stack index in the benchmark.
     s = idx_ref[0]
+    # `window`: the output is column window idx_ref[1] (n_tiles * t wide) of W.
+    col0 = idx_ref[1] * (n_tiles * t) if window else 0
 
     ws_copy = None
     if scale_dma:
@@ -111,7 +114,7 @@ def _kernel(
 
     def copy(j):
         if split == "n":
-            src = w_hbm.at[s, :, pl.ds(j * t, t)]
+            src = w_hbm.at[s, :, pl.ds(col0 + j * t, t)]
         else:
             src = w_hbm.at[s, pl.ds(j * t, t), :]
         return pltpu.make_async_copy(src, wbuf.at[j % nbuf], sem.at[j % nbuf])
@@ -165,7 +168,16 @@ def _kernel(
 
 
 @functools.cache
-def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False):
+def _build(
+    m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False, n_full=None
+):
+    """`n_full`: the weight is `[n_stack, k, n_full]` and the call computes the
+    `n`-wide output column window `idx[1]` of it ('n' tiling only)."""
+    window = n_full is not None
+    if window and (split != "n" or scale_dma or n_full % n):
+        raise ValueError(
+            f"window {n} of {n_full} needs an 'n' tiling without scale_dma"
+        )
     full = k if split == "k" else n
     if full % t or t % LANE:
         raise ValueError(
@@ -192,6 +204,7 @@ def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False
         nbuf=nbuf,
         q_dtype=w_dtype,
         scale_dma=scale_dma,
+        window=window,
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
@@ -202,7 +215,7 @@ def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False
             # copies itself (see `fp8_skinny_matmul_stacked`).
             pl.BlockSpec(memory_space=pltpu.HBM)
             if scale_dma
-            else pl.BlockSpec((1, n), lambda g, idx: (0, 0)),
+            else pl.BlockSpec((1, n), lambda g, idx: (0, idx[1] if window else 0)),
             # W [s, k, n] as an HBM ref in the kernel. This alone does not stop
             # XLA staging the operand in VMEM first; see `hbm_pin`.
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -211,12 +224,13 @@ def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False
         scratch_shapes=scratch,
     )
     sd = "_sd" if scale_dma else ""
+    win = f"_of{n_full}" if window else ""
     return pl.pallas_call(
         kern,
         out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
         grid_spec=grid_spec,
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
-        name=f"fp8_skinny_{split}{t}_b{nbuf}{sd}_m{m}_k{k}_n{n}",
+        name=f"fp8_skinny_{split}{t}_b{nbuf}{sd}_m{m}_k{k}_n{n}{win}",
     )
 
 
@@ -296,6 +310,35 @@ def fp8_skinny_matmul_stacked(
     if n_logical is not None and n_logical != n:
         out = out[:, :n_logical]
     return out
+
+
+def fp8_skinny_matmul_window(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    window: jax.Array,
+    width: int,
+    *,
+    hbm_pin: bool = False,
+) -> jax.Array:
+    """Output columns `[window * width, (window + 1) * width)` of
+    `fp8_skinny_matmul(x, w_q, w_s)`, streaming only their weight: x [m<=16, k]
+    bf16, w_q fp8 [k, n], w_s f32 [n], `window` int32 [1] (data, so every rank
+    runs one program) -> [m, width]. Same tiles as the whole call's config, so
+    each column is the same dot and the values are bit-identical."""
+    m, k = x.shape
+    n = w_q.shape[1]
+    split, t, nbuf = pick_config(k, n)
+    if split != "n" or width % t:
+        raise ValueError(f"({k}, {n}) config {split}{t} does not tile a {width} window")
+    call = _build(m, k, width, 1, w_q.dtype, x.dtype, split, t, nbuf, n_full=n)
+    idx = jnp.concatenate(
+        [jnp.zeros((1,), jnp.int32), window.reshape(1).astype(jnp.int32)]
+    )
+    w_s2 = w_s.reshape(1, n).astype(jnp.float32)
+    if hbm_pin:
+        return _call_constrained(call, idx, x, w_s2, w_q[None], False, True)
+    return call(idx, x, w_s2, w_q[None])
 
 
 # Sites where TPU_FP8_SKINNY_SCALE_DMA is used in the model: those whose XLA scale

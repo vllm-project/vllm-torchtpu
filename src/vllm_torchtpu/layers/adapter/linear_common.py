@@ -18,6 +18,7 @@ from vllm_torchtpu.kernels.quantized_matmul.util import (
     xla_prequantized_matmul,
     xla_quantized_matmul,
 )
+from vllm_torchtpu.utils import get_shared_jax_op
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
 # `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
@@ -363,6 +364,27 @@ def get_fp8_linear_pallas_op(
         op.register_fake(_fake)
         _fp8_linear_pallas_ops[key] = op
         return op
+
+
+def get_fp8_linear_window_op(width: int, hbm_pin: bool = False) -> Callable:
+    """`op(x, w_q, w_s, window)`: output columns `[window * width, (window + 1) *
+    width)` of the TPU_FP8_LINEAR_PALLAS kernel on `(w_q, w_s)` for skinny `x`
+    (`fp8_skinny.fp8_skinny_matmul_window`; `window` int32 [1]). Build it outside
+    Dynamo (load time)."""
+
+    def build(name: str) -> Callable:
+        def fn(
+            x: jax.Array, w_q: jax.Array, w_s: jax.Array, window: jax.Array
+        ) -> jax.Array:
+            return fp8_skinny.fp8_skinny_matmul_window(
+                x, w_q, w_s, window, width, hbm_pin=hbm_pin
+            )
+
+        op = pallas.jax_op(name, fn)
+        op.register_fake(lambda x, w_q, w_s, window: x.new_empty((x.shape[0], width)))
+        return op
+
+    return get_shared_jax_op("fp8_linear_window", (width, hbm_pin), build)
 
 
 def quantized_matmul_pallas(

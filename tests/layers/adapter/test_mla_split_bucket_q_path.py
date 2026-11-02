@@ -23,7 +23,7 @@ import torch
 
 # pytest prepends this directory to sys.path (no __init__.py here).
 from test_indexer_qb_overlap import _FakeIndexer  # noqa: E402
-from test_mla_rope_neox_permute import V_DIM, _inputs, _wrapper  # noqa: E402
+from test_mla_rope_neox_permute import QK, V_DIM, _inputs, _wrapper  # noqa: E402
 
 from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
@@ -128,3 +128,45 @@ def test_overlap_reads_the_rope_cache_before_the_indexer():
     cache = w.rotary_emb.cos_sin_cache
     first = next(i for i, e in enumerate(events) if e[1] is cache)
     assert first < events.index(("indexer", None))
+
+
+def test_decode_buckets_gather_the_local_q_window():
+    """TPU_MLA_LOCAL_Q_GATHER: a decode bucket projects this rank's column
+    window of q_b and all-gathers the heads; attention gets the q the whole
+    replicated projection gives. Here the window op slices the replicated
+    output and the gather rebuilds it from every rank's window, so only the
+    wrapper's plumbing (operands, window, head order) is under test."""
+    hidden, positions = _inputs(16, seed=4)
+    ref = _forward(_flagged(False), hidden, positions, None)
+    w = _flagged(False)
+    width = w.num_heads * QK
+    seen = {}
+
+    def window_op(q_c, w_q, w_s, window):
+        seen.update(q_c=q_c, operands=(w_q, w_s), window=window)
+        r = int(window)
+        return w.q_b_proj(q_c)[0][:, r * width : (r + 1) * width]
+
+    def gather(heads):
+        full = w.q_b_proj(seen["q_c"])[0]
+        windows = full.split(width, dim=-1)
+        r = int(seen["window"])
+        assert torch.equal(heads.reshape(heads.shape[0], -1), windows[r])
+        return full.view(heads.shape[0], -1, QK)
+
+    w.local_q_op = window_op
+    w.local_q_window = torch.tensor([1], dtype=torch.int32)
+    with (
+        patch.object(mla_op, "_qb_overlap_operands", lambda layer: ("w", "s")),
+        patch.object(mla_op, "all_gather_heads", gather),
+        patch.object(mla_op.vllm_compilation_backends, "model_tag", "backbone"),
+    ):
+        out = _forward(w, hidden, positions, None)
+        assert seen["operands"] == ("w", "s") and seen["window"] is w.local_q_window
+        seen.clear()
+        _forward(w, hidden, positions, "token_parallel")
+        assert not seen  # a split bucket keeps the replicated q_b
+    for name in ("q_nope", "q_pe", "kv_c", "k_pe", "topk"):
+        assert torch.equal(out[name], ref[name]), name
+    for a, b in zip(out["rep"], ref["rep"]):
+        assert torch.equal(a, b)

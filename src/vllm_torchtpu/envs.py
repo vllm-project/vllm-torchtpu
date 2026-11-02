@@ -218,6 +218,7 @@ if TYPE_CHECKING:
     TPU_MLA_DECODE_PROLOGUE: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_INDEXER_QB_OVERLAP: bool = False
+    TPU_MLA_LOCAL_Q_GATHER: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
@@ -991,6 +992,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # would otherwise idle on the top-k's call-done. Same kernel, same inputs:
     # bit-identical q. Needs the fp8 Pallas q_b site (TPU_FP8_LINEAR_PALLAS).
     "TPU_INDEXER_QB_OVERLAP": env_bool("TPU_INDEXER_QB_OVERLAP", default=False),
+    # Query replication, decode buckets of at most fp8_skinny.MAX_M tokens: a
+    # layer whose q_b the indexer does not overlap projects only this rank's
+    # heads (its column window of the replicated q_b weight, 1/dcp of the
+    # bytes) and all-gathers the heads over the DCP group, instead of every
+    # rank streaming the whole replicated weight. Same columns, same dots:
+    # bit-identical q. Needs the fp8 Pallas q_b site (TPU_FP8_LINEAR_PALLAS).
+    "TPU_MLA_LOCAL_Q_GATHER": env_bool("TPU_MLA_LOCAL_Q_GATHER", default=False),
     # Store each token's 64-byte fp8 RoPE key in 64 bytes instead of a padded
     # 128-byte row (eight tokens per 128-word row), cutting the sparse MLA
     # latent cache from 640 to 576 B/token. SparseCore layouts only; the

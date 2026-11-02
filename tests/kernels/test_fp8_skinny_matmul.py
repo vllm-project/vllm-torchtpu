@@ -376,3 +376,28 @@ def test_hbm_pin_lowers_to_hbm_color_and_no_vmem_staging(k, n, staged):
     if staged:
         assert _weight_vmem_lines(unpinned_hlo, k, n), "no staging to remove here"
     assert _weight_vmem_lines(pinned_hlo, k, n) == []
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("m", [4, 8, 16])
+def test_window_is_bit_identical_to_the_whole_call(m):
+    """q_b's per-rank column windows (TPU_MLA_LOCAL_Q_GATHER): each window's
+    output is the whole call's columns bit for bit, and the window index is
+    data, so one compiled program serves every rank."""
+    k, n, width = 2048, 16384, 1024
+    x = _x(m, k, m)
+    wq, ws = _w(k, n)
+    full = np.asarray(jax.jit(fp8_skinny.fp8_skinny_matmul)(x, wq, ws), np.float32)
+    f = jax.jit(
+        lambda a, b, c, r: fp8_skinny.fp8_skinny_matmul_window(a, b, c, r, width)
+    )
+    for r in (0, 5, n // width - 1):
+        y = np.asarray(f(x, wq, ws, jnp.array([r], jnp.int32)), np.float32)
+        np.testing.assert_array_equal(y, full[:, r * width : (r + 1) * width])
+
+
+def test_window_needs_an_n_tiled_config():
+    x = _x(16, 6144, 16)
+    wq, ws = _w(6144, 2688)  # q_a + kv_a tiles K
+    with pytest.raises(ValueError, match="does not tile"):
+        fp8_skinny.fp8_skinny_matmul_window(x, wq, ws, jnp.zeros((1,), jnp.int32), 1344)

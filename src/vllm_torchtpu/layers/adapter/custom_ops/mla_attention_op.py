@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
@@ -85,6 +86,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     VllmTPUDeepseekV32IndexerBackend,
     _retain_buffers,
 )
+from vllm_torchtpu.layers.adapter.cp_mla_attention import all_gather_heads
 from vllm_torchtpu.layers.adapter.linear_common import (
     DCP_ROWS_ATTR,
     FP8_PALLAS_N_ATTR,
@@ -94,6 +96,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     WEIGHT_FLIPPED_ATTR,
     _fp8_linear_pallas_hbm_pinned_jax,
     _fp8_linear_pallas_jax,
+    get_fp8_linear_window_op,
     get_prequantized_matmul_op,
     prequantized_matmul,
 )
@@ -2240,6 +2243,34 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and self.q_lora_rank is not None
         )
 
+        # TPU_MLA_LOCAL_Q_GATHER: on decode buckets, this rank's q heads through
+        # its column window of the replicated q_b weight, then the DCP group's
+        # all-gather of the heads (`_project_local_q`).
+        self.local_q_op = None
+        self.local_q_window = None
+        if (
+            envs.TPU_MLA_LOCAL_Q_GATHER
+            and self.dcp_q_replicate
+            and self.is_sparse
+            and self.q_lora_rank is not None
+        ):
+            from vllm_torchtpu.distributed.dcp import get_dcp_rank
+            from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+                fp8_skinny_hbm_pin_selected,
+            )
+
+            if get_dcp_rank() != q_proj_layer.rank_in_group:
+                raise NotImplementedError(
+                    "TPU_MLA_LOCAL_Q_GATHER needs the DCP rank to index the q_b "
+                    f"head windows (DCP rank {get_dcp_rank()}, q_b group rank "
+                    f"{q_proj_layer.rank_in_group})"
+                )
+            self.local_q_op = get_fp8_linear_window_op(
+                self.num_heads * self.qk_head_dim,
+                fp8_skinny_hbm_pin_selected(f"{prefix}.q_b_proj"),
+            )
+            self.local_q_window = dcp_rank_operand()
+
         # TPU_MLA_ROPE_NEOX_PERMUTE: set once the q / k_pe projection columns
         # are in half-split order, which is what switches `forward` to NeoX
         # rope -- the two can never disagree.
@@ -2310,6 +2341,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
     def _q_proj_layer(self):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
+
+    def _project_local_q(self, q_c: torch.Tensor) -> torch.Tensor:
+        """`q_b_proj(q_c)` under query replication, bit for bit: this rank's
+        heads from its column window of the replicated weight (1/dcp of the
+        bytes), all-gathered over the DCP group in head order."""
+        operands = _qb_overlap_operands(self.q_b_proj)
+        assert operands is not None and self.local_q_op is not None
+        local = self.local_q_op(q_c, *operands, self.local_q_window)
+        heads = local.view(q_c.shape[0], self.num_heads, self.qk_head_dim)
+        return all_gather_heads(heads).reshape(q_c.shape[0], -1)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
@@ -2429,6 +2470,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     )
                     if q is None:
                         q = self.q_b_proj(q_c)[0]
+                elif (
+                    getattr(self, "local_q_op", None) is not None
+                    and not split
+                    and vllm_compilation_backends.model_tag == "backbone"
+                    and q_c.shape[0] <= fp8_skinny.MAX_M
+                    and _qb_overlap_operands(self.q_b_proj) is not None
+                ):
+                    q = self._project_local_q(q_c)
                 else:
                     q = self.q_b_proj(
                         q_c if q_rows is None else q_c.index_select(0, q_rows)
