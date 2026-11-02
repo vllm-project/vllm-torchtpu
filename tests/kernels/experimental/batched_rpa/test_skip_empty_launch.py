@@ -15,7 +15,9 @@
 work, and every output is identical to the call that runs zero steps.
 
 The schedule half runs on CPU in Pallas TPU interpret mode; the kernel half
-needs a TPU (interpret mode cannot run the kernel's ref bitcasts).
+needs a TPU (interpret mode cannot run the kernel's ref bitcasts). The kernel
+test runs with max_num_seqs equal to the token count (conditional launch) and
+below it (unconditional launch with the in-kernel early exit).
 """
 
 import jax
@@ -32,7 +34,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as KB
 _DECODE_BLOCKS = KBC.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8)
 _PREFILL_BLOCKS = KBC.BlockSizes(bq_sz=64, bq_c_sz=16, bkv_sz=256, batch_size=2)
 _NUM_Q_HEADS, _NUM_KV_HEADS, _HEAD_DIM = 2, 1, 256
-_PAGE_SIZE, _PAGES_PER_SEQ, _MAX_SEQS, _TOKENS = 16, 8, 4, 16
+_PAGE_SIZE, _PAGES_PER_SEQ, _MAX_SEQS, _TOKENS = 16, 8, 16, 16
 
 
 def _configs(mode: KBC.RpaCase, skip_empty_launch: bool) -> KBC.RpaConfigs:
@@ -91,7 +93,9 @@ def _schedule(mode, skip_empty_launch, distribution, kv_lens, cu_q_lens):
 
 # One decode sequence and no mixed one: the decode-only step of c=1 serving.
 _DECODE_ONLY = dict(
-    distribution=(1, 1, 1), kv_lens=(100, 0, 0, 0), cu_q_lens=(0, 1, 1, 1, 1)
+    distribution=(1, 1, 1),
+    kv_lens=(100,) + (0,) * (_MAX_SEQS - 1),
+    cu_q_lens=(0,) + (1,) * _MAX_SEQS,
 )
 
 
@@ -115,19 +119,22 @@ def _require_tpu() -> None:
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("max_seqs", [_MAX_SEQS, 4])
 @pytest.mark.parametrize(
     "distribution, kv_lens, cu_q_lens",
     [
-        ((1, 1, 1), (100, 0, 0, 0), (0, 1, 1, 1, 1)),  # decode only: mixed empty
-        ((0, 0, 1), (40, 0, 0, 0), (0, 16, 16, 16, 16)),  # prefill only: decode empty
-        ((1, 1, 2), (100, 40, 0, 0), (0, 1, 13, 13, 13)),  # both segments
+        ((1, 1, 1), (100,), (0, 1)),  # decode only: mixed empty
+        ((0, 0, 1), (40,), (0, 16)),  # prefill only: decode empty
+        ((1, 1, 2), (100, 40), (0, 1, 13)),  # both segments
     ],
 )
-def test_kernel_outputs_bitwise_equal(distribution, kv_lens, cu_q_lens):
+def test_kernel_outputs_bitwise_equal(max_seqs, distribution, kv_lens, cu_q_lens):
+    kv_lens = kv_lens + (0,) * (max_seqs - len(kv_lens))
+    cu_q_lens = cu_q_lens + (cu_q_lens[-1],) * (max_seqs + 1 - len(cu_q_lens))
     _require_tpu()
     rng = np.random.default_rng(0)
     cache_shape = KB.get_kv_cache_shape(
-        _MAX_SEQS * _PAGES_PER_SEQ,
+        max_seqs * _PAGES_PER_SEQ,
         _PAGE_SIZE,
         _NUM_KV_HEADS,
         _HEAD_DIM,
@@ -142,11 +149,12 @@ def test_kernel_outputs_bitwise_equal(distribution, kv_lens, cu_q_lens):
         # The cache is donated, so each run gets a fresh copy.
         out, new_cache = KB.ragged_paged_attention(
             jnp.asarray(q, jnp.bfloat16),
-            jnp.asarray(k, jnp.bfloat16),
-            jnp.asarray(v, jnp.bfloat16),
+            # New K/V arrive in the cache dtype, as the attention layer quantizes them.
+            jnp.asarray(k, jnp.float8_e4m3fn),
+            jnp.asarray(v, jnp.float8_e4m3fn),
             jnp.asarray(cache, jnp.float8_e4m3fn),
             jnp.asarray(kv_lens, jnp.int32),
-            jnp.arange(_MAX_SEQS * _PAGES_PER_SEQ, dtype=jnp.int32),
+            jnp.arange(max_seqs * _PAGES_PER_SEQ, dtype=jnp.int32),
             jnp.asarray(cu_q_lens, jnp.int32),
             jnp.asarray(distribution, jnp.int32),
             decode_block_sizes=_DECODE_BLOCKS,

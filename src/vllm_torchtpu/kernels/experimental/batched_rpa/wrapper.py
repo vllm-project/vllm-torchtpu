@@ -634,9 +634,12 @@ def ragged_paged_attention(
             matmul so NaNs in unused VMEM or shared new-KV pages cannot propagate via
             0.0 * NaN. Defaults to None (True for SEQ_ALONG_LANE, False for
             HEAD_ALONG_SUBLANE).
-        skip_empty_launch: If True, the decode or mixed kernel call whose segment
-            of `distribution` is empty returns at entry, and its schedule writes
-            only `actual_steps`. Outputs are identical either way.
+        skip_empty_launch: If True, a decode or mixed kernel whose schedule has
+            no steps returns at entry, an empty schedule writes only
+            `actual_steps`, and on batches of at most max_num_seqs *
+            decode_query_size tokens an XLA conditional skips the launch of the
+            kernel whose segment of `distribution` is empty. Outputs are
+            identical either way.
         sliding_decode_max_bkv: Largest default decode KV block (tokens) when
             `sliding_window` is set. None keeps the VMEM-filling default.
 
@@ -792,6 +795,10 @@ def ragged_paged_attention(
         kv_new_lens = q_lens
         q_offsets = global_kv_cache_lens
 
+    # XLA copies the output buffer around the conditional, so the branch is
+    # limited to buckets no larger than a decode-only batch can be.
+    branch_on_empty_segment = queries.shape[0] <= max_num_seqs * decode_query_size
+
     def run_rpa_kernel(
         mode: configs.RpaCase,
         o_hbm_alias_q_hbm: jax.Array,
@@ -839,25 +846,31 @@ def ragged_paged_attention(
             computer_cls=computer_cls,
             extra_scalars=extra_scalars,
         )
-        result = kernel.rpa_kernel(
-            cu_q_lens,
-            q_offsets,
-            kv_cache_lens,
-            kv_new_lens,
-            schedule_hbm,
-            o_hbm_alias_q_hbm,
-            new_kv_hbm,
-            kv_cache,
-            lse_hbm_in,
-            cfgs=cfgs,
-            computer_cls=computer_cls,
-        )
-        if return_lse:
+
+        def launch(operands):
+            o_in, kv_in, lse_in = operands
+            result = kernel.rpa_kernel(
+                cu_q_lens,
+                q_offsets,
+                kv_cache_lens,
+                kv_new_lens,
+                schedule_hbm,
+                o_in,
+                new_kv_hbm,
+                kv_in,
+                lse_in,
+                cfgs=cfgs,
+                computer_cls=computer_cls,
+            )
             o_out, kv_out, lse_out = result
-        else:
-            o_out, kv_out, _ = result
-            lse_out = None
-        return o_out, kv_out, lse_out
+            return o_out, kv_out, lse_out if return_lse else None
+
+        operands = (o_hbm_alias_q_hbm, kv_cache, lse_hbm_in)
+        if not (skip_empty_launch and branch_on_empty_segment):
+            return launch(operands)
+        # The schedule stays outside the branch so layers keep sharing it.
+        seq_start, seq_end = cfgs.seq_range(distribution)
+        return jax.lax.cond(seq_end > seq_start, launch, lambda ops: ops, operands)
 
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
