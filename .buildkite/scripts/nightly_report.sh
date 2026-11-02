@@ -36,14 +36,16 @@ meta() {
 # not passed: a nightly test missing from the step's depends_on can stop a
 # pair being recorded, never let one through.
 tests_lane_passed() {
-  local file=".buildkite/pipeline_tests.yml" key outcome passed=true
+  local key outcome passed=true
   while IFS= read -r key; do
     outcome=$(buildkite-agent step get outcome --step "${key}" 2>/dev/null || true)
     echo "tests lane ${key}: ${outcome:-no outcome}"
     if [[ "${outcome}" != "passed" ]]; then
       passed=false
     fi
-  done < <(grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${file}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -v '_pr$')
+  done < <(grep -hoE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' \
+    .buildkite/pipeline_cpu.yml .buildkite/pipeline_tests.yml \
+    | sed -E 's/.*key:[[:space:]]*"?//' | grep -vE '(_pr|^unit_tests_tpu)$')
   [[ "${passed}" == true ]]
 }
 

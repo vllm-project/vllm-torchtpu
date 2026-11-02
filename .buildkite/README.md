@@ -1,14 +1,19 @@
 # Buildkite pipelines
 
-CI runs on the Kueue fleet: `bootstrap.sh` uploads the `pipeline_<lane>.yml`
-lanes (`tests`, `integration`, `perf`, `verify`), and every step runs in a pod
-through `.buildkite/kubernetes/run.sh`.
+CI runs on the Kueue fleet: `bootstrap.sh` renders `.buildkite/stages.yml`
+(`build`, `precheck`, `tpu`, `report`, and `promote` on the integration
+pipeline) through `.buildkite/scripts/render_pipeline.py` and uploads one
+pipeline across the active lanes (`tests`, `integration`, `perf`, `verify`).
+Every pod step runs through `.buildkite/kubernetes/run.sh`.
 
-`pipeline_tests.yml` runs unmarked unit tests in `tests/` in CPU pods and
-tests marked `tpu_test` (or `multichip`) on TPU v7x slices (1x1x1 and 2x2x1).
-PR steps exclude `nightly` tests; nightly steps include them. Both use the CI
-image built by `pipeline_build.yml`. The CPU steps set `JAX_PLATFORMS=cpu` so
-JAX does not look for a TPU.
+`pipeline_cpu.yml` (`precheck`) runs full-environment typecheck and unmarked
+unit tests in `tests/` in CPU pods (`JAX_PLATFORMS=cpu`), and
+`pipeline_tests.yml` (`tpu`) runs tests marked `tpu_test` or `multichip` on TPU
+v7x slices (1x1x1 and 2x2x1). PR steps exclude `nightly` tests; nightly steps
+include them. Both use the CI image built by `pipeline_build.yml`. The `tpu`
+stage depends on `precheck` unless the build matches `nightly`, `oncall-fix`,
+or `release-tag`, and wraps TPU execution in a `1`-per-author concurrency gate
+(`tpu-pr/<author>`) on `/ci run` (`CI_RUN_TPU=1`) builds.
 
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
@@ -22,11 +27,11 @@ steps not gated on it. The schedules keep clear of the hours the nightly's
 perf steps take. The integration pipeline also runs the lane, because its LKG
 promotion waits on two of its steps.
 
-A PR labeled `skip-tpu-ci` (it still needs `ready`) runs only the `tests` lane
-and the image build, and the lane's `Unit Tests on TPU` group is skipped through
-`SKIP_TPU_CI`, so what runs is the type check and the CPU unit tests. The
+A PR labeled `skip-tpu-ci` (it still needs `ready`) renders only `build` and
+`precheck` (`pipeline_build.yml` without the `-omni` image, plus
+`pipeline_cpu.yml`), so what runs is the type check and the CPU unit tests. The
 post-merge build of such a PR does the same: `bootstrap.sh` reads the merged
-PR's labels from GitHub. Keep TPU steps of the `tests` lane inside that group.
+PR's labels from GitHub.
 
 Releases and nightly images are published by the `vllm-torchtpu-release`
 pipeline in the TPU Release cluster; [`release/README.md`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/release/README.md)
