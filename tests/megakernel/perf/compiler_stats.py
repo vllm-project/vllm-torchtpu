@@ -287,7 +287,7 @@ def plan_bucket_stats(
     """Compute fast CPU static plan, VMEM/SMEM usage, and tunable breakdown for
     `(T, B)`.
     """
-    from vllm_torchtpu.megakernel import vmem
+    from vllm_torchtpu.megakernel.dma import vmem
     from vllm_torchtpu.megakernel.exec_spec import ExecSpec
     from vllm_torchtpu.megakernel.modules.gdn import GDNModule, GDNTunables
     from vllm_torchtpu.megakernel.modules.gqa import GQAModule, GQATunables
