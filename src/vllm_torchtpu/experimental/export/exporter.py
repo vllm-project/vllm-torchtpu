@@ -1106,8 +1106,9 @@ def _export_mtp_split(
     runs the draft over the step's rows and returns the MTP KV and the
     `_MTP_CARRIES`. `mtp_chain_req{R}`, one per request bucket up to
     `max_num_seqs`, takes `block_tables`, `req_dist`, the weights, the MTP KV and
-    the carries, drafts for the first `R` requests and returns the MTP KV and
-    `draft_tokens [R, k]`. The variants add up rather than multiply.
+    the carries, drafts for the first `R` requests over `R` rows and returns the
+    MTP KV and `draft_tokens [max_num_seqs, k]`, as `mtp_draft` does, rows past
+    `R` 0. The variants add up rather than multiply.
     """
     cfg: api.TextOnlyLLMExportConfig = model.export_config
     act = tpu_lowering.dtype_name(cfg.dtype)
@@ -1327,7 +1328,7 @@ def _export_mtp_split(
                 arg_index=len(states),
                 index=0,
                 name="draft_tokens",
-                shape=[req, k],
+                shape=[seqs, k],
                 dtype="i32",
                 argument_type="user_io",
                 is_input=False,

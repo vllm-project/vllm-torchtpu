@@ -2371,7 +2371,9 @@ class _SplitMtpExportableLLM(_TinyMtpExportableLLM):
 
     def mtp_chain(self, weights, kv_caches, *, last_hidden, rows, **_):  # type: ignore[no-untyped-def]
         logits = torch.matmul(last_hidden[:rows], weights["lm_head.weight"])
-        return list(kv_caches), logits.argmax(dim=-1).to(torch.int32).view(-1, 1)
+        tokens = logits.argmax(dim=-1).to(torch.int32).view(-1, 1)
+        pad = tokens.new_zeros((last_hidden.shape[0] - rows, 1))
+        return list(kv_caches), torch.cat([tokens, pad])
 
 
 def test_mtp_split_exports_a_first_pass_per_token_bucket_and_a_chain_per_request_bucket(
@@ -2399,8 +2401,9 @@ def test_mtp_split_exports_a_first_pass_per_token_bucket_and_a_chain_per_request
     assert by_type["user_io"] == ["block_tables", "req_dist"]
     assert by_type["intermediate"] == ["mtp_hidden", "mtp_positions", "mtp_kv_lens"]
     assert by_type["state"] == ["mtp_kv_cache_layer_0"]
+    # The drafts keep mtp_draft's max_num_seqs rows whatever the request bucket.
     drafts = [o for o in chain["outputs"] if o["name"] == "draft_tokens"]
-    assert drafts[0]["shape"] == [4, 1]
+    assert drafts[0]["shape"] == [8, 1]
     # Both stages bind the MTP KV to the same state slot as mtp_draft.
     slot = {
         i["name"]: i["index"]

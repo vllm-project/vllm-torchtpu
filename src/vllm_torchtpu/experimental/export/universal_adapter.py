@@ -1364,7 +1364,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         last_kv_lens: Any,
         rows: int,
     ) -> tuple[Sequence[Any], Any]:
-        """Drafts `K` tokens for each of the first `rows` requests.
+        """Drafts `K` tokens for each of the first `rows` requests, as
+        `draft_tokens [max_num_seqs, K]` whose later rows are 0.
 
         The first draft comes from `mtp_first_pass`'s hidden state; each further
         pass feeds every request its last draft and the draft's own hidden
@@ -1399,7 +1400,13 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             )
             hidden = self._run_mtp(weights, drafts[-1], pos, hidden, metadata)
             drafts.append(self.greedy_tokens(hidden, lm_head))
-        return self._mtp_kv_caches(), torch.stack(drafts, dim=1)
+        tokens = torch.stack(drafts, dim=1)
+        # `max_num_seqs` rows, as `mtp_draft` returns, so whatever reads the
+        # drafts does not depend on the request bucket; rows past `rows` are 0.
+        pad = cfg.max_num_seqs - rows
+        if pad:
+            tokens = torch.cat([tokens, tokens.new_zeros((pad, k))])
+        return self._mtp_kv_caches(), tokens
 
     def _run_mtp(
         self,
