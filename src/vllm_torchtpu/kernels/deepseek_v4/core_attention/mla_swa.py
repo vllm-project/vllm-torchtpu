@@ -164,6 +164,26 @@ def zero_rows_from(out: jax.Array, first_row: jax.Array) -> jax.Array:
     )(jnp.reshape(first_row, (1,)).astype(jnp.int32), out)
 
 
+def _omit_in_output(body, in_specs, inputs, input_output_aliases, num_scalar_prefetch):
+    """Drops the in_output operand (`inputs[4]`) of a SWA kernel call.
+
+    The call's output then starts uninitialized instead of in place of
+    in_output, which XLA would otherwise have to materialize and copy.
+    """
+    idx = num_scalar_prefetch + 4
+
+    def body_without_in_output(*refs):
+        return body(*refs[:idx], None, *refs[idx:])
+
+    aliases = {i - (i > idx): o for i, o in input_output_aliases.items() if i != idx}
+    return (
+        body_without_in_output,
+        in_specs[:4] + in_specs[5:],
+        inputs[:4] + inputs[5:],
+        aliases,
+    )
+
+
 def get_dtype_bitwidth(dtype):
     return jax.dtypes.itemsize_bits(dtype)
 
@@ -1432,7 +1452,8 @@ def run_mla_batched_decode_kernel(
     num_queries_per_block: int,
     start_seq_idx: jax.Array,  # i32
     end_seq_idx: jax.Array,  # i32
-    in_output: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
+    # None: the output starts uninitialized (see `_omit_in_output`).
+    in_output: jax.Array | None,  # [max_num_tokens, actual_num_q_heads, head_dim]
     in_l: jax.Array,  # [max_num_tokens, num_l_heads]
     in_m: jax.Array,  # [max_num_tokens, num_l_heads]
     attention_sinks: jax.Array,  # float32[num_q_heads]
@@ -1538,18 +1559,25 @@ def run_mla_batched_decode_kernel(
         sems,
     ]
 
+    body = functools.partial(
+        _mla_batched_decode_kernel,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        logical_page_size=logical_page_size,
+        unnormalized_output=unnormalized_output,
+        bkv_p=bkv_p,
+        seq_batch_sz=seq_batch_sz,
+    )
+    inputs = [attention_sinks, q, new_kv, cache_kv, in_output, in_l, in_m]
+    if in_output is None:
+        body, in_specs, inputs, input_output_aliases = _omit_in_output(
+            body, in_specs, inputs, input_output_aliases, len(scalar_prefetches)
+        )
+
     scope_name = f"SWA-d-bq_1-bkvp_{bkv_p}"
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
-            functools.partial(
-                _mla_batched_decode_kernel,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                logical_page_size=logical_page_size,
-                unnormalized_output=unnormalized_output,
-                bkv_p=bkv_p,
-                seq_batch_sz=seq_batch_sz,
-            ),
+            body,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
@@ -1567,16 +1595,7 @@ def run_mla_batched_decode_kernel(
             name=scope_name,
         )
     )
-    return kernel(
-        *scalar_prefetches,
-        attention_sinks,
-        q,
-        new_kv,
-        cache_kv,
-        in_output,
-        in_l,
-        in_m,
-    )
+    return kernel(*scalar_prefetches, *inputs)
 
 
 @functools.partial(
@@ -1753,7 +1772,8 @@ def mla_sliding_window_ragged_paged_attention(
         cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
         start_seq_idx: jax.Array,  # i32
         end_seq_idx: jax.Array,  # i32
-        in_output: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
+        # None: the output starts uninitialized (see `_omit_in_output`).
+        in_output: jax.Array | None,  # [max_num_tokens, actual_num_q_heads, head_dim]
         in_l: jax.Array,  # [max_num_tokens, num_l_heads]
         in_m: jax.Array,  # [max_num_tokens, num_l_heads]
         attention_sinks: jax.Array,  # float32[num_q_heads]
@@ -1855,22 +1875,34 @@ def mla_sliding_window_ragged_paged_attention(
             f"SWA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
             f"{'-ncb' if non_causal_block else ''}"
         )
+        body = functools.partial(
+            _mla_sliding_window_ragged_paged_attention_kernel,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            static_q_len=static_q_len,
+            bq_sz=bq_sz,
+            bkv_p=bkv_p,
+            bq_compute_sz=bq_compute_sz,
+            bkv_compute_sz=num_kv_pages_per_block * logical_page_size,
+            logical_page_size=logical_page_size,
+            unnormalized_output=unnormalized_output,
+            non_causal_block=non_causal_block,
+            q_compute_block_size=q_compute_block_size,
+        )
+        inputs = [attention_sinks, q, new_kv, cache_kv, in_output, in_l, in_m]
+        input_output_aliases = {
+            11: 0,  # Alias output activation with in_output
+            10: 1,  # Aliasing cache_kv with updated_cache_kv
+            12: 2,  # Alias l with in_l
+            13: 3,  # Alias m with in_m
+        }
+        if in_output is None:
+            body, in_specs, inputs, input_output_aliases = _omit_in_output(
+                body, in_specs, inputs, input_output_aliases, len(scalar_prefetches)
+            )
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
-                functools.partial(
-                    _mla_sliding_window_ragged_paged_attention_kernel,
-                    sm_scale=sm_scale,
-                    sliding_window=sliding_window,
-                    static_q_len=static_q_len,
-                    bq_sz=bq_sz,
-                    bkv_p=bkv_p,
-                    bq_compute_sz=bq_compute_sz,
-                    bkv_compute_sz=num_kv_pages_per_block * logical_page_size,
-                    logical_page_size=logical_page_size,
-                    unnormalized_output=unnormalized_output,
-                    non_causal_block=non_causal_block,
-                    q_compute_block_size=q_compute_block_size,
-                ),
+                body,
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
                     in_specs=in_specs,
@@ -1893,33 +1925,19 @@ def mla_sliding_window_ragged_paged_attention(
                         shape=(q.shape[0], num_l_heads), dtype=jnp.float32
                     ),
                 ],
-                input_output_aliases={
-                    11: 0,  # Alias output activation with in_output
-                    10: 1,  # Aliasing cache_kv with updated_cache_kv
-                    12: 2,  # Alias l with in_l
-                    13: 3,  # Alias m with in_m
-                },
+                input_output_aliases=input_output_aliases,
                 name=scope_name,
             )
         )
-        return kernel(
-            *scalar_prefetches,
-            attention_sinks,
-            q,
-            new_kv,
-            cache_kv,
-            in_output,
-            in_l,
-            in_m,
-        )
+        return kernel(*scalar_prefetches, *inputs)
 
     num_l_heads = align_to(num_q_heads, 128)
     l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
     m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
-    # The kernels write every token's row. A normalized output's padding rows
-    # are zeroed after them (see `zero_rows_from`); an unnormalized one is
-    # consumed by the csa, hca attn, which never reads padding tokens' rows.
-    in_output = jnp.empty_like(q)
+    # The kernels write every token's row, the first of them into a fresh
+    # output. A normalized output's padding rows are zeroed after them (see
+    # `zero_rows_from`); an unnormalized one is consumed by the csa, hca attn,
+    # which never reads padding tokens' rows.
 
     bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
     if sliding_window <= bkv_sz:
@@ -1934,7 +1952,7 @@ def mla_sliding_window_ragged_paged_attention(
             num_queries_per_block=num_queries_per_blocks[0],
             start_seq_idx=jnp.array(0),
             end_seq_idx=distribution[0],
-            in_output=in_output,
+            in_output=None,
             in_l=l,
             in_m=m,
             attention_sinks=attention_sinks,
@@ -1955,7 +1973,7 @@ def mla_sliding_window_ragged_paged_attention(
             cu_q_lens,
             start_seq_idx=jnp.array(0),
             end_seq_idx=distribution[0],
-            in_output=in_output,
+            in_output=None,
             in_l=l,
             in_m=m,
             attention_sinks=attention_sinks,
