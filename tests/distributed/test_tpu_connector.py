@@ -5999,6 +5999,7 @@ class TestTPUConnectorStats(unittest.TestCase):
             "kv_pull_time": [1200.0, 5400.0, 12000.0],
             "mb_transferred": [128.0, 256.0, 2048.0],
             "num_failed_transfers": [0, 1, 2],
+            "admission_refusals_insufficient_free_blocks": [2, 1],
         }
 
         self.metrics.observe(mock_data, engine_idx=0)
@@ -6144,6 +6145,16 @@ class TestTPUConnectorStats(unittest.TestCase):
     def test_prometheus_counter_num_failed_transfers(self):
         counter = self.metrics.counter_tpu_num_failed_transfers[0]
         assert counter._value.get() == 3.0
+
+    def test_prometheus_counter_kv_admission_refusals(self):
+        def value(reason):
+            return self.registry.get_sample_value(
+                "vllm:kv_admission_refusals_total",
+                {"model_name": "my_model", "engine": "0", "reason": reason},
+            )
+
+        assert value("insufficient_free_blocks") == 3
+        assert value("watermark") == 0  # Exists before the first refusal.
 
     def test_tpu_stats_aggregation_queue_lengths(self):
         stats = TpuKVConnectorStats()
@@ -8229,3 +8240,107 @@ class TestSpecSourceFenceRegisterAhead:
         assert fences == [(2, True)]
         worker.process_send_load(self._meta(c=False))
         assert fences == [(2, True), (2, True)]
+
+
+# ---------------------------------------------------------------------------
+# vllm:kv_admission_refusals
+# ---------------------------------------------------------------------------
+
+
+@patch(f"{_MOD}.TPUConnectorScheduler")
+class TestAdmissionRefusals:
+    """Refused admissions of waiting requests are counted by reason."""
+
+    @staticmethod
+    def _bound(watermark: float = 0.0):
+        """A connector bound to a real manager with 3 usable 16-token blocks."""
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm.v1.core.kv_cache_utils import init_none_hash
+
+        init_none_hash(sha256)
+        config = _make_test_kv_cache_config()
+        config.num_blocks = 4  # Block 0 is the null block.
+        manager = KVCacheManager(
+            config,
+            max_model_len=1024,
+            scheduler_block_size=16,
+            hash_block_size=16,
+            watermark=watermark,
+        )
+        connector = TPUConnector(
+            _make_vllm_config(is_producer=False), KVConnectorRole.SCHEDULER, config
+        )
+        connector.bind_kv_cache_manager(manager)
+        return connector, manager
+
+    @staticmethod
+    def _request(req_id: str, num_blocks: int):
+        from vllm import SamplingParams
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+        from vllm.v1.request import Request
+
+        return Request(
+            req_id,
+            list(range(num_blocks * 16)),
+            SamplingParams(max_tokens=1),
+            None,
+            block_hasher=get_request_block_hasher(16, sha256),
+        )
+
+    @staticmethod
+    def _refusals(connector) -> dict[str, list[int]]:
+        stats = connector.get_kv_connector_stats()
+        if stats is None:
+            return {}
+        prefix = "admission_refusals_"
+        return {
+            key.removeprefix(prefix): value
+            for key, value in stats.data.items()
+            if key.startswith(prefix) and value
+        }
+
+    def test_counted_once_per_episode(self, _):
+        connector, manager = self._bound()
+        first, second = self._request("a", 2), self._request("b", 2)
+        assert manager.allocate_slots(first, 32) is not None
+        assert manager.allocate_slots(second, 32) is None  # 1 block free.
+        assert manager.allocate_slots(second, 32) is None  # Retried: same episode.
+        assert self._refusals(connector) == {"insufficient_free_blocks": [1]}
+        assert self._refusals(connector) == {}
+
+        # Once admitted, a later refusal is a new episode.
+        manager.free(first)
+        assert manager.allocate_slots(second, 32) is not None
+        manager.free(second)
+        assert manager.allocate_slots(self._request("big", 4), 64) is None
+        assert self._refusals(connector) == {"exceeds_pool_capacity": [1]}
+
+    def test_watermark(self, _):
+        connector, manager = self._bound(watermark=0.5)  # 2 of 4 blocks.
+        assert manager.allocate_slots(self._request("a", 2), 32) is None
+        assert self._refusals(connector) == {"watermark": [1]}
+
+    def test_inflight_load_reserve(self, _):
+        connector, manager = self._bound()
+        request = self._request("a", 2)
+        assert manager.allocate_slots(request, 32, reserved_blocks=2) is None
+        assert self._refusals(connector) == {"inflight_load_reserve": [1]}
+
+    def test_running_requests_are_not_counted(self, _):
+        # A running request refused blocks is preempted, not refused admission.
+        connector, manager = self._bound()
+        request = self._request("a", 4)
+        request.status = RequestStatus.RUNNING
+        assert manager.allocate_slots(request, 64) is None
+        assert self._refusals(connector) == {}
+
+    def test_finished_request_ends_its_episode(self, _):
+        connector, manager = self._bound()
+        request = self._request("a", 4)
+        assert manager.allocate_slots(request, 64) is None
+        connector.request_finished(request, [])
+        # The same request ID re-queued, e.g. a retry, counts again.
+        assert manager.allocate_slots(self._request("a", 4), 64) is None
+        assert self._refusals(connector) == {"exceeds_pool_capacity": [2]}

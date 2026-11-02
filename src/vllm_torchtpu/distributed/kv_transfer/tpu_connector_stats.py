@@ -67,6 +67,15 @@ RUNNER_TIMING_BUCKETS_SECONDS = (
 )
 
 
+# Why `allocate_slots` refused a waiting request, most fundamental first.
+ADMISSION_REFUSAL_REASONS = (
+    "exceeds_pool_capacity",
+    "insufficient_free_blocks",
+    "watermark",
+    "inflight_load_reserve",
+)
+
+
 @dataclass
 class TpuKVConnectorStats(KVConnectorStats):
     """Container for transfer performance metrics"""
@@ -96,6 +105,11 @@ class TpuKVConnectorStats(KVConnectorStats):
         """Record a failed KV transfer operation."""
         self.data["num_failed_transfers"].append(1)
 
+    def record_admission_refusals(self, counts: dict[str, int]):
+        """Record refused admissions of waiting requests, by reason."""
+        for reason, count in counts.items():
+            self.data[f"admission_refusals_{reason}"].append(count)
+
     def record_prefill_queue_length(self, prefill_queue_length: int):
         """Record the prefill (send) queue length."""
         self.data["prefill_queue_length"].append(prefill_queue_length)
@@ -120,6 +134,7 @@ class TpuKVConnectorStats(KVConnectorStats):
             "kv_pull_time": [],
             "mb_transferred": [],
             "num_failed_transfers": [],
+            **{f"admission_refusals_{r}": [] for r in ADMISSION_REFUSAL_REASONS},
             "prefill_queue_length": [],
             "decode_queue_length": [],
             "runner_cpu_issue_seconds": [],
@@ -322,6 +337,18 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues
         )
 
+        # Not TPU-specific: named as in the HBM KV cache observability design.
+        self.counter_kv_admission_refusals = self._counter_cls(
+            name="vllm:kv_admission_refusals",
+            documentation=(
+                "Waiting requests refused KV cache blocks, once per request and reason."
+            ),
+            labelnames=[*labelnames, "reason"],
+        )
+        for engine_labels in self.per_engine_labelvalues.values():
+            for reason in ADMISSION_REFUSAL_REASONS:
+                self.counter_kv_admission_refusals.labels(*engine_labels, reason)
+
         self.dynamic_metrics: dict[str, tuple[str, Any, list[str]]] = (
             self._get_raiden_metric_definitions(labelnames)
         )
@@ -441,6 +468,12 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         ):
             for list_item in transfer_stats_data.get(gauge_item_key, []):
                 cast(Gauge, gauge_obj[engine_idx]).set(list_item)
+
+        for reason in ADMISSION_REFUSAL_REASONS:
+            for count in transfer_stats_data.get(f"admission_refusals_{reason}", []):
+                self.counter_kv_admission_refusals.labels(*engine_labels, reason).inc(
+                    count
+                )
 
         # Dynamic metric observations
         base_labels = (
