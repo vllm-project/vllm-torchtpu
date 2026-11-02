@@ -62,7 +62,12 @@ from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_me
 from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
     grouped_shared_expert_sharded,
 )
-from vllm_torchtpu.layers.adapter import fused_moe_decode, fused_moe_ep, token_padding
+from vllm_torchtpu.layers.adapter import (
+    fused_moe_decode,
+    fused_moe_ep,
+    mla_prefill_rows,
+    token_padding,
+)
 from vllm_torchtpu.layers.adapter.attention import _retain_buffers
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
@@ -289,7 +294,7 @@ class _GatherProjections(_OProjReduceScatter):
         indexer = mla.indexer if not mla.skip_topk else None
         if indexer is not None:
             parts.append(indexer.wk_weights_proj(x)[0])
-        rows = _all_rows(torch.cat(parts, dim=-1), num_tokens)
+        rows = all_rows(torch.cat(parts, dim=-1), num_tokens)
         if indexer is None:
             return rows, None
         width = parts[0].shape[-1]
@@ -313,7 +318,7 @@ def own_rows(x: torch.Tensor, rank: torch.Tensor, tp: int) -> torch.Tensor:
     return rows.index_select(0, rank.view(1)).view(x.shape[0] // tp, *x.shape[1:])
 
 
-def _all_rows(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+def all_rows(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
     # narrow, not [:n]: keeps the token dim the traced symbol itself.
     return tensor_model_parallel_all_gather(x, 0).narrow(0, 0, num_tokens)
 
@@ -365,6 +370,36 @@ def _sequence_parallel_layer_forward(
     return _moe(layer.mlp, hidden_states), residual
 
 
+def _rows_layer_forward(
+    layer: Any,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    gathered: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_sequence_parallel_layer_forward` with the attention block on this
+    rank's rows (`mla_prefill_rows`); `gathered` is the layer's
+    `mla_prefill_rows.prefetch`."""
+    hidden_states = _retain_buffers(hidden_states, *getattr(layer, KEEP_ATTR))
+    num_tokens = positions.shape[0]
+    tp = _check_divides(num_tokens)
+    rank = fused_moe_ep.rank_operand()
+    sharded_in = hidden_states.shape[0] != num_tokens
+    if residual is None:
+        residual = hidden_states
+        hidden_states = layer.input_layernorm(hidden_states)
+    else:
+        hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+    if not sharded_in:
+        hidden_states = own_rows(hidden_states, rank, tp)
+        residual = own_rows(residual, rank, tp)
+    hidden_states = mla_prefill_rows.forward(
+        layer.self_attn.mla_attn, positions, hidden_states, gathered, rank
+    )
+    hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+    return _moe(layer.mlp, hidden_states), residual
+
+
 def patched_decoder_layer_forward(
     self,
     positions: torch.Tensor,
@@ -403,11 +438,27 @@ def patched_model_forward(
         inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
     )
     residual = None
-    for layer in islice(self.layers, self.start_layer, self.end_layer):
+    rows = mla_prefill_rows.applies(num_tokens)
+    layers = list(islice(self.layers, self.start_layer, self.end_layer))
+    gathered = None
+    for i, layer in enumerate(layers):
+        if rows:
+            # Gather the next layer's o_proj / W_UV shards from this layer's
+            # input on: they run under this layer.
+            current, gathered = gathered, None
+            if i + 1 < len(layers) and mla_prefill_rows.armed(layers[i + 1]):
+                gathered = mla_prefill_rows.prefetch(layers[i + 1], hidden_states)
+            if mla_prefill_rows.armed(layer):
+                if current is None:
+                    current = mla_prefill_rows.prefetch(layer, hidden_states)
+                hidden_states, residual = _rows_layer_forward(
+                    layer, positions, hidden_states, residual, current
+                )
+                continue
         hidden_states, residual = layer(positions, hidden_states, residual, None)
     hidden_states, _ = self.norm(hidden_states, residual)
     if hidden_states.shape[0] != num_tokens:
-        hidden_states = _all_rows(hidden_states, num_tokens)
+        hidden_states = all_rows(hidden_states, num_tokens)
     return hidden_states
 
 
@@ -554,9 +605,31 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         backbone, [layer.mlp for layer in layers[first:]], shared_parts
     )
     del shared_parts
+    rows = envs.TPU_MLA_PREFILL_SEQUENCE_ROWS
+    rows_armed = []
     for layer in layers[first:]:
-        setattr(layer, KEEP_ATTR, _keep_list(layer.mlp))
+        keep = _keep_list(layer.mlp)
+        mla = layer.self_attn.mla_attn
+        # A layer that reuses the top-k rows of the indexer layer before it
+        # takes the rows block only if that layer did (the rows are in its
+        # order), so the first rows layer is an indexer layer.
+        if rows and (not mla.skip_topk or (rows_armed and rows_armed[-1])):
+            mla_prefill_rows.arm(mla)
+            keep += mla_prefill_rows.keep_list(mla)
+            rows_armed.append(True)
+        else:
+            rows_armed.append(False)
+        setattr(layer, KEEP_ATTR, keep)
     setattr(backbone, KEEP_ATTR, True)
+    if rows:
+        logger.info(
+            "TPU_MLA_PREFILL_SEQUENCE_ROWS: %d of %d MoE layers take the rows "
+            "block, buckets >= %d tokens, shards gathered by %s",
+            sum(rows_armed),
+            len(rows_armed),
+            envs.TPU_MLA_PREFILL_ROWS_MIN_TOKENS,
+            envs.TPU_MLA_PREFILL_ROWS_GATHER,
+        )
     n = len(layers) - first
     logger.info(
         "TPU_MOE_PREFILL_SEQUENCE_PARALLEL: %d MoE layers armed (layers %d..%d), "

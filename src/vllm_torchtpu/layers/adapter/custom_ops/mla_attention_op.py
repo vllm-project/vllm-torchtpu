@@ -14,6 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
+import dataclasses
 import re
 from typing import Any, cast
 
@@ -73,7 +74,11 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
-from vllm_torchtpu.layers.adapter import dcp_token_parallel_op, small_all_reduce_op
+from vllm_torchtpu.layers.adapter import (
+    dcp_token_parallel_op,
+    mla_prefill_rows,
+    small_all_reduce_op,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
@@ -532,6 +537,14 @@ def _streamidx_shared_meta_for(prefix: str) -> bool:
     )
 
 
+def pack_index_k(k: torch.Tensor) -> torch.Tensor:
+    """Index-K rows as the cache stores them: per-token fp8 values + one e8m0
+    scale byte, as uint8 `[T, head_dim + 1]` (cat needs one dtype, so the fp8
+    values go in as raw bytes)."""
+    k_quant, k_scale = quantize_tensor(k, torch.float8_e4m3fn, axis=-1, use_ue8m0=True)
+    return torch.cat([k_quant.view(torch.uint8), k_scale], dim=-1)
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
@@ -566,10 +579,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 qb_overlap=envs.TPU_INDEXER_QB_OVERLAP,
             )
             self.topk_op_tp = None
+            self.topk_op_tp_rows = None
             if envs.TPU_DCP_PREFILL_TOKEN_PARALLEL:
-                self.topk_op_tp = dcp_token_parallel_op.build_indexer_op(
-                    self, dcp_token_parallel_op.layout_for(vllm_config)
-                )
+                layout = dcp_token_parallel_op.layout_for(vllm_config)
+                self.topk_op_tp = dcp_token_parallel_op.build_indexer_op(self, layout)
+                if envs.TPU_MLA_PREFILL_SEQUENCE_ROWS:
+                    self.topk_op_tp_rows = dcp_token_parallel_op.build_indexer_op(
+                        self, dataclasses.replace(layout, rows_aligned=True)
+                    )
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
@@ -1152,16 +1169,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             f"streamindex_topk expects fp8 q, got {q_values.dtype}"
         )
 
-        k_quant, k_scale = quantize_tensor(
-            k,
-            torch.float8_e4m3fn,
-            axis=-1,
-            use_ue8m0=True,
-        )
-        # Pack per-token fp8 values + 1-byte e8m0 scale into the uint8 row
-        # layout the TPU kernel unpacks (head_dim value bytes + 1 scale byte).
-        # cat requires a single dtype, so view the fp8 values as raw bytes.
-        k_quant_packed = torch.cat([k_quant.view(torch.uint8), k_scale], dim=-1)
+        k_quant_packed = pack_index_k(k)
 
         attn_metadata = get_forward_context().attn_metadata
         metadata = None
@@ -1251,6 +1259,45 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             # index prep is one CSE class across them.
             return self.topk_indices_buffer, q_b_out
         return rows, q_b_out
+
+    def rows_topk(
+        self,
+        q_values: torch.Tensor,
+        weights: torch.Tensor,
+        q_values_dcp: torch.Tensor,
+        weights_dcp: torch.Tensor,
+        k_packed: torch.Tensor,
+    ) -> torch.Tensor:
+        """The top-k of a sequence-parallel-rows bucket (`mla_prefill_rows`),
+        written to the shared top-k rows like `forward_oot`'s:
+        `dcp_token_parallel_op.indexer_rows_aligned` of this rank's own rows
+        (`q_values`, `weights`), the DCP sub-batch's (`*_dcp`) and every row's
+        packed K. Returns at least `split_rows + R` rows."""
+        attn_metadata = get_forward_context().attn_metadata
+        metadata = None
+        if isinstance(attn_metadata, dict):
+            metadata = attn_metadata.get(self.k_cache.prefix)
+        kv_cache = self.k_cache.kv_cache
+        if not isinstance(metadata, AttentionMetadata) or kv_cache.numel() == 0:
+            return self.topk_indices_buffer
+        rd = metadata.request_distribution
+        topk_indices = dcp_token_parallel_op.indexer_rows_aligned(
+            self,
+            q_values.view(torch.uint8),
+            weights,
+            q_values_dcp.view(torch.uint8),
+            weights_dcp,
+            kv_cache,
+            k_packed,
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+            torch.stack([rd[0], rd[0], rd[2]]),
+        )
+        rows = self._write_topk_rows(topk_indices.shape[0], topk_indices)
+        if envs.TPU_INDEXER_TOPK_SHARED_READ:
+            return self.topk_indices_buffer
+        return rows
 
     def _write_topk_rows(
         self, num_tokens: int, topk_indices: torch.Tensor
@@ -1428,6 +1475,30 @@ class VllmTPUIndexer(Indexer):
         not take it (the caller runs `q_b_layer` itself). `kw`: the
         `wk_weights_proj` output, when the caller already projected the rows
         (only their count is then read from `hidden_states`)."""
+        q_fp8, q_scale, k, weights = self._project(
+            hidden_states, qr, positions, rotary_emb, kw
+        )
+        return self._finish_forward(
+            hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
+        )
+
+    def rows_inputs(
+        self,
+        qr: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb,
+        kw: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The top-k's per-row inputs for the rows of `qr` / `kw` (at
+        `positions`), as `forward` computes them: fp8 q, the weights scaled as
+        `_finish_forward` scales them, and the K rows packed as the cache stores
+        them (`pack_index_k`). For a caller that runs the top-k itself
+        (`mla_prefill_rows`)."""
+        q_fp8, q_scale, k, weights = self._project(None, qr, positions, rotary_emb, kw)
+        return q_fp8, self._scaled_weights(weights, q_scale), pack_index_k(k)
+
+    def _project(self, hidden_states, qr, positions, rotary_emb, kw):
+        """`(fp8 q, q scale, roped k, raw weights)` of each row."""
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         # Fused wk + weights_proj: one GEMM, then split
@@ -1453,9 +1524,7 @@ class VllmTPUIndexer(Indexer):
             )
             q_fp8, q_scale = qprep_op(q.reshape(-1, self.n_head * self.head_dim), c, s_)
             q_scale = q_scale.view(-1, self.n_head, 1)
-            return self._finish_forward(
-                hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
-            )
+            return q_fp8, q_scale, k, weights
         if permuted and rope_half_split_leading_supported(rotary_emb):
             # Half-split columns: rope the whole head in place, no split/cat.
             q = rope_half_split_leading(rotary_emb, positions, q, self.rope_dim)
@@ -1493,18 +1562,19 @@ class VllmTPUIndexer(Indexer):
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
-        return self._finish_forward(
-            hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
-        )
+        return q_fp8, q_scale, k, weights
 
-    def _finish_forward(self, hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer):
+    def _scaled_weights(self, weights, q_scale):
         # q_scale is fp32, so fold it in and cast back: the kernel expects the
         # weights in the activation dtype.
         weights_dtype = weights.dtype
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
-        weights = weights.squeeze(-1).to(weights_dtype)
+        return weights.squeeze(-1).to(weights_dtype)
+
+    def _finish_forward(self, hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer):
+        weights = self._scaled_weights(weights, q_scale)
 
         if q_b_layer is None:
             return self.indexer_op(hidden_states, q_fp8, k, weights)
@@ -1782,6 +1852,8 @@ class VllmTPUMLAAttention(MLAAttention):
             and vllm_config.parallel_config.decode_context_parallel_size > 1
         ):
             dcp_token_parallel_op.check_config(vllm_config)
+            if envs.TPU_MLA_PREFILL_SEQUENCE_ROWS:
+                mla_prefill_rows.check_config(vllm_config)
             self.token_parallel_layout = dcp_token_parallel_op.layout_for(vllm_config)
 
         # For compatibility reasons.
@@ -1937,6 +2009,7 @@ class VllmTPUMLAAttention(MLAAttention):
         self.sparse_mla_dcp_send_op = None
         self.sparse_mla_dcp_fused_op = None
         self.sparse_mla_tp_op = None
+        self.sparse_mla_tp_rows_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
@@ -1948,6 +2021,19 @@ class VllmTPUMLAAttention(MLAAttention):
                     self.token_parallel_layout,
                     q_replicated=bool(self.dcp_q_replicate),
                 )
+                # TPU_MLA_PREFILL_SEQUENCE_ROWS (mla_prefill_rows): the same
+                # split on each rank's sequence-parallel rows.
+                if envs.TPU_MLA_PREFILL_SEQUENCE_ROWS and self.dcp_q_replicate:
+                    self.sparse_mla_tp_rows_op = (
+                        dcp_token_parallel_op.build_attention_op(
+                            self,
+                            impl,
+                            dataclasses.replace(
+                                self.token_parallel_layout, rows_aligned=True
+                            ),
+                            q_replicated=True,
+                        )
+                    )
             # TPU_MLA_DECODE_PROLOGUE: the variant that takes the raw q head
             # and ropes q_pe in the attention kernel (query replication only).
             if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:

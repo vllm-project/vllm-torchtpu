@@ -31,6 +31,7 @@ bf16 reduce-scatter into an f32 accumulator.
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -303,8 +304,9 @@ def rows_oproj(
             f"rows_oproj shapes: latent {out_latent.shape} w_uv {w_uv.shape} "
             f"w_o {w_o.shape} w_scale {w_scale.shape} k_shard {k_shard}"
         )
-    block_rows = min(block_rows, rows)
-    if rows % block_rows or n_out % (chunks * 128):
+    # The largest row tile up to block_rows that divides the rows.
+    block_rows = math.gcd(rows, block_rows)
+    if block_rows % 8 or n_out % (chunks * 128):
         raise ValueError(f"rows {rows} / block_rows {block_rows} / n_out {n_out}")
     per_tile = head_tile // heads
     itemsize = out_latent.dtype.itemsize

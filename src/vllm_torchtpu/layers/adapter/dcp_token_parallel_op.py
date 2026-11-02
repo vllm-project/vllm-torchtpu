@@ -42,6 +42,7 @@ import torch
 from jax import lax
 from jax.sharding import PartitionSpec as P
 from vllm.compilation import backends as vllm_compilation_backends
+from vllm.distributed import tensor_model_parallel_all_gather
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
@@ -317,7 +318,11 @@ def build_attention_op(
     `split_rows + i`. `ql_nope` / `q_pe` (latent nope and rope query parts)
     hold this rank's heads of every row -- or, with `q_replicated` (query
     replication), every head of this rank's own rows (`q_rows`); the op
-    writes every row's latents into the caches."""
+    writes every row's latents into the caches. With `layout.rows_aligned`
+    the rows are the rank's sequence-parallel rows and the result is
+    `[R, heads * dcp, kv_lora_rank]`, every head of them (`attention_rows`)."""
+    if layout.rows_aligned and not q_replicated:
+        raise ValueError("aligned token-parallel rows need query replication")
     mesh = impl._dcp_mesh
     assert mesh is not None
     dcp, il = impl.dcp_size, impl.dcp_interleave_size
@@ -476,7 +481,8 @@ def build_attention_op(
         in_specs += (sharded,)
     op = pcp_streaming_jax_op(
         f"pallas::sparse_mla_tp_{layer.layer_name.replace('.', '_')}"
-        + ("_qrep" if q_replicated else ""),
+        + ("_qrep" if q_replicated else "")
+        + ("_rows" if layout.rows_aligned else ""),
         sparse_mla_tp if rank_tensor is None else sparse_mla_tp_rank,
         donate_argnums=(0, 1),
         mesh=mesh,
@@ -489,10 +495,14 @@ def build_attention_op(
         kv_cache_nope, kv_cache_rope, ql_nope, q_pe, kv_c_normed, *rest, **kwargs
     ):
         del q_pe, rest, kwargs
+        if layout.rows_aligned:  # every head of this rank's own rows
+            out_shape = (*ql_nope.shape[:2], kv_lora_rank)
+        else:
+            out_shape = (kv_c_normed.shape[0], num_heads, kv_lora_rank)
         return (
             torch.empty_like(kv_cache_nope),
             torch.empty_like(kv_cache_rope),
-            ql_nope.new_empty((kv_c_normed.shape[0], num_heads, kv_lora_rank)),
+            ql_nope.new_empty(out_shape),
         )
 
     op.register_fake(_fake)
@@ -631,7 +641,9 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
     """The token-parallel top-k op of a DCP indexer: `(q_bytes, weights,
     kv_cache, k_packed, seq_lens, page_indices, cu_q_lens, distribution) ->
     [T / dcp, topk]` this rank's rows as flat gather-buffer rows. Writes every
-    row's K into the cache first, as the DCP op does."""
+    row's K into the cache first, as the DCP op does. With
+    `layout.rows_aligned`, q_bytes / weights hold this rank's own rows and
+    the result is in their order (`indexer_rows_aligned`)."""
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 
     dcp, il = layout.dcp_size, layout.interleave_size
@@ -777,23 +789,29 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
         )
 
     sharded, rep = P(DCP_AXIS_NAME), P()
-    in_specs = (rep, rep, sharded, rep, rep, rep, rep, rep, sharded)
+    # Aligned, q and the weights are each rank's own rows (sharded).
+    rows = sharded if layout.rows_aligned else rep
+    in_specs = (rows, rows, sharded, rep, rep, rep, rep, rep, sharded)
     if rank_tensor is not None:
         in_specs += (sharded,)
     op = pcp_streaming_jax_op(
-        f"pallas::streamidx_topk_tp_{indexer.k_cache.prefix.replace('.', '_')}",
+        f"pallas::streamidx_topk_tp_{indexer.k_cache.prefix.replace('.', '_')}"
+        + ("_rows" if layout.rows_aligned else ""),
         streamidx_topk_tp if rank_tensor is None else streamidx_topk_tp_rank,
         donate_argnums=(2,),
         mesh=mesh,
         input_partition_specs=in_specs,
         output_partition_specs=(sharded, sharded),
     )
+    rows_per_q_row = 1 if layout.rows_aligned else dcp
 
     def _fake(q_bytes, weights, cache_kv, *rest, **kwargs):
         del weights, rest, kwargs
         return (
             torch.empty_like(cache_kv),
-            q_bytes.new_empty((q_bytes.shape[0] // dcp, topk), dtype=torch.int32),
+            q_bytes.new_empty(
+                (q_bytes.shape[0] // rows_per_q_row, topk), dtype=torch.int32
+            ),
         )
 
     op.register_fake(_fake)
@@ -846,3 +864,110 @@ def indexer_rows(
         head,
     )
     return torch.cat([head, tail])
+
+
+def indexer_rows_aligned(
+    indexer: Any,
+    q_bytes: torch.Tensor,
+    weights: torch.Tensor,
+    q_bytes_dcp: torch.Tensor,
+    weights_dcp: torch.Tensor,
+    kv_cache: torch.Tensor,
+    k_packed: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_indices: torch.Tensor,
+    cu_q_lens: torch.Tensor,
+    distribution: torch.Tensor,
+) -> torch.Tensor:
+    """`indexer_rows` on sequence-parallel rows (`mla_prefill_rows`):
+    `q_bytes` / `weights` are this rank's own rows, `*_dcp` the DCP sub-batch's
+    `[split_rows]`, `k_packed` every row. `[split_rows + R, topk]`: the DCP
+    rank-local top-k, then the token-parallel top-k in own-row order."""
+    s = indexer.topk_op_tp_rows.layout.split_rows
+    seq_s, qsl_s, dist_s = dcp_rows_metadata(seq_lens, cu_q_lens, distribution, s)
+    head = indexer.topk_op_dcp(
+        q_bytes_dcp,
+        weights_dcp,
+        kv_cache,
+        k_packed[:s],
+        seq_s,
+        page_indices,
+        qsl_s,
+        dist_s,
+    )
+    tail = indexer.topk_op_tp_rows(
+        q_bytes,
+        weights,
+        kv_cache,
+        k_packed,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        head,
+    )
+    return torch.cat([head, tail])
+
+
+def attention_rows(
+    layer: Any,
+    kv_cache: tuple[torch.Tensor, torch.Tensor],
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    ql_nope_dcp: torch.Tensor,
+    q_pe_dcp: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    topk_rows: torch.Tensor,
+    attn_metadata: Any,
+    rank: torch.Tensor,
+) -> torch.Tensor:
+    """Sparse MLA of a split bucket on sequence-parallel rows
+    (`mla_prefill_rows`): `[R, heads, kv_lora_rank]`, every head of this
+    rank's own rows. `ql_nope` / `q_pe` are every head of those rows,
+    `*_dcp` of the DCP sub-batch's rows `[0, split_rows)` (rank 0's own
+    first rows, filled in from the DCP path); `kv_c_normed` / `k_pe` every
+    row's quantized latents; `topk_rows` as `indexer_rows_aligned` returns
+    them; `rank` this rank's index as data (any shape of one element)."""
+    from vllm_torchtpu.layers.adapter.cp_mla_attention import (
+        merge_lse_partials_scatter_heads,
+    )
+
+    tp_op = layer.sparse_mla_tp_rows_op
+    s = tp_op.layout.split_rows
+    md = attn_metadata
+    seq_s, qsl_s, dist_s = dcp_rows_metadata(
+        md.seq_lens, md.query_start_loc, md.request_distribution, s
+    )
+    partial, lse = layer.sparse_mla_dcp_op(
+        kv_cache,
+        ql_nope_dcp,
+        q_pe_dcp,
+        kv_c_normed[:s],
+        k_pe[:s],
+        topk_rows[:s],
+        seq_s,
+        md.block_tables,
+        qsl_s,
+        dist_s,
+    )
+    head = merge_lse_partials_scatter_heads(
+        partial, lse, is_backbone=True, wire_dtype=partial.dtype, query_start_loc=qsl_s
+    )
+    out = tp_op(
+        kv_cache,
+        ql_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        topk_rows[s:],
+        md.seq_lens,
+        md.block_tables,
+        md.query_start_loc,
+        md.request_distribution,
+        lse,
+    )
+    # Every head of the DCP rows, in place of rank 0's first own rows.
+    head = tensor_model_parallel_all_gather(head, 1)
+    first = torch.where(rank.reshape(1, 1, 1) == 0, head, out[:s])
+    return out.slice_scatter(first, dim=0, start=0, end=s)

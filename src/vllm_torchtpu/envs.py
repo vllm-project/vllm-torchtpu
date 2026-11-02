@@ -110,6 +110,9 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_PREFILL_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_PREFILL_SP_SHARED_GROUP: int = 4
+    TPU_MLA_PREFILL_SEQUENCE_ROWS: bool = False
+    TPU_MLA_PREFILL_ROWS_GATHER: str = "allgather"
+    TPU_MLA_PREFILL_ROWS_MIN_TOKENS: int = 2048
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -1153,6 +1156,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (each holds 1/group of the shared expert; the group exchanges its rows).
     # 1 replicates the shared expert (no exchange, the most HBM).
     "TPU_MOE_PREFILL_SP_SHARED_GROUP": env_int("TPU_MOE_PREFILL_SP_SHARED_GROUP", 4),
+    # With TPU_MOE_PREFILL_SEQUENCE_PARALLEL and TPU_DCP_PREFILL_TOKEN_PARALLEL
+    # (query replication): on buckets of at least
+    # TPU_MLA_PREFILL_ROWS_MIN_TOKENS tokens, each MoE layer's attention block
+    # runs on the rank's own residual rows (`layers/adapter/mla_prefill_rows.py`):
+    # per-row work on own rows, one all-gather of the cache-ready latent and
+    # index-K rows, token-parallel attention of own rows, and W_UV + o_proj of
+    # every head of them with the layer's o_proj / W_UV shards gathered while
+    # the layer before runs -- no projection all-gather, all-to-all or o_proj
+    # reduce-scatter. o_proj's shard partials are summed in f32.
+    "TPU_MLA_PREFILL_SEQUENCE_ROWS": env_bool(
+        "TPU_MLA_PREFILL_SEQUENCE_ROWS", default=False
+    ),
+    # How TPU_MLA_PREFILL_SEQUENCE_ROWS gathers the o_proj / W_UV shards: one
+    # all-gather (offloaded to the SparseCores) or collective-permutes around a
+    # ring of the slice (TensorCore DMAs).
+    "TPU_MLA_PREFILL_ROWS_GATHER": env_with_choices(
+        "TPU_MLA_PREFILL_ROWS_GATHER", "allgather", ["allgather", "ring"]
+    ),
+    # Smallest bucket TPU_MLA_PREFILL_SEQUENCE_ROWS takes (the shard gather is
+    # the same size at every bucket; the collectives it replaces scale with it).
+    "TPU_MLA_PREFILL_ROWS_MIN_TOKENS": env_int("TPU_MLA_PREFILL_ROWS_MIN_TOKENS", 2048),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
