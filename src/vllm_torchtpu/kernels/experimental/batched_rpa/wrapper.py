@@ -572,21 +572,27 @@ def fp8_prefill_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
+    sliding_prefill_max_bkv: int | None = None,
 ) -> configs.BlockSizes:
     """Mixed-kernel block sizes for `fp8_compute`.
 
     The query block is halved until the kernel's buffers and scratch fit in
-    `FP8_PREFILL_BUFFER_VMEM_FRACTION` of `vmem_limit_bytes`.
+    `FP8_PREFILL_BUFFER_VMEM_FRACTION` of `vmem_limit_bytes`. On a sliding-window
+    layer, `sliding_prefill_max_bkv` caps both blocks as it does on the default
+    path (each rounded to its own granularity, the query block to `bq_c`).
     """
     rows_per_token = utils.align_to(
         model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
     )
     bq_c = max(1, FP8_PREFILL_CHUNK_ROWS // rows_per_token)
     bkv = FP8_PREFILL_KV_BLOCK
+    bq = FP8_PREFILL_STEP_ROWS // (rows_per_token * model_cfgs.num_kv_heads)
+    if model_cfgs.sliding_window is not None and sliding_prefill_max_bkv is not None:
+        bkv = min(bkv, sliding_prefill_max_bkv)
+        bq = min(bq, sliding_prefill_max_bkv)
     if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         bkv = utils.align_to(bkv, serve_cfgs.page_size)
-    bq = FP8_PREFILL_STEP_ROWS // (rows_per_token * model_cfgs.num_kv_heads)
-    bq = utils.align_to(max(bq, bq_c), bq_c)
+    bq = max(bq // bq_c, 1) * bq_c
     while True:
         blocks = configs.BlockSizes(bq_sz=bq, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=1)
         cfgs = configs.RpaConfigs(
@@ -905,7 +911,10 @@ def ragged_paged_attention(
         )
         q_fetch_hbm = quantize_queries(q_hbm, kv_cache.dtype)
         default_prefill = fp8_prefill_block_sizes(
-            model_cfgs, mixed_serve_cfgs, vmem_limit_bytes
+            model_cfgs,
+            mixed_serve_cfgs,
+            vmem_limit_bytes,
+            sliding_prefill_max_bkv=sliding_prefill_max_bkv,
         )
 
     # Pre-allocate LSE buffer.
