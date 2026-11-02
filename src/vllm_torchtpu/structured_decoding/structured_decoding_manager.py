@@ -371,7 +371,7 @@ class StructuredDecodingManager:
         req_id_to_index = self.runner.input_batch.req_id_to_index
         num_acceptable = grammar_output.num_acceptable_drafts
         # Requests without a grammar stay unconstrained (INT32_MAX).
-        limits = np.full(chunk_num_reqs + 1, np.iinfo(np.int32).max, dtype=np.int32)
+        limits = np.full(chunk_num_reqs, np.iinfo(np.int32).max, dtype=np.int32)
         has_structured = False
         for grammar_idx, req_id in enumerate(req_ids):
             batch_index = req_id_to_index.get(req_id)

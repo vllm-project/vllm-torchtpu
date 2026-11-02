@@ -7573,8 +7573,8 @@ class TPUModelRunner(GPUModelRunner):
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P, greedy)
         try:
-            # Match the low-block working set used by the LIFO BlockPool
-            # workaround. High physical block ids can trigger the v7x SC2
+            # Match the low-block working set that vLLM's LIFO reuse of freed
+            # blocks keeps in service. High physical block ids can trigger the v7x SC2
             # indexed-KV halt even though they are inside the allocated pool.
             # Warmup runs before serving, with no live scheduler requests;
             # reserve block 0 and keep each synthetic request's range disjoint.
@@ -7735,8 +7735,8 @@ class TPUModelRunner(GPUModelRunner):
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
         decode_ncts = [P + t for t in range(n_dec)]
-        # Reuse low physical block ids, as in _warmup_spec_batch and the LIFO
-        # BlockPool workaround, rather than exercising the SC2-sensitive end
+        # Reuse low physical block ids, as in _warmup_spec_batch and vLLM's
+        # LIFO reuse of freed blocks, rather than exercising the SC2-sensitive end
         # of the pool. Warmup runs before serving and tears down each request;
         # real requests overwrite their valid KV positions on first prefill.
         # Cover the highest context this request reaches, reserving block 0.

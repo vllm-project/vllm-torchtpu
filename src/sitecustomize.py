@@ -57,7 +57,7 @@ class _PostExecLoader(importlib.abc.Loader):
 
 
 class _VllmOmniCompatFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Lazy compatibility shim for vllm-omni==0.32.0rc1 against vLLM main HEAD.
+    """Lazy compatibility shim for vllm-omni==0.32.0rc1 against vLLM v0.33.0.
 
     vllm-omni 0.32.0rc1 references three vLLM paths that were relocated in
     upstream vLLM after v0.32.0:

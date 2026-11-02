@@ -23,10 +23,10 @@ consistent with that drop (``Scheduler._mamba_block_aligned_split``).
 The drop only protects draft-model KV, so it only affects the acceptance
 rate. The target model's KV and Mamba state are exact either way. vLLM keeps
 the block natively in two cases: ``SpeculativeConfig.disable_eagle_block_drop``,
-and, with prefix caching on and no KV connector, lookahead block hashes
-(``VllmConfig.num_hash_lookahead_tokens``), under which the scheduler sets
-``use_eagle_block_drop = False`` itself. With prefix caching on and no KV
-connector this module is therefore a no-op; otherwise it matches
+and lookahead block hashes (``VllmConfig.num_hash_lookahead_tokens > 0``: prefix
+caching on, no KV connector, ``disable_lookahead_block_hashes`` unset), under
+which the scheduler sets ``use_eagle_block_drop = False`` itself. With lookahead
+block hashes this module is therefore a no-op; otherwise it matches
 ``disable_eagle_block_drop`` except that the speculative config is left
 unchanged. In the engine-core process:
 

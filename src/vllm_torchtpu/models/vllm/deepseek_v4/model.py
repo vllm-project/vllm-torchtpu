@@ -299,9 +299,11 @@ class DeepseekV4Model(nn.Module):
         self.num_hash_layers: int = config.mlp_layer_types.count("hash_moe")
         # The hash routing input gather and the start_layer test assume the
         # hash layers come first.
-        assert set(config.mlp_layer_types[: self.num_hash_layers]) <= {"hash_moe"}, (
-            f"hash_moe layers must precede moe layers: {config.mlp_layer_types}"
-        )
+        if not set(config.mlp_layer_types[: self.num_hash_layers]) <= {"hash_moe"}:
+            raise ValueError(
+                "DeepSeek-V4 mlp_layer_types must list every hash_moe layer before "
+                f"any moe layer: {config.mlp_layer_types}"
+            )
 
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,

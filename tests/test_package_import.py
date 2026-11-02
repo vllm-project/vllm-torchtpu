@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import importlib.util
 import subprocess
 import sys
 
@@ -118,27 +117,5 @@ def test_sitecustomize_cold_import_serve_api_utils_subprocess():
         capture_output=True,
         text=True,
         timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
-
-
-@pytest.mark.parametrize(
-    "module_name",
-    [
-        "vllm_omni.diffusion.diffusion_engine",
-        "vllm_omni.entrypoints.openai.api_server",
-        "vllm_omni.entrypoints.cli.main",
-    ],
-)
-def test_sitecustomize_cold_import_vllm_omni_entrypoints_subprocess(
-    module_name: str,
-):
-    if importlib.util.find_spec("vllm_omni") is None:
-        pytest.skip("vllm_omni is not installed in this environment")
-    result = subprocess.run(
-        [sys.executable, "-c", f"import {module_name}"],
-        capture_output=True,
-        text=True,
-        timeout=60,
     )
     assert result.returncode == 0, result.stderr

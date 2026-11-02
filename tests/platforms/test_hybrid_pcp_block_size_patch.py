@@ -437,3 +437,27 @@ def test_no_prefix_cache_admits_950k_with_rank_local_capacity(pcp):
     assert manager.block_pool.get_num_free_blocks() == 1023
     # Normalization is local to the coordinator; physical storage is untouched.
     assert config.kv_cache_groups[-1].kv_cache_spec.block_size == 512
+
+
+def test_unpromotable_specs_are_planned_unchanged():
+    """Upstream raises when local specs cannot be promoted to one type (full
+    attention next to Mamba). The patch keeps the specs as they are, so hybrid
+    planning neither drops them nor logs a promotion it did not make."""
+    _patch_vllm_hybrid_pcp_block_sizes()
+    from vllm.v1.core import kv_cache_planning
+
+    specs = {
+        "attn": FullAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+        ),
+        "ssm": MambaSpec(
+            block_size=16,
+            shapes=((2, 8),),
+            dtypes=(torch.bfloat16,),
+            mamba_cache_mode="align",
+        ),
+    }
+    assert kv_cache_planning._promote_local_kv_cache_specs(dict(specs)) == specs
+    planned = dict(specs)
+    kv_cache_planning.unify_hybrid_kv_cache_specs(planned)
+    assert planned == specs

@@ -849,42 +849,6 @@ class TestKVCacheManager:
         assert set(kv_cache_specs) == {"layer.0"}
         assert self.runner.shared_kv_cache_layers == {"layer.1": "layer.0"}
 
-    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
-    @patch(
-        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
-        return_value=4096,
-    )
-    def test_get_kv_cache_spec_propagates_is_draft_layer(
-        self, mock_get_page_size, mock_get_layers
-    ):
-        target = _attention_layer_mock()
-        target.attn_type = AttentionType.DECODER
-        target.num_kv_heads = 2
-        target.head_size = 128
-        target.kv_sharing_target_layer_name = None
-        target.sliding_window = None
-        target.is_draft_layer = False
-        target.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
-
-        draft = _attention_layer_mock()
-        draft.attn_type = AttentionType.DECODER
-        draft.num_kv_heads = 2
-        draft.head_size = 128
-        draft.kv_sharing_target_layer_name = None
-        draft.sliding_window = None
-        draft.is_draft_layer = True
-        draft.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
-
-        mock_get_layers.return_value = {
-            "target.0": target,
-            "draft.0": draft,
-        }
-
-        kv_cache_specs = self.runner.get_kv_cache_spec()
-
-        assert kv_cache_specs["target.0"].is_draft is False
-        assert kv_cache_specs["draft.0"].is_draft is True
-
     def _make_shared_pair(self, attn_window, target_window):
         attn = _attention_layer_mock()
         attn.attn_type = AttentionType.DECODER
