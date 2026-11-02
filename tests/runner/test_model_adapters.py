@@ -192,6 +192,7 @@ def test_load_selects_adapter_after_device_setup_before_weights(monkeypatch, ena
         device_config=NS(),
         vllm_config=NS(),
         model_config=NS(quantization=None),
+        lora_config=None,
         load_config=object(),
         mesh=None,
         is_pooling_model=False,

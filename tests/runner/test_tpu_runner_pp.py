@@ -362,6 +362,7 @@ class TestRingStepPosting:
 
         runner = SimpleNamespace(
             execute_model_state=None,
+            model_adapter=None,
             _update_states=lambda _so: None,
             scheduler_config=SimpleNamespace(async_scheduling=False),
             _mtp_prefill_only=False,
