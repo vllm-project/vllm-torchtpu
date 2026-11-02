@@ -18,6 +18,9 @@ request's chunk at one point, ``_mamba_block_aligned_split``. This subclass
 routes every request through that point, clips prefill chunks to what the
 step's remaining time holds (``core/pp_chunks.py``) and then applies the
 base scheduler's mamba block alignment when the model has a mamba cache.
+Pipelines use it by default; one stage opts in with TPU_DYNAMIC_CHUNKS, so a
+chunk deep in a long prompt cannot stall a step's decodes for longer than a
+full prefix-free step.
 Decode requests count toward the step before any prefill chunk is sized,
 whatever their position in the running queue. When the pending prefill
 work cannot fill every stage with a full step, the step shrinks to that
@@ -46,11 +49,15 @@ SCHEDULER_CLS = "vllm_torchtpu.core.pp_chunk_scheduler.TpuPipelineChunkScheduler
 
 
 def uses_dynamic_chunks(vllm_config: Any) -> bool:
-    """Whether this configuration sizes pipeline steps by time; the platform
-    installs the scheduler class only when it does."""
+    """Whether this configuration sizes steps by time: a pipeline, or one
+    stage with TPU_DYNAMIC_CHUNKS. The platform installs the scheduler class
+    only when it does."""
     return (
         vllm_config is not None
-        and vllm_config.parallel_config.pipeline_parallel_size > 1
+        and (
+            vllm_config.parallel_config.pipeline_parallel_size > 1
+            or envs.TPU_DYNAMIC_CHUNKS
+        )
         and vllm_config.scheduler_config.scheduler_cls == SCHEDULER_CLS
     )
 
@@ -95,14 +102,21 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._step_schedule = 0
         self._seeded = set()
         self._step_limit = self._pending_step_limit()
-        # Every running request past its prefill with a token left to
-        # compute takes it this step; count them before the loop sizes any
-        # prefill chunk. A request whose last chunk is still in flight has
-        # nothing to compute yet.
+        # Every running request past its prefill takes its decode tokens this
+        # step; count them before the loop sizes any prefill chunk. The count
+        # is the base scheduler's: draft tokens and async output placeholders
+        # included. A request whose last chunk is still in flight has none.
         for request in self.running:
             computed = request.num_computed_tokens
-            if computed >= _prefill_end(request) and request.num_tokens > computed:
-                self._account(1, computed)
+            if computed < _prefill_end(request):
+                continue
+            decode = (
+                getattr(request, "num_tokens_with_spec", request.num_tokens)
+                + getattr(request, "num_output_placeholders", 0)
+                - computed
+            )
+            if decode > 0:
+                self._account(decode, computed)
                 self._seeded.add(request.request_id)
         return super().schedule(throttle_prefills)
 

@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
+    TPU_DYNAMIC_CHUNKS: bool = False
     TPU_PP_LAZY_PUSH: bool = False
     TPU_PP_HANDOFF: str = "wave"
     TPU_PP_RING_DEPTH: int = 2
@@ -829,6 +830,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction above the time of a full prefix-free step that a step may
     # take before its chunks are shortened.
     "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
+    # Without pipeline parallelism: size prefill chunks by the same per-step
+    # time budget, so a chunk deep in a long prompt stalls decodes no longer
+    # than a full prefix-free step. TPU_PP_CHUNK_SLACK applies.
+    "TPU_DYNAMIC_CHUNKS": env_bool("TPU_DYNAMIC_CHUNKS", default=False),
     # Pipeline parallelism over more than two stages: the engine core pushes
     # the pipeline only when stage 0 would otherwise idle and drops empty
     # steps, so requests share the pipeline (core/pp_lazy_step.py).

@@ -880,6 +880,8 @@ class TpuPlatform(Platform):
             from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
 
             patch_engine_core_for_lazy_push(vllm_config)
+        elif envs.TPU_DYNAMIC_CHUNKS:
+            _configure_pipeline_chunks(vllm_config)
 
         from vllm.config import CompilationMode
 
@@ -1424,29 +1426,32 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
-    """Install the time-budget scheduler for a pipeline and the engine-core
-    hook that times the stages. Off when the env disables it, when the DP
-    scheduler or another scheduler is configured, or when chunked prefill is
-    disabled."""
+    """Install the time-budget scheduler and the engine-core hook that times
+    the stages: for a pipeline unless TPU_PP_DYNAMIC_CHUNKS is off, for one
+    stage when TPU_DYNAMIC_CHUNKS is on. Off when the DP scheduler or another
+    scheduler is configured, or when chunked prefill is disabled."""
     from vllm_torchtpu.core.pp_chunk_scheduler import (
         SCHEDULER_CLS,
         patch_engine_core_for_pp_chunks,
     )
 
     scheduler_config = vllm_config.scheduler_config
-    if not envs.TPU_PP_DYNAMIC_CHUNKS:
+    if vllm_config.parallel_config.pipeline_parallel_size > 1:
+        if not envs.TPU_PP_DYNAMIC_CHUNKS:
+            return
+    elif not envs.TPU_DYNAMIC_CHUNKS:
         return
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         logger.warning(
-            "Pipeline chunk sizing is off: scheduler %s is configured.",
+            "Time-budget chunk sizing is off: scheduler %s is configured.",
             scheduler_config.scheduler_cls,
         )
         return
     if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
-        logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
+        logger.warning("Time-budget chunk sizing is off: the DP scheduler is enabled.")
         return
     if not scheduler_config.enable_chunked_prefill:
-        logger.warning("Pipeline chunk sizing is off: chunked prefill is disabled.")
+        logger.warning("Time-budget chunk sizing is off: chunked prefill is disabled.")
         return
     if envs.TPU_PP_CHUNK_SLACK < 0:
         raise ValueError(
