@@ -298,6 +298,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_DETOK_SUFFIX_PRIME: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
+    VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS: int = 0
     VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK: bool = False
     VLLM_TPU_SEND_NEW_PROMPT_IDS: int = 0
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
@@ -2160,6 +2161,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS", 0
     ),
+    # Engine core: the number of recent prompts whose block hashes a new prompt
+    # reuses for the blocks it shares with them (core/block_hash_reuse.py).
+    # Exact; 0 keeps none and hashes every block.
+    "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS": env_int("VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS", 0),
     # API server: prompt ids the server's own tokenizer made skip the max/min
     # scan that checks each lies in the vocabulary (input_range_check.py).
     # Exact; prompts sent as ids keep the check.
