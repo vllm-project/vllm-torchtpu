@@ -989,22 +989,20 @@ def shard_expert_slabs(routing, me, *, e_total, ep):
 
 
 def local_slab_rows(routing, me, *, shard_stride):
-    """`routing.slab_row` rebased onto shard `me`'s own slab.
+    """Each device throw away the work items belongs to other devices.
 
-    A pair that computes on another shard is sent past the end of this
-    shard's slab, so a scatter through this index carrying mode="drop"
-    writes only the rows this shard will read. The off-shard pairs are
-    dropped rather than accumulated onto a sink row, because every shard but
-    one owns most of the pairs and a sink would take (ep - 1) / ep of them
-    as write conflicts on a single row.
-
-    The index is never negative: a row below this shard's slab is mapped to
-    shard_stride, not to a negative offset, because jax indexing wraps a
-    negative index around the destination instead of dropping it.
+    One (token, expert) is a pair. `routing.slab_row` is a list containing all
+    the pairs. Each device owns one piece of the `routing.slab_row`,
+    `shard_stride` rows long. Every device sees the whole list.
     """
+    # me refers to the local device id.
     base = me * shard_stride
+    ep = routing.rows_alloc // shard_stride
+    past_end = off_shard_slab_row(shard_stride, ep)
     return jnp.where(
-        routing.slab_row < base, jnp.int32(shard_stride), routing.slab_row - base
+        routing.slab_row < base,  # this pair row below my piece?
+        routing.slab_row + jnp.int32(past_end),
+        routing.slab_row - base,
     )
 
 
