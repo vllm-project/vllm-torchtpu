@@ -158,6 +158,10 @@ class _OpStatics:
     # TPU_MOE_TP_DECODE_AG_PAIRS: the all-reduce paths that exchange at least
     # this many rows all-gather by chip pairs (0: none). Same bits.
     ag_pairs: int = 0
+    # TPU_MOE_TP_DECODE_EXCHANGE_PIECES: the all-reduce paths that exchange at
+    # least this many rows exchange by lane-group piece (reduce-scatter and
+    # all-gather overlap; 0: none). Same bits.
+    exchange_pieces: int = 0
     # TPU_MOE_TP_DECODE_PAD_ROWS: a token count between two kernel row counts
     # runs the kernel on the next one (see _kernel_rows). Same bits per row.
     pad_rows: bool = False
@@ -378,6 +382,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         ),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
         ag_pairs=int(envs.TPU_MOE_TP_DECODE_AG_PAIRS),
+        exchange_pieces=int(envs.TPU_MOE_TP_DECODE_EXCHANGE_PIECES),
         pad_rows=bool(envs.TPU_MOE_TP_DECODE_PAD_ROWS),
     )
     return _Admitted(
@@ -570,6 +575,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     fast=statics.fast,
                     hbm_operands=statics.hbm_operands,
                     ag_pairs=statics.ag_pairs,
+                    exchange_pieces=statics.exchange_pieces,
                 )[:n]
         if kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
@@ -588,6 +594,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 fast=statics.fast,
                 hbm_operands=statics.hbm_operands,
                 ag_pairs=statics.ag_pairs,
+                exchange_pieces=statics.exchange_pieces,
             )
         if statics.prefill_above is not None and n > statics.prefill_above:
             return _prefill_chain(
@@ -850,19 +857,19 @@ def _e0_tensor(device: torch.device, experts_start: int) -> torch.Tensor:
 
 
 def _selftest(
-    topo: _Topology, buckets, device, ag_pairs: int = 0
+    topo: _Topology, buckets, device, ag_pairs: int = 0, pieces: int = 0
 ) -> list[tuple[int, int, int]]:
     """Run the kernel's all-reduce alone for every armed (rows, hidden) and row
     path through the op's mesh and rank operand, with the kernel's chip-pair
-    setting; returns this rank's failing (rows, hidden, n_valid). Collective:
-    every rank makes the same calls."""
+    and piece settings; returns this rank's failing (rows, hidden, n_valid).
+    Collective: every rank makes the same calls."""
     n_ranks = int(topo.mesh.size)
     rank = _rank_tensor(device, topo.mesh_index)
     failures = []
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
         for m, h in buckets:
-            spec = all_reduce.make_spec(n_ranks, m, h, ag_pairs)
+            spec = all_reduce.make_spec(n_ranks, m, h, ag_pairs, pieces)
             op = _selftest_op(topo.mesh, spec)
             x = all_reduce.selftest_inputs(spec)
             mine = torch.from_numpy(x[topo.mesh_index]).to(torch.bfloat16).to(device)
@@ -1025,6 +1032,7 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
     mesh_index = -1 if isinstance(topo, str) else topo.mesh_index
     _check_ranks_agree(dict(sig=sig, mesh_index=mesh_index, armed=len(plan)))
     ag_pairs = int(envs.TPU_MOE_TP_DECODE_AG_PAIRS)
+    pieces = int(envs.TPU_MOE_TP_DECODE_EXCHANGE_PIECES)
     if plan and ag_pairs > 0:
         assert not isinstance(topo, str)
         places = _chip_places(topo)
@@ -1045,7 +1053,7 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
     if plan and not _SELFTEST_DONE:
         assert not isinstance(topo, str)
         device = plan[0][0].routed_experts.w13_weight.device
-        failures = _selftest(topo, buckets, device, ag_pairs)
+        failures = _selftest(topo, buckets, device, ag_pairs, pieces)
         seen = _gather(dict(mesh_index=topo.mesh_index, failures=failures))
         if any(s["failures"] for s in seen):
             raise RuntimeError(
@@ -1085,8 +1093,8 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
     )
     log(
         "moe_tp_decode: armed %d/%d target and %d/%d drafter MoE layers (mesh "
-        "index %d, kernel token counts %s, chip-pair all-gather %s, sig %s); "
-        "refused: %s",
+        "index %d, kernel token counts %s, chip-pair all-gather %s, piece "
+        "exchange %s, sig %s); refused: %s",
         len(plan) - armed_drafter,
         len(target),
         armed_drafter,
@@ -1094,6 +1102,7 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         mesh_index,
         sorted({m for m, _ in buckets}),
         f"from {ag_pairs} rows" if ag_pairs else "off",
+        f"from {pieces} rows" if pieces else "off",
         sig,
         refused or "none",
     )

@@ -34,6 +34,23 @@ reduce-scatter and the sum are unchanged and the all-gather copies the same
 bytes to the same places, so the output bits are the same. The fold path
 stays flat.
 
+Pieces (spec.piece_rows): the trim and full paths that exchange at least
+piece_rows rows exchange each column chunk as lane_groups pieces of one lane
+group each (3 at h = 6144, n = 16), so the reduce-scatter and the all-gather
+overlap (_exchange_pieces, _exchange_pairs_pieces). Piece c from every sender
+counts its bytes on one semaphore, rs_recv.at[c]; once all n - 1 senders'
+piece c has landed, the rank sums piece c over the n slots in rank order (the
+same f32 sum, rounded once to bf16) and starts piece c's all-gather while the
+later pieces still arrive. The reduce-scatter keeps two pieces in flight:
+piece c + 2 starts as soon as my piece c sends are done (rs_send.at[c] counts
+them), before piece c is summed, so the copy engines serve the pieces in
+order, piece 0 lands first and the links never wait for a sum. With chip
+pairs each landed piece is forwarded to the chip-mate on its own (ag_recv
+indexed by owner and piece), after every piece is summed and sent, so no
+piece's sum waits for an earlier piece's all-gather. Every element gets the
+same sum and lands in the same place, so the output bits are the same. The
+fold path (one lane group per chunk) stays serial.
+
 n_valid must be the same on every rank (one replicated value). The barrier
 semaphore gets one signal from every rank at entry and is waited for n
 signals before each path's first remote copy, so every peer's buffers are
@@ -93,6 +110,7 @@ class AllReduceSpec:
     tile_rows: int  # bf16 sublane tiling
     lanes: int
     pair_rows: int = 0  # 0, tile_rows or m: fewest rows gathered by chip pairs
+    piece_rows: int = 0  # 0 or fewest rows exchanged by lane-group piece
 
     @property
     def chunk(self) -> int:
@@ -115,10 +133,19 @@ class AllReduceSpec:
         pairs."""
         return 0 < self.pair_rows <= rows
 
+    def pieced(self, rows: int) -> bool:
+        """Whether a trim or full path exchanging `rows` rows exchanges by
+        lane-group piece."""
+        return 0 < self.piece_rows <= rows
 
-def make_spec(n: int, m: int, h: int, pair_rows: int = 0) -> AllReduceSpec:
+
+def make_spec(
+    n: int, m: int, h: int, pair_rows: int = 0, piece_rows: int = 0
+) -> AllReduceSpec:
     """pair_rows: the trim and full paths that exchange at least this many
-    rows all-gather by chip pairs (0: none)."""
+    rows all-gather by chip pairs (0: none). piece_rows: the trim and full
+    paths that exchange at least this many rows exchange by lane-group piece
+    (0: none; none when a chunk is one lane group)."""
     info = pltpu.get_tpu_info()
     if not supported(n, m, h, info):
         raise ValueError(
@@ -133,13 +160,25 @@ def make_spec(n: int, m: int, h: int, pair_rows: int = 0) -> AllReduceSpec:
         raise ValueError(f"the chip-pair all-gather needs an even n, not {n}")
     else:
         pair_rows = tile_rows if pair_rows <= tile_rows else m
-    return AllReduceSpec(n, m, h, tile_rows, info.num_lanes, pair_rows)
+    lane_groups = h // n // info.num_lanes
+    if not 0 < piece_rows <= m or lane_groups < 2:
+        piece_rows = 0
+    else:
+        piece_rows = tile_rows if piece_rows <= tile_rows else m
+    if piece_rows and lane_groups > n:
+        raise ValueError(
+            f"the piece exchange needs at most {n} lane groups per chunk, not "
+            f"{lane_groups}"
+        )
+    return AllReduceSpec(n, m, h, tile_rows, info.num_lanes, pair_rows, piece_rows)
 
 
 def kernel_name(spec: AllReduceSpec) -> str:
     name = f"moe_tp_decode_all_reduce-m_{spec.m}-h_{spec.h}-n_{spec.n}"
     if spec.pair_rows:
         name += f"-pairs_{spec.pair_rows}"
+    if spec.piece_rows:
+        name += f"-pieces_{spec.piece_rows}"
     return name
 
 
@@ -171,8 +210,13 @@ def _scratch_names(spec: AllReduceSpec) -> tuple[str, ...]:
 
 
 def scratch_shapes(spec: AllReduceSpec) -> list:
-    """The epilogue's scratch, in the order `epilogue` takes it."""
+    """The epilogue's scratch, in the order `epilogue` takes it. rs_send,
+    rs_recv, ag_send: n semaphores each (with pieces, rs_recv's first
+    lane_groups count the pieces); ag_recv: n, or with pieces one per (owner,
+    piece) for the chip-pair forwards, the first n per sender for the flat
+    all-gather."""
     n, m, w = spec.n, spec.m, spec.chunk
+    ag_recv = n * spec.lane_groups if spec.piece_rows else n
     fold = (
         [pltpu.VMEM((spec.tile_rows, spec.h // spec.lane_groups), BF16)]
         if spec.fold
@@ -182,7 +226,8 @@ def scratch_shapes(spec: AllReduceSpec) -> list:
         pltpu.VMEM((n, m, w), BF16),
         pltpu.VMEM((m, w), BF16),
         *fold,
-        *[pltpu.SemaphoreType.DMA((n,)) for _ in range(4)],
+        *[pltpu.SemaphoreType.DMA((n,)) for _ in range(3)],
+        pltpu.SemaphoreType.DMA((ag_recv,)),
         pltpu.SemaphoreType.DMA((2,)),
     ]
 
@@ -376,6 +421,175 @@ def _exchange_pairs(spec, me, buf, rows, cols, s):
         copy.wait_send()
 
 
+def _piece_views(spec, me, buf, rows, cols, s):
+    """Views of one exchange in lane-group pieces: chunk and slot, each whole
+    and by piece c (columns c * lanes .. c * lanes + lanes - 1 of the chunk),
+    and red by piece. Returns (pieces, slot, slot_piece, chunk, chunk_piece,
+    red_piece)."""
+    cw, lw = cols // spec.n, spec.lanes
+
+    def slot(q):
+        return s["recv"].at[q, pl.ds(0, rows), pl.ds(0, cw)]
+
+    def slot_piece(q, c):
+        return s["recv"].at[q, pl.ds(0, rows), pl.ds(c * lw, lw)]
+
+    def chunk(t):
+        return _cols(buf, t, cw)
+
+    def chunk_piece(t, c):
+        return buf.at[:, pl.ds(pl.multiple_of(t * cw + c * lw, lw), lw)]
+
+    def red_piece(c):
+        return s["red"].at[pl.ds(0, rows), pl.ds(c * lw, lw)]
+
+    return cw // lw, slot, slot_piece, chunk, chunk_piece, red_piece
+
+
+def _rs_piece(spec, me, s, slot_piece, chunk_piece, c):
+    """Start piece c's n - 1 remote copies; rank t's rs_recv.at[c] counts
+    piece c's bytes from every sender, my rs_send.at[c] my sends of it."""
+    sends = []
+    for step in range(1, spec.n):
+        t = lax.rem(me + step, spec.n)
+        copy = pltpu.make_async_remote_copy(
+            chunk_piece(t, c),
+            slot_piece(me, c),
+            s["rs_send"].at[c],
+            s["rs_recv"].at[c],
+            device_id=(t,),
+            device_id_type=_MESH,
+        )
+        copy.start()
+        sends.append(copy)
+    return sends
+
+
+def _sum_piece(spec, me, s, rows, slot_piece, red_piece, c):
+    """Wait for piece c from all n - 1 senders (n - 1 piece-sized waits on its
+    one byte-counted semaphore), then red piece c = the f32 sum of the n slots'
+    piece c in slot (rank) order, rounded once. Returns the red piece."""
+    lw = spec.lanes
+    for step in range(1, spec.n):
+        t = lax.rem(me + (spec.n - step), spec.n)
+        view = slot_piece(t, c)
+        pltpu.make_async_copy(view, view, s["rs_recv"].at[c]).wait_recv()
+    red = red_piece(c)
+    red[...] = _sum_slots(
+        lambda q: s["recv"][q, pl.ds(0, rows), pl.ds(c * lw, lw)], spec.n
+    ).astype(red.dtype)
+    return red
+
+
+def _rs_sum_pieces(spec, me, s, rows, views, gather):
+    """Reduce-scatter by piece, two pieces in flight, and gather(c, red) once
+    piece c is summed: start the own chunk's local copy and pieces 0 and 1;
+    once my piece c sends are done, start piece c + 2, then wait for piece c
+    to land, sum it and gather it. Returns the sends not yet waited."""
+    pieces, slot, slot_piece, chunk, chunk_piece, red_piece = views
+    own = pltpu.make_async_copy(chunk(me), slot(me), s["loc"].at[0])
+    own.start()
+    rs = [
+        _rs_piece(spec, me, s, slot_piece, chunk_piece, c)
+        for c in range(min(2, pieces))
+    ]
+    own.wait()
+    for c in range(pieces):
+        if c + 2 < pieces:
+            for copy in rs[c]:
+                copy.wait_send()
+            rs.append(_rs_piece(spec, me, s, slot_piece, chunk_piece, c + 2))
+        gather(c, _sum_piece(spec, me, s, rows, slot_piece, red_piece, c))
+    return [copy for c in range(max(0, pieces - 2), pieces) for copy in rs[c]]
+
+
+def _exchange_pieces(spec, me, buf, rows, cols, s):
+    """_exchange pipelined by lane-group piece: piece c's all-gather starts
+    once piece c of the reduce-scatter has landed from every sender and is
+    summed. Every piece of a sender's chunk counts on its ag_recv slot, so the
+    all-gather ends with one wait of the whole chunk per sender."""
+    views = _piece_views(spec, me, buf, rows, cols, s)
+    _, _, _, chunk, chunk_piece, _ = views
+    ag, own_ag = [], []
+
+    def gather(c, red):
+        local = pltpu.make_async_copy(red, chunk_piece(me, c), s["loc"].at[1])
+        local.start()
+        own_ag.append(local)
+        for step in range(1, spec.n):
+            t = lax.rem(me + step, spec.n)
+            copy = pltpu.make_async_remote_copy(
+                red,
+                chunk_piece(me, c),
+                s["ag_send"].at[step],
+                s["ag_recv"].at[me],
+                device_id=(t,),
+                device_id_type=_MESH,
+            )
+            copy.start()
+            ag.append(copy)
+
+    rs = _rs_sum_pieces(spec, me, s, rows, views, gather)
+    for local in own_ag:
+        local.wait()
+    _recv_all(spec, me, chunk, s["ag_recv"])
+    for copy in (*rs, *ag):
+        copy.wait_send()
+
+
+def _exchange_pairs_pieces(spec, me, buf, rows, cols, s):
+    """_exchange_pairs pipelined by lane-group piece: once piece c is summed,
+    my piece c goes to the ranks of my parity (k-th to (me + 2k) % n) and to
+    my mate; once every piece is summed and sent, each piece of my parity's
+    chunks is forwarded to my mate as it lands, piece-major. ag_send:
+    1..n/2-1 parity, n/2 mate, n/2+1.. forwards (one semaphore per position,
+    shared by the pieces); ag_recv.at[owner * pieces + c] counts piece c of
+    the owner's chunk, so every (owner, piece) slot takes one copy."""
+    n = spec.n
+    half, mate = n // 2, lax.bitwise_xor(me, 1)
+    views = _piece_views(spec, me, buf, rows, cols, s)
+    pieces, _, _, _, chunk_piece, _ = views
+
+    def put(src, t, owner, c, k):
+        copy = pltpu.make_async_remote_copy(
+            src,
+            chunk_piece(owner, c),
+            s["ag_send"].at[k],
+            s["ag_recv"].at[owner * pieces + c],
+            device_id=(t,),
+            device_id_type=_MESH,
+        )
+        copy.start()
+        return copy
+
+    def land(q, c):
+        view = chunk_piece(q, c)
+        pltpu.make_async_copy(view, view, s["ag_recv"].at[q * pieces + c]).wait_recv()
+
+    ag, own_ag = [], []
+
+    def gather(c, red):
+        local = pltpu.make_async_copy(red, chunk_piece(me, c), s["loc"].at[1])
+        local.start()
+        own_ag.append(local)
+        ag.extend(put(red, lax.rem(me + 2 * k, n), me, c, k) for k in range(1, half))
+        ag.append(put(red, mate, me, c, half))
+
+    rs = _rs_sum_pieces(spec, me, s, rows, views, gather)
+    for c in range(pieces):
+        for k in range(1, half):
+            q = lax.rem(me + (n - 2 * k), n)
+            land(q, c)
+            ag.append(put(chunk_piece(q, c), mate, q, c, half + k))
+    for local in own_ag:
+        local.wait()
+    for c in range(pieces):
+        for k in range(half):
+            land(lax.rem(mate + (n - 2 * k), n), c)
+    for copy in (*rs, *ag):
+        copy.wait_send()
+
+
 def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
     """One row path (fold / trim / full): stage, barrier wait, exchange."""
     m, h, tr = spec.m, spec.h, spec.tile_rows
@@ -389,9 +603,12 @@ def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
         buf = out_ref if rows == m else out_ref.at[pl.ds(0, rows)]
     pl.semaphore_wait(barrier, spec.n)
     if kind != "fold" and spec.pairs(rows):
-        _exchange_pairs(spec, me, buf, rows, cols, s)
+        exchange = _exchange_pairs_pieces if spec.pieced(rows) else _exchange_pairs
+    elif kind != "fold" and spec.pieced(rows):
+        exchange = _exchange_pieces
     else:
-        _exchange(spec, me, buf, rows, cols, s)
+        exchange = _exchange
+    exchange(spec, me, buf, rows, cols, s)
     if kind == "fold":
         _unfold(spec, s["q"][...].astype(F32), nv, out_ref)
 
