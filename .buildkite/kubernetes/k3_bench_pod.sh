@@ -132,12 +132,12 @@ if [ -n "${ARTIFACTS_DIR:-}" ]; then
   # LLO dumps: the decoder and draft kernels' final bundles, one tarball per
   # command (a full dump is tens of thousands of files, over the per-job
   # artifact limit).
+  art_dir="$(cd "$ARTIFACTS_DIR/k3-bench" && pwd)"
   for d in "$OUT"/llo-cmd*/; do
     [ -d "$d" ] || continue
     name="$(basename "$d")"
     (cd "$d" && find . -name '*final_bundles.txt' \( -name '*decoder_stack*' -o -name '*dspark*' \) -print0 \
-      | tar czf "$ARTIFACTS_DIR/k3-bench/$name.tgz" --null -T -)
-    rm -rf "$d"
+      | tar czf "$art_dir/$name.tgz" --null -T -) && rm -rf "$d"
   done
   # Traces (directories; their files name the rank).
   for d in "$OUT"/*/; do
