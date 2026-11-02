@@ -222,9 +222,6 @@ def test_no_forced_embedding_sharing():
 
 
 class _FakeBackbone:
-    def __init__(self, confidence_head: bool):
-        self.confidence_head = object() if confidence_head else None
-
     def __call__(self, input_ids, positions):
         rows = torch.arange(input_ids.shape[0], dtype=torch.float32)
         return torch.stack([rows, torch.zeros_like(rows)], dim=1)
@@ -237,9 +234,9 @@ class _FakeDraft:
     has_own_lm_head = False
     has_own_embed_tokens = False
 
-    def __init__(self, vocab=16, confidence_head=True):
+    def __init__(self, vocab=16):
         self.vocab = vocab
-        self.model = _FakeBackbone(confidence_head)
+        self.model = _FakeBackbone()
 
     def compute_draft_logits(self, hidden):
         rows = hidden[:, 0].long()
@@ -258,38 +255,27 @@ class _FakeDraft:
         return 100 * head_hidden[:, 0] + markov_embed[:, 0]
 
 
-@pytest.mark.parametrize(
-    "enabled,confidence_head,uses_head,warns",
-    [
-        (True, True, True, False),
-        (True, False, False, True),
-        (False, True, False, False),
-    ],
-)
-def test_adaptive_verification_needs_a_confidence_head(
-    monkeypatch, enabled, confidence_head, uses_head, warns
-):
-    p = _make_proposer(
-        {"dspark_noise_token_id": 7, **_LAYER_IDS},
-        enable_adaptive_verification=enabled,
-    )
-    draft = _FakeDraft(confidence_head=confidence_head)
+@pytest.mark.parametrize("enabled", [True, False])
+def test_adaptive_verification_is_ignored_with_a_warning(monkeypatch, enabled):
+    with mock.patch("vllm_torchtpu.spec_decode.dspark.logger") as log:
+        p = _make_proposer(
+            {"dspark_noise_token_id": 7, **_LAYER_IDS},
+            enable_adaptive_verification=enabled,
+        )
     monkeypatch.setattr(
         DFlashProposer,
         "load_model",
-        lambda self, target_model: setattr(self, "draft_model", draft),
+        lambda self, target_model: setattr(self, "draft_model", _FakeDraft()),
     )
-    with mock.patch("vllm_torchtpu.spec_decode.dspark.logger") as log:
-        p.load_model(None)
-    assert p.use_confidence_head is uses_head
-    assert log.warning.called is warns
+    p.load_model(None)
+    assert p.use_confidence_head is False
+    assert log.warning.called is enabled
 
 
 def test_draft_step_scores_each_slot_from_its_hidden_and_previous_token():
     p = _make_proposer(
         {"dspark_noise_token_id": 7, **_LAYER_IDS},
         num_speculative_tokens=3,
-        enable_adaptive_verification=True,
     )
     p.draft_model = _FakeDraft()
     forward = DSparkProposer._dflash_forward_and_sample.__wrapped__
@@ -310,10 +296,33 @@ def test_draft_step_scores_each_slot_from_its_hidden_and_previous_token():
 def test_proposal_confidences_are_taken_once():
     p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
     p.use_confidence_head = True
-    confidences = torch.ones(8, 4)
-    p._observe_draft_aux([confidences], [SimpleNamespace(start_index=2, num_reqs=3)])
+    first, second = torch.ones(8, 4), torch.zeros(4, 4)
+    p._observe_draft_aux(first, 0, SimpleNamespace(start_index=2, num_reqs=3))
+    p._observe_draft_aux(second, 1, SimpleNamespace(start_index=5, num_reqs=1))
     taken = p.take_draft_confidences()
     assert taken is not None
-    assert taken.chunks == [confidences]
-    assert taken.spans == [(2, 3)]
+    assert taken.chunks == [first, second]
+    assert taken.spans == [(2, 3), (5, 1)]
+    assert p.take_draft_confidences() is None
+
+
+def test_a_new_proposal_replaces_untaken_confidences():
+    p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    p.use_confidence_head = True
+    p._observe_draft_aux(
+        torch.ones(8, 4), 0, SimpleNamespace(start_index=0, num_reqs=8)
+    )
+    p._observe_draft_aux(
+        torch.zeros(4, 4), 0, SimpleNamespace(start_index=1, num_reqs=2)
+    )
+    taken = p.take_draft_confidences()
+    assert taken is not None
+    assert taken.spans == [(1, 2)]
+
+
+def test_draft_aux_is_dropped_without_the_confidence_head():
+    p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    p._observe_draft_aux(
+        torch.ones(8, 4), 0, SimpleNamespace(start_index=0, num_reqs=8)
+    )
     assert p.take_draft_confidences() is None

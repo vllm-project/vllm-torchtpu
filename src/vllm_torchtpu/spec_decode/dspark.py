@@ -28,8 +28,7 @@ DFlash's 1 + K (anchor is bonus only). Speculators-format checkpoints set
 ``sample_from_anchor=False`` and keep the DFlash layout.
 
 PoC scope: greedy draft sampling only (argmax + d2t remap); probabilistic
-Gumbel-coupled sampling is not implemented. Adaptive verification scores the
-drafts with the checkpoint's confidence head (``adaptive_verification.py``).
+Gumbel-coupled sampling is not implemented.
 """
 
 from __future__ import annotations
@@ -71,16 +70,21 @@ class DSparkProposer(DFlashProposer):
         # vLLM 0.29 drafting options this proposer does not implement yet. They
         # are ignored, not rejected: drafting stays greedy over a fixed block.
         spec = self.speculative_config
-        if spec.draft_sample_method != "greedy" or spec.dspark_draft_topk is not None:
+        if (
+            spec.draft_sample_method != "greedy"
+            or spec.enable_adaptive_verification
+            or spec.dspark_draft_topk is not None
+        ):
             logger.warning(
                 "DSpark on TPU does not support draft_sample_method=%r, "
-                "dspark_draft_topk=%s; ignoring them and using greedy drafting "
-                "of a fixed block.",
+                "enable_adaptive_verification=%s, dspark_draft_topk=%s; "
+                "ignoring them and using greedy drafting of a fixed block.",
                 spec.draft_sample_method,
+                spec.enable_adaptive_verification,
                 spec.dspark_draft_topk,
             )
-        # Set by load_model once the checkpoint's heads are known; the
-        # compiled draft step traces against it.
+        # Whether the compiled draft step scores its drafts; it traces against
+        # this, and nothing turns it on until a caller takes the confidences.
         self.use_confidence_head = False
         self._draft_confidences: DraftConfidences | None = None
         # The query block follows K, not the block length the checkpoint was
@@ -132,29 +136,18 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
-        if self.speculative_config.enable_adaptive_verification:
-            assert self.draft_model is not None
-            self.use_confidence_head = (
-                hasattr(self.draft_model, "compute_confidence")
-                and self.draft_model.model.confidence_head is not None
-            )
-            if not self.use_confidence_head:
-                # TODO: estimate confidences from the draft logits, as
-                # upstream's OnlineAcceptanceEstimator does without a head.
-                logger.warning(
-                    "Adaptive verification needs the DSpark checkpoint's "
-                    "confidence head, which %s does not provide; verifying "
-                    "every draft.",
-                    type(self.draft_model).__name__,
-                )
 
     def _observe_draft_aux(
-        self, aux_per_chunk: list[torch.Tensor], chunks: list[DraftChunkInputs]
+        self, aux: torch.Tensor, chunk_index: int, chunk: DraftChunkInputs
     ) -> None:
-        if self.use_confidence_head:
-            self._draft_confidences = DraftConfidences(
-                aux_per_chunk, [(c.start_index, c.num_reqs) for c in chunks]
-            )
+        if not self.use_confidence_head:
+            return
+        if chunk_index == 0:
+            self._draft_confidences = DraftConfidences([], [])
+        confidences = self._draft_confidences
+        assert confidences is not None
+        confidences.chunks.append(aux)
+        confidences.spans.append((chunk.start_index, chunk.num_reqs))
 
     def take_draft_confidences(self) -> DraftConfidences | None:
         """The last proposal's confidences; None once taken."""
