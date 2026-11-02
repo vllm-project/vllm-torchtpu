@@ -21,10 +21,16 @@ landing buffer, and once the sender's data is ready the runtime copies it
 there. So a stage waits only for its own input, never for the other stages
 to reach the same point, and a forward moves on as soon as it is done.
 
-What travels is what ``pp_wave`` carries: the sum of hidden states and
-residual in the model dtype, plus any side tensor such as a sparse model's
-top-k table. The next stage starts from that sum and a zero residual, one
-kept per padded token count.
+What travels is the sum of hidden states and residual, one tensor in the
+model dtype, plus any side tensor such as a sparse model's top-k table. The
+next stage starts from that sum and a zero residual, one kept per padded
+token count. Its first norm adds hidden states and residual in float32,
+normalizes that sum, and keeps it rounded to the model dtype as the new
+residual. Given the rounded sum and a zero residual, the norm keeps the
+identical residual but normalizes a sum rounded once more than in a
+single-stage model: a relative difference of at most 2^-8 per element for
+bfloat16. Sending the sum halves the bytes on the link; sending both
+tensors would reproduce the single-stage arithmetic exactly.
 
 A forward is one runner forward over one token chunk. Every stage runs the
 same sequence of forwards, so a count of transfers kept by each process
@@ -68,29 +74,25 @@ taken up its step. At most ``depth`` forwards wait in a stage's queue, the
 one being sent included; end_forward blocks until there is room, which
 bounds the memory a stage that runs ahead holds for its outputs. The engine
 keeps more steps in flight than the pipeline has stages
-(``pp_push.buffered_extra_steps``), so stage 0 has its next forward queued
-while the engine core prepares the following step.
+(``pp_engine.buffered_extra_steps``), so stage 0 has its next forward
+queued while the engine core prepares the following step.
 
-Unlike the lockstep hand-off, nothing here needs the stages to issue the
-same launches: there is no prologue, the engine sends no pushes and no
-settles (``push`` and ``settle`` do nothing), a stage of several chips
-neither drains its device nor waits at a world barrier before a hand-off,
-and the only programs a stage runs across its devices are its forwards.
+Nothing here needs the stages to issue matching launches: a stage of
+several chips neither drains its device nor waits at a world barrier before
+a hand-off, and the only programs a stage runs across its devices are its
+forwards.
 """
 
 import math
 import threading
 from collections import deque
-from collections.abc import Iterator
 from concurrent.futures import Future
-from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu.distributed.pp_push import buffered_extra_steps
-from vllm_torchtpu.distributed.pp_wave import HIDDEN_STATES, RESIDUAL, _fence, _flush
+from vllm_torchtpu.distributed.pp_engine import buffered_extra_steps
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
@@ -99,13 +101,17 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# The intermediate tensors every stage passes on.
+HIDDEN_STATES = "hidden_states"
+RESIDUAL = "residual"
+
 # Tags are C ints; transfer numbers wrap well before they would overflow one.
 _TAG_SPAN = 1 << 30
 
 _LIBTPU_REQUIREMENT = (
-    "TPU_PP_HANDOFF=buffered needs a libtpu whose transfers between hosts "
+    "The pipeline hand-off needs a libtpu whose transfers between hosts "
     "land in the posted receive, as libtpu 0.0.50 and later do with "
-    "torch_tpu 0.2.0 and later; TPU_PP_HANDOFF=lockstep does not"
+    "torch_tpu 0.2.0 and later"
 )
 
 # Receive calls a device may have posted whose data has not landed, each
@@ -113,6 +119,32 @@ _LIBTPU_REQUIREMENT = (
 # receive flags, and a receive posted beyond them stalls its sender without
 # an error; the hand-off keeps one spare.
 _MAX_RECEIVES = 7
+
+
+def pp_rank_flags(parallel_config: Any) -> tuple[bool, bool]:
+    """(is_first_stage, is_last_stage) for this worker."""
+    if parallel_config.pipeline_parallel_size <= 1:
+        return True, True
+    from vllm.distributed.parallel_state import get_pp_group
+
+    group = get_pp_group()
+    return bool(group.is_first_rank), bool(group.is_last_rank)
+
+
+def _flush(tensors: tuple[torch.Tensor, ...]) -> None:
+    """Submits the pending ops producing ``tensors`` without blocking."""
+    from torch_tpu._internal.sync import sync
+
+    sync.synchronize(list(tensors), wait=False)
+
+
+def _fence() -> "TpuEvent":
+    """Records a device event for all work submitted so far."""
+    from torch_tpu._internal.stream.streams import TpuEvent
+
+    event = TpuEvent()
+    event.record()
+    return event
 
 
 def buffered_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
@@ -126,7 +158,7 @@ def buffered_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
     ``depth`` earlier forwards: end_forward waits while that many are
     unsent, and a forward is sent only after it has run on the data it
     received. No stage holds more than the steps the engine keeps in
-    flight: ``stages`` plus ``pp_push.buffered_extra_steps``.
+    flight: ``stages`` plus ``pp_engine.buffered_extra_steps``.
 
     At run time every device holds its posted receives to _MAX_RECEIVES,
     whether a step queues them ahead or a forward posts its own, so a step
@@ -186,10 +218,6 @@ def _first_and_last(x: torch.Tensor) -> tuple[float, float]:
 
 
 class PPBuffered:
-    # Read by the worker's pp_drains_before_handoff: no stage waits for the
-    # slice before a hand-off.
-    drain_before_handoff = False
-
     def __init__(
         self,
         device: torch.device,
@@ -339,12 +367,6 @@ class PPBuffered:
                 raise RuntimeError(
                     f"PP buffered rank {self.rank}: the posting thread failed"
                 ) from self._post_error
-
-    @contextmanager
-    def step(self) -> Iterator[None]:
-        """Marks a runner call that traces device ops. The helper threads
-        trace none, so there is nothing to keep out of it."""
-        yield
 
     def warmup(self) -> None:
         """One small transfer of every carried tensor from each device to
@@ -553,7 +575,7 @@ class PPBuffered:
                 f"PP buffered rank {self.rank}: the forward produced no "
                 f"{missing} to hand on"
             )
-        # Summed in the model dtype; see pp_wave's module docstring.
+        # Summed in the model dtype; see the module docstring.
         total = tensors[HIDDEN_STATES] + tensors[RESIDUAL]
         outgoing = (total, *(tensors[key] for key in self.carried[1:]))
         # Sending a view would build its copy on the send thread; the copy is
@@ -646,13 +668,6 @@ class PPBuffered:
                 if outgoing:
                     self.sent += 1
                 self._cv.notify_all()
-
-    def push(self) -> None:
-        """Does nothing: every forward moves on as soon as it is done, and
-        the engine sends no pushes with the buffered hand-off."""
-
-    def settle(self) -> None:
-        """Does nothing: no stage holds launches for the others to match."""
 
     def close(self) -> None:
         """Drops the receives still queued, whose forwards will not run,

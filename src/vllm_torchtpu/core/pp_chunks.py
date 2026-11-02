@@ -13,7 +13,8 @@
 # limitations under the License.
 """Sizing prefill chunks for the pipeline chunk scheduler.
 
-The stages of a pipeline advance in lockstep (``distributed/pp_wave.py``).
+A step moves through the pipeline one stage at a time, each stage running
+its forward once the previous one hands it on (``distributed/pp_buffered.py``).
 While the pending prefill work cannot fill every stage with a full step, a
 step is held to that work spread over the stages (`step_limit`), so a lone
 prompt runs as one small step per stage instead of trailing itself through

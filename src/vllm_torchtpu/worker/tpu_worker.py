@@ -107,7 +107,7 @@ class TPUWorker(WorkerBase):
 
         patch_registry.apply("worker_init")
         # This process creates the worker's reply ring to the engine.
-        from vllm_torchtpu.distributed.pp_push import widen_message_rings
+        from vllm_torchtpu.distributed.pp_engine import widen_message_rings
 
         widen_message_rings(vllm_config)
 
@@ -626,18 +626,6 @@ class TPUWorker(WorkerBase):
 
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)
-
-    def pp_push(self):
-        return self.model_runner.pp_push()
-
-    def pp_settle(self):
-        return self.model_runner.pp_settle()
-
-    def pp_drains_before_handoff(self) -> bool:
-        """Whether this worker's stage drains the slice before each hand-off
-        launch."""
-        handoff = self.model_runner._pp_handoff
-        return bool(getattr(handoff, "drain_before_handoff", False))
 
     def pipeline_chunk_limits(self) -> dict:
         return self.model_runner.pipeline_chunk_limits()

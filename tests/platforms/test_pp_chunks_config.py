@@ -95,4 +95,4 @@ def test_custom_scheduler_logs_configured_scheduler_when_dp_sched_env_set(
 
 def test_pipeline_knobs_do_not_change_the_compile_cache_key():
     assert "TPU_PP_DYNAMIC_CHUNKS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
-    assert "TPU_PP_LAZY_PUSH" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    assert "TPU_PP_HANDOFF_DEPTH" in tpu_compiler._TPU_COMPILE_ENV_IGNORED

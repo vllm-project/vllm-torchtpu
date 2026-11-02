@@ -749,18 +749,6 @@ def test_a_forward_that_drops_a_side_tensor_is_refused(monkeypatch):
         first.end_forward(_outgoing(8), 8)
 
 
-def test_push_settle_and_step_do_nothing(monkeypatch):
-    transport, handoffs = _build(monkeypatch, stages=3)
-    for handoff in handoffs.values():
-        with handoff.step():
-            handoff.push()
-            handoff.settle()
-        handoff.close()
-        assert handoff.transfers == 0
-        assert handoff.drain_before_handoff is False
-    assert transport.sends == [] and transport.posted == {}
-
-
 def test_the_first_and_last_stage_post_and_send_only_what_they_must(monkeypatch):
     transport, handoffs = _build(monkeypatch, stages=3)
     assert (handoffs[0, 0].prev, handoffs[0, 0].next) == (None, 1)

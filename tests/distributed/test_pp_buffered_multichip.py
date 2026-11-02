@@ -93,7 +93,6 @@ def _launch_torchrun(result_dir: Path) -> None:
     except (ImportError, ValueError) as exc:
         print(f"Two TPU devices are unavailable: {exc}", flush=True)
         sys.exit(SKIP_EXIT_CODE)
-    os.environ["TPU_PP_HANDOFF"] = "buffered"
     os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
     from torch.distributed.run import main as torchrun_main
 

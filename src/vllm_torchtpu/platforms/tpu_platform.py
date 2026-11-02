@@ -873,13 +873,12 @@ class TpuPlatform(Platform):
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
             # get the hand-off's engine side here; engine-core processes
             # install it again on their side.
-            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
+            from vllm_torchtpu.distributed.pp_engine import (
+                patch_executor_for_pp_buffered,
+            )
 
-            patch_executor_for_pp_handoff(vllm_config)
+            patch_executor_for_pp_buffered(vllm_config)
             _configure_pipeline_chunks(vllm_config)
-            from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
-
-            patch_engine_core_for_lazy_push(vllm_config)
 
         from vllm.config import CompilationMode
 
