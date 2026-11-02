@@ -170,6 +170,34 @@ When opening a pull request, please select the appropriate category prefix from 
 ### Reviewer Routing
 GitHub automatically requests reviews from the owners in `.github/CODEOWNERS` of the files a PR changes, and a PR needs an approval from a code owner of each area it touches before it can merge.
 
+### Issue and PR Labels
+
+Three labels help with triage:
+
+* `bug`: incorrect behavior, crashes, failures, demonstrated regressions, and their fixes.
+* `documentation`: guides, reference material, recipes, and documentation maintenance.
+* `model-support`: model requests and work adding or improving models, following the existing `[Model]` PR category.
+
+Issue templates apply labels when an issue is submitted. The issue-labeling
+workflow also recognizes `[Bug]` / `[Bugfix]`, `[Doc]` / `[Docs]` /
+`[Documentation]`, and `[Model]` / `[Model Support]` / `[New Model]` title tags
+on opening, editing, or reopening an issue. It does not search issue bodies
+or logs.
+
+Mergify labels PRs from the same title tags or checked categories in the PR
+description (`[Bugfix]`, `[Doc]`, and the existing `[Model]` category).
+PRs changing only documentation paths (`docs/`, README files, and
+`CONTRIBUTING.md`) also trigger `documentation`. Mixed code/documentation PRs
+need an explicit documentation title tag or checked category to get that label.
+Unchecked categories do not match. Model names and model implementation paths
+alone do not automatically trigger `model-support`.
+Contributors can select a category without changing their title. Maintainers
+can label unstructured reports and ambiguous cases manually.
+
+Both automations only add labels; they never remove existing labels. If a
+category was selected incorrectly, correct the title or checkbox before
+removing its label so automation does not add it again.
+
 ---
 
 ## 7. Policy on AI-Assisted Code
