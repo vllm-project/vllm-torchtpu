@@ -222,3 +222,39 @@ def test_dcp_op_serves_both_variants_from_one_function():
     assert torch.all(cache == 7)  # the op writes the new cache back
     plain = VllmTPUSparseAttnIndexer._build_streamidx_dcp_op(stub, 16, 4)
     assert not plain.takes_qb
+
+
+@pytest.mark.parametrize("rows, gathered", [(4, True), (16, True), (32, False)])
+def test_window_gather_overlap_takes_decode_rows(monkeypatch, rows, gathered):
+    """TPU_MLA_LOCAL_Q_FUSED_AG: the indexer-overlapped q_b runs the window
+    all-gather on the rows it serves (the skinny kernel's M range), handing it
+    the rank and lane; larger buckets keep the replicated projection."""
+    import jax.numpy as jnp
+
+    seen = {}
+
+    def window(x, w_q, w_s, rank, **kw):
+        seen["window"] = (x.shape, rank, kw)
+        return "gathered"
+
+    monkeypatch.setattr(mla_op.fp8_window_all_gather, "fp8_window_all_gather", window)
+    x = jnp.zeros((rows, 2048), jnp.bfloat16)
+    w_q = jnp.zeros((2048, 16384), jnp.float8_e4m3fn)
+    w_s = jnp.ones((16384,), jnp.float32)
+    rank, lane = jnp.array([3], jnp.int32), jnp.array([0], jnp.int32)
+    out = mla_op._qb_window_gather_jax(
+        x,
+        w_q,
+        w_s,
+        rank,
+        lane,
+        num_cores=16,
+        axis="d",
+        lane_axis="lane",
+        replicated=lambda x, w, s: "replicated",
+    )
+    assert out == ("gathered" if gathered else "replicated")
+    if gathered:
+        shape, got_rank, kw = seen["window"]
+        assert shape == (rows, 2048) and got_rank is rank
+        assert kw == dict(num_cores=16, axis="d", lane_axis="lane", lane=lane)

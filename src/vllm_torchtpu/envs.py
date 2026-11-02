@@ -1007,7 +1007,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather as one Pallas kernel (kernels/quantized_matmul/
     # fp8_window_all_gather.py): one round of remote copies whose barrier
     # hides under the window's weight stream, instead of the window kernel
-    # then XLA's all-gather. Bit-identical q.
+    # then XLA's all-gather. With TPU_INDEXER_QB_OVERLAP it also replaces the
+    # indexer layers' overlapped q_b. Bit-identical q.
     "TPU_MLA_LOCAL_Q_FUSED_AG": env_bool("TPU_MLA_LOCAL_Q_FUSED_AG"),
     # Store each token's 64-byte fp8 RoPE key in 64 bytes instead of a padded
     # 128-byte row (eight tokens per 128-word row), cutting the sparse MLA

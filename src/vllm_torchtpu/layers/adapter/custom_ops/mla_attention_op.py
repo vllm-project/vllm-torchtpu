@@ -15,6 +15,7 @@
 Multi-Head Latent Attention (MLA)."""
 
 import dataclasses
+import functools
 import re
 from typing import Any, cast
 
@@ -74,7 +75,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
-from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
+from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny, fp8_window_all_gather
 from vllm_torchtpu.layers.adapter import (
     dcp_token_parallel_op,
     mla_prefill_rows,
@@ -184,6 +185,28 @@ def _streamidx_block_sizes(
     return (
         STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
         STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,),
+    )
+
+
+def _qb_window_gather_jax(
+    x, w_q, w_s, rank, lane, *, num_cores, axis, lane_axis, replicated
+):
+    """The indexer-overlapped q_b under TPU_MLA_LOCAL_Q_FUSED_AG, inside the DCP
+    op's shard_map: decode buckets the window all-gather serves (bitwise the
+    replicated skinny kernel), other buckets `replicated(x, w_q, w_s)`, the
+    projection the overlap would run without the flag."""
+    m, k = x.shape
+    if not fp8_window_all_gather.supports(m, k, w_q.shape[1], num_cores):
+        return replicated(x, w_q, w_s)
+    return fp8_window_all_gather.fp8_window_all_gather(
+        x,
+        w_q,
+        w_s,
+        rank,
+        num_cores=num_cores,
+        axis=axis,
+        lane_axis=lane_axis,
+        lane=None if lane_axis is None else lane,
     )
 
 
@@ -843,6 +866,28 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             layer_prefix = self.k_cache.prefix.split(".self_attn")[0]
             if fp8_skinny_hbm_pin_selected(f"{layer_prefix}.self_attn.q_b_proj"):
                 qb_overlap_fn = _fp8_linear_pallas_hbm_pinned_jax
+        # TPU_MLA_LOCAL_Q_FUSED_AG: the overlapped q_b is the window all-gather
+        # too (`_qb_window_gather_jax`), taking the rank and lane as data.
+        qb_window_gather = bool(
+            qb_overlap and envs.TPU_MLA_LOCAL_Q_GATHER and envs.TPU_MLA_LOCAL_Q_FUSED_AG
+        )
+        if qb_window_gather:
+            lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
+            lane_axis = lane_axes[0] if lane_axes else None
+            if lane_axis is not None and mesh.shape[lane_axis] > 1 and not small_ag:
+                raise NotImplementedError(
+                    "TPU_MLA_LOCAL_Q_FUSED_AG in the indexer overlap addresses peers "
+                    "by (lane, rank): with more than one DCP lane it needs the lane "
+                    "operand of TPU_DCP_INDEXER_SMALL_AG (with "
+                    "TPU_SC_TOPK_DCP_MERGE_FLAT and TPU_DCP_RANK_OPERAND)"
+                )
+            qb_overlap_fn = functools.partial(
+                _qb_window_gather_jax,
+                num_cores=dcp_size,
+                axis=DCP_AXIS_NAME,
+                lane_axis=lane_axis,
+                replicated=qb_overlap_fn,
+            )
 
         def _streamidx_topk_dcp_impl(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -889,6 +934,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                     overlap_args=tuple(qb_args),
                     # Decode buckets only: the skinny kernel's M range.
                     overlap_pin_max_tokens=fp8_skinny.MAX_M,
+                    overlap_rank=qb_window_gather,
                 )
             # The histogram merge, if on, replaces the all-to-all one.
             large = _dcp_indexer_a2a_for_bucket(q.shape[0], True, a2a_min_tokens)
@@ -1601,6 +1647,17 @@ class VllmTPUIndexer(Indexer):
         operands = _qb_overlap_operands(q_b_layer)
         if operands is None:
             return self.indexer_op(hidden_states, q_fp8, k, weights), None
+        if (
+            envs.TPU_MLA_LOCAL_Q_GATHER
+            and envs.TPU_MLA_LOCAL_Q_FUSED_AG
+            and not getattr(q_b_layer, "qrep_active", False)
+        ):
+            # The window all-gather takes rank j's window of a weight every DCP
+            # rank holds whole: a TP-sharded q_b would mix ranks' heads.
+            raise NotImplementedError(
+                "TPU_MLA_LOCAL_Q_FUSED_AG in the indexer overlap needs a "
+                "query-replicated q_b"
+            )
         qb_x = qr.reshape(-1, qr.shape[-1])
         return self.indexer_op(
             hidden_states, q_fp8, k, weights, qb_overlap=(qb_x, *operands)
