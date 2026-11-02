@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
 from diffusers.pipelines.ltx2.vocoder import UpSample1d
+from torch_tpu._internal import execution_mode
 from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -29,13 +31,22 @@ from vllm_omni.diffusion.models.ltx2 import (
     ltx2_transformer,
 )
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
+from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
+    WanS2VTransformer3DModel,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     ColumnParallelGELU,
     WanSelfAttention,
+    WanTransformer3DModel,
+)
+from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
+    WanVACETransformer3DModel,
 )
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
+from vllm_torchtpu import patch_registry
 from vllm_torchtpu.omni import patches, register_omni_tpu_platform
+from vllm_torchtpu.omni import platform as omni_platform
 from vllm_torchtpu.omni import rope as omni_rope
 from vllm_torchtpu.omni.attention import (
     TpuFlashAttentionBackend,
@@ -49,13 +60,17 @@ from vllm_torchtpu.omni.patches import (
     _SDPA_FALLBACK_PATCHED,
     _SPLIT_ROPE_PATCHED,
     _VOCODER_CPU_INIT_PATCHED,
+    _extend_async_output_timeout,
+    _patch_diffusion_ipc_cpu_pack,
     _patch_diffusion_startup_warmup_sync,
     _patch_diffusion_worker_d2h_stream,
     _patch_ltx2_split_rope,
     _patch_ltx2_vocoder_cpu_init,
+    _patch_qwen_image_rope_txt_freqs_clone,
     _patch_sdpa_fallback_dispatch,
-    apply_omni_model_specific_patches,
-    apply_omni_tpu_patches,
+    _patch_wan_ffn_gelu_fence,
+    _patch_wan_fused_qk_norm_rope,
+    _patch_wan_pair_swap_rope,
 )
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 from vllm_torchtpu.omni.rope import (
@@ -69,10 +84,48 @@ from vllm_torchtpu.omni.rope import (
 
 pytestmark = pytest.mark.omni
 
-# The patches rebind these upstream functions in place, and the first
-# apply_omni_model_specific_patches() call in the session installs them for
-# good. Tests that reinstall a patch start from the functions captured here,
-# at collection, before any test has run.
+_WAN = SimpleNamespace(model_class_name="WanPipeline")
+_QWEN_IMAGE = SimpleNamespace(model_class_name="QwenImagePipeline")
+_LTX2 = SimpleNamespace(model_class_name="LTX2Pipeline")
+_WAN_MODULES = (
+    "vllm_omni.diffusion.models.wan2_2",
+    "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer",
+    "vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer",
+    "vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer",
+)
+_DIFFUSION_MODEL_MODULES = (
+    *_WAN_MODULES,
+    "vllm_omni.diffusion.models.qwen_image",
+    "vllm_omni.diffusion.models.qwen_image.qwen_image_transformer",
+    "vllm_omni.diffusion.models.ltx2",
+    "vllm_omni.diffusion.models.ltx2.ltx2_components",
+    "vllm_omni.diffusion.models.ltx2.ltx2_runtime",
+    "vllm_omni.diffusion.models.ltx2.ltx2_transformer",
+)
+_QWEN_IMAGE_ROPES = (
+    qwen_image_transformer.QwenEmbedRope,
+    qwen_image_transformer.QwenEmbedLayer3DRope,
+)
+_WAN_PATCHED_CLASSES = (
+    ColumnParallelGELU,
+    WanSelfAttention,
+    WanTransformer3DModel,
+    WanVACETransformer3DModel,
+    WanS2VTransformer3DModel,
+)
+
+# The patches rebind these upstream functions in place, and the first test
+# that installs a patch installs it for good. Tests that reinstall a patch
+# start from the functions captured here, at collection, before any test has
+# run.
+_UPSTREAM_FORWARDS = {
+    cls: cls.forward for cls in (*_QWEN_IMAGE_ROPES, *_WAN_PATCHED_CLASSES)
+}
+_UPSTREAM_EAGER_MODE = execution_mode.eager_mode
+_UPSTREAM_PACK_TENSOR_IF_LARGE = ipc._pack_tensor_if_large
+_UPSTREAM_RUN_STARTUP_WARMUP = DiffusionEngine.run_startup_warmup
+_UPSTREAM_WAN_ROPE_FORWARD = RotaryEmbeddingWan.forward
+_UPSTREAM_ASYNC_OUTPUT_LOOP = WorkerProc._async_output_loop
 _UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
 _UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
 _UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
@@ -108,6 +161,177 @@ def test_platform_attributes():
         mock_dev.assert_called_once_with("tpu")
 
 
+def test_backend_selection_imports_no_model_module(monkeypatch):
+    _isolate_diffusion_worker_patches(monkeypatch)
+    monkeypatch.setattr(patch_registry, "_entered_stages", set())
+    for name in _DIFFUSION_MODEL_MODULES:
+        monkeypatch.setitem(sys.modules, name, None)
+    assert (
+        OmniTpuPlatform.get_diffusion_attn_backend_cls(None, 64)
+        == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
+    )
+
+
+@pytest.mark.parametrize(
+    "model_class_name",
+    ["LingBotWorldCausalDMDPipeline", "FluxPipeline", None],
+)
+def test_model_patches_skip_other_models(monkeypatch, model_class_name):
+    # Another model's patch neither imports its module nor completes, so it
+    # still runs if this process loads that model later.
+    for name in _DIFFUSION_MODEL_MODULES:
+        monkeypatch.setitem(sys.modules, name, None)
+    od_config = SimpleNamespace(model_class_name=model_class_name)
+    assert _patch_qwen_image_rope_txt_freqs_clone(od_config=od_config) is False
+    assert _patch_wan_ffn_gelu_fence(od_config=od_config) is False
+    assert _patch_ltx2_vocoder_cpu_init(od_config=od_config) is False
+    assert _patch_ltx2_split_rope(od_config=od_config) is False
+    assert _patch_qwen_image_rope_txt_freqs_clone(od_config=None) is False
+
+
+def test_diffusion_model_load_patches_only_the_served_model(monkeypatch):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    monkeypatch.setattr(patch_registry, "_entered_stages", set())
+    for cls, forward in _UPSTREAM_FORWARDS.items():
+        monkeypatch.setattr(cls, "forward", forward)
+    gelu_forward = _UPSTREAM_FORWARDS[ColumnParallelGELU]
+    with monkeypatch.context() as blocked:
+        # Wan modules are unimportable here, so loading Qwen-Image only
+        # succeeds if no Wan patch imports them.
+        for name in _WAN_MODULES:
+            blocked.setitem(sys.modules, name, None)
+        OmniTpuPlatform.init_diffusion_model_runner_runtime(
+            None, _QWEN_IMAGE, torch.device("cpu")
+        )
+    assert all(
+        rope_cls.forward is not _UPSTREAM_FORWARDS[rope_cls]
+        for rope_cls in _QWEN_IMAGE_ROPES
+    )
+    assert ColumnParallelGELU.forward is gelu_forward
+
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(None, _WAN, torch.device("cpu"))
+    assert ColumnParallelGELU.forward is not gelu_forward
+
+
+@pytest.mark.parametrize(
+    ("od_config", "logged_name"),
+    [
+        (SimpleNamespace(model_class_name="FluxPipeline"), "FluxPipeline"),
+        (SimpleNamespace(model_class_name=None), None),
+        (None, None),
+    ],
+)
+def test_model_load_logs_unpatched_pipeline(monkeypatch, od_config, logged_name):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    monkeypatch.setattr(patch_registry, "_entered_stages", set())
+    info = MagicMock()
+    monkeypatch.setattr(patches.logger, "info", info)
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(
+        None, od_config, torch.device("cpu")
+    )
+    info.assert_called_once_with(
+        "No model-specific TPU diffusion patch applies to pipeline %s.", logged_name
+    )
+
+
+def test_model_load_does_not_log_patched_pipeline(monkeypatch):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    monkeypatch.setattr(patch_registry, "_entered_stages", set())
+    for rope_cls in _QWEN_IMAGE_ROPES:
+        monkeypatch.setattr(rope_cls, "forward", _UPSTREAM_FORWARDS[rope_cls])
+    info = MagicMock()
+    monkeypatch.setattr(patches.logger, "info", info)
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(
+        None, _QWEN_IMAGE, torch.device("cpu")
+    )
+    assert (
+        call(
+            "No model-specific TPU diffusion patch applies to pipeline %s.",
+            "QwenImagePipeline",
+        )
+        not in info.call_args_list
+    )
+
+
+def _isolate_diffusion_worker_patches(monkeypatch):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    monkeypatch.setattr(execution_mode, "eager_mode", _UPSTREAM_EAGER_MODE)
+    monkeypatch.setattr(ipc, "_pack_tensor_if_large", _UPSTREAM_PACK_TENSOR_IF_LARGE)
+    monkeypatch.setattr(
+        DiffusionEngine, "run_startup_warmup", _UPSTREAM_RUN_STARTUP_WARMUP
+    )
+    monkeypatch.setattr(RotaryEmbeddingWan, "forward", _UPSTREAM_WAN_ROPE_FORWARD)
+    monkeypatch.setattr(WorkerProc, "_async_output_loop", _UPSTREAM_ASYNC_OUTPUT_LOOP)
+    monkeypatch.setattr(SDPAImpl, "forward", _UPSTREAM_SDPA_FORWARD)
+
+
+def test_init_diffusion_worker_vllm_config_applies_shared_patches(monkeypatch):
+    _isolate_diffusion_worker_patches(monkeypatch)
+    monkeypatch.setattr(patch_registry, "_entered_stages", set())
+    for name in _DIFFUSION_MODEL_MODULES:
+        monkeypatch.setitem(sys.modules, name, None)
+
+    fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
+    q, k, v = (torch.ones(1, 3, 2, 8) for _ in range(3))
+    with pytest.raises(NotImplementedError):
+        fallback.forward(q, k, v)
+
+    OmniTpuPlatform.init_diffusion_worker_vllm_config(None)
+    assert patch_registry.entered("diffusion_worker") is True
+    assert patch_registry.entered("diffusion_model_load") is False
+    torch.testing.assert_close(fallback.forward(q, k, v), v, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("entered_stages", "warns"),
+    [
+        (set(), True),
+        ({"diffusion_worker"}, True),
+        ({"diffusion_model_load"}, False),
+        ({"worker_init"}, False),
+    ],
+)
+def test_backend_selection_warns_without_model_load_stage(
+    monkeypatch, entered_stages, warns
+):
+    _isolate_diffusion_worker_patches(monkeypatch)
+    monkeypatch.setattr(patch_registry, "_entered_stages", set(entered_stages))
+    warning_once = MagicMock()
+    monkeypatch.setattr(omni_platform.logger, "warning_once", warning_once)
+    OmniTpuPlatform.get_diffusion_attn_backend_cls(None, 64)
+    assert warning_once.call_count == int(warns)
+
+
+def test_backend_selection_in_worker_init_applies_shared_diffusion_patches(
+    monkeypatch,
+):
+    # A GENERATION-stage TPUWorker enters worker_init, not the diffusion stages;
+    # building diffusion attention there must still install shared diffusion
+    # patches (such as SDPAImpl fallback dispatch) without importing models.
+    _isolate_diffusion_worker_patches(monkeypatch)
+    monkeypatch.setattr(patch_registry, "_entered_stages", {"worker_init"})
+    warning_once = MagicMock()
+    monkeypatch.setattr(omni_platform.logger, "warning_once", warning_once)
+    for name in _DIFFUSION_MODEL_MODULES:
+        monkeypatch.setitem(sys.modules, name, None)
+
+    fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 5, 2, 8) for _ in range(3))
+    with pytest.raises(NotImplementedError):
+        fallback.forward(q, k, v)
+
+    backend = OmniTpuPlatform.get_diffusion_attn_backend_cls(None, 64)
+    assert backend == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
+    assert warning_once.call_count == 0
+
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.double(), k.double()) * 0.3
+    want = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v.double()).float()
+    torch.testing.assert_close(fallback.forward(q, k, v), want, rtol=1e-5, atol=1e-5)
+    assert patch_registry.entered("diffusion_worker") is True
+    assert patch_registry.entered("diffusion_model_load") is False
+
+
 def test_rope_pair_swap_matches_native():
     torch.manual_seed(0)
     rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
@@ -130,8 +354,9 @@ def test_rope_pair_swap_matches_native():
     )
 
 
-def test_rope_patch_installed():
-    apply_omni_model_specific_patches()
+def test_rope_patch_installed(monkeypatch):
+    monkeypatch.setattr(RotaryEmbeddingWan, "forward", _UPSTREAM_WAN_ROPE_FORWARD)
+    _patch_wan_pair_swap_rope()
     assert RotaryEmbeddingWan.forward is rotary_embedding_wan_forward
     # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
     rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
@@ -243,7 +468,7 @@ def test_tpu_flash_attention_backend(monkeypatch):
 def test_wan_ffn_gelu_fence(monkeypatch):
     # The Wan FFN returns the GELU output passed through the XLA
     # optimization barrier (its result must be used, or XLA drops it).
-    apply_omni_model_specific_patches()
+    _patch_wan_ffn_gelu_fence(od_config=_WAN)
     # Skip __init__ (ColumnParallelLinear requires an initialized TP group).
     ffn = object.__new__(ColumnParallelGELU)
     torch.nn.Module.__init__(ffn)
@@ -399,10 +624,16 @@ def test_tpu_sdpa_attention_backend():
     "rope_cls_name",
     ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
 )
-def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
-    apply_omni_model_specific_patches()
-
+def test_qwen_image_rope_txt_freqs_clone(monkeypatch, rope_cls_name):
+    for cls in _QWEN_IMAGE_ROPES:
+        monkeypatch.setattr(cls, "forward", _UPSTREAM_FORWARDS[cls])
     rope_cls = getattr(qwen_image_transformer, rope_cls_name)
+    _patch_qwen_image_rope_txt_freqs_clone(od_config=_QWEN_IMAGE)
+    patched_forward = rope_cls.forward
+    assert patched_forward is not _UPSTREAM_FORWARDS[rope_cls]
+    _patch_qwen_image_rope_txt_freqs_clone(od_config=_QWEN_IMAGE)
+    assert rope_cls.forward is patched_forward
+
     rope = rope_cls(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
 
     vid_freqs, txt_freqs = rope.forward([(1, 2, 2)], [3], torch.device("cpu"))
@@ -424,7 +655,12 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
     ids=["lt_1mb", "gt_1mb"],
 )
 def test_safe_pack_tensor_if_large(monkeypatch, nbytes):
-    apply_omni_model_specific_patches()
+    monkeypatch.setattr(ipc, "_pack_tensor_if_large", _UPSTREAM_PACK_TENSOR_IF_LARGE)
+    _patch_diffusion_ipc_cpu_pack()
+    patched_pack = ipc._pack_tensor_if_large
+    assert patched_pack is not _UPSTREAM_PACK_TENSOR_IF_LARGE
+    _patch_diffusion_ipc_cpu_pack()
+    assert ipc._pack_tensor_if_large is patched_pack
     # Return the tensor that would be copied to SHM, so that the test sees
     # what the original function received for tensors above the threshold.
     monkeypatch.setattr(ipc, "_tensor_to_shm", lambda val, **kwargs: val)
@@ -443,12 +679,11 @@ def test_safe_pack_tensor_if_large(monkeypatch, nbytes):
 
 
 def test_omni_tpu_patches_configuration():
-    # Call the undecorated body so the run-once cache is left alone, and
-    # restore the process-global state it edits (env var).
+    # Restore the process-global state the patch edits (env var).
     orig = torch.nn.functional.interpolate
     with patch.dict(os.environ):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
-        apply_omni_tpu_patches.__wrapped__()
+        _extend_async_output_timeout()
         assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
         assert torch.nn.functional.interpolate is orig
 
@@ -465,6 +700,9 @@ def test_startup_warmup_device_sync(monkeypatch):
         DiffusionEngine, "run_startup_warmup", lambda self: calls.append("warmup")
     )
     _patch_diffusion_startup_warmup_sync()
+    patched_warmup = DiffusionEngine.run_startup_warmup
+    _patch_diffusion_startup_warmup_sync()
+    assert DiffusionEngine.run_startup_warmup is patched_warmup
 
     DiffusionEngine.run_startup_warmup(object())
     assert calls == ["warmup", "sync"]
@@ -512,7 +750,7 @@ def _make_wan_self_attention(dim=64, heads=2, head_dim=128) -> WanSelfAttention:
 def test_wan_self_attention_fused_matches_native(monkeypatch):
     # The fused forward's glue (flattening, tables, value slice) around the
     # kernel reproduces vLLM-Omni's norm -> unflatten -> RoPE -> attention.
-    apply_omni_model_specific_patches()
+    _patch_wan_fused_qk_norm_rope(od_config=_WAN)
     torch.manual_seed(0)
     attn = _make_wan_self_attention()
     batch, seq, half = 2, 5, attn.head_dim // 2
@@ -536,7 +774,7 @@ def test_can_fuse_qk_norm_rope():
 
 
 def test_wan_self_attention_patch_falls_back_on_f32():
-    apply_omni_model_specific_patches()
+    _patch_wan_fused_qk_norm_rope(od_config=_WAN)
     attn = _make_wan_self_attention()
     x = torch.ones(1, 3, 64)
     rot = (torch.ones(1, 3, 1, 64), torch.ones(1, 3, 1, 64))
@@ -645,7 +883,7 @@ def test_ltx2_vocoder_cpu_init_patch(monkeypatch):
         _UPSTREAM_RESTORE_BWE_FILTER,
     )
 
-    _patch_ltx2_vocoder_cpu_init()
+    _patch_ltx2_vocoder_cpu_init(od_config=_LTX2)
     patched = ltx2_components._load_component
     assert patched is not _load_component
     assert getattr(patched, _VOCODER_CPU_INIT_PATCHED, False)
@@ -659,7 +897,7 @@ def test_ltx2_vocoder_cpu_init_patch(monkeypatch):
         ("vae", True, torch.float32, None),
     ]
 
-    _patch_ltx2_vocoder_cpu_init()
+    _patch_ltx2_vocoder_cpu_init(od_config=_LTX2)
     assert ltx2_components._load_component is patched
 
 
@@ -689,11 +927,11 @@ def test_ltx2_bwe_filter_cpu_restore_patch(monkeypatch):
         ltx2_components._load_component,
     )
 
-    _patch_ltx2_vocoder_cpu_init()
+    _patch_ltx2_vocoder_cpu_init(od_config=_LTX2)
     patched = ltx2_runtime._restore_ltx_bwe_resampler_filter
     assert patched is not _restore
     assert getattr(patched, _BWE_FILTER_CPU_RESTORE_PATCHED, False)
-    _patch_ltx2_vocoder_cpu_init()
+    _patch_ltx2_vocoder_cpu_init(od_config=_LTX2)
     assert ltx2_runtime._restore_ltx_bwe_resampler_filter is patched
 
     # A CPU filter goes straight to upstream.
@@ -757,7 +995,7 @@ def ltx2(monkeypatch, table_syncs):
         ("get_tensor_model_parallel_rank", lambda: 0),
     ):
         monkeypatch.setattr(ltx2_transformer, name, value)
-    _patch_ltx2_split_rope()
+    _patch_ltx2_split_rope(od_config=_LTX2)
     assert getattr(
         ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward, _SPLIT_ROPE_PATCHED
     )
@@ -844,7 +1082,7 @@ def test_ltx2_split_rope_passes_other_tables_through(ltx2):
     # Installing again keeps the single wrapper.
     forward = ltx2.LTX2AudioVideoRotaryPosEmbed.forward
     apply_split_rotary_emb = ltx2.apply_split_rotary_emb
-    _patch_ltx2_split_rope()
+    _patch_ltx2_split_rope(od_config=_LTX2)
     assert ltx2.LTX2AudioVideoRotaryPosEmbed.forward is forward
     assert ltx2.apply_split_rotary_emb is apply_split_rotary_emb
 

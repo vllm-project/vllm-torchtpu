@@ -38,6 +38,7 @@ PR/nightly tests.
 
 import copy
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -89,12 +90,21 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
     WanVACETransformer3DModel,
 )
 
+from vllm_torchtpu import patch_registry
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
+from vllm_torchtpu.omni.patches import _patch_wan_pair_swap_rope
 from vllm_torchtpu.omni.rope import can_fuse_qk_norm_rope
 
 logger = init_logger(__name__)
 pytestmark = [pytest.mark.omni]
+
+
+def _apply_model_patches() -> None:
+    patch_registry.apply("diffusion_worker")
+    patch_registry.apply(
+        "diffusion_model_load",
+        od_config=SimpleNamespace(model_class_name="WanPipeline"),
+    )
 
 
 def _metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
@@ -153,6 +163,7 @@ def _assert_parity(
 @pytest.fixture(scope="module")
 def omni_ctx():
     """Single-rank diffusion parallel groups plus a default forward context."""
+    _apply_model_patches()
     owns_dist_env = not torch.distributed.is_initialized()
     if owns_dist_env:
         init_distributed_environment(
@@ -259,7 +270,7 @@ ROPE_FREQS_ATOL = 1e-4
 
 
 def test_wan_rotary_embedding_pair_swap_bit_exact_on_tpu() -> None:
-    apply_omni_model_specific_patches()
+    _patch_wan_pair_swap_rope()
 
     torch.manual_seed(42)
     rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
@@ -279,7 +290,7 @@ def test_wan_self_attention_fused_matches_unpatched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify fused q/k RMSNorm + RoPE on the real WanSelfAttention on TPU."""
-    apply_omni_model_specific_patches()
+    _apply_model_patches()
 
     torch.manual_seed(42)
     for target in (
