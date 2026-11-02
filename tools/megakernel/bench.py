@@ -24,6 +24,7 @@ import os
 import statistics
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 
@@ -58,6 +59,25 @@ def add_arguments(parser, profile: bool = False) -> None:
         help="time B1 as DSpark verify + draft with this speculator; without "
         "the flag B1 is the plain step",
     )
+    decode.add_argument(
+        "--real-context",
+        type=int,
+        default=0,
+        help="kdecode: each row's last N context tokens are real text from --context-file "
+        "(replayed on the decoder before the timed steps; the rest stay synthetic pages)",
+    )
+    decode.add_argument(
+        "--spec-drafts",
+        type=int,
+        default=0,
+        help="kdecode: batched DSpark at every batch (synthetic acceptance --spec-al) with the "
+        "--dspark checkpoint: each timed step is the serving verify + draft path",
+    )
+    decode.add_argument("--spec-al", type=float, default=2.87)
+    decode.add_argument(
+        "--context-file", default=str(Path(__file__).parent / "data" / "corpus.npy")
+    )
+    decode.add_argument("--context-seed", type=int, default=0)
     decode.add_argument(
         "--save-tokens",
         default="",
@@ -109,8 +129,10 @@ def _trace(directory: str, tag: str, last: bool):
         return
     from torch_tpu._internal.profiler import _impl as profiler
 
-    path = os.path.join(directory, tag)
-    profiler.start_trace(path)
+    path = os.path.join(directory, f"{tag}-r{harness.rank():02d}")
+    profiler.start_trace(
+        path, profiler.ProfileOptions(device_tracer_level=10, host_tracer_level=2)
+    )
     try:
         yield
     finally:
@@ -154,9 +176,27 @@ def run_decode(args, records: harness.Records) -> None:
         num_slots=Control.total_slots(sub_base) if args.dspark else sub_base,
         batch_sizes=sizes,
     )
+    spec = args.spec_drafts
     pools = k3.Pools(blocks, pages, 1, pattern=True)
     draft = None
-    if args.dspark and any(batch == 1 for batch, _ in cases):
+    if spec:
+        from pathlib import Path
+
+        from vllm.config import SpeculativeConfig
+
+        from vllm_torchtpu.megakernel.kimi_k3.draft import draft_class
+
+        rates = tuple(SpeculativeConfig._acceptance_length_to_rates(args.spec_al, spec))
+        harness.log(
+            f"batched DSpark: {spec} drafts, AL {args.spec_al} -> rates {rates}"
+        )
+        draft = draft_class(args.dspark)(
+            max_position=max_context + 8 * args.steps * args.repeats + 256,
+            checkpoint=args.dspark,
+            presharded=Path(args.presharded),
+            synthetic_rates=rates,
+        )
+    elif args.dspark and any(batch == 1 for batch, _ in cases):
         from vllm_torchtpu.megakernel.kimi_k3.draft import DsparkDraft
 
         draft = DsparkDraft(
@@ -170,8 +210,21 @@ def run_decode(args, records: harness.Records) -> None:
         max_num_seqs=max_num_seqs,
         max_model_len=pages * k3.logical(),
         draft=draft,
-        # The bench speculates on batch-one rows only (7 drafts).
-        schedule=((1, 1, 7), (2, max(2, max_num_seqs), 0)) if draft else None,
+        # The bench speculates on batch-one rows only (7 drafts); --spec-drafts everywhere.
+        # kdecode mixed launch: batched DSpark up to 32 requests; above, the
+        # mixed launch (KernelConfig.mixed_launch) runs instead of plain steps.
+        schedule=(
+            ((1, min(32, max_num_seqs), spec),)
+            + (((33, max_num_seqs, 0),) if max_num_seqs > 32 else ())
+            if spec and getattr(config.active(), "mixed_launch", "")
+            else ((1, max_num_seqs, spec),)
+        )
+        if spec
+        else ((1, 1, 7), (2, max(2, max_num_seqs), 0))
+        if draft
+        else None,
+        drafts=spec or 7,
+        synthetic_rates=rates if spec else None,
     )
     harness.sync()
     decoder.warmup()
@@ -180,6 +233,9 @@ def run_decode(args, records: harness.Records) -> None:
     )
     sampling = (args.temperature, 0.95 if args.temperature > 0 else 1.0, 0, 7)
 
+    corpus = np.load(args.context_file).astype(np.int32) if args.real_context else None
+    real_rng = np.random.default_rng(args.context_seed)
+
     def rows_for(batch, context, first, tag):
         """The step's requests: on the first, each reset at its context with
         a clean KDA state; then continuing (the device holds their inputs)."""
@@ -187,9 +243,25 @@ def run_decode(args, records: harness.Records) -> None:
         out = []
         for r in range(batch):
             table = pools.scheduled([1 + r // dp * pages + p for p in range(pages)], r)
-            query = 8 if batch == 1 and draft is not None and not first else 1
+            query = (
+                (1 + spec)
+                if spec and not first
+                else 8
+                if batch == 1 and draft is not None and not first
+                else 1
+            )
             tokens = [1000 + 37 * r] if first else np.zeros(query, np.int32)
             computed = per_row[r] - 1 if first else 0
+            if first and corpus is not None:
+                n = args.real_context
+                # Per-row context: row r of every batch gets the same text.
+                at = int(
+                    np.random.default_rng((args.context_seed, r)).integers(
+                        0, corpus.size - n
+                    )
+                )
+                tokens = corpus[at : at + n]
+                computed = per_row[r] - n
             out.append(k3.request(f"{tag}-{r}", tokens, table, sampling, computed))
         return mk.StepInput(out)
 
@@ -199,7 +271,15 @@ def run_decode(args, records: harness.Records) -> None:
         label = context if not isinstance(context, list) else "mix " + args.mix
         tag = f"b{batch}c{context if not isinstance(context, list) else 'mix'}"
         # First step: rows reset at the context.
+        replay_started = time.perf_counter()
         decoder.step(rows_for(batch, context, True, tag))
+        if corpus is not None:
+            bridge.materialize(
+                decoder.step(rows_for(batch, context, False, tag)).tokens
+            )
+            harness.log(
+                f"{tag}: real contexts replayed in {time.perf_counter() - replay_started:.1f} s"
+            )
         bridge.materialize(decoder.step(rows_for(batch, context, False, tag)).tokens)
         times, outs = [], []
         for repeat in range(args.repeats):
@@ -212,15 +292,31 @@ def run_decode(args, records: harness.Records) -> None:
                 bridge.materialize(outs[-1])
                 times.append(1e3 * (time.perf_counter() - started) / args.steps)
         ms = statistics.median(times)
-        dspark = batch == 1 and draft is not None
+        dspark = (batch == 1 and draft is not None) or bool(spec)
         if dspark:
-            tokens = torch.cat([o[:1] for o in outs]).cpu()
+            tokens = torch.cat([o[:batch] for o in outs]).cpu()
             per_step = float((tokens >= 0).sum()) / len(outs)
             rate = 1e3 * per_step / ms
             line = (
-                f"B1 ctx {label}: DSpark {ms:.2f} ms per step, "
-                f"{per_step:.2f} tokens per step (synthetic) -> {rate:.0f} tok/s"
+                f"B{batch} ctx {label}: DSpark {ms:.2f} ms per step, "
+                f"{per_step:.2f} tokens per step ({per_step / batch:.2f} per request, synthetic) -> {rate:.0f} tok/s"
             )
+            verifying = getattr(decoder, "_mixed_verify", set())
+            if verifying:
+                counts = (
+                    (tokens >= 0)
+                    .sum(dim=1)
+                    .reshape(len(outs), batch)
+                    .float()
+                    .mean(dim=0)
+                )
+                x = [r for r in range(batch) if f"{tag}-{r}" in verifying]
+                y = [r for r in range(batch) if f"{tag}-{r}" not in verifying]
+                line += (
+                    f"; mixed {decoder.stats.get('mixed', 0)} steps: verify {len(x)} requests "
+                    f"{float(counts[x].mean()) if x else 0:.3f} tokens/step, plain {len(y)} requests "
+                    f"{float(counts[y].mean()) if y else 0:.3f}"
+                )
         else:
             rate = batch * 1e3 / ms
             line = f"B{batch} ctx {label}: {ms:.2f} ms per step, {rate:.1f} tok/s"

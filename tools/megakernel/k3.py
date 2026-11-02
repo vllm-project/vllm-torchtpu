@@ -172,6 +172,8 @@ def decoder(
     max_model_len: int,
     draft=None,
     schedule: tuple[tuple[int, int, int], ...] | None = None,
+    drafts: int = 7,
+    synthetic_rates: tuple[float, ...] | None = None,
 ):
     """A :class:`KimiDecoder` over shared ``ops`` (and ``draft``) and the
     fixture ``pools``, bound and ready to warm. ``schedule``: vLLM's
@@ -184,9 +186,21 @@ def decoder(
         max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
         max_num_batched_tokens=512,
-        num_speculative_tokens=7 if schedule else 0,
+        num_speculative_tokens=drafts if schedule else 0,
         num_speculative_tokens_per_batch_size=schedule,
     )
+    import dataclasses
+
+    from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
+
+    # Serving sets attention DP on the engine config (spec shape checks use it).
+    config = dataclasses.replace(
+        config, attention_dp=kernel_config.active().attention_dp
+    )
+    if synthetic_rates is not None:
+        config = dataclasses.replace(
+            config, synthetic_acceptance_rates=tuple(synthetic_rates)
+        )
     decoder = KimiDecoder(config, ops, draft if schedule else None, tp_rank=ops.rank)
     decoder.bind_kv_caches(pools.caches, pools.groups)
     return decoder
