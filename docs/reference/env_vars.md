@@ -60,6 +60,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
+| `TPU_GEMMA4_SEQUENCE_PARALLEL` | `True` | Gemma4 at TP > 1: token buckets of >= 1 MiB of residual stream per rank keep it token-sharded (reduce-scatter instead of all-reduce, norms on T/tp rows, FP8 all-gather into the next projection). Not with drafters that read auxiliary hidden states (EAGLE3, DFlash, DSpark). |
+| `TPU_GEMMA4_SP_MICROBATCHES` | `1` | With `TPU_GEMMA4_SEQUENCE_PARALLEL`: run a large bucket as this many contiguous token chunks, one dataflow each outside attention, so one chunk's collectives can overlap another's projections. Applied only while every chunk keeps >= 1 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
