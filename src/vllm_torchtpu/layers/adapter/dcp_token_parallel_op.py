@@ -110,6 +110,11 @@ def check_config(vllm_config: Any) -> None:
             "TPU_DCP_PREFILL_TOKEN_PARALLEL returns merged latent outputs; it "
             "does not take TPU_DCP_MLA_UV_BEFORE_MERGE / _OPROJ_ALL_REDUCE."
         )
+    if body_levers() and not envs.TPU_MLA_SPARSE_SPLIT_Q:
+        raise NotImplementedError(
+            "TPU_MLA_TP_BODY_LEVERS needs TPU_MLA_SPARSE_SPLIT_Q (the NOPE-only "
+            "PV of the levers needs the split query)."
+        )
     if vllm_config.cache_config.enable_prefix_caching:
         raise NotImplementedError(
             "TPU_DCP_PREFILL_TOKEN_PARALLEL does not take prefix caching: the "
@@ -181,6 +186,24 @@ def _sharded_rank_ids() -> torch.Tensor | None:
     return dcp_rank_operand()
 
 
+def body_levers() -> tuple[str, ...]:
+    """TPU_MLA_TP_BODY_LEVERS -> the attend kernel's `plain_body_levers`
+    ("1" = all of `PLAIN_BODY_LEVERS`, else a comma list; empty / "0" = off)."""
+    value = envs.TPU_MLA_TP_BODY_LEVERS
+    if value in ("", "0"):
+        return ()
+    if value == "1":
+        return sparse_mla_kernel.PLAIN_BODY_LEVERS
+    levers = tuple(v.strip() for v in value.split(",") if v.strip())
+    unknown = set(levers) - set(sparse_mla_kernel.PLAIN_BODY_LEVERS)
+    if unknown:
+        raise ValueError(
+            f"TPU_MLA_TP_BODY_LEVERS: {sorted(unknown)} not in "
+            f"{sparse_mla_kernel.PLAIN_BODY_LEVERS}"
+        )
+    return levers
+
+
 def make_attend(
     *,
     sm_scale: float,
@@ -199,6 +222,8 @@ def make_attend(
 
     packed = {"packed_rope": True} if packed_rope else {}
     split_q = envs.TPU_MLA_SPARSE_SPLIT_Q
+    levers = body_levers()
+    body = {"plain_body_levers": levers} if levers else {}
 
     def attend(q_nope, q_pe, g_nope, g_rope, topk, num_rows):
         if split_q:
@@ -219,6 +244,7 @@ def make_attend(
             **sparse_mla_chunk_kwargs(),
             **packed,
             **split,
+            **body,
         )
         return out[..., :lkv_dim]
 

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
+    TPU_MLA_TP_BODY_LEVERS: str = ""
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
     TPU_MTP_DCP_MERGE_SIZED: bool = False
@@ -843,6 +844,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies through the LSE merge. Bit-identical outputs. On by default on
     # glm-agentx (it replaces the branch's TPU_DCP_MLA_SPLIT_Q_LSE).
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=True),
+    # TPU_DCP_PREFILL_TOKEN_PARALLEL: attention-body levers of the
+    # token-parallel sparse MLA kernel (its plain body) -- "1" = all of
+    # kernels/mla/sparse/kernel.py PLAIN_BODY_LEVERS (byte-transpose NOPE
+    # unpack, per-row zeroing on the packed words, NOPE-only PV, no forced
+    # MXU/VPU dependency; bitwise-identical outputs), or a comma list of them.
+    # Needs TPU_MLA_SPARSE_SPLIT_Q. Empty = off.
+    "TPU_MLA_TP_BODY_LEVERS": env_str("TPU_MLA_TP_BODY_LEVERS", ""),
     # DCP sparse MLA: chunks of at most this many query tokens take the
     # decode-sized (small-chunk) path -- TPU_DCP_MLA_SMALL_CHUNK_BATCH tokens
     # per grid step and the one-atom live-bounded SparseCore gather

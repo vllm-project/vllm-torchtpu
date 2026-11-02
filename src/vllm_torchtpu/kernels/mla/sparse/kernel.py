@@ -1445,6 +1445,10 @@ DECODE_BODY_LEVERS = (
     "step8",
 )
 DECODE_STEP8_TOKENS = 8
+# Plain body levers (`plain_body_levers`, TPU_MLA_TP_BODY_LEVERS): the
+# bitwise-identical per-token levers of the live body, on the plain body (no
+# capped windows, live groups or DCP mode: the token-parallel attend).
+PLAIN_BODY_LEVERS = ("tr", "zu", "pv512", "noinf")
 # The measured set (decode probes 02 / 04 / 05): "step8" runs 8 tokens per
 # attention grid step and "quad" stacks them in one softmax; "nofill" and
 # "q128" measured no gain.
@@ -1746,7 +1750,8 @@ def _attention_kernel(
     # result is the same. Steps wider than every width run the full body.
     assert not live_widths or group_tab_ref is not None
     assert not row_widths or group_tab_ref is None
-    # Body levers (`body_levers`, live-group mode only; `MIXED_BODY_LEVERS`):
+    # Body levers (`body_levers`; the live-group body takes `MIXED_BODY_LEVERS`,
+    # the plain body `PLAIN_BODY_LEVERS`):
     #   "tr"     unpack the NOPE words with four stride-4 row loads and a 4x4
     #            byte transpose on 32-bit words, then a native bitcast to fp8,
     #            instead of the u8 reshape relayout (same bytes, same layout).
@@ -1772,7 +1777,12 @@ def _attention_kernel(
     #            sublanes, PV with a transposed-LHS contraction; the lse
     #            arrives lane-dense (not bit-exact: reduction order).
     # Every stage-A lever except "xqk" is bitwise-identical.
-    assert not body_levers or group_tab_ref is not None or row_widths
+    assert (
+        not body_levers
+        or group_tab_ref is not None
+        or row_widths
+        or not (is_dcp_mode or capped_windows is not None)
+    )
     assert set(body_levers) <= set(MIXED_BODY_LEVERS) | {
         "nofill",
         "quad",
@@ -3439,6 +3449,7 @@ def prepare_outputs(
         "out_pieces_fault",
         "out_pieces_gather_first",
         "packed_rope",
+        "plain_body_levers",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -3496,6 +3507,7 @@ def sparse_ragged_paged_attention(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    plain_body_levers: tuple[str, ...] = (),
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -3660,6 +3672,10 @@ def sparse_ragged_paged_attention(
         (`SparseMLAKVCacheSpec.packed_rope`); the gather expands it to the
         padded rows the attention body reads, so the scores are unchanged.
         `kv_write` then writes 16-word rope tokens.
+      plain_body_levers: TPU_MLA_TP_BODY_LEVERS. `PLAIN_BODY_LEVERS` on the
+        chunks that take the plain body (no `topk_cap`, not `is_dcp_mode`),
+        documented at `_attention_kernel`: bitwise-identical outputs. "zu"
+        needs "pv512", which needs split q.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -3822,6 +3838,19 @@ def sparse_ragged_paged_attention(
         # "zu" leaves ROPE rows past kv_len as gathered; only a NOPE-only PV
         # keeps them out of the output.
         raise ValueError("decode_body_levers: 'zu' needs 'pv512'")
+    if not set(plain_body_levers) <= set(PLAIN_BODY_LEVERS):
+        raise ValueError(
+            f"plain_body_levers {plain_body_levers} not in {PLAIN_BODY_LEVERS}"
+        )
+    if "zu" in plain_body_levers and "pv512" not in plain_body_levers:
+        raise ValueError("plain_body_levers: 'zu' needs 'pv512'")
+    if plain_body_levers and not sparsecore_layout:
+        # The lever unpack reads one u32[128] word row per key.
+        raise ValueError("plain_body_levers need the sparsecore cache layout")
+    if "pv512" in plain_body_levers and q_pe is None:
+        # Without split q the PV keeps every column, so "pv512" is a no-op
+        # and "zu"'s unzeroed ROPE rows would reach the output.
+        raise ValueError("plain_body_levers: 'pv512' needs split q (q_pe)")
     if q_rope_table is None:
         # "q128" narrows the in-kernel q rope's raw-head DMA; without it
         # there is nothing to narrow.
@@ -4135,6 +4164,7 @@ def sparse_ragged_paged_attention(
             send_peer=send_peer,
             send_recv_in=send_recv_in,
             packed_rope=packed_rope,
+            plain_levers=plain_body_levers,
             **extra,
         )
 
@@ -4333,6 +4363,7 @@ def sparse_attention_chunk(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    plain_levers: tuple[str, ...] = (),
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -4379,6 +4410,8 @@ def sparse_attention_chunk(
     `packed_rope` (SparseCore layout only): the rope cache holds 16 words per
     token (and `kv_write` writes 16-word rope tokens); the gather returns the
     same padded rows either way.
+    `plain_levers` (`PLAIN_BODY_LEVERS`): body levers for a chunk that takes
+    the plain body (no capped windows, not `is_dcp_mode`); ignored otherwise.
     """
     if kv_write is not None and not gather_live_in_indices:
         raise ValueError("kv_write rides the fused-prep capped gather only")
@@ -4655,6 +4688,10 @@ def sparse_attention_chunk(
         if live_views is None and row_levers and row_widths and capped_windows:
             # Decode body levers on the row-widths body.
             kernel_body = functools.partial(kernel_body, body_levers=tuple(row_levers))
+        elif plain_levers and capped_windows is None and not is_dcp_mode:
+            kernel_body = functools.partial(
+                kernel_body, body_levers=tuple(plain_levers)
+            )
         if live_views is not None:
             group_body = functools.partial(
                 kernel_body,
