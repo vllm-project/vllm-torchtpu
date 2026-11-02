@@ -2406,6 +2406,10 @@ def compressed_dcp_blocks(vals_pair, pos_pair, block_topk, *, topk=None):
     blocks; the DCP attention drops the groups another rank owns."""
     from vllm_torchtpu.kernels.qwen4_exp import dcp_select
 
+    if topk is None and envs.VLLM_TPU_QSA_FUSED_DCP_BLOCKS:
+        from vllm_torchtpu.kernels.qwen4_exp.fused_dcp_blocks import fused_dcp_blocks
+
+        return fused_dcp_blocks(vals_pair, pos_pair, block_topk)
     thr_val, thr_pos = dcp_select.merge_threshold(vals_pair, pos_pair, block_topk, topk=topk)
     keep = jax.vmap(dcp_select.keep_mask, in_axes=(0, 0, None, None))(
         vals_pair, pos_pair, thr_val, thr_pos
