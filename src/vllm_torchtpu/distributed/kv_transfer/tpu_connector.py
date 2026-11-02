@@ -29,6 +29,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 ``kv_connector_extra_config.use_hma_connector``.
 """
 
+import concurrent.futures
 import dataclasses
 import importlib
 import json
@@ -141,6 +142,27 @@ _STAGE3_REGISTRY_STATUS_CANCELLED = 4
 # kHz while a load waits; rate-limit the controller RPCs per parked request.
 _STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S = 0.05
 _STAGE3_REGISTRATION_CANCELLED_ERROR = "Request block registration was cancelled"
+
+# Attempts per complete_request_blocks RPC under TPU_RAIDEN_ASYNC_COMPLETE (see
+# _submit_stage3_async_complete) before the failure is raised.
+_STAGE3_ASYNC_COMPLETE_MAX_ATTEMPTS = 5
+
+
+def _log_slow_stage3_complete(
+    rank: int, req_id: str, start: float, *, asynchronous: bool
+) -> None:
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    if elapsed_ms >= tpu_envs.TPU_RAIDEN_COMPLETE_SLOW_MS:
+        logger.info(
+            "TPURaidenConnectorWorker rank%d --> complete_request_blocks "
+            "took %.1f ms req_id=%s async=%s",
+            rank,
+            elapsed_ms,
+            req_id,
+            asynchronous,
+        )
+
+
 # Pool selection is vLLM policy expressed as request data: the connector names
 # the manifest tags to move and raiden resolves them against both peers'
 # registered manifests. Each GDN state class rides a sibling transfer with a
@@ -2631,6 +2653,11 @@ class TPURaidenConnectorWorker:
         self._stage3_registered_sends: dict[str, _Stage3RegisteredSend] = {}
         self._stage3_terminal_sends: dict[str, _Stage3RegisteredSend] = {}
         self._stage3_terminal_cleanup: dict[str, bool] = {}
+        # TPU_RAIDEN_ASYNC_COMPLETE: complete_request_blocks RPCs in flight on
+        # a background thread, keyed by req_id -> (future, uuid, attempts).
+        self._stage3_complete_futures: dict[str, tuple[Any, int, int]] = {}
+        self._stage3_complete_executor: Any | None = None
+        self._stage3_complete_local = threading.local()
         self._stage3_reported_sends: set[str] = set()
         self._stage3_submitted_loads: dict[str, int] = {}
         self._stage3_submitted_load_tokens: dict[str, int] = {}
@@ -6762,6 +6789,12 @@ class TPURaidenConnectorWorker:
             for req_id in cancelled_sends:
                 self._stage3_terminal_cleanup[req_id] = False
         if (
+            self._stage3_complete_futures
+            and self.is_producer
+            and self._raiden_stage3_enabled()
+        ):
+            self._reap_stage3_async_completes()
+        if (
             self._stage3_terminal_cleanup
             and self.is_producer
             and self._raiden_stage3_enabled()
@@ -6784,16 +6817,23 @@ class TPURaidenConnectorWorker:
                 # release. Active ranks may race the idempotent aggregate
                 # cleanup RPC after genuine native completion.
                 if force_release:
-                    with TraceAnnotation(
-                        "KV_Cache_Prefill_Send_Complete",
-                        uuid=registration.uuid,
-                        request_id=str(req_id),
-                        num_tokens=registration.num_tokens,
-                    ):
-                        facade.complete_request_blocks(
-                            req_id=req_id,
+                    if tpu_envs.TPU_RAIDEN_ASYNC_COMPLETE:
+                        self._submit_stage3_async_complete(req_id, registration.uuid)
+                    else:
+                        start = time.perf_counter()
+                        with TraceAnnotation(
+                            "KV_Cache_Prefill_Send_Complete",
                             uuid=registration.uuid,
-                            unit=self._raiden_work_unit,
+                            request_id=str(req_id),
+                            num_tokens=registration.num_tokens,
+                        ):
+                            facade.complete_request_blocks(
+                                req_id=req_id,
+                                uuid=registration.uuid,
+                                unit=self._raiden_work_unit,
+                            )
+                        _log_slow_stage3_complete(
+                            self.tp_rank, req_id, start, asynchronous=False
                         )
                 tombstone_deadline = time.time() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
@@ -6806,6 +6846,63 @@ class TPURaidenConnectorWorker:
                 )
                 del self._stage3_registered_sends[req_id]
                 del self._stage3_terminal_cleanup[req_id]
+
+    def _submit_stage3_async_complete(
+        self, req_id: str, uuid: int, attempts: int = 0
+    ) -> None:
+        """Hand one complete_request_blocks RPC to the background thread.
+
+        The RPC is idempotent aggregate cleanup issued only after the native
+        transfer completed, but it can take seconds (it settles across every
+        transfer rank). Issued inline from get_finished it stalls the engine
+        step, so the prefill worker stops prefilling queued requests.
+        """
+        if self._stage3_complete_executor is None:
+            self._stage3_complete_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="raiden-complete"
+            )
+        address = str(self._raiden_controller_address or "").strip()
+        unit = self._raiden_work_unit
+        rank = self.tp_rank
+
+        def _run() -> None:
+            # A thread-private client, so this never shares a native client
+            # with register_request_blocks on the engine thread.
+            facade = getattr(self._stage3_complete_local, "facade", None)
+            if facade is None:
+                facade = self._new_raiden_controller_facade(address)
+                self._stage3_complete_local.facade = facade
+            start = time.perf_counter()
+            facade.complete_request_blocks(req_id=req_id, uuid=uuid, unit=unit)
+            _log_slow_stage3_complete(rank, req_id, start, asynchronous=True)
+
+        future = self._stage3_complete_executor.submit(_run)
+        self._stage3_complete_futures[req_id] = (future, uuid, attempts)
+
+    def _reap_stage3_async_completes(self) -> None:
+        """Retire finished background completes; resubmit failures."""
+        for req_id, (future, uuid, attempts) in list(
+            self._stage3_complete_futures.items()
+        ):
+            if not future.done():
+                continue
+            del self._stage3_complete_futures[req_id]
+            exc = future.exception()
+            if exc is None:
+                continue
+            if attempts + 1 >= _STAGE3_ASYNC_COMPLETE_MAX_ATTEMPTS:
+                raise exc
+            logger.warning(
+                "TPURaidenConnectorWorker rank%d --> async "
+                "complete_request_blocks failed req_id=%s uuid=%d "
+                "attempt=%d, retrying: %s",
+                self.tp_rank,
+                req_id,
+                uuid,
+                attempts + 1,
+                exc,
+            )
+            self._submit_stage3_async_complete(req_id, uuid, attempts + 1)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         # Drain the failed-load block ids for the scheduler to recompute. Paired
