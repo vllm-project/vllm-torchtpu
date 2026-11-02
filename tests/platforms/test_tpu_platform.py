@@ -1172,6 +1172,20 @@ def test_prefill_first_flags_refuse_another_scheduler(monkeypatch):
         tpu_platform._configure_prefill_first_scheduler(vllm_config)
 
 
+def test_prefill_first_flags_name_the_dp_scheduler_as_the_conflict(monkeypatch):
+    monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_DECODE_INTERVAL_MS", 40)
+    monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", True)
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            scheduler_cls="vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
+        ),
+        parallel_config=SimpleNamespace(data_parallel_size=4),
+    )
+
+    with pytest.raises(ValueError, match="DP_SCHED_ENABLED=1 installs it"):
+        tpu_platform._configure_prefill_first_scheduler(vllm_config)
+
+
 def _device_left_unset():
     """Stop ``DeviceConfig`` building ``torch.device("tpu")`` off a TPU."""
     return patch.object(TpuPlatform, "uses_host_device_handling", return_value=True)
