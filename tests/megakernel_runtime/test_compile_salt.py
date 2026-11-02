@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The megakernel compile-cache salt leaves stock compile keys unchanged."""
+"""The megakernel compile-cache salt: the digest of a plugin's cache-layout
+request (`None` without one), and stock compile keys unchanged."""
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import importlib
 import json
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +31,8 @@ import pytest
 import torch
 
 import vllm_torchtpu
+from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
+from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
 
 _SRC = Path(vllm_torchtpu.__file__).resolve().parent.parent
 
@@ -51,8 +55,6 @@ SPEC = TpuMonoSpec("lay", "1", create="lay_mk_plugin:create",
 
 def _compute_hash_fn() -> Any:
     """`compute_tpu_compilation_hash`, compiled from source with CPU stand-ins."""
-    from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
-
     path = _SRC / "vllm_torchtpu" / "compilation" / "tpu_compiler.py"
     src = path.read_text(encoding="utf-8")
     fn = next(
@@ -117,3 +119,65 @@ def test_stock_compile_hash_unchanged_with_megakernel_on(
         assert compute(_vllm_config(mk2)) not in (base, lay)
     finally:
         sys.modules.pop("lay_mk_plugin", None)
+
+
+# A built-in shorthand and a checkpoint arch it claims.
+_SHORTHAND, _ENTRY = next(iter(plugin_mod.SHORTHANDS.items()))
+
+
+def _salt_config(megakernel: Any) -> Any:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[_ENTRY.architectures[0]])
+        ),
+        additional_config={} if megakernel is None else {"megakernel": megakernel},
+    )
+
+
+def test_compile_cache_salt_digests_the_layout_request_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shorthand_cfg = {"plugin": _SHORTHAND, "options": {"mode": "tp"}}
+    for mk in (None, False, True, _SHORTHAND, shorthand_cfg):
+        assert compile_cache_salt(_salt_config(mk)) is None
+    # Without the shorthand's model folder installed, too.
+    gone = _ENTRY._replace(module="no_such_mk_folder.megakernel")
+    with monkeypatch.context() as m:
+        m.setitem(plugin_mod.SHORTHANDS, _SHORTHAND, gone)
+        assert compile_cache_salt(_salt_config(True)) is None
+    path = tmp_path / "lay_mk_plugin.py"
+    path.write_text(_LAYOUT_PLUGIN, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    try:
+        salt1 = compile_cache_salt(_salt_config({"plugin": "lay_mk_plugin"}))
+        assert salt1 is not None and len(salt1) == 16
+        mk2 = {"plugin": "lay_mk_plugin", "options": {"n": 2}}
+        assert compile_cache_salt(_salt_config(mk2)) not in (None, salt1)
+        # Only the request counts: editing the plugin's source doesn't re-key.
+        path.write_text(_LAYOUT_PLUGIN + "\n# edited\n", encoding="utf-8")
+        sys.modules.pop("lay_mk_plugin", None)
+        assert compile_cache_salt(_salt_config({"plugin": "lay_mk_plugin"})) == salt1
+    finally:
+        sys.modules.pop("lay_mk_plugin", None)
+
+
+_FRESH_IMPORT = """
+import sys
+for name in ("torch", "jax", "jaxlib", "vllm", "numpy"):
+    sys.modules[name] = None
+import vllm_torchtpu.megakernel_runtime.salt as s
+assert s.compile_cache_salt
+print("OK")
+"""
+
+
+def test_salt_imports_without_torch_jax_or_vllm() -> None:
+    out = subprocess.run(
+        [sys.executable, "-c", _FRESH_IMPORT],
+        capture_output=True,
+        text=True,
+        env={"PYTHONPATH": str(_SRC), "PATH": "/usr/bin:/bin"},
+        timeout=120,
+    )
+    assert out.returncode == 0 and out.stdout.strip() == "OK", out.stderr
