@@ -30,6 +30,15 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_gated_act
 _VMEM = 64 * 1024 * 1024
 
 
+def _pack_rows(x):
+    """BF16 [n, hidden] -> the packed uint32 [n * hidden // 256, 128] row form."""
+    n, h = x.shape
+    s = G.packed_sublanes(h)
+    bits = jax.lax.bitcast_convert_type(x.reshape(n, s, 2, 128), jnp.uint16)
+    bits = bits.astype(jnp.uint32)
+    return (bits[:, :, 0, :] | (bits[:, :, 1, :] << 16)).reshape(n * s, 128)
+
+
 def _quantize(block):
     amax = jnp.max(jnp.abs(block), axis=1, keepdims=True)
     scale = amax / float(jnp.finfo(jnp.float8_e4m3fn).max)
@@ -103,9 +112,33 @@ def _weights(key, experts, hidden, inter):
 
 def test_pack_rows_roundtrip():
     x = jax.random.normal(jax.random.PRNGKey(0), (6, 768)).astype(jnp.bfloat16)
-    packed = G.pack_rows(x)
+    packed = _pack_rows(x)
     assert packed.shape == (6 * 3, 128) and packed.dtype == jnp.uint32
     np.testing.assert_array_equal(np.asarray(G.unpack_rows(packed, 6)), np.asarray(x))
+
+
+def test_quantize_pack_rows_layout():
+    tokens, hidden = 32, 768
+    x = (jax.random.normal(jax.random.PRNGKey(4), (tokens, hidden)) * 3).astype(
+        jnp.bfloat16
+    )
+    x = x.at[5].set(0)  # an all-zero row has scale 0 and scale_inv 0
+    packed = G.quantize_pack_rows(x, tile_tokens=16, interpret=True)
+    rows = np.asarray(packed).reshape(tokens, 4, 128)
+    want_scaled, want_scales = [], []
+    for k0 in range(0, hidden, G.QUANT_BLOCK):
+        scaled, scale = jax.jit(G._scale_rows)(x[:, k0 : k0 + G.QUANT_BLOCK])
+        want_scaled.append(scaled)
+        want_scales.append(scale.astype(jnp.float32))
+    got_scaled = G.unpack_rows(jnp.asarray(rows[:, :3].reshape(-1, 128)), tokens)
+    np.testing.assert_array_equal(
+        np.asarray(got_scaled), np.asarray(jnp.concatenate(want_scaled, axis=1))
+    )
+    got_scales = rows[:, 3, :2].view(np.float32)
+    np.testing.assert_array_equal(
+        got_scales, np.asarray(jnp.concatenate(want_scales, 1))
+    )
+    assert not rows[:, 3, 2:].any()
 
 
 @pytest.mark.parametrize(
@@ -123,7 +156,7 @@ def test_gather_fused_moe_matches_reference(tokens, experts, topk, tile_m, skew)
     token_ids, group_sizes, _, _ = _routing(kr, tokens, experts, topk, skew)
     w1, w1s, w2, w2s = _weights(kw, experts, hidden, inter)
     out = G.gather_fused_moe(
-        G.pack_rows(x),
+        G.quantize_pack_rows(x, tile_tokens=16, interpret=True),
         token_ids,
         group_sizes,
         w1,
@@ -149,7 +182,7 @@ def test_gather_combine_matches_reference():
     _, _, positions, weights = _routing(kr, tokens, 16, topk, 0.0)
     y = jax.random.normal(ky, (tokens * topk, hidden)).astype(jnp.bfloat16)
     out = G.gather_combine(
-        G.pack_rows(y),
+        _pack_rows(y),
         positions,
         weights,
         hidden_size=hidden,
@@ -177,7 +210,7 @@ def test_routed_moe_end_to_end():
     )
     w1, w1s, w2, w2s = _weights(kw, experts, hidden, inter)
     rows = G.gather_fused_moe(
-        G.pack_rows(x),
+        G.quantize_pack_rows(x, tile_tokens=16, interpret=True),
         token_ids,
         group_sizes,
         w1,

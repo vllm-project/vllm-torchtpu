@@ -31,7 +31,10 @@ Rows cross HBM in a packed form so a single row is one contiguous DMA: BF16
 row ``r`` in sublanes ``[S * r, S * r + S)`` and word ``(S * r + j, l)``
 holding column ``256 * j + l`` in its low half and ``256 * j + 128 + l`` in its
 high half. (A BF16 array's native tiling interleaves row pairs, so one BF16 row
-is not addressable on its own.)
+is not addressable on its own.) The expert kernel's input rows,
+``quantize_pack_rows``, carry one more sublane: each token is quantized once,
+as ``bf16(x * scale_inv)`` per 512-column block, with the block scales in the
+extra sublane, instead of once per routed copy inside the expert kernel.
 
 The arithmetic of each routed row matches ``gmm_v2`` (per-row, per-512-column
 FP8 activation quantization with BF16 accumulation, the fused activation, and
@@ -67,17 +70,8 @@ def packed_sublanes(hidden_size: int) -> int:
     return hidden_size // PACKED_COLUMNS
 
 
-def pack_rows(x: jax.Array) -> jax.Array:
-    """BF16 ``[n, hidden]`` -> packed uint32 ``[n * hidden // 256, 128]``."""
-    n, h = x.shape
-    s = packed_sublanes(h)
-    bits = lax.bitcast_convert_type(x.reshape(n, s, 2, LANES), jnp.uint16)
-    bits = bits.astype(jnp.uint32)
-    return (bits[:, :, 0, :] | (bits[:, :, 1, :] << 16)).reshape(n * s, LANES)
-
-
 def unpack_rows(packed: jax.Array, n: int) -> jax.Array:
-    """Inverse of ``pack_rows``."""
+    """Packed uint32 ``[n * S, 128]`` -> BF16 ``[n, S * 256]``."""
     s = packed.shape[0] // n
     p = packed.reshape(n, s, 1, LANES)
     halves = jnp.concatenate([p & 0xFFFF, p >> 16], axis=2).astype(jnp.uint16)
@@ -91,21 +85,87 @@ def _unpack_lane_block(words: jax.Array) -> tuple[jax.Array, jax.Array]:
     return lo, hi
 
 
+def _bf16_bits(x: jax.Array) -> jax.Array:
+    """The BF16 bit pattern of each element, zero-extended to uint32.
+
+    Bitcasting the BF16 value (rather than widening it to F32) pins the
+    stored bits to the rounded BF16 value even where the compiler would keep
+    excess precision in a BF16 intermediate.
+    """
+    return pltpu.bitcast(x.astype(jnp.bfloat16), jnp.uint16).astype(jnp.uint32)
+
+
 def _pack_lane_block(lo: jax.Array, hi: jax.Array) -> jax.Array:
     """BF16 (low, high) ``[rows, 128]`` -> packed uint32 ``[rows, 128]``."""
-    lo_bits = pltpu.bitcast(lo.astype(jnp.float32), jnp.uint32)
-    hi_bits = pltpu.bitcast(hi.astype(jnp.float32), jnp.uint32)
-    return jnp.bitwise_or(
-        jnp.right_shift(lo_bits, 16), jnp.bitwise_and(hi_bits, jnp.uint32(_HI_MASK))
-    )
+    return jnp.bitwise_or(_bf16_bits(lo), jnp.left_shift(_bf16_bits(hi), 16))
+
+
+def _scale_rows(block: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """gmm_v2's activation quantization of one BF16 block, before the FP8 cast.
+
+    Returns ``(block * scale_inv, scale)`` in BF16, exactly as gmm_v2 forms them.
+    """
+    abs_max = jnp.max(jnp.abs(block), axis=1, keepdims=True)
+    scale = abs_max / _FP8_MAX
+    scale_inv = jnp.where(scale == 0, 0, 1 / scale)
+    return block * scale_inv, scale
 
 
 def _quantize_rows(block: jax.Array) -> tuple[jax.Array, jax.Array]:
     """gmm_v2's activation quantization of one BF16 block: (fp8 values, BF16 scale)."""
-    abs_max = jnp.max(jnp.abs(block), axis=1, keepdims=True)
-    scale = abs_max / _FP8_MAX
-    scale_inv = jnp.where(scale == 0, 0, 1 / scale)
-    return (block * scale_inv).astype(FP8), scale
+    scaled, scale = _scale_rows(block)
+    return scaled.astype(FP8), scale
+
+
+def _quantize_pack_kernel(x_ref, o_ref, *, s, tt, hidden):
+    scaled, scales = [], []
+    for k0 in range(0, hidden, QUANT_BLOCK):
+        block_scaled, block_scale = _scale_rows(
+            x_ref[:, k0 : min(hidden, k0 + QUANT_BLOCK)]
+        )
+        scaled.append(block_scaled)
+        scales.append(block_scale)
+    xs = jnp.concatenate(scaled, axis=1)
+    for j in range(s):
+        lo = xs[:, PACKED_COLUMNS * j : PACKED_COLUMNS * j + LANES]
+        hi = xs[:, PACKED_COLUMNS * j + LANES : PACKED_COLUMNS * (j + 1)]
+        o_ref[pl.ds(j, tt, stride=s + 1), :] = _pack_lane_block(lo, hi)
+    # Block b's scale, as F32 bits, in lane b of the row's last sublane.
+    lane = lax.broadcasted_iota(jnp.int32, (tt, LANES), 1)
+    words = jnp.zeros((tt, LANES), jnp.uint32)
+    for b, block_scale in enumerate(scales):
+        bits = jnp.left_shift(_bf16_bits(block_scale), 16)
+        words = jnp.where(lane == b, bits, words)
+    o_ref[pl.ds(s, tt, stride=s + 1), :] = words
+
+
+@functools.partial(jax.jit, static_argnames=("tile_tokens", "interpret"))
+def quantize_pack_rows(
+    x: jax.Array, *, tile_tokens: int = 256, interpret: bool = False
+) -> jax.Array:
+    """BF16 ``[n, hidden]`` -> the expert kernel's rows, uint32 ``[n * (S + 1), 128]``.
+
+    Sublanes ``[0, S)`` of a row hold ``bf16(x * scale_inv)`` per 512-column
+    block in the packed form; lane ``b`` of sublane ``S`` holds block ``b``'s
+    BF16 scale as F32 bits.
+    """
+    n, h = x.shape
+    s = packed_sublanes(h)
+    if pl.cdiv(h, QUANT_BLOCK) > LANES:
+        raise ValueError(f"hidden size {h} has more than {LANES} quantization blocks")
+    tile_tokens = min(tile_tokens, n)
+    if n % tile_tokens:
+        raise ValueError(f"{n=} is not a multiple of {tile_tokens=}")
+    return pl.pallas_call(
+        functools.partial(_quantize_pack_kernel, s=s, tt=tile_tokens, hidden=h),
+        out_shape=jax.ShapeDtypeStruct((n * (s + 1), LANES), jnp.uint32),
+        grid=(n // tile_tokens,),
+        in_specs=[pl.BlockSpec((tile_tokens, h), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((tile_tokens * (s + 1), LANES), lambda i: (i, 0)),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        name=f"quantize_pack_rows-h_{h}-tt_{tile_tokens}",
+        interpret=pltpu.InterpretParams() if interpret else False,
+    )(x)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,10 +178,15 @@ class FusedMoeConfig:
     max_tiles: int
     act: str
     mxu_cols: int
+    issue_group: int
 
     @property
     def sublanes(self) -> int:
         return packed_sublanes(self.hidden_size)
+
+    @property
+    def x_sublanes(self) -> int:
+        return self.sublanes + 1
 
 
 def _fill_tiles(gs_ref, m_expert, m_start, m_count, m_visit, v_expert, *, cfg):
@@ -158,7 +223,7 @@ def _fill_tiles(gs_ref, m_expert, m_start, m_count, m_visit, v_expert, *, cfg):
 def _fused_moe_kernel(
     gs_ref,  # SMEM int32 [E] (scalar prefetch)
     tok_hbm,  # int32 [rows + tile_m + 128]: token id of each expert-sorted row
-    x_hbm,  # uint32 [tokens * S, 128] packed hidden rows
+    x_hbm,  # uint32 [tokens * (S + 1), 128] quantize_pack_rows rows
     w1_hbm,  # fp8 [E, H, 2I] gate | up
     w1s_hbm,  # f32 [E, 1, 2I]
     w2_hbm,  # fp8 [E, I, H]
@@ -170,7 +235,7 @@ def _fused_moe_kernel(
     m_visit,
     v_expert,
     tok_sm,  # SMEM int32 [2, tile_m + 128]
-    x_vm,  # VMEM uint32 [2, tile_m * S, 128]
+    x_vm,  # VMEM uint32 [2, tile_m * (S + 1), 128]
     w1_vm,
     w1s_vm,
     w2_vm,
@@ -184,6 +249,8 @@ def _fused_moe_kernel(
     cfg: FusedMoeConfig,
 ):
     s = cfg.sublanes
+    sx = cfg.x_sublanes
+    group = cfg.issue_group
     n_tiles, n_visits = _fill_tiles(
         gs_ref, m_expert, m_start, m_count, m_visit, v_expert, cfg=cfg
     )
@@ -197,24 +264,31 @@ def _fused_moe_kernel(
             sem_tok.at[slot],
         )
 
+    def issued_rows(i):
+        # Rows are issued in unrolled groups; the tail of the last group
+        # fetches the next tile's (or padding) tokens into rows nothing reads.
+        return pl.cdiv(m_count[i], group) * group
+
     def issue_rows(i, slot):
         offset = m_start[i] % LANES
 
-        def body(r, carry):
-            token = tok_sm[slot, offset + r]
-            pltpu.make_async_copy(
-                x_hbm.at[pl.ds(token * s, s)],
-                x_vm.at[slot, pl.ds(r * s, s)],
-                sem_x.at[slot],
-            ).start()
+        def body(g, carry):
+            for u in range(group):
+                r = g * group + u
+                token = tok_sm[slot, offset + r]
+                pltpu.make_async_copy(
+                    x_hbm.at[pl.ds(token * sx, sx)],
+                    x_vm.at[slot, pl.ds(r * sx, sx)],
+                    sem_x.at[slot],
+                ).start()
             return carry
 
-        lax.fori_loop(0, m_count[i], body, 0)
+        lax.fori_loop(0, issued_rows(i) // group, body, 0)
 
     def rows_copy(i, slot):
-        # Waits count bytes, so one descriptor the size of the tile's rows
-        # retires all of its row DMAs whatever order they landed in.
-        rows = pl.ds(0, m_count[i] * s)
+        # Waits count bytes, so one descriptor the size of the issued rows
+        # retires all of their DMAs whatever order they landed in.
+        rows = pl.ds(0, issued_rows(i) * sx)
         return pltpu.make_async_copy(
             x_vm.at[slot, rows], x_vm.at[slot, rows], sem_x.at[slot]
         )
@@ -249,10 +323,12 @@ def _fused_moe_kernel(
 
     def compute(slot, wslot, height):
         def lane_block(j):
-            return x_vm[slot, pl.ds(j, height, stride=s), :]
+            return x_vm[slot, pl.ds(j, height, stride=sx), :]
 
-        # gate_up: per 512-column block, quantize as gmm_v2 does, then BF16
-        # accumulation of the dequantized block products.
+        scale_words = lane_block(s)
+        # gate_up: per 512-column block, the FP8 cast of the stored
+        # bf16(x * scale_inv) as gmm_v2 does, then BF16 accumulation of the
+        # dequantized block products.
         n1 = 2 * cfg.inter_size
         acc = [
             jnp.zeros((height, cfg.mxu_cols), jnp.bfloat16)
@@ -263,8 +339,9 @@ def _fused_moe_kernel(
             cols = []
             for j in range(k0 // PACKED_COLUMNS, k1 // PACKED_COLUMNS):
                 cols.extend(_unpack_lane_block(lane_block(j)))
-            block = jnp.concatenate(cols, axis=1).astype(jnp.bfloat16)
-            block_q, block_scale = _quantize_rows(block)
+            block_q = jnp.concatenate(cols, axis=1).astype(jnp.bfloat16).astype(FP8)
+            b = k0 // QUANT_BLOCK
+            block_scale = pltpu.bitcast(scale_words[:, b : b + 1], jnp.float32)
             block_scale = block_scale.astype(jnp.bfloat16)
             for n, n0 in enumerate(range(0, n1, cfg.mxu_cols)):
                 prod = jnp.dot(
@@ -356,10 +433,17 @@ def _fused_moe_kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("act", "tile_m", "height_step", "vmem_limit_bytes", "interpret"),
+    static_argnames=(
+        "act",
+        "tile_m",
+        "height_step",
+        "issue_group",
+        "vmem_limit_bytes",
+        "interpret",
+    ),
 )
 def gather_fused_moe(
-    x_packed: jax.Array,  # uint32 [tokens * S, 128] (pack_rows)
+    x_packed: jax.Array,  # uint32 [tokens * (S + 1), 128] (quantize_pack_rows)
     token_indices_sorted: jax.Array,  # int32 [rows]
     group_sizes: jax.Array,  # int32 [E]
     w1: jax.Array,  # fp8 [E, H, 2I]: gate columns [0, I), up columns [I, 2I)
@@ -370,6 +454,7 @@ def gather_fused_moe(
     act: str,
     tile_m: int = 512,
     height_step: int = 128,
+    issue_group: int = 16,
     vmem_limit_bytes: int | None = None,
     interpret: bool = False,
 ) -> jax.Array:
@@ -391,8 +476,12 @@ def gather_fused_moe(
         raise ValueError(
             f"intermediate {inter} must be a multiple of {LANES} and <= {QUANT_BLOCK}"
         )
-    if tile_m % height_step:
-        raise ValueError(f"{tile_m=} is not a multiple of {height_step=}")
+    if tile_m % height_step or tile_m % issue_group:
+        raise ValueError(
+            f"{tile_m=} is not a multiple of {height_step=} and {issue_group=}"
+        )
+    if x_packed.shape[0] % (s + 1):
+        raise ValueError(f"x_packed {x_packed.shape} is not quantize_pack_rows output")
     w1_scale = w1_scale.reshape(num_experts, 1, n1).astype(jnp.float32)
     w2_scale = w2_scale.reshape(num_experts, 1, hidden).astype(jnp.float32)
     # The token-id windows read up to tile_m + 128 entries past a tile's start.
@@ -407,6 +496,7 @@ def gather_fused_moe(
         max_tiles=max_tiles,
         act=act,
         mxu_cols=256,
+        issue_group=issue_group,
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     smem_tiles = [pltpu.SMEM((max_tiles,), jnp.int32) for _ in range(4)]
@@ -422,7 +512,7 @@ def gather_fused_moe(
                 *smem_tiles,
                 pltpu.SMEM((num_experts,), jnp.int32),
                 pltpu.SMEM((2, tile_m + LANES), jnp.int32),
-                pltpu.VMEM((2, tile_m * s, LANES), jnp.uint32),
+                pltpu.VMEM((2, tile_m * (s + 1), LANES), jnp.uint32),
                 pltpu.VMEM((2, hidden, n1), w1.dtype),
                 pltpu.VMEM((2, 1, n1), jnp.float32),
                 pltpu.VMEM((2, inter, hidden), w2.dtype),

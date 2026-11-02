@@ -501,6 +501,11 @@ def prepare_routed_gmm_inputs(
     )
 
 
+def _tpu_has_fp8_matmul() -> bool:
+    """gmm_v2 quantizes activations to FP8 only where the MXU takes FP8."""
+    return pltpu.get_tpu_info().fp8_ops_per_second > 0
+
+
 def can_use_gather_gmm(
     hidden_states: jax.Array,
     w1: jax.Array,
@@ -518,7 +523,9 @@ def can_use_gather_gmm(
     """Shapes and formats `gather_gmm_moe` serves (trace-time predicate).
 
     Skipped padded tokens leave sorted rows the kernels never write, which the
-    combine would read, so that mode keeps the grouped-matmul path.
+    combine would read, so that mode keeps the grouped-matmul path. The
+    kernels always run FP8 x FP8 dots, so chips where gmm_v2 would keep BF16
+    activations keep the grouped-matmul path too.
     """
     num_tokens, hidden = hidden_states.shape
     num_experts, w1_k, n1 = w1.shape
@@ -545,6 +552,7 @@ def can_use_gather_gmm(
         and w1_scale.size == num_experts * n1
         and w2_scale is not None
         and w2_scale.size == num_experts * hidden
+        and _tpu_has_fp8_matmul()
     )
 
 
@@ -580,7 +588,7 @@ def gather_gmm_moe(
         )
     )
     down_rows = gather_gmm.gather_fused_moe(
-        gather_gmm.pack_rows(hidden_states),
+        gather_gmm.quantize_pack_rows(hidden_states),
         token_indices_sorted,
         group_sizes,
         w1,
