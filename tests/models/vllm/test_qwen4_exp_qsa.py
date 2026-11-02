@@ -562,7 +562,7 @@ def test_static_indexer_backend_cache_and_owner_contract(
             factory(topk_backend_key="orphan-key")
         assert (
             captured[0][0]
-            == "qwen4_exp::" + factory_name[6:-3] + "_combined_20261030_v1"
+            == "qwen4_exp::" + factory_name[6:-3] + "_rebased_20261102_v3"
         )
         assert len(captured) == 3
     finally:
@@ -691,3 +691,34 @@ def test_output_projection_tp2_partial_sum_matches_tp1(monkeypatch):
     # Binary-exact inputs isolate rank slicing/reduction from BF16 sum rounding.
     assert expected is not None
     torch.testing.assert_close(partials[0] + partials[1], expected, rtol=0, atol=0)
+
+
+def test_retained_norm_multiplier_survives_dtype_migration(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
+    )
+    model = Qwen4ExpQSA(
+        config=attention_config(hidden_size=16),
+        tp_rank=0,
+        tp_size=1,
+        max_model_len=128,
+        device="cpu",
+    )
+    # A value whose 1+w result cannot be represented exactly in BF16.
+    model.k_norm.weight.data.fill_(2**-10)
+    model.k_norm_multiplier = 1 + model.k_norm.weight.detach().float()
+    model.to(dtype=torch.bfloat16)
+    assert model.k_norm_multiplier.dtype == torch.float32
+    torch.testing.assert_close(
+        model.k_norm_multiplier,
+        1 + model.k_norm.weight.detach().float(),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.all(
+        model.k_norm_multiplier != model.k_norm_multiplier.bfloat16().float()
+    )
+    assert "k_norm_multiplier" not in model.state_dict()

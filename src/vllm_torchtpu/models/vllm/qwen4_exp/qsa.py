@@ -63,6 +63,7 @@ class QSAMetadata:
 
     query_start_loc: torch.Tensor
     context_lens: torch.Tensor
+    decode_cu: torch.Tensor | None = None
 
 
 def make_rope_cache(max_positions: int, *, rotary_dim: int, theta: float):
@@ -311,6 +312,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             set_default_quant_scales(self, register_buffer=True)
         self.cache_owners: tuple[torch.Tensor, ...] = ()
         self.register_buffer("output_weight_tiles", None, persistent=False)
+        self.register_buffer("k_norm_multiplier", None, persistent=False)
         self._loaded: set[str] = set()
         self._op = partial(
             build_compact_pooled_qsa_op(
@@ -419,12 +421,20 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self._loaded.update(loaded)
         return loaded
 
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        if self.k_norm_multiplier is not None:
+            # Rebuild after dtype/device conversion; never retain a rounded BF16 scale.
+            self.k_norm_multiplier = 1.0 + self.k_norm.weight.detach().float()
+        return result
+
     def finalize_weights(self):
         expected = set(dict(self.named_parameters())) - {"input_proj.weight"}
         expected.update(_INPUT_PROJECTION_NAMES)
         missing = expected - self._loaded
         if missing:
             raise ValueError(f"Missing QSA checkpoint tensors: {sorted(missing)}")
+        self.k_norm_multiplier = 1.0 + self.k_norm.weight.detach().float()
         # Shard checkpoint columns before preparing the existing K-major BF16
         # linear path. Its idempotent hook also handles the loader's later pass.
         self.o_proj.quant_method = VllmUnquantizedLinearMethod()
@@ -526,6 +536,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             cast(torch.Tensor, per_layer[self.prefix].block_tables),
             cast(torch.Tensor, per_layer[self.prefix].block_tables),
             cast(torch.Tensor, per_layer[self.prefix].request_distribution),
+            k_norm_multiplier=self.k_norm_multiplier,
+            decode_cu=metadata.decode_cu,
             **projection_args,
             k_scale=cast(float, self._k_scale_float) if self.fp8_kv else 1.0,
             v_scale=cast(float, self._v_scale_float) if self.fp8_kv else 1.0,

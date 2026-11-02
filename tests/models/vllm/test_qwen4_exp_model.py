@@ -94,6 +94,10 @@ def test_rope_sharing_is_model_local_and_excludes_kv_state(monkeypatch, layer_ty
             )
             for length in (128, 256)
         ]
+    assert first.decode_cu.dtype == torch.int32
+    torch.testing.assert_close(first.decode_cu, torch.arange(17, dtype=torch.int32))
+    assert first.decode_cu is not second.decode_cu
+    assert "decode_cu" not in first.state_dict()
     attentions = [
         layer.self_attn
         for layer in first.layers

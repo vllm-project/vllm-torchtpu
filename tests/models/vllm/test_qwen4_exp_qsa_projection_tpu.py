@@ -100,6 +100,14 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
             base_owners = [x.to("tpu") for x in initial]
             fused_owners = [x.to("tpu") for x in initial]
             layer.to("tpu")
+            assert layer.k_norm_multiplier.dtype == torch.float32
+            torch.testing.assert_close(
+                layer.k_norm_multiplier.cpu(),
+                1 + layer.k_norm.weight.detach().cpu().float(),
+                rtol=0,
+                atol=0,
+            )
+            shared_cu = torch.arange(17, dtype=torch.int32).to("tpu")
 
             from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
                 build_gated_residual_op,
@@ -175,13 +183,14 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
                 lengths[:live] = context
                 slots = torch.arange(32, dtype=torch.int32)
                 slots[live:] = -1
-                pages = torch.zeros((32, 2), dtype=torch.int32)
+                pages = torch.zeros((32, 41), dtype=torch.int32)
                 pages[:live, 0] = torch.arange(1, live + 1)
                 metadata = QSAMetadata(
                     *(
                         x.to("tpu")
                         for x in (starts, lengths, slots, pages, pages.clone())
-                    )
+                    ),
+                    decode_cu=shared_cu,
                 )
                 positions = torch.full((tokens,), context, dtype=torch.int64)
                 if live:

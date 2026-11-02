@@ -155,6 +155,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         context_lens,
         valid_tokens,
         ple_raw_embeddings=None,
+        decode_cu=None,
     ):
         if self.ple is not None:
             per_layer = cast(
@@ -202,6 +203,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 QSAMetadata(
                     query_start_loc,
                     context_lens,
+                    decode_cu,
                 ),
                 **projection_args,
             )
@@ -228,6 +230,10 @@ class Qwen4ExpBackbone(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.prefix = "model"
+        # Immutable prefix for the measured 16-token decode bucket.
+        self.register_buffer(
+            "decode_cu", torch.arange(17, dtype=torch.int32), persistent=False
+        )
         t = cfg.model_config.hf_text_config
         self.hc_count = t.hc_count
         self.embed_tokens = VocabParallelEmbedding(t.vocab_size, t.hidden_size)
@@ -294,6 +300,7 @@ class Qwen4ExpBackbone(nn.Module):
                 context_lens,
                 valid_tokens,
                 ple_raw_embeddings,
+                decode_cu=self.decode_cu,
             )
         return self.hyper_connection_mixer.mix(hidden)[0]
 

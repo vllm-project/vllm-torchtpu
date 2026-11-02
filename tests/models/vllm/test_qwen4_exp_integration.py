@@ -103,6 +103,9 @@ class _FakeSublayer(nn.Module):
         self.calls.append(args)
         return torch.tanh(self.proj(hidden))
 
+    def can_prefetch_output(self, hidden):
+        return False
+
 
 def _hc(*, use_combine=True):
     return qwen4_model.GatedResidual(
@@ -123,6 +126,9 @@ def backbone():
     with torch.device("cpu"):
         result = qwen4_model.Qwen4ExpBackbone.__new__(qwen4_model.Qwen4ExpBackbone)
         nn.Module.__init__(result)
+        result.register_buffer(
+            "decode_cu", torch.arange(17, dtype=torch.int32), persistent=False
+        )
         result.hc_count = HC
         result.host_ple_index = None
         result.embed_tokens = nn.Embedding(VOCAB, HIDDEN)
@@ -214,6 +220,7 @@ def test_layer_types_route_positions_and_native_qsa_metadata(backbone):
     actual_positions, actual_metadata = qsa.self_attn.calls[0]
     assert actual_positions is positions
     assert actual_metadata.query_start_loc is metadata["query_start_loc"]
+    assert actual_metadata.decode_cu is backbone.decode_cu
     assert not hasattr(backbone.hyper_connection_mixer, "block_inject_weight")
 
 

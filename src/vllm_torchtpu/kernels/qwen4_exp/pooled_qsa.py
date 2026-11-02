@@ -16,6 +16,7 @@
 import functools
 import math
 from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -636,6 +637,8 @@ def compact_pooled_qsa_step(
     original_output_weight: jax.Array | None = None,
     hc_token_tile: int = 0,
     hc_min_tokens: int = 1024,
+    k_norm_multiplier: jax.Array | None = None,
+    decode_cu: jax.Array | None = None,
     *,
     topk_backend: TopKBackend | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -657,9 +660,53 @@ def compact_pooled_qsa_step(
     # Native BlockTable pads this one-block ring row to token alignment.
     # Only column zero owns storage; the remaining entries are padding.
     ring_ids = ring_ids.reshape(len(context), -1)[:, 0]
-    q, k, v, gate, iq, raw = produce(
-        qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim
+    from .retained_preparation import produce_prepared, use_retained_preparation
+
+    prepared = use_retained_preparation(
+        qgate,
+        key,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        k_norm_multiplier,
+        trig,
+        context,
+        main_table,
+        main_pool,
+        ratio=compress_ratio,
+        topk=token_topk,
+        rotary_dim=rotary_dim,
     )
+    if prepared:
+        assert k_norm_multiplier is not None
+        q, k, v, gate, iq, raw = produce_prepared(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            k_norm_multiplier,
+            niq,
+            positions,
+            trig,
+            norm_eps,
+            rotary_dim,
+        )
+    else:
+        q, k, v, gate, iq, raw = produce(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            positions,
+            trig,
+            norm_eps,
+            rotary_dim,
+        )
     # Native allocation supplies an owner for every nonempty query row;
     # padded/idle rows have empty query ranges. Keep lengths independent of
     # layer-specific page IDs so XLA can share RPA schedules across layers.
@@ -780,7 +827,7 @@ def compact_pooled_qsa_step(
     )
     attention: Callable[..., tuple[jax.Array, jax.Array]] = qsa_attention
     projection_args: tuple[jax.Array, ...] = ()
-    projection_options = {}
+    projection_options: dict[str, Any] = {}
     if output_weight is not None:
         from vllm_torchtpu.kernels.sparse_gqa_decode.projection import (
             projected_attention,
@@ -794,6 +841,8 @@ def compact_pooled_qsa_step(
             "hc_token_tile": hc_token_tile,
             "hc_min_tokens": hc_min_tokens,
         }
+    if prepared:
+        projection_options.update(query_prepared=True, prepared_cu=decode_cu)
     output, _ = attention(
         q,
         gate,

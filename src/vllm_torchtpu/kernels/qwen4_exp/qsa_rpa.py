@@ -173,12 +173,16 @@ def rpa_attention(
     v_scale=1.0,
     active_tokens: jax.Array | None = None,
     initial_output: jax.Array | None = None,
+    query_prepared=False,
+    prepared_cu=None,
 ):
     from vllm_torchtpu.kernels.sparse_gqa_decode import plan_decode
     from vllm_torchtpu.kernels.sparse_gqa_decode.decode import execute_decode
 
+    from .retained_preparation import planning_query
+
     launch = plan_decode(
-        query,
+        planning_query(query, query_prepared),
         gate,
         blocks,
         lengths,
@@ -200,11 +204,13 @@ def rpa_attention(
             launch=launch,
             active_tokens=active_tokens,
             initial_output=initial_output,
+            query_prepared=query_prepared,
+            prepared_cu=prepared_cu,
             k_scale=k_scale,
             v_scale=v_scale,
         )
     return _rpa_attention_in_chunks(
-        query,
+        planning_query(query, query_prepared),
         gate,
         blocks,
         lengths,
@@ -321,8 +327,12 @@ def qsa_attention(
     ratio,
     k_scale=1.0,
     v_scale=1.0,
+    query_prepared=False,
+    prepared_cu=None,
 ):
     """Use Runner order: decode/verify prefix, then prefill in original rows."""
+    from .retained_preparation import planning_query
+
     tokens = len(query)
     if tokens == 0:
         return jnp.zeros_like(query), cache
@@ -334,7 +344,7 @@ def qsa_attention(
     # Schedule both request segments. The leaves bound attention work using
     # their live metadata; neither segment owns or updates the written cache.
     prefill, _ = _prefill_attention(
-        query,
+        planning_query(query, query_prepared),
         gate,
         blocks,
         jnp.where(suffix, lengths, 0),
@@ -352,6 +362,8 @@ def qsa_attention(
         cache,
         active_tokens=prefix_tokens,
         initial_output=prefill,
+        query_prepared=query_prepared,
+        prepared_cu=prepared_cu,
         **options,
     )
     return output, cache

@@ -49,10 +49,14 @@ def projected_attention(
     original_weight: jax.Array | None = None,
     hc_token_tile: int = 0,
     hc_min_tokens: int = 1024,
+    query_prepared: bool = False,
+    prepared_cu: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Return projected HC output and donated cache, retaining a generic fallback."""
+    from vllm_torchtpu.kernels.qwen4_exp.retained_preparation import planning_query
+
     launch = plan_decode(
-        query,
+        planning_query(query, query_prepared),
         gate,
         blocks,
         lengths,
@@ -79,7 +83,7 @@ def projected_attention(
         and pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
     )
     def fallback():
-        attended, cache = qsa_attention(
+        attended, _ = qsa_attention(
             query,
             gate,
             blocks,
@@ -88,6 +92,8 @@ def projected_attention(
             cache,
             starts,
             request_distribution=request_distribution,
+            query_prepared=query_prepared,
+            prepared_cu=prepared_cu,
             kv_heads=kv_heads,
             ratio=ratio,
             k_scale=k_scale,
@@ -133,12 +139,26 @@ def projected_attention(
             # pyrefly: ignore[bad-argument-type]
             serve=dataclasses.replace(cfgs.serve, scale_k=k_scale, scale_v=v_scale),
         )
-        pages, kv_lens = virtual_page_metadata(
+        from vllm_torchtpu.kernels.qwen4_exp.preparation_candidates import (
+            virtual_pages_unpadded,
+        )
+        from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import prepare_query
+
+        page_prepare = virtual_pages_unpadded if query_prepared else virtual_page_metadata
+        pages, kv_lens = page_prepare(
             blocks, lengths, table, ratio=ratio, page_size=cache.shape[1]
         )
-        q = jnp.where((lengths > 0)[:, None, None], query, 0).astype(jnp.float32)
-        q = q.reshape(batch, kv_heads, heads // kv_heads, 1, dim).swapaxes(0, 1)
-        starts = jnp.arange(batch + 1, dtype=jnp.int32)
+        if query_prepared:
+            q = prepare_query(query, lengths, kv_heads)
+            q = jnp.where((lengths > 0)[None, :, None, None, None], q, 0)
+        else:
+            q = jnp.where((lengths > 0)[:, None, None], query, 0).astype(jnp.float32)
+            q = q.reshape(batch, kv_heads, heads // kv_heads, 1, dim).swapaxes(0, 1)
+        if prepared_cu is not None:
+            assert prepared_cu.shape == (batch + 1,) and prepared_cu.dtype == jnp.int32
+        starts = (
+            jnp.arange(batch + 1, dtype=jnp.int32) if prepared_cu is None else prepared_cu
+        )
         q_lens = (kv_lens > 0).astype(jnp.int32)
         metadata = schedule.generate(starts, kv_lens, pages, cfgs)
         _, _, output = decode_projected_kernel(

@@ -29,11 +29,29 @@ from vllm_torchtpu.kernels.sparse_gqa_decode.planning import DecodeLaunch
 from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import prepare_query
 
 
-def _attend(q, gate, blocks, lengths, table, cache, *, launch, k_scale, v_scale):
+def _attend(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    launch,
+    k_scale,
+    v_scale,
+    query_prepared=False,
+    prepared_cu=None,
+):
     batch, heads, dim = q.shape
     cfgs = launch.config_for_batch(batch)
     kv_heads, ratio = cfgs.model.num_kv_heads, cfgs.serve.page_size
-    pages, kv_lens = virtual_page_metadata(
+    from vllm_torchtpu.kernels.qwen4_exp.preparation_candidates import (
+        virtual_pages_unpadded,
+    )
+
+    page_prepare = virtual_pages_unpadded if query_prepared else virtual_page_metadata
+    pages, kv_lens = page_prepare(
         blocks, lengths, table, ratio=ratio, page_size=cache.shape[1]
     )
     cfgs = dataclasses.replace(
@@ -45,7 +63,11 @@ def _attend(q, gate, blocks, lengths, table, cache, *, launch, k_scale, v_scale)
     # RPA's buffer binding accepts a new-KV operand even when cache updates and
     # new-KV DMAs are disabled. No dummy K/V preparation or concatenation needed.
     unused_new_kv = jnp.zeros((batch, *cache.shape[2:]), cache.dtype)
-    cu_q_lens = jnp.arange(batch + 1, dtype=jnp.int32)
+    if prepared_cu is not None:
+        assert prepared_cu.shape == (batch + 1,) and prepared_cu.dtype == jnp.int32
+    cu_q_lens = (
+        jnp.arange(batch + 1, dtype=jnp.int32) if prepared_cu is None else prepared_cu
+    )
     q_lens = (kv_lens > 0).astype(jnp.int32)
     metadata = schedule.generate(cu_q_lens, kv_lens, pages, cfgs)
     out, next_cache = decode_kernel(
@@ -78,8 +100,19 @@ def execute_decode(
     initial_output: jax.Array | None = None,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    query_prepared: bool = False,
+    prepared_cu: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    attend = functools.partial(_attend, launch=launch, k_scale=k_scale, v_scale=v_scale)
+    if query_prepared:
+        assert len(q) == 16 and launch.chunk_queries >= len(q)
+    attend = functools.partial(
+        _attend,
+        launch=launch,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        query_prepared=query_prepared,
+        prepared_cu=prepared_cu,
+    )
     return attend_in_chunks(
         attend,
         q,

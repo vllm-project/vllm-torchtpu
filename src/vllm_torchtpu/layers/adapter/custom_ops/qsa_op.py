@@ -31,14 +31,14 @@ def _op_name(kind: str, backend: TopKBackend | None, backend_key: str | None) ->
     if backend is None:
         if backend_key is not None:
             raise ValueError("A backend key requires an explicit topk_backend")
-        return f"qwen4_exp::{kind}_combined_20261030_v1"
+        return f"qwen4_exp::{kind}_rebased_20261102_v3"
     if not isinstance(backend_key, str) or not backend_key:
         raise ValueError("Explicit topk_backend requires a stable topk_backend_key")
     previous = _backend_keys.setdefault(backend_key, backend)
     if previous != backend:
         raise ValueError("topk_backend_key already identifies a different backend")
     suffix = hashlib.sha256(backend_key.encode("utf-8")).hexdigest()
-    return f"qwen4_exp::{kind}_{suffix}_combined_20261030_v1"
+    return f"qwen4_exp::{kind}_{suffix}_rebased_20261102_v3"
 
 
 def build_compact_pooled_qsa_op(
@@ -107,6 +107,8 @@ def _build_compact_pooled_qsa_op(
         original_output_weight=None,
         hc_token_tile=0,
         hc_min_tokens=1024,
+        k_norm_multiplier=None,
+        decode_cu=None,
     ):
         return (
             torch.empty_like(pool),
@@ -151,6 +153,8 @@ def _build_compact_pooled_qsa_op(
         original_output_weight: torch.Tensor | None = None,
         hc_token_tile: int = 0,
         hc_min_tokens: int = 1024,
+        k_norm_multiplier: torch.Tensor | None = None,
+        decode_cu: torch.Tensor | None = None,
     ):
         # The native QSA kernels consume positions and request/page metadata as int32.
         positions = positions.to(torch.int32)
@@ -192,6 +196,8 @@ def _build_compact_pooled_qsa_op(
             original_output_weight,
             hc_token_tile,
             hc_min_tokens,
+            k_norm_multiplier,
+            decode_cu,
         )
         pool.copy_(updated)
         index_pool.copy_(index_updated)
