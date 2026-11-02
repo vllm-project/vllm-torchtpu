@@ -131,8 +131,9 @@ class PrefillFirstScheduler(AsyncScheduler):
             )
         threshold = self.scheduler_config.long_prefill_token_threshold
         if 0 < threshold < self.max_solo_tokens:
-            # It caps a step's chunk of a prompt whenever another request
-            # waits, which would split a solo prompt.
+            # It caps a step's chunk of a prompt whenever more than one
+            # request is running or waiting (a blocked KV-holding request
+            # counts), which would split a solo prompt.
             raise ValueError(
                 f"long_prefill_token_threshold ({threshold}) would split solo "
                 f"prompts of up to {self.max_solo_tokens} tokens; set it to 0 "

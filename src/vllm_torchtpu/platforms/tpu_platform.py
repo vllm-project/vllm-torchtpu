@@ -1436,7 +1436,12 @@ def _configure_prefill_first_scheduler(vllm_config: VllmConfig) -> None:
     scheduler_config = vllm_config.scheduler_config
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         installed_by = ""
-        if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
+        if (
+            scheduler_config.scheduler_cls
+            == "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
+            and envs.DP_SCHED_ENABLED
+            and vllm_config.parallel_config.data_parallel_size > 1
+        ):
             installed_by = " (DP_SCHED_ENABLED=1 installs it for DP > 1; unset it)"
         raise ValueError(
             "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS and VLLM_TPU_DECODE_INTERVAL_MS "
