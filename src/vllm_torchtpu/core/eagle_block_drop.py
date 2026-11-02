@@ -21,11 +21,14 @@ scheduler also backs off every Mamba "align" split by one block to stay
 consistent with that drop (``Scheduler._mamba_block_aligned_split``).
 
 The drop only protects draft-model KV, so it only affects the acceptance
-rate. The target model's KV and Mamba state are exact either way. vLLM main
-makes it optional (``SpeculativeConfig.disable_eagle_block_drop``;
-``Scheduler.use_eagle_block_drop`` is passed to ``KVCacheManager`` and gates
-the Mamba back-off). This module installs the same behavior on the pinned
-release, in the engine-core process:
+rate. The target model's KV and Mamba state are exact either way. vLLM keeps
+the block natively in two cases: ``SpeculativeConfig.disable_eagle_block_drop``,
+and, with prefix caching on and no KV connector, lookahead block hashes
+(``VllmConfig.num_hash_lookahead_tokens``), under which the scheduler sets
+``use_eagle_block_drop = False`` itself. With prefix caching on and no KV
+connector this module is therefore a no-op; otherwise it matches
+``disable_eagle_block_drop`` except that the speculative config is left
+unchanged. In the engine-core process:
 
 - The ``KVCacheManager`` is built with ``use_eagle=False``, and any
   annotated eagle groups are cleared afterwards. No group drops a block,
@@ -54,9 +57,9 @@ logger = init_logger(__name__)
 def clear_eagle_block_drop(kv_cache_manager) -> None:
     """Clear every EAGLE drop flag in a built KV cache manager.
 
-    ``use_eagle=False`` only turns off the coordinator's "flag every group"
-    fallback. Groups that ``_annotate_eagle_groups`` marked (DSpark,
-    DeepseekV4) would still drop a block, so this clears them too.
+    ``use_eagle=False`` already keeps the coordinator from dropping a block in
+    any group; this also clears the groups marked from ``KVCacheSpec.is_draft``
+    (DSpark, DeepseekV4) and every per-group flag.
     """
     kv_cache_manager.use_eagle = False
     coordinator = kv_cache_manager.coordinator

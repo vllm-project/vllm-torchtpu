@@ -1787,33 +1787,6 @@ def _patch_dflash_bypass_v2_runner_check() -> None:
     logger.info("Applied TPU patch: bypass DFlash V2 runner check on TPU.")
 
 
-def _patch_vllm_config_triton_tpu() -> None:
-    """Bypass V2 model runner Triton check on TPU.
-
-    The config forces use_v2_model_runner=True for hybrid DFlash drafters.
-    When it validates V2, it crashes on TPU because HAS_TRITON is False.
-    TPU uses TPUModelRunner instead, so we can safely bypass this.
-    """
-    from vllm.config.vllm import VllmConfig
-
-    if getattr(VllmConfig, "_tpu_triton_patch_applied", False):
-        return
-
-    original_validate = VllmConfig._validate_v2_model_runner
-
-    def patched_validate(self):
-        if (
-            getattr(self, "device_config", None)
-            and self.device_config.device_type == "tpu"
-        ):
-            return
-        return original_validate(self)
-
-    VllmConfig._validate_v2_model_runner = patched_validate
-    VllmConfig._tpu_triton_patch_applied = True
-    logger.info("Applied TPU patch: bypass V2 model runner Triton check.")
-
-
 def _patch_vllm_force_v1_runner_tpu() -> None:
     """Keep TPU's V1 scheduler contract and validate its own capabilities.
 
@@ -1911,42 +1884,6 @@ if "proxy" in envs.JAX_PLATFORMS:
         logger.error(
             "Error occurred while importing pathwaysutils or logging TPU info: %s", e
         )
-
-
-def _patch_vllm_block_pool_lifo_free() -> None:
-    """Restore pre-#48017 LIFO block reuse when prefix caching is off.
-
-    vllm a82f1b38 switched hashless freed blocks from prepend (LIFO reuse
-    of a small hot set of block ids) to append (FIFO) when prefix caching
-    is disabled. On TPU v7x the FIFO order cycles the entire KV block-id
-    space under sustained load and an indexed SparseCore-offloaded op on
-    the paged-KV path traps with E0200 RuntimeUnexpectedCoreHalt (UserFatal
-    on SC2). Bisect evidence: docs/sc2-sparsecore-halt-2026-08.md on branch
-    mhhua/sc2-sparsecore-halt-evidence, vllm-torchtpu-dev builds 136-146.
-    Behavior with prefix caching enabled is unchanged. Remove once the
-    SparseCore index handling is fixed in the TPU runtime.
-    """
-    from vllm.v1.core.block_pool import BlockPool
-
-    if BlockPool.__dict__.get("_tpu_lifo_free_patch", False):
-        return
-
-    def free_blocks(self, ordered_blocks) -> None:
-        blocks_with_hash = []
-        blocks_without_hash = []
-        for block in ordered_blocks:
-            block.ref_cnt -= 1
-            if block.ref_cnt == 0 and not block.is_null:
-                if block.block_hash is None:
-                    blocks_without_hash.append(block)
-                else:
-                    blocks_with_hash.append(block)
-        self.free_block_queue.prepend_n(blocks_without_hash)
-        self.free_block_queue.append_n(blocks_with_hash)
-
-    BlockPool.free_blocks = free_blocks
-    BlockPool._tpu_lifo_free_patch = True
-    logger.info("Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
 
 
 def _patch_vllm_abort_on_preemption() -> None:

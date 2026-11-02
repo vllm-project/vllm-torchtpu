@@ -259,8 +259,9 @@ class TPULoRAModelManager(LRUCacheLoRAModelManager):
             if activated:
                 self._slot_writer.write_slot(self.lora_index_to_id.index(lora_id))
         except BaseException:
-            # vLLM gives the adapter its slot before the weights land; without
-            # this, a failed write would leave the slot serving stale weights.
+            # super() has claimed the slot before write_slot lands the weights
+            # on the device; without this, a failed write would leave the slot
+            # serving stale weights.
             self.deactivate_adapter(lora_id)
             raise
         return activated

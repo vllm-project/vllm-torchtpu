@@ -207,7 +207,6 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ),
     ("vllm.model_executor.layers.fused_moe.router.grouped_topk_router", "grouped_topk"),
     ("vllm.v1.sample.ops.logprobs", "batched_count_greater_than"),
-    ("vllm.v1.sample.ops.topk_topp_sampler", "compiled_random_sample"),
     ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"),
 ]
 
@@ -1001,6 +1000,14 @@ class TpuPlatform(Platform):
         cache_config = vllm_config.cache_config
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and (
+            speculative_config.rejection_sample_method not in ("standard", "synthetic")
+        ):
+            raise NotImplementedError(
+                "TPU supports rejection_sample_method 'standard' and 'synthetic' "
+                f"(got {speculative_config.rejection_sample_method!r})."
+            )
         if (
             vllm_config.speculative_config is not None
             and scheduler_config.async_scheduling

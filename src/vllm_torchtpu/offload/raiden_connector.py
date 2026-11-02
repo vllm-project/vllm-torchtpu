@@ -209,6 +209,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(spec, vllm_config, kv_cache_config)
+        if self.config.sync_load_budget_bytes:
+            raise ValueError(
+                "TPURaidenOffloadingConnector does not support "
+                "sync_load_budget_bytes: its loads always complete asynchronously."
+            )
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
@@ -328,9 +333,8 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
         """No layout preference, unlike the `OffloadingConnector` this extends.
 
-        Upstream hardcodes "HND" for NIXL on CUDA. On TPU "HND" names
-        SEQ_ALONG_LANE, so inheriting it would select a layout nobody asked
-        for; these pages are opaque bytes to this connector.
+        Upstream asks for "LBHNC" ("BLHNC" with HiSparse), a layout the TPU
+        KV cache does not use; these pages are opaque bytes to this connector.
         """
         return None
 

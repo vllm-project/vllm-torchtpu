@@ -417,6 +417,18 @@ class TestTpuPlatform:
             vllm_config.kv_transfer_config = MagicMock()
             assert unified_kv_layout_enabled(vllm_config)
 
+    @pytest.mark.parametrize("method", ["block", "fly"])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_unsupported_rejection_sampling(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, method
+    ):
+        vllm_config.speculative_config = MagicMock(rejection_sample_method=method)
+        with pytest.raises(NotImplementedError, match="rejection_sample_method"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling", "message"),
         [
