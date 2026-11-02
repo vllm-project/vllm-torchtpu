@@ -79,15 +79,21 @@ def stack_fn3(fn: jax.Array) -> jax.Array:
     chunks. Built elementwise over three row-stacked copies of fn rather
     than as a concatenation of the chunks, which XLA leaves as a second
     fusion.
+
+    The masks pass through an optimization barrier with fn so that each
+    layer's stack has operands of its own: with one shared mask, XLA merges
+    every layer's stack into a single multi-output fusion at the start of
+    the step, which pushes the gates' small copies out of VMEM.
     """
     n = fn.shape[0]
+    row = jax.lax.broadcasted_iota(jnp.int32, (3 * n, 1), 0)
+    fn, is_hi, is_mid = jax.lax.optimization_barrier((fn, row < n, row < 2 * n))
     x = jnp.tile(fn, (3, 1))
-    row = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
     hi = jax.lax.reduce_precision(x, 8, 7)
     rem = x - hi
     mid = jax.lax.reduce_precision(rem, 8, 7)
     lo = jax.lax.reduce_precision(rem - mid, 8, 7)
-    return jnp.where(row < n, hi, jnp.where(row < 2 * n, mid, lo)).astype(jnp.bfloat16)
+    return jnp.where(is_hi, hi, jnp.where(is_mid, mid, lo)).astype(jnp.bfloat16)
 
 
 def dot_fn_chunks(x: jax.Array, fn_chunks: jax.Array, n: int) -> jax.Array:
