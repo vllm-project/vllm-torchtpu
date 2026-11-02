@@ -927,6 +927,10 @@ class TpuCompilerAdaptor(CompilerInterface):
         """
         assert isinstance(handle, tuple) and len(handle) == 3
         key, path, _saved_was_wrapped = handle
+        # The recorded path is absolute and goes stale when the cache root is
+        # moved or mounted elsewhere; `compile` always saves to cache_dir/key.
+        if self.cache_dir is not None:
+            path = os.path.join(self.cache_dir, key)
         size = _single_size(compile_range)
         # Screened on the load path too, and for a second reason beyond
         # "unsupported bucket": vLLM's key is (subgraph, bucket) with no graph
