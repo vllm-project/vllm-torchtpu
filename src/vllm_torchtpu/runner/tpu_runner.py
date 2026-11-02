@@ -2507,12 +2507,12 @@ class TPUModelRunner(GPUModelRunner):
                     constant_values=-1,
                 )
 
-                cur_input_indices = torch.from_numpy(
-                    padded_token_in_tpu_cur_input_indices
-                ).to(self.device, non_blocking=True)
-                pre_next_tokens_indices = torch.from_numpy(
-                    padded_token_in_tpu_pre_next_tokens_indices
-                ).to(self.device, non_blocking=True)
+                cur_input_indices = stage_h2d_upload(
+                    self, torch.from_numpy(padded_token_in_tpu_cur_input_indices)
+                )
+                pre_next_tokens_indices = stage_h2d_upload(
+                    self, torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
+                )
                 self._cached_subst_key = subst_key
                 self._cached_cur_input_indices = cur_input_indices
                 self._cached_pre_next_tokens_indices = pre_next_tokens_indices
@@ -2532,12 +2532,12 @@ class TPUModelRunner(GPUModelRunner):
                 constant_values=-1,
             )
 
-            cur_input_indices = torch.from_numpy(
-                padded_token_in_tpu_cur_input_indices
-            ).to(self.device, non_blocking=True)
-            pre_next_tokens_indices = torch.from_numpy(
-                padded_token_in_tpu_pre_next_tokens_indices
-            ).to(self.device, non_blocking=True)
+            cur_input_indices = stage_h2d_upload(
+                self, torch.from_numpy(padded_token_in_tpu_cur_input_indices)
+            )
+            pre_next_tokens_indices = stage_h2d_upload(
+                self, torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
+            )
 
         return _substitute_placeholder_token(
             input_ids,
@@ -3228,8 +3228,8 @@ class TPUModelRunner(GPUModelRunner):
             request_major_input_ids_cpu_padded.narrow(
                 0, 0, layout_plan.global_num_tokens
             ).copy_(request_major_input_ids_cpu)
-            request_major_input_ids = request_major_input_ids_cpu_padded.to(
-                self.device, non_blocking=True
+            request_major_input_ids = stage_h2d_upload(
+                self, request_major_input_ids_cpu_padded
             )
         local_total_num_scheduled_tokens = layout_plan.local_num_tokens
         local_padded_total_num_scheduled_tokens = layout_plan.local_padded_num_tokens
@@ -3380,15 +3380,15 @@ class TPUModelRunner(GPUModelRunner):
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
             elif layout_plan.logits_indices_cpu is not None:
-                logits_indices = layout_plan.logits_indices_cpu.to(
-                    self.device, non_blocking=True
+                logits_indices = stage_h2d_upload(
+                    self, layout_plan.logits_indices_cpu.contiguous()
                 )
             else:
                 # Indices at which we sample (positions of last token in the
                 # sequence). Padded to avoid recompiling when `num_reqs` varies.
-                logits_indices = (
-                    self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
-                ).to(self.device, non_blocking=True)
+                logits_indices = stage_h2d_upload(
+                    self, self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
+                )
 
             # For the V3 kernel, request_distribution is
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
@@ -8292,9 +8292,9 @@ class TPUModelRunner(GPUModelRunner):
                 self._upload_unless_unchanged("sampling_top_p", top_p_cpu.unsqueeze(1)),
             )
         return (
-            temps_cpu.unsqueeze(1).to(device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(device, non_blocking=True),
+            stage_h2d_upload(self, temps_cpu.unsqueeze(1)),
+            stage_h2d_upload(self, top_k_cpu.unsqueeze(1)),
+            stage_h2d_upload(self, top_p_cpu.unsqueeze(1)),
         )
 
     def _topk_candidate_blocks(self) -> int:
