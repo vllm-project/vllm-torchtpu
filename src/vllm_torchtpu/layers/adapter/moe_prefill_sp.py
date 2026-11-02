@@ -467,6 +467,7 @@ def _backbone(model: torch.nn.Module) -> Any:
             "TPU_MOE_PREFILL_SEQUENCE_PARALLEL serves DeepseekV2Model backbones; "
             f"got {type(inner).__name__}"
         )
+    assert inner is not None
     if deepseek_v2.DeepseekV2Model.forward is not patched_model_forward:
         raise RuntimeError("install_forwards did not run before the model was built")
     if getattr(inner.config, "llama_4_scaling", None) is not None:
@@ -511,7 +512,10 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     shared_parts = []
     for layer in layers[first:]:
         mla = getattr(layer.self_attn, "mla_attn", None)
-        if "prefill_group" not in inspect.signature(type(mla).forward).parameters:
+        if (
+            mla is None
+            or "prefill_group" not in inspect.signature(type(mla).forward).parameters
+        ):
             raise NotImplementedError(
                 f"the split needs the TPU MLA op's o_proj hook; got {type(mla)}"
             )

@@ -321,7 +321,18 @@ def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
     return acc
 
 
-def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
+def expert_ffn_fp8(
+    act_q,
+    act_scale,
+    w1,
+    w2,
+    w1s,
+    act_fn="silu",
+    w1b=None,
+    wait_w1=None,
+    retire_w1=None,
+    wait_w2=None,
+):
     """One expert's FFN on eight-bit weights: the gate/up matmul, the
     activation, the intermediate requantization and the down matmul.
 
@@ -329,12 +340,20 @@ def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
     activation rows. Returns the down matmul's accumulator and the
     intermediate row scale the caller still has to apply to it.
     """
-    inter = w1.shape[-1] // 2
-    acc1 = lax.dot_general(act_q, w1, DN, preferred_element_type=jnp.float32)
+    if wait_w1 is not None:
+        wait_w1()
+    w1_arr = w1() if callable(w1) else w1
+    inter = w1_arr.shape[-1] // 2
+    acc1 = lax.dot_general(act_q, w1_arr, DN, preferred_element_type=jnp.float32)
+    if retire_w1 is not None:
+        retire_w1()
     mid_q, mid_scale = _intermediate_rows(
         acc1, act_scale, inter, w1s=w1s, act_fn=act_fn, w1b=w1b
     )
-    acc2 = lax.dot_general(mid_q, w2, DN, preferred_element_type=jnp.float32)
+    if wait_w2 is not None:
+        wait_w2()
+    w2_arr = w2() if callable(w2) else w2
+    acc2 = lax.dot_general(mid_q, w2_arr, DN, preferred_element_type=jnp.float32)
     return acc2, mid_scale
 
 
@@ -666,10 +685,7 @@ def _build_fused_ep_moe_kernel(
 
     # Whether each expert's weights are waited by the block that first reads
     # it rather than waiting at the beginning of each expert's visit.
-    # fp4, fp8 expert FFN are running different code paths. This flag can
-    # be activated only for fp4 expert FFN now. But the idea should be
-    # applicable to fp8 expert FFN as well.
-    streams_weights = rhs_packed4
+    streams_weights = rhs_packed4 or weight_format == host.WeightFormat.FP8
     # Whether issue async copy the NEXT expert's weights as soon as we finish
     # reading the current expert's weights, instead of at the beginning of the
     # next expert's visit.
@@ -1601,14 +1617,35 @@ def _build_fused_ep_moe_kernel(
                             w1b=w1b_row,
                         )
                     else:
+                        first_tile, last_tile = t == 0, t == n_tiles - 1
+                        wait_slab = (
+                            _slab_waiter(e, slot, first_tile)
+                            if streams_weights
+                            else None
+                        )
                         acc2, mid_scale = expert_ffn_fp8(
                             act_rows,
                             act_scales,
-                            w1_vm[slot],
-                            w2_vm[slot],
+                            lambda: w1_vm[slot],
+                            lambda: w2_vm[slot],
                             w1s_vm[pl.ds(slot, 1), :],
                             act_fn=act_fn,
                             w1b=w1b_row,
+                            wait_w1=(
+                                (lambda: wait_slab(w1_copy, 0))
+                                if wait_slab is not None
+                                else None
+                            ),
+                            retire_w1=(
+                                _start_next_gate_up(visit_i, slot, last_tile)
+                                if starts_next_weights
+                                else None
+                            ),
+                            wait_w2=(
+                                (lambda: wait_slab(w2_copy, 0))
+                                if wait_slab is not None
+                                else None
+                            ),
                         )
                     # The destination applies the router weight, not this.
                     # Four-bit weights carry w2s inside the block sums; the

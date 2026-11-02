@@ -2344,6 +2344,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             getattr(self, "decode_prologue", False)
             and getattr(self, "_rope_neox_permuted", False)
             and llama_4_scaling is None
+            and q_rows is None
         )
         if fold_q_rope:
             # k_pe exactly as below (the unused q half is dead code to XLA);

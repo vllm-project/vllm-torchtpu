@@ -86,13 +86,19 @@ def layout_for(vllm_config: Any) -> dcp_token_parallel.TokenParallelLayout:
     vps = page_size * dcp
     max_model_len = int(vllm_config.model_config.max_model_len)
     max_pages = -(-max_model_len // vps) + EXTRA_PAGES
+    caps_env = envs.TPU_DCP_PREFILL_GATHER_CAPS.strip()
+    base_caps = (
+        tuple(int(x) for x in caps_env.split(",") if x.strip())
+        if caps_env
+        else GATHER_CAPS
+    )
     return dcp_token_parallel.TokenParallelLayout(
         dcp_size=dcp,
         interleave_size=int(parallel.cp_kv_cache_interleave_size),
         page_size=page_size,
         split_rows=-(-max_num_seqs // SPLIT_ROWS_ALIGN) * SPLIT_ROWS_ALIGN,
         max_pages=max_pages,
-        gather_caps=tuple(c for c in GATHER_CAPS if c < max_pages) + (max_pages,),
+        gather_caps=tuple(c for c in base_caps if c < max_pages) + (max_pages,),
     )
 
 
@@ -102,11 +108,6 @@ def check_config(vllm_config: Any, *, q_replicate: bool) -> None:
         raise NotImplementedError(
             "TPU_DCP_PREFILL_TOKEN_PARALLEL: speculative decoding is not "
             "supported (the drafter is traced once for every bucket)."
-        )
-    if q_replicate and envs.TPU_MLA_DECODE_PROLOGUE:
-        raise NotImplementedError(
-            "TPU_DCP_PREFILL_TOKEN_PARALLEL does not take TPU_MLA_DECODE_PROLOGUE "
-            "(an un-roped q under query replication)."
         )
     if envs.TPU_DCP_MLA_UV_BEFORE_MERGE or envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE:
         raise NotImplementedError(
@@ -229,7 +230,7 @@ def make_select_topk(
     kv_layout: KVLayout,
     *,
     chunk_tokens: int | None,
-    small_bucket: tuple,
+    small_bucket: tuple[int | None, int | None, int],
     skip_empty_decode: bool,
     skip_empty_decode_chunked: bool,
     mixed_bkvp: int | None,
@@ -301,6 +302,9 @@ def build_attention_op(
         _, k_scale, _ = impl._get_kv_scales(layer)
     dequant = float(k_scale) if k_scale is not None else 1.0
     rank_tensor = _sharded_rank_ids()
+    uv_in_tp = envs.TPU_DCP_PREFILL_TP_UV_BEFORE_A2A and not hasattr(
+        layer, "W_UV_scale"
+    )
 
     def _run(
         kv_cache_nope: jax.Array,
@@ -315,6 +319,7 @@ def build_attention_op(
         request_distribution: jax.Array,
         after: jax.Array,
         rank_ids: jax.Array | None,
+        w_uv: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         kv_cache_nope, kv_cache_rope = _after_reads(
             kv_cache_nope, kv_cache_rope, after=after
@@ -376,6 +381,7 @@ def build_attention_op(
                     page_gather.gather_pages, row_width=rope_spec.token_bytes // 4
                 ),
             ),
+            w_uv=w_uv,
         )
 
     # Fixed arity per variant: torch custom-op schemas take no varargs.
@@ -405,6 +411,37 @@ def build_attention_op(
             request_distribution,
             after,
             None,
+            None,
+        )
+
+    def sparse_mla_tp_uv(
+        kv_cache_nope: jax.Array,
+        kv_cache_rope: jax.Array,
+        q: jax.Array,
+        kv_c_normed: jax.Array,
+        k_pe: jax.Array,
+        flat_topk: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        after: jax.Array,
+        w_uv: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return _run(
+            kv_cache_nope,
+            kv_cache_rope,
+            q,
+            kv_c_normed,
+            k_pe,
+            flat_topk,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            after,
+            None,
+            w_uv,
         )
 
     def sparse_mla_tp_rank(
@@ -434,6 +471,38 @@ def build_attention_op(
             request_distribution,
             after,
             rank_ids,
+            None,
+        )
+
+    def sparse_mla_tp_rank_uv(
+        kv_cache_nope: jax.Array,
+        kv_cache_rope: jax.Array,
+        q: jax.Array,
+        kv_c_normed: jax.Array,
+        k_pe: jax.Array,
+        flat_topk: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        after: jax.Array,
+        rank_ids: jax.Array,
+        w_uv: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return _run(
+            kv_cache_nope,
+            kv_cache_rope,
+            q,
+            kv_c_normed,
+            k_pe,
+            flat_topk,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            after,
+            rank_ids,
+            w_uv,
         )
 
     sharded, rep = P(DCP_AXIS_NAME), P()
@@ -441,23 +510,33 @@ def build_attention_op(
     in_specs += (sharded,)
     if rank_tensor is not None:
         in_specs += (sharded,)
+    if uv_in_tp:
+        in_specs += (sharded,)
+    fn = {
+        (False, False): sparse_mla_tp,
+        (False, True): sparse_mla_tp_uv,
+        (True, False): sparse_mla_tp_rank,
+        (True, True): sparse_mla_tp_rank_uv,
+    }[(rank_tensor is not None, uv_in_tp)]
     op = pcp_streaming_jax_op(
         f"pallas::sparse_mla_tp_{layer.layer_name.replace('.', '_')}"
-        + ("_qrep" if q_replicated else ""),
-        sparse_mla_tp if rank_tensor is None else sparse_mla_tp_rank,
+        + ("_qrep" if q_replicated else "")
+        + ("_uv" if uv_in_tp else ""),
+        fn,
         donate_argnums=(0, 1),
         mesh=mesh,
         input_partition_specs=in_specs,
         output_partition_specs=(sharded, sharded, sharded),
     )
-    num_heads, kv_lora_rank = layer.num_heads, layer.kv_lora_rank
+    num_heads = layer.num_heads
+    out_dim = layer.v_head_dim if uv_in_tp else layer.kv_lora_rank
 
     def _fake(kv_cache_nope, kv_cache_rope, q, kv_c_normed, *rest, **kwargs):
         del rest, kwargs
         return (
             torch.empty_like(kv_cache_nope),
             torch.empty_like(kv_cache_rope),
-            q.new_empty((kv_c_normed.shape[0], num_heads, kv_lora_rank)),
+            q.new_empty((kv_c_normed.shape[0], num_heads, out_dim)),
         )
 
     op.register_fake(_fake)
@@ -473,6 +552,7 @@ def build_attention_op(
         query_start_loc: torch.Tensor,
         request_distribution: torch.Tensor,
         after: torch.Tensor,
+        w_uv: torch.Tensor | None = None,
     ) -> torch.Tensor:
         nope_cache, rope_cache = kv_cache
         new_nope, new_rope, out = op(
@@ -488,6 +568,7 @@ def build_attention_op(
             request_distribution,
             after,
             *(() if rank_tensor is None else (rank_tensor,)),
+            *(() if w_uv is None else (w_uv,)),
         )
         nope_cache.copy_(new_nope)
         rope_cache.copy_(new_rope)
@@ -495,6 +576,7 @@ def build_attention_op(
 
     run.layout = layout  # type: ignore[attr-defined]
     run.q_replicated = q_replicated  # type: ignore[attr-defined]
+    run.uv_in_tp = uv_in_tp  # type: ignore[attr-defined]
     # This rank's DCP index as data, for `q_rows` (built here, outside Dynamo).
     from vllm_torchtpu.distributed.dcp import dcp_rank_operand
 
@@ -572,6 +654,14 @@ def attention(
     head = merge_lse_partials_scatter_heads(
         partial, lse, is_backbone=True, wire_dtype=partial.dtype, query_start_loc=qsl_s
     )
+    w_uv_arg = None
+    if getattr(tp_op, "uv_in_tp", False):
+        w_uv_arg = (
+            layer.W_UV.to(head.dtype) if layer.W_UV.dtype != head.dtype else layer.W_UV
+        )
+        head = (
+            torch.bmm(head.transpose(0, 1), w_uv_arg).transpose(0, 1).to(ql_nope.dtype)
+        )
     # The token-parallel op rewrites the caches in place; it must not start
     # before the sub-batch has read them (`_after_reads`).
     q_tp = torch.cat([ql_nope, q_pe], dim=-1)
@@ -586,6 +676,7 @@ def attention(
         md.query_start_loc,
         md.request_distribution,
         lse,
+        w_uv_arg,
     )
     return torch.cat([head, tail[: num_tokens - s]])
 

@@ -445,6 +445,7 @@ def sparse_mla_attention(
     rank_ids: jax.Array | None = None,
     q_own_rows: bool = False,
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
+    w_uv: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Token-parallel sparse MLA for one layer (global view).
 
@@ -462,14 +463,20 @@ def sparse_mla_attention(
       rank_ids: optional i32[dcp] sharded over `axis_name`, entry r = r.
 
     Returns:
-      `(kv_cache_nope, kv_cache_rope, out)`, `out` `[dcp * T, h, L]`: each
-      rank's head slice, row `i` being step row `split_rows + i`.
+      `(kv_cache_nope, kv_cache_rope, out)`, `out` `[dcp * T, h, L]` (or
+      `[dcp * T, h, V]` when `w_uv` is given): each rank's head slice, row `i`
+      being step row `split_rows + i`.
     """
     dcp = layout.dcp_size
     sharded = P(axis_name)
     rep = P()
 
-    def _local(nope, rope, q, kv_c, k_pe, topk, seq_lens, bt, qsl, dist, *rank_ids):
+    def _local(nope, rope, q, kv_c, k_pe, topk, seq_lens, bt, qsl, dist, *extra_args):
+        if w_uv is not None:
+            rank_ids, w_uv_local = extra_args[:-1], extra_args[-1]
+        else:
+            rank_ids = extra_args
+            w_uv_local = None
         rank = _rank(rank_ids, axis_name, dcp)
         nope, rope = write_kv(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank)
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
@@ -490,9 +497,22 @@ def sparse_mla_attention(
             return run
 
         out = _switch_on_cap(layout, jnp.sum(pages), branch)
+        if w_uv_local is not None:
+            w_uv_all = lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
+            out = (
+                jnp.einsum(
+                    "hrl,hlv->hrv",
+                    jnp.swapaxes(out, 0, 1),
+                    w_uv_all.astype(out.dtype),
+                )
+                .swapaxes(0, 1)
+                .astype(out.dtype)
+            )
         return nope, rope, tokens_to_heads(out, axis_name)
 
     extra = () if rank_ids is None else (rank_ids,)
+    if w_uv is not None:
+        extra = (*extra, w_uv)
     return jax.shard_map(
         _local,
         mesh=mesh,

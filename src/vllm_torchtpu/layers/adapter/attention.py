@@ -2933,7 +2933,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # rows, the token-parallel split on the rest; merged outputs.
                 outputs = dcp_token_parallel_op.attention(
                     layer,
-                    kv_cache,
+                    (kv_cache[0], kv_cache[1]),
                     ql_nope_flat,
                     q_pe_flat,
                     kv_c_normed_flat,
@@ -3175,7 +3175,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
-        if uv_first:
+        if uv_first or outputs.shape[-1] == layer.v_head_dim:
             outputs = outputs.to(input_dtype).reshape(
                 -1, layer.num_heads * layer.v_head_dim
             )

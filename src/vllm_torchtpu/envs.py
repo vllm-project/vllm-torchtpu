@@ -22,6 +22,9 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = False
+    TPU_DCP_PREFILL_TP_UV_BEFORE_A2A: bool = True
+    TPU_DCP_PREFILL_GATHER_CAPS: str = ""
+    TPU_DCP_PREFILL_INDEXER_QROWS: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -832,6 +835,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whose requests need more pages than the gather buffer holds raises.
     "TPU_DCP_PREFILL_TOKEN_PARALLEL": env_bool(
         "TPU_DCP_PREFILL_TOKEN_PARALLEL", default=False
+    ),
+    # Project W_UV inside token-parallel sparse MLA before tokens_to_heads
+    # all-to-all so the output collective carries v_head_dim instead of
+    # kv_lora_rank (4x smaller on DeepSeek-V3.2 / GLM-5.3).
+    "TPU_DCP_PREFILL_TP_UV_BEFORE_A2A": env_bool(
+        "TPU_DCP_PREFILL_TP_UV_BEFORE_A2A", default=True
+    ),
+    # Optional comma-separated virtual-page caps for TPU_DCP_PREFILL_TOKEN_PARALLEL
+    # (overrides dcp_token_parallel_op.GATHER_CAPS when non-empty).
+    "TPU_DCP_PREFILL_GATHER_CAPS": lambda: os.getenv("TPU_DCP_PREFILL_GATHER_CAPS", ""),
+    # Project indexer queries (wq_b + rope + fp8 quant) only for the rows this
+    # rank attends under TPU_DCP_PREFILL_TOKEN_PARALLEL + VLLM_DCP_Q_REPLICATE.
+    "TPU_DCP_PREFILL_INDEXER_QROWS": env_bool(
+        "TPU_DCP_PREFILL_INDEXER_QROWS", default=True
     ),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
