@@ -248,6 +248,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_5_attn_moe_overlap",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
+    assert "patch_chat_template_namespace_aliases" in stages["platform_activation"]
     for names in (stages["platform_activation"], stages["worker_init"]):
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
             "_patch_vllm_config_triton_tpu"
