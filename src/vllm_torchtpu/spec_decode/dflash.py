@@ -300,8 +300,7 @@ class DFlashProposer:
 
         The target's buckets stop at max_num_batched_tokens, but the draft
         forward is num_reqs * block_size tokens: the scheduler does not
-        charge drafting slots for these methods
-        (vllm_torchtpu._patch_dflash_drafting_slot_budget), so a request
+        charge drafting slots for these methods, so a request
         scheduled fewer than block_size tokens still drafts a full block,
         and a step's draft can outgrow the largest target bucket.
         """

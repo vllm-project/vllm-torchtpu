@@ -478,16 +478,9 @@ def patch_runai_sharded_expert_streaming() -> None:
                 "'distributed': incompatible with per-rank sharded fetch "
                 "plans; streaming per rank instead."
             )
+        # The sharded iterator reads every shard header and skips unused
+        # tensors itself, so a shard of only unused tensors costs no fetch.
         hf_weights_files = self._prepare_weights(model_or_path, revision)
-        if is_unused_weight is not None:
-            if rsl.is_runai_obj_uri(model_or_path):
-                hf_weights_files = rsl._filter_remote_weights(
-                    hf_weights_files, model_or_path, is_unused_weight
-                )
-            else:
-                hf_weights_files = rsl.filter_safetensors_files_by_weight_name(
-                    hf_weights_files, is_unused_weight
-                )
         return _sharded_runai_weights_iterator(
             hf_weights_files,
             local_expert_ids,

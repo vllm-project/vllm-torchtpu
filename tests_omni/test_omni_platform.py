@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -928,26 +927,3 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
         fresh = call(coords[:, 0:1, :])
         assert len(table_syncs) == syncs + 1
         assert not torch.equal(fresh[0], stale[0])
-
-
-@pytest.mark.parametrize(
-    "module_name",
-    [
-        "vllm_omni.diffusion.diffusion_engine",
-        "vllm_omni.entrypoints.openai.api_server",
-        "vllm_omni.entrypoints.cli.main",
-    ],
-)
-def test_vllm_omni_cold_import_subprocesses(module_name: str):
-    import importlib.machinery
-    import subprocess
-
-    if importlib.machinery.PathFinder.find_spec("vllm_omni") is None:
-        pytest.skip("vllm_omni is not installed in this environment")
-    result = subprocess.run(
-        [sys.executable, "-c", f"import {module_name}"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stderr

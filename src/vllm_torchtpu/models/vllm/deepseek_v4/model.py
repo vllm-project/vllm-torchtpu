@@ -297,6 +297,11 @@ class DeepseekV4Model(nn.Module):
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
         self.num_hash_layers: int = config.mlp_layer_types.count("hash_moe")
+        # The hash routing input gather and the start_layer test assume the
+        # hash layers come first.
+        assert set(config.mlp_layer_types[: self.num_hash_layers]) <= {"hash_moe"}, (
+            f"hash_moe layers must precede moe layers: {config.mlp_layer_types}"
+        )
 
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,

@@ -334,8 +334,9 @@ def test_patch_falls_back_when_filter_inactive():
 
 
 def test_patch_forwards_is_unused_weight_when_filter_active():
-    """With EP sharding active, _get_weights_iterator must filter remote files
-    and forward is_unused_weight to _sharded_runai_weights_iterator."""
+    """With EP sharding active, _get_weights_iterator forwards every shard and
+    is_unused_weight to _sharded_runai_weights_iterator, which skips unused
+    tensors from the shard headers without a separate file pre-filter."""
     from vllm.model_executor.model_loader import runai_streamer_loader as rsl
 
     from vllm_torchtpu import model_loader_patches as mlp
@@ -352,24 +353,16 @@ def test_patch_forwards_is_unused_weight_when_filter_active():
     with (
         patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader),
         patch.object(rsl, "is_runai_obj_uri", return_value=True),
-        patch.object(
-            rsl,
-            "_filter_remote_weights",
-            return_value=["gs://b/m/shard0.safetensors"],
-        ) as mock_filter,
+        patch.object(rsl, "_filter_remote_weights") as mock_filter,
         patch.object(mlp, "_compute_local_expert_ids", return_value={0}),
         patch.object(mlp, "_sharded_runai_weights_iterator") as mock_sharded_iter,
     ):
         mlp.patch_runai_sharded_expert_streaming()
         loader = FakeLoader()
         FakeLoader._get_weights_iterator(loader, "gs://b/m", "main", unused_fn)
-        mock_filter.assert_called_once_with(
-            ["gs://b/m/shard0.safetensors", "gs://b/m/shard1.safetensors"],
-            "gs://b/m",
-            unused_fn,
-        )
+        mock_filter.assert_not_called()
         mock_sharded_iter.assert_called_once_with(
-            ["gs://b/m/shard0.safetensors"],
+            ["gs://b/m/shard0.safetensors", "gs://b/m/shard1.safetensors"],
             {0},
             False,
             None,

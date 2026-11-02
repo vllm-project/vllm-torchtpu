@@ -751,7 +751,10 @@ class TestMaskLogitsWithTrace:
         ), f"SD:MaskSpecLogits not found in {events}"
 
         # 3. TraceAnnotation verification when target_logits is None (non-draft chunk).
-        grammar_output_none = make_grammar_output(["req0"], [[ALLOW_ALL, BLOCK_ALL]])
+        # The scheduler still sends the request's full 1 + K row block.
+        grammar_output_none = make_grammar_output(
+            ["req0"], [[ALLOW_ALL, BLOCK_ALL], [ALLOW_ALL, ALLOW_ALL]]
+        )
         with capture_trace() as prof_none:
             manager.mask_spec_logits(
                 None, bonus_logits, grammar_output_none, {}, None, 0, 1
@@ -775,14 +778,10 @@ class TestMaskInvalidDraftTokens:
             num_acceptable_drafts=[3],
         )
         draft_token_ids = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
-        segment_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2], dtype=torch.int64)
-        group_indices = torch.tensor([0, 1, 2, 0, 1, 0, 0, 0], dtype=torch.int32)
         draft_lengths_cpu = np.array([3, 2], dtype=np.int32)
 
         out = manager.mask_invalid_draft_tokens(
             draft_token_ids,
-            segment_ids,
-            group_indices,
             grammar_output,
             cur_start_idx=0,
             cur_end_idx=2,
@@ -801,16 +800,12 @@ class TestMaskInvalidDraftTokens:
         )
         # req0 has 3 drafts [10, 11, 12] (only 1 acceptable -> [10, -1, -1]);
         # req1 is unstructured with 2 drafts [20, 21] (unchanged);
-        # trailing 3 slots are padding with segment_ids == 2 (chunk_num_reqs).
+        # the trailing 3 slots are padding past the drafts (unchanged).
         draft_token_ids = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
-        segment_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2], dtype=torch.int64)
-        group_indices = torch.tensor([0, 1, 2, 0, 1, 0, 0, 0], dtype=torch.int32)
         draft_lengths_cpu = np.array([3, 2], dtype=np.int32)
 
         out = manager.mask_invalid_draft_tokens(
             draft_token_ids,
-            segment_ids,
-            group_indices,
             grammar_output,
             cur_start_idx=0,
             cur_end_idx=2,
@@ -818,7 +813,7 @@ class TestMaskInvalidDraftTokens:
         )
         assert out.tolist() == [10, -1, -1, 20, 21, 0, 0, 0]
 
-    def test_masks_drafts_without_draft_lengths_cpu_and_sentinel_segment_ids(self):
+    def test_masks_every_structured_request_and_leaves_padding(self):
         manager = make_manager(
             num_spec_tokens=3, req_id_to_index={"req0": 0, "req1": 1}
         )
@@ -827,20 +822,16 @@ class TestMaskInvalidDraftTokens:
             [[ALLOW_ALL, ALLOW_ALL]] * 8,
             num_acceptable_drafts=[2, 0],
         )
-        # Padding positions have segment_ids == 2 (chunk_num_reqs); must not
-        # index out-of-bounds or corrupt padding slots.
+        # The trailing 3 slots are padding past the drafts and stay untouched.
         draft_token_ids = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
-        segment_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2], dtype=torch.int64)
-        group_indices = torch.tensor([0, 1, 2, 0, 1, 0, 0, 0], dtype=torch.int32)
+        draft_lengths_cpu = np.array([3, 2], dtype=np.int32)
 
         out = manager.mask_invalid_draft_tokens(
             draft_token_ids,
-            segment_ids,
-            group_indices,
             grammar_output,
             cur_start_idx=0,
             cur_end_idx=2,
-            draft_lengths_cpu=None,
+            draft_lengths_cpu=draft_lengths_cpu,
         )
         assert out.tolist() == [10, 11, -1, -1, -1, 0, 0, 0]
 
@@ -854,14 +845,10 @@ class TestMaskInvalidDraftTokens:
             num_acceptable_drafts=None,
         )
         draft_token_ids = torch.tensor([10, 11, 20, 21], dtype=torch.int32)
-        segment_ids = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
-        group_indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32)
         draft_lengths_cpu = np.array([2, 2], dtype=np.int32)
 
         out = manager.mask_invalid_draft_tokens(
             draft_token_ids,
-            segment_ids,
-            group_indices,
             grammar_output,
             cur_start_idx=0,
             cur_end_idx=2,
@@ -882,14 +869,10 @@ class TestMaskInvalidDraftTokens:
         # Chunk covers [2, 4) -> local 0 is req2 (unstructured, 1 draft),
         # local 1 is req3 (structured, 2 drafts, 1 acceptable).
         draft_token_ids = torch.tensor([20, 30, 31, 0], dtype=torch.int32)
-        segment_ids = torch.tensor([0, 1, 1, 2], dtype=torch.int64)
-        group_indices = torch.tensor([0, 0, 1, 0], dtype=torch.int32)
         draft_lengths_cpu = np.array([1, 2], dtype=np.int32)
 
         out = manager.mask_invalid_draft_tokens(
             draft_token_ids,
-            segment_ids,
-            group_indices,
             grammar_output,
             cur_start_idx=2,
             cur_end_idx=4,

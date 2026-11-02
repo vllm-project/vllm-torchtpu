@@ -84,20 +84,42 @@ class _VllmOmniCompatFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     _SERVE_API_UTILS = "vllm.entrypoints.serve.utils.api_utils"
 
     @staticmethod
-    def _patch_kv_cache_utils(module: Any) -> None:
-        from vllm.v1.core import kv_cache_planning
+    def _alias_lazily(module: Any, source: str, names: tuple[str, ...]) -> None:
+        """Serve the missing ``names`` from ``source`` on first access (PEP 562).
 
-        if not hasattr(module, "get_kv_cache_configs"):
-            module.get_kv_cache_configs = kv_cache_planning.get_kv_cache_configs
+        ``source`` is not imported here: ``module`` may still be executing as
+        an import of ``source``, which would then be partially initialized.
+        """
+        missing = frozenset(name for name in names if name not in vars(module))
+        previous = vars(module).get("__getattr__")
+        if not missing or getattr(previous, "_vllm_omni_compat", False):
+            return
 
-    @staticmethod
-    def _patch_serve_api_utils(module: Any) -> None:
-        from vllm.entrypoints.common import startup
+        def __getattr__(name: str) -> Any:
+            if name in missing:
+                return getattr(importlib.import_module(source), name)
+            if previous is not None:
+                return previous(name)
+            raise AttributeError(
+                f"module {module.__name__!r} has no attribute {name!r}"
+            )
 
-        if not hasattr(module, "VLLM_SUBCMD_PARSER_EPILOG"):
-            module.VLLM_SUBCMD_PARSER_EPILOG = startup.VLLM_SUBCMD_PARSER_EPILOG
-        if not hasattr(module, "cli_env_setup"):
-            module.cli_env_setup = startup.cli_env_setup
+        __getattr__._vllm_omni_compat = True  # type: ignore[attr-defined]
+        module.__getattr__ = __getattr__
+
+    @classmethod
+    def _patch_kv_cache_utils(cls, module: Any) -> None:
+        cls._alias_lazily(
+            module, "vllm.v1.core.kv_cache_planning", ("get_kv_cache_configs",)
+        )
+
+    @classmethod
+    def _patch_serve_api_utils(cls, module: Any) -> None:
+        cls._alias_lazily(
+            module,
+            "vllm.entrypoints.common.startup",
+            ("VLLM_SUBCMD_PARSER_EPILOG", "cli_env_setup"),
+        )
 
     @classmethod
     def apply_to_loaded_modules(cls) -> None:

@@ -4771,8 +4771,6 @@ class TPUModelRunner(GPUModelRunner):
                 draft_token_ids = (
                     self.structured_decoding_manager.mask_invalid_draft_tokens(
                         draft_token_ids,
-                        md.segment_ids,
-                        md.group_indices,
                         grammar_output,
                         cur_start_idx,
                         cur_end_idx,

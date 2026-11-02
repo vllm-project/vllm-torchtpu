@@ -42,16 +42,30 @@ def test_submodule_imports_before_vllm_initialization_completes():
     assert result.returncode == 0, result.stderr
 
 
-def test_sitecustomize_cold_import_kv_cache_configs_subprocess():
+@pytest.mark.parametrize(
+    "imports",
+    [
+        (
+            "from vllm.v1.core.kv_cache_utils import get_kv_cache_configs; "
+            "from vllm.v1.core import kv_cache_planning; "
+        ),
+        # kv_cache_planning imports kv_cache_utils while it is still executing.
+        (
+            "from vllm.v1.core import kv_cache_planning; "
+            "from vllm.v1.core.kv_cache_utils import get_kv_cache_configs; "
+        ),
+    ],
+    ids=["utils_first", "planning_first"],
+)
+def test_sitecustomize_cold_import_kv_cache_configs_subprocess(imports: str):
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             (
                 "import sys; "
-                "from vllm.v1.core.kv_cache_utils import get_kv_cache_configs; "
+                f"{imports}"
                 "assert 'vllm.entrypoints.launchers.cli_args' not in sys.modules; "
-                "from vllm.v1.core import kv_cache_planning; "
                 "assert get_kv_cache_configs is kv_cache_planning.get_kv_cache_configs"
             ),
         ],
