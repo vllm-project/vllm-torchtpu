@@ -668,7 +668,7 @@ class StreamIndexDecodeRing:
     def copy_kv_in(
         self,
         src_ref: tuple[jax.Ref, jax.Ref, Any],
-        p_id: jax.Array,
+        p_id: int | jax.Array,
         slot: int | jax.Array,
         enabled: jax.Array,
     ):
@@ -705,7 +705,7 @@ class StreamIndexDecodeRing:
         dst_ref: tuple[Any, ...],
         p_id: jax.Array,
         slot: int | jax.Array,
-        enabled: jax.Array | None = None,
+        enabled: bool | jax.Array | None = None,
     ):
         """(VMEM source, HBM destination) of step `p_id`'s scores.
 
@@ -735,7 +735,7 @@ class StreamIndexDecodeRing:
         dst_ref: tuple[Any, ...],
         p_id: jax.Array,
         slot: int | jax.Array,
-        enabled: jax.Array,
+        enabled: bool | jax.Array,
     ):
         """Starts the score copy of step `p_id` from `slot`; empty unless `enabled`."""
         src, dst = self._scores_block(dst_ref, jnp.maximum(p_id, 0), slot, enabled)

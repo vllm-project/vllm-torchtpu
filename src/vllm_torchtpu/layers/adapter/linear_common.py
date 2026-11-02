@@ -68,6 +68,29 @@ FP8_PALLAS_HBM_PIN_ATTR = "_tpu_fp8_pallas_hbm_pin"
 PREQUANT_ATTR = "_tpu_prequant_slot"
 
 
+def is_xla_fp8_projection(layer: torch.nn.Module) -> bool:
+    """Whether a prefill-sized `layer(x)` is ``xla_quantized_matmul(x, weight,
+    weight_scale)``: a per-channel fp8 weight in (k, n) layout, no bias, no
+    gathered output, no padded kernel copy. Every fused path that runs such a
+    projection itself asks this one predicate."""
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+
+    weight = getattr(layer, "weight", None)
+    scale = getattr(layer, "weight_scale", None)
+    return (
+        isinstance(getattr(layer, "quant_method", None), VllmFp8LinearMethodTPU)
+        and weight is not None
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.dim() == 2
+        and scale is not None
+        and scale.dim() == 1
+        and getattr(layer, "bias", None) is None
+        and not getattr(layer, "gather_output", False)
+        and not getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        and getattr(layer, FP8_PALLAS_WEIGHT, None) is None
+    )
+
+
 class PrequantSlot:
     """A plain object shared by a norm and its linear, so the norm never holds
     the linear module: Dynamo would otherwise reach the linear's weights

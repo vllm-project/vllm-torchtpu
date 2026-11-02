@@ -1015,7 +1015,7 @@ def _capped_window_live_fused_kernel(
     for cc in range(num_chunks):
 
         @pl.when(c == cc)
-        def _flush():
+        def _flush(*, cc=cc):
             region_copy(outs[cc], 0, slot, slot * num_windows).start()
             if window_cache:
                 meta_copy(outs[cc], slot).start()
@@ -1654,6 +1654,8 @@ def decode_step_tokens(levers: tuple[str, ...]) -> int:
     if len(steps) > 1:
         raise ValueError(f"decode_body_levers: one step lever at most, got {levers}")
     return steps[0] if steps else 0
+
+
 # The measured set (decode probes 02 / 04 / 05): "step8" runs 8 tokens per
 # attention grid step and "quad" stacks them in one softmax; "nofill" and
 # "q128" measured no gain.
@@ -2104,6 +2106,9 @@ def _attention_kernel(
 
     assert head_dim % 128 == 0
     assert num_q_heads % q_packing == 0
+    # Send-layout geometry: rows per destination and lse lane width, read only
+    # with `send`.
+    send_per = send_rows = send_lanes = 0
     if send:
         assert send_layout_supported(
             num_tokens, num_q_heads, send_world, o_dim, batch_size
@@ -2121,14 +2126,12 @@ def _attention_kernel(
         assert bo_x2_ref is not None and lse_hbm_ref is not None
         xchg_axis, xchg_lane_axis = send_exchange[:2]
         # Rows each destination receives from row SEND_SLAB_ROW0 of its block.
-        xchg_rows = SEND_SLAB_ROW0 + send_rows  # pyrefly: ignore[unbound-name]
+        xchg_rows = SEND_SLAB_ROW0 + send_rows
         xchg_block = SEND_PAD_ROWS + send_rows
         if xchg_steps:
             assert bo_x2_ref.shape[2] == batch_size * send_per, bo_x2_ref.shape
             assert recv_v_ref is not None
-            assert recv_v_ref.shape == (send_world, xchg_block, o_dim), (
-                recv_v_ref.shape
-            )
+            assert recv_v_ref.shape == (send_world, xchg_block, o_dim), recv_v_ref.shape
         else:
             assert bo_x2_ref.shape[2] == xchg_rows, bo_x2_ref.shape
         if xchg_merge:
@@ -2841,6 +2844,7 @@ def _attention_kernel(
         # Bytes of n - 1 head blocks, then of n - 1 slabs per step that ran.
         heads = send_wbuf.at[pl.ds(0, n - 1)]
         pltpu.make_async_copy(heads, heads, recv_sem).wait()
+
         def step_slabs(size):
             return bo_x2_ref.at[0, pl.ds(0, n - 1), pl.ds(0, size)]
 
@@ -4447,7 +4451,7 @@ def sparse_ragged_paged_attention(
                     topk_cap=topk_cap,
                     page_size=page_size,
                     total_num_pages=cache_kv_nope.shape[0],
-                    **({"window_cache": True} if window_cache else {}),
+                    window_cache=window_cache,
                 )
             )
         else:
@@ -4665,7 +4669,7 @@ def sparse_ragged_paged_attention(
             packed_rope=packed_rope,
             packed_gather=packed_gather and group_tab is not None,
             out_vmem=out_vmem,
-            **({"gather_window_cache": True} if window_cache else {}),
+            gather_window_cache=window_cache,
             **extra,
         )
 
@@ -5273,11 +5277,13 @@ def sparse_attention_chunk(
             piece_aliases[lse_operand + 1] = 0
         # out_vmem: the refs stay typed as above (the kernel only DMAs them);
         # the output arrays themselves are placed in VMEM.
-        out_vmem_outputs = (
-            [pltpu.VMEM(q.shape, q.dtype), pltpu.VMEM(lse_shape, jnp.float32)]
-            if out_vmem
-            else []
-        )
+        out_vmem_outputs = []
+        if out_vmem:
+            assert lse_shape is not None
+            out_vmem_outputs = [
+                pltpu.VMEM(q.shape, q.dtype),
+                pltpu.VMEM(lse_shape, jnp.float32),
+            ]
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 kernel_body,

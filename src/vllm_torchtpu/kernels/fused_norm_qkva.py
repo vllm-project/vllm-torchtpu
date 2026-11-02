@@ -199,6 +199,7 @@ def _kernel(
     qc_ref[...] = q_c
     if q8_ref is not None:
         # q_b_proj's own activation quant, for its XLA matmul above 16 rows.
+        assert qs_ref is not None  # emit_q8 binds both refs
         q8, q_scale = _quant_rows(q_c.astype(jnp.float32), q_max, q8_ref.dtype)
         q8_ref[...] = q8
         qs_ref[...] = q_scale
@@ -328,7 +329,7 @@ def _n_major(w_q: jax.Array) -> jax.Array:
     """[hidden, n] -> [n, hidden]: the canonical parameter is stored N-major
     (layout {0,1}), so this transpose is a bitcast, where handing the kernel
     the [hidden, n] row-major operand made XLA transpose the 16 MB weight
-    before every call (37.4 us at decode-b1, j-709ea6e5-6a38-48b9-abb7)."""
+    before every call (37.4 us at decode-b1)."""
     return w_q.T
 
 

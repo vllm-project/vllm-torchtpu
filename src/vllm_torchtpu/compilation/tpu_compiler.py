@@ -318,8 +318,10 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/dcp_vspace.py",
     # The token split's lane all-to-all op (TPU_DCP_MLA_TOKEN_SPLIT).
     "vllm_torchtpu/layers/adapter/dcp_token_split.py",
-    # The small all-reduce ops, built through `sharded_jax_op`.
+    # The small collectives and the fused o_proj all-reduce ops, and the
+    # prefill token split's rotated collectives and fused projection ops.
     "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
+    "vllm_torchtpu/layers/adapter/prefill_token_split.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",

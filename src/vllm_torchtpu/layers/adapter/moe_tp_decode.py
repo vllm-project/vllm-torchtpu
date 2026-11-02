@@ -60,8 +60,8 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
 from vllm_torchtpu.kernels.experimental import rotated_collectives
-from vllm_torchtpu.kernels.experimental.fused_moe_prefill import combine_scatter
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
+    combine_scatter,
     fused_moe_prefill,
     plan_blocks,
     row_all_gather,
@@ -77,7 +77,7 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import moe_routing, small_all_reduce_op, token_padding
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     resolve_onehot_permute_threshold,
@@ -883,27 +883,12 @@ def _selftest(
     return failures
 
 
-def _chip_places(topo: _Topology) -> list[tuple[tuple[int, ...], int | None]]:
-    """(chip coords, core on chip) at each index of the op's mesh. Its devices
-    carry ids only (get_pallas_mesh builds them from the process group), so
-    every rank reports its own JAX device, the one TPU device its process
-    addresses, and it must be the mesh's device at the rank's index.
-    Collective."""
-    device = jax.local_devices()[0]
-    mine = dict(
-        mesh_index=topo.mesh_index,
-        id=int(device.id),
-        coords=tuple(getattr(device, "coords", None) or ()),
-        core=getattr(device, "core_on_chip", None),
+def _chip_places(topo: _Topology) -> list[tuple[tuple[int, ...], int]]:
+    """(chip coords, core on chip) at each index of the op's mesh, gathered
+    over the TP group (small_all_reduce_op._chip_places). Collective."""
+    return small_all_reduce_op._chip_places(
+        topo.mesh, topo.mesh_index, _gather, who="moe_tp_decode"
     )
-    seen = sorted(_gather(mine), key=lambda s: s["mesh_index"])
-    ids = [int(d.id) for d in topo.mesh.devices.flat]
-    if [(s["mesh_index"], s["id"]) for s in seen] != list(enumerate(ids)):
-        raise RuntimeError(
-            f"moe_tp_decode: the ranks' JAX devices {seen} are not the op "
-            f"mesh's devices {ids} in mesh order"
-        )
-    return [(s["coords"], s["core"]) for s in seen]
 
 
 def _rotated_places(topo: _Topology) -> list | None:
@@ -915,23 +900,13 @@ def _rotated_places(topo: _Topology) -> list | None:
         raise ValueError(
             "TPU_MOE_PREFILL_ROTATED_COLLECTIVES needs TPU_MOE_PREFILL_GATHER_ONCE=1"
         )
-    if int(topo.mesh.size) != rotated_collectives.CORES:
-        reason = f"the mesh has {int(topo.mesh.size)} cores, not 16"
-    else:
-        try:
-            places = _chip_places(topo)
-            rotated_collectives.Layout(places)
-        except (RuntimeError, ValueError) as e:
-            reason = str(e)
-        else:
-            logger.info(
-                "TPU_MOE_PREFILL_ROTATED_COLLECTIVES: the split MoE op's fp8 row "
-                "all-gather and last reduce-scatter run rotated over %s",
-                places,
-            )
-            return places
-    logger.warning("TPU_MOE_PREFILL_ROTATED_COLLECTIVES: %s; XLA's collectives", reason)
-    return None
+    return small_all_reduce_op.rotated_places(
+        topo.mesh,
+        topo.mesh_index,
+        "TPU_MOE_PREFILL_ROTATED_COLLECTIVES",
+        "the split MoE op's fp8 row all-gather and last reduce-scatter",
+        _gather,
+    )
 
 
 def _rotated_tables(mesh) -> tuple | None:
@@ -1130,6 +1105,7 @@ def moe_tp_decode_forward(
     split_slot = getattr(layer, TOKEN_SPLIT_MOE_ATTR, None)
     split = split_slot is not None and split_slot.value is not None
     if split:
+        assert split_slot is not None
         split_slot.value = None
     op = getattr(quant_method, _OP_SPLIT_ATTR if split else _OP_ATTR)
     extra: tuple = ()

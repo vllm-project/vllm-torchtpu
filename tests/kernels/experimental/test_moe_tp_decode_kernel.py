@@ -897,9 +897,7 @@ def _worker(part):
             more_x, more_scores = inputs(bucket)
             x_next = jnp.concatenate([x, more_x[rows:]])
             scores_next = jnp.concatenate([scores, more_scores[rows:]])
-            main, _ = _interpret(
-                run_body, *body_operands(x_next, scores_next, n_valid)
-            )
+            main, _ = _interpret(run_body, *body_operands(x_next, scores_next, n_valid))
             mine = np.asarray(out).reshape(N_RANKS, rows, c["h"])
             main = np.asarray(main).reshape(N_RANKS, bucket, c["h"])[:, :rows]
             case["bitwise_vs_next_bucket"] = bool(
@@ -921,7 +919,10 @@ def _worker(part):
         want = np.zeros((rows, c["h"]), np.float32)
         want[:n_valid] = N_RANKS
         result["pad_off_chain_exact"] = bool(
-            np.array_equal(out.reshape(N_RANKS, rows, c["h"]), np.broadcast_to(want, (N_RANKS, rows, c["h"])))
+            np.array_equal(
+                out.reshape(N_RANKS, rows, c["h"]),
+                np.broadcast_to(want, (N_RANKS, rows, c["h"])),
+            )
         )
         print("RESULT " + json.dumps(result))
         return

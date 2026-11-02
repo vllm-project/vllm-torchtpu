@@ -53,7 +53,9 @@ def model_dir(tmp_path_factory):
     return str(path)
 
 
-def _scheduler(cls, model_dir, monkeypatch, short=SHORT, max_seqs=16):
+def _scheduler(
+    cls, model_dir, monkeypatch, short=SHORT, max_seqs=16, num_blocks=40_000
+):
     monkeypatch.setenv("TPU_SHORT_PREFILL_FIRST_TOKENS", str(short))
     model_config = ModelConfig(
         model=model_dir, skip_tokenizer_init=True, max_model_len=131072
@@ -73,7 +75,6 @@ def _scheduler(cls, model_dir, monkeypatch, short=SHORT, max_seqs=16):
             block_size=BLOCK, cache_dtype="auto", enable_prefix_caching=True
         ),
     )
-    num_blocks = 40_000
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
@@ -222,7 +223,7 @@ def test_waiting_order_is_untouched_without_a_running_prefill(model_dir, monkeyp
     _step(scheduler)
     scheduler.add_request(_request("other", 9000, first_token=50_000))
     scheduler.add_request(_request("short", 300, first_token=70_000))
-    assert scheduler._promote_short_waiting() == 0
+    assert scheduler._promote_short_waiting() == []
     assert [r.request_id for r in scheduler.waiting] == ["other", "short"]
 
 
@@ -232,8 +233,30 @@ def test_each_waiting_prompt_is_looked_up_once(model_dir, monkeypatch):
     _step(scheduler)
     lookups = []
     look_up = scheduler._look_up_uncached
-    scheduler._look_up_uncached = lambda request: lookups.append(request.request_id) or look_up(request)
+    scheduler._look_up_uncached = lambda request: lookups.append(
+        request.request_id
+    ) or look_up(request)
     scheduler.add_request(_request("other", 9000, first_token=50_000))
     for _ in range(3):
         _step(scheduler)
     assert lookups == ["other"]
+
+
+def test_a_reservation_the_kv_cache_cannot_hold_does_not_stall_the_prefill(
+    model_dir, monkeypatch
+):
+    # 300 blocks hold 4,800 tokens. The long prefill's first chunk takes 256 of
+    # them; the two short prompts reserve the whole budget but need 128 blocks
+    # each, more than the 44 left. Capping the prefill at 0 for them would
+    # schedule nothing on every step: the prefill never reaches allocate_slots,
+    # so nothing is preempted, and the shorts never fit.
+    scheduler = _scheduler(
+        ShortPrefillFirstScheduler, model_dir, monkeypatch, num_blocks=300
+    )
+    scheduler.add_request(_request("long", 4_500))
+    assert _step(scheduler) == {"long": BUDGET}
+    scheduler.add_request(_request("a", SHORT, first_token=50_000))
+    scheduler.add_request(_request("b", SHORT, first_token=60_000))
+    for _ in range(3):
+        _step(scheduler)
+    assert scheduler.requests["long"].num_computed_tokens >= 4_500
