@@ -124,11 +124,9 @@ def _combine_arrivals(
     Where the kernel path applies (kernel.combine_step_tokens) the row gather
     and the weighted sum are one Mosaic call: XLA answers `arrivals[rows]`
     with a SparseCore gather whose output is in HBM at any size, so the rows
-    are written out and read straight back before the sum sees them. At
-    kernel.COMBINE_TAIL_TOKENS the gather stays in VMEM and the kernel is
-    taken for its row DMA rate instead. Everywhere else the gather is not
-    offloaded and there is no round trip to remove, so the fused XLA epilogue
-    below stays.
+    are written out and read straight back before the sum sees them.
+    Everywhere else the gather is not offloaded and there is no round trip to
+    remove, so the fused XLA epilogue below stays.
 
     Both paths fold the arrival row's scale and the router weight into one
     coefficient over K * t_local values, so each of the K * t_local * hidden
