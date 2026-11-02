@@ -15,6 +15,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 from jax.sharding import Mesh
 
@@ -31,6 +32,10 @@ class VllmModelWrapperContext:
     # attention forward execution routes through the bundled RPA custom op with
     # in-place buffer donation, bypassing the per-layer tensor views bound by vLLM.
     kv_cache_bundle: torch.Tensor | None = None
+    # Host copies of a serving step's query_start_loc[: num_reqs + 1] and
+    # seq_lens[:num_reqs]; None in warmup and profiling forwards.
+    query_start_loc_cpu: np.ndarray | None = None
+    seq_lens_cpu: np.ndarray | None = None
 
 
 _vllm_model_wrapper_context: VllmModelWrapperContext | None = None
@@ -75,6 +80,8 @@ def set_vllm_model_wrapper_context(
     layer_name_to_kvcache_index: dict[str, int] | None = None,
     vllm_config: object | None = None,
     kv_cache_bundle: torch.Tensor | None = None,
+    query_start_loc_cpu: np.ndarray | None = None,
+    seq_lens_cpu: np.ndarray | None = None,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
@@ -84,6 +91,8 @@ def set_vllm_model_wrapper_context(
         layer_name_to_kvcache_index=layer_name_to_kvcache_index,
         vllm_config=vllm_config,
         kv_cache_bundle=kv_cache_bundle,
+        query_start_loc_cpu=query_start_loc_cpu,
+        seq_lens_cpu=seq_lens_cpu,
     )
 
     try:
