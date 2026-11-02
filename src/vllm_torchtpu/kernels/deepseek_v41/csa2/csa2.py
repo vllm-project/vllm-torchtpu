@@ -842,7 +842,10 @@ def csa2(
         metadata_space,
     )
     inputs = (q, main_kv, main_kv_scale[:, None, :], banks, sink[:, None], rope_cache)
-    out_shape = jax.ShapeDtypeStruct(q.shape, q.dtype)
+    # Pin the attention output to HBM. As a plain ShapeDtypeStruct XLA may
+    # place it in VMEM, and the output projection, which takes its input in
+    # HBM, then waits on a blocking copy of the whole [T, heads, 512] result.
+    out_shape = pltpu.HBM(shape=q.shape, dtype=q.dtype)
     out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
     aliases = {}
     if owners != "none":
