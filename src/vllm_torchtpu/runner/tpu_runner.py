@@ -4551,7 +4551,9 @@ class TPUModelRunner(GPUModelRunner):
             verify_rows = self._verify_trim_rows(
                 md.target_logits_indices.shape[0], md.draft_lengths_cpu
             )
-        verify_kwargs = {"verify_rows": verify_rows} if verify_rows else {}
+        verify_kwargs: dict[str, Any] = (
+            {"verify_rows": verify_rows} if verify_rows else {}
+        )
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices

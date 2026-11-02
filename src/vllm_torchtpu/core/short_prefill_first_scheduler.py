@@ -51,17 +51,29 @@ class ShortPrefillFirstScheduler(AsyncScheduler):
         self.short_prompt_tokens = envs.TPU_SHORT_PREFILL_FIRST_TOKENS
         self._running_prefill_budget: int | None = None
         self._uncached_by_request: dict[str, int | None] = {}
+        self._skip_promotion = False
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        reserved = self._promote_short_waiting()
+        promoted: list[Request] = []
+        if not self._skip_promotion:
+            promoted = self._promote_short_waiting()
+        reserved = sum(self._uncached_by_request[r.request_id] or 0 for r in promoted)
         if reserved:
             self._running_prefill_budget = max(
                 self.max_num_scheduled_tokens - self._decode_tokens() - reserved, 0
             )
         try:
-            return super().schedule(throttle_prefills)
+            output = super().schedule(throttle_prefills)
         finally:
             self._running_prefill_budget = None
+        # A reservation that no promoted request used (none got its KV blocks)
+        # would cap the running prefill again next step, and a prefill capped
+        # at 0 never reaches allocate_slots, so nothing is preempted or freed:
+        # every step would schedule nothing. The next step reserves nothing.
+        self._skip_promotion = bool(reserved) and not any(
+            r.request_id in output.num_scheduled_tokens for r in promoted
+        )
+        return output
 
     def _reserve_prefill_lookahead(
         self,
@@ -85,9 +97,9 @@ class ShortPrefillFirstScheduler(AsyncScheduler):
         self._running_prefill_budget -= num_new_tokens
         return num_new_tokens
 
-    def _promote_short_waiting(self) -> int:
+    def _promote_short_waiting(self) -> list[Request]:
         """Move the short waiting requests that fit this step to the head of
-        the waiting queue, in arrival order, and return their uncached tokens."""
+        the waiting queue, in arrival order, and return them."""
         if (
             self.short_prompt_tokens <= 0
             or self.policy != SchedulingPolicy.FCFS
@@ -95,7 +107,7 @@ class ShortPrefillFirstScheduler(AsyncScheduler):
             or not self.waiting
             or not any(r.is_prefill_chunk for r in self.running)
         ):
-            return 0
+            return []
         self._forget_requests_that_left_waiting()
         free_slots = (
             self.max_num_running_reqs
@@ -117,13 +129,13 @@ class ShortPrefillFirstScheduler(AsyncScheduler):
                 short.append(request)
                 reserved += uncached
         if not short:
-            return 0
+            return []
         waiting = self.waiting
         assert isinstance(waiting, FCFSRequestQueue)
         waiting.remove_requests(short)
         for request in reversed(short):
             waiting.prepend_request(request)
-        return reserved
+        return short
 
     def _forget_requests_that_left_waiting(self) -> None:
         waiting = {request.request_id for request in self.waiting}

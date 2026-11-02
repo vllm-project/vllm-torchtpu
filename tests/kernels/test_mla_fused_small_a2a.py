@@ -102,9 +102,13 @@ def test_gate_cap():
 def test_gate_step32():
     # "step32": buckets of up to 32 tokens are one grid step.
     levers = "tr,zu,pv512,noinf,quad,fxskip,lrows,step32"
-    env = dict(TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32", TPU_MLA_DECODE_BODY_LEVERS=levers)
+    env = dict(
+        TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32", TPU_MLA_DECODE_BODY_LEVERS=levers
+    )
     assert [t for t in (4, 8, 16, 32, 64) if _applies(t, **env)] == [4, 8, 16, 32]
-    assert [t for t in (4, 8, 16, 32) if _applies(t, TPU_MLA_DECODE_BODY_LEVERS=levers)] == [4, 8]
+    assert [
+        t for t in (4, 8, 16, 32) if _applies(t, TPU_MLA_DECODE_BODY_LEVERS=levers)
+    ] == [4, 8]
 
 
 def test_gate_xchg_max_tokens():

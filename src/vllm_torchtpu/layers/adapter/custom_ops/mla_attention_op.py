@@ -79,6 +79,8 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
     _retain_buffers,
+    uses_query_replication,
+    uv_before_merge_runs,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     DCP_ROWS_ATTR,
@@ -87,9 +89,11 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    PrequantSlot,
     _fp8_linear_pallas_hbm_pinned_jax,
     _fp8_linear_pallas_jax,
     get_prequantized_matmul_op,
+    is_xla_fp8_projection,
     prequantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
@@ -322,28 +326,6 @@ def _dcp_indexer_a2a_for_bucket(
     was set.
     """
     return enabled and num_tokens > envs.bucket_gate_edge(min_tokens)
-
-
-def _xla_quantized_projection(layer: Any) -> bool:
-    """Whether a prefill-sized `layer(x)` is ``xla_quantized_matmul(x, weight,
-    weight_scale)``: a per-channel fp8 weight in (k, n) layout, no bias, no
-    padded kernel copy."""
-    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
-
-    weight = getattr(layer, "weight", None)
-    scale = getattr(layer, "weight_scale", None)
-    return (
-        isinstance(getattr(layer, "quant_method", None), VllmFp8LinearMethodTPU)
-        and weight is not None
-        and weight.dtype == torch.float8_e4m3fn
-        and weight.dim() == 2
-        and scale is not None
-        and scale.dim() == 1
-        and getattr(layer, "bias", None) is None
-        and not getattr(layer, "gather_output", False)
-        and not getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
-        and getattr(layer, FP8_PALLAS_WEIGHT, None) is None
-    )
 
 
 def _qb_overlap_operands(layer: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -2002,6 +1984,13 @@ VllmMLAAttention = VllmTPUMLAAttention
 
 @MultiHeadLatentAttentionWrapper.register_oot
 class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
+    # Set at load, only when their switch arms them, and read with getattr:
+    # rmsnorm.arm_norm_qkva (TPU_FUSED_NORM_QKVA) and
+    # prefill_token_split (TPU_PREFILL_LATENT_GATHER_FP8).
+    _nq_slot: PrequantSlot | None
+    _nq_qb_slot: PrequantSlot | None
+    fp8_q_latent_projections: int
+
     def __init__(
         self,
         hidden_size: int,
@@ -2220,6 +2209,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q_c, kv_c, k_pe = qkv_lora.split(
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
+        assert self.q_a_layernorm is not None
         parts = [self.q_a_layernorm(q_c), self.kv_a_layernorm(kv_c), k_pe]
         count = getattr(self, "fp8_q_latent_projections", 0)
         if token_split.quantized_gather and count:
@@ -2230,14 +2220,18 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
                 return None, kv_c_normed, k_pe, {}, q
             assert self.indexer is not None
-            parts.append(self.indexer.wk_weights_proj(hidden_states)[0])
-            q, q_index, kv_c_normed, k_pe, kw = (
-                token_split.gather_quantized_columns(tokens, projections, *parts)
+            parts.append(
+                cast(VllmTPUIndexer, self.indexer).wk_weights_proj(hidden_states)[0]
+            )
+            q, q_index, kv_c_normed, k_pe, kw = token_split.gather_quantized_columns(
+                tokens, projections, *parts
             )
             return None, kv_c_normed, k_pe, {"kw": kw, "q_index": q_index}, q
         if self._reads_indexer_keys():
             assert self.indexer is not None
-            parts.append(self.indexer.wk_weights_proj(hidden_states)[0])
+            parts.append(
+                cast(VllmTPUIndexer, self.indexer).wk_weights_proj(hidden_states)[0]
+            )
         gathered = token_split.gather_columns(tokens, *parts)
         index_kw = {"kw": gathered[3]} if len(gathered) > 3 else {}
         return gathered[0], gathered[1], gathered[2], index_kw, None
@@ -2262,9 +2256,20 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         ):
             return 0
         projections = self._q_latent_projection_modules()
-        if all(_xla_quantized_projection(p) for p in projections):
+        if all(is_xla_fp8_projection(p) for p in projections):
             return len(projections)
         return 0
+
+    def _uv_before_merge(self, num_tokens: int, q_dcp_replicated, topk_indices) -> bool:
+        """Whether the backend applies W_UV before the DCP merge on this bucket,
+        and so hands back the projected rows, not the latent TPU_FUSED_UV_OPROJ's
+        kernel takes. Asked of the backend itself, as the backend asks it."""
+        impl = cast(PallasMLAttentionBackendImpl, self.mla_attn.impl)
+        return uv_before_merge_runs(
+            self.mla_attn,
+            num_tokens,
+            uses_query_replication(impl, q_dcp_replicated, topk_indices),
+        )
 
     def _reads_indexer_keys(self) -> bool:
         """Whether this layer runs its own indexer (and so its key projection)."""
@@ -2299,6 +2304,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q = None
         kv_lora = None
         kv_c_normed = None
+        k_pe = None
         output_gate = None
         early_topk = None
         index_kw: dict[str, torch.Tensor] = {}
@@ -2350,7 +2356,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         q_c,
                         cast(torch.Tensor, self.fused_qkv_a_proj.weight),
                         cast(torch.Tensor, self.fused_qkv_a_proj.weight_scale),
-                        self.q_a_layernorm.weight,
+                        cast(torch.Tensor, self.q_a_layernorm.weight),
                         cast(torch.Tensor, self.kv_a_layernorm.weight),
                     )
                     qkv_lora = None
@@ -2361,10 +2367,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     and envs.TPU_PREFILL_LATENT_NORMS_LOCAL
                     and not self.gate_is_fused
                 ):
-                    q_c, kv_c_normed, k_pe, index_kw, q = (
-                        self._norm_and_gather_latents(
-                            qkv_lora, hidden_states, positions.shape[0], token_split
-                        )
+                    q_c, kv_c_normed, k_pe, index_kw, q = self._norm_and_gather_latents(
+                        qkv_lora, hidden_states, positions.shape[0], token_split
                     )
                     qkv_lora = None
                 elif token_split is not None and self._reads_indexer_keys():
@@ -2372,29 +2376,32 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     qkv_lora, index_kw["kw"] = token_split.gather_columns(
                         positions.shape[0],
                         qkv_lora,
-                        self.indexer.wk_weights_proj(hidden_states)[0],
+                        cast(VllmTPUIndexer, self.indexer).wk_weights_proj(
+                            hidden_states
+                        )[0],
                     )
                 elif token_split is not None:
                     (qkv_lora,) = token_split.gather_columns(
                         positions.shape[0], qkv_lora
                     )
-                if qkv_lora is None:
-                    pass
-                elif self.gate_is_fused:
-                    q_c, kv_lora, output_gate = qkv_lora.split(
-                        [
-                            self.q_lora_rank,
-                            self.kv_lora_rank + self.qk_rope_head_dim,
-                            self.num_heads * self.v_head_dim,
-                        ],
-                        dim=-1,
-                    )
-                else:
-                    q_c, kv_lora = qkv_lora.split(
-                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                        dim=-1,
-                    )
                 if qkv_lora is not None:
+                    if self.gate_is_fused:
+                        q_c, kv_lora, output_gate = qkv_lora.split(
+                            [
+                                self.q_lora_rank,
+                                self.kv_lora_rank + self.qk_rope_head_dim,
+                                self.num_heads * self.v_head_dim,
+                            ],
+                            dim=-1,
+                        )
+                    else:
+                        q_c, kv_lora = qkv_lora.split(
+                            [
+                                self.q_lora_rank,
+                                self.kv_lora_rank + self.qk_rope_head_dim,
+                            ],
+                            dim=-1,
+                        )
                     q_c = self.q_a_layernorm(q_c)
                 if q is None and (
                     getattr(self, "qb_overlap", False)
@@ -2442,6 +2449,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Add head dim of 1 to k_pe
+        assert k_pe is not None
         k_pe = k_pe.unsqueeze(1)
 
         q_rope_table = None
@@ -2519,6 +2527,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and output_gate is None
             and getattr(self, "g_proj", None) is None
             and getattr(self.mla_attn, "W_O_dcp_qrep", None) is None
+            and not self._uv_before_merge(q.shape[0], q_dcp_replicated, topk_indices)
             and small_all_reduce_op.uv_oproj_fits(
                 q.shape[0], self.mla_attn, self.o_proj
             )

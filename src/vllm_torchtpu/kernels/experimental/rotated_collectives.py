@@ -60,6 +60,7 @@ LANES = 128
 # 13. Both kernels here signal the same four peers, so they share one group.
 COLLECTIVE_ID = 15
 ROTATIONS = (("x", "y", "z"), ("y", "z", "x"), ("z", "x", "y"))
+PARTS = len(ROTATIONS)
 AXES = ("x", "y", "z")
 TABLE_WIDTH = 64
 MESH = pl.DeviceIdType.MESH
@@ -90,13 +91,16 @@ class Layout:
 
     def __init__(self, places):
         """``places``: (chip coords (x, y, z), core on chip) per mesh index."""
-        self.places = [(tuple(int(c) for c in coords[:3]), int(core)) for coords, core in places]
+        self.places = [
+            (tuple(int(c) for c in coords[:3]), int(core)) for coords, core in places
+        ]
         self.index = {p: m for m, p in enumerate(self.places)}
         chips = {coords for coords, _ in self.places}
         if (
             len(self.places) != CORES
             or len(self.index) != CORES
-            or chips != {(x, y, z) for x in range(2) for y in range(2) for z in range(2)}
+            or chips
+            != {(x, y, z) for x in range(2) for y in range(2) for z in range(2)}
         ):
             raise ValueError(
                 f"the cores {self.places} are not a 2x2x2 slice of 2-core chips"
@@ -166,7 +170,7 @@ def peer_table(places, kind):
     return np.asarray(rows, dtype=np.int32).reshape(-1)
 
 
-def part_widths(hidden, parts=len(ROTATIONS)):
+def part_widths(hidden, parts=PARTS):
     """Column widths of the parts: whole 128-lane tiles, as even as they go."""
     if hidden % LANES:
         raise ValueError(f"hidden {hidden} is not a multiple of {LANES} lanes")
@@ -202,7 +206,9 @@ def _wait(ref, sem):
 def _barrier(peers, axis, dict_ids):
     sem = pltpu.get_barrier_semaphore()
     for p in peers:
-        pl.semaphore_signal(sem, 1, device_id=_peer(p, axis, dict_ids), device_id_type=MESH)
+        pl.semaphore_signal(
+            sem, 1, device_id=_peer(p, axis, dict_ids), device_id_type=MESH
+        )
     pl.semaphore_wait(sem, len(peers))
 
 
@@ -261,7 +267,9 @@ def reduce_scatter(x, rank, table, *, axis, dict_ids=True, interpret=None, name=
         def own_copy(n):
             j, i = seq[n]
             return pltpu.make_async_copy(
-                rows_of(x_ref, at(_RS_OWN + j * 8 + i), j), tmp.at[n % 2], lsem.at[n % 2]
+                rows_of(x_ref, at(_RS_OWN + j * 8 + i), j),
+                tmp.at[n % 2],
+                lsem.at[n % 2],
             )
 
         own_copy(0).start()
@@ -305,7 +313,9 @@ def reduce_scatter(x, rank, table, *, axis, dict_ids=True, interpret=None, name=
                 for j in range(nsub):
                     if k == 2:
                         complete(j, i)
-                    _wait(slot(buf, j, _BASE[k] + i), recv.at[j * _SLOTS + _BASE[k] + i])
+                    _wait(
+                        slot(buf, j, _BASE[k] + i), recv.at[j * _SLOTS + _BASE[k] + i]
+                    )
                     add_into(slot(buf, j, i), slot(buf, j, _BASE[k] + i))
         outs = [
             pltpu.make_async_copy(slot(buf, j, 0), o_ref.at[:, pl.ds(j * W, W)], osem)
@@ -370,7 +380,9 @@ def all_gather_many(xs, rank, table, *, axis, dict_ids=True, interpret=None, nam
     r = xs[0].shape[0]
     for x in xs:
         if x.shape[0] != r or not all_gather_supports(r, x.shape[1], x.dtype):
-            raise ValueError(f"all_gather does not take {x.dtype}[{x.shape[0]}, {x.shape[1]}]")
+            raise ValueError(
+                f"all_gather does not take {x.dtype}[{x.shape[0]}, {x.shape[1]}]"
+            )
     T = CORES * r
     nsub = len(ROTATIONS)
     count = len(xs)
@@ -398,7 +410,8 @@ def all_gather_many(xs, rank, table, *, axis, dict_ids=True, interpret=None, nam
         _barrier([mate] + peers[:3], axis, dict_ids)
 
         local_in = [
-            pltpu.make_async_copy(x_refs[a], stages[a], lsem.at[a]) for a in range(count)
+            pltpu.make_async_copy(x_refs[a], stages[a], lsem.at[a])
+            for a in range(count)
         ]
         for copy in local_in:
             copy.start()
@@ -420,7 +433,9 @@ def all_gather_many(xs, rank, table, *, axis, dict_ids=True, interpret=None, nam
                         for a in range(count):
                             _wait(blk(a, block, j), recv.at[a * 7 * nsub + n])
                         for a in range(count):
-                            remote(blk(a, block, j), blk(a, block, j), msend, mrecv, mate)
+                            remote(
+                                blk(a, block, j), blk(a, block, j), msend, mrecv, mate
+                            )
                 if k < 3:
                     partner = peers[j * 3 + k]
                     for i in range(2**k):
@@ -428,7 +443,13 @@ def all_gather_many(xs, rank, table, *, axis, dict_ids=True, interpret=None, nam
                         block = at(_AG_SEND + n)
                         for a in range(count):
                             src = own(a, j) if i == 0 else blk(a, block, j)
-                            remote(src, blk(a, block, j), send, recv.at[a * 7 * nsub + n], partner)
+                            remote(
+                                src,
+                                blk(a, block, j),
+                                send,
+                                recv.at[a * 7 * nsub + n],
+                                partner,
+                            )
         local_out = []
         for a in range(count):
             local_in[a].wait()
@@ -531,10 +552,28 @@ def _matmul_reduce_scatter_vmem(rows, k, hidden):
     W = hidden // nsub
     blocks = (nsub * _SLOTS + 8 * nsub + 2) * r * W * 2
     padded_r = -(-r // 32) * 32
-    return blocks + k * hidden + CORES * padded_r * k + CORES * padded_r * LANES * 4 + 8 * hidden * 4
+    return (
+        blocks
+        + k * hidden
+        + CORES * padded_r * k
+        + CORES * padded_r * LANES * 4
+        + 8 * hidden * 4
+    )
 
 
-def matmul_reduce_scatter(x_q, x_scale, w_q, w_s, rank, table, *, axis, dict_ids=True, interpret=None, name=None):
+def matmul_reduce_scatter(
+    x_q,
+    x_scale,
+    w_q,
+    w_s,
+    rank,
+    table,
+    *,
+    axis,
+    dict_ids=True,
+    interpret=None,
+    name=None,
+):
     """This core's rows of the sum over the cores of the per-channel fp8
     projection of x, in one kernel: the projection's row blocks are computed
     in the order the rotated reduce-scatter sends them, each sent while the
@@ -574,7 +613,22 @@ def matmul_reduce_scatter(x_q, x_scale, w_q, w_s, rank, table, *, axis, dict_ids
 
         lax.fori_loop(0, r // RC, rows, 0)
 
-    def kernel(rank_ref, t_ref, xq_ref, xs_ref, w_ref, ws_ref, o_ref, buf, stage, tmp, send, recv, msend, osem):
+    def kernel(
+        rank_ref,
+        t_ref,
+        xq_ref,
+        xs_ref,
+        w_ref,
+        ws_ref,
+        o_ref,
+        buf,
+        stage,
+        tmp,
+        send,
+        recv,
+        msend,
+        osem,
+    ):
         base = rank_ref[0] * TABLE_WIDTH
 
         def at(column):
@@ -588,9 +642,14 @@ def matmul_reduce_scatter(x_q, x_scale, w_q, w_s, rank, table, *, axis, dict_ids
             def cols(b, carry):
                 cs = pl.ds(pl.multiple_of(j * W + b * CC, CC), CC)
                 y = lax.dot_general(
-                    xq, w_ref[:, cs], (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+                    xq,
+                    w_ref[:, cs],
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
                 )
-                dst[:, pl.ds(pl.multiple_of(b * CC, CC), CC)] = (y * xs * ws_ref[:, cs]).astype(jnp.bfloat16)
+                dst[:, pl.ds(pl.multiple_of(b * CC, CC), CC)] = (
+                    y * xs * ws_ref[:, cs]
+                ).astype(jnp.bfloat16)
                 return carry
 
             lax.fori_loop(0, W // CC, cols, 0)
@@ -607,7 +666,9 @@ def matmul_reduce_scatter(x_q, x_scale, w_q, w_s, rank, table, *, axis, dict_ids
         for i in _MATE_ORDER:
             for j in range(nsub):
                 project(stage.at[n], at(_RS_TO_MATE + j * 8 + i), j)
-                remote(stage.at[n], slot(buf, j, i), msend, recv.at[j * _SLOTS + i], mate)
+                remote(
+                    stage.at[n], slot(buf, j, i), msend, recv.at[j * _SLOTS + i], mate
+                )
                 n += 1
 
         done = []
@@ -637,7 +698,9 @@ def matmul_reduce_scatter(x_q, x_scale, w_q, w_s, rank, table, *, axis, dict_ids
                 for j in range(nsub):
                     if k == 2:
                         complete(j, i)
-                    _wait(slot(buf, j, _BASE[k] + i), recv.at[j * _SLOTS + _BASE[k] + i])
+                    _wait(
+                        slot(buf, j, _BASE[k] + i), recv.at[j * _SLOTS + _BASE[k] + i]
+                    )
                     add_into(slot(buf, j, i), slot(buf, j, _BASE[k] + i))
         outs = [
             pltpu.make_async_copy(slot(buf, j, 0), o_ref.at[:, pl.ds(j * W, W)], osem)
@@ -689,7 +752,9 @@ def matmul_reduce_scatter(x_q, x_scale, w_q, w_s, rank, table, *, axis, dict_ids
     )
 
 
-def matmul_reduce_scatter_chunks(x_q, x_scale, w_q, w_s, rank, table, *, axis, chunk, dict_ids=True):
+def matmul_reduce_scatter_chunks(
+    x_q, x_scale, w_q, w_s, rank, table, *, axis, chunk, dict_ids=True
+):
     """One matmul_reduce_scatter per `chunk`-row chunk of the core's quantized
     activations, the outputs in chunk order: the per-chunk reduce-scatter of
     ``xla_quantized_matmul``, concatenated."""

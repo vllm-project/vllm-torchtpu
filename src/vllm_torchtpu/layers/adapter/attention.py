@@ -151,6 +151,31 @@ def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
     return is_backbone and num_tokens > envs.bucket_gate_edge(min_tokens)
 
 
+def uses_query_replication(impl, q_dcp_replicated, topk_indices) -> bool:
+    """Whether the backend ``impl`` attends the whole DCP group's heads that
+    query replication hands it, so the sparse DCP path skips its per-step q
+    all-gather. That path is the only consumer, hence the `topk_indices`
+    term. ``impl.dcp_size`` is read only when a replicated query is given."""
+    return (
+        q_dcp_replicated is not None and topk_indices is not None and impl.dcp_size > 1
+    )
+
+
+def uv_before_merge_runs(layer, num_tokens: int, use_qrep: bool) -> bool:
+    """Whether the backend applies W_UV ahead of the DCP merge on this bucket
+    (TPU_DCP_MLA_UV_BEFORE_MERGE under query replication), and so returns the
+    projected [T, heads * v_head_dim] instead of the latent. A caller that
+    asks for the latent (TPU_FUSED_UV_OPROJ's skip_uv) must not ask for it
+    on such a bucket."""
+    is_backbone = vllm_compilation_backends.model_tag == "backbone"
+    return (
+        use_qrep
+        and getattr(layer, "W_UV_dcp_qrep", None) is not None
+        and (not envs.TPU_MTP_DCP_MERGE_SIZED or is_backbone)
+        and _uv_before_merge_applies(num_tokens, is_backbone)
+    )
+
+
 def _keep_input_fn(a: jax.Array, b: jax.Array) -> jax.Array:
     del b
     return a
@@ -2872,16 +2897,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
-        # Query replication hands us the whole DCP group's heads already, so
-        # the sparse DCP path below can skip its per-step q all-gather. It is
-        # the only consumer, hence the `topk_indices` term.
-        use_qrep = (
-            q_dcp_replicated is not None
-            and self.dcp_size > 1
-            and topk_indices is not None
-        )
+        use_qrep = uses_query_replication(self, q_dcp_replicated, topk_indices)
         q_rope_table: list[torch.Tensor] = []
         if use_qrep:
+            assert q_dcp_replicated is not None
             assert layer.W_UK_T_dcp_qrep is not None, (
                 "q_dcp_replicated was passed but W_UK_T_dcp_qrep was never "
                 "built; `process_weights_after_loading` must run first."
@@ -2899,17 +2918,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Not in the MTP drafter under TPU_MTP_DCP_MERGE_SIZED: the drafter's
         # projected partial stays f32, and the sized merge only takes a 2-byte
         # partial, so it would silently fall back to the f32 reduce-scatter.
-        uv_first = (
-            use_qrep
-            and getattr(layer, "W_UV_dcp_qrep", None) is not None
-            and (
-                not envs.TPU_MTP_DCP_MERGE_SIZED
-                or vllm_compilation_backends.model_tag == "backbone"
-            )
-            and _uv_before_merge_applies(
-                q_nope.shape[0], vllm_compilation_backends.model_tag == "backbone"
-            )
-        )
+        uv_first = uv_before_merge_runs(layer, q_nope.shape[0], use_qrep)
 
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
@@ -3191,6 +3200,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
+        assert not (uv_first and kwargs.get("skip_uv")), (
+            "skip_uv asks for the merged latent on a bucket that applies W_UV "
+            "before the merge (TPU_FUSED_UV_OPROJ with TPU_DCP_MLA_UV_BEFORE_MERGE)"
+        )
         if uv_first:
             outputs = outputs.to(input_dtype).reshape(
                 -1, layer.num_heads * layer.v_head_dim

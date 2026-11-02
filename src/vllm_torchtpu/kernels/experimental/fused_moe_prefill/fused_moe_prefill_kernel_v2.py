@@ -460,6 +460,7 @@ def build_expert_kernel(
                 )
             ]
         else:
+            assert shared_w2_vmem is not None
             sw2_dst = (
                 shared_w2_vmem if kp_s == i_s else shared_w2_vmem.at[pl.ds(0, i_s)]
             )
@@ -647,6 +648,7 @@ def build_expert_kernel(
             assert row_token_sm is not None and sums_vmem is not None
 
             def add_row(r, carry):
+                assert sums_vmem is not None  # pyrefly drops the narrowing on `+=`
                 token = row_token_sm[start + r]
                 if coeff_sm is None:
                     sums_vmem[token] += out_vmem[parity, r].astype(jnp.float32)
@@ -971,6 +973,7 @@ def build_expert_kernel(
                 (nb, kp - i, stage_cols), w2_ring.dtype
             )
         if kp_s != i_s and not two_phase:
+            assert shared_w2_vmem is not None
             shared_w2_vmem[pl.ds(i_s, kp_s - i_s), :] = jnp.zeros(
                 (kp_s - i_s, h), shared_w2_vmem.dtype
             )
@@ -1162,13 +1165,15 @@ def build_expert_kernel(
                     # allocated here (inside this copy's run_scoped), shared by both
                     # parity branches
                     down_accs[rows] = down_accumulators(rows, nt)
+                # the other slot; rows are only ever added with a static stage
+                added_slot = None if stage is None else 1 - stage
                 act_scale = _tile_row_scales(act_scale_vmem[aslot], start, rows)
                 if xmxu:  # Mosaic refuses explicit MXU ops beside a dot in one program
                     acc1 = gateup_xmxu(
                         rows,
                         build_lhs(rows, as_blocks=True),
                         w1,
-                        gateup_adds(added_rows, 1 - stage)
+                        gateup_adds(added_rows, added_slot)
                         if added_rows
                         else lambda k: None,
                     )
@@ -1182,7 +1187,7 @@ def build_expert_kernel(
                     )
                     if added_rows:
                         add_staged_rows(
-                            extra[0], staged_batches(added_rows), 1 - stage, extra[1]
+                            extra[0], staged_batches(added_rows), added_slot, extra[1]
                         )
                 if two_phase:
                     assert mid_vmem is not None
@@ -1294,7 +1299,7 @@ def build_expert_kernel(
 
             if overlap_adds:
                 covered = jnp.where(is_shared(v), 0, _cdiv(live, rung_step) * rung_step)
-                add_left_rows(*extra, covered, 1 - p)
+                add_left_rows(extra[0], extra[1], covered, 1 - p)
 
             for r, rows in enumerate(rungs):
                 below = rungs[r - 1] if r else 0
@@ -1696,7 +1701,12 @@ def combine(
         rows = slice(c * chunk, (c + 1) * chunk)
         if fused:
             y = combine_scatter.combine_scatter(
-                slab, coeff[rows], slab_row[rows], rank, jnp.asarray(cs_table), axis=axis_name
+                slab,
+                coeff[rows],
+                slab_row[rows],
+                rank,
+                jnp.asarray(cs_table),
+                axis=axis_name,
             )
             if outs:
                 y, _ = lax.optimization_barrier((y, outs[-1]))
@@ -1720,9 +1730,7 @@ def combine(
         if scatter and c == chunks - 1:
             outs.append(reduce_scatter_rows(y, axis_name, rank, rs_table))
         elif scatter:
-            outs.append(
-                lax.psum_scatter(y, axis_name, scatter_dimension=0, tiled=True)
-            )
+            outs.append(lax.psum_scatter(y, axis_name, scatter_dimension=0, tiled=True))
         else:
             # Reduce-scatter + all-gather, not one all-reduce of the chunk (#2196).
             outs.append(_psum_rows(y, axis_name))
@@ -1802,7 +1810,9 @@ def fused_moe_prefill(
     combine chunk's reduce-scatter, or the one after an in-kernel sum, runs as
     rotated_collectives.reduce_scatter (TPU_MOE_PREFILL_ROTATED_COLLECTIVES)."""
     if core_major and not scatter:
-        raise ValueError("core-major rows are only reduce-scattered back to their cores")
+        raise ValueError(
+            "core-major rows are only reduce-scattered back to their cores"
+        )
     if rs_table is not None and (not core_major or rank is None):
         raise ValueError("the rotated reduce-scatter needs core-major rows and a rank")
     if x_q is None:
@@ -1906,18 +1916,21 @@ def fused_moe_prefill(
     row_token = jnp.pad(row_token, (0, token_rows - row_token.shape[0]))
     args = [visit_expert, visit_start, visit_rows, (routed_visits + 1).reshape(1)]
     if sum_cols:
+        assert sorted_coeff is not None
         row_coeff = jnp.concatenate([sorted_coeff, gate.reshape(-1)])
-    if sum_cols == h:
-        row_coeff = jnp.pad(row_coeff, (0, scale_rows * _LANES - row_coeff.shape[0]))
-        args += [
-            row_token,
-            x_q,
-            row_scale.reshape(-1, _LANES),
-            row_coeff.reshape(-1, _LANES),
-        ]
-    elif sum_cols:
-        row_coeff = jnp.pad(row_coeff, (0, token_rows - row_coeff.shape[0]))
-        args += [row_token, row_coeff, x_q, row_scale.reshape(-1, _LANES)]
+        if sum_cols == h:
+            row_coeff = jnp.pad(
+                row_coeff, (0, scale_rows * _LANES - row_coeff.shape[0])
+            )
+            args += [
+                row_token,
+                x_q,
+                row_scale.reshape(-1, _LANES),
+                row_coeff.reshape(-1, _LANES),
+            ]
+        else:
+            row_coeff = jnp.pad(row_coeff, (0, token_rows - row_coeff.shape[0]))
+            args += [row_token, row_coeff, x_q, row_scale.reshape(-1, _LANES)]
     elif issue == "inline" or resident_tokens:
         args += [row_token, x_q, row_scale.reshape(-1, _LANES)]
     else:

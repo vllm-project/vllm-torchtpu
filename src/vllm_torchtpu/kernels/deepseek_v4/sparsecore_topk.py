@@ -1209,9 +1209,10 @@ def _one_subcore_when_rows_fit(
         lengths = lengths_vmem[pl.ds(i * LANES, LANES)]
         return count + plsc.all_reduce_population_count(lengths > capacity)[0]
 
-    long_rows = plsc.parallel_loop(
-        0, num_rows // LANES, unroll=2, carry=jnp.int32(0)
-    )(count_long_rows)  # pytype: disable=bad-argument-type
+    long_rows = plsc.parallel_loop(0, num_rows // LANES, unroll=2, carry=jnp.int32(0))(
+        # pyrefly: ignore[bad-argument-type]
+        count_long_rows
+    )  # pytype: disable=bad-argument-type
 
     def run(body):
         body(scores_hbm, lengths_hbm, *refs, lengths_vmem=lengths_vmem)

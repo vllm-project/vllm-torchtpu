@@ -53,7 +53,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import COMBINE_CHUNK, COMBINE_GRO
 CORES = rc.CORES
 PARTS = len(rc.ROTATIONS)
 LANES = rc.LANES
-# Barrier semaphore group of this kernel; rotated_collectives uses 15, row_all_gather 17.
+# Barrier semaphore group of this kernel; rotated_collectives uses 15 and
+# row_all_gather 17.
 COLLECTIVE_ID = 19
 CHIP_ORDER = (7, 6, 5, 3, 4, 2, 1, 0)
 AXIS_BIT = {"x": 1, "y": 2, "z": 4}
@@ -85,7 +86,9 @@ def scatter_table(places):
     for m in range(CORES):
         coords, core = layout.places[m]
         mate = layout.peer(m, "c")
-        partners = [layout.peer(m, order[k]) for order in rc.ROTATIONS for k in range(3)]
+        partners = [
+            layout.peer(m, order[k]) for order in rc.ROTATIONS for k in range(3)
+        ]
         blocks = []
         for half in (1 - core, core):
             for offset in CHIP_ORDER:
@@ -124,7 +127,9 @@ def build(*, tokens, topk, hidden, axis, interpret=False):
     """The kernel for one combine chunk of `tokens` tokens: (slab, coeff [tokens,
     topk], slab_row [tokens, topk], rank int32 [1], table) -> [tokens / 16,
     hidden] bf16, this core's rows of the chunk summed over the cores."""
-    tb, parities, lead = plan(tokens, hidden)
+    planned = plan(tokens, hidden)
+    assert planned is not None, (tokens, hidden)
+    tb, parities, lead = planned
     r = tokens // CORES
     W = hidden // PARTS
     spb = r // tb
@@ -188,7 +193,10 @@ def build(*, tokens, topk, hidden, axis, interpret=False):
         def step_token(g):
             """First token in the chunk of global combine step g."""
             position = g // spb
-            return at(_BLOCK + position % 2 * len(CHIP_ORDER) + position // 2) * r + g % spb * tb
+            return (
+                at(_BLOCK + position % 2 * len(CHIP_ORDER) + position // 2) * r
+                + g % spb * tb
+            )
 
         def start_row(pidx, parity, i, k):
             pltpu.make_async_copy(
@@ -217,13 +225,18 @@ def build(*, tokens, topk, hidden, axis, interpret=False):
                             * coef_sm[pb + (u * topk + k)]
                         )
                         acc = term if acc is None else acc + term
+                    assert acc is not None  # topk >= 1
                     tile_vm[r0 + u] = acc.astype(jnp.bfloat16)
                 return pn + ch * topk, pb + ch * topk, r0 + ch
 
-            lax.fori_loop(0, tb // ch, one_chunk, (nxt * topk, first * topk, jnp.int32(0)))
+            lax.fori_loop(
+                0, tb // ch, one_chunk, (nxt * topk, first * topk, jnp.int32(0))
+            )
             for grp in range(tb // gt):
                 row = pl.multiple_of(sub * tb + grp * gt, gt)
-                blk_vm[half, pl.ds(row, gt)] = tile_vm[pl.ds(grp * gt, gt)].reshape(gt, hidden)
+                blk_vm[half, pl.ds(row, gt)] = tile_vm[pl.ds(grp * gt, gt)].reshape(
+                    gt, hidden
+                )
 
         def combine_block(position, half):
             """Combine the block at `position` into blk_vm[half]."""
@@ -247,7 +260,13 @@ def build(*, tokens, topk, hidden, axis, interpret=False):
             combine_block(2 * t, 0)
             for j in range(PARTS):
                 i = at(_SLOT + t * PARTS + j)
-                remote(part(blk_vm.at[0], j), slot(buf, j, i), msend, recv.at[j * SLOTS + i], mate)
+                remote(
+                    part(blk_vm.at[0], j),
+                    slot(buf, j, i),
+                    msend,
+                    recv.at[j * SLOTS + i],
+                    mate,
+                )
             combine_block(2 * t + 1, 1)
             for j in range(PARTS):
                 i = at(_SLOT + t * PARTS + j)
@@ -259,12 +278,18 @@ def build(*, tokens, topk, hidden, axis, interpret=False):
                     partner = at(_PARTNER + j * 3 + k)
 
                     @pl.when((alive == 1) & (bit == 1))
-                    def _():
+                    def _(*, i=i, j=j, k=k, partner=partner):
                         dst = BASE[k] + i - 2**k
-                        remote(slot(buf, j, i), slot(buf, j, dst), send, recv.at[j * SLOTS + dst], partner)
+                        remote(
+                            slot(buf, j, i),
+                            slot(buf, j, dst),
+                            send,
+                            recv.at[j * SLOTS + dst],
+                            partner,
+                        )
 
                     @pl.when((alive == 1) & (bit == 0))
-                    def _():
+                    def _(*, i=i, j=j, k=k):
                         s = BASE[k] + i
                         rc._wait(slot(buf, j, s), recv.at[j * SLOTS + s])
                         add_into(slot(buf, j, i), slot(buf, j, s))
@@ -279,7 +304,8 @@ def build(*, tokens, topk, hidden, axis, interpret=False):
                     start_row((first + u) * topk + k, p, u, k)
         lax.fori_loop(0, len(CHIP_ORDER), one_offset, 0)
         outs = [
-            pltpu.make_async_copy(slot(buf, j, 0), part(o_ref, j), osem) for j in range(PARTS)
+            pltpu.make_async_copy(slot(buf, j, 0), part(o_ref, j), osem)
+            for j in range(PARTS)
         ]
         for c in outs:
             c.start()
@@ -291,11 +317,13 @@ def build(*, tokens, topk, hidden, axis, interpret=False):
             c.wait()
 
     need = 2 * (
-        PARTS * SLOTS * r * W + 2 * r * hidden + parities * topk * tb * hidden + tb * hidden
+        PARTS * SLOTS * r * W
+        + 2 * r * hidden
+        + parities * topk * tb * hidden
+        + tb * hidden
     )
     info = pltpu.get_tpu_info() if not interpret else None
     limit = v2_host.vmem_limit(info) if not interpret else 63 << 20
-    kw = {"interpret": pltpu.InterpretParams()} if interpret else {}
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -322,7 +350,7 @@ def build(*, tokens, topk, hidden, axis, interpret=False):
             disable_bounds_checks=True,
         ),
         name=f"moe_combine_scatter_t{tokens}_k{topk}_b{tb}",
-        **kw,
+        interpret=pltpu.InterpretParams() if interpret else False,
     )
 
     def fn(slab, coeff, slab_row, rank, table):
@@ -345,6 +373,6 @@ def combine_scatter(slab, coeff, slab_row, rank, table, *, axis, interpret=False
     [tokens, topk], rank int32 [1], table `scatter_table`."""
     tokens, topk = slab_row.shape
     hidden = slab.shape[1] * slab.shape[2]
-    return build(tokens=tokens, topk=topk, hidden=hidden, axis=axis, interpret=interpret)(
-        slab, coeff, slab_row, rank, table
-    )
+    return build(
+        tokens=tokens, topk=topk, hidden=hidden, axis=axis, interpret=interpret
+    )(slab, coeff, slab_row, rank, table)

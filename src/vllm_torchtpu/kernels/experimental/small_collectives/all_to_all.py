@@ -253,8 +253,11 @@ def small_all_to_all(
     data_lane = lane_axis is not None and lane is not None
     merge = merge_live is not None
     sized = live_rows is not None
+    tl = chunks = part_row = 0  # merge mode only
     if merge:
-        tl = block - (merge_row or 0)
+        if merge_row is None:
+            raise ValueError("merge mode (merge_live) needs merge_row")
+        tl = block - merge_row
         if not (
             x.dtype.itemsize == 2
             and row0 < merge_row < block
@@ -269,6 +272,7 @@ def small_all_to_all(
                 f"{merge_row} / {n} cores / V {vdim} has no in-kernel merge layout"
             )
         chunks = tl // MERGE_CHUNK_ROWS
+        part_row = merge_row - row0
 
     def kernel(*refs):
         refs = list(refs)
@@ -279,8 +283,10 @@ def small_all_to_all(
             my_lane = refs.pop(0)[0]
         else:
             my_lane = lax.axis_index(lane_axis)
+        live = 0  # merge mode only
         if merge:
             live = jnp.clip(refs.pop(0)[0], 0, tl)
+        sizes = []  # sized only
         if sized:
             end = live_row0 + refs.pop(0)[0]
             sizes = live_sizes(jnp.clip((end - row0 + 7) & -8, 8, rows), rows)
@@ -289,6 +295,7 @@ def small_all_to_all(
             send_sem, recv_sem, local_sem, out_sem = sems
         else:
             x_ref, o_ref, send_sem, recv_sem, local_sem = refs
+            recv_ref = w_ref = None  # merge mode's scratch
 
         def peer(j):
             ids = {axis: jnp.int32(j)}
@@ -303,6 +310,7 @@ def small_all_to_all(
         def slot(size):
             """Rows ``[row0, row0 + size)`` of slot ``me``."""
             if merge:
+                assert recv_ref is not None
                 if size == rows:
                     return recv_ref.at[me]
                 return recv_ref.at[me, pl.ds(0, size)]
@@ -331,6 +339,7 @@ def small_all_to_all(
         def span(copies, size):
             """A ref of ``copies`` copies of ``size`` rows, for byte counts."""
             if merge:
+                assert recv_ref is not None
                 if size == rows:
                     return recv_ref.at[pl.ds(0, copies)]
                 return recv_ref.at[pl.ds(0, copies), pl.ds(0, size)]
@@ -379,9 +388,7 @@ def small_all_to_all(
         else:
             local.wait()
         if merge:
-            merge_weights(
-                recv_ref, w_ref, num_cores=n, word_row=merge_row - 1 - row0, tl=tl
-            )
+            merge_weights(recv_ref, w_ref, num_cores=n, word_row=part_row - 1, tl=tl)
             for c in range(chunks):
 
                 @pl.when(c * MERGE_CHUNK_ROWS < live)
@@ -393,7 +400,7 @@ def small_all_to_all(
                             c,
                             live,
                             num_cores=n,
-                            part_row=merge_row - row0,
+                            part_row=part_row,
                         )
                     )
                     chunk_out(c).start()
