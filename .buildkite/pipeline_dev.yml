@@ -92,7 +92,7 @@ steps:
   # -----------------------------------------------------------------
   - label: "[demo] offline_inference.py (Qwen3-0.6B)"
     key: demo_offline_inference
-    if: 'build.env("K3_PD_CONFIG") == null'
+    if: 'build.env("K3_PD_CONFIG") == null && build.env("K3_BENCH_COMMANDS") == null'
     depends_on: build_docker
     agents:
       queue: "kube"
@@ -120,7 +120,7 @@ steps:
   # -----------------------------------------------------------------
   - label: "[demo] pytest one file"
     key: demo_pytest
-    if: 'build.env("K3_PD_CONFIG") == null'
+    if: 'build.env("K3_PD_CONFIG") == null && build.env("K3_BENCH_COMMANDS") == null'
     depends_on: build_docker
     agents:
       queue: "kube"
@@ -146,7 +146,7 @@ steps:
   # -----------------------------------------------------------------
   - label: "[demo] stress: pytest one file (run {{matrix}})"
     key: demo_stress
-    if: 'build.env("K3_PD_CONFIG") == null'
+    if: 'build.env("K3_PD_CONFIG") == null && build.env("K3_BENCH_COMMANDS") == null'
     depends_on: build_docker
     agents:
       queue: "kube"
@@ -193,7 +193,7 @@ steps:
   # Publishes K3_ENGINE_IMAGE, which common.sh hands the manifest.
   - label: ":docker: Build Kimi-K3 megakernel engine image"
     key: k3_engine_image
-    if: 'build.env("K3_PD_CONFIG") != null'
+    if: 'build.env("K3_PD_CONFIG") != null || build.env("K3_BENCH_COMMANDS") != null'
     agents:
       queue: cpu_64_core
     commands:
@@ -202,7 +202,7 @@ steps:
 
   - label: ":tpu: Perf: Kimi-K3 AgentX 1P1D ${K3_PD_CONFIG} (TPU v7x 2x2x4 x2)"
     key: k3_mk_agentx_1p1d
-    if: 'build.env("K3_PD_CONFIG") != null && build.env("K3_PD_CONFIG") !~ /^kimi-k3-megakernel-agg\//'
+    if: 'build.env("K3_PD_CONFIG") != null && build.env("K3_PD_CONFIG") !~ /^kimi-k3-megakernel-agg\// && build.env("K3_BENCH_COMMANDS") == null'
     depends_on:
       - build_docker
       - k3_engine_image
@@ -241,7 +241,7 @@ steps:
   # kimi-k3-megakernel-agg/ point; the engine image comes from K3_ENGINE_REF.
   - label: ":tpu: Perf: Kimi-K3 AgentX aggregate ${K3_PD_CONFIG} (TPU v7x 2x2x4)"
     key: k3_mk_agentx_agg
-    if: 'build.env("K3_PD_CONFIG") =~ /^kimi-k3-megakernel-agg\//'
+    if: 'build.env("K3_PD_CONFIG") =~ /^kimi-k3-megakernel-agg\// && build.env("K3_BENCH_COMMANDS") == null'
     depends_on:
       - build_docker
       - k3_engine_image
@@ -259,3 +259,35 @@ steps:
         test -f "scripts/vllm/benchmarking/configs/$${K3_PD_CONFIG}.sh" \
           || { echo "no such config: $${K3_PD_CONFIG}" >&2; exit 2; }
       - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-agg.yaml
+
+  # -----------------------------------------------------------------
+  # Kimi-K3 megakernel kernel bench, on a build that sets K3_BENCH_COMMANDS
+  # The engine image's tools.megakernel on one tpu7x 2x2x4 slice: four pods of
+  # eight TP32 ranks (kimi-k3-kernel-bench.yaml, k3_bench_pod.sh). The AgentX
+  # steps above skip on such a build. Variables:
+  #   K3_BENCH_COMMANDS  ";;"-separated tools.megakernel argument lines, e.g.
+  #                      "--kv-cache-dtype fp8 --set attention_dp=2 bench decode
+  #                      --contexts 131072 --batches 64,128"; @OUT@ is the
+  #                      results directory
+  #   K3_ENGINE_REF      the engine commit (the variant under test)
+  #   K3_BENCH_LIBTPU    flags appended to LIBTPU_INIT_ARGS (optional)
+  #   K3_BENCH_FRESH     1: compile every command afresh (optional)
+  # Results (results-cmd*.jsonl, saved tokens, rank-0 logs) are the artifacts.
+  # -----------------------------------------------------------------
+  - label: ":tpu: Bench: Kimi-K3 megakernel kernels (TPU v7x 2x2x4)"
+    key: k3_kernel_bench
+    if: 'build.env("K3_BENCH_COMMANDS") != null'
+    depends_on:
+      - build_docker
+      - k3_engine_image
+    timeout_in_minutes: 480
+    env:
+      ARTIFACTS_DIR: "perf_eval_results"
+      WORKLOAD_PRIORITY: "post-merge"
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-kernel-bench.yaml

@@ -1,0 +1,119 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kimi-K3 megakernel kernel bench: the engine image's tools.megakernel on one
+# 2x2x4 slice, four pods of eight TP32 ranks (k3_bench_pod.sh), running the
+# build's K3_BENCH_COMMANDS. ${WORKLOAD_NAME}, ${IMAGE} and ${K3_ENGINE_IMAGE}
+# are substituted before submission, a literal dollar is $$, and the pods run
+# this commit's .buildkite/kubernetes.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    tpu-ci.google.com/defaults: standard
+    # No fleet caches: the bench streams the TP32 pre-shard itself.
+    tpu-ci.google.com/caches: "none"
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  # <jobset>-bench-0-<index> under a headless service named for the JobSet.
+  network:
+    enableDNSHostnames: true
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - bench
+  replicatedJobs:
+    - name: bench
+      groupName: bench
+      replicas: 1
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          completionMode: Indexed
+          activeDeadlineSeconds: 21600
+          backoffLimit: 0
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x4
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              # This commit's lane scripts, for the engine image.
+              initContainers:
+                - name: lane-scripts
+                  image: ${IMAGE}
+                  command: ["/bin/sh", "-c", "cp -a /workspace/vllm-torchtpu/.buildkite/kubernetes /lane/kubernetes"]
+                  volumeMounts:
+                    - name: lane-scripts
+                      mountPath: /lane
+              containers:
+                - name: workload
+                  image: ${K3_ENGINE_IMAGE}
+                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_bench_pod.sh"]
+                  env:
+                    # Host i is <prefix>i.<domain>.
+                    - name: ROLE_HOST_PREFIX
+                      value: ${WORKLOAD_NAME}-bench-0-
+                    - name: ROLE_HOST_DOMAIN
+                      value: ${WORKLOAD_NAME}
+                    - name: NUM_HOSTS
+                      value: "4"
+                    - name: ARTIFACTS_DIR
+                      value: perf_eval_results
+                    - name: TPU_ACCELERATOR_TYPE
+                      value: tpu7x
+                    - name: TMPDIR
+                      value: /dev/shm
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                    requests:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: lane-scripts
+                      mountPath: /workspace/vllm-torchtpu/.buildkite/kubernetes
+                      subPath: kubernetes
+                    - name: k3-presharded
+                      mountPath: /cache/hf/hub/presharded/kimi-k3-tp32
+                      readOnly: true
+                    - name: k3-dspark-mla
+                      mountPath: /cache/hf/hub/models--Inferact--Kimi-K3-DSpark
+                      readOnly: true
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 300Gi
+                - name: lane-scripts
+                  emptyDir: {}
+                - name: k3-presharded
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=presharded/kimi-k3-tp32,read_ahead_kb=131072"
+                      skipCSIBucketAccessCheck: "true"
+                # The MLA DSpark speculator (--dspark <mount>/snapshots/<rev>).
+                - name: k3-dspark-mla
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=models--Inferact--Kimi-K3-DSpark"
+                      skipCSIBucketAccessCheck: "true"
