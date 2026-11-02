@@ -440,14 +440,27 @@ def _derive_pcp_ragged_exchange_descriptors(
     return jax.vmap(_summarize_rank)(rank_major, valid, run_starts, run_ids)
 
 
+# Chips with compile and numerical coverage for the explicit ragged-exchange
+# layout below, which pins (8, 128) tiles. Gate on the chip rather than the
+# generation, so an unvalidated chip of a validated generation (TPU 8t) stays
+# rejected.
+_VALIDATED_PCP_RAGGED_EXCHANGE_CHIPS = frozenset(
+    {
+        pltpu.ChipVersion.TPU_7,
+        pltpu.ChipVersion.TPU_7X,
+        pltpu.ChipVersion.TPU_8I,
+    }
+)
+
+
 def _validate_pcp_ragged_exchange_layout_support() -> None:
-    generation = pltpu.get_tpu_info().generation
-    # TODO: Validate this explicit tiled layout on TPU v4/v5e/v6 and relax
-    # this guard once compile and numerical coverage exists for those targets.
-    if generation != 7:
+    chip_version = pltpu.get_tpu_info().chip_version
+    # TODO: Validate this explicit tiled layout on other TPU chips and extend
+    # the allowlist once compile and numerical coverage exists for them.
+    if chip_version not in _VALIDATED_PCP_RAGGED_EXCHANGE_CHIPS:
         raise NotImplementedError(
-            "GDN PCP ragged exchange layout is only validated on TPU "
-            f"generation 7, got generation {generation}."
+            "GDN PCP ragged exchange layout is only validated on TPU 7, 7x, "
+            f"and 8i, got TPU {chip_version}."
         )
 
 
@@ -1059,6 +1072,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         raise ValueError(
             f"pcp_size={pcp_size} does not match mesh axis size {mesh.shape[pcp_axis]}."
         )
+    # The fused projection path (gdn_pcp_fused) pins the same (8, 128) tiles
+    # as the ragged exchange, but does not go through that exchange.
+    _validate_pcp_ragged_exchange_layout_support()
     geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
     local_n_v = geometry.local_num_v_heads
     local_conv_dim = geometry.local_conv_dim(d_k, d_v)
