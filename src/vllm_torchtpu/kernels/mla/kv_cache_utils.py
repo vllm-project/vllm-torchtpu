@@ -243,10 +243,13 @@ def pack_tokens(values: jax.Array, token_bytes: int) -> jax.Array:
         f"token_bytes ({token_bytes}) must be a multiple of {WORD_BYTES}"
     )
     u8 = as_token_bytes(values, token_bytes)
-    bands = u8.reshape(u8.shape[0], WORD_BYTES, token_bytes // WORD_BYTES).astype(
-        jnp.uint32
-    )
-    return bands[:, 0] | (bands[:, 1] << 8) | (bands[:, 2] << 16) | (bands[:, 3] << 24)
+    band = token_bytes // WORD_BYTES
+    # Lane slices of the byte row, not a [T, WORD_BYTES, band] reshape: the
+    # same words, built by one lane-dense fusion instead of a relayout per band.
+    words = u8[:, :band].astype(jnp.uint32)
+    for b in range(1, WORD_BYTES):
+        words |= u8[:, b * band : (b + 1) * band].astype(jnp.uint32) << (8 * b)
+    return words
 
 
 def _row_positions(
