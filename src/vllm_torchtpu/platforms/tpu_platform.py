@@ -861,7 +861,9 @@ class TpuPlatform(Platform):
                     f"--attention-backend {selected_backend.name.lower()} resolves "
                     f"to {backend.__qualname__}, not a PallasAttentionBackend."
                 )
-        elif _is_turboquant_cache_dtype(cache_dtype):
+        elif _is_turboquant_cache_dtype(cache_dtype) and (
+            vllm_config.model_config is None or not vllm_config.model_config.use_mla
+        ):
             from vllm_torchtpu.layers.adapter.turboquant_attention import (
                 PallasTurboQuantAttentionBackend,
             )
