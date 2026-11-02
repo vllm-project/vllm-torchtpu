@@ -620,7 +620,9 @@ def prefetch(st, w, after, gather="allgather"):
     """Gather a layer's o_proj / W_UV / o_proj scale shards, starting once
     `after` exists: one all-gather (offloaded to the SparseCores) or
     collective-permutes around a ring of the slice (TensorCore DMAs)."""
-    ring = ro.ring_order(st.mesh.devices.reshape(-1))
+    ring = None
+    if set(ro.GATHERS[gather]) - {"ag"}:
+        ring = ro.ring_order(st.mesh.devices.reshape(-1))
 
     def local(wo, uv, so, after):
         return ro.gather_shards(wo, uv, so[0], after, AX, gather, ring)
