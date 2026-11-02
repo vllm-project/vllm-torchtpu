@@ -77,6 +77,7 @@ def _build(
     num_blocks: int = 64,
     max_num_seqs: int = 8,
     max_num_batched_tokens: int = 128,
+    long_prefill_token_threshold: int = 0,
     policy: str = "fcfs",
 ):
     monkeypatch.setenv("VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", str(over_tokens))
@@ -89,6 +90,7 @@ def _build(
             max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=2048,
             enable_chunked_prefill=True,
+            long_prefill_token_threshold=long_prefill_token_threshold,
             is_encoder_decoder=False,
             watermark=0.0,
             async_scheduling=True,
@@ -290,6 +292,18 @@ def test_no_solo_step_until_the_prompt_fits(shared_model_config, monkeypatch):
 def test_rejects_a_threshold_at_the_step_budget(shared_model_config, monkeypatch):
     with pytest.raises(ValueError, match="step budget"):
         _build(shared_model_config, monkeypatch, over_tokens=128)
+
+
+def test_rejects_a_long_prefill_threshold_that_splits_solo_prompts(
+    shared_model_config, monkeypatch
+):
+    with pytest.raises(ValueError, match="long_prefill_token_threshold"):
+        _build(
+            shared_model_config,
+            monkeypatch,
+            over_tokens=32,
+            long_prefill_token_threshold=64,
+        )
 
 
 def test_needs_a_policy(shared_model_config, monkeypatch):

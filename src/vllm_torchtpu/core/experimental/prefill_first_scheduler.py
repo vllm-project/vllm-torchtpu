@@ -129,6 +129,16 @@ class PrefillFirstScheduler(AsyncScheduler):
                 f"be below the step budget ({self.max_solo_tokens}); raise "
                 "--max-num-batched-tokens to the longest prompt served."
             )
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < self.max_solo_tokens:
+            # It caps a step's chunk of a prompt whenever another request
+            # waits, which would split a solo prompt.
+            raise ValueError(
+                f"long_prefill_token_threshold ({threshold}) would split solo "
+                f"prompts of up to {self.max_solo_tokens} tokens; set it to 0 "
+                "(vLLM sets it when max_num_partial_prefills > 1) or to at "
+                "least the step budget."
+            )
         if self.solo_max_consecutive and self.solo_decode_steps < 1:
             raise ValueError(
                 "VLLM_TPU_SOLO_PREFILL_DECODE_STEPS must be at least 1 when "
