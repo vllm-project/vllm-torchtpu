@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections.abc import Mapping
 from typing import Any
 from unittest import mock
 
@@ -52,6 +53,9 @@ if args[:2] == ["pipeline", "upload"]:
     if "--dry-run" in args:
         if os.environ.get("TEST_DRY_RUN_FAIL") == "1":
             sys.exit(1)
+        if "TEST_DRY_RUN_RAW" in os.environ:
+            sys.stdout.write(os.environ["TEST_DRY_RUN_RAW"])
+            sys.exit(0)
         doc = yaml.safe_load(content) or {}
         clean = {k: v for k, v in doc.items() if not k.startswith("x-")}
         json.dump(clean, sys.stdout)
@@ -431,6 +435,211 @@ class TestBootstrapUnits(unittest.TestCase):
             )
             self.assertEqual(uploads[1]["args"], [])
             self.assertTrue(uploads[1]["content"].startswith("priority: 9\n"))
+
+            # Non-dict / malformed dry-run JSON also warns and falls back uncapped.
+            for raw_bad in (
+                "{not-json",
+                "[1, 2]",
+                '{"steps": [{"agents": {"queue": "kube"}, "env": ["bad"]}]}',
+            ):
+                cmd = f'source "{config_sh}" && upload_with_priority "{sample_yaml}" 7'
+                bad_run = subprocess.run(
+                    ["bash", "-c", cmd],
+                    cwd=tmp_path,
+                    env={**env, "TEST_DRY_RUN_RAW": raw_bad},
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("WARNING: could not put", bad_run.stderr)
+
+            # _load_pipeline_config tolerates trailing comments and names missing keys.
+            cfg_file = tmp_path / "pipeline_config.sh"
+            cfg_file.write_text(
+                "export PRIORITY_DEFAULT=2  # inline note\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                self.bp._load_pipeline_config(cfg_file, required=("PRIORITY_DEFAULT",)),
+                {"PRIORITY_DEFAULT": 2},
+            )
+            with self.assertRaisesRegex(self.bp.BootstrapError, "PRIORITY_NIGHTLY"):
+                self.bp._load_pipeline_config(
+                    cfg_file, required=("PRIORITY_DEFAULT", "PRIORITY_NIGHTLY")
+                )
+
+    def test_run_bootstrap_orchestration(self) -> None:
+        import yaml  # pyrefly: ignore[missing-import]
+
+        bp = self.bp
+        pinned = bp.parse_pinned_vllm_commit(
+            (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        tags = (
+            ("promote", "promote_lkg"),
+            ("verify", "Support matrices and verified commit"),
+            ("perf", "Perf and Eval on TPU"),
+            ("integration", "integration_tpu"),
+            ("tests", "Unit Tests on TPU"),
+            ("build", "build_docker_group"),
+        )
+
+        class FakeEffects(bp.BootstrapEffects):
+            def __init__(
+                self,
+                files: list[str] | None = None,
+                labels: tuple[str, ...] = (),
+            ) -> None:
+                super().__init__(repo_root=_REPO_ROOT)
+                self.files = ["src/vllm_torchtpu/envs.py"] if files is None else files
+                self.labels = labels
+                self.meta: list[tuple[str, str]] = []
+                self.annotations: list[str] = []
+                self.uploads: list[tuple[str, str, dict[str, str]]] = []
+
+            def set_metadata(
+                self, key: str, value: str, *, env: Mapping[str, str]
+            ) -> None:
+                self.meta.append((key, value))
+
+            def annotate(self, annotation: Any, *, env: Mapping[str, str]) -> None:
+                self.annotations.append(annotation.context)
+
+            def dry_run_upload(
+                self, content: str, *, env: Mapping[str, str]
+            ) -> str | None:
+                doc = yaml.safe_load(content) or {}
+                return json.dumps(
+                    {k: v for k, v in doc.items() if not k.startswith("x-")}
+                )
+
+            def upload_pipeline(
+                self, content: str, *, no_interpolation: bool, env: Mapping[str, str]
+            ) -> None:
+                tag = next((k for k, needle in tags if needle in content), "unknown")
+                self.uploads.append((tag, content, dict(env)))
+
+            def pr_changed_files(
+                self, base_branch: str, commit: str, *, env: Mapping[str, str]
+            ) -> list[str]:
+                return list(self.files)
+
+            def commit_changed_files(
+                self, commit: str, *, env: Mapping[str, str]
+            ) -> list[str]:
+                return list(self.files)
+
+            def merged_pr_labels(
+                self, pr_number: str, *, env: Mapping[str, str]
+            ) -> tuple[str, ...]:
+                return self.labels
+
+            def vllm_upstream_head(self, *, env: Mapping[str, str]) -> str:
+                return "upstream999"
+
+        def run(
+            env: dict[str, str],
+            *,
+            files: list[str] | None = None,
+            labels: tuple[str, ...] = (),
+        ) -> FakeEffects:
+            fx = FakeEffects(files=files, labels=labels)
+            self.assertEqual(bp.run_bootstrap(env, repo_root=_REPO_ROOT, effects=fx), 0)
+            return fx
+
+        # PR default: priority 6, pre-merge class, 4 uploads, SKIP_TPU_CI=0.
+        pr = run(
+            {
+                "BUILDKITE_PULL_REQUEST": "42",
+                "BUILDKITE_BUILD_AUTHOR_EMAIL": "Alice@Example.com",
+            }
+        )
+        self.assertEqual(
+            pr.meta,
+            [
+                ("JOB_PRIORITY", "6"),
+                ("WORKLOAD_PRIORITY", "pre-merge"),
+                ("VLLM_COMMIT_HASH", pinned),
+            ],
+        )
+        self.assertEqual(pr.annotations, [])
+        self.assertEqual(
+            [u[0] for u in pr.uploads], ["verify", "integration", "tests", "build"]
+        )
+        self.assertEqual(pr.uploads[2][2]["SKIP_TPU_CI"], "0")
+        self.assertEqual(pr.uploads[3][2]["OMNI_IMAGE_SKIP"], "")
+        self.assertIn("tpu-pr/alice@example.com", pr.uploads[2][1])
+
+        # PR skip-tpu-ci & post-merge main webhook honoring merged PR skip-tpu-ci.
+        for fx, prio, wprio in (
+            (
+                run(
+                    {
+                        "BUILDKITE_PULL_REQUEST": "42",
+                        "BUILDKITE_PULL_REQUEST_LABELS": "ready,skip-tpu-ci",
+                    }
+                ),
+                "6",
+                "pre-merge",
+            ),
+            (
+                run(
+                    {
+                        "BUILDKITE_BRANCH": "main",
+                        "BUILDKITE_SOURCE": "webhook",
+                        "BUILDKITE_MESSAGE": "fix: tweak (#99)",
+                    },
+                    labels=("skip-tpu-ci",),
+                ),
+                "11",
+                "post-merge",
+            ),
+        ):
+            self.assertIn(("JOB_PRIORITY", prio), fx.meta)
+            self.assertIn(("WORKLOAD_PRIORITY", wprio), fx.meta)
+            self.assertEqual(fx.annotations, ["skip-tpu-ci"])
+            self.assertEqual([u[0] for u in fx.uploads], ["tests", "build"])
+            self.assertEqual(fx.uploads[0][2]["SKIP_TPU_CI"], "1")
+            self.assertTrue(bool(fx.uploads[1][2]["OMNI_IMAGE_SKIP"]))
+
+        # PR run-full-ci + oncall-fix & scheduled Nightly (no WORKLOAD_PRIORITY).
+        full = run(
+            {
+                "BUILDKITE_PULL_REQUEST": "42",
+                "BUILDKITE_PULL_REQUEST_LABELS": "run-full-ci,oncall-fix",
+            }
+        )
+        self.assertIn(("JOB_PRIORITY", "12"), full.meta)
+        self.assertIn(("WORKLOAD_PRIORITY", "oncall-fix"), full.meta)
+        self.assertEqual(full.annotations, ["oncall-fix", "full-ci"])
+        nightly = run(
+            {
+                "NIGHTLY": "1",
+                "BUILDKITE_SOURCE": "schedule",
+                "BUILDKITE_BRANCH": "main",
+            }
+        )
+        self.assertEqual(
+            nightly.meta, [("JOB_PRIORITY", "1"), ("VLLM_COMMIT_HASH", pinned)]
+        )
+        for fx in (full, nightly):
+            self.assertEqual(
+                [u[0] for u in fx.uploads],
+                ["verify", "perf", "integration", "tests", "build"],
+            )
+            for _, content, _ in fx.uploads:
+                self.assertNotIn('build.env("NIGHTLY")', content)
+
+        # Integration pipeline (promote first, upstream head) and early exits.
+        integ = run({"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"})
+        self.assertIn(("VLLM_COMMIT_HASH", "upstream999"), integ.meta)
+        self.assertEqual(
+            [u[0] for u in integ.uploads],
+            ["promote", "verify", "perf", "integration", "tests", "build"],
+        )
+        self.assertEqual(run({"BUILDKITE_MESSAGE": "doc [skip ci]"}).uploads, [])
+        self.assertEqual(
+            run({"BUILDKITE_PULL_REQUEST": "42"}, files=["README.md"]).uploads, []
+        )
 
 
 if __name__ == "__main__":

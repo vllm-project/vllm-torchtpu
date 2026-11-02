@@ -43,16 +43,40 @@ import cap_pr_tpu_concurrency
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parents[1]
 
-_EXPORT_INT_RE = re.compile(r"^export\s+([A-Z0-9_]+)=(-?[0-9]+)\s*$")
+
+class BootstrapError(Exception):
+    """Fatal configuration or git/pin lookup error that exits bootstrap with 1."""
 
 
-def _load_pipeline_config(path: pathlib.Path) -> dict[str, int]:
+_EXPORT_INT_RE = re.compile(r"^export\s+([A-Z0-9_]+)=(-?[0-9]+)(?:\s+#.*)?$")
+_REQUIRED_CONFIG_KEYS = (
+    "PRIORITY_ONCALL_FIX",
+    "PRIORITY_POST_MERGE",
+    "PRIORITY_PRE_MERGE",
+    "PRIORITY_INTEGRATION",
+    "PRIORITY_BENCHMARK",
+    "PRIORITY_DEFAULT",
+    "PRIORITY_NIGHTLY",
+    "PRIORITY_KERNEL_TUNING",
+    "PR_TPU_JOBS_PER_AUTHOR",
+)
+
+
+def _load_pipeline_config(
+    path: pathlib.Path,
+    required: Sequence[str] = _REQUIRED_CONFIG_KEYS,
+) -> dict[str, int]:
     """Load integer constants from `configs/pipeline_config.sh` (single source)."""
     values: dict[str, int] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         match = _EXPORT_INT_RE.match(line.strip())
         if match:
             values[match.group(1)] = int(match.group(2))
+    missing = [key for key in required if key not in values]
+    if missing:
+        raise BootstrapError(
+            f"ERROR: missing constant(s) {', '.join(missing)} in {path}"
+        )
     return values
 
 
@@ -97,10 +121,6 @@ _MERGED_PR_RE = re.compile(r"\(#([0-9]+)\)$")
 _VLLM_PIN_RE = re.compile(
     r".*vllm @ git\+https://github\.com/vllm-project/vllm\.git@([a-zA-Z0-9.-]+).*"
 )
-
-
-class BootstrapError(Exception):
-    """Fatal configuration or git/pin lookup error that exits bootstrap with 1."""
 
 
 def _env_or(env: Mapping[str, str], key: str, default: str) -> str:
@@ -489,14 +509,22 @@ def upload_with_priority(
         if dry_run_json is not None:
             try:
                 pipeline = json.loads(dry_run_json)
+                if not isinstance(pipeline, dict):
+                    raise TypeError(
+                        "expected JSON object from --dry-run, "
+                        f"got {type(pipeline).__name__}"
+                    )
                 cap_pr_tpu_concurrency.cap(
                     pipeline.get("steps") or [],
                     pr_tpu_concurrency_group,
                     pr_tpu_jobs_per_author,
                 )
                 capped = json.dumps(pipeline) + "\n"
-            except (ValueError, TypeError):
-                pass
+            except Exception as exc:
+                print(
+                    f"WARNING: failed to cap TPU concurrency for {yaml_file}: {exc}",
+                    file=sys.stderr,
+                )
             else:
                 effects.upload_pipeline(capped, no_interpolation=True, env=env)
                 return
