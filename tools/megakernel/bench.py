@@ -124,7 +124,7 @@ def _prompt_tokens(rng, corpus, size):
 @contextmanager
 def _trace(directory: str, tag: str, last: bool):
     """Rank 0 saves an xprof trace of the last repeat under ``directory``."""
-    if not (directory and last and harness.rank() == 0):
+    if not (directory and last and (harness.rank() == 0 or os.environ.get("K3_TRACE_ALL_RANKS") == "1")):
         yield
         return
     from torch_tpu._internal.profiler import _impl as profiler

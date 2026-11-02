@@ -2816,10 +2816,11 @@ def moe(
         ).wait()
 
     def start_latent_gather(latent_input_projection_vmem, latent_input_copy):
-        latent_input_copy.wait()
-        latent_vmem[:, pl.ds(rank * 128, 128)] = _dot(
-            hidden, latent_input_projection_vmem[...]
-        ).astype(jnp.bfloat16)
+        with _phase("m_latent_down"):
+            latent_input_copy.wait()
+            latent_vmem[:, pl.ds(rank * 128, 128)] = _dot(
+                hidden, latent_input_projection_vmem[...]
+            ).astype(jnp.bfloat16)
         for offset in (
             31, 30, 29, 27, 23, 15, 28, 26, 25, 22, 21, 19,
             14, 13, 11, 7, 24, 20, 18, 17, 12, 10, 9, 6, 5, 3,
@@ -2904,6 +2905,7 @@ def moe(
             start_latent_gather(latent_input_projection_vmem, latent_input_copy)
 
         def prepare_shared_compute():
+          with _phase("m_shared_expert"):
             if shared_gate_up_stream is not None:
                 shared_gate_up = shared_gate_up_stream.dot(
                     hidden, communication_workspace.reduction_phase[0] >= 0
@@ -3020,7 +3022,8 @@ def moe(
                 latent_input_projection_vmem,
                 latent_input_copy,
             )
-            wait_for_latent_gather()
+            with _phase("m_latent_wait"):
+                wait_for_latent_gather()
 
         if overlap_shared_routing:
             dense_copies.down.wait()
@@ -3604,11 +3607,12 @@ def moe(
             # storage is disjoint from the still-live routed gather packets.
             latent_vmem[row_slice, :1024] = local_output
 
-    finish_reductions(
-        routed_outputs_vmem[...],
-        routed_outputs_vmem,
-        shared_outputs_vmem,
-    )
+    with _phase("m_finish_reductions"):
+        finish_reductions(
+            routed_outputs_vmem[...],
+            routed_outputs_vmem,
+            shared_outputs_vmem,
+        )
     t7 = _phase_start("t7_latent_up")
     if token_pipeline:
         local_output = latent_vmem[:, :1024]
