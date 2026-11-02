@@ -180,7 +180,9 @@ def _build_ops() -> _Rows:
             w_o, w_uv, w_scale, after, DCP_AXIS_NAME, gather, ring
         )
 
-    def gather_fn(w_o, w_uv, w_scale, after):
+    def gather_fn(
+        w_o: jax.Array, w_uv: jax.Array, w_scale: jax.Array, after: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return jax.shard_map(
             local,
             mesh=mesh,
@@ -207,7 +209,9 @@ def _build_ops() -> _Rows:
 
     prefetch_op.register_fake(_gather_fake)
 
-    def oproj_fn(out_latent, w_uv, w_o, w_scale):
+    def oproj_fn(
+        out_latent: jax.Array, w_uv: jax.Array, w_o: jax.Array, w_scale: jax.Array
+    ) -> jax.Array:
         return rows_oproj.rows_oproj(out_latent, w_uv, w_o, w_scale)
 
     oproj_op = pallas.jax_op("pallas::mla_rows_oproj", oproj_fn)
