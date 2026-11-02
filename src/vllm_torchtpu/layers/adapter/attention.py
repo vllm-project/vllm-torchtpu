@@ -66,7 +66,12 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.absorb_q import absorb_q
+from vllm_torchtpu.kernels.mla.absorb_q import (
+    HEAD_TAIL_LANES,
+    absorb_q,
+    absorb_q_head,
+)
+from vllm_torchtpu.kernels.mla.absorb_q import MIN_TOKENS as ABSORB_Q_MIN_TOKENS
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -116,6 +121,20 @@ def _fake_absorb_q(q_nope: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
 # Registered at import: Dynamo cannot trace a lock-guarded registration.
 _absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
 _absorb_q.register_fake(_fake_absorb_q)
+
+
+def _fake_absorb_q_head(
+    q2d: torch.Tensor, w_uk_t: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    heads, _, rank = w_uk_t.shape
+    tokens = q2d.shape[0]
+    return q2d.new_empty((tokens, heads, rank)), q2d.new_empty(
+        (tokens, heads, HEAD_TAIL_LANES)
+    )
+
+
+_absorb_q_head = pallas.jax_op("pallas::mla_absorb_q_head", absorb_q_head)
+_absorb_q_head.register_fake(_fake_absorb_q_head)
 
 
 def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
@@ -2891,12 +2910,24 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 q_nope.shape[0], vllm_compilation_backends.model_tag == "backbone"
             )
         )
-        pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
 
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
+        if (
+            envs.TPU_MLA_ABSORB_Q_FROM_HEAD
+            and q_rope_table
+            and q_pe.device.type == "tpu"
+            and w_uk_t_scale is None
+            and vllm_compilation_backends.model_tag == "backbone"
+            and q_pe.shape[0] > envs.bucket_gate_edge(ABSORB_Q_MIN_TOKENS)
+        ):
+            # q_pe is the raw q head here. The kernel reads it as the q
+            # projection wrote it and hands attention only the 128 lanes per
+            # head it reads, so XLA never relays out the whole q head.
+            ql_nope, q_pe = _absorb_q_head(q_pe.flatten(1), w_uk_t_src.to(q_pe.dtype))
+            ql_nope = ql_nope.to(input_dtype)
+        elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
             q_nope_t = q_nope.transpose(0, 1)
@@ -2917,6 +2948,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             )
 
         ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
+        pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
         q_pe_flat = q_pe.reshape(-1, attn_heads, pe_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
