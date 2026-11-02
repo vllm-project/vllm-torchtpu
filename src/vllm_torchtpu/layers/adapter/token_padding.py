@@ -71,7 +71,9 @@ def zero_routing_weights_for_padding(
         topk_ids: Selected expert IDs for each token.
         topk_weights: Routing weights for each token.
         is_local_tensor: Whether topk_ids and topk_weights are local tensors
-            (i.e. not gathered across DP ranks). If True, skips DP all_gather.
+            (i.e. not yet gathered across ranks). If True, skips DP/PCP
+            all_gather, and under sequence-parallel MoE at DP=1 slices this EP
+            rank's shard of ``local_padding_mask``.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: The (topk_ids, topk_weights) tensors
@@ -96,12 +98,19 @@ def zero_routing_weights_for_padding(
             dp_size = int(dp_group.world_size) if dp_group is not None else 1
             pcp_size = int(pcp_group.world_size) if pcp_group is not None else 1
             ep_size = int(ep_group.world_size) if ep_group is not None else 1
-            if (
-                dp_size == 1
-                and pcp_size == 1
-                and ep_size > 1
-                and _padding_state.local_padding_mask.shape[0] >= ep_size * num_tokens
-            ):
+            if pcp_size > 1:
+                raise NotImplementedError(
+                    "Sequence-parallel MoE padding mask slicing does not yet "
+                    f"support PCP ({pcp_size})."
+                )
+            if dp_size == 1 and ep_size > 1:
+                mask_len = _padding_state.local_padding_mask.shape[0]
+                if mask_len < ep_size * num_tokens:
+                    raise ValueError(
+                        f"Sequence-parallel MoE padding mask length ({mask_len}) "
+                        f"cannot cover ep_size ({ep_size}) * num_tokens "
+                        f"({num_tokens})."
+                    )
                 assert ep_group is not None
                 rank = int(ep_group.rank_in_group)
                 is_padding = _padding_state.local_padding_mask[

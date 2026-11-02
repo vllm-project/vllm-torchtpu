@@ -1184,31 +1184,32 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER
         )
 
-        with sequence_parallel_moe(layer):
-            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            with sequence_parallel_moe(layer):
                 topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                     topk_ids,
                     topk_weights,
                     is_local_tensor=owns_collectives,
                 )
 
-            # Step 2: EP global->local remap happens inside fused_moe_gmm via an
-            # elementwise subtract from `experts_start` (scalar).
-            kwargs = {
-                "hidden_states": x,
-                "w1": layer.w13_weight,
-                "w2": layer.w2_weight,
-                "w1_scale": layer.w13_weight_scale_inv,
-                "w2_scale": layer.w2_weight_scale_inv,
-                "w1_bias": getattr(layer, "w13_bias", None),
-                "w2_bias": getattr(layer, "w2_bias", None),
-                "topk_weights": topk_weights,
-                "topk_ids": topk_ids,
-                "experts_start": layer._experts_start,
-                "topk": layer.moe_config.experts_per_token,
-                "activation": activation_str,
-            }
-            if owns_collectives:
+        # Step 2: EP global->local remap happens inside fused_moe_gmm via an
+        # elementwise subtract from `experts_start` (scalar).
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": layer.w13_weight_scale_inv,
+            "w2_scale": layer.w2_weight_scale_inv,
+            "w1_bias": getattr(layer, "w13_bias", None),
+            "w2_bias": getattr(layer, "w2_bias", None),
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+        }
+        if owns_collectives:
+            with sequence_parallel_moe(layer):
                 return pipelined_fused_moe_gmm(**kwargs)
 
         from vllm_torchtpu.layers.adapter.fused_moe_decode import (

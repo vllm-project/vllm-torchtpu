@@ -321,23 +321,24 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                 topk_ids, topk_weights, is_local_tensor=pipelined
             )
 
-            kwargs = {
-                "hidden_states": x,
-                "w1": layer.w13_weight,
-                "w2": layer.w2_weight,
-                "w1_scale": layer.w13_weight_scale,
-                "w2_scale": layer.w2_weight_scale,
-                "w1_bias": None,
-                "w2_bias": None,
-                "topk_weights": topk_weights,
-                "topk_ids": topk_ids,
-                "experts_start": layer._experts_start,
-                "topk": layer.moe_config.experts_per_token,
-                "activation": activation_str,
-                "rhs_quant_dtype": None,
-                "skip_padded_tokens": True,
-            }
-            if pipelined:
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": layer.w13_weight_scale,
+            "w2_scale": layer.w2_weight_scale,
+            "w1_bias": None,
+            "w2_bias": None,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+            "rhs_quant_dtype": None,
+            "skip_padded_tokens": True,
+        }
+        if pipelined:
+            with sequence_parallel_moe(layer):
                 return pipelined_fused_moe_gmm(**kwargs)
 
         # Execute GMM Kernel with native fp4 weights and scales
