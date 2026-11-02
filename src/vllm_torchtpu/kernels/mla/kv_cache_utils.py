@@ -148,18 +148,18 @@ class SparseMLAKVCacheSpec:
             assert head_dim % WORD_BYTES == 0, (
                 f"head_dim {head_dim} must be a multiple of {WORD_BYTES}"
             )
-            if cache_type is KVCacheType.ROPE:
-                row_bytes = WORD_BYTES * TILE_LANE_BYTES
-                if (
-                    head_dim > TILE_LANE_BYTES
-                    or row_bytes % head_dim
-                    or page_size % (row_bytes // head_dim)
-                ):
-                    raise ValueError(
-                        f"SparseCore ROPE head_dim {head_dim} must not exceed "
-                        f"{TILE_LANE_BYTES} or fail to divide {row_bytes}, and "
-                        f"page_size {page_size} must hold whole {row_bytes}-byte rows"
-                    )
+            row_bytes = WORD_BYTES * TILE_LANE_BYTES
+            max_dim = row_bytes if cache_type is KVCacheType.NOPE else TILE_LANE_BYTES
+            if (
+                head_dim > max_dim
+                or row_bytes % head_dim
+                or page_size % (row_bytes // head_dim)
+            ):
+                raise ValueError(
+                    f"SparseCore {cache_type.name} head_dim {head_dim} must not "
+                    f"exceed {max_dim}, must divide {row_bytes}, and page_size "
+                    f"{page_size} must hold whole {row_bytes}-byte rows"
+                )
         elif layout is KVCacheLayout.TENSORCORE:
             if cache_type is KVCacheType.NOPE:
                 assert head_dim == WORD_BYTES * TILE_LANE_BYTES, (
@@ -192,7 +192,7 @@ class SparseMLAKVCacheSpec:
 
     @property
     def tokens_per_row(self) -> int:
-        """Tokens sharing one `TILE_LANE_BYTES`-word row of a ROPE/SC cache."""
+        """Tokens sharing one `TILE_LANE_BYTES`-word row of a SparseCore cache."""
         return WORD_BYTES * TILE_LANE_BYTES // self.token_bytes
 
     @property
@@ -205,7 +205,14 @@ class SparseMLAKVCacheSpec:
                     self.head_dim // TILE_LANE_BYTES,
                     TILE_LANE_BYTES,
                 )
-            return (self.num_pages, self.page_size, self.head_dim // WORD_BYTES)
+            # Narrow tokens (e.g. TurboQuant's 256 B NoPE codes) share a
+            # 128-word row so HBM is not lane-padded; readers view it as
+            # `(-1, head_dim // WORD_BYTES)`.
+            return (
+                self.num_pages,
+                self.page_size // self.tokens_per_row,
+                TILE_LANE_BYTES,
+            )
         if self.cache_type is KVCacheType.ROPE:
             if self.layout is KVCacheLayout.TENSORCORE:
                 return (
@@ -351,8 +358,15 @@ def _check_inputs(
     rope_spec: SparseMLAKVCacheSpec,
 ) -> None:
     """Assert the caches were allocated from the specs they are written with."""
-    assert kv_c_normed.dtype == jnp.float8_e4m3fn, (
-        f"sparse MLA kernel requires --kv-cache-dtype fp8 (got {kv_c_normed.dtype})"
+    # fp8 latents, or TurboQuant's pre-packed uint8 codes (narrow NoPE token).
+    assert kv_c_normed.dtype == jnp.float8_e4m3fn or (
+        kv_c_normed.dtype == jnp.uint8
+        and kv_c_normed.shape[-1]
+        == nope_spec.token_bytes
+        < WORD_BYTES * TILE_LANE_BYTES
+    ), (
+        "sparse MLA kernel requires --kv-cache-dtype fp8 or turboquant "
+        f"(got {kv_c_normed.dtype}{list(kv_c_normed.shape)})"
     )
     assert kv_cache_nope.dtype == nope_spec.jax_dtype, (
         f"nope cache {kv_cache_nope.dtype} does not match its spec "

@@ -48,7 +48,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -1016,3 +1016,131 @@ def ref_tq_ragged_paged_attention(
         skip_kv_update=skip_kv_update,
     )
     return kv_cache, outputs
+
+
+# ======================================================================================
+# Sparse (DSA) absorbed-MLA latent cache
+# ======================================================================================
+#
+# In absorbed MLA the 512-dim compressed latent `kv_c_normed` is BOTH the key
+# (`q_nope . c`) and the value (`P @ c`), so a single 4-bit MSE code covers K and
+# V. Rotating the latent by an orthonormal symmetric `H` keeps the scores
+# (`(q H) . (c H) == q . c`) and rotates the value aggregate (`P (c H) ==
+# (P c) H`), so callers fold `H` into `W_UK_T` and `W_UV` at load time (or
+# pre-/post-rotate `q_nope` and the attention output by `H` in standalone kernel
+# calls). One norm-corrected `bf16` L2 norm per token rides in the otherwise
+# zero-padded tail of the RoPE row (`MLA_TQ_NORM_BYTE_OFFSET`).
+
+# Sparse (DSA) MLA supports only the key+value MSE-rotated 4-bit preset: the
+# latent is a shared K/V vector (256 B = 64 words = half a 128-word SC row).
+MLA_TURBOQUANT_PRESETS: tuple[Literal["turboquant_4bit_nc"], ...] = (
+    "turboquant_4bit_nc",
+)
+
+MLA_TQ_LATENT_DIM = 512
+MLA_TQ_BITS = 4
+MLA_TQ_NOPE_BYTES = MLA_TQ_LATENT_DIM * MLA_TQ_BITS // 8  # 256 B/token.
+MLA_TQ_NORM_BYTE_OFFSET = 64  # After the 64 fp8 `k_pe` bytes in the RoPE row.
+
+# Exact IEEE `float8_e4m3fn` levels for SWAR byte ramp `(sign << 7) | (3 * m + 2)`
+# (`m = 0..7`), i.e. `+/-[2, 5, 8, 11, 14, 18, 24, 30] / 512`. Unpacks eight
+# 4-bit codes per `uint32` lane in 6 integer ALU ops directly into `float8_e4m3fn`
+# MXU operands while matching unit-sphere D=512 Lloyd-Max cosine similarity.
+# `MLA_TQ_FP8_SCALE` scales only the quantizer's decision thresholds; dequant and
+# norm correction use the exact unscaled `float8_e4m3fn` levels.
+_MLA_FP8_POS_LEVELS = np.array(
+    [2, 5, 8, 11, 14, 18, 24, 30], dtype=np.float32
+) / np.float32(512.0)
+MLA_TQ_FP8_SCALE = 2.009064
+
+
+@functools.cache
+def make_mla_latent_tables() -> TQTables:
+    """Builds Hadamard and SWAR `float8_e4m3fn` threshold tables for 512-dim MLA."""
+    levels = np.concatenate([-_MLA_FP8_POS_LEVELS[::-1], _MLA_FP8_POS_LEVELS])
+    sorted_c = np.sort((levels * np.float32(MLA_TQ_FP8_SCALE)).astype(np.float32))
+    assert sorted_c.shape == (1 << MLA_TQ_BITS,), sorted_c.shape
+    return TQTables(
+        hadamard=hadamard_matrix(MLA_TQ_LATENT_DIM),
+        centroids=sorted_c,
+        midpoints=((sorted_c[:-1] + sorted_c[1:]) / 2).astype(np.float32),
+    )
+
+
+def quantize_mla_latent(
+    latent: jax.Array,  # [T, 512]
+    tables: TQTables,
+) -> tuple[jax.Array, jax.Array]:
+    """`latent` -> (`u8[T, 256]` packed 4-bit codes, `u8[T, 2]` bf16 norm bytes).
+
+    Byte `i` holds sign-magnitude code `i` in its low nibble and code `256 + i`
+    in its high nibble (bit 3 sign, bits 0..2 magnitude index `0..7`).
+    """
+    x = latent.astype(jnp.float32)
+    norm = jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True))
+    rot = rotate(x / (norm + _KEY_NORM_EPS), jnp.asarray(tables.hadamard))
+    half_levels = 1 << (MLA_TQ_BITS - 1)
+    m0, m1, m2, m3, m4, m5, m6 = (float(m) for m in tables.midpoints[half_levels:])
+    abs_rot = jnp.abs(rot)
+    b2 = abs_rot >= m3
+    b1 = abs_rot >= jnp.where(b2, m5, m1)
+    b0 = abs_rot >= jnp.where(
+        b2,
+        jnp.where(b1, m6, m4),
+        jnp.where(b1, m2, m0),
+    )
+    mag_idx = (
+        (b2.astype(jnp.uint8) << jnp.uint8(2))
+        | (b1.astype(jnp.uint8) << jnp.uint8(1))
+        | b0.astype(jnp.uint8)
+    )
+    s0, s1, s2, s3, s4, s5, s6, s7 = (float(v * v) for v in _MLA_FP8_POS_LEVELS)
+    c_sq_elem = jnp.where(
+        b2,
+        jnp.where(b1, jnp.where(b0, s7, s6), jnp.where(b0, s5, s4)),
+        jnp.where(b1, jnp.where(b0, s3, s2), jnp.where(b0, s1, s0)),
+    )
+    c_sq = jnp.sum(c_sq_elem, axis=-1, keepdims=True)
+    codes = mag_idx | jnp.where(rot < 0.0, jnp.uint8(half_levels), jnp.uint8(0))
+    norm = norm * jax.lax.rsqrt(c_sq + _CENTROID_NORM_EPS)
+    half = MLA_TQ_LATENT_DIM // 2
+    packed = codes[:, :half] | (codes[:, half:] << jnp.uint8(4))
+    kn_lo, kn_hi = _f32_to_bf16_bytes(norm)
+    return packed, jnp.concatenate([kn_lo, kn_hi], axis=-1)
+
+
+def unpack_mla_fp8_nibbles_u32(
+    codes_u32: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """SWAR unpacks `uint32` words of 4-bit MLA codes into `(lo, hi)` `fp8` bytes."""
+    sign_lo = (codes_u32 & jnp.uint32(0x08080808)) << jnp.uint32(4)
+    mag_lo = codes_u32 & jnp.uint32(0x07070707)
+    fp8_lo = sign_lo | (mag_lo * jnp.uint32(3) + jnp.uint32(0x02020202))
+    sign_hi = codes_u32 & jnp.uint32(0x80808080)
+    mag_hi = (codes_u32 >> jnp.uint32(4)) & jnp.uint32(0x07070707)
+    fp8_hi = sign_hi | (mag_hi * jnp.uint32(3) + jnp.uint32(0x02020202))
+    return fp8_lo, fp8_hi
+
+
+def dequant_mla_latent_ref(
+    packed: jax.Array, norm_bytes: jax.Array, tables: TQTables
+) -> jax.Array:
+    """Pure-jnp reference: original-basis `f32[T, 512]` reconstruction."""
+    num_tokens = packed.shape[0]
+    half = MLA_TQ_NOPE_BYTES
+    codes_u32 = jax.lax.bitcast_convert_type(
+        packed.reshape(num_tokens, half // 4, 4), jnp.uint32
+    )
+    fp8_lo, fp8_hi = unpack_mla_fp8_nibbles_u32(codes_u32)
+    vals_lo = jax.lax.bitcast_convert_type(fp8_lo, jnp.float8_e4m3fn).reshape(
+        num_tokens, half
+    )
+    vals_hi = jax.lax.bitcast_convert_type(fp8_hi, jnp.float8_e4m3fn).reshape(
+        num_tokens, half
+    )
+    vals = jnp.concatenate([vals_lo, vals_hi], axis=-1).astype(jnp.float32)
+    norm = _bf16_u16_to_f32_vreg(
+        norm_bytes[:, :1].astype(jnp.uint32),
+        norm_bytes[:, 1:2].astype(jnp.uint32),
+    )
+    return rotate(vals * norm, jnp.asarray(tables.hadamard))

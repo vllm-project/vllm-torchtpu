@@ -189,6 +189,10 @@ def _mock_vllm_config(**kw: Any) -> Any:
         ),
         model_config=SimpleNamespace(
             use_mla=kw.get("use_mla", False),
+            hf_text_config=SimpleNamespace(
+                index_topk=kw.get("index_topk"),
+                kv_lora_rank=kw.get("kv_lora_rank", 512),
+            ),
             get_head_size=lambda: kw.get("head_size", 128),
             is_hybrid=kw.get("is_hybrid", False),
             max_model_len=kw.get("max_model_len", 4096),
@@ -203,7 +207,31 @@ def _mock_vllm_config(**kw: Any) -> Any:
 @pytest.mark.parametrize(
     ("cfg_kwargs", "exc", "match"),
     [
-        ({"use_mla": True}, NotImplementedError, "MLA"),
+        (
+            {"use_mla": True, "index_topk": None},
+            NotImplementedError,
+            "sparse \\(DSA\\) MLA",
+        ),
+        (
+            {"cache_dtype": "turboquant_k8v4", "use_mla": True, "index_topk": 2048},
+            NotImplementedError,
+            "turboquant_4bit_nc",
+        ),
+        (
+            {"use_mla": True, "index_topk": 2048, "kv_lora_rank": 256},
+            NotImplementedError,
+            "kv_lora_rank=512",
+        ),
+        (
+            {
+                "use_mla": True,
+                "index_topk": 2048,
+                "user_specified_block_size": True,
+                "block_size": 16,
+            },
+            ValueError,
+            "multiple of 32",
+        ),
         ({"head_size": 64}, NotImplementedError, "head_dim"),
         ({"pcp": 2}, NotImplementedError, "PCP"),
         ({"dcp": 2}, NotImplementedError, "DCP"),
@@ -228,6 +256,48 @@ def test_check_turboquant_config_rejects_invalid(
 ):
     with pytest.raises(exc, match=match):
         check_turboquant_config(_mock_vllm_config(**cfg_kwargs))
+
+
+def test_check_turboquant_config_sparse_mla_and_page_bytes():
+    from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        _streamidx_block_sizes,
+    )
+
+    cfg = _mock_vllm_config(
+        use_mla=True, index_topk=2048, user_specified_block_size=True, block_size=256
+    )
+    check_turboquant_config(cfg)
+    nope_spec, rope_spec = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        4, 256, 576, torch.uint8
+    )
+    assert nope_spec.shape == (4, 128, 128) and rope_spec.shape == (4, 64, 128)
+    assert (
+        PallasMLAttentionBackend.get_kv_cache_page_size_bytes(256, 1, 576, torch.uint8)
+        == 256 * 384
+    )
+    # Non-576 uint8 (e.g. 129 B DSA indexer) and non-uint8 dtypes must not match TQ.
+    assert (
+        PallasMLAttentionBackend.get_kv_cache_page_size_bytes(256, 1, 129, torch.uint8)
+        == 256 * 256
+    )
+    assert (
+        PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            170, 1, 576, torch.bfloat16
+        )
+        == 170 * 640 * 2
+    )
+    kv_pages, _ = _streamidx_block_sizes(
+        64,
+        None,
+        None,
+        0,
+        num_seqs=16,
+        pages_per_seq=4096,
+        page_size=256,
+        smem_cap=20480,
+    )
+    assert kv_pages[0] > 2 and kv_pages[0] * 256 <= 8192
 
 
 def test_check_turboquant_config_updates_hybrid_and_page_sizes(

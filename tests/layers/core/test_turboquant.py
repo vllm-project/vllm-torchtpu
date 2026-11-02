@@ -340,3 +340,27 @@ def test_tq_hook_caching_dtype_validation_and_bundled_dispatch(preset):
     )
     assert seen == {"layer_idx": 2, "dequant_fn": d1}
     assert out_c.shape == c5.shape and out_q.shape == q.shape
+
+
+def test_mla_latent_roundtrip():
+    """SWAR float8_e4m3fn MLA 4-bit latent quantization preserves direction and norm."""
+    rng = np.random.default_rng(13)
+    tables = tq.make_mla_latent_tables()
+    assert tables.hadamard.shape == (tq.MLA_TQ_LATENT_DIM, tq.MLA_TQ_LATENT_DIM)
+    outliers = 1.0 + 4.0 * (rng.random(tq.MLA_TQ_LATENT_DIM) < 0.02)
+    latent = jnp.asarray(
+        rng.standard_normal((64, tq.MLA_TQ_LATENT_DIM)) * outliers, jnp.bfloat16
+    )
+    packed, norm_bytes = tq.quantize_mla_latent(latent, tables)
+    assert packed.shape == (64, tq.MLA_TQ_NOPE_BYTES) and packed.dtype == jnp.uint8
+    assert norm_bytes.shape == (64, 2) and norm_bytes.dtype == jnp.uint8
+
+    recon = np.asarray(tq.dequant_mla_latent_ref(packed, norm_bytes, tables))
+    orig = np.asarray(latent, dtype=np.float32)
+    cos = np.sum(recon * orig, axis=-1) / (
+        np.linalg.norm(recon, axis=-1) * np.linalg.norm(orig, axis=-1)
+    )
+    assert float(cos.min()) > 0.99, cos.min()
+    assert float(cos.mean()) > 0.993, cos.mean()
+    norm_ratio = np.linalg.norm(recon, axis=-1) / np.linalg.norm(orig, axis=-1)
+    np.testing.assert_allclose(norm_ratio, 1.0, rtol=1e-2, atol=1e-2)
