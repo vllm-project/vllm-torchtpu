@@ -34,13 +34,13 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4Model
+from vllm.model_executor.models.utils import sequence_parallel_chunk
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
@@ -131,19 +131,6 @@ def _patched_model_init(self: Gemma4Model, *args: Any, **kwargs: Any) -> None:
         raise ValueError(
             "TPU_GEMMA4_SEQUENCE_PARALLEL does not support kv_sharing_fast_prefill"
         )
-    # A buffer, not a Python int: every TP rank keeps one identical program.
-    self.register_buffer(
-        "_tpu_sp_rank",
-        torch.tensor(get_tensor_model_parallel_rank(), dtype=torch.int64),
-        persistent=False,
-    )
-
-
-def _local_rows(x: torch.Tensor, rank: torch.Tensor, tp_size: int) -> torch.Tensor:
-    """This rank's contiguous 1/tp of the rows of replicated ``x``."""
-    rows = x.shape[0] // tp_size
-    index = torch.arange(rows, device=x.device) + rank * rows
-    return x.index_select(0, index)
 
 
 def _gathered_projection(linear: Any, x_local: torch.Tensor) -> torch.Tensor:
@@ -215,6 +202,12 @@ def _sequence_parallel_layer(
         assert self.router is not None
         assert self.experts is not None
         assert self.post_feedforward_layernorm_2 is not None
+        mlp_out = [
+            self.post_feedforward_layernorm_1(
+                tensor_model_parallel_reduce_scatter(m, 0)
+            )
+            for m in mlp_out
+        ]
         # gmm_v2 quantizes its lhs per 512-column block, so the experts take
         # bf16 rows; every rank routes all of a chunk's tokens, as upstream does.
         experts_out = [
@@ -227,9 +220,7 @@ def _sequence_parallel_layer(
             for r in residual
         ]
         hidden_states = [
-            self.post_feedforward_layernorm_1(
-                tensor_model_parallel_reduce_scatter(m, 0)
-            )
+            m
             + self.post_feedforward_layernorm_2(
                 tensor_model_parallel_reduce_scatter(e, 0)
             )
@@ -329,10 +320,7 @@ def _patched_model_forward(
     if inputs_embeds is None:
         inputs_embeds = self.embed_input_ids(input_ids)
     chunks = _num_microbatches(positions.shape[-1], row_bytes, tp_size)
-    hidden_states = [
-        _local_rows(chunk, self._tpu_sp_rank, tp_size)
-        for chunk in inputs_embeds.chunk(chunks)
-    ]
+    hidden_states = [sequence_parallel_chunk(c) for c in inputs_embeds.chunk(chunks)]
     for layer in islice(self.layers, self.start_layer, self.end_layer):
         hidden_states, _ = layer(
             positions, hidden_states, None, sequence_parallel=True, **kwargs

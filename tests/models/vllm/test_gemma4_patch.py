@@ -475,7 +475,6 @@ def test_model_forward_matches_all_reduce(mock_collectives, monkeypatch, chunks)
             project_per_layer_inputs=lambda h, p: None,
             config=SimpleNamespace(hidden_size=model.hidden),
             normalizer=torch.tensor(1.0),
-            _tpu_sp_rank=torch.tensor(rank),
         )
         fake._maybe_add_hidden_state = types.MethodType(
             EagleModelMixin._maybe_add_hidden_state, fake
@@ -492,6 +491,11 @@ def test_model_forward_matches_all_reduce(mock_collectives, monkeypatch, chunks)
     monkeypatch.setattr(
         gemma4_patch, "get_tensor_model_parallel_world_size", lambda: tp
     )
+    monkeypatch.setattr(
+        gemma4_patch,
+        "sequence_parallel_chunk",
+        lambda x: x.chunk(tp)[threading.current_thread().rank].clone(),
+    )
     shard_bytes = num_tokens // tp * model.hidden * 4
     monkeypatch.setattr(gemma4_patch, "_MIN_SHARD_BYTES", shard_bytes + 1)
     reference = _run_ranks(tp, forward)
@@ -504,6 +508,82 @@ def test_model_forward_matches_all_reduce(mock_collectives, monkeypatch, chunks)
     assert (shard_rows, model.hidden) in {c[2] for c in mock.calls}
     for out in sp:
         torch.testing.assert_close(out, reference[0], rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("moe", [False, True])
+def test_branches_trace_the_same_inputs(monkeypatch, moe: bool) -> None:
+    """The all-reduce and sequence-parallel traces take the same tensors, in order.
+
+    The shape-variant warmup hands a bucket's executable from one trace to the
+    other, and the receiving graph calls it with its own inputs by position.
+    """
+    tp, rank = 4, 1
+    pp = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    for name, fn in (
+        ("tensor_model_parallel_all_reduce", lambda x: x * 1),
+        (
+            "tensor_model_parallel_reduce_scatter",
+            lambda x, dim=0: x.chunk(tp, dim)[rank].contiguous(),
+        ),
+        ("tensor_model_parallel_all_gather", lambda x, dim=0: torch.cat([x] * tp, dim)),
+        ("get_tensor_model_parallel_world_size", lambda: tp),
+        ("sequence_parallel_chunk", lambda x: x.chunk(tp)[rank].clone()),
+    ):
+        monkeypatch.setattr(gemma4_patch, name, fn)
+    monkeypatch.setattr(gemma4, "get_pp_group", lambda: pp)
+    model = _Model(tp, moe=moe, fp8=True, num_layers=2)
+    fake = SimpleNamespace(
+        layers=[
+            model.layer(i, rank, gemma4_patch.tensor_model_parallel_all_reduce)
+            for i in range(2)
+        ],
+        start_layer=0,
+        end_layer=2,
+        norm=model.final_norm,
+        aux_hidden_state_layers=(),
+        fast_prefill_enabled=False,
+        embed_input_ids=lambda ids: model.embedding[ids],
+        get_per_layer_inputs=lambda ids: None,
+        project_per_layer_inputs=lambda h, p: None,
+        config=SimpleNamespace(hidden_size=model.hidden),
+        normalizer=torch.tensor(1.0),
+    )
+    fake._maybe_add_hidden_state = types.MethodType(
+        EagleModelMixin._maybe_add_hidden_state, fake
+    )
+    for layer in fake.layers:
+        gemma4_patch._configure_layer(layer)
+    input_ids, positions = torch.randint(0, 64, (64,)), torch.arange(64)
+
+    def traced_inputs(min_shard_bytes: int, chunks: int) -> list[int]:
+        monkeypatch.setattr(gemma4_patch, "_MIN_SHARD_BYTES", min_shard_bytes)
+        monkeypatch.setattr(gemma4_patch, "_microbatches", chunks)
+        seen: list[list[Any]] = []
+
+        def backend(gm, example_inputs):
+            seen.append(example_inputs)
+            return gm.forward
+
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            lambda ids, pos: gemma4_patch._patched_model_forward(fake, ids, pos, None),
+            backend=backend,
+            fullgraph=True,
+            dynamic=True,
+        )
+        with shape_variants.warmup():
+            compiled(input_ids, positions)
+        skip = {input_ids.data_ptr(), positions.data_ptr()}
+        return [
+            x.data_ptr()
+            for x in seen[0]
+            if isinstance(x, torch.Tensor) and x.data_ptr() not in skip
+        ]
+
+    all_reduce = traced_inputs(1 << 60, 1)
+    assert all_reduce
+    assert traced_inputs(0, 1) == all_reduce
+    assert traced_inputs(0, 2) == all_reduce
 
 
 def test_bf16_gather_when_method_cannot_take_quantized_rows(mock_collectives):
@@ -617,28 +697,25 @@ def test_configure_layer_refuses(override: dict, match: str) -> None:
         gemma4_patch._configure_layer(_layer_for_configure(**override))
 
 
-def test_patched_model_init_registers_rank_buffer(monkeypatch) -> None:
+def test_patched_model_init_refuses_pp_and_fast_prefill(monkeypatch) -> None:
     monkeypatch.setattr(gemma4_patch, "_orig_model_init", lambda self, *a, **k: None)
     monkeypatch.setattr(
         gemma4_patch, "get_pp_group", lambda: SimpleNamespace(world_size=1)
     )
-    monkeypatch.setattr(gemma4_patch, "get_tensor_model_parallel_rank", lambda: 3)
     model = torch.nn.Module()
     model.fast_prefill_enabled = False
     gemma4_patch._patched_model_init(model)
-    assert int(model._tpu_sp_rank) == 3
-    assert "_tpu_sp_rank" not in model.state_dict()
+    # Nothing is added to the model: both branches must trace the same inputs.
+    assert list(model.state_dict()) == [] and list(model.buffers()) == []
 
+    model.fast_prefill_enabled = True
+    with pytest.raises(ValueError, match="kv_sharing_fast_prefill"):
+        gemma4_patch._patched_model_init(model)
     monkeypatch.setattr(
         gemma4_patch, "get_pp_group", lambda: SimpleNamespace(world_size=2)
     )
     with pytest.raises(ValueError, match="PP"):
         gemma4_patch._patched_model_init(torch.nn.Module())
-
-
-def test_local_rows() -> None:
-    x = torch.arange(16).view(8, 2)
-    torch.testing.assert_close(gemma4_patch._local_rows(x, torch.tensor(2), 4), x[4:6])
 
 
 def test_maybe_patch_waits_for_gemma4(monkeypatch: pytest.MonkeyPatch) -> None:
