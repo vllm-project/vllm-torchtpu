@@ -33,6 +33,12 @@ padding). Each rank
      an exact top-k and an exact softmax: no cross-rank merge of either;
   4. returns its outputs to head sharding by one all-to-all (`tokens_to_heads`).
 
+With `TokenParallelLayout.rows_aligned` rank `j` owns its sequence-parallel
+rows `j * R + [0, R)` instead (rank 0 those past `split_rows`): a caller that
+holds those rows already computes their queries locally and keeps the outputs
+token-major, so neither all-to-all runs (`kernels/mla/rows_oproj.py` finishes
+the layer on them).
+
 Everything below runs inside a `shard_map` over the DCP axis with this rank's
 index as traced data, so one compiled program serves every rank. The kernels
 are passed in, so the layout is checkable on CPU against jnp references.
@@ -85,6 +91,10 @@ class TokenParallelLayout:
     # max_pages): it moves the smallest that holds the step's pages, so the
     # collective scales with the context rather than the buffer.
     gather_caps: tuple[int, ...] = ()
+    # Rank j attends its sequence-parallel rows j * R + [0, R) (rank 0 only
+    # those past split_rows) and keeps every head of them: the rows a
+    # sequence-parallel residual already holds (`row_range`).
+    rows_aligned: bool = False
 
     def __post_init__(self):
         if self.dcp_size < 2:
@@ -111,7 +121,26 @@ class TokenParallelLayout:
                 f"token-parallel bucket of {num_tokens} tokens must exceed "
                 f"split_rows={self.split_rows} and divide by dcp={self.dcp_size}"
             )
-        return num_tokens // self.dcp_size
+        rows = num_tokens // self.dcp_size
+        if self.rows_aligned and rows < self.split_rows:
+            raise ValueError(
+                f"aligned rows: a {num_tokens}-token bucket gives rank 0 {rows} "
+                f"rows, fewer than the split_rows={self.split_rows} DCP rows"
+            )
+        return rows
+
+    def row_range(
+        self, rank: jax.Array, num_tokens: int
+    ) -> tuple[jax.Array, jax.Array]:
+        """`(lo, cap)`: this rank's token-parallel rows are step rows
+        `[lo, cap)` (those before the step's end). Aligned, rank `j` keeps its
+        sequence-parallel rows `[j * R, (j + 1) * R)` past split_rows;
+        otherwise rows `split_rows + j * R + [0, R)`."""
+        rows = self.rows_per_rank(num_tokens)
+        if self.rows_aligned:
+            return jnp.maximum(rank * rows, self.split_rows), (rank + 1) * rows
+        lo = self.split_rows + rank * rows
+        return lo, lo + rows
 
 
 def rank_as_data(axis_name: str, axis_size: int) -> jax.Array:
@@ -216,17 +245,17 @@ def rank_rows(
     query_start_loc: jax.Array,
     num_seqs: jax.Array,
 ) -> RankRows:
-    """Per-rank sequence metadata for rows `split_rows + rank * R + [0, R)`.
+    """Per-rank sequence metadata for this rank's token-parallel rows
+    (`layout.row_range`), local row `i` being step row `lo + i`.
 
     Each row keeps its global position and causal bound: a request's
     `seq_len` is cut by the rows that follow this rank's range, so the last
     local row of the request sits at `seq_len' - 1`.
     """
     num_reqs = seq_lens.shape[0]
-    rows = layout.rows_per_rank(num_tokens)
     total = query_start_loc[num_seqs]
-    lo = layout.split_rows + rank * rows
-    hi = jnp.clip(total, lo, lo + rows)
+    lo, cap = layout.row_range(rank, num_tokens)
+    hi = jnp.clip(total, lo, cap)
     q_start, q_end = query_start_loc[:-1], query_start_loc[1:]
     req = jnp.arange(num_reqs, dtype=jnp.int32)
     active = req < num_seqs
@@ -391,8 +420,44 @@ def own_rows(layout: TokenParallelLayout, x: jax.Array, rank: jax.Array) -> jax.
     padding."""
     num_tokens = x.shape[0]
     rows = layout.rows_per_rank(num_tokens)
-    idx = layout.split_rows + rank * rows + jnp.arange(rows, dtype=jnp.int32)
+    lo, _ = layout.row_range(rank, num_tokens)
+    idx = lo + jnp.arange(rows, dtype=jnp.int32)
     return jnp.take(x, jnp.minimum(idx, num_tokens - 1), axis=0)
+
+
+def _aligned_shift(
+    layout: TokenParallelLayout, rank: jax.Array, rows: int
+) -> jax.Array:
+    """How far into its own rows a rank's token-parallel rows start: split_rows
+    on rank 0 (its first rows stay on the DCP path), else 0."""
+    if not layout.rows_aligned:
+        raise ValueError("own-row operands need a rows_aligned layout")
+    lo, _ = layout.row_range(rank, rows * layout.dcp_size)
+    return lo - rank * rows
+
+
+def tp_rows_of_own(
+    layout: TokenParallelLayout, x: jax.Array, rank: jax.Array
+) -> jax.Array:
+    """This rank's token-parallel rows of its own sequence-parallel rows `x`
+    `[R, ...]` (aligned layout): row `i` is own row `shift + i`; rows past
+    `R` repeat row `R - 1` and are padding."""
+    rows = x.shape[0]
+    idx = _aligned_shift(layout, rank, rows) + jnp.arange(rows, dtype=jnp.int32)
+    return jnp.take(x, jnp.minimum(idx, rows - 1), axis=0)
+
+
+def own_rows_of_tp(
+    layout: TokenParallelLayout, y: jax.Array, rank: jax.Array, fill: int
+) -> jax.Array:
+    """Per-row results `y` `[R, ...]` of `tp_rows_of_own`'s rows, back in own
+    row order; own rows before the token-parallel ones (rank 0's DCP rows)
+    are `fill`."""
+    rows = y.shape[0]
+    idx = jnp.arange(rows, dtype=jnp.int32) - _aligned_shift(layout, rank, rows)
+    out = jnp.take(y, jnp.maximum(idx, 0), axis=0)
+    keep = (idx >= 0).reshape((rows,) + (1,) * (y.ndim - 1))
+    return jnp.where(keep, out, jnp.asarray(fill, y.dtype))
 
 
 def heads_to_tokens(
@@ -466,13 +531,21 @@ def sparse_mla_attention(
         step's metadata, replicated.
       rank_ids: optional i32[dcp] sharded over `axis_name`, entry r = r.
 
+    With `layout.rows_aligned` (needs `q_own_rows`), each rank's rows are its
+    own sequence-parallel rows `j * R + [0, R)`: `flat_topk` in that order
+    (`indexer_topk`'s, empty on rank 0's DCP rows) and `out` too.
+
     Returns:
       `(kv_cache_nope, kv_cache_rope, out)`, `out` `[dcp * T, h, L]`: each
-      rank's head slice, row `i` being step row `split_rows + i`.
+      rank's head slice, row `i` being step row `split_rows + i`; aligned,
+      `[dcp * R, H, L]`, every head of each rank's own rows (rank 0's DCP rows
+      are not attended here and hold no result).
     """
     dcp = layout.dcp_size
     sharded = P(axis_name)
     rep = P()
+    if layout.rows_aligned and not q_own_rows:
+        raise ValueError("aligned rows need every head of a rank's own rows")
 
     def _local(
         nope, rope, q_nope, q_pe, kv_c, k_pe, topk, seq_lens, bt, qsl, dist, *rank_ids
@@ -490,7 +563,13 @@ def sparse_mla_attention(
         if not q_own_rows:
             q_nope = heads_to_tokens(layout, q_nope, axis_name)
             q_pe = heads_to_tokens(layout, q_pe, axis_name)
-        rr = rank_rows(layout, rank, kv_c.shape[0], seq_lens, qsl, dist[2])
+        if layout.rows_aligned:
+            rows = q_nope.shape[0]
+            num_rows = jnp.clip(qsl[dist[2]] - rank * rows, 0, rows)
+        else:
+            num_rows = rank_rows(
+                layout, rank, kv_c.shape[0], seq_lens, qsl, dist[2]
+            ).num_rows
 
         # Gather and attend at the step's page count: the kernel reads a
         # buffer of `cap` pages per rank, with no padding copy to max_pages.
@@ -500,11 +579,13 @@ def sparse_mla_attention(
                     nope, rope, page_ids[:cap], axis_name, read_pages
                 )
                 flat = restride_flat_rows(layout, topk, cap)
-                return attend(q_nope, q_pe, g_nope, g_rope, flat, rr.num_rows)
+                return attend(q_nope, q_pe, g_nope, g_rope, flat, num_rows)
 
             return run
 
         out = _switch_on_cap(layout, jnp.sum(pages), branch)
+        if layout.rows_aligned:
+            return nope, rope, out
         return nope, rope, tokens_to_heads(out, axis_name)
 
     extra = () if rank_ids is None else (rank_ids,)
@@ -553,32 +634,41 @@ def indexer_topk(
     `[T, h, d]` and `weights` `[T, h]` (replicated, every row). Returns
     `[dcp * R, K]`: each rank's rows' top-k as flat rows of the latent gather
     buffer (`flat_rows`), `-1` padded, and `-1` on padding rows.
+
+    With `layout.rows_aligned`, `q` `[dcp * R, h, d]` and `weights` `[dcp * R,
+    h]` hold each rank's own sequence-parallel rows, and so does the result
+    (`-1` on rank 0's DCP rows).
     """
     dcp = layout.dcp_size
     sharded = P(axis_name)
     rep = P()
+    aligned = layout.rows_aligned
 
     def _local(cache, q, weights, seq_lens, bt, qsl, dist, *rank_ids):
         rank = _rank(rank_ids, axis_name, dcp)
-        num_tokens = q.shape[0]
+        num_tokens = q.shape[0] * (dcp if aligned else 1)
         rows = layout.rows_per_rank(num_tokens)
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
         page_ids = gather_page_ids(layout, bt, pages, offsets, cache.shape[0])
         natural = gather_index_k(layout, cache, page_ids, jnp.sum(pages), axis_name)
         rr = rank_rows(layout, rank, num_tokens, seq_lens, qsl, dist[2])
-        q_r, w_r = own_rows(layout, q, rank), own_rows(layout, weights, rank)
+        pick = tp_rows_of_own if aligned else own_rows
+        q_r, w_r = pick(layout, q, rank), pick(layout, weights, rank)
         vpages_per_seq = bt.shape[0] // seq_lens.shape[0]
         table = natural_page_table(layout, rr, offsets, vpages_per_seq)
         positions = select_topk(q_r, w_r, natural, rr, table)
         flat = flat_rows(layout, positions, offsets[row_requests(rr, rows)])
         real = jnp.arange(rows, dtype=jnp.int32) < rr.num_rows
-        return jnp.where(real[:, None], flat, -1)
+        flat = jnp.where(real[:, None], flat, -1)
+        return own_rows_of_tp(layout, flat, rank, -1) if aligned else flat
 
     extra = () if rank_ids is None else (rank_ids,)
+    row_spec = sharded if aligned else rep
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded, rep, rep, rep, rep, rep, rep) + (sharded,) * len(extra),
+        in_specs=(sharded, row_spec, row_spec, rep, rep, rep, rep)
+        + (sharded,) * len(extra),
         out_specs=sharded,
         check_vma=False,
     )(

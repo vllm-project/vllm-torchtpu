@@ -155,11 +155,13 @@ class Step:
         ]
 
     def tp_rows(self):
-        """(rank, local row) -> step row, for the real token-parallel rows."""
+        """(rank, row of its result) -> step row, for the real token-parallel
+        rows; aligned, a rank's results are in its own-row order."""
         lay = self.layout
         per = lay.rows_per_rank(self.num_tokens)
+        base = 0 if lay.rows_aligned else lay.split_rows
         for t in range(lay.split_rows, self.total):
-            yield divmod(t - lay.split_rows, per), t
+            yield divmod(t - base, per), t
 
 
 def _write_kv_ref(layout, num_pages):
@@ -215,12 +217,14 @@ def _random_topk(rng, pos):
     return np.concatenate([sel, -np.ones(TOPK - n, np.int64)]).astype(np.int32)
 
 
-@pytest.mark.parametrize("q_own_rows", [False, True])
+@pytest.mark.parametrize("rows", ["heads", "own", "aligned"])
 @pytest.mark.parametrize("dcp", sorted(CASES))
-def test_sparse_mla_attention_matches_natural_reference(dcp, q_own_rows):
+def test_sparse_mla_attention_matches_natural_reference(dcp, rows):
     mesh = _mesh(dcp)
     case = CASES[dcp]
-    lay, num_tokens = case["layout"], case["num_tokens"]
+    q_own_rows = rows != "heads"
+    lay = dataclasses.replace(case["layout"], rows_aligned=rows == "aligned")
+    num_tokens = case["num_tokens"]
     st = Step(lay, num_tokens, case["reqs"])
     rng = np.random.default_rng(1)
     heads = 2 * dcp  # 2 per rank
@@ -248,9 +252,12 @@ def test_sparse_mla_attention_matches_natural_reference(dcp, q_own_rows):
 
     # Each rank's head slice of every row, stacked rank-major.
     q_sharded = q_full.reshape(num_tokens, dcp, 2, -1).transpose(1, 0, 2, 3)
-    # Every head of each rank's rows S + j * R + [0, R) (zero past T).
+    # Every head of each rank's rows S + j * R + [0, R) (zero past T), or,
+    # aligned, of its own rows j * R + [0, R).
     q_rows = np.concatenate([q_full, np.zeros_like(q_full[: lay.split_rows])])
     q_own = q_rows[lay.split_rows :].reshape(dcp * per, heads, -1)
+    if lay.rows_aligned:
+        q_own = q_full
     q_in = q_own if q_own_rows else q_sharded.reshape(dcp * num_tokens, 2, -1)
     nope, rope, out = jax.jit(
         lambda *a: tp.sparse_mla_attention(
@@ -272,9 +279,15 @@ def test_sparse_mla_attention_matches_natural_reference(dcp, q_own_rows):
         jnp.asarray(topk_flat.reshape(dcp * per, TOPK)),
         *st.args(),
     )
-    out = np.asarray(out).reshape(dcp, num_tokens, 2, DN)
-    # Back to [rows, heads]: step row S + i is out[:, i].
-    out = out.transpose(1, 0, 2, 3).reshape(num_tokens, heads, DN)
+    if lay.rows_aligned:
+        # Own rows in step order: step row t is out[t].
+        out = np.asarray(out).reshape(num_tokens, heads, DN)
+        base = 0
+    else:
+        out = np.asarray(out).reshape(dcp, num_tokens, 2, DN)
+        # Back to [rows, heads]: step row S + i is out[:, i].
+        out = out.transpose(1, 0, 2, 3).reshape(num_tokens, heads, DN)
+        base = lay.split_rows
 
     checked = 0
     for (rank, i), t in st.tp_rows():
@@ -287,7 +300,7 @@ def test_sparse_mla_attention_matches_natural_reference(dcp, q_own_rows):
             jnp.asarray(st.rope[r][idx][None]),
             jnp.asarray(valid[None]),
         )[0]
-        np.testing.assert_allclose(out[t - lay.split_rows], want, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(out[t - base], want, rtol=1e-5, atol=1e-6)
         checked += 1
     assert checked == st.total - lay.split_rows
 
@@ -339,11 +352,14 @@ def _select_topk_ref(layout):
     return select
 
 
+@pytest.mark.parametrize("aligned", [False, True])
 @pytest.mark.parametrize("dcp", sorted(CASES))
-def test_indexer_topk_matches_natural_reference(dcp):
+def test_indexer_topk_matches_natural_reference(dcp, aligned):
     mesh = _mesh(dcp)
     case = CASES[dcp]
-    lay, num_tokens = case["layout"], case["num_tokens"]
+    # Aligned, the same rows are each rank's own rows (sharded, not replicated).
+    lay = dataclasses.replace(case["layout"], rows_aligned=aligned)
+    num_tokens = case["num_tokens"]
     st = Step(lay, num_tokens, case["reqs"], seed=2)
     rng = np.random.default_rng(3)
     per = lay.rows_per_rank(num_tokens)
@@ -410,6 +426,9 @@ def test_layout_rejects_unservable_buckets():
     lay = CASES[4]["layout"]
     with pytest.raises(ValueError):
         lay.rows_per_rank(lay.split_rows)
+    # Aligned, rank 0 must hold every DCP row.
+    with pytest.raises(ValueError):
+        dataclasses.replace(lay, rows_aligned=True).rows_per_rank(32)
     with pytest.raises(ValueError):
         lay.rows_per_rank(258)
     with pytest.raises(ValueError):
