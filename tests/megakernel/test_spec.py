@@ -338,3 +338,28 @@ def test_resolve_pool_layout_from_standalone_model_spec():
     pt, ckpt, roff, min_pages = cache.default_pool_layout(ms, ex)
     assert pt.shape == (4, 2) and ckpt.shape == (1, 4, 1) and roff.shape == (1, 4)
     assert min_pages >= 8
+
+
+def test_pack_spec_logical_weights_slices_2d_smalls_along_layer_axis():
+    """`pack_spec_logical_weights` slices 2-D `(L, W)` smalls by layer, not column."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from tests.megakernel.megakernel_fakes import TINY_TILES, make_fake_model_spec
+    from vllm_torchtpu.megakernel import planner
+    from vllm_torchtpu.megakernel.weights.spec_inputs import random_spec_logical_weights
+    from vllm_torchtpu.megakernel.weights.spec_pack import pack_spec_logical_weights
+
+    ms = make_fake_model_spec(L=2, att_every=2, H=256)
+    ex = ExecSpec(B=4, T=1, R=2, ctx=256, stack_e=True, tiles=TINY_TILES)
+    w_log = random_spec_logical_weights(jax.random.PRNGKey(0), ms, ex)
+    assert w_log["in_norm"].shape == (2, 256)
+    w_log["in_norm"] = jnp.stack(
+        [jnp.full((256,), 1.25, dtype=F32), jnp.full((256,), 2.75, dtype=F32)], axis=0
+    )
+    packed = pack_spec_logical_weights(ms, ex, w_log)
+    o_in, w_in = planner.plan(ms, ex).smalls_layout["in_norm"]
+    assert w_in == 256
+    np.testing.assert_allclose(packed["smalls"][:, 0, 0, o_in : o_in + w_in], 1.25)
+    np.testing.assert_allclose(packed["smalls"][:, 1, 0, o_in : o_in + w_in], 2.75)
