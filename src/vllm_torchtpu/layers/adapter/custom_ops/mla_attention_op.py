@@ -1028,8 +1028,13 @@ class VllmTPUMLAAttention(MLAAttention):
                     "dcp_q_replicate is set but no DCP group is initialized, "
                     "so W_UK_T cannot be gathered across the group."
                 )
-            self.W_UK_T_dcp_qrep = fresh_buffer(
-                dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
+            # Upstream vLLM (0.32.0, MLAAttention.process_weights_after_loading)
+            # registers W_UK_T_dcp_qrep as an nn.Parameter. Module.__setattr__
+            # then refuses a plain tensor for that name, so wrap it the same
+            # way as W_UK_T above.
+            self.W_UK_T_dcp_qrep = Parameter(
+                fresh_buffer(dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)),
+                requires_grad=False,
             )
             if hasattr(self, "W_UK_T_scale"):
                 self.W_UK_T_dcp_qrep_scale = fresh_buffer(
