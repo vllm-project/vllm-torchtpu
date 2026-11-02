@@ -338,8 +338,9 @@ def _select_topk_ref(layout):
     return select
 
 
+@pytest.mark.parametrize("q_own_rows", [False, True])
 @pytest.mark.parametrize("dcp", sorted(CASES))
-def test_indexer_topk_matches_natural_reference(dcp):
+def test_indexer_topk_matches_natural_reference(dcp, q_own_rows):
     mesh = _mesh(dcp)
     case = CASES[dcp]
     lay, num_tokens = case["layout"], case["num_tokens"]
@@ -348,12 +349,36 @@ def test_indexer_topk_matches_natural_reference(dcp):
     per = lay.rows_per_rank(num_tokens)
     q = rng.standard_normal((num_tokens, 1, IDX_ROWS * IDX_SUB)).astype(np.float32)
     weights = np.ones((num_tokens, 1), np.float32)
+    if q_own_rows:
+        q_in = np.concatenate(
+            [
+                q[np.minimum(lay.split_rows + r * per + np.arange(per), num_tokens - 1)]
+                for r in range(dcp)
+            ]
+        )
+        w_in = np.concatenate(
+            [
+                weights[
+                    np.minimum(
+                        lay.split_rows + r * per + np.arange(per), num_tokens - 1
+                    )
+                ]
+                for r in range(dcp)
+            ]
+        )
+    else:
+        q_in, w_in = q, weights
 
     flat = jax.jit(
         lambda *a: tp.indexer_topk(
-            lay, mesh, AXIS, *a, select_topk=_select_topk_ref(lay)
+            lay,
+            mesh,
+            AXIS,
+            *a,
+            select_topk=_select_topk_ref(lay),
+            q_own_rows=q_own_rows,
         )
-    )(jnp.asarray(st.idx_cache), jnp.asarray(q), jnp.asarray(weights), *st.args())
+    )(jnp.asarray(st.idx_cache), jnp.asarray(q_in), jnp.asarray(w_in), *st.args())
     flat = np.asarray(flat).reshape(dcp, per, TOPK)
 
     _, offsets = (

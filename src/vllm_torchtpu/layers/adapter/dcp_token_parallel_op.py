@@ -681,7 +681,11 @@ def attention(
     return torch.cat([head, tail[: num_tokens - s]])
 
 
-def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayout):
+def build_indexer_op(
+    indexer: Any,
+    layout: dcp_token_parallel.TokenParallelLayout,
+    q_own_rows: bool = False,
+):
     """The token-parallel top-k op of a DCP indexer: `(q_bytes, weights,
     kv_cache, k_packed, seq_lens, page_indices, cu_q_lens, distribution) ->
     [T / dcp, topk]` this rank's rows as flat gather-buffer rows. Writes every
@@ -778,6 +782,7 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
             distribution,
             select_topk=select,
             rank_ids=rank_ids,
+            q_own_rows=q_own_rows,
         )
         return cache_kv, flat
 
@@ -831,11 +836,13 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
         )
 
     sharded, rep = P(DCP_AXIS_NAME), P()
-    in_specs = (rep, rep, sharded, rep, rep, rep, rep, rep, sharded)
+    q_spec = sharded if q_own_rows else rep
+    in_specs = (q_spec, q_spec, sharded, rep, rep, rep, rep, rep, sharded)
     if rank_tensor is not None:
         in_specs += (sharded,)
     op = pcp_streaming_jax_op(
-        f"pallas::streamidx_topk_tp_{indexer.k_cache.prefix.replace('.', '_')}",
+        f"pallas::streamidx_topk_tp_{indexer.k_cache.prefix.replace('.', '_')}"
+        + ("_qown" if q_own_rows else ""),
         streamidx_topk_tp if rank_tensor is None else streamidx_topk_tp_rank,
         donate_argnums=(2,),
         mesh=mesh,
@@ -845,9 +852,10 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
 
     def _fake(q_bytes, weights, cache_kv, *rest, **kwargs):
         del weights, rest, kwargs
+        out_rows = q_bytes.shape[0] if q_own_rows else q_bytes.shape[0] // dcp
         return (
             torch.empty_like(cache_kv),
-            q_bytes.new_empty((q_bytes.shape[0] // dcp, topk), dtype=torch.int32),
+            q_bytes.new_empty((out_rows, topk), dtype=torch.int32),
         )
 
     op.register_fake(_fake)
@@ -860,6 +868,7 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
         return flat
 
     run.layout = layout  # type: ignore[attr-defined]
+    run.q_own_rows = q_own_rows  # type: ignore[attr-defined]
     return run
 
 
@@ -877,6 +886,7 @@ def indexer_rows(
     """`[split_rows + T / dcp, topk]`: the DCP sub-batch's rank-local top-k,
     then this rank's token-parallel rows (see the module docstring)."""
     s = indexer.topk_op_tp.layout.split_rows
+    q_own = getattr(indexer.topk_op_tp, "q_own_rows", False)
     seq_s, qsl_s, dist_s = dcp_rows_metadata(seq_lens, cu_q_lens, distribution, s)
     head = indexer.topk_op_dcp(
         q_bytes[:s],
@@ -889,8 +899,8 @@ def indexer_rows(
         dist_s,
     )
     tail = indexer.topk_op_tp(
-        q_bytes,
-        weights,
+        q_bytes[s:] if q_own else q_bytes,
+        weights[s:] if q_own else weights,
         kv_cache,
         k_packed,
         seq_lens,

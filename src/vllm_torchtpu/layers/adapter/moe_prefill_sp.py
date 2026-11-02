@@ -62,7 +62,11 @@ from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_me
 from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
     grouped_shared_expert_sharded,
 )
-from vllm_torchtpu.layers.adapter import fused_moe_decode, fused_moe_ep
+from vllm_torchtpu.layers.adapter import (
+    dcp_token_parallel_op,
+    fused_moe_decode,
+    fused_moe_ep,
+)
 from vllm_torchtpu.layers.adapter.attention import _retain_buffers
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
@@ -284,9 +288,60 @@ class _GatherProjections(_OProjReduceScatter):
     @staticmethod
     def project_gather(
         mla: Any, x: torch.Tensor, num_tokens: int
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        parts = [mla.fused_qkv_a_proj(x)[0]]
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor | None]:
+        qkv = mla.fused_qkv_a_proj(x)[0]
         indexer = mla.indexer if not mla.skip_topk else None
+        tp_op = getattr(getattr(mla, "mla_attn", None), "sparse_mla_tp_op", None)
+        idx_qown = indexer is None or getattr(
+            getattr(getattr(indexer, "indexer_op", None), "topk_op_tp", None),
+            "q_own_rows",
+            False,
+        )
+        rows_local = x.shape[0]
+        if (
+            tp_op is not None
+            and getattr(tp_op, "q_replicated", False)
+            and getattr(tp_op, "rank", None) is not None
+            and dcp_token_parallel_op.applies(num_tokens)
+            and not getattr(mla, "gate_is_fused", False)
+            and getattr(mla, "kimi_preprocess", None) is None
+            and not getattr(mla, "qb_overlap", False)
+            and idx_qown
+            and mla.q_lora_rank is not None
+        ):
+            tp = tp_op.layout.dcp_size
+            s = tp_op.layout.split_rows
+            q_lora = int(mla.q_lora_rank)
+            if (
+                num_tokens == tp * rows_local
+                and get_tensor_model_parallel_world_size() == tp
+                and 0 < s <= rows_local
+                and (s * q_lora) % rows_local == 0
+            ):
+                kv_dim = qkv.shape[-1] - q_lora
+                q_c_local, kv_lora_local = qkv.split([q_lora, kv_dim], dim=-1)
+                cols_qc = (s * q_lora) // rows_local
+                parts = [kv_lora_local, q_c_local[:s].reshape(rows_local, cols_qc)]
+                if indexer is not None:
+                    parts.append(indexer.wk_weights_proj(x)[0])
+                gathered = _all_rows(torch.cat(parts, dim=-1), num_tokens)
+                kv_lora = gathered[:, :kv_dim]
+                all_heads = gathered[:, kv_dim : kv_dim + cols_qc].reshape(
+                    tp, s, q_lora
+                )
+                kw = gathered[:, kv_dim + cols_qc :] if indexer is not None else None
+                rank = tp_op.rank.view(1)
+                next_rank = torch.clamp(rank + 1, max=tp - 1)
+                from_next = all_heads.index_select(0, next_rank).squeeze(0)
+                tail_s = torch.where(
+                    rank.view(1, 1) < tp - 1,
+                    from_next,
+                    q_c_local[-1:].expand(s, -1),
+                )
+                q_c_qrows = torch.cat([all_heads[0], q_c_local[s:], tail_s], dim=0)
+                return (q_c_qrows, kv_lora), kw
+
+        parts = [qkv]
         if indexer is not None:
             parts.append(indexer.wk_weights_proj(x)[0])
         rows = _all_rows(torch.cat(parts, dim=-1), num_tokens)

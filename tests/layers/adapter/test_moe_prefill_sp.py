@@ -319,3 +319,72 @@ def test_shared_slices_are_stacked_into_four_model_wide_tensors():
         torch.testing.assert_close(
             w2.float(), parts[idx][2].to(torch.float8_e4m3fn).float(), rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize("tp,num_tokens,split_rows", [(4, 128, 16), (16, 8192, 64)])
+def test_gather_projections_slim_qrows_matches_full_gather(tp, num_tokens, split_rows):
+    from vllm_torchtpu.kernels.mla.dcp_token_parallel import TokenParallelLayout
+    from vllm_torchtpu.layers.adapter import dcp_token_parallel_op as tp_op_mod
+
+    rows_local = num_tokens // tp
+    q_lora, kv_dim, kw_dim, hidden = 1536, 576, 192, 32
+    full_x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
+    w_qkv = torch.randn(hidden, q_lora + kv_dim, dtype=torch.bfloat16)
+    w_kw = torch.randn(hidden, kw_dim, dtype=torch.bfloat16)
+    full_qkv = full_x @ w_qkv
+    full_qc, full_kv = full_qkv.split([q_lora, kv_dim], dim=-1)
+    full_kw = full_x @ w_kw
+    layout = TokenParallelLayout(tp, 4, 256, split_rows=split_rows, max_pages=8)
+
+    # Mock all-gather concatenating every rank's local tensor on dim 0.
+    local_parts: dict[int, torch.Tensor] = {}
+
+    for r in range(tp):
+        x_r = full_x[r * rows_local : (r + 1) * rows_local]
+        qkv_r = x_r @ w_qkv
+        qc_r, kv_r = qkv_r.split([q_lora, kv_dim], dim=-1)
+        cols_qc = (split_rows * q_lora) // rows_local
+        local_parts[r] = torch.cat(
+            [kv_r, qc_r[:split_rows].reshape(rows_local, cols_qc), x_r @ w_kw], dim=-1
+        )
+    gathered_all = torch.cat([local_parts[r] for r in range(tp)], dim=0)
+    assert gathered_all.shape == (
+        num_tokens,
+        kv_dim + (split_rows * q_lora) // rows_local + kw_dim,
+    )
+
+    for r in range(tp):
+        rank_t = torch.tensor([r], dtype=torch.int32)
+        tp_op = SimpleNamespace(layout=layout, q_replicated=True, rank=rank_t)
+        indexer = SimpleNamespace(
+            wk_weights_proj=lambda z: (z @ w_kw, None),
+            indexer_op=SimpleNamespace(topk_op_tp=SimpleNamespace(q_own_rows=True)),
+        )
+        mla = SimpleNamespace(
+            fused_qkv_a_proj=lambda z: (z @ w_qkv, None),
+            indexer=indexer,
+            skip_topk=False,
+            mla_attn=SimpleNamespace(sparse_mla_tp_op=tp_op),
+            gate_is_fused=False,
+            kimi_preprocess=None,
+            qb_overlap=False,
+            q_lora_rank=q_lora,
+        )
+        with (
+            patch.object(tp_op_mod, "applies", return_value=True),
+            patch.object(sp, "get_tensor_model_parallel_world_size", return_value=tp),
+            patch.object(
+                sp, "tensor_model_parallel_all_gather", return_value=gathered_all
+            ),
+        ):
+            pre_qkv, pre_kw = sp._GatherProjections.project_gather(
+                mla, full_x[r * rows_local : (r + 1) * rows_local], num_tokens
+            )
+        assert isinstance(pre_qkv, tuple)
+        got_qc, got_kv = pre_qkv
+        q_idx = tp_op_mod.q_rows(tp_op, num_tokens)
+        want_qc = full_qc.index_select(0, q_idx)
+        torch.testing.assert_close(got_qc, want_qc, rtol=0, atol=0)
+        torch.testing.assert_close(got_kv, full_kv, rtol=0, atol=0)
+        assert pre_kw is not None
+        torch.testing.assert_close(pre_kw, full_kw, rtol=0, atol=0)

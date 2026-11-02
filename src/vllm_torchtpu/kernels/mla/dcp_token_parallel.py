@@ -549,13 +549,16 @@ def indexer_topk(
     *,
     select_topk: SelectTopkFn,
     rank_ids: jax.Array | None = None,
+    q_own_rows: bool = False,
 ) -> jax.Array:
     """Token-parallel indexer top-k for one layer (global view).
 
     `index_cache` (position shards, this step's K already written), `q`
-    `[T, h, d]` and `weights` `[T, h]` (replicated, every row). Returns
-    `[dcp * R, K]`: each rank's rows' top-k as flat rows of the latent gather
-    buffer (`flat_rows`), `-1` padded, and `-1` on padding rows.
+    `[T, h, d]` and `weights` `[T, h]` (replicated, every row; or, with
+    `q_own_rows`, `[dcp * R, h, d]` and `[dcp * R, h]`, each rank's own rows
+    sharded on `axis_name`). Returns `[dcp * R, K]`: each rank's rows' top-k
+    as flat rows of the latent gather buffer (`flat_rows`), `-1` padded, and
+    `-1` on padding rows.
     """
     dcp = layout.dcp_size
     sharded = P(axis_name)
@@ -563,13 +566,17 @@ def indexer_topk(
 
     def _local(cache, q, weights, seq_lens, bt, qsl, dist, *rank_ids):
         rank = _rank(rank_ids, axis_name, dcp)
-        num_tokens = q.shape[0]
+        num_tokens = q.shape[0] * dcp if q_own_rows else q.shape[0]
         rows = layout.rows_per_rank(num_tokens)
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
         page_ids = gather_page_ids(layout, bt, pages, offsets, cache.shape[0])
         natural = gather_index_k(layout, cache, page_ids, jnp.sum(pages), axis_name)
         rr = rank_rows(layout, rank, num_tokens, seq_lens, qsl, dist[2])
-        q_r, w_r = own_rows(layout, q, rank), own_rows(layout, weights, rank)
+        q_r, w_r = (
+            (q, weights)
+            if q_own_rows
+            else (own_rows(layout, q, rank), own_rows(layout, weights, rank))
+        )
         vpages_per_seq = bt.shape[0] // seq_lens.shape[0]
         table = natural_page_table(layout, rr, offsets, vpages_per_seq)
         positions = select_topk(q_r, w_r, natural, rr, table)
@@ -578,10 +585,12 @@ def indexer_topk(
         return jnp.where(real[:, None], flat, -1)
 
     extra = () if rank_ids is None else (rank_ids,)
+    q_spec = sharded if q_own_rows else rep
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded, rep, rep, rep, rep, rep, rep) + (sharded,) * len(extra),
+        in_specs=(sharded, q_spec, q_spec, rep, rep, rep, rep)
+        + (sharded,) * len(extra),
         out_specs=sharded,
         check_vma=False,
     )(
