@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST: float = 0.0
     VLLM_TPU_DECODE_TPOT_CAP_MS: tuple[tuple[int, float], ...] = ()
     VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST: float = 0.0
+    VLLM_TPU_DP_LB_EXACT_INFLIGHT: bool = False
 
 
 def env_with_choices(
@@ -1395,6 +1396,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST": env_nonnegative_float(
         "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST", 0.0
     ),
+    # With data parallelism and one API server, route each new request to the
+    # engine with the fewest of its unfinished requests, ignoring the DP
+    # coordinator's lagging snapshot (core/dp_lb_exact_inflight.py).
+    "VLLM_TPU_DP_LB_EXACT_INFLIGHT": env_bool("VLLM_TPU_DP_LB_EXACT_INFLIGHT"),
 }
 
 

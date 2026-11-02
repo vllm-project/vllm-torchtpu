@@ -31,6 +31,7 @@ from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, patch_registry
+from vllm_torchtpu.core.dp_lb_exact_inflight import check_api_server_count
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
@@ -792,6 +793,7 @@ class TpuPlatform(Platform):
                 "nothing. Unset it; the fused expert-parallel MoE kernel is "
                 "USE_MOE_FUSED_EP_KERNEL=1."
             )
+        check_api_server_count(vllm_config.parallel_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
