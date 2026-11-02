@@ -1090,9 +1090,12 @@ def test_a_recurrent_model_verifying_without_a_drafter_keeps_its_checkpoints() -
         ("mamba_ckpt_indices", (8, 4)),
     ]
     assert exporter._req_dist_len(adapter) == 6
-    with pytest.raises(ValueError, match="without speculative decoding"):
+    # A drafter proposing 2 tokens leaves the window at 4 verify slots.
+    mtp = {"method": "mtp", "num_speculative_tokens": 2}
+    assert dataclasses.replace(cfg, speculative_config=mtp).recurrent_window == 4
+    with pytest.raises(ValueError, match="must exceed"):
         dataclasses.replace(
-            cfg, speculative_config={"method": "mtp", "num_speculative_tokens": 2}
+            cfg, speculative_config={**mtp, "num_speculative_tokens": 3}
         )
     with pytest.raises(ValueError, match=">= 0"):
         dataclasses.replace(cfg, max_verify_tokens=-1)
@@ -1119,11 +1122,23 @@ def test_max_verify_tokens_loads_vllm_with_a_drafterless_speculative_config(
     )
     assert (cfg.speculative_config, cfg.max_verify_tokens) == (None, 3)
     assert cfg.req_buckets == (8,)
-    args = SimpleNamespace(
-        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
-        max_verify_tokens=2,
+    # With MTP, vLLM loads the artifact's config with the wider window, and the
+    # request buckets cover the drafter's rows only.
+    mtp = {"method": "mtp", "num_speculative_tokens": 2}
+    assert cli.verify_window_speculative_config(8, mtp) == {
+        "method": "mtp",
+        "num_speculative_tokens": 8,
+    }
+    vllm_config.speculative_config = SimpleNamespace(num_speculative_tokens=8)
+    cfg = universal_adapter.build_export_config_from_vllm(
+        vllm_config,
+        token_buckets=(16, 256),
+        max_verify_tokens=8,
+        num_speculative_tokens=2,
     )
-    with pytest.raises(ValueError, match="without --speculative-config"):
+    assert cfg.req_buckets == (8, 16, 24)
+    args = SimpleNamespace(speculative_config=mtp, max_verify_tokens=2)
+    with pytest.raises(ValueError, match="must exceed"):
         cli.run_export_from_args(args, vllm_config=vllm_config)
 
 
