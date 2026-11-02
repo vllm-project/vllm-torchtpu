@@ -1098,3 +1098,191 @@ def test_fp4_row_padded_flat_scales_refuse_the_wrong_row_count():
             weight_format=WeightFormat.FP4,
             rhs_qb=rhs_qb,
         )
+
+
+# ---------------------------------------------------------------------------
+# Static expert layout (vllm_torchtpu/expert_placement.py): the weights sit
+# in slot order, spare slots hold replicas, and `expert_slot` maps the
+# selected global ids to slots after selection.
+
+
+def _placement_slots(rng, e_total, spare, ep=EP):
+    """(expert of each slot, [experts, replicas] slot table) for a random
+    layout with `spare` extra slots per shard holding replicas."""
+    g_local = e_total // ep
+    ranks = [list(r) for r in rng.permutation(e_total).reshape(ep, g_local)]
+    hot = rng.choice(e_total, size=ep * spare, replace=False)
+    for i, e in enumerate(hot):
+        r = next(r for r in (np.arange(ep) + i) % ep if e not in ranks[r])
+        while len(ranks[r]) >= g_local + spare:
+            r = (r + 1) % ep
+            while e in ranks[r]:
+                r = (r + 1) % ep
+        ranks[r].append(int(e))
+    width = g_local + spare
+    expert_of_slot = np.array([e for held in ranks for e in held])
+    held_at = [list(np.flatnonzero(expert_of_slot == e)) for e in range(e_total)]
+    reps = max(len(h) for h in held_at)
+    table = np.array([h + [-1] * (reps - len(h)) for h in held_at], np.int32)
+    assert expert_of_slot.size == ep * width
+    return expert_of_slot, table
+
+
+def _placed_fp4_case(
+    mesh, rng, *, e_total, spare, tokens, hidden, inter, topk, routing
+):
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 52, hidden=hidden, inter=inter, e_total=e_total, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 53, tokens=tokens, hidden=hidden, e_total=e_total)
+    expert_of_slot, slot_table = _placement_slots(rng, e_total, spare)
+    expert_sharding = NamedSharding(mesh, P(AXIS))
+
+    def to_slot_order(a):
+        return jax.device_put(np.asarray(a)[expert_of_slot], expert_sharding)
+
+    extra = {}
+    if routing == "score_bias":
+        extra["score_bias"] = jnp.asarray(
+            rng.normal(size=(e_total,)).astype(np.float32)
+        )
+    elif routing == "hash":
+        extra["hash_topk_ids"] = _make_hash_ids(
+            mesh, 55, tokens=tokens, topk=topk, e_total=e_total
+        )
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+        **extra,
+    )
+    placed_weights = tuple(to_slot_order(a) for a in (*weights, *scales))
+    return x, gating, weights, scales, placed_weights, slot_table, common
+
+
+@pytest.mark.parametrize("spare", [0, 1])
+@pytest.mark.parametrize("routing", ["topk", "score_bias", "hash"])
+def test_expert_slot_placement_is_bit_exact(routing, spare):
+    """A static layout moves experts between shards and nothing else.
+
+    The weights go in slot order, `expert_slot` maps each global expert to
+    its slots after selection, and every token must come out with the same
+    bits as the unplaced layer -- on the served fp4 block-512 form, for the
+    plain top-k, the bias-corrected top-k and the hash-table selections, with
+    and without spare slots holding replicas. The control checks the
+    layout really moved experts across shards.
+    """
+    mesh = _mesh()
+    rng = np.random.default_rng(54 + spare)
+    x, gating, weights, scales, placed_weights, slot_table, common = _placed_fp4_case(
+        mesh,
+        rng,
+        e_total=32,
+        spare=spare,
+        tokens=256,
+        hidden=1024,
+        inter=512,
+        topk=4,
+        routing=routing,
+    )
+    identity = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    placed = fused_ep_moe_v2(
+        x, *placed_weights, gating, expert_slot=jnp.asarray(slot_table), **common
+    )
+    np.testing.assert_array_equal(np.asarray(placed), np.asarray(identity))
+    if spare:
+        return
+    unmapped = fused_ep_moe_v2(x, *placed_weights, gating, **common)
+    assert not np.array_equal(np.asarray(unmapped), np.asarray(identity))
+
+
+def test_thirteen_slot_layout_is_bit_exact_at_the_dp32_shape():
+    """The DP32 per-device shape on eight shards: 96 logical experts over 8
+    shards is 12 per device, and one spare slot makes 13 (104 physical),
+    the geometry the DSv4.1-Flash DP32 layout uses."""
+    mesh = _mesh()
+    rng = np.random.default_rng(61)
+    x, gating, weights, scales, placed_weights, slot_table, common = _placed_fp4_case(
+        mesh,
+        rng,
+        e_total=96,
+        spare=1,
+        tokens=1152,
+        hidden=1024,
+        inter=512,
+        topk=6,
+        routing="score_bias",
+    )
+    assert slot_table.shape == (96, 2)
+    identity = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    placed = fused_ep_moe_v2(
+        x, *placed_weights, gating, expert_slot=jnp.asarray(slot_table), **common
+    )
+    np.testing.assert_array_equal(np.asarray(placed), np.asarray(identity))
+
+
+def test_replica_rows_split_evenly_between_the_copies():
+    """The token-row rule sends row r's pick of e to copy (row_base + r) mod
+    replicas(e): rows that all pick e alternate between its two slots
+    exactly, the base row shifts the parity, and an expert with one slot
+    keeps it. Positions in the [rows, K] selection are kept."""
+    rng = np.random.default_rng(71)
+    e_total, ep, rows, topk = 32, EP, 1024, 4
+    _, table = _placement_slots(rng, e_total, 1, ep=ep)
+    replicated = [e for e in range(e_total) if table[e, 1] >= 0]
+    single = [e for e in range(e_total) if table[e, 1] < 0]
+    assert replicated and single
+    e, s = replicated[0], single[0]
+    ids = np.stack([rng.choice(e_total, size=topk, replace=False) for _ in range(rows)])
+    ids[:, 0] = e
+    ids[:, 1] = s
+    for row_base in (0, 5):
+        slots = np.asarray(
+            layer._to_slots(jnp.asarray(ids, jnp.int32), jnp.asarray(table), row_base)
+        )
+        parity = (np.arange(rows) + row_base) % 2
+        np.testing.assert_array_equal(
+            slots[:, 0], np.where(parity == 0, table[e, 0], table[e, 1])
+        )
+        np.testing.assert_array_equal(slots[:, 1], np.full(rows, table[s, 0]))
+        # Every other pick lands on one of its expert's slots.
+        for k in (2, 3):
+            held = table[ids[:, k]]
+            assert np.all((slots[:, k] == held[:, 0]) | (slots[:, k] == held[:, 1]))
+
+
+def test_expert_load_counts_the_rows_per_physical_slot():
+    """With an accumulator the layer returns it plus this step's rows per
+    physical slot, the same on every shard, and the output is unchanged."""
+    mesh = _mesh()
+    e_total, tokens, topk = 32, 256, 4
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 81, hidden=1024, inter=512, e_total=e_total, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 82, tokens=tokens, hidden=1024, e_total=e_total)
+    hash_ids = _make_hash_ids(mesh, 83, tokens=tokens, topk=topk, e_total=e_total)
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        hash_topk_ids=hash_ids,
+    )
+    plain = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    load = jnp.full((e_total,), 5, jnp.int32)
+    out, updated = fused_ep_moe_v2(
+        x, *weights, *scales, gating, expert_load=load, **common
+    )
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(plain))
+    expected = 5 + np.bincount(np.asarray(hash_ids).ravel(), minlength=e_total)
+    np.testing.assert_array_equal(np.asarray(updated), expected)

@@ -77,7 +77,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, expert_relayout, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -768,6 +768,11 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_max_reqs: int = 0
         self._draft_proposals_needed: bool = True
         self._dp_step_has_encoder_inputs = False
+        # The coordinated step counter (one per _dp_coordinated_step call,
+        # identical on every rank) and the dynamic expert re-layout
+        # controller the worker arms after warm-up (expert_relayout.py).
+        self._dp_step_index: int = 0
+        self._expert_relayout: Any = None
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3559,6 +3564,13 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
+        # The last five fields belong to the dynamic expert re-layout
+        # (expert_relayout.py): its plan hash twice (max and -min say whether
+        # every rank solved the same plan), -staged generation (the max is
+        # -the slowest rank's), and -tokens and -requests (the min over ranks,
+        # for `step_phase`). The vector's length is the same on every rank.
+        controller = self._expert_relayout
+        relayout = controller.fields() if controller is not None else (0, 0, 0)
         t = torch.tensor(
             [
                 int(local_num_tokens),
@@ -3566,6 +3578,9 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_num_reqs),
                 int(has_encoder_inputs),
                 int(needs_draft_proposals),
+                *(int(v) for v in relayout),
+                -int(local_num_tokens),
+                -int(local_num_reqs),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3573,7 +3588,22 @@ class TPUModelRunner(GPUModelRunner):
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
+        self._dp_step_index += 1
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
+        if controller is not None:
+            controller.on_step(
+                self._dp_step_index,
+                (int(t[5].item()), int(t[6].item()), int(t[7].item())),
+                phase=expert_relayout.step_phase(
+                    bucket,
+                    max_tokens=int(t[0].item()),
+                    min_tokens=-int(t[8].item()),
+                    num_chunks=int(t[1].item()),
+                    max_reqs=int(t[2].item()),
+                    min_reqs=-int(t[9].item()),
+                    max_num_reqs=int(self.max_num_reqs),
+                ),
+            )
         # Spec-decode draft forwards size themselves off the step's DP-wide
         # max per-chunk request count (see DFlashProposer), riding this same
         # all-reduce instead of paying the theoretical max bucket or a
@@ -3639,6 +3669,9 @@ class TPUModelRunner(GPUModelRunner):
             use_max_model_len=True,
             dp_lockstep=True,
         )
+        relayout = self._expert_relayout
+        if relayout is not None:
+            relayout.after_dispatch()
 
     def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
         """Pair encoder, target and draft collectives on an idle EP-DP rank."""
@@ -3976,6 +4009,11 @@ class TPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
                 )
+            # The dynamic expert re-layout's device legs go behind this
+            # step's launches (expert_relayout.py), never ahead of them.
+            relayout = self._expert_relayout
+            if relayout is not None:
+                relayout.after_dispatch()
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling

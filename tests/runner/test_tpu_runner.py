@@ -128,11 +128,15 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
     runner = SimpleNamespace(
         _dp_lockstep_enabled=lambda: True,
         num_tokens_paddings=[128, 2048],
+        _expert_relayout=None,
+        _dp_step_index=0,
     )
 
     def reduce(tensor, **kwargs):
-        assert tensor.tolist() == [0, 0, 0, 0, 0]
-        tensor.copy_(torch.tensor([2048, 2, 1, 0, int(peer_needs_draft)]))
+        assert tensor.tolist() == [0] * 10
+        tensor.copy_(
+            torch.tensor([2048, 2, 1, 0, int(peer_needs_draft), 0, 0, 0, 0, 0])
+        )
 
     with (
         patch("vllm.distributed.parallel_state.get_dp_group") as group,
@@ -145,6 +149,38 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
     assert result == (2048, 2)
     assert runner._draft_proposals_needed is peer_needs_draft
     collective.assert_called_once()
+
+
+def test_dp_step_carries_the_relayout_fields_and_calls_the_controller():
+    seen = []
+
+    class Controller:
+        def fields(self):
+            return (0x5A5A, -0x5A5A, -3)
+
+        def on_step(self, step, reduced, phase):
+            seen.append((step, reduced, phase))
+
+    runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True,
+        num_tokens_paddings=[128, 2048],
+        _expert_relayout=Controller(),
+        _dp_step_index=41,
+        max_num_reqs=1,
+    )
+
+    def reduce(tensor, **kwargs):
+        assert tensor.tolist()[5:] == [0x5A5A, -0x5A5A, -3, 0, 0]
+        tensor.copy_(torch.tensor([128, 1, 1, 0, 1, 0x5A5A, -0x5A5A, -2, -128, -1]))
+
+    with (
+        patch("vllm.distributed.parallel_state.get_dp_group") as group,
+        patch.object(torch.distributed, "all_reduce", side_effect=reduce),
+    ):
+        group.return_value.cpu_group = "cpu-group"
+        TPUModelRunner._dp_coordinated_step(runner, 0, 0)
+    assert runner._dp_step_index == 42
+    assert seen == [(42, (0x5A5A, -0x5A5A, -2), "decode")]
 
 
 def test_non_lockstep_partial_prefill_skips_proposals():
