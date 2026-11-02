@@ -237,7 +237,8 @@ def _fused_moe_kernel(
     m_count,
     m_visit,
     v_expert,
-    tok_sm,  # SMEM int32 [2, tile_m + 128]
+    tok_sm0,  # SMEM int32 [tile_m + 128]: token ids of even tiles
+    tok_sm1,  # SMEM int32 [tile_m + 128]: token ids of odd tiles
     x_vm,  # VMEM uint32 [2, tile_m * (S + 1), 128]
     w1_vm,
     w1s_vm,
@@ -258,13 +259,21 @@ def _fused_moe_kernel(
         gs_ref, m_expert, m_start, m_count, m_visit, v_expert, cfg=cfg
     )
 
-    def tok_copy(i, slot):
+    # Separate 1-D windows per slot keep each row's SMEM address one add.
+    tok_windows = (tok_sm0, tok_sm1)
+
+    def per_slot(slot, fn):
+        """Run fn(static_slot) for the dynamic slot, so its addressing is static."""
+        for static_slot in (0, 1):
+            pl.when(slot == static_slot)(functools.partial(fn, static_slot))
+
+    def tok_copy(i, static_slot):
         # A 1-D HBM window DMA must start on a lane-tile boundary.
         base = pl.multiple_of(m_start[i] - m_start[i] % LANES, LANES)
         return pltpu.make_async_copy(
             tok_hbm.at[pl.ds(base, cfg.tile_m + LANES)],
-            tok_sm.at[slot],
-            sem_tok.at[slot],
+            tok_windows[static_slot],
+            sem_tok.at[static_slot],
         )
 
     def issued_rows(i):
@@ -272,17 +281,17 @@ def _fused_moe_kernel(
         # fetches the next tile's (or padding) tokens into rows nothing reads.
         return pl.cdiv(m_count[i], group) * group
 
-    def issue_rows(i, slot):
+    def issue_rows(i, static_slot):
+        window = tok_windows[static_slot]
         offset = m_start[i] % LANES
 
         def body(g, carry):
             for u in range(group):
                 r = g * group + u
-                token = tok_sm[slot, offset + r]
                 pltpu.make_async_copy(
-                    x_hbm.at[pl.ds(token * sx, sx)],
-                    x_vm.at[slot, pl.ds(r * sx, sx)],
-                    sem_x.at[slot],
+                    x_hbm.at[pl.ds(window[offset + r] * sx, sx)],
+                    x_vm.at[static_slot, pl.ds(r * sx, sx)],
+                    sem_x.at[static_slot],
                 ).start()
             return carry
 
@@ -385,12 +394,15 @@ def _fused_moe_kernel(
 
         @pl.when(i + 1 < n_tiles)
         def _():
-            tok_copy(i + 1, 1 - slot).wait()
-            issue_rows(i + 1, 1 - slot)
+            def next_tile(next_slot):
+                tok_copy(i + 1, next_slot).wait()
+                issue_rows(i + 1, next_slot)
+
+            per_slot(1 - slot, next_tile)
 
             @pl.when(i + 2 < n_tiles)
             def _():
-                tok_copy(i + 2, slot).start()
+                per_slot(slot, lambda static_slot: tok_copy(i + 2, static_slot).start())
 
         visit = m_visit[i]
         wslot = visit % 2
@@ -514,7 +526,8 @@ def gather_fused_moe(
             scratch_shapes=[
                 *smem_tiles,
                 pltpu.SMEM((num_experts,), jnp.int32),
-                pltpu.SMEM((2, tile_m + LANES), jnp.int32),
+                pltpu.SMEM((tile_m + LANES,), jnp.int32),
+                pltpu.SMEM((tile_m + LANES,), jnp.int32),
                 pltpu.VMEM((2, tile_m * (s + 1), LANES), jnp.uint32),
                 pltpu.VMEM((2, hidden, n1), w1.dtype),
                 pltpu.VMEM((2, 1, n1), jnp.float32),
