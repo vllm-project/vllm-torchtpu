@@ -282,20 +282,6 @@ def test_layer_config_plan_is_the_step_plan():
     assert cfg.plan(2 * plan.piece_tokens, PAGE) == plan
 
 
-def test_halo_blocks_deliver_the_preceding_tails():
-    world, plan = 8, cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
-    # A rank's tails, labelled by the piece they end: (first piece, second piece).
-    sent = [
-        cp_prefill.halo_blocks(plan.rank_pieces(r), r, world, None)
-        for r in range(world)
-    ]
-    for rank in range(1, world - 1):
-        received = [sent[src][rank] for src in range(world)]
-        first, second = cp_prefill.halo_sources(rank, world)
-        piece_a, piece_b = plan.rank_pieces(rank)
-        assert (received[first], received[second]) == (piece_a - 1, piece_b - 1)
-
-
 @pytest.mark.parametrize("layout", LAYOUTS)
 def test_full_attention_layer_caches_rank_heads(monkeypatch, layout):
     monkeypatch.setattr(

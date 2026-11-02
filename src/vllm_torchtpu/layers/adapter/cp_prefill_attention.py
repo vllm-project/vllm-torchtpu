@@ -22,8 +22,9 @@ tensor-parallel KV cache as decode steps read it:
 * full attention: the ranks all-gather their fp8 K/V pages, attend through the
   zigzag page table and cache their own KV head(s) of every prompt position;
 * sliding window: each rank receives the pages before its two pieces from the
-  ranks holding them and attends within [halo | piece]; the pages the next
-  decode's window reaches go to every rank's heads in an all-to-all.
+  ranks holding them (collective permutes, in a JAX op over the TP mesh) and
+  attends within [halo | piece]; the pages the next decode's window reaches go
+  to every rank's heads in an all-to-all.
 
 The step must hold exactly one request, the whole prompt, at batch index 0;
 the caller checks that, and keeps prefix caching off (sliding-window layers
@@ -36,13 +37,18 @@ import dataclasses
 import functools
 from typing import Any
 
+import jax
 import torch
+import torch.distributed as dist
+from jax.sharding import PartitionSpec as P
 from torch.distributed import _functional_collectives as funcol
 from torch_tpu._internal import pallas
+from torch_tpu._internal.pallas import get_pallas_mesh
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.attention.attention import get_attention_context
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.batched_rpa import cp_prefill
 from vllm_torchtpu.layers.adapter.attention import (
     PallasBatchedRPAAttentionBackendImpl,
@@ -57,11 +63,42 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 logger = init_logger(__name__)
 
 
+# The mesh axis of the halo exchange: the TP ranks in rank order.
+_AXIS = "cp"
+
+
 @dataclasses.dataclass(frozen=True)
 class _LayerOps:
     full_attention: Any = None
+    halo_exchange: Any = None
     sliding_attention: Any = None
     window_write: Any = None
+
+
+@functools.cache
+def _mesh(world: int) -> jax.sharding.Mesh:
+    # Pallas meshes span the torch.distributed world; here that is the TP group.
+    if dist.get_world_size() != world:
+        raise NotImplementedError(
+            "Context-parallel prefill needs the tensor-parallel group to be the "
+            f"whole world ({world} of {dist.get_world_size()} ranks)."
+        )
+    return get_pallas_mesh((_AXIS,))
+
+
+def _halo_exchange_fn(mesh: jax.sharding.Mesh, sliding_window: int):
+    # A closure, not a partial: sharded_jax_op checks every parameter's type.
+    def halo_exchange(pages: jax.Array) -> jax.Array:
+        halo_pages = cp_prefill.num_halo_pages(sliding_window, pages.shape[1])
+
+        def exchange(own_pages):
+            return cp_prefill.exchange_halos(own_pages, halo_pages, _AXIS, mesh.size)
+
+        return jax.shard_map(
+            exchange, mesh=mesh, in_specs=P(_AXIS), out_specs=P(_AXIS), check_vma=False
+        )(pages)
+
+    return halo_exchange
 
 
 _OPS: dict[cp_prefill.LayerConfig, _LayerOps] = {}
@@ -117,7 +154,21 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> _LayerOps:
     def fake_window(kv_cache, *args):
         return torch.empty_like(kv_cache)
 
+    def fake_halos(pages):
+        halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, pages.shape[1])
+        return pages.new_empty((2 * halo_pages, *pages.shape[1:]))
+
+    mesh = _mesh(cfg.world)
+    halo_exchange = sharded_jax_op(
+        f"cp_prefill::halo_exchange_{len(_OPS)}",
+        _halo_exchange_fn(mesh, cfg.sliding_window),
+        mesh=mesh,
+        input_partition_specs=(P(_AXIS),),
+        output_partition_specs=P(_AXIS),
+    )
+    halo_exchange.register_fake(fake_halos)
     return _LayerOps(
+        halo_exchange=halo_exchange,
         sliding_attention=_register(
             "sliding_attention",
             cp_prefill.sliding_attention_layer,
@@ -145,6 +196,12 @@ def _layer_config(
             "Context-parallel prefill attention needs --attention-backend CUSTOM, "
             f"got {type(impl).__name__}."
         )
+    if impl.rpa_kernel is None and impl.rpa_dcp_cache_kernel is None:
+        # initialize_kernel decides DCP and PCP, which the checks below read.
+        raise RuntimeError(
+            f"{attn.layer_name}: prepare_cp_prefill_attention runs after the "
+            "backend's initialize_kernel."
+        )
     if impl.kv_cache_quantized_dtype != torch.float8_e4m3fn:
         raise NotImplementedError(
             "Context-parallel prefill attention needs an fp8_e4m3 KV cache."
@@ -170,13 +227,15 @@ def _layer_config(
             f"{num_kv_heads} KV heads do not fill whole fp8 K/V words; the packed "
             "pages would need padding slots."
         )
-    if world < 3:
-        raise ValueError(
-            f"Context-parallel prefill needs at least 3 ranks, got {world}"
-        )
     if impl.num_heads * world != num_heads:
         raise ValueError(
             f"{num_heads} query heads are not {world} ranks x {impl.num_heads}."
+        )
+    _, local_kv_heads = cp_prefill.tp_kv_heads(num_kv_heads, world, rank)
+    if local_kv_heads != impl.num_kv_heads:
+        raise ValueError(
+            f"{num_kv_heads} KV heads on {world} ranks give {local_kv_heads} per "
+            f"rank; the layer's cache holds {impl.num_kv_heads}."
         )
     if impl.fp8_compute and (num_heads // num_kv_heads) % 4:
         raise ValueError(
@@ -208,7 +267,8 @@ def prepare_cp_prefill_attention(
 ) -> None:
     """Builds the ops `cp_prefill_attention` runs for this layer.
 
-    Call it outside any compiled region, after the KV scales are loaded.
+    Call it outside any compiled region, after the KV scales are loaded and the
+    backend's `initialize_kernel`.
 
     Args:
         attn: The layer's vLLM `Attention` module (tensor-parallel heads).
@@ -244,26 +304,6 @@ def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
     """Block d of x's leading axis goes to rank d; block s of the result came
     from rank s."""
     return _waited(funcol.all_to_all_single(x.contiguous(), None, None, group))
-
-
-def _exchange_halos(
-    pages: torch.Tensor,
-    cfg: cp_prefill.LayerConfig,
-    plan: cp_prefill.ZigzagPlan,
-    group: Any,
-) -> torch.Tensor:
-    """[first piece's halo | second piece's halo]: the tails of the pieces
-    before them, from the ranks holding those (`cp_prefill.halo_blocks`)."""
-    assert cfg.sliding_window is not None
-    halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, plan.page_size)
-    pp = plan.piece_pages
-    tails = pages[pp - halo_pages : pp], pages[2 * pp - halo_pages :]
-    blocks = cp_prefill.halo_blocks(
-        tails, cfg.rank, cfg.world, torch.zeros_like(tails[0])
-    )
-    received = _all_to_all(torch.stack(blocks), group)
-    first, second = cp_prefill.halo_sources(cfg.rank, cfg.world)
-    return torch.cat([received[first], received[second]])
 
 
 def cp_prefill_attention(
@@ -326,7 +366,7 @@ def cp_prefill_attention(
             kv_cache, query, gathered, seq_lens, block_tables
         )
     else:
-        halos = _exchange_halos(pages, cfg, plan, group)
+        halos = ops.halo_exchange(pages)
         out, send, owners = ops.sliding_attention(query, pages, halos, seq_lens)
         received = _all_to_all(send, group)
         new_kv_cache = ops.window_write(

@@ -209,6 +209,22 @@ def piece_tails(
     return own_pages[pp - halo_pages : pp], own_pages[2 * pp - halo_pages :]
 
 
+def exchange_halos(
+    own_pages: jax.Array, halo_pages: int, axis_name: str, world: int
+) -> jax.Array:
+    """[first piece's halo | second piece's halo] of this rank, inside a
+    `shard_map` over `axis_name`: the `halo_permutations` shifts of every
+    rank's piece tails. `own_pages` holds the rank's two pieces."""
+    pp = own_pages.shape[0] // 2
+    up, down = halo_permutations(world)
+    return jnp.concatenate(
+        [
+            jax.lax.ppermute(own_pages[pp - halo_pages : pp], axis_name, up),
+            jax.lax.ppermute(own_pages[2 * pp - halo_pages :], axis_name, down),
+        ]
+    )
+
+
 def sliding_local_pages(
     own_pages: jax.Array,
     halo_first: jax.Array,
@@ -359,11 +375,13 @@ def write_kv_pages(
     dst_pages: jax.Array,
     count: jax.Array,
 ) -> jax.Array:
-    """kv_cache[dst_pages[i]] = pages[src_pages[i]] for i < count (count >= 1).
+    """kv_cache[dst_pages[i]] = pages[src_pages[i]] for i < max(count, 1).
 
     A Pallas copy into the aliased cache, so it costs the pages written; an XLA
     scatter would rewrite the whole cache. Steps past `count` repeat the last
-    page, which re-fetches and writes back nothing.
+    page, which re-fetches and writes back nothing. A count of 0 (a dummy step
+    with no tokens) still copies page 0, into the null block a dummy step's
+    zero-filled block table names.
     """
     block = (1, *kv_cache.shape[1:])
     rest = (0,) * (kv_cache.ndim - 1)
@@ -473,22 +491,6 @@ def window_slots_from_ranks(received: jax.Array, owners: jax.Array) -> jax.Array
     after an all-to-all, sources along axis 0): each page from its
     `window_page_owners` rank."""
     return received[owners, jnp.arange(owners.shape[0])]
-
-
-def halo_blocks(tails: tuple[Any, Any], rank: int, world: int, zeros: Any) -> list[Any]:
-    """`halo_permutations` as one all-to-all of `world` blocks: the first-piece
-    tail to rank + 1, the second-piece tail to rank - 1, `zeros` elsewhere. Of
-    what arrives, block rank - 1 is the first piece's halo and block rank + 1
-    the second's (`halo_sources`). Needs world >= 3."""
-    blocks = [zeros] * world
-    blocks[(rank + 1) % world], blocks[(rank - 1) % world] = tails
-    return blocks
-
-
-def halo_sources(rank: int, world: int) -> tuple[int, int]:
-    """Blocks of the `halo_blocks` all-to-all holding the first and second
-    piece's halos."""
-    return (rank - 1) % world, (rank + 1) % world
 
 
 CacheView = Callable[
