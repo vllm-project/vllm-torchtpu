@@ -541,6 +541,10 @@ def can_use_gather_gmm(
         and hidden % gather_gmm.PACKED_COLUMNS == 0
         and inter % gather_gmm.LANES == 0
         and w2.shape == (num_experts, inter, hidden)
+        # _gather_routing: experts + 1 counting-sort buckets fit one block,
+        # and (bucket, route) packs into a non-negative int32 sort key.
+        and num_experts + 1 <= min(_COUNTING_SORT_BLOCK, num_tokens * topk)
+        and (num_experts + 1).bit_length() + (num_tokens * topk - 1).bit_length() < 31
         # Per-channel weight scales: one quantization block along K.
         and w1_scale is not None
         and w1_scale.size == num_experts * n1
@@ -548,6 +552,43 @@ def can_use_gather_gmm(
         and w2_scale.size == num_experts * hidden
         and _tpu_has_fp8_matmul()
     )
+
+
+def _gather_routing(
+    topk_ids: jax.Array,
+    topk_weights: jax.Array,
+    *,
+    local_num_experts: int,
+    topk: int,
+    skip_padded_tokens: bool,
+    masked: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """(token id per sorted row, group sizes, sorted position per route).
+
+    The same stable (expert, route) order as prepare_routed_gmm_inputs, from
+    one packed sort and the MXU counting sort instead of two argsorts and a
+    packed sort. Routes with no row (negative ids, skipped padded tokens) sort
+    last and get position -1 when ``masked``.
+    """
+    flat_ids = topk_ids.reshape(-1)
+    valid = flat_ids >= 0
+    if skip_padded_tokens:
+        valid &= topk_weights.reshape(-1) != 0
+    keys = jnp.where(valid, flat_ids, local_num_experts)
+    rows = keys.shape[0]
+    positions, counts = _counting_sort_positions(keys, local_num_experts + 1)
+    if positions is None:
+        raise ValueError(
+            f"{local_num_experts + 1} buckets exceed the counting sort block"
+        )
+    bits = max(1, (rows - 1).bit_length())
+    packed = jax.lax.sort(
+        jnp.left_shift(keys, bits) | jnp.arange(rows, dtype=jnp.int32), is_stable=False
+    )
+    token_indices_sorted = jnp.bitwise_and(packed, (1 << bits) - 1) // topk
+    if masked:
+        positions = jnp.where(valid, positions, -1)
+    return token_indices_sorted, counts[:local_num_experts], positions
 
 
 def gather_gmm_moe(
@@ -574,22 +615,14 @@ def gather_gmm_moe(
     skipped padded tokens, whose rows the expert kernel never writes.
     """
     num_tokens, hidden = hidden_states.shape
-    _, group_sizes, argsort_revert_indices, _, valid_mask, token_indices_sorted = (
-        prepare_routed_gmm_inputs(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            local_num_experts=w1.shape[0],
-            topk=topk,
-            use_ep=False,
-            use_sparse_core=False,
-            skip_padded_tokens=skip_padded_tokens,
-            permute=False,
-        )
+    token_indices_sorted, group_sizes, positions = _gather_routing(
+        topk_ids,
+        topk_weights,
+        local_num_experts=w1.shape[0],
+        topk=topk,
+        skip_padded_tokens=skip_padded_tokens,
+        masked=masked,
     )
-    positions = argsort_revert_indices
-    if masked:
-        positions = jnp.where(valid_mask, positions, -1)
     down_rows = gather_gmm.gather_fused_moe(
         gather_gmm.quantize_pack_rows(hidden_states),
         token_indices_sorted,
