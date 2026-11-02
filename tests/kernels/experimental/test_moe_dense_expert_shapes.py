@@ -332,6 +332,7 @@ def test_token_threshold_dispatch_and_resource_failure_propagation(
         raise StandardSelected("original GMM path")
 
     monkeypatch.setattr(wrapper, "_DENSE_EXPERT_THRESHOLD", threshold)
+    monkeypatch.setattr(wrapper, "_GATHER_GMM", False)
     monkeypatch.setattr(wrapper, "dense_expert_moe", resource_failure)
     monkeypatch.setattr(wrapper, "prepare_routed_gmm_inputs", standard_selected)
     wrapper.fused_moe_func.clear_cache()

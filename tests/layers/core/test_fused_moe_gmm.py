@@ -501,6 +501,159 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
     np.testing.assert_array_equal(group_sizes, np.array([3, 2]))
 
 
+def test_prepare_routed_gmm_inputs_permute_false_skips_only_the_rows():
+    key = jax.random.PRNGKey(0)
+    hidden_states = jax.random.normal(key, (64, 256)).astype(jnp.bfloat16)
+    topk_indices = jax.random.randint(key, (64, 4), 0, 16, jnp.int32)
+    topk_weights = jax.random.uniform(key, (64, 4)).astype(jnp.bfloat16)
+    kwargs = dict(local_num_experts=16, topk=4, use_ep=False, use_sparse_core=False)
+    full = prepare_routed_gmm_inputs(
+        hidden_states, topk_indices, topk_weights, **kwargs
+    )
+    bare = prepare_routed_gmm_inputs(
+        hidden_states, topk_indices, topk_weights, permute=False, **kwargs
+    )
+    assert bare[0] is None
+    np.testing.assert_array_equal(full[0], hidden_states[full[5]])
+    for want, got in zip(full[1:], bare[1:], strict=True):
+        np.testing.assert_array_equal(want, got)
+
+
+@pytest.mark.parametrize("counting_sort", [True, False])
+@pytest.mark.parametrize(
+    ("tokens", "masked", "skip_padded"),
+    [(256, False, False), (1088, True, False), (512, True, True)],
+)
+def test_gather_routing_matches_prepare_routed_gmm_inputs(
+    monkeypatch, counting_sort, tokens, masked, skip_padded
+):
+    """Same stable (expert, route) order as the grouped-matmul path."""
+    monkeypatch.setattr(fused_moe_gmm, "_COUNTING_SORT", counting_sort)
+    experts, topk = 16, 8
+    key = jax.random.PRNGKey(tokens)
+    ids = jax.random.randint(key, (tokens, topk), 0, 2 * experts, jnp.int32)
+    weights = jax.random.uniform(key, (tokens, topk)).astype(jnp.bfloat16)
+    # Masked: this rank owns experts [0, experts) and the others are remote.
+    ids = jnp.where(ids < experts, ids, -1) if masked else ids % experts
+    if skip_padded:
+        weights = weights.at[-16:].set(0)
+    tis, group_sizes, positions = fused_moe_gmm._gather_routing(
+        ids,
+        weights,
+        local_num_experts=experts,
+        topk=topk,
+        skip_padded_tokens=skip_padded,
+        masked=masked,
+    )
+    _, want_sizes, want_positions, _, valid, want_tis = prepare_routed_gmm_inputs(
+        jnp.zeros((tokens, 128), jnp.bfloat16),
+        ids,
+        weights,
+        local_num_experts=experts,
+        topk=topk,
+        use_ep=False,
+        use_sparse_core=False,
+        skip_padded_tokens=skip_padded,
+        permute=False,
+    )
+    n_valid = int(want_sizes.sum())
+    np.testing.assert_array_equal(group_sizes, want_sizes)
+    np.testing.assert_array_equal(tis[:n_valid], want_tis[:n_valid])
+    if masked:
+        want_positions = np.where(np.asarray(valid), want_positions, -1)
+    np.testing.assert_array_equal(positions, want_positions)
+
+
+def _gather_gmm_weights(inter, num_experts=32, hidden=2816):
+    """can_use_gather_gmm weight overrides for another intermediate size."""
+    f8 = jnp.float8_e4m3fn
+    return {
+        "w1": jax.ShapeDtypeStruct((num_experts, hidden, 2 * inter), f8),
+        "w2": jax.ShapeDtypeStruct((num_experts, inter, hidden), f8),
+        "w1_scale": jax.ShapeDtypeStruct((num_experts, 1, 1, 2 * inter), jnp.float32),
+        "w2_scale": jax.ShapeDtypeStruct((num_experts, 1, 1, hidden), jnp.float32),
+    }
+
+
+def _gather_gmm_case(**overrides):
+    """can_use_gather_gmm arguments for Gemma4-26B TP2, as abstract shapes."""
+    e, h, inter = 128, 2816, 384
+    f8 = jnp.float8_e4m3fn
+    case = dict(
+        hidden_states=jax.ShapeDtypeStruct((8192, h), jnp.bfloat16),
+        w1=jax.ShapeDtypeStruct((e, h, 2 * inter), f8),
+        w2=jax.ShapeDtypeStruct((e, inter, h), f8),
+        w1_scale=jax.ShapeDtypeStruct((e, 1, 1, 2 * inter), jnp.float32),
+        w2_scale=jax.ShapeDtypeStruct((e, 1, 1, h), jnp.float32),
+        w1_bias=None,
+        w2_bias=None,
+        topk=8,
+        rhs_quant_dtype=None,
+    )
+    case.update(overrides)
+    return case
+
+
+@pytest.mark.parametrize(
+    ("overrides", "fp8_mxu", "expected"),
+    [
+        ({}, True, True),
+        ({}, False, False),
+        ({"w1_bias": jax.ShapeDtypeStruct((128, 1, 768), jnp.float32)}, True, False),
+        # 512-row weight-scale blocks instead of one per channel.
+        (
+            {"w1_scale": jax.ShapeDtypeStruct((128, 6, 1, 768), jnp.float32)},
+            True,
+            False,
+        ),
+        (
+            {
+                "w1": jax.ShapeDtypeStruct((128, 2816, 1536), jnp.float8_e4m3fn),
+                "w2": jax.ShapeDtypeStruct((128, 768, 2816), jnp.float8_e4m3fn),
+                "w1_scale": jax.ShapeDtypeStruct((128, 1, 1, 1536), jnp.float32),
+            },
+            True,
+            True,
+        ),  # intermediate 768: two quantization blocks
+        (
+            {"hidden_states": jax.ShapeDtypeStruct((512, 2816), jnp.bfloat16)},
+            True,
+            False,
+        ),
+        (
+            {"hidden_states": jax.ShapeDtypeStruct((1056, 2816), jnp.bfloat16)},
+            True,
+            False,
+        ),
+        (
+            {"hidden_states": jax.ShapeDtypeStruct((32768, 2816), jnp.bfloat16)},
+            True,
+            False,
+        ),
+        (
+            {"hidden_states": jax.ShapeDtypeStruct((16384, 2816), jnp.bfloat16)},
+            True,
+            True,
+        ),
+        (  # a multiple of 64 that is not a multiple of 256
+            {"hidden_states": jax.ShapeDtypeStruct((1088, 2816), jnp.bfloat16)},
+            True,
+            True,
+        ),
+        # Whole-expert weights in the expert kernel's VMEM: intermediate 1536
+        # compiles under its limit on tpu7x, 2048 runs out of VMEM.
+        (_gather_gmm_weights(1536), True, True),
+        (_gather_gmm_weights(2048), True, False),
+    ],
+)
+def test_can_use_gather_gmm(monkeypatch, overrides, fp8_mxu, expected):
+    monkeypatch.setattr(fused_moe_gmm, "_GATHER_GMM_MIN_TOKENS", 1024)
+    monkeypatch.setattr(fused_moe_gmm, "_tpu_has_fp8_matmul", lambda: fp8_mxu)
+    # tpu7x: 64 MiB of VMEM per core.
+    monkeypatch.setattr(fused_moe_gmm, "_tpu_vmem_capacity_bytes", lambda: 64 << 20)
+    assert fused_moe_gmm.can_use_gather_gmm(**_gather_gmm_case(**overrides)) is expected
+
+
 @pytest.mark.parametrize(("mode", "owner_called"), [("on", True), ("off", False)])
 def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
     x = jnp.zeros((4, 2), dtype=jnp.bfloat16)

@@ -103,21 +103,26 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
         return acc
 
     acc_gate, acc_up = deinterleave_lane(acc)
+    return apply_gated_act(acc_gate, acc_up, fuse_act)
+
+
+def apply_gated_act(gate: jax.Array, up: jax.Array, fuse_act: str) -> jax.Array:
+    """The activation of `apply_act_fn` on already separated gate and up halves."""
     match fuse_act:
         case "silu":
-            return jax.nn.silu(acc_gate) * acc_up
+            return jax.nn.silu(gate) * up
         case "gelu":
-            return jax.nn.gelu(acc_gate) * acc_up
+            return jax.nn.gelu(gate) * up
         case "gelu_tanh":
-            return jax.nn.gelu(acc_gate, approximate=True) * acc_up
+            return jax.nn.gelu(gate, approximate=True) * up
         case "swigluoai":
-            return swigluoai(acc_gate, acc_up)
+            return swigluoai(gate, up)
         case "silu_and_mul_with_clamp":
-            return silu_and_mul_with_clamp(acc_gate, acc_up)
+            return silu_and_mul_with_clamp(gate, up)
         case str() if fuse_act.startswith("situ:"):
             _, beta, linear_beta = fuse_act.split(":")
             linear_beta = None if linear_beta == "none" else float(linear_beta)
-            return situ_and_mul(acc_gate, acc_up, float(beta), linear_beta)
+            return situ_and_mul(gate, up, float(beta), linear_beta)
         case _:
             raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
