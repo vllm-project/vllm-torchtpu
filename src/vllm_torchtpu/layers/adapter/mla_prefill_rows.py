@@ -102,7 +102,7 @@ def check_config(vllm_config: Any) -> None:
     build, with TPU_DCP_PREFILL_TOKEN_PARALLEL's checks)."""
     parallel = vllm_config.parallel_config
     tp = int(parallel.tensor_parallel_size)
-    split_rows = dcp_token_parallel_op.layout_for(vllm_config).split_rows
+    split_rows = dcp_token_parallel_op.split_rows_for(vllm_config)
     refusals = {
         "needs TPU_MOE_PREFILL_SEQUENCE_PARALLEL": (
             not envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL
@@ -112,9 +112,10 @@ def check_config(vllm_config: Any) -> None:
         "holds a DCP shard and a residual row block)": (
             parallel.decode_context_parallel_size != parallel.tensor_parallel_size
         ),
-        f"needs TPU_MLA_PREFILL_ROWS_MIN_TOKENS / tp of at least the {split_rows} "
-        "DCP rows (rank 0 holds them all)": (
-            envs.TPU_MLA_PREFILL_ROWS_MIN_TOKENS // tp < split_rows
+        f"needs every bucket it takes to give rank 0 at least the {split_rows} "
+        "DCP rows (TPU_MLA_PREFILL_ROWS_MIN_TOKENS)": (
+            (envs.bucket_gate_edge(envs.TPU_MLA_PREFILL_ROWS_MIN_TOKENS) + 1) // tp
+            < split_rows
         ),
     }
     bad = [why for why, hit in refusals.items() if hit]

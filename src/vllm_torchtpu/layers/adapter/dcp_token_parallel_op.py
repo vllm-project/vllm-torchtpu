@@ -78,12 +78,17 @@ def applies(num_tokens: int) -> bool:
     )
 
 
+def split_rows_for(vllm_config: Any) -> int:
+    """Rows `[0, split_rows)` of a split bucket stay on the DCP path."""
+    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+    return -(-max_num_seqs // SPLIT_ROWS_ALIGN) * SPLIT_ROWS_ALIGN
+
+
 def layout_for(vllm_config: Any) -> dcp_token_parallel.TokenParallelLayout:
     """The split's static shape for this server config."""
     parallel = vllm_config.parallel_config
     dcp = int(parallel.decode_context_parallel_size)
     page_size = int(vllm_config.cache_config.block_size)
-    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
     vps = page_size * dcp
     max_model_len = int(vllm_config.model_config.max_model_len)
     max_pages = -(-max_model_len // vps) + EXTRA_PAGES
@@ -91,7 +96,7 @@ def layout_for(vllm_config: Any) -> dcp_token_parallel.TokenParallelLayout:
         dcp_size=dcp,
         interleave_size=int(parallel.cp_kv_cache_interleave_size),
         page_size=page_size,
-        split_rows=-(-max_num_seqs // SPLIT_ROWS_ALIGN) * SPLIT_ROWS_ALIGN,
+        split_rows=split_rows_for(vllm_config),
         max_pages=max_pages,
         gather_caps=tuple(c for c in GATHER_CAPS if c < max_pages) + (max_pages,),
     )

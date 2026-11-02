@@ -1852,9 +1852,13 @@ class VllmTPUMLAAttention(MLAAttention):
             and vllm_config.parallel_config.decode_context_parallel_size > 1
         ):
             dcp_token_parallel_op.check_config(vllm_config)
-            if envs.TPU_MLA_PREFILL_SEQUENCE_ROWS:
-                mla_prefill_rows.check_config(vllm_config)
             self.token_parallel_layout = dcp_token_parallel_op.layout_for(vllm_config)
+        if (
+            envs.TPU_MLA_PREFILL_SEQUENCE_ROWS
+            and use_sparse
+            and vllm_config is not None
+        ):
+            mla_prefill_rows.check_config(vllm_config)
 
         # For compatibility reasons.
         self.prefix = prefix
