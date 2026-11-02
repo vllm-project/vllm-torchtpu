@@ -212,6 +212,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE: int = 0
     VLLM_TPU_SOLO_PREFILL_DECODE_STEPS: int = 1
     VLLM_TPU_DECODE_INTERVAL_MS: int = 0
+    VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS: int = 0
 
 
 def env_with_choices(
@@ -1272,6 +1273,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # milliseconds instead of in every step (0: every step).
     "VLLM_TPU_DECODE_INTERVAL_MS": env_nonnegative_int(
         "VLLM_TPU_DECODE_INTERVAL_MS", 0
+    ),
+    # PrefillFirstScheduler: the request counts it reports for data-parallel
+    # load balancing add one running request per this many tokens each request
+    # still has to prefill (0: true counts).
+    "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS", 0
     ),
 }
 

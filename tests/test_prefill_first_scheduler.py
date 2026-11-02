@@ -74,6 +74,7 @@ def _build(
     max_consecutive: int = 0,
     decode_steps: int = 1,
     decode_interval_ms: int = 0,
+    dp_lb_prefill_unit_tokens: int = 0,
     num_blocks: int = 64,
     max_num_seqs: int = 8,
     max_num_batched_tokens: int = 128,
@@ -84,6 +85,9 @@ def _build(
     monkeypatch.setenv("VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE", str(max_consecutive))
     monkeypatch.setenv("VLLM_TPU_SOLO_PREFILL_DECODE_STEPS", str(decode_steps))
     monkeypatch.setenv("VLLM_TPU_DECODE_INTERVAL_MS", str(decode_interval_ms))
+    monkeypatch.setenv(
+        "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS", str(dp_lb_prefill_unit_tokens)
+    )
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=max_num_seqs,
@@ -317,6 +321,7 @@ def test_flags_stay_out_of_the_compile_key():
         "VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE",
         "VLLM_TPU_SOLO_PREFILL_DECODE_STEPS",
         "VLLM_TPU_DECODE_INTERVAL_MS",
+        "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS",
     ):
         assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
         assert name not in tpu_compiler._tpu_compile_env_factors()
@@ -480,3 +485,39 @@ def test_random_workload_keeps_step_shapes_and_finishes(
         scheduler.update_from_output(*in_flight.popleft())
     assert num_added > 20
     assert scheduler.get_num_unfinished_requests() == 0
+
+
+def test_reported_counts_add_pending_prefill_units(shared_model_config, monkeypatch):
+    scheduler, hasher = _build(
+        shared_model_config,
+        monkeypatch,
+        dp_lb_prefill_unit_tokens=32,
+        max_num_batched_tokens=64,
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    scheduler.schedule()
+    _add(scheduler, hasher, ("long", 100, 2))
+    # `d` decodes; `long` waits with 100 tokens to prefill: 4 units.
+    assert scheduler.get_request_counts() == (1 + 4, 1)
+
+    assert scheduler.schedule().num_scheduled_tokens == {"d": 1, "long": 63}
+    # 37 tokens left to prefill: 2 units.
+    assert scheduler.get_request_counts() == (2 + 2, 0)
+
+    scheduler.schedule()
+    assert scheduler.get_request_counts() == (2, 0)
+
+
+def test_scheduling_reads_the_true_counts(shared_model_config, monkeypatch):
+    # The long-prefill threshold caps a chunk only when more than one request
+    # is running or waiting: a lone request takes the whole budget.
+    scheduler, hasher = _build(
+        shared_model_config,
+        monkeypatch,
+        dp_lb_prefill_unit_tokens=16,
+        max_num_batched_tokens=64,
+        long_prefill_token_threshold=16,
+    )
+    _add(scheduler, hasher, ("long", 48, 1))
+    assert scheduler.get_request_counts() == (3, 1)
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 48}

@@ -1429,7 +1429,11 @@ def _configure_prefill_first_scheduler(vllm_config: VllmConfig) -> None:
     """Install PrefillFirstScheduler when one of its policies is set. Solo
     prefill steps are a layout the model's programs rely on, so a different
     configured scheduler is an error rather than a warning."""
-    if not (envs.VLLM_TPU_SOLO_PREFILL_OVER_TOKENS or envs.VLLM_TPU_DECODE_INTERVAL_MS):
+    if not (
+        envs.VLLM_TPU_SOLO_PREFILL_OVER_TOKENS
+        or envs.VLLM_TPU_DECODE_INTERVAL_MS
+        or envs.VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS
+    ):
         return
     from vllm_torchtpu.core.experimental.prefill_first_scheduler import SCHEDULER_CLS
 
@@ -1444,9 +1448,9 @@ def _configure_prefill_first_scheduler(vllm_config: VllmConfig) -> None:
         ):
             installed_by = " (DP_SCHED_ENABLED=1 installs it for DP > 1; unset it)"
         raise ValueError(
-            "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS and VLLM_TPU_DECODE_INTERVAL_MS "
-            f"need PrefillFirstScheduler, but {scheduler_config.scheduler_cls} "
-            f"is configured{installed_by}."
+            "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS, VLLM_TPU_DECODE_INTERVAL_MS and "
+            "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS need PrefillFirstScheduler, but "
+            f"{scheduler_config.scheduler_cls} is configured{installed_by}."
         )
     scheduler_config.scheduler_cls = SCHEDULER_CLS
     logger.info("Enabled PrefillFirstScheduler.")

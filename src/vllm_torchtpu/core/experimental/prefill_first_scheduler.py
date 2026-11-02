@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Two prefill-first policies that trade running requests' TPOT for TTFT.
+"""Prefill-first policies that trade running requests' TPOT for TTFT.
 
 Solo prefill (``VLLM_TPU_SOLO_PREFILL_OVER_TOKENS=N > 0``). A context-parallel
 prefill program takes a step that holds one request's whole prompt, with no
@@ -48,10 +48,19 @@ every step; the other steps carry only prefill. With a closed-loop client,
 TTFT + output_len * TPOT is the time between a user's requests, so raising TPOT
 toward its limit lowers TTFT at the same throughput.
 
+Prefill-aware DP load balancing (``VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS=U > 0``).
+vLLM's data-parallel front end sends each new request to the engine with the
+fewest waiting plus running requests, as each engine's scheduler reports them;
+a replica that still has a long prompt to prefill then looks no busier than one
+that only decodes, and a request routed there waits for that prefill. The
+counts this scheduler reports (for the front end and its logged stats, not for
+its own scheduling) add, to the running requests, one per U tokens (rounded up)
+that each running prefill chunk and waiting request still has to prefill.
+
 Requests that sit a step out are resent with only the output tokens the model
 runner reads (see ``_make_cached_request_data``).
 
-The platform installs this scheduler when either policy is set;
+The platform installs this scheduler when any of these policies is set;
 ``--scheduler-cls
 vllm_torchtpu.core.experimental.prefill_first_scheduler.PrefillFirstScheduler``
 selects it too.
@@ -78,7 +87,8 @@ SCHEDULER_CLS = (
 
 
 class PrefillFirstScheduler(AsyncScheduler):
-    """Solo whole-prompt prefill steps and decode pacing (module docstring)."""
+    """Solo whole-prompt prefill steps, decode pacing and prefill-aware DP
+    load-balancing counts (module docstring)."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -86,10 +96,11 @@ class PrefillFirstScheduler(AsyncScheduler):
         self.solo_max_consecutive = envs.VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE
         self.solo_decode_steps = envs.VLLM_TPU_SOLO_PREFILL_DECODE_STEPS
         self.decode_interval = envs.VLLM_TPU_DECODE_INTERVAL_MS / 1000
-        if not (self.solo_over_tokens or self.decode_interval):
+        self.lb_prefill_unit = envs.VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS
+        if not (self.solo_over_tokens or self.decode_interval or self.lb_prefill_unit):
             raise ValueError(
-                "PrefillFirstScheduler needs VLLM_TPU_SOLO_PREFILL_OVER_TOKENS or "
-                "VLLM_TPU_DECODE_INTERVAL_MS."
+                "PrefillFirstScheduler needs VLLM_TPU_SOLO_PREFILL_OVER_TOKENS, "
+                "VLLM_TPU_DECODE_INTERVAL_MS or VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS."
             )
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
@@ -111,15 +122,18 @@ class PrefillFirstScheduler(AsyncScheduler):
         # nothing).
         self._decode_due = 0.0
         self._force_decode = False
+        # Inside schedule(): the base scheduler reads the true request counts.
+        self._scheduling = False
         logger.info(
             "PrefillFirstScheduler active (solo_over_tokens=%d, "
             "max_solo_tokens=%d, solo_max_consecutive=%d, solo_decode_steps=%d, "
-            "decode_interval_ms=%g)",
+            "decode_interval_ms=%g, dp_lb_prefill_unit_tokens=%d)",
             self.solo_over_tokens,
             self.max_solo_tokens,
             self.solo_max_consecutive,
             self.solo_decode_steps,
             self.decode_interval * 1000,
+            self.lb_prefill_unit,
         )
 
     def _check_solo_config(self) -> None:
@@ -161,6 +175,28 @@ class PrefillFirstScheduler(AsyncScheduler):
             )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._scheduling = True
+        try:
+            return self._schedule(throttle_prefills)
+        finally:
+            self._scheduling = False
+
+    def get_request_counts(self) -> tuple[int, int]:
+        num_running, num_waiting = super().get_request_counts()
+        if not self.lb_prefill_unit or self._scheduling:
+            return num_running, num_waiting
+        prefilling = chain(
+            (r for r in self.running if r.is_prefill_chunk),
+            self.kv_holding_waiting,
+            self.waiting,
+        )
+        pending_units = sum(
+            -(-(r.num_tokens - r.num_computed_tokens) // self.lb_prefill_unit)
+            for r in prefilling
+        )
+        return num_running + pending_units, num_waiting
+
+    def _schedule(self, throttle_prefills: bool) -> SchedulerOutput:
         request = None
         if self.solo_over_tokens and not throttle_prefills and not self._skip_solo:
             request = self._solo_candidate()
