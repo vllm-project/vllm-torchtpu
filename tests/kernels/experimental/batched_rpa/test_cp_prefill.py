@@ -19,10 +19,6 @@ pages `wrapper.prepare_inputs` lays out, and that the kernel lowers for tpu7x.
 """
 
 import dataclasses
-import json
-import os
-import subprocess
-import sys
 
 import jax
 import jax.numpy as jnp
@@ -126,7 +122,7 @@ def test_halo_exchange_gives_each_piece_its_window(traced):
     k, v = _kv(plan.num_tokens, 16, 128, seed=1)
     in_order = cp_prefill.pack_kv_pages(k, v, PAGE)
     rows = [(_rank_rows(k, plan, r), _rank_rows(v, plan, r)) for r in range(plan.world)]
-    # The tails each rank sends, as exchange_halos packs them.
+    # The tails each rank sends, as pack_piece_tails packs them.
     piece = plan.piece_tokens
     tails = [
         [
@@ -156,64 +152,6 @@ def test_halo_exchange_gives_each_piece_its_window(traced):
             )
             # ...and the piece's own pages, which the kernel only writes.
             assert (tables[sub][p * pp : (p + 1) * pp] == 2 * halo).all()
-
-
-def _halo_worker(world: int) -> dict:
-    """Runs `exchange_halos` under shard_map on `world` host devices and checks
-    every rank's halos against the pages of the pieces before its two."""
-    from jax.sharding import Mesh
-    from jax.sharding import PartitionSpec as P
-
-    halo = 4
-    plan = cp_prefill.make_zigzag_plan(world * 2 * 8 * PAGE, world, PAGE)
-    pp = plan.piece_pages
-    k, v = _kv(plan.num_tokens, 8, 128, seed=10)
-    in_order = cp_prefill.pack_kv_pages(k, v, PAGE)
-    order = np.concatenate(
-        [np.arange(s, e) for r in range(world) for s, e in plan.rank_slices(r)]
-    )
-    mesh = Mesh(np.array(jax.devices()[:world]), ("x",))
-    halos = jax.jit(
-        jax.shard_map(
-            lambda kr, vr: cp_prefill.exchange_halos(
-                cp_prefill.pack_piece_tails(kr, vr, halo, PAGE), "x", world
-            ),
-            mesh=mesh,
-            in_specs=(P("x"), P("x")),
-            out_specs=P("x"),
-        )
-    )(k[order], v[order])
-    halos = np.asarray(halos).reshape(world, 2 * halo, *in_order.shape[1:])
-    ok = []
-    for rank in range(world):
-        for slot, piece in enumerate(plan.rank_pieces(rank)):
-            if (slot, rank) in ((0, 0), (1, world - 1)):
-                continue  # what the wrap delivers is unused (sliding_local_pages)
-            want = np.asarray(in_order[piece * pp - halo : piece * pp])
-            got = halos[rank, slot * halo : (slot + 1) * halo]
-            ok.append(bool((got.view(np.uint8) == want.view(np.uint8)).all()))
-    return {"checked": len(ok), "all_equal": all(ok)}
-
-
-@pytest.mark.parametrize("world", [2, 8])
-def test_exchange_halos_delivers_the_preceding_tails(world):
-    flags = os.environ.get("XLA_FLAGS", "")
-    env = dict(
-        os.environ,
-        JAX_PLATFORMS="cpu",
-        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count={world}",
-    )
-    proc = subprocess.run(
-        [sys.executable, __file__, str(world)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
-    assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
-    result = json.loads(lines[-1][len("RESULT ") :])
-    assert result == {"checked": 2 * world - 2, "all_equal": True}
 
 
 @pytest.mark.parametrize("halo", [0, 3])
@@ -382,9 +320,7 @@ def test_full_attention_layer_caches_rank_heads(monkeypatch, layout):
     k, v = _kv(plan.num_tokens, num_kv_heads, 128, seed=6)
     gathered = jnp.concatenate(
         [
-            cp_prefill.pack_kv_pages(
-                _rank_rows(k, plan, r), _rank_rows(v, plan, r), PAGE
-            )
+            cp_prefill.pack_kv_rows(_rank_rows(k, plan, r), _rank_rows(v, plan, r))
             for r in range(plan.world)
         ]
     )
@@ -425,40 +361,50 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
     plan = cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
     seq_len = 9 * 8 * PAGE + 100  # the window across two ranks' pieces
     k, v = _kv(plan.num_tokens, num_kv_heads, 128, seed=8)
+    in_order = cp_prefill.pack_kv_pages(k, v, PAGE)
     block_table = _block_table(num_cache_pages, plan.num_pages, seed=9)
     seq_lens = jnp.array([seq_len], jnp.int32)
     query = jnp.zeros((2 * plan.piece_tokens, 32, 128), jnp.bfloat16)
-    halo = cp_prefill.num_halo_pages(window, PAGE)
-    halos = jnp.zeros((2 * halo, PAGE, 2 * num_kv_heads // 4, 4, 128), jnp.int8)
-    sent, owners = [], None
-    for rank in range(plan.world):
-        cfg = _layer_config(rank, num_kv_heads, window, layout)
-        _, blocks, owners = cp_prefill.sliding_attention_layer(
-            query,
-            _rank_rows(k, plan, rank),
-            _rank_rows(v, plan, rank),
-            halos,
-            seq_lens,
-            cfg=cfg,
+    rows = [(_rank_rows(k, plan, r), _rank_rows(v, plan, r)) for r in range(plan.world)]
+    sent = [
+        cp_prefill.sliding_exchange_blocks(
+            *rows[r], seq_lens, PAGE, cfg=_layer_config(r, num_kv_heads, window, layout)
         )
-        sent.append(blocks)
+        for r in range(plan.world)
+    ]
     position_pages, count = cp_prefill.window_position_pages(
         jnp.int32(seq_len), window, PAGE
     )
     needed = np.asarray(position_pages)[: int(count)]
+    halo = cp_prefill.num_halo_pages(window, PAGE)
+    halo_bytes = halo * PAGE * 2 * num_kv_heads * 128
+    pp = plan.piece_pages
     for rank in range(plan.world):
         cfg = _layer_config(rank, num_kv_heads, window, layout)
+        # The all-to-all: rank `rank` receives block `rank` of what every rank sent.
+        received = jnp.stack([x[rank] for x in sent])
+        # Its halos: the tails of the pieces before its two (where they exist).
+        for src, piece in (
+            ((rank - 1) % 8, plan.rank_pieces(rank)[0]),
+            ((rank + 1) % 8, plan.rank_pieces(rank)[1]),
+        ):
+            if piece == 0 or (rank == 7 and src == 0):
+                continue
+            np.testing.assert_array_equal(
+                _bytes(received[src, :halo_bytes]),
+                _bytes(in_order[piece * pp - halo : piece * pp]).reshape(-1),
+            )
         first, num_heads = cfg.tp_kv_heads
         expected = _serving_pages(
             k[:, first : first + num_heads], v[:, first : first + num_heads], layout
         )
         cache = jnp.full((num_cache_pages, *expected.shape[1:]), 7, FP8)
-        received = jnp.stack([x[rank] for x in sent])
         with pltpu.force_tpu_interpret_mode():
-            cache = cp_prefill.window_write_layer(
+            cache, _ = cp_prefill.sliding_attention_layer(
                 cache,
+                query,
+                *rows[rank],
                 received,
-                owners,
                 seq_lens,
                 block_table,
                 cfg=cfg,
@@ -507,7 +453,3 @@ def test_cp_prefill_attention_lowers_for_tpu7x(heads, head_dim, window, fp8_comp
             jax.jit(call).trace(q, pages, kv, kv).lower(lowering_platforms=("tpu",))
         )
     assert "RPAm-snh-p256" in lowered.as_text()
-
-
-if __name__ == "__main__":
-    print("RESULT " + json.dumps(_halo_worker(int(sys.argv[1]))))

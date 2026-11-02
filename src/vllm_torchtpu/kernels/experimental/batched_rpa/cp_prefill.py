@@ -220,20 +220,6 @@ def pack_piece_tails(
     )
 
 
-def exchange_halos(tails: jax.Array, axis_name: str, world: int) -> jax.Array:
-    """[first piece's halo | second piece's halo] of this rank, inside a
-    `shard_map` over `axis_name`: the `halo_permutations` shifts of every rank's
-    `pack_piece_tails`."""
-    halo_pages = tails.shape[0] // 2
-    up, down = halo_permutations(world)
-    return jnp.concatenate(
-        [
-            jax.lax.ppermute(tails[:halo_pages], axis_name, up),
-            jax.lax.ppermute(tails[halo_pages:], axis_name, down),
-        ]
-    )
-
-
 def sliding_local_pages(
     halos: jax.Array,
     keys: jax.Array,
@@ -578,14 +564,6 @@ def _cache_pages(kv_cache: jax.Array, cfg: LayerConfig, cache_view: CacheView):
     return native, page_stride, restore, native.shape[page_axis]
 
 
-def _check_page_size(plan_page_size: int, cache_page_size: int) -> None:
-    if plan_page_size != cache_page_size:
-        raise ValueError(
-            f"The zigzag plan's pages ({plan_page_size} tokens) are not the KV "
-            f"cache's ({cache_page_size})."
-        )
-
-
 def _request_block_table(block_tables: jax.Array, seq_lens: jax.Array) -> jax.Array:
     """Block table row of the step's one request (batch index 0)."""
     return block_tables[: block_tables.shape[0] // seq_lens.shape[0]]
@@ -594,21 +572,20 @@ def _request_block_table(block_tables: jax.Array, seq_lens: jax.Array) -> jax.Ar
 def full_attention_layer(
     kv_cache: jax.Array,
     query: jax.Array,
-    kv_pages: jax.Array,
+    kv_rows: jax.Array,
     seq_lens: jax.Array,
     block_tables: jax.Array,
     *,
     cfg: LayerConfig,
     cache_view: CacheView,
 ) -> tuple[jax.Array, jax.Array]:
-    """A full-attention layer: attention of the rank's rows over the
-    all-gathered pages, and the cache with this rank's heads of every prompt
-    position.
+    """A full-attention layer: attention of the rank's rows over every rank's
+    K/V, and the cache with this rank's heads of every prompt position.
 
     Args:
         kv_cache: The layer's serving cache; `cache_view` gives its native pages.
         query: [rows, num_heads, head_dim].
-        kv_pages: Every rank's `pack_kv_pages` pages in rank order, as int8.
+        kv_rows: Every rank's `pack_kv_rows` rows in rank order, as int8.
         seq_lens, block_tables: The step's attention metadata (one request).
         cfg: The layer.
         cache_view: `kv_cache` -> (native pages, pages per block, inverse view).
@@ -617,9 +594,9 @@ def full_attention_layer(
         (the new kv_cache, [rows, num_heads, head_dim] attention output).
     """
     native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
-    _check_page_size(kv_pages.shape[1], page_size)
     plan = cfg.plan(query.shape[0], page_size)
-    pages = jax.lax.bitcast_convert_type(kv_pages, native.dtype)
+    rows = jax.lax.bitcast_convert_type(kv_rows, native.dtype)
+    pages = kv_pages_from_rows(rows, cfg.head_dim, page_size)
     out = cp_prefill_attention(
         query, pages, plan.gathered_page_table(), plan, cfg.rank, **cfg.rpa_kwargs()
     )
@@ -630,34 +607,102 @@ def full_attention_layer(
     return restore(write_kv_pages(native, mine, *writes)), out
 
 
+def _sliding_exchange_sizes(cfg: LayerConfig, page_size: int) -> tuple[int, ...]:
+    """(halo pages, window pages, halo bytes, window bytes) of one block of a
+    sliding-window layer's all-to-all."""
+    assert cfg.sliding_window is not None
+    halo_pages = num_halo_pages(cfg.sliding_window, page_size)
+    window_pages = halo_pages + 1
+    _, local_heads = cfg.tp_kv_heads
+    halo_bytes = halo_pages * page_size * 2 * cfg.num_kv_heads * cfg.head_dim
+    window_bytes = window_pages * page_size * 2 * local_heads * cfg.head_dim
+    return halo_pages, window_pages, halo_bytes, window_bytes
+
+
+def sliding_exchange_blocks(
+    keys: jax.Array,
+    values: jax.Array,
+    seq_lens: jax.Array,
+    page_size: int,
+    *,
+    cfg: LayerConfig,
+) -> jax.Array:
+    """What this rank sends each rank in a sliding-window layer's one
+    all-to-all: [world, halo bytes + window bytes] int8. Block d carries the
+    tail of the piece before rank d's first or second piece when this rank
+    holds it (`halo_permutations`; zeros otherwise), then the decode window's
+    K/V slots of rank d's heads (`window_slots_for_ranks`).
+
+    `keys` and `values` are the rank's fp8 rows; `page_size` is the KV
+    cache's. Needs world >= 3, so the two tails go to different ranks.
+    """
+    if cfg.world < 3:
+        raise ValueError(
+            f"The sliding-window exchange needs 3 or more ranks, got {cfg.world}"
+        )
+    plan = cfg.plan(keys.shape[0], page_size)
+    halo_pages, _, halo_bytes, _ = _sliding_exchange_sizes(cfg, page_size)
+    tails = pack_piece_tails(keys, values, halo_pages, page_size)
+    tails = jax.lax.bitcast_convert_type(tails, jnp.int8).reshape(2, halo_bytes)
+    dest = jnp.arange(cfg.world)[:, None]
+    up, down = (cfg.rank + 1) % cfg.world, (cfg.rank - 1) % cfg.world
+    halo = jnp.where(dest == up, tails[0], jnp.where(dest == down, tails[1], 0))
+    position_pages, _ = window_position_pages(
+        seq_lens[0], cfg.sliding_window, page_size
+    )
+    window = window_slots_for_ranks(
+        keys, values, plan, cfg.rank, position_pages, cfg.num_kv_heads
+    )
+    window = jax.lax.bitcast_convert_type(window, jnp.int8).reshape(cfg.world, -1)
+    return jnp.concatenate([halo.astype(jnp.int8), window], axis=1)
+
+
 def sliding_attention_layer(
+    kv_cache: jax.Array,
     query: jax.Array,
     keys: jax.Array,
     values: jax.Array,
-    halos: jax.Array,
+    received: jax.Array,
     seq_lens: jax.Array,
+    block_tables: jax.Array,
     *,
     cfg: LayerConfig,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """A sliding-window layer's attention, within [halo | piece].
+    cache_view: CacheView,
+) -> tuple[jax.Array, jax.Array]:
+    """A sliding-window layer: attention of the rank's rows within [halo |
+    piece], and the cache with this rank's heads of the decode window.
 
     Args:
+        kv_cache: The layer's serving cache; `cache_view` gives its native pages.
         query: [rows, num_heads, head_dim].
         keys, values: [rows, num_kv_heads, head_dim] fp8 K/V of the rank's rows.
-        halos: `exchange_halos` pages, as int8.
-        seq_lens: The step's sequence lengths (one request).
+        received: What every rank sent this one (`sliding_exchange_blocks` after
+            an all-to-all, block s from rank s).
+        seq_lens, block_tables: The step's attention metadata (one request).
         cfg: The layer.
+        cache_view: `kv_cache` -> (native pages, pages per block, inverse view).
 
     Returns:
-        (attention output, the int8 `window_slots_for_ranks` blocks for an
-        all-to-all, the `window_page_owners` of the window pages).
+        (the new kv_cache, [rows, num_heads, head_dim] attention output).
     """
     if cfg.sliding_window is None:
         raise ValueError("sliding_attention_layer needs a sliding window")
-    page_size = halos.shape[1]
+    native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
     plan = cfg.plan(query.shape[0], page_size)
-    halo_pages = num_halo_pages(cfg.sliding_window, page_size)
-    halos = jax.lax.bitcast_convert_type(halos, keys.dtype)
+    halo_pages, window_pages, halo_bytes, window_bytes = _sliding_exchange_sizes(
+        cfg, page_size
+    )
+    if received.shape[1] != halo_bytes + window_bytes:
+        raise ValueError(
+            f"Exchange blocks of {received.shape[1]} bytes are not those of "
+            f"{page_size}-token pages ({halo_bytes} + {window_bytes})."
+        )
+    page = (page_size, 2 * cfg.num_kv_heads // 4, 4, cfg.head_dim)
+    first_src, second_src = (cfg.rank - 1) % cfg.world, (cfg.rank + 1) % cfg.world
+    halos = jnp.stack(
+        [received[first_src, :halo_bytes], received[second_src, :halo_bytes]]
+    )
+    halos = jax.lax.bitcast_convert_type(halos, keys.dtype).reshape(-1, *page)
     local = sliding_local_pages(halos, keys, values, plan, cfg.rank)
     tables = plan.sliding_page_tables(cfg.rank, halo_pages)
     out = cp_prefill_attention(
@@ -670,39 +715,16 @@ def sliding_attention_layer(
         values=values,
         **cfg.rpa_kwargs(),
     )
-    position_pages, _ = window_position_pages(
-        seq_lens[0], cfg.sliding_window, page_size
-    )
-    send = window_slots_for_ranks(
-        keys, values, plan, cfg.rank, position_pages, cfg.num_kv_heads
-    )
-    owners = window_page_owners(plan, position_pages)
-    return out, jax.lax.bitcast_convert_type(send, jnp.int8), owners
-
-
-def window_write_layer(
-    kv_cache: jax.Array,
-    received: jax.Array,
-    owners: jax.Array,
-    seq_lens: jax.Array,
-    block_tables: jax.Array,
-    *,
-    cfg: LayerConfig,
-    cache_view: CacheView,
-) -> jax.Array:
-    """The cache with this rank's heads of the decode window, from the
-    all-to-all of `sliding_attention_layer`'s blocks."""
-    if cfg.sliding_window is None:
-        raise ValueError("window_write_layer needs a sliding window")
-    native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
-    _check_page_size(received.shape[2], page_size)
-    slots = window_slots_from_ranks(
-        jax.lax.bitcast_convert_type(received, native.dtype), owners
+    _, local_heads = cfg.tp_kv_heads
+    window = jax.lax.bitcast_convert_type(received[:, halo_bytes:], native.dtype)
+    window = window.reshape(
+        cfg.world, window_pages, page_size, 2 * local_heads, cfg.head_dim
     )
     position_pages, count = window_position_pages(
         seq_lens[0], cfg.sliding_window, page_size
     )
+    slots = window_slots_from_ranks(window, window_page_owners(plan, position_pages))
     table = _request_block_table(block_tables, seq_lens) * page_stride
     writes = window_page_writes(table, position_pages, count)
     mine = cache_pages_from_slots(slots, cfg.kv_layout)
-    return restore(write_kv_pages(native, mine, *writes))
+    return restore(write_kv_pages(native, mine, *writes)), out

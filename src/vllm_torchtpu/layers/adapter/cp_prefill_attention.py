@@ -19,12 +19,16 @@ zigzag pieces of one prompt with every query and KV head
 those rows their attention over the whole prompt and leaves the layer's
 tensor-parallel KV cache as decode steps read it:
 
-* full attention: the ranks all-gather their fp8 K/V pages, attend through the
+* full attention: the ranks all-gather their fp8 K/V rows, attend through the
   zigzag page table and cache their own KV head(s) of every prompt position;
-* sliding window: each rank receives the pages before its two pieces from the
-  ranks holding them (collective permutes, in a JAX op over the TP mesh) and
-  attends within [halo | piece]; the pages the next decode's window reaches go
-  to every rank's heads in an all-to-all.
+* sliding window: one all-to-all brings each rank the pages before its two
+  pieces (from the ranks holding them) and its heads of the pages the next
+  decode's window reaches; it attends within [halo | piece] and caches those.
+
+Each layer runs exactly one collective, on a 2-D tensor, whose result feeds the
+one op that produces the layer's output. The ranks run differently specialized
+programs (rank-dependent tables), so this is what keeps their collectives in
+the same order: each layer's collective depends on the previous layer's output.
 
 The step must hold exactly one request, the whole prompt, at batch index 0;
 the caller checks that, and keeps prefix caching off (sliding-window layers
@@ -37,13 +41,9 @@ import dataclasses
 import functools
 from typing import Any
 
-import jax
 import torch
-import torch.distributed as dist
-from jax.sharding import PartitionSpec as P
 from torch.distributed import _functional_collectives as funcol
 from torch_tpu._internal import pallas
-from torch_tpu._internal.pallas import get_pallas_mesh
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.attention.attention import get_attention_context
 
@@ -62,40 +62,11 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 logger = init_logger(__name__)
 
 
-# The mesh axis of the halo exchange: the TP ranks in rank order.
-_AXIS = "cp"
-
-
 @dataclasses.dataclass(frozen=True)
 class LayerOps:
     full_attention: Any = None
-    halo_exchange: Any = None
+    sliding_exchange: Any = None
     sliding_attention: Any = None
-    window_write: Any = None
-
-
-@functools.cache
-def _mesh(world: int) -> jax.sharding.Mesh:
-    # Pallas meshes span the torch.distributed world; here that is the TP group.
-    if dist.get_world_size() != world:
-        raise NotImplementedError(
-            "Context-parallel prefill needs the tensor-parallel group to be the "
-            f"whole world ({world} of {dist.get_world_size()} ranks)."
-        )
-    return get_pallas_mesh((_AXIS,))
-
-
-def _halo_exchange_fn(mesh: jax.sharding.Mesh):
-    def halo_exchange(tails: jax.Array) -> jax.Array:
-        return jax.shard_map(
-            lambda t: cp_prefill.exchange_halos(t, _AXIS, mesh.size),
-            mesh=mesh,
-            in_specs=P(_AXIS),
-            out_specs=P(_AXIS),
-            check_vma=False,
-        )(tails)
-
-    return halo_exchange
 
 
 _OPS: dict[cp_prefill.LayerConfig, LayerOps] = {}
@@ -145,43 +116,33 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
             )
         )
 
-    def fake_sliding(query, keys, values, halos, seq_lens):
-        page_size = halos.shape[1]
-        num_window = cp_prefill.num_halo_pages(cfg.sliding_window, page_size) + 1
-        send = (cfg.world, num_window, page_size, 2 * local_kv_heads, cfg.head_dim)
-        return (
-            torch.empty_like(query),
-            query.new_empty(send, dtype=torch.int8),
-            query.new_empty((num_window,), dtype=torch.int32),
+    def fake_exchange(keys, values, seq_lens, page_size):
+        halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, page_size)
+        block = (
+            page_size
+            * cfg.head_dim
+            * (
+                halo_pages * 2 * cfg.num_kv_heads
+                + (halo_pages + 1) * 2 * local_kv_heads
+            )
         )
+        return keys.new_empty((cfg.world, block), dtype=torch.int8)
 
-    def fake_window(kv_cache, *args):
-        return torch.empty_like(kv_cache)
+    def fake_sliding(kv_cache, query, *args):
+        return torch.empty_like(kv_cache), torch.empty_like(query)
 
-    mesh = _mesh(cfg.world)
-    halo_exchange = pallas.jax_op(
-        f"cp_prefill::halo_exchange_{len(_OPS)}",
-        _halo_exchange_fn(mesh),
-        mesh=mesh,
-        input_partition_specs=(P(_AXIS),),
-        # One spec per output: torch_tpu iterates this, and a bare PartitionSpec
-        # would be iterated axis name by axis name.
-        output_partition_specs=(P(_AXIS),),
-    )
-    halo_exchange.register_fake(torch.empty_like)
     return LayerOps(
-        halo_exchange=halo_exchange,
+        sliding_exchange=_register(
+            "sliding_exchange",
+            cp_prefill.sliding_exchange_blocks,
+            fake_exchange,
+            donate=False,
+            cfg=cfg,
+        ),
         sliding_attention=_register(
             "sliding_attention",
             cp_prefill.sliding_attention_layer,
             fake_sliding,
-            donate=False,
-            cfg=cfg,
-        ),
-        window_write=_register(
-            "window_write",
-            cp_prefill.window_write_layer,
-            fake_window,
             donate=True,
             cfg=cfg,
             cache_view=cache_view,
@@ -228,6 +189,10 @@ def _layer_config(
         raise NotImplementedError(
             f"{num_kv_heads} KV heads do not fill whole fp8 K/V words; the packed "
             "pages would need padding slots."
+        )
+    if impl.sliding_window is not None and world < 3:
+        raise ValueError(
+            f"Sliding-window layers need 3 or more ranks to exchange halos, got {world}"
         )
     if impl.num_heads * world != num_heads:
         raise ValueError(
@@ -309,31 +274,10 @@ def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
     return _waited(funcol.all_to_all_single(x.contiguous(), None, None, group))
 
 
-def _int8_pages(key: torch.Tensor, value: torch.Tensor, page_size: int) -> torch.Tensor:
-    """fp8 [n, kv, d] K/V as int8 `cp_prefill.pack_kv_pages` pages: per token
-    K_0 V_0 K_1 V_1 ... in words of 4 (`_layer_config` refuses padding slots)."""
-    n, num_kv_heads, head_dim = key.shape
+def _int8_rows(key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    """fp8 [n, kv, d] K/V as int8 `cp_prefill.pack_kv_rows` rows (2-D)."""
     kv = torch.cat([key.view(torch.int8), value.view(torch.int8)], dim=-1)
-    return kv.reshape(n // page_size, page_size, 2 * num_kv_heads // 4, 4, head_dim)
-
-
-def _pack_piece_tails(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    cfg: cp_prefill.LayerConfig,
-    plan: cp_prefill.ZigzagPlan,
-) -> torch.Tensor:
-    """`cp_prefill.pack_piece_tails`, as int8."""
-    assert cfg.sliding_window is not None
-    halo = cp_prefill.num_halo_pages(cfg.sliding_window, plan.page_size)
-    halo *= plan.page_size
-    piece = plan.piece_tokens
-    return torch.cat(
-        [
-            _int8_pages(key[end - halo : end], value[end - halo : end], plan.page_size)
-            for end in (piece, 2 * piece)
-        ]
-    )
+    return kv.reshape(key.shape[0], -1)
 
 
 def cp_prefill_attention(
@@ -409,18 +353,15 @@ def cp_layer(
     """`cp_prefill_attention` past the forward context: [rows, heads, d] query,
     fp8 [rows, kv_heads, d] K/V; writes `kv_cache` in place."""
     if cfg.sliding_window is None:
-        # fp8 crosses the collectives as raw bytes.
-        pages = _int8_pages(key, value, plan.page_size)
-        gathered = _waited(funcol.all_gather_single(pages, 0, group))
+        gathered = _waited(funcol.all_gather_single(_int8_rows(key, value), 0, group))
         new_kv_cache, out = ops.full_attention(
             kv_cache, query, gathered, seq_lens, block_tables
         )
     else:
-        halos = ops.halo_exchange(_pack_piece_tails(key, value, cfg, plan))
-        out, send, owners = ops.sliding_attention(query, key, value, halos, seq_lens)
+        send = ops.sliding_exchange(key, value, seq_lens, plan.page_size)
         received = _all_to_all(send, group)
-        new_kv_cache = ops.window_write(
-            kv_cache, received, owners, seq_lens, block_tables
+        new_kv_cache, out = ops.sliding_attention(
+            kv_cache, query, key, value, received, seq_lens, block_tables
         )
     # The ops donate the cache; the copy_ folds into that alias when compiled.
     kv_cache.copy_(new_kv_cache)
