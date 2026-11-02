@@ -2044,6 +2044,11 @@ def _attention_kernel(
         assert q_pe_hbm_ref is not None
         pe_dim = Q_ROPE_DIM if q_rope else q_pe_hbm_ref.shape[-1]
         head_dim = align_to(head_dim + pe_dim, 128)
+    # A 128-lane q_pe with the in-kernel rope is the tail of each raw head
+    # (lanes 128:256), handed over already narrowed: read as "q128" reads.
+    pe_narrow = (
+        bool(q_rope) and q_pe_hbm_ref is not None and q_pe_hbm_ref.shape[-1] == 128
+    )
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
     bkv_sz = (
@@ -2438,14 +2443,14 @@ def _attention_kernel(
                 sem,
                 wait,
             )
-            if split_q and q128:
+            if split_q and (q128 or pe_narrow):
                 # "q128": only lanes 128:256 of the raw head, the lanes
                 # `load_bq` reads, into the 128-lane q_pe buffer.
                 _async_copy(
                     q_pe_hbm_ref.at[
                         pl.ds(seq_idx_start, batch_size),
                         :,
-                        pl.ds(Q_ROPE_HEAD_DIM - 128, 128),
+                        pl.ds(q_pe_hbm_ref.shape[-1] - 128, 128),
                     ],
                     bq_pe_x2_ref.at[bq_sem_idx, :],
                     sem,
@@ -2581,7 +2586,7 @@ def _attention_kernel(
         if q_rope:
             # The caller's rope + concat + zero pad, rebuilt in VMEM: lanes
             # 128:256 of the raw head are one aligned vreg column.
-            if q128:
+            if q128 or pe_narrow:
                 raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]
             else:
                 raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][:, 128:Q_ROPE_HEAD_DIM]
@@ -4006,10 +4011,10 @@ def sparse_ragged_paged_attention(
             "(int32 [2]: rank, lane)"
         )
     if q_rope_table is not None:
-        if q_pe is None or q_pe.shape[-1] != Q_ROPE_HEAD_DIM:
+        if q_pe is None or q_pe.shape[-1] not in (128, Q_ROPE_HEAD_DIM):
             raise ValueError(
                 "q_rope_table needs the raw q head view as q_pe, "
-                f"[tokens, heads, {Q_ROPE_HEAD_DIM}]"
+                f"[tokens, heads, {Q_ROPE_HEAD_DIM}], or its lanes 128:256"
             )
         if q_rope_table.shape != (q.shape[0], 2, 128) or (
             q_rope_table.dtype != jnp.float32
