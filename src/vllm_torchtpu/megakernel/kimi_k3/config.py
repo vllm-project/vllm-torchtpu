@@ -107,6 +107,11 @@ class KernelConfig:
     prefill_moe_oneshot_max: int = dataclasses.field(
         default_factory=lambda: int(os.environ.get("K3_PREFILL_MOE_ONESHOT_MAX", "0"))
     )
+    # Fused prefill MoE reduce ring at windows from 2K: 1 = 12 streams, 2 = 24
+    # (each region's columns split across two streams on the same rings).
+    prefill_moe_ring_split: int = dataclasses.field(
+        default_factory=lambda: int(os.environ.get("K3_PREFILL_MOE_RING_SPLIT", "1"))
+    )
     # Weight loading.
     read_streams: int = 4
     load_inflight_gb: float = 16.0
@@ -155,6 +160,8 @@ class KernelConfig:
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
         if self.prefill_moe_dma_banks not in (2, 3, 4):
             raise ValueError("prefill_moe_dma_banks is 2, 3 or 4")
+        if self.prefill_moe_ring_split not in (1, 2):
+            raise ValueError("prefill_moe_ring_split is 1 or 2")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
             raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):

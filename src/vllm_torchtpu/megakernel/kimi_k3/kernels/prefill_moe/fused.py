@@ -1005,7 +1005,7 @@ def _routed_experts(
     )
     sub = cfg.dims.size_lhs_sublane
     max_gm = cfg.dims.size_group + pl.cdiv(rows, tm) - 1
-    regions = k._regions(localrows, tn)
+    regions = _ring_regions(localrows, tn, k._config().prefill_moe_ring_split)
     streams = len(regions)
     store_tile = 128
     gu_cfg = k.make_gmm_configs(
@@ -1884,11 +1884,27 @@ def _ready_reduce(
         @pl.when(state[0] != 1)
         def progress():
             # Alternate two six-stream groups only for long expert loops.
-            for group in range(2):
+            groups = count // 6
+            for group in range(groups):
 
-                @pl.when(((poll_round & 1) == group) | ~sparse_poll)
+                @pl.when((lax.rem(poll_round, groups) == group) | ~sparse_poll)
                 def selected(*, group=group):
                     sweep(group)
+
+
+def _ring_regions(rows, width, split):
+    """The reduce ring's stream regions; ``split`` 2 (windows from 2K) halves
+    every region's columns into a second set of streams on the same rings,
+    so twice as many hops are in flight per directed ring."""
+    regions = k._regions(rows, width)
+    if split == 1 or rows < 64:
+        return regions
+    first, second = [], []
+    for begin, size, col, cols in regions:
+        low = (cols // 128 + 1) // 2 * 128
+        first.append((begin, size, col, low))
+        second.append((begin, size, col + low, cols - low))
+    return tuple(first + second)
 
 
 def _oneshot_descriptor(subtotal, slots, column, send_sems, recv_sems, peer, *, rows):
