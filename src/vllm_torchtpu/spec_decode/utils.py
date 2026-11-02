@@ -50,6 +50,47 @@ _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
 )
 
 
+def sample_draft_tokens(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    uniform: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample one draft token per row and keep the distribution it came from.
+
+    Temperature-only draft sampling, as upstream vLLM's probabilistic draft
+    sampling: top-k / top-p are not applied to the draft so the draft
+    probabilities returned here are exactly the proposal the token was drawn
+    from and can serve as q in the accept ratio min(1, p / q) and in the
+    residual max(0, p - q).
+
+    Args:
+      logits: [rows, vocab] draft logits (any float dtype).
+      temperatures: [rows] or [rows, 1]; rows at 0 draft greedily (argmax of
+        the raw logits, as the greedy path does, so greedy requests draft
+        the same tokens with either method).
+      uniform: [rows, vocab] uniform(0, 1) draws; the Gumbel-max trick (in
+        logit space) turns them into one categorical sample per row.
+
+    Returns:
+      (token_ids [rows] int64, probs [rows, vocab] float32).
+    """
+    temps = temperatures.reshape(-1, 1).to(torch.float32)
+    is_greedy = temps <= 0
+    scaled = logits.to(torch.float32) / torch.where(is_greedy, 1.0, temps)
+    probs = torch.softmax(scaled, dim=-1)
+    # Gumbel-max in logit space: argmax(scaled - log(-log u)) ~ softmax(scaled).
+    # Deliberately not argmax(probs / exp_noise): on TPU a reduction over the
+    # softmax output inside the DSpark draft graph never completes under
+    # EP-DP lockstep (see DSparkProposer), while the logit-space form is fine.
+    tiny = torch.finfo(torch.float32).tiny
+    u = torch.clamp(uniform, min=tiny, max=1.0 - torch.finfo(torch.float32).eps)
+    gumbel = -torch.log(-torch.log(u))
+    sampled = torch.argmax(scaled + gumbel, dim=-1)
+    greedy = torch.argmax(logits, dim=-1)
+    token_ids = torch.where(is_greedy.squeeze(-1), greedy, sampled)
+    return token_ids, probs
+
+
 def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
     """`t` with its leading dim sliced or padded (with `value`) to `rows`.
 

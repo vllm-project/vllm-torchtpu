@@ -4841,7 +4841,21 @@ class TPUModelRunner(GPUModelRunner):
             do_sampling=True,
             topk_candidates=topk_candidates,
             apply_topk_topp=self._sampler_applies_topk_topp(),
+            draft_probs=self._gather_spec_draft_probs(md, cur_start_idx, cur_end_idx),
         )
+
+    def _gather_spec_draft_probs(
+        self, md: SpecDecodeMetadata, cur_start_idx: int, cur_end_idx: int
+    ) -> torch.Tensor | None:
+        """The distribution each of this chunk's draft tokens was sampled
+        from, `[padded_logits_length, vocab]`, when the drafter sampled
+        probabilistically (DSparkProposer.gather_draft_probs); None for
+        greedy drafting, which the sampler verifies as one-hot."""
+        gather = getattr(getattr(self, "drafter", None), "gather_draft_probs", None)
+        if gather is None:
+            return None
+        req_ids = self.input_batch.req_ids[cur_start_idx:cur_end_idx]
+        return gather(req_ids, md.draft_lengths_cpu, md.segment_ids.shape[0])
 
     @_pp_step
     def sample_tokens(
@@ -6767,6 +6781,35 @@ class TPUModelRunner(GPUModelRunner):
                         topk_candidates=blocks,
                     )
                     synchronize_tensors(out)
+                if getattr(self.drafter, "probabilistic", False):
+                    # Probabilistic drafting hands the sampler q as well:
+                    # a distinct graph per (apply_topk_topp, candidates).
+                    warm_draft_probs = torch.zeros(
+                        (num_tokens, self.vocab_size), dtype=torch.float32
+                    ).to(self.device)
+                    variants = [(True, 0), (False, 0)]
+                    if blocks:
+                        variants.append((True, blocks))
+                    for apply_topk_topp, candidates in variants:
+                        out = self.rejection_sampler(
+                            draft_token_ids=draft_token_ids,
+                            num_draft_tokens=draft_lengths,
+                            target_logits=target_logits_ng,
+                            bonus_token_ids=bonus_token_ids,
+                            segment_ids=segment_ids,
+                            group_indices=group_indices,
+                            max_draft_tokens=k,
+                            temperatures=warm_temps,
+                            top_k=warm_top_k,
+                            top_p=warm_top_p,
+                            accept_u=warm_accept_u,
+                            recover_u=warm_recover_u,
+                            do_sampling=True,
+                            topk_candidates=candidates,
+                            apply_topk_topp=apply_topk_topp,
+                            draft_probs=warm_draft_probs,
+                        )
+                        synchronize_tensors(out)
                 logger.info(
                     "  -- padded_logits_length: %d, num_seqs: %d",
                     num_tokens,

@@ -1190,6 +1190,44 @@ def test_rejection_sampler_random_draft_probs_shape_mismatch_raises(device, q_sh
         )
 
 
+def test_rejection_sampler_synthetic_random_draft_probs(device):
+    """As upstream: with q, the synthetic schedule still decides acceptance,
+    q only shapes the max(0, p - q) recovery, and the caller is warned once."""
+    sampler = _synthetic_sampler([1.0, 0.0], device)
+    # Both rows: p = [.1, .6, .3], q = [.3, .6, .1], draft token 0.
+    # Row 0: rate 1.0 accepts, though the ratio test would reject
+    # (u * q(0) = .297 > p(0) = .1).
+    # Row 1: rate 0.0 rejects; p - q = [0, 0, .2] recovers token 2, where the
+    # one-hot recovery (p without 0) would give token 1.
+    target_logits = torch.log(torch.tensor([[0.1, 0.6, 0.3]] * 2, device=device))
+    draft_probs = torch.tensor(
+        [[0.3, 0.6, 0.1]] * 2, dtype=torch.float32, device=device
+    )
+    segment_ids, group_indices = _segment_info([2], device)
+    with mock.patch(
+        "vllm_torchtpu.layers.adapter.sample.rejection_sampler.logger"
+    ) as log:
+        output = sampler(
+            draft_token_ids=torch.tensor([0, 0], dtype=torch.int32, device=device),
+            num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=device),
+            target_logits=target_logits,
+            bonus_token_ids=torch.tensor([9], dtype=torch.int32, device=device),
+            segment_ids=segment_ids,
+            group_indices=group_indices,
+            max_draft_tokens=2,
+            temperatures=torch.ones((2, 1), dtype=torch.float32, device=device),
+            top_k=torch.zeros((2, 1), dtype=torch.int32, device=device),
+            top_p=torch.ones((2, 1), dtype=torch.float32, device=device),
+            accept_u=torch.tensor([0.99, 0.0], dtype=torch.float32, device=device),
+            recover_u=torch.full_like(target_logits, 0.5),
+            do_sampling=True,
+            draft_probs=draft_probs,
+        )
+    assert output.tolist() == [[0, 2, -1]]
+    log.warning_once.assert_called_once()
+    assert "Synthetic" in log.warning_once.call_args.args[0]
+
+
 def test_rejection_sampler_greedy_path_ignores_draft_probs(device):
     """As upstream: the greedy path verifies by argmax match, so draft_probs
     does not change its decision; the caller is warned once."""
