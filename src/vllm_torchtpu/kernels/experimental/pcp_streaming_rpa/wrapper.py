@@ -274,6 +274,14 @@ def _compute_cache_owner_and_slot_ids_for_rows(
     )
 
 
+def _per_token(values: jax.Array, token_requests: jax.Array) -> jax.Array:
+    """``values[token_requests]`` as a select over the batch's few requests: a
+    TPU gather of token-sized indices costs far more."""
+    requests = jnp.arange(values.shape[0], dtype=jnp.int32)
+    hit = token_requests[:, None] == requests[None, :]
+    return jnp.sum(jnp.where(hit, values[None, :], 0), axis=1, dtype=values.dtype)
+
+
 def _compute_pcp_local_query_row_mapping(
     q_lens: jax.Array,
     token_owner_starts: jax.Array,
@@ -309,12 +317,12 @@ def _compute_pcp_local_query_row_mapping(
     row_valid = local_token_indices < total_local_tokens
     max_num_reqs = int(q_lens.shape[0])
     safe_req_indices = jnp.minimum(token_req_indices, max_num_reqs - 1)
-    req_local_starts = req_ends[safe_req_indices] - local_counts[safe_req_indices]
+    req_local_starts = _per_token(req_ends - local_counts, safe_req_indices)
     req_rank_offsets = local_token_indices - req_local_starts
 
     cycle = pcp_size * interleave_size
-    req_owner_starts = token_owner_starts[safe_req_indices]
-    req_owner_ends = token_owner_ends[safe_req_indices]
+    req_owner_starts = _per_token(token_owner_starts, safe_req_indices)
+    req_owner_ends = _per_token(token_owner_ends, safe_req_indices)
     rank_chunk_offset = pcp_rank * interleave_size
     first_chunk = (req_owner_starts // cycle) * cycle + rank_chunk_offset
     first_chunk = jnp.where(
@@ -339,7 +347,9 @@ def _compute_pcp_local_query_row_mapping(
         req_rank_offsets < first_overlap_len, positions_in_first, positions_after_first
     )
     request_offsets = owner_positions - req_owner_starts
-    absolute_positions = request_absolute_starts[safe_req_indices] + request_offsets
+    absolute_positions = (
+        _per_token(request_absolute_starts, safe_req_indices) + request_offsets
+    )
     absolute_positions = jnp.where(row_valid, absolute_positions, -1).astype(jnp.int32)
     request_indices = jnp.where(row_valid, safe_req_indices, -1).astype(jnp.int32)
     return _PCPQueryRowMapping(
