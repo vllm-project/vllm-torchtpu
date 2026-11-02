@@ -150,17 +150,27 @@ def test_pipeline_moves_only_decode_and_preserves_kernel_coverage():
         assert steps[key]["agents"]["queue"] == "tpu_v7x_8_queue"
 
 
-@pytest.mark.parametrize("failure", ["", "head", "worker", "audit"])
+@pytest.mark.parametrize(
+    "failure",
+    ["", "head", "worker", "audit", "probe_once", "probe_always", "probe_error"],
+)
 def test_shell_coordinator_propagates_failure_and_stops_both_hosts(tmp_path, failure):
     binary = tmp_path / "bin"
     binary.mkdir()
     (tmp_path / "perf_eval_results").mkdir()
     out = tmp_path / "persist/perf_eval_results/result/benchmark"
     out.mkdir(parents=True)
+    out.parent.chmod(0o777)
+    (out.parent / "task.log").write_text("head log")
+    peer = tmp_path / "peer/persist/perf_eval_results/result"
+    (peer / "worker/benchmark").mkdir(parents=True)
+    peer.chmod(0o755)
+    (peer / "task.log").write_text("must not overwrite the head log")
+    (peer / "worker/benchmark/server.log").write_text("worker log")
     # Simulate the remote worker and Docker control plane; no SSH or containers.
     fake = binary / "fake"
     fake.write_text("""#!/usr/bin/env python3
-import os, pathlib, sys, tarfile, time
+import os, pathlib, subprocess, sys, time
 root = pathlib.Path(os.environ["TEST_ROOT"])
 failure = os.environ["TEST_FAILURE"]
 name = pathlib.Path(sys.argv[0]).name
@@ -184,12 +194,20 @@ elif "bash ~/multihost/run_cluster_mp.sh" in command:
 elif "docker exec" in command or "docker stop" in command:
     (root / "worker-stop").touch()
 elif "test -f" in command:
+    probes = root / "probes"
+    count = int(probes.read_text()) + 1 if probes.exists() else 1
+    probes.write_text(str(count))
+    if failure == "probe_always" or (failure == "probe_once" and count == 1):
+        sys.exit(255)
+    if failure == "probe_error":
+        sys.exit(2)
     sys.exit(0 if (root / "worker-start").exists() else 1)
 elif "launch-permitted" in command:
     (root / "worker-launch-permitted").touch()
 elif "tar -C" in command:
-    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|"):
-        pass
+    sys.exit(subprocess.run(
+        ["bash", "-c", command], env={**os.environ, "HOME": str(root / "peer")}
+    ).returncode)
 elif "cat >" in command or "bash -s" in command:
     sys.stdin.read()
 """)
@@ -259,8 +277,16 @@ exit "$status"
         with suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
         process.wait()
-    assert (process.returncode == 0) == (not failure), stdout + stderr
-    assert (tmp_path / "audited").exists() == (failure in ("", "audit"))
+    assert (process.returncode == 0) == (failure in ("", "probe_once")), stdout + stderr
+    assert (tmp_path / "audited").exists() == (failure in ("", "probe_once", "audit"))
+    assert (out.parent / "task.log").read_text() == "head log"
+    assert out.parent.stat().st_mode & 0o777 == 0o777
+    assert (out.parent / "worker/benchmark/server.log").read_text() == "worker log"
+    if failure in ("probe_once", "probe_always", "probe_error"):
+        assert (
+            int((tmp_path / "probes").read_text())
+            == {"probe_once": 2, "probe_always": 5, "probe_error": 1}[failure]
+        )
     if failure != "worker":
         assert (tmp_path / "worker-finished").exists()
     for path in ("head-command", "worker-command"):

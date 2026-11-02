@@ -223,7 +223,7 @@ def main() -> None:
             MASTER_ADDR=head,
             MASTER_PORT="19700",
             TORCH_TPU_BASE_PORT="19000",
-            HOST="0.0.0.0",
+            HOST="127.0.0.1",
             HEADLESS=str(int(worker)),
             TPU_DEEPSEEK_V41_ENGRAM_HBM="first",
             MOE_FUSED_EP_KERNEL_IMPL="push",

@@ -101,6 +101,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
     for key in inherited_roots:
         monkeypatch.setenv(key, str(tmp_path / "persistent-cache"))
     if scenario == "decode_dp16":
+        monkeypatch.setenv("HOST", "0.0.0.0")
         monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
         monkeypatch.setenv("MOE_FUSED_EP_PUSH_SC_PREPUSH", "1")
         monkeypatch.setenv("MOE_FUSED_EP_PUSH_TC_EXCHANGE", "0")
@@ -117,6 +118,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
         assert env["DP"] == ("16" if scenario == "decode_dp16" else "8")
         if scenario == "decode_dp16":
             assert env["HEADLESS"] == "0"
+            assert env["HOST"] == "127.0.0.1"
             assert env["TPU_DEEPSEEK_V41_ENGRAM_HBM"] == "first"
             assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
             assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
@@ -248,6 +250,7 @@ def test_dp16_worker_waits_for_shutdown_and_never_runs_client(
     def start(command, *, env, **kwargs):
         commands.append(command)
         assert env["HEADLESS"] == "1" and env["DP"] == "16"
+        assert env["HOST"] == "127.0.0.1"
         assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
         assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
         assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"

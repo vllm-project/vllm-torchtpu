@@ -48,7 +48,8 @@ docs/
 # results into BigQuery.
 !.buildkite/kubernetes/
 !.buildkite/scripts/
-# CPU regression tests execute the GitHub Check publication hook.
+# CPU regressions inspect the decode pipeline and execute its publication hook.
+!.buildkite/pipeline_dsv41.yml
 !.buildkite/hooks/post-command
 .github/
 mkdocs.yml

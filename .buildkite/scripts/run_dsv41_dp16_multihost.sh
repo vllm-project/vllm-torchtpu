@@ -48,7 +48,7 @@ run_dsv41_dp16_multihost() {
     > >(tee "$MULTIHOST_RUN_LOG") 2>&1 &
   head_pid=$!
 
-  local launched=0 probe_status=0
+  local launched=0 probe_status=0 probe_failures=0
   while kill -0 "$head_pid" 2>/dev/null; do
     if [[ -f "$host_out/formal-complete" ]]; then break; fi
     if ! kill -0 "$worker_pid" 2>/dev/null; then
@@ -70,7 +70,16 @@ run_dsv41_dp16_multihost() {
           status=1
           break
         fi
-      elif [[ "$probe_status" != 1 ]]; then
+      elif [[ "$probe_status" == 255 ]]; then
+        probe_failures=$((probe_failures + 1))
+        echo "WARNING: DP16 readiness SSH failure ${probe_failures}/5" >&2
+        if (( probe_failures >= 5 )); then
+          status=1
+          break
+        fi
+      elif [[ "$probe_status" == 1 ]]; then
+        probe_failures=0
+      else
         status=1
         break
       fi
@@ -108,9 +117,11 @@ run_dsv41_dp16_multihost() {
   wait "$head_pid" || status=$?
 
   # Both log sets survive container removal. A missing worker copy fails CI.
+  # Do not restore metadata on the head container's existing root-owned dirs.
+  printf -v remote_cmd 'tar -C "$HOME/persist"%q -cf - worker' "$results"
   ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
-    'tar -C "$HOME/persist/perf_eval_results" -cf - .' \
-    | tar -C "$PERSIST_ROOT/perf_eval_results" -xf - || status=1
+    "$remote_cmd" \
+    | tar -C "$PERSIST_ROOT$results" -xf - || status=1
   if [[ "$status" == 0 ]]; then
     docker run --rm --network none --entrypoint python \
       -v "$PERSIST_ROOT/perf_eval_results:/perf_eval_results" \
