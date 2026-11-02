@@ -14,7 +14,8 @@
 
 # Settings for the PR review bot (cbs-oss-review-bot). Every value below is
 # the bot's default, so this file changes nothing until someone edits it.
-# README.md in this folder explains each setting.
+# README.md in this folder explains each setting. REVIEW.md is the guide the
+# bot follows.
 #
 # Format: one `setting: value` per line. A list goes on one line, separated
 # by commas, in double quotes ("a, b"), not as a YAML list. An empty value
@@ -48,3 +49,7 @@ automatic_reviews: on
 # "draft" at the start or in brackets ([WIP], Draft:, (draft)), or with
 # "do not review", "do not merge" or "do not submit" anywhere.
 title_keywords_to_skip:
+
+# How the bot uses REVIEW.md: bot keeps the bot's own review format, repo lets
+# REVIEW.md also set the format and verdict.
+review_format: bot
