@@ -23,6 +23,16 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
+# Grid token block at large buckets. Each step pushes the three resident fn
+# chunks into the MXU once for the whole block, so a bigger block amortizes
+# that and the per-step overhead over more tokens.
+TOKEN_BLOCK = 128
+# Token block at small (decode-size) buckets, and the multiple blocks round to.
+MIN_TOKEN_BLOCK = 32
+# A bucket is split into at least this many grid steps, so the next block's
+# DMA still hides behind compute; smaller buckets keep MIN_TOKEN_BLOCK.
+MIN_GRID_STEPS = 4
+
 
 def _fused_kernel(
     x_ref,
@@ -104,7 +114,7 @@ def fused_post_pre_mixes(
     rms_eps: float,
     hc_pre_eps: float,
     *,
-    token_block_size: int = 32,
+    token_block_size: int = TOKEN_BLOCK,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -123,10 +133,10 @@ def fused_post_pre_mixes(
         hc_base: (hc_mult3,), float32 — logit biases, pre entries first.
         rms_eps: static; RMS-norm epsilon for the in-block pre gates.
         hc_pre_eps: static; additive floor on the sigmoid pre gates.
-        token_block_size: tokens per grid step. Default 32 keeps the
-            worst-case VMEM footprint (f32 old streams + bf16 blocks +
-            the three resident bf16 fn chunks) near 12 MB at DeepSeek-V4
-            shapes; 64 also fits.
+        token_block_size: most tokens per grid step. Below it, a bucket
+            is split into MIN_GRID_STEPS blocks, but none smaller than
+            MIN_TOKEN_BLOCK. 256 still fits VMEM at DeepSeek-V4 shapes;
+            512 does not.
         gemm_precision: "highest" (3-chunk exact decomposition, the
             default) or "default" (hi-chunk pass only; pre_mix and the
             collapse then also see the hi-only mixes).
@@ -152,9 +162,14 @@ def fused_post_pre_mixes(
     assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, res2d.shape)
     assert gemm_precision in ("highest", "default"), gemm_precision
 
-    # This kernel keeps a fixed block: its default (32) already fits the
-    # budget at DeepSeek-V4 shapes, so there is no vmem_need to shrink by.
-    tb, padded_tokens = utils.select_token_block(num_tokens, token_block_size)
+    # The block is sized by the bucket alone and fits the budget at
+    # DeepSeek-V4 shapes, so there is no vmem_need to shrink by.
+    per_step = utils.round_up(num_tokens, utils.SUBLANE) // MIN_GRID_STEPS
+    block = min(
+        token_block_size,
+        max(MIN_TOKEN_BLOCK, per_step // MIN_TOKEN_BLOCK * MIN_TOKEN_BLOCK),
+    )
+    tb, padded_tokens = utils.select_token_block(num_tokens, block)
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
     fn_chunks = utils.stack_fn3(fn)
@@ -222,7 +237,7 @@ def mhc_fused_post_pre(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
-    token_block_size: int = 32,
+    token_block_size: int = TOKEN_BLOCK,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:

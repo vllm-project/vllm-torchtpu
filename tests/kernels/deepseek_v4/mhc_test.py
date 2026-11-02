@@ -457,7 +457,7 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
 
     @parameterized.product(
         num_tokens=[16, 17, 128, 2048],
-        token_block_size=[32, 64],
+        token_block_size=[32, 64, 128],
     )
     def test_matches_sequential_reference(self, num_tokens, token_block_size):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
