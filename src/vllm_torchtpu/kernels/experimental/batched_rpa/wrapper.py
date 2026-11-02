@@ -283,8 +283,9 @@ def calculate_block_sizes(
     """Calculate optimal block size for decode and prefill.
 
     `cap_sliding_decode_block` stops the decode KV block of a sliding-window
-    layer at half the window. The VMEM-filling default grows it far past the
-    window, and every decode launch zero-fills and computes all lanes of it.
+    layer at half the window, rounded down to the block stride. The
+    VMEM-filling default grows it far past the window, and every decode launch
+    zero-fills and computes all lanes of it.
 
     `sliding_prefill_max_bkv` caps the prefill KV (and query) block of a
     sliding-window layer. Blocks start at multiples of bkv, so a query block
@@ -542,8 +543,8 @@ def calculate_block_sizes(
 
     decode_max_bkv_sz = _MAX_BKV_SZ
     if cap_sliding_decode_block and model_cfgs.sliding_window is not None:
-        # The window then spans at most three blocks; never below the first
-        # block size the search starts from.
+        # The search rounds this down to its block stride and never goes below
+        # the first block it tries.
         decode_max_bkv_sz = min(decode_max_bkv_sz, model_cfgs.sliding_window // 2)
     decode_block_sizes = find_best_block_sizes(
         decode_batch_size, decode_query_size, decode_max_bkv_sz

@@ -740,9 +740,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # zero steps on initialized buffers. Outputs are unchanged.
     "TPU_RPA_SKIP_EMPTY_LAUNCH": env_bool("TPU_RPA_SKIP_EMPTY_LAUNCH"),
     # Cap the batched-RPA decode KV block of sliding-window layers at half the
-    # window. The default block fills VMEM (1792 tokens for a 1024-token
-    # window on Gemma4), and each decode launch zero-fills and computes every
-    # lane of it.
+    # window, rounded down to the block stride. The default block fills VMEM
+    # (1792 tokens for a 1024-token window on Gemma4), and each decode launch
+    # zero-fills and computes every lane of it.
     "TPU_RPA_CAP_SLIDING_DECODE_BLOCK": env_bool("TPU_RPA_CAP_SLIDING_DECODE_BLOCK"),
     # Largest batched-RPA mixed (prefill) KV and query block (tokens) on
     # sliding-window layers, rounded down to the block stride and no smaller
