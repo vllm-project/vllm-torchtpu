@@ -21,8 +21,10 @@
 #                      order; @OUT@ is the results directory
 #   K3_BENCH_LIBTPU    flags appended to LIBTPU_INIT_ARGS (optional)
 #   K3_BENCH_FRESH     1: compile every command afresh (no compilation caches)
+#   K3_BENCH_TRACE_ALL 1: every rank writes its --trace (not only rank 0)
 #
-# Pod 0 copies the results and rank logs into ARTIFACTS_DIR and uploads them.
+# Pod 0 copies the results and rank-0 logs into ARTIFACTS_DIR; every pod adds
+# its trace and dump directories and uploads them.
 set -uo pipefail
 
 : "${K3_BENCH_COMMANDS:?}" "${ROLE_HOST_PREFIX:?}" "${ROLE_HOST_DOMAIN:?}" "${NUM_HOSTS:?}"
@@ -41,6 +43,9 @@ export HF_HUB_OFFLINE=1 MEGAKERNEL_TOOL_WORKER=1 TPU_STDERR_LOG_LEVEL=0 TPU_PARA
 export PJRT_DEVICE=TPU VLLM_TARGET_DEVICE=tpu
 mkdir -p /dev/shm/xla_cache
 export VLLM_XLA_CACHE_PATH=/dev/shm/xla_cache
+if [ "${K3_BENCH_TRACE_ALL:-0}" = 1 ]; then
+  export K3_TRACE_ALL_RANKS=1
+fi
 
 for _ in $(seq 1 60); do
   [ -f "$PRESHARDED/layout.json" ] && break
@@ -101,14 +106,17 @@ while IFS= read -r line; do
   fi
 done < <(printf '%s\n' "$K3_BENCH_COMMANDS" | sed 's/;;/\n/g')
 
-if [ "$NODE" = 0 ] && [ -n "${ARTIFACTS_DIR:-}" ]; then
-  echo "=== results"
-  cat "$OUT"/results-cmd*.jsonl 2>/dev/null || true
+if [ -n "${ARTIFACTS_DIR:-}" ]; then
   mkdir -p "$ARTIFACTS_DIR/k3-bench"
-  # Results, saved tokens and rank-0 logs; traces and LLO dumps when written.
-  cp -a "$OUT"/results-cmd*.jsonl "$ARTIFACTS_DIR/k3-bench/" 2>/dev/null
-  cp -a "$OUT"/*.npz "$ARTIFACTS_DIR/k3-bench/" 2>/dev/null
-  cp -a "$OUT"/cmd*-node0-rank00.log "$ARTIFACTS_DIR/k3-bench/" 2>/dev/null
+  if [ "$NODE" = 0 ]; then
+    echo "=== results"
+    cat "$OUT"/results-cmd*.jsonl 2>/dev/null || true
+    # Results, saved tokens and rank-0 logs.
+    cp -a "$OUT"/results-cmd*.jsonl "$ARTIFACTS_DIR/k3-bench/" 2>/dev/null
+    cp -a "$OUT"/*.npz "$ARTIFACTS_DIR/k3-bench/" 2>/dev/null
+    cp -a "$OUT"/cmd*-node0-rank00.log "$ARTIFACTS_DIR/k3-bench/" 2>/dev/null
+  fi
+  # Traces and LLO dumps (directories; their files name the rank).
   for d in "$OUT"/*/; do
     [ -d "$d" ] && cp -a "$d" "$ARTIFACTS_DIR/k3-bench/"
   done
