@@ -66,6 +66,7 @@ from vllm_torchtpu.omni.rope import (
     split_rope_natural_tables,
     wan_self_attention_fused,
 )
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 pytestmark = pytest.mark.omni
 
@@ -77,6 +78,7 @@ _UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
 _UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
 _UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
 _UPSTREAM_RESTORE_BWE_FILTER = ltx2_runtime._restore_ltx_bwe_resampler_filter
+_UPSTREAM_CHECK_AND_UPDATE_CONFIG = TpuPlatform.__dict__["check_and_update_config"]
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -442,10 +444,13 @@ def test_safe_pack_tensor_if_large(monkeypatch, nbytes):
     assert res is cpu_tensor
 
 
-def test_omni_tpu_patches_configuration():
+def test_omni_tpu_patches_configuration(monkeypatch):
     # Call the undecorated body so the run-once cache is left alone, and
-    # restore the process-global state it edits (env var).
+    # restore the process-global state it edits (env var and TpuPlatform check).
     orig = torch.nn.functional.interpolate
+    monkeypatch.setattr(
+        TpuPlatform, "check_and_update_config", _UPSTREAM_CHECK_AND_UPDATE_CONFIG
+    )
     with patch.dict(os.environ):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
         apply_omni_tpu_patches.__wrapped__()
@@ -927,3 +932,35 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
         fresh = call(coords[:, 0:1, :])
         assert len(table_syncs) == syncs + 1
         assert not torch.equal(fresh[0], stale[0])
+
+
+def test_omni_model_runner_v2_config_rejected(monkeypatch):
+    from vllm_omni.config.model import OmniModelConfig
+
+    from vllm_torchtpu.omni.patches import (
+        _patch_tpu_platform_omni_config_check,
+        _validate_omni_model_runner_config,
+    )
+
+    monkeypatch.setattr(
+        TpuPlatform, "check_and_update_config", _UPSTREAM_CHECK_AND_UPDATE_CONFIG
+    )
+    _patch_tpu_platform_omni_config_check()
+
+    omni_v2 = OmniModelConfig.__new__(OmniModelConfig)
+    omni_v2.use_v2_model_runner = True
+    cfg_v2 = SimpleNamespace(model_config=omni_v2)
+
+    with pytest.raises(ValueError, match="model_runner='v2' is not supported on TPU"):
+        OmniTpuPlatform.check_and_update_config(cfg_v2)
+
+    with pytest.raises(ValueError, match="model_runner='v2' is not supported on TPU"):
+        TpuPlatform.check_and_update_config(cfg_v2)
+
+    omni_v1 = OmniModelConfig.__new__(OmniModelConfig)
+    omni_v1.use_v2_model_runner = False
+    cfg_v1 = SimpleNamespace(model_config=omni_v1)
+    _validate_omni_model_runner_config(cfg_v1)
+
+    plain_cfg = SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=True))
+    _validate_omni_model_runner_config(plain_cfg)

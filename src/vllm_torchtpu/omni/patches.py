@@ -68,6 +68,55 @@ def apply_omni_tpu_patches() -> None:
 
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
+    _patch_tpu_platform_omni_config_check()
+
+
+_OMNI_CONFIG_CHECK_PATCHED = "_tpu_omni_config_check_patched"
+
+
+def _validate_omni_model_runner_config(vllm_config: Any) -> None:
+    """Reject vLLM-Omni model_runner='v2' configs on TPU with an actionable error."""
+    from vllm_omni.config.model import OmniModelConfig
+
+    model_config = getattr(vllm_config, "model_config", None)
+    if isinstance(model_config, OmniModelConfig) and model_config.use_v2_model_runner:
+        raise ValueError(
+            "vLLM-Omni model_runner='v2' is not supported on TPU because "
+            "TPUModelRunner implements the vLLM V1 runner contract. Set "
+            "model_runner='v1' in the stage config (for example under "
+            "platforms.tpu.model_runner or via --deploy-config)."
+        )
+
+
+def _patch_tpu_platform_omni_config_check() -> None:
+    """Hook OmniModelConfig validation into TpuPlatform.check_and_update_config.
+
+    vLLM's VllmConfig.__post_init__ dispatches config validation through
+    vllm.platforms.current_platform (TpuPlatform), never current_omni_platform
+    (OmniTpuPlatform). Wrapping TpuPlatform.check_and_update_config ensures
+    unsupported model_runner='v2' configs fail fast during
+    OmniEngineArgs.create_engine_config(). Since OmniTpuPlatform subclasses
+    TpuPlatform, both classes inherit this check without a duplicate override.
+    """
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    orig_check_func = TpuPlatform.__dict__["check_and_update_config"].__func__
+    if getattr(orig_check_func, _OMNI_CONFIG_CHECK_PATCHED, False):
+        return
+
+    def _checked_check_and_update_config(
+        cls: type[TpuPlatform], vllm_config: Any
+    ) -> None:
+        _validate_omni_model_runner_config(vllm_config)
+        orig_check_func(cls, vllm_config)
+
+    setattr(_checked_check_and_update_config, _OMNI_CONFIG_CHECK_PATCHED, True)
+    TpuPlatform.check_and_update_config = classmethod(  # type: ignore[method-assign]
+        _checked_check_and_update_config
+    )
+    logger.info(
+        "Applied TPU patch: validate OmniModelConfig model_runner on TpuPlatform."
+    )
 
 
 @run_once
