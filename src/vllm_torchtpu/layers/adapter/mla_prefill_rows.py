@@ -125,14 +125,14 @@ def check_config(vllm_config: Any) -> None:
 
 def _check_layer(mla: Any) -> None:
     attn = mla.mla_attn
+    # TPU_INDEXER_QB_OVERLAP and TPU_MLA_DECODE_PROLOGUE act only on the
+    # buckets the prefill splits leave (the wrapper's forward), never here.
     problems = {
         "the q_lora MLA path without fused preprocessing, gates or g_proj": (
             mla.q_lora_rank is None
             or mla.kimi_preprocess is not None
             or mla.gate_is_fused
             or mla.g_proj is not None
-            or getattr(mla, "qb_overlap", False)
-            or getattr(mla, "decode_prologue", False)
         ),
         "sparse MLA under query replication with the rows op built": (
             not mla.is_sparse
