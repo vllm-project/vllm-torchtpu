@@ -37,6 +37,11 @@ from vllm.model_executor.models.vision import (
     get_load_balance_assignment,
     is_vit_use_data_parallel,
 )
+from vllm.models.muse_spark.common.processor import (
+    MuseSpark1xOmniDummyInputsBuilder,
+    MuseSpark1xOmniMultiModalProcessor,
+    MuseSpark1xOmniProcessingInfo,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -47,11 +52,6 @@ from vllm_torchtpu.utils import get_dp_size, synchronize_tensors
 from .audio import AutoEncoder
 from .layers import MuseRMSNorm
 from .model import MuseSparkForCausalLM
-from .processor import (
-    MuseSparkDummyInputsBuilder,
-    MuseSparkMultiModalProcessor,
-    MuseSparkProcessingInfo,
-)
 from .vision import (
     NaViT,
     NaViTAdapter,
@@ -64,9 +64,9 @@ logger = init_logger(__name__)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    MuseSparkMultiModalProcessor,
-    info=MuseSparkProcessingInfo,
-    dummy_inputs=MuseSparkDummyInputsBuilder,
+    MuseSpark1xOmniMultiModalProcessor,
+    info=MuseSpark1xOmniProcessingInfo,
+    dummy_inputs=MuseSpark1xOmniDummyInputsBuilder,
 )
 class MuseSparkForConditionalGeneration(
     MuseSparkForCausalLM, MuseVisionReplayMixin, SupportsMultiModal

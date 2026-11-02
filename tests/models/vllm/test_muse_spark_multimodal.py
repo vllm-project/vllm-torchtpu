@@ -15,10 +15,8 @@
 
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
-from PIL import Image
 from torch import nn
 
 from vllm_torchtpu.models.vllm.muse_spark.audio import DepthwiseCausalConv
@@ -26,42 +24,6 @@ from vllm_torchtpu.models.vllm.muse_spark.layers import MuseRMSNorm
 from vllm_torchtpu.models.vllm.muse_spark.multimodal import (
     MuseSparkForConditionalGeneration,
 )
-from vllm_torchtpu.models.vllm.muse_spark.processor import (
-    PreprocessConfig,
-    compute_video_clip_metadata,
-    preprocess_image,
-    preprocess_video,
-)
-
-
-def test_image_preprocessing_composites_alpha_and_preserves_rectangular_grid():
-    rgba = np.zeros((56, 84, 4), dtype=np.uint8)
-    rgba[..., 0] = 255
-    rgba[:, :42, 3] = 255
-    image = Image.fromarray(rgba)
-    pixels, count = preprocess_image(image, PreprocessConfig(max_num_image_tokens=6))
-    assert pixels.shape == (3, 56, 84) and count == 6
-    torch.testing.assert_close(pixels[:, 0, 0], torch.tensor([1.0, -1.0, -1.0]))
-    torch.testing.assert_close(pixels[:, 0, -1], torch.ones(3))
-
-
-def test_video_alignment_keeps_frame_order_and_clip_timestamps():
-    frame_count, aligned = 5, 4
-    frames = np.stack(
-        [np.full((28, 56, 3), 30 * i, dtype=np.uint8) for i in range(frame_count)]
-    )
-    cfg = PreprocessConfig(max_num_tokens_per_frame=2)
-    pixels, counts, timestamps = preprocess_video(
-        frames, [float(i) for i in range(frame_count)], cfg
-    )
-    assert pixels.shape == (aligned, 3, 28, 56)
-    assert counts == [2] * aligned
-    assert timestamps == [0.0, 1.0, 2.0, 3.0]
-    # Each clip combines two adjacent frames into the same two spatial tokens.
-    metadata = compute_video_clip_metadata(pixels, timestamps, cfg)
-    assert metadata.num_clips == aligned // 2
-    assert metadata.patches_per_clip == 2
-    assert metadata.clip_timestamps == timestamps[::2]
 
 
 def test_audio_causal_convolution_streaming_matches_prefill():
