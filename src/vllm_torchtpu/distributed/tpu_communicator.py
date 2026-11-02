@@ -27,6 +27,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
+from vllm_torchtpu.distributed.hier_reduce_scatter import moe_combine_reduce_scatter
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -90,4 +92,4 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states
-        return group.reduce_scatter(hidden_states, dim=0)
+        return moe_combine_reduce_scatter(group, hidden_states)
