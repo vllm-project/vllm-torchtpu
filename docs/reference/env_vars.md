@@ -54,12 +54,14 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_GEMMA4_SP_MICROBATCHES` | `1` | With `TPU_GEMMA4_SEQUENCE_PARALLEL`: run a large bucket as this many contiguous token chunks, one dataflow each outside attention, so one chunk's collectives can overlap another's projections. Applied only while every chunk keeps >= 1 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
+| `TPU_GEMMA4_TOPK_SOFTMAX_ROUTING` | `False` | Opt-in. Gemma4 MoE routing as a softmax over the top-k router logits, with `per_expert_scale` selected without a gather, instead of upstream's full softmax, one-hot renormalization and two gathers. Same top-k ids; weights match to float32 rounding for float32 logits. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |
 | `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size for load-time linear weight requantization. |
 | `TPU_FP8_LINEAR_W8A16_MAX_ROWS` | `0` | Opt-in. FP8 dense-linear steps whose padded token bucket has at most this many rows keep bf16 activations (W8A16) instead of quantizing them to FP8. Per-channel path with FP8 weights only; measured on v7x. |
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time MoE expert weight requantization (e.g., `"fp4"`). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |
+| `TPU_NORM_WEIGHTS_FP32` | `False` | Opt-in. Stores learned RMSNorm weights in float32 at load, removing a per-norm weight convert from every step. Outputs are unchanged where every norm goes through the TPU `rms_norm` providers (verified on Gemma4); code that reads norm weights directly sees float32. |
 | `VLLM_TPU_MXFP4_DEVICE_DEQUANT` | `True` | Performs MXFP4 weight dequantization on TPU device during load rather than on CPU. |
 
 ---
@@ -77,6 +79,9 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_SPARSE_MLA_NOPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA non-positional (`nope`) KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `TPU_RPA_SKIP_EMPTY_LAUNCH` | `False` | Opt-in. Batched RPA (`--attention-backend CUSTOM`) does no work for a decode or mixed kernel whose batch segment is empty: the kernel returns at entry, its schedule writes only the step count, and on buckets of at most `max_num_seqs` (times the decode query size) tokens an XLA conditional skips the launch. Outputs are unchanged. |
+| `TPU_RPA_CAP_SLIDING_DECODE_BLOCK` | `False` | Opt-in. Caps the batched-RPA decode KV block of sliding-window layers at half the window instead of filling VMEM (1792 tokens for Gemma4's 1024-token window), so decode launches zero-fill and compute less. Changes the online-softmax block order. |
+| `TPU_REUSE_STAGED_BLOCK_TABLES` | `False` | Opt-in. Reuses the previous step's staged device block tables when every staged row is unchanged (most decode steps), skipping the host-side pack, upload and split. Not applied to dummy runs or mamba groups. |
 
 ---
 
