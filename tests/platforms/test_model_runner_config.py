@@ -48,6 +48,7 @@ def _config(device="tpu", method=None, pcp=1):
             enable_adaptive_verification=False,
             parallel_drafting=method in ("dflash", "dspark"),
             draft_lm_head_quantization=None,
+            is_xpress=lambda: False,
             draft_model_config=SimpleNamespace(
                 architectures=["DFlashDraftModel"],
                 hf_config=SimpleNamespace(
@@ -87,6 +88,7 @@ def test_native_v1_validation_uses_tpu_capabilities(device, method, pcp, reason)
     "feature,reason",
     [
         ("adaptive", "adaptive draft verification"),
+        ("xpress", "xpress speculative decoding"),
         ("dflash2", r"(?:DFlash candidate-head drafts|dflash2 drafts)"),
         ("diffusion", "diffusion models"),
         ("batch_sharded", "batch-sharded sampling"),
@@ -96,6 +98,8 @@ def test_tpu_preserves_native_v1_rejections(feature, reason):
     config = _config(method="dflash", pcp=2)
     if feature == "adaptive":
         config.speculative_config.enable_adaptive_verification = True
+    elif feature == "xpress":
+        config.speculative_config.is_xpress = lambda: True
     elif feature == "dflash2":
         config.speculative_config.draft_model_config.architectures = [
             "DFlash2DraftModel"

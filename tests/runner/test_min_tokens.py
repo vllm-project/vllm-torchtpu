@@ -969,7 +969,10 @@ def _verify(min_toks, grammar=False, start=0, grammar_only_stop=None, greedy=Tru
             return target, bonus
 
         runner.structured_decoding_manager = SimpleNamespace(
-            mask_spec_logits=mask_spec_logits
+            mask_spec_logits=mask_spec_logits,
+            mask_invalid_draft_tokens=lambda draft_token_ids, *_args, **_kwargs: (
+                draft_token_ids
+            ),
         )
     with torch.compiler.set_stance("force_eager"):
         out = TPUModelRunner._sample_spec_verify_chunk(

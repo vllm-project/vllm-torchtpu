@@ -163,7 +163,7 @@ def test_resolve_leaves_multi_group_to_previous_resolver():
     assert _resolve(config, vllm_config) == upstream(config, vllm_config)
 
 
-def _scheduler(monkeypatch, *, prefix_match_unit, use_mtp=False):
+def _scheduler(monkeypatch, *, prefix_match_unit, use_mtp=False, lookahead_hashes=True):
     """Build a real Scheduler at DCP=16 the way EngineCore does."""
     # opt-125m's 2048 positions are irrelevant: the scheduler never runs it.
     monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
@@ -182,6 +182,7 @@ def _scheduler(monkeypatch, *, prefix_match_unit, use_mtp=False):
             num_speculative_tokens=3,
             prompt_lookup_max=3,
             prompt_lookup_min=1,
+            disable_lookahead_block_hashes=not lookahead_hashes,
         )
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
@@ -221,7 +222,9 @@ def _scheduler(monkeypatch, *, prefix_match_unit, use_mtp=False):
         log_stats=True,
     )
     init_none_hash(sha256)
-    return scheduler, get_request_block_hasher(hash_block_size, sha256)
+    return scheduler, get_request_block_hasher(
+        hash_block_size, sha256, vllm_config.num_hash_lookahead_tokens
+    )
 
 
 def _request(request_id, prompt, hasher):
@@ -289,14 +292,33 @@ def test_scheduler_default_keeps_block_granularity(monkeypatch):
 
 
 def test_scheduler_mtp_drops_one_hash_unit(monkeypatch):
-    scheduler, hasher = _scheduler(monkeypatch, prefix_match_unit=UNIT, use_mtp=True)
+    scheduler, hasher = _scheduler(
+        monkeypatch, prefix_match_unit=UNIT, use_mtp=True, lookahead_hashes=False
+    )
     assert scheduler.use_eagle
     assert scheduler.num_prefill_lookahead == 3
+    assert scheduler.num_hash_lookahead_tokens == 0
 
     _, new_b, out_b = _schedule_a_then_b(scheduler, hasher)
 
     # One 256-token hash unit is dropped, not the whole 4096-token block.
     assert new_b.num_computed_tokens == TAIL_BOUNDARY - UNIT
+    manager = scheduler.kv_cache_manager
+    (a_blocks,) = manager.get_block_ids("a")
+    (b_blocks,) = manager.get_block_ids("b")
+    assert [(c.src_block_id, c.dst_block_id) for c in out_b.kv_cache_block_copies] == [
+        (a_blocks[1], b_blocks[1])
+    ]
+
+
+def test_scheduler_mtp_lookahead_hashes_keep_the_hash_unit(monkeypatch):
+    scheduler, hasher = _scheduler(monkeypatch, prefix_match_unit=UNIT, use_mtp=True)
+    assert scheduler.num_hash_lookahead_tokens == 3
+
+    _, new_b, out_b = _schedule_a_then_b(scheduler, hasher)
+
+    # Each unit's hash covers the drafter's lookahead, so no unit is dropped.
+    assert new_b.num_computed_tokens == TAIL_BOUNDARY
     manager = scheduler.kv_cache_manager
     (a_blocks,) = manager.get_block_ids("a")
     (b_blocks,) = manager.get_block_ids("b")

@@ -834,7 +834,7 @@ class KVCacheManager:
         #   e.g. 10 full-attn      + 30 mamba     → min (1 attn + 3 mamba)
         #
         # This duplicates the heuristic from
-        # `vllm/v1/core/kv_cache_utils.py::_get_kv_cache_groups_uniform_page_size`.
+        # `vllm/v1/core/kv_cache_planning.py::_get_kv_cache_groups_uniform_page_size`.
         # We can't call it directly because vLLM's grouping needs a fully
         # populated spec dict, while we need the group layout *before* we
         # can finish creating the specs (padding depends on grouping,

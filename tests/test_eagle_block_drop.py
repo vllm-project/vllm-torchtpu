@@ -26,6 +26,7 @@ def _split_scheduler(use_eagle: bool):
     return SimpleNamespace(
         use_eagle=use_eagle,
         use_eagle_block_drop=use_eagle,
+        num_hash_lookahead_tokens=0,
         block_size=BLOCK,
         cache_config=SimpleNamespace(block_size=BLOCK),
         max_num_scheduled_tokens=16384,

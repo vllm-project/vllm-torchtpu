@@ -132,6 +132,7 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         block_size=16,
         use_eagle=False,
         use_eagle_block_drop=False,
+        num_hash_lookahead_tokens=0,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
         mamba_shared_prefix_checkpoint=False,

@@ -769,6 +769,8 @@ def _patch_vllm_offloading_config_build() -> None:
     hybrid configs ``build_offloading_config`` trips its own
     ``tokens_per_block % tokens_per_hash`` assert (the PCP-patched resolve
     returns logical hash sizes while the group sizes stay rank-local).
+    Each group's ``sliding_window_size_in_chunks`` is recomputed against the
+    logical chunk span for the same reason.
     """
     import sys
     from dataclasses import replace
@@ -776,6 +778,7 @@ def _patch_vllm_offloading_config_build() -> None:
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
         config as offloading_config_module,
     )
+    from vllm.v1.kv_cache_interface import iter_layer_specs
 
     if getattr(offloading_config_module, "_tpu_offloading_config_patch", False):
         return
@@ -811,12 +814,25 @@ def _patch_vllm_offloading_config_build() -> None:
         _, tokens_per_hash = kv_cache_utils.resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
+        blocks_per_chunk = config.cache.blocks_per_chunk
+
+        def logical_group(group):
+            tokens_per_block = group.tokens_per_block * pcp
+            group_spec = kv_cache_config.kv_cache_groups[group.group_id].kv_cache_spec
+            layer_spec = next(iter(iter_layer_specs(group_spec)))
+            return replace(
+                group,
+                tokens_per_block=tokens_per_block,
+                sliding_window_size_in_chunks=(
+                    offloading_config_module.get_sliding_window_size_in_chunks(
+                        layer_spec, tokens_per_block * blocks_per_chunk
+                    )
+                ),
+            )
+
         config = replace(
             config,
-            groups=tuple(
-                replace(group, tokens_per_block=group.tokens_per_block * pcp)
-                for group in config.groups
-            ),
+            groups=tuple(logical_group(group) for group in config.groups),
             cache=replace(config.cache, tokens_per_hash=tokens_per_hash),
         )
         for group in config.groups:
@@ -1091,6 +1107,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             scheduler_block_size,
             hash_block_size,
             metrics_collector=None,
+            num_hash_lookahead_tokens=0,
             num_prefill_lookahead=0,
             allow_partial_hash_hits: bool = True,
             **kwargs,
@@ -1164,6 +1181,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
+                num_hash_lookahead_tokens=num_hash_lookahead_tokens,
                 num_prefill_lookahead=num_prefill_lookahead,
                 allow_partial_hash_hits=allow_partial_hash_hits,
                 **kwargs,
@@ -1460,7 +1478,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
         self.pcp_world_size = init_args["pcp_world_size"]
         self.block_size = manager.block_size
         self.hash_block_size = hash_block_size
-        manager.use_eagle = 0 in self.eagle_group_ids
+        manager.use_eagle = 0 in self.drop_eagle_group_ids
         if not type(manager).supports_fine_grained_hash_lookup:
             raise ValueError(
                 f"{type(manager).__name__} does not support prefix hits finer "
@@ -1473,7 +1491,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
             )
         # EAGLE/MTP drops one hash unit (not a whole block) from each hit; it
         # must still cover the multi-module prefill lookahead.
-        if self.eagle_group_ids and hash_block_size < num_prefill_lookahead:
+        if self.drop_eagle_group_ids and hash_block_size < num_prefill_lookahead:
             raise ValueError(
                 f"prefix_match_unit={hash_block_size} must be >= "
                 f"num_speculative_tokens={num_prefill_lookahead}."
@@ -1496,7 +1514,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
             kv_cache_group_ids=[0],
             block_pool=self.block_pool,
             kv_cache_spec=self.kv_cache_spec,
-            drop_eagle_block=0 in self.eagle_group_ids,
+            drop_eagle_block=0 in self.drop_eagle_group_ids,
             alignment_tokens=self.hash_block_size,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,

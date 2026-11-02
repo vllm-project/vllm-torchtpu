@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -39,7 +40,9 @@ from vllm_torchtpu import (
 
 def _vllm_config(*, pcp: int, block_size: int = 4096, dcp: int = 1):
     return SimpleNamespace(
-        model_config=SimpleNamespace(model="test-model", use_mla=dcp > 1),
+        model_config=SimpleNamespace(
+            model="test-model", use_mla=dcp > 1, max_model_len=65536
+        ),
         cache_config=SimpleNamespace(
             block_size=block_size,
             cache_dtype="fp8",
@@ -158,11 +161,43 @@ def test_pcp_scales_tokens_per_block_and_hash():
 
     # Logical (all-PCP-rank) token spans: 4096 rank-local * pcp 8.
     assert tuple(g.tokens_per_block for g in config.groups) == (32768, 32768)
+    assert tuple(g.sliding_window_size_in_chunks for g in config.groups) == (None, 1)
     assert config.cache.tokens_per_hash == 32768
     # Per-rank physical bytes are untouched by the PCP scaling.
     assert config.worker_kv_bytes_per_block == (256 * 1024) // 128
     # The temporary unpatched-resolve swap must be restored.
     assert module.resolve_kv_cache_block_sizes is resolve_before
+
+
+def test_pcp_sizes_sliding_window_in_logical_chunks():
+    module = _patched_offloading_config_module()
+    swa = SlidingWindowSpec(
+        block_size=4096,
+        num_kv_heads=4,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=8192,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=256 * 1024,
+                layers=["swa"],
+                layer_stride=256 * 1024,
+                block_stride=2048,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["swa"], swa)],
+    )
+
+    config = module.build_offloading_config(_vllm_config(pcp=8), kv_cache_config)
+
+    # The 8192-token window spans two rank-local 4096-token chunks but fits in
+    # one 32768-token logical chunk.
+    (group,) = config.groups
+    assert group.tokens_per_block == 32768
+    assert group.sliding_window_size_in_chunks == 1
 
 
 def test_no_pcp_is_passthrough():

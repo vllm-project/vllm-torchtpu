@@ -4017,14 +4017,23 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
         spec = SimpleNamespace(
             config=SimpleNamespace(
                 groups=[
-                    SimpleNamespace(group_id=group, tokens_per_block=self.BLOCK)
-                    for group in (self.ATTN, self.MAMBA)
+                    SimpleNamespace(
+                        group_id=self.ATTN,
+                        tokens_per_block=self.BLOCK,
+                        sliding_window_size_in_chunks=None,
+                    ),
+                    SimpleNamespace(
+                        group_id=self.MAMBA,
+                        tokens_per_block=self.BLOCK,
+                        sliding_window_size_in_chunks=1,
+                    ),
                 ]
             ),
             blocks_per_chunk=1,
             tokens_per_block=[self.BLOCK, self.BLOCK],
             tokens_per_hash=self.BLOCK,
             offload_prompt_only=False,
+            extra_config={},
             kv_events_config=OffloadingKVEventsConfig(
                 enable_kv_cache_events=False, self_describing_kv_events=False
             ),

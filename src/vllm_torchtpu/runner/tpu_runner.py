@@ -496,9 +496,9 @@ def _build_kv_connector_output(
 ) -> KVConnectorOutput:
     """Build the runner's KVConnectorOutput.
 
-    ``failed_recving`` needs vLLM >= 0.31 (the pin is v0.32.0).
+    ``failed_recving`` needs vLLM >= 0.31 (the pin is v0.33.0).
     ``invalid_block_group_index`` is passed only when ``KVConnectorOutput``
-    has it. v0.32.0 does not, so it rejects block-level load failures on
+    has it. v0.33.0 does not, so it rejects block-level load failures on
     multi-group KV layouts; connectors for those layouts must report failed
     requests through ``failed_recving``.
     """
@@ -8080,7 +8080,7 @@ class TPUModelRunner(GPUModelRunner):
         Groups whose kernel block is smaller than their manager block get a
         `KernelBlockTable`, so the block tables hold the kernel block ids TPU
         attention reads. `kernel_block_sizes` is required; its `None` default
-        only matches the vLLM 0.32 base signature.
+        only matches the vLLM 0.33.0 base signature.
         """
         if kernel_block_sizes is None:
             raise ValueError("kernel_block_sizes is required on TPU")
