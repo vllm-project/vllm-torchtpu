@@ -128,6 +128,14 @@ class ZigzagPlan:
         """Page of the all-gather -> the position page it holds."""
         return np.argsort(self.gathered_page_table()).astype(np.int32)
 
+    def check_halo_pages(self, halo_pages: int) -> None:
+        """Refuses a halo that is not within the one piece before each piece."""
+        if not 1 <= halo_pages <= self.piece_pages:
+            raise ValueError(
+                f"A halo of {halo_pages} pages must be between 1 and the piece's "
+                f"{self.piece_pages} pages."
+            )
+
     def sliding_page_tables(self, rank: Rank, halo_pages: int) -> jax.Array:
         """Per sub-request position page -> page of the rank's local buffer
         [first piece's halo | second piece's halo | scratch]; [2, num_pages].
@@ -137,11 +145,7 @@ class ZigzagPlan:
         before the halo map to its first page, finite and fully masked
         wherever a KV block reaches them.
         """
-        if not 1 <= halo_pages <= self.piece_pages:
-            raise ValueError(
-                f"A halo of {halo_pages} pages must be between 1 and the piece's "
-                f"{self.piece_pages} pages."
-            )
+        self.check_halo_pages(halo_pages)
         pieces = jnp.stack(self.rank_pieces(rank)).astype(jnp.int32)
         local = jnp.arange(self.num_pages, dtype=jnp.int32) - (
             pieces[:, None] * self.piece_pages - halo_pages
@@ -520,11 +524,12 @@ CacheView = Callable[
 class LayerConfig:
     """One attention layer of a context-parallel prefill on `world` ranks.
 
-    `num_heads` and `num_kv_heads` count every rank's heads; the serving cache
-    holds `tp_kv_heads` of them.
+    `num_heads` and `num_kv_heads` count every rank's heads; each rank's serving
+    cache holds `local_kv_heads` of them (`tp_kv_heads`). The rank itself is
+    not part of it: the layer functions take it as an array, so every rank
+    traces the same program.
     """
 
-    rank: int
     world: int
     num_heads: int
     num_kv_heads: int
@@ -540,8 +545,8 @@ class LayerConfig:
     fence_output: bool = False
 
     @property
-    def tp_kv_heads(self) -> tuple[int, int]:
-        return tp_kv_heads(self.num_kv_heads, self.world, self.rank)
+    def local_kv_heads(self) -> int:
+        return tp_kv_heads(self.num_kv_heads, self.world, 0)[1]
 
     def plan(self, num_rows: int, page_size: int) -> ZigzagPlan:
         """The plan of a step in which every rank holds `num_rows` rows."""
@@ -583,6 +588,7 @@ def full_attention_layer(
     kv_rows: jax.Array,
     seq_lens: jax.Array,
     block_tables: jax.Array,
+    rank: jax.Array,
     *,
     cfg: LayerConfig,
     cache_view: CacheView,
@@ -595,20 +601,22 @@ def full_attention_layer(
         query: [rows, num_heads, head_dim].
         kv_rows: Every rank's `pack_kv_rows` rows in rank order, as int8.
         seq_lens, block_tables: The step's attention metadata (one request).
+        rank: [1] int32, this rank.
         cfg: The layer.
         cache_view: `kv_cache` -> (native pages, pages per block, inverse view).
 
     Returns:
         (the new kv_cache, [rows, num_heads, head_dim] attention output).
     """
+    rank = rank[0]
     native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
     plan = cfg.plan(query.shape[0], page_size)
     rows = jax.lax.bitcast_convert_type(kv_rows, native.dtype)
     pages = kv_pages_from_rows(rows, cfg.head_dim, page_size)
     out = cp_prefill_attention(
-        query, pages, plan.gathered_page_table(), plan, cfg.rank, **cfg.rpa_kwargs()
+        query, pages, plan.gathered_page_table(), plan, rank, **cfg.rpa_kwargs()
     )
-    first, count = cfg.tp_kv_heads
+    first, count = tp_kv_heads(cfg.num_kv_heads, cfg.world, rank)
     mine = cache_pages_from_slots(kv_head_slots(pages, first, count), cfg.kv_layout)
     table = _request_block_table(block_tables, seq_lens) * page_stride
     writes = full_attention_page_writes(plan, table, seq_lens[0])
@@ -621,7 +629,7 @@ def _sliding_exchange_sizes(cfg: LayerConfig, page_size: int) -> tuple[int, ...]
     assert cfg.sliding_window is not None
     halo_pages = num_halo_pages(cfg.sliding_window, page_size)
     window_pages = halo_pages + 1
-    _, local_heads = cfg.tp_kv_heads
+    local_heads = cfg.local_kv_heads
     halo_bytes = halo_pages * page_size * 2 * cfg.num_kv_heads * cfg.head_dim
     window_bytes = window_pages * page_size * 2 * local_heads * cfg.head_dim
     return halo_pages, window_pages, halo_bytes, window_bytes
@@ -631,6 +639,7 @@ def sliding_exchange_blocks(
     keys: jax.Array,
     values: jax.Array,
     seq_lens: jax.Array,
+    rank: jax.Array,
     page_size: int,
     *,
     cfg: LayerConfig,
@@ -641,27 +650,30 @@ def sliding_exchange_blocks(
     holds it (`halo_permutations`; zeros otherwise), then the decode window's
     K/V slots of rank d's heads (`window_slots_for_ranks`).
 
-    `keys` and `values` are the rank's fp8 rows; `page_size` is the KV
-    cache's. Needs world >= 3, so the two tails go to different ranks.
+    `keys` and `values` are the rank's fp8 rows, `rank` [1] int32 this rank and
+    `page_size` the KV cache's. Needs world >= 3, so the two tails go to
+    different ranks.
     """
+    rank = rank[0]
     if cfg.world < 3:
         raise ValueError(
             f"The sliding-window exchange needs 3 or more ranks, got {cfg.world}"
         )
     plan = cfg.plan(keys.shape[0], page_size)
     halo_pages, _, halo_bytes, _ = _sliding_exchange_sizes(cfg, page_size)
+    plan.check_halo_pages(halo_pages)
     tails = pack_piece_tails(keys, values, halo_pages, page_size)
     tails = jax.lax.bitcast_convert_type(tails, jnp.int8).reshape(2, halo_bytes)
     dest = jnp.arange(cfg.world)[:, None]
     # This rank is the first-piece source of the rank above and the second-piece
     # source of the rank below.
-    down, up = halo_neighbours(cfg.rank, cfg.world)
+    down, up = halo_neighbours(rank, cfg.world)
     halo = jnp.where(dest == up, tails[0], jnp.where(dest == down, tails[1], 0))
     position_pages, _ = window_position_pages(
         seq_lens[0], cfg.sliding_window, page_size
     )
     window = window_slots_for_ranks(
-        keys, values, plan, cfg.rank, position_pages, cfg.num_kv_heads
+        keys, values, plan, rank, position_pages, cfg.num_kv_heads
     )
     window = jax.lax.bitcast_convert_type(window, jnp.int8).reshape(cfg.world, -1)
     return jnp.concatenate([halo.astype(jnp.int8), window], axis=1)
@@ -675,6 +687,7 @@ def sliding_attention_layer(
     received: jax.Array,
     seq_lens: jax.Array,
     block_tables: jax.Array,
+    rank: jax.Array,
     *,
     cfg: LayerConfig,
     cache_view: CacheView,
@@ -689,6 +702,7 @@ def sliding_attention_layer(
         received: What every rank sent this one (`sliding_exchange_blocks` after
             an all-to-all, block s from rank s).
         seq_lens, block_tables: The step's attention metadata (one request).
+        rank: [1] int32, this rank.
         cfg: The layer.
         cache_view: `kv_cache` -> (native pages, pages per block, inverse view).
 
@@ -697,6 +711,7 @@ def sliding_attention_layer(
     """
     if cfg.sliding_window is None:
         raise ValueError("sliding_attention_layer needs a sliding window")
+    rank = rank[0]
     native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
     plan = cfg.plan(query.shape[0], page_size)
     halo_pages, window_pages, halo_bytes, window_bytes = _sliding_exchange_sizes(
@@ -709,24 +724,24 @@ def sliding_attention_layer(
         )
     packing = utils.get_dtype_packing(keys.dtype)
     page = (page_size, 2 * cfg.num_kv_heads // packing, packing, cfg.head_dim)
-    first_src, second_src = halo_neighbours(cfg.rank, cfg.world)
+    first_src, second_src = halo_neighbours(rank, cfg.world)
     halos = jnp.stack(
         [received[first_src, :halo_bytes], received[second_src, :halo_bytes]]
     )
     halos = jax.lax.bitcast_convert_type(halos, keys.dtype).reshape(-1, *page)
-    local = sliding_local_pages(halos, keys, values, plan, cfg.rank)
-    tables = plan.sliding_page_tables(cfg.rank, halo_pages)
+    local = sliding_local_pages(halos, keys, values, plan, rank)
+    tables = plan.sliding_page_tables(rank, halo_pages)
     out = cp_prefill_attention(
         query,
         local,
         tables,
         plan,
-        cfg.rank,
+        rank,
         keys=keys,
         values=values,
         **cfg.rpa_kwargs(),
     )
-    _, local_heads = cfg.tp_kv_heads
+    local_heads = cfg.local_kv_heads
     window = jax.lax.bitcast_convert_type(received[:, halo_bytes:], native.dtype)
     window = window.reshape(
         cfg.world, window_pages, page_size, 2 * local_heads, cfg.head_dim

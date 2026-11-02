@@ -161,10 +161,26 @@ def test_sliding_page_tables_refuse_halos_outside_one_piece(halo):
         plan.sliding_page_tables(0, halo)
 
 
+def test_sliding_exchange_refuses_pieces_shorter_than_the_halo():
+    # 8 ranks x 2 pieces of 2 pages: a 1024-token window needs 4 pages of halo.
+    plan = cp_prefill.make_zigzag_plan(16 * 2 * PAGE, world=8, page_size=PAGE)
+    rows = jnp.zeros((2 * plan.piece_tokens, 4, 128), jnp.float8_e4m3fn)
+    cfg = _layer_config(4, 1024, configs.KVLayout.HEAD_ALONG_SUBLANE)
+    with pytest.raises(ValueError, match="halo"):
+        cp_prefill.sliding_exchange_blocks(
+            rows,
+            rows,
+            jnp.array([plan.num_pages * PAGE], jnp.int32),
+            jnp.array([0], jnp.int32),
+            PAGE,
+            cfg=cfg,
+        )
+
+
 @pytest.mark.parametrize("fence", [False, True])
 def test_layer_config_passes_the_output_fence(fence):
     cfg = dataclasses.replace(
-        _layer_config(0, 16, 1024, configs.KVLayout.HEAD_ALONG_SUBLANE),
+        _layer_config(16, 1024, configs.KVLayout.HEAD_ALONG_SUBLANE),
         fence_output=fence,
     )
     kwargs = cfg.rpa_kwargs()
@@ -279,9 +295,8 @@ def test_sliding_window_write_caches_the_decode_window(seq_len, layout):
         assert (np.asarray(cache[untouched]).astype(np.float32) == 7).all()
 
 
-def _layer_config(rank, num_kv_heads, window, layout):
+def _layer_config(num_kv_heads, window, layout):
     return cp_prefill.LayerConfig(
-        rank=rank,
         world=8,
         num_heads=2 * num_kv_heads,
         num_kv_heads=num_kv_heads,
@@ -306,7 +321,7 @@ def _int8(x):
 
 def test_layer_config_plan_is_the_step_plan():
     plan = cp_prefill.make_zigzag_plan(81920, world=8, page_size=PAGE)
-    cfg = _layer_config(0, 4, None, configs.KVLayout.HEAD_ALONG_SUBLANE)
+    cfg = _layer_config(4, None, configs.KVLayout.HEAD_ALONG_SUBLANE)
     assert cfg.plan(2 * plan.piece_tokens, PAGE) == plan
 
 
@@ -330,9 +345,9 @@ def test_full_attention_layer_caches_rank_heads(monkeypatch, layout):
     seq_lens = jnp.array([seq_len, 0], jnp.int32)
     written = np.asarray(block_table[: -(-seq_len // PAGE)])
     query = jnp.zeros((2 * plan.piece_tokens, 8, 128), jnp.bfloat16)
+    cfg = _layer_config(num_kv_heads, None, layout)
     for rank in (0, 5):
-        cfg = _layer_config(rank, num_kv_heads, None, layout)
-        first, num_heads = cfg.tp_kv_heads
+        first, num_heads = cp_prefill.tp_kv_heads(num_kv_heads, plan.world, rank)
         expected = _serving_pages(
             k[:, first : first + num_heads], v[:, first : first + num_heads], layout
         )
@@ -344,6 +359,7 @@ def test_full_attention_layer_caches_rank_heads(monkeypatch, layout):
                 _int8(gathered),
                 seq_lens,
                 block_tables,
+                jnp.array([rank], jnp.int32),
                 cfg=cfg,
                 cache_view=_identity_view,
             )
@@ -366,9 +382,10 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
     seq_lens = jnp.array([seq_len], jnp.int32)
     query = jnp.zeros((2 * plan.piece_tokens, 32, 128), jnp.bfloat16)
     rows = [(_rank_rows(k, plan, r), _rank_rows(v, plan, r)) for r in range(plan.world)]
+    cfg = _layer_config(num_kv_heads, window, layout)
     sent = [
         cp_prefill.sliding_exchange_blocks(
-            *rows[r], seq_lens, PAGE, cfg=_layer_config(r, num_kv_heads, window, layout)
+            *rows[r], seq_lens, jnp.array([r], jnp.int32), PAGE, cfg=cfg
         )
         for r in range(plan.world)
     ]
@@ -380,7 +397,6 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
     halo_bytes = halo * PAGE * 2 * num_kv_heads * 128
     pp = plan.piece_pages
     for rank in range(plan.world):
-        cfg = _layer_config(rank, num_kv_heads, window, layout)
         # The all-to-all: rank `rank` receives block `rank` of what every rank sent.
         received = jnp.stack([x[rank] for x in sent])
         # Its halos: the tails of the pieces before its two (where they exist).
@@ -394,7 +410,7 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
                 _bytes(received[src, :halo_bytes]),
                 _bytes(in_order[piece * pp - halo : piece * pp]).reshape(-1),
             )
-        first, num_heads = cfg.tp_kv_heads
+        first, num_heads = cp_prefill.tp_kv_heads(num_kv_heads, plan.world, rank)
         expected = _serving_pages(
             k[:, first : first + num_heads], v[:, first : first + num_heads], layout
         )
@@ -407,6 +423,7 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
                 received,
                 seq_lens,
                 block_table,
+                jnp.array([rank], jnp.int32),
                 cfg=cfg,
                 cache_view=_identity_view,
             )

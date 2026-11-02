@@ -25,10 +25,11 @@ tensor-parallel KV cache as decode steps read it:
   pieces (from the ranks holding them) and its heads of the pages the next
   decode's window reaches; it attends within [halo | piece] and caches those.
 
-Each layer runs exactly one collective, on a 2-D tensor, whose result feeds the
-one op that produces the layer's output. The ranks run differently specialized
-programs (rank-dependent tables), so this is what keeps their collectives in
-the same order: each layer's collective depends on the previous layer's output.
+vllm-torchtpu compiles functional collectives into the program and so needs
+every rank to run the same program: the rank reaches the ops as a device
+tensor, never as a constant (rank-specialized programs computed wrong results
+or hung in an 8-rank check). Each layer runs exactly one collective, on a 2-D
+tensor, whose result feeds the one op that produces the layer's output.
 
 The step must hold exactly one request, the whole prompt, at batch index 0;
 the caller checks that, and keeps prefix caching off (sliding-window layers
@@ -93,7 +94,7 @@ def build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
 
 
 def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
-    _, local_kv_heads = cfg.tp_kv_heads
+    local_kv_heads = cfg.local_kv_heads
     cache_view = functools.partial(
         native_kv_cache_view,
         num_kv_heads=local_kv_heads,
@@ -116,7 +117,7 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
             )
         )
 
-    def fake_exchange(keys, values, seq_lens, page_size):
+    def fake_exchange(keys, values, seq_lens, rank, page_size):
         halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, page_size)
         block = (
             page_size
@@ -151,7 +152,7 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
 
 
 def _layer_config(
-    attn: Any, num_heads: int, num_kv_heads: int, rank: int, world: int
+    attn: Any, num_heads: int, num_kv_heads: int, world: int
 ) -> cp_prefill.LayerConfig:
     impl = attn.impl
     if not isinstance(impl, PallasBatchedRPAAttentionBackendImpl):
@@ -198,7 +199,7 @@ def _layer_config(
         raise ValueError(
             f"{num_heads} query heads are not {world} ranks x {impl.num_heads}."
         )
-    _, local_kv_heads = cp_prefill.tp_kv_heads(num_kv_heads, world, rank)
+    _, local_kv_heads = cp_prefill.tp_kv_heads(num_kv_heads, world, 0)
     if local_kv_heads != impl.num_kv_heads:
         raise ValueError(
             f"{num_kv_heads} KV heads on {world} ranks give {local_kv_heads} per "
@@ -211,7 +212,6 @@ def _layer_config(
         )
     sliding = impl.sliding_window is not None
     return cp_prefill.LayerConfig(
-        rank=rank,
         world=world,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -231,7 +231,7 @@ def _layer_config(
 
 
 def prepare_cp_prefill_attention(
-    attn: Any, *, num_heads: int, num_kv_heads: int, rank: int, world: int
+    attn: Any, *, num_heads: int, num_kv_heads: int, world: int
 ) -> None:
     """Builds the ops `cp_prefill_attention` runs for this layer.
 
@@ -242,14 +242,13 @@ def prepare_cp_prefill_attention(
         attn: The layer's vLLM `Attention` module (tensor-parallel heads).
         num_heads: Query heads of the layer (all ranks').
         num_kv_heads: KV heads of the layer (all ranks').
-        rank: This tensor-parallel rank.
         world: Tensor-parallel world size.
     """
     if get_vllm_model_wrapper_context().kv_cache_bundle is not None:
         raise NotImplementedError(
             "Context-parallel prefill attention does not support the bundled KV cache."
         )
-    cfg = _layer_config(attn, num_heads, num_kv_heads, rank, world)
+    cfg = _layer_config(attn, num_heads, num_kv_heads, world)
     if cfg not in _OPS:
         logger.info_once(
             "Context-parallel prefill attention on %d ranks: %d query / %d KV heads, "
@@ -286,7 +285,7 @@ def cp_prefill_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     plan: cp_prefill.ZigzagPlan,
-    rank: int,
+    rank: torch.Tensor,
 ) -> torch.Tensor:
     """Attention of this rank's zigzag rows over the whole prompt.
 
@@ -298,16 +297,22 @@ def cp_prefill_attention(
         key: [rows, num_kv_heads * head_dim], after the k norm and rotary.
         value: [rows, num_kv_heads * head_dim], after the v norm.
         plan: The step's zigzag plan; its page size is the KV cache's.
-        rank: This tensor-parallel rank.
+        rank: [1] int32 device tensor holding this tensor-parallel rank, a
+            program input (not a constant), so every rank runs one program.
 
     Returns:
         [rows, num_heads * head_dim] attention output.
     """
     cfg: cp_prefill.LayerConfig | None = getattr(attn, "_cp_prefill_config", None)
-    if cfg is None or cfg.rank != rank or cfg.world != plan.world:
+    if cfg is None or cfg.world != plan.world:
         raise RuntimeError(
-            f"{attn.layer_name}: call prepare_cp_prefill_attention for rank {rank} "
-            f"of {plan.world} before tracing."
+            f"{attn.layer_name}: call prepare_cp_prefill_attention for a world of "
+            f"{plan.world} before tracing."
+        )
+    if not isinstance(rank, torch.Tensor):
+        raise TypeError(
+            "Pass the rank as a device tensor: a constant rank specializes each "
+            "rank's program, which compiled collectives do not support."
         )
     rows, d = query.shape[0], cfg.head_dim
     if rows != 2 * plan.piece_tokens:
@@ -333,6 +338,7 @@ def cp_prefill_attention(
         value,
         attn_metadata.seq_lens,
         attn_metadata.block_tables,
+        rank,
         get_tp_group().device_group,
     )
     return out.reshape(rows, cfg.num_heads * d)
@@ -348,20 +354,21 @@ def cp_layer(
     value: torch.Tensor,
     seq_lens: torch.Tensor,
     block_tables: torch.Tensor,
+    rank: torch.Tensor,
     group: Any,
 ) -> torch.Tensor:
     """`cp_prefill_attention` past the forward context: [rows, heads, d] query,
-    fp8 [rows, kv_heads, d] K/V; writes `kv_cache` in place."""
+    fp8 [rows, kv_heads, d] K/V, [1] int32 rank; writes `kv_cache` in place."""
     if cfg.sliding_window is None:
         gathered = _waited(funcol.all_gather_single(_int8_rows(key, value), 0, group))
         new_kv_cache, out = ops.full_attention(
-            kv_cache, query, gathered, seq_lens, block_tables
+            kv_cache, query, gathered, seq_lens, block_tables, rank
         )
     else:
-        send = ops.sliding_exchange(key, value, seq_lens, plan.page_size)
+        send = ops.sliding_exchange(key, value, seq_lens, rank, plan.page_size)
         received = _all_to_all(send, group)
         new_kv_cache, out = ops.sliding_attention(
-            kv_cache, query, key, value, received, seq_lens, block_tables
+            kv_cache, query, key, value, received, seq_lens, block_tables, rank
         )
     # The ops donate the cache; the copy_ folds into that alias when compiled.
     kv_cache.copy_(new_kv_cache)
