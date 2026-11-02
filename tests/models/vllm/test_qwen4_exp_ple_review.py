@@ -31,7 +31,9 @@ from vllm_torchtpu.models.vllm.qwen4_exp.pooled_ple import Qwen4ExpPooledPLE
 
 
 @pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("ids", [[-1, 19, 20, 22, 25, 24], [-1, 19, 25], []])
+@pytest.mark.parametrize(
+    "ids", [[-1, 19, 20, 22, 25, 24], [-1, 19, 25], [], [24, 20, 22, 20]]
+)
 def test_host_gathers_only_owned_rows(monkeypatch, fp8, ids):
     table = HostPLETable.__new__(HostPLETable)
     nn.Module.__init__(table)

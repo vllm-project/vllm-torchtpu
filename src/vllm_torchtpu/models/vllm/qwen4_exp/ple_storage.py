@@ -333,8 +333,10 @@ class HostPLETable(_LoadedPLETable):
         end = self.shard_indices.org_vocab_end_index
         owned = (indices >= start) & (indices < end)
         dtype = np.int16 if self.storage_dtype == torch.bfloat16 else np.uint8
-        output = np.zeros((indices.size, self.embedding_dim), dtype=dtype)
         selected = np.flatnonzero(owned)
+        # Every output row is overwritten when every input ID is owned.
+        allocate = np.empty if selected.size == indices.size else np.zeros
+        output = allocate((indices.size, self.embedding_dim), dtype=dtype)
         if selected.size:
             rows = indices[selected] - start
             gathered = (
