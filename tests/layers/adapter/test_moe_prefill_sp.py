@@ -374,3 +374,35 @@ def test_a_dense_layer_keeps_the_replicated_stream_on_a_split_bucket():
     ):
         sp.patched_decoder_layer_forward(layer, torch.zeros(2048), "h", None)
     assert calls == ["upstream"]
+
+
+def test_shared_op_runs_the_fused_down_only_on_request():
+    built = []
+
+    class _Op:
+        def __init__(self, name):
+            self.name = name
+
+        def register_fake(self, fn):
+            pass
+
+    with (
+        patch.dict(sp._SHARED_OPS, clear=True),
+        patch.object(sp, "build_ep_mesh", return_value="mesh"),
+        patch.object(
+            sp,
+            "grouped_shared_expert_sharded",
+            side_effect=lambda mesh, axis, group, *, fused_down: built.append(
+                (group, fused_down)
+            ),
+        ),
+        patch.object(sp, "jax_op", side_effect=lambda name, fn, **kw: _Op(name)),
+    ):
+        plain = sp._build_shared_op(1, False)
+        fused = sp._build_shared_op(1, True)
+        assert sp._build_shared_op(1, True) is fused
+    assert built == [(1, False), (1, True)]
+    assert (plain.name, fused.name) == (
+        "pallas::moe_prefill_sp_shared_g1",
+        "pallas::moe_prefill_sp_shared_g1_fd",
+    )

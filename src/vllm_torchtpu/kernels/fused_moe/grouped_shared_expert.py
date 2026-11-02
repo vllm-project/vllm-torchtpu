@@ -87,25 +87,33 @@ def blocked_down_fused(
     interpret: bool = False,
 ) -> jax.Array:
     """`blocked_down` as one kernel: the activation's k-slices are quantized
-    per row exactly as there, and each `[block_m, block_n]` output tile runs
-    all `blocks` slice matmuls and their f32 sum in VMEM."""
+    per row exactly as there, and each output tile (at most `block_m` rows by
+    `block_n` columns) runs all `blocks` slice matmuls and their f32 sum in
+    VMEM. Rows split into equal tiles of a multiple of 32 (fp8's sublane
+    tile), the last padded with zero rows when `m` does not divide."""
     blocks, n = s2.shape
     m, k = act.shape
     kb = k // blocks
-    tm, tn = min(m, block_m), min(n, block_n)
-    if kb * blocks != k or w2.shape != (k, n) or m % tm or n % tn:
+    tn = min(n, block_n)
+    if kb * blocks != k or w2.shape != (k, n) or n % tn:
         raise ValueError(
             f"blocked_down_fused: act {act.shape}, w2 {w2.shape}, s2 {s2.shape}, "
-            f"tiles {tm}x{tn}"
+            f"block_n {block_n}"
         )
+    tiles = pl.cdiv(m, block_m)
+    tm = m if tiles == 1 else pl.cdiv(pl.cdiv(m, tiles), 32) * 32
     parts = [
         quantize_tensor(act[:, b * kb : (b + 1) * kb], w2.dtype) for b in range(blocks)
     ]
     q = jnp.concatenate([p[0] for p in parts], axis=1)
     xs = jnp.concatenate([p[1] for p in parts], axis=1)  # [m, blocks] f32
-    return pl.pallas_call(
+    pad = tiles * tm - m
+    if pad:
+        q = jnp.pad(q, ((0, pad), (0, 0)))
+        xs = jnp.pad(xs, ((0, pad), (0, 0)))
+    out = pl.pallas_call(
         functools.partial(_blocked_down_kernel, blocks=blocks, kb=kb),
-        grid=(m // tm, n // tn),
+        grid=(tiles, n // tn),
         in_specs=[
             pl.BlockSpec((tm, k), lambda i, j: (i, 0)),
             pl.BlockSpec((tm, blocks), lambda i, j: (i, 0)),
@@ -113,13 +121,14 @@ def blocked_down_fused(
             pl.BlockSpec((blocks, tn), lambda i, j: (0, j)),
         ],
         out_specs=pl.BlockSpec((tm, tn), lambda i, j: (i, j)),
-        out_shape=jax.ShapeDtypeStruct((m, n), act.dtype),
+        out_shape=jax.ShapeDtypeStruct((tiles * tm, n), act.dtype),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
         interpret=interpret,
         name="shared_expert_blocked_down",
     )(q, xs, w2, s2.astype(jnp.float32))
+    return out[:m] if pad else out
 
 
 def grouped_shared_expert(

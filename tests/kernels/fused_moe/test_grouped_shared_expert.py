@@ -80,7 +80,9 @@ def test_each_rank_gets_the_whole_expert_on_its_rows(group):
 
 @pytest.mark.parametrize(
     "m, blocks, block_m",
-    [(64, 16, 512), (256, 4, 128), (32, 2, 512)],
+    # One tile; even row tiles; 640 rows at 512 (two 320-row tiles, a linear
+    # bucket's share); 536 rows at 512 (two 288-row tiles, 40 padded rows).
+    [(64, 16, 512), (256, 4, 128), (32, 2, 512), (640, 2, 512), (536, 2, 512)],
 )
 def test_fused_down_is_bitwise_blocked_down(m, blocks, block_m):
     # The served shapes' structure: 128-channel blocks, rows tiled or not.
