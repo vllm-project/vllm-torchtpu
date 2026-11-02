@@ -75,6 +75,7 @@ from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
@@ -946,8 +947,62 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         Get the KV transfer stats for the connector.
         """
         if self.connector_worker is None:
-            return None
+            return self._take_scheduler_stats()
         return self.connector_worker.get_kv_connector_stats()
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        """Count the cached blocks this pool evicts for new blocks.
+
+        The scheduler binds the pool before allocating any block. Only this
+        pool instance is wrapped, so engines without `TPUConnector` are
+        unaffected. `_maybe_evict_cached_block` also drops hashes outside
+        allocation (`evict_blocks` after a failed KV load, Mamba checkpoint
+        hash drops), so only evictions made while `get_new_blocks` hands out
+        blocks are counted. Remove once upstream vLLM exports an eviction
+        counter.
+        """
+        self._num_evicted_blocks = 0
+        # Another connector on this engine already wrapped the pool.
+        if getattr(gpu_block_pool, "_tpu_eviction_counter_bound", False):
+            return
+
+        orig_get_new_blocks = gpu_block_pool.get_new_blocks
+        orig_maybe_evict = gpu_block_pool._maybe_evict_cached_block
+        allocating = False
+
+        def get_new_blocks(num_blocks: int):
+            nonlocal allocating
+            was_allocating = allocating
+            allocating = True
+            try:
+                return orig_get_new_blocks(num_blocks)
+            finally:
+                allocating = was_allocating
+
+        def _maybe_evict_cached_block(block) -> bool:
+            evicted = orig_maybe_evict(block)
+            if evicted and allocating:
+                self._num_evicted_blocks += 1
+            return evicted
+
+        gpu_block_pool.get_new_blocks = get_new_blocks  # type: ignore[method-assign]
+        gpu_block_pool._maybe_evict_cached_block = _maybe_evict_cached_block  # type: ignore[method-assign]
+        # pyrefly: ignore[missing-attribute]
+        gpu_block_pool._tpu_eviction_counter_bound = True
+
+    def _take_scheduler_stats(self) -> TpuKVConnectorStats | None:
+        """Drain the HBM block evictions counted since the last step.
+
+        `bind_gpu_block_pool` does the counting; vLLM merges scheduler-side
+        connector stats into the step's stats.
+        """
+        num_evicted_blocks = getattr(self, "_num_evicted_blocks", 0)
+        if not num_evicted_blocks:
+            return None
+        self._num_evicted_blocks = 0
+        stats = TpuKVConnectorStats()
+        stats.record_evicted_blocks(num_evicted_blocks)
+        return stats
 
     @classmethod
     def build_kv_connector_stats(

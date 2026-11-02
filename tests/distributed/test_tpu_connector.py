@@ -5999,6 +5999,7 @@ class TestTPUConnectorStats(unittest.TestCase):
             "kv_pull_time": [1200.0, 5400.0, 12000.0],
             "mb_transferred": [128.0, 256.0, 2048.0],
             "num_failed_transfers": [0, 1, 2],
+            "num_evicted_blocks": [2, 5],
         }
 
         self.metrics.observe(mock_data, engine_idx=0)
@@ -6144,6 +6145,10 @@ class TestTPUConnectorStats(unittest.TestCase):
     def test_prometheus_counter_num_failed_transfers(self):
         counter = self.metrics.counter_tpu_num_failed_transfers[0]
         assert counter._value.get() == 3.0
+
+    def test_prometheus_counter_kv_cache_evictions(self):
+        counter = self.metrics.counter_kv_cache_evictions[0]
+        assert counter._value.get() == 7.0
 
     def test_tpu_stats_aggregation_queue_lengths(self):
         stats = TpuKVConnectorStats()
@@ -8229,3 +8234,245 @@ class TestSpecSourceFenceRegisterAhead:
         assert fences == [(2, True)]
         worker.process_send_load(self._meta(c=False))
         assert fences == [(2, True), (2, True)]
+
+
+# ---------------------------------------------------------------------------
+# vllm:kv_cache_evictions: only cached blocks reused as new blocks count.
+# See `TPUConnector.bind_gpu_block_pool`.
+# ---------------------------------------------------------------------------
+
+
+class TestEvictionCounter:
+    BLOCK_SIZE = 16
+
+    @classmethod
+    def _manager(cls, enable_caching: bool = True, bind: bool = True):
+        """Returns a 3-usable-block cache manager and a connector bound to it."""
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm.v1.core.kv_cache_utils import init_none_hash
+
+        init_none_hash(sha256)
+        config = _make_test_kv_cache_config()
+        config.num_blocks = 4  # 3 usable blocks; block 0 is the null block.
+        manager = KVCacheManager(
+            config,
+            max_model_len=256,
+            scheduler_block_size=cls.BLOCK_SIZE,
+            hash_block_size=cls.BLOCK_SIZE,
+            enable_caching=enable_caching,
+        )
+        connector = SimpleNamespace()
+        if bind:
+            TPUConnector.bind_gpu_block_pool(connector, manager.block_pool)  # type: ignore[arg-type]
+        return manager, connector
+
+    @classmethod
+    def _allocate(cls, manager, request_id: str, start: int, num_blocks: int):
+        from vllm import SamplingParams
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+        from vllm.v1.request import Request
+
+        prompt = list(range(start, start + num_blocks * cls.BLOCK_SIZE))
+        request = Request(
+            request_id,
+            prompt,
+            SamplingParams(max_tokens=1),
+            None,
+            block_hasher=get_request_block_hasher(cls.BLOCK_SIZE, sha256),
+        )
+        blocks, num_hit_tokens = manager.get_computed_blocks(request)[:2]
+        assert num_hit_tokens == 0
+        assert manager.allocate_slots(request, len(prompt), 0, blocks) is not None
+        return request
+
+    @staticmethod
+    def _drain(connector) -> list[int] | None:
+        stats = TPUConnector._take_scheduler_stats(connector)  # type: ignore[arg-type]
+        return None if stats is None else stats.data["num_evicted_blocks"]
+
+    def test_counts_cached_blocks_reused_for_new_blocks(self):
+        manager, connector = self._manager()
+        manager.free(self._allocate(manager, "cached", start=0, num_blocks=2))
+        assert self._drain(connector) is None
+
+        # 1 empty block + 2 cached blocks are free; taking all 3 evicts both.
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+        assert self._drain(connector) == [2]
+        # Draining resets the count.
+        assert self._drain(connector) is None
+
+    def test_invalidation_is_not_an_eviction(self):
+        manager, connector = self._manager()
+        request = self._allocate(manager, "cached", start=0, num_blocks=2)
+        block_ids = manager.get_block_ids(request.request_id)[0]
+        manager.free(request)
+
+        # As after a failed KV load: the hash is dropped, the block is not reused.
+        manager.evict_blocks({block_ids[0]})
+        assert self._drain(connector) is None
+
+        # Only the block that still holds a hash is evicted when reused.
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+        assert self._drain(connector) == [1]
+
+    def test_no_evictions_without_prefix_caching(self):
+        manager, connector = self._manager(enable_caching=False)
+        manager.free(self._allocate(manager, "first", start=0, num_blocks=2))
+        self._allocate(manager, "second", start=0, num_blocks=3)
+        assert self._drain(connector) is None
+
+    def test_binding_twice_wraps_once(self):
+        manager, connector = self._manager()
+        pool = manager.block_pool
+        wrapped = (pool.get_new_blocks, pool._maybe_evict_cached_block)
+
+        TPUConnector.bind_gpu_block_pool(SimpleNamespace(), pool)  # type: ignore[arg-type]
+
+        assert (pool.get_new_blocks, pool._maybe_evict_cached_block) == wrapped
+        manager.free(self._allocate(manager, "cached", start=0, num_blocks=2))
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+        assert self._drain(connector) == [2]
+
+    def test_pool_wrapped_by_someone_else_is_still_counted(self):
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm.v1.core.kv_cache_utils import init_none_hash
+
+        init_none_hash(sha256)
+        config = _make_test_kv_cache_config()
+        config.num_blocks = 4
+        manager = KVCacheManager(
+            config,
+            max_model_len=256,
+            scheduler_block_size=self.BLOCK_SIZE,
+            hash_block_size=self.BLOCK_SIZE,
+        )
+        pool = manager.block_pool
+        # E.g. a test spy wrapping the instance method before the bind.
+        pool.get_new_blocks = MagicMock(wraps=pool.get_new_blocks)  # type: ignore[method-assign]
+        connector = SimpleNamespace()
+        TPUConnector.bind_gpu_block_pool(connector, pool)  # type: ignore[arg-type]
+
+        manager.free(self._allocate(manager, "cached", start=0, num_blocks=2))
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+        assert self._drain(connector) == [2]
+
+    def test_without_block_pool(self):
+        assert self._drain(SimpleNamespace()) is None
+
+    @staticmethod
+    def _offloading_connector():
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+
+        # Eviction counting needs no store or worker resources.
+        connector = object.__new__(TPURaidenOffloadingConnector)
+        connector.connector_scheduler = None
+        return connector
+
+    def test_standalone_offloading_connector_counts(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+            OffloadingConnectorStats,
+        )
+
+        manager, _ = self._manager(bind=False)
+        connector = self._offloading_connector()
+        connector.bind_gpu_block_pool(manager.block_pool)
+
+        manager.free(self._allocate(manager, "cached", start=0, num_blocks=2))
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+
+        stats = connector.get_kv_connector_stats()
+        assert isinstance(stats, OffloadingConnectorStats)
+        assert stats.reduce() == {"vllm:kv_cache_evictions": 2}
+        assert connector.get_kv_connector_stats() is None
+
+    def test_multi_connector_counts_once(self):
+        # Under TPUMultiConnector both children bind the same pool: the first
+        # one counts, the other counts nothing.
+        manager, tpu_connector = self._manager()
+        offloading_connector = self._offloading_connector()
+        offloading_connector.bind_gpu_block_pool(manager.block_pool)
+
+        manager.free(self._allocate(manager, "cached", start=0, num_blocks=2))
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+
+        assert self._drain(tpu_connector) == [2]
+        assert offloading_connector.get_kv_connector_stats() is None
+
+    @pytest.mark.parametrize("offload_first", [False, True])
+    def test_multi_connector_registers_and_counts_once(self, offload_first):
+        # The real TPUMultiConnector metrics and bind paths, in either child
+        # order: one counter is registered, and evictions are counted once.
+        from vllm.config import KVTransferConfig
+        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+            MultiConnector,
+        )
+
+        from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import (
+            TPUMultiConnector,
+        )
+
+        p2p = {
+            "kv_connector": "TPURaidenConnector",
+            "kv_connector_module_path": _MOD,
+            "kv_role": "kv_producer",
+        }
+        offload = {
+            "kv_connector": "TPURaidenOffloadingConnector",
+            "kv_connector_module_path": "vllm_torchtpu.offload.raiden_connector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 30},
+        }
+        children = [offload, p2p] if offload_first else [p2p, offload]
+        vllm_config = SimpleNamespace(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="TPUMultiConnector",
+                kv_role="kv_producer",
+                kv_connector_extra_config={"connectors": children},
+            )
+        )
+        registry = CollectorRegistry()
+        metric_types = {
+            Gauge: partial(Gauge, registry=registry),
+            Counter: partial(Counter, registry=registry),
+            Histogram: partial(Histogram, registry=registry),
+        }
+        prom = TPUMultiConnector.build_prom_metrics(
+            vllm_config, metric_types, ["model_name", "engine"], {0: ["my_model", "0"]}
+        )
+        assert (
+            sum(
+                getattr(c, "_name", None) == "vllm:kv_cache_evictions"
+                for c in registry._collector_to_names
+            )
+            == 1
+        )
+
+        manager, _ = self._manager(bind=False)
+        multi = object.__new__(TPUMultiConnector)
+        multi._connectors = []
+        for child in children:
+            if child is p2p:
+                connector = object.__new__(TPURaidenConnector)
+                connector.connector_worker = None
+            else:
+                connector = self._offloading_connector()
+            multi._connectors.append(connector)
+        MultiConnector.bind_kv_cache_manager(multi, manager)
+        manager.free(self._allocate(manager, "cached", start=0, num_blocks=2))
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+
+        stats = MultiConnector.get_kv_connector_stats(multi)
+        # Only the child that bound the pool first reports evictions.
+        first = type(multi._connectors[0]).__name__
+        assert stats is not None and list(stats.data) == [first]
+        prom.observe({k: v.data for k, v in stats.data.items()}, engine_idx=0)
+        assert (
+            registry.get_sample_value(
+                "vllm:kv_cache_evictions_total",
+                {"model_name": "my_model", "engine": "0"},
+            )
+            == 2
+        )

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
@@ -36,6 +36,23 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def get_or_create_counter(counter_cls: Any, name: str, **kwargs: Any) -> Any:
+    """Create counter `name`, or return it if another connector's metrics did.
+
+    `TPUMultiConnector` builds the metrics of both `TPUConnector` and
+    `TPURaidenOffloadingConnector`, which both export `vllm:kv_cache_evictions`.
+    """
+    try:
+        return counter_cls(name=name, **kwargs)
+    except ValueError:
+        # As vllm/parser/metrics.py: prometheus_client has no public lookup.
+        registry = getattr(counter_cls, "keywords", {}).get("registry", REGISTRY)
+        if name not in registry._names_to_collectors:
+            raise
+        return registry._names_to_collectors[name]
+
 
 # Prometheus metric type constants
 METRIC_TYPE_HISTOGRAM = "histogram"
@@ -96,6 +113,10 @@ class TpuKVConnectorStats(KVConnectorStats):
         """Record a failed KV transfer operation."""
         self.data["num_failed_transfers"].append(1)
 
+    def record_evicted_blocks(self, num_evicted_blocks: int):
+        """Record cached HBM blocks evicted to make room for new blocks."""
+        self.data["num_evicted_blocks"].append(num_evicted_blocks)
+
     def record_prefill_queue_length(self, prefill_queue_length: int):
         """Record the prefill (send) queue length."""
         self.data["prefill_queue_length"].append(prefill_queue_length)
@@ -120,6 +141,7 @@ class TpuKVConnectorStats(KVConnectorStats):
             "kv_pull_time": [],
             "mb_transferred": [],
             "num_failed_transfers": [],
+            "num_evicted_blocks": [],
             "prefill_queue_length": [],
             "decode_queue_length": [],
             "runner_cpu_issue_seconds": [],
@@ -304,6 +326,17 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             counter_tpu_num_failed_transfers, self.per_engine_labelvalues
         )
 
+        # Not TPU-specific: named as in the HBM KV cache observability design.
+        counter_kv_cache_evictions = get_or_create_counter(
+            self._counter_cls,
+            name="vllm:kv_cache_evictions",
+            documentation="Cached KV blocks evicted to make room for new blocks.",
+            labelnames=labelnames,
+        )
+        self.counter_kv_cache_evictions = create_metric_per_engine(
+            counter_kv_cache_evictions, self.per_engine_labelvalues
+        )
+
         gauge_tpu_prefill_queue_length = self._gauge_cls(
             name="vllm:tpu_prefill_kv_queue_length",
             documentation="Current length of the TPU KV transfer prefill queue.",
@@ -423,8 +456,9 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         for counter_obj, counter_item_key in zip(
             [
                 self.counter_tpu_num_failed_transfers,
+                self.counter_kv_cache_evictions,
             ],
-            ["num_failed_transfers"],
+            ["num_failed_transfers", "num_evicted_blocks"],
         ):
             for list_item in transfer_stats_data.get(counter_item_key, []):
                 cast(Counter, counter_obj[engine_idx]).inc(list_item)

@@ -51,9 +51,10 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from prometheus_client import Counter
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -61,12 +62,23 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorTransferResults,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     config as offloading_config_module,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+    OffloadPromMetrics,
+    _StatsKey,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
@@ -86,9 +98,13 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     OffloadKey,
 )
+from vllm.v1.metrics.utils import create_metric_per_engine
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
+    get_or_create_counter,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -99,6 +115,7 @@ from vllm_torchtpu.offload.raiden_store import (
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.v1.core.block_pool import BlockPool
 
 logger = init_logger(__name__)
 
@@ -321,6 +338,46 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         super().update_connector_output(connector_output)
 
 
+_KV_CACHE_EVICTIONS = "vllm:kv_cache_evictions"
+
+
+class TPURaidenOffloadPromMetrics(OffloadPromMetrics):
+    """vLLM's offloading metrics plus `vllm:kv_cache_evictions`."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        counter_kv_cache_evictions = get_or_create_counter(
+            self._counter_cls,
+            name=_KV_CACHE_EVICTIONS,
+            documentation="Cached KV blocks evicted to make room for new blocks.",
+            labelnames=labelnames,
+        )
+        self.counter_kv_cache_evictions = create_metric_per_engine(
+            counter_kv_cache_evictions, per_engine_labelvalues
+        )
+
+    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+        values = transfer_stats_data.get(_StatsKey.DATA, {})
+        if _KV_CACHE_EVICTIONS in values:
+            for num_evicted_blocks in values[_KV_CACHE_EVICTIONS].values():
+                counter = cast(Counter, self.counter_kv_cache_evictions[engine_idx])
+                counter.inc(num_evicted_blocks)
+            # The upstream metrics know only the offloading metrics.
+            transfer_stats_data = {
+                **transfer_stats_data,
+                _StatsKey.DATA: {
+                    k: v for k, v in values.items() if k != _KV_CACHE_EVICTIONS
+                },
+            }
+        super().observe(transfer_stats_data, engine_idx)
+
+
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
 
@@ -415,6 +472,38 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
 
     # -- scheduler-side hooks ----------------------------------------------
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        """Count the cached HBM blocks the pool evicts, as `TPUConnector` does.
+
+        Under `TPUMultiConnector` both bind the same pool, which is wrapped
+        once: the first one to bind it counts.
+        """
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPUConnector
+
+        super().bind_gpu_block_pool(gpu_block_pool)
+        TPUConnector.bind_gpu_block_pool(self, gpu_block_pool)  # type: ignore[arg-type]
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        stats = super().get_kv_connector_stats()
+        if num_evicted_blocks := getattr(self, "_num_evicted_blocks", 0):
+            self._num_evicted_blocks = 0
+            if not isinstance(stats, OffloadingConnectorStats):
+                stats = OffloadingConnectorStats()
+            stats.increase_counter(_KV_CACHE_EVICTIONS, num_evicted_blocks)
+        return stats
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return TPURaidenOffloadPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
+
     def reset_cache(self) -> bool | None:
         # External cache reset is unsupported by the Raiden store. Report
         # failure through the endpoint's documented channel instead of raising an
