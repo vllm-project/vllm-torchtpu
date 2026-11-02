@@ -129,7 +129,17 @@ if [ -n "${ARTIFACTS_DIR:-}" ]; then
     cp -a "$OUT"/*.npz "$ARTIFACTS_DIR/k3-bench/" 2>/dev/null
     cp -a "$OUT"/cmd*-node0-rank00.log "$ARTIFACTS_DIR/k3-bench/" 2>/dev/null
   fi
-  # Traces and LLO dumps (directories; their files name the rank).
+  # LLO dumps: the decoder and draft kernels' final bundles, one tarball per
+  # command (a full dump is tens of thousands of files, over the per-job
+  # artifact limit).
+  for d in "$OUT"/llo-cmd*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    (cd "$d" && find . -name '*final_bundles.txt' \( -name '*decoder_stack*' -o -name '*dspark*' \) -print0 \
+      | tar czf "$ARTIFACTS_DIR/k3-bench/$name.tgz" --null -T -)
+    rm -rf "$d"
+  done
+  # Traces (directories; their files name the rank).
   for d in "$OUT"/*/; do
     [ -d "$d" ] && cp -a "$d" "$ARTIFACTS_DIR/k3-bench/"
   done
