@@ -1536,7 +1536,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         """Convert dense linear checkpoint weights to runtime FP8."""
         layer = cast("TpuLinear", layer)
         if self.online_fp8:
-            if layer._tpu_online_fp8_processed:
+            # Keyed on the weight: layerwise reload rebuilds it in BF16 while
+            # the layer keeps `_tpu_online_fp8_processed`.
+            if layer.weight.dtype == torch.float8_e4m3fn:
                 return
             if layer.weight.dtype != torch.bfloat16:
                 raise ValueError(
@@ -1605,8 +1607,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         ckpt_n_out, ckpt_n_in = weight.shape
         # Layers whose weight is read raw by code expecting vLLM's
         # [n_out, n_in] keep that layout; `apply` below contracts accordingly.
-        if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
-            return  # already flipped; reload paths re-enter this hook
+        if getattr(layer.weight, WEIGHT_FLIPPED_ATTR, False):
+            return  # already flipped; see WEIGHT_FLIPPED_ATTR
         # Prevent transposing for embedding lookup, keep [vocab_size, hidden_size].
         is_embedding = isinstance(layer, VocabParallelEmbedding) and not isinstance(
             layer, ParallelLMHead
@@ -1626,6 +1628,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
         )
         if not keep_vllm_layout:
+            setattr(layer.weight, WEIGHT_FLIPPED_ATTR, True)
             setattr(layer, WEIGHT_FLIPPED_ATTR, True)
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")

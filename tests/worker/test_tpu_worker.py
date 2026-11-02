@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from vllm.config import ParallelConfig
+from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
@@ -440,6 +440,22 @@ def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
     )
     TPUWorker.load_model(worker)
     assert events == [("model_load", {"model_config": config}), "load", "release"]
+
+
+def test_reload_weights_runs_the_runner_reload_under_the_vllm_config():
+    """`LLM.collective_rpc("reload_weights", ...)` calls this on every worker."""
+    config = object()
+    calls = []
+    worker = SimpleNamespace(
+        vllm_config=config,
+        model_runner=SimpleNamespace(
+            reload_weights=lambda **kwargs: calls.append(
+                (kwargs, get_current_vllm_config())
+            )
+        ),
+    )
+    TPUWorker.reload_weights(worker, weights_path="/ckpt")
+    assert calls == [({"weights_path": "/ckpt"}, config)]
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])

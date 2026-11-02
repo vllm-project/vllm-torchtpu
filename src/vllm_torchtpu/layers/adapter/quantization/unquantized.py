@@ -107,8 +107,8 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
             # A consumer reads this weight raw and expects [n_out, n_in];
             # `apply` below falls back to the stock contraction.
             return
-        if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
-            return  # already flipped; reload paths re-enter this hook
+        if getattr(layer.weight, WEIGHT_FLIPPED_ATTR, False):
+            return  # already flipped; see WEIGHT_FLIPPED_ATTR
         weight = layer.weight.data
         if weight.dim() != 2:
             # Not a plain dense weight; leave the stock behaviour alone.
@@ -117,6 +117,7 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
         )
+        setattr(layer.weight, WEIGHT_FLIPPED_ATTR, True)
         setattr(layer, WEIGHT_FLIPPED_ATTR, True)
         if layer.weight.device.type == "tpu":
             synchronize_tensors([layer.weight])

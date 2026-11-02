@@ -40,16 +40,17 @@ logger = init_logger(__name__)
 # name-matched list would not.
 KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 
-# Idempotence guard, set by the linear method once it has flipped a weight.
+# Set by the linear method once it has flipped a weight, on the layer (read by
+# code that consumes the weight raw) and on the weight (the idempotence guard).
 # Not how `apply` picks its contraction -- that keys off the marker above.
 #
-# It has to be a stored flag rather than a property of the weight: the flip
-# cannot be recovered from the shape (`o_proj` and friends are square in most
-# models), and encoding it in a Parameter subclass does not survive vLLM's
-# `replace_parameter`, which re-wraps by type. Meanwhile
-# `process_weights_after_loading` IS re-entered by vLLM's reload paths
-# (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
-# back and silently corrupt the values.
+# The flip cannot be recovered from the shape (`o_proj` and friends are square
+# in most models), and `process_weights_after_loading` can run again on a
+# weight it already flipped, where a second flip would transpose back and
+# silently corrupt the values. The guard reads the weight, not the layer:
+# vLLM's layerwise reload (`reload_weights`, weight transfer) rebuilds the
+# weight in checkpoint layout from metadata recorded before the first load and
+# runs the hook again, while the layer keeps its attributes.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
 

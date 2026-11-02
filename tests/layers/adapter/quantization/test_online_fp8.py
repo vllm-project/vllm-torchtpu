@@ -24,6 +24,11 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.model_loader.reload import (
+    finalize_layerwise_reload,
+    initialize_layerwise_reload,
+    record_metadata_for_reloading,
+)
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -221,6 +226,33 @@ def test_real_bf16_checkpoint_loading(tmp_path, kind, keep_layout):
     process_weights_after_loading(model, model_config, torch.device("cpu"))
     assert layer.weight is old_weight
     assert layer.weight_scale is old_scale
+
+
+@pytest.mark.parametrize("keep_layout", [False, True])
+def test_layerwise_reload_requantizes_the_reloaded_weight(keep_layout):
+    config = make_config()
+    layer = linear(config)
+    setattr(layer, KEEP_VLLM_LAYOUT_ATTR, keep_layout)
+    model = torch.nn.Module()
+    model.add_module("proj", layer)
+    record_metadata_for_reloading(model)
+    generator = torch.Generator().manual_seed(0)
+    first = torch.randn(16, 32, generator=generator).to(torch.bfloat16)
+    source = torch.randn(16, 32, generator=generator).to(torch.bfloat16)
+    layer.weight.weight_loader(layer.weight, first)
+    layer.quant_method.process_weights_after_loading(layer)
+    weight, scale = layer.weight, layer.weight_scale
+
+    initialize_layerwise_reload(model)
+    layer.weight.weight_loader(layer.weight, source)
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert layer.weight is weight and layer.weight_scale is scale
+    validate_online_fp8(model, config)
+    weight = weight.float() if keep_layout else weight.float().t()
+    dequantized = weight * scale[:, None]
+    relative_error = (dequantized - source.float()).norm() / source.float().norm()
+    assert relative_error < 0.04
 
 
 def test_bf16_required():

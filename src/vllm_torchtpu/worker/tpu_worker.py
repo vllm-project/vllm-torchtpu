@@ -790,6 +790,10 @@ class TPUWorker(WorkerBase):
         # where a KV connector may allocate its host store.
         _release_free_host_heap()
 
+    def reload_weights(self, *args, **kwargs) -> None:
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner.reload_weights(*args, **kwargs)
+
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
         if getattr(self, "speculative_config", None) is not None:
