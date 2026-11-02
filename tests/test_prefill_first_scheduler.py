@@ -29,6 +29,7 @@ from vllm.config import (
 )
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -79,6 +80,7 @@ def _build(
     max_num_seqs: int = 8,
     max_num_batched_tokens: int = 128,
     long_prefill_token_threshold: int = 0,
+    data_parallel_size: int = 1,
     policy: str = "fcfs",
 ):
     monkeypatch.setenv("VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", str(over_tokens))
@@ -107,7 +109,7 @@ def _build(
             cache_dtype="auto",
             enable_prefix_caching=True,
         ),
-        parallel_config=ParallelConfig(),
+        parallel_config=ParallelConfig(data_parallel_size=data_parallel_size),
         device_config=DeviceConfig(device="cpu"),
     )
     kv_cache_config = KVCacheConfig(
@@ -493,6 +495,7 @@ def test_reported_counts_add_pending_prefill_units(shared_model_config, monkeypa
         monkeypatch,
         dp_lb_prefill_unit_tokens=32,
         max_num_batched_tokens=64,
+        data_parallel_size=2,
     )
     _add(scheduler, hasher, ("d", 16, 1))
     scheduler.schedule()
@@ -517,7 +520,35 @@ def test_scheduling_reads_the_true_counts(shared_model_config, monkeypatch):
         dp_lb_prefill_unit_tokens=16,
         max_num_batched_tokens=64,
         long_prefill_token_threshold=16,
+        data_parallel_size=2,
     )
     _add(scheduler, hasher, ("long", 48, 1))
     assert scheduler.get_request_counts() == (3, 1)
     assert scheduler.schedule().num_scheduled_tokens == {"long": 48}
+
+
+def test_unfinished_requests_are_true_counts_while_paused(
+    shared_model_config, monkeypatch
+):
+    scheduler, hasher = _build(
+        shared_model_config,
+        monkeypatch,
+        dp_lb_prefill_unit_tokens=32,
+        data_parallel_size=2,
+    )
+    _add(scheduler, hasher, ("queued", 100, 1))
+    scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    # A pause drains running requests only; the queued one is not counted.
+    assert scheduler.get_num_unfinished_requests() == 0
+    assert not scheduler.has_requests()
+    assert scheduler.get_request_counts() == (4, 1)
+
+
+def test_dp_lb_counts_are_off_without_data_parallelism(
+    shared_model_config, monkeypatch
+):
+    scheduler, hasher = _build(
+        shared_model_config, monkeypatch, dp_lb_prefill_unit_tokens=32
+    )
+    _add(scheduler, hasher, ("long", 100, 1))
+    assert scheduler.get_request_counts() == (0, 1)

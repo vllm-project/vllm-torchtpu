@@ -52,10 +52,11 @@ Prefill-aware DP load balancing (``VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS=U > 0``).
 vLLM's data-parallel front end sends each new request to the engine with the
 fewest waiting plus running requests, as each engine's scheduler reports them;
 a replica that still has a long prompt to prefill then looks no busier than one
-that only decodes, and a request routed there waits for that prefill. The
-counts this scheduler reports (for the front end and its logged stats, not for
-its own scheduling) add, to the running requests, one per U tokens (rounded up)
-that each running prefill chunk and waiting request still has to prefill.
+that only decodes, and a request routed there waits for that prefill. With
+DP > 1, the counts this scheduler publishes (for the front end and its logged
+stats) add, to the running requests, one per U tokens (rounded up) that each
+running prefill chunk and waiting request still has to prefill; its own
+scheduling and the engine's unfinished-request checks keep the true counts.
 
 Requests that sit a step out are resent with only the output tokens the model
 runner reads (see ``_make_cached_request_data``).
@@ -102,6 +103,12 @@ class PrefillFirstScheduler(AsyncScheduler):
                 "PrefillFirstScheduler needs VLLM_TPU_SOLO_PREFILL_OVER_TOKENS, "
                 "VLLM_TPU_DECODE_INTERVAL_MS or VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS."
             )
+        if self.lb_prefill_unit and self.parallel_config.data_parallel_size == 1:
+            logger.warning(
+                "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS has no load balancer to "
+                "inform without data parallelism; reporting true counts."
+            )
+            self.lb_prefill_unit = 0
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         # The longest prompt one step can hold whole.
@@ -122,8 +129,9 @@ class PrefillFirstScheduler(AsyncScheduler):
         # nothing).
         self._decode_due = 0.0
         self._force_decode = False
-        # Inside schedule(): the base scheduler reads the true request counts.
-        self._scheduling = False
+        # Set while the base scheduler's own logic reads the request counts:
+        # schedule() and the unfinished-request checks see the true counts.
+        self._true_counts = False
         logger.info(
             "PrefillFirstScheduler active (solo_over_tokens=%d, "
             "max_solo_tokens=%d, solo_max_consecutive=%d, solo_decode_steps=%d, "
@@ -174,16 +182,34 @@ class PrefillFirstScheduler(AsyncScheduler):
                 self.solo_over_tokens,
             )
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        self._scheduling = True
+    @contextlib.contextmanager
+    def _reading_true_counts(self) -> Iterator[None]:
+        outer = self._true_counts
+        self._true_counts = True
         try:
-            return self._schedule(throttle_prefills)
+            yield
         finally:
-            self._scheduling = False
+            self._true_counts = outer
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        with self._reading_true_counts():
+            return self._schedule(throttle_prefills)
+
+    def get_num_unfinished_requests(self) -> int:
+        # Pausing, idling and shutdown drains count real requests.
+        with self._reading_true_counts():
+            return super().get_num_unfinished_requests()
+
+    def has_finished_requests(self) -> bool:
+        with self._reading_true_counts():
+            return super().has_finished_requests()
 
     def get_request_counts(self) -> tuple[int, int]:
+        """With prefill-aware load balancing, outside the base scheduler's own
+        logic (so for the DP stats publisher and make_stats), running also
+        counts the units of prefill still pending."""
         num_running, num_waiting = super().get_request_counts()
-        if not self.lb_prefill_unit or self._scheduling:
+        if not self.lb_prefill_unit or self._true_counts:
             return num_running, num_waiting
         prefilling = chain(
             (r for r in self.running if r.is_prefill_chunk),
