@@ -683,12 +683,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
-    # Non-EP MoE with FP8 per-channel weights: run the experts with the
-    # gather-fused kernels (kernels/megablox/gather_gmm.py) instead of the
-    # routed-row gather, two gmm_v2 calls and the gather + top-k sum, so the
-    # [tokens * topk, hidden] permuted activations never reach HBM. Applies to
-    # batches of at least TPU_MOE_GATHER_GMM_MIN_TOKENS tokens; smaller
-    # batches and unsupported layouts keep the grouped-matmul path.
+    # MoE layers with FP8 per-channel weights (EP or not): run the experts
+    # with the gather-fused kernels (kernels/megablox/gather_gmm.py) instead
+    # of the routed-row permute, two gmm_v2 calls and the unpermute + top-k
+    # sum, so the [tokens * topk, hidden] permuted activations never reach
+    # HBM. Applies to batches of at least TPU_MOE_GATHER_GMM_MIN_TOKENS
+    # tokens; smaller batches and unsupported layouts or sizes keep the
+    # grouped-matmul path (can_use_gather_gmm in layers/core/fused_moe_gmm.py).
     "TPU_MOE_GATHER_GMM": env_bool("TPU_MOE_GATHER_GMM"),
     "TPU_MOE_GATHER_GMM_MIN_TOKENS": env_nonnegative_int(
         "TPU_MOE_GATHER_GMM_MIN_TOKENS", 1024
