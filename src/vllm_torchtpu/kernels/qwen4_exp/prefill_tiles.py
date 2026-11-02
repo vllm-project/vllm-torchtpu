@@ -109,6 +109,16 @@ def _get_sparse_prefill_tiles(query, cache, *, kv_heads, ratio):
         while query_block > 256 and query_block >= 2 * tokens:
             query_block //= 2
         return query_block, kv_tile, min(query_tile, query_block)
+    # The table was measured at T8192, but a pipeline stage's dynamic chunks run any multiple of
+    # the chunk granule (1024 tokens); a deep-context chunk cut to 7168 tokens missed it and ran
+    # the unpaired Q256/KV128 kernel (~20% of calls, 165 ms each, at 8 x 262016 in
+    # j-879a082f-d500-4947-985d). The paired-page tiles need only query blocks that divide the
+    # step, so reuse the T8192 entry for any step that is a multiple of its query block.
+    if key not in SPARSE_PREFILL_TILES:
+        full = (key[0], 8192, *key[2:])
+        tiles = SPARSE_PREFILL_TILES.get(full)
+        if tiles is not None and tokens % tiles[0] == 0:
+            return tiles
     if key not in SPARSE_PREFILL_TILES:
         logger.warning_once("QSA uses default prefill tiles for key: %s", key)
         # Keep query/state windows within the measured Q24/D256 footprint
