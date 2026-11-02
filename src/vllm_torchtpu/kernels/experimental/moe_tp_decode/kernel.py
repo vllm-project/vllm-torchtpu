@@ -155,7 +155,15 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
 
 
 def kernel_name(
-    experts, m, h, i, shared_inter, n_ranks, num_experts=None, fast=False
+    experts,
+    m,
+    h,
+    i,
+    shared_inter,
+    n_ranks,
+    num_experts=None,
+    fast=False,
+    ar_one_shot=False,
 ) -> str:
     name = (
         f"moe_tp_decode-e_{experts}-m_{m}-h_{h}-i_{i}-fs_{shared_inter}"
@@ -168,6 +176,8 @@ def kernel_name(
         name += f"-ne_{num_experts}"
     if fast:
         name += "-fast"
+    if ar_one_shot:
+        name += "-os"
     return name
 
 
@@ -186,6 +196,7 @@ def can_use_moe_tp_decode(
     *,
     topk: int,
     n_ranks: int,
+    ar_one_shot: bool = False,
 ) -> bool:
     """Trace-time admission; False means the caller keeps its own path.
 
@@ -230,7 +241,9 @@ def can_use_moe_tp_decode(
         return False
     if not all_reduce.supported(n_ranks, m, h, info):
         return False
-    spec = all_reduce.make_spec(n_ranks, m, h)
+    if ar_one_shot and not all_reduce.one_shot_supported(h, info):
+        return False
+    spec = all_reduce.make_spec(n_ranks, m, h, one_shot=ar_one_shot)
     plan = _vmem_plan(m, h, _i_chunk(i), num_experts, shared_inter, info, spec)
     return plan is not None
 
@@ -722,7 +735,14 @@ def _kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("routed_scale", "topk", "n_ranks", "fast", "hbm_operands"),
+    static_argnames=(
+        "routed_scale",
+        "topk",
+        "n_ranks",
+        "fast",
+        "hbm_operands",
+        "ar_one_shot",
+    ),
 )
 def moe_tp_decode(
     x,
@@ -745,6 +765,7 @@ def moe_tp_decode(
     n_ranks: int,
     fast: bool = False,
     hbm_operands: bool = False,
+    ar_one_shot: bool = False,
 ):
     """The layer's bf16 [N, D] output, summed over the n_ranks TP ranks.
 
@@ -773,6 +794,8 @@ def moe_tp_decode(
         VMEM with a copy-start/-done before the call (exposed in the MTP
         drafter's one-layer program), though the kernel DMAs the rows it uses
         itself. Same bytes read, same output bits.
+      ar_one_shot: the all-reduce's one-row path (all_reduce.py): a step with
+        one valid row exchanges it in one round instead of two. Same bits.
 
     Returns:
       bf16(sum over ranks of each rank's shared + routed_scale * routed),
@@ -789,7 +812,7 @@ def moe_tp_decode(
     num_experts = scores.shape[1]
     shared_inter = shared_w2.shape[0]
     info = pltpu.get_tpu_info()
-    ar_spec = all_reduce.make_spec(n_ranks, m, h)
+    ar_spec = all_reduce.make_spec(n_ranks, m, h, one_shot=ar_one_shot)
     ic = _i_chunk(i)
     plan = _vmem_plan(m, h, ic, num_experts, shared_inter, info, ar_spec)
     if plan is None:
@@ -880,7 +903,9 @@ def moe_tp_decode(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID
         ),
-        name=kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts, fast),
+        name=kernel_name(
+            experts, m, h, i, shared_inter, n_ranks, num_experts, fast, ar_one_shot
+        ),
     )(
         *metas,
         x,

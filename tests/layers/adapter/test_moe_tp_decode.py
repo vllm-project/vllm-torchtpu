@@ -154,6 +154,7 @@ class _Harness:
         self.op_calls = []
         self.statics = []
         self.selftest_calls = 0
+        self.selftest_one_shot = None
         self.selftest_failures = []
         self.logs = []
 
@@ -246,8 +247,9 @@ def harness(monkeypatch):
 
     monkeypatch.setattr(moe_tp_decode, "_get_op", get_op)
 
-    def selftest(topo, buckets, device):
+    def selftest(topo, buckets, device, one_shot=False):
         h.selftest_calls += 1
+        h.selftest_one_shot = one_shot
         return h.selftest_failures
 
     monkeypatch.setattr(moe_tp_decode, "_selftest", selftest)
@@ -556,3 +558,11 @@ def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, pref
     else:
         assert calls == [("chain", tokens)]
         assert bool(jnp.all(out == 2))  # the chain's partial, psummed over 2
+
+
+def test_one_shot_flag_reaches_the_statics_and_the_selftest(harness, monkeypatch):
+    monkeypatch.setattr(envs, "TPU_MOE_TP_DECODE_AR_ONE_SHOT", True)
+    model = harness.model({})
+    assert moe_tp_decode.arm(model) == 1
+    assert harness.selftest_one_shot is True
+    assert all(statics.ar_one_shot for statics in harness.statics)

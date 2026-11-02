@@ -186,6 +186,14 @@ def test_row_paths_at_glm52_shapes(monkeypatch):
     h = GLM52_TP16["h"]
     # 6144 / 16 = 3 lane groups per chunk, so up to 16 // 3 = 5 rows fold.
     assert all_reduce.selftest_row_counts(all_reduce.make_spec(16, 16, h)) == [16, 5, 0]
+    # The one-row path takes n_valid = 1 ahead of the fold (16 x 384 tile).
+    one_shot = all_reduce.make_spec(16, 16, h, one_shot=True)
+    assert all_reduce.selftest_row_counts(one_shot) == [16, 1, 5, 0]
+    assert one_shot.row_tile_width == 384
+    # 8 ranks x 3072: 384-column chunks, but one row does not fill 16 x 128-lane
+    # groups.
+    with pytest.raises(ValueError, match="one-row"):
+        all_reduce.make_spec(8, 16, 3072, one_shot=True)
     assert all_reduce.selftest_row_counts(all_reduce.make_spec(16, 32, h)) == [
         32,
         5,

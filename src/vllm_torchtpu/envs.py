@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
+    TPU_MOE_TP_DECODE_AR_ONE_SHOT: bool = False
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -1270,6 +1271,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # issued after the compaction instead of inside it, and a ring loop without
     # conditional DMAs or a stale matmul. Default on.
     "TPU_MOE_TP_DECODE_FAST": env_bool("TPU_MOE_TP_DECODE_FAST", True),
+    # With USE_MOE_TP_DECODE_KERNEL: a step with one valid row (a batch-1
+    # decode step) all-reduces that row in one round of remote copies -- every
+    # rank pushes it, folded into one row tile, to every peer and sums the n
+    # copies itself -- instead of the two-shot's two rounds. Each element is
+    # the same f32 sum in rank order: bit-identical output.
+    "TPU_MOE_TP_DECODE_AR_ONE_SHOT": env_bool("TPU_MOE_TP_DECODE_AR_ONE_SHOT"),
     # moe_tp_decode: pass n_valid, rank and the expert offset as three [1]
     # scalar operands instead of one stacked int32[3] (one XLA fusion per MoE
     # layer, ~0.6 us in situ). Exact.
