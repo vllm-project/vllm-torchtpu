@@ -198,6 +198,45 @@ def test_prepare_singlehost_tpu_env_keeps_inherited_slice_bootstrap(monkeypatch)
     assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
 
 
+@pytest.mark.parametrize("world_size", [1, 8])
+def test_prepare_singlehost_tpu_env_leaves_embedded_host_env_alone(
+    monkeypatch, world_size
+):
+    """An embedded engine's host already bootstrapped PjRt from its own env."""
+    monkeypatch.setenv("TPU_VLLM_EMBEDDED_ENGINE", "1")
+    monkeypatch.setenv("WORLD_SIZE", "128")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "host-0:8070,host-1:8070")
+    monkeypatch.delenv("TORCH_TPU_TOPOLOGY", raising=False)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    before = dict(os.environ)
+
+    with patch.object(TpuPlatform, "_get_tpu_topology", return_value="2,2,1,2"):
+        TpuPlatform._prepare_singlehost_tpu_env(world_size)
+
+    assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+def test_configure_torchtpu_eager_mode_spares_embedded_host(monkeypatch, embedded):
+    """The eager mode is process-global; an embedded engine leaves it alone."""
+    from torch_tpu._internal import execution_mode
+
+    monkeypatch.delenv("TPU_KERNEL_ITER_MODE", raising=False)
+    monkeypatch.setenv("TPU_VLLM_EMBEDDED_ENGINE", "1" if embedded else "0")
+    monkeypatch.setattr(
+        execution_mode, "eager_mode", execution_mode.EagerMode.DEFER_NEVER
+    )
+
+    tpu_platform._configure_torchtpu_eager_mode()
+
+    expected = (
+        execution_mode.EagerMode.DEFER_NEVER
+        if embedded
+        else execution_mode.EagerMode.DEFER_AND_FUSE
+    )
+    assert execution_mode.eager_mode == expected
+
+
 @pytest.mark.parametrize("inherited_endpoint", [False, True])
 def test_singlehost_workers_share_native_endpoint_with_filestore(
     monkeypatch, tmp_path, inherited_endpoint

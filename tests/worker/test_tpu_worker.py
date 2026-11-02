@@ -47,6 +47,23 @@ def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(monke
     assert os.environ["WORLD_SIZE"] == "8"
 
 
+def test_configure_tpu_process_env_leaves_embedded_host_env_alone(monkeypatch):
+    """An embedded engine's host owns the torchrun variables."""
+    monkeypatch.setenv("TPU_VLLM_EMBEDDED_ENGINE", "1")
+    host_env = {
+        "RANK": "37",
+        "LOCAL_RANK": "5",
+        "WORLD_SIZE": "128",
+        "LOCAL_WORLD_SIZE": "8",
+    }
+    for name, value in host_env.items():
+        monkeypatch.setenv(name, value)
+
+    _configure_tpu_process_env(rank=0, local_rank=0, world_size=1, local_world_size=1)
+
+    assert {name: os.environ[name] for name in host_env} == host_env
+
+
 def _make_vllm_config(profiler_torch_dir=None):
     """Build a minimal mock VllmConfig for TPUWorker.__init__."""
     cfg = MagicMock()

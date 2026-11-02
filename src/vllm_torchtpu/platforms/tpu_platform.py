@@ -228,6 +228,14 @@ def _configure_torchtpu_eager_mode() -> None:
             "TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).", previous_mode.name
         )
         return
+    # The mode is process-global, so an embedded engine would switch its host
+    # for good; the host scopes it around engine calls instead.
+    if envs.TPU_VLLM_EMBEDDED_ENGINE:
+        logger.info(
+            "TorchTPU eager mode left at %s (TPU_VLLM_EMBEDDED_ENGINE).",
+            previous_mode.name,
+        )
+        return
     execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
     logger.info(
         "TorchTPU eager mode configured: %s (previous=%s)",
@@ -625,7 +633,16 @@ class TpuPlatform(Platform):
         world_size (not auto-detected chip count) so slicebuilder and topology
         match the actual number of workers. A single TPU does not need the
         distributed PjRt bootstrap.
+
+        Skipped for an embedded engine (TPU_VLLM_EMBEDDED_ENGINE): its host
+        process already initialized PjRt from its own values.
         """
+        if envs.TPU_VLLM_EMBEDDED_ENGINE:
+            logger.info(
+                "Keeping the host process's TorchTPU bootstrap env "
+                "(TPU_VLLM_EMBEDDED_ENGINE)."
+            )
+            return
         os.environ.setdefault("TORCH_TPU_XPROF_SESSION_ID", str(time.time_ns()))
 
         if world_size == 1:
