@@ -6324,6 +6324,35 @@ class TPUModelRunner(GPUModelRunner):
         max_positions = num_reqs * (k + 1)
         return prev_num_reqs < num_tokens and prev_num_tokens < max_positions
 
+    def _spec_selected_logits_pairs(self) -> list[tuple[int, int]]:
+        """(num_tokens, padded_logits_length) pairs a spec-decode verify step
+        can pass to compute_selected_logits that the num_reqs sweep in
+        _precompile_compute_selected_logits does not compile.
+
+        A verify step gathers up to max_num_reqs * (K + 1) rows, padded to a
+        token bucket, from hidden states padded to the step's own token
+        bucket. A prefill chunk in the step makes that bucket larger than any
+        decode-only step reaches. The gathered rows never exceed the tokens.
+        """
+        assert self.speculative_config is not None
+        k = self.speculative_config.num_speculative_tokens
+        paddings = sorted(self.num_tokens_paddings)
+        cap = min(self.max_num_reqs * (k + 1), paddings[-1])
+        lengths = paddings[: bisect.bisect_left(paddings, cap) + 1]
+        pairs = []
+        for num_tokens in paddings:
+            covered = set()
+            for num_reqs in self.num_reqs_paddings:
+                covered.add(num_reqs)
+                if num_reqs >= min(num_tokens, self.max_num_reqs):
+                    break
+            pairs.extend(
+                (num_tokens, length)
+                for length in lengths
+                if length <= num_tokens and length not in covered
+            )
+        return pairs
+
     @contextlib.contextmanager
     def _precompile_timed(self, name: str):
         """Common boilerplate for each AOT bucket precompile pass."""
@@ -6356,6 +6385,33 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
+
+    def _precompile_spec_selected_logits(self) -> None:
+        if not envs.TPU_PRECOMPILE_SPEC_MIXED or self.speculative_config is None:
+            return
+        pairs = self._spec_selected_logits_pairs()
+        if not pairs:
+            return
+        hsize = self.model_config.get_hidden_size()
+        top_tokens = self._greedy_head_owner is not None
+        with self._precompile_timed("spec compute_selected_logits"):
+            for num_tokens, logits_len in pairs:
+                dummy_hidden = torch.zeros(
+                    (num_tokens, hsize),
+                    dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                # final_logits_indices is int32 (get_spec_decode_metadata).
+                indices = torch.zeros(logits_len, dtype=torch.int32).to(self.device)
+                out = self.compute_selected_logits(dummy_hidden, indices)
+                synchronize_tensors(out)
+                if top_tokens:
+                    out = self.compute_selected_top_tokens(dummy_hidden, indices)
+                    synchronize_tensors(out)
+                logger.info(
+                    "  -- num_tokens: %d, padded_logits_length: %d",
+                    num_tokens,
+                    logits_len,
+                )
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -6558,12 +6614,17 @@ class TPUModelRunner(GPUModelRunner):
         # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
         # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
         # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
+        next_variants = [(n, torch.int64) for n in self.num_reqs_paddings]
         if self._is_async_drafter:
             assert self.speculative_config is not None
-            next_lens.append(
-                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+            spec_span = self.max_num_reqs * (
+                1 + self.speculative_config.num_speculative_tokens
             )
+            next_variants.append((spec_span, torch.int64))
+            if envs.TPU_PRECOMPILE_SPEC_MIXED:
+                # assemble_spec_next_tokens builds the span in the drafts'
+                # dtype, which is int32 for eagle3 and MTP.
+                next_variants.append((spec_span, torch.int32))
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
@@ -6575,8 +6636,8 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices = torch.full(
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
-                for nlen in next_lens:
-                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
+                for nlen, next_dtype in next_variants:
+                    next_tokens = torch.zeros(nlen, dtype=next_dtype).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,
@@ -6815,6 +6876,7 @@ class TPUModelRunner(GPUModelRunner):
             # Only the last stage holds the lm_head and samples.
             return
         self._precompile_compute_selected_logits()
+        self._precompile_spec_selected_logits()
         if _get_sequence_layout_planner_for_runner(
             self
         ).uses_selected_logits_hidden_states:

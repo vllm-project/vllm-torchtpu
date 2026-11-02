@@ -839,6 +839,7 @@ def _spec_bucket_runner(spec_k):
         speculative_config=SimpleNamespace(num_speculative_tokens=spec_k),
         num_tokens_paddings=[32, 64, 128, 256, 384, 512, 768],
         num_reqs_paddings=[8, 16, 32, 64, 128, 192],
+        max_num_reqs=192,
     )
 
 
@@ -883,6 +884,52 @@ def test_spec_verify_bucket_reachable_prunes_impossible_pairs():
         512: [128, 192],
         768: [192],
     }
+
+
+@pytest.mark.parametrize("spec_k", [1, 3, 7])
+def test_spec_selected_logits_pairs_cover_every_mixed_step(spec_k):
+    # n requests sample between n and n * (K + 1) logits positions, in a step
+    # of any token bucket at least that large. The num_reqs sweep or the spec
+    # pairs must compile each padded (num_tokens, logits length) pair.
+    runner = _spec_bucket_runner(spec_k)
+    compiled = set(TPUModelRunner._spec_selected_logits_pairs(runner))
+    for num_tokens in runner.num_tokens_paddings:
+        for num_reqs in runner.num_reqs_paddings:
+            assert (num_tokens, num_reqs) not in compiled
+            compiled.add((num_tokens, num_reqs))
+            if num_reqs >= min(num_tokens, runner.max_num_reqs):
+                break
+
+    def pad(value, paddings):
+        return next((p for p in paddings if p >= value), None)
+
+    for n in range(1, runner.max_num_reqs + 1):
+        for positions in range(n, n * (spec_k + 1) + 1):
+            length = pad(positions, runner.num_tokens_paddings)
+            if length is None:
+                break
+            for num_tokens in runner.num_tokens_paddings:
+                if num_tokens >= length:
+                    assert (num_tokens, length) in compiled, (n, positions)
+
+
+def test_spec_selected_logits_pairs_glm_mtp():
+    # GLM-5.2 with MTP 3, max_num_seqs 8 and 4096 batched tokens compiled
+    # these (hidden rows, gathered rows) pairs while serving without the
+    # spec pairs.
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        num_tokens_paddings=[16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+        num_reqs_paddings=[8],
+        max_num_reqs=8,
+    )
+    served = {
+        (2048, 16), (1024, 16), (4096, 16), (256, 16), (512, 16), (64, 16),
+        (2048, 32), (4096, 32), (512, 32), (1024, 32), (256, 32),
+    }  # fmt: skip
+    pairs = TPUModelRunner._spec_selected_logits_pairs(runner)
+    assert served <= set(pairs)
+    assert len(pairs) == 17
 
 
 @pytest.mark.parametrize(

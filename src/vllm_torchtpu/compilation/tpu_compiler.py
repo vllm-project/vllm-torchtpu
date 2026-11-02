@@ -255,6 +255,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "RAIDEN_STORAGE_TYPE",
     # Compiles the same spec-decode artifacts, just eagerly at startup.
     "SPEC_WARMUP",
+    "TPU_PRECOMPILE_SPEC_MIXED",
     "TORCH_TPU_BASE_PORT",
     "TORCH_TPU_MP_RENDEZVOUS_PORT",
     "TPU_LOCAL_RANK_OFFSET",
