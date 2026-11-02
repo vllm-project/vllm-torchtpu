@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for TPU chip specifications, model geometry, and stdlib isolation."""
+"""Unit tests for TPU chip specifications, model geometry, and import isolation."""
 
 from __future__ import annotations
 
@@ -19,8 +19,9 @@ import ast
 from pathlib import Path
 
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.roofline import CHIPS
+from vllm_torchtpu.roofline import CHIPS, chips
 from vllm_torchtpu.roofline.geometry import from_hf_config
 
 QWEN35_CFG: dict[str, object] = {
@@ -48,16 +49,14 @@ QWEN35_CFG: dict[str, object] = {
 
 
 def test_chip_table_matches_jax_tpu_info() -> None:
-    jti = pytest.importorskip("jax._src.tpu_info")
-
-    info = jti.get_tpu_info_for_chip(jti.ChipVersion.TPU_7X, 1)
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     c = CHIPS["tpu7x"]
     assert c.hbm_bytes == info.hbm_capacity_bytes
-    assert c.hbm_bw == pytest.approx(info.mem_bw_bytes_per_second)
-    assert c.bf16_flops == pytest.approx(info.bf16_ops_per_second)
-    assert c.fp8_flops == 2.307e15
-    assert c.fp8_flops == pytest.approx(info.fp8_ops_per_second, rel=1e-2)
+    assert c.hbm_bw == info.mem_bw_bytes_per_second
+    assert c.bf16_flops == info.bf16_ops_per_second
+    assert c.fp8_flops == info.fp8_ops_per_second
     assert c.vmem_bytes == info.vmem_capacity_bytes
+    assert (c.ici_link_bw, c.ici_bw, c.ici_hop_latency_s) == (100.0e9, 300.0e9, 1.0e-6)
 
 
 def test_core_has_no_engine_imports() -> None:
@@ -66,8 +65,6 @@ def test_core_has_no_engine_imports() -> None:
         "vllm",
         "torch",
         "torch_tpu",
-        "jax",
-        "jaxlib",
         "numpy",
         "vllm_torchtpu",
     }
@@ -129,3 +126,21 @@ def test_linear_conv_kernel_dim_validation() -> None:
     }
     geom = from_hf_config(cfg_non_linear)
     assert geom.conv_kernel == 0
+
+
+def test_chips_stdlib_fallback_when_jax_absent() -> None:
+    jax_spec = CHIPS["tpu7x"]
+    orig_pltpu = chips.pltpu
+    try:
+        chips.pltpu = None
+        fallback = chips._from_jax(
+            "tpu7x",
+            "tpu7x",
+            cores_per_chip=2,
+            ici_link_bw=100.0e9,
+            ici_bw=300.0e9,
+            ici_hop_latency_s=1.0e-6,
+        )
+    finally:
+        chips.pltpu = orig_pltpu
+    assert fallback == jax_spec
