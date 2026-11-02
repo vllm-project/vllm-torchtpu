@@ -223,6 +223,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         nan_kv_seq_idx: int | None = None,
         nan_new_seq_idx: int | None = None,
         mask_invalid_v: bool | None = None,
+        fp8_compute: bool = False,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
@@ -416,6 +417,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
             mask_invalid_v=mask_invalid_v,
+            fp8_compute=fp8_compute,
         )
         output = output[: cu_q_lens[distribution[-1]]]
 
@@ -607,6 +609,35 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+        )
+
+    @parameterized.product(
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
+        head_dim=[128, 512],
+        sliding_window=[None, 128],
+    )
+    def test_ragged_paged_attention_fp8_compute(
+        self, kv_layout, head_dim, sliding_window
+    ):
+        if not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("Expect TPU7x+ (fp8 MXU)")
+        # Decodes first, then prefill chunks with and without cached context.
+        seq_lens = [(1, 300), (1, 77), (192, 328), (128, 180), (64, 255)]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (32, 8),
+            head_dim,
+            256,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            1000,
+            sliding_window=sliding_window,
+            kv_layout=kv_layout,
+            distribution=jnp.array([2, 2, len(seq_lens)], dtype=jnp.int32),
+            fp8_compute=True,
         )
 
     @parameterized.product(

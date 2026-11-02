@@ -12,12 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
+
+# Under `fp8_compute`, P is computed as 2**P_FP8_EXP * exp(s - m) before it is
+# cast to fp8, so probabilities down to 2**-(9 + P_FP8_EXP) survive the cast
+# (e4m3's smallest subnormal is 2**-9) while the largest, 2**P_FP8_EXP, stays
+# under e4m3's 448. `l` sums the same scaled P, so the factor cancels in acc / l.
+P_FP8_EXP = 8
 
 
 def flash_attention_qk_softmax(
@@ -96,7 +104,10 @@ def flash_attention_qk_softmax(
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+    m_sub = m_next
+    if cfgs.serve.fp8_compute:
+        m_sub = m_next - P_FP8_EXP * math.log(2.0)
+    p = jnp.exp(qk - utils.broadcast_minor(m_sub, qk.shape))
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []
@@ -143,6 +154,9 @@ def flash_attention_pv(
         # We can scale p or v, and because p will be smaller especially for decode
         # workflows, we scale p to save some time.
         p = p.astype(v_sc.dtype) * v_sc
+
+    if cfgs.serve.fp8_compute:
+        p = p.astype(v.dtype)
 
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         h_size = v.shape[-2]
