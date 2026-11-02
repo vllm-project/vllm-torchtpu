@@ -897,6 +897,10 @@ def _eager_vocab_mask(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _rows(plan: Any, rank: int) -> torch.Tensor:
+    return gemma4_patch._rank_rows(torch.arange(plan.num_tokens), plan, rank)
+
+
 def _vocab_shard(embedding: torch.Tensor, rank: int, world: int) -> SimpleNamespace:
     """A VocabParallelEmbedding shard: rows [rank * V/world, (rank + 1) * V/world)."""
     vocab = embedding.shape[0]
@@ -981,7 +985,7 @@ def _cp_attention_reference(mock: _TPCollectiveMock, model: _Model, plan: Any):
         kv = gemma4_patch._token_order(mock.all_gather(k + v), plan)
         kv = kv.view(num_tokens, kv_heads, hd).repeat_interleave(heads // kv_heads, 1)
         prefix = kv.cumsum(0) / torch.arange(1, num_tokens + 1).view(-1, 1, 1)
-        rows = gemma4_patch._rank_rows(torch.arange(num_tokens), plan, rank)
+        rows = _rows(plan, int(rank[0]))
         return (q.view(-1, heads, hd) * prefix[rows]).flatten(1)
 
     return attention
@@ -1019,7 +1023,13 @@ def test_context_parallel_forward_matches_tp(mock_collectives, world, fp8) -> No
             norm=model.final_norm,
         )
         return gemma4_patch._context_parallel_forward(
-            fake, input_ids, positions, plan, rank, attention
+            fake,
+            input_ids,
+            positions,
+            plan,
+            torch.tensor([rank]),
+            _rows(plan, rank),
+            attention,
         )
 
     expected = reference()
@@ -1066,26 +1076,35 @@ def test_context_parallel_moe_forward_matches_tp(mock_collectives) -> None:
             norm=model.final_norm,
         )
         return gemma4_patch._context_parallel_forward(
-            fake, input_ids, positions, plan, rank, attention
+            fake,
+            input_ids,
+            positions,
+            plan,
+            torch.tensor([rank]),
+            _rows(plan, rank),
+            attention,
         )
 
     for out in _run_ranks(world, cp_rank):
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
-def test_context_parallel_trace_keeps_the_bucket_symbolic(monkeypatch) -> None:
-    """Only the token slices touch the token dimension: no specialization, and
-    the trace refuses smaller buckets, as shape_variants reads its guards."""
-    world, rank = 4, 1
+def _trace_context_parallel_forward(monkeypatch, rank: int) -> Any:
+    """Dynamo's graph of `_context_parallel_forward` on rank ``rank`` of 4, with
+    collectives and attention that are the same on every rank and the vocab
+    shard bounds as the TPU platform's buffers."""
+    world = 4
     model = _GqaModel(1, moe=False, fp8=True, num_layers=2)
     plan = _zigzag_plan(world, 2 * world * 4)
-    num_tokens = plan.num_tokens
     monkeypatch.setattr(
-        gemma4_patch, "_reduce_scatter_rows", lambda x: x.chunk(world)[rank] * 1
+        gemma4_patch, "_reduce_scatter_rows", lambda x: x[: x.shape[0] // world] * 1
     )
     monkeypatch.setattr(gemma4_patch, "_all_gather_rows", lambda x: x.repeat(world, 1))
+    embed = _vocab_shard(model.embedding, rank, world)
+    for name in ("org_vocab_start_index", "org_vocab_end_index"):
+        setattr(embed, name, torch.tensor(getattr(embed.shard_indices, name)))
     fake = SimpleNamespace(
-        embed_tokens=_vocab_shard(model.embedding, rank, world),
+        embed_tokens=embed,
         normalizer=torch.tensor(2.0),
         layers=[model.layer(i, 0, lambda t: t) for i in range(2)],
         cp_replica=SimpleNamespace(layers=[_replica(model, i) for i in range(2)]),
@@ -1097,22 +1116,38 @@ def test_context_parallel_trace_keeps_the_bucket_symbolic(monkeypatch) -> None:
         graphs.append(gm)
         return gm.forward
 
-    def forward(ids: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    def forward(ids, pos, rank_tensor, rows):
         return gemma4_patch._context_parallel_forward(
-            fake, ids, pos, plan, rank, lambda attn, q, k, v, plan, rank: q * 1
+            fake, ids, pos, plan, rank_tensor, rows, lambda a, q, k, v, p, r: q * 1
         )
 
-    ids = torch.randint(0, model.embedding.shape[0], (num_tokens,))
-    pos = torch.arange(num_tokens)
+    ids = torch.randint(0, model.embedding.shape[0], (plan.num_tokens,))
+    pos = torch.arange(plan.num_tokens)
     torch._dynamo.mark_dynamic(ids, 0)
     torch._dynamo.mark_dynamic(pos, 0)
     torch._dynamo.reset()
-    out = torch.compile(forward, backend=backend, fullgraph=True)(ids, pos)
-    assert out.shape == (num_tokens, model.hidden)
-    shape_env = shape_variants.trace_shape_env(graphs[0])
+    out = torch.compile(forward, backend=backend, fullgraph=True)(
+        ids, pos, torch.tensor([rank], dtype=torch.int32), _rows(plan, rank)
+    )
+    assert out.shape == (plan.num_tokens, model.hidden)
+    return graphs[0], plan.num_tokens
+
+
+def test_context_parallel_trace_keeps_the_bucket_symbolic(monkeypatch) -> None:
+    """Only the token slices touch the token dimension: no specialization, and
+    the trace refuses smaller buckets, as shape_variants reads its guards."""
+    graph, num_tokens = _trace_context_parallel_forward(monkeypatch, 1)
+    shape_env = shape_variants.trace_shape_env(graph)
     assert shape_env is not None and shape_env.var_to_range
     assert shape_variants.unsupported_reason(shape_env, num_tokens) is None
     assert shape_variants.unsupported_reason(shape_env, num_tokens // 2) is not None
+
+
+def test_context_parallel_trace_is_the_same_on_every_rank(monkeypatch) -> None:
+    """The rank reaches the program only as tensors (collectives compiled into
+    the program assume every rank runs the same one)."""
+    graphs = [_trace_context_parallel_forward(monkeypatch, r)[0] for r in (0, 1, 3)]
+    assert graphs[0].code == graphs[1].code == graphs[2].code
 
 
 def _cp_config(**overrides: Any) -> SimpleNamespace:

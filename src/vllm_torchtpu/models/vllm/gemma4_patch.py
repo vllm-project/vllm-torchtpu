@@ -581,7 +581,8 @@ def _vocab_shard_embedding(embed: Any, input_ids: torch.Tensor) -> torch.Tensor:
     return rows.masked_fill(outside.unsqueeze(-1), 0)
 
 
-# (attn, q, k, v, plan, rank) -> attention of the rank's rows over the prompt.
+# (attn, q, k, v, plan, rank tensor) -> attention of the rank's rows over the
+# whole prompt.
 CPAttention = Callable[..., torch.Tensor]
 
 
@@ -591,7 +592,7 @@ def _context_parallel_layer(
     positions: torch.Tensor,
     x: torch.Tensor,
     plan: Any,
-    rank: int,
+    rank: torch.Tensor,
     attention: CPAttention,
 ) -> torch.Tensor:
     """Upstream's decoder layer on this rank's zigzag rows, every head local."""
@@ -634,14 +635,21 @@ def _context_parallel_forward(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
     plan: Any,
-    rank: int,
+    rank: torch.Tensor,
+    rows: torch.Tensor,
     attention: CPAttention,
 ) -> torch.Tensor:
-    """Gemma4Model.forward of one prompt, on this rank's zigzag rows."""
+    """Gemma4Model.forward of one prompt, on this rank's zigzag rows.
+
+    ``rank`` ([1] int32) and ``rows``, the token indices of the rank's rows
+    (`_rank_rows`), are device tensors: every rank traces the same program, as
+    the collectives compiled into it assume, so nothing rank-specific may be a
+    constant of the graph.
+    """
     shards = _vocab_shard_embedding(model.embed_tokens, _rank_major(input_ids, plan))
     # As upstream: the normalizer scales the reduced embedding.
     x = _reduce_scatter_rows(shards) * model.normalizer
-    positions = _rank_rows(positions, plan, rank)
+    positions = positions.index_select(0, rows)
     for layer, replica in zip(model.layers, getattr(model, _REPLICA).layers):
         x = _context_parallel_layer(layer, replica, positions, x, plan, rank, attention)
     return _token_order(_all_gather_rows(model.norm(x)), plan)
@@ -653,7 +661,8 @@ class Gemma4ContextParallelProgram(nn.Module):
 
     A compiled module of its own, built for that bucket only: its zigzag plan
     is a constant of the trace, which only slices the token dimension, so the
-    bucket size remains a free symbol. It runs the TP model's embedding
+    bucket size remains a free symbol, and the rank's rows are a buffer, so
+    every rank compiles the same program. It runs the TP model's embedding
     shards, norms, rotary embeddings and attention layers, and its projection
     replica.
     """
@@ -677,12 +686,27 @@ class Gemma4ContextParallelProgram(nn.Module):
             get_tensor_model_parallel_world_size(),
             vllm_config.cache_config.block_size,
         )
-        self.rank = get_tensor_model_parallel_rank()
+        rank = get_tensor_model_parallel_rank()
+        # Buffers, not constants: the rank and its rows are inputs of the program.
+        self.register_buffer(
+            "rank", torch.tensor([rank], dtype=torch.int32), persistent=False
+        )
+        self.register_buffer(
+            "rows",
+            _rank_rows(torch.arange(num_tokens, dtype=torch.int32), self.plan, rank),
+            persistent=False,
+        )
         self.attention: CPAttention = cp_prefill_attention
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return _context_parallel_forward(
-            self.model, input_ids, positions, self.plan, self.rank, self.attention
+            self.model,
+            input_ids,
+            positions,
+            self.plan,
+            self.rank,
+            self.rows,
+            self.attention,
         )
 
 
@@ -837,7 +861,6 @@ def _prepare_context_parallel_attention(model: Any) -> None:
             attn.attn,
             num_heads=attn.total_num_heads,
             num_kv_heads=attn.total_num_kv_heads,
-            rank=get_tensor_model_parallel_rank(),
             world=get_tensor_model_parallel_world_size(),
         )
 
