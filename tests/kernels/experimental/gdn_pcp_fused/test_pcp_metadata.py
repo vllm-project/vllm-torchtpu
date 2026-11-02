@@ -15,6 +15,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import config, pcp_metadata
 
@@ -70,7 +71,8 @@ def _assert_pytree_array_equal(actual, expected):
         )
 
 
-def test_schedule_splits_cross_request_batch_flat_pcp_rounds():
+@pytest.mark.parametrize("projection_chunks", [1, 2, 4])
+def test_schedule_splits_cross_request_batch_flat_pcp_rounds(projection_chunks):
     cfg = _cfg(batch_size=128, tile_size=4)
     seq_lens, query_start, state_indices, distribution = _metadata_inputs(
         lengths=[13, 11],
@@ -87,7 +89,7 @@ def test_schedule_splits_cross_request_batch_flat_pcp_rounds():
         distribution[-1],
         pcp_size=4,
         comm_chunk_size=4,
-        projection_token_block_size=16,
+        projection_token_block_size=4 * projection_chunks,
         num_qkv_out_blocks=6,
         num_projection_out_blocks=8,
     )
