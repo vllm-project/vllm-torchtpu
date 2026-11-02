@@ -237,17 +237,20 @@ def _dense_panels(lhs, weights, buffers, semaphores, *, columns):
     compiler can schedule that work alongside the MXU product.
     """
 
-    def source(panel):
-        return weights.at[:, pl.ds(panel * 256, 256)]
+    def copy(panel):
+        bank = panel % len(buffers)
+        return pltpu.make_async_copy(
+            weights.at[:, pl.ds(panel * 256, 256)], buffers[bank], semaphores[bank]
+        )
 
-    pltpu.make_async_copy(source(0), buffers[0], semaphores[0]).start()
-    for panel in range(columns // 256):
-        bank = panel % 2
-        pltpu.make_async_copy(source(panel), buffers[bank], semaphores[bank]).wait()
-        if panel + 1 < columns // 256:
-            pltpu.make_async_copy(
-                source(panel + 1), buffers[1 - bank], semaphores[1 - bank]
-            ).start()
+    panels = columns // 256
+    for panel in range(min(len(buffers) - 1, panels)):
+        copy(panel).start()
+    for panel in range(panels):
+        bank = panel % len(buffers)
+        copy(panel).wait()
+        if panel + len(buffers) - 1 < panels:
+            copy(panel + len(buffers) - 1).start()
         yield (
             panel * 256,
             jnp.matmul(lhs, buffers[bank][...], preferred_element_type=jnp.float32),
@@ -627,19 +630,30 @@ def _prologue(
     shared_down = shared_down.at[family]
     valid = _stripe_validity(rows, control[0], rank)
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
+    banks = k._config().prefill_moe_dma_banks if rows <= 128 else 2
 
     def body(s):
         own = s["pair"].at[pl.ds(parity * rows, rows), :]
-        copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
-        copy.start()
-        copy.wait()
-        if rows <= 128:
-            copy = pltpu.make_async_copy(router, s["router"], s["input_sem"])
+        if banks > 2:
+            # Input, router and bias loads in flight together.
+            loads = [pltpu.make_async_copy(hidden, own, s["input_sem"]),
+                     pltpu.make_async_copy(router, s["router"], s["load_sems"][0]),
+                     pltpu.make_async_copy(bias, s["bias"], s["load_sems"][1])]
+            for copy in loads:
+                copy.start()
+            for copy in loads:
+                copy.wait()
+        else:
+            copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
             copy.start()
             copy.wait()
-        copy = pltpu.make_async_copy(bias, s["bias"], s["input_sem"])
-        copy.start()
-        copy.wait()
+            if rows <= 128:
+                copy = pltpu.make_async_copy(router, s["router"], s["input_sem"])
+                copy.start()
+                copy.wait()
+            copy = pltpu.make_async_copy(bias, s["bias"], s["input_sem"])
+            copy.start()
+            copy.wait()
         _enter_mesh()
         pl.semaphore_signal(
             s["peer_credit"], 1, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL
@@ -662,8 +676,9 @@ def _prologue(
             copy.wait()
         else:
             buffers, router_v = s["gu_buffers"], s["router"]
-        gate_buffers, up_buffers = buffers[:2], buffers[2:]
-        gate_sems, up_sems = s["gu_sems"][:2], s["gu_sems"][2:]
+        half = len(buffers) // 2
+        gate_buffers, up_buffers = buffers[:half], buffers[half:]
+        gate_sems, up_sems = s["gu_sems"][:half], s["gu_sems"][half:]
         hx = own[...]
         logits = jnp.matmul(hx, router_v[...], preferred_element_type=jnp.float32)
         top = _Top16(logits, s["bias"][...])
@@ -791,26 +806,27 @@ def _prologue(
         peer_input.wait_recv()
 
         def gu_copy(panel, offset, buffers, sems):
-            bank = panel % 2
+            bank = panel % half
             return pltpu.make_async_copy(
                 shared_gu.at[:, pl.ds(offset + panel * 256, 256)],
                 buffers[bank],
                 sems[bank],
             )
 
-        gu_copy(0, 0, gate_buffers, gate_sems).start()
-        gu_copy(0, 3072, up_buffers, up_sems).start()
+        for panel in range(half - 1):
+            gu_copy(panel, 0, gate_buffers, gate_sems).start()
+            gu_copy(panel, 3072, up_buffers, up_sems).start()
         if rows == 256:
             latent_progress()
         for panel in range(12):
             if rows <= 128:
                 latent_progress()
-            bank = panel % 2
+            bank = panel % half
             gu_copy(panel, 0, gate_buffers, gate_sems).wait()
             gu_copy(panel, 3072, up_buffers, up_sems).wait()
-            if panel + 1 < 12:
-                gu_copy(panel + 1, 0, gate_buffers, gate_sems).start()
-                gu_copy(panel + 1, 3072, up_buffers, up_sems).start()
+            if panel + half - 1 < 12:
+                gu_copy(panel + half - 1, 0, gate_buffers, gate_sems).start()
+                gu_copy(panel + half - 1, 3072, up_buffers, up_sems).start()
             for row in (0, rows):
                 lhs = s["pair"][pl.ds(row, rows), :]
                 gate = jnp.matmul(
@@ -833,8 +849,8 @@ def _prologue(
         def down_copy(panel):
             return pltpu.make_async_copy(
                 shared_down.at[:, pl.ds(panel * 256, 256)],
-                s["down_buffers"][panel % 2],
-                s["down_sems"][panel % 2],
+                s["down_buffers"][panel % banks],
+                s["down_sems"][panel % banks],
             )
 
         def finish_reduction(pending):
@@ -846,17 +862,18 @@ def _prologue(
                 jnp.bfloat16
             )
 
-        down_copy(0).start()
+        for panel in range(banks - 1):
+            down_copy(panel).start()
         pending = None
         for panel in range(28):
             bank = panel % 2
             down_copy(panel).wait()
-            if panel + 1 < 28:
-                down_copy(panel + 1).start()
+            if panel + banks - 1 < 28:
+                down_copy(panel + banks - 1).start()
             for row in (0, rows):
                 product = jnp.matmul(
                     s["middle"][pl.ds(row, rows), :],
-                    s["down_buffers"][bank][...],
+                    s["down_buffers"][panel % banks][...],
                     preferred_element_type=jnp.float32,
                 )
                 metadata_progress()
@@ -892,10 +909,11 @@ def _prologue(
         pair=vmem((2 * rows, hidden_size), jnp.bfloat16),
         router=vmem((hidden_size, 896), jnp.bfloat16) if rows <= 128 else None,
         router_gu=vmem((hidden_size, 1024), jnp.bfloat16) if rows == 256 else None,
-        gu_buffers=tuple(vmem((hidden_size, 256), jnp.bfloat16) for _ in range(4))
+        gu_buffers=tuple(vmem((hidden_size, 256), jnp.bfloat16) for _ in range(2 * banks))
         if rows <= 128
         else (),
-        gu_sems=tuple(dma for _ in range(4)),
+        gu_sems=tuple(dma for _ in range(2 * banks)),
+        load_sems=(dma, dma),
         bias=vmem((1, 896), jnp.float32),
         input_sem=dma,
         peer_send=dma,
@@ -916,8 +934,8 @@ def _prologue(
         latent_credits=pltpu.SemaphoreType.REGULAR((12,)),
         latent_stores=dma((12,)) if rows <= 128 else dma,
         middle=vmem((2 * rows, 3072), jnp.bfloat16),
-        down_buffers=tuple(vmem((3072, 256), jnp.bfloat16) for _ in range(2)),
-        down_sems=(dma, dma),
+        down_buffers=tuple(vmem((3072, 256), jnp.bfloat16) for _ in range(banks)),
+        down_sems=tuple(dma for _ in range(banks)),
         partial=tuple(vmem((2 * rows, 256), jnp.float32) for _ in range(2)),
         peer_y=tuple(vmem((rows, 256), jnp.float32) for _ in range(2)),
         reduce_send=(dma, dma),
@@ -943,8 +961,14 @@ def _routed_experts(
     *,
     tokens,
     probabilities_ready,
+    slots=None,
 ):
-    """Joint GU/SiTU/first-down pipeline followed by remaining columns."""
+    """Joint GU/SiTU/first-down pipeline followed by remaining columns.
+
+    ``slots`` (HBM [columns, 32, rows, tn] BF16): reduce each column with one
+    direct send per owner instead of the ring (the one-shot reduce-scatter).
+    """
+    oneshot = slots is not None
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
@@ -1034,6 +1058,10 @@ def _routed_experts(
         rx,
         state,
         ring_meta,
+        os_send=None,
+        os_recv=None,
+        os_local=None,
+        os_gather=None,
     ):
         w = dataclasses.replace(
             w, weight=w.weight.at[layer[0]], scale=w.scale.at[layer[0]]
@@ -1074,6 +1102,13 @@ def _routed_experts(
         # Real-prompt tuning: short expert loops need all twelve streams per
         # poll; longer loops alternate six-stream groups to bound polling cost.
         def advance(stop, block, subtotal_vmem, *, drain=False, poll_round=0):
+            if oneshot:
+                if drain:
+                    _oneshot_finish(
+                        subtotal_vmem, slots, block, out.at[:, pl.ds(block * tn, tn)],
+                        os_send, os_recv, os_local, os_gather, rows=localrows,
+                    )
+                return
             _ready_reduce(
                 tables, subtotal_vmem, out.at[:, pl.ds(block * tn, tn)],
                 sends, receives, credits, stores, payload, rx,
@@ -1204,6 +1239,9 @@ def _routed_experts(
                 if not first:
                     advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
                     emit_subtotals(subtotal_vmem)
+                    if oneshot:
+                        _oneshot_start(subtotal_vmem, slots, n, os_send, os_recv, os_local,
+                                       rows=localrows)
                     state[0] = 0
 
                     @pl.when(n == width // tn - 1)
@@ -1347,6 +1385,8 @@ def _routed_experts(
         )
         def remaining_columns(subtotal_vmem):
             emit_subtotals(subtotal_vmem)
+            if oneshot:
+                _oneshot_start(subtotal_vmem, slots, 0, os_send, os_recv, os_local, rows=localrows)
             state[0] = 0
 
             def shifted(spec):
@@ -1385,6 +1425,20 @@ def _routed_experts(
             **scratch,
         )
 
+    ring_scratch = dict(
+        payload=pltpu.VMEM((localrows, tn), ring_dtype),
+        rx=pltpu.VMEM((2, localrows, tn), ring_dtype),
+    )
+    if oneshot:
+        chunk = min(localrows, 16 if tn > 896 else 32)
+        ring_scratch = dict(
+            payload=None,
+            rx=None,
+            os_send=pltpu.SemaphoreType.DMA((width // tn,)),
+            os_recv=pltpu.SemaphoreType.DMA((width // tn,)),
+            os_local=pltpu.SemaphoreType.DMA,
+            os_gather=pltpu.VMEM((32, chunk, tn), x.dtype),
+        )
     pl.run_scoped(
         run,
         metadata=k.MetadataRef(
@@ -1398,10 +1452,9 @@ def _routed_experts(
         receives=pltpu.SemaphoreType.DMA((2, streams)),
         credits=pltpu.SemaphoreType.REGULAR((streams,)),
         stores=pltpu.SemaphoreType.DMA,
-        payload=pltpu.VMEM((localrows, tn), ring_dtype),
-        rx=pltpu.VMEM((2, localrows, tn), ring_dtype),
         state=pltpu.SMEM((1 + 2 * streams,), jnp.int32),
         ring_meta=pltpu.SMEM((6 * 34,), jnp.int32),
+        **ring_scratch,
     )
 
 
@@ -1838,6 +1891,68 @@ def _ready_reduce(
                     sweep(group)
 
 
+def _oneshot_descriptor(subtotal, slots, column, send_sems, recv_sems, peer, *, rows):
+    rank = lax.axis_index("k3_sp")
+    return pltpu.make_async_remote_copy(
+        subtotal.at[pl.ds(peer * rows, rows), :],
+        slots.at[column, rank],
+        send_sems.at[column],
+        recv_sems.at[column],
+        device_id=peer,
+        device_id_type=pl.DeviceIdType.LOGICAL,
+    )
+
+
+def _oneshot_start(subtotal, slots, column, send_sems, recv_sems, local_sem, *, rows):
+    """Send every owner's rows of one column's BF16 subtotal straight to its slot.
+
+    Each rank owns slot [column, rank] on every peer, so no slot is written twice
+    in a layer; the call-entry barrier orders reuse across layers.
+    """
+    ranks = slots.shape[1]
+    rank = lax.axis_index("k3_sp")
+
+    @pl.loop(1, ranks)
+    def send(d):
+        peer = lax.rem(rank + d, ranks)
+        _oneshot_descriptor(subtotal, slots, column, send_sems, recv_sems, peer, rows=rows).start()
+
+    pltpu.make_async_copy(
+        subtotal.at[pl.ds(rank * rows, rows), :], slots.at[column, rank], local_sem
+    ).start()
+
+
+def _oneshot_finish(subtotal, slots, column, out, send_sems, recv_sems, local_sem, gather, *, rows):
+    """Wait for one column's 31 sends and receives, then sum the 32 slots in FP32.
+
+    Every owner sums the same 32 BF16 subtotals in rank order (exact inputs, one
+    FP32 accumulation), so the result does not depend on arrival order.
+    """
+    rank = lax.axis_index("k3_sp")
+    ranks = slots.shape[1]
+    descriptor = _oneshot_descriptor(subtotal, slots, column, send_sems, recv_sems, rank, rows=rows)
+
+    @pl.loop(1, ranks)
+    def wait(d):
+        descriptor.wait_send()
+        descriptor.wait_recv()
+
+    pltpu.make_async_copy(
+        subtotal.at[pl.ds(rank * rows, rows), :], slots.at[column, rank], local_sem
+    ).wait()
+    chunk = gather.shape[1]
+    for begin in range(0, rows, chunk):
+        copy = pltpu.make_async_copy(
+            slots.at[column, :, pl.ds(begin, chunk), :], gather, local_sem
+        )
+        copy.start()
+        copy.wait()
+        total = gather[0].astype(jnp.float32)
+        for r in range(1, ranks):
+            total = total + gather[r].astype(jnp.float32)
+        out.at[pl.ds(begin, chunk), :][...] = total.astype(out.dtype)
+
+
 def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
     """Normalize routed output and project up with three weight/prefix banks.
 
@@ -1964,6 +2079,7 @@ def _layer_kernel(
     fallback_shared=None,
     maximum=None,
     route_counts=None,
+    slots=None,
 ):
     """One launch owns all compute, metadata and communication on the fast path.
 
@@ -2082,6 +2198,7 @@ def _layer_kernel(
                 s["reduced"],
                 tokens=tokens,
                 probabilities_ready=probabilities_ready,
+                slots=slots,
             )
             _epilogue(
                 control, s["reduced"], s["shared"], norm, latent_up, prefix, output
@@ -2160,13 +2277,20 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         ]
         output_specs += [hbm] * 4 + [pl.BlockSpec()]
     counting = k._config().prefill_route_counts
-    body = _layer_kernel
+    oneshot = 0 < seq_len <= k._config().prefill_moe_oneshot_max
+    if oneshot:
+        tn = 1792 if seq_len < 8192 else 896
+        workspace_shapes += [((3584 // tn, 32, rows, tn), bf16)]
+        output_specs += [hbm]
     if counting:
         workspace_shapes += [((56,), jnp.int32)]
         output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
 
-        def body(*refs):
-            return _layer_kernel(*refs[:-1], route_counts=refs[-1])
+    def body(*refs):
+        refs = list(refs)
+        routes = refs.pop() if counting else None
+        slots = refs.pop() if oneshot else None
+        return _layer_kernel(*refs, route_counts=routes, slots=slots)
     kernel = pl.pallas_call(
         body,
         out_shape=tuple(jax.ShapeDtypeStruct(s, d) for s, d in workspace_shapes),
@@ -2214,6 +2338,8 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         if counting:
             *outputs, routes = outputs
             routes = routes[None]
+        if oneshot:
+            *outputs, _ = outputs
         if seq_len < 8192:
             return (outputs[0][None], routes) if counting else outputs[0][None]
         final, latent, _, ids, probs, counts, shared, maximum = outputs

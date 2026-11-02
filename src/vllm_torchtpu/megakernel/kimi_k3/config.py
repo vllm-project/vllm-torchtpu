@@ -95,6 +95,18 @@ class KernelConfig:
     prefill_fused_moe: bool = True
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
+    # Fused prefill MoE prologue (windows up to 4K): weight panels in flight
+    # per stream (banks - 1) for the latent and shared-expert projections.
+    prefill_moe_dma_banks: int = dataclasses.field(
+        default_factory=lambda: int(os.environ.get("K3_PREFILL_MOE_DMA_BANKS", "2"))
+    )
+    # Fused prefill MoE: windows up to this many tokens reduce each output
+    # column with one direct BF16 send per owner and an FP32 sum at the owner,
+    # instead of the 31-hop FP32 ring (0: always the ring). Faster only at
+    # 512/1024 on a 2x2x4 slice; from 2048 the direct sends lose to the ring.
+    prefill_moe_oneshot_max: int = dataclasses.field(
+        default_factory=lambda: int(os.environ.get("K3_PREFILL_MOE_ONESHOT_MAX", "0"))
+    )
     # Weight loading.
     read_streams: int = 4
     load_inflight_gb: float = 16.0
@@ -141,6 +153,8 @@ class KernelConfig:
             raise ValueError("fp8_wires holds t0 and/or t10")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
+        if self.prefill_moe_dma_banks not in (2, 3, 4):
+            raise ValueError("prefill_moe_dma_banks is 2, 3 or 4")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
             raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):
