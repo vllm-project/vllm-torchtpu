@@ -1089,6 +1089,11 @@ def test_context_parallel_moe_forward_matches_tp(mock_collectives) -> None:
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
+def _rank_scaled_query(attn, q, k, v, plan, rank):
+    """An attention stand-in that reads the rank tensor, as the real op does."""
+    return q * rank.to(q.dtype)
+
+
 def _trace_context_parallel_forward(monkeypatch, rank: int) -> Any:
     """Dynamo's graph of `_context_parallel_forward` on rank ``rank`` of 4, with
     collectives and attention that are the same on every rank and the vocab
@@ -1116,19 +1121,29 @@ def _trace_context_parallel_forward(monkeypatch, rank: int) -> Any:
         graphs.append(gm)
         return gm.forward
 
-    def forward(ids, pos, rank_tensor, rows):
-        return gemma4_patch._context_parallel_forward(
-            fake, ids, pos, plan, rank_tensor, rows, lambda a, q, k, v, p, r: q * 1
-        )
+    class Program(torch.nn.Module):
+        """The rank and its rows as Gemma4ContextParallelProgram holds them."""
 
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer(
+                "rank", torch.tensor([rank], dtype=torch.int32), persistent=False
+            )
+            self.register_buffer("rows", _rows(plan, rank), persistent=False)
+
+        def forward(self, ids: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+            return gemma4_patch._context_parallel_forward(
+                fake, ids, pos, plan, self.rank, self.rows, _rank_scaled_query
+            )
+
+    program = Program()
     ids = torch.randint(0, model.embedding.shape[0], (plan.num_tokens,))
     pos = torch.arange(plan.num_tokens)
     torch._dynamo.mark_dynamic(ids, 0)
     torch._dynamo.mark_dynamic(pos, 0)
     torch._dynamo.reset()
-    out = torch.compile(forward, backend=backend, fullgraph=True)(
-        ids, pos, torch.tensor([rank], dtype=torch.int32), _rows(plan, rank)
-    )
+    # As TorchCompileWithNoGuardsWrapper compiles a vLLM module's forward.
+    out = torch.compile(program.forward, backend=backend, fullgraph=True)(ids, pos)
     assert out.shape == (plan.num_tokens, model.hidden)
     return graphs[0], plan.num_tokens
 
@@ -1144,10 +1159,14 @@ def test_context_parallel_trace_keeps_the_bucket_symbolic(monkeypatch) -> None:
 
 
 def test_context_parallel_trace_is_the_same_on_every_rank(monkeypatch) -> None:
-    """The rank reaches the program only as tensors (collectives compiled into
-    the program assume every rank runs the same one)."""
+    """The rank reaches the program only through the module's buffers, which
+    Dynamo lifts to inputs (collectives compiled into the program assume every
+    rank runs the same one)."""
     graphs = [_trace_context_parallel_forward(monkeypatch, r)[0] for r in (0, 1, 3)]
     assert graphs[0].code == graphs[1].code == graphs[2].code
+    placeholders = [n.name for n in graphs[0].graph.nodes if n.op == "placeholder"]
+    assert any("buffers_rank" in n for n in placeholders), placeholders
+    assert any("buffers_rows" in n for n in placeholders), placeholders
 
 
 def _cp_config(**overrides: Any) -> SimpleNamespace:
