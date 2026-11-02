@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """VLLM_TPU_DECODE_PRIORITY=N:K: K throttled (decode-only) schedules after a
 step with >= N prefill tokens."""
 
@@ -63,7 +75,8 @@ def test_caller_throttle_is_kept(monkeypatch):
     monkeypatch.setenv("VLLM_TPU_DECODE_PRIORITY", "4096:3")
     decode_priority.patch_decode_priority()
     sched = types.SimpleNamespace(
-        vllm_config=types.SimpleNamespace(speculative_config=None), prefill_capacity_bound=False
+        vllm_config=types.SimpleNamespace(speculative_config=None),
+        prefill_capacity_bound=False,
     )
     Scheduler.schedule(sched, True)
     assert calls == [True]
@@ -77,16 +90,30 @@ def test_off_and_bad_values(monkeypatch):
     monkeypatch.setenv("VLLM_TPU_DECODE_PRIORITY", "4096:0")
     with pytest.raises(ValueError):
         decode_priority.patch_decode_priority()
+    monkeypatch.setattr(
+        Scheduler, "schedule", lambda self, throttle_prefills=False: None
+    )
+    monkeypatch.setenv("VLLM_TPU_DECODE_PRIORITY", "4096:2")
+    decode_priority.patch_decode_priority()
+    first = Scheduler.schedule
+    decode_priority.patch_decode_priority()
+    assert Scheduler.schedule is first
 
 
 def test_upstream_schedule_takes_throttle_prefills():
-    assert "throttle_prefills" in inspect.signature(inspect.unwrap(Scheduler.schedule)).parameters
+    assert (
+        "throttle_prefills"
+        in inspect.signature(inspect.unwrap(Scheduler.schedule)).parameters
+    )
 
 
 def _req(prompt, computed, out, max_tokens, arrival=0.0):
     return types.SimpleNamespace(
-        num_prompt_tokens=prompt, num_computed_tokens=computed, num_output_tokens=out,
-        max_tokens=max_tokens, arrival_time=arrival,
+        num_prompt_tokens=prompt,
+        num_computed_tokens=computed,
+        num_output_tokens=out,
+        max_tokens=max_tokens,
+        arrival_time=arrival,
     )
 
 
@@ -105,7 +132,9 @@ def _run_sched(monkeypatch, flag, steps, running=(), waiting=()):
         vllm_config=types.SimpleNamespace(
             speculative_config=types.SimpleNamespace(num_speculative_tokens=3)
         ),
-        prefill_capacity_bound=True, running=list(running), waiting=list(waiting),
+        prefill_capacity_bound=True,
+        running=list(running),
+        waiting=list(waiting),
     )
     for _ in steps:
         Scheduler.schedule(sched)
@@ -121,14 +150,19 @@ def test_scaled_window(monkeypatch):
 
 def test_protect_holds_prefill_for_near_done_decode(monkeypatch):
     import time as _t
+
     now = _t.time()
-    near = _req(100, 120, 20, 24)            # 4 tokens left
+    near = _req(100, 120, 20, 24)  # 4 tokens left
     far = _req(100, 101, 1, 500)
-    partial = _req(9000, 4096, 0, 50, now)   # prefill in progress
+    partial = _req(9000, 4096, 0, 50, now)  # prefill in progress
     small = {**DEC, "p": 1000}
-    calls = _run_sched(monkeypatch, "100000:1:protect=8:hold=2", [DEC, DEC, small, DEC, DEC, DEC],
-                       running=[near, far, partial])
-    # hold=2, then a chunk runs and resets the hold, then hold again for 2 steps
+    calls = _run_sched(
+        monkeypatch,
+        "100000:1:protect=8:hold=2",
+        [DEC, DEC, small, DEC, DEC, DEC],
+        running=[near, far, partial],
+    )
+    # hold=2, then a chunk runs and resets the hold, then hold again.
     assert calls == [True, True, False, True, True, False]
 
 
@@ -140,10 +174,16 @@ def test_protect_needs_prefill_work(monkeypatch):
 
 def test_deadline_releases_window(monkeypatch):
     import time as _t
+
     old = _req(9000, 0, 0, 50, _t.time() - 10.0)  # waited 10 s
     big = {**DEC, "p": 8192}
-    calls = _run_sched(monkeypatch, "512:4:deadline=5000", [big, DEC, DEC],
-                       running=[_req(100, 101, 1, 500)], waiting=[old])
+    calls = _run_sched(
+        monkeypatch,
+        "512:4:deadline=5000",
+        [big, DEC, DEC],
+        running=[_req(100, 101, 1, 500)],
+        waiting=[old],
+    )
     assert calls == [False, False, False]
 
 
@@ -157,6 +197,20 @@ def test_option_errors(monkeypatch):
 def test_min_decodes_gates_the_window(monkeypatch):
     big = {**DEC, "p": 8192}
     one = [_req(100, 101, 1, 500)]
-    assert _run_sched(monkeypatch, "512:2:minb=2", [big, DEC, DEC], running=one) == [False] * 3
+    assert (
+        _run_sched(monkeypatch, "512:2:minb=2", [big, DEC, DEC], running=one)
+        == [False] * 3
+    )
     two = [_req(100, 101, 1, 500), _req(100, 101, 1, 500)]
-    assert _run_sched(monkeypatch, "512:2:minb=2", [big, DEC, DEC], running=two) == [False, True, True]
+    assert _run_sched(monkeypatch, "512:2:minb=2", [big, DEC, DEC], running=two) == [
+        False,
+        True,
+        True,
+    ]
+
+
+def test_env_var_skips_compile_cache():
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    assert "VLLM_TPU_DECODE_PRIORITY" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    assert "VLLM_TPU_DECODE_PRIORITY" not in tpu_compiler._tpu_compile_env_factors()

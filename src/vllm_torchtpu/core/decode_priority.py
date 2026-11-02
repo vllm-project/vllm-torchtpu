@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Decode priority after a large prefill step (VLLM_TPU_DECODE_PRIORITY).
 
 At c32 the p90-interactivity requests spend ~57% of their decode window inside
@@ -34,9 +46,9 @@ size (1 + speculative tokens). Deferral is skipped when nothing is decoding
 import dataclasses
 import functools
 import math
-import os
 import time
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -59,7 +71,7 @@ class _Config:
 
 
 def _parse() -> _Config | None:
-    raw = os.environ.get("VLLM_TPU_DECODE_PRIORITY", "").strip()
+    raw = envs.VLLM_TPU_DECODE_PRIORITY
     if not raw:
         return None
     parts = raw.split(":")
@@ -67,7 +79,8 @@ def _parse() -> _Config | None:
         n, k = int(parts[0]), int(parts[1])
         opts = dict(p.split("=", 1) for p in parts[2:])
         cfg = _Config(
-            n, k,
+            n,
+            k,
             scale=int(opts.pop("scale", 0)),
             protect=int(opts.pop("protect", 0)),
             hold=int(opts.pop("hold", 8)),
@@ -75,10 +88,14 @@ def _parse() -> _Config | None:
             min_decodes=int(opts.pop("minb", 0)),
         )
     except (IndexError, ValueError) as e:
-        raise ValueError(f"VLLM_TPU_DECODE_PRIORITY={raw!r}: want N:K[:opt=val...]") from e
+        raise ValueError(
+            f"VLLM_TPU_DECODE_PRIORITY={raw!r}: want N:K[:opt=val...]"
+        ) from e
     if n <= 0 or k <= 0 or opts or cfg.hold <= 0:
-        raise ValueError(f"VLLM_TPU_DECODE_PRIORITY={raw!r}: want N:K with N, K > 0 and "
-                         "options scale/protect/hold/deadline/minb")
+        raise ValueError(
+            f"VLLM_TPU_DECODE_PRIORITY={raw!r}: want N:K with N, K > 0 and "
+            "options scale/protect/hold/deadline/minb"
+        )
     return cfg
 
 
@@ -130,8 +147,8 @@ def patch_decode_priority() -> None:
             self._tpu_decode_only_left = 0
         if defer:
             throttle_prefills = True
-            # vLLM releases deferral when the waiting queue outgrows the deferred
-            # set (DP capacity rule); here the window is the whole point.
+            # vLLM releases deferral when the waiting queue outgrows the
+            # deferred set (DP capacity rule); here the window is the point.
             self.prefill_capacity_bound = False
         out = original(self, throttle_prefills)
         if left <= 0:
@@ -139,7 +156,8 @@ def patch_decode_priority() -> None:
             decode = 1 + (spec.num_speculative_tokens if spec is not None else 0)
             prefill = sum(n for n in out.num_scheduled_tokens.values() if n > decode)
             if prefill > 0:
-                self._tpu_protect_held = 0  # a chunk ran: the next near-done request may hold again
+                # A chunk ran: the next near-done request may hold again.
+                self._tpu_protect_held = 0
             if prefill >= cfg.threshold and (
                 not cfg.min_decodes
                 or sum(1 for r in self.running if _is_decoding(r)) >= cfg.min_decodes
@@ -147,13 +165,16 @@ def patch_decode_priority() -> None:
                 self._tpu_decode_only_left = cfg.window_for(prefill)
                 n = getattr(self, "_tpu_decode_windows", 0) + 1
                 self._tpu_decode_windows = n
-                if n in (1, 1000, 10000):  # path proof in the engine-core process
+                if n in (1, 1000, 10000):  # path proof in engine-core process
                     logger.info(
-                        "Decode priority: window %d opened after %d prefill tokens (%d steps)",
-                        n, prefill, self._tpu_decode_only_left,
+                        "Decode priority: window %d opened after %d prefill "
+                        "tokens (%d steps)",
+                        n,
+                        prefill,
+                        self._tpu_decode_only_left,
                     )
         return out
 
-    schedule._tpu_decode_priority = True
+    schedule.__dict__["_tpu_decode_priority"] = True
     Scheduler.schedule = schedule
     logger.info("Decode priority: %s", cfg)
