@@ -34,6 +34,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     flat_manager_ids,
@@ -377,10 +378,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._create_conv1d()
-        # `_require_pcp_projection_parameters` hands this weight straight to
-        # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
-        if hasattr(self, "in_proj_qkvz"):
-            setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].
@@ -397,6 +394,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
+        self._keep_qkvz_layout(pcp_enabled)
         self.gdn_pcp_op = (
             self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
         )
@@ -405,6 +403,29 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             if pcp_enabled
             else None
         )
+
+    def _keep_qkvz_layout(self, pcp_enabled: bool) -> None:
+        """Keep `in_proj_qkvz` in vLLM's [n_out, n_in] layout unless
+        TPU_GDN_QKVZ_KERNEL_LAYOUT asks for the (k, n) layout without PCP.
+
+        The pooled PCP op hands this weight straight to
+        `fused_qkvz_projection_pcp_gdn` (`_require_pcp_projection_parameters`),
+        which validates it as [n_out, n_in], so PCP always keeps it. Without
+        PCP nothing reads it raw, and the flag lets it take the (k, n) layout
+        like every other linear: the kept layout costs the per-block FP8 path
+        (gmm_v2) a full weight copy every step, ~11 ms of a ~110 ms decode step
+        for a model with 69 GDN layers at hidden size 8,192.
+        """
+        if not hasattr(self, "in_proj_qkvz"):
+            return
+        if envs.TPU_GDN_QKVZ_KERNEL_LAYOUT:
+            if not pcp_enabled:
+                return
+            logger.warning_once(
+                "TPU_GDN_QKVZ_KERNEL_LAYOUT is ignored with prefill context "
+                "parallelism: its pooled op reads in_proj_qkvz as [n_out, n_in]."
+            )
+        setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
 
     def set_block_major_pool(
         self, pool_index: int, layout: BlockMajorPoolLayout

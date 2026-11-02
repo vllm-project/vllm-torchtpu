@@ -1587,3 +1587,31 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
     assert re.fullmatch(rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"])
     assert captured["kernel_pool_shape"] == kernel_pool_shape
     assert tuple(new_pool.shape) == tuple(pool.shape)
+
+
+@pytest.mark.parametrize(
+    "flag, pcp_enabled, keeps_layout",
+    [
+        (None, False, True),
+        (None, True, True),
+        ("1", False, False),
+        ("1", True, True),
+    ],
+)
+def test_qkvz_layout_follows_the_flag_except_under_pcp(
+    monkeypatch, flag, pcp_enabled, keeps_layout
+):
+    """in_proj_qkvz keeps vLLM's [n_out, n_in] layout by default. With
+    TPU_GDN_QKVZ_KERNEL_LAYOUT it flips to (k, n) like every other linear,
+    except under PCP, whose pooled op reads the weight raw."""
+    from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+
+    if flag is None:
+        monkeypatch.delenv("TPU_GDN_QKVZ_KERNEL_LAYOUT", raising=False)
+    else:
+        monkeypatch.setenv("TPU_GDN_QKVZ_KERNEL_LAYOUT", flag)
+    attn = object.__new__(VllmGatedDeltaNetAttention)
+    torch.nn.Module.__init__(attn)
+    attn.in_proj_qkvz = torch.nn.Linear(4, 8)
+    VllmGatedDeltaNetAttention._keep_qkvz_layout(attn, pcp_enabled)
+    assert getattr(attn.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, False) == keeps_layout
