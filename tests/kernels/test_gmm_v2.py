@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     Dimensions,
@@ -521,10 +522,7 @@ def test_gmm_v2_mxfp4_sparse_decode_fused_situ_matches_reference():
 def test_calculate_tiling_scales_bucket_base_with_group_density(monkeypatch):
     monkeypatch.setattr(
         "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
-        lambda: SimpleNamespace(
-            mxu_column_size=256,
-            num_lanes=128,
-        ),
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
     )
     lhs_bf16 = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
     lhs_fp8 = InputConfigs(
@@ -566,9 +564,11 @@ def test_calculate_tiling_scales_bucket_base_with_group_density(monkeypatch):
         )
         return calculate_tiling(dims, lhs_cfgs, rhs_cfgs, limit, fuse_act=fuse_act)
 
-    # Sparse decode batches (< 24 rows/group, bf16 LHS) use {16, 32, 48, 64}.
-    assert (_tiles_for(64).bucket_base, _tiles_for(64).tile_m) == (16, 64)
-    assert (_tiles_for(1024).bucket_base, _tiles_for(1024).tile_m) == (16, 64)
+    # TPU v7x sparse decode batches (< 24 rows/group, bf16 LHS) use {16, 32, 48, 64}.
+    t_m64 = _tiles_for(64)
+    assert (t_m64.bucket_base, t_m64.tile_m) == (16, 64)
+    t_m1024 = _tiles_for(1024)
+    assert (t_m1024.bucket_base, t_m1024.tile_m) == (16, 64)
     t_g96_m2048 = _tiles_for(2048, size_group=96)
     assert (t_g96_m2048.bucket_base, t_g96_m2048.tile_m) == (16, 64)
     # EP-sharded group_sizes (size_lhs_group=128 > size_group=16) uses size_lhs_group.
@@ -589,9 +589,10 @@ def test_calculate_tiling_scales_bucket_base_with_group_density(monkeypatch):
     t_dense = _tiles_for(64, size_group=1)
     assert (t_dense.bucket_base, t_dense.tile_m) == (64, 64)
 
-    # Multi-k tiling caps max_num_buckets at 1 so tile_m == bucket_base.
-    t_multi_k = _tiles_for(
-        16384, size_k=16384, size_n=640, limit=8 * 1024 * 1024, fuse_act=None
+    # Unvalidated generations (e.g. v6e) keep the 64-row bucket_base.
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V6E, 1),
     )
-    assert t_multi_k.tile_k < 16384
-    assert t_multi_k.tile_m == t_multi_k.bucket_base
+    t_v6e = _tiles_for(1024)
+    assert (t_v6e.bucket_base, t_v6e.tile_m) == (64, 256)

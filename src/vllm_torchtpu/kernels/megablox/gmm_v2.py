@@ -919,6 +919,14 @@ def kernel_main(
         zero_out_end(out_ref, cast(jax.Array, semaphore_ref), zero_size, dims=cfgs.dims)
 
 
+# Chosen from a TPU v7x rows-per-group sweep across sparse bf16-LHS MoE shapes:
+# below 24 rows/group on average (`size_m < 24 * size_lhs_group`), groups are
+# pad-dominated under a 64-row `bucket_base` and starting at `size_lhs_sublane`
+# cuts row padding; at >= 24 rows/group, hot experts regularly exceed 64 rows
+# and keeping `{64, 128, 192, 256}` avoids splitting them across extra M tiles.
+_SPARSE_BF16_LHS_MAX_ROWS_PER_GROUP = 24
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -933,6 +941,7 @@ def calculate_tiling(
 
     lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
+    tpu_info = pltpu.get_tpu_info()
 
     # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
     # safe to use for most scenarios. But if lower bitwidth is used, we need
@@ -943,20 +952,24 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m // rhs_mod
     if lhs_cfgs.should_quantize:
         tile_m *= 2
-    elif dims.size_group > 1 and dims.size_m < 24 * dims.size_lhs_group:
-        # For sparse multi-group decode batches where LHS stays in bf16
-        # (e.g. subchannel weight-only quantization with < 24 rows/group on
-        # average across size_lhs_group), start bucket_base at the LHS sublane
-        # size (16) so the 4-bucket ladder {16, 32, 48, 64} avoids padding small
-        # expert groups up to 64-row multiples. Dense/prefill batches (>= 24
-        # rows/group) and single-group calls keep the full 64-row bucket_base so
-        # skewed hot experts do not split across extra M tiles.
+    elif (
+        tpu_info.generation == 7
+        and dims.size_group > 1
+        and dims.size_m < _SPARSE_BF16_LHS_MAX_ROWS_PER_GROUP * dims.size_lhs_group
+    ):
+        # For TPU v7x sparse multi-group decode batches where LHS stays in bf16
+        # (e.g. subchannel weight-only quantization below
+        # `_SPARSE_BF16_LHS_MAX_ROWS_PER_GROUP` rows/group across
+        # `size_lhs_group`), start `bucket_base` at the LHS sublane size so the
+        # 4-bucket ladder avoids padding small expert groups up to 64-row
+        # multiples. Denser/prefill batches, single-group calls, and unvalidated
+        # generations keep the 64-row `bucket_base`.
         tile_m = min(tile_m, dims.size_lhs_sublane)
     tile_m = min(tile_m, dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.
-    tile_n_limit = pltpu.get_tpu_info().mxu_column_size * 2
+    tile_n_limit = tpu_info.mxu_column_size * 2
     tile_n_limit = min(tile_n_limit, dims.size_n)
 
     size_n_per_rhs = dims.size_n
@@ -974,7 +987,7 @@ def calculate_tiling(
 
     # Initialize tile_k and tile_n to their maximum valid values.
     num_k_tiles = num_n_tiles = 1
-    num_lanes = pltpu.get_tpu_info().num_lanes
+    num_lanes = tpu_info.num_lanes
     tile_k = align_to(dims.size_k, num_lanes)
     tile_n = align_to(size_n_per_rhs, num_lanes)
 
@@ -1049,9 +1062,7 @@ def calculate_tiling(
 
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
-    # Keep a single bucket when contraction is split across k tiles so partial
-    # row buckets below tile_m never cross k-tile accumulation boundaries.
-    max_num_buckets = 1 if num_k_tiles > 1 else 4
+    max_num_buckets = 4
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
