@@ -124,6 +124,24 @@ def test_candidate_blocks_keep_ties_within_the_documented_bound():
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+def test_candidate_blocks_match_full_vocab_beyond_the_tie_bound():
+    # 19 distinct logits plus 200 ties at the 20th value, one per block: far
+    # more blocks than num_blocks hold the 20th value, and top-p 0.9 cuts
+    # inside the tie group, so top-p needs the ties outside the candidates.
+    num_blocks, k = 40, 20
+    logits = torch.full((1, 128 * 400), -5.0)
+    for i in range(k - 1):
+        logits[0, 128 * i] = 10.0 + 0.25 * i
+    for j in range(200):
+        logits[0, 128 * (k - 1 + j) + 7] = 9.75
+    top_k = torch.tensor([[k]], dtype=torch.int32)
+    for p in (1.0, 0.95, 0.9):
+        top_p = torch.tensor([[p]])
+        expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
+        result = sampling.apply_top_k_top_p_candidates(logits, top_k, top_p, num_blocks)
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
 def test_candidate_blocks_leave_rows_without_top_k_unmasked():
     gen = torch.Generator().manual_seed(1)
     logits = torch.randn(3, 128 * 50, generator=gen)

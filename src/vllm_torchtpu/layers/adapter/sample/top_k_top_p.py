@@ -268,15 +268,18 @@ def apply_top_k_top_p_candidates(
     top_p: torch.Tensor,
     num_blocks: int,
 ) -> torch.Tensor:
-    """Applies top-k then top-p using only the blocks with the largest maxima.
+    """Applies top-k then top-p, searching the blocks with the largest maxima.
 
-    Splits the vocab into blocks of CANDIDATE_BLOCK logits, runs
-    `apply_top_k_top_p` on the `num_blocks` blocks with the largest maxima,
-    and masks the full row below the smallest kept logit. Matches
-    `apply_top_k_top_p` unless more than `num_blocks - k + 1` logits tie at
-    the k-th largest value; float32 sums run in a different order, so a top-p
-    boundary within rounding can flip. Caller must ensure active rows have
-    1 <= top_k <= num_blocks // 2; rows with top_k <= 0 (padded slots) are
+    Splits the vocab into blocks of CANDIDATE_BLOCK logits and takes the k-th
+    largest logit from the `num_blocks` blocks with the largest maxima; with
+    top_k <= num_blocks these blocks hold every logit above it and at least
+    one equal to it, so the top-k mask is the full-vocab one, ties included.
+    Top-p then runs `topp_mask`'s full-row softmax and mass sums, but
+    searches only the kept probabilities (at most top_k distinct values, all
+    inside the candidate blocks) instead of every float32, in
+    log2(num_blocks + 1) sums instead of 32. The result matches
+    `apply_top_k_top_p` bit for bit. Caller must ensure active rows have
+    1 <= top_k <= num_blocks; rows with top_k <= 0 (padded slots) are
     returned unmasked.
 
     Args:
@@ -298,16 +301,42 @@ def apply_top_k_top_p_candidates(
             "rows with top_k <= 0 would skip top_p. Use apply_top_k_top_p."
         )
     rows, vocab_size = logits.shape
-    blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
+    num_vocab_blocks = vocab_size // CANDIDATE_BLOCK
+    blocks = logits.reshape(rows, num_vocab_blocks, CANDIDATE_BLOCK)
     block_max = blocks.amax(dim=-1)
     block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
-    candidates = torch.gather(
-        blocks, 1, block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
-    ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
-    kept = apply_top_k_top_p(candidates, top_k, top_p) > MASKED_LOGIT_VALUE
-    inf = torch.full_like(candidates, float("inf"))
-    cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
-    masked = torch.where(
-        logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
-    )
+    block_ids = block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
+    candidates = torch.gather(blocks, 1, block_ids).reshape(rows, -1)
+    top_values = torch.topk(candidates, num_blocks, dim=-1).values
+    kth = torch.gather(top_values, 1, (top_k.clamp(1, num_blocks) - 1).long())
+    replace_tensor = torch.full_like(logits, MASKED_LOGIT_VALUE)
+    topk_masked = torch.where(logits >= kth, logits, replace_tensor)
+    masked_logits = torch.where(top_k > 0, topk_masked, logits)
+
+    # topp_mask's threshold is the largest kept probability whose mass sum
+    # reaches p, so search the kept probabilities, largest first, with the
+    # same full-row sums; past the last one, keep everything as topp_mask does.
+    p = top_p.squeeze(-1)
+    probs = torch.softmax(masked_logits, dim=-1)
+    zero_val = torch.zeros_like(probs)
+    candidate_probs = torch.gather(
+        probs.reshape(rows, num_vocab_blocks, CANDIDATE_BLOCK), 1, block_ids
+    ).reshape(rows, -1)
+    levels = torch.topk(candidate_probs, num_blocks, dim=-1).values.to(torch.float32)
+    levels = torch.cat([levels, torch.full_like(levels[:, :1], float("-inf"))], -1)
+    lo = torch.zeros((rows, 1), dtype=torch.int64, device=logits.device)
+    hi = torch.full_like(lo, num_blocks)
+    for _ in range(num_blocks.bit_length()):
+        mid = (lo + hi) // 2
+        threshold = torch.gather(levels, 1, mid)
+        probability_mass = torch.sum(
+            torch.where(probs >= threshold, probs, zero_val),
+            dim=-1,
+        )
+        below_p = (probability_mass < p).unsqueeze(-1)
+        hi = torch.where(below_p, hi, mid)
+        lo = torch.where(below_p, torch.minimum(mid + 1, hi), lo)
+    threshold = torch.gather(levels, 1, lo)
+    topp_masked = torch.where(probs >= threshold, masked_logits, replace_tensor)
+    masked = torch.where(top_p < 1.0, topp_masked, masked_logits)
     return torch.where(top_k > 0, masked, logits)
