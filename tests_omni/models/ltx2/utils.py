@@ -160,25 +160,24 @@ LTX2_GOLDEN_EXTRA_ARGS = {
     "video_rescale_scale": 0.7,
     "audio_rescale_scale": 0.7,
 }
-# Metric -> (min, max) for TPU output vs the CPU fp32 golden. Three TPU v7x runs
-# were bitwise identical: video MAE 0.0077, SSIM 0.9903, mean shift 0.0045, HF
-# ratio 1.015, motion ratio 0.964, audio log-spectrogram L1 0.563, RMS ratio
-# 1.092. MAE, 1 - SSIM and log-spectrogram L1 allow 2x that error, mean shift
-# +0.015. Must-fail goldens (seed 43, 3 steps, another prompt, CFG-only
-# guidance) fail on MAE (>= 0.0237), SSIM (<= 0.926) and the RMS ratio.
+LTX2_GOLDEN_STEPS = 40
+# Metric -> (min, max), TPU bf16 vs the TPU fp32 golden. Observed (bitwise
+# identical on two images): MAE 0.0229, SSIM 0.9271, mean shift 0.0044,
+# log-spectrogram L1 0.313. MAE, 1 - SSIM and log-spectrogram L1 allow 2x,
+# mean shift +0.015. Caught: 30 steps (SSIM 0.849), another prompt, other seeds.
 LTX2_GOLDEN_LIMITS = {
-    "video_mae": (0.0, 0.0155),
-    "video_ssim": (0.980, 1.0),
-    "video_mean_shift": (0.0, 0.0195),
+    "video_mae": (0.0, 0.046),
+    "video_ssim": (0.854, 1.0),
+    "video_mean_shift": (0.0, 0.020),
     "video_hf_ratio": (0.70, 1.40),
     "video_motion_ratio": (0.80, 1.40),
-    "audio_logspec_l1": (0.0, 1.13),
+    "audio_logspec_l1": (0.0, 0.63),
     "audio_rms_ratio": (0.75, 1.35),
 }
 
 
 def get_ltx2_golden_path() -> Path:
-    """Path of the CPU fp32 golden for ``LTX2_GOLDEN_VARIANT``.
+    """Path of the TPU fp32 golden for ``LTX2_GOLDEN_VARIANT``.
 
     CI stages gs://tpu-commons-ci/golden/ into $HF_HOME/golden, so the default
     directory is $HF_HOME/golden/ltx2. Set LTX2_GOLDEN_DIR to override it.
@@ -186,7 +185,10 @@ def get_ltx2_golden_path() -> Path:
     golden_dir = os.environ.get("LTX2_GOLDEN_DIR") or os.path.join(
         os.environ.get("HF_HOME", "/local_hf_cache"), "golden", "ltx2"
     )
-    return Path(golden_dir) / f"ltx2_t2v_{LTX2_GOLDEN_VARIANT}_cpu_golden.npz"
+    return (
+        Path(golden_dir)
+        / f"ltx2_t2v_{LTX2_GOLDEN_VARIANT}_{LTX2_GOLDEN_STEPS}step_tpu_fp32_golden.npz"
+    )
 
 
 def load_and_verify_ltx2_golden() -> tuple[np.ndarray, np.ndarray]:
@@ -209,7 +211,7 @@ def load_and_verify_ltx2_golden() -> tuple[np.ndarray, np.ndarray]:
         "width": LTX2_DEFAULT_WIDTH,
         "num_frames": LTX2_DEFAULT_FRAMES,
         "frame_rate": LTX2_DEFAULT_FRAME_RATE,
-        "steps": LTX2_DEFAULT_STEPS,
+        "steps": LTX2_GOLDEN_STEPS,
     }
     for key, expected_val in expected_meta.items():
         assert meta[key] == expected_val, (
@@ -229,8 +231,8 @@ def compare_ltx2_to_golden(
     ratios of high-frequency energy (mean absolute Laplacian: drops with blur,
     rises with noise) and of motion (mean absolute frame-to-frame difference).
     Audio (float32 [2, N]): mean absolute log-spectrogram difference and RMS
-    ratio. Waveform metrics are not used: bf16 alone (CPU bf16 vs CPU fp32)
-    moves the waveform by rel-L2 ~1.0 (cosine ~0.4) at 2 steps.
+    ratio. No waveform metrics: bf16 alone drops the waveform cosine vs fp32 to
+    0.70-0.89.
     """
     assert out.video.shape == golden_video.shape, (out.video.shape, golden_video.shape)
     assert out.audio.shape == golden_audio.shape, (out.audio.shape, golden_audio.shape)
