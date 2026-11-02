@@ -1035,7 +1035,7 @@ def _routed_experts(
     direct send per owner instead of the ring (the one-shot reduce-scatter).
     """
     oneshot = slots is not None
-    columns = 1792 if tokens < 8192 else 896
+    columns = _down_columns(tokens)
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
     gu_unroll = 4 if tokens < 8192 else 8
@@ -1047,7 +1047,7 @@ def _routed_experts(
     rows, width = (metadata_row_capacity or x.shape[0], rhs.shape[-1])
     assert rows <= x.shape[0]
     tm, tn, localrows = (tile, columns, tokens // 32)
-    packed_half = 512 if tokens == 8192 else tn // 2
+    packed_half = 512 if tn == 896 else tn // 2
     assert width % tn == 0
     limit = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.98)
     cfg = k.make_gmm_configs(
@@ -1962,6 +1962,13 @@ def _ready_reduce(
                     sweep(group)
 
 
+def _down_columns(tokens):
+    """Routed down/reduce column width: 896 at 8K, and from
+    prefill_moe_cols4_min tokens (2K/4K; four ring columns), else 1792."""
+    low = k._config().prefill_moe_cols4_min
+    return 896 if tokens == 8192 or (low and 2048 <= low <= tokens) else 1792
+
+
 def _oneshot_descriptor(subtotal, slots, column, send_sems, recv_sems, peer, *, rows):
     rank = lax.axis_index("k3_sp")
     return pltpu.make_async_remote_copy(
@@ -2003,26 +2010,22 @@ def _oneshot_finish(subtotal, slots, column, out, send_sems, recv_sems, local_se
     ranks = slots.shape[1]
     descriptor = _oneshot_descriptor(subtotal, slots, column, send_sems, recv_sems, rank, rows=rows)
 
-    @pl.loop(1, ranks)
-    def wait(d):
-        descriptor.wait_send()
-        descriptor.wait_recv()
+    with jax.named_scope("os_wait"):
+        @pl.loop(1, ranks)
+        def wait(d):
+            descriptor.wait_send()
+            descriptor.wait_recv()
 
     pltpu.make_async_copy(
         subtotal.at[pl.ds(rank * rows, rows), :], slots.at[column, rank], local_sem
     ).wait()
     chunk = gather.shape[1]
     for begin in range(0, rows, chunk):
-        copies = [
-            pltpu.make_async_copy(
-                slots.at[column, r, pl.ds(begin, chunk), :], gather.at[r], local_sem
-            )
-            for r in range(ranks)
-        ]
-        for copy in copies:
-            copy.start()
-        for copy in copies:
-            copy.wait()
+        copy = pltpu.make_async_copy(
+            slots.at[column, :, pl.ds(begin, chunk), :], gather, local_sem
+        )
+        copy.start()
+        copy.wait()
         total = gather[0].astype(jnp.float32)
         for r in range(1, ranks):
             total = total + gather[r].astype(jnp.float32)
@@ -2362,7 +2365,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     counting = k._config().prefill_route_counts
     oneshot = 0 < seq_len <= k._config().prefill_moe_oneshot_max
     if oneshot:
-        tn = 1792 if seq_len < 8192 else 896
+        tn = _down_columns(seq_len)
         workspace_shapes += [((3584 // tn, 32, rows, tn), bf16)]
         output_specs += [hbm]
     if counting:

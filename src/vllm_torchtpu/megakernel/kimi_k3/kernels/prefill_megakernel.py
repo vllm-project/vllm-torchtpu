@@ -1458,12 +1458,9 @@ def _project_oneshot_kernel(x_ref, w_ref, o_ref, partial_ref, slots, weights, tm
     width = gather.shape[2]
     for col in range(0, o_ref.shape[1], width):
         cols = pl.ds(col, width)
-        copies = [pltpu.make_async_copy(slots.at[r, :, cols], gather.at[r], local_sem)
-                  for r in range(n)]
-        for copy in copies:
-            copy.start()
-        for copy in copies:
-            copy.wait()
+        copy = pltpu.make_async_copy(slots.at[:, :, cols], gather, local_sem)
+        copy.start()
+        copy.wait()
         total = gather[0].astype(jnp.float32)
         for r in range(1, n):
             total = total + gather[r].astype(jnp.float32)
@@ -5779,12 +5776,9 @@ def _kda_oneshot_reduce(tables_ref, length_ref, partial_ref, prefix_ref, output_
         token_owner = tables_ref[0, 2, rank]
         for col in range(0, partial_ref.shape[1], width):
             cols = pl.ds(col, width)
-            copies = [pltpu.make_async_copy(slots.at[r, :, cols], gather.at[r], local)
-                      for r in range(n)]
-            for copy in copies:
-                copy.start()
-            for copy in copies:
-                copy.wait()
+            copy = pltpu.make_async_copy(slots.at[:, :, cols], gather, local)
+            copy.start()
+            copy.wait()
             total = gather[0].astype(jnp.float32)
             for r in range(1, n):
                 total = total + gather[r].astype(jnp.float32)
