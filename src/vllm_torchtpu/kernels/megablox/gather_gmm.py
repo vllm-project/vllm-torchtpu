@@ -185,9 +185,10 @@ def gather_fused_moe_vmem_bytes(
     output row tiles, and the body's live values (gate_up accumulator, one
     activation block in BF16 and FP8, the intermediate in BF16 and FP8, and an
     F32 down-projection block), which the compiler places in the same memory.
-    At hidden 2816 and tile_m 640 it is 0.7 to 1.7 MiB above the smallest
-    vmem_limit_bytes the kernel compiles under on tpu7x (intermediates 384,
-    768 and 1536).
+    Calibrated at tile_m 640 against the smallest vmem_limit_bytes the kernel
+    compiles under on tpu7x: 0.7 to 1.7 MiB above it at hidden 2816
+    (intermediates 384, 768, 1536) and 0.6 to 1.1 MiB at hidden 4096 (512,
+    1024). Recheck it before relying on it far from those shapes.
     """
     s = packed_sublanes(hidden)
     row_bytes = LANES * 4
