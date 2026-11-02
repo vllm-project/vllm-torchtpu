@@ -2263,11 +2263,11 @@ class TPUModelRunner(GPUModelRunner):
                 for block_copy in copies
             ]
             mgr_pairs = self._pad_to_bucket(mgr_pairs, pad=(0, 0))
-            mgr_src_t = torch.tensor([s for s, _ in mgr_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            mgr_src_t = stage_h2d_upload(
+                self, torch.tensor([s for s, _ in mgr_pairs], dtype=torch.long)
             )
-            mgr_dst_t = torch.tensor([d for _, d in mgr_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            mgr_dst_t = stage_h2d_upload(
+                self, torch.tensor([d for _, d in mgr_pairs], dtype=torch.long)
             )
             _rollback_offsets_migrate(read_offsets, mgr_src_t, mgr_dst_t)
 
@@ -2278,11 +2278,11 @@ class TPUModelRunner(GPUModelRunner):
             for j in range(split)
         ]
         pairs = self._pad_to_bucket(pairs, pad=(0, 0))
-        src_t = torch.tensor([src for src, _ in pairs], dtype=torch.int32).to(
-            self.device, non_blocking=True
+        src_t = stage_h2d_upload(
+            self, torch.tensor([src for src, _ in pairs], dtype=torch.int32)
         )
-        dst_t = torch.tensor([dst for _, dst in pairs], dtype=torch.int32).to(
-            self.device, non_blocking=True
+        dst_t = stage_h2d_upload(
+            self, torch.tensor([dst for _, dst in pairs], dtype=torch.int32)
         )
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
 
@@ -2353,11 +2353,11 @@ class TPUModelRunner(GPUModelRunner):
                 for j in range(split)
             ]
             pairs = self._pad_to_bucket(pairs, pad=(0, 0))
-            src_t = torch.tensor([s for s, _ in pairs], dtype=torch.int32).to(
-                self.device, non_blocking=True
+            src_t = stage_h2d_upload(
+                self, torch.tensor([s for s, _ in pairs], dtype=torch.int32)
             )
-            dst_t = torch.tensor([d for _, d in pairs], dtype=torch.int32).to(
-                self.device, non_blocking=True
+            dst_t = stage_h2d_upload(
+                self, torch.tensor([d for _, d in pairs], dtype=torch.int32)
             )
             copy_pool_blocks(pools, src_t, dst_t)
 

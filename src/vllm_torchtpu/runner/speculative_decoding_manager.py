@@ -10,6 +10,7 @@ import torch
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+from vllm_torchtpu.layers.core.attention_metadata import stage_h2d_upload
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 if TYPE_CHECKING:
@@ -297,8 +298,8 @@ class SpeculativeDecodingManager:
                 draft_token_ids=(
                     None
                     if defer_draft_token_ids
-                    else torch.from_numpy(padded_draft_token_ids).to(
-                        self.runner.device, non_blocking=True
+                    else stage_h2d_upload(
+                        self.runner, torch.from_numpy(padded_draft_token_ids)
                     )
                 ),
                 draft_lengths=self._meta_cache.draft_lengths,
@@ -400,35 +401,32 @@ class SpeculativeDecodingManager:
         padded_group_indices = np.zeros(padded_logits_length, dtype=np.int32)
         padded_group_indices[: group_indices.shape[0]] = group_indices
 
-        # CPU -> TPU copy.
-        device = self.runner.device
-
         metadata = SpecDecodeMetadata(
             draft_token_ids=(
                 None
                 if defer_draft_token_ids
-                else torch.from_numpy(padded_draft_token_ids).to(
-                    device, non_blocking=True
+                else stage_h2d_upload(
+                    self.runner, torch.from_numpy(padded_draft_token_ids)
                 )
             ),
-            draft_lengths=torch.from_numpy(padded_num_draft_tokens).to(
-                device, non_blocking=True
+            draft_lengths=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_num_draft_tokens)
             ),
             draft_lengths_cpu=num_draft_tokens,
-            target_logits_indices=torch.from_numpy(padded_target_logits_indices).to(
-                device, non_blocking=True
+            target_logits_indices=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_target_logits_indices)
             ),
-            bonus_logits_indices=torch.from_numpy(padded_bonus_logits_indices).to(
-                device, non_blocking=True
+            bonus_logits_indices=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_bonus_logits_indices)
             ),
-            final_logits_indices=torch.from_numpy(padded_logits_indices).to(
-                device, non_blocking=True
+            final_logits_indices=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_logits_indices)
             ),
-            segment_ids=torch.from_numpy(padded_segment_ids).to(
-                device, non_blocking=True
+            segment_ids=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_segment_ids)
             ),
-            group_indices=torch.from_numpy(padded_group_indices).to(
-                device, non_blocking=True
+            group_indices=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_group_indices)
             ),
             deferred_draft_token_ids_cpu=(
                 padded_draft_token_ids if defer_draft_token_ids else None
