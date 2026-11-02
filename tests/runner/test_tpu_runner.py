@@ -3652,3 +3652,41 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def test_decode_metadata_cache_hit_updates_request_distribution_cpu():
+    from runner_input_test_utils import (
+        _make_runner,
+        _scheduler_output,
+    )
+
+    runner = _make_runner(
+        num_computed_tokens=[10, 10, 10, 10],
+        prompt_tokens=[10, 10, 10, 10],
+        scheduled_tokens=[1, 1, 1, 1],
+        token_paddings=[4, 8, 16],
+        max_num_reqs=4,
+        pcp_size=1,
+    )
+    scheduler_output = _scheduler_output([1, 1, 1, 1])
+
+    # First call: cache miss, initializes cache and sets distribution.
+    TPUModelRunner._prepare_inputs(
+        runner, scheduler_output, start_index=0, num_decode_reqs=4
+    )
+    assert torch.equal(
+        runner._request_distribution_cpu,
+        torch.tensor([4, 4, 4], dtype=torch.int32),
+    )
+
+    # Simulate stale CPU request distribution from intervening prefill/mixed step.
+    runner._request_distribution_cpu.copy_(torch.tensor([0, 0, 4], dtype=torch.int32))
+
+    # Second call: cache hit. Must refresh _request_distribution_cpu to [4, 4, 4].
+    TPUModelRunner._prepare_inputs(
+        runner, scheduler_output, start_index=0, num_decode_reqs=4
+    )
+    assert torch.equal(
+        runner._request_distribution_cpu,
+        torch.tensor([4, 4, 4], dtype=torch.int32),
+    )

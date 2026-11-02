@@ -3328,6 +3328,28 @@ class TPUModelRunner(GPUModelRunner):
             and layout_plan.logits_indices_cpu is None
         )
 
+        # For the V3 kernel, request_distribution is
+        # [decode_end, prefill_end, mixed_end]. We put decode requests first,
+        # no dedicated prefill-only bucket, and all remaining requests in
+        # mixed mode.
+        chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+        # [decode_end, static-q verify end, mixed_end]; the middle
+        # segment is empty unless static-q verify windows are present
+        # (see _init_speculative_decoding).
+        chunk_static_verify_end = max(
+            chunk_num_decode,
+            min(
+                num_decode_reqs
+                + getattr(self, "_num_static_verify_reqs", 0)
+                - start_index,
+                num_reqs,
+            ),
+        )
+        if self.mamba_slot_read_offsets is None:
+            self._request_distribution_cpu[0] = chunk_num_decode
+            self._request_distribution_cpu[1] = chunk_static_verify_end
+            self._request_distribution_cpu[2] = num_reqs
+
         if (
             can_cache_decode_metadata
             and decode_cache_key == self._decode_device_cache_key
@@ -3363,27 +3385,7 @@ class TPUModelRunner(GPUModelRunner):
                     self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
                 ).to(self.device, non_blocking=True)
 
-            # For the V3 kernel, request_distribution is
-            # [decode_end, prefill_end, mixed_end]. We put decode requests first,
-            # no dedicated prefill-only bucket, and all remaining requests in
-            # mixed mode.
-            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
-            # [decode_end, static-q verify end, mixed_end]; the middle
-            # segment is empty unless static-q verify windows are present
-            # (see _init_speculative_decoding).
-            chunk_static_verify_end = max(
-                chunk_num_decode,
-                min(
-                    num_decode_reqs
-                    + getattr(self, "_num_static_verify_reqs", 0)
-                    - start_index,
-                    num_reqs,
-                ),
-            )
             if self.mamba_slot_read_offsets is None:
-                self._request_distribution_cpu[0] = chunk_num_decode
-                self._request_distribution_cpu[1] = chunk_static_verify_end
-                self._request_distribution_cpu[2] = num_reqs
                 request_distribution = self._request_distribution_cpu.to(
                     self.device, non_blocking=True
                 )
