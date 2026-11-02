@@ -1012,6 +1012,40 @@ def _adapter_without_model(cfg: api.TextOnlyLLMExportConfig) -> Any:
     return adapter
 
 
+@pytest.mark.parametrize("tp", [1, 4])
+def test_greedy_tokens_match_the_argmax_of_the_gathered_logits(tp: int) -> None:
+    """Each rank's shard maximum, gathered, names the full argmax, ties included."""
+    shard = 5
+    vocab = shard * tp
+    full = torch.zeros(4, vocab, dtype=torch.bfloat16)
+    full[0, vocab - 1] = 3  # the maximum in the last shard
+    full[1, [vocab - 2, 1]] = 2  # tied across shards (at tp > 1): the lower index wins
+    full[2, [vocab - 3, vocab - 1]] = 1  # tied within a shard
+    full[3] = -1  # every logit negative and equal
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=shard * tp, num_partitions=tp
+    )
+
+    def greedy(rank: int, gather: Any) -> torch.Tensor:
+        adapter = _adapter_without_model(cfg)
+        adapter._local_logits = lambda h, w: full[:, rank * shard : (rank + 1) * shard]
+        with mock.patch(
+            "vllm.distributed.tensor_model_parallel_all_gather", side_effect=gather
+        ):
+            return adapter.greedy_tokens(torch.zeros(4, 1), torch.zeros(1))
+
+    # Record what each rank contributes to each gather, then gather it.
+    sent: list[list[torch.Tensor]] = []
+    for rank in range(tp):
+        sent.append([])
+        greedy(rank, lambda t, dim=-1, out=sent[-1]: out.append(t) or t.repeat(1, tp))
+    for rank in range(tp):
+        gathered = [torch.cat(ts, dim=-1) for ts in zip(*sent)]
+        tokens = greedy(rank, gathered)
+        assert tokens.dtype == torch.int32
+        assert torch.equal(tokens, full.argmax(dim=-1).to(torch.int32))
+
+
 def test_fit_num_blocks_to_hbm_fills_the_budget_with_exported_kv_blocks() -> None:
     from vllm_torchtpu import utils
 
