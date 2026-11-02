@@ -277,14 +277,14 @@ def calculate_block_sizes(
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
     decode_query_size: int = 1,
-    sliding_decode_max_bkv: int | None = None,
+    cap_sliding_decode_block: bool = False,
     sliding_prefill_max_bkv: int | None = None,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
     """Calculate optimal block size for decode and prefill.
 
-    `sliding_decode_max_bkv` caps the decode KV block of a sliding-window layer.
-    The VMEM-filling default grows it far past the window, and every decode
-    launch zero-fills and computes all lanes of that block.
+    `cap_sliding_decode_block` stops the decode KV block of a sliding-window
+    layer at half the window. The VMEM-filling default grows it far past the
+    window, and every decode launch zero-fills and computes all lanes of it.
 
     `sliding_prefill_max_bkv` caps the prefill KV (and query) block of a
     sliding-window layer. Blocks start at multiples of bkv, so a query block
@@ -541,8 +541,10 @@ def calculate_block_sizes(
     prefill_batch_size = 2
 
     decode_max_bkv_sz = _MAX_BKV_SZ
-    if model_cfgs.sliding_window is not None and sliding_decode_max_bkv is not None:
-        decode_max_bkv_sz = min(decode_max_bkv_sz, sliding_decode_max_bkv)
+    if cap_sliding_decode_block and model_cfgs.sliding_window is not None:
+        # The window then spans at most three blocks; never below the first
+        # block size the search starts from.
+        decode_max_bkv_sz = min(decode_max_bkv_sz, model_cfgs.sliding_window // 2)
     decode_block_sizes = find_best_block_sizes(
         decode_batch_size, decode_query_size, decode_max_bkv_sz
     )
@@ -662,7 +664,7 @@ def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
         "return_lse",
         "mask_invalid_v",
         "skip_empty_launch",
-        "sliding_decode_max_bkv",
+        "cap_sliding_decode_block",
         "sliding_prefill_max_bkv",
         "fp8_compute",
     ),
@@ -709,7 +711,7 @@ def ragged_paged_attention(
     return_lse: bool = False,
     mask_invalid_v: bool | None = None,
     skip_empty_launch: bool = False,
-    sliding_decode_max_bkv: int | None = None,
+    cap_sliding_decode_block: bool = False,
     sliding_prefill_max_bkv: int | None = None,
     fp8_compute: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
@@ -779,8 +781,9 @@ def ragged_paged_attention(
             decode_query_size tokens an XLA conditional skips the launch of the
             kernel whose segment of `distribution` is empty. Outputs are
             identical either way.
-        sliding_decode_max_bkv: Largest default decode KV block (tokens) when
-            `sliding_window` is set. None keeps the VMEM-filling default.
+        cap_sliding_decode_block: If True and `sliding_window` is set, the
+            default decode KV block grows to at most half the window instead
+            of filling VMEM.
         sliding_prefill_max_bkv: Largest default mixed-kernel KV and query block
             (tokens) when `sliding_window` is set. None keeps the VMEM-filling
             default.
@@ -895,7 +898,7 @@ def ragged_paged_attention(
         serve_cfgs,
         vmem_limit_bytes,
         decode_query_size=decode_query_size,
-        sliding_decode_max_bkv=sliding_decode_max_bkv,
+        cap_sliding_decode_block=cap_sliding_decode_block,
         sliding_prefill_max_bkv=sliding_prefill_max_bkv,
     )
 
