@@ -490,34 +490,37 @@ def main():
         )
 
     h = HEADS // dcp
-    q_sharded = _global(
-        shd, q.reshape(T, dcp, h, -1).transpose(1, 0, 2, 3).reshape(dcp * T, h, -1)
-    )
+    q_heads = q.reshape(T, dcp, h, -1).transpose(1, 0, 2, 3).reshape(dcp * T, h, -1)
+    q_sharded = _global(shd, q_heads)
     flat_dev = _global(shd, flat)
     tp_attn = jax.jit(
-        lambda n, r, qq, kc, kp, ft, *m: tp.sparse_mla_attention(
+        lambda n, r, qn, qp, kc, kp, ft, *m: tp.sparse_mla_attention(
             lay,
             mesh,
             AXIS,
             n,
             r,
-            qq,
+            qn,
+            qp,
             kc,
             kp,
             ft,
             *m,
             write_kv=write_kv,
             attend=attend,
-            q_replicated=a.q_replicated,
+            q_own_rows=a.q_replicated,
             read_pages=READ_PAGES,
         )
     )
-    q_tp = _global(NamedSharding(mesh, P()), q) if a.q_replicated else q_sharded
+    # Query replication: every head of each rank's rows S + j * R + [0, R)
+    # (zero past T); otherwise each rank's heads of every row.
+    q_tp = np.concatenate([q, np.zeros_like(q[:S])])[S:] if a.q_replicated else q_heads
+    q_tp = (_global(shd, q_tp[..., :LKV]), _global(shd, q_tp[..., LKV:]))
     t_tp_attn, (_, _, out_tp) = _timeit(
         tp_attn,
         nope0,
         rope0,
-        q_tp,
+        *q_tp,
         lat_c,
         pe_c,
         flat_dev,
@@ -845,7 +848,7 @@ def main():
         # told apart by their module names.
         with jax.profiler.trace(a.trace_dir):
             for fn, args in (
-                (tp_attn, (nope0, rope0, q_tp, lat_c, pe_c, flat_dev, *meta)),
+                (tp_attn, (nope0, rope0, *q_tp, lat_c, pe_c, flat_dev, *meta)),
                 (tp_index, (icache, q_idx_g, w_idx_g, *meta)),
                 (
                     jax.jit(dcp_attn_fn),
@@ -867,18 +870,19 @@ def main():
             check_vma=False,
         )
     )(q_sharded)
+    q_tok = jax.jit(lambda x: (x[..., :LKV], x[..., LKV:]))(q_tok)
     kernel_only = jax.jit(
         jax.shard_map(
-            lambda qq, gn, gr, ft: attend(
-                qq, gn, gr, tp.restride_flat_rows(lay, ft, cap), jnp.int32(rows)
+            lambda qn, qp, gn, gr, ft: attend(
+                qn, qp, gn, gr, tp.restride_flat_rows(lay, ft, cap), jnp.int32(rows)
             ),
             mesh=mesh,
-            in_specs=(P(AXIS),) * 4,
+            in_specs=(P(AXIS),) * 5,
             out_specs=P(AXIS),
             check_vma=False,
         )
     )
-    t_kernel, _ = _timeit(kernel_only, q_tok, g_nope, g_rope, flat_dev, iters=a.iters)
+    t_kernel, _ = _timeit(kernel_only, *q_tok, g_nope, g_rope, flat_dev, iters=a.iters)
     results.update(tp_kernel_only_ms=t_kernel)
     results.update(
         tp_attention_ms=t_tp_attn,

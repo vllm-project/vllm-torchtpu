@@ -199,12 +199,19 @@ def make_attend(
     """The single-device sparse MLA kernel as the split's `attend`: one ragged
     "request" of `num_rows` rows; with no page table the kernel reads the
     top-k as flat rows of the gathered buffer. Exact softmax over the row's
-    whole top-k, so no log-sum-exp is returned."""
+    whole top-k, so no log-sum-exp is returned. Under TPU_MLA_SPARSE_SPLIT_Q
+    the kernel joins q_nope and q_pe in VMEM, as on the DCP path, instead of
+    reading a concatenated query padded to a lane multiple."""
     from vllm_torchtpu.layers.core.attention_interface import sparse_mla_chunk_kwargs
 
     packed = {"packed_rope": True} if packed_rope else {}
+    split_q = envs.TPU_MLA_SPARSE_SPLIT_Q
 
-    def attend(q, g_nope, g_rope, topk, num_rows):
+    def attend(q_nope, q_pe, g_nope, g_rope, topk, num_rows):
+        if split_q:
+            q, split = q_nope, {"q_pe": q_pe}
+        else:
+            q, split = jnp.concatenate([q_nope, q_pe], axis=-1), {}
         out = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             g_nope,
@@ -218,6 +225,7 @@ def make_attend(
             cache_layout=cache_layout,
             **sparse_mla_chunk_kwargs(),
             **packed,
+            **split,
         )
         return out[..., :lkv_dim]
 
@@ -284,13 +292,13 @@ def build_attention_op(
     layout: dcp_token_parallel.TokenParallelLayout,
     q_replicated: bool,
 ):
-    """The token-parallel sparse MLA op of `layer`: `(kv_cache, q, kv_c_normed,
-    k_pe, flat_topk, seq_lens, block_tables, query_start_loc,
+    """The token-parallel sparse MLA op of `layer`: `(kv_cache, ql_nope, q_pe,
+    kv_c_normed, k_pe, flat_topk, seq_lens, block_tables, query_start_loc,
     request_distribution) -> [T, heads, kv_lora_rank]`, row `i` being step row
-    `split_rows + i`. `q` is this rank's heads of every row, latent nope and
-    rope concatenated -- or, with `q_replicated` (query replication), every
-    head of this rank's own rows (`q_rows`); the op writes every row's
-    latents into the caches."""
+    `split_rows + i`. `ql_nope` / `q_pe` (latent nope and rope query parts)
+    hold this rank's heads of every row -- or, with `q_replicated` (query
+    replication), every head of this rank's own rows (`q_rows`); the op
+    writes every row's latents into the caches."""
     mesh = impl._dcp_mesh
     assert mesh is not None
     dcp, il = impl.dcp_size, impl.dcp_interleave_size
@@ -305,7 +313,8 @@ def build_attention_op(
     def _run(
         kv_cache_nope: jax.Array,
         kv_cache_rope: jax.Array,
-        q: jax.Array,
+        ql_nope: jax.Array,
+        q_pe: jax.Array,
         kv_c_normed: jax.Array,
         k_pe: jax.Array,
         flat_topk: jax.Array,
@@ -358,7 +367,8 @@ def build_attention_op(
             DCP_AXIS_NAME,
             kv_cache_nope,
             kv_cache_rope,
-            q,
+            ql_nope,
+            q_pe,
             kv_c_normed,
             k_pe,
             flat_topk,
@@ -382,7 +392,8 @@ def build_attention_op(
     def sparse_mla_tp(
         kv_cache_nope: jax.Array,
         kv_cache_rope: jax.Array,
-        q: jax.Array,
+        ql_nope: jax.Array,
+        q_pe: jax.Array,
         kv_c_normed: jax.Array,
         k_pe: jax.Array,
         flat_topk: jax.Array,
@@ -395,7 +406,8 @@ def build_attention_op(
         return _run(
             kv_cache_nope,
             kv_cache_rope,
-            q,
+            ql_nope,
+            q_pe,
             kv_c_normed,
             k_pe,
             flat_topk,
@@ -410,7 +422,8 @@ def build_attention_op(
     def sparse_mla_tp_rank(
         kv_cache_nope: jax.Array,
         kv_cache_rope: jax.Array,
-        q: jax.Array,
+        ql_nope: jax.Array,
+        q_pe: jax.Array,
         kv_c_normed: jax.Array,
         k_pe: jax.Array,
         flat_topk: jax.Array,
@@ -424,7 +437,8 @@ def build_attention_op(
         return _run(
             kv_cache_nope,
             kv_cache_rope,
-            q,
+            ql_nope,
+            q_pe,
             kv_c_normed,
             k_pe,
             flat_topk,
@@ -437,7 +451,7 @@ def build_attention_op(
         )
 
     sharded, rep = P(DCP_AXIS_NAME), P()
-    in_specs = (sharded, sharded, sharded, rep, rep, sharded, rep, rep, rep, rep)
+    in_specs = (sharded,) * 4 + (rep, rep, sharded, rep, rep, rep, rep)
     in_specs += (sharded,)
     if rank_tensor is not None:
         in_specs += (sharded,)
@@ -452,19 +466,22 @@ def build_attention_op(
     )
     num_heads, kv_lora_rank = layer.num_heads, layer.kv_lora_rank
 
-    def _fake(kv_cache_nope, kv_cache_rope, q, kv_c_normed, *rest, **kwargs):
-        del rest, kwargs
+    def _fake(
+        kv_cache_nope, kv_cache_rope, ql_nope, q_pe, kv_c_normed, *rest, **kwargs
+    ):
+        del q_pe, rest, kwargs
         return (
             torch.empty_like(kv_cache_nope),
             torch.empty_like(kv_cache_rope),
-            q.new_empty((kv_c_normed.shape[0], num_heads, kv_lora_rank)),
+            ql_nope.new_empty((kv_c_normed.shape[0], num_heads, kv_lora_rank)),
         )
 
     op.register_fake(_fake)
 
     def run(
         kv_cache: tuple[torch.Tensor, torch.Tensor],
-        q: torch.Tensor,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         flat_topk: torch.Tensor,
@@ -478,7 +495,8 @@ def build_attention_op(
         new_nope, new_rope, out = op(
             nope_cache,
             rope_cache,
-            q,
+            ql_nope,
+            q_pe,
             kv_c_normed,
             k_pe,
             flat_topk,
@@ -574,10 +592,10 @@ def attention(
     )
     # The token-parallel op rewrites the caches in place; it must not start
     # before the sub-batch has read them (`_after_reads`).
-    q_tp = torch.cat([ql_nope, q_pe], dim=-1)
     tail = tp_op(
         kv_cache,
-        q_tp[s:] if q_replicated else q_tp,
+        ql_nope[s:] if q_replicated else ql_nope,
+        q_pe[s:] if q_replicated else q_pe,
         kv_c_normed,
         k_pe,
         topk_rows[s : s + rows],

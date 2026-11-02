@@ -411,8 +411,11 @@ def tokens_to_heads(y: jax.Array, axis_name: str) -> jax.Array:
     return lax.all_to_all(y, axis_name, 1, 0, tiled=True)
 
 
-# (q [R, H, D], nope buffer, rope buffer, flat top-k [R, K], real rows) -> [R, H, L]
-AttendFn = Callable[[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array], jax.Array]
+# (q_nope [R, H, L], q_pe [R, H, P], nope buffer, rope buffer, flat top-k [R, K],
+#  real rows) -> [R, H, L]
+AttendFn = Callable[
+    [jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array], jax.Array
+]
 # (nope, rope, kv_c, k_pe, seq_lens, block_tables, query_start_loc, rank) -> caches
 WriteKVFn = Callable[..., tuple[jax.Array, jax.Array]]
 # (q [R, h, d], weights [R, h], natural cache, RankRows, page table) -> positions
@@ -431,7 +434,8 @@ def sparse_mla_attention(
     axis_name: str,
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
-    q: jax.Array,
+    q_nope: jax.Array,
+    q_pe: jax.Array,
     kv_c_normed: jax.Array,
     k_pe: jax.Array,
     flat_topk: jax.Array,
@@ -450,9 +454,10 @@ def sparse_mla_attention(
 
     Args:
       kv_cache_nope, kv_cache_rope: position shards over `axis_name`.
-      q: `[dcp * T, h, D]`, each rank's `[T, h, D]` head slice of every row
-        (latent nope and rope concatenated); with `q_own_rows`, `[dcp * R, H,
-        D]`, every head of each rank's own rows (no all-to-all needed).
+      q_nope, q_pe: the latent nope and rope parts of the queries, `[dcp * T,
+        h, L]` and `[dcp * T, h, P]`: each rank's head slice of every row; with
+        `q_own_rows`, `[dcp * R, H, *]`, every head of each rank's own rows (no
+        all-to-all needed).
       kv_c_normed, k_pe: this step's latents, replicated; `write_kv` writes
         every row this rank owns before anything is gathered.
       flat_topk: `[dcp * R, K]`, each rank's rows' top-k as flat buffer rows
@@ -469,7 +474,9 @@ def sparse_mla_attention(
     sharded = P(axis_name)
     rep = P()
 
-    def _local(nope, rope, q, kv_c, k_pe, topk, seq_lens, bt, qsl, dist, *rank_ids):
+    def _local(
+        nope, rope, q_nope, q_pe, kv_c, k_pe, topk, seq_lens, bt, qsl, dist, *rank_ids
+    ):
         rank = _rank(rank_ids, axis_name, dcp)
         nope, rope = write_kv(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank)
         # Hand the cap switch below the caches in their own shapes. Otherwise
@@ -480,7 +487,9 @@ def sparse_mla_attention(
         nope, rope = lax.optimization_barrier((nope, rope))
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
         page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
-        q_tok = q if q_own_rows else heads_to_tokens(layout, q, axis_name)
+        if not q_own_rows:
+            q_nope = heads_to_tokens(layout, q_nope, axis_name)
+            q_pe = heads_to_tokens(layout, q_pe, axis_name)
         rr = rank_rows(layout, rank, kv_c.shape[0], seq_lens, qsl, dist[2])
 
         # Gather and attend at the step's page count: the kernel reads a
@@ -491,7 +500,7 @@ def sparse_mla_attention(
                     nope, rope, page_ids[:cap], axis_name, read_pages
                 )
                 flat = restride_flat_rows(layout, topk, cap)
-                return attend(q_tok, g_nope, g_rope, flat, rr.num_rows)
+                return attend(q_nope, q_pe, g_nope, g_rope, flat, rr.num_rows)
 
             return run
 
@@ -502,14 +511,16 @@ def sparse_mla_attention(
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded, sharded, sharded, rep, rep, sharded, rep, rep, rep, rep)
+        in_specs=(sharded,) * 4
+        + (rep, rep, sharded, rep, rep, rep, rep)
         + (sharded,) * len(extra),
         out_specs=(sharded, sharded, sharded),
         check_vma=False,
     )(
         kv_cache_nope,
         kv_cache_rope,
-        q,
+        q_nope,
+        q_pe,
         kv_c_normed,
         k_pe,
         flat_topk,

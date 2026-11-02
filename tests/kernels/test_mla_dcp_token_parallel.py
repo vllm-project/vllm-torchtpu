@@ -198,13 +198,13 @@ def _attend_rows(q, keys_nope, keys_rope, valid):
     return jnp.einsum("rhk,rkd->rhd", p, keys_nope)
 
 
-def _attend_ref(q, g_nope, g_rope, topk, num_rows):
+def _attend_ref(q_nope, q_pe, g_nope, g_rope, topk, num_rows):
     valid = topk >= 0
     idx = jnp.where(valid, topk, 0)
     kn = g_nope.reshape(-1, DN)[idx]
     kr = g_rope.reshape(-1, ROPE_PER_ROW, DR)[idx // ROPE_PER_ROW, idx % ROPE_PER_ROW]
-    out = _attend_rows(q[..., : DN + DR], kn, kr, valid)
-    real = jnp.arange(q.shape[0]) < num_rows
+    out = _attend_rows(jnp.concatenate([q_nope, q_pe], axis=-1), kn, kr, valid)
+    real = jnp.arange(q_nope.shape[0]) < num_rows
     return jnp.where(real[:, None, None], out, 0.0)
 
 
@@ -265,7 +265,8 @@ def test_sparse_mla_attention_matches_natural_reference(dcp, q_own_rows):
     )(
         jnp.asarray(st.nope_cache),
         jnp.asarray(st.rope_cache),
-        jnp.asarray(q_in),
+        jnp.asarray(q_in[..., :DN]),
+        jnp.asarray(q_in[..., DN:]),
         jnp.asarray(st.kv_c),
         jnp.asarray(st.k_pe),
         jnp.asarray(topk_flat.reshape(dcp * per, TOPK)),
