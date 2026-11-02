@@ -32,7 +32,9 @@ layer, the pages the next decode's window reaches, which the ranks holding
 them send.
 
 Positions past the prompt's length are padding. Causality keeps them out of
-every real query's keys, and the cache writes skip their pages.
+every real query's keys, and the cache writes skip their pages. A sliding-window
+layer's earlier pages are left unwritten, so the cache blocks of such a prompt
+must not be reused through prefix caching.
 
 A rank is a Python int or a traced scalar (`jax.lax.axis_index` under
 `shard_map`). This module holds the page arithmetic; moving pages between ranks
@@ -40,10 +42,14 @@ is the caller's.
 """
 
 import dataclasses
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils, wrapper
 
@@ -268,6 +274,9 @@ def cp_prefill_attention(
 
     Returns:
         [2 * piece_tokens, num_q_heads, head_dim] attention output.
+
+    `ragged_paged_attention` donates its cache argument, so outside a jit this
+    consumes `kv_pages`.
     """
     cu_q_lens, kv_lens, distribution = plan.sub_request_metadata(rank)
     tables = jnp.broadcast_to(jnp.asarray(page_tables), (2, plan.num_pages))
@@ -339,33 +348,91 @@ def cache_pages_from_slots(slots: jax.Array, kv_layout: configs.KVLayout) -> jax
     return slots.reshape(num_pages, page_size, aligned // packing, packing, head_dim)
 
 
+def _copy_page_kernel(_count_ref, _src_ref, _dst_ref, page_ref, _cache_ref, out_ref):
+    out_ref[...] = page_ref[...]
+
+
 def write_kv_pages(
-    kv_cache: jax.Array, pages: jax.Array, dst_pages: jax.Array
+    kv_cache: jax.Array,
+    pages: jax.Array,
+    src_pages: jax.Array,
+    dst_pages: jax.Array,
+    count: jax.Array,
 ) -> jax.Array:
-    """kv_cache[dst_pages[i]] = pages[i]; an index past the cache drops page i."""
-    return kv_cache.at[dst_pages].set(pages, mode="drop")
+    """kv_cache[dst_pages[i]] = pages[src_pages[i]] for i < count (count >= 1).
+
+    A Pallas copy into the aliased cache, so it costs the pages written; an XLA
+    scatter would rewrite the whole cache. Steps past `count` repeat the last
+    page, which re-fetches and writes back nothing.
+    """
+    block = (1, *kv_cache.shape[1:])
+    rest = (0,) * (kv_cache.ndim - 1)
+
+    def step(i, count_ref):
+        return jnp.maximum(jnp.minimum(i, count_ref[0] - 1), 0)
+
+    def page_index(i, count_ref, src_ref, dst_ref):
+        return (src_ref[step(i, count_ref)], *rest)
+
+    def cache_index(i, count_ref, src_ref, dst_ref):
+        return (dst_ref[step(i, count_ref)], *rest)
+
+    return pl.pallas_call(
+        _copy_page_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(dst_pages.shape[0],),
+            in_specs=[
+                pl.BlockSpec(block, page_index),
+                # Aliased with the output and never read.
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(block, cache_index),
+        ),
+        out_shape=jax.ShapeDtypeStruct(kv_cache.shape, kv_cache.dtype),
+        input_output_aliases={4: 0},
+    )(
+        jnp.reshape(count, (1,)).astype(jnp.int32),
+        src_pages.astype(jnp.int32),
+        dst_pages.astype(jnp.int32),
+        pages,
+        kv_cache,
+    )
 
 
-def full_attention_dst_pages(
-    plan: ZigzagPlan, block_table: jax.Array, seq_len: jax.Array, num_cache_pages: int
-) -> jax.Array:
-    """Cache page of each all-gather page under the request's `block_table`;
-    `num_cache_pages` (dropped by `write_kv_pages`) for pages past `seq_len`."""
-    position_pages = plan.gathered_position_pages()
-    dst = jnp.take(block_table, position_pages, mode="clip")
-    return jnp.where(position_pages * plan.page_size < seq_len, dst, num_cache_pages)
+def full_attention_page_writes(
+    plan: ZigzagPlan, block_table: jax.Array, seq_len: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`write_kv_pages` (src, dst, count) that cache every all-gather page of a
+    position below `seq_len` under the request's `block_table`."""
+    src = jnp.asarray(plan.gathered_page_table())
+    dst = jnp.take(block_table, jnp.arange(plan.num_pages), mode="clip")
+    count = jnp.minimum(
+        utils.align_to(seq_len, plan.page_size) // plan.page_size, plan.num_pages
+    )
+    return src, dst, count
 
 
 def window_position_pages(
     seq_len: jax.Array, sliding_window: int, page_size: int
 ) -> tuple[jax.Array, jax.Array]:
-    """(position pages, valid) that the window of the token after a
-    `seq_len`-token prompt reaches; a fixed count of
-    `num_halo_pages(sliding_window, page_size) + 1` pages."""
-    count = num_halo_pages(sliding_window, page_size) + 1
+    """(position pages, count): the first `count` of the
+    `num_halo_pages(sliding_window, page_size) + 1` position pages are those the
+    window of the token after a `seq_len`-token prompt reaches."""
+    num = num_halo_pages(sliding_window, page_size) + 1
     first = jnp.maximum(seq_len - (sliding_window - 1), 0) // page_size
-    pages = first + jnp.arange(count, dtype=jnp.int32)
-    return pages, pages * page_size < seq_len
+    pages = first + jnp.arange(num, dtype=jnp.int32)
+    last = utils.align_to(seq_len, page_size) // page_size
+    return pages, jnp.minimum(last - first, num)
+
+
+def window_page_writes(
+    block_table: jax.Array, position_pages: jax.Array, count: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`write_kv_pages` (src, dst, count) that cache the window pages
+    (`window_position_pages`, in that order) under the request's `block_table`."""
+    src = jnp.arange(position_pages.shape[0], dtype=jnp.int32)
+    return src, jnp.take(block_table, position_pages, mode="clip"), count
 
 
 def window_slots_for_ranks(
@@ -376,14 +443,10 @@ def window_slots_for_ranks(
     num_kv_heads: int,
 ) -> jax.Array:
     """What this rank sends each rank in an all-to-all of the window: per
-    destination, the K/V slots of the destination's KV heads (`tp_kv_heads`,
-    no replication) in the window pages this rank holds; the other pages carry
-    nothing (`window_slots_from_ranks` takes each page from its holder).
+    destination, the K/V slots of the destination's `tp_kv_heads` in the window
+    pages this rank holds; the other pages carry nothing
+    (`window_slots_from_ranks` takes each page from its holder).
     [world, len(position_pages), page_size, 2 * heads per rank, d]."""
-    if num_kv_heads % plan.world:
-        raise ValueError(
-            f"{num_kv_heads} KV heads do not split over {plan.world} ranks"
-        )
     pp = plan.piece_pages
     first, second = plan.rank_pieces(rank)
     piece = position_pages // pp
@@ -391,18 +454,217 @@ def window_slots_for_ranks(
         piece == first, position_pages - first * pp, position_pages - second * pp + pp
     )
     pages = jnp.take(own_pages, jnp.clip(local, 0, 2 * pp - 1), axis=0)
-    per_rank = num_kv_heads // plan.world
     return jnp.stack(
-        [kv_head_slots(pages, r * per_rank, per_rank) for r in range(plan.world)]
+        [
+            kv_head_slots(pages, *tp_kv_heads(num_kv_heads, plan.world, r))
+            for r in range(plan.world)
+        ]
     )
 
 
-def window_slots_from_ranks(
-    received: jax.Array, plan: ZigzagPlan, position_pages: jax.Array
-) -> jax.Array:
-    """The window from what every rank sent this one (`window_slots_for_ranks`
-    after an all-to-all, sources along axis 0): each page from the rank holding
-    it."""
+def window_page_owners(plan: ZigzagPlan, position_pages: jax.Array) -> jax.Array:
+    """The rank holding each position page."""
     piece = position_pages // plan.piece_pages
-    owner = jnp.where(piece < plan.world, piece, plan.num_pieces - 1 - piece)
-    return received[owner, jnp.arange(position_pages.shape[0])]
+    return jnp.where(piece < plan.world, piece, plan.num_pieces - 1 - piece)
+
+
+def window_slots_from_ranks(received: jax.Array, owners: jax.Array) -> jax.Array:
+    """The window from what every rank sent this one (`window_slots_for_ranks`
+    after an all-to-all, sources along axis 0): each page from its
+    `window_page_owners` rank."""
+    return received[owners, jnp.arange(owners.shape[0])]
+
+
+def halo_blocks(tails: tuple[Any, Any], rank: int, world: int, zeros: Any) -> list[Any]:
+    """`halo_permutations` as one all-to-all of `world` blocks: the first-piece
+    tail to rank + 1, the second-piece tail to rank - 1, `zeros` elsewhere. Of
+    what arrives, block rank - 1 is the first piece's halo and block rank + 1
+    the second's (`halo_sources`). Needs world >= 3."""
+    blocks = [zeros] * world
+    blocks[(rank + 1) % world], blocks[(rank - 1) % world] = tails
+    return blocks
+
+
+def halo_sources(rank: int, world: int) -> tuple[int, int]:
+    """Blocks of the `halo_blocks` all-to-all holding the first and second
+    piece's halos."""
+    return (rank - 1) % world, (rank + 1) % world
+
+
+CacheView = Callable[
+    [jax.Array], tuple[jax.Array, int, Callable[[jax.Array], jax.Array]]
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class LayerConfig:
+    """One attention layer of a context-parallel prefill on `world` ranks.
+
+    `num_heads` and `num_kv_heads` count every rank's heads; the serving cache
+    holds `tp_kv_heads` of them.
+    """
+
+    rank: int
+    world: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    sliding_window: int | None
+    sm_scale: float
+    soft_cap: float | None
+    k_scale: float
+    v_scale: float
+    fp8_compute: bool
+    kv_layout: configs.KVLayout
+    sliding_prefill_max_bkv: int | None = None
+
+    @property
+    def tp_kv_heads(self) -> tuple[int, int]:
+        return tp_kv_heads(self.num_kv_heads, self.world, self.rank)
+
+    def plan(self, num_rows: int, page_size: int) -> ZigzagPlan:
+        """The plan of a step in which every rank holds `num_rows` rows."""
+        return make_zigzag_plan(num_rows * self.world, self.world, page_size)
+
+    def rpa_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = dict(
+            num_kv_heads=self.num_kv_heads,
+            sm_scale=self.sm_scale,
+            soft_cap=self.soft_cap,
+            k_scale=self.k_scale,
+            v_scale=self.v_scale,
+            fp8_compute=self.fp8_compute,
+        )
+        if self.sliding_window is not None:
+            kwargs["sliding_window"] = self.sliding_window
+            if self.sliding_prefill_max_bkv:
+                kwargs["sliding_prefill_max_bkv"] = self.sliding_prefill_max_bkv
+        return kwargs
+
+
+def _cache_pages(kv_cache: jax.Array, cfg: LayerConfig, cache_view: CacheView):
+    """(native pages, native pages per block, inverse view, page size)."""
+    native, page_stride, restore = cache_view(kv_cache)
+    page_axis = 4 if cfg.kv_layout == configs.KVLayout.SEQ_ALONG_LANE else 1
+    return native, page_stride, restore, native.shape[page_axis]
+
+
+def _check_page_size(plan_page_size: int, cache_page_size: int) -> None:
+    if plan_page_size != cache_page_size:
+        raise ValueError(
+            f"The zigzag plan's pages ({plan_page_size} tokens) are not the KV "
+            f"cache's ({cache_page_size})."
+        )
+
+
+def _request_block_table(block_tables: jax.Array, seq_lens: jax.Array) -> jax.Array:
+    """Block table row of the step's one request (batch index 0)."""
+    return block_tables[: block_tables.shape[0] // seq_lens.shape[0]]
+
+
+def full_attention_layer(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    kv_pages: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    *,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+) -> tuple[jax.Array, jax.Array]:
+    """A full-attention layer: attention of the rank's rows over the
+    all-gathered pages, and the cache with this rank's heads of every prompt
+    position.
+
+    Args:
+        kv_cache: The layer's serving cache; `cache_view` gives its native pages.
+        query: [rows, num_heads, head_dim].
+        kv_pages: Every rank's `pack_kv_pages` pages in rank order, as int8.
+        seq_lens, block_tables: The step's attention metadata (one request).
+        cfg: The layer.
+        cache_view: `kv_cache` -> (native pages, pages per block, inverse view).
+
+    Returns:
+        (the new kv_cache, [rows, num_heads, head_dim] attention output).
+    """
+    native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
+    _check_page_size(kv_pages.shape[1], page_size)
+    plan = cfg.plan(query.shape[0], page_size)
+    pages = jax.lax.bitcast_convert_type(kv_pages, native.dtype)
+    out = cp_prefill_attention(
+        query, pages, plan.gathered_page_table(), plan, cfg.rank, **cfg.rpa_kwargs()
+    )
+    first, count = cfg.tp_kv_heads
+    mine = cache_pages_from_slots(kv_head_slots(pages, first, count), cfg.kv_layout)
+    table = _request_block_table(block_tables, seq_lens) * page_stride
+    writes = full_attention_page_writes(plan, table, seq_lens[0])
+    return restore(write_kv_pages(native, mine, *writes)), out
+
+
+def sliding_attention_layer(
+    query: jax.Array,
+    kv_pages: jax.Array,
+    halos: jax.Array,
+    seq_lens: jax.Array,
+    *,
+    cfg: LayerConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """A sliding-window layer's attention, within [halo | piece].
+
+    Args:
+        query: [rows, num_heads, head_dim].
+        kv_pages: The rank's `pack_kv_pages` pages, as int8.
+        halos: [first piece's halo | second piece's halo] pages, as int8.
+        seq_lens: The step's sequence lengths (one request).
+        cfg: The layer.
+
+    Returns:
+        (attention output, the int8 `window_slots_for_ranks` blocks for an
+        all-to-all, the `window_page_owners` of the window pages).
+    """
+    if cfg.sliding_window is None:
+        raise ValueError("sliding_attention_layer needs a sliding window")
+    page_size = kv_pages.shape[1]
+    plan = cfg.plan(query.shape[0], page_size)
+    halo_pages = num_halo_pages(cfg.sliding_window, page_size)
+    own = jax.lax.bitcast_convert_type(kv_pages, jnp.float8_e4m3fn)
+    halos = jax.lax.bitcast_convert_type(halos, jnp.float8_e4m3fn)
+    local = sliding_local_pages(
+        own, halos[:halo_pages], halos[halo_pages:], plan, cfg.rank
+    )
+    tables = plan.sliding_page_tables(cfg.rank, halo_pages)
+    out = cp_prefill_attention(query, local, tables, plan, cfg.rank, **cfg.rpa_kwargs())
+    position_pages, _ = window_position_pages(
+        seq_lens[0], cfg.sliding_window, page_size
+    )
+    send = window_slots_for_ranks(own, plan, cfg.rank, position_pages, cfg.num_kv_heads)
+    owners = window_page_owners(plan, position_pages)
+    return out, jax.lax.bitcast_convert_type(send, jnp.int8), owners
+
+
+def window_write_layer(
+    kv_cache: jax.Array,
+    received: jax.Array,
+    owners: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    *,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+) -> jax.Array:
+    """The cache with this rank's heads of the decode window, from the
+    all-to-all of `sliding_attention_layer`'s blocks."""
+    if cfg.sliding_window is None:
+        raise ValueError("window_write_layer needs a sliding window")
+    native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
+    _check_page_size(received.shape[2], page_size)
+    slots = window_slots_from_ranks(
+        jax.lax.bitcast_convert_type(received, native.dtype), owners
+    )
+    position_pages, count = window_position_pages(
+        seq_lens[0], cfg.sliding_window, page_size
+    )
+    table = _request_block_table(block_tables, seq_lens) * page_stride
+    writes = window_page_writes(table, position_pages, count)
+    mine = cache_pages_from_slots(slots, cfg.kv_layout)
+    return restore(write_kv_pages(native, mine, *writes))

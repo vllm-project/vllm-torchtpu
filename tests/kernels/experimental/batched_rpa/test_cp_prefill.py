@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, cp_prefill, wrapper
@@ -178,19 +179,20 @@ def test_full_attention_write_caches_each_rank_heads_up_to_the_prompt(layout):
         ]
     )
     block_table = _block_table(num_cache_pages, plan.num_pages, seed=3)
-    dst = cp_prefill.full_attention_dst_pages(
-        plan, block_table, jnp.int32(seq_len), num_cache_pages
+    src, dst, count = cp_prefill.full_attention_page_writes(
+        plan, block_table, jnp.int32(seq_len)
     )
     written = np.asarray(block_table[: -(-seq_len // PAGE)])
     for rank in range(plan.world):
-        first, count = cp_prefill.tp_kv_heads(num_kv_heads, plan.world, rank)
-        heads = slice(first, first + count)
+        first, num_heads = cp_prefill.tp_kv_heads(num_kv_heads, plan.world, rank)
+        heads = slice(first, first + num_heads)
         expected = _serving_pages(k[:, heads], v[:, heads], layout)
         cache = jnp.full((num_cache_pages, *expected.shape[1:]), 7, FP8)
         pages = cp_prefill.cache_pages_from_slots(
-            cp_prefill.kv_head_slots(gathered, first, count), layout
+            cp_prefill.kv_head_slots(gathered, first, num_heads), layout
         )
-        cache = cp_prefill.write_kv_pages(cache, pages, dst)
+        with pltpu.force_tpu_interpret_mode():
+            cache = cp_prefill.write_kv_pages(cache, pages, src, dst, count)
         np.testing.assert_array_equal(
             _bytes(cache[written]), _bytes(expected[: len(written)])
         )
@@ -211,7 +213,7 @@ def test_sliding_window_write_caches_the_decode_window(seq_len, layout):
     window, num_kv_heads, head_dim, num_cache_pages = 1024, 16, 128, 160
     plan = cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
     k, v = _kv(plan.num_tokens, num_kv_heads, head_dim, seed=4)
-    position_pages, valid = cp_prefill.window_position_pages(
+    position_pages, count = cp_prefill.window_position_pages(
         jnp.int32(seq_len), window, PAGE
     )
     sent = [
@@ -227,20 +229,167 @@ def test_sliding_window_write_caches_the_decode_window(seq_len, layout):
         for r in range(plan.world)
     ]
     block_table = _block_table(num_cache_pages, plan.num_pages, seed=5)
-    dst = jnp.where(valid, block_table[position_pages], num_cache_pages)
+    src, dst, count = cp_prefill.window_page_writes(block_table, position_pages, count)
     first_page = max(seq_len - window + 1, 0) // PAGE
     needed = np.arange(first_page, -(-seq_len // PAGE))
-    np.testing.assert_array_equal(np.asarray(position_pages)[np.asarray(valid)], needed)
+    np.testing.assert_array_equal(np.asarray(position_pages)[: int(count)], needed)
     for rank in range(plan.world):
-        first, count = cp_prefill.tp_kv_heads(num_kv_heads, plan.world, rank)
-        heads = slice(first, first + count)
+        first, num_heads = cp_prefill.tp_kv_heads(num_kv_heads, plan.world, rank)
+        heads = slice(first, first + num_heads)
         expected = _serving_pages(k[:, heads], v[:, heads], layout)
         cache = jnp.full((num_cache_pages, *expected.shape[1:]), 7, FP8)
         # The all-to-all: rank `rank` receives slice `rank` of what every rank sent.
         received = jnp.stack([x[rank] for x in sent])
-        slots = cp_prefill.window_slots_from_ranks(received, plan, position_pages)
+        owners = cp_prefill.window_page_owners(plan, position_pages)
+        slots = cp_prefill.window_slots_from_ranks(received, owners)
         pages = cp_prefill.cache_pages_from_slots(slots, layout)
-        cache = cp_prefill.write_kv_pages(cache, pages, dst)
+        with pltpu.force_tpu_interpret_mode():
+            cache = cp_prefill.write_kv_pages(cache, pages, src, dst, count)
+        written = np.asarray(block_table[needed])
+        np.testing.assert_array_equal(_bytes(cache[written]), _bytes(expected[needed]))
+        untouched = np.setdiff1d(np.arange(num_cache_pages), written)
+        assert (np.asarray(cache[untouched]).astype(np.float32) == 7).all()
+
+
+def _layer_config(rank, num_kv_heads, window, layout):
+    return cp_prefill.LayerConfig(
+        rank=rank,
+        world=8,
+        num_heads=2 * num_kv_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        sliding_window=window,
+        sm_scale=1.0,
+        soft_cap=None,
+        k_scale=1.0,
+        v_scale=1.0,
+        fp8_compute=False,
+        kv_layout=layout,
+    )
+
+
+def _identity_view(cache):
+    return cache, 1, lambda native: native
+
+
+def _int8(x):
+    return jax.lax.bitcast_convert_type(x, jnp.int8)
+
+
+def test_layer_config_plan_is_the_step_plan():
+    plan = cp_prefill.make_zigzag_plan(81920, world=8, page_size=PAGE)
+    cfg = _layer_config(0, 4, None, configs.KVLayout.HEAD_ALONG_SUBLANE)
+    assert cfg.plan(2 * plan.piece_tokens, PAGE) == plan
+
+
+def test_halo_blocks_deliver_the_preceding_tails():
+    world, plan = 8, cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
+    # A rank's tails, labelled by the piece they end: (first piece, second piece).
+    sent = [
+        cp_prefill.halo_blocks(plan.rank_pieces(r), r, world, None)
+        for r in range(world)
+    ]
+    for rank in range(1, world - 1):
+        received = [sent[src][rank] for src in range(world)]
+        first, second = cp_prefill.halo_sources(rank, world)
+        piece_a, piece_b = plan.rank_pieces(rank)
+        assert (received[first], received[second]) == (piece_a - 1, piece_b - 1)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_full_attention_layer_caches_rank_heads(monkeypatch, layout):
+    monkeypatch.setattr(
+        cp_prefill, "cp_prefill_attention", lambda q, *args, **kwargs: q
+    )
+    plan = cp_prefill.make_zigzag_plan(16 * 2 * PAGE, world=8, page_size=PAGE)
+    num_kv_heads, num_cache_pages, seq_len = 4, 48, 16 * 2 * PAGE - 300
+    k, v = _kv(plan.num_tokens, num_kv_heads, 128, seed=6)
+    gathered = jnp.concatenate(
+        [
+            cp_prefill.pack_kv_pages(
+                _rank_rows(k, plan, r), _rank_rows(v, plan, r), PAGE
+            )
+            for r in range(plan.world)
+        ]
+    )
+    block_table = _block_table(num_cache_pages, plan.num_pages + 4, seed=7)
+    # Two request slots; the step's request is the first.
+    block_tables = jnp.concatenate([block_table, jnp.zeros_like(block_table)])
+    seq_lens = jnp.array([seq_len, 0], jnp.int32)
+    written = np.asarray(block_table[: -(-seq_len // PAGE)])
+    query = jnp.zeros((2 * plan.piece_tokens, 8, 128), jnp.bfloat16)
+    for rank in (0, 5):
+        cfg = _layer_config(rank, num_kv_heads, None, layout)
+        first, num_heads = cfg.tp_kv_heads
+        expected = _serving_pages(
+            k[:, first : first + num_heads], v[:, first : first + num_heads], layout
+        )
+        cache = jnp.full((num_cache_pages, *expected.shape[1:]), 7, FP8)
+        with pltpu.force_tpu_interpret_mode():
+            cache, _ = cp_prefill.full_attention_layer(
+                cache,
+                query,
+                _int8(gathered),
+                seq_lens,
+                block_tables,
+                cfg=cfg,
+                cache_view=_identity_view,
+            )
+        np.testing.assert_array_equal(
+            _bytes(cache[written]), _bytes(expected[: len(written)])
+        )
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
+    monkeypatch.setattr(
+        cp_prefill, "cp_prefill_attention", lambda q, *args, **kwargs: q
+    )
+    window, num_kv_heads, num_cache_pages = 1024, 16, 160
+    plan = cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
+    seq_len = 9 * 8 * PAGE + 100  # the window across two ranks' pieces
+    k, v = _kv(plan.num_tokens, num_kv_heads, 128, seed=8)
+    block_table = _block_table(num_cache_pages, plan.num_pages, seed=9)
+    seq_lens = jnp.array([seq_len], jnp.int32)
+    query = jnp.zeros((2 * plan.piece_tokens, 32, 128), jnp.bfloat16)
+    own = [
+        _int8(
+            cp_prefill.pack_kv_pages(
+                _rank_rows(k, plan, r), _rank_rows(v, plan, r), PAGE
+            )
+        )
+        for r in range(plan.world)
+    ]
+    halo = cp_prefill.num_halo_pages(window, PAGE)
+    sent, owners = [], None
+    for rank in range(plan.world):
+        cfg = _layer_config(rank, num_kv_heads, window, layout)
+        _, blocks, owners = cp_prefill.sliding_attention_layer(
+            query, own[rank], jnp.zeros_like(own[rank][: 2 * halo]), seq_lens, cfg=cfg
+        )
+        sent.append(blocks)
+    position_pages, count = cp_prefill.window_position_pages(
+        jnp.int32(seq_len), window, PAGE
+    )
+    needed = np.asarray(position_pages)[: int(count)]
+    for rank in range(plan.world):
+        cfg = _layer_config(rank, num_kv_heads, window, layout)
+        first, num_heads = cfg.tp_kv_heads
+        expected = _serving_pages(
+            k[:, first : first + num_heads], v[:, first : first + num_heads], layout
+        )
+        cache = jnp.full((num_cache_pages, *expected.shape[1:]), 7, FP8)
+        received = jnp.stack([x[rank] for x in sent])
+        with pltpu.force_tpu_interpret_mode():
+            cache = cp_prefill.window_write_layer(
+                cache,
+                received,
+                owners,
+                seq_lens,
+                block_table,
+                cfg=cfg,
+                cache_view=_identity_view,
+            )
         written = np.asarray(block_table[needed])
         np.testing.assert_array_equal(_bytes(cache[written]), _bytes(expected[needed]))
         untouched = np.setdiff1d(np.arange(num_cache_pages), written)
