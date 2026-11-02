@@ -296,10 +296,12 @@ def test_schedule_fields_against_scalar_task_oracle(fp8, batch, ratio, groups, l
                 np.testing.assert_array_equal(
                     dma[step, lane, page],
                     [
-                        pages[min(
-                            row * (groups + 1) + tile * (256 // ratio) + page,
-                            batch * (groups + 1) - 1,
-                        )],
+                        pages[
+                            min(
+                                row * (groups + 1) + tile * (256 // ratio) + page,
+                                batch * (groups + 1) - 1,
+                            )
+                        ],
                         page * ratio,
                         max(0, min(length - tile * 256 - page * ratio, ratio)),
                     ],

@@ -630,7 +630,6 @@ def compact_pooled_qsa_step(
     rotary_dim: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
-    scheduling_group_namespace: int = 0,
     output_weight: jax.Array | None = None,
     residual: jax.Array | None = None,
     hc_gate: jax.Array | None = None,
@@ -639,6 +638,7 @@ def compact_pooled_qsa_step(
     hc_min_tokens: int = 1024,
     k_norm_multiplier: jax.Array | None = None,
     decode_cu: jax.Array | None = None,
+    scheduling_group_namespace: int = 0,
     *,
     topk_backend: TopKBackend | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:

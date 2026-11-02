@@ -42,10 +42,10 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import AUTO_MIN_TOKENS
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention,
 )
-from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import AUTO_MIN_TOKENS
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.model_hooks import qwen4_options
 

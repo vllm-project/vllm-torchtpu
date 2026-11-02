@@ -202,6 +202,7 @@ _INPUT_PROJECTION_NAMES = (
     "indexer.index_qk_proj.weight",
 )
 
+
 class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     """Config-derived gated attention with a fully replicated MQA indexer.
 
@@ -502,27 +503,20 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         per_layer = cast(
             dict[str, AttentionMetadata], get_forward_context().attn_metadata
         )
-        small_projections = self.input_proj(hidden).split(self.input_sizes[1:], dim=-1)
-        projections = (self.q_proj(hidden), *small_projections)
+        key, value, index_qk = self.input_proj(hidden).split(
+            self.input_sizes[1:], dim=-1
+        )
+        qgate = self.q_proj(hidden)
         projected = residual is not None
         if projected:
             assert hc_gate is not None and self.can_prefetch_output(hidden)
         op = self._projected_op if projected else self._op
-        projection_args = (
-            {
-                "output_weight": self.output_weight_tiles,
-                "residual": residual,
-                "hc_gate": hc_gate,
-                "original_output_weight": self.o_proj.weight,
-                "hc_token_tile": hc_token_tile,
-                "hc_min_tokens": hc_min_tokens,
-            }
-            if projected
-            else {}
-        )
         assert op is not None
         output, selected = op(
-            *projections,
+            qgate,
+            key,
+            value,
+            index_qk,
             self.q_norm.weight,
             self.k_norm.weight,
             self.indexer.q_layernorm.weight,
@@ -538,7 +532,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             cast(torch.Tensor, per_layer[self.prefix].request_distribution),
             k_norm_multiplier=self.k_norm_multiplier,
             decode_cu=metadata.decode_cu,
-            **projection_args,
+            output_weight=self.output_weight_tiles if projected else None,
+            residual=residual,
+            hc_gate=hc_gate,
+            original_output_weight=self.o_proj.weight if projected else None,
+            hc_token_tile=hc_token_tile,
+            hc_min_tokens=hc_min_tokens,
             k_scale=cast(float, self._k_scale_float) if self.fp8_kv else 1.0,
             v_scale=cast(float, self._v_scale_float) if self.fp8_kv else 1.0,
         )

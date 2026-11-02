@@ -121,6 +121,7 @@ def test_sidecar_page_coalescing_preserves_owned_key_addresses(monkeypatch, case
         block_topk=512,
         topk_backend=ReferenceTopK() if case == "backend" else None,
         logical_block_size=1664,
+        request_distribution=jnp.full((3,), requests, jnp.int32),
     )
     expected = pool.reshape(4, physical_rows, 128)[
         table[req[:, None], columns[None] // 416], columns[None] % 416
@@ -617,3 +618,65 @@ def test_prefill_prefix_capacity_preserves_functional_visibility(monkeypatch, mo
         np.testing.assert_array_equal(np.sort(ids, axis=1), np.sort(expected, axis=1))
         np.testing.assert_array_equal(np.asarray(ids) >= 0, expected >= 0)
         assert widths == [256 if history == 0 and mode != "injected" else 4096] * 2
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.uint8, jnp.float8_e4m3fn])
+@pytest.mark.parametrize("page_size", [32, 416])
+@pytest.mark.parametrize("decode_only", [False, True])
+def test_ragged_prefill_view_preserves_carrier_and_page_addresses(
+    monkeypatch, dtype, page_size, decode_only
+):
+    """Both traced branches retain every byte and physical page mapping."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    packing = 2 if dtype == jnp.bfloat16 else 4
+    storage = jnp.arange(4 * (page_size // 2) * packing * 128) % 113
+    cache = storage.astype(jnp.bfloat16 if packing == 2 else jnp.uint8)
+    if dtype == jnp.float8_e4m3fn:
+        cache = jax.lax.bitcast_convert_type(cache, dtype)
+    cache = cache.reshape(4, page_size // 2, packing, 128)
+    table = jnp.array([[3, 1], [2, 0]], jnp.int32)
+    starts = jnp.array([0, 1, 2] if decode_only else [0, 8, 16], jnp.int32)
+    distribution = jnp.array([2, 2, 2] if decode_only else [0, 0, 2], jnp.int32)
+    prefill_calls = []
+
+    def record(q, weights, read_cache, lengths, pages, cu, dist, **kwargs):
+        kwargs["components"].keys.validate(read_cache, 128, KVLayout.HEAD_ALONG_SUBLANE)
+        if cu is not None and not isinstance(pages, jax.core.Tracer):
+            prefill_calls.append(1)
+            actual = read_cache[pages.reshape(2, -1)].reshape(2, -1)
+            expected = cache[table].reshape(2, -1)
+            if dtype == jnp.float8_e4m3fn:
+                actual = jax.lax.bitcast_convert_type(actual, jnp.uint8)
+                expected = jax.lax.bitcast_convert_type(expected, jnp.uint8)
+            np.testing.assert_array_equal(actual, expected)
+            assert read_cache.shape[1] * 2 == 32
+        return jnp.full((len(q), 16), -1, jnp.int32)
+
+    monkeypatch.setattr(decode_indexer, "streamindex_topk", record)
+
+    def run(query):
+        return decode_indexer.select_index_blocks(
+            query,
+            cache,
+            jnp.full((16,), 64, jnp.int32),
+            table,
+            jnp.arange(16, dtype=jnp.int32) % 2,
+            starts=starts,
+            context=jnp.full((2,), 48, jnp.int32),
+            request_distribution=distribution,
+            ratio=4,
+            block_topk=16,
+        )
+
+    query = jnp.zeros((16, 4, 128), jnp.bfloat16)
+    # lax.cond must trace the prefill branch even for an all-decode batch.
+    assert jax.eval_shape(run, query).shape == (16, 16)
+    with jax.disable_jit():
+        np.testing.assert_array_equal(run(query), -np.ones((16, 16), np.int32))
+    assert bool(prefill_calls) == (not decode_only)

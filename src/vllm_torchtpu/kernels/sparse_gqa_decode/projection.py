@@ -82,6 +82,7 @@ def projected_attention(
         and launch.chunk_queries >= len(query)
         and pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
     )
+
     def fallback():
         attended, _ = qsa_attention(
             query,
@@ -144,7 +145,9 @@ def projected_attention(
         )
         from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import prepare_query
 
-        page_prepare = virtual_pages_unpadded if query_prepared else virtual_page_metadata
+        page_prepare = (
+            virtual_pages_unpadded if query_prepared else virtual_page_metadata
+        )
         pages, kv_lens = page_prepare(
             blocks, lengths, table, ratio=ratio, page_size=cache.shape[1]
         )
@@ -157,7 +160,9 @@ def projected_attention(
         if prepared_cu is not None:
             assert prepared_cu.shape == (batch + 1,) and prepared_cu.dtype == jnp.int32
         starts = (
-            jnp.arange(batch + 1, dtype=jnp.int32) if prepared_cu is None else prepared_cu
+            jnp.arange(batch + 1, dtype=jnp.int32)
+            if prepared_cu is None
+            else prepared_cu
         )
         q_lens = (kv_lens > 0).astype(jnp.int32)
         metadata = schedule.generate(starts, kv_lens, pages, cfgs)

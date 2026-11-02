@@ -80,7 +80,7 @@ def test_new_contracts_fail_before_allocation(updates, cache_dtype, match, monke
     def forbidden(*args, **kwargs):
         raise AssertionError("invalid QSA geometry reached allocation")
 
-    monkeypatch.setattr(qsa, "ColumnParallelLinear", forbidden)
+    monkeypatch.setattr(qsa, "MergedColumnParallelLinear", forbidden)
     monkeypatch.setattr(qsa, "ReplicatedLinear", forbidden)
     monkeypatch.setattr(qsa, "make_rope_cache", forbidden)
     with pytest.raises(ValueError, match=match):
@@ -104,7 +104,8 @@ def test_component_geometry_does_not_assume_a_cache_page(cache_dtype):
     )
     assert layer.compress_ratio == 3
     assert layer.q_proj.weight.shape == (1024, 16)
-    assert layer.k_proj.weight.shape == (256, 16)
+    assert layer.input_sizes[1] == 256
+    assert layer.input_proj.weight.shape == (sum(layer.input_sizes[1:]), 16)
     assert layer.rope_cache.shape == (16, 128)
 
 
@@ -198,15 +199,28 @@ def test_checkpoint_weights_finalize_and_reject_bad_payloads():
     ]:
         with pytest.raises(ValueError, match="Invalid BF16"):
             layer.load_weights([(name, weight)])
-    weights = [
-        (name, torch.full_like(parameter, (index + 1) / 16))
+    weights = {
+        name: torch.full_like(parameter, (index + 1) / 16)
         for index, (name, parameter) in enumerate(layer.named_parameters())
-    ]
+    }
+    packed = weights.pop("input_proj.weight")
+    for name, part in zip(
+        ("k_proj.weight", "v_proj.weight", "indexer.index_qk_proj.weight"),
+        packed.split(layer.input_sizes[1:], dim=0),
+    ):
+        weights[name] = part
     assert len(weights) == 9
-    assert layer.load_weights(weights) == {name for name, _ in weights}
+    assert layer.load_weights(weights.items()) == set(weights)
     layer.finalize_weights()
     for name, parameter in layer.named_parameters():
-        torch.testing.assert_close(parameter, dict(weights)[name], rtol=0, atol=0)
+        expected = (
+            packed
+            if name == "input_proj.weight"
+            else weights[name].T
+            if name == "o_proj.weight"
+            else weights[name]
+        )
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("name", ["kv_scale", "attn.kv_scale"])

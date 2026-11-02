@@ -341,7 +341,10 @@ def main_kv_dma_batch(
     ):
         return 1
     assert hardware is not None
-    if get_main_kv_tile(rows) < _MAIN_TILE and hardware.chip_version != pltpu.ChipVersion.TPU_7X:
+    if (
+        get_main_kv_tile(rows) < _MAIN_TILE
+        and hardware.chip_version != pltpu.ChipVersion.TPU_7X
+    ):
         return 1
     # A resident decode bucket owns one semaphore per source row. The older
     # prefill writer retains its measured packet-size candidates.

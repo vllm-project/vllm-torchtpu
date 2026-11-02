@@ -167,35 +167,50 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
                 (16, context, live, 1)
                 for context, live in ((0, 8), (1, 8), (2, 8), (3, 8), (4, 16), (5, 0))
             ]
-            cases += [(8, 0, 8, 1), (128, 0, 8, 16), (1024, 0, 8, 128)]
+            cases += [
+                (8, 0, 8, 1),
+                (128, 0, 8, 16),
+                (1024, 0, 8, 128),
+                (16, 0, 2, 8),
+                (16, 4, 4, (1, 2, 6, 7)),
+            ]
             for tokens, context, live, query_len in cases:
-                if tokens != 16:
+                if tokens != 16 or not isinstance(query_len, int) or query_len > 1:
                     base_owners = [x.to("tpu") for x in initial]
                     fused_owners = [x.to("tpu") for x in initial]
-                valid_rows = live * query_len
-                starts = torch.cat(
-                    (
-                        torch.arange(live + 1) * query_len,
-                        torch.full((32 - live,), valid_rows),
-                    )
-                ).int()
+                query_lengths = (
+                    [query_len] * live
+                    if isinstance(query_len, int)
+                    else list(query_len)
+                )
+                valid_rows = sum(query_lengths)
+                starts = torch.tensor(
+                    [
+                        0,
+                        *torch.tensor(query_lengths).cumsum(0).tolist(),
+                        *([valid_rows] * (32 - live)),
+                    ],
+                    dtype=torch.int32,
+                )
                 lengths = torch.zeros(32, dtype=torch.int32)
                 lengths[:live] = context
                 slots = torch.arange(32, dtype=torch.int32)
                 slots[live:] = -1
                 pages = torch.zeros((32, 41), dtype=torch.int32)
                 pages[:live, 0] = torch.arange(1, live + 1)
-                metadata = QSAMetadata(
-                    *(
-                        x.to("tpu")
-                        for x in (starts, lengths, slots, pages, pages.clone())
-                    ),
-                    decode_cu=shared_cu,
-                )
+                starts, lengths, slots, pages = [
+                    x.to("tpu") for x in (starts, lengths, slots, pages)
+                ]
+                decode = sum(n == 1 for n in query_lengths)
+                verify = decode + sum(n == 2 for n in query_lengths)
+                distribution = torch.tensor(
+                    [decode, verify, live], dtype=torch.int32
+                ).to("tpu")
+                metadata = QSAMetadata(starts, lengths, decode_cu=shared_cu)
                 positions = torch.full((tokens,), context, dtype=torch.int64)
                 if live:
                     positions[:valid_rows] = (
-                        torch.arange(query_len).repeat(live) + context
+                        torch.cat([torch.arange(n) for n in query_lengths]) + context
                     )
                 positions = positions.to("tpu")
                 hidden = (
@@ -213,11 +228,9 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
                 )
                 per_layer = {
                     layer.prefix: SimpleNamespace(
-                        block_tables=metadata.main_block_table
+                        block_tables=pages, request_distribution=distribution
                     ),
-                    layer.prefix + ".raw_ring": SimpleNamespace(
-                        block_tables=metadata.state_slots
-                    ),
+                    layer.prefix + ".raw_ring": SimpleNamespace(block_tables=slots),
                 }
                 with set_forward_context(per_layer, config, num_tokens=tokens):
                     layer.bind_pool(*base_owners)
