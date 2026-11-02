@@ -62,11 +62,9 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (
+    DeepseekScalingRotaryEmbedding,
     MRotaryEmbedding,
     RotaryEmbedding,
-)
-from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
-    MRotaryEmbeddingInterleaved,
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models import supports_lora
@@ -1377,22 +1375,24 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
     def _relayout_tables(self, model: torch.nn.Module | None) -> None:
-        """Give ``model`` the row-major table layouts the env knobs ask for.
+        """Give ``model`` the table shapes and row-major layouts the env knobs ask for.
 
-        ``load_model`` relayouts the target inline; this applies the same to
-        the draft, which feeds the same cached Pallas ops and so must share
-        the target's table layout.
+        ``load_model`` truncates and relayouts the target inline; this applies
+        the same to the draft, which feeds the same cached Pallas ops and so
+        must share the target's table shape and layout.
         """
         if model is None:
             return
+        if envs.TPU_ROPE_CACHE_TRUNCATE:
+            self._truncate_rope_caches(model)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
             runner_utils.relayout_rope_caches(model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(model)
 
-    def _truncate_rope_caches(self) -> None:
-        """Slice rotary cos_sin caches to max_model_len which can reduce
-        the overhead of xla layout data copy. Applicable to text-only.
+    def _truncate_rope_caches(self, model: torch.nn.Module) -> None:
+        """Slice rotary cos_sin caches to max_model_len (plus speculative slack)
+        which can reduce the overhead of xla layout data copy. Applicable to text-only.
         """
         multimodal_config = self.model_config.multimodal_config
         if self.model_config.is_multimodal_model and not (
@@ -1403,18 +1403,31 @@ class TPUModelRunner(GPUModelRunner):
                 "not bounded by max_model_len"
             )
             return
+        spec_cfg = self.speculative_config
+        spec_tokens = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
         max_len = self.model_config.max_model_len
+        if spec_tokens > 0:
+            # K > 1 MTP/EAGLE draft steps advance positions past max_model_len - 1
+            # without clamping; keep speculative slack rounded up to an 8-row
+            # sublane multiple so unchecked Pallas HBM DMAs (e.g. DeepSeek-V4
+            # RoPE) stay in bounds and sublane-aligned.
+            max_len = cdiv(max_len + spec_tokens, 8) * 8
         num_eligible = 0
         num_truncated = 0
-        for name, module in self.model.named_modules():
+        # Share one truncated tensor across modules that share a buffer.
+        truncated_by_id: dict[int, torch.Tensor] = {}
+        for name, module in model.named_modules():
             # isinstance, not an exact type match: on TPU these are the
-            # out-of-tree subclasses from layers/adapter/rotary_embedding.py.
+            # out-of-tree subclasses from layers/adapter/rotary_embedding.py
+            # and layers/adapter/custom_ops/mla_attention_op.py. DeepSeek
+            # scaling (YaRN for MLA models, and DeepSeek-V4's subclass)
+            # derives from RotaryEmbeddingBase, not RotaryEmbedding.
             if not isinstance(
                 module,
                 (
                     RotaryEmbedding,
                     MRotaryEmbedding,
-                    MRotaryEmbeddingInterleaved,
+                    DeepseekScalingRotaryEmbedding,
                 ),
             ):
                 continue
@@ -1424,9 +1437,13 @@ class TPUModelRunner(GPUModelRunner):
                     continue
                 num_eligible += 1
                 if buf.ndim >= 1 and buf.shape[0] > max_len:
-                    truncated = buf[:max_len].clone(
-                        memory_format=torch.contiguous_format
-                    )
+                    buf_id = id(buf)
+                    truncated = truncated_by_id.get(buf_id)
+                    if truncated is None:
+                        truncated = buf[:max_len].clone(
+                            memory_format=torch.contiguous_format
+                        )
+                        truncated_by_id[buf_id] = truncated
                     setattr(module, buf_name, truncated)
                     num_truncated += 1
                     logger.info(
@@ -1437,7 +1454,12 @@ class TPUModelRunner(GPUModelRunner):
                         max_len,
                     )
         if num_eligible:
-            logger.info("Truncated %d of %d rope caches", num_truncated, num_eligible)
+            logger.info(
+                "Truncated %d of %d rope caches (%d unique buffers)",
+                num_truncated,
+                num_eligible,
+                len(truncated_by_id),
+            )
         else:
             logger.warning(
                 "TPU_ROPE_CACHE_TRUNCATE is set but the model has no "
@@ -5535,7 +5557,7 @@ class TPUModelRunner(GPUModelRunner):
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
-            self._truncate_rope_caches()
+            self._truncate_rope_caches(self.model)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
