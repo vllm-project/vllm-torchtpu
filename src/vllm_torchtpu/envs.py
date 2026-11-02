@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE: int = 256
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
+    VLLM_TPU_QSA_DCP_SHARD_MERGE: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -770,6 +771,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split the same way; each rank scores its owned groups and the pair merges
     # the local top-k lists into the exact global selection.
     "VLLM_TPU_QSA_COMPRESSED_DCP": env_bool("VLLM_TPU_QSA_COMPRESSED_DCP"),
+    # With VLLM_TPU_QSA_COMPRESSED_DCP on the prefill token-shard path: each
+    # rank merges its own 1/TP of the rows from its pair's lists and one TP
+    # all-gather shares the merged selection, instead of every rank merging
+    # every row of every pair's raw lists (bit-identical).
+    "VLLM_TPU_QSA_DCP_SHARD_MERGE": env_bool("VLLM_TPU_QSA_DCP_SHARD_MERGE"),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every

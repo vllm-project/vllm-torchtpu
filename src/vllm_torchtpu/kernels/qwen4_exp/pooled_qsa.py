@@ -2576,6 +2576,58 @@ def pooled_qsa_compressed_dcp_attend_step(
     ``vals_pair`` / ``pos_pair`` are ``[2, T, k]``: per pair rank, every row's
     local list (token shards concatenated in token order)."""
     blocks = compressed_dcp_blocks(vals_pair, pos_pair, token_topk // compress_ratio)
+    return pooled_qsa_compressed_dcp_attend_blocks_step(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        blocks,
+        dcp_rank,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        dcp_size=dcp_size,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+    )
+
+
+def pooled_qsa_compressed_dcp_merge_step(
+    vals_pair: jax.Array, pos_pair: jax.Array, block_topk: int
+) -> jax.Array:
+    """``compressed_dcp_blocks`` as a step: row-independent, so a rank may
+    merge any subset of rows (VLLM_TPU_QSA_DCP_SHARD_MERGE)."""
+    return compressed_dcp_blocks(vals_pair, pos_pair, block_topk)
+
+
+def pooled_qsa_compressed_dcp_attend_blocks_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    blocks: jax.Array,
+    dcp_rank: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_compressed_dcp_attend_step`` from the merged global
+    selection ``blocks`` [T, token_topk // compress_ratio]."""
     return _shard_attend(
         q,
         gate,
