@@ -1073,7 +1073,8 @@ def export(
     all_params = model.abstract_params()
     if cfg.speculative_config:
         # Verify rows are some of a step's tokens.
-        rows = min(cfg.max_num_seqs * cfg.recurrent_window, max(cfg.token_buckets))
+        k = int(cfg.speculative_config["num_speculative_tokens"])
+        rows = min(cfg.max_num_seqs * (k + 1), max(cfg.token_buckets))
         if max(cfg.req_buckets) < rows:
             raise ValueError(
                 f"the largest request bucket ({max(cfg.req_buckets)}) is below the "

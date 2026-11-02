@@ -174,12 +174,14 @@ def build_export_config_from_vllm(
     token_buckets: Sequence[int] | None = None,
     req_buckets: Sequence[int] | None = None,
     max_verify_tokens: int = 0,
+    num_speculative_tokens: int = 0,
 ) -> api.TextOnlyLLMExportConfig:
     """Derives a `TextOnlyLLMExportConfig` from a `VllmConfig` (or mock config).
 
-    With `max_verify_tokens`, the export verifies tokens without speculative
-    decoding; `vllm_config` then carries only the speculative config that makes
-    vLLM keep the recurrent checkpoints (`verify_window_speculative_config`).
+    With `max_verify_tokens`, `vllm_config`'s speculative config is the one that
+    makes vLLM keep that many recurrent checkpoints
+    (`verify_window_speculative_config`), and `num_speculative_tokens` is what the
+    export's drafter proposes, if any.
     """
     model_cfg = getattr(vllm_config, "model_config", None)
     cache_cfg = getattr(vllm_config, "cache_config", None)
@@ -292,10 +294,13 @@ def build_export_config_from_vllm(
         # drafts and the token after them, as vLLM's sampler does; they are some of
         # the step's tokens, so no more than its largest token bucket.
         spec = getattr(vllm_config, "speculative_config", None)
-        rows = max_num_seqs
-        # Tokens verified without a drafter are forced, and skip the LM head.
+        drafted = num_speculative_tokens
         if spec is not None and not max_verify_tokens:
-            verify_rows = max_num_seqs * (spec.num_speculative_tokens + 1)
+            drafted = spec.num_speculative_tokens
+        # Tokens verified beyond the drafter's are forced, and skip the LM head.
+        rows = max_num_seqs
+        if drafted:
+            verify_rows = max_num_seqs * (drafted + 1)
             rows = max(rows, min(verify_rows, max(token_buckets)))
         req_buckets = default_req_buckets(rows)
     else:
