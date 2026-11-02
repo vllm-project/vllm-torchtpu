@@ -907,6 +907,16 @@ class TpuPlatform(Platform):
                 for i in range(64)
             ]
 
+        # TPUC_MOE: the TPU-C MoE op launches a raw PJRT executable and cannot
+        # be traced, so the compiled graph is split at it and it runs eagerly.
+        if envs.TPUC_MOE:
+            from vllm_torchtpu.layers.adapter.tpuc_moe import SPLITTING_OP
+
+            compilation_config.splitting_ops = [
+                *compilation_config.splitting_ops,
+                SPLITTING_OP,
+            ]
+
         # Disable inductor-specific fusion passes (only available on CUDA).
         compilation_config.pass_config.fuse_norm_quant = False
         compilation_config.pass_config.fuse_act_quant = False

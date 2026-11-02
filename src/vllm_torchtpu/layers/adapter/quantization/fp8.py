@@ -1061,6 +1061,33 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        if envs.TPUC_MOE:
+            # TPU-C MoE replaces the plain GMM path only: everything that
+            # takes the collectives from vLLM's MoE runner (or rewires it)
+            # must stay off, or the runner would skip collectives it needs.
+            from vllm_torchtpu.layers.adapter import tpuc_moe
+
+            conflicts = [
+                name
+                for name, on in (
+                    ("MOE_FUSED_EP_KERNEL_IMPL", envs.MOE_FUSED_EP_KERNEL_IMPL),
+                    ("USE_MOE_FUSED_EP_KERNEL", envs.USE_MOE_FUSED_EP_KERNEL),
+                    ("TPU_MOE_COLLECTION_CHUNK_SIZE", envs.TPU_MOE_COLLECTION_CHUNK_SIZE),
+                    ("TPU_MOE_FP8_ALL_GATHER", envs.TPU_MOE_FP8_ALL_GATHER),
+                    ("FUSED_MOE_DECODE_KERNEL", envs.FUSED_MOE_DECODE_KERNEL),
+                    ("USE_MOE_TP_DECODE_KERNEL", envs.USE_MOE_TP_DECODE_KERNEL),
+                )
+                if on
+            ]
+            if conflicts:
+                raise ValueError(f"TPUC_MOE=1 cannot be combined with {conflicts}")
+            tpuc_moe.prepare_layer(layer)
+            logger.info_once(
+                "TPUC_MOE: routed experts run on the TPU-C MoE kernel "
+                f"(w13={list(layer.w13_weight.shape)}, "
+                f"w2={list(layer.w2_weight.shape)})"
+            )
+            return
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
@@ -1208,6 +1235,17 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
+
+        if envs.TPUC_MOE:
+            from vllm_torchtpu.layers.adapter.tpuc_moe import fused_moe_tpuc
+
+            return fused_moe_tpuc(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                layer.moe_config.experts_per_token,
+            )
 
         from vllm_torchtpu.layers.adapter.fused_moe_decode import (
             fused_moe_decode,
