@@ -66,6 +66,10 @@ class KernelConfig:
     # Plain decode without attention DP: the smallest batch that token-scatters
     # rows over the sequence-parallel owners, and the smallest that uses the
     # routed MoE reduce-scatter (the compiled lists still apply).
+    # Plain decode up to this batch (without token scatter or the routed
+    # reduce-scatter) reduces the MoE outputs in one exchange with all 32
+    # ranks instead of a local and a host stage (0: off).
+    oneshot_reduce_max_batch: int = 0
     decode_scatter_from: int = 8
     decode_routed_reduce_scatter_from: int = 6
     # Attention DP verifies (sequence_rows > 1) also take these plain B64/B128
