@@ -72,14 +72,17 @@ def rpa_query_batch_size(
             (batch,),
             (batch,),
             (batch,),
-            (batch * page_columns,),
         )
         scalar_bytes = sum(
             math.prod(shape) * jnp.dtype(jnp.int32).itemsize for shape in scalar_shapes
         )
-        # Schedule generation has distribution[3] in place of the page table.
+        # Schedule generation also holds distribution and two page DMA windows.
+        generation_bytes = (
+            4 * batch + 1 + 3 + 2 * cfgs.page_window_slot_len
+        ) * jnp.dtype(jnp.int32).itemsize
         scalar_bytes = max(
-            scalar_bytes, (4 * batch + 1 + 3) * jnp.dtype(jnp.int32).itemsize
+            scalar_bytes,
+            generation_bytes,
         )
         if scratch_bytes + scalar_bytes <= info.smem_capacity_bytes:
             return batch

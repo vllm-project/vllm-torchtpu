@@ -165,13 +165,15 @@ def test_rpa_one_row_exact_smem_capacity(monkeypatch, info, lanes):
     scratch_bytes = sum(
         math.prod(ref.shape) * ref.dtype.itemsize for ref in jax.tree.leaves(scratch)
     )
-    # Attention: cu_q_lens, offsets, kv_lens, q_lens, virtual page table.
+    # Attention: cu_q_lens, offsets, kv_lens, q_lens.
     scalars = tuple(
-        jax.ShapeDtypeStruct(shape, jnp.int32)
-        for shape in ((2,), (1,), (1,), (1,), (columns,))
+        jax.ShapeDtypeStruct(shape, jnp.int32) for shape in ((2,), (1,), (1,), (1,))
     )
-    # Schedule generation replaces the virtual page table by distribution[3].
-    generation = (*scalars[:-1], jax.ShapeDtypeStruct((3,), jnp.int32))
+    generation = (
+        *scalars,
+        jax.ShapeDtypeStruct((3,), jnp.int32),
+        jax.ShapeDtypeStruct((2 * cfg.page_window_slot_len,), jnp.int32),
+    )
     scalar_bytes = max(
         sum(ref.size * ref.dtype.itemsize for ref in scalars),
         sum(ref.size * ref.dtype.itemsize for ref in generation),

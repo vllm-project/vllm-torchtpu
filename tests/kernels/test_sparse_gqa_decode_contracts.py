@@ -89,8 +89,7 @@ def test_resource_bytes_and_boundary_are_independent_of_policy_names(monkeypatch
     # Enumerate actual scalar ABI shapes, independent of the planner formula.
     assert (
         usage.scalar_bytes
-        == sum(np.prod(s) for s in [(65,), (64,), (64,), (64, 513)])
-        * np.dtype(np.int32).itemsize
+        == sum(np.prod(s) for s in [(65,), (64,), (64,)]) * np.dtype(np.int32).itemsize
     )
     assert usage.schedule_bytes == sum(
         x.size * x.dtype.itemsize
@@ -184,7 +183,7 @@ def test_policy_static_identity_and_layout_constraints(monkeypatch):
     )
     with pytest.raises(ValueError, match="scalar"):
         abi.output_aliases((None,), ())
-    assert abi.output_aliases((None,) * 4, (None,)) == {4: 0, 6: 1}
+    assert abi.output_aliases((None,) * 3, (None,)) == {3: 0, 5: 1}
 
 
 def test_public_decode_entry_forwards_geometry_plan_and_scales(monkeypatch):
@@ -240,7 +239,10 @@ def test_schedule_fields_against_scalar_task_oracle(fp8, batch):
     cfg = make_config(batch, 8, 128, 1, 8, 65, dtype)
     lengths = np.tile(np.array([0, 1, 255, 256, 257, 520], np.int32), batch // 6)
     cu = np.arange(batch + 1, dtype=np.int32)
-    actual = schedule.generate(jnp.asarray(cu), jnp.asarray(lengths), cfg)
+    pages = np.random.default_rng(73).permutation(batch * 66).astype(np.int32)
+    actual = schedule.generate(
+        jnp.asarray(cu), jnp.asarray(lengths), jnp.asarray(pages), cfg
+    )
     tasks = [
         (row, tile, int(length))
         for row, length in enumerate(lengths)
@@ -276,7 +278,7 @@ def test_schedule_fields_against_scalar_task_oracle(fp8, batch):
                 np.testing.assert_array_equal(
                     dma[step, lane, page],
                     [
-                        min(row * 66 + tile * 32 + page, batch * 66 - 1),
+                        pages[min(row * 66 + tile * 32 + page, batch * 66 - 1)],
                         page * 8,
                         max(0, min(length - tile * 256 - page * 8, 8)),
                     ],

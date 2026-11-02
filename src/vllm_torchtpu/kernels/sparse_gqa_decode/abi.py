@@ -23,7 +23,7 @@ WORD_BYTES = jnp.dtype(jnp.uint32).itemsize
 RPA_WAIT_ROW_BYTES = RPA_WAIT_ROW_WORDS * WORD_BYTES
 KV_DMA_FIELDS = ("source_index", "destination_token", "token_count")
 QUERY_DMA_FIELDS = ("source_row", "row_count")
-SCALAR_OPERANDS = ("cu_q_lens", "compressed_query_offsets", "q_lens", "pages")
+SCALAR_OPERANDS = ("cu_q_lens", "compressed_query_offsets", "q_lens")
 TENSOR_OPERANDS = ("query", "unused_new_kv", "cache", "gate")
 OUTPUT_OPERANDS = ("query", "cache")
 
@@ -39,12 +39,11 @@ def output_aliases(scalars: tuple, metadata: object) -> dict[int, int]:
     }
 
 
-def scalar_prefetch_words(batch: int, page_indices: int) -> int:
+def scalar_prefetch_words(batch: int) -> int:
     shapes = dict(
         cu_q_lens=batch + 1,
         compressed_query_offsets=batch,
         q_lens=batch,
-        pages=page_indices,
     )
     assert tuple(shapes) == SCALAR_OPERANDS
     return sum(shapes.values())

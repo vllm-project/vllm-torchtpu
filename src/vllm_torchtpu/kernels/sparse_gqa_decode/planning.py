@@ -106,8 +106,7 @@ def resource_usage(cfgs: configs.RpaConfigs) -> ResourceUsage:
     worst_steps = pl.cdiv(n * tiles, cfgs.batch_size)
     metadata = schedule.BaseMetadataComputer.get_rpa_schedule(cfgs)
     schedule_bytes = sum(x.size * x.dtype.itemsize for x in jax.tree.leaves(metadata))
-    # Actual scalar prefetch: cu_q_lens, offsets, q_lens and virtual pages.
-    scalar_bytes = scalar_prefetch_words(n, cfgs.serve.num_page_indices) * WORD_BYTES
+    scalar_bytes = scalar_prefetch_words(n) * WORD_BYTES
     q_bytes = math.prod(cfgs.q_vmem_shape) * cfgs.serve.dtype_q.itemsize
     kv_bytes = math.prod(cfgs.kv_vmem_shape) * cfgs.serve.dtype_kv.itemsize
     buffers = (

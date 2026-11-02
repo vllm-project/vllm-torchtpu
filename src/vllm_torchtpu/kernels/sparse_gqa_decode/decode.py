@@ -47,12 +47,11 @@ def _attend(q, gate, blocks, lengths, table, cache, *, launch, k_scale, v_scale)
     unused_new_kv = jnp.zeros((batch, *cache.shape[2:]), cache.dtype)
     cu_q_lens = jnp.arange(batch + 1, dtype=jnp.int32)
     q_lens = (kv_lens > 0).astype(jnp.int32)
-    metadata = schedule.generate(cu_q_lens, kv_lens, cfgs)
+    metadata = schedule.generate(cu_q_lens, kv_lens, pages, cfgs)
     out, next_cache = decode_kernel(
         cu_q_lens=cu_q_lens,
         compressed_query_offsets=kv_lens - q_lens,
         q_lens=q_lens,
-        pages=pages.reshape(-1),
         metadata=metadata,
         query=query,
         unused_new_kv=unused_new_kv,

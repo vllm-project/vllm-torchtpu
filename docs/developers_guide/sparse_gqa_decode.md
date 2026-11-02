@@ -32,6 +32,9 @@ The shared RPA wait ABI uses 128 uint32 words per row: `128*4 = 512` bytes.
 This is the supported row-preserving policy, not a silicon DMA minimum.
 Unknown fields fail closed. Selected KV is not materialized in an HBM gather;
 the returned cache aliases its input and preserves the caller's donation.
+The schedule resolves physical page IDs before the shared KV buffers consume it.
+Decode scalar prefetch holds query lengths and offsets; the RPA fallback accounts
+for both page-table DMA windows in its SMEM bound.
 
 The visible RPA pipeline retains input/output slots 3/2 and LAST_TILE scratch
 carry/reset. Sigmoid, explicit BF16 rounding and multiplication precede output

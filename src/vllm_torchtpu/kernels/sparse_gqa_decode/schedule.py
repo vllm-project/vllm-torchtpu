@@ -146,7 +146,10 @@ def _kernel(meta_ref, *out_refs, cfgs, names):
 
 
 def generate(
-    cu_q_lens: jax.Array, lengths: jax.Array, cfgs: configs.RpaConfigs
+    cu_q_lens: jax.Array,
+    lengths: jax.Array,
+    pages: jax.Array,
+    cfgs: configs.RpaConfigs,
 ) -> schedule.RpaSchedule:
     shape = schedule.BaseMetadataComputer.get_rpa_schedule(cfgs)
     steps, lanes = cfgs.max_steps_ub, cfgs.batch_size
@@ -194,11 +197,19 @@ def generate(
         jax.ShapeDtypeStruct((steps, ref.data.size // steps), jnp.int32)
         for _, ref in fields
     ]
-    outputs = pl.pallas_call(
-        functools.partial(_kernel, cfgs=cfgs, names=names),
-        out_shape=out_shape,
-        name="qsa_decode_schedule",
-    )(meta)
+    outputs = list(
+        pl.pallas_call(
+            functools.partial(_kernel, cfgs=cfgs, names=names),
+            out_shape=out_shape,
+            name="qsa_decode_schedule",
+        )(meta)
+    )
+    dma_index = names.index("dma_kv_cache")
+    dma = outputs[dma_index].reshape(steps, lanes, cfgs.bkv_p_cache, len(KV_DMA_FIELDS))
+    # Shared RPA buffers consume physical page IDs from the schedule itself.
+    sources = pages.reshape(-1)[dma[..., 0]]
+    dma = dma.at[..., 0].set(jnp.where(live[..., None], sources, 0))
+    outputs[dma_index] = dma.reshape(outputs[dma_index].shape)
     return jax.tree.unflatten(
         jax.tree.structure(shape),
         [

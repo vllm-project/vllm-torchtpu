@@ -87,7 +87,6 @@ def decode_kernel(
     cu_q_lens: jax.Array,
     compressed_query_offsets: jax.Array,
     q_lens: jax.Array,
-    pages: jax.Array,
     metadata: schedule.RpaSchedule,
     query: jax.Array,
     unused_new_kv: jax.Array,
@@ -112,7 +111,6 @@ def decode_kernel(
         cu_ref,
         offsets_ref,
         q_lens_ref,
-        pages_ref,
         metadata_ref,
         query_ref,
         new_kv_ref,
@@ -160,7 +158,7 @@ def decode_kernel(
 
                 q_bound = q_alloc.bind(src_ref=(query_ref, schedule_ref))
                 o_bound = o_alloc.bind(dst_ref=(out_ref, schedule_ref))
-                kv_refs = (cache_ref, new_kv_ref, schedule_ref, pages_ref)
+                kv_refs = (cache_ref, new_kv_ref, schedule_ref)
                 kv_bound = kv_alloc.bind(src_ref=kv_refs, dst_ref=kv_refs)
 
                 def compute(
@@ -202,7 +200,7 @@ def decode_kernel(
 
         execute()
 
-    scalars = (cu_q_lens, compressed_query_offsets, q_lens, pages)
+    scalars = (cu_q_lens, compressed_query_offsets, q_lens)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     return pl.pallas_call(
         run,
