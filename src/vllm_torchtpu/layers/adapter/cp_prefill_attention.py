@@ -164,7 +164,9 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
         _halo_exchange_fn(mesh),
         mesh=mesh,
         input_partition_specs=(P(_AXIS),),
-        output_partition_specs=P(_AXIS),
+        # One spec per output: torch_tpu iterates this, and a bare PartitionSpec
+        # would be iterated axis name by axis name.
+        output_partition_specs=(P(_AXIS),),
     )
     halo_exchange.register_fake(torch.empty_like)
     return LayerOps(
