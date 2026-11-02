@@ -214,8 +214,6 @@ def get_scale_factors(
     return k, v, k_scale, v_scale
 
 
-# The `pl.when` region in `rpa_body` is a basic block boundary, so splitting
-# these keeps the mask arithmetic isolated to the bodies that need it.
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class StitchMetadata:
@@ -255,6 +253,8 @@ def _compute_valid_kv_mask(
     return valid
 
 
+# The `pl.when` region in `rpa_body` is a basic block boundary, so splitting
+# these keeps the mask arithmetic isolated to the bodies that need it.
 def fetch_stitch_metadata(
     step: jax.Array,
     schedule_ref: schedule.RpaSchedule,

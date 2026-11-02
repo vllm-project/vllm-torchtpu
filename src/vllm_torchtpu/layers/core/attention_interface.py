@@ -383,6 +383,9 @@ def sharded_ragged_paged_attention(
     page_size_axis = 1
     if kv_layout is not None and not use_hd64:
         layout_kwargs["kv_layout"] = rpa_batched.configs.KVLayout(kv_layout)
+        layout_kwargs["mask_invalid_v"] = (
+            kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+        )
         if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
             kv_cache_spec = P(None, "model", None, None, None)
             page_size_axis = 4
