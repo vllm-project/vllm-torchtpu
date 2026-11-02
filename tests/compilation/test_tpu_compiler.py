@@ -737,6 +737,108 @@ class TestTpuCompilerCache:
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
 
+    def test_ep_rank_order_permutes_signature_and_keeps_host_orders_side_by_side(
+        self, tmp_path, monkeypatch
+    ):
+        """Swapping multi-host TPU pod placement permutes ep_rank_order() while
+        keeping the FX graph and vLLM AOT cache key identical.
+
+        1. A legacy/mismatched artifact saved under host order A must be
+           refused by _replay when loaded under host order B.
+        2. load() under host order B must compile and persist its own
+           order-qualified artifact without clobbering host order A's file, so
+           subsequent warm runs on either host placement hit the cache.
+        """
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import shape_variants, tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+        from vllm_torchtpu.distributed import ep_mesh
+
+        host_order_a = (0, 1, 6, 7, 2, 3, 4, 5, 8, 9, 14, 15, 10, 11, 12, 13)
+        device_ids_a = (0, 1, 4, 5, 6, 7, 2, 3, 8, 9, 12, 13, 14, 15, 10, 11)
+        host_order_b = (8, 9, 14, 15, 10, 11, 12, 13, 0, 1, 6, 7, 2, 3, 4, 5)
+        device_ids_b = (8, 9, 12, 13, 14, 15, 10, 11, 0, 1, 4, 5, 6, 7, 2, 3)
+
+        state = {"order": None, "device_ids": None}
+        monkeypatch.setattr(ep_mesh, "ep_rank_order", lambda **_: state["order"])
+        monkeypatch.setattr(ep_mesh, "ep_device_ids", lambda **_: state["device_ids"])
+
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+        sig_no_ep = shape_variants.graph_signature(graph)
+
+        state["order"], state["device_ids"] = host_order_a, device_ids_a
+        sig_a = shape_variants.graph_signature(graph)
+        state["order"], state["device_ids"] = host_order_b, device_ids_b
+        sig_b = shape_variants.graph_signature(graph)
+
+        assert sig_no_ep != sig_a
+        assert sig_a != sig_b
+
+        compiled_orders = []
+
+        class Compiled:
+            def __init__(self, order):
+                self.order = order
+
+            def __call__(self, *args):
+                return (self.order,)
+
+            def serialize(self):
+                return f"entry-{self.order[0]}"
+
+        monkeypatch.setattr(
+            tpu_compiler,
+            "_tpu_backend",
+            lambda g, inputs: (
+                compiled_orders.append(state["order"][0]) or Compiled(state["order"])
+            ),
+        )
+        monkeypatch.setattr(
+            tpu_compiler,
+            "_deserialize_entry",
+            lambda entry: lambda *args: (entry,),
+        )
+
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(cache_dir=str(tmp_path / "hash" / "rank_0_0" / "sub"))
+        compile_range = Range(start=16, end=16)
+
+        # Cold compile on host order A (slice-0-0 on physical host 0).
+        state["order"], state["device_ids"] = host_order_a, device_ids_a
+        fn_a, handle_a = compiler.compile(
+            graph, [], {}, compile_range, key="artifact_compile_range_16_16"
+        )
+        assert compiled_orders == [0]
+        assert fn_a() == host_order_a
+        _, path_a, _ = handle_a
+        assert os.path.exists(path_a)
+
+        # Direct _replay of host order A's file under host order B must be refused.
+        state["order"], state["device_ids"] = host_order_b, device_ids_b
+        assert compiler._replay(path_a, graph, was_wrapped=True) is None
+
+        # Warm load() with handle_a when scheduled onto host order B compiles
+        # for B and writes a separate file without overwriting path_a.
+        fn_b = compiler.load(handle_a, graph, [], 0, compile_range)
+        assert compiled_orders == [0, 8]
+        assert fn_b() == host_order_b
+        path_b = compiler._ep_artifact_path(path_a)
+        assert path_b != path_a
+        assert os.path.exists(path_a) and os.path.exists(path_b)
+
+        # Subsequent warm loads on EITHER host order replay from disk with no
+        # further backend compilation.
+        for order, device_ids, expected_entry in (
+            (host_order_a, device_ids_a, "entry-0"),
+            (host_order_b, device_ids_b, "entry-8"),
+        ):
+            state["order"], state["device_ids"] = order, device_ids
+            fn = compiler.load(handle_a, graph, [], 0, compile_range)
+            assert fn() == expected_entry
+        assert compiled_orders == [0, 8]
+
 
 def test_deserialize_entry_does_not_copy_the_entry():
     """Replay rebuilds the runnable from the entry itself: a deepcopy would load

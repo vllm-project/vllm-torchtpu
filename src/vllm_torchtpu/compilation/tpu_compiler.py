@@ -47,6 +47,7 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed import ep_mesh
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -713,6 +714,25 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
             return None
 
+    @staticmethod
+    def _ep_artifact_path(path: str) -> str:
+        """Qualify an artifact path with the active EP rank/device order.
+
+        On multi-host TPU slices, pod-to-host scheduling can invert which host
+        holds EP ranks 0..7 vs 8..15 while vLLM's AOT compile cache key stays
+        the same. Qualifying the artifact filename by `(ep_rank_order,
+        ep_device_ids)` lets a shared compilation cache store both host-order
+        permutations side-by-side without overwriting one another on warm runs.
+        When EP is off (`ep_rank_order() is None`), returns `path` unchanged.
+        """
+        base = re.sub(r"\.ep_[0-9a-f]{12}$", "", path)
+        order = ep_mesh.ep_rank_order(cached_only=True)
+        if order is None:
+            return base
+        device_ids = ep_mesh.ep_device_ids(cached_only=True)
+        digest = hashlib.sha256(repr((order, device_ids)).encode()).hexdigest()[:12]
+        return f"{base}.ep_{digest}"
+
     def _peer_paths(self, key: str) -> list[str]:
         """Where the other ranks have saved their artifact for `key`.
 
@@ -728,13 +748,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         rank_dir, prefix = os.path.split(own)
         if re.fullmatch(r"rank_\d+_\d+", os.path.basename(rank_dir)) is None:
             return []
+        ep_key = self._ep_artifact_path(key)
         pattern = os.path.join(
             glob.escape(os.path.dirname(rank_dir)),
             "rank_*_*",
             glob.escape(prefix),
-            glob.escape(key),
+            glob.escape(ep_key),
         )
-        mine = os.path.join(own, key)
+        mine = os.path.join(own, ep_key)
         return sorted(p for p in glob.glob(pattern) if p != mine)
 
     def _replay_from_peer(
@@ -851,7 +872,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                 compile_range,
                 peer_path,
             )
-            save_path = os.path.join(self.cache_dir, key)
+            save_path = self._ep_artifact_path(os.path.join(self.cache_dir, key))
             handle = (
                 (key, save_path, was_wrapped)
                 if self._link_artifact(peer_path, save_path)
@@ -885,7 +906,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         handle = None
         if caching and entry is not None:
             assert self.cache_dir is not None
-            save_path = os.path.join(self.cache_dir, key)
+            save_path = self._ep_artifact_path(os.path.join(self.cache_dir, key))
             if self._save_handle(
                 key, save_path, entry, graph, was_wrapped, fingerprint
             ):
@@ -927,6 +948,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         """
         assert isinstance(handle, tuple) and len(handle) == 3
         key, path, _saved_was_wrapped = handle
+        path = self._ep_artifact_path(path)
         size = _single_size(compile_range)
         # Screened on the load path too, and for a second reason beyond
         # "unsupported bucket": vLLM's key is (subgraph, bucket) with no graph
