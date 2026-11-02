@@ -32,12 +32,12 @@ from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch.distributed import _functional_collectives as funcol
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
-    tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4Model
 from vllm.model_executor.models.utils import sequence_parallel_chunk
@@ -133,6 +133,21 @@ def _patched_model_init(self: Gemma4Model, *args: Any, **kwargs: Any) -> None:
         )
 
 
+# Functional collectives: vLLM's all_gather and reduce_scatter allocate their
+# output with torch.empty at the traced token count, which torch_tpu cannot
+# lower while that count is symbolic (the fused EP MoE gathers the same way).
+def _all_gather_rows(x: torch.Tensor) -> torch.Tensor:
+    return funcol.wait_tensor(
+        funcol.all_gather_tensor(x, 0, get_tp_group().device_group)
+    )
+
+
+def _reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
+    return funcol.wait_tensor(
+        funcol.reduce_scatter_tensor(x, "sum", 0, get_tp_group().device_group)
+    )
+
+
 def _gathered_projection(linear: Any, x_local: torch.Tensor) -> torch.Tensor:
     """Column-parallel ``linear`` on the all-gather of token-sharded rows."""
     method = linear.quant_method
@@ -142,10 +157,10 @@ def _gathered_projection(linear: Any, x_local: torch.Tensor) -> torch.Tensor:
     ):
         x_q, x_scale = method.quantize_input(linear, x_local)
         # Collectives move FP8 as raw bytes.
-        rows_q = tensor_model_parallel_all_gather(x_q.view(torch.int8), 0)
-        x_scale = tensor_model_parallel_all_gather(x_scale, 0)
+        rows_q = _all_gather_rows(x_q.view(torch.int8))
+        x_scale = _all_gather_rows(x_scale)
         return method.apply_quantized_input(linear, rows_q.view(x_q.dtype), x_scale)
-    out, _ = linear(tensor_model_parallel_all_gather(x_local, 0))
+    out, _ = linear(_all_gather_rows(x_local))
     return out
 
 
@@ -178,10 +193,7 @@ def _sequence_parallel_layer(
     )
     attn_out = _attention(attn, positions, qkv).chunk(len(residual))
     hidden_states = [
-        self.post_attention_layernorm(
-            tensor_model_parallel_reduce_scatter(attn.o_proj(a)[0], 0)
-        )
-        + r
+        self.post_attention_layernorm(_reduce_scatter_rows(attn.o_proj(a)[0])) + r
         for a, r in zip(attn_out, residual)
     ]
     residual = hidden_states
@@ -203,31 +215,23 @@ def _sequence_parallel_layer(
         assert self.experts is not None
         assert self.post_feedforward_layernorm_2 is not None
         mlp_out = [
-            self.post_feedforward_layernorm_1(
-                tensor_model_parallel_reduce_scatter(m, 0)
-            )
-            for m in mlp_out
+            self.post_feedforward_layernorm_1(_reduce_scatter_rows(m)) for m in mlp_out
         ]
         # gmm_v2 quantizes its lhs per 512-column block, so the experts take
         # bf16 rows; every rank routes all of a chunk's tokens, as upstream does.
         experts_out = [
             self.experts(
-                tensor_model_parallel_all_gather(
-                    self.pre_feedforward_layernorm_2(r), 0
-                ),
-                tensor_model_parallel_all_gather(self.router(r), 0),
+                _all_gather_rows(self.pre_feedforward_layernorm_2(r)),
+                _all_gather_rows(self.router(r)),
             )
             for r in residual
         ]
         hidden_states = [
-            m
-            + self.post_feedforward_layernorm_2(
-                tensor_model_parallel_reduce_scatter(e, 0)
-            )
+            m + self.post_feedforward_layernorm_2(_reduce_scatter_rows(e))
             for m, e in zip(mlp_out, experts_out)
         ]
     else:
-        hidden_states = [tensor_model_parallel_reduce_scatter(m, 0) for m in mlp_out]
+        hidden_states = [_reduce_scatter_rows(m) for m in mlp_out]
     return [
         (self.post_feedforward_layernorm(h) + r) * self.layer_scalar
         for h, r in zip(hidden_states, residual)
@@ -332,9 +336,7 @@ def _patched_model_forward(
         hidden_states, _ = layer(
             positions, hidden_states, None, sequence_parallel=True, **kwargs
         )
-    return torch.cat(
-        [tensor_model_parallel_all_gather(self.norm(h), 0) for h in hidden_states]
-    )
+    return torch.cat([_all_gather_rows(self.norm(h)) for h in hidden_states])
 
 
 def maybe_patch_gemma4_sequence_parallel(
@@ -345,6 +347,12 @@ def maybe_patch_gemma4_sequence_parallel(
         return None
     if model_config is None or model_config.hf_text_config.model_type != "gemma4_text":
         return False
+    if envs.TPU_PRECOMPILE_PEER_REPLAY:
+        # sequence_parallel_chunk bakes each rank's rows into its program while
+        # the FX graph, which peer replay fingerprints, is the same on every rank.
+        raise ValueError(
+            "TPU_GEMMA4_SEQUENCE_PARALLEL does not support TPU_PRECOMPILE_PEER_REPLAY"
+        )
     microbatches = envs.TPU_GEMMA4_SP_MICROBATCHES
     if microbatches < 1:
         raise ValueError(f"TPU_GEMMA4_SP_MICROBATCHES must be >= 1, got {microbatches}")

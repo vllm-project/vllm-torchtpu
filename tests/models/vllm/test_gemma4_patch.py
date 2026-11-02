@@ -110,8 +110,8 @@ def mock_collectives(monkeypatch: pytest.MonkeyPatch):
         mock = _TPCollectiveMock(tp)
         for name, fn in (
             ("tensor_model_parallel_all_reduce", mock.all_reduce),
-            ("tensor_model_parallel_reduce_scatter", mock.reduce_scatter),
-            ("tensor_model_parallel_all_gather", mock.all_gather),
+            ("_reduce_scatter_rows", mock.reduce_scatter),
+            ("_all_gather_rows", mock.all_gather),
         ):
             monkeypatch.setattr(gemma4_patch, name, fn)
         return mock
@@ -528,11 +528,8 @@ def test_branches_trace_the_same_inputs(monkeypatch, moe: bool) -> None:
     pp = SimpleNamespace(is_first_rank=True, is_last_rank=True)
     for name, fn in (
         ("tensor_model_parallel_all_reduce", lambda x: x * 1),
-        (
-            "tensor_model_parallel_reduce_scatter",
-            lambda x, dim=0: x.chunk(tp, dim)[rank].contiguous(),
-        ),
-        ("tensor_model_parallel_all_gather", lambda x, dim=0: torch.cat([x] * tp, dim)),
+        ("_reduce_scatter_rows", lambda x: x.chunk(tp)[rank].contiguous()),
+        ("_all_gather_rows", lambda x: torch.cat([x] * tp)),
         ("get_tensor_model_parallel_world_size", lambda: tp),
         ("sequence_parallel_chunk", lambda x: x.chunk(tp)[rank].clone()),
     ):
@@ -748,8 +745,12 @@ def test_maybe_patch_waits_for_gemma4(monkeypatch: pytest.MonkeyPatch) -> None:
         for name in ("__init__", "forward")
     }
     monkeypatch.setattr(gemma4_patch, "_microbatches", gemma4_patch._microbatches)
-    monkeypatch.setattr(envs, "TPU_GEMMA4_SP_MICROBATCHES", 0)
     cfg = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="gemma4_text"))
+    monkeypatch.setattr(envs, "TPU_PRECOMPILE_PEER_REPLAY", True)
+    with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_REPLAY"):
+        gemma4_patch.maybe_patch_gemma4_sequence_parallel(cfg)
+    monkeypatch.setattr(envs, "TPU_PRECOMPILE_PEER_REPLAY", False)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_SP_MICROBATCHES", 0)
     with pytest.raises(ValueError, match="TPU_GEMMA4_SP_MICROBATCHES"):
         gemma4_patch.maybe_patch_gemma4_sequence_parallel(cfg)
     monkeypatch.setattr(envs, "TPU_GEMMA4_SP_MICROBATCHES", 2)
