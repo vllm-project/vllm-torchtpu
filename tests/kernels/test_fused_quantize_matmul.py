@@ -52,6 +52,35 @@ def test_matches_xla_quantized_matmul(m: int, k: int, n: int) -> None:
     )
 
 
+@pytest.mark.parametrize("k,n", [(1024, 32768), (4096, 1536)])
+def test_returns_quantized_activation(k: int, n: int) -> None:
+    """The returned activation stands in for `quantize_tensor`'s, so a second
+    matmul of it matches `xla_quantized_matmul` too."""
+    m = 1024
+    kx, kw, ks, kw2, ks2 = jax.random.split(jax.random.key(1), 5)
+    x = jax.random.normal(kx, (m, k), jnp.bfloat16).at[3].set(0)
+    w_q = (jax.random.normal(kw, (k, n)) * 0.5).astype(jnp.float8_e4m3fn)
+    w_scale = jax.random.uniform(ks, (n,), minval=1e-3, maxval=1e-2)
+    w_q2 = (jax.random.normal(kw2, (k, 8192)) * 0.5).astype(jnp.float8_e4m3fn)
+    w_scale2 = jax.random.uniform(ks2, (8192,), minval=1e-3, maxval=1e-2)
+
+    out, x_q, x_scale = fused_quantize_matmul.fused_quantize_matmul(
+        x, w_q, w_scale, return_quantized=True
+    )
+    expected_x_q, expected_x_scale = util.quantize_tensor(x, w_q.dtype)
+    second = util.xla_prequantized_matmul(x_q, x_scale, w_q2, w_scale2, x.dtype)
+    pairs = [
+        (x_q, expected_x_q),
+        (x_scale, expected_x_scale),
+        (out, util.xla_quantized_matmul(x, w_q, w_scale)),
+        (second, util.xla_quantized_matmul(x, w_q2, w_scale2)),
+    ]
+    for got, expected in pairs:
+        np.testing.assert_array_equal(
+            np.asarray(got).view(np.uint8), np.asarray(expected).view(np.uint8)
+        )
+
+
 @pytest.mark.parametrize(
     "m,w_dtype",
     [
