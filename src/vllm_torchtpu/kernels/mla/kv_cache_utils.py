@@ -251,10 +251,50 @@ def pack_tokens(values: jax.Array, token_bytes: int) -> jax.Array:
     return bands[:, 0] | (bands[:, 1] << 8) | (bands[:, 2] << 16) | (bands[:, 3] << 24)
 
 
+def _sequence_membership(
+    num_tokens: int,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array | int | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Returns `(tok [T], seq_id [T], member [T, S])` via interval membership."""
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    tok_col = tok[:, None]
+    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)[None, :]
+    member = (tok_col >= cu_q_lens[None, :-1]) & (tok_col < cu_q_lens[None, 1:])
+    if num_seqs is not None:
+        member = member & (seq_idx < num_seqs)
+    # Clamped so overlapping (malformed) intervals cannot sum past the last slot.
+    seq_id = jnp.minimum(
+        jnp.sum(jnp.where(member, seq_idx, 0), axis=1), max_num_seqs - 1
+    )
+    return tok, seq_id, member
+
+
+def token_seq_ids(
+    cu_q_lens: jax.Array,
+    num_tokens: int,
+    num_seqs: jax.Array | int | None = None,
+) -> jax.Array:
+    """Maps each token in `[0, num_tokens)` to its sequence ID (`0` on padding).
+
+    Uses a `[T, S]` interval membership mask rather than `jnp.searchsorted`
+    (which lowers to a binary-search `while` loop) or
+    `jnp.repeat(..., total_repeat_length=...)` (which lowers to `cumsum` +
+    non-unique `scatter-add` + `cumsum`, expanding into a loop on TPU). When
+    `num_seqs` is provided, trailing slots `>= num_seqs` in `cu_q_lens` are
+    masked out so callers that only populate `cu_q_lens[:num_seqs + 1]` cannot
+    collide with active intervals.
+    """
+    _, seq_id, _ = _sequence_membership(num_tokens, cu_q_lens, num_seqs=num_seqs)
+    return seq_id
+
+
 def _row_positions(
     num_tokens: int,
     seq_lens: jax.Array,
     query_start_loc: jax.Array,
+    num_seqs: jax.Array | int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Per-row `(token, sequence, global KV position, valid)`.
 
@@ -262,19 +302,24 @@ def _row_positions(
     tokens, so a chunked-prefill continuation resumes at the right offset
     rather than at zero.
 
-    Padded tokens index past the last sequence; `seq_id` is clamped so the
-    gathers stay in bounds and `valid` is returned alongside so every caller
-    masks them out the same way. Shared by the sharded and unsharded writers so
-    they cannot drift into two different notions of where a row belongs.
+    Without `num_seqs`, requires `query_start_loc` (`shape [max_num_seqs + 1]`)
+    to be monotonically non-decreasing across all slots (empty trailing slots
+    repeat the last offset, as padded by `TPUModelRunner`) so intervals are
+    disjoint. When `num_seqs` is given, slots `>= num_seqs` are ignored, the
+    same contract as `token_seq_ids`. Uses a `[T, S]` interval membership mask
+    instead of
+    `jnp.searchsorted` (which lowers to an HLO `while` loop). Padded tokens
+    index past the last active interval (`seq_id = 0`, `valid = False`) so
+    gathers stay in bounds and every caller masks them out the same way. Shared
+    by the sharded and unsharded writers so they cannot drift into two
+    different notions of where a row belongs.
     """
-    num_seqs = seq_lens.shape[0]
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_id = jnp.searchsorted(query_start_loc[1:], tok, side="right").astype(jnp.int32)
-    valid = tok < query_start_loc[-1]
-
-    seq_id = jnp.minimum(seq_id, num_seqs - 1)
-    q_len = query_start_loc[seq_id + 1] - query_start_loc[seq_id]
-    pos = seq_lens[seq_id] - q_len + (tok - query_start_loc[seq_id])
+    tok, seq_id, member = _sequence_membership(
+        num_tokens, query_start_loc, num_seqs=num_seqs
+    )
+    pos_offset = seq_lens - query_start_loc[1:]
+    pos = tok + jnp.sum(jnp.where(member, pos_offset[None, :], 0), axis=1)
+    valid = jnp.any(member, axis=1)
     return tok, seq_id, pos, valid
 
 
@@ -284,9 +329,16 @@ def get_page_and_slot(
     block_tables: jax.Array,
     query_start_loc: jax.Array,
     page_size: int,
+    num_seqs: jax.Array | int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Computes target (page, slot) in the paged KV cache for each token."""
-    _, seq_id, pos, valid = _row_positions(num_tokens, seq_lens, query_start_loc)
+    """Computes target (page, slot) in the paged KV cache for each token.
+
+    `num_seqs`, when given, ignores `query_start_loc` slots `>= num_seqs`
+    (see `_row_positions`).
+    """
+    _, seq_id, pos, valid = _row_positions(
+        num_tokens, seq_lens, query_start_loc, num_seqs=num_seqs
+    )
 
     block_tables_2d = block_tables.reshape(seq_lens.shape[0], -1)
     max_pages_per_seq = block_tables_2d.shape[1]
