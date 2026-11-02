@@ -26,6 +26,7 @@ from jax.sharding import Mesh
 
 from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
     blocked_down,
+    blocked_down_fused,
     grouped_shared_expert_sharded,
     silu_and_mul,
 )
@@ -75,3 +76,52 @@ def test_each_rank_gets_the_whole_expert_on_its_rows(group):
     # being summed in bf16 (group > 1).
     tol = 1e-3 if group == 1 else 1e-2
     assert np.linalg.norm(got - want) / np.linalg.norm(want) < tol
+
+
+@pytest.mark.parametrize(
+    "m, blocks, block_m",
+    [(64, 16, 512), (256, 4, 128), (32, 2, 512)],
+)
+def test_fused_down_is_bitwise_blocked_down(m, blocks, block_m):
+    # The served shapes' structure: 128-channel blocks, rows tiled or not.
+    k, n = blocks * 128, 256
+    ks = jax.random.split(jax.random.key(1), 3)
+    act = (jax.random.normal(ks[0], (m, k)) * 3).astype(jnp.bfloat16)
+    act = act.at[0].set(0)  # a zero row: scale 1, zero partials
+    w2 = (jax.random.normal(ks[1], (k, n)) * 32).astype(FP8)
+    s2 = jax.random.uniform(ks[2], (blocks, n), minval=0.5, maxval=1.5) / 32
+    want = jax.jit(blocked_down)(act, w2, s2)
+    got = jax.jit(
+        lambda a, w, s: blocked_down_fused(
+            a, w, s, block_m=block_m, block_n=128, interpret=True
+        )
+    )(act, w2, s2)
+    bits = jax.lax.bitcast_convert_type
+    assert np.array_equal(bits(got, jnp.uint16), bits(want, jnp.uint16))
+
+
+@pytest.mark.parametrize("group", [1, 4])
+def test_sharded_fused_down_matches_the_xla_down(group):
+    n = len(jax.devices())
+    if n < 4 or n % group:
+        pytest.skip("needs 4+ devices divisible by the group")
+    mesh = Mesh(np.array(jax.devices()), (AX,))
+    k, inter, hid, t, blocks = 128, 128 * n // group, 256, 32, n
+    ks = jax.random.split(jax.random.key(2), 5)
+    w13 = (jax.random.normal(ks[0], (k, 2 * inter)) * 32).astype(FP8)
+    s13 = jax.random.uniform(ks[1], (2 * inter,), minval=0.5, maxval=1.5) / 32
+    w2 = (jax.random.normal(ks[2], (inter, hid)) * 32).astype(FP8)
+    s2 = jax.random.uniform(ks[3], (blocks, hid), minval=0.5, maxval=1.5) / 32
+    x = jax.random.normal(ks[4], (n * t, k)).astype(jnp.bfloat16)
+    members = [_member(w13, s13, w2, s2, n, group, m) for m in range(group)]
+    stacked = [
+        jnp.concatenate([members[r % group][i] for r in range(n)]) for i in range(4)
+    ]
+    want = jax.jit(grouped_shared_expert_sharded(mesh, AX, group))(x, *stacked)
+    got = jax.jit(
+        grouped_shared_expert_sharded(mesh, AX, group, fused_down=True, interpret=True)
+    )(x, *stacked)
+    got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
+    # Bitwise on its own (above); here XLA:CPU may sum a dot's 128 products in
+    # another order inside the larger program, which flips a rare bf16 ulp.
+    assert np.linalg.norm(got - want) / np.linalg.norm(want) < 1e-3

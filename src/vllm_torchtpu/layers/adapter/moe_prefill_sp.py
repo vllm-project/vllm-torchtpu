@@ -244,15 +244,17 @@ def _stack_group_slices(
 _SHARED_OPS: dict[tuple, Any] = {}
 
 
-def _build_shared_op(group: int) -> Any:
+def _build_shared_op(group: int, fused_down: bool) -> Any:
     """The grouped shared expert as one SPMD op over the EP mesh (built at
     load, outside Dynamo)."""
-    key = (group,)
+    key = (group, fused_down)
     if key in _SHARED_OPS:
         return _SHARED_OPS[key]
     mesh = build_ep_mesh()
     # jax_op hands fn the global arrays: the per-rank body goes under shard_map.
-    sharded = grouped_shared_expert_sharded(mesh, EP_AXIS_NAME, group)
+    sharded = grouped_shared_expert_sharded(
+        mesh, EP_AXIS_NAME, group, fused_down=fused_down
+    )
 
     def fn(
         x: jax.Array, w13: jax.Array, s13: jax.Array, w2: jax.Array, s2: jax.Array
@@ -261,7 +263,7 @@ def _build_shared_op(group: int) -> Any:
 
     spec = PartitionSpec(EP_AXIS_NAME)
     op = jax_op(
-        f"pallas::moe_prefill_sp_shared_g{group}",
+        f"pallas::moe_prefill_sp_shared_g{group}" + ("_fd" if fused_down else ""),
         fn,
         mesh=mesh,
         input_partition_specs=(spec,) * 5,
@@ -619,7 +621,11 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         shared_parts.append(
             _group_mlp(mlp.shared_experts, tp, get_tp_group().rank_in_group, group)
         )
-        setattr(mlp, SHARED_OP, _build_shared_op(group))
+        setattr(
+            mlp,
+            SHARED_OP,
+            _build_shared_op(group, envs.TPU_MOE_PREFILL_SP_SHARED_FUSED_DOWN),
+        )
     _stack_group_slices(backbone, [layer.mlp for layer in layers[first:]], shared_parts)
     del shared_parts
     # TPU_MLA_PREFILL_SEQUENCE_ROWS: which layers take the rows block; with
@@ -642,7 +648,9 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             DENSE_STACK,
         )
         for layer in dense:
-            setattr(layer.mlp, SHARED_OP, _build_shared_op(group))
+            # The dense MLPs keep the XLA down projection; the fused one was
+            # measured on the shared experts only.
+            setattr(layer.mlp, SHARED_OP, _build_shared_op(group, False))
     for i, layer in enumerate(layers):
         if i < first and not rows_armed[i]:
             continue

@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     TPU_MLA_PREFILL_ROWS_GATHER: str = "allgather"
     TPU_MLA_PREFILL_ROWS_MIN_TOKENS: int = 2048
     TPU_MLA_PREFILL_ROWS_DENSE: bool = False
+    TPU_MOE_PREFILL_SP_SHARED_FUSED_DOWN: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -1184,6 +1185,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Smallest bucket TPU_MLA_PREFILL_SEQUENCE_ROWS takes (the shard gather is
     # the same size at every bucket; the collectives it replaces scale with it).
     "TPU_MLA_PREFILL_ROWS_MIN_TOKENS": env_int("TPU_MLA_PREFILL_ROWS_MIN_TOKENS", 2048),
+    # With TPU_MOE_PREFILL_SEQUENCE_PARALLEL: run the shared expert's
+    # block-scaled down projection as one kernel (`blocked_down_fused`), the
+    # per-block partials summed in VMEM rather than in HBM. Same values.
+    "TPU_MOE_PREFILL_SP_SHARED_FUSED_DOWN": env_bool(
+        "TPU_MOE_PREFILL_SP_SHARED_FUSED_DOWN", default=False
+    ),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
