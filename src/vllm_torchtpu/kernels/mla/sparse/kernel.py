@@ -1772,7 +1772,12 @@ def _attention_kernel(
     #            sublanes, PV with a transposed-LHS contraction; the lse
     #            arrives lane-dense (not bit-exact: reduction order).
     # Every stage-A lever except "xqk" is bitwise-identical.
-    assert not body_levers or group_tab_ref is not None or row_widths
+    assert (
+        not body_levers
+        or group_tab_ref is not None
+        or row_widths
+        or (sparsecore_layout and capped_windows is None)
+    )
     assert set(body_levers) <= set(MIXED_BODY_LEVERS) | {
         "nofill",
         "quad",
@@ -4127,6 +4132,8 @@ def sparse_ragged_paged_attention(
                     mixed_body_levers
                     if group_tab is None
                     and not decode_row_widths
+                    and sparsecore_layout
+                    and (q_pe is not None or "zu" not in mixed_body_levers)
                     and q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
                     else ()
                 )
