@@ -266,10 +266,71 @@ def test_gather_combine_masked_routes():
     gathered = (
         y[positions.reshape(-1)].reshape(tokens, topk, hidden).astype(jnp.float32)
     )
-    prod = gathered * weights[..., None].astype(jnp.float32)
-    want = jnp.where(valid[..., None], prod, 0.0).sum(axis=1).astype(jnp.bfloat16)
+    acc = jnp.zeros((tokens, hidden), jnp.float32)
+    for k in range(topk):
+        prod = gathered[:, k] * weights[:, k : k + 1].astype(jnp.float32)
+        acc = acc + jnp.where(valid[:, k : k + 1], prod, 0.0)
     got = np.asarray(out, np.float32)
-    assert np.isnan(got[0]).all() and np.isfinite(np.delete(got, 0, axis=0)).all()
-    np.testing.assert_allclose(
-        got[1:], np.asarray(want, np.float32)[1:], rtol=8e-3, atol=1e-2
+    assert np.isnan(got[0]).all() and np.isfinite(got[1:]).all()
+    np.testing.assert_array_equal(
+        got[1:], np.asarray(acc.astype(jnp.bfloat16), np.float32)[1:]
     )
+
+
+@pytest.mark.parametrize("skip_padded", [False, True])
+def test_masked_routes_end_to_end(skip_padded):
+    """EP-style routing (-1 ids) and zero-weight padded tokens through the
+    routing permutation, the expert kernel and the masked combine."""
+    tokens, experts, topk, hidden, inter = 64, 8, 4, 768, 128
+    kx, kr, kw = jax.random.split(jax.random.PRNGKey(7), 3)
+    x = jax.random.normal(kx, (tokens, hidden)).astype(jnp.bfloat16)
+    logits = jax.random.normal(kr, (tokens, 2 * experts))
+    weights, global_ids = jax.lax.top_k(jax.nn.softmax(logits, axis=-1), topk)
+    weights = weights.astype(jnp.bfloat16)
+    # This rank owns global experts [0, experts); the others are remote.
+    ids = jnp.where(global_ids < experts, global_ids, -1).astype(jnp.int32)
+    if skip_padded:
+        weights = weights.at[-8:].set(0)  # padded tokens
+    valid = (ids >= 0) & (weights != 0) if skip_padded else ids >= 0
+    flat_valid = valid.reshape(-1)
+    keys = jnp.where(flat_valid, ids.reshape(-1), experts)
+    order = jnp.argsort(keys, stable=True)
+    group_sizes = jnp.bincount(keys, length=experts + 1)[:experts].astype(jnp.int32)
+    positions = jnp.argsort(order).reshape(tokens, topk).astype(jnp.int32)
+    w1, w1s, w2, w2s = _weights(kw, experts, hidden, inter)
+    rows = G.gather_fused_moe(
+        G.quantize_pack_rows(x, interpret=True),
+        (order // topk).astype(jnp.int32),
+        group_sizes,
+        w1,
+        w1s,
+        w2,
+        w2s,
+        act="gelu_tanh",
+        tile_m=64,
+        height_step=32,
+        vmem_limit_bytes=_VMEM,
+        interpret=True,
+    )
+    out = G.gather_combine(
+        rows,
+        jnp.where(valid, positions, -1),
+        weights,
+        hidden_size=hidden,
+        tile_tokens=16,
+        masked=True,
+        interpret=True,
+    )
+    n_valid = int(group_sizes.sum())
+    y = _reference(
+        x, order[:n_valid] // topk, group_sizes, w1, w1s, w2, w2s, "gelu_tanh"
+    )
+    y = jnp.concatenate([y, jnp.full((len(order) - n_valid, hidden), jnp.nan, y.dtype)])
+    gathered = (
+        y[positions.reshape(-1)].reshape(tokens, topk, hidden).astype(jnp.float32)
+    )
+    acc = jnp.zeros((tokens, hidden), jnp.float32)
+    for k in range(topk):
+        prod = gathered[:, k] * weights[:, k : k + 1].astype(jnp.float32)
+        acc = acc + jnp.where(valid[:, k : k + 1], prod, 0.0)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(acc.astype(jnp.bfloat16)))
