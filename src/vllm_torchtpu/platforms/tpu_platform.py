@@ -1008,6 +1008,9 @@ class TpuPlatform(Platform):
                 "TPU supports rejection_sample_method 'standard' and 'synthetic' "
                 f"(got {speculative_config.rejection_sample_method!r})."
             )
+        is_attention_free = (
+            model_config.is_attention_free if model_config is not None else False
+        )
         if (
             vllm_config.speculative_config is not None
             and scheduler_config.async_scheduling
@@ -1042,6 +1045,15 @@ class TpuPlatform(Platform):
                     "unified KV pool; remove "
                     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0."
                 )
+        if (
+            is_attention_free
+            and cache_config.enable_prefix_caching
+            and not is_decode_bench
+        ):
+            raise NotImplementedError(
+                "Prefix caching on attention-free models is not yet "
+                "supported on TPU; run with --no-enable-prefix-caching."
+            )
 
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
