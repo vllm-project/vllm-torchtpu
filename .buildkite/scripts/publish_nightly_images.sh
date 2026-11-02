@@ -84,9 +84,7 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
     fi
   else
     # The pyproject.toml pin, which build_image.sh builds with.
-    # shellcheck source=/dev/null
-    source "${SCRIPT_DIR}/configs/pipeline_config.sh"
-    VLLM_COMMIT_HASH="$(get_vllm_commit_hash)"
+    VLLM_COMMIT_HASH="$(python3 "${SCRIPT_DIR}/bootstrap.py" vllm-pin)"
     DOCKERHUB_TARGET="dev"
     VLLM_REF="${VLLM_COMMIT_HASH}"
     if [[ "${VLLM_REF}" =~ ^[0-9a-f]{40}$ ]]; then
