@@ -177,6 +177,9 @@ class VllmQuantConfig:
         moe_config = layer.moe_config
         assert self.vllm_config is not None
         use_ep = self.vllm_config.parallel_config.enable_expert_parallel
+        # A layer built with a subset of the experts (ep_size > 1) is EP even
+        # without --enable-expert-parallel (TPU_MOE_TP_EXPERT_SPLIT).
+        use_ep = use_ep or moe_config.moe_parallel_config.ep_size > 1
         moe_config.moe_parallel_config.use_ep = use_ep
         return moe_config
 
