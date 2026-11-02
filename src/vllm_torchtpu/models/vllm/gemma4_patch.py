@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Gemma4 at TP > 1: a token-sharded residual stream for large token buckets.
+"""Gemma4 at TP > 1: prefill buckets restructured around the TP group.
 
 Upstream all-reduces every row-parallel output (o_proj, down_proj and, on MoE
 layers, the routed experts), then each TP rank runs the norms, the residual
@@ -24,32 +24,64 @@ projection's method quantizes its input per token anyway (the bytes it would
 have produced itself), in bf16 otherwise. The residual stream stays sharded
 from the embedding to the final norm, and one all-gather returns ``[T, H]`` to
 the runner. Smaller buckets, decode among them, keep upstream's all-reduces.
+
+With TPU_GEMMA4_CP_MIN_TOKENS, a bucket of at least that many tokens is a
+context-parallel program of its own instead: each rank holds two zigzag pieces
+of the step's one prompt (``cp_prefill.ZigzagPlan``) and runs every layer on
+them with a whole copy of the projections, so nothing is reduced; attention
+over the whole prompt, and the layer's TP KV cache, come from
+``cp_prefill_attention``. The embedding is the vocab shards' lookup
+reduce-scattered to each rank's rows, and an all-gather of the final hidden
+states returns ``[T, H]`` in token order.
 """
 
 from __future__ import annotations
 
+import copy
+import re
+from collections.abc import Callable, Iterable, Iterator
 from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch import nn
 from torch.distributed import _functional_collectives as funcol
+from vllm.compilation.backends import set_model_tag
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import set_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4Model
-from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.layers import vocab_parallel_embedding
+from vllm.model_executor.layers.attention.attention import get_attention_context
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.models.gemma4 import (
+    Gemma4DecoderLayer,
+    Gemma4ForCausalLM,
+    Gemma4Model,
+)
+from vllm.model_executor.models.utils import maybe_prefix, sequence_parallel_chunk
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.kernels.experimental.batched_rpa import cp_prefill
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.gemma4_attention_patch import attention_from_qkv
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_vllm_model_wrapper_context,
+)
 
 if TYPE_CHECKING:
-    from vllm.config import ModelConfig
+    from vllm.config import ModelConfig, VllmConfig
 
 logger = init_logger(__name__)
 
@@ -385,5 +417,457 @@ def maybe_patch_gemma4_sequence_parallel(
         "chunks; FP8 per-token projections all-gather FP8 rows, the rest bf16.",
         _MIN_SHARD_BYTES,
         _microbatches,
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Context parallelism (TPU_GEMMA4_CP_MIN_TOKENS)
+# ---------------------------------------------------------------------------
+
+_orig_causal_lm_init = Gemma4ForCausalLM.__init__
+_orig_causal_lm_forward = Gemma4ForCausalLM.forward
+_orig_model_load_weights = Gemma4Model.load_weights
+
+# TPU_GEMMA4_CP_MIN_TOKENS, read when the patch is applied.
+_cp_min_tokens = 0
+
+# Gemma4Model's submodule holding every layer's projections whole.
+_REPLICA = "cp_replica"
+# The checkpoint tensors (names as Gemma4Model.load_weights receives them) that
+# the replica takes too.
+_REPLICATED_TENSOR = re.compile(
+    r"layers\.\d+\.(self_attn\.[qkvo]_proj|mlp\.(gate|up|down)_proj)\."
+)
+
+
+class _ReplicaAttention(nn.Module):
+    def __init__(self, attn: Any, quant_config: Any, prefix: str) -> None:
+        super().__init__()
+        self.qkv_proj = QKVParallelLinear(
+            attn.hidden_size,
+            attn.head_dim,
+            attn.total_num_heads,
+            attn.total_num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+            disable_tp=True,
+        )
+        self.o_proj = RowParallelLinear(
+            attn.total_num_heads * attn.head_dim,
+            attn.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+            disable_tp=True,
+        )
+
+
+class _ReplicaMLP(nn.Module):
+    def __init__(
+        self, mlp: Any, hidden_size: int, quant_config: Any, prefix: str
+    ) -> None:
+        super().__init__()
+        intermediate_size = mlp.down_proj.input_size
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+            disable_tp=True,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+            disable_tp=True,
+        )
+
+
+class _ReplicaLayer(nn.Module):
+    def __init__(self, layer: Any, quant_config: Any, prefix: str) -> None:
+        super().__init__()
+        self.self_attn = _ReplicaAttention(
+            layer.self_attn, quant_config, f"{prefix}.self_attn"
+        )
+        self.mlp = _ReplicaMLP(
+            layer.mlp, layer.hidden_size, quant_config, f"{prefix}.mlp"
+        )
+
+
+class Gemma4ProjectionReplica(nn.Module):
+    """Every decoder layer's projections, whole on this rank.
+
+    The module paths mirror Gemma4Model's (``layers.<i>.self_attn.qkv_proj``
+    and so on), so the model's own weights mapper stacks the checkpoint
+    tensors into the replica as it does into the TP shards.
+    """
+
+    def __init__(self, model: Gemma4Model, quant_config: Any, prefix: str) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            _ReplicaLayer(layer, quant_config, f"{prefix}.layers.{i}")
+            for i, layer in enumerate(model.layers)
+        )
+
+
+def _piece_rows(x: torch.Tensor, plan: Any, piece: int) -> torch.Tensor:
+    size = plan.piece_tokens
+    return x[piece * size : (piece + 1) * size]
+
+
+def _rank_rows(x: torch.Tensor, plan: Any, rank: int) -> torch.Tensor:
+    """The rows of `rank`'s two zigzag pieces, in the order the rank holds them."""
+    return torch.cat([_piece_rows(x, plan, p) for p in plan.rank_pieces(rank)])
+
+
+def _rank_major(x: torch.Tensor, plan: Any) -> torch.Tensor:
+    """Every rank's rows, rank after rank, as a reduce-scatter deals them out."""
+    return torch.cat([_rank_rows(x, plan, r) for r in range(plan.world)])
+
+
+def _token_order(rows: torch.Tensor, plan: Any) -> torch.Tensor:
+    """Inverts `_rank_major`: the all-gathered rows of every rank, by token."""
+    size, blocks = plan.piece_tokens, []
+    for piece in range(plan.num_pieces):
+        rank, slot = plan.piece_owner(piece)
+        start = (2 * rank + slot) * size
+        blocks.append(rows[start : start + size])
+    return torch.cat(blocks)
+
+
+def _vocab_shard_embedding(embed: Any, input_ids: torch.Tensor) -> torch.Tensor:
+    """VocabParallelEmbedding.forward before its all-reduce: the rows of this
+    rank's vocab shard, zero for ids outside it."""
+    shard = embed.shard_indices
+    ids, outside = vocab_parallel_embedding.get_masked_input_and_mask(
+        input_ids,
+        shard.org_vocab_start_index,
+        shard.org_vocab_end_index,
+        shard.num_org_vocab_padding,
+        shard.added_vocab_start_index,
+        shard.added_vocab_end_index,
+    )
+    rows = embed.quant_method.embedding(embed, ids.long())
+    return rows.masked_fill(outside.unsqueeze(-1), 0)
+
+
+# (attn, q, k, v, plan, rank) -> attention of the rank's rows over the prompt.
+CPAttention = Callable[..., torch.Tensor]
+
+
+def _context_parallel_layer(
+    layer: Any,
+    replica: Any,
+    positions: torch.Tensor,
+    x: torch.Tensor,
+    plan: Any,
+    rank: int,
+    attention: CPAttention,
+) -> torch.Tensor:
+    """Upstream's decoder layer on this rank's zigzag rows, every head local."""
+    attn = layer.self_attn
+    heads, kv_heads, head_dim = (
+        attn.total_num_heads,
+        attn.total_num_kv_heads,
+        attn.head_dim,
+    )
+    residual = x
+    qkv, _ = replica.self_attn.qkv_proj(layer.input_layernorm(x))
+    q, k, v = qkv.split(
+        [heads * head_dim, kv_heads * head_dim, kv_heads * head_dim], dim=-1
+    )
+    q = attn.q_norm(q.unflatten(-1, (heads, head_dim))).flatten(-2, -1)
+    k = attn.k_norm(k.unflatten(-1, (kv_heads, head_dim)))
+    q, k = attn.rotary_emb(positions, q, k.flatten(-2, -1))
+    v = attn.v_norm(v.unflatten(-1, (kv_heads, head_dim))).flatten(-2, -1)
+    out, _ = replica.self_attn.o_proj(attention(attn.attn, q, k, v, plan, rank))
+    x = layer.post_attention_layernorm(out) + residual
+    residual = x
+
+    gate_up, _ = replica.mlp.gate_up_proj(layer.pre_feedforward_layernorm(x))
+    out, _ = replica.mlp.down_proj(layer.mlp.act_fn(gate_up))
+    return (layer.post_feedforward_layernorm(out) + residual) * layer.layer_scalar
+
+
+def _context_parallel_forward(
+    model: Any,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    plan: Any,
+    rank: int,
+    attention: CPAttention,
+) -> torch.Tensor:
+    """Gemma4Model.forward of one prompt, on this rank's zigzag rows."""
+    shards = _vocab_shard_embedding(model.embed_tokens, _rank_major(input_ids, plan))
+    # As upstream: the normalizer scales the reduced embedding.
+    x = _reduce_scatter_rows(shards) * model.normalizer
+    positions = _rank_rows(positions, plan, rank)
+    for layer, replica in zip(model.layers, getattr(model, _REPLICA).layers):
+        x = _context_parallel_layer(layer, replica, positions, x, plan, rank, attention)
+    return _token_order(_all_gather_rows(model.norm(x)), plan)
+
+
+@support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": 0})
+class Gemma4ContextParallelProgram(nn.Module):
+    """The forward of one context-parallel token bucket.
+
+    A compiled module of its own, built for that bucket only: its zigzag plan
+    is a constant of the trace, which only slices the token dimension, so the
+    bucket size remains a free symbol. It runs the TP model's embedding
+    shards, norms, rotary embeddings and attention layers, and its projection
+    replica.
+    """
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        model: Gemma4Model,
+        num_tokens: int,
+    ) -> None:
+        super().__init__()
+        from vllm_torchtpu.layers.adapter.cp_prefill_attention import (
+            cp_prefill_attention,
+        )
+
+        self.model = model
+        self.plan = cp_prefill.make_zigzag_plan(
+            num_tokens,
+            get_tensor_model_parallel_world_size(),
+            vllm_config.cache_config.block_size,
+        )
+        self.rank = get_tensor_model_parallel_rank()
+        self.attention: CPAttention = cp_prefill_attention
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return _context_parallel_forward(
+            self.model, input_ids, positions, self.plan, self.rank, self.attention
+        )
+
+
+def _check_context_parallel(model: Gemma4Model, vllm_config: VllmConfig) -> None:
+    """Refuses a configuration the context-parallel programs cannot serve."""
+    what = "TPU_GEMMA4_CP_MIN_TOKENS"
+    parallel = vllm_config.parallel_config
+    unsupported = [
+        name
+        for name, present in (
+            ("PP", parallel.pipeline_parallel_size > 1),
+            ("DP", parallel.data_parallel_size > 1),
+            ("LoRA", vllm_config.lora_config is not None),
+            ("speculative decoding", vllm_config.speculative_config is not None),
+            # Sliding-window layers cache only the final window of the prompt.
+            ("prefix caching", vllm_config.cache_config.enable_prefix_caching),
+            ("kv_sharing_fast_prefill", model.fast_prefill_enabled),
+            # Programs differ per rank while their FX graphs need not.
+            ("TPU_PRECOMPILE_PEER_REPLAY", envs.TPU_PRECOMPILE_PEER_REPLAY),
+            # One block-table shape per bucket.
+            ("VLLM_TPU_MOST_MODEL_LEN", envs.VLLM_TPU_MOST_MODEL_LEN is not None),
+        )
+        if present
+    ]
+    for layer in model.layers:
+        attn: Any = layer.self_attn
+        for name, present in (
+            ("MoE layers", layer.enable_moe_block),
+            ("KV sharing", attn.is_kv_shared_layer),
+            ("per-layer embeddings", layer.per_layer_input_gate is not None),
+            ("attention biases", attn.o_proj.bias is not None),
+        ):
+            if present and name not in unsupported:
+                unsupported.append(name)
+    if unsupported:
+        raise ValueError(f"{what} does not support {', '.join(unsupported)}")
+    if parallel.tensor_parallel_size < 3:
+        raise ValueError(f"{what} needs TP >= 3, got {parallel.tensor_parallel_size}")
+
+    # Every step padded into a context-parallel bucket must be one whole
+    # prompt: the solo-prefill scheduler's steps of more than N tokens are,
+    # and its other steps hold at most N, so N's bucket must be the last one
+    # below the threshold.
+    sizes = sorted(int(s) for s in vllm_config.compilation_config.compile_sizes)
+    solo = envs.VLLM_TPU_SOLO_PREFILL_OVER_TOKENS
+    above = [s for s in sizes if s >= solo] if solo else []
+    if len(above) < 2 or not above[0] < _cp_min_tokens <= above[1]:
+        raise ValueError(
+            f"{what}={_cp_min_tokens} needs VLLM_TPU_SOLO_PREFILL_OVER_TOKENS=N "
+            "whose token bucket is the last one below it; got "
+            f"N={solo}, buckets {sizes}"
+        )
+
+
+def _build_context_parallel_programs(
+    model: Gemma4Model, vllm_config: VllmConfig
+) -> dict[int, Gemma4ContextParallelProgram]:
+    """One compiled program per bucket at or above the threshold.
+
+    Each compiles under its own copy of the compilation config, holding only
+    its bucket (its cache directory hashes the files its own trace reads), and
+    the TP model keeps the buckets below.
+    """
+    config = vllm_config.compilation_config
+    sizes = sorted(int(s) for s in config.compile_sizes)
+    config.compile_sizes = [s for s in sizes if s < _cp_min_tokens]
+    programs = {}
+    for size in (s for s in sizes if s >= _cp_min_tokens):
+        program_config = copy.copy(vllm_config)
+        program_config.compilation_config = copy.copy(config)
+        program_config.compilation_config.compile_sizes = [size]
+        program_config.compilation_config.traced_files = set()
+        program_config.compilation_config.cache_dir = ""
+        program_config.compilation_config.local_cache_dir = ""
+        with (
+            set_current_vllm_config(program_config),
+            set_model_tag(f"gemma4_cp{size}"),
+        ):
+            programs[size] = Gemma4ContextParallelProgram(
+                vllm_config=program_config, model=model, num_tokens=size
+            )
+    return programs
+
+
+def _patched_causal_lm_init(
+    self: Gemma4ForCausalLM, *, vllm_config: VllmConfig, prefix: str = ""
+) -> None:
+    _orig_causal_lm_init(self, vllm_config=vllm_config, prefix=prefix)
+    model: Any = self.model
+    _check_context_parallel(model, vllm_config)
+    replica = Gemma4ProjectionReplica(
+        model, vllm_config.quant_config, f"{maybe_prefix(prefix, 'model')}.{_REPLICA}"
+    )
+    for layer, copied in zip(model.layers, replica.layers):
+        for tp_linear, linear in (
+            (layer.self_attn.qkv_proj, copied.self_attn.qkv_proj),
+            (layer.self_attn.o_proj, copied.self_attn.o_proj),
+            (layer.mlp.gate_up_proj, copied.mlp.gate_up_proj),
+            (layer.mlp.down_proj, copied.mlp.down_proj),
+        ):
+            if type(linear.quant_method) is not type(tp_linear.quant_method):
+                raise ValueError(
+                    f"{linear.prefix} would run {type(linear.quant_method).__name__}"
+                    f", its TP shard {type(tp_linear.quant_method).__name__}"
+                )
+    setattr(model, _REPLICA, replica)
+    # A plain dict: the programs are not submodules, so nothing that walks the
+    # model's compiled modules (a re-trace, a profiling reset) reaches them.
+    self._cp_programs = _build_context_parallel_programs(model, vllm_config)
+    self._cp_attention_prepared = False
+    logger.info(
+        "Gemma4 context-parallel programs for token buckets %s; the TP model "
+        "compiles %s",
+        sorted(self._cp_programs),
+        vllm_config.compilation_config.compile_sizes,
+    )
+
+
+def _profiling(model: Any) -> bool:
+    """Whether this is the memory-profiling forward, run before KV caches exist."""
+    attn = model.layers[0].self_attn.attn
+    return get_attention_context(attn.layer_name)[2].numel() == 0
+
+
+def _check_solo_prompt(num_tokens: int) -> None:
+    context = get_vllm_model_wrapper_context()
+    query_start_loc, seq_lens = context.query_start_loc_cpu, context.seq_lens_cpu
+    if seq_lens is None:
+        return  # a warmup forward: no request to check
+    if len(seq_lens) != 1 or seq_lens[0] != query_start_loc[1]:
+        raise RuntimeError(
+            f"A context-parallel step of {num_tokens} tokens must hold one prompt, "
+            "whole and without cached tokens; got query_start_loc "
+            f"{query_start_loc.tolist()}, seq_lens {seq_lens.tolist()}"
+        )
+
+
+def _prepare_context_parallel_attention(model: Any) -> None:
+    from vllm_torchtpu.layers.adapter.cp_prefill_attention import (
+        prepare_cp_prefill_attention,
+    )
+
+    for layer in model.layers:
+        attn = layer.self_attn
+        prepare_cp_prefill_attention(
+            attn.attn,
+            num_heads=attn.total_num_heads,
+            num_kv_heads=attn.total_num_kv_heads,
+            rank=get_tensor_model_parallel_rank(),
+            world=get_tensor_model_parallel_world_size(),
+        )
+
+
+def _patched_causal_lm_forward(
+    self: Gemma4ForCausalLM,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    intermediate_tensors: Any = None,
+    inputs_embeds: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> Any:
+    program = self._cp_programs.get(positions.shape[-1])
+    # The profiling forward measures the largest bucket's activations on the
+    # TP model, whose are the larger: all T rows rather than T/tp.
+    if program is None or _profiling(self.model):
+        return _orig_causal_lm_forward(
+            self, input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+        )
+    if input_ids is None or intermediate_tensors is not None or kwargs:
+        raise NotImplementedError(
+            "A context-parallel step takes token ids only, got "
+            f"inputs_embeds={inputs_embeds is not None}, "
+            f"intermediate_tensors={intermediate_tensors is not None}, {list(kwargs)}"
+        )
+    _check_solo_prompt(positions.shape[-1])
+    if not self._cp_attention_prepared:
+        # Builds the attention ops outside any trace, once caches and KV scales
+        # exist.
+        _prepare_context_parallel_attention(self.model)
+        self._cp_attention_prepared = True
+    return program(input_ids, positions)
+
+
+def _patched_model_load_weights(
+    self: Gemma4Model, weights: Iterable[tuple[str, torch.Tensor]]
+) -> set[str]:
+    if not hasattr(self, _REPLICA):
+        return _orig_model_load_weights(self, weights)
+
+    def with_replica() -> Iterator[tuple[str, torch.Tensor]]:
+        for name, tensor in weights:
+            yield name, tensor
+            if _REPLICATED_TENSOR.match(name):
+                yield f"{_REPLICA}.{name}", tensor
+
+    return _orig_model_load_weights(self, with_replica())
+
+
+def maybe_patch_gemma4_context_parallel(
+    model_config: ModelConfig | None,
+) -> bool | None:
+    """Returns False until a Gemma4 text model config is available."""
+    if not envs.TPU_GEMMA4_CP_MIN_TOKENS:
+        return None
+    if model_config is None or model_config.hf_text_config.model_type != "gemma4_text":
+        return False
+    if model_config.architecture != "Gemma4ForCausalLM":
+        raise ValueError(
+            "TPU_GEMMA4_CP_MIN_TOKENS needs Gemma4ForCausalLM, got "
+            f"{model_config.architecture} (--hf-overrides "
+            '\'{"architectures": ["Gemma4ForCausalLM"]}\' serves the text model)'
+        )
+    global _cp_min_tokens
+    _cp_min_tokens = envs.TPU_GEMMA4_CP_MIN_TOKENS
+    Gemma4ForCausalLM.__init__ = _patched_causal_lm_init
+    Gemma4ForCausalLM.forward = _patched_causal_lm_forward
+    Gemma4Model.load_weights = _patched_model_load_weights
+    logger.info(
+        "Applied TPU patch: Gemma4 context-parallel prefill for token buckets of "
+        "at least %d tokens.",
+        _cp_min_tokens,
     )
     return None
