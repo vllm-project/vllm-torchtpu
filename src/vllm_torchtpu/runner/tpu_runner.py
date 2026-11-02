@@ -169,6 +169,11 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+from vllm_torchtpu.runner.static_decode_buffers import (
+    StaticDecodeBufferTracker,
+    build_fresh_verify_reference,
+    verify_static_decode_PrepareInputs,
+)
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -1066,6 +1071,9 @@ class TPUModelRunner(GPUModelRunner):
         # Last upload per `_upload_unless_unchanged` slot:
         # (key, device tensor, host source).
         self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
+        self._static_decode_tracker: StaticDecodeBufferTracker | None = None
+        self._pending_static_verify: dict[str, Any] | None = None
+        self._last_step_used_static_decode: bool = False
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
@@ -3011,12 +3019,133 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_per_req,
         )
 
+    def _get_static_decode_tracker(self) -> StaticDecodeBufferTracker:
+        tracker = self._static_decode_tracker
+        if tracker is None:
+            block_sizes: list[int] = []
+            if self.kv_cache_config is not None:
+                for group in self.kv_cache_config.kv_cache_groups:
+                    bs = group.kv_cache_spec.block_size
+                    if bs > 0 and bs not in block_sizes:
+                        block_sizes.append(bs)
+            for group_list in self.attn_groups:
+                for group in group_list:
+                    target_bs = cast(
+                        AttentionMetadataBuilder, group.metadata_builders[0]
+                    ).target_block_size
+                    if target_bs > 0 and target_bs not in block_sizes:
+                        block_sizes.append(target_bs)
+            if not block_sizes:
+                block_sizes.append(int(self.cache_config.block_size))
+            tracker = StaticDecodeBufferTracker(
+                max_num_reqs=int(self.max_num_reqs),
+                max_num_tokens=int(self.positions_np.shape[0]),
+                block_sizes=tuple(block_sizes),
+            )
+            self._static_decode_tracker = tracker
+        return tracker
+
+    def _compute_static_bt_ver_key(
+        self, start_index: int, num_reqs: int, target_num_reqs: int
+    ) -> tuple[int, int, int, tuple[tuple[int, bytes], ...]] | None:
+        if not self.attn_groups:
+            return None
+        ver_entries: list[tuple[int, bytes]] = []
+        seen_gids: set[int] = set()
+        end_index = start_index + num_reqs
+        for group_list in self.attn_groups:
+            for group in group_list:
+                builder = cast(AttentionMetadataBuilder, group.metadata_builders[0])
+                gid = int(builder.kv_cache_group_id)
+                if gid in seen_gids:
+                    continue
+                seen_gids.add(gid)
+                bt_obj = self.input_batch.block_table[gid]
+                row_counts = bt_obj.num_blocks_per_row[start_index:end_index]
+                ver_entries.append((gid, row_counts.tobytes()))
+        return (target_num_reqs, start_index, num_reqs, tuple(ver_entries))
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
         start_index: int,
         num_decode_reqs: int,
         num_windowed_reqs: int | None = None,
+    ):
+        if envs.TPU_STATIC_DECODE_INPUTS_VERIFY:
+            self._wait_input_staging_fence()
+            num_reqs_all = int(self.input_batch.num_reqs)
+            poison_reqs = min(
+                int(self.max_num_reqs), max(1, num_reqs_all - start_index)
+            )
+            poison_tokens = min(
+                int(self.positions_np.shape[0]),
+                int(scheduler_output.total_num_scheduled_tokens),
+            )
+            self.positions_np[:poison_tokens] = -1
+            self.input_ids_cpu[:poison_tokens] = -1
+            self.seq_lens_np[:poison_reqs] = -1
+            self.query_start_loc_np[: poison_reqs + 1] = -1
+            if self.uses_mrope:
+                self.mrope_positions.np[:, :poison_tokens] = -1
+
+            static_out = TPUModelRunner._prepare_inputs_core(
+                self,
+                scheduler_output,
+                start_index,
+                num_decode_reqs,
+                num_windowed_reqs,
+                use_static_decode=True,
+            )
+            ref_pack = build_fresh_verify_reference(
+                self,
+                scheduler_output,
+                start_index,
+                num_decode_reqs,
+                num_windowed_reqs,
+                layout_plan=static_out[9],
+                padded_num_reqs_override=int(static_out[2]),
+            )
+            cur_input_indices = static_out[5]
+            has_deferred_subst = (
+                cur_input_indices is not None and len(cur_input_indices) > 0
+            )
+            if has_deferred_subst:
+                self._pending_static_verify = ref_pack
+            else:
+                self._pending_static_verify = None
+                static_umi = self._attn_metadata_builder_ctx.unified_mamba_state_indices
+                verify_static_decode_PrepareInputs(
+                    ref_pack["ref_result"],
+                    static_out,
+                    ref_pack["ref_input_ids_post"],
+                    self.input_ids,
+                    ref_pack["ref_position_ids"],
+                    self.position_ids,
+                    ref_unified_mamba_state_indices=ref_pack[
+                        "ref_unified_mamba_state_indices"
+                    ],
+                    static_unified_mamba_state_indices=static_umi,
+                    step_context=ref_pack["step_context"],
+                )
+            return static_out
+        self._pending_static_verify = None
+        return TPUModelRunner._prepare_inputs_core(
+            self,
+            scheduler_output,
+            start_index,
+            num_decode_reqs,
+            num_windowed_reqs,
+            use_static_decode=bool(envs.TPU_STATIC_DECODE_INPUTS),
+        )
+
+    def _prepare_inputs_core(
+        self,
+        scheduler_output: "SchedulerOutput",
+        start_index: int,
+        num_decode_reqs: int,
+        num_windowed_reqs: int | None = None,
+        use_static_decode: bool = False,
     ):
         if num_windowed_reqs is None:
             num_windowed_reqs = num_decode_reqs
@@ -3079,87 +3208,218 @@ class TPUModelRunner(GPUModelRunner):
             self, int(total_num_scheduled_tokens)
         )
 
-        if self.uses_mrope:
+        req_ids_all = self.input_batch.req_ids
+        spec_k = (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config is not None
+            else 0
+        )
+        is_uniform_spec_step = False
+        has_mrope_delta = False
+        can_use_static_decode = False
+        if use_static_decode:
+            is_uniform_scheduled = bool(
+                (
+                    num_scheduled_tokens_per_req == max_num_scheduled_tokens_all_reqs
+                ).all()
+            )
+            sched_spec_map = (
+                scheduler_output.scheduled_spec_decode_tokens
+                if self.speculative_config is not None
+                else None
+            )
+            is_uniform_spec_step = (
+                spec_k > 0
+                and max_num_scheduled_tokens_all_reqs == 1 + spec_k
+                and bool(sched_spec_map)
+                and all(
+                    len(sched_spec_map.get(req_ids_all[idx], ())) == spec_k
+                    for idx in range(start_index, end_index)
+                )
+            )
+            has_mrope_delta = bool(
+                self.uses_mrope
+                and any(
+                    bool(self.requests[req_ids_all[idx]].mrope_position_delta)
+                    if req_ids_all[idx] in self.requests
+                    else False
+                    for idx in range(start_index, end_index)
+                )
+            )
+            can_use_static_decode = (
+                is_uniform_scheduled
+                and start_index == 0
+                and end_index == self.input_batch.num_reqs
+                and not has_mrope_delta
+                and not self._has_mamba_state
+                and not self._pcp_enabled
+                and self.lora_config is None
+                and (max_num_scheduled_tokens_all_reqs == 1 or is_uniform_spec_step)
+            )
+        self._last_step_used_static_decode = can_use_static_decode
+        if self.uses_mrope and not can_use_static_decode:
             self._calc_mrope_positions(scheduler_output)
+        static_same_batch = False
+        static_block_boundary_crossed = True
+        static_tracker: StaticDecodeBufferTracker | None = None
 
-        # Fast path for decode-only: all requests have exactly 1 token.
-        if max_num_scheduled_tokens_all_reqs == 1:
-            # Pure decode: each request schedules exactly 1 token.
-            # req_indices = [0, 1, ..., num_reqs-1]
-            req_indices = self.arange_np[start_index : start_index + num_reqs]
-            # positions = num_computed_tokens for each request
-            positions_np = self.positions_np[:num_reqs]
-            np.copyto(
-                positions_np,
-                self.input_batch.num_computed_tokens_cpu[
-                    start_index : start_index + num_reqs
+        if can_use_static_decode:
+            static_tracker = TPUModelRunner._get_static_decode_tracker(self)
+            req_ids_slice = [str(req_ids_all[i]) for i in range(start_index, end_index)]
+            cached_reqs_data = scheduler_output.scheduled_cached_reqs
+            has_resumed_reqs = bool(
+                cached_reqs_data is not None and cached_reqs_data.resumed_req_ids
+            )
+            has_new_blocks = bool(
+                cached_reqs_data is not None
+                and (
+                    has_resumed_reqs
+                    or any(
+                        blk_entry is not None and any(blk_entry)
+                        for blk_entry in (cached_reqs_data.new_block_ids or ())
+                    )
+                )
+            )
+            has_batch_membership_change = bool(
+                scheduler_output.scheduled_new_reqs
+                or scheduler_output.finished_req_ids
+                or has_resumed_reqs
+            )
+            if has_batch_membership_change:
+                static_tracker.reset()
+            force_block_rebuild = bool(
+                scheduler_output.kv_cache_block_copies
+                or has_new_blocks
+                or has_batch_membership_change
+            )
+            (
+                static_in_ids,
+                static_pos,
+                static_seq_lens,
+                static_qsl,
+                static_same_batch,
+                static_block_boundary_crossed,
+            ) = static_tracker.update_step_buffers(
+                req_ids=req_ids_slice,
+                num_computed_tokens=self.input_batch.num_computed_tokens_cpu[
+                    start_index:end_index
                 ],
+                token_ids_table=self.input_batch.token_ids_cpu,
+                query_len=max_num_scheduled_tokens_all_reqs,
+                force_block_rebuild=force_block_rebuild,
+                max_rejected=(
+                    spec_k
+                    if (
+                        bool(self.scheduler_config.async_scheduling)
+                        and is_uniform_spec_step
+                    )
+                    else 0
+                ),
             )
-            # token_indices = positions + req_index * max_model_len
-            token_indices = (
-                positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            np.copyto(
+                self.positions_np[:total_num_scheduled_tokens],
+                static_pos[:total_num_scheduled_tokens],
             )
-            torch.index_select(
-                self.input_batch.token_ids_cpu_tensor.flatten(),
-                0,
-                torch.from_numpy(token_indices),
-                out=self.input_ids_cpu[:num_reqs],
+            if self.uses_mrope:
+                self.mrope_positions.np[:, :total_num_scheduled_tokens] = static_pos[
+                    :total_num_scheduled_tokens
+                ]
+            np.copyto(
+                self.input_ids_cpu.numpy()[:total_num_scheduled_tokens],
+                static_in_ids[:total_num_scheduled_tokens],
+            )
+            np.copyto(self.query_start_loc_np[: num_reqs + 1], static_qsl)
+            self.query_start_loc_np[num_reqs + 1 :] = static_qsl[num_reqs]
+            np.copyto(self.seq_lens_np[:num_reqs], static_seq_lens)
+            self._check_attention_schedule(
+                num_reqs,
+                num_scheduled_tokens_per_req,
+                max(0, min(rpa_num_decode_reqs - start_index, num_reqs)),
+                use_max_model_len,
             )
         else:
-            # General path: mixed prefill + decode.
-            # Get request indices.
-            req_indices = np.repeat(
-                self.arange_np[start_index : start_index + num_reqs],
-                num_scheduled_tokens_per_req,
-            )
+            if self._static_decode_tracker is not None:
+                self._static_decode_tracker.reset()
+        if not can_use_static_decode:
+            if max_num_scheduled_tokens_all_reqs == 1:
+                # Pure decode: each request schedules exactly 1 token.
+                # req_indices = [0, 1, ..., num_reqs-1]
+                req_indices = self.arange_np[start_index : start_index + num_reqs]
+                # positions = num_computed_tokens for each request
+                positions_np = self.positions_np[:num_reqs]
+                np.copyto(
+                    positions_np,
+                    self.input_batch.num_computed_tokens_cpu[
+                        start_index : start_index + num_reqs
+                    ],
+                )
+                # token_indices = positions + req_index * max_model_len
+                token_indices = (
+                    positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+                )
+                torch.index_select(
+                    self.input_batch.token_ids_cpu_tensor.flatten(),
+                    0,
+                    torch.from_numpy(token_indices),
+                    out=self.input_ids_cpu[:num_reqs],
+                )
+            else:
+                # General path: mixed prefill + decode.
+                # Get request indices.
+                req_indices = np.repeat(
+                    self.arange_np[start_index : start_index + num_reqs],
+                    num_scheduled_tokens_per_req,
+                )
 
-            # Get batched arange.
-            # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-            arange = np.concatenate(
-                [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
-            )
+                # Get batched arange.
+                # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+                arange = np.concatenate(
+                    [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
+                )
 
-            # Get positions.
-            positions_np = self.positions_np[:total_num_scheduled_tokens]
-            np.add(
-                self.input_batch.num_computed_tokens_cpu[req_indices],
-                arange,
-                out=positions_np,
-            )
+                # Get positions.
+                positions_np = self.positions_np[:total_num_scheduled_tokens]
+                np.add(
+                    self.input_batch.num_computed_tokens_cpu[req_indices],
+                    arange,
+                    out=positions_np,
+                )
 
-            # Get token indices.
-            token_indices = (
-                positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
-            )
+                # Get token indices.
+                token_indices = (
+                    positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+                )
 
-            torch.index_select(
-                self.input_batch.token_ids_cpu_tensor.flatten(),
-                0,
-                torch.from_numpy(token_indices),
-                out=self.input_ids_cpu[:total_num_scheduled_tokens],
-            )
+                torch.index_select(
+                    self.input_batch.token_ids_cpu_tensor.flatten(),
+                    0,
+                    torch.from_numpy(token_indices),
+                    out=self.input_ids_cpu[:total_num_scheduled_tokens],
+                )
 
         # Prepare the attention metadata.
-        self.query_start_loc_np[0] = 0
-        np.cumsum(
-            num_scheduled_tokens_per_req, out=self.query_start_loc_np[1 : num_reqs + 1]
-        )
-        # Keep padded entries equal to the last valid location so padded
-        # requests have zero length instead of a negative q_len.
-        self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
+        if not can_use_static_decode:
+            self.query_start_loc_np[0] = 0
+            np.cumsum(
+                num_scheduled_tokens_per_req,
+                out=self.query_start_loc_np[1 : num_reqs + 1],
+            )
+            # Keep padded entries equal to the last valid location so padded
+            # requests have zero length instead of a negative q_len.
+            self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
 
-        self.seq_lens_np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[
-                start_index : start_index + num_reqs
-            ]
-            + num_scheduled_tokens_per_req
-        )
-        self._check_attention_schedule(
-            num_reqs,
-            num_scheduled_tokens_per_req,
-            max(0, min(rpa_num_decode_reqs - start_index, num_reqs)),
-            use_max_model_len,
-        )
+            self.seq_lens_np[:num_reqs] = (
+                self.input_batch.num_computed_tokens_cpu[
+                    start_index : start_index + num_reqs
+                ]
+                + num_scheduled_tokens_per_req
+            )
+            self._check_attention_schedule(
+                num_reqs,
+                num_scheduled_tokens_per_req,
+                max(0, min(rpa_num_decode_reqs - start_index, num_reqs)),
+                use_max_model_len,
+            )
 
         request_major_input_ids_cpu: torch.Tensor | None = None
         if self._pcp_enabled and self._mtp_enabled:
@@ -3212,6 +3472,9 @@ class TPUModelRunner(GPUModelRunner):
             self.input_ids_cpu[
                 total_num_scheduled_tokens:padded_total_num_scheduled_tokens
             ] = 0
+            self.positions_cpu[
+                total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+            ] = 0
         self.input_ids = self.input_ids_cpu[local_token_slice].to(
             self.device, non_blocking=True
         )
@@ -3227,6 +3490,7 @@ class TPUModelRunner(GPUModelRunner):
             self.position_ids = self.positions_cpu[local_token_slice].to(
                 self.device, non_blocking=True
             )
+        self.seq_lens_np[num_reqs:target_num_reqs] = 0
         if use_max_model_len:
             seq_lens = self.seq_lens_cpu[: self.num_reqs_max_model_len].to(
                 self.device, non_blocking=True
@@ -3465,16 +3729,84 @@ class TPUModelRunner(GPUModelRunner):
             sequence_layout_descriptor=layout_plan.descriptor,
         )
         slot_mappings = self.empty_slot_mappings
-        per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
-            self._build_attention_metadata(
-                num_tokens=local_total_num_scheduled_tokens,
-                num_reqs=target_num_reqs,
-                max_query_len=max_num_scheduled_tokens_all_reqs,
-                num_tokens_padded=local_padded_total_num_scheduled_tokens,
-                num_reqs_padded=target_num_reqs,
-                slot_mappings=slot_mappings,
+        current_bt_ver_key = (
+            TPUModelRunner._compute_static_bt_ver_key(
+                self, start_index, num_reqs, target_num_reqs
             )
+            if can_use_static_decode
+            else None
         )
+        if (
+            can_use_static_decode
+            and static_tracker is not None
+            and static_same_batch
+            and not static_block_boundary_crossed
+            and not self._has_mamba_state
+            and current_bt_ver_key is not None
+            and static_tracker.cached_bt_ver_key == current_bt_ver_key
+            and static_tracker.cached_attn_metadata is not None
+            and static_tracker.cached_target_num_reqs == target_num_reqs
+            and static_tracker.cached_padded_tokens
+            == local_padded_total_num_scheduled_tokens
+        ):
+            per_layer_attn_metadata = {}
+            replaced_md: dict[int, Any] = {}
+            for layer_name, cached_md in static_tracker.cached_attn_metadata.items():
+                md_id = id(cached_md)
+                if md_id not in replaced_md:
+                    updated_md = copy.copy(cached_md)
+                    updated_md.input_positions = self.position_ids
+                    updated_md.seq_lens = seq_lens
+                    updated_md.query_start_loc = query_start_loc
+                    updated_md.request_distribution = request_distribution
+                    if updated_md.mamba_slot_read_offsets is not None:
+                        updated_md.mamba_slot_read_offsets = (
+                            self.mamba_slot_read_offsets
+                        )
+                    if updated_md.mamba_request_distribution is not None:
+                        updated_md.mamba_request_distribution = (
+                            mamba_request_distribution
+                        )
+                    replaced_md[md_id] = updated_md
+                per_layer_attn_metadata[layer_name] = replaced_md[md_id]
+            if static_tracker.cached_unified_mamba_state_indices is not None:
+                self._attn_metadata_builder_ctx.unified_mamba_state_indices = list(
+                    static_tracker.cached_unified_mamba_state_indices
+                )
+        else:
+            if (
+                can_use_static_decode
+                and static_tracker is not None
+                and static_tracker.metadata_reused_last_step
+            ):
+                static_tracker.metadata_reused_last_step = False
+            per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
+                self._build_attention_metadata(
+                    num_tokens=local_total_num_scheduled_tokens,
+                    num_reqs=target_num_reqs,
+                    max_query_len=max_num_scheduled_tokens_all_reqs,
+                    num_tokens_padded=local_padded_total_num_scheduled_tokens,
+                    num_reqs_padded=target_num_reqs,
+                    slot_mappings=slot_mappings,
+                )
+            )
+            if (
+                can_use_static_decode
+                and static_tracker is not None
+                and not self._has_mamba_state
+            ):
+                static_tracker.cached_attn_metadata = dict(per_layer_attn_metadata)
+                static_tracker.cached_unified_mamba_state_indices = (
+                    list(self._attn_metadata_builder_ctx.unified_mamba_state_indices)
+                    if self._attn_metadata_builder_ctx.unified_mamba_state_indices
+                    is not None
+                    else None
+                )
+                static_tracker.cached_bt_ver_key = current_bt_ver_key
+                static_tracker.cached_target_num_reqs = target_num_reqs
+                static_tracker.cached_padded_tokens = (
+                    local_padded_total_num_scheduled_tokens
+                )
 
         if self.lora_config is not None:
             # Map this chunk's tokens and logits rows to adapter ids, padded
@@ -4078,6 +4410,44 @@ class TPUModelRunner(GPUModelRunner):
                     spec_decode_metadata.upload_deferred_draft_token_ids(self.device)
                 )
             draft_input_ids_src = input_ids
+            if envs.TPU_STATIC_DECODE_INPUTS_VERIFY:
+                pending_verify = self._pending_static_verify
+                self._pending_static_verify = None
+                if pending_verify is not None:
+                    ref_pack = pending_verify
+                    if self.mamba_slot_read_offsets is not None:
+                        fresh_ro = self.mamba_slot_read_offsets.cpu().clone()
+                        for ref_md_item in ref_pack["ref_result"][0].values():
+                            if ref_md_item.mamba_slot_read_offsets is not None:
+                                ref_md_item.mamba_slot_read_offsets = fresh_ro
+                    static_verify_tuple = (
+                        attn_metadata,
+                        logits_indices,
+                        padded_num_reqs,
+                        num_reqs,
+                        end_index,
+                        cur_input_indices,
+                        pre_next_tokens_indices,
+                        spec_decode_metadata,
+                        request_major_input_ids,
+                        draft_sequence_layout_plan,
+                    )
+                    static_umi = (
+                        self._attn_metadata_builder_ctx.unified_mamba_state_indices
+                    )
+                    verify_static_decode_PrepareInputs(
+                        ref_pack["ref_result"],
+                        static_verify_tuple,
+                        ref_pack["ref_input_ids_post"],
+                        input_ids,
+                        ref_pack["ref_position_ids"],
+                        self.position_ids,
+                        ref_unified_mamba_state_indices=ref_pack[
+                            "ref_unified_mamba_state_indices"
+                        ],
+                        static_unified_mamba_state_indices=static_umi,
+                        step_context=ref_pack["step_context"],
+                    )
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
             # covers requests [start_index, end_index) in req order). Offsets
@@ -7860,6 +8230,10 @@ class TPUModelRunner(GPUModelRunner):
             logger.exception("spec-decode warmup chunk cleanup failed")
         self._pre_async_results = None
         self.mm_embed_inputs = None
+        if self._static_decode_tracker is not None:
+            self._static_decode_tracker.reset()
+        self._pending_static_verify = None
+        self._last_step_used_static_decode = False
         if self.input_batch.num_reqs != 0:
             cleanup_succeeded = False
             logger.warning(
