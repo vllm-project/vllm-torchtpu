@@ -668,6 +668,7 @@ def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
         "cap_sliding_decode_block",
         "sliding_prefill_max_bkv",
         "fp8_compute",
+        "fence_output",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -715,6 +716,7 @@ def ragged_paged_attention(
     cap_sliding_decode_block: bool = False,
     sliding_prefill_max_bkv: int | None = None,
     fp8_compute: bool = False,
+    fence_output: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -793,6 +795,9 @@ def ragged_paged_attention(
             scale of 1.0 and the softmax probabilities are cast to it as well.
             The decode kernel is unchanged. Requires an fp8 KV cache and a
             number of query heads per KV head divisible by the fp8 packing (4).
+        fence_output: If True, the token-major output is materialized behind
+            an optimization barrier instead of its transpose being fused into
+            the consumer. Outputs are identical either way.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -1065,6 +1070,10 @@ def ragged_paged_attention(
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
+    if fence_output:
+        # Materialize the token-major copy here: fused into the consumer, the
+        # transpose is planned around the consumer's f32 math.
+        o_hbm = jax.lax.optimization_barrier(o_hbm)
 
     if not return_lse:
         return o_hbm, kv_cache
