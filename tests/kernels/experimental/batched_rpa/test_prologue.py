@@ -151,3 +151,52 @@ def test_block_tokens_fit_vmem_and_tile():
     assert prologue.choose_block_tokens(8320, (16 + 16) * 256, 16, 4, 256) == 128
     with pytest.raises(ValueError, match="no token block"):
         prologue.choose_block_tokens(24, 512, 1, 1, 256)
+
+
+def test_sharded_attention_from_qkv_lowers_for_tpu():
+    """The sharded entry runs the prologue kernel, then the batched RPA kernels."""
+    from vllm_torchtpu.layers.core import attention_interface
+
+    tokens, nq, nkv, d = 16, 2, 1, 256
+    device = jax.sharding.AbstractDevice(
+        device_kind="TPU7x", num_cores=1, platform="tpu"
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("model",),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=device,
+    )
+    spec = jax.ShapeDtypeStruct
+    with jax.sharding.use_abstract_mesh(mesh):
+        cache = KB.get_kv_cache_shape(128, 16, nkv, d, jnp.float8_e4m3fn)
+        args = (
+            spec((tokens, (nq + 2 * nkv) * d), jnp.bfloat16),
+            spec((tokens, d // 2), jnp.bfloat16),
+            spec((tokens, d // 2), jnp.bfloat16),
+            spec((d,), jnp.bfloat16),
+            spec((d,), jnp.bfloat16),
+            spec(cache, jnp.float8_e4m3fn),
+            spec((16,), jnp.int32),
+            spec((128,), jnp.int32),
+            spec((17,), jnp.int32),
+            spec((3,), jnp.int32),
+        )
+
+        def attend(*a):
+            return attention_interface.sharded_ragged_paged_attention_from_qkv(
+                mesh,
+                *a,
+                num_q_heads=nq,
+                num_kv_heads=nkv,
+                head_dim=d,
+                eps=_EPS,
+                sm_scale=d**-0.5,
+                k_scale=1.0,
+                v_scale=1.0,
+            )
+
+        out, new_cache = jax.eval_shape(attend, *args)
+        text = jax.jit(attend).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+    assert out.shape == (tokens, nq, d) and new_cache.shape == cache
+    assert "qkv_to_rpa_inputs" in text
