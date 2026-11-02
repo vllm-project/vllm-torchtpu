@@ -117,13 +117,14 @@ def test_pack_rows_roundtrip():
     np.testing.assert_array_equal(np.asarray(G.unpack_rows(packed, 6)), np.asarray(x))
 
 
-def test_quantize_pack_rows_layout():
-    tokens, hidden = 32, 768
+@pytest.mark.parametrize("tokens", [32, 1088])  # 1088 = 17 x 64: not a multiple of 256
+def test_quantize_pack_rows_layout(tokens):
+    hidden = 768
     x = (jax.random.normal(jax.random.PRNGKey(4), (tokens, hidden)) * 3).astype(
         jnp.bfloat16
     )
     x = x.at[5].set(0)  # an all-zero row has scale 0 and scale_inv 0
-    packed = G.quantize_pack_rows(x, tile_tokens=16, interpret=True)
+    packed = G.quantize_pack_rows(x, interpret=True)
     rows = np.asarray(packed).reshape(tokens, 4, 128)
     want_scaled, want_scales = [], []
     for k0 in range(0, hidden, G.QUANT_BLOCK):

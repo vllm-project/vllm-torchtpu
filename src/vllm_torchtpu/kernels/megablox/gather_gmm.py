@@ -43,6 +43,7 @@ the same for the down projection); only where rows live changes.
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -153,9 +154,10 @@ def quantize_pack_rows(
     s = packed_sublanes(h)
     if pl.cdiv(h, QUANT_BLOCK) > LANES:
         raise ValueError(f"hidden size {h} has more than {LANES} quantization blocks")
-    tile_tokens = min(tile_tokens, n)
-    if n % tile_tokens:
-        raise ValueError(f"{n=} is not a multiple of {tile_tokens=}")
+    # Any token bucket: the largest tile dividing n (>= 8 for 8-aligned n).
+    tile_tokens = math.gcd(n, tile_tokens)
+    if tile_tokens % 8:
+        raise ValueError(f"{n=} tokens is not a multiple of 8")
     return pl.pallas_call(
         functools.partial(_quantize_pack_kernel, s=s, tt=tile_tokens, hidden=h),
         out_shape=jax.ShapeDtypeStruct((n * (s + 1), LANES), jnp.uint32),

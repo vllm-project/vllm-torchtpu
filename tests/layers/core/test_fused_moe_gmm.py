@@ -549,6 +549,11 @@ def _gather_gmm_case(**overrides):
             True,
             True,
         ),
+        (  # a multiple of 64 that is not a multiple of 256
+            {"hidden_states": jax.ShapeDtypeStruct((1088, 2816), jnp.bfloat16)},
+            True,
+            True,
+        ),
     ],
 )
 def test_can_use_gather_gmm(monkeypatch, overrides, fp8_mxu, expected):
