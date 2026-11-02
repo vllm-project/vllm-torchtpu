@@ -123,6 +123,11 @@ def _patched_layer_init(self: Gemma4DecoderLayer, *args: Any, **kwargs: Any) -> 
     _configure_layer(self)
 
 
+# Speculative methods whose drafter reads the target's intermediate hidden states
+# (vLLM's SpeculativeConfig lists them in its compile hash factors).
+_AUX_HIDDEN_STATE_METHODS = ("eagle3", "extract_hidden_states", "dflash", "dspark")
+
+
 def _patched_model_init(self: Gemma4Model, *args: Any, **kwargs: Any) -> None:
     _orig_model_init(self, *args, **kwargs)
     if get_pp_group().world_size > 1:
@@ -130,6 +135,12 @@ def _patched_model_init(self: Gemma4Model, *args: Any, **kwargs: Any) -> None:
     if self.fast_prefill_enabled:
         raise ValueError(
             "TPU_GEMMA4_SEQUENCE_PARALLEL does not support kv_sharing_fast_prefill"
+        )
+    speculative = self.vllm_config.speculative_config
+    if speculative is not None and speculative.method in _AUX_HIDDEN_STATE_METHODS:
+        raise ValueError(
+            "TPU_GEMMA4_SEQUENCE_PARALLEL does not support speculative method "
+            f"{speculative.method!r}: its drafter reads auxiliary hidden states"
         )
 
 
