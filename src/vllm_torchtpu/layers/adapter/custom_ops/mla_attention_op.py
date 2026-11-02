@@ -1766,9 +1766,7 @@ class VllmTPUMLAAttention(MLAAttention):
             and vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1
         ):
-            dcp_token_parallel_op.check_config(
-                vllm_config, q_replicate=bool(dcp_q_replicate)
-            )
+            dcp_token_parallel_op.check_config(vllm_config)
             self.token_parallel_layout = dcp_token_parallel_op.layout_for(vllm_config)
 
         # For compatibility reasons.
@@ -2241,17 +2239,25 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # only the rows this rank attends (`dcp_token_parallel_op.q_rows`).
         q_rows = None
         tp_op = getattr(self.mla_attn, "sparse_mla_tp_op", None)
+        token_parallel = tp_op is not None and dcp_token_parallel_op.applies(
+            hidden_states.shape[0]
+        )
         if tp_op is not None and tp_op.q_replicated:
-            if not dcp_token_parallel_op.applies(hidden_states.shape[0]):
+            if not token_parallel:
                 # Lift the rank operand here too: the warmup hands buckets
                 # over only between traces that lift the same buffers.
                 hidden_states = _retain_buffers(hidden_states, tp_op.rank)
-            elif self.kimi_preprocess is not None or getattr(self, "qb_overlap", False):
+            elif self.kimi_preprocess is not None:
                 raise NotImplementedError(
                     "TPU_DCP_PREFILL_TOKEN_PARALLEL: no fused q preprocessing"
                 )
             else:
                 q_rows = dcp_token_parallel_op.q_rows(tp_op, hidden_states.shape[0])
+        # The q_b overlap and the in-kernel q rope serve the buckets neither
+        # prefill split takes; a split bucket projects and ropes q as before.
+        split = token_parallel or prefill_group is not None
+        qb_overlap = getattr(self, "qb_overlap", False) and not split
+        decode_prologue = getattr(self, "decode_prologue", False) and not split
 
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
@@ -2298,7 +2304,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         dim=-1,
                     )
                 q_c = self.q_a_layernorm(q_c)
-                if getattr(self, "qb_overlap", False) and self.kimi_preprocess is None:
+                if qb_overlap and self.kimi_preprocess is None:
                     # The indexer runs on q_c anyway; it returns q too.
                     assert self.indexer is not None
                     early_topk, q = self.indexer(
@@ -2341,7 +2347,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         q_rope_table = None
         fold_q_rope = (
-            getattr(self, "decode_prologue", False)
+            decode_prologue
             and getattr(self, "_rope_neox_permuted", False)
             and llama_4_scaling is None
         )

@@ -62,7 +62,7 @@ from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_me
 from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
     grouped_shared_expert_sharded,
 )
-from vllm_torchtpu.layers.adapter import fused_moe_decode, fused_moe_ep
+from vllm_torchtpu.layers.adapter import fused_moe_decode, fused_moe_ep, token_padding
 from vllm_torchtpu.layers.adapter.attention import _retain_buffers
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
@@ -445,13 +445,9 @@ def check_config(vllm_config: Any) -> None:
         "does not take USE_MOE_FUSED_EP_KERNEL (it owns every bucket)": (
             envs.USE_MOE_FUSED_EP_KERNEL
         ),
-        "does not take USE_MOE_TP_DECODE_KERNEL": envs.USE_MOE_TP_DECODE_KERNEL,
         "does not take TPU_FUSED_ADD_RMSNORM (its norm -> linear fp8 pairing "
         "would hand the rank's rows to a gathered linear)": envs.TPU_FUSED_ADD_RMSNORM,
         "does not take TPU_DCP_MLA_OPROJ_ALL_REDUCE": envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE,
-        "does not take TPU_MOE_SKIP_PADDED_TOKENS (its mask is over all rows)": (
-            envs.TPU_MOE_SKIP_PADDED_TOKENS
-        ),
     }
     bad = [why for why, hit in refusals.items() if hit]
     if bad:
@@ -478,9 +474,16 @@ def _backbone(model: torch.nn.Module) -> Any:
 
 def _keep_list(mlp: torch.nn.Module) -> list[torch.Tensor]:
     """The layer's tensors plus the module-global operands the other buckets'
-    MoE ops read (the decode kernel's rank buffer, when it is armed)."""
+    MoE ops read: the decode kernel's rank buffer, when it is armed, and the
+    token-padding mask (TPU_MOE_SKIP_PADDED_TOKENS; USE_MOE_TP_DECODE_KERNEL
+    reads its valid-row count from it)."""
     seen: dict[int, torch.Tensor] = {}
-    extra = (fused_moe_ep.rank_operand(), fused_moe_decode.rank_operand())
+    padding = token_padding._padding_state
+    extra = (
+        fused_moe_ep.rank_operand(),
+        fused_moe_decode.rank_operand(),
+        None if padding is None else padding.local_padding_mask,
+    )
     for t in (*mlp.parameters(), *mlp.buffers(), *getattr(mlp, SHARED_ATTR), *extra):
         if t is not None:
             seen.setdefault(id(t), t)
@@ -519,11 +522,10 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             mla.kimi_preprocess is not None
             or mla.q_lora_rank is None
             or mla.g_proj is not None
-            or getattr(mla, "qb_overlap", False)
         ):
             raise NotImplementedError(
                 "the split gathers fused_qkv_a outputs: it needs the q_lora MLA "
-                "path without fused preprocessing, g_proj or the q_b overlap"
+                "path without fused preprocessing or g_proj"
             )
         mlp = layer.mlp
         experts = mlp.experts.routed_experts

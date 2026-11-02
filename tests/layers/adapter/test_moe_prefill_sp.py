@@ -24,6 +24,7 @@ import torch
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
 from vllm_torchtpu.layers.adapter import moe_prefill_sp as sp
+from vllm_torchtpu.layers.adapter import token_padding
 
 
 def _shards(full: torch.Tensor, tp: int, dim: int) -> list[torch.Tensor]:
@@ -165,7 +166,6 @@ def test_the_served_config_is_admitted():
         (dict(pipeline_parallel_size=2), {}, "pipeline"),
         ({}, dict(USE_MOE_FUSED_EP_KERNEL=True), "USE_MOE_FUSED_EP_KERNEL"),
         ({}, dict(TPU_FUSED_ADD_RMSNORM=True), "TPU_FUSED_ADD_RMSNORM"),
-        ({}, dict(TPU_MOE_SKIP_PADDED_TOKENS=True), "SKIP_PADDED"),
         ({}, dict(TPU_DCP_MLA_OPROJ_ALL_REDUCE=True), "OPROJ_ALL_REDUCE"),
     ],
 )
@@ -177,6 +177,38 @@ def test_unserved_configs_are_refused(parallel, flags, match):
     finally:
         for p in patches:
             p.stop()
+
+
+def test_the_decode_moe_kernel_flags_are_admitted():
+    """USE_MOE_TP_DECODE_KERNEL and TPU_MOE_SKIP_PADDED_TOKENS act through the
+    MoE runner, which only the buckets the split leaves serve."""
+    patches = _with_envs(USE_MOE_TP_DECODE_KERNEL=True, TPU_MOE_SKIP_PADDED_TOKENS=True)
+    try:
+        sp.check_config(_config())
+    finally:
+        for p in patches:
+            p.stop()
+
+
+@pytest.mark.parametrize("padding", [False, True])
+def test_keep_list_lifts_the_token_padding_mask(padding):
+    """The decode MoE kernel reads the token-padding mask, so both branches of
+    an armed layer lift it when it exists."""
+    mlp = torch.nn.Linear(4, 4)
+    setattr(mlp, sp.SHARED_ATTR, (torch.zeros(1),))
+    state = token_padding.TokenPaddingState.create(8, "cpu") if padding else None
+    rank = torch.zeros(1, 1, dtype=torch.int32)
+    with (
+        patch.object(token_padding, "_padding_state", state),
+        patch.object(bridge, "_RANK_BUFFER", rank),
+        patch.object(sp.fused_moe_decode, "_RANK_BUFFER", None),
+    ):
+        keep = sp._keep_list(mlp)
+    want = [mlp.weight, mlp.bias, getattr(mlp, sp.SHARED_ATTR)[0], rank]
+    if padding:
+        want.append(state.local_padding_mask)
+    assert len(keep) == len(want)
+    assert all(a is b for a, b in zip(keep, want))
 
 
 def test_non_bf16_models_are_refused():

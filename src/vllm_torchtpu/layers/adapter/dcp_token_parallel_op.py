@@ -96,26 +96,19 @@ def layout_for(vllm_config: Any) -> dcp_token_parallel.TokenParallelLayout:
     )
 
 
-def check_config(vllm_config: Any, *, q_replicate: bool) -> None:
-    """Raise for a config the split does not serve."""
+def check_config(vllm_config: Any) -> None:
+    """Raise for a config the split does not serve. TPU_MLA_DECODE_PROLOGUE
+    and TPU_INDEXER_QB_OVERLAP serve only the buckets the split does not take
+    (`VllmTPUMultiHeadLatentAttentionWrapper.forward`)."""
     if vllm_config.speculative_config is not None:
         raise NotImplementedError(
             "TPU_DCP_PREFILL_TOKEN_PARALLEL: speculative decoding is not "
             "supported (the drafter is traced once for every bucket)."
         )
-    if q_replicate and envs.TPU_MLA_DECODE_PROLOGUE:
-        raise NotImplementedError(
-            "TPU_DCP_PREFILL_TOKEN_PARALLEL does not take TPU_MLA_DECODE_PROLOGUE "
-            "(an un-roped q under query replication)."
-        )
     if envs.TPU_DCP_MLA_UV_BEFORE_MERGE or envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE:
         raise NotImplementedError(
             "TPU_DCP_PREFILL_TOKEN_PARALLEL returns merged latent outputs; it "
             "does not take TPU_DCP_MLA_UV_BEFORE_MERGE / _OPROJ_ALL_REDUCE."
-        )
-    if envs.TPU_INDEXER_QB_OVERLAP:
-        raise NotImplementedError(
-            "TPU_DCP_PREFILL_TOKEN_PARALLEL does not take TPU_INDEXER_QB_OVERLAP."
         )
     if vllm_config.cache_config.enable_prefix_caching:
         raise NotImplementedError(
