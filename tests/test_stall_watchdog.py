@@ -21,6 +21,9 @@ def test_dumps_once_per_stall_only_with_live_requests(monkeypatch):
     monkeypatch.setattr(
         stall_watchdog.faulthandler, "dump_traceback", lambda **kw: dumps.append(1)
     )
+    # The real logger's first use imports vLLM (seconds in a pod), which
+    # delays the dump past the polls below.
+    monkeypatch.setattr(stall_watchdog.logger, "warning", lambda *a, **k: None)
     monkeypatch.setattr(stall_watchdog, "_armed", True)
     stall_watchdog.note_step(0)
     stall_watchdog._last_step = time.monotonic() - 10
@@ -42,6 +45,9 @@ def test_empty_schedules_do_not_count_as_progress(monkeypatch):
     monkeypatch.setattr(
         stall_watchdog.faulthandler, "dump_traceback", lambda **kw: dumps.append(1)
     )
+    # The real logger's first use imports vLLM (seconds in a pod), which
+    # delays the dump past the polls below.
+    monkeypatch.setattr(stall_watchdog.logger, "warning", lambda *a, **k: None)
     monkeypatch.setattr(stall_watchdog, "_armed", True)
     stall_watchdog.note_step(4)
     stall_watchdog._last_step = time.monotonic() - 10
