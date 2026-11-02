@@ -34,6 +34,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs, transforms
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     flat_manager_ids,
@@ -1075,13 +1076,18 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def _apply_output_projection(
         self, core_attn_out: torch.Tensor, z: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
+        del num_tokens
         local_num_v_heads = self.num_v_heads // self.tp_size
-        core_attn_out = core_attn_out.view(
-            num_tokens, local_num_v_heads, self.head_v_dim
-        )
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output, _ = self.out_proj(core_attn_out)
+        with transforms.microbatch(
+            min_len=envs.TPU_QWEN35_MICROBATCH_MIN_TOKENS,
+            groups=envs.TPU_QWEN35_MICROBATCH_GROUPS,
+        ):
+            core_attn_out = core_attn_out.view(
+                -1, local_num_v_heads, self.head_v_dim
+            )
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+            output, _ = self.out_proj(core_attn_out)
         return output
 
     def _forward_fused_pooled_pcp(
@@ -1146,28 +1152,32 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        if hasattr(self, "in_proj_qkv"):
-            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-            z, _ = self.in_proj_z(hidden_states)
-            z = z.reshape(z.size(0), -1, self.head_v_dim)
-            b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
-        else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+        with transforms.microbatch(
+            min_len=envs.TPU_QWEN35_MICROBATCH_MIN_TOKENS,
+            groups=envs.TPU_QWEN35_MICROBATCH_GROUPS,
+        ):
+            if hasattr(self, "in_proj_qkv"):
+                mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+                ba, _ = self.in_proj_ba(hidden_states)
+                z, _ = self.in_proj_z(hidden_states)
+                z = z.reshape(z.size(0), -1, self.head_v_dim)
+                b, a = ba.chunk(2, dim=-1)
+                b = b.contiguous()
+                a = a.contiguous()
+            else:
+                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                ba, _ = self.in_proj_ba(hidden_states)
 
-            # Every checkpoint loader produces [q, k, v, z] and [b, a].
-            qkv_size = self.tp_head_geometry.local_conv_dim(
-                self.head_k_dim, self.head_v_dim
-            )
-            z_size = self.value_dim // self.tp_size
-            mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-            z = z.reshape(z.size(0), -1, self.head_v_dim)
-            b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
+                # Every checkpoint loader produces [q, k, v, z] and [b, a].
+                qkv_size = self.tp_head_geometry.local_conv_dim(
+                    self.head_k_dim, self.head_v_dim
+                )
+                z_size = self.value_dim // self.tp_size
+                mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+                z = z.reshape(z.size(0), -1, self.head_v_dim)
+                b, a = ba.chunk(2, dim=-1)
+                b = b.contiguous()
+                a = a.contiguous()
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)

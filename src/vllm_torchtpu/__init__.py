@@ -2,7 +2,7 @@
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
 import vllm_torchtpu.env_override  # noqa: F401
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, transforms
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)

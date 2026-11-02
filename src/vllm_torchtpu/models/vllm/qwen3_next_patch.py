@@ -38,10 +38,12 @@ from vllm.model_executor.models import qwen3_next
 from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu import transforms
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+UPSTREAM_ATTENTION_FORWARD = qwen3_next.Qwen3NextAttention.forward
 UPSTREAM_DECODER_LAYER_FORWARD = qwen3_next.Qwen3NextDecoderLayer.forward
 UPSTREAM_MODEL_FORWARD = qwen3_next.Qwen3NextModel.forward
 
@@ -50,6 +52,28 @@ def _check_tokens_divide_by_tp(num_tokens: int) -> None:
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size > 1:
         torch._check(num_tokens % tp_size == 0)
+
+
+def patched_attention_forward(
+    self,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    with transforms.microbatch(
+        min_len=envs.TPU_QWEN35_MICROBATCH_MIN_TOKENS,
+        groups=envs.TPU_QWEN35_MICROBATCH_GROUPS,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+    q, k, v, gate = self._project_qkv_gate(qkv, positions)
+    attn_output = self.attn(q, k, v)
+    with transforms.microbatch(
+        min_len=envs.TPU_QWEN35_MICROBATCH_MIN_TOKENS,
+        groups=envs.TPU_QWEN35_MICROBATCH_GROUPS,
+    ):
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
+        output, _ = self.o_proj(attn_output)
+    return output
 
 
 def patched_decoder_layer_forward(
@@ -61,15 +85,28 @@ def patched_decoder_layer_forward(
 ):
     full_num_tokens = positions.shape[-1]
 
-    if residual is None:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-    else:
-        hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
     if self.use_attn_reduce_scatter_for_moe:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual
+            )
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
         hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
+    else:
+        with transforms.microbatch(
+            min_len=envs.TPU_QWEN35_MICROBATCH_MIN_TOKENS,
+            groups=envs.TPU_QWEN35_MICROBATCH_GROUPS,
+        ):
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual
+                )
 
     if self.layer_type == "linear_attention":
         hidden_states = self.linear_attn(hidden_states=hidden_states)
@@ -96,14 +133,20 @@ def patched_decoder_layer_forward(
         hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
 
     # Fully Connected
-    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-    if self.use_attn_reduce_scatter_for_moe:
-        hidden_states = self.mlp(
-            hidden_states,
-            already_sequence_parallel=True,
+    with transforms.microbatch(
+        min_len=envs.TPU_QWEN35_MICROBATCH_MIN_TOKENS,
+        groups=envs.TPU_QWEN35_MICROBATCH_GROUPS,
+    ):
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
         )
-    else:
-        hidden_states = self.mlp(hidden_states)
+        if self.use_attn_reduce_scatter_for_moe:
+            hidden_states = self.mlp(
+                hidden_states,
+                already_sequence_parallel=True,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
 
     if self.layer_scale:
         if len(hidden_states.shape) == 2:
@@ -187,12 +230,14 @@ def patched_model_forward(
 
 
 def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
-    """Install trace-stable forwards when TPU_MOE_SEQUENCE_PARALLEL=1."""
-    if not envs.TPU_MOE_SEQUENCE_PARALLEL:
+    """Install trace-stable forwards when SP or Qwen3.5 microbatching is enabled."""
+    if not envs.TPU_MOE_SEQUENCE_PARALLEL and envs.TPU_QWEN35_MICROBATCH_GROUPS <= 1:
         return None
     qwen3_next.Qwen3NextDecoderLayer.forward = patched_decoder_layer_forward
     qwen3_next.Qwen3NextModel.forward = patched_model_forward
+    if envs.TPU_QWEN35_MICROBATCH_GROUPS > 1:
+        qwen3_next.Qwen3NextAttention.forward = patched_attention_forward
     logger.info(
-        "Applied TPU patch: Qwen3.5 MoE trace-stable sequence-parallel forward."
+        "Applied TPU patch: Qwen3.5 MoE trace-stable sequence-parallel / microbatch forward."
     )
     return None
