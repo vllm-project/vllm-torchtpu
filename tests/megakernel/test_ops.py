@@ -65,7 +65,7 @@ def test_ops_primitives():
 
 
 def test_fp32_intermediate_precision_rope_and_swiglu():
-    """Verify `rope_partial` and `silu_mul` avoid multi-stage BF16 truncation drift."""
+    """Verify `round_intermediates=False` avoids multi-stage BF16 truncation drift."""
     rng = jax.random.PRNGKey(1234)
     k1, k2, k3, k4 = jax.random.split(rng, 4)
     x = jax.random.normal(k1, (16, 256), dtype=F32)
@@ -73,7 +73,7 @@ def test_fp32_intermediate_precision_rope_and_swiglu():
     sin = jax.random.normal(k3, (16, 32), dtype=F32)
     up = jax.random.normal(k4, (16, 256), dtype=F32)
 
-    out_rope = rope_partial(x, cos, sin, 64)
+    out_rope = rope_partial(x, cos, sin, 64, round_intermediates=False)
     assert out_rope.dtype == F32
 
     x1_64 = np.asarray(x[:, :32], dtype=np.float64)
@@ -94,9 +94,41 @@ def test_fp32_intermediate_precision_rope_and_swiglu():
     assert err_fp32 < 1e-6
     assert err_fp32 * 100.0 < err_legacy
 
-    out_swiglu = silu_mul(x, up)
+    out_swiglu = silu_mul(x, up, round_intermediates=False)
     assert out_swiglu.dtype == BF16
     expected_swiglu = (jax.nn.silu(x) * up).astype(BF16)
+    np.testing.assert_array_equal(
+        np.asarray(out_swiglu).view(np.uint16),
+        np.asarray(expected_swiglu).view(np.uint16),
+    )
+
+
+def test_default_bf16_rounded_intermediates_rope_and_swiglu():
+    """Verify default `round_intermediates=True` matches BF16-rounded reference."""
+    rng = jax.random.PRNGKey(1234)
+    k1, k2, k3, k4 = jax.random.split(rng, 4)
+    x = jax.random.normal(k1, (16, 256), dtype=F32)
+    cos = jax.random.normal(k2, (16, 32), dtype=F32)
+    sin = jax.random.normal(k3, (16, 32), dtype=F32)
+    up = jax.random.normal(k4, (16, 256), dtype=F32)
+
+    out_rope = rope_partial(x, cos, sin, 64)
+    x1, x2, rest = x[:, :32], x[:, 32:64], x[:, 64:]
+    expected_rope = jnp.concatenate(
+        (
+            rnd(rnd(x1 * cos) - rnd(x2 * sin)),
+            rnd(rnd(x2 * cos) + rnd(x1 * sin)),
+            rest,
+        ),
+        axis=-1,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(out_rope).view(np.uint32),
+        np.asarray(expected_rope).view(np.uint32),
+    )
+
+    out_swiglu = silu_mul(x, up)
+    expected_swiglu = (rnd(jax.nn.silu(x)) * up).astype(BF16)
     np.testing.assert_array_equal(
         np.asarray(out_swiglu).view(np.uint16),
         np.asarray(expected_swiglu).view(np.uint16),

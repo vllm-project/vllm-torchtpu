@@ -46,9 +46,8 @@ def test_pool_alias_reinterpret_mosaic_lowering(monkeypatch):
     from jax._src.lib.mlir import ir
     from jax._src.pallas.mosaic import lowering
 
-    # Start from a fresh install: earlier tests may already have installed the
-    # hook, and the frozen reference kernel (loaded by other test modules)
-    # installs its own pool_alias hook on top. monkeypatch restores all three.
+    # Start from a fresh install: earlier tests in the session may already
+    # have installed the lowering hook; monkeypatch restores the pre-test state.
     monkeypatch.setattr(pool_alias, "_installed", False)
     monkeypatch.setattr(pool_alias, "_original", pool_alias._original)
     monkeypatch.setattr(lowering, "_reshape_memref", lowering._reshape_memref)
