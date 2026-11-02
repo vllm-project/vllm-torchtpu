@@ -139,19 +139,23 @@ def main_rows(
     dst_pages: Sequence[int],
     dst_block: int,
     rank: RankSlice,
+    start: int = 0,
+    src_first: int = 0,
 ) -> tuple[list[int], list[int]]:
     """(source row, destination row) of every token this rank keeps.
 
     With main-KV DCP a destination table entry covers ``D * B`` tokens and pair
     rank ``(t // B) % D`` stores token ``t`` at row ``t % B`` of the entry's page
-    (``qsa_rpa.virtual_page_metadata``).
+    (``qsa_rpa.virtual_page_metadata``). A prefix-aware load repacks only tokens
+    from ``start`` on: ``src_pages`` then begins at source page ``src_first``
+    (the staged suffix), ``dst_pages`` is the full destination table.
     """
     src, dst = [], []
     d = rank.main_dcp
-    for t in range(num_tokens):
+    for t in range(start, num_tokens):
         if d > 1 and (t // dst_block) % d != rank.dcp_rank:
             continue
-        src.append(src_pages[t // src_block] * src_block + t % src_block)
+        src.append(src_pages[t // src_block - src_first] * src_block + t % src_block)
         dst.append(dst_pages[t // (d * dst_block)] * dst_block + t % dst_block)
     return src, dst
 
@@ -163,19 +167,27 @@ def compressed_rows(
     src_block: int,
     dst_pages: Sequence[int],
     dst_block: int,
+    start: int = 0,
+    src_first: int = 0,
 ) -> tuple[list[int], list[int]]:
     """Rows ("pairs") holding the compressed keys of the first ``num_tokens``.
 
     Pair ``p`` of a page holds compressed groups ``2p`` and ``2p + 1``, i.e.
     tokens ``[2 p ratio, 2 (p + 1) ratio)`` of the page's span
-    (``pooled_qsa.compressed_pairs``); the content does not depend on TP.
+    (``pooled_qsa.compressed_pairs``); the content does not depend on TP. A
+    prefix-aware load starts at the pair of token ``start`` (a pair boundary),
+    with ``src_pages`` beginning at source page ``src_first``.
     """
     span = 2 * ratio
+    if start % span:
+        raise ValueError(f"A repack must start on a compressed pair ({span} tokens)")
     pairs = math.ceil(math.ceil(num_tokens / ratio) / 2)
     src, dst = [], []
-    for q in range(pairs):
+    for q in range(start // span, pairs):
         t = q * span
-        src.append(src_pages[t // src_block] * src_block + (t % src_block) // span)
+        src.append(
+            src_pages[t // src_block - src_first] * src_block + (t % src_block) // span
+        )
         dst.append(dst_pages[t // dst_block] * dst_block + (t % dst_block) // span)
     return src, dst
 
@@ -430,6 +442,8 @@ class StagedConsumer:
         self.free = torch.ones(self.pages, dtype=torch.int32)
         self.free[0] = 0  # the null page
         self.reservations: dict[int, list[list[int]]] = {}
+        # uuid -> (decode-local prefix tokens, first staged source page per group)
+        self.skips: dict[int, tuple[int, list[int]]] = {}
         self.manifest = PoolManifest(
             BINDING_ALIASED_RAW,
             [self.staging],
@@ -470,10 +484,20 @@ class StagedConsumer:
 
     # --- allocation (identical on every rank of the engine) ---
 
-    def reserve(self, uuid: int, num_tokens: int, tp_group=None) -> bool:
+    def reserve(
+        self, uuid: int, num_tokens: int, tp_group=None, *, skip_tokens: int = 0
+    ) -> bool:
+        """Staging pages for one load. A prefix-aware load (``skip_tokens``:
+        the decode-local prefix) stages each token group from the first source
+        page not wholly inside that prefix; request-state pages stage whole."""
+        from .pd import skipped_source_pages
+
         if uuid in self.reservations:
             return True
-        counts = [g.page_count(num_tokens) for g in self.src_groups]
+        first = [skipped_source_pages(g, skip_tokens) for g in self.src_groups]
+        counts = [g.page_count(num_tokens) - f for g, f in zip(self.src_groups, first)]
+        if any(count <= 0 for count in counts):
+            raise ValueError("A prefix-aware load must leave every group a suffix")
         free = self.free.clone()
         if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             import torch.distributed as dist
@@ -491,9 +515,20 @@ class StagedConsumer:
         for group_pages in pages:
             self.free[group_pages] = 0
         self.reservations[uuid] = pages
+        self.skips[uuid] = (skip_tokens, first)
         return True
 
     def destination(self, uuid: int) -> tuple[list[str], list[int], list[int]]:
+        skip, _ = self.skips.get(uuid, (0, None))
+        # The repack writes rows from the local prefix's end on: it must end on
+        # a compressed pair and on a destination table entry (D * B tokens
+        # under main-KV DCP), or those writes would land in shared prefix pages.
+        entry = self.rank.main_dcp * self.dst_block
+        if skip and (skip % (2 * self.ratio) or skip % entry):
+            raise ValueError(
+                f"A staged prefix-aware load needs a local prefix on a {entry}-token "
+                f"table entry and a {2 * self.ratio}-token compressed pair, got {skip}"
+            )
         pages = self.reservations[uuid]
         tags, blocks, counts = [], [], []
         for pool in self.manifest.pools:
@@ -503,7 +538,17 @@ class StagedConsumer:
             counts.append(len(group_pages))
         return tags, blocks, counts
 
+    def skip_bytes(self, uuid: int) -> list[int]:
+        """Per-tag destination clips, in ``destination`` order: the bytes of
+        the source pages a prefix-aware load leaves out of each pool."""
+        _, first = self.skips.get(uuid, (0, [0] * len(self.src_groups)))
+        return [
+            first[self._src_owner[pool.layer_name]] * pool.block_stride_bytes
+            for pool in self.manifest.pools
+        ]
+
     def release(self, uuid: int) -> list[list[int]] | None:
+        self.skips.pop(uuid, None)
         pages = self.reservations.pop(uuid, None)
         if pages is not None:
             for group_pages in pages:
@@ -512,18 +557,25 @@ class StagedConsumer:
 
     # --- the repack ---
 
-    def indices(self, src_pages, dst_tables, num_tokens):
+    def indices(self, src_pages, dst_tables, num_tokens, skip_tokens=0, first=None):
+        """Row indices of the repack. With ``skip_tokens`` only tokens from
+        there on are written (the destination's earlier rows are shared prefix
+        pages); ``first[g]`` is the source page group ``g``'s staging starts at."""
+        first = first or [0] * len(self.src_groups)
         main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = [], [], [], [], [], []
         for name, gi in self._dst_owner.items():
             kind = owner_kind(name)
             src = src_pages[self._src_owner[name]]
+            src_first = first[self._src_owner[name]]
             dst = dst_tables[gi]
             if kind == "main":
-                s, d = main_rows(num_tokens, src, self.src_block, dst, self.dst_block, self.rank)
+                s, d = main_rows(num_tokens, src, self.src_block, dst, self.dst_block,
+                                 self.rank, start=skip_tokens, src_first=src_first)
                 main_s += s
                 main_d += d
             elif kind == "compressed":
-                s, d = compressed_rows(num_tokens, self.ratio, src, self.src_block, dst, self.dst_block)
+                s, d = compressed_rows(num_tokens, self.ratio, src, self.src_block, dst,
+                                       self.dst_block, start=skip_tokens, src_first=src_first)
                 copy_s += s
                 copy_d += d
             elif kind in ("ring", "ple"):
@@ -538,7 +590,10 @@ class StagedConsumer:
 
     def repack(self, uuid: int, dst_tables, num_tokens: int) -> None:
         pages = self.reservations[uuid]
-        main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = self.indices(pages, dst_tables, num_tokens)
+        skip, first = self.skips.get(uuid, (0, None))
+        main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = self.indices(
+            pages, dst_tables, num_tokens, skip, first
+        )
         device = self.pool.device
 
         if self._op is None:

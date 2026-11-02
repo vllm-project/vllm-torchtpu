@@ -43,7 +43,14 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
     _use_per_layer_pool_tags,
 )
 
-from .pd import TransferExtent, TransferGroup, build_transfer_groups, handoff_block_ids
+from .pd import (
+    TransferExtent,
+    TransferGroup,
+    build_transfer_groups,
+    handoff_block_ids,
+    skipped_source_pages,
+    suffix_pages,
+)
 from .pd_identity import canonical_rank_identity
 from .pd_manifest import build_transfer_manifest, measure_transfer_layout
 
@@ -65,13 +72,16 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
     ):
         parallel = vllm_config.parallel_config
         cache = vllm_config.cache_config
+        # Prefix caching is admitted on either leg: a producer publishes the
+        # running state of its align-mode state tables (and ordinary, possibly
+        # shared, token pages); a consumer adopts its local prefix and pulls
+        # the suffix (supports_stage3_grouped_prefix_loads).
         if (
             parallel.prefill_context_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
             or vllm_config.speculative_config is not None
-            or cache.enable_prefix_caching
         ):
-            raise NotImplementedError("Qwen PD first requires CP1, APC and MTP off")
+            raise NotImplementedError("Qwen PD first requires CP1 and MTP off")
         # A pipeline producer (Qwen3.5's prefill shape): each TP1 stage ships
         # its own layers' pages whole, paired with a TP1 consumer's pools by
         # per-layer tag, so both peers hold the same per-layer page encoding.
@@ -107,9 +117,14 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
                 cache_group_index=group.group_index,
                 page_tokens=group.block_size,
                 request_state=group.extent is TransferExtent.REQUEST_STATE,
+                positional_state=group.positional_state,
             )
             for group in build_transfer_groups(config.kv_cache_groups)
         )
+
+    # The worker plans per-group suffix pages for decode-local prefix hits
+    # (token groups clip their local prefix, request-state groups move whole).
+    supports_stage3_grouped_prefix_loads = True
 
     @staticmethod
     def _supports_stage3_grouped_transfer() -> bool:
@@ -263,7 +278,12 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         staging = getattr(self, "_staging", None)
         if staging is None:
             return True
-        ok = staging.reserve(int(req_meta.uuid), int(req_meta.num_tokens), tp_group)
+        ok = staging.reserve(
+            int(req_meta.uuid),
+            int(req_meta.num_tokens),
+            tp_group,
+            skip_tokens=int(getattr(req_meta, "skip_tokens", 0) or 0),
+        )
         if not ok:
             # The load parks and is re-attempted each step until room frees
             # (or the wait budget ends; the connector logs that fallback).
@@ -333,7 +353,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 cp=1,
                 pp=1,
                 mtp=False,
-                apc=False,
+                # Prefix caching is a per-leg choice: the pages that cross are
+                # the same encoding either way (a positional state table ships
+                # its running-state page), so it is not part of the identity.
             ),
         )
         records: list[Any] = [None] * group.world_size
@@ -390,11 +412,10 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             or parallel.prefill_context_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
             or self.vllm_config.speculative_config is not None
-            or self.vllm_config.cache_config.enable_prefix_caching
         ):
             raise ValueError(
                 "Qwen PD requires matching TP (or a TP1 pipeline producer with "
-                "a TP1 consumer), CP1 and APC/MTP off"
+                "a TP1 consumer), CP1 and MTP off"
             )
 
     def _raiden_interleave_tokens(
@@ -461,11 +482,20 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
     def _stage3_grouped_destination_pages(
         self, req_meta: _Stage3LoadMeta, num_tokens: int
     ) -> tuple[list[str], list[int], list[int]]:
+        """Destination pages per pool tag, in plan order.
+
+        A prefix-aware load (``skip_tokens`` > 0: the decode-local prefix
+        cache already holds that prefix of every token group) lists only each
+        token group's suffix pages, which the transfer fills from the clipped
+        source (``_stage3_dst_skip_bytes``); request-state pages move whole.
+        The adopted prefix pages are shared cache pages and never targets.
+        """
         plan = self._page_plan()
-        if req_meta.skip_tokens or (
-            req_meta.src_parallelism != self._raiden_transfer_parallelism()
-        ):
-            raise ValueError("Qwen PD needs a full prefix and the admitted source units")
+        if req_meta.src_parallelism != self._raiden_transfer_parallelism():
+            raise ValueError("Qwen PD needs the admitted source units")
+        skip = int(req_meta.skip_tokens or 0)
+        if skip and not self._prefix_loads_supported():
+            raise ValueError("Qwen PD prefix-aware loads are not enabled on this rank")
         staging = getattr(self, "_staging", None)
         if staging is not None:
             return staging.destination(int(req_meta.uuid))
@@ -474,11 +504,42 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             raise ValueError("Qwen PD primary pages differ from the full group table")
         tags, blocks, counts = [], [], []
         for pool, group_index in plan.pool_groups():
-            ids = pages[group_index]
+            ids = suffix_pages(plan.groups[group_index], pages[group_index], skip)
             tags.append(pool.tag)
             blocks.extend(ids)
             counts.append(len(ids))
         return tags, blocks, counts
+
+    @staticmethod
+    def _prefix_loads_supported() -> bool:
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+            _prefix_aware_load_enabled,
+        )
+
+        return _prefix_aware_load_enabled()
+
+    def _stage3_dst_skip_bytes(
+        self, req_meta: Any, skip_tokens: int, num_tags: int, fa_tag_count: int
+    ) -> list[int]:
+        """Per-tag clips of a prefix-aware load, in the order of
+        ``_stage3_grouped_destination_pages``: each token pool skips the source
+        pages wholly inside the local prefix, request-state pools nothing."""
+        staging = getattr(self, "_staging", None)
+        if staging is not None:
+            clips = staging.skip_bytes(int(req_meta.uuid))
+        else:
+            plan = self._page_plan()
+            clips = [
+                skipped_source_pages(plan.groups[group_index], skip_tokens)
+                * pool.block_stride_bytes
+                for pool, group_index in plan.pool_groups()
+            ]
+        if len(clips) != num_tags or num_tags != fa_tag_count:
+            raise ValueError(
+                "Qwen PD clips must cover every grouped transfer tag: "
+                f"clips={len(clips)}, tags={num_tags}, grouped={fa_tag_count}"
+            )
+        return clips
 
 
 def _owner_invariant_layout(layout: dict[str, Any]) -> dict[str, Any]:
