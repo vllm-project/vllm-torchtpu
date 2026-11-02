@@ -38,7 +38,7 @@ exec vllm serve "$model" \
   --enable-expert-parallel --enable-ep-weight-filter --language-model-only \
   --async-scheduling --enable-prefix-caching --kv-cache-dtype fp8 \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
-  --engram-config '{"cpu_offload":true}' \
+  --engram-config '{"cpu_offload":true,"dp_shared_memory":false}' \
   --additional-config '{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}' \
   --block-size 64 \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
