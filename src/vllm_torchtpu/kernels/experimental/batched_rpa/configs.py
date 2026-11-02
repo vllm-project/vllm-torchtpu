@@ -177,6 +177,9 @@ class ServingConfigs:
     # Skip a launch whose segment of the batch has no work (no VMEM zero-fill,
     # no schedule write-back beyond actual_steps).
     skip_empty_launch: bool = False
+    # QK^T and PV run fp8 x fp8 on the MXU: Q arrives already quantized to
+    # `dtype_q` and P is quantized to `dtype_kv` (see flash_attention.py).
+    fp8_compute: bool = False
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -446,17 +449,23 @@ class RpaConfigs:
             >> 3
         )
 
-    @property
-    def q_vmem_shape(self):
-        q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
+    def _q_like_vmem_shape(self, packing: int):
         return (
             self.block.batch_size,
             self.model.num_kv_heads,
             self.block.bq_sz,
-            q_per_kv_packing,
-            self.serve.packing_q,
+            self.aligned_num_q_heads_per_kv_head // packing,
+            packing,
             self.aligned_q_head_dim,
         )
+
+    @property
+    def q_vmem_shape(self):
+        return self._q_like_vmem_shape(self.serve.packing_q)
+
+    @property
+    def o_vmem_shape(self):
+        return self._q_like_vmem_shape(utils.get_dtype_packing(self.serve.dtype_out))
 
     @property
     def kv_token_align(self) -> int:

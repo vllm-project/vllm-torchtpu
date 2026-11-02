@@ -19,6 +19,14 @@ from jax import lax
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
 
+# Under `fp8_compute`, P is computed as exp(s - (m - P_FP8_SHIFT)), i.e. scaled
+# by about e**P_FP8_SHIFT, and cast to fp8; `l` sums the cast P, so acc / l
+# normalizes by exactly the weights PV applied. In bf16, m - 3.5 rounds to
+# between m - 4 and m for every m, so P <= e**4 < 448 (e4m3's max) whatever the
+# logits, while small P sit about e**3.5 above e4m3's subnormals. The rounding
+# depends on m, so the rescale between KV blocks uses the same shifted maxima.
+P_FP8_SHIFT = 3.5
+
 
 def flash_attention_qk_softmax(
     step: jax.Array,
@@ -87,17 +95,34 @@ def flash_attention_qk_softmax(
     alpha_list = []
     m_next_list = []
 
+    m_sub_list = []
     for b_idx in range(cfgs.block.batch_size):
         m_curr_b = m_curr[b_idx]
         m_next_b = jnp.maximum(m_prev, m_curr_b)
-        alpha_b = jnp.exp(m_prev - m_next_b)
+        if cfgs.serve.fp8_compute:
+            m_sub_b = m_next_b - P_FP8_SHIFT
+            alpha_b = jnp.exp((m_prev - P_FP8_SHIFT) - m_sub_b)
+        else:
+            m_sub_b = m_next_b
+            alpha_b = jnp.exp(m_prev - m_next_b)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
+        m_sub_list.append(m_sub_b)
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
-    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
+    m_sub = jnp.stack(m_sub_list, axis=0)
+    p = jnp.exp(qk - utils.broadcast_minor(m_sub, qk.shape))
+    if cfgs.serve.fp8_compute:
+        p = p.astype(cfgs.serve.dtype_kv)
+        p_rowsum = jnp.sum(
+            p.astype(cfgs.serve.dtype_out),
+            axis=-1,
+            keepdims=True,
+            dtype=cfgs.serve.dtype_out,
+        )
+    else:
+        p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []
     for b_idx in range(cfgs.block.batch_size):
@@ -143,6 +168,9 @@ def flash_attention_pv(
         # We can scale p or v, and because p will be smaller especially for decode
         # workflows, we scale p to save some time.
         p = p.astype(v_sc.dtype) * v_sc
+
+    if cfgs.serve.fp8_compute:
+        p = p.astype(v.dtype)
 
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         h_size = v.shape[-2]

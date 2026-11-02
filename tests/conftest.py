@@ -86,6 +86,7 @@ def _reset_warning_once():
 
 # Knobs that are on when unset.
 DEFAULT_ON_KNOBS = (
+    "TPU_FP8_ATTENTION",
     "TPU_GEMMA4_TOPK_SOFTMAX_ROUTING",
     "TPU_NORM_WEIGHTS_FP32",
     "TPU_REUSE_STAGED_BLOCK_TABLES",

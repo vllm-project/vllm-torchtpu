@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_K3_SP_PREFILL: bool = False
+    TPU_FP8_ATTENTION: bool = True
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
@@ -86,6 +87,7 @@ if TYPE_CHECKING:
     TPU_GREEDY_TOP_TOKENS: bool = False
     TPU_RPA_SKIP_EMPTY_LAUNCH: bool = True
     TPU_RPA_SLIDING_DECODE_MAX_BKV: int = 0
+    TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -448,6 +450,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
+    # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and
+    # PV as fp8 x fp8 matmuls on layers with an fp8 KV cache and a multiple of 4
+    # query heads per KV head (`ragged_paged_attention(fp8_compute=True)`).
+    "TPU_FP8_ATTENTION": env_bool("TPU_FP8_ATTENTION", default=True),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
     # top-k slots per token instead of all `topk`; tokens owning more are
     # recomputed exactly in-kernel over all their windows
@@ -790,6 +796,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it. 0 (default) keeps that block.
     "TPU_RPA_SLIDING_DECODE_MAX_BKV": env_nonnegative_int(
         "TPU_RPA_SLIDING_DECODE_MAX_BKV", 0
+    ),
+    # Largest batched-RPA mixed (prefill) KV and query block (tokens) on
+    # sliding-window layers. Blocks start at multiples of the KV block, so each
+    # query block computes about (block + window) / block + 1 whole KV blocks;
+    # the VMEM-filling default (1024 tokens on Gemma4-31B at TP8, 1536 on
+    # Gemma4-26B) computes 2-4x the window. 0 (default) keeps that block.
+    "TPU_RPA_SLIDING_PREFILL_MAX_BKV": env_nonnegative_int(
+        "TPU_RPA_SLIDING_PREFILL_MAX_BKV", 0
     ),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),

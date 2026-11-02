@@ -92,6 +92,7 @@ def calculate_and_store_out(
     lse_o_vref: jax.Ref | None,
     *,
     cfgs: configs.RpaConfigs,
+    carry_refs: tuple[jax.Ref, jax.Ref] | None = None,
 ):
     def _accum(b_idx: int | jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
@@ -134,9 +135,20 @@ def calculate_and_store_out(
         # tune `fuse_accum` for your use case.
         for b in range(cfgs.batch_size):
             is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
+            accum_named_call = jax.named_call(_accum, name=f"accum_{b}")
+            if carry_refs is not None and b == cfgs.batch_size - 1:
+                # The last lane's accumulators are the carries just stored to
+                # scratch; reading them back inside the branch keeps the whole
+                # step's acc from staying live until here.
+                acc_ref, l_ref = carry_refs
+                jax.lax.cond(
+                    is_last_k,
+                    lambda: accum_named_call(b, acc_ref[...], l_ref[...]),
+                    lambda: None,
+                )
+                continue
             acc_val = acc_list[b]
             l_val = l_list[b]
-            accum_named_call = jax.named_call(_accum, name=f"accum_{b}")
             jax.lax.cond(
                 is_last_k, accum_named_call, lambda *_: None, b, acc_val, l_val
             )
@@ -709,6 +721,7 @@ def rpa_body(
         o_vref,
         lse_o_vref,
         cfgs=cfgs,
+        carry_refs=(acc_scratch_ref, l_scratch_ref) if cfgs.serve.fp8_compute else None,
     )
 
 
@@ -717,6 +730,7 @@ def rpa_body(
 
 def create_allocs(
     kv_cache_hbm_ref: jax.Ref,
+    q_hbm_ref: jax.Ref,
     o_hbm_ref: jax.Ref,
     lse_hbm_ref: jax.Ref | None,
     cfgs: configs.RpaConfigs,
@@ -744,7 +758,7 @@ def create_allocs(
         pipeline_mode=pl.Buffered(buffer_count=in_slots, use_lookahead=False),
     )
     o_spec = pl.BlockSpec(
-        block_shape=cfgs.q_vmem_shape,
+        block_shape=cfgs.o_vmem_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i,),
         pipeline_mode=pl.Buffered(buffer_count=out_slots, use_lookahead=False),
@@ -764,7 +778,7 @@ def create_allocs(
     )
     q_alloc = bref_override.BatchingQRef.input(
         spec=q_spec,
-        dtype_or_type=o_hbm_ref,
+        dtype_or_type=q_hbm_ref,
         buffer_count=in_slots,
         use_lookahead=False,
         cfgs=cfgs,
@@ -831,6 +845,7 @@ def rpa_kernel(
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[schedule.BaseMetadataComputer] = schedule.BaseMetadataComputer,
+    q_fetch_hbm: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Perform batched ragged paged attention with scheduler data.
 
@@ -854,6 +869,10 @@ def rpa_kernel(
             concatenated along num kv heads dim.
         lse_hbm: pre-allocated buffer for LSE output. None when return_lse=False.
         cfgs: Configuration of the kernel.
+        computer_cls: Metadata computer class the schedule was generated with.
+        q_fetch_hbm: Queries in `cfgs.serve.dtype_q`, laid out like `q_hbm`, to
+            read instead of `q_hbm`. The output is still written into `q_hbm`.
+            None reads the queries from `q_hbm` itself.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -875,6 +894,7 @@ def rpa_kernel(
         new_kv_hbm_ref: jax.Ref,
         kv_cache_hbm_ref: jax.Ref,
         lse_hbm_ref: jax.Ref | None,
+        q_fetch_hbm_ref: jax.Ref | None,
         # Outputs.
         o_hbm_ref: jax.Ref,
         o_kv_cache_hbm_ref: jax.Ref,
@@ -883,9 +903,11 @@ def rpa_kernel(
         del o_kv_cache_hbm_ref
         if o_lse_hbm_ref is not None:
             del o_lse_hbm_ref
+        if q_fetch_hbm_ref is None:
+            q_fetch_hbm_ref = q_hbm_ref
 
         q_alloc, kv_cache_alloc, o_alloc, lse_alloc = create_allocs(
-            kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
+            kv_cache_hbm_ref, q_fetch_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
         )
 
         actual_steps = schedule_hbm_ref.actual_steps[0]
@@ -976,7 +998,7 @@ def rpa_kernel(
                     src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
                     dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
                 )
-                q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
+                q_bound = q_alloc.bind(src_ref=(q_fetch_hbm_ref, schedule_ref))
                 o_bound = o_alloc.bind(dst_ref=(o_hbm_ref, schedule_ref))
                 lse_bound = (
                     lse_alloc.bind(dst_ref=(lse_hbm_ref, schedule_ref))
@@ -1070,6 +1092,11 @@ def rpa_kernel(
                 pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,
+                (
+                    pl.BlockSpec(memory_space=pltpu.HBM)  # q_fetch_hbm_ref
+                    if q_fetch_hbm is not None
+                    else None
+                ),
             ],
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
@@ -1097,4 +1124,5 @@ def rpa_kernel(
         new_kv_hbm,
         kv_cache_hbm,
         lse_hbm if return_lse else None,
+        q_fetch_hbm,
     )

@@ -21,6 +21,7 @@ from typing import Any, ClassVar, cast
 
 import jax
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.compilation import backends as vllm_compilation_backends
@@ -556,6 +557,8 @@ def _pallas_rpa_kernel_batched(
     block_major: bool = False,
     skip_empty_launch: bool = False,
     sliding_decode_max_bkv: int | None = None,
+    sliding_prefill_max_bkv: int | None = None,
+    fp8_compute: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
@@ -566,6 +569,10 @@ def _pallas_rpa_kernel_batched(
         rpa_kwargs["skip_empty_launch"] = True
     if sliding_decode_max_bkv is not None:
         rpa_kwargs["sliding_decode_max_bkv"] = sliding_decode_max_bkv
+    if sliding_prefill_max_bkv is not None:
+        rpa_kwargs["sliding_prefill_max_bkv"] = sliding_prefill_max_bkv
+    if fp8_compute:
+        rpa_kwargs["fp8_compute"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -858,6 +865,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
     )
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
+    # Set by the batched-RPA impl under TPU_FP8_ATTENTION.
+    fp8_compute: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -1003,6 +1012,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            self.fp8_compute,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1045,6 +1055,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            self.fp8_compute,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1099,6 +1110,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     max_bkv,
                 )
                 entry_kwargs["sliding_decode_max_bkv"] = max_bkv
+            max_prefill_bkv = envs.TPU_RPA_SLIDING_PREFILL_MAX_BKV
+            if (
+                "sliding_prefill_max_bkv" in entry_params
+                and max_prefill_bkv
+                and self.sliding_window is not None
+            ):
+                logger.info_once(
+                    "Batched RPA sliding-window prefill blocks of at most %d tokens.",
+                    max_prefill_bkv,
+                )
+                entry_kwargs["sliding_prefill_max_bkv"] = max_prefill_bkv
+            if self.fp8_compute:
+                if "fp8_compute" not in entry_params:
+                    raise NotImplementedError(
+                        "TPU_FP8_ATTENTION: kernel entry "
+                        f"{self._kernel_entry.__name__} has no fp8 QK/PV path."
+                    )
+                entry_kwargs["fp8_compute"] = True
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1368,6 +1397,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         `torch.compile` traces `capture_model`. Mesh, sliding window, and scaling
         parameters are bound into the compiled op.
         """
+        if self.fp8_compute:
+            raise NotImplementedError(
+                "TPU_FP8_ATTENTION: the bundled block-major RPA path has no fp8 "
+                "QK/PV kernel."
+            )
         q_scale = k_scale = v_scale = None
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
@@ -1408,6 +1442,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
             parallel_config is not None
             and parallel_config.prefill_context_parallel_size > 1
         )
+        dcp_configured = (
+            parallel_config is not None
+            and getattr(parallel_config, "decode_context_parallel_size", 1) > 1
+        )
+        if self.fp8_compute and (pcp_configured or dcp_configured):
+            raise NotImplementedError(
+                "TPU_FP8_ATTENTION: the PCP streaming and DCP attention kernels "
+                "have no fp8 QK/PV path."
+            )
         if pcp_configured:
             self._validate_pcp_streaming_support(skip_kv_update)
             self.decode_query_size = 1
@@ -1423,10 +1466,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             return
 
-        dcp_configured = (
-            parallel_config is not None
-            and getattr(parallel_config, "decode_context_parallel_size", 1) > 1
-        )
         if dcp_configured:
             # These backends allocate NHD even when the global layout is HND.
             # Passing HND to LONGCTX would reinterpret the physical KV pool.
@@ -1727,6 +1766,36 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
+        if envs.TPU_FP8_ATTENTION:
+            self.fp8_compute = self._fp8_compute_supported()
+            logger.info_once(
+                "TPU_FP8_ATTENTION: %s for layers with %d q heads, %d kv heads, "
+                "head size %d, sliding window %s, kv cache %s",
+                "fp8 QK/PV prefill" if self.fp8_compute else "bf16 query path",
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                self.sliding_window,
+                self.kv_cache_quantized_dtype,
+            )
+
+    def _fp8_compute_supported(self) -> bool:
+        """Whether `ragged_paged_attention(fp8_compute=True)` can run this layer.
+
+        It needs a chip whose MXU runs fp8 faster than bf16, an e4m3 KV cache
+        (queries and probabilities are cast to it) and query heads per KV head
+        in whole fp8 packing groups.
+        """
+        chip = pltpu.get_tpu_info_for_chip(get_chip_version(), 1)
+        if self.kv_cache_quantized_dtype != torch.float8_e4m3fn:
+            return False
+        packing = get_dtype_packing(self.kv_cache_quantized_dtype)
+        return (
+            chip.fp8_ops_per_second > chip.bf16_ops_per_second
+            and self.head_size != 64
+            and (self.num_heads // self.num_kv_heads) % packing == 0
+            and self.sinks is None
+        )
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
