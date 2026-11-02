@@ -38,6 +38,15 @@ SC_ROPE_ALIGN_BYTES = 16 * WORD_BYTES
 OOB_PAGE = 2**30
 SKIP_ROW = -1
 
+# Smallest token bucket whose rope/TENSORCORE write goes through
+# `rope_run_write`. Smaller buckets keep the scatter: on TPU v7x the run writer
+# is slower on buckets of one-row sequences (16-128 of them: 2.0-3.0x the
+# scatter's device time). 512 is masked-dense's `MASKED_DENSE_MIN_TOKEN_BUCKET`,
+# which treats smaller buckets as decode-sized; it is a choice, not a measured
+# crossover. Larger buckets made mostly of one-row sequences are slower too
+# (512 of them: 1.6x).
+ROPE_RUN_MIN_TOKENS = 512
+
 
 class KVCacheLayout(enum.Enum):
     """Physical HBM layout of a paged KV cache.
@@ -390,6 +399,8 @@ def update_sparse_mla_kv_cache(
     Both nope layouts and rope/SPARSECORE go through the SparseCore Pallas
     writer. Rope/TENSORCORE falls back to the XLA scatter: its token is a single
     lane row, not the `WORD_BYTES` rows the TC sublane fold packs into a word.
+    Buckets of at least `ROPE_RUN_MIN_TOKENS` tokens write rope/TENSORCORE with
+    the DMA run writer in `rope_run_write` instead (byte-identical).
 
     Args:
       kv_cache_nope: Nope cache, shaped and typed by `nope_spec`.
@@ -415,6 +426,23 @@ def update_sparse_mla_kv_cache(
         query_start_loc,
         nope_spec.page_size,
     )
+    if (
+        rope_spec.layout is KVCacheLayout.TENSORCORE
+        and k_pe.shape[0] >= ROPE_RUN_MIN_TOKENS
+    ):
+        # Imported here, not at module scope: both import this module back.
+        from vllm_torchtpu.kernels.mla import rope_run_write, scatter
+
+        kv_cache_nope = scatter.scatter(
+            kv_cache_nope,
+            kv_c_normed,
+            nope_spec,
+            dst_rows=_dst_rows(page, slot, nope_spec.page_size),
+        )
+        kv_cache_rope = rope_run_write.write_rope_runs(
+            kv_cache_rope, k_pe, seq_lens, block_tables, query_start_loc, rope_spec
+        )
+        return kv_cache_nope, kv_cache_rope
     return _scatter_caches(
         kv_cache_nope,
         kv_cache_rope,
