@@ -43,7 +43,7 @@ Nightly images are built automatically every night from the `main` branch (`--ta
 * **Date- and Commit-Pinned Nightly Tags** (`:nightly-YYYYMMDD-<commit>-<vllm-version>`):
 
   ```bash
-  docker pull vllm/vllm-torchtpu:nightly-20261029-c7f724b-v0.32.0
+  docker pull vllm/vllm-torchtpu:nightly-20261029-1689a6b-v0.32.0
   ```
 
 Browse all available release and nightly tags at [`https://hub.docker.com/r/vllm/vllm-torchtpu/tags`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags).
