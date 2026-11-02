@@ -1280,63 +1280,57 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     ) -> tuple[Sequence[Any], Any]:
         """Drafts `K` tokens per request with the MTP draft.
 
-        The first pass runs the draft over every row of the step, `input_ids`
-        shifted by one token and the target's `hidden_states`, which writes the
-        draft's KV for each row; each request's first draft comes from its row
-        `last_token_indices`. Each further pass feeds every request its last
-        draft and the draft's own hidden state, one token per request at the
-        next position, as vLLM's MTP proposer chains them.
+        `mtp_first_pass` and then `mtp_chain` over all `max_num_seqs` rows.
         """
-        draft = self._require_mtp_draft()
-        cfg = self._export_config
-        k = int(cfg.speculative_config["num_speculative_tokens"])  # type: ignore[index]
-        names = mtp_draft_names(self._model)
-        call_weights = {d: weights[e] for d, e in names.items() if e in weights}
-        lm_head = weights[self._lm_head_weight_name()]
-        layers = self._mtp_attention_layers()
-        for (_, layer), kv in zip(layers, kv_caches, strict=True):
-            layer.kv_cache = kv
+        kv_caches, last_hidden, last_positions, last_kv_lens = self.mtp_first_pass(
+            weights,
+            kv_caches,
+            input_ids=input_ids,
+            positions=positions,
+            kv_lens=kv_lens,
+            block_tables=block_tables,
+            query_start_loc=query_start_loc,
+            req_dist=req_dist,
+            last_token_indices=last_token_indices,
+            hidden_states=hidden_states,
+        )
+        return self.mtp_chain(
+            weights,
+            kv_caches,
+            block_tables=block_tables,
+            req_dist=req_dist,
+            last_hidden=last_hidden,
+            last_positions=last_positions,
+            last_kv_lens=last_kv_lens,
+            rows=self._export_config.max_num_seqs,
+        )
 
-        def run(ids: Any, pos: Any, hidden: Any, metadata: Any) -> Any:
-            forward_metadata = {name: metadata for name, _ in layers}
-            prev = getattr(draft, "do_not_compile", None)
-            if prev is not None:
-                draft.do_not_compile = True
-            try:
-                with contextlib.ExitStack() as stack:
-                    if self._vllm_config is not None:
-                        from vllm.forward_context import set_forward_context
+    def mtp_first_pass(
+        self,
+        weights: Mapping[str, Any],
+        kv_caches: Sequence[Any],
+        *,
+        input_ids: Any,
+        positions: Any,
+        kv_lens: Any,
+        block_tables: Any,
+        query_start_loc: Any,
+        req_dist: Any,
+        last_token_indices: Any,
+        hidden_states: Any,
+    ) -> tuple[Sequence[Any], Any, Any, Any]:
+        """Runs the MTP draft over every row of the step.
 
-                        mesh = getattr(self._model, "_export_tpu_mesh", None)
-                        if mesh is not None:
-                            from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (  # noqa: E501
-                                set_vllm_model_wrapper_context,
-                            )
-
-                            stack.enter_context(
-                                set_vllm_model_wrapper_context(
-                                    mesh=mesh, vllm_config=self._vllm_config
-                                )
-                            )
-                        stack.enter_context(
-                            set_forward_context(
-                                forward_metadata,
-                                self._vllm_config,
-                                num_tokens=int(ids.shape[0]),
-                            )
-                        )
-                    stack.enter_context(_weights_bound_in_place(draft, call_weights))
-                    return torch.func.functional_call(
-                        draft, call_weights, args=(ids, pos, hidden)
-                    )
-            finally:
-                if prev is not None:
-                    draft.do_not_compile = prev
-
-        def greedy(hidden: Any) -> Any:
-            return self.greedy_tokens(hidden, lm_head)
-
-        hidden = run(
+        Feeds `input_ids` shifted by one token and the target's `hidden_states`,
+        which writes the draft's KV for each row. Returns the updated KV and,
+        at each request's row `last_token_indices` (`max_num_seqs` rows), the
+        draft's hidden state, its position and its KV length, from which
+        `mtp_chain` drafts.
+        """
+        rows = last_token_indices.to(torch.int64)
+        self._bind_mtp_kv_caches(kv_caches)
+        hidden = self._run_mtp(
+            weights,
             input_ids,
             positions,
             hidden_states,
@@ -1348,36 +1342,126 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 request_distribution=_split_req_dist(req_dist)[0],
             ),
         )
-        rows = last_token_indices.to(torch.int64)
-        hidden = hidden[rows]
-        drafts = [greedy(hidden)]
-        if k > 1:
-            num_seqs = req_dist[2]
-            live = torch.arange(cfg.max_num_seqs, device=rows.device) < num_seqs
-            # KV index of each request's row `last_token_indices`: its KV length
-            # less the rows after it in the step.
-            last_kv = kv_lens - (query_start_loc[1:] - rows.to(kv_lens.dtype) - 1) - 1
-            one_per_seq = torch.clamp(
-                torch.arange(cfg.max_num_seqs + 1, device=rows.device), max=num_seqs
-            ).to(query_start_loc.dtype)
-            all_decode = torch.stack([num_seqs, num_seqs, num_seqs]).to(req_dist.dtype)
-            last_pos = positions[..., rows]
-            for step in range(1, k):
-                pos = last_pos + step
-                metadata = make_attention_metadata(
-                    input_positions=pos,
-                    block_tables=block_tables,
-                    seq_lens=torch.where(live, last_kv + step + 1, 0).to(kv_lens.dtype),
-                    query_start_loc=one_per_seq,
-                    request_distribution=all_decode,
+        # KV length of each request's row `last_token_indices`: its KV length
+        # less the rows after it in the step.
+        last_kv_lens = kv_lens - (query_start_loc[1:] - rows.to(kv_lens.dtype) - 1)
+        return (
+            self._mtp_kv_caches(),
+            hidden[rows],
+            positions[..., rows],
+            last_kv_lens,
+        )
+
+    def mtp_chain(
+        self,
+        weights: Mapping[str, Any],
+        kv_caches: Sequence[Any],
+        *,
+        block_tables: Any,
+        req_dist: Any,
+        last_hidden: Any,
+        last_positions: Any,
+        last_kv_lens: Any,
+        rows: int,
+    ) -> tuple[Sequence[Any], Any]:
+        """Drafts `K` tokens for each of the first `rows` requests.
+
+        The first draft comes from `mtp_first_pass`'s hidden state; each further
+        pass feeds every request its last draft and the draft's own hidden
+        state, one token per request at the next position, as vLLM's MTP
+        proposer chains them. Every pass and LM head runs over `rows` rows, the
+        step's request bucket, which must cover its requests.
+        """
+        cfg = self._export_config
+        k = int(cfg.speculative_config["num_speculative_tokens"])  # type: ignore[index]
+        self._bind_mtp_kv_caches(kv_caches)
+        lm_head = weights[self._lm_head_weight_name()]
+        hidden = last_hidden[:rows]
+        drafts = [self.greedy_tokens(hidden, lm_head)]
+        num_seqs = req_dist[2]
+        device = hidden.device
+        live = torch.arange(rows, device=device) < num_seqs
+        kv_lens = last_kv_lens[:rows]
+        positions = last_positions[..., :rows]
+        # The kernel reads `len(block_tables) / len(seq_lens)` pages per request.
+        pages_per_seq = int(block_tables.shape[0]) // cfg.max_num_seqs
+        tables = block_tables[: rows * pages_per_seq]
+        one_per_seq = torch.clamp(torch.arange(rows + 1, device=device), max=num_seqs)
+        all_decode = torch.stack([num_seqs, num_seqs, num_seqs]).to(req_dist.dtype)
+        for step in range(1, k):
+            pos = positions + step
+            metadata = make_attention_metadata(
+                input_positions=pos,
+                block_tables=tables,
+                seq_lens=torch.where(live, kv_lens + step, 0).to(kv_lens.dtype),
+                query_start_loc=one_per_seq.to(kv_lens.dtype),
+                request_distribution=all_decode,
+            )
+            hidden = self._run_mtp(weights, drafts[-1], pos, hidden, metadata)
+            drafts.append(self.greedy_tokens(hidden, lm_head))
+        return self._mtp_kv_caches(), torch.stack(drafts, dim=1)
+
+    def _run_mtp(
+        self,
+        weights: Mapping[str, Any],
+        ids: Any,
+        pos: Any,
+        hidden: Any,
+        metadata: Any,
+    ) -> Any:
+        """One pass of the MTP draft over `ids`, updating the KV its attention
+        layers hold (`_bind_mtp_kv_caches`)."""
+        draft = self._require_mtp_draft()
+        names = mtp_draft_names(self._model)
+        call_weights = {d: weights[e] for d, e in names.items() if e in weights}
+        layers = self._mtp_attention_layers()
+        forward_metadata = {name: metadata for name, _ in layers}
+        prev = getattr(draft, "do_not_compile", None)
+        if prev is not None:
+            draft.do_not_compile = True
+        try:
+            with contextlib.ExitStack() as stack:
+                if self._vllm_config is not None:
+                    from vllm.forward_context import set_forward_context
+
+                    mesh = getattr(self._model, "_export_tpu_mesh", None)
+                    if mesh is not None:
+                        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (  # noqa: E501
+                            set_vllm_model_wrapper_context,
+                        )
+
+                        stack.enter_context(
+                            set_vllm_model_wrapper_context(
+                                mesh=mesh, vllm_config=self._vllm_config
+                            )
+                        )
+                    stack.enter_context(
+                        set_forward_context(
+                            forward_metadata,
+                            self._vllm_config,
+                            num_tokens=int(ids.shape[0]),
+                        )
+                    )
+                stack.enter_context(_weights_bound_in_place(draft, call_weights))
+                return torch.func.functional_call(
+                    draft, call_weights, args=(ids, pos, hidden)
                 )
-                hidden = run(drafts[-1], pos, hidden, metadata)
-                drafts.append(greedy(hidden))
-        updated = [
+        finally:
+            if prev is not None:
+                draft.do_not_compile = prev
+
+    def _bind_mtp_kv_caches(self, kv_caches: Sequence[Any]) -> None:
+        """Binds `kv_caches` to the MTP draft's attention layers, in layer order."""
+        for (_, layer), kv in zip(self._mtp_attention_layers(), kv_caches, strict=True):
+            layer.kv_cache = kv
+
+    def _mtp_kv_caches(self) -> list[Any]:
+        """The MTP draft's KV caches as its attention layers hold them now."""
+        layers = self._mtp_attention_layers()
+        return [
             layer.kv_cache[0] if isinstance(layer.kv_cache, list) else layer.kv_cache
             for _, layer in layers
         ]
-        return updated, torch.stack(drafts, dim=1)
 
     def forward(
         self,

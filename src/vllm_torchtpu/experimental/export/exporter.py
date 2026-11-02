@@ -905,6 +905,20 @@ def _export_text_only_llm_functions(
             constants=constants,
             debug_taps=debug_taps,
         )
+        if hasattr(model, "mtp_first_pass") and hasattr(model, "mtp_chain"):
+            functions.update(
+                _export_mtp_split(
+                    model,
+                    params_map,
+                    layouts,
+                    weight_slots,
+                    target_dir,
+                    subdir,
+                    mtp_weight_names=mtp_weight_names,
+                    first_state_index=len(state_entries),
+                    constants=constants,
+                )
+            )
     return functions
 
 
@@ -1064,6 +1078,269 @@ def _export_mtp_draft(
             "outputs": outputs,
         }
     return variants
+
+
+# Intermediates `mtp_first_pass_bucket{B}` hands `mtp_chain_req{R}`, one row per
+# request (`max_num_seqs` rows): the draft's hidden state at the request's last
+# row, that row's position and its KV length.
+_MTP_CARRIES = ("mtp_hidden", "mtp_positions", "mtp_kv_lens")
+
+
+@trace("export.mtp_split")
+def _export_mtp_split(
+    model: api.ExportableTextOnlyLLM,
+    params_map: Mapping[str, Any],
+    layouts: Mapping[str, _TensorLayout],
+    weight_slots: Mapping[str, int],
+    target_dir: str,
+    subdir: str,
+    *,
+    mtp_weight_names: Sequence[str],
+    first_state_index: int,
+    constants: frozenset[str],
+) -> dict[str, dict[str, Any]]:
+    """Lowers `mtp_draft` split in two, so a step pays for the drafter's chain
+    and LM heads only over its request bucket rather than `max_num_seqs` rows.
+
+    `mtp_first_pass_bucket{B}`, one per token bucket, takes `mtp_draft`'s inputs,
+    runs the draft over the step's rows and returns the MTP KV and the
+    `_MTP_CARRIES`. `mtp_chain_req{R}`, one per request bucket up to
+    `max_num_seqs`, takes `block_tables`, `req_dist`, the weights, the MTP KV and
+    the carries, drafts for the first `R` requests and returns the MTP KV and
+    `draft_tokens [R, k]`. The variants add up rather than multiply.
+    """
+    cfg: api.TextOnlyLLMExportConfig = model.export_config
+    act = tpu_lowering.dtype_name(cfg.dtype)
+    axis_sizes = _axis_sizes(cfg)
+    k = int(cfg.speculative_config["num_speculative_tokens"])  # type: ignore[index]
+    seqs = cfg.max_num_seqs
+    state_specs = list(model.mtp_abstract_states())  # type: ignore[attr-defined]
+    states = []
+    for spec in state_specs:
+        sharding = (
+            _state_sharding(spec.shape, cfg.tensor_parallel_size)
+            if spec.sharding is None
+            else list(spec.sharding)
+        )
+        states.append(
+            (_global_shape(spec.shape, sharding, axis_sizes), sharding, spec.dtype)
+        )
+    lowered = _lowered_params(params_map, layouts)
+    reshapes = _weight_reshapes(layouts)
+    weight_specs = [
+        api.ShapeDtypeStruct(
+            tuple(int(d) for d in lowered[n].shape),
+            tpu_lowering.dtype_name(lowered[n].dtype),
+        )
+        for n in mtp_weight_names
+    ]
+    positions_shape = (3, seqs) if getattr(cfg, "uses_mrope", False) else (seqs,)
+    carry_specs = [
+        api.ShapeDtypeStruct((seqs, cfg.hidden_size), act),
+        api.ShapeDtypeStruct(positions_shape, "i32"),
+        api.ShapeDtypeStruct((seqs,), "i32"),
+    ]
+
+    def weights_of(args: Sequence[Any], start: int) -> dict[str, Any]:
+        w = {n: args[start + i] for i, n in enumerate(mtp_weight_names)}
+        for name, shape in reshapes.items():
+            if name in w:
+                w[name] = w[name].reshape(shape)
+        return w
+
+    def entries(
+        user: Sequence[tuple[str, tuple[int, ...]]],
+        carries_in: bool,
+    ) -> list[dict[str, Any]]:
+        inputs: list[dict[str, Any]] = [
+            _io_entry(
+                arg_index=i,
+                index=i,
+                name=name,
+                shape=shape,
+                dtype="i32",
+                argument_type="user_io",
+            )
+            for i, (name, shape) in enumerate(user)
+        ]
+        start = len(user)
+        for w_i, w_name in enumerate(mtp_weight_names):
+            inputs.append(
+                _weight_input_entry(
+                    w_name,
+                    params_map[w_name],
+                    layouts[w_name],
+                    arg_index=start + w_i,
+                    slot=weight_slots[w_name],
+                    buffer_donor=False,
+                    constant=w_name in constants,
+                )
+            )
+        start += len(mtp_weight_names)
+        for s_i, (shape, sharding, dtype) in enumerate(states):
+            inputs.append(
+                _io_entry(
+                    arg_index=start + s_i,
+                    index=first_state_index + s_i,
+                    name=f"mtp_kv_cache_layer_{s_i}",
+                    shape=shape,
+                    dtype=dtype,
+                    argument_type="state",
+                    sharding=sharding,
+                    buffer_donor=True,
+                )
+            )
+        start += len(states)
+        intermediates = (
+            [(n, list(c.shape), c.dtype) for n, c in zip(_MTP_CARRIES, carry_specs)]
+            if carries_in
+            else []
+        )
+        for i, (name, shape, dtype) in enumerate(intermediates):
+            inputs.append(
+                _io_entry(
+                    arg_index=start + i,
+                    index=i,
+                    name=name,
+                    shape=shape,
+                    dtype=dtype,
+                    argument_type="intermediate",
+                )
+            )
+        return inputs
+
+    def state_outputs() -> list[dict[str, Any]]:
+        return [
+            _io_entry(
+                arg_index=s_i,
+                index=first_state_index + s_i,
+                name=f"mtp_kv_cache_out_layer_{s_i}",
+                shape=shape,
+                dtype=dtype,
+                argument_type="state",
+                sharding=sharding,
+                is_input=False,
+            )
+            for s_i, (shape, sharding, dtype) in enumerate(states)
+        ]
+
+    def write(file: str, mlir: str) -> str:
+        with open(os.path.join(target_dir, file), "w") as f:
+            f.write(mlir)
+        return f"{subdir}/{file}" if subdir else file
+
+    first_pass: dict[str, Any] = {}
+    for b_idx, bucket in enumerate(cfg.token_buckets):
+        user = _mtp_user_inputs(model, bucket)
+        hidden = api.ShapeDtypeStruct((bucket, cfg.hidden_size), act)
+        state_start = len(user) + len(mtp_weight_names)
+
+        def first_pass_entry(*args: Any, user=user, state_start=state_start) -> Any:
+            controls = {name: args[i] for i, (name, _) in enumerate(user)}
+            kvs, *carries = model.mtp_first_pass(  # type: ignore[attr-defined]
+                weights_of(args, len(user)),
+                list(args[state_start : state_start + len(states)]),
+                hidden_states=args[state_start + len(states)],
+                **controls,
+            )
+            return (*kvs, *carries)
+
+        mlir = tpu_lowering.lower_torch_stateful_to_mlir(
+            first_pass_entry,
+            [
+                *(api.ShapeDtypeStruct(shape, "i32") for _, shape in user),
+                *weight_specs,
+                *state_specs,
+                hidden,
+            ],
+            state_args=range(state_start, state_start + len(states)),
+            module_name=f"mtp_first_pass_bucket{bucket}",
+        )
+        inputs = entries(user, carries_in=False)
+        inputs.append(
+            _io_entry(
+                arg_index=state_start + len(states),
+                index=0,
+                name="hidden_states",
+                shape=[bucket, cfg.hidden_size],
+                dtype=act,
+                argument_type="intermediate",
+            )
+        )
+        outputs = state_outputs()
+        outputs += [
+            _io_entry(
+                arg_index=len(states) + i,
+                index=i,
+                name=name,
+                shape=list(c.shape),
+                dtype=c.dtype,
+                argument_type="intermediate",
+                is_input=False,
+            )
+            for i, (name, c) in enumerate(zip(_MTP_CARRIES, carry_specs))
+        ]
+        first_pass[str(bucket)] = {
+            "file_path": write(f"mtp_first_pass_bucket{bucket}.mlir", mlir),
+            "subgraph_index": b_idx,
+            "compile_size": bucket,
+            "inputs": inputs,
+            "outputs": outputs,
+        }
+
+    chain: dict[str, Any] = {}
+    chain_user = [
+        ("block_tables", (cfg.max_num_pages,)),
+        ("req_dist", (_req_dist_len(model),)),
+    ]
+    state_start = len(chain_user) + len(mtp_weight_names)
+    carry_start = state_start + len(states)
+    for r_idx, req in enumerate(r for r in cfg.req_buckets if r <= seqs):
+
+        def chain_entry(*args: Any, req=req) -> Any:
+            kvs, drafts = model.mtp_chain(  # type: ignore[attr-defined]
+                weights_of(args, len(chain_user)),
+                list(args[state_start:carry_start]),
+                block_tables=args[0],
+                req_dist=args[1],
+                last_hidden=args[carry_start],
+                last_positions=args[carry_start + 1],
+                last_kv_lens=args[carry_start + 2],
+                rows=req,
+            )
+            return (*kvs, drafts)
+
+        mlir = tpu_lowering.lower_torch_stateful_to_mlir(
+            chain_entry,
+            [
+                *(api.ShapeDtypeStruct(shape, "i32") for _, shape in chain_user),
+                *weight_specs,
+                *state_specs,
+                *carry_specs,
+            ],
+            state_args=range(state_start, carry_start),
+            module_name=f"mtp_chain_req{req}",
+        )
+        outputs = state_outputs()
+        outputs.append(
+            _io_entry(
+                arg_index=len(states),
+                index=0,
+                name="draft_tokens",
+                shape=[req, k],
+                dtype="i32",
+                argument_type="user_io",
+                is_input=False,
+            )
+        )
+        chain[str(req)] = {
+            "file_path": write(f"mtp_chain_req{req}.mlir", mlir),
+            "subgraph_index": r_idx,
+            "compile_size": req,
+            "inputs": entries(chain_user, carries_in=True),
+            "outputs": outputs,
+        }
+    return {"mtp_first_pass": first_pass, "mtp_chain": chain}
 
 
 def _emit_model_companion_files(

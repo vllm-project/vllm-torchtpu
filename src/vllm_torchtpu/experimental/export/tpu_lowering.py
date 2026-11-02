@@ -489,3 +489,19 @@ def lower_torch_mtp_draft_to_mlir(
     return set_aliasing_outputs(
         mlir_text, {arg: i for i, arg in enumerate(donate_argnums)}
     )
+
+
+def lower_torch_stateful_to_mlir(
+    fn: Callable[..., tuple[torch.Tensor, ...]],
+    arg_specs: Sequence[api.ShapeDtypeStruct],
+    *,
+    state_args: Sequence[int],
+    module_name: str,
+) -> str:
+    """Lowers `fn` whose first results are its `state_args`, each donated by
+    its argument, as `forward` and `mtp_draft` donate their states."""
+    donate = tuple(state_args)
+    mlir_text = lower_torch_callable_to_mlir(
+        fn, arg_specs, donate_argnums=donate, module_name=module_name
+    )
+    return set_aliasing_outputs(mlir_text, {arg: i for i, arg in enumerate(donate)})

@@ -2356,6 +2356,63 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     assert draft[0]["shape"] == [8, 1] and draft[0]["dtype"] == "i32"
 
 
+class _SplitMtpExportableLLM(_TinyMtpExportableLLM):
+    """`_TinyMtpExportableLLM` whose draft is split into a first pass and a chain."""
+
+    def mtp_first_pass(self, weights, kv_caches, **controls):  # type: ignore[no-untyped-def]
+        rows = controls["last_token_indices"].to(torch.int64)
+        hidden = controls["hidden_states"]
+        return (
+            list(kv_caches),
+            hidden[rows],
+            controls["positions"][..., rows],
+            controls["kv_lens"],
+        )
+
+    def mtp_chain(self, weights, kv_caches, *, last_hidden, rows, **_):  # type: ignore[no-untyped-def]
+        logits = torch.matmul(last_hidden[:rows], weights["lm_head.weight"])
+        return list(kv_caches), logits.argmax(dim=-1).to(torch.int32).view(-1, 1)
+
+
+def test_mtp_split_exports_a_first_pass_per_token_bucket_and_a_chain_per_request_bucket(
+    tmp_path,
+) -> None:
+    out_dir = _export_mtp(tmp_path, _SplitMtpExportableLLM)
+    functions = json.loads(Path(out_dir, "metadata.json").read_text())["functions"]
+    # The fused draft stays for runtimes that predate the split.
+    assert set(functions["mtp_draft"]) == {"8", "16"}
+    # Token buckets 8 and 16; request buckets up to max_num_seqs (8).
+    assert set(functions["mtp_first_pass"]) == {"8", "16"}
+    assert set(functions["mtp_chain"]) == {"4", "8"}
+
+    first = functions["mtp_first_pass"]["16"]
+    carries = [o for o in first["outputs"] if o["argument_type"] == "intermediate"]
+    assert [(o["name"], o["shape"]) for o in carries] == [
+        ("mtp_hidden", [8, 16]),
+        ("mtp_positions", [8]),
+        ("mtp_kv_lens", [8]),
+    ]
+    chain = functions["mtp_chain"]["4"]
+    by_type: dict[str, list[str]] = {}
+    for i in chain["inputs"]:
+        by_type.setdefault(i["argument_type"], []).append(i["name"])
+    assert by_type["user_io"] == ["block_tables", "req_dist"]
+    assert by_type["intermediate"] == ["mtp_hidden", "mtp_positions", "mtp_kv_lens"]
+    assert by_type["state"] == ["mtp_kv_cache_layer_0"]
+    drafts = [o for o in chain["outputs"] if o["name"] == "draft_tokens"]
+    assert drafts[0]["shape"] == [4, 1]
+    # Both stages bind the MTP KV to the same state slot as mtp_draft.
+    slot = {
+        i["name"]: i["index"]
+        for i in functions["mtp_draft"]["16"]["inputs"]
+        if i["argument_type"] == "state"
+    }
+    for variant in (first, chain):
+        states = [i for i in variant["inputs"] if i["argument_type"] == "state"]
+        assert states[0]["index"] == slot["mtp_kv_cache_layer_0"]
+        assert states[0]["buffer_donor"] is True
+
+
 class _TappableMtpExportableLLM(_TinyMtpExportableLLM):
     """`_TinyMtpExportableLLM` whose forward and draft run modules a debug tap
     can hook: the target's `final` and the draft's `fc_act`, which the chain
