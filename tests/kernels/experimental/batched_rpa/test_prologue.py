@@ -73,6 +73,7 @@ def _reference(qkv, cos, sin, wq, wk, *, nq, nkv, d, k_scale, v_scale):
         (64, 4, 1, 512, 512, 32, 1.0, 1.0),  # global: one KV head, padded slots
         (64, 16, 2, 512, 512, 64, 0.5, 2.0),  # four q packs per KV head, KV scales
         (32, 8, 4, 256, 128, None, 1.0, 1.0),  # partial rotary, chosen block
+        (40, 4, 2, 256, 256, None, 1.0, 1.0),  # odd bucket: padded to 48 rows
     ],
 )
 def test_matches_norm_rotary_quantize_prepare(

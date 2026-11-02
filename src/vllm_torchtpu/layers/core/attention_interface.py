@@ -503,16 +503,20 @@ def sharded_ragged_paged_attention_from_qkv(
     soft_cap: float | None = None,
     **rpa_kwargs: Any,
 ) -> tuple[jax.Array, jax.Array]:
-    """Batched RPA on fused qkv rows, sharded along KV heads like
-    `sharded_ragged_paged_attention`.
+    """Batched RPA on fused qkv rows over the per-worker (one-device) mesh.
 
-    Each shard turns its `[tokens, (q + 2 * kv heads) * head_dim]` rows into
+    The worker turns its `[tokens, (q + 2 * kv heads) * head_dim]` rows into
     the kernel's inputs with `prologue.qkv_to_rpa_inputs` (q/k/v norms, rotary
     from the tokens' `cos`/`sin` rows, FP8 K/V) and attends. Returns
     `(output [tokens, num_q_heads, head_dim], new_kv_cache)`.
     """
     shards = mesh.shape["model"]
-    q_heads, kv_heads = num_q_heads // shards, num_kv_heads // shards
+    if shards != 1:
+        # P(None, "model") would hand shard 0 only q columns of [q | k | v].
+        raise NotImplementedError(
+            f"fused qkv rows need a one-device model axis, got {shards} shards"
+        )
+    q_heads, kv_heads = num_q_heads, num_kv_heads
     kv_cache_spec = P(None, None, "model", None, None)
 
     def _attend(qkv, cos, sin, wq, wk, kv_cache, kv_lens, pages, cu_q_lens, dist):
@@ -558,7 +562,7 @@ def sharded_ragged_paged_attention_from_qkv(
         _attend,
         mesh=mesh,
         in_specs=(
-            P(None, "model"),  # qkv: each shard's q | k | v heads
+            P(None, "model"),  # qkv: the worker's q | k | v heads
             replicated,  # cos
             replicated,  # sin
             P(None),  # q norm weight

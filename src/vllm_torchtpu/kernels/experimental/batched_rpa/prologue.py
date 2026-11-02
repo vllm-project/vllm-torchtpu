@@ -141,7 +141,7 @@ def _kernel(
         "interpret",
     ),
 )
-def qkv_to_rpa_inputs(
+def _qkv_to_rpa_inputs(
     qkv: jax.Array,  # [tokens, (num_q_heads + 2 * num_kv_heads) * head_dim] bf16
     cos: jax.Array,  # [tokens, rotary_dim // 2], the rotary cache rows of the tokens
     sin: jax.Array,  # [tokens, rotary_dim // 2]
@@ -158,7 +158,7 @@ def qkv_to_rpa_inputs(
     block_tokens: int | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """(q_hbm, new_kv_hbm) as `wrapper.prepare_inputs` returns them."""
+    """`qkv_to_rpa_inputs` on a token count that is a multiple of 16."""
     tokens, width = qkv.shape
     group = num_q_heads // num_kv_heads
     if width != (num_q_heads + 2 * num_kv_heads) * head_dim:
@@ -224,3 +224,25 @@ def qkv_to_rpa_inputs(
         q_norm_weight.astype(jnp.float32).reshape(1, head_dim),
         k_norm_weight.astype(jnp.float32).reshape(1, head_dim),
     )
+
+
+def qkv_to_rpa_inputs(
+    qkv: jax.Array,  # [tokens, (num_q_heads + 2 * num_kv_heads) * head_dim] bf16
+    cos: jax.Array,  # [tokens, rotary_dim // 2], the rotary cache rows of the tokens
+    sin: jax.Array,  # [tokens, rotary_dim // 2]
+    q_norm_weight: jax.Array,  # [head_dim]
+    k_norm_weight: jax.Array,  # [head_dim]
+    **kwargs,
+) -> tuple[jax.Array, jax.Array]:
+    """(q_hbm, new_kv_hbm) as `wrapper.prepare_inputs` returns them.
+
+    A token count that 16-token blocks do not tile (an odd bucket) runs on
+    zero rows padded to the next multiple of 16, and the outputs are cut back.
+    """
+    tokens = qkv.shape[0]
+    pad = -tokens % _BLOCK_TOKENS[-1]
+    if pad:
+        rows = ((0, pad), (0, 0))
+        qkv, cos, sin = (jnp.pad(a, rows) for a in (qkv, cos, sin))
+    q, kv = _qkv_to_rpa_inputs(qkv, cos, sin, q_norm_weight, k_norm_weight, **kwargs)
+    return (q[:, :tokens], kv[:tokens]) if pad else (q, kv)

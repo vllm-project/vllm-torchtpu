@@ -20,6 +20,9 @@ the batched RPA kernel. XLA runs that as a dozen passes with f32
 intermediates. With the flag, ``attention_from_qkv`` hands the projection's
 rows to ``PallasBatchedRPAAttentionBackendImpl.forward_from_qkv``, which does
 all of it in one Pallas pass (``kernels/experimental/batched_rpa/prologue``).
+It is a model patch because upstream exposes nothing between the qkv
+projection and ``self.attn``: a backend or custom-op hook only ever sees the
+normed, rotated q/k/v, never the projection's rows.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.models.gemma4 import Gemma4Attention
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.attention import PallasBatchedRPAAttentionBackendImpl
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -39,6 +43,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _orig_attention_forward = Gemma4Attention.forward
+_orig_attention_init = Gemma4Attention.__init__
 
 
 def _upstream_attention(
@@ -98,12 +103,36 @@ def _patched_attention_forward(
     return output
 
 
+def _patched_attention_init(self: Gemma4Attention, *args: Any, **kwargs: Any) -> None:
+    """Upstream's init, then a refusal of what forward_from_qkv cannot run,
+    so it surfaces at model build rather than at the first trace."""
+    _orig_attention_init(self, *args, **kwargs)
+    if self.is_kv_shared_layer:
+        return
+    impl = self.attn.impl
+    if not isinstance(impl, PallasBatchedRPAAttentionBackendImpl):
+        raise NotImplementedError(
+            "TPU_GEMMA4_FUSED_ATTN_PROLOGUE needs the batched RPA backend "
+            f"(--attention-backend CUSTOM); {self.attn.layer_name} uses "
+            f"{type(impl).__name__}"
+        )
+    unsupported = impl.qkv_prologue_unsupported()
+    if not self.rotary_emb.is_neox_style:
+        unsupported.append("non-neox rotary")
+    if unsupported:
+        raise NotImplementedError(
+            f"TPU_GEMMA4_FUSED_ATTN_PROLOGUE does not support {', '.join(unsupported)}"
+            f" ({self.attn.layer_name}); unset it for this configuration"
+        )
+
+
 def maybe_patch_gemma4_attention(model_config: ModelConfig | None) -> bool | None:
     """Returns False until a Gemma4 text model config is available."""
     if not envs.TPU_GEMMA4_FUSED_ATTN_PROLOGUE:
         return None
     if model_config is None or model_config.hf_text_config.model_type != "gemma4_text":
         return False
+    Gemma4Attention.__init__ = _patched_attention_init
     Gemma4Attention.forward = _patched_attention_forward
     logger.info(
         "Applied TPU patch: Gemma4 attention takes its qkv rows straight to the "

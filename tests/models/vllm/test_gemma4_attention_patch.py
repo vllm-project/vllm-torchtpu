@@ -94,7 +94,7 @@ def test_flag_off_keeps_upstream_ops(monkeypatch):
 
 
 def test_patch_needs_the_flag_and_a_gemma4_config(monkeypatch):
-    original = Gemma4Attention.forward
+    original, original_init = Gemma4Attention.forward, Gemma4Attention.__init__
     gemma4 = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="gemma4_text"))
     other = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="llama"))
     try:
@@ -107,8 +107,20 @@ def test_patch_needs_the_flag_and_a_gemma4_config(monkeypatch):
         assert Gemma4Attention.forward is original
         assert patch.maybe_patch_gemma4_attention(gemma4) is None
         assert Gemma4Attention.forward is patch._patched_attention_forward
+        assert Gemma4Attention.__init__ is patch._patched_attention_init
     finally:
         Gemma4Attention.forward = original
+        Gemma4Attention.__init__ = original_init
+
+
+def test_init_refuses_a_backend_without_the_fused_entry(monkeypatch):
+    def fake_init(self, *args, **kwargs):
+        self.is_kv_shared_layer = False
+        self.attn = SimpleNamespace(layer_name="layers.0.attn", impl=object())
+
+    monkeypatch.setattr(patch, "_orig_attention_init", fake_init)
+    with pytest.raises(NotImplementedError, match="CUSTOM"):
+        patch._patched_attention_init(SimpleNamespace())
 
 
 def test_non_neox_rotary_is_refused(monkeypatch):
