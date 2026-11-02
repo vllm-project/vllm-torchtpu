@@ -14,6 +14,7 @@
 """Wrapper for RPA kernel to match expected interface."""
 
 import dataclasses
+import math
 from typing import cast
 
 import jax
@@ -174,6 +175,7 @@ def validate_fp8_compute(
     num_kv_heads: int,
     q_scale: float | None,
     return_lse: bool,
+    use_per_token_scale: bool = False,
 ) -> None:
     """Raises unless `fp8_compute` can run for this call."""
     kv_dtype = jnp.dtype(kv_dtype)
@@ -191,6 +193,9 @@ def validate_fp8_compute(
         raise ValueError("fp8_compute quantizes queries at scale 1.0; got q_scale.")
     if return_lse:
         raise ValueError("fp8_compute does not support return_lse.")
+    if use_per_token_scale:
+        # Per-token V scales multiply P before its e4m3 cast.
+        raise ValueError("fp8_compute does not support per-token KV scales.")
 
 
 def quantize_queries(q_hbm: jax.Array, dtype: jnp.dtype) -> jax.Array:
@@ -546,20 +551,66 @@ def calculate_block_sizes(
 FP8_PREFILL_KV_BLOCK = 512
 FP8_PREFILL_CHUNK_ROWS = 256
 FP8_PREFILL_STEP_ROWS = 8192
+# Share of the VMEM limit the pipeline buffers and softmax scratch may take; the
+# rest is left to the compiler for the compute temporaries it spills (the
+# Gemma4 geometries above use up to 77% and compile for tpu7x).
+FP8_PREFILL_BUFFER_VMEM_FRACTION = 0.8
 
 
 def fp8_prefill_block_sizes(
-    model_cfgs: configs.ModelConfigs, serve_cfgs: configs.ServingConfigs
+    model_cfgs: configs.ModelConfigs,
+    serve_cfgs: configs.ServingConfigs,
+    vmem_limit_bytes: int,
 ) -> configs.BlockSizes:
-    """Mixed-kernel block sizes for `fp8_compute`."""
+    """Mixed-kernel block sizes for `fp8_compute`.
+
+    The query block is halved until the kernel's buffers and scratch fit in
+    `FP8_PREFILL_BUFFER_VMEM_FRACTION` of `vmem_limit_bytes`.
+    """
     rows_per_token = utils.align_to(
         model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
     )
     bq_c = max(1, FP8_PREFILL_CHUNK_ROWS // rows_per_token)
+    bkv = FP8_PREFILL_KV_BLOCK
+    if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        bkv = utils.align_to(bkv, serve_cfgs.page_size)
     bq = FP8_PREFILL_STEP_ROWS // (rows_per_token * model_cfgs.num_kv_heads)
     bq = utils.align_to(max(bq, bq_c), bq_c)
-    return configs.BlockSizes(
-        bq_sz=bq, bq_c_sz=bq_c, bkv_sz=FP8_PREFILL_KV_BLOCK, batch_size=1
+    while True:
+        blocks = configs.BlockSizes(bq_sz=bq, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=1)
+        cfgs = configs.RpaConfigs(
+            block=blocks,
+            model=model_cfgs,
+            serve=serve_cfgs,
+            mode=configs.RpaCase.MIXED,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        if (
+            fp8_prefill_vmem_bytes(cfgs)
+            <= FP8_PREFILL_BUFFER_VMEM_FRACTION * vmem_limit_bytes
+        ):
+            return blocks
+        if bq == bq_c:
+            raise ValueError(
+                f"fp8_compute: no query block fits {vmem_limit_bytes} bytes of VMEM "
+                f"for {model_cfgs}."
+            )
+        bq = utils.align_to(max(bq // 2, bq_c), bq_c)
+
+
+def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
+    """VMEM of the mixed kernel's pipeline buffers and softmax scratch."""
+
+    def nbytes(shape, dtype):
+        return math.prod(shape) * utils.get_dtype_bits(dtype) // 8
+
+    serve = cfgs.serve
+    return (
+        configs.NUM_INPUT_SLOTS * nbytes(cfgs.q_vmem_shape, serve.dtype_q)
+        + configs.NUM_INPUT_SLOTS * nbytes(cfgs.kv_vmem_shape, serve.dtype_kv)
+        + configs.NUM_OUTPUT_SLOTS * nbytes(cfgs.o_vmem_shape, serve.dtype_out)
+        + 2 * nbytes(cfgs.lm_scratch_shape, serve.dtype_out)
+        + nbytes(cfgs.acc_scratch_shape, serve.dtype_out)
     )
 
 
@@ -825,13 +876,20 @@ def ragged_paged_attention(
     q_fetch_hbm = None
     if fp8_compute:
         validate_fp8_compute(
-            kv_cache.dtype, num_q_heads, num_kv_heads, q_scale, return_lse
+            kv_cache.dtype,
+            num_q_heads,
+            num_kv_heads,
+            q_scale,
+            return_lse,
+            use_per_token_scale,
         )
         mixed_serve_cfgs = dataclasses.replace(
             serve_cfgs, dtype_q=kv_cache.dtype, fp8_compute=True
         )
         q_fetch_hbm = quantize_queries(q_hbm, kv_cache.dtype)
-        default_prefill = fp8_prefill_block_sizes(model_cfgs, mixed_serve_cfgs)
+        default_prefill = fp8_prefill_block_sizes(
+            model_cfgs, mixed_serve_cfgs, vmem_limit_bytes
+        )
 
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None

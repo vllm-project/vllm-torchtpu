@@ -61,7 +61,26 @@ def _cfgs(num_q_heads, num_kv_heads, dtype_q=FP8):
     ],
 )
 def test_fp8_prefill_block_sizes(heads, expected):
-    assert wrapper.fp8_prefill_block_sizes(*_cfgs(*heads)) == expected
+    mesh = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(mesh):
+        blocks = wrapper.fp8_prefill_block_sizes(*_cfgs(*heads), 64 * 1024 * 1024)
+    assert blocks == expected
+
+
+def test_fp8_prefill_block_sizes_shrink_to_fit_vmem():
+    mesh = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(mesh):
+        blocks = wrapper.fp8_prefill_block_sizes(*_cfgs(4, 1), 32 * 1024 * 1024)
+        cfgs = configs.RpaConfigs(
+            block=blocks,
+            model=_cfgs(4, 1)[0],
+            serve=_cfgs(4, 1)[1],
+            mode=configs.RpaCase.MIXED,
+            vmem_limit_bytes=32 * 1024 * 1024,
+        )
+        used = wrapper.fp8_prefill_vmem_bytes(cfgs)
+    assert blocks.bq_sz < 2048
+    assert used <= wrapper.FP8_PREFILL_BUFFER_VMEM_FRACTION * 32 * 1024 * 1024
 
 
 @pytest.mark.parametrize(
@@ -71,6 +90,7 @@ def test_fp8_prefill_block_sizes(heads, expected):
         (dict(num_q_heads=4, num_kv_heads=2), "multiple of 4"),
         (dict(q_scale=0.5), "q_scale"),
         (dict(return_lse=True), "return_lse"),
+        (dict(use_per_token_scale=True), "per-token"),
     ],
 )
 def test_validate_fp8_compute_rejects(kwargs, match):

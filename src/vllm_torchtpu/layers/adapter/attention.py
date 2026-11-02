@@ -21,6 +21,7 @@ from typing import Any, ClassVar, cast
 
 import jax
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.compilation import backends as vllm_compilation_backends
@@ -1072,6 +1073,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
                 entry_kwargs["sliding_decode_max_bkv"] = max_bkv
             if self.fp8_compute:
+                if "fp8_compute" not in entry_params:
+                    raise NotImplementedError(
+                        "TPU_FP8_ATTENTION: kernel entry "
+                        f"{self._kernel_entry.__name__} has no fp8 QK/PV path."
+                    )
                 entry_kwargs["fp8_compute"] = True
             if block_major:
                 if "block_major" not in entry_params:
@@ -1719,13 +1725,18 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     def _fp8_compute_supported(self) -> bool:
         """Whether `ragged_paged_attention(fp8_compute=True)` can run this layer.
 
-        It needs an e4m3 KV cache (queries and probabilities are cast to it) and
-        a multiple of 4 query heads per KV head (the fp8 query packing).
+        It needs a chip whose MXU runs fp8 faster than bf16, an e4m3 KV cache
+        (queries and probabilities are cast to it) and query heads per KV head
+        in whole fp8 packing groups.
         """
+        chip = pltpu.get_tpu_info_for_chip(get_chip_version(), 1)
+        if self.kv_cache_quantized_dtype != torch.float8_e4m3fn:
+            return False
+        packing = get_dtype_packing(self.kv_cache_quantized_dtype)
         return (
-            self.kv_cache_quantized_dtype == torch.float8_e4m3fn
+            chip.fp8_ops_per_second > chip.bf16_ops_per_second
             and self.head_size != 64
-            and (self.num_heads // self.num_kv_heads) % 4 == 0
+            and (self.num_heads // self.num_kv_heads) % packing == 0
             and self.sinks is None
         )
 
