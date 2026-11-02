@@ -19,7 +19,9 @@ does between its qkv projection and the kernel: per-head RMSNorm of q and k
 FP8 quantization of k and v, and `wrapper.prepare_inputs`' layouts. It writes
 q as `[kv_heads, tokens, q_per_kv // 2, 2, head_dim]` and the new K/V as
 `[tokens, slots, 4, head_dim]`, the layouts the kernel reads, so nothing is
-relaid out in between.
+relaid out in between. It covers bf16 queries, an FP8 KV cache in the
+HEAD_ALONG_SUBLANE layout and static per-tensor KV scales; `prepare_inputs`
+also handles SEQ_ALONG_LANE and per-token scales, which this does not.
 
 The arithmetic is the one XLA runs for those ops today: the norms in f32 with
 their outputs fed to rotary unrounded, rotary's output rounded to bf16 (q is
@@ -36,6 +38,26 @@ from jax.experimental.pallas import tpu as pltpu
 
 _KV_PACKING = 4  # FP8 rows per packed K/V slot
 _Q_PACKING = 2  # bf16 query heads per packed row pair
+_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
+_VMEM_BUDGET_BYTES = 46 * 1024 * 1024
+_BLOCK_TOKENS = (512, 256, 128, 64, 32, 16)
+
+
+def _block_vmem_bytes(bt: int, width: int, num_q_heads: int, slots: int, d: int) -> int:
+    io = bt * width * 2 + num_q_heads * bt * d * 2 + bt * slots * _KV_PACKING * d
+    return 2 * io + 8 * bt * d * 4  # double-buffered blocks + f32 temporaries
+
+
+def choose_block_tokens(
+    tokens: int, width: int, num_q_heads: int, slots: int, d: int
+) -> int:
+    """The largest token block that divides `tokens` and fits the VMEM budget."""
+    for bt in _BLOCK_TOKENS:
+        if tokens % bt == 0 and (
+            _block_vmem_bytes(bt, width, num_q_heads, slots, d) <= _VMEM_BUDGET_BYTES
+        ):
+            return bt
+    raise ValueError(f"no token block for {tokens} tokens of width {width}")
 
 
 def _rms(x: jax.Array, w: jax.Array | None, eps: float) -> jax.Array:
@@ -133,7 +155,7 @@ def qkv_to_rpa_inputs(
     k_scale: float,
     v_scale: float,
     kv_dtype: jnp.dtype = jnp.float8_e4m3fn,
-    block_tokens: int = 256,
+    block_tokens: int | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """(q_hbm, new_kv_hbm) as `wrapper.prepare_inputs` returns them."""
@@ -149,8 +171,12 @@ def qkv_to_rpa_inputs(
     half = cos.shape[-1]
     if cos.shape != (tokens, half) or sin.shape != cos.shape or 2 * half > head_dim:
         raise ValueError(f"rotary rows {cos.shape} / {sin.shape} for {qkv.shape}")
-    bt = block_tokens if tokens % block_tokens == 0 else tokens
     slots = -(-2 * num_kv_heads // _KV_PACKING)
+    bt = block_tokens or choose_block_tokens(
+        tokens, width, num_q_heads, slots, head_dim
+    )
+    if tokens % bt:
+        raise ValueError(f"block of {bt} tokens does not tile {tokens} tokens")
     kernel = functools.partial(
         _kernel,
         num_q_heads=num_q_heads,
@@ -187,7 +213,7 @@ def qkv_to_rpa_inputs(
             jax.ShapeDtypeStruct((tokens, slots, _KV_PACKING, head_dim), kv_dtype),
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel",), vmem_limit_bytes=48 * 1024 * 1024
+            dimension_semantics=("parallel",), vmem_limit_bytes=_VMEM_LIMIT_BYTES
         ),
         name="qkv_to_rpa_inputs",
         interpret=interpret,

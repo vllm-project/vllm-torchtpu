@@ -67,16 +67,16 @@ def _reference(qkv, cos, sin, wq, wk, *, nq, nkv, d, k_scale, v_scale):
 
 
 @pytest.mark.parametrize(
-    "tokens,nq,nkv,d,rotary_dim,block_tokens,k_scale",
+    "tokens,nq,nkv,d,rotary_dim,block_tokens,k_scale,v_scale",
     [
-        (64, 4, 2, 256, 256, 32, 1.0),  # sliding, TP8 per rank
-        (64, 4, 1, 512, 512, 32, 1.0),  # global: one KV head, padded slots
-        (64, 16, 2, 512, 512, 64, 0.5),  # four q packs per KV head, k scale
-        (32, 8, 4, 256, 128, 32, 1.0),  # partial rotary
+        (64, 4, 2, 256, 256, 32, 1.0, 1.0),  # sliding, TP8 per rank
+        (64, 4, 1, 512, 512, 32, 1.0, 1.0),  # global: one KV head, padded slots
+        (64, 16, 2, 512, 512, 64, 0.5, 2.0),  # four q packs per KV head, KV scales
+        (32, 8, 4, 256, 128, None, 1.0, 1.0),  # partial rotary, chosen block
     ],
 )
 def test_matches_norm_rotary_quantize_prepare(
-    tokens, nq, nkv, d, rotary_dim, block_tokens, k_scale
+    tokens, nq, nkv, d, rotary_dim, block_tokens, k_scale, v_scale
 ):
     key = jax.random.key(tokens + nq + d)
     qkv = jax.random.normal(key, (tokens, (nq + 2 * nkv) * d), jnp.float32) * 2
@@ -90,7 +90,7 @@ def test_matches_norm_rotary_quantize_prepare(
     wk = (1 + 0.1 * jax.random.normal(jax.random.fold_in(key, 2), (d,))).astype(
         jnp.bfloat16
     )
-    heads = dict(nq=nq, nkv=nkv, d=d, k_scale=k_scale, v_scale=1.0)
+    heads = dict(nq=nq, nkv=nkv, d=d, k_scale=k_scale, v_scale=v_scale)
     with jax.default_matmul_precision("highest"):
         ref_q, ref_kv = _reference(qkv, cos, sin, wq, wk, **heads)
     q, kv = prologue.qkv_to_rpa_inputs(
@@ -104,7 +104,7 @@ def test_matches_norm_rotary_quantize_prepare(
         head_dim=d,
         eps=_EPS,
         k_scale=k_scale,
-        v_scale=1.0,
+        v_scale=v_scale,
         block_tokens=block_tokens,
         interpret=True,
     )
@@ -141,3 +141,13 @@ def test_rejects_odd_q_heads_per_kv_head():
             v_scale=1.0,
             interpret=True,
         )
+
+
+def test_block_tokens_fit_vmem_and_tile():
+    # 31B TP1 widths do not fit 512 tokens; a 65 x 128 bucket takes 128.
+    assert prologue.choose_block_tokens(10240, (32 + 32) * 256, 32, 8, 256) == 256
+    assert prologue.choose_block_tokens(10240, (32 + 8) * 512, 32, 2, 512) == 256
+    assert prologue.choose_block_tokens(16384, (16 + 16) * 256, 16, 4, 256) == 512
+    assert prologue.choose_block_tokens(8320, (16 + 16) * 256, 16, 4, 256) == 128
+    with pytest.raises(ValueError, match="no token block"):
+        prologue.choose_block_tokens(24, 512, 1, 1, 256)
