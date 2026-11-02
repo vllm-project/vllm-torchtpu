@@ -355,6 +355,18 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             *jax.tree.map(lambda x: x.copy(), args),
             **kwargs,
         )
+        if fp8_compute:
+            # The mixed kernel casts queries to the KV dtype at scale 1.0 (the
+            # decode kernel keeps bf16 ones); quantize the reference's mixed
+            # rows the same way so near-tied logits rank alike.
+            expected_fp8_q, _ = ref_ragged_paged_attention(
+                *jax.tree.map(lambda x: x.copy(), args),
+                **{**kwargs, "q_scale": 1.0},
+            )
+            num_decode_tokens = int(cu_q_lens[distribution[0]])
+            expected = jnp.concatenate(
+                [expected[:num_decode_tokens], expected_fp8_q[num_decode_tokens:]]
+            )
 
         rpa_kv_cache = kv_cache
         num_sublanes = pltpu.get_tpu_info().num_sublanes
