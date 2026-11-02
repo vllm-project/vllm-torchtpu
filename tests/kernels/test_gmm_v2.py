@@ -28,6 +28,7 @@ import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
+    act_and_mul,
     apply_act_fn,
     gmm_v2,
     interleave_lane,
@@ -257,12 +258,13 @@ def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fuse_act", ["silu", "swigluoai"])
-def test_gmm_fused_activation_matches_reference(fuse_act):
+# 640 cannot split gate and up by lanes, so it takes the unfused fallback.
+@pytest.mark.parametrize("out_size", [512, 640])
+def test_gmm_fused_activation_matches_reference(fuse_act, out_size):
     _require_tpu()
 
     batch_size = 128
     in_size = 512
-    out_size = 512
     final_out_size = out_size // 2
     num_groups = 16
     block_size = 512
@@ -294,11 +296,8 @@ def test_gmm_fused_activation_matches_reference(fuse_act):
         rhs_bias=rhs_bias,
         group_offset=group_offset,
     )
-    raw_gate, raw_up = jnp.split(raw_expected, 2, axis=-1)
-    raw_expected = interleave_lane(raw_gate, raw_up)
-    expected = apply_act_fn(raw_expected.astype(jnp.float32), fuse_act).astype(
-        lhs.dtype
-    )
+    raw_gate, raw_up = jnp.split(raw_expected.astype(jnp.float32), 2, axis=-1)
+    expected = act_and_mul(raw_gate, raw_up, fuse_act).astype(lhs.dtype)
 
     actual = gmm_v2(
         lhs,

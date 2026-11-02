@@ -103,23 +103,37 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
         return acc
 
     acc_gate, acc_up = deinterleave_lane(acc)
+    return act_and_mul(acc_gate, acc_up, fuse_act)
+
+
+def act_and_mul(gate: jax.Array, up: jax.Array, fuse_act: str) -> jax.Array:
+    """``fuse_act(gate)`` times ``up``, for the activations ``fuse_act`` accepts.
+
+    Raises:
+        NotImplementedError: If an unsupported `fuse_act` is provided.
+    """
     match fuse_act:
         case "silu":
-            return jax.nn.silu(acc_gate) * acc_up
+            return jax.nn.silu(gate) * up
         case "gelu":
-            return jax.nn.gelu(acc_gate) * acc_up
+            return jax.nn.gelu(gate) * up
         case "gelu_tanh":
-            return jax.nn.gelu(acc_gate, approximate=True) * acc_up
+            return jax.nn.gelu(gate, approximate=True) * up
         case "swigluoai":
-            return swigluoai(acc_gate, acc_up)
+            return swigluoai(gate, up)
         case "silu_and_mul_with_clamp":
-            return silu_and_mul_with_clamp(acc_gate, acc_up)
+            return silu_and_mul_with_clamp(gate, up)
         case str() if fuse_act.startswith("situ:"):
             _, beta, linear_beta = fuse_act.split(":")
             linear_beta = None if linear_beta == "none" else float(linear_beta)
-            return situ_and_mul(acc_gate, acc_up, float(beta), linear_beta)
+            return situ_and_mul(gate, up, float(beta), linear_beta)
         case _:
             raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
+
+
+def supports_fused_act(size_n: int) -> bool:
+    """Whether ``fuse_act`` can split a ``size_n``-wide gate/up output by lanes."""
+    return size_n % (2 * pltpu.get_tpu_info().num_lanes) == 0
 
 
 def align_to(x, a):
@@ -1085,13 +1099,11 @@ def validate_inputs(
     assert group_offset.shape == (1,)
 
     size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
-    if fuse_act is not None:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        if size_n % (2 * num_lanes) != 0:
-            raise ValueError(
-                f"{size_n=} should be divisible by 2 * num_lanes when fuse_act is "
-                "enabled since we need to split n dimension for gate and up."
-            )
+    if fuse_act is not None and not supports_fused_act(size_n):
+        raise ValueError(
+            f"{size_n=} should be divisible by 2 * num_lanes when fuse_act is "
+            "enabled since we need to split n dimension for gate and up."
+        )
 
     return Dimensions(
         size_m=size_m,
@@ -1325,6 +1337,29 @@ def gmm_v2(
     """
 
     del precision
+
+    if fuse_act is not None and not supports_fused_act(rhs.shape[-1]):
+        # Too narrow to split gate and up by lanes: run unfused to FP32 and
+        # apply the activation there, rounding once like the fused epilogue.
+        out = gmm_v2(
+            lhs,
+            rhs,
+            group_sizes,
+            rhs_scale,
+            rhs_bias,
+            group_offset,
+            tile_info=tile_info,
+            vmem_limit_bytes=vmem_limit_bytes,
+            preferred_element_type=jnp.float32,
+            acc_dtype=acc_dtype,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            zero_initialize=zero_initialize,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        gate, up = jnp.split(out, 2, axis=-1)
+        return act_and_mul(gate, up, fuse_act).astype(
+            preferred_element_type or lhs.dtype
+        )
 
     # The kernel reshapes lhs by its sublane block, so pad the rows up to it.
     # The extra rows sit past every group, so they add no work, and they are
