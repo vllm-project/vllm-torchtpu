@@ -561,34 +561,52 @@ def gather_fused_moe(
 # ---------------------------------------------------------------- combine
 
 
-def _combine_kernel(pos_smem, w_ref, *rest, tt, topk, s, masked):
+# Masked combine route entries: (row << _SLOT_BITS) | buffer slot.
+_SLOT_BITS = 12
+_ISSUE_GROUP = 8
+
+
+def _combine_kernel(route_smem, *rest, tt, topk, s, masked):
     if masked:
-        pos_ref, y_hbm, out_ref, buf, sem, count = rest
+        count_smem, w_ref, pos_ref, y_hbm, out_ref, buf, sem = rest
     else:
-        y_hbm, out_ref, buf, sem = rest
+        w_ref, y_hbm, out_ref, buf, sem = rest
     i = pl.program_id(0)
+    routes = tt * topk
+
+    def issued_rows(tile):
+        return pl.cdiv(count_smem[tile], _ISSUE_GROUP) * _ISSUE_GROUP
 
     def issue(tile, slot):
-        def body(t, issued):
+        if masked:
+            # The tile's valid routes come first in its entry list; the rest
+            # point at row 0 and the spare slot, which compute never reads.
+            def group(g, carry):
+                for u in range(_ISSUE_GROUP):
+                    entry = route_smem[tile * routes + g * _ISSUE_GROUP + u]
+                    row = jnp.right_shift(entry, _SLOT_BITS)
+                    dst = jnp.bitwise_and(entry, (1 << _SLOT_BITS) - 1)
+                    pltpu.make_async_copy(
+                        y_hbm.at[pl.ds(row * s, s)],
+                        buf.at[slot, pl.ds(dst * s, s)],
+                        sem.at[slot],
+                    ).start()
+                return carry
+
+            lax.fori_loop(0, issued_rows(tile) // _ISSUE_GROUP, group, 0)
+            return
+
+        def body(t, carry):
             for k in range(topk):
-                row = pos_smem[(tile * tt + t) * topk + k]
-                copy = pltpu.make_async_copy(
+                row = route_smem[(tile * tt + t) * topk + k]
+                pltpu.make_async_copy(
                     y_hbm.at[pl.ds(row * s, s)],
                     buf.at[slot, pl.ds((k * tt + t) * s, s)],
                     sem.at[slot],
-                )
-                if masked:
-                    # A negative position is a route this call has no row
-                    # for (another rank's expert, a skipped padded token).
-                    pl.when(row >= 0)(copy.start)
-                    issued += (row >= 0).astype(jnp.int32)
-                else:
-                    copy.start()
-            return issued
+                ).start()
+            return carry
 
-        issued = lax.fori_loop(0, tt, body, jnp.int32(0))
-        if masked:
-            count[slot] = issued
+        lax.fori_loop(0, tt, body, 0)
 
     @pl.when(i == 0)
     def _():
@@ -602,9 +620,9 @@ def _combine_kernel(pos_smem, w_ref, *rest, tt, topk, s, masked):
 
     if masked:
         # Waits count bytes: one descriptor the size of the issued rows.
-        rows = pl.ds(0, count[slot] * s)
+        rows = pl.ds(0, issued_rows(i) * s)
 
-        @pl.when(count[slot] > 0)
+        @pl.when(count_smem[i] > 0)
         def _():
             pltpu.make_async_copy(
                 buf.at[slot, rows], buf.at[slot, rows], sem.at[slot]
@@ -625,7 +643,7 @@ def _combine_kernel(pos_smem, w_ref, *rest, tt, topk, s, masked):
             wk = w[:, k : k + 1]
             lo, hi = lo * wk, hi * wk
             if masked:
-                # Rows of skipped routes are stale buffer contents.
+                # Slots of skipped routes hold stale buffer contents.
                 lo = jnp.where(valid[:, k : k + 1], lo, 0.0)
                 hi = jnp.where(valid[:, k : k + 1], hi, 0.0)
             acc_lo += lo
@@ -636,6 +654,27 @@ def _combine_kernel(pos_smem, w_ref, *rest, tt, topk, s, masked):
         out_ref[:, PACKED_COLUMNS * j + LANES : PACKED_COLUMNS * (j + 1)] = (
             acc_hi.astype(out_ref.dtype)
         )
+
+
+def _masked_route_entries(positions: jax.Array, tt: int) -> tuple[jax.Array, jax.Array]:
+    """Per token tile, its valid routes first as packed (row, slot) entries.
+
+    Slot ``k * tt + t`` holds route ``(t, k)``'s row; entries past a tile's
+    count read row 0 into the spare slot ``tt * topk``.
+    """
+    tokens, topk = positions.shape
+    routes = tt * topk
+    by_tile = positions.reshape(tokens // tt, routes)  # entry t * topk + k
+    valid = by_tile >= 0
+    order = jnp.argsort(~valid, axis=1, stable=True)
+    rows = jnp.take_along_axis(by_tile, order, axis=1)
+    slots = (order % topk) * tt + order // topk
+    entries = jnp.where(
+        jnp.take_along_axis(valid, order, axis=1),
+        jnp.left_shift(rows, _SLOT_BITS) | slots,
+        routes,
+    )
+    return entries.reshape(-1).astype(jnp.int32), valid.sum(axis=1, dtype=jnp.int32)
 
 
 @functools.partial(
@@ -654,41 +693,50 @@ def gather_combine(
     """BF16 ``out[t] = sum_k weights[t, k] * row(positions[t, k])``.
 
     ``masked=True`` admits negative positions: those routes contribute zero
-    and are never read.
+    and are never read, and only the valid routes are fetched.
     """
     tokens, topk = weights.shape
     s = packed_sublanes(hidden_size)
     if tokens % tile_tokens:
         raise ValueError(f"{tokens=} is not a multiple of {tile_tokens=}")
+    routes = tile_tokens * topk
+    if masked and (routes >= 1 << _SLOT_BITS or y_packed.shape[0] // s >= 1 << 19):
+        raise ValueError(
+            f"{routes=} or {y_packed.shape[0] // s} rows exceed the entry fields"
+        )
     positions = positions.astype(jnp.int32)
-    route_block = pl.BlockSpec((tile_tokens, topk), lambda i, pos: (i, 0))
-    in_specs = [route_block]
-    operands = [weights]
-    scratch = [
-        pltpu.VMEM((2, topk * tile_tokens * s, LANES), jnp.uint32),
-        pltpu.SemaphoreType.DMA((2,)),
-    ]
+    route_block = pl.BlockSpec((tile_tokens, topk), lambda i, *_: (i, 0))
     if masked:
-        in_specs.append(route_block)
-        operands.append(positions)
-        scratch.append(pltpu.SMEM((2,), jnp.int32))
+        entries, counts = _masked_route_entries(positions, tile_tokens)
+        prefetch = [entries, counts]
+        in_specs = [route_block, route_block]
+        operands = [weights, positions]
+        slots = routes + 1  # one spare slot for the padding entries
+    else:
+        prefetch = [positions.reshape(-1)]
+        in_specs = [route_block]
+        operands = [weights]
+        slots = routes
     return pl.pallas_call(
         functools.partial(
             _combine_kernel, tt=tile_tokens, topk=topk, s=s, masked=masked
         ),
         out_shape=jax.ShapeDtypeStruct((tokens, s * PACKED_COLUMNS), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=len(prefetch),
             grid=(tokens // tile_tokens,),
             in_specs=[*in_specs, pl.BlockSpec(memory_space=pltpu.HBM)],
             out_specs=pl.BlockSpec(
-                (tile_tokens, s * PACKED_COLUMNS), lambda i, pos: (i, 0)
+                (tile_tokens, s * PACKED_COLUMNS), lambda i, *_: (i, 0)
             ),
-            scratch_shapes=scratch,
+            scratch_shapes=[
+                pltpu.VMEM((2, slots * s, LANES), jnp.uint32),
+                pltpu.SemaphoreType.DMA((2,)),
+            ],
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",), disable_bounds_checks=True
         ),
         name=f"gather_combine-k_{topk}-s_{s}-tt_{tile_tokens}-m{int(masked)}",
         interpret=pltpu.InterpretParams() if interpret else False,
-    )(positions.reshape(-1), *operands, y_packed)
+    )(*prefetch, *operands, y_packed)
