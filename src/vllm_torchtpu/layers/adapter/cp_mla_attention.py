@@ -223,9 +223,7 @@ def vspace_fused_applies(num_tokens: int, is_backbone: bool) -> bool:
         and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
         return False
-    return (
-        _merge_chunks(num_tokens) > 1 or envs.TPU_DCP_MERGE_VSPACE_FUSED_UNCHUNKED
-    )
+    return _merge_chunks(num_tokens) > 1 or envs.TPU_DCP_MERGE_VSPACE_FUSED_UNCHUNKED
 
 
 def merge_lse_partials_scatter_heads_vspace(

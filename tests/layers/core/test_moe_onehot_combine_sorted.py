@@ -45,7 +45,7 @@ def _routing(seed, num_tokens, num_padded):
     w_sorted = np.zeros_like(w_flat)
     w_sorted[revert] = w_flat
     gmm = rng.standard_normal((order.size, HIDDEN)).astype(np.float32)
-    gmm[int(valid.sum()):] = 0.0  # rows past the computed prefix are zeroed
+    gmm[int(valid.sum()) :] = 0.0  # rows past the computed prefix are zeroed
     return weights, valid, revert, token_sorted, w_sorted, gmm
 
 

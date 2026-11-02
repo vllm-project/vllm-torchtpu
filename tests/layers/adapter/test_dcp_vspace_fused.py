@@ -92,7 +92,9 @@ def test_vspace_merge_is_the_latent_merge_then_w_uv(monkeypatch, lse_ag, chunks)
     }.items():
         monkeypatch.setattr(cp_mla.envs, k, val, raising=False)
     if chunks == 1:
-        monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: _Group(outputs, lses, w_uv, 0))
+        monkeypatch.setattr(
+            cp_mla, "get_dcp_group", lambda: _Group(outputs, lses, w_uv, 0)
+        )
         assert not cp_mla.vspace_fused_applies(T, True)
         monkeypatch.setattr(cp_mla.envs, "TPU_DCP_MERGE_VSPACE_FUSED_UNCHUNKED", True)
     merged = torch.logsumexp(lses.double(), dim=0)
