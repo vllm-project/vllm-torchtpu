@@ -48,6 +48,7 @@ def _block_maxima(pages, block):
         # Lane j * block + block - 1 holds block j's maximum.
         page = pltpu.roll(page, (p - block + 1) % PAGE_RECORDS, axis=1)
         merged = page if merged is None else jnp.where(lanes % block == p, page, merged)
+    assert merged is not None, "Block maxima need at least one page"
     blocks = PAGE_RECORDS // block
     order = (lanes % blocks) * block + lanes // blocks
     return jnp.take_along_axis(merged, jnp.broadcast_to(order, merged.shape), axis=1)
