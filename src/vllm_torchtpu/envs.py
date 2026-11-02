@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
+    TPU_LIBRARY_PATH: str | None = None
     TPU_WORKER_ID: str | None = None
     TPU_MULTIHOST_BACKEND: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
@@ -476,6 +477,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ACCELERATOR_TYPE": lambda: os.getenv("TPU_ACCELERATOR_TYPE", None),
     # Name of the TPU resource
     "TPU_NAME": lambda: os.getenv("TPU_NAME", None),
+    # libtpu.so loaded by the TPU runtime instead of the pip libtpu package
+    # (e.g. container images that ship a prebuilt library). Read only to
+    # identify the library when no libtpu package metadata is installed.
+    "TPU_LIBRARY_PATH": lambda: os.getenv("TPU_LIBRARY_PATH", None),
     # Worker ID for multi-host TPU setups
     "TPU_WORKER_ID": lambda: os.getenv("TPU_WORKER_ID", None),
     # Backend for multi-host communication on TPU. "" auto-detects: "mp" is
