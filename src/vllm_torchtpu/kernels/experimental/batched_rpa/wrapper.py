@@ -549,7 +549,7 @@ def calculate_block_sizes(
     decode_block_sizes = find_best_block_sizes(
         decode_batch_size, decode_query_size, decode_max_bkv_sz
     )
-    prefill_max_bkv_sz = 4096
+    prefill_max_bkv_sz = _MAX_BKV_SZ
     if model_cfgs.sliding_window is not None and sliding_prefill_max_bkv is not None:
         prefill_max_bkv_sz = min(prefill_max_bkv_sz, sliding_prefill_max_bkv)
     prefill_block_sizes = find_best_block_sizes(
