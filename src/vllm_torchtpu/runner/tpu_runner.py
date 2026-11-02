@@ -903,6 +903,9 @@ class TPUModelRunner(GPUModelRunner):
         self._fast_token_substitution: bool = bool(
             envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
         )
+        # Read by stage_block_table_uploads (layers/core/attention_metadata.py).
+        self._reuse_staged_block_tables: bool = envs.TPU_REUSE_STAGED_BLOCK_TABLES
+        self._staged_block_table_reuse: dict[tuple, tuple] = {}
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req
