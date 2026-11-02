@@ -8948,7 +8948,11 @@ def stack(
                     ),
                     after_experts=after_experts,
                     after_routing_scores=after_routing_scores,
-                    overlap_router_latent=(attention_dp == 2 and batch_size == 128 and plain_overlap("router")),
+                    overlap_router_latent=(
+                        (attention_dp == 2 and batch_size == 128 and plain_overlap("router"))
+                        or (attention_dp == 1 and sequence_rows == 1
+                            and batch_size <= _config().decode_overlap_router_latent_max)
+                    ),
                     # Verify steps of 64 rows overlap it too; at 128 verify rows it is slower.
                     overlap_shared_reduction=(attention_dp == 2 and (batch_size == 64 or batch_size == 128 and plain_overlap("shared128"))),
                     token_scatter_output=moe_token_scatter_output,
