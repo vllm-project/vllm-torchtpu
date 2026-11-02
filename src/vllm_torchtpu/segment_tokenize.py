@@ -23,9 +23,11 @@ holds piece by piece. Chat templates put added tokens (``<|user|>``,
 message body is one piece. This module performs the same split, serves
 pieces already seen from an LRU cache keyed by the piece text, and encodes
 only new pieces -- in one ``encode_batch`` call, so a cold long prompt is
-also encoded across cores. Tokenizers that do not satisfy the conditions
-above, or requests that need offsets, special-token insertion or tokenizer
-truncation, take vLLM's original path unchanged.
+also encoded across cores. With ``VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS=1``
+that call goes to fastokens, which loads the same tokenizer file and returns
+the same ids in a fraction of the time. Tokenizers that do not satisfy the
+conditions above, or requests that need offsets, special-token insertion or
+tokenizer truncation, take vLLM's original path unchanged.
 
 Prefix reuse (``VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS=N``): the split, the
 piece slicing, hashing and lookup and the id copy above still run over the
@@ -45,10 +47,13 @@ from __future__ import annotations
 
 import bisect
 import copy
+import importlib.util
 import re
+import sys
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from vllm_torchtpu.logger import init_logger
@@ -196,12 +201,19 @@ class RecentPrompts:
 class SegmentTokenizer:
     """Encodes text exactly as ``backend.encode(text, add_special_tokens=False)``."""
 
-    def __init__(self, backend: Any, max_cached_tokens: int, max_prompts: int = 0):
+    def __init__(
+        self,
+        backend: Any,
+        max_cached_tokens: int,
+        max_prompts: int = 0,
+        use_fastokens: bool = False,
+    ):
         # Private copy: transformers mutates truncation/padding on the shared
         # backend per call, which must not leak into these encodes.
         self._backend = copy.deepcopy(backend)
         self._backend.no_truncation()
         self._backend.no_padding()
+        self._miss_encoder = _fastokens_of(self._backend) if use_fastokens else self._backend
         added = self._backend.get_added_tokens_decoder()
         self._added_id = {tok.content: tid for tid, tok in added.items()}
         alts: list[str] = sorted(self._added_id, key=len, reverse=True)
@@ -286,7 +298,7 @@ class SegmentTokenizer:
                     todo.append(piece)
             self.misses += len(todo)
             if todo:
-                encs = self._backend.encode_batch(todo, add_special_tokens=False)
+                encs = self._miss_encoder.encode_batch(todo, add_special_tokens=False)
                 for piece, enc in zip(todo, encs):
                     ids = list(map(self._ints.__getitem__, enc.ids))
                     found[piece] = ids
@@ -315,6 +327,34 @@ class SegmentTokenizer:
             self._cached_tokens -= len(old)
 
 
+def _fastokens_of(backend: Any) -> Any:
+    """A fastokens encoder of ``backend``'s tokenizer file, else ``backend`` itself."""
+    try:
+        return _import_fastokens().Tokenizer.from_json_str(backend.to_str())
+    except Exception as exc:
+        logger.warning("VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS: keeping the HF encoder: %s", exc)
+        return backend
+
+
+def _import_fastokens() -> Any:
+    """The installed fastokens, else the copy a patch serves beside this package."""
+    try:
+        import fastokens
+
+        return fastokens
+    except ImportError:
+        package = Path(__file__).resolve().parents[1] / "fastokens"
+        if not (package / "__init__.py").is_file():
+            raise
+    spec = importlib.util.spec_from_file_location(
+        "fastokens", package / "__init__.py", submodule_search_locations=[str(package)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["fastokens"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _backend_of(tokenizer: Any) -> Any:
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is None:
@@ -328,7 +368,9 @@ _INSTANCES: dict[int, SegmentTokenizer | None] = {}
 _INSTANCES_LOCK = threading.Lock()
 
 
-def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int, max_prompts: int = 0):
+def get_segment_tokenizer(
+    tokenizer: Any, max_cached_tokens: int, max_prompts: int = 0, use_fastokens: bool = False
+):
     """One ``SegmentTokenizer`` per vLLM tokenizer object, or None if ineligible."""
     key = id(tokenizer)
     with _INSTANCES_LOCK:
@@ -343,14 +385,15 @@ def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int, max_prompts: i
         else:
             reason = SegmentTokenizer.eligible(backend)
         if reason is None:
-            seg = SegmentTokenizer(backend, max_cached_tokens, max_prompts)
+            seg = SegmentTokenizer(backend, max_cached_tokens, max_prompts, use_fastokens)
             logger.info(
                 "VLLM_TPU_SEGMENT_TOKENIZE: piecewise prompt tokenization on "
                 "(%d added tokens, cache %d tokens, ~12 B/token, prefix reuse "
-                "over %d recent prompts).",
+                "over %d recent prompts, missed pieces encoded by %s).",
                 len(seg._added_id),
                 max_cached_tokens,
                 max_prompts,
+                "HF tokenizers" if seg._miss_encoder is seg._backend else "fastokens",
             )
         else:
             logger.warning(
@@ -379,12 +422,15 @@ def patch_renderer_segment_tokenize() -> None:
     orig = cls._tokenize_prompt
     max_cached = envs.VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS
     max_prompts = envs.VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS
+    use_fastokens = envs.VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS
 
     def _tokenize_prompt(self, prompt, params):
         kwargs = params.get_encode_kwargs()
         if kwargs.get("add_special_tokens") or self._wants_offsets(prompt, params):
             return orig(self, prompt, params)
-        seg = get_segment_tokenizer(self.get_tokenizer(), max_cached, max_prompts)
+        seg = get_segment_tokenizer(
+            self.get_tokenizer(), max_cached, max_prompts, use_fastokens
+        )
         if seg is None:
             return orig(self, prompt, params)
         ids = seg.encode(prompt["prompt"])
