@@ -126,9 +126,17 @@ VIDEO_VAE_MAX_REL_L2: dict[str, tuple[float, float]] = {
     "decode": (6.5e-3, 1.2e-2),
     "decode-frame": (6.7e-3, 1.3e-2),
 }
+VIDEO_VAE_MAX_ABS: dict[str, tuple[float, float]] = {
+    "mode": (4.0e-3, 9.8e-3),
+    "decode": (1.2e-2, 2.1e-2),
+    "decode-frame": (1.2e-2, 2.1e-2),
+}
 AUDIO_VAE_MAX_REL_L2: tuple[float, float] = (9.6e-3, 1.9e-2)
+AUDIO_VAE_MAX_ABS: tuple[float, float] = (1.6e-2, 2.6e-2)
 VOCODER_MAX_REL_L2: tuple[float, float] = (1.7e-3, 8.4e-3)
+VOCODER_MAX_ABS: tuple[float, float] = (1.6e-3, 5.5e-3)
 GEMMA3_MAX_REL_L2: tuple[float, float] = (7.4e-3, 1.2e-2)
+GEMMA3_MAX_ABS: tuple[float, float] = (4.9e-2, 5.9e-2)
 
 
 @pytest.fixture(scope="module")
@@ -674,32 +682,38 @@ def test_ltx2_tiny_video_vae_parity(
 
     for output, ref_out in (("mode", ref_mode), ("decode", ref_decode)):
         fp32_max, bf16_max = VIDEO_VAE_MAX_REL_L2[output]
+        fp32_max_abs, bf16_max_abs = VIDEO_VAE_MAX_ABS[output]
         assert_parity(
             tpu_outputs[torch.float32][output],
             ref_out,
             name=f"video VAE {output} TPU fp32",
             max_rel_l2=fp32_max,
+            max_abs=fp32_max_abs,
         )
         assert_parity(
             tpu_outputs[torch.bfloat16][output],
             ref_out,
             name=f"video VAE {output} TPU bf16",
             max_rel_l2=bf16_max,
+            max_abs=bf16_max_abs,
         )
 
     frame_fp32_max, frame_bf16_max = VIDEO_VAE_MAX_REL_L2["decode-frame"]
+    frame_fp32_max_abs, frame_bf16_max_abs = VIDEO_VAE_MAX_ABS["decode-frame"]
     for frame in range(ref_decode.shape[2]):
         assert_parity(
             tpu_outputs[torch.float32]["decode"][:, :, frame],
             ref_decode[:, :, frame],
             name=f"video VAE decode frame {frame} TPU fp32",
             max_rel_l2=frame_fp32_max,
+            max_abs=frame_fp32_max_abs,
         )
         assert_parity(
             tpu_outputs[torch.bfloat16]["decode"][:, :, frame],
             ref_decode[:, :, frame],
             name=f"video VAE decode frame {frame} TPU bf16",
             max_rel_l2=frame_bf16_max,
+            max_abs=frame_bf16_max_abs,
         )
 
 
@@ -752,17 +766,20 @@ def test_ltx2_tiny_audio_vae_parity(
         tpu_outputs[dtype] = mel_out.float().cpu()
 
     fp32_max, bf16_max = AUDIO_VAE_MAX_REL_L2
+    fp32_max_abs, bf16_max_abs = AUDIO_VAE_MAX_ABS
     assert_parity(
         tpu_outputs[torch.float32],
         ref_mel,
         name="audio VAE decode TPU fp32",
         max_rel_l2=fp32_max,
+        max_abs=fp32_max_abs,
     )
     assert_parity(
         tpu_outputs[torch.bfloat16],
         ref_mel,
         name="audio VAE decode TPU bf16",
         max_rel_l2=bf16_max,
+        max_abs=bf16_max_abs,
     )
 
 
@@ -804,17 +821,20 @@ def test_ltx2_tiny_vocoder_parity(
         tpu_outputs[dtype] = wav_out.float().cpu()
 
     fp32_max, bf16_max = VOCODER_MAX_REL_L2
+    fp32_max_abs, bf16_max_abs = VOCODER_MAX_ABS
     assert_parity(
         tpu_outputs[torch.float32],
         ref_wav,
         name="vocoder TPU fp32",
         max_rel_l2=fp32_max,
+        max_abs=fp32_max_abs,
     )
     assert_parity(
         tpu_outputs[torch.bfloat16],
         ref_wav,
         name="vocoder TPU bf16",
         max_rel_l2=bf16_max,
+        max_abs=bf16_max_abs,
     )
 
 
@@ -907,15 +927,18 @@ def test_ltx2_tiny_gemma3_parity(
         )
 
     fp32_max, bf16_max = GEMMA3_MAX_REL_L2
+    fp32_max_abs, bf16_max_abs = GEMMA3_MAX_ABS
     assert_parity(
         tpu_outputs[torch.float32],
         ref_real,
         name="gemma3 hidden states TPU fp32",
         max_rel_l2=fp32_max,
+        max_abs=fp32_max_abs,
     )
     assert_parity(
         tpu_outputs[torch.bfloat16],
         ref_real,
         name="gemma3 hidden states TPU bf16",
         max_rel_l2=bf16_max,
+        max_abs=bf16_max_abs,
     )
