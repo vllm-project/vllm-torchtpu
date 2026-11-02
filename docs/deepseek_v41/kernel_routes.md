@@ -64,14 +64,7 @@ Run kernel correctness tests before full serving:
 python -m pytest tests/kernels/test_dsv41_decode_tuning.py \
   tests/kernels/test_dsv41_decode_index_scores.py \
   tests/models/vllm/test_dsv41_decode_indexer_route.py
-python scripts/dsv41_bench/bench_kernel_routes.py \
-  --baseline-root /workspace/baseline --out /tmp/route-ab
 ```
-
-The standalone A/B uses the same device/runtime and alternating synchronized
-samples after warmup. It checks exact final indices, random and tied scores,
-measured C384 configurations and untuned request/query counts. It bypasses
-serving registration; it does not replace model integration tests.
 
 Use `scripts/dsv41_bench/server_steps/run.py` for paired `encoder_extend` and
 `decode` serving runs with identical frozen inputs, dependencies and hardware.

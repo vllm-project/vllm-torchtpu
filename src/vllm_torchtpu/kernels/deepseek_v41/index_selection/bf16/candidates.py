@@ -413,35 +413,6 @@ def _candidate_scores(
     )(start_request.reshape(1), q, weights, keys, bases, members, lengths, offsets)
 
 
-@functools.partial(jax.jit, static_argnames=("block_size", "key_tile", "interpret"))
-def candidate_scores(
-    q: jax.Array,
-    weights: jax.Array,
-    keys: jax.Array,
-    ids: jax.Array,
-    membership: jax.Array,
-    lengths: jax.Array,
-    *,
-    block_size: int,
-    key_tile: int = 4096,
-    interpret: bool = False,
-) -> jax.Array:
-    """Score canonical int32 keys with per-query membership and causal masks."""
-    return _candidate_scores(
-        q,
-        weights,
-        keys,
-        ids,
-        membership,
-        lengths,
-        start_request=jnp.int32(0),
-        request_tile=q.shape[0],
-        block_size=block_size,
-        key_tile=key_tile,
-        interpret=interpret,
-    )
-
-
 @functools.partial(
     jax.jit,
     static_argnames=(
