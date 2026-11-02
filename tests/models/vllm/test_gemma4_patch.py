@@ -30,6 +30,7 @@ from typing import Any
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.fx.passes.split_module import split_module
 from vllm.model_executor.models import gemma4
 from vllm.model_executor.models.gemma4 import (
     Gemma4Attention,
@@ -165,7 +166,10 @@ class _PerTokenFp8Method(VllmFp8LinearMethodTPU):
         return (x_q.to(torch.float32) @ layer.weight) * x_scale
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
-        return self.apply_quantized_input(layer, *self.quantize_input(layer, x))
+        # As linear_common.quantized_matmul: 2-D in, reshaped back out.
+        x_2d = x.reshape(-1, x.shape[-1])
+        out = self.apply_quantized_input(layer, *self.quantize_input(layer, x_2d))
+        return out.reshape(*x.shape[:-1], out.shape[-1])
 
 
 class _Linear:
@@ -224,8 +228,11 @@ def _causal_mix(q, k, v, num_heads: int, num_kv_heads: int, head_dim: int):
 
 
 def _rope(positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor):
+    # Viewed by the positions' length, as vLLM's rotary embedding does.
+    num_tokens = positions.shape[0]
     angle = positions.to(q.dtype)[:, None] * 0.01
-    return q * torch.cos(angle), k + k * torch.sin(angle)
+    q = q.view(num_tokens, -1) * torch.cos(angle)
+    return q, (k + k * torch.sin(angle)).view(num_tokens, -1)
 
 
 class _Model:
@@ -555,13 +562,14 @@ def test_branches_trace_the_same_inputs(monkeypatch, moe: bool) -> None:
         gemma4_patch._configure_layer(layer)
     input_ids, positions = torch.randint(0, 64, (64,)), torch.arange(64)
 
-    def traced_inputs(min_shard_bytes: int, chunks: int) -> list[int]:
+    def traced_inputs(min_shard_bytes: int, chunks: int) -> tuple[tuple, list[int]]:
+        """vt's signature of the graph vLLM compiles, and its tensors' storage."""
         monkeypatch.setattr(gemma4_patch, "_MIN_SHARD_BYTES", min_shard_bytes)
         monkeypatch.setattr(gemma4_patch, "_microbatches", chunks)
-        seen: list[list[Any]] = []
+        seen: list[tuple[Any, list[Any]]] = []
 
         def backend(gm, example_inputs):
-            seen.append(example_inputs)
+            seen.append((gm, example_inputs))
             return gm.forward
 
         torch._dynamo.reset()
@@ -569,21 +577,28 @@ def test_branches_trace_the_same_inputs(monkeypatch, moe: bool) -> None:
             lambda ids, pos: gemma4_patch._patched_model_forward(fake, ids, pos, None),
             backend=backend,
             fullgraph=True,
-            dynamic=True,
         )
+        ids, pos = input_ids.clone(), positions.clone()
+        # As vLLM marks them: the token dimension is the only dynamic one.
+        torch._dynamo.mark_dynamic(ids, 0)
+        torch._dynamo.mark_dynamic(pos, 0)
         with shape_variants.warmup():
-            compiled(input_ids, positions)
-        skip = {input_ids.data_ptr(), positions.data_ptr()}
-        return [
+            compiled(ids, pos)
+        graph, example_inputs = seen[0]
+        # vLLM's split orders a subgraph's inputs by first use.
+        subgraph = split_module(graph, None, lambda node: 0).submod_0
+        skip = {ids.data_ptr(), pos.data_ptr()}
+        tensors = [
             x.data_ptr()
-            for x in seen[0]
+            for x in example_inputs
             if isinstance(x, torch.Tensor) and x.data_ptr() not in skip
         ]
+        return shape_variants.graph_signature(subgraph), tensors
 
-    all_reduce = traced_inputs(1 << 60, 1)
-    assert all_reduce
-    assert traced_inputs(0, 1) == all_reduce
-    assert traced_inputs(0, 2) == all_reduce
+    signature, tensors = traced_inputs(1 << 60, 1)
+    assert "SymInt" in signature and tensors
+    assert traced_inputs(0, 1) == (signature, tensors)
+    assert traced_inputs(0, 2) == (signature, tensors)
 
 
 def test_bf16_gather_when_method_cannot_take_quantized_rows(mock_collectives):

@@ -300,10 +300,17 @@ def _patched_model_forward(
     per_layer_inputs: torch.Tensor | None = None,
     **kwargs: Any,
 ) -> torch.Tensor:
+    num_tokens = positions.shape[-1]
+    # shape_variants hands a bucket's executable between the traces of the two
+    # branches by input position, and inputs are ordered by first use: stating
+    # the token count's identity first gives both traces the same leading
+    # symbolic inputs, wherever each branch would first use them.
+    tokens = inputs_embeds if input_ids is None else input_ids
+    torch._check(tokens.shape[0] == num_tokens)
     tp_size = get_tensor_model_parallel_world_size()
     # The residual stream has the hidden size and the dtype of the embedding.
     row_bytes = self.config.hidden_size * self.normalizer.dtype.itemsize
-    if not _use_sequence_parallel(positions.shape[-1], row_bytes, tp_size):
+    if not _use_sequence_parallel(num_tokens, row_bytes, tp_size):
         return _orig_model_forward(
             self,
             input_ids,
@@ -319,7 +326,7 @@ def _patched_model_forward(
         )
     if inputs_embeds is None:
         inputs_embeds = self.embed_input_ids(input_ids)
-    chunks = _num_microbatches(positions.shape[-1], row_bytes, tp_size)
+    chunks = _num_microbatches(num_tokens, row_bytes, tp_size)
     hidden_states = [sequence_parallel_chunk(c) for c in inputs_embeds.chunk(chunks)]
     for layer in islice(self.layers, self.start_layer, self.end_layer):
         hidden_states, _ = layer(
