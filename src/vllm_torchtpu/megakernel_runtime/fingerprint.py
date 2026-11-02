@@ -128,15 +128,11 @@ def source_hash(module: ModuleType, *, source_root: str | None = None) -> str:
 
 @functools.lru_cache(maxsize=1)
 def runtime_src_hash() -> str:
-    """The digest of `megakernel/` + `megakernel_runtime/` (minus `models/`,
-    whose templates are plugins with their own source hash)."""
+    """The digest of the `megakernel/` and `megakernel_runtime/` sources."""
     pkg = Path(__file__).resolve().parent.parent
     files: list[tuple[str, Path]] = []
     for sub in ("megakernel", "megakernel_runtime"):
-        for rel, p in _walk_py(pkg / sub, sub):
-            if sub == "megakernel_runtime" and rel.startswith("models/"):
-                continue
-            files.append((f"{sub}/{rel}", p))
+        files += [(f"{sub}/{rel}", p) for rel, p in _walk_py(pkg / sub, sub)]
     return hash_files(files, name="vllm_torchtpu.megakernel*")
 
 
