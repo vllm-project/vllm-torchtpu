@@ -140,6 +140,8 @@ PATCHES = (
     Patch(
         "vllm_torchtpu.input_range_check:patch_skip_tokenizer_id_range_check", _ACTIVE
     ),
+    # Prompt ids sent from the API server to the engine core (VLLM_TPU_SEND_NEW_PROMPT_IDS).
+    Patch("vllm_torchtpu.core.send_new_prompt_ids:patch_send_new_prompt_ids", _ENGINE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
