@@ -106,6 +106,12 @@ class KernelConfig:
     prefill_moe_oneshot_max: int = dataclasses.field(
         default_factory=lambda: int(os.environ.get("K3_PREFILL_MOE_ONESHOT_MAX", "0"))
     )
+    # Prefill KDA layer, windows of one SP block (512-2048) up to this many
+    # tokens: direct window all-gather and one-shot reduce-scatter (FP32 sum of
+    # the 32 BF16 partials) instead of the 17-step half rings (0: rings).
+    prefill_kda_oneshot_max: int = dataclasses.field(
+        default_factory=lambda: int(os.environ.get("K3_PREFILL_KDA_ONESHOT_MAX", "0"))
+    )
     # Prefill KDA layer: start the weight copies with the window all-gather
     # instead of at the first KDA tile.
     prefill_kda_early_weights: bool = dataclasses.field(

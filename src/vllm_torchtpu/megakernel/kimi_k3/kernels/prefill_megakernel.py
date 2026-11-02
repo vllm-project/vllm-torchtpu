@@ -5581,6 +5581,101 @@ def make_norm_gather_sp(mesh, *, seq_len, token_ranks=None,
     ))
 
 
+def _oneshot_barrier():
+    """All 32 ranks have entered this kernel (direct copies reach any peer)."""
+    barrier = pltpu.get_barrier_semaphore()
+    for peer in range(32):
+        pl.semaphore_signal(barrier, 1, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL)
+    pl.semaphore_wait(barrier, 32)
+
+
+def _kda_oneshot_gather(normalized_ref, gathered_ref, send, recv, local, *, step, stripe):
+    """Window all-gather of one SP block (blocks == 1, identity token owners):
+    step 0 copies this rank's rows to every peer's window rows, step
+    HALF_STEPS - 1 waits for the 31 incoming copies."""
+    rank = jax.lax.axis_index("k3_sp")
+    rows = pl.ds(rank * stripe, stripe)
+
+    def remote(peer):
+        return pltpu.make_async_remote_copy(
+            normalized_ref.at[pl.ds(0, stripe)], gathered_ref.at[rows], send, recv,
+            device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL)
+
+    own = pltpu.make_async_copy(normalized_ref.at[pl.ds(0, stripe)], gathered_ref.at[rows], local)
+
+    @pl.when(step == 0)
+    def start():
+        @pl.loop(1, 32)
+        def send_all(d):
+            remote(jax.lax.rem(rank + d, 32)).start()
+        own.start()
+
+    @pl.when(step == HALF_STEPS - 1)
+    def finish():
+        @pl.loop(1, 32)
+        def wait_all(d):
+            remote(rank).wait_send()
+            remote(rank).wait_recv()
+        own.wait()
+
+
+def _kda_oneshot_reduce(tables_ref, length_ref, partial_ref, prefix_ref, output_ref, slots,
+                        send, recv, local, gather, *, step, stripe, replace):
+    """Reduce-scatter of one SP block's output-projection partials (blocks ==
+    1, identity token owners): step 0 sends owner d's partial rows to slot
+    [rank] on rank d; the last step sums the 32 BF16 slots in FP32 in rank
+    order and adds the residual."""
+    rank = jax.lax.axis_index("k3_sp")
+
+    def remote(peer):
+        return pltpu.make_async_remote_copy(
+            partial_ref.at[pl.ds(peer * stripe, stripe)], slots.at[rank], send, recv,
+            device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL)
+
+    own = pltpu.make_async_copy(partial_ref.at[pl.ds(rank * stripe, stripe)], slots.at[rank], local)
+
+    @pl.when(step == 0)
+    def start():
+        @pl.loop(1, 32)
+        def send_all(d):
+            remote(jax.lax.rem(rank + d, 32)).start()
+        own.start()
+
+    @pl.when(step == HALF_STEPS - 1)
+    def finish():
+        @pl.loop(1, 32)
+        def wait_all(d):
+            remote(rank).wait_send()
+            remote(rank).wait_recv()
+        own.wait()
+        width = gather.shape[2]
+        staging = gather.at[0]
+        token_owner = tables_ref[0, 2, rank]
+        for col in range(0, partial_ref.shape[1], width):
+            cols = pl.ds(col, width)
+            copies = [pltpu.make_async_copy(slots.at[r, :, cols], gather.at[r], local)
+                      for r in range(32)]
+            for copy in copies:
+                copy.start()
+            for copy in copies:
+                copy.wait()
+            total = gather[0].astype(jnp.float32)
+            for r in range(1, 32):
+                total = total + gather[r].astype(jnp.float32)
+            prefix_copy = pltpu.make_async_copy(prefix_ref.at[pl.ds(0, stripe), cols], staging, local)
+            prefix_copy.start()
+            prefix_copy.wait()
+            valid = sp_token_index(
+                token_owner, jax.lax.broadcasted_iota(jnp.int32, (stripe, width), 0), stripe,
+            ) < length_ref[0]
+            residual = staging[...].astype(jnp.float32)
+            residual = jnp.where(replace, jnp.zeros_like(residual), residual)
+            staging[...] = (residual + jnp.where(valid, total, 0)).astype(jnp.bfloat16)
+            out = pltpu.make_async_copy(staging, output_ref.at[pl.ds(0, stripe), cols], local)
+            out.start()
+            out.wait()
+
+
 def _kda_layer_body(
     slot_ref, segment_ref, active_ref, tables_ref, length_ref,
     prefix_ref, blocks_ref, folded_ref, norm_ref,
@@ -5589,7 +5684,7 @@ def _kda_layer_body(
     rec_in_ref, hist_in_ref, output_family_ref,
     normalized_ref, gathered_ref, attended_ref, rec_out_ref, hist_out_ref,
     final_ref, rec_checkpoint_ref, hist_checkpoint_ref, partial_ref,
-    pool, *scratch, eps, count, blocks,
+    pool, *scratch, eps, count, blocks, slots=None,
 ):
     """One KDA layer of the family-major weights (``slot_ref``) over a
     packed window of ``count`` sequences, pipelined over its ``blocks`` SP
@@ -5608,7 +5703,12 @@ def _kda_layer_body(
     stripe = window_stripe(prefix_ref.shape[0])
     mix_small, gather_sems = scratch[:8], scratch[8:11]
     reduce_sems, projection_scratch = scratch[11:16], scratch[16:19]
-    kda_scratch = scratch[19:]
+    oneshot = slots is not None
+    if oneshot:
+        os_gsend, os_grecv, os_rsend, os_rrecv, os_local, os_gather = scratch[19:25]
+        kda_scratch = scratch[25:]
+    else:
+        kda_scratch = scratch[19:]
 
     def views(shapes):  # the shared pool: the mixture at step 0, then the projection ring
         offset, result = 0, []
@@ -5619,7 +5719,10 @@ def _kda_layer_body(
             offset += size
         return result
 
-    pl.when(step == 0)(lambda: _ring_enter(tables_ref, jax.lax.axis_index("k3_sp")))
+    if oneshot:
+        pl.when(step == 0)(_oneshot_barrier)
+    else:
+        pl.when(step == 0)(lambda: _ring_enter(tables_ref, jax.lax.axis_index("k3_sp")))
 
     @pl.when(step < blocks)  # only block 0's mixture delays the first ring
     def normalize():
@@ -5633,12 +5736,22 @@ def _kda_layer_body(
     @pl.when(phase < blocks)
     @jax.named_scope("kl_gather")
     def gather():
+        if oneshot:
+            _kda_oneshot_gather(normalized_ref, gathered_ref, os_gsend, os_grecv, os_local,
+                                step=ring_step, stripe=stripe)
+            return
         _half_gather_step(tables_ref, normalized_ref, gathered_ref, *gather_sems,
                           step=ring_step, block=phase)
 
     @pl.when(phase >= 2)
     @jax.named_scope("kl_reduce")
     def reduce():
+        if oneshot:
+            _kda_oneshot_reduce(
+                tables_ref, length_ref, partial_ref, prefix_ref, final_ref, slots,
+                os_rsend, os_rrecv, os_local, os_gather,
+                step=ring_step, stripe=stripe, replace=slot % 9 == 0)
+            return
         _half_reduce_step(
             tables_ref, length_ref, partial_ref, prefix_ref, final_ref,
             *reduce_sems, *views(_kda_reduce_shapes(stripe)),
@@ -5717,6 +5830,8 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
         ring_tables(list(mesh.devices.flat), token_ranks), jnp.int32,
     )
     streams = len(_half_ring_streams(width))
+    oneshot = (blocks == 1 and seq_len <= _config().prefill_kda_oneshot_max
+               and tuple(token_ranks) == tuple(range(32)))
     pool_bytes = max(
         sum(pool_alias.storage_size(shape, jnp.dtype(dtype))
             for shape, dtype in _kda_mix_shapes(stripe)),
@@ -5746,6 +5861,8 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
         pltpu.VMEM((384, width), jnp.bfloat16),  # the output projection
         pltpu.VMEM((2, 128, width), jnp.bfloat16),  # its partials
         pltpu.SemaphoreType.DMA((2,)),
+        *((pltpu.SemaphoreType.DMA,) * 5 + (pltpu.VMEM((32, stripe, 512), jnp.bfloat16),)
+          if oneshot else ()),
         *kda_prefill_tiled_scratch_shapes(width, 128, *shapes),
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -5760,10 +5877,18 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
         jax.ShapeDtypeStruct((*state_lead, 3, 3, 3, 128), jnp.bfloat16),
         jax.ShapeDtypeStruct((seq_len, width), jnp.bfloat16),  # projection partials
     )
+    body = functools.partial(_kda_layer_body, count=segments, eps=eps, blocks=blocks)
+    if oneshot:
+        # One-shot reduce slots [32, stripe, hidden], after the partials.
+        output_shapes += (jax.ShapeDtypeStruct((32, stripe, width), jnp.bfloat16),)
+        refs_before = 5 + 14 + len(output_shapes) - 1
+
+        def body(*refs):
+            refs = list(refs)
+            slots = refs.pop(refs_before)
+            return _kda_layer_body(*refs, count=segments, eps=eps, blocks=blocks, slots=slots)
     call = pl.pallas_call(
-        functools.partial(
-            _kda_layer_body, count=segments, eps=eps, blocks=blocks,
-        ),
+        body,
         out_shape=output_shapes,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
@@ -5787,7 +5912,7 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
             w["k_gate"], w["k_fb"], w["k_projection"], w["k_conv"],
             w["k_a_log"], w["k_dt"], w["k_norm"], rec[0], hist[0], w["k_o"],
         )
-        normalized, gathered, attended, new_rec, new_hist, final, rec_at, hist_at, _ = outputs
+        normalized, gathered, attended, new_rec, new_hist, final, rec_at, hist_at = outputs[:8]
         return (normalized[None], gathered, attended[None], new_rec[None],
                 new_hist[None], final[None], rec_at[None], hist_at[None])
 
