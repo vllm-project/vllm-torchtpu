@@ -636,8 +636,19 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
     ):
         if not jtu.is_device_tpu_at_least(version=7):
             self.skipTest("Expect TPU7x+ (fp8 MXU)")
-        # Decodes first, then prefill chunks with and without cached context.
-        seq_lens = [(1, 300), (1, 77), (192, 328), (128, 180), (64, 255)]
+        # Decodes first, then prefill chunks with and without cached context; the
+        # last two span several KV blocks, so the online-softmax rescale runs while
+        # the running max still rises (at head_dim 512 these logits sit around
+        # 130-150, where bf16 rounds m - 3.5 differently for neighbouring maxima).
+        seq_lens = [
+            (1, 300),
+            (1, 77),
+            (192, 328),
+            (128, 180),
+            (64, 255),
+            (256, 1500),
+            (128, 2100),
+        ]
         self._test_ragged_paged_attention(
             seq_lens,
             (32, 8),

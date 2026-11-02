@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -21,11 +19,13 @@ from jax import lax
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
 
-# Under `fp8_compute`, P is computed as 2**P_FP8_EXP * exp(s - m) before it is
-# cast to fp8, so probabilities down to 2**-(9 + P_FP8_EXP) survive the cast
-# (e4m3's smallest subnormal is 2**-9) while the largest, 2**P_FP8_EXP, stays
-# under e4m3's 448. `l` sums the same scaled P, so the factor cancels in acc / l.
-P_FP8_EXP = 8
+# Under `fp8_compute`, P is computed as exp(s - (m - P_FP8_SHIFT)), i.e. scaled
+# by about e**P_FP8_SHIFT, and cast to fp8; `l` sums the cast P, so acc / l
+# normalizes by exactly the weights PV applied. In bf16, m - 3.5 rounds to
+# between m - 4 and m for every m, so P <= e**4 < 448 (e4m3's max) whatever the
+# logits, while small P sit about e**3.5 above e4m3's subnormals. The rounding
+# depends on m, so the rescale between KV blocks uses the same shifted maxima.
+P_FP8_SHIFT = 3.5
 
 
 def flash_attention_qk_softmax(
@@ -95,20 +95,34 @@ def flash_attention_qk_softmax(
     alpha_list = []
     m_next_list = []
 
+    m_sub_list = []
     for b_idx in range(cfgs.block.batch_size):
         m_curr_b = m_curr[b_idx]
         m_next_b = jnp.maximum(m_prev, m_curr_b)
-        alpha_b = jnp.exp(m_prev - m_next_b)
+        if cfgs.serve.fp8_compute:
+            m_sub_b = m_next_b - P_FP8_SHIFT
+            alpha_b = jnp.exp((m_prev - P_FP8_SHIFT) - m_sub_b)
+        else:
+            m_sub_b = m_next_b
+            alpha_b = jnp.exp(m_prev - m_next_b)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
+        m_sub_list.append(m_sub_b)
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    m_sub = m_next
-    if cfgs.serve.fp8_compute:
-        m_sub = m_next - P_FP8_EXP * math.log(2.0)
+    m_sub = jnp.stack(m_sub_list, axis=0)
     p = jnp.exp(qk - utils.broadcast_minor(m_sub, qk.shape))
-    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
+    if cfgs.serve.fp8_compute:
+        p = p.astype(cfgs.serve.dtype_kv)
+        p_rowsum = jnp.sum(
+            p.astype(cfgs.serve.dtype_out),
+            axis=-1,
+            keepdims=True,
+            dtype=cfgs.serve.dtype_out,
+        )
+    else:
+        p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []
     for b_idx in range(cfgs.block.batch_size):
