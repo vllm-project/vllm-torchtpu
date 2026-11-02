@@ -1426,18 +1426,19 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
 
 
 def _configure_prefill_first_scheduler(vllm_config: VllmConfig) -> None:
-    """Install PrefillFirstScheduler when VLLM_TPU_SOLO_PREFILL_OVER_TOKENS is
-    set. Solo prefill steps are a layout the model's programs rely on, so a
-    different configured scheduler is an error rather than a warning."""
-    if not envs.VLLM_TPU_SOLO_PREFILL_OVER_TOKENS:
+    """Install PrefillFirstScheduler when one of its policies is set. Solo
+    prefill steps are a layout the model's programs rely on, so a different
+    configured scheduler is an error rather than a warning."""
+    if not (envs.VLLM_TPU_SOLO_PREFILL_OVER_TOKENS or envs.VLLM_TPU_DECODE_INTERVAL_MS):
         return
     from vllm_torchtpu.core.experimental.prefill_first_scheduler import SCHEDULER_CLS
 
     scheduler_config = vllm_config.scheduler_config
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         raise ValueError(
-            "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS needs PrefillFirstScheduler, but "
-            f"{scheduler_config.scheduler_cls} is configured."
+            "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS and VLLM_TPU_DECODE_INTERVAL_MS "
+            f"need PrefillFirstScheduler, but {scheduler_config.scheduler_cls} "
+            "is configured."
         )
     scheduler_config.scheduler_cls = SCHEDULER_CLS
     logger.info("Enabled PrefillFirstScheduler.")

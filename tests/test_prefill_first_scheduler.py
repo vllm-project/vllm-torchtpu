@@ -39,6 +39,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_torchtpu.core.experimental import prefill_first_scheduler
 from vllm_torchtpu.core.experimental.prefill_first_scheduler import (
     PrefillFirstScheduler,
 )
@@ -52,6 +53,18 @@ def shared_model_config():
     return ModelConfig(model=MODEL, dtype="float16", seed=42, max_model_len=2048)
 
 
+class _Clock:
+    def __init__(self, step_s: float) -> None:
+        self.now = 0.0
+        self.step_s = step_s
+
+    def __call__(self) -> float:
+        return self.now
+
+    def tick(self) -> None:
+        self.now += self.step_s
+
+
 def _build(
     model_config: ModelConfig,
     monkeypatch,
@@ -59,6 +72,7 @@ def _build(
     over_tokens: int = 0,
     max_consecutive: int = 0,
     decode_steps: int = 1,
+    decode_interval_ms: int = 0,
     num_blocks: int = 64,
     max_num_seqs: int = 8,
     max_num_batched_tokens: int = 128,
@@ -67,6 +81,7 @@ def _build(
     monkeypatch.setenv("VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", str(over_tokens))
     monkeypatch.setenv("VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE", str(max_consecutive))
     monkeypatch.setenv("VLLM_TPU_SOLO_PREFILL_DECODE_STEPS", str(decode_steps))
+    monkeypatch.setenv("VLLM_TPU_DECODE_INTERVAL_MS", str(decode_interval_ms))
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=max_num_seqs,
@@ -258,6 +273,81 @@ def test_rejects_a_threshold_at_the_step_budget(shared_model_config, monkeypatch
         _build(shared_model_config, monkeypatch, over_tokens=128)
 
 
+def test_needs_a_policy(shared_model_config, monkeypatch):
+    with pytest.raises(ValueError, match="needs"):
+        _build(shared_model_config, monkeypatch)
+
+
+def test_decodes_are_paced_while_a_prefill_is_pending(shared_model_config, monkeypatch):
+    clock = _Clock(step_s=0.010)
+    monkeypatch.setattr(prefill_first_scheduler, "monotonic", clock)
+    scheduler, hasher = _build(
+        shared_model_config,
+        monkeypatch,
+        decode_interval_ms=30,
+        max_num_batched_tokens=32,
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    steps = []
+    for i in range(9):
+        if i == 1:
+            _add(scheduler, hasher, ("long", 160, 2))
+        steps.append(scheduler.schedule().num_scheduled_tokens)
+        clock.tick()
+    assert steps == [
+        {"d": 16},
+        # First step with a prefill pending: due; the next is 30 ms later.
+        {"d": 1, "long": 31},
+        {"long": 32},
+        {"d": 1, "long": 31},
+        {"long": 32},
+        {"long": 32},
+        {"d": 1, "long": 2},
+        # Nothing left to prefill: decodes every step.
+        {"d": 1, "long": 1},
+        {"d": 1, "long": 1},
+    ]
+
+
+def test_decodes_are_not_paused_for_a_prompt_that_does_not_fit(
+    shared_model_config, monkeypatch
+):
+    clock = _Clock(step_s=0.010)
+    monkeypatch.setattr(prefill_first_scheduler, "monotonic", clock)
+    # Three usable blocks: the 64-token prompt needs four.
+    scheduler, hasher = _build(
+        shared_model_config, monkeypatch, decode_interval_ms=30, num_blocks=4
+    )
+    _add(scheduler, hasher, ("d", 16, 1))
+    scheduler.schedule()
+    _add(scheduler, hasher, ("w", 64, 2))
+    for _ in range(3):
+        clock.tick()
+        assert scheduler.schedule().num_scheduled_tokens == {"d": 1}
+
+
+def test_paused_step_that_schedules_nothing_forces_decodes(
+    shared_model_config, monkeypatch
+):
+    clock = _Clock(step_s=0.010)
+    monkeypatch.setattr(prefill_first_scheduler, "monotonic", clock)
+    scheduler, hasher = _build(
+        shared_model_config, monkeypatch, decode_interval_ms=30, num_blocks=4
+    )
+    # The pending-prefill check expects the prompt to fit; admission refuses.
+    monkeypatch.setattr(scheduler, "_fits", lambda request, num_tokens: True)
+    _add(scheduler, hasher, ("d", 16, 1))
+    steps = []
+    for i in range(4):
+        if i == 1:
+            _add(scheduler, hasher, ("w", 64, 2))
+        steps.append(scheduler.schedule().num_scheduled_tokens)
+        clock.tick()
+    # The third step paused the decode and scheduled nothing, so the fourth
+    # decodes before the pacing due time.
+    assert steps == [{"d": 16}, {"d": 1}, {}, {"d": 1}]
+
+
 def test_resent_requests_carry_only_their_output_tokens(
     shared_model_config, monkeypatch
 ):
@@ -275,22 +365,32 @@ def test_resent_requests_carry_only_their_output_tokens(
     assert cached.all_token_ids["a"] == list(request.all_token_ids)[-num_output_tokens:]
 
 
-@pytest.mark.parametrize(("max_consecutive", "num_blocks"), [(0, 64), (1, 40)])
+@pytest.mark.parametrize(
+    ("over_tokens", "max_consecutive", "decode_interval_ms", "num_blocks"),
+    [(32, 0, 0, 64), (32, 1, 30, 40), (0, 0, 30, 24)],
+)
 def test_random_workload_keeps_step_shapes_and_finishes(
-    shared_model_config, monkeypatch, max_consecutive, num_blocks
+    shared_model_config,
+    monkeypatch,
+    over_tokens,
+    max_consecutive,
+    decode_interval_ms,
+    num_blocks,
 ):
     """Async steps (one in flight) over random arrivals: every step is solo or
     within the threshold, and every request finishes."""
     rng = random.Random(0)
-    over_tokens = 32
+    clock = _Clock(step_s=0.010)
+    monkeypatch.setattr(prefill_first_scheduler, "monotonic", clock)
     scheduler, hasher = _build(
         shared_model_config,
         monkeypatch,
         over_tokens=over_tokens,
         max_consecutive=max_consecutive,
+        decode_interval_ms=decode_interval_ms,
         num_blocks=num_blocks,
         max_num_seqs=6,
-        max_num_batched_tokens=256,
+        max_num_batched_tokens=256 if over_tokens else 48,
     )
     in_flight: deque = deque()
     num_added = 0
@@ -305,12 +405,12 @@ def test_random_workload_keeps_step_shapes_and_finishes(
         fresh = {r.request_id for r in scheduler.waiting if not r.num_computed_tokens}
         out = scheduler.schedule()
         scheduled = out.num_scheduled_tokens
-        solo = [r for r, n in scheduled.items() if n > over_tokens]
+        solo = [r for r, n in scheduled.items() if over_tokens and n > over_tokens]
         if solo:
             assert len(scheduled) == 1
             assert solo[0] in fresh
             assert scheduled[solo[0]] == scheduler.requests[solo[0]].num_tokens
-        else:
+        elif over_tokens:
             assert out.total_num_scheduled_tokens <= over_tokens
         req_ids = list(scheduled)
         in_flight.append(
@@ -331,6 +431,7 @@ def test_random_workload_keeps_step_shapes_and_finishes(
         )
         if len(in_flight) == 2 or not scheduled:
             scheduler.update_from_output(*in_flight.popleft())
+        clock.tick()
     while in_flight:
         scheduler.update_from_output(*in_flight.popleft())
     assert num_added > 20

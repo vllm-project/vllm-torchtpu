@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prefill each long prompt whole, in a step of its own.
+"""Two prefill-first policies that trade running requests' TPOT for TTFT.
 
-A context-parallel prefill program takes a step that holds one request's whole
-prompt, with no cached context and no other request, while every other step
-runs the regular programs. With ``VLLM_TPU_SOLO_PREFILL_OVER_TOKENS=N`` every
-step this scheduler makes has one of two shapes:
+Solo prefill (``VLLM_TPU_SOLO_PREFILL_OVER_TOKENS=N > 0``). A context-parallel
+prefill program takes a step that holds one request's whole prompt, with no
+cached context and no other request, while every other step runs the regular
+programs. Every step then has one of two shapes:
 
 * solo: one waiting request with more than ``N`` tokens to compute, none
   computed yet and no encoder inputs, scheduled whole and alone. It skips the
@@ -36,13 +36,20 @@ as waiting for a grammar) during a regular step's admission pass.
 A solo step stalls every running request for a whole prefill. While requests
 run, at most ``VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE`` solo steps (0: no limit)
 run in a row, then ``VLLM_TPU_SOLO_PREFILL_DECODE_STEPS`` regular steps that
-schedule tokens run before the next one: waiting requests' TTFT traded for
-running requests' TPOT.
+schedule tokens run before the next one.
+
+Decode pacing (``VLLM_TPU_DECODE_INTERVAL_MS=T > 0``). While a regular step has
+a prefill to schedule (a running prefill chunk, or a waiting request it may
+admit), the running requests' decode tokens run on average once per ``T``
+milliseconds, in the steps that start at or after each due time, instead of in
+every step; the other steps carry only prefill. With a closed-loop client,
+TTFT + output_len * TPOT is the time between a user's requests, so raising TPOT
+toward its limit lowers TTFT at the same throughput.
 
 Requests that sit a step out are resent with only the output tokens the model
 runner reads (see ``_make_cached_request_data``).
 
-The platform installs this scheduler when that variable is set;
+The platform installs this scheduler when either policy is set;
 ``--scheduler-cls
 vllm_torchtpu.core.experimental.prefill_first_scheduler.PrefillFirstScheduler``
 selects it too.
@@ -50,6 +57,8 @@ selects it too.
 
 import contextlib
 from collections.abc import Iterator
+from itertools import chain
+from time import monotonic
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
@@ -67,14 +76,19 @@ SCHEDULER_CLS = (
 
 
 class PrefillFirstScheduler(AsyncScheduler):
-    """Schedule each long prompt whole and alone; keep every other step at
-    most ``VLLM_TPU_SOLO_PREFILL_OVER_TOKENS`` tokens."""
+    """Solo whole-prompt prefill steps and decode pacing (module docstring)."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.solo_over_tokens = envs.VLLM_TPU_SOLO_PREFILL_OVER_TOKENS
         self.solo_max_consecutive = envs.VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE
         self.solo_decode_steps = envs.VLLM_TPU_SOLO_PREFILL_DECODE_STEPS
+        self.decode_interval = envs.VLLM_TPU_DECODE_INTERVAL_MS / 1000
+        if not (self.solo_over_tokens or self.decode_interval):
+            raise ValueError(
+                "PrefillFirstScheduler needs VLLM_TPU_SOLO_PREFILL_OVER_TOKENS or "
+                "VLLM_TPU_DECODE_INTERVAL_MS."
+            )
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         # The longest prompt one step can hold whole.
@@ -82,28 +96,36 @@ class PrefillFirstScheduler(AsyncScheduler):
             self.max_num_scheduled_tokens,
             self.scheduler_config.max_num_batched_tokens - draft_slots,
         )
-        self._check_solo_config()
+        if self.solo_over_tokens:
+            self._check_solo_config()
         # Solo steps since the last run of `solo_decode_steps` regular steps,
         # and regular steps that scheduled tokens since the last solo step.
         self._solo_run = 0
         self._regular_run = 0
         # Set when a solo step admitted nothing, so the next step is regular.
         self._skip_solo = False
+        # When the paced decodes are due next, and whether the next regular
+        # step must run them (its predecessor paused them and scheduled
+        # nothing).
+        self._decode_due = 0.0
+        self._force_decode = False
         logger.info(
             "PrefillFirstScheduler active (solo_over_tokens=%d, "
-            "max_solo_tokens=%d, solo_max_consecutive=%d, solo_decode_steps=%d)",
+            "max_solo_tokens=%d, solo_max_consecutive=%d, solo_decode_steps=%d, "
+            "decode_interval_ms=%g)",
             self.solo_over_tokens,
             self.max_solo_tokens,
             self.solo_max_consecutive,
             self.solo_decode_steps,
+            self.decode_interval * 1000,
         )
 
     def _check_solo_config(self) -> None:
-        if not 0 < self.solo_over_tokens < self.max_solo_tokens:
+        if self.solo_over_tokens >= self.max_solo_tokens:
             raise ValueError(
                 f"VLLM_TPU_SOLO_PREFILL_OVER_TOKENS ({self.solo_over_tokens}) must "
-                f"be positive and below the step budget ({self.max_solo_tokens}); "
-                "raise --max-num-batched-tokens to the longest prompt served."
+                f"be below the step budget ({self.max_solo_tokens}); raise "
+                "--max-num-batched-tokens to the longest prompt served."
             )
         if self.solo_max_consecutive and self.solo_decode_steps < 1:
             raise ValueError(
@@ -127,7 +149,7 @@ class PrefillFirstScheduler(AsyncScheduler):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         request = None
-        if not throttle_prefills and not self._skip_solo:
+        if self.solo_over_tokens and not throttle_prefills and not self._skip_solo:
             request = self._solo_candidate()
         self._skip_solo = False
         if request is not None:
@@ -145,7 +167,8 @@ class PrefillFirstScheduler(AsyncScheduler):
 
     def _takes_solo_step(self, request: Request) -> bool:
         return (
-            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            self.solo_over_tokens > 0
+            and request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
             and request.num_computed_tokens == 0
             and self.solo_over_tokens < request.num_tokens <= self.max_solo_tokens
             and not request.has_encoder_inputs
@@ -214,13 +237,68 @@ class PrefillFirstScheduler(AsyncScheduler):
 
     def _schedule_regular(self, throttle_prefills: bool) -> SchedulerOutput:
         solo = [r for r in self.waiting if self._takes_solo_step(r)]
+        paused = self._paused_decodes()
         budget = self.max_num_scheduled_tokens
-        self.max_num_scheduled_tokens = min(budget, self.solo_over_tokens)
+        if self.solo_over_tokens:
+            self.max_num_scheduled_tokens = min(budget, self.solo_over_tokens)
         try:
-            with self._hidden_waiting(solo):
-                return super().schedule(throttle_prefills)
+            with self._hidden_waiting(solo), self._hidden_running(paused):
+                output = super().schedule(throttle_prefills)
         finally:
             self.max_num_scheduled_tokens = budget
+        if paused and not output.total_num_scheduled_tokens:
+            self._force_decode = True
+        return output
+
+    def _paused_decodes(self) -> list[Request]:
+        """The running decodes that sit this regular step out for pacing."""
+        if not self.decode_interval:
+            return []
+        decodes = [r for r in self.running if not r.is_prefill_chunk]
+        if not decodes:
+            return []
+        now = monotonic()
+        if self._force_decode or not self._prefill_pending():
+            # Pacing restarts one interval after the last decode step.
+            self._force_decode = False
+            self._decode_due = now + self.decode_interval
+            return []
+        if now >= self._decode_due:
+            # Keep the average interval: the next due time follows this one.
+            self._decode_due = max(self._decode_due + self.decode_interval, now)
+            return []
+        return decodes
+
+    def _prefill_pending(self) -> bool:
+        """Whether a regular step has a prefill to schedule: a running prefill
+        chunk, or a waiting request it admits (the first one ready, whose
+        first chunk, or whole prompt under full-ISL reservation, fits)."""
+        if any(r.is_prefill_chunk for r in self.running):
+            return True
+        if self._pause_state == PauseState.PAUSED_ALL:
+            return False
+        num_active = len(self.running) + self.num_waiting_for_streaming_input
+        if num_active >= self.max_num_active_reqs:
+            return False
+        queues = [self.kv_holding_waiting]
+        if self._pause_state == PauseState.UNPAUSED:
+            queues.append(self.waiting)
+        budget = self.max_num_scheduled_tokens
+        if self.solo_over_tokens:
+            budget = min(budget, self.solo_over_tokens)
+        for r in chain(*queues):
+            if (
+                self._is_blocked_waiting_status(r.status)
+                or (r.num_stale_output_tokens and not r.drop_stale_output)
+                or self._takes_solo_step(r)
+            ):
+                continue
+            if r.num_computed_tokens:
+                return True
+            if self.scheduler_reserve_full_isl:
+                return self._fits(r, r.num_tokens)
+            return self._fits(r, min(r.num_tokens, budget))
+        return False
 
     @contextlib.contextmanager
     def _hidden_waiting(self, hidden: list[Request]) -> Iterator[None]:
@@ -279,7 +357,7 @@ class PrefillFirstScheduler(AsyncScheduler):
             return data
         # A request that sat the last step out is resent with all its token
         # ids, of which GPUModelRunner._update_states reads the last
-        # num_output_tokens. Solo steps make such steps routine, and an
+        # num_output_tokens. Both policies make such steps routine, and an
         # 80K-token prompt costs milliseconds to serialize and decode per
         # request and step.
         for req_id, num_output_tokens in zip(data.req_ids, data.num_output_tokens):

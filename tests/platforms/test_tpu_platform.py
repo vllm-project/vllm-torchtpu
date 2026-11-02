@@ -1129,15 +1129,16 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
 
 
 @pytest.mark.parametrize(
-    ("over_tokens", "initial_cls", "expected_cls"),
+    ("over_tokens", "interval_ms", "initial_cls", "expected_cls"),
     [
-        (0, None, None),
-        (16384, None, "PrefillFirstScheduler"),
-        (16384, "PrefillFirstScheduler", "PrefillFirstScheduler"),
+        (0, 0, None, None),
+        (16384, 0, None, "PrefillFirstScheduler"),
+        (0, 40, None, "PrefillFirstScheduler"),
+        (16384, 0, "PrefillFirstScheduler", "PrefillFirstScheduler"),
     ],
 )
 def test_prefill_first_scheduler_is_installed_by_its_flags(
-    monkeypatch, over_tokens, initial_cls, expected_cls
+    monkeypatch, over_tokens, interval_ms, initial_cls, expected_cls
 ):
     from vllm_torchtpu.core.experimental.prefill_first_scheduler import (
         SCHEDULER_CLS,
@@ -1149,6 +1150,7 @@ def test_prefill_first_scheduler_is_installed_by_its_flags(
     monkeypatch.setattr(
         tpu_platform.envs, "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", over_tokens
     )
+    monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_DECODE_INTERVAL_MS", interval_ms)
     vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(scheduler_cls=resolve(initial_cls))
     )
@@ -1166,7 +1168,7 @@ def test_prefill_first_flags_refuse_another_scheduler(monkeypatch):
         )
     )
 
-    with pytest.raises(ValueError, match="needs PrefillFirstScheduler"):
+    with pytest.raises(ValueError, match="need PrefillFirstScheduler"):
         tpu_platform._configure_prefill_first_scheduler(vllm_config)
 
 
