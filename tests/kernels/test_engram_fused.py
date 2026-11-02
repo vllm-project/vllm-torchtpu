@@ -69,7 +69,7 @@ def reference_gate(hidden, projection, q, k, mask):
     return (h + gate[..., None] * values[:, None, :]).astype(hidden.dtype)
 
 
-def test_streamwise_gate_matches_the_original_gate():
+def test_gate_matches_the_original_gate():
     packed, hidden, weight, scale, q, k, mask = inputs(32)
     projection = xla_quantized_matmul(
         dequantize_rows(
@@ -100,8 +100,22 @@ def test_fused_engram_matches_unfused_reference(tokens):
     assert np.isfinite(actual).all()
 
 
+def test_n_tiles_preserve_projection_column_order():
+    data = inputs(32, width=256, dim=512)
+    actual = jax.jit(
+        functools.partial(fused_engram, eps=1e-20, clamp_value=1e-6, interpret=True)
+    )(*data)
+    expected = jax.jit(reference)(*data)
+    np.testing.assert_allclose(
+        np.asarray(actual.astype(jnp.float32)),
+        np.asarray(expected.astype(jnp.float32)),
+        atol=0.02,
+        rtol=0.01,
+    )
+
+
 def test_decode_tile_reads_the_weight_once():
-    assert get_block_sizes(288, 6144, 4, 5120) == (288, 256)
+    assert get_block_sizes(288, 6144, 4, 5120) == (288, 256, 256)
 
 
 def test_packed_rows_keep_raw_and_scale_regions_separate():
