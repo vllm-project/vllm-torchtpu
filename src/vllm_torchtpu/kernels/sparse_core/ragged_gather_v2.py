@@ -209,6 +209,28 @@ def main_kernel_v2(
     )(indices_hbm_ref)
 
 
+def choose_num_row_subchunks(out_size: int, base_block_size: int) -> int:
+    """Rows each subcore gathers per DMA round, in units of SIMD-lane rows.
+
+    The output is padded to a multiple of ``base_block_size * subchunks``.
+    Small (decode) outputs of at most 8 base blocks use a single subchunk, so
+    they are never padded past the next base block (e.g. 3072 rows = 6 blocks
+    of 512 would otherwise be padded to 4096). Larger outputs use up to 4
+    subchunks, halved until they divide an exact multiple of base blocks.
+    """
+    num_base_blocks = (out_size + base_block_size - 1) // base_block_size
+    if num_base_blocks <= 8:
+        return 1
+    num_row_subchunks = min(4, num_base_blocks)
+    while (
+        num_row_subchunks > 1
+        and out_size % base_block_size == 0
+        and (out_size // base_block_size) % num_row_subchunks != 0
+    ):
+        num_row_subchunks //= 2
+    return num_row_subchunks
+
+
 @jax.jit
 def ragged_gather_v2(
     x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
@@ -244,17 +266,15 @@ def ragged_gather_v2(
     num_cores = sc_info.num_cores * sc_info.num_subcores
     base_block_size = num_simd_lanes * num_cores
 
-    # Calculate ideal num_row_subchunks to avoid too much padding overhead.
-    num_row_subchunks = max(
-        1, min(4, (out_size + base_block_size - 1) // base_block_size)
-    )
+    num_row_subchunks = choose_num_row_subchunks(out_size, base_block_size)
 
     row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
 
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+    if out_pad_size > 0:
+        indices = jnp.pad(indices, ((0, out_pad_size)))
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -262,7 +282,7 @@ def ragged_gather_v2(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    return core_map_helper.kernel(
+    out = core_map_helper.kernel(
         functools.partial(
             main_kernel_v2,
             core_axis_name=vector_mesh.core_axis_name,
@@ -284,4 +304,7 @@ def ragged_gather_v2(
         ],
         mesh=vector_mesh,
         name="sc_ragged_gather_v2",
-    )(start, end, x, indices)[:out_size, :hidden_size]
+    )(start, end, x, indices)
+    if out_pad_size == 0 and aligned_hidden_size == hidden_size:
+        return out
+    return out[:out_size, :hidden_size]
