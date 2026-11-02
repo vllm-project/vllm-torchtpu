@@ -531,6 +531,15 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
             pltpu.reset_tpu_interpret_mode_state()
 
 
+class GDNL2NormTest(parameterized.TestCase):
+    def test_l2_norm_bf16_accumulates_in_fp32(self):
+        x = (jax.random.normal(jax.random.key(0), (32, 256)) * 5.0).astype(jnp.bfloat16)
+        out = compute_gdn.l2_norm(x)
+        ref = compute_gdn.l2_norm(x.astype(jnp.float32))
+        self.assertEqual(out.dtype, jnp.bfloat16)
+        np.testing.assert_array_equal(out, ref.astype(jnp.bfloat16))
+
+
 class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
     """CPU checks for single-token decode [k, q] projection fusion."""
 
@@ -1238,6 +1247,55 @@ class GDNAttentionTest(parameterized.TestCase):
         # reference; Step B (continuation) must match the second half.
         np.testing.assert_allclose(output_a, output_ref[:half], rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(output_b, output_ref[half:], rtol=2e-2, atol=2e-2)
+
+    def test_kernel_storage_dtypes_match_reference(self):
+        """Storage dtype overrides match the float32 eager reference."""
+        d_k, d_v, n_kq, n_v, kernel_size = 128, 128, 2, 8, 4
+        lengths = [1] * 8 + [128, 128, 256]
+        max_reqs = len(lengths)
+        num_tokens = sum(lengths)
+        dim = 2 * n_kq * d_k + n_v * d_v
+        num_blocks = max_reqs + 1
+
+        rngs = iter(jax.random.split(jax.random.key(5), 10))
+        q_loc = jnp.array(np.cumsum([0] + lengths), dtype=jnp.int32)
+        kwargs = dict(
+            qkv=jax.random.normal(next(rngs), (num_tokens, dim)),
+            b=jax.random.normal(next(rngs), (num_tokens, n_v)),
+            a=jax.random.normal(next(rngs), (num_tokens, n_v)),
+            states=(
+                jax.random.normal(next(rngs), (num_blocks, kernel_size - 1, dim)) * 0.5,
+                jax.random.normal(next(rngs), (num_blocks, n_v, d_k, d_v)) * 0.1,
+            ),
+            conv_weight=jax.random.normal(next(rngs), (dim, 1, kernel_size)),
+            conv_bias=jax.random.normal(next(rngs), (dim,)),
+            a_log=jax.random.normal(next(rngs), (n_v,)),
+            dt_bias=jax.random.normal(next(rngs), (n_v,)),
+            query_start_loc=q_loc,
+            state_indices=jnp.arange(1, max_reqs + 1, dtype=jnp.int32),
+            distribution=jnp.array([8, max_reqs, max_reqs], jnp.int32),
+            seq_lens=(q_loc[1:] - q_loc[:-1] + 16).astype(jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+
+        with self.assertRaisesRegex(ValueError, "kernel_act_dtype"):
+            wrapper.fused_conv1d_gdn(
+                **kwargs,
+                kernel_act_dtype=jnp.dtype(jnp.bfloat16),
+            )
+
+        states_ref, output_ref = gdn_attention_ref(**kwargs)
+        states, output = wrapper.fused_conv1d_gdn(
+            **kwargs,
+            kernel_conv_weight_dtype=jnp.dtype(jnp.bfloat16),
+        )
+        np.testing.assert_allclose(output, output_ref, rtol=2e-2, atol=2e-2)
+        for state, state_ref in zip(states, states_ref, strict=True):
+            np.testing.assert_allclose(state, state_ref, rtol=2e-2, atol=2e-2)
 
     def test_dynamic_tiling_with_mixed_and_decode_parity(self):
         """Verifies dynamic tiling matches static output and state."""
