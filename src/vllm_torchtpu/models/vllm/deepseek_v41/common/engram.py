@@ -838,12 +838,12 @@ class Engram(upstream.Engram):
         return local.transpose(0, 1).flatten(1, 2)[:, :cols]
 
     def _uses_fused_offload(self, hidden_states: torch.Tensor) -> bool:
-        # This measured scope is TP1's decode verify bucket. Other buckets and
-        # sharded tables keep their existing lookup/communication contract.
+        # Select token buckets in JAX after Torch's dynamic graph is traced.
+        # Only the static TP1 packed table/weight contract is checked here.
         return (
             hidden_states.device.type == "tpu"
             and hidden_states.dtype == torch.bfloat16
-            and hidden_states.shape == (288, 4, 5120)
+            and hidden_states.shape[1:] == (4, 5120)
             and self.embed_tokens.host_offload
             and self.embed_tokens.dp_size == 1
             and self.embed_tokens.tp_size == 1

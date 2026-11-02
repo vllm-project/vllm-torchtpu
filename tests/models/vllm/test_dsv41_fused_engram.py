@@ -91,9 +91,49 @@ def test_both_engram_layers_bind_their_own_inputs():
     assert calls[1][0][0] == 14
 
 
-@pytest.mark.parametrize("tokens", [1, 128, 256, 2048])
-def test_other_buckets_keep_the_original_path(tokens):
-    assert not methods()._uses_fused_offload(owner(1), hidden(tokens))
+@pytest.mark.parametrize("tokens", [1, 128, 256, 288, 2048])
+def test_torch_dispatch_does_not_specialize_the_token_dimension(tokens):
+    assert methods()._uses_fused_offload(owner(1), hidden(tokens))
+
+
+def test_jax_bridge_keeps_other_buckets_on_the_unfused_computation():
+    path = SOURCE.parents[4] / "kernels/engram/vllm_adapter.py"
+    tree = ast.parse(path.read_text())
+    bridge = next(n for n in tree.body if getattr(n, "name", None) == "_engram_jax")
+    bridge = ast.FunctionDef(
+        name=bridge.name,
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg=x.arg) for x in bridge.args.args],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+        body=bridge.body,
+        decorator_list=[],
+    )
+    calls = []
+    namespace = dict(
+        fused_engram=lambda *args: calls.append("fused") or args[1],
+        dequantize_rows=lambda *args: args[0],
+        xla_quantized_matmul=lambda *args: args[0],
+        gated_residual=lambda *args: calls.append("unfused") or args[0],
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[bridge], type_ignores=[])),
+            str(path),
+            "exec",
+        ),
+        namespace,
+    )
+    for tokens in (128, 288, 2048):
+        h = torch.empty((tokens, 4, 5120), device="meta")
+        packed = torch.empty((tokens * 1584,), device="meta")
+        namespace["_engram_jax"](
+            packed, h, owner(1).wkv.weight, None, None, None, None, 1e-20, 1e-6
+        )
+    assert calls == ["unfused", "fused", "unfused"]
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,12 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.engram.kernel import fused_engram
+from vllm_torchtpu.kernels.engram.kernel import (
+    dequantize_rows,
+    fused_engram,
+    gated_residual,
+)
+from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 
 def _engram_jax(
@@ -19,7 +24,18 @@ def _engram_jax(
     eps: float,
     clamp: float,
 ) -> jax.Array:
-    return fused_engram(packed, hidden, weight, scale, query, key, mask, eps, clamp)
+    if hidden.shape[0] == 288:
+        return fused_engram(packed, hidden, weight, scale, query, key, mask, eps, clamp)
+    tokens, width = hidden.shape[0], weight.shape[0]
+    if not tokens:
+        return hidden
+    raw_end = tokens * width // 4
+    embedded = dequantize_rows(
+        packed[:raw_end].reshape(tokens, width // 4),
+        packed[raw_end:].reshape(tokens, width // 128),
+    )
+    projected = xla_quantized_matmul(embedded, weight, scale)
+    return gated_residual(hidden, projected, query, key, mask, eps, clamp)
 
 
 _op = pallas.jax_op("pallas::engram_offload_fused", _engram_jax)
