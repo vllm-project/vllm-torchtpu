@@ -305,6 +305,8 @@ if TYPE_CHECKING:
     TPU_SAMPLER_GRAPH_RNG: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
+    TPU_MOE_PREFILL_SP_FP8_WIRE: bool = False
+    TPU_DCP_PREFILL_FUSED_SUBBATCH: bool = False
 
 
 def env_with_choices(
@@ -2113,6 +2115,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
         "TPU_FP8_LINEAR_PALLAS_SITES",
         "q_b_proj,self_attn.o_proj,mlp.gate_up_proj",
+    ),
+    # With TPU_MOE_PREFILL_SEQUENCE_PARALLEL: dispatch tokens across the EP
+    # mesh in fp8 (wire_dtype=None) instead of bfloat16, halving dispatch wire
+    # bytes across all MoE layers.
+    "TPU_MOE_PREFILL_SP_FP8_WIRE": env_bool(
+        "TPU_MOE_PREFILL_SP_FP8_WIRE", default=False
+    ),
+    # With TPU_DCP_PREFILL_TOKEN_PARALLEL: write all T KV / index-K rows once
+    # up front and run the leading DCP sub-batch and token-parallel tail inside
+    # one unified JAX op without duplicate KV scatters or serialization barrier.
+    "TPU_DCP_PREFILL_FUSED_SUBBATCH": env_bool(
+        "TPU_DCP_PREFILL_FUSED_SUBBATCH", default=False
     ),
 }
 

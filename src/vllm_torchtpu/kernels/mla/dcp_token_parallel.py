@@ -329,13 +329,34 @@ def gather_latent(
     it reads each cache in the layout the SparseCore cache kernels use). The
     pages move flat, so a linear-layout read stays linear up to the kernel."""
 
-    def gather(cache: jax.Array, read: ReadPagesFn) -> jax.Array:
-        local = read(cache, page_ids).reshape(-1)
-        return lax.all_gather(local, axis_name, tiled=True).reshape(
-            -1, *cache.shape[1:]
+    local_nope = read_pages[0](nope_cache, page_ids)
+    local_rope = read_pages[1](rope_cache, page_ids)
+    if (
+        local_nope.dtype == local_rope.dtype
+        and local_nope.ndim == 3
+        and local_rope.ndim == 3
+        and local_nope.shape[0] == local_rope.shape[0]
+        and local_nope.shape[2] == local_rope.shape[2]
+        and local_nope.shape[1] % 8 == 0
+        and local_rope.shape[1] % 8 == 0
+    ):
+        n_rows = local_nope.shape[1]
+        both = jnp.concatenate([local_nope, local_rope], axis=1)
+        g_both = lax.all_gather(both, axis_name, axis=0, tiled=True)
+        return (
+            g_both[:, :n_rows, :].reshape(-1, *nope_cache.shape[1:]),
+            g_both[:, n_rows:, :].reshape(-1, *rope_cache.shape[1:]),
         )
 
-    return gather(nope_cache, read_pages[0]), gather(rope_cache, read_pages[1])
+    def gather(local: jax.Array, tail_shape: tuple[int, ...]) -> jax.Array:
+        return lax.all_gather(local.reshape(-1), axis_name, tiled=True).reshape(
+            -1, *tail_shape
+        )
+
+    return (
+        gather(local_nope, nope_cache.shape[1:]),
+        gather(local_rope, rope_cache.shape[1:]),
+    )
 
 
 def restride_flat_rows(
@@ -440,12 +461,13 @@ def sparse_mla_attention(
     query_start_loc: jax.Array,
     request_distribution: jax.Array,
     *,
-    write_kv: WriteKVFn,
-    attend: AttendFn,
+    write_kv: WriteKVFn | None,
+    attend: Callable[..., jax.Array],
     rank_ids: jax.Array | None = None,
     q_own_rows: bool = False,
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     w_uv: jax.Array | None = None,
+    q_pe: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Token-parallel sparse MLA for one layer (global view).
 
@@ -472,16 +494,30 @@ def sparse_mla_attention(
     rep = P()
 
     def _local(nope, rope, q, kv_c, k_pe, topk, seq_lens, bt, qsl, dist, *extra_args):
-        if w_uv is not None:
-            rank_ids, w_uv_local = extra_args[:-1], extra_args[-1]
-        else:
-            rank_ids = extra_args
-            w_uv_local = None
-        rank = _rank(rank_ids, axis_name, dcp)
-        nope, rope = write_kv(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank)
+        idx = 0
+        q_pe_local = None
+        if q_pe is not None:
+            q_pe_local = extra_args[idx]
+            idx += 1
+        n_rank = 1 if rank_ids is not None else 0
+        rank_arg = extra_args[idx : idx + n_rank]
+        idx += n_rank
+        w_uv_local = extra_args[idx] if w_uv is not None else None
+        rank = _rank(rank_arg, axis_name, dcp)
+        if write_kv is not None:
+            nope, rope = write_kv(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank)
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
         page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
         q_tok = q if q_own_rows else heads_to_tokens(layout, q, axis_name)
+        q_pe_tok = (
+            None
+            if q_pe_local is None
+            else (
+                q_pe_local
+                if q_own_rows
+                else heads_to_tokens(layout, q_pe_local, axis_name)
+            )
+        )
         rr = rank_rows(layout, rank, kv_c.shape[0], seq_lens, qsl, dist[2])
 
         # Gather and attend at the step's page count: the kernel reads a
@@ -492,6 +528,8 @@ def sparse_mla_attention(
                     nope, rope, page_ids[:cap], axis_name, read_pages
                 )
                 flat = restride_flat_rows(layout, topk, cap)
+                if q_pe_tok is not None:
+                    return attend(q_tok, g_nope, g_rope, flat, rr.num_rows, q_pe_tok)
                 return attend(q_tok, g_nope, g_rope, flat, rr.num_rows)
 
             return run
@@ -510,7 +548,11 @@ def sparse_mla_attention(
             )
         return nope, rope, tokens_to_heads(out, axis_name)
 
-    extra = () if rank_ids is None else (rank_ids,)
+    extra: tuple[jax.Array, ...] = ()
+    if q_pe is not None:
+        extra = (*extra, q_pe)
+    if rank_ids is not None:
+        extra = (*extra, rank_ids)
     if w_uv is not None:
         extra = (*extra, w_uv)
     return jax.shard_map(
@@ -570,7 +612,6 @@ def indexer_topk(
         rows = layout.rows_per_rank(num_tokens)
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
         page_ids = gather_page_ids(layout, bt, pages, offsets, cache.shape[0])
-        natural = gather_index_k(layout, cache, page_ids, jnp.sum(pages), axis_name)
         rr = rank_rows(layout, rank, num_tokens, seq_lens, qsl, dist[2])
         q_r, w_r = (
             (q, weights)
@@ -579,7 +620,27 @@ def indexer_topk(
         )
         vpages_per_seq = bt.shape[0] // seq_lens.shape[0]
         table = natural_page_table(layout, rr, offsets, vpages_per_seq)
-        positions = select_topk(q_r, w_r, natural, rr, table)
+        il, ps = layout.interleave_size, layout.page_size
+
+        def branch(cap: int) -> Callable[[], jax.Array]:
+            def run() -> jax.Array:
+                local = cache[page_ids[:cap]]
+                r_dim = local.shape[1]
+                words = lax.bitcast_convert_type(local.swapaxes(2, 3), jnp.uint32)
+                g = lax.all_gather(
+                    words.reshape(cap, r_dim, ps // il, il), axis_name, axis=3
+                )
+                g = g.reshape(cap, r_dim, dcp, ps).swapaxes(1, 2)
+                nat = (
+                    lax.bitcast_convert_type(g, jnp.uint8)
+                    .swapaxes(3, 4)
+                    .reshape(cap * dcp, *cache.shape[1:])
+                )
+                return select_topk(q_r, w_r, nat, rr, table)
+
+            return run
+
+        positions = _switch_on_cap(layout, jnp.sum(pages), branch)
         flat = flat_rows(layout, positions, offsets[row_requests(rr, rows)])
         real = jnp.arange(rows, dtype=jnp.int32) < rr.num_rows
         return jnp.where(real[:, None], flat, -1)

@@ -578,11 +578,10 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             mla.kimi_preprocess is not None
             or mla.q_lora_rank is None
             or mla.g_proj is not None
-            or getattr(mla, "qb_overlap", False)
         ):
             raise NotImplementedError(
                 "the split gathers fused_qkv_a outputs: it needs the q_lora MLA "
-                "path without fused preprocessing, g_proj or the q_b overlap"
+                "path without fused preprocessing or g_proj"
             )
         mlp = layer.mlp
         experts = mlp.experts.routed_experts

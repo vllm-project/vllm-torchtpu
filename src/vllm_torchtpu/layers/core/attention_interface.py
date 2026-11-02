@@ -1195,6 +1195,7 @@ def sparse_mla_attention_dcp(
     dcp_lane_ids: jax.Array | None = None,
     fused_merge: bool = False,
     merge_pieces: bool = True,
+    skip_kv_write: bool = False,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1398,7 +1399,8 @@ def sparse_mla_attention_dcp(
             dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
         decode_bucket = topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
         kv_in_gather = (
-            envs.TPU_MLA_KV_WRITE_IN_GATHER
+            not skip_kv_write
+            and envs.TPU_MLA_KV_WRITE_IN_GATHER
             and envs.TPU_DCP_MLA_MASK_IN_KERNEL
             and envs.TPU_DCP_MLA_FUSED_PREP
             and decode_bucket
@@ -1429,7 +1431,7 @@ def sparse_mla_attention_dcp(
                 _pack_lane_dense(kv_c_normed, nope_spec.token_bytes),
                 _pack_lane_dense(k_pe, rope_spec.token_bytes),
             )
-        else:
+        elif not skip_kv_write:
             kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
                 kv_cache_nope,
                 kv_cache_rope,

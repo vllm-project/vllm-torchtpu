@@ -756,7 +756,7 @@ def build_sequence_parallel_op(layer, topk: int, renormalize: bool, activation: 
         routed_scale,
         False,
         token_replica_groups=ep_token_replica_groups(is_sequence_parallel=True),
-        wire_dtype=jnp.bfloat16,
+        wire_dtype=None if envs.TPU_MOE_PREFILL_SP_FP8_WIRE else jnp.bfloat16,
     )
 
 

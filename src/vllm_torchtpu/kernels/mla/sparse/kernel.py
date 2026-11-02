@@ -4123,7 +4123,13 @@ def sparse_ragged_paged_attention(
             row_levers=(
                 decode_body_levers
                 if group_tab is None and fused_prep and decode_row_widths
-                else ()
+                else (
+                    mixed_body_levers
+                    if group_tab is None
+                    and not decode_row_widths
+                    and q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
+                    else ()
+                )
             ),
             q_rope_table=q_rope_table,
             lse_fill=lse_fill,
@@ -4652,8 +4658,16 @@ def sparse_attention_chunk(
             send_exchange=send_exchange,
             recv_in=send_recv_in is not None,
         )
-        if live_views is None and row_levers and row_widths and capped_windows:
-            # Decode body levers on the row-widths body.
+        if (
+            live_views is None
+            and row_levers
+            and (
+                (row_widths and capped_windows)
+                or (not row_widths and capped_windows is None)
+            )
+        ):
+            # Decode body levers on the row-widths body, or mixed body levers
+            # on the unsharded / token-parallel prefill body.
             kernel_body = functools.partial(kernel_body, body_levers=tuple(row_levers))
         if live_views is not None:
             group_body = functools.partial(

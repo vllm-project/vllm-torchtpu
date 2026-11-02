@@ -2272,7 +2272,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 # Lift the rank operand here too: the warmup hands buckets
                 # over only between traces that lift the same buffers.
                 hidden_states = _retain_buffers(hidden_states, tp_op.rank)
-            elif self.kimi_preprocess is not None or getattr(self, "qb_overlap", False):
+            elif self.kimi_preprocess is not None:
                 raise NotImplementedError(
                     "TPU_DCP_PREFILL_TOKEN_PARALLEL: no fused q preprocessing"
                 )
@@ -2280,7 +2280,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 q_rows = dcp_token_parallel_op.q_rows(tp_op, hidden_states.shape[0])
 
         indexer_qrows = None
-        if q_rows is not None and not getattr(self, "qb_overlap", False):
+        if q_rows is not None:
             idx = self.indexer if not self.skip_topk else None
             if idx is None or getattr(
                 getattr(idx.indexer_op, "topk_op_tp", None), "q_own_rows", False
@@ -2340,7 +2340,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     if indexer_qrows is not None:
                         q_c = q_c.index_select(0, indexer_qrows)
                 q_c = self.q_a_layernorm(q_c)
-                if getattr(self, "qb_overlap", False) and self.kimi_preprocess is None:
+                if (
+                    getattr(self, "qb_overlap", False)
+                    and self.kimi_preprocess is None
+                    and q_rows is None
+                    and pre_qkv is None
+                    and pre_qc_qrows is None
+                    and not dcp_token_parallel_op.applies(hidden_states.shape[0])
+                ):
                     # The indexer runs on q_c anyway; it returns q too.
                     assert self.indexer is not None
                     early_topk, q = self.indexer(
