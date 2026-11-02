@@ -1167,7 +1167,9 @@ def _max_node_tokens(ep: int, pcp: int = 1) -> int:
     if not isinstance(cap, int):
         return 0
     pcp = max(int(pcp), 1)
-    return int(cap) * max(ep // pcp, 1)
+    parallel_cfg = getattr(cfg, "parallel_config", None)
+    dp = max(int(getattr(parallel_cfg, "data_parallel_size", 1) or 1), 1)
+    return int(cap) * max(ep // pcp, dp * max(ep // pcp, 1))
 
 
 def _smem_capacity_bytes() -> int:
