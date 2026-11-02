@@ -112,13 +112,11 @@ def fused_engram(
     assert token_mask.shape == (tokens,), token_mask.shape
     assert hidden.dtype == jnp.bfloat16, hidden.dtype
     assert weight.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2), weight.dtype
-    tile_m, tile_k, tile_n = get_block_sizes(tokens, in_features, streams, dim)
+    tile_m, tile_k = get_block_sizes(tokens, in_features, streams, dim)
     vector_m = min(VECTOR_TILE_M, tile_m)
     assert tokens % tile_m == 0 and in_features % tile_k == 0
     assert tile_m % vector_m == 0
     steps = in_features // tile_k
-    assert dim % tile_n == 0
-    groups = (streams + 1) * (dim // tile_n)
     chunks = tile_m // vector_m
     buffer_count = min(2, chunks)
 
@@ -195,7 +193,7 @@ def fused_engram(
 
         @pl.when(step == 0)
         def reset_accumulator():
-            acc_scratch[...] = jnp.zeros((tile_m, tile_n), jnp.float32)
+            acc_scratch[...] = jnp.zeros((tile_m, dim), jnp.float32)
 
         x = x_scratch[:, pl.ds(step * tile_k, tile_k)]
         acc_scratch[...] += jnp.dot(x, w_ref[...], preferred_element_type=jnp.float32)
@@ -207,13 +205,13 @@ def fused_engram(
                 projection = (
                     acc_scratch[tile, :] * xs_scratch[tile, :] * ws_ref[...]
                 ).astype(hidden.dtype)
-                column = projection_index(output_block) * tile_n
-                projection_scratch[tile, pl.ds(column, tile_n)] = projection
+                group = jnp.where(output_block == 0, streams, output_block - 1)
+                projection_scratch[tile, pl.ds(group * dim, dim)] = projection
                 return unused
 
             jax.lax.fori_loop(0, chunks, finish_rows, None)
 
-            @pl.when(output_block == groups - 1)
+            @pl.when(output_block == streams)
             def apply_gates():
                 def gate_rows(chunk, unused):
                     bank = chunk % buffer_count
@@ -245,18 +243,17 @@ def fused_engram(
                     output_copy(chunk).wait()
 
     def projection_index(j):
-        per_stream = dim // tile_n
-        return jnp.where(j < per_stream, streams * per_stream + j, j - per_stream)
+        return jnp.where(j == 0, streams, j - 1)
 
     return pl.pallas_call(
         kernel,
-        grid=(tokens // tile_m, groups, steps),
+        grid=(tokens // tile_m, streams + 1, steps),
         in_specs=[
             pl.BlockSpec((tile_m, raw_words), lambda i, j, k: (i, 0)),
             pl.BlockSpec((tile_m, scale_words), lambda i, j, k: (i, 0)),
             pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec((tile_k, tile_n), lambda i, j, k: (k, projection_index(j))),
-            pl.BlockSpec((tile_n,), lambda i, j, k: (projection_index(j),)),
+            pl.BlockSpec((tile_k, dim), lambda i, j, k: (k, projection_index(j))),
+            pl.BlockSpec((dim,), lambda i, j, k: (projection_index(j),)),
             pl.BlockSpec((streams, dim), lambda i, j, k: (0, 0)),
             pl.BlockSpec((streams, dim), lambda i, j, k: (0, 0)),
             pl.BlockSpec((tile_m, 1), lambda i, j, k: (i, 0)),
@@ -266,7 +263,7 @@ def fused_engram(
         scratch_shapes=[
             pltpu.VMEM((tile_m, in_features), weight.dtype),
             pltpu.VMEM((tile_m, 1), jnp.float32),
-            pltpu.VMEM((tile_m, tile_n), jnp.float32),
+            pltpu.VMEM((tile_m, dim), jnp.float32),
             pltpu.VMEM((tile_m, out_features), hidden.dtype),
             pltpu.VMEM((buffer_count, vector_m, streams, dim), hidden.dtype),
             pltpu.VMEM((buffer_count, vector_m, streams, dim), hidden.dtype),

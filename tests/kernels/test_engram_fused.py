@@ -100,7 +100,7 @@ def test_fused_engram_matches_unfused_reference(tokens):
     assert np.isfinite(actual).all()
 
 
-def test_n_tiles_preserve_projection_column_order():
+def test_projection_preserves_stream_column_order():
     data = inputs(32, width=256, dim=512)
     actual = jax.jit(
         functools.partial(fused_engram, eps=1e-20, clamp_value=1e-6, interpret=True)
@@ -115,7 +115,7 @@ def test_n_tiles_preserve_projection_column_order():
 
 
 def test_decode_tile_reads_the_weight_once():
-    assert get_block_sizes(288, 6144, 4, 5120) == (288, 256, 256)
+    assert get_block_sizes(288, 6144, 4, 5120) == (288, 256)
 
 
 def test_packed_rows_keep_raw_and_scale_regions_separate():
