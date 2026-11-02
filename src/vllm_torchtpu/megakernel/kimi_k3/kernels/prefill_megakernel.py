@@ -3476,6 +3476,7 @@ def kda_prefill_tiled_body(
     tiles=None,
     block_tiles=None,
     projection=None,
+    weights_start=None,
 ):
     """Run one KDA layer, reading and writing tiled activations in HBM.
 
@@ -3496,6 +3497,8 @@ def kda_prefill_tiled_body(
     ``projection``: ``(weight_ref, weight_vmem, partial_ref, partial_bufs,
     partial_sems)``; also write each tile's BF16 output projection to
     ``partial_ref`` ``[T, hidden]``, the reduce-scatter's partial sums.
+    ``weights_start``: a condition under which the weight copies start (an
+    earlier grid step); ``first`` then only waits for them.
     Scratch refs follow ``kda_prefill_tiled_scratch_shapes``.
     """
     tokens, hidden = hidden_ref.shape
@@ -3537,10 +3540,17 @@ def kda_prefill_tiled_body(
         weight_ref, weight_vmem, partial_ref, partial_bufs, partial_sems = projection
         weight_copies += (pltpu.make_async_copy(weight_ref, weight_vmem, weight_sems.at[13]),)
 
+    if weights_start is not None:
+        @when(weights_start)
+        def start_weights():
+            for c in weight_copies:
+                c.start()
+
     @when(first)
     def load_weights():
-        for c in weight_copies:
-            c.start()
+        if weights_start is None:
+            for c in weight_copies:
+                c.start()
         for c in weight_copies:
             c.wait()
 
@@ -5621,11 +5631,13 @@ def _kda_layer_body(
         )
 
     @pl.when(phase < blocks)
+    @jax.named_scope("kl_gather")
     def gather():
         _half_gather_step(tables_ref, normalized_ref, gathered_ref, *gather_sems,
                           step=ring_step, block=phase)
 
     @pl.when(phase >= 2)
+    @jax.named_scope("kl_reduce")
     def reduce():
         _half_reduce_step(
             tables_ref, length_ref, partial_ref, prefix_ref, final_ref,
@@ -5655,6 +5667,7 @@ def _kda_layer_body(
         block_tiles=block_tiles,
         projection=(output_family_ref.at[slot], *projection_scratch[:1], partial_ref,
                     *projection_scratch[1:]),
+        weights_start=(step == 0) if _config().prefill_kda_early_weights else None,
     )
 
 

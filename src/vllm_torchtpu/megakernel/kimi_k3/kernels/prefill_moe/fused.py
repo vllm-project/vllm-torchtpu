@@ -237,17 +237,20 @@ def _dense_panels(lhs, weights, buffers, semaphores, *, columns):
     compiler can schedule that work alongside the MXU product.
     """
 
-    def source(panel):
-        return weights.at[:, pl.ds(panel * 256, 256)]
+    def copy(panel):
+        bank = panel % len(buffers)
+        return pltpu.make_async_copy(
+            weights.at[:, pl.ds(panel * 256, 256)], buffers[bank], semaphores[bank]
+        )
 
-    pltpu.make_async_copy(source(0), buffers[0], semaphores[0]).start()
-    for panel in range(columns // 256):
-        bank = panel % 2
-        pltpu.make_async_copy(source(panel), buffers[bank], semaphores[bank]).wait()
-        if panel + 1 < columns // 256:
-            pltpu.make_async_copy(
-                source(panel + 1), buffers[1 - bank], semaphores[1 - bank]
-            ).start()
+    panels = columns // 256
+    for panel in range(min(len(buffers) - 1, panels)):
+        copy(panel).start()
+    for panel in range(panels):
+        bank = panel % len(buffers)
+        copy(panel).wait()
+        if panel + len(buffers) - 1 < panels:
+            copy(panel + len(buffers) - 1).start()
         yield (
             panel * 256,
             jnp.matmul(lhs, buffers[bank][...], preferred_element_type=jnp.float32),
@@ -452,6 +455,15 @@ def _latent_gather_steps(
     seed.wait()
 
 
+def _latent_local_steps(payload, output, store, *, rank):
+    """Diagnostics (debug_skip moe_latent_ring): store only this rank's rows."""
+    rows = payload.shape[0]
+    copy = pltpu.make_async_copy(payload, output.at[pl.ds(rank * rows, rows), :, :], store)
+    copy.start()
+    yield
+    copy.wait()
+
+
 def _latent_ready_init(tables, payload, output, send, recv, stores, state, meta, *, rank):
     """Seed twelve independently progressing streams of the 8K latent gather.
 
@@ -584,6 +596,20 @@ def _latent_ready_progress(
             sweep()
 
 
+class _Phases:
+    """Diagnostics: consecutive named scopes (kept only by the profiling flags)."""
+
+    def __init__(self):
+        self.scope = None
+
+    def __call__(self, name=None):
+        if self.scope is not None:
+            self.scope.__exit__(None, None, None)
+        self.scope = jax.named_scope(name) if name else None
+        if self.scope is not None:
+            self.scope.__enter__()
+
+
 def _stripe_validity(rows, length, rank):
     row = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0)
     stripe = min(rows, 64)
@@ -627,19 +653,33 @@ def _prologue(
     shared_down = shared_down.at[family]
     valid = _stripe_validity(rows, control[0], rank)
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
+    banks = k._config().prefill_moe_dma_banks if rows <= 128 else 2
+    skip_latent_ring = "moe_latent_ring" in k._config().debug_skip
+    phase = _Phases()
 
     def body(s):
+        phase("mp_in")
         own = s["pair"].at[pl.ds(parity * rows, rows), :]
-        copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
-        copy.start()
-        copy.wait()
-        if rows <= 128:
-            copy = pltpu.make_async_copy(router, s["router"], s["input_sem"])
+        if banks > 2:
+            # Input, router and bias loads in flight together.
+            loads = [pltpu.make_async_copy(hidden, own, s["input_sem"]),
+                     pltpu.make_async_copy(router, s["router"], s["load_sems"][0]),
+                     pltpu.make_async_copy(bias, s["bias"], s["load_sems"][1])]
+            for copy in loads:
+                copy.start()
+            for copy in loads:
+                copy.wait()
+        else:
+            copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
             copy.start()
             copy.wait()
-        copy = pltpu.make_async_copy(bias, s["bias"], s["input_sem"])
-        copy.start()
-        copy.wait()
+            if rows <= 128:
+                copy = pltpu.make_async_copy(router, s["router"], s["input_sem"])
+                copy.start()
+                copy.wait()
+            copy = pltpu.make_async_copy(bias, s["bias"], s["input_sem"])
+            copy.start()
+            copy.wait()
         _enter_mesh()
         pl.semaphore_signal(
             s["peer_credit"], 1, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL
@@ -662,8 +702,9 @@ def _prologue(
             copy.wait()
         else:
             buffers, router_v = s["gu_buffers"], s["router"]
-        gate_buffers, up_buffers = buffers[:2], buffers[2:]
-        gate_sems, up_sems = s["gu_sems"][:2], s["gu_sems"][2:]
+        half = len(buffers) // 2
+        gate_buffers, up_buffers = buffers[:half], buffers[half:]
+        gate_sems, up_sems = s["gu_sems"][:half], s["gu_sems"][half:]
         hx = own[...]
         logits = jnp.matmul(hx, router_v[...], preferred_element_type=jnp.float32)
         top = _Top16(logits, s["bias"][...])
@@ -702,6 +743,7 @@ def _prologue(
                 hx, latent_weight, gate_buffers, gate_sems, columns=4096
             )
         first_half = None
+        phase("mp_latent")
         for col, product in latent_products:
             if route_started:
                 stage = next(route_steps, None)
@@ -750,12 +792,16 @@ def _prologue(
                 )
                 next(route_steps, None)
                 route_started = True
+        phase("mp_route_drain")
         for _ in route_steps:
             pass
         start_metadata()
         if rows <= 128:
             s["latent_payload"][...] = s["latent"][:, :3584].reshape(rows, 2, 1792)
-        latent_steps = _latent_gather_steps(
+        latent_steps = _latent_local_steps(
+            s["latent_payload"], latent_hbm,
+            s["latent_stores"].at[0] if rows <= 128 else s["latent_stores"], rank=rank,
+        ) if skip_latent_ring else _latent_gather_steps(
             tables,
             s["latent_payload"],
             s["latent_recv"],
@@ -766,7 +812,7 @@ def _prologue(
             s["latent_stores"],
             rank=rank,
         )
-        if rows == 256:
+        if rows == 256 and not skip_latent_ring:
             latent_tick = 0
             def latent_progress(*, drain=False):
                 nonlocal latent_tick
@@ -787,30 +833,33 @@ def _prologue(
                         pass
                 else:
                     next(latent_steps, None)
+        phase("mp_peer")
         peer_input.wait_send()
         peer_input.wait_recv()
 
         def gu_copy(panel, offset, buffers, sems):
-            bank = panel % 2
+            bank = panel % half
             return pltpu.make_async_copy(
                 shared_gu.at[:, pl.ds(offset + panel * 256, 256)],
                 buffers[bank],
                 sems[bank],
             )
 
-        gu_copy(0, 0, gate_buffers, gate_sems).start()
-        gu_copy(0, 3072, up_buffers, up_sems).start()
+        phase("mp_shared_gu")
+        for panel in range(half - 1):
+            gu_copy(panel, 0, gate_buffers, gate_sems).start()
+            gu_copy(panel, 3072, up_buffers, up_sems).start()
         if rows == 256:
             latent_progress()
         for panel in range(12):
             if rows <= 128:
                 latent_progress()
-            bank = panel % 2
+            bank = panel % half
             gu_copy(panel, 0, gate_buffers, gate_sems).wait()
             gu_copy(panel, 3072, up_buffers, up_sems).wait()
-            if panel + 1 < 12:
-                gu_copy(panel + 1, 0, gate_buffers, gate_sems).start()
-                gu_copy(panel + 1, 3072, up_buffers, up_sems).start()
+            if panel + half - 1 < 12:
+                gu_copy(panel + half - 1, 0, gate_buffers, gate_sems).start()
+                gu_copy(panel + half - 1, 3072, up_buffers, up_sems).start()
             for row in (0, rows):
                 lhs = s["pair"][pl.ds(row, rows), :]
                 gate = jnp.matmul(
@@ -833,8 +882,8 @@ def _prologue(
         def down_copy(panel):
             return pltpu.make_async_copy(
                 shared_down.at[:, pl.ds(panel * 256, 256)],
-                s["down_buffers"][panel % 2],
-                s["down_sems"][panel % 2],
+                s["down_buffers"][panel % banks],
+                s["down_sems"][panel % banks],
             )
 
         def finish_reduction(pending):
@@ -846,17 +895,19 @@ def _prologue(
                 jnp.bfloat16
             )
 
-        down_copy(0).start()
+        phase("mp_shared_down")
+        for panel in range(banks - 1):
+            down_copy(panel).start()
         pending = None
         for panel in range(28):
             bank = panel % 2
             down_copy(panel).wait()
-            if panel + 1 < 28:
-                down_copy(panel + 1).start()
+            if panel + banks - 1 < 28:
+                down_copy(panel + banks - 1).start()
             for row in (0, rows):
                 product = jnp.matmul(
                     s["middle"][pl.ds(row, rows), :],
-                    s["down_buffers"][bank][...],
+                    s["down_buffers"][panel % banks][...],
                     preferred_element_type=jnp.float32,
                 )
                 metadata_progress()
@@ -877,6 +928,7 @@ def _prologue(
                 if rows == 256 or row == rows:
                     latent_progress()
         finish_reduction(pending)
+        phase("mp_tail")
         if rows == 256:
             for _ in metadata_steps:
                 latent_progress()
@@ -887,15 +939,17 @@ def _prologue(
             latent_progress(drain=True)
             for _ in metadata_steps:
                 pass
+        phase()
 
     scratch = dict(
         pair=vmem((2 * rows, hidden_size), jnp.bfloat16),
         router=vmem((hidden_size, 896), jnp.bfloat16) if rows <= 128 else None,
         router_gu=vmem((hidden_size, 1024), jnp.bfloat16) if rows == 256 else None,
-        gu_buffers=tuple(vmem((hidden_size, 256), jnp.bfloat16) for _ in range(4))
+        gu_buffers=tuple(vmem((hidden_size, 256), jnp.bfloat16) for _ in range(2 * banks))
         if rows <= 128
         else (),
-        gu_sems=tuple(dma for _ in range(4)),
+        gu_sems=tuple(dma for _ in range(2 * banks)),
+        load_sems=(dma, dma),
         bias=vmem((1, 896), jnp.float32),
         input_sem=dma,
         peer_send=dma,
@@ -916,8 +970,8 @@ def _prologue(
         latent_credits=pltpu.SemaphoreType.REGULAR((12,)),
         latent_stores=dma((12,)) if rows <= 128 else dma,
         middle=vmem((2 * rows, 3072), jnp.bfloat16),
-        down_buffers=tuple(vmem((3072, 256), jnp.bfloat16) for _ in range(2)),
-        down_sems=(dma, dma),
+        down_buffers=tuple(vmem((3072, 256), jnp.bfloat16) for _ in range(banks)),
+        down_sems=tuple(dma for _ in range(banks)),
         partial=tuple(vmem((2 * rows, 256), jnp.float32) for _ in range(2)),
         peer_y=tuple(vmem((rows, 256), jnp.float32) for _ in range(2)),
         reduce_send=(dma, dma),
@@ -1722,6 +1776,11 @@ def _ready_reduce(
     """
     assert buffers == 2
     count = len(streams)
+    if "moe_reduce_ring" in k._config().debug_skip:
+        # Diagnostics only: keep this rank's own subtotal rows, no ring.
+        if drain:
+            o_ref[...] = x_ref[pl.ds(0, o_ref.shape[0]), :].astype(o_ref.dtype)
+        return
 
     def remote(stream, rows, cols, target, bank):
         return pltpu.make_async_remote_copy(
@@ -1976,6 +2035,7 @@ def _layer_kernel(
     capacity = tokens * 16 if tokens < 8192 else 32768
     shape = (tokens // 8, 128)
     vmem, smem, dma = pltpu.VMEM, pltpu.SMEM, pltpu.SemaphoreType.DMA
+    phase = _Phases()
 
     def body(s):
         s["offset"][0] = 0
@@ -2008,6 +2068,7 @@ def _layer_kernel(
             def metadata_ready():
                 indices.start()
                 probability_copy(probs_v).start()
+            phase("m_prologue")
             _prologue(
                 tables,
                 control,
@@ -2026,6 +2087,7 @@ def _layer_kernel(
                 counts_ready=counts_ready,
                 metadata_ready=metadata_ready,
             )
+            phase("m_meta")
             count_copy().wait()
             if route_counts is not None:
                 for e in range(56):
@@ -2051,6 +2113,7 @@ def _layer_kernel(
             indices.wait()
             if tokens == 8192:
                 probability_copy(probs_v).wait()
+            phase()
 
         if tokens == 8192:
             # The compact path completes both metadata DMAs before expert work.
@@ -2066,6 +2129,7 @@ def _layer_kernel(
                 probability_copy(s["probs_v"]).wait()
 
         def fast():
+            phase("m_experts")
             _routed_experts(
                 latent,
                 expert_gu,
@@ -2083,9 +2147,11 @@ def _layer_kernel(
                 tokens=tokens,
                 probabilities_ready=probabilities_ready,
             )
+            phase("m_epilogue")
             _epilogue(
                 control, s["reduced"], s["shared"], norm, latent_up, prefix, output
             )
+            phase()
 
         if tokens < 8192:
             fast()
