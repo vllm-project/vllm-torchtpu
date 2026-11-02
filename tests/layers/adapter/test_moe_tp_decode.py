@@ -246,7 +246,7 @@ def harness(monkeypatch):
 
     monkeypatch.setattr(moe_tp_decode, "_get_op", get_op)
 
-    def selftest(topo, buckets, device):
+    def selftest(topo, buckets, device, ag_pairs=0, pieces=0):
         h.selftest_calls += 1
         return h.selftest_failures
 
