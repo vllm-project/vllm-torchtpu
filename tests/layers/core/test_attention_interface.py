@@ -30,9 +30,12 @@ Because none of these tests dispatch a kernel, they run the same way on any
 TPU generation and on CPU.
 """
 
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
@@ -277,3 +280,154 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
                 NOPE_SPEC,
                 ROPE_SC_SPEC,
             )
+
+
+class SparseMlaSupportsSplitQTest(parameterized.TestCase):
+    def test_supports_split_q(self):
+        """`supports_split_q` enforces the kernel's `q_pe=` envelope."""
+        q_ok = jnp.ones((4, 2, LKV_DIM), jnp.bfloat16)
+        pe_ok = jnp.ones((4, 2, ROPE_DIM), jnp.bfloat16)
+        self.assertTrue(sparse_mla_kernel.supports_split_q(q_ok, pe_ok))
+        # Non-3D inputs.
+        self.assertFalse(sparse_mla_kernel.supports_split_q(q_ok[0], pe_ok[0]))
+        # Unpacked bf16 head count (1 < packing 2).
+        self.assertFalse(
+            sparse_mla_kernel.supports_split_q(q_ok[:, :1, :], pe_ok[:, :1, :])
+        )
+        # Nope dim not a multiple of 128 (e.g. 448 = 3 * 128 + 64).
+        self.assertFalse(sparse_mla_kernel.supports_split_q(q_ok[..., :448], pe_ok))
+        # Mismatched leading shape or dtype.
+        self.assertFalse(sparse_mla_kernel.supports_split_q(q_ok[:2], pe_ok))
+        self.assertFalse(
+            sparse_mla_kernel.supports_split_q(q_ok, pe_ok.astype(jnp.float32))
+        )
+
+
+def _call_sparse_mla(dcp: bool, ql_nope, q_pe):
+    """Runs the non-DCP or DCP entry point on minimal inputs; returns (out, lse)."""
+    tokens = ql_nope.shape[0]
+    common = (
+        jnp.zeros((tokens, LKV_DIM), jnp.float8_e4m3fn),
+        jnp.zeros((tokens, ROPE_DIM), jnp.float8_e4m3fn),
+    )
+    tail = (
+        jnp.ones((1,), jnp.int32),
+        jnp.zeros((tokens,), jnp.int32),
+        jnp.array([0, tokens], jnp.int32),
+        jnp.array([0, 0, 1], jnp.int32),
+    )
+    if not dcp:
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
+        _, _, out = attention_interface.sparse_mla_attention(
+            ql_nope,
+            q_pe,
+            *common,
+            jnp.zeros(NOPE_SPEC.shape, NOPE_SPEC.jax_dtype),
+            jnp.zeros(ROPE_SPEC.shape, ROPE_SPEC.jax_dtype),
+            jnp.zeros((tokens, 1), jnp.int32),
+            *tail,
+            mesh,
+            NOPE_SPEC,
+            ROPE_SPEC,
+        )
+        return out, None
+    dcp_size = 2
+    devices = jax.local_devices()
+    if len(devices) < dcp_size:
+        pytest.skip(f"needs {dcp_size} local devices, got {len(devices)}")
+    mesh = jax.sharding.Mesh(np.array(devices[:dcp_size]), ("dcp",))
+    _, _, out, lse = attention_interface.sparse_mla_attention_dcp(
+        ql_nope,
+        q_pe,
+        *common,
+        jnp.zeros(
+            (dcp_size * NOPE_SPEC.shape[0], *NOPE_SPEC.shape[1:]), NOPE_SPEC.jax_dtype
+        ),
+        jnp.zeros(
+            (dcp_size * ROPE_SPEC.shape[0], *ROPE_SPEC.shape[1:]), ROPE_SPEC.jax_dtype
+        ),
+        jnp.zeros((dcp_size * tokens, 1), jnp.int32),
+        *tail,
+        mesh,
+        NOPE_SPEC,
+        ROPE_SPEC,
+        dcp_axis_name="dcp",
+        dcp_size=dcp_size,
+        interleave_size=1,
+    )
+    return out, lse
+
+
+@pytest.mark.parametrize(
+    "dcp",
+    [
+        pytest.param(False, id="non_dcp"),
+        pytest.param(True, marks=pytest.mark.tpu_test, id="dcp"),
+    ],
+)
+@pytest.mark.parametrize(
+    "split_q, num_heads, expect_split",
+    [
+        (False, 2, False),
+        (False, 1, False),
+        (True, 2, True),
+        # Unpacked per-device head count (1 < bf16 packing 2) falls back to the
+        # concat path (`prepare_q_inputs` pads heads) instead of raising in
+        # `static_validate_inputs`.
+        (True, 1, False),
+    ],
+)
+def test_split_q_plumbing(dcp: bool, split_q: bool, num_heads: int, expect_split: bool):
+    """Both sparse MLA entry points pass `q_pe` separately when
+    `TPU_MLA_SPARSE_SPLIT_Q` is on and heads are packed (DCP also exporting a
+    lane-dense lse), and otherwise concat `[ql_nope, q_pe]`, warning once when
+    the flag asked for a split the shapes cannot take."""
+    tokens = 4
+    ql_nope = jnp.ones((tokens, num_heads, LKV_DIM), jnp.bfloat16)
+    q_pe = jnp.ones((tokens, num_heads, ROPE_DIM), jnp.bfloat16)
+    recorded: dict[str, object] = {}
+
+    def fake_kernel(q, kv_nope, kv_rope, *args, **kwargs):
+        del kv_nope, kv_rope, args
+        recorded["q_shape"] = q.shape
+        recorded["q_pe_shape"] = kwargs["q_pe"].shape if "q_pe" in kwargs else None
+        recorded["lse_lane_dense"] = kwargs.get("lse_lane_dense", False)
+        if dcp:
+            return q, jnp.zeros((q.shape[0], num_heads), jnp.float32)
+        return q
+
+    kernel_target = (
+        (attention_interface.sparse_mla_kernel, "sparse_ragged_paged_attention")
+        if dcp
+        else (attention_interface, "sparse_mla_ragged_paged_attention")
+    )
+    writer = "update_sparse_mla_kv_cache_dcp" if dcp else "update_sparse_mla_kv_cache"
+    with (
+        mock.patch.object(attention_interface.envs, "TPU_MLA_SPARSE_SPLIT_Q", split_q),
+        mock.patch.object(*kernel_target, side_effect=fake_kernel),
+        mock.patch.object(
+            attention_interface,
+            writer,
+            side_effect=lambda nope, rope, *a, **kw: (nope, rope),
+        ),
+        mock.patch.object(attention_interface.logger, "warning_once") as mock_warn,
+    ):
+        out, lse = _call_sparse_mla(dcp, ql_nope, q_pe)
+
+    rows = 2 * tokens if dcp else tokens
+    assert out.shape == (rows, num_heads, LKV_DIM)
+    if dcp:
+        assert lse.shape == (rows, num_heads)
+        assert recorded["lse_lane_dense"] == expect_split
+    if expect_split:
+        assert recorded["q_shape"] == (tokens, num_heads, LKV_DIM)
+        assert recorded["q_pe_shape"] == (tokens, num_heads, ROPE_DIM)
+    else:
+        assert recorded["q_pe_shape"] is None
+        assert recorded["q_shape"] == (tokens, num_heads, LKV_DIM + ROPE_DIM)
+    if split_q and not expect_split:
+        mock_warn.assert_called_once()
+        assert mock_warn.call_args.args[1] == (num_heads, LKV_DIM)
+        assert mock_warn.call_args.args[3] == (num_heads, ROPE_DIM)
+    else:
+        mock_warn.assert_not_called()
