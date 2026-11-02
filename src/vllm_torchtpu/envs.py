@@ -1556,7 +1556,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DRAFT_CARRY_FUSED": env_bool("VLLM_TPU_DRAFT_CARRY_FUSED"),
     # With VLLM_TPU_VERIFY_FUSED: compute the mamba read offsets inside the
     # fused verify program and apply them with one eager scatter.
-    "VLLM_TPU_VERIFY_FUSED_READ_OFFSETS": env_bool("VLLM_TPU_VERIFY_FUSED_READ_OFFSETS"),
+    "VLLM_TPU_VERIFY_FUSED_READ_OFFSETS": env_bool(
+        "VLLM_TPU_VERIFY_FUSED_READ_OFFSETS"
+    ),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),

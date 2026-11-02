@@ -1357,7 +1357,9 @@ class Eagle3Proposer:
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
         if d2t is None:
             token = (
-                self.draft_model.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
+                self.draft_model.compute_logits(last_hidden)
+                .argmax(dim=-1)
+                .to(torch.int32)
             )
         else:
             draft_id = self.draft_model.logits_processor(
@@ -2178,7 +2180,10 @@ class Eagle3Proposer:
             torch.int64
         )
         delta = torch.stack(
-            [mism * (0 if faulted else 1), (mism > 0).to(torch.int64) * (1 if faulted else 0)]
+            [
+                mism * (0 if faulted else 1),
+                (mism > 0).to(torch.int64) * (1 if faulted else 0),
+            ]
         )
         self._carry_mismatches = (
             delta if self._carry_mismatches is None else self._carry_mismatches + delta
@@ -2796,7 +2801,11 @@ class Eagle3Proposer:
                 for width in reqs:
                     # Mixed chunks carry prefill tokens too, so T is not
                     # bounded by the verify width: warm every token bucket.
-                    prev = reqs[bisect.bisect_left(reqs, width) - 1] if width != reqs[0] else 0
+                    prev = (
+                        reqs[bisect.bisect_left(reqs, width) - 1]
+                        if width != reqs[0]
+                        else 0
+                    )
                     ps = {
                         _get_padded_token_len(runner.num_tokens_paddings, n)
                         for n in range(prev + 1, width + 1)
@@ -2810,7 +2819,9 @@ class Eagle3Proposer:
                             qsl = torch.zeros(q, dtype=torch.int32).to(runner.device)
                             n_dev = torch.tensor(1, dtype=torch.int64).to(runner.device)
                             ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
-                            out = _async_seed_inputs_compiled(nt, nd, qsl, n_dev, ids, p)
+                            out = _async_seed_inputs_compiled(
+                                nt, nd, qsl, n_dev, ids, p
+                            )
                             synchronize_tensors(out)
 
     def _precompile_draft_rows_carry_and_token(self) -> None:

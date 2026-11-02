@@ -4817,14 +4817,15 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates,
         )
         ro_groups, ro_num_reqs = self._fused_read_offsets
+        slot_offsets = self.mamba_slot_read_offsets
         fold_ro = (
             envs.VLLM_TPU_VERIFY_FUSED_READ_OFFSETS
-            and self.mamba_slot_read_offsets is not None
+            and slot_offsets is not None
             and bool(ro_groups)
             and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
-            and self.mamba_slot_read_offsets.device.type == "tpu"
+            and slot_offsets.device.type == "tpu"
         )
-        if fold_ro:
+        if fold_ro and slot_offsets is not None:
             out, row_offsets = _verify_fused_compiled(
                 *args, self._num_reqs_tensor(ro_num_reqs)
             )
@@ -4838,25 +4839,23 @@ class TPUModelRunner(GPUModelRunner):
                 row_offsets[:width]
                 if rows >= width
                 else torch.nn.functional.pad(row_offsets, (0, width - rows))
-            ).to(self.mamba_slot_read_offsets.dtype)
+            ).to(slot_offsets.dtype)
             if len(groups) > 1:
                 idx = torch.cat(groups, dim=0).long()
                 vals = vals.repeat(len(groups))
             else:
                 idx = groups[0].long()
             ref_buf = (
-                self.mamba_slot_read_offsets.clone()
-                if self._verify_fused_checks_left > 0
-                else None
+                slot_offsets.clone() if self._verify_fused_checks_left > 0 else None
             )
-            self.mamba_slot_read_offsets.index_put_((idx,), vals)
+            slot_offsets.index_put_((idx,), vals)
             self._fused_read_offsets_applied = True
             if ref_buf is not None:
                 # Check: the separate program's scatter on a copy must match.
                 _update_read_offsets_impl(
                     ref_buf, groups, out, self._num_reqs_tensor(ro_num_reqs)
                 )
-                ro_mism = (ref_buf != self.mamba_slot_read_offsets).sum()
+                ro_mism = (ref_buf != slot_offsets).sum()
                 self._verify_fused_ro_mismatches = (
                     ro_mism
                     if self._verify_fused_ro_mismatches is None
