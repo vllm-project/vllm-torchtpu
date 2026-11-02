@@ -2233,6 +2233,14 @@ class TestV2KernelFull:
         # combine_step_tokens
         assert combine_step_tokens(64) == 0
         assert combine_step_tokens(256) > 0
+        # Shapes the strict search accepts keep their step size; only the
+        # listed decode shape takes a tail, and nothing else starts to.
+        for t_local, tb in ((256, 64), (320, 16), (384, 32), (512, 64), (2048, 64)):
+            assert combine_step_tokens(t_local) == tb
+        assert combine_step_tokens(288) == 32
+        assert 288 // combine_step_tokens(288) % kernel.COMBINE_PARITIES
+        assert combine_step_tokens(272) == 0
+        assert combine_step_tokens(304) == 0
 
         # _build_combine_kernel validation and execution
         mock_info = _mock_tpu_info()
@@ -3176,8 +3184,13 @@ class TestV2KernelFull:
         ):
             captured_kernel(*refs)
 
-    def test_combine_kernel_simulation_and_steps(self):
-        """Simulate combine kernel body execution and token step calculations."""
+    @pytest.mark.parametrize("t_local", [512, 288])
+    def test_combine_kernel_simulation_and_steps(self, t_local):
+        """Simulate combine kernel body execution and token step calculations.
+
+        288 runs a step count that is not a multiple of the rotation, so it
+        also traces the unrolled tail steps and the shifted row drain.
+        """
         mock_info = _mock_tpu_info()
         captured_combine = None
 
@@ -3191,7 +3204,7 @@ class TestV2KernelFull:
             patch("jax.experimental.pallas.pallas_call", side_effect=mock_pallas_call),
         ):
             _build_combine_kernel(
-                t_local=512,
+                t_local=t_local,
                 topk=2,
                 hidden=128,
                 lane_blocks=1,
@@ -3211,9 +3224,8 @@ class TestV2KernelFull:
         sem = MagicMock()
         sem.at = MagicMock(return_value=sem)
 
-        t_local = 512
         topk = 2
-        tb = kernel.COMBINE_TOKENS
+        tb = combine_step_tokens(t_local)
         pos_sm = jnp.zeros((t_local * topk,), jnp.int32)
         coef_sm = jnp.zeros((t_local * topk,), jnp.float32)
         arr_hbm = MockRef(jnp.zeros((t_local * topk, 1, 128), kernel.FP8))

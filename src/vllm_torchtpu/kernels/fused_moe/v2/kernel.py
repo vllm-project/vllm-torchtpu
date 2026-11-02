@@ -2287,6 +2287,12 @@ COMBINE_CHUNK = 16
 # Mosaic call's fixed cost would be the whole effect.
 COMBINE_MIN_TOKENS = 256
 COMBINE_PARITIES = 4
+# Local token counts whose step count need not be a multiple of the rotation:
+# the steps past the last whole rotation run unrolled after the loop. DSv4.1
+# decode (288 = 9 x 32) is the one shape this is measured for. Its gather is not
+# offloaded either -- the XLA epilogue keeps it in VMEM -- so what the kernel
+# buys there is the row DMA rate, not a removed round trip.
+COMBINE_TAIL_TOKENS = (288,)
 # Steps of row lead. A step's rows are waited at its head, so at one step of
 # lead the DMA queue drains to empty at every boundary and refills from cold;
 # more lead keeps descriptors in flight across it. Must divide the rotation:
@@ -2298,23 +2304,30 @@ def combine_step_tokens(t_local):
     """Tokens a combine step stages, or 0 where this path does not apply.
 
     The step loop is unrolled by parity so that every VMEM store has a static
-    buffer index, which needs an even step count; the group width has to divide
-    the step; and the fixed cost is only worth paying above COMBINE_MIN_TOKENS.
+    buffer index, which needs a step count that is a multiple of
+    COMBINE_PARITIES -- except for COMBINE_TAIL_TOKENS, whose remaining steps
+    run unrolled after the loop; the group width has to divide the step; and
+    the fixed cost is only worth paying above COMBINE_MIN_TOKENS. A tail is
+    only searched for where no whole rotation fits, so every shape the strict
+    search accepts keeps its step size.
     """
     if t_local < COMBINE_MIN_TOKENS:
         return 0
-    tb = COMBINE_TOKENS
-    while tb >= COMBINE_GROUP:
-        steps = t_local // tb
-        if (
-            not t_local % tb
-            and not tb % COMBINE_GROUP
-            and steps > COMBINE_LEAD
-            and steps >= COMBINE_PARITIES
-            and not steps % COMBINE_PARITIES
-        ):
-            return tb
-        tb //= 2
+    for allow_tail in (False, True):
+        if allow_tail and t_local not in COMBINE_TAIL_TOKENS:
+            break
+        tb = COMBINE_TOKENS
+        while tb >= COMBINE_GROUP:
+            steps = t_local // tb
+            if (
+                not t_local % tb
+                and not tb % COMBINE_GROUP
+                and steps > COMBINE_LEAD
+                and steps >= COMBINE_PARITIES
+                and (allow_tail or not steps % COMBINE_PARITIES)
+            ):
+                return tb
+            tb //= 2
     return 0
 
 
@@ -2412,9 +2425,15 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
                 for k in range(topk):
                     start_row(p * tb, p, i, k)
         lax.fori_loop(0, steps // COMBINE_PARITIES, step_pair, jnp.int32(0))
+        # Steps past the last whole rotation keep their static parity.
+        for step in range(steps - steps % COMBINE_PARITIES, steps):
+            one_step(jnp.int32(step), step % COMBINE_PARITIES)
         # The last COMBINE_LEAD steps re-start the final step's rows into the
-        # buffers the loop no longer reads; drain them, and the stores.
-        for p in range(COMBINE_LEAD):
+        # buffers no later step reads -- those of steps `steps + j`, which are
+        # buffers 0 and 1 only when the rotation divides the step count --
+        # drain them, and the stores.
+        for j in range(COMBINE_LEAD):
+            p = (steps + j) % COMBINE_PARITIES
             pltpu.make_async_copy(rows_vm.at[p], rows_vm.at[p], row_sems.at[p]).wait()
         for p in range(COMBINE_PARITIES):
             pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], out_sems.at[p]).wait()
