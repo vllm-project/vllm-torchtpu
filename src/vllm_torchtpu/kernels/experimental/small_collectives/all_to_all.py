@@ -104,25 +104,33 @@ def merge_sender_rows(num_cores):
     return -(-num_cores // 8) * 8
 
 
-def merge_weights(recv_ref, w_ref, *, num_cores, word_row, tl):
+def merge_weights(recv_ref, w_ref, *, num_cores, word_row, tl, rolled=False):
     """``_merge_received``'s weights of every sender and row: the lse words of
     sender ``w`` from row ``word_row`` of slot ``w`` of ``recv_ref``, as f32
     rows (senders in sublanes, rows in lanes), then transposed once into
     ``w_ref`` [LANES, LANES]: row r holds ``w_hi`` of sender w at lane w and
-    ``w_lo`` at lane ``senders + w``."""
+    ``w_lo`` at lane ``senders + w``. ``rolled``: the senders in a loop, not
+    unrolled (same values)."""
     n = num_cores
     vdim = recv_ref.shape[-1]
     senders = merge_sender_rows(n)
     head0 = word_row // MERGE_CHUNK_ROWS * MERGE_CHUNK_ROWS
     sub = lax.broadcasted_iota(jnp.int32, (senders, LANES), 0)
     lse = jnp.full((senders, LANES), -jnp.inf, jnp.float32)
-    for w in range(n):
+
+    def take_sender(w, lse):
         head = recv_ref[w, pl.ds(head0, MERGE_CHUNK_ROWS), :].astype(jnp.int32)
         words = head[word_row - head0 : word_row - head0 + 1]
         lo = pltpu.roll(words, vdim - tl, 1)
         bits = lax.shift_left(words, jnp.int32(16)) | (lo & 0xFFFF)
         row = lax.bitcast_convert_type(bits, jnp.float32)[:, :LANES]
-        lse = jnp.where(sub == w, jnp.broadcast_to(row, lse.shape), lse)
+        return jnp.where(sub == w, jnp.broadcast_to(row, lse.shape), lse)
+
+    if rolled:
+        lse = lax.fori_loop(0, n, take_sender, lse)
+    else:
+        for w in range(n):
+            lse = take_sender(w, lse)
     finite = jnp.isfinite(lse)
     shift = jnp.max(jnp.where(finite, lse, -jnp.inf), axis=0, keepdims=True)
     shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
@@ -135,23 +143,48 @@ def merge_weights(recv_ref, w_ref, *, num_cores, word_row, tl):
     w_ref[...] = jnp.concatenate([w_hi, w_lo, pad], axis=0).T
 
 
-def merge_chunk(recv_ref, w_ref, chunk, live, *, num_cores, part_row):
+def merge_chunk(recv_ref, w_ref, chunk, live, *, num_cores, part_row, rolled=False):
     """Rows ``[chunk * MERGE_CHUNK_ROWS, ...)`` of the merge, bf16: each
     sender's partials (NaN zeroed, then f32) times its ``w_hi`` and ``w_lo``
-    columns, summed in order, rows at or past ``live`` zero."""
+    columns, summed in order, rows at or past ``live`` zero. ``rolled``: the
+    senders in a loop, each one's columns rolled to lane 0 (same values);
+    ``chunk`` and ``part_row`` may then be data, ``part_row`` a whole tile."""
     n = num_cores
     senders = merge_sender_rows(n)
     start = chunk * MERGE_CHUNK_ROWS
     vdim = recv_ref.shape[-1]
+    dynamic = not isinstance(chunk, int)
+    if rolled or dynamic:
+        start = pl.multiple_of(start, MERGE_CHUNK_ROWS)
     cols = w_ref[pl.ds(start, MERGE_CHUNK_ROWS), :]
-    acc_hi = jnp.zeros((MERGE_CHUNK_ROWS, vdim), jnp.float32)
-    acc_lo = jnp.zeros((MERGE_CHUNK_ROWS, vdim), jnp.float32)
-    for k in range(n):
-        words = recv_ref[k, pl.ds(part_row + start, MERGE_CHUNK_ROWS), :]
+
+    def column(lane):
+        if rolled:
+            return pltpu.roll(cols, lax.rem(LANES - lane, LANES), 1)[:, :1]
+        return cols[:, lane : lane + 1]
+
+    def add_sender(k, acc):
+        acc_hi, acc_lo = acc
+        first = part_row + start
+        if rolled or dynamic:
+            first = pl.multiple_of(first, MERGE_CHUNK_ROWS)
+        words = recv_ref[k, pl.ds(first, MERGE_CHUNK_ROWS), :]
         part = pltpu.bitcast(words, jnp.bfloat16)
         part = jnp.where(jnp.isnan(part), jnp.bfloat16(0), part).astype(jnp.float32)
-        acc_hi = acc_hi + part * cols[:, k : k + 1]
-        acc_lo = acc_lo + part * cols[:, senders + k : senders + k + 1]
+        acc_hi = acc_hi + part * column(k)
+        acc_lo = acc_lo + part * column(senders + k)
+        return acc_hi, acc_lo
+
+    acc = (
+        jnp.zeros((MERGE_CHUNK_ROWS, vdim), jnp.float32),
+        jnp.zeros((MERGE_CHUNK_ROWS, vdim), jnp.float32),
+    )
+    if rolled:
+        acc_hi, acc_lo = lax.fori_loop(0, n, add_sender, acc)
+    else:
+        for k in range(n):
+            acc = add_sender(k, acc)
+        acc_hi, acc_lo = acc
     row = lax.broadcasted_iota(jnp.int32, acc_hi.shape, 0) + start
     merged = jnp.where(row < live, acc_hi + acc_lo, 0.0)
     return merged.astype(jnp.bfloat16)

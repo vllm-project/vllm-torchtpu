@@ -1185,13 +1185,19 @@ def one_capped_gather(num_tokens: int, topk_cap: int | None) -> bool:
     )
 
 
-def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
+def fused_small_a2a_bucket_config(
+    num_tokens: int, steps: bool = False
+) -> tuple[bool | tuple, int]:
     """TPU_MLA_FUSED_SMALL_A2A: (operands pinned to HBM, scoped VMEM MiB) of the
     fused call at a decode bucket of `num_tokens` (static: the JAX op's shape).
     TPU_MLA_FUSED_SMALL_A2A_BUCKETS, when set, gives it per bucket as
     `T=<pins>@<MiB>` entries (`<pins>`: all | none | roles of
     `sparse_mla_kernel.SEND_EXCHANGE_PIN_ROLES` joined by `+`); a bucket it does
-    not list, or an empty knob, takes PIN_MIN_TOKENS / PIN_VMEM_MIB / VMEM_MIB."""
+    not list, or an empty knob, takes PIN_MIN_TOKENS / PIN_VMEM_MIB / VMEM_MIB;
+    a multi-step bucket (`steps`, TPU_MLA_FUSED_XCHG_MAX_TOKENS) it does not
+    list pins only the gathered KV at VMEM_MIB (unpinned, XLA stages it into
+    VMEM and the kernel's DMAs of it compile to vector copies: 2.2x the
+    code)."""
     spec = (envs.TPU_MLA_FUSED_SMALL_A2A_BUCKETS or "").strip()
     for entry in filter(None, (e.strip() for e in spec.split(","))):
         tokens, _, rest = entry.partition("=")
@@ -1211,6 +1217,8 @@ def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
                     f"TPU_MLA_FUSED_SMALL_A2A_BUCKETS: unknown roles {bad}"
                 )
         return pin, int(mib) if mib.strip() else envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
+    if steps:
+        return ("kv",), envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
     pin = num_tokens >= envs.TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS
     vmem_mib = (
         envs.TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB
@@ -1445,9 +1453,18 @@ def sparse_mla_attention_dcp(
             )
         # TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: buckets above it keep the
         # kernel's exchange but merge in the op (jnp), same result schema.
+        # TPU_MLA_FUSED_XCHG_MAX_TOKENS: a fused bucket above the decode step
+        # runs the exchange over several grid steps and merges in the kernel.
+        step_tokens = sparse_mla_kernel.decode_step_tokens(
+            _decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS)
+        )
+        xchg_steps = bool(fuse_here and step_tokens and topk_idx.shape[0] > step_tokens)
         merge_here = bool(
             fused_merge
-            and topk_idx.shape[0] <= envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS
+            and (
+                topk_idx.shape[0] <= envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS
+                or xchg_steps
+            )
         )
         if dcp_rank_ids is not None:
             dcp_rank = extra_[int(q_rope)][0]
@@ -1548,7 +1565,9 @@ def sparse_mla_attention_dcp(
                     split_kwargs["send_world"] = dcp_size
                 if fused_exchange and fuse_here:
                     # Static per bucket (the JAX op's shape, not a torch gate).
-                    pin, vmem_mib = fused_small_a2a_bucket_config(num_tokens)
+                    pin, vmem_mib = fused_small_a2a_bucket_config(
+                        num_tokens, steps=xchg_steps
+                    )
                     split_kwargs["send_exchange"] = (
                         dcp_axis_name,
                         lane_axis,

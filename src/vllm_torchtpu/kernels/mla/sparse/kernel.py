@@ -23,6 +23,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.experimental.small_collectives import (
+    all_to_all as small_all_to_all,
+)
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather, native_sc_gather
 
@@ -1729,6 +1732,16 @@ SEND_EXCHANGE_FAULTS = (
 # partials itself -- the unpack and torch's `_merge_received`, term by term --
 # into the second output, int16 [T * L, V] (the bf16 merge's words). The
 # real-token count rides the bounds prefetch after (rank, lane).
+#
+# TPU_MLA_FUSED_XCHG_MAX_TOKENS (merge mode on a grid of several steps): the
+# body and the bo tile are the send layout's, step by step. Each step pushes
+# its bo slot's slab j into rows `SEND_PAD_ROWS + step * bsz * L` of slot `me`
+# of rank j's receive scratch [W, SEND_PAD_ROWS + T * L, V] (the send block's
+# layout) right after its body; the last step pushes the head rows (lse word
+# row last) and only then waits for the arrivals, so earlier steps' transfers
+# run under later steps' bodies. The merge is the small all-to-all's merge
+# mode (`small_all_to_all.merge_weights` / `merge_chunk`) with the senders
+# and the chunks in loops.
 
 
 def send_layout_lanes(num_tokens: int, num_heads: int, world: int) -> int:
@@ -1879,7 +1892,18 @@ def _attention_kernel(
         send_exchange is not None and len(send_exchange) > 4 and send_exchange[4]
     )
     recv_v_ref = None
-    if xchg_merge:
+    # Fused exchange over several grid steps (see SEND_SLAB_ROW0): merge mode
+    # on a bucket the grid walks in more than one step.
+    xchg_steps = send_exchange is not None and batch_size < q_hbm_ref.shape[0]
+    assert not xchg_steps or xchg_merge, "a multi-step exchange merges in the kernel"
+    merge_w_ref = None
+    merge_out_ref = None
+    if xchg_steps:
+        # The merge weights f32 [128, 128], the merged rows' words [T * L,
+        # o_dim] and the receive scratch [W, SEND_PAD_ROWS + T * L, o_dim].
+        merge_w_ref, merge_out_ref, recv_v_ref = refs[-3:]
+        refs = refs[:-3]
+    elif xchg_merge:
         # [W, SEND_SLAB_ROW0 + T * L, o_dim] int16: the last scratch ref.
         recv_v_ref = refs[-1]
         refs = refs[:-1]
@@ -1925,7 +1949,12 @@ def _attention_kernel(
     xchg_sems = None
     if lse_fill:
         assert return_lse and lse_lane_dense
-        if send and xchg:
+        if send and xchg_steps:
+            # Multi-step exchange: the send layout's word buffer and the
+            # (send, recv) DMA semaphores of the head rows.
+            fill_ref, send_wbuf, xchg_sems, fill_sem = refs[-4:]
+            refs = refs[:-4]
+        elif send and xchg:
             # Fused exchange: the slabs are the bo tile; DMA sems (send,
             # recv, local) take the word buffer's slot.
             fill_ref, xchg_sems, fill_sem = refs[-3], refs[-2], refs[-1]
@@ -2083,10 +2112,10 @@ def _attention_kernel(
         send_rows = num_tokens * send_per
         send_lanes = send_layout_lanes(num_tokens, num_q_heads, send_world)
     # First partial row of a destination's slab in the bo tile.
-    slab_row0 = SEND_SLAB_ROW0 if xchg else 0
+    slab_row0 = SEND_SLAB_ROW0 if xchg and not xchg_steps else 0
     if xchg:
-        assert not preserve_suffix and batch_size == num_tokens, (
-            "the fused exchange runs on a one-step grid"
+        assert not preserve_suffix and (batch_size == num_tokens or xchg_steps), (
+            "the fused exchange runs on a one-step grid or merges in the kernel"
         )
         assert send, "the fused exchange needs the send layout"
         assert bo_x2_ref is not None and lse_hbm_ref is not None
@@ -2094,10 +2123,19 @@ def _attention_kernel(
         # Rows each destination receives from row SEND_SLAB_ROW0 of its block.
         xchg_rows = SEND_SLAB_ROW0 + send_rows  # pyrefly: ignore[unbound-name]
         xchg_block = SEND_PAD_ROWS + send_rows
-        assert bo_x2_ref.shape[2] == xchg_rows, bo_x2_ref.shape
+        if xchg_steps:
+            assert bo_x2_ref.shape[2] == batch_size * send_per, bo_x2_ref.shape
+            assert recv_v_ref is not None
+            assert recv_v_ref.shape == (send_world, xchg_block, o_dim), (
+                recv_v_ref.shape
+            )
+        else:
+            assert bo_x2_ref.shape[2] == xchg_rows, bo_x2_ref.shape
         if xchg_merge:
             assert recv_v_ref is not None
-            assert recv_v_ref.shape == (send_world, xchg_rows, o_dim), recv_v_ref.shape
+            assert xchg_steps or recv_v_ref.shape == (send_world, xchg_rows, o_dim), (
+                recv_v_ref.shape
+            )
             assert lse_hbm_ref.shape == (send_rows, o_dim), lse_hbm_ref.shape
             assert lse_hbm_ref.dtype == jnp.int16 and send_rows % 16 == 0
         else:
@@ -2483,10 +2521,32 @@ def _attention_kernel(
                 )
 
     def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
-        if xchg:
+        if xchg and not xchg_steps:
             return  # The slabs leave by the exchange's remote pushes.
         sem = sems.at[2, bo_sem_idx]
         vmem_ref = bo_x2_ref.at[bo_sem_idx, :]
+
+        if xchg and not wait:
+            # Multi-step exchange: this step's partial rows go to every peer
+            # (xchg_steps_finish waits the same byte counts).
+            pl.when(pl.program_id(0) == 0)(xchg_barrier_wait)
+            row = pl.multiple_of(
+                SEND_PAD_ROWS + seq_idx_start * send_per, SEND_PAD_ROWS
+            )
+            slot_shift = 1 if fault == "send_peer_misorder" else 0
+            half = xchg_step_half(seq_idx_start)
+            for size, taken in xchg_step_sizes(half):
+
+                @pl.when(taken)
+                def _(size=size):
+                    xchg_push(
+                        vmem_ref.at[:, pl.ds(0, size)],
+                        pl.ds(row, size),
+                        sem,
+                        slot_shift,
+                    )
+
+            return
 
         if preserve_suffix:
             # Split routing owns only the prefix, including in the last
@@ -2677,7 +2737,7 @@ def _attention_kernel(
         word = jnp.broadcast_to(
             lax.shift_left(acc, jnp.int32(16))[:, None, :], tile_shape
         )
-        if xchg:
+        if xchg and not xchg_steps:
             assert bo_x2_ref is not None
             # Fused exchange: the word row is int16 row SEND_SLAB_ROW0 - 1 of
             # each slab, rows before it zero; the slab's first tile also holds
@@ -2717,6 +2777,139 @@ def _attention_kernel(
             pl.semaphore_signal(
                 bsem, 1, device_id=xchg_peer(j), device_id_type=pl.DeviceIdType.MESH
             )
+
+    def xchg_barrier_wait():
+        pl.semaphore_wait(pltpu.get_barrier_semaphore(), send_world)
+
+    def xchg_step_half(seq_idx_start):
+        """Multi-step exchange: whether the step at `seq_idx_start` has at
+        most half a step of real tokens (the same on every rank), so only the
+        first half of its rows (whole SEND_PAD_ROWS tiles) move; the rest are
+        rows of padding tokens, which the merge masks."""
+        hrows = batch_size // 2 * send_per
+        if batch_size % 2 or not hrows or hrows % SEND_PAD_ROWS:
+            return None
+        return start_end_seq_idx_ref[4] - seq_idx_start <= batch_size // 2
+
+    def xchg_step_sizes(half):
+        """(rows, taken) of a step's push: the whole step, or half of it."""
+        full = batch_size * send_per
+        if half is None:
+            return ((full, True),)
+        return ((full // 2, half), (full, jnp.logical_not(half)))
+
+    def xchg_push(slabs, rows, sem, slot_shift=0):
+        """Multi-step exchange: slab j of `slabs` [W, k, o_dim] into `rows` of
+        slot `me` of rank j's receive scratch, the own slab by a local copy,
+        all counted on `sem`. Push k goes to rank me + k, so at each k every
+        rank sends to a different rank; the own copy last. `slot_shift` (test
+        only) lands them in slot `me + slot_shift` instead."""
+        n = send_world
+        me = start_end_seq_idx_ref[2]
+        slot = lax.rem(me + slot_shift, n) if slot_shift else me
+        dst = recv_v_ref.at[slot, rows]
+
+        def push(k, carry):
+            j = lax.rem(me + k, n)
+            pltpu.make_async_remote_copy(
+                src_ref=slabs.at[j],
+                dst_ref=dst,
+                send_sem=sem,
+                recv_sem=xchg_sems.at[1],
+                device_id=xchg_peer(j),
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+            return carry
+
+        lax.fori_loop(1, n, push, 0)
+        pltpu.make_async_copy(slabs.at[me], dst, sem).start()
+
+    def xchg_steps_finish():
+        """Multi-step exchange, last grid step: every destination's head rows
+        (lse word row last) to its peer, the wait for every arrival and own
+        head copy and own step slabs, then the small all-to-all's merge of the
+        live rows into the second output."""
+        n = send_world
+        tl = send_rows
+        chunk = small_all_to_all.MERGE_CHUNK_ROWS
+        assert send_wbuf is not None and merge_w_ref is not None
+        assert merge_out_ref is not None and tl % chunk == 0
+        build_send_lse_words()
+        pl.when(jnp.logical_not(has_work))(xchg_barrier_wait)
+        xchg_push(send_wbuf, pl.ds(0, SEND_PAD_ROWS), xchg_sems.at[0])
+        recv_sem = xchg_sems.at[1]
+        # Bytes of n - 1 head blocks, then of n - 1 slabs per step that ran.
+        heads = send_wbuf.at[pl.ds(0, n - 1)]
+        pltpu.make_async_copy(heads, heads, recv_sem).wait()
+        def step_slabs(size):
+            return bo_x2_ref.at[0, pl.ds(0, n - 1), pl.ds(0, size)]
+
+        def wait_step(i, carry):
+            s = step_slabs(batch_size * send_per)
+            pltpu.make_async_copy(s, s, recv_sem).wait()
+            return carry
+
+        steps = jnp.where(has_work, pl.num_programs(0), 0)
+        lax.fori_loop(0, jnp.maximum(steps - 1, 0), wait_step, 0)
+        last_half = xchg_step_half((steps - 1) * batch_size)
+
+        @pl.when(has_work)
+        def _():
+            for size, taken in xchg_step_sizes(last_half):
+
+                @pl.when(taken)
+                def _(size=size):
+                    s = step_slabs(size)
+                    pltpu.make_async_copy(s, s, recv_sem).wait()
+
+        pltpu.make_async_copy(send_wbuf, send_wbuf, xchg_sems.at[0]).wait()
+
+        # The own sends (W slabs per step) count on each step's ring slot.
+        for i in range(bo_x2_ref.shape[0]):
+            half_i = xchg_step_half(i * batch_size)
+            for size, taken in xchg_step_sizes(half_i):
+
+                @pl.when(jnp.logical_and(i < steps, taken))
+                def _(i=i, size=size):
+                    s = bo_x2_ref.at[i, :, pl.ds(0, size)]
+                    pltpu.make_async_copy(s, s, sems.at[2, i]).wait()
+
+        live = jnp.clip(start_end_seq_idx_ref[4] * send_per, 0, tl)
+        small_all_to_all.merge_weights(
+            recv_v_ref,
+            merge_w_ref,
+            num_cores=n,
+            word_row=SEND_PAD_ROWS - 1,
+            tl=tl,
+            rolled=True,
+        )
+
+        def merge_rows(c, carry):
+            first = pl.multiple_of(c * chunk, chunk)
+            rows = pl.ds(first, chunk)
+
+            @pl.when(first < live)
+            def _():
+                merged = small_all_to_all.merge_chunk(
+                    recv_v_ref,
+                    merge_w_ref,
+                    c,
+                    live,
+                    num_cores=n,
+                    part_row=SEND_PAD_ROWS,
+                )
+                merge_out_ref[rows, :] = pltpu.bitcast(merged, jnp.int16)
+
+            @pl.when(first >= live)
+            def _():
+                merge_out_ref[rows, :] = jnp.zeros((chunk, o_dim), jnp.int16)
+
+            return carry
+
+        lax.fori_loop(0, tl // chunk, merge_rows, 0)
+        copy = pltpu.make_async_copy(merge_out_ref, lse_hbm_ref, fill_sem)
+        copy.start()
+        copy.wait()
 
     def xchg_round():
         """small_all_to_all's round on the slabs: slab d into rows
@@ -3146,6 +3339,10 @@ def _attention_kernel(
 
         bo_sem_idx = sem_ids_ref[1]
         sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
+        if xchg_steps:
+            # One bo slot per grid step: a step never reuses a slot whose
+            # pushes may still be in flight.
+            bo_sem_idx = pl.program_id(0)
 
         def write_blse(batch_idx, m, l_sum):
             # log-sum-exp in the *unshifted* frame, so a peer holding a
@@ -3164,7 +3361,8 @@ def _attention_kernel(
         if not row_widths:
             wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
 
-        @pl.when(pl.program_id(0) >= 2)
+        # The multi-step exchange gives each step its own slot: no reuse wait.
+        @pl.when(pl.program_id(0) >= (pl.num_programs(0) if xchg_steps else 2))
         def _wait_send():
             # This slot holds the transfer from two batches earlier.
             sent_start = (
@@ -3518,7 +3716,9 @@ def _attention_kernel(
             functools.partial(start_fetch_bkv_batch, batch_start_seq_idx, 0),
         )
 
-    if xchg:
+    if xchg_steps:
+        pl.when(pl.program_id(0) == 0)(xchg_signal)
+    elif xchg:
         if xchg_merge and fault in ("send_peer_misorder", "send_peer_drop"):
             # Test only: a slot nobody writes reads NaN (before any peer can
             # push: they wait for this rank's barrier signal).
@@ -3536,7 +3736,9 @@ def _attention_kernel(
         process()
 
     is_last = pl.program_id(0) == pl.num_programs(0) - 1
-    if xchg:
+    if xchg_steps:
+        pl.when(is_last)(xchg_steps_finish)
+    elif xchg:
         build_send_lse_words()
         xchg_round()
         if xchg_merge:
@@ -3549,7 +3751,6 @@ def _attention_kernel(
             build_send_lse_words()
             send_words_copy().start()
 
-    @pl.when(jnp.logical_and(batch_end_seq_idx == end_seq_idx - 1, has_work))
     def epilogue():
         # Partial stores must wait for the same byte count as their send.
         last_even = (pl.num_programs(0) - 1) // 2 * 2
@@ -3565,6 +3766,11 @@ def _attention_kernel(
             wait_send_bo_batch(sent_start, 1)
             if return_lse:
                 _send_blse_batch(0, 1, wait=True)
+
+    if not xchg_steps:  # The multi-step exchange waits them before its merge.
+        pl.when(jnp.logical_and(batch_end_seq_idx == end_seq_idx - 1, has_work))(
+            epilogue
+        )
 
     if send and not xchg:
         pl.when(is_last)(lambda: send_words_copy().wait())
@@ -3889,6 +4095,11 @@ def sparse_ragged_paged_attention(
         the send buffer. `send_peer`: int32 [2], this rank's (DCP index,
         lane) as data. `send_recv_in` (optional): a buffer of that shape the
         result aliases (rows the exchange does not write keep its values).
+        In merge mode (a fifth entry True; `send_peer` then int32 [3], the
+        real-token count last) on a bucket the grid walks in several steps
+        (TPU_MLA_FUSED_XCHG_MAX_TOKENS), the kernel returns the merged rows'
+        words int16 `[T * L, V]`: `small_all_to_all(send, merge_live=,
+        live_rows=)`'s merge of the send-layout kernel's buffer, bit for bit.
       out_pieces: TPU_DCP_MLA_MERGE_PIECES. With `return_lse`,
         `lse_lane_dense` and `lse_mask_empty`, several chunks, and `out_pieces`
         equal token pieces that are whole chunks or divide one
@@ -4789,7 +5000,13 @@ def sparse_attention_chunk(
         if lse_fill:
             # Never empty: step 0 lays down the lse sentinel.
             grid = (jnp.maximum(grid[0], 1),)
-        if send_exchange is not None:
+        xchg_merge = bool(
+            send_exchange is not None and len(send_exchange) > 4 and send_exchange[4]
+        )
+        # Multi-step exchange (see SEND_SLAB_ROW0): the grid walks the real
+        # tokens in steps as without the exchange.
+        xchg_steps = send_exchange is not None and batch_size < q.shape[0]
+        if send_exchange is not None and not xchg_steps:
             # The fused exchange runs on a one-step grid (the whole bucket).
             assert send_world and lse_fill and batch_size == q.shape[0], (
                 send_world,
@@ -4798,6 +5015,8 @@ def sparse_attention_chunk(
                 q.shape,
             )
             grid = (1,)
+        if xchg_steps:
+            assert send_world and lse_fill and xchg_merge, (send_world, lse_fill)
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
@@ -4841,14 +5060,18 @@ def sparse_attention_chunk(
         )
 
         bo_double_buf = bq_double_buf
+        # Multi-step exchange: one bo (and blse) slot per grid step.
+        bo_slots = max(2, q.shape[0] // batch_size) if xchg_steps else 2
         if send_world:
             # Destination-major partial tile: W slabs of bsz * L rows (fused
-            # exchange: SEND_SLAB_ROW0 head rows first, the lse word row last).
+            # exchange on one step: SEND_SLAB_ROW0 head rows first, the lse
+            # word row last).
+            slab_head = send_exchange is not None and not xchg_steps
             bo_double_buf = pltpu.VMEM(
                 (
-                    2,
+                    bo_slots,
                     send_world,
-                    (SEND_SLAB_ROW0 if send_exchange is not None else 0)
+                    (SEND_SLAB_ROW0 if slab_head else 0)
                     + batch_size * num_q_heads // send_world,
                     q.shape[-1],
                 ),
@@ -4867,15 +5090,17 @@ def sparse_attention_chunk(
         if return_lse:
             scratch_shapes.append(
                 pltpu.VMEM(
-                    (2, batch_size, send_lanes or num_q_heads)
+                    (bo_slots, batch_size, send_lanes or num_q_heads)
                     if lse_lane_dense
-                    else (2, batch_size, num_q_heads, 1),
+                    else (bo_slots, batch_size, num_q_heads, 1),
                     jnp.float32,
                 )
             )
         # Semaphores for double buffering of bkv_nope, bq, bo, bkv_rope
         # (+ blse when the log-sum-exp is exported).
-        scratch_shapes.append(pltpu.SemaphoreType.DMA((5 if return_lse else 4, 2)))
+        scratch_shapes.append(
+            pltpu.SemaphoreType.DMA((5 if return_lse else 4, bo_slots))
+        )
         if capped_windows is not None:
             # Overflow fix-up: two window slots per cache, running max / sum /
             # accumulator, and a semaphore per (cache, slot).
@@ -4896,8 +5121,10 @@ def sparse_attention_chunk(
                 ),
                 # Fused exchange: (send, recv, local) DMA semaphores instead.
                 pltpu.SemaphoreType.DMA((3,))
-                if send_exchange is not None
+                if send_exchange is not None and not xchg_steps
                 else pltpu.VMEM((send_world, SEND_PAD_ROWS, q.shape[-1]), jnp.int16),
+                # Multi-step exchange: the head rows and the DMA semaphores.
+                *([pltpu.SemaphoreType.DMA((2,))] if xchg_steps else []),
                 pltpu.SemaphoreType.DMA(()),
             ]
         elif lse_fill:
@@ -4941,10 +5168,19 @@ def sparse_attention_chunk(
                 )
             )
 
-        xchg_merge = bool(
-            send_exchange is not None and len(send_exchange) > 4 and send_exchange[4]
-        )
-        if xchg_merge:
+        if xchg_steps:
+            # The merge weights, the merged rows and the receive scratch (the
+            # send blocks' layout), the last scratch refs.
+            assert send_recv_in is None, "merge mode has no receive buffer"
+            send_rows = q.shape[0] * num_q_heads // send_world
+            scratch_shapes += [
+                pltpu.VMEM((small_all_to_all.LANES,) * 2, jnp.float32),
+                pltpu.VMEM((send_rows, q.shape[-1]), jnp.int16),
+                pltpu.VMEM(
+                    (send_world, SEND_PAD_ROWS + send_rows, q.shape[-1]), jnp.int16
+                ),
+            ]
+        elif xchg_merge:
             # Merge mode: the receive scratch, the last scratch ref.
             assert send_recv_in is None, "merge mode has no receive buffer"
             scratch_shapes.append(
