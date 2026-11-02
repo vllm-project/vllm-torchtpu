@@ -42,6 +42,7 @@ from .modules import (
     experts_touched,
     pass_costs,
 )
+from .report import MAX_EMBEDDED_CANDIDATES, render_html, write_html
 from .serving import ConcurrencyRow, plan
 from .solver import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
@@ -91,9 +92,12 @@ __all__ = [
     "build_solve_payload",
     "emit_ceiling_rows",
     "emit_launch_args",
+    "MAX_EMBEDDED_CANDIDATES",
     "point_launch_args",
     "pool_cli_args",
+    "render_html",
     "top_layouts",
+    "write_html",
     "build_example_scenario",
     "dtypes_from_hf_config",
     "ep_busiest_experts",

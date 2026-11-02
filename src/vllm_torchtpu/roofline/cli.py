@@ -19,12 +19,14 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, replace
+from pathlib import Path
 
 from .chips import CHIPS
 from .emit import build_solve_payload, emit_ceiling_rows, emit_launch_args
 from .geometry import from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import Dtypes, Parallel, StepShape
+from .report import write_html
 from .serving import plan
 from .solver import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
@@ -124,6 +126,12 @@ def main(argv: list[str] | None = None) -> int:
 
     p_solve = sub.add_parser("solve")
     _add_scenario_args(p_solve)
+    p_solve.add_argument(
+        "--html",
+        type=Path,
+        default=None,
+        help="Write an offline HTML report to PATH.",
+    )
 
     p_emit = sub.add_parser("emit")
     _add_scenario_args(p_emit)
@@ -239,6 +247,12 @@ def main(argv: list[str] | None = None) -> int:
             for cmd_line in emitted["commands"]:
                 sys.stdout.write(cmd_line + "\n")
             return 0
+
+        if args.html is not None:
+            payload_html = build_solve_payload(
+                splan, chip=chip, dtypes=dt_auto, model=src
+            )
+            write_html(payload_html, args.html)
 
         if args.json:
             payload = build_solve_payload(splan, chip=chip, dtypes=dt_auto, model=src)
