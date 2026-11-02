@@ -66,6 +66,7 @@ from vllm_torchtpu.layers.adapter import (
     dcp_token_parallel_op,
     fused_moe_decode,
     fused_moe_ep,
+    token_padding,
 )
 from vllm_torchtpu.layers.adapter.attention import _retain_buffers
 from vllm_torchtpu.layers.adapter.linear_common import (
@@ -305,7 +306,6 @@ class _GatherProjections(_OProjReduceScatter):
             and dcp_token_parallel_op.applies(num_tokens)
             and not getattr(mla, "gate_is_fused", False)
             and getattr(mla, "kimi_preprocess", None) is None
-            and not getattr(mla, "qb_overlap", False)
             and idx_qown
             and mla.q_lora_rank is not None
         ):
@@ -373,11 +373,19 @@ def _all_rows(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
     return tensor_model_parallel_all_gather(x, 0).narrow(0, 0, num_tokens)
 
 
-def _moe(mlp: Any, x: torch.Tensor) -> torch.Tensor:
+def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
     """The MoE block on this rank's rows: routed (fused EP, own tokens) times
     the routed scale, plus the shared expert -- the runner's order."""
     experts = mlp.experts.routed_experts
     router_logits, _ = mlp.gate(x)
+    rank = fused_moe_ep.rank_operand()
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS and token_padding._padding_state is not None:
+        pad_mask = own_rows(
+            token_padding._padding_state.local_padding_mask.narrow(0, 0, num_tokens),
+            rank,
+            tp,
+        )
+        router_logits = torch.where(pad_mask[:, None], float("nan"), router_logits)
     routed = fused_moe_ep.run_sequence_parallel_op(
         getattr(mlp, OP_ATTR),
         x,
@@ -386,7 +394,7 @@ def _moe(mlp: Any, x: torch.Tensor) -> torch.Tensor:
         experts.w13_weight_scale_inv,
         experts.w2_weight_scale_inv,
         router_logits,
-        fused_moe_ep.rank_operand(),
+        rank,
         experts.e_score_correction_bias,
     )
     scale = getattr(mlp, SCALE_ATTR)
@@ -417,7 +425,7 @@ def _sequence_parallel_layer_forward(
     if not sharded_in:
         residual = own_rows(residual, fused_moe_ep.rank_operand(), tp)
     hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
-    return _moe(layer.mlp, hidden_states), residual
+    return _moe(layer.mlp, hidden_states, num_tokens, tp), residual
 
 
 def patched_decoder_layer_forward(
@@ -501,12 +509,7 @@ def check_config(vllm_config: Any) -> None:
             envs.USE_MOE_FUSED_EP_KERNEL
         ),
         "does not take USE_MOE_TP_DECODE_KERNEL": envs.USE_MOE_TP_DECODE_KERNEL,
-        "does not take TPU_FUSED_ADD_RMSNORM (its norm -> linear fp8 pairing "
-        "would hand the rank's rows to a gathered linear)": envs.TPU_FUSED_ADD_RMSNORM,
         "does not take TPU_DCP_MLA_OPROJ_ALL_REDUCE": envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE,
-        "does not take TPU_MOE_SKIP_PADDED_TOKENS (its mask is over all rows)": (
-            envs.TPU_MOE_SKIP_PADDED_TOKENS
-        ),
     }
     bad = [why for why, hit in refusals.items() if hit]
     if bad:
@@ -536,7 +539,12 @@ def _keep_list(mlp: torch.nn.Module) -> list[torch.Tensor]:
     """The layer's tensors plus the module-global operands the other buckets'
     MoE ops read (the decode kernel's rank buffer, when it is armed)."""
     seen: dict[int, torch.Tensor] = {}
-    extra = (fused_moe_ep.rank_operand(), fused_moe_decode.rank_operand())
+    pad_mask = (
+        token_padding._padding_state.local_padding_mask
+        if token_padding._padding_state is not None
+        else None
+    )
+    extra = (fused_moe_ep.rank_operand(), fused_moe_decode.rank_operand(), pad_mask)
     for t in (*mlp.parameters(), *mlp.buffers(), *getattr(mlp, SHARED_ATTR), *extra):
         if t is not None:
             seen.setdefault(id(t), t)

@@ -359,7 +359,7 @@ class TpuRMSNorm(RMSNorm):
             # The same rows predicate as the plain Pallas path above: no new
             # token-count branch. The paired linear takes (y_q, scale).
             assert self._op_quant is not None
-            y, y_q, scale, new_res = self._op_quant(x, residual, self.weight.data)
+            y, y_q, scale, new_res = self._op_quant(x, residual, self.weight)
             self._prequant_slot.value = (y_q, scale)
             return y, new_res
         if (
@@ -370,20 +370,20 @@ class TpuRMSNorm(RMSNorm):
             # Same rows predicate again. The paired MoE op takes (x_q, x_scale)
             # on its stage-A prefill kernel; y still feeds the router.
             assert self._op_quant_moe is not None
-            y, x_q, x_scale, new_res = self._op_quant_moe(x, residual, self.weight.data)
+            y, x_q, x_scale, new_res = self._op_quant_moe(x, residual, self.weight)
             self._prequant_moe_slot.value = (x_q, x_scale)
             return y, new_res
         if x.dim() == 2:
             # No view ops on the 2-D residual stream: a view the backend
             # lowers as a relayout would cost a full pass at these sizes.
             if residual is None:
-                return self._op_nores(x, self.weight.data)
-            return self._op_res(x, residual, self.weight.data)
+                return self._op_nores(x, self.weight)
+            return self._op_res(x, residual, self.weight)
         shape = x.shape
         x2 = x.reshape(-1, self.hidden_size)
         if residual is None:
-            return self._op_nores(x2, self.weight.data).reshape(shape)
+            return self._op_nores(x2, self.weight).reshape(shape)
         y, new_res = self._op_res(
-            x2, residual.reshape(-1, self.hidden_size), self.weight.data
+            x2, residual.reshape(-1, self.hidden_size), self.weight
         )
         return y.reshape(shape), new_res.reshape(shape)

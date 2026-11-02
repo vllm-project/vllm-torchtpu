@@ -2158,6 +2158,23 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and not self.skip_topk
             and self.q_lora_rank is not None
         )
+        dcp_indexer = (
+            getattr(getattr(self.indexer, "indexer_op", None), "dcp_size", 1) > 1
+        )
+        self._dcp_rank_keep = (
+            dcp_rank_operand()
+            if self.qb_overlap
+            and (self.dcp_group_size > 1 or dcp_indexer)
+            and envs.TPU_DCP_RANK_OPERAND
+            else None
+        )
+        self._dcp_lane_keep = (
+            dcp_lane_operand()
+            if self._dcp_rank_keep is not None
+            and envs.TPU_DCP_INDEXER_SMALL_AG
+            and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+            else None
+        )
 
         # TPU_MLA_ROPE_NEOX_PERMUTE: set once the q / k_pe projection columns
         # are in half-split order, which is what switches `forward` to NeoX
@@ -2250,6 +2267,18 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         kv_lora = None
         output_gate = None
         early_topk = None
+        if getattr(self, "qb_overlap", False):
+            cos_sin = (
+                getattr(self.rotary_emb, "cos_sin_cache", None)
+                if self.rotary_emb is not None
+                else None
+            )
+            hidden_states = _retain_buffers(
+                hidden_states,
+                cos_sin,
+                getattr(self, "_dcp_rank_keep", None),
+                getattr(self, "_dcp_lane_keep", None),
+            )
         # TPU_MOE_PREFILL_SEQUENCE_PARALLEL: `hidden_states` holds this rank's
         # rows; the group projects them and gathers the projections instead of
         # the hidden rows. From here on the gathered fused_qkv_a output stands
