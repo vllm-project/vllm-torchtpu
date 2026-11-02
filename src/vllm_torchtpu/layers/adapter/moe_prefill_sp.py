@@ -500,6 +500,19 @@ def install_forwards() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _fused_norm_reaches_split(vllm_config: Any) -> bool:
+    """Whether TPU_FUSED_ADD_RMSNORM's Pallas norm can run inside a split
+    bucket: its prefill gate (`rows > edge`) at a bucket's rows, or its decode
+    cap at the rank's rows a split bucket's norms see (T / tp)."""
+    largest = vllm_config.scheduler_config.max_num_batched_tokens
+    prefill_edge = envs.bucket_gate_edge(
+        max(envs.TPU_FUSED_ADD_RMSNORM_MIN_TOKENS, 256)
+    )
+    tp = vllm_config.parallel_config.tensor_parallel_size
+    decode_cap = envs.TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS
+    return largest > prefill_edge or decode_cap * tp > envs.bucket_gate_edge(MIN_TOKENS)
+
+
 def check_config(vllm_config: Any) -> None:
     """Raise for a server config the split does not serve."""
     parallel = vllm_config.parallel_config
@@ -517,8 +530,12 @@ def check_config(vllm_config: Any) -> None:
         "does not take USE_MOE_FUSED_EP_KERNEL (it owns every bucket)": (
             envs.USE_MOE_FUSED_EP_KERNEL
         ),
-        "does not take TPU_FUSED_ADD_RMSNORM (its norm -> linear fp8 pairing "
-        "would hand the rank's rows to a gathered linear)": envs.TPU_FUSED_ADD_RMSNORM,
+        "does not take TPU_FUSED_ADD_RMSNORM on split buckets (its norm -> "
+        "linear fp8 pairing would hand the rank's rows to a gathered linear): "
+        "keep TPU_FUSED_ADD_RMSNORM_MIN_TOKENS above --max-num-batched-tokens "
+        "and TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS below the rank's rows of "
+        "the smallest split bucket": envs.TPU_FUSED_ADD_RMSNORM
+        and _fused_norm_reaches_split(vllm_config),
         "does not take TPU_DCP_MLA_OPROJ_ALL_REDUCE": envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE,
     }
     bad = [why for why, hit in refusals.items() if hit]

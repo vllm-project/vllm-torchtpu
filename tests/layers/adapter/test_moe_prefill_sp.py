@@ -129,6 +129,7 @@ def _config(dtype=torch.bfloat16, **parallel):
         parallel_config=SimpleNamespace(**p),
         speculative_config=None,
         model_config=SimpleNamespace(dtype=dtype),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
     )
 
 
@@ -137,6 +138,8 @@ _OFF = dict(
     USE_MOE_FUSED_EP_KERNEL=False,
     USE_MOE_TP_DECODE_KERNEL=False,
     TPU_FUSED_ADD_RMSNORM=False,
+    TPU_FUSED_ADD_RMSNORM_MIN_TOKENS=512,
+    TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS=0,
     TPU_DCP_MLA_OPROJ_ALL_REDUCE=False,
     TPU_MOE_SKIP_PADDED_TOKENS=False,
 )
@@ -174,6 +177,33 @@ def test_unserved_configs_are_refused(parallel, flags, match):
     try:
         with pytest.raises(NotImplementedError, match=match):
             sp.check_config(_config(**parallel))
+    finally:
+        for p in patches:
+            p.stop()
+
+
+@pytest.mark.parametrize(
+    "min_tokens,decode_max,admitted",
+    [
+        (16384, 32, True),  # decode buckets only: a 1024 split is 64 rows a rank
+        (16384, 64, False),  # 64 rank rows of the 1024 split bucket
+        (8192, 32, False),  # the prefill gate takes the 8192 bucket
+    ],
+)
+def test_fused_norm_is_admitted_on_buckets_the_split_leaves(
+    min_tokens, decode_max, admitted
+):
+    patches = _with_envs(
+        TPU_FUSED_ADD_RMSNORM=True,
+        TPU_FUSED_ADD_RMSNORM_MIN_TOKENS=min_tokens,
+        TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS=decode_max,
+    )
+    try:
+        if admitted:
+            sp.check_config(_config())
+        else:
+            with pytest.raises(NotImplementedError, match="TPU_FUSED_ADD_RMSNORM"):
+                sp.check_config(_config())
     finally:
         for p in patches:
             p.stop()

@@ -303,6 +303,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
+    TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS: int = 0
     TPU_FUSED_ADD_RMSNORM_QUANT: bool = True
     TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = False
     TPU_MTP_EH_PROJ_TP: bool = False
@@ -2174,6 +2175,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN": env_int(
         "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN", 4096
+    ),
+    # With TPU_FUSED_ADD_RMSNORM: buckets of at most this many rows (a power of
+    # 2, at most 256, below the TPU_FUSED_ADD_RMSNORM_MIN_TOKENS gate) also take
+    # the Pallas pass, as one block of all rows, and with
+    # TPU_FUSED_ADD_RMSNORM_QUANT hand qkv_a its fp8 rows (a skinny-kernel
+    # linear keeps its own quant). Residual bit-identical; y can differ in the
+    # last bf16 ulp. 0 = off.
+    "TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS": env_int(
+        "TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS", 0
     ),
     # With TPU_FUSED_ADD_RMSNORM: a residual-stream norm whose output feeds a
     # per-channel FP8 linear (the MLA fused_qkv_a_proj; a dense layer's

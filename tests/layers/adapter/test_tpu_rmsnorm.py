@@ -93,6 +93,39 @@ def test_decode_sized_batches_keep_upstream_path(vllm_config_context):
     assert not n._use_pallas(wide[:, :6144], None)
 
 
+@pytest.mark.parametrize("rows", [4, 16])
+@pytest.mark.parametrize("has_res", [True, False])
+def test_decode_rows_take_the_kernel_with_the_decode_cap(
+    vllm_config_context, monkeypatch, rows, has_res
+):
+    """TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS: a decode bucket runs the kernel
+    as one block and matches the compiled native norm (residual bitwise)."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS", 16384)
+    monkeypatch.setattr(envs, "TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS", 64)
+    torch.manual_seed(rows)
+    torch._dynamo.reset()
+    n = _norm()
+    x = (0.7 * torch.randn(rows, 6144)).to(torch.bfloat16).to("tpu")
+    r = (4 * torch.randn(rows, 6144)).to(torch.bfloat16).to("tpu") if has_res else None
+    assert n._use_pallas(x, r)
+    got = n.forward(x, r)
+    compiled = torch.compile(n.forward_native, fullgraph=True, dynamic=False)
+    ref = compiled(x.clone(), None if r is None else r.clone())
+    _assert_close(got, ref, has_res)
+    big = torch.randn(1024, 6144).to(torch.bfloat16).to("tpu")
+    assert not n._use_pallas(big, big.clone())  # above the cap, below the gate
+
+
+def test_decode_cap_must_sit_below_the_prefill_gate(vllm_config_context, monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS", 512)
+    with pytest.raises(ValueError, match="DECODE_MAX_TOKENS"):
+        _norm()  # the default gate (512 rows) starts above 256
+
+
 def test_small_hidden_not_taken(vllm_config_context):
     n = _norm(hidden=512)
     x = torch.randn(4096, 512).to(torch.bfloat16).to("tpu")

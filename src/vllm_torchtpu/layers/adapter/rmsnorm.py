@@ -18,7 +18,12 @@ reduction and an apply pass that re-reads both inputs (and recomputes the
 add), so each norm moves ~1.75x the bytes it needs. Rows at or above
 ``TPU_FUSED_ADD_RMSNORM_MIN_TOKENS`` go to ``kernels/fused_add_rmsnorm``,
 which reads ``x``/``residual`` once and writes ``y``/``residual`` once. Smaller
-(decode) batches keep the upstream path untouched.
+(decode) batches keep the upstream path untouched, unless
+``TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS`` sends buckets of at most that many
+rows to the same kernel as one block (at decode XLA's reduction, apply, amax and
+convert are separate small ops). A pair whose linear runs the weight-streaming
+skinny kernel at decode (``FP8_PALLAS_N_ATTR``) keeps that kernel there: the
+decode norm hands it no pre-quantized rows.
 
 Imported only when the flag is set, so the flag-off model builds the stock
 ``RMSNorm`` class.
@@ -36,6 +41,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import fused_add_rmsnorm as kernel
 from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_N_ATTR,
     FP8_PALLAS_WEIGHT,
     PREQUANT_ATTR,
     PrequantSlot,
@@ -61,7 +67,13 @@ def _get_op(eps: float, has_residual: bool) -> Callable[..., Any]:
             def fn(
                 x: jax.Array, residual: jax.Array, weight: jax.Array
             ) -> tuple[jax.Array, jax.Array]:
-                return kernel.fused_add_rms_norm(x, residual, weight, eps=float(eps))
+                return kernel.fused_add_rms_norm(
+                    x,
+                    residual,
+                    weight,
+                    eps=float(eps),
+                    block_rows=kernel.block_rows_for(x.shape[0]),
+                )
 
             def fake(x, residual, weight):
                 return torch.empty_like(x), torch.empty_like(residual)
@@ -69,7 +81,13 @@ def _get_op(eps: float, has_residual: bool) -> Callable[..., Any]:
         else:
 
             def fn(x: jax.Array, weight: jax.Array) -> jax.Array:
-                return kernel.fused_add_rms_norm(x, None, weight, eps=float(eps))
+                return kernel.fused_add_rms_norm(
+                    x,
+                    None,
+                    weight,
+                    eps=float(eps),
+                    block_rows=kernel.block_rows_for(x.shape[0]),
+                )
 
             def fake(x, weight):
                 return torch.empty_like(x)
@@ -99,7 +117,12 @@ def _get_quant_op(eps: float, emit_y: bool):
             x: jax.Array, residual: jax.Array, weight: jax.Array
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             y, y_q, scale, new_res = kernel.fused_add_rms_norm_quant(
-                x, residual, weight, eps=float(eps), emit_y=emit_y
+                x,
+                residual,
+                weight,
+                eps=float(eps),
+                emit_y=emit_y,
+                block_rows=kernel.block_rows_for(x.shape[0]),
             )
             if y is None:
                 # No second consumer: y is dead and XLA drops this. Kept so a
@@ -153,6 +176,8 @@ def _pair(norm, linear, emit_y: bool) -> bool:
     slot = PrequantSlot()
     norm._prequant_slot = slot
     norm._op_quant = _get_quant_op(norm.variance_epsilon, emit_y)
+    # At decode the skinny kernel serves this linear from its own quant.
+    norm._prequant_decode = getattr(linear, FP8_PALLAS_N_ATTR, None) is None
     setattr(linear, PREQUANT_ATTR, slot)
     return True
 
@@ -167,6 +192,10 @@ def arm_prequant(model: torch.nn.Module) -> int:
     - ``post_attention_layernorm`` -> a dense MLP's ``gate_up_proj``. MoE
       layers are left alone: their router reads ``y`` and the fused MoE ops
       quantize with their own numerics.
+
+    With TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS the slot is also filled on
+    buckets of at most that many rows, for a linear off the skinny kernel only
+    (``_prequant_decode``).
 
     Call on the target model only (the drafter's norms stay upstream).
     """
@@ -315,6 +344,24 @@ class TpuRMSNorm(RMSNorm):
         self._min_rows = max(
             envs.TPU_FUSED_ADD_RMSNORM_MIN_TOKENS, kernel.DEFAULT_BLOCK_ROWS
         )
+        # TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS: a `rows <= cap` gate, disjoint
+        # from the prefill gate's `rows > edge` (two gates true at one bucket
+        # would pin the traced token count).
+        self._decode_max_rows = envs.TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS
+        cap = self._decode_max_rows
+        if cap and (
+            cap & (cap - 1)
+            or cap > envs.bucket_gate_edge(self._min_rows)
+            # Every bucket up to the cap is one block (`block_rows_for`).
+            or cap > kernel.DEFAULT_BLOCK_ROWS
+        ):
+            raise ValueError(
+                f"TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS={cap} must be a power of "
+                f"2 of at most {kernel.DEFAULT_BLOCK_ROWS}, below the prefill gate "
+                "(TPU_FUSED_ADD_RMSNORM_MIN_TOKENS="
+                f"{envs.TPU_FUSED_ADD_RMSNORM_MIN_TOKENS})"
+            )
+        self._prequant_decode = False
         self._pallas_ok = (
             self.has_weight
             and self.variance_size_override is None
@@ -347,15 +394,26 @@ class TpuRMSNorm(RMSNorm):
         ):
             return False
         rows = x.numel() // self.hidden_size
+        if self._decode_rows(rows):
+            return True
         # Cap rule: `rows > edge` (the bucket below `_min_rows`).
         return rows > envs.bucket_gate_edge(self._min_rows) and kernel.supports(
             rows, self.hidden_size
         )
 
+    def _decode_rows(self, rows: int) -> bool:
+        """A bucket TPU_FUSED_ADD_RMSNORM_DECODE_MAX_TOKENS sends to the kernel."""
+        return 0 < rows <= self._decode_max_rows
+
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
         if not self._use_pallas(x, residual):
             return super().forward(x, residual)
-        if self._prequant_slot is not None and residual is not None and x.dim() == 2:
+        if (
+            self._prequant_slot is not None
+            and residual is not None
+            and x.dim() == 2
+            and (self._prequant_decode or not self._decode_rows(x.shape[0]))
+        ):
             # The same rows predicate as the plain Pallas path above: no new
             # token-count branch. The paired linear takes (y_q, scale).
             assert self._op_quant is not None
@@ -366,6 +424,7 @@ class TpuRMSNorm(RMSNorm):
             self._prequant_moe_slot is not None
             and residual is not None
             and x.dim() == 2
+            and not self._decode_rows(x.shape[0])
         ):
             # Same rows predicate again. The paired MoE op takes (x_q, x_scale)
             # on its stage-A prefill kernel; y still feeds the router.

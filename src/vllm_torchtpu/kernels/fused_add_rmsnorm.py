@@ -38,6 +38,22 @@ from jax.experimental.pallas import tpu as pltpu
 # Rows per grid step. One [rows, 6144] bf16 tile is 3 MiB at 256 rows; measured
 # 74 us vs 81 us at 128 rows for 4096 x 6144 on v7x (j-97d7757a).
 DEFAULT_BLOCK_ROWS = 256
+# Scoped VMEM floor of a call: a prefill tile's, and a decode block's (a few
+# [rows, hidden] rows), which must leave XLA room to keep its prefetches of the
+# next ops' weights in VMEM across the call.
+_VMEM_FLOOR = 32 * 1024 * 1024
+_VMEM_FLOOR_SMALL = 4 * 1024 * 1024
+
+
+def block_rows_for(rows: int) -> int:
+    """The grid's row block: DEFAULT_BLOCK_ROWS, or all rows of a smaller (decode)
+    bucket as one block."""
+    return min(rows, DEFAULT_BLOCK_ROWS)
+
+
+def _vmem_limit(block_rows: int, tiles: int, tile: int) -> int:
+    floor = _VMEM_FLOOR if block_rows >= DEFAULT_BLOCK_ROWS else _VMEM_FLOOR_SMALL
+    return min(100 * 1024 * 1024, max(floor, tiles * tile))
 
 
 def _kernel(*refs, eps: float, has_residual: bool):
@@ -93,7 +109,7 @@ def fused_add_rms_norm(
     args.append(weight.reshape(1, hidden))
     # 2 (or 4) row tiles double-buffered plus ~4 f32 tile temporaries.
     tile = block_rows * hidden * 4
-    vmem_limit = min(100 * 1024 * 1024, max(32 * 1024 * 1024, 12 * tile))
+    vmem_limit = _vmem_limit(block_rows, 12, tile)
     outs = pl.pallas_call(
         functools.partial(_kernel, eps=eps, has_residual=has_residual),
         grid=(rows // block_rows,),
@@ -202,7 +218,7 @@ def _quant_call(
     ]
     out_specs += [row_spec, s_spec, row_spec]
     tile = block_rows * hidden * 4
-    vmem_limit = min(100 * 1024 * 1024, max(32 * 1024 * 1024, 14 * tile))
+    vmem_limit = _vmem_limit(block_rows, 14, tile)
     outs = pl.pallas_call(
         functools.partial(body, eps=eps, emit_y=emit_y, q_max=q_max),
         grid=(rows // block_rows,),
