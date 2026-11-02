@@ -24,6 +24,7 @@ Options:
   -t, --image-tag TAG      Tag for the built image (default: vllm-torchtpu-local)
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
       --target TARGET      Dockerfile stage to build: prod, dev, ci, or omni (default: prod)
+      --cache-from IMAGE   Registry image to use as BuildKit layer cache (repeatable)
   -h, --help               Show this help and exit
 
 Examples:
@@ -43,6 +44,7 @@ IMAGE_TAG="vllm-torchtpu-local"
 VLLM_SOURCE=""
 VLLM_COMMIT_HASH=""
 TARGET="prod"
+CACHE_FROM_ARGS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -61,6 +63,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --target)
       TARGET="$2"
+      shift 2
+      ;;
+    --cache-from)
+      CACHE_FROM_ARGS+=(--cache-from "$2")
       shift 2
       ;;
     -h|--help)
@@ -149,12 +155,13 @@ DOCKER_ARGS=(
   -f "${SCRIPT_DIR}/Dockerfile" \
   -t "${IMAGE_TAG}" \
   --target "${TARGET}" \
+  --build-arg BUILDKIT_INLINE_CACHE=1 \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
 )
 
 # Run docker build
-DOCKER_BUILDKIT=1 docker build "${DOCKER_ARGS[@]}" "${REPO_ROOT}"
+DOCKER_BUILDKIT=1 docker build "${DOCKER_ARGS[@]}" ${CACHE_FROM_ARGS[@]+"${CACHE_FROM_ARGS[@]}"} "${REPO_ROOT}"
 
 cleanup
 echo "===> Done!"
