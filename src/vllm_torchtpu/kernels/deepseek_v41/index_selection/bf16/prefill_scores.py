@@ -15,8 +15,9 @@ from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 
-from ..index_key_layout import DIM, ROW_WORDS, SLOTS
-from . import tuned_block_sizes
+from ...index_key_layout import DIM, ROW_WORDS, SLOTS
+from .. import tuned_block_sizes
+from .common import _block_max
 
 
 def supports_chunked_prefill(
@@ -56,37 +57,6 @@ def context_buckets(capacity: int) -> tuple[int, ...]:
         widths.append(width)
         width *= 2
     return (*widths, capacity)
-
-
-def _block_max(values, lanes, block_size):
-    indices = jnp.broadcast_to(
-        (jnp.arange(lanes // block_size) * block_size + block_size - 1)[None, :, None],
-        (values.shape[0], lanes // block_size, 1),
-    )
-    parts = []
-    for start in range(0, values.shape[1], lanes):
-        window = values[:, start : start + lanes]
-        for power in range(block_size.bit_length() - 1):
-            shift = 1 << power
-            window = jnp.maximum(window, pltpu.roll(window, shift, axis=1))
-        # Preserve the row batching dimension even for one query. take_along_axis
-        # squeezes it in that case, which Mosaic's gather lowering cannot handle.
-        parts.append(
-            jax.lax.gather(
-                window,
-                indices,
-                dimension_numbers=jax.lax.GatherDimensionNumbers(
-                    offset_dims=(),
-                    collapsed_slice_dims=(1,),
-                    start_index_map=(1,),
-                    operand_batching_dims=(0,),
-                    start_indices_batching_dims=(0,),
-                ),
-                slice_sizes=(1, 1),
-                mode="promise_in_bounds",
-            )
-        )
-    return jnp.concatenate(parts, axis=1)
 
 
 def _kernel(

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.decode_scores import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.decode_scores import (
     grouped_decode_scores,
 )
 
@@ -109,7 +109,7 @@ def test_grouped_decode_page_table_beyond_128_entries():
 
 @pytest.mark.cpu_test
 def test_candidate_union_membership_overflow_and_invalid_pages():
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.candidates import (
         union_metadata,
         union_record_starts,
     )
@@ -141,7 +141,7 @@ def test_candidate_union_membership_overflow_and_invalid_pages():
 def test_long_candidate_union_preserves_membership_and_overflow(
     logical_blocks, capacity, queries
 ):
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.candidates import (
         union_metadata,
     )
 
@@ -191,7 +191,7 @@ def test_candidate_scores_match_independent_per_head_reference(
     if not interpret and jax.default_backend() != "tpu":
         pytest.skip("Native candidate DMA scoring requires TPU")
     from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout as layout
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.candidates import (
         _candidate_scores,
         union_metadata,
     )
@@ -270,7 +270,7 @@ def test_candidate_scores_match_independent_per_head_reference(
     ],
 )
 def test_sparse_candidate_union_exact(queries, logical_blocks, capacity):
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.candidates import (
         union_metadata,
     )
 
@@ -314,7 +314,7 @@ def test_decode_scores_write_flat_rows_with_ragged_lengths(
 ):
     if jax.default_backend() != "tpu":
         pytest.skip("Persistent DMA scoring requires TPU")
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection import decode_scores
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import decode_scores
 
     rng = np.random.default_rng(949)
     heads, width = 32, 4096

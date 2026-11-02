@@ -28,7 +28,7 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     native, old_topk, _, _ = load_kernels(root)
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import candidates
 
     inputs, _, _ = fixture(
         args.requests, 6, args.width, args.width - 1, 128, True, "random", 2, args.seed
@@ -73,12 +73,12 @@ def main():
     candidate_block_ids = jnp.asarray(candidate_block_ids, jnp.int32)
 
     def prepare(pool, records, candidate_block_ids):
-        meta = candidate.union_metadata(
+        meta = candidates.union_metadata(
             candidate_block_ids,
             logical_blocks=args.width // 8,
             capacity_blocks=capacity // 8,
         )
-        starts, bits = candidate.union_record_starts(
+        starts, bits = candidates.union_record_starts(
             meta,
             records,
             block_size=8,
@@ -140,7 +140,7 @@ def main():
     }
     for tile in args.tiles:
         fn = functools.partial(
-            candidate.candidate_indexer, block_size=8, request_tile=tile
+            candidates.candidate_indexer, block_size=8, request_tile=tile
         )
 
         def invoke(fn=fn):
@@ -176,7 +176,7 @@ def main():
         def chain(tile=tile):
             cache = prepare(pool, records, candidate_block_ids)
             return tuple(
-                candidate.candidate_indexer(
+                candidates.candidate_indexer(
                     qi, wi, *cache, lengths, block_size=8, request_tile=tile
                 )
                 for qi, wi in zip(qs, ws)

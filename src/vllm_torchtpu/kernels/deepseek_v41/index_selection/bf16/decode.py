@@ -16,10 +16,10 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, ROW_WORDS, SLOTS
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    decode_scores,
     publication,
     streaming_topk,
 )
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import decode_scores
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     DecodeTuningKey,
     PersistentScoreConfig,

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout, indexer
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.prefill_scores import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.prefill_scores import (
     prefill_index_scores,
 )
 

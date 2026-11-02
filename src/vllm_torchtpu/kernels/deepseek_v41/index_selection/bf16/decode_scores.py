@@ -15,41 +15,11 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, SLOTS
-from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    prefill_scores,
-    tuned_block_sizes,
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import tuned_block_sizes
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.common import (
+    _block_max,
+    _reduce_heads,
 )
-
-
-def _reduce_heads(logits, weights, queries, stripe):
-    query_group = math.gcd(queries, stripe)
-    head_group = stripe // query_group
-    grouped_rows = queries * head_group
-    width = logits.shape[-1]
-    accumulated = jnp.zeros((grouped_rows, width), jnp.float32)
-    # Consume aligned head/query stripes without padding Q=6 to eight queries.
-    # Reassociate the FP32 reduction; identical FP32 bits are not required.
-    for chunk in range(weights.shape[0]):
-        activated = jnp.maximum(
-            logits[chunk * grouped_rows : (chunk + 1) * grouped_rows, :], 0
-        )
-        accumulated = accumulated + activated * weights[chunk, :, None]
-    accumulated = accumulated.reshape(queries // query_group, stripe, width)
-    outputs = []
-    for group in range(queries // query_group):
-        head_parts = [
-            accumulated[group, h * query_group : (h + 1) * query_group, :]
-            for h in range(head_group)
-        ]
-        # Preserve the existing cyclic reduction's FP32 addition order, while
-        # leaving only the dependency tree for returned query rows live.
-        for shift in reversed(range(head_group.bit_length() - 1)):
-            head_parts = [
-                head_parts[h] + head_parts[(h - (1 << shift)) % head_group]
-                for h in range(head_group)
-            ]
-        outputs.append(head_parts[0])
-    return jnp.concatenate(outputs, axis=0)
 
 
 def _prepare_queries(q, weights, query_out, weight_out, head_group, start):
@@ -540,9 +510,7 @@ def _grouped_decode_scores(
                     write_values(tokens, r, start, values)
                     if block_size:
                         block_parts.append(
-                            prefill_scores._block_max(
-                                values, info.num_lanes, block_size
-                            )
+                            _block_max(values, info.num_lanes, block_size)
                         )
                 if block_size:
                     write_values(

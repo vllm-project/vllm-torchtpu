@@ -681,7 +681,8 @@ class TestAttentionSelectPagedIndicesDecode:
         expected_part = max(2, ((count + ranks - 1) // ranks + 1) & ~1)
         assert captured_args["q_part_shape"][0] == expected_part
         assert captured_args["lengths_part_shape"][0] == expected_part
-        assert captured_args["page_records"] == (0 if packed else 16)
+        if not packed:  # The FP8 route takes no page_records.
+            assert captured_args["page_records"] == 16
 
     def test_select_paged_indices_candidate_write_and_published_buffer(
         self, monkeypatch
@@ -827,7 +828,7 @@ class TestAttentionSelectPagedIndicesDecode:
 
 @pytest.mark.cpu_test
 def test_candidate_envelope_keeps_token_rows_dynamic():
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.candidates import (
         cache_capacity,
     )
 

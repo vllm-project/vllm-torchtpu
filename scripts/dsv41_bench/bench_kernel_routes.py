@@ -43,7 +43,10 @@ def main() -> None:
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     native, _, _, _ = load_kernels(root)
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate, decode
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import (
+        candidates as candidate,
+    )
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import decode
 
     relative = Path("src/vllm_torchtpu/kernels/deepseek_v41/index_selection")
     for name in ("scores.py", "streaming_topk.py", "union.py"):

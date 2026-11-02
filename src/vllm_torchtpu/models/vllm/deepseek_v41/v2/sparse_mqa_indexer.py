@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import cache_capacity
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.candidates import (
+    cache_capacity,
+)
 
 from . import indexer_impl
 from .cache import IndexCacheRows

@@ -16,16 +16,18 @@ from vllm_torchtpu.kernels.deepseek_v41 import (
     indexer,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    decode as decode_index_selection,
-)
-from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    packed_scores,
-    prefill_scores,
     publication,
     streaming_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     tuned_block_sizes as prefill_tuning,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import (
+    decode as decode_index_selection,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import (
+    prefill_scores,
+    word_scores,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
     PAGE_RECORDS,
@@ -699,7 +701,7 @@ def _prefill_top_k(scores, lengths, *, k: int, scheduling_group_id: int | None =
 
 
 def _score_word_rows(q: jax.Array, weights: jax.Array, words: jax.Array) -> jax.Array:
-    """`packed_scores.score_word_rows` on every device (replicated)."""
+    """`word_scores.score_word_rows` on every device (replicated)."""
     from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -707,7 +709,7 @@ def _score_word_rows(q: jax.Array, weights: jax.Array, words: jax.Array) -> jax.
     )
 
     score = functools.partial(
-        packed_scores.score_word_rows,
+        word_scores.score_word_rows,
         interpret=jax.default_backend() != "tpu",
     )
     try:

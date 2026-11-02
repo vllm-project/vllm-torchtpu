@@ -20,11 +20,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41 import indexer
 from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, ROW_WORDS, SLOTS
-from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    decode,
-    decode_scores,
-    tuned_block_sizes,
-)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import tuned_block_sizes
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import common, decode
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
     streaming_topk,
 )
@@ -257,7 +254,7 @@ def _score_kernel(
                 logits = logits.reshape(queries, heads, compute_tile)
                 values = (jnp.maximum(logits, 0) * weights[row][:, :, None]).sum(1)
             else:
-                values = decode_scores._reduce_heads(
+                values = common._reduce_heads(
                     logits, weights[row], queries, head_stripe
                 )
             # Divide the static strides first so Mosaic can prove lane alignment.
