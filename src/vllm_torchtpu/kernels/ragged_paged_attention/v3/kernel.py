@@ -321,14 +321,14 @@ def _ragged_paged_attention_kernel_loop(
     bkv_update_ids_ref,
     # Input
     # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing,
-    #     q_packing, head_dim]
+    #     q_packing, head_dim], with the first two axes swapped if
+    #     fuse_non_tiling_axis_swap.
     q_hbm_ref,
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,
     # Output
-    # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing,
-    #     q_packing, head_dim]
+    # Same shape as q_hbm_ref.
     o_hbm_ref,
     # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     updated_kv_cache_hbm_ref,
@@ -363,6 +363,7 @@ def _ragged_paged_attention_kernel_loop(
     bq_csz,  # bq compute size
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
+    fuse_non_tiling_axis_swap: bool = False,
     debug_mode: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -372,13 +373,16 @@ def _ragged_paged_attention_kernel_loop(
         use_causal_mask = False
 
     out_dtype = acc_ref.dtype
+    q_shape = q_hbm_ref.shape
+    if fuse_non_tiling_axis_swap:
+        q_shape = (q_shape[1], q_shape[0], *q_shape[2:])
     (
         actual_num_kv_heads,
         max_num_tokens,
         num_q_heads_per_kv_head_per_packing,
         q_packing,
         head_dim,
-    ) = q_hbm_ref.shape
+    ) = q_shape
     (
         total_num_pages,
         page_size,
@@ -714,6 +718,28 @@ def _ragged_paged_attention_kernel_loop(
                 wait=True,
             )
 
+    def _copy_token_major_block(hbm_ref, vmem_ref, start, sz, sem, *, to_hbm, wait):
+        """Copies tokens [start, start + sz) between token-major HBM and the
+        head-major VMEM block, swapping the token and kv head axes in the DMA."""
+        if wait:
+            # Every copy below signals `sem`; one wait for the whole block's bytes.
+            block = (
+                hbm_ref.at[pl.ds(start, sz)] if to_hbm else vmem_ref.at[:, pl.ds(0, sz)]
+            )
+            _async_copy(block, block, sem, wait=True)
+            return
+        if bq_sz == 1:
+            # A single token's heads are contiguous on both sides.
+            copies = [(hbm_ref.at[start], vmem_ref.at[:, 0])]
+        else:
+            copies = [
+                (hbm_ref.at[pl.ds(start, sz), h], vmem_ref.at[h, pl.ds(0, sz)])
+                for h in range(actual_num_kv_heads)
+            ]
+        for hbm, vmem in copies:
+            src, dst = (vmem, hbm) if to_hbm else (hbm, vmem)
+            _async_copy(src, dst, sem, wait=False)
+
     def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
         vmem_ref = bq_x2_ref.at[bq_sem_idx]
@@ -731,6 +757,11 @@ def _ragged_paged_attention_kernel_loop(
         debug_print("[RPA debug] q_end={}", q_end)
         debug_print("[RPA debug] sz={}", sz)
 
+        if fuse_non_tiling_axis_swap:
+            _copy_token_major_block(
+                q_hbm_ref, vmem_ref, q_len_start, sz, sem, to_hbm=False, wait=wait
+            )
+            return
         _async_copy(
             q_hbm_ref.at[:, pl.ds(q_len_start, sz)],
             vmem_ref.at[:, pl.ds(0, sz)],
@@ -755,6 +786,11 @@ def _ragged_paged_attention_kernel_loop(
         debug_print("[RPA debug] q_end={}", q_end)
         debug_print("[RPA debug] sz={}", sz)
 
+        if fuse_non_tiling_axis_swap:
+            _copy_token_major_block(
+                o_hbm_ref, vmem_ref, q_len_start, sz, sem, to_hbm=True, wait=wait
+            )
+            return
         _async_copy(
             vmem_ref.at[:, pl.ds(0, sz)],
             o_hbm_ref.at[:, pl.ds(q_len_start, sz)],
@@ -1624,13 +1660,14 @@ def get_default_block_sizes(
         "p_block_sizes",
         "m_block_sizes",
         "vmem_limit_bytes",
+        "fuse_non_tiling_axis_swap",
         "debug_mode",
         "disable_bounds_checks",
         "disable_semaphore_checks",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
-def ragged_paged_attention(
+def _ragged_paged_attention(
     queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     values: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
@@ -1664,6 +1701,7 @@ def ragged_paged_attention(
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
+    fuse_non_tiling_axis_swap: bool = False,
     # Debug params.
     debug_mode: bool = False,
     disable_bounds_checks: bool = True,
@@ -1701,6 +1739,9 @@ def ragged_paged_attention(
       p_block_sizes: the block sizes for the prefill case.
       m_block_sizes: the block sizes for the mixed case.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
+      fuse_non_tiling_axis_swap: if true, the kernel DMAs the token-major queries
+        and outputs straight into and out of its head-major VMEM blocks, instead
+        of XLA transposing them in HBM before and after the kernel.
       debug_mode: if true, RPA does not issue any DMAs or run flash attention but
         print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
       disable_bounds_checks: if true, disable bounds checks.
@@ -1750,19 +1791,16 @@ def ragged_paged_attention(
         vmem_limit_bytes=vmem_limit_bytes,
     )
 
-    actual_num_q_heads = q.shape[1]
-    actual_head_dim = q.shape[2]
+    max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     actual_num_kv_heads = k.shape[1]
 
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
-    q, kv = prepare_inputs(q, k, v, fuse_non_tiling_axis_swap=False)
+    q, kv = prepare_inputs(q, k, v, fuse_non_tiling_axis_swap=fuse_non_tiling_axis_swap)
     (
-        _,
-        max_num_tokens,
         num_q_heads_per_kv_head_per_q_packing,
         q_packing,
         head_dim,
-    ) = q.shape
+    ) = q.shape[2:]
     page_size = kv_cache.shape[1]
     num_kv_heads_x2_per_kv_packing = kv_cache.shape[2]
     max_num_seqs = kv_lens.shape[0]
@@ -1875,6 +1913,7 @@ def ragged_paged_attention(
                 bq_csz=bq_csz,
                 bkv_csz=bkv_csz,
                 case=case,
+                fuse_non_tiling_axis_swap=fuse_non_tiling_axis_swap,
                 debug_mode=debug_mode,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1978,9 +2017,26 @@ def ragged_paged_attention(
             q,
             actual_num_q_heads_per_kv_head,
             actual_head_dim,
-            fuse_non_tiling_axis_swap=False,
+            fuse_non_tiling_axis_swap=fuse_non_tiling_axis_swap,
         ),
         kv_cache,
+    )
+
+
+def ragged_paged_attention(
+    *args,
+    fuse_non_tiling_axis_swap: bool | None = None,
+    **kwargs,
+) -> tuple[jax.Array, jax.Array]:
+    """See `_ragged_paged_attention`.
+
+    Resolves `fuse_non_tiling_axis_swap=None` from USE_RPA_PIPELINED_DMA_STAGING
+    outside the jit, so the env value is never baked into a cached trace.
+    """
+    if fuse_non_tiling_axis_swap is None:
+        fuse_non_tiling_axis_swap = envs.USE_RPA_PIPELINED_DMA_STAGING
+    return _ragged_paged_attention(
+        *args, fuse_non_tiling_axis_swap=fuse_non_tiling_axis_swap, **kwargs
     )
 
 
@@ -2002,13 +2058,14 @@ def ragged_paged_attention(
         "p_block_sizes",
         "m_block_sizes",
         "vmem_limit_bytes",
+        "fuse_non_tiling_axis_swap",
         "debug_mode",
         "disable_bounds_checks",
         "disable_semaphore_checks",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_bundle"),
 )
-def ragged_paged_attention_bundled(
+def _ragged_paged_attention_bundled(
     queries: jax.Array,
     keys: jax.Array,
     values: jax.Array,
@@ -2044,7 +2101,7 @@ def ragged_paged_attention_bundled(
         num_blocks * num_layers, *kv_cache_bundle.shape[2:]
     )
     flat_page_indices = page_indices * num_layers + layer_idx
-    out, new_flat_bundle = ragged_paged_attention(
+    out, new_flat_bundle = _ragged_paged_attention(
         queries,
         keys,
         values,
@@ -2059,3 +2116,17 @@ def ragged_paged_attention_bundled(
         num_blocks, num_layers, *new_flat_bundle.shape[1:]
     )
     return out, new_bundle
+
+
+def ragged_paged_attention_bundled(
+    *args,
+    fuse_non_tiling_axis_swap: bool | None = None,
+    **kwargs,
+) -> tuple[jax.Array, jax.Array]:
+    """See `_ragged_paged_attention_bundled`; resolves
+    `fuse_non_tiling_axis_swap` like `ragged_paged_attention`."""
+    if fuse_non_tiling_axis_swap is None:
+        fuse_non_tiling_axis_swap = envs.USE_RPA_PIPELINED_DMA_STAGING
+    return _ragged_paged_attention_bundled(
+        *args, fuse_non_tiling_axis_swap=fuse_non_tiling_axis_swap, **kwargs
+    )
