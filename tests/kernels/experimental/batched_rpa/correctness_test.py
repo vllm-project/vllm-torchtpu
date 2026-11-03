@@ -224,6 +224,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         nan_new_seq_idx: int | None = None,
         mask_invalid_v: bool | None = None,
         fp8_compute: bool = False,
+        rpa_kwargs: dict | None = None,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
@@ -430,6 +431,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             decode_query_size=decode_query_size,
             mask_invalid_v=mask_invalid_v,
             fp8_compute=fp8_compute,
+            **(rpa_kwargs or {}),
         )
         output = output[: cu_q_lens[distribution[-1]]]
 
@@ -661,6 +663,55 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             kv_layout=kv_layout,
             distribution=jnp.array([2, 2, len(seq_lens)], dtype=jnp.int32),
             fp8_compute=True,
+        )
+
+    @parameterized.product(
+        sliding_window=[None, 128],
+        k_scale=[None, 0.75],
+        rpa_kwargs=[{"unmasked_interior": True}],
+    )
+    def test_ragged_paged_attention_fp8_compute_options(
+        self, sliding_window, k_scale, rpa_kwargs
+    ):
+        if not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("Expect TPU7x+ (fp8 MXU)")
+        # Prompts longer than several KV blocks, none a whole number of blocks,
+        # so interior, diagonal and window-edge steps all occur.
+        seq_lens = [(1, 300), (1, 77), (192, 328), (256, 1500), (128, 2100)]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (32, 8),
+            512,
+            256,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            1000,
+            sliding_window=sliding_window,
+            k_scale=k_scale,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            distribution=jnp.array([2, 2, len(seq_lens)], dtype=jnp.int32),
+            fp8_compute=True,
+            rpa_kwargs=rpa_kwargs,
+        )
+
+    @parameterized.product(
+        sliding_window=[None, 5, 128],
+        rpa_kwargs=[{"unmasked_interior": True}],
+    )
+    def test_ragged_paged_attention_bf16_options(self, sliding_window, rpa_kwargs):
+        seq_lens = [(1, 300), (80, 300), (40, 560), (96, 96)]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (4, 2),
+            128,
+            16,
+            jnp.bfloat16,
+            jnp.bfloat16,
+            1000,
+            sliding_window=sliding_window,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            distribution=jnp.array([1, 1, len(seq_lens)], dtype=jnp.int32),
+            rpa_kwargs=rpa_kwargs,
         )
 
     @parameterized.product(
