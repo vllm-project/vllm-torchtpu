@@ -90,6 +90,7 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
 )
+from vllm_torchtpu.layers.adapter.rpa_v3_kv_write_op import write_new_kv_
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
     attention_bundled,
@@ -1648,6 +1649,75 @@ class PallasAttentionBackendImpl(AttentionImpl):
             output.copy_(outputs)
         return outputs
 
+    def supports_kv_cache_write(self, kv_cache: torch.Tensor | None = None) -> bool:
+        """Whether write_kv_cache can store this layer's K/V without attention.
+
+        Covers the layer-major RPA v3 pool only. The hd64 kernel packs K/V
+        along the head dim, and the block-major, bundled, KV-sharing and
+        context-parallel paths write through other layouts or not at all.
+
+        The pools are allocated after the layers are built, so the layer's
+        config alone cannot rule out the 4-D packed pool that layers of mixed
+        head geometry share. Pass the layer's bound kv_cache to check the pool
+        too; the memory-profiling placeholder (numel() == 0) passes.
+        """
+        return (
+            self.head_size != 64
+            and self.kv_sharing_target_layer_name is None
+            and not self._pool_is_seq_along_lane
+            and not self._bm_kernel
+            and not envs.VLLM_TPU_BLOCK_MAJOR_KV
+            and not self._pcp_streaming
+            and self.dcp_world_size == 1
+            and (kv_cache is None or kv_cache.numel() == 0 or kv_cache.ndim == 5)
+        )
+
+    def write_kv_cache(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        """Store key/value into kv_cache exactly as forward() would, without
+        computing attention. key, value: [num_tokens, num_kv_heads, head_size]
+        or flattened to [num_tokens, num_kv_heads * head_size]. Raises
+        ValueError unless supports_kv_cache_write(kv_cache)."""
+        if not self.supports_kv_cache_write(kv_cache):
+            raise ValueError(
+                "write_kv_cache supports only the 5-D layer-major RPA v3 pool; "
+                f"got a {tuple(kv_cache.shape)} pool for a layer with "
+                f"head_size={self.head_size}. Check supports_kv_cache_write("
+                "kv_cache) first."
+            )
+        # For determine_available_memory case, as in forward().
+        if kv_cache.numel() == 0:
+            return
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
+        # A pool shared with wider layers has a wider head dim; zero-pad K/V
+        # to it, as forward() does.
+        pad_size = kv_cache.shape[-1] - self.head_size
+        if pad_size > 0:
+            key = torch.nn.functional.pad(key, (0, pad_size))
+            value = torch.nn.functional.pad(value, (0, pad_size))
+        if self.kv_cache_quantized_dtype:
+            k_scale_value = layer._k_scale_float
+            v_scale_value = layer._v_scale_float
+            if k_scale_value == 0.0 or v_scale_value == 0.0:
+                raise ValueError("k_scale_float and v_scale_float must be non-zero")
+            key, quantized_value = quantize_kv(
+                self.kv_cache_quantized_dtype, key, value, k_scale_value, v_scale_value
+            )
+            assert quantized_value is not None
+            value = quantized_value
+        if key.dtype != kv_cache.dtype:
+            raise ValueError(
+                f"K/V dtype {key.dtype} does not match the KV cache's {kv_cache.dtype}"
+            )
+        write_new_kv_(kv_cache, key, value, attn_metadata)
+
 
 class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
@@ -1663,6 +1733,11 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
+
+    def supports_kv_cache_write(self, kv_cache: torch.Tensor | None = None) -> bool:
+        # The batched RPA pool layout is not the v3 layout write_kv_cache
+        # reproduces.
+        return False
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
