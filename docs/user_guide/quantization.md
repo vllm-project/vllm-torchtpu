@@ -48,6 +48,7 @@ For checkpoints whose native block granularity or weight dtype is not optimal fo
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype when requantizing linear weights at load time. |
 | `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size when requantizing linear weights at load time. |
 | `TPU_FP8_LINEAR_W8A16_MAX_ROWS` | `0` | Opt-in. FP8 linear steps whose padded token bucket (from `compile_sizes`) has at most this many rows skip activation quantization and run bf16 activations against the FP8 weights (W8A16). Speeds up small decode steps on v7x; applies to the per-channel path with FP8 weights only, so the blockwise kernel path and `REQUANTIZE_WEIGHT_DTYPE=int8` are unaffected. |
+| `VLLM_TPU_FP8_FAST_BF16_ACT_QUANT` | `0` | Opt-in. Keeps dynamic FP8 activation quantization division in `bfloat16` rather than upcasting `[M, K]` activations to `float32` before casting to `float8_e4m3fn`. Applies to the per-channel dense-linear path with FP8 weights and `bfloat16` activations only, so the blockwise `gmm_v2` path and `REQUANTIZE_WEIGHT_DTYPE=int8` are unaffected. |
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for MoE expert weights (set to `fp4` with `MOE_FUSED_EP_ENABLE_W4A8=1` for W4A8 MoE execution). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size (e.g., `512`) for load-time MoE weight requantization. |
 

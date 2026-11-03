@@ -101,6 +101,7 @@ class VllmQuantLinearConfig:
         self.requant_block_size = envs.REQUANTIZE_BLOCK_SIZE
         self.requant_weight_dtype = envs.REQUANTIZE_WEIGHT_DTYPE
         self.w8a16_max_rows = envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
+        self.bf16_act_quant = envs.VLLM_TPU_FP8_FAST_BF16_ACT_QUANT
 
         # TODO: Implement proper sharding configuration for TPU
         # This should determine weight/bias sharding based on layer type

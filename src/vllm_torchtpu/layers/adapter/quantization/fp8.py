@@ -33,10 +33,12 @@ them into the runtime FP8 layout consumed by the Pallas matmul bridge in
 `vllm_torchtpu/layers/adapter/linear_common.py`. Activations are quantized
 dynamically inside the bridge, except that TPU_FP8_LINEAR_W8A16_MAX_ROWS (off
 by default) keeps bf16 activations (W8A16) for small token buckets on the
-per-channel path with FP8 weights. By default the bridge dispatches to a pure-JAX
-`dot_general`-based per-channel FP8 matmul (`xla_quantized_matmul`); setting
-ENABLE_QUANTIZED_MATMUL_KERNEL=1 together with REQUANTIZE_BLOCK_SIZE selects
-the blockwise Pallas kernel path instead.
+per-channel path with FP8 weights, and VLLM_TPU_FP8_FAST_BF16_ACT_QUANT (off by
+default) keeps the per-channel activation quantization division in bfloat16
+instead of promoting [M, K] activations to float32. By default the bridge
+dispatches to a pure-JAX `dot_general`-based per-channel FP8 matmul
+(`xla_quantized_matmul`); setting ENABLE_QUANTIZED_MATMUL_KERNEL=1 together
+with REQUANTIZE_BLOCK_SIZE selects the blockwise Pallas kernel path instead.
 """
 
 from __future__ import annotations
@@ -1399,6 +1401,11 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             if linear_config is not None
             else envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
         )
+        self.bf16_act_quant = (
+            linear_config.bf16_act_quant
+            if linear_config is not None
+            else envs.VLLM_TPU_FP8_FAST_BF16_ACT_QUANT
+        )
 
         if quant_config.is_checkpoint_fp8_serialized:
             self._linear_quant_config = _get_linear_quant_config(self.linear_config)
@@ -1692,6 +1699,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 weight,
                 layer.weight_scale,
                 w8a16_max_rows=self.w8a16_max_rows,
+                bf16_act_quant=self.bf16_act_quant,
             )
         if bias is not None:
             out = out + bias
