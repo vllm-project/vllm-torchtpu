@@ -55,7 +55,9 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
     MHCOps,
     get_mhc_ops,
+    get_mhc_post_head_op,
     get_mhc_post_op,
+    split_fn_chunks,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
@@ -124,6 +126,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             torch.empty(3, dtype=torch.float32),
             requires_grad=False,
         )
+        # What the mHC ops read in place of hc_*_fn; see split_hc_fns.
+        for name in ("hc_attn_fn_chunks", "hc_ffn_fn_chunks"):
+            self.register_buffer(
+                name,
+                torch.empty(3 * mix_hc, hc_dim, dtype=torch.bfloat16),
+                persistent=False,
+            )
+        self._hc_fns_split = False
+
+    def split_hc_fns(self) -> None:
+        """Split hc_attn_fn / hc_ffn_fn into the ops' bf16 chunks, once.
+
+        The split depends on the weights alone; done inside the forward it
+        was an XLA fusion before every mHC call of every step. Called by
+        the model's load_weights.
+        """
+        self.hc_attn_fn_chunks.copy_(split_fn_chunks(self.hc_attn_fn))
+        self.hc_ffn_fn_chunks.copy_(split_fn_chunks(self.hc_ffn_fn))
+        self._hc_fns_split = True
 
     @property
     def mhc_ops(self) -> MHCOps:
@@ -147,7 +168,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     def hc_pre(
         self,
         x: torch.Tensor,
-        hc_fn: torch.Tensor,
+        hc_fn_chunks: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -156,7 +177,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         The gate constants are baked into the op, so only the tensors are
         passed; this just puts `layer_input` first for the caller.
         """
-        post_mix, res_mix, layer_input = self.mhc_ops.pre(x, hc_fn, hc_scale, hc_base)
+        post_mix, res_mix, layer_input = self.mhc_ops.pre(
+            x, hc_fn_chunks, hc_scale, hc_base
+        )
         return layer_input, post_mix, res_mix
 
     def forward(
@@ -175,11 +198,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
         """
+        assert self._hc_fns_split, (
+            "the mHC ops read hc_*_fn_chunks; the model's load_weights is "
+            "expected to call split_hc_fns()"
+        )
         if residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                x, self.hc_attn_fn_chunks, self.hc_attn_scale, self.hc_attn_base
             )
         else:
             residual, post_mix, res_mix, x = self.mhc_ops.fused(
@@ -187,7 +214,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 residual,
                 post_mix,
                 res_mix,
-                self.hc_attn_fn,
+                self.hc_attn_fn_chunks,
                 self.hc_attn_scale,
                 self.hc_attn_base,
             )
@@ -200,7 +227,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             residual,
             post_mix,
             res_mix,
-            self.hc_ffn_fn,
+            self.hc_ffn_fn_chunks,
             self.hc_ffn_scale,
             self.hc_ffn_base,
         )
@@ -335,6 +362,14 @@ class DeepseekV4Model(nn.Module):
             torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
+        # hc_head_fn rounded to bf16, what mhc_post_head_op reads; see
+        # split_hc_head_fn.
+        self.register_buffer(
+            "hc_head_fn_bf16",
+            torch.empty(self.hc_mult, self.hc_dim, dtype=torch.bfloat16),
+            persistent=False,
+        )
+        self._hc_head_fn_split = False
 
         if get_pp_group().is_last_rank:
             self._mtp_hidden_buffer = torch.empty(
@@ -362,6 +397,28 @@ class DeepseekV4Model(nn.Module):
             op = get_mhc_post_op()
             object.__setattr__(self, "_mhc_post_op_instance", op)
         return op
+
+    @property
+    def mhc_post_head_op(self):
+        """The op that settles the last layer's post and collapses the
+        streams for the head in one kernel.
+
+        Built once outside the trace, like ``mhc_post_op``.
+        """
+        op = self.__dict__.get("_mhc_post_head_op_instance")
+        if op is None:
+            op = get_mhc_post_head_op(self.rms_norm_eps, self.hc_eps)
+            object.__setattr__(self, "_mhc_post_head_op_instance", op)
+        return op
+
+    def split_hc_head_fn(self) -> None:
+        """Round hc_head_fn to bf16 for mhc_post_head_op, once at load.
+
+        The hi chunk of ``split_fn_chunks``: round to nearest even, as XLA
+        rounds the head's f32 projection operands.
+        """
+        self.hc_head_fn_bf16.copy_(split_fn_chunks(self.hc_head_fn)[: self.hc_mult])
+        self._hc_head_fn_split = True
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -463,14 +520,31 @@ class DeepseekV4Model(nn.Module):
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
 
+        head_collapsed = False
         if post_mix is not None:
             if (
                 final_aux_recon is not None
                 and self.end_layer in self.aux_hidden_state_layers
             ):
                 hidden_states = final_aux_recon
+            elif get_pp_group().is_last_rank:
+                # Fused path: settle the post the last layer deferred and
+                # collapse the streams for the head in the same kernel.
+                assert self._hc_head_fn_split, (
+                    "mhc_post_head_op reads hc_head_fn_bf16; load_weights is "
+                    "expected to call split_hc_head_fn()"
+                )
+                hidden_states = self.mhc_post_head_op(
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_head_fn_bf16,
+                    self.hc_head_scale,
+                    self.hc_head_base,
+                )
+                head_collapsed = True
             else:
-                # Fused path: settle the post the last layer deferred.
                 hidden_states = self.mhc_post_op(
                     hidden_states, residual, post_mix, res_mix
                 )
@@ -478,14 +552,15 @@ class DeepseekV4Model(nn.Module):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        hidden_states = mhc_collapse_head(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
+        if not head_collapsed:
+            hidden_states = mhc_collapse_head(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
         hidden_states = self.norm(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
@@ -603,6 +678,12 @@ class DeepseekV4Model(nn.Module):
                         continue
         finally:
             staged.flush_all()
+
+        for module in self.modules():
+            if isinstance(module, DeepseekV4DecoderLayer):
+                module.split_hc_fns()
+            elif isinstance(module, DeepseekV4Model):
+                module.split_hc_head_fn()
 
         return loaded_params
 

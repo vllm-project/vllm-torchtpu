@@ -437,6 +437,11 @@ def _make_fused_inputs(rng, num_tokens, hidden_size):
     )
 
 
+def _split_fn(args, index):
+    """``args`` with its f32 fn at ``index`` split as the kernels take it."""
+    return (*args[:index], utils.stack_fn3(args[index]), *args[index + 1 :])
+
+
 def _fused_args(rng, num_tokens, hidden_size, sinkhorn_repeat=20):
     x, res, plm, crm, fn, sc, hb = _make_fused_inputs(rng, num_tokens, hidden_size)
     return (
@@ -473,7 +478,9 @@ class MhcFusedPostPrePallasSmallShapeTest(parameterized.TestCase):
         fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
 
         want_res, want_post, want_comb, want_layer = _ref_mhc_fused_post_pre(*args)
-        got_res, got_post, got_comb, got_layer = fused_fn(*args, token_block_size=64)
+        got_res, got_post, got_comb, got_layer = fused_fn(
+            *_split_fn(args, 4), token_block_size=64
+        )
 
         self.assertEqual(got_res.shape, want_res.shape)
         self.assertEqual(got_res.dtype, jnp.bfloat16)
@@ -519,7 +526,7 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
         fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
 
         want = _ref_mhc_fused_post_pre(*args)
-        got = fused_fn(*args, token_block_size=token_block_size)
+        got = fused_fn(*_split_fn(args, 4), token_block_size=token_block_size)
 
         for g, w, tol in zip(got, want, ("bf16", "f32", "f32", "bf16")):
             rtol, atol = (
@@ -528,6 +535,57 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
                 else (FUSED_F32_RTOL, FUSED_F32_ATOL)
             )
             np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
+
+
+def _ref_mhc_post_head(x, residual, post_mix, comb_mix, head_fn, head_scale, head_base):
+    """The model head (``mhc_collapse_head``) on the reference post's
+    output, its projection in one bf16 pass as XLA runs an f32 dot."""
+    settled = _ref_mhc_post(x, residual, post_mix, comb_mix)
+    flat = settled.reshape(settled.shape[0], -1).astype(jnp.float32)
+    norm = flat * jax.lax.rsqrt(jnp.mean(flat * flat, -1, keepdims=True) + RMS_EPS)
+    logits = jnp.dot(
+        norm.astype(jnp.bfloat16),
+        head_fn.astype(jnp.bfloat16).T,
+        preferred_element_type=jnp.float32,
+    )
+    pre_mix = jax.nn.sigmoid(logits * head_scale + head_base) + HC_PRE_EPS
+    return jnp.sum(pre_mix[..., None] * settled.astype(jnp.float32), axis=-2).astype(
+        jnp.bfloat16
+    )
+
+
+@pytest.mark.tpu_test
+class MhcPostHeadPallasTpuTest(parameterized.TestCase):
+    """Compiled (Mosaic) post + head kernel vs the post reference followed
+    by the model head. Needs TPU hardware."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(num_tokens=[16, 17, 128, 1024])
+    def test_matches_reference(self, num_tokens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        rng = np.random.default_rng(11)
+        post_args = _make_post_inputs(rng, num_tokens, 4096)
+        head_fn = jnp.asarray(
+            rng.standard_normal((HC_MULT, HC_MULT * 4096), dtype=np.float32) * 0.02
+        ).astype(jnp.bfloat16)
+        head_scale = jnp.asarray([0.5], jnp.float32)
+        head_base = jnp.asarray(rng.standard_normal(HC_MULT, dtype=np.float32))
+
+        want = _ref_mhc_post_head(*post_args, head_fn, head_scale, head_base)
+        got = fused_post_pre_kernel.mhc_post_head(
+            *post_args, head_fn, head_scale, head_base, RMS_EPS, HC_PRE_EPS
+        )
+
+        self.assertEqual(got.shape, want.shape)
+        self.assertEqual(got.dtype, jnp.bfloat16)
+        np.testing.assert_allclose(
+            _to_np(got), _to_np(want), rtol=BF16_RTOL, atol=BF16_ATOL
+        )
 
 
 @pytest.mark.tpu_test
@@ -629,7 +687,7 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         )
 
         want_post, want_comb, want_layer = _ref_mhc_pre(*args)
-        got_post, got_comb, got_layer = pre_kernel.mhc_pre(*args)
+        got_post, got_comb, got_layer = pre_kernel.mhc_pre(*_split_fn(args, 1))
 
         self.assertEqual(got_layer.dtype, jnp.bfloat16)
         np.testing.assert_allclose(
@@ -641,6 +699,25 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         np.testing.assert_allclose(
             _to_np(got_layer), _to_np(want_layer), rtol=BF16_RTOL, atol=BF16_ATOL
         )
+
+
+class MhcSplitFnChunksTest(parameterized.TestCase):
+    """The model's load-time host split of fn is bit-equal to stack_fn3."""
+
+    def test_host_split_matches_stack_fn3(self):
+        pytest.importorskip("torch_tpu")
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
+            split_fn_chunks,
+        )
+
+        rng = np.random.default_rng(12)
+        fn = rng.standard_normal((24, 4096), dtype=np.float32) * 0.02
+        # Rounding ties, zeros of both signs and the extremes of the range.
+        fn[0, :6] = [1 + 2.0**-8, 1 + 3 * 2.0**-8, 0.0, -0.0, 3e38, 2.0**-120]
+
+        want = np.asarray(utils.stack_fn3(jnp.asarray(fn))).view(np.uint16)
+        got = split_fn_chunks(torch.from_numpy(fn)).view(torch.int16).numpy()
+        np.testing.assert_array_equal(got.view(np.uint16), want)
 
 
 if __name__ == "__main__":
