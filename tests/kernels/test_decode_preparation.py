@@ -164,3 +164,20 @@ def test_mhc_pre_entry():
             np.testing.assert_array_equal(np.asarray(got), want)
         else:
             np.testing.assert_allclose(np.asarray(got), want, rtol=2e-5, atol=2e-6)
+
+
+def test_csa2_bridge_registration(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import csa2_adapter
+
+    mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("data",))
+    monkeypatch.setattr(
+        csa2_adapter,
+        "get_vllm_model_wrapper_context",
+        lambda: SimpleNamespace(mesh=mesh),
+    )
+    monkeypatch.setattr(csa2_adapter, "get_pallas_op_mesh", lambda: mesh)
+    csa2_adapter.initialize_csa2_ops()
+    assert "prepare_publish_swa" in csa2_adapter._ops
+    assert "prepare_publish_swa_banked" in csa2_adapter._ops

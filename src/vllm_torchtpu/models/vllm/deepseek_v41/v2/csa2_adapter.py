@@ -202,20 +202,41 @@ def _fake_metadata(table, starts, positions, minimum, page_size, *_):
     )
 
 
-def _prepare_publish_swa(raw, table, starts, positions, minimum, values):
+def _prepare_publish_swa(
+    raw: jax.Array,
+    table: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum: jax.Array,
+    values: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     from vllm_torchtpu.kernels.experimental.decode_preparation import (
         swa_prepare_publish,
     )
 
-    return swa_prepare_publish((raw,), table, starts, positions, minimum, values)
+    owner, metadata, bounds, records = swa_prepare_publish(
+        (raw,), table, starts, positions, minimum, values
+    )
+    return owner, metadata, bounds, records
 
 
-def _prepare_publish_swa_banked(raw, high, table, starts, positions, minimum, values):
+def _prepare_publish_swa_banked(
+    raw: jax.Array,
+    high: jax.Array,
+    table: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum: jax.Array,
+    values: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     from vllm_torchtpu.kernels.experimental.decode_preparation import (
         swa_prepare_publish,
     )
 
-    return swa_prepare_publish((raw, high), table, starts, positions, minimum, values)
+    owner, upper, metadata, bounds, records = swa_prepare_publish(
+        (raw, high), table, starts, positions, minimum, values
+    )
+    return owner, upper, metadata, bounds, records
 
 
 def _fake_prepare_publish_swa(raw, table, starts, positions, minimum, values):
