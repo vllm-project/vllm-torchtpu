@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Chunk boundaries preserve ragged requests, SWA visibility and cached KV."""
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,7 +15,10 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     prepare_swa_metadata,
 )
 from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
-from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import csa2_pipeline
+from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
+    csa2_gather_chunk_size,
+    csa2_pipeline,
+)
 from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
 
 
@@ -275,3 +280,187 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
     np.testing.assert_allclose(
         reused, attend(next_q, expected_words, expected_scales), atol=2e-3, rtol=2e-2
     )
+
+
+def _offset_inputs(ragged):
+    tokens, heads, page_size = 40, 8, 32
+    rng = np.random.default_rng(7)
+
+    def random(shape):
+        return jnp.asarray(rng.standard_normal(shape) * 0.2, jnp.bfloat16)
+
+    if ragged:
+        starts = jnp.array([0, 15, 15, 40], jnp.int32)
+        positions = jnp.array([*range(100, 115), *range(300, 325)], jnp.int32)
+    else:
+        starts = jnp.array([0, 40], jnp.int32)
+        positions = jnp.arange(200, 240, dtype=jnp.int32)
+    batch = starts.shape[0] - 1
+    words, scales = encode_csa2_kv(random((97, 512)))
+    counts = jnp.array(rng.integers(0, 513, tokens), jnp.int32)
+    records = jnp.array(rng.integers(0, 97, (tokens, 512)), jnp.int32)
+    records = jnp.where(jnp.arange(512) < counts[:, None], records, 0)
+    table = jnp.arange(1, 1 + batch * 16, dtype=jnp.int32).reshape(batch, 16)
+    metadata, _, _ = prepare_swa_metadata(
+        table,
+        starts,
+        positions,
+        jnp.zeros(batch, jnp.int32),
+        page_size=page_size,
+        page_stride=page_size,
+        row_offset=0,
+    )
+    angles = jnp.asarray(rng.standard_normal((tokens, 64)) * 0.1)
+    rope = jnp.stack(
+        (
+            jnp.concatenate((jnp.ones_like(angles), jnp.cos(angles)), axis=1),
+            jnp.concatenate((jnp.zeros_like(angles), jnp.sin(angles)), axis=1),
+        ),
+        axis=1,
+    )
+    return dict(
+        main_kv=words[records],
+        main_kv_scale=scales[records],
+        swa_kv=random((1 + batch * 16, page_size, 512)).at[0].set(0),
+        starts=starts,
+        positions=positions,
+        sink=jnp.linspace(-1, 1, heads, dtype=jnp.float32),
+        rope_cache=rope,
+        swa_metadata=metadata,
+        main_lengths=counts,
+    ), random
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="CSA2 attention")
+def test_offset_attention_updates_only_its_owner_rows(ragged):
+    # A chunk call writes attention and staged KV to rows [offset, offset + T)
+    # of the aliased owners; every other owner row keeps its contents.
+    inputs, random = _offset_inputs(ragged)
+    tokens, offset = inputs["positions"].shape[0], 24
+    q = random((96, 8, 512))
+    rows = np.arange(offset, offset + tokens)
+    expected = csa2(q[rows], **inputs, bq=8)
+    out = random(q.shape)
+    kv_out = jnp.asarray(
+        np.random.default_rng(3).integers(-(2**31), 2**31, (96, 512, 128)), jnp.int32
+    )
+    got, got_kv = csa2(q, **inputs, bq=8, query_offset=offset, out=out, kv_out=kv_out)
+    others = np.setdiff1d(np.arange(96), rows)
+    np.testing.assert_array_equal(got[rows], expected)
+    np.testing.assert_array_equal(got[others], out[others])
+    np.testing.assert_array_equal(got_kv[rows], inputs["main_kv"])
+    np.testing.assert_array_equal(got_kv[others], kv_out[others])
+
+
+def test_offset_attention_requires_matching_owners():
+    inputs, random = _offset_inputs(False)
+    q = random((96, 8, 512))
+    with pytest.raises(ValueError, match="require out and kv_out"):
+        csa2(q, **inputs, query_offset=24)
+    with pytest.raises(ValueError, match="together"):
+        csa2(q, **inputs, query_offset=24, out=q)
+    with pytest.raises(ValueError, match="excludes"):
+        csa2(
+            q,
+            **inputs,
+            query_offset=24,
+            out=q,
+            kv_out=jnp.zeros((96, 512, 128), jnp.int32),
+            new_owners=True,
+        )
+    with pytest.raises(ValueError, match="within q"):
+        csa2(
+            q,
+            **inputs,
+            query_offset=60,
+            out=q,
+            kv_out=jnp.zeros((96, 512, 128), jnp.int32),
+        )
+
+
+def test_new_owner_attention_writes_offset_rows():
+    # The first chunk allocates both owners; only its rows are defined.
+    if jax.default_backend() != "tpu":
+        pytest.skip("CSA2 attention")
+    inputs, random = _offset_inputs(True)
+    tokens, offset = inputs["positions"].shape[0], 24
+    q = random((96, 8, 512))
+    rows = np.arange(offset, offset + tokens)
+    expected = csa2(q[rows], **inputs, bq=8)
+    got, got_kv = csa2(q, **inputs, bq=8, query_offset=offset, new_owners=True)
+    assert got.shape == q.shape and got_kv.shape == (96, 512, 128)
+    np.testing.assert_array_equal(got[rows], expected)
+    np.testing.assert_array_equal(got_kv[rows], inputs["main_kv"])
+
+
+def test_chunked_pipeline_writes_owners_without_joins(sparsecore_device):
+    # Chunked attention writes its output and gathered KV in place: no
+    # whole-T update, concatenation or copy of either owner remains, also
+    # when several layers' pipelines share one program.
+    tokens, heads = 256, 8
+    words, scales = encode_csa2_kv(jnp.zeros((257, 512), jnp.bfloat16))
+    table = jnp.arange(1, 17, dtype=jnp.int32).reshape(1, 16)
+    starts = jnp.array([0, tokens], jnp.int32)
+    positions = jnp.arange(tokens, dtype=jnp.int32)
+    metadata, _, _ = prepare_swa_metadata(
+        table,
+        starts,
+        positions,
+        jnp.zeros(1, jnp.int32),
+        page_size=32,
+        page_stride=32,
+        row_offset=0,
+    )
+
+    def layer(q, records):
+        return csa2_pipeline(
+            q,
+            words,
+            scales,
+            records,
+            jnp.zeros((17, 32, 512), jnp.bfloat16),
+            starts,
+            positions,
+            jnp.zeros(heads, jnp.float32),
+            jnp.zeros((tokens, 2, 128), jnp.float32),
+            metadata,
+            None,
+            jnp.full(tokens, 512, jnp.int32),
+            chunk_size=64,
+            bq=8,
+            scale=512**-0.5,
+            compress_ratio=2,
+        )
+
+    def two_layers(q, records):
+        # Identical uninitialized owners would be merged across layers and
+        # one layer's owners copied, so each layer must allocate its own.
+        first = layer(q, records)
+        second = layer(first[0], records)
+        return first, second
+
+    text = (
+        jax.jit(two_layers)
+        .lower(
+            jax.ShapeDtypeStruct((tokens, heads, 512), jnp.bfloat16),
+            jax.ShapeDtypeStruct((tokens, 512), jnp.int32),
+        )
+        .compile()
+        .as_text()
+    )
+    owners = rf"(s32\[{tokens},512,128\]|bf16\[{tokens},{heads},512\])"
+    joins = re.findall(
+        rf"= {owners}\S* (fusion|concatenate|dynamic-update-slice|copy)\(", text
+    )
+    assert not joins, joins
+
+
+def test_gather_chunk_size_splits_only_measured_small_buckets():
+    # The 288-query decode bucket was measured faster in 96-row chunks; other
+    # buckets up to 512 queries stay one chunk, larger ones use 128 rows.
+    assert csa2_gather_chunk_size(288) == 96
+    for tokens in (1, 6, 128, 144, 287, 289, 512):
+        assert csa2_gather_chunk_size(tokens) == tokens
+    for tokens in (513, 2048, 8192):
+        assert csa2_gather_chunk_size(tokens) == 128
