@@ -25,6 +25,8 @@ from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX_DEFAULT_NEGATIVE_PR
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
+from tests_omni.omni_test_utils import compare_video_to_golden
+
 LTX2_MODEL_ID = "Lightricks/LTX-2"
 LTX2_PROMPT = (
     "A golden retriever runs across a sunny meadow toward the camera and barks "
@@ -226,49 +228,19 @@ def compare_ltx2_to_golden(
 ) -> dict[str, float]:
     """Compare LTX-2 outputs with a golden video and audio.
 
-    Video (uint8 [F, H, W, 3]): mean per-frame MAE and SSIM (single window, per
-    channel), the largest per-channel mean shift, and the output-to-golden
-    ratios of high-frequency energy (mean absolute Laplacian: drops with blur,
-    rises with noise) and of motion (mean absolute frame-to-frame difference).
+    Video: the shared ``compare_video_to_golden`` metrics, prefixed ``video_``.
     Audio (float32 [2, N]): mean absolute log-spectrogram difference and RMS
     ratio. No waveform metrics: bf16 alone drops the waveform cosine vs fp32 to
     0.70-0.89.
     """
-    assert out.video.shape == golden_video.shape, (out.video.shape, golden_video.shape)
     assert out.audio.shape == golden_audio.shape, (out.audio.shape, golden_audio.shape)
-    x = out.video.astype(np.float64) / 255.0
-    y = golden_video.astype(np.float64) / 255.0
-    hw = (1, 2)
-    mu_x, mu_y = x.mean(hw, keepdims=True), y.mean(hw, keepdims=True)
-    cov = ((x - mu_x) * (y - mu_y)).mean(hw, keepdims=True)
-    var_x, var_y = x.var(hw, keepdims=True), y.var(hw, keepdims=True)
-    c1, c2 = 0.01**2, 0.03**2
-    ssim = (
-        (2 * mu_x * mu_y + c1)
-        * (2 * cov + c2)
-        / ((mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2))
-    )
-    hf_x, hf_y = (
-        np.abs(
-            4 * v[:, 1:-1, 1:-1]
-            - v[:, :-2, 1:-1]
-            - v[:, 2:, 1:-1]
-            - v[:, 1:-1, :-2]
-            - v[:, 1:-1, 2:]
-        ).mean()
-        for v in (x, y)
-    )
-    motion_x, motion_y = (np.abs(np.diff(v, axis=0)).mean() for v in (x, y))
+    video_metrics = compare_video_to_golden(out.video, golden_video)
     logspec_x, logspec_y = (_log_spectrogram(a) for a in (out.audio, golden_audio))
     rms_x, rms_y = (
         np.sqrt(np.mean(a.astype(np.float64) ** 2)) for a in (out.audio, golden_audio)
     )
     return {
-        "video_mae": float(np.abs(x - y).mean()),
-        "video_ssim": float(ssim.mean()),
-        "video_mean_shift": float(np.abs(mu_x.mean(0) - mu_y.mean(0)).max()),
-        "video_hf_ratio": float(hf_x / max(hf_y, 1e-9)),
-        "video_motion_ratio": float(motion_x / max(motion_y, 1e-9)),
+        **{f"video_{name}": value for name, value in video_metrics.items()},
         "audio_logspec_l1": float((logspec_x - logspec_y).abs().mean()),
         "audio_rms_ratio": float(rms_x / max(rms_y, 1e-12)),
     }
