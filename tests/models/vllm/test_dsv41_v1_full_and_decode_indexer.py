@@ -46,7 +46,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v1 import (
     replay_plan as v1_replay_plan,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
-    indexer_impl as v2_indexer_ops,
+    indexer_bf16,
+    indexer_select,
 )
 
 # ==============================================================================
@@ -2070,7 +2071,7 @@ class TestDecodeIndexerCandidateContext:
         requests = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
 
         # 1. pages = True (page_records=16, tile multiple of 16)
-        scores_pages = v2_indexer_ops.paged_index_scores_jax(
+        scores_pages = indexer_bf16.paged_index_scores_jax(
             q,
             pool,
             records,
@@ -2082,7 +2083,7 @@ class TestDecodeIndexerCandidateContext:
         assert scores_pages.shape == (tokens, width)
 
         # 2. pages = False (page_records=None)
-        scores_nopages = v2_indexer_ops.paged_index_scores_jax(
+        scores_nopages = indexer_bf16.paged_index_scores_jax(
             q,
             pool,
             records,
@@ -2113,9 +2114,9 @@ class TestDecodeIndexerCandidateContext:
         def _mock_sc_topk(scores, k, lengths):
             return jnp.full((scores.shape[0], k), 0, dtype=jnp.int32)
 
-        monkeypatch.setattr(v2_indexer_ops, "_sparsecore_top_k", _mock_sc_topk)
+        monkeypatch.setattr(indexer_select, "_sparsecore_top_k", _mock_sc_topk)
 
-        selected_uo, cand_uo = v2_indexer_ops.paged_indexer_jax(
+        selected_uo, cand_uo = indexer_bf16.paged_indexer_jax(
             q,
             pool,
             records,
@@ -2133,7 +2134,7 @@ class TestDecodeIndexerCandidateContext:
         assert selected_uo.shape == (tokens, topk)
         assert cand_uo is candidates
 
-        selected_ord, cand_ord = v2_indexer_ops.paged_indexer_jax(
+        selected_ord, cand_ord = indexer_bf16.paged_indexer_jax(
             q,
             pool,
             records,

@@ -20,7 +20,7 @@ from .cache import (
     merge_pieces,
     split_pieces,
 )
-from .indexer_impl import _compact_selected
+from .indexer_select import _compact_selected
 
 _attention_op = None
 _attention_2bank_op = None

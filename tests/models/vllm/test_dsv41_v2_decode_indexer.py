@@ -50,7 +50,11 @@ import pytest
 import torch
 
 import vllm_torchtpu.models.vllm.deepseek_v41.v2.attention as v2_attn
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+    indexer_bf16,
+    indexer_fp8,
+    indexer_select,
+)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
     _index_page_records,
 )
@@ -60,18 +64,18 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     gather_cache_page_values,
     gather_cache_values,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
-    PackedFP8IndexCacheRows,
-)
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_bf16 import (
     _INDEX_KEYS_PER_ITER,
     _INDEX_MAX_TILE,
-    _visible_top_k,
     initialize_indexer,
     paged_index_scores_jax,
     paged_indexer,
     select_indexer_jax,
 )
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
+    PackedFP8IndexCacheRows,
+)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select import _visible_top_k
 
 
 class TestGatherCachePageValues:
@@ -346,7 +350,7 @@ class TestAttentionKernelsDecodeIndexer:
             sparsecore_calls.append((scores.shape, k))
             return jnp.zeros((scores.shape[0], k), dtype=jnp.int32)
 
-        monkeypatch.setattr(indexer_ops, "_sparsecore_top_k", mock_sc_top_k)
+        monkeypatch.setattr(indexer_select, "_sparsecore_top_k", mock_sc_top_k)
 
         bound = jnp.int32(2048)
 
@@ -414,7 +418,7 @@ class TestAttentionKernelsDecodeIndexer:
                 args[5],
             )
 
-        monkeypatch.setattr(indexer_ops, "_indexer_op", mock_op)
+        monkeypatch.setattr(indexer_bf16, "_indexer_op", mock_op)
 
         q = torch.zeros(4, 2, 128)
         pool = torch.zeros(16, ROW_WORDS, dtype=torch.int32)
@@ -522,13 +526,13 @@ class TestAttentionKernelsDecodeIndexer:
 
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
         with set_vllm_model_wrapper_context(mesh=mesh):
-            indexer_ops._indexer_op = None
+            indexer_bf16._indexer_op = None
             initialize_indexer()
-            assert indexer_ops._indexer_op is not None
+            assert indexer_bf16._indexer_op is not None
             # Test early return branch
-            saved_op = indexer_ops._indexer_op
+            saved_op = indexer_bf16._indexer_op
             initialize_indexer()
-            assert indexer_ops._indexer_op is saved_op
+            assert indexer_bf16._indexer_op is saved_op
 
         # Verify fake registration by calling op with meta device tensors
         q = torch.empty((4, 2, 128), dtype=torch.bfloat16, device="meta")
@@ -541,9 +545,9 @@ class TestAttentionKernelsDecodeIndexer:
         batch_max = torch.empty((1,), dtype=torch.int32, device="meta")
 
         op = (
-            indexer_ops._indexer_op
+            indexer_bf16._indexer_op
             if bank_count == 1
-            else indexer_ops._indexer_2bank_op
+            else indexer_bf16._indexer_2bank_op
         )
         f_sel, f_pub = op(
             q,
@@ -667,8 +671,8 @@ class TestAttentionSelectPagedIndicesDecode:
                 candidates_part,
             )
 
-        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
-        monkeypatch.setattr(indexer_ops, "paged_fp8_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_bf16, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_fp8, "paged_fp8_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(
             attn, count, cache_offset=16 * 256, packed=packed
@@ -681,7 +685,8 @@ class TestAttentionSelectPagedIndicesDecode:
         expected_part = max(2, ((count + ranks - 1) // ranks + 1) & ~1)
         assert captured_args["q_part_shape"][0] == expected_part
         assert captured_args["lengths_part_shape"][0] == expected_part
-        assert captured_args["page_records"] == (0 if packed else 16)
+        if not packed:  # The FP8 route takes no page_records.
+            assert captured_args["page_records"] == 16
 
     def test_select_paged_indices_candidate_write_and_published_buffer(
         self, monkeypatch
@@ -710,7 +715,7 @@ class TestAttentionSelectPagedIndicesDecode:
                 pub_part,
             )
 
-        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_bf16, "paged_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(attn, count)
 
@@ -754,7 +759,7 @@ class TestAttentionSelectPagedIndicesDecode:
                 candidates_part,
             )
 
-        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_bf16, "paged_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(attn, count)
 
@@ -791,7 +796,7 @@ class TestAttentionSelectPagedIndicesDecode:
                 candidates_part,
             )
 
-        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_bf16, "paged_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(attn, count)
 
@@ -812,7 +817,7 @@ class TestAttentionSelectPagedIndicesDecode:
             layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 0)
             index_cache_2b = IndexCacheRows((raw_lo, raw_hi), layout)
             monkeypatch.setattr(
-                indexer_ops,
+                indexer_bf16,
                 "paged_indexer",
                 lambda q_part, idx_c, *a, **kw: (
                     torch.zeros(q_part.shape[0], 4, dtype=torch.int32),
@@ -827,7 +832,7 @@ class TestAttentionSelectPagedIndicesDecode:
 
 @pytest.mark.cpu_test
 def test_candidate_envelope_keeps_token_rows_dynamic():
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.candidates import (
         cache_capacity,
     )
 

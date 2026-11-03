@@ -38,11 +38,11 @@ def load_kernels(root: Path):
     sys.modules[logger_module.__name__] = logger_module
     from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
     from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection import packed_scores
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.decode import (
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import word_scores
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.decode import (
         decode_indexer,
     )
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.decode_scores import (
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.decode_scores import (
         grouped_decode_scores,
     )
 
@@ -51,7 +51,7 @@ def load_kernels(root: Path):
         jnp=jnp,
         ROW_WORDS=128,
         index_key_layout=index_key_layout,
-        packed_scores=packed_scores,
+        packed_scores=word_scores,
     )
     source = root / "src/vllm_torchtpu/models/vllm/deepseek_v41/v2"
     cache = ast.parse((source / "cache.py").read_text())
@@ -75,7 +75,7 @@ def load_kernels(root: Path):
         ),
         namespace,
     )
-    indexer = ast.parse((source / "indexer_impl.py").read_text())
+    indexer = ast.parse((source / "indexer_bf16.py").read_text())
     definitions = [
         node
         for node in indexer.body
@@ -91,12 +91,12 @@ def load_kernels(root: Path):
     exec(
         compile(
             ast.Module(body=definitions, type_ignores=[]),
-            str(source / "indexer_impl.py"),
+            str(source / "indexer_bf16.py"),
             "exec",
         ),
         namespace,
     )
-    namespace["_score_word_rows"] = packed_scores.score_word_rows
+    namespace["_score_word_rows"] = word_scores.score_word_rows
     return namespace, sparsecore_topk, decode_indexer, grouped_decode_scores
 
 

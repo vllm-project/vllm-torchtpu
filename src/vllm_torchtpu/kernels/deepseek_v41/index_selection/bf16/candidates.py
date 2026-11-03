@@ -20,11 +20,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41 import indexer
 from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, ROW_WORDS, SLOTS
-from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    decode,
-    decode_scores,
-    tuned_block_sizes,
-)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import tuned_block_sizes
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import common, decode
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
     streaming_topk,
 )
@@ -257,7 +254,7 @@ def _score_kernel(
                 logits = logits.reshape(queries, heads, compute_tile)
                 values = (jnp.maximum(logits, 0) * weights[row][:, :, None]).sum(1)
             else:
-                values = decode_scores._reduce_heads(
+                values = common._reduce_heads(
                     logits, weights[row], queries, head_stripe
                 )
             # Divide the static strides first so Mosaic can prove lane alignment.
@@ -414,35 +411,6 @@ def _candidate_scores(
         interpret=interpret,
         name="candidate_union_packed_scores",
     )(start_request.reshape(1), q, weights, keys, bases, members, lengths, offsets)
-
-
-@functools.partial(jax.jit, static_argnames=("block_size", "key_tile", "interpret"))
-def candidate_scores(
-    q: jax.Array,
-    weights: jax.Array,
-    keys: jax.Array,
-    ids: jax.Array,
-    membership: jax.Array,
-    lengths: jax.Array,
-    *,
-    block_size: int,
-    key_tile: int = 4096,
-    interpret: bool = False,
-) -> jax.Array:
-    """Score canonical int32 keys with per-query membership and causal masks."""
-    return _candidate_scores(
-        q,
-        weights,
-        keys,
-        ids,
-        membership,
-        lengths,
-        start_request=jnp.int32(0),
-        request_tile=q.shape[0],
-        block_size=block_size,
-        key_tile=key_tile,
-        interpret=interpret,
-    )
 
 
 @functools.partial(

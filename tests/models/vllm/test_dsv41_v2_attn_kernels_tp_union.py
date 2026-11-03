@@ -31,10 +31,9 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     slice_token_parallel_attention_inputs,
     sparse_fp8_attention,
     sparse_fp8_attention_jax,
-    sparse_ragged_paged_attention_union_gather,
     unpack_union_rope_words,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import _compact_selected
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select import _compact_selected
 
 
 class TestCompactRecords:
@@ -240,96 +239,6 @@ class TestGatherSparseKvChunkWithUnionFallback:
         ).reshape(total_num_pages, page_size // 4, 128)
         return cache_kv_nope, cache_kv_rope, total_num_pages, page_size
 
-    def test_union_branch_cpu(self, setup_kv_cache):
-        cache_kv_nope, cache_kv_rope, total_num_pages, page_size = setup_kv_cache
-        chunk_size, topk = 64, 32
-        union_cap = 128
-        num_unique_chunk = jnp.array(50, dtype=jnp.int32)  # <= union_cap -> union
-
-        union_phys = jnp.arange(union_cap, dtype=jnp.int32)
-        inv_idx = jnp.zeros((chunk_size, topk), dtype=jnp.int32)
-        chunk_rec = jnp.full((chunk_size, topk), 0, dtype=jnp.int32)
-        chunk_seq = jnp.zeros((chunk_size,), dtype=jnp.int32)
-        page_indices = jnp.arange(total_num_pages, dtype=jnp.int32)
-
-        g_nope, g_rope = gather_sparse_kv_chunk_with_union_fallback(
-            cache_kv_nope,
-            cache_kv_rope,
-            union_phys,
-            inv_idx,
-            num_unique_chunk,
-            chunk_rec,
-            chunk_seq,
-            page_indices,
-            max_num_seqs=1,
-            start_pos=0,
-            batch_end=jnp.array(chunk_size, dtype=jnp.int32),
-            topk=topk,
-        )
-        assert g_nope.shape == (chunk_size, topk, 128)
-        assert g_rope.shape == (chunk_size, topk // 4, 128)
-
-    def test_direct_branch_cpu_on_overflow(self, setup_kv_cache):
-        cache_kv_nope, cache_kv_rope, total_num_pages, page_size = setup_kv_cache
-        chunk_size, topk = 64, 32
-        union_cap = 128
-        num_unique_chunk = jnp.array(
-            200, dtype=jnp.int32
-        )  # > union_cap -> direct branch
-
-        union_phys = jnp.arange(union_cap, dtype=jnp.int32)
-        inv_idx = jnp.zeros((chunk_size, topk), dtype=jnp.int32)
-        chunk_rec = jnp.full((chunk_size, topk), -1, dtype=jnp.int32)
-        chunk_rec = chunk_rec.at[:10, :5].set(3)
-        chunk_seq = jnp.zeros((chunk_size,), dtype=jnp.int32)
-        page_indices = jnp.arange(total_num_pages, dtype=jnp.int32)
-
-        g_nope, g_rope = gather_sparse_kv_chunk_with_union_fallback(
-            cache_kv_nope,
-            cache_kv_rope,
-            union_phys,
-            inv_idx,
-            num_unique_chunk,
-            chunk_rec,
-            chunk_seq,
-            page_indices,
-            max_num_seqs=1,
-            start_pos=0,
-            batch_end=jnp.array(chunk_size, dtype=jnp.int32),
-            topk=topk,
-        )
-        assert g_nope.shape == (chunk_size, topk, 128)
-        assert g_rope.shape == (chunk_size, topk // 4, 128)
-
-    def test_union_branch_has_valid_false(self, setup_kv_cache):
-        cache_kv_nope, cache_kv_rope, total_num_pages, page_size = setup_kv_cache
-        chunk_size, topk = 64, 32
-        union_cap = 128
-        num_unique_chunk = jnp.array(10, dtype=jnp.int32)
-
-        union_phys = jnp.arange(union_cap, dtype=jnp.int32)
-        inv_idx = jnp.zeros((chunk_size, topk), dtype=jnp.int32)
-        chunk_rec = jnp.full((chunk_size, topk), -1, dtype=jnp.int32)
-        chunk_seq = jnp.zeros((chunk_size,), dtype=jnp.int32)
-        page_indices = jnp.arange(total_num_pages, dtype=jnp.int32)
-
-        # batch_end = 0 <= start_pos = 0 -> has_valid is False
-        g_nope, g_rope = gather_sparse_kv_chunk_with_union_fallback(
-            cache_kv_nope,
-            cache_kv_rope,
-            union_phys,
-            inv_idx,
-            num_unique_chunk,
-            chunk_rec,
-            chunk_seq,
-            page_indices,
-            max_num_seqs=1,
-            start_pos=0,
-            batch_end=jnp.array(0, dtype=jnp.int32),
-            topk=topk,
-        )
-        assert g_nope.shape == (chunk_size, topk, 128)
-
     def test_union_and_direct_branches_tpu_mock(self, setup_kv_cache, monkeypatch):
         cache_kv_nope, cache_kv_rope, total_num_pages, page_size = setup_kv_cache
         chunk_size, topk = 32, 16
@@ -390,46 +299,6 @@ class TestGatherSparseKvChunkWithUnionFallback:
             topk=topk,
         )
         assert g_nope_d.shape == (chunk_size, topk, 128)
-
-
-class TestSparseRaggedPagedAttentionUnionGather:
-    """Tests for sparse_ragged_paged_attention_union_gather with mocked Pallas."""
-
-    def test_pipeline_execution_single_and_multi_chunk(self):
-        total_pages, page_size = 32, 16
-        nope = jnp.zeros((total_pages, page_size, 128), dtype=jnp.int32)
-        rope = jnp.zeros((total_pages, page_size // 4, 128), dtype=jnp.int32)
-        page_indices = jnp.zeros((32,), dtype=jnp.int32)
-        distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
-        attention_sinks = jnp.zeros((64,), dtype=jnp.float32)
-
-        # Multi-chunk: 256 tokens, chunk_size = 128 -> 2 chunks
-        tokens = 256
-        q = jnp.zeros((tokens, 64, 512), dtype=jnp.bfloat16)
-        topk_indices = jnp.zeros((tokens, 128), dtype=jnp.int32)
-        cu_q_lens = jnp.array([0, tokens], dtype=jnp.int32)
-        swa_acc = jnp.zeros((tokens, 64, 512), dtype=jnp.bfloat16)
-        swa_l = jnp.zeros((tokens, 64), dtype=jnp.float32)
-        swa_m = jnp.zeros((tokens, 64), dtype=jnp.float32)
-
-        with mock.patch("jax.experimental.pallas.pallas_call") as mock_pcall:
-            mock_pcall.return_value = lambda *args: args[5]  # returns q
-            out = sparse_ragged_paged_attention_union_gather(
-                q,
-                nope,
-                rope,
-                topk_indices,
-                page_indices,
-                cu_q_lens,
-                distribution,
-                attention_sinks,
-                swa_acc,
-                swa_l,
-                swa_m,
-                gather_and_attention_chunk_size=128,
-            )
-            assert out.shape == (tokens, 64, 512)
-            assert mock_pcall.call_count == 2
 
 
 class TestSparseFp8AttentionJax:

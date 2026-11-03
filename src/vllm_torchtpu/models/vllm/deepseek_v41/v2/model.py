@@ -55,7 +55,7 @@ from .host_engram import (
     gather_host_engram_hashes,
     install_host_engram_inputs,
 )
-from .indexer_impl import initialize_indexer
+from .indexer_bf16 import initialize_indexer
 from .ops import bind_device_ops, compact_rope_caches, device_hooks
 
 logger = init_logger(__name__)

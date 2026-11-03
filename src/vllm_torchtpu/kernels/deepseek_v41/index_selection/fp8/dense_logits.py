@@ -19,6 +19,8 @@ from .common import (
     _head_order,
     _next_query_tile,
     _reduce_heads,
+    _reduce_on_mxu,
+    _weighted_selector,
 )
 from .tuned import (
     PACKED_FP8_MQA_CONFIG,
@@ -30,6 +32,26 @@ from .tuned import (
 def supports_candidate_publication(block_size: int) -> bool:
     """Block reductions fit independently in each packed-record vector."""
     return block_size > 0 and PAGE_RECORDS % block_size == 0
+
+
+def _block_maxima(pages, block):
+    """Block maxima of up to `block` [rows, 128] pages, in block order.
+
+    After a roll, page p's block j sits at lane j * block + p, so the pages
+    merge with selects and one lane gather restores block order.
+    """
+    lanes = jnp.arange(PAGE_RECORDS)
+    merged = None
+    for p, page in enumerate(pages):
+        for bit in range(block.bit_length() - 1):
+            page = jnp.maximum(page, pltpu.roll(page, 1 << bit, axis=1))
+        # Lane j * block + block - 1 holds block j's maximum.
+        page = pltpu.roll(page, (p - block + 1) % PAGE_RECORDS, axis=1)
+        merged = page if merged is None else jnp.where(lanes % block == p, page, merged)
+    assert merged is not None, "Block maxima need at least one page"
+    blocks = PAGE_RECORDS // block
+    order = (lanes % blocks) * block + lanes // blocks
+    return jnp.take_along_axis(merged, jnp.broadcast_to(order, merged.shape), axis=1)
 
 
 def _encode_page_table(page_ids, layout, first_bank_rows, tile_pages):
@@ -64,9 +86,6 @@ def _kernel(
     buffers, semaphores = scratch
     queries, keys, scores, counts, pages = buffers[:5]
     read_sem, write_sem, q_sem, page_sem = semaphores[:4]
-    if candidate_block_size is not None:
-        block_scores, block_sem = buffers[5], semaphores[4]
-        block_columns = block_scores.shape[-1]
     weights = pltpu.annotate(weights, no_store=True)
     keys = pltpu.annotate(keys, no_store=True)
     tokens, heads, dim = q.shape
@@ -76,6 +95,13 @@ def _kernel(
     page_size, page_rows = layout.page_size, layout.page_rows
     page_count, tile_pages = table.shape[-1], key_tile // page_size
     tiles, fragments = out.shape[1] // key_tile, key_tile // mxu_size
+    if candidate_block_size is not None:
+        # One contiguous block row per query slot; tiles merge into it.
+        block_scores, block_sem = buffers[5], semaphores[4]
+        tile_blocks = key_tile // candidate_block_size
+
+        def block_rows(pair):
+            return block_scores.at[pair, :, pl.ds(0, block_out.shape[1])]
 
     def page_record(i, slot):
         # Keep SMEM flat: 2D indexing adds scalar address work in masked tiles.
@@ -92,9 +118,9 @@ def _kernel(
         for slot in (2 * pair, 2 * pair + 1)[:tiles]:
             src = scores.at[slot]
             _dma_rows(src, src, write_sem.at[slot], count, wait=True)
-            if candidate_block_size is not None:
-                src = block_scores.at[slot]
-                _dma_rows(src, src, block_sem.at[slot], count, wait=True)
+        if candidate_block_size is not None:
+            src = block_rows(pair)
+            _dma_rows(src, src, block_sem.at[pair], counts[2 + pair], wait=True)
 
     def load_page(i, page_slot, slot):
         record = page_record(i, page_slot)
@@ -148,23 +174,13 @@ def _kernel(
 
         copy_queries(following, 1 - q_slot, zero=True)
         lengths_vector = jnp.stack(row_lengths(query))
-        minimum_length = reduce(jnp.minimum, row_lengths(query))
+        maximum_length = reduce(jnp.maximum, row_lengths(query))
 
         def publish(tile, wait=False, slot=None):
             slot = output_slot(tile) if slot is None else slot
             src, sem = scores.at[slot], write_sem.at[slot]
             dst = out.at[:, pl.ds(tile * key_tile, key_tile)]
             _dma_rows(src, dst, sem, query.count, wait, dst_start=query.start - begin)
-            if candidate_block_size is not None:
-                assert block_out is not None
-                _dma_rows(
-                    block_scores.at[slot],
-                    block_out.at[:, pl.ds(tile * block_columns, block_columns)],
-                    block_sem.at[slot],
-                    query.count,
-                    wait,
-                    dst_start=query.start - begin,
-                )
 
         def load_table(future, wait=False):
             first, after = future < tile_count, future - tile_count
@@ -189,6 +205,10 @@ def _kernel(
                 load_table(i)
 
         release_outputs(q_slot)
+        if candidate_block_size is not None:
+            block_scores[q_slot] = jnp.full(
+                block_scores.shape[1:], -jnp.inf, jnp.float32
+            )
         if reuse_keys:
             pl.when(tile_count > 0)(lambda: load_table(0, wait=True))
 
@@ -210,18 +230,32 @@ def _kernel(
                         load_page(page, page_slot(i), key_slot(i))
 
         copy_queries(query, q_slot, wait=True)
+        weight = jnp.concatenate([weights[r][:, None] for r in row_ids(query)])
+        head_weights = _head_order(weight, q_tile, sublanes)
+        mxu_selector = _weighted_selector(
+            selector, weights, row_ids(query), sublanes=sublanes
+        )
+        query_slice = pl.ds(q_slot * q_tile, q_tile)
+        lhs = _head_order(
+            queries[query_slice].reshape(q_tile * heads, dim), q_tile, sublanes
+        )
 
-        def emit_tile(tile, *, prefetch, full):
-            weight = jnp.concatenate([weights[r][:, None] for r in row_ids(query)])
-            head_weights = _head_order(weight, q_tile, sublanes)
-            query_slice = pl.ds(q_slot * q_tile, q_tile)
-            lhs = _head_order(
-                queries[query_slice].reshape(q_tile * heads, dim), q_tile, sublanes
-            )
-            if prefetch:
-                load_table(tile + 2, wait=True)
-            metadata = page_slot(tile + 2)
-            following_slot = key_slot(tile + 2)
+        def emit_tile(tile, *, prefetch, count=fragments):
+            # Only the first `count` fragments are scored; the rest are -inf.
+            live_pages = count * mxu_size // PAGE_RECORDS
+
+            metadata, following_slot = page_slot(tile + 2), key_slot(tile + 2)
+
+            def prefetching(fn):
+                # `prefetch` is False (static) or a traced flag.
+                if prefetch is not False:
+                    pl.when(prefetch)(fn)
+
+            def load_pages(first, last):
+                for page in range(first, last):
+                    load_page(page, metadata, following_slot)
+
+            prefetching(lambda: load_table(tile + 2, wait=True))
 
             def key_rows(start, count):
                 return keys[key_slot(tile), pl.ds(start, count)]
@@ -272,44 +306,62 @@ def _kernel(
                 )
                 return jnp.maximum(logits.astype(jnp.bfloat16), jnp.bfloat16(0))
 
-            block_pending = []
+            block_pending, block_carry = [], []
+
+            def write_blocks(start, values, final):
+                # A tile's blocks start at lane `shift` of the row. Each rotated
+                # write fills the rest of its vector and spills its tail into the
+                # next one, carried in registers: only the tile's first and last
+                # vectors touch VMEM outside a plain aligned store.
+                rows, width = values.shape
+                if width < PAGE_RECORDS:
+                    values = jnp.concatenate(
+                        [values, jnp.full((rows, PAGE_RECORDS - width), -jnp.inf)],
+                        axis=1,
+                    )
+                shift = tile * tile_blocks % PAGE_RECORDS
+                rolled = pltpu.roll(values, shift, axis=1)
+                lane = lax.broadcasted_iota(jnp.int32, rolled.shape, 1)
+                row = block_scores.at[q_slot]
+                base = pl.multiple_of(start - shift, PAGE_RECORDS)
+                low = (
+                    block_carry.pop()
+                    if block_carry
+                    else row[:, pl.ds(base, PAGE_RECORDS)]
+                )
+                row[:, pl.ds(base, PAGE_RECORDS)] = jnp.where(
+                    lane >= shift, rolled, low
+                )
+                if final:
+                    row[:, pl.ds(base + PAGE_RECORDS, PAGE_RECORDS)] = jnp.where(
+                        lane < shift, rolled, -jnp.inf
+                    )
+                else:
+                    block_carry.append(rolled)
 
             def publish_block_scores(column, scaled):
                 assert candidate_block_size is not None
                 local_page = column // PAGE_RECORDS
-                reduced = scaled
-                for bit in range(candidate_block_size.bit_length() - 1):
-                    reduced = jnp.maximum(
-                        reduced, pltpu.roll(reduced, 1 << bit, axis=1)
-                    )
                 blocks_per_page = PAGE_RECORDS // candidate_block_size
-                indices = jnp.broadcast_to(
-                    jnp.arange(blocks_per_page)[None, :] * candidate_block_size
-                    + candidate_block_size
-                    - 1,
-                    (q_tile, blocks_per_page),
-                )
-                reduced = jnp.take_along_axis(reduced, indices, axis=1)
-                block_pending.append(reduced)
-                pages_per_write = info.num_lanes // blocks_per_page
+                block_pending.append(scaled)
+                # One write covers `candidate_block_size` pages of block maxima.
+                pages_per_write = candidate_block_size
                 if (
                     local_page % pages_per_write == pages_per_write - 1
-                    or local_page == key_tile // PAGE_RECORDS - 1
+                    or local_page == live_pages - 1
                 ):
-                    packed = jnp.concatenate(block_pending, axis=1)
-                    start = (
-                        column // candidate_block_size
-                        + blocks_per_page
-                        - packed.shape[1]
-                    )
+                    written = len(block_pending) * blocks_per_page
+                    packed = _block_maxima(block_pending, candidate_block_size)
+                    packed = packed[:, :written]
+                    start = tile * tile_blocks + (local_page + 1) * blocks_per_page
+                    start -= written
                     last = (lengths_vector - 1) // candidate_block_size
-                    positions = tile * (key_tile // candidate_block_size)
-                    positions += start + jnp.arange(packed.shape[1])
-                    block_scores[
-                        output_slot(tile),
-                        :,
-                        pl.ds(start, packed.shape[1]),
-                    ] = jnp.where(positions[None, :] == last[:, None], jnp.inf, packed)
+                    positions = start + jnp.arange(written)
+                    write_blocks(
+                        start,
+                        jnp.where(positions[None, :] == last[:, None], jnp.inf, packed),
+                        final=local_page == live_pages - 1,
+                    )
                     block_pending.clear()
 
             def store(fragment, values):
@@ -330,21 +382,20 @@ def _kernel(
                                 jnp.float32,
                             )
                         )
-                        valid = full or (page_record(page, page_slot(tile)) & 2) != 0
+                        valid = (page_record(page, page_slot(tile)) & 2) != 0
                         masks.append(
                             jnp.full((min(page_size, mxu_size),), valid, jnp.int32)
                         )
                     scaled = values * jnp.concatenate(scales)[None, :]
-                    if not full:
-                        positions = (
-                            tile * key_tile + fragment * mxu_size + jnp.arange(mxu_size)
-                        )
-                        scaled = jnp.where(
-                            (jnp.concatenate(masks)[None, :] != 0)
-                            & (lengths_vector[:, None] > positions[None, :]),
-                            scaled,
-                            -jnp.inf,
-                        )
+                    positions = (
+                        tile * key_tile + fragment * mxu_size + jnp.arange(mxu_size)
+                    )
+                    scaled = jnp.where(
+                        (jnp.concatenate(masks)[None, :] != 0)
+                        & (lengths_vector[:, None] > positions[None, :]),
+                        scaled,
+                        -jnp.inf,
+                    )
                     scores[
                         output_slot(tile), :, pl.ds(fragment * mxu_size, mxu_size)
                     ] = scaled
@@ -357,42 +408,53 @@ def _kernel(
                     return
                 for offset in range(0, mxu_size, PAGE_RECORDS):
                     local_page = (fragment * mxu_size + offset) // PAGE_RECORDS
-                    valid = full or (page_record(local_page, page_slot(tile)) & 2) != 0
+                    valid = (page_record(local_page, page_slot(tile)) & 2) != 0
                     scale_row = (local_page + 1) * PAGE_ROWS - 1
                     scale = lax.bitcast_convert_type(
                         key_rows(scale_row, 1), jnp.float32
                     )
                     scaled = values[:, offset : offset + PAGE_RECORDS] * scale
                     column = local_page * PAGE_RECORDS
-                    if not full:
-                        bound = jnp.where(valid, column, jnp.iinfo(jnp.int32).max)
-                        scaled = jnp.where(remaining > bound, scaled, -jnp.inf)
+                    bound = jnp.where(valid, column, jnp.iinfo(jnp.int32).max)
+                    scaled = jnp.where(remaining > bound, scaled, -jnp.inf)
                     scores[output_slot(tile), :, pl.ds(column, PAGE_RECORDS)] = scaled
                     if candidate_block_size is not None:
                         publish_block_scores(column, scaled)
 
             pending = {}
-            for stage in range(fragments + config.issue_depth):
+            depth = config.issue_depth
+            # Prefetch still loads every page of the next tile.
+            for stage in range(max(count + depth, fragments)):
                 first = pl.cdiv(stage * mxu_size, page_size)
                 last = pl.cdiv((stage + 1) * mxu_size, page_size)
                 middle = (first + last + 1) // 2
                 if stage < fragments:
-                    if prefetch:
-                        for page in range(first, middle):
-                            load_page(page, metadata, following_slot)
+                    prefetching(partial(load_pages, first, middle))
+                if stage < count:
                     pending[stage] = qk(stage)
-                if stage >= config.issue_depth:
-                    fragment = stage - config.issue_depth
+                if depth <= stage < count + depth:
+                    fragment = stage - depth
                     values = _reduce_heads(
-                        pending.pop(fragment) * head_weights,
-                        selector,
+                        pending.pop(fragment),
+                        head_weights,
+                        mxu_selector,
                         sublanes=sublanes,
-                        use_mxu=stage < fragments and bool(fragment % 2),
+                        use_mxu=_reduce_on_mxu(
+                            fragment, stage, count, every=4, drain=4
+                        ),
                     )
                     store(fragment, values)
-                if stage < fragments and prefetch:
-                    for page in range(middle, last):
-                        load_page(page, metadata, following_slot)
+                if stage < fragments:
+                    prefetching(partial(load_pages, middle, last))
+            if count < fragments:
+                slot, start = output_slot(tile), count * mxu_size
+                scores[slot, :, pl.ds(start, key_tile - start)] = jnp.full(
+                    (q_tile, key_tile - start), -jnp.inf, jnp.float32
+                )
+
+        # Partial tiles whose rows all end in the first half score only that
+        # half; four-fragment steps keep the -inf fills lane-aligned.
+        half = pl.cdiv(pl.cdiv(fragments, 2), 4) * 4
 
         def step_tile(tile, _):
             # Four slots retain the current mask while prefetching metadata
@@ -402,21 +464,18 @@ def _kernel(
             if not reuse_keys:
                 pltpu.make_async_copy(src, src, read_sem.at[key_slot(tile)]).wait()
             pl.when(tile >= 2)(lambda: publish(tile - 2, wait=True))
-            pending = tile + 2 < total_tiles
-            encoded = page_record(0, page_slot(tile))
-            full = ((tile + 1) * key_tile <= minimum_length) & ((encoded & 4) != 0)
-
-            def emit(full):
-                if reuse_keys:
-                    emit_tile(tile, prefetch=False, full=full)
-                else:
-                    lax.cond(
-                        pending,
-                        lambda: emit_tile(tile, prefetch=True, full=full),
-                        lambda: emit_tile(tile, prefetch=False, full=full),
-                    )
-
-            lax.cond(full, lambda: emit(True), lambda: emit(False))
+            prefetch = False if reuse_keys else tile + 2 < total_tiles
+            emit = partial(emit_tile, tile, prefetch=prefetch)
+            # Every tile takes the masked path: the extra selects are free next
+            # to the MXU/VPOP bound, and one emit family halves the code size.
+            if half >= fragments:
+                emit()
+            else:
+                lax.cond(
+                    maximum_length - tile * key_tile <= half * mxu_size,
+                    lambda: emit(count=half),
+                    emit,
+                )
             publish(tile)
 
         if tiles == 1:
@@ -434,16 +493,23 @@ def _kernel(
                 pl.when(tile_count > 1)(lambda: publish(tile_count - 2, wait=True))
 
             scores[output_slot(0)] = jnp.full(scores.shape[1:], -jnp.inf, jnp.float32)
-            if candidate_block_size is not None:
-                block_scores[output_slot(0)] = jnp.full(
-                    block_scores.shape[1:], -jnp.inf, jnp.float32
-                )
             for wait in (False, True):
 
                 def body(tile, _, wait=wait):
                     publish(tile, wait=wait, slot=output_slot(0))
 
                 lax.fori_loop(tile_count, tiles, body, None)
+
+        if candidate_block_size is not None:
+            assert block_out is not None
+            _dma_rows(
+                block_rows(q_slot),
+                block_out,
+                block_sem.at[q_slot],
+                query.count,
+                dst_start=query.start - begin,
+            )
+            counts[2 + q_slot] = query.count
 
         return (
             following,
@@ -462,7 +528,7 @@ def _kernel(
     second = next_query(first)
     third = next_query(second)
     initial = (first, second, third)
-    for pair in range(2):
+    for pair in range(4):
         counts[pair] = jnp.int32(0)
     copy_queries(first, 0, zero=True)
     lax.while_loop(
@@ -607,7 +673,7 @@ def fp8_paged_mqa_logits(
                 (config.key_buffers, tile_pages * layout.page_rows, dim), jnp.int32
             ),
             pltpu.VMEM((4, tile, config.key_tile), jnp.float32),
-            pltpu.SMEM((2,), jnp.int32),
+            pltpu.SMEM((4,), jnp.int32),
             pltpu.SMEM((4 * page_count,), jnp.int32),
         ),
         tuple(
@@ -627,13 +693,12 @@ def fp8_paged_mqa_logits(
     out_shape = jax.ShapeDtypeStruct((tokens, width), jnp.float32)
     out_specs = hbm
     if candidate_block_size is not None:
-        block_columns = (
-            pl.cdiv(config.key_tile // candidate_block_size, info.num_lanes)
-            * info.num_lanes
-        )
+        blocks = width // candidate_block_size
+        # One spare vector for the last unaligned tile write.
+        block_columns = (pl.cdiv(blocks, info.num_lanes) + 1) * info.num_lanes
         scratch = (
-            (*scratch[0], pltpu.VMEM((4, tile, block_columns), jnp.float32)),
-            (*scratch[1], pltpu.SemaphoreType.DMA((4, tile))),
+            (*scratch[0], pltpu.VMEM((2, tile, block_columns), jnp.float32)),
+            (*scratch[1], pltpu.SemaphoreType.DMA((2, tile))),
         )
         kernel = partial(
             _kernel_with_block_scores,
@@ -645,8 +710,10 @@ def fp8_paged_mqa_logits(
         )
         out_shape = (
             out_shape,
+            # Lane-aligned row DMAs; the -inf tail is sliced off below.
             jax.ShapeDtypeStruct(
-                (tokens, width // config.key_tile * block_columns), jnp.float32
+                (tokens, pl.cdiv(blocks, info.num_lanes) * info.num_lanes),
+                jnp.float32,
             ),
         )
         out_specs = (hbm, hbm)
@@ -669,10 +736,6 @@ def fp8_paged_mqa_logits(
     )(query_start_loc, context_lens, jnp.asarray(query_start, jnp.int32), inputs)
     if candidate_block_size is not None:
         scores, blocks = result
-        # Each tile's block output has its own HBM lane padding.
-        blocks = blocks.reshape(tokens, width // config.key_tile, -1)
-        blocks = blocks[:, :, : config.key_tile // candidate_block_size]
-        blocks = blocks.reshape(tokens, width // candidate_block_size)
         return scores[:, :max_model_len], blocks[
             :, : pl.cdiv(max_model_len, candidate_block_size)
         ]

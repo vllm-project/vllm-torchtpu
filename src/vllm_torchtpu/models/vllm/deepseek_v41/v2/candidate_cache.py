@@ -10,11 +10,11 @@ import torch
 
 from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, ROW_WORDS, SLOTS
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    candidate,
     streaming_topk,
     tuned_block_sizes,
 )
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.gather_index_keys import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import candidates
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.gather_keys import (
     gather_packed_candidate_keys,
     is_supported_by_gather_packed_candidate_keys,
 )
@@ -57,7 +57,7 @@ def prepare_candidate_cache_jax(
         raise ValueError("Candidate capacity must contain whole even-sized blocks")
     groups = records.shape[0]
     key_shape = (groups, capacity // SLOTS, ROW_WORDS)
-    queries = candidate.request_query_count(candidate_block_ids.shape[0], groups)
+    queries = candidates.request_query_count(candidate_block_ids.shape[0], groups)
     if queries is None:
         # These shapes are concrete in JAX lowering, unlike Dynamo token rows.
         return (
@@ -72,12 +72,12 @@ def prepare_candidate_cache_jax(
     logical_blocks = (records.shape[1] + block_size - 1) // block_size
     if logical_blocks > tuned_block_sizes.CANDIDATE_DENSE_UNION_MAX_BLOCKS:
         candidate_block_ids = jnp.where(lengths[:, None] > 0, candidate_block_ids, -1)
-    meta = candidate.union_metadata(
+    meta = candidates.union_metadata(
         candidate_block_ids.reshape(groups, queries, -1),
         logical_blocks=logical_blocks,
         capacity_blocks=capacity // block_size,
     )
-    starts, membership = candidate.union_record_starts(
+    starts, membership = candidates.union_record_starts(
         meta, records, block_size=block_size, pool_records=_cache_num_rows(pool) * SLOTS
     )
     usable = regular & ~jnp.any(meta.overflow)
@@ -148,14 +148,14 @@ def select_candidate_cache_jax(
     request_tile: int | None,
     topk: int = 512,
 ) -> jax.Array:
-    from .indexer_impl import paged_indexer_jax
+    from .indexer_bf16 import paged_indexer_jax
 
     groups = records.shape[0]
-    queries = candidate.request_query_count(q.shape[0], groups)
+    queries = candidates.request_query_count(q.shape[0], groups)
 
     def cached():
         assert queries is not None
-        return candidate.candidate_indexer(
+        return candidates.candidate_indexer(
             split_halves(q).reshape(groups, queries, *q.shape[1:]),
             weights.astype(jnp.float32).reshape(groups, queries, q.shape[1]),
             keys,

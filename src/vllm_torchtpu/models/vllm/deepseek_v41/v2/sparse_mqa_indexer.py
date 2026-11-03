@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import cache_capacity
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.candidates import (
+    cache_capacity,
+)
 
-from . import indexer_impl
+from . import indexer_bf16, indexer_fp8
 from .cache import IndexCacheRows
 from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .indexer_cache import PackedFP8IndexCacheRows
@@ -26,7 +28,7 @@ def quantize_query(
     weights: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate Q, quantize each head and fold its scale into FP32 weights."""
-    operation = indexer_impl._query_op
+    operation = indexer_fp8._query_op
     assert operation is not None
     return operation(q, positions, cos_sin, weights)
 
@@ -87,7 +89,7 @@ class SparseMQAIndexer(torch.nn.Module):
         if capacity is None:
             select: Callable[..., tuple[torch.Tensor, torch.Tensor]] = (
                 functools.partial(
-                    indexer_impl.paged_fp8_indexer,
+                    indexer_fp8.paged_fp8_indexer,
                     score_width=score_width,
                     stage_cache=stage_cache,
                     source_prefix=self.k_cache.prefix,
@@ -95,7 +97,7 @@ class SparseMQAIndexer(torch.nn.Module):
                 )
                 if packed_fp8
                 else functools.partial(
-                    indexer_impl.paged_indexer, page_records=page_records
+                    indexer_bf16.paged_indexer, page_records=page_records
                 )
             )
             return select(

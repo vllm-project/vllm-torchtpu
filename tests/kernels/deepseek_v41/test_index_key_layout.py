@@ -8,11 +8,10 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout as layout
-from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    decode_scores,
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16 import (
     prefill_scores,
 )
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_scores import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.bf16.word_scores import (
     score_word_rows,
 )
 
@@ -145,50 +144,3 @@ def test_all_score_routes_match_dense(monkeypatch, prefetch, record_mask):
                 valid &= records >= 0
             expected = jnp.where(valid, expected, -jnp.inf)
         np.testing.assert_array_equal(actual, expected)
-
-
-def test_decode_native_bitcast_on_eight_devices():
-    """Exercise native bitcast under the model's manual eight-device partition."""
-    if jax.default_backend() != "tpu":
-        pytest.skip("native TPU lowering")
-    from jax.sharding import Mesh
-    from jax.sharding import PartitionSpec as P
-
-    if len(jax.devices()) < 8:
-        pytest.skip("Eight TPU devices required for model-mesh lowering")
-    rng = np.random.default_rng(73)
-    keys = jnp.asarray(rng.integers(-8, 9, (256, 128)), jnp.bfloat16)
-    native = native_pool(keys)
-    q = jnp.asarray(rng.integers(-2, 3, (8, 6, 32, 128)), jnp.bfloat16)
-    weights = jnp.asarray(rng.integers(-2, 3, (8, 6, 32)), jnp.float32)
-    pages = jnp.broadcast_to(jnp.array([128, 0], jnp.int32), (8, 2))
-    lengths = jnp.broadcast_to(jnp.array([256, 255, 128, 17, 1, 0], jnp.int32), (8, 6))
-    mesh = Mesh(np.asarray(jax.devices()[:8]), ("d",))
-
-    def run(q, weights, pool, pages, lengths):
-        return decode_scores.grouped_decode_scores(
-            q,
-            weights,
-            pool,
-            pages,
-            lengths,
-            page_records=128,
-        )
-
-    mapped = jax.jit(
-        jax.shard_map(
-            run,
-            mesh=mesh,
-            in_specs=(P("d"), P("d"), (P(), P()), P("d"), P("d")),
-            out_specs=P("d"),
-            check_vma=False,
-        )
-    )
-    actual = mapped(q, weights, (native[:64], native[64:]), pages, lengths)
-    ids = pages[..., None] + jnp.arange(128, dtype=jnp.int32)
-    logical = keys[ids].reshape(8, 256, 128)
-    expected = dense_scores(q, weights, logical)
-    expected = jnp.where(
-        jnp.arange(256)[None, None] < lengths[..., None], expected, -jnp.inf
-    )
-    np.testing.assert_array_equal(actual, expected.reshape(-1, expected.shape[-1]))

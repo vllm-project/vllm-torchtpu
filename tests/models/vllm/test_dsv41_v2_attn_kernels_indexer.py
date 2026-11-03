@@ -20,8 +20,11 @@ import torch
 from jax.sharding import Mesh
 
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+    attention_kernels,
+    indexer_bf16,
+    indexer_select,
+)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     _pad_compacted_records,
     initialize_paged_attention,
@@ -30,18 +33,20 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     sparse_fp8_attention,
     sparse_fp8_attention_jax,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
-    _prefix_count,
-    _sparsecore_top_k,
-    _threshold_top_k,
-    _visible_top_k,
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_bf16 import (
     initialize_indexer,
     paged_index_scores_jax,
     paged_indexer,
     paged_indexer_jax,
     select_indexer_jax,
-    select_indices_jax,
     write_index_keys,
+)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select import (
+    _prefix_count,
+    _sparsecore_top_k,
+    _threshold_top_k,
+    _visible_top_k,
+    select_indices_jax,
 )
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -454,8 +459,8 @@ class TestSelectIndicesJax:
         sc_lengths = jnp.array([1024, 2048, 4096, 8192], dtype=jnp.int32)
         sc_candidates = jnp.full((count, 16), -1, dtype=jnp.int32)
         with mock.patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl._sparsecore_top_k",
-            side_effect=lambda s, k, n: jnp.broadcast_to(
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select._sparsecore_top_k",
+            side_effect=lambda s, k, *_: jnp.broadcast_to(
                 jnp.arange(k, dtype=jnp.int32), (s.shape[0], k)
             ),
         ) as mock_sc:
@@ -651,7 +656,7 @@ class TestThresholdAndVisibleTopK:
         scores_large = jnp.asarray(rng.standard_normal((16, 2048)), dtype=jnp.float32)
         lengths_large = jnp.full((16,), 2048, dtype=jnp.int32)
         with mock.patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl._sparsecore_top_k",
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_select._sparsecore_top_k",
             return_value=jnp.zeros((16, 64), dtype=jnp.int32),
         ) as mock_sc:
             res_sc = _visible_top_k(
@@ -781,7 +786,7 @@ class TestPagedIndexerJax:
             candidate_filter=False,  # False forces full_context
         )
         assert sel.shape == (8, topk)
-        assert pub is candidates
+        np.testing.assert_array_equal(pub, candidates)
 
     def test_routing_to_full_context_via_candidate_coverage(self):
         rng = np.random.default_rng(505)
@@ -804,7 +809,7 @@ class TestPagedIndexerJax:
             candidate_filter=True,
         )
         assert sel.shape == (4, topk)
-        assert pub is candidates
+        np.testing.assert_array_equal(pub, candidates)
 
     def test_routing_to_full_context_via_short_context_or_prefill_keys(self):
         rng = np.random.default_rng(606)
@@ -907,7 +912,7 @@ class TestPagedIndexerJax:
             candidate_filter=True,
             unordered=True,
         )
-        assert pub_unord is candidates
+        np.testing.assert_array_equal(pub_unord, candidates)
         assert sel_unord.shape == (tokens, topk)
         # First row has valid selections at head, -1 at tail
         row0 = np.asarray(sel_unord[0])
@@ -922,7 +927,7 @@ class TestPagedIndexerJax:
         records_large = jnp.zeros((16, 4096), dtype=jnp.int32)
         lengths_large = jnp.full((tokens,), 3000, dtype=jnp.int32)
         with mock.patch.object(
-            indexer_ops,
+            indexer_select,
             "_sparsecore_top_k",
             return_value=jnp.zeros((tokens, topk), dtype=jnp.int32),
         ) as mock_sc_topk:
@@ -958,7 +963,7 @@ class TestPagedIndexerJax:
             candidate_filter=True,
             unordered=False,
         )
-        assert pub_ord is candidates
+        np.testing.assert_array_equal(pub_ord, candidates)
         assert sel_ord.shape == (tokens, topk)
         # Zero-length rows are completely -1
         assert np.all(np.asarray(sel_ord[1:]) == -1)
@@ -1020,13 +1025,13 @@ class TestIndexerOpAndWrapper:
     def test_initialize_indexer_and_fake(self):
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
         with set_vllm_model_wrapper_context(mesh=mesh):
-            indexer_ops._indexer_op = None
+            indexer_bf16._indexer_op = None
             initialize_indexer()
-            assert indexer_ops._indexer_op is not None
+            assert indexer_bf16._indexer_op is not None
             # Test early return branch
-            saved_op = indexer_ops._indexer_op
+            saved_op = indexer_bf16._indexer_op
             initialize_indexer()
-            assert indexer_ops._indexer_op is saved_op
+            assert indexer_bf16._indexer_op is saved_op
 
         # Verify fake registration by calling op with meta device tensors
         q = torch.empty((4, 4, 128), dtype=torch.bfloat16, device="meta")
@@ -1038,7 +1043,7 @@ class TestIndexerOpAndWrapper:
         requests = torch.empty((4,), dtype=torch.int32, device="meta")
         batch_max = torch.empty((1,), dtype=torch.int32, device="meta")
 
-        f_sel, f_pub = indexer_ops._indexer_op(
+        f_sel, f_pub = indexer_bf16._indexer_op(
             q,
             pool,
             records,
@@ -1072,7 +1077,7 @@ class TestIndexerOpAndWrapper:
 
         # 1) batch_max is None (default)
         with mock.patch.object(
-            indexer_ops,
+            indexer_bf16,
             "_indexer_op",
             return_value=(records, candidates),
         ) as mock_op:
@@ -1096,7 +1101,7 @@ class TestIndexerOpAndWrapper:
 
         # 2) explicit batch_max
         with mock.patch.object(
-            indexer_ops,
+            indexer_bf16,
             "_indexer_op",
             return_value=(records, candidates),
         ) as mock_op:
