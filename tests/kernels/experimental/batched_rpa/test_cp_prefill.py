@@ -122,19 +122,17 @@ def test_halo_exchange_gives_each_piece_its_window(traced):
     k, v = _kv(plan.num_tokens, 16, 128, seed=1)
     in_order = cp_prefill.pack_kv_pages(k, v, PAGE)
     rows = [(_rank_rows(k, plan, r), _rank_rows(v, plan, r)) for r in range(plan.world)]
-    # Every rank's tails as pages, as the receiver unpacks the gathered rows.
-    piece = plan.piece_tokens
-    tails = [
-        [
-            cp_prefill.pack_kv_pages(kr[end - ht : end], vr[end - ht : end], PAGE)
-            for end in (piece, 2 * piece)
-        ]
-        for kr, vr in rows
-    ]
+    # Every rank's tail rows, as sliding_exchange_rows sends them.
+    tails = [cp_prefill.pack_piece_tails(kr, vr, halo, PAGE) for kr, vr in rows]
     local_pages = jax.jit(cp_prefill.sliding_local_pages, static_argnums=3)
     for rank in range(plan.world):
+        # As sliding_attention_layer reads its halos from the gathered rows.
         first_src, second_src = cp_prefill.halo_neighbours(rank, plan.world)
-        halos = jnp.concatenate([tails[first_src][0], tails[second_src][1]])
+        halos = cp_prefill.kv_pages_from_rows(
+            jnp.concatenate([tails[first_src][:ht], tails[second_src][ht : 2 * ht]]),
+            128,
+            PAGE,
+        )
         args = (halos, *rows[rank], plan)
         local = (
             local_pages(*args, jnp.int32(rank)) if traced else local_pages(*args, rank)
