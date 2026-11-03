@@ -32,6 +32,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     SparseCoreTopK,
 )
 
+
 @dataclasses.dataclass(frozen=True)
 class LegacySchedule(PrefixSchedule):
     def validate(self, compression_ratio):
@@ -47,15 +48,109 @@ class PreservingSchedule(LegacySchedule):
 def preserving_components(admitted=True):
     return StreamIndexComponents(
         DenseKeyReader(scale_gain=1.0),
-        LegacySchedule()
-        if admitted is None
-        else PreservingSchedule(admitted),
+        LegacySchedule() if admitted is None else PreservingSchedule(admitted),
     )
 
 
 module = importlib.import_module(
     "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
 )
+
+
+@pytest.fixture(autouse=True)
+def cpu_tpu_geometry(request, monkeypatch):
+    if request.node.get_closest_marker("tpu_test") is None:
+        monkeypatch.setattr(
+            module.pltpu,
+            "get_tpu_info",
+            lambda: module.pltpu.get_tpu_info_for_chip(
+                module.pltpu.ChipVersion.TPU_7X, 1
+            ),
+        )
+
+
+@pytest.mark.parametrize("chunk", [None, 8])
+@pytest.mark.parametrize("return_scores", [False, True])
+def test_aligned_score_tail_is_masked_and_pass_aliases_keep_shape(
+    monkeypatch, chunk, return_scores
+):
+    """Three scoring passes retain causal limits despite poisoned physical padding."""
+    from tests.kernels.test_streamindex_topk_backend import ReferenceTopK
+
+    aliases = []
+
+    def pallas_call(kernel, **kwargs):
+        shape = kwargs["out_shape"].shape
+        assert shape[1:] == (8, 128)
+        aliased = bool(kwargs["input_output_aliases"])
+        pass_index = len(aliases) % 3
+        aliases.append(aliased)
+
+        def call(*args):
+            if aliased:
+                assert args[-1].shape == shape
+                assert kwargs["input_output_aliases"] == {
+                    len(jax.tree_util.tree_leaves(args)) - 1: 0
+                }
+            starts = args[2]
+            first, end, offset = args[3]
+            tokens = jnp.arange(shape[0]) + offset
+            owners = jnp.sum(tokens[:, None] >= starts[None, 1:], axis=1)
+            written = (owners >= first) & (owners < end) & (tokens < starts[-1])
+            columns = jnp.arange(1024, dtype=jnp.float32)
+            scores = jnp.where(columns < 384, columns + (pass_index + 1) * 1024, 1e30)
+            bits = jax.lax.bitcast_convert_type(scores, jnp.int32)
+            previous = (
+                args[-1] if aliased else jnp.full(shape, module.BITS_NEG_INF, jnp.int32)
+            )
+            return jnp.where(
+                written[:, None, None],
+                jnp.broadcast_to(bits.reshape(1, 8, 128), shape),
+                previous,
+            )
+
+        return call
+
+    monkeypatch.setattr(module.pl, "pallas_call", pallas_call)
+    lengths, counts = [5, 127, 256], [1, 5, 8]
+    actual = module.streamindex_topk.__wrapped__(
+        jnp.ones((16, 4, 128), jnp.bfloat16),
+        jnp.ones((16, 4), jnp.float32),
+        jnp.zeros((27, 8, 4, 256), jnp.uint8),
+        jnp.array(lengths, jnp.int32),
+        jnp.arange(27, dtype=jnp.int32),
+        jnp.array([0, 1, 6, 14], jnp.int32),
+        jnp.array([1, 2, 3], jnp.int32),
+        k=128,
+        compression_ratio=1,
+        num_kv_pages_per_block=4,
+        num_queries_per_block=(1, 8, 8),
+        uniform_q_len=5,
+        decode_req_batch_size=4,
+        chunk_tokens=chunk,
+        enable_early_exit=False,
+        return_scores=return_scores,
+        topk_backend=ReferenceTopK(),
+    )
+    assert aliases == [False, True, True] * (1 if chunk is None else 2)
+    visible = np.r_[
+        *[
+            np.arange(length - count + 1, length + 1)
+            for length, count in zip(lengths, counts)
+        ],
+        0,
+        0,
+    ]
+    slots = np.arange(128)[None, :]
+    expected = np.where(slots < visible[:, None], visible[:, None] - 1 - slots, -1)
+    ids = actual[0] if return_scores else actual
+    np.testing.assert_array_equal(ids, expected)
+    if return_scores:
+        scores = np.asarray(actual[1]).view(np.float32)
+        offsets = np.r_[np.repeat([1024, 2048, 3072], counts), 0, 0]
+        np.testing.assert_array_equal(
+            scores, np.where(expected >= 0, expected + offsets[:, None], -np.inf)
+        )
 
 
 @pytest.mark.parametrize(
@@ -211,6 +306,7 @@ def test_active_context_extent_guards_not_visible_floor(
     )
     assert bool(decision) == expected
 
+
 @dataclasses.dataclass(frozen=True)
 class Alternate(SparseCoreTopK):
     pass
@@ -283,7 +379,7 @@ def test_real_pipeline_selects_same_ids_and_keeps_branch_groups_disjoint(
         -1,
     )
     np.testing.assert_array_equal(result, expected)
-    assert {s[1] for s in seen} == ({256, 4096} if bounded else {4096})
+    assert {s[1] for s in seen} == ({1024, 4096} if bounded else {4096})
     actual_groups = {g for g in groups if g is not None}
     assert actual_groups == {
         config.scoped_scheduling_group_id(5, i) for i in range(2 if bounded else 1)
@@ -479,7 +575,7 @@ def run_prefix_case(lengths, starts, distribution, *, ratio, capacity, blocks):
 
 def test_complete_mixed_dma_requires_full_pipeline(monkeypatch):
     executed = record_score_widths(monkeypatch)
-    for context, expected_width in ((2048, 2304), (2200, 4224)):
+    for context, expected_width in ((2048, 3072), (2200, 5120)):
         for tile in (384, 256, 512):
             np.testing.assert_array_equal(
                 dma_endpoints([context], [0, 1], tile),
@@ -506,7 +602,7 @@ def test_idle_decode_neighbor_widens_real_grouped_metadata(monkeypatch):
         [256, 512, 768, 1024],
     )
     executed = record_score_widths(monkeypatch)
-    for idle_context, expected_width in ((1024, 256), (4096, 4096)):
+    for idle_context, expected_width in ((1024, 1024), (4096, 4096)):
         executed.clear()
         run_prefix_case(
             [1, idle_context, 0, 0, 1023],

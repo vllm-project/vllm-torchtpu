@@ -27,8 +27,8 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
 )
 from vllm_torchtpu.kernels.qwen4_exp import decode_indexer, pooled_qsa
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
-from vllm_torchtpu.kernels.qwen4_exp.resident_topk import QwenSparseCoreTopK
 from vllm_torchtpu.kernels.qwen4_exp.qsa import _token_metadata
+from vllm_torchtpu.kernels.qwen4_exp.resident_topk import QwenSparseCoreTopK
 
 
 @pytest.mark.parametrize("case", ["wide", "chip", "batch", "topk", "carrier"])
@@ -621,7 +621,7 @@ def test_prefill_prefix_capacity_preserves_functional_visibility(monkeypatch, mo
         )
         np.testing.assert_array_equal(np.sort(ids, axis=1), np.sort(expected, axis=1))
         np.testing.assert_array_equal(np.asarray(ids) >= 0, expected >= 0)
-        assert widths == [256 if history == 0 and mode != "injected" else 4096] * 2
+        assert widths == [1024 if history == 0 and mode != "injected" else 4096] * 2
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.uint8, jnp.float8_e4m3fn])
@@ -688,6 +688,7 @@ def test_ragged_prefill_view_preserves_carrier_and_page_addresses(
         np.testing.assert_array_equal(run(query), -np.ones((16, 16), np.int32))
     assert bool(prefill_calls) == (not decode_only)
 
+
 @pytest.mark.parametrize("qwen", [False, True])
 @pytest.mark.parametrize("return_scores", [False, True])
 def test_resident_policy_is_local_to_qwen(monkeypatch, qwen, return_scores):
@@ -710,9 +711,12 @@ def test_resident_policy_is_local_to_qwen(monkeypatch, qwen, return_scores):
     backend = QwenSparseCoreTopK() if qwen else SparseCoreTopK()
     scores = jnp.zeros((3, 16), jnp.int32)
     lengths = jnp.array([0, 7, 16], jnp.int32)
-    assert backend.select(
-        scores, 16, lengths, scheduling_group_id=7, return_scores=return_scores
-    ) is scores
+    assert (
+        backend.select(
+            scores, 16, lengths, scheduling_group_id=7, return_scores=return_scores
+        )
+        is scores
+    )
     assert calls[0][0] is qwen
     assert "try_resident_prefix" not in calls[0][1]
     assert calls[0][1]["row_lengths"] is lengths

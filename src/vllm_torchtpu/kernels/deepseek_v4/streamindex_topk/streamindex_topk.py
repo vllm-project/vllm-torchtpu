@@ -1483,9 +1483,12 @@ def streamindex_topk(
                 out_shape=jax.ShapeDtypeStruct(
                     shape=(
                         chunk_tokens,
-                        num_sublanes_total
-                        if score_sublanes is None
-                        else score_sublanes,
+                        align_to(
+                            num_sublanes_total
+                            if score_sublanes is None
+                            else score_sublanes,
+                            pltpu.get_tpu_info().num_sublanes,
+                        ),
                         128,
                     ),
                     dtype=out_dtype,
