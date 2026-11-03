@@ -1801,7 +1801,23 @@ def _decoder_attention(window: int | None) -> Any:
     layer.num_kv_heads, layer.head_size = 2, 128
     layer.sliding_window = window
     layer.impl = _pallas_impl(None)
+    layer.get_kv_cache_spec = lambda vllm_config: _kv_cache_spec(window)
     return layer
+
+
+def _kv_cache_spec(window: int | None) -> Any:
+    """The KV cache spec vLLM's `Attention.get_kv_cache_spec` returns for a layer."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    fields: dict[str, Any] = {
+        "block_size": 16,
+        "num_kv_heads": 2,
+        "head_size": 128,
+        "dtype": torch.bfloat16,
+    }
+    if window is None:
+        return FullAttentionSpec(**fields)
+    return SlidingWindowSpec(**fields, sliding_window=window)
 
 
 def _grouping_vllm_config() -> Any:
@@ -1820,7 +1836,18 @@ def _grouping_vllm_config() -> Any:
     )
 
 
-def _adapter_with_layers(windows: Sequence[int | None]) -> Any:
+def _adapter_with_layers(
+    windows: Sequence[int | None], monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    # The runner normalizes specs with the backend of the model's layers.
+    monkeypatch.setattr(
+        TpuPlatform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: PallasAttentionBackend),
+    )
     cfg = api.TextOnlyLLMExportConfig(
         model_name="tiny", num_blocks=16, block_size=16, max_num_seqs=4
     )
@@ -1833,10 +1860,14 @@ def _adapter_with_layers(windows: Sequence[int | None]) -> Any:
     return adapter
 
 
-def test_sliding_window_and_full_layers_export_vllm_kv_cache_groups() -> None:
+def test_sliding_window_and_full_layers_export_vllm_kv_cache_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Layers keep vLLM's groups: one page table each, layer `j` of every group
     sharing KV tensor `j`."""
-    adapter = _adapter_with_layers([2048, None, 2048, 2048, 2048, None, 2048, 2048])
+    adapter = _adapter_with_layers(
+        [2048, None, 2048, 2048, 2048, None, 2048, 2048], monkeypatch
+    )
     assert adapter.kv_cache_groups() == [
         api.KvCacheGroup("kv0", ("layers.0.attn", "layers.4.attn"), 2048),
         api.KvCacheGroup("kv1", ("layers.2.attn", "layers.6.attn"), 2048),
@@ -1873,9 +1904,11 @@ def test_sliding_window_and_full_layers_export_vllm_kv_cache_groups() -> None:
     }
 
 
-def test_a_model_with_one_kv_cache_group_keeps_block_tables() -> None:
+def test_a_model_with_one_kv_cache_group_keeps_block_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     for windows in ([None, None], [2048, 2048]):
-        adapter = _adapter_with_layers(windows)
+        adapter = _adapter_with_layers(windows, monkeypatch)
         assert adapter.kv_cache_groups() == []
         assert len(list(adapter.abstract_states())) == 2
         assert adapter.extra_user_inputs() == []
@@ -1883,11 +1916,41 @@ def test_a_model_with_one_kv_cache_group_keeps_block_tables() -> None:
         assert exporter._kv_cache_groups_serving_config(adapter) == {}
 
 
-def test_kv_cache_groups_with_an_mtp_draft_are_rejected() -> None:
-    adapter = _adapter_with_layers([2048, None])
+def test_a_model_without_sliding_window_layers_skips_the_spec_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full-attention models never reach vLLM's spec or grouping code, so their
+    artifacts stay byte-identical to the ones exported before groups existed."""
+    adapter = _adapter_with_layers([None, None, None], monkeypatch)
+    for _, layer in adapter._named_attention_layers():
+        layer.get_kv_cache_spec = lambda vllm_config: pytest.fail("spec path ran")
+    assert adapter.kv_cache_groups() == []
+
+
+def test_a_model_that_drafts_with_mtp_keeps_one_page_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter_with_layers([2048, None], monkeypatch)
     adapter._drafts_with_mtp = lambda: True
-    with pytest.raises(NotImplementedError, match="with an MTP draft"):
-        adapter.kv_cache_groups()
+    assert adapter.kv_cache_groups() == []
+    assert adapter.extra_user_inputs() == []
+    assert exporter._block_tables_name(adapter) == "block_tables"
+    assert exporter._kv_cache_groups_serving_config(adapter) == {}
+
+
+def test_kv_cache_groups_come_from_each_layers_own_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The groups follow what each layer reports, as the runner's do: a layer
+    whose spec is full attention joins the full group whatever its attributes."""
+    adapter = _adapter_with_layers([2048, None, 2048, None], monkeypatch)
+    _, layer = adapter._named_attention_layers()[2]
+    layer.get_kv_cache_spec = lambda vllm_config: _kv_cache_spec(None)
+    groups = adapter.kv_cache_groups()
+    window_layers = {n for g in groups if g.window is not None for n in g.layer_names}
+    full_layers = {n for g in groups if g.window is None for n in g.layer_names}
+    assert window_layers == {"layers.0.attn"}
+    assert full_layers == {"layers.1.attn", "layers.2.attn", "layers.3.attn"}
 
 
 class _GroupRecordingBackbone(nn.Module):
@@ -1921,8 +1984,8 @@ def test_forward_binds_shared_kv_tensors_and_group_page_tables() -> None:
         api.KvCacheGroup("kv1", ("l1", "l3"), None),
     ]
     backbone = _GroupRecordingBackbone(layers)
-    adapter._model = nn.Module()
-    adapter._model.model = backbone
+    # The export calls the top-level model's forward, as the runner does.
+    adapter._model = backbone
     kvs = [torch.zeros(2), torch.zeros(2)]
     tables = {
         "kv0_block_tables": torch.tensor([1]),

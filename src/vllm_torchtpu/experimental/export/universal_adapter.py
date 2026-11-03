@@ -1187,12 +1187,19 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         return self._kv_cache_groups
 
     def _compute_kv_cache_groups(self) -> list[api.KvCacheGroup]:
-        if self._vllm_config is None:
+        # `mtp_draft` takes one page table, so a drafting model keeps every layer
+        # on `block_tables`, as it exported before groups existed.
+        if self._vllm_config is None or self._drafts_with_mtp():
             return []
         from vllm.model_executor.layers.attention import Attention
         from vllm.v1.attention.backend import AttentionType
         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
         from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        from vllm_torchtpu.kv_cache_spec_normalizer import (
+            normalize_kv_cache_specs_for_tpu,
+        )
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
         named_layers = self._named_attention_layers()
         if not named_layers or not all(
@@ -1202,6 +1209,12 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             for _, m in named_layers
         ):
             return []
+        # Decoder attention splits into groups only around sliding-window layers.
+        # Without one, nothing below runs, so such a model exports exactly as it
+        # did before groups existed (the spec path touches the backend, which can
+        # shift the KV budget fit by a block).
+        if all(m.sliding_window is None for _, m in named_layers):
+            return []
         per_layer = self._layer_state_specs([m for _, m in named_layers])
         if (
             per_layer is None
@@ -1209,30 +1222,28 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             != 1
         ):
             return []
-        # As the runner's `get_kv_cache_spec` builds them for decoder attention.
-        block_size = self._vllm_config.cache_config.block_size
+        # The runner's specs: each layer's own `get_kv_cache_spec`, normalized to
+        # the TPU page geometry (`KVCacheManager.get_kv_cache_spec`), so the export
+        # groups the layers exactly as serving does.
+        from vllm.config import set_current_vllm_config
+
         specs: dict[str, Any] = {}
-        for name, layer in named_layers:
-            fields = {
-                "block_size": block_size,
-                "num_kv_heads": layer.num_kv_heads,
-                "head_size": layer.head_size,
-                "dtype": tpu_lowering.torch_dtype(per_layer[0][0].dtype),
-            }
-            if layer.sliding_window is not None:
-                specs[name] = SlidingWindowSpec(
-                    **fields, sliding_window=layer.sliding_window
-                )
-            else:
-                specs[name] = FullAttentionSpec(**fields)
-        groups = get_kv_cache_groups(self._vllm_config, specs)
+        # The TPU backend's `customize_spec` reads the current config, as it does
+        # in the runner.
+        with set_current_vllm_config(self._vllm_config):
+            for name, layer in named_layers:
+                spec = layer.get_kv_cache_spec(self._vllm_config)
+                if not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+                    return []
+                specs[name] = spec
+            specs = normalize_kv_cache_specs_for_tpu(
+                specs,
+                tpu_lowering.torch_dtype(per_layer[0][0].dtype),
+                attention_backend=TpuPlatform._find_non_ssm_backend(self._vllm_config),
+            )
+            groups = get_kv_cache_groups(self._vllm_config, specs)
         if len(groups) <= 1:
             return []
-        if self._drafts_with_mtp():
-            raise NotImplementedError(
-                "KV cache groups (sliding-window and full-attention layers) with an "
-                "MTP draft are not supported by export"
-            )
         result = []
         for i, group in enumerate(groups):
             spec = group.kv_cache_spec
@@ -1605,8 +1616,10 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         per_layer = None if groups else self._layer_state_specs()
         # Each recurrent layer binds its `[conv_state, recurrent_state]` list.
         layer_kvs: list[list[Any]] | None = None
-        # Of a model with KV cache groups, one layer per shared KV tensor.
+        # Of a model with KV cache groups, one layer per shared KV tensor and the
+        # metadata of each layer's group.
         slot_layers: list[Any] = []
+        metadata_by_layer: dict[str, Any] = {}
         if groups:
             slots = self._kv_cache_slots()
             group_metadata = {
