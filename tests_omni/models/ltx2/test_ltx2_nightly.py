@@ -35,8 +35,6 @@ well within the 1800s CI Nightly per-test timeout):
   (``video_sha256 = 0e9bc093...``, ``audio_sha256 = 382ac716...``).
 """
 
-from collections.abc import Callable
-
 import numpy as np
 import pytest
 
@@ -68,10 +66,7 @@ AUDIO_RMS_FLOOR = 1e-3
     [get_ltx2_model()],
     indirect=True,
 )
-def test_ltx2_t2v_smoke_tpu(
-    omni_runner: OmniRunner,
-    record_property: Callable[[str, object], None],
-) -> None:
+def test_ltx2_t2v_smoke_tpu(omni_runner: OmniRunner) -> None:
     """Verify LTX-2 T2V output shapes, dtypes, and non-degeneracy on TPU v7x."""
     raw_outputs = list(omni_runner.generate(LTX2_PROMPT, build_ltx2_request(seed=42)))
 
@@ -100,10 +95,7 @@ def test_ltx2_t2v_smoke_tpu(
     [get_ltx2_model()],
     indirect=True,
 )
-def test_ltx2_seed_determinism_tpu(
-    omni_runner: OmniRunner,
-    record_property: Callable[[str, object], None],
-) -> None:
+def test_ltx2_seed_determinism_tpu(omni_runner: OmniRunner) -> None:
     """Verify identical seeds produce bitwise-equal video and audio on TPU v7x."""
     out_42_a = extract_ltx2_outputs(
         list(omni_runner.generate(LTX2_PROMPT, build_ltx2_request(seed=42)))
