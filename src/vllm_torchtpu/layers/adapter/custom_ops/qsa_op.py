@@ -1308,6 +1308,19 @@ def build_pooled_qsa_compressed_dcp_op(pair_group, size: int):
     return run
 
 
+def _pair_qgate(qgate, head_dim, pair_group):
+    """The pair's concatenated ``qgate`` for the DCP prefill select step.
+    VLLM_TPU_QSA_DCP_Q_GATHER: gather only the q halves and zero the gates;
+    the DCP attention returns ungated partials and ``_dcp_finish`` gates with
+    this rank's own ``qgate``, so half the bytes and the same values."""
+    if not envs.VLLM_TPU_QSA_DCP_Q_GATHER:
+        return pair_group.all_gather(qgate.contiguous(), dim=-1)
+    tokens = qgate.shape[0]
+    q = qgate.reshape(tokens, -1, 2 * head_dim)[..., :head_dim]
+    q_pair = pair_group.all_gather(q.contiguous(), dim=1)
+    return torch.cat([q_pair, torch.zeros_like(q_pair)], dim=-1).reshape(tokens, -1)
+
+
 def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: int):
     """``build_pooled_qsa_compressed_dcp_op`` for the prefill sequence-parallel
     graph: each DCP pair scores one token shard (``TP / size`` shards, both
@@ -1326,7 +1339,7 @@ def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: i
             args[index] = args[index].to(torch.int32)
         qgate = args[0]
         tokens, head_dim = qgate.shape[0], args[4].shape[0]
-        args[0] = pair_group.all_gather(qgate.contiguous(), dim=-1)
+        args[0] = _pair_qgate(qgate, head_dim, pair_group)
         pool = args[10]
         updated, q, gate, lengths, req, starts, vals, pos = token_select(
             *args, torch.div(shard_index, size, rounding_mode="floor"), dcp_rank,
@@ -1373,7 +1386,7 @@ def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
             args[index] = args[index].to(torch.int32)
         qgate = args[0]
         head_dim = args[4].shape[0]
-        args[0] = pair_group.all_gather(qgate.contiguous(), dim=-1)
+        args[0] = _pair_qgate(qgate, head_dim, pair_group)
         pool = args[10]
         updated, q, gate, lengths, req, starts, blocks = select(
             *args, shard_index, dcp_rank, shard_size=world, dcp_size=size, **kwargs
