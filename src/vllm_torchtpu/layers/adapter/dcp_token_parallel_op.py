@@ -194,8 +194,11 @@ def _sharded_rank_ids() -> torch.Tensor | None:
 
 def body_levers() -> tuple[str, ...]:
     """TPU_MLA_TP_BODY_LEVERS -> the attend kernel's `plain_body_levers`
-    ("1" = all of `PLAIN_BODY_LEVERS`, else a comma list; empty / "0" = off)."""
+    ("1" = all of `PLAIN_BODY_LEVERS`, else a comma list; "auto" = all of
+    them under split q, none without; empty / "0" = off)."""
     value = envs.TPU_MLA_TP_BODY_LEVERS
+    if value == "auto":
+        value = "1" if envs.TPU_MLA_SPARSE_SPLIT_Q else "0"
     if value in ("", "0"):
         return ()
     if value == "1":
