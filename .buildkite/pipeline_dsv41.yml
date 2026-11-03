@@ -84,6 +84,21 @@ steps:
     artifact_paths:
       - "perf_eval_results/**/*"
 
+  - label: "DeepSeek-V4.1 SWA: shared windows and guard fallback"
+    key: "dsv41_swa_parity"
+    depends_on: "build_docker"
+    timeout_in_minutes: 30
+    agents:
+      queue: "tpu_v7x_2_queue"
+    commands:
+      - >-
+        bash .buildkite/scripts/run_in_docker.sh
+        python -m pytest tests/models/vllm/test_dsv41_v2_attention_addressing.py
+        -k test_pure_swa_pallas_preserves_cache_addressing
+        -q --junitxml=/perf_eval_results/dsv41-swa-parity.xml
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
   - label: "DeepSeek-V4.1 benchmark scripts: CPU regression tests"
     key: "dsv41_benchmark_scripts_cpu"
     depends_on: "build_docker"

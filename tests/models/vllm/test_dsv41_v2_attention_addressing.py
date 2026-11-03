@@ -812,13 +812,17 @@ def test_query_split_traces_one_graph_for_all_buckets():
     assert counter.frame_count == 1
 
 
-@pytest.mark.parametrize("layout", ["shared", "boundary", "decode"])
+@pytest.mark.parametrize(
+    "layout",
+    ["shared", "boundary", "decode", "q6", "q6_short", "q6_reordered", "q6_padded"],
+)
 @pytest.mark.parametrize("banked", [False, True])
 def test_pure_swa_pallas_preserves_cache_addressing(monkeypatch, layout, banked):
     """Check union reuse, request-tail patching and per-token windows end to end."""
     import functools
 
     from vllm_torchtpu.kernels.mla import swa_attention
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import _pack_bf16_words
 
     if jax.default_backend() != "tpu":
@@ -830,17 +834,45 @@ def test_pure_swa_pallas_preserves_cache_addressing(monkeypatch, layout, banked)
         )
     rng = np.random.default_rng(17)
     tokens, heads, dim = 128, 8, 512
+    q6 = layout.startswith("q6")
+    if q6:
+        tokens, heads = 288, 64
     values = jnp.asarray(rng.normal(size=(512, dim)), jnp.bfloat16)
     pool = _pack_bf16_words(values).reshape(-1, 128)
     if banked:
         pool = (pool[:512], pool[512:])
     positions = np.arange(tokens) + 127
-    if layout == "boundary":
+    if q6:
+        positions = np.repeat(np.arange(tokens // 6) * 7 + 127, 6)
+        positions += np.tile(np.arange(6), tokens // 6)
+        if layout == "q6_short":
+            positions[:6] = np.arange(6)
+    elif layout == "boundary":
         positions[37:] = np.arange(tokens - 37) + 300
     elif layout == "decode":
         positions = rng.integers(127, 512, tokens)
     records = positions[:, None] - 127 + np.arange(128)[None]
-    records[-1] = -1
+    if q6:
+        # Shuffle physical pages, including across the two cache banks.
+        pages = rng.permutation(16)
+        records = np.where(
+            records >= 0, pages[np.maximum(records, 0) // 32] * 32 + records % 32, -1
+        )
+        records[-6:] = -1
+        if layout == "q6_reordered":
+            records[[2, 3]] = records[[3, 2]]
+        elif layout == "q6_padded":
+            records[3] = -1
+    else:
+        records[-1] = -1
+    gathered_sizes = []
+    original_gather = attention_kernels.gather_cache_pieces
+
+    def checked_gather(pool, records, elements):
+        jax.debug.callback(lambda size: gathered_sizes.append(int(size)), records.size)
+        return original_gather(pool, records, elements)
+
+    monkeypatch.setattr(attention_kernels, "gather_cache_pieces", checked_gather)
     records = jnp.asarray(records, jnp.int32)
     q = jnp.asarray(rng.normal(size=(tokens, heads, dim)), jnp.bfloat16)
     sink = jnp.asarray(rng.normal(size=heads), jnp.float32)
@@ -858,3 +890,7 @@ def test_pure_swa_pallas_preserves_cache_addressing(monkeypatch, layout, banked)
         np.asarray(got, np.float32), expected, atol=3e-3, rtol=1e-2
     )
     np.testing.assert_array_equal(got[-1], 0)
+    if q6:
+        jax.effects_barrier()
+        expected_rows = 48 * 256 if layout in ("q6", "q6_short") else tokens * 128
+        assert gathered_sizes == [expected_rows]

@@ -322,6 +322,31 @@ def _swa_attention(q, pool, records, sink, scale):
         kv = kv.reshape(4, *records.shape, 128)
         return attend_swa(q, kv, (records >= 0)[:, None, :], sink, scale)
 
+    # DSpark K5 supplies six consecutive query windows per request. Prove
+    # the overlap from physical records before sharing cache rows; rejected,
+    # padded or reordered groups retain the direct gather path.
+    if q.shape == (288, 64, 512) and records.shape == (288, 128):
+        queries, width = 6, records.shape[1]
+        rows = records.reshape(-1, queries, width)
+        union = jnp.concatenate((rows[:, 0], rows[:, -1, -(queries - 1) :]), axis=1)
+        offsets = jnp.arange(queries)[:, None] + jnp.arange(width)[None, :]
+        valid = jnp.all(rows == union[:, offsets])
+
+        def shared_q6(_):
+            padded = jnp.pad(
+                union, ((0, 0), (0, 256 - union.shape[1])), constant_values=-1
+            )
+            kv = gather_cache_pieces(pool, padded.reshape(-1), q.shape[-1])
+            kv = kv.reshape(4, *padded.shape, 128)
+            column = jnp.arange(padded.shape[1])[None, None, :]
+            slot = jnp.arange(queries)[None, :, None]
+            mask = (
+                (column >= slot) & (column < width + slot) & (padded[:, None, :] >= 0)
+            )
+            return attend_swa(q, kv, mask, sink, scale)
+
+        return jax.lax.cond(valid, shared_q6, lambda _: direct(q, records), None)
+
     tokens = q.shape[0]
     if tokens < 128 or tokens % 64 or tokens % 6 == 0 or records.shape[1] != 128:
         return direct(q, records)
