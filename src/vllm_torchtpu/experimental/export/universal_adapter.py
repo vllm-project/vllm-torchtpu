@@ -565,8 +565,10 @@ def _load_mtp_draft(vllm_config: Any, target: nn.Module) -> nn.Module | None:
     draft_vllm_config = copy.copy(vllm_config)
     draft_model_config = copy.copy(spec.draft_model_config)
     draft_model_config.runner_type = "draft"
+    import typing
     with trace("export.load_mtp_draft"), set_current_vllm_config(draft_vllm_config):
-        draft = get_model_loader(vllm_config.load_config).load_model(
+        load_model = typing.cast(typing.Callable[..., torch.nn.Module], get_model_loader(vllm_config.load_config).load_model)
+        draft = load_model(
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
     _share_embedding_and_lm_head(draft, target)
@@ -1374,7 +1376,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             forward_metadata = {name: metadata for name, _ in layers}
             prev = getattr(draft, "do_not_compile", None)
             if prev is not None:
-                draft.do_not_compile = True
+                object.__setattr__(draft, "do_not_compile", True)
             try:
                 with contextlib.ExitStack() as stack:
                     if self._vllm_config is not None:
