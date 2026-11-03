@@ -145,6 +145,9 @@ class KernelConfig:
     # Weight loading.
     read_streams: int = 4
     load_inflight_gb: float = 16.0
+    # Join each expert family's per-file parts on the host and upload it whole
+    # (one device allocation) instead of joining the parts on the device.
+    expert_host_join: bool = False
     # Diagnostics (off in serving): dcp_skip and debug_skip skip named work, so
     # results are invalid (timing or hang bisection only); the rest add trace
     # scopes, VMEM reports or VMEM padding.

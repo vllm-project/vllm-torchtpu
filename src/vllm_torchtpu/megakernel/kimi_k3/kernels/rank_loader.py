@@ -407,6 +407,34 @@ def _replica_table(latent_norm, experts, order):
     return table
 
 
+def _host_joined(jobs):
+    """``(key, nbytes, reader)`` jobs with each family's ``family@i/n`` parts
+    merged into one job that reads them into one host array."""
+    jobs, out, index = list(jobs), [], 0
+    while index < len(jobs):
+        key = jobs[index][0]
+        family, marker, suffix = key.partition("@")
+        if not marker:
+            out.append(jobs[index])
+            index += 1
+            continue
+        count = int(suffix.split("/")[1])
+        parts = jobs[index:index + count]
+        if [k for k, _, _ in parts] != [f"{family}@{i}/{count}" for i in range(count)]:
+            raise ValueError(f"expert parts of {family} are not consecutive")
+
+        def reader(parts=parts):
+            first = parts[0][2]()
+            arrays = [first]
+            for _, _, read in parts[1:]:
+                arrays.append(read())
+            return np.concatenate(arrays, axis=0)
+
+        out.append((family, sum(n for _, n, _ in parts), reader))
+        index += count
+    return out
+
+
 def _ep16_expert_jobs(presharded, rank_dir: RankDir, rank: int, layers: int):
     """EP16/TP2 expert families regrouped from the EP8 group's quarters (same
     host): 56 experts, half the intermediate (the prefill's EP16 layout)."""
@@ -438,6 +466,8 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
         jobs = list(_ep16_expert_jobs(presharded, rank_dir, rank, layers))
     else:
         jobs = list(_expert_jobs(rank_dir, split_experts))
+    if _config().expert_host_join:
+        jobs = _host_joined(jobs)
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for key, value in _budgeted(jobs):
         if plan is not None and key != "dense":
@@ -621,6 +651,8 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
                      for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)]
     else:
         jobs += list(_expert_jobs(rank_dir, split_experts))
+    if _config().expert_host_join:
+        jobs = _host_joined(jobs)
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for name, source in (("latent_down", "latent_down"), ("latent_up", "latent_up"),
                          ("shared_gu", f"shared_gu_{parity}"), ("shared_down", f"shared_down_{parity}")):

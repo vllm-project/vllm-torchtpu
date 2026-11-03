@@ -132,3 +132,14 @@ def test_config_rejects_hot_plans_at_ep16():
         KernelConfig(decode_expert_parallel=12)
     with pytest.raises(ValueError, match="hot-expert plans"):
         KernelConfig(decode_expert_parallel=16, kd_hot_plan="hot_plan_p8c72_plain8.npz")
+
+
+def test_host_joined_parts_match_the_device_join(preshard):
+    root, _ = preshard
+    rank_dir = rl.RankDir(root, 3, LAYERS)
+    jobs = list(rl._ep16_expert_jobs(root, rank_dir, 3, LAYERS))
+    joined = {key: (nbytes, read()) for key, nbytes, read in rl._host_joined(jobs)}
+    assert set(joined) == set(SHAPES)
+    for name in SHAPES:
+        np.testing.assert_array_equal(joined[name][1], _decode_family(root, 3, name))
+        assert joined[name][0] == sum(n for k, n, _ in jobs if k.startswith(name + "@"))
