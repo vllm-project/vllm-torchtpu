@@ -362,6 +362,13 @@ def run_prefill(args, records: harness.Records) -> None:
                 prompts = []
                 for r in range(count):
                     fixed = np.random.default_rng(1000 + 16 * repeat + r)
+                    if corpus is None:  # ids uniform over the vocabulary
+                        prompts.append(
+                            fixed.integers(
+                                0, k3_program.VOCAB, prefix + length, dtype=np.int32
+                            )
+                        )
+                        continue
                     start = int(fixed.integers(0, corpus.size - 262144))
                     prompts.append(corpus[start : start + prefix + length])
             else:
