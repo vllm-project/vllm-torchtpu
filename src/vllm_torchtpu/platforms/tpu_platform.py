@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Ensure environment overrides are applied before any other imports,
 # especially torch_tpu which might read them at import time.
@@ -289,6 +301,25 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
     logger.info(
         "Applied TPU patch: /reload_kernel dev endpoint (TPU_KERNEL_ITER_MODE)."
     )
+
+
+def _validate_peer_replay_config() -> None:
+    """Fail fast on TPU_PRECOMPILE_PEER_REPLAY with vLLM's compile cache off.
+
+    Peer replay hands a compiled range to the host's other ranks through the
+    compile cache (TpuCompilerAdaptor saves and replays the cache artifact),
+    so with VLLM_DISABLE_COMPILE_CACHE=1 there is nothing to replay.
+    """
+    if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
+        return
+    if vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
+        raise ValueError(
+            "TPU_PRECOMPILE_PEER_REPLAY=1 needs vLLM's compile cache: peer ranks "
+            "share compiled ranges through it, so it does nothing with "
+            "VLLM_DISABLE_COMPILE_CACHE=1. Unset VLLM_DISABLE_COMPILE_CACHE "
+            "(point VLLM_CACHE_ROOT at a temporary directory for a cold start "
+            "with nothing kept across runs) or set TPU_PRECOMPILE_PEER_REPLAY=0."
+        )
 
 
 def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
@@ -608,6 +639,7 @@ class TpuPlatform(Platform):
 
         configure_mtp_prefill_mode(vllm_config)
         _validate_phased_profiling_config(vllm_config)
+        _validate_peer_replay_config()
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
