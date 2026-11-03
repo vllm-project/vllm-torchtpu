@@ -122,7 +122,7 @@ def test_halo_exchange_gives_each_piece_its_window(traced):
     k, v = _kv(plan.num_tokens, 16, 128, seed=1)
     in_order = cp_prefill.pack_kv_pages(k, v, PAGE)
     rows = [(_rank_rows(k, plan, r), _rank_rows(v, plan, r)) for r in range(plan.world)]
-    # Every rank's tails, as pack_piece_tails packs them.
+    # Every rank's tails as pages, as the receiver unpacks the gathered rows.
     piece = plan.piece_tokens
     tails = [
         [
@@ -163,7 +163,7 @@ def test_sliding_exchange_refuses_pieces_shorter_than_the_halo():
     rows = jnp.zeros((2 * plan.piece_tokens, 4, 128), jnp.float8_e4m3fn)
     cfg = _layer_config(4, 1024, configs.KVLayout.HEAD_ALONG_SUBLANE)
     with pytest.raises(ValueError, match="halo"):
-        cp_prefill.sliding_exchange_row(
+        cp_prefill.sliding_exchange_rows(
             rows,
             rows,
             jnp.array([plan.num_pages * PAGE], jnp.int32),
@@ -259,12 +259,12 @@ def test_sliding_window_write_caches_the_decode_window(seq_len, layout):
     )
     held = jnp.stack(
         [
-            cp_prefill.window_pages_held(
+            cp_prefill.window_rows_held(
                 _rank_rows(k, plan, r), _rank_rows(v, plan, r), plan, r, position_pages
             )
             for r in range(plan.world)
         ]
-    )
+    ).reshape(plan.world, position_pages.shape[0], PAGE, -1)
     block_table = _block_table(num_cache_pages, plan.num_pages, seed=5)
     src, dst, count = cp_prefill.window_page_writes(block_table, position_pages, count)
     first_page = max(seq_len - window + 1, 0) // PAGE
@@ -276,8 +276,9 @@ def test_sliding_window_write_caches_the_decode_window(seq_len, layout):
         expected = _serving_pages(k[:, heads], v[:, heads], layout)
         cache = jnp.full((num_cache_pages, *expected.shape[1:]), 7, FP8)
         owners = cp_prefill.window_page_owners(plan, position_pages)
-        window = cp_prefill.window_pages_from_ranks(held, owners)
-        slots = cp_prefill.kv_head_slots(window, first, num_heads)
+        slots = cp_prefill.window_slots_from_rows(
+            held, owners, first, num_heads, head_dim
+        )
         pages = cp_prefill.cache_pages_from_slots(slots, layout)
         with pltpu.force_tpu_interpret_mode():
             cache = cp_prefill.write_kv_pages(cache, pages, src, dst, count)
@@ -378,7 +379,7 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
     # The all-gather: every rank's row, in rank order.
     gathered = jnp.concatenate(
         [
-            cp_prefill.sliding_exchange_row(
+            cp_prefill.sliding_exchange_rows(
                 *rows[r], seq_lens, jnp.array([r], jnp.int32), PAGE, cfg=cfg
             )
             for r in range(plan.world)
@@ -389,8 +390,8 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
     )
     needed = np.asarray(position_pages)[: int(count)]
     halo = cp_prefill.num_halo_pages(window, PAGE)
-    tail_bytes = halo * PAGE * 2 * num_kv_heads * 128
-    pp = plan.piece_pages
+    by_rank = gathered.reshape(plan.world, -1, 2 * num_kv_heads * 128)
+    ht, pp = halo * PAGE, plan.piece_pages
     for rank in range(plan.world):
         # Its halos: the tails of the pieces before its two (where they exist),
         # the first-piece tail of the rank below and the second-piece tail of
@@ -402,7 +403,7 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
             if piece == 0 or (rank == 7 and src == 0):
                 continue
             np.testing.assert_array_equal(
-                _bytes(gathered[src, slot * tail_bytes : (slot + 1) * tail_bytes]),
+                _bytes(by_rank[src, slot * ht : (slot + 1) * ht]).reshape(-1),
                 _bytes(in_order[piece * pp - halo : piece * pp]).reshape(-1),
             )
         first, num_heads = cp_prefill.tp_kv_heads(num_kv_heads, plan.world, rank)

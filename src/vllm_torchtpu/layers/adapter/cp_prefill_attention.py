@@ -121,9 +121,9 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
     def fake_exchange(keys, values, seq_lens, rank, page_size):
         # Two piece tails of halo pages, then halo + 1 window pages.
         halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, page_size)
-        page_bytes = page_size * 2 * cfg.num_kv_heads * cfg.head_dim
-        row = (3 * halo_pages + 1) * page_bytes
-        return keys.new_empty((1, row), dtype=torch.int8)
+        rows = (3 * halo_pages + 1) * page_size
+        width = 2 * cfg.num_kv_heads * cfg.head_dim
+        return keys.new_empty((rows, width), dtype=torch.int8)
 
     def fake_sliding(kv_cache, query, *args):
         return torch.empty_like(kv_cache), torch.empty_like(query)
@@ -131,7 +131,7 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
     return LayerOps(
         sliding_exchange=_register(
             "sliding_exchange",
-            cp_prefill.sliding_exchange_row,
+            cp_prefill.sliding_exchange_rows,
             fake_exchange,
             donate=False,
             cfg=cfg,
@@ -355,8 +355,8 @@ def cp_layer(
             kv_cache, query, gathered, seq_lens, block_tables, rank
         )
     else:
-        row = ops.sliding_exchange(key, value, seq_lens, rank, plan.page_size)
-        gathered = _waited(funcol.all_gather_single(row, 0, group))
+        rows = ops.sliding_exchange(key, value, seq_lens, rank, plan.page_size)
+        gathered = _waited(funcol.all_gather_single(rows, 0, group))
         new_kv_cache, out = ops.sliding_attention(
             kv_cache, query, key, value, gathered, seq_lens, block_tables, rank
         )
