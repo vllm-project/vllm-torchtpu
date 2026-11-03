@@ -84,6 +84,12 @@ def make_attention_metadata(
     )
 
 
+def _model_config_value(model_cfg: Any, accessor: str) -> Any:
+    """Calls `model_cfg.<accessor>()` if vLLM's ModelConfig provides it."""
+    fn = getattr(model_cfg, accessor, None)
+    return fn() if callable(fn) else None
+
+
 def _extract_hf_field(hf_config: Any, *keys: str, default: Any = None) -> Any:
     """Reads the first present attribute or dict entry from `hf_config`."""
     if hf_config is None:
@@ -259,8 +265,12 @@ def build_export_config_from_vllm(
         )
         or _extract_hf_field(hf_cfg, "hidden_size", default=1024)
     )
+    # vLLM's ModelConfig resolves fields a checkpoint declares per layer (e.g.
+    # Gemma 4's KV heads and head_dim), which transformers refuses to read as
+    # one global value, so its accessors come before the raw HF fields.
     num_layers = int(
-        _extract_hf_field(
+        _model_config_value(model_cfg, "get_total_num_hidden_layers")
+        or _extract_hf_field(
             hf_cfg, "num_hidden_layers", "num_layers", "n_layer", default=28
         )
     )
@@ -270,7 +280,8 @@ def build_export_config_from_vllm(
         )
     )
     num_kv_heads = int(
-        _extract_hf_field(
+        _model_config_value(model_cfg, "get_total_num_kv_heads")
+        or _extract_hf_field(
             hf_cfg,
             "num_key_value_heads",
             "num_kv_heads",
