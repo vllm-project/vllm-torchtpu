@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_SHARD_MERGE: bool = False
     VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
+    VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_QSA_FUSED_DCP_BLOCKS: bool = False
     VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
     VLLM_TPU_QSA_DCP_Q_GATHER: bool = False
@@ -805,6 +806,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is a bitcast and the per-call relayout copy before the kernel goes away
     # (bit-identical).
     "VLLM_TPU_HC_PREFILL_UP_T": env_bool("VLLM_TPU_HC_PREFILL_UP_T"),
+    # Prefill HC combine_mix (attn -> mlp): the gated residual runs as the
+    # prologue of the next HC's full-mix kernel, which writes the combined hyper
+    # input once instead of a separate merge kernel writing it and the mix
+    # reading it back (bit-identical).
+    "VLLM_TPU_HC_PREFILL_COMBINE_MIX": env_bool("VLLM_TPU_HC_PREFILL_COMBINE_MIX"),
     # With VLLM_TPU_QSA_COMPRESSED_DCP: merge a pair's local top-k lists into the
     # global selection with one TensorCore Pallas kernel (radix select, tie
     # cut, bitonic sort) instead of the SparseCore top-k + keep mask + sort
