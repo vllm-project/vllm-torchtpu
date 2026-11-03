@@ -467,6 +467,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             if envs.VLLM_TPU_GDN_HOIST_METADATA and not self._bm_kernel
             else None
         )
+        # Built here, not on first use: registering a custom op while dynamo
+        # traces the forward is an error.
+        self.gdn_step_metadata_op = (
+            _gdn_step_metadata_op() if self.gdn_pooled_hoisted_op is not None else None
+        )
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
         self.gdn_pcp_op = (
@@ -1424,6 +1429,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 if (
                     gdn_step_metadata_cache is not None
                     and self.gdn_pooled_hoisted_op is not None
+                    and self.gdn_step_metadata_op is not None
                     and slot_read_offsets is not None
                     and ckpt_indices is not None
                 ):
@@ -1440,7 +1446,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     slot_read_offsets, ckpt_indices, *rest = (
                         gdn_step_metadata_cache.get(
                             attn_metadata,
-                            lambda: tuple(_gdn_step_metadata_op()(*group_inputs)),
+                            lambda: tuple(self.gdn_step_metadata_op(*group_inputs)),
                         )
                     )
                     step_metadata = tuple(rest)
