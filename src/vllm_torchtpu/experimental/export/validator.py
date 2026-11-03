@@ -406,7 +406,7 @@ def validate_exported_model_dir(output_dir: str) -> None:
 
 
 def _check_mtp_draft(meta: dict[str, Any], functions: dict[str, Any]) -> None:
-    """The MTP drafting contract across functions (RFC 0002, `mtp_draft`).
+    """The MTP drafting contract across functions (`mtp_draft`).
 
     An artifact declaring `speculative_config.method = "mtp"` exports
     `mtp_draft` for exactly the `forward` buckets; each variant takes the

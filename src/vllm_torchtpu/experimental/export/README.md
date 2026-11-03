@@ -93,11 +93,15 @@ adds no drafter, and the artifact declares no speculative decoding. With
 `--speculative-config`, `--max-verify-tokens` above its `num_speculative_tokens`
 widens the window past the drafter's tokens (vLLM loads the config with `K`
 tokens; the artifact keeps its own draft count). Each window slot costs one more
-recurrent state per request. These layers keep this per-layer
-layout rather than
-vLLM's unified KV block pool, and the export runs with prefix caching off. The
-recurrent state bytes come off the KV budget before it is divided among KV
-blocks.
+recurrent state per request. Whenever these windows span more than one token
+(`--speculative-config`, or `--max-verify-tokens` above 1), `req_dist` grows
+from 3 to 6 int32 elements: the first three are the attention kernel's request
+distribution, as without windows, and the last three are the recurrent kernels'
+distribution, in which a request's verify window counts as one windowed
+segment rather than as a mixed sequence. Without windows `req_dist` keeps its 3
+elements. These layers keep this per-layer layout rather than vLLM's unified KV
+block pool, and the export runs with prefix caching off. The recurrent state
+bytes come off the KV budget before it is divided among KV blocks.
 
 ### MTP drafting
 

@@ -864,9 +864,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     - `abstract_params()` inspects `self.model.named_parameters()` and infers TP/EP
       sharding specs via `weight_mapper.infer_weight_sharding`.
     - `forward()` converts the 6 standard control inputs into `AttentionMetadata`
-      via `make_attention_metadata(...)` and drives `self.model.model(...)` (or
-      `self.model(...)`) inside `vllm.forward_context.set_forward_context(...)`.
-    - `compute_logits()` invokes `self.model.compute_logits` or `self.model.lm_head`.
+      via `make_attention_metadata(...)` and drives the top-level `self.model(...)`
+      inside `vllm.forward_context.set_forward_context(...)`.
+    - `compute_logits()` invokes the model's own `self.model.compute_logits`.
     - `sample_tokens()` executes greedy, dynamic stochastic, or penalized token
       sampling.
     """
