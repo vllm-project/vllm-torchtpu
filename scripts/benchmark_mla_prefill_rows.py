@@ -621,7 +621,7 @@ def prefetch(st, w, after, gather="allgather"):
     `after` exists: one all-gather (offloaded to the SparseCores) or
     collective-permutes around a ring of the slice (TensorCore DMAs)."""
     ring = None
-    if set(ro.GATHERS[gather]) - {"ag"}:
+    if ro.needs_ring(gather):
         ring = ro.ring_order(st.mesh.devices.reshape(-1))
 
     def local(wo, uv, so, after):

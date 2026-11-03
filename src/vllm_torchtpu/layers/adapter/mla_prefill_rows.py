@@ -175,7 +175,7 @@ def _build_ops() -> _Rows:
         return _OPS[gather]
     mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
     ring = None
-    if set(rows_oproj.GATHERS[gather]) - {"ag"}:
+    if rows_oproj.needs_ring(gather):
         ring = rows_oproj.ring_order(mesh.devices.reshape(-1))
     sharded = P(DCP_AXIS_NAME)
 

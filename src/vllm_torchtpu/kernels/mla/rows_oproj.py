@@ -113,6 +113,12 @@ GATHERS = {
 }
 
 
+def needs_ring(mode: str) -> bool:
+    """Whether gather `mode` moves anything by collective-permutes (and so
+    needs `ring_order`)."""
+    return bool(set(GATHERS[mode]) - {"ag"})
+
+
 def gather_shards(
     w_o: jax.Array,
     w_uv: jax.Array,
@@ -130,7 +136,7 @@ def gather_shards(
     that reads only weights would otherwise be hoisted to the start of the
     step, every layer's at once."""
     how = GATHERS[mode]
-    if set(how) - {"ag"} and ring is None:
+    if needs_ring(mode) and ring is None:
         raise ValueError(f"gather mode {mode} needs a ring order")
     parts = list(
         lax.optimization_barrier((w_o, w_uv, w_scale.astype(jnp.float32), after))[:3]
