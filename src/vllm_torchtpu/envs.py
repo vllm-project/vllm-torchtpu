@@ -281,6 +281,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_GATE_IN_COMBINE: bool = False
     VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: bool = False
     VLLM_TPU_QSA_DCP_SPLIT_LSE: bool = False
+    VLLM_TPU_QSA_DCP_PACK_LISTS: bool = False
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1727,6 +1728,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of one [.., D + 1] channel (a padded f32 concat plus the slices
     # that undo it at every 8K prefill step); same values.
     "VLLM_TPU_QSA_DCP_SPLIT_LSE": env_bool("VLLM_TPU_QSA_DCP_SPLIT_LSE"),
+    # Compressed main-KV DCP: all-gather the local top-k values (f32, as int32
+    # bits) and group ids (int32) as one stacked tensor instead of two
+    # gathers; same bits.
+    "VLLM_TPU_QSA_DCP_PACK_LISTS": env_bool("VLLM_TPU_QSA_DCP_PACK_LISTS"),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for
