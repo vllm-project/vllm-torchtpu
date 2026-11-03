@@ -116,6 +116,56 @@ def test_supports_kv_cache_write_rejects_the_batched_rpa_pool():
     assert not impl.supports_kv_cache_write()
 
 
+def test_supports_kv_cache_write_rejects_the_shared_packed_pool():
+    """Layers of mixed head geometry share a 4-D packed pool, which only the
+    bound cache reveals."""
+    packed_pool = torch.zeros(NUM_PAGES, PAGE_SIZE, 2, 512, dtype=torch.bfloat16)
+    assert not _impl().supports_kv_cache_write(packed_pool)
+    assert _impl().supports_kv_cache_write(_cache(torch.bfloat16))
+    assert _impl().supports_kv_cache_write(torch.empty(0, dtype=torch.bfloat16))
+
+
+def test_write_kv_cache_rejects_the_shared_packed_pool(monkeypatch):
+    monkeypatch.setattr(attention, "write_new_kv_", mock.Mock())
+    key = torch.zeros(NUM_TOKENS, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.bfloat16)
+    packed_pool = torch.zeros(NUM_PAGES, PAGE_SIZE, 2, 512, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="5-D layer-major"):
+        _impl().write_kv_cache(SimpleNamespace(), key, key, packed_pool, _metadata())
+    attention.write_new_kv_.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "head_size,pool_head_size", [(96, 96), (128, 256)], ids=["own", "wider"]
+)
+def test_write_kv_cache_pads_to_the_pools_head_dim(
+    monkeypatch, head_size, pool_head_size
+):
+    """Like forward(), K/V are zero-padded to the pool's head dim: its own
+    128-aligned one, or a wider layer's in a shared pool."""
+    written = {}
+    monkeypatch.setattr(
+        attention,
+        "write_new_kv_",
+        lambda kv_cache, key, value, md: written.update(key=key, value=value),
+    )
+    key = torch.randn(NUM_TOKENS, NUM_KV_HEADS, head_size, dtype=torch.bfloat16)
+    pool = torch.zeros(
+        rpa_v3.get_kv_cache_shape(
+            NUM_PAGES, PAGE_SIZE, NUM_KV_HEADS, pool_head_size, jnp.bfloat16
+        ),
+        dtype=torch.bfloat16,
+    )
+
+    _impl(head_size=head_size).write_kv_cache(
+        SimpleNamespace(), key, key, pool, _metadata()
+    )
+
+    for written_kv in (written["key"], written["value"]):
+        assert written_kv.shape == (NUM_TOKENS, NUM_KV_HEADS, pool.shape[-1])
+        assert torch.equal(written_kv[..., :head_size], key)
+        assert not written_kv[..., head_size:].any()
+
+
 def test_write_kv_cache_quantizes_like_forward(monkeypatch):
     written = {}
     monkeypatch.setattr(
@@ -156,7 +206,7 @@ def test_write_kv_cache_skips_the_memory_profiling_placeholder(monkeypatch):
 
 def test_write_kv_cache_rejects_a_dtype_mismatch():
     key = torch.zeros(NUM_TOKENS, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float32)
-    with pytest.raises(AssertionError, match="does not match the KV cache"):
+    with pytest.raises(ValueError, match="does not match the KV cache"):
         _impl().write_kv_cache(
             SimpleNamespace(), key, key, _cache(torch.bfloat16), _metadata()
         )
