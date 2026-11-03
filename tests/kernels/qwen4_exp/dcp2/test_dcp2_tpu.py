@@ -12,9 +12,18 @@ same TPU: gated <= 2 BF16 ulps, pre-gate within TPU_TOL, no NaN.
 
 import numpy as np
 import pytest
-from dcp2_harness import decode_case, prefill_case
-from test_dcp2_decode import SEATS, check_case, production_rpa_attend
-from test_dcp2_prefill import check_production_prefill
+
+from tests.kernels.qwen4_exp.dcp2.dcp2_harness import (
+    _cpu_device_fixture,  # noqa: F401
+    decode_case,
+    prefill_case,
+)
+from tests.kernels.qwen4_exp.dcp2.test_dcp2_decode import (
+    SEATS,
+    check_case,
+    production_rpa_attend,
+)
+from tests.kernels.qwen4_exp.dcp2.test_dcp2_prefill import check_production_prefill
 
 pytestmark = pytest.mark.tpu_test
 

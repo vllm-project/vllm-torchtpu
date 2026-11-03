@@ -17,8 +17,12 @@ import inspect
 import jax
 import numpy as np
 import pytest
-from dcp2_harness import (
+
+from tests.kernels.qwen4_exp.dcp2.dcp2_harness import (
     D,
+    _cpu_device_fixture,  # noqa: F401
+    _interpret_fixture,  # noqa: F401
+    _rpa_stand_in_fixture,  # noqa: F401
     check_gated,
     check_metadata,
     check_pregate,
@@ -39,7 +43,6 @@ from dcp2_harness import (
     run_dcp_attention,
     selected_token_ids,
 )
-
 from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
 
 B = 512

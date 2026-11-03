@@ -15,8 +15,11 @@ import inspect
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from dcp2_harness import (
+
+from tests.kernels.qwen4_exp.dcp2.dcp2_harness import (
     D,
+    _cpu_device_fixture,  # noqa: F401
+    _interpret_fixture,  # noqa: F401
     check_gated,
     check_pregate,
     combine_plain_average,
@@ -29,7 +32,6 @@ from dcp2_harness import (
     replicated_gated,
     run_dcp_attention,
 )
-
 from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
 from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
     block_sparse_gqa_attention,

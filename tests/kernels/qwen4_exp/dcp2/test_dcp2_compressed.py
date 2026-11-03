@@ -13,8 +13,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from dcp2_harness import (
+
+from tests.kernels.qwen4_exp.dcp2.dcp2_harness import (
     D,
+    _cpu_device_fixture,  # noqa: F401
+    _interpret_fixture,  # noqa: F401
+    _rpa_stand_in_fixture,  # noqa: F401
     check_gated,
     from_raw,
     on_tpu,
@@ -23,7 +27,7 @@ from dcp2_harness import (
     rank_operand,
     raw,
 )
-from test_dcp2_op import (
+from tests.kernels.qwen4_exp.dcp2.test_dcp2_op import (
     DH,
     K_SCALE,
     OP_CASES,
@@ -33,11 +37,10 @@ from test_dcp2_op import (
     V_SCALE,
     H,
     _args,
+    _partial_kernels_fixture,  # noqa: F401
     make_step,
-    partial_kernels,  # noqa: F401 (fixture)
     stub_select,
 )
-
 from vllm_torchtpu.kernels.qwen4_exp import dcp_select, pooled_qsa, qsa_rpa
 
 

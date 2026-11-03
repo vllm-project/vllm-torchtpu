@@ -730,12 +730,23 @@ def test_main_kv_dcp_allocation_and_prefix_hits_align_to_scheduler_blocks(
 ):
     """Main KV takes one page per 2B tokens, every other group one per B; a
     repeated prompt hits at a scheduler-block (2B) multiple."""
+    import inspect
+
     from vllm import SamplingParams
     from vllm.utils.hashing import sha256
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.kv_cache_interface import MambaSpec
     from vllm.v1.request import Request
+
+    from vllm_torchtpu import _patch_vllm_same_step_prefix_hits
+
+    for attr in ("_insert_block_hash", "get_cached_block"):
+        monkeypatch.setattr(BlockPool, attr, inspect.unwrap(getattr(BlockPool, attr)))
+    monkeypatch.setattr(Scheduler, "schedule", lambda self, *args, **kwargs: None)
+    _patch_vllm_same_step_prefix_hits()
 
     cfg = dcp_config(monkeypatch, compressed=True, dcp=dcp)
     layout, specs = pooled_cache_specs(cfg)
@@ -748,6 +759,7 @@ def test_main_kv_dcp_allocation_and_prefix_hits_align_to_scheduler_blocks(
     scheduler_block, hash_block = resolve_kv_cache_block_sizes(scheduler, cfg)
     assert (scheduler_block, hash_block) == (D * B, B)
     context = cfg.model_config.max_model_len
+    init_none_hash(sha256)
     manager = KVCacheManager(
         scheduler,
         max_model_len=context,
@@ -756,7 +768,6 @@ def test_main_kv_dcp_allocation_and_prefix_hits_align_to_scheduler_blocks(
         max_in_flight_tokens=context,
         enable_caching=True,
     )
-    init_none_hash(sha256)
     hasher = get_request_block_hasher(hash_block, sha256)
     prompt = list(range(5 * B + 7))
 
@@ -765,6 +776,7 @@ def test_main_kv_dcp_allocation_and_prefix_hits_align_to_scheduler_blocks(
             rid, prompt, SamplingParams(max_tokens=1), None, block_hasher=hasher
         )
 
+    Scheduler.schedule(NS(kv_cache_manager=manager))
     first = request("a")
     for offset in range(0, len(prompt), scheduler_block):
         chunk = min(scheduler_block, len(prompt) - offset)
@@ -780,6 +792,9 @@ def test_main_kv_dcp_allocation_and_prefix_hits_align_to_scheduler_blocks(
         assert blocks == -(-len(prompt) // spec.block_size), g.layer_names
     manager.free(first)
     second = request("b")
+    # Same-step unwritten blocks stay suppressed until the next schedule() step.
+    assert manager.get_computed_blocks(second)[1] == 0
+    Scheduler.schedule(NS(kv_cache_manager=manager))
     _, hit, *_ = manager.get_computed_blocks(second)
     assert hit > 0 and hit % scheduler_block == 0, (hit, scheduler_block)
     assert hit <= len(prompt) - 1

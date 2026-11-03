@@ -24,8 +24,12 @@ import inspect
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from dcp2_harness import (
+
+from tests.kernels.qwen4_exp.dcp2.dcp2_harness import (
     D,
+    _cpu_device_fixture,  # noqa: F401
+    _interpret_fixture,  # noqa: F401
+    _rpa_stand_in_fixture,  # noqa: F401
     build_layout,
     check_gated,
     from_raw,
@@ -36,7 +40,6 @@ from dcp2_harness import (
     raw,
     reference_attend,
 )
-
 from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa, qsa_rpa
 from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
     block_sparse_gqa_attention,
@@ -94,8 +97,8 @@ def _reference_route(original, monkeypatch, name):
     monkeypatch.setattr(qsa_rpa, name, route)
 
 
-@pytest.fixture(params=["reference", "production"])
-def partial_kernels(request, monkeypatch):
+@pytest.fixture(name="partial_kernels", params=["reference", "production"])
+def _partial_kernels_fixture(request, monkeypatch):
     if request.param == "production":
         if not _implemented():
             pytest.skip("set6 return_lse kernels not landed")

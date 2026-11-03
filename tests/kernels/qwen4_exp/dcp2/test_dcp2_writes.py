@@ -13,8 +13,11 @@ rings identical to the replicated write. Writes run in Pallas interpret mode.
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from dcp2_harness import (
+
+from tests.kernels.qwen4_exp.dcp2.dcp2_harness import (
     D,
+    _cpu_device_fixture,  # noqa: F401
+    _interpret_fixture,  # noqa: F401
     build_layout,
     from_raw,
     owner_of_token,
@@ -23,7 +26,6 @@ from dcp2_harness import (
     rank_operand,
     raw,
 )
-
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa, qsa_rpa
 

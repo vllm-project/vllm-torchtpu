@@ -10,8 +10,10 @@ rows. The combine is also exercised end to end by the decode/prefill tests.
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from dcp2_harness import (
+
+from tests.kernels.qwen4_exp.dcp2.dcp2_harness import (
     D,
+    _cpu_device_fixture,  # noqa: F401
     check_gated,
     combine_plain_average,
     combine_rank0_only,
@@ -20,7 +22,6 @@ from dcp2_harness import (
     rank_operand,
     reference_combine,
 )
-
 from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
 
 H, DH, T = 3, 256, 64
