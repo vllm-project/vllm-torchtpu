@@ -96,6 +96,9 @@ class KernelConfig:
     # The fused MoE at prefill_expert_parallel 8 (EP8/TP4), as the aggregate
     # engine's prefill runs it; off: EP8 takes the unfused path.
     prefill_fused_moe_ep8: bool = False
+    # Fused EP8 MoE at 8K: routes one rank's compact path holds in SMEM (more
+    # take the unfused overflow path for the layer).
+    prefill_moe_capacity_ep8: int = 32768
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.

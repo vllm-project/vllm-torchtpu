@@ -15,6 +15,7 @@ an uncapped fallback. Python generators split work at tracing time, allowing
 independent vector/communication work between MXU panels without extra calls.
 """
 
+import contextlib
 import dataclasses
 import functools
 from typing import Any
@@ -48,6 +49,25 @@ class _Experts:
 
 EP16 = _Experts(local=56, middle=1536)
 EP8 = _Experts(local=112, middle=768)
+
+
+def _scope(name):
+    """A named trace scope when KernelConfig.phase_scopes is on (diagnostics)."""
+    if k._config().phase_scopes:
+        return jax.named_scope(name)
+    return contextlib.nullcontext()
+
+
+def _skip(name):
+    """KernelConfig.debug_skip names work to skip (timing only, wrong output)."""
+    return name in k._config().debug_skip
+
+
+def _capacity(tokens, experts):
+    """SMEM route capacity of one rank's compact 8K path (all routes below 8K)."""
+    if tokens < 8192:
+        return tokens * 16
+    return 32768 if experts == EP16 else k._config().prefill_moe_capacity_ep8
 
 
 def experts_for(expert_parallel: int) -> _Experts:
@@ -979,12 +999,13 @@ def _routed_experts(
 ):
     """Joint GU/SiTU/first-down pipeline followed by remaining columns."""
     mid = experts.middle
+    skip_combine = _skip("moe_combine")
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
     gu_unroll = 4 if tokens < 8192 else 8
     first_down_unroll = 2 if tokens < 8192 else 8
-    metadata_row_capacity = 0 if tokens < 8192 else 32768
+    metadata_row_capacity = 0 if tokens < 8192 else _capacity(tokens, experts)
     ring_dtype = jnp.float32
     assert tokens in (512, 1024, 2048, 4096, 8192)
     x = jax.ShapeDtypeStruct((tokens * 16, mid), latent.dtype)
@@ -1138,7 +1159,8 @@ def _routed_experts(
                 dest, weight = route(i)
                 value = source.at[pl.ds(i - begin, 1)][...].astype(jnp.float32)
                 target = sums.at[pl.ds(dest, 1)]
-                target[...] = target[...] + value * weight
+                if not skip_combine:
+                    target[...] = target[...] + value * weight
 
             full = (end - start) // loop_unroll
 
@@ -1167,7 +1189,8 @@ def _routed_experts(
                 previous = packed.at[(g + 1) % 2]
                 value = previous.at[pl.ds(i - begin, 1)][...].astype(jnp.float32)
                 target = sums.at[pl.ds(dest, 1)]
-                target[...] = target[...] + value * weight
+                if not skip_combine:
+                    target[...] = target[...] + value * weight
 
         def inner(x, w, metadata, *, first=False, subtotal_vmem=None):
             g, n = (pl.program_id(1), 0 if first else pl.program_id(0) + 1)
@@ -1178,7 +1201,8 @@ def _routed_experts(
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
 
             if not first:
-                advance(jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem, poll_round=g)
+                with _scope("ring_poll"):
+                    advance(jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem, poll_round=g)
             current = packed.at[g % 2]
             previous = packed.at[(g + 1) % 2]
             previous_g = jnp.maximum(g - 1, 0)
@@ -1202,7 +1226,8 @@ def _routed_experts(
                             jnp.float32
                         )
                         target = sums.at[pl.ds(dest, 1)]
-                        target[...] = target[...] + value * weight
+                        if not skip_combine:
+                            target[...] = target[...] + value * weight
 
                 work()
 
@@ -1214,35 +1239,40 @@ def _routed_experts(
 
             @pl.when(active_ng > 0)
             def product():
-                _down_inner(
-                    x,
-                    w,
-                    current,
-                    metadata,
-                    cfgs=cfg,
-                    overlap_work=overlap_work,
-                )
+                with _scope("down_tile"):
+                    _down_inner(
+                        x,
+                        w,
+                        current,
+                        metadata,
+                        cfgs=cfg,
+                        overlap_work=overlap_work,
+                    )
 
             @pl.when(g > 0)
             def previous_tail():
-                consume(
-                    previous_g,
-                    previous,
-                    (moved_rows if first else 0) + panel_count * down_unroll,
-                    loop_unroll=8 if first else unroll,
-                )
+                with _scope("consume_tail"):
+                    consume(
+                        previous_g,
+                        previous,
+                        (moved_rows if first else 0) + panel_count * down_unroll,
+                        loop_unroll=8 if first else unroll,
+                    )
 
             @pl.when(g == ng - 1)
             def finish():
                 consume(g, current, loop_unroll=8 if first else unroll)
                 if not first:
-                    advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
-                    emit_subtotals(subtotal_vmem)
+                    with _scope("ring_prev_drain"):
+                        advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
+                    with _scope("emit_subtotals"):
+                        emit_subtotals(subtotal_vmem)
                     state[0] = 0
 
                     @pl.when(n == width // tn - 1)
                     def last():
-                        advance(jnp.int32(32), n, subtotal_vmem, drain=True)
+                        with _scope("ring_final_drain"):
+                            advance(jnp.int32(32), n, subtotal_vmem, drain=True)
 
         (_, gu_ws), gu_ys = k.generate_block_specs(metadata, gu_cfg)
         gu_ws = k.FusedWeightsRef(gate=gu_ws, up=gu_ws)
@@ -1301,21 +1331,23 @@ def _routed_experts(
 
                     _, nrows = bounds(g)
                     active = acts.at[bank, pl.ds(0, nrows)]
-                    pltpu.make_async_copy(active, active, act_sems.at[bank]).wait()
+                    with _scope("act_wait"):
+                        pltpu.make_async_copy(active, active, act_sems.at[bank]).wait()
 
                     @pl.when(g + 1 < ng)
                     def following():
                         start(g + 1, 1 - bank)
 
-                    _gu_inner(
-                        _PackedRows(acts.at[bank]),
-                        gw,
-                        gy,
-                        gu_partial,
-                        metadata,
-                        cfgs=gu_cfg,
-                        overlap_work=lambda panel: gu_work(g, panel),
-                    )
+                    with _scope("gu_tile"):
+                        _gu_inner(
+                            _PackedRows(acts.at[bank]),
+                            gw,
+                            gy,
+                            gu_partial,
+                            metadata,
+                            cfgs=gu_cfg,
+                            overlap_work=lambda panel: gu_work(g, panel),
+                        )
 
                 inner(gy, dw, metadata, first=True)
 
@@ -1380,7 +1412,8 @@ def _routed_experts(
             pl.run_scoped, subtotal_vmem=pltpu.VMEM((tokens, tn), x.dtype)
         )
         def remaining_columns(subtotal_vmem):
-            emit_subtotals(subtotal_vmem)
+            with _scope("emit_subtotals"):
+                emit_subtotals(subtotal_vmem)
             state[0] = 0
 
             def shifted(spec):
@@ -1507,7 +1540,11 @@ def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
     panels = []
     for first in range(0, width, columns):
         panel_width = min(columns, width - first)
-        if panel_local:
+        if panel_local and _skip("moe_dequant"):
+            panel_weights = jnp.zeros(
+                (cfgs.tiles.tile_k, panel_width), cfgs.lhs_cfgs.dtype
+            )
+        elif panel_local:
             panel_rhs = _column_rhs(rhs, first, panel_width)
             panel_weights = panel_rhs.get_weight().astype(cfgs.lhs_cfgs.dtype).reshape(
                 cfgs.num_quant_blocks_per_tile_k, block, panel_width
@@ -1756,6 +1793,11 @@ def _ready_reduce(
     """
     assert buffers == 2
     count = len(streams)
+    if _skip("moe_reduce_ring"):
+        # Diagnostics only: keep this rank's own subtotal rows, no ring.
+        if drain:
+            o_ref[...] = x_ref[pl.ds(0, o_ref.shape[0]), :].astype(o_ref.dtype)
+        return
 
     def remote(stream, rows, cols, target, bank):
         return pltpu.make_async_remote_copy(
@@ -2008,7 +2050,7 @@ def _layer_kernel(
     """
     rows = hidden.shape[0]
     tokens = rows * 32
-    capacity = tokens * 16 if tokens < 8192 else 32768
+    capacity = _capacity(tokens, experts)
     shape = (tokens // 8, 128)
     vmem, smem, dma = pltpu.VMEM, pltpu.SMEM, pltpu.SemaphoreType.DMA
 
@@ -2088,20 +2130,25 @@ def _layer_kernel(
             if tokens == 8192:
                 probability_copy(probs_v).wait()
 
-        if tokens == 8192:
-            # The compact path completes both metadata DMAs before expert work.
-            # Reclaim the full probability array (512 KiB) for expert scratch.
-            pl.run_scoped(prepare, vmem(shape, jnp.int32), vmem(shape, jnp.float32))
-        else:
-            pl.run_scoped(
-                lambda ids: prepare(ids, s["probs_v"]), vmem(shape, jnp.int32)
-            )
+        with _scope("m_prologue"):
+            if tokens == 8192:
+                # The compact path completes both metadata DMAs before expert work.
+                # Reclaim the full probability array (512 KiB) for expert scratch.
+                pl.run_scoped(
+                    prepare, vmem(shape, jnp.int32), vmem(shape, jnp.float32)
+                )
+            else:
+                pl.run_scoped(
+                    lambda ids: prepare(ids, s["probs_v"]), vmem(shape, jnp.int32)
+                )
 
         def probabilities_ready():
             if tokens < 8192:
                 probability_copy(s["probs_v"]).wait()
 
         def fast():
+            scope = _scope("m_experts")
+            scope.__enter__()
             _routed_experts(
                 latent,
                 expert_gu,
@@ -2120,9 +2167,11 @@ def _layer_kernel(
                 probabilities_ready=probabilities_ready,
                 experts=experts,
             )
-            _epilogue(
-                control, s["reduced"], s["shared"], norm, latent_up, prefix, output
-            )
+            scope.__exit__(None, None, None)
+            with _scope("m_epilogue"):
+                _epilogue(
+                    control, s["reduced"], s["shared"], norm, latent_up, prefix, output
+                )
 
         if tokens < 8192:
             fast()
@@ -2287,7 +2336,9 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
                 shared_reduced=True,
             )
 
-        result = jax.lax.cond(maximum[0] <= 32768, lambda: final, overflow)[None]
+        result = jax.lax.cond(
+            maximum[0] <= _capacity(seq_len, experts), lambda: final, overflow
+        )[None]
         return (result, routes) if counting else result
 
     return jax.jit(local)
