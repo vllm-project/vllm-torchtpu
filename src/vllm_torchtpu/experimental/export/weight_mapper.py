@@ -162,6 +162,10 @@ def infer_weight_sharding(
                 "f_b_proj",
                 "g_b_proj",
                 "attn_sink",
+                # The MTP predictor's column-parallel fc (Qwen3.5, Qwen3-Next).
+                ".fc.",
+                # Muse Spark's MoE projection to the expert width.
+                ".pre_expert_proj.",
             )
         ):
             return ["tp"]
@@ -176,6 +180,8 @@ def infer_weight_sharding(
             or weight_name.endswith(".down_proj.weight")
             or weight_name.endswith(".out_proj.weight")
             or weight_name.endswith(".wo_b.weight")
+            # Muse Spark's MoE projection back from the expert width.
+            or weight_name.endswith(".post_expert_proj.weight")
             or ".in_proj_qkvz." in weight_name
         ):
             return ["tp", None]
@@ -199,6 +205,8 @@ def infer_weight_sharding(
                 "f_b_proj",
                 "g_b_proj",
                 "compressor.fused_wkv_wgate",
+                ".fc.",
+                ".pre_expert_proj.",
             )
         ):
             return [None, "tp"]

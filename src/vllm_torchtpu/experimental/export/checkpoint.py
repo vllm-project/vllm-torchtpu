@@ -82,15 +82,19 @@ def shard_shape(spec: Mapping[str, Any], axis_sizes: Mapping[str, int]) -> list[
 
 
 def local_tensors(model: Any) -> dict[str, Any]:
-    """The model's parameters and buffers by name.
+    """The model's parameters and buffers by name, its MTP draft's own included
+    under their `mtp.` names.
 
     A tied LM head (see `weight_mapper.tied_lm_head_alias`) is the embedding tensor.
     """
+    from vllm_torchtpu.experimental.export import universal_adapter
+
     tensors = dict(model.named_buffers())
     tensors.update(model.named_parameters())
     tied = weight_mapper.tied_lm_head_alias(tensors)
     if tied:
         tensors[tied[0]] = tensors[tied[1]]
+    tensors.update(universal_adapter.mtp_draft_tensors(model))
     return tensors
 
 
@@ -99,11 +103,15 @@ def host_tensors(model: Any) -> dict[str, Any]:
 
     Taken before lowering: tracing on TPU can leave placeholder tensors in the
     model (e.g. a MoE router weight), which cannot be copied to host afterwards.
+    Tensors left on the meta device hold no data and no step reads them (Muse
+    Spark's encoders, when every multimodal prompt limit is 0), so they are
+    skipped.
     """
     copies: dict[int, Any] = {}
     return {
         name: copies.setdefault(id(t), t.detach().cpu())
         for name, t in local_tensors(model).items()
+        if not t.is_meta
     }
 
 
