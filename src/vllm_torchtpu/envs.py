@@ -89,6 +89,9 @@ if TYPE_CHECKING:
     VLLM_TPU_GDN_HOIST_METADATA: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_CHUNK_PAIR: bool = False
+    TPU_GDN_RAW_QKV: bool = False
+    TPU_GDN_RAW_BA: bool = False
+    TPU_GDN_KERNEL_ZERO_OUT: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
@@ -593,6 +596,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so bit-identical. A sequence's odd last chunk still costs a full pair
     # (its empty half is masked).
     "TPU_GDN_CHUNK_PAIR": env_bool("TPU_GDN_CHUNK_PAIR", default=False),
+    # GDN v3: hand the kernel the projection's qkv [tokens, dim] as is (BF16)
+    # instead of an FP32 [tokens, 1, dim] copy. The kernel DMAs a tile-aligned
+    # row block and casts / places the rows in VMEM. Same values (BF16 -> FP32
+    # is exact), so bit-identical; removes an XLA convert + relayout copy per
+    # layer.
+    "TPU_GDN_RAW_QKV": env_bool("TPU_GDN_RAW_QKV", default=False),
+    # GDN v3: the same for the b / a gate inputs ([tokens, n_v] as is, no FP32
+    # cast and 128-lane pad in XLA). GDN only (not KDA).
+    "TPU_GDN_RAW_BA": env_bool("TPU_GDN_RAW_BA", default=False),
+    # GDN v3: the first kernel of a call zero-fills the output rows no kernel
+    # writes (bucket padding) instead of XLA zero-initializing the whole
+    # output buffer first. Bit-identical.
+    "TPU_GDN_KERNEL_ZERO_OUT": env_bool("TPU_GDN_KERNEL_ZERO_OUT", default=False),
     # Qwen4-exp QSA decode/verify indexer: score all query tokens of a
     # request (e.g. the K+1 MTP verify tokens) in one query block of this many
     # tokens, sharing one stream over the request's compressed keys instead of

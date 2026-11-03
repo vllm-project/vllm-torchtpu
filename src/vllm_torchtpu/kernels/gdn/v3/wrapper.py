@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 from typing import cast
 
@@ -37,6 +38,45 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _load_raw_rows(
+    block_ref: jax.Ref,  # [rows, width] raw row block (RowBlockInBufferedRef)
+    stage_ref: jax.Ref,  # [rows + chunk, 1, padded_width] float32 scratch
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+    align: int,
+) -> jax.Array:
+    """Casts a raw row block to FP32 and gathers each sequence's rows.
+
+    Returns [seq_tile_size, chunk_size, 1, padded_width] float32, the value the
+    prepared [tokens, 1, padded_width] FP32 input's slot would hold: the
+    same cast (exact), and lanes past `width` zero like the wrapper's pad.
+    Rows past a sequence's real size hold neighbouring rows instead of
+    stale data; the kernel masks them either way.
+    """
+    rows, width = block_ref.shape
+    padded_width = stage_ref.shape[-1]
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    start = memory_ref.raw_block_start(
+        metadata_ref, p_id, rows, align, cfg.batch_size
+    )
+    if width == padded_width:
+        for col in range(0, width, num_lanes):
+            stage_ref[pl.ds(0, rows), 0, col : col + num_lanes] = block_ref[
+                :, col : col + num_lanes
+            ].astype(jnp.float32)
+    else:
+        block = block_ref[...].astype(jnp.float32)
+        stage_ref[pl.ds(0, rows), 0, :] = jnp.pad(
+            block, ((0, 0), (0, padded_width - width))
+        )
+    parts = []
+    for idx in range(cfg.seq_tile_size):
+        offset = jnp.clip(metadata_ref.p_id_to_r_base[p_id, idx] - start, 0, rows)
+        parts.append(stage_ref[pl.ds(offset, cfg.chunk_size)])
+    return jnp.stack(parts, axis=0)
+
+
 def inner_kernel(
     # Inputs.
     qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
@@ -53,6 +93,7 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
+    raw_scratch_ref: dict[str, jax.Ref] | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -105,7 +146,35 @@ def inner_kernel(
     # single register which necessitate costly shuffling for every sliding.
     # Therefore, it is extremely important to leverage compact layout that
     # ensures 1 register only stores data from 1 row.
-    qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+    if cfg.raw_qkv:
+        assert raw_scratch_ref is not None
+        qkv_in_compact = _load_raw_rows(
+            qkv_slot_ref,
+            raw_scratch_ref["qkv_stage"],
+            metadata_ref,
+            p_id,
+            cfg,
+            cfg.raw_qkv_align,
+        )
+        # FP32 compact scratch the activation loaders stage the conv output
+        # through (the raw block is neither FP32 nor compact).
+        qkv_slot_ref = raw_scratch_ref["qkv_act"]
+    else:
+        qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+    if cfg.raw_ba:
+        assert raw_scratch_ref is not None
+        for name, raw_ref in (("b", b_slot_ref), ("a", a_slot_ref)):
+            act_ref = raw_scratch_ref[f"{name}_act"]
+            act_ref[...] = _load_raw_rows(
+                raw_ref,
+                raw_scratch_ref[f"{name}_stage"],
+                metadata_ref,
+                p_id,
+                cfg,
+                cfg.raw_ba_align,
+            )
+        b_slot_ref = raw_scratch_ref["b_act"]
+        a_slot_ref = raw_scratch_ref["a_act"]
     qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
     # Prepare conv1d weights.
@@ -260,6 +329,8 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    raw_scratch_ref: dict[str, jax.Array] | None = None,
+    zero_out_scratch_ref: tuple[jax.Array, jax.Array] | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -340,11 +411,43 @@ def outer_kernel(
                 weights_ref,
                 carry_conv_scratch_ref,
                 carry_recurrent_scratch_ref,
+                raw_scratch_ref,
             ),
             allocations=allocations,
         )
 
+    if not cfg.kernel_zero_out:
+        _run()
+        return
+
+    # Zero the output rows [first, batch_size) that no kernel of this call
+    # writes (bucket padding, plus the PER_SEQ rows when PER_SEQ will not
+    # run), in ZERO_OUT_ROWS-row DMAs overlapped with the pipeline. They are
+    # disjoint from the rows the pipeline writes.
+    zero_ref, zero_sem = cast(tuple[jax.Array, jax.Array], zero_out_scratch_ref)
+    zero_ref[...] = jnp.zeros(zero_ref.shape, zero_ref.dtype)
+    zero_rows = cfg.ZERO_OUT_ROWS
+    first = metadata_ref.zero_out_query_start_loc[
+        metadata_ref.zero_out_distribution[cfg.zero_out_from]
+    ]
+    num_copies = (cfg.batch_size - first + zero_rows - 1) // zero_rows
+
+    def zero_copy(i):
+        row = first + i * zero_rows
+        size = jnp.minimum(zero_rows, cfg.batch_size - row)
+        return pltpu.make_async_copy(
+            zero_ref.at[pl.ds(0, size)], out_ref.at[pl.ds(row, size)], zero_sem
+        )
+
+    @pl.loop(0, num_copies)
+    def _(i):
+        zero_copy(i).start()
+
     _run()
+
+    @pl.loop(0, num_copies)
+    def _(i):
+        zero_copy(i).wait()
 
 
 def kernel_metadata(
@@ -560,13 +663,40 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    if not prepared_qkv:
-        qkv = qkv.astype(jnp.float32)
-    b = b.astype(jnp.float32)
-    a = a.astype(jnp.float32)
-
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
+
+    # Raw inputs: the kernel DMAs tile-aligned row blocks of the unpadded 2D
+    # projection outputs and casts in VMEM (see RowBlockInBufferedRef), so
+    # the token count must be a whole number of HBM row tiles.
+    def raw_row_align(x: jax.Array) -> int:
+        itemsize = jnp.dtype(x.dtype).itemsize
+        return 8 * (4 // itemsize) if itemsize in (2, 4) else 0
+
+    def raw_eligible(x: jax.Array) -> bool:
+        align = raw_row_align(x)
+        return x.ndim == 2 and align > 0 and x.shape[0] % align == 0
+
+    use_raw_qkv = (
+        envs.TPU_GDN_RAW_QKV and not prepared_qkv and raw_eligible(qkv)
+    )
+    use_raw_ba = (
+        envs.TPU_GDN_RAW_BA
+        and not is_kda
+        and raw_eligible(b)
+        and raw_eligible(a)
+        and b.shape[0] == a.shape[0] == qkv.shape[0]
+        and raw_row_align(b) == raw_row_align(a)
+    )
+    use_kernel_zero_out = (
+        envs.TPU_GDN_KERNEL_ZERO_OUT and zero_initialize_out and not prefill_only
+    )
+
+    if not prepared_qkv and not use_raw_qkv:
+        qkv = qkv.astype(jnp.float32)
+    if not use_raw_ba:
+        b = b.astype(jnp.float32)
+        a = a.astype(jnp.float32)
     if gate_lower_bound is not None:
         if not is_kda:
             raise ValueError(
@@ -616,7 +746,7 @@ def fused_conv1d_gdn(
         )
         ckpt_indices = ckpt_indices.astype(jnp.int32)
     act_in_dtype = jnp.dtype(jnp.float32)
-    assert a.dtype == b.dtype == act_in_dtype
+    assert use_raw_ba or a.dtype == b.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
@@ -688,14 +818,18 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv_padding = ((0, batch_padding_size),) + ((0, 0),) * (qkv.ndim - 1)
-    qkv = jnp.pad(qkv, qkv_padding)
-    b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-    a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
-
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
-    b = b.reshape(padded_batch_size, 1, -1)
-    a = a.reshape(padded_batch_size, 1, -1)
+    # FP32 activations need no batch padding (packing is 1); the raw path
+    # relies on that to read the unpadded inputs with batch_size rows.
+    assert not (use_raw_qkv or use_raw_ba) or padded_batch_size == batch_size
+    if not use_raw_qkv:
+        qkv_padding = ((0, batch_padding_size),) + ((0, 0),) * (qkv.ndim - 1)
+        qkv = jnp.pad(qkv, qkv_padding)
+        qkv = qkv.reshape(padded_batch_size, 1, -1)
+    if not use_raw_ba:
+        b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
+        a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
+        b = b.reshape(padded_batch_size, 1, -1)
+        a = a.reshape(padded_batch_size, 1, -1)
 
     # Step 3: States and weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
@@ -744,6 +878,22 @@ def fused_conv1d_gdn(
             tile_size = decode_tile_size
             window_size = num_spec_tokens + 1
 
+        # Rows a tile's tokens span (seq_tile_size * chunk_size, both modes).
+        tile_rows = tile_size * (1 if mode == config.GDNMode.PER_SEQ else window_size)
+
+        def raw_rows(x: jax.Array) -> int:
+            # A block starting up to align - 1 rows before the tile's first
+            # token still covers all of its tokens.
+            align = raw_row_align(x)
+            return min(pl.cdiv(tile_rows, align) * align + align, batch_size)
+
+        # The first kernel of the call zero-fills the rows no kernel writes:
+        # those past the PER_SEQ segment, or past the BATCHED one when
+        # PER_SEQ does not run.
+        zero_out_from = -1
+        if use_kernel_zero_out and in_act is None:
+            zero_out_from = 0 if batched_only else 2
+
         cfg = config.GDNConfig(
             mode=mode,
             batch_size=padded_batch_size,
@@ -770,6 +920,11 @@ def fused_conv1d_gdn(
                 conv_state=(jnp.float32.dtype if pooled else in_conv_state.dtype),
             ),
             state_plan=state_plan,
+            raw_qkv_rows=raw_rows(qkv) if use_raw_qkv else 0,
+            raw_qkv_align=raw_row_align(qkv) if use_raw_qkv else 0,
+            raw_ba_rows=raw_rows(b) if use_raw_ba else 0,
+            raw_ba_align=raw_row_align(b) if use_raw_ba else 0,
+            zero_out_from=zero_out_from,
         )
 
         # Step 6: Metadata preprocessing. Runs once per layer: each layer's
@@ -786,6 +941,13 @@ def fused_conv1d_gdn(
             per_seq_inputs=per_seq_inputs,
         )
 
+        if cfg.kernel_zero_out:
+            metadata_obj = dataclasses.replace(
+                metadata_obj,
+                zero_out_query_start_loc=query_start_loc,
+                zero_out_distribution=distribution,
+            )
+
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
         # Step 7: Handle case where write needs to be done in existing out.
@@ -798,7 +960,7 @@ def fused_conv1d_gdn(
             input_output_aliases[len(metadata_obj) + 4] = 2
         out_shape = cfg.get_out_shape()
 
-        if in_act is None and zero_initialize_out:
+        if in_act is None and zero_initialize_out and not cfg.kernel_zero_out:
             in_act = jnp.zeros_like(out_shape)
         if in_act is not None:
             out_shape = in_act
