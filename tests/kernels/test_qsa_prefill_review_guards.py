@@ -54,7 +54,7 @@ def metadata_inputs():
     return jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table)
 
 
-def test_bounded_metadata_filters_inactive_prefix_and_implicit_tail():
+def test_bounded_metadata_filters_inactive_prefix_and_implicit_tail(tpu_info):
     blocks, lengths, table = metadata_inputs()
     _, tiles, counts, bits = tc._prepare_metadata_bounded(
         blocks, lengths, table, query_block=128, physical_page_size=128
@@ -68,7 +68,7 @@ def test_bounded_metadata_filters_inactive_prefix_and_implicit_tail():
     assert int(tiles[0, 0]) == 0
 
 
-def test_bounded_metadata_duplicate_bits_cannot_carry_to_another_group():
+def test_bounded_metadata_duplicate_bits_cannot_carry_to_another_group(tpu_info):
     blocks = jnp.full((128, 4), -1, jnp.int32).at[0, :2].set(0)
     lengths = jnp.zeros(128, jnp.int32).at[0].set(16)
     table = jnp.zeros((128, 1), jnp.int32)

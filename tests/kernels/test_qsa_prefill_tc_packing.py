@@ -87,7 +87,7 @@ def expected(args):
         raw = (query[lo:hi].astype(jnp.float32) + table[lo, 0]).astype(jnp.bfloat16)
         value = bf16(
             bf16(raw).astype(jnp.float32)
-            * bf16(jax.nn.sigmoid(gate[lo:hi].astype(jnp.float32))).astype(jnp.float32)
+            * jax.nn.sigmoid(gate[lo:hi].astype(jnp.float32))
         )
         result = result.at[lo:hi].set(
             jnp.where((lengths[lo:hi] > 0)[:, None, None], value, 0)
@@ -510,7 +510,9 @@ def test_global_selection_wrapper_chunks_long_context_rows(monkeypatch):
     assert max(row_counts) <= limit
 
 
-def test_bounded_metadata_parallel_rows_share_the_same_scratch_budget(monkeypatch):
+def test_bounded_metadata_parallel_rows_share_the_same_scratch_budget(
+    monkeypatch, core_calls
+):
     monkeypatch.setattr(tc, "TC_SELECTION_TARGET_BYTES", 2 * 1024**2)
     calls = []
     original = tc.lax.map

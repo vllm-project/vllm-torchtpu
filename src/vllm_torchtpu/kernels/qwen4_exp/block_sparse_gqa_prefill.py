@@ -15,6 +15,7 @@
 
 import functools
 import math
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -388,6 +389,44 @@ def _metadata_prefix_pages(
     return pages
 
 
+def _metadata_native_align(size: int) -> int:
+    """Use the native padded bitset dimension for words and query rows."""
+    return utils.align_to(size, pltpu.get_tpu_info().num_lanes)
+
+
+def _metadata_resident_pages(
+    tokens: int,
+    query_block: int,
+    ratio: int,
+    page_size: int,
+    full_pages: int,
+    kv_tile: int,
+    request_capacity: int = 1,
+    target_bytes: int = TC_METADATA_BITSET_TARGET_BYTES,
+) -> int:
+    """Choose a page prefix whose padded bitset fits target_bytes."""
+    if min(tokens, query_block, ratio, page_size, full_pages, kv_tile) <= 0:
+        return full_pages
+    word_bits = jnp.iinfo(jnp.int32).bits
+    if kv_tile % (ratio * word_bits) or request_capacity <= 0 or target_bytes <= 0:
+        return full_pages
+    # Each nonempty request can add one partial query block. This bound also
+    # covers ragged packs without assuming that request boundaries align.
+    nblocks = _request_tile_capacity(tokens, query_block, request_capacity)
+    native_width = _metadata_native_align(query_block)
+    word_alignment = pltpu.get_tpu_info().num_lanes
+    word_budget = target_bytes // (
+        nblocks * native_width * jnp.dtype(jnp.int32).itemsize
+    )
+    word_budget = word_budget // word_alignment * word_alignment
+    tiles = word_budget // (kv_tile // (ratio * word_bits))
+    pages = min(full_pages, tiles * kv_tile // page_size)
+    safe_tokens = pages * page_size // kv_tile * kv_tile
+    if safe_tokens < ratio or safe_tokens > jnp.iinfo(jnp.int32).max:
+        return full_pages
+    return pages
+
+
 def _metadata_prefix_fits(
     blocks: jax.Array,
     lengths: jax.Array,
@@ -399,6 +438,57 @@ def _metadata_prefix_fits(
     return jnp.all(
         (blocks < 0) | (blocks >= full_groups) | (blocks < prefix_groups)
     ) & jnp.all((lengths >= 0) & (lengths <= prefix_groups * ratio))
+
+
+def _metadata_prefix_dispatch(
+    run: Callable[[jax.Array], jax.Array],
+    blocks: jax.Array,
+    lengths: jax.Array,
+    page_table: jax.Array,
+    *,
+    tokens: int,
+    query_block: int,
+    ratio: int,
+    page_size: int,
+    kv_tile: int,
+    request_capacity: int = 1,
+) -> jax.Array:
+    full_pages = page_table.shape[1]
+    small_pages = _metadata_prefix_pages(
+        tokens, blocks.shape[1], ratio, page_size, full_pages, kv_tile
+    )
+    resident_pages = _metadata_resident_pages(
+        tokens, query_block, ratio, page_size, full_pages, kv_tile, request_capacity
+    )
+
+    def fits(pages):
+        # A visited KV tile is DMAed in full, including its masked token rows.
+        return _metadata_prefix_fits(
+            blocks,
+            lengths,
+            ratio=ratio,
+            full_groups=full_pages * page_size // ratio,
+            prefix_groups=pages * page_size // kv_tile * kv_tile // ratio,
+        )
+
+    def fallback(_):
+        if not small_pages < resident_pages < full_pages:
+            return run(page_table)
+        return lax.cond(
+            fits(resident_pages),
+            lambda _: run(page_table[:, :resident_pages]),
+            lambda _: run(page_table),
+            None,
+        )
+
+    if small_pages >= full_pages:
+        return run(page_table)
+    return lax.cond(
+        fits(small_pages),
+        lambda _: run(page_table[:, :small_pages]),
+        fallback,
+        None,
+    )
 
 
 @functools.partial(
@@ -445,26 +535,16 @@ def block_sparse_gqa_prefill(
             bf16_io=bf16_io,
         )
 
-    full_pages = page_table.shape[1]
-    page_size = cache.shape[1]
-    prefix_pages = _metadata_prefix_pages(
-        len(query), blocks.shape[1], ratio, page_size, full_pages, kv_tile
-    )
-    if prefix_pages >= full_pages:
-        return run(page_table)
-    # A visited KV tile is DMAed in full, including its masked token rows.
-    prefix_groups = prefix_pages * page_size // kv_tile * kv_tile // ratio
-    return lax.cond(
-        _metadata_prefix_fits(
-            blocks,
-            lengths,
-            ratio=ratio,
-            full_groups=full_pages * page_size // ratio,
-            prefix_groups=prefix_groups,
-        ),
-        lambda _: run(page_table[:, :prefix_pages]),
-        lambda _: run(page_table),
-        None,
+    return _metadata_prefix_dispatch(
+        run,
+        blocks,
+        lengths,
+        page_table,
+        tokens=len(query),
+        query_block=query_block,
+        ratio=ratio,
+        page_size=cache.shape[1],
+        kv_tile=kv_tile,
     )
 
 
@@ -531,10 +611,10 @@ def _prefill(
     groups = page_table.shape[1] * physical_page_size // ratio
     num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
     words_per_tile = kv_tile // (ratio * 32)
-    words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
+    words = _metadata_native_align(num_kv_tiles * words_per_tile)
     nblocks = tokens // query_block
     bitset_row_bytes = words * jnp.dtype(jnp.int32).itemsize
-    native_query_width = ((query_block + 127) // 128) * 128
+    native_query_width = _metadata_native_align(query_block)
     live = jnp.clip(
         lengths.reshape(nblocks, query_block).max(axis=1),
         0,
@@ -696,7 +776,7 @@ def _metadata_from_bits(
         )
     else:
         active = jnp.any(block_bits[:, :, :num_kv_tiles] != 0, axis=1)
-    native_width = ((query_block + 127) // 128) * 128
+    native_width = _metadata_native_align(query_block)
     native_bits = jnp.pad(
         block_bits.transpose(0, 2, 1),
         ((0, 0), (0, 0), (0, native_width - query_block)),
@@ -845,13 +925,71 @@ def _ragged_prefill(
     v_scale,
     output_base=0,
 ):
+    if size == 0 or len(output) == 0:
+        return output
+
+    def run(table):
+        return _ragged_prefill_full(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            output,
+            offset,
+            size,
+            ratio=ratio,
+            kv_heads=kv_heads,
+            query_block=query_block,
+            kv_tile=kv_tile,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            output_base=output_base,
+        )
+
+    return _metadata_prefix_dispatch(
+        run,
+        blocks,
+        lengths,
+        page_table,
+        tokens=size,
+        query_block=query_block,
+        ratio=ratio,
+        page_size=cache.shape[1],
+        kv_tile=kv_tile,
+        request_capacity=len(starts) - 1,
+    )
+
+
+def _ragged_prefill_full(
+    query,
+    gate,
+    blocks,
+    lengths,
+    page_table,
+    cache,
+    starts,
+    output,
+    offset,
+    size,
+    *,
+    ratio,
+    kv_heads,
+    query_block,
+    kv_tile,
+    k_scale,
+    v_scale,
+    output_base=0,
+):
     """Read global source rows and write output relative to output_base."""
     if size == 0 or len(output) == 0:
         return output
     first, ends, total = _request_tiles(starts, offset, size, query_block)
     groups = page_table.shape[1] * cache.shape[1] // ratio
     num_tiles = (page_table.shape[1] * cache.shape[1] + kv_tile - 1) // kv_tile
-    words = ((num_tiles * (kv_tile // (ratio * 32)) + 127) // 128) * 128
+    words = _metadata_native_align(num_tiles * (kv_tile // (ratio * 32)))
     pack_tiles, source_rows, _ = _ragged_plan(
         size,
         query.shape[1],
@@ -1075,9 +1213,9 @@ def _prepare_metadata_bounded(
     groups = page_table.shape[1] * physical_page_size // ratio
     num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
     words_per_tile = kv_tile // (ratio * 32)
-    words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
+    words = _metadata_native_align(num_kv_tiles * words_per_tile)
     paired_pages = kv_tile == 256 and physical_page_size % 128 == 0 and ratio == 4
-    native_query_width = ((query_block + 127) // 128) * 128
+    native_query_width = _metadata_native_align(query_block)
     nblocks = tokens // query_block
 
     batch_size = min(

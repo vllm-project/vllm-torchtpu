@@ -19,8 +19,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as tc
+
+
+@pytest.fixture(autouse=True)
+def cpu_native_layout(monkeypatch):
+    if jax.default_backend() == "cpu":
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+        monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
 
 
 @pytest.mark.parametrize(
