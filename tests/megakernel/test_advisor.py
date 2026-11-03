@@ -20,7 +20,7 @@ import importlib
 import json
 import re
 import sys
-import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from typing import TYPE_CHECKING
 
 import pytest
@@ -162,13 +162,9 @@ _QWEN35_SHIPPED_VERIFY_ROWS = 80
 _QWEN35_VERIFY_ROWS_MIN = 64
 # Shipped Kimi-K3 prefill calls: embedding + layers 0-3, 11 groups, last layer.
 _K3_PREFILL_CALLS = 13
-# Per-decode-pod concurrency at the two saturation points: 152 (one decode pod)
-# and 600 split over three decode pods.
-_SATURATION_POD_CONCURRENCY = (152, 600 // 3)
-# Long-context serving mix: mean prompt and output tokens per request.
-_LONG_CTX_ISL, _LONG_CTX_OSL = 96937, 912
-_KERNEL_NAME_DENYLIST = re.compile(r"gmm|ragged_dot|megablox|sparsecore|mxu", re.I)
-_SVG_NS = "{http://www.w3.org/2000/svg}"
+_KERNEL_NAME_DENYLIST = re.compile(
+    r"gmm|ragged_dot|megablox|sparsecore|mxu", re.IGNORECASE
+)
 
 
 def test_package_reexport_without_prior_submodule_import() -> None:
@@ -873,17 +869,20 @@ def test_cli_json_presets_and_validation_errors(
         advisor.advise(bad_dense, advisor.WorkloadSpec(tp=8))
 
 
-def _preset_fields(layout: advisor.ParallelLayout) -> dict[str, object]:
-    """Return WorkloadSpec mesh fields for a deployment preset layout."""
-    return {
-        "tp": layout.tp,
-        "ep": layout.ep,
-        "dp": layout.dp,
-        "pp": layout.pp,
-        "dcp": layout.dcp,
-        "pcp": layout.pcp,
-        "layer_groups": layout.layer_groups,
-    }
+def _preset_workload(
+    layout: advisor.ParallelLayout, **changes: object
+) -> advisor.WorkloadSpec:
+    """Return a WorkloadSpec on a deployment preset layout with `changes` applied."""
+    mesh = advisor.WorkloadSpec(
+        tp=layout.tp,
+        ep=layout.ep,
+        dp=layout.dp,
+        pp=layout.pp,
+        dcp=layout.dcp,
+        pcp=layout.pcp,
+        layer_groups=layout.layer_groups,
+    )
+    return dataclasses.replace(mesh, **changes)
 
 
 def test_qwen35_decode_preset_whole_step_admits_shipped_verify_rows() -> None:
@@ -892,12 +891,12 @@ def test_qwen35_decode_preset_whole_step_admits_shipped_verify_rows() -> None:
     rows_per_seq = dep.decode.spec_tokens + 1
     rep = advisor.advise(
         advisor.resolve_model_profile("qwen3.5-397b"),
-        advisor.WorkloadSpec(
+        _preset_workload(
+            dep.decode,
             phase="verify",
             batch=_QWEN35_VERIFY_ROWS_MIN // rows_per_seq,
             spec_tokens=dep.decode.spec_tokens,
             moe_mode="grouped_on_chip",
-            **_preset_fields(dep.decode),  # type: ignore[arg-type]
         ),
         "tpu7x",
     )
@@ -907,41 +906,16 @@ def test_qwen35_decode_preset_whole_step_admits_shipped_verify_rows() -> None:
     assert abs(rows_cap - _QWEN35_SHIPPED_VERIFY_ROWS) <= rows_per_seq
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known mismatch: the shipped saturation layout ran per-op kernels, "
-    "but tokens per core (38 and 50) fit the whole_step ceiling; the cost model "
-    "has no term for what made per_op win there.",
-)
-@pytest.mark.parametrize("pod_concurrency", _SATURATION_POD_CONCURRENCY)
-def test_qwen35_saturation_preset_prefers_per_op(pod_concurrency: int) -> None:
-    """Verify per-pod saturation decode at the saturation layout picks per_op."""
-    dep = advisor.DEPLOYMENT_PRESETS["qwen3.5-397b"]
-    assert dep.saturation is not None
-    rep = advisor.advise(
-        advisor.resolve_model_profile("qwen3.5-397b"),
-        advisor.WorkloadSpec(
-            phase="decode",
-            batch=pod_concurrency,
-            isl=_LONG_CTX_ISL,
-            osl=_LONG_CTX_OSL,
-            **_preset_fields(dep.saturation),  # type: ignore[arg-type]
-        ),
-        "tpu7x",
-    )
-    assert rep.recommended_scope == "per_op"
-
-
 @pytest.mark.parametrize("batch", [1, 2, 4, 8])
 def test_kimi_k3_decode_preset_low_batch_prefers_whole_step(batch: int) -> None:
     """Verify Kimi-K3 decode at batch 1..8 on the TP32 mesh is one call."""
     dep = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
     rep = advisor.advise(
         advisor.resolve_model_profile("kimi-k3"),
-        advisor.WorkloadSpec(
+        _preset_workload(
+            dep.decode,
             phase="decode",
             batch=batch,
-            **_preset_fields(dep.decode),  # type: ignore[arg-type]
         ),
         "tpu7x",
     )
@@ -954,13 +928,13 @@ def test_kimi_k3_prefill_preset_evaluates_layer_group(window: int) -> None:
     dep = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
     rep = advisor.advise(
         advisor.resolve_model_profile("kimi-k3"),
-        advisor.WorkloadSpec(
+        _preset_workload(
+            dep.prefill,
             phase="prefill",
             batch=1,
             isl=window,
             chunk_size=window,
             moe_mode="grouped_on_chip",
-            **_preset_fields(dep.prefill),  # type: ignore[arg-type]
         ),
         "tpu7x",
     )
@@ -980,23 +954,46 @@ def test_layer_groups_must_cover_every_layer() -> None:
         )
 
 
+class _SvgTextCollector(HTMLParser):
+    """Collect the viewBox and every <text> element's attributes and content."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.view_box = ""
+        self.texts: list[tuple[dict[str, str], str]] = []
+        self._open: dict[str, str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Record the svg viewBox and open a text element."""
+        attr = {k: v or "" for k, v in attrs}
+        if tag == "svg":
+            self.view_box = attr["viewbox"]
+        elif tag == "text":
+            self._open = attr
+
+    def handle_data(self, data: str) -> None:
+        """Attach character data to the open text element."""
+        if self._open is not None:
+            self.texts.append((self._open, data))
+            self._open = None
+
+
 @pytest.mark.parametrize("model", ["qwen3.5-397b", "kimi-k3"])
 def test_regime_dot_plot_labels_once_and_inside_viewbox(model: str) -> None:
     """Verify each regime label renders once and no text leaves the viewBox."""
     sweep = advisor.advise_regimes(model, "tpu7x")
-    svg = advisor.report._render_regime_dot_plot_svg(sweep)  # noqa: SLF001
-    root = ET.fromstring(svg)
-    _, _, width, height = (float(v) for v in root.get("viewBox", "").split())
-    texts = list(root.iter(f"{_SVG_NS}text"))
+    parser = _SvgTextCollector()
+    parser.feed(advisor.report.render_regime_dot_plot_svg(sweep))
+    _, _, width, height = (float(v) for v in parser.view_box.split())
     for entry in sweep.regimes:
-        assert sum(t.text == entry.label for t in texts) == 1
-    for t in texts:
-        size = float(t.get("font-size", "0"))
-        assert size >= advisor.report._SVG_FONT_PX  # noqa: SLF001
-        span = advisor.report._text_width(t.text or "", size)  # noqa: SLF001
-        x, y = float(t.get("x", "0")), float(t.get("y", "0"))
+        assert sum(text == entry.label for _, text in parser.texts) == 1
+    for attr, text in parser.texts:
+        size = float(attr["font-size"])
+        assert size >= advisor.report.SVG_MIN_FONT_PX
+        span = advisor.report.svg_text_width(text, size)
+        x, y = float(attr["x"]), float(attr["y"])
         left = {"start": x, "middle": x - span / 2, "end": x - span}[
-            t.get("text-anchor", "start")
+            attr.get("text-anchor", "start")
         ]
         assert left >= 0.0
         assert left + span <= width

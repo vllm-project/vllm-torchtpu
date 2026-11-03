@@ -838,6 +838,47 @@ class _ScopeContext:
     plan_error: str
 
 
+def _vmem_budget_bytes(workload: WorkloadSpec, chip_spec: ChipSpec) -> int:
+    """Return usable VMEM bytes: user budget, Tiles budget, or chip default."""
+    vmem_usable = chip_spec.vmem_usable_bytes
+    tiles = workload.tiles
+    base_vmem_bytes = (
+        int(workload.vmem_budget_mib * (1 << 20))
+        if workload.vmem_budget_mib is not None
+        else (tiles.vmem_mib << 20 if tiles else vmem_usable)
+    )
+    vmem_raw = (
+        base_vmem_bytes - (FIT_VMEM_HEADROOM_MIB << 20) * workload.vmem_fit_headroom
+    )
+    return min(vmem_usable, max(0, vmem_raw))
+
+
+def _whole_step_staging(
+    workload: WorkloadSpec, layer_dense_weight_bytes: int
+) -> tuple[float, int, int]:
+    """Return first DMA slot bytes and multi-layer dense and expert staging bytes.
+
+    ExecSpec.Tiles slot counts (nbd, nbe) and slot widths (bank, ebank) map to
+    dense_buffer_slots, expert_buffer_slots, dense_slot_bytes, expert_slot_bytes.
+    Not modeled yet: per-stream slot counts, e.g. 3 slots for recurrent-state
+    read-update-write streams while large weight banks stay on 2 slots.
+    """
+    tiles = workload.tiles
+    if tiles is not None:
+        dense_slot_bytes = tiles.bank
+        dense_staging = tiles.nbd * tiles.bank
+        expert_staging = tiles.nbe * tiles.ebank
+    else:
+        dense_slot_bytes = 2 << 20
+        extra_slot_bytes = (workload.dma_buffers - 2) * (2 << 20)
+        dense_staging = min(28 << 20, 2 * layer_dense_weight_bytes) + extra_slot_bytes
+        expert_staging = (10 << 20) + extra_slot_bytes
+    first_slot_bytes = float(
+        min(dense_slot_bytes, max(1 << 18, layer_dense_weight_bytes // 4))
+    )
+    return first_slot_bytes, dense_staging, expert_staging
+
+
 def _build_scope_context(
     profile: ModelProfile,
     workload: WorkloadSpec,
@@ -855,7 +896,6 @@ def _build_scope_context(
     spec_tok = workload.spec_tokens
     head_dim, kv_lora = profile.head_dim, profile.kv_lora_rank
     q_lora, qk_rope = profile.q_lora_rank, profile.qk_rope_head_dim
-    tiles = workload.tiles
 
     uncached_isl = max(1, round(workload.isl * (1.0 - workload.prefix_hit_rate)))
     batch_local, chunk_tokens, layers_local = (
@@ -953,16 +993,7 @@ def _build_scope_context(
         * (z_dim * kd + qkv_lin * profile.linear_conv_kernel)
         * bw_st
     )
-    vmem_usable = chip_spec.vmem_usable_bytes
-    base_vmem_bytes = (
-        int(workload.vmem_budget_mib * (1 << 20))
-        if workload.vmem_budget_mib is not None
-        else (tiles.vmem_mib << 20 if tiles else vmem_usable)
-    )
-    vmem_raw = (
-        base_vmem_bytes - (FIT_VMEM_HEADROOM_MIB << 20) * workload.vmem_fit_headroom
-    )
-    vmem_budget = min(vmem_usable, max(0, vmem_raw))
+    vmem_budget = _vmem_budget_bytes(workload, chip_spec)
     layer_dense_weight_bytes = int(
         (
             max(attn_params, linear_attn_params)
@@ -1004,31 +1035,12 @@ def _build_scope_context(
         else 0.0
     )
 
-    # Translate ExecSpec.Tiles buffer slot counts (nbd, nbe) and slot byte widths
-    # (bank, ebank) into descriptive multi-buffering staging quantities.
-    # TODO(brianseung): Model selective per-stream 3-slot triple-buffering
-    # (buffer_count=3) so recurrent state read-update-write streams (load i+1,
-    # update i, write back i-1) and small latency-bound tiles use 3 slots when
-    # VMEM headroom permits while keeping large weight banks on 2-slot ping-pong.
     buf_slots = workload.dma_buffers
-    if tiles is not None:
-        dense_buffer_slots = tiles.nbd
-        dense_slot_bytes = tiles.bank
-        expert_buffer_slots = tiles.nbe
-        expert_slot_bytes = tiles.ebank
-        whole_step_dense_staging_bytes = dense_buffer_slots * dense_slot_bytes
-        whole_step_expert_staging_bytes = expert_buffer_slots * expert_slot_bytes
-    else:
-        dense_slot_bytes = 2 << 20
-        extra_slot_bytes = (buf_slots - 2) * (2 << 20)
-        whole_step_dense_staging_bytes = (
-            min(28 << 20, 2 * layer_dense_weight_bytes) + extra_slot_bytes
-        )
-        whole_step_expert_staging_bytes = (10 << 20) + extra_slot_bytes
-
-    first_slot_bytes = float(
-        min(dense_slot_bytes, max(1 << 18, layer_dense_weight_bytes // 4))
-    )
+    (
+        first_slot_bytes,
+        whole_step_dense_staging_bytes,
+        whole_step_expert_staging_bytes,
+    ) = _whole_step_staging(workload, layer_dense_weight_bytes)
     return _ScopeContext(
         vmem_budget=vmem_budget,
         single_layer_dense_staging_bytes=min(4 << 20, layer_dense_weight_bytes),
@@ -1280,14 +1292,14 @@ def _layout_recommendation(
     prof: ModelProfile,
     chip_spec: ChipSpec,
     layout: ParallelLayout,
-    vmem_budget_mib: float | None,
-    dma_buffers: int,
+    base: WorkloadSpec,
     source: str = "deployment preset",
 ) -> ParallelismRecommendation:
     """Evaluate a fixed layout's HBM fit at the reference decode workload."""
     base_rep = advise(
         prof,
-        WorkloadSpec(
+        replace(
+            base,
             phase="decode",
             batch=16,
             tp=layout.tp,
@@ -1297,8 +1309,6 @@ def _layout_recommendation(
             dcp=layout.dcp,
             pcp=layout.pcp,
             layer_groups=layout.layer_groups,
-            vmem_budget_mib=vmem_budget_mib,
-            dma_buffers=dma_buffers,
         ),
         chip_spec,
     )
@@ -1320,6 +1330,74 @@ def _layout_recommendation(
     )
 
 
+def _select_layouts(
+    prof: ModelProfile,
+    chip_spec: ChipSpec,
+    base: WorkloadSpec,
+    requested: tuple[int | None, int | None, int, int, int, int],
+    dep: DeploymentPreset | None,
+) -> tuple[ParallelismRecommendation, ParallelismRecommendation | None]:
+    """Return decode and prefill layouts: preset, user-specified, or auto-pick."""
+    tp, ep, dp, pp, dcp, pcp = requested
+    if dep is not None:
+        return (
+            _layout_recommendation(prof, chip_spec, dep.decode, base),
+            _layout_recommendation(prof, chip_spec, dep.prefill, base),
+        )
+    if tp is not None:
+        ep_val = (
+            ep
+            if ep is not None
+            else (gcd(tp * dp, prof.num_experts) if prof.num_experts > 0 else 1)
+        )
+        layout = ParallelLayout(tp=tp, ep=ep_val, dp=dp, pp=pp, dcp=dcp, pcp=pcp)
+        return _layout_recommendation(prof, chip_spec, layout, base, source=""), None
+    par = recommend_parallelism(prof, chip_spec, dp=dp, pp=pp)
+    if ep is not None or dcp > 1 or pcp > 1:
+        par = replace(par, ep=ep if ep is not None else par.ep, dcp=dcp, pcp=pcp)
+    return par, None
+
+
+def _with_preset_prefill(
+    workloads: tuple[tuple[str, WorkloadSpec], ...],
+    dep: DeploymentPreset | None,
+) -> tuple[tuple[str, WorkloadSpec], ...]:
+    """Move prefill regimes onto the preset's prefill layout and add its windows."""
+    if dep is None:
+        return workloads
+    pre = dep.prefill
+    fields = {
+        "tp": pre.tp,
+        "ep": pre.ep,
+        "dp": pre.dp,
+        "pp": pre.pp,
+        "dcp": pre.dcp,
+        "pcp": pre.pcp,
+        "layer_groups": pre.layer_groups,
+    }
+    decode_base = workloads[0][1]
+    windows = tuple(
+        (
+            f"Preset Prefill Window (W={win})",
+            replace(
+                decode_base,
+                phase="prefill",
+                batch=1,
+                isl=win,
+                chunk_size=win,
+                moe_mode="grouped_on_chip",
+                **fields,
+            ),
+        )
+        for win in dep.prefill_windows
+    )
+    moved = tuple(
+        (lbl, replace(wl, **fields) if wl.phase == "prefill" else wl)
+        for lbl, wl in workloads
+    )
+    return moved + windows
+
+
 def advise_regimes(
     profile: ModelProfile | str | Mapping[str, object],
     chip: ChipSpec | str = "tpu7x",
@@ -1338,165 +1416,123 @@ def advise_regimes(
     pp = _int_opt(opts, "pp", 1)
     dcp = _int_opt(opts, "dcp", 1)
     pcp = _int_opt(opts, "pcp", 1)
-    dma_buffers = _int_opt(opts, "dma_buffers", 2)
-    vmem_alias = bool(opts.get("vmem_alias", True))
-    vmem_fit_headroom = bool(opts.get("vmem_fit_headroom", False))
-    op_overhead_us = _float_opt(opts, "op_overhead_us", 0.0)
+    base = WorkloadSpec(
+        vmem_alias=bool(opts.get("vmem_alias", True)),
+        vmem_fit_headroom=bool(opts.get("vmem_fit_headroom", False)),
+        op_overhead_us=_float_opt(opts, "op_overhead_us", 0.0),
+        vmem_budget_mib=vmem_budget_mib,
+        dma_buffers=_int_opt(opts, "dma_buffers", 2),
+    )
+    dma_buffers = base.dma_buffers
 
     prof = resolve_model_profile(profile)
     chip_spec = resolve_chip_spec(chip)
-    use_preset = bool(opts.get("deployment_preset", True))
     explicit_layout = tp is not None or ep is not None or (dp, pp, dcp, pcp) != (1,) * 4
-    dep: DeploymentPreset | None = (
+    dep = (
         DEPLOYMENT_PRESETS.get(prof.name)
-        if use_preset and not explicit_layout
+        if bool(opts.get("deployment_preset", True)) and not explicit_layout
         else None
     )
-    prefill_par: ParallelismRecommendation | None = None
-    if dep is not None:
-        par = _layout_recommendation(
-            prof, chip_spec, dep.decode, vmem_budget_mib, dma_buffers
-        )
-        prefill_par = _layout_recommendation(
-            prof, chip_spec, dep.prefill, vmem_budget_mib, dma_buffers
-        )
-    elif tp is None:
-        par = recommend_parallelism(prof, chip_spec, dp=dp, pp=pp)
-        if ep is not None or dcp > 1 or pcp > 1:
-            par = ParallelismRecommendation(
-                tp=par.tp,
-                ep=ep if ep is not None else par.ep,
-                dp=dp,
-                pp=pp,
-                topology=par.topology,
-                hbm_used_gb=par.hbm_used_gb,
-                hbm_capacity_gb=par.hbm_capacity_gb,
-                w_step_gb=par.w_step_gb,
-                auto_selected=True,
-                dcp=dcp,
-                pcp=pcp,
-            )
-    else:
-        ep_val = (
-            ep
-            if ep is not None
-            else (gcd(tp * dp, prof.num_experts) if prof.num_experts > 0 else 1)
-        )
-        par = _layout_recommendation(
-            prof,
-            chip_spec,
-            ParallelLayout(tp=tp, ep=ep_val, dp=dp, pp=pp, dcp=dcp, pcp=pcp),
-            vmem_budget_mib,
-            dma_buffers,
-            source="",
-        )
-
-    common = {
-        "tp": par.tp,
-        "ep": par.ep,
-        "dp": par.dp,
-        "pp": par.pp,
-        "dcp": par.dcp,
-        "pcp": par.pcp,
-        "vmem_alias": vmem_alias,
-        "vmem_fit_headroom": vmem_fit_headroom,
-        "op_overhead_us": op_overhead_us,
-        "vmem_budget_mib": vmem_budget_mib,
-        "dma_buffers": dma_buffers,
-    }
+    par, prefill_par = _select_layouts(
+        prof, chip_spec, base, (tp, ep, dp, pp, dcp, pcp), dep
+    )
+    base = replace(
+        base, tp=par.tp, ep=par.ep, dp=par.dp, pp=par.pp, dcp=par.dcp, pcp=par.pcp
+    )
     workloads = (
         (
             "Decode Small (B=4, T=1, 4K)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="decode",
                 batch=4,
                 isl=3072,
                 osl=2048,
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Decode Low (B=8, T=1, 4K)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="decode",
                 batch=8,
                 isl=3072,
                 osl=2048,
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Decode Med (B=16, T=1, 4K)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="decode",
                 batch=16,
                 isl=3072,
                 osl=2048,
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Decode High (B=64, T=1, 32K)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="decode",
                 batch=64,
                 isl=32768,
                 osl=2048,
                 context=32768,
                 moe_mode="grouped_on_chip",
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Decode Saturated (B=256, T=1, 32K)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="decode",
                 batch=256,
                 isl=32768,
                 osl=2048,
                 context=32768,
                 moe_mode="grouped_on_chip",
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Spec Verify Small (B=4, K=3)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="verify",
                 batch=4,
                 spec_tokens=3,
                 isl=3072,
                 osl=2048,
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Spec Verify Low (B=8, K=3)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="verify",
                 batch=8,
                 spec_tokens=3,
                 isl=3072,
                 osl=2048,
                 moe_mode="grouped_on_chip",
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Spec Verify Med (B=16, K=3)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="verify",
                 batch=16,
                 spec_tokens=3,
                 isl=3072,
                 osl=2048,
                 moe_mode="grouped_on_chip",
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Spec Verify High (B=32, K=3)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="verify",
                 batch=32,
                 spec_tokens=3,
@@ -1504,12 +1540,12 @@ def advise_regimes(
                 osl=2048,
                 context=32768,
                 moe_mode="grouped_on_chip",
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Mixed Decode+Prefill (B=16, C=256)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="mixed",
                 batch=16,
                 isl=4096,
@@ -1517,65 +1553,33 @@ def advise_regimes(
                 chunk_size=256,
                 prefix_hit_rate=0.90,
                 moe_mode="grouped_on_chip",
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Chunked Prefill (B=1, T=256)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="prefill",
                 batch=1,
                 isl=4096,
                 chunk_size=256,
                 prefix_hit_rate=0.9375,
                 moe_mode="grouped_on_chip",
-                **common,  # type: ignore[arg-type]
             ),
         ),
         (
             "Long Prefill (B=1, T=4096)",
-            WorkloadSpec(
+            replace(
+                base,
                 phase="prefill",
                 batch=1,
                 isl=4096,
                 moe_mode="grouped_on_chip",
-                **common,  # type: ignore[arg-type]
             ),
         ),
     )
 
-    if dep is not None:
-        # Prefill regimes run on the prefill layout, plus the preset's windows.
-        pre = dep.prefill
-        pre_fields = {
-            "tp": pre.tp,
-            "ep": pre.ep,
-            "dp": pre.dp,
-            "pp": pre.pp,
-            "dcp": pre.dcp,
-            "pcp": pre.pcp,
-            "layer_groups": pre.layer_groups,
-        }
-        workloads = (
-            *(
-                (lbl, replace(wl, **pre_fields) if wl.phase == "prefill" else wl)
-                for lbl, wl in workloads
-            ),
-            *(
-                (
-                    f"Preset Prefill Window (W={win})",
-                    WorkloadSpec(
-                        phase="prefill",
-                        batch=1,
-                        isl=win,
-                        chunk_size=win,
-                        moe_mode="grouped_on_chip",
-                        **{**common, **pre_fields},  # type: ignore[arg-type]
-                    ),
-                )
-                for win in dep.prefill_windows
-            ),
-        )
+    workloads = _with_preset_prefill(workloads, dep)
 
     entries: list[RegimeEntry] = []
     reports: list[AdvisorReport] = []

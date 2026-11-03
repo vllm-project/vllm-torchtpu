@@ -255,7 +255,7 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
     return "\n".join(parts)
 
 
-_SVG_FONT_PX = 13
+SVG_MIN_FONT_PX = 13
 # Width of one glyph as a fraction of font size, a conservative upper bound for
 # the system sans-serif stack on digits, Latin letters, and punctuation.
 _SVG_GLYPH_EM = 0.62
@@ -269,7 +269,7 @@ _SCOPE_MARKS: Mapping[str, tuple[str, str]] = {
 }
 
 
-def _text_width(text: str, font_px: float = _SVG_FONT_PX) -> float:
+def svg_text_width(text: str, font_px: float = SVG_MIN_FONT_PX) -> float:
     """Return an upper-bound pixel width of `text` at `font_px`."""
     return len(text) * font_px * _SVG_GLYPH_EM
 
@@ -280,7 +280,7 @@ def _svg_text(
     """Return one SVG text element at the report's minimum font size."""
     return (
         f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="{anchor}" '
-        f'font-size="{_SVG_FONT_PX}" fill="{fill}">{_esc(text)}</text>'
+        f'font-size="{SVG_MIN_FONT_PX}" fill="{fill}">{_esc(text)}</text>'
     )
 
 
@@ -301,13 +301,13 @@ def _svg_marker(shape: str, cx: float, cy: float, color: str, title: str) -> str
     return f'<polygon points="{pts}" {common}>{tip}</polygon>'
 
 
-def _render_regime_dot_plot_svg(sweep: AdvisorSweepReport) -> str:
+def render_regime_dot_plot_svg(sweep: AdvisorSweepReport) -> str:
     """Render one row per workload on a log axis of tokens per core."""
     regimes = sweep.regimes
     right = [f"{e.recommended_scope}, {e.step_bound_us:,.0f} us" for e in regimes]
     pad, gap, row_h, plot_w = 12.0, 14.0, 26.0, 440.0
-    label_w = max(_text_width(e.label) for e in regimes)
-    right_w = max(_text_width(t) for t in right)
+    label_w = max(svg_text_width(e.label) for e in regimes)
+    right_w = max(svg_text_width(t) for t in right)
     x0 = pad + label_w + gap
     x1 = x0 + plot_w
     marks = (
@@ -327,10 +327,13 @@ def _render_regime_dot_plot_svg(sweep: AdvisorSweepReport) -> str:
     mark_labels = [f"{name}: {val:,} tok" for name, val, _ in marks]
     width = max(
         x1 + gap + right_w + pad,
-        *(sx(v) + 4 + _text_width(t) + pad for (_, v, _), t in zip(marks, mark_labels)),
+        *(
+            sx(v) + 4 + svg_text_width(t) + pad
+            for (_, v, _), t in zip(marks, mark_labels)
+        ),
     )
     title = "Where each workload lands: tokens per core vs on-chip limits"
-    width = max(width, pad + _text_width(title, 15) + pad)
+    width = max(width, pad + svg_text_width(title, 15) + pad)
     top = 30.0 + 18.0 * len(marks) + 8.0
     bottom = top + row_h * len(regimes)
     legend_y = bottom + 58.0
@@ -399,7 +402,7 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     """Render a self-contained, zero-CDN HTML report with inline SVG regime charts."""
     rec = sweep.parallelism
     vmem_svg = _render_vmem_svg(sweep)
-    regime_svg = _render_regime_dot_plot_svg(sweep)
+    regime_svg = render_regime_dot_plot_svg(sweep)
     safe_json = json.dumps(sweep.to_dict(), indent=2).replace("</", "<\\/")
 
     rows_html = []
