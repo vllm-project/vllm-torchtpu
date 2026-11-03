@@ -53,7 +53,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     for fld in fields(WorkloadSpec):
-        if fld.type in ("int", "float"):
+        if fld.type in ("int", "float", "float | None"):
             arg_type = int if fld.type == "int" else float
             default_val = None if fld.name in ("batch", "tp", "ep") else fld.default
             parser.add_argument(
@@ -74,7 +74,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ici-bw-gbps", type=float, default=None)
     parser.add_argument("--collective-latency-us", type=float, default=None)
     parser.add_argument("--phase", choices=get_args(Phase), default="decode")
-    parser.add_argument("--moe-mode", choices=get_args(MoEMode), default="dense_masked")
+    parser.add_argument(
+        "--moe-mode", choices=get_args(MoEMode), default="token_masked_vmem"
+    )
     parser.add_argument("--no-vmem-alias", dest="vmem_alias", action="store_false")
     for bool_flag in (
         "--megacore",
@@ -131,9 +133,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             ep=args.ep,
             dp=args.dp,
             pp=args.pp,
+            dcp=args.dcp,
+            pcp=args.pcp,
             vmem_alias=args.vmem_alias,
             vmem_fit_headroom=args.vmem_fit_headroom,
             op_overhead_us=args.op_overhead_us,
+            vmem_budget_mib=args.vmem_budget_mib,
+            dma_buffers=args.dma_buffers,
         )
         if args.html:
             write_advisor_html(sweep, args.html)

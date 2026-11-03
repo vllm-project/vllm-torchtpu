@@ -47,12 +47,21 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 FusionScope = Literal["sublayer", "single_layer", "stage", "cross_layer"]
-FusionMode = Literal["standard", "layer", "segment", "full_step"]
+FusionMode = Literal["modular_kernel", "layer", "segment", "full_step"]
 Phase = Literal["decode", "verify", "prefill", "mixed"]
-MoEMode = Literal["dense_masked", "binned_vmem", "masked", "grouped"]
+MoEMode = Literal[
+    "token_masked_vmem",
+    "expert_grouped_vmem",
+    "standalone_ragged_dot",
+    "dense_mlp",
+    "dense_masked",
+    "binned_vmem",
+    "masked",
+    "grouped",
+]
 
 SCOPE_TO_FUSION_MODE: Mapping[FusionScope, FusionMode] = {
-    "sublayer": "standard",
+    "sublayer": "modular_kernel",
     "single_layer": "layer",
     "stage": "segment",
     "cross_layer": "full_step",
@@ -64,6 +73,8 @@ _MIN_VMEM_MIB = 2
 _MEGACORE_CORES = 2
 _GROUPED_MOE_MIN_TOKENS = 32
 _MAX_RECOMMENDED_STEP_WEIGHT_GB = 45.0
+_VALID_DMA_BUFFERS = (2, 3)
+_GROUPED_MOE_MODES = frozenset({"expert_grouped_vmem", "grouped", "binned_vmem"})
 _DTYPE_BYTES: Mapping[str, float] = {
     "fp32": 4.0,
     "bf16": 2.0,
@@ -132,7 +143,7 @@ class ChipSpec:
 
 @dataclass(frozen=True)
 class WorkloadSpec:
-    """Serving request geometry and parallelism configuration."""
+    """Serving request geometry, VMEM budget, and multi-buffering configuration."""
 
     phase: Phase = "decode"
     batch: int = 16
@@ -148,12 +159,16 @@ class WorkloadSpec:
     dp: int = 1
     ep: int = 1
     kv_split: int = 1
+    dcp: int = 1
+    pcp: int = 1
     segment_layers: int = 0
-    moe_mode: MoEMode = "dense_masked"
+    moe_mode: MoEMode = "token_masked_vmem"
     vmem_alias: bool = True
     vmem_fit_headroom: bool = False
     tiles: exec_spec.Tiles | None = None
     op_overhead_us: float = 0.0
+    vmem_budget_mib: float | None = None
+    dma_buffers: int = 2
 
 
 @dataclass(frozen=True)
@@ -213,7 +228,8 @@ class AdvisorReport:
     scopes: tuple[ScopeEstimate, ...]
     per_token_vmem_bytes: int = 0
     ridge_tokens: int = 0
-    recommended_moe_mode: str = "none"
+    recommended_moe_mode: str = "dense_mlp"
+    dma_buffers: int = 2
 
     @property
     def recommended_fusion_mode(self) -> FusionMode:
@@ -240,6 +256,8 @@ class ParallelismRecommendation:
     hbm_capacity_gb: float
     w_step_gb: float
     auto_selected: bool = True
+    dcp: int = 1
+    pcp: int = 1
 
 
 @dataclass(frozen=True)
@@ -276,6 +294,7 @@ class AdvisorSweepReport:
     ridge_tokens: int
     regimes: tuple[RegimeEntry, ...]
     tailoring_guide: tuple[str, ...]
+    dma_buffers: int = 2
 
     def to_dict(self) -> dict[str, object]:
         """Serialize AdvisorSweepReport to a JSON-compatible dictionary."""
@@ -348,36 +367,36 @@ def compute_per_token_vmem_bytes(
     hidden = profile.hidden_size
     tp = max(1, workload.tp)
     ep = max(1, workload.ep)
-    kv_split = max(1, workload.kv_split)
+    kv_split = max(1, workload.kv_split, workload.dcp)
 
-    # 1. Persistent residual (F32 4*H), norm (BF16 2*H), AR staging (6*H if TP > 1)
-    b_spine = 6 * hidden + (6 * hidden if tp > 1 else 0)
+    # 1. On-chip residual buffer (F32 4*H), norm (BF16 2*H), collective staging (6*H)
+    residual_buffer_bytes = 6 * hidden + (6 * hidden if tp > 1 else 0)
 
     # 2. Attention sublayer per-token scratch (sharded across TP ranks)
     nh_local = max(1, ceil(profile.num_attention_heads / tp))
     if profile.kv_lora_rank > 0:
-        b_attn = 2 * (
+        attn_scratch_bytes = 2 * (
             profile.q_lora_rank + profile.kv_lora_rank + profile.qk_rope_head_dim
         ) + 6 * (nh_local * profile.head_dim)
     else:
         nkv_local = max(1, ceil(profile.num_kv_heads / max(1, tp // kv_split)))
-        b_attn = 2 * (2 * nh_local + 2 * nkv_local) * profile.head_dim + 4 * (
-            nh_local * profile.head_dim
+        attn_scratch_bytes = 2 * (2 * nh_local + 2 * nkv_local) * profile.head_dim + (
+            4 * nh_local * profile.head_dim
         )
 
     # 3. Linear attention (GDN / KDA) per-token scratch (sharded across TP ranks)
     if profile.num_linear_layers > 0 and profile.linear_value_heads > 0:
         kh_local = max(1, ceil(profile.linear_key_heads / tp))
         vh_local = max(1, ceil(profile.linear_value_heads / tp))
-        b_lin = 2 * (
+        linear_attn_scratch_bytes = 2 * (
             2 * kh_local * profile.linear_key_dim
             + 2 * vh_local * profile.linear_value_dim
         ) + 4 * (vh_local * profile.linear_value_dim)
     else:
-        b_lin = 0
+        linear_attn_scratch_bytes = 0
 
     # 4. MoE / FFN sublayer per-token scratch (sharded across TP and EP ranks)
-    h_exp = profile.routed_expert_hidden_size or hidden
+    expert_hidden = profile.routed_expert_hidden_size or hidden
     if profile.num_moe_layers > 0 and profile.num_experts > 0:
         ep_tp = gcd(ep, tp)
         inter_local = ceil(profile.moe_intermediate_size / max(1, tp // ep_tp))
@@ -386,34 +405,42 @@ def compute_per_token_vmem_bytes(
             if profile.shared_expert_intermediate_size > 0
             else 0
         )
-        b_router = 4 * profile.num_experts + 8 * profile.top_k
-        is_grouped = workload.moe_mode in ("grouped", "binned_vmem")
+        router_scratch_bytes = 4 * profile.num_experts + 8 * profile.top_k
+        is_grouped = workload.moe_mode in _GROUPED_MOE_MODES
         if is_grouped:
-            b_exp = (
-                8 * h_exp
-                + ceil(profile.top_k * (6 * h_exp + 8 * inter_local) / ep)
+            expert_tile_bytes = (
+                8 * expert_hidden
+                + ceil(profile.top_k * (6 * expert_hidden + 8 * inter_local) / ep)
                 + 8 * shared_local
             )
         else:
-            b_exp = 16 * h_exp + 8 * (inter_local + shared_local)
-        b_moe = (
-            max(b_router + 2 * h_exp, b_exp)
+            expert_tile_bytes = 16 * expert_hidden + 8 * (inter_local + shared_local)
+        moe_scratch_bytes = (
+            max(router_scratch_bytes + 2 * expert_hidden, expert_tile_bytes)
             if workload.vmem_alias
-            else (b_router + b_exp)
+            else (router_scratch_bytes + expert_tile_bytes)
         )
     else:
         inter_local = ceil(profile.intermediate_size / tp)
-        b_moe = 6 * hidden + 8 * inter_local
+        moe_scratch_bytes = 6 * hidden + 8 * inter_local
 
-    b_sublayer = (
-        max(b_attn, b_lin, b_moe) if workload.vmem_alias else (b_attn + b_lin + b_moe)
+    sublayer_scratch_bytes = (
+        max(attn_scratch_bytes, linear_attn_scratch_bytes, moe_scratch_bytes)
+        if workload.vmem_alias
+        else (attn_scratch_bytes + linear_attn_scratch_bytes + moe_scratch_bytes)
     )
+    total_per_token_bytes = residual_buffer_bytes + sublayer_scratch_bytes
     return {
-        "b_spine": b_spine,
-        "b_attn": b_attn,
-        "b_lin": b_lin,
-        "b_moe": b_moe,
-        "b_tok": b_spine + b_sublayer,
+        "residual_buffer_bytes": residual_buffer_bytes,
+        "attn_scratch_bytes": attn_scratch_bytes,
+        "linear_attn_scratch_bytes": linear_attn_scratch_bytes,
+        "moe_scratch_bytes": moe_scratch_bytes,
+        "total_per_token_bytes": total_per_token_bytes,
+        "b_spine": residual_buffer_bytes,
+        "b_attn": attn_scratch_bytes,
+        "b_lin": linear_attn_scratch_bytes,
+        "b_moe": moe_scratch_bytes,
+        "b_tok": total_per_token_bytes,
     }
 
 
@@ -423,7 +450,7 @@ def _validate_advise_inputs(
     """Validate ModelProfile and WorkloadSpec and return dtype byte widths."""
     num_layers = profile.num_layers
     tp, pp, dp, ep = workload.tp, workload.pp, workload.dp, workload.ep
-    kv_split = workload.kv_split
+    kv_split, dcp, pcp = workload.kv_split, workload.dcp, workload.pcp
     pos_fields = (
         num_layers,
         profile.hidden_size,
@@ -435,6 +462,8 @@ def _validate_advise_inputs(
         dp,
         ep,
         kv_split,
+        dcp,
+        pcp,
         workload.isl,
     )
     nonneg_fields = (
@@ -461,10 +490,20 @@ def _validate_advise_inputs(
     if min(*pos_fields) < 1 or workload.op_overhead_us < 0.0:
         msg = "Dimensions and parallelism must be >= 1"
         raise errors.MegakernelConfigError(msg)
+    if workload.dma_buffers not in _VALID_DMA_BUFFERS:
+        msg = f"dma_buffers must be 2 or 3, got {workload.dma_buffers!r}"
+        raise errors.MegakernelConfigError(msg)
+    if (
+        workload.vmem_budget_mib is not None
+        and workload.vmem_budget_mib < _MIN_VMEM_MIB
+    ):
+        msg = f"vmem_budget_mib must be >= {_MIN_VMEM_MIB}"
+        raise errors.MegakernelConfigError(msg)
     parallel_ok = (
         min(*nonneg_fields) >= 0
-        and (tp * dp) % ep == 0
+        and (tp * dp * pcp) % ep == 0
         and tp % kv_split == 0
+        and tp % dcp == 0
         and pp <= num_layers
     )
     expert_ok = (
@@ -503,8 +542,10 @@ def _scope_vmem_and_ops(
 ) -> tuple[int, float, int, int, int, bool, str]:
     """Compute static VMEM, activation HBM bytes, op count, and token split count."""
     vmem_budget = int(ctx["vmem_budget"])
-    d_1l, e_1l = int(ctx["d_1l"]), int(ctx["e_1l"])
-    d_multi, e_multi = int(ctx["d_multi"]), int(ctx["e_multi"])
+    single_layer_dense_staging = int(ctx["single_layer_dense_staging_bytes"])
+    single_layer_expert_staging = int(ctx["single_layer_expert_staging_bytes"])
+    cross_layer_dense_staging = int(ctx["cross_layer_dense_staging_bytes"])
+    cross_layer_expert_staging = int(ctx["cross_layer_expert_staging_bytes"])
     gqa_scratch = int(ctx["gqa_scratch"])
     gdn_scratch = int(ctx["gdn_scratch"])
     ffn_scratch = int(ctx["ffn_scratch"])
@@ -512,8 +553,8 @@ def _scope_vmem_and_ops(
     num_segments = int(ctx["num_segments"])
     l_moe, l_attn, l_lin = int(ctx["l_moe"]), int(ctx["l_attn"]), int(ctx["l_lin"])
     active_tokens = int(ctx["active_tokens"])
-    b_tok_fused = int(ctx["b_tok_fused"])
-    token_spine_bytes = float(ctx["token_spine_bytes"])
+    per_token_fused_bytes = int(ctx["per_token_fused_bytes"])
+    token_residual_bytes = float(ctx["token_residual_bytes"])
     no_cross_layer = bool(ctx["no_cross_layer"])
     plan_error = str(ctx["plan_error"])
 
@@ -525,32 +566,40 @@ def _scope_vmem_and_ops(
         reason = plan_error or "Bounded by stage/1L or non-periodic"
 
     if scope == "sublayer":
-        v_st = max(1 << 20, d_1l)
+        static_vmem_bytes = max(1 << 20, single_layer_dense_staging)
         alpha = 4 * profile.hidden_size
         n_splits = 1
-        t_max = max(active_tokens, (vmem_budget - v_st) // alpha)
+        t_max = max(active_tokens, (vmem_budget - static_vmem_bytes) // alpha)
         n_ops = 2 * layers_local
-        act_bytes = 4.0 * layers_local * token_spine_bytes
-        return v_st, act_bytes, n_ops, t_max, n_splits, feasible, reason
+        act_bytes = 4.0 * layers_local * token_residual_bytes
+        return static_vmem_bytes, act_bytes, n_ops, t_max, n_splits, feasible, reason
 
-    is_1l = scope == "single_layer"
+    is_single_layer = scope == "single_layer"
     mul = num_segments if scope == "stage" else 1
-    d_ring = d_1l if is_1l else d_multi
-    e_ring = (e_1l if is_1l else e_multi) * (l_moe > 0)
+    dense_staging_bytes = (
+        single_layer_dense_staging if is_single_layer else cross_layer_dense_staging
+    )
+    expert_staging_bytes = (
+        single_layer_expert_staging if is_single_layer else cross_layer_expert_staging
+    ) * (l_moe > 0)
     scratch_alias = (
         max(gqa_scratch, gdn_scratch, ffn_scratch)
-        if is_1l
+        if is_single_layer
         else max(gqa_scratch + gdn_scratch, ffn_scratch)
     )
-    pad_moe = (
-        (min(12 << 20, e_ring) if workload.tiles else (12 << 20))
+    moe_alignment_pad_bytes = (
+        (min(12 << 20, expert_staging_bytes) if workload.tiles else (12 << 20))
         if l_moe > 0
         else (2 << 20)
     )
-    pad_bytes = 0 if is_1l else pad_moe + 2304 * profile.hidden_size * (l_moe == 0)
-    v_st = (
-        d_ring
-        + e_ring
+    pad_bytes = (
+        0
+        if is_single_layer
+        else moe_alignment_pad_bytes + 2304 * profile.hidden_size * (l_moe == 0)
+    )
+    static_vmem_bytes = (
+        dense_staging_bytes
+        + expert_staging_bytes
         + (
             scratch_alias
             if workload.vmem_alias
@@ -558,18 +607,22 @@ def _scope_vmem_and_ops(
         )
         + pad_bytes
     )
-    act_bytes = 2.0 * (layers_local if is_1l else mul) * token_spine_bytes
+    act_bytes = 2.0 * (layers_local if is_single_layer else mul) * token_residual_bytes
     n_ops = (
         layers_local
-        if is_1l
+        if is_single_layer
         else (mul * (3 if workload.tp * workload.ep > 1 and l_attn + l_lin else 1))
     )
-    alpha = b_tok_fused
-    t_max = 0 if v_st + alpha > vmem_budget else max(1, (vmem_budget - v_st) // alpha)
+    alpha = per_token_fused_bytes
+    t_max = (
+        0
+        if static_vmem_bytes + alpha > vmem_budget
+        else max(1, (vmem_budget - static_vmem_bytes) // alpha)
+    )
     n_splits = active_tokens if t_max == 0 else ceil(active_tokens / t_max)
     if t_max == 0:
-        feasible, reason = False, "Rings exceed VMEM"
-    return v_st, act_bytes, n_ops, t_max, n_splits, feasible, reason
+        feasible, reason = False, "Weight buffers exceed VMEM"
+    return static_vmem_bytes, act_bytes, n_ops, t_max, n_splits, feasible, reason
 
 
 def _evaluate_scopes(
@@ -580,7 +633,7 @@ def _evaluate_scopes(
     """Evaluate all four FusionScope options against VMEM, HBM, and MXU bounds."""
     layers_local, l_moe = int(ctx["layers_local"]), int(ctx["l_moe"])
     active_tokens = int(ctx["active_tokens"])
-    token_spine_bytes = float(ctx["token_spine_bytes"])
+    token_residual_bytes = float(ctx["token_residual_bytes"])
     w_static, exp_bytes = float(ctx["w_static"]), float(ctx["exp_bytes"])
     experts_local, ep_dp = int(ctx["experts_local"]), int(ctx["ep_dp"])
     row_floor, num_ar, ar_hops = (
@@ -600,7 +653,9 @@ def _evaluate_scopes(
         float(ctx["peak_e"]),
         float(ctx["bw_hbm"]),
     )
-    s_kv_bytes, s_rec_rw = float(ctx["s_kv_bytes"]), float(ctx["s_rec_rw"])
+    kv_cache_read_bytes = float(ctx["kv_cache_read_bytes"])
+    recurrent_state_rw_bytes = float(ctx["recurrent_state_rw_bytes"])
+    first_slot_bytes = float(ctx["first_slot_bytes"])
 
     estimates: list[ScopeEstimate] = []
     raw_step_map: dict[FusionScope, float] = {}
@@ -613,9 +668,15 @@ def _evaluate_scopes(
     )
 
     for scope in scopes_order:
-        v_st, act_bytes, n_ops, t_max, n_splits, feasible, reason = _scope_vmem_and_ops(
-            scope, ctx, profile, workload
-        )
+        (
+            static_vmem_bytes,
+            act_bytes,
+            n_ops,
+            t_max,
+            n_splits,
+            feasible,
+            reason,
+        ) = _scope_vmem_and_ops(scope, ctx, profile, workload)
         w_step, phi = w_static, 1.0
         t_ep = ceil(active_tokens / max(1, n_splits)) * ep_dp
         if experts_local > 0:
@@ -627,35 +688,59 @@ def _evaluate_scopes(
             pairs = max(1.0, t_ep * profile.top_k * experts_local / profile.num_experts)
             avg_m = max(1.0, pairs / e_hit)
             w_step = w_static + l_moe * e_hit * exp_bytes
-            is_binned = scope == "sublayer" or workload.moe_mode in (
-                "binned_vmem",
-                "grouped",
-            )
+            is_binned = scope == "sublayer" or workload.moe_mode in _GROUPED_MOE_MODES
             phi = (
                 ceil(avg_m / row_floor) * row_floor / avg_m
                 if is_binned
                 else max(1.0, (ops.rup(t_ep, 16) * e_hit) / pairs)
             )
 
+        # Out-of-kernel XLA collectives (sublayer) execute 2-phase RS + AG on HBM
+        # buffers, whereas in-kernel megakernel collectives push directly VMEM->VMEM.
+        xla_ar_factor = 2 if scope == "sublayer" and workload.tp > 1 else 1
+        xla_hbm_coll_bytes = (
+            2.0 * num_ar * token_residual_bytes
+            if scope == "sublayer" and workload.tp > 1
+            else 0.0
+        )
         t_comm = (
-            num_ar * (ar_vol / egress_bw + n_splits * ar_hops * lat_coll)
+            num_ar
+            * (ar_vol / egress_bw + n_splits * xla_ar_factor * ar_hops * lat_coll)
+            + xla_hbm_coll_bytes / bw_hbm
             + pp_stage_time
             + (
-                l_moe * (a2a_time + 2 * n_splits * lat_coll)
+                l_moe * (a2a_time + 2 * n_splits * xla_ar_factor * lat_coll)
                 if l_moe > 0 and ep_dp > 1
                 else 0.0
             )
         )
+        # Pallas pipeline prologue fill + epilogue drain per separate kernel launch:
+        # cross_layer pays once/step; single_layer/sublayer pay at each HLO boundary.
+        # dma_buffers only sizes VMEM staging; state streams are priced at full bytes.
+        eff_state_bytes = kv_cache_read_bytes + recurrent_state_rw_bytes
+        pipeline_fill_drain_s = (n_ops - 1) * (
+            first_slot_bytes / bw_hbm + 2.0 * lat_coll
+        )
         t_mxu = flops_dense / peak_w + (phi * flops_moe) / peak_e
-        act_saved = 4.0 * layers_local * token_spine_bytes - act_bytes
-        hbm_int = n_splits * w_step + s_kv_bytes + s_rec_rw
+        act_saved = 4.0 * layers_local * token_residual_bytes - act_bytes
+        hbm_int = n_splits * w_step + eff_state_bytes
         d_ops = sub_ops - n_ops
-        roof_us = (max(t_mxu, (hbm_int + act_bytes) / bw_hbm) + t_comm) * 1e6
-        base_ai = (flops_dense + flops_moe) / max(1.0, w_step + s_kv_bytes + s_rec_rw)
+        roof_us = (
+            max(t_mxu, (hbm_int + act_bytes) / bw_hbm) + t_comm + pipeline_fill_drain_s
+        ) * 1e6
+        base_ai = (flops_dense + flops_moe) / max(
+            1.0, w_step + kv_cache_read_bytes + recurrent_state_rw_bytes
+        )
         pure_us = (
             roof_us + (act_bytes + (n_splits - 1) * w_step) / bw_hbm * 1e6
             if base_ai >= peak_w / bw_hbm and n_splits > 1
-            else (max(t_mxu, hbm_int / bw_hbm) + act_bytes / bw_hbm + t_comm) * 1e6
+            else (
+                max(t_mxu, hbm_int / bw_hbm)
+                + act_bytes / bw_hbm
+                + t_comm
+                + pipeline_fill_drain_s
+            )
+            * 1e6
         )
         if scope == "sublayer":
             sub_pure_us = pure_us
@@ -676,7 +761,7 @@ def _evaluate_scopes(
                 feasible=feasible,
                 reason=reason,
                 ops_per_step=n_ops,
-                vmem_static_mib=round(v_st / (1 << 20), 3),
+                vmem_static_mib=round(static_vmem_bytes / (1 << 20), 3),
                 t_vmem_max=t_max,
                 n_splits=n_splits,
                 w_step_gb=round(w_step / 1e9, 4),
@@ -704,7 +789,9 @@ def _build_scope_context(
     num_layers, hidden = profile.num_layers, profile.hidden_size
     num_experts, top_k = profile.num_experts, profile.top_k
     tp, pp, dp, ep = workload.tp, workload.pp, workload.dp, workload.ep
-    kv_split, spec_tok = workload.kv_split, workload.spec_tokens
+    kv_split = max(workload.kv_split, workload.dcp)
+    eff_pcp = workload.pcp if workload.phase in ("prefill", "mixed") else 1
+    spec_tok = workload.spec_tokens
     head_dim, kv_lora = profile.head_dim, profile.kv_lora_rank
     q_lora, qk_rope = profile.q_lora_rank, profile.qk_rope_head_dim
     tiles = workload.tiles
@@ -712,7 +799,7 @@ def _build_scope_context(
     uncached_isl = max(1, round(workload.isl * (1.0 - workload.prefix_hit_rate)))
     batch_local, chunk_tokens, layers_local = (
         ceil(workload.batch / dp),
-        workload.chunk_size or uncached_isl,
+        ceil((workload.chunk_size or uncached_isl) / eff_pcp),
         ceil(num_layers / pp),
     )
     eff_ctx = workload.context or (
@@ -723,8 +810,12 @@ def _build_scope_context(
         if workload.phase == "verify"
         else (spec_tok + 1 if spec_tok > 0 else 1)
     )
-    prefill_tokens = workload.chunk_size or ceil(
-        batch_local * uncached_isl / max(1, workload.microbatches or pp)
+    prefill_tokens = (
+        ceil(workload.chunk_size / eff_pcp)
+        if workload.chunk_size
+        else ceil(
+            batch_local * uncached_isl / max(1, (workload.microbatches or pp) * eff_pcp)
+        )
     )
     decode_tokens = batch_local * (1 if workload.phase == "decode" else verify_tokens)
     active_tokens = (
@@ -740,7 +831,7 @@ def _build_scope_context(
         layers_local - l_attn,
         ceil(profile.num_linear_layers * layers_local / num_layers),
     )
-    token_spine_bytes = active_tokens * hidden * 2.0
+    token_residual_bytes = active_tokens * hidden * 2.0
 
     qk_nope = profile.qk_nope_head_dim or head_dim
     kd, vd = profile.linear_key_dim, profile.linear_value_dim
@@ -749,11 +840,11 @@ def _build_scope_context(
         max(1, ceil(profile.num_kv_heads / (tp // kv_split))),
     )
     q_dim, q_tot = nh_local * head_dim, nh_local * (qk_nope + qk_rope)
-    p_mla = (q_lora * (hidden + q_tot) if q_lora else hidden * q_tot) + hidden * (
-        kv_lora + qk_rope + q_dim
-    )
-    p_attn = (
-        p_mla + kv_lora * nh_local * (qk_nope + head_dim)
+    mla_proj_params = (
+        q_lora * (hidden + q_tot) if q_lora else hidden * q_tot
+    ) + hidden * (kv_lora + qk_rope + q_dim)
+    attn_params = (
+        mla_proj_params + kv_lora * nh_local * (qk_nope + head_dim)
         if kv_lora
         else hidden * 2 * (q_dim + kvh_local * head_dim)
     )
@@ -764,23 +855,28 @@ def _build_scope_context(
         2 * kh_local * kd + vh_local * vd,
         gcd(ep, tp),
     )
-    p_lin, experts_local = (
+    linear_attn_params, experts_local = (
         hidden * (qkv_lin + 2 * z_dim) * (l_lin > 0),
         (num_experts // ep) * (l_moe > 0),
     )
-    p_dffn, p_sh, ep_dp = (
+    dense_ffn_params, shared_expert_params, ep_dp = (
         3 * hidden * max(1, ceil(profile.intermediate_size / tp)),
         3 * hidden * ceil(profile.shared_expert_intermediate_size / tp),
         ep // ep_tp,
     )
     i_exp_local = ceil(profile.moe_intermediate_size / (tp // ep_tp)) * (l_moe > 0)
-    p_exp = 3 * (profile.routed_expert_hidden_size or hidden) * i_exp_local
-    p_base = (
-        l_attn * p_attn + l_lin * p_lin + (layers_local - l_moe) * p_dffn + l_moe * p_sh
+    routed_expert_params = (
+        3 * (profile.routed_expert_hidden_size or hidden) * i_exp_local
+    )
+    base_dense_params = (
+        l_attn * attn_params
+        + l_lin * linear_attn_params
+        + (layers_local - l_moe) * dense_ffn_params
+        + l_moe * shared_expert_params
     )
     w_static, exp_bytes = (
-        p_base * bw_w + l_moe * hidden * num_experts * 2.0,
-        p_exp * bw_e,
+        base_dense_params * bw_w + l_moe * hidden * num_experts * 2.0,
+        routed_expert_params * bw_e,
     )
 
     kv_bytes_per_tok = (
@@ -788,8 +884,8 @@ def _build_scope_context(
         * bw_kv
         / kv_split
     )
-    s_kv_bytes = l_attn * batch_local * eff_ctx * kv_bytes_per_tok
-    s_rec_rw = (
+    kv_cache_read_bytes = l_attn * batch_local * eff_ctx * kv_bytes_per_tok
+    recurrent_state_rw_bytes = (
         2.0
         * l_lin
         * batch_local
@@ -797,11 +893,22 @@ def _build_scope_context(
         * bw_st
     )
     vmem_usable = chip_spec.vmem_usable_bytes
-    vmem_raw = (tiles.vmem_mib << 20 if tiles else vmem_usable) - (
-        FIT_VMEM_HEADROOM_MIB << 20
-    ) * workload.vmem_fit_headroom
+    base_vmem_bytes = (
+        int(workload.vmem_budget_mib * (1 << 20))
+        if workload.vmem_budget_mib is not None
+        else (tiles.vmem_mib << 20 if tiles else vmem_usable)
+    )
+    vmem_raw = (
+        base_vmem_bytes - (FIT_VMEM_HEADROOM_MIB << 20) * workload.vmem_fit_headroom
+    )
     vmem_budget = min(vmem_usable, max(0, vmem_raw))
-    s1_bytes = int((max(p_attn, p_lin) + (p_sh if l_moe > 0 else p_dffn)) * bw_w)
+    layer_dense_weight_bytes = int(
+        (
+            max(attn_params, linear_attn_params)
+            + (shared_expert_params if l_moe > 0 else dense_ffn_params)
+        )
+        * bw_w
+    )
     t_prefill_part = {"prefill": active_tokens, "mixed": chunk_tokens}.get(
         workload.phase, 0
     )
@@ -815,7 +922,8 @@ def _build_scope_context(
         * (nh_local * d_mla if kv_lora else 2.0 * active_tokens * q_dim)
     )
     flops_dense = (
-        2.0 * active_tokens * (p_base + l_moe * hidden * num_experts) + flops_kv
+        2.0 * active_tokens * (base_dense_params + l_moe * hidden * num_experts)
+        + flops_kv
     )
     num_segments = (
         ceil(layers_local / workload.segment_layers)
@@ -828,18 +936,45 @@ def _build_scope_context(
         * ep_dp
         * l_moe
         * top_k
-        * p_exp
+        * routed_expert_params
         * experts_local
         / num_experts
         if experts_local > 0
         else 0.0
     )
+
+    # Translate ExecSpec.Tiles buffer slot counts (nbd, nbe) and slot byte widths
+    # (bank, ebank) into descriptive multi-buffering staging quantities.
+    # TODO(brianseung): Model selective per-stream 3-slot triple-buffering
+    # (buffer_count=3) so recurrent state read-update-write streams (load i+1,
+    # update i, write back i-1) and small latency-bound tiles use 3 slots when
+    # VMEM headroom permits while keeping large weight banks on 2-slot ping-pong.
+    buf_slots = workload.dma_buffers
+    if tiles is not None:
+        dense_buffer_slots = tiles.nbd
+        dense_slot_bytes = tiles.bank
+        expert_buffer_slots = tiles.nbe
+        expert_slot_bytes = tiles.ebank
+        cross_layer_dense_staging_bytes = dense_buffer_slots * dense_slot_bytes
+        cross_layer_expert_staging_bytes = expert_buffer_slots * expert_slot_bytes
+    else:
+        dense_slot_bytes = 2 << 20
+        extra_slot_bytes = (buf_slots - 2) * (2 << 20)
+        cross_layer_dense_staging_bytes = (
+            min(28 << 20, 2 * layer_dense_weight_bytes) + extra_slot_bytes
+        )
+        cross_layer_expert_staging_bytes = (10 << 20) + extra_slot_bytes
+
+    first_slot_bytes = float(
+        min(dense_slot_bytes, max(1 << 18, layer_dense_weight_bytes // 4))
+    )
     return {
         "vmem_budget": vmem_budget,
-        "d_1l": min(4 << 20, s1_bytes),
-        "e_1l": min(4 << 20, int(2 * exp_bytes)),
-        "d_multi": (tiles.nbd * tiles.bank) if tiles else min(28 << 20, 2 * s1_bytes),
-        "e_multi": (tiles.nbe * tiles.ebank) if tiles else (10 << 20),
+        "single_layer_dense_staging_bytes": min(4 << 20, layer_dense_weight_bytes),
+        "single_layer_expert_staging_bytes": min(4 << 20, int(buf_slots * exp_bytes)),
+        "cross_layer_dense_staging_bytes": cross_layer_dense_staging_bytes,
+        "cross_layer_expert_staging_bytes": cross_layer_expert_staging_bytes,
+        "first_slot_bytes": first_slot_bytes,
         "gqa_scratch": 3072 * max(head_dim, kv_lora) if l_attn > 0 else 0,
         "gdn_scratch": 16 * min(vh_local, 8) * kd * vd,
         "ffn_scratch": (
@@ -856,9 +991,11 @@ def _build_scope_context(
         "verify_tokens": verify_tokens,
         "nh_local": nh_local,
         "q_dim": q_dim,
-        "p_base": p_base,
-        "b_tok_fused": compute_per_token_vmem_bytes(profile, workload)["b_tok"],
-        "token_spine_bytes": token_spine_bytes,
+        "base_dense_params": base_dense_params,
+        "per_token_fused_bytes": compute_per_token_vmem_bytes(profile, workload)[
+            "total_per_token_bytes"
+        ],
+        "token_residual_bytes": token_residual_bytes,
         "w_static": w_static,
         "exp_bytes": exp_bytes,
         "experts_local": experts_local,
@@ -868,12 +1005,12 @@ def _build_scope_context(
         ),
         "num_ar": profile.ar_slots_per_layer * layers_local,
         "ar_hops": round(log2(tp)),
-        "ar_vol": 2.0 * (tp - 1) / tp * token_spine_bytes,
+        "ar_vol": 2.0 * (tp - 1) / tp * token_residual_bytes,
         "egress_bw": chip_spec.ici_egress_bw_bytes_per_s,
         "lat_coll": chip_spec.collective_latency_s,
         "pp_stage_time": (
             (
-                token_spine_bytes / chip_spec.ici_link_bw_bytes_per_s
+                token_residual_bytes / chip_spec.ici_link_bw_bytes_per_s
                 + chip_spec.collective_latency_s
             )
             if pp > 1
@@ -884,7 +1021,7 @@ def _build_scope_context(
             * (ep_dp - 1)
             / ep_dp
             * max(1, top_k)
-            * token_spine_bytes
+            * token_residual_bytes
             / chip_spec.ici_egress_bw_bytes_per_s
             if ep_dp > 1
             else 0.0
@@ -893,11 +1030,14 @@ def _build_scope_context(
         "flops_moe": flops_moe,
         "peak_w": chip_spec.peak_flops(profile.weight_dtype),
         "peak_e": chip_spec.peak_flops(profile.expert_dtype),
-        "s_kv_bytes": s_kv_bytes,
-        "s_rec_rw": s_rec_rw,
+        "kv_cache_read_bytes": kv_cache_read_bytes,
+        "recurrent_state_rw_bytes": recurrent_state_rw_bytes,
         "bw_hbm": chip_spec.hbm_bw_bytes_per_s,
         "hbm_used": (
-            w_static + l_moe * experts_local * exp_bytes + s_kv_bytes + 0.5 * s_rec_rw
+            w_static
+            + l_moe * experts_local * exp_bytes
+            + kv_cache_read_bytes
+            + 0.5 * recurrent_state_rw_bytes
         ),
         "no_cross_layer": (
             pp > 1
@@ -929,7 +1069,9 @@ def advise(
     used_gb, cap_gb = hbm_used / 1e9, chip_spec.hbm_capacity_bytes / 1e9
     ridge = float(ctx["peak_w"]) / float(ctx["bw_hbm"])
     b_wa = best.w_step_gb * 1e9 * best.n_splits + best.act_hbm_mb * 1e6
-    state_bytes = float(ctx["s_kv_bytes"]) + float(ctx["s_rec_rw"])
+    state_bytes = float(ctx["kv_cache_read_bytes"]) + float(
+        ctx["recurrent_state_rw_bytes"]
+    )
     kv_lora, qk_rope = profile.kv_lora_rank, profile.qk_rope_head_dim
     nh_local, q_dim = int(ctx["nh_local"]), int(ctx["q_dim"])
     v_q = nh_local * (2 * kv_lora + qk_rope) if kv_lora else 2.0 * q_dim
@@ -939,7 +1081,7 @@ def advise(
     l_moe, l_attn = int(ctx["l_moe"]), int(ctx["l_attn"])
     flops_dense, flops_moe = float(ctx["flops_dense"]), float(ctx["flops_moe"])
     v_p = (
-        float(ctx["p_base"])
+        float(ctx["base_dense_params"])
         + l_moe * profile.hidden_size * profile.num_experts
         + flops_moe / (2.0 * active_tokens)
     )
@@ -964,11 +1106,17 @@ def advise(
         1,
         ceil((estimates[0].w_step_gb * 1e9 + state_bytes) * ridge / flop_per_tok),
     )
-    if l_moe == 0 or rec_scope == "sublayer":
-        rec_moe = "none"
+    if l_moe == 0:
+        rec_moe = "dense_mlp"
+    elif rec_scope == "sublayer":
+        rec_moe = "standalone_ragged_dot"
     else:
         t_per_ep = ceil(active_tokens / max(1, best.n_splits)) * int(ctx["ep_dp"])
-        rec_moe = "grouped" if t_per_ep >= _GROUPED_MOE_MIN_TOKENS else "masked"
+        rec_moe = (
+            "expert_grouped_vmem"
+            if t_per_ep >= _GROUPED_MOE_MIN_TOKENS
+            else "token_masked_vmem"
+        )
 
     return AdvisorReport(
         model=profile.name,
@@ -987,9 +1135,10 @@ def advise(
         build_megakernel=rec_scope != "sublayer",
         rationale=rationale,
         scopes=tuple(estimates),
-        per_token_vmem_bytes=int(ctx["b_tok_fused"]),
+        per_token_vmem_bytes=int(ctx["per_token_fused_bytes"]),
         ridge_tokens=ridge_tokens,
         recommended_moe_mode=rec_moe,
+        dma_buffers=workload.dma_buffers,
     )
 
 
@@ -1073,13 +1222,20 @@ def advise_regimes(
     chip: ChipSpec | str = "tpu7x",
     **opts: object,
 ) -> AdvisorSweepReport:
-    """Evaluate Decode, Speculative Verify, Short Prefill, and Long Prefill regimes."""
+    """Evaluate the 12-regime Batch Size x Phase & Context matrix."""
     raw_tp = opts.get("tp")
     raw_ep = opts.get("ep")
+    raw_vmem = opts.get("vmem_budget_mib")
     tp = int(raw_tp) if isinstance(raw_tp, int) else None
     ep = int(raw_ep) if isinstance(raw_ep, int) else None
+    vmem_budget_mib = (
+        float(raw_vmem) if isinstance(raw_vmem, (int, float, str)) else None
+    )
     dp = _int_opt(opts, "dp", 1)
     pp = _int_opt(opts, "pp", 1)
+    dcp = _int_opt(opts, "dcp", 1)
+    pcp = _int_opt(opts, "pcp", 1)
+    dma_buffers = _int_opt(opts, "dma_buffers", 2)
     vmem_alias = bool(opts.get("vmem_alias", True))
     vmem_fit_headroom = bool(opts.get("vmem_fit_headroom", False))
     op_overhead_us = _float_opt(opts, "op_overhead_us", 0.0)
@@ -1088,10 +1244,10 @@ def advise_regimes(
     chip_spec = resolve_chip_spec(chip)
     if tp is None:
         par = recommend_parallelism(prof, chip_spec, dp=dp, pp=pp)
-        if ep is not None:
+        if ep is not None or dcp > 1 or pcp > 1:
             par = ParallelismRecommendation(
                 tp=par.tp,
-                ep=ep,
+                ep=ep if ep is not None else par.ep,
                 dp=dp,
                 pp=pp,
                 topology=par.topology,
@@ -1099,6 +1255,8 @@ def advise_regimes(
                 hbm_capacity_gb=par.hbm_capacity_gb,
                 w_step_gb=par.w_step_gb,
                 auto_selected=True,
+                dcp=dcp,
+                pcp=pcp,
             )
     else:
         ep_val = (
@@ -1108,7 +1266,18 @@ def advise_regimes(
         )
         base_rep = advise(
             prof,
-            WorkloadSpec(phase="decode", batch=16, tp=tp, ep=ep_val, dp=dp, pp=pp),
+            WorkloadSpec(
+                phase="decode",
+                batch=16,
+                tp=tp,
+                ep=ep_val,
+                dp=dp,
+                pp=pp,
+                dcp=dcp,
+                pcp=pcp,
+                vmem_budget_mib=vmem_budget_mib,
+                dma_buffers=dma_buffers,
+            ),
             chip_spec,
         )
         total_cores = tp * dp * pp
@@ -1122,59 +1291,149 @@ def advise_regimes(
             hbm_capacity_gb=base_rep.hbm_capacity_gb,
             w_step_gb=base_rep.scopes[0].w_step_gb,
             auto_selected=False,
+            dcp=dcp,
+            pcp=pcp,
         )
 
+    common = {
+        "tp": par.tp,
+        "ep": par.ep,
+        "dp": par.dp,
+        "pp": par.pp,
+        "dcp": par.dcp,
+        "pcp": par.pcp,
+        "vmem_alias": vmem_alias,
+        "vmem_fit_headroom": vmem_fit_headroom,
+        "op_overhead_us": op_overhead_us,
+        "vmem_budget_mib": vmem_budget_mib,
+        "dma_buffers": dma_buffers,
+    }
     workloads = (
         (
-            "Decode (B=16, T=1)",
+            "Decode Small (B=4, T=1, 4K)",
             WorkloadSpec(
                 phase="decode",
-                batch=16,
-                isl=4096,
-                osl=1024,
-                tp=par.tp,
-                ep=par.ep,
-                dp=par.dp,
-                pp=par.pp,
-                vmem_alias=vmem_alias,
-                vmem_fit_headroom=vmem_fit_headroom,
-                op_overhead_us=op_overhead_us,
+                batch=4,
+                isl=3072,
+                osl=2048,
+                **common,  # type: ignore[arg-type]
             ),
         ),
         (
-            "Spec Verify (B=16, K=3)",
+            "Decode Low (B=8, T=1, 4K)",
+            WorkloadSpec(
+                phase="decode",
+                batch=8,
+                isl=3072,
+                osl=2048,
+                **common,  # type: ignore[arg-type]
+            ),
+        ),
+        (
+            "Decode Med (B=16, T=1, 4K)",
+            WorkloadSpec(
+                phase="decode",
+                batch=16,
+                isl=3072,
+                osl=2048,
+                **common,  # type: ignore[arg-type]
+            ),
+        ),
+        (
+            "Decode High (B=64, T=1, 32K)",
+            WorkloadSpec(
+                phase="decode",
+                batch=64,
+                isl=32768,
+                osl=2048,
+                context=32768,
+                moe_mode="expert_grouped_vmem",
+                **common,  # type: ignore[arg-type]
+            ),
+        ),
+        (
+            "Decode Saturated (B=256, T=1, 32K)",
+            WorkloadSpec(
+                phase="decode",
+                batch=256,
+                isl=32768,
+                osl=2048,
+                context=32768,
+                moe_mode="expert_grouped_vmem",
+                **common,  # type: ignore[arg-type]
+            ),
+        ),
+        (
+            "Spec Verify Small (B=4, K=3)",
+            WorkloadSpec(
+                phase="verify",
+                batch=4,
+                spec_tokens=3,
+                isl=3072,
+                osl=2048,
+                **common,  # type: ignore[arg-type]
+            ),
+        ),
+        (
+            "Spec Verify Low (B=8, K=3)",
+            WorkloadSpec(
+                phase="verify",
+                batch=8,
+                spec_tokens=3,
+                isl=3072,
+                osl=2048,
+                moe_mode="expert_grouped_vmem",
+                **common,  # type: ignore[arg-type]
+            ),
+        ),
+        (
+            "Spec Verify Med (B=16, K=3)",
             WorkloadSpec(
                 phase="verify",
                 batch=16,
                 spec_tokens=3,
-                isl=4096,
-                osl=1024,
-                tp=par.tp,
-                ep=par.ep,
-                dp=par.dp,
-                pp=par.pp,
-                moe_mode="grouped",
-                vmem_alias=vmem_alias,
-                vmem_fit_headroom=vmem_fit_headroom,
-                op_overhead_us=op_overhead_us,
+                isl=3072,
+                osl=2048,
+                moe_mode="expert_grouped_vmem",
+                **common,  # type: ignore[arg-type]
             ),
         ),
         (
-            "Cached Prefill (B=1, T=256)",
+            "Spec Verify High (B=32, K=3)",
+            WorkloadSpec(
+                phase="verify",
+                batch=32,
+                spec_tokens=3,
+                isl=32768,
+                osl=2048,
+                context=32768,
+                moe_mode="expert_grouped_vmem",
+                **common,  # type: ignore[arg-type]
+            ),
+        ),
+        (
+            "Mixed Decode+Prefill (B=16, C=256)",
+            WorkloadSpec(
+                phase="mixed",
+                batch=16,
+                isl=4096,
+                osl=2048,
+                chunk_size=256,
+                prefix_hit_rate=0.90,
+                moe_mode="expert_grouped_vmem",
+                **common,  # type: ignore[arg-type]
+            ),
+        ),
+        (
+            "Chunked Prefill (B=1, T=256)",
             WorkloadSpec(
                 phase="prefill",
                 batch=1,
                 isl=4096,
                 chunk_size=256,
                 prefix_hit_rate=0.9375,
-                tp=par.tp,
-                ep=par.ep,
-                dp=par.dp,
-                pp=par.pp,
-                moe_mode="grouped",
-                vmem_alias=vmem_alias,
-                vmem_fit_headroom=vmem_fit_headroom,
-                op_overhead_us=op_overhead_us,
+                moe_mode="expert_grouped_vmem",
+                **common,  # type: ignore[arg-type]
             ),
         ),
         (
@@ -1183,14 +1442,8 @@ def advise_regimes(
                 phase="prefill",
                 batch=1,
                 isl=4096,
-                tp=par.tp,
-                ep=par.ep,
-                dp=par.dp,
-                pp=par.pp,
-                moe_mode="grouped",
-                vmem_alias=vmem_alias,
-                vmem_fit_headroom=vmem_fit_headroom,
-                op_overhead_us=op_overhead_us,
+                moe_mode="expert_grouped_vmem",
+                **common,  # type: ignore[arg-type]
             ),
         ),
     )
@@ -1218,8 +1471,8 @@ def advise_regimes(
             )
         )
 
-    decode_rep = reports[0]
-    vmem_parts = compute_per_token_vmem_bytes(prof, workloads[0][1])
+    decode_rep = reports[2]
+    vmem_parts = compute_per_token_vmem_bytes(prof, workloads[2][1])
     cross_sc = next(s for s in decode_rep.scopes if s.scope == "cross_layer")
     one_l_sc = next(s for s in decode_rep.scopes if s.scope == "single_layer")
     ref_sc = cross_sc if cross_sc.feasible else one_l_sc
@@ -1227,21 +1480,22 @@ def advise_regimes(
     t_ceil = ref_sc.t_vmem_max
     t_ridge = decode_rep.ridge_tokens
     step_mode = primary_step_mode(cross_sc)
-    slope_kib = vmem_parts["b_tok"] / 1024
+    slope_kib = vmem_parts["total_per_token_bytes"] / 1024
     ridge_fb = decode_rep.ridge_dense_flop_per_byte
     guide = (
-        f"Small-Token Decode & Spec Verify (T <= {t_ceil} tokens): "
-        f"use fusion_mode='{step_mode}' with moe_mode='masked' (T < 32) "
-        f"or 'grouped' (T >= 32) to keep the residual spine in VMEM "
-        f"({ref_sc.vmem_static_mib:.1f} MiB static + {slope_kib:.1f} KiB/tok).",
-        f"Intermediate / Chunked Prefill ({t_ceil} < T <= {t_ridge} tokens): "
+        f"Small/Med Decode & Spec Verify (T <= {t_ceil} active tokens): "
+        f"use fusion_mode='{step_mode}' with moe_mode='token_masked_vmem' (T < 32) "
+        f"or 'expert_grouped_vmem' (T >= 32) to keep [T, H] in VMEM "
+        f"({ref_sc.vmem_static_mib:.1f} MiB {dma_buffers}-slot weight staging + "
+        f"{slope_kib:.1f} KiB/tok).",
+        f"High-Batch Decode & Chunked Prefill ({t_ceil} < T <= {t_ridge} tokens): "
         "use fusion_mode='layer' or 'segment' "
         f"(single-layer VMEM ceiling T_max={one_l_sc.t_vmem_max}) "
-        "so weights are not re-streamed across multi-split passes.",
-        f"Compute-Bound Long Prefill (T > {t_ridge} tokens, "
-        f"AI >= {ridge_fb:.0f} FLOP/B): use fusion_mode='standard' "
-        "(sublayer XLA ops) to maximize MXU systolic utilization "
-        "without VMEM ring reservation.",
+        "so weights are not re-streamed across multi-pass token splits.",
+        f"Saturated Decode & Compute-Bound Prefill (T > {t_ridge} tokens, "
+        f"AI >= {ridge_fb:.0f} FLOP/B): use fusion_mode='modular_kernel' "
+        "with moe_mode='standalone_ragged_dot' to saturate the 256x256 MXU "
+        "without reserving multi-layer weight staging VMEM.",
     )
     return AdvisorSweepReport(
         model=prof.name,
@@ -1249,13 +1503,14 @@ def advise_regimes(
         parallelism=par,
         vmem_budget_mib=decode_rep.vmem_budget_mib,
         vmem_static_mib=ref_sc.vmem_static_mib,
-        per_token_vmem_bytes=vmem_parts["b_tok"],
+        per_token_vmem_bytes=vmem_parts["total_per_token_bytes"],
         vmem_breakdown_bytes=vmem_parts,
         max_vmem_tokens=t_ceil,
         ridge_dense_flop_per_byte=decode_rep.ridge_dense_flop_per_byte,
         ridge_tokens=t_ridge,
         regimes=tuple(entries),
         tailoring_guide=guide,
+        dma_buffers=dma_buffers,
     )
 
 
@@ -1268,7 +1523,7 @@ def advise_from_spec(
     model_spec: spec.ModelSpec,
     ex: exec_spec.ExecSpec,
     chip: ChipSpec | str = "tpu7x",
-    moe_mode: MoEMode = "dense_masked",
+    moe_mode: MoEMode = "token_masked_vmem",
     op_overhead_us: float = 0.0,
 ) -> AdvisorReport:
     """Bridge declarative ModelSpec + ExecSpec schedules via planner.plan."""
