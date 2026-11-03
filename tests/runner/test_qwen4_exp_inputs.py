@@ -123,6 +123,7 @@ def test_reordered_history_slots_and_group_tables_are_independent(
     layer = Mock(return_value=hidden, ple=NS(lookup_for_model=lookup))
     backbone = NS(
         host_ple_index=0 if offload else None,
+        decode_cu=None,
         layers=[layer],
         hc_count=1,
         embed_tokens=Mock(return_value=hidden),
@@ -187,7 +188,10 @@ def test_old_model_has_no_adapter():
 
 
 @pytest.mark.parametrize("tp", [1, 2])
-def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, tp):
+@pytest.mark.parametrize("other_decode", [False, True])
+def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
+    monkeypatch, tp, other_decode
+):
     from contextlib import nullcontext
 
     from vllm_torchtpu.models.vllm.qwen4_exp import inputs
@@ -211,7 +215,8 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     monkeypatch.setattr(
         inputs, "set_vllm_model_wrapper_context", lambda **kw: nullcontext()
     )
-    monkeypatch.setattr(inputs, "synchronize_tensors", lambda tensor: None)
+    sync = Mock()
+    monkeypatch.setattr(inputs, "synchronize_tensors", sync)
     runner = NS(
         device="cpu",
         _pp_is_first=True,
@@ -228,6 +233,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
         _dp_num_tokens_across_dp=lambda n: torch.full((8,), n, dtype=torch.int32),
         forward_model=forward,
         compute_selected_logits=logits,
+        _dp_step_other_decode=other_decode,
     )
     runner.model_config = NS(hf_text_config=q4exp_text_config())
     runner.cache_config = NS(block_size=128)
@@ -243,6 +249,8 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     )
     runner.most_model_len = 384
     adapter.dummy_run(128, 8, num_blocks=3, use_max_model_len=False)
+    assert sync.call_count == 1 and sync.call_args.kwargs.get("wait", True)
+    sync.reset_mock()
     kwargs = captured["model_kwargs"]
     assert captured["metadata"]["gdn"].block_tables.shape == (24,)
     assert allocations == [True]
@@ -271,12 +279,18 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     # Idle TP groups must also issue the LM-head collective before returning
     # to DP coordination, or busy ranks cannot materialize their sample.
     if tp > 1:
+        if other_decode:
+            sync.assert_not_called()
+        else:
+            sync.assert_called_once_with(logits.return_value)
         logits.assert_called_once()
         hidden, indices = logits.call_args.args
         assert hidden.shape == (128, 2560)
         assert indices.shape == (8,) and indices.dtype == torch.int32
         assert not indices.any()
     else:
+        assert sync.call_count == 1
+        assert sync.call_args.kwargs["wait"] is not other_decode
         logits.assert_not_called()  # TP1 has no LM-head collective to pair.
     assert adapter.ngram_context is before
     assert (adapter.ngram_context == 123).all()
@@ -338,10 +352,11 @@ def test_native_kwargs_match_warmup_profile_and_idle(monkeypatch, tokens, live_c
     monkeypatch.setattr(
         inputs, "set_vllm_model_wrapper_context", lambda **kw: nullcontext()
     )
-    monkeypatch.setattr(inputs, "synchronize_tensors", lambda tensor: None)
+    monkeypatch.setattr(inputs, "synchronize_tensors", lambda tensor, wait=True: None)
     runner.forward_model = forward
     runner._record_input_staging_fence = Mock()
     runner.parallel_config.tensor_parallel_size = 1
+    runner._dp_step_other_decode = False
     runner.scheduler_config.max_num_seqs = cfg.scheduler_config.max_num_seqs
     runner._dp_num_tokens_across_dp = lambda n: torch.full((8,), n, dtype=torch.int32)
     runner.max_model_len = cfg.model_config.max_model_len

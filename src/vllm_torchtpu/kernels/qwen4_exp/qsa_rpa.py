@@ -342,6 +342,18 @@ def qsa_attention(
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
 
     positions = jnp.arange(tokens, dtype=jnp.int32)
+    # Small buckets also include verify and prefill rows; their per-query
+    # causal lengths allow the same schedule without segment dispatch.
+    if tokens <= len(starts) - 1:
+        return rpa_attention(
+            query,
+            gate,
+            blocks,
+            jnp.where(positions < active_tokens, lengths, 0),
+            table,
+            cache,
+            **options,
+        )
     suffix = (positions >= prefix_tokens) & (positions < active_tokens)
     # Neither request segment owns or updates the written cache.
     prefill_options: dict[str, Any] = dict(options, sc_min_context=sc_min_context)

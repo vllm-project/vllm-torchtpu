@@ -46,6 +46,43 @@ def _reference(query, cache, lengths, table):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "counts,distribution",
+    [
+        ([1] * 8, [8, 8, 8]),
+        ([3, 2], [0, 2, 2]),
+        ([4, 3], [0, 0, 2]),
+        ([1, 2, 4], [1, 2, 3]),
+        ([], [0, 0, 0]),
+    ],
+)
+def test_small_indexer_bucket_has_no_segment_dispatch(counts, distribution):
+    """Small decode, verify and prefill batches share the per-query schedule."""
+    query, cache, _, table = _inputs(batch=16)
+    counts = np.asarray(counts + [0] * (16 - len(counts)), np.int32)
+    starts = jnp.asarray(np.r_[0, np.cumsum(counts)], jnp.int32)
+    context = jnp.full((16,), 2048, jnp.int32)
+    request_ids = jnp.asarray(
+        np.pad(np.repeat(np.arange(16), counts), (0, 16 - counts.sum())), jnp.int32
+    )
+    lengths = context[request_ids] + jnp.arange(16) - starts[request_ids] + 1
+    args = (query, cache, lengths, table, request_ids)
+    options = dict(
+        starts=starts,
+        context=context,
+        request_distribution=jnp.asarray(distribution, jnp.int32),
+    )
+    lowered = select_decode_blocks.lower(*args, **options)
+    assert "stablehlo.case" not in lowered.as_text()
+    actual = np.asarray(lowered.compile()(*args, **options))
+    live_lengths = jnp.where(jnp.arange(16) < counts.sum(), lengths, 0)
+    expected = np.asarray(
+        select_decode_blocks(query, cache, live_lengths, table, request_ids)
+    )
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("ties", [False, True])
 @pytest.mark.parametrize("heads", [1, 2, 4, 8])
 def test_decode_blocks_match_exact_topk_set(ties, heads):

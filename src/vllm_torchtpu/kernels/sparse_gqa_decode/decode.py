@@ -64,7 +64,7 @@ def _attend(
     )
     q_lens = (kv_lens > 0).astype(jnp.int32)
     metadata = schedule.generate(cu_q_lens, kv_lens, pages, cfgs)
-    out, next_cache = decode_kernel(
+    out = decode_kernel(
         cu_q_lens=cu_q_lens,
         compressed_query_offsets=kv_lens - q_lens,
         q_lens=q_lens,
@@ -78,7 +78,9 @@ def _attend(
     )
     out = bf16(out.swapaxes(0, 1).reshape(q.shape))
     out = jnp.where((lengths > 0)[:, None, None], out, 0)
-    return out, next_cache.reshape(cache.shape)
+    # Cache is read-only. Returning it from the Pallas call as an aliased
+    # output would force a pool-sized copy when a dynamic loop retains it.
+    return out, cache
 
 
 def execute_decode(

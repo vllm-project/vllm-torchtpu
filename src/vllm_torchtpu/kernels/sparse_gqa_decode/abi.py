@@ -25,7 +25,7 @@ KV_DMA_FIELDS = ("source_index", "destination_token", "token_count")
 QUERY_DMA_FIELDS = ("source_row", "row_count")
 SCALAR_OPERANDS = ("cu_q_lens", "compressed_query_offsets", "q_lens")
 TENSOR_OPERANDS = ("query", "unused_new_kv", "cache", "gate")
-OUTPUT_OPERANDS = ("query", "cache")
+OUTPUT_OPERANDS = ("query",)
 
 
 def output_aliases(scalars: tuple, metadata: object) -> dict[int, int]:

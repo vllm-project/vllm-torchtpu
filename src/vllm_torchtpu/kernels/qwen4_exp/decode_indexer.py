@@ -25,12 +25,11 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     TopKBackend,
 )
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
+from vllm_torchtpu.kernels.qwen4_exp.resident_topk import QwenSparseCoreTopK
 from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
     get_decode_index_key_packing,
     get_decode_index_pages,
 )
-
-from vllm_torchtpu.kernels.qwen4_exp.resident_topk import QwenSparseCoreTopK
 
 
 def _request_bounds(starts, distribution, tokens):
@@ -275,6 +274,10 @@ def select_index_blocks(
     if request_distribution is None:
         raise ValueError("Ragged QSA selection requires Runner request_distribution")
     prefix_tokens, active_tokens = _request_bounds(starts, request_distribution, batch)
+    if batch <= len(starts) - 1:
+        # Per-query scoring remains causal for small verify/prefill batches.
+        lengths = jnp.where(jnp.arange(batch) < active_tokens, lengths, 0)
+        return per_query()
     if prefix_capacity is None and default_backend:
         prefix_capacity = max(block_topk, (batch + ratio - 1) // ratio)
 

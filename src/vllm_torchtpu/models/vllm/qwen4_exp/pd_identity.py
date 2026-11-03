@@ -17,6 +17,7 @@ import hashlib
 import json
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from typing import cast
 
 import torch
 from torch.overrides import TorchFunctionMode
@@ -74,16 +75,17 @@ class LoadedWeightIdentity(TorchFunctionMode):
         kwargs=None,
     ):
         result = func(*args, **(kwargs or {}))
-        if (
-            func is torch.Tensor.copy_
-            and len(args) >= 2
-            and isinstance(args[0], torch.Tensor)
-            and isinstance(args[1], torch.Tensor)
-            and args[0].untyped_storage() in self._destinations
-            and args[1].device.type == "cpu"
-        ):
-            self.add(f"{self._current_name}/{self._copy_index}", args[1])
-            self._copy_index += 1
+        if func is torch.Tensor.copy_ and len(args) >= 2:
+            destination, source = args[:2]
+            if (
+                isinstance(destination, torch.Tensor)
+                and isinstance(source, torch.Tensor)
+                and cast(torch.Tensor, destination).untyped_storage()
+                in self._destinations
+                and cast(torch.Tensor, source).device.type == "cpu"
+            ):
+                self.add(f"{self._current_name}/{self._copy_index}", source)
+                self._copy_index += 1
         return result
 
     def finish(self, *, name_fragment: str | None = None) -> str:

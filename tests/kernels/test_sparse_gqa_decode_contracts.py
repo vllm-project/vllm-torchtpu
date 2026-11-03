@@ -183,7 +183,7 @@ def test_policy_static_identity_and_layout_constraints(monkeypatch):
     )
     with pytest.raises(ValueError, match="scalar"):
         abi.output_aliases((None,), ())
-    assert abi.output_aliases((None,) * 3, (None,)) == {3: 0, 5: 1}
+    assert abi.output_aliases((None,) * 3, (None,)) == {3: 0}
 
 
 def test_public_decode_entry_forwards_geometry_plan_and_scales(monkeypatch):
@@ -235,7 +235,15 @@ def test_schedule_prefix_tail_capacity(alignment):
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
     "batch,ratio,groups,lanes",
-    [(6, 8, 65, 8), (12, 8, 65, 8), (24, 8, 65, 8), (16, 4, 512, 4)],
+    [
+        (6, 8, 65, 8),
+        (12, 8, 65, 8),
+        (24, 8, 65, 8),
+        (16, 4, 512, 4),
+        (6, 8, 512, 8),
+        (12, 8, 512, 8),
+        (24, 8, 512, 8),
+    ],
 )
 def test_schedule_fields_against_scalar_task_oracle(fp8, batch, ratio, groups, lanes):
     dtype = jnp.dtype(jnp.float8_e4m3fn if fp8 else jnp.bfloat16)
@@ -320,6 +328,40 @@ def test_schedule_fields_against_scalar_task_oracle(fp8, batch, ratio, groups, l
         )
     for name in schedule.UNUSED_FIELDS:
         np.testing.assert_array_equal(np.asarray(getattr(actual, name).data), 0)
+
+
+@pytest.mark.tpu_test
+def test_schedule_shares_common_fields_across_physical_page_tables():
+    cfg = make_config(6, 8, 128, 1, 8, 65, jnp.dtype(jnp.bfloat16))
+    lengths = jnp.array([0, 1, 255, 256, 257, 520], jnp.int32)
+    cu = jnp.arange(7, dtype=jnp.int32)
+    pages = jnp.arange(6 * 66, dtype=jnp.int32)
+
+    @jax.jit
+    def both(cu, lengths, first_pages, second_pages):
+        return (
+            schedule.generate(cu, lengths, first_pages, cfg),
+            schedule.generate(cu, lengths, second_pages, cfg),
+        )
+
+    executable = both.lower(cu, lengths, pages, pages).compile()
+    first, second = executable(cu, lengths, pages, pages[::-1])
+    for name in schedule.field_names(first):
+        if name != "dma_kv_cache":
+            np.testing.assert_array_equal(
+                np.asarray(getattr(first, name).data),
+                np.asarray(getattr(second, name).data),
+            )
+    assert not np.array_equal(
+        np.asarray(first.dma_kv_cache.data),
+        np.asarray(second.dma_kv_cache.data),
+    )
+    # Inspect optimized HLO: physical addresses must not duplicate the common
+    # schedule kernel when multiple decoder layers consume the same lengths.
+    calls = [
+        line for line in executable.as_text().splitlines() if "custom-call(" in line
+    ]
+    assert sum("qsa_decode_schedule" in line for line in calls) == 1
 
 
 @pytest.mark.tpu_test

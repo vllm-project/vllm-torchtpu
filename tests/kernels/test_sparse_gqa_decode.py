@@ -81,6 +81,37 @@ def _case(
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "counts,distribution",
+    [
+        ([1] * 8, [8, 8, 8]),
+        ([3, 2], [0, 2, 2]),
+        ([4, 3], [0, 0, 2]),
+        ([1, 2, 4], [1, 2, 3]),
+        ([], [0, 0, 0]),
+    ],
+)
+def test_small_qsa_bucket_has_no_segment_loop(counts, distribution):
+    """Small ragged batches retain causal rows without empty prefill work."""
+    args = list(_case(16, 2051, 128, True))
+    starts = jnp.asarray(np.r_[0, np.cumsum(counts + [0] * (16 - len(counts)))])
+    distribution = jnp.asarray(distribution, jnp.int32)
+    options = dict(kv_heads=2, ratio=4, k_scale=0.375, v_scale=2.5)
+    expected_args = list(args)
+    expected_args[3] = jnp.where(jnp.arange(16) < sum(counts), args[3], 0)
+    expected, _ = jax.jit(functools.partial(rpa_attention, **options))(*expected_args)
+    fn = jax.jit(functools.partial(qsa_attention, **options))
+    lowered = fn.lower(*args, starts, request_distribution=distribution)
+    assert "stablehlo.while" not in lowered.as_text()
+    assert "sparse_gqa_prefill" not in lowered.as_text()
+    actual, cache = lowered.compile()(*args, starts, request_distribution=distribution)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    np.testing.assert_array_equal(
+        np.asarray(cache).view(np.uint8), np.asarray(args[-1]).view(np.uint8)
+    )
+
+
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
     "batch,context,page",
@@ -97,6 +128,7 @@ def _case(
         (257, 2051, 256),
         (513, 7, 4),
         (3, 2051, 132),
+        (8, 65537, 128),
         (1, 524289, 256),
     ],
 )
@@ -542,3 +574,69 @@ def test_launch_bound_tracks_selected_tiles_and_hardware(monkeypatch):
         ),
     )
     assert query_batch_size(512, 24, 256, 2, 4, 512, jnp.dtype(jnp.bfloat16)) < normal
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+def test_dynamic_prefix_keeps_read_only_cache_without_pool_copy(fp8, tmp_path):
+    """A read-only Pallas operand must not be donated inside a while body."""
+    import re
+
+    from vllm_torchtpu.kernels.sparse_gqa_decode.decode import execute_decode
+    from vllm_torchtpu.kernels.sparse_gqa_decode.eligibility import plan_decode
+
+    args = _case(9, 2051, 1664, fp8, kv_heads=1)
+    cache_before = np.asarray(args[5]).copy()
+    options = dict(kv_heads=1, ratio=4, k_scale=0.375, v_scale=2.5)
+    # Four-query chunks exercise zero, partial, and multiple loop iterations.
+    launch = plan_decode(*(arg[:4] for arg in args[:5]), args[5], **options)
+    assert launch is not None and launch.chunk_queries == 4
+    initial = jnp.full_like(args[0], 0.125)
+
+    def prefix(*values):
+        *inputs, active, previous = values
+        return execute_decode(
+            *inputs,
+            launch=launch,
+            active_tokens=active,
+            initial_output=previous,
+            k_scale=options["k_scale"],
+            v_scale=options["v_scale"],
+        )
+
+    executable = jax.jit(prefix).lower(*args, jnp.int32(1), initial).compile()
+    hlo = executable.as_text()
+    (tmp_path / "prefix.hlo").write_text(hlo)
+    assert "while(" in hlo and "fused_qsa_decode" in hlo
+    # This test retains the caller input, so JAX may copy the returned cache
+    # at ENTRY. No nested computation may copy the read-only pool.
+    cache_type = "f8e4m3fn" if fp8 else "bf16"
+    copies = re.findall(
+        rf"= {cache_type}\[([0-9,]+)\]\{{[^}}]*\}} copy\(",
+        hlo.split("\nENTRY ", 1)[0],
+    )
+    assert not any(
+        math.prod(map(int, dims.split(","))) == args[5].size for dims in copies
+    ), "Read-only QSA copied the entire KV pool inside its dynamic prefix"
+
+    reference, _ = jax.jit(functools.partial(qsa_decode_attention, **options))(*args)
+    expected_all = np.asarray(reference, np.float32)
+    for count in (0, 1, 4, 5, 8, 9):
+        output, returned = jax.block_until_ready(
+            executable(*args, jnp.int32(count), initial)
+        )
+        expected = np.asarray(initial, np.float32).copy()
+        expected[:count] = expected_all[:count]
+        actual = np.asarray(output, np.float32)
+        assert np.isfinite(actual).all()
+        assert (
+            np.linalg.norm(actual - expected) / max(np.linalg.norm(expected), 1e-12)
+            < 0.01
+        )
+        np.testing.assert_array_equal(actual[count:], expected[count:])
+        np.testing.assert_array_equal(
+            np.asarray(returned).view(np.uint8), cache_before.view(np.uint8)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(args[5]).view(np.uint8), cache_before.view(np.uint8)
+        )

@@ -25,7 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
 
-from .abi import KV_DMA_FIELDS, QUERY_DMA_FIELDS, RPA_WAIT_ROW_BYTES
+from .abi import QUERY_DMA_FIELDS, RPA_WAIT_ROW_BYTES
 
 
 class CompactRow(enum.IntEnum):
@@ -61,8 +61,8 @@ def field_names(shape: schedule.RpaSchedule) -> tuple[str, ...]:
     return tuple(name for name in names if name in POPULATED_FIELDS | UNUSED_FIELDS)
 
 
-def _kernel(cu_ref, lengths_ref, *out_refs, cfgs, names):
-    steps, lanes = cfgs.max_steps_ub, cfgs.batch_size
+def _kernel(cu_ref, lengths_ref, *out_refs, cfgs, names, steps):
+    lanes = cfgs.batch_size
     # Keep steps on vector lanes while assigning tasks, then expand directly
     # into the existing RPA protocol without an intermediate HBM owner.
     slots = jnp.arange(steps)[None, :] * lanes + jnp.arange(lanes)[:, None]
@@ -100,32 +100,6 @@ def _kernel(cu_ref, lengths_ref, *out_refs, cfgs, names):
             axis=1,
         )
 
-    col = jnp.arange(lanes * cfgs.bkv_p_cache * len(KV_DMA_FIELDS))
-    idx, page, field = (
-        col // (cfgs.bkv_p_cache * len(KV_DMA_FIELDS)),
-        (col // len(KV_DMA_FIELDS)) % cfgs.bkv_p_cache,
-        col % len(KV_DMA_FIELDS),
-    )
-    seq, k, length, live = (
-        gather(row, idx)
-        for row in (
-            CompactRow.SEQUENCE,
-            CompactRow.KV_TILE,
-            CompactRow.LENGTH,
-            CompactRow.LIVE,
-        )
-    )
-    src = jnp.minimum(
-        seq * cfgs.serve.pages_per_seq + k * cfgs.bkv_p + page[None, :],
-        cfgs.serve.num_page_indices - 1,
-    )
-    dst = jnp.broadcast_to(page[None, :] * cfgs.serve.page_size, src.shape)
-    size = jnp.clip(length - k * cfgs.bkv_sz - dst, 0, cfgs.serve.page_size)
-    dma = jnp.where(
-        live != 0,
-        jnp.where(field[None, :] == 0, src, jnp.where(field[None, :] == 1, dst, size)),
-        0,
-    )
     qcol = jnp.arange(lanes * len(QUERY_DMA_FIELDS))
     dq = jnp.where(
         qcol[None, :] % len(QUERY_DMA_FIELDS) == 0,
@@ -154,7 +128,6 @@ def _kernel(cu_ref, lengths_ref, *out_refs, cfgs, names):
         k_idx=jnp.where(live != 0, lane(CompactRow.KV_TILE), 0),
         is_last_k=last,
         dma_q=dq,
-        dma_kv_cache=dma,
         total_wait_kv_in=kv_count * cfgs.kv_bytes_per_token // RPA_WAIT_ROW_BYTES,
         total_wait_q_in=count * cfgs.q_bytes_per_token // RPA_WAIT_ROW_BYTES,
         total_wait_o_out=outs * cfgs.o_bytes_per_token // RPA_WAIT_ROW_BYTES,
@@ -178,36 +151,96 @@ def generate(
     cfgs: configs.RpaConfigs,
 ) -> schedule.RpaSchedule:
     shape = schedule.BaseMetadataComputer.get_rpa_schedule(cfgs)
-    steps, lanes = cfgs.max_steps_ub, cfgs.batch_size
-    assert steps * lanes >= len(lengths) * pl.cdiv(
+    capacity, lanes = cfgs.max_steps_ub, cfgs.batch_size
+    max_tasks = len(lengths) * pl.cdiv(
         cfgs.serve.pages_per_seq * cfgs.serve.page_size, cfgs.bkv_sz
     )
-    names = field_names(shape)
-    out_shape = [
-        jax.ShapeDtypeStruct(
-            (steps, getattr(shape, name).data.size // steps), jnp.int32
-        )
-        for name in names
-    ]
-    outputs = pl.pallas_call(
-        functools.partial(_kernel, cfgs=cfgs, names=names),
+    assert capacity * lanes >= max_tasks
+    # The shared ABI reserves SMEM capacity, which can greatly exceed this
+    # query bucket's worst-case work. Only expand the reachable schedule rows.
+    vector_rows = pltpu.get_tpu_info().num_sublanes
+    steps = min(capacity, pl.cdiv(pl.cdiv(max_tasks, lanes), vector_rows) * vector_rows)
+    fields = (
+        ("s_idx", shape.s_idx),
+        ("q_idx", shape.q_idx),
+        ("k_idx", shape.k_idx),
+        ("is_last_k", shape.is_last_k),
+        ("do_writeback", shape.do_writeback),
+        ("dma_q", shape.dma_q),
+        ("dma_kv_cache", shape.dma_kv_cache),
+        ("dma_kv_new", shape.dma_kv_new),
+        ("total_wait_kv_in", shape.total_wait_kv_in),
+        ("total_wait_kv_out", shape.total_wait_kv_out),
+        ("total_wait_q_in", shape.total_wait_q_in),
+        ("total_wait_o_out", shape.total_wait_o_out),
+        ("total_wait_lse_out", shape.total_wait_lse_out),
+    )
+    names = tuple(name for name, _ in fields)
+    if names != field_names(shape):
+        raise ValueError("RpaSchedule field order changed")
+    shapes = {
+        name: jax.ShapeDtypeStruct((steps, ref.data.size // capacity), jnp.int32)
+        for name, ref in fields
+    }
+    # Physical page addresses are expanded below; the common fields can be
+    # shared across layers, with task assignment fused into the same kernel.
+    shared_names = tuple(name for name in names if name != "dma_kv_cache")
+    shared_outputs = pl.pallas_call(
+        functools.partial(_kernel, cfgs=cfgs, names=shared_names, steps=steps),
         grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2),
-        out_shape=[*out_shape, jax.ShapeDtypeStruct((1,), jnp.int32)],
+        out_shape=[
+            *(shapes[name] for name in shared_names),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+        ],
         name="qsa_decode_schedule",
     )(cu_q_lens, lengths)
-    outputs = list(outputs)
-    dma_index = names.index("dma_kv_cache")
-    dma = outputs[dma_index].reshape(steps, lanes, cfgs.bkv_p_cache, len(KV_DMA_FIELDS))
-    live = outputs[names.index("s_idx")].reshape(steps, lanes) >= 0
-    sources = pages.reshape(-1)[dma[..., 0]]
-    dma = dma.at[..., 0].set(jnp.where(live[..., None], sources, 0))
-    outputs[dma_index] = dma.reshape(outputs[dma_index].shape)
-    result = {
-        name: dataclasses.replace(getattr(shape, name), data=value.reshape(-1))
-        for name, value in zip(names, outputs)
-    }
-    return dataclasses.replace(
-        shape,
-        **result,
-        actual_steps=outputs[-1],
+    outputs = dict(zip(shared_names, shared_outputs[:-1]))
+    actual_steps = shared_outputs[-1]
+    owners = outputs["s_idx"].reshape(steps, lanes)
+    seq = jnp.maximum(owners, 0)
+    k = outputs["k_idx"].reshape(steps, lanes)
+    live = owners >= 0
+    # Select whole contiguous page windows before expanding their DMA fields.
+    # Scalar gathers from the expanded schedule create one HBM lookup per page
+    # and a strided scatter, even though every task reads adjacent page IDs.
+    page_count = cfgs.serve.pages_per_seq
+    page_tiles = pl.cdiv(page_count, cfgs.bkv_p_cache)
+    window_words = page_tiles * cfgs.bkv_p_cache
+    flat_pages = jnp.pad(pages.reshape(-1), (0, window_words - page_count), mode="edge")
+    windows = jnp.stack(
+        [
+            flat_pages[row * page_count : row * page_count + window_words]
+            for row in range(len(lengths))
+        ]
+    ).reshape(-1, cfgs.bkv_p_cache)
+    physical = windows[seq * page_tiles + jnp.clip(k, 0, page_tiles - 1)]
+    dma_shape = shapes["dma_kv_cache"]
+    # Let XLA fuse physical DMA fields with the contiguous page-window gather.
+    # A separate Pallas call forces these intermediates into HBM for each layer.
+    physical = physical.reshape(steps, lanes, cfgs.bkv_p_cache)
+    dst = jnp.broadcast_to(
+        jnp.arange(cfgs.bkv_p_cache, dtype=jnp.int32) * cfgs.serve.page_size,
+        physical.shape,
+    )
+    size = jnp.clip(
+        lengths[seq, None] - k[..., None] * cfgs.bkv_sz - dst,
+        0,
+        cfgs.serve.page_size,
+    )
+    outputs["dma_kv_cache"] = jnp.where(
+        live[..., None, None], jnp.stack((physical, dst, size), axis=-1), 0
+    ).reshape(dma_shape.shape)
+    return jax.tree.unflatten(
+        jax.tree.structure(shape),
+        [
+            *(
+                jnp.pad(
+                    outputs[name],
+                    ((0, capacity - steps), (0, 0)),
+                    constant_values=-1 if name == "s_idx" else 0,
+                ).reshape(-1)
+                for name in names
+            ),
+            actual_steps,
+        ],
     )

@@ -94,8 +94,8 @@ def decode_kernel(
     gate: jax.Array,
     cfgs: configs.RpaConfigs,
     policy: DecodePolicy,
-) -> tuple[jax.Array, jax.Array]:
-    """Run one bounded, read-only decode schedule; output aliases query/cache."""
+) -> jax.Array:
+    """Run one bounded decode schedule; only query aliases the output."""
     if (
         cfgs.mode != configs.RpaCase.DECODE
         or cfgs.serve.return_lse
@@ -117,9 +117,7 @@ def decode_kernel(
         cache_ref,
         gate_ref,
         out_ref,
-        out_cache_ref,
     ):
-        del out_cache_ref  # The aliased cache is read-only for this entry.
         allocs = kernel.create_allocs(cache_ref, query_ref, None, cfgs)
 
         @pl.with_scoped(
@@ -204,7 +202,7 @@ def decode_kernel(
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     return pl.pallas_call(
         run,
-        out_shape=[query, cache],
+        out_shape=query,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalars),
             in_specs=[
@@ -214,7 +212,7 @@ def decode_kernel(
                 hbm,
                 pl.BlockSpec(gate.shape, lambda *_: (0, 0, 0)),
             ],
-            out_specs=[hbm, hbm],
+            out_specs=hbm,
         ),
         input_output_aliases=output_aliases(scalars, metadata),
         compiler_params=pltpu.CompilerParams(

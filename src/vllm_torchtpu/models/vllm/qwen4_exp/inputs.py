@@ -377,6 +377,9 @@ class Qwen4ExpAdapter:
             if through_handoff:
                 assert runner._pp_wave is not None
                 runner._pp_wave.end_forward(None, num_tokens)
+            # Bound idle prefill work so newly arrived requests do not trail
+            # other DP ranks by several chunks. Keep decode asynchronous.
+            wait_for_output = not dp_lockstep or not runner._dp_step_other_decode
             if dp_lockstep and runner.parallel_config.tensor_parallel_size > 1:
                 # Match the generic runner's idle-DP protocol. The LM head
                 # has a TP collective even when this DP has no live tokens;
@@ -386,9 +389,11 @@ class Qwen4ExpAdapter:
                     dtype=torch.int32,
                     device=out.device,
                 )
-                runner.compute_selected_logits(out, indices)
+                logits = runner.compute_selected_logits(out, indices)
+                if wait_for_output:
+                    synchronize_tensors(logits)
             else:
-                synchronize_tensors(out)
+                synchronize_tensors(out, wait=wait_for_output)
         runner._hidden_states_dtype = out.dtype
         return (
             (time.perf_counter() - started) * 1000
