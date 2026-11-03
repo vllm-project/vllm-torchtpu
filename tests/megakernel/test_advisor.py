@@ -958,6 +958,7 @@ class _SvgTextCollector(HTMLParser):
     """Collect the viewBox and every <text> element's attributes and content."""
 
     def __init__(self) -> None:
+        """Start with no viewBox, no collected text, and no open element."""
         super().__init__()
         self.view_box = ""
         self.texts: list[tuple[dict[str, str], str]] = []
