@@ -137,6 +137,20 @@ def _quantized_matmul_jax(
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
+    return xla_quantized_matmul(
+        x,
+        w_q,
+        w_s,
+        quantize_activation=not _use_w8a16(x, w_q, w8a16_max_rows),
+        split_cols=split_cols,
+        weight_nk=weight_nk,
+        split_head_dim=split_head_dim,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+
+
+def _use_w8a16(x: jax.Array, w_q: jax.Array, w8a16_max_rows: int) -> bool:
     # Rows is static at trace time, so each token bucket picks one path.
     # W8A16 is only measured with FP8 weights; int8 weights keep W8A8.
     rows = x.shape[0]
@@ -150,16 +164,39 @@ def _quantized_matmul_jax(
             rows,
             w8a16_max_rows,
         )
+    return use_w8a16
+
+
+def _quantized_matmul_aux_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    aux_weight: jax.Array,
+    norm_weight: jax.Array,
+    norm_eps: float,
+    w8a16_max_rows: int = 0,
+    split_cols: int = 0,
+    weight_nk: bool = False,
+    split_head_dim: int = 0,
+) -> tuple[jax.Array, jax.Array]:
+    """`_quantized_matmul_jax` of an RMSNorm's input that also returns the
+    normalized input times the bf16 `aux_weight` [n_aux, n_in]."""
+    if x.shape[1] != w_q.shape[0] or w_s.ndim != 1:
+        raise ValueError(
+            f"needs a per-channel (k, n) weight for [m, k] input, got "
+            f"{x.shape=} {w_q.shape=} {w_s.shape=}"
+        )
     return xla_quantized_matmul(
         x,
         w_q,
         w_s,
-        quantize_activation=not use_w8a16,
+        quantize_activation=not _use_w8a16(x, w_q, w8a16_max_rows),
         split_cols=split_cols,
         weight_nk=weight_nk,
         split_head_dim=split_head_dim,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        aux_weight=aux_weight,
     )
 
 
@@ -197,6 +234,47 @@ def _get_quantized_matmul_op() -> Callable:
 
         op.register_fake(_fake_quantized_matmul)
         _quantized_matmul_kernel_op = op
+        return op
+
+
+_quantized_matmul_aux_op: Callable | None = None
+
+
+def _get_quantized_matmul_aux_op() -> Callable:
+    global _quantized_matmul_aux_op
+    if _quantized_matmul_aux_op is not None:
+        return _quantized_matmul_aux_op
+
+    with _quantized_matmul_kernel_op_lock:
+        if _quantized_matmul_aux_op is not None:
+            return _quantized_matmul_aux_op
+
+        op = pallas.jax_op(
+            "pallas::quantized_matmul_aux_kernel", _quantized_matmul_aux_jax
+        )
+
+        def _fake_quantized_matmul_aux(
+            x: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+            aux_weight: torch.Tensor,
+            norm_weight: torch.Tensor,
+            norm_eps: float,
+            w8a16_max_rows: int = 0,
+            split_cols: int = 0,
+            weight_nk: bool = False,
+            split_head_dim: int = 0,
+        ):
+            del w_s, norm_weight, norm_eps, w8a16_max_rows
+            del split_cols, weight_nk, split_head_dim
+            out = torch.empty(x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device)
+            aux = torch.empty(
+                x.shape[0], aux_weight.shape[0], dtype=x.dtype, device=x.device
+            )
+            return out, aux
+
+        op.register_fake(_fake_quantized_matmul_aux)
+        _quantized_matmul_aux_op = op
         return op
 
 
@@ -241,6 +319,35 @@ def quantized_matmul(
         norm_eps,
     )
     return out_2d.reshape(orig_out_shape)
+
+
+def quantized_matmul_with_aux(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    aux_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    w8a16_max_rows: int = 0,
+    split_cols: int = 0,
+    weight_nk: bool = False,
+    split_head_dim: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`quantized_matmul` of a 2-D RMSNorm input (per-channel weight only)
+    that also returns the normalized input times the bf16 `aux_weight`
+    `[n_aux, n_in]`, computed in the same kernel from the same VMEM copy."""
+    return _get_quantized_matmul_aux_op()(
+        x,
+        w_q,
+        w_s,
+        aux_weight,
+        norm_weight,
+        norm_eps,
+        w8a16_max_rows,
+        split_cols,
+        weight_nk,
+        split_head_dim,
+    )
 
 
 def _quantized_matmul_fp4_jax(

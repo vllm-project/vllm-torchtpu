@@ -92,6 +92,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     SPLIT_OUTPUT_HEAD_DIM_ATTR,
     WEIGHT_FLIPPED_ATTR,
     quantized_matmul,
+    quantized_matmul_with_aux,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -1669,17 +1670,29 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             f"requant_block_size={scale_desc}"
         )
 
+    @staticmethod
+    def _runtime_weight(layer: TpuLinear) -> torch.Tensor:
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
+            # takes the canonical (k, n), so flip the view for the contraction.
+            return layer.weight.transpose(0, 1)
+        return layer.weight
+
+    @staticmethod
+    def _output_layout(layer: TpuLinear) -> dict:
+        # How the FP8 kernel lays out the output for this layer's consumer,
+        # and whether it reads the weight as stored ([n_out, n_in]).
+        return {
+            "split_cols": getattr(layer, SPLIT_OUTPUT_ATTR, 0),
+            "weight_nk": getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False),
+            "split_head_dim": getattr(layer, SPLIT_OUTPUT_HEAD_DIM_ATTR, 0),
+        }
+
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         layer = cast("TpuLinear", layer)
-        weight = layer.weight
-        keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
-        if keep_vllm_layout:
-            # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
-            # takes the canonical (k, n), so flip the view for the contraction.
-            # `weight_nk` below has the FP8 kernel read it as stored.
-            weight = weight.transpose(0, 1)
+        weight = self._runtime_weight(layer)
         if isinstance(layer, VocabParallelEmbedding):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
@@ -1690,15 +1703,32 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 weight,
                 layer.weight_scale,
                 w8a16_max_rows=self.w8a16_max_rows,
-                split_cols=getattr(layer, SPLIT_OUTPUT_ATTR, 0),
-                weight_nk=keep_vllm_layout,
-                split_head_dim=getattr(layer, SPLIT_OUTPUT_HEAD_DIM_ATTR, 0),
+                **self._output_layout(layer),
                 norm_weight=None if norm is None else norm.consumer_weight(),
                 norm_eps=0.0 if norm is None else norm.variance_epsilon,
             )
         if bias is not None:
             out = out + bias
         return out
+
+    def apply_with_aux(
+        self, layer: torch.nn.Module, x: torch.Tensor, aux_weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`apply` for a bias-free per-channel layer with INPUT_RMS_NORM_ATTR
+        and 2-D `x`, also returning the normalized `x` times the bf16
+        `aux_weight` [n_aux, n_in] from the same kernel."""
+        layer = cast("TpuLinear", layer)
+        norm = getattr(layer, INPUT_RMS_NORM_ATTR)
+        return quantized_matmul_with_aux(
+            x,
+            self._runtime_weight(layer),
+            layer.weight_scale,
+            aux_weight,
+            norm.consumer_weight(),
+            norm.variance_epsilon,
+            w8a16_max_rows=self.w8a16_max_rows,
+            **self._output_layout(layer),
+        )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         layer = cast("TpuLinear", layer)

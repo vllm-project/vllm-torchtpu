@@ -26,7 +26,10 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -55,9 +58,11 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnInterleavedColumnParallelLinear,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    INPUT_RMS_NORM_ATTR,
     KEEP_VLLM_LAYOUT_ATTR,
     SPLIT_OUTPUT_ATTR,
     SPLIT_OUTPUT_HEAD_DIM_ATTR,
+    WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
@@ -431,6 +436,41 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         assert self._bm_region is not None
         pool_index, layout = self._bm_region
         return flat_manager_ids(ids, pool_index, layout.num_pools)
+
+    def fold_input_norm(self, norm: torch.nn.Module) -> bool:
+        """Take `norm`'s input instead of its output: in_proj_qkvz, whose
+        linear method the caller has checked honors INPUT_RMS_NORM_ATTR,
+        normalizes it in its FP8 kernel and computes in_proj_ba from the same
+        normalized rows. Returns False, changing nothing, if this layer's
+        projections cannot."""
+        qkvz = getattr(self, "in_proj_qkvz", None)
+        ba = getattr(self, "in_proj_ba", None)
+        if (
+            self._pcp_streaming_configured
+            or hasattr(self, "in_proj_qkv")
+            or qkvz is None
+            or qkvz.bias is not None
+            or qkvz.weight_scale.ndim != 1
+            or ba is None
+            or not isinstance(ba.quant_method, UnquantizedLinearMethod)
+            or ba.bias is not None
+            or ba.weight.dtype != torch.bfloat16
+        ):
+            return False
+        # Not registered as a submodule: the weight keeps its one name.
+        object.__setattr__(qkvz, INPUT_RMS_NORM_ATTR, norm)
+        return True
+
+    def _project_normed_qkvz_ba(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # See fold_input_norm; ba takes its weight as [n_out, n_in].
+        ba_weight = self.in_proj_ba.weight
+        if getattr(self.in_proj_ba, WEIGHT_FLIPPED_ATTR, False):
+            ba_weight = ba_weight.transpose(0, 1)
+        return self.in_proj_qkvz.quant_method.apply_with_aux(
+            self.in_proj_qkvz, hidden_states, ba_weight
+        )
 
     @property
     def tp_head_geometry(self) -> GdnHeadGeometry:
@@ -1156,8 +1196,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             b = b.contiguous()
             a = a.contiguous()
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            if getattr(self.in_proj_qkvz, INPUT_RMS_NORM_ATTR, None) is not None:
+                mixed_qkvz, ba = self._project_normed_qkvz_ba(hidden_states)
+            else:
+                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                ba, _ = self.in_proj_ba(hidden_states)
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].
             qkv_size = self.tp_head_geometry.local_conv_dim(

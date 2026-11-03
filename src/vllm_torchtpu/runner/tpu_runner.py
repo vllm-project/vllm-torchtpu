@@ -5572,6 +5572,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (
+            _get_quantized_matmul_aux_op,
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
         )
@@ -5579,6 +5580,7 @@ class TPUModelRunner(GPUModelRunner):
         with set_current_vllm_config(self.vllm_config):
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
             _get_quantized_matmul_op()
+            _get_quantized_matmul_aux_op()
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
 

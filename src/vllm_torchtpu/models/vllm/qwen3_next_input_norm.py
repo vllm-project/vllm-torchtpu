@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Move Qwen3-Next / Qwen3.5 input RMSNorms into the FP8 qkv projection.
+"""Move Qwen3-Next / Qwen3.5 input RMSNorms into the FP8 input projections.
 
-A full-attention decoder layer's input norm feeds nothing but
-``self_attn.qkv_proj``. When that runs the FP8 linear method, it can
-normalize its own input inside the matmul kernel (``INPUT_RMS_NORM_ATTR``),
-and the norm then only adds the residual, so the normalized activation is
-never written to HBM.
+A decoder layer's input norm feeds nothing but its attention's input
+projections. When those run the FP8 linear method, they can normalize their
+own input inside the matmul kernel (``INPUT_RMS_NORM_ATTR``), and the norm
+then only adds the residual, so the normalized activation is never written to
+HBM.
 """
 
 import torch
@@ -26,6 +26,9 @@ from vllm.model_executor.models.qwen3_next import (
     Qwen3NextDecoderLayer,
 )
 
+from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+    VllmGatedDeltaNetAttention,
+)
 from vllm_torchtpu.layers.adapter.layernorm import TpuGemmaRMSNorm
 from vllm_torchtpu.layers.adapter.linear_common import INPUT_RMS_NORM_ATTR
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
@@ -39,8 +42,8 @@ def _runs_fp8(proj: torch.nn.Module | None) -> bool:
 
 
 def _fold(layer: Qwen3NextDecoderLayer, norm: TpuGemmaRMSNorm) -> bool:
-    # Exact attention type: a subclass may read `hidden_states` beyond the
-    # projection that normalizes it.
+    # Exact attention types: a subclass may read `hidden_states` beyond the
+    # projections that normalize it.
     if layer.layer_type == "full_attention":
         attn = layer.self_attn
         if type(attn) is not Qwen3NextAttention or not _runs_fp8(attn.qkv_proj):
@@ -48,6 +51,13 @@ def _fold(layer: Qwen3NextDecoderLayer, norm: TpuGemmaRMSNorm) -> bool:
         # Not registered as a submodule: the weight keeps its one name.
         object.__setattr__(attn.qkv_proj, INPUT_RMS_NORM_ATTR, norm)
         return True
+    if layer.layer_type == "linear_attention":
+        attn = layer.linear_attn
+        if type(attn) is not VllmGatedDeltaNetAttention:
+            return False
+        return _runs_fp8(getattr(attn, "in_proj_qkvz", None)) and (
+            attn.fold_input_norm(norm)
+        )
     return False
 
 
@@ -66,5 +76,5 @@ def fold_input_norms(model: torch.nn.Module) -> int:
             norm.defer_to_consumers()
             folded += 1
     if folded:
-        logger.info("Folded %d input RMSNorms into FP8 qkv projections.", folded)
+        logger.info("Folded %d input RMSNorms into FP8 input projections.", folded)
     return folded
