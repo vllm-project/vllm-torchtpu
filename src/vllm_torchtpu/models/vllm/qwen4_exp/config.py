@@ -438,7 +438,9 @@ def validate_config(cfg):
             "Qwen4Exp requires HC, sigmoid gates, SiLU and unbiased "
             "projections with valid top-k"
         )
-    if t.decoder_sparse_step != 1 or t.mlp_only_layers:
+    # transformers >= 5.19 ships Qwen4ExpTextConfig without these two fields
+    # (the checkpoint does not set them); their absence means MoE everywhere.
+    if getattr(t, "decoder_sparse_step", 1) != 1 or getattr(t, "mlp_only_layers", None):
         raise ValueError(
             "Qwen4Exp TPU currently requires routed MoE in every decoder layer"
         )
