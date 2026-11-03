@@ -7,6 +7,7 @@ from collections.abc import Callable
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     pooled_qsa_rows_step,
     pooled_qsa_shard_attend_rows_step,
