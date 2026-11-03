@@ -77,6 +77,7 @@ LAYOUT=tp32dcp8 GLOBAL_SEQS=96 "$PYTHON_BIN" bench_sweep.py --stage <arm> --inpu
 | `ASYNC_SCHED` | 1 | `--async-scheduling` on/off |
 | `FUSED_EP` | 0 | `1` = `MOE_FUSED_EP_KERNEL_IMPL=adaptive MOE_FUSED_EP_KERNEL_MIN_TOKENS=1`: one fused program per MoE layer instead of all-gather + grouped matmul + reduce-scatter |
 | `BLOCK_SIZE` | 384 | `--block-size` |
+| `HOT_SET` | | simulated routing for profiling: `uniform` = balanced; `16:0.3` = 30% of tokens route only into 16 fixed experts (per-expert load CV 1.67, one EP rank 10x loaded); `16:0.3:spread` = the same skew with one hot expert per rank (balanced control). Dummy weights route near-uniformly, so expert imbalance is invisible without this |
 | `EXTRA_ARGS` | | appended to `vllm serve` |
 
 Compile sizes are derived: `[max-num-seqs, max-num-seqs * (MTP_K + 1), MNBT]`.
