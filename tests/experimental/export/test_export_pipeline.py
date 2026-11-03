@@ -2478,3 +2478,40 @@ def test_validator_rejects_mtp_draft_missing_a_bucket(tmp_path) -> None:
     meta_path.write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="exports no mtp_draft"):
         validator.validate_exported_model_dir(out_dir)
+
+
+def test_a_row_parallel_layer_selects_its_input_slice_by_a_per_rank_constant() -> None:
+    """A RowParallelLinear that splits its input picks its rank's slice in-graph."""
+    from vllm.model_executor.layers.linear import RowParallelLinear
+
+    seen: list[torch.Tensor] = []
+
+    class Layer(RowParallelLinear):
+        def __init__(self) -> None:
+            nn.Module.__init__(self)
+            self.input_is_parallel = False
+            self.bias = None
+            self.skip_bias_add = False
+            self.weight = nn.Parameter(torch.zeros(1))
+
+        def forward(self, input_):  # type: ignore[override]
+            assert self.input_is_parallel
+            seen.append(input_)
+            return input_
+
+    model = nn.Module()
+    model.down = Layer()
+    with (
+        mock.patch("vllm.distributed.model_parallel_is_initialized", return_value=True),
+        mock.patch(
+            "vllm.distributed.get_tensor_model_parallel_world_size", return_value=4
+        ),
+        mock.patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=2),
+    ):
+        assert universal_adapter._patch_row_parallel_input_split(model) == 1
+    # The rank is a buffer, a per-device constant, not a Python int in the trace.
+    assert model.down.export_tp_rank.tolist() == [2]
+    x = torch.arange(16.0).reshape(2, 8)
+    model.down(x)
+    torch.testing.assert_close(seen[0], x[:, 4:6])
+    assert model.down.input_is_parallel is False
