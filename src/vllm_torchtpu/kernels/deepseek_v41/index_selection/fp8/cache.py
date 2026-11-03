@@ -117,7 +117,8 @@ def write_fp8_records(
     bases, order = jax.lax.sort_key_val(
         jnp.where(valid, bases, total_rows), jnp.arange(count, dtype=jnp.int32)
     )
-    columns, values = prepare_sorted_fp8(keys, columns, order)
+    _, scales, _ = quantize_index_rows(keys)
+    columns, values = prepare_sorted_fp8(keys, columns, order, scales)
     batch = min(count, PACKED_FP8_WRITE_BATCH)
     bases = jnp.pad(bases, (0, -count % batch + 1), constant_values=total_rows)
     return _write_sorted_packed_pages(

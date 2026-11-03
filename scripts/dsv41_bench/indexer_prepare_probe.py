@@ -24,8 +24,12 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.prepare import (  # 
 )
 
 
-def native(keys, columns, order):
-    q, s, _ = cache.quantize_index_rows(keys)
+def native(keys, columns, order, scales=None):
+    if scales is None:
+        q, s, _ = cache.quantize_index_rows(keys)
+    else:
+        s = scales
+        q = (keys.astype(jnp.float32) / s[:, None]).astype(jnp.float8_e4m3fn)
     bits = (
         jax.lax.bitcast_convert_type(q, jnp.uint8)
         .astype(jnp.uint32)
@@ -41,12 +45,13 @@ def native(keys, columns, order):
     return jnp.pad(columns[order], (0, 96)), jnp.pad(values[order].T, ((0, 0), (0, 96)))
 
 
-def reference(keys, columns, order):
+def reference(keys, columns, order, scales=None):
     values = keys.astype(np.float32)
     exponent = np.ceil(
         np.log2(np.maximum(np.abs(values).max(1), np.float32(1e-4)) / np.float32(448))
     ).astype(np.int32)
-    scales = np.exp2(exponent).astype(np.float32)
+    if scales is None:
+        scales = np.exp2(exponent).astype(np.float32)
     bits = (
         (values / scales[:, None])
         .astype(ml_dtypes.float8_e4m3fn)
@@ -70,7 +75,12 @@ def main():
     rng = np.random.default_rng(137)
     columns = rng.integers(0, 256, 288, dtype=np.int32)
     order = rng.permutation(288).astype(np.int32)
-    functions = {"native": jax.jit(native), "candidate": jax.jit(prepare_sorted_fp8)}
+
+    def candidate(keys, columns, order):
+        _, scales, _ = cache.quantize_index_rows(keys)
+        return prepare_sorted_fp8(keys, columns, order, scales)
+
+    functions = {"native": jax.jit(native), "candidate": jax.jit(candidate)}
     results = []
     for kind in (
         "normal",
@@ -144,6 +154,28 @@ def main():
                 for a, b in zip(outputs["native"], outputs["candidate"], strict=True)
             ],
         }
+        # Full composition keeps original encoded semantics, including known
+        # scale-producer boundary rounding. New work is checked independently
+        # at its explicit (keys, columns, order, scales) contract below.
+        assert result["native_candidate_mismatches"] == [0, 0], result
+        fixture_scales = np.empty(288, np.float32)
+        fixture_scales[order] = expected[1][32, :288].copy().view(np.float32)
+        for factor in (1, 2):
+            provided = fixture_scales * factor
+            expected_cut = reference(keys, columns, order, provided)
+            for fn in (jax.jit(native), jax.jit(prepare_sorted_fp8)):
+                actual_cut = jax.block_until_ready(
+                    fn(
+                        jnp.asarray(keys),
+                        jnp.asarray(columns),
+                        jnp.asarray(order),
+                        jnp.asarray(provided),
+                    )
+                )
+                for a, e in zip(actual_cut, expected_cut, strict=True):
+                    np.testing.assert_array_equal(np.asarray(a), e)
+        result["explicit_scale_cut_three_way_byte_exact"] = True
+        result["explicit_scale_fixtures"] = 2
         if not result["three_way_byte_exact"]:
 
             def decode(words):
