@@ -305,6 +305,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PROPOSE_DEVICE_CONSTANTS: bool = False
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    VLLM_TPU_SAMPLER_CANDIDATES_ONLY: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -1832,6 +1833,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
         "TPU_SAMPLER_TOPK_CANDIDATES", 0
     ),
+    # With TPU_SAMPLER_TOPK_CANDIDATES in use: run the non-greedy rejection
+    # sampler on the candidate logits only, instead of masking, normalizing
+    # and arg-maxing full-vocab rows. Same uniforms; probabilities can differ
+    # in the last bit (softmax normalizer summed in another order).
+    "VLLM_TPU_SAMPLER_CANDIDATES_ONLY": env_bool("VLLM_TPU_SAMPLER_CANDIDATES_ONLY"),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
