@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
+    VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
     VLLM_TPU_QSA_DCP_Q_GATHER: bool = False
     VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
@@ -772,6 +773,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split the same way; each rank scores its owned groups and the pair merges
     # the local top-k lists into the exact global selection.
     "VLLM_TPU_QSA_COMPRESSED_DCP": env_bool("VLLM_TPU_QSA_COMPRESSED_DCP"),
+    # Prefill HC full mix: take the up projection as its [low rank, width]
+    # transpose. The checkpoint weight is held column-major, so the transpose
+    # is a bitcast and the per-call relayout copy before the kernel goes away
+    # (bit-identical).
+    "VLLM_TPU_HC_PREFILL_UP_T": env_bool("VLLM_TPU_HC_PREFILL_UP_T"),
     # With VLLM_TPU_QSA_MAIN_KV_DCP: the pair exchanges each rank's heads of
     # the partial attention (all-to-all) instead of all-gathering every
     # partial; half the bytes, bit-identical.

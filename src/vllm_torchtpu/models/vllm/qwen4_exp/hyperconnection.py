@@ -61,11 +61,13 @@ class GatedResidual(common_hc.GatedResidual):
         ):
             from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_full_mix_op
 
+            self._prefill_full_up_t = envs.VLLM_TPU_HC_PREFILL_UP_T
             self._prefill_full_op = build_full_mix_op(
                 self.hc_count,
                 self.hidden_size,
                 self.hc_norm.variance_epsilon,
                 prefill_full_tile,
+                self._prefill_full_up_t,
             )
         if prefill_norm_tile and self.config.hc_per_branch_norm:
             from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_norm_op
@@ -212,11 +214,12 @@ class GatedResidual(common_hc.GatedResidual):
             and self.input_mix_weight_down.weight.dtype == torch.bfloat16
             and self.input_mix_weight_up.weight.dtype == torch.bfloat16
         ):
+            up = self.input_mix_weight_up.weight
             mixed, norm = self._prefill_full_op(
                 hyper_input,
                 self.hc_norm.weight,
                 self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                up.t() if self._prefill_full_up_t else up,
             )
             return mixed, self._residual(hyper_input, norm)
         norm = self._normalize(hyper_input, small_rows)

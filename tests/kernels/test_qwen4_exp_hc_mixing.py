@@ -85,3 +85,35 @@ def test_hc_staged_and_full_mix_match_cpu_reference(tokens):
             np.vdot(a.ravel(), e.ravel()) / (np.linalg.norm(a) * np.linalg.norm(e))
             >= 0.999
         )
+
+
+def _full_mix_up_t_matches(device):
+    arrays = tuple(
+        jax.device_put(jnp.asarray(a, jnp.bfloat16), device) for a in inputs(256)
+    )
+    x, weight, down, up = arrays
+    static = dict(branches=4, hidden=128, eps=1e-6, token_tile=128)
+    expected = _full_mix(x, weight, down, up, **static)
+    actual = _full_mix(x, weight, down, up.T, **static, up_t=True)
+    for a, e in zip(actual, expected):
+        np.testing.assert_array_equal(
+            np.asarray(a).view(np.uint16), np.asarray(e).view(np.uint16)
+        )
+
+
+def test_full_mix_transposed_up_is_bit_identical_interpret():
+    from jax.experimental import pallas as pl
+
+    real = pl.pallas_call
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(pl, "pallas_call", functools.partial(real, interpret=True))
+        _full_mix.clear_cache()
+        try:
+            _full_mix_up_t_matches(jax.devices("cpu")[0])
+        finally:
+            _full_mix.clear_cache()
+
+
+@pytest.mark.tpu_test
+def test_full_mix_transposed_up_is_bit_identical():
+    _full_mix_up_t_matches(jax.devices("tpu")[0])

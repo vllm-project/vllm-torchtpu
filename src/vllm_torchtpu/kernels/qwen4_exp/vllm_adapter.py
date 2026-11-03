@@ -30,7 +30,10 @@ def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
 
 
 @functools.cache
-def build_full_mix_op(branches: int, hidden: int, eps: float, token_tile: int):
+def build_full_mix_op(
+    branches: int, hidden: int, eps: float, token_tile: int, up_t: bool = False
+):
+    """``up_t``: the op takes the up projection as its [low rank, width] transpose."""
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
 
     def core(
@@ -45,10 +48,12 @@ def build_full_mix_op(branches: int, hidden: int, eps: float, token_tile: int):
             hidden=hidden,
             eps=eps,
             token_tile=token_tile,
+            up_t=up_t,
         )
 
     op = pallas.jax_op(
-        f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}_v1",
+        f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"{'_upt' if up_t else ''}_v1",
         core,
     )
 
