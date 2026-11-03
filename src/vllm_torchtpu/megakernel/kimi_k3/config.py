@@ -116,6 +116,18 @@ class KernelConfig:
     # With pair tiles: poll the reduce ring every this many tiles (0: per
     # pair_tiles).
     prefill_moe_poll_every: int = 0
+    # Prefill KDA chunk sub-block (rows per decay anchor): 16, or 32 (one
+    # matmul fewer per 16 rows; factors up to exp(80)).
+    prefill_kda_sub_block: int = 16
+    # Prefill KDA layer: rings in half-stripe segments, balanced over the
+    # phases (``_kda_ring_schedule``) instead of one block per ring a phase.
+    prefill_kda_ring_balance: bool = False
+    # Prefill KDA layer: the window all-gather carries unit-RMS E4M3FN rows
+    # (half the bytes); each KDA tile applies the norm weight. Changes numerics.
+    prefill_kda_fp8_gather: bool = False
+    # Prefill KDA layer diagnostics (invalid results, timing only): no_tiles,
+    # no_rings, no_gather, no_reduce, no_chunk skip that part of the layer.
+    prefill_kda_diag: tuple[str, ...] = ()
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.
@@ -164,6 +176,11 @@ class KernelConfig:
             raise ValueError("fp8_wires holds t0 and/or t10")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
+        if self.prefill_kda_sub_block not in (16, 32):
+            raise ValueError("prefill_kda_sub_block is 16 or 32")
+        if not set(self.prefill_kda_diag) <= {
+            "no_tiles", "no_rings", "no_gather", "no_reduce", "no_chunk"}:
+            raise ValueError("unknown prefill_kda_diag entry")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
             raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):

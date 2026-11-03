@@ -407,6 +407,12 @@ def run_prefill(args, records: harness.Records) -> None:
                 bridge.materialize(stepped.tokens)
                 elapsed = 1e3 * (time.perf_counter() - started)
             first_tokens.append(stepped.tokens[:count, 0].cpu().tolist())
+            if harness.rank() == 0:
+                # Correctness fingerprint: first tokens and a checksum of every KV pool.
+                sums = [float(tensor.float().abs().sum().cpu()) for tensor in pools.tensors]
+                harness.log(f"fingerprint {tag} repeat {repeat}: tokens "
+                            f"{stepped.tokens.cpu().tolist()} pools "
+                            f"{' '.join(f'{x:.6e}' for x in sums)}")
             if repeat:
                 times.append(elapsed)
         ms = statistics.median(times)
