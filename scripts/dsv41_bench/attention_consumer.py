@@ -88,6 +88,9 @@ def main():
     parser.add_argument("--samples", type=int, default=200)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument("--integration", choices=("bridge", "caller"))
+    parser.add_argument("--int64-positions", action="store_true")
+    parser.add_argument("--state-capacity", type=int, choices=(8, 16), default=16)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     import torch
@@ -198,6 +201,19 @@ def main():
         b.copy_(high)
         return latent, words, scales, valid
 
+    if args.integration:
+        from attention_integration import (
+            bridge_candidate,
+            caller_functions,
+            production_ops,
+        )
+
+        ops = production_ops(mesh)
+        if args.integration == "caller":
+            original, candidate = caller_functions(ops, args.state_capacity)
+        else:
+            candidate = bridge_candidate(ops)
+
     functions = {
         "native": torch.compile(original, backend="tpu", fullgraph=True, dynamic=False),
         "packed": torch.compile(
@@ -218,7 +234,14 @@ def main():
             "Torch native metadata or packed + unchanged compressor + state copy_; "
             "external valid mask for publish/index is also live"
         ),
-        "geometry": {"capacity": 16, "stride": 16, "offset": 0, "bank_rows": ROWS},
+        "integration": args.integration,
+        "int64_positions": args.int64_positions,
+        "geometry": {
+            "capacity": args.state_capacity,
+            "stride": args.state_capacity,
+            "offset": 0,
+            "bank_rows": ROWS,
+        },
         "source_sha256": {
             str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in (
@@ -239,6 +262,20 @@ def main():
             "dense JAX encoding mismatch also recorded"
         ),
     }
+
+    if args.integration:
+        sources = (
+            "scripts/dsv41_bench/attention_integration.py",
+            "src/vllm_torchtpu/kernels/experimental/decode_preparation.py",
+            "src/vllm_torchtpu/models/vllm/deepseek_v41/v2/preprocess_ops.py",
+            "src/vllm_torchtpu/models/vllm/deepseek_v41/v2/attention.py",
+        )
+        result["source_sha256"].update(
+            {
+                name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+                for name in sources
+            }
+        )
 
     def save():
         (args.out / "results.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -261,9 +298,10 @@ def main():
 
     def inputs(kind):
         arrays = fixture(kind)
-        return arrays, tuple(
-            torch.from_numpy(a).to("tpu") for a in arrays
-        ) + compute + banks
+        tensors = [torch.from_numpy(a).to("tpu") for a in arrays]
+        if args.int64_positions:
+            tensors[2] = tensors[2].to(torch.int64)
+        return arrays, tuple(tensors) + compute + banks
 
     cases = (
         ("decode",)
@@ -274,7 +312,10 @@ def main():
         arrays, values = inputs(kind)
         table, starts, pos, minimum = arrays
         prev, valid, write, read = reference(
-            (table, starts, starts, pos, minimum), 16, 16, 0
+            (table, starts, starts, pos, minimum),
+            args.state_capacity,
+            args.state_capacity,
+            0,
         )
         initial_previous = np.zeros((288, 1024), np.float32)
         initial_previous[read >= 0] = INITIAL
@@ -295,6 +336,11 @@ def main():
         dense_expected[1][valid[:, 0] == 0] = 0
         cpu_words, cpu_scales = encode_reference_cpu(dense_expected[0], rope, valid)
         expected = [dense_expected[0], cpu_words, cpu_scales, dense_expected[3]]
+        if args.integration == "caller":
+            slots = np.where(np.arange(288) < starts[-1], (pos // 2) % 64, -1)
+            main_records = np.where(valid[:, 0] != 0, slots, -1)
+            expected += [main_records, slots]
+            dense_expected += [main_records, slots]
         score = np.asarray(score)
         rows = np.flatnonzero(write >= 0)
         assert np.unique(write[rows]).size == rows.size
@@ -311,6 +357,7 @@ def main():
                 outputs[2].cpu().numpy(),
                 outputs[3].cpu().numpy(),
             ]
+            actual += [x.cpu().numpy() for x in outputs[4:]]
             mismatches = []
             for i, (a, b) in enumerate(zip(actual, expected, strict=True)):
                 mismatches.append(int(np.count_nonzero(a != b)))
@@ -387,7 +434,12 @@ def main():
 
     arrays, values = inputs("decode")
     table, starts, pos, minimum = arrays
-    _, _, write, read = reference((table, starts, starts, pos, minimum), 16, 16, 0)
+    _, _, write, read = reference(
+        (table, starts, starts, pos, minimum),
+        args.state_capacity,
+        args.state_capacity,
+        0,
+    )
     assert not np.intersect1d(write[write >= 0], read[read >= 0]).size
     reset()
 
