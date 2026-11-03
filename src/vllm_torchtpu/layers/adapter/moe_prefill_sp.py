@@ -332,6 +332,20 @@ def own_rows(x: torch.Tensor, rank: torch.Tensor, tp: int) -> torch.Tensor:
     return rows.index_select(0, rank.view(1)).view(x.shape[0] // tp, *x.shape[1:])
 
 
+def bind_token_count(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """The full stream `x` `[T, ...]` viewed at `num_tokens` rows: no data
+    moves, but the view equates the stream's traced row count with it.
+
+    The backend compiles each bucket by re-tracing the graph with its integer
+    inputs as fresh symbols (aot_autograd under the ShapeEnv
+    `TpuCompilerAdaptor._run_backend` installs), so a size computed from them
+    (`own_rows`' `T // tp`) is concrete there only once an op equates them with
+    a tensor dimension. A replicated layer before the split does so in passing;
+    on the first layer (TPU_MLA_PREFILL_ROWS_DENSE) nothing had, and the rows
+    block's `new_ones(rows, n)` failed to lower."""
+    return x.view(num_tokens, *x.shape[1:])
+
+
 def all_rows(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
     # narrow, not [:n]: keeps the token dim the traced symbol itself.
     return tensor_model_parallel_all_gather(x, 0).narrow(0, 0, num_tokens)
@@ -399,6 +413,8 @@ def _rows_layer_forward(
     tp = _check_divides(num_tokens)
     rank = fused_moe_ep.rank_operand()
     sharded_in = hidden_states.shape[0] != num_tokens
+    if not sharded_in:
+        hidden_states = bind_token_count(hidden_states, num_tokens)
     if residual is None:
         residual = hidden_states
         hidden_states = layer.input_layernorm(hidden_states)

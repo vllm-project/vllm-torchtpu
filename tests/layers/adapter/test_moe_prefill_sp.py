@@ -98,6 +98,79 @@ def test_own_rows_are_the_rank_s_contiguous_slice(rank):
     torch.testing.assert_close(got, x[rank * t : (rank + 1) * t])
 
 
+def _bucket_new_ones_sizes(fn, *args) -> list:
+    """The size lists of `fn`'s `new_ones` as the backend compiles one bucket:
+    Dynamo traces with every token count symbolic, the backend gets concrete
+    inputs and re-traces them with aot_autograd under a ShapeEnv
+    (`TpuCompilerAdaptor._run_backend`), which makes integer inputs symbols.
+    Written against torch 2.14 (aot_autograd's `process_inputs`); if a torch
+    bump breaks it, compare with `_run_backend` first."""
+    from torch._functorch.aot_autograd import aot_module_simplified
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    bucket = args[0].shape[0]
+    sizes = []
+
+    def concrete(v):
+        if not isinstance(v, torch.SymInt):
+            return v
+        expr = v.node.expr
+        return int(expr.subs({s: bucket for s in expr.free_symbols}))
+
+    def record(graph, _inputs):
+        sizes.extend(
+            n.args[1]
+            for n in graph.graph.nodes
+            if n.target is torch.ops.aten.new_ones.default
+        )
+        return graph.forward
+
+    def backend(gm, example_inputs):
+        mode = FakeTensorMode(shape_env=ShapeEnv())
+        with mode:
+            inputs = [
+                torch.empty([concrete(d) for d in v.shape], dtype=v.dtype)
+                if isinstance(v, torch.Tensor)
+                else concrete(v)
+                for v in example_inputs
+            ]
+        with torch._guards.tracing(torch._guards.TracingContext(mode)):
+            aot_module_simplified(gm, inputs, fw_compiler=record)
+        return gm.forward
+
+    torch._dynamo.reset()
+    for a in args:
+        torch._dynamo.mark_dynamic(a, 0)
+    with torch.no_grad():
+        torch.compile(fn, backend=backend, fullgraph=True)(*args)
+    return sizes
+
+
+@pytest.mark.parametrize("bind", [False, True])
+def test_the_bound_stream_s_rows_are_concrete_in_a_bucket_compile(bind):
+    """An allocation sized by `own_rows` of the embedding (the first layer on
+    rows) lowers only with a concrete row count; unbound it is symbolic."""
+    tp, bucket = 4, 64
+    weight = torch.randn(32, 8)
+    rank = torch.tensor([[1]], dtype=torch.int32)
+
+    def stream(input_ids, positions):
+        x = torch.nn.functional.embedding(input_ids, weight)
+        if bind:
+            x = sp.bind_token_count(x, positions.shape[0])
+        rows = sp.own_rows(x, rank, tp)
+        return rows.new_ones(rows.shape[0], 2)
+
+    (size,) = _bucket_new_ones_sizes(
+        stream, torch.zeros(bucket, dtype=torch.long), torch.arange(bucket)
+    )
+    if bind:
+        assert size == [bucket // tp, 2]
+    else:
+        assert isinstance(size[0], torch.fx.Node)
+
+
 @pytest.mark.parametrize(
     "flag,tag,tokens,want",
     [
