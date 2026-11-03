@@ -1181,6 +1181,7 @@ def _effective_row_lengths(
         "topk_backend",
         "decode_passes",
         "hoist_step_metadata",
+        "tile_aligned_scores",
     ),
 )
 def streamindex_topk(
@@ -1213,8 +1214,14 @@ def streamindex_topk(
     topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
     decode_passes: bool = True,
     hoist_step_metadata: bool = False,
+    tile_aligned_scores: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
+
+    ``tile_aligned_scores=True`` rounds each token's score rows up to a whole
+    (8, 128) int32 tile. The HBM scores are then the row-major flat array the
+    SparseCore top-k reads, so handing them over is a bitcast instead of a
+    relayout copy; the padding is past every ``row_lengths`` and never read.
 
     ``hoist_step_metadata=True`` builds the step-level metadata (and the pass
     schedules of a single-chunk call) outside the early-exit ``lax.cond``, so
@@ -1399,6 +1406,8 @@ def streamindex_topk(
         align_to(pages_per_seq, bkv_p) * page_size // 128
         for bkv_p in num_kv_pages_per_blocks
     )
+    if tile_aligned_scores:
+        num_sublanes_total = align_to(num_sublanes_total, 8)
 
     def _block_sizes(num_queries_per_block, bkv_p, static_q_len):
         """Query and KV block sizes a pass runs with."""
