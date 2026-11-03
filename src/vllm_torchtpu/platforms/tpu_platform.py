@@ -33,6 +33,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.dp_lb_exact_inflight import check_api_server_count
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.platforms.dp_pipeline_validation import validate_dp_pipeline_config
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -794,6 +795,7 @@ class TpuPlatform(Platform):
                 "USE_MOE_FUSED_EP_KERNEL=1."
             )
         check_api_server_count(vllm_config.parallel_config)
+        validate_dp_pipeline_config(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
@@ -1206,6 +1208,7 @@ class TpuPlatform(Platform):
                 )
 
         _configure_prefill_first_scheduler(vllm_config)
+        _configure_dp_pipeline_scheduler(vllm_config)
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
@@ -1464,6 +1467,25 @@ def _configure_prefill_first_scheduler(vllm_config: VllmConfig) -> None:
         )
     scheduler_config.scheduler_cls = SCHEDULER_CLS
     logger.info("Enabled PrefillFirstScheduler.")
+
+
+def _configure_dp_pipeline_scheduler(vllm_config: VllmConfig) -> None:
+    """Install DpPipelineScheduler for TPU_DP_PIPELINE_PREFILL: every engine of
+    a pipeline must run each of its chunks alone and cut the same chunks."""
+    if not envs.TPU_DP_PIPELINE_PREFILL:
+        return
+    from vllm_torchtpu.core.dp_pipeline_scheduler import SCHEDULER_CLS
+
+    scheduler_config = vllm_config.scheduler_config
+    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+        raise ValueError(
+            "TPU_DP_PIPELINE_PREFILL needs DpPipelineScheduler, but "
+            f"{scheduler_config.scheduler_cls} is configured."
+        )
+    if not scheduler_config.async_scheduling:
+        raise ValueError("TPU_DP_PIPELINE_PREFILL needs --async-scheduling.")
+    scheduler_config.scheduler_cls = SCHEDULER_CLS
+    logger.info("Enabled DpPipelineScheduler.")
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:

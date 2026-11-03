@@ -1213,6 +1213,35 @@ def test_prefill_first_flags_name_the_dp_scheduler_as_the_conflict(monkeypatch):
         tpu_platform._configure_prefill_first_scheduler(vllm_config)
 
 
+def test_dp_pipeline_installs_its_scheduler(monkeypatch):
+    from vllm_torchtpu.core.dp_pipeline_scheduler import SCHEDULER_CLS
+
+    def config(scheduler_cls=None, async_scheduling=True):
+        return SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                scheduler_cls=scheduler_cls, async_scheduling=async_scheduling
+            )
+        )
+
+    monkeypatch.setattr(tpu_platform.envs, "TPU_DP_PIPELINE_PREFILL", False)
+    off = config()
+    tpu_platform._configure_dp_pipeline_scheduler(off)
+    assert off.scheduler_config.scheduler_cls is None
+
+    monkeypatch.setattr(tpu_platform.envs, "TPU_DP_PIPELINE_PREFILL", True)
+    on = config()
+    tpu_platform._configure_dp_pipeline_scheduler(on)
+    assert on.scheduler_config.scheduler_cls == SCHEDULER_CLS
+    with pytest.raises(ValueError, match="--async-scheduling"):
+        tpu_platform._configure_dp_pipeline_scheduler(config(async_scheduling=False))
+    from vllm_torchtpu.core.experimental import prefill_first_scheduler
+
+    with pytest.raises(ValueError, match="needs DpPipelineScheduler"):
+        tpu_platform._configure_dp_pipeline_scheduler(
+            config(prefill_first_scheduler.SCHEDULER_CLS)
+        )
+
+
 def _device_left_unset():
     """Stop ``DeviceConfig`` building ``torch.device("tpu")`` off a TPU."""
     return patch.object(TpuPlatform, "uses_host_device_handling", return_value=True)
