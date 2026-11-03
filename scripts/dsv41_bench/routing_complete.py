@@ -269,9 +269,13 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--with-scale", action="store_true")
     parser.add_argument("--slab-mode", choices=("grid", "native"), default="grid")
+    parser.add_argument(
+        "--timing-case", choices=("uniform", "skew", "empty", "edge"), default="uniform"
+    )
+    parser.add_argument("--timing-rank", type=int, choices=range(EP), default=0)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    xs = tuple(jax.device_put(x) for x in fixture("uniform", 0))
+    xs = tuple(jax.device_put(x) for x in fixture(args.timing_case, args.timing_rank))
     funcs = {
         "baseline": native,
         "candidate": make_candidate(xs, args.interpret, args.slab_mode),
@@ -289,6 +293,8 @@ def main():
         "runtime": {p: importlib.metadata.version(p) for p in ("jax", "jaxlib")},
         "with_scale": args.with_scale,
         "slab_mode": args.slab_mode,
+        "timing_case": args.timing_case,
+        "timing_rank": args.timing_rank,
     }
     compiled = {}
     for name, fn in funcs.items():
