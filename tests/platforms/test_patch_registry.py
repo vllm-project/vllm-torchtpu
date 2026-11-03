@@ -251,6 +251,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_gemma4_attention",
         "maybe_patch_gemma4_fused_gelu_quant",
         "maybe_patch_gemma4_context_parallel",
+        "maybe_patch_gemma4_dp_pipeline",
         "maybe_patch_gemma4_decode_mlp",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]

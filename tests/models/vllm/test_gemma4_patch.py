@@ -1583,3 +1583,246 @@ def test_attention_chunks_split_quantized_rows_and_scales(monkeypatch):
         (4, 3),
         (4, 3),
     ]
+# ---------------------------------------------------------------------------
+# Pipelined prefill across DP engines: layer segments
+# ---------------------------------------------------------------------------
+
+
+class _UpstreamLayer(SimpleNamespace):
+    def __call__(self, *args: Any, **kwargs: Any):
+        return _UPSTREAM_LAYER_FORWARD(self, *args, **kwargs)
+
+
+def _upstream_model(model: _Model, rank: int, all_reduce: Callable) -> SimpleNamespace:
+    fake = SimpleNamespace(
+        layers=[
+            _UpstreamLayer(**vars(model.layer(i, rank, all_reduce)))
+            for i in range(model.num_layers)
+        ],
+        start_layer=0,
+        end_layer=model.num_layers,
+        norm=model.final_norm,
+        aux_hidden_state_layers=(),
+        fast_prefill_enabled=False,
+        embed_input_ids=lambda ids: model.embedding[ids],
+        get_per_layer_inputs=lambda ids: None,
+        project_per_layer_inputs=lambda h, p: None,
+    )
+    fake._maybe_add_hidden_state = types.MethodType(
+        EagleModelMixin._maybe_add_hidden_state, fake
+    )
+    return fake
+
+
+@pytest.mark.parametrize("cuts", [(1,), (2,), (1, 3), (1, 2, 3)])
+def test_layer_ranges_compose_to_the_upstream_forward(
+    mock_collectives, monkeypatch, cuts
+):
+    """Stages that each run a range of layers on the previous range's output
+    reproduce upstream's whole forward bit for bit."""
+    tp, num_layers, num_tokens = 2, 4, 24
+    mock = mock_collectives(tp)
+    model = _Model(tp, moe=False, fp8=True, num_layers=num_layers)
+    monkeypatch.setattr(
+        gemma4,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    input_ids = torch.randint(0, model.embedding.shape[0], (num_tokens,))
+    positions = torch.arange(num_tokens)
+    bounds = (0, *cuts, num_layers)
+
+    def run(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+        fake = _upstream_model(model, rank, mock.all_reduce)
+        reference = gemma4_patch._orig_model_forward(fake, input_ids, positions, None)
+        x = fake.embed_input_ids(input_ids)
+        for start, end in zip(bounds, bounds[1:]):
+            x = gemma4_patch._layer_range_forward(fake, x, positions, start, end)
+        return reference, x
+
+    for reference, staged in _run_ranks(tp, run):
+        assert torch.equal(staged, reference)
+
+
+def test_layer_segments_tile_a_stage(monkeypatch) -> None:
+    calls: list[tuple[int, int]] = []
+
+    def segment(start: int, end: int) -> Callable:
+        def run(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+            calls.append((start, end))
+            return x + 1
+
+        return run
+
+    model = SimpleNamespace(
+        _dp_pipeline_segments={
+            (s, e): segment(s, e) for s, e in ((0, 2), (2, 3), (3, 6))
+        }
+    )
+    ids, positions = torch.zeros(4), torch.arange(4)
+    out = gemma4_patch._run_layer_segments(model, 0, 3, ids, positions, None)
+    assert calls == [(0, 2), (2, 3)] and torch.equal(out, ids + 2)
+    calls.clear()
+    out = gemma4_patch._run_layer_segments(model, 2, 6, ids, positions, torch.ones(4))
+    assert calls == [(2, 3), (3, 6)] and torch.equal(out, torch.full((4,), 3.0))
+    for start, end in ((1, 3), (0, 4), (2, 2)):
+        with pytest.raises(ValueError, match="not a run of the compiled segments"):
+            gemma4_patch._run_layer_segments(
+                model, start, end, ids, positions, torch.ones(4)
+            )
+
+
+def test_dp_pipeline_forward_dispatch(monkeypatch) -> None:
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+    from vllm_torchtpu.runner.dp_pipeline_stage import StageCall
+
+    whole: list[str] = []
+    monkeypatch.setattr(
+        gemma4_patch,
+        "_orig_causal_lm_forward",
+        lambda self, ids, pos, it, emb, **kw: whole.append("whole") or "logits-hidden",
+    )
+    monkeypatch.setattr(gemma4_patch, "_profiling", lambda model: False)
+    ranges: list[tuple[int, int, Any]] = []
+    monkeypatch.setattr(
+        gemma4_patch,
+        "_run_layer_segments",
+        lambda self, start, end, ids, pos, hidden: (
+            ranges.append((start, end, hidden)) or "seg"
+        ),
+    )
+    lm = SimpleNamespace(model=SimpleNamespace(layers=[None] * 6), _dp_pipeline_rows=4)
+    ids, positions = torch.zeros(4, dtype=torch.int32), torch.arange(4)
+    hidden = torch.ones(4, 8)
+    # A served step: the whole model.
+    with set_vllm_model_wrapper_context(mesh=None, seq_lens_cpu=np.array([4])):
+        assert (
+            gemma4_patch._patched_dp_pipeline_forward(lm, ids, positions)
+            == "logits-hidden"
+        )
+    assert whole == ["whole"] and ranges == []
+    # The warmup forward of the segments' bucket also compiles them; the other
+    # buckets' do not.
+    with set_vllm_model_wrapper_context(mesh=None):
+        gemma4_patch._patched_dp_pipeline_forward(lm, ids, positions)
+        gemma4_patch._patched_dp_pipeline_forward(lm, ids[:2], positions[:2])
+    assert ranges == [(0, 6, None)]
+    ranges.clear()
+    # A pipelined chunk: only this stage's layers.
+    with set_vllm_model_wrapper_context(
+        mesh=None, seq_lens_cpu=np.array([4]), dp_pipeline_stage=StageCall(2, 6, hidden)
+    ):
+        assert gemma4_patch._patched_dp_pipeline_forward(lm, ids, positions) == "seg"
+    assert ranges == [(2, 6, hidden)] and whole == ["whole"] * 3
+    with (
+        set_vllm_model_wrapper_context(
+            mesh=None, dp_pipeline_stage=StageCall(0, 2, None)
+        ),
+        pytest.raises(NotImplementedError, match="token ids only"),
+    ):
+        gemma4_patch._patched_dp_pipeline_forward(
+            lm, None, positions, inputs_embeds=hidden
+        )
+
+
+def test_maybe_patch_dp_pipeline_waits_for_gemma4(monkeypatch) -> None:
+    monkeypatch.setattr(envs, "TPU_DP_PIPELINE_PREFILL", False)
+    assert gemma4_patch.maybe_patch_gemma4_dp_pipeline(None) is None
+    monkeypatch.setattr(envs, "TPU_DP_PIPELINE_PREFILL", True)
+    assert gemma4_patch.maybe_patch_gemma4_dp_pipeline(None) is False
+    cfg = SimpleNamespace(
+        hf_text_config=SimpleNamespace(model_type="gemma4_text"),
+        architecture="Gemma4ForConditionalGeneration",
+    )
+    with pytest.raises(ValueError, match="Gemma4ForCausalLM"):
+        gemma4_patch.maybe_patch_gemma4_dp_pipeline(cfg)
+    cfg.architecture = "Gemma4ForCausalLM"
+    monkeypatch.setattr(envs, "TPU_GEMMA4_CP_MIN_TOKENS", 40960)
+    with pytest.raises(ValueError, match="exclude each other"):
+        gemma4_patch.maybe_patch_gemma4_dp_pipeline(cfg)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_CP_MIN_TOKENS", 0)
+    saved = {name: Gemma4ForCausalLM.__dict__[name] for name in ("__init__", "forward")}
+    try:
+        assert gemma4_patch.maybe_patch_gemma4_dp_pipeline(cfg) is None
+        assert Gemma4ForCausalLM.__init__ is gemma4_patch._patched_dp_pipeline_init
+        assert Gemma4ForCausalLM.forward is gemma4_patch._patched_dp_pipeline_forward
+    finally:
+        for name, value in saved.items():
+            setattr(Gemma4ForCausalLM, name, value)
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        ({"fast_prefill_enabled": True}, "kv_sharing_fast_prefill"),
+        ({"per_layer_input_gate": object()}, "per-layer embeddings"),
+        ({"is_kv_shared_layer": True}, "KV sharing"),
+        ({"additional_config": object()}, "dict additional_config"),
+    ],
+)
+def test_dp_pipeline_refuses(monkeypatch, override: dict, match: str) -> None:
+    monkeypatch.setattr(envs, "TPU_GEMMA4_CP_MIN_TOKENS", 0)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_SEQUENCE_PARALLEL", False)
+
+    def model(**kw):
+        layer = SimpleNamespace(
+            per_layer_input_gate=kw.get("per_layer_input_gate"),
+            self_attn=SimpleNamespace(
+                is_kv_shared_layer=kw.get("is_kv_shared_layer", False)
+            ),
+        )
+        return SimpleNamespace(
+            fast_prefill_enabled=kw.get("fast_prefill_enabled", False),
+            layers=[layer, layer],
+        )
+
+    def config(**kw):
+        return SimpleNamespace(
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+            additional_config=kw.get("additional_config", {}),
+        )
+
+    gemma4_patch._check_dp_pipeline(model(), config())
+    with pytest.raises(ValueError, match=match):
+        gemma4_patch._check_dp_pipeline(model(**override), config(**override))
+
+
+def test_layer_segments_have_distinct_compile_configs(monkeypatch) -> None:
+    """vLLM keys a compiled module's AOT artifact by its config hash and its
+    forward's code: every segment of one class needs a config of its own."""
+    import contextlib
+
+    monkeypatch.setattr(envs, "TPU_DP_PIPELINE_STAGES", 4)
+    monkeypatch.setattr(envs, "TPU_DP_PIPELINE_SPLITS", "2:30;3:20,41;4:14,29,44")
+    monkeypatch.setattr(
+        gemma4_patch, "set_current_vllm_config", lambda c: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        gemma4_patch, "set_model_tag", lambda t: contextlib.nullcontext()
+    )
+    built: dict[tuple[int, int], Any] = {}
+
+    def record(**kw):
+        start = kw.get("start", 0)
+        built[(start, kw["end"])] = kw["vllm_config"]
+        return SimpleNamespace()
+
+    monkeypatch.setattr(gemma4_patch, "Gemma4FirstLayers", record)
+    monkeypatch.setattr(gemma4_patch, "Gemma4MiddleLayers", record)
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(compile_sizes=[16, 32]),
+        additional_config={"other": 1},
+    )
+    model = SimpleNamespace(layers=[None] * 60)
+    segments = gemma4_patch._build_layer_segments(model, config)
+    assert sorted(segments) == sorted(built) and len(built) == 7
+    extras = [built[key].additional_config for key in sorted(built)]
+    assert [e["tpu_dp_pipeline_layers"] for e in extras] == [
+        list(key) for key in sorted(built)
+    ]
+    assert all(e["other"] == 1 for e in extras)
+    assert config.additional_config == {"other": 1}
+    # The largest bucket only: every pipelined chunk pads to it.
+    assert all(built[key].compilation_config.compile_sizes == [32] for key in built)

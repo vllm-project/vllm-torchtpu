@@ -84,6 +84,7 @@ from vllm_torchtpu.models.vllm.gemma4_attention_patch import (
 )
 from vllm_torchtpu.models.vllm.gemma4_mlp_patch import down_proj_from_gate_up
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    current_vllm_model_wrapper_context,
     get_vllm_model_wrapper_context,
 )
 
@@ -1039,6 +1040,8 @@ def _build_context_parallel_programs(
     for size in (s for s in sizes if s >= _cp_min_tokens):
         program_config = copy.copy(vllm_config)
         program_config.compilation_config = copy.copy(config)
+        # Also what keeps the programs' AOT artifacts apart: vLLM keys them by
+        # the config hash and the forward's code, which they share.
         program_config.compilation_config.compile_sizes = [size]
         program_config.compilation_config.traced_files = set()
         program_config.compilation_config.cache_dir = ""
@@ -1208,4 +1211,231 @@ def maybe_patch_gemma4_context_parallel(
         "at least %d tokens.",
         _cp_min_tokens,
     )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pipelined prefill across DP engines (TPU_DP_PIPELINE_PREFILL)
+# ---------------------------------------------------------------------------
+
+
+def _layer_range_forward(
+    model: Gemma4Model, x: torch.Tensor, positions: torch.Tensor, start: int, end: int
+) -> torch.Tensor:
+    """Upstream Gemma4Model.forward over layers ``[start, end)``: its layer
+    loop (Gemma4 keeps the residual in the hidden states), then its final norm
+    when ``end`` is the last layer."""
+    for layer in islice(model.layers, start, end):
+        x, _ = layer(positions, x, None)
+    return model.norm(x) if end == len(model.layers) else x
+
+
+@support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": 0})
+class Gemma4FirstLayers(nn.Module):
+    """Layers ``[0, end)`` from the token ids, as one compiled program."""
+
+    def __init__(
+        self, *, vllm_config: VllmConfig, prefix: str = "", model: Gemma4Model, end: int
+    ) -> None:
+        super().__init__()
+        self.model, self.end = model, end
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        x = self.model.embed_input_ids(input_ids)
+        return _layer_range_forward(self.model, x, positions, 0, self.end)
+
+
+@support_torch_compile(dynamic_arg_dims={"hidden_states": 0, "positions": 0})
+class Gemma4MiddleLayers(nn.Module):
+    """Layers ``[start, end)`` from a previous range's hidden states."""
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        model: Gemma4Model,
+        start: int,
+        end: int,
+    ) -> None:
+        super().__init__()
+        self.model, self.start, self.end = model, start, end
+
+    def forward(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        return _layer_range_forward(
+            self.model, hidden_states, positions, self.start, self.end
+        )
+
+
+def _build_layer_segments(
+    model: Gemma4Model, vllm_config: VllmConfig
+) -> dict[tuple[int, int], nn.Module]:
+    """One compiled program per layer segment (dp_pipeline.plan.segment_bounds),
+    each under its own copy of the compilation config: the largest token
+    bucket only, which every pipelined chunk pads to (plan.pipelined_tokens),
+    and its own cache directory. A pipeline stage runs a run of them."""
+    from vllm_torchtpu.distributed.dp_pipeline.plan import segment_bounds
+
+    bounds = segment_bounds(len(model.layers))
+    config = vllm_config.compilation_config
+    segments: dict[tuple[int, int], nn.Module] = {}
+    for start, end in zip(bounds, bounds[1:]):
+        program_config = copy.copy(vllm_config)
+        program_config.compilation_config = copy.copy(config)
+        program_config.compilation_config.compile_sizes = [
+            max(int(s) for s in config.compile_sizes)
+        ]
+        program_config.compilation_config.traced_files = set()
+        program_config.compilation_config.cache_dir = ""
+        program_config.compilation_config.local_cache_dir = ""
+        # vLLM keys a compiled module's AOT artifact by its config hash and its
+        # forward's code, the same for every Gemma4MiddleLayers: without the
+        # range in the config, each segment would load the first one's program.
+        program_config.additional_config = {
+            **vllm_config.additional_config,
+            "tpu_dp_pipeline_layers": [start, end],
+        }
+        with (
+            set_current_vllm_config(program_config),
+            set_model_tag(f"gemma4_layers_{start}_{end}"),
+        ):
+            if start == 0:
+                segment: nn.Module = Gemma4FirstLayers(
+                    vllm_config=program_config, model=model, end=end
+                )
+            else:
+                segment = Gemma4MiddleLayers(
+                    vllm_config=program_config, model=model, start=start, end=end
+                )
+        segments[(start, end)] = segment
+    return segments
+
+
+def _check_dp_pipeline(model: Gemma4Model, vllm_config: VllmConfig) -> None:
+    what = "TPU_DP_PIPELINE_PREFILL"
+    if envs.TPU_GEMMA4_CP_MIN_TOKENS or envs.TPU_GEMMA4_SEQUENCE_PARALLEL:
+        raise ValueError(
+            f"{what} runs upstream's TP layers: unset TPU_GEMMA4_CP_MIN_TOKENS and "
+            "TPU_GEMMA4_SEQUENCE_PARALLEL"
+        )
+    if (
+        model.fast_prefill_enabled
+        or vllm_config.parallel_config.pipeline_parallel_size > 1
+    ):
+        raise ValueError(f"{what} does not support kv_sharing_fast_prefill or PP")
+    if any(layer.per_layer_input_gate is not None for layer in model.layers):
+        raise ValueError(f"{what} does not support per-layer embeddings")
+    if any(layer.self_attn.is_kv_shared_layer for layer in model.layers):
+        # A shared layer reads the KV another layer wrote, maybe on another engine.
+        raise ValueError(f"{what} does not support KV sharing")
+    if not isinstance(vllm_config.additional_config, dict):
+        # Each layer segment keys its compiled artifact by a range stored there.
+        raise ValueError(
+            f"{what} needs a dict additional_config, got "
+            f"{type(vllm_config.additional_config).__name__}"
+        )
+
+
+def _patched_dp_pipeline_init(
+    self: Gemma4ForCausalLM, *, vllm_config: VllmConfig, prefix: str = ""
+) -> None:
+    _orig_causal_lm_init(self, vllm_config=vllm_config, prefix=prefix)
+    model: Any = self.model
+    _check_dp_pipeline(model, vllm_config)
+    # A plain dict: the segments share the model's weights and are not its
+    # submodules, so loading and walking the model never reaches them.
+    self._dp_pipeline_segments = _build_layer_segments(model, vllm_config)
+    self._dp_pipeline_rows = max(
+        int(s) for s in vllm_config.compilation_config.compile_sizes
+    )
+    logger.info(
+        "Gemma4 pipelined-prefill layer segments %s", sorted(self._dp_pipeline_segments)
+    )
+
+
+def _run_layer_segments(
+    self: Any,
+    start: int,
+    end: int,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor | None,
+) -> torch.Tensor:
+    """Layers ``[start, end)`` as the run of segments that tiles them."""
+    covered = start
+    x = hidden_states
+    for (seg_start, seg_end), segment in self._dp_pipeline_segments.items():
+        if seg_start < start or seg_end > end:
+            continue
+        if seg_start != covered:
+            break
+        x = segment(input_ids, positions) if seg_start == 0 else segment(x, positions)
+        covered = seg_end
+    if covered != end or start >= end or x is None:
+        raise ValueError(
+            f"layers [{start}, {end}) are not a run of the compiled segments "
+            f"{sorted(self._dp_pipeline_segments)} (TPU_DP_PIPELINE_SPLITS)"
+        )
+    return x
+
+
+def _patched_dp_pipeline_forward(
+    self: Gemma4ForCausalLM,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    intermediate_tensors: Any = None,
+    inputs_embeds: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> Any:
+    context = current_vllm_model_wrapper_context()
+    call = None if context is None else context.dp_pipeline_stage
+    if call is None:
+        out = _orig_causal_lm_forward(
+            self, input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+        )
+        if (
+            context is not None
+            and context.seq_lens_cpu is None
+            and input_ids is not None
+            and input_ids.shape[0] == self._dp_pipeline_rows
+            and not _profiling(self.model)
+        ):
+            # The warmup forward of the segments' bucket: compile them too, so
+            # no served chunk is the first to reach them.
+            _run_layer_segments(
+                self, 0, len(self.model.layers), input_ids, positions, None
+            )
+        return out
+    if input_ids is None or intermediate_tensors is not None or kwargs:
+        raise NotImplementedError(
+            "A pipelined prefill chunk takes token ids only, got "
+            f"inputs_embeds={inputs_embeds is not None}, "
+            f"intermediate_tensors={intermediate_tensors is not None}, {list(kwargs)}"
+        )
+    return _run_layer_segments(
+        self, call.start, call.end, input_ids, positions, call.hidden_states
+    )
+
+
+def maybe_patch_gemma4_dp_pipeline(model_config: ModelConfig | None) -> bool | None:
+    """Returns False until a Gemma4 text model config is available."""
+    if not envs.TPU_DP_PIPELINE_PREFILL:
+        return None
+    if model_config is None or model_config.hf_text_config.model_type != "gemma4_text":
+        return False
+    if model_config.architecture != "Gemma4ForCausalLM":
+        raise ValueError(
+            "TPU_DP_PIPELINE_PREFILL needs Gemma4ForCausalLM, got "
+            f"{model_config.architecture} (--hf-overrides "
+            '\'{"architectures": ["Gemma4ForCausalLM"]}\' serves the text model)'
+        )
+    if envs.TPU_GEMMA4_CP_MIN_TOKENS:
+        raise ValueError(
+            "TPU_DP_PIPELINE_PREFILL and TPU_GEMMA4_CP_MIN_TOKENS exclude each other"
+        )
+    Gemma4ForCausalLM.__init__ = _patched_dp_pipeline_init
+    Gemma4ForCausalLM.forward = _patched_dp_pipeline_forward
+    logger.info("Applied TPU patch: Gemma4 layer segments for pipelined prefill.")
     return None
