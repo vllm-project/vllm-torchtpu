@@ -189,12 +189,24 @@ def flat_candidate(true, aligned, starts, expert_rows, rank):
     )
 
 
-def candidate(xs, interpret=False):
+def candidate(xs, interpret=False, vector_outputs=False):
     def adapt(a, b, c, rows, rank):
         return a.T, b.T, c.T, rows[None, :], rank
 
+    def body(*args):
+        outputs = list(flat_candidate(*args))
+        if vector_outputs:
+            for i in (0, 1):
+                outputs[i] = outputs[i].reshape(-1)
+        return tuple(outputs)
+
     fused = (original.fuse_function if interpret else prep.fuse_function)(
-        flat_candidate, adapt(*xs), name="dsv41_route_metadata", interpret=interpret
+        body,
+        adapt(*xs),
+        name="dsv41_route_metadata_vectors"
+        if vector_outputs
+        else "dsv41_route_metadata",
+        interpret=interpret,
     )
 
     def call(*args):
@@ -304,6 +316,7 @@ def main():
     parser.add_argument("--interpret", action="store_true")
     parser.add_argument("--samples", type=int, default=200)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--vector-outputs", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     xs = tuple(jax.device_put(x) for x in fixture("uniform", 0))
@@ -315,8 +328,12 @@ def main():
         "timings": {},
         "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "runtime": {p: importlib.metadata.version(p) for p in ("jax", "jaxlib")},
+        "vector_outputs": args.vector_outputs,
     }
-    funcs = {"baseline": baseline, "candidate": candidate(xs, args.interpret)}
+    funcs = {
+        "baseline": baseline,
+        "candidate": candidate(xs, args.interpret, args.vector_outputs),
+    }
     compiled = {}
     for name, fn in funcs.items():
         lowered = jax.jit(fn).lower(*xs)
