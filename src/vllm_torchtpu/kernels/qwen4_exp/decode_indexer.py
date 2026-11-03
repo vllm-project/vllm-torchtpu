@@ -14,6 +14,7 @@
 """QSA geometry adapter for the shared StreamIndex scoring and top-k pipeline."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +26,10 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     TopKBackend,
 )
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
+from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
+    get_decode_index_key_packing,
+    get_decode_index_pages,
+)
 
 
 def _request_bounds(starts, distribution, tokens):
@@ -202,21 +207,36 @@ def select_index_blocks(
         size = len(q)
 
         def score(_):
+            key_packing = get_decode_index_key_packing(
+                q, cache, pages_per_query=table.shape[1], ratio=ratio, topk=block_topk
+            )
+            # The reader view preserves the pool and its physical page IDs.
+            reader_cache = (
+                cache.reshape(cache.shape[0], page_size // key_packing, key_packing, -1)
+                if key_packing != 2
+                else cache
+            )
             return streamindex_topk(
                 q,
                 jnp.full(q.shape[:2], scale, jnp.float32),
-                cache,
+                reader_cache,
                 lens,
                 table[req].reshape(-1),
                 jnp.arange(size + 1, dtype=jnp.int32),
                 jnp.full((3,), size, jnp.int32),
                 k=block_topk,
                 compression_ratio=ratio,
-                num_kv_pages_per_block=max(1, 256 // page_size),
+                num_kv_pages_per_block=get_decode_index_pages(
+                    q,
+                    cache,
+                    pages_per_query=table.shape[1],
+                    ratio=ratio,
+                    topk=block_topk,
+                ),
                 num_queries_per_block=1,
                 decode_req_batch_size=8 if size >= 8 else 4,
                 enable_early_exit=True,
-                components=qsa_indexing(),
+                components=qsa_indexing(key_packing=key_packing),
                 topk_backend=topk_backend,
                 scheduling_group_namespace=scheduling_group_namespace,
                 **resource_options,
@@ -258,6 +278,17 @@ def select_index_blocks(
         prefix_capacity = max(block_topk, (batch + ratio - 1) // ratio)
 
     def score_prefill(q, cu, history):
+        # Decode groups 13 adjacent 32-key pages into one 416-key view.
+        # Ragged prefill retains its upstream 256-key tile and page schedule.
+        prefill_page_size = math.gcd(page_size, 128) if page_size % 128 else page_size
+        subpages = page_size // prefill_page_size
+        # Native BF16 stores two keys per row; byte carriers keep packing four.
+        prefill_cache = cache.reshape(
+            -1, prefill_page_size // 2, cache.shape[2], cache.shape[-1]
+        )
+        prefill_table = (
+            table[..., None] * subpages + jnp.arange(subpages, dtype=jnp.int32)
+        ).reshape(len(table), -1)
         counts = cu[1:] - cu[:-1]
         num_seqs = jnp.max(
             jnp.where(counts > 0, jnp.arange(len(counts), dtype=jnp.int32) + 1, 0)
@@ -265,14 +296,14 @@ def select_index_blocks(
         return streamindex_topk(
             q,
             jnp.full(q.shape[:2], scale, jnp.float32),
-            cache,
+            prefill_cache,
             jnp.where(counts > 0, history + counts, 0),
-            table.reshape(-1),
+            prefill_table.reshape(-1),
             cu,
             jnp.array([0, 0, num_seqs], jnp.int32),
             k=block_topk,
             compression_ratio=ratio,
-            num_kv_pages_per_block=(max(1, 256 // page_size),) * 3,
+            num_kv_pages_per_block=(max(1, 256 // prefill_page_size),) * 3,
             num_queries_per_block=(1, 128, 128),
             decode_req_batch_size=8,
             enable_early_exit=True,

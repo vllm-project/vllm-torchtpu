@@ -84,8 +84,11 @@ def _dense_step(hidden, weights, positions, prior, fp8):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("decode_bucket,metadata_slots", [(8, 8), (16, 16), (16, 32)])
 @torch.inference_mode()
-def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
+def test_complete_layer_dense_context_against_plain_torch(
+    fp8, tmp_path, decode_bucket, metadata_slots
+):
     from torch_tpu._internal.compile._backend import TpuBackend
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
@@ -95,8 +98,12 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
         initialize_model_parallel,
     )
     from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.linear import LinearBase
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
+    from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+        VllmUnquantizedLinearMethod,
+    )
     from vllm_torchtpu.models.vllm.qwen4_exp.qsa import QSAMetadata, Qwen4ExpQSA
     from vllm_torchtpu.utils import synchronize_tensors
 
@@ -137,8 +144,24 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
                 )
                 for name, p in model.named_parameters()
             }
+            packed = weights.pop("input_proj.weight")
+            for name, value in zip(
+                (
+                    "k_proj.weight",
+                    "v_proj.weight",
+                    "indexer.index_qk_proj.weight",
+                ),
+                packed.split(model.input_sizes[1:], dim=0),
+            ):
+                weights[name] = value
             model.load_weights(weights.items())
             model.finalize_weights()
+            # Exercise the same once-only K-major preparation as TPU workers,
+            # even when this test bootstraps vLLM with a CPU config.
+            for linear in model.modules():
+                if isinstance(linear, LinearBase):
+                    linear.quant_method = VllmUnquantizedLinearMethod()
+                    linear.quant_method.process_weights_after_loading(linear)
             if fp8:
                 model.load_weights(
                     [
@@ -158,7 +181,7 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
                 dynamic=False,
             )
             previous = None
-            for context, count, bucket in [(0, 2047, 2048), (2047, 1, 8)]:
+            for context, count, bucket in [(0, 2047, 2048), (2047, 1, decode_bucket)]:
                 hidden = (torch.randn((bucket, 128), generator=generator) * 0.2).to(
                     torch.bfloat16
                 )
@@ -167,10 +190,14 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
                 expected, previous = _dense_step(
                     hidden[:count], weights, positions[:count], previous, fp8
                 )
-                starts = torch.tensor([0] + [count] * 8, dtype=torch.int32)
-                lengths = torch.tensor([context] + [0] * 7, dtype=torch.int32)
-                slots = torch.tensor([0] + [-1] * 7, dtype=torch.int32)
-                pages = torch.zeros((8, 16), dtype=torch.int32)
+                starts = torch.tensor([0] + [count] * metadata_slots, dtype=torch.int32)
+                lengths = torch.tensor(
+                    [context] + [0] * (metadata_slots - 1), dtype=torch.int32
+                )
+                slots = torch.tensor(
+                    [0] + [-1] * (metadata_slots - 1), dtype=torch.int32
+                )
+                pages = torch.zeros((metadata_slots, 16), dtype=torch.int32)
                 pages[0] = torch.arange(1, 17)
                 metadata = QSAMetadata(starts.to("tpu"), lengths.to("tpu"))
                 main_table = pages.to("tpu")

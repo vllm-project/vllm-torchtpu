@@ -43,6 +43,7 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import AUTO_MIN_TOKENS
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention,
 )
@@ -62,6 +63,7 @@ from .pd_identity import LoadedWeightIdentity
 from .ple import PLEInputs
 from .ple_geometry import ple_state_shape
 from .ple_host import shared_ple_options
+from .pool_layout import pooled_cache_specs
 from .pooled_ple import Qwen4ExpPooledPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
 
@@ -202,6 +204,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         attention_mix=None,
         next_attention_mixer=None,
         initial_embedding=None,
+        decode_cu=None,
     ):
         if initial_embedding is not None:
             # The explicit ``initial_embedding`` entry is the caller's
@@ -248,23 +251,53 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 "a PLE-owning layer reads the combined value before its mix"
             )
             block, residual = attention_mix.mixed, attention_mix.residuals
+        fused_output = False
         if self.layer_type == "linear_attention":
             block = self.linear_attn(block)
         else:
+            fused_output = not isinstance(
+                residual, HcPackedMixState
+            ) and self.self_attn.can_prefetch_output(block)
+            projection_args = {}
+            if fused_output:
+                hyper_input, hyper_norm = residual
+                injection = torch.nn.functional.linear(
+                    hyper_norm, self.attn_hyper_connection.block_inject_weight.weight
+                )
+                injection = 2.0 * torch.sigmoid(
+                    injection.float() / self.attn_hyper_connection.hc_count
+                )
+                connection = self.attn_hyper_connection
+                projection_args = {
+                    "residual": hyper_input,
+                    "hc_gate": injection,
+                    "hc_token_tile": connection._combine_token_tile
+                    if connection._prefill_combine_op is not None
+                    else 0,
+                    "hc_min_tokens": AUTO_MIN_TOKENS
+                    if connection.prefill_combine_tile == "auto"
+                    else 0,
+                }
             block = self.self_attn(
                 block,
                 positions,
                 QSAMetadata(
                     query_start_loc,
                     context_lens,
+                    decode_cu,
                 ),
+                **projection_args,
             )
-        hidden, block, residual = combine_then_mix_packed(
-            self.attn_hyper_connection,
-            self.mlp_hyper_connection,
-            block,
-            residual,
-        )
+        if fused_output:
+            hidden = block
+            block, residual = self.mlp_hyper_connection.mix_packed(hidden)
+        else:
+            hidden, block, residual = combine_then_mix_packed(
+                self.attn_hyper_connection,
+                self.mlp_hyper_connection,
+                block,
+                residual,
+            )
         # GDN may leave padded rows unwritten; MoE dispatch requires finite inputs.
         block = torch.where(valid_tokens[:, None], block, 0)
         block = self.mlp(block)
@@ -308,6 +341,10 @@ class Qwen4ExpBackbone(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.prefix = "model"
+        # Immutable prefix for the measured 16-token decode bucket.
+        self.register_buffer(
+            "decode_cu", torch.arange(17, dtype=torch.int32), persistent=False
+        )
         t = cfg.model_config.hf_text_config
         self.hc_count = t.hc_count
         self.embed_tokens = VocabParallelEmbedding(t.vocab_size, t.hidden_size)
@@ -426,6 +463,7 @@ class Qwen4ExpBackbone(nn.Module):
                 attention_mix=attention_mix,
                 next_attention_mixer=following,
                 initial_embedding=initial_embedding,
+                decode_cu=self.decode_cu,
             )
             initial_embedding = None
             if isinstance(result, HcCrossLayerMix):
@@ -459,6 +497,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()
+        self.vllm_config = vllm_config
         self._pd_weight_identity_enabled = vllm_config.kv_transfer_config is not None
         self.pd_loaded_weight_identity: str | None = None
         self.pd_loaded_ple_identity: str | None = None
@@ -554,6 +593,13 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             }
         )
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.model.layers)
+        # Resolve the allocator's layout during weight loading, before
+        # KV-cache HBM budgeting.
+        layout = (
+            pooled_cache_specs(self.vllm_config)[0]
+            if any(layer.layer_type == "indexed_attention" for layer in layers)
+            else None
+        )
         moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in layers]
         # Exactly the Qwen3.5 checkpoint projection mapping. HC remains
         # separate checkpoint-native parameters (no NVIDIA packed-HC mapper).
@@ -687,7 +733,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             if layer.ple is not None:
                 layer.ple.finalize_weights()
             if layer.layer_type == "indexed_attention":
-                layer.self_attn.finalize_weights()
+                assert layout is not None
+                layer.self_attn.finalize_weights(block_size=layout.block_size)
             else:
                 base = f"model.layers.{i}.linear_attn."
                 if {base + n for n in gdn_map} - source:

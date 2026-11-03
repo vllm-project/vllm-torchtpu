@@ -804,6 +804,8 @@ def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
     block = upstream_moe(tp, enable_ep, 7, shared_fp8=shared_fp8)
     model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
     nn.Module.__init__(model)
+    model.vllm_config = config(tp)
+    model.vllm_config.cache_config.block_size = 3328
     model._pd_weight_identity_enabled = pd_identity
     model.model = nn.Module()
     layer = nn.Module()
@@ -903,7 +905,12 @@ def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
             torch.testing.assert_close(
                 projection.weight_scale, projection.weight_scale_inv, rtol=0, atol=0
             )
-    layer.self_attn.finalize_weights.assert_called_once()
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+
+    layout, _ = pooled_cache_specs(model.vllm_config)
+    layer.self_attn.finalize_weights.assert_called_once_with(
+        block_size=layout.block_size
+    )
     if pd_identity and enable_ep:
         before_identity = model.pd_loaded_weight_identity
         unowned = prefix + "layers.0.mlp.experts.0.gate_proj.weight"
@@ -1055,6 +1062,8 @@ def test_pd_identity_hashes_only_real_ple_checkpoint_overlap(
         ):
             model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
             nn.Module.__init__(model)
+            model.vllm_config = config()
+            model.vllm_config.model_config.hf_text_config = text
             model._pd_weight_identity_enabled = True
             model.model = Qwen4ExpBackbone.__new__(Qwen4ExpBackbone)
             nn.Module.__init__(model.model)

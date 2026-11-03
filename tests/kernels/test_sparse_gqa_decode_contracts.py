@@ -233,13 +233,27 @@ def test_schedule_prefix_tail_capacity(alignment):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("batch", [6, 12, 24])
-def test_schedule_fields_against_scalar_task_oracle(fp8, batch):
+@pytest.mark.parametrize(
+    "batch,ratio,groups,lanes",
+    [(6, 8, 65, 8), (12, 8, 65, 8), (24, 8, 65, 8), (16, 4, 512, 4)],
+)
+def test_schedule_fields_against_scalar_task_oracle(fp8, batch, ratio, groups, lanes):
     dtype = jnp.dtype(jnp.float8_e4m3fn if fp8 else jnp.bfloat16)
-    cfg = make_config(batch, 8, 128, 1, 8, 65, dtype)
-    lengths = np.tile(np.array([0, 1, 255, 256, 257, 520], np.int32), batch // 6)
+    cfg = make_config(
+        batch,
+        8,
+        128,
+        1,
+        ratio,
+        groups,
+        dtype,
+        policy=DecodePolicy(pipeline_lanes=lanes),
+    )
+    lengths = np.resize(
+        np.array([0, 1, 255, 256, 257, groups * ratio + ratio - 1], np.int32), batch
+    )
     cu = np.arange(batch + 1, dtype=np.int32)
-    pages = np.random.default_rng(73).permutation(batch * 66).astype(np.int32)
+    pages = np.random.default_rng(73).permutation(batch * (groups + 1)).astype(np.int32)
     actual = schedule.generate(
         jnp.asarray(cu), jnp.asarray(lengths), jnp.asarray(pages), cfg
     )
@@ -248,39 +262,48 @@ def test_schedule_fields_against_scalar_task_oracle(fp8, batch):
         for row, length in enumerate(lengths)
         for tile in range(math.ceil(int(length) / 256))
     ]
-    steps = math.ceil(len(tasks) / 8)
+    steps = math.ceil(len(tasks) / lanes)
     assert np.asarray(actual.actual_steps)[0] == steps
     for step in range(steps):
         tokens = 0
         live = 0
         lasts = 0
-        for lane in range(8):
-            i = step * 8 + lane
+        for lane in range(lanes):
+            i = step * lanes + lane
             if i >= len(tasks):
-                assert np.asarray(actual.s_idx.data).reshape(-1, 8)[step, lane] == -1
+                assert (
+                    np.asarray(actual.s_idx.data).reshape(-1, lanes)[step, lane] == -1
+                )
                 continue
             row, tile, length = tasks[i]
             live += 1
             tokens += min(256, length - tile * 256)
             last = tile == math.ceil(length / 256) - 1
             lasts += last
-            assert np.asarray(actual.s_idx.data).reshape(-1, 8)[step, lane] == row
-            assert np.asarray(actual.k_idx.data).reshape(-1, 8)[step, lane] == tile
-            assert np.asarray(actual.is_last_k.data).reshape(-1, 8)[step, lane] == last
+            assert np.asarray(actual.s_idx.data).reshape(-1, lanes)[step, lane] == row
+            assert np.asarray(actual.k_idx.data).reshape(-1, lanes)[step, lane] == tile
+            assert (
+                np.asarray(actual.is_last_k.data).reshape(-1, lanes)[step, lane] == last
+            )
             np.testing.assert_array_equal(
-                np.asarray(actual.dma_q.data).reshape(-1, 8, 2)[step, lane],
+                np.asarray(actual.dma_q.data).reshape(-1, lanes, 2)[step, lane],
                 [row, 1],
             )
             dma = np.asarray(actual.dma_kv_cache.data).reshape(
-                cfg.max_steps_ub, 8, cfg.bkv_p_cache, 3
+                cfg.max_steps_ub, lanes, cfg.bkv_p_cache, 3
             )
             for page in range(cfg.bkv_p_cache):
                 np.testing.assert_array_equal(
                     dma[step, lane, page],
                     [
-                        pages[min(row * 66 + tile * 32 + page, batch * 66 - 1)],
-                        page * 8,
-                        max(0, min(length - tile * 256 - page * 8, 8)),
+                        pages[
+                            min(
+                                row * (groups + 1) + tile * (256 // ratio) + page,
+                                batch * (groups + 1) - 1,
+                            )
+                        ],
+                        page * ratio,
+                        max(0, min(length - tile * 256 - page * ratio, ratio)),
                     ],
                 )
         assert (

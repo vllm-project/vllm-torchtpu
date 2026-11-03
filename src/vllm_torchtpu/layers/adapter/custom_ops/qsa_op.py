@@ -31,18 +31,21 @@ def _op_name(kind: str, backend: TopKBackend | None, backend_key: str | None) ->
     if backend is None:
         if backend_key is not None:
             raise ValueError("A backend key requires an explicit topk_backend")
-        return f"qwen4_exp::{kind}"
+        return f"qwen4_exp::{kind}_rebased_20261102_v3"
     if not isinstance(backend_key, str) or not backend_key:
         raise ValueError("Explicit topk_backend requires a stable topk_backend_key")
     previous = _backend_keys.setdefault(backend_key, backend)
     if previous != backend:
         raise ValueError("topk_backend_key already identifies a different backend")
     suffix = hashlib.sha256(backend_key.encode("utf-8")).hexdigest()
-    return f"qwen4_exp::{kind}_{suffix}"
+    return f"qwen4_exp::{kind}_{suffix}_rebased_20261102_v3"
 
 
 def build_compact_pooled_qsa_op(
-    *, topk_backend: TopKBackend | None = None, topk_backend_key: str | None = None
+    *,
+    topk_backend: TopKBackend | None = None,
+    topk_backend_key: str | None = None,
+    project_output: bool = False,
 ):
     """Bind a selector under a stable persisted-graph identity.
 
@@ -52,15 +55,21 @@ def build_compact_pooled_qsa_op(
     The TPU compiler binds scheduling_group_namespace per FX call site; zero
     keeps direct native calls safe without cross-call scheduling annotations.
     """
-    return _build_compact_pooled_qsa_op(topk_backend, topk_backend_key)
+    return _build_compact_pooled_qsa_op(topk_backend, topk_backend_key, project_output)
 
 
 @functools.cache
 def _build_compact_pooled_qsa_op(
-    topk_backend: TopKBackend | None, topk_backend_key: str | None
+    topk_backend: TopKBackend | None, topk_backend_key: str | None, project_output: bool
 ):
     op = pallas.jax_op(
-        _op_name("compact_pooled_qsa", topk_backend, topk_backend_key),
+        _op_name(
+            "compact_pooled_qsa_projected_v2"
+            if project_output
+            else "compact_pooled_qsa",
+            topk_backend,
+            topk_backend_key,
+        ),
         functools.partial(compact_pooled_qsa_step, topk_backend=topk_backend),
         donate_argnums=(10, 11),  # pool, index_pool
     )
@@ -91,12 +100,22 @@ def _build_compact_pooled_qsa_op(
         rotary_dim,
         k_scale=1.0,
         v_scale=1.0,
+        output_weight=None,
+        residual=None,
+        hc_gate=None,
+        original_output_weight=None,
+        hc_token_tile=0,
+        hc_min_tokens=1024,
+        k_norm_multiplier=None,
+        decode_cu=None,
         scheduling_group_namespace=0,
     ):
         return (
             torch.empty_like(pool),
             torch.empty_like(index_pool),
-            qgate.new_empty((qgate.shape[0], qgate.shape[-1] // 2)),
+            torch.empty_like(residual)
+            if output_weight is not None
+            else qgate.new_empty((qgate.shape[0], qgate.shape[-1] // 2)),
             positions.new_empty(
                 (qgate.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
             ),
@@ -127,6 +146,14 @@ def _build_compact_pooled_qsa_op(
         rotary_dim: int,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        output_weight: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+        hc_gate: torch.Tensor | None = None,
+        original_output_weight: torch.Tensor | None = None,
+        hc_token_tile: int = 0,
+        hc_min_tokens: int = 1024,
+        k_norm_multiplier: torch.Tensor | None = None,
+        decode_cu: torch.Tensor | None = None,
         scheduling_group_namespace: int = 0,
     ):
         # The native QSA kernels consume positions and request/page metadata as int32.
@@ -162,6 +189,14 @@ def _build_compact_pooled_qsa_op(
             rotary_dim,
             k_scale,
             v_scale,
+            output_weight,
+            residual,
+            hc_gate,
+            original_output_weight,
+            hc_token_tile,
+            hc_min_tokens,
+            k_norm_multiplier,
+            decode_cu,
             scheduling_group_namespace,
         )
         pool.copy_(updated)

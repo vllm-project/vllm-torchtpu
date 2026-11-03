@@ -38,10 +38,17 @@ from vllm_torchtpu.models.vllm.qwen4_exp.qsa import (
 
 
 @pytest.fixture(autouse=True)
-def cpu_vllm_config_context():
+def cpu_vllm_config_context(monkeypatch):
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
+    # These loader/fake-forward tests retain checkpoint-format weights. Use
+    # the upstream plain Torch GEMM rather than CPU's post-load packed backend.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+        lambda _: default_unquantized_gemm,
+    )
     config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
     with set_current_vllm_config(config):
@@ -349,17 +356,22 @@ def test_checkpoint_head_packing_and_kv_replication(tp, rank, monkeypatch):
             ]
         )
         width = 12288 // tp
+        packed = (
+            module.q_proj.weight,
+            *module.input_proj.weight.split(module.input_sizes[1:], dim=0),
+        )
         torch.testing.assert_close(
-            module.q_proj.weight, q[rank * width : (rank + 1) * width], rtol=0, atol=0
+            packed[0], q[rank * width : (rank + 1) * width], rtol=0, atol=0
         )
         kv_rank = rank // max(tp // 2, 1)
         kw = max(512 // tp, 256)
         torch.testing.assert_close(
-            module.k_proj.weight, k[kv_rank * kw : (kv_rank + 1) * kw], rtol=0, atol=0
+            packed[1], k[kv_rank * kw : (kv_rank + 1) * kw], rtol=0, atol=0
         )
         torch.testing.assert_close(
-            module.indexer.index_qk_proj.weight, index, rtol=0, atol=0
+            packed[2], k[kv_rank * kw : (kv_rank + 1) * kw], rtol=0, atol=0
         )
+        torch.testing.assert_close(packed[3], index, rtol=0, atol=0)
         torch.testing.assert_close(
             module.o_proj.weight,
             o[:, rank * width // 2 : (rank + 1) * width // 2],
@@ -380,6 +392,80 @@ def test_checkpoint_head_packing_and_kv_replication(tp, rank, monkeypatch):
         )
         with pytest.raises(ValueError, match="Missing"):
             module.finalize_weights()
+
+
+@pytest.mark.parametrize("tp,rank", [(1, 0), (2, 1), (4, 2), (8, 7)])
+@torch.inference_mode()
+def test_merged_inputs_forward_and_checkpoint_completeness(tp, rank, monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: rank
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: tp
+    )
+    config = attention_config(
+        hidden_size=64,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=32,
+        indexer_n_heads=2,
+        indexer_head_dim=32,
+    )
+    model = Qwen4ExpQSA(config=config, tp_rank=rank, tp_size=tp, max_model_len=128)
+    generator = torch.Generator().manual_seed(391)
+    names = (
+        "q_proj.weight",
+        "k_proj.weight",
+        "v_proj.weight",
+        "indexer.index_qk_proj.weight",
+    )
+    weights = [
+        torch.randn(n, 64, generator=generator).to(torch.bfloat16)
+        for n in (512, 64, 64, 96)
+    ]
+    # Stream shards independently, retaining a separate completeness bit for
+    # every checkpoint tensor, including each packed small projection.
+    other = {
+        n: torch.zeros_like(p)
+        for n, p in model.named_parameters()
+        if n not in ("input_proj.weight", "q_proj.weight")
+    }
+    other["o_proj.weight"] = torch.randn(64, 256, generator=generator).bfloat16()
+    model.load_weights(other.items())
+    for name, weight in zip(names, weights):
+        with pytest.raises(ValueError, match=name):
+            model.finalize_weights()
+        assert model.load_weights([(name, weight)]) == {name}
+    model.finalize_weights()
+    output_weight = other["o_proj.weight"][
+        :, rank * (256 // tp) : (rank + 1) * (256 // tp)
+    ]
+    torch.testing.assert_close(model.o_proj.weight, output_weight.T, rtol=0, atol=0)
+    output_storage = model.o_proj.weight.data_ptr()
+    model.finalize_weights()
+    model.o_proj.quant_method.process_weights_after_loading(model.o_proj)
+    assert model.o_proj.weight.data_ptr() == output_storage
+    expected_weights = []
+    for shard, (weight, width) in enumerate(zip(weights, model.input_sizes)):
+        shard_rank = rank if shard == 0 else rank // max(tp // 2, 1) if shard < 3 else 0
+        expected_weights.append(weight.narrow(0, shard_rank * width, width))
+    for batch in (1, 16, 128):
+        hidden = torch.randn(batch, 64, generator=generator).to(torch.bfloat16)
+        hidden[-1].zero_()  # Padded decode rows must remain zero.
+        actual = (
+            model.q_proj(hidden),
+            *model.input_proj(hidden).split(model.input_sizes[1:], dim=-1),
+        )
+        for got, weight in zip(actual, expected_weights):
+            torch.testing.assert_close(got, torch.nn.functional.linear(hidden, weight))
+        attended = torch.randn(batch, 256 // tp, generator=generator).bfloat16()
+        attended[-1].zero_()
+        torch.testing.assert_close(
+            model.o_proj(attended),
+            torch.nn.functional.linear(attended, output_weight),
+            rtol=0,
+            atol=0,
+        )
 
 
 @pytest.mark.parametrize("fp8", [False, True])
@@ -474,7 +560,10 @@ def test_static_indexer_backend_cache_and_owner_contract(
             )
         with pytest.raises(ValueError, match="requires an explicit"):
             factory(topk_backend_key="orphan-key")
-        assert captured[0][0] == "qwen4_exp::" + factory_name[6:-3]
+        assert (
+            captured[0][0]
+            == "qwen4_exp::" + factory_name[6:-3] + "_rebased_20261102_v3"
+        )
         assert len(captured) == 3
     finally:
         cached.cache_clear()
@@ -602,3 +691,34 @@ def test_output_projection_tp2_partial_sum_matches_tp1(monkeypatch):
     # Binary-exact inputs isolate rank slicing/reduction from BF16 sum rounding.
     assert expected is not None
     torch.testing.assert_close(partials[0] + partials[1], expected, rtol=0, atol=0)
+
+
+def test_retained_norm_multiplier_survives_dtype_migration(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
+    )
+    model = Qwen4ExpQSA(
+        config=attention_config(hidden_size=16),
+        tp_rank=0,
+        tp_size=1,
+        max_model_len=128,
+        device="cpu",
+    )
+    # A value whose 1+w result cannot be represented exactly in BF16.
+    model.k_norm.weight.data.fill_(2**-10)
+    model.k_norm_multiplier = 1 + model.k_norm.weight.detach().float()
+    model.to(dtype=torch.bfloat16)
+    assert model.k_norm_multiplier.dtype == torch.float32
+    torch.testing.assert_close(
+        model.k_norm_multiplier,
+        1 + model.k_norm.weight.detach().float(),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.all(
+        model.k_norm_multiplier != model.k_norm_multiplier.bfloat16().float()
+    )
+    assert "k_norm_multiplier" not in model.state_dict()

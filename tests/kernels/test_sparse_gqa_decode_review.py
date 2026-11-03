@@ -138,6 +138,52 @@ def test_smaller_power_of_two_fallback_keeps_32(monkeypatch, info):
     assert seen == [65, 64, 32]
 
 
+def test_prepared_query_prefix_is_local_to_each_decode_chunk(monkeypatch, info):
+    from vllm_torchtpu.kernels.sparse_gqa_decode import decode
+
+    args = specs(16, 17)
+    launch = plan_decode(*args, kv_heads=2, ratio=4, k_scale=1.0, v_scale=1.0)
+    assert launch is not None
+    launch = dataclasses.replace(launch, config=launch.config_for_batch(8))
+    q, gate, blocks, _, table, cache = [jnp.zeros(x.shape, x.dtype) for x in args]
+    q = q.astype(jnp.float32) + 0.5
+    lengths = jnp.where(jnp.arange(16) % 2, 4, 0).astype(jnp.int32)
+    monkeypatch.setattr(
+        decode,
+        "virtual_page_metadata",
+        lambda blocks, lengths, table, **_: (
+            jnp.zeros((len(blocks), 18), jnp.int32),
+            lengths,
+        ),
+    )
+    monkeypatch.setattr(decode.schedule, "generate", lambda *args: None)
+
+    def identity_attention(**kwargs):
+        cu = kwargs["cu_q_lens"]
+        assert cu.shape == (9,)
+        # Encode the actual schedule query index so every chunk must restart at zero.
+        query = kwargs["query"] + cu[:-1][None, :, None, None, None]
+        return query, kwargs["cache"]
+
+    monkeypatch.setattr(decode, "decode_kernel", identity_attention)
+    output, _ = decode.execute_decode(
+        q,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        launch=launch,
+        prepared_cu=jnp.arange(17, dtype=jnp.int32),
+    )
+    expected = jnp.where(
+        (lengths > 0)[:, None, None],
+        q + (jnp.arange(16) % 8)[:, None, None],
+        0,
+    )
+    np.testing.assert_array_equal(output, expected)
+
+
 @pytest.mark.parametrize(
     "dtype,kv,ratio,page", [(jnp.bfloat16, 1, 4, 896), (jnp.float8_e4m3fn, 4, 8, 136)]
 )
@@ -254,6 +300,7 @@ def test_prefill_dma_layout_selects_bounded_fallback(monkeypatch, info, page, ro
 @pytest.mark.parametrize("page", [896, 1664])
 def test_small_vector_gather_keeps_physical_page_mapping(monkeypatch, info, page):
     from vllm_torchtpu.kernels.mla.sparse import kernel
+    from vllm_torchtpu.kernels.sparse_gqa_decode import tuned_block_sizes
 
     ratio, budget = 4, 512
     lengths = np.array([page + 5, 0], np.int32)
@@ -268,6 +315,10 @@ def test_small_vector_gather_keeps_physical_page_mapping(monkeypatch, info, page
         return jnp.take_along_axis(windows, logical, axis=1)
 
     monkeypatch.setattr(kernel, "gather_page_ids", vector_gather)
+    # Exercise the shared gather fallback independently of the resident page kernel.
+    monkeypatch.setattr(
+        tuned_block_sizes, "use_fused_page_metadata", lambda *args: False
+    )
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
     actual, kv_lens = metadata.virtual_page_metadata(
         jnp.asarray(blocks),

@@ -31,20 +31,25 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.metadata import Metadata
 class BF16KeyReader:
     """Read native BF16 or its byte-carrier view without requantizing keys."""
 
-    @property
-    def packing(self) -> int:
-        return 2
+    packing: int = 2
 
     def validate(self, cache: jax.Array, width: int, layout: KVLayout) -> None:
         if layout != KVLayout.HEAD_ALONG_SUBLANE or cache.ndim != 4:
             raise ValueError("BF16 index keys require a four-dimensional HEAD cache")
         if cache.dtype == jnp.bfloat16:
-            if cache.shape[2:] != (2, width):
+            if self.packing < 2 or self.packing & (self.packing - 1):
+                raise ValueError("native BF16 key packing must be a power of two >= 2")
+            if cache.shape[2:] != (self.packing, width):
                 raise ValueError(
-                    "native BF16 index keys require [pages, rows, 2, width]"
+                    "native BF16 index keys require [pages, rows, packing, width]"
                 )
         elif cache.dtype in (jnp.uint8, jnp.float8_e4m3fn):
-            if cache.shape[2] != 4 or cache.shape[-1] != width or cache.shape[-1] % 128:
+            if (
+                self.packing != 2
+                or cache.shape[2] != 4
+                or cache.shape[-1] != width
+                or cache.shape[-1] % 128
+            ):
                 raise ValueError(
                     "BF16 carrier requires packing 4 and aligned storage width"
                 )
@@ -91,5 +96,5 @@ class QSAIndexSchedule:
         )
 
 
-def qsa_indexing() -> StreamIndexComponents:
-    return StreamIndexComponents(BF16KeyReader(), QSAIndexSchedule())
+def qsa_indexing(*, key_packing: int = 2) -> StreamIndexComponents:
+    return StreamIndexComponents(BF16KeyReader(key_packing), QSAIndexSchedule())

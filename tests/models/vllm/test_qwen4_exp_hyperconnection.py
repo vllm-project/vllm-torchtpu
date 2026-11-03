@@ -774,6 +774,77 @@ class _StandInBlock(nn.Module):
         return torch.sigmoid(F.linear(x, self.weight))
 
 
+@pytest.mark.parametrize("state_kind", ["tuple", "packed", "broadcast"])
+@torch.inference_mode()
+def test_indexed_decoder_combines_attention_once_for_each_mix_state(state_kind):
+    from vllm_torchtpu.models.vllm.qwen4_exp import model as qwen4_model
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projected = []
+
+        def can_prefetch_output(self, hidden):
+            return True
+
+        def forward(
+            self, mixed, positions, metadata, residual=None, hc_gate=None, **kw
+        ):
+            self.projected.append(residual is not None)
+            output = torch.tanh(mixed)
+            if residual is None:
+                return output
+            return torch.cat(
+                [
+                    residual[:, branch * 8 : (branch + 1) * 8].float()
+                    + output.float() * hc_gate[:, branch : branch + 1]
+                    for branch in range(2)
+                ],
+                dim=-1,
+            ).bfloat16()
+
+    torch.manual_seed(758)
+    config = HyperConnectionConfig(hidden_size=8, hc_count=2, hc_lowrank=4)
+    layer = qwen4_model.Qwen4ExpDecoderLayer.__new__(qwen4_model.Qwen4ExpDecoderLayer)
+    nn.Module.__init__(layer)
+    layer.ple = None
+    layer.layer_type = "indexed_attention"
+    layer.self_attn = Attention()
+    layer.attn_hyper_connection = GatedResidual(config, prefill_full_tile=0)
+    layer.mlp_hyper_connection = GatedResidual(config, prefill_full_tile=0)
+    layer.mlp = nn.Identity()
+    x = torch.randn(3, 8 if state_kind == "broadcast" else 16).bfloat16()
+    expanded = x.repeat(1, 2) if state_kind == "broadcast" else x
+    mixed, (hyper, norm) = layer.attn_hyper_connection.mix(expanded)
+    attention_mix = None
+    if state_kind != "tuple":
+        state = HcPackedMixState(
+            x,
+            F.linear(norm, layer.attn_hyper_connection.block_inject_weight.weight),
+            layer.attn_hyper_connection._hc_owner_id,
+            broadcast=state_kind == "broadcast",
+        )
+        attention_mix = qwen4_model.HcCrossLayerMix(expanded, mixed, state)
+    valid = torch.tensor([True, False, True])
+    combined = layer.attn_hyper_connection.combine(torch.tanh(mixed), (hyper, norm))
+    mlp_input, mlp_state = layer.mlp_hyper_connection.mix(combined)
+    expected = layer.mlp_hyper_connection.combine(
+        torch.where(valid[:, None], mlp_input, 0), mlp_state
+    )
+    actual = layer.forward(
+        expanded,
+        torch.arange(3),
+        torch.zeros(3, dtype=torch.int64),
+        torch.tensor([0, 3], dtype=torch.int32),
+        torch.empty(0, 2, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+        valid,
+        attention_mix=attention_mix,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert layer.self_attn.projected == [state_kind == "tuple"]
+
+
 @TPU
 @pytest.mark.parametrize("compiled", [False, True])
 def test_hc_tpu_decoder_forward_packed_boundary(monkeypatch, compiled):

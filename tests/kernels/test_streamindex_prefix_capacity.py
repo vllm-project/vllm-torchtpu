@@ -72,6 +72,106 @@ module = importlib.import_module(
 
 
 @pytest.mark.parametrize(
+    "batch,chunk", [(1, None), (3, None), (8, None), (9, None), (16, None), (16, 8)]
+)
+def test_per_query_contract_omits_empty_passes_and_preserves_selection(
+    monkeypatch, batch, chunk
+):
+    from tests.kernels.test_streamindex_topk_backend import ReferenceTopK
+    from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
+
+    passes = []
+    pitches = []
+
+    def pallas_call(kernel, **kwargs):
+        shape = kwargs["out_shape"].shape
+        passes.append((kwargs["name"], kernel.keywords["seq_batch_size"]))
+        pitches.append(shape[1] * shape[2])
+
+        def call(*args):
+            bits = jnp.arange(shape[1] * 128, dtype=jnp.int32) + 0x3F000000
+            return jnp.broadcast_to(bits.reshape(1, shape[1], 128), shape)
+
+        return call
+
+    monkeypatch.setattr(module.pl, "pallas_call", pallas_call)
+    monkeypatch.setattr(
+        module.pltpu,
+        "get_tpu_info",
+        lambda: module.pltpu.get_tpu_info_for_chip(module.pltpu.ChipVersion.TPU_7X, 1),
+    )
+    lengths = np.resize([0, 1, 511, 512, 513, 1024], batch).astype(np.int32)
+    args = (
+        jnp.ones((batch, 4, 128), jnp.bfloat16),
+        jnp.ones((batch, 4), jnp.float32),
+        jnp.zeros((8, 16, 2, 128), jnp.bfloat16),
+        jnp.asarray(lengths),
+        jnp.tile(jnp.arange(8, dtype=jnp.int32), batch),
+    )
+    options = dict(
+        k=128,
+        compression_ratio=4,
+        num_kv_pages_per_block=4,
+        num_queries_per_block=1,
+        decode_req_batch_size=8,
+        components=qsa_indexing(),
+        topk_backend=ReferenceTopK(),
+        chunk_tokens=chunk,
+    )
+    legacy = module.streamindex_topk.__wrapped__(
+        *args,
+        jnp.arange(batch + 1, dtype=jnp.int32),
+        jnp.full((3,), batch, jnp.int32),
+        **options,
+    )
+    passes.clear()
+    pitches.clear()
+    actual = module.streamindex_topk.__wrapped__(*args, None, None, **options)
+    np.testing.assert_array_equal(actual, legacy)
+    visible = lengths // 4
+    expected = np.where(
+        np.arange(128)[None, :] < np.minimum(visible, 128)[:, None],
+        visible[:, None] - 1 - np.arange(128)[None, :],
+        -1,
+    )
+    np.testing.assert_array_equal(actual, expected)
+    chunks = 1 if chunk is None else batch // chunk
+    groups = ([8] if batch >= 8 else []) + ([1] if batch % 8 else [])
+    assert [size for _, size in passes] == groups * chunks
+    assert all(name.startswith("StreamIdxTC-d-") for name, _ in passes)
+    assert all(pitch % 1024 == 0 for pitch in pitches)
+
+
+@pytest.mark.parametrize(
+    "starts,distribution,tokens,uniform",
+    [
+        (None, [1, 1, 1], 1, None),
+        ([0, 1], None, 1, None),
+        (None, None, 2, None),
+        (None, None, 1, 2),
+    ],
+)
+def test_per_query_contract_rejects_ambiguous_metadata(
+    starts, distribution, tokens, uniform
+):
+    with pytest.raises(ValueError, match="query|cu_q_lens"):
+        module.streamindex_topk.__wrapped__(
+            jnp.ones((tokens, 4, 128), jnp.bfloat16),
+            jnp.ones((tokens, 4), jnp.float32),
+            jnp.zeros((8, 16, 2, 128), jnp.bfloat16),
+            jnp.array([1024], jnp.int32),
+            jnp.arange(8, dtype=jnp.int32),
+            None if starts is None else jnp.array(starts, jnp.int32),
+            None if distribution is None else jnp.array(distribution, jnp.int32),
+            k=128,
+            compression_ratio=4,
+            num_kv_pages_per_block=4,
+            num_queries_per_block=1,
+            uniform_q_len=uniform,
+        )
+
+
+@pytest.mark.parametrize(
     "tokens,ratio,k,page,blocks,expected",
     [
         (8192, 4, 512, 32, (8, 8, 8), 2048),

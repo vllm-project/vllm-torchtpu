@@ -26,9 +26,22 @@ from vllm_torchtpu.kernels.sparse_gqa_decode.batching import attend_in_chunks
 from vllm_torchtpu.kernels.sparse_gqa_decode.fused_kernel import decode_kernel
 from vllm_torchtpu.kernels.sparse_gqa_decode.metadata import virtual_page_metadata
 from vllm_torchtpu.kernels.sparse_gqa_decode.planning import DecodeLaunch
+from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import prepare_query
 
 
-def _attend(q, gate, blocks, lengths, table, cache, *, launch, k_scale, v_scale):
+def _attend(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    launch,
+    k_scale,
+    v_scale,
+    prepared_cu=None,
+):
     batch, heads, dim = q.shape
     cfgs = launch.config_for_batch(batch)
     kv_heads, ratio = cfgs.model.num_kv_heads, cfgs.serve.page_size
@@ -39,13 +52,16 @@ def _attend(q, gate, blocks, lengths, table, cache, *, launch, k_scale, v_scale)
         cfgs, serve=dataclasses.replace(cfgs.serve, scale_k=k_scale, scale_v=v_scale)
     )
     # Keep request order; the compact schedule omits inactive requests.
-    query = jnp.where((lengths > 0)[:, None, None], q, 0).astype(jnp.float32)
-    query = query.reshape(batch, kv_heads, heads // kv_heads, 1, dim).swapaxes(0, 1)
+    query = prepare_query(q, lengths, kv_heads)
     virtual_cache = cache.reshape(-1, ratio, *cache.shape[2:])
     # RPA's buffer binding accepts a new-KV operand even when cache updates and
     # new-KV DMAs are disabled. No dummy K/V preparation or concatenation needed.
     unused_new_kv = jnp.zeros((batch, *cache.shape[2:]), cache.dtype)
-    cu_q_lens = jnp.arange(batch + 1, dtype=jnp.int32)
+    if prepared_cu is not None:
+        assert prepared_cu.shape == (batch + 1,) and prepared_cu.dtype == jnp.int32
+    cu_q_lens = (
+        jnp.arange(batch + 1, dtype=jnp.int32) if prepared_cu is None else prepared_cu
+    )
     q_lens = (kv_lens > 0).astype(jnp.int32)
     metadata = schedule.generate(cu_q_lens, kv_lens, pages, cfgs)
     out, next_cache = decode_kernel(
@@ -78,8 +94,18 @@ def execute_decode(
     initial_output: jax.Array | None = None,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    prepared_cu: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    attend = functools.partial(_attend, launch=launch, k_scale=k_scale, v_scale=v_scale)
+    if launch.chunk_queries < len(q):
+        # Every chunk addresses its local query rows from zero.
+        prepared_cu = None
+    attend = functools.partial(
+        _attend,
+        launch=launch,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        prepared_cu=prepared_cu,
+    )
     return attend_in_chunks(
         attend,
         q,

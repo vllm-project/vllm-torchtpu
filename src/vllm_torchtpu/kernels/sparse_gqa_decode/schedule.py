@@ -61,15 +61,41 @@ def field_names(shape: schedule.RpaSchedule) -> tuple[str, ...]:
     return tuple(name for name in names if name in POPULATED_FIELDS | UNUSED_FIELDS)
 
 
-def _kernel(meta_ref, *out_refs, cfgs, names):
+def _kernel(cu_ref, lengths_ref, *out_refs, cfgs, names):
     steps, lanes = cfgs.max_steps_ub, cfgs.batch_size
+    # Keep steps on vector lanes while assigning tasks, then expand directly
+    # into the existing RPA protocol without an intermediate HBM owner.
+    slots = jnp.arange(steps)[None, :] * lanes + jnp.arange(lanes)[:, None]
+    seq = jnp.zeros((lanes, steps), jnp.int32)
+    tile = jnp.zeros_like(seq)
+    length = jnp.zeros_like(seq)
+    query = jnp.zeros_like(seq)
+    last = jnp.zeros_like(seq)
+    begin = jnp.int32(0)
+    for row in range(lengths_ref.shape[0]):
+        count = (lengths_ref[row] + cfgs.bkv_sz - 1) // cfgs.bkv_sz
+        end = begin + count
+        mask = (slots >= begin) & (slots < end)
+        seq = jnp.where(mask, row, seq)
+        tile = jnp.where(mask, slots - begin, tile)
+        length = jnp.where(mask, lengths_ref[row], length)
+        query = jnp.where(mask, cu_ref[row], query)
+        last = jnp.where(mask, (slots == end - 1).astype(jnp.int32), last)
+        begin = end
+    live = (slots < begin).astype(jnp.int32)
+    meta = tuple(
+        jnp.pad(row.T, ((0, 0), (0, pltpu.get_tpu_info().num_lanes - lanes)))
+        for row in (seq, tile, length, live, query, last)
+    )
+    out_refs[-1][...] = jnp.full((1,), (begin + lanes - 1) // lanes, jnp.int32)
+    out_refs = out_refs[:-1]
 
     def lane(row):
-        return meta_ref[row, :, :lanes]
+        return meta[row][:, :lanes]
 
     def gather(row, indices):
         return jnp.take_along_axis(
-            meta_ref[row, :, :],
+            meta[row],
             jnp.broadcast_to(indices[None, :], (steps, indices.size)),
             axis=1,
         )
@@ -156,64 +182,32 @@ def generate(
     assert steps * lanes >= len(lengths) * pl.cdiv(
         cfgs.serve.pages_per_seq * cfgs.serve.page_size, cfgs.bkv_sz
     )
-    tiles = (lengths + cfgs.bkv_sz - 1) // cfgs.bkv_sz
-    ends = jnp.cumsum(tiles)
-    slots = jnp.arange(steps * lanes).reshape(steps, lanes)
-    seq = jnp.minimum(jnp.sum(slots[..., None] >= ends, axis=-1), len(lengths) - 1)
-    begins = jnp.concatenate((jnp.zeros(1, jnp.int32), ends[:-1]))
-    k = slots - begins[seq]
-    live = slots < ends[-1]
-    last = live & (k == tiles[seq] - 1)
-    meta = jnp.stack(
-        (
-            seq,
-            k,
-            lengths[seq],
-            live.astype(jnp.int32),
-            jnp.where(live, cu_q_lens[seq], 0),
-            last.astype(jnp.int32),
-        )
-    )
-    meta = jnp.pad(meta, ((0, 0), (0, 0), (0, pltpu.get_tpu_info().num_lanes - lanes)))
-    fields = (
-        ("s_idx", shape.s_idx),
-        ("q_idx", shape.q_idx),
-        ("k_idx", shape.k_idx),
-        ("is_last_k", shape.is_last_k),
-        ("do_writeback", shape.do_writeback),
-        ("dma_q", shape.dma_q),
-        ("dma_kv_cache", shape.dma_kv_cache),
-        ("dma_kv_new", shape.dma_kv_new),
-        ("total_wait_kv_in", shape.total_wait_kv_in),
-        ("total_wait_kv_out", shape.total_wait_kv_out),
-        ("total_wait_q_in", shape.total_wait_q_in),
-        ("total_wait_o_out", shape.total_wait_o_out),
-        ("total_wait_lse_out", shape.total_wait_lse_out),
-    )
-    names = tuple(name for name, _ in fields)
-    if names != field_names(shape):
-        raise ValueError("RpaSchedule field order changed")
+    names = field_names(shape)
     out_shape = [
-        jax.ShapeDtypeStruct((steps, ref.data.size // steps), jnp.int32)
-        for _, ref in fields
+        jax.ShapeDtypeStruct(
+            (steps, getattr(shape, name).data.size // steps), jnp.int32
+        )
+        for name in names
     ]
-    outputs = list(
-        pl.pallas_call(
-            functools.partial(_kernel, cfgs=cfgs, names=names),
-            out_shape=out_shape,
-            name="qsa_decode_schedule",
-        )(meta)
-    )
+    outputs = pl.pallas_call(
+        functools.partial(_kernel, cfgs=cfgs, names=names),
+        grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2),
+        out_shape=[*out_shape, jax.ShapeDtypeStruct((1,), jnp.int32)],
+        name="qsa_decode_schedule",
+    )(cu_q_lens, lengths)
+    outputs = list(outputs)
     dma_index = names.index("dma_kv_cache")
     dma = outputs[dma_index].reshape(steps, lanes, cfgs.bkv_p_cache, len(KV_DMA_FIELDS))
-    # Shared RPA buffers consume physical page IDs from the schedule itself.
+    live = outputs[names.index("s_idx")].reshape(steps, lanes) >= 0
     sources = pages.reshape(-1)[dma[..., 0]]
     dma = dma.at[..., 0].set(jnp.where(live[..., None], sources, 0))
     outputs[dma_index] = dma.reshape(outputs[dma_index].shape)
-    return jax.tree.unflatten(
-        jax.tree.structure(shape),
-        [
-            *(value.reshape(-1) for value in outputs),
-            ((ends[-1:] + lanes - 1) // lanes).astype(jnp.int32),
-        ],
+    result = {
+        name: dataclasses.replace(getattr(shape, name), data=value.reshape(-1))
+        for name, value in zip(names, outputs)
+    }
+    return dataclasses.replace(
+        shape,
+        **result,
+        actual_steps=outputs[-1],
     )
