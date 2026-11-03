@@ -428,3 +428,125 @@ def swa_prepare_publish(banks, table, starts, positions, minimum, values):
     updated = write_swa_pages(pages, records, values, prepared=packed)
     owners = updated if isinstance(updated, tuple) else (updated,)
     return (*owners, metadata, bounds, records)
+
+
+def supports_compressor_state_packed(
+    tokens: int,
+    table_shape: tuple[int, ...],
+    capacity: int,
+    page_stride: int,
+    row_offset: int,
+    window: int,
+) -> bool:
+    """Measured decode envelope; other geometries retain native metadata."""
+    return (tokens, table_shape, capacity, page_stride, row_offset, window) == (
+        288,
+        (48, 8),
+        16,
+        16,
+        0,
+        128,
+    )
+
+
+def _compressor_state_addresses(table, starts, kv_starts, positions, minimum):
+    capacity, stride, offset = 16, 16, 0
+    tokens, requests = positions.size, table.shape[0]
+    rows = jnp.arange(tokens, dtype=jnp.int32)
+    r = jnp.arange(requests, dtype=jnp.int32)[:, None]
+
+    def map_requests(boundaries):
+        req = jnp.minimum(
+            jnp.sum(rows[None, :] >= boundaries[1:, None], axis=0), requests - 1
+        )
+        return req[None, :] == r
+
+    selected = map_requests(starts)
+
+    def select(values):
+        return jnp.sum(jnp.where(selected, values[:, None], 0), axis=0)
+
+    first, end, blocks = select(starts[:-1]), select(starts[1:]), select(table[:, 0])
+    has_prev = rows != first
+    active = rows < starts[-1]
+    slots = jnp.where(active, blocks * capacity + positions % capacity, -1)
+    previous = jnp.where(active, blocks * capacity + (positions - 1) % capacity, -1)
+    stored = (slots >= 0) & (rows >= end - capacity)
+    replay_start = jnp.sum(
+        jnp.where(map_requests(kv_starts), minimum[:, None], 0), axis=0
+    )
+    replay = (
+        (replay_start > 0)
+        & (positions >= replay_start)
+        & (positions < replay_start + 128)
+    )
+    valid = (rows < kv_starts[-1]) & ((positions + 1) % 2 == 0) & ~replay
+
+    def physical(slot):
+        return offset + slot // capacity * stride + slot % capacity
+
+    return (
+        has_prev.astype(jnp.int32),
+        valid.astype(jnp.int32),
+        jnp.where(stored, physical(slots), -1),
+        jnp.where(has_prev | (slots < 0), -1, physical(previous)),
+    )
+
+
+def compressor_state_packed(
+    table: jax.Array,
+    starts: jax.Array,
+    kv_starts: jax.Array,
+    positions: jax.Array,
+    minimum: jax.Array,
+    *,
+    total_records: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Decode flags and stable ring tables for one 288-token compressor tile."""
+    args = (table, starts, kv_starts, positions, minimum)
+    shapes = ((48, 8), (49,), (49,), (288,), (48,))
+    if any(
+        x.shape != shape or x.dtype != jnp.int32
+        for x, shape in zip(args, shapes, strict=True)
+    ):
+        raise ValueError("Packed compressor metadata requires INT32 decode shapes")
+
+    def compact(records):
+        n = records.size
+        r = records.reshape(1, n)
+        valid = (r >= 0) & (r < total_records)
+        rank = prefix_sum(valid.astype(jnp.int32), axis=1) - 1
+        match = valid & (rank == jnp.arange(n, dtype=jnp.int32)[:, None])
+        token = jnp.sum(jnp.where(match, jnp.arange(n)[None, :], 0), axis=1)
+        record = jnp.sum(jnp.where(match, r, 0), axis=1)
+        count = jnp.sum(valid, dtype=jnp.int32)
+        return jnp.stack((token, record), axis=1), jnp.stack((jnp.int32(0), count))
+
+    def kernel(*refs):
+        prev, valid, write, read = _compressor_state_addresses(
+            *(r[...] for r in refs[:5])
+        )
+        outputs = (prev, valid, *compact(write), *compact(read))
+        for ref, value in zip(refs[5:], outputs, strict=True):
+            ref[...] = value
+
+    n = positions.shape[0]
+    outputs = pl.pallas_call(
+        kernel,
+        out_shape=tuple(
+            jax.ShapeDtypeStruct(s, jnp.int32)
+            for s in ((n,), (n,), (n, 2), (2,), (n, 2), (2,))
+        ),
+        name="dsv41_compressor_state_packed",
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes // 2
+        ),
+    )(*args)
+    return (
+        outputs[0][:, None],
+        outputs[1][:, None],
+        outputs[2].reshape(-1),
+        outputs[3],
+        outputs[4].reshape(-1),
+        outputs[5],
+    )

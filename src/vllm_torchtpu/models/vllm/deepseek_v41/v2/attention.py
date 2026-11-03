@@ -21,6 +21,9 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu.kernels.experimental.decode_preparation import (
+    supports_compressor_state_packed,
+)
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -505,6 +508,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _q_projection_rope_op: Any = None
     # TP1 FP8-KV layers run the fused Q-A/KV, Q-B and compressor kernels.
     _fused_preprocess = False
+    _packed_compressor_op: Any = None
     _swa_query_group_size = 1
 
     @classmethod
@@ -839,12 +843,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         ratio = self.compress_ratio
         kv_meta = metadata[self.prefix]
         index_k = self.indexer.k_cache
-        rows = torch.arange(positions.shape[0], device=positions.device)
-        valid = (rows < kv_meta.query_start_loc[-1]) & ((positions + 1) % ratio == 0)
         starts = _window_starts()
-        if starts is not None:
-            # Shared prefix rows must survive replay unchanged.
-            valid = valid & ~_replayed(kv_meta, positions, starts, self.window_size)
         compressed_slots = _cache_slots(
             self.kv_cache, kv_meta, positions, compress_ratio=ratio
         )
@@ -861,40 +860,98 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             compressor.norm.weight,
             self._rope_rows(group_positions, ratio),
         ]
-        pools = ()
-        if ratio == 1:
-            args += [torch.ones_like(positions[:, None]), valid[:, None].int()]
+        state_meta = metadata[compressor.state_cache.prefix] if ratio == 2 else None
+        state_cache = compressor.state_cache.kv_cache if ratio == 2 else None
+        packed = (
+            self._packed_compressor_op is not None
+            and state_meta is not None
+            and isinstance(state_cache, PagedCacheRows)
+            and state_cache.raw_hi is not None
+            and starts is not None
+            and starts.shape == (48,)
+            and kv_meta.query_start_loc.shape == (49,)
+            and state_meta.query_start_loc.shape == (49,)
+            and state_meta.seq_lens.numel() > 0
+            and hidden_states.shape == (288, 5120)
+            and supports_compressor_state_packed(
+                positions.shape[0],
+                tuple(_block_table(state_meta).shape),
+                state_cache.shape[1],
+                state_cache.page_stride,
+                state_cache.row_offset,
+                self.window_size,
+            )
+            and all(
+                x.dtype == torch.int32
+                for x in (
+                    _block_table(state_meta),
+                    state_meta.query_start_loc,
+                    kv_meta.query_start_loc,
+                    positions,
+                    starts,
+                )
+            )
+        )
+        if packed:
+            assert state_meta is not None and state_cache is not None
+            assert state_cache.raw_hi is not None
+            latent, words, scales, low, high, valid = self._packed_compressor_op(
+                _block_table(state_meta),
+                state_meta.query_start_loc,
+                kv_meta.query_start_loc,
+                positions,
+                starts,
+                *args,
+                state_cache.raw,
+                state_cache.raw_hi,
+            )
+            state_cache.raw.copy_(low)
+            state_cache.raw_hi.copy_(high)
         else:
-            state_meta = metadata[compressor.state_cache.prefix]
-            state_cache = compressor.state_cache.kv_cache
-            pools = tuple(
-                p for p in (state_cache.raw, state_cache.raw_hi) if p is not None
+            rows = torch.arange(positions.shape[0], device=positions.device)
+            valid = (rows < kv_meta.query_start_loc[-1]) & (
+                (positions + 1) % ratio == 0
             )
-            starts_loc = state_meta.query_start_loc
-            requests = _token_requests(state_meta, positions).clamp(
-                max=starts_loc.numel() - 2
+            if starts is not None:
+                valid = valid & ~_replayed(kv_meta, positions, starts, self.window_size)
+            pools = ()
+            if ratio == 1:
+                args += [torch.ones_like(positions[:, None]), valid[:, None].int()]
+            else:
+                state_meta = metadata[compressor.state_cache.prefix]
+                state_cache = compressor.state_cache.kv_cache
+                pools = tuple(
+                    p for p in (state_cache.raw, state_cache.raw_hi) if p is not None
+                )
+                starts_loc = state_meta.query_start_loc
+                requests = _token_requests(state_meta, positions).clamp(
+                    max=starts_loc.numel() - 2
+                )
+                # A request's first row pools with the ring's stored predecessor;
+                # only its last ring-capacity rows are stored.
+                has_prev = rows != starts_loc[requests]
+                slots = _cache_slots(state_cache, state_meta, positions, ring=True)
+                previous = _cache_slots(
+                    state_cache, state_meta, positions - 1, ring=True
+                )
+                stored = (slots >= 0) & (
+                    rows >= starts_loc[requests + 1] - state_cache.shape[1]
+                )
+                args += [
+                    has_prev[:, None].int(),
+                    valid[:, None].int(),
+                    *pools,
+                    state_cache.row_indices(slots).masked_fill(~stored, -1).int(),
+                    state_cache.row_indices(previous)
+                    .masked_fill(has_prev | (slots < 0), -1)
+                    .int(),
+                ]
+            op = preprocess_ops.compress_rope(
+                ratio, len(pools), compressor.rms_norm_eps
             )
-            # A request's first row pools with the ring's stored predecessor;
-            # only its last ring-capacity rows are stored.
-            has_prev = rows != starts_loc[requests]
-            slots = _cache_slots(state_cache, state_meta, positions, ring=True)
-            previous = _cache_slots(state_cache, state_meta, positions - 1, ring=True)
-            stored = (slots >= 0) & (
-                rows >= starts_loc[requests + 1] - state_cache.shape[1]
-            )
-            args += [
-                has_prev[:, None].int(),
-                valid[:, None].int(),
-                *pools,
-                state_cache.row_indices(slots).masked_fill(~stored, -1).int(),
-                state_cache.row_indices(previous)
-                .masked_fill(has_prev | (slots < 0), -1)
-                .int(),
-            ]
-        op = preprocess_ops.compress_rope(ratio, len(pools), compressor.rms_norm_eps)
-        latent, words, scales, *states = op(*args)
-        for pool, state in zip(pools, states, strict=True):
-            pool.copy_(state)
+            latent, words, scales, *states = op(*args)
+            for pool, state in zip(pools, states, strict=True):
+                pool.copy_(state)
         records = self.kv_cache.row_indices(compressed_slots.clamp(min=0))
         csa2_adapter.publish_main(
             self.kv_cache,
@@ -2054,6 +2111,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             preprocess_ops.qb_rope()
             if self.compressor is not None:
                 ratio = self.compress_ratio
+                if ratio == 2:
+                    self._packed_compressor_op = preprocess_ops.compress_rope_packed(
+                        self.compressor.rms_norm_eps
+                    )
                 for banks in (0,) if ratio == 1 else (1, 2):
                     preprocess_ops.compress_rope(
                         ratio, banks, self.compressor.rms_norm_eps

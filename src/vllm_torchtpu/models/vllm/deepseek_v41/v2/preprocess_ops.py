@@ -23,6 +23,7 @@ from vllm_torchtpu.kernels.attention_preprocessing import (
 from vllm_torchtpu.kernels.attention_preprocessing import qa_rope as qa_kernel
 from vllm_torchtpu.kernels.attention_preprocessing import qb_rope as qb_kernel
 from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
+from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_pallas_op_mesh
 
 _HEAD_DIM = 512
@@ -249,4 +250,74 @@ def compress_rope(ratio: int, banks: int, eps: float) -> Any:
         f"compress_rope_r{ratio}_b{banks}_e{_tag(eps)}",
         lambda: (_compress_bridge(ratio, banks, eps), _compress_fake(banks)),
         donate=tuple(range(6, 6 + banks)),
+    )
+
+
+def compress_rope_packed(eps: float) -> Any:
+    """Registered decode metadata + ratio-2 compressor, with two donated banks."""
+    from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
+        get_tpu_version,
+    )
+
+    if jax.default_backend() != "tpu" or get_tpu_version() != 7:
+        return None
+
+    def build():
+        def run(
+            table: jax.Array,
+            starts: jax.Array,
+            kv_starts: jax.Array,
+            positions: jax.Array,
+            minimum: jax.Array,
+            x: jax.Array,
+            weight: jax.Array,
+            gamma: jax.Array,
+            rows: jax.Array,
+            low: jax.Array,
+            high: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            records = (low.shape[0] + high.shape[0]) // compress_kernel._RECORD_ROWS
+            prev, valid, wp, wo, rp, ro = decode_preparation.compressor_state_packed(
+                table, starts, kv_starts, positions, minimum, total_records=records
+            )
+            latent, words, scales, state = compress_kernel.fused_compress_rope(
+                x,
+                weight,
+                gamma,
+                rows,
+                prev,
+                valid,
+                (low, high),
+                eps=eps,
+                ring_tables=(wp, wo, rp, ro),
+            )
+            assert isinstance(state, tuple)
+            return latent, words, scales, *state, valid[:, 0] != 0
+
+        def fake(
+            table,
+            starts,
+            kv_starts,
+            positions,
+            minimum,
+            x,
+            weight,
+            gamma,
+            rows,
+            low,
+            high,
+        ):
+            return (
+                x.new_empty((x.shape[0], 512), dtype=torch.bfloat16),
+                x.new_empty((x.shape[0], 128), dtype=torch.int32),
+                x.new_empty((x.shape[0], 1), dtype=torch.float32),
+                torch.empty_like(low),
+                torch.empty_like(high),
+                x.new_empty((x.shape[0],), dtype=torch.bool),
+            )
+
+        return run, fake
+
+    return _get(
+        f"compress_rope_packed_c16_s16_o0_w128_e{_tag(eps)}", build, donate=(9, 10)
     )
