@@ -132,7 +132,7 @@ def _kernel(x_ref, w_ref, w_scale_ref, *refs, out_block, n_first, w_nk, head_dim
     @pl.when(s > 0)
     def _():
         n_chunks = w_scale_ref.shape[1] // out_block
-        per_chunk = -(-len(quant_starts) // n_chunks)
+        n_quant = len(quant_starts)
         x_q = x_q_ref.at[(s + 1) % 2]
         x_scale = x_scale_ref[(s + 1) % 2]
         # One basic block, so the scheduler interleaves the quantization of
@@ -165,7 +165,11 @@ def _kernel(x_ref, w_ref, w_scale_ref, *refs, out_block, n_first, w_nk, head_dim
             else:
                 part = pl.ds(col - n_first, out_block)
                 out_refs[1][:, part] = acc.astype(out_refs[1].dtype)
-            quantize(quant_starts[j * per_chunk : (j + 1) * per_chunk])
+            # Spread evenly: ceil-sized shares would leave the last chunks
+            # with none (16 steps over 5 chunks: 4, 4, 4, 4, 0).
+            quantize(
+                quant_starts[j * n_quant // n_chunks : (j + 1) * n_quant // n_chunks]
+            )
 
 
 @functools.partial(
