@@ -253,6 +253,59 @@ class MhcPreParityTest(parameterized.TestCase):
             self.assertTrue(bool(jnp.isfinite(out.astype(jnp.float32)).all()))
 
 
+class MhcGatesTokensOnLanesTest(parameterized.TestCase):
+    """The kernels' tokens-on-lanes post/comb gates vs the XLA gates."""
+
+    @parameterized.product(num_tokens=[16, 128], sinkhorn_repeat=[1, 2, 20])
+    def test_matches_xla_gates(self, num_tokens, sinkhorn_repeat):
+        hidden_size = 7168
+        hc_mult3 = 2 * HC_MULT + HC_MULT * HC_MULT
+        rng = np.random.default_rng(11)
+        mixes = jnp.asarray(
+            3 * rng.standard_normal((num_tokens, hc_mult3)), jnp.float32
+        )
+        sqrsum = jnp.asarray(rng.uniform(1e3, 1e5, (num_tokens, 1)), jnp.float32)
+        hc_scale = jnp.asarray(1.0 + 0.1 * rng.standard_normal(3), jnp.float32)
+        hc_base = jnp.asarray(0.5 * rng.standard_normal(hc_mult3), jnp.float32)
+
+        _, want_post, want_comb = utils.mhc_pre_gates(
+            mixes,
+            sqrsum,
+            HC_MULT,
+            hidden_size,
+            hc_scale,
+            hc_base,
+            RMS_EPS,
+            HC_PRE_EPS,
+            HC_SINKHORN_EPS,
+            HC_POST_MULT_VALUE,
+            sinkhorn_repeat,
+        )
+        got_post, got_comb = utils.mhc_post_comb_gates_t(
+            mixes.T,
+            sqrsum.T,
+            hc_scale[1],
+            hc_scale[2],
+            hc_base.reshape(hc_mult3, 1),
+            hc_mult=HC_MULT,
+            hidden_size=hidden_size,
+            rms_eps=RMS_EPS,
+            hc_sinkhorn_eps=HC_SINKHORN_EPS,
+            hc_post_mult_value=HC_POST_MULT_VALUE,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+
+        np.testing.assert_allclose(
+            _to_np(got_post.T), _to_np(want_post), rtol=F32_RTOL, atol=F32_ATOL
+        )
+        np.testing.assert_allclose(
+            _to_np(got_comb.T),
+            _to_np(want_comb).reshape(num_tokens, -1),
+            rtol=F32_RTOL,
+            atol=F32_ATOL,
+        )
+
+
 class MhcPostParityTest(parameterized.TestCase):
     @parameterized.product(num_tokens=[1, 17, 128], hidden_size=[256, 7168])
     def test_matches_torch_reference(self, num_tokens, hidden_size):
@@ -457,7 +510,7 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
 
     @parameterized.product(
         num_tokens=[16, 17, 128, 2048],
-        token_block_size=[32, 64],
+        token_block_size=[32, 64, 128],
     )
     def test_matches_sequential_reference(self, num_tokens, token_block_size):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
@@ -556,7 +609,7 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
             _to_np(got_sqrsum), _to_np(want_sqrsum), rtol=F32_RTOL, atol=F32_ATOL
         )
 
-    @parameterized.product(num_tokens=[16, 128], sinkhorn_repeat=[1, 20])
+    @parameterized.product(num_tokens=[16, 128, 1024], sinkhorn_repeat=[1, 20])
     def test_full_op_matches_reference(self, num_tokens, sinkhorn_repeat):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
 
