@@ -451,9 +451,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pooled GDN layers declare one prefill checkpoint block, so a prefill
     # chunk runs to the prompt end and the kernel writes the block-boundary
-    # state mid-chunk (gdn_pool_layout.prefill_checkpoint_enabled). Set it to
-    # the same value on every rank and PP stage: the scheduler requires
-    # identical MambaSpecs.
+    # state mid-chunk (gdn_pool_layout.prefill_checkpoint_enabled). On by
+    # default; 0 goes back to ending each prefill chunk at its last cacheable
+    # block boundary. Set it to the same value on every rank and PP stage: the
+    # scheduler requires identical MambaSpecs.
     "TPU_GDN_PREFILL_CHECKPOINT": env_bool("TPU_GDN_PREFILL_CHECKPOINT", default=True),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4

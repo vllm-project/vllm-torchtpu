@@ -26,20 +26,34 @@ from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
 
 class TestTpuCompilerCache:
     @staticmethod
-    def _config(*, max_num_seqs=16, num_gpu_blocks=1024, prefix_match_unit=None):
+    def _config(
+        *,
+        max_num_seqs=16,
+        num_gpu_blocks=1024,
+        mamba_cache_mode="none",
+        prefix_match_unit=None,
+    ):
         return SimpleNamespace(
             cache_config=SimpleNamespace(
                 gpu_memory_utilization=0.9,
                 num_gpu_blocks=num_gpu_blocks,
                 num_gpu_blocks_override=None,
+                mamba_cache_mode=mamba_cache_mode,
+                mamba_block_size=3072,
                 prefix_match_unit=prefix_match_unit,
             ),
-            model_config=SimpleNamespace(max_model_len=4096),
+            model_config=SimpleNamespace(
+                max_model_len=4096, architecture="Qwen3_5MoeForCausalLM"
+            ),
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=2048,
                 max_num_seqs=max_num_seqs,
             ),
-            parallel_config=SimpleNamespace(data_parallel_size=1),
+            parallel_config=SimpleNamespace(
+                data_parallel_size=1,
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+            ),
             speculative_config=None,
         )
 
@@ -57,13 +71,32 @@ class TestTpuCompilerCache:
             different_kv = compute_tpu_compilation_hash(
                 self._config(num_gpu_blocks=2048)
             )
-            different_prefix_unit = compute_tpu_compilation_hash(
-                self._config(prefix_match_unit=3072)
-            )
 
         assert base != different_batch
         assert base != different_kv
-        assert base != different_prefix_unit
+
+    def test_tpu_hash_covers_gdn_prefill_checkpoint_gate_only(self):
+        """The hash follows prefill_checkpoint_enabled, not its raw inputs."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            disabled = compute_tpu_compilation_hash(self._config())
+            enabled = compute_tpu_compilation_hash(
+                self._config(mamba_cache_mode="align")
+            )
+            enabled_block_unit = compute_tpu_compilation_hash(
+                self._config(mamba_cache_mode="align", prefix_match_unit=3072)
+            )
+            disabled_fine_unit = compute_tpu_compilation_hash(
+                self._config(mamba_cache_mode="align", prefix_match_unit=1024)
+            )
+
+        assert disabled != enabled
+        assert enabled == enabled_block_unit
+        assert disabled_fine_unit == disabled
 
     def test_tpu_hash_covers_plugin_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash

@@ -19,8 +19,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vllm_torchtpu.logger import init_logger
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+logger = init_logger(__name__)
 
 # Architectures whose recurrent layers read and write their state through the
 # attention-shaped pool. The Qwen3 and Qwen4Exp families build on
@@ -207,9 +211,19 @@ def prefill_checkpoint_enabled(vllm_config: VllmConfig) -> bool:
     assert cache.mamba_block_size is not None
     # vLLM 0.32.0 can hash a partial-hit state copy at the next block boundary
     # without writing it when an internal checkpoint skips that boundary.
-    return cache.prefix_match_unit is None or cache.prefix_match_unit >= (
-        cache.mamba_block_size * parallel.prefill_context_parallel_size
+    # TODO(https://github.com/vllm-project/vllm/issues/65264): remove this
+    # check once the pin has the fix.
+    logical_block = cache.mamba_block_size * parallel.prefill_context_parallel_size
+    unit = cache.prefix_match_unit
+    if unit is None or unit >= logical_block:
+        return True
+    logger.info_once(
+        "GDN internal prefill checkpoints are off: prefix_match_unit=%d is finer "
+        "than the logical Mamba block size %d.",
+        unit,
+        logical_block,
     )
+    return False
 
 
 @dataclass(frozen=True)

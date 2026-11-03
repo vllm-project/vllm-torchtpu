@@ -47,6 +47,7 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -433,11 +434,13 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "kv_cache": {
             "gpu_memory_utilization": cache_config.gpu_memory_utilization,
             "num_gpu_blocks": cache_config.num_gpu_blocks,
-            # Upstream CacheConfig.compute_hash ignores it, but it gates GDN
-            # prefill checkpoints (gdn_pool_layout.prefill_checkpoint_enabled),
-            # which changes the traced GDN op inputs.
-            "prefix_match_unit": cache_config.prefix_match_unit,
         },
+        # The GDN op traces with prefill checkpoint operands or with constant
+        # None inputs depending on this gate. Its inputs (prefix_match_unit,
+        # mamba_cache_mode, the PCP and DCP sizes, TPU_GDN_PREFILL_CHECKPOINT)
+        # are hashed only through the outcome, so changing one of them without
+        # flipping the gate keeps the cache.
+        "gdn_prefill_checkpoint": prefill_checkpoint_enabled(vllm_config),
         "scheduler": {
             "max_model_len": vllm_config.model_config.max_model_len,
             "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,

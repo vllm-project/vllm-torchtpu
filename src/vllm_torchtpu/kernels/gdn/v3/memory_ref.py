@@ -418,7 +418,11 @@ class StateOutBufferedRef(_GranuleStateRef):
                 assert self.cfg.window_size == 1
                 is_ckpt_tile = self.metadata_ref.is_prefill_ckpt_tile(p_id, idx)
                 dma_size = jnp.where(is_ckpt_tile, 1, 0)
-                ckpt_idx = self.metadata_ref.s_idx_to_prefill_ckpt_index[s_idx]
+                # -1 marks a sequence without a checkpoint; clamp so the
+                # zero-length DMA below never starts at a negative row.
+                ckpt_idx = jnp.maximum(
+                    self.metadata_ref.s_idx_to_prefill_ckpt_index[s_idx], 0
+                )
                 pltpu.make_async_copy(
                     vmem_ref.at[pl.ds(idx, dma_size), 0],
                     dst_ref.at[
