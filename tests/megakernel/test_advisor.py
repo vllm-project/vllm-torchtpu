@@ -156,8 +156,10 @@ _KIMI_GROUPED_B_TOK = 139264
 _KIMI_CROSS_T_MAX = 67
 _KIMI_1L_T_MAX = 384
 _QWEN38_CROSS_T_MAX = 42
-# Shipped Qwen3.5 decode megakernel: largest single-call verify bucket (rows).
-_QWEN35_SHIPPED_VERIFY_ROWS = 80
+# Shipped Qwen3.5 decode megakernel: microbatch rows when a verify bucket splits.
+# Buckets up to 112 rows still run as one call by trading expert-ring depth for
+# VMEM, which the advisor does not model.
+_QWEN35_SPLIT_VERIFY_ROWS = 80
 # 16 sequences x MTP-3 verify (4 rows per sequence) in one call.
 _QWEN35_VERIFY_ROWS_MIN = 64
 # Shipped Kimi-K3 prefill calls: embedding + layers 0-3, 11 groups, last layer.
@@ -889,7 +891,7 @@ def _preset_workload(
 
 
 def test_qwen35_decode_preset_whole_step_admits_shipped_verify_rows() -> None:
-    """Verify the whole_step ceiling fits 64 verify rows and lands near 80."""
+    """Verify the whole_step token tile fits 64 verify rows and the shipped split."""
     dep = advisor.DEPLOYMENT_PRESETS["qwen3.5-397b"]
     rows_per_seq = dep.decode.spec_tokens + 1
     rep = advisor.advise(
@@ -906,7 +908,7 @@ def test_qwen35_decode_preset_whole_step_admits_shipped_verify_rows() -> None:
     whole = next(s for s in rep.scopes if s.scope == "whole_step")
     rows_cap = rows_per_seq * (whole.t_vmem_max // rows_per_seq)
     assert rows_cap >= _QWEN35_VERIFY_ROWS_MIN
-    assert abs(rows_cap - _QWEN35_SHIPPED_VERIFY_ROWS) <= rows_per_seq
+    assert abs(rows_cap - _QWEN35_SPLIT_VERIFY_ROWS) <= rows_per_seq
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4, 8])
@@ -1021,7 +1023,7 @@ def test_whole_step_tiles_overflow_and_reads_weights_once() -> None:
         _preset_workload(
             dep.decode,
             phase="verify",
-            batch=_QWEN35_SHIPPED_VERIFY_ROWS // (dep.decode.spec_tokens + 1),
+            batch=_QWEN35_SPLIT_VERIFY_ROWS // (dep.decode.spec_tokens + 1),
             spec_tokens=dep.decode.spec_tokens,
             moe_mode="grouped_on_chip",
         ),
