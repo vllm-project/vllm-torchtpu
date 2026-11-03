@@ -267,6 +267,7 @@ if TYPE_CHECKING:
     VLLM_TPU_LOOP_LAG_WATCHDOG_S: float = 30.0
     VLLM_TPU_FREEZE_PYSPY_S: float = 120.0
     VLLM_TPU_REASONING_COUNT_SKIP_TOOLS: bool = False
+    VLLM_TPU_QSA_PREFILL_BITSET_OWNED: bool = False
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1639,6 +1640,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # re-parsing its tool calls (core/reasoning_count_patch.py). The full
     # re-parse is quadratic in tool-argument length and freezes the server.
     "VLLM_TPU_REASONING_COUNT_SKIP_TOOLS": env_bool("VLLM_TPU_REASONING_COUNT_SKIP_TOOLS"),
+    # Main-KV DCP sparse prefill: the selection bitset kernel emits this rank's
+    # words only, instead of a global bitset then an owned-word gather
+    # (bit-identical).
+    "VLLM_TPU_QSA_PREFILL_BITSET_OWNED": env_bool("VLLM_TPU_QSA_PREFILL_BITSET_OWNED"),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for

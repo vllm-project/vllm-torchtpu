@@ -146,8 +146,12 @@ def _selection_bitset(
     query_block,
     width,
     interpret=False,
+    owned=None,
 ):
     """int32[blocks, words, width] selection bitset without a scatter.
+
+    ``owned=(rank, dcp_world, words_per_tile, live_words)``: keep only this
+    DCP rank's words, numbered locally (``own_words`` of the global bitset).
 
     Equals ``_scatter_bitset`` reshaped to query blocks, transposed to
     word-major rows and zero padded to ``width`` query lanes. Each block only
@@ -158,6 +162,12 @@ def _selection_bitset(
     tokens = blocks.shape[0]
     nblocks = tokens // query_block
     word, bit = _selection_words(blocks, lengths, ratio=ratio, groups=groups)
+    if owned is not None:
+        rank, world, per_tile, live_words = owned
+        local = (word // (per_tile * world)) * per_tile + word % per_tile
+        keep = (word >= 0) & ((word // per_tile) % world == rank) & (local < live_words)
+        word = jnp.where(keep, local, -1)
+        bit = jnp.where(keep, bit, 0)
     rows = (word.shape[1] + 7) // 8 * 8
 
     def layout(array, fill):
@@ -635,17 +645,26 @@ def block_sparse_gqa_prefill(
             shape[axis] = words
             return jnp.where(owned_word_live.reshape(shape), taken, 0)
 
+    # VLLM_TPU_QSA_PREFILL_BITSET_OWNED: the bitset kernel numbers this rank's
+    # words itself, so the global bitset, its relayout copy and the owned-word
+    # gather drop out (bit-identical).
+    owned_kernel = dcp and envs.VLLM_TPU_QSA_PREFILL_BITSET_OWNED
     if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
         block_bits_native = _selection_bitset(
             blocks,
             lengths,
             ratio=ratio,
             groups=groups,
-            words=global_words if dcp else words,
+            words=global_words if dcp and not owned_kernel else words,
             query_block=query_block // parts,
             width=part_width,
+            **(
+                {"owned": (rank, dcp_world, words_per_tile, num_kv_tiles * words_per_tile)}
+                if owned_kernel
+                else {}
+            ),
         )
-        if dcp:
+        if dcp and not owned_kernel:
             block_bits_native = own_words(block_bits_native, 1)
         part_bits = block_bits_native.reshape(nblocks, parts, words, part_width)
         if paired_pages:
