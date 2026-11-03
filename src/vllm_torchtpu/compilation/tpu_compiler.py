@@ -315,6 +315,10 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
+    # Builds the chip-pair Pallas ops (wo_a o fetch, q send).
+    "vllm_torchtpu/models/vllm/deepseek_v4/attn_intra_chip.py",
+    # The q send's post-scheduler pass (under TPU_DSV4_ATTN_INTRA_CHIP_TP).
+    "vllm_torchtpu/compilation/q_send_reorder.py",
     # `get_pallas_op_mesh` decides whether the DSv4 Pallas ops are built with
     # the wrapper mesh or with none, like `build_ep_mesh` above.
     "vllm_torchtpu/models/vllm/vllm_model_wrapper_context.py",
