@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     TPU_CP_EMBED_REPLICA: bool = False
     TPU_CP_FUSED_EPILOGUE: bool = False
     TPU_CP_EARLY_HALO: bool = False
+    TPU_CP_PAGED_GATHER: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -555,6 +556,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # window) first, so its all-gather overlaps the prologue of the other rows
     # instead of waiting for all of them. Same rows.
     "TPU_CP_EARLY_HALO": env_bool("TPU_CP_EARLY_HALO", default=False),
+    # With TPU_CP_FUSED_PROLOGUE: the context-parallel layers all-gather their
+    # fp8 K/V as int8 rows in the prologue's [rows, slots, packing, d] layout,
+    # which the attention's page buffers split without a copy, instead of as
+    # 2-D [rows, slots * packing * d] rows. Same bytes.
+    "TPU_CP_PAGED_GATHER": env_bool("TPU_CP_PAGED_GATHER", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and

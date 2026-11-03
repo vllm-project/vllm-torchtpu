@@ -964,6 +964,11 @@ def _check_context_parallel(model: Gemma4Model, vllm_config: VllmConfig) -> None
                 "TPU_CP_EARLY_HALO without TPU_CP_FUSED_PROLOGUE",
                 envs.TPU_CP_EARLY_HALO and not envs.TPU_CP_FUSED_PROLOGUE,
             ),
+            # The prologue's K/V layout is what the paged gather carries.
+            (
+                "TPU_CP_PAGED_GATHER without TPU_CP_FUSED_PROLOGUE",
+                envs.TPU_CP_PAGED_GATHER and not envs.TPU_CP_FUSED_PROLOGUE,
+            ),
         )
         if present
     ]

@@ -48,6 +48,7 @@ around its one collective (an all-gather of `pack_kv_rows` rows, or of
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -714,10 +715,14 @@ def window_slots_from_rows(
     head_dim: int,
 ) -> jax.Array:
     """[world, window pages, page_size, 2 * kv_heads * d] `window_rows_held` of
-    every rank -> the [window pages, page_size, 2 * num_heads, d] K/V slots of
-    heads [first_head, first_head + num_heads), each page from its
-    `window_page_owners` rank."""
+    every rank (or [..., 2 * kv_heads, d]) -> the [window pages, page_size,
+    2 * num_heads, d] K/V slots of heads [first_head, first_head + num_heads),
+    each page from its `window_page_owners` rank."""
     pages = window_rows[owners, jnp.arange(owners.shape[0])]
+    if pages.ndim == 4:
+        return jax.lax.dynamic_slice_in_dim(
+            pages, 2 * first_head, 2 * num_heads, axis=2
+        )
     slots = jax.lax.dynamic_slice_in_dim(
         pages, 2 * first_head * head_dim, 2 * num_heads * head_dim, axis=2
     )
@@ -768,6 +773,10 @@ class LayerConfig:
     # The attention kernel skips the mask on steps that mask nothing
     # (`ragged_paged_attention(unmasked_interior=True)`).
     unmasked_interior: bool = False
+    # The from-qkv layers all-gather their fp8 K/V as int8 rows in the new-K/V
+    # layout ([rows, slots, packing, d], `exchange_rows_int8`), which a page
+    # buffer splits without a copy, instead of as [rows, slots * packing * d].
+    paged_gather: bool = False
 
     def __post_init__(self):
         if not self.head_page_writes:
@@ -936,7 +945,7 @@ def _full_attention(
     native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
     plan = cfg.plan(query.shape[0], page_size)
     rows = jax.lax.bitcast_convert_type(kv_rows, native.dtype)
-    pages = kv_pages_from_rows(rows, cfg.head_dim, page_size)
+    pages = _gathered_pages(rows, cfg.head_dim, page_size)
     first, count = tp_kv_heads(cfg.num_kv_heads, cfg.world, rank)
     table = _request_block_table(block_tables, seq_lens) * page_stride
     writes = full_attention_page_writes(plan, table, seq_lens[0])
@@ -1006,6 +1015,23 @@ def sliding_exchange_rows(
     return jax.lax.bitcast_convert_type(rows, jnp.int8)
 
 
+def exchange_rows_int8(new_kv: jax.Array, cfg: LayerConfig) -> jax.Array:
+    """The all-gather operand of fp8 K/V rows in the new-K/V layout ([rows,
+    slots, packing, d], `wrapper.prepare_inputs`): int8 rows of that layout with
+    `cfg.paged_gather`, else 2-D [rows, slots * packing * d]."""
+    rows = new_kv if cfg.paged_gather else new_kv.reshape(new_kv.shape[0], -1)
+    return jax.lax.bitcast_convert_type(rows, jnp.int8)
+
+
+def _gathered_pages(rows: jax.Array, head_dim: int, page_size: int) -> jax.Array:
+    """Exchanged fp8 rows -> HEAD_ALONG_SUBLANE pages: 2-D `pack_kv_rows`
+    rows through `kv_pages_from_rows`, new-K/V-layout rows by a split of their
+    leading axis."""
+    if rows.ndim == 2:
+        return kv_pages_from_rows(rows, head_dim, page_size)
+    return rows.reshape(rows.shape[0] // page_size, page_size, *rows.shape[1:])
+
+
 def sliding_exchange_rows_from_kv(
     new_kv: jax.Array,
     seq_lens: jax.Array,
@@ -1032,7 +1058,7 @@ def sliding_exchange_rows_from_kv(
             jnp.take(new_kv, _window_rows(plan, rank, position_pages), axis=0),
         ]
     )
-    return jax.lax.bitcast_convert_type(rows.reshape(rows.shape[0], -1), jnp.int8)
+    return exchange_rows_int8(rows, cfg)
 
 
 def sliding_exchange_rows_from_qkv(
@@ -1068,7 +1094,7 @@ def sliding_exchange_rows_from_qkv(
     _, new_kv = qkv_prologue(
         pick(qkv), pick(cos), pick(sin), q_norm_weight, k_norm_weight, cfg=cfg
     )
-    return jax.lax.bitcast_convert_type(new_kv.reshape(new_kv.shape[0], -1), jnp.int8)
+    return exchange_rows_int8(new_kv, cfg)
 
 
 def sliding_attention_layer(
@@ -1184,26 +1210,27 @@ def _sliding_attention(
     halo_pages, window_pages = _sliding_exchange_pages(cfg, page_size)
     halo, width = halo_pages * page_size, 2 * cfg.num_kv_heads * cfg.head_dim
     num_rows = 2 * halo + window_pages * page_size
-    if gathered.shape != (cfg.world * num_rows, width):
+    row_shape = gathered.shape[1:]
+    if gathered.shape[0] != cfg.world * num_rows or math.prod(row_shape) != width:
         raise ValueError(
             f"Exchange rows {gathered.shape} are not {cfg.world} x {num_rows} "
             f"rows of {width} bytes ({page_size}-token pages)."
         )
     if cfg.exchange_from_qkv:
         # Bitcast only the rows read: the whole buffer's bitcast is a copy.
-        rows = gathered.reshape(cfg.world, num_rows, width)
+        rows = gathered.reshape(cfg.world, num_rows, *row_shape)
 
         def fp8(x):
             return jax.lax.bitcast_convert_type(x, keys.dtype)
     else:
         rows = jax.lax.bitcast_convert_type(gathered, keys.dtype)
-        rows = rows.reshape(cfg.world, num_rows, width)
+        rows = rows.reshape(cfg.world, num_rows, *row_shape)
 
         def fp8(x):
             return x
 
     first_src, second_src = halo_neighbours(rank, cfg.world)
-    halos = kv_pages_from_rows(
+    halos = _gathered_pages(
         fp8(
             jnp.concatenate([rows[first_src, :halo], rows[second_src, halo : 2 * halo]])
         ),
@@ -1223,7 +1250,14 @@ def _sliding_attention(
         prepared_inputs=prepared_inputs,
         **cfg.rpa_kwargs(),
     )
-    window = rows[:, 2 * halo :].reshape(cfg.world, window_pages, page_size, width)
+    window = rows[:, 2 * halo :].reshape(
+        cfg.world,
+        window_pages,
+        page_size,
+        # New-K/V-layout rows keep d minor: merging (slots, packing), packing
+        # being the sublane tile, keeps their tiling.
+        *((width,) if len(row_shape) == 1 else (-1, cfg.head_dim)),
+    )
     position_pages, count = window_position_pages(
         seq_lens[0], cfg.sliding_window, page_size
     )

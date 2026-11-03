@@ -29,8 +29,10 @@ tensor-parallel KV cache as decode steps read it:
 vllm-torchtpu compiles functional collectives into the program and so needs
 every rank to run the same program: the rank reaches the ops as a device
 tensor, never as a constant (rank-specialized programs computed wrong results
-or hung in an 8-rank check). Each layer runs exactly one collective, on a 2-D
-tensor, whose result feeds the one op that produces the layer's output.
+or hung in an 8-rank check). Each layer runs exactly one collective, on 2-D
+int8 rows (or, with TPU_CP_PAGED_GATHER, int8 rows of the prologue's
+[rows, slots, packing, d] layout), whose result feeds the one op that produces
+the layer's output.
 
 The step must hold exactly one request, the whole prompt, at batch index 0;
 the caller checks that, and keeps prefix caching off (sliding-window layers
@@ -211,7 +213,8 @@ def _build_ops_from_qkv(cfg: cp_prefill.LayerConfig, cache_view) -> LayerOps:
         # Two piece tails of halo pages, then halo + 1 window pages.
         halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, args[-1])
         rows = (3 * halo_pages + 1) * args[-1]
-        return x.new_empty((rows, 2 * kv_heads * d), dtype=torch.int8)
+        row = (slots, 4, d) if cfg.paged_gather else (slots * 4 * d,)
+        return x.new_empty((rows, *row), dtype=torch.int8)
 
     if cfg.exchange_from_qkv:
         # (qkv, cos, sin, q norm weight, k norm weight, seq_lens, rank, page size)
@@ -338,6 +341,7 @@ def _layer_config(
         exchange_from_qkv=(
             envs.TPU_CP_EARLY_HALO and sliding and prologue_eps is not None
         ),
+        paged_gather=envs.TPU_CP_PAGED_GATHER and prologue_eps is not None,
     )
     if cfg.local_kv_heads != impl.num_kv_heads:
         raise ValueError(
@@ -539,8 +543,11 @@ def cp_prefill_attention_from_qkv(
         gathered = _waited(funcol.all_gather_single(exchanged, 0, group))
     q_hbm, new_kv = ops.prologue(qkv, cos, sin, *weights)
     if cfg.sliding_window is None:
-        # [rows, slots, 4, d] is `pack_kv_rows`' order: 2-D rows, as int8.
-        kv_rows = new_kv.view(torch.int8).reshape(rows, -1)
+        # [rows, slots, 4, d] is `pack_kv_rows`' order: as int8 rows of that
+        # layout (cfg.paged_gather) or 2-D.
+        kv_rows = new_kv.view(torch.int8)
+        if not cfg.paged_gather:
+            kv_rows = kv_rows.reshape(rows, -1)
         gathered = _waited(funcol.all_gather_single(kv_rows, 0, group))
         new_kv_cache, *out = ops.full_attention(
             kv_cache, q_hbm, gathered, seq_lens, block_tables, rank

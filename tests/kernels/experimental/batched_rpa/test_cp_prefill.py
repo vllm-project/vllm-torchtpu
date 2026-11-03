@@ -698,13 +698,21 @@ def test_sliding_exchange_rows_from_qkv_match_the_full_prologue(seq_len):
             rows, 2 * num_kv_heads, num_kv_heads, 128, rank
         )
         args = (seq_lens, jnp.array([rank], jnp.int32), PAGE)
+        paged = dataclasses.replace(cfg, paged_gather=True)
         with pltpu.force_tpu_interpret_mode():
             _, new_kv = cp_prefill.qkv_prologue(qkv, cos, sin, wq, wk, cfg=cfg)
             want = cp_prefill.sliding_exchange_rows_from_kv(new_kv, *args, cfg=cfg)
             got = cp_prefill.sliding_exchange_rows_from_qkv(
                 qkv, cos, sin, wq, wk, *args, cfg=cfg
             )
+            got_paged = cp_prefill.sliding_exchange_rows_from_qkv(
+                qkv, cos, sin, wq, wk, *args, cfg=paged
+            )
         np.testing.assert_array_equal(_bytes(got), _bytes(want))
+        assert got_paged.shape == (want.shape[0], *new_kv.shape[1:])
+        np.testing.assert_array_equal(
+            _bytes(got_paged).reshape(want.shape), _bytes(want)
+        )
 
 
 def _attention_stub(calls, pages_seen=None):
@@ -722,8 +730,9 @@ def _attention_stub(calls, pages_seen=None):
 
 
 @pytest.mark.parametrize("head_page_writes", [False, True])
+@pytest.mark.parametrize("paged_gather", [False, True])
 def test_full_attention_layer_from_q_caches_like_from_q_k_v(
-    monkeypatch, head_page_writes
+    monkeypatch, head_page_writes, paged_gather
 ):
     calls = []
     monkeypatch.setattr(cp_prefill, "cp_prefill_attention", _attention_stub(calls))
@@ -760,9 +769,12 @@ def test_full_attention_layer_from_q_caches_like_from_q_k_v(
             got, out = cp_prefill.full_attention_layer_from_q(
                 jnp.full_like(cache, 7),
                 q_hbm,
-                gathered,
+                # The same bytes as rows of the new-K/V layout.
+                gathered.reshape(plan.num_tokens, 1, 4, 128)
+                if paged_gather
+                else gathered,
                 *args,
-                cfg=cfg,
+                cfg=dataclasses.replace(cfg, paged_gather=paged_gather),
                 cache_view=_identity_view,
             )
         np.testing.assert_array_equal(_bytes(got), _bytes(want))
@@ -771,9 +783,10 @@ def test_full_attention_layer_from_q_caches_like_from_q_k_v(
         assert prepared_q is q_hbm and prepared_kv.shape == (rows, 1, 4, 128)
 
 
+@pytest.mark.parametrize("paged_gather", [False, True])
 @pytest.mark.parametrize("exchange_from_qkv", [False, True])
 def test_sliding_attention_layer_from_q_caches_like_from_q_k_v(
-    monkeypatch, exchange_from_qkv
+    monkeypatch, exchange_from_qkv, paged_gather
 ):
     calls, pages_seen = [], []
     monkeypatch.setattr(
@@ -815,8 +828,14 @@ def test_sliding_attention_layer_from_q_caches_like_from_q_k_v(
                 jnp.full_like(cache, 7),
                 q_hbm,
                 new_kv,
-                *args,
-                cfg=dataclasses.replace(cfg, exchange_from_qkv=exchange_from_qkv),
+                # The same bytes as rows of the new-K/V layout.
+                gathered.reshape(gathered.shape[0], 8, 4, 128)
+                if paged_gather
+                else gathered,
+                *args[1:],
+                cfg=dataclasses.replace(
+                    cfg, exchange_from_qkv=exchange_from_qkv, paged_gather=paged_gather
+                ),
                 cache_view=_identity_view,
             )
         np.testing.assert_array_equal(_bytes(got), _bytes(want))
