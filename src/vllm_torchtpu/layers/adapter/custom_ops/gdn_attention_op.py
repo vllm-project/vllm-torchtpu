@@ -46,6 +46,9 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_world_size,
 )
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import projection_scale
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
+    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+)
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
@@ -59,6 +62,7 @@ from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
     run_jax_gdn_attention_pooled,
+    run_jax_gdn_attention_pooled_pcp_prefill,
     run_jax_gdn_attention_pooled_pcp_prefill_projection,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -369,6 +373,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+    _pcp_streaming_configured: bool = False
+    gdn_pooled_pcp_op: Callable[..., Any] | None = None
+    gdn_pooled_pcp_unfused_op: Callable[..., Any] | None = None
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -377,10 +384,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._create_conv1d()
-        # `_require_pcp_projection_parameters` hands this weight straight to
-        # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
-        if hasattr(self, "in_proj_qkvz"):
-            setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].
@@ -393,16 +396,26 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self._bm_kernel = vllm_config is not None and unified_block_major_enabled(
             vllm_config
         )
-        self.gdn_op = self._build_gdn_op()
-        self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
+        fused_pooled_pcp = pcp_enabled and self._fused_pooled_pcp_supported(vllm_config)
+        # Fused pooled PCP reads `in_proj_qkvz` raw as [n_out, n_in]; unfused
+        # paths call `self.in_proj_qkvz(hidden_states)` and use the K-major flip.
+        if fused_pooled_pcp and hasattr(self, "in_proj_qkvz"):
+            setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
+        self.gdn_op = self._build_gdn_op()
+        self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
         self.gdn_pcp_op = (
             self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
         )
         self.gdn_pooled_pcp_op = (
             self._build_pooled_pcp_gdn_op(block_major=self._bm_kernel)
-            if pcp_enabled
+            if fused_pooled_pcp
+            else None
+        )
+        self.gdn_pooled_pcp_unfused_op = (
+            self._build_unfused_pooled_pcp_gdn_op(block_major=self._bm_kernel)
+            if pcp_enabled and not fused_pooled_pcp
             else None
         )
 
@@ -550,6 +563,51 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
         return parallel_config.prefill_context_parallel_size > 1
 
+    def _fused_pooled_pcp_supported(self, vllm_config: VllmConfig | None) -> bool:
+        """Whether fused QKVZ projection + collective supports this config."""
+        if vllm_config is None or hasattr(self, "in_proj_qkv"):
+            return False
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.prefill_context_parallel_size <= 1:
+            return False
+        interleave_size = parallel_config.cp_kv_cache_interleave_size
+        return (
+            isinstance(interleave_size, int)
+            and interleave_size >= 16
+            and interleave_size % 16 == 0
+            and PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE % (2 * interleave_size)
+            == 0
+        )
+
+    def _pcp_op_mesh_and_interleave(
+        self, label: str
+    ) -> tuple[VllmConfig, Any, int, int]:
+        vllm_config = cast(VllmConfig, get_vllm_model_wrapper_context().vllm_config)
+        interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
+        if not isinstance(interleave_size, int) or interleave_size <= 0:
+            raise ValueError(f"{label} requires cp_kv_cache_interleave_size > 0.")
+        pcp_mesh = get_or_create_pcp_mesh(
+            axis_name=_GDN_PCP_AXIS_NAME,
+            tp_axis_name=_GDN_TP_AXIS_NAME,
+        )
+        pcp_size = get_pcp_world_size()
+        if pcp_size != pcp_mesh.shape[_GDN_PCP_AXIS_NAME]:
+            raise ValueError(
+                f"PCP world size {pcp_size} does not match mesh shape "
+                f"{pcp_mesh.shape[_GDN_PCP_AXIS_NAME]}."
+            )
+        if self.tp_size != pcp_mesh.shape[_GDN_TP_AXIS_NAME]:
+            raise ValueError(
+                f"TP size {self.tp_size} does not match mesh shape "
+                f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}."
+            )
+        derive_gdn_head_geometry(
+            self.tp_head_geometry.local_num_kq_heads,
+            self.num_v_heads // self.tp_size,
+            pcp_size,
+        )
+        return vllm_config, pcp_mesh, pcp_size, interleave_size
+
     def _build_gdn_op(self, *, pcp_streaming: bool = False):
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
@@ -570,28 +628,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
 
         if pcp_streaming:
-            parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
-            interleave_size = parallel_config.cp_kv_cache_interleave_size
-            if not isinstance(interleave_size, int) or interleave_size <= 0:
-                raise ValueError(
-                    "GDN PCP streaming requires cp_kv_cache_interleave_size > 0."
-                )
-            pcp_mesh = get_or_create_pcp_mesh(
-                axis_name=_GDN_PCP_AXIS_NAME,
-                tp_axis_name=_GDN_TP_AXIS_NAME,
+            _, pcp_mesh, pcp_size, interleave_size = self._pcp_op_mesh_and_interleave(
+                "GDN PCP streaming"
             )
-            pcp_size = get_pcp_world_size()
-            if pcp_size != pcp_mesh.shape[_GDN_PCP_AXIS_NAME]:
-                raise ValueError(
-                    f"PCP world size {pcp_size} does not match mesh shape "
-                    f"{pcp_mesh.shape[_GDN_PCP_AXIS_NAME]}."
-                )
-            if self.tp_size != pcp_mesh.shape[_GDN_TP_AXIS_NAME]:
-                raise ValueError(
-                    f"TP size {self.tp_size} does not match mesh shape "
-                    f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}."
-                )
-            derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
             op_name = f"pallas::gdn_attention_pcp_{self.prefix.replace('.', '_')}"
             wrapped_fn = functools.partial(
                 gdn_attention_core_tpu_pcp_prefill,
@@ -847,34 +886,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return gdn_impl
 
     def _build_pooled_pcp_gdn_op(self, *, block_major: bool = False):
-        vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
         has_conv_bias = self.conv1d.bias is not None
-        parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
-        interleave_size = parallel_config.cp_kv_cache_interleave_size
-        if not isinstance(interleave_size, int) or interleave_size <= 0:
-            raise ValueError(
-                "GDN pooled PCP prefill requires cp_kv_cache_interleave_size > 0."
-            )
-        pcp_mesh = get_or_create_pcp_mesh(
-            axis_name=_GDN_PCP_AXIS_NAME,
-            tp_axis_name=_GDN_TP_AXIS_NAME,
+        vllm_config, pcp_mesh, pcp_size, interleave_size = (
+            self._pcp_op_mesh_and_interleave("GDN pooled PCP prefill")
         )
-        pcp_size = get_pcp_world_size()
-        if pcp_size != pcp_mesh.shape[_GDN_PCP_AXIS_NAME]:
-            raise ValueError(
-                f"PCP world size {pcp_size} does not match mesh shape "
-                f"{pcp_mesh.shape[_GDN_PCP_AXIS_NAME]}."
-            )
-        if self.tp_size != pcp_mesh.shape[_GDN_TP_AXIS_NAME]:
-            raise ValueError(
-                f"TP size {self.tp_size} does not match mesh shape "
-                f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}."
-            )
-        derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
-
-        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
@@ -1017,6 +1034,114 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return gdn_impl
 
+    def _build_unfused_pooled_pcp_gdn_op(self, *, block_major: bool = False):
+        local_num_v_heads = self.num_v_heads // self.tp_size
+        local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
+        has_conv_bias = self.conv1d.bias is not None
+        vllm_config, pcp_mesh, pcp_size, interleave_size = (
+            self._pcp_op_mesh_and_interleave("GDN pooled PCP prefill")
+        )
+        d_k = self.head_k_dim
+        d_v = self.head_v_dim
+        kernel_size = self.conv_kernel_size
+        recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
+
+        def wrapped_fn(
+            mixed_qkv: jax.Array,
+            b: jax.Array,
+            a: jax.Array,
+            recurrent_state: jax.Array,
+            conv_weight: jax.Array,
+            conv_bias: jax.Array | None,
+            A_log: jax.Array,
+            dt_bias: jax.Array,
+            state_indices: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            pool = kernel_view(recurrent_state) if block_major else recurrent_state
+            result = run_jax_gdn_attention_pooled_pcp_prefill(
+                mixed_qkv,
+                b,
+                a,
+                pool,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                mesh=pcp_mesh,
+                n_kq=local_num_kq_heads,
+                n_v=local_num_v_heads,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                pool_block_tokens=vllm_config.cache_config.block_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                recurrent_state_dtype=recurrent_state_dtype,
+            )
+            if not block_major:
+                return result
+            new_pool, output = result
+            return new_pool.reshape(recurrent_state.shape), output
+
+        op_name = (
+            "pallas::gdn_attention_pooled_pcp_"
+            f"{self.prefix.replace('.', '_')}"
+            f"{'_bm' if block_major else ''}"
+        )
+        input_partition_specs = (
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),
+            PartitionSpec(_GDN_PCP_TP_STATE_AXIS),
+            PartitionSpec(_GDN_TP_AXIS_NAME),
+            PartitionSpec(_GDN_TP_AXIS_NAME) if has_conv_bias else None,
+            PartitionSpec(_GDN_TP_AXIS_NAME),
+            PartitionSpec(_GDN_TP_AXIS_NAME),
+            PartitionSpec(),
+            PartitionSpec(),
+            PartitionSpec(),
+            PartitionSpec(),
+        )
+        output_partition_specs = (
+            PartitionSpec(_GDN_PCP_TP_STATE_AXIS),
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME, None),
+        )
+        gdn_jax_op = cast(Callable[..., Any], pallas.jax_op)(
+            op_name,
+            wrapped_fn,
+            donate_argnums=(3,),
+            mesh=pcp_mesh,
+            input_partition_specs=input_partition_specs,
+            output_partition_specs=output_partition_specs,
+        )
+
+        def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
+            out_shape = (mixed_qkv.size(0), local_num_v_heads, d_v)
+            out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+            return torch.empty_like(recurrent_state), out
+
+        gdn_jax_op.register_fake(_fake_gdn)
+
+        def gdn_impl(
+            mixed_qkv: torch.Tensor,
+            b: torch.Tensor,
+            a: torch.Tensor,
+            recurrent_state: torch.Tensor,
+            *args: torch.Tensor | None,
+        ) -> torch.Tensor:
+            new_rec, outputs = gdn_jax_op(mixed_qkv, b, a, recurrent_state, *args)
+            recurrent_state.copy_(new_rec)
+            return outputs
+
+        return gdn_impl
+
     def _require_pcp_projection_parameters(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1053,12 +1178,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return weight, weight_scale
 
     def _has_active_pooled_pcp_state(self, kv_cache) -> bool:
-        """Whether a PCP-configured worker owns an allocated unified pool."""
+        """Whether this worker uses the fused pooled PCP kernel path."""
         return (
             kv_cache is not None
             and len(kv_cache) == 1
             and kv_cache[0].numel() > 0
             and self._pcp_streaming_configured
+            and self.gdn_pooled_pcp_op is not None
         )
 
     def _apply_output_projection(
@@ -1113,6 +1239,47 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
         if core_attn_out.shape[0] != num_tokens:
             raise RuntimeError("GDN op returned an incompatible output shape.")
+        return self._apply_output_projection(core_attn_out, z, num_tokens)
+
+    def _forward_unfused_pooled_pcp(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        z: torch.Tensor,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
+        attn_metadata,
+    ) -> torch.Tensor:
+        """Run the unfused pooled PCP path when projection fusion is unsupported."""
+        gdn_pooled_pcp_unfused_op = self.gdn_pooled_pcp_unfused_op
+        if gdn_pooled_pcp_unfused_op is None:
+            raise RuntimeError(
+                "GDN unfused pooled PCP prefill op was not initialized "
+                "during model loading."
+            )
+        if self.num_spec > 0:
+            raise NotImplementedError(
+                "Speculative decoding is not supported with GDN pooled PCP prefill."
+            )
+        core_attn_out = gdn_pooled_pcp_unfused_op(
+            mixed_qkv,
+            b,
+            a,
+            state_pool,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            self.A_log,
+            self.dt_bias,
+            state_indices,
+            attn_metadata.query_start_loc,
+            attn_metadata.request_distribution,
+            attn_metadata.seq_lens,
+        )
+        num_tokens = mixed_qkv.size(0)
+        if core_attn_out.shape[0] != num_tokens:
+            start = get_pcp_rank() * num_tokens
+            core_attn_out = core_attn_out[start : start + num_tokens]
         return self._apply_output_projection(core_attn_out, z, num_tokens)
 
     def forward(
@@ -1185,6 +1352,21 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 state_indices = self._bm_state_ids(
                     attn_metadata.mamba_state_indices.to(torch.int32)
                 )
+                if is_pcp_streaming_attention_metadata(attn_metadata):
+                    return self._forward_unfused_pooled_pcp(
+                        mixed_qkv,
+                        b,
+                        a,
+                        z,
+                        recurrent_state,
+                        state_indices,
+                        attn_metadata,
+                    )
+                if self._pcp_streaming_configured:
+                    raise RuntimeError(
+                        "PCP is configured with a unified pool, but attention "
+                        "metadata does not use the PCP streaming sequence layout."
+                    )
                 # Speculative decoding: the GDN kernel's windowed segment
                 # covers both 1-token decodes and speculative verify
                 # windows (the batch is ordered [decode][verify][prefill]);

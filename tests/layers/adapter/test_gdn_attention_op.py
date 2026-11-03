@@ -1587,3 +1587,106 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
     assert re.fullmatch(rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"])
     assert captured["kernel_pool_shape"] == kernel_pool_shape
     assert tuple(new_pool.shape) == tuple(pool.shape)
+
+
+@pytest.mark.parametrize(
+    ("interleave_size", "expect_fused"),
+    [(4, False), (16, True), (128, True), (512, False)],
+)
+def test_init_gates_fused_vs_unfused_pooled_pcp_by_interleave(
+    interleave_size: int, expect_fused: bool
+):
+    fused_op, unfused_op = MagicMock(), MagicMock()
+
+    def fake_super_init(self):
+        self.in_proj_qkvz = SimpleNamespace()
+
+    with (
+        patch.object(VllmGatedDeltaNetAttention, "_create_conv1d"),
+        set_vllm_model_wrapper_context(
+            mesh=_mesh(),
+            vllm_config=_vllm_config(pcp_size=4, interleave_size=interleave_size),
+        ),
+        patch.object(
+            gdn_attention_op.QwenGatedDeltaNetAttention, "__init__", fake_super_init
+        ),
+        patch.object(
+            VllmGatedDeltaNetAttention,
+            "_build_gdn_op",
+            side_effect=[MagicMock(), MagicMock()],
+        ),
+        patch.object(
+            VllmGatedDeltaNetAttention, "_build_pooled_gdn_op", return_value=MagicMock()
+        ),
+        patch.object(
+            VllmGatedDeltaNetAttention,
+            "_build_pooled_pcp_gdn_op",
+            return_value=fused_op,
+        ) as mock_fused,
+        patch.object(
+            VllmGatedDeltaNetAttention,
+            "_build_unfused_pooled_pcp_gdn_op",
+            return_value=unfused_op,
+        ) as mock_unfused,
+    ):
+        attn = VllmGatedDeltaNetAttention()
+
+    assert hasattr(attn.in_proj_qkvz, gdn_attention_op.KEEP_VLLM_LAYOUT_ATTR) is (
+        expect_fused
+    )
+    assert attn.gdn_pooled_pcp_op is (fused_op if expect_fused else None)
+    assert attn.gdn_pooled_pcp_unfused_op is (None if expect_fused else unfused_op)
+    assert mock_fused.call_count == int(expect_fused)
+    assert mock_unfused.call_count == int(not expect_fused)
+
+
+@patch(
+    "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_rank",
+    return_value=1,
+)
+@patch("vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context")
+def test_forward_dispatches_unfused_pooled_pcp_prefill(
+    mock_get_forward_context, _mock_rank
+):
+    attn = _qwen35_397b_gdn_attn("test_layer")
+    attn.key_dim, attn.value_dim = 64 * 128, 64 * 128
+    attn._pcp_streaming_configured = True
+    attn.conv1d = SimpleNamespace(weight=torch.zeros(1), bias=None)
+    attn.A_log, attn.dt_bias = torch.zeros(1), torch.zeros(1)
+    attn.kv_cache = (torch.ones(1),)
+    attn.gdn_pooled_op = MagicMock()
+    attn.gdn_pooled_pcp_op = None
+    attn.gdn_pooled_pcp_unfused_op = MagicMock(
+        return_value=torch.cat(
+            [torch.zeros(2, 64, 128), torch.full((2, 64, 128), 3.0)], dim=0
+        )
+    )
+    qkv_dim = attn.tp_head_geometry.local_conv_dim(128, 128)
+    attn.in_proj_qkvz = MagicMock(
+        return_value=(torch.ones(2, qkv_dim + attn.value_dim), None)
+    )
+    attn.in_proj_ba = MagicMock(return_value=(torch.ones(2, 128), None))
+    attn.norm = MagicMock(side_effect=lambda core, _z: core)
+    attn.out_proj = MagicMock(return_value=(torch.full((2, 64), 9.0), None))
+    attn._bm_kernel = True
+    attn.set_block_major_pool(_BM_POOL_INDEX, _BM_LAYOUT)
+    metadata = SimpleNamespace(
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        mamba_state_indices=torch.tensor([0, 1], dtype=torch.int32),
+        sequence_layout_kind=SequenceLayoutKind.PARTIAL.value,
+        sequence_layout_protocol="pcp_streaming",
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        request_distribution=torch.zeros(3, dtype=torch.int32),
+    )
+    mock_get_forward_context.return_value = SimpleNamespace(
+        attn_metadata={"test_layer": metadata}
+    )
+
+    out = attn.forward(torch.zeros(2, 64))
+
+    attn.in_proj_qkvz.assert_called_once()
+    attn.gdn_pooled_op.assert_not_called()
+    attn.gdn_pooled_pcp_unfused_op.assert_called_once()
+    assert attn.gdn_pooled_pcp_unfused_op.call_args.args[8].tolist() == [2, 5]
+    assert torch.all(attn.norm.call_args.args[0] == 3.0)
+    assert torch.all(out == 9.0)
