@@ -20,15 +20,83 @@ import numpy as np
 import pytest
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.sparse_core.ragged_gather import ragged_gather
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
-
-pytestmark = pytest.mark.tpu_test
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
+    choose_num_row_subchunks,
+    ragged_gather_v2,
+)
 
 jax.config.parse_flags_with_absl()
 
+# v7x SparseCore: 16 SIMD lanes x 2 cores x 16 subcores.
+_BASE_BLOCK = 512
 
+
+def _padded_rows(out_size: int, subchunks: int, base_block: int = _BASE_BLOCK) -> int:
+    block = base_block * subchunks
+    return -(-out_size // block) * block
+
+
+class SubchunkChoiceCpuTest(parameterized.TestCase):
+    @parameterized.parameters(
+        (1, 1),
+        (512, 1),
+        (1024, 1),
+        (3072, 1),
+        (4096, 1),
+        (4608, 1),
+        (5120, 2),
+        (6144, 4),
+        (8192, 4),
+        (16384, 4),
+        (4500, 4),
+        (6000, 4),
+    )
+    def test_choose_num_row_subchunks(self, out_size, expected):
+        self.assertEqual(choose_num_row_subchunks(out_size, _BASE_BLOCK), expected)
+
+    @parameterized.parameters(*range(1, 65))
+    def test_block_multiples_are_never_padded(self, num_blocks):
+        out_size = num_blocks * _BASE_BLOCK
+        subchunks = choose_num_row_subchunks(out_size, _BASE_BLOCK)
+        self.assertIn(subchunks, (1, 2, 4))
+        self.assertEqual(_padded_rows(out_size, subchunks), out_size)
+
+    def test_small_outputs_pad_under_one_base_block_and_valid_sweep(self):
+        # Outputs in 1..8*base_block use 1 subchunk on v7x, so padding never
+        # reaches a full base block; every size up to 16384 picks in {1, 2, 4}.
+        for out_size in range(1, 8 * _BASE_BLOCK + 1):
+            subchunks = choose_num_row_subchunks(out_size, _BASE_BLOCK)
+            self.assertEqual(subchunks, 1)
+            pad = _padded_rows(out_size, subchunks) - out_size
+            self.assertGreaterEqual(pad, 0)
+            self.assertLess(pad, _BASE_BLOCK)
+        for out_size in range(8 * _BASE_BLOCK + 1, 16385):
+            self.assertIn(choose_num_row_subchunks(out_size, _BASE_BLOCK), (1, 2, 4))
+
+    @parameterized.parameters((5, 512), (6, 256))
+    def test_non_v7x_generations_preserve_min_four_subchunks(
+        self, generation, base_block
+    ):
+        for out_size in (1, base_block, 3 * base_block, 6 * base_block, 9 * base_block):
+            expected = max(1, min(4, -(-out_size // base_block)))
+            self.assertEqual(
+                choose_num_row_subchunks(out_size, base_block, generation=generation),
+                expected,
+            )
+
+    @parameterized.parameters(2560, 3072, 3584)
+    def test_decode_sizes_avoid_four_subchunk_padding(self, out_size):
+        # Multiples of base_block <= 8 blocks avoid the 4-block alignment pad.
+        four_subchunk_cap = min(4, -(-out_size // _BASE_BLOCK))
+        self.assertGreater(_padded_rows(out_size, four_subchunk_cap), out_size)
+        subchunks = choose_num_row_subchunks(out_size, _BASE_BLOCK)
+        self.assertEqual(_padded_rows(out_size, subchunks), out_size)
+
+
+@pytest.mark.tpu_test
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class GatherTest(jtu.JaxTestCase):
     @parameterized.product(
@@ -63,6 +131,61 @@ class GatherTest(jtu.JaxTestCase):
         desired = x[indices][start:end]
 
         self.assertArraysEqual(actual, desired)
+
+    @parameterized.product(
+        # 512 is one v7x base block (16 lanes x 32 subcores); 3072 = 6 blocks
+        # uses one subchunk with no padding on v7x; 4608 / 5120 / 6144 =
+        # 9 / 10 / 12 blocks use 1 / 2 / 4 subchunks; 4500 is not a multiple of
+        # the base block and must be padded. `partial_end` exercises EP partial
+        # gathers where only `[0:end]` rows are active.
+        out_size=[512, 3072, 4500, 4608, 5120, 6144],
+        hidden_size=[512, 7168],
+        partial_end=[False, True],
+    )
+    def test_sc_gather_subchunk_choices(self, out_size, hidden_size, partial_end):
+        tpu_info = pltpu.get_tpu_info()
+        sc_info = tpu_info.sparse_core
+        assert sc_info is not None
+        base_block = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
+        expected_rows = _padded_rows(
+            out_size,
+            choose_num_row_subchunks(
+                out_size, base_block, generation=tpu_info.generation
+            ),
+            base_block=base_block,
+        )
+
+        in_size = 8192
+        key = jax.random.key(1)
+        x = jax.random.normal(key, (in_size, hidden_size), jnp.bfloat16)
+        indices = jax.random.randint(key, (out_size,), 0, in_size, jnp.int32)
+        end_val = out_size // 8 if partial_end else out_size
+        start = jnp.array([0], jnp.int32)
+        end = jnp.array([end_val], jnp.int32)
+
+        actual = ragged_gather_v2(x, indices, start, end)
+
+        self.assertEqual(actual.shape, (out_size, hidden_size))
+        self.assertArraysEqual(actual[:end_val], x[indices[:end_val]])
+
+        inner_jaxpr = (
+            jax.make_jaxpr(ragged_gather_v2)(x, indices, start, end)
+            .jaxpr.eqns[0]
+            .params["jaxpr"]
+            .jaxpr
+        )
+        prims = {eqn.primitive.name for eqn in inner_jaxpr.eqns} | {
+            sub.primitive.name
+            for eqn in inner_jaxpr.eqns
+            if "jaxpr" in eqn.params
+            for sub in eqn.params["jaxpr"].jaxpr.eqns
+        }
+        if expected_rows == out_size:
+            self.assertNotIn("pad", prims)
+            self.assertNotIn("slice", prims)
+        else:
+            self.assertIn("pad", prims)
+            self.assertIn("slice", prims)
 
     @pytest.mark.nightly
     def test_benchmark(self):
