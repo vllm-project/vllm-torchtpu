@@ -3152,6 +3152,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             )
             if self.pcp_kv_gather and is_pcp_kv_gather_metadata(attn_metadata):
                 local_topk_indices = topk_indices[: ql_nope_flat.shape[0]]
+                if use_qrep:
+                    raise NotImplementedError(
+                        "The PCP manager needs --no-dcp-q-replicate."
+                    )
                 outputs = self._forward_pcp_kv_gather(
                     layer,
                     kv_cache,

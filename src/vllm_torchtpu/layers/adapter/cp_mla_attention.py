@@ -261,6 +261,8 @@ def vspace_fused_applies(num_tokens: int, is_backbone: bool) -> bool:
     MTP drafter never takes it."""
     if not envs.TPU_DCP_MERGE_VSPACE_FUSED or not is_backbone:
         return False
+    if dcp_spans_pcp():
+        return False
     if envs.TPU_DCP_MERGE_RS_BF16 == 2:
         return False
     group = get_dcp_group()
@@ -700,6 +702,8 @@ def send_layout_applies(
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
         return False
+    if dcp_spans_pcp():
+        return False
     if not (
         envs.TPU_DCP_MLA_SEND_LAYOUT
         and envs.TPU_DCP_LSE_MERGE_A2A
@@ -1075,6 +1079,8 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
     from vllm_torchtpu.layers.core.attention_interface import dcp_mla_topk_cap
 
     if not (envs.TPU_MLA_FUSED_SMALL_A2A and send_small_a2a_applies(num_tokens)):
+        return False
+    if dcp_spans_pcp():
         return False
     group = get_dcp_group()
     dcp_size = 1 if group is None else int(group.world_size)
