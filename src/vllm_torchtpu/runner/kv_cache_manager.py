@@ -188,6 +188,41 @@ def folded_dsa_side_page_size_bytes(
     return rope_bytes + indexer_page_size_bytes(k_cache, block_size)
 
 
+def folded_mla_page_size_bytes(
+    mla_layers: dict[str, MLAAttention],
+    folded_indexer_caches: dict[str, VllmTPUIndexerCache],
+    block_size: int,
+    kv_cache_dtype: torch.dtype,
+) -> int:
+    """Scheduler page of every MLA layer when the pool is born sparse.
+
+    Each region's pool page is the sparse NoPE latents. Everything the MLA
+    layers keep outside the pool (a folded layer's RoPE and indexer K rows, a
+    dense draft layer's whole cache) is spread evenly over one region per MLA
+    layer, so `num_blocks` budgets the arrays that actually exist. That count
+    is a lower bound on the regions while the MLA layers form one KV cache
+    group, which `_folded_dsa_pool_page` checks.
+    """
+    pool_page = PallasSparseMLAPoolBackend.get_kv_cache_page_size_bytes(
+        block_size, 1, next(iter(mla_layers.values())).head_size, kv_cache_dtype
+    )
+    side_bytes = 0
+    for name, layer in mla_layers.items():
+        k_cache = folded_indexer_caches.get(name)
+        if k_cache is not None:
+            side_bytes += folded_dsa_side_page_size_bytes(
+                k_cache, block_size, layer.head_size, kv_cache_dtype
+            )
+        else:
+            side_bytes += PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+                block_size, 1, layer.head_size, kv_cache_dtype
+            )
+    side_per_region = (
+        math.ceil(side_bytes / (len(mla_layers) * block_size)) * block_size
+    )
+    return pool_page + side_per_region
+
+
 def check_kv_caches_cover_block_ids(
     kv_caches: dict[str, torch.Tensor],
     kv_cache_tensors: Iterable[KVCacheTensor],
@@ -300,6 +335,20 @@ class KVCacheManager:
         folded_indexer_names = {
             k_cache.prefix for k_cache in folded_indexer_caches.values()
         }
+        folded_mla_page = (
+            folded_mla_page_size_bytes(
+                {
+                    name: layer
+                    for name, layer in layers.items()
+                    if isinstance(layer, MLAAttention)
+                },
+                folded_indexer_caches,
+                block_size,
+                self.runner.kv_cache_dtype,
+            )
+            if folded_indexer_caches
+            else None
+        )
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         # DSv4 layers whose specs must reach vLLM verbatim; see
@@ -424,22 +473,17 @@ class KVCacheManager:
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:
                     continue
-                if layer_name in folded_indexer_caches:
-                    # One scheduler page holds the layer's (nope, rope) latents
-                    # and its indexer K rows, as one KV cache group.
-                    k_cache = folded_indexer_caches[layer_name]
-                    latent_page_size = sparse_mla_page_size_bytes(
-                        attn_module, block_size, self.runner.kv_cache_dtype
-                    )
-                    assert latent_page_size is not None
+                if folded_mla_page is not None:
+                    # One scheduler page holds the layer's latents and its
+                    # indexer K rows; dense draft layers share the page shape
+                    # so that all MLA layers are one KV cache group.
                     kv_cache_spec[layer_name] = MLAAttentionSpec(
                         block_size=block_size,
                         num_kv_heads=1,
                         head_size=attn_module.head_size,
                         dtype=self.runner.kv_cache_dtype,
                         cache_dtype_str=cache_dtype_str,
-                        page_size_padded=latent_page_size
-                        + indexer_page_size_bytes(k_cache, block_size),
+                        page_size_padded=folded_mla_page,
                     )
                     continue
                 sparse_page_size = (
@@ -1419,6 +1463,13 @@ class KVCacheManager:
         """The pool page of the folded sparse MLA layers, or None without any."""
         if not folded_indexer_caches:
             return None
+        mla_groups = [
+            group.layer_names
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MLAAttentionSpec)
+        ]
+        # `folded_mla_page_size_bytes` budgets one region per MLA layer.
+        assert len(mla_groups) == 1, mla_groups
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
             names = folded_indexer_caches.keys() & set(group.layer_names)
             if not names:
@@ -1435,11 +1486,9 @@ class KVCacheManager:
             )
             return PoolPageLayout(
                 dtype=nope_spec.torch_dtype,
-                side_page_bytes=folded_dsa_side_page_size_bytes(
-                    folded_indexer_caches[min(names)],
-                    spec.block_size,
-                    spec.head_size,
-                    spec.dtype,
+                side_page_bytes=spec.page_size_bytes
+                - PallasSparseMLAPoolBackend.get_kv_cache_page_size_bytes(
+                    spec.block_size, 1, spec.head_size, spec.dtype
                 ),
             )
         raise AssertionError(
@@ -1495,6 +1544,30 @@ class KVCacheManager:
             # The indexer reads its block tables from the MLA layer's group.
             k_cache.metadata_layer_name = layer_name
             side_caches += [rope, indexer]
+        for group in kv_cache_config.kv_cache_groups:
+            if not folded_indexer_caches.keys() & set(group.layer_names):
+                continue
+            for layer_name in group.layer_names:
+                if layer_name in folded_indexer_caches:
+                    continue
+                if self.runner.parallel_config.decode_context_parallel_size > 1:
+                    raise NotImplementedError(
+                        f"Dense MLA layer {layer_name} has no DCP kernel path."
+                    )
+                # A dense draft layer's records are wider than a pool page.
+                dense = torch.empty(
+                    PallasMLAttentionBackend.get_kv_cache_shape(
+                        num_pages,
+                        block_size,
+                        1,
+                        cast(AttentionSpec, group.kv_cache_spec).head_size,
+                        self.runner.kv_cache_dtype,
+                    ),
+                    dtype=self.runner.kv_cache_dtype,
+                    device=self.runner.device,
+                )
+                kv_caches[layer_name] = dense
+                side_caches.append(dense)
         # Same reason as the pool flush below: donated buffers must be quiescent.
         synchronize_tensors(side_caches)
         self.runner.kv_cache_side_tensors = side_caches
