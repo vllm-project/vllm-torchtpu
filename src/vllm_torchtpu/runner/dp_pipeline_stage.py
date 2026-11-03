@@ -39,7 +39,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -61,6 +61,7 @@ from vllm_torchtpu.distributed.dp_pipeline.plan import (
 from vllm_torchtpu.distributed.dp_pipeline.transport import (
     HIDDEN,
     EdgeRing,
+    hidden_channel,
     kv_channel,
 )
 from vllm_torchtpu.logger import init_logger
@@ -75,11 +76,25 @@ _MAX_HELD_KV = 4
 class StageCall:
     """What the model forward runs for a pipelined chunk: layers
     ``[start, end)``, from ``hidden_states`` (None on the first stage, which
-    embeds the step's token ids)."""
+    embeds the step's token ids). A forward before the last stage appends to
+    ``output`` what the stage hands on."""
 
     start: int
     end: int
     hidden_states: torch.Tensor | None
+    output: list[torch.Tensor] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class HandOff:
+    """What a stage hands the next one for a full chunk: ``rows`` rows of
+    ``row_shape`` in ``dtype``, from TP rank 0 to every rank, or with
+    ``per_rank`` from each rank to the same rank (its own rows)."""
+
+    per_rank: bool
+    rows: int
+    row_shape: tuple[int, ...]
+    dtype: torch.dtype
 
 
 @dataclass(frozen=True)
@@ -138,15 +153,20 @@ class DpPipelineStage:
         tp_rank: int,
         tp_size: int,
         max_rows: int,
-        row_shape: tuple[int, ...],
-        dtype: torch.dtype,
+        hand_off: HandOff,
         device: torch.device,
         materialize: Callable[..., None],
     ) -> None:
-        """``materialize(tensors, wait=True)`` runs the device work producing
-        ``tensors``; with ``wait=False`` it only enqueues it."""
+        """``max_rows`` is the full chunk's token bucket. ``materialize(tensors,
+        wait=True)`` runs the device work producing ``tensors``; with
+        ``wait=False`` it only enqueues it."""
         self.dp_rank, self.tp_rank, self.tp_size = dp_rank, tp_rank, tp_size
-        self.max_rows, self.row_shape, self.dtype = max_rows, row_shape, dtype
+        self.max_rows, self.hand_off = max_rows, hand_off
+        # This rank's hidden-state channel and its index among the readers.
+        if hand_off.per_rank:
+            self._hidden, self._reader = hidden_channel(tp_rank), 0
+        else:
+            self._hidden, self._reader = HIDDEN, tp_rank
         self.device = device
         self._materialize = materialize
         self.timeout_s = envs.TPU_DP_PIPELINE_TIMEOUT_S
@@ -236,8 +256,10 @@ class DpPipelineStage:
         key = (plan.server_id, src, dst, channel)
         ring = self._rings.get(key)
         if ring is None:
-            if channel == HIDDEN:
-                shape = (self.max_rows, self.row_shape, self.dtype, self.tp_size)
+            if channel == self._hidden:
+                h = self.hand_off
+                readers = 1 if h.per_rank else self.tp_size
+                shape = (h.rows, h.row_shape, h.dtype, readers)
             else:
                 assert self._kv is not None
                 shape = (self._kv_rows, self._kv.page_shape, self._kv.dtype, 1)
@@ -314,20 +336,21 @@ class DpPipelineStage:
         if step.is_first:
             return StageCall(start, end, None)
         ring = self._ring(
-            step.plan, step.plan.ranks[step.stage - 1], self.dp_rank, HIDDEN
+            step.plan, step.plan.ranks[step.stage - 1], self.dp_rank, self._hidden
         )
         began = time.monotonic()
+        rows = self.hand_off.rows
         prefetched = self._prefetched.pop(step.token, None)
         if prefetched is None:
             hidden = ring.take(
-                step.token, num_rows, self.device, self.tp_rank, self.timeout_s
+                step.token, rows, self.device, self._reader, self.timeout_s
             )
         else:
             hidden = prefetched[1].result()
-            if hidden.shape[0] != num_rows:
+            if hidden.shape[0] != rows:
                 raise RuntimeError(
                     f"chunk {step.token} arrived with {hidden.shape[0]} rows, this "
-                    f"stage expects {num_rows}"
+                    f"stage expects {rows}"
                 )
         if not step.is_final_chunk:
             following = step.plan.chunk_token(step.first_position + step.num_tokens)
@@ -338,7 +361,7 @@ class DpPipelineStage:
                     following,
                     None,
                     self.device,
-                    self.tp_rank,
+                    self._reader,
                     self.timeout_s,
                 ),
             )
@@ -354,29 +377,28 @@ class DpPipelineStage:
         assert isinstance(hidden, torch.Tensor)
         return StageCall(start, end, hidden)
 
-    def send(self, step: StageStep, hidden_states: torch.Tensor) -> None:
-        """Hands this chunk's output to the next stage (TP rank 0 sends; every
-        rank of a TP group holds the same hidden states) and, with
-        ``plan.kv``, this rank's K/V pages to the owner. The owner
-        instead scatters every page after its last pipelined forward, so the
-        step's sampled token waits for them rather than the next step: the
-        wait counts in the time to first token, not between tokens."""
+    def send(self, step: StageStep, call: StageCall) -> None:
+        """Hands what the forward left in ``call.output`` to the next stage
+        (``HandOff``) and, with ``plan.kv``, this rank's K/V pages to the
+        owner. The owner instead scatters every page after its last pipelined
+        forward, so the step's sampled token waits for them rather than the
+        next step: the wait counts in the time to first token, not between
+        tokens."""
         if step.is_last:
             if step.is_final_chunk and step.req_id in self._receipts:
                 self._apply(step.req_id, wait=True)
             return
-        if self.tp_rank == 0:
+        (out,) = call.output
+        if self.hand_off.per_rank or self.tp_rank == 0:
             ring = self._ring(
-                step.plan, self.dp_rank, step.plan.ranks[step.stage + 1], HIDDEN
+                step.plan, self.dp_rank, step.plan.ranks[step.stage + 1], self._hidden
             )
             what = (
                 f"stage {step.stage}/{step.plan.num_stages} chunk "
-                f"@{step.first_position} rows {hidden_states.shape[0]}"
+                f"@{step.first_position} rows {out.shape[0]}"
             )
             self._sent.append(
-                self._hidden_sender.submit(
-                    self._put, ring, step.token, hidden_states, what
-                )
+                self._hidden_sender.submit(self._put, ring, step.token, out, what)
             )
         if step.plan.kv:
             ring = self._ring(

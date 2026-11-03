@@ -18,11 +18,12 @@ two of them (worker/tpu_worker.py), so a stage's hidden states reach the next
 stage's engine, and a helper's K/V pages reach the owner, through POSIX shared
 memory. Each channel of a directed pair of engines is one ring of two slots:
 ``HIDDEN`` carries hidden states from the sender's TP rank 0 to every TP rank
-of the receiver; ``kv_channel(r)`` carries TP rank ``r``'s K/V pages to the
-same rank of the owner. The writer copies a hand-off into a slot and marks it
-ready; each reader copies it to its device and acknowledges it; a slot is
-reused once all readers have. Slots take the hand-offs in turn, so the writer
-fills one while the other is being read.
+of the receiver, or ``hidden_channel(r)`` TP rank ``r``'s own rows of a
+sequence-parallel residual stream to the same rank; ``kv_channel(r)`` carries
+TP rank ``r``'s K/V pages to the same rank of the owner. The writer copies a
+hand-off into a slot and marks it ready; each reader copies it to its device
+and acknowledges it; a slot is reused once all readers have. Slots take the
+hand-offs in turn, so the writer fills one while the other is being read.
 
 Tensor.copy_ into the slot and ``.to(device)`` out of it are the fast torch_tpu
 paths (3.5 and 4.3 GB/s per core measured, unlike batch_transfer into
@@ -52,6 +53,11 @@ _ATTACH_TIMEOUT_S = 10.0
 HIDDEN = "h"
 
 
+def hidden_channel(tp_rank: int) -> str:
+    """The channel of TP rank ``tp_rank``'s own rows of a hand-off."""
+    return f"h{tp_rank}"
+
+
 def kv_channel(tp_rank: int) -> str:
     return f"kv{tp_rank}"
 
@@ -63,7 +69,11 @@ def ring_name(server_id: int, src_rank: int, dst_rank: int, channel: str) -> str
 def unlink_rings(server_id: int, num_engines: int, tp_size: int) -> None:
     """Removes the rings of API server ``server_id``, whose engines have
     stopped (engines map them for as long as they serve)."""
-    channels = [HIDDEN, *(kv_channel(r) for r in range(tp_size))]
+    channels = [
+        HIDDEN,
+        *(hidden_channel(r) for r in range(tp_size)),
+        *(kv_channel(r) for r in range(tp_size)),
+    ]
     for src, dst in itertools.permutations(range(num_engines), 2):
         for channel in channels:
             name = ring_name(server_id, src, dst, channel)

@@ -1230,6 +1230,131 @@ def _layer_range_forward(
     return model.norm(x) if end == len(model.layers) else x
 
 
+# With TPU_GEMMA4_SEQUENCE_PARALLEL the layer ranges run `_patched_model_forward`'s
+# sequence-parallel branch, which every range's bucket (the largest) takes: set
+# when the pipelined-prefill patch is applied.
+_dp_pipeline_sequence_parallel = False
+
+
+def _hand_off_bytes(hidden_size: int, dtype: torch.dtype) -> int:
+    """Bytes per row of a sequence-parallel hand-off: this rank's residual
+    rows, and with TPU_GEMMA4_FUSED_NORM_QUANT the FP8 rows (as int8 bytes)
+    and f32 scales the last layer's tail made for the next layer's input
+    norm."""
+    rows = hidden_size * dtype.itemsize
+    return rows + hidden_size + 4 if envs.TPU_GEMMA4_FUSED_NORM_QUANT else rows
+
+
+def _pack_hand_off(chunks: list[Any], tp_size: int) -> torch.Tensor:
+    """The chunks of a sequence-parallel residual stream between two layers:
+    this rank's ``T / tp`` rows of ``_hand_off_bytes`` bytes, viewed as
+    ``[T, _hand_off_bytes / tp]``. A range that takes them then traces the
+    step's token count as its only size: vLLM looks a compiled bucket up by
+    it, and builds the bucket (and shape_variants screens it) by giving every
+    size symbol of the trace the bucket's token count."""
+    if not isinstance(chunks[0], tuple):
+        packed = torch.cat(chunks).view(torch.uint8)
+    else:
+        rows, q, scale = (torch.cat(part) for part in zip(*chunks))
+        packed = torch.cat(
+            [rows.view(torch.uint8), q.view(torch.uint8), scale.view(torch.uint8)],
+            dim=1,
+        )
+    return packed.view(packed.shape[0] * tp_size, -1)
+
+
+def _unpack_hand_off(
+    hand_off: torch.Tensor,
+    chunks: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    tp_size: int,
+) -> list[Any]:
+    """`_pack_hand_off`'s inverse."""
+    packed = hand_off.view(hand_off.shape[0] // tp_size, -1)
+    width = hidden_size * dtype.itemsize
+    rows = _token_chunks(packed[:, :width].contiguous().view(dtype), chunks)
+    if not envs.TPU_GEMMA4_FUSED_NORM_QUANT:
+        return rows
+    q = packed[:, width : width + hidden_size].contiguous().view(torch.int8)
+    scale = packed[:, width + hidden_size :].contiguous().view(torch.float32)
+    return list(zip(rows, _token_chunks(q, chunks), _token_chunks(scale, chunks)))
+
+
+def _sp_range_forward(
+    model: Gemma4Model, chunks: list[Any], positions: torch.Tensor, start: int, end: int
+) -> list[Any]:
+    """`_patched_model_forward`'s sequence-parallel layer loop over layers
+    ``[start, end)``: each layer's tail quantizes through the next layer's input
+    norm, past the range's end too, as the whole model's does."""
+    layers = list(model.layers)
+    for i in range(start, end):
+        kwargs: dict[str, Any] = {}
+        if envs.TPU_GEMMA4_FUSED_NORM_QUANT:
+            kwargs["next_input_norm"] = (
+                layers[i + 1].input_layernorm if i + 1 < len(layers) else None
+            )
+        chunks, _ = layers[i](positions, chunks, None, sequence_parallel=True, **kwargs)
+    return chunks
+
+
+def _sp_microbatches(model: Gemma4Model, num_tokens: int) -> int:
+    row_bytes = model.config.hidden_size * model.normalizer.dtype.itemsize
+    return _num_microbatches(
+        num_tokens, row_bytes, get_tensor_model_parallel_world_size()
+    )
+
+
+def _sp_range_end(model: Gemma4Model, chunks: list[Any], end: int) -> torch.Tensor:
+    """The final norm and all-gather after the last layer, else the hand-off."""
+    if end == len(model.layers):
+        return torch.cat([_all_gather_rows(model.norm(h)) for h in chunks])
+    return _pack_hand_off(chunks, get_tensor_model_parallel_world_size())
+
+
+def _first_range_forward(
+    model: Gemma4Model, input_ids: torch.Tensor, positions: torch.Tensor, end: int
+) -> torch.Tensor:
+    """Layers ``[0, end)`` from the token ids: the hidden states, or with
+    sequence parallelism this rank's hand-off, as the whole model's forward
+    would hold them after layer ``end - 1``."""
+    x = model.embed_input_ids(input_ids)
+    if not _dp_pipeline_sequence_parallel:
+        return _layer_range_forward(model, x, positions, 0, end)
+    chunks = [
+        sequence_parallel_chunk(c)
+        for c in _token_chunks(x, _sp_microbatches(model, x.shape[0]))
+    ]
+    return _sp_range_end(
+        model, _sp_range_forward(model, chunks, positions, 0, end), end
+    )
+
+
+def _middle_range_forward(
+    model: Gemma4Model,
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    start: int,
+    end: int,
+) -> torch.Tensor:
+    """Layers ``[start, end)`` from what `_first_range_forward` or this
+    function returned for the layers before."""
+    if not _dp_pipeline_sequence_parallel:
+        return _layer_range_forward(model, hidden_states, positions, start, end)
+    # One size symbol, as in `_patched_model_forward` (`_pack_hand_off`).
+    torch._check(hidden_states.shape[0] == positions.shape[-1])
+    chunks = _unpack_hand_off(
+        hidden_states,
+        _sp_microbatches(model, positions.shape[-1]),
+        model.config.hidden_size,
+        model.normalizer.dtype,
+        get_tensor_model_parallel_world_size(),
+    )
+    return _sp_range_end(
+        model, _sp_range_forward(model, chunks, positions, start, end), end
+    )
+
+
 @support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": 0})
 class Gemma4FirstLayers(nn.Module):
     """Layers ``[0, end)`` from the token ids, as one compiled program."""
@@ -1241,13 +1366,13 @@ class Gemma4FirstLayers(nn.Module):
         self.model, self.end = model, end
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        x = self.model.embed_input_ids(input_ids)
-        return _layer_range_forward(self.model, x, positions, 0, self.end)
+        return _first_range_forward(self.model, input_ids, positions, self.end)
 
 
 @support_torch_compile(dynamic_arg_dims={"hidden_states": 0, "positions": 0})
 class Gemma4MiddleLayers(nn.Module):
-    """Layers ``[start, end)`` from a previous range's hidden states."""
+    """Layers ``[start, end)`` from a previous range's hidden states (with
+    sequence parallelism, its hand-off of this rank's rows)."""
 
     def __init__(
         self,
@@ -1264,9 +1389,23 @@ class Gemma4MiddleLayers(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        return _layer_range_forward(
+        return _middle_range_forward(
             self.model, hidden_states, positions, self.start, self.end
         )
+
+
+def dp_pipeline_hand_off(vllm_config: VllmConfig) -> tuple[bool, int, int, torch.dtype]:
+    """What a stage hands the next one for a full chunk: ``(per_rank, rows,
+    width, dtype)``. With sequence parallelism every TP rank sends its rows of
+    the residual stream (`_pack_hand_off`); otherwise TP rank 0 sends the
+    whole ``[tokens, hidden]`` hidden states."""
+    rows = max(int(s) for s in vllm_config.compilation_config.compile_sizes)
+    hidden = vllm_config.model_config.get_hidden_size()
+    dtype = vllm_config.model_config.dtype
+    if not envs.TPU_GEMMA4_SEQUENCE_PARALLEL:
+        return False, rows, hidden, dtype
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    return True, rows, _hand_off_bytes(hidden, dtype) // tp_size, torch.uint8
 
 
 def _build_layer_segments(
@@ -1315,11 +1454,23 @@ def _build_layer_segments(
 
 def _check_dp_pipeline(model: Gemma4Model, vllm_config: VllmConfig) -> None:
     what = "TPU_DP_PIPELINE_PREFILL"
-    if envs.TPU_GEMMA4_CP_MIN_TOKENS or envs.TPU_GEMMA4_SEQUENCE_PARALLEL:
-        raise ValueError(
-            f"{what} runs upstream's TP layers: unset TPU_GEMMA4_CP_MIN_TOKENS and "
-            "TPU_GEMMA4_SEQUENCE_PARALLEL"
-        )
+    if envs.TPU_GEMMA4_CP_MIN_TOKENS:
+        raise ValueError(f"{what} does not support TPU_GEMMA4_CP_MIN_TOKENS")
+    if envs.TPU_GEMMA4_SEQUENCE_PARALLEL:
+        rows = max(int(s) for s in vllm_config.compilation_config.compile_sizes)
+        row_bytes = model.config.hidden_size * model.normalizer.dtype.itemsize
+        tp_size = get_tensor_model_parallel_world_size()
+        if not _shards_fit(rows, row_bytes, tp_size):
+            raise ValueError(
+                f"{what} with TPU_GEMMA4_SEQUENCE_PARALLEL needs the {rows}-token "
+                "bucket, the layer ranges', to run sequence-parallel"
+            )
+        hand_off = _hand_off_bytes(model.config.hidden_size, model.normalizer.dtype)
+        if hand_off % tp_size:
+            raise ValueError(
+                f"{what} with TPU_GEMMA4_SEQUENCE_PARALLEL hands {hand_off} bytes "
+                f"per token row, which TP {tp_size} does not divide"
+            )
     if (
         model.fast_prefill_enabled
         or vllm_config.parallel_config.pipeline_parallel_size > 1
@@ -1371,7 +1522,14 @@ def _run_layer_segments(
             continue
         if seg_start != covered:
             break
-        x = segment(input_ids, positions) if seg_start == 0 else segment(x, positions)
+        if seg_start == 0:
+            x = segment(input_ids, positions)
+        else:
+            # A fresh alias: AOTAutograd stamps the dimensions the previous
+            # program traced as symbolic on its output, and Dynamo makes a
+            # stamped dimension dynamic, the hand-off's width included. Not a
+            # view: Dynamo would trace its stamped base's sizes too.
+            x = segment(x.detach(), positions)
         covered = seg_end
     if covered != end or start >= end or x is None:
         raise ValueError(
@@ -1414,8 +1572,21 @@ def _patched_dp_pipeline_forward(
             f"inputs_embeds={inputs_embeds is not None}, "
             f"intermediate_tensors={intermediate_tensors is not None}, {list(kwargs)}"
         )
-    return _run_layer_segments(
+    out = _run_layer_segments(
         self, call.start, call.end, input_ids, positions, call.hidden_states
+    )
+    if call.end == len(self.model.layers):
+        return out
+    # What the stage hands on: the hidden states, or with sequence parallelism
+    # this rank's rows (`_pack_hand_off`), while the runner's logits read
+    # [tokens, hidden] rows of a token nobody reads.
+    call.output.append(out)
+    if not _dp_pipeline_sequence_parallel:
+        return out
+    return out.new_zeros(
+        positions.shape[-1],
+        self.model.config.hidden_size,
+        dtype=self.model.normalizer.dtype,
     )
 
 
@@ -1435,7 +1606,12 @@ def maybe_patch_gemma4_dp_pipeline(model_config: ModelConfig | None) -> bool | N
         raise ValueError(
             "TPU_DP_PIPELINE_PREFILL and TPU_GEMMA4_CP_MIN_TOKENS exclude each other"
         )
+    global _dp_pipeline_sequence_parallel
+    _dp_pipeline_sequence_parallel = envs.TPU_GEMMA4_SEQUENCE_PARALLEL
     Gemma4ForCausalLM.__init__ = _patched_dp_pipeline_init
     Gemma4ForCausalLM.forward = _patched_dp_pipeline_forward
-    logger.info("Applied TPU patch: Gemma4 layer segments for pipelined prefill.")
+    logger.info(
+        "Applied TPU patch: Gemma4 layer segments for pipelined prefill%s.",
+        " (sequence-parallel hand-offs)" if _dp_pipeline_sequence_parallel else "",
+    )
     return None

@@ -155,7 +155,11 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
-from vllm_torchtpu.runner.dp_pipeline_stage import DpPipelineStage, runner_kv_access
+from vllm_torchtpu.runner.dp_pipeline_stage import (
+    DpPipelineStage,
+    HandOff,
+    runner_kv_access,
+)
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -1108,20 +1112,21 @@ class TPUModelRunner(GPUModelRunner):
         # reaches the same point.
         self._pp_wave = None
         # This engine's stages of pipelined prefills (TPU_DP_PIPELINE_PREFILL).
-        self._dp_pipeline = (
-            DpPipelineStage(
+        self._dp_pipeline = None
+        if envs.TPU_DP_PIPELINE_PREFILL:
+            # The model hands off its layer ranges' outputs (gemma4_patch).
+            from vllm_torchtpu.models.vllm.gemma4_patch import dp_pipeline_hand_off
+
+            per_rank, rows, width, dtype = dp_pipeline_hand_off(vllm_config)
+            self._dp_pipeline = DpPipelineStage(
                 dp_rank=vllm_config.parallel_config.data_parallel_index or 0,
                 tp_rank=get_tensor_model_parallel_rank(),
                 tp_size=vllm_config.parallel_config.tensor_parallel_size,
                 max_rows=self.max_num_tokens,
-                row_shape=(vllm_config.model_config.get_hidden_size(),),
-                dtype=vllm_config.model_config.dtype,
+                hand_off=HandOff(per_rank, rows, (width,), dtype),
                 device=self.device,
                 materialize=synchronize_tensors,
             )
-            if envs.TPU_DP_PIPELINE_PREFILL
-            else None
-        )
         # A sparse model's shared top-k index table, when this stage's layers
         # cannot all recompute it; set at load time under a pipeline.
         self._pp_topk_buffer: torch.Tensor | None = None
@@ -4198,7 +4203,8 @@ class TPUModelRunner(GPUModelRunner):
                 )
             if dp_stage_step is not None:
                 assert self._dp_pipeline is not None
-                self._dp_pipeline.send(dp_stage_step, hidden_states)
+                assert dp_stage_call is not None
+                self._dp_pipeline.send(dp_stage_step, dp_stage_call)
 
             if nan_check is not None:
                 assert isinstance(hidden_states, (torch.Tensor, IntermediateTensors)), (

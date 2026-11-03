@@ -194,7 +194,11 @@ def test_a_smaller_left_over_ring_is_refused():
 
 def test_unlink_rings_removes_every_ring_of_the_server():
     server = next(_server_ids)
-    made = [(0, 1, transport.HIDDEN), (2, 1, transport.kv_channel(1))]
+    made = [
+        (0, 1, transport.HIDDEN),
+        (0, 2, transport.hidden_channel(1)),
+        (2, 1, transport.kv_channel(1)),
+    ]
     rings = [
         transport.EdgeRing(
             server, src, dst, ch, 2, (4,), torch.bfloat16, 1, lambda t: None

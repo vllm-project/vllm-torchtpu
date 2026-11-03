@@ -1583,6 +1583,8 @@ def test_attention_chunks_split_quantized_rows_and_scales(monkeypatch):
         (4, 3),
         (4, 3),
     ]
+
+
 # ---------------------------------------------------------------------------
 # Pipelined prefill across DP engines: layer segments
 # ---------------------------------------------------------------------------
@@ -1716,6 +1718,13 @@ def test_dp_pipeline_forward_dispatch(monkeypatch) -> None:
     ):
         assert gemma4_patch._patched_dp_pipeline_forward(lm, ids, positions) == "seg"
     assert ranges == [(2, 6, hidden)] and whole == ["whole"] * 3
+    # Before the last stage the forward also leaves what the stage hands on.
+    call = StageCall(0, 2, None)
+    with set_vllm_model_wrapper_context(
+        mesh=None, seq_lens_cpu=np.array([4]), dp_pipeline_stage=call
+    ):
+        assert gemma4_patch._patched_dp_pipeline_forward(lm, ids, positions) == "seg"
+    assert call.output == ["seg"]
     with (
         set_vllm_model_wrapper_context(
             mesh=None, dp_pipeline_stage=StageCall(0, 2, None)
@@ -1826,3 +1835,291 @@ def test_layer_segments_have_distinct_compile_configs(monkeypatch) -> None:
     assert config.additional_config == {"other": 1}
     # The largest bucket only: every pipelined chunk pads to it.
     assert all(built[key].compilation_config.compile_sizes == [32] for key in built)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("chunks", [1, 2])
+@pytest.mark.parametrize("cuts", [(1,), (2,), (1, 2)])
+def test_sequence_parallel_layer_ranges_compose_to_the_model_forward(
+    mock_collectives, monkeypatch, fused, chunks, cuts
+):
+    """With TPU_GEMMA4_SEQUENCE_PARALLEL, ranges of layers handing each other
+    this rank's packed rows (`_pack_hand_off`) reproduce the sequence-parallel
+    forward bit for bit, fused norm tails across the range ends included."""
+    tp, num_layers, num_tokens = 2, 3, 32
+    mock = mock_collectives(tp)
+    model = _Model(tp, moe=False, fp8=True, num_layers=num_layers)
+    monkeypatch.setattr(
+        gemma4_patch, "_activation_quant_dtype", lambda linear: torch.float8_e4m3fn
+    )
+    monkeypatch.setattr(
+        gemma4_patch, "add_rms_norm_quantize_op", _emulated_add_rms_norm_quantize
+    )
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", fused)
+    monkeypatch.setattr(
+        gemma4_patch, "get_tensor_model_parallel_world_size", lambda: tp
+    )
+    monkeypatch.setattr(
+        gemma4_patch,
+        "sequence_parallel_chunk",
+        lambda x: x.chunk(tp)[threading.current_thread().rank].clone(),
+    )
+    monkeypatch.setattr(gemma4_patch, "_MIN_SHARD_BYTES", 1)
+    monkeypatch.setattr(gemma4_patch, "_microbatches", chunks)
+    monkeypatch.setattr(gemma4_patch, "_dp_pipeline_sequence_parallel", True)
+    input_ids = torch.randint(0, model.embedding.shape[0], (num_tokens,))
+    positions = torch.arange(num_tokens)
+    bounds = (0, *cuts, num_layers)
+
+    def run(rank: int) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        fake = SimpleNamespace(
+            layers=[model.layer(i, rank, mock.all_reduce) for i in range(num_layers)],
+            start_layer=0,
+            end_layer=num_layers,
+            norm=model.final_norm,
+            aux_hidden_state_layers=(),
+            embed_input_ids=lambda ids: model.embedding[ids],
+            config=SimpleNamespace(hidden_size=model.hidden),
+            # The residual stream's dtype: the f32 test model's.
+            normalizer=torch.tensor(1.0),
+        )
+        for layer in fake.layers:
+            gemma4_patch._configure_layer(layer)
+        reference = gemma4_patch._patched_model_forward(
+            fake, input_ids, positions, None
+        )
+        x = gemma4_patch._first_range_forward(fake, input_ids, positions, bounds[1])
+        shapes = [tuple(x.shape)]
+        for start, end in zip(bounds[1:], bounds[2:]):
+            x = gemma4_patch._middle_range_forward(fake, x, positions, start, end)
+            shapes.append(tuple(x.shape))
+        return reference, x, shapes
+
+    for reference, staged, shapes in _run_ranks(tp, run):
+        assert torch.equal(staged, reference)
+        # Each hand-off: this rank's residual rows, and with the fused tails
+        # their FP8 rows and scales, as bytes, viewed as the step's token rows.
+        row_bytes = model.hidden * 4 + (model.hidden + 4 if fused else 0)
+        hand_off = (num_tokens, row_bytes // tp)
+        assert shapes[:-1] == [hand_off] * (len(bounds) - 2)
+
+
+@pytest.mark.parametrize("chunks", [1, 2])
+def test_later_sequence_parallel_range_traces_the_token_count(
+    monkeypatch, chunks: int
+) -> None:
+    """A later range's trace keeps one size symbol, the token count, as the
+    hand-off's leading size and the positions': vLLM picks a compiled bucket by
+    a SymInt input and builds it on inputs that give every size symbol the
+    bucket's token count (create_concrete_args), whose guards shape_variants
+    checks before it compiles the bucket."""
+    from vllm.compilation.piecewise_backend import create_concrete_args
+
+    tp, rank, num_layers, num_tokens = 2, 1, 3, 64
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+    monkeypatch.setattr(
+        gemma4_patch, "add_rms_norm_quantize_op", _emulated_add_rms_norm_quantize
+    )
+    monkeypatch.setattr(
+        gemma4_patch, "_activation_quant_dtype", lambda linear: torch.float8_e4m3fn
+    )
+    for name, fn in (
+        ("tensor_model_parallel_all_reduce", lambda x: x * 1),
+        ("_reduce_scatter_rows", lambda x: x.chunk(tp)[rank].contiguous()),
+        ("_all_gather_rows", lambda x: torch.cat([x] * tp)),
+        ("get_tensor_model_parallel_world_size", lambda: tp),
+        ("sequence_parallel_chunk", lambda x: x.chunk(tp)[rank].clone()),
+    ):
+        monkeypatch.setattr(gemma4_patch, name, fn)
+    monkeypatch.setattr(gemma4_patch, "_MIN_SHARD_BYTES", 1)
+    monkeypatch.setattr(gemma4_patch, "_microbatches", chunks)
+    monkeypatch.setattr(gemma4_patch, "_dp_pipeline_sequence_parallel", True)
+    model = _Model(tp, moe=False, fp8=True, num_layers=num_layers)
+    fake = SimpleNamespace(
+        layers=[
+            model.layer(i, rank, gemma4_patch.tensor_model_parallel_all_reduce)
+            for i in range(num_layers)
+        ],
+        norm=model.final_norm,
+        embed_input_ids=lambda ids: model.embedding[ids],
+        config=SimpleNamespace(hidden_size=model.hidden),
+        normalizer=torch.tensor(1.0),
+    )
+    for layer in fake.layers:
+        gemma4_patch._configure_layer(layer)
+    positions = torch.arange(num_tokens)
+    ids = torch.randint(0, model.embedding.shape[0], (num_tokens,))
+    packed = gemma4_patch._first_range_forward(fake, ids, positions, 1)
+    graphs: list[torch.fx.GraphModule] = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        lambda h, p: gemma4_patch._middle_range_forward(fake, h, p, 1, num_layers),
+        backend=backend,
+        fullgraph=True,
+    )
+    hand_off, pos = packed.clone(), positions.clone()
+    # As vLLM marks them (dynamic_arg_dims): the leading dimensions.
+    torch._dynamo.mark_dynamic(hand_off, 0)
+    torch._dynamo.mark_dynamic(pos, 0)
+    compiled(hand_off, pos)
+    (graph,) = graphs
+    values = [
+        node.meta["example_value"]
+        for node in graph.graph.nodes
+        if node.op == "placeholder"
+    ]
+    symbols = {str(v) for v in values if isinstance(v, torch.SymInt)}
+    leading = {
+        str(v.shape[0])
+        for v in values
+        if isinstance(v, torch.Tensor) and v.dtype in (torch.uint8, pos.dtype)
+    }
+    assert len(symbols) == 1 and leading == symbols
+    concrete = [
+        (arg.dtype, tuple(arg.shape))
+        for arg in create_concrete_args(graph, num_tokens)
+        if isinstance(arg, torch.Tensor) and arg.dtype in (torch.uint8, pos.dtype)
+    ]
+    assert sorted(concrete, key=str) == sorted(
+        [(torch.uint8, tuple(packed.shape)), (pos.dtype, (num_tokens,))], key=str
+    )
+    shape_env = shape_variants.trace_shape_env(graph)
+    assert shape_variants.unsupported_reason(shape_env, num_tokens) is None
+
+
+def test_later_segment_input_carries_no_dynamic_stamp() -> None:
+    """A segment's output reaches the next segment without the dimensions
+    AOTAutograd stamped on it as traced symbolic: Dynamo would make them
+    dynamic even under dynamic=False, and a hand-off width as a size symbol
+    fails the next segment's bucket (shape_variants)."""
+    from torch._functorch._aot_autograd.runtime_wrappers import (
+        mark_dynamo_propagated_dynamic_indices,
+    )
+
+    def trace(t: torch.Tensor) -> tuple[tuple, Any]:
+        """The traced input's sizes and the trace's ShapeEnv, with the
+        leading dimension marked dynamic as vLLM marks it."""
+        traced: list[tuple[tuple, Any]] = []
+
+        def backend(gm, example_inputs):
+            values = [n.meta.get("example_value") for n in gm.graph.nodes]
+            tensor = next(v for v in values if isinstance(v, torch.Tensor))
+            traced.append((tuple(tensor.shape), shape_variants.trace_shape_env(gm)))
+            return gm.forward
+
+        torch._dynamo.reset()
+        torch._dynamo.mark_dynamic(t, 0)
+        torch.compile(lambda h: h * 1, backend=backend, dynamic=False)(t)
+        return traced[0]
+
+    tokens, width = 16, 6
+    stamped = torch.zeros(tokens, width, dtype=torch.uint8)
+    mark_dynamo_propagated_dynamic_indices(stamped, {0, 1})
+    # The mechanism: the stamped width traces as a size symbol, which no
+    # token bucket's substitution satisfies.
+    shape, _ = trace(stamped)
+    assert type(shape[1]) is not int
+    seen: list[torch.Tensor] = []
+    lm = SimpleNamespace(
+        _dp_pipeline_segments={
+            (0, 1): lambda ids, pos: stamped,
+            (1, 2): lambda h, pos: seen.append(h) or h,
+        }
+    )
+    ids, positions = torch.zeros(tokens, dtype=torch.int32), torch.arange(tokens)
+    gemma4_patch._run_layer_segments(lm, 0, 2, ids, positions, None)
+    (handed,) = seen
+    assert torch.equal(handed, stamped)
+    shape, shape_env = trace(handed)
+    assert type(shape[1]) is int and shape[1] == width
+    # The token count is the trace's only size symbol.
+    assert len(shape_env.var_to_range) == 1
+    assert shape_variants.unsupported_reason(shape_env, tokens) is None
+
+
+def test_sequence_parallel_stage_hands_on_its_rows(monkeypatch) -> None:
+    """With sequence parallelism a stage before the last hands on this rank's
+    packed rows; the runner's logits get [tokens, hidden] zeros."""
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+    from vllm_torchtpu.runner.dp_pipeline_stage import StageCall
+
+    packed = torch.ones(2, 12, dtype=torch.uint8)
+    monkeypatch.setattr(gemma4_patch, "_dp_pipeline_sequence_parallel", True)
+    monkeypatch.setattr(gemma4_patch, "_run_layer_segments", lambda self, *args: packed)
+    lm = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[None] * 6,
+            config=SimpleNamespace(hidden_size=8),
+            normalizer=torch.tensor(1.0, dtype=torch.bfloat16),
+        ),
+        _dp_pipeline_rows=4,
+    )
+    ids, positions = torch.zeros(4, dtype=torch.int32), torch.arange(4)
+    call = StageCall(0, 2, None)
+    with set_vllm_model_wrapper_context(
+        mesh=None, seq_lens_cpu=np.array([4]), dp_pipeline_stage=call
+    ):
+        out = gemma4_patch._patched_dp_pipeline_forward(lm, ids, positions)
+    assert call.output == [packed]
+    assert out.shape == (4, 8) and out.dtype == torch.bfloat16 and not out.any()
+
+
+def test_dp_pipeline_hand_off_follows_sequence_parallelism(monkeypatch) -> None:
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(compile_sizes=[16, 64]),
+        model_config=SimpleNamespace(get_hidden_size=lambda: 8, dtype=torch.bfloat16),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+    )
+    monkeypatch.setattr(envs, "TPU_GEMMA4_SEQUENCE_PARALLEL", False)
+    assert gemma4_patch.dp_pipeline_hand_off(config) == (
+        False,
+        64,
+        8,
+        torch.bfloat16,
+    )
+    monkeypatch.setattr(envs, "TPU_GEMMA4_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", False)
+    # A rank's 32 rows of 16 bytes, viewed as the 64 tokens' rows (`_pack_hand_off`).
+    assert gemma4_patch.dp_pipeline_hand_off(config) == (True, 64, 8, torch.uint8)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+    # bf16 rows, their FP8 bytes, an f32 scale.
+    assert gemma4_patch.dp_pipeline_hand_off(config) == (True, 64, 14, torch.uint8)
+
+
+def test_dp_pipeline_needs_sequence_parallel_ranges(monkeypatch) -> None:
+    monkeypatch.setattr(envs, "TPU_GEMMA4_CP_MIN_TOKENS", 0)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(gemma4_patch, "get_tensor_model_parallel_world_size", lambda: 2)
+    layer = SimpleNamespace(
+        per_layer_input_gate=None,
+        self_attn=SimpleNamespace(is_kv_shared_layer=False),
+    )
+    model = SimpleNamespace(
+        fast_prefill_enabled=False,
+        layers=[layer],
+        config=SimpleNamespace(hidden_size=5376),
+        normalizer=torch.tensor(1.0, dtype=torch.bfloat16),
+    )
+
+    def config(largest):
+        return SimpleNamespace(
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+            additional_config={},
+            compilation_config=SimpleNamespace(compile_sizes=[16, largest]),
+        )
+
+    gemma4_patch._check_dp_pipeline(model, config(16384))
+    with pytest.raises(ValueError, match="run sequence-parallel"):
+        gemma4_patch._check_dp_pipeline(model, config(64))
+    # bf16 rows, their FP8 bytes and an f32 scale: 3 * 5377 + 4 bytes per row.
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+    model.config.hidden_size = 5377
+    with pytest.raises(ValueError, match="does not divide"):
+        gemma4_patch._check_dp_pipeline(model, config(16384))

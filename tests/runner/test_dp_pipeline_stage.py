@@ -14,9 +14,7 @@
 """A pipelined prefill's stages on CPU: which steps are stage steps, the
 hand-off from one engine's runner to the next, and the K/V the owner gets."""
 
-import contextlib
 import itertools
-from multiprocessing import shared_memory
 from types import SimpleNamespace
 
 import numpy as np
@@ -31,7 +29,7 @@ from vllm_torchtpu.distributed.dp_pipeline.plan import (
     PipelinePlan,
     make_pipeline_id,
 )
-from vllm_torchtpu.runner.dp_pipeline_stage import DpPipelineStage, KvAccess
+from vllm_torchtpu.runner.dp_pipeline_stage import DpPipelineStage, HandOff, KvAccess
 
 _servers = itertools.count(51000)
 CHUNKS = [(0, 8), (8, 8), (16, 5)]  # (first position, tokens) of a 21-token prompt
@@ -40,17 +38,23 @@ CHUNKS = [(0, 8), (8, 8), (16, 5)]  # (first position, tokens) of a 21-token pro
 ROWS = 8  # the full chunk's bucket, which every pipelined chunk pads to
 
 
-def _stage(dp_rank, tp_rank=0, tp_size=1):
+def _stage(dp_rank, tp_rank=0, tp_size=1, per_rank=False):
+    rows = ROWS // tp_size if per_rank else ROWS
     return DpPipelineStage(
         dp_rank=dp_rank,
         tp_rank=tp_rank,
         tp_size=tp_size,
         max_rows=ROWS,
-        row_shape=(4,),
-        dtype=torch.float32,
+        hand_off=HandOff(per_rank, rows, (4,), torch.float32),
         device=torch.device("cpu"),
         materialize=lambda t, wait=True: None,
     )
+
+
+def _sent(call, out):
+    """``call`` after a forward that left ``out`` to hand on."""
+    call.output.append(out)
+    return call
 
 
 def _batch(requests):
@@ -76,11 +80,7 @@ def _states(plans):
 
 
 def _unlink(p):
-    for src, dst in itertools.permutations(p.ranks, 2):
-        for channel in (transport.HIDDEN, transport.kv_channel(0)):
-            name = transport.ring_name(p.server_id, src, dst, channel)
-            with contextlib.suppress(FileNotFoundError):
-                shared_memory.SharedMemory(name=name).unlink()
+    transport.unlink_rings(p.server_id, max(p.ranks) + 1, tp_size=2)
 
 
 @pytest.fixture
@@ -136,7 +136,7 @@ def _run_helper(helper, plan, states, outputs=None, chunks=CHUNKS):
         call = helper.call(step, ROWS)
         assert (call.start, call.end, call.hidden_states) == (0, 3, None)
         out = torch.full((ROWS, 4), float(first))
-        helper.send(step, out)
+        helper.send(step, _sent(call, out))
         if outputs is not None:
             outputs.append(out)
 
@@ -151,7 +151,7 @@ def test_hand_off_between_engines(plan):
         call = owner.call(step, ROWS)
         assert (call.start, call.end) == (3, 6)
         assert torch.equal(call.hidden_states, out)
-        owner.send(step, call.hidden_states)  # the last stage keeps its output
+        owner.send(step, call)  # the last stage keeps its output
     # The input of every chunk after the first was copied in ahead of it.
     assert owner._prefetched == {}
     helper.close()
@@ -164,7 +164,7 @@ def test_a_failed_hand_off_surfaces_on_the_next_step(plan, monkeypatch):
     states = _states({"a": plan})
     for first in (0, 8, 16):  # two slots fill; nobody takes them
         step = helper.step(["a"], _batch({"a": (first, 21)}), states, {"a": 5})
-        helper.send(step, torch.zeros(8, 4))
+        helper.send(step, _sent(helper.call(step, ROWS), torch.zeros(8, 4)))
     helper._sent[-1].exception(timeout=5.0)
     with pytest.raises(TimeoutError, match="free slot"):
         helper.step(["a"], _batch({"a": (0, 21)}), states, {"a": 8})
@@ -248,8 +248,7 @@ def test_the_owner_gets_the_helpers_kv_before_it_decodes(kv_plan_):
         batch = _batch({"a": (first, 21)})
         owner.before_forward(["a"], batch, states)
         step = owner.step(["a"], batch, states, {"a": tokens})
-        call = owner.call(step, ROWS)
-        owner.send(step, call.hidden_states)
+        owner.send(step, owner.call(step, ROWS))
     # The last pipelined step waited for every hand-off, so its sampled token
     # does: the first decode step finds nothing left to wait for.
     assert owner._receipts == {}
@@ -335,3 +334,27 @@ def test_the_owner_computes_the_rest_of_the_prompt_alone(monkeypatch):
         helper.close()
         owner.close()
         _unlink(plan)
+
+
+def test_each_rank_hands_its_own_rows_to_the_same_rank(plan):
+    """Sequence-parallel hand-offs: TP rank r of a stage sends its rows to TP
+    rank r of the next one."""
+    states = _states({"a": plan})
+    helpers = [_stage(2, r, 2, per_rank=True) for r in range(2)]
+    owners = [_stage(0, r, 2, per_rank=True) for r in range(2)]
+    try:
+        for first, tokens in CHUNKS:
+            batch = _batch({"a": (first, 21)})
+            for r, helper in enumerate(helpers):
+                step = helper.step(["a"], batch, states, {"a": tokens})
+                rows = torch.full((ROWS // 2, 4), float(10 * first + r))
+                helper.send(step, _sent(helper.call(step, ROWS), rows))
+            for r, owner in enumerate(owners):
+                step = owner.step(["a"], batch, states, {"a": tokens})
+                got = owner.call(step, ROWS).hidden_states
+                assert torch.equal(
+                    got, torch.full((ROWS // 2, 4), float(10 * first + r))
+                )
+    finally:
+        for stage in helpers + owners:
+            stage.close()
