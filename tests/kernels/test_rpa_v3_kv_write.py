@@ -141,6 +141,26 @@ def test_write_kv_matches_reference(batch, num_kv_heads, head_dim, dtype):
     np.testing.assert_array_equal(_bits(written), _bits(_reference_write(case)))
 
 
+@pytest.mark.parametrize(
+    "keys_shape,keys_dtype,match",
+    [
+        # The cache holds 8 KV heads: a TP-sharded caller passing 4.
+        ((21, 4, 256), jnp.bfloat16, "for 4 KV heads"),
+        # A cache wider than the keys' aligned head dim; RPA v3 rejects it, so
+        # callers pad K/V to the cache's head dim first.
+        ((21, 8, 128), jnp.bfloat16, "head dim 128"),
+        ((21, 8, 256), jnp.float32, "dtype"),
+        ((21, 8 * 256), jnp.bfloat16, "3-D"),
+    ],
+    ids=["heads", "head_dim", "dtype", "rank"],
+)
+def test_write_kv_rejects_inputs_the_kernel_rejects(keys_shape, keys_dtype, match):
+    case = _make_case("verify_windows", 8, 256, jnp.bfloat16)
+    keys = jnp.zeros(keys_shape, keys_dtype)
+    with pytest.raises(ValueError, match=match):
+        write_kv(case.kv_cache, keys, keys, *case.rpa_args())
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("batch", list(BATCHES))
 @pytest.mark.parametrize("num_kv_heads,head_dim,dtype", CACHES)

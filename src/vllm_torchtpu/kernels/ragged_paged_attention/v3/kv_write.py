@@ -21,7 +21,10 @@ For callers that need only the write.
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import merge_kv
+from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
+    get_kv_cache_shape,
+    merge_kv,
+)
 
 
 def new_token_slots(
@@ -70,6 +73,33 @@ def new_token_slots(
     return jnp.where(written, slots, num_cache_slots + tokens)
 
 
+def _validate_inputs(kv_cache: jax.Array, keys: jax.Array, values: jax.Array) -> None:
+    """The shape and dtype checks of RPA v3's static_validate_inputs that
+    apply to the write. Shapes and dtypes are static, so this costs nothing
+    at run time."""
+    if keys.ndim != 3 or keys.shape != values.shape:
+        raise ValueError(
+            f"Expected 3-D keys and values of one shape, got {keys.shape=}, "
+            f"{values.shape=}"
+        )
+    if not (kv_cache.dtype == keys.dtype == values.dtype):
+        raise ValueError(
+            f"Expected {kv_cache.dtype=} to equal {keys.dtype=} and {values.dtype=}"
+        )
+    expected_shape = get_kv_cache_shape(
+        kv_cache.shape[0],
+        kv_cache.shape[1],
+        keys.shape[1],
+        keys.shape[2],
+        kv_cache.dtype,
+    )
+    if kv_cache.shape != expected_shape:
+        raise ValueError(
+            f"Expected {kv_cache.shape=} to equal {expected_shape=} for "
+            f"{keys.shape[1]} KV heads of head dim {keys.shape[2]}"
+        )
+
+
 def write_kv(
     kv_cache: jax.Array,
     keys: jax.Array,
@@ -82,15 +112,22 @@ def write_kv(
     """Returns kv_cache with keys/values written where RPA v3 writes them.
 
     kv_cache: [total_num_pages, page_size, num_kv_heads_x2 // kv_packing,
-    kv_packing, head_dim], possibly with a wider head_dim than the layer's.
-    keys, values: [num_tokens, num_kv_heads, actual_head_dim] in the cache
-    dtype. The other arguments are RPA v3's.
+    kv_packing, head_dim], as get_kv_cache_shape gives for keys' heads and
+    head dim. keys, values: [num_tokens, num_kv_heads, actual_head_dim] in the
+    cache dtype. The other arguments are RPA v3's. Raises ValueError on the
+    shape and dtype mismatches the kernel rejects.
 
     Donate kv_cache to update it in place. The scatter goes through a
     [slots, num_kv_heads_x2, head_dim] view, which holds the same bytes in the
     cache's TPU layout; scattering [num_kv_heads_x2 // kv_packing, kv_packing,
     head_dim] rows makes XLA copy the whole cache around the scatter.
+
+    The scatter assumes no two written tokens share a slot (unique_indices):
+    distinct sequences must own distinct pages, as the paged KV cache
+    allocates them. If two tokens did share a slot, the kernel's sequential
+    write would keep the last; here the result is undefined.
     """
+    _validate_inputs(kv_cache, keys, values)
     total_num_pages, page_size, heads_per_packing, kv_packing, head_dim = kv_cache.shape
     num_kv_heads_x2 = heads_per_packing * kv_packing
     num_cache_slots = total_num_pages * page_size
