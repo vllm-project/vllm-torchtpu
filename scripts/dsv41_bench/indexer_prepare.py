@@ -19,9 +19,9 @@ def prepare(keys, columns, order):
 
     def kernel(key_ref, column_ref, order_ref, column_out, value_out):
         order = order_ref[:]
-        values = jnp.take_along_axis(
-            key_ref[:, :], jnp.broadcast_to(order[:, None], (padded, 128)), axis=0
-        ).astype(jnp.float32)
+        # Mosaic dynamic_gather requires 32-bit data for int32 indices.
+        # Encode first: reorder 33 packed fields instead of 128 widened keys.
+        values = key_ref[:, :].astype(jnp.float32)
         amax = jnp.maximum(jnp.max(jnp.abs(values), axis=1), 1e-4)
         exponent = jnp.ceil(jnp.log2(amax / 448.0)).astype(jnp.int32)
         scale = jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
@@ -38,7 +38,10 @@ def prepare(keys, columns, order):
             axis=1,
         )
         active = jnp.arange(padded) < count
-        value_out[:, :] = jnp.where(active[:, None], packed, 0).T
+        sorted_values = jnp.take_along_axis(
+            packed.T, jnp.broadcast_to(order[None, :], (33, padded)), axis=1
+        )
+        value_out[:, :] = jnp.where(active[None, :], sorted_values, 0)
         column_out[:] = jnp.where(active, columns_gather(column_ref[:], order), 0)
 
     return pl.pallas_call(
