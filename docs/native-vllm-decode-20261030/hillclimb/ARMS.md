@@ -27,9 +27,11 @@ Reference: the 2026-10-30 baseline measured 879.9 tok/s at 109.1 ms steady TPOT.
 | 14 | `base-dp8tp4-s96-k3-hot` | dp8tp4 | 96 | 3 | `KV_BYTES=25769803776 HOT_SET=16:0.3` | skewed routing: 30% of tokens into 16 experts on one rank |
 | 15 | `base-dp8tp4-s96-k3-hotspread` | dp8tp4 | 96 | 3 | `KV_BYTES=25769803776 HOT_SET=16:0.3:spread` | same skew, hot experts spread over ranks |
 | 16 | `base-dp8tp4-s144-k3` | dp8tp4 | 144 | 3 | `KV_BYTES=auto` | batch within the baseline's own capacity (18 per engine) |
+| 17 | `tp32dcp8-s96-k3-fuseddraft` | tp32dcp8 | 96 | 3 | `FUSED_DRAFT=1` | draft steps 1-2 as one program (vs arm 3) |
+| 18 | `base-dp8tp4-s96-k3-fastsubst` | dp8tp4 | 96 | 3 | `KV_BYTES=25769803776 FAST_SUBST=1` | host fast path for token substitution (vs arm 1) |
 
 Arms 1 to 5 answer the layout question; 6 and 7 the batch question; 8 and 9 the two cheapest
-engine knobs; 11 and 12 the expert path; 13 to 15 how much routing skew costs (dummy weights route nearly uniformly, so arms 1 to 12 cannot show it); 16 the batch lever on the baseline itself. If arm 3 beats arm 1, run 6 and 8 on top of it; otherwise run 7 on top of arm 5.
+engine knobs; 11 and 12 the expert path; 13 to 15 how much routing skew costs (dummy weights route nearly uniformly, so arms 1 to 12 cannot show it); 16 the batch lever on the baseline itself; 17 and 18 the per-step program and host costs. If arm 3 beats arm 1, run 6 and 8 on top of it; otherwise run 7 on top of arm 5.
 
 ## What to report per arm
 

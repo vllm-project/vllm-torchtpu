@@ -79,6 +79,8 @@ LAYOUT=tp32dcp8 GLOBAL_SEQS=96 "$PYTHON_BIN" bench_sweep.py --stage <arm> --inpu
 | `W4A8` | 0 | `1` = fp8 activations in the fused EP kernel, so 4-bit experts feed the MXU as fp8 instead of being dequantized to bf16 (needs `FUSED_EP`) |
 | `BLOCK_SIZE` | 384 | `--block-size` |
 | `HOT_SET` | | simulated routing for profiling: `uniform` = balanced; `16:0.3` = 30% of tokens route only into 16 fixed experts (per-expert load CV 1.67, one EP rank 10x loaded); `16:0.3:spread` = the same skew with one hot expert per rank (balanced control). Dummy weights route near-uniformly, so expert imbalance is invisible without this |
+| `FUSED_DRAFT` | 0 | `1` = draft steps 1..K-1 as one compiled program instead of two programs per step; single-engine layouts only (the switch does not support EP across data-parallel engines) |
+| `FAST_SUBST` | 0 | `1` = steady-state fast token substitution (skips the substitution kernel and per-step index uploads) |
 | `WEIGHTS` | dummy | `real` loads the checkpoint at `MODEL_PATH` |
 | `KV_MODE` | synthetic | `normal` = real prefill with prefix caching (required with real weights; measure with `../benchmark_window.py`) |
 | `EXTRA_ARGS` | | appended to `vllm serve` |

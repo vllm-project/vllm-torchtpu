@@ -16,6 +16,8 @@
 #   HOT_SET       "" (real/dummy routing) | "uniform" (balanced simulated routing) | "<size>:<rate>[:spread]"
 #                 skewed simulated routing: <rate> of the tokens route only into <size> fixed experts
 #   BLOCK_SIZE    --block-size (baseline 384)
+#   FUSED_DRAFT   1 = draft steps 1..K-1 as one compiled program (VLLM_TPU_FUSED_DRAFT_LOOP); single-engine layouts only
+#   FAST_SUBST    1 = steady-state fast token substitution (VLLM_TPU_FAST_TOKEN_SUBSTITUTION)
 #   WEIGHTS       dummy (default) | real: real checkpoint at MODEL_PATH
 #   KV_MODE       synthetic (default, needs dummy weights) | normal: real prefill with prefix caching
 #   EXTRA_ARGS    appended verbatim to vllm serve
@@ -30,11 +32,19 @@ FUSED_EP=${FUSED_EP:-0}
 W4A8=${W4A8:-0}
 BLOCK_SIZE=${BLOCK_SIZE:-384}
 HOT_SET=${HOT_SET:-}
+FUSED_DRAFT=${FUSED_DRAFT:-0}
+FAST_SUBST=${FAST_SUBST:-0}
 WEIGHTS=${WEIGHTS:-dummy}
 KV_MODE=${KV_MODE:-synthetic}
 read -r -a EXTRA_ARGV <<< "${EXTRA_ARGS:-}"
 cd "$(dirname -- "$0")/.."
 
+if [[ "$FUSED_DRAFT" == 1 ]]; then
+  # The fused draft loop does not support EP across data-parallel engines (idle ranks replay the per-step trace).
+  (( ENGINES == 1 )) || { echo "FUSED_DRAFT=1 needs a single-engine layout (got $ENGINES engines)" >&2; exit 2; }
+  export VLLM_TPU_FUSED_DRAFT_LOOP=1
+fi
+[[ "$FAST_SUBST" == 1 ]] && export VLLM_TPU_FAST_TOKEN_SUBSTITUTION=1
 LOAD_ARGS=(--load-format dummy)
 [[ "$WEIGHTS" == real ]] && LOAD_ARGS=()
 case "$KV_MODE" in
@@ -69,7 +79,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \
