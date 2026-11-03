@@ -106,7 +106,7 @@ steps:
           <<: *tests_plugin_defaults
           split-by-example: true
           test-file-pattern: "tests/**/{test_*,*_test}.py"
-          test-cmd: "python3 .buildkite/scripts/run_pytest_chunked.py --isolated-chunk-size 8 --chunk-size 64 --timeout 600 --mark 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} -- {{testExamples}}"
+          test-cmd: "python3 .buildkite/scripts/run_pytest_chunked.py --isolated-chunk-size 4 --chunk-size 64 --timeout 600 --mark 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} -- {{testExamples}}"
 
   - label: "Unit Tests - CPU (Nightly)"
     key: "unit_tests_cpu_nightly"

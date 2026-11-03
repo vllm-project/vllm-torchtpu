@@ -288,7 +288,7 @@ def test_cli_flag_orders_exit_codes_and_validation(tmp_path: Path) -> None:
             sys.executable,
             str(_SCRIPT_PATH),
             "--isolated-chunk-size",
-            "8",
+            "4",
             "--chunk-size",
             "64",
             "--timeout",
@@ -341,6 +341,73 @@ def test_cli_flag_orders_exit_codes_and_validation(tmp_path: Path) -> None:
         ValueError, match="--isolated-chunk-size must be a positive integer"
     ):
         run_pytest_chunked.main(["--isolated-chunk-size", "-1", str(pass_test)])
+
+
+def test_whole_file_cpu_heavy_ast_subfile_expansion_and_negative_controls(
+    tmp_path: Path,
+) -> None:
+    run_pytest_chunked._analyze_test_file.cache_clear()
+    run_pytest_chunked._extract_pytest_targets.cache_clear()
+
+    # Positive control: whole-file heavy module with 3 top-level test_* defs,
+    # 1 parameterized-style TestCase class, 1 private helper class, and 1
+    # class with __init__ (ignored by pytest).
+    heavy_multi = _write_file(
+        tmp_path / "tests" / "megakernel" / "test_m3_like.py",
+        "from jax.experimental import pallas as pl\n"
+        "class _PrivateHelper:\n"
+        "    def test_ignored(self): pass\n"
+        "class HelperWithInit:\n"
+        "    def __init__(self): pass\n"
+        "    def test_ignored(self): pass\n"
+        "def test_alpha(): assert pl is not None\n"
+        "async def test_beta(): assert True\n"
+        "class SparseMlaCaseTest:\n"
+        "    def test_case_one(self): assert True\n"
+        "def test_gamma(): assert True\n",
+    )
+    # Negative control 1: same-file class inheritance keeps whole-file selector
+    # so abstract base classes are never selected directly.
+    heavy_inherited = _write_file(
+        tmp_path / "tests" / "kernels" / "test_inherited_base.py",
+        "from jax.experimental import pallas as pl\n"
+        "class BaseCase:\n"
+        "    def test_shared(self): assert pl is not None\n"
+        "class ChildCaseTest(BaseCase):\n"
+        "    def test_child(self): assert True\n",
+    )
+    # Negative control 2: single-test heavy file stays whole-file selector.
+    heavy_single = _write_file(
+        tmp_path / "tests" / "kernels" / "test_single_heavy.py",
+        "from jax.experimental import pallas as pl\n"
+        "def test_only(): assert pl is not None\n",
+    )
+    # Negative control 3: non-heavy batch file with multiple test_* functions
+    # is NOT sub-file split (avoids extra subprocess overhead).
+    light_multi = _write_file(
+        tmp_path / "tests" / "runner" / "test_light_multi.py",
+        "def test_one(): assert True\ndef test_two(): assert True\n",
+    )
+
+    chunks = run_pytest_chunked.plan_chunks(
+        [
+            str(light_multi),
+            str(heavy_multi),
+            str(heavy_inherited),
+            str(heavy_single),
+        ],
+        chunk_size=8,
+        isolated_chunk_size=2,
+        has_vfio=False,
+        repo_root=tmp_path,
+    )
+    assert chunks == [
+        [str(heavy_inherited)],
+        [str(heavy_single)],
+        [f"{heavy_multi}::test_alpha", f"{heavy_multi}::test_beta"],
+        [f"{heavy_multi}::SparseMlaCaseTest", f"{heavy_multi}::test_gamma"],
+        [str(light_multi)],
+    ]
 
 
 def test_signal_exit_normalization_and_vfio_settle_transitions(

@@ -150,6 +150,60 @@ def _analyze_test_file(resolved_path: str) -> tuple[bool, bool]:
     return spawns_workers, cpu_heavy_kernel
 
 
+@functools.lru_cache(maxsize=2048)
+def _extract_pytest_targets(resolved_path: str) -> tuple[str, ...]:
+    """Return top-level pytest function/class names for safe sub-file splitting.
+
+    Emits top-level ``test_*`` functions and non-private classes that directly
+    define ``test_*`` methods (at class granularity so ``absl.testing``
+    ``@parameterized`` method-renaming metaclasses remain intact). If the module
+    uses same-file class inheritance or defines <= 1 target, returns ``()`` so
+    the caller keeps the whole-file selector unchanged.
+    """
+    path = Path(resolved_path)
+    if not path.is_file():
+        return ()
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=resolved_path)
+    except (OSError, SyntaxError):
+        return ()
+
+    classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
+    local_class_names = {c.name for c in classes}
+    for cls in classes:
+        for base in cls.bases:
+            base_name = (
+                base.id
+                if isinstance(base, ast.Name)
+                else (base.attr if isinstance(base, ast.Attribute) else None)
+            )
+            if base_name in local_class_names:
+                return ()
+
+    targets: list[str] = []
+    for node in tree.body:
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ) and node.name.startswith("test_"):
+            targets.append(node.name)
+        elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+            has_init = any(
+                isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and sub.name == "__init__"
+                for sub in node.body
+            )
+            has_test_method = any(
+                isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and sub.name.startswith("test_")
+                for sub in node.body
+            )
+            if has_test_method and not has_init:
+                targets.append(node.name)
+
+    return tuple(targets) if len(targets) > 1 else ()
+
+
 def classify_selector(
     selector: str,
     *,
@@ -217,10 +271,21 @@ def plan_chunks(
     heavy_by_file: dict[str, list[str]] = defaultdict(list)
     batch_items = []
     for sel in clean:
-        rel_posix, _ = _normalize_selector_path(sel, root)
+        rel_posix, resolved = _normalize_selector_path(sel, root)
         kind = classify_selector(sel, has_vfio=False, repo_root=root)
         if kind == "cpu_heavy_isolated":
-            heavy_by_file[rel_posix].append(sel)
+            expanded = (
+                _extract_pytest_targets(str(resolved.resolve()))
+                if "::" not in sel
+                else ()
+            )
+            candidates = (
+                [f"{sel}::{target}" for target in expanded] if expanded else [sel]
+            )
+            bucket = heavy_by_file[rel_posix]
+            for cand in candidates:
+                if cand not in bucket:
+                    bucket.append(cand)
         else:
             batch_items.append((rel_posix, sel))
 
