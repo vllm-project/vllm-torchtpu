@@ -55,6 +55,28 @@ if _strategy_name:
         RoutingSimulator,
     )
 
+    if _strategy_name == "hot_set":
+        from vllm_torchtpu.layers.adapter.hot_set_routing import (
+            HotSetRouting,
+            expected_load_cv,
+        )
+
+        RoutingSimulator.register_strategy(
+            "hot_set",
+            HotSetRouting(
+                hot_size=envs.TPU_MOE_HOT_SET_SIZE,
+                rate=envs.TPU_MOE_HOT_SET_RATE,
+                spread=envs.TPU_MOE_HOT_SET_SPREAD,
+            ),
+        )
+        logger.warning(
+            "hot_set routing: %d hot experts, rate %.2f, spread=%s; expected "
+            "per-expert load CV over 512 experts = %.2f",
+            envs.TPU_MOE_HOT_SET_SIZE,
+            envs.TPU_MOE_HOT_SET_RATE,
+            envs.TPU_MOE_HOT_SET_SPREAD,
+            expected_load_cv(512, envs.TPU_MOE_HOT_SET_SIZE, envs.TPU_MOE_HOT_SET_RATE),
+        )
     _available = RoutingSimulator.get_available_strategies()
     if _strategy_name not in _available:
         raise ValueError(

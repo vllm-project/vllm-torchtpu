@@ -81,6 +81,9 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_MOE_HOT_SET_SIZE: int = 16
+    TPU_MOE_HOT_SET_RATE: float = 0.3
+    TPU_MOE_HOT_SET_SPREAD: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -643,6 +646,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
+    # Profiling-only skewed routing (VLLM_MOE_ROUTING_SIMULATION_STRATEGY=hot_set):
+    # a fraction TPU_MOE_HOT_SET_RATE of the tokens route only into the first
+    # TPU_MOE_HOT_SET_SIZE experts (or one hot expert per EP rank with
+    # TPU_MOE_HOT_SET_SPREAD=1); see layers/adapter/hot_set_routing.py.
+    "TPU_MOE_HOT_SET_SIZE": lambda: int(os.getenv("TPU_MOE_HOT_SET_SIZE", "16")),
+    "TPU_MOE_HOT_SET_RATE": lambda: float(os.getenv("TPU_MOE_HOT_SET_RATE", "0.3")),
+    "TPU_MOE_HOT_SET_SPREAD": env_bool("TPU_MOE_HOT_SET_SPREAD"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's
