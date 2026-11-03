@@ -415,12 +415,15 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                             effective = min(b, cfg.chunk_size)
                             self.assertEqual(cfg.chunk_size % effective, 0)
                 if n_v in expected_gdn:
-                    cfg = self._gdn_config(n_v, 128, cfg_mod=cfg_mod)
-                    self.assertEqual(
-                        cfg.triangular_block_size,
-                        expected_gdn[n_v],
-                        (fork_name, n_v),
-                    )
+                    with self.subTest(
+                        fork=fork_name, n_v=n_v, expected_b=expected_gdn[n_v]
+                    ):
+                        cfg = self._gdn_config(n_v, 128, cfg_mod=cfg_mod)
+                        self.assertEqual(
+                            cfg.triangular_block_size,
+                            expected_gdn[n_v],
+                            (fork_name, n_v),
+                        )
 
     def test_invert_triangular_matrix_rejects_non_dividing_block(self):
         """Negative control: a block size that does not divide the chunk
@@ -428,7 +431,7 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
         from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
             compute_gdn as pcp_compute_gdn,
         )
-        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn
+        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, compute_kda
 
         t = jnp.tril(jnp.ones((2, 128, 128), dtype=jnp.float32))
         for fork_name, mod in (
@@ -442,6 +445,36 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                 for block_size in (16, 8, 4, 2):
                     inv = mod.invert_triangular_matrix(t, block_size=block_size)
                     self.assertEqual(inv.shape, t.shape)
+
+        with self.subTest(fork="v3_kda"):
+            kda_bad_cfg = self._gdn_config(
+                8, 24, attention_mode=config.AttentionMode.KDA
+            )
+            self.assertEqual(kda_bad_cfg.triangular_block_size, 16)
+            with self.assertRaisesRegex(AssertionError, "divisible"):
+                compute_kda.chunked_kda_per_seq(
+                    q_large=jnp.zeros((2, 24, 128), dtype=jnp.float32),
+                    k_large=jnp.zeros((2, 24, 128), dtype=jnp.float32),
+                    v_large=jnp.zeros((8, 24, 128), dtype=jnp.float32),
+                    gating_log=jnp.zeros((8, 24, 128), dtype=jnp.float32),
+                    beta=jnp.zeros((1, 24, 8), dtype=jnp.float32),
+                    state_prev=jnp.zeros((8, 128, 128), dtype=jnp.float32),
+                    cfg=kda_bad_cfg,
+                )
+            kda_ok_cfg = self._gdn_config(
+                8, 32, attention_mode=config.AttentionMode.KDA
+            )
+            out, state = compute_kda.chunked_kda_per_seq(
+                q_large=jnp.zeros((2, 32, 128), dtype=jnp.float32),
+                k_large=jnp.zeros((2, 32, 128), dtype=jnp.float32),
+                v_large=jnp.zeros((8, 32, 128), dtype=jnp.float32),
+                gating_log=jnp.zeros((8, 32, 128), dtype=jnp.float32),
+                beta=jnp.zeros((1, 32, 8), dtype=jnp.float32),
+                state_prev=jnp.zeros((8, 128, 128), dtype=jnp.float32),
+                cfg=kda_ok_cfg,
+            )
+            self.assertEqual(out.shape, (8, 32, 128))
+            self.assertEqual(state.shape, (8, 128, 128))
 
     def test_mixed_tile_clip_rounds_down_to_power_of_two(self):
         """Small non-power-of-two token buckets round mixed_tile_size down to a
@@ -493,45 +526,45 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                 (24, 16),
                 (48, 32),
             ):
-                seen_cfgs.clear()
+                with self.subTest(batch_size=batch_size):
+                    seen_cfgs.clear()
 
-                with (
-                    self.subTest(batch_size=batch_size),
-                    mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False),
-                    mock.patch.object(wrapper.pl, "pallas_call", _fake_pallas_call),
-                ):
-                    wrapper.fused_conv1d_gdn.__wrapped__(
-                        qkv=jnp.zeros((batch_size, dim), dtype=jnp.bfloat16),
-                        b=jnp.zeros((batch_size, n_v), dtype=jnp.bfloat16),
-                        a=jnp.zeros((batch_size, n_v), dtype=jnp.bfloat16),
-                        states=(
-                            jnp.zeros((2, kernel_size - 1, dim), dtype=jnp.float32),
-                            jnp.zeros((2, n_v, d_k, d_v), dtype=jnp.float32),
-                        ),
-                        conv_weight=jnp.zeros(
-                            (dim, 1, kernel_size), dtype=jnp.bfloat16
-                        ),
-                        conv_bias=None,
-                        a_log=jnp.zeros((n_v,), dtype=jnp.float32),
-                        dt_bias=jnp.zeros((n_v,), dtype=jnp.float32),
-                        query_start_loc=jnp.array([0, batch_size], dtype=jnp.int32),
-                        state_indices=jnp.array([1], dtype=jnp.int32),
-                        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
-                        seq_lens=jnp.array([batch_size], dtype=jnp.int32),
-                        n_kq=n_kq,
-                        n_v=n_v,
-                        d_k=d_k,
-                        d_v=d_v,
-                        kernel_size=kernel_size,
-                        prefill_only=True,
+                    with (
+                        mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False),
+                        mock.patch.object(wrapper.pl, "pallas_call", _fake_pallas_call),
+                    ):
+                        wrapper.fused_conv1d_gdn.__wrapped__(
+                            qkv=jnp.zeros((batch_size, dim), dtype=jnp.bfloat16),
+                            b=jnp.zeros((batch_size, n_v), dtype=jnp.bfloat16),
+                            a=jnp.zeros((batch_size, n_v), dtype=jnp.bfloat16),
+                            states=(
+                                jnp.zeros((2, kernel_size - 1, dim), dtype=jnp.float32),
+                                jnp.zeros((2, n_v, d_k, d_v), dtype=jnp.float32),
+                            ),
+                            conv_weight=jnp.zeros(
+                                (dim, 1, kernel_size), dtype=jnp.bfloat16
+                            ),
+                            conv_bias=None,
+                            a_log=jnp.zeros((n_v,), dtype=jnp.float32),
+                            dt_bias=jnp.zeros((n_v,), dtype=jnp.float32),
+                            query_start_loc=jnp.array([0, batch_size], dtype=jnp.int32),
+                            state_indices=jnp.array([1], dtype=jnp.int32),
+                            distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+                            seq_lens=jnp.array([batch_size], dtype=jnp.int32),
+                            n_kq=n_kq,
+                            n_v=n_v,
+                            d_k=d_k,
+                            d_v=d_v,
+                            kernel_size=kernel_size,
+                            prefill_only=True,
+                        )
+                    self.assertEqual(len(seen_cfgs), 1)
+                    per_seq_cfg = seen_cfgs[0]
+                    self.assertEqual(per_seq_cfg.chunk_size, expected_chunk)
+                    effective_b = min(
+                        per_seq_cfg.triangular_block_size, per_seq_cfg.chunk_size
                     )
-                self.assertEqual(len(seen_cfgs), 1)
-                per_seq_cfg = seen_cfgs[0]
-                self.assertEqual(per_seq_cfg.chunk_size, expected_chunk)
-                effective_b = min(
-                    per_seq_cfg.triangular_block_size, per_seq_cfg.chunk_size
-                )
-                self.assertEqual(per_seq_cfg.chunk_size % effective_b, 0)
+                    self.assertEqual(per_seq_cfg.chunk_size % effective_b, 0)
 
     def test_invert_triangular_matrix_block_sizes_agree(self):
         """Every power-of-two block size inverts the same matrix identically,

@@ -24,7 +24,6 @@ Run: .venv/bin/python -m pytest \
 
 from unittest.mock import MagicMock
 
-import jax.numpy as jnp
 import pytest
 import torch
 from vllm.model_executor import parameter as parameter_mod
@@ -363,12 +362,9 @@ def test_qwen3_5_27b_tp2_constructs_with_24_local_value_heads(
 ):
     """Qwen3.5/3.6-27B (16 K heads, 48 V heads) at TP=2 and its FP8 checkpoints.
 
-    Each rank owns 8 K + 24 V heads. 24 is the first head count whose
-    exact 16 // head_groups quotient (5) does not divide the 128-token chunk;
-    the kernel-side config must hand the solve a power-of-two block instead.
+    Each rank owns 8 K + 24 V heads and forwards those local head counts to
+    the pooled GDN kernel with a 5120-channel conv1d projection.
     """
-    from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
-
     for rank in range(2):
         attention, _ = make_gdn_attention(
             2, rank, quantization, num_key_heads=16, num_value_heads=48
@@ -386,24 +382,3 @@ def test_qwen3_5_27b_tp2_constructs_with_24_local_value_heads(
         assert (n_kq, n_v) == (8, 24)
         assert attention.conv1d.weight.shape[0] == (2 * 8 + 24) * HEAD_DIM == 5120
         gdn_attention_op.pallas.jax_op.reset_mock()
-
-    cfg = gdn_config.GDNConfig(
-        mode=gdn_config.GDNMode.PER_SEQ,
-        dtypes=gdn_config.Dtypes(
-            act_in=jnp.dtype(jnp.bfloat16),
-            act_out=jnp.dtype(jnp.bfloat16),
-            compute=jnp.dtype(jnp.float32),
-            recurrent_state=jnp.dtype(jnp.float32),
-            conv_state=jnp.dtype(jnp.bfloat16),
-        ),
-        batch_size=128,
-        dim_size=5120,
-        kernel_size=CONV_KERNEL_SIZE,
-        tile_size=128,
-        num_kq_heads=8,
-        num_v_heads=24,
-        kq_head_dim=HEAD_DIM,
-        v_head_dim=HEAD_DIM,
-    )
-    assert cfg.triangular_block_size == 4
-    assert cfg.chunk_size % cfg.triangular_block_size == 0

@@ -132,13 +132,13 @@ class GDNConfig:
 
     @property
     def triangular_block_size(self) -> int:
-        """Sub-block size of the chunked KDA intra-chunk solve.
+        """Sub-block size of the chunked GDN and KDA intra-chunk solves.
 
-        The diagonal sub-blocks are evaluated on the VPU/XLU with exact
-        pairwise gate differences and the off-diagonal ones as MXU GEMMs,
-        so this trades the two units off against each other: raising it
-        moves work from MXU to XLU. More value heads already means more
-        XLU work, hence the smaller blocks there.
+        The diagonal sub-blocks are evaluated on the VPU/XLU (forward
+        substitution, plus KDA's exact pairwise gate differences) and the
+        off-diagonal ones as MXU GEMMs, so this trades the two units off
+        against each other: raising it moves work from MXU to XLU. More value
+        heads already means more XLU work, hence the smaller blocks there.
         """
         # Within-block forward substitution issues head_groups * B / 2 broadcasts
         # per token. At 1 head group (<= 8 heads), B = 16 is optimal.

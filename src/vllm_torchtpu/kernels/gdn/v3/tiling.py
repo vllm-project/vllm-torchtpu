@@ -265,6 +265,17 @@ def calculate_mixed_tile_size(
     return mixed_tile_size
 
 
+def clip_mixed_tile_size(mixed_tile_size: int, batch_size: int) -> int:
+    """Clips `mixed_tile_size` to `batch_size` and rounds down to a power of two.
+
+    Guarantees a strictly positive (>= 1) power-of-two chunk size so
+    `GDNConfig.triangular_block_size` divides the chunk even for small
+    non-power-of-two token buckets or explicit tile overrides.
+    """
+    clipped = max(1, min(mixed_tile_size, batch_size))
+    return 1 << (clipped.bit_length() - 1)
+
+
 def get_tile_sizes(
     batch_size: int,
     num_seqs: int,
@@ -354,6 +365,5 @@ def get_tile_sizes(
     # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation,
     # keeping mixed_tile_size a power of two so triangular_block_size divides it.
     decode_tile_size = max(1, min(decode_tile_size, padded_batch_size))
-    mixed_tile_size = max(1, min(mixed_tile_size, batch_size))
-    mixed_tile_size = 1 << (mixed_tile_size.bit_length() - 1)
+    mixed_tile_size = clip_mixed_tile_size(mixed_tile_size, batch_size)
     return decode_tile_size, mixed_tile_size
