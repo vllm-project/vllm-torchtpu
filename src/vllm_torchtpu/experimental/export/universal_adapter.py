@@ -700,9 +700,9 @@ def _backbone_module(model: nn.Module) -> nn.Module:
     encoders, and defines no `forward`) runs its own `forward` instead.
     """
     inner = getattr(model, "model", None)
-    if isinstance(inner, nn.Module) and type(inner).forward is not nn.Module.forward:
-        return inner
-    return model
+    if not isinstance(inner, nn.Module):
+        return model
+    return inner if type(inner).forward is not nn.Module.forward else model
 
 
 def _backbone_kwargs(
@@ -1626,17 +1626,14 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         from vllm.distributed import tensor_model_parallel_all_gather
 
         model_logits = getattr(self._model, "compute_logits", None)
-        head = (
-            self._bound_head_name()
-            if self._vllm_config is not None and callable(model_logits)
-            else None
-        )
-        if head is not None:
-            from torch.nn.utils.stateless import _reparametrize_module
+        if self._vllm_config is not None and callable(model_logits):
+            head = self._bound_head_name()
+            if head is not None:
+                from torch.nn.utils.stateless import _reparametrize_module
 
-            with _reparametrize_module(self._model, {head: lm_head_weight}):
-                logits = model_logits(hidden_states)
-            return logits[..., : self._export_config.vocab_size]
+                with _reparametrize_module(self._model, {head: lm_head_weight}):
+                    logits = model_logits(hidden_states)
+                return logits[..., : self._export_config.vocab_size]
         local = self._local_logits(hidden_states, lm_head_weight)
         gathered = tensor_model_parallel_all_gather(local, dim=-1)
         return gathered[..., : self._export_config.vocab_size]
