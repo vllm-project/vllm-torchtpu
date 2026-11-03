@@ -13,9 +13,11 @@
 # limitations under the License.
 """Unit tests for the TPU Reflection Beam model.
 
-Covers registration, the pure PyTorch ops and the fp32-accurate router, on CPU
-and on TPU.
+Covers registration, the config checks, the pure PyTorch ops and the
+fp32-accurate router, on CPU and on TPU.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,13 +26,49 @@ from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import GateLinear
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+from vllm.transformers_utils.configs.beam import BeamConfig
 
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.beam import ops
+from vllm_torchtpu.models.vllm.beam.config import TPUBeamConfig
 from vllm_torchtpu.models.vllm.beam.model import BeamForCausalLM
 from vllm_torchtpu.models.vllm.beam.router import BeamRouter
 
 BF16, FP32 = torch.bfloat16, torch.float32
+
+# The fields of the released Beam-1.0-501B-A23B config.json.
+RELEASED_CONFIG = dict(
+    vocab_size=151936,
+    hidden_size=5120,
+    intermediate_size=20480,
+    num_hidden_layers=52,
+    num_attention_heads=48,
+    num_key_value_heads=8,
+    head_dim=128,
+    hidden_act="silu",
+    max_position_embeddings=1048576,
+    rms_norm_eps=1e-06,
+    tie_word_embeddings=False,
+    rope_parameters={
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": None,
+    },
+    sliding_window=512,
+    # Five sliding layers per full one, then three sliding and one full: 52.
+    layer_types=(["sliding_attention"] * 5 + ["full_attention"]) * 8
+    + ["sliding_attention"] * 3
+    + ["full_attention"],
+    mlp_layer_types=["dense"] * 3 + ["sparse"] * 49,
+    moe_intermediate_size=2560,
+    num_experts_per_tok=8,
+    num_experts=256,
+    norm_topk_prob=True,
+    n_group=8,
+    topk_group=4,
+    routed_scaling_factor=2.5,
+    final_logit_softcapping=30.0,
+)
 
 # The real router: 256 experts over hidden 5120, top-8.
 ROUTER_EXPERTS, ROUTER_HIDDEN, ROUTER_TOPK = 256, 5120, 8
@@ -40,7 +78,7 @@ FP32_ROUTER_MAX_REL_ERROR = 1e-6
 # Op-test heads: 6 Q heads and 1 K / V head of 128 channels.
 HEAD_DIM, Q_HEADS = 128, 6
 EPS, SOFTCAP = 1e-6, 30.0
-# Positions up to the last of Beam's 2**20 max_position_embeddings.
+# Positions up to the last of the released max_position_embeddings.
 SSMAX_POSITIONS = [0, 1, 15, 2047, 2048, 16384, 100000, 1048575]
 
 
@@ -49,6 +87,95 @@ def test_beam_resolves_to_this_package():
     register_models()
     model_cls = ModelRegistry.models["BeamForCausalLM"].load_model_cls()
     assert model_cls is BeamForCausalLM
+    assert MODELS_CONFIG_MAP["BeamForCausalLM"] is TPUBeamConfig
+
+
+@pytest.fixture
+def clean_check_flags(monkeypatch):
+    """Unsets the TPU flags the config checks reject."""
+    for name in ("TPU_MOE_SEQUENCE_PARALLEL", "VLLM_TPU_BLOCK_MAJOR_KV"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _config_for_checks(
+    *,
+    dtype=BF16,
+    speculative_config=None,
+    lora_config=None,
+    hf_overrides=None,
+    tensor_parallel_size=8,
+    pipeline_parallel_size=1,
+    prefill_context_parallel_size=1,
+    decode_context_parallel_size=1,
+    enable_eplb=False,
+):
+    """A VllmConfig stand-in: the released Beam config, no extra features."""
+    hf_config = BeamConfig(**{**RELEASED_CONFIG, **(hf_overrides or {})})
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf_config, dtype=dtype),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            prefill_context_parallel_size=prefill_context_parallel_size,
+            decode_context_parallel_size=decode_context_parallel_size,
+            enable_eplb=enable_eplb,
+        ),
+        speculative_config=speculative_config,
+        lora_config=lora_config,
+    )
+
+
+def test_config_accepts_released_model(clean_check_flags):
+    TPUBeamConfig.verify_and_update_config(_config_for_checks())
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        pytest.param({"dtype": torch.float16}, "--dtype bfloat16", id="dtype"),
+        pytest.param(
+            {"speculative_config": object()}, "--speculative-config", id="spec"
+        ),
+        pytest.param({"lora_config": object()}, "--enable-lora", id="lora"),
+        pytest.param(
+            {"pipeline_parallel_size": 2}, "--pipeline-parallel-size 1", id="pp"
+        ),
+        pytest.param(
+            {"prefill_context_parallel_size": 2}, "context parallelism", id="pcp"
+        ),
+        pytest.param(
+            {"decode_context_parallel_size": 2}, "context parallelism", id="dcp"
+        ),
+        pytest.param({"enable_eplb": True}, "--enable-eplb", id="eplb"),
+        # Divides the 48 Q heads but not the 8 KV heads.
+        pytest.param(
+            {"tensor_parallel_size": 3}, r"use one of \[1, 2, 4, 8\], got 3", id="tp"
+        ),
+        pytest.param(
+            {"hf_overrides": {"hidden_act": "gelu"}},
+            "hidden_act='silu'",
+            id="hidden_act",
+        ),
+        pytest.param(
+            {"hf_overrides": {"tie_word_embeddings": True}},
+            "tie_word_embeddings=False",
+            id="tied_embeddings",
+        ),
+    ],
+)
+def test_config_rejects_unsupported(clean_check_flags, overrides, match):
+    """Rejected when the config is built, before any worker starts."""
+    with pytest.raises(NotImplementedError, match=match):
+        TPUBeamConfig.verify_and_update_config(_config_for_checks(**overrides))
+
+
+@pytest.mark.parametrize(
+    "flag", ["TPU_MOE_SEQUENCE_PARALLEL", "VLLM_TPU_BLOCK_MAJOR_KV"]
+)
+def test_config_rejects_unsupported_flag(clean_check_flags, monkeypatch, flag):
+    monkeypatch.setenv(flag, "1")
+    with pytest.raises(NotImplementedError, match=f"unset {flag}"):
+        TPUBeamConfig.verify_and_update_config(_config_for_checks())
 
 
 def _randn(generator, *shape, dtype=BF16, scale=1.0):
