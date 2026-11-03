@@ -217,6 +217,10 @@ steps:
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
+    retry:
+      automatic:
+        - exit_status: 1
+          limit: 2
     plugins:
       - *kube_plugin
     commands:

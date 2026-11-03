@@ -25,7 +25,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -133,11 +132,9 @@ def random_wholestep_inputs(
     ang = pos[:, None] * inv[None, :]
     rope = np.zeros(
         (ex.M, 128), np.float32
-    )  # host-only (traceable under jit): ml_dtypes BF16
-    rope[:, : g.ROT // 2] = np.cos(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    rope[:, g.ROT // 2 : g.ROT] = (
-        np.sin(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    )
+    )  # host-only (traceable under jit): BF16-rounded sin/cos
+    rope[:, : g.ROT // 2] = np.cos(ang).astype(BF16).astype(np.float32)
+    rope[:, g.ROT // 2 : g.ROT] = np.sin(ang).astype(BF16).astype(np.float32)
     out = dict(
         inp=inp,
         hc=hc,
@@ -573,12 +570,8 @@ def add_step_inputs(
     inv = 1.0 / (g.theta ** (np.arange(0, g.ROT, 2) / g.ROT))
     ang = j0[:, None] * inv[None, :]
     rope_ck = np.zeros((nreq, 1, 128), np.float32)
-    rope_ck[:, 0, : g.ROT // 2] = (
-        np.cos(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    )
-    rope_ck[:, 0, g.ROT // 2 : g.ROT] = (
-        np.sin(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    )
+    rope_ck[:, 0, : g.ROT // 2] = np.cos(ang).astype(BF16).astype(np.float32)
+    rope_ck[:, 0, g.ROT // 2 : g.ROT] = np.sin(ang).astype(BF16).astype(np.float32)
     return {
         **d,
         "ctxq": jnp.asarray(ctxq),

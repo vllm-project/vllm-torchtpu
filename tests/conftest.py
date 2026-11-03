@@ -101,18 +101,87 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "golden: bit-exact golden hash regression tests")
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _module_host_and_cpu_jax_gc():
-    """Reclaim host allocations (and CPU JAX executables) at module boundaries."""
-    yield
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+_CPU_JAX_GROUP_RSS_LIMIT_MIB = int(
+    os.environ.get("VLLM_TPU_CPU_TEST_GROUP_RSS_MIB", "2400")
+)
+_CPU_JAX_HARD_RSS_LIMIT_MIB = int(
+    os.environ.get("VLLM_TPU_CPU_TEST_HARD_RSS_MIB", "3600")
+)
+_MALLOC_TRIM_FN = None
+_MALLOC_TRIM_RESOLVED = False
+
+
+def _glibc_malloc_trim() -> None:
+    global _MALLOC_TRIM_FN, _MALLOC_TRIM_RESOLVED
+    if not _MALLOC_TRIM_RESOLVED:
+        _MALLOC_TRIM_RESOLVED = True
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL("libc.so.6")
+            fn = getattr(libc, "malloc_trim", None)
+            if fn is not None:
+                fn.argtypes = [ctypes.c_size_t]
+                fn.restype = ctypes.c_int
+                _MALLOC_TRIM_FN = fn
+        except OSError:
+            _MALLOC_TRIM_FN = None
+    if _MALLOC_TRIM_FN is not None:
+        _MALLOC_TRIM_FN(0)
+
+
+def _current_rss_mib() -> float:
+    try:
+        with open("/proc/self/statm", encoding="ascii") as statm:
+            parts = statm.read().split()
+        return int(parts[1]) * _PAGE_SIZE / (1024 * 1024)
+    except (OSError, IndexError, ValueError):
+        return 0.0
+
+
+def _reclaim_cpu_jax_memory() -> None:
     import gc
 
-    if not os.path.exists("/dev/vfio") and "jax" in sys.modules:
+    from tests.distributed.tpu_test_utils import has_tpu_vfio_devices
+
+    is_cpu = not has_tpu_vfio_devices()
+    if is_cpu and "jax" in sys.modules:
         from jax._src import xla_bridge
 
         if xla_bridge.backends_are_initialized():
             sys.modules["jax"].clear_caches()
     gc.collect()
+    if is_cpu:
+        _glibc_malloc_trim()
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Bound XLA:CPU / LLVM MCJIT arena growth inside large parametrized modules."""
+    from tests.distributed.tpu_test_utils import has_tpu_vfio_devices
+
+    if has_tpu_vfio_devices() or "jax" not in sys.modules:
+        return
+    rss_mib = _current_rss_mib()
+    cur_fn = getattr(item, "originalname", item.name)
+    nxt_fn = (
+        getattr(nextitem, "originalname", nextitem.name)
+        if nextitem is not None
+        else None
+    )
+    group_done = cur_fn != nxt_fn
+    if (
+        group_done and rss_mib >= _CPU_JAX_GROUP_RSS_LIMIT_MIB
+    ) or rss_mib >= _CPU_JAX_HARD_RSS_LIMIT_MIB:
+        _reclaim_cpu_jax_memory()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _module_host_and_cpu_jax_gc():
+    """Reclaim host allocations (and CPU JAX executables) at module boundaries."""
+    yield
+    _reclaim_cpu_jax_memory()
 
 
 @pytest.fixture

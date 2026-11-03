@@ -15,13 +15,15 @@
 
 from __future__ import annotations
 
-import gc
-import os
-import sys
 from typing import Any
 
 import pytest
 
+from tests.conftest import (
+    _CPU_JAX_GROUP_RSS_LIMIT_MIB,
+    _current_rss_mib,
+    _reclaim_cpu_jax_memory,
+)
 from tests.megakernel.megakernel_helpers import (  # noqa: F401
     EXACT_FLIPS,
     TINY_TILES,
@@ -47,12 +49,7 @@ def pytest_configure(config: Any) -> None:
 
 @pytest.fixture(autouse=True)
 def _reclaim_megakernel_cpu_jax_cache():
-    """Release one-shot megakernel `make_step` closures after each CPU test."""
+    """Bound megakernel `make_step` XLA:CPU memory growth across tests."""
     yield
-    if os.path.exists("/dev/vfio") or "jax" not in sys.modules:
-        return
-    from jax._src import xla_bridge
-
-    if xla_bridge.backends_are_initialized():
-        sys.modules["jax"].clear_caches()
-        gc.collect()
+    if _current_rss_mib() >= _CPU_JAX_GROUP_RSS_LIMIT_MIB:
+        _reclaim_cpu_jax_memory()

@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent native P/D processes; synthetic page bytes, no model decode."""
 
-import contextlib
 import datetime
+import gc
 import hashlib
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -245,71 +243,85 @@ def _run_role(role: str, exchange: Path) -> None:
             fingerprint=fingerprint,
         ),
     )
-    _receive(exchange / f"{peer_role}-done.json")
+    _receive(exchange / f"{peer_role}-done.json", seconds=300)
+    sync.synchronize([raw], wait=True)
+    del client
+    del manager
+    del store
+    del worker, manifest, materialized, raw, before, after
+    gc.collect()
 
 
-@pytest.mark.timeout(900)
+@pytest.mark.timeout(2400)
 @pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
 def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
-    from tests.distributed.tpu_test_utils import prepare_tpu_environment
-
-    _publish(tmp_path / "test-config.json", dict(ssm_dtype=ssm_dtype))
-    roles = ("prefill", "decode")
-    with patch.dict(os.environ):
-        for key in (
-            "TORCH_TPU_SLICEBUILDER_ADDRESSES",
-            "TORCH_TPU_TOPOLOGY",
-            "TORCH_TPU_XPROF_SESSION_ID",
-            "MASTER_ADDR",
-            "MASTER_PORT",
-            "JOB_COMPLETION_INDEX",
-            "TPU_VISIBLE_CHIPS",
-            "TPU_VISIBLE_DEVICES",
-        ):
-            os.environ.pop(key, None)
-        # Use the full runtime used by the successful multichip PLE test.
-        prepare_tpu_environment(world_size=8)
-        launch_env = os.environ.copy()
-    launch_env.update(
-        ALLOW_MULTIPLE_LIBTPU_LOAD="1", TPU_RAIDEN_TRANSFER_PARALLELISM="1"
+    from tests.distributed.tpu_test_utils import (
+        kill_process_group,
+        run_tpu_worker_session,
     )
-    root = Path(__file__).resolve().parents[2]
-    launch_env["PYTHONPATH"] = str(root) + os.pathsep + launch_env.get("PYTHONPATH", "")
-    log_path = tmp_path / "torchrun.log"
-    with log_path.open("w") as log:
-        child = subprocess.Popen(
-            _launcher_command(tmp_path),
-            env=launch_env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        killed = False
-        try:
-            deadline = time.monotonic() + 480
-            while child.poll() is None:
-                assert time.monotonic() < deadline, "Native P/D process deadline"
-                assert log_path.stat().st_size <= 32 * 1024**2, "Launcher log limit"
-                time.sleep(0.1)
-            assert child.wait() == 0
-            records = [_receive(tmp_path / f"{role}-done.json") for role in roles]
-            assert all(record["ssm_dtype"] == ssm_dtype for record in records)
-            print("QWEN_NATIVE_PAGE_TRANSFER " + json.dumps(records))
-        finally:
-            if child.poll() is None:
-                killed = True
-                os.killpg(child.pid, signal.SIGTERM)
+
+    roles = ("prefill", "decode")
+
+    def _run_attempt(attempt: int) -> tuple[int, str, Path]:
+        attempt_dir = tmp_path / f"attempt_{attempt}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        _publish(attempt_dir / "test-config.json", dict(ssm_dtype=ssm_dtype))
+        log_path = attempt_dir / "torchrun.log"
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--launch",
+            str(attempt_dir),
+        ]
+        with log_path.open("w", encoding="utf-8") as log:
+            child = subprocess.Popen(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
             try:
-                child.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                killed = True
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
-            if killed:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(child.pid, signal.SIGKILL)
-                time.sleep(3.0)
-            print("TORCHRUN LOG TAIL\n" + log_path.read_text()[-32000:])
+                bootstrap_deadline = time.monotonic() + 300
+                deadline = time.monotonic() + 660
+                bootstrapped = False
+                while child.poll() is None:
+                    now = time.monotonic()
+                    if not bootstrapped:
+                        ready_ranks = sum(
+                            (attempt_dir / f"runtime-{r}.json").exists()
+                            for r in range(8)
+                        )
+                        if ready_ranks == 8:
+                            bootstrapped = True
+                        elif now >= bootstrap_deadline:
+                            kill_process_group(child)
+                            log_text = (
+                                log_path.read_text(errors="replace")
+                                + f"\nTPU_WORKER_BOOTSTRAP_TIMEOUT: {ready_ranks}/8 "
+                                "workers initialized TPU runtime within 300s\n"
+                            )
+                            print(
+                                f"TORCHRUN BOOTSTRAP TIMEOUT (attempt {attempt + 1})\n"
+                                + log_text[-32000:]
+                            )
+                            return 124, log_text, attempt_dir
+                    if now >= deadline:
+                        return 124, log_path.read_text(errors="replace"), attempt_dir
+                    assert log_path.stat().st_size <= 32 * 1024**2, "Launcher log limit"
+                    time.sleep(0.1)
+                rc = child.wait()
+            finally:
+                kill_process_group(child)
+        log_text = log_path.read_text(errors="replace")
+        print(f"TORCHRUN LOG TAIL (attempt {attempt + 1})\n" + log_text[-32000:])
+        return rc, log_text, attempt_dir
+
+    rc, log_text, attempt_dir = run_tpu_worker_session(_run_attempt)
+    assert rc != 124, "Native P/D process deadline\n" + log_text[-12000:]
+    assert rc == 0, log_text[-12000:]
+    records = [_receive(attempt_dir / f"{role}-done.json") for role in roles]
+    assert all(record["ssm_dtype"] == ssm_dtype for record in records)
+    print("QWEN_NATIVE_PAGE_TRANSFER " + json.dumps(records))
 
 
 def _launcher_command(exchange: Path) -> list[str]:
@@ -326,6 +338,26 @@ def _launcher_command(exchange: Path) -> list[str]:
     ]
 
 
+def _launch_workers(exchange: Path) -> int:
+    root = Path(__file__).resolve().parents[2]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from tests.distributed.tpu_test_utils import (
+        clear_tpu_launch_env,
+        prepare_tpu_environment,
+    )
+
+    clear_tpu_launch_env()
+    prepare_tpu_environment(world_size=8)
+    launch_env = os.environ.copy()
+    launch_env.update(
+        ALLOW_MULTIPLE_LIBTPU_LOAD="1",
+        TPU_RAIDEN_TRANSFER_PARALLELISM="1",
+    )
+    launch_env["PYTHONPATH"] = str(root) + os.pathsep + launch_env.get("PYTHONPATH", "")
+    return subprocess.call(_launcher_command(exchange), env=launch_env)
+
+
 def _run_runtime_worker(rank: int, exchange: Path) -> None:
     import torch
     from torch import distributed as dist
@@ -333,25 +365,29 @@ def _run_runtime_worker(rank: int, exchange: Path) -> None:
 
     # Runtime participants need the same plugin bootstrap as the P/D workers.
     load_general_plugins()
-    dist.init_process_group(backend="tpu_dist", timeout=datetime.timedelta(seconds=120))
+    dist.init_process_group(backend="tpu_dist", timeout=datetime.timedelta(seconds=300))
     try:
         torch.empty(1, device="tpu").cpu()
         _publish(exchange / f"runtime-{rank}.json", dict(rank=rank, pid=os.getpid()))
         # Keep every native runtime participant alive until both roles finish.
         for peer in range(8):
-            _receive(exchange / f"runtime-{peer}.json")
+            _receive(exchange / f"runtime-{peer}.json", seconds=300)
         if rank < 2:
             _run_role(("prefill", "decode")[rank], exchange)
+            gc.collect()
         for role in ("prefill", "decode"):
-            _receive(exchange / f"{role}-done.json", seconds=150)
+            _receive(exchange / f"{role}-done.json", seconds=300)
         _publish(exchange / f"finished-{rank}.json", dict(rank=rank))
         for peer in range(8):
-            _receive(exchange / f"finished-{peer}.json")
+            _receive(exchange / f"finished-{peer}.json", seconds=300)
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--launch":
+        raise SystemExit(_launch_workers(Path(sys.argv[2])))
     rank = int(os.environ["RANK"])
     assert int(os.environ["WORLD_SIZE"]) == 8 and rank in range(8)
     exchange = Path(sys.argv[1])

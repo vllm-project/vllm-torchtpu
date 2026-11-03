@@ -199,6 +199,7 @@ def test_pool_warmup_tables_match_native_ring_padding():
         pin_memory=False,
         device=runner.device,
         block_sizes=[s.block_size for s in specs],
+        kernel_block_sizes=[s.block_size for s in specs],
         max_num_blocks=[s.max_num_blocks_per_req(cfg, 9216) for s in specs],
         slot_mapping_modes=[
             SlotMappingMode.NONE
