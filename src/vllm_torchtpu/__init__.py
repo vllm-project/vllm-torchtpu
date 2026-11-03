@@ -540,10 +540,7 @@ def _patch_vllm_compile_all_ranges() -> None:
             compile_rotated(pairs, local_rank)
             return
 
-        from vllm_torchtpu.compilation.tpu_compiler import (
-            PEER_WAIT_S,
-            wait_for_peer_artifact,
-        )
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
 
         host = host_slot()
         if host is None:
@@ -574,7 +571,7 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         for backend, range_entry in mine:
             compile_entry(backend, range_entry)
-        with wait_for_peer_artifact(PEER_WAIT_S):
+        with wait_for_peer_artifact(envs.TPU_PRECOMPILE_PEER_WAIT_S):
             for _, _, backend, range_entry in sorted(others, key=lambda o: o[:2]):
                 compile_entry(backend, range_entry)
 
@@ -1975,6 +1972,12 @@ def _patch_vllm_block_pool_lifo_free() -> None:
 
 def _patch_vllm_abort_on_preemption() -> None:
     from vllm_torchtpu.core.abort_on_preemption import patch_scheduler_init
+
+    patch_scheduler_init()
+
+
+def _patch_vllm_raiden_pd_completion() -> None:
+    from vllm_torchtpu.core.raiden_pd import patch_scheduler_init
 
     patch_scheduler_init()
 
