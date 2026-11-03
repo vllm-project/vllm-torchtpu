@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
+    VLLM_TPU_GDN_HOIST_METADATA: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_CHUNK_PAIR: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
@@ -571,6 +572,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in its `[kernel_size, 1, dim]` order. Otherwise every GDN layer swaps
     # and casts the bf16 `[dim, 1, kernel_size]` weight on every forward.
     "VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR": env_bool("VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR"),
+    # Compute the pooled GDN step metadata (read-offset gather, int32 casts,
+    # PER_SEQ roll) once per step and KV-cache group instead of in every GDN
+    # layer: each layer's op is a separate program, so XLA cannot share them.
+    # Same integers; spec decoding on the plain unified pool only.
+    "VLLM_TPU_GDN_HOIST_METADATA": env_bool("VLLM_TPU_GDN_HOIST_METADATA"),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.

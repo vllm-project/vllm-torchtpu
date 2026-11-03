@@ -347,6 +347,53 @@ def outer_kernel(
     _run()
 
 
+def kernel_metadata(
+    cfg: config.GDNConfig,
+    *,
+    seq_lens: jax.Array,
+    query_start_loc: jax.Array,
+    state_indices: jax.Array,
+    read_offsets: jax.Array,
+    distribution: jax.Array,
+    ckpt_indices: jax.Array | None,
+    per_seq_inputs: tuple[jax.Array, ...] | None = None,
+) -> memory_ref.MetadataRef:
+    """The scalar-prefetch metadata of one `fused_conv1d_gdn` kernel call."""
+    if cfg.mode != config.GDNMode.PER_SEQ:
+        return metadata.compute_batched_seq_metadata(
+            cfg=cfg,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            read_offsets=read_offsets,
+            end_seq=distribution[0],
+            ckpt_indices=ckpt_indices,
+        )
+    if per_seq_inputs is not None:
+        ps_qsl, ps_seq_lens, ps_state, ps_read, ps_ckpt = per_seq_inputs
+        return metadata.compute_per_seq_metadata(
+            cfg=cfg,
+            seq_lens=ps_seq_lens,
+            query_start_loc=ps_qsl,
+            state_indices=ps_state,
+            read_offsets=ps_read,
+            start_seq=distribution[0],
+            end_seq=distribution[-1],
+            ckpt_indices=ps_ckpt,
+            prerolled=True,
+        )
+    return metadata.compute_per_seq_metadata(
+        cfg=cfg,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        state_indices=state_indices,
+        read_offsets=read_offsets,
+        start_seq=distribution[0],
+        end_seq=distribution[-1],
+        ckpt_indices=ckpt_indices,
+    )
+
+
 @jax.jit(
     donate_argnames=("conv_state", "recurrent_state", "state_source"),
     static_argnames=(
@@ -403,6 +450,7 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    per_seq_inputs: tuple[jax.Array, ...] | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -473,6 +521,10 @@ def fused_conv1d_gdn(
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
         decode_tile_size: Tile size along sequence dimension for decode sequences.
+        per_seq_inputs: Optional `metadata.roll_per_seq_inputs(query_start_loc,
+            seq_lens, state_indices, read_offsets, distribution[0],
+            ckpt_indices)` (read offsets and checkpoint ids as int32), rolled
+            once per step by the caller instead of once per layer here.
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
@@ -720,29 +772,19 @@ def fused_conv1d_gdn(
             state_plan=state_plan,
         )
 
-        # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
-        # but will be CSEed by compiler.
-        if mode != config.GDNMode.PER_SEQ:
-            metadata_obj = metadata.compute_batched_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                read_offsets=read_offsets,
-                end_seq=distribution[0],
-                ckpt_indices=ckpt_indices,
-            )
-        else:
-            metadata_obj = metadata.compute_per_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                read_offsets=read_offsets,
-                start_seq=distribution[0],
-                end_seq=distribution[-1],
-                ckpt_indices=ckpt_indices,
-            )
+        # Step 6: Metadata preprocessing. Runs once per layer: each layer's
+        # op is its own program, so XLA does not share it across layers
+        # (pass `per_seq_inputs` to hoist the PER_SEQ roll).
+        metadata_obj = kernel_metadata(
+            cfg,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            read_offsets=read_offsets,
+            distribution=distribution,
+            ckpt_indices=ckpt_indices,
+            per_seq_inputs=per_seq_inputs,
+        )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
