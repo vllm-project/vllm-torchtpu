@@ -91,6 +91,19 @@ def _lane_broadcast(cols, width):
     ]
 
 
+def _select_token_block(num_tokens: int, token_block_size: int) -> tuple[int, int]:
+    """(token block, padded tokens): ``token_block_size`` at large buckets,
+    else MIN_GRID_STEPS blocks of at least MIN_TOKEN_BLOCK tokens."""
+    # The block is sized by the bucket alone and fits the budget at
+    # DeepSeek-V4 shapes, so there is no vmem_need to shrink by.
+    per_step = utils.round_up(num_tokens, utils.SUBLANE) // MIN_GRID_STEPS
+    block = min(
+        token_block_size,
+        max(MIN_TOKEN_BLOCK, per_step // MIN_TOKEN_BLOCK * MIN_TOKEN_BLOCK),
+    )
+    return utils.select_token_block(num_tokens, block)
+
+
 def _fused_kernel(
     x_ref,
     res_ref,
@@ -241,14 +254,7 @@ def fused_post_pre_gates(
     assert fn_chunks.shape == (3 * hc_mult3, hc_hidden), (fn_chunks.shape, res2d.shape)
     assert gemm_precision in ("highest", "default"), gemm_precision
 
-    # The block is sized by the bucket alone and fits the budget at
-    # DeepSeek-V4 shapes, so there is no vmem_need to shrink by.
-    per_step = utils.round_up(num_tokens, utils.SUBLANE) // MIN_GRID_STEPS
-    block = min(
-        token_block_size,
-        max(MIN_TOKEN_BLOCK, per_step // MIN_TOKEN_BLOCK * MIN_TOKEN_BLOCK),
-    )
-    tb, padded_tokens = utils.select_token_block(num_tokens, block)
+    tb, padded_tokens = _select_token_block(num_tokens, token_block_size)
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
     if gemm_precision == "default":
@@ -360,3 +366,170 @@ def mhc_fused_post_pre(
         comb_mix_cur.reshape(*outer_shape, hc_mult, hc_mult),
         layer_input_cur.reshape(*outer_shape, hidden_size),
     )
+
+
+def _head_collapse_tile(newres_ref, out_ref, pre_b, rows, c, *, hc_mult, hidden_size):
+    """The head output of one tile at column ``c``. Streams add pairwise,
+    ``i`` with ``i + hc_mult / 2`` first, the order XLA's reduce over the
+    streams uses, rather than ``_collapse_tile``'s running sum."""
+    slab = pre_b[0].shape[1]
+    terms = [
+        pre_b[i]
+        * newres_ref[rows, pl.ds(i * hidden_size + c, slab)].astype(jnp.float32)
+        for i in range(hc_mult)
+    ]
+    while len(terms) > 1:
+        half = len(terms) // 2
+        terms = [terms[i] + terms[i + half] for i in range(half)]
+    out_ref[rows, pl.ds(c, slab)] = terms[0].astype(jnp.bfloat16)
+
+
+def _post_head_kernel(
+    x_ref,
+    res_ref,
+    post_ref,
+    comb_ref,
+    fn_ref,
+    sc_ref,
+    hb_ref,
+    out_ref,
+    newres_ref,
+    norm_ref,
+    *,
+    hc_mult,
+    hidden_size,
+    rms_eps,
+    hc_eps,
+):
+    """One token block: recombine, RMS norm, gate GEMM, collapse.
+
+    The settled streams stay in VMEM. As the head computes its gates, each
+    token's flat streams are RMS-normalized in f32 and the projection takes
+    them, and fn, as bf16 in one MXU pass.
+    """
+    tb = x_ref.shape[0]
+    m, h = hc_mult, hidden_size
+    slab = math.gcd(TILE_LANES, h)
+    tile_kw = dict(hc_mult=m, hidden_size=h)
+    row_groups = [pl.ds(r, TILE_ROWS) for r in range(0, tb, TILE_ROWS)]
+
+    for rows in row_groups:
+        post_b = _lane_broadcast(post_ref[rows, :], slab)
+        comb_b = _lane_broadcast(comb_ref[rows, :], slab)
+        sq = None
+        for c in range(0, h, slab):
+            sq = _recombine_tile(
+                x_ref, res_ref, newres_ref, post_b, comb_b, sq, rows, c, **tile_kw
+            )
+        inv_rms = jax.lax.rsqrt(jnp.sum(sq, axis=-1, keepdims=True) / (m * h) + rms_eps)
+        inv_rms_b = jnp.broadcast_to(inv_rms, (TILE_ROWS, slab))
+        for c in range(0, m * h, slab):
+            new = newres_ref[rows, pl.ds(c, slab)].astype(jnp.float32)
+            norm_ref[rows, pl.ds(c, slab)] = (new * inv_rms_b).astype(jnp.bfloat16)
+
+    dn = (((1,), (1,)), ((), ()))
+    logits = jax.lax.dot_general(
+        norm_ref[...], fn_ref[...], dn, preferred_element_type=jnp.float32
+    )
+    # The sigmoid as torch's lowers it, 1 / (1 + exp(-z)).
+    pre_mix = 1.0 / (1.0 + jnp.exp(-(logits * sc_ref[0, 0] + hb_ref[...]))) + hc_eps
+    for rows in row_groups:
+        pre_b = _lane_broadcast(pre_mix[rows.start : rows.start + TILE_ROWS], slab)
+        for c in range(0, h, slab):
+            _head_collapse_tile(newres_ref, out_ref, pre_b, rows, c, **tile_kw)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("rms_eps", "hc_eps", "token_block_size", "vmem_limit_bytes"),
+)
+def mhc_post_head(
+    x: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    head_fn: jax.Array,
+    head_scale: jax.Array,
+    head_base: jax.Array,
+    rms_eps: float,
+    hc_eps: float,
+    *,
+    token_block_size: int = TOKEN_BLOCK,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> jax.Array:
+    """The last layer's post and the model head's stream collapse as one
+    kernel; the settled streams never reach HBM.
+
+    The head is ``sum_i pre_mix[:, i] * stream_i`` with
+    ``pre_mix = sigmoid((rms_norm(flat streams) @ head_fn.T) * head_scale
+    + head_base) + hc_eps``.
+
+    Args:
+        x: (..., hidden_size), bfloat16 — the last sublayer's output.
+        residual: (..., hc_mult, hidden_size), bfloat16.
+        post_layer_mix: (..., hc_mult, 1), float32.
+        comb_res_mix: (..., hc_mult, hc_mult), float32.
+        head_fn: (hc_mult, hc_mult * hidden_size), bfloat16 — the head's
+            gate projection, rounded to bf16.
+        head_scale: (1,), float32.
+        head_base: (hc_mult,), float32.
+        rms_eps: static; RMS-norm epsilon of the gates.
+        hc_eps: static; additive floor on the sigmoid gates.
+
+    Returns:
+        (..., hidden_size), bfloat16.
+    """
+    assert residual.dtype == jnp.bfloat16, residual.dtype
+    assert head_fn.dtype == jnp.bfloat16, head_fn.dtype
+
+    outer_shape = residual.shape[:-2]
+    hc_mult, hidden_size = residual.shape[-2:]
+    hc_hidden = hc_mult * hidden_size
+    assert head_fn.shape == (hc_mult, hc_hidden), (head_fn.shape, residual.shape)
+    # The collapse adds the streams pairwise (_head_collapse_tile).
+    assert hc_mult & (hc_mult - 1) == 0, hc_mult
+
+    x2d = x.reshape(-1, hidden_size).astype(jnp.bfloat16)
+    res2d = residual.reshape(-1, hc_hidden)
+    post2d = post_layer_mix.reshape(-1, hc_mult)
+    comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
+    num_tokens = x2d.shape[0]
+
+    tb, padded_tokens = _select_token_block(num_tokens, token_block_size)
+    x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
+    sc2d = head_scale.reshape(1, 1).astype(jnp.float32)
+    hb2d = head_base.reshape(1, hc_mult).astype(jnp.float32)
+
+    out = pl.pallas_call(
+        functools.partial(
+            _post_head_kernel,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+        ),
+        grid=(padded_tokens // tb,),
+        in_specs=[
+            pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
+            pl.BlockSpec(head_fn.shape, lambda i: (0, 0)),
+            pl.BlockSpec((1, 1), lambda i: (0, 0)),
+            pl.BlockSpec((1, hc_mult), lambda i: (0, 0)),
+        ],
+        out_specs=pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
+        scratch_shapes=[
+            pltpu.VMEM((tb, hc_hidden), jnp.bfloat16),
+            pltpu.VMEM((tb, hc_hidden), jnp.bfloat16),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+    )(x2d, res2d, post2d, comb2d, head_fn, sc2d, hb2d)
+
+    (out,) = utils.trim_to(num_tokens, out)
+    return out.reshape(*outer_shape, hidden_size)

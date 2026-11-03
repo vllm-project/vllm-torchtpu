@@ -537,6 +537,57 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
             np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
 
 
+def _ref_mhc_post_head(x, residual, post_mix, comb_mix, head_fn, head_scale, head_base):
+    """The model head (``mhc_collapse_head``) on the reference post's
+    output, its projection in one bf16 pass as XLA runs an f32 dot."""
+    settled = _ref_mhc_post(x, residual, post_mix, comb_mix)
+    flat = settled.reshape(settled.shape[0], -1).astype(jnp.float32)
+    norm = flat * jax.lax.rsqrt(jnp.mean(flat * flat, -1, keepdims=True) + RMS_EPS)
+    logits = jnp.dot(
+        norm.astype(jnp.bfloat16),
+        head_fn.astype(jnp.bfloat16).T,
+        preferred_element_type=jnp.float32,
+    )
+    pre_mix = jax.nn.sigmoid(logits * head_scale + head_base) + HC_PRE_EPS
+    return jnp.sum(pre_mix[..., None] * settled.astype(jnp.float32), axis=-2).astype(
+        jnp.bfloat16
+    )
+
+
+@pytest.mark.tpu_test
+class MhcPostHeadPallasTpuTest(parameterized.TestCase):
+    """Compiled (Mosaic) post + head kernel vs the post reference followed
+    by the model head. Needs TPU hardware."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(num_tokens=[16, 17, 128, 1024])
+    def test_matches_reference(self, num_tokens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        rng = np.random.default_rng(11)
+        post_args = _make_post_inputs(rng, num_tokens, 4096)
+        head_fn = jnp.asarray(
+            rng.standard_normal((HC_MULT, HC_MULT * 4096), dtype=np.float32) * 0.02
+        ).astype(jnp.bfloat16)
+        head_scale = jnp.asarray([0.5], jnp.float32)
+        head_base = jnp.asarray(rng.standard_normal(HC_MULT, dtype=np.float32))
+
+        want = _ref_mhc_post_head(*post_args, head_fn, head_scale, head_base)
+        got = fused_post_pre_kernel.mhc_post_head(
+            *post_args, head_fn, head_scale, head_base, RMS_EPS, HC_PRE_EPS
+        )
+
+        self.assertEqual(got.shape, want.shape)
+        self.assertEqual(got.dtype, jnp.bfloat16)
+        np.testing.assert_allclose(
+            _to_np(got), _to_np(want), rtol=BF16_RTOL, atol=BF16_ATOL
+        )
+
+
 @pytest.mark.tpu_test
 class MhcPreMixesPallasSmallShapeTest(parameterized.TestCase):
     """Mix-GEMM kernel vs the jnp oracle at small shapes and ragged
