@@ -132,6 +132,59 @@ class TestTpuCompilerCache:
                     changed = compute_tpu_compilation_hash(self._config())
                 assert base != changed
 
+    @pytest.mark.parametrize(
+        "libtpu_version",
+        (pytest.param(None, id="no-package"), pytest.param("0.0.50", id="package")),
+    )
+    def test_tpu_hash_follows_custom_library_bytes_not_path(
+        self, tmp_path, libtpu_version
+    ):
+        # JAX loads a custom TPU_LIBRARY_PATH in preference to the pip package,
+        # so the hash follows that library's bytes whether or not libtpu is
+        # installed, and not the path it was loaded from.
+        from importlib import metadata as importlib_metadata
+
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def version(name):
+            if name != "libtpu":
+                return "1"
+            if libtpu_version is None:
+                raise importlib_metadata.PackageNotFoundError(name)
+            return libtpu_version
+
+        def compilation_hash(library):
+            with (
+                patch(
+                    "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+                    return_value=[],
+                ),
+                patch(
+                    "vllm_torchtpu.compilation.tpu_compiler.importlib_metadata.version",
+                    side_effect=version,
+                ),
+                patch.dict(os.environ, {"TPU_LIBRARY_PATH": str(library)}),
+            ):
+                return compute_tpu_compilation_hash(self._config())
+
+        build_a = b"build-a" * 4096
+        # A different size as well as different bytes, so the cached
+        # fingerprint of the first build at this path is not reused.
+        build_b = b"build-b" * 8192
+        library = tmp_path / "a" / "libtpu.so"
+        library.parent.mkdir()
+        library.write_bytes(build_a)
+        hash_a = compilation_hash(library)
+        library.write_bytes(build_b)
+        hash_b = compilation_hash(library)
+        assert hash_a != hash_b
+
+        # The same build mounted at another path.
+        moved = tmp_path / "b" / "libtpu.so"
+        moved.parent.mkdir()
+        moved.write_bytes(build_b)
+        assert compilation_hash(moved) == hash_b
+
     def test_tpu_hash_covers_effective_data_parallel_size(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
@@ -265,6 +318,7 @@ class TestTpuCompilerCache:
             "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+            "TPU_LIBRARY_PATH",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED

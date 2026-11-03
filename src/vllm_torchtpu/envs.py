@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
+    TPU_LIBRARY_PATH: str | None = None
     TPU_WORKER_ID: str | None = None
     TPU_MULTIHOST_BACKEND: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
@@ -121,6 +123,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
+    TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
@@ -310,15 +313,19 @@ def env_nonnegative_int(env_name: str, default: int) -> Callable[[], int]:
     similar, where silently substituting the default hides the typo and the
     process runs with a pool size nobody asked for.
     """
-    parse_int = env_int(env_name, default)
+    return _nonnegative(env_int(env_name, default), env_name)
 
-    def _get_nonnegative_int_env() -> int:
-        value = parse_int()
+
+def _nonnegative(parse: Callable[[], Any], env_name: str) -> Callable[[], Any]:
+    """Wrap a number parser so a negative value raises instead of passing."""
+
+    def _get_nonnegative_env() -> Any:
+        value = parse()
         if value < 0:
             raise ValueError(f"Invalid value '{value}' for {env_name}: must be >= 0.")
         return value
 
-    return _get_nonnegative_int_env
+    return _get_nonnegative_env
 
 
 def env_float(env_name: str, default: float) -> Callable[[], float]:
@@ -336,6 +343,23 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
             ) from exc
 
     return _get_float_env
+
+
+def env_nonnegative_float(env_name: str, default: float) -> Callable[[], float]:
+    """Float knob that must be finite and not negative.
+
+    `nan` and `inf` parse as floats but are rejected: as a timeout, `nan`
+    compares false against everything and `inf` never expires.
+    """
+    parse = _nonnegative(env_float(env_name, default), env_name)
+
+    def _get_nonnegative_float_env() -> float:
+        value = parse()
+        if not math.isfinite(value):
+            raise ValueError(f"Invalid value '{value}' for {env_name}: must be finite.")
+        return value
+
+    return _get_nonnegative_float_env
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -492,6 +516,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ACCELERATOR_TYPE": lambda: os.getenv("TPU_ACCELERATOR_TYPE", None),
     # Name of the TPU resource
     "TPU_NAME": lambda: os.getenv("TPU_NAME", None),
+    # libtpu.so loaded by the TPU runtime instead of the pip libtpu package
+    # (e.g. container images that ship a prebuilt library). A path to a file
+    # other than the pip package's own libtpu.so takes precedence over an
+    # installed libtpu package, so it is used to identify the loaded library.
+    "TPU_LIBRARY_PATH": lambda: os.getenv("TPU_LIBRARY_PATH", None),
     # Worker ID for multi-host TPU setups
     "TPU_WORKER_ID": lambda: os.getenv("TPU_WORKER_ID", None),
     # Backend for multi-host communication on TPU. "" auto-detects: "mp" is
@@ -869,6 +898,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per host and the others wait for its artifact. Off compiles every bucket
     # on every rank, sharing only through the Tier-2 cache.
     "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
+    # Under TPU_PRECOMPILE_PEER_REPLAY, how long a rank waits for a bucket's
+    # owner to save it before compiling the bucket itself. The default fits
+    # well over a single bucket compile with every rank of the host compiling
+    # at once (~165 s for the biggest Qwen3.5-397B bucket at DP8); raise it for
+    # a model whose biggest bucket takes longer, since a waiter that times out
+    # compiles concurrently with the owner. 0 checks once, then compiles.
+    "TPU_PRECOMPILE_PEER_WAIT_S": env_nonnegative_float(
+        "TPU_PRECOMPILE_PEER_WAIT_S", 600.0
+    ),
     # With shape-specialized backbone traces (one per token-bucket group, see
     # compilation/shape_variants.py), trace every group before compiling any
     # bucket, then compile all buckets at once across the host's ranks
