@@ -128,6 +128,12 @@ class KernelConfig:
     # Prefill KDA layer diagnostics (invalid results, timing only): no_tiles,
     # no_rings, no_gather, no_reduce, no_chunk skip that part of the layer.
     prefill_kda_diag: tuple[str, ...] = ()
+    # A 16384-token window's MoE as the fused 8192 MoE over its two halves
+    # (where the fused MoE runs at 8192); K3_PREFILL_MOE_HALVES=0: the unfused
+    # path (its real-text first tokens agreed less, 21/24).
+    prefill_moe_halves: bool = dataclasses.field(
+        default_factory=lambda: os.environ.get("K3_PREFILL_MOE_HALVES", "1") != "0"
+    )
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.

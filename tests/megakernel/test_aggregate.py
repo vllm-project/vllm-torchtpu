@@ -98,6 +98,9 @@ def test_aggregate_capabilities_and_role_configs():
     decode = role_config(config, "decode")
     assert decode.role == "decode" and decode.num_speculative_tokens == 7
     k3.check(decode)
+    big = role_config(_engine_config(max_num_batched_tokens=16448), "prefill")
+    assert big.max_num_batched_tokens == 16384
+    k3.check(big)
     with pytest.raises(NotImplementedError, match="decode-only"):
         k3.check(_engine_config(mamba_ssm_cache_dtype="bfloat16"))
     with pytest.raises(NotImplementedError, match="async"):

@@ -296,7 +296,10 @@ def run_prefill(args, records: harness.Records) -> None:
             "prefill",
             max_num_seqs=max_seqs,
             max_model_len=max_model_len,
-            max_num_batched_tokens=k3_program.MAX_STEP_TOKENS,
+            # 16384-token windows only when a case needs them.
+            max_num_batched_tokens=k3_program.prefill_step_tokens(
+                max(length * count for length, count, _ in cases)
+            ),
         ),
         args.presharded,
         tp_rank=torch.distributed.get_rank(),
@@ -365,6 +368,13 @@ def run_prefill(args, records: harness.Records) -> None:
                 prompts = []
                 for r in range(count):
                     fixed = np.random.default_rng(1000 + 16 * repeat + r)
+                    if corpus is None:  # ids uniform over the vocabulary
+                        prompts.append(
+                            fixed.integers(
+                                0, k3_program.VOCAB, prefix + length, dtype=np.int32
+                            )
+                        )
+                        continue
                     start = int(fixed.integers(0, corpus.size - 262144))
                     prompts.append(corpus[start : start + prefix + length])
             else:

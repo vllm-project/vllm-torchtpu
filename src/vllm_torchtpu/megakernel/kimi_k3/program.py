@@ -26,7 +26,18 @@ DRAFT_TOKENS = 7  # DSpark: the verify is the anchor and 7 drafts
 SPEC_BATCHES = (1, 2, 4, 8, 16)  # the batched speculation's compiled request counts
 # Attention DP2's compiled request counts: half of each are one group's.
 DP_SPEC_BATCHES = (2, 4, 8, 16, 32)
-MAX_STEP_TOKENS = 8192  # the prefill's largest window
+MAX_STEP_TOKENS = 16384  # the prefill's largest window
+DEFAULT_STEP_TOKENS = 8192  # the prefill's largest window under a smaller budget
+
+
+def prefill_step_tokens(budget: int) -> int:
+    """The aggregate prefill's step tokens for a step budget: 16384 from a
+    16384-token budget, else at most 8192."""
+    if budget >= MAX_STEP_TOKENS:
+        return MAX_STEP_TOKENS
+    return min(budget, DEFAULT_STEP_TOKENS)
+
+
 # Sampling parameters the ops implement (beyond greedy): temperature, top-p,
 # top-k and a per-request seed, on both roles.
 SAMPLING = frozenset({"temperature", "top_p", "top_k", "seed"})
