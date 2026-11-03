@@ -50,10 +50,14 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.quantized_matmul import decode_gemv
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -63,6 +67,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    decode_matmul_nt,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -146,6 +151,49 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
 
 
+class VllmDecodeLMHeadMethod(UnquantizedEmbeddingMethod):
+    """vLLM's unquantized LM head, with decode buckets as one weight stream.
+
+    The head's `[vocab shard, hidden]` weight (the embedding's, when tied) is
+    read whole for a few rows per step. A bucket of at most `max_rows` rows
+    without a bias runs `decode_matmul_nt` (TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS);
+    others, and the embedding lookup, are upstream's.
+    """
+
+    def __init__(self, max_rows: int):
+        super().__init__()
+        self.max_rows = max_rows
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        weight = layer.weight
+        if (
+            bias is None
+            and x.dim() == 2
+            and 0 < x.shape[0] <= self.max_rows
+            and x.dtype == weight.dtype
+            and decode_gemv.supports_nt(
+                x.shape[0], weight.shape[1], weight.shape[0], weight.dtype.itemsize
+            )
+        ):
+            return decode_matmul_nt(x, weight)
+        return super().apply(layer, x, bias)
+
+
+def decode_lm_head_method(layer: torch.nn.Module) -> VllmDecodeLMHeadMethod | None:
+    """The method of an unquantized ParallelLMHead under
+    TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS; None (upstream's) otherwise."""
+    if isinstance(layer, ParallelLMHead) and (
+        max_rows := envs.TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS
+    ):
+        return VllmDecodeLMHeadMethod(max_rows)
+    return None
+
+
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
 class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
     """
@@ -218,7 +266,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
                 # forward pass is (m, k) @ (k, n) rather than vLLM's
                 # (m, k) @ (n, k).T.
                 return VllmUnquantizedLinearMethod()
-            return None
+            return decode_lm_head_method(layer)
 
         if isinstance(layer, RoutedExperts):
             # For MoE layers, use our custom TPU implementation

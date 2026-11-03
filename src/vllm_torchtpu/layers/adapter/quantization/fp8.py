@@ -767,7 +767,12 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         if isinstance(layer, Attention):
             return None
 
-        return None
+        from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+            decode_lm_head_method,
+        )
+
+        # The checkpoint's LM head is not FP8.
+        return decode_lm_head_method(layer)
 
 
 class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
@@ -1393,6 +1398,11 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             if linear_config is not None
             else envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
         )
+        self.decode_gemv_max_rows = (
+            linear_config.decode_gemv_max_rows
+            if linear_config is not None
+            else envs.TPU_FP8_DECODE_GEMV_MAX_ROWS
+        )
 
         if quant_config.is_checkpoint_fp8_serialized:
             self._linear_quant_config = _get_linear_quant_config(self.linear_config)
@@ -1686,6 +1696,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 weight,
                 layer.weight_scale,
                 w8a16_max_rows=self.w8a16_max_rows,
+                decode_gemv_max_rows=self.decode_gemv_max_rows,
             )
         if bias is not None:
             out = out + bias
@@ -1717,7 +1728,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self, layer: torch.nn.Module, x_q: torch.Tensor, x_scale: torch.Tensor
     ) -> torch.Tensor:
         """`apply` on rows `quantize_input` produced (see supports_quantized_input)."""
-        return prequantized_matmul(x_q, x_scale, layer.weight, layer.weight_scale)
+        return prequantized_matmul(
+            x_q,
+            x_scale,
+            layer.weight,
+            layer.weight_scale,
+            decode_gemv_max_rows=self.decode_gemv_max_rows,
+        )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         layer = cast("TpuLinear", layer)
