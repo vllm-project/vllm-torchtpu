@@ -1664,6 +1664,7 @@ def fused_qkvz_projection_pcp_gdn(
 
     global_stage_tokens = pcp_size * comm_chunk_size
     tile_size = min(mixed_tile_size, global_stage_tokens, global_batch_size)
+    tile_size = 1 << (tile_size.bit_length() - 1)
     if global_stage_tokens % tile_size != 0:
         raise ValueError(
             "The global PCP communication stage must be divisible by the GDN "
