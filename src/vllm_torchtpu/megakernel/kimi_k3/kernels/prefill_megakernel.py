@@ -5465,6 +5465,12 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     from ..config import active
 
     cfg = active()
+    fused_8192 = cfg.prefill_fused_moe and cfg.moe_reduce_dtype == "float32" and (
+        cfg.prefill_expert_parallel == 16
+        or (cfg.prefill_expert_parallel == 8 and cfg.prefill_fused_moe_ep8)
+    )
+    if seq_len > 8192 and cfg.prefill_moe_halves and fused_8192:
+        return _moe_parts(make_indexed_moe_sp_ring(mesh, seq_len=8192), seq_len)
     if (
         cfg.prefill_fused_moe
         and cfg.prefill_expert_parallel == 8
@@ -5490,6 +5496,28 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             from .prefill_moe.layer import make_indexed_moe_sp_ring as make_packed_moe
         return make_packed_moe(mesh, seq_len=seq_len)
     return _make_indexed_moe_sp_ring_reference(mesh, seq_len=seq_len)
+
+
+def _moe_parts(part, seq_len):
+    """A window's MoE as the 8192-token ``part`` over its 8192-token parts:
+    part i is rank r's local rows [256 i, 256 (i + 1)) and its tokens
+    [8192 i, 8192 (i + 1)), ``length`` counted from the part's start."""
+    counting = bool(_config().prefill_route_counts)
+
+    def run(hidden, prefix, families, length, slot):
+        outputs, routes = [], None
+        for i in range(seq_len // 8192):
+            rows = slice(256 * i, 256 * (i + 1))
+            local = jnp.clip(length - 8192 * i, 0, 8192).astype(length.dtype)
+            out = part(hidden[:, rows], prefix[:, rows], families, local, slot)
+            if counting:
+                out, counts = out
+                routes = counts if routes is None else routes + counts
+            outputs.append(out)
+        joined = jnp.concatenate(outputs, axis=1)
+        return (joined, routes) if counting else joined
+
+    return jax.jit(run)
 
 
 def _make_indexed_moe_sp_ring_reference(mesh, *, seq_len=8192):

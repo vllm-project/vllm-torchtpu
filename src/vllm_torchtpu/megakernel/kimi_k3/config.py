@@ -96,6 +96,9 @@ class KernelConfig:
     # The fused MoE at prefill_expert_parallel 8 (EP8/TP4), as the aggregate
     # engine's prefill runs it; off: EP8 takes the unfused path.
     prefill_fused_moe_ep8: bool = False
+    # A 16384-token window's MoE as the fused 8192 MoE over its two halves
+    # (where the fused MoE runs at 8192); off: the unfused path.
+    prefill_moe_halves: bool = True
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.
