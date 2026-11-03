@@ -11,7 +11,8 @@
 #   MNBT          --max-num-batched-tokens
 #   KV_BYTES      --kv-cache-memory-bytes; "auto" lets --gpu-memory-utilization size the pool
 #   ASYNC_SCHED   1 = --async-scheduling (baseline), 0 = --no-async-scheduling
-#   FUSED_EP      1 = fused expert-parallel MoE kernel on every step (MOE_FUSED_EP_KERNEL_IMPL=adaptive)
+#   FUSED_EP      0 | v2 | adaptive: fused expert-parallel MoE kernel on every step (adaptive needs torch_tpu >= dev20261017)
+#   W4A8          1 = fp8 activations in the fused EP kernel (needs FUSED_EP); 0 = W4A16 as served
 #   HOT_SET       "" (real/dummy routing) | "uniform" (balanced simulated routing) | "<size>:<rate>[:spread]"
 #                 skewed simulated routing: <rate> of the tokens route only into <size> fixed experts
 #   BLOCK_SIZE    --block-size (baseline 384)
@@ -24,6 +25,7 @@ source "$(dirname -- "$0")/layout.sh"
 KV_BYTES=${KV_BYTES:-auto}
 ASYNC_SCHED=${ASYNC_SCHED:-1}
 FUSED_EP=${FUSED_EP:-0}
+W4A8=${W4A8:-0}
 BLOCK_SIZE=${BLOCK_SIZE:-384}
 HOT_SET=${HOT_SET:-}
 read -r -a EXTRA_ARGV <<< "${EXTRA_ARGS:-}"
@@ -36,8 +38,15 @@ fi
 KV_ARGS=()
 if [[ "$KV_BYTES" != auto ]]; then KV_ARGS=(--kv-cache-memory-bytes "$KV_BYTES"); fi
 SCHED_ARGS=(--async-scheduling); (( ASYNC_SCHED )) || SCHED_ARGS=(--no-async-scheduling)
-if (( FUSED_EP )); then
-  export MOE_FUSED_EP_KERNEL_IMPL=adaptive MOE_FUSED_EP_KERNEL_MIN_TOKENS=1
+case "$FUSED_EP" in
+  0) ;;
+  v2|1) export USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_MIN_TOKENS=1 ;;
+  adaptive) export MOE_FUSED_EP_KERNEL_IMPL=adaptive MOE_FUSED_EP_KERNEL_MIN_TOKENS=1 ;;
+  *) echo "FUSED_EP must be 0, v2 or adaptive" >&2; exit 2 ;;
+esac
+if [[ "$W4A8" == 1 ]]; then
+  [[ "$FUSED_EP" != 0 ]] || { echo "W4A8=1 needs FUSED_EP=v2 or adaptive" >&2; exit 2; }
+  export MOE_FUSED_EP_ENABLE_W4A8=1
 fi
 if [[ "$HOT_SET" == uniform ]]; then
   export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
@@ -47,7 +56,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \

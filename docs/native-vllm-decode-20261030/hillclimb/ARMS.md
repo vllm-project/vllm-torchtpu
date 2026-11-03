@@ -17,12 +17,19 @@ Reference: the 2026-10-30 baseline measured 879.9 tok/s at 109.1 ms steady TPOT.
 | 5 | `dp4tp8dcp2-s96-k3` | dp4tp8dcp2 | 96 | 3 | | one engine per host: all TP collectives inside a host, 2-way page stripes |
 | 6 | `tp32dcp8-s192-k3` | tp32dcp8 | 192 | 3 | | batch amortization: the per-layer fixed costs are paid once per step whatever the batch; the roofline predicts +60% tok/s for +25% TPOT |
 | 7 | `dp4tp8dcp2-s160-k3` | dp4tp8dcp2 | 160 | 3 | | same lever at 40 per engine (capacity about 44) |
-| 8 | `tp32dcp8-s96-k3-fusedep` | tp32dcp8 | 96 | 3 | `FUSED_EP=1` | fused EP MoE program replacing the per-layer all-gather + reduce-scatter |
+| 8 | `tp32dcp8-s96-k3-fusedep` | tp32dcp8 | 96 | 3 | `FUSED_EP=v2` | fused EP MoE program replacing the per-layer all-gather + reduce-scatter |
 | 9 | `tp32dcp8-s96-k3-sync` | tp32dcp8 | 96 | 3 | `ASYNC_SCHED=0` | async scheduling on/off |
 | 10 | `dp2tp16dcp4-s96-k3` | dp2tp16dcp4 | 96 | 3 | | experimental launch form; skip if it does not start within 30 minutes |
 
+| 11 | `base-dp8tp4-s96-k3-fusedep` | dp8tp4 | 96 | 3 | `KV_BYTES=25769803776 FUSED_EP=v2` | fused EP on the baseline layout |
+| 12 | `base-dp8tp4-s96-k3-w4a8` | dp8tp4 | 96 | 3 | `KV_BYTES=25769803776 FUSED_EP=v2 W4A8=1` | 4-bit experts fed to the MXU as fp8 instead of bf16 |
+| 13 | `base-dp8tp4-s96-k3-uniform` | dp8tp4 | 96 | 3 | `KV_BYTES=25769803776 HOT_SET=uniform` | simulated balanced routing (control for 14 and 15) |
+| 14 | `base-dp8tp4-s96-k3-hot` | dp8tp4 | 96 | 3 | `KV_BYTES=25769803776 HOT_SET=16:0.3` | skewed routing: 30% of tokens into 16 experts on one rank |
+| 15 | `base-dp8tp4-s96-k3-hotspread` | dp8tp4 | 96 | 3 | `KV_BYTES=25769803776 HOT_SET=16:0.3:spread` | same skew, hot experts spread over ranks |
+| 16 | `base-dp8tp4-s144-k3` | dp8tp4 | 144 | 3 | `KV_BYTES=auto` | batch within the baseline's own capacity (18 per engine) |
+
 Arms 1 to 5 answer the layout question; 6 and 7 the batch question; 8 and 9 the two cheapest
-engine knobs. If arm 3 beats arm 1, run 6 and 8 on top of it; otherwise run 7 on top of arm 5.
+engine knobs; 11 and 12 the expert path; 13 to 15 how much routing skew costs (dummy weights route nearly uniformly, so arms 1 to 12 cannot show it); 16 the batch lever on the baseline itself. If arm 3 beats arm 1, run 6 and 8 on top of it; otherwise run 7 on top of arm 5.
 
 ## What to report per arm
 

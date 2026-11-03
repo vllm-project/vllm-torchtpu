@@ -75,7 +75,8 @@ LAYOUT=tp32dcp8 GLOBAL_SEQS=96 "$PYTHON_BIN" bench_sweep.py --stage <arm> --inpu
 | `MNBT` | 1024 | `--max-num-batched-tokens`; must be >= `max-num-seqs * (MTP_K + 1)` |
 | `KV_BYTES` | auto | explicit `--kv-cache-memory-bytes`; the baseline used 25769803776 (24 GiB) |
 | `ASYNC_SCHED` | 1 | `--async-scheduling` on/off |
-| `FUSED_EP` | 0 | `1` = `MOE_FUSED_EP_KERNEL_IMPL=adaptive MOE_FUSED_EP_KERNEL_MIN_TOKENS=1`: one fused program per MoE layer instead of all-gather + grouped matmul + reduce-scatter |
+| `FUSED_EP` | 0 | `v2` or `adaptive`: one fused program per MoE layer (dispatch, expert matmuls, combine) instead of all-gather + grouped matmul + reduce-scatter, armed for every step. `adaptive` does not compile on torch_tpu 0928; it needs dev20261017 or later |
+| `W4A8` | 0 | `1` = fp8 activations in the fused EP kernel, so 4-bit experts feed the MXU as fp8 instead of being dequantized to bf16 (needs `FUSED_EP`) |
 | `BLOCK_SIZE` | 384 | `--block-size` |
 | `HOT_SET` | | simulated routing for profiling: `uniform` = balanced; `16:0.3` = 30% of tokens route only into 16 fixed experts (per-expert load CV 1.67, one EP rank 10x loaded); `16:0.3:spread` = the same skew with one hot expert per rank (balanced control). Dummy weights route near-uniformly, so expert imbalance is invisible without this |
 | `EXTRA_ARGS` | | appended to `vllm serve` |
