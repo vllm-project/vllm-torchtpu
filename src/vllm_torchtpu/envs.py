@@ -267,6 +267,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_BITSET_OWNED: bool = False
     VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR: bool = False
     VLLM_TPU_QSA_DCP_GATE_IN_COMBINE: bool = False
+    VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: bool = False
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1634,6 +1635,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gate half itself, instead of slicing it on the Torch side
     # (a standalone strided slice plus relayout; bit-identical).
     "VLLM_TPU_QSA_DCP_GATE_IN_COMBINE": env_bool("VLLM_TPU_QSA_DCP_GATE_IN_COMBINE"),
+    # Sparse prefill with lse (main-KV DCP): mask dead rows only in the padded
+    # layouts; the aligned layout's kernel rows are already 0 / -inf there
+    # (bit-identical, drops an f32 [T, heads, D] select per call).
+    "VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED": env_bool("VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED"),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for
