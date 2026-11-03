@@ -648,10 +648,35 @@ def _gather_gmm_case(**overrides):
 )
 def test_can_use_gather_gmm(monkeypatch, overrides, fp8_mxu, expected):
     monkeypatch.setattr(fused_moe_gmm, "_GATHER_GMM_MIN_TOKENS", 1024)
+    monkeypatch.setattr(fused_moe_gmm, "_GATHER_GMM_CHUNKED_COMBINE", False)
     monkeypatch.setattr(fused_moe_gmm, "_tpu_has_fp8_matmul", lambda: fp8_mxu)
     # tpu7x: 64 MiB of VMEM per core.
     monkeypatch.setattr(fused_moe_gmm, "_tpu_vmem_capacity_bytes", lambda: 64 << 20)
     assert fused_moe_gmm.can_use_gather_gmm(**_gather_gmm_case(**overrides)) is expected
+
+
+@pytest.mark.parametrize(
+    ("tokens", "chunked", "masked", "expected"),
+    [
+        (32768, False, False, False),  # 262,144 routes: past the combine's cap
+        (32768, True, False, True),  # unless it runs in chunks
+        (32768, True, True, True),
+        # 524,288 routes: more expert-order rows than masked entries address.
+        (65536, True, True, False),
+        (65536, True, False, True),
+    ],
+)
+def test_can_use_gather_gmm_over_the_route_cap(
+    monkeypatch, tokens, chunked, masked, expected
+):
+    monkeypatch.setattr(fused_moe_gmm, "_GATHER_GMM_MIN_TOKENS", 1024)
+    monkeypatch.setattr(fused_moe_gmm, "_GATHER_GMM_CHUNKED_COMBINE", chunked)
+    monkeypatch.setattr(fused_moe_gmm, "_tpu_has_fp8_matmul", lambda: True)
+    monkeypatch.setattr(fused_moe_gmm, "_tpu_vmem_capacity_bytes", lambda: 64 << 20)
+    case = _gather_gmm_case(
+        hidden_states=jax.ShapeDtypeStruct((tokens, 2816), jnp.bfloat16)
+    )
+    assert fused_moe_gmm.can_use_gather_gmm(**case, masked=masked) is expected
 
 
 @pytest.mark.parametrize(("mode", "owner_called"), [("on", True), ("off", False)])

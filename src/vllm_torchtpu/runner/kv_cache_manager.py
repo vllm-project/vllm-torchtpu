@@ -208,18 +208,27 @@ def _warn_if_kv_cache_is_padded(
     unpadded = block_size * 2 * num_kv_heads * head_size * dtype.itemsize
     if actual == unpadded:
         return
+    # The batched RPA kernel's SEQ_ALONG_LANE pages pack head_size, not the
+    # K/V vectors, into 32-bit words; its head_size 64 kernel has no such page.
+    hnd = (
+        " Under the default NHD layout, VLLM_KV_CACHE_LAYOUT=HND avoids the K/V "
+        "padding."
+        if backend.get_name() == "CUSTOM" and head_size != 64
+        else ""
+    )
     logger.warning_once(
         "KV cache pages are %.2fx larger than num_kv_heads=%d at "
         "head_size=%d with dtype %s requires: the %s layout pads head_size to "
         "a whole 128-lane register and the K/V vectors to a whole 32-bit word, "
         "so HBM use exceeds a shape-and-dtype estimate. Where head_size is a "
         "multiple of 128, lowering tensor parallelism (more KV heads per rank) "
-        "or enabling attention data parallelism avoids it.",
+        "or enabling attention data parallelism avoids it.%s",
         actual / unpadded,
         num_kv_heads,
         head_size,
         dtype,
         backend.get_name(),
+        hnd,
     )
 
 
