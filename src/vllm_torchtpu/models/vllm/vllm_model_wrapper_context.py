@@ -14,6 +14,7 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -36,6 +37,9 @@ class VllmModelWrapperContext:
     # seq_lens[:num_reqs]; None in warmup and profiling forwards.
     query_start_loc_cpu: np.ndarray | None = None
     seq_lens_cpu: np.ndarray | None = None
+    # This engine's stage of a pipelined prefill chunk
+    # (runner/dp_pipeline_stage.py:StageCall); None for every other forward.
+    dp_pipeline_stage: Any = None
 
 
 _vllm_model_wrapper_context: VllmModelWrapperContext | None = None
@@ -47,6 +51,11 @@ def get_vllm_model_wrapper_context() -> VllmModelWrapperContext:
         "Please use `set_vllm_model_wrapper_context` to set the "
         "VllmModelWrapperContext."
     )
+    return _vllm_model_wrapper_context
+
+
+def current_vllm_model_wrapper_context() -> VllmModelWrapperContext | None:
+    """The context a forward runs under, or None outside one."""
     return _vllm_model_wrapper_context
 
 
@@ -82,6 +91,7 @@ def set_vllm_model_wrapper_context(
     kv_cache_bundle: torch.Tensor | None = None,
     query_start_loc_cpu: np.ndarray | None = None,
     seq_lens_cpu: np.ndarray | None = None,
+    dp_pipeline_stage: Any = None,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
@@ -93,6 +103,7 @@ def set_vllm_model_wrapper_context(
         kv_cache_bundle=kv_cache_bundle,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens_cpu=seq_lens_cpu,
+        dp_pipeline_stage=dp_pipeline_stage,
     )
 
     try:

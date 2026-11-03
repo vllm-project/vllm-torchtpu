@@ -49,7 +49,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_pcp_group
+from vllm.distributed import get_pcp_group, get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -155,6 +155,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.dp_pipeline_stage import DpPipelineStage, runner_kv_access
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -630,8 +631,9 @@ class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
-    # Default for a runner built without __init__.
+    # Defaults for a runner built without __init__.
     _pp_wave: PPWave | None = None
+    _dp_pipeline: DpPipelineStage | None = None
     _dp_step_other_decode: bool = False
 
     @property
@@ -1105,6 +1107,21 @@ class TPUModelRunner(GPUModelRunner):
         # Hand-off wave over ICI; built in capture_model, where every stage
         # reaches the same point.
         self._pp_wave = None
+        # This engine's stages of pipelined prefills (TPU_DP_PIPELINE_PREFILL).
+        self._dp_pipeline = (
+            DpPipelineStage(
+                dp_rank=vllm_config.parallel_config.data_parallel_index or 0,
+                tp_rank=get_tensor_model_parallel_rank(),
+                tp_size=vllm_config.parallel_config.tensor_parallel_size,
+                max_rows=self.max_num_tokens,
+                row_shape=(vllm_config.model_config.get_hidden_size(),),
+                dtype=vllm_config.model_config.dtype,
+                device=self.device,
+                materialize=synchronize_tensors,
+            )
+            if envs.TPU_DP_PIPELINE_PREFILL
+            else None
+        )
         # A sparse model's shared top-k index table, when this stage's layers
         # cannot all recompute it; set at load time under a pipeline.
         self._pp_topk_buffer: torch.Tensor | None = None
@@ -1784,6 +1801,12 @@ class TPUModelRunner(GPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+        if self._dp_pipeline is not None:
+            self._dp_pipeline.bind_kv(
+                runner_kv_access(self),
+                self.model_config.hf_text_config.num_hidden_layers,
+                self.scheduler_config.max_num_batched_tokens,
+            )
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -4090,6 +4113,22 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_wave is not None:
                 intermediate_tensors = self._pp_wave.start_forward(num_tokens_padded)
                 self._pp_take_topk_indices(intermediate_tensors, num_tokens_padded)
+            dp_stage_step = dp_stage_call = None
+            if self._dp_pipeline is not None:
+                step_req_ids = self.input_batch.req_ids[start_index:end_index]
+                self._dp_pipeline.before_forward(
+                    step_req_ids, self.input_batch, self.requests
+                )
+                dp_stage_step = self._dp_pipeline.step(
+                    step_req_ids,
+                    self.input_batch,
+                    self.requests,
+                    scheduler_output.num_scheduled_tokens,
+                )
+                if dp_stage_step is not None:
+                    dp_stage_call = self._dp_pipeline.call(
+                        dp_stage_step, num_tokens_padded
+                    )
 
             trace_kwargs: dict[str, Any] = {}
             if TraceAnnotation.is_enabled():
@@ -4147,6 +4186,7 @@ class TPUModelRunner(GPUModelRunner):
                     kv_cache_bundle=self._kv_cache_bundle,
                     query_start_loc_cpu=self.query_start_loc_np[: num_reqs + 1],
                     seq_lens_cpu=self.seq_lens_np[:num_reqs],
+                    dp_pipeline_stage=dp_stage_call,
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
@@ -4156,6 +4196,9 @@ class TPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
                 )
+            if dp_stage_step is not None:
+                assert self._dp_pipeline is not None
+                self._dp_pipeline.send(dp_stage_step, hidden_states)
 
             if nan_check is not None:
                 assert isinstance(hidden_states, (torch.Tensor, IntermediateTensors)), (
