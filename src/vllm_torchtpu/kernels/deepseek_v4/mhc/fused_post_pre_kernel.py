@@ -184,7 +184,7 @@ def fused_post_pre_gates(
     res2d: jax.Array,
     post2d: jax.Array,
     comb2d: jax.Array,
-    fn: jax.Array,
+    fn_chunks: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
@@ -205,8 +205,8 @@ def fused_post_pre_gates(
         res2d: (num_tokens, hc_mult * hidden_size), bfloat16 — old streams.
         post2d: (num_tokens, hc_mult), float32.
         comb2d: (num_tokens, hc_mult * hc_mult), float32, row-major (i, j).
-        fn: (hc_mult3, hc_mult * hidden_size), float32 — next sublayer's
-            gate projection.
+        fn_chunks: (3 * hc_mult3, hc_mult * hidden_size), bfloat16 — next
+            sublayer's gate projection, split by ``utils.stack_fn3``.
         hc_scale: (3,), float32 — pre/post/comb logit scales.
         hc_base: (hc_mult3,), float32 — logit biases, pre entries first.
         rms_eps: static; RMS-norm epsilon for the in-block gates.
@@ -231,14 +231,14 @@ def fused_post_pre_gates(
     assert res2d.dtype == jnp.bfloat16, res2d.dtype
     assert post2d.dtype == jnp.float32, post2d.dtype
     assert comb2d.dtype == jnp.float32, comb2d.dtype
-    assert fn.dtype == jnp.float32, fn.dtype
+    assert fn_chunks.dtype == jnp.bfloat16, fn_chunks.dtype
 
     num_tokens, hidden_size = x2d.shape
     hc_hidden = res2d.shape[1]
     hc_mult = hc_hidden // hidden_size
-    hc_mult3 = fn.shape[0]
+    hc_mult3 = fn_chunks.shape[0] // 3
     assert res2d.shape == (num_tokens, hc_mult * hidden_size)
-    assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, res2d.shape)
+    assert fn_chunks.shape == (3 * hc_mult3, hc_hidden), (fn_chunks.shape, res2d.shape)
     assert gemm_precision in ("highest", "default"), gemm_precision
 
     # The block is sized by the bucket alone and fits the budget at
@@ -251,7 +251,6 @@ def fused_post_pre_gates(
     tb, padded_tokens = utils.select_token_block(num_tokens, block)
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
-    fn_chunks = utils.stack_fn3(fn)
     if gemm_precision == "default":
         fn_chunks = fn_chunks[:hc_mult3]
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
@@ -311,7 +310,7 @@ def mhc_fused_post_pre(
     residual: jax.Array,
     post_layer_mix: jax.Array,
     comb_res_mix: jax.Array,
-    fn: jax.Array,
+    fn_chunks: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
@@ -342,7 +341,7 @@ def mhc_fused_post_pre(
         res2d,
         post2d,
         comb2d,
-        fn,
+        fn_chunks,
         hc_scale,
         hc_base,
         rms_eps,

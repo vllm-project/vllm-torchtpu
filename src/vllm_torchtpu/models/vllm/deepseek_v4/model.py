@@ -56,6 +56,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op impo
     MHCOps,
     get_mhc_ops,
     get_mhc_post_op,
+    split_fn_chunks,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
@@ -124,6 +125,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             torch.empty(3, dtype=torch.float32),
             requires_grad=False,
         )
+        # What the mHC ops read in place of hc_*_fn; see split_hc_fns.
+        for name in ("hc_attn_fn_chunks", "hc_ffn_fn_chunks"):
+            self.register_buffer(
+                name,
+                torch.empty(3 * mix_hc, hc_dim, dtype=torch.bfloat16),
+                persistent=False,
+            )
+        self._hc_fns_split = False
+
+    def split_hc_fns(self) -> None:
+        """Split hc_attn_fn / hc_ffn_fn into the ops' bf16 chunks, once.
+
+        The split depends on the weights alone; done inside the forward it
+        was an XLA fusion before every mHC call of every step. Called by
+        the model's load_weights.
+        """
+        self.hc_attn_fn_chunks.copy_(split_fn_chunks(self.hc_attn_fn))
+        self.hc_ffn_fn_chunks.copy_(split_fn_chunks(self.hc_ffn_fn))
+        self._hc_fns_split = True
 
     @property
     def mhc_ops(self) -> MHCOps:
@@ -147,7 +167,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     def hc_pre(
         self,
         x: torch.Tensor,
-        hc_fn: torch.Tensor,
+        hc_fn_chunks: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -156,7 +176,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         The gate constants are baked into the op, so only the tensors are
         passed; this just puts `layer_input` first for the caller.
         """
-        post_mix, res_mix, layer_input = self.mhc_ops.pre(x, hc_fn, hc_scale, hc_base)
+        post_mix, res_mix, layer_input = self.mhc_ops.pre(
+            x, hc_fn_chunks, hc_scale, hc_base
+        )
         return layer_input, post_mix, res_mix
 
     def forward(
@@ -175,11 +197,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
         """
+        assert self._hc_fns_split, (
+            "the mHC ops read hc_*_fn_chunks; the model's load_weights is "
+            "expected to call split_hc_fns()"
+        )
         if residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                x, self.hc_attn_fn_chunks, self.hc_attn_scale, self.hc_attn_base
             )
         else:
             residual, post_mix, res_mix, x = self.mhc_ops.fused(
@@ -187,7 +213,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 residual,
                 post_mix,
                 res_mix,
-                self.hc_attn_fn,
+                self.hc_attn_fn_chunks,
                 self.hc_attn_scale,
                 self.hc_attn_base,
             )
@@ -200,7 +226,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             residual,
             post_mix,
             res_mix,
-            self.hc_ffn_fn,
+            self.hc_ffn_fn_chunks,
             self.hc_ffn_scale,
             self.hc_ffn_base,
         )
@@ -603,6 +629,10 @@ class DeepseekV4Model(nn.Module):
                         continue
         finally:
             staged.flush_all()
+
+        for module in self.modules():
+            if isinstance(module, DeepseekV4DecoderLayer):
+                module.split_hc_fns()
 
         return loaded_params
 

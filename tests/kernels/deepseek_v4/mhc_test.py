@@ -437,6 +437,11 @@ def _make_fused_inputs(rng, num_tokens, hidden_size):
     )
 
 
+def _split_fn(args, index):
+    """``args`` with its f32 fn at ``index`` split as the kernels take it."""
+    return (*args[:index], utils.stack_fn3(args[index]), *args[index + 1 :])
+
+
 def _fused_args(rng, num_tokens, hidden_size, sinkhorn_repeat=20):
     x, res, plm, crm, fn, sc, hb = _make_fused_inputs(rng, num_tokens, hidden_size)
     return (
@@ -473,7 +478,9 @@ class MhcFusedPostPrePallasSmallShapeTest(parameterized.TestCase):
         fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
 
         want_res, want_post, want_comb, want_layer = _ref_mhc_fused_post_pre(*args)
-        got_res, got_post, got_comb, got_layer = fused_fn(*args, token_block_size=64)
+        got_res, got_post, got_comb, got_layer = fused_fn(
+            *_split_fn(args, 4), token_block_size=64
+        )
 
         self.assertEqual(got_res.shape, want_res.shape)
         self.assertEqual(got_res.dtype, jnp.bfloat16)
@@ -519,7 +526,7 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
         fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
 
         want = _ref_mhc_fused_post_pre(*args)
-        got = fused_fn(*args, token_block_size=token_block_size)
+        got = fused_fn(*_split_fn(args, 4), token_block_size=token_block_size)
 
         for g, w, tol in zip(got, want, ("bf16", "f32", "f32", "bf16")):
             rtol, atol = (
@@ -629,7 +636,7 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         )
 
         want_post, want_comb, want_layer = _ref_mhc_pre(*args)
-        got_post, got_comb, got_layer = pre_kernel.mhc_pre(*args)
+        got_post, got_comb, got_layer = pre_kernel.mhc_pre(*_split_fn(args, 1))
 
         self.assertEqual(got_layer.dtype, jnp.bfloat16)
         np.testing.assert_allclose(
@@ -641,6 +648,25 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         np.testing.assert_allclose(
             _to_np(got_layer), _to_np(want_layer), rtol=BF16_RTOL, atol=BF16_ATOL
         )
+
+
+class MhcSplitFnChunksTest(parameterized.TestCase):
+    """The model's load-time host split of fn is bit-equal to stack_fn3."""
+
+    def test_host_split_matches_stack_fn3(self):
+        pytest.importorskip("torch_tpu")
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
+            split_fn_chunks,
+        )
+
+        rng = np.random.default_rng(12)
+        fn = rng.standard_normal((24, 4096), dtype=np.float32) * 0.02
+        # Rounding ties, zeros of both signs and the extremes of the range.
+        fn[0, :6] = [1 + 2.0**-8, 1 + 3 * 2.0**-8, 0.0, -0.0, 3e38, 2.0**-120]
+
+        want = np.asarray(utils.stack_fn3(jnp.asarray(fn))).view(np.uint16)
+        got = split_fn_chunks(torch.from_numpy(fn)).view(torch.int16).numpy()
+        np.testing.assert_array_equal(got.view(np.uint16), want)
 
 
 if __name__ == "__main__":

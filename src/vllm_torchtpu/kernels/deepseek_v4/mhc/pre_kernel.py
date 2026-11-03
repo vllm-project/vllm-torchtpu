@@ -188,7 +188,7 @@ def mhc_pre_mixes(
 )
 def mhc_pre_mixes_collapse(
     x2d: jax.Array,
-    fn: jax.Array,
+    fn_chunks: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
@@ -206,19 +206,21 @@ def mhc_pre_mixes_collapse(
     bucket is split into COLLAPSE_MIN_GRID_STEPS blocks, but none smaller
     than COLLAPSE_MIN_TOKEN_BLOCK.
 
+    ``fn_chunks`` is fn split by ``utils.stack_fn3``: (3 * hc_mult3,
+    hc_mult * hidden_size) bf16.
+
     Returns (post_mix (T, hc_mult) f32; comb_mix (T, hc_mult * hc_mult)
     f32, row-major (i, j); layer_input2d (T, hidden_size) bf16).
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
-    assert fn.dtype == jnp.float32, fn.dtype
+    assert fn_chunks.dtype == jnp.bfloat16, fn_chunks.dtype
     num_tokens, hc_hidden = x2d.shape
-    hc_mult3 = fn.shape[0]
-    assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, x2d.shape)
+    hc_mult3 = fn_chunks.shape[0] // 3
+    assert fn_chunks.shape == (3 * hc_mult3, hc_hidden), (fn_chunks.shape, x2d.shape)
     # hc_mult3 = hc_mult * (hc_mult + 2) -> unique positive hc_mult.
     hc_mult = next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
     hidden_size = hc_hidden // hc_mult
 
-    fn_chunks = utils.stack_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
@@ -295,7 +297,7 @@ def mhc_pre_mixes_collapse(
 
 def mhc_pre(
     residual: jax.Array,
-    fn: jax.Array,
+    fn_chunks: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
@@ -309,13 +311,13 @@ def mhc_pre(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``mhc_pre`` as one Pallas kernel: mix GEMM, collapse and gates.
 
-    Same contract as vLLM's ``mhc_pre_torch``:
+    Same contract as vLLM's ``mhc_pre_torch``, except that fn comes split
+    by ``utils.stack_fn3``:
     residual (..., hc_mult, hidden_size) bf16 in; post_mix (..., hc_mult, 1)
     f32, comb_mix (..., hc_mult, hc_mult) f32, layer_input (..., hidden_size)
     bf16 out.
     """
     assert residual.dtype == jnp.bfloat16
-    assert fn.dtype == jnp.float32
 
     outer_shape = residual.shape[:-2]
     hc_mult, hidden_size = residual.shape[-2:]
@@ -323,7 +325,7 @@ def mhc_pre(
 
     post_mix, comb_mix, layer2d = mhc_pre_mixes_collapse(
         x2d,
-        fn,
+        fn_chunks,
         hc_scale,
         hc_base,
         rms_eps,
