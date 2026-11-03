@@ -634,6 +634,19 @@ def mtp_draft_tensors(model: nn.Module) -> dict[str, Any]:
 _MAX_CONSTANT_ELEMENTS = 4096
 
 
+def _backbone_module(model: nn.Module) -> nn.Module:
+    """The module whose forward maps a step's tokens to hidden states.
+
+    vLLM's `*ForCausalLM` keeps its decoder at `.model`; a model whose `.model`
+    only groups its components (Muse Spark's holds `language_model` and the
+    encoders, and defines no `forward`) runs its own `forward` instead.
+    """
+    inner = getattr(model, "model", None)
+    if isinstance(inner, nn.Module) and type(inner).forward is not nn.Module.forward:
+        return inner
+    return model
+
+
 def _backbone_kwargs(
     backbone: nn.Module,
     *,
@@ -1411,7 +1424,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             mamba_request_distribution=recurrent_dist,
         )
 
-        backbone: Any = getattr(self._model, "model", self._model)
+        backbone: Any = _backbone_module(self._model)
         call_weights: dict[str, Any] = {}
         if backbone is not self._model:
             prefix = "model."
@@ -1543,9 +1556,22 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         Each rank holds one vocabulary shard of `lm_head_weight`; the shards are
         gathered and the vocabulary padding dropped, so every rank returns the full
         vocabulary (at tensor parallel size 1 the gather returns its input).
+
+        A vLLM model's own `compute_logits` runs, with `lm_head_weight` bound to its
+        LM head, so whatever it does past the projection (Muse Spark's output
+        multiplier and final logit soft-capping) is in the artifact too.
         """
         from vllm.distributed import tensor_model_parallel_all_gather
 
+        model_logits = getattr(getattr(self, "_model", None), "compute_logits", None)
+        if getattr(self, "_vllm_config", None) is not None and callable(model_logits):
+            from torch.nn.utils.stateless import _reparametrize_module
+
+            with _reparametrize_module(
+                self._model, {self._lm_head_weight_name(): lm_head_weight}
+            ):
+                logits = model_logits(hidden_states)
+            return logits[..., : self._export_config.vocab_size]
         local = self._local_logits(hidden_states, lm_head_weight)
         gathered = tensor_model_parallel_all_gather(local, dim=-1)
         return gathered[..., : self._export_config.vocab_size]
