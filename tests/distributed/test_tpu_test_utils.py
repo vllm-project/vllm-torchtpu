@@ -1,10 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import contextlib
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
-from .tpu_test_utils import prepare_tpu_environment
+from .tpu_test_utils import (
+    TPU_LAUNCH_ENV_KEYS,
+    clear_tpu_launch_env,
+    find_vfio_holder_pids,
+    has_tpu_vfio_devices,
+    is_transient_tpu_session_error,
+    kill_process_group,
+    prepare_tpu_environment,
+    run_tpu_worker_session,
+    wait_for_vfio_idle,
+)
+
+
+def test_has_tpu_vfio_devices_positive_and_cpu_lookalike_controls(
+    tmp_path: Path,
+) -> None:
+    # Negative control 1: Linux CPU host with /dev/vfio/vfio only (no numeric groups).
+    cpu_vfio = tmp_path / "cpu_vfio"
+    cpu_vfio.mkdir()
+    (cpu_vfio / "vfio").write_text("", encoding="utf-8")
+    assert not has_tpu_vfio_devices(vfio_dir=str(cpu_vfio), environ={})
+
+    # Positive control: TPU pod with numeric IOMMU group /dev/vfio/0 + /dev/vfio/vfio.
+    tpu_vfio = tmp_path / "tpu_vfio"
+    tpu_vfio.mkdir()
+    (tpu_vfio / "vfio").write_text("", encoding="utf-8")
+    (tpu_vfio / "0").write_text("", encoding="utf-8")
+    assert has_tpu_vfio_devices(vfio_dir=str(tpu_vfio), environ={})
+
+    # Negative control 2: TPU host explicitly running in JAX_PLATFORMS=cpu or SHAPE=cpu.
+    assert not has_tpu_vfio_devices(
+        vfio_dir=str(tpu_vfio), environ={"JAX_PLATFORMS": "cpu"}
+    )
+    assert not has_tpu_vfio_devices(vfio_dir=str(tpu_vfio), environ={"SHAPE": "cpu"})
+
+    # Negative control 3: Missing /dev/vfio directory.
+    assert not has_tpu_vfio_devices(vfio_dir=str(tmp_path / "absent"), environ={})
 
 
 def test_prepare_tpu_environment_prefers_public_api(monkeypatch):
@@ -33,3 +77,140 @@ def test_prepare_tpu_environment_falls_back_to_legacy_singlehost_wrapper(monkeyp
     with patch.dict("sys.modules", {legacy_mod_name: mock_legacy_module}):
         prepare_tpu_environment(world_size=8)
         mock_legacy_prepare.assert_called_once_with(world_size=8)
+
+
+def test_clear_tpu_launch_env_removes_only_tpu_launch_keys() -> None:
+    env = {key: f"val_{idx}" for idx, key in enumerate(TPU_LAUNCH_ENV_KEYS)}
+    env["UNRELATED_VAR"] = "keep_me"
+    clear_tpu_launch_env(env)
+    for key in TPU_LAUNCH_ENV_KEYS:
+        assert key not in env
+    assert env["UNRELATED_VAR"] == "keep_me"
+
+
+def test_is_transient_tpu_session_error_positive_and_negative_controls() -> None:
+    # Positive controls: real Buildkite multichip failure signatures.
+    assert is_transient_tpu_session_error(
+        "RuntimeError: failed to retrieve the PjRt client: "
+        "TPU initialization failed: GRPC_ERROR error message: START_SESSION failed"
+    )
+    assert is_transient_tpu_session_error(
+        "E0000 00:00:1234 slice failure: SLICE_FAILURE_SW_INJECT_ERROR"
+    )
+
+    # Negative controls: comments, empty logs, and non-session assertion failures.
+    assert not is_transient_tpu_session_error("")
+    assert not is_transient_tpu_session_error(
+        "# START_SESSION failed in comment should not trigger retry\n"
+        "   # SLICE_FAILURE_SW_INJECT_ERROR\n"
+    )
+    assert not is_transient_tpu_session_error(
+        "AssertionError: tensor mismatch at index 4\n"
+        "RuntimeError: normal shape validation error"
+    )
+
+
+def test_find_vfio_holder_pids_positive_and_lookalike_symlinks(tmp_path: Path) -> None:
+    proc_root = tmp_path / "proc"
+    vfio_prefix = "/dev/vfio"
+
+    # PID 101 holds /dev/vfio/0 -> positive match.
+    fd_101 = proc_root / "101" / "fd"
+    fd_101.mkdir(parents=True)
+    os.symlink("/dev/vfio/0", fd_101 / "3")
+
+    # PID 202 holds /dev/vfio_lookalike/0 and /dev/null -> negative control.
+    fd_202 = proc_root / "202" / "fd"
+    fd_202.mkdir(parents=True)
+    os.symlink("/dev/vfio_lookalike/0", fd_202 / "3")
+    os.symlink("/dev/null", fd_202 / "4")
+
+    # Non-numeric /proc entries ("self", "net") -> ignored.
+    (proc_root / "self").mkdir()
+
+    # Ignored self PID (303) holding /dev/vfio/vfio -> excluded.
+    fd_303 = proc_root / "303" / "fd"
+    fd_303.mkdir(parents=True)
+    os.symlink("/dev/vfio/vfio", fd_303 / "5")
+
+    holders = find_vfio_holder_pids(
+        proc_root=str(proc_root),
+        vfio_prefix=vfio_prefix,
+        ignore_pid=303,
+    )
+    assert holders == [101]
+
+
+def test_wait_for_vfio_idle_returns_when_holder_releases(tmp_path: Path) -> None:
+    proc_root = tmp_path / "proc"
+    fd_dir = proc_root / "444" / "fd"
+    fd_dir.mkdir(parents=True)
+    link = fd_dir / "7"
+    os.symlink("/dev/vfio/1", link)
+    os.unlink(link)
+
+    remaining = wait_for_vfio_idle(
+        proc_root=str(proc_root),
+        vfio_prefix=str(tmp_path / "no_vfio_dir"),
+        timeout_s=0.2,
+        settle_s=0.0,
+        poll_s=0.01,
+    )
+    assert remaining == []
+
+
+def test_run_tpu_worker_session_retries_transient_error_only() -> None:
+    calls: list[int] = []
+
+    def transient_then_pass(attempt: int) -> tuple[int, str, str]:
+        calls.append(attempt)
+        if attempt == 0:
+            return 1, "GRPC_ERROR: START_SESSION failed", f"dir_{attempt}"
+        return 0, "ok", f"dir_{attempt}"
+
+    rc, log, payload = run_tpu_worker_session(
+        transient_then_pass, max_attempts=3, backoff_s=0.0, settle_s=0.0
+    )
+    assert (rc, log, payload) == (0, "ok", "dir_1")
+    assert calls == [0, 1]
+
+    # Deterministic test failure must NOT waste retries.
+    non_transient_calls: list[int] = []
+
+    def deterministic_failure(attempt: int) -> tuple[int, str, str]:
+        non_transient_calls.append(attempt)
+        return 1, "AssertionError: numerical mismatch", f"dir_{attempt}"
+
+    rc2, _, payload2 = run_tpu_worker_session(
+        deterministic_failure, max_attempts=3, backoff_s=0.0, settle_s=0.0
+    )
+    assert rc2 == 1
+    assert payload2 == "dir_0"
+    assert non_transient_calls == [0]
+
+    with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+        run_tpu_worker_session(deterministic_failure, max_attempts=0)
+
+
+def test_kill_process_group_reaps_grandchild_in_session(tmp_path: Path) -> None:
+    pid_file = tmp_path / "grandchild.pid"
+    script = (
+        "import subprocess, sys, time; "
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid)); "
+        "time.sleep(60)"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        start_new_session=True,
+    )
+    try:
+        while not pid_file.exists() or not pid_file.read_text().strip():
+            assert child.poll() is None
+        grandchild_pid = int(pid_file.read_text().strip())
+    finally:
+        kill_process_group(child, sigterm_timeout_s=1.0)
+
+    assert child.poll() is not None
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(grandchild_pid, 0)

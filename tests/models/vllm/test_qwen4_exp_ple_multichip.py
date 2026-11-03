@@ -10,7 +10,6 @@ import argparse
 import datetime
 import json
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -24,35 +23,44 @@ pytestmark = [
 ]
 
 
+@pytest.mark.timeout(1200)
 @pytest.mark.parametrize("tp", [2, 4])
 def test_compiled_ple_transport_preserves_raw_bits(tp, tmp_path):
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--tp",
-        str(tp),
-        "--out",
-        str(tmp_path),
-    ]
-    # Bootstrap in a subprocess: pytest must not retain a device client or
-    # topology environment after these workers exit.
-    with (tmp_path / "workers.log").open("w") as log:
-        child = subprocess.Popen(
-            command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
-        )
-        try:
-            code = child.wait(timeout=600)
-        finally:
-            if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
-                try:
-                    child.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait()
-    assert code == 0, (tmp_path / "workers.log").read_text()[-12000:]
+    from tests.distributed.tpu_test_utils import (
+        kill_process_group,
+        run_tpu_worker_session,
+    )
+
+    def _run_attempt(attempt: int) -> tuple[int, str, Path]:
+        attempt_dir = tmp_path / f"attempt_{attempt}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--tp",
+            str(tp),
+            "--out",
+            str(attempt_dir),
+        ]
+        # Bootstrap in a subprocess: pytest must not retain a device client or
+        # topology environment after these workers exit.
+        log_path = attempt_dir / "workers.log"
+        with log_path.open("w", encoding="utf-8") as log:
+            child = subprocess.Popen(
+                command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            )
+            try:
+                code = child.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                code = 124
+            finally:
+                kill_process_group(child)
+        return code, log_path.read_text(errors="replace"), attempt_dir
+
+    code, log_text, attempt_dir = run_tpu_worker_session(_run_attempt)
+    assert code == 0, log_text[-12000:]
     for rank in range(8):
-        result = json.loads((tmp_path / f"rank{rank}.json").read_text())
+        result = json.loads((attempt_dir / f"rank{rank}.json").read_text())
         assert result["checks"] == 96
         assert not result["errors"], result
 
@@ -203,8 +211,12 @@ def _main():
         _worker(args.tp, args.out)
         return
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from tests.distributed.tpu_test_utils import prepare_tpu_environment
+    from tests.distributed.tpu_test_utils import (
+        clear_tpu_launch_env,
+        prepare_tpu_environment,
+    )
 
+    clear_tpu_launch_env()
     prepare_tpu_environment(world_size=8)
     command = [
         sys.executable,
