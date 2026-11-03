@@ -206,6 +206,7 @@ def main():
     parser.add_argument("--with-mhc-post", action="store_true")
     parser.add_argument("--production-caller", action="store_true")
     parser.add_argument("--compare-post-block32", action="store_true")
+    parser.add_argument("--post-layout3d", action="store_true")
     parser.add_argument("--baseline-source", type=Path)
     parser.add_argument("--fallback-eps", type=float)
     parser.add_argument("--tokens", type=int, default=288)
@@ -371,6 +372,10 @@ def main():
                 post: jax.Array,
                 comb: jax.Array,
             ) -> jax.Array:
+                if args.post_layout3d:
+                    import mhc_post_layout
+
+                    return mhc_post_layout.post3d(x, residual, post, comb)
                 return post_kernel.mhc_post(
                     x, residual, post, comb, token_block_size=32
                 )
@@ -417,6 +422,7 @@ def main():
         "with_mhc_post": args.with_mhc_post,
         "production_caller": args.production_caller,
         "compare_post_block32": args.compare_post_block32,
+        "post_layout3d": args.post_layout3d,
         "integration_checks": integration_checks,
     }
 
