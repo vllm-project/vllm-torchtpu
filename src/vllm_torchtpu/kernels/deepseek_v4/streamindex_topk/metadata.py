@@ -155,6 +155,7 @@ def compute_batched_seq_metadata(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    select_empty_pass: bool = False,
 ) -> MetadataRef:
     max_num_seqs = seq_lens.shape[0]
     max_seq_tiles = pl.cdiv(max_num_seqs, seq_batch_size)
@@ -328,6 +329,14 @@ def compute_batched_seq_metadata(
             bkv_idx=bkv_idx,
         )
 
+    if select_empty_pass:
+        # Both schedules as plain ops: a cond branch is opaque to CSE, so every
+        # QSA layer of a step would rebuild the same schedule.
+        return jax.tree_util.tree_map(
+            lambda empty, full: jnp.where(is_empty_pass, empty, full),
+            _empty_schedule(),
+            _compute_schedule(),
+        )
     return jax.lax.cond(is_empty_pass, _empty_schedule, _compute_schedule)
 
 
@@ -349,11 +358,14 @@ def compute_metadata(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    select_empty_pass: bool = False,
 ) -> MetadataRef:
     """Unified metadata calculation for batch_tile_idx, bq_idx, and bkv_idx.
 
     Passing a tuple of `chunk_token_start` values builds one schedule holding
     every chunk back to back, with `num_steps[m]` steps for chunk `m`.
+    ``select_empty_pass`` picks the empty schedule with a select instead of a
+    ``lax.cond``, so XLA can share one schedule between calls (same values).
     """
     return compute_batched_seq_metadata(
         seq_lens=seq_lens,
@@ -373,4 +385,5 @@ def compute_metadata(
         cp_rank=cp_rank,
         cp_size=cp_size,
         interleave_c=interleave_c,
+        select_empty_pass=select_empty_pass,
     )
