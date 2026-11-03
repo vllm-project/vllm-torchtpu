@@ -1224,8 +1224,9 @@ def streamindex_topk(
     relayout copy; the padding is past every ``row_lengths`` and never read.
 
     ``hoist_step_metadata=True`` builds the step-level metadata (and the pass
-    schedules of a single-chunk call) outside the early-exit ``lax.cond``, so
-    XLA can CSE them across the layers of a step.
+    schedules of a single-chunk call) outside the early-exit ``lax.cond``, and
+    each pass schedule without the empty-pass ``lax.cond``, so XLA can CSE
+    them across the layers of a step.
 
     ``decode_passes=False`` emits only the mixed pass. The caller must then pass
     ``distribution = [0, 0, n]``, so the mixed pass covers every sequence; this
@@ -1612,6 +1613,7 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
+            select_empty_pass=hoist_step_metadata,
         )
 
     def _scores_for_chunk(
