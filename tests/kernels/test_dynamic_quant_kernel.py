@@ -47,8 +47,12 @@ def _operands(rows, k, n):
 
 def _split_cols(split, n):
     # "tail" splits the output like GDN's in_proj_qkvz: q/k/v, then z (the last
-    # 1024 columns at TP 8).
-    return {"none": 0, "tail": 128 if n <= 512 else 1024}[split]
+    # 1024 columns at TP 8); "heads" also writes z as heads of 128.
+    return 0 if split == "none" else 128 if n <= 512 else 1024
+
+
+def _split_head_dim(split):
+    return 128 if split == "heads" else 0
 
 
 def _matmul(x, w_q, w_scale, split, weight_nk):
@@ -61,6 +65,7 @@ def _matmul(x, w_q, w_scale, split, weight_nk):
         w_scale,
         split_cols=_split_cols(split, w_q.shape[1]),
         weight_nk=weight_nk,
+        split_head_dim=_split_head_dim(split),
     )
 
 
@@ -74,11 +79,13 @@ def _matmul(x, w_q, w_scale, split, weight_nk):
         (1024, 256, 384),  # output chunk narrower than OUT_BLOCK
     ],
 )
-@pytest.mark.parametrize("split", ["none", "tail"])
+@pytest.mark.parametrize("split", ["none", "tail", "heads"])
 @pytest.mark.parametrize("weight_nk", [False, True])
 def test_matches_plain_jax(rows, k, n, split, weight_nk):
     x, w_q, w_scale = _operands(rows, k, n)
-    assert dynamic_quant_kernel.supports(x, w_q, w_scale, _split_cols(split, n))
+    assert dynamic_quant_kernel.supports(
+        x, w_q, w_scale, _split_cols(split, n), _split_head_dim(split)
+    )
     with pltpu.force_tpu_interpret_mode():
         got = _matmul(x, w_q, w_scale, split, weight_nk)
     want = jax.jit(_reference)(x, w_q, w_scale)
@@ -88,7 +95,7 @@ def test_matches_plain_jax(rows, k, n, split, weight_nk):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("rows,k,n", [(16384, 4096, 2560), (1024, 256, 384)])
-@pytest.mark.parametrize("split", ["none", "tail"])
+@pytest.mark.parametrize("split", ["none", "tail", "heads"])
 @pytest.mark.parametrize("weight_nk", [False, True])
 def test_compiled_matches_xla(rows, k, n, split, weight_nk):
     x, w_q, w_scale = _operands(rows, k, n)
@@ -119,3 +126,14 @@ def test_unsupported_split_stays_on_plain_jax(split_cols):
     w_q = jnp.zeros((512, 512), jnp.float8_e4m3fn)
     w_scale = jnp.ones((512,), jnp.float32)
     assert not dynamic_quant_kernel.supports(x, w_q, w_scale, split_cols)
+
+
+@pytest.mark.parametrize("split_cols,split_head_dim", [(0, 128), (256, 64), (256, 384)])
+def test_unsupported_split_heads_stay_on_plain_jax(split_cols, split_head_dim):
+    # Heads need a split, a 128-multiple size, and to tile the output chunks.
+    x = jnp.zeros((512, 512), jnp.bfloat16)
+    w_q = jnp.zeros((512, 1024), jnp.float8_e4m3fn)
+    w_scale = jnp.ones((1024,), jnp.float32)
+    assert not dynamic_quant_kernel.supports(
+        x, w_q, w_scale, split_cols, split_head_dim
+    )

@@ -85,6 +85,7 @@ def xla_quantized_matmul(
     quantize_activation=True,
     split_cols: int = 0,
     weight_nk: bool = False,
+    split_head_dim: int = 0,
 ) -> jax.Array:
     """
     Per-channel quantized matmul with dynamic per-row activation quantization.
@@ -107,15 +108,28 @@ def xla_quantized_matmul(
         weight_nk: `w_q` is the transpose of a stored [n_output_features,
             n_input_features] array, which the kernel then reads as is rather
             than leave XLA a weight transpose per call.
+        split_head_dim: The consumer reshapes the split-off columns into heads
+            of this size, so the kernel writes them head by head rather than
+            leave XLA to relayout them.
 
     Returns:
         Output of the quantized matmul.
     """
+    if split_head_dim and not dynamic_quant_kernel.supports(
+        x, w_q, w_scale, split_cols, split_head_dim
+    ):
+        # The head layout only saves the consumer a relayout; keep the kernel.
+        split_head_dim = 0
     if quantize_activation and dynamic_quant_kernel.supports(
-        x, w_q, w_scale, split_cols
+        x, w_q, w_scale, split_cols, split_head_dim
     ):
         return dynamic_quant_kernel.dynamic_quant_matmul(
-            x, w_q, w_scale, split_cols=split_cols, weight_nk=weight_nk
+            x,
+            w_q,
+            w_scale,
+            split_cols=split_cols,
+            weight_nk=weight_nk,
+            split_head_dim=split_head_dim,
         )
     if quantize_activation:
         acc_dtype = jnp.float32

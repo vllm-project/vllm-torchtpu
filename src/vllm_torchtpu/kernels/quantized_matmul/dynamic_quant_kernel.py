@@ -51,18 +51,28 @@ def _out_block(n: int, split_cols: int) -> int | None:
     return None
 
 
-def _vmem_limit_bytes(k: int, n: int, out_block: int) -> int:
+def _vmem_limit_bytes(
+    k: int, n: int, out_block: int, split_cols: int = 0, split_head_dim: int = 0
+) -> int:
     x = 2 * ROW_BLOCK * k * 2  # double-buffered bf16 input block
     x_q = 2 * ROW_BLOCK * k  # two fp8 slots
     x_scale = 2 * ROW_BLOCK * 128 * 4  # (rows, 1) f32 pads to 128 lanes
     w = k * n + 8 * n * 4  # resident fp8 weight; its (1, n) scale pads to 8 rows
+    if split_head_dim:
+        # A (rows, heads, head_dim) bf16 block pads heads to 16 sublanes.
+        heads = -(-split_cols // split_head_dim // 16) * 16
+        n += heads * split_head_dim - split_cols
     out = 2 * ROW_BLOCK * n * 2  # double-buffered bf16 output blocks
     acc = ROW_BLOCK * out_block * 4
     return int(VMEM_HEADROOM * (x + x_q + x_scale + w + out + acc))
 
 
 def supports(
-    x: jax.Array, w_q: jax.Array, w_scale: jax.Array, split_cols: int = 0
+    x: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    split_cols: int = 0,
+    split_head_dim: int = 0,
 ) -> bool:
     """Whether `dynamic_quant_matmul` takes these operands (static shapes)."""
     if x.ndim != 2 or w_q.ndim != 2 or w_scale.shape != w_q.shape[1:]:
@@ -76,7 +86,12 @@ def supports(
     out_block = _out_block(n, split_cols)
     if out_block is None:
         return False
-    return _vmem_limit_bytes(k, n, out_block) <= min(DEVICE_VMEM_LIMIT.values())
+    if split_head_dim and (
+        not split_cols or split_head_dim % 128 or out_block % split_head_dim
+    ):
+        return False
+    vmem = _vmem_limit_bytes(k, n, out_block, split_cols, split_head_dim)
+    return vmem <= min(DEVICE_VMEM_LIMIT.values())
 
 
 def _quantize_rows(x_ref, x_q_ref, x_scale_ref, rows):
@@ -93,9 +108,10 @@ def _quantize_rows(x_ref, x_q_ref, x_scale_ref, rows):
     x_q_ref[rows, :] = jnp.clip(x / scale, q_min, q_max).astype(q_dtype)
 
 
-def _kernel(x_ref, w_ref, w_scale_ref, *refs, out_block, n_first, w_nk):
+def _kernel(x_ref, w_ref, w_scale_ref, *refs, out_block, n_first, w_nk, head_dim):
     # One output, or two when the trailing columns from `n_first` on are split
-    # off. w_ref is (n, k) when `w_nk`, else (k, n).
+    # off, the second as (rows, heads, head_dim) when `head_dim`. w_ref is
+    # (n, k) when `w_nk`, else (k, n).
     *out_refs, x_q_ref, x_scale_ref = refs
 
     # Step s quantizes row block s into slot s % 2 and multiplies row block
@@ -140,29 +156,41 @@ def _kernel(x_ref, w_ref, w_scale_ref, *refs, out_block, n_first, w_nk):
             acc = acc * w_scale_ref[:, cols]
             if col < n_first:
                 out_refs[0][:, cols] = acc.astype(out_refs[0].dtype)
+            elif head_dim:
+                heads = pl.ds((col - n_first) // head_dim, out_block // head_dim)
+                acc = acc.astype(out_refs[1].dtype)
+                out_refs[1][:, heads, :] = acc.reshape(
+                    acc.shape[0], out_block // head_dim, head_dim
+                )
             else:
                 part = pl.ds(col - n_first, out_block)
                 out_refs[1][:, part] = acc.astype(out_refs[1].dtype)
             quantize(quant_starts[j * per_chunk : (j + 1) * per_chunk])
 
 
-@functools.partial(jax.jit, static_argnames=("split_cols", "weight_nk"))
+@functools.partial(
+    jax.jit, static_argnames=("split_cols", "weight_nk", "split_head_dim")
+)
 def dynamic_quant_matmul(
     x: jax.Array,  # [m, k] bf16
     w_q: jax.Array,  # [k, n] fp8
     w_scale: jax.Array,  # [n]
     split_cols: int = 0,
     weight_nk: bool = False,
+    split_head_dim: int = 0,
 ) -> jax.Array:
     """`x @ w_q` with per-row dynamic FP8 quantization of `x`, as [m, n].
 
     With `split_cols`, the last that many columns are written as their own
     [m, split_cols] array and the result is the concatenation of the two,
-    which XLA folds away when the consumers slice at the split. `weight_nk`
-    says `w_q` is the transpose of a stored [n, k] array, which the kernel
-    then reads as is.
+    which XLA folds away when the consumers slice at the split. With
+    `split_head_dim` too, that array is written as [m, heads, split_head_dim],
+    so a consumer that reshapes the split-off columns into heads reads the
+    kernel's output as is rather than through a relayout. `weight_nk` says
+    `w_q` is the transpose of a stored [n, k] array, which the kernel then
+    reads as is.
     """
-    if not supports(x, w_q, w_scale, split_cols):
+    if not supports(x, w_q, w_scale, split_cols, split_head_dim):
         raise ValueError(f"unsupported operands {x.shape=} {x.dtype=} {w_q.shape=}")
     m, k = x.shape
     n = w_q.shape[1]
@@ -172,9 +200,24 @@ def dynamic_quant_matmul(
     if weight_nk:
         w_q = w_q.T
     widths = [n_first, split_cols] if split_cols else [n]
+    out_specs = [
+        pl.BlockSpec((ROW_BLOCK, w), lambda s: (jnp.maximum(s - 1, 0), 0))
+        for w in widths
+    ]
+    out_shape = [jax.ShapeDtypeStruct((m, w), x.dtype) for w in widths]
+    if split_head_dim:
+        heads = (split_cols // split_head_dim, split_head_dim)
+        out_specs[1] = pl.BlockSpec(
+            (ROW_BLOCK, *heads), lambda s: (jnp.maximum(s - 1, 0), 0, 0)
+        )
+        out_shape[1] = jax.ShapeDtypeStruct((m, *heads), x.dtype)
     outs = pl.pallas_call(
         functools.partial(
-            _kernel, out_block=out_block, n_first=n_first, w_nk=weight_nk
+            _kernel,
+            out_block=out_block,
+            n_first=n_first,
+            w_nk=weight_nk,
+            head_dim=split_head_dim,
         ),
         grid=(nb + 1,),
         in_specs=[
@@ -182,18 +225,19 @@ def dynamic_quant_matmul(
             pl.BlockSpec(w_q.shape, lambda s: (0, 0)),
             pl.BlockSpec((1, n), lambda s: (0, 0)),
         ],
-        out_specs=[
-            pl.BlockSpec((ROW_BLOCK, w), lambda s: (jnp.maximum(s - 1, 0), 0))
-            for w in widths
-        ],
-        out_shape=[jax.ShapeDtypeStruct((m, w), x.dtype) for w in widths],
+        out_specs=out_specs,
+        out_shape=out_shape,
         scratch_shapes=[
             pltpu.VMEM((2, ROW_BLOCK, k), w_q.dtype),
             pltpu.VMEM((2, ROW_BLOCK, 1), jnp.float32),
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=_vmem_limit_bytes(k, n, out_block),
+            vmem_limit_bytes=_vmem_limit_bytes(
+                k, n, out_block, split_cols, split_head_dim
+            ),
         ),
     )(x, w_q, w_scale.astype(jnp.float32).reshape(1, n))
-    return outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=1)
+    if len(outs) == 1:
+        return outs[0]
+    return jnp.concatenate([outs[0], outs[1].reshape(m, split_cols)], axis=1)
