@@ -41,13 +41,15 @@ import jax.numpy as jnp
 from jax import lax
 
 from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
-    local_sort_activations,
     push_dispatch_segments,
     run_tables,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
     build_combine_fs_kernel,
     build_push_moe_kernel,
+)
+from vllm_torchtpu.kernels.experimental.push_fused_moe.presort import (
+    local_sort_activations,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.routing import prepare_routing
 from vllm_torchtpu.kernels.experimental.push_fused_moe.sc_dispatch import (

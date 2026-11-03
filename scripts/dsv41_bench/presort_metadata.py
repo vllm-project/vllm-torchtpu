@@ -115,15 +115,16 @@ def fixture(kind, seed=42):
 
 def reference(xs):
     pairs, counts, q = xs
-    pairs = pairs.reshape(288, 6)
+    tokens, experts = q.shape[0], counts.size
+    pairs = pairs.reshape(tokens, -1)
     end = np.cumsum(counts, dtype=np.int32)
     start = end - counts
     order = []
     # A per-row search/reference deliberately independent of the matrix kernel.
-    for j in range(1728):
-        expert = min(int(np.searchsorted(end, j, side="right")), 383)
+    for j in range(pairs.size):
+        expert = min(int(np.searchsorted(end, j, side="right")), experts - 1)
         seen = np.cumsum(np.any(pairs == expert, axis=1))
-        order.append(min(int(np.count_nonzero(seen <= j - start[expert])), 287))
+        order.append(min(int(np.count_nonzero(seen <= j - start[expert])), tokens - 1))
     return q[np.asarray(order)], start
 
 
@@ -140,6 +141,7 @@ def main():
     parser.add_argument("--samples", default=200, type=int)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--revision", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument("--production", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     initial = tuple(jax.device_put(x) for x in fixture("uniform"))
@@ -158,6 +160,15 @@ def main():
         )
         return q[order], start
 
+    if args.production:
+        from vllm_torchtpu.kernels.experimental.push_fused_moe import layer, presort
+
+        assert layer.local_sort_activations is presort.local_sort_activations
+        assert presort.supports_local_sort(*initial, e_total=384, topk=6)
+
+        def candidate(pairs, counts, q):
+            return layer.local_sort_activations(pairs, counts, q, e_total=384, topk=6)
+
     funcs = {"native": jax.jit(native), "pallas": jax.jit(candidate)}
     source_paths = [
         Path(__file__),
@@ -165,8 +176,13 @@ def main():
         ROOT / "src/vllm_torchtpu/kernels/experimental/push_fused_moe/host.py",
         ROOT / "src/vllm_torchtpu/kernels/experimental/push_fused_moe/layer.py",
     ]
+    if args.production:
+        source_paths.append(
+            ROOT / "src/vllm_torchtpu/kernels/experimental/push_fused_moe/presort.py"
+        )
     result = {
         "revision": args.revision,
+        "production": args.production,
         "runtime": {
             "versions": {
                 n: importlib.metadata.version(n)
@@ -228,6 +244,45 @@ def main():
         result["correctness"].append(row)
         save()
         print(json.dumps(row), flush=True)
+    if args.production:
+        result["fallbacks"] = []
+        base = fixture("uniform")
+        for kind in ("tokens", "dtype", "topk", "experts", "width", "index_dtype"):
+            p, c, q = (x.copy() for x in base)
+            e, k = 384, 6
+            if kind == "tokens":
+                q, p = q[:256], p[: 256 * k]
+            elif kind == "dtype":
+                q = q.astype(ml_dtypes.bfloat16)
+            elif kind == "topk":
+                p, k = p.reshape(288, 6)[:, :4].reshape(-1), 4
+            elif kind == "experts":
+                e = 128
+            elif kind == "width":
+                q = q[:, :20]
+            elif kind == "index_dtype":
+                p = p.astype(np.int16)
+            c = np.bincount(p[p < e], minlength=e).astype(np.int32)
+            xs = tuple(jax.device_put(x) for x in (p, c, q))
+            assert not presort.supports_local_sort(*xs, e_total=e, topk=k)
+            original = jax.jit(
+                functools.partial(host.local_sort_activations, e_total=e, topk=k)
+            )
+            actual = jax.jit(
+                functools.partial(layer.local_sort_activations, e_total=e, topk=k)
+            )
+            want = reference((p, c, q))
+            a, b = jax.block_until_ready((original(*xs), actual(*xs)))
+            assert_equal(a, want)
+            assert_equal(b, want)
+            assert_equal(a, b)
+            hlo = actual.lower(*xs).compile().as_text()
+            assert "dsv41_presort_metadata" not in hlo
+            (args.out / f"fallback-{kind}-optimized.txt").write_text(hlo)
+            result["fallbacks"].append(
+                {"case": kind, "three_way_exact": True, "no_pallas": True}
+            )
+            save()
     result["precision_passed"] = True
     for kind in ("uniform", "skew"):
         xs = tuple(jax.device_put(x) for x in fixture(kind))
