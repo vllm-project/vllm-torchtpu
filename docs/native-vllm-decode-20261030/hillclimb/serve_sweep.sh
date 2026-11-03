@@ -16,6 +16,7 @@
 #   HOT_SET       "" (real/dummy routing) | "uniform" (balanced simulated routing) | "<size>:<rate>[:spread]"
 #                 skewed simulated routing: <rate> of the tokens route only into <size> fixed experts
 #   BLOCK_SIZE    --block-size (baseline 384)
+#   EXPERT_BLOCK  "" (served block-16 scales) | 256 | 512: requantize expert scales so the matmul scales after the MXU
 #   FUSED_DRAFT   1 = draft steps 1..K-1 as one compiled program (VLLM_TPU_FUSED_DRAFT_LOOP); single-engine layouts only
 #   FAST_SUBST    1 = steady-state fast token substitution (VLLM_TPU_FAST_TOKEN_SUBSTITUTION)
 #   WEIGHTS       dummy (default) | real: real checkpoint at MODEL_PATH
@@ -32,6 +33,7 @@ FUSED_EP=${FUSED_EP:-0}
 W4A8=${W4A8:-0}
 BLOCK_SIZE=${BLOCK_SIZE:-384}
 HOT_SET=${HOT_SET:-}
+EXPERT_BLOCK=${EXPERT_BLOCK:-}
 FUSED_DRAFT=${FUSED_DRAFT:-0}
 FAST_SUBST=${FAST_SUBST:-0}
 WEIGHTS=${WEIGHTS:-dummy}
@@ -45,6 +47,7 @@ if [[ "$FUSED_DRAFT" == 1 ]]; then
   export VLLM_TPU_FUSED_DRAFT_LOOP=1
 fi
 [[ "$FAST_SUBST" == 1 ]] && export VLLM_TPU_FAST_TOKEN_SUBSTITUTION=1
+[[ -n "$EXPERT_BLOCK" ]] && export MOE_REQUANTIZE_BLOCK_SIZE="$EXPERT_BLOCK"
 LOAD_ARGS=(--load-format dummy)
 [[ "$WEIGHTS" == real ]] && LOAD_ARGS=()
 case "$KV_MODE" in
@@ -79,7 +82,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \

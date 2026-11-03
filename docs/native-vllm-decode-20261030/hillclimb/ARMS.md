@@ -29,9 +29,10 @@ Reference: the 2026-10-30 baseline measured 879.9 tok/s at 109.1 ms steady TPOT 
 | 13 | `base-dp8tp4-s96-k0-hotspread` | dp8tp4 | 96 | 0 | `KV_BYTES=25769803776 HOT_SET=16:0.3:spread` | same skew, hot experts spread over ranks |
 | 14 | `tp32dcp8-s96-k0-fusedep` | tp32dcp8 | 96 | 0 | `FUSED_EP=v2` | fused EP on the single-engine layout |
 | 15 | `tp32dcp8-s96-k0-sync` | tp32dcp8 | 96 | 0 | `ASYNC_SCHED=0` | async scheduling on/off |
+| 17 | `base-dp8tp4-s96-k0-blk256` | dp8tp4 | 96 | 0 | `KV_BYTES=25769803776 EXPERT_BLOCK=256` | expert scales after the matmul (measured 2x on the expert kernel at decode batch) |
 | 16 | `dp2tp16dcp4-s96-k0` | dp2tp16dcp4 | 96 | 0 | | experimental launch form; skip if it does not start within 30 minutes |
 
-Arms 2-4 answer the layout question at fixed batch; 5-7 the expert path and host costs; 8-10 the batch lever on each
+Run arm 17 right after arm 2: it is the largest expected gain. Arms 2-4 answer the layout question at fixed batch; 5-7 the expert path and host costs; 8-10 the batch lever on each
 layout; 11-13 how much routing skew costs (dummy weights route nearly uniformly, so the other arms cannot show it);
 14-16 combinations and the experimental layout. Arms 4 and 9 (24 and 44 requests per engine) and 8 (18 per engine) need
 the GDN tile fix on this branch (commit 7e0b6bc22): without it warm-up fails with a broadcasting error.
