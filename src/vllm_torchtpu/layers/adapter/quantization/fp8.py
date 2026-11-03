@@ -86,6 +86,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    INPUT_RMS_NORM_ATTR,
     KEEP_VLLM_LAYOUT_ATTR,
     SPLIT_OUTPUT_ATTR,
     SPLIT_OUTPUT_HEAD_DIM_ATTR,
@@ -1683,6 +1684,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
         else:
+            norm = getattr(layer, INPUT_RMS_NORM_ATTR, None)
             out = quantized_matmul(
                 x,
                 weight,
@@ -1691,6 +1693,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 split_cols=getattr(layer, SPLIT_OUTPUT_ATTR, 0),
                 weight_nk=keep_vllm_layout,
                 split_head_dim=getattr(layer, SPLIT_OUTPUT_HEAD_DIM_ATTR, 0),
+                norm_weight=None if norm is None else norm.consumer_weight(),
+                norm_eps=0.0 if norm is None else norm.variance_epsilon,
             )
         if bias is not None:
             out = out + bias

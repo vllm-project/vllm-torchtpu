@@ -69,6 +69,11 @@ def rms_norm(
     return out.to(orig_dtype)
 
 
+def residual_sum(x: Tensor, x_residual: Tensor) -> Tensor:
+    """``x + x_residual`` added in FP32 and rounded to ``x.dtype``."""
+    return (x.to(torch.float32) + x_residual.to(torch.float32)).to(x.dtype)
+
+
 @ir.ops.fused_add_rms_norm.register_impl(TPU_IR_PROVIDER)
 def fused_add_rms_norm(
     x: Tensor,
@@ -83,6 +88,6 @@ def fused_add_rms_norm(
     sum, and that rounded sum (not the FP32 sum) is what gets normalized.
     """
     orig_dtype = x.dtype
-    x_residual = (x.to(torch.float32) + x_residual.to(torch.float32)).to(orig_dtype)
+    x_residual = residual_sum(x, x_residual)
     out = _normalize_fp32(x_residual.to(torch.float32), weight, epsilon, variance_size)
     return out.to(orig_dtype), x_residual

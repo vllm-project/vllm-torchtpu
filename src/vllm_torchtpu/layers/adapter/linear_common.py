@@ -23,7 +23,10 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    rms_norm,
+    xla_quantized_matmul,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -48,6 +51,12 @@ SPLIT_OUTPUT_ATTR = "_tpu_split_output_cols"
 # And to the head size it reshapes those columns into: the FP8 matmul then
 # writes them as [tokens, heads, head size], so that reshape needs no relayout.
 SPLIT_OUTPUT_HEAD_DIM_ATTR = "_tpu_split_output_head_dim"
+
+# Set to an RMSNorm (`layers/adapter/layernorm.py`) whose normalization this
+# linear applies to its own input: the input is then the norm's input, and the
+# FP8 matmul normalizes each row in VMEM, so the normalized activation is never
+# written to HBM.
+INPUT_RMS_NORM_ATTR = "_tpu_input_rms_norm"
 
 # Idempotence guard, set by the linear method once it has flipped a weight.
 # Not how `apply` picks its contraction -- that keys off the marker above.
@@ -83,6 +92,8 @@ def _quantized_matmul_jax(
     split_cols: int = 0,
     weight_nk: bool = False,
     split_head_dim: int = 0,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float = 0.0,
 ) -> jax.Array:
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
@@ -98,6 +109,8 @@ def _quantized_matmul_jax(
             f"{w_q.shape[0]}."
         )
     if len(w_s.shape) == 4:
+        if norm_weight is not None:
+            x = rms_norm(x, norm_weight, norm_eps)
         k_dim, n_out = w_q.shape
         _, sharded_num_blocks, mid, scale_n_out = w_s.shape
         if mid != 1:
@@ -145,6 +158,8 @@ def _quantized_matmul_jax(
         split_cols=split_cols,
         weight_nk=weight_nk,
         split_head_dim=split_head_dim,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
@@ -171,8 +186,11 @@ def _get_quantized_matmul_op() -> Callable:
             split_cols: int = 0,
             weight_nk: bool = False,
             split_head_dim: int = 0,
+            norm_weight: torch.Tensor | None = None,
+            norm_eps: float = 0.0,
         ):
             del w_s, w8a16_max_rows, split_cols, weight_nk, split_head_dim
+            del norm_weight, norm_eps
             return torch.empty(
                 x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
             )
@@ -190,6 +208,8 @@ def quantized_matmul(
     split_cols: int = 0,
     weight_nk: bool = False,
     split_head_dim: int = 0,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
 ) -> torch.Tensor:
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
@@ -197,7 +217,9 @@ def quantized_matmul(
     reshapes the output back. `w_q` is the canonical (k, n) layout
     `[n_in, n_out]`. The underlying JAX function picks `gmm_v2` when `w_s` is
     rank-4 `[1, n_in_blocks, 1, n_out]`, and the per-channel dot_general path
-    when `w_s` is 1-D `[n_out]`.
+    when `w_s` is 1-D `[n_out]`. With `norm_weight`, `x` is the input of an
+    RMSNorm with that f32 weight and `norm_eps`, and the matmul takes its
+    output.
     """
     if x.shape[-1] != w_q.shape[0]:
         raise ValueError(
@@ -208,7 +230,15 @@ def quantized_matmul(
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(
-        x_2d, w_q, w_s, w8a16_max_rows, split_cols, weight_nk, split_head_dim
+        x_2d,
+        w_q,
+        w_s,
+        w8a16_max_rows,
+        split_cols,
+        weight_nk,
+        split_head_dim,
+        norm_weight,
+        norm_eps,
     )
     return out_2d.reshape(orig_out_shape)
 
