@@ -49,6 +49,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax import lax
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
@@ -57,6 +58,15 @@ from vllm.distributed import parallel_state
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
+from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
+    fused_moe_decode as _fused_moe_decode_kernel,
+)
+from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
+    plan_weight_ring as _plan_fused_decode_ring,
+)
+from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
+    vmem_bytes as _fused_decode_vmem_bytes,
+)
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     fused_moe_prefill,
     plan_blocks,
@@ -137,6 +147,9 @@ class _OpStatics:
     # TPU_MOE_TP_DECODE_HBM_OPERANDS: the kernel's 8 weight operands constrained
     # to HBM (it DMAs them itself; no XLA VMEM staging copy). Same bits.
     hbm_operands: bool = False
+    # TPU_MOE_TP_DECODE_FALLBACK_FUSED: serve decode buckets above
+    # TPU_MOE_TP_DECODE_MAX_TOKENS (up to this token cap) with fused_moe_decode.
+    fallback_fused_max_tokens: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -337,6 +350,26 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
             f"the kernel admits no token count (w13 {list(layer.w13_weight.shape)} "
             f"{layer.w13_weight.dtype}, shared w13 {list(shared[0].shape)})"
         )
+    fallback_fused_max_tokens = 0
+    if (
+        envs.TPU_MOE_TP_DECODE_FALLBACK_FUSED
+        and hidden % _PREFILL_Q_BLOCK == 0
+        and shared[2].shape[0] <= layer.w2_weight.shape[1]
+    ):
+        cap = int(envs.FUSED_MOE_DECODE_KERNEL_MAX_TOKENS)
+        if cap > 0 and (
+            _fused_decode_vmem_bytes(
+                cap,
+                hidden,
+                int(layer.w2_weight.shape[1]),
+                int(shared[2].shape[0]),
+                int(layer.w2_weight.shape[0]),
+                n_ranks,
+                jnp.float8_e4m3fn,
+            )
+            <= pltpu.get_tpu_info().vmem_capacity_bytes
+        ):
+            fallback_fused_max_tokens = cap
     statics = _OpStatics(
         topk=topk,
         routed_scale=float(runner.routed_scaling_factor),
@@ -353,6 +386,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
             else None
         ),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
+        fallback_fused_max_tokens=fallback_fused_max_tokens,
     )
     return _Admitted(
         shared=shared,
@@ -547,6 +581,45 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 n_ranks=n_ranks,
                 fast=statics.fast,
                 hbm_operands=statics.hbm_operands,
+            )
+        if (
+            statics.fallback_fused_max_tokens > 0
+            and n <= statics.fallback_fused_max_tokens
+        ):
+            ib, nb = _plan_fused_decode_ring(
+                n + (-n) % 16,
+                x.shape[1],
+                w2.shape[1],
+                sw2.shape[0],
+                w2.shape[0],
+                n_ranks,
+                w13.dtype,
+            )
+            logger.info(
+                "moe_tp_decode: fused_moe_decode fallback traced for %d tokens "
+                "(%s, ring %d)",
+                n,
+                "whole experts" if ib is None else f"blocked ib={ib}",
+                nb,
+            )
+            w, ids = _route(x, scores, bias, is_pad, statics)
+            return _fused_moe_decode_kernel(
+                rank.reshape(1),
+                x,
+                w13,
+                w2,
+                s13,
+                s2,
+                sw13,
+                ss13.reshape(1, -1),
+                sw2,
+                ss2.reshape(1, -1),
+                None,
+                w.astype(x.dtype),
+                ids.astype(jnp.int32),
+                n_ranks=n_ranks,
+                expert_start=e0.reshape(()) if statics.use_ep else None,
+                routed_scale=statics.routed_scale,
             )
         if statics.prefill_above is not None and n > statics.prefill_above:
             return _prefill_chain(

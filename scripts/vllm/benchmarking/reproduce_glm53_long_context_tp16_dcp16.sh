@@ -99,7 +99,7 @@ export_glm53_env() {
     return 1
   fi
 
-  # MoE flags (TP=2 decode MoE kernel + HBM->Peer VMEM sequence-parallel FP8-wire prefill MoE)
+  # MoE flags (hybrid decode MoE: moe_tp_decode for <=16 tokens + fused_moe_decode for 32..64 + EP=16 sequence-parallel FP8-wire prefill MoE)
   export FUSED_MOE_DECODE_KERNEL="${FUSED_MOE_DECODE_KERNEL:-0}"
   export FUSED_MOE_PREFILL_KERNEL="${FUSED_MOE_PREFILL_KERNEL:-0}"
   export ONEHOT_MOE_PERMUTE_THRESHOLD=2048
@@ -107,7 +107,10 @@ export_glm53_env() {
   export USE_MOE_TP_DECODE_KERNEL="${USE_MOE_TP_DECODE_KERNEL:-1}"
   export TPU_MOE_TP_DECODE_FAST="${TPU_MOE_TP_DECODE_FAST:-1}"
   export TPU_MOE_TP_DECODE_HBM_OPERANDS="${TPU_MOE_TP_DECODE_HBM_OPERANDS:-all}"
-  export TPU_MOE_EP_TP_SIZE="${TPU_MOE_EP_TP_SIZE:-2}"
+  export TPU_MOE_TP_DECODE_MAX_TOKENS="${TPU_MOE_TP_DECODE_MAX_TOKENS:-16}"
+  export TPU_MOE_TP_DECODE_I_CHUNK="${TPU_MOE_TP_DECODE_I_CHUNK:-256}"
+  export TPU_MOE_TP_DECODE_FALLBACK_FUSED="${TPU_MOE_TP_DECODE_FALLBACK_FUSED:-1}"
+  export TPU_MOE_EP_TP_SIZE="${TPU_MOE_EP_TP_SIZE:-1}"
   export TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER=0
   export TPU_MOE_ONEHOT_SORTFREE=1
   export TPU_MOE_ROUTER_TOPK_BIAS=1

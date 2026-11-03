@@ -122,7 +122,12 @@ def _split_entry(n_valid_ref, rank_ref, e0_ref, *refs, **kwargs):
 
 def _i_chunk(i):
     """Intermediate columns per ring item for a rank holding I = i."""
-    return min(i, _I_CHUNK)
+    from vllm_torchtpu import envs
+
+    ic = int(envs.TPU_MOE_TP_DECODE_I_CHUNK)
+    if ic <= 0 or ic % PAIR or i % ic:
+        ic = _I_CHUNK
+    return min(i, ic)
 
 
 def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
@@ -161,6 +166,9 @@ def kernel_name(
         f"moe_tp_decode-e_{experts}-m_{m}-h_{h}-i_{i}-fs_{shared_inter}"
         f"-nb_{_NUM_BUFFERS}-n_{n_ranks}"
     )
+    ic = _i_chunk(i)
+    if ic != min(i, _I_CHUNK):
+        name += f"-ic_{ic}"
     if _split_meta():
         name += "-sm"
     if num_experts is not None and num_experts != experts:
@@ -202,6 +210,11 @@ def can_use_moe_tp_decode(
     if w13.ndim != 3 or w2.ndim != 3 or shared_w13.ndim != 2 or shared_w2.ndim != 2:
         return False
     m, h = x.shape
+    from vllm_torchtpu import envs
+
+    max_tokens = int(envs.TPU_MOE_TP_DECODE_MAX_TOKENS)
+    if 0 < max_tokens < m:
+        return False
     experts, i, out = w2.shape
     num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
     if m not in ROW_BUCKETS or scores.shape != (m, num_experts):

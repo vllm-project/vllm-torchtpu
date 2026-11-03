@@ -123,6 +123,9 @@ if TYPE_CHECKING:
     TPU_MOE_TP_DECODE_FAST: bool = True
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
+    TPU_MOE_TP_DECODE_MAX_TOKENS: int = 64
+    TPU_MOE_TP_DECODE_I_CHUNK: int = 128
+    TPU_MOE_TP_DECODE_FALLBACK_FUSED: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -1245,6 +1248,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     .strip()
     .lower(),
+    # Largest token bucket that USE_MOE_TP_DECODE_KERNEL serves with the
+    # moe_tp_decode Pallas kernel (default 64, i.e. all of ROW_BUCKETS).
+    "TPU_MOE_TP_DECODE_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_TP_DECODE_MAX_TOKENS", 64
+    ),
+    # Intermediate columns per weight-ring item in moe_tp_decode (default 128;
+    # 256 halves the ring chunk count per active expert when I >= 256 and VMEM
+    # permits).
+    "TPU_MOE_TP_DECODE_I_CHUNK": env_nonnegative_int("TPU_MOE_TP_DECODE_I_CHUNK", 128),
+    # With USE_MOE_TP_DECODE_KERNEL: serve decode buckets above
+    # TPU_MOE_TP_DECODE_MAX_TOKENS (up to FUSED_MOE_DECODE_KERNEL_MAX_TOKENS)
+    # with fused_moe_decode inside the same moe_tp_decode op instead of the
+    # unarmed GMM + psum fallback.
+    "TPU_MOE_TP_DECODE_FALLBACK_FUSED": env_bool(
+        "TPU_MOE_TP_DECODE_FALLBACK_FUSED", default=False
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
