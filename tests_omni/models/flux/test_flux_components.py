@@ -394,14 +394,20 @@ class TestFluxRoPEPositionEmbeddingOnTpu:
         assert cos.device.type == "tpu" and sin.device.type == "tpu"
         assert cos.dtype == sin.dtype == torch.float64
         assert cos.shape == sin.shape == (ids.shape[0], sum(embedder.axes_dim) // 2)
-        for table, actual, reference in (("cos", cos, ref_cos), ("sin", sin, ref_sin)):
-            assert_parity(
-                actual,
-                reference,
-                name=f"{type(embedder).__name__} {table}",
-                max_rel_l2=POS_EMBED_MAX_REL_L2,
-                max_abs=POS_EMBED_MAX_ABS,
-            )
+        assert_parity(
+            cos,
+            ref_cos,
+            name=f"{type(embedder).__name__} cos",
+            max_rel_l2=POS_EMBED_MAX_REL_L2,
+            max_abs=POS_EMBED_MAX_ABS,
+        )
+        assert_parity(
+            sin,
+            ref_sin,
+            name=f"{type(embedder).__name__} sin",
+            max_rel_l2=POS_EMBED_MAX_REL_L2,
+            max_abs=POS_EMBED_MAX_ABS,
+        )
 
 
 class TestFluxRoPEKernelApplication:
@@ -466,11 +472,17 @@ class TestFluxRoPEKernelApplication:
         torch.testing.assert_close(tpu_k.cpu(), tpu_k_replay.cpu(), atol=0.0, rtol=0.0)
 
         # Numerical parity against the float64 CPU reference
-        for which, tpu_out, ref_out in (("q", tpu_q, ref_q), ("k", tpu_k, ref_k)):
-            assert_parity(
-                tpu_out.cpu(),
-                ref_out,
-                name=f"RoPE {which} {dtype}",
-                max_rel_l2=ROPE_MAX_REL_L2[limit_index],
-                max_abs=ROPE_MAX_ABS[limit_index],
-            )
+        assert_parity(
+            tpu_q.cpu(),
+            ref_q,
+            name=f"RoPE q {dtype}",
+            max_rel_l2=ROPE_MAX_REL_L2[limit_index],
+            max_abs=ROPE_MAX_ABS[limit_index],
+        )
+        assert_parity(
+            tpu_k.cpu(),
+            ref_k,
+            name=f"RoPE k {dtype}",
+            max_rel_l2=ROPE_MAX_REL_L2[limit_index],
+            max_abs=ROPE_MAX_ABS[limit_index],
+        )

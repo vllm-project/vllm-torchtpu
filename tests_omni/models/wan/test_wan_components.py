@@ -319,16 +319,22 @@ def test_wan_rope_freqs_on_tpu_match_diffusers():
     ref_rope = RefWanRotaryPosEmbed(128, (1, 2, 2), 1024)
     # Latents [B, C, T, H, W]; the (1, 2, 2) patch gives a 5x30x52 token grid.
     latents = torch.zeros(1, 16, 5, 60, 104)
-    tpu_freqs = rope(latents.to("tpu"))
-    ref_freqs = ref_rope(latents)
-    for i, (tpu_table, ref_table) in enumerate(zip(tpu_freqs, ref_freqs, strict=True)):
-        assert_parity(
-            tpu_table,
-            ref_table,
-            name=f"WanRotaryPosEmbed table {i}",
-            max_rel_l2=ROPE_FREQS_MAX_REL_L2,
-            max_abs=ROPE_FREQS_MAX_ABS,
-        )
+    tpu_cos, tpu_sin = rope(latents.to("tpu"))
+    ref_cos, ref_sin = ref_rope(latents)
+    assert_parity(
+        tpu_cos,
+        ref_cos,
+        name="WanRotaryPosEmbed cos",
+        max_rel_l2=ROPE_FREQS_MAX_REL_L2,
+        max_abs=ROPE_FREQS_MAX_ABS,
+    )
+    assert_parity(
+        tpu_sin,
+        ref_sin,
+        name="WanRotaryPosEmbed sin",
+        max_rel_l2=ROPE_FREQS_MAX_REL_L2,
+        max_abs=ROPE_FREQS_MAX_ABS,
+    )
 
 
 # --------------------------------------------------------------------------- #
