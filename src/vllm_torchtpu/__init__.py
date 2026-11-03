@@ -1,3 +1,17 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
@@ -549,6 +563,11 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         local_rank = int(os.environ["LOCAL_RANK"])
         range_entry_list = list(self.range_entries.values())
+        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+            # Biggest first: local rank 0 starts on the biggest range, which
+            # takes far longer than the others and so bounds startup, instead
+            # of reaching it only after the smallest one.
+            range_entry_list.sort(key=lambda e: e.compile_range.end, reverse=True)
 
         range_entry_len = len(range_entry_list)
 
