@@ -411,21 +411,19 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         The pooled PCP op hands this weight straight to
         `fused_qkvz_projection_pcp_gdn` (`_require_pcp_projection_parameters`),
         which validates it as [n_out, n_in], so PCP always keeps it. Without
-        PCP nothing reads it raw, and the flag lets it take the (k, n) layout
-        like every other linear: the kept layout costs the per-block FP8 path
-        (gmm_v2) a full weight copy every step, ~11 ms of a ~110 ms decode step
-        for a model with 69 GDN layers at hidden size 8,192.
+        PCP nothing reads it raw, and the kept layout costs the per-block FP8
+        path (gmm_v2) a full weight copy every step.
         """
         if not hasattr(self, "in_proj_qkvz"):
             return
-        if envs.TPU_GDN_QKVZ_KERNEL_LAYOUT:
-            if not pcp_enabled:
-                return
+        kernel_layout = envs.TPU_GDN_QKVZ_KERNEL_LAYOUT
+        if kernel_layout and pcp_enabled:
             logger.warning_once(
                 "TPU_GDN_QKVZ_KERNEL_LAYOUT is ignored with prefill context "
                 "parallelism: its pooled op reads in_proj_qkvz as [n_out, n_in]."
             )
-        setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
+        if pcp_enabled or not kernel_layout:
+            setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
 
     def set_block_major_pool(
         self, pool_index: int, layout: BlockMajorPoolLayout

@@ -65,6 +65,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |
 | `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size for load-time linear weight requantization. |
 | `TPU_FP8_LINEAR_W8A16_MAX_ROWS` | `0` | Opt-in. FP8 dense-linear steps whose padded token bucket has at most this many rows keep bf16 activations (W8A16) instead of quantizing them to FP8. Per-channel path with FP8 weights only; measured on v7x. |
+| `TPU_GDN_QKVZ_KERNEL_LAYOUT` | `False` | Opt-in. Stores the GDN `in_proj_qkvz` weight in the matmul's (k, n) layout instead of vLLM's [n_out, n_in], removing a per-step weight copy on the per-block FP8 path. Ignored with prefill context parallelism; the experimental AOT export rejects it at TP > 1. |
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time MoE expert weight requantization (e.g., `"fp4"`). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |
 | `VLLM_TPU_MXFP4_DEVICE_DEQUANT` | `True` | Performs MXFP4 weight dequantization on TPU device during load rather than on CPU. |
@@ -77,7 +78,6 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | :--- | :--- | :--- |
 | `VLLM_TPU_BLOCK_MAJOR_KV` | `False` | Selects the block-major KV cache memory layout for Ragged Paged Attention. |
 | `TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL` | `None` | Enables the unified KV cache block pool across hybrid attention layers (e.g., GDN + Full Attention or MLA). |
-| `TPU_GDN_QKVZ_KERNEL_LAYOUT` | `False` | Stores the GDN `in_proj_qkvz` weight in the matmul's (k, n) layout instead of vLLM's [n_out, n_in], removing a per-step weight copy on the per-block FP8 path. Ignored with prefill context parallelism; the experimental AOT export assumes the vLLM layout. |
 | `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `False` | Shards MLA latent projections across the 2 TensorCores of a single TPU v7x chip when `TP=1`. |
 | `TPU_MLA_MASKED_DENSE_ENABLED` | `False` | Enables the masked-dense MLA attention path for short KV lengths. |
 | `TPU_SPARSE_MLA_NOPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA non-positional (`nope`) KV cache (`"sparsecore"` or `"tc"`). |
