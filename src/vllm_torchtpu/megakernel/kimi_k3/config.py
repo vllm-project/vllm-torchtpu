@@ -78,12 +78,19 @@ class KernelConfig:
         default_factory=lambda: os.environ.get("K3_PREFILL_ROUTE_COUNTS", "") == "1"
     )
     prefill_route_counts_every: int = 200
-    # Prefill EP16 expert placement (empty: the pre-shard's): an npz whose
-    # ``order`` [92, 896] is the logical expert at each physical slot (chip c:
-    # slots 56c..56c+55); the router columns and expert weights are loaded in
-    # that order. A bare name loads from kimi_k3/data.
+    # Prefill expert placement (empty: the pre-shard's): an npz whose
+    # ``order`` [92, 896] is the logical expert at each physical slot (EP16
+    # chip c: slots 56c..56c+55; EP8 group g: 112g..112g+111); the router
+    # columns and expert weights are loaded in that order. A bare name loads
+    # from kimi_k3/data.
     prefill_expert_plan: str = dataclasses.field(
         default_factory=lambda: os.environ.get("K3_PREFILL_EXPERT_PLAN", "")
+    )
+    # The decode's EP8 expert placement (empty: the pre-shard's), as
+    # prefill_expert_plan (group g: slots 112g..112g+111). The aggregate
+    # engine's prefill shares these experts and router columns.
+    decode_expert_plan: str = dataclasses.field(
+        default_factory=lambda: os.environ.get("K3_DECODE_EXPERT_PLAN", "")
     )
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
