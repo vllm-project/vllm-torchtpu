@@ -22,7 +22,7 @@ sys.modules[spec.name] = original
 spec.loader.exec_module(original)
 
 
-def compact_gate(out):
+def compact_gate(out, *, hbm_output=False, early_output=False):
     """Change only the output storage/trim of the original gate kernel."""
     node = next(
         n
@@ -55,6 +55,83 @@ def compact_gate(out):
         "compiler_params=pltpu.CompilerParams(",
         'name="dsv41_mhc_compact_gates", compiler_params=pltpu.CompilerParams(',
     )
+    if hbm_output:
+        source = source.replace(
+            "pre_out, post_out, comb_out):",
+            "pre_out, post_out, comb_out, pre_buf, post_buf, comb_buf, sems):",
+        )
+        for prefix in ("pre", "post", "comb"):
+            source = source.replace(f"{prefix}_out[...] =", f"{prefix}_buf[...] =")
+        source = source.replace(
+            "    pre, post, comb = pl.pallas_call(",
+            """        copies = [
+            pltpu.make_async_copy(src, dst, sems.at[i])
+            for i, (src, dst) in enumerate(
+                ((pre_buf, pre_out), (post_buf, post_out), (comb_buf, comb_out))
+            )
+        ]
+        for copy in copies:
+            copy.start()
+        for copy in copies:
+            copy.wait()
+
+    pre, post, comb = pl.pallas_call(""",
+        )
+        # The unparsed call uses one line; replace output specs only.
+        source = source.replace(
+            "out_specs=[pl.BlockSpec((m, out_block), lambda i: (0, i)), "
+            "pl.BlockSpec((m, out_block), lambda i: (0, i)), "
+            "pl.BlockSpec((m, m, out_block), lambda i: (0, 0, i))]",
+            "out_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 3",
+        )
+        source = source.replace(
+            'name="dsv41_mhc_compact_gates",',
+            'name="dsv41_mhc_compact_gates_hbm", '
+            "scratch_shapes=[pltpu.VMEM((m, out_block), jnp.float32), "
+            "pltpu.VMEM((m, out_block), jnp.float32), "
+            "pltpu.VMEM((m, m, out_block), jnp.float32), "
+            "pltpu.SemaphoreType.DMA((3,))],",
+        )
+        source = source.replace(
+            "jax.ShapeDtypeStruct(shape, jnp.float32)",
+            "pltpu.HBM(shape, jnp.float32)",
+        )
+        assert "pre_buf[...]" in source and "copy.start()" in source
+        assert "out_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 3" in source
+    if early_output:
+        assert hbm_output
+        for prefix in ("pre", "post"):
+            source = source.replace(
+                f"        {prefix}_buf[...] = {prefix}_mix[:, :out_block]\n", ""
+            )
+        source = source.replace(
+            "        comb_logits =",
+            """        pre_buf[...] = pre_mix[:, :out_block]
+        post_buf[...] = post_mix[:, :out_block]
+        pre_copy = pltpu.make_async_copy(pre_buf, pre_out, sems.at[0])
+        post_copy = pltpu.make_async_copy(post_buf, post_out, sems.at[1])
+        pre_copy.start()
+        post_copy.start()
+        comb_logits =""",
+        )
+        begin = source.index("        copies = [")
+        end = source.index("\n    pre, post, comb = pl.pallas_call(", begin)
+        source = (
+            source[:begin]
+            + """        comb_copy = pltpu.make_async_copy(
+            comb_buf, comb_out, sems.at[2]
+        )
+        comb_copy.start()
+        pre_copy.wait()
+        post_copy.wait()
+        comb_copy.wait()
+"""
+            + source[end:]
+        )
+        source = source.replace(
+            'name="dsv41_mhc_compact_gates_hbm"',
+            'name="dsv41_mhc_compact_gates_hbm_early"',
+        )
     (out / "candidate-gate.py").write_text(source + "\n")
     namespace = dict(vars(original))
     exec(compile(source, str(out / "candidate-gate.py"), "exec"), namespace)

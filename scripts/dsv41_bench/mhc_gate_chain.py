@@ -126,9 +126,13 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--samples", default=1000, type=int)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--hbm-output", action="store_true")
+    parser.add_argument("--early-output", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    compact = gate.compact_gate(args.out)
+    compact = gate.compact_gate(
+        args.out, hbm_output=args.hbm_output, early_output=args.early_output
+    )
     original = gate.original.shifted_post_pre_rms
     namespace = dict(original.__globals__)
     namespace["_pre_gates"] = compact
@@ -210,6 +214,8 @@ def main():
             "bf16": [2e-2, 2e-2],
             "origin": "tests/models/vllm/test_dsv41_common_mhc.py",
         },
+        "hbm_output": args.hbm_output,
+        "early_output": args.early_output,
         "correctness": [],
         "timings": {},
         "compile_llo": {},
