@@ -17,6 +17,7 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.models.deepseek_v41.common import engram as upstream
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.engram.vllm_adapter import fused_engram_torch
 from vllm_torchtpu.layers.adapter.custom_ops.packed_suffix_op import packed_suffix
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
@@ -614,6 +615,10 @@ class Engram(upstream.Engram):
         return embedding
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
+        config = get_current_vllm_config_or_none()
+        compilation = getattr(config, "compilation_config", None)
+        buckets = getattr(compilation, "compile_sizes", None) or ()
+        self._has_fused_offload_bucket = 288 in buckets
         if not self.embed_tokens.host_offload:
             super()._init_staging(max_tokens, head_dim)
         else:
@@ -951,7 +956,45 @@ class Engram(upstream.Engram):
         local = gathered[:, rank * chunk : (rank + 1) * chunk]
         return local.transpose(0, 1).flatten(1, 2)[:, :cols]
 
+    def _uses_fused_offload(self, hidden_states: torch.Tensor) -> bool:
+        # Token buckets are selected in JAX after Torch's dynamic graph is traced.
+        return (
+            self._has_fused_offload_bucket
+            and hidden_states.device.type == "tpu"
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[1:] == (4, 5120)
+            and not self.use_sequence_parallel
+            and self.embed_tokens.host_offload
+            and self.embed_tokens.dp_size == 1
+            and self.embed_tokens.tp_size == 1
+            and self.embed_tokens.block_size == 32
+            and not self.uses_hbm_lookup
+            and self.embed_tokens.n_hash_cols * self._host_raw.shape[-1] == 6144
+            and self.wkv.weight.shape == (6144, 25600)
+            and self.wkv.weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and self.wkv.weight_scale.shape == (25600,)
+            and self.wkv.weight_scale.dtype == torch.float32
+        )
+
+    def _fused_forward(self, hidden_states, token_mask):
+        assert self._active_raw is not None
+        if token_mask is None:
+            token_mask = torch.ones_like(hidden_states[:, 0, 0], dtype=torch.bool)
+        return fused_engram_torch(
+            self._active_raw.flatten(),
+            hidden_states,
+            self.wkv.weight,
+            self.wkv.weight_scale,
+            self.q_weight,
+            self.k_weight,
+            token_mask,
+            self.eps,
+            self.clamp_value,
+        )
+
     def forward(self, hidden_states, hash_ids, token_mask=None):
+        if self._uses_fused_offload(hidden_states):
+            return self._fused_forward(hidden_states, token_mask)
         if self.use_sequence_parallel:
             tp = self.embed_tokens.tp_size
             chunk = -(-hash_ids.shape[0] // tp)
