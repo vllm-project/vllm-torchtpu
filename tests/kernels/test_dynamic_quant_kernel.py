@@ -93,6 +93,39 @@ def test_matches_plain_jax(rows, k, n, split, weight_nk):
     assert not np.asarray(got[0]).any()
 
 
+def _norm_weight(k):
+    rng = np.random.default_rng(k)
+    return jnp.asarray(1.0 + 0.1 * rng.standard_normal(k), jnp.float32)
+
+
+@pytest.mark.parametrize(
+    "rows,k,n",
+    [
+        (512, 512, 1024),  # one row block
+        (1536, 384, 512),  # odd row blocks; k not a multiple of NORM_LANES
+    ],
+)
+@pytest.mark.parametrize("split", ["none", "tail", "heads"])
+def test_norm_matches_normalizing_first(rows, k, n, split):
+    x, w_q, w_scale = _operands(rows, k, n)
+    norm_weight = _norm_weight(k)
+    cols, head_dim = _split_cols(split, n), _split_head_dim(split)
+    assert dynamic_quant_kernel.supports(x, w_q, w_scale, cols, head_dim, norm_weight)
+    with pltpu.force_tpu_interpret_mode():
+        got = dynamic_quant_kernel.dynamic_quant_matmul(
+            x,
+            w_q,
+            w_scale,
+            split_cols=cols,
+            split_head_dim=head_dim,
+            norm_weight=norm_weight,
+            norm_eps=1e-6,
+        )
+    want = jax.jit(_reference)(util.rms_norm(x, norm_weight, 1e-6), w_q, w_scale)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert not np.asarray(got[0]).any()
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("rows,k,n", [(16384, 4096, 2560), (1024, 256, 384)])
 @pytest.mark.parametrize("split", ["none", "tail", "heads"])

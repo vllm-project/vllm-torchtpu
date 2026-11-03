@@ -78,6 +78,13 @@ def get_kernel_name(tuned_value: TunedValue):
     )
 
 
+def rms_norm(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:
+    """`x * rsqrt(mean(x^2) + eps) * weight` in f32, rounded once to `x.dtype`."""
+    x_f32 = x.astype(jnp.float32)
+    scale = jax.lax.rsqrt(jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True) + eps)
+    return (x_f32 * scale * weight.astype(jnp.float32)).astype(x.dtype)
+
+
 def xla_quantized_matmul(
     x: jax.Array,
     w_q: jax.Array,
@@ -86,6 +93,8 @@ def xla_quantized_matmul(
     split_cols: int = 0,
     weight_nk: bool = False,
     split_head_dim: int = 0,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float = 0.0,
 ) -> jax.Array:
     """
     Per-channel quantized matmul with dynamic per-row activation quantization.
@@ -111,17 +120,21 @@ def xla_quantized_matmul(
         split_head_dim: The consumer reshapes the split-off columns into heads
             of this size, so the kernel writes them head by head rather than
             leave XLA to relayout them.
+        norm_weight: Given, `x` is the input of an RMSNorm with this weight
+            [n_input_features] and `norm_eps`, and the matmul takes
+            `rms_norm(x, norm_weight, norm_eps)`. The kernel normalizes in
+            VMEM, so the normalized activation is never written to HBM.
 
     Returns:
         Output of the quantized matmul.
     """
     if split_head_dim and not dynamic_quant_kernel.supports(
-        x, w_q, w_scale, split_cols, split_head_dim
+        x, w_q, w_scale, split_cols, split_head_dim, norm_weight
     ):
         # The head layout only saves the consumer a relayout; keep the kernel.
         split_head_dim = 0
     if quantize_activation and dynamic_quant_kernel.supports(
-        x, w_q, w_scale, split_cols, split_head_dim
+        x, w_q, w_scale, split_cols, split_head_dim, norm_weight
     ):
         return dynamic_quant_kernel.dynamic_quant_matmul(
             x,
@@ -130,7 +143,11 @@ def xla_quantized_matmul(
             split_cols=split_cols,
             weight_nk=weight_nk,
             split_head_dim=split_head_dim,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
+    if norm_weight is not None:
+        x = rms_norm(x, norm_weight, norm_eps)
     if quantize_activation:
         acc_dtype = jnp.float32
         if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
