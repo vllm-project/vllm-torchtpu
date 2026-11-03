@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 from jax._src import dtypes
 
+from vllm_torchtpu.kernels.quantized_matmul import dynamic_quant_kernel
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import TunedValue
 
 
@@ -84,12 +85,14 @@ def xla_quantized_matmul(
     quantize_activation=True,
 ) -> jax.Array:
     """
-    Reference (pure JAX) implementation of the quantized matmul kernel.
+    Per-channel quantized matmul with dynamic per-row activation quantization.
 
     Weights are in the canonical (k, n) layout, so this is a plain
     `(m, k) @ (k, n)` contraction. Callers holding an N-major
     `[n_output_features, n_input_features]` weight (the Pallas kernels and
-    their tests) transpose at the call site.
+    their tests) transpose at the call site. FP8 shapes that
+    `dynamic_quant_kernel` supports run there, which computes the same values
+    with one read of `x`; everything else is plain JAX.
 
     Args:
         x:  Activation.
@@ -100,6 +103,8 @@ def xla_quantized_matmul(
     Returns:
         Output of the quantized matmul.
     """
+    if quantize_activation and dynamic_quant_kernel.supports(x, w_q, w_scale):
+        return dynamic_quant_kernel.dynamic_quant_matmul(x, w_q, w_scale)
     if quantize_activation:
         acc_dtype = jnp.float32
         if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
