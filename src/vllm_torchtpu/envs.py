@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    TPU_FP8_DECODE_GEMV_MAX_ROWS: int = 0
+    TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS: int = 0
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -112,6 +114,7 @@ if TYPE_CHECKING:
     TPU_RPA_UNMASKED_INTERIOR: bool = False
     TPU_RPA_PROLOGUE_DMA_STORES: bool = False
     TPU_RPA_PROLOGUE_FP8_QUERIES: bool = False
+    TPU_RPA_SLIDING_DECODE_LANES: int = 0
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -686,6 +689,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
     ),
+    # Opt-in weight-streaming kernel for small FP8 dense-linear steps. A step
+    # whose padded token bucket has at most this many rows runs its per-channel
+    # W8A8 projection as one Pallas weight stream that quantizes the rows while
+    # the first weight tiles land (kernels/quantized_matmul/decode_gemv.py)
+    # instead of XLA's activation-quantization fusions and dot fusion. Same
+    # quantization and scaling; the FP8 dot accumulates in Mosaic's order, which
+    # on some shapes rounds differently from XLA's. Buckets under
+    # TPU_FP8_LINEAR_W8A16_MAX_ROWS keep W8A16. 0 (default) keeps XLA.
+    "TPU_FP8_DECODE_GEMV_MAX_ROWS": env_nonnegative_int(
+        "TPU_FP8_DECODE_GEMV_MAX_ROWS", 0
+    ),
+    # Opt-in weight stream for the unquantized LM head on small buckets: a
+    # logits step of at most this many rows (a multiple of 8) runs x @ w.T as
+    # one Pallas kernel that keeps four row tiles of the [vocab shard, hidden]
+    # weight in flight (decode_gemv.decode_matmul_nt), instead of XLA's dot.
+    # f32 accumulation in Mosaic's order. 0 (default) keeps upstream's matmul.
+    "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS": env_nonnegative_int(
+        "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", 0
+    ),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
@@ -963,6 +985,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # writes the FP8 queries the mixed kernel reads, instead of a separate XLA
     # cast and relayout of its bf16 queries (wrapper.quantize_queries).
     "TPU_RPA_PROLOGUE_FP8_QUERIES": env_bool("TPU_RPA_PROLOGUE_FP8_QUERIES"),
+    # Lanes of the batched-RPA decode kernel on sliding-window layers, when
+    # fewer than the default 8; the KV block stays the default's. Every lane of
+    # a step is computed, active or not, and one decode sequence's window spans
+    # a few blocks, so at one or two sequences per engine most lanes are idle.
+    # Lanes only regroup the blocks: outputs are unchanged. 0 (default) keeps 8.
+    "TPU_RPA_SLIDING_DECODE_LANES": env_nonnegative_int(
+        "TPU_RPA_SLIDING_DECODE_LANES", 0
+    ),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.

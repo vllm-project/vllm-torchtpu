@@ -281,6 +281,7 @@ def calculate_block_sizes(
     decode_query_size: int = 1,
     cap_sliding_decode_block: bool = False,
     sliding_prefill_max_bkv: int | None = None,
+    sliding_decode_lanes: int | None = None,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
     """Calculate optimal block size for decode and prefill.
 
@@ -293,6 +294,11 @@ def calculate_block_sizes(
     sliding-window layer. Blocks start at multiples of bkv, so a query block
     visits about (bq + window) / bkv + 1 KV blocks and computes every key of
     each; smaller blocks waste less of that beyond the window.
+
+    `sliding_decode_lanes` runs a sliding-window layer's decode kernel on that
+    many lanes (fewer than the default's) with the default's KV block. Each
+    step computes every lane, active or not, and a decode sequence's window
+    spans only a few blocks, so few decode sequences leave most lanes idle.
     """
 
     tpu_info = pltpu.get_tpu_info()
@@ -551,6 +557,14 @@ def calculate_block_sizes(
     decode_block_sizes = find_best_block_sizes(
         decode_batch_size, decode_query_size, decode_max_bkv_sz
     )
+    if (
+        sliding_decode_lanes
+        and model_cfgs.sliding_window is not None
+        and sliding_decode_lanes < decode_block_sizes.batch_size
+    ):
+        decode_block_sizes = dataclasses.replace(
+            decode_block_sizes, batch_size=sliding_decode_lanes
+        )
     prefill_max_bkv_sz = _MAX_BKV_SZ
     if model_cfgs.sliding_window is not None and sliding_prefill_max_bkv is not None:
         prefill_max_bkv_sz = min(prefill_max_bkv_sz, sliding_prefill_max_bkv)
@@ -669,6 +683,7 @@ def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
         "skip_empty_launch",
         "cap_sliding_decode_block",
         "sliding_prefill_max_bkv",
+        "sliding_decode_lanes",
         "fp8_compute",
         "fence_output",
         "unmasked_interior",
@@ -719,6 +734,7 @@ def ragged_paged_attention(
     skip_empty_launch: bool = False,
     cap_sliding_decode_block: bool = False,
     sliding_prefill_max_bkv: int | None = None,
+    sliding_decode_lanes: int | None = None,
     fp8_compute: bool = False,
     fence_output: bool = False,
     unmasked_interior: bool = False,
@@ -797,6 +813,9 @@ def ragged_paged_attention(
         sliding_prefill_max_bkv: Largest default mixed-kernel KV and query block
             (tokens) when `sliding_window` is set. None keeps the VMEM-filling
             default.
+        sliding_decode_lanes: Lanes of the default decode kernel when
+            `sliding_window` is set, if fewer than the default's; the KV block
+            stays the default's. None keeps the default.
         fp8_compute: If True, the mixed (prefill) kernel runs QK^T and PV as
             fp8 x fp8 matmuls: queries are cast to the fp8 KV cache dtype at a
             scale of 1.0 and the softmax probabilities are cast to it as well.
@@ -941,6 +960,7 @@ def ragged_paged_attention(
         decode_query_size=decode_query_size,
         cap_sliding_decode_block=cap_sliding_decode_block,
         sliding_prefill_max_bkv=sliding_prefill_max_bkv,
+        sliding_decode_lanes=sliding_decode_lanes,
     )
 
     mixed_serve_cfgs = serve_cfgs

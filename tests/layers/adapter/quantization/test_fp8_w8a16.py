@@ -130,7 +130,7 @@ def test_fp8_linear_method_forwards_w8a16_max_rows(monkeypatch, env_val, expecte
 
     seen = {}
 
-    def fake_quantized_matmul(x, w_q, w_s, w8a16_max_rows=0):
+    def fake_quantized_matmul(x, w_q, w_s, w8a16_max_rows=0, decode_gemv_max_rows=0):
         seen["w8a16_max_rows"] = w8a16_max_rows
         return torch.zeros((x.shape[0], w_q.shape[-1]), dtype=x.dtype)
 
@@ -164,7 +164,7 @@ def test_fp8_linear_method_takes_w8a16_max_rows_from_linear_config(monkeypatch):
 
     seen = {}
 
-    def fake_quantized_matmul(x, w_q, w_s, w8a16_max_rows=0):
+    def fake_quantized_matmul(x, w_q, w_s, w8a16_max_rows=0, decode_gemv_max_rows=0):
         seen["w8a16_max_rows"] = w8a16_max_rows
         return torch.zeros((x.shape[0], w_q.shape[-1]), dtype=x.dtype)
 
