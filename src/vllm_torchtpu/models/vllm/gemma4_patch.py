@@ -698,6 +698,19 @@ class Gemma4ProjectionReplica(nn.Module):
             _ReplicaLayer(layer, model.config, quant_config, f"{prefix}.layers.{i}")
             for i, layer in enumerate(model.layers)
         )
+        # TPU_CP_EMBED_REPLICA: the whole vocabulary, so a rank looks up its
+        # own rows instead of every row of its vocab shard plus a reduce-scatter.
+        self.embed_tokens: vocab_parallel_embedding.VocabParallelEmbedding | None = (
+            vocab_parallel_embedding.VocabParallelEmbedding(
+                model.config.vocab_size,
+                model.config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+                disable_tp=True,
+            )
+            if envs.TPU_CP_EMBED_REPLICA
+            else None
+        )
 
 
 def _piece_rows(x: torch.Tensor, plan: Any, piece: int) -> torch.Tensor:
@@ -830,9 +843,15 @@ def _context_parallel_forward(
     the collectives compiled into it assume, so nothing rank-specific may be a
     constant of the graph.
     """
-    shards = _vocab_shard_embedding(model.embed_tokens, _rank_major(input_ids, plan))
-    # As upstream: the normalizer scales the reduced embedding.
-    x = _reduce_scatter_rows(shards) * model.normalizer
+    embed = getattr(getattr(model, _REPLICA), "embed_tokens", None)
+    if embed is not None:
+        x = embed(input_ids.index_select(0, rows)) * model.normalizer
+    else:
+        shards = _vocab_shard_embedding(
+            model.embed_tokens, _rank_major(input_ids, plan)
+        )
+        # As upstream: the normalizer scales the reduced embedding.
+        x = _reduce_scatter_rows(shards) * model.normalizer
     positions = positions.index_select(0, rows)
     for layer, replica in zip(model.layers, getattr(model, _REPLICA).layers):
         x = _context_parallel_layer(
@@ -1013,15 +1032,24 @@ def _patched_causal_lm_init(
                     f"{module.prefix} would run {type(module.quant_method).__name__}"
                     f", its TP shard {type(tp_module.quant_method).__name__}"
                 )
+    if replica.embed_tokens is not None and type(
+        replica.embed_tokens.quant_method
+    ) is not type(model.embed_tokens.quant_method):
+        raise ValueError(
+            "The embedding replica would run "
+            f"{type(replica.embed_tokens.quant_method).__name__}, the TP "
+            f"embedding {type(model.embed_tokens.quant_method).__name__}"
+        )
     setattr(model, _REPLICA, replica)
     # A plain dict: the programs are not submodules, so nothing that walks the
     # model's compiled modules (a re-trace, a profiling reset) reaches them.
     self._cp_programs = _build_context_parallel_programs(model, vllm_config)
     self._cp_attention_prepared = False
     logger.info(
-        "Gemma4 context-parallel programs for token buckets %s; the TP model "
-        "compiles %s",
+        "Gemma4 context-parallel programs for token buckets %s (embedding: %s); "
+        "the TP model compiles %s",
         sorted(self._cp_programs),
+        "replica lookup" if replica.embed_tokens is not None else "vocab shards",
         vllm_config.compilation_config.compile_sizes,
     )
 
@@ -1098,11 +1126,14 @@ def _patched_model_load_weights(
 ) -> set[str]:
     if not hasattr(self, _REPLICA):
         return _orig_model_load_weights(self, weights)
+    embed = getattr(getattr(self, _REPLICA), "embed_tokens", None) is not None
 
     def with_replica() -> Iterator[tuple[str, torch.Tensor]]:
         for name, tensor in weights:
             yield name, tensor
-            if _REPLICATED_TENSOR.match(name):
+            if _REPLICATED_TENSOR.match(name) or (
+                embed and name.startswith("embed_tokens.")
+            ):
                 yield f"{_REPLICA}.{name}", tensor
 
     return _orig_model_load_weights(self, with_replica())

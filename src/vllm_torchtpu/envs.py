@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     TPU_CP_KV_WRITE_KERNEL: bool = False
     TPU_CP_FP8_ATTENTION: bool = False
     TPU_CP_FUSED_PROLOGUE: bool = False
+    TPU_CP_EMBED_REPLICA: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -537,6 +538,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # q/k/v norms, rotary and FP8 K/V quantization and writes the attention
     # kernel's query and K/V layouts, which the CP ops take as they are.
     "TPU_CP_FUSED_PROLOGUE": env_bool("TPU_CP_FUSED_PROLOGUE", default=False),
+    # Gemma4 context-parallel prefill: the projection replica also holds the
+    # whole embedding table (the model's embedding weights again on every
+    # rank), so a rank looks up its own rows instead of every row of the
+    # step in its vocab shard followed by a reduce-scatter. Same values.
+    "TPU_CP_EMBED_REPLICA": env_bool("TPU_CP_EMBED_REPLICA", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and
