@@ -1225,6 +1225,11 @@ class TpuPlatform(Platform):
                     cache_config.block_size = (  # type: ignore[assignment]
                         backend_cls.get_preferred_block_size(default)
                     )
+            from vllm_torchtpu.megakernel_runtime.hooks import (
+                apply_layout_request,
+            )
+
+            apply_layout_request(vllm_config)
             if unified_kv_layout_enabled(vllm_config):
                 update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 

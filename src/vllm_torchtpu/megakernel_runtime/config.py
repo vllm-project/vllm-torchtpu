@@ -37,7 +37,7 @@ from typing import Any
 
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 
-from .plugin import API_VERSION, SHORTHANDS, TpuMonoSpec
+from .plugin import API_VERSION, SHORTHANDS, Shorthand, TpuMonoSpec
 
 RUNTIME_KEYS = frozenset({"plugin", "options", "enabled", "ab", "stats_period_s"})
 _LEGACY_KEYS = frozenset().union(*(s.legacy_keys for s in SHORTHANDS.values()))
@@ -225,13 +225,41 @@ def _hf_arch_candidates(hf_config: Any) -> list[str]:
     return cands
 
 
+def _hf_field_value(hf_config: Any, key: str) -> Any:
+    for root in (
+        hf_config,
+        hf_config.get("text_config")
+        if isinstance(hf_config, Mapping)
+        else getattr(hf_config, "text_config", None),
+    ):
+        if root is None:
+            continue
+        val = root.get(key) if isinstance(root, Mapping) else getattr(root, key, None)
+        if val is not None:
+            return val
+    return None
+
+
+def _matches_hf_fields(sh: Shorthand, hf_config: Any) -> bool:
+    if not sh.hf_fields:
+        return True
+    if hf_config is None:
+        return False
+    return all(_hf_field_value(hf_config, k) == v for k, v in sh.hf_fields)
+
+
 def shorthand_for_arch(hf_config: Any) -> str | None:
     """The shorthand template that serves this checkpoint's arch, if any (from
     the HF config's `architectures` / `model_type` only)."""
-    for cand in _hf_arch_candidates(hf_config):
-        for name, sh in SHORTHANDS.items():
-            if cand in sh.architectures or cand in sh.model_types:
-                return name
+    candidates = _hf_arch_candidates(hf_config)
+    for with_fields in (True, False):
+        for cand in candidates:
+            for name, sh in SHORTHANDS.items():
+                if bool(sh.hf_fields) != with_fields:
+                    continue
+                is_arch = cand in sh.architectures or cand in sh.model_types
+                if is_arch and _matches_hf_fields(sh, hf_config):
+                    return name
     return None
 
 
@@ -278,7 +306,7 @@ def missing_template(ref: PluginRef, hf_config: Any = None) -> str | None:
     installed (`None` otherwise). Shorthands are imported by string, so the
     runtime works without the model folders; then the megakernel stays off.
     An explicit plugin reference that doesn't import is an error instead."""
-    if ref.shorthand is None:
+    if getattr(ref, "shorthand", None) is None:
         return None
     try:
         if importlib.util.find_spec(ref.module) is not None:

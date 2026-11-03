@@ -63,9 +63,11 @@ def _parse_tri_flag(val: Any, *, true_extra: str, name: str) -> bool | str:
         return "auto"
     if s in (*_TRUE_STRS, true_extra) or s in _SPLIT_STRS:
         return s in (*_TRUE_STRS, true_extra)
-    raise ValueError(
-        f"MegakernelDriver: invalid {name}={val!r}; expected 'auto', 'true', or 'false'"
+    msg = (
+        f"MegakernelDriver: invalid {name}={val!r}; "
+        "expected 'auto', 'true', or 'false'"
     )
+    raise ValueError(msg)
 
 
 def _parse_fused_pool_io(val: Any) -> bool | str:
@@ -84,8 +86,8 @@ def _parse_bucket_list(
     val: str | Iterable[int], *, valid_fn: Any, label: str
 ) -> tuple[int, ...]:
     if not isinstance(val, str):
-        if not isinstance(val, Iterable) or isinstance(val, (bytes, bytearray)):
-            raise ValueError(f"MegakernelDriver: invalid {label}={val!r}")
+        bad = not isinstance(val, Iterable) or isinstance(val, (bytes, bytearray))
+        _need(not bad, f"invalid {label}={val!r}")
         bs = sorted({int(x) for x in val})
         _need(all(valid_fn(b) for b in bs), f"invalid {label}={val!r}")
         return tuple(bs)
@@ -104,10 +106,15 @@ def parse_mk_buckets(val: str | Iterable[int]) -> tuple[int, ...]:
     )
 
 
-def parse_mk_verify_buckets(val: str | Iterable[int]) -> tuple[int, ...]:
-    """Parse `T=4` MTP verify row buckets from a string or iterable (`'0'` disables)."""
+def parse_mk_verify_buckets(
+    val: str | Iterable[int], verify_tokens: Sequence[int] = (MTP_VERIFY_TOKENS,)
+) -> tuple[int, ...]:
+    """Parse MTP verify row buckets from a string or iterable (`'0'` disables)."""
+    toks = tuple(verify_tokens) or (MTP_VERIFY_TOKENS,)
     return _parse_bucket_list(
-        val, valid_fn=lambda b: 4 <= b <= 64 and b % 4 == 0, label="verify_buckets"
+        val,
+        valid_fn=lambda b: b <= 64 and any(b >= t and b % t == 0 for t in toks),
+        label="verify_buckets",
     )
 
 
@@ -132,20 +139,13 @@ def _apply_profile_defaults(cfg: dict[str, Any], explicit: set[str]) -> None:
 
 
 _DEFAULT_CFG: dict[str, Any] = {
-    "enabled": False,
-    "mode": "",
-    "profile": None,
-    "buckets": DEFAULT_BUCKETS,
-    "verify_buckets": DEFAULT_VERIFY_BUCKETS,
-    "buckets_explicit": False,
-    "verify_buckets_explicit": False,
-    "fused_pool_io": False,
+    "enabled": False, "mode": "", "profile": None,
+    "buckets": DEFAULT_BUCKETS, "verify_buckets": DEFAULT_VERIFY_BUCKETS,
+    "buckets_explicit": False, "verify_buckets_explicit": False,
+    "fused_pool_io": False, "pool_gather": False,
     "fused_pool_io_max_b": DEFAULT_FUSED_POOL_IO_MAX_B,
     "fused_pool_io_min_b_hi": DEFAULT_FUSED_POOL_IO_MIN_B_HI,
-    "pool_gather": False,
-    "ab": False,
-    "stats_period_s": 60.0,
-    "compile_hlo_check": False,
+    "ab": False, "stats_period_s": 60.0, "compile_hlo_check": False,
 }
 
 
@@ -236,13 +236,9 @@ def explicit_profile_settings(cfg: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def resolve_driver_profile(
-    profile: str | Profile | None,
-    *,
-    model_name: str = "",
-    fused_pool_io: bool | str | None = None,
-    fused_pool_io_max_b: int | None = None,
-    fused_pool_io_min_b_hi: int | None = None,
-    pool_gather: bool | str | None = None,
+    profile: str | Profile | None, *, model_name: str = "",
+    fused_pool_io: bool | str | None = None, fused_pool_io_max_b: int | None = None,
+    fused_pool_io_min_b_hi: int | None = None, pool_gather: bool | str | None = None,
 ) -> Profile:
     """Resolve the effective profile: named profile plus explicit overrides."""
     try:
@@ -276,11 +272,12 @@ def select_bucket(num_tokens: int, buckets: Sequence[int] = DEFAULT_BUCKETS) -> 
 
 @dataclass(frozen=True)
 class BucketPolicy:
-    """Resolved `T=1` decode and `T=4` verify buckets and output-padding rules."""
+    """Resolved `T=1` decode and verify buckets and output-padding rules."""
 
     buckets: tuple[int, ...] = DEFAULT_BUCKETS
     verify_buckets: tuple[int, ...] = DEFAULT_VERIFY_BUCKETS
     token_paddings: tuple[int, ...] = ()
+    verify_tokens: tuple[int, ...] = (MTP_VERIFY_TOKENS,)
 
     @property
     def max_bucket(self) -> int:
@@ -301,31 +298,40 @@ class BucketPolicy:
         buckets_explicit: bool | None = None,
         verify_buckets_explicit: bool | None = None,
         token_paddings: Sequence[int] = (),
+        verify_tokens: Sequence[int] = (MTP_VERIFY_TOKENS,),
     ) -> BucketPolicy:
         """Resolve `(buckets, verify_buckets)` from explicit args or `profile`."""
+        pv = profile.verify_buckets
         def_b = DEFAULT_BUCKETS if profile.buckets is None else profile.buckets
-        p_ver = profile.verify_buckets
-        def_v = DEFAULT_VERIFY_BUCKETS if p_ver is None else p_ver
+        def_v = DEFAULT_VERIFY_BUCKETS if pv is None else pv
         eff_b = def_b if buckets is None else buckets
         eff_v = def_v if verify_buckets is None else verify_buckets
         b_sorted = tuple(sorted(int(x) for x in eff_b))
         v_sorted = tuple(sorted(int(x) for x in eff_v))
+        ver_t = tuple(int(x) for x in verify_tokens)
         if speculative_tokens is not None:
-            b_ok = buckets is not None
-            v_ok = verify_buckets is not None
-            b_exp = b_ok if buckets_explicit is None else buckets_explicit
-            v_exp = v_ok if verify_buckets_explicit is None else verify_buckets_explicit
-            if speculative_tokens == MTP_SPECULATIVE_TOKENS and not b_exp:
+            b_exp = (
+                buckets_explicit
+                if buckets_explicit is not None
+                else (buckets is not None)
+            )
+            v_exp = (
+                verify_buckets_explicit
+                if verify_buckets_explicit is not None
+                else (verify_buckets is not None)
+            )
+            if (speculative_tokens + 1) in ver_t and not b_exp:
                 b_sorted = ()
-            elif speculative_tokens != MTP_SPECULATIVE_TOKENS and not v_exp:
+            elif (speculative_tokens + 1) not in ver_t and not v_exp:
                 v_sorted = ()
-        return cls(b_sorted, v_sorted, tuple(int(x) for x in token_paddings))
+        pad_t = tuple(int(x) for x in token_paddings)
+        return cls(b_sorted, v_sorted, pad_t, ver_t)
 
     def select(
         self, active_rows: int, tokens_per_seq: int = 1, *, clamp: bool = False
     ) -> int:
         """Select the smallest bucket for `(tokens_per_seq, active_rows)`."""
-        is_v = tokens_per_seq == MTP_VERIFY_TOKENS
+        is_v = tokens_per_seq in self.verify_tokens
         b_list = self.verify_buckets if is_v else self.buckets
         max_b = self.max_verify_bucket if is_v else self.max_bucket
         target = max(tokens_per_seq, min(active_rows, max_b)) if clamp else active_rows
@@ -340,18 +346,15 @@ class BucketPolicy:
         """Yield `(tokens_per_seq, bucket_t)` across decode and verify buckets."""
         for b in self.buckets:
             yield (1, b)
-        for b in self.verify_buckets:
-            yield (MTP_VERIFY_TOKENS, b)
+        for v_t in self.verify_tokens:
+            for b in self.verify_buckets:
+                if b >= v_t and b % v_t == 0:
+                    yield (v_t, b)
 
 
 def align_cache_exec(
-    base_exec: ExecSpec,
-    profile: Profile,
-    geom: Any,
-    *,
-    num_pages: int,
-    page_size: int,
-    max_pages_per_seq: int,
+    base_exec: ExecSpec, profile: Profile, geom: Any, *,
+    num_pages: int, page_size: int, max_pages_per_seq: int,
 ) -> ExecSpec:
     """Align `base_exec.ctx` to `kv_blk` and bind paged KV cache geometry."""
     ex0 = profile.exec_for(base_exec, B=base_exec.B, T=1, g=geom)
@@ -359,23 +362,15 @@ def align_cache_exec(
     aligned_ctx = ((int(max_pages_per_seq) * int(page_size)) // kv_blk) * kv_blk
     return with_cache(
         dataclasses.replace(base_exec, ctx=max(base_exec.ctx, aligned_ctx)),
-        num_pages=int(num_pages),
-        page_size=int(page_size),
-        max_pages_per_seq=int(max_pages_per_seq),
-        paged_kv=True,
+        num_pages=int(num_pages), page_size=int(page_size),
+        max_pages_per_seq=int(max_pages_per_seq), paged_kv=True,
     )
 
 
 def bucket_exec_spec(
-    spec: ModelSpec,
-    base_exec: ExecSpec,
-    profile: Profile,
-    *,
-    bucket_t: int,
-    tokens_per_seq: int,
-    fused_pool_io: bool | str | None = None,
-    fused_pool_io_max_b: int | None = None,
-    fused_pool_io_min_b_hi: int | None = None,
+    spec: ModelSpec, base_exec: ExecSpec, profile: Profile, *,
+    bucket_t: int, tokens_per_seq: int, fused_pool_io: bool | str | None = None,
+    fused_pool_io_max_b: int | None = None, fused_pool_io_min_b_hi: int | None = None,
 ) -> tuple[ExecSpec, bool, bool]:
     """Build per-bucket `(ExecSpec, use_fused_pool_io, use_pool_gather)`."""
     eff_fused = profile.fused_pool_io if fused_pool_io is None else fused_pool_io
@@ -391,8 +386,7 @@ def bucket_exec_spec(
     ex_cand2 = with_cache(ex_cand, fused_pool_io=use_fused)
     pb = spec.cache_backend
     use_gpr = (
-        False
-        if (use_fused or pb is None)
+        False if (use_fused or pb is None)
         else should_use_pool_gather(spec, pb, ex_cand2, use_fused=use_fused)
     )
     return with_cache(ex_cand2, pool_gather=use_gpr), bool(use_fused), bool(use_gpr)

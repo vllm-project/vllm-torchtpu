@@ -56,6 +56,7 @@ class Shorthand(NamedTuple):
     architectures: tuple[str, ...]
     model_types: tuple[str, ...]
     legacy_keys: frozenset[str]
+    hf_fields: tuple[tuple[str, Any], ...] = ()
 
 
 # Built-in templates by shorthand name. Imported by string only, so the
@@ -131,6 +132,11 @@ class RunnerView:
         tp_size = int(getattr(p_cfg, "tensor_parallel_size", 0) or 0)
         if tp_size > 0:
             return tp_size
+        v_cfg = getattr(self._runner, "vllm_config", None)
+        p_cfg2 = getattr(v_cfg, "parallel_config", None)
+        tp_size2 = int(getattr(p_cfg2, "tensor_parallel_size", 0) or 0)
+        if tp_size2 > 0:
+            return tp_size2
         mesh = getattr(self._runner, "mesh", None)
         devs = getattr(mesh, "devices", None) if mesh is not None else None
         return int(devs.size) if devs is not None else 0

@@ -217,6 +217,15 @@ def check_spec(
             "'module:attr' string (e.g. '.adapter:create'), so importing the "
             "plugin loads no torch / jax / vLLM"
         )
+    if lazy_create and spec.observe_weight is not None and (
+        not isinstance(spec.observe_weight, str) or ":" not in spec.observe_weight
+    ):
+        obs = spec.observe_weight
+        raise AssertionError(
+            f"SPEC {spec.name!r}: observe_weight={obs!r} should be a "
+            "lazy 'module:attr' string (e.g. '.adapter:observe_weight'), "
+            "so importing the plugin loads no torch / jax / vLLM"
+        )
     codes = list(spec.decline_codes)
     if any(not isinstance(c, str) or not c or c == "other" for c in codes):
         raise AssertionError(f"SPEC {spec.name!r}: bad decline_codes {codes}")
@@ -226,6 +235,8 @@ def check_spec(
         resolve_callable(spec.create, module, what="create")
         if isinstance(spec.layout_request, str):
             resolve_callable(spec.layout_request, module, what="layout_request")
+        if isinstance(spec.observe_weight, str):
+            resolve_callable(spec.observe_weight, module, what="observe_weight")
     return spec
 
 

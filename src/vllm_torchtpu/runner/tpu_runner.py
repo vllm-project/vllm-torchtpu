@@ -664,6 +664,11 @@ class TPUModelRunner(GPUModelRunner):
         # worker resolves them from the TPU rank binding. Required rather than
         # defaulted, because the obvious default -- parallel_config -- is the
         # wrong scope and fails silently. See `_init_phased_profiling`.
+        from vllm_torchtpu.megakernel_runtime.hooks import (
+            apply_layout_request,
+        )
+
+        apply_layout_request(vllm_config)
         self._profiler_rank = profiler_rank
         self._profiler_world_size = profiler_world_size
         pcp_config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
@@ -5291,16 +5296,58 @@ class TPUModelRunner(GPUModelRunner):
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
-        with (
-            set_vllm_model_wrapper_context(
-                mesh=self.mesh, vllm_config=self.vllm_config
-            ),
-            set_current_vllm_config(self.vllm_config),
-        ):
-            load_model = cast(Callable[..., torch.nn.Module], model_loader.load_model)
-            model = load_model(
-                vllm_config=self.vllm_config, model_config=self.model_config
-            )
+        from vllm_torchtpu.megakernel_runtime.hooks import (
+            observe_weight_stream,
+        )
+
+        orig_get_all_weights = getattr(model_loader, "get_all_weights", None)
+        orig_load_weights = getattr(model_loader, "load_weights", None)
+        if callable(orig_get_all_weights):
+
+            def _observed_get_all_weights(*args: Any, **kwargs: Any) -> Any:
+                weights = orig_get_all_weights(*args, **kwargs)
+                return observe_weight_stream(self.vllm_config, weights)
+
+            setattr(model_loader, "get_all_weights", _observed_get_all_weights)
+        elif callable(orig_load_weights):
+
+            def _observed_load_weights(
+                model: Any, model_config: Any, *args: Any, **kwargs: Any
+            ) -> Any:
+                orig_mlw = getattr(model, "load_weights", None)
+                if callable(orig_mlw):
+
+                    def _wrapped_load_weights(
+                        weights: Any, *w_args: Any, **w_kwargs: Any
+                    ) -> Any:
+                        return orig_mlw(
+                            observe_weight_stream(self.vllm_config, weights),
+                            *w_args,
+                            **w_kwargs,
+                        )
+
+                    setattr(model, "load_weights", _wrapped_load_weights)
+                return orig_load_weights(model, model_config, *args, **kwargs)
+
+            setattr(model_loader, "load_weights", _observed_load_weights)
+        try:
+            with (
+                set_vllm_model_wrapper_context(
+                    mesh=self.mesh, vllm_config=self.vllm_config
+                ),
+                set_current_vllm_config(self.vllm_config),
+            ):
+                load_fn = cast(
+                    Callable[..., torch.nn.Module], model_loader.load_model
+                )
+                model = load_fn(
+                    vllm_config=self.vllm_config, model_config=self.model_config
+                )
+        finally:
+            if orig_get_all_weights is not None:
+                setattr(model_loader, "get_all_weights", orig_get_all_weights)
+            if orig_load_weights is not None:
+                setattr(model_loader, "load_weights", orig_load_weights)
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         if self.is_pooling_model:

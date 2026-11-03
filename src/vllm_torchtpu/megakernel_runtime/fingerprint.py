@@ -185,6 +185,8 @@ def plugin_fingerprint(
         "config": dict(config),
         "raw_env": raw_env,
     }
+    if getattr(plugin, "observe_weight", None) is not None:
+        doc["observe_weight"] = str(plugin.observe_weight)
     return hashlib.sha256(canonical_json(doc).encode("utf-8")).hexdigest()
 
 

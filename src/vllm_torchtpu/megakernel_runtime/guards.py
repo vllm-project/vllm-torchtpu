@@ -23,7 +23,10 @@ from typing import Any
 
 from vllm_torchtpu import _OFFLOADING_CONNECTORS
 from vllm_torchtpu.megakernel.runtime.contract import (
+    COLLECTIVE_DOMAINS,
+    DOMAIN_KERNEL_MESH,
     DOMAIN_TP,
+    DOMAIN_TP_X_DCP,
     PARALLELISM_UNSUPPORTED,
     REQUIRES_KEYS,
     REQUIRES_UNMET,
@@ -150,13 +153,46 @@ _PARALLELISM_DETAIL = {
 }
 
 
+def _parallel_field(runner: Any, field: str, default: int = 1) -> int:
+    for cfg in (
+        getattr(runner, "parallel_config", None),
+        getattr(getattr(runner, "vllm_config", None), "parallel_config", None),
+    ):
+        v = getattr(cfg, field, None)
+        if v is not None:
+            return int(v)
+    return default
+
+
+def _dp_size(runner: Any) -> int:
+    return int(os.environ.get("TORCH_TPU_DP_SIZE", "0") or 0) or _parallel_field(
+        runner, "data_parallel_size", 1
+    )
+
+
+def domain_world_size(domain: str, runner: Any, view: RunnerView) -> int:
+    """The rank count a spec's collective domain communicates across."""
+    tp = _parallel_field(
+        runner, "tensor_parallel_size", getattr(view, "tp_size", 1) or 1
+    )
+    if domain == DOMAIN_TP:
+        return tp
+    if domain == DOMAIN_TP_X_DCP:
+        dcp = _parallel_field(runner, "decode_context_parallel_size", 1)
+        return max(tp, dcp)
+    if domain == DOMAIN_KERNEL_MESH:
+        return _dp_size(runner) * tp
+    return tp
+
+
 def detect_parallelism(runner: Any, tp_size: int) -> list[str]:
     """The parallelism kinds (beyond "tp") the runner uses, in check order.
     Reads config and group sizes only: no collective."""
-    p_cfg = _runner_cfg(runner, "parallel_config")
-    dp = int(os.environ.get("TORCH_TPU_DP_SIZE", "0") or 0) or int(
-        getattr(p_cfg, "data_parallel_size", 1) or 1
+    vcfg = getattr(runner, "vllm_config", None)
+    p_cfg = getattr(vcfg, "parallel_config", None) or getattr(
+        runner, "parallel_config", None
     )
+    dp = _dp_size(runner)
     ep_wide = _ep_group_size() > max(1, int(tp_size))
     dp_fn = getattr(runner, "_dp_lockstep_enabled", None)
     pp_multi = not (
@@ -217,7 +253,7 @@ def check_spec(runner: Any, spec: Any, *, view: RunnerView) -> EligibilityResult
         )
         return EligibilityResult(False, UNSUPPORTED_TP_SIZE, msg)
     domain = spec.collective_domain
-    if domain != DOMAIN_TP:
+    if domain not in COLLECTIVE_DOMAINS:
         return _decline(
             f"{PARALLELISM_UNSUPPORTED}:{domain}",
             f"agrees across the TP group only: collective_domain {domain!r} "

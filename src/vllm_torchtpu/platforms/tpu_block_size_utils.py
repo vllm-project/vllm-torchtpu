@@ -387,18 +387,62 @@ def _derive_tpu_block_slot_config(
     backend_min_page_size = backend_cls.get_min_page_size(vllm_config)
     final_block_size = input_block_size
     block_size_source = "input_block_size"
-    if mamba_layout is not None:
-        mamba_fit_block_size = mamba_layout.required_tokens * fa_pool_row_tokens
-        if vllm_config.cache_config.user_specified_block_size:
+
+    plugin_token_floor: int | None = None
+    layout_req = getattr(vllm_config, "_megakernel_layout_applied", None)
+    if not isinstance(layout_req, dict):
+        try:
+            from vllm_torchtpu.megakernel_runtime.hooks import apply_layout_request
+
+            layout_req = apply_layout_request(vllm_config)
+        except Exception:
+            layout_req = None
+    if isinstance(layout_req, dict):
+        plugin_token_floor = (
+            layout_req.get("block_size")
+            or layout_req.get("mamba_slot_tokens")
+            or layout_req.get("slot_stride_tokens")
+            or layout_req.get("mamba_block_size")
+        )
+    if plugin_token_floor is None:
+        add_cfg = getattr(vllm_config, "additional_config", None)
+        if isinstance(add_cfg, dict):
+            plugin_token_floor = (
+                add_cfg.get("mamba_slot_tokens")
+                or add_cfg.get("mamba_block_size")
+                or add_cfg.get("slot_stride_tokens")
+                or add_cfg.get("block_size")
+            )
+    if plugin_token_floor is not None:
+        try:
+            plugin_token_floor = int(plugin_token_floor)
+        except (ValueError, TypeError):
+            plugin_token_floor = None
+
+    if mamba_layout is not None or plugin_token_floor is not None:
+        if mamba_layout is not None:
+            mamba_fit_block_size = mamba_layout.required_tokens * fa_pool_row_tokens
+        cache_cfg = getattr(vllm_config, "cache_config", None)
+        user_specified = (
+            cache_cfg is not None
+            and getattr(cache_cfg, "user_specified_block_size", False)
+        )
+        if user_specified:
             user_block_size_floor = input_block_size
         block_size_floor = max(
-            mamba_fit_block_size,
+            mamba_fit_block_size or 0,
             user_block_size_floor or 0,
+            plugin_token_floor or 0,
             backend_min_page_size,
         )
         final_block_size = _align_block_to_backend(block_size_floor, supported)
         final_block_size = _round_up_to_multiple(final_block_size, fa_pool_row_tokens)
         if (
+            plugin_token_floor is not None
+            and block_size_floor == plugin_token_floor
+        ):
+            block_size_source = "plugin_layout_request"
+        elif (
             user_block_size_floor is not None
             and block_size_floor == user_block_size_floor
         ):
