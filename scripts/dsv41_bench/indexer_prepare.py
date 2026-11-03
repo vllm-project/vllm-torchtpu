@@ -38,11 +38,12 @@ def prepare(keys, columns, order):
             axis=1,
         )
         active = jnp.arange(padded) < count
-        sorted_values = jnp.take_along_axis(
-            packed.T, jnp.broadcast_to(order[None, :], (33, padded)), axis=1
+        # Include columns in the same gather; both use the identical permutation.
+        sorted_values = tiled_gather(
+            jnp.concatenate((packed.T, column_ref[:][None, :]), axis=0), order
         )
-        value_out[:, :] = jnp.where(active[None, :], sorted_values, 0)
-        column_out[:] = jnp.where(active, columns_gather(column_ref[:], order), 0)
+        value_out[:, :] = jnp.where(active[None, :], sorted_values[:33], 0)
+        column_out[:] = jnp.where(active, sorted_values[33], 0)
 
     return pl.pallas_call(
         kernel,
@@ -64,15 +65,20 @@ def prepare(keys, columns, order):
     )
 
 
-def columns_gather(columns, order):
-    # A singleton non-gather axis becomes an offset dimension in JAX gather,
-    # which Mosaic rejects. Eight rows retain the supported batching contract.
-    shape = (8, columns.shape[0])
-    return jnp.take_along_axis(
-        jnp.broadcast_to(columns[None, :], shape),
-        jnp.broadcast_to(order[None, :], shape),
-        axis=1,
-    )[0]
+def tiled_gather(values, order):
+    """Mosaic permits one 128-lane source register per dynamic gather."""
+    outputs = []
+    for output in range(order.shape[0] // 128):
+        indices = order[output * 128 : (output + 1) * 128]
+        local = jnp.broadcast_to(indices[None, :] % 128, (values.shape[0], 128))
+        result = jnp.zeros(local.shape, values.dtype)
+        for source in range(values.shape[1] // 128):
+            part = jnp.take_along_axis(
+                values[:, source * 128 : (source + 1) * 128], local, axis=1
+            )
+            result = jnp.where(indices[None, :] // 128 == source, part, result)
+        outputs.append(result)
+    return jnp.concatenate(outputs, axis=1)
 
 
 def original_writer_with_prepared_inputs():
