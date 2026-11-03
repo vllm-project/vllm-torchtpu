@@ -83,6 +83,7 @@ def xla_quantized_matmul(
     w_q: jax.Array,
     w_scale: jax.Array,
     quantize_activation=True,
+    out_token_minor: bool = False,
 ) -> jax.Array:
     """
     Per-channel quantized matmul with dynamic per-row activation quantization.
@@ -99,12 +100,19 @@ def xla_quantized_matmul(
         x: Activation. [num_tokens, n_input_features]
         w_q: Weight quantized array. [n_input_features, n_output_features]
         w_scale: Weight quantization scale. [n_output_features]
+        out_token_minor: The consumer reads the output token-minor, so the
+            kernel writes it transposed rather than leave XLA a transposing
+            copy. The plain-JAX path lets XLA pick the layout itself.
 
     Returns:
         Output of the quantized matmul.
     """
-    if quantize_activation and dynamic_quant_kernel.supports(x, w_q, w_scale):
-        return dynamic_quant_kernel.dynamic_quant_matmul(x, w_q, w_scale)
+    if quantize_activation and dynamic_quant_kernel.supports(
+        x, w_q, w_scale, out_token_minor
+    ):
+        return dynamic_quant_kernel.dynamic_quant_matmul(
+            x, w_q, w_scale, transpose_out=out_token_minor
+        )
     if quantize_activation:
         acc_dtype = jnp.float32
         if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):

@@ -55,11 +55,14 @@ def _operands(rows, k, n):
         (1024, 256, 384),  # output chunk narrower than OUT_BLOCK
     ],
 )
-def test_matches_plain_jax(rows, k, n):
+@pytest.mark.parametrize("transpose_out", [False, True])
+def test_matches_plain_jax(rows, k, n, transpose_out):
     x, w_q, w_scale = _operands(rows, k, n)
-    assert dynamic_quant_kernel.supports(x, w_q, w_scale)
+    assert dynamic_quant_kernel.supports(x, w_q, w_scale, transpose_out)
     with pltpu.force_tpu_interpret_mode():
-        got = dynamic_quant_kernel.dynamic_quant_matmul(x, w_q, w_scale)
+        got = dynamic_quant_kernel.dynamic_quant_matmul(
+            x, w_q, w_scale, transpose_out=transpose_out
+        )
     want = jax.jit(_reference)(x, w_q, w_scale)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     assert not np.asarray(got[0]).any()
@@ -67,9 +70,12 @@ def test_matches_plain_jax(rows, k, n):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("rows,k,n", [(16384, 4096, 2560), (1024, 256, 384)])
-def test_compiled_matches_xla(rows, k, n):
+@pytest.mark.parametrize("transpose_out", [False, True])
+def test_compiled_matches_xla(rows, k, n, transpose_out):
     x, w_q, w_scale = _operands(rows, k, n)
-    got = dynamic_quant_kernel.dynamic_quant_matmul(x, w_q, w_scale)
+    got = dynamic_quant_kernel.dynamic_quant_matmul(
+        x, w_q, w_scale, transpose_out=transpose_out
+    )
     want = jax.jit(_reference)(x, w_q, w_scale)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
