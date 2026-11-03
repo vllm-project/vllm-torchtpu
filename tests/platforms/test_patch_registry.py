@@ -433,4 +433,3 @@ def test_block_table_version_patch(monkeypatch):
     am._install_block_table_version()
     assert BlockTable._tpu_version_patch is True
     assert BlockTable.add_row is not orig_add_row
-

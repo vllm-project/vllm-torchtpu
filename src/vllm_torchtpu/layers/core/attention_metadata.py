@@ -654,11 +654,7 @@ def stage_block_table_uploads(
     )
     prev = runner.__dict__.get("_block_table_stage_prev")
     reused_key = None
-    if (
-        ctx.position_ids_override is None
-        and prev is not None
-        and prev[3] == stage_key
-    ):
+    if ctx.position_ids_override is None and prev is not None and prev[3] == stage_key:
         staged_dev = prev[2]
         reused_key = stage_key
     else:
@@ -704,7 +700,8 @@ def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_ke
     # read-only (every consumer gets the walk program's outputs).
     prev = runner.__dict__.get("_block_table_stage_prev")
     if (
-        prev is not None
+        ctx.position_ids_override is None
+        and prev is not None
         and prev[0] == table_geom
         and torch.equal(prev[1], flat)
     ):
