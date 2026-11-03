@@ -138,6 +138,8 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
                 # The aggregate prefill shares the decode's EP8 experts.
                 prefill_expert_parallel=8 if aggregate else 16,
                 prefill_fused_moe_ep8=aggregate,
+                # Every 8K window's routes on the fused path (no unfused overflow).
+                prefill_moe_capacity_ep8=65536 if aggregate else 32768,
             )
         )
     # The prefill computes the rings of its loader config's draft; the
