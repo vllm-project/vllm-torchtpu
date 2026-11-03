@@ -90,6 +90,11 @@ class MetadataRef:
     # speculative decoding, where the only checkpoint is the slot's own
     # state block (`s_idx_to_state_indices`).
     s_idx_to_ckpt_indices: Any = None
+    # TPU_GDN_KERNEL_ZERO_OUT only: the call's query_start_loc and
+    # distribution, from which the kernel finds the first output row no
+    # kernel writes (see GDNConfig.zero_out_from). None otherwise.
+    zero_out_query_start_loc: Any = None
+    zero_out_distribution: Any = None
 
     @classmethod
     def create(
@@ -201,6 +206,57 @@ class InBufferedRef(BaseBufferedRef):
             vmem_ref.at[0, pl.ds(0, dma_size)],
             sem,
         ).wait()
+
+
+def raw_block_start(
+    metadata_ref: MetadataRef, p_id: jax.Array, rows: int, align: int, total: int
+) -> jax.Array:
+    """First row of the raw-input row block a tile reads.
+
+    The tile's tokens are rows [r0, r0 + seq_tile_size * chunk_size) of the
+    2D [total, width] input, r0 being its first sequence's base row. The
+    block is `rows` rows starting at r0 rounded down to the HBM row tile
+    (`align`), moved back so it stays inside the array; `rows` is sized so
+    the block still covers the tile's tokens.
+    """
+    r0 = metadata_ref.p_id_to_r_base[p_id, 0]
+    start = jnp.minimum((r0 // align) * align, total - rows)
+    return pl.multiple_of(start, align)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class RowBlockInBufferedRef(BaseBufferedRef):
+    """Raw 2D activation input: one tile-aligned row block per tile.
+
+    The source is the projection output [tokens, width] in its own dtype
+    and HBM tiling, whose rows can only be sliced at tile-aligned offsets.
+    So each tile DMAs `rows` rows from `raw_block_start` and the kernel
+    places each sequence's rows in VMEM (wrapper._load_raw_rows).
+    """
+
+    rows: int = dataclasses.field(metadata=dict(static=True))
+    align: int = dataclasses.field(metadata=dict(static=True))
+
+    def _copy(self, src_ref: jax.Ref, grid_indices, slot):
+        assert self.window_ref is not None
+        p_id = grid_indices[0]
+        start = raw_block_start(
+            self.metadata_ref, p_id, self.rows, self.align, src_ref.shape[0]
+        )
+        return pltpu.make_async_copy(
+            src_ref.at[pl.ds(start, self.rows)],
+            cast(jax.Ref, self.window_ref.at[slot]),
+            cast(Any, self.sem_recvs).at[slot],
+        )
+
+    def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        self._copy(src_ref, grid_indices, self.current_copy_in_slot).start()
+
+    def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        self._copy(src_ref, grid_indices, self.current_wait_in_slot).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -664,9 +720,35 @@ def create_allocs(
         cfg=cfg,
         metadata_ref=metadata_ref,
     )
-    qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
-    b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
-    a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
+    raw_partial = functools.partial(
+        RowBlockInBufferedRef.input,
+        buffer_count=pipeline_mode.buffer_count,
+        use_lookahead=pipeline_mode.use_lookahead,
+        cfg=cfg,
+        metadata_ref=metadata_ref,
+    )
+    if cfg.raw_qkv:
+        qkv_alloc = raw_partial(
+            spec=block_spec_partial(block_shape=(cfg.raw_qkv_rows, qkv_ref.shape[-1])),
+            dtype_or_type=qkv_ref,
+            rows=cfg.raw_qkv_rows,
+            align=cfg.raw_qkv_align,
+        )
+    else:
+        qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
+    if cfg.raw_ba:
+        b_alloc, a_alloc = (
+            raw_partial(
+                spec=block_spec_partial(block_shape=(cfg.raw_ba_rows, ref.shape[-1])),
+                dtype_or_type=ref,
+                rows=cfg.raw_ba_rows,
+                align=cfg.raw_ba_align,
+            )
+            for ref in (b_ref, a_ref)
+        )
+    else:
+        b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
+        a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
 
     out_alloc = OutBufferedRef.output(
         spec=block_spec_partial(block_shape=out_shape),

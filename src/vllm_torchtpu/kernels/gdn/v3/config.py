@@ -126,6 +126,35 @@ class GDNConfig:
     # sequence (tile_size = 2 * sub_chunk_size), whose state-independent
     # work is batched over heads (TPU_GDN_CHUNK_PAIR).
     chunk_pair: bool = False
+    # Raw activation inputs (TPU_GDN_RAW_QKV / TPU_GDN_RAW_BA): qkv (and b/a)
+    # arrive as the projection's 2D [tokens, width] array, unpadded and in its
+    # own dtype. Each tile DMAs `raw_*_rows` rows starting at a multiple of
+    # `raw_*_align` (the HBM row tile) that cover the tile's tokens, then
+    # casts and places them in the compact layout in VMEM. 0 = off.
+    raw_qkv_rows: int = 0
+    raw_qkv_align: int = 0
+    raw_ba_rows: int = 0
+    raw_ba_align: int = 0
+    # TPU_GDN_KERNEL_ZERO_OUT: the kernel zero-fills the output rows
+    # [query_start_loc[distribution[zero_out_from]], batch_size), which no
+    # kernel of the call writes, instead of an XLA zero-initialized buffer.
+    # -1 = off.
+    zero_out_from: int = -1
+
+    # Output rows zeroed per DMA by the in-kernel zero-fill.
+    ZERO_OUT_ROWS: ClassVar[int] = 32
+
+    @property
+    def raw_qkv(self) -> bool:
+        return self.raw_qkv_rows > 0
+
+    @property
+    def raw_ba(self) -> bool:
+        return self.raw_ba_rows > 0
+
+    @property
+    def kernel_zero_out(self) -> bool:
+        return self.zero_out_from >= 0
 
     @property
     def sub_chunk_size(self) -> int:
@@ -226,6 +255,12 @@ class GDNConfig:
             suffix += "_bounded"
         if self.chunk_pair:
             suffix += "_pair"
+        if self.raw_qkv:
+            suffix += "_rawqkv"
+        if self.raw_ba:
+            suffix += "_rawba"
+        if self.kernel_zero_out:
+            suffix += "_zf"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
@@ -278,7 +313,42 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
+        raw_scratch = None
+        if self.raw_qkv or self.raw_ba:
+            act = (self.seq_tile_size, self.chunk_size, 1)
+            raw_scratch = {}
+            if self.raw_qkv:
+                # Rows [0, raw_qkv_rows) hold the cast row block; the extra
+                # chunk_size rows keep every per-sequence window read in
+                # bounds (rows past a sequence's tokens are masked).
+                raw_scratch["qkv_stage"] = pltpu.VMEM(
+                    (self.raw_qkv_rows + self.chunk_size, 1, self.dim_size),
+                    jnp.float32,
+                )
+                raw_scratch["qkv_act"] = pltpu.VMEM(act + (self.dim_size,), jnp.float32)
+            if self.raw_ba:
+                for name, width in (
+                    ("b", self.aligned_num_v_heads),
+                    ("a", self.aligned_gate_dim),
+                ):
+                    raw_scratch[f"{name}_stage"] = pltpu.VMEM(
+                        (self.raw_ba_rows + self.chunk_size, 1, width), jnp.float32
+                    )
+                    raw_scratch[f"{name}_act"] = pltpu.VMEM(act + (width,), jnp.float32)
+
+        zero_out_scratch = None
+        if self.kernel_zero_out:
+            zero_out_scratch = (
+                pltpu.VMEM(
+                    (self.ZERO_OUT_ROWS, self.num_v_heads, self.v_head_dim),
+                    self.dtypes.act_out,
+                ),
+                pltpu.SemaphoreType.DMA,
+            )
+
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
+            raw_scratch_ref=raw_scratch,
+            zero_out_scratch_ref=zero_out_scratch,
         )
