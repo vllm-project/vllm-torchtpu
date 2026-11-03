@@ -60,6 +60,7 @@ def assert_parity(
 
     Metrics are computed in fp64.
     """
+    assert max_rel_l2 is not None or max_abs is not None, f"{name}: no gate given"
     assert actual.shape == reference.shape, (
         f"{name}: shape ({tuple(actual.shape)}) != ({tuple(reference.shape)})"
     )
