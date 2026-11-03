@@ -289,6 +289,26 @@ def _fake_prequantized_matmul_bf16(x_q, x_scale, w_q, w_s, decode_gemv_max_rows=
 _prequantized_matmul_bf16_op.register_fake(_fake_prequantized_matmul_bf16)
 
 
+def _decode_matmul_nt_jax(x: jax.Array, w: jax.Array) -> jax.Array:
+    return decode_gemv.decode_matmul_nt(x, w)
+
+
+_decode_matmul_nt_op = pallas.jax_op("pallas::decode_matmul_nt", _decode_matmul_nt_jax)
+
+
+def _fake_decode_matmul_nt(x, w):
+    return torch.empty(x.shape[0], w.shape[0], dtype=x.dtype, device=x.device)
+
+
+_decode_matmul_nt_op.register_fake(_fake_decode_matmul_nt)
+
+
+def decode_matmul_nt(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """`F.linear(x, w)` for a decode bucket as one weight stream
+    (`decode_gemv.decode_matmul_nt`): `x` `[rows, k]`, `w` `[n, k]`."""
+    return _decode_matmul_nt_op(x, w)
+
+
 def quantize_activation(
     x: torch.Tensor, w_q: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:

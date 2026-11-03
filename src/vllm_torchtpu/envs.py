@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     TPU_FP8_DECODE_GEMV_MAX_ROWS: int = 0
+    TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS: int = 0
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -703,6 +704,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_FP8_LINEAR_W8A16_MAX_ROWS keep W8A16. 0 (default) keeps XLA.
     "TPU_FP8_DECODE_GEMV_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_DECODE_GEMV_MAX_ROWS", 0
+    ),
+    # Opt-in weight stream for the unquantized LM head on small buckets: a
+    # logits step of at most this many rows (a multiple of 8) runs x @ w.T as
+    # one Pallas kernel that keeps four row tiles of the [vocab shard, hidden]
+    # weight in flight (decode_gemv.decode_matmul_nt), instead of XLA's dot.
+    # f32 accumulation in Mosaic's order. 0 (default) keeps upstream's matmul.
+    "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS": env_nonnegative_int(
+        "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", 0
     ),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(

@@ -767,7 +767,12 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         if isinstance(layer, Attention):
             return None
 
-        return None
+        from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+            decode_lm_head_method,
+        )
+
+        # The checkpoint's LM head is not FP8.
+        return decode_lm_head_method(layer)
 
 
 class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):

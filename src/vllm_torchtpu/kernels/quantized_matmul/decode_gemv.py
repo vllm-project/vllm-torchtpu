@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-channel W8A8 FP8 matmul for decode-sized token buckets, as one weight stream.
+"""Weight-streaming matmuls for decode-sized token buckets.
+
+`fp8_decode_matmul` / `fp8_decode_prequantized_matmul`: per-channel W8A8 FP8
+projections on the canonical `(k, n)` weight. `decode_matmul_nt`: `x @ w.T`
+on an `(n, k)` weight, the layout vLLM keeps for a (tied) LM head.
 
 A decode bucket's FP8 projection reads a weight of tens of MB for a few rows,
 so its time is the weight's HBM stream. XLA runs it as two activation
@@ -43,6 +47,8 @@ _LANES = 128
 # FP8 rows pack 32 to a sublane tile; the dot runs on a whole tile of rows.
 _ROW_TILE = 32
 _VMEM_LIMIT_BYTES = 32 * 1024 * 1024
+# The LM head's 5.5 MB bf16 row tiles and its [rows, vocab shard] output.
+_NT_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
 # Share of a limit the estimated buffers may take; the rest is left for the
 # compiler's temporaries. Checked by deviceless tpu7x compiles (jax 0.11.2,
 # libtpu 0.0.50) of the largest buckets it admits at Gemma4-31B TP2; recheck
@@ -319,3 +325,78 @@ def fp8_decode_prequantized_matmul(
         name="fp8_decode_prequantized_matmul",
         interpret=interpret,
     )
+
+
+def supports_nt(rows: int, k: int, n: int, itemsize: int = 2) -> bool:
+    """Whether `[rows, k] @ [n, k].T` can run in `decode_matmul_nt`: whole
+    lanes, and the weight ring, the rows and the whole output in VMEM."""
+    if not (rows % 8 == 0 and n % _LANES == 0 and k % _LANES == 0):
+        return False
+    tn, depth, _ = tile_config(k, n, itemsize=itemsize, tile_bytes=_NT_TILE_BYTES)
+    ring = depth * tn * k * itemsize
+    out_bytes = rows * n * itemsize + rows * tn * 4
+    return _fits_vmem(ring + rows * k * itemsize + out_bytes, _NT_VMEM_LIMIT_BYTES)
+
+
+# Row tiles of a bf16 LM head: 512 rows of a 5376-wide hidden size.
+_NT_TILE_BYTES = 2 * _TILE_BYTES
+
+
+@functools.partial(jax.jit, static_argnames=("tile_bytes", "interpret"))
+def decode_matmul_nt(
+    x: jax.Array,
+    w: jax.Array,
+    tile_bytes: int = _NT_TILE_BYTES,
+    interpret: bool = False,
+) -> jax.Array:
+    """`x @ w.T` accumulated in f32 and cast to `x.dtype`, streaming `w`
+    (`[n, k]`) as `[tn, k]` row tiles: `x` `[m, k]` (m a multiple of 8)."""
+    m, k = x.shape
+    n = w.shape[0]
+    # A [tn, k] row tile holds as many bytes as a [k, tn] column tile.
+    tn, depth, _ = tile_config(k, n, itemsize=w.dtype.itemsize, tile_bytes=tile_bytes)
+    nt = n // tn
+
+    def kernel(x_ref, w_hbm, o_ref, wbuf, sems):
+        def copy(t, slot):
+            return pltpu.make_async_copy(
+                w_hbm.at[pl.ds(t * tn, tn)], wbuf.at[slot], sems.at[slot]
+            )
+
+        for t in range(depth):
+            copy(t, t).start()
+
+        def body(t, carry):
+            slot = lax.rem(t, depth)
+            copy(t, slot).wait()
+            acc = lax.dot_general(
+                x_ref[...],
+                wbuf[slot],
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            col = pl.multiple_of(t * tn, _LANES)
+            o_ref[:, pl.ds(col, tn)] = acc.astype(o_ref.dtype)
+
+            @pl.when(t + depth < nt)
+            def _():
+                copy(t + depth, slot).start()
+
+            return carry
+
+        lax.fori_loop(0, nt, body, 0)
+
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((m, n), x.dtype),
+        in_specs=[vmem, pl.BlockSpec(memory_space=pltpu.HBM)],
+        out_specs=vmem,
+        scratch_shapes=[
+            pltpu.VMEM((depth, tn, k), w.dtype),
+            pltpu.SemaphoreType.DMA((depth,)),
+        ],
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=_NT_VMEM_LIMIT_BYTES),
+        name=f"decode_matmul_nt_tn{tn}_d{depth}",
+        interpret=pltpu.InterpretParams() if interpret else False,
+    )(x, _hbm(w))

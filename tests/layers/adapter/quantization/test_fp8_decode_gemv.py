@@ -115,6 +115,10 @@ def test_supports_needs_vmem():
     """Buckets whose rows and output outgrow the kernel's VMEM keep XLA."""
     assert decode_gemv.supports(32, 5376, 21504, jnp.float8_e4m3fn, 1)
     assert not decode_gemv.supports(1024, 5376, 21504, jnp.float8_e4m3fn, 1)
+    # Gemma4's bf16 LM head: the TP2 vocab shard at 16 rows, the whole vocab
+    # at 32 (a 16 MiB output next to the 21 MiB ring) does not fit.
+    assert decode_gemv.supports_nt(16, 5376, 131072)
+    assert not decode_gemv.supports_nt(32, 5376, 262144)
 
 
 def _route(monkeypatch, rows, n=256, w8a16_max_rows=0, gemv_max_rows=16):
@@ -202,3 +206,106 @@ def test_ops_accept_decode_gemv_max_rows():
         x_scale = torch.empty((16, 1), dtype=torch.float32)
         out = linear_common._prequantized_matmul_bf16_op(x_q, x_scale, w_q, w_s, 16)
         assert out.shape == (16, 128)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "rows,k,n,tile_bytes",
+    [
+        (8, 512, 2048, 512 * 256 * 2),
+        (16, 384, 1280, 384 * 128 * 2),
+        (8, 256, 384, 1 << 20),
+    ],
+)
+def test_nt_matches_xla(rows, k, n, tile_bytes):
+    x = jax.random.normal(jax.random.key(0), (rows, k), jnp.float32).astype(
+        jnp.bfloat16
+    )
+    w = jax.random.normal(jax.random.key(1), (n, k), jnp.float32).astype(jnp.bfloat16)
+    ref = jax.jit(
+        lambda a, b: jnp.einsum(
+            "mk,nk->mn", a, b, preferred_element_type=jnp.float32
+        ).astype(a.dtype)
+    )(x, w)
+    out = decode_gemv.decode_matmul_nt(x, w, tile_bytes=tile_bytes, interpret=True)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
+
+
+def _head(n=256, k=128, dtype=torch.bfloat16):
+    head = torch.nn.Module()
+    head.weight = torch.nn.Parameter(torch.randn(n, k).to(dtype), requires_grad=False)
+    return head
+
+
+@pytest.mark.cpu_test
+def test_lm_head_method_is_opt_in(monkeypatch):
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+
+    from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+        VllmDecodeLMHeadMethod,
+        VllmUnquantizedConfig,
+    )
+
+    head = MagicMock(spec=ParallelLMHead)
+    embedding = MagicMock(spec=VocabParallelEmbedding)
+    get = VllmUnquantizedConfig.get_quant_method
+    monkeypatch.setenv("TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", "0")
+    assert get(None, head, "lm_head") is None
+    monkeypatch.setenv("TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", "16")
+    method = get(None, head, "lm_head")
+    assert isinstance(method, VllmDecodeLMHeadMethod) and method.max_rows == 16
+    assert get(None, embedding, "model.embed_tokens") is None
+
+
+@pytest.mark.cpu_test
+def test_lm_head_method_routes_small_buckets(monkeypatch):
+    from vllm_torchtpu.layers.adapter.quantization import unquantized
+
+    calls = []
+
+    def fake_nt(x, w):
+        calls.append(tuple(x.shape))
+        return torch.nn.functional.linear(x, w)
+
+    monkeypatch.setattr(unquantized, "decode_matmul_nt", fake_nt)
+    method = unquantized.VllmDecodeLMHeadMethod(16)
+    head = _head()
+    x = torch.randn(8, 128).to(torch.bfloat16)
+    torch.testing.assert_close(
+        method.apply(head, x), torch.nn.functional.linear(x, head.weight)
+    )
+    assert calls == [(8, 128)]
+    method.apply(head, torch.randn(32, 128).to(torch.bfloat16))  # above max_rows
+    method.apply(head, x, bias=torch.zeros(256, dtype=torch.bfloat16))
+    method.apply(head, torch.randn(12, 128).to(torch.bfloat16))  # not a row tile
+    method.apply(_head(n=200), x)  # columns not whole lanes
+    assert calls == [(8, 128)]
+
+
+@pytest.mark.cpu_test
+def test_fp8_config_lm_head_gets_the_decode_method(monkeypatch):
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+    from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+        VllmDecodeLMHeadMethod,
+    )
+
+    config = VllmFp8Config(is_checkpoint_fp8_serialized=True)
+    head = MagicMock(spec=ParallelLMHead)
+    monkeypatch.setenv("TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", "0")
+    assert config.get_quant_method(head, "lm_head") is None
+    monkeypatch.setenv("TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", "8")
+    assert isinstance(config.get_quant_method(head, "lm_head"), VllmDecodeLMHeadMethod)
+
+
+@pytest.mark.cpu_test
+def test_decode_matmul_nt_op_shape():
+    with torch.device("meta"):
+        x = torch.empty((8, 128), dtype=torch.bfloat16)
+        w = torch.empty((256, 128), dtype=torch.bfloat16)
+        out = linear_common._decode_matmul_nt_op(x, w)
+    assert out.shape == (8, 256) and out.dtype == torch.bfloat16
