@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -511,6 +512,75 @@ def rpa_body(
         cfgs=cfgs,
     )
 
+    attend = functools.partial(
+        _attend_and_store,
+        step,
+        q_vref,
+        kv_in_vref,
+        o_vref,
+        lse_o_vref,
+        schedule_ref,
+        m_scratch_ref,
+        l_scratch_ref,
+        acc_scratch_ref,
+        stitch_meta=stitch_meta,
+        step_meta=step_meta,
+        cfgs=cfgs,
+    )
+    if cfgs.mode == configs.RpaCase.MIXED and cfgs.serve.unmasked_interior:
+        needs_mask = step_needs_mask(step, schedule_ref, step_meta, cfgs=cfgs)
+        pl.when(needs_mask)(functools.partial(attend, masked=True))
+        pl.when(jnp.logical_not(needs_mask))(functools.partial(attend, masked=False))
+    else:
+        attend(masked=True)
+
+
+def step_needs_mask(
+    step: jax.Array,
+    schedule_ref: schedule.RpaSchedule,
+    step_meta: ComputeMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> jax.Array:
+    """Whether `generate_mask` masks out any (query, key) pair of the step.
+
+    It masks nothing when every key of the KV block precedes the step's first
+    query (causal offset <= 1 - bkv), lies inside the last query's window, and
+    lies inside the scope's key range. Padding steps take the masked path.
+    """
+    needs = []
+    for b_idx in range(cfgs.batch_size):
+        offset = step_meta.causal_offset[b_idx]
+        lane = jnp.logical_or(
+            offset > 1 - cfgs.bkv_sz, schedule_ref.s_idx[step, b_idx] == -1
+        )
+        if (sliding_window := cfgs.model.sliding_window) is not None:
+            lane = jnp.logical_or(lane, offset <= cfgs.bq_sz - 1 - sliding_window)
+        if step_meta.local_k_start is not None:
+            lane = jnp.logical_or(lane, step_meta.local_k_start[b_idx] > 0)
+        if step_meta.local_k_end is not None:
+            lane = jnp.logical_or(lane, step_meta.local_k_end[b_idx] < cfgs.bkv_sz)
+        needs.append(lane)
+    return functools.reduce(jnp.logical_or, needs)
+
+
+def _attend_and_store(
+    step: jax.Array,
+    q_vref: jax.Ref,
+    kv_in_vref: jax.Ref,
+    o_vref: jax.Ref,
+    lse_o_vref: jax.Ref | None,
+    schedule_ref: schedule.RpaSchedule,
+    m_scratch_ref: jax.Ref,
+    l_scratch_ref: jax.Ref,
+    acc_scratch_ref: jax.Ref,
+    *,
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+    cfgs: configs.RpaConfigs,
+    masked: bool,
+):
+    """Steps 2b-4 of `rpa_body`; `masked=False` drops the QK mask."""
     # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
@@ -643,16 +713,20 @@ def rpa_body(
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
 
-        custom_mask = generate_mask(
-            shape=(
-                cfgs.batch_size,
-                cfgs.model.num_kv_heads,
-                q_end - q_start,
-                cfgs.bkv_sz,
-            ),
-            bq_start=bq_start,
-            step_meta=step_meta,
-            cfgs=cfgs,
+        custom_mask = (
+            generate_mask(
+                shape=(
+                    cfgs.batch_size,
+                    cfgs.model.num_kv_heads,
+                    q_end - q_start,
+                    cfgs.bkv_sz,
+                ),
+                bq_start=bq_start,
+                step_meta=step_meta,
+                cfgs=cfgs,
+            )
+            if masked
+            else None
         )
 
         p, alpha_list, m_next, l_next, m_carry, l_carry = (
