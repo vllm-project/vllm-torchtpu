@@ -38,12 +38,24 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe import host  # noqa: E402
 
 def metadata_candidate(pairs, counts, *, revision=1):
     """Retain count semantics, excluding the rejected activation matmul."""
-    topk, tokens = pairs.shape
+    topk, tokens = (6, pairs.size // 6) if revision == 3 else pairs.shape
     experts = counts.size
     bins = jnp.arange(experts, dtype=jnp.int32)
     selection = jnp.zeros((tokens, experts), bool)
     for k in range(topk):
-        selection = selection | (pairs[k, :, None] == bins[None, :])
+        if revision == 3:
+            column = lax.gather(
+                pairs,
+                (jnp.arange(tokens, dtype=jnp.int32) * topk + k)[:, None],
+                lax.GatherDimensionNumbers(
+                    offset_dims=(), collapsed_slice_dims=(0,), start_index_map=(0,)
+                ),
+                slice_sizes=(1,),
+                mode=lax.GatherScatterMode.PROMISE_IN_BOUNDS,
+            )
+        else:
+            column = pairs[k]
+        selection = selection | (column[:, None] == bins[None, :])
     cumulative = prefix_sum(selection.astype(jnp.int32), axis=0)
     end = prefix_sum(counts)
     start = end - counts
@@ -127,18 +139,23 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--samples", default=200, type=int)
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--revision", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--revision", type=int, choices=(1, 2, 3), default=1)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     initial = tuple(jax.device_put(x) for x in fixture("uniform"))
     fused = fuse_function(
         functools.partial(metadata_candidate, revision=args.revision),
-        (initial[0].reshape(288, 6).T, initial[1]),
+        (
+            initial[0] if args.revision == 3 else initial[0].reshape(288, 6).T,
+            initial[1],
+        ),
         name=f"dsv41_presort_metadata_v{args.revision}",
     )
 
     def candidate(pairs, counts, q):
-        order, start = fused(pairs.reshape(288, 6).T, counts)
+        order, start = fused(
+            pairs if args.revision == 3 else pairs.reshape(288, 6).T, counts
+        )
         return q[order], start
 
     funcs = {"native": jax.jit(native), "pallas": jax.jit(candidate)}
