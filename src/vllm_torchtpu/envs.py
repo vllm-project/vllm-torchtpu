@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_RESHARD_PORT_BASE: int = 27000
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
+    TPU_RAIDEN_HANDOFF_ALIGN_TOKENS: int = 0
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
@@ -1028,6 +1029,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # installed client lacks dst_skip_bytes support, local hits are ignored
     # and the full payload is pulled into every destination page.
     "TPU_RAIDEN_PREFIX_AWARE_LOAD": env_bool("TPU_RAIDEN_PREFIX_AWARE_LOAD", False),
+    # Stage-3 producers of state-bearing (Mamba / request-state) models: end
+    # the handoff on a multiple of this many tokens instead of one token short
+    # of the prompt, and let the decode peer recompute the rest. Set it to the
+    # decode peer's prefix-hit alignment (its largest token page, e.g. 512-row
+    # pages x main-KV DCP 4 = 2048): the transferred running state then sits on
+    # a decode block boundary, which is the decode's replay checkpoint, so the
+    # decode can cache it and the next turn can hit there. 0 keeps the
+    # one-token handoff. Prompts shorter than one alignment unit also keep it.
+    "TPU_RAIDEN_HANDOFF_ALIGN_TOKENS": env_int("TPU_RAIDEN_HANDOFF_ALIGN_TOKENS", 0),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
     # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors
