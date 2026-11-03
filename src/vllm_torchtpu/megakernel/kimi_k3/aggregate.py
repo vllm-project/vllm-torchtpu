@@ -128,6 +128,12 @@ class KimiAggregate:
                 "the K3 aggregate engine does not run hot-expert plans "
                 "(K3_HOT_PLAN, K3_REPLICA_PLAN): they change the shared experts"
             )
+        if kernel.prefill_expert_plan:
+            raise NotImplementedError(
+                "the K3 aggregate engine's prefill shares the decode's experts "
+                "and router: place them with decode_expert_plan "
+                "(K3_DECODE_EXPERT_PLAN), not prefill_expert_plan"
+            )
         if config.attention_dp != 1:
             raise NotImplementedError(
                 "the K3 aggregate engine decodes at attention_dp 1"

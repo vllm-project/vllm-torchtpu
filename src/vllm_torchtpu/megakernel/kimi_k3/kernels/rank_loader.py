@@ -462,7 +462,16 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
     rank_dir = RankDir(presharded, rank, layers)
     plan = hot_plan(rank, layers)
     replicas = replica_plan(rank, layers)
-    if _config().decode_expert_parallel == 16:
+    placement = decode_expert_plan(layers)
+    if placement is not None and (plan is not None or replicas is not None):
+        raise ValueError("decode_expert_plan does not combine with hot or replica plans (logical expert ids)")
+    if placement is not None and not split_experts:
+        raise ValueError("decode_expert_plan loads the experts per file (split_experts)")
+    ep = _config().decode_expert_parallel
+    if placement is not None:
+        jobs = [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
+                for job in _planned_expert_parts(presharded, rank_dir, name, rank, placement, layers, ep=ep)]
+    elif ep == 16:
         jobs = list(_ep16_expert_jobs(presharded, rank_dir, rank, layers))
     else:
         jobs = list(_expert_jobs(rank_dir, split_experts))
@@ -486,6 +495,9 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
                 families["latent_norm"] = _hot_table(families["latent_norm"], plan[1])
             if replicas is not None:
                 families["latent_norm"] = _replica_table(families["latent_norm"], replicas[1], replicas[2])
+            if placement is not None:
+                for name in ("router", "router_bias"):
+                    families[name] = planned_router(families[name], placement)
             if attention_dp > 1:
                 families.update(attention_dp_families(families, presharded, rank, layers, attention_dp))
             for name, family in families.items():
@@ -532,48 +544,74 @@ def _sequence_parallel_output(own: np.ndarray, peer_dir: RankDir, name: str, ran
     return np.ascontiguousarray(np.concatenate([h[:, rows] for h in halves], axis=-1))
 
 
-def prefill_expert_plan(layers: int):
-    """The prefill EP16 expert placement (``KernelConfig.prefill_expert_plan``):
-    ``order [layers - 1, 896]``, the logical expert at each physical slot
-    (chip c holds slots 56c..56c+55), or None. A bare name loads from
-    kimi_k3/data."""
-    path = _config().prefill_expert_plan
+def _load_expert_plan(path: str, layers: int):
+    """``order [layers - 1, 896]`` from a plan npz (a bare name loads from
+    kimi_k3/data), or None for an empty path."""
     if not path:
         return None
     order = np.load(_plan_path(path))["order"].astype(np.int64)
     if order.shape != (layers - 1, 896) or any(sorted(row) != list(range(896)) for row in order.tolist()):
-        raise ValueError(f"prefill expert plan {path}: order must be [{layers - 1}, 896] permutations")
+        raise ValueError(f"expert plan {path}: order must be [{layers - 1}, 896] permutations")
     return order
 
 
-def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
-    """``RankDir.regrouped_expert_parts`` for EP16/TP2 with a placement plan:
-    chip ``rank // 2`` holds, per layer, the experts ``order[l, 56 c:56 c + 56]``
-    (from any EP8 group's pre-shard), half the intermediate (quarters
-    2 (rank % 2) and 2 (rank % 2) + 1)."""
+def prefill_expert_plan(layers: int):
+    """The prefill expert placement (``KernelConfig.prefill_expert_plan``):
+    ``order [layers - 1, 896]``, the logical expert at each physical slot
+    (EP16: chip c holds slots 56c..56c+55; EP8: group g holds 112g..112g+111),
+    or None. A bare name loads from kimi_k3/data."""
+    return _load_expert_plan(_config().prefill_expert_plan, layers)
+
+
+def decode_expert_plan(layers: int):
+    """The decode's expert placement (EP8, or EP16 at decode_expert_parallel 16) (``KernelConfig.decode_expert_plan``),
+    as :func:`prefill_expert_plan`; in the aggregate engine it places the
+    experts and router columns the prefill shares."""
+    return _load_expert_plan(_config().decode_expert_plan, layers)
+
+
+def planned_router(family: np.ndarray, order) -> np.ndarray:
+    """``router [L, K, 896]`` / ``router_bias [L, 1, 896]`` in plan order:
+    physical expert p's column is logical expert ``order[l, p]``."""
+    return np.ascontiguousarray(np.take_along_axis(family, order[:, None, :].astype(np.int64), axis=-1))
+
+
+def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers, ep: int = 16):
+    """``RankDir.regrouped_expert_parts`` with a placement plan, per file.
+
+    EP16/TP2: chip ``rank // 2`` holds, per layer, the experts
+    ``order[l, 56 c:56 c + 56]`` (from any EP8 group's pre-shard), half the
+    intermediate (quarters 2 (rank % 2) and 2 (rank % 2) + 1). EP8/TP4: group
+    ``rank // 4`` holds ``order[l, 112 g:112 g + 112]``, quarter ``rank % 4``
+    (the pre-shard's layout for the identity order)."""
     spec = rank_dir.spec(name)
     shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
     dtype = _dtype(spec["dtype"])
-    chip, quarters = rank // 2, (2 * (rank % 2), 2 * (rank % 2) + 1)
+    if ep == 16:
+        chip, held, quarters = rank // 2, 56, (2 * (rank % 2), 2 * (rank % 2) + 1)
+    elif ep == 8:
+        chip, held, quarters = rank // 4, 112, (rank % 4,)
+    else:
+        raise ValueError(f"expert plans need EP8 or EP16, not EP{ep}")
     dirs = {}
 
     def source(group, q):
         key = 4 * group + q
         if key not in dirs:
-            dirs[key] = RankDir(presharded, key, layers)
+            dirs[key] = rank_dir if key == rank else RankDir(presharded, key, layers)
         return dirs[key]
 
     count = len(spec["files"])
-    nbytes = int(np.prod((56,) + shape[2:])) * dtype.itemsize * len(quarters)
+    nbytes = int(np.prod((held,) + shape[2:])) * dtype.itemsize * len(quarters)
     for index, (filename, (lo, hi)) in enumerate(zip(spec["files"], spec["layer_ranges"])):
         def reader(filename=filename, lo=lo, hi=hi):
             # One contiguous read per (layer, expert, quarter), many in flight:
             # memmap page faults over network storage are far slower.
             expert_bytes = int(np.prod(shape[2:])) * dtype.itemsize
-            raw = {q: np.empty((hi - lo, 56, *shape[2:]), dtype) for q in quarters}
+            raw = {q: np.empty((hi - lo, held, *shape[2:]), dtype) for q in quarters}
             jobs = []
             for layer in range(lo, hi):
-                experts = order[layer, 56 * chip:56 * chip + 56]
+                experts = order[layer, held * chip:held * chip + held]
                 for slot, expert in enumerate(experts):
                     group, index = int(expert) // 112, int(expert) % 112
                     for q in quarters:
@@ -581,6 +619,8 @@ def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
                         jobs.append((source(group, q).path / filename, offset, raw[q][layer - lo, slot]))
             with ThreadPoolExecutor(32) as pool:
                 list(pool.map(lambda job: read_into(job[0], job[1], job[2], streams=1), jobs))
+            if len(quarters) == 1:
+                return raw[quarters[0]]
             layers_out = []
             for layer in range(lo, hi):
                 parts = [raw[q][layer - lo] for q in quarters]
@@ -649,6 +689,9 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
         else:
             jobs += [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
                      for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)]
+    elif (plan := prefill_expert_plan(layers)) is not None:  # EP8, placed
+        jobs += [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
+                 for job in _planned_expert_parts(presharded, rank_dir, name, rank, plan, layers, ep=8)]
     else:
         jobs += list(_expert_jobs(rank_dir, split_experts))
     if _config().expert_host_join:
@@ -684,15 +727,13 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
             if name == "m_o":
                 family = _sequence_parallel_output(family, peer_dir, "m_o", rank)
             yield "mla", name, family
-        plan = prefill_expert_plan(layers) if ep == 16 else None
+        plan = prefill_expert_plan(layers) if ep in (8, 16) else None
         for name in PREFILL_MOE_DENSE:
             if name in skip:
                 continue
             family = families[name]
             if plan is not None and name in ("router", "router_bias"):
-                # Physical expert p's router column is logical expert order[l, p].
-                family = np.ascontiguousarray(np.take_along_axis(
-                    family, plan[:, None, :].astype(np.int64), axis=-1))
+                family = planned_router(family, plan)
             yield "moe", name, family
         del families
 
