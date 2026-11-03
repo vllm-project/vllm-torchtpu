@@ -69,6 +69,7 @@ def _runner():
         # (TPU_SAMPLER_VOCAB_PARALLEL / TPU_SAMPLER_FUSED_CHAIN) are off.
         _sampler_light_variants=lambda: [],
         _sampler_fused_chain=False,
+        _sampler_verify_trim_rows=(),
     )
     runner._spec_verify_bucket_reachable = functools.partial(
         TPUModelRunner._spec_verify_bucket_reachable, runner
@@ -215,10 +216,14 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         _sampler_radix_bits=tpu_runner._SAMPLER_LIGHT_DEFAULT_RADIX_BITS,
         _sampler_fused_chain=optional_paths,
         _sampler_verify_trim=optional_paths,
+        _sampler_verify_trim_rows=(),
         _sampler_graph_rng=False,  # TPU_SAMPLER_GRAPH_RNG off: host-drawn uniforms
     )
     runner._sampler_light_variants = functools.partial(
         TPUModelRunner._sampler_light_variants, runner
+    )
+    runner._verify_trim_buckets = functools.partial(
+        TPUModelRunner._verify_trim_buckets, runner
     )
     fused_graphs: list[torch.fx.GraphModule] = []
     runner.spec_sample_verify_fused = functools.partial(

@@ -62,6 +62,9 @@ DCP_AXIS_NAME = "dcp"
 # short enough that a deeper lookahead still pays (−3…−4.5 % at 47k–67k keys
 # per rank, bkvp 32, v7x).
 _DECODE_PACK_OPTS = {"interior_skip": True, "buffer_count": 6}
+# Score blocks of the packed body's manual ring (TPU_STREAMIDX_DECODE_RING):
+# step i fills one while step i - 1's is copied out and step i - 2's lands.
+_DECODE_RING_SCORE_SLOTS = 3
 
 cp_local_to_global = metadata.cp_local_to_global
 cp_local_length = metadata.cp_local_length
@@ -222,6 +225,7 @@ def kernel(
     chunk_idx: int = 0,
     decode_pack: bool = False,
     decode_page_major: bool = False,
+    decode_ring: int = 0,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     scores_hbm_ref = score_refs[-1]
@@ -317,6 +321,9 @@ def kernel(
         and seq_batch_size == 1
         and page_size % 128 == 0
     )
+    # Packed page-major decode as a manual pipeline (TPU_STREAMIDX_DECODE_RING);
+    # see `run_decode_ring`.
+    decode_ring = decode_ring if decode_pack and page_major else 0
 
     q_spec = pl.BlockSpec(
         (pl.BoundedSlice(seq_batch_size * bq_sz), num_q_heads, head_dim),
@@ -657,6 +664,8 @@ def kernel(
         q2w_ref,
         q2_ref,
         w2_ref,
+        p_id=None,
+        before_store=None,
     ):
         """One (q block, kv block) step of the packed decode path.
 
@@ -675,8 +684,11 @@ def kernel(
           q2w_ref: [2, 2 * H, D] u32 staging for the block-diagonal query.
           q2_ref: [8 * H, 2 * D] block-diagonal query, rebuilt once per q block.
           w2_ref: [8, H] f32 weights in query row order, once per q block.
+          p_id: the step; `pl.program_id(0)` under `emit_pipeline`.
+          before_store: runs after the head sum, before the scores are stored.
         """
-        p_id = pl.program_id(0)
+        if p_id is None:
+            p_id = pl.program_id(0)
         batch_start_seq_idx = seq_tile(p_id)
         bq_idx = bq_block(p_id)
         bkv_idx = bkv_block(p_id)
@@ -762,6 +774,8 @@ def kernel(
             mask = jnp.logical_and(k_span < kv_len, k_span <= (q_pos >> shift_comp))
             return jnp.where(mask, acc, -jnp.inf)
 
+        if before_store is not None:
+            before_store()
         if _DECODE_PACK_OPTS["interior_skip"]:
             # Every key of a block before the last one a row can see is
             # visible to all rows: the mask would select `acc` everywhere.
@@ -953,7 +967,165 @@ def kernel(
                 s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
             )
 
+    def run_decode_ring(q_hm_ref, q2w_ref, q2_ref, w2_ref):
+        """The packed decode pass as a manual `decode_ring`-slot pipeline.
+
+        q and weights of the pass's tokens are copied in once, and the weights
+        are laid out once per token offset as the [bq, H] block that a q block
+        starting there reads. Step i waits for its KV slot, and after its head
+        sum, with no branch between, starts step i + decode_ring - 1's page
+        copies and step i - 1's score copy; copies past either end are empty.
+        Their scalar work then shares the block of the MXU and head-sum work.
+        Same operands, same arithmetic, so the same scores as `emit_pipeline`.
+        """
+        # decode_ring is nonzero only with page_major, so SEQ_ALONG_LANE.
+        assert kv_sublane_groups is not None
+        slots, score_slots = decode_ring, _DECODE_RING_SCORE_SLOTS
+        chunk_tokens = scores_hbm_ref.shape[0]
+        chunk_start = start_end_seq_idx_ref[2]
+        chunk_end = chunk_start + chunk_tokens
+        tok_lo = jnp.clip(
+            cu_q_lens_ref[start_end_seq_idx_ref[0]], chunk_start, chunk_end
+        )
+        tok_hi = jnp.clip(
+            cu_q_lens_ref[start_end_seq_idx_ref[1]], chunk_start, chunk_end
+        )
+        num_tok = tok_hi - tok_lo
+        num_steps = metadata_ref.num_steps[chunk_idx]
+        kv_src = (cache_kv_hbm_ref, page_indices_ref, metadata_ref)
+        scores_dst = (
+            scores_hbm_ref,
+            cu_q_lens_ref,
+            metadata_ref,
+            start_end_seq_idx_ref,
+        )
+        w_rows = align_to(chunk_tokens, 8)
+
+        def run_steps(
+            q_res, w_res, w_blk, kv_ring, scores_ring, qw_sems, kv_sems, o_sems
+        ):
+            ring = bref_override.StreamIndexDecodeRing(
+                kv_ring=kv_ring,
+                kv_sems=kv_sems,
+                scores_ring=scores_ring,
+                scores_sems=o_sems,
+                bkv_p=bkv_p,
+                groups=kv_sublane_groups,
+                pages_per_seq=pages_per_seq,
+                bq_sz=bq_sz,
+                num_sublanes=num_sublanes_bkv,
+                chunk_idx=chunk_idx,
+            )
+            q_copy = pltpu.make_async_copy(
+                q_hbm_ref.at[pl.ds(tok_lo, num_tok)],
+                q_res.at[pl.ds(0, num_tok)],
+                qw_sems.at[0],
+            )
+            w_copy = pltpu.make_async_copy(
+                indexer_weights_hbm_ref.at[pl.ds(tok_lo, num_tok)],
+                w_res.at[pl.ds(0, num_tok)],
+                qw_sems.at[1],
+            )
+            q_copy.start()
+            w_copy.start()
+            for p_id in range(slots - 1):
+                ring.copy_kv_in(kv_src, p_id, p_id, p_id < num_steps)
+            w_copy.wait()
+
+            def spread_weights(tile, _):
+                base = pl.multiple_of(tile * 8, 8)
+                w = w_res[pl.ds(base, 16)]
+                for s in range(8):
+                    for t in range(bq_sz):
+                        w_blk[base + s, pl.ds(t, 1)] = w[s + t : s + t + 1]
+
+            lax.fori_loop(0, pl.cdiv(num_tok, 8), spread_weights, None)
+            q_copy.wait()
+
+            def step(p_id, carry):
+                slot, score_slot = carry
+                ring.wait_kv_in(slot)
+
+                def before_store():
+                    ahead = p_id + slots - 1
+                    ring.copy_kv_in(
+                        kv_src,
+                        ahead,
+                        jnp.where(slot == 0, slots - 1, slot - 1),
+                        ahead < num_steps,
+                    )
+                    ring.copy_scores_out(
+                        scores_dst,
+                        p_id - 1,
+                        jnp.where(score_slot == 0, score_slots - 1, score_slot - 1),
+                        p_id > 0,
+                    )
+
+                    @pl.when(p_id >= score_slots)
+                    def _():
+                        ring.wait_scores_out(scores_dst, p_id - score_slots, score_slot)
+
+                q_off = (
+                    jnp.maximum(cu_q_lens_ref[seq_tile(p_id)], chunk_start)
+                    + bq_block(p_id) * bq_sz
+                    - tok_lo
+                )
+                packed_decode_step(
+                    q_res.at[pl.ds(q_off, bq_sz)],
+                    w_blk.at[q_off],
+                    kv_ring.at[slot],
+                    scores_ring.at[score_slot],
+                    q_hm_ref,
+                    q2w_ref,
+                    q2_ref,
+                    w2_ref,
+                    p_id=p_id,
+                    before_store=before_store,
+                )
+                return (
+                    jnp.where(slot == slots - 1, 0, slot + 1),
+                    jnp.where(score_slot == score_slots - 1, 0, score_slot + 1),
+                )
+
+            lax.fori_loop(0, num_steps, step, (jnp.int32(0), jnp.int32(0)))
+            last = num_steps - 1
+            ring.copy_scores_out(scores_dst, last, last % score_slots, True)
+            for d in range(score_slots):
+                p_id = num_steps - score_slots + d
+
+                @pl.when(p_id >= 0)
+                def _(*, p_id=p_id):
+                    ring.wait_scores_out(scores_dst, p_id, p_id % score_slots)
+
+        pl.run_scoped(
+            lambda *scoped: pl.when(num_steps > 0)(
+                functools.partial(run_steps, *scoped)
+            ),
+            pltpu.VMEM((chunk_tokens + bq_sz, num_q_heads, head_dim), q_hbm_ref.dtype),
+            pltpu.VMEM((w_rows + 8, num_q_heads), indexer_weights_hbm_ref.dtype),
+            pltpu.VMEM((w_rows, bq_sz, num_q_heads), indexer_weights_hbm_ref.dtype),
+            pltpu.VMEM(
+                (
+                    slots,
+                    seq_batch_size,
+                    bkv_p * kv_sublane_groups,
+                    kv_packing,
+                    page_size,
+                ),
+                cache_kv_hbm_ref.dtype,
+            ),
+            pltpu.VMEM(
+                (score_slots, bq_sz, prefill_cfg.score_pitch, 128), scores_hbm_ref.dtype
+            ),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((slots,)),
+            pltpu.SemaphoreType.DMA((score_slots,)),
+        )
+
     def _run_all(q_hm_ref=None, wb_ref=None, q2_ref=None, w2_ref=None):
+        if decode_ring:
+            run_decode_ring(q_hm_ref, wb_ref, q2_ref, w2_ref)
+            return
         if prefill_cfg.enabled:
             body = functools.partial(
                 blocked_prefill_step, q_hm_ref=q_hm_ref, wb_ref=wb_ref
@@ -1293,6 +1465,7 @@ def _effective_row_lengths(
         "skip_empty_decode_chunked",
         "decode_pack",
         "decode_page_major",
+        "decode_ring",
         "shared_meta",
         "dcp_axis_name",
     ),
@@ -1328,6 +1501,7 @@ def streamindex_topk(
     final_sc_tie: tuple = (),
     decode_pack: bool = False,
     decode_page_major: bool | None = None,
+    decode_ring: int = 0,
     shared_meta: bool = False,
     dcp_axis_name: str | None = None,
 ) -> jax.Array | tuple[Any, ...]:  # (out, [scores,] [tied])
@@ -1416,6 +1590,12 @@ def streamindex_topk(
         bit; SEQ_ALONG_LANE and FP8 queries only, other passes ignore it.
       decode_page_major: gather those blocks page-major (one contiguous copy
         per page). None follows `decode_pack`. Same scores.
+      decode_ring: run the packed page-major blocks as a manual pipeline with
+        a KV ring this many slots deep instead of `emit_pipeline`: q and
+        weights resident for the call, page copies issued `decode_ring - 1`
+        steps ahead and score copies one step behind, both in the block of
+        the MXU and head-sum work (see `run_decode_ring` in `kernel`). 0
+        keeps `emit_pipeline`. Same indices and scores bit for bit.
       shared_meta: build the per-step inputs every indexer layer derives from
         the same step metadata so XLA keeps one copy per step instead of one
         per layer: the MIXED pass's schedule without its empty-pass cond
@@ -1461,6 +1641,8 @@ def streamindex_topk(
         raise NotImplementedError(
             "return_scores is not supported with enable_early_exit."
         )
+    if decode_ring < 0 or decode_ring == 1:
+        raise ValueError(f"decode_ring must be 0 or at least 2, got {decode_ring}.")
     interleave_c = interleave_size // compression_ratio if cp_size > 1 else 1
 
     if num_kv_pages_per_block is None or num_queries_per_block is None:
@@ -1655,12 +1837,15 @@ def streamindex_topk(
 
         layout_tag = "" if kv_layout == KVLayout.HEAD_ALONG_SUBLANE else "-sal"
         pack, pack_page_major = _pack_flags(case, seq_batch_size, bq_sz)
+        ring = decode_ring if pack and pack_page_major else 0
         if pack:
             buffer_count = max(buffer_count, _DECODE_PACK_OPTS["buffer_count"])
         if pack:
             layout_tag += "-pk"
         if pack_page_major:
             layout_tag += "-pm"
+        if ring:
+            layout_tag += f"-rg{ring}"
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}"
         if chunked:
             # The chunk count is part of the kernel's identity, so a sweep over chunk
@@ -1683,6 +1868,7 @@ def streamindex_topk(
                     chunk_idx=chunk_idx,
                     decode_pack=pack,
                     decode_page_major=pack_page_major,
+                    decode_ring=ring,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -2081,6 +2267,7 @@ SMALL_AG_MAX_TOKENS = 8
         "flat_merge",
         "small_all_gather",
         "decode_pack",
+        "decode_ring",
         "shared_meta",
     ),
 )
@@ -2120,6 +2307,7 @@ def streamindex_topk_dcp(
     flat_merge: bool | None = None,
     small_all_gather: bool | None = None,
     decode_pack: bool = False,
+    decode_ring: int = 0,
     shared_meta: bool = False,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
@@ -2202,6 +2390,7 @@ def streamindex_topk_dcp(
       skip_empty_decode: forwarded to `streamindex_topk`; see there.
       skip_empty_decode_chunked: forwarded to `streamindex_topk`; see there.
       decode_pack: forwarded to `streamindex_topk`; see there. Same result.
+      decode_ring: forwarded to `streamindex_topk`; see there. Same result.
       shared_meta: forwarded to `streamindex_topk`; see there. Same result.
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
@@ -2382,6 +2571,7 @@ def streamindex_topk_dcp(
             skip_empty_decode_chunked=skip_empty_decode_chunked,
             final_sc_tie=tuple(ov_args[:1]) if pin else (),
             decode_pack=decode_pack,
+            decode_ring=decode_ring,
             shared_meta=shared_meta,
             dcp_axis_name=dcp_axis_name if hist_merge else None,
         )
