@@ -813,11 +813,36 @@ def test_query_split_traces_one_graph_for_all_buckets():
 
 
 @pytest.mark.parametrize(
-    "layout",
-    ["shared", "boundary", "decode", "q6", "q6_short", "q6_reordered", "q6_padded"],
+    "tokens,heads,queries,width,layout",
+    [
+        (128, 8, 1, 128, "shared"),
+        (128, 8, 1, 128, "boundary"),
+        (128, 8, 1, 128, "decode"),
+        (288, 64, 6, 128, "grouped"),
+        (96, 32, 6, 128, "grouped"),
+        (48, 16, 6, 128, "short"),
+        (24, 8, 6, 128, "reordered"),
+        (24, 64, 6, 128, "padded"),
+        (15, 64, 5, 128, "grouped"),
+        (21, 16, 7, 128, "grouped"),
+        (18, 8, 3, 128, "grouped"),
+        (32, 32, 4, 128, "grouped"),
+        (16, 64, 8, 128, "grouped"),
+        (256, 8, 16, 128, "grouped"),
+        (24, 32, 6, 256, "grouped"),
+        (24, 64, 2, 128, "grouped"),
+        (25, 16, 6, 128, "grouped"),
+        (6, 64, 6, 128, "masked"),
+        (24, 16, 6, 128, "repeated"),
+        (128, 32, 4, 128, "prefill_padded"),
+        (258, 8, 129, 128, "grouped"),
+        (260, 8, 130, 128, "grouped"),
+    ],
 )
 @pytest.mark.parametrize("banked", [False, True])
-def test_pure_swa_pallas_preserves_cache_addressing(monkeypatch, layout, banked):
+def test_pure_swa_pallas_preserves_cache_addressing(
+    monkeypatch, tokens, heads, queries, width, layout, banked
+):
     """Check union reuse, request-tail patching and per-token windows end to end."""
     import functools
 
@@ -833,36 +858,36 @@ def test_pure_swa_pallas_preserves_cache_addressing(monkeypatch, layout, banked)
             functools.partial(swa_attention.attend_swa, interpret=True),
         )
     rng = np.random.default_rng(17)
-    tokens, heads, dim = 128, 8, 512
-    q6 = layout.startswith("q6")
-    if q6:
-        tokens, heads = 288, 64
+    dim = 512
     values = jnp.asarray(rng.normal(size=(512, dim)), jnp.bfloat16)
     pool = _pack_bf16_words(values).reshape(-1, 128)
     if banked:
         pool = (pool[:512], pool[512:])
-    positions = np.arange(tokens) + 127
-    if q6:
-        positions = np.repeat(np.arange(tokens // 6) * 7 + 127, 6)
-        positions += np.tile(np.arange(6), tokens // 6)
-        if layout == "q6_short":
-            positions[:6] = np.arange(6)
+    positions = np.arange(tokens) + width - 1
+    if queries > 1 and layout != "prefill_padded":
+        positions = (np.arange(tokens) // queries) * 7 + width - 1
+        if layout != "repeated":
+            positions += np.arange(tokens) % queries
+        if layout == "short":
+            positions[:queries] = np.arange(queries)
     elif layout == "boundary":
         positions[37:] = np.arange(tokens - 37) + 300
     elif layout == "decode":
         positions = rng.integers(127, 512, tokens)
-    records = positions[:, None] - 127 + np.arange(128)[None]
-    if q6:
+    records = positions[:, None] - width + 1 + np.arange(width)[None]
+    if queries > 1:
         # Shuffle physical pages, including across the two cache banks.
         pages = rng.permutation(16)
         records = np.where(
             records >= 0, pages[np.maximum(records, 0) // 32] * 32 + records % 32, -1
         )
-        records[-6:] = -1
-        if layout == "q6_reordered":
+        records[-queries:] = -1
+        if layout == "reordered":
             records[[2, 3]] = records[[3, 2]]
-        elif layout == "q6_padded":
+        elif layout in ("padded", "prefill_padded"):
             records[3] = -1
+        elif layout == "masked":
+            records[:] = -1
     else:
         records[-1] = -1
     gathered_sizes = []
@@ -877,20 +902,101 @@ def test_pure_swa_pallas_preserves_cache_addressing(monkeypatch, layout, banked)
     q = jnp.asarray(rng.normal(size=(tokens, heads, dim)), jnp.bfloat16)
     sink = jnp.asarray(rng.normal(size=heads), jnp.float32)
     got = paged_attention_jax(
-        q, pool, pool, records, jnp.empty((tokens, 0), jnp.int32), sink, dim**-0.5
+        q,
+        pool,
+        pool,
+        records,
+        jnp.empty((tokens, 0), jnp.int32),
+        sink,
+        dim**-0.5,
+        query_group_size=queries,
     )
     kv = values[jnp.maximum(records, 0)].astype(jnp.float32)
     scores = jnp.einsum("thd,tkd->thk", q.astype(jnp.float32), kv) * dim**-0.5
     scores = jnp.where((records >= 0)[:, None], scores, -jnp.inf)
     maximum = jnp.maximum(scores.max(-1), sink)
     prob = jnp.exp(scores - maximum[..., None])
-    expected = jnp.einsum("thk,tkd->thd", prob, kv)
+    expected = jnp.einsum(
+        "thk,tkd->thd", prob.astype(jnp.bfloat16).astype(jnp.float32), kv
+    )
     expected /= (prob.sum(-1) + jnp.exp(sink - maximum))[..., None]
     np.testing.assert_allclose(
         np.asarray(got, np.float32), expected, atol=3e-3, rtol=1e-2
     )
     np.testing.assert_array_equal(got[-1], 0)
-    if q6:
+    if queries > 1:
         jax.effects_barrier()
-        expected_rows = 48 * 256 if layout in ("q6", "q6_short") else tokens * 128
+        shares = (
+            3 <= queries <= 129
+            and width == 128
+            and tokens % queries == 0
+            and layout in ("grouped", "short", "masked")
+        )
+        expected_rows = tokens // queries * 256 if shares else tokens * width
+        if layout == "prefill_padded":
+            expected_rows = tokens // 64 * 256
         assert gathered_sizes == [expected_rows]
+        baseline = paged_attention_jax(
+            q, pool, pool, records, jnp.empty((tokens, 0), jnp.int32), sink, dim**-0.5
+        )
+        np.testing.assert_allclose(
+            np.asarray(baseline, np.float32), expected, atol=3e-3, rtol=1e-2
+        )
+        np.testing.assert_allclose(
+            np.asarray(got, np.float32),
+            np.asarray(baseline, np.float32),
+            atol=3e-3,
+            rtol=1e-2,
+        )
+        if not shares:
+            np.testing.assert_array_equal(got, baseline)
+
+
+@pytest.mark.parametrize("banked", [False, True])
+def test_swa_query_group_bridge_keeps_token_count_dynamic(monkeypatch, banked):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
+
+    lib = torch.library.Library("swa_group_bridge_test", "FRAGMENT")
+    lib.define("attend(Tensor q, int group_size) -> Tensor")
+    lib.impl("attend", lambda q, group_size: q.clone(), "CPU")
+    lib.impl("attend", lambda q, group_size: torch.empty_like(q), "Meta")
+    op = torch.ops.swa_group_bridge_test.attend.default
+
+    def bridge(*args):
+        return op(args[0], args[-1])
+
+    monkeypatch.setattr(attention_kernels, "_attention_op", bridge)
+    monkeypatch.setattr(attention_kernels, "_attention_2bank_op", bridge)
+    monkeypatch.setattr(attention_kernels, "_active_gathered_kv", None)
+    cache = SimpleNamespace(raw=torch.zeros((32, 128), dtype=torch.int32))
+    cache.raw_hi = cache.raw.clone() if banked else None
+    graphs = []
+
+    def backend(gm, inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    def forward(q, records):
+        return attention_kernels.paged_attention(
+            q,
+            cache,
+            cache,
+            records,
+            records[:, :0],
+            q.new_zeros(8),
+            512**-0.5,
+            query_group_size=5,
+        )
+
+    compiled = torch.compile(forward, backend=backend, fullgraph=True)
+    for tokens in (15, 25):
+        q = torch.ones((tokens, 8, 512), dtype=torch.bfloat16)
+        records = torch.zeros((tokens, 128), dtype=torch.int32)
+        torch._dynamo.mark_dynamic(q, 0)
+        torch._dynamo.mark_dynamic(records, 0)
+        torch.testing.assert_close(compiled(q, records), q)
+    assert len(graphs) == 1
+    calls = [node for node in graphs[0].graph.nodes if node.target == op]
+    assert len(calls) == 1 and calls[0].args[-1] == 5
