@@ -30,6 +30,7 @@ from vllm.models.deepseek_v41.nvidia import model as upstream
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
 
+from ..common.engram_gate import initialize_engram_gate
 from ..common.mhc import (
     collapse,
     initialize_delayed_mhc,
@@ -132,6 +133,7 @@ class DSparkDeepseekV41Model(nn.Module):
         initialize_cache_ops()
         initialize_delayed_mhc()
         initialize_mhc_post()
+        initialize_engram_gate()
         from .dspark_sampling import initialize_collapse
 
         self._boundary_collapse = initialize_collapse()
