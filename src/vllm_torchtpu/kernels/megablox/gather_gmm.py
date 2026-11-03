@@ -593,8 +593,10 @@ def gather_fused_moe(
 # ---------------------------------------------------------------- combine
 
 
-# Masked combine route entries: (row << _SLOT_BITS) | buffer slot.
+# Masked combine route entries: (row << _SLOT_BITS) | buffer slot, in int32.
 _SLOT_BITS = 12
+# Expert-order rows a masked combine can address.
+MASKED_COMBINE_MAX_ROWS = 1 << (31 - _SLOT_BITS)
 _ISSUE_GROUP = 8
 
 
@@ -732,7 +734,9 @@ def gather_combine(
     if tokens % tile_tokens:
         raise ValueError(f"{tokens=} is not a multiple of {tile_tokens=}")
     routes = tile_tokens * topk
-    if masked and (routes >= 1 << _SLOT_BITS or y_packed.shape[0] // s >= 1 << 19):
+    if masked and (
+        routes >= 1 << _SLOT_BITS or y_packed.shape[0] // s >= MASKED_COMBINE_MAX_ROWS
+    ):
         raise ValueError(
             f"{routes=} or {y_packed.shape[0] // s} rows exceed the entry fields"
         )
@@ -772,3 +776,41 @@ def gather_combine(
         name=f"gather_combine-k_{topk}-s_{s}-tt_{tile_tokens}-m{int(masked)}",
         interpret=pltpu.InterpretParams() if interpret else False,
     )(*prefetch, *operands, y_packed)
+
+
+def gather_combine_in_chunks(
+    y_packed: jax.Array,  # uint32 [rows * S, 128] (gather_fused_moe)
+    positions: jax.Array,  # int32 [tokens, topk]: expert-order row of each route
+    weights: jax.Array,  # BF16 [tokens, topk]
+    *,
+    hidden_size: int,
+    max_routes: int,
+    tile_tokens: int = 64,
+    masked: bool = False,
+    interpret: bool = False,
+) -> jax.Array:
+    """`gather_combine` run on token chunks of at most `max_routes` routes.
+
+    A call scalar-prefetches one int32 per route into SMEM, which bounds the
+    routes a single call takes; every chunk reads the same `y_packed`.
+    """
+    tokens, topk = weights.shape
+    chunk = max_routes // topk // tile_tokens * tile_tokens
+    if not chunk:
+        raise ValueError(f"{max_routes=} holds no {tile_tokens}-token tile")
+    combine = functools.partial(
+        gather_combine,
+        y_packed,
+        hidden_size=hidden_size,
+        tile_tokens=tile_tokens,
+        masked=masked,
+        interpret=interpret,
+    )
+    if tokens <= chunk:
+        return combine(positions, weights)
+    return jnp.concatenate(
+        [
+            combine(positions[start : start + chunk], weights[start : start + chunk])
+            for start in range(0, tokens, chunk)
+        ]
+    )

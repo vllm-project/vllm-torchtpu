@@ -206,6 +206,26 @@ def test_gather_combine_matches_reference():
     np.testing.assert_array_equal(np.asarray(out), np.asarray(want))
 
 
+@pytest.mark.parametrize("masked", [False, True])
+def test_gather_combine_in_chunks_matches_one_call(masked):
+    """A route cap below the batch splits the combine over token tiles."""
+    tokens, topk, hidden, tt = 80, 4, 768, 16
+    kr, ky, km = jax.random.split(jax.random.PRNGKey(8), 3)
+    _, _, positions, weights = _routing(kr, tokens, 16, topk, 0.0)
+    if masked:
+        positions = jnp.where(
+            jax.random.bernoulli(km, 0.7, (tokens, topk)), positions, -1
+        )
+    y = _pack_rows(jax.random.normal(ky, (tokens * topk, hidden)).astype(jnp.bfloat16))
+    kwargs = dict(hidden_size=hidden, tile_tokens=tt, masked=masked, interpret=True)
+    want = G.gather_combine(y, positions, weights, **kwargs)
+    # 2 tiles (32 tokens) per call: chunks of 32, 32 and 16 tokens.
+    got = G.gather_combine_in_chunks(
+        y, positions, weights, max_routes=2 * tt * topk + 1, **kwargs
+    )
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 def test_routed_moe_end_to_end():
     """Routing permutation -> gather_fused_moe -> gather_combine vs the reference."""
     tokens, experts, topk, hidden, inter = 64, 8, 4, 768, 128

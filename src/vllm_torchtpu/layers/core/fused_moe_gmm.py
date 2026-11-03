@@ -68,6 +68,9 @@ _GATHER_GMM = envs.TPU_MOE_GATHER_GMM
 _GATHER_GMM_MIN_TOKENS = envs.TPU_MOE_GATHER_GMM_MIN_TOKENS
 # gather_combine scalar-prefetches one int32 expert-order position per route.
 _GATHER_GMM_MAX_ROUTES = 128 * 1024
+# Batches over that cap take the gather-fused kernels too, the combine in token
+# chunks under it.
+_GATHER_GMM_CHUNKED_COMBINE = envs.TPU_MOE_GATHER_GMM_CHUNKED_COMBINE
 _GATHER_COMBINE_TILE_TOKENS = 64
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
@@ -521,6 +524,7 @@ def can_use_gather_gmm(
     *,
     topk: int,
     rhs_quant_dtype: jnp.dtype | None,
+    masked: bool = False,
 ) -> bool:
     """Shapes and formats `gather_gmm_moe` serves (trace-time predicate).
 
@@ -537,7 +541,9 @@ def can_use_gather_gmm(
         and w2_bias is None
         and num_tokens >= max(_GATHER_GMM_MIN_TOKENS, 1)
         and num_tokens % _GATHER_COMBINE_TILE_TOKENS == 0
-        and num_tokens * topk <= _GATHER_GMM_MAX_ROUTES
+        and (num_tokens * topk <= _GATHER_GMM_MAX_ROUTES or _GATHER_GMM_CHUNKED_COMBINE)
+        # A masked combine packs each route's expert-order row into an entry.
+        and (not masked or num_tokens * topk < gather_gmm.MASKED_COMBINE_MAX_ROWS)
         and hidden_states.dtype == jnp.bfloat16
         and w1.dtype == jnp.float8_e4m3fn
         and w2.dtype == jnp.float8_e4m3fn
@@ -659,11 +665,12 @@ def gather_gmm_moe(
         w2_scale,
         act=activation,
     )
-    return gather_gmm.gather_combine(
+    return gather_gmm.gather_combine_in_chunks(
         down_rows,
         positions.reshape(num_tokens, topk),
         topk_weights,
         hidden_size=hidden,
+        max_routes=_GATHER_GMM_MAX_ROUTES,
         tile_tokens=_GATHER_COMBINE_TILE_TOKENS,
         masked=masked,
     )
@@ -956,6 +963,7 @@ def fused_moe_func(
         w2_bias,
         topk=topk,
         rhs_quant_dtype=rhs_quant_dtype,
+        masked=use_ep or skip_padded_tokens,
     ):
         logger.info_once(
             "Selected gather-fused MoE expert kernels (TPU_MOE_GATHER_GMM)"

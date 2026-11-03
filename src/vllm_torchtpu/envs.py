@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MOE_GATHER_GMM: bool = False
     TPU_MOE_GATHER_GMM_MIN_TOKENS: int = 1024
+    TPU_MOE_GATHER_GMM_CHUNKED_COMBINE: bool = False
     TPU_MOE_TP_EXPERT_SPLIT: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -784,6 +785,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_GATHER_GMM": env_bool("TPU_MOE_GATHER_GMM"),
     "TPU_MOE_GATHER_GMM_MIN_TOKENS": env_nonnegative_int(
         "TPU_MOE_GATHER_GMM_MIN_TOKENS", 1024
+    ),
+    # With TPU_MOE_GATHER_GMM: batches of more than 128 Ki routes (tokens x
+    # top-k) take the gather-fused kernels too, running the combine on token
+    # chunks of at most that many routes (its SMEM-prefetched route table);
+    # without it they keep the grouped-matmul path.
+    "TPU_MOE_GATHER_GMM_CHUNKED_COMBINE": env_bool(
+        "TPU_MOE_GATHER_GMM_CHUNKED_COMBINE"
     ),
     # MoE layers that run without expert parallelism (no
     # --enable-expert-parallel) on a tensor-parallel group, with no data,
