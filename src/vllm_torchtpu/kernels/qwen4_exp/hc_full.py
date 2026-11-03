@@ -14,25 +14,50 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine):
+def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine, inject):
+    refs = iter(refs)
+    take = lambda n: [next(refs) for _ in range(n)]  # noqa: E731
+    x_hbm, *extra_hbm = take(3 if combine else 1)
+    weight_hbm, down_hbm, up_hbm, *inject_hbm = take(4 if inject else 3)
+    # With ``inject`` the kernel emits the combine's gate projection in place
+    # of the normalized input (its only other consumer).
+    mixed_hbm, norm_hbm, *combined_hbm = take(3 if combine else 2)
+    x_vm, *extra_vm = take(3 if combine else 1)
+    # With ``inject`` the gate weight rows follow the down projection's in
+    # ``down_vm``: one matmul yields both (the MXU pads 320 columns anyway).
+    weight_vm, down_vm, up_vm = take(3)
+    mixed_vm, norm_vm, *proj_vm = take(3 if inject else 2)
+    x_sems, *extra_sems = take(3 if combine else 1)
+    weight_sem, down_sem, up_sem, *inject_sem = take(4 if inject else 3)
+    mixed_sems, norm_sems, *combined_sems = take(3 if combine else 2)
     if combine:
-        (x_hbm, block_hbm, gates_hbm, weight_hbm, down_hbm, up_hbm) = refs[:6]
-        (mixed_hbm, norm_hbm, combined_hbm) = refs[6:9]
-        (x_vm, block_vm, gates_vm, weight_vm, down_vm, up_vm, mixed_vm, norm_vm) = refs[
-            9:17
-        ]
-        (x_sems, block_sems, gates_sems, weight_sem, down_sem, up_sem) = refs[17:23]
-        (mixed_sems, norm_sems, combined_sems) = refs[23:]
-    else:
-        (x_hbm, weight_hbm, down_hbm, up_hbm, mixed_hbm, norm_hbm) = refs[:6]
-        (x_vm, weight_vm, down_vm, up_vm, mixed_vm, norm_vm) = refs[6:12]
-        (x_sems, weight_sem, down_sem, up_sem, mixed_sems, norm_sems) = refs[12:]
+        block_hbm, gates_hbm = extra_hbm
+        block_vm, gates_vm = extra_vm
+        block_sems, gates_sems = extra_sems
+        (combined_hbm,) = combined_hbm
+        (combined_sems,) = combined_sems
+    lowrank = down_hbm.shape[0]
+    if inject:
+        (proj_vm,) = proj_vm
+        inject_dma = pltpu.make_async_copy(
+            inject_hbm[0], down_vm.at[pl.ds(lowrank, branches)], inject_sem[0]
+        )
+        inject_dma.start()
     weight_dma = pltpu.make_async_copy(weight_hbm, weight_vm, weight_sem)
-    down_dma = pltpu.make_async_copy(down_hbm, down_vm, down_sem)
+    down_dma = pltpu.make_async_copy(
+        down_hbm, down_vm.at[pl.ds(0, lowrank)] if inject else down_vm, down_sem
+    )
     up_dma = pltpu.make_async_copy(up_hbm, up_vm, up_sem)
     weight_dma.start()
     down_dma.start()
     up_dma.start()
+
+    def wait_norm_output(slot):
+        """Wait for the slot's last ``norm`` (or gate projection) output copy."""
+        out_vm = proj_vm if inject else norm_vm
+        pltpu.make_async_copy(
+            out_vm.at[slot], out_vm.at[slot], norm_sems.at[slot]
+        ).wait()
 
     def input_copies(step, slot):
         rows = pl.ds(step * token_tile, token_tile)
@@ -107,9 +132,7 @@ def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine):
 
             @pl.when(step >= 2)
             def _wait_prior_norm_output():
-                pltpu.make_async_copy(
-                    norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
-                ).wait()
+                wait_norm_output(parity)
 
             def normalize_rows(index, carry):
                 offset = index * 32
@@ -165,20 +188,21 @@ def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine):
 
             @pl.when(step >= 2)
             def _wait_prior_norm_output():
-                pltpu.make_async_copy(
-                    norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
-                ).wait()
+                wait_norm_output(parity)
 
             norm_vm[parity] = norm
-        pltpu.make_async_copy(
-            norm_vm.at[parity],
-            norm_hbm.at[pl.ds(step * token_tile, token_tile)],
-            norm_sems.at[parity],
-        ).start()
+        if not inject:
+            pltpu.make_async_copy(
+                norm_vm.at[parity],
+                norm_hbm.at[pl.ds(step * token_tile, token_tile)],
+                norm_sems.at[parity],
+            ).start()
 
         @pl.when(step == 0)
         def _wait_down():
             down_dma.wait()
+            if inject:
+                inject_dma.wait()
 
         down = jax.lax.dot_general(
             norm,
@@ -186,6 +210,14 @@ def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine):
             dimension_numbers=(((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32,
         ).astype(jnp.bfloat16)
+        if inject:
+            proj_vm[parity] = down[:, lowrank:]
+            pltpu.make_async_copy(
+                proj_vm.at[parity],
+                norm_hbm.at[pl.ds(step * token_tile, token_tile)],
+                norm_sems.at[parity],
+            ).start()
+            down = down[:, :lowrank]
         gate = (down / branches).astype(jnp.bfloat16)
         gate = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16)
 
@@ -229,9 +261,7 @@ def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine):
 
     jax.lax.fori_loop(0, tokens // (2 * token_tile), step_pair, jnp.int32(0))
     for parity in range(2):
-        pltpu.make_async_copy(
-            norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
-        ).wait()
+        wait_norm_output(parity)
         pltpu.make_async_copy(
             mixed_vm.at[parity], mixed_vm.at[parity], mixed_sems.at[parity]
         ).wait()
@@ -240,8 +270,14 @@ def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine):
         pltpu.make_async_copy(x_vm.at[1], x_vm.at[1], combined_sems.at[1]).wait()
 
 
-def _pallas_mix(x, weight, down, up, extra, *, branches, hidden, eps, token_tile, up_t):
-    """The full mix over ``x`` (``extra``: (block, gates) to combine into it first)."""
+def _pallas_mix(
+    x, weight, down, up, extra, inject, *, branches, hidden, eps, token_tile, up_t
+):
+    """The full mix over ``x`` (``extra``: (block, gates) to combine into it first).
+
+    ``inject`` (the combine's [branches, width] gate weight, or ``()``): return the
+    BF16 gate projection ``norm @ inject.T`` [tokens, branches] in place of ``norm``.
+    """
     tokens, width = x.shape
     lowrank = down.shape[0]
     if (
@@ -263,6 +299,10 @@ def _pallas_mix(x, weight, down, up, extra, *, branches, hidden, eps, token_tile
             or gates.dtype != jnp.float32
         ):
             raise ValueError("HC combine requires a BF16 block and FP32 gates")
+    if inject and (
+        inject[0].shape != (branches, width) or inject[0].dtype != jnp.bfloat16
+    ):
+        raise ValueError("HC inject requires a BF16 [branches, width] weight")
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     dma = pltpu.SemaphoreType.DMA
     tiles = [pltpu.VMEM((2, token_tile, width), jnp.bfloat16)]
@@ -274,25 +314,27 @@ def _pallas_mix(x, weight, down, up, extra, *, branches, hidden, eps, token_tile
     scratch = (
         *tiles,
         pltpu.VMEM((width,), jnp.bfloat16),
-        pltpu.VMEM((lowrank, width), jnp.bfloat16),
+        pltpu.VMEM((lowrank + (branches if inject else 0), width), jnp.bfloat16),
         pltpu.VMEM(up.shape, jnp.bfloat16),
         pltpu.VMEM((2, token_tile, hidden), jnp.bfloat16),
         pltpu.VMEM((2, token_tile, width), jnp.bfloat16),
+        *((pltpu.VMEM((2, token_tile, branches), jnp.bfloat16),) if inject else ()),
         *(dma((2,)) for _ in tiles),
         dma,
         dma,
         dma,
+        *((dma,) if inject else ()),
         dma((2,)),
         dma((2,)),
         *((dma((2,)),) if combine else ()),
     )
     out_shape = [
         jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
-        jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((tokens, branches if inject else width), jnp.bfloat16),
     ]
     if combine:
         out_shape.append(jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16))
-    inputs = (x, *extra, weight, down, up)
+    inputs = (x, *extra, weight, down, up, *inject)
     return pl.pallas_call(
         functools.partial(
             _kernel,
@@ -303,6 +345,7 @@ def _pallas_mix(x, weight, down, up, extra, *, branches, hidden, eps, token_tile
             eps=eps,
             up_t=up_t,
             combine=combine,
+            inject=bool(inject),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
@@ -320,14 +363,18 @@ def _pallas_mix(x, weight, down, up, extra, *, branches, hidden, eps, token_tile
 @functools.partial(
     jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile", "up_t")
 )
-def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, up_t=False):
-    """``up_t``: ``up`` is given as its [low rank, width] transpose."""
+def _full_mix(
+    x, weight, down, up, inject=None, *, branches, hidden, eps, token_tile, up_t=False
+):
+    """``up_t``: ``up`` is given as its [low rank, width] transpose. ``inject``: the
+    second output is the gate projection (see ``_pallas_mix``)."""
     return _pallas_mix(
         x,
         weight,
         down,
         up,
         (),
+        () if inject is None else (inject,),
         branches=branches,
         hidden=hidden,
         eps=eps,
@@ -340,7 +387,19 @@ def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, up_t=Fa
     jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile", "up_t")
 )
 def _combine_full_mix(
-    residual, block, gates, weight, down, up, *, branches, hidden, eps, token_tile, up_t
+    residual,
+    block,
+    gates,
+    weight,
+    down,
+    up,
+    inject=None,
+    *,
+    branches,
+    hidden,
+    eps,
+    token_tile,
+    up_t,
 ):
     """``_full_mix(gated_residual(residual, block, gates), ...)`` in one kernel.
 
@@ -353,6 +412,7 @@ def _combine_full_mix(
         down,
         up,
         (block, gates),
+        () if inject is None else (inject,),
         branches=branches,
         hidden=hidden,
         eps=eps,

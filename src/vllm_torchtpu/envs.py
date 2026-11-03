@@ -119,6 +119,7 @@ if TYPE_CHECKING:
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
+    VLLM_TPU_HC_PREFILL_INJECT: bool = False
     VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
     VLLM_TPU_QSA_DCP_Q_GATHER: bool = False
     VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
@@ -792,6 +793,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_HC_PREFILL_WIDE_TILE": env_nonnegative_int(
         "VLLM_TPU_HC_PREFILL_WIDE_TILE", 0
     ),
+    # Prefill HC full mix: project the normalized input onto the combine's gate
+    # weight in the kernel and return that [T, hc] projection instead of writing
+    # the normalized [T, hc * H] input for an XLA projection to read back.
+    "VLLM_TPU_HC_PREFILL_INJECT": env_bool("VLLM_TPU_HC_PREFILL_INJECT"),
     # With VLLM_TPU_QSA_MAIN_KV_DCP: the pair exchanges each rank's heads of
     # the partial attention (all-to-all) instead of all-gathering every
     # partial; half the bytes, bit-identical.

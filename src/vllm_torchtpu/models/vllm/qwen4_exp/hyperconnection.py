@@ -75,17 +75,19 @@ class GatedResidual(common_hc.GatedResidual):
             # Full-mix ops by token tile, widest first.
             tiles = (wide, prefill_full_tile) if wide else (prefill_full_tile,)
             args = (self.hc_count, self.hidden_size, self.hc_norm.variance_epsilon)
+            # The kernel also projects onto the gate weight of this HC's combine.
+            self._prefill_inject = envs.VLLM_TPU_HC_PREFILL_INJECT and hasattr(
+                self, "block_inject_weight"
+            )
+            variant = (self._prefill_full_up_t, self._prefill_inject)
             self._prefill_full_ops = {
-                tile: build_full_mix_op(*args, tile, self._prefill_full_up_t)
-                for tile in tiles
+                tile: build_full_mix_op(*args, tile, *variant) for tile in tiles
             }
             self._prefill_full_op = self._prefill_full_ops[prefill_full_tile]
             if envs.VLLM_TPU_HC_PREFILL_COMBINE_MIX:
                 # Used by the preceding HC's combine_mix (attn -> mlp).
                 self._prefill_combine_full_ops = {
-                    tile: build_combine_full_mix_op(
-                        *args, tile, self._prefill_full_up_t
-                    )
+                    tile: build_combine_full_mix_op(*args, tile, *variant)
                     for tile in tiles
                 }
                 self._prefill_combine_full_op = self._prefill_combine_full_ops[
@@ -225,11 +227,21 @@ class GatedResidual(common_hc.GatedResidual):
 
     def _prefill_weights(self):
         up = self.input_mix_weight_up.weight
-        return (
+        weights = (
             self.hc_norm.weight,
             self.input_mix_weight_down.weight,
             up.t() if self._prefill_full_up_t else up,
         )
+        if self._prefill_inject:
+            weights += (self.block_inject_weight.weight,)
+        return weights
+
+    def _prefill_residual(self, hyper_input, second):
+        """``mix``'s residual pair from a full-mix kernel's second output."""
+        if self._prefill_inject:
+            # The kernel's BF16 gate projection; the gate as ``_residual``.
+            return hyper_input, 2.0 * torch.sigmoid(second.float() / self.hc_count)
+        return self._residual(hyper_input, second)
 
     def mix(self, hyper_input, small_rows=False):
         """Returns ``mixed, (hyper_input, injection)``: the combine's [T, hc] FP32
@@ -252,8 +264,8 @@ class GatedResidual(common_hc.GatedResidual):
             return out, (hyper_input, None)
         if not small_rows and self._prefill_full(hyper_input):
             op = self._prefill_full_ops[self._prefill_tile(hyper_input.shape[0])]
-            mixed, norm = op(hyper_input, *self._prefill_weights())
-            return mixed, self._residual(hyper_input, norm)
+            mixed, second = op(hyper_input, *self._prefill_weights())
+            return mixed, self._prefill_residual(hyper_input, second)
         norm = self._normalize(hyper_input, small_rows)
         gate = F.linear(norm, self.input_mix_weight_down.weight) / self.hc_count
         # TorchTPU can lower BF16 SiLU through BF16 logistic/tanh, rounding
@@ -356,13 +368,13 @@ class GatedResidual(common_hc.GatedResidual):
         ):
             # The merge this HC's combine would run, as the next mix's prologue.
             tile = next_hc._prefill_tile(hyper_input.shape[0])
-            mixed, norm, combined = next_hc._prefill_combine_full_ops[tile](
+            mixed, second, combined = next_hc._prefill_combine_full_ops[tile](
                 hyper_input,
                 block_output,
                 self._injection(residuals),
                 *next_hc._prefill_weights(),
             )
-            return mixed, next_hc._residual(combined, norm)
+            return mixed, next_hc._prefill_residual(combined, second)
         return next_hc.mix(self.combine(block_output, residuals))
 
 
