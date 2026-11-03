@@ -26,6 +26,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
 from ..config import engram_cpu_offload
+from .engram_gate import engram_gate, supports_engram_gate
 from .host_exchange import start_exchange_rows
 from .host_gather import gather_weight_scale
 
@@ -966,6 +967,18 @@ class Engram(upstream.Engram):
         else:
             embedded = self.embed(hash_ids)
         kv = self.wkv(embedded.flatten(-2))
+        if supports_engram_gate(
+            hidden_states,
+            kv,
+            self.q_weight,
+            self.k_weight,
+            token_mask,
+            self.eps,
+            self.clamp_value,
+        ):
+            return engram_gate(
+                hidden_states, kv, self.q_weight, self.k_weight, token_mask
+            )
         keys = (
             kv[:, : self.hc_mult * self.dim]
             .unflatten(-1, (self.hc_mult, self.dim))
