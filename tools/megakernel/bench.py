@@ -72,6 +72,19 @@ def add_arguments(parser, profile: bool = False) -> None:
     )
     prefill.add_argument("--repeats", type=int, default=3)
     prefill.add_argument(
+        "--chain-prefix",
+        action="store_true",
+        help="compute each case's prefix first (--chain-step token steps of a "
+        "separate request on the same blocks), so the timed step reads real KV",
+    )
+    prefill.add_argument("--chain-step", type=int, default=8192)
+    prefill.add_argument(
+        "--fixed-prompts",
+        action="store_true",
+        help="repeat k's prompts are the same token slices in every case (a "
+        "case's prompt is a prefix of a longer case's), for first-token checks",
+    )
+    prefill.add_argument(
         "--token-file",
         default="",
         help="a .npy of int32 token ids: each prompt is a random slice of it "
@@ -343,14 +356,42 @@ def run_prefill(args, records: harness.Records) -> None:
                 prefiller.program.capacity,
             )
         )
-        times = []
+        times, first_tokens = [], []
         for repeat in range(args.repeats + 1):  # the first is a warm-up of this shape
+            if args.fixed_prompts:
+                prompts = []
+                for r in range(count):
+                    fixed = np.random.default_rng(1000 + 16 * repeat + r)
+                    start = int(fixed.integers(0, corpus.size - 262144))
+                    prompts.append(corpus[start : start + prefix + length])
+            else:
+                prompts = [
+                    _prompt_tokens(rng, corpus, prefix + length) for _ in range(count)
+                ]
+            if args.chain_prefix and prefix:
+                # The prefix as its own prompt on the same blocks (untimed): its
+                # pages and final KDA state are what the timed step's hit reads.
+                for r in range(count):
+                    for begin in range(0, prefix, args.chain_step):
+                        size = min(args.chain_step, prefix - begin)
+                        chained = mk.RequestInput(
+                            req_id=f"{tag}-{repeat}-{r}-prefix",
+                            computed=begin,
+                            scheduled=size,
+                            token_ids=prompts[r][:prefix],
+                            num_tokens=prefix,
+                            num_prompt_tokens=prefix,
+                            block_tables=tables[r],
+                        )
+                        bridge.materialize(
+                            prefiller.step(mk.StepInput([chained])).tokens
+                        )
             rows = [
                 mk.RequestInput(
                     req_id=f"{tag}-{repeat}-{r}",
                     computed=prefix,
                     scheduled=length,
-                    token_ids=_prompt_tokens(rng, corpus, prefix + length),
+                    token_ids=prompts[r],
                     num_tokens=prefix + length,
                     num_prompt_tokens=prefix + length,
                     block_tables=tables[r],
@@ -359,8 +400,10 @@ def run_prefill(args, records: harness.Records) -> None:
             ]
             with _trace(args.trace, tag, repeat == args.repeats):
                 started = time.perf_counter()
-                bridge.materialize(prefiller.step(mk.StepInput(rows)).tokens)
+                stepped = prefiller.step(mk.StepInput(rows))
+                bridge.materialize(stepped.tokens)
                 elapsed = 1e3 * (time.perf_counter() - started)
+            first_tokens.append(stepped.tokens[:count, 0].cpu().tolist())
             if repeat:
                 times.append(elapsed)
         ms = statistics.median(times)
@@ -380,4 +423,5 @@ def run_prefill(args, records: harness.Records) -> None:
             ms=round(ms, 2),
             tokens_per_s=round(rate, 1),
             repeats=[round(t, 2) for t in times],
+            first_tokens=first_tokens,
         )
