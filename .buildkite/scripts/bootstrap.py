@@ -39,13 +39,8 @@ import cap_pr_tpu_concurrency
 
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parents[1]
-
-# Job priorities: On-call fix > Post-merge > Pre-merge > Default > Nightly.
-PRIORITY_ONCALL_FIX = 12
-PRIORITY_POST_MERGE = 11
-PRIORITY_PRE_MERGE = 6
-PRIORITY_DEFAULT = 2
-PRIORITY_NIGHTLY = 1
+_CREDENTIAL_HELPER = pathlib.Path("/etc/buildkite-agent/git-credential-github-app")
+_GITHUB_API_URL = "https://api.github.com"
 
 # Max TPU jobs one author's PR builds may have in flight on kube (~2 PRs at ~19 jobs).
 PR_TPU_JOBS_PER_AUTHOR = 40
@@ -55,6 +50,10 @@ PR_TPU_JOBS_PER_AUTHOR = 40
 #
 #   build -> cpu => (gate) -> tests / integration / perf -> verify
 #                                                        -> promote (integration only)
+
+# Each lane is .buildkite/pipeline_<lane>.yml. On gated builds these lanes
+# wait for the cpu lane (their steps depend on ${CPU_GATE} = cpu_checks).
+WAITS_FOR_CPU = {"tests", "integration", "perf", "verify"}
 
 # Lane sets a build can run, each in run order.
 SUITES: dict[str, tuple[str, ...]] = {
@@ -75,7 +74,7 @@ SUITES: dict[str, tuple[str, ...]] = {
 
 
 def choose_suite(ctx: BuildContext, merged_labels: Sequence[str] = ()) -> str:
-    """One readable if-chain. First match wins."""
+    """Return the `SUITES` key for `ctx` (`CI_SUITE` wins; first match wins)."""
     pr_labels = ctx.pr_labels if ctx.is_pr else ()
     skip_labels = pr_labels or (merged_labels if ctx.is_post_merge_webhook else ())
     if ctx.suite_override:
@@ -89,22 +88,38 @@ def choose_suite(ctx: BuildContext, merged_labels: Sequence[str] = ()) -> str:
     return "default"  # PRs, main, torchtpu-nightly
 
 
-@dataclass(frozen=True)
-class Lane:
-    """One pipeline YAML fragment in `.buildkite/`."""
+# Build kind -> (Buildkite job priority, Kueue workload priority class).
+# Nightly builds are unclassed on kube, level with the tpu-inference nightlies.
+PRIORITIES: dict[str, tuple[int, str | None]] = {
+    "oncall-fix": (12, "oncall-fix"),
+    "post-merge": (11, "post-merge"),
+    "pre-merge": (6, "pre-merge"),
+    "other": (2, None),
+    "nightly": (1, None),
+}
 
-    file: str
-    tpu: bool = True  # skipped by cpu-only; waits on cpu_checks when gated
+
+def build_kind(ctx: BuildContext) -> str:
+    """Classify the build into one of the `PRIORITIES` keys."""
+    if ctx.nightly_env or ctx.torchtpu_nightly_env:
+        return "nightly"
+    if ctx.is_pr and "oncall-fix" in ctx.pr_labels:
+        return "oncall-fix"
+    if ctx.is_pr:
+        return "pre-merge"
+    if ctx.branch == "main":
+        return "post-merge"
+    return "other"
 
 
-LANES: dict[str, Lane] = {
-    "build": Lane(".buildkite/pipeline_build.yml", tpu=False),
-    "cpu": Lane(".buildkite/pipeline_cpu.yml", tpu=False),
-    "tests": Lane(".buildkite/pipeline_tests.yml"),
-    "integration": Lane(".buildkite/pipeline_integration.yml"),
-    "perf": Lane(".buildkite/pipeline_perf.yml"),
-    "verify": Lane(".buildkite/pipeline_verify.yml"),
-    "promote": Lane(".buildkite/pipeline_promote.yml", tpu=False),
+ANNOTATIONS: dict[str, str] = {
+    "oncall-fix": (
+        "Runs at on-call priority (`oncall-fix` label): "
+        "ahead of every other build, including main."
+    ),
+    "full-ci": "Runs the full (nightly) suite (`run-full-ci` label).",
+    "perf-eval": "Runs the perf/eval lane (`run-perf-eval` label).",
+    "skip-tpu-ci": "TPU steps not run (`skip-tpu-ci` label); the CPU steps still run.",
 }
 
 # Commit-message, changed-file, and vLLM-pin patterns (.pyrefly-baseline-full.json stays
@@ -115,6 +130,8 @@ _DOCS_ONLY_RE = re.compile(
     r"|^LICENSE$|^\.git-blame-ignore-revs$|^\.pyrefly-baseline\.json$)"
 )
 _MERGED_PR_RE = re.compile(r"\(#([0-9]+)\)$")
+# Keep in sync with .buildkite/pipeline_verify.yml:22 and
+# .buildkite/scripts/nightly_report.sh:74.
 _RELEASE_TAG_RE = re.compile(r"^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$")
 _VLLM_PIN_RE = re.compile(
     r".*vllm @ git\+https://github\.com/vllm-project/vllm\.git@([a-zA-Z0-9.-]+).*"
@@ -123,6 +140,15 @@ _MISSING_VLLM_PIN_ERROR = (
     "ERROR: vLLM commit hash is missing from pyproject.toml. "
     "Cannot proceed without a pinned hash."
 )
+
+
+def is_gated(ctx: BuildContext) -> bool:
+    """True when TPU steps must wait for `cpu_checks` to pass first."""
+    return (
+        ctx.source != "schedule"
+        and "oncall-fix" not in ctx.pr_labels
+        and not bool(_RELEASE_TAG_RE.match(ctx.tag))
+    )
 
 
 class BootstrapError(Exception):
@@ -140,7 +166,7 @@ def _split_labels(raw: str) -> tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Context
+# Context & pure helpers
 # ---------------------------------------------------------------------------
 
 
@@ -163,7 +189,6 @@ class BuildContext:
     suite_override: str
     vllm_commit_override: str
     pr_tpu_concurrency_group_env: str
-    pr_tpu_jobs_per_author: int
 
     @property
     def is_pr(self) -> bool:
@@ -179,6 +204,16 @@ class BuildContext:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> BuildContext:
+        suite_override = env.get("CI_SUITE", "").strip()
+        if env.get("CI_LANES", "").strip() and not suite_override:
+            raise BootstrapError(
+                "ERROR: CI_LANES was removed; set CI_SUITE=<name> "
+                f"(suites: {' '.join(SUITES)})"
+            )
+        if env.get("SKIP_TPU_CI", "").strip():
+            raise BootstrapError(
+                "ERROR: SKIP_TPU_CI was removed; use CI_SUITE=cpu-only"
+            )
         pr_raw = _env_or(env, "BUILDKITE_PULL_REQUEST", "false")
         author = _env_or(
             env,
@@ -198,150 +233,10 @@ class BuildContext:
             author_email=author,
             nightly_env=_env_or(env, "NIGHTLY", "0") == "1",
             torchtpu_nightly_env=_env_or(env, "TORCHTPU_NIGHTLY", "0") == "1",
-            suite_override=env.get("CI_SUITE", "").strip(),
+            suite_override=suite_override,
             vllm_commit_override=env.get("VLLM_COMMIT_HASH_OVERRIDE", ""),
             pr_tpu_concurrency_group_env=env.get("PR_TPU_CONCURRENCY_GROUP", ""),
-            pr_tpu_jobs_per_author=PR_TPU_JOBS_PER_AUTHOR,
         )
-
-
-# ---------------------------------------------------------------------------
-# Pure planning
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Annotation:
-    """A Buildkite build annotation."""
-
-    style: str
-    context: str
-    body: str
-
-
-@dataclass(frozen=True)
-class PriorityPlan:
-    """Priority, Kueue workload class, and per-author PR concurrency group."""
-
-    job_priority: int
-    workload_priority: str | None
-    annotation: Annotation | None
-    pr_tpu_concurrency_group: str | None
-    log_line: str
-
-
-@dataclass(frozen=True)
-class UploadPlan:
-    """Resolved suite, lane files, exported flags, and annotations for upload."""
-
-    suite: str
-    lanes: tuple[str, ...]
-    lane_files: tuple[str, ...]
-    nightly: bool
-    cpu_gate: str
-    omni_image_skip: str
-    annotations: tuple[Annotation, ...]
-
-
-@dataclass(frozen=True)
-class DevBootstrapPlan:
-    """Resolved settings for the `vllm-torchtpu-dev` experimental pipeline."""
-
-    raw_job_priority: str
-    pipeline_file: str
-    branch: str
-    commit: str
-    nightly: bool
-    pr_tpu_concurrency_group: str | None
-
-
-def plan_priority(ctx: BuildContext) -> PriorityPlan:
-    """Compute Buildkite job priority, Kueue class, and PR concurrency group."""
-    workload_priority: str | None = None
-    annotation: Annotation | None = None
-
-    if ctx.nightly_env or ctx.torchtpu_nightly_env:
-        # Nightly build (Lowest priority). Unclassed on kube, level with the
-        # tpu-inference nightlies it shares the TPU queues with, which record no
-        # class either.
-        priority = PRIORITY_NIGHTLY
-        log_line = f"Build type: Nightly - Priority: {priority}"
-    elif ctx.pull_request is not None:
-        if "oncall-fix" in ctx.pr_labels:
-            # PR that fixes a CI or nightly breakage (Highest priority).
-            priority = PRIORITY_ONCALL_FIX
-            workload_priority = "oncall-fix"
-            annotation = Annotation(
-                style="warning",
-                context="oncall-fix",
-                body=(
-                    "Runs at on-call priority (`oncall-fix` label): "
-                    "ahead of every other build, including main."
-                ),
-            )
-            log_line = (
-                f"Build type: On-call fix (PR #{ctx.pull_request}) "
-                f"- Priority: {priority}"
-            )
-        else:
-            priority = PRIORITY_PRE_MERGE
-            workload_priority = "pre-merge"
-            log_line = (
-                f"Build type: Pre-merge (PR #{ctx.pull_request}) - Priority: {priority}"
-            )
-    elif ctx.branch == "main":
-        priority = PRIORITY_POST_MERGE
-        workload_priority = "post-merge"
-        log_line = f"Build type: Post-merge (Main branch) - Priority: {priority}"
-    else:
-        priority = PRIORITY_DEFAULT
-        log_line = f"Build type: General - Priority: {priority}"
-
-    # One concurrency group per author for the TPU steps of their PR builds; see
-    # PR_TPU_JOBS_PER_AUTHOR. Keyed on the commit author's email, which every
-    # webhook build carries: the Buildkite creator is missing whenever the GitHub
-    # account is not linked to a Buildkite user.
-    if ctx.is_pr and ctx.author_email:
-        concurrency_group: str | None = f"tpu-pr/{ctx.author_email.lower()}"
-    elif ctx.pr_tpu_concurrency_group_env:
-        concurrency_group = ctx.pr_tpu_concurrency_group_env
-    else:
-        concurrency_group = None
-
-    return PriorityPlan(
-        job_priority=priority,
-        workload_priority=workload_priority,
-        annotation=annotation,
-        pr_tpu_concurrency_group=concurrency_group,
-        log_line=log_line,
-    )
-
-
-def plan_dev_bootstrap(env: Mapping[str, str]) -> DevBootstrapPlan:
-    """Compute priority and target pipeline file for `vllm-torchtpu-dev`."""
-    # Dev builds are experiments — they must never outrank real CI on a shared
-    # queue. Default to PRIORITY_DEFAULT; override per build with
-    # DEV_JOB_PRIORITY if an experiment needs to jump ahead of nightlies only.
-    # No WORKLOAD_PRIORITY either: on kube an unclassed workload is ordered at 0,
-    # ahead of the nightlies and behind every other kind of build.
-    return DevBootstrapPlan(
-        raw_job_priority=_env_or(env, "DEV_JOB_PRIORITY", str(PRIORITY_DEFAULT)),
-        pipeline_file=_env_or(env, "DEV_PIPELINE_FILE", ".buildkite/pipeline_dev.yml"),
-        branch=_env_or(env, "BUILDKITE_BRANCH", "unknown"),
-        commit=_env_or(env, "BUILDKITE_COMMIT", "unknown"),
-        nightly=_env_or(env, "NIGHTLY", "0") == "1",
-        pr_tpu_concurrency_group=env.get("PR_TPU_CONCURRENCY_GROUP") or None,
-    )
-
-
-def parse_dev_job_priority(raw_priority: str) -> int:
-    """Validate `DEV_JOB_PRIORITY` as an integer at upload time."""
-    try:
-        return int(raw_priority)
-    except ValueError as exc:
-        raise BootstrapError(
-            f"ERROR: invalid DEV_JOB_PRIORITY '{raw_priority}'; expected an integer."
-        ) from exc
 
 
 def has_skip_ci_marker(message: str) -> bool:
@@ -351,9 +246,7 @@ def has_skip_ci_marker(message: str) -> bool:
 
 def only_docs_changed(files: Sequence[str]) -> bool:
     """Return True when `files` is non-empty and every path is non-code/docs."""
-    if not files:
-        return False
-    return all(bool(_DOCS_ONLY_RE.search(path)) for path in files)
+    return bool(files) and all(bool(_DOCS_ONLY_RE.search(path)) for path in files)
 
 
 def parse_merged_pr_number(message: str) -> str | None:
@@ -382,89 +275,6 @@ def read_pinned_vllm_commit(repo_root: pathlib.Path = _REPO_ROOT) -> str:
     return parse_pinned_vllm_commit(pyproject_text)
 
 
-def resolve_vllm_commit_hash(base_hash: str, override: str) -> str:
-    """Apply `VLLM_COMMIT_HASH_OVERRIDE` when non-empty."""
-    return override if override else base_hash
-
-
-def plan_uploads(
-    ctx: BuildContext,
-    *,
-    merged_labels: Sequence[str] = (),
-) -> UploadPlan:
-    """Choose the lane suite, `CPU_GATE`, annotations, and `OMNI_IMAGE_SKIP`."""
-    suite = choose_suite(ctx, merged_labels)
-    if suite not in SUITES:
-        raise BootstrapError(
-            f"ERROR: unknown CI_SUITE '{suite}'; suites are: {' '.join(SUITES)}"
-        )
-    lanes = SUITES[suite]
-    pr_labels = ctx.pr_labels if ctx.is_pr else ()
-    nightly = ctx.nightly_env or (suite == "full" and "run-full-ci" in pr_labels)
-
-    annotations: list[Annotation] = []
-    if not ctx.suite_override:
-        if suite == "cpu-only":
-            annotations.append(
-                Annotation(
-                    style="info",
-                    context="skip-tpu-ci",
-                    body=(
-                        "TPU steps not run (`skip-tpu-ci` label); "
-                        "the CPU steps still run."
-                    ),
-                )
-            )
-        elif suite == "full" and "run-full-ci" in pr_labels:
-            annotations.append(
-                Annotation(
-                    style="info",
-                    context="full-ci",
-                    body="Runs the full (nightly) suite (`run-full-ci` label).",
-                )
-            )
-        elif suite == "full" and not ctx.nightly_env and "run-perf-eval" in pr_labels:
-            annotations.append(
-                Annotation(
-                    style="info",
-                    context="perf-eval",
-                    body="Runs the perf/eval lane (`run-perf-eval` label).",
-                )
-            )
-
-    is_gated = (
-        ctx.source != "schedule"
-        and "oncall-fix" not in ctx.pr_labels
-        and not bool(_RELEASE_TAG_RE.match(ctx.tag))
-    )
-    has_cpu = "cpu" in lanes
-    has_tpu = any(LANES[name].tpu for name in lanes)
-    cpu_gate = "cpu_checks" if (is_gated and has_cpu and has_tpu) else "build_docker"
-
-    # pipeline_build.yml skips the -omni image build when this is non-empty.
-    # Buildkite rejects the upload if a skip reason is over 70 characters.
-    omni_image_skip = (
-        ""
-        if "tests" in lanes
-        else "Only the tests lane uses the -omni image; this build has none."
-    )
-
-    return UploadPlan(
-        suite=suite,
-        lanes=lanes,
-        lane_files=tuple(LANES[name].file for name in lanes),
-        nightly=nightly,
-        cpu_gate=cpu_gate,
-        omni_image_skip=omni_image_skip,
-        annotations=tuple(annotations),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Pipeline upload
-# ---------------------------------------------------------------------------
-
-
 def prepare_upload_yaml(raw_yaml: str, *, job_priority: int, nightly: bool) -> str:
     """Prepend `priority:` and substitute `build.env("NIGHTLY")` when needed."""
     # build.env("NIGHTLY") is evaluated by Buildkite against the build's initial
@@ -474,16 +284,177 @@ def prepare_upload_yaml(raw_yaml: str, *, job_priority: int, nightly: bool) -> s
     return f"priority: {job_priority}\n{body}"
 
 
+# ---------------------------------------------------------------------------
+# Subprocess & GitHub helpers (monkeypatched in tests)
+# ---------------------------------------------------------------------------
+
+
+def _agent(
+    *args: str,
+    input_text: str | None = None,
+    check: bool = True,
+    env: Mapping[str, str] | None = None,
+    cwd: pathlib.Path = _REPO_ROOT,
+) -> subprocess.CompletedProcess[str]:
+    """Run `buildkite-agent` with the given arguments."""
+    return subprocess.run(
+        ["buildkite-agent", *args],
+        cwd=cwd,
+        env=env,
+        input=input_text,
+        stdout=subprocess.PIPE if "--dry-run" in args else None,
+        text=True,
+        check=check,
+    )
+
+
+def _annotate(reason: str, *, env: Mapping[str, str]) -> None:
+    """Post one of the standard `ANNOTATIONS` to the Buildkite build."""
+    style = "warning" if reason == "oncall-fix" else "info"
+    _agent(
+        "annotate",
+        "--style",
+        style,
+        "--context",
+        reason,
+        ANNOTATIONS[reason],
+        env=env,
+    )
+
+
+def _git(
+    *args: str,
+    check: bool = False,
+    env: Mapping[str, str] | None = None,
+    cwd: pathlib.Path = _REPO_ROOT,
+) -> subprocess.CompletedProcess[str]:
+    """Run a `git` command and capture stdout."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL if args[:1] == ("diff",) else None,
+        text=True,
+        check=check,
+    )
+
+
+def _changed_files(ctx: BuildContext, *, env: Mapping[str, str]) -> list[str]:
+    """Return files changed by a PR or non-scheduled commit build."""
+    if ctx.is_pr:
+        print(f"PR detected. Target branch: {ctx.pr_base_branch}")
+        if (
+            _git(
+                "fetch",
+                "origin",
+                ctx.pr_base_branch,
+                "--depth=20",
+                "--quiet",
+                env=env,
+            ).returncode
+            != 0
+        ):
+            print("Base fetch failed")
+        _git("fetch", "origin", ctx.commit, "--depth=20", "--quiet", env=env)
+        diff = _git(
+            "diff",
+            "--name-only",
+            f"origin/{ctx.pr_base_branch}...{ctx.commit}",
+            env=env,
+        )
+        files = [line for line in diff.stdout.splitlines() if line]
+        if files:
+            return files
+        tree = _git(
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-m",
+            ctx.commit,
+            check=True,
+            env=env,
+        )
+        return [line for line in tree.stdout.splitlines() if line]
+
+    if ctx.source != "schedule":
+        # Any other build is of a commit, which on main is the squash merge of
+        # one PR, so its diff against its parent is the whole change. Not a
+        # scheduled build: the nightly tests main as it stands, whatever its
+        # last commit touched.
+        _git("fetch", "origin", ctx.commit, "--depth=2", "--quiet", env=env)
+        diff = _git("diff", "--name-only", f"{ctx.commit}^", ctx.commit, env=env)
+        return [line for line in diff.stdout.splitlines() if line]
+
+    return []
+
+
+def _github_app_token(*, env: Mapping[str, str] | None = None) -> str | None:
+    if not _CREDENTIAL_HELPER.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            [str(_CREDENTIAL_HELPER), "get"],
+            cwd=_REPO_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in proc.stdout.splitlines():
+        if line.startswith("password="):
+            token = line.removeprefix("password=").strip()
+            if token:
+                return token
+    return None
+
+
+def _github_labels(
+    pr_number: str, *, env: Mapping[str, str] | None = None
+) -> tuple[str, ...]:
+    """Read labels of a merged PR from GitHub; return `()` on any failure."""
+    headers = {"Accept": "application/vnd.github+json"}
+    token = _github_app_token(env=env)
+    if token:
+        headers["Authorization"] = f"token {token}"
+    url = (
+        f"{_GITHUB_API_URL.rstrip('/')}/repos/"
+        f"vllm-project/vllm-torchtpu/issues/{pr_number}/labels"
+    )
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            items = json.loads(resp.read().decode("utf-8"))
+    except (
+        OSError,
+        urllib.error.URLError,
+        http.client.HTTPException,
+        ValueError,
+    ):
+        return ()
+    if not isinstance(items, list):
+        return ()
+    return tuple(
+        item["name"]
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    )
+
+
 def upload_with_priority(
     yaml_file: str,
     *,
-    repo_root: pathlib.Path,
+    repo_root: pathlib.Path = _REPO_ROOT,
     job_priority: int,
     nightly: bool,
     pr_tpu_concurrency_group: str | None,
-    pr_tpu_jobs_per_author: int,
+    pr_tpu_jobs_per_author: int = PR_TPU_JOBS_PER_AUTHOR,
     env: Mapping[str, str],
-    effects: BootstrapEffects,
 ) -> None:
     """Upload one pipeline YAML file with priority and optional PR TPU capping."""
     print(f"--- :pipeline: Uploading {yaml_file} with priority {job_priority}")
@@ -495,10 +466,19 @@ def upload_with_priority(
     # resolved), the group is added, and the result is uploaded as is. If any of
     # that fails the file goes up uncapped rather than failing the build.
     if pr_tpu_concurrency_group:
-        dry_run_json = effects.dry_run_upload(payload, env=env)
-        if dry_run_json is not None:
+        dry_run = _agent(
+            "pipeline",
+            "upload",
+            "--dry-run",
+            "--format",
+            "json",
+            input_text=payload,
+            check=False,
+            env=env,
+        )
+        if dry_run.returncode == 0 and dry_run.stdout is not None:
             try:
-                pipeline = json.loads(dry_run_json)
+                pipeline = json.loads(dry_run.stdout)
                 if not isinstance(pipeline, dict):
                     raise TypeError(
                         "expected JSON object from --dry-run, "
@@ -516,7 +496,13 @@ def upload_with_priority(
                     file=sys.stderr,
                 )
             else:
-                effects.upload_pipeline(capped, no_interpolation=True, env=env)
+                _agent(
+                    "pipeline",
+                    "upload",
+                    "--no-interpolation",
+                    input_text=capped,
+                    env=env,
+                )
                 return
         print(
             f"WARNING: could not put {yaml_file} in {pr_tpu_concurrency_group}; "
@@ -524,211 +510,11 @@ def upload_with_priority(
             file=sys.stderr,
         )
 
-    effects.upload_pipeline(payload, no_interpolation=False, env=env)
+    _agent("pipeline", "upload", input_text=payload, env=env)
 
 
 # ---------------------------------------------------------------------------
-# Side effects
-# ---------------------------------------------------------------------------
-
-
-class BootstrapEffects:
-    """Thin IO layer isolating `buildkite-agent`, `git`, and GitHub API calls."""
-
-    def __init__(
-        self,
-        repo_root: pathlib.Path = _REPO_ROOT,
-        credential_helper: pathlib.Path = pathlib.Path(
-            "/etc/buildkite-agent/git-credential-github-app"
-        ),
-        credential_timeout: float = 10.0,
-        github_api_url: str = "https://api.github.com",
-    ) -> None:
-        self.repo_root = repo_root
-        self.credential_helper = credential_helper
-        self.credential_timeout = credential_timeout
-        self.github_api_url = github_api_url
-
-    def set_metadata(self, key: str, value: str, *, env: Mapping[str, str]) -> None:
-        subprocess.run(
-            ["buildkite-agent", "meta-data", "set", key, value],
-            cwd=self.repo_root,
-            env=env,
-            check=True,
-        )
-
-    def annotate(self, annotation: Annotation, *, env: Mapping[str, str]) -> None:
-        subprocess.run(
-            [
-                "buildkite-agent",
-                "annotate",
-                "--style",
-                annotation.style,
-                "--context",
-                annotation.context,
-                annotation.body,
-            ],
-            cwd=self.repo_root,
-            env=env,
-            check=True,
-        )
-
-    def dry_run_upload(self, content: str, *, env: Mapping[str, str]) -> str | None:
-        proc = subprocess.run(
-            ["buildkite-agent", "pipeline", "upload", "--dry-run", "--format", "json"],
-            cwd=self.repo_root,
-            env=env,
-            input=content,
-            stdout=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        return proc.stdout if proc.returncode == 0 else None
-
-    def upload_pipeline(
-        self,
-        content: str,
-        *,
-        no_interpolation: bool,
-        env: Mapping[str, str],
-    ) -> None:
-        cmd = ["buildkite-agent", "pipeline", "upload"]
-        if no_interpolation:
-            cmd.append("--no-interpolation")
-        subprocess.run(
-            cmd, cwd=self.repo_root, env=env, input=content, text=True, check=True
-        )
-
-    def pr_changed_files(
-        self, base_branch: str, commit: str, *, env: Mapping[str, str]
-    ) -> list[str]:
-        fetch_base = subprocess.run(
-            ["git", "fetch", "origin", base_branch, "--depth=20", "--quiet"],
-            cwd=self.repo_root,
-            env=env,
-            check=False,
-        )
-        if fetch_base.returncode != 0:
-            print("Base fetch failed")
-        subprocess.run(
-            ["git", "fetch", "origin", commit, "--depth=20", "--quiet"],
-            cwd=self.repo_root,
-            env=env,
-            check=False,
-        )
-        diff = subprocess.run(
-            ["git", "diff", "--name-only", f"origin/{base_branch}...{commit}"],
-            cwd=self.repo_root,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
-        files = [line for line in diff.stdout.splitlines() if line]
-        if files:
-            return files
-        tree = subprocess.run(
-            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", commit],
-            cwd=self.repo_root,
-            env=env,
-            stdout=subprocess.PIPE,
-            text=True,
-            check=True,
-        )
-        return [line for line in tree.stdout.splitlines() if line]
-
-    def commit_changed_files(self, commit: str, *, env: Mapping[str, str]) -> list[str]:
-        subprocess.run(
-            ["git", "fetch", "origin", commit, "--depth=2", "--quiet"],
-            cwd=self.repo_root,
-            env=env,
-            check=False,
-        )
-        diff = subprocess.run(
-            ["git", "diff", "--name-only", f"{commit}^", commit],
-            cwd=self.repo_root,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
-        return [line for line in diff.stdout.splitlines() if line]
-
-    def vllm_upstream_head(self, *, env: Mapping[str, str]) -> str:
-        proc = subprocess.run(
-            ["git", "ls-remote", "https://github.com/vllm-project/vllm.git", "HEAD"],
-            cwd=self.repo_root,
-            env=env,
-            stdout=subprocess.PIPE,
-            text=True,
-            check=True,
-        )
-        tokens = proc.stdout.split()
-        return tokens[0] if tokens else ""
-
-    def _github_app_token(self, *, env: Mapping[str, str]) -> str | None:
-        if not self.credential_helper.is_file():
-            return None
-        try:
-            proc = subprocess.run(
-                [str(self.credential_helper), "get"],
-                cwd=self.repo_root,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=self.credential_timeout,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        for line in proc.stdout.splitlines():
-            if line.startswith("password="):
-                token = line.removeprefix("password=").strip()
-                if token:
-                    return token
-        return None
-
-    def merged_pr_labels(
-        self, pr_number: str, *, env: Mapping[str, str]
-    ) -> tuple[str, ...]:
-        # Labels of the PR a post-merge build on main merged. They do not reach
-        # the build, so they are read from GitHub by the PR number GitHub puts at
-        # the end of a squash commit's subject, with a token from the agent's
-        # GitHub App helper when it has one. Any failure returns empty and the
-        # build runs everything.
-        headers = {"Accept": "application/vnd.github+json"}
-        token = self._github_app_token(env=env)
-        if token:
-            headers["Authorization"] = f"token {token}"
-        url = (
-            f"{self.github_api_url.rstrip('/')}/repos/"
-            f"vllm-project/vllm-torchtpu/issues/{pr_number}/labels"
-        )
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                items = json.loads(resp.read().decode("utf-8"))
-        except (
-            OSError,
-            urllib.error.URLError,
-            http.client.HTTPException,
-            ValueError,
-        ):
-            return ()
-        if not isinstance(items, list):
-            return ()
-        return tuple(
-            item["name"]
-            for item in items
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        )
-
-
-# ---------------------------------------------------------------------------
-# Orchestration & CLI
+# Entry points
 # ---------------------------------------------------------------------------
 
 
@@ -736,48 +522,33 @@ def run_bootstrap(
     env: Mapping[str, str] | None = None,
     *,
     repo_root: pathlib.Path = _REPO_ROOT,
-    effects: BootstrapEffects | None = None,
 ) -> int:
     """Execute the full Buildkite bootstrap flow and return an exit status."""
     child_env = dict(os.environ if env is None else env)
-    effects = BootstrapEffects(repo_root=repo_root) if effects is None else effects
     ctx = BuildContext.from_env(child_env)
 
+    # 1. Kind and priority (metadata).
     print("--- Determining job priority", file=sys.stderr)
-    priority_plan = plan_priority(ctx)
-    print(priority_plan.log_line, file=sys.stderr)
-
-    child_env["JOB_PRIORITY"] = str(priority_plan.job_priority)
-    effects.set_metadata("JOB_PRIORITY", str(priority_plan.job_priority), env=child_env)
+    kind = build_kind(ctx)
+    job_priority, workload_priority = PRIORITIES[kind]
+    print(f"Build type: {kind} - Priority: {job_priority}", file=sys.stderr)
+    child_env["JOB_PRIORITY"] = str(job_priority)
+    _agent("meta-data", "set", "JOB_PRIORITY", str(job_priority), env=child_env)
     # The kube launcher submits every workload of the build at this Kueue
     # priority class (ci-infra launch.py). None leaves them unclassed, at 0.
-    if priority_plan.workload_priority is not None:
-        effects.set_metadata(
-            "WORKLOAD_PRIORITY", priority_plan.workload_priority, env=child_env
+    if workload_priority is not None:
+        _agent(
+            "meta-data", "set", "WORKLOAD_PRIORITY", workload_priority, env=child_env
         )
-    if priority_plan.annotation is not None:
-        effects.annotate(priority_plan.annotation, env=child_env)
-    if priority_plan.pr_tpu_concurrency_group is not None:
-        child_env["PR_TPU_CONCURRENCY_GROUP"] = priority_plan.pr_tpu_concurrency_group
+    if kind == "oncall-fix":
+        _annotate("oncall-fix", env=child_env)
 
+    # 2. Skip checks ([skip ci], docs-only).
     print("--- :git: Checking if CI build should be skipped")
     if has_skip_ci_marker(ctx.message):
         print("Commit message contains [skip ci]. Skipping build.")
         return 0
-
-    changed_files: list[str] = []
-    if ctx.is_pr:
-        print(f"PR detected. Target branch: {ctx.pr_base_branch}")
-        changed_files = effects.pr_changed_files(
-            ctx.pr_base_branch, ctx.commit, env=child_env
-        )
-    elif ctx.source != "schedule":
-        # Any other build is of a commit, which on main is the squash merge of
-        # one PR, so its diff against its parent is the whole change. Not a
-        # scheduled build: the nightly tests main as it stands, whatever its
-        # last commit touched.
-        changed_files = effects.commit_changed_files(ctx.commit, env=child_env)
-
+    changed_files = _changed_files(ctx, env=child_env)
     if changed_files:
         print("Files changed:")
         print("\n".join(changed_files))
@@ -786,45 +557,80 @@ def run_bootstrap(
             return 0
         print("Code files changed. Proceeding with pipeline upload.")
 
+    # 3. vLLM commit.
     print("--- Starting Buildkite Bootstrap")
     if ctx.is_integration:
-        base_vllm_hash = effects.vllm_upstream_head(env=child_env)
+        tokens = _git(
+            "ls-remote",
+            "https://github.com/vllm-project/vllm.git",
+            "HEAD",
+            check=True,
+            env=child_env,
+        ).stdout.split()
+        base_vllm_hash = tokens[0] if tokens else ""
     else:
         base_vllm_hash = read_pinned_vllm_commit(repo_root)
-
-    vllm_commit_hash = resolve_vllm_commit_hash(
-        base_vllm_hash, ctx.vllm_commit_override
-    )
-    effects.set_metadata("VLLM_COMMIT_HASH", vllm_commit_hash, env=child_env)
+    vllm_commit_hash = ctx.vllm_commit_override or base_vllm_hash
+    _agent("meta-data", "set", "VLLM_COMMIT_HASH", vllm_commit_hash, env=child_env)
     print(f"Using vLLM commit: {vllm_commit_hash}")
 
+    # 4. Suite selection and annotations.
     merged_labels: tuple[str, ...] = ()
     if ctx.is_post_merge_webhook:
         pr_num = parse_merged_pr_number(ctx.message)
         if pr_num is not None:
-            merged_labels = effects.merged_pr_labels(pr_num, env=child_env)
+            merged_labels = _github_labels(pr_num, env=child_env)
+    suite = choose_suite(ctx, merged_labels)
+    if suite not in SUITES:
+        raise BootstrapError(
+            f"ERROR: unknown CI_SUITE '{suite}'; suites are: {' '.join(SUITES)}"
+        )
+    lanes = SUITES[suite]
+    pr_labels = ctx.pr_labels if ctx.is_pr else ()
+    if not ctx.suite_override:
+        if suite == "cpu-only":
+            _annotate("skip-tpu-ci", env=child_env)
+        elif suite == "full" and "run-full-ci" in pr_labels:
+            _annotate("full-ci", env=child_env)
+        elif suite == "full" and not ctx.nightly_env and "run-perf-eval" in pr_labels:
+            _annotate("perf-eval", env=child_env)
 
-    upload_plan = plan_uploads(ctx, merged_labels=merged_labels)
-    if upload_plan.nightly:
+    # 5. Env exports (NIGHTLY, CPU_GATE, OMNI_IMAGE_SKIP, PR_TPU_CONCURRENCY_GROUP).
+    nightly = ctx.nightly_env or "run-full-ci" in pr_labels
+    if nightly:
         child_env["NIGHTLY"] = "1"
-    child_env["CPU_GATE"] = upload_plan.cpu_gate
-    child_env["OMNI_IMAGE_SKIP"] = upload_plan.omni_image_skip
-    for annotation in upload_plan.annotations:
-        effects.annotate(annotation, env=child_env)
+    waits_for_cpu = (
+        is_gated(ctx)
+        and "cpu" in lanes
+        and any(lane in WAITS_FOR_CPU for lane in lanes)
+    )
+    child_env["CPU_GATE"] = "cpu_checks" if waits_for_cpu else "build_docker"
+    # pipeline_build.yml skips the -omni image build when this is non-empty.
+    # Buildkite rejects the upload if a skip reason is over 70 characters.
+    child_env["OMNI_IMAGE_SKIP"] = (
+        ""
+        if "tests" in lanes
+        else "Only the tests lane uses the -omni image; this build has none."
+    )
+    concurrency_group = (
+        f"tpu-pr/{ctx.author_email.lower()}"
+        if (ctx.is_pr and ctx.author_email)
+        else (ctx.pr_tpu_concurrency_group_env or None)
+    )
+    if concurrency_group is not None:
+        child_env["PR_TPU_CONCURRENCY_GROUP"] = concurrency_group
 
-    # Buildkite prepends each uploaded file right after bootstrap, so upload
-    # the suite's lane files in reverse to run them in SUITES[suite] order.
-    for lane_file in reversed(upload_plan.lane_files):
+    # 6. Upload loop (reversed because Buildkite prepends each upload after bootstrap).
+    for lane in reversed(lanes):
+        lane_file = f".buildkite/pipeline_{lane}.yml"
         print(f"Uploading {lane_file}")
         upload_with_priority(
             lane_file,
             repo_root=repo_root,
-            job_priority=priority_plan.job_priority,
-            nightly=upload_plan.nightly,
-            pr_tpu_concurrency_group=priority_plan.pr_tpu_concurrency_group,
-            pr_tpu_jobs_per_author=ctx.pr_tpu_jobs_per_author,
+            job_priority=job_priority,
+            nightly=nightly,
+            pr_tpu_concurrency_group=concurrency_group,
             env=child_env,
-            effects=effects,
         )
 
     print("--- Buildkite Bootstrap Finished")
@@ -835,41 +641,50 @@ def run_bootstrap_dev(
     env: Mapping[str, str] | None = None,
     *,
     repo_root: pathlib.Path = _REPO_ROOT,
-    effects: BootstrapEffects | None = None,
 ) -> int:
     """Execute the `vllm-torchtpu-dev` bootstrap flow (`bootstrap_dev.sh`)."""
     child_env = dict(os.environ if env is None else env)
-    effects = BootstrapEffects(repo_root=repo_root) if effects is None else effects
-
     vllm_commit_hash = read_pinned_vllm_commit(repo_root)
-    effects.set_metadata("VLLM_COMMIT_HASH", vllm_commit_hash, env=child_env)
+    _agent("meta-data", "set", "VLLM_COMMIT_HASH", vllm_commit_hash, env=child_env)
     print(f"Using vLLM commit: {vllm_commit_hash}")
 
-    dev_plan = plan_dev_bootstrap(child_env)
-    child_env["JOB_PRIORITY"] = dev_plan.raw_job_priority
-    effects.set_metadata("JOB_PRIORITY", dev_plan.raw_job_priority, env=child_env)
-    print(f"--- Dev build priority: {dev_plan.raw_job_priority}")
+    # Dev builds are experiments — they must never outrank real CI on a shared
+    # queue. Default to PRIORITIES["other"][0] (2); override per build with
+    # DEV_JOB_PRIORITY if an experiment needs to jump ahead of nightlies only.
+    raw_priority = _env_or(child_env, "DEV_JOB_PRIORITY", str(PRIORITIES["other"][0]))
+    child_env["JOB_PRIORITY"] = raw_priority
+    _agent("meta-data", "set", "JOB_PRIORITY", raw_priority, env=child_env)
+    print(f"--- Dev build priority: {raw_priority}")
 
-    if not (repo_root / dev_plan.pipeline_file).is_file():
+    pipeline_file = _env_or(
+        child_env, "DEV_PIPELINE_FILE", ".buildkite/pipeline_dev.yml"
+    )
+    if not (repo_root / pipeline_file).is_file():
+        branch = _env_or(child_env, "BUILDKITE_BRANCH", "unknown")
+        commit = _env_or(child_env, "BUILDKITE_COMMIT", "unknown")
         print(
-            f"ERROR: dev pipeline file '{dev_plan.pipeline_file}' not found on "
-            f"branch '{dev_plan.branch}' at commit {dev_plan.commit}. "
+            f"ERROR: dev pipeline file '{pipeline_file}' not found on "
+            f"branch '{branch}' at commit {commit}. "
             "Create it on your branch, or point DEV_PIPELINE_FILE at an existing "
             "file."
         )
         return 1
 
-    print(f"--- :pipeline: Uploading {dev_plan.pipeline_file}")
-    job_priority = parse_dev_job_priority(dev_plan.raw_job_priority)
+    try:
+        job_priority = int(raw_priority)
+    except ValueError as exc:
+        raise BootstrapError(
+            f"ERROR: invalid DEV_JOB_PRIORITY '{raw_priority}'; expected an integer."
+        ) from exc
+
+    print(f"--- :pipeline: Uploading {pipeline_file}")
     upload_with_priority(
-        dev_plan.pipeline_file,
+        pipeline_file,
         repo_root=repo_root,
         job_priority=job_priority,
-        nightly=dev_plan.nightly,
-        pr_tpu_concurrency_group=dev_plan.pr_tpu_concurrency_group,
-        pr_tpu_jobs_per_author=PR_TPU_JOBS_PER_AUTHOR,
+        nightly=_env_or(child_env, "NIGHTLY", "0") == "1",
+        pr_tpu_concurrency_group=child_env.get("PR_TPU_CONCURRENCY_GROUP") or None,
         env=child_env,
-        effects=effects,
     )
     print("--- Buildkite Dev Bootstrap Finished")
     return 0

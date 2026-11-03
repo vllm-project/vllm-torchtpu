@@ -27,9 +27,10 @@ x-kube-plugin: &kube_plugin
     podTemplate: tpu-launcher
 
 x-tpu-step-defaults: &tpu_step
+  # bootstrap.py always sets CPU_GATE, so no fallback is needed.
   depends_on:
     - "build_docker"
-    - "${CPU_GATE:-build_docker}"
+    - "${CPU_GATE}"
   # Covers queueing too: the agent pod starts at once and waits inside the
   # step, so this is the launcher's whole budget, not a test's length.
   timeout_in_minutes: 1440
@@ -137,7 +138,7 @@ steps:
         <<: *tpu_step
         depends_on:
           - "build_docker_omni"
-          - "${CPU_GATE:-build_docker_omni}"
+          - "${CPU_GATE}"
         if: 'build.env("NIGHTLY") != "1"'
         env:
           SHAPE: *shape_single
@@ -228,7 +229,7 @@ steps:
         <<: *tpu_step
         depends_on:
           - "build_docker_omni"
-          - "${CPU_GATE:-build_docker_omni}"
+          - "${CPU_GATE}"
         if: 'build.env("NIGHTLY") == "1"'
         env:
           SHAPE: *shape_single
@@ -248,7 +249,7 @@ steps:
         <<: *tpu_step
         depends_on:
           - "build_docker_omni"
-          - "${CPU_GATE:-build_docker_omni}"
+          - "${CPU_GATE}"
         if: 'build.env("NIGHTLY") == "1"'
         env:
           SHAPE: *shape_multi
