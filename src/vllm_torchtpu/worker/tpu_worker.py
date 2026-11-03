@@ -364,9 +364,14 @@ class TPUWorker(WorkerBase):
                 # requires MASTER_PORT, chosen once by the parent's shared
                 # slice preparation and inherited by all local workers.
                 os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            elif parsed.scheme == "env":
+                # vLLM's external_launcher executor: the launcher (torchrun or
+                # similar) already exported MASTER_ADDR and MASTER_PORT, which
+                # torch.distributed and the PjRt bootstrap read from there.
+                pass
             else:
                 raise ValueError(
-                    "Expected tcp://<host>:<port> or file://<path> "
+                    "Expected tcp://<host>:<port>, file://<path> or env:// "
                     f"distributed_init_method, got: {dist_init_method!r}"
                 )
             if pcp_size > 1:
