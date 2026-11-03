@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--samples", default=1000, type=int)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--candidate", choices=("gate", "post32"), default="gate")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(gate.ROOT / "src"))
@@ -119,7 +120,28 @@ def main():
     def fake_post(x, residual, post, comb):
         return torch.empty_like(residual)
 
-    def wrap(op, terminal):
+    if args.candidate == "post32":
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+            deepseek_v4_mhc_op as post_bridge,
+        )
+
+        with set_vllm_model_wrapper_context(mesh=mesh):
+            post_op = post_bridge.get_mhc_post_op()
+
+        def post32_jax(
+            x: jax.Array, residual: jax.Array, post: jax.Array, comb: jax.Array
+        ) -> jax.Array:
+            return post_kernel.mhc_post(x, residual, post, comb, token_block_size=32)
+
+        post32_op = pallas.jax_op(
+            "pallas::dsv41_mhc_terminal_post32_bench",
+            post32_jax,
+            mesh=mesh,
+            input_partition_specs=(jax.sharding.PartitionSpec(),) * 4,
+        )
+        post32_op.register_fake(fake_post)
+
+    def wrap(op, terminal, terminal_op):
         def call(*xs):
             (
                 x0,
@@ -172,7 +194,7 @@ def main():
                 1e-20,
             )
             if terminal:
-                residual = post_op(
+                residual = terminal_op(
                     x0, second[0].view(288, 4, 5120), second[1], second[2]
                 )
                 return first[3], second[3], residual, second[4]
@@ -180,14 +202,27 @@ def main():
 
         return call
 
+    variants = (
+        (("native", native_op, post_op), ("pallas", candidate_op, post_op))
+        if args.candidate == "gate"
+        else (("native", native_op, post_op), ("pallas", native_op, post32_op))
+    )
+    boundaries = (
+        (("public", False), ("terminal", True))
+        if args.candidate == "gate"
+        else (("terminal", True),)
+    )
     funcs = {
         label: {
             name: torch.compile(
-                wrap(op, terminal), backend="tpu", fullgraph=True, dynamic=False
+                wrap(op, terminal, terminal_op),
+                backend="tpu",
+                fullgraph=True,
+                dynamic=False,
             )
-            for name, op in (("native", native_op), ("pallas", candidate_op))
+            for name, op, terminal_op in variants
         }
-        for label, terminal in (("public", False), ("terminal", True))
+        for label, terminal in boundaries
     }
     result = {
         "runtime": {
@@ -199,6 +234,7 @@ def main():
             "outputs or original terminal mhc_post consuming post/comb; "
             "sublayer inputs are independent, no attention/MoE or full model"
         ),
+        "candidate": args.candidate,
         "source_sha256": {
             str(p.relative_to(gate.ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in (
