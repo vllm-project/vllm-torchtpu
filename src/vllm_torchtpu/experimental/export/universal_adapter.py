@@ -634,6 +634,78 @@ def mtp_draft_tensors(model: nn.Module) -> dict[str, Any]:
 _MAX_CONSTANT_ELEMENTS = 4096
 
 
+# Per-rank constant naming the rank's slice of a `RowParallelLinear` input.
+_TP_RANK_BUFFER = "export_tp_rank"
+
+
+def _patch_row_parallel_input_split(model: nn.Module) -> int:
+    """Selects each `RowParallelLinear`'s input slice by a per-rank constant.
+
+    With `input_is_parallel=False` the layer takes the full input and keeps
+    `split[self.tp_rank]`, a Python int the trace bakes into the rank's module,
+    while every device runs the one module; Muse Spark's `post_expert_proj` is
+    such a layer. Each one gains a `[1]` buffer holding its rank, a constant the
+    export lays out per device, and its forward picks the slice with it. A layer
+    with a bias is refused: only rank 0 adds it, which the trace bakes as well.
+    Returns the number of layers patched.
+    """
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+        model_parallel_is_initialized,
+    )
+    from vllm.model_executor.layers.linear import RowParallelLinear
+
+    if not model_parallel_is_initialized():
+        return 0
+    tp = get_tensor_model_parallel_world_size()
+    if tp == 1:
+        return 0
+    patched = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, RowParallelLinear) or module.input_is_parallel:
+            continue
+        if module.bias is not None and not module.skip_bias_add:
+            raise NotImplementedError(
+                f"{name}: a RowParallelLinear that splits its input and adds a bias "
+                "cannot be exported at tensor parallel size > 1"
+            )
+        device = next(module.parameters()).device
+        module.register_buffer(
+            _TP_RANK_BUFFER,
+            torch.tensor([get_tensor_model_parallel_rank()], device=device),
+            persistent=False,
+        )
+        forward = module.forward
+
+        def split_forward(input_: Any, module=module, forward=forward) -> Any:
+            rank = getattr(module, _TP_RANK_BUFFER)
+            local = input_.unflatten(-1, (tp, -1)).index_select(-2, rank).squeeze(-2)
+            module.input_is_parallel = True
+            try:
+                return forward(local)
+            finally:
+                module.input_is_parallel = False
+
+        module.forward = split_forward
+        patched += 1
+    return patched
+
+
+def _backbone_module(model: nn.Module) -> nn.Module:
+    """The module whose forward maps a step's tokens to hidden states.
+
+    vLLM's `*ForCausalLM` keeps its decoder at `.model`; a model whose `.model`
+    only groups its components (Muse Spark's holds `language_model` and the
+    encoders, and defines no `forward`) runs its own `forward` instead.
+    """
+    inner = getattr(model, "model", None)
+    forward = getattr(type(inner), "forward", None)
+    if isinstance(inner, nn.Module) and forward is not nn.Module.forward:
+        return inner
+    return model
+
+
 def _backbone_kwargs(
     backbone: nn.Module,
     *,
@@ -836,6 +908,10 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             self._patched_rope_modules += rope_patch.patch_in_graph_rotary_embedding(
                 self._mtp_draft
             )
+        _patch_row_parallel_input_split(self._model)
+        if self._mtp_draft is not None:
+            # Kept off the target's module tree, like the RoPE patch above.
+            _patch_row_parallel_input_split(self._mtp_draft)
         if not self._export_config.uses_mrope and any(
             getattr(m, "_in_graph_rope_dim_modalities", None) is not None
             or rope_patch.compute_mrope_dim_modalities(m) is not None
@@ -1411,7 +1487,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             mamba_request_distribution=recurrent_dist,
         )
 
-        backbone: Any = getattr(self._model, "model", self._model)
+        backbone: Any = _backbone_module(self._model)
         call_weights: dict[str, Any] = {}
         if backbone is not self._model:
             prefix = "model."
@@ -1543,9 +1619,22 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         Each rank holds one vocabulary shard of `lm_head_weight`; the shards are
         gathered and the vocabulary padding dropped, so every rank returns the full
         vocabulary (at tensor parallel size 1 the gather returns its input).
+
+        A vLLM model's own `compute_logits` runs, with `lm_head_weight` bound to its
+        LM head, so whatever it does past the projection (Muse Spark's output
+        multiplier and final logit soft-capping) is in the artifact too.
         """
         from vllm.distributed import tensor_model_parallel_all_gather
 
+        model_logits = getattr(self._model, "compute_logits", None)
+        if self._vllm_config is not None and callable(model_logits):
+            head = self._bound_head_name()
+            if head is not None:
+                from torch.nn.utils.stateless import _reparametrize_module
+
+                with _reparametrize_module(self._model, {head: lm_head_weight}):
+                    logits = model_logits(hidden_states)
+                return logits[..., : self._export_config.vocab_size]
         local = self._local_logits(hidden_states, lm_head_weight)
         gathered = tensor_model_parallel_all_gather(local, dim=-1)
         return gathered[..., : self._export_config.vocab_size]
@@ -1562,6 +1651,11 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         does. With vocabulary padding the last shard's padded columns would join
         the race, and the shard a rank holds is unknown while tracing, so a
         padded vocabulary gathers the logits instead.
+
+        It takes the raw projection, not `compute_logits`'s post-processing: a
+        monotonic step (output multiplier, soft-capping) leaves the argmax alone,
+        except where bf16 soft-capping saturates several logits to one value,
+        which can change a draft token, never a verified one.
         """
         from vllm.distributed import tensor_model_parallel_all_gather
 
@@ -1578,6 +1672,20 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         rank = best.argmax(dim=-1, keepdim=True)
         token = rank.to(torch.int32) * shard + index.gather(-1, rank)
         return token.squeeze(-1)
+
+    def _bound_head_name(self) -> str | None:
+        """The parameter `compute_logits` projects with, as the model names it.
+
+        `_lm_head_weight_name()` may be the alias of a tied head the model holds
+        only as its embedding (no `lm_head` attribute); then the embedding's
+        parameter is bound. None when the model holds neither.
+        """
+        names = {n for n, _ in self._model.named_parameters(remove_duplicate=False)}
+        head = self._lm_head_weight_name()
+        if head in names:
+            return head
+        tied = weight_mapper.tied_lm_head_alias(names)
+        return tied[1] if tied and tied[0] == head else None
 
     def _local_logits(
         self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor

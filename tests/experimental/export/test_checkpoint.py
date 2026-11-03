@@ -160,6 +160,24 @@ def test_the_mtp_fc_is_sharded_like_a_column_parallel_layer(
     assert weight_mapper.infer_weight_sharding(name, shape, tp_size_hint=2) == expected
 
 
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        # Muse Spark's MoE projects to and from the expert width with column- and
+        # row-parallel layers whose shard attributes processing drops.
+        ("model.language_model.layers.0.mlp.pre_expert_proj.weight", [None, "tp"]),
+        ("model.language_model.layers.0.mlp.post_expert_proj.weight", ["tp", None]),
+    ],
+)
+def test_muse_expert_projections_are_sharded_like_their_parallel_layers(
+    name: str, expected: list[str | None]
+) -> None:
+    from vllm_torchtpu.experimental.export import weight_mapper
+
+    sharding = weight_mapper.infer_weight_sharding(name, [8192, 4096], tp_size_hint=8)
+    assert sharding == expected
+
+
 def test_save_checkpoint_writes_zarr_v2_arrays(tmp_path: Path) -> None:
     pytest.importorskip("orbax.checkpoint")
     ts = pytest.importorskip("tensorstore")
