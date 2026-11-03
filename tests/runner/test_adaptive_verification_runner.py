@@ -51,6 +51,7 @@ def _runner(device, req_ids, step_trimmed):
     return runner
 
 
+@pytest.mark.tpu_test
 def test_trimmed_drafts_roll_back_as_rejected(device):
     # "a": scheduled K drafts, verified 2, accepted 1. "b": scheduled K,
     # every draft trimmed, so its chunk carries no verify metadata.
@@ -82,6 +83,7 @@ def test_trimmed_drafts_roll_back_as_rejected(device):
     assert num_draft_per_req == {0: 2}
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("step_trimmed,expected", [({}, [0, 0]), ({"a": K}, [K, 0])])
 def test_fully_trimmed_step_rolls_back_every_scheduled_draft(
     device, step_trimmed, expected
@@ -97,6 +99,7 @@ def test_fully_trimmed_step_rolls_back_every_scheduled_draft(
     assert num_draft_per_req == {0: 0, 1: 0}
 
 
+@pytest.mark.tpu_test
 def test_scheduled_draft_counts_keep_their_host_source_alive(device):
     runner = _runner(device, ["a", "b"], {"a": 1})
     md = mock.Mock(draft_lengths_cpu=np.array([2, 3], dtype=np.int32))
@@ -109,6 +112,7 @@ def test_scheduled_draft_counts_keep_their_host_source_alive(device):
     assert source.tolist() == [3, 3, 0, 0]
 
 
+@pytest.mark.tpu_test
 def test_confidences_map_to_their_chunks_requests(device):
     runner = _runner(device, ["x", "a", "b", "c"], {})
     runner.drafter = mock.MagicMock(spec=DSparkProposer)
@@ -125,6 +129,7 @@ def test_confidences_map_to_their_chunks_requests(device):
     np.testing.assert_allclose(manager._confidences["c"], [0.25] * K)
 
 
+@pytest.mark.tpu_test
 def test_a_step_without_proposal_records_nothing(device):
     runner = _runner(device, ["a"], {})
     runner.drafter = mock.MagicMock(spec=DSparkProposer)
