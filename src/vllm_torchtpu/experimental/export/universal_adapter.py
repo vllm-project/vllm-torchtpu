@@ -700,9 +700,10 @@ def _backbone_module(model: nn.Module) -> nn.Module:
     encoders, and defines no `forward`) runs its own `forward` instead.
     """
     inner = getattr(model, "model", None)
-    if not isinstance(inner, nn.Module):
-        return model
-    return inner if type(inner).forward is not nn.Module.forward else model
+    forward = getattr(type(inner), "forward", None)
+    if isinstance(inner, nn.Module) and forward is not nn.Module.forward:
+        return inner
+    return model
 
 
 def _backbone_kwargs(
