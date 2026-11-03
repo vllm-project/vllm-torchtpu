@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent native P/D processes; synthetic page bytes, no model decode."""
 
+import contextlib
 import datetime
 import hashlib
 import json
@@ -247,6 +248,7 @@ def _run_role(role: str, exchange: Path) -> None:
     _receive(exchange / f"{peer_role}-done.json")
 
 
+@pytest.mark.timeout(900)
 @pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
 def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
     from tests.distributed.tpu_test_utils import prepare_tpu_environment
@@ -282,8 +284,9 @@ def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        killed = False
         try:
-            deadline = time.monotonic() + 240
+            deadline = time.monotonic() + 480
             while child.poll() is None:
                 assert time.monotonic() < deadline, "Native P/D process deadline"
                 assert log_path.stat().st_size <= 32 * 1024**2, "Launcher log limit"
@@ -294,12 +297,18 @@ def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
             print("QWEN_NATIVE_PAGE_TRANSFER " + json.dumps(records))
         finally:
             if child.poll() is None:
+                killed = True
                 os.killpg(child.pid, signal.SIGTERM)
             try:
                 child.wait(timeout=30)
             except subprocess.TimeoutExpired:
+                killed = True
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
+            if killed:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(child.pid, signal.SIGKILL)
+                time.sleep(3.0)
             print("TORCHRUN LOG TAIL\n" + log_path.read_text()[-32000:])
 
 

@@ -4459,10 +4459,14 @@ class TPUModelRunner(GPUModelRunner):
     def _num_reqs_tensor(self, num_reqs: int) -> torch.Tensor:
         """A cached 0-d int64 device tensor holding `num_reqs` (read-only), so
         the per-step read-offset update does not upload a fresh scalar."""
-        t = self._num_reqs_device.get(num_reqs)
+        cache = getattr(self, "_num_reqs_device", None)
+        if cache is None:
+            cache = {}
+            self._num_reqs_device = cache
+        t = cache.get(num_reqs)
         if t is None:
             t = torch.tensor(num_reqs, dtype=torch.int64, device=self.device)
-            self._num_reqs_device[num_reqs] = t
+            cache[num_reqs] = t
         return t
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
