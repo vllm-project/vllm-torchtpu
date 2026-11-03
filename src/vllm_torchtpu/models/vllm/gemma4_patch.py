@@ -682,6 +682,20 @@ class _ReplicaLayer(nn.Module):
                 custom_routing_function=layer.router.routing_function,
                 activation="gelu_tanh",
             )
+            if envs.TPU_CP_MOE_NO_EP:
+                # get_moe_config marks every MoE layer EP under
+                # --enable-expert-parallel, so these experts, every one
+                # local, took the EP routing: an expert-id remap by a zero
+                # start, a mask of routes that are all valid and the
+                # gather-fused combine's per-tile route compaction. The
+                # quant method holds this config and reads use_ep after load.
+                parallel = self.experts.moe_config.moe_parallel_config
+                if parallel.ep_size != 1:
+                    raise ValueError(
+                        f"TPU_CP_MOE_NO_EP: {prefix}.experts hold 1/{parallel.ep_size}"
+                        " of the experts; the non-EP path needs every one"
+                    )
+                parallel.use_ep = False
 
 
 class Gemma4ProjectionReplica(nn.Module):

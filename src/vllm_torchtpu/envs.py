@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     TPU_CP_FUSED_EPILOGUE: bool = False
     TPU_CP_EARLY_HALO: bool = False
     TPU_CP_PAGED_GATHER: bool = False
+    TPU_CP_MOE_NO_EP: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -561,6 +562,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # which the attention's page buffers split without a copy, instead of as
     # 2-D [rows, slots * packing * d] rows. Same bytes.
     "TPU_CP_PAGED_GATHER": env_bool("TPU_CP_PAGED_GATHER", default=False),
+    # Gemma4 context-parallel prefill: the projection replica's experts (every
+    # expert on every rank) run the MoE path without expert parallelism, which
+    # --enable-expert-parallel otherwise selects for every MoE layer. Every
+    # route is valid either way; device numerics not yet shown bitexact.
+    "TPU_CP_MOE_NO_EP": env_bool("TPU_CP_MOE_NO_EP", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and
