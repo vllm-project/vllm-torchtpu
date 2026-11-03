@@ -62,7 +62,14 @@ def prepare(keys, columns, order):
 
 
 def columns_gather(columns, order):
-    return jnp.take_along_axis(columns[None, :], order[None, :], axis=1)[0]
+    # A singleton non-gather axis becomes an offset dimension in JAX gather,
+    # which Mosaic rejects. Eight rows retain the supported batching contract.
+    shape = (8, columns.shape[0])
+    return jnp.take_along_axis(
+        jnp.broadcast_to(columns[None, :], shape),
+        jnp.broadcast_to(order[None, :], shape),
+        axis=1,
+    )[0]
 
 
 def original_writer_with_prepared_inputs():
