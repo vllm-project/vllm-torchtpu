@@ -3264,8 +3264,12 @@ def mixture_norm_tiled_body(
     *,
     tile,
     eps,
+    unit_fp8=False,
 ):
-    """Run residual mixture plus RMSNorm with caller-owned refs and scratch."""
+    """Run residual mixture plus RMSNorm with caller-owned refs and scratch.
+
+    ``unit_fp8``: write the unit-RMS rows (before the norm weight) as
+    E4M3FN; the reader applies the weight."""
     tokens, hidden = prefix_ref.shape
     n_tiles = tokens // tile
     active_count = active_ref[0]
@@ -3341,11 +3345,11 @@ def mixture_norm_tiled_body(
 
         mixed = (numerator_buf[...] / row_sum_buf[...]).astype(jnp.bfloat16)
         mixed = mixed.astype(jnp.float32)
-        normalized = (
-            mixed
-            * jax.lax.rsqrt(jnp.mean(mixed * mixed, axis=1, keepdims=True) + eps)
-            * norm
-        ).astype(jnp.bfloat16)
+        unit = mixed * jax.lax.rsqrt(jnp.mean(mixed * mixed, axis=1, keepdims=True) + eps)
+        if unit_fp8:  # |unit| <= sqrt(hidden) = 85 < 448
+            normalized = unit.astype(jnp.float8_e4m3fn)
+        else:
+            normalized = (unit * norm).astype(jnp.bfloat16)
         output_bufs.at[slot][...] = normalized
         store_output(t, slot).start()
 
@@ -3482,8 +3486,12 @@ def kda_prefill_tiled_body(
     tiles=None,
     block_tiles=None,
     projection=None,
+    input_norm=None,
 ):
     """Run one KDA layer, reading and writing tiled activations in HBM.
+
+    ``input_norm``: ``(norm_ref [1, hidden] BF16, norm_vmem)``; the hidden
+    rows are unit-RMS E4M3FN and each tile is scaled by the norm weight.
 
     ``checkpoint``: ``(position, rec_out_ref, conv_out_ref)``; also store the
     state after ``position`` tokens (a multiple of ``tile``, at most
@@ -3542,6 +3550,8 @@ def kda_prefill_tiled_body(
     if projection is not None:
         weight_ref, weight_vmem, partial_ref, partial_bufs, partial_sems = projection
         weight_copies += (pltpu.make_async_copy(weight_ref, weight_vmem, weight_sems.at[13]),)
+    if input_norm is not None:
+        weight_copies += (pltpu.make_async_copy(input_norm[0], input_norm[1], weight_sems.at[12]),)
 
     @when(first)
     def load_weights():
@@ -3664,6 +3674,8 @@ def kda_prefill_tiled_body(
         scope = _phase("kda_projections")
         scope.__enter__()
         hidden_tile = hidden_bufs.at[buf][...]  # [tile, hidden]
+        if input_norm is not None:
+            hidden_tile = hidden_tile.astype(jnp.bfloat16) * input_norm[1][...]
         # ---- projections ----
         gate_features = _dot(hidden_tile, gate_w_vmem[...]).astype(jnp.bfloat16)  # [tile, 128]
         raw_gate = _dot(gate_features, fb_w_vmem[...]).astype(jnp.bfloat16).reshape(
@@ -3816,12 +3828,12 @@ class _Copies:
 
 
 def kda_prefill_tiled_scratch_shapes(
-    hidden_size, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm
+    hidden_size, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm, hidden_dtype=jnp.bfloat16,
 ):
     """Scratch specs, in the order expected by ``kda_prefill_tiled_body``."""
     width = _HEADS * _CHANNELS
     return (
-        pltpu.VMEM((2, tile, hidden_size), jnp.bfloat16),
+        pltpu.VMEM((2, tile, hidden_size), hidden_dtype),
         pltpu.VMEM((2, tile, width), jnp.bfloat16),
         pltpu.VMEM(gate_w.shape, gate_w.dtype),
         pltpu.VMEM(fb_w.shape, fb_w.dtype),
@@ -4678,7 +4690,7 @@ def _half_ring_streams(width):
 
 
 def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, own_sem,
-                      *, step, block):
+                      *, step, block, rows=None, row0=0):
     """Step ``step`` (0..16) of SP block ``block``'s window all-gather on
     half rings: copies go HBM to the peer's HBM, each owner's rows straight
     to their window rows (forwarded from there), so no buffer is reused and
@@ -4687,11 +4699,12 @@ def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, o
     rank = jax.lax.axis_index("k3_sp")
     positions = [tables_ref[f, 0, rank] for f in range(3)]
     stripe = window_stripe(local_ref.shape[0])
-    local_rows = pl.ds(block * stripe, stripe)
+    rows = rows or stripe  # ``rows`` of each stripe from ``row0`` (default: all)
+    local_rows = pl.ds(block * stripe + row0, rows)
 
     def window_rows(family, position):
         owner = tables_ref[family, 2, tables_ref[family, 1, position % 32]]
-        return pl.ds(block * 32 * stripe + owner * stripe, stripe)
+        return pl.ds(block * 32 * stripe + owner * stripe + row0, rows)
 
     @pl.when(step == 0)
     def own_rows():
@@ -4742,7 +4755,7 @@ def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, o
 def _half_reduce_step(
     tables_ref, length_ref, partial_ref, prefix_ref, output_ref,
     read_sems, send_sems, recv_sems, credits, store_sem,
-    local_bufs, payload, received, *, step, block, replace,
+    local_bufs, payload, received, *, step, block, replace, stripe=None, row0=0,
 ):
     """Step ``step`` (0..16) of SP block ``block``'s reduce-scatter of the
     rank's output-projection partials (``partial_ref`` ``[T, hidden]``) on
@@ -4754,8 +4767,9 @@ def _half_reduce_step(
     rank = jax.lax.axis_index("k3_sp")
     token_owner = tables_ref[0, 2, rank]
     positions = [tables_ref[f, 0, rank] for f in range(3)]
-    stripe = payload.shape[1]
-    local_first, window_first = block * stripe, block * 32 * stripe
+    rows = payload.shape[1]  # rows of each stripe from ``row0``
+    stripe = stripe or rows
+    local_first, window_first = block * stripe + row0, block * 32 * stripe + row0
     streams = _half_ring_streams(partial_ref.shape[1])
 
     for stream, (family, direction, col, width) in enumerate(streams):
@@ -4770,7 +4784,7 @@ def _half_reduce_step(
             peer = tables_ref[family, 1, (position + direction * (hops - index)) % 32]
             owner = tables_ref[family, 2, peer]
             return pltpu.make_async_copy(
-                partial_ref.at[pl.ds(window_first + owner * stripe, stripe), cols],
+                partial_ref.at[pl.ds(window_first + owner * stripe, rows), cols],
                 local_bufs.at[index % 2, side, :, cols], read_sems.at[index % 2, stream],
             )
 
@@ -4823,12 +4837,12 @@ def _half_reduce_step(
             # local buffer.
             staging = local_bufs.at[1, 1, :, cols]
             prefix_copy = pltpu.make_async_copy(
-                prefix_ref.at[pl.ds(local_first, stripe), cols], staging, store_sem)
+                prefix_ref.at[pl.ds(local_first, rows), cols], staging, store_sem)
             prefix_copy.start()
             prefix_copy.wait()
             valid = sp_token_index(
                 token_owner,
-                local_first + jax.lax.broadcasted_iota(jnp.int32, (stripe, width), 0),
+                local_first + jax.lax.broadcasted_iota(jnp.int32, (rows, width), 0),
                 stripe,
             ) < length_ref[0]
             projection = (
@@ -4842,7 +4856,7 @@ def _half_reduce_step(
             residual = jnp.where(replace, jnp.zeros_like(residual), residual)
             staging[...] = (residual + jnp.where(valid, projection, 0)).astype(jnp.bfloat16)
             output = pltpu.make_async_copy(
-                staging, output_ref.at[pl.ds(local_first, stripe), cols], store_sem)
+                staging, output_ref.at[pl.ds(local_first, rows), cols], store_sem)
             output.start()
             output.wait()
         for stream in range(len(streams)):  # the senders' last buffer is free
@@ -5630,6 +5644,10 @@ def _kda_layer_body(
     mix_small, gather_sems = scratch[:8], scratch[8:11]
     reduce_sems, projection_scratch = scratch[11:16], scratch[16:19]
     kda_scratch = scratch[19:]
+    if _kda_layer_options(window_stripe(prefix_ref.shape[0]), blocks)[1]:
+        kda_scratch, input_norm = kda_scratch[:-1], (norm_ref, kda_scratch[-1])
+    else:
+        input_norm = None
 
     def views(shapes):  # the shared pool: the mixture at step 0, then the projection ring
         offset, result = 0, []
@@ -5641,34 +5659,75 @@ def _kda_layer_body(
         return result
 
     pl.when(step == 0)(lambda: _ring_enter(tables_ref, jax.lax.axis_index("k3_sp")))
+    balance, fp8 = _kda_layer_options(stripe, blocks)
+    schedule = _kda_ring_schedule(blocks) if balance else None
 
     @pl.when(step < blocks)  # only block 0's mixture delays the first ring
     def normalize():
         rows = pl.ds(step * stripe, stripe)
         mixture_norm_tiled_body(
             active_ref, prefix_ref.at[rows], blocks_ref.at[:, rows], folded_ref, norm_ref,
-            normalized_ref.at[rows], *views(_kda_mix_shapes(stripe)), *mix_small,
-            tile=stripe, eps=eps,
+            normalized_ref.at[rows], *views(_kda_mix_shapes(stripe, fp8)), *mix_small,
+            tile=stripe, eps=eps, unit_fp8=fp8,
         )
 
     diag = set(_config().prefill_kda_diag)  # timing-only skips
     gather_on = not diag & {"no_rings", "no_gather"}
     reduce_on = not diag & {"no_rings", "no_reduce"}
 
-    @pl.when((phase < blocks) & gather_on)
-    def gather():
-        with _phase("kda_gather"):
-            _half_gather_step(tables_ref, normalized_ref, gathered_ref, *gather_sems,
-                              step=ring_step, block=phase)
+    if schedule is not None:
+        # Half-stripe ring segments per phase (``_kda_ring_schedule``), each
+        # with its own semaphores and buffers.
+        def pick(field):
+            value = jnp.int32(0)
+            for p, entry in enumerate(schedule):
+                value = jnp.where(phase == p, entry[field], value)
+            return value
 
-    @pl.when((phase >= 2) & reduce_on)
-    def reduce():
-        with _phase("kda_reduce"):
-            _half_reduce_step(
-                tables_ref, length_ref, partial_ref, prefix_ref, final_ref,
-                *reduce_sems, *views(_kda_reduce_shapes(stripe)),
-                step=ring_step, block=phase - 2, replace=slot % 9 == 0,
-            )
+        half = stripe // 2
+        gather_lo, gather_n, reduce_lo, reduce_n = (pick(f) for f in range(4))
+        gather_n = gather_n if gather_on else 0
+        reduce_n = reduce_n if reduce_on else 0
+        send, recv, own = gather_sems
+
+        @pl.loop(0, gather_n)
+        def gather_segment(i):
+            k = gather_lo + i
+            with _phase("kda_gather"):
+                _half_gather_step(tables_ref, normalized_ref, gathered_ref, send.at[i],
+                                  recv.at[i], own.at[i], step=ring_step, block=k // 2,
+                                  rows=half, row0=(k % 2) * half)
+
+        read, rsend, rrecv, credits, store = reduce_sems
+        segments_max = max(entry[3] for entry in schedule)
+
+        @pl.loop(0, reduce_n)
+        def reduce_segment(i):
+            j = reduce_lo + i
+            local_bufs, payload, received = views(_kda_reduce_shapes(half, segments_max))
+            with _phase("kda_reduce"):
+                _half_reduce_step(
+                    tables_ref, length_ref, partial_ref, prefix_ref, final_ref,
+                    read.at[i], rsend.at[i], rrecv.at[i], credits.at[i], store,
+                    local_bufs.at[i], payload.at[i], received.at[i],
+                    step=ring_step, block=j // 2, replace=slot % 9 == 0,
+                    stripe=stripe, row0=(j % 2) * half,
+                )
+    else:
+        @pl.when((phase < blocks) & gather_on)
+        def gather():
+            with _phase("kda_gather"):
+                _half_gather_step(tables_ref, normalized_ref, gathered_ref, *gather_sems,
+                                  step=ring_step, block=phase)
+
+        @pl.when((phase >= 2) & reduce_on)
+        def reduce():
+            with _phase("kda_reduce"):
+                _half_reduce_step(
+                    tables_ref, length_ref, partial_ref, prefix_ref, final_ref,
+                    *reduce_sems, *views(_kda_reduce_shapes(stripe)),
+                    step=ring_step, block=phase - 2, replace=slot % 9 == 0,
+                )
 
     # One call site for the KDA tile: inlined twice, the layer would no
     # longer fit the instruction memory.
@@ -5692,24 +5751,65 @@ def _kda_layer_body(
         block_tiles=block_tiles,
         projection=(output_family_ref.at[slot], *projection_scratch[:1], partial_ref,
                     *projection_scratch[1:]),
+        input_norm=input_norm,
     )
 
 
-def _kda_mix_shapes(mix_tile):
+def _kda_mix_shapes(mix_tile, fp8=False):
     return (
         ((2, mix_tile, 7168), jnp.bfloat16),
         ((mix_tile, 7168), jnp.bfloat16),
-        ((2, mix_tile, 7168), jnp.bfloat16),
+        ((2, mix_tile, 7168), jnp.float8_e4m3fn if fp8 else jnp.bfloat16),
         ((mix_tile, 7168), jnp.float32),
     )
 
 
-def _kda_reduce_shapes(stripe):
+def _kda_reduce_shapes(stripe, segments=None):
+    lead = () if segments is None else (segments,)
     return (
-        ((2, 2, stripe, 7168), jnp.bfloat16),  # the local partials (slot, direction)
-        ((2, stripe, 7168), jnp.bfloat16),  # payload (direction)
-        ((2, 2, stripe, 7168), jnp.bfloat16),  # received (slot, direction)
+        ((*lead, 2, 2, stripe, 7168), jnp.bfloat16),  # the local partials (slot, direction)
+        ((*lead, 2, stripe, 7168), jnp.bfloat16),  # payload (direction)
+        ((*lead, 2, 2, stripe, 7168), jnp.bfloat16),  # received (slot, direction)
     )
+
+
+def _kda_layer_options(stripe, blocks):
+    """(ring balance, FP8 window) as the KDA layer runs them: balancing
+    needs 64-row stripes and 3+ blocks, FP8 rows 32-row stripes."""
+    cfg = _config()
+    return (cfg.prefill_kda_ring_balance and stripe == 64 and blocks >= 3,
+            cfg.prefill_kda_fp8_gather and stripe >= 32)
+
+
+def _kda_ring_schedule(blocks):
+    """Per phase of the KDA layer, ``(gather_first, gather_count,
+    reduce_first, reduce_count)`` in half-stripe segments (segment 2b + h:
+    half h of SP block b). Block b's window is gathered by phase b (its KDA
+    tiles run in phase b + 1) and reduced from phase b + 2. Phase 0 gathers
+    block 0 and the last phase reduces the last block; the phases between
+    take up to ``cap`` segments each: due gathers first, then released
+    reduces, then early gathers."""
+    cap = 3 if blocks <= 4 else 4
+    phases = []
+    gathered, reduced = 0, 0
+    for p in range(blocks + 2):
+        due_gather = min(2 * (p + 1), 2 * blocks)  # segments needed by the end of phase p
+        released = 2 * max(0, p - 1)  # segments whose KDA tiles are done
+        if p == 0:
+            g = due_gather - gathered
+            r = 0
+        elif p == blocks + 1:
+            g = 0
+            r = 2 * blocks - reduced
+        else:
+            g = max(0, due_gather - gathered)
+            r = min(released - reduced, max(0, cap - g))
+            g += min(2 * blocks - gathered - g, max(0, cap - g - r))
+        phases.append((gathered, g, reduced, r))
+        gathered += g
+        reduced += r
+    assert gathered == reduced == 2 * blocks
+    return tuple(phases)
 
 
 def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
@@ -5741,11 +5841,21 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
         ring_tables(list(mesh.devices.flat), token_ranks), jnp.int32,
     )
     streams = len(_half_ring_streams(width))
+    balance, fp8 = _kda_layer_options(stripe, blocks)
+    window_dtype = jnp.float8_e4m3fn if fp8 else jnp.bfloat16
+    if balance:
+        schedule = _kda_ring_schedule(blocks)
+        gather_lead = (max(1, max(entry[1] for entry in schedule)),)
+        reduce_lead = (max(1, max(entry[3] for entry in schedule)),)
+        reduce_shapes = _kda_reduce_shapes(stripe // 2, reduce_lead[0])
+    else:
+        gather_lead = reduce_lead = ()
+        reduce_shapes = _kda_reduce_shapes(stripe)
     pool_bytes = max(
         sum(pool_alias.storage_size(shape, jnp.dtype(dtype))
-            for shape, dtype in _kda_mix_shapes(stripe)),
+            for shape, dtype in _kda_mix_shapes(stripe, fp8)),
         sum(pool_alias.storage_size(shape, jnp.dtype(dtype))
-            for shape, dtype in _kda_reduce_shapes(stripe)),
+            for shape, dtype in reduce_shapes),
     )
     shapes = (
         jax.ShapeDtypeStruct((width, 128), jnp.bfloat16),
@@ -5759,23 +5869,24 @@ def make_norm_gather_kda_sp(mesh, *, seq_len, segments, token_ranks=None,
     scratch = (
         pltpu.VMEM((pool_bytes // 128, 128), jnp.uint8),
         *mixture_norm_tiled_scratch_shapes(width, stripe)[4:],
-        pltpu.SemaphoreType.DMA((streams,)),  # the window all-gather
-        pltpu.SemaphoreType.DMA((streams,)),
-        pltpu.SemaphoreType.DMA,
-        pltpu.SemaphoreType.DMA((2, streams)),  # the reduce-scatter
-        pltpu.SemaphoreType.DMA((streams,)),
-        pltpu.SemaphoreType.DMA((2, streams)),
-        pltpu.SemaphoreType.REGULAR((streams,)),
+        pltpu.SemaphoreType.DMA((*gather_lead, streams)),  # the window all-gather
+        pltpu.SemaphoreType.DMA((*gather_lead, streams)),
+        pltpu.SemaphoreType.DMA(gather_lead) if gather_lead else pltpu.SemaphoreType.DMA,
+        pltpu.SemaphoreType.DMA((*reduce_lead, 2, streams)),  # the reduce-scatter
+        pltpu.SemaphoreType.DMA((*reduce_lead, streams)),
+        pltpu.SemaphoreType.DMA((*reduce_lead, 2, streams)),
+        pltpu.SemaphoreType.REGULAR((*reduce_lead, streams)),
         pltpu.SemaphoreType.DMA,
         pltpu.VMEM((384, width), jnp.bfloat16),  # the output projection
         pltpu.VMEM((2, 128, width), jnp.bfloat16),  # its partials
         pltpu.SemaphoreType.DMA((2,)),
-        *kda_prefill_tiled_scratch_shapes(width, 128, *shapes),
+        *kda_prefill_tiled_scratch_shapes(width, 128, *shapes, hidden_dtype=window_dtype),
+        *((pltpu.VMEM((1, width), jnp.bfloat16),) if fp8 else ()),  # the input norm weight
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     output_shapes = (
-        jax.ShapeDtypeStruct((rows, width), jnp.bfloat16),
-        jax.ShapeDtypeStruct((seq_len, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, width), window_dtype),
+        jax.ShapeDtypeStruct((seq_len, width), window_dtype),
         jax.ShapeDtypeStruct((seq_len, 384), jnp.bfloat16),
         jax.ShapeDtypeStruct((*state_lead, 3, 128, 128), jnp.float32),
         jax.ShapeDtypeStruct((*state_lead, 3, 3, 3, 128), jnp.bfloat16),

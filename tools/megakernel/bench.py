@@ -361,8 +361,15 @@ def run_prefill(args, records: harness.Records) -> None:
             ]
             with _trace(args.trace, tag, repeat == args.repeats):
                 started = time.perf_counter()
-                bridge.materialize(prefiller.step(mk.StepInput(rows)).tokens)
+                stepped = prefiller.step(mk.StepInput(rows))
+                bridge.materialize(stepped.tokens)
                 elapsed = 1e3 * (time.perf_counter() - started)
+            if harness.rank() == 0:
+                # Correctness fingerprint: first tokens and a checksum of every KV pool.
+                sums = [float(tensor.float().abs().sum().cpu()) for tensor in pools.tensors]
+                harness.log(f"fingerprint {tag} repeat {repeat}: tokens "
+                            f"{stepped.tokens.cpu().tolist()} pools "
+                            f"{' '.join(f'{x:.6e}' for x in sums)}")
             if repeat:
                 times.append(elapsed)
         ms = statistics.median(times)

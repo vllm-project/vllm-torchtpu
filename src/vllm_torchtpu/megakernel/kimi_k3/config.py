@@ -99,6 +99,12 @@ class KernelConfig:
     # Prefill KDA chunk sub-block (rows per decay anchor): 16, or 32 (one
     # matmul fewer per 16 rows; factors up to exp(80)).
     prefill_kda_sub_block: int = 16
+    # Prefill KDA layer: rings in half-stripe segments, balanced over the
+    # phases (``_kda_ring_schedule``) instead of one block per ring a phase.
+    prefill_kda_ring_balance: bool = False
+    # Prefill KDA layer: the window all-gather carries unit-RMS E4M3FN rows
+    # (half the bytes); each KDA tile applies the norm weight. Changes numerics.
+    prefill_kda_fp8_gather: bool = False
     # Prefill KDA layer diagnostics (invalid results, timing only): no_tiles,
     # no_rings, no_gather, no_reduce, no_chunk skip that part of the layer.
     prefill_kda_diag: tuple[str, ...] = ()
