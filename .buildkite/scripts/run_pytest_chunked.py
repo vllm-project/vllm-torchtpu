@@ -176,6 +176,7 @@ def plan_chunks(
     chunk_size: int,
     *,
     has_vfio: bool,
+    isolated_chunk_size: int | None = None,
     repo_root: Path | None = None,
 ) -> list[list[str]]:
     """Order and partition selectors into safe subprocess chunks."""
@@ -184,6 +185,12 @@ def plan_chunks(
             f"--chunk-size must be a positive integer >= 1, got {chunk_size}; "
             "pass e.g. --chunk-size 6."
         )
+    if isolated_chunk_size is not None and isolated_chunk_size <= 0:
+        raise ValueError(
+            "--isolated-chunk-size must be a positive integer >= 1, got "
+            f"{isolated_chunk_size}; pass e.g. --isolated-chunk-size 8."
+        )
+    eff_isolated = chunk_size if isolated_chunk_size is None else isolated_chunk_size
     root = _REPO_ROOT if repo_root is None else repo_root
     clean = [s for s in selectors if s.strip()]
     if not clean:
@@ -220,8 +227,8 @@ def plan_chunks(
     chunks: list[list[str]] = []
     for rel_posix in sorted(heavy_by_file):
         file_sels = heavy_by_file[rel_posix]
-        for i in range(0, len(file_sels), chunk_size):
-            chunks.append(file_sels[i : i + chunk_size])
+        for i in range(0, len(file_sels), eff_isolated):
+            chunks.append(file_sels[i : i + eff_isolated])
 
     batch_items.sort(key=lambda pair: pair[0])
     ordered_batch = [sel for _, sel in batch_items]
@@ -305,6 +312,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum number of batch test selectors per pytest subprocess (e.g. 6).",
     )
     parser.add_argument(
+        "--isolated-chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "Optional max number of selectors per subprocess for CPU-heavy "
+            "Pallas/megakernel files (defaults to --chunk-size; e.g. 8)."
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=600,
@@ -334,6 +350,11 @@ def main(argv: list[str] | None = None) -> int:
             f"--chunk-size must be a positive integer >= 1, got {args.chunk_size}; "
             "pass e.g. --chunk-size 6."
         )
+    if args.isolated_chunk_size is not None and args.isolated_chunk_size <= 0:
+        raise ValueError(
+            "--isolated-chunk-size must be a positive integer >= 1, got "
+            f"{args.isolated_chunk_size}; pass e.g. --isolated-chunk-size 8."
+        )
 
     files = [f for f in [*args.selectors, *post_sep_files] if f.strip()]
     if not files:
@@ -344,7 +365,12 @@ def main(argv: list[str] | None = None) -> int:
     has_vfio = has_tpu_vfio_devices()
     has_pytest_timeout = importlib.util.find_spec("pytest_timeout") is not None
     settle_s = float(os.environ.get("PYTEST_CHUNK_TPU_SETTLE_SECONDS", "6.0"))
-    chunks = plan_chunks(files, args.chunk_size, has_vfio=has_vfio)
+    chunks = plan_chunks(
+        files,
+        args.chunk_size,
+        has_vfio=has_vfio,
+        isolated_chunk_size=args.isolated_chunk_size,
+    )
     any_collected = False
     first_failure_rc: int | None = None
 

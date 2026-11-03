@@ -163,6 +163,50 @@ def test_classify_and_plan_chunks_cpu_heavy_isolated_and_negative_control(
         [str(lookalike_kernel), str(lookalike_megakernel), str(other_batch)],
     ]
 
+    # When split-by-example nodeids are passed with isolated_chunk_size=2 and
+    # chunk_size=4, CPU-heavy nodeids stay grouped per file in <=2-example
+    # chunks while lightweight batch nodeids pack up to 4 per chunk.
+    split_chunks = run_pytest_chunked.plan_chunks(
+        [
+            f"{other_batch}::test_r1",
+            f"{heavy_pallas}::test_p1",
+            f"{heavy_pallas}::test_p2",
+            f"{heavy_pallas}::test_p3",
+            f"{heavy_qsa}::test_q1",
+            f"{lookalike_kernel}::test_l1",
+            f"{lookalike_kernel}::test_l2",
+            f"{lookalike_megakernel}::test_m1",
+            f"{other_batch}::test_r2",
+        ],
+        chunk_size=4,
+        isolated_chunk_size=2,
+        has_vfio=False,
+        repo_root=tmp_path,
+    )
+    assert split_chunks == [
+        [f"{heavy_pallas}::test_p1", f"{heavy_pallas}::test_p2"],
+        [f"{heavy_pallas}::test_p3"],
+        [f"{heavy_qsa}::test_q1"],
+        [
+            f"{lookalike_kernel}::test_l1",
+            f"{lookalike_kernel}::test_l2",
+            f"{lookalike_megakernel}::test_m1",
+            f"{other_batch}::test_r1",
+        ],
+        [f"{other_batch}::test_r2"],
+    ]
+
+    with pytest.raises(
+        ValueError, match="--isolated-chunk-size must be a positive integer"
+    ):
+        run_pytest_chunked.plan_chunks(
+            [str(other_batch)],
+            chunk_size=4,
+            isolated_chunk_size=0,
+            has_vfio=False,
+            repo_root=tmp_path,
+        )
+
 
 def test_write_merged_junit_xml_crash_repeat_and_concurrent_paths(
     tmp_path: Path,
@@ -243,8 +287,10 @@ def test_cli_flag_orders_exit_codes_and_validation(tmp_path: Path) -> None:
         [
             sys.executable,
             str(_SCRIPT_PATH),
+            "--isolated-chunk-size",
+            "8",
             "--chunk-size",
-            "6",
+            "64",
             "--timeout",
             "60",
             "--mark",
@@ -273,6 +319,8 @@ def test_cli_flag_orders_exit_codes_and_validation(tmp_path: Path) -> None:
             "60",
             "--chunk-size",
             "1",
+            "--isolated-chunk-size",
+            "1",
         ],
         capture_output=True,
         text=True,
@@ -286,9 +334,13 @@ def test_cli_flag_orders_exit_codes_and_validation(tmp_path: Path) -> None:
     assert run_pytest_chunked.main([f"--junit-xml={empty_xml}"]) == 5
     assert ET.parse(empty_xml).getroot().findall("testsuite") == []
 
-    # Invalid --chunk-size -> actionable ValueError.
+    # Invalid --chunk-size / --isolated-chunk-size -> actionable ValueError.
     with pytest.raises(ValueError, match="--chunk-size must be a positive integer"):
         run_pytest_chunked.main(["--chunk-size", "0", str(pass_test)])
+    with pytest.raises(
+        ValueError, match="--isolated-chunk-size must be a positive integer"
+    ):
+        run_pytest_chunked.main(["--isolated-chunk-size", "-1", str(pass_test)])
 
 
 def test_signal_exit_normalization_and_vfio_settle_transitions(

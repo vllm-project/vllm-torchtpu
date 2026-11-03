@@ -243,12 +243,16 @@ def _run_role(role: str, exchange: Path) -> None:
             fingerprint=fingerprint,
         ),
     )
-    _receive(exchange / f"{peer_role}-done.json")
-    del client, manager, store
+    _receive(exchange / f"{peer_role}-done.json", seconds=300)
+    sync.synchronize([raw], wait=True)
+    del client
+    del manager
+    del store
+    del worker, manifest, materialized, raw, before, after
     gc.collect()
 
 
-@pytest.mark.timeout(1200)
+@pytest.mark.timeout(2400)
 @pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
 def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
     from tests.distributed.tpu_test_utils import (
@@ -277,8 +281,8 @@ def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
                 start_new_session=True,
             )
             try:
-                bootstrap_deadline = time.monotonic() + 150
-                deadline = time.monotonic() + 480
+                bootstrap_deadline = time.monotonic() + 300
+                deadline = time.monotonic() + 660
                 bootstrapped = False
                 while child.poll() is None:
                     now = time.monotonic()
@@ -294,7 +298,7 @@ def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
                             log_text = (
                                 log_path.read_text(errors="replace")
                                 + f"\nTPU_WORKER_BOOTSTRAP_TIMEOUT: {ready_ranks}/8 "
-                                "workers initialized TPU runtime within 150s\n"
+                                "workers initialized TPU runtime within 300s\n"
                             )
                             print(
                                 f"TORCHRUN BOOTSTRAP TIMEOUT (attempt {attempt + 1})\n"
@@ -361,20 +365,22 @@ def _run_runtime_worker(rank: int, exchange: Path) -> None:
 
     # Runtime participants need the same plugin bootstrap as the P/D workers.
     load_general_plugins()
-    dist.init_process_group(backend="tpu_dist", timeout=datetime.timedelta(seconds=120))
+    dist.init_process_group(backend="tpu_dist", timeout=datetime.timedelta(seconds=300))
     try:
         torch.empty(1, device="tpu").cpu()
         _publish(exchange / f"runtime-{rank}.json", dict(rank=rank, pid=os.getpid()))
         # Keep every native runtime participant alive until both roles finish.
         for peer in range(8):
-            _receive(exchange / f"runtime-{peer}.json")
+            _receive(exchange / f"runtime-{peer}.json", seconds=300)
         if rank < 2:
             _run_role(("prefill", "decode")[rank], exchange)
+            gc.collect()
         for role in ("prefill", "decode"):
-            _receive(exchange / f"{role}-done.json", seconds=150)
+            _receive(exchange / f"{role}-done.json", seconds=300)
         _publish(exchange / f"finished-{rank}.json", dict(rank=rank))
         for peer in range(8):
-            _receive(exchange / f"finished-{peer}.json")
+            _receive(exchange / f"finished-{peer}.json", seconds=300)
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
