@@ -416,6 +416,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
+        self.shared_topk_read = envs.TPU_INDEXER_TOPK_SHARED_READ
 
         parallel_config = getattr(
             get_current_vllm_config_or_none(), "parallel_config", None
@@ -763,7 +764,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
-        return self._write_topk_rows(hidden_states.shape[0], topk_indices)
+        rows = self._write_topk_rows(hidden_states.shape[0], topk_indices)
+        # The skip_topk layers read the table; one expression, one index prep.
+        return self.topk_indices_buffer if self.shared_topk_read else rows
 
     def _write_topk_rows(
         self, num_tokens: int, topk_indices: torch.Tensor
@@ -774,8 +777,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         (see `_TOPK_ROWS_UPDATE_OP`), so XLA updates the table in place: same
         contents, no full-table copy per indexed layer. Returns those rows
         rather than the buffer, so attention reads them instead of a whole
-        `[max_num_batched_tokens, width]` buffer version. The buffer still gets
-        the same contents for the layers that reuse it.
+        `[max_num_batched_tokens, width]` buffer version (unless
+        TPU_INDEXER_TOPK_SHARED_READ). The buffer still gets the same contents
+        for the layers that reuse it.
         """
         buf = self.topk_indices_buffer
         rows = _topk_rows(buf, self.topk_tokens, num_tokens, topk_indices)

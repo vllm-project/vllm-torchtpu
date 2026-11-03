@@ -13,6 +13,9 @@
 # limitations under the License.
 """Standalone sparse-attention tests for both physical cache layouts."""
 
+import functools
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -683,6 +686,61 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         np.testing.assert_array_equal(
             np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
         )
+
+    @parameterized.named_parameters(
+        ("uncapped", None, "gather_page_ids"),
+        ("capped", 512, "capped_window_indices"),
+    )
+    def test_shared_topk_read_dedupes_index_prep(self, topk_cap, prep_name):
+        """TPU_INDEXER_TOPK_SHARED_READ: one index prep for two layers.
+
+        Models an indexed layer and the skip_topk layer after it. With the
+        fresh rows in the first and `table[:n]` in the second, the index prep
+        is compiled twice; with `table[:n]` in both, once. Outputs match.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        topk, rows = 2048, 64
+        rng = np.random.default_rng(20261005)
+        problem = _build_problem(rng, k_scale=0.75, query_tokens=16, topk=topk)
+        live = np.arange(topk)[None, :] < rng.integers(1, 400, size=16)[:, None]
+        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        table = jnp.full((rows, topk), -1, jnp.int32)
+        cu_q_lens = jnp.array([0, 4], jnp.int32)
+        distribution = jnp.array([1, 1, 1], jnp.int32)
+
+        def attn(q, t):
+            return sparse_mla.sparse_ragged_paged_attention(
+                q,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                t,
+                problem["page_table"],
+                cu_q_lens,
+                distribution,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=topk_cap,
+            )
+
+        # A runtime row offset, like the indexer's donated row update, keeps
+        # XLA from folding `table[:n]` back to the rows it just wrote.
+        def layers(table, fresh, q, row, *, shared):
+            table = jax.lax.dynamic_update_slice(table, fresh, (row, 0))
+            reuse = table[: fresh.shape[0]]
+            return attn(q, reuse if shared else fresh), attn(q * 0.5, reuse)
+
+        args = (table, topk_idx, problem["q"], jnp.int32(0))
+        counts, outs = {}, {}
+        for shared in (False, True):
+            fn = jax.jit(functools.partial(layers, shared=shared))
+            hlo = fn.lower(*args).compile().as_text()
+            counts[shared] = len(re.findall(rf"%{prep_name}(?:\.\d+)? = ", hlo))
+            outs[shared] = jax.block_until_ready(fn(*args))
+        self.assertEqual(counts, {False: 2, True: 1})
+        for x, y in zip(jax.tree.leaves(outs[False]), jax.tree.leaves(outs[True])):
+            np.testing.assert_array_equal(np.asarray(x), np.asarray(y))
 
     def test_topk_cap_validation(self):
         q = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)
