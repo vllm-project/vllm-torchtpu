@@ -39,6 +39,7 @@ def _kernel(
     hidden,
     branches,
     eps,
+    up_t,
 ):
     weight_dma = pltpu.make_async_copy(weight_hbm, weight_vm, weight_sem)
     down_dma = pltpu.make_async_copy(down_hbm, down_vm, down_sem)
@@ -162,7 +163,7 @@ def _kernel(
             jax.lax.dot_general(
                 gate,
                 up_vm[...],
-                dimension_numbers=(((1,), (1,)), ((), ())),
+                dimension_numbers=(((1,), (0 if up_t else 1,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )
             .astype(jnp.bfloat16)
@@ -202,8 +203,11 @@ def _kernel(
         ).wait()
 
 
-@functools.partial(jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile"))
-def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile):
+@functools.partial(
+    jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile", "up_t")
+)
+def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, up_t=False):
+    """``up_t``: ``up`` is given as its [low rank, width] transpose."""
     tokens, width = x.shape
     lowrank = down.shape[0]
     if (
@@ -211,7 +215,7 @@ def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile):
         or width != branches * hidden
         or weight.shape != (width,)
         or down.shape != (lowrank, width)
-        or up.shape != (width, lowrank)
+        or up.shape != ((lowrank, width) if up_t else (width, lowrank))
         or any(a.dtype != jnp.bfloat16 for a in (x, weight, down, up))
     ):
         raise ValueError("HC full mix requires even BF16 token tiles")
@@ -224,6 +228,7 @@ def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile):
             hidden=hidden,
             branches=branches,
             eps=eps,
+            up_t=up_t,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
@@ -234,7 +239,7 @@ def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile):
                 pltpu.VMEM((2, token_tile, width), jnp.bfloat16),
                 pltpu.VMEM((width,), jnp.bfloat16),
                 pltpu.VMEM((lowrank, width), jnp.bfloat16),
-                pltpu.VMEM((width, lowrank), jnp.bfloat16),
+                pltpu.VMEM(up.shape, jnp.bfloat16),
                 pltpu.VMEM((2, token_tile, hidden), jnp.bfloat16),
                 pltpu.VMEM((2, token_tile, width), jnp.bfloat16),
                 pltpu.SemaphoreType.DMA((2,)),
