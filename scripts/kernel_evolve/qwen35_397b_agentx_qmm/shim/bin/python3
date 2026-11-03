@@ -1,0 +1,13 @@
+#!/bin/bash
+# python3 for `run_benchmarks.sh --dry-run` on a host without vLLM: perfkit reads the
+# serve command from that dry run, and the script refuses to start unless it can find a
+# `vllm` package. This puts an empty one on the path and runs the real python3.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+keep=()
+IFS=: read -ra parts <<< "$PATH"
+for p in "${parts[@]}"; do
+  [ "$(cd "$p" 2>/dev/null && pwd)" = "$here/bin" ] || keep+=("$p")
+done
+PATH="$(IFS=:; echo "${keep[*]}")"
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$here/stub"
+exec python3 "$@"
