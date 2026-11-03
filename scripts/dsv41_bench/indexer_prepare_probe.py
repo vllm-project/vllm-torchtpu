@@ -64,6 +64,7 @@ def reference(keys, columns, order):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--diagnose", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(137)
@@ -102,15 +103,74 @@ def main():
             keys *= np.exp2(np.arange(288) % 41 - 20)[:, None]
         keys = keys.astype(ml_dtypes.bfloat16)
         expected = reference(keys, columns, order)
+        outputs = {}
         for name, fn in functions.items():
             actual = jax.block_until_ready(
                 fn(jnp.asarray(keys), jnp.asarray(columns), jnp.asarray(order))
             )
-            for a, e in zip(actual, expected, strict=True):
-                np.testing.assert_array_equal(
-                    np.asarray(a), e, err_msg=f"{kind}/{name}"
+            outputs[name] = tuple(np.asarray(a) for a in actual)
+            if not args.diagnose:
+                for a, e in zip(actual, expected, strict=True):
+                    np.testing.assert_array_equal(
+                        np.asarray(a), e, err_msg=f"{kind}/{name}"
+                    )
+        mismatches = {
+            name: [
+                int(np.count_nonzero(a != e))
+                for a, e in zip(value, expected, strict=True)
+            ]
+            for name, value in outputs.items()
+        }
+        result = {
+            "case": kind,
+            "three_way_byte_exact": not any(sum(x) for x in mismatches.values()),
+            "mismatches_to_reference": mismatches,
+            "native_candidate_mismatches": [
+                int(np.count_nonzero(a != b))
+                for a, b in zip(outputs["native"], outputs["candidate"], strict=True)
+            ],
+        }
+        if not result["three_way_byte_exact"]:
+
+            def decode(words):
+                payload = words[:32, :288].T.astype(np.uint32)
+                bits = ((payload[..., None] >> (np.arange(4) * 8)) & 255).astype(
+                    np.uint8
                 )
-        results.append({"case": kind, "three_way_byte_exact": True})
+                values = (
+                    bits.reshape(288, 128)
+                    .view(ml_dtypes.float8_e4m3fn)
+                    .astype(np.float32)
+                )
+                return values * words[32, :288].copy().view(np.float32)[:, None]
+
+            decoded = {name: decode(value[1]) for name, value in outputs.items()}
+            wanted = decode(expected[1])
+            result["decoded_reference_mismatches"] = {
+                name: int(np.count_nonzero(value != wanted))
+                for name, value in decoded.items()
+            }
+            result["decoded_native_candidate_mismatches"] = int(
+                np.count_nonzero(decoded["native"] != decoded["candidate"])
+            )
+            result["decoded_reference_max_abs"] = {
+                name: float(np.max(np.abs(value - wanted)))
+                for name, value in decoded.items()
+            }
+            result["scale_reference_mismatches"] = {
+                name: int(np.count_nonzero(value[1][32] != expected[1][32]))
+                for name, value in outputs.items()
+            }
+            np.savez(
+                args.out / f"{kind}-mismatch.npz",
+                keys=keys.astype(np.float32),
+                order=order,
+                columns=columns,
+                expected=expected[1],
+                native=outputs["native"][1],
+                candidate=outputs["candidate"][1],
+            )
+        results.append(result)
         (args.out / "probe.json").write_text(json.dumps(results, indent=2) + "\n")
         print(results[-1], flush=True)
 
