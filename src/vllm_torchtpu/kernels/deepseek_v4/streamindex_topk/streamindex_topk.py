@@ -2020,7 +2020,9 @@ def streamindex_topk(
     def _fast_path(_):
         token_idx = jnp.arange(q.shape[0])
         seq_idx = jnp.minimum(
-            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
+            jnp.searchsorted(
+                cu_q_lens[1:], token_idx, side="right", method="compare_all"
+            ),
             seq_lens.shape[0] - 1,
         )
         seq_len = seq_lens[seq_idx]

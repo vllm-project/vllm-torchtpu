@@ -198,7 +198,9 @@ def arm_prequant(model: torch.nn.Module) -> int:
                 and w.q_lora_rank is not None
                 and w.fused_qkv_a_proj is not None
             ):
-                emit_y = w.indexer is not None or w.g_proj is not None
+                emit_y = (
+                    w.indexer is not None and not getattr(w, "skip_topk", False)
+                ) or w.g_proj is not None
                 n += _pair(ln_in, w.fused_qkv_a_proj, emit_y)
         if (
             mlp is not None

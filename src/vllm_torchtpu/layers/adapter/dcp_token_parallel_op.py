@@ -65,7 +65,7 @@ EXTRA_PAGES = 4
 # Rows [0, split_rows) stay on the DCP path; a multiple of this.
 SPLIT_ROWS_ALIGN = 16
 # Gather sizes (virtual pages) below the buffer's capacity a step may take.
-GATHER_CAPS = (2, 4, 8, 12, 16, 24, 32)
+GATHER_CAPS = (2, 4, 8, 12, 16, 20, 24, 32)
 
 
 def applies(num_tokens: int) -> bool:

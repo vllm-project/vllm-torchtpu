@@ -972,6 +972,9 @@ def owned_rows_bound(
     return _align_to(cap, 8)
 
 
+_COMPACT_BLOCK = 256
+
+
 def compact_owned_rows(
     src: jax.Array,
     dst_rows: jax.Array,
@@ -988,8 +991,10 @@ def compact_owned_rows(
     untouched when the bound does not shrink them (decode buckets).
 
     The compaction index is `idx[j] = #{t : cumsum(valid)[t] <= j}`, the
-    first token with `j + 1` writable tokens at or before it -- a dense
-    `[cap, T]` compare-and-count (no gather loop, unlike `searchsorted`)."""
+    first token with `j + 1` writable tokens at or before it -- computed via a
+    two-level block compare-and-count when `T` is a multiple of `_COMPACT_BLOCK`
+    (no gather loop, unlike `searchsorted`, and without materializing a dense
+    `[cap, T]` tensor)."""
     num_tokens = dst_rows.shape[0]
     cap = owned_rows_bound(
         num_tokens,
@@ -1002,8 +1007,19 @@ def compact_owned_rows(
     valid = dst_rows >= 0
     csum = jnp.cumsum(valid.astype(jnp.int32))
     j = jnp.arange(cap, dtype=jnp.int32)
-    idx = jnp.sum((csum[None, :] <= j[:, None]).astype(jnp.int32), axis=1)
-    idx = jnp.minimum(idx, num_tokens - 1)
+    if num_tokens >= 2 * _COMPACT_BLOCK and num_tokens % _COMPACT_BLOCK == 0:
+        num_blocks = num_tokens // _COMPACT_BLOCK
+        csum_2d = csum.reshape(num_blocks, _COMPACT_BLOCK)
+        blk = jnp.sum(
+            (csum_2d[:, _COMPACT_BLOCK - 1][None, :] <= j[:, None]).astype(jnp.int32),
+            axis=1,
+        )
+        blk_clamped = jnp.minimum(blk, num_blocks - 1)
+        in_blk = jnp.sum((csum_2d[blk_clamped] <= j[:, None]).astype(jnp.int32), axis=1)
+        idx = jnp.minimum(blk * _COMPACT_BLOCK + in_blk, num_tokens - 1)
+    else:
+        idx = jnp.sum((csum[None, :] <= j[:, None]).astype(jnp.int32), axis=1)
+        idx = jnp.minimum(idx, num_tokens - 1)
     keep = j < csum[-1]
     dst_c = jnp.where(keep, jnp.take(dst_rows, idx), jnp.int32(kv_cache_utils.SKIP_ROW))
     return jnp.take(src, idx, axis=0), dst_c

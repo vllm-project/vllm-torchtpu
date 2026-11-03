@@ -267,12 +267,13 @@ def _row_positions(
     """
     num_seqs = seq_lens.shape[0]
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_id = jnp.searchsorted(query_start_loc[1:], tok, side="right").astype(jnp.int32)
+    seq_id = jnp.searchsorted(
+        query_start_loc[1:], tok, side="right", method="compare_all"
+    ).astype(jnp.int32)
     valid = tok < query_start_loc[-1]
 
     seq_id = jnp.minimum(seq_id, num_seqs - 1)
-    q_len = query_start_loc[seq_id + 1] - query_start_loc[seq_id]
-    pos = seq_lens[seq_id] - q_len + (tok - query_start_loc[seq_id])
+    pos = tok + (seq_lens - query_start_loc[1:])[seq_id]
     return tok, seq_id, pos, valid
 
 
@@ -506,6 +507,64 @@ def update_sparse_mla_kv_cache_jax(
     )
 
 
+_COMPACT_BLOCK = 256
+
+
+def _owned_rows_bound(
+    num_tokens: int, *, num_seqs: int, dcp_size: int, interleave_size: int
+) -> int:
+    cap = -(-num_tokens // dcp_size) + 2 * interleave_size * num_seqs
+    return (cap + 7) // 8 * 8
+
+
+def _compact_dcp_mla_rows(
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    page: jax.Array,
+    slot: jax.Array,
+    *,
+    num_seqs: int,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Moves writable DCP rows (`page < OOB_PAGE`) to the front in order and
+    cuts all arrays to `_owned_rows_bound` rows (`OOB_PAGE` on the tail)."""
+    num_tokens = kv_c_normed.shape[0]
+    cap = _owned_rows_bound(
+        num_tokens,
+        num_seqs=num_seqs,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    if cap >= num_tokens:
+        return kv_c_normed, k_pe, page, slot
+    valid = page < OOB_PAGE
+    csum = jnp.cumsum(valid.astype(jnp.int32))
+    j = jnp.arange(cap, dtype=jnp.int32)
+    if num_tokens >= 2 * _COMPACT_BLOCK and num_tokens % _COMPACT_BLOCK == 0:
+        num_blocks = num_tokens // _COMPACT_BLOCK
+        csum_2d = csum.reshape(num_blocks, _COMPACT_BLOCK)
+        blk = jnp.sum(
+            (csum_2d[:, _COMPACT_BLOCK - 1][None, :] <= j[:, None]).astype(jnp.int32),
+            axis=1,
+        )
+        blk_clamped = jnp.minimum(blk, num_blocks - 1)
+        in_blk = jnp.sum((csum_2d[blk_clamped] <= j[:, None]).astype(jnp.int32), axis=1)
+        idx = jnp.minimum(blk * _COMPACT_BLOCK + in_blk, num_tokens - 1)
+    else:
+        idx = jnp.sum((csum[None, :] <= j[:, None]).astype(jnp.int32), axis=1)
+        idx = jnp.minimum(idx, num_tokens - 1)
+    keep = j < csum[-1]
+    page_c = jnp.where(keep, jnp.take(page, idx), jnp.int32(OOB_PAGE))
+    slot_c = jnp.where(keep, jnp.take(slot, idx), 0)
+    return (
+        jnp.take(kv_c_normed, idx, axis=0),
+        jnp.take(k_pe, idx, axis=0),
+        page_c,
+        slot_c,
+    )
+
+
 def update_sparse_mla_kv_cache_dcp(
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
@@ -575,6 +634,16 @@ def update_sparse_mla_kv_cache_dcp(
         dcp_size=dcp_size,
         interleave_size=interleave_size,
     )
+    if envs.TPU_INDEXER_K_WRITE_COMPACT:
+        kv_c_normed, k_pe, page, slot = _compact_dcp_mla_rows(
+            kv_c_normed,
+            k_pe,
+            page,
+            slot,
+            num_seqs=seq_lens.shape[0],
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
     return _scatter_caches(
         kv_cache_nope,
         kv_cache_rope,
