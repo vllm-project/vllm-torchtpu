@@ -94,26 +94,34 @@ def _kernel(
     groups = x.shape[1] // HEADS_PER_GROUP
     width = wa.shape[1] // groups
     windows = wb.shape[1] // WINDOW
+    group_depth, window_depth = xb.shape[0], wbb.shape[0]
 
-    def x_copy(g):
+    def succ(slot, depth):
+        # Next ring slot. Loops carry the slot instead of computing i % depth,
+        # a scalar division.
+        if isinstance(slot, int):
+            return (slot + 1) % depth
+        return jnp.where(slot == depth - 1, 0, slot + 1)
+
+    def x_copy(g, slot):
         return pltpu.make_async_copy(
             x.at[:, pl.ds(g * HEADS_PER_GROUP, HEADS_PER_GROUP), :],
-            xb.at[g % GROUP_DEPTH],
-            xsem.at[g % GROUP_DEPTH],
+            xb.at[slot],
+            xsem.at[slot],
         )
 
-    def wa_copy(g):
+    def wa_copy(g, slot):
         return pltpu.make_async_copy(
             wa.at[:, pl.ds(g * width, width)],
-            wab.at[g % GROUP_DEPTH],
-            wsem.at[g % GROUP_DEPTH],
+            wab.at[slot],
+            wsem.at[slot],
         )
 
-    def wb_copy(i):
+    def wb_copy(i, slot):
         return pltpu.make_async_copy(
             wb.at[:, pl.ds(i * WINDOW, WINDOW)],
-            wbb.at[i % WINDOW_DEPTH],
-            bsem.at[i % WINDOW_DEPTH],
+            wbb.at[slot],
+            bsem.at[slot],
         )
 
     def out_copy(i):
@@ -124,26 +132,30 @@ def _kernel(
     sa_copy = pltpu.make_async_copy(sa, sav, ssem.at[0])
     sb_copy = pltpu.make_async_copy(sb, sbv, ssem.at[1])
 
-    def quantize_a(g):
+    # The quantized wo_a input alternates between two slots. Callers pass the
+    # slot as a Python int: with a traced index the compiler cannot tell the
+    # slots apart and keeps one group's quantize stores ahead of the other
+    # group's matmul loads.
+    def quantize_a(xslot, slot):
         # Same operations as wo_a_projection's quantized _kernel body.
-        v = xb[g % GROUP_DEPTH].reshape(tokens, -1)
+        v = xb[xslot].reshape(tokens, -1)
         amax = jnp.max(jnp.abs(v), axis=1, keepdims=True)
         inv = (FP8_E4M3_MAX / jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(
             jnp.bfloat16
         )
-        qa[g % 2] = (v * inv).astype(qa.dtype)
-        ia[g % 2] = inv.astype(jnp.float32)
+        qa[slot] = (v * inv).astype(qa.dtype)
+        ia[slot] = inv.astype(jnp.float32)
 
-    def project_a(g):
+    def project_a(g, wslot, slot):
         partial = jax.lax.dot_general(
-            qa[g % 2],
-            wab[g % GROUP_DEPTH],
+            qa[slot],
+            wab[wslot],
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
         start = g * width if isinstance(g, int) else pl.multiple_of(g * width, width)
         cols = pl.ds(start, width)
-        v = ((partial * (1.0 / ia[g % 2])) * sav[:, cols]).astype(y.dtype)
+        v = ((partial * (1.0 / ia[slot])) * sav[:, cols]).astype(y.dtype)
         y[:, cols] = v
         # wo_b's row amax, exact: max is order independent.
         ya[...] = jnp.maximum(
@@ -154,46 +166,86 @@ def _kernel(
         for i, at in enumerate(b_issue):
             if isinstance(g, int):
                 if g == at:
-                    wb_copy(i).start(priority=weight_priority)
+                    wb_copy(i, i).start(priority=weight_priority)
             else:
 
                 @pl.when(g == at)
                 def _(i=i):
-                    wb_copy(i).start(priority=weight_priority)
+                    wb_copy(i, i).start(priority=weight_priority)
 
     with jax.named_scope("op_start"):
         sa_copy.start()
-        for g in range(GROUP_DEPTH):
-            x_copy(g).start()
+        # Group 0's matmul needs both x0 and wa0; queue wa0 right behind x0
+        # instead of behind every activation copy.
+        x_copy(0, 0).start()
+        wa_copy(0, 0).start()
+        for g in range(1, group_depth):
+            x_copy(g, g).start()
         sb_copy.start()
-        for g in range(GROUP_DEPTH):
-            wa_copy(g).start(priority=weight_priority)
+        for g in range(1, group_depth):
+            wa_copy(g, g).start(priority=weight_priority)
         ya[...] = jnp.zeros(ya.shape, ya.dtype)
-        x_copy(0).wait()
-        quantize_a(0)
+        x_copy(0, 0).wait()
+        quantize_a(0, 0)
         sa_copy.wait()
 
-    # Iteration g quantizes group g + 1 and multiplies group g; the two are
-    # independent, so their vector and MXU work can interleave.
-    @pl.loop(0, groups - 1, unroll=False)
-    def _(g):
+    # Step g quantizes group g + 1 and multiplies group g; the two are
+    # independent, so their vector and MXU work can interleave. slot is
+    # g's parity, static in every caller; cur is g's ring slot, which group
+    # g + group_depth reuses once g's matmul is done. Returns g + 1's slot.
+    def step(g, slot, cur):
+        nxt = succ(cur, group_depth)
+        ahead = cur
         with jax.named_scope("op_a_group"):
-            x_copy(g + 1).wait()
-            quantize_a(g + 1)
-            wa_copy(g).wait()
-            project_a(g)
+            # Both waits first: the scheduler does not move vector work
+            # across a DMA wait, so a wait between the two would serialize them.
+            x_copy(g + 1, nxt).wait()
+            wa_copy(g, cur).wait()
+            quantize_a(nxt, 1 - slot)
+            project_a(g, cur, slot)
 
-        @pl.when(g + GROUP_DEPTH < groups)
-        def _():
-            x_copy(g + GROUP_DEPTH).start()
-            wa_copy(g + GROUP_DEPTH).start(priority=weight_priority)
+        if isinstance(g, int):
+            if g + group_depth < groups:
+                x_copy(g + group_depth, ahead).start()
+                wa_copy(g + group_depth, ahead).start(priority=weight_priority)
+        else:
+
+            @pl.when(g + group_depth < groups)
+            def _():
+                x_copy(g + group_depth, ahead).start()
+                wa_copy(g + group_depth, ahead).start(priority=weight_priority)
 
         issue_b(g)
+        return nxt
+
+    with jax.named_scope("op_a_first"):
+        # Group 0's matmul needs only wa0, which lands before x1: run it
+        # first instead of waiting for x1 with the steady-state step.
+        wa_copy(0, 0).wait()
+        project_a(0, 0, 0)
+        x_copy(1, 1).wait()
+        quantize_a(1, 1)
+    x_copy(group_depth, 0).start()
+    wa_copy(group_depth, 0).start(priority=weight_priority)
+    issue_b(0)
+
+    # Two steps per iteration so every quantized-input slot is static; a
+    # fully unrolled loop measured 1.1 us slower on v7 (spills).
+    pairs = (groups - 2) // 2
+
+    def pair(p, cur):
+        g = 2 * p + 1
+        return step(g + 1, 0, step(g, 1, cur))
+
+    jax.lax.fori_loop(0, pairs, pair, jnp.int32(1))
+    for g in range(1 + 2 * pairs, groups - 1):
+        step(g, g % 2, g % group_depth)
 
     with jax.named_scope("op_a_last"):
-        issue_b(groups - 1)
-        wa_copy(groups - 1).wait()
-        project_a(groups - 1)
+        last = groups - 1
+        issue_b(last)
+        wa_copy(last, last % group_depth).wait()
+        project_a(last, last % group_depth, last % 2)
 
     # Same operations and order as buffered._quantize_rows.
     with jax.named_scope("op_b_quant"):
@@ -216,11 +268,11 @@ def _kernel(
             quantize_rows(tokens // QUANT_ROWS * QUANT_ROWS, tokens % QUANT_ROWS)
         sb_copy.wait()
 
-    # Same operations as buffered._kernel's window loop.
-    @pl.loop(0, windows, unroll=False)
-    def _(i):
+    # Same operations as buffered._kernel's window loop. slot is window i's
+    # ring slot, which window i + window_depth refills; returns i + 1's slot.
+    def window(i, slot):
         with jax.named_scope("op_b_window"):
-            wb_copy(i).wait()
+            wb_copy(i, slot).wait()
 
             @pl.when(i >= 2)
             def _():
@@ -228,18 +280,21 @@ def _kernel(
 
             z = jax.lax.dot_general(
                 qb[...],
-                wbb[i % WINDOW_DEPTH, ...],
+                wbb[slot, ...],
                 (((1,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )
             z = (z * xs[...]) * sbv[pl.ds(i * WINDOW, WINDOW)][None, :]
             ob[i % 2, ...] = z.astype(out.dtype)
 
-        @pl.when(i + WINDOW_DEPTH < windows)
+        @pl.when(i + window_depth < windows)
         def _():
-            wb_copy(i + WINDOW_DEPTH).start(priority=weight_priority)
+            wb_copy(i + window_depth, slot).start(priority=weight_priority)
 
         out_copy(i).start()
+        return succ(slot, window_depth)
+
+    jax.lax.fori_loop(0, windows, window, jnp.int32(0))
 
     with jax.named_scope("op_drain"):
         out_copy(windows - 2).wait()
@@ -265,7 +320,9 @@ def fused_output_projection(
     groups = heads // HEADS_PER_GROUP
     width = features // groups
     k, n = wb.shape
-    assert len(b_issue) == WINDOW_DEPTH and all(0 <= at < groups for at in b_issue)
+    group_depth, window_depth = GROUP_DEPTH, WINDOW_DEPTH
+    assert len(b_issue) == window_depth and all(0 <= at < groups for at in b_issue)
+    assert group_depth < groups
     hbm = pltpu.HBM
     # Ordinary JAX primitives cannot consume Pallas memory-space annotations.
     # Reshape before constraining the array at the custom-call boundary.
@@ -275,26 +332,30 @@ def fused_output_projection(
     )
     f32, fp8 = jnp.float32, wa.dtype
     return pl.pallas_call(
-        functools.partial(_kernel, b_issue=b_issue, weight_priority=weight_priority),
+        functools.partial(
+            _kernel,
+            b_issue=b_issue,
+            weight_priority=weight_priority,
+        ),
         out_shape=jax.ShapeDtypeStruct((tokens, n), x.dtype),
         in_specs=(pl.BlockSpec(memory_space=hbm),) * 5,
         out_specs=pl.BlockSpec(memory_space=hbm),
         scratch_shapes=(
-            pltpu.VMEM((GROUP_DEPTH, tokens, HEADS_PER_GROUP, head_dim), x.dtype),
-            pltpu.VMEM((GROUP_DEPTH, reduction, width), fp8),
+            pltpu.VMEM((group_depth, tokens, HEADS_PER_GROUP, head_dim), x.dtype),
+            pltpu.VMEM((group_depth, reduction, width), fp8),
             pltpu.VMEM((2, tokens, reduction), fp8),
             pltpu.VMEM((2, tokens, 1), f32),
             pltpu.VMEM((tokens, features), x.dtype),
             pltpu.VMEM((tokens, 1), f32),
             pltpu.VMEM((tokens, k), fp8),
             pltpu.VMEM((tokens, 1), f32),
-            pltpu.VMEM((WINDOW_DEPTH, k, WINDOW), fp8),
+            pltpu.VMEM((window_depth, k, WINDOW), fp8),
             pltpu.VMEM((1, features), f32),
             pltpu.VMEM((n,), f32),
             pltpu.VMEM((2, tokens, WINDOW), x.dtype),
-            pltpu.SemaphoreType.DMA((GROUP_DEPTH,)),
-            pltpu.SemaphoreType.DMA((GROUP_DEPTH,)),
-            pltpu.SemaphoreType.DMA((WINDOW_DEPTH,)),
+            pltpu.SemaphoreType.DMA((group_depth,)),
+            pltpu.SemaphoreType.DMA((group_depth,)),
+            pltpu.SemaphoreType.DMA((window_depth,)),
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA((2,)),
         ),
