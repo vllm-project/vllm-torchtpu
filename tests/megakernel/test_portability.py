@@ -19,6 +19,8 @@ import ast
 import sys
 from pathlib import Path
 
+import pytest
+
 from vllm_torchtpu import megakernel
 
 
@@ -57,17 +59,7 @@ def _derive_required_modules(
     return required
 
 
-def test_megakernel_portability_ast_guard():
-    """Enforce relative internal imports, 0 vllm/torch deps, and jax._src allowlist.
-
-    Checks all `.py` files under `src/vllm_torchtpu/megakernel/`:
-    - Zero imports from `vllm`, `vllm_torchtpu`, or `torch`.
-    - All absolute (`level == 0`) imports come strictly from Python stdlib, `jax`,
-      or `numpy` (enforcing relative imports for all internal modules).
-    - Private `jax._src.*` imports are restricted to `{"pool_alias.py"}`.
-    - Dynamic import calls (`__import__`, `import_module`) are forbidden.
-    """
-    pkg_root = Path(megakernel.__file__).resolve().parent
+def _check_megakernel_portability(pkg_root: Path) -> None:
     jax_src_allowlist = {"pool_alias.py"}
     forbidden_roots = {"vllm", "vllm_torchtpu", "torch"}
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
@@ -106,19 +98,28 @@ def test_megakernel_portability_ast_guard():
             else:
                 continue
 
-            # `__init__.py` is the public package facade and may re-export
-            # model helpers; all other core modules outside `models/` must not.
+            # `__init__.py` is the public package facade and `models/` +
+            # `wholestep/` are model-specific assembly packages; all other core
+            # megakernel modules must remain model-agnostic.
             facade_allowlist = {"__init__.py"}
-            if rel not in facade_allowlist and not rel.startswith("models/"):
+            model_scoped_prefixes = ("models/", "wholestep/")
+            model_scoped_roots = {"models", "wholestep"}
+            if rel not in facade_allowlist and not rel.startswith(
+                model_scoped_prefixes
+            ):
                 for mod in modules:
-                    assert mod != "models" and not mod.startswith("models."), (
+                    mod_root = mod.split(".")[0]
+                    assert mod_root not in model_scoped_roots, (
                         f"{rel}:{node.lineno} imports '{mod}'; core megakernel "
-                        "modules must be model-agnostic and never import models/."
+                        "modules must be model-agnostic and never import "
+                        "models/ or wholestep/."
                     )
                 if not modules:
-                    assert "models" not in imported_names, (
-                        f"{rel}:{node.lineno} imports 'models'; core megakernel "
-                        "modules must be model-agnostic and never import models/."
+                    bad_names = model_scoped_roots.intersection(imported_names)
+                    assert not bad_names, (
+                        f"{rel}:{node.lineno} imports {sorted(bad_names)}; core "
+                        "megakernel modules must be model-agnostic and never "
+                        "import models/ or wholestep/."
                     )
 
             for mod in modules:
@@ -138,6 +139,38 @@ def test_megakernel_portability_ast_guard():
                         f"{rel}:{node.lineno} imports private JAX API '{mod}', "
                         f"which is restricted to allowlist {sorted(jax_src_allowlist)}."
                     )
+
+
+def test_megakernel_portability_ast_guard():
+    """Enforce relative internal imports, 0 vllm/torch deps, and jax._src allowlist."""
+    _check_megakernel_portability(Path(megakernel.__file__).resolve().parent)
+
+
+def test_megakernel_portability_negative_controls(tmp_path: Path):
+    """Verify wholestep/ lookalike passes while core->wholestep or ml_dtypes fails."""
+    (tmp_path / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "ops.py").write_text("import jax.numpy as jnp\n", encoding="utf-8")
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "models" / "qwen38.py").write_text("X = 1\n", encoding="utf-8")
+    (tmp_path / "wholestep").mkdir()
+    (tmp_path / "wholestep" / "__init__.py").write_text("", encoding="utf-8")
+    ws_file = tmp_path / "wholestep" / "spec.py"
+    ws_file.write_text("from ..models.qwen38 import X\n", encoding="utf-8")
+
+    # Valid lookalike: wholestep/ importing ..models passes.
+    _check_megakernel_portability(tmp_path)
+
+    # Positive violation 1: core module importing wholestep/ fails.
+    (tmp_path / "ops.py").write_text("from .wholestep import spec\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="never import models/ or wholestep/"):
+        _check_megakernel_portability(tmp_path)
+    (tmp_path / "ops.py").write_text("import jax.numpy as jnp\n", encoding="utf-8")
+
+    # Positive violation 2: disallowed external import ml_dtypes fails.
+    ws_file.write_text("import ml_dtypes\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="disallowed import 'ml_dtypes'"):
+        _check_megakernel_portability(tmp_path)
 
 
 def test_blocks_do_not_import_experimental_code():
