@@ -16,6 +16,8 @@
 #   HOT_SET       "" (real/dummy routing) | "uniform" (balanced simulated routing) | "<size>:<rate>[:spread]"
 #                 skewed simulated routing: <rate> of the tokens route only into <size> fixed experts
 #   BLOCK_SIZE    --block-size (baseline 384)
+#   WEIGHTS       dummy (default) | real: real checkpoint at MODEL_PATH
+#   KV_MODE       synthetic (default, needs dummy weights) | normal: real prefill with prefix caching
 #   EXTRA_ARGS    appended verbatim to vllm serve
 set -euo pipefail
 # shellcheck disable=SC1091
@@ -28,9 +30,20 @@ FUSED_EP=${FUSED_EP:-0}
 W4A8=${W4A8:-0}
 BLOCK_SIZE=${BLOCK_SIZE:-384}
 HOT_SET=${HOT_SET:-}
+WEIGHTS=${WEIGHTS:-dummy}
+KV_MODE=${KV_MODE:-synthetic}
 read -r -a EXTRA_ARGV <<< "${EXTRA_ARGS:-}"
 cd "$(dirname -- "$0")/.."
 
+LOAD_ARGS=(--load-format dummy)
+[[ "$WEIGHTS" == real ]] && LOAD_ARGS=()
+case "$KV_MODE" in
+  synthetic)
+    [[ "$WEIGHTS" == dummy ]] || { echo "KV_MODE=synthetic requires WEIGHTS=dummy" >&2; exit 2; }
+    CACHE_ARGS=(--no-enable-prefix-caching --kv-transfer-config '{"kv_connector":"DecodeBenchConnector","kv_connector_module_path":"synthetic_decode_connector","kv_role":"kv_both","kv_connector_extra_config":{"synthetic_decode_benchmark":true}}') ;;
+  normal) CACHE_ARGS=(--enable-prefix-caching) ;;
+  *) echo "KV_MODE must be synthetic or normal" >&2; exit 2 ;;
+esac
 SPEC_ARGS=()
 if (( MTP_K > 0 )); then
   SPEC_ARGS=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP_K}")
@@ -56,7 +69,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \
@@ -82,7 +95,7 @@ exec numactl --interleave=all "$VLLM_BIN" serve \
   --seed 42 \
   --generation-config vllm \
   --mamba-cache-mode align \
-  --load-format dummy \
+  "${LOAD_ARGS[@]}" \
   --hf-overrides '{"max_position_embeddings":1048576,"rope_parameters":{"partial_rotary_factor":0.25,"rope_theta":10000000,"type":"yarn","rope_type":"yarn","factor":4,"original_max_position_embeddings":262144}}' \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --block-size "$BLOCK_SIZE" \
@@ -97,6 +110,5 @@ exec numactl --interleave=all "$VLLM_BIN" serve \
   --port 8000 \
   --enable-prompt-tokens-details \
   "${KV_ARGS[@]}" \
-  --no-enable-prefix-caching \
-  --kv-transfer-config '{"kv_connector":"DecodeBenchConnector","kv_connector_module_path":"synthetic_decode_connector","kv_role":"kv_both","kv_connector_extra_config":{"synthetic_decode_benchmark":true}}' \
+  "${CACHE_ARGS[@]}" \
   "${EXTRA_ARGV[@]}"
