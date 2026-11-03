@@ -721,3 +721,45 @@ def test_qwen_consumer_suffix_load_lists_suffix_pages_and_clips_each_tag(
     # Two whole 4096-byte source pages of each token pool stay local.
     assert task.call_kwargs["dst_skip_bytes"] == [8192, 8192, 0, 0, 0]
     assert task.skip_tokens == 256
+
+
+@pytest.mark.parametrize(
+    "tokens,align,keep",
+    [
+        (300, 0, 299),  # off: one short of the prompt
+        (300, 128, 256),  # on: the last multiple of 128 below 299
+        (257, 128, 256),  # 256 is already a multiple: one short
+        (129, 128, 128),
+        (100, 128, 99),  # shorter than one unit: one-token handoff
+        (2, 128, 1),
+    ],
+)
+def test_aligned_handoff_ends_on_the_decode_block_boundary(
+    tokens, align, keep, monkeypatch
+):
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+        _stage3_handoff_prefix,
+    )
+
+    assert _stage3_handoff_prefix(tokens, align) == keep
+    monkeypatch.setenv("TPU_RAIDEN_HANDOFF_ALIGN_TOKENS", str(align))
+    scheduler = connector(_make_vllm_config()).connector_scheduler
+    prompt = list(range(10, 10 + tokens))
+    request = SimpleNamespace(
+        request_id="aligned",
+        prompt_token_ids=prompt.copy(),
+        _all_token_ids=prompt.copy(),
+        num_prompt_tokens=tokens,
+        kv_transfer_params=None,
+    )
+    scheduler.on_new_request(request)
+    scheduler.on_new_request(request)  # idempotent
+    assert request.prompt_token_ids == prompt[:keep]
+    assert request._all_token_ids == prompt[:keep]
+    assert request.num_prompt_tokens == keep
+    params = request.kv_transfer_params
+    assert params["_p_side_truncated"]
+    assert params["_p_side_next_prompt_token_id"] == prompt[keep]
+    # The published extent is the computed prefix, which the decode loads
+    # and then recomputes the rest of the prompt from.
+    assert scheduler._stage3_transfer_tokens(request, keep) == keep

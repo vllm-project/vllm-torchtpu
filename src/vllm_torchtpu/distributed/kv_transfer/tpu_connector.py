@@ -215,6 +215,22 @@ class _Stage3TransferGroup:
         return pages[-1:]
 
 
+def _stage3_handoff_prefix(num_prompt_tokens: int, align_tokens: int) -> int:
+    """Prompt tokens a state-bearing Stage-3 producer computes and publishes.
+
+    One short of the prompt (the decode peer computes the last token for its
+    first logits), or, with ``align_tokens`` (TPU_RAIDEN_HANDOFF_ALIGN_TOKENS),
+    the largest multiple of it below that, so the published running state sits
+    on the decode's block boundary and becomes its cacheable replay
+    checkpoint; the decode recomputes the rest. A prompt shorter than one unit
+    keeps the one-token handoff.
+    """
+    keep = num_prompt_tokens - 1
+    if align_tokens > 0 and keep >= align_tokens:
+        keep = keep // align_tokens * align_tokens
+    return keep
+
+
 # vLLM reserves block 0 as the null block and points every freed sliding-window
 # entry at it, so a transfer range containing it is a range whose KV is gone.
 _STAGE3_NULL_BLOCK_ID = 0
@@ -1161,9 +1177,16 @@ class TPUConnectorScheduler:
             return
         if request.prompt_token_ids is None:
             return
-        next_prompt_token_id = request.prompt_token_ids.pop()
-        request._all_token_ids.pop()
-        request.num_prompt_tokens -= 1
+        keep = _stage3_handoff_prefix(
+            int(request.num_prompt_tokens),
+            int(tpu_envs.TPU_RAIDEN_HANDOFF_ALIGN_TOKENS),
+        )
+        # The first dropped token: the continuation of the published prefix.
+        next_prompt_token_id = request.prompt_token_ids[keep]
+        while len(request.prompt_token_ids) > keep:
+            request.prompt_token_ids.pop()
+            request._all_token_ids.pop()
+        request.num_prompt_tokens = keep
         if request.kv_transfer_params is None:
             request.kv_transfer_params = {}
         request.kv_transfer_params["_p_side_truncated"] = True
