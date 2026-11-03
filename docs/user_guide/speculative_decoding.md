@@ -79,11 +79,7 @@ vllm serve Qwen/Qwen3-4B \
   }'
 ```
 
----
-
-## 4. DSpark Speculative Decoding
-
-DSpark drafts a block in one parallel forward and then corrects each slot with a lightweight Markov head conditioned on the previously drafted token. `DeepSeek-V4` checkpoints that ship a DSpark draft carry it under `mtp.*`, so no separate model is needed. Start from the `DeepSeek-V4-Pro` `v7x-16` recipe in the [TPU v7x serving recipes](../deployment/v7x_recipes.md), with its environment variables, and add the speculative config:
+`DeepSeek-V4` checkpoints that ship a DSpark draft carry it under `mtp.*`, so no separate model is needed. Start from the `DeepSeek-V4-Pro` `v7x-16` recipe in the [TPU v7x serving recipes](../deployment/v7x_recipes.md), with its environment variables, and add the speculative config:
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-V4-Pro-DSpark \
@@ -97,7 +93,7 @@ vllm serve deepseek-ai/DeepSeek-V4-Pro-DSpark \
   }'
 ```
 
-### Adaptive verification
+#### Adaptive verification
 
 With `"enable_adaptive_verification": true`, each decode step verifies only the drafts worth their cost. The checkpoint's confidence head scores every draft; a draft's survival probability is the running product of the confidences up to it, and the step verifies the globally most likely drafts, as many as maximize expected tokens per millisecond under a step-cost table the server profiles at startup. Outputs are unchanged: unverified drafts are treated as rejected.
 
@@ -111,7 +107,7 @@ The startup profile times decode-shaped verify steps at several request counts, 
 
 ---
 
-## 5. Draft-Model-Free Speculative Decoding (`ngram` & `suffix`)
+## 4. Draft-Model-Free Speculative Decoding (`ngram` & `suffix`)
 
 When no separate draft model is available, use `"ngram"` or `"suffix"` matching directly on prompt tokens:
 
