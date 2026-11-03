@@ -43,28 +43,26 @@ QUANT_ROWS = 32
 VMEM_HEADROOM = 1.5
 
 
-def _out_block(n: int, token_minor_cols: int) -> int | None:
-    # Each chunk lands wholly in the row-major or the token-minor part.
+def _out_block(n: int, split_cols: int) -> int | None:
+    # Each chunk lands wholly in one output.
     for block in range(OUT_BLOCK, 0, -128):
-        if n % block == 0 and token_minor_cols % block == 0:
+        if n % block == 0 and split_cols % block == 0:
             return block
     return None
 
 
-def _vmem_limit_bytes(k: int, n: int, out_block: int, token_minor_cols: int) -> int:
+def _vmem_limit_bytes(k: int, n: int, out_block: int) -> int:
     x = 2 * ROW_BLOCK * k * 2  # double-buffered bf16 input block
     x_q = 2 * ROW_BLOCK * k  # two fp8 slots
     x_scale = 2 * ROW_BLOCK * 128 * 4  # (rows, 1) f32 pads to 128 lanes
-    # Resident fp8 weight and its scales: (n_tm, 1) pads to 128 lanes,
-    # (1, n_rm) to 8 sublanes.
-    w = k * n + (8 * (n - token_minor_cols) + 128 * token_minor_cols) * 4
+    w = k * n + 8 * n * 4  # resident fp8 weight; its (1, n) scale pads to 8 rows
     out = 2 * ROW_BLOCK * n * 2  # double-buffered bf16 output blocks
     acc = ROW_BLOCK * out_block * 4
     return int(VMEM_HEADROOM * (x + x_q + x_scale + w + out + acc))
 
 
 def supports(
-    x: jax.Array, w_q: jax.Array, w_scale: jax.Array, token_minor_cols: int = 0
+    x: jax.Array, w_q: jax.Array, w_scale: jax.Array, split_cols: int = 0
 ) -> bool:
     """Whether `dynamic_quant_matmul` takes these operands (static shapes)."""
     if x.ndim != 2 or w_q.ndim != 2 or w_scale.shape != w_q.shape[1:]:
@@ -73,13 +71,12 @@ def supports(
         return False
     m, k = x.shape
     n = w_q.shape[1]
-    if m == 0 or m % ROW_BLOCK or k % 128 or not 0 <= token_minor_cols <= n:
+    if m == 0 or m % ROW_BLOCK or k % 128 or not 0 <= split_cols < n:
         return False
-    out_block = _out_block(n, token_minor_cols)
+    out_block = _out_block(n, split_cols)
     if out_block is None:
         return False
-    vmem = _vmem_limit_bytes(k, n, out_block, token_minor_cols)
-    return vmem <= min(DEVICE_VMEM_LIMIT.values())
+    return _vmem_limit_bytes(k, n, out_block) <= min(DEVICE_VMEM_LIMIT.values())
 
 
 def _quantize_rows(x_ref, x_q_ref, x_scale_ref, rows):
@@ -96,18 +93,10 @@ def _quantize_rows(x_ref, x_q_ref, x_scale_ref, rows):
     x_q_ref[rows, :] = jnp.clip(x / scale, q_min, q_max).astype(q_dtype)
 
 
-def _kernel(x_ref, w_ref, *refs, out_block, n_rm, n_tm):
-    # Operands present only for a non-empty part: the row-major part's (1, n_rm)
-    # scale and (rows, n_rm) output, the token-minor part's (n_tm, 1) scale and
-    # (n_tm, rows) output.
-    refs = list(refs)
-    rm_scale_ref = refs.pop(0) if n_rm else None
-    tm_scale_ref = refs.pop(0) if n_tm else None
-    rm_out_ref = refs.pop(0) if n_rm else None
-    tm_out_ref = refs.pop(0) if n_tm else None
-    x_q_ref, x_scale_ref = refs
-    # w_ref is (n, k) when any part is token-minor, else (k, n).
-    w_nk = n_tm > 0
+def _kernel(x_ref, w_ref, w_scale_ref, *refs, out_block, n_first, w_nk):
+    # One output, or two when the trailing columns from `n_first` on are split
+    # off. w_ref is (n, k) when `w_nk`, else (k, n).
+    *out_refs, x_q_ref, x_scale_ref = refs
 
     # Step s quantizes row block s into slot s % 2 and multiplies row block
     # s - 1 from the other slot.
@@ -126,114 +115,85 @@ def _kernel(x_ref, w_ref, *refs, out_block, n_rm, n_tm):
 
     @pl.when(s > 0)
     def _():
-        n_chunks = (n_rm + n_tm) // out_block
+        n_chunks = w_scale_ref.shape[1] // out_block
         per_chunk = -(-len(quant_starts) // n_chunks)
         x_q = x_q_ref.at[(s + 1) % 2]
         x_scale = x_scale_ref[(s + 1) % 2]
-        if n_tm:
-            # The (n_tm, rows) output block scales its columns, so the per-row
-            # scales go lane-major once per block.
-            rows = x_scale.shape[0]
-            x_scale_t = jnp.transpose(jnp.broadcast_to(x_scale, (rows, 128)))[:1]
         # One basic block, so the scheduler interleaves the quantization of
         # the next row block with these matmuls. The last step re-quantizes
         # the last block into the free slot rather than branch.
         for j in range(n_chunks):
-            cols = pl.ds(j * out_block, out_block)
-            if j * out_block >= n_rm:
-                # Contract both operands on k for an (out_block, rows) slice
-                # of the transposed output.
-                part = pl.ds(j * out_block - n_rm, out_block)
+            col = j * out_block
+            cols = pl.ds(col, out_block)
+            if w_nk:
                 acc = jax.lax.dot_general(
-                    w_ref[cols, :],
                     x_q[...],
+                    w_ref[cols, :],
                     (((1,), (1,)), ((), ())),
                     preferred_element_type=jnp.float32,
                 )
-                acc = acc * x_scale_t
-                acc = acc * tm_scale_ref[part, :]
-                tm_out_ref[part, :] = acc.astype(tm_out_ref.dtype)
             else:
-                if w_nk:
-                    acc = jax.lax.dot_general(
-                        x_q[...],
-                        w_ref[cols, :],
-                        (((1,), (1,)), ((), ())),
-                        preferred_element_type=jnp.float32,
-                    )
-                else:
-                    acc = jnp.dot(
-                        x_q[...], w_ref[:, cols], preferred_element_type=jnp.float32
-                    )
-                acc = acc * x_scale
-                acc = acc * rm_scale_ref[:, cols]
-                rm_out_ref[:, cols] = acc.astype(rm_out_ref.dtype)
+                acc = jnp.dot(
+                    x_q[...], w_ref[:, cols], preferred_element_type=jnp.float32
+                )
+            acc = acc * x_scale
+            acc = acc * w_scale_ref[:, cols]
+            if col < n_first:
+                out_refs[0][:, cols] = acc.astype(out_refs[0].dtype)
+            else:
+                part = pl.ds(col - n_first, out_block)
+                out_refs[1][:, part] = acc.astype(out_refs[1].dtype)
             quantize(quant_starts[j * per_chunk : (j + 1) * per_chunk])
 
 
-@functools.partial(jax.jit, static_argnames=("token_minor_cols",))
+@functools.partial(jax.jit, static_argnames=("split_cols", "weight_nk"))
 def dynamic_quant_matmul(
     x: jax.Array,  # [m, k] bf16
     w_q: jax.Array,  # [k, n] fp8
     w_scale: jax.Array,  # [n]
-    token_minor_cols: int = 0,
+    split_cols: int = 0,
+    weight_nk: bool = False,
 ) -> jax.Array:
     """`x @ w_q` with per-row dynamic FP8 quantization of `x`, as [m, n].
 
-    The last `token_minor_cols` output columns are written as an [n_tm, m]
-    row-major array and returned transposed, so a consumer that reads those
-    columns token-minor gets them through a layout change instead of a
-    transposing copy; the other columns are written [m, n_rm] row-major. A
-    split result is the concatenation of the two parts, which XLA folds away
-    when the consumers slice at the split.
+    With `split_cols`, the last that many columns are written as their own
+    [m, split_cols] array and the result is the concatenation of the two,
+    which XLA folds away when the consumers slice at the split. `weight_nk`
+    says `w_q` is the transpose of a stored [n, k] array, which the kernel
+    then reads as is.
     """
-    if not supports(x, w_q, w_scale, token_minor_cols):
+    if not supports(x, w_q, w_scale, split_cols):
         raise ValueError(f"unsupported operands {x.shape=} {x.dtype=} {w_q.shape=}")
     m, k = x.shape
     n = w_q.shape[1]
-    n_tm = token_minor_cols
-    n_rm = n - n_tm
-    out_block = _out_block(n, n_tm)
+    n_first = n - split_cols
+    out_block = _out_block(n, split_cols)
     nb = m // ROW_BLOCK
-    w_scale = w_scale.astype(jnp.float32)
-    rm_out_spec = pl.BlockSpec((ROW_BLOCK, n_rm), lambda s: (jnp.maximum(s - 1, 0), 0))
-    tm_out_spec = pl.BlockSpec((n_tm, ROW_BLOCK), lambda s: (0, jnp.maximum(s - 1, 0)))
-    if n_tm:
+    if weight_nk:
         w_q = w_q.T
-    in_specs = [
-        pl.BlockSpec((ROW_BLOCK, k), lambda s: (jnp.minimum(s, nb - 1), 0)),
-        pl.BlockSpec(w_q.shape, lambda s: (0, 0)),
-    ]
-    operands = [x, w_q]
-    out_specs, out_shapes = [], []
-    if n_rm:
-        in_specs.append(pl.BlockSpec((1, n_rm), lambda s: (0, 0)))
-        operands.append(w_scale[:n_rm].reshape(1, n_rm))
-        out_specs.append(rm_out_spec)
-        out_shapes.append(jax.ShapeDtypeStruct((m, n_rm), x.dtype))
-    if n_tm:
-        in_specs.append(pl.BlockSpec((n_tm, 1), lambda s: (0, 0)))
-        operands.append(w_scale[n_rm:].reshape(n_tm, 1))
-        out_specs.append(tm_out_spec)
-        out_shapes.append(jax.ShapeDtypeStruct((n_tm, m), x.dtype))
+    widths = [n_first, split_cols] if split_cols else [n]
     outs = pl.pallas_call(
-        functools.partial(_kernel, out_block=out_block, n_rm=n_rm, n_tm=n_tm),
+        functools.partial(
+            _kernel, out_block=out_block, n_first=n_first, w_nk=weight_nk
+        ),
         grid=(nb + 1,),
-        in_specs=in_specs,
-        out_specs=out_specs,
-        out_shape=out_shapes,
+        in_specs=[
+            pl.BlockSpec((ROW_BLOCK, k), lambda s: (jnp.minimum(s, nb - 1), 0)),
+            pl.BlockSpec(w_q.shape, lambda s: (0, 0)),
+            pl.BlockSpec((1, n), lambda s: (0, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((ROW_BLOCK, w), lambda s: (jnp.maximum(s - 1, 0), 0))
+            for w in widths
+        ],
+        out_shape=[jax.ShapeDtypeStruct((m, w), x.dtype) for w in widths],
         scratch_shapes=[
             pltpu.VMEM((2, ROW_BLOCK, k), w_q.dtype),
             pltpu.VMEM((2, ROW_BLOCK, 1), jnp.float32),
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=_vmem_limit_bytes(k, n, out_block, n_tm),
+            vmem_limit_bytes=_vmem_limit_bytes(k, n, out_block),
         ),
-    )(*operands)
-    parts = []
-    if n_rm:
-        parts.append(outs[0])
-    if n_tm:
-        parts.append(outs[-1].T)
-    return parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=1)
+    )(x, w_q, w_scale.astype(jnp.float32).reshape(1, n))
+    return outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=1)

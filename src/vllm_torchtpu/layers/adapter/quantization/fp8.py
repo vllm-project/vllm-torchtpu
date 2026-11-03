@@ -87,7 +87,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
-    TOKEN_MINOR_OUTPUT_ATTR,
+    SPLIT_OUTPUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     quantized_matmul,
 )
@@ -1672,9 +1672,11 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     ) -> torch.Tensor:
         layer = cast("TpuLinear", layer)
         weight = layer.weight
-        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+        keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        if keep_vllm_layout:
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
+            # `weight_nk` below has the FP8 kernel read it as stored.
             weight = weight.transpose(0, 1)
         if isinstance(layer, VocabParallelEmbedding):
             # Prevent the quantization of activations to FP8 (W8A16).
@@ -1685,7 +1687,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 weight,
                 layer.weight_scale,
                 w8a16_max_rows=self.w8a16_max_rows,
-                token_minor_cols=getattr(layer, TOKEN_MINOR_OUTPUT_ATTR, 0),
+                split_cols=getattr(layer, SPLIT_OUTPUT_ATTR, 0),
+                weight_nk=keep_vllm_layout,
             )
         if bias is not None:
             out = out + bias
