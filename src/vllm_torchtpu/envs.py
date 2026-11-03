@@ -1170,11 +1170,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MLA_PREFILL_SEQUENCE_ROWS", default=False
     ),
     # How TPU_MLA_PREFILL_SEQUENCE_ROWS gathers the o_proj / W_UV / scale
-    # shards (`kernels/mla/rows_oproj.py` GATHERS): all-gathers, collective-
-    # permutes around a ring of the slice, or o_proj by all-gather and the small
-    # W_UV / scale shards by independent collective-permutes from every rank.
+    # shards (`kernels/mla/rows_oproj.py` GATHERS): all-gathers, or o_proj by
+    # all-gather and the small W_UV / scale shards by independent
+    # collective-permutes from every rank.
     "TPU_MLA_PREFILL_ROWS_GATHER": env_with_choices(
-        "TPU_MLA_PREFILL_ROWS_GATHER", "allgather", ["allgather", "ring", "hybrid"]
+        "TPU_MLA_PREFILL_ROWS_GATHER", "allgather", ["allgather", "hybrid"]
     ),
     # With TPU_MLA_PREFILL_SEQUENCE_ROWS, the dense layers in front of the first
     # MoE layer join the sequence-parallel stream too: the rows attention block,

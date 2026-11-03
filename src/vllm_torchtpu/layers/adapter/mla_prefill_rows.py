@@ -174,15 +174,14 @@ def _build_ops() -> _Rows:
     if gather in _OPS:
         return _OPS[gather]
     mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
-    ring = None
-    if rows_oproj.needs_ring(gather):
-        ring = rows_oproj.ring_order(mesh.devices.reshape(-1))
     sharded = P(DCP_AXIS_NAME)
 
     def local(w_o, w_uv, w_scale, after):
-        # Each rank's gathered shards stacked along dim 0 of the outputs.
+        # Each rank's gathered shards stacked along dim 0 of the outputs. The
+        # served modes need no ring order (the mesh's devices carry no
+        # coordinates to build one from).
         return rows_oproj.gather_shards(
-            w_o, w_uv, w_scale, after, DCP_AXIS_NAME, gather, ring
+            w_o, w_uv, w_scale, after, DCP_AXIS_NAME, gather
         )
 
     def gather_fn(

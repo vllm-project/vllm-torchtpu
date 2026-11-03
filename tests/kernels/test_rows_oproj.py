@@ -73,10 +73,11 @@ def test_rows_oproj_matches_reference(rows, block_rows):
     )
 
 
-def test_ring_modes_need_a_ring():
+def test_only_the_ring_mode_needs_a_ring_order():
+    assert [m for m in sorted(ro.GATHERS) if ro.needs_ring(m)] == ["ring"]
     w_o, w_uv, w_scale = _shards()
     with pytest.raises(ValueError, match="ring order"):
-        ro.gather_shards(w_o[0], w_uv[0], w_scale[0], w_o[0], "x", "hybrid")
+        ro.gather_shards(w_o[0], w_uv[0], w_scale[0], w_o[0], "x", "ring")
 
 
 def test_rows_oproj_rejects_mismatched_shards():

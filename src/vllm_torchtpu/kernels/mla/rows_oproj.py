@@ -85,13 +85,14 @@ def _ring_all_gather(x: jax.Array, axis_name: str, ring: tuple[int, ...]) -> jax
     return out
 
 
-def _permute_all_gather(x: jax.Array, axis_name: str, n: int) -> jax.Array:
-    """`lax.all_gather(x, axis_name)` by `n - 1` independent collective-
-    permutes (rank r sends to r + k for each k): async on the TensorCores'
-    DMA engines, and no step waits for another."""
+def _permute_all_gather(x: jax.Array, axis_name: str) -> jax.Array:
+    """`lax.all_gather(x, axis_name)` by independent collective-permutes
+    (rank r sends to r + k for each k): async on the TensorCores' DMA
+    engines, and no step waits for another."""
     if x.dtype == FP8:  # stacked as bytes, as in `_ring_all_gather`
-        out = _permute_all_gather(lax.bitcast_convert_type(x, jnp.uint8), axis_name, n)
+        out = _permute_all_gather(lax.bitcast_convert_type(x, jnp.uint8), axis_name)
         return lax.bitcast_convert_type(out, FP8)
+    n = lax.axis_size(axis_name)
     rank = lax.all_to_all(jnp.arange(n, dtype=jnp.int32), axis_name, 0, 0, tiled=True)
     out = jnp.zeros((n, *x.shape), x.dtype)
     out = lax.dynamic_update_index_in_dim(out, x, rank[0], 0)
@@ -114,9 +115,9 @@ GATHERS = {
 
 
 def needs_ring(mode: str) -> bool:
-    """Whether gather `mode` moves anything by collective-permutes (and so
-    needs `ring_order`)."""
-    return bool(set(GATHERS[mode]) - {"ag"})
+    """Whether gather `mode` moves anything around the ring (and so needs
+    `ring_order`, which reads the devices' coordinates)."""
+    return "ring" in GATHERS[mode]
 
 
 def gather_shards(
@@ -150,7 +151,7 @@ def gather_shards(
         if h == "ring":
             parts[i] = _ring_all_gather(parts[i], axis_name, ring)
         elif h == "permute":
-            parts[i] = _permute_all_gather(parts[i], axis_name, len(ring))
+            parts[i] = _permute_all_gather(parts[i], axis_name)
     w_o, w_uv, w_scale = parts
     return w_o, w_uv.reshape(-1, *w_uv.shape[2:]), w_scale
 
