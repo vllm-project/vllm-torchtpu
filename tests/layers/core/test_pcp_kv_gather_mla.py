@@ -86,12 +86,21 @@ def _mesh():
     return jax.sharding.Mesh(np.array(devices[:DCP]), (streamindex_topk.DCP_AXIS_NAME,))
 
 
-def _specs(layout):
+def _specs(layout, packed_rope=False):
     packing = sparse_mla_kernel.get_dtype_packing(jnp.float8_e4m3fn)
-    return tuple(
-        SparseMLAKVCacheSpec.create(kind, layout, NUM_PAGES, PAGE_SIZE, dim, packing)
-        for kind, dim in ((KVCacheType.NOPE, LKV_DIM), (KVCacheType.ROPE, ROPE_DIM))
+    nope = SparseMLAKVCacheSpec.create(
+        KVCacheType.NOPE, layout, NUM_PAGES, PAGE_SIZE, LKV_DIM, packing
     )
+    rope = SparseMLAKVCacheSpec.create(
+        KVCacheType.ROPE,
+        layout,
+        NUM_PAGES,
+        PAGE_SIZE,
+        ROPE_DIM,
+        packing,
+        packed_rope=packed_rope,
+    )
+    return nope, rope
 
 
 def _fake_runner(num_computed, num_prompt, q_lens, seq_lens):
@@ -295,13 +304,16 @@ def _fp8(rng, shape, scale=1.0):
     )
 
 
-@pytest.mark.parametrize("layout", ["sparsecore", "tensorcore"])
+@pytest.mark.parametrize("layout", ["sparsecore", "sparsecore_packed", "tensorcore"])
 @pytest.mark.parametrize("pcp", [2, 4, 8])
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
 def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout):
     mesh = _mesh()
     monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", CHUNK_TOKENS)
-    nope_spec, rope_spec = _specs(KVCacheLayout(layout))
+    packed_rope = layout == "sparsecore_packed"
+    nope_spec, rope_spec = _specs(
+        KVCacheLayout(layout.removesuffix("_packed")), packed_rope=packed_rope
+    )
     chunk_pages = pcp_chunk_pages(PAGE_SIZE, DCP)
     rng = np.random.default_rng(zlib.crc32(f"{scenario}-{pcp}-{layout}".encode()))
     tp = DCP // pcp

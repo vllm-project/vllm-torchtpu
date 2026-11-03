@@ -1914,6 +1914,8 @@ def sparse_mla_attention_pcp_prefill(
                 sm_scale=sm_scale or 1.0,
                 k_scale=dequant_scale,
                 cache_layout=cache_layout,
+                # Packed rope pages (8 tokens per row) gather as whole pages too.
+                packed_rope=rope_spec.packed_rope,
             )
             # Drop the rope tail: only the nope part is the MLA value.
             return output[..., :lkv_dim].astype(ql_nope.dtype)
