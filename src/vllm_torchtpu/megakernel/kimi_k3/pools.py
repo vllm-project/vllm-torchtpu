@@ -43,8 +43,129 @@ MLA_LAYERS = len(LAYOUT.attention_layers)
 KDA_LAYERS = len(LAYOUT.state_layers)
 SSM_ROWS = LAYOUT.region("recurrent").rows
 CONV_ROWS = LAYOUT.region("conv").rows
+TOTAL_STATE_ROWS = SSM_ROWS + CONV_ROWS
 DRAFT_ROW0 = LAYOUT.region("draft").first_row
 DRAFT_ROWS = LAYOUT.region("draft").rows
+
+
+def kda_state_packed_shapes(pool) -> tuple[tuple[int, int], tuple[int, int]]:
+    """``((ssm_rows, 128), (conv_rows, lanes))`` per state block in ``pool``."""
+    from vllm_torchtpu.kernels import pool_adapters
+
+    _, payload, lanes = pool_adapters._pool_geometry(pool)
+    ssm_split = lanes // HEAD_DIM
+    ssm_pay = (
+        payload
+        if jnp.dtype(pool.dtype) == jnp.dtype(jnp.float32)
+        else pool_adapters._bitcast_payload(payload, pool.dtype, jnp.float32)
+    )
+    conv_pay = (
+        payload
+        if jnp.dtype(pool.dtype) == jnp.dtype(jnp.bfloat16)
+        else pool_adapters._bitcast_payload(payload, pool.dtype, jnp.bfloat16)
+    )
+    ssm_rows = pool_adapters._out_rows(ssm_pay, SSM_ROWS) * ssm_split
+    conv_rows = pool_adapters._out_rows(conv_pay, CONV_ROWS)
+    return (ssm_rows, HEAD_DIM), (conv_rows, lanes)
+
+
+def scatter_kda_state_fused(pool, ssm_vals, conv_vals, state_indices):
+    """Fused single-chunk scatter of KDA recurrent + conv state rows (0..80)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels import pool_adapters, typed_ldst
+
+    na = state_indices.shape[0]
+    _, payload, lanes = pool_adapters._pool_geometry(pool)
+    ssm_lane_split = lanes // HEAD_DIM
+    pad = (0,) * (len(payload) + 1)
+
+    def _kernel(sidx_ref, ssm_ref, conv_ref, pool_in_ref, pool_out_ref):
+        del sidx_ref, pool_in_ref
+        typed_ldst.store_typed(
+            pool_out_ref.at[0, pl.ds(0, SSM_ROWS)],
+            ssm_ref[0],
+            lane_split=ssm_lane_split,
+        )
+        typed_ldst.store_typed(
+            pool_out_ref.at[0, pl.ds(SSM_ROWS, CONV_ROWS)],
+            conv_ref[0],
+            lane_split=1,
+        )
+
+    return pl.pallas_call(
+        _kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(na,),
+            in_specs=[
+                pl.BlockSpec((1,) + ssm_vals.shape[1:], lambda i, s: (i, 0, 0)),
+                pl.BlockSpec((1,) + conv_vals.shape[1:], lambda i, s: (i, 0, 0)),
+                pl.BlockSpec(
+                    (1, TOTAL_STATE_ROWS) + payload + (lanes,),
+                    lambda i, s: (s[i], 0) + pad,
+                ),
+            ],
+            out_specs=pl.BlockSpec(
+                (1, TOTAL_STATE_ROWS) + payload + (lanes,),
+                lambda i, s: (s[i], 0) + pad,
+            ),
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={3: 0},
+    )(state_indices, ssm_vals, conv_vals, pool)
+
+
+def gather_kda_state_fused(pool, state_indices):
+    """Fused single-chunk gather of KDA recurrent + conv state rows (0..80)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels import pool_adapters, typed_ldst
+
+    na = state_indices.shape[0]
+    _, payload, lanes = pool_adapters._pool_geometry(pool)
+    ssm_lane_split = lanes // HEAD_DIM
+    (ssm_rows, _), (conv_rows, _) = kda_state_packed_shapes(pool)
+    pad = (0,) * (len(payload) + 1)
+
+    def _kernel(sidx_ref, pool_ref, ssm_out_ref, conv_out_ref):
+        del sidx_ref
+        ssm_out_ref[0] = typed_ldst.load_typed(
+            pool_ref.at[0, pl.ds(0, SSM_ROWS)],
+            view_dtype=jnp.float32,
+            lane_split=ssm_lane_split,
+        )
+        conv_out_ref[0] = typed_ldst.load_typed(
+            pool_ref.at[0, pl.ds(SSM_ROWS, CONV_ROWS)],
+            view_dtype=jnp.bfloat16,
+            lane_split=1,
+        )
+
+    return pl.pallas_call(
+        _kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(na,),
+            in_specs=[
+                pl.BlockSpec(
+                    (1, TOTAL_STATE_ROWS) + payload + (lanes,),
+                    lambda i, s: (s[i], 0) + pad,
+                )
+            ],
+            out_specs=[
+                pl.BlockSpec((1, ssm_rows, HEAD_DIM), lambda i, s: (i, 0, 0)),
+                pl.BlockSpec((1, conv_rows, lanes), lambda i, s: (i, 0, 0)),
+            ],
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((na, ssm_rows, HEAD_DIM), jnp.float32),
+            jax.ShapeDtypeStruct((na, conv_rows, lanes), jnp.bfloat16),
+        ],
+    )(state_indices, pool)
+
+
 _MLA_INDEX = {layer: m for m, layer in enumerate(LAYOUT.attention_layers)}
 _KDA_INDEX = {layer: k for k, layer in enumerate(LAYOUT.state_layers)}
 _LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
@@ -348,7 +469,6 @@ class KdaImporter:
     def _build(self) -> Any:
         if self._op is not None:
             return self._op
-        from vllm_torchtpu.kernels import pool_adapters
         from vllm_torchtpu.megakernel.bridge import register_op
 
         num_raw, kda_raw, perm = (
@@ -364,39 +484,35 @@ class KdaImporter:
         def body(conv, recurrent, *args):
             conv, recurrent = conv[0], recurrent[0]
             raws, (kda_blocks, slot) = args[:num_raw], args[num_raw:]
-            conv_rows, recurrent_rows = [], []
-            for k in range(KDA_LAYERS):
-                raw, ids = raws[kda_raw[k]], kda_blocks[k : k + 1]
-                ssm = pool_adapters.gather_region(
-                    raw,
-                    ids,
-                    tok0=0,
-                    ntok=SSM_ROWS,
-                    out_dtype=jnp.float32,
-                    out_lanes=HEAD_DIM,
-                )
+            conv_by_k: list[Any] = [None] * KDA_LAYERS
+            recurrent_by_k: list[Any] = [None] * KDA_LAYERS
+            for p in range(num_raw):
+                ks = [k for k in range(KDA_LAYERS) if kda_raw[k] == p]
+                if not ks:
+                    continue
+                ids = jnp.stack([kda_blocks[k] for k in ks])
+                ssm, taps = gather_kda_state_fused(raws[p], ids)
                 # Block 0 is padding, not a stored KDA state. FP8 pools
                 # are uninitialized, and warmup also writes MLA latents to
                 # their null blocks; neither byte pattern is valid SSM data.
-                ssm = jnp.where(ids[0] != 0, ssm, jnp.zeros_like(ssm))
-                recurrent_rows.append(
-                    ssm[0, : KDA_HEADS * HEAD_DIM].reshape(
-                        KDA_HEADS, HEAD_DIM, HEAD_DIM
-                    )
+                nz = ids[:, None, None] != 0
+                ssm = jnp.where(nz, ssm, 0)
+                taps = jnp.where(nz, taps, 0)
+                ssm_k = ssm[:, : KDA_HEADS * HEAD_DIM, :].reshape(
+                    len(ks), KDA_HEADS, HEAD_DIM, HEAD_DIM
                 )
-                taps = pool_adapters.gather_region(
-                    raw, ids, tok0=SSM_ROWS, ntok=CONV_ROWS, out_dtype=jnp.bfloat16
+                taps_k = taps.reshape(len(ks), -1)[
+                    :, : CONV_TAPS * 3 * KDA_HEADS * HEAD_DIM
+                ].reshape(len(ks), CONV_TAPS, 3, KDA_HEADS, HEAD_DIM)
+                taps_k = jnp.pad(
+                    taps_k,
+                    ((0, 0), (0, 0), (0, 0), (0, CONV_HEAD_ROWS - KDA_HEADS), (0, 0)),
                 )
-                taps = jnp.where(ids[0] != 0, taps, jnp.zeros_like(taps))
-                taps = taps.reshape(-1)[: CONV_TAPS * 3 * KDA_HEADS * HEAD_DIM]
-                conv_rows.append(
-                    jnp.pad(
-                        taps.reshape(CONV_TAPS, 3, KDA_HEADS, HEAD_DIM),
-                        ((0, 0), (0, 0), (0, CONV_HEAD_ROWS - KDA_HEADS), (0, 0)),
-                    )
-                )
-            conv_state = jnp.stack(conv_rows).astype(conv.dtype)
-            recurrent_state = jnp.stack(recurrent_rows).astype(recurrent.dtype)
+                for idx_in_p, k in enumerate(ks):
+                    recurrent_by_k[k] = ssm_k[idx_in_p]
+                    conv_by_k[k] = taps_k[idx_in_p]
+            conv_state = jnp.stack(conv_by_k).astype(conv.dtype)
+            recurrent_state = jnp.stack(recurrent_by_k).astype(recurrent.dtype)
             if perm is not None:
                 conv_state = jax.lax.ppermute(conv_state, MESH_AXIS, perm)
                 recurrent_state = jax.lax.ppermute(recurrent_state, MESH_AXIS, perm)

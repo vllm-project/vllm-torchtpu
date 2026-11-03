@@ -130,6 +130,17 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
         # Kernel modules read the config at import: install it before the
         # program imports them.
         prefill_ep = 16 if (not aggregate or envs.K3_AGGREGATE_EP16) else 8
+        expert_plan = envs.K3_PREFILL_EXPERT_PLAN
+        replica_plan = envs.K3_REPLICA_PLAN
+        if aggregate and prefill_ep == 8:
+            if expert_plan.lower() in ("0", "none", "off", "false"):
+                expert_plan = ""
+            elif not expert_plan:
+                expert_plan = "plan_ep8_real_hotfirst.npz"
+            if replica_plan.lower() in ("0", "none", "off", "false"):
+                replica_plan = ""
+            elif not replica_plan and not envs.K3_HOT_PLAN:
+                replica_plan = "replica_plan_ep8_real_plain4.npz"
         kernel_config.install(
             kernel_config.KernelConfig(
                 attention_dp=config.attention_dp,
@@ -137,6 +148,8 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
                 # The aggregate prefill shares the decode's EP8 experts unless
                 # K3_AGGREGATE_EP16=1 requests banked EP16 experts.
                 prefill_expert_parallel=prefill_ep,
+                prefill_expert_plan=expert_plan,
+                kd_replica_plan=replica_plan,
             )
         )
     # The prefill computes the rings of its loader config's draft; the

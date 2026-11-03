@@ -1176,11 +1176,11 @@ def _routed_experts(
         gu_panels = pl.cdiv(gu_width, pltpu.get_tpu_info().mxu_column_size)
         moved_rows = gu_panels * gu_unroll
         ep8_8k = tokens == 8192 and mid_width == 768
-        gu_u_by_bucket = (4, 8, 10, 12) if ep8_8k else (gu_unroll,) * 4
+        gu_u_by_bucket = (4, 8, 12, 16) if ep8_8k else (gu_unroll,) * 4
         first_down_u_by_bucket = (
-            (4, 8, 12, 14) if ep8_8k else (first_down_unroll,) * 4
+            (4, 8, 16, 20) if ep8_8k else (first_down_unroll,) * 4
         )
-        rem_down_u_by_bucket = (8, 16, 24, 24) if ep8_8k else (unroll,) * 4
+        rem_down_u_by_bucket = (8, 16, 28, 36) if ep8_8k else (unroll,) * 4
 
         def gu_work(g, panel, bucket_index=0):
             gu_u = gu_u_by_bucket[bucket_index]
@@ -2253,13 +2253,18 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         ]
         output_specs += [hbm] * 4 + [pl.BlockSpec()]
     counting = k._config().prefill_route_counts
-    body = _layer_kernel
     if counting:
         workspace_shapes += [((local_experts,), jnp.int32)]
         output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
 
-        def body(*refs):
+    def body(*refs):
+        refs = list(refs)
+        for idx in (8, 9, 10, 11):
+            if refs[idx].shape[1] != local_experts:
+                refs[idx] = refs[idx].at[:, pl.ds(0, local_experts)]
+        if counting:
             return _layer_kernel(*refs[:-1], route_counts=refs[-1])
+        return _layer_kernel(*refs)
     kernel = pl.pallas_call(
         body,
         out_shape=tuple(jax.ShapeDtypeStruct(s, d) for s, d in workspace_shapes),
@@ -2313,11 +2318,15 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         final, latent, _, ids, probs, counts, shared, maximum = outputs
 
         def overflow():
+            extra_slots = w["expert_gu"].shape[1] - local_experts
+            counts_for_prep = (
+                jnp.pad(counts, (0, extra_slots)) if extra_slots > 0 else counts
+            )
             reduced = routed_experts_prepared(
                 latent,
                 ids.reshape(-1),
                 probs.reshape(-1),
-                counts,
+                counts_for_prep,
                 w["expert_gu"],
                 w["expert_gus"],
                 w["expert_down"],
@@ -2395,6 +2404,9 @@ def _make_moe_16k(mesh):
             own = pl.ds(half * rows, rows)
             for index in (2, 1 + inputs, 2 + inputs):  # hidden, prefix, output
                 refs[index] = refs[index].at[own]
+            for idx in (8, 9, 10, 11):  # expert_gu, expert_gus, expert_down, expert_ds
+                if refs[idx].shape[1] != local_experts:
+                    refs[idx] = refs[idx].at[:, pl.ds(0, local_experts)]
             if counting:
                 return _layer_kernel(*refs[:-1], route_counts=refs[-1])
             return _layer_kernel(*refs)
@@ -2457,11 +2469,15 @@ def _make_moe_16k(mesh):
 
         def overflow(half):
             _, latent, _, ids, probs, counts, shared, maximum = halves[half]
+            extra_slots = w["expert_gu"].shape[1] - local_experts
+            counts_for_prep = (
+                jnp.pad(counts, (0, extra_slots)) if extra_slots > 0 else counts
+            )
             reduced = routed_experts_prepared(
                 latent,
                 ids.reshape(-1),
                 probs.reshape(-1),
-                counts,
+                counts_for_prep,
                 w["expert_gu"],
                 w["expert_gus"],
                 w["expert_down"],

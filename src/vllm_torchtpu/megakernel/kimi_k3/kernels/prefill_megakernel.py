@@ -5977,13 +5977,20 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
 def _make_indexed_moe_sp_ring_reference(mesh, *, seq_len=8192):
     """SparseCore gather/combine path, for shapes the fused MoE does not cover
     or with ``prefill_fused_moe`` off."""
+    from ..config import active
+
     base = make_moe_fused_sp_repacked(mesh, seq_len=seq_len)
+    local_experts = 896 // active().prefill_expert_parallel
 
     def run(hidden, prefix, families, length, slot):
         selected = {
             name: (
-                families[name] if name in ("expert_gu", "expert_down", "expert_gus", "expert_ds", "latent_down",
-                                           "shared_gu", "shared_down")
+                families[name][:, :, :local_experts]
+                if name in ("expert_gu", "expert_down", "expert_gus", "expert_ds")
+                and families[name].shape[2] != local_experts
+                else families[name]
+                if name in ("expert_gu", "expert_down", "expert_gus", "expert_ds", "latent_down",
+                            "shared_gu", "shared_down")
                 else jax.lax.dynamic_index_in_dim(
                     families[name], slot[0], axis=1, keepdims=False,
                 )
@@ -6012,12 +6019,10 @@ def _norm_gather_body(
 
     @pl.when((pl.program_id(0) == 0) & (pl.program_id(1) == 0))
     def normalize():
-        for m_idx in range(prefix_ref.shape[0] // mix_tile):
-            r_sl = pl.ds(m_idx * mix_tile, mix_tile)
-            mixture_norm_tiled_body(
-                active_ref, prefix_ref.at[r_sl], blocks_ref.at[:, r_sl], folded_ref, norm_ref,
-                normalized_ref.at[r_sl], *mix_scratch, tile=mix_tile, eps=eps,
-            )
+        mixture_norm_tiled_body(
+            active_ref, prefix_ref, blocks_ref, folded_ref, norm_ref,
+            normalized_ref, *mix_scratch, tile=mix_tile, eps=eps,
+        )
 
     _all_gather_kernel(
         tables_ref, normalized_ref, gathered_ref, *ring_scratch,
@@ -6165,7 +6170,7 @@ def _kda_layer_body(
         alog_family_ref.at[slot], dt_family_ref.at[slot],
         kda_norm_family_ref.at[slot], rec_in_ref, hist_in_ref,
         None, rec_out_ref, hist_out_ref,
-        hidden_bufs, None, *kda_weights_and_state, hidden_sems, None, weight_sems,
+        hidden_bufs, None, *kda_weights_and_state, hidden_sems, None, weight_sems,  # type: ignore[bad-argument-count]
         tile=kda_tile, decay_lower_bound=-5.0, epsilon=eps,
         checkpoint=(None, rec_checkpoint_ref, hist_checkpoint_ref),
         segments=(segment_ref, count),
