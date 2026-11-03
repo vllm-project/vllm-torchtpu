@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_DCP_SHARD_MERGE: bool = False
     VLLM_TPU_QSA_FUSED_DCP_BLOCKS: bool = False
+    VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -785,6 +786,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cut, bitonic sort) instead of the SparseCore top-k + keep mask + sort
     # (bit-identical).
     "VLLM_TPU_QSA_FUSED_DCP_BLOCKS": env_bool("VLLM_TPU_QSA_FUSED_DCP_BLOCKS"),
+    # With VLLM_TPU_QSA_MAIN_KV_DCP: the pair exchanges each rank's heads of
+    # the partial attention (all-to-all) instead of all-gathering every
+    # partial; half the bytes, bit-identical.
+    "VLLM_TPU_QSA_DCP_HEAD_EXCHANGE": env_bool("VLLM_TPU_QSA_DCP_HEAD_EXCHANGE"),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every
