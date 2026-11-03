@@ -92,6 +92,18 @@ def _sdpa_reference(
     return torch.einsum("bhqk,bkhd->bqhd", scores.softmax(dim=-1), v)
 
 
+def _masked_attention_inputs(
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """CPU [B, S, H, D] query, key, value and a [B, S] key mask hiding 16 keys."""
+    torch.manual_seed(42)
+    shape = (1, 64, 2, 128)
+    mask = torch.ones(shape[:2], dtype=torch.bool)
+    mask[:, -16:] = False
+    query, key, value = (torch.randn(shape, dtype=dtype) for _ in range(3))
+    return query, key, value, mask
+
+
 class TestFluxTpuSDPAAttention:
     """Numerical correctness and parity tests for TPU SDPA attention backend.
 
@@ -294,41 +306,22 @@ class TestFluxTpuSDPAAttention:
             max_abs=LONG_SEQ_ATTN_MAX_ABS[limit_index],
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="Masked SDPA on TPU returns wrong values (fp32 rel_l2 0.60, bf16 NaN)",
-    )
     @DTYPES
-    def test_flux_masked_attention_fallback_matches_sdpa_on_tpu(
+    def test_flux_masked_attention_falls_back_to_sdpa_on_tpu(
         self, monkeypatch, dtype, limit_index
     ):
         """Verify masked calls fall back from TpuFlashAttentionImpl to TpuSDPAImpl."""
         from unittest.mock import MagicMock
 
-        torch.manual_seed(42)
-        batch_size = 1
-        seq_len = 64
-        num_heads = 2
-        head_size = 128
-        scale = 1.0 / math.sqrt(head_size)
-
-        mask_cpu = torch.ones(batch_size, seq_len, dtype=torch.bool)
-        mask_cpu[:, -16:] = False
-
+        query_cpu, key_cpu, value_cpu, mask_cpu = _masked_attention_inputs(dtype)
+        scale = 1.0 / math.sqrt(query_cpu.shape[-1])
         flash_impl = TpuFlashAttentionImpl(
-            num_heads=num_heads, head_size=head_size, softmax_scale=scale
+            num_heads=query_cpu.shape[2],
+            head_size=query_cpu.shape[3],
+            softmax_scale=scale,
         )
-
-        query_cpu = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=dtype)
-        key_cpu = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=dtype)
-        value_cpu = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=dtype)
-
-        q_tpu = query_cpu.to(device="tpu")
-        k_tpu = key_cpu.to(device="tpu")
-        v_tpu = value_cpu.to(device="tpu")
-        mask_tpu = mask_cpu.to(device="tpu")
-        attn_metadata = SimpleNamespace(attn_mask=mask_tpu)
+        q_tpu, k_tpu, v_tpu = (t.to("tpu") for t in (query_cpu, key_cpu, value_cpu))
+        attn_metadata = SimpleNamespace(attn_mask=mask_cpu.to("tpu"))
 
         orig_sdpa_forward = TpuSDPAImpl.forward
         spy_calls = []
@@ -349,13 +342,34 @@ class TestFluxTpuSDPAAttention:
         assert len(spy_calls) == 1
         assert spy_calls[0][3] is attn_metadata
         assert masked_out.device.type == "tpu"
-        assert masked_out.shape == (batch_size, seq_len, num_heads, head_size)
+        assert masked_out.shape == query_cpu.shape
         assert masked_out.dtype == dtype
         mock_warn.assert_called_once_with(
             "TpuFlashAttentionImpl falling back to PyTorch SDPA (%s).",
             "attn_mask is not None",
         )
 
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="Masked SDPA on TPU returns wrong values (fp32 rel_l2 0.60, bf16 NaN)",
+    )
+    @DTYPES
+    def test_flux_masked_attention_numeric_parity_on_tpu(self, dtype, limit_index):
+        """Test masked TpuFlashAttentionImpl output against the float64 reference."""
+        query_cpu, key_cpu, value_cpu, mask_cpu = _masked_attention_inputs(dtype)
+        scale = 1.0 / math.sqrt(query_cpu.shape[-1])
+        flash_impl = TpuFlashAttentionImpl(
+            num_heads=query_cpu.shape[2],
+            head_size=query_cpu.shape[3],
+            softmax_scale=scale,
+        )
+        q_tpu, k_tpu, v_tpu = (t.to("tpu") for t in (query_cpu, key_cpu, value_cpu))
+        attn_metadata = SimpleNamespace(attn_mask=mask_cpu.to("tpu"))
+
+        masked_out = flash_impl.forward(
+            q_tpu, k_tpu, v_tpu, attn_metadata=attn_metadata
+        )
         ref_out = _sdpa_reference(
             query_cpu, key_cpu, value_cpu, scale, key_mask=mask_cpu
         )
