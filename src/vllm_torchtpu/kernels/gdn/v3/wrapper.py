@@ -674,10 +674,20 @@ def fused_conv1d_gdn(
     ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
         # With a state source, it rides the conv-state slot and the dense
         # recurrent-state input is absent.
+        chunk_pair = False
         if mode == config.GDNMode.PER_SEQ:
             tile_size = mixed_tile_size
             # Prefill / mixed sequences keep a single state checkpoint.
             window_size = 1
+            # Two chunks per grid step (chunked GDN only; chunk 1 is the
+            # token-recurrent scan).
+            if (
+                envs.TPU_GDN_CHUNK_PAIR
+                and not is_kda
+                and tile_size > 1
+                and 2 * tile_size <= padded_batch_size
+            ):
+                tile_size, chunk_pair = 2 * tile_size, True
         else:
             tile_size = decode_tile_size
             window_size = num_spec_tokens + 1
@@ -695,6 +705,7 @@ def fused_conv1d_gdn(
             v_head_dim=d_v,
             attention_mode=attention_mode,
             gate_lower_bound=gate_lower_bound,
+            chunk_pair=chunk_pair,
             dtypes=config.Dtypes(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,
