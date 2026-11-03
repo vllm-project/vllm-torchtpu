@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
+    TPU_GDN_CHUNK_PAIR: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
@@ -557,6 +558,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
         "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
     ),
+    # GDN chunked prefill: each grid step takes two chunks of the same
+    # sequence. The state-independent intra-chunk work (gates, K K^T, the
+    # triangular inverse, U/W, masked Q K^T) runs once for both chunks batched
+    # over heads, then the two state updates run in order. Same ops per chunk,
+    # so bit-identical. A sequence's odd last chunk still costs a full pair
+    # (its empty half is masked).
+    "TPU_GDN_CHUNK_PAIR": env_bool("TPU_GDN_CHUNK_PAIR", default=False),
     # Qwen4-exp QSA decode/verify indexer: score all query tokens of a
     # request (e.g. the K+1 MTP verify tokens) in one query block of this many
     # tokens, sharing one stream over the request's compressed keys instead of
