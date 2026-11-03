@@ -279,6 +279,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: bool = False
     VLLM_TPU_QSA_DCP_SPLIT_LSE: bool = False
     VLLM_TPU_QSA_DCP_PACK_LISTS: bool = False
+    VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS: int = 0
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1712,6 +1713,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bits) and group ids (int32) as one stacked tensor instead of two
     # gathers; same bits.
     "VLLM_TPU_QSA_DCP_PACK_LISTS": env_bool("VLLM_TPU_QSA_DCP_PACK_LISTS"),
+    # TP all-reduce of BF16 tensors with at most this many rows (0 = off): one-shot
+    # all-gather + local f32 sum (tpu_communicator.TpuDeviceCommunicator.all_reduce).
+    # Faster for decode-sized tensors; not bit-identical to psum.
+    "VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS": env_nonnegative_int("VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS", 0),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for

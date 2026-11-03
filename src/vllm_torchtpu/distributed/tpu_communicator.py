@@ -21,6 +21,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
+from vllm_torchtpu import envs
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -35,6 +37,25 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        """VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS: a TP all-reduce of a BF16 tensor with at
+        most that many rows runs one-shot, an all-gather of every rank's tensor and
+        a local f32 sum in rank order, which is latency-bound decode's faster
+        collective (half the time of psum at 16-64 rows of 2560). The f32 sum
+        rounds differently from psum (not bit-identical)."""
+        max_rows = envs.VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS
+        if (
+            max_rows
+            and self.world_size > 1
+            and self.unique_name.split(":")[0] == "tp"
+            and input_.dtype == torch.bfloat16
+            and input_.dim() >= 2
+            and input_.shape[0] <= max_rows
+        ):
+            gathered = self.all_gather(input_.unsqueeze(0), dim=0)
+            return gathered.float().sum(0).to(input_.dtype)
+        return super().all_reduce(input_)
 
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
