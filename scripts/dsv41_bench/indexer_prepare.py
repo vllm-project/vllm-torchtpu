@@ -8,6 +8,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8 import cache
 
@@ -26,21 +27,20 @@ def prepare(keys, columns, order):
         exponent = jnp.ceil(jnp.log2(amax / 448.0)).astype(jnp.int32)
         scale = jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
         quantized = (values / scale[:, None]).astype(jnp.float8_e4m3fn)
-        bits = jax.lax.bitcast_convert_type(quantized, jnp.uint8).astype(jnp.uint32)
-        bits = bits.reshape(padded, 32, 4)
-        words = bits[:, :, 0] | (bits[:, :, 1] << 8)
-        words |= (bits[:, :, 2] << 16) | (bits[:, :, 3] << 24)
+        # Native bitcast packs the second-minor dimension. Feature-major
+        # FP8 therefore becomes the writer's 32 packed int32 feature rows.
+        words = pltpu.bitcast(quantized.T, jnp.int32)
         packed = jnp.concatenate(
             (
-                words.astype(jnp.int32),
-                jax.lax.bitcast_convert_type(scale, jnp.int32)[:, None],
+                words,
+                jax.lax.bitcast_convert_type(scale, jnp.int32)[None, :],
             ),
-            axis=1,
+            axis=0,
         )
         active = jnp.arange(padded) < count
         # Include columns in the same gather; both use the identical permutation.
         sorted_values = tiled_gather(
-            jnp.concatenate((packed.T, column_ref[:][None, :]), axis=0), order
+            jnp.concatenate((packed, column_ref[:][None, :]), axis=0), order
         )
         value_out[:, :] = jnp.where(active[None, :], sorted_values[:33], 0)
         column_out[:] = jnp.where(active, sorted_values[33], 0)
