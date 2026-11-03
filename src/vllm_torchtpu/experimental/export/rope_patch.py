@@ -27,7 +27,7 @@ import inspect
 import math
 import types
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -433,7 +433,7 @@ class InGraphCosSinCache:
         dtype: torch.dtype,
         num_rows: int,
         width: int,
-        half: str | None = None,
+        half: Literal["cos", "sin"] | None = None,
     ) -> None:
         self.segments = tuple(segments)
         # "cos" or "sin" for a table holding only that half, else `[cos | sin]`.

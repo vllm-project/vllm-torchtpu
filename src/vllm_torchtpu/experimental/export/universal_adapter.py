@@ -665,7 +665,7 @@ def _patch_row_parallel_input_split(model: nn.Module) -> int:
     for name, module in model.named_modules():
         if not isinstance(module, RowParallelLinear) or module.input_is_parallel:
             continue
-        if getattr(module, "bias", None) is not None and not module.skip_bias_add:
+        if module.bias is not None and not module.skip_bias_add:
             raise NotImplementedError(
                 f"{name}: a RowParallelLinear that splits its input and adds a bias "
                 "cannot be exported at tensor parallel size > 1"
@@ -908,6 +908,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 self._mtp_draft
             )
         _patch_row_parallel_input_split(self._model)
+        if self._mtp_draft is not None:
+            # Kept off the target's module tree, like the RoPE patch above.
+            _patch_row_parallel_input_split(self._mtp_draft)
         if not self._export_config.uses_mrope and any(
             getattr(m, "_in_graph_rope_dim_modalities", None) is not None
             or rope_patch.compute_mrope_dim_modalities(m) is not None
@@ -1622,13 +1625,16 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         """
         from vllm.distributed import tensor_model_parallel_all_gather
 
-        model_logits = getattr(getattr(self, "_model", None), "compute_logits", None)
-        if getattr(self, "_vllm_config", None) is not None and callable(model_logits):
+        model_logits = getattr(self._model, "compute_logits", None)
+        head = (
+            self._bound_head_name()
+            if self._vllm_config is not None and callable(model_logits)
+            else None
+        )
+        if head is not None:
             from torch.nn.utils.stateless import _reparametrize_module
 
-            with _reparametrize_module(
-                self._model, {self._lm_head_weight_name(): lm_head_weight}
-            ):
+            with _reparametrize_module(self._model, {head: lm_head_weight}):
                 logits = model_logits(hidden_states)
             return logits[..., : self._export_config.vocab_size]
         local = self._local_logits(hidden_states, lm_head_weight)
@@ -1647,6 +1653,11 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         does. With vocabulary padding the last shard's padded columns would join
         the race, and the shard a rank holds is unknown while tracing, so a
         padded vocabulary gathers the logits instead.
+
+        It takes the raw projection, not `compute_logits`'s post-processing: a
+        monotonic step (output multiplier, soft-capping) leaves the argmax alone,
+        except where bf16 soft-capping saturates several logits to one value,
+        which can change a draft token, never a verified one.
         """
         from vllm.distributed import tensor_model_parallel_all_gather
 
@@ -1663,6 +1674,20 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         rank = best.argmax(dim=-1, keepdim=True)
         token = rank.to(torch.int32) * shard + index.gather(-1, rank)
         return token.squeeze(-1)
+
+    def _bound_head_name(self) -> str | None:
+        """The parameter `compute_logits` projects with, as the model names it.
+
+        `_lm_head_weight_name()` may be the alias of a tied head the model holds
+        only as its embedding (no `lm_head` attribute); then the embedding's
+        parameter is bound. None when the model holds neither.
+        """
+        names = {n for n, _ in self._model.named_parameters(remove_duplicate=False)}
+        head = self._lm_head_weight_name()
+        if head in names:
+            return head
+        tied = weight_mapper.tied_lm_head_alias(names)
+        return tied[1] if tied and tied[0] == head else None
 
     def _local_logits(
         self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor

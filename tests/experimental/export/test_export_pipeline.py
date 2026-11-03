@@ -1615,6 +1615,8 @@ def test_compute_logits_returns_the_vocabulary_without_padding() -> None:
     exportable = SimpleNamespace(
         _export_config=SimpleNamespace(vocab_size=10),
         _local_logits=lambda h, w: torch.matmul(h, w.T),
+        _model=nn.Module(),
+        _vllm_config=None,
     )
     hidden = torch.ones(3, 4)
     lm_head = torch.arange(48.0).reshape(12, 4)
@@ -1623,6 +1625,40 @@ def test_compute_logits_returns_the_vocabulary_without_padding() -> None:
     )
     assert logits.shape == (3, 10)
     assert torch.equal(logits, torch.matmul(hidden, lm_head.T)[:, :10])
+
+
+class _SoftCappedLM(nn.Module):
+    """A vLLM-style LM whose `compute_logits` soft-caps after the projection."""
+
+    def __init__(self, tied: bool) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(10, 4)
+        if not tied:
+            self.lm_head = nn.Linear(4, 10, bias=False)
+
+    def head(self) -> torch.Tensor:
+        return (getattr(self, "lm_head", None) or self.model.embed_tokens).weight
+
+    def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        return 2.0 * torch.tanh(torch.matmul(hidden, self.head().T) / 2.0)
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_compute_logits_runs_the_models_own_with_the_bound_head(tied: bool) -> None:
+    """The model's post-projection steps are exported, with the weight input bound."""
+    model = _SoftCappedLM(tied)
+    adapter = _adapter_without_model(
+        api.TextOnlyLLMExportConfig(model_name="tiny", vocab_size=10)
+    )
+    adapter._model = model
+    adapter._vllm_config = SimpleNamespace()
+    hidden = torch.randn(3, 4)
+    # A weight other than the module's own, so the bound one must be the one used.
+    weight = torch.randn(10, 4) * 5
+    logits = adapter.compute_logits(hidden, weight)
+    torch.testing.assert_close(logits, 2.0 * torch.tanh(hidden @ weight.T / 2.0))
+    assert not torch.equal(model.head(), weight)
 
 
 class _LlamaLikeBackbone(nn.Module):
@@ -2515,3 +2551,16 @@ def test_a_row_parallel_layer_selects_its_input_slice_by_a_per_rank_constant() -
     model.down(x)
     torch.testing.assert_close(seen[0], x[:, 4:6])
     assert model.down.input_is_parallel is False
+
+    # Only rank 0 adds the bias, which the trace would bake in too.
+    model.down = Layer()
+    model.down.bias = nn.Parameter(torch.zeros(1))
+    with (
+        mock.patch("vllm.distributed.model_parallel_is_initialized", return_value=True),
+        mock.patch(
+            "vllm.distributed.get_tensor_model_parallel_world_size", return_value=4
+        ),
+        mock.patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=2),
+        pytest.raises(NotImplementedError, match="adds a bias"),
+    ):
+        universal_adapter._patch_row_parallel_input_split(model)
