@@ -5078,7 +5078,9 @@ class TPUModelRunner(GPUModelRunner):
         log the running counts every 500 checks. The first
         VLLM_TPU_VERIFY_FUSED_CHECK_FAULT checks perturb the compared copy
         only (a positive control that must be caught); the rest must be
-        clean."""
+        clean. The reference always runs the full-vocab rejection sampler, so
+        with VLLM_TPU_SAMPLER_CANDIDATES_ONLY the check also proves the
+        candidates-only path."""
         (
             logits,
             bonus_idx,
@@ -5127,7 +5129,6 @@ class TPUModelRunner(GPUModelRunner):
             recover_u=recover_u,
             do_sampling=True,
             topk_candidates=topk_candidates,
-            candidates_only=self._sampler_candidates_only(topk_candidates),
         )
         faulted = (
             self._verify_fused_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
