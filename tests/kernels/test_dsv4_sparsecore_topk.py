@@ -498,3 +498,34 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
         np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
         np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
     )
+
+
+@pytest.mark.tpu_test
+def test_dcp_merge_rank_metadata_keeps_full_candidate_extent():
+    """DCP rank metadata must not be mistaken for a short visible prefix."""
+    b, k, ranks, rank = 3, 4096, 16, 2
+    n = ranks * k
+    rng = np.random.default_rng(681104)
+    scores = np.stack([rng.permutation(n) for _ in range(b)]).astype(np.float32)
+    local = np.broadcast_to(np.arange(k, dtype=np.int32), (b, k)).copy()
+    device_scores, device_local = jnp.asarray(scores), jnp.asarray(local)
+    frozen = np.asarray(device_scores).tobytes(), np.asarray(device_local).tobytes()
+    actual = np.asarray(sc_module.sparsecore_topk_dcp_merge(
+        device_scores, device_local, k,
+        dcp_rank=jnp.int32(rank), dcp_size=ranks,
+    ))
+    repeated = np.asarray(sc_module.sparsecore_topk_dcp_merge(
+        device_scores, device_local, k,
+        dcp_rank=jnp.int32(rank), dcp_size=ranks,
+    ))
+    np.testing.assert_array_equal(np.sort(actual, axis=1), np.sort(repeated, axis=1))
+    assert (
+        np.asarray(device_scores).tobytes(), np.asarray(device_local).tobytes()
+    ) == frozen
+    for row in range(b):
+        winners = np.argsort(scores[row])[-k:]
+        expected = winners[(winners // k) == rank] % k
+        live = actual[row, actual[row] >= 0]
+        assert len(live) == len(expected)
+        assert set(live.tolist()) == set(expected.tolist())
+        np.testing.assert_array_equal(actual[row, len(live):], -1)

@@ -43,16 +43,8 @@ def register_selector(name, traces, *, chunk_tokens=512):
         SparseCoreTopK,
     )
 
-    @dataclass(frozen=True)
-    class IdentitySchedule(PrefixSchedule):
-        def positions(self, positions):
-            return positions
-
-        def visible_lengths(self, lengths):
-            return lengths
-
     components = StreamIndexComponents(
-        DenseKeyReader(scale_gain=1.0), IdentitySchedule()
+        DenseKeyReader(scale_gain=1.0), PrefixSchedule()
     )
     backend = SparseCoreTopK()
 

@@ -394,16 +394,8 @@ def native_selector(annotated=True):
         SparseCoreTopK,
     )
 
-    @dataclass(frozen=True)
-    class IdentitySchedule(PrefixSchedule):
-        def positions(self, positions):
-            return positions
-
-        def visible_lengths(self, lengths):
-            return lengths
-
     components = StreamIndexComponents(
-        DenseKeyReader(scale_gain=1.0), IdentitySchedule()
+        DenseKeyReader(scale_gain=1.0), PrefixSchedule()
     )
     # This lets the same native test reproduce the old cached-body collision;
     # old source did not expose the namespace keyword at the StreamIndex API.

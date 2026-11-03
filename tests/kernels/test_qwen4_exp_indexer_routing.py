@@ -27,6 +27,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
 )
 from vllm_torchtpu.kernels.qwen4_exp import decode_indexer, pooled_qsa
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
+from vllm_torchtpu.kernels.qwen4_exp.resident_topk import QwenSparseCoreTopK
 from vllm_torchtpu.kernels.qwen4_exp.qsa import _token_metadata
 
 
@@ -261,7 +262,7 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
     assert prefill_rows == sum(int(n) for n in counts if n > 1)
 
 
-def test_default_is_original_sparsecore_and_jit_backend_identity(monkeypatch):
+def test_default_is_qwen_sparsecore_and_jit_backend_identity(monkeypatch):
     traces = []
 
     def record(q, weights, cache, lengths, pages, cu, distribution, **kwargs):
@@ -280,14 +281,14 @@ def test_default_is_original_sparsecore_and_jit_backend_identity(monkeypatch):
     args = (
         jnp.zeros((1, 1, 128), jnp.bfloat16),
         jnp.zeros((1, 32, 1, 128), jnp.bfloat16),
-        jnp.array([4], jnp.int32),
+        jnp.array([4096], jnp.int32),
         jnp.zeros((1, 1), jnp.int32),
         jnp.zeros((1,), jnp.int32),
     )
     np.testing.assert_array_equal(fn(*args), 1)
     np.testing.assert_array_equal(fn(*args, topk_backend=ReferenceTopK()), 2)
     np.testing.assert_array_equal(fn(*args), 1)
-    assert traces == [SparseCoreTopK(), ReferenceTopK()]
+    assert traces == [QwenSparseCoreTopK(), ReferenceTopK()]
     jax.clear_caches()
 
 
@@ -589,7 +590,7 @@ def test_prefill_prefix_capacity_preserves_functional_visibility(monkeypatch, mo
     # bodies alone are replaced by monotonic float32 scores and CPU selection.
     monkeypatch.setattr(stream.pl, "pallas_call", pallas_call)
     monkeypatch.setattr(ReferenceTopK, "select", select)
-    monkeypatch.setattr(SparseCoreTopK, "select", select)
+    monkeypatch.setattr(QwenSparseCoreTopK, "select", select)
     jax.clear_caches()
     backend = None if mode == "default" else ReferenceTopK()
     prefix_capacity = 256 if mode == "explicit" else None
@@ -686,3 +687,36 @@ def test_ragged_prefill_view_preserves_carrier_and_page_addresses(
     with jax.disable_jit():
         np.testing.assert_array_equal(run(query), -np.ones((16, 16), np.int32))
     assert bool(prefill_calls) == (not decode_only)
+
+@pytest.mark.parametrize("qwen", [False, True])
+@pytest.mark.parametrize("return_scores", [False, True])
+def test_resident_policy_is_local_to_qwen(monkeypatch, qwen, return_scores):
+    import importlib
+
+    backend_module = importlib.import_module(SparseCoreTopK.__module__)
+    qwen_module = importlib.import_module(QwenSparseCoreTopK.__module__)
+    calls = []
+
+    def shared_selector(scores, k, **kwargs):
+        calls.append((False, kwargs))
+        return scores
+
+    def qwen_selector(scores, k, **kwargs):
+        calls.append((True, kwargs))
+        return scores
+
+    monkeypatch.setattr(backend_module, "sparsecore_topk", shared_selector)
+    monkeypatch.setattr(qwen_module, "qwen_sparsecore_topk", qwen_selector)
+    backend = QwenSparseCoreTopK() if qwen else SparseCoreTopK()
+    scores = jnp.zeros((3, 16), jnp.int32)
+    lengths = jnp.array([0, 7, 16], jnp.int32)
+    assert backend.select(
+        scores, 16, lengths, scheduling_group_id=7, return_scores=return_scores
+    ) is scores
+    assert calls[0][0] is qwen
+    assert "try_resident_prefix" not in calls[0][1]
+    assert calls[0][1]["row_lengths"] is lengths
+    assert calls[0][1]["write_empty_rows"] is True
+    assert calls[0][1]["scheduling_group_id"] == 7
+    assert calls[0][1]["return_scores"] is return_scores
+    assert backend.overlaps_scoring is True

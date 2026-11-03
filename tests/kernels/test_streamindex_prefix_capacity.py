@@ -32,37 +32,24 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     SparseCoreTopK,
 )
 
-
 @dataclasses.dataclass(frozen=True)
 class LegacySchedule(PrefixSchedule):
-    offset: int = 0
-
     def validate(self, compression_ratio):
-        if not 0 <= self.offset < compression_ratio:
-            raise ValueError("offset must fit the compression group")
-
-    def positions(self, positions):
-        return positions - self.offset
-
-    def visible_lengths(self, lengths):
-        return jnp.maximum(lengths, 0)
+        if compression_ratio <= 0:
+            raise ValueError("compression_ratio must be positive")
 
 
 @dataclasses.dataclass(frozen=True)
 class PreservingSchedule(LegacySchedule):
     admitted: bool = True
 
-    @property
-    def preserves_kv_extent(self):
-        return self.admitted
 
-
-def preserving_components(offset=0, admitted=True):
+def preserving_components(admitted=True):
     return StreamIndexComponents(
         DenseKeyReader(scale_gain=1.0),
-        LegacySchedule(offset)
+        LegacySchedule()
         if admitted is None
-        else PreservingSchedule(offset, admitted),
+        else PreservingSchedule(admitted),
     )
 
 
@@ -224,7 +211,6 @@ def test_active_context_extent_guards_not_visible_floor(
     )
     assert bool(decision) == expected
 
-
 @dataclasses.dataclass(frozen=True)
 class Alternate(SparseCoreTopK):
     pass
@@ -285,12 +271,12 @@ def test_real_pipeline_selects_same_ids_and_keeps_branch_groups_disjoint(
         num_queries_per_block=(1, 128, 128),
         decode_req_batch_size=8,
         chunk_tokens=512,
-        components=preserving_components(3, opt_in),
+        components=preserving_components(opt_in),
         topk_backend=backend,
         scheduling_group_namespace=5,
         prefix_capacity=256 if opt_in is True else None,
     )
-    visible = np.maximum((np.arange(1, T + 1) - 3) // 4, 0)
+    visible = np.arange(1, T + 1) // 4
     expected = np.where(
         np.arange(128)[None, :] < np.minimum(visible, 128)[:, None],
         np.maximum(visible - 128, 0)[:, None] + np.arange(128)[None, :],
@@ -303,7 +289,6 @@ def test_real_pipeline_selects_same_ids_and_keeps_branch_groups_disjoint(
         config.scoped_scheduling_group_id(5, i) for i in range(2 if bounded else 1)
     }
     assert all(s[0] == 512 and s[2] == 128 for s in outputs)
-    assert preserving_components().schedule.preserves_kv_extent
 
 
 def test_standalone_and_native_branch_group_domains_do_not_alias():

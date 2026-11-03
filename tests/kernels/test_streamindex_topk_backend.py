@@ -175,17 +175,11 @@ class DenseKeyReader:
 
 @dataclass(frozen=True)
 class PrefixSchedule:
-    """Nonidentity coordinates and row-dependent visibility, including empty rows."""
+    """Dense key metadata coverage, without query-position hooks."""
 
     def validate(self, compression_ratio):
         if compression_ratio != 1:
             raise ValueError("PrefixSchedule requires compression_ratio=1")
-
-    def positions(self, positions):
-        return positions - 3
-
-    def visible_lengths(self, lengths):
-        return jnp.where(lengths % 4 == 0, 0, jnp.maximum(lengths - 11, 0))
 
     def chunk_metadata(self, meta, chunk_idx):
         from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.metadata import (
@@ -201,56 +195,6 @@ class PrefixSchedule:
                 for a in (meta.batch_tile_idx, meta.bq_idx, meta.bkv_idx)
             ),
         )
-
-
-@pytest.mark.parametrize("cp_size", [1, 2])
-@pytest.mark.parametrize(
-    "shift,offset,visible,local,sharded",
-    [
-        (-3, 0, [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 0]),
-        (20, 0, [4, 4, 4, 4], [3, 3, 3, 3], [2, 2, 2, 2]),
-        (0, -10, [1, 2, 3, 4], [0, 0, 0, 0], [0, 0, 0, 0]),
-        (0, 10, [1, 2, 3, 4], [3, 3, 3, 3], [3, 3, 3, 3]),
-    ],
-    ids=[
-        "negative-positions",
-        "past-end-positions",
-        "negative-lengths",
-        "long-lengths",
-    ],
-)
-def test_component_row_lengths_are_bounded(
-    cp_size, shift, offset, visible, local, sharded
-):
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
-        _effective_row_lengths,
-    )
-
-    calls = []
-
-    class ObservingSchedule(PrefixSchedule):
-        def positions(self, positions):
-            calls.append("positions")
-            return positions + shift
-
-        def visible_lengths(self, lengths):
-            calls.append("visible_lengths")
-            np.testing.assert_array_equal(lengths, visible)
-            return lengths + offset
-
-    actual = _effective_row_lengths(
-        jnp.array([4]),
-        jnp.array([0, 4]),
-        jnp.array([0, 0, 1]),
-        num_tokens=4,
-        num_positions=3,
-        compression_ratio=1,
-        cp_rank=cp_size - 1,
-        cp_size=cp_size,
-        components=StreamIndexComponents(DenseKeyReader(), ObservingSchedule()),
-    )
-    assert calls == ["positions", "visible_lengths"]
-    np.testing.assert_array_equal(actual, local if cp_size == 1 else sharded)
 
 
 @pytest.mark.parametrize(
@@ -297,17 +241,11 @@ def test_key_reader_decodes_window_and_scales():
     assert reader.packing == 1
 
 
-def test_schedule_coordinates_visibility_and_chunk_window():
+def test_schedule_chunk_window():
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.metadata import MetadataRef
 
     schedule = PrefixSchedule()
     schedule.validate(1)
-    np.testing.assert_array_equal(
-        schedule.positions(jnp.array([60, 61, 62, 63])), [57, 58, 59, 60]
-    )
-    np.testing.assert_array_equal(
-        schedule.visible_lengths(jnp.array([58, 59, 60, 61])), [47, 48, 0, 50]
-    )
     meta = MetadataRef.create(
         jnp.array([2, 3]), jnp.arange(5), jnp.arange(5) + 10, jnp.arange(5) + 20
     )
@@ -360,8 +298,7 @@ def _assert_component_selection(result, inputs, seq_lens, q_lens, k, return_scor
         records = cache[table[seq]].reshape(-1, cache.shape[-1])
         for t in range(count):
             # Independent host arithmetic; do not call the schedule or scoring helpers.
-            causal_count = min(length, length - count + t - 3 + 1)
-            visible = 0 if causal_count % 4 == 0 else max(causal_count - 11, 0)
+            visible = max(0, min(length, length - count + t + 1))
             expected = (
                 np.maximum(q[row] @ records[:visible, :128].T, 0).T @ weights[row]
             )
@@ -385,7 +322,7 @@ def _assert_component_selection(result, inputs, seq_lens, q_lens, k, return_scor
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("enable_early_exit", [False, True])
-def test_custom_schedule_short_candidates_use_full_visibility(enable_early_exit):
+def test_custom_metadata_short_candidates_keep_causal_visibility(enable_early_exit):
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.components import (
         StreamIndexComponents,
     )

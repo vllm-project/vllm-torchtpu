@@ -40,21 +40,14 @@ class KeyReader(Protocol):
 
 
 class IndexSchedule(Protocol):
-    """Define query positions, visible prefixes and per-chunk DMA steps.
+    """Define per-chunk DMA steps for the shared causal visibility schedule.
 
-    Implementations are hashable static JIT arguments. ``positions`` preserves
-    the shape of uncompressed query coordinates. ``visible_lengths`` maps their
-    causal compressed prefix lengths to admitted prefix lengths of the same
-    shape. ``chunk_metadata`` returns one chunk's steps indexed from zero; it
-    must cover every admitted score column. These hooks do not promise that
-    score-free enumeration is equivalent to scoring and selection.
+    Implementations are hashable static JIT arguments. ``chunk_metadata`` returns
+    one chunk's steps indexed from zero and must cover every admitted score
+    column. It does not certify score-free enumeration.
     """
 
     def validate(self, compression_ratio: int) -> None: ...
-
-    def positions(self, positions: jax.Array) -> jax.Array: ...
-
-    def visible_lengths(self, lengths: jax.Array) -> jax.Array: ...
 
     def chunk_metadata(self, meta: MetadataRef, chunk_idx: int) -> MetadataRef: ...
 

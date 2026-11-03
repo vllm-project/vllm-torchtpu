@@ -1056,7 +1056,6 @@ def _effective_row_lengths(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
-    components: indexing.StreamIndexComponents | None = None,
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix.
 
@@ -1079,12 +1078,8 @@ def _effective_row_lengths(
     q_len = cu_q_lens[seq_ids + 1] - q_start
     seq_len = seq_lens[seq_ids]
     token_pos = seq_len - q_len + (token_ids - q_start)
-    if components is not None:
-        token_pos = components.schedule.positions(token_pos)
     kv_len = seq_len // compression_ratio
     visible = jnp.clip((token_pos + 1) // compression_ratio, 0, kv_len)
-    if components is not None:
-        visible = components.schedule.visible_lengths(visible)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
     valid = token_ids < cu_q_lens[num_seqs]
     return jnp.where(valid, jnp.clip(visible, 0, num_positions), 0)
@@ -1676,7 +1671,6 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
-            components=components,
         )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
@@ -1838,8 +1832,7 @@ def streamindex_topk(
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
         return jnp.where(s_idx < row_lengths[:, None], s_idx, -1)
 
-    # A custom schedule can change both visibility and DMA coverage. Its
-    # protocol does not promise equivalence to score-free prefix enumeration.
+    # Custom DMA coverage does not certify score-free prefix enumeration.
     if not enable_early_exit or components is not None:
         return _common_path(None)
     return jax.lax.cond(

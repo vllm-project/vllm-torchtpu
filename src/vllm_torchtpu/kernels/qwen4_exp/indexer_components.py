@@ -68,19 +68,9 @@ class BF16KeyReader:
 class QSAIndexSchedule:
     """Prefill excludes incomplete groups; expanded decode already bounds lengths."""
 
-    @property
-    def preserves_kv_extent(self) -> bool:
-        return True
-
     def validate(self, compression_ratio: int) -> None:
         if compression_ratio <= 0:
             raise ValueError("compression_ratio must be positive")
-
-    def positions(self, positions: jax.Array) -> jax.Array:
-        return positions
-
-    def visible_lengths(self, lengths: jax.Array) -> jax.Array:
-        return jnp.maximum(lengths, 0)
 
     def chunk_metadata(self, meta: MetadataRef, chunk_idx: int) -> MetadataRef:
         num_chunks = meta.num_steps.shape[0]

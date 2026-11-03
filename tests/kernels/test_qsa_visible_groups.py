@@ -66,7 +66,7 @@ def _inputs(kind, ratio=4, heads=4):
             [0, 0, 3],
             64,
         )
-    elif kind == "prefill-split":
+    elif kind == "prefill-crosses-budget":
         counts, context, distribution, tokens = (
             [37, 0, 91, 0],
             [0, 300, 3, 300],
@@ -166,7 +166,7 @@ def _select(args, **kwargs):
         "decode-fit",
         "decode-fallback",
         "prefill-fit",
-        "prefill-split",
+        "prefill-crosses-budget",
         "prefill-fallback",
         "mixed",
     ],
@@ -200,8 +200,8 @@ def test_score_free_routes_only_complete_winner_sets(monkeypatch, kind):
     _assert_winners(result, args, visible)
     if kind.endswith("fit"):
         assert not calls
-    elif kind == "prefill-split":
-        assert calls == [64]
+    elif kind.startswith("prefill-"):
+        assert calls == [len(args[0])]
     else:
         assert calls
 
@@ -213,7 +213,7 @@ def test_score_free_routes_only_complete_winner_sets(monkeypatch, kind):
         "decode-fit",
         "decode-fallback",
         "prefill-fit",
-        "prefill-split",
+        "prefill-crosses-budget",
         "prefill-fallback",
         "mixed",
     ],
@@ -291,9 +291,15 @@ def test_explicit_backend_keeps_its_scoring_contract(monkeypatch):
 @pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "kind,calls",
-    [("prefill-fit", []), ("prefill-split", [64]), ("prefill-fallback", [64, 64])],
+    [
+        ("prefill-fit", []),
+        ("prefill-crosses-budget", [128]),
+        ("prefill-fallback", [128]),
+    ],
 )
-def test_native_scoring_executes_only_for_required_suffix(monkeypatch, kind, calls):
+def test_native_scoring_uses_whole_chunk_unless_all_visible_groups_fit(
+    monkeypatch, kind, calls
+):
     args, visible = _inputs(kind)
     observed = []
     original = decode_indexer.streamindex_topk
@@ -330,8 +336,10 @@ def test_native_scoring_executes_only_for_required_suffix(monkeypatch, kind, cal
 
 
 @pytest.mark.parametrize("tokens", [70, 133])
-@pytest.mark.parametrize("kind", ["prefill-split", "prefill-fallback", "mixed"])
-def test_score_windows_preserve_request_crossings_and_partial_tail(
+@pytest.mark.parametrize(
+    "kind", ["prefill-crosses-budget", "prefill-fallback", "mixed"]
+)
+def test_prefill_preserves_request_crossings_and_partial_tail(
     monkeypatch, kind, tokens
 ):
     args, visible = _inputs(kind)
@@ -365,3 +373,69 @@ def test_score_windows_preserve_request_crossings_and_partial_tail(
     with jax.disable_jit():
         actual = _select(tuple(args))
     _assert_winners(actual, args, visible)
+
+
+@pytest.mark.parametrize(
+    "tokens,history,active,injected",
+    [
+        (8192, 0, 8192, False),
+        (8192, 8192, 8192, False),
+        (8192, 8192, 8019, False),
+        (4097, 8192, 3989, False),
+        (2048, 0, 1997, False),
+        (512, 0, 497, True),
+    ],
+)
+def test_prefill_scoring_receives_complete_query_and_metadata(
+    monkeypatch, tokens, history, active, injected
+):
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+        SparseCoreTopK,
+    )
+
+    monkeypatch.setattr(decode_indexer, "decode_query_chunk_size", lambda _: 512)
+    query = jnp.zeros((tokens, 1, 128), jnp.bfloat16)
+    query = query.at[:, 0, 0].set(jnp.arange(tokens) % 127)
+    starts = jnp.array([0, active] + [active] * 7, jnp.int32)
+    context = jnp.array([history] + [73] * 7, jnp.int32)
+    lengths = jnp.where(
+        jnp.arange(tokens) < active, history + jnp.arange(tokens) + 1, 0
+    )
+    visible = np.where(
+        np.arange(tokens) < active, (history + np.arange(tokens) + 1) // 4, 0
+    )
+    backend = SparseCoreTopK() if injected else None
+    calls = []
+
+    def score(q, weights, cache, seq_lens, pages, cu, distribution, **kwargs):
+        np.testing.assert_array_equal(q, query)
+        np.testing.assert_array_equal(cu, starts)
+        np.testing.assert_array_equal(seq_lens, [history + active] + [0] * 7)
+        np.testing.assert_array_equal(distribution, [0, 0, 1])
+        assert kwargs["chunk_tokens"] == (512 if tokens % 512 == 0 else None)
+        if injected:
+            assert kwargs["topk_backend"] is backend
+        calls.append(len(q))
+        groups = jnp.arange(512)[None]
+        return jnp.where(groups < jnp.asarray(visible)[:, None], groups, -1)
+
+    monkeypatch.setattr(decode_indexer, "streamindex_topk", score)
+    with jax.disable_jit():
+        actual = decode_indexer.select_index_blocks(
+            query,
+            jnp.zeros((1, 16, 2, 128), jnp.bfloat16),
+            lengths,
+            jnp.zeros((8, 2054), jnp.int32),
+            jnp.zeros(tokens, jnp.int32),
+            starts=starts,
+            context=context,
+            request_distribution=jnp.array([0, 0, 1], jnp.int32),
+            ratio=4,
+            block_topk=512,
+            topk_backend=backend,
+        )
+    groups = np.arange(512)[None]
+    np.testing.assert_array_equal(
+        actual, np.where(groups < visible[:, None], groups, -1)
+    )
+    assert calls == ([tokens] if injected or np.any(visible > 512) else [])

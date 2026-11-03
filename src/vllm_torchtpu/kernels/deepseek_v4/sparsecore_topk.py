@@ -47,6 +47,8 @@ NUM_BUCKETS = 256
 # emit_pipeline to 256KB out of the 512KB tile memory). Rows that would need more
 # than 16 slices use slices of up to twice this, single-buffered instead.
 MAX_SLICE_WORDS = 32 * 1024
+# A cooperative partition group cannot cross one SC's subcores.
+MAX_COOPERATIVE_PARTITIONS = 16
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
 
@@ -94,6 +96,7 @@ def _topk_body(
     write_empty: bool,
     return_scores: bool,
     local_idxs_hbm: Any = None,
+    physical_pitch: int | None = None,
 ):
     dcp_merge = local_idxs_hbm is not None
     num_subcores = 16
@@ -558,13 +561,32 @@ def _topk_body(
     cores_per_chip = num_sc_cores * num_subcores
     # A slice past MAX_SLICE_WORDS only fits in tile memory single-buffered.
     buf_count = 1 if (num_waves == 1 or slice_len > MAX_SLICE_WORDS) else 2
+    if physical_pitch is None:
+        score_spec = pl.BlockSpec(
+            (slice_len,),
+            lambda w: (w * cores_per_chip + flat,),
+            pipeline_mode=pl.Buffered(buf_count),
+        )
+    else:
+
+        def score_offset(w):
+            row = (
+                w * cores_per_chip + flat
+                if p == 1
+                else w * groups_per_chip + core * groups_per_core + group_id
+            )
+            # The DMA precedes active-row masking. Clamp padded-wave reads,
+            # preserving zero lengths and the original padded output ownership.
+            return (jnp.minimum(row, b - 1) * physical_pitch + col_base,)
+
+        score_spec = pl.BlockSpec(
+            (pl.Element(slice_len),),
+            score_offset,
+            pipeline_mode=pl.Buffered(buf_count),
+        )
     if p == 1:
         in_specs = (
-            pl.BlockSpec(
-                (slice_len,),
-                lambda w: (w * cores_per_chip + flat,),
-                pipeline_mode=pl.Buffered(buf_count),
-            ),
+            score_spec,
             pl.BlockSpec(
                 (LANES,),
                 lambda w: (w * cores_per_chip + flat,),
@@ -627,11 +649,7 @@ def _topk_body(
             _run_step(scores_vmem, len_slice_vmem)
 
         in_specs = (
-            pl.BlockSpec(
-                (slice_len,),
-                lambda w: (w * cores_per_chip + flat,),
-                pipeline_mode=pl.Buffered(buf_count),
-            ),
+            score_spec,
             pl.BlockSpec(
                 (LANES,),
                 lambda w: (w * cores_per_chip + flat,),
@@ -645,6 +663,35 @@ def _topk_body(
             out_specs=(),
         )(scores_hbm, lengths_hbm)
 
+
+def _topk_scratch_types(
+    k: int, p: int, return_scores: bool, num_subcores: int
+) -> tuple[Any, ...]:
+    """Build per-subcore and cooperative shared scratch buffer types."""
+    return (
+        pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),  # glob_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32),  # rowbuf_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32) if return_scores else None,  # keybuf_vmem
+        pltpu.VMEM((p * NUM_BUCKETS + LANES,), jnp.int32)
+        if p > 1
+        else None,  # peer_hist_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32) if p > 1 else None,  # peer_idx_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32)
+        if (p > 1 and return_scores)
+        else None,  # peer_key_vmem
+        pltpu.VMEM_SHARED((2 * num_subcores * NUM_BUCKETS,), jnp.int32)
+        if p > 1
+        else None,  # shared_hist_vmem
+        pltpu.VMEM_SHARED((2 * num_subcores * LANES,), jnp.int32)
+        if p > 1
+        else None,  # shared_counts_vmem
+        pltpu.VMEM_SHARED((2 * num_subcores * k,), jnp.int32)
+        if p > 1
+        else None,  # shared_idx_vmem
+        pltpu.VMEM_SHARED((2 * num_subcores * k,), jnp.int32)
+        if (p > 1 and return_scores)
+        else None,  # shared_key_vmem
+    )
 
 def _sc_topk_direct(
     scores: jax.Array,  # f32[b, n]
@@ -707,30 +754,7 @@ def _sc_topk_direct(
     slot_type = jax.ShapeDtypeStruct((padded_b * k,), jnp.int32)
     out_type = (slot_type, slot_type if return_scores else None)
 
-    scratch_types = (
-        pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),  # glob_vmem
-        pltpu.VMEM((k + LANES,), jnp.int32),  # rowbuf_vmem
-        pltpu.VMEM((k + LANES,), jnp.int32) if return_scores else None,  # keybuf_vmem
-        pltpu.VMEM((p * NUM_BUCKETS + LANES,), jnp.int32)
-        if p > 1
-        else None,  # peer_hist_vmem
-        pltpu.VMEM((k + LANES,), jnp.int32) if p > 1 else None,  # peer_idx_vmem
-        pltpu.VMEM((k + LANES,), jnp.int32)
-        if (p > 1 and return_scores)
-        else None,  # peer_key_vmem
-        pltpu.VMEM_SHARED((2 * sc.num_subcores * NUM_BUCKETS,), jnp.int32)
-        if p > 1
-        else None,  # shared_hist_vmem
-        pltpu.VMEM_SHARED((2 * sc.num_subcores * LANES,), jnp.int32)
-        if p > 1
-        else None,  # shared_counts_vmem
-        pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32)
-        if p > 1
-        else None,  # shared_idx_vmem
-        pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32)
-        if (p > 1 and return_scores)
-        else None,  # shared_key_vmem
-    )
+    scratch_types = _topk_scratch_types(k, p, return_scores, sc.num_subcores)
 
     body_fn = functools.partial(
         _topk_body,
@@ -774,6 +798,8 @@ def _sc_topk_direct(
     return slots_2d
 
 
+
+
 def _pick_partition(b: int, n: int, k: int) -> int:
     """Picks the power-of-two partition factor P (1..16) per row to maximize
 
@@ -781,12 +807,12 @@ def _pick_partition(b: int, n: int, k: int) -> int:
     """
     # A cooperative group must fit on one SparseCore's 16 subcores; past that,
     # slices grow beyond MAX_SLICE_WORDS and run single-buffered (~5% slower).
-    p_min = min(16, _cdiv(n, MAX_SLICE_WORDS))
+    p_min = min(MAX_COOPERATIVE_PARTITIONS, _cdiv(n, MAX_SLICE_WORDS))
     p = 1
     while p < p_min:
         p *= 2
 
-    max_p = min(16, 32 // b) if b < 32 else 1
+    max_p = min(MAX_COOPERATIVE_PARTITIONS, 32 // b) if b < 32 else 1
     while p * 2 <= max_p:
         next_np = n // (p * 2)
         if next_np >= k and next_np >= LANES and (n % (p * 2)) == 0:
@@ -794,6 +820,20 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         else:
             break
     return p
+
+
+def _validate_topk_inputs(scores: jax.Array, k: int) -> tuple[int, int]:
+    """Validate the selector API input contract and return its matrix shape."""
+    if scores.ndim != 2:
+        raise ValueError(f"scores must be 2D, got {scores.shape}")
+    if scores.dtype not in (jnp.float32, jnp.int32):
+        raise ValueError(f"scores must be f32 or i32, got {scores.dtype}")
+    b, n = scores.shape
+    if n % LANES != 0:
+        raise ValueError(f"{n=} must be a multiple of {LANES}")
+    if k % LANES != 0 or not 0 < k <= 4096:
+        raise ValueError(f"{k=} must be a positive multiple of {LANES}, at most 4096")
+    return b, n
 
 
 @functools.partial(
@@ -824,15 +864,7 @@ def sparsecore_topk(
     ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
     raw bits either way.
     """
-    if scores.ndim != 2:
-        raise ValueError(f"scores must be 2D, got {scores.shape}")
-    if scores.dtype not in (jnp.float32, jnp.int32):
-        raise ValueError(f"scores must be f32 or i32, got {scores.dtype}")
-    b, n = scores.shape
-    if n % LANES != 0:
-        raise ValueError(f"{n=} must be a multiple of {LANES}")
-    if k % LANES != 0 or not 0 < k <= 4096:
-        raise ValueError(f"{k=} must be a positive multiple of {LANES}, at most 4096")
+    b, n = _validate_topk_inputs(scores, k)
 
     if row_lengths is None:
         row_lengths = jnp.full((b,), n, jnp.int32)

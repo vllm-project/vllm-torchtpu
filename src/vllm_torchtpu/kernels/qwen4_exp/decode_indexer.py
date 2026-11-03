@@ -22,7 +22,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
-    SparseCoreTopK,
     TopKBackend,
 )
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
@@ -30,6 +29,8 @@ from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
     get_decode_index_key_packing,
     get_decode_index_pages,
 )
+
+from vllm_torchtpu.kernels.qwen4_exp.resident_topk import QwenSparseCoreTopK
 
 
 def _request_bounds(starts, distribution, tokens):
@@ -192,7 +193,7 @@ def select_index_blocks(
     )
     default_backend = topk_backend is None
     if default_backend:
-        topk_backend = SparseCoreTopK()
+        topk_backend = QwenSparseCoreTopK()
     page_size = cache.shape[1] * 2
     query_width = query.shape[-1]
     query = jnp.pad(query, ((0, 0), (0, 0), (0, cache.shape[-1] - query_width)))
@@ -320,41 +321,10 @@ def select_index_blocks(
             return score_prefill(q, cu, history)
         visible = _prefill_visible_groups(cu, history, len(q), ratio)
 
-        def score_suffix(_):
-            prefix = block_topk * ratio
-            if len(q) <= prefix:
-                return score_prefill(q, cu, history)
-
-            # Full and suffix routes share one score body. Request metadata
-            # excludes padded rows and preserves each window's causal history.
-            window = max(prefix, len(q) - prefix)
-            padded_tokens = (len(q) + window - 1) // window * window
-            padded_query = jnp.pad(q, ((0, padded_tokens - len(q)), (0, 0), (0, 0)))
-            first = jnp.where(jnp.all(visible[:prefix] <= block_topk), prefix, 0)
-            output = jnp.full((padded_tokens, block_topk), -1, jnp.int32)
-            output = jax.lax.dynamic_update_slice(
-                output, _enumerate_groups(visible[:prefix], block_topk), (0, 0)
-            )
-
-            def score_window(index, output):
-                offset = first + index * window
-                local_starts = jnp.clip(cu - offset, 0, window)
-                progress = jnp.clip(offset - cu[:-1], 0, cu[1:] - cu[:-1])
-                query_window = jax.lax.dynamic_slice_in_dim(
-                    padded_query, offset, window
-                )
-                selected = score_prefill(query_window, local_starts, history + progress)
-                return jax.lax.dynamic_update_slice(output, selected, (offset, 0))
-
-            output = jax.lax.fori_loop(
-                0, (len(q) - first + window - 1) // window, score_window, output
-            )
-            return output[: len(q)]
-
         return jax.lax.cond(
             jnp.all(visible <= block_topk),
             lambda _: _enumerate_groups(visible, block_topk),
-            score_suffix,
+            lambda _: score_prefill(q, cu, history),
             None,
         )
 

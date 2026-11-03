@@ -46,10 +46,7 @@ def test_shared_causal_default_counts_only_complete_groups():
     np.testing.assert_array_equal(
         streamindex._effective_row_lengths(*args), [0, 0, 0, 1, 1, 1, 1, 2]
     )
-    np.testing.assert_array_equal(
-        streamindex._effective_row_lengths(*args, components=qsa_indexing()),
-        [0, 0, 0, 1, 1, 1, 1, 2],
-    )
+
 
 
 def test_bf16_indexer_retains_fp32_head_reduction(tpu_info):
@@ -119,7 +116,6 @@ def test_completed_groups_for_full_prefill_with_idle_request(context):
         num_tokens=8192,
         num_positions=65536,
         compression_ratio=4,
-        components=qsa_indexing(),
     )
     np.testing.assert_array_equal(actual, expected)
 
@@ -181,7 +177,6 @@ def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch, tpu_in
             len(q),
             65536,
             4,
-            components=kwargs["components"],
         )
         return jnp.broadcast_to(visible[:, None], (len(q), kwargs["k"]))
 
