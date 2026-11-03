@@ -31,7 +31,7 @@ def test_upload_keyed_reuses_until_values_change():
     assert third is not first and torch.equal(third, changed)
 
 
-def test_padded_sampling_params_reuse_flag(monkeypatch):
+def test_padded_sampling_params_reuses_until_inputs_change():
     input_batch = SimpleNamespace(
         temperature_cpu_tensor=torch.tensor([0.7, 1.0, 0.9], dtype=torch.float32),
         top_k_cpu_tensor=torch.tensor([20, 1024, 5], dtype=torch.int32),
@@ -50,7 +50,6 @@ def test_padded_sampling_params_reuse_flag(monkeypatch):
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
-    monkeypatch.setenv("VLLM_TPU_SAMPLING_PARAMS_REUSE", "1")
     t1, k1, p1 = runner._padded_sampling_params(
         0, 2, 4, torch.bfloat16, torch.device("cpu")
     )
@@ -71,9 +70,11 @@ def test_padded_sampling_params_reuse_flag(monkeypatch):
     assert k3 is k1
     assert p3 is p1
 
-    monkeypatch.setenv("VLLM_TPU_SAMPLING_PARAMS_REUSE", "0")
+    # Changing the active request slice invalidates top_k and top_p as well.
     t4, k4, p4 = runner._padded_sampling_params(
-        0, 2, 4, torch.bfloat16, torch.device("cpu")
+        0, 3, 4, torch.bfloat16, torch.device("cpu")
     )
     assert t4 is not t3
-    assert torch.equal(t4, t3)
+    assert k4 is not k3
+    assert p4 is not p3
+    assert k4.squeeze(1).tolist() == [20, 0, 5, 0]

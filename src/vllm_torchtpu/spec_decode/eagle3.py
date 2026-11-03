@@ -184,7 +184,7 @@ def _async_seed_inputs_impl(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """`_async_draft_seed_impl`, the eagle3 input shift + seed scatter
     (`Eagle3Proposer._draft_seed_input_ids`) and the loop-bucket pad of the
-    gather index as one program (VLLM_TPU_DRAFT_SEED_FUSED). Returns
+    gather index as one program. Returns
     `(draft_input_ids, gather_indices [p], num_rejected)`."""
     last_token_indices, next_token_ids, num_rejected = _async_draft_seed_impl(
         next_tokens, num_draft, query_start_loc, num_reqs
@@ -1738,7 +1738,6 @@ class Eagle3Proposer:
             if (
                 not ov_i
                 and envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED
-                and envs.VLLM_TPU_DRAFT_SEED_FUSED
                 and nt.device.type == "tpu"
             ):
                 # Seed, input shift/scatter and gather pad in one program.
@@ -2398,6 +2397,8 @@ class Eagle3Proposer:
             return
         self._precompile_combine_hidden_states()
         self._precompile_draft_seed()
+        if envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED:
+            self._precompile_async_seed_inputs()
         self._precompile_compute_logits()
 
     def _draft_hidden_size(self) -> int:
@@ -2538,6 +2539,51 @@ class Eagle3Proposer:
                     nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)
+
+    def _precompile_async_seed_inputs(self) -> None:
+        """`_async_seed_inputs_compiled` at every reachable (token bucket T,
+        sampler request bucket width, loop bucket p, query-start width)."""
+        import bisect
+
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        if runner.device.type != "tpu":
+            return
+        k = self.speculative_config.num_speculative_tokens
+        reqs = sorted(runner.num_reqs_paddings)
+        qsl_widths = {
+            w + 1
+            for w in (runner.num_reqs_max_model_len, runner.num_reqs_most_model_len)
+            if w
+        }
+        with runner._precompile_timed("drafter fused async seed"):
+            for T in runner.num_tokens_paddings:
+                for width in reqs:
+                    # Mixed chunks carry prefill tokens too, so T is not
+                    # bounded by the verify width: warm every token bucket.
+                    prev = (
+                        reqs[bisect.bisect_left(reqs, width) - 1]
+                        if width != reqs[0]
+                        else 0
+                    )
+                    ps = {
+                        _get_padded_token_len(runner.num_tokens_paddings, n)
+                        for n in range(prev + 1, width + 1)
+                    }
+                    for p in sorted(x for x in ps if x <= T):
+                        for q in sorted(qsl_widths):
+                            nt = torch.zeros((width, k + 1), dtype=torch.int32).to(
+                                runner.device
+                            )
+                            nd = torch.zeros(width, dtype=torch.int32).to(runner.device)
+                            qsl = torch.zeros(q, dtype=torch.int32).to(runner.device)
+                            n_dev = torch.tensor(1, dtype=torch.int64).to(runner.device)
+                            ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
+                            out = _async_seed_inputs_compiled(
+                                nt, nd, qsl, n_dev, ids, p
+                            )
+                            synchronize_tensors(out)
 
     def _precompile_compute_logits(self) -> None:
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exactness tests for VLLM_TPU_VERIFY_FUSED and VLLM_TPU_DRAFT_SEED_FUSED.
+"""Exactness tests for fused spec verify and fused async draft seed.
 
 Compares `_verify_fused_impl` / `_verify_fused_compiled` with the separate
 verify path across `apply_topk_topp` in `(True, False)`, `synthetic` in
@@ -211,7 +211,7 @@ _seed_scatter = _tpu_compile(_seed_scatter_impl)
 
 
 def check_seed(device, seeds: int, *, compiled: bool = True) -> int:
-    """VLLM_TPU_DRAFT_SEED_FUSED vs the separate seed / scatter / pad programs."""
+    """Fused async draft seed vs the separate seed / scatter / pad programs."""
     k = 3
     fail = 0
     seed_fn = _async_draft_seed_compiled if compiled else _async_draft_seed_impl
@@ -323,6 +323,53 @@ def test_verify_fused_impl_matches_separate_cpu(apply_topk_topp, synthetic, cand
 
 def test_async_seed_inputs_impl_matches_separate_cpu():
     assert check_seed(torch.device("cpu"), seeds=5, compiled=False) == 0
+
+
+def test_sample_spec_verify_chunk_masks_min_tokens_before_fused_verify():
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    events: list[str] = []
+    masked_logits = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+    raw_logits = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+
+    def mask_min_tokens(logits, rows, min_toks):
+        assert logits is raw_logits
+        assert rows
+        events.append("mask")
+        return masked_logits
+
+    def sample_spec_verify_fused(logits, md, start, end, gen):
+        assert logits is masked_logits
+        events.append("fused")
+        return "fused_out"
+
+    runner = SimpleNamespace(
+        _mask_min_tokens=mask_min_tokens,
+        _sample_spec_verify_fused=sample_spec_verify_fused,
+    )
+    md = SimpleNamespace(
+        draft_token_ids=torch.zeros((2,), dtype=torch.int32),
+        draft_lengths_cpu=np.array([1, 1], dtype=np.int32),
+    )
+    out = TPUModelRunner._sample_spec_verify_chunk(
+        runner,
+        raw_logits,
+        md,
+        grammar_output=None,
+        scheduler_output=SimpleNamespace(),
+        cur_start_idx=0,
+        cur_end_idx=2,
+        all_greedy=False,
+        sampling_generator=None,
+        top_tokens=False,
+        min_toks={0: (1, frozenset({2}))},
+    )
+    assert out == "fused_out"
+    assert events == ["mask", "fused"]
 
 
 @pytest.mark.tpu_test

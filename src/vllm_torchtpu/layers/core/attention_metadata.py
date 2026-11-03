@@ -680,8 +680,8 @@ def stage_block_table_uploads(
 
     # Walk in the same order the builds will, deduping shared group ids. The
     # result depends only on the groups and the walk's geometry inputs, so
-    # VLLM_TPU_STAGE_ENTRIES_CACHE keeps it instead of re-walking all groups
-    # (59 for Qwen4Exp) every step.
+    # cache it on the runner instead of re-walking all groups (59 for Qwen4Exp)
+    # every step.
     entries_key = (
         id(runner.attn_groups),
         id(runner.input_batch),
@@ -689,11 +689,7 @@ def stage_block_table_uploads(
         ctx.mamba_ckpt_window,
         None if gids is None else frozenset(gids),
     )
-    cached_entries = (
-        runner.__dict__.get("_stage_entries_cache")
-        if envs.VLLM_TPU_STAGE_ENTRIES_CACHE
-        else None
-    )
+    cached_entries = runner.__dict__.get("_stage_entries_cache")
     if cached_entries is not None and cached_entries[0] == entries_key:
         entries, entry_builders = cached_entries[1], cached_entries[2]
     else:
@@ -710,8 +706,7 @@ def stage_block_table_uploads(
                 block_table_obj, target_num_blocks = builder._block_table_geometry(ctx)
                 entries.append((gid, block_table_obj, target_num_blocks))
                 entry_builders.append(builder)
-        if envs.VLLM_TPU_STAGE_ENTRIES_CACHE:
-            runner._stage_entries_cache = (entries_key, entries, entry_builders)
+        runner._stage_entries_cache = (entries_key, entries, entry_builders)
     if not entries:
         return
 

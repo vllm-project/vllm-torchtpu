@@ -399,12 +399,12 @@ def _verify_fused_impl(
     topk_candidates: int,
     apply_topk_topp: bool = True,
 ) -> torch.Tensor:
-    """Non-greedy spec verify of one chunk as one program
-    (VLLM_TPU_VERIFY_FUSED): the bonus/target logit gathers, the bonus-token
-    sample, the per-position sampling-parameter gathers and the rejection
-    sampler, op for op the same as `_sample_spec_verify_chunk`'s separate
-    programs. The uniforms come from the caller's eager draws, in the same
-    order and shapes, so the random stream is unchanged."""
+    """Non-greedy spec verify of one chunk as one program: the bonus/target
+    logit gathers, the bonus-token sample, the per-position sampling-parameter
+    gathers and the rejection sampler, op for op the same as
+    `_sample_spec_verify_chunk`'s separate programs. The uniforms come from
+    the caller's eager draws, in the same order and shapes, so the random
+    stream is unchanged."""
     bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
     target_logits = torch.index_select(logits, 0, target_logits_indices)
     bonus_token_ids = _sample_from_logits_impl(
@@ -2681,8 +2681,14 @@ class TPUModelRunner(GPUModelRunner):
 
     def _substitute_next_lens(self) -> list[int]:
         """next_tokens lengths `_precompile_substitute_placeholder_token` warms."""
-        next_lens = list(self.num_reqs_paddings)
-        if self._is_async_drafter:
+        paddings = getattr(self, "num_reqs_paddings", None)
+        if paddings is None:
+            return []
+        next_lens = list(paddings)
+        if (
+            getattr(self, "_is_async_drafter", False)
+            and getattr(self, "max_num_reqs", None) is not None
+        ):
             assert self.speculative_config is not None
             next_lens.append(
                 self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
@@ -4881,15 +4887,6 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 target_argmax=target_argmax,
             )
-        if (
-            envs.VLLM_TPU_VERIFY_FUSED
-            and not all_greedy
-            and grammar_output is None
-            and logits.device.type == "tpu"
-        ):
-            return self._sample_spec_verify_fused(
-                logits, md, cur_start_idx, cur_end_idx, sampling_generator
-            )
         req_temperatures = req_top_k = req_top_p = None
         topk_candidates = 0
         min_toks = min_toks or {}
@@ -4897,8 +4894,8 @@ class TPUModelRunner(GPUModelRunner):
         if min_toks and any(cur_start_idx <= i < cur_end_idx for i in min_toks):
             draft_lengths = md.draft_lengths_cpu[: cur_end_idx - cur_start_idx]
             if grammar_output is None:
-                # Mask before the gathers, so a greedy chunk keeps the fused
-                # verify prelude.
+                # Mask before the gathers, so both greedy and fused non-greedy
+                # chunks keep their single-program verify paths.
                 logits = self._mask_min_tokens(
                     logits,
                     min_tokens_mask.verify_logits_rows(
@@ -4912,6 +4909,10 @@ class TPUModelRunner(GPUModelRunner):
                 min_tokens_rows = min_tokens_mask.verify_rows(
                     min_toks, cur_start_idx, draft_lengths.tolist()
                 )
+        if not all_greedy and grammar_output is None and logits.device.type == "tpu":
+            return self._sample_spec_verify_fused(
+                logits, md, cur_start_idx, cur_end_idx, sampling_generator
+            )
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
@@ -7063,18 +7064,17 @@ class TPUModelRunner(GPUModelRunner):
                         topk_candidates=blocks,
                     )
                     synchronize_tensors(out)
-                if envs.VLLM_TPU_VERIFY_FUSED:
-                    self._precompile_verify_fused(
-                        dummy_logits,
-                        bonus_logits_indices,
-                        target_logits_indices,
-                        draft_token_ids,
-                        draft_lengths,
-                        segment_ids,
-                        group_indices,
-                        warm_accept_u,
-                        warm_recover_u,
-                    )
+                self._precompile_verify_fused(
+                    dummy_logits,
+                    bonus_logits_indices,
+                    target_logits_indices,
+                    draft_token_ids,
+                    draft_lengths,
+                    segment_ids,
+                    group_indices,
+                    warm_accept_u,
+                    warm_recover_u,
+                )
                 logger.info(
                     "  -- padded_logits_length: %d, num_seqs: %d",
                     num_tokens,
@@ -7096,6 +7096,8 @@ class TPUModelRunner(GPUModelRunner):
         """`_verify_fused_compiled` at one (padded_logits_length,
         padded_num_reqs) bucket, with and without top-k candidates, at the
         dtypes `_sample_spec_verify_fused` passes."""
+        if self.device.type != "tpu":
+            return
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
         num_reqs = bonus_logits_indices.shape[0]
@@ -8580,7 +8582,7 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
 
-        if envs.VLLM_TPU_SAMPLING_PARAMS_REUSE:
+        if device == self.device:
             # Requests' sampling parameters rarely change between steps: reuse
             # the previous uploads while the values match (keyed in float32,
             # as numpy has no bfloat16).

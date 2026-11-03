@@ -79,3 +79,19 @@ def test_warmed_next_tokens_pads_to_a_warmed_length():
     out = warm(two_d)
     assert out.dtype == torch.int64 and out.shape == (32,)
     assert torch.equal(out[:20], two_d.reshape(-1).long())
+
+
+def test_warmed_next_tokens_handles_uninitialized_runner_stub():
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    bare = object.__new__(TPUModelRunner)
+    bare.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    t = torch.tensor([200, 201, 202, 203], dtype=torch.int32)
+    assert bare._substitute_next_lens() == []
+    assert bare._warmed_next_tokens(t) is t
+
+    partial = object.__new__(TPUModelRunner)
+    partial.num_reqs_paddings = [4, 8]
+    short = torch.tensor([10, 11, 12], dtype=torch.int64)
+    padded = partial._warmed_next_tokens(short)
+    assert padded.shape == (4,) and torch.equal(padded[:3], short) and padded[3] == 0

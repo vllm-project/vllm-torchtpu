@@ -850,10 +850,7 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, ctx_preinit, 4)
         assert ctx_preinit.staged_block_tables is None
 
-    def test_stage_entries_cache_reuses_walk_and_invalidates_on_key_change(
-        self, monkeypatch
-    ):
-        monkeypatch.setenv("VLLM_TPU_STAGE_ENTRIES_CACHE", "1")
+    def test_stage_entries_cache_reuses_walk_and_invalidates_on_key_change(self):
         runner = self._make_runner_mock(num_groups=2, most_model_len=64)
         builders = [
             self._make_mamba_builder(runner, kv_cache_group_id=gid) for gid in range(2)
