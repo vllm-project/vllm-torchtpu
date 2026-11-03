@@ -5475,6 +5475,13 @@ class TPUModelRunner(GPUModelRunner):
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
+        if self.lora_config is None:
+            # A LoRA wrapper would feed its adapter the un-normalized input.
+            from vllm_torchtpu.models.vllm.qwen3_next_input_norm import (
+                fold_input_norms,
+            )
+
+            fold_input_norms(model)
         self.model = model
         if self.is_pooling_model:
             self._resolve_static_pooler()

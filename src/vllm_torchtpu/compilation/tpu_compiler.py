@@ -306,6 +306,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
+    # Picks the layers whose FP8 projections normalize their own input; the
+    # graph changes with it while no traced source does.
+    "vllm_torchtpu/models/vllm/qwen3_next_input_norm.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
     # `get_pallas_op_mesh` decides whether the DSv4 Pallas ops are built with
     # the wrapper mesh or with none, like `build_ep_mesh` above.
