@@ -103,11 +103,15 @@ def host_tensors(model: Any) -> dict[str, Any]:
 
     Taken before lowering: tracing on TPU can leave placeholder tensors in the
     model (e.g. a MoE router weight), which cannot be copied to host afterwards.
+    Tensors left on the meta device hold no data and no step reads them (Muse
+    Spark's encoders, when every multimodal prompt limit is 0), so they are
+    skipped.
     """
     copies: dict[int, Any] = {}
     return {
         name: copies.setdefault(id(t), t.detach().cpu())
         for name, t in local_tensors(model).items()
+        if not t.is_meta
     }
 
 
