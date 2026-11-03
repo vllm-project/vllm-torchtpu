@@ -136,3 +136,23 @@ def test_remap_topk_flat_is_rank_major():
     )
     # (owner * num_ws_pages + ws_page) * page_size + slot; empty row -> dummy 0.
     np.testing.assert_array_equal(idx, [[11, 13, -1], [0, -1, -1]])
+
+
+def test_remap_topk_chunk_packs_each_chunk():
+    page_size, chunk_pages = 4, 2
+    # Row 0 spans both chunks (pages 1 and 2), row 1 only chunk 1, row 2 none.
+    owner = [[1, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 0]]
+    ws_page = [[2, 1, 0, 3], [3, 2, 0, 0], [0, 0, 0, 0]]
+    slot = [[1, 2, 3, 0], [1, 0, 0, 0], [0, 0, 0, 0]]
+    valid = [[True, True, True, True], [True, True, False, False], [False] * 4]
+    coords = _coords(owner, ws_page, slot, valid)
+    want = {
+        0: ([[6, 11, -1, -1], [0, -1, -1, -1], [0, -1, -1, -1]], [1, 0, 0]),
+        1: ([[9, 4, -1, -1], [5, 8, -1, -1], [0, -1, -1, -1]], [1, 1, 0]),
+    }
+    for chunk, (idx_want, owns_want) in want.items():
+        idx, owns = ws.remap_topk_chunk(
+            coords, chunk * chunk_pages, chunk_pages, page_size=page_size
+        )
+        np.testing.assert_array_equal(np.asarray(idx), idx_want)
+        np.testing.assert_array_equal(np.asarray(owns), np.asarray(owns_want, bool))

@@ -1464,8 +1464,8 @@ def sparse_mla_attention_pcp_prefill(
                     g_rope.reshape(-1, *g_rope.shape[2:]),
                 )
 
-            def attend(ws_nope, ws_rope, ws_idx):
-                output = sparse_mla_kernel.sparse_ragged_paged_attention(
+            def attend(ws_nope, ws_rope, ws_idx, return_lse=False):
+                out = sparse_mla_kernel.sparse_ragged_paged_attention(
                     q,
                     ws_nope,
                     ws_rope,
@@ -1476,18 +1476,47 @@ def sparse_mla_attention_pcp_prefill(
                     sm_scale=sm_scale or 1.0,
                     k_scale=dequant_scale,
                     cache_layout=cache_layout,
+                    return_lse=return_lse,
                 )
+                output, lse = out if return_lse else (out, None)
                 # Drop the rope tail: only the nope part is the MLA value.
-                return output[..., :lkv_dim].astype(ql_nope.dtype)
+                return output[..., :lkv_dim], lse
+
+            def attend_pipelined(size):
+                # Chunk c's gather has no dependency on chunk c-1's attention,
+                # so XLA can run it under that attention.
+                m = jnp.full((num_tokens, num_heads), -jnp.inf, jnp.float32)
+                denom = jnp.zeros((num_tokens, num_heads), jnp.float32)
+                acc = jnp.zeros((num_tokens, num_heads, lkv_dim), jnp.float32)
+                for first in range(0, size, chunk_pages):
+                    count = min(chunk_pages, size - first)
+                    idx, owns = ws.remap_topk_chunk(
+                        coords, first, count, page_size=nope_spec.page_size
+                    )
+                    out, lse = attend(*gather(first, count), idx, return_lse=True)
+                    assert lse is not None
+                    lse = jnp.where(
+                        owns[:, None], lse.reshape(num_tokens, num_heads), -jnp.inf
+                    )
+                    m_new = jnp.maximum(m, lse)
+                    base = jnp.where(jnp.isinf(m_new), 0.0, m_new)
+                    a, b = jnp.exp(m - base), jnp.exp(lse - base)
+                    acc = acc * a[..., None] + out.astype(jnp.float32) * b[..., None]
+                    denom, m = denom * a + b, m_new
+                return acc / jnp.where(denom > 0, denom, 1.0)[..., None]
 
             # One all-gather of the smallest bucket that holds the pages in
             # use, straight into the workspace: no zero fill, no copy loop.
             def at_size(size):
                 def branch(_):
-                    ws_idx = ws.remap_topk_flat(
-                        coords, num_ws_pages=size, page_size=nope_spec.page_size
-                    )
-                    return attend(*gather(0, size), ws_idx)
+                    if envs.TPU_PCP_KV_PIPELINE:
+                        out = attend_pipelined(size)
+                    else:
+                        ws_idx = ws.remap_topk_flat(
+                            coords, num_ws_pages=size, page_size=nope_spec.page_size
+                        )
+                        out, _ = attend(*gather(0, size), ws_idx)
+                    return out.astype(ql_nope.dtype)
 
                 return branch
 

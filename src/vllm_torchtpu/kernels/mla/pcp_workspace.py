@@ -156,3 +156,30 @@ def remap_topk_flat(
     empty = ~jnp.any(valid, axis=1)
     col = jnp.arange(idx.shape[1], dtype=jnp.int32)[None, :]
     return jnp.where((col == 0) & empty[:, None], 0, idx)
+
+
+def remap_topk_chunk(
+    coords: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    first_page: int,
+    num_pages: int,
+    *,
+    page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Indices into the `[dcp, num_pages, page_size]` gather of workspace pages
+    `[first_page, first_page + num_pages)`, valid entries first, and whether
+    each row has any.
+
+    A row with none keeps index 0 (`kv_len >= 1`); the caller masks its lse.
+    """
+    valid, owner, ws_page, slot = coords
+    local = ws_page - first_page
+    in_chunk = valid & (local >= 0) & (local < num_pages)
+    page = owner * num_pages + local
+    idx = jnp.where(in_chunk, page * page_size + slot, -1).astype(jnp.int32)
+    # The kernel derives kv_len from the -1 tail, so pack each row.
+    width = idx.shape[1]
+    col = jnp.arange(width, dtype=jnp.int32)[None, :]
+    key = jnp.where(in_chunk, col, width + col)
+    _, idx = lax.sort_key_val(key, idx, dimension=1)
+    owns = jnp.any(in_chunk, axis=1)
+    return jnp.where((col == 0) & ~owns[:, None], 0, idx), owns

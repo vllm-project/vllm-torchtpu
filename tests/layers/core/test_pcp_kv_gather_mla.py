@@ -75,7 +75,7 @@ TOPK = 128
 K_SCALE = 1.5
 SM_SCALE = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
 TOKEN_PADDINGS = [16, 32, 64, 128, 256, 512, 1024, 2048]
-CHUNK_TOKENS = 1024  # 2 workspace pages per gather chunk: exercises the loop
+CHUNK_TOKENS = 1024  # 2 workspace pages per chunk: buckets of 2..32 pages
 WORKSPACE_TOKENS = 16384
 
 
@@ -295,12 +295,15 @@ def _fp8(rng, shape, scale=1.0):
     )
 
 
+@pytest.mark.parametrize("pipeline", [False, True], ids=["one_gather", "pipelined"])
 @pytest.mark.parametrize("layout", ["sparsecore", "tensorcore"])
 @pytest.mark.parametrize("pcp", [2, 4, 8])
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
-def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout):
+def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout, pipeline):
     mesh = _mesh()
     monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", CHUNK_TOKENS)
+    # Pipelined: chunk-by-chunk attention merged by lse (TPU_PCP_KV_PIPELINE).
+    monkeypatch.setattr(envs, "TPU_PCP_KV_PIPELINE", pipeline)
     nope_spec, rope_spec = _specs(KVCacheLayout(layout))
     chunk_pages = pcp_chunk_pages(PAGE_SIZE, DCP)
     rng = np.random.default_rng(zlib.crc32(f"{scenario}-{pcp}-{layout}".encode()))
