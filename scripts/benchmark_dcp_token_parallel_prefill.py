@@ -416,7 +416,7 @@ def main():
     select = tp_op.make_select_topk(
         TOPK,
         SAL,
-        chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+        chunk_tokens=envs.TPU_DCP_TP_INDEXER_CHUNK_TOKENS or None,
         small_bucket=(None, None, 0),
         skip_empty_decode=False,
         skip_empty_decode_chunked=False,

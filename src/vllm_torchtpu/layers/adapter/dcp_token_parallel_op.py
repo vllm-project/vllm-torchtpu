@@ -657,7 +657,7 @@ def build_indexer_op(indexer: Any, layout: dcp_token_parallel.TokenParallelLayou
     dcp, il = layout.dcp_size, layout.interleave_size
     mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
     topk = indexer.topk_tokens
-    chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+    chunk_tokens = envs.TPU_DCP_TP_INDEXER_CHUNK_TOKENS or None
     small_bucket = (
         envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
         envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,

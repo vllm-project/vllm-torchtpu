@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_MLA_TP_BODY_LEVERS: str = "auto"
+    TPU_DCP_TP_INDEXER_CHUNK_TOKENS: int = 256
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
     TPU_MTP_DCP_MERGE_SIZED: bool = False
@@ -857,6 +858,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # both need TPU_MLA_SPARSE_SPLIT_Q. "auto" (default) = all of them when
     # TPU_MLA_SPARSE_SPLIT_Q is on, none otherwise. Empty / "0" = off.
     "TPU_MLA_TP_BODY_LEVERS": env_str("TPU_MLA_TP_BODY_LEVERS", "auto"),
+    # TPU_DCP_PREFILL_TOKEN_PARALLEL: rows per chunk of the token-parallel
+    # indexer's StreamIndex top-k (its `chunk_tokens`: chunk i's SparseCore
+    # top-k overlaps chunk i+1's scoring); 0 = one unchunked pass. Only the
+    # token-parallel rows; the DCP indexer keeps TPU_STREAMIDX_CHUNK_TOKENS.
+    # 256 was measured at dcp16, where it splits a rank's 512 rows of the
+    # 8192 bucket in two; a rank's rows are T / dcp, so smaller DCP sizes get
+    # more chunks per bucket.
+    "TPU_DCP_TP_INDEXER_CHUNK_TOKENS": env_nonnegative_int(
+        "TPU_DCP_TP_INDEXER_CHUNK_TOKENS", 256
+    ),
     # DCP sparse MLA: chunks of at most this many query tokens take the
     # decode-sized (small-chunk) path -- TPU_DCP_MLA_SMALL_CHUNK_BATCH tokens
     # per grid step and the one-atom live-bounded SparseCore gather
