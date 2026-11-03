@@ -97,8 +97,10 @@ class KernelConfig:
     # engine's prefill runs it; off: EP8 takes the unfused path.
     prefill_fused_moe_ep8: bool = False
     # A 16384-token window's MoE as the fused 8192 MoE over its two halves
-    # (where the fused MoE runs at 8192); off: the unfused path.
-    prefill_moe_halves: bool = True
+    # (where the fused MoE runs at 8192); off: the unfused path (faster, BK 786).
+    prefill_moe_halves: bool = dataclasses.field(
+        default_factory=lambda: os.environ.get("K3_PREFILL_MOE_HALVES", "") == "1"
+    )
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.
