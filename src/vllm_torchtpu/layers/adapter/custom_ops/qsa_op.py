@@ -1345,19 +1345,26 @@ def _pair_qgate(qgate, head_dim, pair_group, pair_major=False, q_gather=True):
     return torch.cat([q_pair, torch.zeros_like(q_pair)], dim=-1).reshape(tokens, -1)
 
 
-def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: int):
+def build_pooled_qsa_token_shard_compressed_dcp_op(
+    tp_group, pair_group, size: int, shard_merge: bool | None = None
+):
     """``build_pooled_qsa_compressed_dcp_op`` for the prefill sequence-parallel
     graph (and, with VLLM_TPU_QSA_DECODE_TOKEN_SHARD, the replicated backbone,
     whose shards of at most one row per request slot take the decode
     indexer): each DCP pair scores one token shard (``TP / size`` shards, both
     ranks over their owned groups), one TP all-gather brings every pair's
     local lists, and every rank merges all rows. Takes ``shard_index`` (the
-    TP rank), ``dcp_rank`` and ``kv_heads`` keywords."""
+    TP rank), ``dcp_rank`` and ``kv_heads`` keywords. ``shard_merge``
+    (default VLLM_TPU_QSA_DCP_SHARD_MERGE): split the merge over the ranks;
+    it reshapes by the step's rows, so graphs traced with symbolic rows (the
+    replicated backbone) build the op without it."""
     world = int(tp_group.world_size)
     _, attend, token_select = _compressed_dcp_ops()
     _, _, _, combine = _dcp_ops()
+    if shard_merge is None:
+        shard_merge = envs.VLLM_TPU_QSA_DCP_SHARD_MERGE
     # Built here, outside the traced forward: jax_op inspects the step.
-    merge, attend_blocks = _shard_merge_ops() if envs.VLLM_TPU_QSA_DCP_SHARD_MERGE else (None, None)
+    merge, attend_blocks = _shard_merge_ops() if shard_merge else (None, None)
 
     def run(*args, shard_index, dcp_rank, kv_heads, **kwargs):
         args = list(args)
