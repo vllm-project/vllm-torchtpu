@@ -85,6 +85,18 @@ def add_arguments(parser, profile: bool = False) -> None:
         "case's prompt is a prefix of a longer case's), for first-token checks",
     )
     prefill.add_argument(
+        "--prompt-seed",
+        type=int,
+        default=1000,
+        help="--fixed-prompts: repeat k's prompt r uses seed PROMPT_SEED + 16 k + r",
+    )
+    prefill.add_argument(
+        "--route-counts",
+        default="",
+        help="directory: with prefill_route_counts, the prefill saves its MoE "
+        "route count snapshots here (rank 0 logs each step's window numbers)",
+    )
+    prefill.add_argument(
         "--token-file",
         default="",
         help="a .npy of int32 token ids: each prompt is a random slice of it "
@@ -271,6 +283,9 @@ def run_prefill(args, records: harness.Records) -> None:
     from vllm_torchtpu.megakernel.kimi_k3 import prefill as k3_prefill
     from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
 
+    if args.route_counts:
+        os.makedirs(args.route_counts, exist_ok=True)
+        os.environ["K3_PREFILL_ROUTE_COUNTS_DIR"] = args.route_counts
     cases = []
     for part in filter(None, args.prompts.split(",")):
         prompt, _, prefix = part.partition("@")
@@ -367,7 +382,7 @@ def run_prefill(args, records: harness.Records) -> None:
             if args.fixed_prompts:
                 prompts = []
                 for r in range(count):
-                    fixed = np.random.default_rng(1000 + 16 * repeat + r)
+                    fixed = np.random.default_rng(args.prompt_seed + 16 * repeat + r)
                     if corpus is None:  # ids uniform over the vocabulary
                         prompts.append(
                             fixed.integers(
@@ -381,6 +396,7 @@ def run_prefill(args, records: harness.Records) -> None:
                 prompts = [
                     _prompt_tokens(rng, corpus, prefix + length) for _ in range(count)
                 ]
+            windows_before = getattr(prefiller, "_route_windows", 0)
             if args.chain_prefix and prefix:
                 # The prefix as its own prompt on the same blocks (untimed): its
                 # pages and final KDA state are what the timed step's hit reads.
@@ -416,6 +432,11 @@ def run_prefill(args, records: harness.Records) -> None:
                 stepped = prefiller.step(mk.StepInput(rows))
                 bridge.materialize(stepped.tokens)
                 elapsed = 1e3 * (time.perf_counter() - started)
+            if args.route_counts and harness.rank() == 0:
+                harness.log(
+                    f"route windows {tag} repeat {repeat}: "
+                    f"{windows_before + 1}..{getattr(prefiller, '_route_windows', 0)}"
+                )
             first_tokens.append(stepped.tokens[:count, 0].cpu().tolist())
             if harness.rank() == 0:
                 # Correctness fingerprint: first tokens and a checksum of every KV pool.
