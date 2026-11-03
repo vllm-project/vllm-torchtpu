@@ -217,6 +217,7 @@ def _layer_config(
             envs.TPU_RPA_SLIDING_PREFILL_MAX_BKV if sliding else None
         ),
         fence_output=envs.TPU_RPA_FENCE_OUTPUT,
+        head_page_writes=envs.TPU_CP_KV_WRITE_KERNEL and not sliding,
     )
     if cfg.local_kv_heads != impl.num_kv_heads:
         raise ValueError(
@@ -248,12 +249,13 @@ def prepare_cp_prefill_attention(
     if cfg not in _OPS:
         logger.info_once(
             "Context-parallel prefill attention on %d ranks: %d query / %d KV heads, "
-            "sliding window %s, %s QK/PV.",
+            "sliding window %s, %s QK/PV, KV head pages written by %s.",
             world,
             num_heads,
             num_kv_heads,
             cfg.sliding_window,
             "fp8" if cfg.fp8_compute else "bf16",
+            "the head-page kernel" if cfg.head_page_writes else "XLA slices",
         )
     attn._cp_prefill_config = cfg
     attn._cp_prefill_ops = build_ops(cfg)

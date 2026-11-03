@@ -47,6 +47,7 @@ around its one collective (an all-gather of `pack_kv_rows` rows, or of
 """
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import Any
 
@@ -271,8 +272,9 @@ def cp_prefill_attention(
     sm_scale: float = 1.0,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    return_kv_pages: bool = False,
     **rpa_kwargs,
-) -> jax.Array:
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Attention of the rank's two pieces against `kv_pages`.
 
     Args:
@@ -292,10 +294,12 @@ def cp_prefill_attention(
         sliding_window: The layer's window, None for full attention.
         fp8_compute: Run QK^T and PV as fp8 x fp8 (`ragged_paged_attention`).
         sm_scale, k_scale, v_scale: As for `ragged_paged_attention`.
+        return_kv_pages: Also return `kv_pages` as the kernel leaves them.
         **rpa_kwargs: Further static `ragged_paged_attention` arguments.
 
     Returns:
-        [2 * piece_tokens, num_q_heads, head_dim] attention output.
+        [2 * piece_tokens, num_q_heads, head_dim] attention output, and with
+        `return_kv_pages` the pages (the kernel's aliased cache output).
 
     `ragged_paged_attention` donates its cache argument, so outside a jit this
     consumes `kv_pages`.
@@ -308,7 +312,7 @@ def cp_prefill_attention(
         # operand slots.
         shape = (q.shape[0], num_kv_heads, kv_pages.shape[-1])
         keys = values = jnp.zeros(shape, kv_pages.dtype)
-    out, _ = wrapper.ragged_paged_attention(
+    out, kv_pages = wrapper.ragged_paged_attention(
         q,
         keys,
         values,
@@ -327,7 +331,7 @@ def cp_prefill_attention(
         fp8_compute=fp8_compute,
         **rpa_kwargs,
     )
-    return out
+    return (out, kv_pages) if return_kv_pages else out
 
 
 def tp_kv_heads(num_kv_heads: int, tp_size: int, tp_rank: Rank) -> tuple[Rank, int]:
@@ -421,6 +425,162 @@ def write_kv_pages(
         jnp.reshape(count, (1,)).astype(jnp.int32),
         src_pages.astype(jnp.int32),
         dst_pages.astype(jnp.int32),
+        pages,
+        kv_cache,
+    )
+
+
+def _copy_head_page_kernel(
+    _count_ref, _src_ref, _dst_ref, head_ref, page_ref, _cache_ref, out_ref, *, half
+):
+    if not half:
+        out_ref[...] = page_ref[...]
+        return
+    # A 32-bit word packs one position's slots K_h V_h K_h+1 V_h+1, lowest
+    # byte first; the cache keeps K_h V_h and zero padding slots.
+    words = pltpu.bitcast(page_ref[...], jnp.uint32)
+    odd = head_ref[0] % 2
+
+    @pl.when(odd == 0)
+    def _():
+        out_ref[...] = pltpu.bitcast(words & jnp.uint32(0xFFFF), out_ref.dtype)
+
+    @pl.when(odd == 1)
+    def _():
+        out_ref[...] = pltpu.bitcast(words >> 16, out_ref.dtype)
+
+
+def _seq_along_lane_head_page_kernel(
+    _count_ref, _src_ref, _dst_ref, head_ref, page_ref, _cache_ref, out_ref, scratch_ref
+):
+    """One head's K and V of a gathered page as a SEQ_ALONG_LANE cache page:
+    from (token, d) words of four slots to (d group, token) words of four
+    consecutive d, each slot's bytes transposed through `scratch_ref`."""
+    _, page_size, _, _, head_dim = page_ref.shape
+    lanes = scratch_ref.shape[-1]
+    chunks, groups = page_size // lanes, head_dim // 4
+    words = pltpu.bitcast(page_ref[...], jnp.uint32).reshape(page_size, head_dim)
+
+    def every_4th_row(i):
+        """Rows i, i + 4, ... of the transposed slot in scratch: [groups, page_size]."""
+        rows = [
+            scratch_ref[pl.ds(chunks * i + c, groups, stride=4 * chunks), :]
+            for c in range(chunks)
+        ]
+        return jnp.concatenate(rows, axis=1)
+
+    def store(shift):
+        for slot in (0, 1):  # K, then V
+            byte = (words >> (shift + 8 * slot)) & jnp.uint32(0xFF)
+            transposed = byte.T  # [head_dim, page_size]
+            for c in range(chunks):
+                scratch_ref[pl.ds(c, head_dim, stride=chunks), :] = transposed[
+                    :, c * lanes : (c + 1) * lanes
+                ]
+            w = every_4th_row(0)
+            for i in range(1, 4):
+                w = w | (every_4th_row(i) << (8 * i))
+            out_ref[0, slot] = pltpu.bitcast(w, out_ref.dtype).reshape(
+                groups, 4, page_size
+            )
+
+    odd = head_ref[0] % 2
+
+    @pl.when(odd == 0)
+    def _():
+        store(0)
+
+    @pl.when(odd == 1)
+    def _():
+        store(16)
+
+
+def write_kv_head_pages(
+    kv_cache: jax.Array,
+    pages: jax.Array,
+    first_head: Rank,
+    src_pages: jax.Array,
+    dst_pages: jax.Array,
+    count: jax.Array,
+    *,
+    num_heads: int,
+    kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+) -> jax.Array:
+    """`write_kv_pages` of the KV heads [first_head, first_head + num_heads)
+    of `pages`, which hold every KV head (`kv_pages_from_rows`).
+
+    The kernel takes the heads' slots from each page in VMEM, so it costs the
+    pages it reads and writes; `kv_head_slots` before `write_kv_pages` is an
+    XLA slice of the packed slot axis, whose relayout can cost far more.
+    `kv_cache` holds fp8 pages of `num_heads` heads in `kv_layout`: one or an
+    even number of heads (as `tp_kv_heads` deals them out) in a
+    HEAD_ALONG_SUBLANE cache, one head in a SEQ_ALONG_LANE cache.
+    """
+    *_, page_size, rows, packing, head_dim = pages.shape
+    if packing != 4 or kv_cache.dtype != pages.dtype:
+        raise NotImplementedError(
+            f"Head pages need packing-4 (fp8) pages, got {pages.dtype} pages "
+            f"and a {kv_cache.dtype} cache."
+        )
+    half = num_heads == 1
+    if not half and num_heads % 2:
+        raise NotImplementedError(f"{num_heads} heads are neither one nor even.")
+    # Word rows of a page the heads occupy; two heads' K and V fill one.
+    head_rows = 1 if half else num_heads // 2
+    if rows % head_rows:
+        raise ValueError(f"{rows} word rows do not split into {head_rows}-row heads")
+    in_block = (1, page_size, head_rows, packing, head_dim)
+    scratch_shapes = []
+    if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        if not half or page_size % 128:
+            raise NotImplementedError(
+                f"SEQ_ALONG_LANE head pages take one head of whole 128-token lane "
+                f"tiles, got {num_heads} heads of {page_size}-token pages."
+            )
+        out_block = (1, 2, head_dim // packing, packing, page_size)
+        kernel = _seq_along_lane_head_page_kernel
+        scratch_shapes.append(
+            pltpu.VMEM((head_dim * page_size // 128, 128), jnp.uint32)
+        )
+    else:
+        out_block = in_block
+        kernel = functools.partial(_copy_head_page_kernel, half=half)
+    if kv_cache.shape[1:] != out_block[1:]:
+        raise ValueError(
+            f"A {kv_layout} cache of {kv_cache.shape[1:]} pages does not hold "
+            f"{num_heads} head(s) of {pages.shape[1:]} pages."
+        )
+
+    def step(i, count_ref):
+        return jnp.maximum(jnp.minimum(i, count_ref[0] - 1), 0)
+
+    def page_index(i, count_ref, src_ref, dst_ref, head_ref):
+        # The block of word rows holding the first head, in head_rows units.
+        return (src_ref[step(i, count_ref)], 0, head_ref[0] // 2 // head_rows, 0, 0)
+
+    def cache_index(i, count_ref, src_ref, dst_ref, head_ref):
+        return (dst_ref[step(i, count_ref)], 0, 0, 0, 0)
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            grid=(dst_pages.shape[0],),
+            in_specs=[
+                pl.BlockSpec(in_block, page_index),
+                # Aliased with the output and never read.
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(out_block, cache_index),
+            scratch_shapes=scratch_shapes,
+        ),
+        out_shape=jax.ShapeDtypeStruct(kv_cache.shape, kv_cache.dtype),
+        input_output_aliases={5: 0},
+    )(
+        jnp.reshape(count, (1,)).astype(jnp.int32),
+        src_pages.astype(jnp.int32),
+        dst_pages.astype(jnp.int32),
+        jnp.reshape(first_head, (1,)).astype(jnp.int32),
         pages,
         kv_cache,
     )
@@ -538,6 +698,23 @@ class LayerConfig:
     kv_layout: configs.KVLayout
     sliding_prefill_max_bkv: int | None = None
     fence_output: bool = False
+    # A full-attention layer caches its heads with `write_kv_head_pages`.
+    head_page_writes: bool = False
+
+    def __post_init__(self):
+        if not self.head_page_writes:
+            return
+        layout, heads = self.kv_layout, self.local_kv_heads
+        if layout == configs.KVLayout.SEQ_ALONG_LANE and heads != 1:
+            raise NotImplementedError(
+                f"Head page writes cache one KV head per rank in a SEQ_ALONG_LANE "
+                f"cache, not {heads}."
+            )
+        if heads != 1 and heads % 2:
+            raise NotImplementedError(
+                f"Head page writes cache one or an even number of KV heads per "
+                f"rank, not {heads}."
+            )
 
     @property
     def local_kv_heads(self) -> int:
@@ -609,13 +786,28 @@ def full_attention_layer(
     plan = cfg.plan(query.shape[0], page_size)
     rows = jax.lax.bitcast_convert_type(kv_rows, native.dtype)
     pages = kv_pages_from_rows(rows, cfg.head_dim, page_size)
+    first, count = tp_kv_heads(cfg.num_kv_heads, cfg.world, rank)
+    table = _request_block_table(block_tables, seq_lens) * page_stride
+    writes = full_attention_page_writes(plan, table, seq_lens[0])
+    if cfg.head_page_writes:
+        # The kernel reads every key from `pages` and leaves them as they are.
+        out, pages = cp_prefill_attention(
+            query,
+            pages,
+            plan.gathered_page_table(),
+            plan,
+            rank,
+            return_kv_pages=True,
+            **cfg.rpa_kwargs(),
+        )
+        new_native = write_kv_head_pages(
+            native, pages, first, *writes, num_heads=count, kv_layout=cfg.kv_layout
+        )
+        return restore(new_native), out
     out = cp_prefill_attention(
         query, pages, plan.gathered_page_table(), plan, rank, **cfg.rpa_kwargs()
     )
-    first, count = tp_kv_heads(cfg.num_kv_heads, cfg.world, rank)
     mine = cache_pages_from_slots(kv_head_slots(pages, first, count), cfg.kv_layout)
-    table = _request_block_table(block_tables, seq_lens) * page_stride
-    writes = full_attention_page_writes(plan, table, seq_lens[0])
     return restore(write_kv_pages(native, mine, *writes)), out
 
 

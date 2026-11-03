@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     TPU_GEMMA4_SP_MICROBATCHES: int = 1
     TPU_GEMMA4_FUSED_NORM_QUANT: bool = False
     TPU_GEMMA4_CP_MIN_TOKENS: int = 0
+    TPU_CP_KV_WRITE_KERNEL: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -516,6 +517,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_TPU_SOLO_PREFILL_OVER_TOKENS whose bucket is the one below. See
     # models/vllm/gemma4_patch.py.
     "TPU_GEMMA4_CP_MIN_TOKENS": env_nonnegative_int("TPU_GEMMA4_CP_MIN_TOKENS", 0),
+    # Context-parallel prefill (layers/adapter/cp_prefill_attention.py): a
+    # full-attention layer caches its KV heads of the gathered pages with a
+    # Pallas kernel that picks the heads' slots in VMEM, instead of an XLA slice
+    # of the packed slot axis (SEQ_ALONG_LANE caches: one KV head per rank).
+    # Same bytes.
+    "TPU_CP_KV_WRITE_KERNEL": env_bool("TPU_CP_KV_WRITE_KERNEL", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and
