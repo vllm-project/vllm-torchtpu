@@ -337,7 +337,21 @@ def test_determine_available_memory_is_min_across_ep_dp(
     local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
     worker = _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer)
 
-    assert worker.determine_available_memory() == (peer if coupled else local)
+    expected = peer if coupled else local
+    assert worker.determine_available_memory() == expected
+    # Hybrid block counts are sized from the same reduced budget.
+    worker.model_runner.size_hybrid_kv_cache.assert_called_once_with(expected)
+
+
+def test_determine_available_memory_sizes_hybrid_from_kv_cache_memory_bytes():
+    """A user-set KV budget skips profiling; hybrid sizing uses it as is."""
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=4 * utils.GBYTES)
+    worker.model_runner = MagicMock()
+
+    assert worker.determine_available_memory() == 4 * utils.GBYTES
+    worker.model_runner.profile_run.assert_not_called()
+    worker.model_runner.size_hybrid_kv_cache.assert_called_once_with(4 * utils.GBYTES)
 
 
 def test_get_sized_num_gpu_blocks_reports_the_runner_count():

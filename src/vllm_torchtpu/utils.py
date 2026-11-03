@@ -237,10 +237,10 @@ def compute_hbm_budget(devices: Any, gpu_memory_utilization: float) -> HbmBudget
 def estimate_kv_connector_hbm_reserve(vllm_config: Any) -> int:
     """Return HBM allocated after profiling by the configured KV connector.
 
-    Offloading specs can advertise an estimate_hbm_reserve_bytes classmethod
-    through the same metadata used by vLLM's spec factory. Keep this lookup
-    shared so worker budgeting and runner hybrid block-count sizing cannot
-    disagree about the available KV-cache memory.
+    Offloading specs can advertise an `estimate_hbm_reserve_bytes` classmethod
+    through the same metadata used by vLLM's spec factory.
+    `TPUWorker.determine_available_memory` subtracts this reserve via
+    `TPUModelRunner.post_profile_hbm_reserves` before sizing the KV cache.
     """
     kv_tc = vllm_config.kv_transfer_config
     if kv_tc is None:

@@ -22,9 +22,9 @@ from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
 from vllm_torchtpu.executors.tpu_uniproc_executor import TpuUniProcExecutor
 
-# Sentinel returned by the parent get_kv_cache_specs; the override plumbing must
-# pass this through unchanged.
-_SPECS = [{"layer": MagicMock()}]
+# Sentinel returned by the parent determine_available_memory; the override
+# plumbing must pass this through unchanged.
+_AVAIL = [1024 * 1024 * 1024]
 
 
 def _make_executor(
@@ -45,32 +45,32 @@ def _make_executor(
     return executor
 
 
-@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_copies_override_from_workers_when_engine_unset(mock_super):
     """Engine override is None -> copy the agreed worker value to the engine."""
     executor = _make_executor(engine_override=None, worker_overrides=[5428, 5428, 5428])
 
-    specs = executor.get_kv_cache_specs()
+    avail = executor.determine_available_memory()
 
-    assert specs is _SPECS
+    assert avail is _AVAIL
     executor.collective_rpc.assert_called_once_with("get_sized_num_gpu_blocks")
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5428
 
 
-@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_does_not_overwrite_existing_engine_override(mock_super):
     """A user-supplied engine override (e.g. --num-gpu-blocks-override) wins;
     the worker value is never queried."""
     executor = _make_executor(engine_override=1234, worker_overrides=[5428, 5428, 5428])
 
-    specs = executor.get_kv_cache_specs()
+    avail = executor.determine_available_memory()
 
-    assert specs is _SPECS
+    assert avail is _AVAIL
     executor.collective_rpc.assert_not_called()
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 1234
 
 
-@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_raises_when_workers_disagree(mock_super):
     """Workers must agree on the override; a mismatch is a sizing bug, not
     something to silently pick one of. 5428 -> 6840 is 26%, far outside the
@@ -78,10 +78,10 @@ def test_raises_when_workers_disagree(mock_super):
     executor = _make_executor(engine_override=None, worker_overrides=[5428, 6840, 5428])
 
     with pytest.raises(ValueError, match="workers disagree"):
-        executor.get_kv_cache_specs()
+        executor.determine_available_memory()
 
 
-@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_small_blocks_tolerate_measurement_jitter(mock_super):
     """The tolerance must scale with the block count.
 
@@ -95,38 +95,38 @@ def test_small_blocks_tolerate_measurement_jitter(mock_super):
     observed = [551506, 551425, 551415, 551403, 551426, 551358, 551348, 551356]
     executor = _make_executor(engine_override=None, worker_overrides=observed)
 
-    specs = executor.get_kv_cache_specs()
+    avail = executor.determine_available_memory()
 
-    assert specs is _SPECS
+    assert avail is _AVAIL
     # Smallest budget wins, so no worker is asked for more than it measured.
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 551348
 
 
-@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_absolute_floor_applies_to_tiny_block_counts(mock_super):
     """The relative tolerance must not shrink below the absolute floor: at
     100 blocks 0.5% rounds to 0, which would demand exact agreement."""
     executor = _make_executor(engine_override=None, worker_overrides=[100, 102, 101])
 
-    specs = executor.get_kv_cache_specs()
+    avail = executor.determine_available_memory()
 
-    assert specs is _SPECS
+    assert avail is _AVAIL
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 100
 
 
-@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_no_override_when_workers_return_none(mock_super):
     """If no worker computed an override (uniform sizing skipped), the engine
     stays None and vLLM falls back to its own num_blocks computation."""
     executor = _make_executor(engine_override=None, worker_overrides=[None, None, None])
 
-    specs = executor.get_kv_cache_specs()
+    avail = executor.determine_available_memory()
 
-    assert specs is _SPECS
+    assert avail is _AVAIL
     assert executor.vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_pipeline_stages_may_disagree_and_the_smallest_stage_wins(mock_super):
     """Each pipeline stage holds different layers, so its workers measure a
     different count; vLLM sizes every stage's pool to the minimum."""
@@ -136,13 +136,13 @@ def test_pipeline_stages_may_disagree_and_the_smallest_stage_wins(mock_super):
         pipeline_parallel_size=2,
     )
 
-    specs = executor.get_kv_cache_specs()
+    avail = executor.determine_available_memory()
 
-    assert specs is _SPECS
+    assert avail is _AVAIL
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 80
 
 
-@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_workers_within_a_pipeline_stage_must_still_agree(mock_super):
     executor = _make_executor(
         engine_override=None,
@@ -151,10 +151,10 @@ def test_workers_within_a_pipeline_stage_must_still_agree(mock_super):
     )
 
     with pytest.raises(ValueError, match="workers disagree"):
-        executor.get_kv_cache_specs()
+        executor.determine_available_memory()
 
 
-@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_pipeline_stage_without_an_override_is_rejected(mock_super):
     """vLLM applies the override to every stage, so a stage that set none
     (no attention or no mamba layers in it) has no measured capacity for
@@ -166,10 +166,10 @@ def test_pipeline_stage_without_an_override_is_rejected(mock_super):
     )
 
     with pytest.raises(ValueError, match=r"stage\(s\) \[0\] set no"):
-        executor.get_kv_cache_specs()
+        executor.determine_available_memory()
 
 
-@patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(MultiprocExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_pipeline_stages_without_any_override_leave_it_unset(mock_super):
     executor = _make_executor(
         engine_override=None,
@@ -177,30 +177,29 @@ def test_pipeline_stages_without_any_override_leave_it_unset(mock_super):
         pipeline_parallel_size=2,
     )
 
-    executor.get_kv_cache_specs()
+    executor.determine_available_memory()
 
     assert executor.vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-@patch.object(UniProcExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(UniProcExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_uniproc_executor_pins_worker_sized_override(mock_super):
-    """The in-process worker shares the engine's cache_config but no longer
-    writes num_gpu_blocks_override itself, so the single-process executor
-    pins the sized count just like the multi-process ones."""
+    """Single-process executor pins the worker-sized block count after
+    determine_available_memory without mutating a user-supplied override."""
     executor = _make_executor(
         engine_override=None,
         worker_overrides=[5428],
         executor_cls=TpuUniProcExecutor,
     )
 
-    specs = executor.get_kv_cache_specs()
+    avail = executor.determine_available_memory()
 
-    assert specs is _SPECS
+    assert avail is _AVAIL
     executor.collective_rpc.assert_called_once_with("get_sized_num_gpu_blocks")
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5428
 
 
-@patch.object(UniProcExecutor, "get_kv_cache_specs", return_value=_SPECS)
+@patch.object(UniProcExecutor, "determine_available_memory", return_value=_AVAIL)
 def test_uniproc_executor_preserves_user_override(mock_super):
     executor = _make_executor(
         engine_override=1234,
@@ -208,9 +207,9 @@ def test_uniproc_executor_preserves_user_override(mock_super):
         executor_cls=TpuUniProcExecutor,
     )
 
-    specs = executor.get_kv_cache_specs()
+    avail = executor.determine_available_memory()
 
-    assert specs is _SPECS
+    assert avail is _AVAIL
     executor.collective_rpc.assert_not_called()
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 1234
 
@@ -238,10 +237,10 @@ def test_ray_executor_tolerates_measurement_jitter():
 
     observed = [6459, 6456] * 16
     executor = _make_ray_executor(engine_override=None, worker_overrides=observed)
-    with patch.object(RayExecutorV2, "get_kv_cache_specs", return_value=_SPECS):
-        specs = executor.get_kv_cache_specs()
+    with patch.object(RayExecutorV2, "determine_available_memory", return_value=_AVAIL):
+        avail = executor.determine_available_memory()
 
-    assert specs is _SPECS
+    assert avail is _AVAIL
     # Smallest budget wins, so no worker is asked for more than it measured.
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 6456
 
@@ -253,7 +252,7 @@ def test_ray_executor_raises_on_real_disagreement():
         engine_override=None, worker_overrides=[6456, 8000] * 16
     )
     with (
-        patch.object(RayExecutorV2, "get_kv_cache_specs", return_value=_SPECS),
+        patch.object(RayExecutorV2, "determine_available_memory", return_value=_AVAIL),
         pytest.raises(ValueError, match="workers disagree"),
     ):
-        executor.get_kv_cache_specs()
+        executor.determine_available_memory()

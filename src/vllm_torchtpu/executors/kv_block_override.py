@@ -13,7 +13,7 @@
 # limitations under the License.
 """Reconcile per-worker hybrid KV block counts.
 
-Workers size the KV pool from their OWN measured free HBM, so their block
+Workers size the KV pool from their OWN post-profile free HBM, so their block
 counts never agree exactly. The spread that matters is relative: a few tens
 of MiB of allocator jitter is a couple of blocks when a block is megabytes
 (Kimi-K3: ~14 MiB/block, spreads of 1-3 observed at TP=32) but hundreds of
@@ -26,8 +26,8 @@ is asked for more blocks than it measured.
 Shared by every executor that mixes in `KVBlockOverrideMixin`
 (`TpuUniProcExecutor`, `TpuMultiprocExecutor`, and
 `RayDistributedExecutorV2`), which collects `get_sized_num_gpu_blocks` from
-its workers right after `get_kv_cache_specs`; build 155 failed on the Ray
-path's own copy of this logic, which still demanded exact agreement.
+its workers right after `determine_available_memory`; build 155 failed on the
+Ray path's own copy of this logic, which still demanded exact agreement.
 """
 
 from __future__ import annotations
@@ -38,7 +38,6 @@ from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.v1.executor.abstract import Executor
-    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 logger = init_logger(__name__)
 
@@ -119,17 +118,18 @@ def reconcile_num_gpu_blocks_override(
 class KVBlockOverrideMixin:
     """Executor mixin that pins the worker-sized hybrid KV block count.
 
-    Workers record their hybrid KV block count during `get_kv_cache_spec`
-    without touching the user-facing `cache_config.num_gpu_blocks_override`.
-    Place this mixin before the concrete ``Executor`` base class so that,
-    right after ``super().get_kv_cache_specs()``, it reconciles the
-    worker-sized counts onto the engine's ``num_gpu_blocks_override`` unless
-    the user pinned one.
+    Workers size their hybrid KV block count from the post-profile budget in
+    `determine_available_memory` without touching the user-facing
+    `cache_config.num_gpu_blocks_override`. Place this mixin before the
+    concrete ``Executor`` base class so that, right after
+    ``super().determine_available_memory()``, it reconciles the worker-sized
+    counts onto the engine's ``num_gpu_blocks_override`` unless the user
+    pinned one.
     """
 
-    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+    def determine_available_memory(self) -> list[int]:
         # pyrefly: ignore[missing-attribute]
-        specs: list[dict[str, KVCacheSpec]] = super().get_kv_cache_specs()
+        available: list[int] = super().determine_available_memory()
         executor = cast("Executor", self)
         if executor.vllm_config.cache_config.num_gpu_blocks_override is None:
             pc = executor.vllm_config.parallel_config
@@ -139,4 +139,4 @@ class KVBlockOverrideMixin:
             )
             if agreed is not None:
                 executor.vllm_config.cache_config.num_gpu_blocks_override = agreed
-        return specs
+        return available

@@ -516,6 +516,7 @@ class TPUWorker(WorkerBase):
                 "correspondingly."
             )
             logger.info(msg)
+            self.model_runner.size_hybrid_kv_cache(kv_cache_memory_bytes)
             return kv_cache_memory_bytes
 
         # VLLM directive of the percentage of HBM memory the model executor can use
@@ -588,6 +589,7 @@ class TPUWorker(WorkerBase):
                 (available - cap) / utils.GBYTES,
             )
             available = cap
+        self.model_runner.size_hybrid_kv_cache(available)
         return available
 
     def _pooling_kv_cache_cap_bytes(self) -> int | None:
