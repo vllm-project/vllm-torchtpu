@@ -94,6 +94,27 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "slow: multi-rank or large-batch CPU interpret tests"
+    )
+    config.addinivalue_line("markers", "golden: bit-exact golden hash regression tests")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _module_host_and_cpu_jax_gc():
+    """Reclaim host allocations (and CPU JAX executables) at module boundaries."""
+    yield
+    import gc
+
+    if not os.path.exists("/dev/vfio") and "jax" in sys.modules:
+        from jax._src import xla_bridge
+
+        if xla_bridge.backends_are_initialized():
+            sys.modules["jax"].clear_caches()
+    gc.collect()
+
+
 @pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""

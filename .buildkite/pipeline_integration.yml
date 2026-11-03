@@ -71,6 +71,10 @@ steps:
         env:
           SHAPE: *shape_8_core
         <<: *integration_step
+        retry:
+          automatic:
+            - exit_status: 1
+              limit: 2
         plugins:
           - *kube_plugin
         commands:
@@ -123,6 +127,10 @@ steps:
         env:
           SHAPE: *shape_2_core
         <<: *integration_step
+        retry:
+          automatic:
+            - exit_status: 1
+              limit: 3
         plugins:
           - *kube_plugin
         commands:

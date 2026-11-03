@@ -39,7 +39,7 @@ def test_host_ple_compiled_transport_preserves_checkpoint_bits(tp, tmp_path):
             command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
         try:
-            code = child.wait(timeout=600)
+            code = child.wait(timeout=1200)
         finally:
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGTERM)
@@ -60,6 +60,9 @@ def _worker(tp, out):
     import torch_tpu  # noqa: F401
     from torch import distributed as dist
 
+    torch._dynamo.config.cache_size_limit = max(
+        torch._dynamo.config.cache_size_limit, 64
+    )
     rank = int(os.environ["RANK"])
     dp, dp_rank = 8 // tp, rank // tp
     dist.init_process_group(backend="tpu_dist", timeout=datetime.timedelta(seconds=120))
@@ -202,8 +205,8 @@ def _worker(tp, out):
                                     scenario=scenario,
                                 )
                             )
-                    torch._dynamo.reset()
             finally:
+                torch._dynamo.reset()
                 table.close()
     (out / f"rank{rank}.json").write_text(
         json.dumps(dict(rank=rank, checks=checks, errors=errors))

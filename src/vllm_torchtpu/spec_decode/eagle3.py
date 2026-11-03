@@ -1570,12 +1570,20 @@ class Eagle3Proposer:
                 saved_topk_per_chunk.append(
                     self._mtp_compact_and_save(last_token_indices.clamp_min(0))
                 )
+            has_non_default_layout = (
+                getattr(chunk.sequence_layout_plan, "descriptor", None)
+                != DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+            )
+            gather_indices = (
+                last_token_indices.clamp_min(0)
+                if has_non_default_layout
+                else last_token_indices
+            )
             fused_token0 = None
             if (
                 self._draft_rows
                 and envs.VLLM_TPU_DRAFT_CARRY_FUSED
-                and chunk.sequence_layout_plan.descriptor
-                == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+                and not has_non_default_layout
             ):
                 # Position carry + first draft token in one program.
                 hidden_carry, last_hidden_carry = hidden, last_hidden
@@ -1592,18 +1600,15 @@ class Eagle3Proposer:
                 # The draft already returned one row per last token.
                 hidden_carry, last_hidden_carry = hidden, last_hidden
                 positions_carry = self._draft_gather_positions(
-                    positions, last_token_indices
+                    positions, gather_indices
                 )
             else:
                 hidden_carry, positions_carry, last_hidden_carry = (
                     self._draft_gather_carries(
-                        hidden, positions, last_hidden, last_token_indices
+                        hidden, positions, last_hidden, gather_indices
                     )
                 )
-            if (
-                chunk.sequence_layout_plan.descriptor
-                != DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
-            ):
+            if has_non_default_layout:
                 last_hidden_carry = (
                     chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
                         last_hidden_carry, last_token_indices.ge(0)

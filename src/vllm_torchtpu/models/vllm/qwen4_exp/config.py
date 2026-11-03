@@ -187,12 +187,22 @@ def resolve_qsa_kv_cache_layout(cfg):
     return KVCacheLayout.BLHNC
 
 
+def get_qsa_kv_cache_bytes_per_block(groups, cfg) -> int:
+    """Compute per-block KV cache bytes across 1-arg and 2-arg vLLM signatures."""
+    import inspect
+    from collections.abc import Callable
+
+    from vllm.v1.core.kv_cache_utils import _get_kv_cache_bytes_per_block
+
+    fn: Callable[..., int] = _get_kv_cache_bytes_per_block
+    if len(inspect.signature(_get_kv_cache_bytes_per_block).parameters) >= 2:
+        return fn(groups, resolve_qsa_kv_cache_layout(cfg))
+    return fn(groups)
+
+
 def native_cache_capacity(cfg, specs=None):
     """Size scheduler block IDs with the same upstream planner used at runtime."""
-    from vllm.v1.core.kv_cache_utils import (
-        _get_kv_cache_bytes_per_block,
-        get_kv_cache_groups,
-    )
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
     groups = get_kv_cache_groups(
         cfg, native_cache_specs(cfg) if specs is None else specs
@@ -203,9 +213,7 @@ def native_cache_capacity(cfg, specs=None):
     )
     # One null block is reserved by the scheduler's pool.
     pages = 1 + cfg.scheduler_config.max_num_seqs * blocks_per_request
-    bytes_per_block = _get_kv_cache_bytes_per_block(
-        groups, resolve_qsa_kv_cache_layout(cfg)
-    )
+    bytes_per_block = get_qsa_kv_cache_bytes_per_block(groups, cfg)
     max_pool_bytes = (
         envs.QWEN4_EXP_MAX_POOL_BYTES
         if envs.QWEN4_EXP_MAX_POOL_BYTES is not None
