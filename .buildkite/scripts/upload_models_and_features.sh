@@ -146,7 +146,7 @@ if [[ "${#pipeline_v6e_fragments[@]}" -gt 0 ]]; then
     echo "steps:"
     echo "  - group: \"TPU v6e nightly Tests\""
     echo "    key: \"v6e-group\""
-    echo "    depends_on: [\"build_docker\", \"${CPU_GATE:-build_docker}\"]"
+    echo "    depends_on: \"build_docker\""
     echo "    steps:"
     printf "%s\n" "${pipeline_v6e_fragments[@]}" | sed 's/^/      /'
   } | buildkite-agent pipeline upload
@@ -169,7 +169,7 @@ if [[ "${#pipeline_v7x_fragments[@]}" -gt 0 ]]; then
     echo "steps:"
     echo "  - group: \"TPU v7x nightly Tests\""
     echo "    key: \"v7x-group\""
-    echo "    depends_on: [\"build_docker\", \"${CPU_GATE:-build_docker}\"]"
+    echo "    depends_on: \"build_docker\""
     echo "    steps:"
     printf "%s\n" "${pipeline_v7x_fragments[@]}" | sed 's/^/      /'
   } | buildkite-agent pipeline upload

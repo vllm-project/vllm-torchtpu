@@ -5,14 +5,15 @@ CI runs on the Kueue fleet: `bootstrap.sh` (`bootstrap.py`) uploads the
 and every step runs in a pod through `.buildkite/kubernetes/run.sh`.
 
 `pipeline_cpu.yml` runs the full `pyrefly` type check and unmarked unit tests in
-`tests/` in CPU pods (`key: cpu_checks`, with `JAX_PLATFORMS=cpu` so JAX does
+`tests/` in CPU pods (`key: cpu`, with `JAX_PLATFORMS=cpu` so JAX does
 not look for a TPU). `pipeline_tests.yml` runs tests marked `tpu_test` (or
 `multichip`) on TPU v7x slices (1x1x1 and 2x2x1). PR steps exclude `nightly`
 tests; nightly steps include them. Both use the CI image built by
-`pipeline_build.yml`. On gated builds (anything other than scheduled builds,
-`oncall-fix` PRs, and release tags), `bootstrap.py` exports
-`CPU_GATE=cpu_checks` so TPU steps across `tests`, `integration`, `perf`, and
-`verify` wait for `cpu_checks` to pass before claiming TPU chips.
+`pipeline_build.yml`. On gated builds (PRs without `oncall-fix` and `main`
+post-merge builds), `bootstrap.py` layers the suite's lanes by `DEPENDS_ON` and
+uploads phase 0 (`pipeline_build.yml` and `pipeline_cpu.yml`) plus an
+`upload_phase_1` step (`depends_on: [cpu]`) that uploads the TPU lanes
+(`tests`, `integration`, `perf`, `verify`) only after `cpu` passes.
 
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the

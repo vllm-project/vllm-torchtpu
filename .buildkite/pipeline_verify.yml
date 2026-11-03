@@ -24,9 +24,6 @@ x-run-condition: &run-on-nightly-or-tag
 steps:
   - label: "Upload Tests for Models & Features"
     <<: *run-on-nightly-or-tag
-    # bootstrap.py always sets CPU_GATE, so no fallback is needed.
-    env:
-      CPU_GATE: "${CPU_GATE}"
     agents:
       queue: cpu
     commands:

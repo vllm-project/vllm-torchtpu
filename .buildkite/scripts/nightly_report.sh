@@ -32,7 +32,7 @@ meta() {
 }
 
 # Every cpu/tests-lane step a nightly runs (every key but `(PR)` steps and the
-# `cpu_checks` group key) passed. A step the report did not wait for may have no
+# `cpu` group key) passed. A step the report did not wait for may have no
 # outcome yet, which counts as not passed: a nightly test missing from the
 # step's depends_on can stop a pair being recorded, never let one through.
 tests_lane_passed() {
@@ -44,7 +44,7 @@ tests_lane_passed() {
     if [[ "${outcome}" != "passed" ]]; then
       passed=false
     fi
-  done < <(grep -hoE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${files[@]}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -Ev '(_pr|^cpu_checks)$')
+  done < <(grep -hoE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${files[@]}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -Ev '(_pr|^cpu)$')
   [[ "${passed}" == true ]]
 }
 

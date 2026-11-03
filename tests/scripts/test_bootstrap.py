@@ -154,6 +154,12 @@ class TestBootstrapUnits(unittest.TestCase):
                 (2, None),
                 False,
             ),
+            (
+                {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"},
+                "other",
+                (2, None),
+                False,
+            ),
         ):
             build_ctx = ctx(env)
             kind = bp.build_kind(build_ctx)
@@ -288,8 +294,36 @@ class TestBootstrapUnits(unittest.TestCase):
                 ),
             },
         )
-        self.assertEqual(bp.WAITS_FOR_CPU, {"tests", "integration", "perf", "verify"})
-        self.assertTrue(set(bp.SUITES["cpu-only"]).isdisjoint(bp.WAITS_FOR_CPU))
+        self.assertEqual(
+            bp.DEPENDS_ON,
+            {
+                "tests": ("cpu",),
+                "integration": ("cpu",),
+                "perf": ("cpu",),
+                "verify": ("cpu",),
+            },
+        )
+        self.assertEqual(
+            bp.phases(bp.SUITES["default"]),
+            (("build", "cpu"), ("tests", "integration", "verify")),
+        )
+        self.assertEqual(
+            bp.phases(bp.SUITES["full"]),
+            (("build", "cpu"), ("tests", "integration", "perf", "verify")),
+        )
+        self.assertEqual(bp.phases(bp.SUITES["perf"]), (("build", "perf"),))
+        self.assertEqual(bp.phases(bp.SUITES["cpu-only"]), (("build", "cpu"),))
+        self.assertEqual(
+            bp.phases(bp.SUITES["default"], gated=False), (bp.SUITES["default"],)
+        )
+        self.assertEqual(bp.phases(()), ())
+        with self.assertRaisesRegex(
+            bp.BootstrapError, r"dependency cycle in lanes: cpu tests"
+        ):
+            bp.phases(
+                ("build", "cpu", "tests"),
+                depends_on={"cpu": ("tests",), "tests": ("cpu",)},
+            )
         for lanes in bp.SUITES.values():
             for lane in lanes:
                 self.assertTrue(
@@ -517,6 +551,56 @@ class TestBootstrapUnits(unittest.TestCase):
                 missing.stdout,
             )
 
+            # 6. `bootstrap.py upload-phase <suite> <k>` CLI uploads a phase.
+            log_path.unlink()
+            upload_cli = subprocess.run(
+                [
+                    sys.executable,
+                    str(_SCRIPTS_DIR / "bootstrap.py"),
+                    "upload-phase",
+                    "cpu-only",
+                    "0",
+                ],
+                cwd=_REPO_ROOT,
+                env={**env, "JOB_PRIORITY": "6"},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn(
+                "--- :pipeline: Uploading .buildkite/pipeline_build.yml "
+                "with priority 6",
+                upload_cli.stdout,
+            )
+            for bad_args, expected_err in (
+                (
+                    ["upload-phase"],
+                    "Usage: bootstrap.py [dev | vllm-pin | upload-phase <suite> <k>]",
+                ),
+                (
+                    ["upload-phase", "default", "not-an-int"],
+                    "ERROR: invalid phase index 'not-an-int'; expected an integer.",
+                ),
+                (
+                    ["upload-phase", "default", "9"],
+                    "ERROR: phase 9 out of range for suite 'default' (0..1)",
+                ),
+                (
+                    ["upload-phase", "bogus", "0"],
+                    "ERROR: unknown CI_SUITE 'bogus'",
+                ),
+            ):
+                bad_proc = subprocess.run(
+                    [sys.executable, str(_SCRIPTS_DIR / "bootstrap.py"), *bad_args],
+                    cwd=_REPO_ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(bad_proc.returncode, 1)
+                self.assertIn(expected_err, bad_proc.stderr)
+
     def test_run_bootstrap_orchestration(self) -> None:
         import yaml  # pyrefly: ignore[missing-import]
 
@@ -525,12 +609,14 @@ class TestBootstrapUnits(unittest.TestCase):
             (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
         tags = (
+            ("upload_phase_1", "upload_phase_1"),
+            ("upload_phase_2", "upload_phase_2"),
             ("promote", "promote_lkg"),
             ("verify", "Support matrices and verified commit"),
             ("perf", "Perf and Eval on TPU"),
             ("integration", "integration_tpu"),
             ("tests", "Unit Tests on TPU"),
-            ("cpu", "cpu_checks"),
+            ("cpu", "CPU Checks"),
             ("build", "build_docker_group"),
         )
 
@@ -622,6 +708,39 @@ class TestBootstrapUnits(unittest.TestCase):
                 self.assertEqual(bp.run_bootstrap(env, repo_root=_REPO_ROOT), 0)
             return rec
 
+        def run_next_phase(
+            prev: RunRecorder,
+            *,
+            expected_idx: int = 1,
+            expected_deps: list[str] | None = None,
+        ) -> RunRecorder:
+            expected_key = f"upload_phase_{expected_idx}"
+            self.assertEqual(prev.uploads[0][0], expected_key)
+            uploader = json.loads(prev.uploads[0][1])
+            step = uploader["steps"][0]
+            self.assertEqual(step["key"], expected_key)
+            self.assertEqual(
+                step["depends_on"],
+                ["cpu"] if expected_deps is None else expected_deps,
+            )
+            self.assertEqual(step["agents"], {"queue": "cpu"})
+            prefix = "python3 .buildkite/scripts/bootstrap.py upload-phase "
+            self.assertTrue(step["command"].startswith(prefix))
+            suite_arg, phase_arg = step["command"].removeprefix(prefix).split()
+            self.assertEqual(int(phase_arg), expected_idx)
+            rec = RunRecorder()
+            with mock.patch.object(bp, "_agent", side_effect=rec.agent):
+                self.assertEqual(
+                    bp.upload_phase(
+                        suite_arg,
+                        int(phase_arg),
+                        step["env"],
+                        repo_root=_REPO_ROOT,
+                    ),
+                    0,
+                )
+            return rec
+
         # Unknown CI_SUITE and removed CI_LANES / SKIP_TPU_CI knobs fail clearly.
         with self.assertRaisesRegex(
             bp.BootstrapError,
@@ -641,7 +760,8 @@ class TestBootstrapUnits(unittest.TestCase):
         ):
             run({"SKIP_TPU_CI": "1"})
 
-        # PR default: priority 6, gated on cpu_checks, 5 uploads (reverse SUITES).
+        # PR default: priority 6, phase 0 uploads upload_phase_1 + cpu + build;
+        # phase 1 uploads verify + integration + tests after cpu passes.
         pr = run(
             {
                 "BUILDKITE_PULL_REQUEST": "42",
@@ -659,15 +779,50 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertEqual(pr.annotations, [])
         self.assertEqual(
             [u[0] for u in pr.uploads],
-            ["verify", "integration", "tests", "cpu", "build"],
+            ["upload_phase_1", "cpu", "build"],
         )
-        self.assertEqual(pr.uploads[2][2]["CPU_GATE"], "cpu_checks")
-        self.assertNotIn("SKIP_TPU_CI", pr.uploads[2][2])
-        self.assertEqual(pr.uploads[4][2]["OMNI_IMAGE_SKIP"], "")
-        self.assertIn("tpu-pr/alice@example.com", pr.uploads[2][1])
-        self.assertNotIn("tpu-pr/alice@example.com", pr.uploads[3][1])
-        self.assertIn("cpu_checks", pr.uploads[1][1])
-        self.assertIn("cpu_checks", pr.uploads[2][1])
+        self.assertIn(
+            ":pipeline: Upload tests, integration, verify (after cpu passed)",
+            pr.uploads[0][1],
+        )
+        self.assertNotIn("CPU_GATE", pr.uploads[1][2])
+        self.assertNotIn("SKIP_TPU_CI", pr.uploads[1][2])
+        self.assertEqual(pr.uploads[2][2]["OMNI_IMAGE_SKIP"], "")
+        self.assertNotIn("tpu-pr/alice@example.com", pr.uploads[1][1])
+        pr_phase2 = run_next_phase(pr)
+        self.assertEqual(
+            [u[0] for u in pr_phase2.uploads],
+            ["verify", "integration", "tests"],
+        )
+        self.assertIn("tpu-pr/alice@example.com", pr_phase2.uploads[2][1])
+
+        # 3-level DEPENDS_ON (cpu -> tests -> verify) chains phases 0 -> 1 -> 2.
+        three_level_deps = {
+            "tests": ("cpu",),
+            "integration": ("cpu",),
+            "verify": ("tests",),
+        }
+        with mock.patch.object(bp, "DEPENDS_ON", three_level_deps):
+            chain_p0 = run({"BUILDKITE_PULL_REQUEST": "42"})
+            self.assertEqual(
+                [u[0] for u in chain_p0.uploads],
+                ["upload_phase_1", "cpu", "build"],
+            )
+            self.assertIn(
+                ":pipeline: Upload tests, integration (after cpu passed)",
+                chain_p0.uploads[0][1],
+            )
+            chain_p1 = run_next_phase(chain_p0, expected_idx=1, expected_deps=["cpu"])
+            self.assertEqual(
+                [u[0] for u in chain_p1.uploads],
+                ["upload_phase_2", "integration", "tests"],
+            )
+            self.assertIn(
+                ":pipeline: Upload verify (after tests passed)",
+                chain_p1.uploads[0][1],
+            )
+            chain_p2 = run_next_phase(chain_p1, expected_idx=2, expected_deps=["tests"])
+            self.assertEqual([u[0] for u in chain_p2.uploads], ["verify"])
 
         # PR run-perf-eval: gated full suite, NIGHTLY unset, perf-eval annotation.
         perf_eval_pr = run(
@@ -679,10 +834,14 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertEqual(perf_eval_pr.annotations, ["perf-eval"])
         self.assertEqual(
             [u[0] for u in perf_eval_pr.uploads],
-            ["verify", "perf", "integration", "tests", "cpu", "build"],
+            ["upload_phase_1", "cpu", "build"],
         )
-        self.assertEqual(perf_eval_pr.uploads[0][2]["CPU_GATE"], "cpu_checks")
-        self.assertNotIn("NIGHTLY", perf_eval_pr.uploads[0][2])
+        perf_eval_phase2 = run_next_phase(perf_eval_pr)
+        self.assertEqual(
+            [u[0] for u in perf_eval_phase2.uploads],
+            ["verify", "perf", "integration", "tests"],
+        )
+        self.assertNotIn("NIGHTLY", perf_eval_phase2.uploads[0][2])
 
         # PR skip-tpu-ci & post-merge main webhook upload ONLY ["cpu", "build"].
         for fx, prio, wprio in (
@@ -721,8 +880,6 @@ class TestBootstrapUnits(unittest.TestCase):
             {"CI_SUITE": "perf", "CI_LANES": "perf", "BUILDKITE_BRANCH": "main"}
         )
         self.assertEqual([u[0] for u in perf_sched.uploads], ["perf", "build"])
-        self.assertEqual(perf_sched.uploads[0][2]["CPU_GATE"], "build_docker")
-        self.assertNotIn("cpu_checks", perf_sched.uploads[0][1])
         self.assertTrue(bool(perf_sched.uploads[1][2]["OMNI_IMAGE_SKIP"]))
 
         # skip-tpu-ci + run-full-ci uploads ["cpu", "build"] with NIGHTLY=1 substituted.
@@ -761,10 +918,6 @@ class TestBootstrapUnits(unittest.TestCase):
                 [u[0] for u in fx.uploads],
                 ["verify", "perf", "integration", "tests", "cpu", "build"],
             )
-            self.assertEqual(fx.uploads[0][2]["CPU_GATE"], "build_docker")
-            self.assertNotIn("cpu_checks", fx.uploads[1][1])
-            self.assertNotIn("cpu_checks", fx.uploads[2][1])
-            self.assertNotIn("cpu_checks", fx.uploads[3][1])
             for _, content, _ in fx.uploads:
                 self.assertNotIn('build.env("NIGHTLY")', content)
 
@@ -785,14 +938,20 @@ class TestBootstrapUnits(unittest.TestCase):
             [u[0] for u in torchtpu_nightly.uploads],
             ["verify", "integration", "tests", "cpu", "build"],
         )
-        self.assertEqual(torchtpu_nightly.uploads[0][2]["CPU_GATE"], "build_docker")
 
-        # Release tag is ungated; integration pipeline uploads promote first.
+        # Release tag is ungated; integration pipeline is always ungated and uploads
+        # promote first.
         tag_fx = run({"BUILDKITE_TAG": "v0.32.0", "BUILDKITE_BRANCH": "v0.32.0"})
-        self.assertEqual(tag_fx.uploads[0][2]["CPU_GATE"], "build_docker")
+        self.assertEqual(
+            [u[0] for u in tag_fx.uploads],
+            ["verify", "integration", "tests", "cpu", "build"],
+        )
 
-        integ_gated = run({"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"})
-        self.assertEqual(integ_gated.uploads[1][2]["CPU_GATE"], "cpu_checks")
+        integ_manual = run({"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"})
+        self.assertEqual(
+            [u[0] for u in integ_manual.uploads],
+            ["promote", "verify", "perf", "integration", "tests", "cpu", "build"],
+        )
 
         integ = run(
             {
@@ -805,7 +964,6 @@ class TestBootstrapUnits(unittest.TestCase):
             [u[0] for u in integ.uploads],
             ["promote", "verify", "perf", "integration", "tests", "cpu", "build"],
         )
-        self.assertEqual(integ.uploads[1][2]["CPU_GATE"], "build_docker")
         self.assertEqual(run({"BUILDKITE_MESSAGE": "doc [skip ci]"}).uploads, [])
         self.assertEqual(
             run({"BUILDKITE_PULL_REQUEST": "42"}, files=["README.md"]).uploads, []
@@ -837,15 +995,19 @@ class TestBootstrapUnits(unittest.TestCase):
             )
             with tempfile.TemporaryDirectory() as tmp:
                 tmp_dir = pathlib.Path(tmp)
-                for name, scenario_fx in (
-                    ("pr", pr),
-                    ("skip_tpu_ci", skip_fx),
-                    ("ci_suite_perf", perf_sched),
-                    ("nightly", nightly),
-                    ("integration", integ),
+                for name, uploads in (
+                    ("pr_phase1", list(reversed(pr.uploads))),
+                    (
+                        "pr_both_phases",
+                        [*reversed(pr.uploads), *reversed(pr_phase2.uploads)],
+                    ),
+                    ("skip_tpu_ci", list(reversed(skip_fx.uploads))),
+                    ("ci_suite_perf", list(reversed(perf_sched.uploads))),
+                    ("nightly", list(reversed(nightly.uploads))),
+                    ("integration", list(reversed(integ.uploads))),
                 ):
                     steps: list[Any] = []
-                    for _, content, _ in reversed(scenario_fx.uploads):
+                    for _, content, _ in uploads:
                         doc = yaml.safe_load(content) or {}
                         steps.extend(doc.get("steps") or [])
                     merged_file = tmp_dir / f"{name}.yml"
@@ -874,7 +1036,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 "grep -hoE '^[[:space:]]*key:[[:space:]]*\"?[A-Za-z0-9_-]+' "
                 ".buildkite/pipeline_cpu.yml .buildkite/pipeline_tests.yml "
                 "| sed -E 's/.*key:[[:space:]]*\"?//' "
-                "| grep -Ev '(_pr|^cpu_checks)$'",
+                "| grep -Ev '(_pr|^cpu)$'",
             ],
             cwd=_REPO_ROOT,
             check=True,

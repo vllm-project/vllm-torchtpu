@@ -16,6 +16,7 @@
 
 CLI entry points (compatible with Python 3.10+ stdlib on `queue=cpu`):
 - `bootstrap.py`: main CI pipeline bootstrap (invoked by `bootstrap.sh`).
+- `bootstrap.py upload-phase <suite> <k>`: upload phase `<k>` of `<suite>`.
 - `bootstrap.py dev`: experimental dev pipeline bootstrap (`bootstrap_dev.sh`).
 - `bootstrap.py vllm-pin`: print the pinned upstream vLLM ref from `pyproject.toml`.
 """
@@ -45,15 +46,16 @@ _GITHUB_API_URL = "https://api.github.com"
 # Max TPU jobs one author's PR builds may have in flight on kube (~2 PRs at ~19 jobs).
 PR_TPU_JOBS_PER_AUTHOR = 40
 
-# Pipeline shape (`pipeline upload` prepends right after bootstrap, so the
-# chosen suite uploads in reverse order):
-#
-#   build -> cpu => (gate) -> tests / integration / perf -> verify
-#                                                        -> promote (integration only)
-
-# Each lane is .buildkite/pipeline_<lane>.yml. On gated builds these lanes
-# wait for the cpu lane (their steps depend on ${CPU_GATE} = cpu_checks).
-WAITS_FOR_CPU = {"tests", "integration", "perf", "verify"}
+# Each lane is .buildkite/pipeline_<lane>.yml.
+# Lane -> lanes it depends on. On gated builds a lane is uploaded only after every
+# lane it depends on has passed; other builds upload all lanes at once.
+# A lane that others depend on wraps its steps in one top-level group with key: <lane>.
+DEPENDS_ON: dict[str, tuple[str, ...]] = {
+    "tests": ("cpu",),
+    "integration": ("cpu",),
+    "perf": ("cpu",),
+    "verify": ("cpu",),
+}
 
 # Lane sets a build can run, each in run order.
 SUITES: dict[str, tuple[str, ...]] = {
@@ -143,12 +145,47 @@ _MISSING_VLLM_PIN_ERROR = (
 
 
 def is_gated(ctx: BuildContext) -> bool:
-    """True when TPU steps must wait for `cpu_checks` to pass first."""
+    """True when lanes in `DEPENDS_ON` wait until their dependencies pass."""
     return (
         ctx.source != "schedule"
+        and not ctx.is_integration
         and "oncall-fix" not in ctx.pr_labels
         and not bool(_RELEASE_TAG_RE.match(ctx.tag))
     )
+
+
+def phases(
+    lanes: Sequence[str],
+    *,
+    gated: bool = True,
+    depends_on: Mapping[str, Sequence[str]] | None = None,
+) -> tuple[tuple[str, ...], ...]:
+    """Layer `lanes` topologically by `DEPENDS_ON` (single phase when ungated)."""
+    if not lanes:
+        return ()
+    if not gated:
+        return (tuple(lanes),)
+    deps_map = DEPENDS_ON if depends_on is None else depends_on
+    in_suite = set(lanes)
+    deps = {
+        lane: tuple(d for d in deps_map.get(lane, ()) if d in in_suite)
+        for lane in lanes
+    }
+    placed: set[str] = set()
+    remaining = list(lanes)
+    result: list[tuple[str, ...]] = []
+    while remaining:
+        layer = tuple(
+            lane for lane in remaining if all(d in placed for d in deps[lane])
+        )
+        if not layer:
+            raise BootstrapError(
+                f"ERROR: dependency cycle in lanes: {' '.join(remaining)}"
+            )
+        result.append(layer)
+        placed.update(layer)
+        remaining = [lane for lane in remaining if lane not in placed]
+    return tuple(result)
 
 
 class BootstrapError(Exception):
@@ -513,6 +550,94 @@ def upload_with_priority(
     _agent("pipeline", "upload", input_text=payload, env=env)
 
 
+def upload_phase(
+    suite: str,
+    phase_idx: int,
+    env: Mapping[str, str] | None = None,
+    *,
+    gated: bool = True,
+    repo_root: pathlib.Path = _REPO_ROOT,
+) -> int:
+    """Upload `phase_idx` of `SUITES[suite]` (and the next phase's uploader step)."""
+    if suite not in SUITES:
+        raise BootstrapError(
+            f"ERROR: unknown CI_SUITE '{suite}'; suites are: {' '.join(SUITES)}"
+        )
+    suite_lanes = SUITES[suite]
+    all_phases = phases(suite_lanes, gated=gated)
+    if phase_idx < 0 or phase_idx >= len(all_phases):
+        raise BootstrapError(
+            f"ERROR: phase {phase_idx} out of range for suite '{suite}' "
+            f"(0..{len(all_phases) - 1})"
+        )
+
+    child_env = dict(os.environ if env is None else env)
+    job_priority = int(_env_or(child_env, "JOB_PRIORITY", str(PRIORITIES["other"][0])))
+    nightly = _env_or(child_env, "NIGHTLY", "0") == "1"
+    concurrency_group = child_env.get("PR_TPU_CONCURRENCY_GROUP") or None
+
+    next_idx = phase_idx + 1
+    if next_idx < len(all_phases):
+        next_lanes = all_phases[next_idx]
+        in_suite = set(suite_lanes)
+        deps = tuple(
+            dict.fromkeys(
+                dep
+                for lane in next_lanes
+                for dep in DEPENDS_ON.get(lane, ())
+                if dep in in_suite
+            )
+        )
+        step_env = {
+            k: child_env[k]
+            for k in (
+                "JOB_PRIORITY",
+                "NIGHTLY",
+                "OMNI_IMAGE_SKIP",
+                "PR_TPU_CONCURRENCY_GROUP",
+            )
+            if child_env.get(k)
+        }
+        uploader = {
+            "priority": job_priority,
+            "steps": [
+                {
+                    "label": (
+                        f":pipeline: Upload {', '.join(next_lanes)} "
+                        f"(after {', '.join(deps)} passed)"
+                    ),
+                    "key": f"upload_phase_{next_idx}",
+                    "depends_on": list(deps),
+                    "agents": {"queue": "cpu"},
+                    "env": step_env,
+                    "command": (
+                        "python3 .buildkite/scripts/bootstrap.py "
+                        f"upload-phase {suite} {next_idx}"
+                    ),
+                }
+            ],
+        }
+        _agent(
+            "pipeline",
+            "upload",
+            input_text=json.dumps(uploader) + "\n",
+            env=child_env,
+        )
+
+    for lane in reversed(all_phases[phase_idx]):
+        lane_file = f".buildkite/pipeline_{lane}.yml"
+        print(f"Uploading {lane_file}")
+        upload_with_priority(
+            lane_file,
+            repo_root=repo_root,
+            job_priority=job_priority,
+            nightly=nightly,
+            pr_tpu_concurrency_group=concurrency_group,
+            env=child_env,
+        )
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
@@ -595,16 +720,10 @@ def run_bootstrap(
         elif suite == "full" and not ctx.nightly_env and "run-perf-eval" in pr_labels:
             _annotate("perf-eval", env=child_env)
 
-    # 5. Env exports (NIGHTLY, CPU_GATE, OMNI_IMAGE_SKIP, PR_TPU_CONCURRENCY_GROUP).
+    # 5. Env exports (NIGHTLY, OMNI_IMAGE_SKIP, PR_TPU_CONCURRENCY_GROUP).
     nightly = ctx.nightly_env or "run-full-ci" in pr_labels
     if nightly:
         child_env["NIGHTLY"] = "1"
-    waits_for_cpu = (
-        is_gated(ctx)
-        and "cpu" in lanes
-        and any(lane in WAITS_FOR_CPU for lane in lanes)
-    )
-    child_env["CPU_GATE"] = "cpu_checks" if waits_for_cpu else "build_docker"
     # pipeline_build.yml skips the -omni image build when this is non-empty.
     # Buildkite rejects the upload if a skip reason is over 70 characters.
     child_env["OMNI_IMAGE_SKIP"] = (
@@ -620,19 +739,8 @@ def run_bootstrap(
     if concurrency_group is not None:
         child_env["PR_TPU_CONCURRENCY_GROUP"] = concurrency_group
 
-    # 6. Upload loop (reversed because Buildkite prepends each upload after bootstrap).
-    for lane in reversed(lanes):
-        lane_file = f".buildkite/pipeline_{lane}.yml"
-        print(f"Uploading {lane_file}")
-        upload_with_priority(
-            lane_file,
-            repo_root=repo_root,
-            job_priority=job_priority,
-            nightly=nightly,
-            pr_tpu_concurrency_group=concurrency_group,
-            env=child_env,
-        )
-
+    # 6. Upload phase 0 (gated builds chain later phases via upload_phase_<k>).
+    upload_phase(suite, 0, child_env, gated=is_gated(ctx), repo_root=repo_root)
     print("--- Buildkite Bootstrap Finished")
     return 0
 
@@ -705,8 +813,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         elif args == ["vllm-pin"]:
             print(read_pinned_vllm_commit(_REPO_ROOT))
             rc = 0
+        elif len(args) == 3 and args[0] == "upload-phase":
+            try:
+                phase_idx = int(args[2])
+            except ValueError as exc:
+                raise BootstrapError(
+                    f"ERROR: invalid phase index '{args[2]}'; expected an integer."
+                ) from exc
+            rc = upload_phase(args[1], phase_idx)
         else:
-            raise BootstrapError("Usage: bootstrap.py [dev | vllm-pin]")
+            raise BootstrapError(
+                "Usage: bootstrap.py [dev | vllm-pin | upload-phase <suite> <k>]"
+            )
     except BootstrapError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)

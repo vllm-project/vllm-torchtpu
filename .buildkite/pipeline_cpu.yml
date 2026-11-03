@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # CPU checks (full typecheck and unmarked unit tests) on the Kueue fleet's cpu
-# queue; gated builds wait for `cpu_checks` before starting any TPU step.
+# queue; gated builds wait for `cpu` to pass before uploading TPU steps.
 
 x-kube-plugin: &kube_plugin
   kubernetes:
@@ -44,7 +44,7 @@ x-tests-plugin-defaults: &tests_plugin_defaults
 
 steps:
   - group: "CPU Checks"
-    key: "cpu_checks"
+    key: "cpu"
     steps:
       # pyrefly in the CI image against .pyrefly-baseline-full.json.
       # The pod already runs that image, but typecheck_full.sh decides it is
