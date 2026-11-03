@@ -295,17 +295,10 @@ def _fp8(rng, shape, scale=1.0):
     )
 
 
-@pytest.mark.parametrize("pipeline", [False, True], ids=["one_gather", "pipelined"])
-@pytest.mark.parametrize("layout", ["sparsecore", "tensorcore"])
-@pytest.mark.parametrize("pcp", [2, 4, 8])
-@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
-def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout, pipeline):
-    mesh = _mesh()
-    monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", CHUNK_TOKENS)
-    # Pipelined: chunk-by-chunk attention merged by lse (TPU_PCP_KV_PIPELINE).
-    monkeypatch.setattr(envs, "TPU_PCP_KV_PIPELINE", pipeline)
+def _split_prefill_steps(mesh, scenario, pcp, layout):
+    """Per step of `scenario`: the caches after the split write, the split
+    prefill's arguments, and what the numpy reference needs."""
     nope_spec, rope_spec = _specs(KVCacheLayout(layout))
-    chunk_pages = pcp_chunk_pages(PAGE_SIZE, DCP)
     rng = np.random.default_rng(zlib.crc32(f"{scenario}-{pcp}-{layout}".encode()))
     tp = DCP // pcp
     steps = SCENARIOS[scenario]
@@ -321,7 +314,6 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout, pipeline)
         jnp.zeros((DCP * s.shape[0], *s.shape[1:]), s.jax_dtype)
         for s in (nope_spec, rope_spec)
     )
-    checked = 0
     for st in _plan_steps(pcp, steps, _block_table(rng)):
         plan0, local_padded = st.plan0, st.local_padded
         kv_rows, pe_rows, q_rows, topk_rows, owners = [], [], [], [], []
@@ -372,8 +364,7 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout, pipeline)
             pcp_size=pcp,
             interleave_size=INTERLEAVE,
         )
-        out = attention_interface.sparse_mla_attention_pcp_prefill(
-            *caches,
+        prefill_args = (
             jnp.asarray(q_global[..., :LKV_DIM], jnp.bfloat16),
             jnp.asarray(q_global[..., LKV_DIM:], jnp.bfloat16),
             _shard(pcp, topk_rows),
@@ -387,28 +378,61 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout, pipeline)
             ),
             _rep(plan0.host_metadata["num_split_reqs"]),
             _rep(plan0.host_metadata["ws_used_pages"]),
-            mesh,
-            nope_spec,
-            rope_spec,
-            sm_scale=SM_SCALE,
-            k_scale=K_SCALE,
-            dcp_size=DCP,
-            interleave_size=INTERLEAVE,
-            chunk_pages=chunk_pages,
+        )
+        yield SimpleNamespace(
+            st=st,
+            caches=caches,
+            prefill_args=prefill_args,
+            specs=(nope_spec, rope_spec),
+            q_bf16=q_bf16,
+            topk_rows=topk_rows,
+            owners=owners,
+            kv_deq=kv_deq,
+            pe_deq=pe_deq,
+        )
+
+
+def _prefill_kwargs():
+    return dict(
+        sm_scale=SM_SCALE,
+        k_scale=K_SCALE,
+        dcp_size=DCP,
+        interleave_size=INTERLEAVE,
+        chunk_pages=pcp_chunk_pages(PAGE_SIZE, DCP),
+    )
+
+
+@pytest.mark.parametrize("pipeline", [False, True], ids=["one_gather", "pipelined"])
+@pytest.mark.parametrize("layout", ["sparsecore", "tensorcore"])
+@pytest.mark.parametrize("pcp", [2, 4, 8])
+@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout, pipeline):
+    mesh = _mesh()
+    monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", CHUNK_TOKENS)
+    # Pipelined: chunk-by-chunk attention merged by lse (TPU_PCP_KV_PIPELINE).
+    monkeypatch.setattr(envs, "TPU_PCP_KV_PIPELINE", pipeline)
+    tp = DCP // pcp
+    checked = 0
+    for case in _split_prefill_steps(mesh, scenario, pcp, layout):
+        st = case.st
+        out = attention_interface.sparse_mla_attention_pcp_prefill(
+            *case.caches, *case.prefill_args, mesh, *case.specs, **_prefill_kwargs()
         )
         out = np.asarray(out.astype(jnp.float32)).reshape(
-            DCP, local_padded, HEADS_PER_RANK, LKV_DIM
+            DCP, st.local_padded, HEADS_PER_RANK, LKV_DIM
         )
 
         for d in range(DCP):
             p, t = divmod(d, tp)
             heads = slice(t * HEADS_PER_RANK, (t + 1) * HEADS_PER_RANK)
-            for i, tok in enumerate(owners[p]):
+            for i, tok in enumerate(case.owners[p]):
                 if tok is None:
                     continue
                 r, pos = tok
-                sel = topk_rows[p][i][topk_rows[p][i] >= 0]
-                expected = _reference(q_bf16[p][i, heads], kv_deq[r], pe_deq[r], sel)
+                sel = case.topk_rows[p][i][case.topk_rows[p][i] >= 0]
+                expected = _reference(
+                    case.q_bf16[p][i, heads], case.kv_deq[r], case.pe_deq[r], sel
+                )
                 np.testing.assert_allclose(
                     out[d, i],
                     expected,
@@ -419,6 +443,79 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout, pipeline)
                 )
                 checked += 1
     assert checked > 0
+
+
+DECODE_ROWS = 16  # decode window: rows * TOPK must fill whole SparseCore gather batches
+
+
+@pytest.mark.parametrize("pipeline", [False, True], ids=["one_gather", "pipelined"])
+@pytest.mark.parametrize("pcp", [2, 8])
+@pytest.mark.parametrize("scenario", ["multi_req", "with_decode"])
+def test_pcp_mixed_matches_separate_ops(monkeypatch, scenario, pcp, pipeline):
+    """`sparse_mla_attention_pcp_mixed` (TPU_PCP_KV_OVERLAP_DECODE) returns
+    what `sparse_mla_attention_dcp` then `sparse_mla_attention_pcp_prefill`
+    return. The decode rows are synthetic: both paths read and write them the
+    same way, which is all this checks."""
+    mesh = _mesh()
+    monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", CHUNK_TOKENS)
+    monkeypatch.setattr(envs, "TPU_PCP_KV_PIPELINE", pipeline)
+    rng = np.random.default_rng(zlib.crc32(f"mixed-{scenario}-{pcp}".encode()))
+    heads = (DCP // pcp) * HEADS_PER_RANK
+    seq_lens = rng.integers(1, BLOCKS_PER_REQ * PAGE_SIZE * DCP // 4, DECODE_ROWS)
+    decode = (
+        jnp.asarray(rng.standard_normal((DECODE_ROWS, heads, LKV_DIM)), jnp.bfloat16),
+        jnp.asarray(rng.standard_normal((DECODE_ROWS, heads, ROPE_DIM)), jnp.bfloat16),
+        jnp.asarray(_fp8(rng, (DECODE_ROWS, LKV_DIM), K_SCALE)),
+        jnp.asarray(_fp8(rng, (DECODE_ROWS, ROPE_DIM), K_SCALE)),
+        # Rank-local indices below each rank's share of the shortest request.
+        _rep(
+            np.where(
+                np.arange(TOPK)[None, :] < 16,
+                rng.integers(
+                    0, int(seq_lens.min()) // DCP + 1, (DCP * DECODE_ROWS, TOPK)
+                ),
+                -1,
+            )
+        ),
+        _rep(seq_lens),
+        _rep(_block_table(rng)[np.arange(DECODE_ROWS) % MAX_REQS].reshape(-1)),
+        _rep(np.arange(DECODE_ROWS + 1)),
+        _rep([DECODE_ROWS] * 3),
+    )
+    compared = 0
+    for case in _split_prefill_steps(mesh, scenario, pcp, "sparsecore"):
+        nope_spec, rope_spec = case.specs
+        kw = _prefill_kwargs()
+        dcp_kw = {
+            k: kw[k] for k in ("sm_scale", "k_scale", "dcp_size", "interleave_size")
+        }
+        nope, rope, dcp_out, dcp_lse = attention_interface.sparse_mla_attention_dcp(
+            *decode[:4], *case.caches, *decode[4:], mesh, nope_spec, rope_spec, **dcp_kw
+        )
+        prefill = attention_interface.sparse_mla_attention_pcp_prefill(
+            nope, rope, *case.prefill_args, mesh, nope_spec, rope_spec, **kw
+        )
+        mixed = attention_interface.sparse_mla_attention_pcp_mixed(
+            *decode[:4],
+            *case.caches,
+            *decode[4:],
+            *case.prefill_args,
+            mesh,
+            nope_spec,
+            rope_spec,
+            **kw,
+        )
+        names = ("nope cache", "rope cache", "dcp output", "dcp lse", "prefill output")
+        for name, want, got in zip(
+            names, (nope, rope, dcp_out, dcp_lse, prefill), mixed
+        ):
+            np.testing.assert_array_equal(
+                np.asarray(got),
+                np.asarray(want),
+                err_msg=f"step {case.st.index} {name}",
+            )
+        compared += 1
+    assert compared > 0
 
 
 # --- Indexer top-k ---------------------------------------------------------

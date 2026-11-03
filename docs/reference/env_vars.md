@@ -40,6 +40,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_PCP_KV_WORKSPACE_TOKENS` | `1048576` | PCP manager: The capacity (in tokens) of the workspace to gather split prefills. The runner splits a step into more forwards if the sum of the split prefill contexts exceeds this capacity; must be at least `--max-model-len`. |
 | `TPU_PCP_KV_CHUNK_TOKENS` | `65536` | PCP manager: Chunk size (in tokens) of the split-prefill KV workspace; the gathered workspace is the smallest power-of-two multiple of it that holds the pages in use. |
 | `TPU_PCP_KV_PIPELINE` | `False` | PCP manager: Attends the split-prefill KV workspace one chunk at a time and merges the partial outputs by log-sum-exp, so each chunk's all-gather can overlap the previous chunk's attention. |
+| `TPU_PCP_KV_OVERLAP_DECODE` | `False` | PCP manager: Runs the decode rows' sparse MLA and the split-prefill attention in one op, so the split prefill's KV all-gather can overlap the decode attention. |
 | `TPU_DCP_MLA_TOPK_CAP` | `0` | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |

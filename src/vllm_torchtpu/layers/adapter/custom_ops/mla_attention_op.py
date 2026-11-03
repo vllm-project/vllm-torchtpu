@@ -1439,9 +1439,12 @@ class VllmTPUMLAAttention(MLAAttention):
             )
         self.pcp_write_split_op = None
         self.pcp_prefill_op = None
+        self.pcp_mixed_op = None
         if getattr(impl, "pcp_kv_gather", False):
             self.pcp_write_split_op = impl._build_pcp_write_split_op(self)
             self.pcp_prefill_op = impl._build_pcp_prefill_op(self)
+            if envs.TPU_PCP_KV_OVERLAP_DECODE:
+                self.pcp_mixed_op = impl._build_pcp_mixed_op(self)
 
     def forward(
         self,
