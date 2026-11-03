@@ -204,19 +204,10 @@ def num_halo_pages(sliding_window: int, page_size: int) -> int:
 
 def halo_neighbours(rank: Rank, world: int) -> tuple[Rank, Rank]:
     """(rank holding the piece before this rank's first piece, rank holding the
-    piece before its second piece): each rank's first-piece tail goes up a
-    rank, its second-piece tail down a rank (`halo_permutations`)."""
+    piece before its second piece): this rank's halos are the first-piece tail
+    of the one and the second-piece tail of the other. Both wrap around;
+    `sliding_local_pages` ignores the halos the wrap gives."""
     return (rank - 1) % world, (rank + 1) % world
-
-
-def halo_permutations(world: int) -> tuple[list[tuple[int, int]], ...]:
-    """(source, target) rank pairs that send each rank's piece tails on to the
-    rank holding the next piece: first-piece tails go up (r -> r + 1),
-    second-piece tails down (r -> r - 1). Both wrap around; `sliding_local_pages`
-    ignores what the wrap delivers."""
-    up = [(r, (r + 1) % world) for r in range(world)]
-    down = [(r, (r - 1) % world) for r in range(world)]
-    return up, down
 
 
 def pack_piece_tails(
@@ -642,9 +633,10 @@ def sliding_exchange_row(
     this rank holds them (`window_pages_held`), every KV head.
 
     `keys` and `values` are the rank's fp8 rows, `rank` [1] int32 this rank and
-    `page_size` the KV cache's. An all-gather moves the halos to every rank,
-    eight times what they need, yet measured faster than an all-to-all that
-    sends each tail to one rank in blocks of one size.
+    `page_size` the KV cache's. The all-gather delivers every tail to every
+    rank, world / 2 times the halo bytes they read, and its result holds world
+    rows; it still measured faster than an all-to-all whose blocks, one size
+    for every destination, sent each tail to all ranks.
     """
     rank = rank[0]
     plan = cfg.plan(keys.shape[0], page_size)

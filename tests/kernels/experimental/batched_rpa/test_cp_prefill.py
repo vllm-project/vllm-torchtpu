@@ -122,7 +122,7 @@ def test_halo_exchange_gives_each_piece_its_window(traced):
     k, v = _kv(plan.num_tokens, 16, 128, seed=1)
     in_order = cp_prefill.pack_kv_pages(k, v, PAGE)
     rows = [(_rank_rows(k, plan, r), _rank_rows(v, plan, r)) for r in range(plan.world)]
-    # The tails each rank sends, as pack_piece_tails packs them.
+    # Every rank's tails, as pack_piece_tails packs them.
     piece = plan.piece_tokens
     tails = [
         [
@@ -131,14 +131,10 @@ def test_halo_exchange_gives_each_piece_its_window(traced):
         ]
         for kr, vr in rows
     ]
-    up, down = cp_prefill.halo_permutations(plan.world)
-    received = [[None, None] for _ in range(plan.world)]
-    for slot, pairs in enumerate((up, down)):
-        for src, dst in pairs:
-            received[dst][slot] = tails[src][slot]
     local_pages = jax.jit(cp_prefill.sliding_local_pages, static_argnums=3)
     for rank in range(plan.world):
-        halos = jnp.concatenate(received[rank])
+        first_src, second_src = cp_prefill.halo_neighbours(rank, plan.world)
+        halos = jnp.concatenate([tails[first_src][0], tails[second_src][1]])
         args = (halos, *rows[rank], plan)
         local = (
             local_pages(*args, jnp.int32(rank)) if traced else local_pages(*args, rank)
