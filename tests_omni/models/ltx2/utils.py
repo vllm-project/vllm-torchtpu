@@ -46,7 +46,6 @@ class LTX2Outputs:
     video: np.ndarray
     audio: np.ndarray
     sample_rate: int
-    fps: float
 
 
 def get_ltx2_model() -> str:
@@ -89,7 +88,6 @@ def extract_ltx2_outputs(
         3,
     ),
     expected_audio_samples: int = LTX2_DEFAULT_AUDIO_SAMPLES,
-    expected_fps: float = LTX2_DEFAULT_FRAME_RATE,
 ) -> LTX2Outputs:
     """Extract and validate video and audio arrays from LTX-2 Omni outputs.
 
@@ -135,12 +133,9 @@ def extract_ltx2_outputs(
     assert sample_rate == LTX2_AUDIO_SAMPLE_RATE, (
         f"Expected sample_rate {LTX2_AUDIO_SAMPLE_RATE}, got {sample_rate}"
     )
-    fps = float(mm_output.get("fps", expected_fps))
-    assert fps == expected_fps, f"Expected fps {expected_fps}, got {fps}"
 
     return LTX2Outputs(
         video=video,
         audio=audio,
         sample_rate=sample_rate,
-        fps=fps,
     )
