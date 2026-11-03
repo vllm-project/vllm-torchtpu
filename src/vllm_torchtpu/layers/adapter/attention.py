@@ -579,6 +579,7 @@ def _pallas_rpa_kernel_batched(
     sliding_prefill_max_bkv: int | None = None,
     fp8_compute: bool = False,
     fence_output: bool = False,
+    unmasked_interior: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
@@ -595,6 +596,8 @@ def _pallas_rpa_kernel_batched(
         rpa_kwargs["fp8_compute"] = True
     if fence_output:
         rpa_kwargs["fence_output"] = True
+    if unmasked_interior:
+        rpa_kwargs["unmasked_interior"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -652,6 +655,7 @@ def _pallas_rpa_kernel_batched_from_qkv(
     sliding_prefill_max_bkv: int | None = None,
     fp8_compute: bool = False,
     fence_output: bool = False,
+    unmasked_interior: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`_pallas_rpa_kernel_batched` on fused qkv rows (see
     `PallasBatchedRPAAttentionBackendImpl.forward_from_qkv`)."""
@@ -662,6 +666,7 @@ def _pallas_rpa_kernel_batched_from_qkv(
         sliding_prefill_max_bkv=sliding_prefill_max_bkv,
         fp8_compute=fp8_compute,
         fence_output=fence_output,
+        unmasked_interior=unmasked_interior,
     )
     native, page_stride, restore_pool = native_kv_cache_view(
         kv_cache, num_kv_heads, head_dim, None
@@ -1223,6 +1228,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     max_prefill_bkv,
                 )
                 entry_kwargs["sliding_prefill_max_bkv"] = max_prefill_bkv
+            if "unmasked_interior" in entry_params and envs.TPU_RPA_UNMASKED_INTERIOR:
+                logger.info_once(
+                    "Batched RPA mixed steps skip the QK mask where every query "
+                    "sees the whole KV block."
+                )
+                entry_kwargs["unmasked_interior"] = True
             if self.fp8_compute:
                 if "fp8_compute" not in entry_params:
                     raise NotImplementedError(
@@ -1987,6 +1998,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
             fp8_compute=self.fp8_compute,
             skip_empty_launch=envs.TPU_RPA_SKIP_EMPTY_LAUNCH,
             fence_output=envs.TPU_RPA_FENCE_OUTPUT,
+            unmasked_interior=envs.TPU_RPA_UNMASKED_INTERIOR,
         )
         if self.sliding_window is not None:
             entry_kwargs["cap_sliding_decode_block"] = (

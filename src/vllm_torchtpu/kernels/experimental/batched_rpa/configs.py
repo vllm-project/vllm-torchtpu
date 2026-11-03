@@ -180,6 +180,9 @@ class ServingConfigs:
     # QK^T and PV run fp8 x fp8 on the MXU: Q arrives already quantized to
     # `dtype_q` and P is quantized to `dtype_kv` (see flash_attention.py).
     fp8_compute: bool = False
+    # Mixed-kernel steps whose KV block every query of the step sees whole run
+    # without the mask (kernel.step_needs_mask). Outputs are unchanged.
+    unmasked_interior: bool = False
 
     def __post_init__(self):
         if self.mask_invalid_v is None:

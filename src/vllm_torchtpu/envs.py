@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     TPU_GEMMA4_FUSED_ATTN_PROLOGUE: bool = False
     TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = False
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
+    TPU_RPA_UNMASKED_INTERIOR: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -863,6 +864,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RPA_SLIDING_PREFILL_MAX_BKV": env_nonnegative_int(
         "TPU_RPA_SLIDING_PREFILL_MAX_BKV", 0
     ),
+    # Batched RPA's mixed (prefill) kernel builds a causal/window mask for every
+    # query chunk of every step. With this on, a step whose KV block every
+    # query of the step sees whole (all of a long prompt's steps but those on
+    # the diagonal and the window edge) runs a mask-free copy of the step body,
+    # which saves a compare and a select per logit. Outputs are unchanged.
+    "TPU_RPA_UNMASKED_INTERIOR": env_bool("TPU_RPA_UNMASKED_INTERIOR"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.

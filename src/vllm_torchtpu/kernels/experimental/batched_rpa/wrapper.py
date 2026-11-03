@@ -670,6 +670,7 @@ def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
         "sliding_prefill_max_bkv",
         "fp8_compute",
         "fence_output",
+        "unmasked_interior",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -718,6 +719,7 @@ def ragged_paged_attention(
     sliding_prefill_max_bkv: int | None = None,
     fp8_compute: bool = False,
     fence_output: bool = False,
+    unmasked_interior: bool = False,
     prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
@@ -800,6 +802,9 @@ def ragged_paged_attention(
         fence_output: If True, the token-major output is materialized behind
             an optimization barrier instead of its transpose being fused into
             the consumer. Outputs are identical either way.
+        unmasked_interior: If True, a mixed-kernel step whose KV block every
+            query of the step sees whole skips the QK mask (one compare and one
+            select per logit). Outputs are identical either way.
         prepared_inputs: `(q_hbm, new_kv_hbm)` as `prepare_inputs` returns them
             for these queries, keys and values (e.g. from
             `prologue.qkv_to_rpa_inputs`). Then only the shapes and dtypes of
@@ -891,6 +896,7 @@ def ragged_paged_attention(
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
         skip_empty_launch=skip_empty_launch,
+        unmasked_interior=unmasked_interior,
     )
 
     prepare = functools.partial(
