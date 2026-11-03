@@ -31,8 +31,13 @@ def main():
 
     torch.set_num_threads(1)
     torch.empty(1, device="tpu").cpu()
-    # Skip only the unrelated vLLM model registries, as in the Engram harness.
-    for name in ("vllm_torchtpu.models", "vllm_torchtpu.models.vllm"):
+    # Skip unrelated model/layer registries; import the target bridge unchanged.
+    for name in (
+        "vllm_torchtpu.models",
+        "vllm_torchtpu.models.vllm",
+        "vllm_torchtpu.layers",
+        "vllm_torchtpu.layers.adapter.custom_ops",
+    ):
         if name not in sys.modules:
             package = types.ModuleType(name)
             package.__path__ = [str(gate.ROOT / "src" / name.replace(".", "/"))]
@@ -65,6 +70,7 @@ def main():
     candidate_jax = types.FunctionType(
         bridge._post_pre_rms_jax.__code__, bridge_namespace, "candidate_bridge"
     )
+    candidate_jax.__annotations__ = bridge._post_pre_rms_jax.__annotations__
     candidate_op = pallas.jax_op(
         "pallas::dsv41_mhc_gate_layout_torch_candidate",
         candidate_jax,
@@ -83,7 +89,9 @@ def main():
             scale.new_empty((tokens, mult)),
         )
 
-    def post_jax(x, residual, post, comb):
+    def post_jax(
+        x: jax.Array, residual: jax.Array, post: jax.Array, comb: jax.Array
+    ) -> jax.Array:
         return post_kernel.mhc_post(x, residual, post, comb)
 
     post_op = pallas.jax_op(
