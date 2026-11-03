@@ -321,3 +321,107 @@ def compress_rope_packed(eps: float) -> Any:
     return _get(
         f"compress_rope_packed_c16_s16_o0_w128_e{_tag(eps)}", build, donate=(9, 10)
     )
+
+
+def compress_rope_addresses(eps: float) -> Any:
+    """Registered decode state/main/index addresses and ratio-2 compressor."""
+    from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
+        get_tpu_version,
+    )
+
+    if jax.default_backend() != "tpu" or get_tpu_version() != 7:
+        return None
+
+    def build():
+        def run(
+            table: jax.Array,
+            starts: jax.Array,
+            kv_starts: jax.Array,
+            positions: jax.Array,
+            minimum: jax.Array,
+            x: jax.Array,
+            weight: jax.Array,
+            gamma: jax.Array,
+            rows: jax.Array,
+            low: jax.Array,
+            high: jax.Array,
+            main: jax.Array,
+            index: jax.Array,
+        ) -> tuple[
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ]:
+            records = (low.shape[0] + high.shape[0]) // compress_kernel._RECORD_ROWS
+            prev, valid, wp, wo, rp, ro, main_records, index_slots = (
+                decode_preparation.compressor_addresses_packed(
+                    table,
+                    starts,
+                    kv_starts,
+                    positions,
+                    minimum,
+                    main,
+                    index,
+                    total_records=records,
+                )
+            )
+            latent, words, scales, state = compress_kernel.fused_compress_rope(
+                x,
+                weight,
+                gamma,
+                rows,
+                prev,
+                valid,
+                (low, high),
+                eps=eps,
+                ring_tables=(wp, wo, rp, ro),
+            )
+            assert isinstance(state, tuple)
+            return (
+                latent,
+                words,
+                scales,
+                *state,
+                valid[:, 0] != 0,
+                main_records,
+                index_slots,
+            )
+
+        def fake(
+            table,
+            starts,
+            kv_starts,
+            positions,
+            minimum,
+            x,
+            weight,
+            gamma,
+            rows,
+            low,
+            high,
+            main,
+            index,
+        ):
+            return (
+                x.new_empty((x.shape[0], 512), dtype=torch.bfloat16),
+                x.new_empty((x.shape[0], 128), dtype=torch.int32),
+                x.new_empty((x.shape[0], 1), dtype=torch.float32),
+                torch.empty_like(low),
+                torch.empty_like(high),
+                x.new_empty((x.shape[0],), dtype=torch.bool),
+                x.new_empty((x.shape[0],), dtype=torch.int32),
+                x.new_empty((x.shape[0],), dtype=torch.int32),
+            )
+
+        return run, fake
+
+    return _get(
+        f"compress_rope_addresses_c16_m128_i256_w128_e{_tag(eps)}",
+        build,
+        donate=(9, 10),
+    )

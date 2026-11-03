@@ -550,3 +550,92 @@ def compressor_state_packed(
         outputs[4].reshape(-1),
         outputs[5],
     )
+
+
+def compressor_addresses_packed(
+    table: jax.Array,
+    starts: jax.Array,
+    kv_starts: jax.Array,
+    positions: jax.Array,
+    minimum: jax.Array,
+    main: jax.Array,
+    index: jax.Array,
+    *,
+    total_records: int,
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+]:
+    """Decode state, stable ring tables and ratio-2 main/index addresses."""
+    args = (table, starts, kv_starts, positions, minimum, main, index)
+    shapes = ((48, 8), (49,), (49,), (288,), (48,), (48, 386), (48, 193))
+    if any(
+        x.shape != shape or x.dtype != jnp.int32
+        for x, shape in zip(args, shapes, strict=True)
+    ):
+        raise ValueError("Packed compressor addresses require INT32 decode shapes")
+
+    def compact(records):
+        r = records.reshape(1, 288)
+        valid = (r >= 0) & (r < total_records)
+        rank = prefix_sum(valid.astype(jnp.int32), axis=1) - 1
+        match = valid & (rank == jnp.arange(288, dtype=jnp.int32)[:, None])
+        token = jnp.sum(jnp.where(match, jnp.arange(288)[None, :], 0), axis=1)
+        record = jnp.sum(jnp.where(match, r, 0), axis=1)
+        return jnp.stack((token, record), axis=1), jnp.stack(
+            (jnp.int32(0), jnp.sum(valid, dtype=jnp.int32))
+        )
+
+    def kernel(*refs):
+        state, ss, ks, pos, mins, mt, it = (r[...] for r in refs[:7])
+        prev, valid, write, read = _compressor_state_addresses(state, ss, ks, pos, mins)
+        rows = jnp.arange(288, dtype=jnp.int32)
+        request = jnp.minimum(jnp.sum(rows[None, :] >= ks[1:, None], axis=0), 47)
+        selected = request[None, :] == jnp.arange(48)[:, None]
+
+        def slots(page_table, capacity):
+            logical = pos // 2
+            col = jnp.minimum(logical // capacity, page_table.shape[1] - 1)
+            col = jnp.where(col < 0, col + page_table.shape[1], col)
+            indices = jnp.broadcast_to((col % 128)[None, :], (48, 288))
+            chunks = (page_table.shape[1] + 127) // 128
+            padded = jnp.pad(
+                page_table, ((0, 0), (0, chunks * 128 - page_table.shape[1]))
+            )
+            per_request = jnp.zeros((48, 288), jnp.int32)
+            for chunk in range(chunks):
+                tile = padded[:, chunk * 128 : (chunk + 1) * 128]
+                gathered = take_along(tile, indices, axis=1)
+                per_request += jnp.where(col[None, :] // 128 == chunk, gathered, 0)
+            blocks = jnp.sum(jnp.where(selected, per_request, 0), axis=0)
+            return jnp.where(rows < ks[-1], blocks * capacity + logical % capacity, -1)
+
+        main_slots, index_slots = slots(mt, 128), slots(it, 256)
+        records = jnp.where((valid != 0) & (main_slots >= 0), main_slots, -1)
+        outputs = (prev, valid, *compact(write), *compact(read), records, index_slots)
+        for ref, value in zip(refs[7:], outputs, strict=True):
+            ref[...] = value
+
+    outputs = pl.pallas_call(
+        kernel,
+        out_shape=tuple(
+            jax.ShapeDtypeStruct(s, jnp.int32)
+            for s in ((288,), (288,), (288, 2), (2,), (288, 2), (2,), (288,), (288,))
+        ),
+        name="dsv41_compressor_addresses_packed_c128_i256",
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=16 * 1024 * 1024),
+    )(table, starts, kv_starts, positions, minimum, main, index)
+    return tuple(
+        x.reshape(s)
+        for x, s in zip(
+            outputs,
+            ((288, 1), (288, 1), (576,), (2,), (576,), (2,), (288,), (288,)),
+            strict=True,
+        )
+    )
