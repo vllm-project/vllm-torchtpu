@@ -1019,6 +1019,13 @@ class VllmTPUMLAAttention(MLAAttention):
         # Query replication attends with the whole DCP group's heads, so the
         # absorbed W_UK_T has to span them too. Gathered once here rather than
         # gathering q every step -- that trade is the point of qrep.
+        # Upstream `MLAAttention.process_weights_after_loading` (vLLM v0.32.0)
+        # registers its own `W_UK_T_dcp_qrep` as a Parameter when qrep is on.
+        # Drop that registration so the plain device tensor built below can
+        # take its place; torch refuses to assign a plain tensor to a name
+        # that is registered as a Parameter.
+        self._parameters.pop("W_UK_T_dcp_qrep", None)
+        self._parameters.pop("W_UK_T_dcp_qrep_scale", None)
         self.W_UK_T_dcp_qrep = None
         self.W_UK_T_dcp_qrep_scale = None
         if self.dcp_q_replicate:
