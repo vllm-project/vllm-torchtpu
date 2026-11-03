@@ -572,23 +572,113 @@ def _pallas_impl(supports_write: bool):
 
 
 @pytest.mark.parametrize(
-    "draft_tp,target_tp,impls,expected",
+    "draft_tp,target_tp,impls,unsupported",
     [
-        pytest.param(1, 1, [True, True], True, id="replicated-all-supported"),
-        pytest.param(1, 8, [True, True], True, id="replicated-under-target-tp"),
-        pytest.param(1, 1, [True, False], False, id="one-layer-unsupported"),
-        pytest.param(8, 8, [True, True], False, id="sharded-draft"),
-        pytest.param(1, 1, [True, None], False, id="non-pallas-layer"),
+        pytest.param(1, 1, [True, True], None, id="replicated-all-supported"),
+        pytest.param(1, 8, [True, True], None, id="replicated-under-target-tp"),
+        pytest.param(1, 1, [True, False], "layer 1's KV cache", id="one-unsupported"),
+        pytest.param(8, 8, [True, True], "TP-sharded", id="sharded-draft"),
+        pytest.param(1, 1, [True, None], "layer 1 uses MagicMock", id="non-pallas"),
     ],
 )
 def test_context_kv_write_needs_every_draft_layer_supported(
-    draft_tp, target_tp, impls, expected
+    draft_tp, target_tp, impls, unsupported
 ):
     proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp)
     proposer.draft_model = _draft_with_attn_impls(
         [mock.MagicMock() if s is None else _pallas_impl(s) for s in impls]
     )
-    assert proposer._context_kv_write_supported() is expected
+    reason = proposer._context_kv_write_unsupported_reason()
+    if unsupported is None:
+        assert reason is None
+    else:
+        assert unsupported in reason
+
+
+class _OwnsContextKVDraft(SimpleNamespace):
+    owns_context_kv = True
+
+
+@pytest.mark.parametrize(
+    "draft_model,unsupported",
+    [
+        # DeepSeek-V4 DSpark: the layer's attention is `attn`, not `self_attn`.
+        pytest.param(
+            SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(attn=None)])),
+            "layer 0 has no self_attn.attn",
+            id="no-self-attn",
+        ),
+        # Kimi-K3 DSpark: MLA keeps its attention in `mla_attn`.
+        pytest.param(
+            SimpleNamespace(
+                model=SimpleNamespace(
+                    layers=[SimpleNamespace(self_attn=SimpleNamespace(mla_attn=None))]
+                )
+            ),
+            "layer 0 has no self_attn.attn",
+            id="mla-attn",
+        ),
+        pytest.param(
+            _OwnsContextKVDraft(model=SimpleNamespace(layers=[])),
+            "stores its own context K/V",
+            id="owns-context-kv",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                tpu_precompute_and_store_context_kv=lambda *args: None,
+                model=SimpleNamespace(layers=[]),
+            ),
+            "stores its own context K/V",
+            id="tpu-hook",
+        ),
+    ],
+)
+def test_context_kv_write_refuses_drafts_without_the_rpa_update(
+    draft_model, unsupported
+):
+    """Drafts that store context K/V their own way keep it, instead of
+    crashing the support check."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.draft_model = draft_model
+    assert unsupported in proposer._context_kv_write_unsupported_reason()
+
+
+@pytest.mark.parametrize(
+    "flag,supported,expected",
+    [(False, True, False), (True, True, True), (True, False, False)],
+    ids=["flag-off", "flag-on", "flag-on-unsupported"],
+)
+def test_write_only_context_kv_follows_the_flag(monkeypatch, flag, supported, expected):
+    monkeypatch.setattr(
+        dflash_module.envs, "VLLM_TPU_DFLASH_WRITE_ONLY_KV", flag, raising=False
+    )
+    proposer = _make_proposer(draft_tp=1)
+    proposer.draft_model = _draft_with_attn_impls([_pallas_impl(supported)])
+    log = mock.Mock()
+    monkeypatch.setattr(dflash_module.logger, "info", log)
+
+    proposer._resolve_write_only_context_kv()
+
+    assert proposer._write_only_context_kv is expected
+    # The fallback says why.
+    assert log.called is (flag and not supported)
+    if log.called:
+        assert "layer 0's KV cache" in log.call_args.args[1]
+
+
+def _layer_major_impl():
+    """A real PallasAttentionBackendImpl carrying only what the support check
+    reads, so the pool check is the backend's own."""
+    impl = object.__new__(PallasAttentionBackendImpl)
+    impl.__dict__.update(
+        head_size=128,
+        kv_sharing_target_layer_name=None,
+        _pool_is_seq_along_lane=False,
+        _bm_kernel=False,
+        _pcp_streaming=False,
+        dcp_world_size=1,
+    )
+    return impl
 
 
 @pytest.mark.parametrize(
@@ -602,10 +692,13 @@ def test_context_kv_write_needs_every_draft_layer_supported(
     ],
 )
 def test_write_only_context_kv_falls_back_on_a_packed_pool(
-    cache_shapes, write_only, checked
+    monkeypatch, cache_shapes, write_only, checked
 ):
     """Pools are allocated after load_model, so a 4-D shared packed pool is
     only visible at the first context-KV update; it must fall back to RPA."""
+    monkeypatch.setattr(
+        dflash_module.envs, "VLLM_TPU_BLOCK_MAJOR_KV", False, raising=False
+    )
     proposer = _make_proposer(draft_tp=1)
     proposer._write_only_context_kv = True
     proposer.draft_model = SimpleNamespace(
@@ -613,7 +706,9 @@ def test_write_only_context_kv_falls_back_on_a_packed_pool(
             layers=[
                 SimpleNamespace(
                     self_attn=SimpleNamespace(
-                        attn=SimpleNamespace(kv_cache=torch.empty(shape))
+                        attn=SimpleNamespace(
+                            impl=_layer_major_impl(), kv_cache=torch.empty(shape)
+                        )
                     )
                 )
                 for shape in cache_shapes

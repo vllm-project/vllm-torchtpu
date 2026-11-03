@@ -272,54 +272,78 @@ class DFlashProposer:
                     attn_impl.use_causal_mask = layer_causal_list[i]
                     attn_impl.initialize_kernel(attn_obj)
 
-        self._write_only_context_kv = (
-            envs.VLLM_TPU_DFLASH_WRITE_ONLY_KV and self._context_kv_write_supported()
-        )
-        if envs.VLLM_TPU_DFLASH_WRITE_ONLY_KV and not self._write_only_context_kv:
+        self._resolve_write_only_context_kv()
+
+    def _resolve_write_only_context_kv(self) -> None:
+        """Turn on the write-only context-KV update if the flag asks for it and
+        the draft supports it; otherwise keep the RPA call and log why."""
+        if not envs.VLLM_TPU_DFLASH_WRITE_ONLY_KV:
+            self._write_only_context_kv = False
+            return
+        reason = self._context_kv_write_unsupported_reason()
+        self._write_only_context_kv = reason is None
+        if reason is not None:
             logger.info(
-                "VLLM_TPU_DFLASH_WRITE_ONLY_KV is set, but this draft's KV cache "
-                "layout or parallelism is not supported yet; keeping the RPA "
-                "context-KV update."
+                "VLLM_TPU_DFLASH_WRITE_ONLY_KV is set, but %s; keeping the RPA "
+                "context-KV update.",
+                reason,
             )
 
-    def _context_kv_write_supported(self) -> bool:
-        """Whether every draft attention layer can take the write-only context
-        update. TODO: a TP-sharded draft writes a head-sharded pool; enable it
-        once that path is validated."""
+    def _context_kv_write_unsupported_reason(self) -> str | None:
+        """Why the write-only context update cannot serve this draft, or None
+        if every draft attention layer can take it. TODO: a TP-sharded draft
+        writes a head-sharded pool; enable it once that path is validated."""
         assert self.draft_model is not None
+        # Drafts that store their own context K/V (DeepSeek-V4 and Kimi-K3
+        # DSpark) skip the per-layer RPA update; see
+        # _tpu_precompute_and_update_kv_cache.
+        if callable(
+            getattr(self.draft_model, "tpu_precompute_and_store_context_kv", None)
+        ) or getattr(type(self.draft_model), "owns_context_kv", False):
+            return "this draft model stores its own context K/V"
         if not self._draft_replicated:
-            return False
-        for layer in self.draft_model.model.layers:
-            attn_impl = layer.self_attn.attn.impl
-            if not (
-                isinstance(attn_impl, PallasAttentionBackendImpl)
-                and attn_impl.supports_kv_cache_write()
-            ):
-                return False
-        return True
+            return "the draft is TP-sharded (draft_tensor_parallel_size > 1)"
+        for i, layer in enumerate(self.draft_model.model.layers):
+            attn_obj = getattr(getattr(layer, "self_attn", None), "attn", None)
+            if attn_obj is None:
+                return f"draft layer {i} has no self_attn.attn"
+            attn_impl = attn_obj.impl
+            if not isinstance(attn_impl, PallasAttentionBackendImpl):
+                return (
+                    f"draft layer {i} uses {type(attn_impl).__name__}, not the "
+                    "Pallas RPA v3 backend"
+                )
+            if not attn_impl.supports_kv_cache_write():
+                return (
+                    f"draft layer {i}'s KV cache layout or parallelism is not "
+                    "supported by write_kv_cache"
+                )
+        return None
 
     def _check_write_only_kv_pools(self) -> None:
         """Fall back to the RPA context-KV update if a draft layer's KV pool is
-        not the 5-D layer-major pool write_kv_cache writes (e.g. a 4-D shared
-        packed pool). The pools are allocated after load_model, so this runs
-        before the first context-KV update instead."""
+        not one write_kv_cache supports (e.g. a 4-D shared packed pool). The
+        pools are allocated after load_model, so this runs before the first
+        context-KV update instead."""
         if not self._write_only_context_kv or self._write_only_pools_checked:
             return
         assert self.draft_model is not None
-        caches = [
-            layer.self_attn.attn.kv_cache for layer in self.draft_model.model.layers
-        ]
-        if any(cache.numel() == 0 for cache in caches):
+        attn_objs = [layer.self_attn.attn for layer in self.draft_model.model.layers]
+        if any(attn_obj.kv_cache.numel() == 0 for attn_obj in attn_objs):
             # Memory profiling runs before the pools exist; decide later.
             return
         self._write_only_pools_checked = True
-        if all(cache.ndim == 5 for cache in caches):
-            return
-        self._write_only_context_kv = False
-        logger.info(
-            "VLLM_TPU_DFLASH_WRITE_ONLY_KV is set, but a draft layer's KV cache "
-            "is a shared packed pool; keeping the RPA context-KV update."
-        )
+        for i, attn_obj in enumerate(attn_objs):
+            if not attn_obj.impl.supports_kv_cache_write(attn_obj.kv_cache):
+                self._write_only_context_kv = False
+                logger.info(
+                    "VLLM_TPU_DFLASH_WRITE_ONLY_KV is set, but draft layer %d's KV "
+                    "cache is a %s pool write_kv_cache does not support (e.g. a "
+                    "shared packed pool); keeping the RPA context-KV update.",
+                    i,
+                    tuple(attn_obj.kv_cache.shape),
+                )
+                return
 
     def _load_draft_model(self) -> None:
         logger.info("Loading DFlash draft model...")
