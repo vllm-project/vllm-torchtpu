@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_GEMMA4_SEQUENCE_PARALLEL: bool = False
     TPU_GEMMA4_SP_MICROBATCHES: int = 1
+    TPU_GEMMA4_FUSED_NORM_QUANT: bool = False
     TPU_GEMMA4_CP_MIN_TOKENS: int = 0
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
@@ -94,9 +95,14 @@ if TYPE_CHECKING:
     TPU_RPA_SKIP_EMPTY_LAUNCH: bool = False
     TPU_RPA_FENCE_OUTPUT: bool = False
     TPU_GEMMA4_FUSED_ATTN_PROLOGUE: bool = False
+    TPU_GEMMA4_FUSED_GELU_QUANT: bool = False
+    TPU_GEMMA4_GELU_QUANT_BF16: bool = False
+    TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT: bool = False
     TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = False
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
     TPU_RPA_UNMASKED_INTERIOR: bool = False
+    TPU_RPA_PROLOGUE_DMA_STORES: bool = False
+    TPU_RPA_PROLOGUE_FP8_QUERIES: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -471,6 +477,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_GEMMA4_SEQUENCE_PARALLEL: split a large bucket into this many
     # contiguous token chunks whose collectives and projections can overlap.
     "TPU_GEMMA4_SP_MICROBATCHES": env_int("TPU_GEMMA4_SP_MICROBATCHES", 1),
+    # With TPU_GEMMA4_SEQUENCE_PARALLEL: between two projections of a dense
+    # Gemma4 layer, the residual add around a norm and the next norm with its
+    # per-token FP8 quantization run as one Pallas pass on the rank's rows
+    # (kernels/norm_quant.py) instead of four XLA passes. Rounding: the norms'
+    # sums of squares are added in another order, so values can move one step.
+    "TPU_GEMMA4_FUSED_NORM_QUANT": env_bool("TPU_GEMMA4_FUSED_NORM_QUANT"),
     # Gemma4ForCausalLM at TP >= 3: token buckets of at least this many tokens
     # run context-parallel over the TP group (zigzag pieces of the step's one
     # prompt per rank, every projection whole on every rank); 0 disables. Needs
@@ -850,6 +862,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/vllm/gemma4_attention_patch.py). Rounding: the norms' sums of
     # squares are added in another order, so values can move one step.
     "TPU_GEMMA4_FUSED_ATTN_PROLOGUE": env_bool("TPU_GEMMA4_FUSED_ATTN_PROLOGUE"),
+    # Gemma4's GeGLU (tanh GELU) and the down projection's per-token FP8 input
+    # quantization run as one Pallas pass (models/vllm/gemma4_mlp_patch.py,
+    # kernels/gelu_quant.py) instead of XLA's two passes over the activation.
+    # Rounding: GELU runs in f32 and rounds once, so values can move one step.
+    "TPU_GEMMA4_FUSED_GELU_QUANT": env_bool("TPU_GEMMA4_FUSED_GELU_QUANT"),
+    # With TPU_GEMMA4_FUSED_GELU_QUANT: the fused kernel's GELU, product and
+    # quantization multiply run in bf16 (row maximum and scale in f32), about
+    # half its VALU work. Rounding: values move by up to one FP8 step of their
+    # row's scale.
+    "TPU_GEMMA4_GELU_QUANT_BF16": env_bool("TPU_GEMMA4_GELU_QUANT_BF16"),
+    # With TPU_GEMMA4_FUSED_ATTN_PROLOGUE: the attention hands its FP8 o_proj
+    # the output rows quantized per token, made in one Pallas pass over the
+    # kernel's head-major output (batched_rpa/output_quant.py) instead of
+    # XLA's transpose, f32 copy, row-maximum pass and column-major cast.
+    "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT": env_bool("TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT"),
     # Cap the batched-RPA decode KV block of sliding-window layers at half the
     # window, rounded down to the block stride. The default block fills VMEM
     # (1792 tokens for a 1024-token window on Gemma4), and each decode launch
@@ -870,6 +897,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the diagonal and the window edge) runs a mask-free copy of the step body,
     # which saves a compare and a select per logit. Outputs are unchanged.
     "TPU_RPA_UNMASKED_INTERIOR": env_bool("TPU_RPA_UNMASKED_INTERIOR"),
+    # The fused qkv prologue (TPU_GEMMA4_FUSED_ATTN_PROLOGUE) builds its packed
+    # q and K/V rows as 32-bit words in contiguous VMEM buffers and writes them
+    # with strided DMAs, instead of sublane-packing stores. Outputs unchanged.
+    "TPU_RPA_PROLOGUE_DMA_STORES": env_bool("TPU_RPA_PROLOGUE_DMA_STORES"),
+    # With TPU_RPA_PROLOGUE_DMA_STORES: on fp8_compute layers the prologue also
+    # writes the FP8 queries the mixed kernel reads, instead of a separate XLA
+    # cast and relayout of its bf16 queries (wrapper.quantize_queries).
+    "TPU_RPA_PROLOGUE_FP8_QUERIES": env_bool("TPU_RPA_PROLOGUE_FP8_QUERIES"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.

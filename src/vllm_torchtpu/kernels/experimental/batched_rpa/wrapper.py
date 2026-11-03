@@ -16,7 +16,7 @@
 import dataclasses
 import functools
 import math
-from typing import cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     kernel,
+    output_quant,
     schedule,
     schedule_cp,
     utils,
@@ -671,6 +672,7 @@ def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
         "fp8_compute",
         "fence_output",
         "unmasked_interior",
+        "output_quant_dtype",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -720,8 +722,9 @@ def ragged_paged_attention(
     fp8_compute: bool = False,
     fence_output: bool = False,
     unmasked_interior: bool = False,
-    prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
-) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
+    output_quant_dtype: jnp.dtype | None = None,
+    prepared_inputs: tuple[jax.Array, ...] | None = None,
+) -> tuple[Any, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
     Args:
@@ -805,10 +808,17 @@ def ragged_paged_attention(
         unmasked_interior: If True, a mixed-kernel step whose KV block every
             query of the step sees whole skips the QK mask (one compare and one
             select per logit). Outputs are identical either way.
+        output_quant_dtype: If set, `out` is `(q, scale)`: the output rows
+            `[max_num_tokens, num_q_heads * head_dim]` quantized per token to
+            this dtype as `quantize_tensor` does, and their f32 `[max_num_tokens,
+            1]` scales, made in one pass over the head-major output
+            (`output_quant.quantize_head_major_output`).
         prepared_inputs: `(q_hbm, new_kv_hbm)` as `prepare_inputs` returns them
             for these queries, keys and values (e.g. from
             `prologue.qkv_to_rpa_inputs`). Then only the shapes and dtypes of
-            `queries`, `keys` and `values` are read.
+            `queries`, `keys` and `values` are read. A third array is the
+            fp8_compute kernel's FP8 queries, `quantize_queries(q_hbm,
+            kv_cache.dtype)`, made with them.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -898,6 +908,8 @@ def ragged_paged_attention(
         skip_empty_launch=skip_empty_launch,
         unmasked_interior=unmasked_interior,
     )
+    if output_quant_dtype is not None and (return_lse or cp_group_size is not None):
+        raise ValueError("output_quant_dtype supports neither LSE output nor CP.")
 
     prepare = functools.partial(
         prepare_inputs,
@@ -908,16 +920,19 @@ def ragged_paged_attention(
         kv_layout=kv_layout,
         page_size=page_size,
     )
+    prepared_q_fetch = None
     if prepared_inputs is None:
         q_hbm, new_kv_hbm = prepare(queries, keys, values)
     else:
         expected = [
             (a.shape, a.dtype) for a in jax.eval_shape(prepare, queries, keys, values)
         ]
-        got = [(a.shape, a.dtype) for a in prepared_inputs]
-        if got != expected:
+        got = [(a.shape, a.dtype) for a in prepared_inputs[:2]]
+        if got != expected or len(prepared_inputs) > 3:
             raise ValueError(f"prepared_inputs {got} != prepare_inputs {expected}")
-        q_hbm, new_kv_hbm = prepared_inputs
+        q_hbm, new_kv_hbm = prepared_inputs[:2]
+        if len(prepared_inputs) == 3:
+            prepared_q_fetch = prepared_inputs[2]
 
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs,
@@ -930,6 +945,8 @@ def ragged_paged_attention(
 
     mixed_serve_cfgs = serve_cfgs
     q_fetch_hbm = None
+    if prepared_q_fetch is not None and not fp8_compute:
+        raise ValueError("prepared FP8 queries are for the fp8_compute kernel.")
     if fp8_compute:
         validate_fp8_compute(
             kv_cache.dtype,
@@ -942,7 +959,19 @@ def ragged_paged_attention(
         mixed_serve_cfgs = dataclasses.replace(
             serve_cfgs, dtype_q=kv_cache.dtype, fp8_compute=True
         )
-        q_fetch_hbm = quantize_queries(q_hbm, kv_cache.dtype)
+        if prepared_q_fetch is None:
+            q_fetch_hbm = quantize_queries(q_hbm, kv_cache.dtype)
+        else:
+            want = jax.eval_shape(
+                functools.partial(quantize_queries, dtype=kv_cache.dtype), q_hbm
+            )
+            got = (prepared_q_fetch.shape, prepared_q_fetch.dtype)
+            if got != (want.shape, want.dtype):
+                raise ValueError(
+                    f"prepared FP8 queries {got} are not quantize_queries' "
+                    f"{(want.shape, want.dtype)}"
+                )
+            q_fetch_hbm = prepared_q_fetch
         default_prefill = fp8_prefill_block_sizes(
             model_cfgs,
             mixed_serve_cfgs,
@@ -1081,6 +1110,14 @@ def ragged_paged_attention(
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
     )
+    if output_quant_dtype is not None:
+        quantized = output_quant.quantize_head_major_output(
+            o_hbm_alias_q_hbm,
+            num_q_heads_per_kv_head=num_q_heads // num_kv_heads,
+            head_dim=head_dim,
+            quant_dtype=output_quant_dtype,
+        )
+        return quantized, kv_cache
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
