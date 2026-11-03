@@ -29,6 +29,7 @@ read in bf16; k is quantized from the bf16 value) and v quantized from the f32
 norm output.
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -43,19 +44,26 @@ _VMEM_BUDGET_BYTES = 46 * 1024 * 1024
 _BLOCK_TOKENS = (512, 256, 128, 64, 32, 16)
 
 
-def _block_vmem_bytes(bt: int, width: int, num_q_heads: int, slots: int, d: int) -> int:
+def _block_vmem_bytes(
+    bt: int, width: int, num_q_heads: int, slots: int, d: int, fp8_queries: bool
+) -> int:
     io = bt * width * 2 + num_q_heads * bt * d * 2 + bt * slots * _KV_PACKING * d
+    io += num_q_heads * bt * d if fp8_queries else 0
     return 2 * io + 8 * bt * d * 4  # double-buffered blocks + f32 temporaries
 
 
 def choose_block_tokens(
-    tokens: int, width: int, num_q_heads: int, slots: int, d: int
+    tokens: int,
+    width: int,
+    num_q_heads: int,
+    slots: int,
+    d: int,
+    fp8_queries: bool = False,
 ) -> int:
     """The largest token block that divides `tokens` and fits the VMEM budget."""
     for bt in _BLOCK_TOKENS:
-        if tokens % bt == 0 and (
-            _block_vmem_bytes(bt, width, num_q_heads, slots, d) <= _VMEM_BUDGET_BYTES
-        ):
+        vmem = _block_vmem_bytes(bt, width, num_q_heads, slots, d, fp8_queries)
+        if tokens % bt == 0 and vmem <= _VMEM_BUDGET_BYTES:
             return bt
     raise ValueError(f"no token block for {tokens} tokens of width {width}")
 
@@ -83,23 +91,29 @@ def _quantize(x: jax.Array, scale: float, dtype: jnp.dtype) -> jax.Array:
     return jnp.clip(x, float(info.min), float(info.max)).astype(dtype)
 
 
-def _kernel(
-    qkv_ref,
-    cos_ref,
-    sin_ref,
-    wq_ref,
-    wk_ref,
-    q_ref,
-    kv_ref,
-    *,
-    num_q_heads,
-    num_kv_heads,
-    head_dim,
-    eps,
-    k_scale,
-    v_scale,
-):
-    group = num_q_heads // num_kv_heads
+@dataclasses.dataclass(frozen=True)
+class _Heads:
+    """The head geometry and constants both prologue kernels compute with."""
+
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    eps: float
+    k_scale: float
+    v_scale: float
+
+
+def _block_values(qkv_ref, cos_ref, sin_ref, wq_ref, wk_ref, *, heads, kv_dtype):
+    """A token block's values, shared by both kernels: `q_head(j)`, query head
+    j's normed, rotated values (f32, rounded to bf16 by the caller), and
+    `kv_rows()`, the quantized K/V rows in `prepare_inputs`' order (k, v of
+    each KV head)."""
+    nq, nkv, head_dim, eps = (
+        heads.num_q_heads,
+        heads.num_kv_heads,
+        heads.head_dim,
+        heads.eps,
+    )
     cos = cos_ref[...].astype(jnp.float32)
     sin = sin_ref[...].astype(jnp.float32)
     wq, wk = wq_ref[...], wk_ref[...]
@@ -107,24 +121,184 @@ def _kernel(
     def head(j):
         return qkv_ref[:, j * head_dim : (j + 1) * head_dim]
 
-    for j in range(num_q_heads):
-        q = _rotary(_rms(head(j), wq, eps), cos, sin).astype(q_ref.dtype)
+    def q_head(j):
+        return _rotary(_rms(head(j), wq, eps), cos, sin)
+
+    def kv_rows():
+        rows = []
+        for h in range(nkv):
+            k = _rotary(_rms(head(nq + h), wk, eps), cos, sin)
+            k = k.astype(jnp.bfloat16).astype(jnp.float32)
+            v = _rms(head(nq + nkv + h), None, eps)
+            rows += [
+                _quantize(k, heads.k_scale, kv_dtype),
+                _quantize(v, heads.v_scale, kv_dtype),
+            ]
+        return rows
+
+    return q_head, kv_rows
+
+
+def _kernel(qkv_ref, cos_ref, sin_ref, wq_ref, wk_ref, q_ref, kv_ref, *, heads):
+    group = heads.num_q_heads // heads.num_kv_heads
+    q_head, kv_rows = _block_values(
+        qkv_ref, cos_ref, sin_ref, wq_ref, wk_ref, heads=heads, kv_dtype=kv_ref.dtype
+    )
+    for j in range(heads.num_q_heads):
         h, rest = divmod(j, group)
-        q_ref[h, :, rest // _Q_PACKING, rest % _Q_PACKING, :] = q
-    rows = []
-    for h in range(num_kv_heads):
-        k = _rotary(_rms(head(num_q_heads + h), wk, eps), cos, sin)
-        k = k.astype(jnp.bfloat16).astype(jnp.float32)
-        v = _rms(head(num_q_heads + num_kv_heads + h), None, eps)
-        rows += [
-            _quantize(k, k_scale, kv_ref.dtype),
-            _quantize(v, v_scale, kv_ref.dtype),
-        ]
+        q_ref[h, :, rest // _Q_PACKING, rest % _Q_PACKING, :] = q_head(j).astype(
+            q_ref.dtype
+        )
+    rows = kv_rows()
     slots = kv_ref.shape[1]
-    zeros = jnp.zeros((kv_ref.shape[0], head_dim), kv_ref.dtype)
+    zeros = jnp.zeros((kv_ref.shape[0], heads.head_dim), kv_ref.dtype)
     rows += [zeros] * (slots * _KV_PACKING - len(rows))  # prepare_inputs' padding
     for r, row in enumerate(rows):
         kv_ref[:, r // _KV_PACKING, r % _KV_PACKING, :] = row
+
+
+_LANES = 128
+
+
+def _kernel_dma_stores(
+    qkv_ref,
+    cos_ref,
+    sin_ref,
+    wq_ref,
+    wk_ref,
+    *refs,
+    heads,
+    bt,
+    steps,
+    fp8_queries,
+):
+    """`_kernel` writing its outputs through 32-bit words.
+
+    The packed outputs put two query heads (q) or four K/V rows (kv) of one
+    token in each 32-bit word, so a token's word row is one sublane of a tile
+    and a store of eight tokens is a strided one. Each (row group, 128-lane
+    tile) is built here as `[tokens, 128]` words in a contiguous buffer and
+    written with a strided DMA (double buffered across steps). With
+    `fp8_queries` it also writes `wrapper.quantize_queries`' FP8 queries
+    (four heads per word) for the fp8_compute kernel.
+    """
+    if fp8_queries:
+        q_hbm, kv_hbm, qf_hbm, q_buf, kv_buf, qf_buf, sem = refs
+    else:
+        (q_hbm, kv_hbm, q_buf, kv_buf, sem), qf_hbm, qf_buf = refs, None, None
+    step = pl.program_id(0)
+    slot = step % 2
+    num_kv_heads, head_dim = heads.num_kv_heads, heads.head_dim
+    group = heads.num_q_heads // num_kv_heads
+    pairs = group // _Q_PACKING
+    slots = kv_hbm.shape[1]
+    lanes = range(0, head_dim, _LANES)
+    q_words = q_hbm.bitcast(jnp.uint32)  # [kv_heads, tokens, pairs, 1, d]
+    kv_words = kv_hbm.bitcast(jnp.uint32)  # [tokens, slots, 1, d]
+    q_slabs = [
+        (h, p, lane)
+        for h in range(num_kv_heads)
+        for p in range(pairs)
+        for lane in lanes
+    ]
+    kv_slabs = [(s, lane) for s in range(slots) for lane in lanes]
+    quads = group // _KV_PACKING if fp8_queries else 0
+    qf_slabs = [
+        (h, quad, lane)
+        for h in range(num_kv_heads)
+        for quad in range(quads)
+        for lane in lanes
+    ]
+
+    def copies(block, buf_slot):
+        t0 = pl.multiple_of(block * bt, bt)
+        out = [
+            pltpu.make_async_copy(
+                q_buf.at[buf_slot, j],
+                q_words.at[h, pl.ds(t0, bt), p, 0, pl.ds(lane, _LANES)],
+                sem.at[buf_slot],
+            )
+            for j, (h, p, lane) in enumerate(q_slabs)
+        ]
+        out += [
+            pltpu.make_async_copy(
+                kv_buf.at[buf_slot, j],
+                kv_words.at[pl.ds(t0, bt), s, 0, pl.ds(lane, _LANES)],
+                sem.at[buf_slot],
+            )
+            for j, (s, lane) in enumerate(kv_slabs)
+        ]
+        if fp8_queries:
+            qf_words = qf_hbm.bitcast(jnp.uint32)  # [kv_heads, tokens, quads, 1, d]
+            out += [
+                pltpu.make_async_copy(
+                    qf_buf.at[buf_slot, j],
+                    qf_words.at[h, pl.ds(t0, bt), quad, 0, pl.ds(lane, _LANES)],
+                    sem.at[buf_slot],
+                )
+                for j, (h, quad, lane) in enumerate(qf_slabs)
+            ]
+        return out
+
+    if steps > 2:
+
+        @pl.when(step >= 2)
+        def _():  # the copies that last read this slot's buffers
+            for c in copies(step - 2, slot):
+                c.wait()
+
+    q_head, kv_rows = _block_values(
+        qkv_ref, cos_ref, sin_ref, wq_ref, wk_ref, heads=heads, kv_dtype=kv_hbm.dtype
+    )
+
+    def bits(x):
+        return pltpu.bitcast(x, jnp.uint32)
+
+    def byte_words(rows):
+        """Up to four FP8 arrays as words, row r in byte r, as packed."""
+        words = None
+        for r, row in enumerate(rows):
+            byte = jax.lax.bitcast_convert_type(row, jnp.uint8)
+            byte = byte.astype(jnp.uint32) << (8 * r)
+            words = byte if words is None else words | byte
+        return words
+
+    def store(buf, j0, words):
+        for i, lane in enumerate(lanes):
+            buf[slot, j0 + i] = words[:, lane : lane + _LANES]
+
+    # Query heads in groups of four with fp8_queries (one FP8 word), else pairs.
+    per = _KV_PACKING if fp8_queries else _Q_PACKING
+    for h in range(num_kv_heads):
+        for g0 in range(0, group, per):
+            values = [
+                q_head(h * group + g).astype(jnp.bfloat16).astype(jnp.float32)
+                for g in range(g0, g0 + per)
+            ]
+            for k in range(0, per, _Q_PACKING):
+                first, second = values[k : k + _Q_PACKING]
+                # bf16 bits of the pair's first head in the low half, as packed.
+                words = (bits(first) >> 16) | (bits(second) & jnp.uint32(0xFFFF0000))
+                store(q_buf, (h * pairs + (g0 + k) // _Q_PACKING) * len(lanes), words)
+            if fp8_queries:
+                fp8 = [_quantize(v, 1.0, qf_hbm.dtype) for v in values]
+                store(qf_buf, (h * quads + g0 // per) * len(lanes), byte_words(fp8))
+    rows = kv_rows()
+    for s in range(slots):
+        # prepare_inputs' zero padding rows are left as zero bytes.
+        words = byte_words(rows[s * _KV_PACKING : (s + 1) * _KV_PACKING])
+        store(kv_buf, s * len(lanes), words)
+
+    for c in copies(step, slot):
+        c.start()
+
+    @pl.when(step == steps - 1)
+    def _():
+        for c in copies(step, slot):
+            c.wait()
+        if steps > 1:
+            for c in copies(step - 1, 1 - slot):
+                c.wait()
 
 
 @functools.partial(
@@ -138,6 +312,8 @@ def _kernel(
         "v_scale",
         "kv_dtype",
         "block_tokens",
+        "dma_stores",
+        "fp8_queries",
         "interpret",
     ),
 )
@@ -156,9 +332,13 @@ def _qkv_to_rpa_inputs(
     v_scale: float,
     kv_dtype: jnp.dtype = jnp.float8_e4m3fn,
     block_tokens: int | None = None,
+    dma_stores: bool = False,
+    fp8_queries: bool = False,
     interpret: bool = False,
-) -> tuple[jax.Array, jax.Array]:
-    """`qkv_to_rpa_inputs` on a token count that is a multiple of 16."""
+) -> tuple[jax.Array, ...]:
+    """`qkv_to_rpa_inputs` on a token count that is a multiple of 16
+    (`dma_stores`: `_kernel_dma_stores`, same outputs; `fp8_queries` adds the
+    FP8 queries, `quantize_queries(q, kv_dtype)`)."""
     tokens, width = qkv.shape
     group = num_q_heads // num_kv_heads
     if width != (num_q_heads + 2 * num_kv_heads) * head_dim:
@@ -173,21 +353,81 @@ def _qkv_to_rpa_inputs(
         raise ValueError(f"rotary rows {cos.shape} / {sin.shape} for {qkv.shape}")
     slots = -(-2 * num_kv_heads // _KV_PACKING)
     bt = block_tokens or choose_block_tokens(
-        tokens, width, num_q_heads, slots, head_dim
+        tokens, width, num_q_heads, slots, head_dim, fp8_queries
     )
     if tokens % bt:
         raise ValueError(f"block of {bt} tokens does not tile {tokens} tokens")
-    kernel = functools.partial(
-        _kernel,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        eps=eps,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
+    heads = _Heads(num_q_heads, num_kv_heads, head_dim, eps, k_scale, v_scale)
+    kernel = functools.partial(_kernel, heads=heads)
     row_spec = lambda cols: pl.BlockSpec((bt, cols), lambda i: (i, 0))  # noqa: E731
     weight_spec = pl.BlockSpec((1, head_dim), lambda i: (0, 0))
+    out_shape = [
+        jax.ShapeDtypeStruct(
+            (num_kv_heads, tokens, group // _Q_PACKING, _Q_PACKING, head_dim),
+            jnp.bfloat16,
+        ),
+        jax.ShapeDtypeStruct((tokens, slots, _KV_PACKING, head_dim), kv_dtype),
+    ]
+    operands = (
+        qkv,
+        cos,
+        sin,
+        q_norm_weight.astype(jnp.float32).reshape(1, head_dim),
+        k_norm_weight.astype(jnp.float32).reshape(1, head_dim),
+    )
+    if fp8_queries and (not dma_stores or group % _KV_PACKING):
+        raise ValueError(
+            f"fp8_queries needs dma_stores and q heads per kv head in fours: {group}"
+        )
+    if dma_stores:
+        lanes = head_dim // _LANES
+        scratch = [
+            pltpu.VMEM(
+                (2, num_kv_heads * (group // _Q_PACKING) * lanes, bt, _LANES),
+                jnp.uint32,
+            ),
+            pltpu.VMEM((2, slots * lanes, bt, _LANES), jnp.uint32),
+        ]
+        if fp8_queries:
+            out_shape.append(
+                jax.ShapeDtypeStruct(
+                    (num_kv_heads, tokens, group // _KV_PACKING, _KV_PACKING, head_dim),
+                    kv_dtype,
+                )
+            )
+            scratch.append(
+                pltpu.VMEM(
+                    (2, num_kv_heads * (group // _KV_PACKING) * lanes, bt, _LANES),
+                    jnp.uint32,
+                )
+            )
+        return pl.pallas_call(
+            functools.partial(
+                _kernel_dma_stores,
+                heads=heads,
+                bt=bt,
+                steps=tokens // bt,
+                fp8_queries=fp8_queries,
+            ),
+            grid=(tokens // bt,),
+            in_specs=[
+                row_spec(width),
+                row_spec(half),
+                row_spec(half),
+                weight_spec,
+                weight_spec,
+            ],
+            out_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * len(out_shape),
+            out_shape=out_shape,
+            scratch_shapes=[*scratch, pltpu.SemaphoreType.DMA((2,))],
+            compiler_params=pltpu.CompilerParams(
+                # Each step waits for the copies of the step two before.
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+            ),
+            name="qkv_to_rpa_inputs",
+            interpret=interpret,
+        )(*operands)
     return pl.pallas_call(
         kernel,
         grid=(tokens // bt,),
@@ -205,25 +445,13 @@ def _qkv_to_rpa_inputs(
             ),
             pl.BlockSpec((bt, slots, _KV_PACKING, head_dim), lambda i: (i, 0, 0, 0)),
         ],
-        out_shape=[
-            jax.ShapeDtypeStruct(
-                (num_kv_heads, tokens, group // _Q_PACKING, _Q_PACKING, head_dim),
-                jnp.bfloat16,
-            ),
-            jax.ShapeDtypeStruct((tokens, slots, _KV_PACKING, head_dim), kv_dtype),
-        ],
+        out_shape=out_shape,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",), vmem_limit_bytes=_VMEM_LIMIT_BYTES
         ),
         name="qkv_to_rpa_inputs",
         interpret=interpret,
-    )(
-        qkv,
-        cos,
-        sin,
-        q_norm_weight.astype(jnp.float32).reshape(1, head_dim),
-        k_norm_weight.astype(jnp.float32).reshape(1, head_dim),
-    )
+    )(*operands)
 
 
 def qkv_to_rpa_inputs(
@@ -234,7 +462,8 @@ def qkv_to_rpa_inputs(
     k_norm_weight: jax.Array,  # [head_dim]
     **kwargs,
 ) -> tuple[jax.Array, jax.Array]:
-    """(q_hbm, new_kv_hbm) as `wrapper.prepare_inputs` returns them.
+    """(q_hbm, new_kv_hbm) as `wrapper.prepare_inputs` returns them, and with
+    `fp8_queries` the FP8 queries the fp8_compute kernel reads.
 
     A token count that 16-token blocks do not tile (an odd bucket) runs on
     zero rows padded to the next multiple of 16, and the outputs are cut back.
@@ -244,5 +473,8 @@ def qkv_to_rpa_inputs(
     if pad:
         rows = ((0, pad), (0, 0))
         qkv, cos, sin = (jnp.pad(a, rows) for a in (qkv, cos, sin))
-    q, kv = _qkv_to_rpa_inputs(qkv, cos, sin, q_norm_weight, k_norm_weight, **kwargs)
-    return (q[:, :tokens], kv[:tokens]) if pad else (q, kv)
+    out = _qkv_to_rpa_inputs(qkv, cos, sin, q_norm_weight, k_norm_weight, **kwargs)
+    if not pad:
+        return out
+    q, kv, *q_fp8 = out
+    return (q[:, :tokens], kv[:tokens], *(q8[:, :tokens] for q8 in q_fp8))

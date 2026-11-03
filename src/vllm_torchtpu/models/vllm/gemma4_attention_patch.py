@@ -23,6 +23,10 @@ all of it in one Pallas pass (``kernels/experimental/batched_rpa/prologue``).
 It is a model patch because upstream exposes nothing between the qkv
 projection and ``self.attn``: a backend or custom-op hook only ever sees the
 normed, rotated q/k/v, never the projection's rows.
+
+With TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT the backend also returns the output rows
+quantized per token for the FP8 o_proj (``batched_rpa/output_quant``), and
+``o_projection`` completes the projection on them.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.models.gemma4 import Gemma4Attention
 
@@ -81,13 +86,34 @@ def _fused_attention(
     )
 
 
-def attention_from_qkv(
-    attn: Any, positions: torch.Tensor, qkv: torch.Tensor
-) -> torch.Tensor:
-    """``Gemma4Attention.forward`` between the qkv and the o projection."""
+def attention_from_qkv(attn: Any, positions: torch.Tensor, qkv: torch.Tensor) -> Any:
+    """``Gemma4Attention.forward`` between the qkv and the o projection: the
+    output rows, or under TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT ``(rows quantized per
+    token, their scales)``, for ``o_projection``."""
     if envs.TPU_GEMMA4_FUSED_ATTN_PROLOGUE:
         return _fused_attention(attn, positions, qkv)
     return _upstream_attention(attn, positions, qkv)
+
+
+def o_projection(attn: Any, out: Any) -> torch.Tensor:
+    """``attn.o_proj`` on ``attention_from_qkv``'s output, reduced as the
+    projection's ``reduce_results`` says."""
+    o_proj = attn.o_proj
+    if not isinstance(out, tuple):
+        return o_proj(out)[0]
+    x_q, x_scale = out
+    method = o_proj.quant_method
+    if x_q.dtype != o_proj.weight.dtype or not method.supports_quantized_input(
+        o_proj, x_q.shape[0]
+    ):
+        raise NotImplementedError(
+            "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT needs a per-channel FP8 o_proj that "
+            f"takes {x_q.dtype} rows quantized per token"
+        )
+    y = method.apply_quantized_input(o_proj, x_q, x_scale)
+    if o_proj.reduce_results and o_proj.tp_size > 1:
+        y = tensor_model_parallel_all_reduce(y)
+    return y
 
 
 def _patched_attention_forward(
@@ -99,8 +125,7 @@ def _patched_attention_forward(
     if self.is_kv_shared_layer:  # only q is projected; K/V come from the cache
         return _orig_attention_forward(self, positions, hidden_states, **kwargs)
     qkv, _ = self.qkv_proj(hidden_states)
-    output, _ = self.o_proj(_fused_attention(self, positions, qkv))
-    return output
+    return o_projection(self, _fused_attention(self, positions, qkv))
 
 
 def _patched_attention_init(self: Gemma4Attention, *args: Any, **kwargs: Any) -> None:
@@ -131,10 +156,45 @@ def _patched_attention_init(self: Gemma4Attention, *args: Any, **kwargs: Any) ->
     # The backend builds forward_from_qkv's op in initialize_kernel, before
     # the forward is traced.
     impl.qkv_prologue_eps = self.q_norm.variance_epsilon
+    if envs.TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT:
+        impl.qkv_output_quant_dtype = _o_proj_quant_dtype(self.o_proj)
+
+
+def _o_proj_quant_dtype(o_proj: Any) -> torch.dtype:
+    """The FP8 dtype of ``o_proj``'s runtime weight, which its rows are
+    quantized to per token; a projection that quantizes otherwise is refused."""
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+
+    method = o_proj.quant_method
+    dtype = block_size = None
+    if isinstance(method, VllmFp8LinearMethodTPU) and not method.online_fp8:
+        # The weight process_weights_after_loading makes, not the checkpoint's.
+        _, dtype, block_size, _ = method._linear_quant_config
+    if (
+        dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+        or block_size is not None
+        or method.block_quant
+        or method.w8a16_max_rows
+        or o_proj.bias is not None
+        or not o_proj.input_is_parallel
+    ):
+        raise NotImplementedError(
+            "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT needs a per-channel W8A8 FP8 o_proj "
+            "(not online FP8, no block scales, bias or "
+            f"TPU_FP8_LINEAR_W8A16_MAX_ROWS); unset it for {o_proj.prefix}"
+        )
+    return dtype
 
 
 def maybe_patch_gemma4_attention(model_config: ModelConfig | None) -> bool | None:
     """Returns False until a Gemma4 text model config is available."""
+    if (
+        envs.TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT
+        and not envs.TPU_GEMMA4_FUSED_ATTN_PROLOGUE
+    ):
+        raise ValueError(
+            "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT needs TPU_GEMMA4_FUSED_ATTN_PROLOGUE"
+        )
     if not envs.TPU_GEMMA4_FUSED_ATTN_PROLOGUE:
         return None
     if model_config is None or model_config.hf_text_config.model_type != "gemma4_text":
