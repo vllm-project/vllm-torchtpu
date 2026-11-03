@@ -24,7 +24,9 @@ def main():
     parser.add_argument("--samples", default=1000, type=int)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
-        "--candidate", choices=("gate", "post32", "post3d"), default="gate"
+        "--candidate",
+        choices=("gate", "post32", "post3d", "post3d-tile"),
+        default="gate",
     )
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -133,10 +135,12 @@ def main():
         def post32_jax(
             x: jax.Array, residual: jax.Array, post: jax.Array, comb: jax.Array
         ) -> jax.Array:
-            if args.candidate == "post3d":
+            if args.candidate in ("post3d", "post3d-tile"):
                 import mhc_post_layout
 
-                return mhc_post_layout.post3d(x, residual, post, comb)
+                return mhc_post_layout.post3d(
+                    x, residual, post, comb, whole_tile=args.candidate == "post3d-tile"
+                )
             return post_kernel.mhc_post(x, residual, post, comb, token_block_size=32)
 
         post32_op = pallas.jax_op(
