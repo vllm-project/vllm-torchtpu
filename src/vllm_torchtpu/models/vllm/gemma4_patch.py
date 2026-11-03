@@ -75,6 +75,7 @@ from vllm.model_executor.models.utils import maybe_prefix, sequence_parallel_chu
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.kernels.experimental.batched_rpa import cp_prefill
+from vllm_torchtpu.layers.adapter.norm_quant import add_rms_norm_quantize_op
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.gemma4_attention_patch import attention_from_qkv
@@ -143,6 +144,8 @@ def _configure_layer(layer: Gemma4DecoderLayer) -> None:
     # Both branches of the forward place the reduction themselves.
     attn.o_proj.reduce_results = False
     mlp.down_proj.reduce_results = False
+    if envs.TPU_GEMMA4_FUSED_NORM_QUANT:
+        _configure_fused_norm_quant(layer)
     if layer.experts is not None:
         experts: Any = layer.experts
         if experts.moe_config.dp_size > 1 or experts.moe_config.is_sequence_parallel:
@@ -152,6 +155,58 @@ def _configure_layer(layer: Gemma4DecoderLayer) -> None:
                 "with the MoE's own sequence parallelism"
             )
         experts.moe_config.skip_final_all_reduce = True
+
+
+def _per_token_fp8(linear: Any) -> bool:
+    """Whether ``linear`` takes FP8 rows quantized per token in every bucket
+    (per-channel W8A8), as far as the build can tell: the runtime weight scale
+    is checked again when the rows are fed (supports_quantized_input)."""
+    method = linear.quant_method
+    if not isinstance(method, VllmFp8LinearMethodTPU) or method.online_fp8:
+        return False
+    _, _, requant_block_size, _ = method._linear_quant_config
+    return not (method.block_quant or method.w8a16_max_rows or requant_block_size)
+
+
+# The rows quantize_input makes for the e4m3 weights of an FP8 checkpoint; a
+# projection requantized to another dtype is refused at model build.
+_FUSED_QUANT_DTYPE = torch.float8_e4m3fn
+
+
+def _configure_fused_norm_quant(layer: Gemma4DecoderLayer) -> None:
+    """Refuse what the fused add-norm-quantize tail cannot run, and build its op
+    (outside tracing)."""
+    if layer.enable_moe_block:
+        raise ValueError(
+            "TPU_GEMMA4_FUSED_NORM_QUANT supports dense Gemma4 layers only"
+        )
+    norms = (
+        layer.input_layernorm,
+        layer.post_attention_layernorm,
+        layer.pre_feedforward_layernorm,
+        layer.post_feedforward_layernorm,
+    )
+    eps = {norm.variance_epsilon for norm in norms}
+    if len(eps) != 1 or any(
+        not norm.has_weight or norm.variance_size_override is not None for norm in norms
+    ):
+        raise ValueError(
+            "TPU_GEMMA4_FUSED_NORM_QUANT needs weighted RMSNorms with one epsilon"
+        )
+    for linear in (layer.self_attn.qkv_proj, layer.mlp.gate_up_proj):
+        if not _per_token_fp8(linear):
+            # The tails feed FP8 rows quantized per token to every SP bucket.
+            raise ValueError(
+                "TPU_GEMMA4_FUSED_NORM_QUANT needs per-channel W8A8 FP8 "
+                "projections without TPU_FP8_LINEAR_W8A16_MAX_ROWS"
+            )
+        # The runtime weight's dtype, which quantize_input quantizes rows to.
+        if linear.quant_method._linear_quant_config[1] != _FUSED_QUANT_DTYPE:
+            raise ValueError(
+                f"TPU_GEMMA4_FUSED_NORM_QUANT needs {_FUSED_QUANT_DTYPE} "
+                "projection weights (unset REQUANTIZE_WEIGHT_DTYPE)"
+            )
+    layer.fused_norm_quant = add_rms_norm_quantize_op(eps.pop(), _FUSED_QUANT_DTYPE)
 
 
 def _patched_layer_init(self: Gemma4DecoderLayer, *args: Any, **kwargs: Any) -> None:
@@ -213,6 +268,34 @@ def _gathered_projection(linear: Any, x_local: torch.Tensor) -> torch.Tensor:
         return method.apply_quantized_input(linear, rows_q.view(x_q.dtype), x_scale)
     out, _ = linear(_all_gather_rows(x_local))
     return out
+
+
+def _activation_quant_dtype(linear: Any) -> torch.dtype:
+    """The dtype ``quantize_input`` quantizes this projection's rows to: its
+    weight's (linear_common.quantize_activation)."""
+    return linear.weight.dtype
+
+
+def _gathered_prequantized(
+    linear: Any, x_bytes: torch.Tensor, x_scale: torch.Tensor
+) -> torch.Tensor:
+    """Column-parallel FP8 ``linear`` on the all-gather of rows the fused norm
+    tail already quantized per token; ``x_bytes`` holds their
+    ``_FUSED_QUANT_DTYPE`` bytes as int8, gathered without a dtype view."""
+    method = linear.quant_method
+    rows = x_bytes.shape[0] * linear.tp_size
+    if not (
+        isinstance(method, VllmFp8LinearMethodTPU)
+        and method.supports_quantized_input(linear, rows)
+        and _activation_quant_dtype(linear) == _FUSED_QUANT_DTYPE
+        and x_bytes.dtype == torch.int8
+    ):
+        raise NotImplementedError(
+            "TPU_GEMMA4_FUSED_NORM_QUANT needs per-channel FP8 projections that "
+            f"take {_FUSED_QUANT_DTYPE} rows quantized per token"
+        )
+    rows_q = _all_gather_rows(x_bytes).view(_FUSED_QUANT_DTYPE)
+    return method.apply_quantized_input(linear, rows_q, _all_gather_rows(x_scale))
 
 
 def _token_chunks(x: torch.Tensor, chunks: int) -> list[torch.Tensor]:
@@ -285,6 +368,60 @@ def _sequence_parallel_layer(
     ]
 
 
+def _fused_norm_sequence_parallel_layer(
+    self: Gemma4DecoderLayer,
+    positions: torch.Tensor,
+    hidden_states: list[Any],
+    next_input_norm: Any,
+) -> list[Any]:
+    """`_sequence_parallel_layer` of a dense layer with each residual add, the
+    next norm and its FP8 quantization fused (TPU_GEMMA4_FUSED_NORM_QUANT).
+
+    A chunk arrives as this rank's residual rows, or as `(rows, q, scale)` when
+    the previous layer's tail already quantized them through this layer's
+    input norm; with `next_input_norm` the tail does that for the next layer.
+    """
+    attn: Any = self.self_attn
+    mlp: Any = self.mlp
+    fused = self.fused_norm_quant
+    residual = [c[0] if isinstance(c, tuple) else c for c in hidden_states]
+    qkv = torch.cat(
+        [
+            _gathered_prequantized(attn.qkv_proj, c[1], c[2])
+            if isinstance(c, tuple)
+            else _gathered_projection(attn.qkv_proj, self.input_layernorm(c))
+            for c in hidden_states
+        ]
+    )
+    attn_out = _token_chunks(_attention(attn, positions, qkv), len(residual))
+    o_rows = [_reduce_scatter_rows(attn.o_proj(a)[0]) for a in attn_out]
+    # The shape-variant hand-over matches the all-reduce trace's inputs by
+    # position, and inputs are ordered by first use: each weight is used (a
+    # free view) in the order the unfused layers first use them, and the unit
+    # scalar of this tail is made from an activation, not from layer_scalar.
+    w_post = self.post_attention_layernorm.weight.view(-1)
+    one = o_rows[0].new_ones(1)
+    w_next = self.pre_feedforward_layernorm.weight.view(-1)
+    tails = [fused(x, r, w_post, one, w_next) for x, r in zip(o_rows, residual)]
+    mlp_out = [
+        down_proj_from_gate_up(mlp, _gathered_prequantized(mlp.gate_up_proj, q, s))
+        for _, q, s in tails
+    ]
+    residual = [h for h, _, _ in tails]
+    hidden_states = [_reduce_scatter_rows(m) for m in mlp_out]
+    if next_input_norm is None:
+        return [
+            (self.post_feedforward_layernorm(h) + r) * self.layer_scalar
+            for h, r in zip(hidden_states, residual)
+        ]
+    w_post = self.post_feedforward_layernorm.weight.view(-1)
+    scalar = self.layer_scalar.view(1)
+    w_next = next_input_norm.weight.view(-1)
+    return [
+        fused(h, r, w_post, scalar, w_next) for h, r in zip(hidden_states, residual)
+    ]
+
+
 def _all_reduce_layer(
     self: Gemma4DecoderLayer,
     positions: torch.Tensor,
@@ -330,13 +467,21 @@ def _patched_layer_forward(
     residual: torch.Tensor | None,
     per_layer_input: torch.Tensor | None = None,
     sequence_parallel: bool = False,
+    next_input_norm: Any = None,
     **kwargs: Any,
 ) -> tuple[Any, None]:
     """Upstream's signature; with ``sequence_parallel``, ``hidden_states`` is
-    the list of this rank's rows of each token chunk (see the model forward)."""
+    the list of this rank's rows of each token chunk (see the model forward).
+    ``next_input_norm`` is the next layer's input norm under
+    TPU_GEMMA4_FUSED_NORM_QUANT (None for the last layer)."""
     # Gemma4 carries the residual inside hidden_states (residual is always
     # None), and _configure_layer refused per-layer embeddings.
     del residual, per_layer_input
+    if sequence_parallel and envs.TPU_GEMMA4_FUSED_NORM_QUANT:
+        layer_out = _fused_norm_sequence_parallel_layer(
+            self, positions, hidden_states, next_input_norm
+        )
+        return layer_out, None
     if sequence_parallel:
         return _sequence_parallel_layer(self, positions, hidden_states), None
     return _all_reduce_layer(self, positions, hidden_states, **kwargs), None
@@ -381,7 +526,13 @@ def _patched_model_forward(
     hidden_states = [
         sequence_parallel_chunk(c) for c in _token_chunks(inputs_embeds, chunks)
     ]
-    for layer in islice(self.layers, self.start_layer, self.end_layer):
+    layers = list(islice(self.layers, self.start_layer, self.end_layer))
+    for i, layer in enumerate(layers):
+        if envs.TPU_GEMMA4_FUSED_NORM_QUANT:
+            # The last layer's tail ends at the final norm, unfused.
+            kwargs["next_input_norm"] = (
+                layers[i + 1].input_layernorm if i + 1 < len(layers) else None
+            )
         hidden_states, _ = layer(
             positions, hidden_states, None, sequence_parallel=True, **kwargs
         )
@@ -393,6 +544,10 @@ def maybe_patch_gemma4_sequence_parallel(
 ) -> bool | None:
     """Returns False until a Gemma4 text model config is available."""
     if not envs.TPU_GEMMA4_SEQUENCE_PARALLEL:
+        if envs.TPU_GEMMA4_FUSED_NORM_QUANT:
+            raise ValueError(
+                "TPU_GEMMA4_FUSED_NORM_QUANT needs TPU_GEMMA4_SEQUENCE_PARALLEL"
+            )
         return None
     if model_config is None or model_config.hf_text_config.model_type != "gemma4_text":
         return False

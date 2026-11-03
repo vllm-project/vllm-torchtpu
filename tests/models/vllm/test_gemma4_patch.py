@@ -127,8 +127,12 @@ def mock_collectives(monkeypatch: pytest.MonkeyPatch):
 
 
 class _Norm(torch.nn.Module):
+    variance_epsilon = 1e-6
+    variance_size_override = None
+
     def __init__(self, dim: int, has_weight: bool = True) -> None:
         super().__init__()
+        self.has_weight = has_weight
         self.weight = (
             torch.nn.Parameter(1.0 + 0.1 * torch.randn(dim)) if has_weight else None
         )
@@ -147,6 +151,11 @@ class _Bf16Method:
 
 class _PerTokenFp8Method(VllmFp8LinearMethodTPU):
     """VllmFp8LinearMethodTPU's per-token split, emulated in plain torch."""
+
+    block_quant = False
+    w8a16_max_rows = 0
+    online_fp8 = False
+    _linear_quant_config = ("float8_e4m3fn", torch.float8_e4m3fn, None, False)
 
     def __init__(self) -> None:  # no quant config: only the split is used
         pass
@@ -526,13 +535,115 @@ def test_model_forward_matches_all_reduce(mock_collectives, monkeypatch, chunks)
         torch.testing.assert_close(out, reference[0], rtol=2e-5, atol=2e-5)
 
 
-@pytest.mark.parametrize("moe", [False, True])
-def test_branches_trace_the_same_inputs(monkeypatch, moe: bool) -> None:
+def _emulated_add_rms_norm_quantize(eps, quant_dtype):
+    """kernels/norm_quant.py's arithmetic on the f32 test model, in torch."""
+
+    def op(x, residual, w_post, scalar, w_next):
+        def norm(t, w):
+            return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps) * w
+
+        h = (norm(x, w_post) + residual) * scalar
+        m = norm(h, w_next)
+        scale = m.abs().amax(-1, keepdim=True) / 448.0
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        return h, (m / scale).to(quant_dtype).view(torch.int8), scale
+
+    return op
+
+
+@pytest.mark.parametrize("chunks", [1, 2])
+def test_fused_norm_quant_model_forward_matches_unfused(
+    mock_collectives, monkeypatch, chunks
+):
+    """TPU_GEMMA4_FUSED_NORM_QUANT: each layer's add-norm-quantize tails feed the
+    next projection (the next layer's qkv through its input norm) and the last
+    layer ends at the final norm, as the unfused SP forward computes them."""
+    tp, num_layers, num_tokens = 2, 3, 32
+    mock = mock_collectives(tp)
+    model = _Model(tp, moe=False, fp8=True, num_layers=num_layers)
+    calls = []
+    monkeypatch.setattr(
+        gemma4_patch, "_activation_quant_dtype", lambda linear: torch.float8_e4m3fn
+    )
+
+    def counted_op(eps, quant_dtype):
+        op = _emulated_add_rms_norm_quantize(eps, quant_dtype)
+        return lambda *args: calls.append(args[3]) or op(*args)
+
+    monkeypatch.setattr(gemma4_patch, "add_rms_norm_quantize_op", counted_op)
+    input_ids = torch.randint(0, model.embedding.shape[0], (num_tokens,))
+    positions = torch.arange(num_tokens)
+
+    def build(rank: int) -> Any:
+        fake = SimpleNamespace(
+            layers=[model.layer(i, rank, mock.all_reduce) for i in range(num_layers)],
+            start_layer=0,
+            end_layer=num_layers,
+            norm=model.final_norm,
+            aux_hidden_state_layers=(),
+            embed_input_ids=lambda ids: model.embedding[ids],
+            config=SimpleNamespace(hidden_size=model.hidden),
+            normalizer=torch.tensor(1.0),
+        )
+        for layer in fake.layers:
+            gemma4_patch._configure_layer(layer)
+        return fake
+
+    def forward(rank: int) -> torch.Tensor:
+        return gemma4_patch._patched_model_forward(
+            build(rank), input_ids, positions, None
+        )
+
+    monkeypatch.setattr(
+        gemma4_patch, "get_tensor_model_parallel_world_size", lambda: tp
+    )
+    monkeypatch.setattr(
+        gemma4_patch,
+        "sequence_parallel_chunk",
+        lambda x: x.chunk(tp)[threading.current_thread().rank].clone(),
+    )
+    monkeypatch.setattr(gemma4_patch, "_MIN_SHARD_BYTES", 1)
+    monkeypatch.setattr(gemma4_patch, "_microbatches", chunks)
+    reference = _run_ranks(tp, forward)
+    assert not calls
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+    fused = _run_ranks(tp, forward)
+    for out, ref in zip(fused, reference):
+        torch.testing.assert_close(out, ref, rtol=2e-5, atol=2e-5)
+    # Per rank and chunk: two tails in each layer but the last, whose MLP tail
+    # ends at the final norm; layer scalars only on the MLP tails.
+    assert len(calls) == tp * chunks * (2 * num_layers - 1)
+    assert sum(float(c) != 1.0 for c in calls) == tp * chunks * (num_layers - 1)
+
+
+def test_fused_norm_quant_refuses_moe_and_needs_sp(monkeypatch) -> None:
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+    layer = _Model(2, moe=True, fp8=True).layer(0, 0, lambda t: t)
+    with pytest.raises(ValueError, match="dense"):
+        gemma4_patch._configure_fused_norm_quant(layer)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_SEQUENCE_PARALLEL", False)
+    gemma4 = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="gemma4_text"))
+    with pytest.raises(ValueError, match="TPU_GEMMA4_SEQUENCE_PARALLEL"):
+        gemma4_patch.maybe_patch_gemma4_sequence_parallel(gemma4)
+
+
+@pytest.mark.parametrize("moe,fused", [(False, False), (True, False), (False, True)])
+def test_branches_trace_the_same_inputs(monkeypatch, moe: bool, fused: bool) -> None:
     """The all-reduce and sequence-parallel traces take the same tensors, in order.
 
     The shape-variant warmup hands a bucket's executable from one trace to the
     other, and the receiving graph calls it with its own inputs by position.
+    With TPU_GEMMA4_FUSED_NORM_QUANT the tails use each norm weight where the
+    unfused layers first use it.
     """
+    if fused:
+        monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+        monkeypatch.setattr(
+            gemma4_patch, "add_rms_norm_quantize_op", _emulated_add_rms_norm_quantize
+        )
+        monkeypatch.setattr(
+            gemma4_patch, "_activation_quant_dtype", lambda linear: torch.float8_e4m3fn
+        )
     tp, rank = 4, 1
     pp = SimpleNamespace(is_first_rank=True, is_last_rank=True)
     for name, fn in (
@@ -1414,3 +1525,43 @@ def test_maybe_patch_context_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
     finally:
         for (cls, name), value in saved.items():
             setattr(cls, name, value)
+
+
+def test_fused_norm_quant_refuses_rows_of_another_dtype() -> None:
+    method = _PerTokenFp8Method()
+    linear = SimpleNamespace(
+        quant_method=method, tp_size=2, weight=torch.zeros(4, 4, dtype=torch.int8)
+    )
+    x_bytes = torch.zeros(8, 4, dtype=torch.int8)
+    with pytest.raises(NotImplementedError, match="float8_e4m3fn rows"):
+        gemma4_patch._gathered_prequantized(linear, x_bytes, torch.ones(8, 1))
+
+
+def test_fused_norm_quant_refuses_another_weight_dtype(monkeypatch) -> None:
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+    layer = _Model(2, moe=False, fp8=True).layer(0, 0, lambda t: t)
+    method = _PerTokenFp8Method()
+    method._linear_quant_config = ("float8_e5m2", torch.float8_e5m2, None, False)
+    layer.mlp.gate_up_proj.quant_method = method
+    with pytest.raises(ValueError, match="float8_e4m3fn projection weights"):
+        gemma4_patch._configure_fused_norm_quant(layer)
+
+
+_NOT_PER_TOKEN = [
+    dict(block_quant=True),
+    dict(w8a16_max_rows=256),
+    dict(online_fp8=True),
+    dict(_linear_quant_config=("float8_e4m3fn", torch.float8_e4m3fn, 512, True)),
+]
+
+
+@pytest.mark.parametrize("overrides", _NOT_PER_TOKEN)
+def test_fused_norm_quant_refuses_non_w8a8_projections(monkeypatch, overrides) -> None:
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+    layer = _Model(2, moe=False, fp8=True).layer(0, 0, lambda t: t)
+    method = _PerTokenFp8Method()
+    for name, value in overrides.items():
+        setattr(method, name, value)
+    layer.self_attn.qkv_proj.quant_method = method
+    with pytest.raises(ValueError, match="per-channel W8A8"):
+        gemma4_patch._configure_fused_norm_quant(layer)

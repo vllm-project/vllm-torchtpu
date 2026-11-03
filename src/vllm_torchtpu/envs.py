@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_GEMMA4_SEQUENCE_PARALLEL: bool = False
     TPU_GEMMA4_SP_MICROBATCHES: int = 1
+    TPU_GEMMA4_FUSED_NORM_QUANT: bool = False
     TPU_GEMMA4_CP_MIN_TOKENS: int = 0
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
@@ -499,6 +500,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_GEMMA4_SEQUENCE_PARALLEL: split a large bucket into this many
     # contiguous token chunks whose collectives and projections can overlap.
     "TPU_GEMMA4_SP_MICROBATCHES": env_int("TPU_GEMMA4_SP_MICROBATCHES", 1),
+    # With TPU_GEMMA4_SEQUENCE_PARALLEL: between two projections of a dense
+    # Gemma4 layer, the residual add around a norm and the next norm with its
+    # per-token FP8 quantization run as one Pallas pass on the rank's rows
+    # (kernels/norm_quant.py) instead of four XLA passes. Rounding: the norms'
+    # sums of squares are added in another order, so values can move one step.
+    "TPU_GEMMA4_FUSED_NORM_QUANT": env_bool("TPU_GEMMA4_FUSED_NORM_QUANT"),
     # Gemma4ForCausalLM at TP >= 3: token buckets of at least this many tokens
     # run context-parallel over the TP group (zigzag pieces of the step's one
     # prompt per rank, every projection whole on every rank); 0 disables. Needs
