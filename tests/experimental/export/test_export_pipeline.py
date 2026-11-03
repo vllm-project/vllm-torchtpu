@@ -1789,6 +1789,230 @@ def _bare_layer(cls_path: str) -> Any:
     return object.__new__(getattr(module, cls_name))
 
 
+def _decoder_attention(window: int | None) -> Any:
+    """A vLLM decoder `Attention` layer with only what the KV cache spec reads."""
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backend import AttentionType
+
+    layer = object.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer.attn_type = AttentionType.DECODER
+    layer.kv_sharing_target_layer_name = None
+    layer.num_kv_heads, layer.head_size = 2, 128
+    layer.sliding_window = window
+    layer.impl = _pallas_impl(None)
+    layer.get_kv_cache_spec = lambda vllm_config: _kv_cache_spec(window)
+    return layer
+
+
+def _kv_cache_spec(window: int | None) -> Any:
+    """The KV cache spec vLLM's `Attention.get_kv_cache_spec` returns for a layer."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    fields: dict[str, Any] = {
+        "block_size": 16,
+        "num_kv_heads": 2,
+        "head_size": 128,
+        "dtype": torch.bfloat16,
+    }
+    if window is None:
+        return FullAttentionSpec(**fields)
+    return SlidingWindowSpec(**fields, sliding_window=window)
+
+
+def _grouping_vllm_config() -> Any:
+    """The fields of a `VllmConfig` that vLLM's KV cache grouping reads."""
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16,
+            get_resolved_kv_cache_layout=lambda: SimpleNamespace(
+                is_block_outermost=False
+            ),
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        speculative_config=None,
+        model_config=None,
+    )
+
+
+def _adapter_with_layers(
+    windows: Sequence[int | None], monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    # The runner normalizes specs with the backend of the model's layers.
+    monkeypatch.setattr(
+        TpuPlatform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: PallasAttentionBackend),
+    )
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", num_blocks=16, block_size=16, max_num_seqs=4
+    )
+    adapter = _adapter_without_model(cfg)
+    adapter._vllm_config = _grouping_vllm_config()
+    layers = [
+        (f"layers.{i}.attn", _decoder_attention(w)) for i, w in enumerate(windows)
+    ]
+    adapter._named_attention_layers = lambda: layers
+    return adapter
+
+
+def test_sliding_window_and_full_layers_export_vllm_kv_cache_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Layers keep vLLM's groups: one page table each, layer `j` of every group
+    sharing KV tensor `j`."""
+    adapter = _adapter_with_layers(
+        [2048, None, 2048, 2048, 2048, None, 2048, 2048], monkeypatch
+    )
+    assert adapter.kv_cache_groups() == [
+        api.KvCacheGroup("kv0", ("layers.0.attn", "layers.4.attn"), 2048),
+        api.KvCacheGroup("kv1", ("layers.2.attn", "layers.6.attn"), 2048),
+        api.KvCacheGroup("kv2", ("layers.3.attn", "layers.7.attn"), 2048),
+        api.KvCacheGroup("kv3", ("layers.1.attn", "layers.5.attn"), None),
+    ]
+    kv = adapter._layer_state_specs([_decoder_attention(None)])[0][0]
+    assert list(adapter.abstract_states()) == [kv, kv]
+    max_pages = adapter.export_config.max_num_pages
+    assert adapter.extra_user_inputs() == [
+        (f"kv{i}_block_tables", (max_pages,)) for i in (1, 2, 3)
+    ]
+    assert exporter._block_tables_name(adapter) == "kv0_block_tables"
+    assert [
+        n
+        for n, _ in exporter._user_inputs(
+            adapter.export_config, 16, 3, "kv0_block_tables"
+        )
+    ] == [
+        "input_ids",
+        "positions",
+        "kv_lens",
+        "kv0_block_tables",
+        "query_start_loc",
+        "req_dist",
+    ]
+    assert exporter._kv_cache_groups_serving_config(adapter) == {
+        "kv_cache_groups": [
+            {"name": "kv0", "retention": {"window": 2048}},
+            {"name": "kv1", "retention": {"window": 2048}},
+            {"name": "kv2", "retention": {"window": 2048}},
+            {"name": "kv3", "retention": "all"},
+        ]
+    }
+
+
+def test_a_model_with_one_kv_cache_group_keeps_block_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for windows in ([None, None], [2048, 2048]):
+        adapter = _adapter_with_layers(windows, monkeypatch)
+        assert adapter.kv_cache_groups() == []
+        assert len(list(adapter.abstract_states())) == 2
+        assert adapter.extra_user_inputs() == []
+        assert exporter._block_tables_name(adapter) == "block_tables"
+        assert exporter._kv_cache_groups_serving_config(adapter) == {}
+
+
+def test_a_model_without_sliding_window_layers_skips_the_spec_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full-attention models never reach vLLM's spec or grouping code, so their
+    artifacts stay byte-identical to the ones exported before groups existed."""
+    adapter = _adapter_with_layers([None, None, None], monkeypatch)
+    for _, layer in adapter._named_attention_layers():
+        layer.get_kv_cache_spec = lambda vllm_config: pytest.fail("spec path ran")
+    assert adapter.kv_cache_groups() == []
+
+
+def test_a_model_that_drafts_with_mtp_keeps_one_page_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter_with_layers([2048, None], monkeypatch)
+    adapter._drafts_with_mtp = lambda: True
+    assert adapter.kv_cache_groups() == []
+    assert adapter.extra_user_inputs() == []
+    assert exporter._block_tables_name(adapter) == "block_tables"
+    assert exporter._kv_cache_groups_serving_config(adapter) == {}
+
+
+def test_kv_cache_groups_come_from_each_layers_own_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The groups follow what each layer reports, as the runner's do: a layer
+    whose spec is full attention joins the full group whatever its attributes."""
+    adapter = _adapter_with_layers([2048, None, 2048, None], monkeypatch)
+    _, layer = adapter._named_attention_layers()[2]
+    layer.get_kv_cache_spec = lambda vllm_config: _kv_cache_spec(None)
+    groups = adapter.kv_cache_groups()
+    window_layers = {n for g in groups if g.window is not None for n in g.layer_names}
+    full_layers = {n for g in groups if g.window is None for n in g.layer_names}
+    assert window_layers == {"layers.0.attn"}
+    assert full_layers == {"layers.1.attn", "layers.2.attn", "layers.3.attn"}
+
+
+class _GroupRecordingBackbone(nn.Module):
+    """Backbone that writes each layer's KV in place, as the attention kernel
+    does, and records the page table each layer reads."""
+
+    def __init__(self, layers: Sequence[tuple[str, Any]]) -> None:
+        super().__init__()
+        self.layers = layers
+        self.tables: dict[str, torch.Tensor] = {}
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata: Any = None,
+    ) -> torch.Tensor:
+        for i, (name, layer) in enumerate(self.layers):
+            self.tables[name] = attn_metadata[name].block_tables
+            layer.kv_cache.copy_(layer.kv_cache + 10**i)
+        return input_ids.float()
+
+
+def test_forward_binds_shared_kv_tensors_and_group_page_tables() -> None:
+    cfg = api.TextOnlyLLMExportConfig(model_name="tiny", num_layers=0)
+    adapter = _adapter_without_model(cfg)
+    layers = [(f"l{i}", SimpleNamespace(kv_cache=None)) for i in range(4)]
+    adapter._named_attention_layers = lambda: layers
+    adapter._kv_cache_groups = [
+        api.KvCacheGroup("kv0", ("l0", "l2"), 2048),
+        api.KvCacheGroup("kv1", ("l1", "l3"), None),
+    ]
+    backbone = _GroupRecordingBackbone(layers)
+    # The export calls the top-level model's forward, as the runner does.
+    adapter._model = backbone
+    kvs = [torch.zeros(2), torch.zeros(2)]
+    tables = {
+        "kv0_block_tables": torch.tensor([1]),
+        "kv1_block_tables": torch.tensor([2]),
+    }
+    updated, _ = adapter.forward(
+        {},
+        kvs,
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0]),
+        kv_lens=torch.tensor([1]),
+        query_start_loc=torch.tensor([0, 1]),
+        req_dist=torch.tensor([0, 0, 1]),
+        **tables,
+    )
+    # Layer `j` of both groups writes tensor `j`, on top of the other's write.
+    assert updated[0] is kvs[0] and updated[1] is kvs[1]
+    assert updated[0].tolist() == [11.0, 11.0]  # l0, l1
+    assert updated[1].tolist() == [1100.0, 1100.0]  # l2, l3
+    assert {n: int(t[0]) for n, t in backbone.tables.items()} == {
+        "l0": 1,
+        "l1": 2,
+        "l2": 1,
+        "l3": 2,
+    }
+
+
 @pytest.mark.parametrize(
     "cls_path",
     [
