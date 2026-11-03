@@ -53,6 +53,50 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
+def _chunk_rows(x: jax.Array, start_pos: int | jax.Array, chunk_size: int) -> jax.Array:
+    if isinstance(start_pos, int):
+        return x[start_pos : start_pos + chunk_size]
+    return lax.dynamic_slice_in_dim(x, start_pos, chunk_size)
+
+
+def run_chunk_loop(
+    num_rows: int,
+    chunk: int,
+    run_chunk,
+    carry,
+    caches: tuple,
+    *,
+    fori_min_chunks: int | None = None,
+    fori_unroll: int = 1,
+):
+    """Run `run_chunk(start_pos, chunk_size, carry, caches) -> carry` over the rows.
+
+    Unrolled by default: one copy of the chunk's kernels per chunk, so compile
+    time grows with the token bucket. With `fori_min_chunks` set and at least
+    that many (and at least 2) full chunks, the full chunks run in a
+    `lax.fori_loop` with `fori_unroll` chunks per iteration, and `start_pos` is
+    traced there; a partial last chunk stays unrolled.
+    """
+    num_full_chunks = num_rows // chunk
+    num_fori_chunks = 0
+    if fori_min_chunks is not None and num_full_chunks >= max(2, fori_min_chunks):
+        num_fori_chunks = num_full_chunks
+    if num_fori_chunks:
+
+        def body(i, c):
+            # Tie the caches to the loop index so views of them (the SparseCore
+            # RoPE cache as [rows, 32]) stay inside the loop. Hoisted out as
+            # loop invariants, they compiled into a cache-sized buffer per
+            # layer, which ran out of HBM at the default KV cache size.
+            *tied, _ = lax.optimization_barrier((*caches, i))
+            return run_chunk(i * chunk, chunk, c, tuple(tied))
+
+        carry = lax.fori_loop(0, num_fori_chunks, body, carry, unroll=fori_unroll)
+    for start_pos in range(num_fori_chunks * chunk, num_rows, chunk):
+        carry = run_chunk(start_pos, min(chunk, num_rows - start_pos), carry, caches)
+    return carry
+
+
 def _largest_divisor(x: int, cap: int) -> int:
     """Largest divisor of ``x`` that is <= ``cap``."""
     for candidate in range(min(x, cap), 0, -1):
@@ -1061,6 +1105,8 @@ def prepare_outputs(
         "live_gather_all_chunks",
         "topk_cap",
         "lse_lane_dense",
+        "fori_min_chunks",
+        "fori_unroll",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1095,6 +1141,8 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    fori_min_chunks: int | None = None,
+    fori_unroll: int = 1,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1159,6 +1207,16 @@ def sparse_ragged_paged_attention(
       lse_lane_dense: With `return_lse`, carry the log-sum-exp as f32[tokens,
         heads] through the kernel instead of f32[tokens, heads, 1] (lane-padded
         tiles). Same values.
+      fori_min_chunks: Run the full chunks in a `lax.fori_loop` when there are
+        at least this many (and at least 2), so the program holds one copy of
+        the chunk's gather and attention kernels instead of one per chunk;
+        a partial last chunk stays unrolled. Bounds compile time in the token
+        bucket, but the loop may cost runtime (unmeasured on this kernel).
+        None keeps every chunk unrolled.
+      fori_unroll: Chunks per loop iteration when `fori_min_chunks` applies
+        (`lax.fori_loop(unroll=...)`): the program holds this many copies of
+        the chunk's kernels, and a loop count at or below it is fully
+        unrolled.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1276,7 +1334,6 @@ def sparse_ragged_paged_attention(
             f"dividing topk ({topk})"
         )
 
-    num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     # With the cap, translate the top-k once per call straight into the capped
     # window-major layout, live windows only (`prepare_capped_window_indices`),
     # whenever every chunk has one static size; otherwise the full-width
@@ -1342,18 +1399,21 @@ def sparse_ragged_paged_attention(
         else None
     )
 
-    for i in range(num_chunks):
-        start_pos = i * gather_and_attention_chunk_size
-        end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
+    chunk = gather_and_attention_chunk_size
+
+    def run_chunk(start_pos, chunk_size, carry, caches):
+        q, lse = carry
+        nope, rope = caches
         result = sparse_attention_chunk(
             q,
-            cache_kv_nope,
-            cache_kv_rope,
+            nope,
+            rope,
             kv_lens,
             physical_indices,
             lse,
             start_pos=start_pos,
-            end_pos=end_pos,
+            end_pos=start_pos + chunk_size,
+            chunk_size=chunk_size,
             token_end=cu_q_lens[distribution[2]],
             sm_scale=sm_scale,
             k_scale=k_scale,
@@ -1373,17 +1433,27 @@ def sparse_ragged_paged_attention(
             window_indices=(
                 None
                 if window_indices_all is None
-                else window_indices_all[
-                    i * chunk_window_rows : (i + 1) * chunk_window_rows
-                ]
+                else _chunk_rows(
+                    window_indices_all,
+                    start_pos // chunk * chunk_window_rows,
+                    chunk_window_rows,
+                )
             ),
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
         )
-        if return_lse:
-            q, lse = result
-        else:
-            q = result
+        return result if return_lse else (result, lse)
+
+    carry = run_chunk_loop(
+        q.shape[0],
+        chunk,
+        run_chunk,
+        (q, lse),
+        (cache_kv_nope, cache_kv_rope),
+        fori_min_chunks=fori_min_chunks,
+        fori_unroll=fori_unroll,
+    )
+    q, lse = carry
 
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
@@ -1458,11 +1528,12 @@ def sparse_attention_chunk(
     physical_indices: jax.Array | None,  # i32[max_num_tokens, csa_topk]
     lse: jax.Array | None,  # f32[max_num_tokens, num_q_heads, 1]
     *,
-    start_pos: int,
-    end_pos: int,
+    start_pos: int | jax.Array,
+    end_pos: int | jax.Array,
     token_end: jax.Array,  # i32
     sm_scale: float,
     k_scale: float,
+    chunk_size: int | None = None,
     preserve_suffix: bool = False,
     attention_kernel_batch_size: int = DEFAULT_ATTENTION_KERNEL_BATCH_SIZE,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -1488,6 +1559,9 @@ def sparse_attention_chunk(
     up to `attention_kernel_batch_size - 1` rows at or after `token_end` may
     also be overwritten; rows further on keep their input values. Private
     split routing sets `preserve_suffix` to restrict stores to owned rows.
+
+    `start_pos`/`end_pos` may be traced (a `lax.fori_loop` index) when the
+    static `chunk_size == end_pos - start_pos` is given.
 
     `topk_cap` (SparseCore layout only; a multiple of 64 dividing topk) gathers
     the chunk's top-k window-major in `topk_cap`-slot windows, bounded to the
@@ -1523,7 +1597,9 @@ def sparse_attention_chunk(
     split_q = q_pe is not None
     if split_q:
         head_dim = align_to(head_dim + q_pe.shape[-1], 128)
-    chunk_size = end_pos - start_pos
+    if chunk_size is None:
+        assert isinstance(start_pos, int) and isinstance(end_pos, int)
+        chunk_size = end_pos - start_pos
     capped_windows = None if topk_cap is None else topk // topk_cap
 
     def run_mla_kernel(
@@ -1532,7 +1608,7 @@ def sparse_attention_chunk(
         cache_kv_nope: jax.Array,
         cache_kv_rope: jax.Array,  # [num_tokens, topk, rope_dim] (gathered)
         kv_lens: jax.Array,  # i32[max_num_tokens]
-        start_seq_idx: int,
+        start_seq_idx: jax.Array | int,  # i32; traced inside the chunk loop
         end_seq_idx: jax.Array,  # i32
         kernel_batch_size: int,
         lse: jax.Array | None = None,  # f32[max_num_tokens, num_q_heads, 1]
@@ -1687,7 +1763,11 @@ def sparse_attention_chunk(
             operands.append(cast(jax.Array, lse))
         return kernel(*scalar_prefetches, *operands)
 
-    indices = None if physical_indices is None else physical_indices[start_pos:end_pos]
+    indices = (
+        None
+        if physical_indices is None
+        else _chunk_rows(physical_indices, start_pos, chunk_size)
+    )
 
     # Batching
     small_chunk, kernel_batch_size = _chunk_kernel_batch_size(
@@ -1726,7 +1806,8 @@ def sparse_attention_chunk(
         live_tokens = batch_end - start_pos
         token_windows = jnp.where(
             jnp.arange(chunk_size) < live_tokens,
-            (jnp.maximum(kv_lens[start_pos:end_pos], 1) + topk_cap - 1) // topk_cap,
+            (jnp.maximum(_chunk_rows(kv_lens, start_pos, chunk_size), 1) + topk_cap - 1)
+            // topk_cap,
             1,
         )
         live_windows = jnp.clip(jnp.max(token_windows), 1, capped_windows)
