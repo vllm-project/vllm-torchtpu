@@ -12,6 +12,8 @@ def post3d(
     residual: jax.Array,
     post: jax.Array,
     comb: jax.Array,
+    *,
+    whole_tile: bool = False,
 ) -> jax.Array:
     assert x.shape == (288, 5120) and residual.shape == (288, 4, 5120)
     assert post.shape == (288, 4, 1) and comb.shape == (288, 4, 4)
@@ -23,6 +25,15 @@ def post3d(
         # Preserve post_kernel._post_kernel's F32 order and BF16 boundary.
         value = x_ref[...].astype(jnp.float32)
         p, c = post_ref[...], comb_ref[...]
+        if whole_tile:
+            streams = res_ref[...].astype(jnp.float32)
+            p = p.reshape(tile, mult, 1)
+            c = c.reshape(tile, mult, mult)
+            acc = p * value[:, None, :]
+            for i in range(mult):
+                acc = acc + c[:, i, :, None] * streams[:, i : i + 1, :]
+            out_ref[...] = acc.astype(out_ref.dtype)
+            return
         streams = [res_ref[:, i, :].astype(jnp.float32) for i in range(mult)]
         for j in range(mult):
             acc = p[:, j : j + 1] * value
@@ -47,5 +58,5 @@ def post3d(
             vmem_limit_bytes=100 * 1024 * 1024,
             disable_bounds_checks=True,
         ),
-        name="dsv41_mhc_post_3d_layout",
+        name="dsv41_mhc_post_3d_tile" if whole_tile else "dsv41_mhc_post_3d_layout",
     )(x, residual, post.reshape(288, mult), comb.reshape(288, mult * mult))
