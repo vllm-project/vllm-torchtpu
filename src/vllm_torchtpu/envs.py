@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     TPU_RPA_FENCE_OUTPUT: bool = False
     TPU_GEMMA4_FUSED_ATTN_PROLOGUE: bool = False
     TPU_GEMMA4_FUSED_GELU_QUANT: bool = False
+    TPU_GEMMA4_GELU_QUANT_BF16: bool = False
     TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT: bool = False
     TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = False
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
@@ -858,6 +859,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernels/gelu_quant.py) instead of XLA's two passes over the activation.
     # Rounding: GELU runs in f32 and rounds once, so values can move one step.
     "TPU_GEMMA4_FUSED_GELU_QUANT": env_bool("TPU_GEMMA4_FUSED_GELU_QUANT"),
+    # With TPU_GEMMA4_FUSED_GELU_QUANT: the fused kernel's GELU, product and
+    # quantization multiply run in bf16 (row maximum and scale in f32), about
+    # half its VALU work. Rounding: values move by up to one FP8 step of their
+    # row's scale.
+    "TPU_GEMMA4_GELU_QUANT_BF16": env_bool("TPU_GEMMA4_GELU_QUANT_BF16"),
     # With TPU_GEMMA4_FUSED_ATTN_PROLOGUE: the attention hands its FP8 o_proj
     # the output rows quantized per token, made in one Pallas pass over the
     # kernel's head-major output (batched_rpa/output_quant.py) instead of

@@ -83,22 +83,26 @@ def test_unfused_ops_without_the_flag_or_under_the_w8a16_cutoff(
     torch.testing.assert_close(out, torch.full((16, 8), 4.0))
 
 
-def test_fused_path_quantizes_once_and_runs_the_prequantized_matmul(monkeypatch):
+@pytest.mark.parametrize("bf16_math", [False, True])
+def test_fused_path_quantizes_once_and_runs_the_prequantized_matmul(
+    monkeypatch, bf16_math
+):
     mlp, method = _mlp()
     gate_up = torch.randn(16, 8).to(torch.bfloat16)
     x_q = torch.ones(16, 4, dtype=torch.float8_e4m3fn)
     x_scale = torch.full((16, 1), 0.5)
     seen = []
 
-    def fused(x, w_q):
-        seen.append((x, w_q))
+    def fused(x, w_q, bf16_math):
+        seen.append((x, w_q, bf16_math))
         return x_q, x_scale
 
     monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_GELU_QUANT", True)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_GELU_QUANT_BF16", bf16_math)
     monkeypatch.setattr(patch, "gelu_tanh_and_mul_quantize", fused)
     out = patch.down_proj_from_gate_up(mlp, gate_up)
-    ((x, w_q),) = seen
-    assert x is gate_up and w_q is mlp.down_proj.weight
+    ((x, w_q, got_math),) = seen
+    assert x is gate_up and w_q is mlp.down_proj.weight and got_math == bf16_math
     ((layer, got_q, got_scale),) = method.calls
     assert layer is mlp.down_proj and got_q is x_q and got_scale is x_scale
     torch.testing.assert_close(out, torch.full((16, 3), 0.5))
@@ -131,7 +135,7 @@ def test_forward_reduces_once_where_the_down_projection_would(
     monkeypatch.setattr(
         patch,
         "gelu_tanh_and_mul_quantize",
-        lambda x, w: (
+        lambda x, w, bf16_math: (
             torch.ones(x.shape[0], 4, dtype=w.dtype),
             torch.ones(x.shape[0], 1),
         ),
@@ -142,6 +146,13 @@ def test_forward_reduces_once_where_the_down_projection_would(
     want = (x + 1) * 2 if w8a16_max_rows else torch.ones(16, 3)
     assert len(reduced) == int(reduce_results)
     torch.testing.assert_close(out, want * 10 if reduce_results else want)
+
+
+def test_bf16_math_needs_the_fused_kernel(monkeypatch):
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_GELU_QUANT", False)
+    monkeypatch.setattr(envs, "TPU_GEMMA4_GELU_QUANT_BF16", True)
+    with pytest.raises(ValueError, match="TPU_GEMMA4_FUSED_GELU_QUANT"):
+        patch.maybe_patch_gemma4_fused_gelu_quant(None)
 
 
 def test_patch_needs_the_flag_and_a_gemma4_config(monkeypatch):
@@ -204,6 +215,20 @@ def test_init_accepts_the_served_configuration(monkeypatch):
         patch, "_orig_mlp_init", _fake_init(_gelu_and_mul("tanh"), method)
     )
     patch._patched_mlp_init(SimpleNamespace())
+
+
+def test_init_refuses_bf16_math_for_other_activation_dtypes(monkeypatch):
+    method = object.__new__(VllmFp8LinearMethodTPU)
+
+    def init(self, *args, **kwargs):
+        _fake_init(_gelu_and_mul("tanh"), method)(self)
+        self.down_proj.params_dtype = torch.float16
+
+    monkeypatch.setattr(patch, "_orig_mlp_init", init)
+    patch._patched_mlp_init(SimpleNamespace())  # f32 math serves any dtype
+    monkeypatch.setattr(envs, "TPU_GEMMA4_GELU_QUANT_BF16", True)
+    with pytest.raises(NotImplementedError, match="bf16 activations"):
+        patch._patched_mlp_init(SimpleNamespace())
 
 
 def test_init_refuses_a_partial_lane_intermediate_size(monkeypatch):

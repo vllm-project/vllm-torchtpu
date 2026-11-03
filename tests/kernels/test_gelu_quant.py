@@ -59,6 +59,33 @@ def test_matches_the_unfused_ops(tokens, d):
     assert (np.abs(got - want) <= step).all()
 
 
+@pytest.mark.parametrize("tokens,d", [(16, 256), (128, 1024)])
+def test_bf16_math_stays_within_an_fp8_step(tokens, d):
+    rng = np.random.default_rng(tokens + 1)
+    x = jnp.asarray(rng.standard_normal((tokens, 2 * d)) * 3, jnp.bfloat16)
+    x = x.at[1].set(0.0)
+    q, scale = gelu_tanh_and_mul_quantize(x, FP8, bf16_math=True, interpret=True)
+    ref_q, ref_scale = _reference(x)
+    assert q.dtype == FP8 and scale.dtype == jnp.float32
+    assert float(scale[1, 0]) == 1.0
+    # The row maximum is the bf16 product's, a few bf16 steps from the f32 one.
+    np.testing.assert_allclose(np.asarray(scale), np.asarray(ref_scale), rtol=2**-6)
+    got = np.asarray(q.astype(jnp.float32) * scale)
+    want = np.asarray(ref_q.astype(jnp.float32) * ref_scale)
+    tol = np.abs(want) * 2.0**-3 + np.asarray(ref_scale) * 2.0**-6
+    assert (np.abs(got - want) <= tol).all()
+    assert (
+        np.asarray(q.astype(jnp.float32)) == np.asarray(ref_q.astype(jnp.float32))
+    ).mean() > 0.8
+
+
+def test_bf16_math_refuses_f32_rows():
+    with pytest.raises(ValueError, match="bf16"):
+        gelu_tanh_and_mul_quantize(
+            jnp.zeros((16, 512), jnp.float32), FP8, bf16_math=True, interpret=True
+        )
+
+
 def test_row_max_quantizes_to_the_dtype_max():
     x = jnp.zeros((16, 256), jnp.bfloat16).at[0, 0].set(6.0).at[0, 128].set(-6.0)
     q, scale = gelu_tanh_and_mul_quantize(x, FP8, interpret=True)
@@ -106,4 +133,4 @@ def test_lowers_for_tpu7x():
 
 def test_block_rows_need_a_power_of_two():
     with pytest.raises(ValueError, match="power of two"):
-        block_rows(64, 10752, 2, 96)
+        block_rows(64, 10752, 96)

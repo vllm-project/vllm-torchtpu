@@ -63,7 +63,9 @@ def down_proj_from_gate_up(mlp: Any, gate_up: torch.Tensor) -> torch.Tensor:
             "TPU_GEMMA4_FUSED_GELU_QUANT needs a per-channel W8A8 down "
             f"projection quantizing {gate_up.shape[0]} rows per token"
         )
-    x_q, x_scale = gelu_tanh_and_mul_quantize(gate_up, down.weight)
+    x_q, x_scale = gelu_tanh_and_mul_quantize(
+        gate_up, down.weight, bf16_math=envs.TPU_GEMMA4_GELU_QUANT_BF16
+    )
     out = method.apply_quantized_input(down, x_q, x_scale)
     if down.reduce_results and down.tp_size > 1:
         out = tensor_model_parallel_all_reduce(out)
@@ -92,6 +94,14 @@ def _patched_mlp_init(self: Gemma4MLP, *args: Any, **kwargs: Any) -> None:
             f"that is a multiple of {COLUMN_ALIGNMENT}, got "
             f"{self.down_proj.input_size_per_partition}"
         )
+    if (
+        envs.TPU_GEMMA4_GELU_QUANT_BF16
+        and self.down_proj.params_dtype != torch.bfloat16
+    ):
+        raise NotImplementedError(
+            "TPU_GEMMA4_GELU_QUANT_BF16 needs bf16 activations, got "
+            f"{self.down_proj.params_dtype}"
+        )
 
 
 def _patched_mlp_forward(self: Gemma4MLP, x: torch.Tensor) -> torch.Tensor:
@@ -104,6 +114,10 @@ def maybe_patch_gemma4_fused_gelu_quant(
 ) -> bool | None:
     """Returns False until a Gemma4 text model config is available."""
     if not envs.TPU_GEMMA4_FUSED_GELU_QUANT:
+        if envs.TPU_GEMMA4_GELU_QUANT_BF16:
+            raise ValueError(
+                "TPU_GEMMA4_GELU_QUANT_BF16 needs TPU_GEMMA4_FUSED_GELU_QUANT"
+            )
         return None
     if model_config is None or model_config.hf_text_config.model_type != "gemma4_text":
         return False

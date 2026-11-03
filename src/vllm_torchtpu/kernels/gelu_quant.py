@@ -24,6 +24,13 @@ the product is rounded to the activation dtype, the f32 scale is that row's
 maximum / dtype max (1 where it is 0), and the rows are divided by it in f32,
 clipped and cast. GELU runs in f32 and rounds once, which XLA's fusion of the
 same expression need not do, so values can move by one rounding step.
+
+With `bf16_math`, GELU (as x * sigmoid(2z), which has no cancellation), the
+product and the quantization's multiply run in bf16 (the row maximum and the
+scale stay f32): about half the VALU work of the f32 path, which is
+VALU-bound. The bf16 roundings, amplified by exp in the exponent's argument,
+move small values by a few percent of themselves and every value by at most
+one FP8 step of its row's scale.
 """
 
 import functools
@@ -38,15 +45,35 @@ from vllm_torchtpu.kernels.row_blocks import fit_block_rows
 
 _SQRT_2_OVER_PI = math.sqrt(2 / math.pi)
 
-# Rows per block, at most (block_rows): on tpu7x 8192 Gemma4-31B TP2 rows
-# (10752) take 0.268 / 0.239 / 0.241 ms with 64 / 128 / 256 rows (device micro,
-# same outputs).
+# Rows per block. A block holds 2 x rows x intermediate bf16 inputs (double
+# buffered) plus temporaries. On tpu7x 8192 Gemma4-31B TP2 rows (10752) take
+# 0.235 / 0.197 / 0.178 ms with 64 / 128 / 256 rows in bf16 math and 0.268 /
+# 0.239 / 0.241 ms in f32 (device micro, same outputs).
 _BLOCK_ROWS = 256
 _VMEM_LIMIT_BYTES = 48 * 1024 * 1024
 
 
 def _gelu_tanh(x: jax.Array) -> jax.Array:
     return 0.5 * x * (1.0 + jnp.tanh(_SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)))
+
+
+def _kernel_bf16(gate_ref, up_ref, q_ref, scale_ref, *, quant_dtype):
+    info = jnp.finfo(quant_dtype)
+    gate, up = gate_ref[...], up_ref[...]
+    # 0.5 * x * (1 + tanh(z)) as x * sigmoid(2z): no cancellation where tanh
+    # is near -1, which bf16 would round to garbage.
+    neg_2z = gate * (
+        jnp.bfloat16(-2 * _SQRT_2_OVER_PI)
+        + jnp.bfloat16(-2 * _SQRT_2_OVER_PI * 0.044715) * (gate * gate)
+    )
+    y = (gate * up) * (1.0 / (1.0 + jnp.exp(neg_2z)))
+    scale = jnp.max(jnp.abs(y), axis=-1, keepdims=True).astype(jnp.float32)
+    scale = scale / float(info.max)
+    scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
+    q = y * (1.0 / scale).astype(jnp.bfloat16)
+    q = jnp.clip(q, float(info.min), float(info.max))
+    q_ref[...] = q.astype(quant_dtype)
+    scale_ref[...] = scale
 
 
 def _kernel(gate_ref, up_ref, q_ref, scale_ref, *, act_dtype, quant_dtype):
@@ -66,22 +93,19 @@ def _kernel(gate_ref, up_ref, q_ref, scale_ref, *, act_dtype, quant_dtype):
 COLUMN_ALIGNMENT = 128
 
 
-def block_rows(
-    num_tokens: int, d: int, itemsize: int = 2, max_rows: int = _BLOCK_ROWS
-) -> int:
+def block_rows(num_tokens: int, d: int, max_rows: int = _BLOCK_ROWS) -> int:
     """Rows per block (row_blocks.fit_block_rows): the `[gate | up]` inputs are
-    2 x d values of `itemsize` bytes per row and the FP8 output d bytes, each
-    double-buffered."""
-    row_bytes = 2 * (2 * itemsize + 1) * d
-    return fit_block_rows(num_tokens, row_bytes, max_rows, _VMEM_LIMIT_BYTES)
+    2 x d bf16 per row and the FP8 output d bytes, each double-buffered."""
+    return fit_block_rows(num_tokens, 2 * (4 * d + d), max_rows, _VMEM_LIMIT_BYTES)
 
 
 @functools.partial(
-    jax.jit, static_argnames=("quant_dtype", "max_block_rows", "interpret")
+    jax.jit, static_argnames=("quant_dtype", "bf16_math", "max_block_rows", "interpret")
 )
 def gelu_tanh_and_mul_quantize(
     x: jax.Array,
     quant_dtype: jnp.dtype,
+    bf16_math: bool = False,
     max_block_rows: int = _BLOCK_ROWS,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
@@ -97,9 +121,15 @@ def gelu_tanh_and_mul_quantize(
             f"gelu_tanh_and_mul_quantize: width {width} is not twice a multiple of "
             f"{COLUMN_ALIGNMENT}"
         )
-    rows = block_rows(num_tokens, d, x.dtype.itemsize, max_block_rows)
+    if bf16_math and x.dtype != jnp.bfloat16:
+        raise ValueError(f"bf16_math needs bf16 gate/up rows, got {x.dtype}")
+    rows = block_rows(num_tokens, d, max_block_rows)
     half = pl.BlockSpec((rows, d), lambda i: (i, 0))
-    kernel = functools.partial(_kernel, act_dtype=x.dtype, quant_dtype=quant_dtype)
+    kernel = (
+        functools.partial(_kernel_bf16, quant_dtype=quant_dtype)
+        if bf16_math
+        else functools.partial(_kernel, act_dtype=x.dtype, quant_dtype=quant_dtype)
+    )
     return pl.pallas_call(
         kernel,
         grid=(num_tokens // rows,),

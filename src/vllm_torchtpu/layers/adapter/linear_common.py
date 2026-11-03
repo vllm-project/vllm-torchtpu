@@ -267,16 +267,20 @@ def quantize_activation(
 
 
 def _gelu_tanh_and_mul_quantize_jax(
-    x: jax.Array, *, quant_dtype: jnp.dtype
+    x: jax.Array, *, quant_dtype: jnp.dtype, bf16_math: bool
 ) -> tuple[jax.Array, jax.Array]:
-    return _gelu_tanh_and_mul_quantize_kernel(x, quant_dtype)
+    return _gelu_tanh_and_mul_quantize_kernel(x, quant_dtype, bf16_math=bf16_math)
 
 
-def _make_gelu_quantize_op(quant_dtype: torch.dtype) -> Callable:
+def _make_gelu_quantize_op(quant_dtype: torch.dtype, bf16_math: bool) -> Callable:
     name = str(quant_dtype).removeprefix("torch.")
     op = pallas.jax_op(
-        f"pallas::gelu_tanh_and_mul_quantize_{name}",
-        functools.partial(_gelu_tanh_and_mul_quantize_jax, quant_dtype=jnp.dtype(name)),
+        f"pallas::gelu_tanh_and_mul_quantize_{name}{'_bf16_math' if bf16_math else ''}",
+        functools.partial(
+            _gelu_tanh_and_mul_quantize_jax,
+            quant_dtype=jnp.dtype(name),
+            bf16_math=bf16_math,
+        ),
     )
 
     def _fake(x: torch.Tensor):
@@ -291,23 +295,25 @@ def _make_gelu_quantize_op(quant_dtype: torch.dtype) -> Callable:
 
 
 _gelu_quantize_ops = {
-    dtype: _make_gelu_quantize_op(dtype)
+    (dtype, bf16_math): _make_gelu_quantize_op(dtype, bf16_math)
     for dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    for bf16_math in (False, True)
 }
 
 
 def gelu_tanh_and_mul_quantize(
-    x: torch.Tensor, w_q: torch.Tensor
+    x: torch.Tensor, w_q: torch.Tensor, bf16_math: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`quantize_activation(GeluAndMul("tanh")(x), w_q)` in one Pallas pass.
 
     `x` is the 2-D `[tokens, 2 * d]` gate/up rows; returns the `[tokens, d]`
     rows in `w_q`'s FP8 dtype and their f32 `[tokens, 1]` scales, for
-    `prequantized_matmul` (kernels/gelu_quant.py for the rounding).
+    `prequantized_matmul` (kernels/gelu_quant.py for the rounding and
+    `bf16_math`).
     """
     if x.dim() != 2:
         raise ValueError(f"expected 2-D gate/up rows, got {tuple(x.shape)}")
-    op = _gelu_quantize_ops.get(w_q.dtype)
+    op = _gelu_quantize_ops.get((w_q.dtype, bf16_math))
     if op is None:
         raise ValueError(f"no fused GELU quantization for {w_q.dtype}")
     return op(x)
