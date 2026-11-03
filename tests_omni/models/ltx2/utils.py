@@ -164,16 +164,16 @@ LTX2_GOLDEN_EXTRA_ARGS = {
 }
 LTX2_GOLDEN_STEPS = 40
 # Metric -> (min, max), TPU bf16 vs the TPU fp32 golden. Observed (bitwise
-# identical on two images): MAE 0.0229, SSIM 0.9271, mean shift 0.0044,
-# log-spectrogram L1 0.313. MAE, 1 - SSIM and log-spectrogram L1 allow 2x,
-# mean shift +0.015. Caught: 30 steps (SSIM 0.849), another prompt, other seeds.
+# identical on two images): MAE 0.0221, SSIM 0.9322, mean shift 0.0046,
+# log-spectrogram L1 0.335. MAE, 1 - SSIM and log-spectrogram L1 allow 2x,
+# mean shift +0.015. Caught: 30 steps (SSIM 0.843), another prompt, other seeds.
 LTX2_GOLDEN_LIMITS = {
-    "video_mae": (0.0, 0.046),
-    "video_ssim": (0.854, 1.0),
+    "video_mae": (0.0, 0.045),
+    "video_ssim": (0.864, 1.0),
     "video_mean_shift": (0.0, 0.020),
     "video_hf_ratio": (0.70, 1.40),
     "video_motion_ratio": (0.80, 1.40),
-    "audio_logspec_l1": (0.0, 0.63),
+    "audio_logspec_l1": (0.0, 0.67),
     "audio_rms_ratio": (0.75, 1.35),
 }
 

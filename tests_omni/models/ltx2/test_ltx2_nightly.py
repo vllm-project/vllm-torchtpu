@@ -24,9 +24,9 @@ single TPU v7x chip using the canonical 2-step 512x768x25 request (24 fps,
 3. ``test_ltx2_golden_answer_tpu``: runs the request at 40 steps and checks it
    against a TPU fp32 golden within ``LTX2_GOLDEN_LIMITS``. The golden
    (``ltx2_t2v_full_default_40step_tpu_fp32_golden.npz`` in
-   ``$LTX2_GOLDEN_DIR``, default ``$HF_HOME/golden/ltx2``) uses fp32 weights,
-   tensor_parallel_size=4 and "highest" fp32 matmul precision; it matches CPU
-   fp32 diffusers to video MAE 0.0025.
+   ``$LTX2_GOLDEN_DIR``, default ``$HF_HOME/golden/ltx2``) is the same request
+   with fp32 weights and tensor_parallel_size=4; it matches CPU fp32 diffusers
+   to video MAE 0.0036.
 
 Measured on TPU v7x (158.69s total for module,
 well within the 1800s CI Nightly per-test timeout):
