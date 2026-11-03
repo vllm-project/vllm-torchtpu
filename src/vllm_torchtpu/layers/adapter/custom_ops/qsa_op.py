@@ -1280,6 +1280,13 @@ def _gathered_lists(vals, pos, group, size, tokens):
         g = g.reshape(-1, size, *x.shape).permute(1, 0, 2, 3)
         return g.reshape(size, -1, k)[:, :tokens]
 
+    if envs.VLLM_TPU_QSA_DCP_PACK_LISTS and vals.dtype == torch.float32 and pos.dtype == torch.int32:
+        # One all-gather for both lists: the f32 values ride as their int32 bits.
+        both = torch.stack([vals.view(torch.int32), pos], dim=-2)  # [rows, 2, k]
+        g = group.all_gather(both.unsqueeze(0).contiguous(), dim=0)
+        g = g.reshape(-1, size, *both.shape).permute(1, 0, 2, 3, 4)
+        g = g.reshape(size, -1, 2, k)[:, :tokens]
+        return g[:, :, 0].contiguous().view(torch.float32), g[:, :, 1].contiguous()
     return gather(vals), gather(pos)
 
 
