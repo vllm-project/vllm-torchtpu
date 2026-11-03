@@ -520,6 +520,7 @@ def sharded_ragged_paged_attention_from_qkv(
         )
     q_heads, kv_heads = num_q_heads, num_kv_heads
     kv_cache_spec = P(None, None, "model", None, None)
+    prologue_dma_stores = rpa_kwargs.pop("prologue_dma_stores", False)
 
     def _attend(qkv, cos, sin, wq, wk, kv_cache, kv_lens, pages, cu_q_lens, dist):
         prepared = rpa_prologue.qkv_to_rpa_inputs(
@@ -535,6 +536,7 @@ def sharded_ragged_paged_attention_from_qkv(
             k_scale=k_scale,
             v_scale=v_scale,
             kv_dtype=kv_cache.dtype,
+            dma_stores=prologue_dma_stores,
         )
         # Shape-only operands: with prepared_inputs the kernel reads no values
         # from them, and XLA drops the unused zeros.

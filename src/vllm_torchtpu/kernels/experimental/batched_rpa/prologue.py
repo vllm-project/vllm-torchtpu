@@ -29,6 +29,7 @@ read in bf16; k is quantized from the bf16 value) and v quantized from the f32
 norm output.
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -83,23 +84,29 @@ def _quantize(x: jax.Array, scale: float, dtype: jnp.dtype) -> jax.Array:
     return jnp.clip(x, float(info.min), float(info.max)).astype(dtype)
 
 
-def _kernel(
-    qkv_ref,
-    cos_ref,
-    sin_ref,
-    wq_ref,
-    wk_ref,
-    q_ref,
-    kv_ref,
-    *,
-    num_q_heads,
-    num_kv_heads,
-    head_dim,
-    eps,
-    k_scale,
-    v_scale,
-):
-    group = num_q_heads // num_kv_heads
+@dataclasses.dataclass(frozen=True)
+class _Heads:
+    """The head geometry and constants both prologue kernels compute with."""
+
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    eps: float
+    k_scale: float
+    v_scale: float
+
+
+def _block_values(qkv_ref, cos_ref, sin_ref, wq_ref, wk_ref, *, heads, kv_dtype):
+    """A token block's values, shared by both kernels: `q_head(j)`, query head
+    j's normed, rotated values (f32, rounded to bf16 by the caller), and
+    `kv_rows()`, the quantized K/V rows in `prepare_inputs`' order (k, v of
+    each KV head)."""
+    nq, nkv, head_dim, eps = (
+        heads.num_q_heads,
+        heads.num_kv_heads,
+        heads.head_dim,
+        heads.eps,
+    )
     cos = cos_ref[...].astype(jnp.float32)
     sin = sin_ref[...].astype(jnp.float32)
     wq, wk = wq_ref[...], wk_ref[...]
@@ -107,24 +114,153 @@ def _kernel(
     def head(j):
         return qkv_ref[:, j * head_dim : (j + 1) * head_dim]
 
-    for j in range(num_q_heads):
-        q = _rotary(_rms(head(j), wq, eps), cos, sin).astype(q_ref.dtype)
+    def q_head(j):
+        return _rotary(_rms(head(j), wq, eps), cos, sin)
+
+    def kv_rows():
+        rows = []
+        for h in range(nkv):
+            k = _rotary(_rms(head(nq + h), wk, eps), cos, sin)
+            k = k.astype(jnp.bfloat16).astype(jnp.float32)
+            v = _rms(head(nq + nkv + h), None, eps)
+            rows += [
+                _quantize(k, heads.k_scale, kv_dtype),
+                _quantize(v, heads.v_scale, kv_dtype),
+            ]
+        return rows
+
+    return q_head, kv_rows
+
+
+def _kernel(qkv_ref, cos_ref, sin_ref, wq_ref, wk_ref, q_ref, kv_ref, *, heads):
+    group = heads.num_q_heads // heads.num_kv_heads
+    q_head, kv_rows = _block_values(
+        qkv_ref, cos_ref, sin_ref, wq_ref, wk_ref, heads=heads, kv_dtype=kv_ref.dtype
+    )
+    for j in range(heads.num_q_heads):
         h, rest = divmod(j, group)
-        q_ref[h, :, rest // _Q_PACKING, rest % _Q_PACKING, :] = q
-    rows = []
-    for h in range(num_kv_heads):
-        k = _rotary(_rms(head(num_q_heads + h), wk, eps), cos, sin)
-        k = k.astype(jnp.bfloat16).astype(jnp.float32)
-        v = _rms(head(num_q_heads + num_kv_heads + h), None, eps)
-        rows += [
-            _quantize(k, k_scale, kv_ref.dtype),
-            _quantize(v, v_scale, kv_ref.dtype),
-        ]
+        q_ref[h, :, rest // _Q_PACKING, rest % _Q_PACKING, :] = q_head(j).astype(
+            q_ref.dtype
+        )
+    rows = kv_rows()
     slots = kv_ref.shape[1]
-    zeros = jnp.zeros((kv_ref.shape[0], head_dim), kv_ref.dtype)
+    zeros = jnp.zeros((kv_ref.shape[0], heads.head_dim), kv_ref.dtype)
     rows += [zeros] * (slots * _KV_PACKING - len(rows))  # prepare_inputs' padding
     for r, row in enumerate(rows):
         kv_ref[:, r // _KV_PACKING, r % _KV_PACKING, :] = row
+
+
+_LANES = 128
+
+
+def _kernel_dma_stores(
+    qkv_ref,
+    cos_ref,
+    sin_ref,
+    wq_ref,
+    wk_ref,
+    q_hbm,
+    kv_hbm,
+    q_buf,
+    kv_buf,
+    sem,
+    *,
+    heads,
+    bt,
+    steps,
+):
+    """`_kernel` writing its outputs through 32-bit words.
+
+    The packed outputs put two query heads (q) or four K/V rows (kv) of one
+    token in each 32-bit word, so a token's word row is one sublane of a tile
+    and a store of eight tokens is a strided one. Each (row group, 128-lane
+    tile) is built here as `[tokens, 128]` words in a contiguous buffer and
+    written with a strided DMA (double buffered across steps).
+    """
+    step = pl.program_id(0)
+    slot = step % 2
+    num_kv_heads, head_dim = heads.num_kv_heads, heads.head_dim
+    group = heads.num_q_heads // num_kv_heads
+    pairs = group // _Q_PACKING
+    slots = kv_hbm.shape[1]
+    lanes = range(0, head_dim, _LANES)
+    q_words = q_hbm.bitcast(jnp.uint32)  # [kv_heads, tokens, pairs, 1, d]
+    kv_words = kv_hbm.bitcast(jnp.uint32)  # [tokens, slots, 1, d]
+    q_slabs = [
+        (h, p, lane)
+        for h in range(num_kv_heads)
+        for p in range(pairs)
+        for lane in lanes
+    ]
+    kv_slabs = [(s, lane) for s in range(slots) for lane in lanes]
+
+    def copies(block, buf_slot):
+        t0 = pl.multiple_of(block * bt, bt)
+        out = [
+            pltpu.make_async_copy(
+                q_buf.at[buf_slot, j],
+                q_words.at[h, pl.ds(t0, bt), p, 0, pl.ds(lane, _LANES)],
+                sem.at[buf_slot],
+            )
+            for j, (h, p, lane) in enumerate(q_slabs)
+        ]
+        out += [
+            pltpu.make_async_copy(
+                kv_buf.at[buf_slot, j],
+                kv_words.at[pl.ds(t0, bt), s, 0, pl.ds(lane, _LANES)],
+                sem.at[buf_slot],
+            )
+            for j, (s, lane) in enumerate(kv_slabs)
+        ]
+        return out
+
+    if steps > 2:
+
+        @pl.when(step >= 2)
+        def _():  # the copies that last read this slot's buffers
+            for c in copies(step - 2, slot):
+                c.wait()
+
+    q_head, kv_rows = _block_values(
+        qkv_ref, cos_ref, sin_ref, wq_ref, wk_ref, heads=heads, kv_dtype=kv_hbm.dtype
+    )
+
+    def bits(x):
+        return pltpu.bitcast(x, jnp.uint32)
+
+    for h in range(num_kv_heads):
+        for p in range(pairs):
+            first, second = (
+                q_head(h * group + g).astype(jnp.bfloat16).astype(jnp.float32)
+                for g in (2 * p, 2 * p + 1)
+            )
+            # bf16 bits of the pair's first head in the low half, as packed.
+            words = (bits(first) >> 16) | (bits(second) & jnp.uint32(0xFFFF0000))
+            for i, lane in enumerate(lanes):
+                j = (h * pairs + p) * len(lanes) + i
+                q_buf[slot, j] = words[:, lane : lane + _LANES]
+    rows = kv_rows()
+    for s in range(slots):
+        words = None
+        for r in range(_KV_PACKING):  # row r of the slot in byte r, as packed
+            if s * _KV_PACKING + r >= len(rows):
+                break  # prepare_inputs' zero padding rows
+            byte = jax.lax.bitcast_convert_type(rows[s * _KV_PACKING + r], jnp.uint8)
+            byte = byte.astype(jnp.uint32) << (8 * r)
+            words = byte if words is None else words | byte
+        for i, lane in enumerate(lanes):
+            kv_buf[slot, s * len(lanes) + i] = words[:, lane : lane + _LANES]
+
+    for c in copies(step, slot):
+        c.start()
+
+    @pl.when(step == steps - 1)
+    def _():
+        for c in copies(step, slot):
+            c.wait()
+        if steps > 1:
+            for c in copies(step - 1, 1 - slot):
+                c.wait()
 
 
 @functools.partial(
@@ -138,6 +274,7 @@ def _kernel(
         "v_scale",
         "kv_dtype",
         "block_tokens",
+        "dma_stores",
         "interpret",
     ),
 )
@@ -156,9 +293,11 @@ def _qkv_to_rpa_inputs(
     v_scale: float,
     kv_dtype: jnp.dtype = jnp.float8_e4m3fn,
     block_tokens: int | None = None,
+    dma_stores: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """`qkv_to_rpa_inputs` on a token count that is a multiple of 16."""
+    """`qkv_to_rpa_inputs` on a token count that is a multiple of 16
+    (`dma_stores`: `_kernel_dma_stores`, same outputs)."""
     tokens, width = qkv.shape
     group = num_q_heads // num_kv_heads
     if width != (num_q_heads + 2 * num_kv_heads) * head_dim:
@@ -177,17 +316,56 @@ def _qkv_to_rpa_inputs(
     )
     if tokens % bt:
         raise ValueError(f"block of {bt} tokens does not tile {tokens} tokens")
-    kernel = functools.partial(
-        _kernel,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        eps=eps,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
+    heads = _Heads(num_q_heads, num_kv_heads, head_dim, eps, k_scale, v_scale)
+    kernel = functools.partial(_kernel, heads=heads)
     row_spec = lambda cols: pl.BlockSpec((bt, cols), lambda i: (i, 0))  # noqa: E731
     weight_spec = pl.BlockSpec((1, head_dim), lambda i: (0, 0))
+    out_shape = [
+        jax.ShapeDtypeStruct(
+            (num_kv_heads, tokens, group // _Q_PACKING, _Q_PACKING, head_dim),
+            jnp.bfloat16,
+        ),
+        jax.ShapeDtypeStruct((tokens, slots, _KV_PACKING, head_dim), kv_dtype),
+    ]
+    operands = (
+        qkv,
+        cos,
+        sin,
+        q_norm_weight.astype(jnp.float32).reshape(1, head_dim),
+        k_norm_weight.astype(jnp.float32).reshape(1, head_dim),
+    )
+    if dma_stores:
+        lanes = head_dim // _LANES
+        return pl.pallas_call(
+            functools.partial(
+                _kernel_dma_stores, heads=heads, bt=bt, steps=tokens // bt
+            ),
+            grid=(tokens // bt,),
+            in_specs=[
+                row_spec(width),
+                row_spec(half),
+                row_spec(half),
+                weight_spec,
+                weight_spec,
+            ],
+            out_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 2,
+            out_shape=out_shape,
+            scratch_shapes=[
+                pltpu.VMEM(
+                    (2, num_kv_heads * (group // _Q_PACKING) * lanes, bt, _LANES),
+                    jnp.uint32,
+                ),
+                pltpu.VMEM((2, slots * lanes, bt, _LANES), jnp.uint32),
+                pltpu.SemaphoreType.DMA((2,)),
+            ],
+            compiler_params=pltpu.CompilerParams(
+                # Each step waits for the copies of the step two before.
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+            ),
+            name="qkv_to_rpa_inputs",
+            interpret=interpret,
+        )(*operands)
     return pl.pallas_call(
         kernel,
         grid=(tokens // bt,),
@@ -205,25 +383,13 @@ def _qkv_to_rpa_inputs(
             ),
             pl.BlockSpec((bt, slots, _KV_PACKING, head_dim), lambda i: (i, 0, 0, 0)),
         ],
-        out_shape=[
-            jax.ShapeDtypeStruct(
-                (num_kv_heads, tokens, group // _Q_PACKING, _Q_PACKING, head_dim),
-                jnp.bfloat16,
-            ),
-            jax.ShapeDtypeStruct((tokens, slots, _KV_PACKING, head_dim), kv_dtype),
-        ],
+        out_shape=out_shape,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",), vmem_limit_bytes=_VMEM_LIMIT_BYTES
         ),
         name="qkv_to_rpa_inputs",
         interpret=interpret,
-    )(
-        qkv,
-        cos,
-        sin,
-        q_norm_weight.astype(jnp.float32).reshape(1, head_dim),
-        k_norm_weight.astype(jnp.float32).reshape(1, head_dim),
-    )
+    )(*operands)
 
 
 def qkv_to_rpa_inputs(

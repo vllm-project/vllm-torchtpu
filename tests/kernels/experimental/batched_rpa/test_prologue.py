@@ -114,6 +114,52 @@ def test_matches_norm_rotary_quantize_prepare(
     _assert_within_one_step(kv, ref_kv, jnp.int8)
 
 
+@pytest.mark.parametrize(
+    "tokens,nq,nkv,d,rotary_dim,block_tokens",
+    [
+        (64, 16, 8, 256, 256, 16),  # Gemma4-31B TP2 sliding: four K/V slots
+        (64, 16, 2, 512, 128, 32),  # Gemma4-31B TP2 global: partial rotary
+        (48, 4, 1, 128, 64, 16),  # one KV head: K/V rows padded in their slot
+        (40, 4, 2, 256, 256, None),  # odd bucket, chosen block
+    ],
+)
+def test_dma_stores_write_the_same_bits(tokens, nq, nkv, d, rotary_dim, block_tokens):
+    key = jax.random.key(tokens * nq + d)
+    qkv = jax.random.normal(key, (tokens, (nq + 2 * nkv) * d), jnp.float32) * 2
+    qkv = qkv.astype(jnp.bfloat16)
+    angle = jax.random.uniform(jax.random.fold_in(key, 1), (tokens, rotary_dim // 2))
+    cos, sin = jnp.cos(angle).astype(jnp.bfloat16), jnp.sin(angle).astype(jnp.bfloat16)
+    w = (1 + 0.1 * jax.random.normal(jax.random.fold_in(key, 2), (d,))).astype(
+        jnp.bfloat16
+    )
+    outs = [
+        prologue.qkv_to_rpa_inputs(
+            qkv,
+            cos,
+            sin,
+            w,
+            w,
+            num_q_heads=nq,
+            num_kv_heads=nkv,
+            head_dim=d,
+            eps=_EPS,
+            k_scale=0.5,
+            v_scale=1.0,
+            block_tokens=block_tokens,
+            dma_stores=dma,
+            interpret=True,
+        )
+        for dma in (False, True)
+    ]
+    (q, kv), (q_dma, kv_dma) = outs
+    np.testing.assert_array_equal(
+        np.asarray(q_dma.view(jnp.uint16)), np.asarray(q.view(jnp.uint16))
+    )
+    np.testing.assert_array_equal(
+        np.asarray(kv_dma.view(jnp.uint8)), np.asarray(kv.view(jnp.uint8))
+    )
+
+
 def _assert_within_one_step(out, ref, bits):
     """Same values up to one representable step on at most 0.1% of elements."""
     a = np.asarray(out.view(bits)).astype(np.int32)

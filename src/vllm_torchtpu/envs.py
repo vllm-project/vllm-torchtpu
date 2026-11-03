@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = False
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
     TPU_RPA_UNMASKED_INTERIOR: bool = False
+    TPU_RPA_PROLOGUE_DMA_STORES: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -882,6 +883,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the diagonal and the window edge) runs a mask-free copy of the step body,
     # which saves a compare and a select per logit. Outputs are unchanged.
     "TPU_RPA_UNMASKED_INTERIOR": env_bool("TPU_RPA_UNMASKED_INTERIOR"),
+    # The fused qkv prologue (TPU_GEMMA4_FUSED_ATTN_PROLOGUE) builds its packed
+    # q and K/V rows as 32-bit words in contiguous VMEM buffers and writes them
+    # with strided DMAs, instead of sublane-packing stores. Outputs unchanged.
+    "TPU_RPA_PROLOGUE_DMA_STORES": env_bool("TPU_RPA_PROLOGUE_DMA_STORES"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.

@@ -623,6 +623,7 @@ def _pallas_rpa_kernel_batched_from_qkv(
     fence_output: bool = False,
     unmasked_interior: bool = False,
     output_quant_dtype: jnp.dtype | None = None,
+    prologue_dma_stores: bool = False,
 ) -> tuple[jax.Array, ...]:
     """`_pallas_rpa_kernel_batched` on fused qkv rows (see
     `PallasBatchedRPAAttentionBackendImpl.forward_from_qkv`): `(new_kv_cache,
@@ -638,6 +639,8 @@ def _pallas_rpa_kernel_batched_from_qkv(
     )
     if output_quant_dtype is not None:
         rpa_kwargs["output_quant_dtype"] = output_quant_dtype
+    if prologue_dma_stores:
+        rpa_kwargs["prologue_dma_stores"] = True
     native, page_stride, restore_pool = native_kv_cache_view(
         kv_cache, num_kv_heads, head_dim, None
     )
@@ -1976,6 +1979,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
             skip_empty_launch=envs.TPU_RPA_SKIP_EMPTY_LAUNCH,
             fence_output=envs.TPU_RPA_FENCE_OUTPUT,
             unmasked_interior=envs.TPU_RPA_UNMASKED_INTERIOR,
+            prologue_dma_stores=envs.TPU_RPA_PROLOGUE_DMA_STORES,
         )
         quant_dtype = self.qkv_output_quant_dtype
         if quant_dtype is not None:
