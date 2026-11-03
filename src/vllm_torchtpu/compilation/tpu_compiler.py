@@ -193,6 +193,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DECODE_TPOT_CAP_MS",
     "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST",
     "VLLM_TPU_DP_LB_EXACT_INFLIGHT",
+    # Host-side persistent-batch bookkeeping only.
+    "TPU_CACHED_PROMPT_ROWS",
     # Pipelined prefill routing and timeouts; the segment programs follow
     # TPU_DP_PIPELINE_PREFILL, _STAGES and _SPLITS, which stay in the key.
     "TPU_DP_PIPELINE_MIN_TOKENS",

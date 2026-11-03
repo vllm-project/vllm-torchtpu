@@ -167,6 +167,7 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
+from vllm_torchtpu.runner.prompt_rows import cache_prompt_rows
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -2713,6 +2714,12 @@ class TPUModelRunner(GPUModelRunner):
             else scheduler_output
         )
         result = super()._update_states(base_output)
+        if envs.TPU_CACHED_PROMPT_ROWS:
+            cache_prompt_rows(
+                self.requests,
+                self.input_batch,
+                (new_req.req_id for new_req in scheduler_output.scheduled_new_reqs),
+            )
         self._min_tokens.discard(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._min_tokens.add(new_req.req_id, new_req.sampling_params)
