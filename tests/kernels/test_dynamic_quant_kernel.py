@@ -126,6 +126,65 @@ def test_norm_matches_normalizing_first(rows, k, n, split):
     assert not np.asarray(got[0]).any()
 
 
+@pytest.mark.parametrize("split", ["none", "tail", "heads"])
+def test_aux_projects_the_normalized_rows(split):
+    rows, k, n = 1024, 256, 384
+    x, w_q, w_scale = _operands(rows, k, n)
+    norm_weight = _norm_weight(k)
+    rng = np.random.default_rng(0)
+    aux_weight = jnp.asarray(rng.standard_normal((16, k)) * 0.05, jnp.bfloat16)
+    with pltpu.force_tpu_interpret_mode():
+        got, aux = dynamic_quant_kernel.dynamic_quant_matmul(
+            x,
+            w_q,
+            w_scale,
+            split_cols=_split_cols(split, n),
+            split_head_dim=_split_head_dim(split),
+            norm_weight=norm_weight,
+            norm_eps=1e-6,
+            aux_weight=aux_weight,
+        )
+    normed = util.rms_norm(x, norm_weight, 1e-6)
+    want = jax.jit(_reference)(normed, w_q, w_scale)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    want_aux = jax.lax.dot_general(
+        normed, aux_weight, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+    )
+    # Same products, another summation order: within a bf16 rounding.
+    np.testing.assert_allclose(
+        np.asarray(aux, np.float32), np.asarray(want_aux), rtol=2**-7, atol=1e-6
+    )
+
+
+def test_plain_jax_buckets_normalize_first():
+    # 64 rows is not a row-block multiple, so util takes the plain-JAX path.
+    rows, k, n = 64, 256, 384
+    x, w_q, w_scale = _operands(rows, k, n)
+    norm_weight = _norm_weight(k)
+    aux_weight = jnp.asarray(
+        np.random.default_rng(1).standard_normal((16, k)) * 0.05, jnp.bfloat16
+    )
+    assert not dynamic_quant_kernel.supports(x, w_q, w_scale, norm_weight=norm_weight)
+    got, aux = jax.jit(util.xla_quantized_matmul, static_argnames="norm_eps")(
+        x, w_q, w_scale, norm_weight=norm_weight, norm_eps=1e-6, aux_weight=aux_weight
+    )
+    normed = util.rms_norm(x, norm_weight, 1e-6)
+    want = jax.jit(_reference)(normed, w_q, w_scale)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    want_aux = jax.lax.dot_general(
+        normed, aux_weight, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+    ).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(aux), np.asarray(want_aux))
+
+
+def test_aux_needs_a_norm():
+    x = jnp.zeros((512, 512), jnp.bfloat16)
+    w_q = jnp.zeros((512, 512), jnp.float8_e4m3fn)
+    w_scale = jnp.ones((512,), jnp.float32)
+    aux_weight = jnp.zeros((16, 512), jnp.bfloat16)
+    assert not dynamic_quant_kernel.supports(x, w_q, w_scale, aux_weight=aux_weight)
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("rows,k,n", [(16384, 4096, 2560), (1024, 256, 384)])
 @pytest.mark.parametrize("split", ["none", "tail", "heads"])

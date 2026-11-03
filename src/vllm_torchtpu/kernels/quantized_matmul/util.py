@@ -95,7 +95,8 @@ def xla_quantized_matmul(
     split_head_dim: int = 0,
     norm_weight: jax.Array | None = None,
     norm_eps: float = 0.0,
-) -> jax.Array:
+    aux_weight: jax.Array | None = None,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """
     Per-channel quantized matmul with dynamic per-row activation quantization.
 
@@ -124,17 +125,23 @@ def xla_quantized_matmul(
             [n_input_features] and `norm_eps`, and the matmul takes
             `rms_norm(x, norm_weight, norm_eps)`. The kernel normalizes in
             VMEM, so the normalized activation is never written to HBM.
+        aux_weight: Given with `norm_weight`, a second, bf16 weight
+            [n_aux, n_input_features] that the normalized activation is also
+            multiplied by (f32 accumulation); the [num_tokens, n_aux] result
+            is returned after the main output.
 
     Returns:
         Output of the quantized matmul.
     """
+    if aux_weight is not None and norm_weight is None:
+        raise ValueError("aux_weight needs norm_weight")
     if split_head_dim and not dynamic_quant_kernel.supports(
-        x, w_q, w_scale, split_cols, split_head_dim, norm_weight
+        x, w_q, w_scale, split_cols, split_head_dim, norm_weight, aux_weight
     ):
         # The head layout only saves the consumer a relayout; keep the kernel.
         split_head_dim = 0
     if quantize_activation and dynamic_quant_kernel.supports(
-        x, w_q, w_scale, split_cols, split_head_dim, norm_weight
+        x, w_q, w_scale, split_cols, split_head_dim, norm_weight, aux_weight
     ):
         return dynamic_quant_kernel.dynamic_quant_matmul(
             x,
@@ -145,9 +152,19 @@ def xla_quantized_matmul(
             split_head_dim=split_head_dim,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            aux_weight=aux_weight,
         )
     if norm_weight is not None:
         x = rms_norm(x, norm_weight, norm_eps)
+    if aux_weight is not None:
+        aux = jax.lax.dot_general(
+            x,
+            aux_weight,
+            dimension_numbers=(((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        ).astype(x.dtype)
+        out = xla_quantized_matmul(x, w_q, w_scale, quantize_activation)
+        return out, aux
     if quantize_activation:
         acc_dtype = jnp.float32
         if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):

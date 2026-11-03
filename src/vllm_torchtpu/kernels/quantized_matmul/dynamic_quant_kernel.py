@@ -66,11 +66,15 @@ def _vmem_limit_bytes(
     split_cols: int = 0,
     split_head_dim: int = 0,
     norm: bool = False,
+    n_aux: int = 0,
 ) -> int:
     x = 2 * ROW_BLOCK * k * 2  # double-buffered bf16 input block
     # A fused RMSNorm's resident (1, k) f32 weight, padded to 8 sublanes, and
     # its bf16 output for one quantization step.
     x_norm = 8 * k * 4 + QUANT_ROWS * k * 2 if norm else 0
+    # The resident (n_aux, k) bf16 aux weight and double-buffered
+    # (n_aux, rows) bf16 aux output, n_aux padded to 16 sublanes.
+    aux = -(-n_aux // 16) * 16 * (k + 2 * ROW_BLOCK) * 2
     x_q = 2 * ROW_BLOCK * k  # two fp8 slots
     x_scale = 2 * ROW_BLOCK * 128 * 4  # (rows, 1) f32 pads to 128 lanes
     w = k * n + 8 * n * 4  # resident fp8 weight; its (1, n) scale pads to 8 rows
@@ -80,7 +84,7 @@ def _vmem_limit_bytes(
         n += heads * split_head_dim - split_cols
     out = 2 * ROW_BLOCK * n * 2  # double-buffered bf16 output blocks
     acc = ROW_BLOCK * out_block * 4
-    return int(VMEM_HEADROOM * (x + x_norm + x_q + x_scale + w + out + acc))
+    return int(VMEM_HEADROOM * (x + x_norm + aux + x_q + x_scale + w + out + acc))
 
 
 def supports(
@@ -90,6 +94,7 @@ def supports(
     split_cols: int = 0,
     split_head_dim: int = 0,
     norm_weight: jax.Array | None = None,
+    aux_weight: jax.Array | None = None,
 ) -> bool:
     """Whether `dynamic_quant_matmul` takes these operands (static shapes)."""
     if x.ndim != 2 or w_q.ndim != 2 or w_scale.shape != w_q.shape[1:]:
@@ -102,6 +107,13 @@ def supports(
         return False
     if norm_weight is not None and norm_weight.shape != (k,):
         return False
+    n_aux = 0
+    if aux_weight is not None:
+        if norm_weight is None or aux_weight.dtype != x.dtype:
+            return False
+        if aux_weight.ndim != 2 or aux_weight.shape[1] != k:
+            return False
+        n_aux = aux_weight.shape[0]
     out_block = _out_block(n, split_cols)
     if out_block is None:
         return False
@@ -110,7 +122,7 @@ def supports(
     ):
         return False
     vmem = _vmem_limit_bytes(
-        k, n, out_block, split_cols, split_head_dim, norm_weight is not None
+        k, n, out_block, split_cols, split_head_dim, norm_weight is not None, n_aux
     )
     return vmem <= min(DEVICE_VMEM_LIMIT.values())
 
@@ -162,18 +174,23 @@ def _quantize_rows(x_ref, x_q_ref, x_scale_ref, rows):
     x_q_ref[rows, :] = jnp.clip(x / scale, q_min, q_max).astype(q_dtype)
 
 
-def _kernel(*refs, out_block, n_first, w_nk, head_dim, norm_eps):
+def _kernel(*refs, out_block, n_first, w_nk, head_dim, norm_eps, n_aux):
     # One output, or two when the trailing columns from `n_first` on are split
     # off, the second as (rows, heads, head_dim) when `head_dim`. w_ref is
     # (n, k) when `w_nk`, else (k, n). A fused RMSNorm adds its (1, k) weight
-    # after x and its (QUANT_ROWS, k) output scratch last.
+    # after x and its (QUANT_ROWS, k) output scratch last; the aux projection
+    # its (n_aux, k) weight after the scales and its (n_aux, rows) output after
+    # the others.
     norm = norm_eps is not None
     refs = list(refs)
     x_ref = refs.pop(0)
     norm_weight_ref = refs.pop(0) if norm else None
     w_ref, w_scale_ref = refs.pop(0), refs.pop(0)
+    aux_w_ref = refs.pop(0) if n_aux else None
     normed_ref = refs.pop() if norm else None
-    *out_refs, x_q_ref, x_scale_ref = refs
+    x_q_ref, x_scale_ref = refs[-2:]
+    out_refs = refs[:-2]
+    aux_out_ref = out_refs.pop() if n_aux else None
 
     # Step s quantizes row block s into slot s % 2 and multiplies row block
     # s - 1 from the other slot.
@@ -188,6 +205,14 @@ def _kernel(*refs, out_block, n_first, w_nk, head_dim, norm_eps):
                 abs_max = _rms_norm_rows(
                     x_ref, norm_weight_ref, normed_ref, rows, norm_eps
                 )
+                if n_aux:
+                    aux = jax.lax.dot_general(
+                        aux_w_ref[...],
+                        normed_ref[...],
+                        (((1,), (1,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )
+                    aux_out_ref[:, rows] = aux.astype(aux_out_ref.dtype)
                 _quantize_normed_rows(
                     normed_ref, abs_max, x_q.at[rows], x_scale.at[rows]
                 )
@@ -254,11 +279,14 @@ def dynamic_quant_matmul(
     split_head_dim: int = 0,
     norm_weight: jax.Array | None = None,  # [k]
     norm_eps: float = 0.0,
-) -> jax.Array:
+    aux_weight: jax.Array | None = None,  # [n_aux, k] bf16
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """`x @ w_q` with per-row dynamic FP8 quantization of `x`, as [m, n].
 
     With `norm_weight`, `x` is the input of an RMSNorm and the product is
-    `util.rms_norm(x, norm_weight, norm_eps) @ w_q`.
+    `util.rms_norm(x, norm_weight, norm_eps) @ w_q`. With `aux_weight` as
+    well, the normalized rows are also multiplied by `aux_weight.T` (bf16,
+    f32 accumulation), and that [m, n_aux] product is returned second.
 
     With `split_cols`, the last that many columns are written as their own
     [m, split_cols] array and the result is the concatenation of the two,
@@ -269,7 +297,9 @@ def dynamic_quant_matmul(
     `w_q` is the transpose of a stored [n, k] array, which the kernel then
     reads as is.
     """
-    if not supports(x, w_q, w_scale, split_cols, split_head_dim, norm_weight):
+    if not supports(
+        x, w_q, w_scale, split_cols, split_head_dim, norm_weight, aux_weight
+    ):
         raise ValueError(f"unsupported operands {x.shape=} {x.dtype=} {w_q.shape=}")
     m, k = x.shape
     n = w_q.shape[1]
@@ -306,6 +336,15 @@ def dynamic_quant_matmul(
         pl.BlockSpec((1, n), lambda s: (0, 0)),
     ]
     operands += [w_q, w_scale.astype(jnp.float32).reshape(1, n)]
+    n_aux = 0 if aux_weight is None else aux_weight.shape[0]
+    if n_aux:
+        in_specs.append(pl.BlockSpec(aux_weight.shape, lambda s: (0, 0)))
+        operands.append(aux_weight)
+        # Written by the step that normalizes the rows, like the x block.
+        out_specs.append(
+            pl.BlockSpec((n_aux, ROW_BLOCK), lambda s: (0, jnp.minimum(s, nb - 1)))
+        )
+        out_shape.append(jax.ShapeDtypeStruct((n_aux, m), x.dtype))
     outs = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -314,6 +353,7 @@ def dynamic_quant_matmul(
             w_nk=weight_nk,
             head_dim=split_head_dim,
             norm_eps=float(norm_eps) if norm else None,
+            n_aux=n_aux,
         ),
         grid=(nb + 1,),
         in_specs=in_specs,
@@ -323,10 +363,13 @@ def dynamic_quant_matmul(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=_vmem_limit_bytes(
-                k, n, out_block, split_cols, split_head_dim, norm
+                k, n, out_block, split_cols, split_head_dim, norm, n_aux
             ),
         ),
     )(*operands)
-    if len(outs) == 1:
-        return outs[0]
-    return jnp.concatenate([outs[0], outs[1].reshape(m, split_cols)], axis=1)
+    outs = list(outs)
+    aux = outs.pop().T if n_aux else None
+    out = outs[0]
+    if split_cols:
+        out = jnp.concatenate([out, outs[1].reshape(m, split_cols)], axis=1)
+    return out if aux is None else (out, aux)
