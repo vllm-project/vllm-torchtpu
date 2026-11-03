@@ -17,6 +17,7 @@ result row to the shard that owns its token, so the layer needs no dense
 combine reduce-scatter."""
 
 import functools
+import os
 import threading
 from typing import cast
 
@@ -60,6 +61,9 @@ QCHUNK = 512
 # which is why this is a handful of heights and not one per ROWBLK -- and the
 # top rung is always tile_m, so a full tile is unchanged.
 HEIGHT_RUNGS = 4
+# MOE_ADAPTIVE_PREFILL_RUNGS=1: emit the tail-tile height rungs on prefill-sized builds too (a
+# routed expert spans several tiles there, but its last tile still rounds up to a full height).
+PREFILL_RUNGS = os.environ.get("MOE_ADAPTIVE_PREFILL_RUNGS", "0") == "1"
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -154,7 +158,7 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
         HEIGHT_RUNGS < 2
         or step % ROWBLK
         or step * HEIGHT_RUNGS != tile_m
-        or rows_alloc > ep * g_local * tile_m
+        or (rows_alloc > ep * g_local * tile_m and not PREFILL_RUNGS)
     ):
         return (tile_m,)
     return tuple(range(step, tile_m + 1, step))
