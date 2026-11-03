@@ -358,6 +358,7 @@ def _verify_fused_impl(
     max_draft_tokens: int,
     synthetic_mode: bool,
     topk_candidates: int,
+    candidates_only: bool = False,
     num_reqs: torch.Tensor | None = None,
 ):
     """Non-greedy spec verify of one chunk as one program
@@ -387,6 +388,7 @@ def _verify_fused_impl(
         synthetic_conditional_rates,
         synthetic_mode,
         topk_candidates,
+        candidates_only,
     )
     if num_reqs is None:
         return next_tokens
@@ -4926,6 +4928,7 @@ class TPUModelRunner(GPUModelRunner):
             recover_u=recover_u,
             do_sampling=True,
             topk_candidates=topk_candidates,
+            candidates_only=self._sampler_candidates_only(topk_candidates),
         )
 
     def _sample_spec_verify_fused(
@@ -4987,6 +4990,7 @@ class TPUModelRunner(GPUModelRunner):
             self.speculative_config.num_speculative_tokens,
             self.rejection_sampler.synthetic_mode,
             topk_candidates,
+            self._sampler_candidates_only(topk_candidates),
         )
         ro_groups, ro_num_reqs = self._fused_read_offsets
         fold_ro = (
@@ -5065,6 +5069,7 @@ class TPUModelRunner(GPUModelRunner):
             max_draft_tokens,
             _synthetic,
             topk_candidates,
+            _candidates_only,
         ) = args
         assert self.rejection_sampler is not None
         bonus_logits, target_logits = self.spec_gather_bonus_and_target_logits(
@@ -5094,6 +5099,7 @@ class TPUModelRunner(GPUModelRunner):
             recover_u=recover_u,
             do_sampling=True,
             topk_candidates=topk_candidates,
+            candidates_only=self._sampler_candidates_only(topk_candidates),
         )
         faulted = self._verify_fused_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
         compared = fused
@@ -6987,6 +6993,7 @@ class TPUModelRunner(GPUModelRunner):
                             recover_u=warm_recover_u,
                             do_sampling=True,
                             topk_candidates=blocks,
+                            candidates_only=self._sampler_candidates_only(blocks),
                         )
                         synchronize_tensors(out)
                     if envs.VLLM_TPU_VERIFY_FUSED:
@@ -7062,6 +7069,7 @@ class TPUModelRunner(GPUModelRunner):
                         self.speculative_config.num_speculative_tokens,
                         self.rejection_sampler.synthetic_mode,
                         topk_candidates,
+                        self._sampler_candidates_only(topk_candidates),
                         self._num_reqs_tensor(1),
                     )
                 )
@@ -7084,6 +7092,7 @@ class TPUModelRunner(GPUModelRunner):
                 self.speculative_config.num_speculative_tokens,
                 self.rejection_sampler.synthetic_mode,
                 topk_candidates,
+                self._sampler_candidates_only(topk_candidates),
             )
             synchronize_tensors(out)
 
@@ -8642,6 +8651,11 @@ class TPUModelRunner(GPUModelRunner):
             CANDIDATE_BLOCK,
         )
         return num_blocks
+
+    @staticmethod
+    def _sampler_candidates_only(topk_candidates: int) -> bool:
+        """VLLM_TPU_SAMPLER_CANDIDATES_ONLY, for a chunk on top-k candidates."""
+        return topk_candidates > 0 and envs.VLLM_TPU_SAMPLER_CANDIDATES_ONLY
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
