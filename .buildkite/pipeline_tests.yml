@@ -86,7 +86,7 @@ steps:
     key: "unit_tests_cpu_pr"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
-    parallelism: 4
+    parallelism: 8
     commands:
       - .buildkite/kubernetes/run.sh bash -c 'bktec run || [ $$? -eq 5 ]'
     plugins:

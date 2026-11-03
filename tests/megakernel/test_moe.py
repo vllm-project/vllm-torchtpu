@@ -940,6 +940,7 @@ def test_moe_dynamic_dma_race_invariants(
             pltpu.make_async_copy(
                 W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
             ).wait()
+            moe.on_layer_start(ctx, jnp.int32(0), jnp.int32(0))
             ring.begin_layer(jnp.int32(0))
             ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
             part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))

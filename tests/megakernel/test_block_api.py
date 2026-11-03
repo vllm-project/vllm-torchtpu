@@ -200,16 +200,31 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
     assert set(moe_fused.keys()) == {"sh13", "sh13_s", "e13", "e13_s"}
 
     ex = ExecSpec(R=2, B=2, T=1, ctx=128)
-    for g_case in (qwen35.TINY, qwen35.TINY_EP):
+    small_tp = dataclasses.replace(
+        qwen35.TINY, H=256, NH=4, KH=2, VH=4, TOPK=2, I=256, IS=256
+    )
+    small_ep = dataclasses.replace(small_tp, moe_tp=False)
+    for g_case in (small_tp, small_ep):
         hf_cfg_case = _make_mock_hf_config(g_case)
+        in_norm_case = Norm.bind("input_layernorm", zero_centered=True).resolve(
+            hf_cfg_case
+        )
+        post_norm_case = Norm.bind(
+            "post_attention_layernorm", zero_centered=True
+        ).resolve(hf_cfg_case)
+        final_norm_case = Norm.bind("model.norm", zero_centered=True).resolve(
+            hf_cfg_case
+        )
+        gqa_case = GQABlock.bind("self_attn").resolve(hf_cfg_case)
+        gdn_case = GDNBlock.bind("linear_attn").resolve(hf_cfg_case)
         moe_blk_case = MoEBlock.bind("mlp", moe_tp=g_case.moe_tp).resolve(hf_cfg_case)
         rep_decls = (
-            in_norm_blk.hf_params("input_layernorm")
-            + gqa_blk.hf_params("self_attn")
-            + gdn_blk.hf_params("linear_attn")
-            + post_norm_blk.hf_params("post_attention_layernorm")
+            in_norm_case.hf_params("input_layernorm")
+            + gqa_case.hf_params("self_attn")
+            + gdn_case.hf_params("linear_attn")
+            + post_norm_case.hf_params("post_attention_layernorm")
             + moe_blk_case.hf_params("mlp")
-            + final_norm_blk.hf_params("model.norm")
+            + final_norm_case.hf_params("model.norm")
         )
         hf = qwen35.random_hf_weights(jax.random.PRNGKey(0), g_case)
         transformed = apply_hf_transforms(rep_decls, hf, R=ex.R)
@@ -224,6 +239,7 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
                 np.asarray(exp_arr).view(np.uint8),
                 err_msg=f"Bitwise mismatch on {k} (moe_tp={g_case.moe_tp})",
             )
+        del hf, transformed, expected_logical
 
     # Verify apply_hf_transforms rejects wrong shapes and unsupported transform fields.
     q_decl = gqa_by_name["q_proj"]
@@ -562,11 +578,16 @@ class _SingleLayerGDNGeometry(qwen35.Qwen35Geometry):
         return None
 
 
+_SMALL_CPU_GEOMETRY = dataclasses.replace(
+    qwen35.TINY, H=256, NH=4, KH=2, VH=4, TOPK=2, I=256, IS=256
+)
+
+
 @pytest.mark.parametrize("paged_kv", [False, True])
 @pytest.mark.parametrize("T", [1, 2])
 def test_gqa_block_reference_matches_kernel_make_step_cpu(T: int, paged_kv: bool):
     """`GQABlock.reference` matches `kernel.make_step` on a 1-block attention model."""
-    g = dataclasses.replace(qwen35.TINY, L=1, att_every=1)
+    g = dataclasses.replace(_SMALL_CPU_GEOMETRY, L=1, att_every=1)
     cache_cfg = (
         CacheExec(paged_kv=True, num_pages=64)
         if paged_kv
@@ -661,25 +682,26 @@ def test_gdn_block_reference_matches_kernel_make_step_cpu(T: int):
     ex = ExecSpec(R=2, B=2, T=T, ctx=128, interpret=True, tiles=_TINY_STEP_TILES)
     mesh = _cpu_mesh(ex.R)
 
+    g_src = dataclasses.replace(_SMALL_CPU_GEOMETRY, L=2, att_every=2)
     pos, hid_l, w_l4, st_l4 = qwen35.random_logical_inputs(
-        jax.random.PRNGKey(20 + T), qwen35.TINY, ex
+        jax.random.PRNGKey(20 + T), g_src, ex
     )
     g = _SingleLayerGDNGeometry(
         L=1,
         att_every=2,
-        H=qwen35.TINY.H,
-        NH=qwen35.TINY.NH,
-        NKV=qwen35.TINY.NKV,
-        HD=qwen35.TINY.HD,
-        ROT=qwen35.TINY.ROT,
-        KH=qwen35.TINY.KH,
-        VH=qwen35.TINY.VH,
-        KD=qwen35.TINY.KD,
-        VD=qwen35.TINY.VD,
-        E=qwen35.TINY.E,
-        TOPK=qwen35.TINY.TOPK,
-        I=qwen35.TINY.I,
-        IS=qwen35.TINY.IS,
+        H=g_src.H,
+        NH=g_src.NH,
+        NKV=g_src.NKV,
+        HD=g_src.HD,
+        ROT=g_src.ROT,
+        KH=g_src.KH,
+        VH=g_src.VH,
+        KD=g_src.KD,
+        VD=g_src.VD,
+        E=g_src.E,
+        TOPK=g_src.TOPK,
+        I=g_src.I,
+        IS=g_src.IS,
     )
     w_l: dict[str, Any] = {
         "in_norm": w_l4["in_norm"][:1],
@@ -753,7 +775,7 @@ def test_gdn_block_reference_matches_kernel_make_step_cpu(T: int):
 @pytest.mark.parametrize("moe_tp", [True, False])
 def test_moe_block_reference_matches_kernel_make_step_cpu(moe_tp: bool):
     """`MoEBlock.reference` matches `kernel.make_step` on a 1-block MoE model."""
-    g = dataclasses.replace(qwen35.TINY, L=1, att_every=1, moe_tp=moe_tp)
+    g = dataclasses.replace(_SMALL_CPU_GEOMETRY, L=1, att_every=1, moe_tp=moe_tp)
     ex = ExecSpec(R=2, B=2, T=1, ctx=128, interpret=True, tiles=_TINY_STEP_TILES)
     mesh = _cpu_mesh(ex.R)
 

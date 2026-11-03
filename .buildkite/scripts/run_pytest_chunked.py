@@ -74,6 +74,22 @@ _CPU_HEAVY_IMPORT_SUBSTRINGS: tuple[str, ...] = (
     "block_sparse_gqa_prefill",
     "dcp2_harness",
     "test_qwen4_exp_shared_stream_indexer",
+    "sparse_mla",
+)
+
+_CPU_HEAVY_EXEC_SYMBOLS: frozenset[str] = frozenset(
+    {
+        "make_step",
+        "PallasWriter",
+        "pallas_call",
+    }
+)
+
+_CPU_HEAVY_DIR_PREFIXES: tuple[str, ...] = (
+    "tests/kernels/",
+    "tests/layers/",
+    "tests/megakernel/",
+    "tests/megakernel_runtime/",
 )
 
 
@@ -128,7 +144,7 @@ def _analyze_test_file(resolved_path: str) -> tuple[bool, bool]:
     spawns_workers = bool(code_symbols & _SPAWN_SYMBOLS) or (
         "torch.distributed.run" in seq_str_literals
     )
-    cpu_heavy_kernel = any(
+    cpu_heavy_kernel = bool(code_symbols & _CPU_HEAVY_EXEC_SYMBOLS) or any(
         token in imp for imp in import_names for token in _CPU_HEAVY_IMPORT_SUBSTRINGS
     )
     return spawns_workers, cpu_heavy_kernel
@@ -150,7 +166,7 @@ def classify_selector(
             return "spawn_isolated"
         return "batch"
 
-    if rel_posix.startswith("tests/kernels/") and cpu_heavy_kernel:
+    if rel_posix.startswith(_CPU_HEAVY_DIR_PREFIXES) and cpu_heavy_kernel:
         return "cpu_heavy_isolated"
     return "batch"
 

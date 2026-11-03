@@ -29,6 +29,7 @@ TPU_TRANSIENT_SESSION_ERROR_MARKERS: tuple[str, ...] = (
     "START_SESSION failed",
     "SLICE_FAILURE_SW_INJECT_ERROR",
     "failed to retrieve the PjRt client: TPU initialization failed",
+    "TPU_WORKER_BOOTSTRAP_TIMEOUT:",
 )
 
 
@@ -153,8 +154,8 @@ def run_tpu_worker_session[T](
     run_attempt: Callable[[int], tuple[int, str, T]],
     *,
     max_attempts: int = 3,
-    backoff_s: float = 8.0,
-    settle_s: float = 3.0,
+    backoff_s: float = 12.0,
+    settle_s: float = 10.0,
 ) -> tuple[int, str, T]:
     """Run a whole-slice worker launcher with VFIO teardown waits and session retry."""
     if max_attempts < 1:

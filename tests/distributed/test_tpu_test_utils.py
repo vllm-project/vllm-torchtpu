@@ -97,12 +97,16 @@ def test_is_transient_tpu_session_error_positive_and_negative_controls() -> None
     assert is_transient_tpu_session_error(
         "E0000 00:00:1234 slice failure: SLICE_FAILURE_SW_INJECT_ERROR"
     )
+    assert is_transient_tpu_session_error(
+        "TPU_WORKER_BOOTSTRAP_TIMEOUT: 3/8 workers initialized TPU runtime within 150s"
+    )
 
     # Negative controls: comments, empty logs, and non-session assertion failures.
     assert not is_transient_tpu_session_error("")
     assert not is_transient_tpu_session_error(
         "# START_SESSION failed in comment should not trigger retry\n"
         "   # SLICE_FAILURE_SW_INJECT_ERROR\n"
+        "   # TPU_WORKER_BOOTSTRAP_TIMEOUT: comment lookalike\n"
     )
     assert not is_transient_tpu_session_error(
         "AssertionError: tensor mismatch at index 4\n"
@@ -166,15 +170,23 @@ def test_run_tpu_worker_session_retries_transient_error_only() -> None:
         calls.append(attempt)
         if attempt == 0:
             return 1, "GRPC_ERROR: START_SESSION failed", f"dir_{attempt}"
+        if attempt == 1:
+            return (
+                124,
+                "TPU_WORKER_BOOTSTRAP_TIMEOUT: 0/8 workers initialized "
+                "TPU runtime within 150s",
+                f"dir_{attempt}",
+            )
         return 0, "ok", f"dir_{attempt}"
 
     rc, log, payload = run_tpu_worker_session(
         transient_then_pass, max_attempts=3, backoff_s=0.0, settle_s=0.0
     )
-    assert (rc, log, payload) == (0, "ok", "dir_1")
-    assert calls == [0, 1]
+    assert (rc, log, payload) == (0, "ok", "dir_2")
+    assert calls == [0, 1, 2]
 
-    # Deterministic test failure must NOT waste retries.
+    # Deterministic test failure and post-bootstrap transfer deadline (rc=124 without
+    # bootstrap marker) must NOT waste retries.
     non_transient_calls: list[int] = []
 
     def deterministic_failure(attempt: int) -> tuple[int, str, str]:
@@ -187,6 +199,19 @@ def test_run_tpu_worker_session_retries_transient_error_only() -> None:
     assert rc2 == 1
     assert payload2 == "dir_0"
     assert non_transient_calls == [0]
+
+    post_bootstrap_timeout_calls: list[int] = []
+
+    def post_bootstrap_timeout(attempt: int) -> tuple[int, str, str]:
+        post_bootstrap_timeout_calls.append(attempt)
+        return 124, "Workers bootstrapped; hung in transfer loop", f"dir_{attempt}"
+
+    rc3, _, payload3 = run_tpu_worker_session(
+        post_bootstrap_timeout, max_attempts=3, backoff_s=0.0, settle_s=0.0
+    )
+    assert rc3 == 124
+    assert payload3 == "dir_0"
+    assert post_bootstrap_timeout_calls == [0]
 
     with pytest.raises(ValueError, match="max_attempts must be >= 1"):
         run_tpu_worker_session(deterministic_failure, max_attempts=0)

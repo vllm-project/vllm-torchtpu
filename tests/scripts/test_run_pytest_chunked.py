@@ -116,6 +116,21 @@ def test_classify_and_plan_chunks_cpu_heavy_isolated_and_negative_control(
         tmp_path / "tests" / "kernels" / "test_heavy_qsa.py",
         "from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa\n",
     )
+    heavy_layer_mla = _write_file(
+        tmp_path / "tests" / "layers" / "core" / "test_sparse_mla_attention.py",
+        "from vllm_torchtpu.layers.core import sparse_mla_attention\n",
+    )
+    heavy_megakernel = _write_file(
+        tmp_path / "tests" / "megakernel" / "test_b1_tiles_profiles.py",
+        "from vllm_torchtpu import megakernel as mk\n"
+        "def run(w):\n    return mk.PallasWriter().make_step()\n",
+    )
+    lookalike_megakernel = _write_file(
+        tmp_path / "tests" / "megakernel" / "test_decls.py",
+        '# make_step PallasWriter pallas\n"""Docstring mentioning make_step."""\n'
+        'TXT = "make_step PallasWriter sparse_mla"\n'
+        "def test_decls():\n    assert TXT\n",
+    )
     lookalike_kernel = _write_file(
         tmp_path / "tests" / "kernels" / "test_light_kernel.py",
         '# pallas pooled_qsa streamindex\n"""Docstring mentioning pallas."""\n'
@@ -127,7 +142,15 @@ def test_classify_and_plan_chunks_cpu_heavy_isolated_and_negative_control(
     )
 
     chunks = run_pytest_chunked.plan_chunks(
-        [str(other_batch), str(heavy_qsa), str(lookalike_kernel), str(heavy_pallas)],
+        [
+            str(other_batch),
+            str(heavy_megakernel),
+            str(lookalike_megakernel),
+            str(heavy_qsa),
+            str(lookalike_kernel),
+            str(heavy_layer_mla),
+            str(heavy_pallas),
+        ],
         chunk_size=6,
         has_vfio=False,
         repo_root=tmp_path,
@@ -135,7 +158,9 @@ def test_classify_and_plan_chunks_cpu_heavy_isolated_and_negative_control(
     assert chunks == [
         [str(heavy_pallas)],
         [str(heavy_qsa)],
-        [str(lookalike_kernel), str(other_batch)],
+        [str(heavy_layer_mla)],
+        [str(heavy_megakernel)],
+        [str(lookalike_kernel), str(lookalike_megakernel), str(other_batch)],
     ]
 
 

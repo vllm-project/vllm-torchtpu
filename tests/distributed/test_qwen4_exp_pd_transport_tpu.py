@@ -277,9 +277,31 @@ def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
                 start_new_session=True,
             )
             try:
+                bootstrap_deadline = time.monotonic() + 150
                 deadline = time.monotonic() + 480
+                bootstrapped = False
                 while child.poll() is None:
-                    if time.monotonic() >= deadline:
+                    now = time.monotonic()
+                    if not bootstrapped:
+                        ready_ranks = sum(
+                            (attempt_dir / f"runtime-{r}.json").exists()
+                            for r in range(8)
+                        )
+                        if ready_ranks == 8:
+                            bootstrapped = True
+                        elif now >= bootstrap_deadline:
+                            kill_process_group(child)
+                            log_text = (
+                                log_path.read_text(errors="replace")
+                                + f"\nTPU_WORKER_BOOTSTRAP_TIMEOUT: {ready_ranks}/8 "
+                                "workers initialized TPU runtime within 150s\n"
+                            )
+                            print(
+                                f"TORCHRUN BOOTSTRAP TIMEOUT (attempt {attempt + 1})\n"
+                                + log_text[-32000:]
+                            )
+                            return 124, log_text, attempt_dir
+                    if now >= deadline:
                         return 124, log_path.read_text(errors="replace"), attempt_dir
                     assert log_path.stat().st_size <= 32 * 1024**2, "Launcher log limit"
                     time.sleep(0.1)
