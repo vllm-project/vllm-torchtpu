@@ -384,6 +384,25 @@ def swa_pack(banks, records, values):
 def swa_prepare_publish(banks, table, starts, positions, minimum, values):
     from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
 
+    # Shape dispatch belongs inside the JAX bridge. A Torch-side equality
+    # specializes dimensions that the model explicitly marks dynamic.
+    if positions.shape != (288,) or table.shape[0] != 48:
+        from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
+
+        metadata, bounds, records = prepare_swa_metadata(
+            table,
+            starts,
+            positions,
+            minimum,
+            page_size=64,
+            page_stride=64,
+            row_offset=0,
+        )
+        pages = banks if len(banks) == 2 else banks[0]
+        updated = write_swa_pages(pages, records, values)
+        owners = updated if isinstance(updated, tuple) else (updated,)
+        return (*owners, metadata, bounds, records)
+
     capacities, lanes_cores = _swa_capacities(banks)
     padded = (values.shape[0] + lanes_cores - 1) // lanes_cores * lanes_cores
 
