@@ -42,6 +42,9 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import bucket_filter
+from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+    GdnStepMetadataCache,
+)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from . import sequence_parallel as sp
@@ -322,6 +325,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         ple_raw_embeddings=None,
         sequence_parallel=False,
         sp_pad=0,
+        gdn_step_metadata_cache=None,
     ):
         """``sequence_parallel``: ``hidden`` and the result are this TP rank's
         token shard; the token-indexed inputs still cover the whole step.
@@ -346,7 +350,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if sequence_parallel:
             block = sp.gather(block, num_tokens)
         if self.layer_type == "linear_attention":
-            block = sp.reduce(self.linear_attn(block), sequence_parallel)
+            block = sp.reduce(
+                self.linear_attn(block, gdn_step_metadata_cache), sequence_parallel
+            )
         else:
             block = self.self_attn.forward_with_indices(
                 block,
@@ -658,6 +664,10 @@ class Qwen4ExpBackbone(nn.Module):
             hidden = sp.shard(hidden)
         rows = hidden.shape[0]
         hidden = sp.pad_shard(hidden.repeat(1, self.hc_count), sp_pad)
+        # One step-metadata memo for every GDN layer of this forward.
+        gdn_step_metadata_cache = (
+            GdnStepMetadataCache() if envs.VLLM_TPU_GDN_HOIST_METADATA else None
+        )
         for index, layer in enumerate(self.layers):
             if ple_token is not None and index == self.host_ple_index:
                 ple_raw_embeddings = ple.lookup_finish(ple_token, ple_inputs, hidden)
@@ -675,6 +685,7 @@ class Qwen4ExpBackbone(nn.Module):
                 ple_raw_embeddings,
                 sequence_parallel=sequence_parallel,
                 sp_pad=sp_pad,
+                gdn_step_metadata_cache=gdn_step_metadata_cache,
             )
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
         if sp_pad:
