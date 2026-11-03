@@ -110,12 +110,18 @@ def local_q_all_gather_op():
             lane=None if lane_axis is None else lane,
         )
 
-    def fn(x, w_q, w_s, rank, lane):
+    def fn(
+        x: jax.Array,
+        w_q: jax.Array,
+        w_s: jax.Array,
+        rank: jax.Array,
+        lane: jax.Array,
+    ) -> jax.Array:
         return jax.shard_map(
             body, mesh=mesh, in_specs=(spec,) * 5, out_specs=spec, check_vma=False
         )(x, w_q, w_s, rank, lane)
 
-    def fake(x, w_q, w_s, rank, lane):
+    def fake(x: torch.Tensor, w_q: torch.Tensor, *_) -> torch.Tensor:
         return x.new_empty((x.shape[0], w_q.shape[1]))
 
     op = sharded_jax_op(
