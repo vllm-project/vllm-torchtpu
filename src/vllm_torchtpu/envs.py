@@ -271,6 +271,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR: bool = False
     VLLM_TPU_QSA_DCP_GATE_IN_COMBINE: bool = False
     VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: bool = False
+    VLLM_TPU_QSA_DCP_SPLIT_LSE: bool = False
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1659,6 +1660,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layouts; the aligned layout's kernel rows are already 0 / -inf there
     # (bit-identical, drops an f32 [T, heads, D] select per call).
     "VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED": env_bool("VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED"),
+    # Main-KV DCP attention: route the partial output and its lse as two arrays
+    # instead of one [.., D + 1] channel (a padded f32 concat plus the slices
+    # that undo it at every 8K prefill step); same values.
+    "VLLM_TPU_QSA_DCP_SPLIT_LSE": env_bool("VLLM_TPU_QSA_DCP_SPLIT_LSE"),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for

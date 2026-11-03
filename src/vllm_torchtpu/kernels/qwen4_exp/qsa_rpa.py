@@ -604,6 +604,32 @@ def _split_lse_channel(output, lengths, cache):
     return out, lse, cache
 
 
+def _with_lse_pair(attend):
+    """``attend(..., return_lse=True)`` as ``((out, lse), cache)``: the
+    VLLM_TPU_QSA_DCP_SPLIT_LSE form of ``_with_lse_channel``. The routing moves
+    both arrays with the same row selects, without the [.., D + 1] channel
+    concat and the slices that undo it (same values)."""
+
+    def run(*args, **kwargs):
+        out, lse, cache = attend(*args, **kwargs)
+        return (out.astype(jnp.float32), lse), cache
+
+    return run
+
+
+def _split_lse_pair(output, lengths, cache):
+    out, lse = output
+    live = (lengths > 0)[:, None]
+    return jnp.where(live[..., None], out, 0), jnp.where(live, lse, -jnp.inf), cache
+
+
+def _rows_where(mask, a, b):
+    """``where(mask[row], a, b)`` over arrays or (out, lse) pairs."""
+    return jax.tree.map(
+        lambda x, y: jnp.where(mask.reshape(mask.shape + (1,) * (x.ndim - 1)), x, y), a, b
+    )
+
+
 def dcp_combine(out_pair, lse_pair, gate, rank, *, out_dtype=jnp.bfloat16):
     """Merge a DCP group's partial attention for this rank's heads, then gate.
 
@@ -699,15 +725,19 @@ def qsa_attention(
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
     if kv_head_offset:
         options["kv_head_offset"] = kv_head_offset
+    split = _split_lse_channel
     if dcp is not None:
         options.update(dcp=dcp, return_lse=True)
-        decode_fn = _with_lse_channel(decode_attention)
-        prefill_fn = _with_lse_channel(_prefill_attention)
+        if envs.VLLM_TPU_QSA_DCP_SPLIT_LSE:
+            wrap, split = _with_lse_pair, _split_lse_pair
+        else:
+            wrap = _with_lse_channel
+        decode_fn, prefill_fn = wrap(decode_attention), wrap(_prefill_attention)
     else:
         decode_fn, prefill_fn = decode_attention, _prefill_attention
     if len(query) <= (len(starts) - 1) * max_query_len:
         output, cache = decode_fn(query, gate, blocks, lengths, table, cache, **options)
-        return _split_lse_channel(output, lengths, cache) if dcp is not None else (output, cache)
+        return split(output, lengths, cache) if dcp is not None else (output, cache)
 
     # RPA rows: one per request row, times the tokens a verify request holds.
     capacity = min(len(query), (len(starts) - 1) * max_query_len)
@@ -748,13 +778,13 @@ def qsa_attention(
             jnp.maximum(starts - prefix, 0),
             **options,
         )
-        output = jnp.where(
-            (rows < prefix)[:, None, None],
-            _pad_rows(decoded, len(query)),
-            _shift_rows_down(prefilled, prefix, capacity),
+        output = _rows_where(
+            rows < prefix,
+            jax.tree.map(lambda x: _pad_rows(x, len(query)), decoded),
+            jax.tree.map(lambda x: _shift_rows_down(x, prefix, capacity), prefilled),
         )
         if dcp is not None:
-            return _split_lse_channel(output, lengths, cache)
+            return split(output, lengths, cache)
         return jnp.where((lengths > 0)[:, None, None], output, 0), cache
     ids = jnp.minimum(rows + prefix, len(query) - 1)
     prefill_lengths = jnp.where(rows < starts[-1] - prefix, lengths[ids], 0)
@@ -768,13 +798,13 @@ def qsa_attention(
         jnp.maximum(starts - prefix, 0),
         **options,
     )
-    output = jnp.where(
-        (rows < prefix)[:, None, None],
-        decoded[jnp.minimum(rows, capacity - 1)],
-        prefilled[jnp.maximum(rows - prefix, 0)],
+    output = _rows_where(
+        rows < prefix,
+        jax.tree.map(lambda x: x[jnp.minimum(rows, capacity - 1)], decoded),
+        jax.tree.map(lambda x: x[jnp.maximum(rows - prefix, 0)], prefilled),
     )
     if dcp is not None:
-        return _split_lse_channel(output, lengths, cache)
+        return split(output, lengths, cache)
     return jnp.where((lengths > 0)[:, None, None], output, 0), cache
 
 
