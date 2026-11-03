@@ -962,8 +962,21 @@ def block_sparse_gqa_attention(
         )
         back = jnp.minimum(slots, max_tokens - 1)
         if return_lse:
-            return output[0][back], output[1][back]
+            out, lse = output[0][back], output[1][back]
+            if mask_in_padding:
+                # Tokens past the step's rows read the last aligned row, which
+                # can be a real one: mask them here, fused with the gather.
+                out = jnp.where(live[:, None, None], out, 0)
+                lse = jnp.where(live[:, None], lse, -jnp.inf)
+            return out, lse
         return output[back]
+
+    live = lengths > 0
+    # VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: only the padded layouts mask
+    # dead rows. In the aligned layout a row with length 0 sees no key, so the
+    # kernel already gives it out 0 and lse -inf (bit-identical, one f32
+    # [T, heads, D] select less per call).
+    mask_in_padding = return_lse and envs.VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED
 
     # All lax.switch branches are traced. A statically unaligned total cannot
     # enter run_aligned, whose core rejects its shape before execution.
@@ -975,9 +988,11 @@ def block_sparse_gqa_attention(
     output = (
         branches[0](None) if len(branches) == 1 else lax.switch(route, branches, None)
     )
+    if mask_in_padding:
+        out, lse = output
+        return out, lse, cache
     if return_lse:
         out, lse = output
-        live = lengths > 0
         return (
             jnp.where(live[:, None, None], out, 0),
             jnp.where(live[:, None], lse, -jnp.inf),
