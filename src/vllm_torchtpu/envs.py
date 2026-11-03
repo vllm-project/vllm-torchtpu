@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
+    VLLM_TPU_HC_PREFILL_INJECT: bool = False
     VLLM_TPU_QSA_FUSED_DCP_BLOCKS: bool = False
     VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
     VLLM_TPU_QSA_DCP_Q_GATHER: bool = False
@@ -819,6 +820,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_HC_PREFILL_WIDE_TILE": env_nonnegative_int(
         "VLLM_TPU_HC_PREFILL_WIDE_TILE", 0
     ),
+    # Prefill HC full mix: project the normalized input onto the combine's gate
+    # weight in the kernel and return that [T, hc] projection instead of writing
+    # the normalized [T, hc * H] input for an XLA projection to read back.
+    "VLLM_TPU_HC_PREFILL_INJECT": env_bool("VLLM_TPU_HC_PREFILL_INJECT"),
     # With VLLM_TPU_QSA_COMPRESSED_DCP: merge a pair's local top-k lists into the
     # global selection with one TensorCore Pallas kernel (radix select, tie
     # cut, bitonic sort) instead of the SparseCore top-k + keep mask + sort
