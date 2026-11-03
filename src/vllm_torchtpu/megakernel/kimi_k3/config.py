@@ -113,6 +113,9 @@ class KernelConfig:
     # step, 2 also polls the reduce ring once per step (0: one tile per step).
     # EP8 only.
     prefill_moe_pair_tiles: int = 0
+    # With pair tiles: poll the reduce ring every this many tiles (0: per
+    # pair_tiles).
+    prefill_moe_poll_every: int = 0
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.

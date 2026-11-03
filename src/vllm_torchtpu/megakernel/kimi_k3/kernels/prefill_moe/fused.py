@@ -1007,6 +1007,8 @@ def _routed_experts(
     # Remaining down columns: 1 two tiles per step, 2 also one ring poll per
     # step. EP8 only: EP16's doubled 8K blocks exceed VMEM.
     pair_tiles = k._config().prefill_moe_pair_tiles if experts == EP8 else 0
+    # With paired tiles: poll the reduce ring at tiles g % poll_every == 0.
+    poll_every = k._config().prefill_moe_poll_every if pair_tiles else 0
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
@@ -1257,12 +1259,17 @@ def _routed_experts(
                 def clear():
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
 
-            if not first and poll:
+            def ring_poll():
                 with _scope("ring_poll"):
                     advance(
                         jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem,
-                        poll_round=g // 2 if pair_tiles == 2 else g,
+                        poll_round=g // (poll_every or (2 if pair_tiles == 2 else 1)),
                     )
+
+            if not first and poll is True:
+                ring_poll()
+            elif not first and poll is not False:
+                pl.when(poll)(ring_poll)
             current = packed.at[g % 2]
             previous = packed.at[(g + 1) % 2]
             previous_g = jnp.maximum(g - 1, 0)
@@ -1549,13 +1556,20 @@ def _routed_experts(
 
             def remaining_pair(xa, xb, wa, wb, metadata):
                 h = pl.program_id(1)
-                inner(xa, wa, metadata, subtotal_vmem=subtotal_vmem, tile=2 * h)
+
+                def polled(tile, default):
+                    return tile % poll_every == 0 if poll_every else default
+
+                inner(
+                    xa, wa, metadata, subtotal_vmem=subtotal_vmem, tile=2 * h,
+                    poll=polled(2 * h, True),
+                )
 
                 @pl.when(2 * h + 1 < ng)
                 def second():
                     inner(
                         xb, wb, metadata, subtotal_vmem=subtotal_vmem,
-                        tile=2 * h + 1, poll=pair_tiles == 1,
+                        tile=2 * h + 1, poll=polled(2 * h + 1, pair_tiles == 1),
                     )
 
             rows = middle.reshape(-1, sub, mid)

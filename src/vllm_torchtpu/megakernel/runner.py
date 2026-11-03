@@ -140,6 +140,8 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
                 prefill_fused_moe_ep8=aggregate,
                 # Every 8K window's routes on the fused path (no unfused overflow).
                 prefill_moe_capacity_ep8=65536 if aggregate else 32768,
+                # Two expert tiles and one reduce-ring poll per down-column step.
+                prefill_moe_pair_tiles=2 if aggregate else 0,
             )
         )
     # The prefill computes the rings of its loader config's draft; the
