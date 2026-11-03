@@ -331,7 +331,7 @@ def test_arming_moves_shared_expert_scale_and_all_reduce_into_the_op(harness):
     assert torch.equal(sibling(hidden_states=x, router_logits=x), sibling_before)
     assert sibling_shared.calls == calls + 1 and harness.all_reduces == 2
     assert "armed 2/3 target and 1/1 drafter" in harness.logs[-1]
-    assert "kernel token counts [16, 32, 64]" in harness.logs[-1]
+    assert "kernel token counts [16, 32, 64, 80, 96]" in harness.logs[-1]
     assert "routing is not sigmoid" in harness.logs[-1]
 
 
@@ -468,7 +468,7 @@ def test_arms_an_expert_range_on_ep_by_tp_weights(harness, ep_size, tp_size, ep_
     assert harness.statics[0].use_ep
     assert layer._moe_tp_decode_e0.tolist() == [[ep_rank * E]]
     assert layer._moe_tp_decode_e0.dtype == torch.int32
-    assert "kernel token counts [16, 32, 64]" in harness.logs[-1]
+    assert "kernel token counts [16, 32, 64, 80, 96]" in harness.logs[-1]
 
     x = _x()
     out = runner(hidden_states=x, router_logits=x)
