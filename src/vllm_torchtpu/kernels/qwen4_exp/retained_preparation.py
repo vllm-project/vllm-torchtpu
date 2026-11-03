@@ -32,12 +32,7 @@ def use_retained_preparation(
     niq: jax.Array,
     multiplier: jax.Array | None,
     trig: jax.Array,
-    context: jax.Array,
-    table: jax.Array,
-    pool: jax.Array,
     *,
-    ratio: int,
-    topk: int,
     rotary_dim: int,
 ) -> bool:
     if (
@@ -53,13 +48,10 @@ def use_retained_preparation(
         or any(
             x.dtype != jnp.bfloat16 for x in (qgate, key, index_qk, nq, nk, niq, trig)
         )
-        or trig.shape != (67584, 128)
-        or context.shape != (32,)
-        or table.shape != (32, 41)
-        or pool.ndim != 5
-        or pool.shape[1:] != (1664, 1, 4, 256)
-        or pool.dtype != jnp.float8_e4m3fn
-        or (ratio, topk, rotary_dim) != (4, 2048, 64)
+        or trig.ndim != 2
+        or trig.shape[0] == 0
+        or trig.shape[1] != 128
+        or rotary_dim != 64
     ):
         return False
     hardware = _hardware()
@@ -90,15 +82,3 @@ def produce_prepared(
     angles = jax.lax.optimization_barrier(trig[positions])
     iq = prepare_index_query(index_qk, niq, angles, norm_eps)
     return q, key, value, qgate[..., width:], iq, index_qk[:, -niq.shape[0] :]
-
-
-def planning_query(query: jax.Array, prepared: bool) -> jax.Array:
-    """Use BF16 static eligibility without admitting arbitrary FP32 queries.
-
-    Only produce_prepared may set this internal flag: its FP32 container holds
-    exactly representable BF16 values and the pre-existing reader layout.
-    """
-    if prepared:
-        assert query.shape == (16, 24, 256) and query.dtype == jnp.float32
-        return query.astype(jnp.bfloat16)
-    return query

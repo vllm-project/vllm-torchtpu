@@ -13,7 +13,20 @@
 # limitations under the License.
 """Convert queries into the existing RPA input layout."""
 
+import jax
 import jax.numpy as jnp
+
+
+def planning_query(query: jax.Array, prepared: bool) -> jax.Array:
+    """Plan BF16-valued queries held in an FP32 reader layout.
+
+    Prepared producers guarantee exactly representable BF16 values. Arbitrary
+    FP32 input retains its dtype and is rejected by the existing planner.
+    """
+    if prepared:
+        assert query.ndim == 3 and query.dtype == jnp.float32
+        return query.astype(jnp.bfloat16)
+    return query
 
 
 def prepare_query(q, lengths, kv_heads):

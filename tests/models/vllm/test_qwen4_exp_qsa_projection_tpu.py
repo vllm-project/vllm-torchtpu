@@ -21,8 +21,14 @@ from qwen4_exp_test_utils import q4exp_text_config, qsa_test_pools
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "max_model_len,requests,pool_block_size",
+    [(67584, 32, 128), (3328, 16, 128), (3328, 16, 3328)],
+)
 @torch.inference_mode()
-def test_projected_decode_preserves_indices_and_cache(tmp_path):
+def test_projected_decode_preserves_indices_and_cache(
+    tmp_path, max_model_len, requests, pool_block_size
+):
     from torch_tpu._internal.compile._backend import TpuBackend
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
@@ -55,7 +61,7 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
                 tp_size=1,
                 # Exercise completed-group RoPE DMA together with the
                 # prefetched output projection at the serving table size.
-                max_model_len=67584,
+                max_model_len=max_model_len,
                 cache_dtype="fp8_e4m3",
                 device="cpu",
             )
@@ -71,17 +77,23 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
             ):
                 weights[name] = value
             layer.load_weights(weights.items())
-            layer.finalize_weights()
-            assert layer.output_weight_tiles.shape == (5, 6144, 512)
-            storage = layer.output_weight_tiles.data_ptr()
-            layer.finalize_weights()
-            assert layer.output_weight_tiles.data_ptr() == storage
-            torch.testing.assert_close(
-                layer.output_weight_tiles.permute(1, 0, 2).reshape(6144, 2560),
-                layer.o_proj.weight,
-                rtol=0,
-                atol=0,
-            )
+            initial, layout = qsa_test_pools(layer, 20, block_size=pool_block_size)
+            layer.finalize_weights(block_size=initial[0].shape[1])
+            prefetch = layout.block_size == 1664
+            if prefetch:
+                assert layer.output_weight_tiles.shape == (5, 6144, 512)
+                storage = layer.output_weight_tiles.data_ptr()
+                layer.finalize_weights(block_size=layout.block_size)
+                assert layer.output_weight_tiles.data_ptr() == storage
+                torch.testing.assert_close(
+                    layer.output_weight_tiles.permute(1, 0, 2).reshape(6144, 2560),
+                    layer.o_proj.weight,
+                    rtol=0,
+                    atol=0,
+                )
+            else:
+                assert layer.output_weight_tiles is None
+                assert layer._projected_op is None
             layer.load_weights(
                 [("_k_scale", torch.tensor(0.375)), ("_v_scale", torch.tensor(2.5))]
             )
@@ -95,8 +107,7 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
                 if isinstance(linear, LinearBase):
                     linear.quant_method = VllmUnquantizedLinearMethod()
                     linear.quant_method.process_weights_after_loading(linear)
-            initial, _ = qsa_test_pools(layer, 20)
-            assert initial[0].shape[1] == 1664
+            columns = (max_model_len + initial[0].shape[1] - 1) // initial[0].shape[1]
             base_owners = [x.to("tpu") for x in initial]
             fused_owners = [x.to("tpu") for x in initial]
             layer.to("tpu")
@@ -133,8 +144,22 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
             base = torch.compile(
                 baseline, backend=TpuBackend(), fullgraph=True, dynamic=False
             )
+
+            def routed_forward(hidden, positions, metadata, residual, gate):
+                if layer.can_prefetch_output(hidden):
+                    return layer.forward_with_indices(
+                        hidden,
+                        positions,
+                        metadata,
+                        residual,
+                        gate,
+                        hc_token_tile=128,
+                        hc_min_tokens=1024,
+                    )
+                return baseline(hidden, positions, metadata, residual, gate)
+
             fused = torch.compile(
-                layer.forward_with_indices,
+                routed_forward,
                 backend=TpuBackend(),
                 fullgraph=True,
                 dynamic=False,
@@ -157,7 +182,7 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
                 synchronize_tensors([actual])
                 torch.testing.assert_close(
                     actual.cpu(),
-                    torch.ones((rows, 2560), dtype=torch.bfloat16),
+                    torch.full((rows, 2560), int(prefetch), dtype=torch.bfloat16),
                     rtol=0,
                     atol=0,
                 )
@@ -188,15 +213,15 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
                     [
                         0,
                         *torch.tensor(query_lengths).cumsum(0).tolist(),
-                        *([valid_rows] * (32 - live)),
+                        *([valid_rows] * (requests - live)),
                     ],
                     dtype=torch.int32,
                 )
-                lengths = torch.zeros(32, dtype=torch.int32)
+                lengths = torch.zeros(requests, dtype=torch.int32)
                 lengths[:live] = context
-                slots = torch.arange(32, dtype=torch.int32)
+                slots = torch.arange(requests, dtype=torch.int32)
                 slots[live:] = -1
-                pages = torch.zeros((32, 41), dtype=torch.int32)
+                pages = torch.zeros((requests, columns), dtype=torch.int32)
                 pages[:live, 0] = torch.arange(1, live + 1)
                 starts, lengths, slots, pages = [
                     x.to("tpu") for x in (starts, lengths, slots, pages)
@@ -238,15 +263,13 @@ def test_projected_decode_preserves_indices_and_cache(tmp_path):
                         hidden, positions, metadata, residual, gate
                     )
                     layer.bind_pool(*fused_owners)
-                    assert layer.can_prefetch_output(hidden)
+                    assert layer.can_prefetch_output(hidden) == prefetch
                     actual, actual_ids = fused(
                         hidden,
                         positions,
                         metadata,
                         residual,
                         gate,
-                        hc_token_tile=128,
-                        hc_min_tokens=1024,
                     )
                 synchronize_tensors(
                     [

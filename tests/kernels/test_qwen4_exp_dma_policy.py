@@ -313,15 +313,12 @@ def test_query_prepare_guard_keeps_untested_shapes_on_fallback(
 
 
 @pytest.mark.parametrize(
-    "slots,ratio,rotary,expected",
-    [(32, 4, 64, True), (16, 4, 64, False), (32, 8, 64, False), (32, 4, 128, False)],
+    "count,ratio,rotary,expected",
+    [(16, 4, 64, True), (8, 4, 64, False), (16, 8, 64, False), (16, 4, 128, False)],
 )
-def test_compressed_preparation_only_admits_measured_state_geometry(
-    slots, ratio, rotary, expected
+def test_compressed_preparation_only_admits_measured_compute_geometry(
+    count, ratio, rotary, expected
 ):
-    raw = jax.ShapeDtypeStruct((16, 128), jnp.bfloat16)
-    context = jax.ShapeDtypeStruct((slots,), jnp.int32)
+    raw = jax.ShapeDtypeStruct((count, 128), jnp.bfloat16)
     trig = jax.ShapeDtypeStruct((67584, 128), jnp.bfloat16)
-    assert (
-        policy.use_compressed_preparation(raw, context, trig, ratio, rotary) == expected
-    )
+    assert policy.use_compressed_preparation(raw, trig, ratio, rotary) == expected

@@ -13,6 +13,8 @@
 # limitations under the License.
 """Early QSA geometry checks and canonical checkpoint scale buffers."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from qwen4_exp_test_utils import q4exp_text_config as attention_config
@@ -221,6 +223,80 @@ def test_checkpoint_weights_finalize_and_reject_bad_payloads():
             else weights[name]
         )
         torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "cache_dtype,budget,tp,block_size,allocate",
+    [
+        ("auto", 2048, 1, 1664, False),
+        ("bfloat16", 2048, 1, 1664, False),
+        ("fp8", 2048, 1, 1664, True),
+        ("fp8", 2048, 1, 3328, False),
+        ("fp8", 2048, 1, 128, False),
+        ("fp8", 2048, 1, None, False),
+        ("fp8_e4m3", 1024, 1, 1664, False),
+        ("fp8", 2048, 2, 1664, False),
+    ],
+)
+@torch.inference_mode()
+def test_output_weight_storage_only_for_supported_cache_and_projection(
+    cache_dtype, budget, tp, block_size, allocate
+):
+    from vllm.config import CacheConfig
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+
+    text = attention_config(
+        indexer_budget=budget,
+        num_hidden_layers=1,
+        layer_types=["indexed_attention"],
+        ple_layer_ids=[],
+    )
+    if block_size is not None:
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=text, dtype=torch.bfloat16, max_model_len=128
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+            cache_config=CacheConfig(block_size=block_size, cache_dtype=cache_dtype),
+        )
+        layout, _ = pooled_cache_specs(cfg)
+        assert layout.block_size == block_size
+    layer = Qwen4ExpQSA(
+        config=text,
+        tp_rank=0,
+        tp_size=tp,
+        max_model_len=128,
+        cache_dtype=cache_dtype,
+        device="cpu",
+    )
+    width = layer.hidden_size
+    heads = layer.total_num_heads * layer.head_dim
+    weights = {
+        "q_proj.weight": torch.zeros(2 * heads, width, dtype=torch.bfloat16),
+        "k_proj.weight": torch.zeros(512, width, dtype=torch.bfloat16),
+        "v_proj.weight": torch.zeros(512, width, dtype=torch.bfloat16),
+        "indexer.index_qk_proj.weight": torch.zeros(640, width, dtype=torch.bfloat16),
+        "o_proj.weight": torch.zeros(width, heads, dtype=torch.bfloat16),
+        "q_norm.weight": torch.zeros(256, dtype=torch.bfloat16),
+        "k_norm.weight": torch.zeros(256, dtype=torch.bfloat16),
+        "indexer.q_layernorm.weight": torch.zeros(128, dtype=torch.bfloat16),
+        "indexer.k_layernorm.weight": torch.zeros(128, dtype=torch.bfloat16),
+    }
+    layer.load_weights(weights.items())
+    layer.finalize_weights(block_size=block_size)
+    if allocate:
+        tiles = layer.output_weight_tiles
+        assert tiles is not None and tiles.numel() * tiles.element_size() == 30 * 2**20
+        assert tiles.data_ptr() != layer.o_proj.weight.data_ptr()
+        layer.finalize_weights(block_size=block_size)
+        assert layer.output_weight_tiles.data_ptr() == tiles.data_ptr()
+        layer.finalize_weights(block_size=3328)
+        assert layer.output_weight_tiles is None
+        assert layer._projected_op is None
+    else:
+        assert layer.output_weight_tiles is None
+        assert layer._projected_op is None
 
 
 @pytest.mark.parametrize("name", ["kv_scale", "attn.kv_scale"])

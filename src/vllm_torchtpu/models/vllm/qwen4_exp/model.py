@@ -56,6 +56,7 @@ from .pd_identity import LoadedWeightIdentity
 from .ple import PLEInputs
 from .ple_geometry import ple_state_shape
 from .ple_host import shared_ple_options
+from .pool_layout import pooled_cache_specs
 from .pooled_ple import Qwen4ExpPooledPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
 
@@ -318,6 +319,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()
+        self.vllm_config = vllm_config
         self._pd_weight_identity_enabled = vllm_config.kv_transfer_config is not None
         self.pd_loaded_weight_identity: str | None = None
         self.pd_loaded_ple_identity: str | None = None
@@ -413,6 +415,13 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             }
         )
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.model.layers)
+        # Resolve the allocator's layout during weight loading, before
+        # KV-cache HBM budgeting.
+        layout = (
+            pooled_cache_specs(self.vllm_config)[0]
+            if any(layer.layer_type == "indexed_attention" for layer in layers)
+            else None
+        )
         moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in layers]
         # Exactly the Qwen3.5 checkpoint projection mapping. HC remains
         # separate checkpoint-native parameters (no NVIDIA packed-HC mapper).
@@ -546,7 +555,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             if layer.ple is not None:
                 layer.ple.finalize_weights()
             if layer.layer_type == "indexed_attention":
-                layer.self_attn.finalize_weights()
+                assert layout is not None
+                layer.self_attn.finalize_weights(block_size=layout.block_size)
             else:
                 base = f"model.layers.{i}.linear_attn."
                 if {base + n for n in gdn_map} - source:

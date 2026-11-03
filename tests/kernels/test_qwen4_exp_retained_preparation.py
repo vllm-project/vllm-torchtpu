@@ -17,12 +17,16 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import pytest
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp import retained_preparation as prep
 
 
-def test_retained_preparation_is_limited_to_validated_envelope(monkeypatch):
+@pytest.mark.parametrize("rope_rows", [128, 65536, 67584])
+def test_preparation_depends_on_compute_layout_not_serving_capacity(
+    monkeypatch, rope_rows
+):
     arr = jax.ShapeDtypeStruct
     args = [
         arr((16, 12288), jnp.bfloat16),
@@ -32,12 +36,9 @@ def test_retained_preparation_is_limited_to_validated_envelope(monkeypatch):
         arr((256,), jnp.bfloat16),
         arr((128,), jnp.bfloat16),
         arr((256,), jnp.float32),
-        arr((67584, 128), jnp.bfloat16),
-        arr((32,), jnp.int32),
-        arr((32, 41), jnp.int32),
-        arr((20, 1664, 1, 4, 256), jnp.float8_e4m3fn),
+        arr((rope_rows, 128), jnp.bfloat16),
     ]
-    options = dict(ratio=4, topk=2048, rotary_dim=64)
+    options = dict(rotary_dim=64)
     monkeypatch.setattr(
         prep,
         "_hardware",
@@ -48,12 +49,86 @@ def test_retained_preparation_is_limited_to_validated_envelope(monkeypatch):
         (0, arr((32, 12288), jnp.bfloat16)),
         (6, None),
         (6, arr((256,), jnp.bfloat16)),
-        (8, arr((16,), jnp.int32)),
-        (9, arr((32, 2), jnp.int32)),
-        (10, arr((20, 1664, 1, 4, 256), jnp.bfloat16)),
+        (7, arr((0, 128), jnp.bfloat16)),
+        (7, arr((rope_rows, 64), jnp.bfloat16)),
     ]:
         changed = args.copy()
         changed[index] = value
         assert not prep.use_retained_preparation(*changed, **options)
     monkeypatch.setattr(prep, "_hardware", lambda: None)
     assert not prep.use_retained_preparation(*args, **options)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("rope_rows", [128, 65536])
+def test_prepared_producer_matches_original_values_for_other_rope_capacities(rope_rows):
+    import torch
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.kernels.qwen4_exp.qsa import produce
+
+    def build(prepared):
+        def core(
+            q: jax.Array,
+            k: jax.Array,
+            v: jax.Array,
+            iqk: jax.Array,
+            nq: jax.Array,
+            nk: jax.Array,
+            niq: jax.Array,
+            positions: jax.Array,
+            trig: jax.Array,
+        ) -> tuple[jax.Array, ...]:
+            if prepared:
+                return prep.produce_prepared(
+                    q,
+                    k,
+                    v,
+                    iqk,
+                    nq,
+                    1 + nk.astype(jnp.float32),
+                    niq,
+                    positions,
+                    trig,
+                    1e-6,
+                    64,
+                )
+            return produce(q, k, v, iqk, nq, nk, niq, positions, trig, 1e-6, 64)
+
+        op = pallas.jax_op(f"qsa_prepare_test::producer_{rope_rows}_{prepared}", core)
+
+        @op.register_fake
+        def fake(q, k, v, iqk, nq, nk, niq, positions, trig):
+            shapes = [
+                (16, 24, 256),
+                (16, 2, 256),
+                (16, 2, 256),
+                (16, 24, 256),
+                (16, 4, 128),
+                (16, 128),
+            ]
+            return tuple(
+                torch.empty(
+                    s,
+                    device=q.device,
+                    dtype=torch.float32 if prepared and i == 0 else q.dtype,
+                )
+                for i, s in enumerate(shapes)
+            )
+
+        return torch.compile(op, backend="tpu", fullgraph=True, dynamic=False)
+
+    generator = torch.Generator().manual_seed(9451)
+    inputs = [
+        torch.randn(s, generator=generator).bfloat16().to("tpu")
+        for s in [(16, 12288), (16, 512), (16, 512), (16, 640), (256,), (256,), (128,)]
+    ]
+    positions = torch.linspace(0, rope_rows - 1, 16).int().to("tpu")
+    trig = torch.randn((rope_rows, 128), generator=generator).bfloat16().to("tpu")
+    inputs += [positions, trig]
+    with torch.inference_mode():
+        expected, actual = [build(p)(*inputs) for p in (False, True)]
+        for ref, got in zip(expected, actual):
+            torch.testing.assert_close(
+                got.cpu().float(), ref.cpu().float(), rtol=0, atol=0
+            )

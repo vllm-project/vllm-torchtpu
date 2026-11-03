@@ -429,7 +429,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             self.k_norm_multiplier = 1.0 + self.k_norm.weight.detach().float()
         return result
 
-    def finalize_weights(self):
+    def finalize_weights(self, *, block_size: int | None = None):
         expected = set(dict(self.named_parameters())) - {"input_proj.weight"}
         expected.update(_INPUT_PROJECTION_NAMES)
         missing = expected - self._loaded
@@ -446,8 +446,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
 
         weight = self.o_proj.weight
         tile = (
-            output_projection_tile(tuple(weight.shape)) if self.tp_size == 1 else None
+            output_projection_tile(tuple(weight.shape))
+            if self._supports_projected_output(block_size)
+            else None
         )
+        if tile is None:
+            self.output_weight_tiles = None
+            self._projected_op = None
         if tile is not None and self.output_weight_tiles is None:
             self.output_weight_tiles = (
                 weight.detach()
@@ -469,22 +474,33 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 rotary_dim=int(self.head_dim * self.config.partial_rotary_factor),
             )
 
+    def _supports_projected_output(self, block_size: int | None) -> bool:
+        from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import (
+            supports_output_projection_layout,
+        )
+
+        return (
+            self.tp_size == 1
+            and self.fp8_kv
+            and supports_output_projection_layout(
+                (self.num_heads, self.head_dim),
+                kv_heads=self.num_kv_heads,
+                ratio=self.compress_ratio,
+                groups=self.token_topk // self.compress_ratio,
+                page_size=block_size,
+            )
+        )
+
     def can_prefetch_output(self, hidden: torch.Tensor) -> bool:
         """Use a stable Torch ABI; select the measured shape inside JAX."""
         return (
-            self.output_weight_tiles is not None
+            len(self.cache_owners) == 2
+            and self._supports_projected_output(self.cache_owners[0].shape[1])
+            and self.output_weight_tiles is not None
             and hidden.device.type == "tpu"
             and hidden.ndim == 2
             and hidden.shape[1] == self.hidden_size
             and hidden.dtype == torch.bfloat16
-            and self.fp8_kv
-            and self.num_heads == 24
-            and self.head_dim == 256
-            and self.num_kv_heads == 2
-            and self.compress_ratio == 4
-            and self.token_topk == 2048
-            and len(self.cache_owners) == 2
-            and self.cache_owners[0].shape[1] == 1664
         )
 
     def forward_with_indices(

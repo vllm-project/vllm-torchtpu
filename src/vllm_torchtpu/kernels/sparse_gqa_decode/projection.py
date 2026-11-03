@@ -27,6 +27,9 @@ from vllm_torchtpu.kernels.sparse_gqa_decode.metadata import virtual_page_metada
 from vllm_torchtpu.kernels.sparse_gqa_decode.projection_kernel import (
     decode_projected_kernel,
 )
+from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import (
+    supports_output_projection_layout,
+)
 
 
 def projected_attention(
@@ -53,7 +56,7 @@ def projected_attention(
     prepared_cu: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Return projected HC output and donated cache, retaining a generic fallback."""
-    from vllm_torchtpu.kernels.qwen4_exp.retained_preparation import planning_query
+    from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import planning_query
 
     launch = plan_decode(
         planning_query(query, query_prepared),
@@ -68,11 +71,15 @@ def projected_attention(
         v_scale=v_scale,
     )
     supported = (
-        query.shape == (16, 24, 256)
-        and kv_heads == 2
-        and ratio == 4
-        and blocks.shape == (16, 512)
-        and cache.shape[1] == 1664
+        query.shape[0] == 16
+        and blocks.shape[0] == len(query)
+        and supports_output_projection_layout(
+            query.shape[1:],
+            kv_heads=kv_heads,
+            ratio=ratio,
+            groups=blocks.shape[1],
+            page_size=cache.shape[1],
+        )
         and cache.dtype == jnp.float8_e4m3fn
         and weight.shape == (5, 6144, 512)
         and residual.shape == (16, 10240)
@@ -140,15 +147,9 @@ def projected_attention(
             # pyrefly: ignore[bad-argument-type]
             serve=dataclasses.replace(cfgs.serve, scale_k=k_scale, scale_v=v_scale),
         )
-        from vllm_torchtpu.kernels.qwen4_exp.preparation_candidates import (
-            virtual_pages_unpadded,
-        )
         from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import prepare_query
 
-        page_prepare = (
-            virtual_pages_unpadded if query_prepared else virtual_page_metadata
-        )
-        pages, kv_lens = page_prepare(
+        pages, kv_lens = virtual_page_metadata(
             blocks, lengths, table, ratio=ratio, page_size=cache.shape[1]
         )
         if query_prepared:

@@ -178,8 +178,7 @@ def rpa_attention(
 ):
     from vllm_torchtpu.kernels.sparse_gqa_decode import plan_decode
     from vllm_torchtpu.kernels.sparse_gqa_decode.decode import execute_decode
-
-    from .retained_preparation import planning_query
+    from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import planning_query
 
     launch = plan_decode(
         planning_query(query, query_prepared),
@@ -204,7 +203,6 @@ def rpa_attention(
             launch=launch,
             active_tokens=active_tokens,
             initial_output=initial_output,
-            query_prepared=query_prepared,
             prepared_cu=prepared_cu,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -331,7 +329,7 @@ def qsa_attention(
     prepared_cu=None,
 ):
     """Use Runner order: decode/verify prefix, then prefill in original rows."""
-    from .retained_preparation import planning_query
+    from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import planning_query
 
     tokens = len(query)
     if tokens == 0:

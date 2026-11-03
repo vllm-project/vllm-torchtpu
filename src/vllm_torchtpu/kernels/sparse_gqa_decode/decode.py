@@ -40,18 +40,12 @@ def _attend(
     launch,
     k_scale,
     v_scale,
-    query_prepared=False,
     prepared_cu=None,
 ):
     batch, heads, dim = q.shape
     cfgs = launch.config_for_batch(batch)
     kv_heads, ratio = cfgs.model.num_kv_heads, cfgs.serve.page_size
-    from vllm_torchtpu.kernels.qwen4_exp.preparation_candidates import (
-        virtual_pages_unpadded,
-    )
-
-    page_prepare = virtual_pages_unpadded if query_prepared else virtual_page_metadata
-    pages, kv_lens = page_prepare(
+    pages, kv_lens = virtual_page_metadata(
         blocks, lengths, table, ratio=ratio, page_size=cache.shape[1]
     )
     cfgs = dataclasses.replace(
@@ -100,17 +94,16 @@ def execute_decode(
     initial_output: jax.Array | None = None,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
-    query_prepared: bool = False,
     prepared_cu: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    if query_prepared:
-        assert len(q) == 16 and launch.chunk_queries >= len(q)
+    if launch.chunk_queries < len(q):
+        # Every chunk addresses its local query rows from zero.
+        prepared_cu = None
     attend = functools.partial(
         _attend,
         launch=launch,
         k_scale=k_scale,
         v_scale=v_scale,
-        query_prepared=query_prepared,
         prepared_cu=prepared_cu,
     )
     return attend_in_chunks(

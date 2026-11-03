@@ -123,7 +123,7 @@ def q4exp_text_config(**overrides):
     return SimpleNamespace(**values)
 
 
-def qsa_test_pools(model, pages):
+def qsa_test_pools(model, pages, *, block_size=128):
     """Actual dual-store shapes from the configured native pool plan."""
     import math
 
@@ -138,7 +138,7 @@ def qsa_test_pools(model, pages):
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=model.tp_size),
         cache_config=CacheConfig(
-            block_size=128,
+            block_size=block_size,
             cache_dtype=model.cache_dtype,
             enable_prefix_caching=False,
             mamba_cache_mode="none",

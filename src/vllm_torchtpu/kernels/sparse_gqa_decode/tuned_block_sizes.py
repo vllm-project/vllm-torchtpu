@@ -77,18 +77,61 @@ def default_policy_for(
     return _FP8_POLICIES.get(key, DEFAULT_POLICY)
 
 
-_PAGE_METADATA_SHAPES = {((16, 512), (16, 41), 4, 1664)}
-
-
 def use_fused_page_metadata(blocks, lengths, table, ratio, page_size):
-    """Admit the measured compact page table and decode token bucket."""
+    """Bound a resident integer page gather by the native vector/VMEM layout."""
+    # JAX drops singleton batch dimensions from take_along_axis indices;
+    # Mosaic's gather lowering requires them to match the output dimensions.
     if (
-        (blocks.shape, table.shape, ratio, page_size) not in _PAGE_METADATA_SHAPES
+        blocks.ndim != 2
+        or min(blocks.shape) <= 0
+        or blocks.shape[0] == 1
+        or table.ndim != 2
+        or table.shape[0] != blocks.shape[0]
+        or table.shape[1] <= 0
         or lengths.shape != (blocks.shape[0],)
         or any(x.dtype != jnp.int32 for x in (blocks, lengths, table))
+        or ratio <= 0
+        or page_size <= 0
+        or page_size % ratio
     ):
         return False
-    return pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
+    # TorchTPU traces under an abstract TPU mesh with a CPU JAX host backend.
+    device = jax.sharding.get_abstract_mesh().abstract_device
+    if (device is None and jax.default_backend() != "tpu") or (
+        device is not None and device.platform != "tpu"
+    ):
+        return False
+    info = pltpu.get_tpu_info()
+    if info.chip_version != pltpu.ChipVersion.TPU_7X or table.shape[1] > info.num_lanes:
+        return False
+    from .planning import VMEM_USABLE_FRACTION
+
+    sublanes = info.get_sublane_tiling(jnp.int32)
+    rows = (blocks.shape[0] + sublanes - 1) // sublanes * sublanes
+    columns = (blocks.shape[1] + info.num_lanes) // info.num_lanes * info.num_lanes
+    # Bound inputs, output, selected groups, logical/physical gathers and masks.
+    vector_bytes = (
+        rows * (8 * columns + info.num_lanes + 1) * jnp.dtype(jnp.int32).itemsize
+    )
+    return vector_bytes <= info.vmem_capacity_bytes * VMEM_USABLE_FRACTION
+
+
+def supports_output_projection_layout(
+    head_shape: tuple[int, ...],
+    *,
+    kv_heads: int,
+    ratio: int,
+    groups: int,
+    page_size: int | None,
+) -> bool:
+    """Static layout shared by weight preparation and projected decode."""
+    return (head_shape, kv_heads, ratio, groups, page_size) == (
+        (24, 256),
+        2,
+        4,
+        512,
+        1664,
+    )
 
 
 # Match the compiled BF16 output-projection reduction used by the decode

@@ -400,15 +400,15 @@ def use_query_prepare(qgate, norm, trig, rotary_dim):
     return hw is not None and hw.chip_version == pltpu.ChipVersion.TPU_7X
 
 
-_COMPRESSED_PREPARATION_SHAPES = {((16, 128), (32,), 4, 64)}
+_COMPRESSED_PREPARATION_SHAPES = {((16, 128), 4, 64)}
+COMPLETED_ROPE_DMA_ROWS = 8
 
 
-def use_compressed_preparation(raw, context, trig, ratio, rotary_dim):
+def use_compressed_preparation(raw, trig, ratio, rotary_dim):
     """Further preparation fusion only for measured state-fusion geometry."""
     return (
-        (raw.shape, context.shape, ratio, rotary_dim) in _COMPRESSED_PREPARATION_SHAPES
+        (raw.shape, ratio, rotary_dim) in _COMPRESSED_PREPARATION_SHAPES
         and raw.dtype == jnp.bfloat16
-        and context.dtype == jnp.int32
         and trig.ndim == 2
         and trig.shape[1] == 128
         and trig.dtype == jnp.bfloat16
@@ -417,7 +417,10 @@ def use_compressed_preparation(raw, context, trig, ratio, rotary_dim):
 
 def use_completed_rope_dma(trig: jax.Array, positions: jax.Array) -> bool:
     if (
-        trig.shape != (67584, 128)
+        trig.ndim != 2
+        or trig.shape[0] <= 0
+        or trig.shape[0] % COMPLETED_ROPE_DMA_ROWS
+        or trig.shape[1] != 128
         or positions.shape != (16,)
         or trig.dtype != jnp.bfloat16
         or positions.dtype != jnp.int32

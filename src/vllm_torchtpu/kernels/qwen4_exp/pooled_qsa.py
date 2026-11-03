@@ -671,11 +671,6 @@ def compact_pooled_qsa_step(
         niq,
         k_norm_multiplier,
         trig,
-        context,
-        main_table,
-        main_pool,
-        ratio=compress_ratio,
-        topk=token_topk,
         rotary_dim=rotary_dim,
     )
     if prepared:
@@ -736,9 +731,7 @@ def compact_pooled_qsa_step(
     pending_state = None
     trig_rows = None
     compressed_positions = None
-    defer_rope = use_compressed_preparation(
-        raw, context, trig, compress_ratio, rotary_dim
-    )
+    defer_rope = use_compressed_preparation(raw, trig, compress_ratio, rotary_dim)
     if fused_state:
         state_result = update_decode_state(
             index_pool,

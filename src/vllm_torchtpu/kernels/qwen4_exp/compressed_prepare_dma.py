@@ -19,6 +19,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
+from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import COMPLETED_ROPE_DMA_ROWS
 
 
 def write_prepared_pairs_dma(
@@ -42,6 +43,7 @@ def write_prepared_pairs_dma(
     width = pool.shape[-1]
     view = pool.reshape(-1, packing, width)
     count = len(values)
+    angle_rows = COMPLETED_ROPE_DMA_ROWS
     conflict = (
         (pair[:, None] == pair[None, :])
         & active[:, None]
@@ -83,13 +85,19 @@ def write_prepared_pairs_dma(
                 for earlier in range(t):
                     owner = jnp.minimum(
                         owner,
-                        jnp.where(position // 8 == positions[earlier] // 8, earlier, t),
+                        jnp.where(
+                            position // angle_rows == positions[earlier] // angle_rows,
+                            earlier,
+                            t,
+                        ),
                     )
                 owners.append(owner)
 
             def transfer(t):
                 return pltpu.make_async_copy(
-                    trig_ref.at[pl.ds(positions[t] // 8 * 8, 8)],
+                    trig_ref.at[
+                        pl.ds(positions[t] // angle_rows * angle_rows, angle_rows)
+                    ],
                     angle_tiles.at[t],
                     angle_sem.at[t],
                 )
@@ -131,7 +139,12 @@ def write_prepared_pairs_dma(
                         angle_tiles[owners[t]], jnp.uint16
                     ).astype(jnp.int32)
                     bits = jnp.max(
-                        jnp.where(jnp.arange(8)[:, None] == positions[t] % 8, bits, 0),
+                        jnp.where(
+                            jnp.arange(angle_rows)[:, None]
+                            == positions[t] % angle_rows,
+                            bits,
+                            0,
+                        ),
                         axis=0,
                     )
                     exponent = bits & 0x7F80
@@ -246,7 +259,7 @@ def write_prepared_pairs_dma(
             scratch_shapes=[
                 pltpu.VMEM((count, packing, width), pool.dtype),
                 pltpu.SemaphoreType.DMA((count,)),
-                pltpu.VMEM((count, 8, width), trig_cache.dtype),
+                pltpu.VMEM((count, angle_rows, width), trig_cache.dtype),
                 pltpu.SemaphoreType.DMA((count,)),
             ],
         ),
