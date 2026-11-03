@@ -200,6 +200,12 @@ PATCHES = (
         ("platform_activation", "model_load"),
         model_config=True,
     ),
+    # After the other Gemma4 layer patches: it wraps their layer forward.
+    Patch(
+        "vllm_torchtpu.models.vllm.gemma4_decode_patch:maybe_patch_gemma4_decode_mlp",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
 )
 
 _applied: set[str] = set()

@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     TPU_GEMMA4_FUSED_GELU_QUANT: bool = False
     TPU_GEMMA4_GELU_QUANT_BF16: bool = False
     TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT: bool = False
+    TPU_GEMMA4_DECODE_FUSED_MLP_MAX_ROWS: int = 0
     TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = False
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
     TPU_RPA_UNMASKED_INTERIOR: bool = False
@@ -950,6 +951,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel's head-major output (batched_rpa/output_quant.py) instead of
     # XLA's transpose, f32 copy, row-maximum pass and column-major cast.
     "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT": env_bool("TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT"),
+    # Gemma4 decode buckets of at most this many rows (a multiple of 16) run
+    # each dense layer's post-attention block (post-attention norm, residual
+    # add, pre-feedforward norm, W8A8 gate/up, GeGLU, W8A8 down) as one Pallas
+    # weight stream (models/vllm/gemma4_decode_patch.py). Single GELU rounding
+    # and Mosaic's FP8 accumulation order: tolerance tier. 0 (default) keeps
+    # the layer's forward.
+    "TPU_GEMMA4_DECODE_FUSED_MLP_MAX_ROWS": env_nonnegative_int(
+        "TPU_GEMMA4_DECODE_FUSED_MLP_MAX_ROWS", 0
+    ),
     # Cap the batched-RPA decode KV block of sliding-window layers at half the
     # window, rounded down to the block stride. The default block fills VMEM
     # (1792 tokens for a 1024-token window on Gemma4), and each decode launch

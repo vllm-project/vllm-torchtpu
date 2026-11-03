@@ -27,7 +27,7 @@ from vllm_torchtpu.kernels.gelu_quant import (
     gelu_tanh_and_mul_quantize as _gelu_tanh_and_mul_quantize_kernel,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul import decode_gemv
+from vllm_torchtpu.kernels.quantized_matmul import decode_gemv, decode_mlp
 from vllm_torchtpu.kernels.quantized_matmul.util import (
     quantize_tensor,
     xla_prequantized_matmul,
@@ -307,6 +307,73 @@ def decode_matmul_nt(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """`F.linear(x, w)` for a decode bucket as one weight stream
     (`decode_gemv.decode_matmul_nt`): `x` `[rows, k]`, `w` `[n, k]`."""
     return _decode_matmul_nt_op(x, w)
+
+
+def _decode_geglu_mlp_jax(
+    attn: jax.Array,
+    residual: jax.Array,
+    post_attn_norm_w: jax.Array,
+    pre_ff_norm_w: jax.Array,
+    w_gate_up: jax.Array,
+    s_gate_up: jax.Array,
+    w_down: jax.Array,
+    s_down: jax.Array,
+    eps: float,
+) -> tuple[jax.Array, jax.Array]:
+    # Logged at trace time, so absent when executables load from the cache.
+    logger.info_once(
+        "Gemma4 decode post-attention block on the %d-row bucket: one Pallas "
+        "weight stream.",
+        attn.shape[0],
+    )
+    return decode_mlp.decode_geglu_mlp(
+        attn,
+        residual,
+        post_attn_norm_w,
+        pre_ff_norm_w,
+        w_gate_up,
+        s_gate_up,
+        w_down,
+        s_down,
+        eps=eps,
+    )
+
+
+_decode_geglu_mlp_op = pallas.jax_op("pallas::decode_geglu_mlp", _decode_geglu_mlp_jax)
+
+
+def _fake_decode_geglu_mlp(attn, residual, *args, **kwargs):
+    del residual, args, kwargs
+    return torch.empty_like(attn), torch.empty_like(attn)
+
+
+_decode_geglu_mlp_op.register_fake(_fake_decode_geglu_mlp)
+
+
+def decode_geglu_mlp(
+    attn: torch.Tensor,
+    residual: torch.Tensor,
+    post_attn_norm_w: torch.Tensor,
+    pre_ff_norm_w: torch.Tensor,
+    w_gate_up: torch.Tensor,
+    s_gate_up: torch.Tensor,
+    w_down: torch.Tensor,
+    s_down: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`decode_mlp.decode_geglu_mlp`: (the GeGLU MLP's output before its
+    all-reduce, the new residual) for a decode bucket's attention output."""
+    return _decode_geglu_mlp_op(
+        attn,
+        residual,
+        post_attn_norm_w,
+        pre_ff_norm_w,
+        w_gate_up,
+        s_gate_up,
+        w_down,
+        s_down,
+        eps,
+    )
 
 
 def quantize_activation(
