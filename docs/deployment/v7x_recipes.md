@@ -2,7 +2,7 @@
 
 **TPU v7x (Ironwood)** is Google Cloud's 7th-generation TPU architecture. Each physical TPU v7x chip exposes **2 logical TensorCore devices** to PyTorch and JAX (`192 GB` HBM per chip / `96 GB` per logical device), so a single 4-chip TPU v7x host (`tpu7x-8`) provides **8 logical TPU devices** and `768 GB` of total HBM.
 
-The recipes below are extracted directly from the repository's active PR and nightly CI performance benchmark configurations in [`scripts/vllm/benchmarking/configs/`](https://github.com/vllm-project/vllm-torchtpu/tree/main/scripts/vllm/benchmarking/configs) (scheduled via [`.buildkite/pipeline_perf.yml`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/pipeline_perf.yml)).
+Most recipes below are extracted directly from the repository's active PR and nightly CI performance benchmark configurations in [`scripts/vllm/benchmarking/configs/`](https://github.com/vllm-project/vllm-torchtpu/tree/main/scripts/vllm/benchmarking/configs) (scheduled via [`.buildkite/pipeline_perf.yml`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/pipeline_perf.yml)). A recipe validated outside CI says so in its section.
 
 ---
 
@@ -94,6 +94,43 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
   --no-enable-prefix-caching \
   --port 8000
 ```
+
+### `RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic` (`TP=8 + EP`, long prompts, context-parallel prefill)
+
+Validated on a long-prompt trace (prompts of 10K-160K tokens, mean 87K, short answers, up to 64 concurrent requests); not a CI benchmark config:
+
+```bash
+export VLLM_ENGINE_READY_TIMEOUT_S=3600   # 19 context-parallel programs compile at startup (~30 min cold)
+export TPU_FP8_ATTENTION=1 TPU_RPA_SKIP_EMPTY_LAUNCH=1 TPU_RPA_FENCE_OUTPUT=1 \
+  TPU_RPA_CAP_SLIDING_DECODE_BLOCK=1 TPU_NORM_WEIGHTS_FP32=1 TPU_REUSE_STAGED_BLOCK_TABLES=1 \
+  TPU_GEMMA4_TOPK_SOFTMAX_ROUTING=1 TPU_MOE_GATHER_GMM=1
+export VLLM_TPU_SOLO_PREFILL_OVER_TOKENS=8192 TPU_GEMMA4_CP_MIN_TOKENS=16384
+export VLLM_KV_CACHE_LAYOUT=HND
+
+vllm serve RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
+  --language-model-only \
+  --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}' \
+  --attention-backend CUSTOM \
+  --kv-cache-dtype fp8 \
+  --block-size 256 \
+  --max-model-len 163840 \
+  --max-num-seqs 64 \
+  --max-num-batched-tokens 163840 \
+  --gpu-memory-utilization 0.85 \
+  --no-enable-prefix-caching \
+  --async-scheduling \
+  --compilation-config '{"compile_sizes": [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536, 73728, 81920, 90112, 98304, 106496, 114688, 122880, 131072, 139264, 147456, 155648, 163840]}' \
+  --api-server-count 4 \
+  --port 8000
+```
+
+- Every prompt above 8192 tokens is prefilled whole in a step of its own (`VLLM_TPU_SOLO_PREFILL_OVER_TOKENS`), as a context-parallel program over the 8 ranks for each compile size from 16384 up (`TPU_GEMMA4_CP_MIN_TOKENS`). A step pads its prompt to the next compile size, so the sizes step by 8192 above 16384.
+- At TP 8 every layer keeps one KV head per rank; `VLLM_KV_CACHE_LAYOUT=HND` stores it without padding, twice the KV cache of the default layout, which is what lets all 64 long requests run at once. `TPU_GEMMA4_FUSED_ATTN_PROLOGUE` does not support HND; leave it unset.
+- One API-server process falls behind on 64 streams of long prompts; `--api-server-count 4` spreads them.
+- `LIBTPU_INIT_ARGS=--xla_tpu_dvfs_p_state=7` (the highest DVFS performance state) adds about 5% at 4 or more concurrent requests.
 
 ---
 
