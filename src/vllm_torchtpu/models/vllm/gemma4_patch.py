@@ -750,6 +750,16 @@ def _vocab_shard_embedding(embed: Any, input_ids: torch.Tensor) -> torch.Tensor:
 # (attn, q, k, v, plan, rank tensor) -> attention of the rank's rows over the
 # whole prompt.
 CPAttention = Callable[..., torch.Tensor]
+# (attn, qkv, cos, sin, q norm weight, k norm weight, plan, rank tensor) -> the
+# same, from the qkv projection rows (TPU_CP_FUSED_PROLOGUE).
+CPAttentionFromQKV = Callable[..., torch.Tensor]
+
+
+def _rotary_rows(rope: Any, x: torch.Tensor, positions: torch.Tensor) -> tuple:
+    """(cos, sin): the rotary cache rows of `positions`, in `x`'s dtype as the
+    upstream rotary reads them, as dense [rows, rotary_dim // 2] tensors."""
+    cos_sin = rope._match_cos_sin_cache_dtype(x).index_select(0, positions)
+    return tuple(half.contiguous() for half in cos_sin.chunk(2, dim=-1))
 
 
 def _context_parallel_layer(
@@ -760,6 +770,7 @@ def _context_parallel_layer(
     plan: Any,
     rank: torch.Tensor,
     attention: CPAttention,
+    attention_from_qkv: CPAttentionFromQKV | None = None,
 ) -> torch.Tensor:
     """Upstream's decoder layer on this rank's zigzag rows, every head local."""
     attn = layer.self_attn
@@ -770,14 +781,20 @@ def _context_parallel_layer(
     )
     residual = x
     qkv, _ = replica.self_attn.qkv_proj(layer.input_layernorm(x))
-    q, k, v = qkv.split(
-        [heads * head_dim, kv_heads * head_dim, kv_heads * head_dim], dim=-1
-    )
-    q = attn.q_norm(q.unflatten(-1, (heads, head_dim))).flatten(-2, -1)
-    k = attn.k_norm(k.unflatten(-1, (kv_heads, head_dim)))
-    q, k = attn.rotary_emb(positions, q, k.flatten(-2, -1))
-    v = attn.v_norm(v.unflatten(-1, (kv_heads, head_dim))).flatten(-2, -1)
-    out, _ = replica.self_attn.o_proj(attention(attn.attn, q, k, v, plan, rank))
+    if attention_from_qkv is not None:
+        cos, sin = _rotary_rows(attn.rotary_emb, qkv, positions)
+        weights = (attn.q_norm.weight, attn.k_norm.weight)
+        attended = attention_from_qkv(attn.attn, qkv, cos, sin, *weights, plan, rank)
+    else:
+        q, k, v = qkv.split(
+            [heads * head_dim, kv_heads * head_dim, kv_heads * head_dim], dim=-1
+        )
+        q = attn.q_norm(q.unflatten(-1, (heads, head_dim))).flatten(-2, -1)
+        k = attn.k_norm(k.unflatten(-1, (kv_heads, head_dim)))
+        q, k = attn.rotary_emb(positions, q, k.flatten(-2, -1))
+        v = attn.v_norm(v.unflatten(-1, (kv_heads, head_dim))).flatten(-2, -1)
+        attended = attention(attn.attn, q, k, v, plan, rank)
+    out, _ = replica.self_attn.o_proj(attended)
     x = layer.post_attention_layernorm(out) + residual
     residual = x
 
@@ -804,6 +821,7 @@ def _context_parallel_forward(
     rank: torch.Tensor,
     rows: torch.Tensor,
     attention: CPAttention,
+    attention_from_qkv: CPAttentionFromQKV | None = None,
 ) -> torch.Tensor:
     """Gemma4Model.forward of one prompt, on this rank's zigzag rows.
 
@@ -817,7 +835,9 @@ def _context_parallel_forward(
     x = _reduce_scatter_rows(shards) * model.normalizer
     positions = positions.index_select(0, rows)
     for layer, replica in zip(model.layers, getattr(model, _REPLICA).layers):
-        x = _context_parallel_layer(layer, replica, positions, x, plan, rank, attention)
+        x = _context_parallel_layer(
+            layer, replica, positions, x, plan, rank, attention, attention_from_qkv
+        )
     return _token_order(_all_gather_rows(model.norm(x)), plan)
 
 
@@ -844,6 +864,7 @@ class Gemma4ContextParallelProgram(nn.Module):
         super().__init__()
         from vllm_torchtpu.layers.adapter.cp_prefill_attention import (
             cp_prefill_attention,
+            cp_prefill_attention_from_qkv,
         )
 
         self.model = model
@@ -863,6 +884,9 @@ class Gemma4ContextParallelProgram(nn.Module):
             persistent=False,
         )
         self.attention: CPAttention = cp_prefill_attention
+        self.attention_from_qkv: CPAttentionFromQKV | None = (
+            cp_prefill_attention_from_qkv if envs.TPU_CP_FUSED_PROLOGUE else None
+        )
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return _context_parallel_forward(
@@ -873,6 +897,7 @@ class Gemma4ContextParallelProgram(nn.Module):
             self.rank,
             self.rows,
             self.attention,
+            self.attention_from_qkv,
         )
 
 
@@ -907,6 +932,10 @@ def _check_context_parallel(model: Gemma4Model, vllm_config: VllmConfig) -> None
             # The replica holds every expert: the loader must read them all.
             ("the EP weight filter", moe and parallel.enable_ep_weight_filter),
             ("EPLB", moe and parallel.enable_eplb),
+            (
+                "non-neox rotary under TPU_CP_FUSED_PROLOGUE",
+                envs.TPU_CP_FUSED_PROLOGUE and not attn.rotary_emb.is_neox_style,
+            ),
         ):
             if present and name not in unsupported:
                 unsupported.append(name)
@@ -1028,6 +1057,9 @@ def _prepare_context_parallel_attention(model: Any) -> None:
             num_heads=attn.total_num_heads,
             num_kv_heads=attn.total_num_kv_heads,
             world=get_tensor_model_parallel_world_size(),
+            prologue_eps=(
+                attn.q_norm.variance_epsilon if envs.TPU_CP_FUSED_PROLOGUE else None
+            ),
         )
 
 

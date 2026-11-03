@@ -57,7 +57,12 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils, wrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs,
+    prologue,
+    utils,
+    wrapper,
+)
 
 Rank = int | jax.Array
 
@@ -243,11 +248,19 @@ def sliding_local_pages(
     used instead of what the exchange delivered.
     """
     halo_pages, page_size = halos.shape[0] // 2, halos.shape[1]
-    halo_first, halo_second = halos[:halo_pages], halos[halo_pages:]
     piece, halo = plan.piece_tokens, halo_pages * page_size
     own_tail = pack_kv_pages(
         keys[piece - halo : piece], values[piece - halo : piece], page_size
     )
+    return _halo_buffer(halos, own_tail, plan, rank)
+
+
+def _halo_buffer(
+    halos: jax.Array, own_tail: jax.Array, plan: ZigzagPlan, rank: Rank
+) -> jax.Array:
+    """`sliding_local_pages` given the pages of the rank's first-piece tail."""
+    halo_pages = halos.shape[0] // 2
+    halo_first, halo_second = halos[:halo_pages], halos[halo_pages:]
     last = plan.world - 1
     if isinstance(rank, int):
         halo_second = own_tail if rank == last else halo_second
@@ -273,6 +286,7 @@ def cp_prefill_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     return_kv_pages: bool = False,
+    prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
     **rpa_kwargs,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Attention of the rank's two pieces against `kv_pages`.
@@ -295,6 +309,9 @@ def cp_prefill_attention(
         fp8_compute: Run QK^T and PV as fp8 x fp8 (`ragged_paged_attention`).
         sm_scale, k_scale, v_scale: As for `ragged_paged_attention`.
         return_kv_pages: Also return `kv_pages` as the kernel leaves them.
+        prepared_inputs: (q_hbm, new_kv_hbm) as `wrapper.prepare_inputs` lays
+            out `q` and the new K/V (`prologue.qkv_to_rpa_inputs`); then only
+            the shapes of `q`, `keys` and `values` are read.
         **rpa_kwargs: Further static `ragged_paged_attention` arguments.
 
     Returns:
@@ -329,6 +346,7 @@ def cp_prefill_attention(
         # The decode segment is always empty.
         skip_empty_launch=True,
         fp8_compute=fp8_compute,
+        prepared_inputs=prepared_inputs,
         **rpa_kwargs,
     )
     return (out, kv_pages) if return_kv_pages else out
@@ -633,17 +651,19 @@ def window_rows_held(
     clipped rows hold (`window_slots_from_rows` takes each page from its
     holder). `keys` and `values` are the rank's rows.
     [len(position_pages) * page_size, 2 * kv_heads * d]."""
+    rows = _window_rows(plan, rank, position_pages)
+    return pack_kv_rows(jnp.take(keys, rows, axis=0), jnp.take(values, rows, axis=0))
+
+
+def _window_rows(plan: ZigzagPlan, rank: Rank, position_pages: jax.Array) -> jax.Array:
+    """The rank's rows (indices) of the window pages, clipped to its rows."""
     pp, ps = plan.piece_pages, plan.page_size
     first, second = plan.rank_pieces(rank)
     piece = position_pages // pp
     local = jnp.where(
         piece == first, position_pages - first * pp, position_pages - second * pp + pp
     )
-    rows = jnp.clip(local, 0, 2 * pp - 1)[:, None] * ps + jnp.arange(ps)
-    return pack_kv_rows(
-        jnp.take(keys, rows.reshape(-1), axis=0),
-        jnp.take(values, rows.reshape(-1), axis=0),
-    )
+    return (jnp.clip(local, 0, 2 * pp - 1)[:, None] * ps + jnp.arange(ps)).reshape(-1)
 
 
 def window_page_owners(plan: ZigzagPlan, position_pages: jax.Array) -> jax.Array:
@@ -700,6 +720,9 @@ class LayerConfig:
     fence_output: bool = False
     # A full-attention layer caches its heads with `write_kv_head_pages`.
     head_page_writes: bool = False
+    # The q/k/v norm epsilon of a layer whose attention starts from its qkv
+    # projection rows (`prologue.qkv_to_rpa_inputs`); None: from q, k and v.
+    prologue_eps: float | None = None
 
     def __post_init__(self):
         if not self.head_page_writes:
@@ -755,6 +778,34 @@ def _request_block_table(block_tables: jax.Array, seq_lens: jax.Array) -> jax.Ar
     return block_tables[: block_tables.shape[0] // seq_lens.shape[0]]
 
 
+def qkv_prologue(
+    qkv: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    q_norm_weight: jax.Array,
+    k_norm_weight: jax.Array,
+    *,
+    cfg: LayerConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """(q_hbm, new_kv): `prologue.qkv_to_rpa_inputs` of a layer like `cfg`
+    (every rank's heads), whose norms take `cfg.prologue_eps`."""
+    if cfg.prologue_eps is None:
+        raise ValueError("qkv_prologue needs a layer with prologue_eps")
+    return prologue.qkv_to_rpa_inputs(
+        qkv,
+        cos,
+        sin,
+        q_norm_weight,
+        k_norm_weight,
+        num_q_heads=cfg.num_heads,
+        num_kv_heads=cfg.num_kv_heads,
+        head_dim=cfg.head_dim,
+        eps=cfg.prologue_eps,
+        k_scale=cfg.k_scale,
+        v_scale=cfg.v_scale,
+    )
+
+
 def full_attention_layer(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -781,7 +832,51 @@ def full_attention_layer(
     Returns:
         (the new kv_cache, [rows, num_heads, head_dim] attention output).
     """
-    rank = rank[0]
+    return _full_attention(
+        kv_cache, query, kv_rows, seq_lens, block_tables, rank[0], cfg, cache_view
+    )
+
+
+def full_attention_layer_from_q(
+    kv_cache: jax.Array,
+    q_hbm: jax.Array,
+    kv_rows: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    rank: jax.Array,
+    *,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+) -> tuple[jax.Array, jax.Array]:
+    """`full_attention_layer` with the queries as `wrapper.prepare_inputs` lays
+    them out ([kv_heads, rows, q_per_kv // p, p, head_dim], from
+    `prologue.qkv_to_rpa_inputs`)."""
+    num_rows = q_hbm.shape[1]
+    query = jnp.zeros((num_rows, cfg.num_heads, cfg.head_dim), q_hbm.dtype)
+    return _full_attention(
+        kv_cache,
+        query,
+        kv_rows,
+        seq_lens,
+        block_tables,
+        rank[0],
+        cfg,
+        cache_view,
+        q_hbm=q_hbm,
+    )
+
+
+def _full_attention(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    kv_rows: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    rank: jax.Array,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+    q_hbm: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
     native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
     plan = cfg.plan(query.shape[0], page_size)
     rows = jax.lax.bitcast_convert_type(kv_rows, native.dtype)
@@ -789,24 +884,22 @@ def full_attention_layer(
     first, count = tp_kv_heads(cfg.num_kv_heads, cfg.world, rank)
     table = _request_block_table(block_tables, seq_lens) * page_stride
     writes = full_attention_page_writes(plan, table, seq_lens[0])
+    kwargs = cfg.rpa_kwargs()
+    if q_hbm is not None:
+        # Every key comes from `pages`: the new K/V operand is never read.
+        new_kv = jnp.zeros((query.shape[0], *pages.shape[2:]), pages.dtype)
+        kwargs["prepared_inputs"] = (q_hbm, new_kv)
+    tables = plan.gathered_page_table()
     if cfg.head_page_writes:
         # The kernel reads every key from `pages` and leaves them as they are.
         out, pages = cp_prefill_attention(
-            query,
-            pages,
-            plan.gathered_page_table(),
-            plan,
-            rank,
-            return_kv_pages=True,
-            **cfg.rpa_kwargs(),
+            query, pages, tables, plan, rank, return_kv_pages=True, **kwargs
         )
         new_native = write_kv_head_pages(
             native, pages, first, *writes, num_heads=count, kv_layout=cfg.kv_layout
         )
         return restore(new_native), out
-    out = cp_prefill_attention(
-        query, pages, plan.gathered_page_table(), plan, rank, **cfg.rpa_kwargs()
-    )
+    out = cp_prefill_attention(query, pages, tables, plan, rank, **kwargs)
     mine = cache_pages_from_slots(kv_head_slots(pages, first, count), cfg.kv_layout)
     return restore(write_kv_pages(native, mine, *writes)), out
 
@@ -857,6 +950,35 @@ def sliding_exchange_rows(
     return jax.lax.bitcast_convert_type(rows, jnp.int8)
 
 
+def sliding_exchange_rows_from_kv(
+    new_kv: jax.Array,
+    seq_lens: jax.Array,
+    rank: jax.Array,
+    page_size: int,
+    *,
+    cfg: LayerConfig,
+) -> jax.Array:
+    """`sliding_exchange_rows` of the rank's K/V as `wrapper.prepare_inputs`
+    lays new K/V out ([rows, slots, packing, head_dim], every slot a K or V
+    head: the logical row-major order of `pack_kv_rows`)."""
+    rank = rank[0]
+    plan = cfg.plan(new_kv.shape[0], page_size)
+    halo_pages, _ = _sliding_exchange_pages(cfg, page_size)
+    plan.check_halo_pages(halo_pages)
+    position_pages, _ = window_position_pages(
+        seq_lens[0], cfg.sliding_window, page_size
+    )
+    piece, halo = plan.piece_tokens, halo_pages * page_size
+    rows = jnp.concatenate(
+        [
+            new_kv[piece - halo : piece],
+            new_kv[2 * piece - halo : 2 * piece],
+            jnp.take(new_kv, _window_rows(plan, rank, position_pages), axis=0),
+        ]
+    )
+    return jax.lax.bitcast_convert_type(rows.reshape(rows.shape[0], -1), jnp.int8)
+
+
 def sliding_attention_layer(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -887,9 +1009,84 @@ def sliding_attention_layer(
     Returns:
         (the new kv_cache, [rows, num_heads, head_dim] attention output).
     """
+    piece = query.shape[0] // 2
+
+    def own_tail(halo: int, page_size: int) -> jax.Array:
+        span = slice(piece - halo, piece)
+        return pack_kv_pages(keys[span], values[span], page_size)
+
+    return _sliding_attention(
+        kv_cache,
+        query,
+        keys,
+        values,
+        gathered,
+        seq_lens,
+        block_tables,
+        rank[0],
+        cfg,
+        cache_view,
+        own_tail,
+    )
+
+
+def sliding_attention_layer_from_q(
+    kv_cache: jax.Array,
+    q_hbm: jax.Array,
+    new_kv: jax.Array,
+    gathered: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    rank: jax.Array,
+    *,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+) -> tuple[jax.Array, jax.Array]:
+    """`sliding_attention_layer` with the queries and the rank's new K/V as
+    `wrapper.prepare_inputs` lays them out (`prologue.qkv_to_rpa_inputs`), and
+    the all-gather of `sliding_exchange_rows_from_kv`."""
+    num_rows, piece = q_hbm.shape[1], q_hbm.shape[1] // 2
+    query = jnp.zeros((num_rows, cfg.num_heads, cfg.head_dim), q_hbm.dtype)
+    keys = jnp.zeros((num_rows, cfg.num_kv_heads, cfg.head_dim), new_kv.dtype)
+
+    def own_tail(halo: int, page_size: int) -> jax.Array:
+        tail = new_kv[piece - halo : piece]
+        return tail.reshape(halo // page_size, page_size, *new_kv.shape[1:])
+
+    return _sliding_attention(
+        kv_cache,
+        query,
+        keys,
+        keys,
+        gathered,
+        seq_lens,
+        block_tables,
+        rank[0],
+        cfg,
+        cache_view,
+        own_tail,
+        prepared_inputs=(q_hbm, new_kv),
+    )
+
+
+def _sliding_attention(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    gathered: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    rank: jax.Array,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+    own_tail: Callable[[int, int], jax.Array],
+    prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """`sliding_attention_layer`'s body; `own_tail(halo tokens, page size)`
+    gives the pages of the rank's first-piece tail."""
     if cfg.sliding_window is None:
         raise ValueError("sliding_attention_layer needs a sliding window")
-    rank = rank[0]
     native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
     plan = cfg.plan(query.shape[0], page_size)
     halo_pages, window_pages = _sliding_exchange_pages(cfg, page_size)
@@ -908,7 +1105,7 @@ def sliding_attention_layer(
         cfg.head_dim,
         page_size,
     )
-    local = sliding_local_pages(halos, keys, values, plan, rank)
+    local = _halo_buffer(halos, own_tail(halo, page_size), plan, rank)
     tables = plan.sliding_page_tables(rank, halo_pages)
     out = cp_prefill_attention(
         query,
@@ -918,6 +1115,7 @@ def sliding_attention_layer(
         rank,
         keys=keys,
         values=values,
+        prepared_inputs=prepared_inputs,
         **cfg.rpa_kwargs(),
     )
     window = rows[:, 2 * halo :].reshape(cfg.world, window_pages, page_size, width)

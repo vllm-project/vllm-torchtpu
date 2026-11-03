@@ -19,6 +19,7 @@ pages `wrapper.prepare_inputs` lays out, and that the kernel lowers for tpu7x.
 """
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -620,3 +621,198 @@ def test_head_page_writes_refuse_an_odd_head_count_above_one():
             _layer_config(24, None, configs.KVLayout.HEAD_ALONG_SUBLANE),
             head_page_writes=True,
         )
+
+
+def _new_kv(k, v):
+    """K/V as `wrapper.prepare_inputs` lays new K/V out: [n, slots, 4, d]."""
+    q = jnp.zeros((k.shape[0], k.shape[1], k.shape[2]), jnp.bfloat16)
+    with use_abstract_mesh(TPU7X):
+        _, new_kv = wrapper.prepare_inputs(
+            q, k, v, q.dtype, k.dtype, kv_layout=LAYOUTS[0], page_size=PAGE
+        )
+    return new_kv
+
+
+def test_new_kv_rows_are_pack_kv_rows():
+    k, v = _kv(64, 4, 128, seed=20)
+    np.testing.assert_array_equal(
+        _bytes(_new_kv(k, v).reshape(64, -1)), _bytes(cp_prefill.pack_kv_rows(k, v))
+    )
+
+
+@pytest.mark.parametrize("seq_len", [16 * 8 * PAGE, 9 * 8 * PAGE + 100])
+def test_sliding_exchange_rows_from_kv_match(seq_len):
+    window, num_kv_heads = 1024, 16
+    plan = cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
+    k, v = _kv(plan.num_tokens, num_kv_heads, 128, seed=21)
+    cfg = _layer_config(num_kv_heads, window, LAYOUTS[0])
+    seq_lens = jnp.array([seq_len], jnp.int32)
+    for rank in (0, 3, 7):
+        kr, vr = _rank_rows(k, plan, rank), _rank_rows(v, plan, rank)
+        args = (seq_lens, jnp.array([rank], jnp.int32), PAGE)
+        want = cp_prefill.sliding_exchange_rows(kr, vr, *args, cfg=cfg)
+        got = cp_prefill.sliding_exchange_rows_from_kv(_new_kv(kr, vr), *args, cfg=cfg)
+        np.testing.assert_array_equal(_bytes(got), _bytes(want))
+
+
+def _attention_stub(calls, pages_seen=None):
+    """cp_prefill_attention that records how it was called (and, given
+    `pages_seen`, the pages it attends over) and returns its query (or the
+    prepared one's shape of zeros) and the pages."""
+
+    def attention(q, pages, *args, return_kv_pages=False, **kwargs):
+        calls.append(kwargs.get("prepared_inputs"))
+        if pages_seen is not None:
+            pages_seen.append(pages)
+        return (q, pages) if return_kv_pages else q
+
+    return attention
+
+
+@pytest.mark.parametrize("head_page_writes", [False, True])
+def test_full_attention_layer_from_q_caches_like_from_q_k_v(
+    monkeypatch, head_page_writes
+):
+    calls = []
+    monkeypatch.setattr(cp_prefill, "cp_prefill_attention", _attention_stub(calls))
+    layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+    plan = cp_prefill.make_zigzag_plan(16 * 2 * PAGE, world=8, page_size=PAGE)
+    num_kv_heads, num_cache_pages, seq_len = 2, 48, 16 * 2 * PAGE - 300
+    k, v = _kv(plan.num_tokens, num_kv_heads, 128, seed=22)
+    gathered = _int8(
+        jnp.concatenate(
+            [_new_kv(_rank_rows(k, plan, r), _rank_rows(v, plan, r)) for r in range(8)]
+        ).reshape(plan.num_tokens, -1)
+    )
+    block_table = _block_table(num_cache_pages, plan.num_pages + 4, seed=23)
+    block_tables = jnp.concatenate([block_table, jnp.zeros_like(block_table)])
+    seq_lens = jnp.array([seq_len, 0], jnp.int32)
+    rows = 2 * plan.piece_tokens
+    # _layer_config: two query heads per KV head.
+    q_hbm = jnp.ones((num_kv_heads, rows, 1, 2, 128), jnp.bfloat16)
+    cfg = dataclasses.replace(
+        _layer_config(num_kv_heads, None, layout), head_page_writes=head_page_writes
+    )
+    for rank in (0, 6):
+        args = (seq_lens, block_tables, jnp.array([rank], jnp.int32))
+        cache = jnp.full((num_cache_pages, PAGE, 1, 4, 128), 7, FP8)
+        with pltpu.force_tpu_interpret_mode():
+            want, _ = cp_prefill.full_attention_layer(
+                cache,
+                jnp.zeros((rows, 4, 128), jnp.bfloat16),
+                gathered,
+                *args,
+                cfg=cfg,
+                cache_view=_identity_view,
+            )
+            got, out = cp_prefill.full_attention_layer_from_q(
+                jnp.full_like(cache, 7),
+                q_hbm,
+                gathered,
+                *args,
+                cfg=cfg,
+                cache_view=_identity_view,
+            )
+        np.testing.assert_array_equal(_bytes(got), _bytes(want))
+        assert out.shape == (rows, 4, 128)
+        prepared_q, prepared_kv = calls[-1]
+        assert prepared_q is q_hbm and prepared_kv.shape == (rows, 1, 4, 128)
+
+
+def test_sliding_attention_layer_from_q_caches_like_from_q_k_v(monkeypatch):
+    calls, pages_seen = [], []
+    monkeypatch.setattr(
+        cp_prefill, "cp_prefill_attention", _attention_stub(calls, pages_seen)
+    )
+    window, num_kv_heads, num_cache_pages = 1024, 16, 160
+    plan = cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
+    seq_len = 9 * 8 * PAGE + 100
+    k, v = _kv(plan.num_tokens, num_kv_heads, 128, seed=24)
+    block_table = _block_table(num_cache_pages, plan.num_pages, seed=25)
+    seq_lens = jnp.array([seq_len], jnp.int32)
+    rows = [(_rank_rows(k, plan, r), _rank_rows(v, plan, r)) for r in range(plan.world)]
+    cfg = _layer_config(num_kv_heads, window, LAYOUTS[0])
+    gathered = jnp.concatenate(
+        [
+            cp_prefill.sliding_exchange_rows(
+                *rows[r], seq_lens, jnp.array([r], jnp.int32), PAGE, cfg=cfg
+            )
+            for r in range(plan.world)
+        ]
+    )
+    num_rows = 2 * plan.piece_tokens
+    q_hbm = jnp.ones((num_kv_heads, num_rows, 1, 2, 128), jnp.bfloat16)
+    for rank in (0, 7):
+        args = (gathered, seq_lens, block_table, jnp.array([rank], jnp.int32))
+        cache = jnp.full((num_cache_pages, PAGE, 8, 4, 128), 7, FP8)
+        new_kv = _new_kv(*rows[rank])
+        with pltpu.force_tpu_interpret_mode():
+            want, _ = cp_prefill.sliding_attention_layer(
+                cache,
+                jnp.zeros((num_rows, 32, 128), jnp.bfloat16),
+                *rows[rank],
+                *args,
+                cfg=cfg,
+                cache_view=_identity_view,
+            )
+            local_want = calls[-1]
+            got, out = cp_prefill.sliding_attention_layer_from_q(
+                jnp.full_like(cache, 7),
+                q_hbm,
+                new_kv,
+                *args,
+                cfg=cfg,
+                cache_view=_identity_view,
+            )
+        np.testing.assert_array_equal(_bytes(got), _bytes(want))
+        # The same [halo | halo | scratch] pages: on the last rank the second
+        # halo is the rank's own first-piece tail, here sliced from new_kv.
+        np.testing.assert_array_equal(_bytes(pages_seen[-1]), _bytes(pages_seen[-2]))
+        assert out.shape == (num_rows, 32, 128) and local_want is None
+        prepared_q, prepared_kv = calls[-1]
+        assert prepared_q is q_hbm and prepared_kv is new_kv
+
+
+@pytest.mark.parametrize(
+    "heads,head_dim,window",
+    # Gemma4-26B full attention (fp8 QK/PV) and sliding window.
+    [((16, 2), 512, None), ((16, 8), 256, 1024)],
+)
+def test_layers_from_q_lower_for_tpu7x(heads, head_dim, window):
+    plan = cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
+    num_q_heads, num_kv_heads = heads
+    rows, slots = 2 * plan.piece_tokens, 2 * num_kv_heads // 4
+    cfg = dataclasses.replace(
+        _layer_config(num_kv_heads, window, configs.KVLayout.HEAD_ALONG_SUBLANE),
+        num_heads=num_q_heads,
+        head_dim=head_dim,
+        fp8_compute=window is None,
+        head_page_writes=window is None,
+        prologue_eps=1e-6,
+    )
+    with use_abstract_mesh(TPU7X):
+        q_hbm = jax.ShapeDtypeStruct(
+            (num_kv_heads, rows, num_q_heads // num_kv_heads // 2, 2, head_dim),
+            jnp.bfloat16,
+        )
+        cache = jax.ShapeDtypeStruct((64, PAGE, 1, 4, head_dim), FP8)
+        meta = (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((plan.num_pages,), jnp.int32),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+        )
+        width = 2 * num_kv_heads * head_dim
+        kw = dict(cfg=cfg, cache_view=_identity_view)
+        if window is None:
+            gathered = jax.ShapeDtypeStruct((plan.num_tokens, width), jnp.int8)
+            fn = functools.partial(cp_prefill.full_attention_layer_from_q, **kw)
+            lowered = jax.jit(fn).trace(cache, q_hbm, gathered, *meta)
+        else:
+            new_kv = jax.ShapeDtypeStruct((rows, slots, 4, head_dim), FP8)
+            exchange_rows = (3 * cp_prefill.num_halo_pages(window, PAGE) + 1) * PAGE
+            gathered = jax.ShapeDtypeStruct((8 * exchange_rows, width), jnp.int8)
+            fn = functools.partial(cp_prefill.sliding_attention_layer_from_q, **kw)
+            lowered = jax.jit(fn).trace(cache, q_hbm, new_kv, gathered, *meta)
+        text = lowered.lower(lowering_platforms=("tpu",)).as_text()
+    assert "RPAm-snh-p256" in text
+

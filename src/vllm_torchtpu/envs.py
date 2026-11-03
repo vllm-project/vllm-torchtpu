@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     TPU_GEMMA4_CP_MIN_TOKENS: int = 0
     TPU_CP_KV_WRITE_KERNEL: bool = False
     TPU_CP_FP8_ATTENTION: bool = False
+    TPU_CP_FUSED_PROLOGUE: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -531,6 +532,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tensor-parallel shard's ratio does not qualify (Gemma4-26B full attention
     # at TP8).
     "TPU_CP_FP8_ATTENTION": env_bool("TPU_CP_FP8_ATTENTION", default=False),
+    # Gemma4 context-parallel prefill: each layer's attention starts from its
+    # qkv projection rows; one Pallas pass (batched_rpa/prologue.py) runs the
+    # q/k/v norms, rotary and FP8 K/V quantization and writes the attention
+    # kernel's query and K/V layouts, which the CP ops take as they are.
+    "TPU_CP_FUSED_PROLOGUE": env_bool("TPU_CP_FUSED_PROLOGUE", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and
