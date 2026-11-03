@@ -29,8 +29,10 @@ tensor-parallel KV cache as decode steps read it:
 vllm-torchtpu compiles functional collectives into the program and so needs
 every rank to run the same program: the rank reaches the ops as a device
 tensor, never as a constant (rank-specialized programs computed wrong results
-or hung in an 8-rank check). Each layer runs exactly one collective, on a 2-D
-tensor, whose result feeds the one op that produces the layer's output.
+or hung in an 8-rank check). Each layer runs exactly one collective, on 2-D
+int8 rows (or, with TPU_CP_PAGED_GATHER, int8 rows of the prologue's
+[rows, slots, packing, d] layout), whose result feeds the one op that produces
+the layer's output.
 
 The step must hold exactly one request, the whole prompt, at batch index 0;
 the caller checks that, and keeps prefix caching off (sliding-window layers
@@ -69,6 +71,8 @@ class LayerOps:
     full_attention: Any = None
     sliding_exchange: Any = None
     sliding_attention: Any = None
+    # From the layer's qkv projection rows (LayerConfig.prologue_eps).
+    prologue: Any = None
 
 
 _OPS: dict[cp_prefill.LayerConfig, LayerOps] = {}
@@ -87,6 +91,39 @@ def _register(name: str, fn, fake, donate: bool, **bound):
     return op
 
 
+def _register_layer(
+    name: str,
+    fn,
+    fn_fp8_rows,
+    cfg: cp_prefill.LayerConfig,
+    cache_view,
+    num_rows,
+):
+    """A layer op: (kv_cache, [rows, heads, d] output), or with
+    `cfg.fp8_out_rows` (kv_cache, [rows, heads * d] fp8 rows, [rows, 1] f32
+    scales). `num_rows(args)` reads the row count off the op's operands."""
+    heads, d = cfg.num_heads, cfg.head_dim
+
+    def fake(kv_cache, *args):
+        rows = num_rows(args)
+        if cfg.fp8_out_rows:
+            fp8 = kv_cache.new_empty((rows, heads * d), dtype=torch.float8_e4m3fn)
+            scales = kv_cache.new_empty((rows, 1), dtype=torch.float32)
+            return torch.empty_like(kv_cache), fp8, scales
+        # The output takes the query's dtype (args[0]: query or q_hbm).
+        out = kv_cache.new_empty((rows, heads, d), dtype=args[0].dtype)
+        return torch.empty_like(kv_cache), out
+
+    return _register(
+        name,
+        fn_fp8_rows if cfg.fp8_out_rows else fn,
+        fake,
+        donate=True,
+        cfg=cfg,
+        cache_view=cache_view,
+    )
+
+
 def build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
     """The torch ops `cp_layer` runs for layers like `cfg`, built once."""
     if cfg not in _OPS:
@@ -102,19 +139,17 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
         head_dim=cfg.head_dim,
         kv_layout=cfg.kv_layout,
     )
+    if cfg.prologue_eps is not None:
+        return _build_ops_from_qkv(cfg, cache_view)
     if cfg.sliding_window is None:
-
-        def fake_full(kv_cache, query, *args):
-            return torch.empty_like(kv_cache), torch.empty_like(query)
-
         return LayerOps(
-            full_attention=_register(
+            full_attention=_register_layer(
                 "full_attention",
                 cp_prefill.full_attention_layer,
-                fake_full,
-                donate=True,
-                cfg=cfg,
-                cache_view=cache_view,
+                cp_prefill.full_attention_layer_fp8_rows,
+                cfg,
+                cache_view,
+                lambda args: args[0].shape[0],  # query
             )
         )
 
@@ -125,9 +160,6 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
         width = 2 * cfg.num_kv_heads * cfg.head_dim
         return keys.new_empty((rows, width), dtype=torch.int8)
 
-    def fake_sliding(kv_cache, query, *args):
-        return torch.empty_like(kv_cache), torch.empty_like(query)
-
     return LayerOps(
         sliding_exchange=_register(
             "sliding_exchange",
@@ -136,19 +168,89 @@ def _build_ops(cfg: cp_prefill.LayerConfig) -> LayerOps:
             donate=False,
             cfg=cfg,
         ),
-        sliding_attention=_register(
+        sliding_attention=_register_layer(
             "sliding_attention",
             cp_prefill.sliding_attention_layer,
-            fake_sliding,
-            donate=True,
-            cfg=cfg,
-            cache_view=cache_view,
+            cp_prefill.sliding_attention_layer_fp8_rows,
+            cfg,
+            cache_view,
+            lambda args: args[0].shape[0],  # query
         ),
     )
 
 
+def _build_ops_from_qkv(cfg: cp_prefill.LayerConfig, cache_view) -> LayerOps:
+    """The ops of `cp_prefill_attention_from_qkv`: the prologue kernel turns the
+    qkv rows into the attention kernel's query and new K/V layouts, and the
+    layer ops take those."""
+    d, heads, kv_heads = cfg.head_dim, cfg.num_heads, cfg.num_kv_heads
+    # prepare_inputs pads 2 * kv_heads K/V heads up to whole fp8 words of 4.
+    group, slots = heads // kv_heads, -(-2 * kv_heads // 4)
+
+    def fake_prologue(qkv, *args):
+        rows = qkv.shape[0]
+        q_hbm = qkv.new_empty((kv_heads, rows, group // 2, 2, d), dtype=torch.bfloat16)
+        new_kv = qkv.new_empty((rows, slots, 4, d), dtype=torch.float8_e4m3fn)
+        return q_hbm, new_kv
+
+    ops: dict[str, Any] = dict(
+        prologue=_register(
+            "prologue", cp_prefill.qkv_prologue, fake_prologue, donate=False, cfg=cfg
+        )
+    )
+    if cfg.sliding_window is None:
+        ops["full_attention"] = _register_layer(
+            "full_attention_from_q",
+            cp_prefill.full_attention_layer_from_q,
+            cp_prefill.full_attention_layer_from_q_fp8_rows,
+            cfg,
+            cache_view,
+            lambda args: args[0].shape[1],  # q_hbm
+        )
+        return LayerOps(**ops)
+
+    def fake_exchange(x, *args):
+        # Two piece tails of halo pages, then halo + 1 window pages.
+        halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, args[-1])
+        rows = (3 * halo_pages + 1) * args[-1]
+        row = (slots, 4, d) if cfg.paged_gather else (slots * 4 * d,)
+        return x.new_empty((rows, *row), dtype=torch.int8)
+
+    if cfg.exchange_from_qkv:
+        # (qkv, cos, sin, q norm weight, k norm weight, seq_lens, rank, page size)
+        ops["sliding_exchange"] = _register(
+            "sliding_exchange_from_qkv",
+            cp_prefill.sliding_exchange_rows_from_qkv,
+            fake_exchange,
+            donate=False,
+            cfg=cfg,
+        )
+    else:
+        # (new_kv, seq_lens, rank, page size)
+        ops["sliding_exchange"] = _register(
+            "sliding_exchange_from_kv",
+            cp_prefill.sliding_exchange_rows_from_kv,
+            fake_exchange,
+            donate=False,
+            cfg=cfg,
+        )
+    ops["sliding_attention"] = _register_layer(
+        "sliding_attention_from_q",
+        cp_prefill.sliding_attention_layer_from_q,
+        cp_prefill.sliding_attention_layer_from_q_fp8_rows,
+        cfg,
+        cache_view,
+        lambda args: args[0].shape[1],  # q_hbm
+    )
+    return LayerOps(**ops)
+
+
 def _layer_config(
-    attn: Any, num_heads: int, num_kv_heads: int, world: int
+    attn: Any,
+    num_heads: int,
+    num_kv_heads: int,
+    world: int,
+    prologue_eps: float | None = None,
 ) -> cp_prefill.LayerConfig:
     impl = attn.impl
     if not isinstance(impl, PallasBatchedRPAAttentionBackendImpl):
@@ -200,7 +302,22 @@ def _layer_config(
             f"TPU_FP8_ATTENTION: {num_heads} query heads per {num_kv_heads} KV heads "
             "are not whole fp8 packing groups."
         )
+    if prologue_eps is not None and (
+        (num_heads // num_kv_heads) % 2 or impl.head_size % 128
+    ):
+        raise NotImplementedError(
+            f"The qkv prologue needs an even number of query heads per KV head and "
+            f"a lane-aligned head size, got {num_heads // num_kv_heads} and "
+            f"{impl.head_size}."
+        )
     sliding = impl.sliding_window is not None
+    # The layer runs every head here, so its own head ratio can admit fp8 QK/PV
+    # where the tensor-parallel shard's does not.
+    fp8_compute = impl.fp8_compute or (
+        envs.TPU_FP8_ATTENTION
+        and envs.TPU_CP_FP8_ATTENTION
+        and impl._fp8_compute_supported(num_heads, num_kv_heads)
+    )
     cfg = cp_prefill.LayerConfig(
         world=world,
         num_heads=num_heads,
@@ -211,12 +328,20 @@ def _layer_config(
         soft_cap=impl.logits_soft_cap,
         k_scale=attn._k_scale_float,
         v_scale=attn._v_scale_float,
-        fp8_compute=impl.fp8_compute,
+        fp8_compute=fp8_compute,
         kv_layout=impl.kv_layout,
         sliding_prefill_max_bkv=(
             envs.TPU_RPA_SLIDING_PREFILL_MAX_BKV if sliding else None
         ),
         fence_output=envs.TPU_RPA_FENCE_OUTPUT,
+        unmasked_interior=envs.TPU_RPA_UNMASKED_INTERIOR,
+        head_page_writes=envs.TPU_CP_KV_WRITE_KERNEL and not sliding,
+        prologue_eps=prologue_eps,
+        fp8_out_rows=envs.TPU_CP_FUSED_EPILOGUE,
+        exchange_from_qkv=(
+            envs.TPU_CP_EARLY_HALO and sliding and prologue_eps is not None
+        ),
+        paged_gather=envs.TPU_CP_PAGED_GATHER and prologue_eps is not None,
     )
     if cfg.local_kv_heads != impl.num_kv_heads:
         raise ValueError(
@@ -227,7 +352,12 @@ def _layer_config(
 
 
 def prepare_cp_prefill_attention(
-    attn: Any, *, num_heads: int, num_kv_heads: int, world: int
+    attn: Any,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    world: int,
+    prologue_eps: float | None = None,
 ) -> None:
     """Builds the ops `cp_prefill_attention` runs for this layer.
 
@@ -239,24 +369,40 @@ def prepare_cp_prefill_attention(
         num_heads: Query heads of the layer (all ranks').
         num_kv_heads: KV heads of the layer (all ranks').
         world: Tensor-parallel world size.
+        prologue_eps: The q/k/v norm epsilon, to run the layer from its qkv
+            rows (`cp_prefill_attention_from_qkv`) instead.
     """
     if get_vllm_model_wrapper_context().kv_cache_bundle is not None:
         raise NotImplementedError(
             "Context-parallel prefill attention does not support the bundled KV cache."
         )
-    cfg = _layer_config(attn, num_heads, num_kv_heads, world)
+    cfg = _layer_config(attn, num_heads, num_kv_heads, world, prologue_eps)
     if cfg not in _OPS:
         logger.info_once(
             "Context-parallel prefill attention on %d ranks: %d query / %d KV heads, "
-            "sliding window %s, %s QK/PV.",
+            "sliding window %s, %s QK/PV, KV head pages written by %s, %s.",
             world,
             num_heads,
             num_kv_heads,
             cfg.sliding_window,
             "fp8" if cfg.fp8_compute else "bf16",
+            "the head-page kernel" if cfg.head_page_writes else "XLA slices",
+            "from qkv rows" if prologue_eps is not None else "from q, k and v",
         )
     attn._cp_prefill_config = cfg
     attn._cp_prefill_ops = build_ops(cfg)
+
+
+def _placeholder_output(
+    like: torch.Tensor, cfg: cp_prefill.LayerConfig
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """What the layer returns before KV caches exist, in its output's form."""
+    rows = like.shape[0]
+    if cfg.fp8_out_rows:
+        width = cfg.num_heads * cfg.head_dim
+        fp8 = like.new_zeros((rows, width), dtype=torch.float8_e4m3fn)
+        return fp8, like.new_ones((rows, 1), dtype=torch.float32)
+    return like.new_ones(like.shape)
 
 
 def _waited(t: torch.Tensor) -> torch.Tensor:
@@ -276,7 +422,7 @@ def cp_prefill_attention(
     value: torch.Tensor,
     plan: cp_prefill.ZigzagPlan,
     rank: torch.Tensor,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Attention of this rank's zigzag rows over the whole prompt.
 
     Args:
@@ -291,7 +437,9 @@ def cp_prefill_attention(
             program input (not a constant), so every rank runs one program.
 
     Returns:
-        [rows, num_heads * head_dim] attention output.
+        [rows, num_heads * head_dim] attention output, or with
+        TPU_CP_FUSED_EPILOGUE its per-token fp8 rows and [rows, 1] f32 scales
+        (the o projection's quantized input).
     """
     cfg: cp_prefill.LayerConfig | None = getattr(attn, "_cp_prefill_config", None)
     if cfg is None or cfg.world != plan.world:
@@ -310,7 +458,7 @@ def cp_prefill_attention(
     attn_metadata, layer, kv_cache, _ = get_attention_context(attn.layer_name)
     if kv_cache.numel() == 0:
         # The memory-profiling run, before caches exist; the backend does the same.
-        return torch.ones_like(query)
+        return _placeholder_output(query, cfg)
     key, value = quantize_kv(
         layer.impl.kv_cache_quantized_dtype,
         key.view(rows, cfg.num_kv_heads, d),
@@ -331,7 +479,91 @@ def cp_prefill_attention(
         rank,
         get_tp_group().device_group,
     )
+    if cfg.fp8_out_rows:
+        return out
     return out.reshape(rows, cfg.num_heads * d)
+
+
+def cp_prefill_attention_from_qkv(
+    attn: Any,
+    qkv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    plan: cp_prefill.ZigzagPlan,
+    rank: torch.Tensor,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """`cp_prefill_attention` from the layer's qkv projection rows.
+
+    One Pallas pass (`prologue.qkv_to_rpa_inputs`) runs the per-head q/k
+    (weighted) and v (unweighted) RMSNorms, the neox rotary and the FP8 K/V
+    quantization, and writes the query and new K/V in the attention kernel's
+    layouts, which the layer then takes as they are.
+
+    Args:
+        attn: The layer's vLLM `Attention` module, prepared with
+            `prepare_cp_prefill_attention(..., prologue_eps=...)`.
+        qkv: [rows, (num_heads + 2 * num_kv_heads) * head_dim] bf16 of this
+            rank's two pieces.
+        cos, sin: [rows, rotary_dim // 2] rotary cache rows of the rows'
+            positions.
+        q_norm_weight, k_norm_weight: [head_dim] norm weights.
+        plan, rank: As for `cp_prefill_attention`.
+
+    Returns:
+        As `cp_prefill_attention`.
+    """
+    cfg: cp_prefill.LayerConfig | None = getattr(attn, "_cp_prefill_config", None)
+    if cfg is None or cfg.world != plan.world or cfg.prologue_eps is None:
+        raise RuntimeError(
+            f"{attn.layer_name}: call prepare_cp_prefill_attention with "
+            f"prologue_eps for a world of {plan.world} before tracing."
+        )
+    if not isinstance(rank, torch.Tensor):
+        raise TypeError("Pass the rank as a device tensor (see cp_prefill_attention).")
+    rows = qkv.shape[0]
+    if rows != 2 * plan.piece_tokens:
+        raise ValueError(f"{rows} rows are not the two pieces of {plan}")
+    attn_metadata, _, kv_cache, _ = get_attention_context(attn.layer_name)
+    if kv_cache.numel() == 0:
+        # The memory-profiling run, before caches exist.
+        return _placeholder_output(
+            qkv.new_empty(rows, cfg.num_heads * cfg.head_dim), cfg
+        )
+    ops: LayerOps = attn._cp_prefill_ops
+    group = get_tp_group().device_group
+    seq_lens, block_tables = attn_metadata.seq_lens, attn_metadata.block_tables
+    weights = (q_norm_weight, k_norm_weight)
+    if cfg.exchange_from_qkv:
+        # The exchanged rows' own prologue: the all-gather overlaps the rest's.
+        exchanged = ops.sliding_exchange(
+            qkv, cos, sin, *weights, seq_lens, rank, plan.page_size
+        )
+        gathered = _waited(funcol.all_gather_single(exchanged, 0, group))
+    q_hbm, new_kv = ops.prologue(qkv, cos, sin, *weights)
+    if cfg.sliding_window is None:
+        # [rows, slots, 4, d] is `pack_kv_rows`' order: as int8 rows of that
+        # layout (cfg.paged_gather) or 2-D.
+        kv_rows = new_kv.view(torch.int8)
+        if not cfg.paged_gather:
+            kv_rows = kv_rows.reshape(rows, -1)
+        gathered = _waited(funcol.all_gather_single(kv_rows, 0, group))
+        new_kv_cache, *out = ops.full_attention(
+            kv_cache, q_hbm, gathered, seq_lens, block_tables, rank
+        )
+    else:
+        if not cfg.exchange_from_qkv:
+            exchanged = ops.sliding_exchange(new_kv, seq_lens, rank, plan.page_size)
+            gathered = _waited(funcol.all_gather_single(exchanged, 0, group))
+        new_kv_cache, *out = ops.sliding_attention(
+            kv_cache, q_hbm, new_kv, gathered, seq_lens, block_tables, rank
+        )
+    # The ops donate the cache; the copy_ folds into that alias when compiled.
+    kv_cache.copy_(new_kv_cache)
+    if cfg.fp8_out_rows:
+        return tuple(out)
+    return out[0].reshape(rows, cfg.num_heads * cfg.head_dim)
 
 
 def cp_layer(
@@ -346,20 +578,22 @@ def cp_layer(
     block_tables: torch.Tensor,
     rank: torch.Tensor,
     group: Any,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """`cp_prefill_attention` past the forward context: [rows, heads, d] query,
-    fp8 [rows, kv_heads, d] K/V, [1] int32 rank; writes `kv_cache` in place."""
+    fp8 [rows, kv_heads, d] K/V, [1] int32 rank; writes `kv_cache` in place.
+    Returns the [rows, heads, d] output, or with `cfg.fp8_out_rows` the o
+    projection's fp8 rows and scales."""
     if cfg.sliding_window is None:
         gathered = _waited(funcol.all_gather_single(_int8_rows(key, value), 0, group))
-        new_kv_cache, out = ops.full_attention(
+        new_kv_cache, *out = ops.full_attention(
             kv_cache, query, gathered, seq_lens, block_tables, rank
         )
     else:
         rows = ops.sliding_exchange(key, value, seq_lens, rank, plan.page_size)
         gathered = _waited(funcol.all_gather_single(rows, 0, group))
-        new_kv_cache, out = ops.sliding_attention(
+        new_kv_cache, *out = ops.sliding_attention(
             kv_cache, query, key, value, gathered, seq_lens, block_tables, rank
         )
     # The ops donate the cache; the copy_ folds into that alias when compiled.
     kv_cache.copy_(new_kv_cache)
-    return out
+    return tuple(out) if cfg.fp8_out_rows else out[0]

@@ -682,6 +682,20 @@ class _ReplicaLayer(nn.Module):
                 custom_routing_function=layer.router.routing_function,
                 activation="gelu_tanh",
             )
+            if envs.TPU_CP_MOE_NO_EP:
+                # get_moe_config marks every MoE layer EP under
+                # --enable-expert-parallel, so these experts, every one
+                # local, took the EP routing: an expert-id remap by a zero
+                # start, a mask of routes that are all valid and the
+                # gather-fused combine's per-tile route compaction. The
+                # quant method holds this config and reads use_ep after load.
+                parallel = self.experts.moe_config.moe_parallel_config
+                if parallel.ep_size != 1:
+                    raise ValueError(
+                        f"TPU_CP_MOE_NO_EP: {prefix}.experts hold 1/{parallel.ep_size}"
+                        " of the experts; the non-EP path needs every one"
+                    )
+                parallel.use_ep = False
 
 
 class Gemma4ProjectionReplica(nn.Module):
@@ -697,6 +711,19 @@ class Gemma4ProjectionReplica(nn.Module):
         self.layers = nn.ModuleList(
             _ReplicaLayer(layer, model.config, quant_config, f"{prefix}.layers.{i}")
             for i, layer in enumerate(model.layers)
+        )
+        # TPU_CP_EMBED_REPLICA: the whole vocabulary, so a rank looks up its
+        # own rows instead of every row of its vocab shard plus a reduce-scatter.
+        self.embed_tokens: vocab_parallel_embedding.VocabParallelEmbedding | None = (
+            vocab_parallel_embedding.VocabParallelEmbedding(
+                model.config.vocab_size,
+                model.config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+                disable_tp=True,
+            )
+            if envs.TPU_CP_EMBED_REPLICA
+            else None
         )
 
 
@@ -750,6 +777,37 @@ def _vocab_shard_embedding(embed: Any, input_ids: torch.Tensor) -> torch.Tensor:
 # (attn, q, k, v, plan, rank tensor) -> attention of the rank's rows over the
 # whole prompt.
 CPAttention = Callable[..., torch.Tensor]
+# (attn, qkv, cos, sin, q norm weight, k norm weight, plan, rank tensor) -> the
+# same, from the qkv projection rows (TPU_CP_FUSED_PROLOGUE).
+CPAttentionFromQKV = Callable[..., torch.Tensor]
+
+
+def _rotary_rows(rope: Any, x: torch.Tensor, positions: torch.Tensor) -> tuple:
+    """(cos, sin): the rotary cache rows of `positions`, in `x`'s dtype as the
+    upstream rotary reads them, as dense [rows, rotary_dim // 2] tensors."""
+    cos_sin = rope._match_cos_sin_cache_dtype(x).index_select(0, positions)
+    return tuple(half.contiguous() for half in cos_sin.chunk(2, dim=-1))
+
+
+def _o_projection(o_proj: Any, attended: Any) -> torch.Tensor:
+    """The o projection of the attention's bf16 rows, or (TPU_CP_FUSED_EPILOGUE)
+    of the per-token fp8 rows and scales the attention returned, which are
+    the rows the projection would quantize itself."""
+    if not isinstance(attended, tuple):
+        return o_proj(attended)[0]
+    x_q, x_scale = attended
+    method = o_proj.quant_method
+    if not (
+        isinstance(method, VllmFp8LinearMethodTPU)
+        and method.supports_quantized_input(o_proj, x_q.shape[0])
+        and o_proj.weight.dtype == x_q.dtype
+    ):
+        raise NotImplementedError(
+            "TPU_CP_FUSED_EPILOGUE needs an o projection that quantizes its input "
+            f"per token to {x_q.dtype}, got {type(method).__name__} with "
+            f"{o_proj.weight.dtype} weights"
+        )
+    return method.apply_quantized_input(o_proj, x_q, x_scale)
 
 
 def _context_parallel_layer(
@@ -760,6 +818,7 @@ def _context_parallel_layer(
     plan: Any,
     rank: torch.Tensor,
     attention: CPAttention,
+    attention_from_qkv: CPAttentionFromQKV | None = None,
 ) -> torch.Tensor:
     """Upstream's decoder layer on this rank's zigzag rows, every head local."""
     attn = layer.self_attn
@@ -770,14 +829,20 @@ def _context_parallel_layer(
     )
     residual = x
     qkv, _ = replica.self_attn.qkv_proj(layer.input_layernorm(x))
-    q, k, v = qkv.split(
-        [heads * head_dim, kv_heads * head_dim, kv_heads * head_dim], dim=-1
-    )
-    q = attn.q_norm(q.unflatten(-1, (heads, head_dim))).flatten(-2, -1)
-    k = attn.k_norm(k.unflatten(-1, (kv_heads, head_dim)))
-    q, k = attn.rotary_emb(positions, q, k.flatten(-2, -1))
-    v = attn.v_norm(v.unflatten(-1, (kv_heads, head_dim))).flatten(-2, -1)
-    out, _ = replica.self_attn.o_proj(attention(attn.attn, q, k, v, plan, rank))
+    if attention_from_qkv is not None:
+        cos, sin = _rotary_rows(attn.rotary_emb, qkv, positions)
+        weights = (attn.q_norm.weight, attn.k_norm.weight)
+        attended = attention_from_qkv(attn.attn, qkv, cos, sin, *weights, plan, rank)
+    else:
+        q, k, v = qkv.split(
+            [heads * head_dim, kv_heads * head_dim, kv_heads * head_dim], dim=-1
+        )
+        q = attn.q_norm(q.unflatten(-1, (heads, head_dim))).flatten(-2, -1)
+        k = attn.k_norm(k.unflatten(-1, (kv_heads, head_dim)))
+        q, k = attn.rotary_emb(positions, q, k.flatten(-2, -1))
+        v = attn.v_norm(v.unflatten(-1, (kv_heads, head_dim))).flatten(-2, -1)
+        attended = attention(attn.attn, q, k, v, plan, rank)
+    out = _o_projection(replica.self_attn.o_proj, attended)
     x = layer.post_attention_layernorm(out) + residual
     residual = x
 
@@ -804,6 +869,7 @@ def _context_parallel_forward(
     rank: torch.Tensor,
     rows: torch.Tensor,
     attention: CPAttention,
+    attention_from_qkv: CPAttentionFromQKV | None = None,
 ) -> torch.Tensor:
     """Gemma4Model.forward of one prompt, on this rank's zigzag rows.
 
@@ -812,12 +878,20 @@ def _context_parallel_forward(
     the collectives compiled into it assume, so nothing rank-specific may be a
     constant of the graph.
     """
-    shards = _vocab_shard_embedding(model.embed_tokens, _rank_major(input_ids, plan))
-    # As upstream: the normalizer scales the reduced embedding.
-    x = _reduce_scatter_rows(shards) * model.normalizer
+    embed = getattr(getattr(model, _REPLICA), "embed_tokens", None)
+    if embed is not None:
+        x = embed(input_ids.index_select(0, rows)) * model.normalizer
+    else:
+        shards = _vocab_shard_embedding(
+            model.embed_tokens, _rank_major(input_ids, plan)
+        )
+        # As upstream: the normalizer scales the reduced embedding.
+        x = _reduce_scatter_rows(shards) * model.normalizer
     positions = positions.index_select(0, rows)
     for layer, replica in zip(model.layers, getattr(model, _REPLICA).layers):
-        x = _context_parallel_layer(layer, replica, positions, x, plan, rank, attention)
+        x = _context_parallel_layer(
+            layer, replica, positions, x, plan, rank, attention, attention_from_qkv
+        )
     return _token_order(_all_gather_rows(model.norm(x)), plan)
 
 
@@ -844,6 +918,7 @@ class Gemma4ContextParallelProgram(nn.Module):
         super().__init__()
         from vllm_torchtpu.layers.adapter.cp_prefill_attention import (
             cp_prefill_attention,
+            cp_prefill_attention_from_qkv,
         )
 
         self.model = model
@@ -863,6 +938,9 @@ class Gemma4ContextParallelProgram(nn.Module):
             persistent=False,
         )
         self.attention: CPAttention = cp_prefill_attention
+        self.attention_from_qkv: CPAttentionFromQKV | None = (
+            cp_prefill_attention_from_qkv if envs.TPU_CP_FUSED_PROLOGUE else None
+        )
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return _context_parallel_forward(
@@ -873,6 +951,7 @@ class Gemma4ContextParallelProgram(nn.Module):
             self.rank,
             self.rows,
             self.attention,
+            self.attention_from_qkv,
         )
 
 
@@ -894,6 +973,16 @@ def _check_context_parallel(model: Gemma4Model, vllm_config: VllmConfig) -> None
             ("TPU_PRECOMPILE_PEER_REPLAY", envs.TPU_PRECOMPILE_PEER_REPLAY),
             # One block-table shape per bucket.
             ("VLLM_TPU_MOST_MODEL_LEN", envs.VLLM_TPU_MOST_MODEL_LEN is not None),
+            # The early exchange runs the prologue kernel on the sent rows.
+            (
+                "TPU_CP_EARLY_HALO without TPU_CP_FUSED_PROLOGUE",
+                envs.TPU_CP_EARLY_HALO and not envs.TPU_CP_FUSED_PROLOGUE,
+            ),
+            # The prologue's K/V layout is what the paged gather carries.
+            (
+                "TPU_CP_PAGED_GATHER without TPU_CP_FUSED_PROLOGUE",
+                envs.TPU_CP_PAGED_GATHER and not envs.TPU_CP_FUSED_PROLOGUE,
+            ),
         )
         if present
     ]
@@ -907,6 +996,10 @@ def _check_context_parallel(model: Gemma4Model, vllm_config: VllmConfig) -> None
             # The replica holds every expert: the loader must read them all.
             ("the EP weight filter", moe and parallel.enable_ep_weight_filter),
             ("EPLB", moe and parallel.enable_eplb),
+            (
+                "non-neox rotary under TPU_CP_FUSED_PROLOGUE",
+                envs.TPU_CP_FUSED_PROLOGUE and not attn.rotary_emb.is_neox_style,
+            ),
         ):
             if present and name not in unsupported:
                 unsupported.append(name)
@@ -984,15 +1077,24 @@ def _patched_causal_lm_init(
                     f"{module.prefix} would run {type(module.quant_method).__name__}"
                     f", its TP shard {type(tp_module.quant_method).__name__}"
                 )
+    if replica.embed_tokens is not None and type(
+        replica.embed_tokens.quant_method
+    ) is not type(model.embed_tokens.quant_method):
+        raise ValueError(
+            "The embedding replica would run "
+            f"{type(replica.embed_tokens.quant_method).__name__}, the TP "
+            f"embedding {type(model.embed_tokens.quant_method).__name__}"
+        )
     setattr(model, _REPLICA, replica)
     # A plain dict: the programs are not submodules, so nothing that walks the
     # model's compiled modules (a re-trace, a profiling reset) reaches them.
     self._cp_programs = _build_context_parallel_programs(model, vllm_config)
     self._cp_attention_prepared = False
     logger.info(
-        "Gemma4 context-parallel programs for token buckets %s; the TP model "
-        "compiles %s",
+        "Gemma4 context-parallel programs for token buckets %s (embedding: %s); "
+        "the TP model compiles %s",
         sorted(self._cp_programs),
+        "replica lookup" if replica.embed_tokens is not None else "vocab shards",
         vllm_config.compilation_config.compile_sizes,
     )
 
@@ -1028,6 +1130,9 @@ def _prepare_context_parallel_attention(model: Any) -> None:
             num_heads=attn.total_num_heads,
             num_kv_heads=attn.total_num_kv_heads,
             world=get_tensor_model_parallel_world_size(),
+            prologue_eps=(
+                attn.q_norm.variance_epsilon if envs.TPU_CP_FUSED_PROLOGUE else None
+            ),
         )
 
 
@@ -1066,11 +1171,14 @@ def _patched_model_load_weights(
 ) -> set[str]:
     if not hasattr(self, _REPLICA):
         return _orig_model_load_weights(self, weights)
+    embed = getattr(getattr(self, _REPLICA), "embed_tokens", None) is not None
 
     def with_replica() -> Iterator[tuple[str, torch.Tensor]]:
         for name, tensor in weights:
             yield name, tensor
-            if _REPLICATED_TENSOR.match(name):
+            if _REPLICATED_TENSOR.match(name) or (
+                embed and name.startswith("embed_tokens.")
+            ):
                 yield f"{_REPLICA}.{name}", tensor
 
     return _orig_model_load_weights(self, with_replica())

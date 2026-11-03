@@ -25,6 +25,14 @@ if TYPE_CHECKING:
     TPU_GEMMA4_SP_MICROBATCHES: int = 1
     TPU_GEMMA4_FUSED_NORM_QUANT: bool = False
     TPU_GEMMA4_CP_MIN_TOKENS: int = 0
+    TPU_CP_KV_WRITE_KERNEL: bool = False
+    TPU_CP_FP8_ATTENTION: bool = False
+    TPU_CP_FUSED_PROLOGUE: bool = False
+    TPU_CP_EMBED_REPLICA: bool = False
+    TPU_CP_FUSED_EPILOGUE: bool = False
+    TPU_CP_EARLY_HALO: bool = False
+    TPU_CP_PAGED_GATHER: bool = False
+    TPU_CP_MOE_NO_EP: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -81,6 +89,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MOE_GATHER_GMM: bool = False
     TPU_MOE_GATHER_GMM_MIN_TOKENS: int = 1024
+    TPU_MOE_GATHER_GMM_CHUNKED_COMBINE: bool = False
     TPU_MOE_TP_EXPERT_SPLIT: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -489,6 +498,48 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_TPU_SOLO_PREFILL_OVER_TOKENS whose bucket is the one below. See
     # models/vllm/gemma4_patch.py.
     "TPU_GEMMA4_CP_MIN_TOKENS": env_nonnegative_int("TPU_GEMMA4_CP_MIN_TOKENS", 0),
+    # Context-parallel prefill (layers/adapter/cp_prefill_attention.py): a
+    # full-attention layer caches its KV heads of the gathered pages with a
+    # Pallas kernel that picks the heads' slots in VMEM, instead of an XLA slice
+    # of the packed slot axis (SEQ_ALONG_LANE caches: one KV head per rank).
+    # Same bytes.
+    "TPU_CP_KV_WRITE_KERNEL": env_bool("TPU_CP_KV_WRITE_KERNEL", default=False),
+    # With TPU_FP8_ATTENTION, context-parallel prefill: a layer whose query heads
+    # per KV head, counted over all ranks, are whole fp8 packing groups runs fp8
+    # QK^T and PV (`ragged_paged_attention(fp8_compute=True)`) even where its
+    # tensor-parallel shard's ratio does not qualify (Gemma4-26B full attention
+    # at TP8).
+    "TPU_CP_FP8_ATTENTION": env_bool("TPU_CP_FP8_ATTENTION", default=False),
+    # Gemma4 context-parallel prefill: each layer's attention starts from its
+    # qkv projection rows; one Pallas pass (batched_rpa/prologue.py) runs the
+    # q/k/v norms, rotary and FP8 K/V quantization and writes the attention
+    # kernel's query and K/V layouts, which the CP ops take as they are.
+    "TPU_CP_FUSED_PROLOGUE": env_bool("TPU_CP_FUSED_PROLOGUE", default=False),
+    # Gemma4 context-parallel prefill: the projection replica also holds the
+    # whole embedding table (the model's embedding weights again on every
+    # rank), so a rank looks up its own rows instead of every row of the
+    # step in its vocab shard followed by a reduce-scatter. Same values.
+    "TPU_CP_EMBED_REPLICA": env_bool("TPU_CP_EMBED_REPLICA", default=False),
+    # Context-parallel prefill: each layer's attention returns its output as
+    # the o projection's per-token fp8 rows and scales, quantized by a Pallas
+    # kernel straight from the attention kernel's head-major output, instead of
+    # bf16 token-major rows that XLA transposes and quantizes.
+    "TPU_CP_FUSED_EPILOGUE": env_bool("TPU_CP_FUSED_EPILOGUE", default=False),
+    # With TPU_CP_FUSED_PROLOGUE: a context-parallel sliding-window layer runs
+    # the qkv prologue of the rows it sends (its pieces' tails and the decode
+    # window) first, so its all-gather overlaps the prologue of the other rows
+    # instead of waiting for all of them. Same rows.
+    "TPU_CP_EARLY_HALO": env_bool("TPU_CP_EARLY_HALO", default=False),
+    # With TPU_CP_FUSED_PROLOGUE: the context-parallel layers all-gather their
+    # fp8 K/V as int8 rows in the prologue's [rows, slots, packing, d] layout,
+    # which the attention's page buffers split without a copy, instead of as
+    # 2-D [rows, slots * packing * d] rows. Same bytes.
+    "TPU_CP_PAGED_GATHER": env_bool("TPU_CP_PAGED_GATHER", default=False),
+    # Gemma4 context-parallel prefill: the projection replica's experts (every
+    # expert on every rank) run the MoE path without expert parallelism, which
+    # --enable-expert-parallel otherwise selects for every MoE layer. Every
+    # route is valid either way; device numerics not yet shown bitexact.
+    "TPU_CP_MOE_NO_EP": env_bool("TPU_CP_MOE_NO_EP", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and
@@ -777,6 +828,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_GATHER_GMM": env_bool("TPU_MOE_GATHER_GMM"),
     "TPU_MOE_GATHER_GMM_MIN_TOKENS": env_nonnegative_int(
         "TPU_MOE_GATHER_GMM_MIN_TOKENS", 1024
+    ),
+    # With TPU_MOE_GATHER_GMM: batches of more than 128 Ki routes (tokens x
+    # top-k) take the gather-fused kernels too, running the combine on token
+    # chunks of at most that many routes (its SMEM-prefetched route table);
+    # without it they keep the grouped-matmul path.
+    "TPU_MOE_GATHER_GMM_CHUNKED_COMBINE": env_bool(
+        "TPU_MOE_GATHER_GMM_CHUNKED_COMBINE"
     ),
     # MoE layers that run without expert parallelism (no
     # --enable-expert-parallel) on a tensor-parallel group, with no data,
