@@ -1032,9 +1032,18 @@ def gather_cache_pieces(
     rows = (records[None] + jnp.arange(chunks, dtype=records.dtype)[:, None]).reshape(
         -1
     )
-    even, odd = _split_words(
-        _gather_raw_rows(cache, rows).reshape(chunks, records.size, ROW_WORDS)
-    )
+    words = _gather_raw_rows(cache, rows).reshape(chunks, records.size, ROW_WORDS)
+    if (
+        jax.default_backend() == "tpu"
+        and chunks == 2
+        and records.size in (12288, 36864)
+    ):
+        from vllm_torchtpu.kernels.experimental.decode_preparation import (
+            unpack_cache_words,
+        )
+
+        return unpack_cache_words(words)
+    even, odd = _split_words(words)
     return jnp.stack([even, odd], axis=1).reshape(2 * chunks, records.size, ROW_WORDS)
 
 

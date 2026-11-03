@@ -1,0 +1,411 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Experimental decode preparation boundaries validated at T=288.
+
+These functions keep communication and SparseCore producers outside the
+TensorCore preparation call. Callers retain their general-shape paths.
+"""
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+
+def take_along(values, indices, axis):
+    """Explicit batched gather; retain singleton dimensions for Mosaic."""
+    batch = tuple(i for i in range(values.ndim) if i != axis)
+    return lax.gather(
+        values,
+        indices[..., None],
+        lax.GatherDimensionNumbers(
+            offset_dims=(),
+            collapsed_slice_dims=(axis,),
+            start_index_map=(axis,),
+            operand_batching_dims=batch,
+            start_indices_batching_dims=batch,
+        ),
+        slice_sizes=(1,) * values.ndim,
+        mode=lax.GatherScatterMode.PROMISE_IN_BOUNDS,
+    )
+
+
+def prefix_sum(a, axis=None, dtype=None, out=None):
+    """Integer-only inclusive scan with explicit shift/add dependencies."""
+    assert out is None
+    if axis is None:
+        a, axis = a.reshape(-1), 0
+    if dtype is not None:
+        a = a.astype(dtype)
+    assert jnp.issubdtype(a.dtype, jnp.integer)
+    distance = 1
+    while distance < a.shape[axis]:
+        tail = lax.slice_in_dim(a, 0, a.shape[axis] - distance, axis=axis)
+        pad_shape = list(a.shape)
+        pad_shape[axis] = distance
+        a = a + jnp.concatenate((jnp.zeros(pad_shape, a.dtype), tail), axis=axis)
+        distance *= 2
+    return a
+
+
+def fuse_function(fn, args, *, name, interpret=False):
+    """Real Pallas boundary, with the same externally visible array outputs."""
+    out_shape = jax.eval_shape(fn, *args)
+    leaves, tree = jax.tree.flatten(out_shape)
+
+    def kernel(*refs):
+        outputs = fn(*(r[...] for r in refs[: len(args)]))
+        for ref, value in zip(refs[len(args) :], jax.tree.leaves(outputs)):
+            ref[...] = value
+
+    call = pl.pallas_call(
+        kernel,
+        out_shape=tuple(leaves),
+        name=name,
+        interpret=interpret,
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes // 2
+        ),
+    )
+    return lambda *xs: jax.tree.unflatten(tree, call(*xs))
+
+
+def dispatch_flat(counts, seg_start, rank):
+    """Same tables, without dynamic slices or non-tiled expert reshapes."""
+    ep, experts = counts.shape
+    local = experts // ep
+    e = jnp.arange(experts, dtype=jnp.int32)
+    d = jnp.arange(ep, dtype=jnp.int32)
+    aligned = (counts + 1) & -2
+    starts = prefix_sum(aligned, axis=0) - aligned
+    rows = aligned.sum(axis=0)
+    same = e[:, None] // local == e[None, :] // local
+    key = e % local - rows * local
+    order = jnp.sum(same & (key[None, :] < key[:, None]), axis=1)
+    # Each segment is visit-major, then destination-major.
+    visit_number, destination = e // ep, e % ep
+    selected = (e[None, :] // local == destination[:, None]) & (
+        order[None, :] == visit_number[:, None]
+    )
+    chosen = jnp.sum(jnp.where(selected, e[None, :], 0), axis=1)
+    selected = selected & (rows[None, :] > 0)
+    mine = jnp.sum(jnp.where(d[:, None] == rank[0], counts, 0), axis=0)
+    run_mine = jnp.sum(jnp.where(d[:, None] == rank[0], starts, 0), axis=0)
+    base = jnp.sum(
+        jnp.where(same & (e[None, :] < e[:, None]), rows[None, :], 0), axis=1
+    )
+
+    def select(values):
+        return jnp.sum(jnp.where(selected, values[None, :], 0), axis=1)
+
+    count, source, target = select(mine), select(seg_start), select(base + run_mine)
+    seg = jnp.concatenate(
+        (
+            (destination << 24) | ((chosen % local) << 16) | count,
+            source,
+            jnp.where(count > 0, target, 0),
+        )
+    )
+    local_e = jnp.arange(local, dtype=jnp.int32)
+    recv = jnp.sum(
+        jnp.where(
+            e[None, :] == rank[0] * local + local_e[:, None],
+            counts.sum(axis=0)[None, :],
+            0,
+        ),
+        axis=1,
+    )
+    remote = destination != rank[0]
+    remaining = jnp.sum(jnp.where(remote & (visit_number >= 2), count, 0))
+    meta = jnp.concatenate(
+        (jnp.zeros(local + 1, jnp.int32), recv, jnp.stack((remaining, count.sum())))
+    )
+    visit = jnp.sum(
+        jnp.where(
+            (destination[None, :] == rank[0])
+            & (visit_number[None, :] == local_e[:, None]),
+            (chosen % local)[None, :],
+            0,
+        ),
+        axis=1,
+    )
+    recv_two = jnp.sum(
+        jnp.where(visit[:2, None] == local_e[None, :], recv[None, :], 0), axis=1
+    )
+    sc = jnp.concatenate(
+        (
+            recv_two,
+            jnp.stack(
+                [
+                    jnp.sum(jnp.where(remote & (visit_number == v), count, 0))
+                    for v in range(2)
+                ]
+            ),
+        )
+    )
+    return counts.T, aligned.T, starts.T, rows, seg, meta, visit, sc
+
+
+def dispatch_layout_call(xs, interpret=False):
+    """Keep run-table storage in the baseline's expert-minor layout."""
+
+    def body(*args):
+        a, b, c, *rest = dispatch_flat(*args)
+        return a.T, b.T, c.T, *rest
+
+    fused = fuse_function(
+        body, xs, name="dsv41_moe_dispatch_layout", interpret=interpret
+    )
+
+    def call(*args):
+        a, b, c, *rest = fused(*args)
+        return a.T, b.T, c.T, *rest
+
+    return call
+
+
+def metadata_matrix(table, starts, positions, minimum):
+    """Keep explicit row/column dimensions through gather and reductions."""
+    tokens, requests = positions.shape[1], table.shape[0]
+    first = jnp.sum(
+        jnp.where(
+            jnp.arange(tokens)[None, :] == jnp.minimum(starts[:, :-1].T, tokens - 1),
+            positions,
+            0,
+        ),
+        axis=1,
+        keepdims=True,
+    )
+    count = (starts[:, 1:] - starts[:, :-1]).T
+    left = jnp.where(count > 0, jnp.maximum(first - 127, 0), 0)
+    right = jnp.where(count > 0, first + count, 0)
+    columns = (tokens + 128 + 63) // 64 + 1
+    logical = left // 64 + jnp.arange(columns)[None, :]
+    hit = (
+        jnp.arange(table.shape[1])[None, None, :]
+        == jnp.minimum(logical, table.shape[1] - 1)[:, :, None]
+    )
+    blocks = jnp.sum(jnp.where(hit, table[:, None, :], 0), axis=2)
+    visible = (count > 0) & (logical < table.shape[1]) & (logical * 64 < right)
+    metadata = jnp.concatenate(
+        (left // 64 * 64, minimum, jnp.where(visible, blocks, 0)), axis=1
+    )
+    index = jnp.arange(tokens)[None, :]
+    request = jnp.minimum(
+        jnp.sum(index >= starts[:, 1:].T, axis=0, keepdims=True), requests - 1
+    )
+    page_hit = (
+        logical[:, :, None]
+        == jnp.minimum(positions // 64, table.shape[1] - 1)[:, None, :]
+    )
+    per_request = jnp.sum(jnp.where(page_hit, blocks[:, :, None], 0), axis=1)
+    current = jnp.sum(
+        jnp.where(jnp.arange(requests)[:, None] == request, per_request, 0),
+        axis=0,
+        keepdims=True,
+    )
+    records = jnp.where(index < starts[:, -1:], current * 64 + positions % 64, -1)
+    return metadata, jnp.concatenate((left, right), axis=1), records
+
+
+def pack_matrix(records, values, *, base, capacity, padded):
+    n = values.shape[0]
+    local = jnp.where(
+        (max(base, 64) <= records.T) & (base + capacity > records.T),
+        records.T - base,
+        capacity,
+    )
+    idx = jnp.arange(n, dtype=jnp.int32)[:, None]
+    ranks = jnp.sum(
+        (local > local.T) | ((local == local.T) & (idx > idx.T)), axis=1, keepdims=True
+    )
+    permutation = idx == ranks.T
+    ids = jnp.sum(jnp.where(permutation, local.T, 0), axis=1, keepdims=True)
+    next_ids = jnp.concatenate((ids[1:], jnp.full((1, 1), capacity, jnp.int32)), axis=0)
+    pairs = ids // 2
+    boundary = (ids < capacity) & (
+        jnp.concatenate(
+            (jnp.ones((1, 1), jnp.int32), (pairs[1:] != pairs[:-1]).astype(jnp.int32)),
+            axis=0,
+        )
+        != 0
+    )
+    even = ids % 2 == 0
+    odd = (~even) | (next_ids // 2 == pairs)
+    value_bits = lax.bitcast_convert_type(values, jnp.uint16).astype(jnp.uint32)
+    bits = jnp.dot(
+        permutation.astype(jnp.float32),
+        value_bits.astype(jnp.float32),
+        precision=lax.Precision.HIGHEST,
+    ).astype(jnp.uint32)
+    next_bits = jnp.concatenate((bits[1:], jnp.zeros((1, 512), jnp.uint32)), axis=0)
+    low = jnp.where(even, bits, jnp.uint32(0))
+    high = jnp.where(odd, jnp.where(even, next_bits, bits), jnp.uint32(0))
+    words = lax.bitcast_convert_type(low | (high << 16), jnp.int32)
+    masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
+        odd, jnp.int32(-65536), jnp.int32(0)
+    )
+    return (
+        jnp.pad(
+            jnp.where(boundary, pairs, -1),
+            ((0, padded - n), (0, 0)),
+            constant_values=-1,
+        ),
+        jnp.broadcast_to(jnp.pad(masks, ((0, padded - n), (0, 0))), (padded, 512)),
+        jnp.pad(words, ((0, padded - n), (0, 0))),
+    )
+
+
+def main_records_call(xs, *, page_size):
+    selected, pages, starts = xs
+    t, k = selected.shape
+    requests, pps = pages.shape
+    padded_pps = (pps + 127) // 128 * 128
+
+    def body(sel, table, boundaries):
+        token = jnp.arange(t, dtype=jnp.int32)
+        req = jnp.sum(token[:, None] >= boundaries[None, 1:], axis=1)
+        req = jnp.minimum(req, requests - 1)
+        onehot = (req[:, None] == jnp.arange(requests)[None, :]).astype(jnp.bfloat16)
+        table = jnp.pad(table, ((0, 0), (0, padded_pps - pps)))
+        window = jnp.zeros((t, padded_pps), jnp.int32)
+        # Four exact byte limbs preserve every INT32 page id, including -1.
+        # 4*2*T*requests*padded_pps = 56.6 MFLOP for this shape.
+        for shift in (0, 8, 16, 24):
+            limb = ((table >> shift) & 255).astype(jnp.bfloat16)
+            gathered = jnp.dot(onehot, limb, preferred_element_type=jnp.float32).astype(
+                jnp.int32
+            )
+            window = window | (gathered << shift)
+        valid = (sel >= 0) & (token[:, None] < boundaries[-1])
+        logical = jnp.maximum(sel, 0)
+        page = jnp.clip(logical // page_size, 0, pps - 1)
+        physical = jnp.zeros_like(page)
+        for c in range(padded_pps // 128):
+            local = page - c * 128
+            chunk = window[:, c * 128 : (c + 1) * 128]
+            value = take_along(chunk, jnp.clip(local, 0, 127), axis=1)
+            physical = jnp.where((local >= 0) & (local < 128), value, physical)
+        records = jnp.where(valid, physical * page_size + logical % page_size, -1)
+        return records, jnp.sum(valid, axis=1, keepdims=True, dtype=jnp.int32).T
+
+    fused = fuse_function(body, xs, name="dsv41_main_records_matrix")
+
+    def call(*xs):
+        records, counts = fused(*xs)
+        return records, counts.reshape(t)
+
+    return call
+
+
+def quantize_rows(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
+
+    def body(value):
+        q, scale = quantize_block(value, axis=-1, target_dtype=jnp.float8_e4m3fn)
+        return q, scale.astype(jnp.float32).T
+
+    q, scale = fuse_function(body, (x,), name="decode_row_quantize")(x)
+    return q, scale.T
+
+
+def compact_records(records: jax.Array, total_records: int, tb: int):
+    n = records.size
+
+    def body(records):
+        r = records.reshape(1, n)
+        valid = (r >= 0) & (r < total_records)
+        rank = prefix_sum(valid.astype(jnp.int32), axis=1) - 1
+        match = valid & (rank == jnp.arange(n, dtype=jnp.int32)[:, None])
+        token = jnp.sum(jnp.where(match, jnp.arange(n)[None, :], 0), axis=1)
+        record = jnp.sum(jnp.where(match, r, 0), axis=1)
+        boundary = (jnp.arange(n // tb + 1) * tb)[:, None]
+        offsets = jnp.sum(
+            valid & (jnp.arange(n)[None, :] < boundary), axis=1, dtype=jnp.int32
+        )
+        return jnp.stack((token, record), axis=1), offsets
+
+    pairs, offsets = fuse_function(body, (records,), name="decode_compact_records")(
+        records
+    )
+    return pairs.reshape(-1), offsets
+
+
+def unpack_cache_words(words: jax.Array) -> jax.Array:
+    chunks, n, width = words.shape
+    tile = max(v for v in range(128, 4097, 128) if n % v == 0)
+
+    def kernel(wr, out):
+        value = wr[...]
+        lo = lax.bitcast_convert_type(value << 16, jnp.float32).astype(jnp.bfloat16)
+        hi = lax.bitcast_convert_type(value & jnp.int32(-65536), jnp.float32).astype(
+            jnp.bfloat16
+        )
+        out[0, ...], out[1, ...] = lo, hi
+
+    return pl.pallas_call(
+        kernel,
+        grid=(chunks, n // tile),
+        in_specs=[pl.BlockSpec((1, tile, width), lambda c, i: (c, i, 0))],
+        out_specs=pl.BlockSpec((2, 1, tile, width), lambda c, i: (c, 0, i, 0)),
+        out_shape=jax.ShapeDtypeStruct((2 * chunks, 1, n, width), jnp.bfloat16),
+        name="decode_cache_word_unpack",
+    )(words).reshape(2 * chunks, n, width)
+
+
+def _swa_capacities(banks):
+    info = pltpu.get_tpu_info().sparse_core
+    assert info is not None
+    lanes_cores = info.num_lanes * info.num_cores * info.num_subcores
+    return tuple(bank.shape[0] * bank.shape[1] for bank in banks), lanes_cores
+
+
+def swa_pack(banks, records, values):
+    capacities, lanes_cores = _swa_capacities(banks)
+    padded = (values.shape[0] + lanes_cores - 1) // lanes_cores * lanes_cores
+
+    def body(records, values):
+        result, base = [], 0
+        for capacity in capacities:
+            result.append(
+                pack_matrix(
+                    records, values, base=base, capacity=capacity, padded=padded
+                )
+            )
+            base += capacity
+        return tuple(result)
+
+    prepared = fuse_function(
+        body, (records[None, :], values), name="decode_swa_sort_pack"
+    )(records[None, :], values)
+    return tuple((p[0].reshape(-1), *p[1:]) for p in prepared)
+
+
+def swa_prepare_publish(banks, table, starts, positions, minimum, values):
+    from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
+
+    capacities, lanes_cores = _swa_capacities(banks)
+    padded = (values.shape[0] + lanes_cores - 1) // lanes_cores * lanes_cores
+
+    def prepare(table, starts, positions, minimum, values):
+        metadata, bounds, records = metadata_matrix(table, starts, positions, minimum)
+        packed, base = [], 0
+        for capacity in capacities:
+            packed.append(
+                pack_matrix(
+                    records, values, base=base, capacity=capacity, padded=padded
+                )
+            )
+            base += capacity
+        return metadata, bounds, records, tuple(packed)
+
+    inputs = table, starts[None, :], positions[None, :], minimum[:, None], values
+    metadata, bounds, records, packed = fuse_function(
+        prepare, inputs, name="decode_swa_metadata_sort_pack"
+    )(*inputs)
+    records = records.reshape(-1)
+    packed = tuple((p[0].reshape(-1), *p[1:]) for p in packed)
+    pages = banks if len(banks) == 2 else banks[0]
+    updated = write_swa_pages(pages, records, values, prepared=packed)
+    owners = updated if isinstance(updated, tuple) else (updated,)
+    return (*owners, metadata, bounds, records)
