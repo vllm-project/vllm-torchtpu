@@ -88,10 +88,14 @@ def main():
     parser.add_argument("--samples", type=int, default=200)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--diagnostic", action="store_true")
-    parser.add_argument("--integration", choices=("bridge", "caller"))
+    parser.add_argument("--integration", choices=("bridge", "caller", "addresses"))
     parser.add_argument("--int64-positions", action="store_true")
     parser.add_argument("--state-capacity", type=int, choices=(8, 16), default=16)
     args = parser.parse_args()
+    if args.integration == "addresses" and (
+        args.state_capacity != 16 or args.int64_positions
+    ):
+        parser.error("addresses requires capacity=16 and INT32 positions")
     args.out.mkdir(parents=True, exist_ok=True)
     import torch
     import torch_tpu  # noqa: F401
@@ -209,7 +213,11 @@ def main():
         )
 
         ops = production_ops(mesh)
-        if args.integration == "caller":
+        if args.integration == "addresses":
+            from attention_addresses import fullconsumer_functions
+
+            original, candidate = fullconsumer_functions(ops, mesh)
+        elif args.integration == "caller":
             original, candidate = caller_functions(ops, args.state_capacity)
         else:
             candidate = bridge_candidate(ops)
@@ -296,12 +304,32 @@ def main():
             b.fill_(WORD)
         sync.synchronize(tensors=list(banks), wait=True)
 
+    address_tables = None
+    if args.integration == "addresses":
+        from attention_addresses import inputs as address_inputs
+
+        address_tables = address_inputs("decode")[-2:]
+        address_tensors = tuple(torch.from_numpy(a).to("tpu") for a in address_tables)
+        result["baseline_label"] = "retained production packed + native addresses"
+        result["scope"] = (
+            "retained vs expanded metadata + actual compressor/banks + "
+            "live main records/index int32 slots; no SC"
+        )
+        result["source_sha256"]["scripts/dsv41_bench/attention_addresses.py"] = (
+            hashlib.sha256(
+                Path(__file__).with_name("attention_addresses.py").read_bytes()
+            ).hexdigest()
+        )
+
     def inputs(kind):
         arrays = fixture(kind)
         tensors = [torch.from_numpy(a).to("tpu") for a in arrays]
         if args.int64_positions:
             tensors[2] = tensors[2].to(torch.int64)
-        return arrays, tuple(tensors) + compute + banks
+        values = tuple(tensors) + compute + banks
+        if args.integration == "addresses":
+            values += address_tensors
+        return arrays, values
 
     cases = (
         ("decode",)
@@ -341,6 +369,14 @@ def main():
             main_records = np.where(valid[:, 0] != 0, slots, -1)
             expected += [main_records, slots]
             dense_expected += [main_records, slots]
+        if args.integration == "addresses":
+            from attention_addresses import expected as address_reference
+
+            address_outputs = address_reference(
+                (table, starts, starts, pos, minimum, *address_tables)
+            )[6:]
+            expected.extend(address_outputs)
+            dense_expected.extend(address_outputs)
         score = np.asarray(score)
         rows = np.flatnonzero(write >= 0)
         assert np.unique(write[rows]).size == rows.size
