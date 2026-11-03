@@ -289,6 +289,35 @@ def test_op_without_an_ep_group_raises():
         _build(_experts(), mesh=None)
 
 
+def test_op_forwards_ep_tp_size_and_validates_expert_blocks():
+    layer = _experts(local=4, ep=2)
+    layer.moe_config.moe_parallel_config.tp_size = 2
+    mesh = SimpleNamespace(shape={bridge.EP_AXIS_NAME: 4})
+    op, seen = _build(layer, mesh=mesh)
+    assert op == "op"
+    _, kw = seen[0]
+    assert kw["ep_tp_size"] == 2
+
+
+def test_op_refuses_unaligned_or_permuted_ep_tp_mesh():
+    layer = _experts(local=4, ep=2)
+    layer.moe_config.moe_parallel_config.tp_size = 3
+    mesh4 = SimpleNamespace(shape={bridge.EP_AXIS_NAME: 4})
+    with pytest.raises(ValueError, match="not divisible by MoE tp_size"):
+        _build(layer, mesh=mesh4)
+
+    layer.moe_config.moe_parallel_config.tp_size = 2
+    with (
+        patch.object(bridge, "build_ep_mesh", return_value=mesh4),
+        patch.object(bridge, "ep_rank_order", return_value=(0, 2, 1, 3)),
+        patch.object(bridge, "_smem_capacity_bytes", return_value=1024 * 1024),
+        pytest.raises(ValueError, match="rank-ordered EP mesh"),
+    ):
+        bridge.build_sequence_parallel_op(
+            layer, topk=2, renormalize=True, activation="silu"
+        )
+
+
 def test_shared_slices_are_stacked_into_four_model_wide_tensors():
     tp, group, k, i, n, layers = 4, 2, 8, 3, 5, 3
     backbone = torch.nn.Module()

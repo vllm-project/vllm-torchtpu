@@ -178,6 +178,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     wire_dtype=None,
+    ep_tp_size: int = 1,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -196,6 +197,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         wire_dtype,
+        ep_tp_size,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -211,6 +213,8 @@ def _build_op(
     )
     if wire_dtype is not None:
         routing_kw["wire_dtype"] = wire_dtype
+    if ep_tp_size != 1:
+        routing_kw["ep_tp_size"] = ep_tp_size
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
         # The router's top-k selector writes into an f32 accumulator ref, so a
@@ -714,7 +718,13 @@ def build_sequence_parallel_op(layer, topk: int, renormalize: bool, activation: 
     mesh = build_ep_mesh()
     if mesh is None:
         raise ValueError("there is no EP group")
-    ep = mesh.shape[EP_AXIS_NAME]
+    mesh_size = mesh.shape[EP_AXIS_NAME]
+    ep_tp = int(getattr(layer.moe_config.moe_parallel_config, "tp_size", 1))
+    if ep_tp < 1 or mesh_size % ep_tp:
+        raise ValueError(
+            f"EP mesh size {mesh_size} is not divisible by MoE tp_size={ep_tp}"
+        )
+    ep = mesh_size // ep_tp
     needed_smem = _SMEM_OVERHEAD_BYTES + token_gather_smem_bytes(_TILE_M)
     if needed_smem > _smem_capacity_bytes():
         raise ValueError(
@@ -735,6 +745,9 @@ def build_sequence_parallel_op(layer, topk: int, renormalize: bool, activation: 
     reason = fused_moe_ep_unsupported_reason(layer, weights, activation)
     if reason is not None:
         raise ValueError(reason)
+    mesh_expert_order = _mesh_expert_order(mesh_size)
+    if ep_tp > 1 and mesh_expert_order is not None:
+        raise ValueError("ep_tp_size > 1 requires a rank-ordered EP mesh")
     if _RANK_BUFFER is None:
         _RANK_BUFFER = torch.tensor(
             [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
@@ -745,7 +758,7 @@ def build_sequence_parallel_op(layer, topk: int, renormalize: bool, activation: 
         topk,
         renormalize,
         activation,
-        _mesh_expert_order(ep),
+        mesh_expert_order,
         # Always the sharded routing plan: same outputs, and 0.86 vs 1.12 ms
         # per GLM-5.2 layer at 4096 tokens on a 2x2x2 slice.
         True,
@@ -757,6 +770,7 @@ def build_sequence_parallel_op(layer, topk: int, renormalize: bool, activation: 
         False,
         token_replica_groups=ep_token_replica_groups(is_sequence_parallel=True),
         wire_dtype=None if envs.TPU_MOE_PREFILL_SP_FP8_WIRE else jnp.bfloat16,
+        ep_tp_size=ep_tp,
     )
 
 

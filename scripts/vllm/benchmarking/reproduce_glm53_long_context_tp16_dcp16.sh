@@ -6,6 +6,7 @@
 #   source <script> env             Export all verified runtime & kernel env vars
 #   <script> ray-head               Start Ray head on host 0 and wait for 2 TPU hosts
 #   <script> ray-worker <HEAD_IP>   Join Ray cluster from host 1
+#   <script> stop                   Stop vLLM / EngineCore / Ray processes on current host
 #   <script> serve [--daemon]       Launch vllm serve (set MAX_MODEL_LEN=163840 for timed_trace)
 #   <script> bench-random           Run random 80128/512 c=1..64 sweep + Prometheus checks
 #   <script> bench-timed-trace      Run timed_trace c=1..64 sweep (set SHARD_DIR=...)
@@ -38,7 +39,20 @@ log() {
 export_glm53_env() {
   mkdir -p /dev/shm/tmp/tpu_logs /dev/shm/cache/vllm /dev/shm/cache/inductor /dev/shm/xla_cache/jax "${OUT_DIR}/metrics"
 
-  unset TPU_VISIBLE_CHIPS TPU_VISIBLE_DEVICES
+  unset TPU_VISIBLE_CHIPS TPU_VISIBLE_DEVICES TPU_TOPOLOGY TPU_HOST_BOUNDS \
+    TPU_PROCESS_ADDRESSES TPU_WORKER_HOSTNAMES TPU_WORKER_ID TPU_ACCELERATOR_TYPE
+
+  if [[ -z "${GOOGLE_CLOUD_PROJECT:-}" ]]; then
+    local detected_project
+    detected_project="$(curl -sf -m 2 -H 'Metadata-Flavor: Google' \
+      http://metadata.google.internal/computeMetadata/v1/project/project-id 2>/dev/null || true)"
+    if [[ -n "${detected_project}" ]]; then
+      export GOOGLE_CLOUD_PROJECT="${detected_project}"
+      export GCLOUD_PROJECT="${GCLOUD_PROJECT:-${detected_project}}"
+      export CLOUDSDK_CORE_PROJECT="${CLOUDSDK_CORE_PROJECT:-${detected_project}}"
+    fi
+  fi
+
   export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
   export TMPDIR="${TMPDIR:-/dev/shm/tmp}"
   export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/dev/shm/cache}"
@@ -85,13 +99,15 @@ export_glm53_env() {
     return 1
   fi
 
-  # MoE flags (decode TP kernel + sequence-parallel FP8-wire prefill MoE)
-  export FUSED_MOE_DECODE_KERNEL=1
-  export FUSED_MOE_PREFILL_KERNEL=0
+  # MoE flags (TP=2 decode MoE kernel + HBM->Peer VMEM sequence-parallel FP8-wire prefill MoE)
+  export FUSED_MOE_DECODE_KERNEL="${FUSED_MOE_DECODE_KERNEL:-0}"
+  export FUSED_MOE_PREFILL_KERNEL="${FUSED_MOE_PREFILL_KERNEL:-0}"
   export ONEHOT_MOE_PERMUTE_THRESHOLD=2048
   export USE_MOE_SPARSE_CORE=1
-  export USE_MOE_TP_DECODE_KERNEL=0
-  export TPU_MOE_EP_TP_SIZE=1
+  export USE_MOE_TP_DECODE_KERNEL="${USE_MOE_TP_DECODE_KERNEL:-1}"
+  export TPU_MOE_TP_DECODE_FAST="${TPU_MOE_TP_DECODE_FAST:-1}"
+  export TPU_MOE_TP_DECODE_HBM_OPERANDS="${TPU_MOE_TP_DECODE_HBM_OPERANDS:-all}"
+  export TPU_MOE_EP_TP_SIZE="${TPU_MOE_EP_TP_SIZE:-2}"
   export TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER=0
   export TPU_MOE_ONEHOT_SORTFREE=1
   export TPU_MOE_ROUTER_TOPK_BIAS=1
@@ -109,7 +125,11 @@ export_glm53_env() {
 
   # DCP & MLA prefill/decode flags
   export TPU_DCP_PREFILL_TOKEN_PARALLEL=1
-  export TPU_DCP_PREFILL_GATHER_CAPS="4,8,12,16,20,24"
+  local default_gather_caps="4,8,12,16,20,24"
+  if [[ "${MAX_MODEL_LEN}" -gt 80896 ]]; then
+    default_gather_caps="4,8,12,16,20,24,32,44"
+  fi
+  export TPU_DCP_PREFILL_GATHER_CAPS="${TPU_DCP_PREFILL_GATHER_CAPS:-${default_gather_caps}}"
   export TPU_DCP_PREFILL_TP_UV_BEFORE_A2A=1
   export TPU_DCP_PREFILL_INDEXER_QROWS=1
   export TPU_DCP_PREFILL_FUSED_SUBBATCH=1
@@ -185,6 +205,38 @@ if getattr(tpu_compiler, "PEER_WAIT_S", 0.0) < 7200.0:
     sys.exit(f"FATAL: tpu_compiler.PEER_WAIT_S={getattr(tpu_compiler, 'PEER_WAIT_S', None)} < 7200.0 (stale checkout).")
 print(f"[glm53-repro] Verified code revision OK (PEER_WAIT_S={tpu_compiler.PEER_WAIT_S}).")
 PY
+}
+
+ensure_local_tokenizer() {
+  if [[ "${TOKENIZER}" != gs://* ]]; then
+    return 0
+  fi
+  export_glm53_env || return 1
+  local local_tok_dir="${LOCAL_TOKENIZER_DIR:-/dev/shm/cache/tokenizer}"
+  if [[ ! -f "${local_tok_dir}/tokenizer_config.json" ]]; then
+    log "Materializing non-weight tokenizer/config files from ${TOKENIZER} into ${local_tok_dir} ..."
+    mkdir -p "${local_tok_dir}"
+    python3 - "${TOKENIZER}" "${local_tok_dir}" <<'PY' || return 1
+import sys
+from runai_model_streamer.safetensors_streamer import safetensors_streamer
+
+src_uri, dst_dir = sys.argv[1:3]
+safetensors_streamer.pull_files(
+    src_uri,
+    dst_dir,
+    ignore_pattern=["*.safetensors", "*.safetensors.*", "*.bin", "*.pt"],
+)
+PY
+  fi
+  TOKENIZER="${local_tok_dir}"
+  log "Using local tokenizer directory: ${TOKENIZER}"
+}
+
+stop_glm53() {
+  log "Stopping vLLM / EngineCore / Ray processes on current host..."
+  pkill -9 -if "[v]llm|[e]nginecore|[r]ayworker" 2>/dev/null || true
+  ray stop --force >/dev/null 2>&1 || true
+  rm -f /tmp/libtpu_lockfile
 }
 
 start_ray_head() {
@@ -311,6 +363,7 @@ PY
 
 run_bench_random() {
   mkdir -p "${OUT_DIR}/metrics"
+  ensure_local_tokenizer || return 1
   export JAX_PLATFORMS=cpu PJRT_DEVICE=CPU TPU_SKIP_MDS_QUERY=1 TRANSFORMERS_NO_TORCH_TPU=1 VLLM_TARGET_DEVICE=cpu
 
   local isl="${BENCH_ISL:-80128}"
@@ -330,13 +383,17 @@ run_bench_random() {
   # 2. Warmup (80128 input / 32 output, 2 prompts at c=1)
   if [[ "${BENCH_SKIP_WARMUP:-0}" != "1" ]]; then
     log "Running warmup (${isl}/32, c=1, n=2)..."
-    PYTHONHASHSEED=999992 timeout 3600 vllm bench serve \
+    if ! PYTHONHASHSEED=999992 timeout 3600 vllm bench serve \
       --backend openai --host "${BENCH_HOST}" --port "${PORT}" --endpoint /v1/completions \
       --model "${SERVED_MODEL_NAME}" --tokenizer "${TOKENIZER}" --trust-remote-code \
       --dataset-name random --random-input-len "${isl}" --random-output-len 32 --random-range-ratio 0.0 \
       --ignore-eos --request-rate inf --num-prompts 2 --max-concurrency 1 \
       --num-warmups 0 --ready-check-timeout-sec 0 --seed 90031 --temperature 0.0 \
-      >"${OUT_DIR}/warmup.log" 2>&1
+      >"${OUT_DIR}/warmup.log" 2>&1; then
+      log "ERROR: Warmup vllm bench serve failed (see ${OUT_DIR}/warmup.log)"
+      tail -n 30 "${OUT_DIR}/warmup.log" >&2
+      return 1
+    fi
     tail -n 5 "${OUT_DIR}/warmup.log"
   fi
 
@@ -349,7 +406,7 @@ run_bench_random() {
     local fpath="${OUT_DIR}/${fname}"
     prom_snap "c${c}.before"
     log "Running random ${isl}/${osl} c=${c} n=${n} ..."
-    PYTHONHASHSEED=$((200000 + c)) timeout 7200 vllm bench serve \
+    if ! PYTHONHASHSEED=$((200000 + c)) timeout 7200 vllm bench serve \
       --backend openai --host "${BENCH_HOST}" --port "${PORT}" --endpoint /v1/completions \
       --model "${SERVED_MODEL_NAME}" --tokenizer "${TOKENIZER}" --trust-remote-code \
       --dataset-name random --random-input-len "${isl}" --random-output-len "${osl}" --random-range-ratio 0.0 \
@@ -358,7 +415,11 @@ run_bench_random() {
       --seed "$((50000 + c))" --temperature 0.0 \
       --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 25,50,75,90,95,99 \
       --save-result --save-detailed --result-dir "${OUT_DIR}" --result-filename "${fname}" \
-      >"${OUT_DIR}/c${c}.log" 2>&1
+      >"${OUT_DIR}/c${c}.log" 2>&1 || [[ ! -s "${fpath}" ]]; then
+      log "ERROR: Benchmark failed for c=${c} (see ${OUT_DIR}/c${c}.log)"
+      tail -n 30 "${OUT_DIR}/c${c}.log" >&2
+      return 1
+    fi
     prom_snap "c${c}.after"
 
     local ph pe pt gt
@@ -402,19 +463,24 @@ run_bench_timed_trace() {
   local arm_name="${ARM:-glm53_timed_trace_16k}"
 
   mkdir -p "${OUT_DIR}/metrics"
+  ensure_local_tokenizer || return 1
   export JAX_PLATFORMS=cpu PJRT_DEVICE=CPU TPU_SKIP_MDS_QUERY=1 TRANSFORMERS_NO_TORCH_TPU=1 VLLM_TARGET_DEVICE=cpu
 
   wait_server_ready || return 1
 
   if [[ "${BENCH_SKIP_WARMUP:-0}" != "1" && -f "${shard_dir}/${trace_prefix}_warmup.jsonl" ]]; then
     log "Running timed_trace warmup (4 prompts, c=2)..."
-    PYTHONHASHSEED=999999 timeout 3600 vllm bench serve \
+    if ! PYTHONHASHSEED=999999 timeout 3600 vllm bench serve \
       --backend openai --host "${BENCH_HOST}" --port "${PORT}" --endpoint /v1/completions \
       --model "${SERVED_MODEL_NAME}" --tokenizer "${TOKENIZER}" --trust-remote-code \
       --dataset-name timed_trace --dataset-path "${shard_dir}/${trace_prefix}_warmup.jsonl" \
       --timed-trace-chunk-hash-size 512 --no-self-timed \
       --num-prompts 4 --num-warmups 0 --ready-check-timeout-sec 0 \
-      --max-concurrency 2 --request-rate inf --temperature 0.0 >"${OUT_DIR}/warmup_trace.log" 2>&1
+      --max-concurrency 2 --request-rate inf --temperature 0.0 >"${OUT_DIR}/warmup_trace.log" 2>&1; then
+      log "ERROR: Timed-trace warmup failed (see ${OUT_DIR}/warmup_trace.log)"
+      tail -n 30 "${OUT_DIR}/warmup_trace.log" >&2
+      return 1
+    fi
     tail -n 5 "${OUT_DIR}/warmup_trace.log"
   fi
 
@@ -425,7 +491,7 @@ run_bench_timed_trace() {
     local fpath="${OUT_DIR}/${fname}"
     prom_snap "trace_c${c}.before"
     log "Running timed_trace c=${c} n=${num_prompts} ..."
-    PYTHONHASHSEED=$((100000 + c)) timeout 14400 vllm bench serve \
+    if ! PYTHONHASHSEED=$((100000 + c)) timeout 14400 vllm bench serve \
       --backend openai --host "${BENCH_HOST}" --port "${PORT}" --endpoint /v1/completions \
       --model "${SERVED_MODEL_NAME}" --tokenizer "${TOKENIZER}" --trust-remote-code \
       --dataset-name timed_trace --dataset-path "${shard_dir}/${trace_prefix}_c${c}.jsonl" \
@@ -434,7 +500,11 @@ run_bench_timed_trace() {
       --max-concurrency "${c}" --request-rate inf --temperature 0.0 \
       --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 25,50,75,90,95,99 \
       --save-result --save-detailed --result-dir "${OUT_DIR}" --result-filename "${fname}" \
-      >"${OUT_DIR}/trace_c${c}.log" 2>&1
+      >"${OUT_DIR}/trace_c${c}.log" 2>&1 || [[ ! -s "${fpath}" ]]; then
+      log "ERROR: Timed-trace benchmark failed for c=${c} (see ${OUT_DIR}/trace_c${c}.log)"
+      tail -n 30 "${OUT_DIR}/trace_c${c}.log" >&2
+      return 1
+    fi
     prom_snap "trace_c${c}.after"
 
     local ph pe pt gt
@@ -474,6 +544,7 @@ PY
 
 run_eval() {
   mkdir -p "${OUT_DIR}/eval"
+  ensure_local_tokenizer || return 1
   export JAX_PLATFORMS=cpu PJRT_DEVICE=CPU TPU_SKIP_MDS_QUERY=1 TRANSFORMERS_NO_TORCH_TPU=1 VLLM_TARGET_DEVICE=cpu
 
   wait_server_ready || return 1
@@ -591,6 +662,9 @@ main() {
     ray-worker)
       start_ray_worker "$@"
       ;;
+    stop)
+      stop_glm53
+      ;;
     serve)
       run_serve "$@"
       ;;
@@ -616,6 +690,7 @@ Usage:
   source $0 env
   $0 ray-head
   $0 ray-worker <HEAD_IP>
+  $0 stop
   $0 serve [--daemon]
   $0 bench-random
   SHARD_DIR=/path/to/shards $0 bench-timed-trace

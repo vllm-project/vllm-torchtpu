@@ -272,6 +272,7 @@ def fused_ep_moe_v2(
     routed_scaling_factor=1.0,
     token_replica_groups=None,
     wire_dtype=None,
+    ep_tp_size=1,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -362,9 +363,26 @@ def fused_ep_moe_v2(
         )
     if (w1_scale is None) != (w2_scale is None):
         raise ValueError("both weight scales are supplied together or neither is")
+    ep_tp_size = int(ep_tp_size)
+    if ep_tp_size < 1:
+        raise ValueError(f"ep_tp_size must be >= 1; got {ep_tp_size}")
+    if ep_tp_size > 1 and weight_format != WeightFormat.FP8:
+        raise NotImplementedError(
+            f"ep_tp_size > 1 supports FP8 weights only; got {weight_format!r}"
+        )
     T, hidden = x.shape
-    e_total = w1.shape[0]
-    inter = w1.shape[2] // 2
+    w1_experts = w1.shape[0]
+    if w1_experts % ep_tp_size:
+        raise ValueError(
+            f"w1 expert axis {w1_experts} is not divisible by ep_tp_size={ep_tp_size}"
+        )
+    e_total = w1_experts // ep_tp_size
+    inter_slice = w1.shape[2] // 2
+    inter = inter_slice * ep_tp_size
+    if ep_tp_size > 1 and w2.shape != (w1_experts, inter_slice, hidden):
+        raise ValueError(
+            f"w2 layout {tuple(w2.shape)} is not {(w1_experts, inter_slice, hidden)}"
+        )
     # Where the weight scales' layout is fixed: [E, N] per output channel,
     # [E, blocks, N] per contraction block, which is what the kernel's own
     # operands are. The scales are constants of the weights, so whatever
@@ -375,11 +393,11 @@ def fused_ep_moe_v2(
     if form.has_scales:
         ndim = 3 if form.scale_layout == "per_contraction_block" else 2
         for name, s, n in (
-            ("w1_scale", w1_scale, 2 * inter),
+            ("w1_scale", w1_scale, 2 * inter_slice),
             ("w2_scale", w2_scale, hidden),
         ):
-            if s.ndim != ndim or s.shape[0] != e_total or s.shape[-1] != n:
-                want = (e_total, "blocks", n) if ndim == 3 else (e_total, n)
+            if s.ndim != ndim or s.shape[0] != w1_experts or s.shape[-1] != n:
+                want = (w1_experts, "blocks", n) if ndim == 3 else (w1_experts, n)
                 raise ValueError(
                     f"{name} layout {tuple(s.shape)} is not the "
                     f"{form.scale_layout} form {want} the kernel "
@@ -387,6 +405,10 @@ def fused_ep_moe_v2(
                 )
     (ax,) = mesh.axis_names
     ep = mesh.shape[ax]
+    if ep % ep_tp_size:
+        raise ValueError(f"mesh size {ep} is not divisible by ep_tp_size={ep_tp_size}")
+    if ep_tp_size > 1 and mesh_ep_ranks is not None:
+        raise ValueError("ep_tp_size > 1 requires a rank-ordered EP mesh")
     if mesh_ep_ranks is not None:
         mesh_ep_ranks = tuple(int(rank) for rank in mesh_ep_ranks)
         if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
@@ -426,6 +448,8 @@ def fused_ep_moe_v2(
         )
     has_w1_bias = w1_bias is not None
     has_w2_bias = w2_bias is not None
+    if ep_tp_size > 1 and (has_w1_bias or has_w2_bias):
+        raise NotImplementedError("ep_tp_size > 1 does not support expert biases")
     has_score_bias = score_bias is not None
     has_hash_ids = hash_topk_ids is not None
     if scoring_fn not in SCORING_FNS:
@@ -459,6 +483,7 @@ def fused_ep_moe_v2(
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
         **({} if wire_dtype is None else {"wire_dtype": jnp.dtype(wire_dtype)}),
+        **({} if ep_tp_size == 1 else {"ep_tp_size": ep_tp_size}),
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -666,7 +691,19 @@ def fused_ep_moe_v2(
         # row of the count table rather than its own reduction, so this
         # builder's second value is not read; it leaves the program with
         # the rest of the dead code, and its own test still sees it.
-        visit, _ = expert_visit_list(expert_rows, g_local)
+        if ep_tp_size > 1:
+            tp_grp = lax.div(me, jnp.int32(ep_tp_size))
+            grp_rows = lax.dynamic_slice(
+                routing.expert_rows_aligned,
+                (tp_grp * ep_tp_size * g_local,),
+                (ep_tp_size * g_local,),
+            ).reshape(ep_tp_size, g_local)
+            tp_order = jnp.argsort(-grp_rows, axis=1, stable=True).astype(jnp.int32)
+            sorted_rows = jnp.take_along_axis(grp_rows, tp_order, axis=1)
+            active_step = (sorted_rows.max(axis=0, keepdims=True) > 0).astype(jnp.int32)
+            visit = jnp.concatenate([tp_order, active_step], axis=0)
+        else:
+            visit, _ = expert_visit_list(expert_rows, g_local)
         # One pass builds every count the kernel needs, still spread over
         # the expert-parallel axis; the kernel's scalar core closes them.
         counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
@@ -789,6 +826,7 @@ def fused_ep_moe_v2(
         has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
         None if wire_dtype is None else jnp.dtype(wire_dtype),
+        ep_tp_size,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
