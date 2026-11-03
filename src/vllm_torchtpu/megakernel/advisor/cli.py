@@ -75,9 +75,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--collective-latency-us", type=float, default=None)
     parser.add_argument("--phase", choices=get_args(Phase), default="decode")
     parser.add_argument(
-        "--moe-mode", choices=get_args(MoEMode), default="token_masked_vmem"
+        "--moe-mode", choices=get_args(MoEMode), default="masked_on_chip"
     )
     parser.add_argument("--no-vmem-alias", dest="vmem_alias", action="store_false")
+    parser.add_argument(
+        "--no-deployment-preset",
+        dest="deployment_preset",
+        action="store_false",
+        help="Ignore the model's shipped layouts and auto-pick parallelism",
+    )
     for bool_flag in (
         "--megacore",
         "--vmem-fit-headroom",
@@ -140,6 +146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             op_overhead_us=args.op_overhead_us,
             vmem_budget_mib=args.vmem_budget_mib,
             dma_buffers=args.dma_buffers,
+            deployment_preset=args.deployment_preset,
         )
         if args.html:
             write_advisor_html(sweep, args.html)

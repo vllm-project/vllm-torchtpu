@@ -18,7 +18,9 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import json
+import re
 import sys
+import xml.etree.ElementTree as ET
 from typing import TYPE_CHECKING
 
 import pytest
@@ -154,6 +156,19 @@ _KIMI_GROUPED_B_TOK = 139264
 _KIMI_CROSS_T_MAX = 67
 _KIMI_1L_T_MAX = 384
 _QWEN38_CROSS_T_MAX = 42
+# Shipped Qwen3.5 decode megakernel: largest single-call verify bucket (rows).
+_QWEN35_SHIPPED_VERIFY_ROWS = 80
+# 16 sequences x MTP-3 verify (4 rows per sequence) in one call.
+_QWEN35_VERIFY_ROWS_MIN = 64
+# Shipped Kimi-K3 prefill calls: embedding + layers 0-3, 11 groups, last layer.
+_K3_PREFILL_CALLS = 13
+# Per-decode-pod concurrency at the two saturation points: 152 (one decode pod)
+# and 600 split over three decode pods.
+_SATURATION_POD_CONCURRENCY = (152, 600 // 3)
+# Long-context serving mix: mean prompt and output tokens per request.
+_LONG_CTX_ISL, _LONG_CTX_OSL = 96937, 912
+_KERNEL_NAME_DENYLIST = re.compile(r"gmm|ragged_dot|megablox|sparsecore|mxu", re.I)
+_SVG_NS = "{http://www.w3.org/2000/svg}"
 
 
 def test_package_reexport_without_prior_submodule_import() -> None:
@@ -316,18 +331,18 @@ def test_per_token_vmem_live_interval_and_sharding() -> None:
         spec_tokens=3,
         tp=32,
         ep=32,
-        moe_mode="expert_grouped_vmem",
+        moe_mode="grouped_on_chip",
     )
     parts_grp = advisor.compute_per_token_vmem_bytes(pk3, wl_grp)
     assert parts_grp["total_per_token_bytes"] == _KIMI_GROUPED_B_TOK
     assert parts_grp["b_tok"] == _KIMI_GROUPED_B_TOK
     rep_grp = advisor.advise(pk3, wl_grp, "tpu7x")
-    cross_sc = next(s for s in rep_grp.scopes if s.scope == "cross_layer")
+    cross_sc = next(s for s in rep_grp.scopes if s.scope == "whole_step")
     one_l_sc = next(s for s in rep_grp.scopes if s.scope == "single_layer")
     assert cross_sc.max_vmem_tokens == _KIMI_CROSS_T_MAX
     assert one_l_sc.max_vmem_tokens == _KIMI_1L_T_MAX
 
-    wl_msk = dataclasses.replace(wl_grp, moe_mode="token_masked_vmem")
+    wl_msk = dataclasses.replace(wl_grp, moe_mode="masked_on_chip")
     parts_msk = advisor.compute_per_token_vmem_bytes(pk3, wl_msk)
     assert parts_grp["total_per_token_bytes"] < parts_msk["total_per_token_bytes"]
 
@@ -401,7 +416,7 @@ def test_multi_tpu_vmem_and_fp8_dtype_physics() -> None:
 
     p397 = advisor.model_profile_from_hf_config(_QWEN35_397B_CFG, name="qwen35-397b")
     rep_v4 = advisor.advise(p397, advisor.WorkloadSpec(tp=8, batch=4), cv4)
-    v4_cross = next(s for s in rep_v4.scopes if s.scope == "cross_layer")
+    v4_cross = next(s for s in rep_v4.scopes if s.scope == "whole_step")
     assert rep_v4.hbm_fits is False
     assert rep_v4.build_megakernel is False
     assert v4_cross.t_vmem_max == 0
@@ -454,7 +469,7 @@ def test_multi_tpu_vmem_and_fp8_dtype_physics() -> None:
         pdsv3, advisor.WorkloadSpec(tp=8, kv_split=2, batch=32, context=8192), c7x
     )
     assert r_ds2.hbm_used_gb < r_ds1.hbm_used_gb
-    assert next(s for s in r_ds1.scopes if s.scope == "cross_layer").feasible is False
+    assert next(s for s in r_ds1.scopes if s.scope == "whole_step").feasible is False
     r_ver = advisor.advise(
         pdsv3, advisor.WorkloadSpec(phase="verify", tp=8, batch=8, spec_tokens=3), c7x
     )
@@ -521,9 +536,9 @@ def test_asymptotic_decode_intensity_and_vmem_fit_headroom() -> None:
     )
     assert r_alias.vmem_budget_mib == _TPU7X_VMEM_MIB
     assert r_no_alias.vmem_budget_mib == _FIT_VMEM_MIB
-    cx_alias = next(s for s in r_alias.scopes if s.scope == "cross_layer")
-    cx_no_al = next(s for s in r_no_alias.scopes if s.scope == "cross_layer")
-    cx_disp = next(s for s in r_no_alias_disp.scopes if s.scope == "cross_layer")
+    cx_alias = next(s for s in r_alias.scopes if s.scope == "whole_step")
+    cx_no_al = next(s for s in r_no_alias.scopes if s.scope == "whole_step")
+    cx_disp = next(s for s in r_no_alias_disp.scopes if s.scope == "whole_step")
     assert cx_alias.n_splits == 1
     assert cx_no_al.n_splits > 1
     assert cx_no_al.w_crit_gb is not None
@@ -533,63 +548,59 @@ def test_asymptotic_decode_intensity_and_vmem_fit_headroom() -> None:
 
 
 def test_all_four_fusion_scopes_reachable() -> None:
-    """Prove `cross_layer`, `single_layer`, `stage`, and `sublayer` each win."""
+    """Prove `whole_step`, `single_layer`, `stage`, and `per_op` each win."""
     p08 = advisor.model_profile_from_hf_config(_QWEN35_08B_CFG, name="qwen35-0.8b")
     p397 = advisor.model_profile_from_hf_config(_QWEN35_397B_CFG, name="qwen35-397b")
     pllama = advisor.resolve_model_profile("llama-3.1-405b")
 
-    # 1. `cross_layer` (`full_step`) wins on 397B TP8 decode and 0.8B prefill.
+    # 1. `whole_step` (`whole_step`) wins on 397B TP8 decode and 0.8B prefill.
     r_dec = advisor.advise(
         p397, advisor.WorkloadSpec(phase="decode", batch=16, tp=8), "tpu7x"
     )
-    assert r_dec.recommended_scope == "cross_layer"
-    assert r_dec.recommended_fusion_mode == "full_step"
-    assert r_dec.recommended_moe_mode == "token_masked_vmem"
+    assert r_dec.recommended_scope == "whole_step"
+    assert r_dec.recommended_moe_mode == "masked_on_chip"
     assert r_dec.build_megakernel is True
     r_b32 = advisor.advise(
         p397, advisor.WorkloadSpec(phase="decode", batch=32, tp=8), "tpu7x"
     )
-    assert r_b32.recommended_scope == "cross_layer"
-    assert r_b32.recommended_moe_mode == "expert_grouped_vmem"
+    assert r_b32.recommended_scope == "whole_step"
+    assert r_b32.recommended_moe_mode == "grouped_on_chip"
     r_08_pre = advisor.advise(
         p08, advisor.WorkloadSpec(phase="prefill", batch=1, isl=2048, tp=8), "tpu7x"
     )
-    assert r_08_pre.recommended_scope == "cross_layer"
+    assert r_08_pre.recommended_scope == "whole_step"
     assert r_08_pre.recommended_moe_mode == "dense_mlp"
 
     # 2. `single_layer` (`layer`) wins in the B=96 VMEM cliff band on tpu7x,
-    # whereas v6e (TP16) and v5p Megacore (TP8) keep `cross_layer` in 1 pass.
+    # whereas v6e (TP16) and v5p Megacore (TP8) keep `whole_step` in 1 pass.
     r_b96_7x = advisor.advise(
         p397, advisor.WorkloadSpec(phase="decode", batch=96, tp=8), "tpu7x"
     )
     assert r_b96_7x.recommended_scope == "single_layer"
-    assert r_b96_7x.recommended_fusion_mode == "layer"
-    assert r_b96_7x.recommended_moe_mode == "expert_grouped_vmem"
+    assert r_b96_7x.recommended_moe_mode == "grouped_on_chip"
     r_b96_v6e = advisor.advise(
         p397, advisor.WorkloadSpec(phase="decode", batch=96, tp=16), "v6e"
     )
-    assert r_b96_v6e.recommended_scope == "cross_layer"
+    assert r_b96_v6e.recommended_scope == "whole_step"
     v5p_mc = advisor.resolve_chip_spec("v5p", megacore=True)
     r_b96_v5p_mc = advisor.advise(
         p397, advisor.WorkloadSpec(phase="decode", batch=96, tp=8), v5p_mc
     )
-    assert r_b96_v5p_mc.recommended_scope == "cross_layer"
+    assert r_b96_v5p_mc.recommended_scope == "whole_step"
     r_ep8_sat = advisor.advise(
         p397, advisor.WorkloadSpec(phase="decode", batch=600, tp=2, dp=4, ep=8), "tpu7x"
     )
-    assert r_ep8_sat.recommended_scope == "sublayer"
-    assert r_ep8_sat.recommended_fusion_mode == "modular_kernel"
-    assert r_ep8_sat.recommended_moe_mode == "standalone_ragged_dot"
+    assert r_ep8_sat.recommended_scope == "per_op"
+    assert r_ep8_sat.recommended_moe_mode == "grouped_in_hbm"
 
     r_llama_pre = advisor.advise(
         pllama, advisor.WorkloadSpec(phase="prefill", batch=1, isl=4096, tp=8), "tpu7x"
     )
-    assert r_llama_pre.recommended_scope == "sublayer"
-    assert r_llama_pre.recommended_fusion_mode == "modular_kernel"
+    assert r_llama_pre.recommended_scope == "per_op"
     assert r_llama_pre.recommended_moe_mode == "dense_mlp"
     assert r_llama_pre.build_megakernel is False
 
-    # 3. `stage` (`segment`) wins on PP8 tail and segmented TP8 (`segment=10`).
+    # 3. `layer_group` wins on PP8 tail and segmented TP8 (`segment_layers=10`).
     r_stg = advisor.advise(
         p397,
         advisor.WorkloadSpec(
@@ -597,16 +608,15 @@ def test_all_four_fusion_scopes_reachable() -> None:
         ),
         "tpu7x",
     )
-    assert r_stg.recommended_scope == "stage"
-    assert r_stg.recommended_fusion_mode == "segment"
+    assert r_stg.recommended_scope == "layer_group"
     r_seg = advisor.advise(
         p397,
         advisor.WorkloadSpec(phase="decode", batch=16, tp=8, segment_layers=10),
         "tpu7x",
     )
-    assert r_seg.recommended_scope == "stage"
+    assert r_seg.recommended_scope == "layer_group"
     assert (
-        next(s for s in r_seg.scopes if s.scope == "stage").ops_per_step
+        next(s for s in r_seg.scopes if s.scope == "layer_group").ops_per_step
         == _STAGE_OPS_PER_STEP
     )
     r_16k = advisor.advise(
@@ -614,44 +624,35 @@ def test_all_four_fusion_scopes_reachable() -> None:
         advisor.WorkloadSpec(phase="prefill", batch=8, isl=16384, tp=1, pp=8),
         "tpu7x",
     )
-    assert r_16k.recommended_scope == "sublayer"
+    assert r_16k.recommended_scope == "per_op"
     assert r_16k.build_megakernel is False
 
 
 def test_bare_minimum_auto_parallelism_and_html_regime_report(tmp_path: Path) -> None:
     """Verify bare-minimum Model + TPUv7x 12-regime sweep and HTML SVG export."""
-    sweep_397 = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    sweep_397 = advisor.advise_regimes("qwen3.5-397b", "tpu7x", deployment_preset=False)
     assert sweep_397.parallelism.auto_selected is True
     assert (sweep_397.parallelism.tp, sweep_397.parallelism.ep) == (8, 8)
     assert "2x2x1" in sweep_397.parallelism.topology
     assert len(sweep_397.regimes) == _NUM_REGIMES
     by_label = {r.label: r for r in sweep_397.regimes}
+    assert by_label["Decode Small (B=4, T=1, 4K)"].recommended_scope == "whole_step"
     assert (
-        by_label["Decode Small (B=4, T=1, 4K)"].recommended_fusion_mode == "full_step"
+        by_label["Decode Small (B=4, T=1, 4K)"].recommended_moe_mode == "masked_on_chip"
     )
-    assert (
-        by_label["Decode Small (B=4, T=1, 4K)"].recommended_moe_mode
-        == "token_masked_vmem"
-    )
-    assert (
-        by_label["Decode High (B=64, T=1, 32K)"].recommended_fusion_mode == "full_step"
-    )
+    assert by_label["Decode High (B=64, T=1, 32K)"].recommended_scope == "whole_step"
     assert (
         by_label["Decode High (B=64, T=1, 32K)"].recommended_moe_mode
-        == "expert_grouped_vmem"
+        == "grouped_on_chip"
     )
-    assert by_label["Chunked Prefill (B=1, T=256)"].recommended_fusion_mode == "layer"
+    assert by_label["Chunked Prefill (B=1, T=256)"].recommended_scope == "single_layer"
     assert (
         by_label["Chunked Prefill (B=1, T=256)"].recommended_moe_mode
-        == "expert_grouped_vmem"
+        == "grouped_on_chip"
     )
+    assert by_label["Long Prefill (B=1, T=4096)"].recommended_scope == "per_op"
     assert (
-        by_label["Long Prefill (B=1, T=4096)"].recommended_fusion_mode
-        == "modular_kernel"
-    )
-    assert (
-        by_label["Long Prefill (B=1, T=4096)"].recommended_moe_mode
-        == "standalone_ragged_dot"
+        by_label["Long Prefill (B=1, T=4096)"].recommended_moe_mode == "grouped_in_hbm"
     )
 
     sweep_dcp = advisor.advise_regimes("qwen3.5-397b", "tpu7x", dcp=4, pcp=2)
@@ -665,8 +666,8 @@ def test_bare_minimum_auto_parallelism_and_html_regime_report(tmp_path: Path) ->
     sweep_k3 = advisor.advise_regimes("kimi-k3.1-pro", "tpu7x")
     assert (sweep_k3.parallelism.tp, sweep_k3.parallelism.ep) == (32, 32)
     assert "2x2x4" in sweep_k3.parallelism.topology
-    assert sweep_k3.regimes[0].recommended_fusion_mode == "full_step"
-    assert sweep_k3.regimes[-1].recommended_fusion_mode == "modular_kernel"
+    assert sweep_k3.regimes[0].recommended_scope == "whole_step"
+    assert sweep_k3.regimes[-1].recommended_scope == "per_op"
 
     html_file = tmp_path / "advisor_report.html"
     advisor.write_advisor_html(sweep_397, html_file)
@@ -674,18 +675,18 @@ def test_bare_minimum_auto_parallelism_and_html_regime_report(tmp_path: Path) ->
     assert "<svg" in html_text
     assert "advisor-data" in html_text
     assert "qwen3.5-397b" in html_text
-    assert "modular_kernel" in html_text
-    assert "token_masked_vmem" in html_text
-    assert "expert_grouped_vmem" in html_text
-    assert "standalone_ragged_dot" in html_text
+    assert "per_op" in html_text
+    assert "masked_on_chip" in html_text
+    assert "grouped_on_chip" in html_text
+    assert "grouped_in_hbm" in html_text
     table_txt = advisor.format_regime_table(sweep_397)
     assert "Decode Small (B=4, T=1, 4K)" in table_txt
-    assert "Execution Strategy Legend:" in table_txt
+    assert "Scope (where the kernel boundary falls):" in table_txt
     assert "Tailoring Guide:" in table_txt
 
 
 def test_qwen38_24t_decode_regime_crossover_and_moe_modes() -> None:
-    """Verify Qwen3.8-2.4T TP32xEP32 recommends full_step for B=4, 8, 16 decode."""
+    """Verify Qwen3.8-2.4T TP32xEP32 recommends whole_step for B=4, 8, 16 decode."""
     sweep_24t = advisor.advise_regimes("qwen3.8-2.4t", "tpu7x")
     assert (sweep_24t.parallelism.tp, sweep_24t.parallelism.ep) == (32, 32)
     assert sweep_24t.max_vmem_tokens == _QWEN38_CROSS_T_MAX
@@ -698,8 +699,8 @@ def test_qwen38_24t_decode_regime_crossover_and_moe_modes() -> None:
         "Spec Verify Small (B=4, K=3)",
     ):
         entry = by_label[small_lbl]
-        assert entry.recommended_fusion_mode == "full_step"
-        assert entry.recommended_moe_mode == "token_masked_vmem"
+        assert entry.recommended_scope == "whole_step"
+        assert entry.recommended_moe_mode == "masked_on_chip"
         assert entry.num_vmem_splits == 1
 
     for layer_lbl in (
@@ -708,12 +709,12 @@ def test_qwen38_24t_decode_regime_crossover_and_moe_modes() -> None:
         "Chunked Prefill (B=1, T=256)",
     ):
         entry = by_label[layer_lbl]
-        assert entry.recommended_fusion_mode == "layer"
-        assert entry.recommended_moe_mode == "expert_grouped_vmem"
+        assert entry.recommended_scope == "single_layer"
+        assert entry.recommended_moe_mode == "grouped_on_chip"
 
     long_pre = by_label["Long Prefill (B=1, T=4096)"]
-    assert long_pre.recommended_fusion_mode == "modular_kernel"
-    assert long_pre.recommended_moe_mode == "standalone_ragged_dot"
+    assert long_pre.recommended_scope == "per_op"
+    assert long_pre.recommended_moe_mode == "grouped_in_hbm"
 
 
 def test_vmem_budget_override_and_dma_buffers_triple_buffering() -> None:
@@ -732,9 +733,9 @@ def test_vmem_budget_override_and_dma_buffers_triple_buffering() -> None:
         ),
         "tpu7x",
     )
-    cx_2 = next(s for s in rep_2buf.scopes if s.scope == "cross_layer")
-    cx_3 = next(s for s in rep_3buf.scopes if s.scope == "cross_layer")
-    cx_vmem = next(s for s in rep_custom_vmem.scopes if s.scope == "cross_layer")
+    cx_2 = next(s for s in rep_2buf.scopes if s.scope == "whole_step")
+    cx_3 = next(s for s in rep_3buf.scopes if s.scope == "whole_step")
+    cx_vmem = next(s for s in rep_custom_vmem.scopes if s.scope == "whole_step")
     assert rep_2buf.vmem_budget_mib == _TPU7X_VMEM_MIB
     assert rep_custom_vmem.vmem_budget_mib == _CUSTOM_VMEM_MIB
     assert cx_vmem.max_vmem_tokens < cx_2.max_vmem_tokens
@@ -765,19 +766,19 @@ def test_advise_from_model_spec_and_planner() -> None:
     """Verify `advise_from_spec` bridges periodic and non-periodic `ModelSpec`."""
     ms = make_fake_model_spec(L=4, att_every=4, H=256)
     ex = ExecSpec(B=4, T=1, R=2, ctx=1024, tiles=TINY_TILES)
-    rep = advisor.advise_from_spec(ms, ex, chip="tpu7x", moe_mode="binned_vmem")
-    assert rep.recommended_scope == "cross_layer"
+    rep = advisor.advise_from_spec(ms, ex, chip="tpu7x", moe_mode="grouped_on_chip")
+    assert rep.recommended_scope == "whole_step"
     rep_def = advisor.advise_from_spec(
-        ms, ExecSpec(B=4, T=1, R=2, ctx=1024), chip="tpu7x", moe_mode="binned_vmem"
+        ms, ExecSpec(B=4, T=1, R=2, ctx=1024), chip="tpu7x", moe_mode="grouped_on_chip"
     )
-    assert rep_def.recommended_scope == "cross_layer"
+    assert rep_def.recommended_scope == "whole_step"
     assert rep_def.vmem_budget_mib == _TPU7X_VMEM_MIB
 
     ms_non_periodic = make_fake_model_spec(L=5, att_every=4, H=256)
     rep_np = advisor.advise_from_spec(
-        ms_non_periodic, ex, chip="tpu7x", moe_mode="binned_vmem"
+        ms_non_periodic, ex, chip="tpu7x", moe_mode="grouped_on_chip"
     )
-    cross = next(s for s in rep_np.scopes if s.scope == "cross_layer")
+    cross = next(s for s in rep_np.scopes if s.scope == "whole_step")
     assert cross.feasible is False
     assert rep_np.recommended_scope == "single_layer"
 
@@ -814,8 +815,7 @@ def test_cli_json_presets_and_validation_errors(
     )
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["recommended_scope"] == "cross_layer"
-    assert payload["recommended_fusion_mode"] == "full_step"
+    assert payload["recommended_scope"] == "whole_step"
     assert payload["recommended_moe_mode"] == "dense_mlp"
     assert payload["build_megakernel"] is True
     assert payload["vmem_budget_mib"] == _TPU7X_VMEM_MIB
@@ -837,7 +837,7 @@ def test_cli_json_presets_and_validation_errors(
         == 0
     )
     sweep_stdout = capsys.readouterr().out
-    assert "TP=8 x EP=8" in sweep_stdout
+    assert "Decode Parallelism: TP8 x DCP4 x EP8" in sweep_stdout
     assert "usable=60.0 MiB" in sweep_stdout
     assert html_out.is_file()
 
@@ -871,3 +871,142 @@ def test_cli_json_presets_and_validation_errors(
     )
     with pytest.raises(MegakernelConfigError):
         advisor.advise(bad_dense, advisor.WorkloadSpec(tp=8))
+
+
+def _preset_fields(layout: advisor.ParallelLayout) -> dict[str, object]:
+    """Return WorkloadSpec mesh fields for a deployment preset layout."""
+    return {
+        "tp": layout.tp,
+        "ep": layout.ep,
+        "dp": layout.dp,
+        "pp": layout.pp,
+        "dcp": layout.dcp,
+        "pcp": layout.pcp,
+        "layer_groups": layout.layer_groups,
+    }
+
+
+def test_qwen35_decode_preset_whole_step_admits_shipped_verify_rows() -> None:
+    """Verify the whole_step ceiling fits 64 verify rows and lands near 80."""
+    dep = advisor.DEPLOYMENT_PRESETS["qwen3.5-397b"]
+    rows_per_seq = dep.decode.spec_tokens + 1
+    rep = advisor.advise(
+        advisor.resolve_model_profile("qwen3.5-397b"),
+        advisor.WorkloadSpec(
+            phase="verify",
+            batch=_QWEN35_VERIFY_ROWS_MIN // rows_per_seq,
+            spec_tokens=dep.decode.spec_tokens,
+            moe_mode="grouped_on_chip",
+            **_preset_fields(dep.decode),  # type: ignore[arg-type]
+        ),
+        "tpu7x",
+    )
+    whole = next(s for s in rep.scopes if s.scope == "whole_step")
+    rows_cap = rows_per_seq * (whole.t_vmem_max // rows_per_seq)
+    assert rows_cap >= _QWEN35_VERIFY_ROWS_MIN
+    assert abs(rows_cap - _QWEN35_SHIPPED_VERIFY_ROWS) <= rows_per_seq
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Known mismatch: the shipped saturation layout ran per-op kernels, "
+    "but tokens per core (38 and 50) fit the whole_step ceiling; the cost model "
+    "has no term for what made per_op win there.",
+)
+@pytest.mark.parametrize("pod_concurrency", _SATURATION_POD_CONCURRENCY)
+def test_qwen35_saturation_preset_prefers_per_op(pod_concurrency: int) -> None:
+    """Verify per-pod saturation decode at the saturation layout picks per_op."""
+    dep = advisor.DEPLOYMENT_PRESETS["qwen3.5-397b"]
+    assert dep.saturation is not None
+    rep = advisor.advise(
+        advisor.resolve_model_profile("qwen3.5-397b"),
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=pod_concurrency,
+            isl=_LONG_CTX_ISL,
+            osl=_LONG_CTX_OSL,
+            **_preset_fields(dep.saturation),  # type: ignore[arg-type]
+        ),
+        "tpu7x",
+    )
+    assert rep.recommended_scope == "per_op"
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4, 8])
+def test_kimi_k3_decode_preset_low_batch_prefers_whole_step(batch: int) -> None:
+    """Verify Kimi-K3 decode at batch 1..8 on the TP32 mesh is one call."""
+    dep = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    rep = advisor.advise(
+        advisor.resolve_model_profile("kimi-k3"),
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=batch,
+            **_preset_fields(dep.decode),  # type: ignore[arg-type]
+        ),
+        "tpu7x",
+    )
+    assert rep.recommended_scope == "whole_step"
+
+
+@pytest.mark.parametrize("window", [2048, 8192])
+def test_kimi_k3_prefill_preset_evaluates_layer_group(window: int) -> None:
+    """Verify the shipped 13-call layer grouping is feasible and evaluated."""
+    dep = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    rep = advisor.advise(
+        advisor.resolve_model_profile("kimi-k3"),
+        advisor.WorkloadSpec(
+            phase="prefill",
+            batch=1,
+            isl=window,
+            chunk_size=window,
+            moe_mode="grouped_on_chip",
+            **_preset_fields(dep.prefill),  # type: ignore[arg-type]
+        ),
+        "tpu7x",
+    )
+    group = next(s for s in rep.scopes if s.scope == "layer_group")
+    assert group.feasible
+    assert group.ops_per_step == _K3_PREFILL_CALLS
+    assert rep.active_tokens == window // dep.prefill.pcp
+
+
+def test_layer_groups_must_cover_every_layer() -> None:
+    """Verify a layer grouping that does not sum to num_layers is rejected."""
+    with pytest.raises(MegakernelConfigError):
+        advisor.advise(
+            advisor.resolve_model_profile("kimi-k3"),
+            advisor.WorkloadSpec(tp=32, ep=32, layer_groups=(8, 8)),
+            "tpu7x",
+        )
+
+
+@pytest.mark.parametrize("model", ["qwen3.5-397b", "kimi-k3"])
+def test_regime_dot_plot_labels_once_and_inside_viewbox(model: str) -> None:
+    """Verify each regime label renders once and no text leaves the viewBox."""
+    sweep = advisor.advise_regimes(model, "tpu7x")
+    svg = advisor.report._render_regime_dot_plot_svg(sweep)  # noqa: SLF001
+    root = ET.fromstring(svg)
+    _, _, width, height = (float(v) for v in root.get("viewBox", "").split())
+    texts = list(root.iter(f"{_SVG_NS}text"))
+    for entry in sweep.regimes:
+        assert sum(t.text == entry.label for t in texts) == 1
+    for t in texts:
+        size = float(t.get("font-size", "0"))
+        assert size >= advisor.report._SVG_FONT_PX  # noqa: SLF001
+        span = advisor.report._text_width(t.text or "", size)  # noqa: SLF001
+        x, y = float(t.get("x", "0")), float(t.get("y", "0"))
+        left = {"start": x, "middle": x - span / 2, "end": x - span}[
+            t.get("text-anchor", "start")
+        ]
+        assert left >= 0.0
+        assert left + span <= width
+        assert y - size >= 0.0
+        assert y <= height
+
+
+@pytest.mark.parametrize("model", ["qwen3.5-397b", "kimi-k3", "qwen3.8-2.4t"])
+def test_reports_name_mechanisms_not_kernels(model: str) -> None:
+    """Verify the text table and HTML name no kernel or hardware unit."""
+    sweep = advisor.advise_regimes(model, "tpu7x")
+    rendered = advisor.format_regime_table(sweep) + advisor.render_advisor_html(sweep)
+    assert _KERNEL_NAME_DENYLIST.search(rendered) is None

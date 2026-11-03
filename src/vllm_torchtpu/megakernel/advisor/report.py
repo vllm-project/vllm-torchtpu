@@ -30,10 +30,19 @@ if TYPE_CHECKING:
     )
 
 _MOE_MODE_SHORT_HINTS: Mapping[str, str] = {
-    "token_masked_vmem": "Stream active experts to VMEM; mask [T, H] rows (T_ep < 32)",
-    "expert_grouped_vmem": "Compact tokens by expert in VMEM (32 <= T_ep <= T_max)",
-    "standalone_ragged_dot": "HBM SparseCore sort + standalone Pallas ragged_dot",
-    "dense_mlp": "Dense SwiGLU FFN (no routed experts)",
+    "masked_on_chip": "Routed experts stream into VMEM; token rows are masked "
+    "per expert inside the fused call; no reordering",
+    "grouped_on_chip": "Tokens are grouped by expert inside VMEM, then each "
+    "expert runs on its rows inside the fused call",
+    "grouped_in_hbm": "Tokens are sorted by expert in HBM; the MoE is its own "
+    "call, so the kernel boundary falls at each MoE",
+    "dense_mlp": "Dense feed-forward; no routed experts",
+}
+_SCOPE_HINTS: Mapping[str, str] = {
+    "whole_step": "one call for the whole step; [T, H] stays in VMEM",
+    "layer_group": "one call per group of N layers",
+    "single_layer": "one call per layer",
+    "per_op": "one call per operator; activations hand off through HBM",
 }
 
 
@@ -53,8 +62,7 @@ def format_advisor_summary(rep: AdvisorReport) -> str:
         ),
         (
             f"Recommended: {rep.recommended_scope} "
-            f"[mode={rep.recommended_fusion_mode}, "
-            f"moe={rep.recommended_moe_mode}] "
+            f"[moe={rep.recommended_moe_mode}] "
             f"(build={rep.build_megakernel})"
         ),
         f"Rationale: {rep.rationale}",
@@ -66,7 +74,7 @@ def format_advisor_summary(rep: AdvisorReport) -> str:
         ),
     ]
     lines.extend(
-        f"  - {sc.scope:12s} ({sc.fusion_mode:14s}) {sc.step_bound_us:9.1f} us "
+        f"  - {sc.scope:12s} {sc.step_bound_us:9.1f} us "
         f"[t_max={sc.t_vmem_max:4d}, passes={sc.n_splits:2d}, "
         f"static_vmem={sc.vmem_static_mib:5.2f} MiB]"
         for sc in rep.scopes
@@ -79,23 +87,33 @@ def format_regime_table(sweep: AdvisorSweepReport) -> str:
     rec = sweep.parallelism
     vmem = sweep.vmem_breakdown_bytes
     per_tok_kib = sweep.per_token_vmem_bytes / 1024.0
-    mode_tag = "auto-recommended" if rec.auto_selected else "user-specified"
-    hdr = (
-        f"{'Request Regime':33s} | {'Tokens':>6s} | {'AI (FLOP/B)':>11s} | "
-        f"{'Passes':>6s} | {'Fusion Mode':14s} | {'MoE Mode':21s} | {'Step (us)':>10s}"
+    mode_tag = rec.source or (
+        "auto-recommended" if rec.auto_selected else "user-specified"
     )
+    hdr = (
+        f"{'Request Regime':36s} | {'Layout':22s} | {'Tokens':>6s} | "
+        f"{'AI (FLOP/B)':>11s} | {'Passes':>6s} | {'Scope':12s} | "
+        f"{'MoE Mode':15s} | {'Step (us)':>10s}"
+    )
+    layout_lines = [
+        f"Decode Parallelism: {rec.label()} [{rec.topology}] ({mode_tag})",
+    ]
+    pre = sweep.prefill_parallelism
+    if pre is not None:
+        groups = f", {len(pre.layer_groups)} layer groups" if pre.layer_groups else ""
+        layout_lines.append(
+            f"Prefill Parallelism: {pre.label()} [{pre.topology}] "
+            f"({pre.source}{groups})"
+        )
     lines = [
         f"=== Megakernel Advisor Regime Report: {sweep.model} on {sweep.chip} ===",
-        (
-            f"Parallelism: TP={rec.tp} x EP={rec.ep} x DP={rec.dp} x PP={rec.pp} "
-            f"x DCP={rec.dcp} x PCP={rec.pcp} [{rec.topology}] ({mode_tag})"
-        ),
+        *layout_lines,
         (
             f"HBM Footprint: {rec.hbm_used_gb:.2f} / {rec.hbm_capacity_gb:.1f} GB/core "
             f"(active weights/step: {rec.w_step_gb:.2f} GB/core)"
         ),
         (
-            f"VMEM Ceiling (full_step, {sweep.dma_buffers}-slot DMA): "
+            f"VMEM Ceiling (whole_step, {sweep.dma_buffers}-slot DMA): "
             f"max_vmem_tokens = {sweep.max_vmem_tokens} tokens "
             f"(usable={sweep.vmem_budget_mib:.1f} MiB, "
             f"static={sweep.vmem_static_mib:.2f} MiB, "
@@ -111,25 +129,25 @@ def format_regime_table(sweep: AdvisorSweepReport) -> str:
         ),
         "",
         hdr,
-        "-" * 119,
+        "-" * len(hdr),
     ]
     lines.extend(
-        f"{entry.label:33s} | {entry.active_tokens:6d} | "
+        f"{entry.label:36s} | {entry.layout:22s} | {entry.active_tokens:6d} | "
         f"{entry.step_arithmetic_intensity:11.2f} | {entry.num_vmem_splits:6d} | "
-        f"{entry.recommended_fusion_mode:14s} | {entry.recommended_moe_mode:21s} | "
+        f"{entry.recommended_scope:12s} | {entry.recommended_moe_mode:15s} | "
         f"{entry.step_bound_us:10.1f}"
         for entry in sweep.regimes
     )
     lines.extend(
         [
             "",
-            "Execution Strategy Legend:",
-            "  * token_masked_vmem     : Stream active experts to VMEM; "
-            "apply [T, H] routing mask (avoids sort when T_per_ep < 32).",
-            "  * expert_grouped_vmem   : Compact tokens by expert ID inside VMEM "
-            "into 32-row tiles (32 <= T_per_ep <= T_max).",
-            "  * standalone_ragged_dot : Out-of-kernel SparseCore HBM sort + "
-            "standalone Pallas ragged_dot (modular_kernel path).",
+            "Scope (where the kernel boundary falls):",
+            *(f"  * {name:14s}: {hint}." for name, hint in _SCOPE_HINTS.items()),
+            "MoE Mode (where tokens are grouped by expert):",
+            *(
+                f"  * {name:14s}: {hint}."
+                for name, hint in _MOE_MODE_SHORT_HINTS.items()
+            ),
             "",
             "Tailoring Guide:",
         ]
@@ -148,7 +166,7 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
     residual_per_tok_mib = sweep.vmem_breakdown_bytes["residual_buffer_bytes"] / (
         1 << 20
     )
-    sublayer_per_tok_mib = (
+    per_op_per_tok_mib = (
         sweep.per_token_vmem_bytes - sweep.vmem_breakdown_bytes["residual_buffer_bytes"]
     ) / (1 << 20)
 
@@ -179,15 +197,15 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
         cx = pad_l + (idx + 0.5) * (pw / len(token_ticks))
         x0 = cx - bar_w / 2
         residual_mib = residual_per_tok_mib * tok
-        sublayer_mib = sublayer_per_tok_mib * tok
-        total_mib = static_vmem_mib + residual_mib + sublayer_mib
+        per_op_mib = per_op_per_tok_mib * tok
+        total_mib = static_vmem_mib + residual_mib + per_op_mib
         h_static = min(ph, (static_vmem_mib / cap_mib) * ph)
         h_residual = min(ph - h_static, (residual_mib / cap_mib) * ph)
-        h_sublayer = min(ph - h_static - h_residual, (sublayer_mib / cap_mib) * ph)
+        h_per_op = min(ph - h_static - h_residual, (per_op_mib / cap_mib) * ph)
 
         y_static = pad_t + ph - h_static
         y_residual = y_static - h_residual
-        y_sublayer = y_residual - h_sublayer
+        y_per_op = y_residual - h_per_op
         parts.append(
             f'<rect x="{x0:.1f}" y="{y_static:.1f}" width="{bar_w:.1f}" '
             f'height="{h_static:.1f}" fill="#3b82f6">'
@@ -201,9 +219,9 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
             f"{residual_mib:.2f} MiB</title></rect>"
         )
         parts.append(
-            f'<rect x="{x0:.1f}" y="{y_sublayer:.1f}" width="{bar_w:.1f}" '
-            f'height="{h_sublayer:.1f}" fill="#f59e0b">'
-            f"<title>T={tok}: Shared Operator Scratchpad = {sublayer_mib:.2f} MiB "
+            f'<rect x="{x0:.1f}" y="{y_per_op:.1f}" width="{bar_w:.1f}" '
+            f'height="{h_per_op:.1f}" fill="#f59e0b">'
+            f"<title>T={tok}: Shared Operator Scratchpad = {per_op_mib:.2f} MiB "
             f"(Total={total_mib:.1f} MiB)</title></rect>"
         )
         passes = (
@@ -217,7 +235,7 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
         )
         badge = "1 pass" if passes == 1 else f"{passes} passes"
         color = "#4ade80" if passes == 1 else "#fbbf24"
-        y_lbl = max(pad_t + 12, y_sublayer - 5)
+        y_lbl = max(pad_t + 12, y_per_op - 5)
         parts.append(
             f'<text x="{cx:.1f}" y="{y_lbl:.1f}" text-anchor="middle" '
             f'font-size="10" fill="{color}">{total_mib:.1f}M ({badge})</text>'
@@ -237,94 +255,142 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
     return "\n".join(parts)
 
 
-def _render_regime_map_svg(sweep: AdvisorSweepReport) -> str:
-    """Render inline SVG phase map of Arithmetic Intensity vs Active Tokens T."""
-    width, height = 680, 260
-    pad_l, pad_r, pad_t, pad_b = 64, 28, 28, 44
-    pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
+_SVG_FONT_PX = 13
+# Width of one glyph as a fraction of font size, a conservative upper bound for
+# the system sans-serif stack on digits, Latin letters, and punctuation.
+_SVG_GLYPH_EM = 0.62
+_SVG_TICKS = (1, 8, 64, 512, 4096, 32768)
+# Okabe-Ito colorblind-safe palette; each scope also has its own marker shape.
+_SCOPE_MARKS: Mapping[str, tuple[str, str]] = {
+    "whole_step": ("#009E73", "circle"),
+    "layer_group": ("#56B4E9", "diamond"),
+    "single_layer": ("#E69F00", "diamond"),
+    "per_op": ("#CC79A7", "square"),
+}
 
-    max_t = max(
-        [4096, sweep.max_vmem_tokens * 2, *(r.active_tokens for r in sweep.regimes)]
+
+def _text_width(text: str, font_px: float = _SVG_FONT_PX) -> float:
+    """Return an upper-bound pixel width of `text` at `font_px`."""
+    return len(text) * font_px * _SVG_GLYPH_EM
+
+
+def _svg_text(
+    x: float, y: float, text: str, *, anchor: str = "start", fill: str = "#e2e8f0"
+) -> str:
+    """Return one SVG text element at the report's minimum font size."""
+    return (
+        f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="{anchor}" '
+        f'font-size="{_SVG_FONT_PX}" fill="{fill}">{_esc(text)}</text>'
     )
-    max_ai = max(
-        [
-            sweep.ridge_dense_flop_per_byte * 2.2,
-            *(r.step_arithmetic_intensity for r in sweep.regimes),
-        ]
+
+
+def _svg_marker(shape: str, cx: float, cy: float, color: str, title: str) -> str:
+    """Return a circle, diamond, or square marker with a hover tooltip."""
+    r = 6.0
+    tip = f"<title>{_esc(title)}</title>"
+    common = f'fill="{color}" stroke="#0f172a" stroke-width="1.5"'
+    if shape == "circle":
+        return f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r}" {common}>{tip}</circle>'
+    if shape == "square":
+        return (
+            f'<rect x="{cx - r:.1f}" y="{cy - r:.1f}" width="{2 * r}" '
+            f'height="{2 * r}" {common}>{tip}</rect>'
+        )
+    pts = f"{cx:.1f},{cy - r - 1:.1f} {cx + r + 1:.1f},{cy:.1f} "
+    pts += f"{cx:.1f},{cy + r + 1:.1f} {cx - r - 1:.1f},{cy:.1f}"
+    return f'<polygon points="{pts}" {common}>{tip}</polygon>'
+
+
+def _render_regime_dot_plot_svg(sweep: AdvisorSweepReport) -> str:
+    """Render one row per workload on a log axis of tokens per core."""
+    regimes = sweep.regimes
+    right = [f"{e.recommended_scope}, {e.step_bound_us:,.0f} us" for e in regimes]
+    pad, gap, row_h, plot_w = 12.0, 14.0, 26.0, 440.0
+    label_w = max(_text_width(e.label) for e in regimes)
+    right_w = max(_text_width(t) for t in right)
+    x0 = pad + label_w + gap
+    x1 = x0 + plot_w
+    marks = (
+        ("VMEM fit, whole_step", sweep.max_vmem_tokens, "#009E73"),
+        ("VMEM fit, single_layer", sweep.single_layer_vmem_tokens, "#E69F00"),
+        ("compute-bound from", sweep.ridge_tokens, "#cbd5e1"),
     )
+    hi = max(4096, *(e.active_tokens for e in regimes), *(v for _, v, _ in marks))
+    ticks = [t for t in _SVG_TICKS if t <= hi]
+    hi = max(hi, ticks[-1])
+    log_hi = math.log2(hi)
 
     def sx(tok: float) -> float:
-        """Map active token count to horizontal SVG coordinate."""
-        l_min, l_max = 0.0, math.log2(max(2.0, float(max_t)))
-        l_val = math.log2(max(1.0, float(tok)))
-        return pad_l + (l_val - l_min) / (l_max - l_min) * pw
+        """Map tokens per core to an x coordinate on the log2 axis."""
+        return x0 + math.log2(max(1.0, float(tok))) / log_hi * plot_w
 
-    def sy(ai: float) -> float:
-        """Map arithmetic intensity to vertical SVG coordinate."""
-        l_min, l_max = 0.0, math.log10(max(10.0, float(max_ai) + 1.0))
-        l_val = math.log10(max(1.0, float(ai) + 1.0))
-        return pad_t + ph - (l_val - l_min) / (l_max - l_min) * ph
-
-    x_tmax = sx(max(1, sweep.max_vmem_tokens))
-    y_ridge = sy(sweep.ridge_dense_flop_per_byte)
-    zone_w = max(0.0, x_tmax - pad_l)
-    zone_h = max(0.0, pad_t + ph - y_ridge)
+    mark_labels = [f"{name}: {val:,} tok" for name, val, _ in marks]
+    width = max(
+        x1 + gap + right_w + pad,
+        *(sx(v) + 4 + _text_width(t) + pad for (_, v, _), t in zip(marks, mark_labels)),
+    )
+    title = "Where each workload lands: tokens per core vs on-chip limits"
+    width = max(width, pad + _text_width(title, 15) + pad)
+    top = 30.0 + 18.0 * len(marks) + 8.0
+    bottom = top + row_h * len(regimes)
+    legend_y = bottom + 58.0
+    height = legend_y + 20.0 * len(_SCOPE_MARKS) + 8.0
 
     parts = [
-        (
-            f'<svg viewBox="0 0 {width} {height}" class="chart-svg" '
-            'xmlns="http://www.w3.org/2000/svg">'
-        ),
-        (
-            f'<rect x="{pad_l}" y="{pad_t}" width="{pw}" height="{ph}" '
-            'fill="#0f172a" stroke="#334155"/>'
-        ),
-        (
-            f'<rect x="{pad_l}" y="{y_ridge:.1f}" width="{zone_w:.1f}" '
-            f'height="{zone_h:.1f}" fill="#064e3b" fill-opacity="0.35"/>'
-        ),
-        f'<line x1="{x_tmax:.1f}" y1="{pad_t}" x2="{x_tmax:.1f}" y2="{pad_t + ph}" '
-        'stroke="#10b981" stroke-width="1.8" stroke-dasharray="4,4"/>',
-        f'<line x1="{pad_l}" y1="{y_ridge:.1f}" x2="{pad_l + pw}" y2="{y_ridge:.1f}" '
-        'stroke="#f43f5e" stroke-width="1.8" stroke-dasharray="4,4"/>',
-        f'<text x="{x_tmax + 5:.1f}" y="{pad_t + 14}" font-size="10" fill="#6ee7b7">'
-        f"T_max={sweep.max_vmem_tokens}</text>",
-        f'<text x="{pad_l + 6}" y="{y_ridge - 6:.1f}" font-size="10" fill="#fda4af">'
-        f"Ridge={sweep.ridge_dense_flop_per_byte:.0f} FLOP/B</text>",
+        f'<svg viewBox="0 0 {width:.0f} {height:.0f}" class="chart-svg" '
+        'xmlns="http://www.w3.org/2000/svg" role="img">',
+        f'<rect x="0" y="0" width="{width:.0f}" height="{height:.0f}" fill="#0f172a"/>',
+        f'<text x="{pad}" y="20" font-size="15" font-weight="600" '
+        f'fill="#f8fafc">{_esc(title)}</text>',
     ]
-
-    mode_colors = {
-        "full_step": "#22c55e",
-        "segment": "#f59e0b",
-        "layer": "#eab308",
-        "modular_kernel": "#38bdf8",
-    }
-    for entry in sweep.regimes:
-        px = sx(entry.active_tokens)
-        py = sy(entry.step_arithmetic_intensity)
-        col = mode_colors.get(entry.recommended_fusion_mode, "#94a3b8")
-        fusion_mode = entry.recommended_fusion_mode
-        moe_mode = entry.recommended_moe_mode
-        ai_val = entry.step_arithmetic_intensity
+    for i, ((_, val, color), text) in enumerate(zip(marks, mark_labels)):
+        x = sx(val)
+        y_lbl = 30.0 + 18.0 * (i + 1)
         parts.append(
-            f'<circle cx="{px:.1f}" cy="{py:.1f}" r="6.5" '
-            f'fill="{col}" stroke="#0f172a" stroke-width="1.5">'
-            f"<title>{_esc(entry.label)}: T={entry.active_tokens}, "
-            f"AI={ai_val} FLOP/B -> {fusion_mode} ({moe_mode})</title></circle>"
+            f'<line x1="{x:.1f}" y1="{y_lbl + 4:.1f}" x2="{x:.1f}" y2="{bottom:.1f}" '
+            f'stroke="{color}" stroke-width="1.5" stroke-dasharray="5,4"/>'
         )
-        tx = min(pad_l + pw - 55, px + 9)
-        ty = max(pad_t + 12, py - 6)
+        parts.append(_svg_text(x + 4, y_lbl, text))
+    for i, (entry, rtext) in enumerate(zip(regimes, right)):
+        cy = top + row_h * i + row_h / 2
+        color, shape = _SCOPE_MARKS.get(entry.recommended_scope, ("#cbd5e1", "circle"))
         parts.append(
-            f'<text x="{tx:.1f}" y="{ty:.1f}" font-size="10" fill="#e2e8f0">'
-            f"T={entry.active_tokens} ({fusion_mode})</text>"
+            f'<line x1="{x0:.1f}" y1="{cy:.1f}" x2="{x1:.1f}" y2="{cy:.1f}" '
+            'stroke="#334155" stroke-width="1"/>'
         )
-
+        parts.append(_svg_text(x0 - gap / 2, cy + 4.5, entry.label, anchor="end"))
+        tip = (
+            f"{entry.label}: {entry.active_tokens} tokens/core, "
+            f"AI {entry.step_arithmetic_intensity} FLOP/B, {entry.layout} -> "
+            f"{entry.recommended_scope} ({entry.recommended_moe_mode}), "
+            f"{entry.step_bound_us:.1f} us"
+        )
+        parts.append(_svg_marker(shape, sx(entry.active_tokens), cy, color, tip))
+        parts.append(_svg_text(x1 + gap, cy + 4.5, rtext))
     parts.append(
-        f'<text x="{pad_l + pw / 2:.1f}" y="{height - 6}" text-anchor="middle" '
-        'font-size="11" fill="#94a3b8">'
-        "Log2 Active Tokens (T) vs Log10 Arithmetic Intensity (FLOP/B) - "
-        "Green Zone: Full-Step Megakernel</text>"
+        f'<line x1="{x0:.1f}" y1="{bottom:.1f}" x2="{x1:.1f}" y2="{bottom:.1f}" '
+        'stroke="#94a3b8" stroke-width="1"/>'
     )
+    for t in ticks:
+        x = sx(t)
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{bottom:.1f}" x2="{x:.1f}" y2="{bottom + 5:.1f}" '
+            'stroke="#94a3b8" stroke-width="1"/>'
+        )
+        parts.append(_svg_text(x, bottom + 20, f"{t:,}", anchor="middle"))
+    parts.append(
+        _svg_text(
+            (x0 + x1) / 2,
+            bottom + 40,
+            "Active tokens per core per step (log scale)",
+            anchor="middle",
+            fill="#cbd5e1",
+        )
+    )
+    for i, (name, (color, shape)) in enumerate(_SCOPE_MARKS.items()):
+        y = legend_y + 20.0 * i
+        parts.append(_svg_marker(shape, pad + 8, y - 4.5, color, name))
+        parts.append(_svg_text(pad + 22, y, f"{name}: {_SCOPE_HINTS[name]}"))
     parts.append("</svg>")
     return "\n".join(parts)
 
@@ -333,22 +399,22 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     """Render a self-contained, zero-CDN HTML report with inline SVG regime charts."""
     rec = sweep.parallelism
     vmem_svg = _render_vmem_svg(sweep)
-    regime_svg = _render_regime_map_svg(sweep)
+    regime_svg = _render_regime_dot_plot_svg(sweep)
     safe_json = json.dumps(sweep.to_dict(), indent=2).replace("</", "<\\/")
 
     rows_html = []
     for entry in sweep.regimes:
-        fusion_mode = _esc(entry.recommended_fusion_mode)
+        scope = _esc(entry.recommended_scope)
         moe_mode = entry.recommended_moe_mode
         moe_hint = _esc(_MOE_MODE_SHORT_HINTS.get(moe_mode, ""))
         rows_html.append(
             "<tr>"
             f"<td><strong>{_esc(entry.label)}</strong></td>"
+            f"<td>{_esc(entry.layout)}</td>"
             f"<td>{entry.active_tokens}</td>"
             f"<td>{entry.step_arithmetic_intensity:.2f}</td>"
             f"<td>{entry.num_vmem_splits}</td>"
-            f'<td><span class="badge badge-{fusion_mode}">{fusion_mode}</span> '
-            f"<small>({_esc(entry.recommended_scope)})</small></td>"
+            f'<td><span class="badge badge-{scope}">{scope}</span></td>'
             f"<td><code>{_esc(moe_mode)}</code>"
             f'<div class="kpi-sub">{moe_hint}</div></td>'
             f"<td>{entry.step_bound_us:.1f}</td>"
@@ -357,7 +423,21 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
         )
 
     rules_html = "".join(f"<li>{_esc(r)}</li>" for r in sweep.tailoring_guide)
-    mode_src = "auto-derived" if rec.auto_selected else "manual"
+    mode_src = rec.source or ("auto-derived" if rec.auto_selected else "manual")
+    pre = sweep.prefill_parallelism
+    prefill_kpi = (
+        f'<div class="kpi-sub">Prefill: {_esc(pre.label())} ({_esc(pre.source)})</div>'
+        if pre is not None
+        else ""
+    )
+    scope_items = "".join(
+        f"<li><strong><code>{_esc(n)}</code></strong>: {_esc(h)}.</li>"
+        for n, h in _SCOPE_HINTS.items()
+    )
+    moe_items = "".join(
+        f"<li><strong><code>{_esc(n)}</code></strong>: {_esc(h)}.</li>"
+        for n, h in _MOE_MODE_SHORT_HINTS.items()
+    )
     residual_k = sweep.vmem_breakdown_bytes["residual_buffer_bytes"] // 1024
     static_str = (
         f"{sweep.vmem_static_mib:.1f} / {sweep.vmem_budget_mib:.1f} MiB "
@@ -403,9 +483,9 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
   }}
   th {{ color: var(--muted); font-weight: 600; background: #0f172a; }}
   .badge {{ padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 12px; }}
-  .badge-full_step {{ background: #065f46; color: #6ee7b7; }}
-  .badge-segment, .badge-layer {{ background: #78350f; color: #fde68a; }}
-  .badge-modular_kernel {{ background: #0c4a6e; color: #7dd3fc; }}
+  .badge-whole_step {{ background: #065f46; color: #6ee7b7; }}
+  .badge-layer_group, .badge-single_layer {{ background: #78350f; color: #fde68a; }}
+  .badge-per_op {{ background: #0c4a6e; color: #7dd3fc; }}
 </style>
 </head>
 <body>
@@ -414,8 +494,9 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
   <div class="grid-kpi">
     <div class="card">
       <div class="kpi-label">Target Chip &amp; Mesh</div>
-      <div class="kpi-val">{_esc(sweep.chip)} &middot; TP{rec.tp}&times;EP{rec.ep}</div>
-      <div class="kpi-sub">Slice: {_esc(rec.topology)} ({mode_src})</div>
+      <div class="kpi-val">{_esc(sweep.chip)} &middot; {_esc(rec.label())}</div>
+      <div class="kpi-sub">Decode slice: {_esc(rec.topology)} ({_esc(mode_src)})</div>
+      {prefill_kpi}
     </div>
     <div class="card">
       <div class="kpi-label">Full-Step VMEM Ceiling</div>
@@ -439,47 +520,24 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
       {vmem_svg}
     </div>
     <div class="card">
-      <h2>2. Request Regime Phase Map (VMEM vs Compute Ridge)</h2>
+      <h2>2. Where Each Workload Lands (Tokens per Core vs On-Chip Limits)</h2>
       {regime_svg}
     </div>
   </div>
   <div class="card" style="margin-bottom: 20px;">
-    <h2>3. Execution Strategy Guide (Fusion Mode &amp; MoE Mode)</h2>
-    <ul>
-      <li><strong><code>full_step</code> (cross_layer)</strong>: Persistent
-        single-launch megakernel across all layers; keeps <code>[T, H]</code>
-        residual activations in VMEM and overlaps cross-layer weight DMAs with
-        in-kernel remote-VMEM collectives.</li>
-      <li><strong><code>layer</code> (single_layer) / <code>segment</code>
-        (stage)</strong>: Single-layer or pipeline-segment fused kernel; retains
-        <code>[T, H]</code> in VMEM within a layer when cross-layer
-        multi-buffering exceeds VMEM.</li>
-      <li><strong><code>modular_kernel</code> (sublayer)</strong>: Standard
-        per-operator Pallas kernels (<code>gmm_v2</code>,
-        <code>ragged_paged_attention</code>, <code>gdn</code>) with HBM
-        activation handoffs and XLA collectives.</li>
-      <li><strong><code>token_masked_vmem</code> (T_per_ep &lt; 32)</strong>:
-        Streams only routed experts into VMEM and contracts each against
-        <code>[T, H]</code> with a boolean token mask (<code>jnp.where</code>),
-        avoiding dynamic token sorting below the TPU FP8 <code>32</code>-row MXU
-        floor.</li>
-      <li><strong><code>expert_grouped_vmem</code> (32 &le; T_per_ep &le;
-        T_max)</strong>: Compacts tokens by expert ID directly inside VMEM into
-        <code>32</code>-row aligned tiles before matmul, eliminating HBM sort
-        round-trips.</li>
-      <li><strong><code>standalone_ragged_dot</code>
-        (modular_kernel)</strong>: Globally sorts tokens in HBM via SparseCore
-        gather-reduce and executes standalone Pallas <code>gmm_v2</code> /
-        <code>ragged_dot</code>.</li>
-    </ul>
+    <h2>3. How to Read the Scope and MoE Mode</h2>
+    <p>Scope: where the kernel boundary falls.</p>
+    <ul>{scope_items}</ul>
+    <p>MoE mode: where tokens are grouped by expert and where the data lives.</p>
+    <ul>{moe_items}</ul>
   </div>
   <div class="card" style="margin-bottom: 20px;">
-    <h2>4. Request Regime Recommendations (12-Regime Matrix)</h2>
+    <h2>4. Request Regime Recommendations</h2>
     <table>
       <thead>
         <tr>
-          <th>Request Regime</th><th>Active Tokens (T)</th><th>AI (FLOP/B)</th>
-          <th>Token Passes</th><th>Recommended Fusion</th><th>MoE Mode</th>
+          <th>Request Regime</th><th>Layout</th><th>Active Tokens (T)</th>
+          <th>AI (FLOP/B)</th><th>Token Passes</th><th>Scope</th><th>MoE Mode</th>
           <th>Step Bound (us)</th><th>Mechanical Rationale</th>
         </tr>
       </thead>

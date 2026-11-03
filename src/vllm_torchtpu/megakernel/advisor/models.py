@@ -499,6 +499,65 @@ REGISTERED_MODEL_ALIASES: Mapping[str, str] = {
 }
 
 
+@dataclass(frozen=True)
+class ParallelLayout:
+    """One serving role's mesh: parallel degrees, sequence sharding, layer groups."""
+
+    tp: int
+    ep: int
+    dp: int = 1
+    pp: int = 1
+    dcp: int = 1
+    pcp: int = 1
+    spec_tokens: int = 0
+    layer_groups: tuple[int, ...] = ()
+
+    def label(self) -> str:
+        """Return the layout as `TP8 x DCP4 x EP8`, omitting degree-1 axes."""
+        axes = (
+            ("DP", self.dp),
+            ("PP", self.pp),
+            ("TP", self.tp),
+            ("DCP", self.dcp),
+            ("PCP", self.pcp),
+            ("EP", self.ep),
+        )
+        return " x ".join(f"{n}{v}" for n, v in axes if v > 1 or n == "TP")
+
+
+@dataclass(frozen=True)
+class DeploymentPreset:
+    """Shipped prefill and decode layouts for one model, used before auto-pick."""
+
+    decode: ParallelLayout
+    prefill: ParallelLayout
+    saturation: ParallelLayout | None = None
+    # Prefill token windows (or chunks) the shipped prefill engine compiles.
+    prefill_windows: tuple[int, ...] = ()
+
+
+DEPLOYMENT_PRESETS: Mapping[str, DeploymentPreset] = {
+    # Kimi-K3 megakernel serving: decode on one TP32 kernel mesh with 32-way
+    # decode context parallel attention; prefill shards each packed window
+    # 32 ways by sequence, runs MoE at EP16, and fuses layers as
+    # embedding + layers 0-3, eleven 8-layer groups (4-91), layer 92 + logits.
+    "kimi-k3": DeploymentPreset(
+        decode=ParallelLayout(tp=32, ep=32, dcp=32),
+        prefill=ParallelLayout(tp=32, ep=16, pcp=32, layer_groups=(4, *(8,) * 11, 1)),
+        prefill_windows=(2048, 8192),
+    ),
+    # Qwen3.5-397B disaggregated 1P1D serving: decode TP8 x DCP4 x EP8 with
+    # MTP-3 verify (4 rows per sequence); prefill PP8 x TP1; DP4 x TP2 x EP8
+    # decode for saturated concurrency.
+    "qwen3.5-397b": DeploymentPreset(
+        decode=ParallelLayout(tp=8, ep=8, dcp=4, spec_tokens=3),
+        prefill=ParallelLayout(tp=1, ep=1, pp=8),
+        saturation=ParallelLayout(tp=2, ep=8, dp=4),
+        prefill_windows=(2176,),
+    ),
+}
+
+
 def _resolve_linear_topology(
     cfg: Mapping[str, object],
     lin_cfg: Mapping[str, object],

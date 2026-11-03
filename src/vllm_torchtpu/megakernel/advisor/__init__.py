@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import importlib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from math import ceil, gcd, log2
 from typing import TYPE_CHECKING, Literal
 
@@ -25,10 +25,13 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel import errors, exec_spec, ops, planner, spec
 from vllm_torchtpu.megakernel.advisor.models import (
+    DEPLOYMENT_PRESETS,
     MODEL_PRESETS,
     REGISTERED_MODEL_ALIASES,
     SUPPORTED_MODEL_TYPES,
+    DeploymentPreset,
     ModelProfile,
+    ParallelLayout,
     UnsupportedArchitectureError,
     model_profile_from_hf_config,
     resolve_model_profile,
@@ -46,35 +49,21 @@ if TYPE_CHECKING:
     import argparse
     from collections.abc import Mapping, Sequence
 
-FusionScope = Literal["sublayer", "single_layer", "stage", "cross_layer"]
-FusionMode = Literal["modular_kernel", "layer", "segment", "full_step"]
+# Where the kernel boundary falls: one call per operator, per layer, per group
+# of N layers (a model preset or a pipeline stage), or one call per step.
+FusionScope = Literal["per_op", "single_layer", "layer_group", "whole_step"]
 Phase = Literal["decode", "verify", "prefill", "mixed"]
-MoEMode = Literal[
-    "token_masked_vmem",
-    "expert_grouped_vmem",
-    "standalone_ragged_dot",
-    "dense_mlp",
-    "dense_masked",
-    "binned_vmem",
-    "masked",
-    "grouped",
-]
-
-SCOPE_TO_FUSION_MODE: Mapping[FusionScope, FusionMode] = {
-    "sublayer": "modular_kernel",
-    "single_layer": "layer",
-    "stage": "segment",
-    "cross_layer": "full_step",
-}
+# Where routed tokens are grouped by expert and where the data lives.
+MoEMode = Literal["masked_on_chip", "grouped_on_chip", "grouped_in_hbm", "dense_mlp"]
 
 FIT_VMEM_HEADROOM_MIB = 6
-_MXU_COL_256 = 256
+_WIDE_MATMUL_COLS = 256
 _MIN_VMEM_MIB = 2
 _MEGACORE_CORES = 2
 _GROUPED_MOE_MIN_TOKENS = 32
 _MAX_RECOMMENDED_STEP_WEIGHT_GB = 45.0
 _VALID_DMA_BUFFERS = (2, 3)
-_GROUPED_MOE_MODES = frozenset({"expert_grouped_vmem", "grouped", "binned_vmem"})
+_GROUPED_MOE_MODES = frozenset({"grouped_on_chip"})
 _DTYPE_BYTES: Mapping[str, float] = {
     "fp32": 4.0,
     "bf16": 2.0,
@@ -138,7 +127,7 @@ class ChipSpec:
         )
         if is_fp8:
             return _GROUPED_MOE_MIN_TOKENS
-        return 16 if self.tpu_info.mxu_column_size >= _MXU_COL_256 else 8
+        return 16 if self.tpu_info.mxu_column_size >= _WIDE_MATMUL_COLS else 8
 
 
 @dataclass(frozen=True)
@@ -162,7 +151,10 @@ class WorkloadSpec:
     dcp: int = 1
     pcp: int = 1
     segment_layers: int = 0
-    moe_mode: MoEMode = "token_masked_vmem"
+    # Layers fused per kernel call for the layer_group scope, in call order
+    # (empty: the model has no shipped layer grouping). Must sum to num_layers.
+    layer_groups: tuple[int, ...] = ()
+    moe_mode: MoEMode = "masked_on_chip"
     vmem_alias: bool = True
     vmem_fit_headroom: bool = False
     tiles: exec_spec.Tiles | None = None
@@ -189,11 +181,6 @@ class ScopeEstimate:
     roof_floor_us: float
     step_bound_us: float
     break_even_op_overhead_us: float = 0.0
-
-    @property
-    def fusion_mode(self) -> FusionMode:
-        """Return the user-facing FusionMode alias for this scope."""
-        return SCOPE_TO_FUSION_MODE[self.scope]
 
     @property
     def max_vmem_tokens(self) -> int:
@@ -231,16 +218,9 @@ class AdvisorReport:
     recommended_moe_mode: str = "dense_mlp"
     dma_buffers: int = 2
 
-    @property
-    def recommended_fusion_mode(self) -> FusionMode:
-        """Return the user-facing FusionMode for recommended_scope."""
-        return SCOPE_TO_FUSION_MODE[self.recommended_scope]
-
     def to_dict(self) -> dict[str, object]:
         """Serialize AdvisorReport to a JSON-compatible dictionary."""
-        payload = asdict(self)
-        payload["recommended_fusion_mode"] = self.recommended_fusion_mode
-        return payload
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -258,6 +238,15 @@ class ParallelismRecommendation:
     auto_selected: bool = True
     dcp: int = 1
     pcp: int = 1
+    # "deployment preset" when taken from DEPLOYMENT_PRESETS, else empty.
+    source: str = ""
+    layer_groups: tuple[int, ...] = ()
+
+    def label(self) -> str:
+        """Return the layout as `TP8 x DCP4 x EP8`, omitting degree-1 axes."""
+        return ParallelLayout(
+            tp=self.tp, ep=self.ep, dp=self.dp, pp=self.pp, dcp=self.dcp, pcp=self.pcp
+        ).label()
 
 
 @dataclass(frozen=True)
@@ -272,10 +261,10 @@ class RegimeEntry:
     max_vmem_tokens: int
     num_vmem_splits: int
     recommended_scope: FusionScope
-    recommended_fusion_mode: FusionMode
     recommended_moe_mode: str
     step_bound_us: float
     rationale: str
+    layout: str = ""
 
 
 @dataclass(frozen=True)
@@ -295,6 +284,8 @@ class AdvisorSweepReport:
     regimes: tuple[RegimeEntry, ...]
     tailoring_guide: tuple[str, ...]
     dma_buffers: int = 2
+    single_layer_vmem_tokens: int = 0
+    prefill_parallelism: ParallelismRecommendation | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize AdvisorSweepReport to a JSON-compatible dictionary."""
@@ -372,7 +363,7 @@ def compute_per_token_vmem_bytes(
     # 1. On-chip residual buffer (F32 4*H), norm (BF16 2*H), collective staging (6*H)
     residual_buffer_bytes = 6 * hidden + (6 * hidden if tp > 1 else 0)
 
-    # 2. Attention sublayer per-token scratch (sharded across TP ranks)
+    # 2. Attention per_op per-token scratch (sharded across TP ranks)
     nh_local = max(1, ceil(profile.num_attention_heads / tp))
     if profile.kv_lora_rank > 0:
         attn_scratch_bytes = 2 * (
@@ -395,7 +386,7 @@ def compute_per_token_vmem_bytes(
     else:
         linear_attn_scratch_bytes = 0
 
-    # 4. MoE / FFN sublayer per-token scratch (sharded across TP and EP ranks)
+    # 4. MoE / FFN per_op per-token scratch (sharded across TP and EP ranks)
     expert_hidden = profile.routed_expert_hidden_size or hidden
     if profile.num_moe_layers > 0 and profile.num_experts > 0:
         ep_tp = gcd(ep, tp)
@@ -424,12 +415,12 @@ def compute_per_token_vmem_bytes(
         inter_local = ceil(profile.intermediate_size / tp)
         moe_scratch_bytes = 6 * hidden + 8 * inter_local
 
-    sublayer_scratch_bytes = (
+    per_op_scratch_bytes = (
         max(attn_scratch_bytes, linear_attn_scratch_bytes, moe_scratch_bytes)
         if workload.vmem_alias
         else (attn_scratch_bytes + linear_attn_scratch_bytes + moe_scratch_bytes)
     )
-    total_per_token_bytes = residual_buffer_bytes + sublayer_scratch_bytes
+    total_per_token_bytes = residual_buffer_bytes + per_op_scratch_bytes
     return {
         "residual_buffer_bytes": residual_buffer_bytes,
         "attn_scratch_bytes": attn_scratch_bytes,
@@ -520,6 +511,13 @@ def _validate_advise_inputs(
     layers_ok = (
         profile.num_attention_layers + profile.num_linear_layers <= num_layers
         and profile.num_moe_layers <= num_layers
+        and (
+            not workload.layer_groups
+            or (
+                sum(workload.layer_groups) == num_layers
+                and min(workload.layer_groups) >= 1
+            )
+        )
     )
     if not (
         parallel_ok
@@ -544,8 +542,8 @@ def _scope_vmem_and_ops(
     vmem_budget = ctx.vmem_budget
     single_layer_dense_staging = ctx.single_layer_dense_staging_bytes
     single_layer_expert_staging = ctx.single_layer_expert_staging_bytes
-    cross_layer_dense_staging = ctx.cross_layer_dense_staging_bytes
-    cross_layer_expert_staging = ctx.cross_layer_expert_staging_bytes
+    whole_step_dense_staging = ctx.whole_step_dense_staging_bytes
+    whole_step_expert_staging = ctx.whole_step_expert_staging_bytes
     gqa_scratch = ctx.gqa_scratch
     gdn_scratch = ctx.gdn_scratch
     ffn_scratch = ctx.ffn_scratch
@@ -555,17 +553,22 @@ def _scope_vmem_and_ops(
     active_tokens = ctx.active_tokens
     per_token_fused_bytes = ctx.per_token_fused_bytes
     token_residual_bytes = ctx.token_residual_bytes
-    no_cross_layer = ctx.no_cross_layer
+    no_whole_step = ctx.no_whole_step
     plan_error = ctx.plan_error
 
     feasible, reason = True, "ok"
-    if scope == "stage" and workload.pp == 1 and num_segments == 1:
-        feasible, reason = False, "Identical to cross_layer when pp == 1"
-    elif scope == "cross_layer" and no_cross_layer:
+    preset_groups = ctx.num_layer_groups
+    if scope == "layer_group" and preset_groups == 0 and workload.pp == 1:
+        if num_segments == 1:
+            feasible = False
+            reason = (
+                "No layer grouping: needs a model preset, pp > 1, or segment_layers"
+            )
+    elif scope == "whole_step" and no_whole_step:
         feasible = False
-        reason = plan_error or "Bounded by stage/1L or non-periodic"
+        reason = plan_error or "Bounded by layer groups, single layers, or non-periodic"
 
-    if scope == "sublayer":
+    if scope == "per_op":
         static_vmem_bytes = max(1 << 20, single_layer_dense_staging)
         alpha = 4 * profile.hidden_size
         n_splits = 1
@@ -575,12 +578,14 @@ def _scope_vmem_and_ops(
         return static_vmem_bytes, act_bytes, n_ops, t_max, n_splits, feasible, reason
 
     is_single_layer = scope == "single_layer"
-    mul = num_segments if scope == "stage" else 1
+    # Multi-layer calls per step for layer_group: the preset's groups (one call
+    # each) or the pipeline-stage segments; whole_step is one call.
+    mul = (preset_groups or num_segments) if scope == "layer_group" else 1
     dense_staging_bytes = (
-        single_layer_dense_staging if is_single_layer else cross_layer_dense_staging
+        single_layer_dense_staging if is_single_layer else whole_step_dense_staging
     )
     expert_staging_bytes = (
-        single_layer_expert_staging if is_single_layer else cross_layer_expert_staging
+        single_layer_expert_staging if is_single_layer else whole_step_expert_staging
     ) * (l_moe > 0)
     scratch_alias = (
         max(gqa_scratch, gdn_scratch, ffn_scratch)
@@ -611,6 +616,8 @@ def _scope_vmem_and_ops(
     n_ops = (
         layers_local
         if is_single_layer
+        else mul
+        if scope == "layer_group" and preset_groups
         else (mul * (3 if workload.tp * workload.ep > 1 and l_attn + l_lin else 1))
     )
     alpha = per_token_fused_bytes
@@ -630,7 +637,7 @@ def _evaluate_scopes(
     profile: ModelProfile,
     workload: WorkloadSpec,
 ) -> tuple[list[ScopeEstimate], dict[FusionScope, float]]:
-    """Evaluate all four FusionScope options against VMEM, HBM, and MXU bounds."""
+    """Evaluate all four FusionScope options against VMEM, HBM, and matmul bounds."""
     layers_local, l_moe = ctx.layers_local, ctx.l_moe
     active_tokens = ctx.active_tokens
     token_residual_bytes = ctx.token_residual_bytes
@@ -661,10 +668,10 @@ def _evaluate_scopes(
     raw_step_map: dict[FusionScope, float] = {}
     sub_ops, sub_pure_us = 2 * layers_local, 0.0
     scopes_order: tuple[FusionScope, ...] = (
-        "sublayer",
+        "per_op",
         "single_layer",
-        "stage",
-        "cross_layer",
+        "layer_group",
+        "whole_step",
     )
 
     for scope in scopes_order:
@@ -688,19 +695,19 @@ def _evaluate_scopes(
             pairs = max(1.0, t_ep * profile.top_k * experts_local / profile.num_experts)
             avg_m = max(1.0, pairs / e_hit)
             w_step = w_static + l_moe * e_hit * exp_bytes
-            is_binned = scope == "sublayer" or workload.moe_mode in _GROUPED_MOE_MODES
+            is_binned = scope == "per_op" or workload.moe_mode in _GROUPED_MOE_MODES
             phi = (
                 ceil(avg_m / row_floor) * row_floor / avg_m
                 if is_binned
                 else max(1.0, (ops.rup(t_ep, 16) * e_hit) / pairs)
             )
 
-        # Out-of-kernel XLA collectives (sublayer) execute 2-phase RS + AG on HBM
+        # Out-of-kernel XLA collectives (per_op) execute 2-phase RS + AG on HBM
         # buffers, whereas in-kernel megakernel collectives push directly VMEM->VMEM.
-        xla_ar_factor = 2 if scope == "sublayer" and workload.tp > 1 else 1
+        xla_ar_factor = 2 if scope == "per_op" and workload.tp > 1 else 1
         xla_hbm_coll_bytes = (
             2.0 * num_ar * token_residual_bytes
-            if scope == "sublayer" and workload.tp > 1
+            if scope == "per_op" and workload.tp > 1
             else 0.0
         )
         t_comm = (
@@ -715,18 +722,20 @@ def _evaluate_scopes(
             )
         )
         # Pallas pipeline prologue fill + epilogue drain per separate kernel launch:
-        # cross_layer pays once/step; single_layer/sublayer pay at each HLO boundary.
+        # whole_step pays once/step; single_layer/per_op pay at each HLO boundary.
         # dma_buffers only sizes VMEM staging; state streams are priced at full bytes.
         eff_state_bytes = kv_cache_read_bytes + recurrent_state_rw_bytes
         pipeline_fill_drain_s = (n_ops - 1) * (
             first_slot_bytes / bw_hbm + 2.0 * lat_coll
         )
-        t_mxu = flops_dense / peak_w + (phi * flops_moe) / peak_e
+        t_matmul = flops_dense / peak_w + (phi * flops_moe) / peak_e
         act_saved = 4.0 * layers_local * token_residual_bytes - act_bytes
         hbm_int = n_splits * w_step + eff_state_bytes
         d_ops = sub_ops - n_ops
         roof_us = (
-            max(t_mxu, (hbm_int + act_bytes) / bw_hbm) + t_comm + pipeline_fill_drain_s
+            max(t_matmul, (hbm_int + act_bytes) / bw_hbm)
+            + t_comm
+            + pipeline_fill_drain_s
         ) * 1e6
         base_ai = (flops_dense + flops_moe) / max(
             1.0, w_step + kv_cache_read_bytes + recurrent_state_rw_bytes
@@ -735,14 +744,14 @@ def _evaluate_scopes(
             roof_us + (act_bytes + (n_splits - 1) * w_step) / bw_hbm * 1e6
             if base_ai >= peak_w / bw_hbm and n_splits > 1
             else (
-                max(t_mxu, hbm_int / bw_hbm)
+                max(t_matmul, hbm_int / bw_hbm)
                 + act_bytes / bw_hbm
                 + t_comm
                 + pipeline_fill_drain_s
             )
             * 1e6
         )
-        if scope == "sublayer":
+        if scope == "per_op":
             sub_pure_us = pure_us
         step_us = pure_us + n_ops * workload.op_overhead_us
         d_bytes = bw_hbm * max(0, d_ops) * workload.op_overhead_us * 1e-6
@@ -784,14 +793,15 @@ class _ScopeContext:
     vmem_budget: int
     single_layer_dense_staging_bytes: int
     single_layer_expert_staging_bytes: int
-    cross_layer_dense_staging_bytes: int
-    cross_layer_expert_staging_bytes: int
+    whole_step_dense_staging_bytes: int
+    whole_step_expert_staging_bytes: int
     first_slot_bytes: float
     gqa_scratch: int
     gdn_scratch: int
     ffn_scratch: int
     layers_local: int
     num_segments: int
+    num_layer_groups: int
     l_moe: int
     l_attn: int
     l_lin: int
@@ -824,7 +834,7 @@ class _ScopeContext:
     recurrent_state_rw_bytes: float
     bw_hbm: float
     hbm_used: float
-    no_cross_layer: bool
+    no_whole_step: bool
     plan_error: str
 
 
@@ -1006,15 +1016,15 @@ def _build_scope_context(
         dense_slot_bytes = tiles.bank
         expert_buffer_slots = tiles.nbe
         expert_slot_bytes = tiles.ebank
-        cross_layer_dense_staging_bytes = dense_buffer_slots * dense_slot_bytes
-        cross_layer_expert_staging_bytes = expert_buffer_slots * expert_slot_bytes
+        whole_step_dense_staging_bytes = dense_buffer_slots * dense_slot_bytes
+        whole_step_expert_staging_bytes = expert_buffer_slots * expert_slot_bytes
     else:
         dense_slot_bytes = 2 << 20
         extra_slot_bytes = (buf_slots - 2) * (2 << 20)
-        cross_layer_dense_staging_bytes = (
+        whole_step_dense_staging_bytes = (
             min(28 << 20, 2 * layer_dense_weight_bytes) + extra_slot_bytes
         )
-        cross_layer_expert_staging_bytes = (10 << 20) + extra_slot_bytes
+        whole_step_expert_staging_bytes = (10 << 20) + extra_slot_bytes
 
     first_slot_bytes = float(
         min(dense_slot_bytes, max(1 << 18, layer_dense_weight_bytes // 4))
@@ -1023,8 +1033,8 @@ def _build_scope_context(
         vmem_budget=vmem_budget,
         single_layer_dense_staging_bytes=min(4 << 20, layer_dense_weight_bytes),
         single_layer_expert_staging_bytes=min(4 << 20, int(buf_slots * exp_bytes)),
-        cross_layer_dense_staging_bytes=cross_layer_dense_staging_bytes,
-        cross_layer_expert_staging_bytes=cross_layer_expert_staging_bytes,
+        whole_step_dense_staging_bytes=whole_step_dense_staging_bytes,
+        whole_step_expert_staging_bytes=whole_step_expert_staging_bytes,
         first_slot_bytes=first_slot_bytes,
         gqa_scratch=3072 * max(head_dim, kv_lora) if l_attn > 0 else 0,
         gdn_scratch=16 * min(vh_local, 8) * kd * vd,
@@ -1033,6 +1043,11 @@ def _build_scope_context(
         ),
         layers_local=layers_local,
         num_segments=num_segments,
+        num_layer_groups=(
+            ceil(len(workload.layer_groups) * layers_local / num_layers)
+            if workload.layer_groups
+            else 0
+        ),
         l_moe=l_moe,
         l_attn=l_attn,
         l_lin=l_lin,
@@ -1090,7 +1105,7 @@ def _build_scope_context(
             + kv_cache_read_bytes
             + 0.5 * recurrent_state_rw_bytes
         ),
-        no_cross_layer=(
+        no_whole_step=(
             pp > 1
             or num_segments > 1
             or num_layers == 1
@@ -1141,7 +1156,7 @@ def advise(
         if hbm_fits
         else f"Model+cache ({used_gb:.2f} GB) > HBM ({cap_gb:.2f} GB)"
     )
-    rec_scope: FusionScope = best.scope if hbm_fits else "sublayer"
+    rec_scope: FusionScope = best.scope if hbm_fits else "per_op"
     step_ai = round((flops_dense + best.moe_flop_factor * flops_moe) / tot_bytes, 2)
     asymp_ai = round(v_flops / state_bytes, 2) if state_bytes else None
 
@@ -1152,14 +1167,14 @@ def advise(
     )
     if l_moe == 0:
         rec_moe = "dense_mlp"
-    elif rec_scope == "sublayer":
-        rec_moe = "standalone_ragged_dot"
+    elif rec_scope == "per_op":
+        rec_moe = "grouped_in_hbm"
     else:
         t_per_ep = ceil(active_tokens / max(1, best.n_splits)) * ctx.ep_dp
         rec_moe = (
-            "expert_grouped_vmem"
+            "grouped_on_chip"
             if t_per_ep >= _GROUPED_MOE_MIN_TOKENS
-            else "token_masked_vmem"
+            else "masked_on_chip"
         )
 
     return AdvisorReport(
@@ -1176,7 +1191,7 @@ def advise(
         step_arithmetic_intensity=step_ai,
         asymptotic_decode_intensity=asymp_ai,
         recommended_scope=rec_scope,
-        build_megakernel=rec_scope != "sublayer",
+        build_megakernel=rec_scope != "per_op",
         rationale=rationale,
         scopes=tuple(estimates),
         per_token_vmem_bytes=ctx.per_token_fused_bytes,
@@ -1261,6 +1276,50 @@ def _float_opt(opts: Mapping[str, object], key: str, default: float) -> float:
     return float(val) if isinstance(val, (int, float, str)) else default
 
 
+def _layout_recommendation(
+    prof: ModelProfile,
+    chip_spec: ChipSpec,
+    layout: ParallelLayout,
+    vmem_budget_mib: float | None,
+    dma_buffers: int,
+    source: str = "deployment preset",
+) -> ParallelismRecommendation:
+    """Evaluate a fixed layout's HBM fit at the reference decode workload."""
+    base_rep = advise(
+        prof,
+        WorkloadSpec(
+            phase="decode",
+            batch=16,
+            tp=layout.tp,
+            ep=layout.ep,
+            dp=layout.dp,
+            pp=layout.pp,
+            dcp=layout.dcp,
+            pcp=layout.pcp,
+            layer_groups=layout.layer_groups,
+            vmem_budget_mib=vmem_budget_mib,
+            dma_buffers=dma_buffers,
+        ),
+        chip_spec,
+    )
+    total_cores = layout.tp * layout.dp * layout.pp
+    return ParallelismRecommendation(
+        tp=layout.tp,
+        ep=layout.ep,
+        dp=layout.dp,
+        pp=layout.pp,
+        topology=_TPU7X_TOPOLOGIES.get(total_cores, f"{total_cores} cores"),
+        hbm_used_gb=base_rep.hbm_used_gb,
+        hbm_capacity_gb=base_rep.hbm_capacity_gb,
+        w_step_gb=base_rep.scopes[0].w_step_gb,
+        auto_selected=False,
+        dcp=layout.dcp,
+        pcp=layout.pcp,
+        source=source,
+        layer_groups=layout.layer_groups,
+    )
+
+
 def advise_regimes(
     profile: ModelProfile | str | Mapping[str, object],
     chip: ChipSpec | str = "tpu7x",
@@ -1286,7 +1345,22 @@ def advise_regimes(
 
     prof = resolve_model_profile(profile)
     chip_spec = resolve_chip_spec(chip)
-    if tp is None:
+    use_preset = bool(opts.get("deployment_preset", True))
+    explicit_layout = tp is not None or ep is not None or (dp, pp, dcp, pcp) != (1,) * 4
+    dep: DeploymentPreset | None = (
+        DEPLOYMENT_PRESETS.get(prof.name)
+        if use_preset and not explicit_layout
+        else None
+    )
+    prefill_par: ParallelismRecommendation | None = None
+    if dep is not None:
+        par = _layout_recommendation(
+            prof, chip_spec, dep.decode, vmem_budget_mib, dma_buffers
+        )
+        prefill_par = _layout_recommendation(
+            prof, chip_spec, dep.prefill, vmem_budget_mib, dma_buffers
+        )
+    elif tp is None:
         par = recommend_parallelism(prof, chip_spec, dp=dp, pp=pp)
         if ep is not None or dcp > 1 or pcp > 1:
             par = ParallelismRecommendation(
@@ -1308,35 +1382,13 @@ def advise_regimes(
             if ep is not None
             else (gcd(tp * dp, prof.num_experts) if prof.num_experts > 0 else 1)
         )
-        base_rep = advise(
+        par = _layout_recommendation(
             prof,
-            WorkloadSpec(
-                phase="decode",
-                batch=16,
-                tp=tp,
-                ep=ep_val,
-                dp=dp,
-                pp=pp,
-                dcp=dcp,
-                pcp=pcp,
-                vmem_budget_mib=vmem_budget_mib,
-                dma_buffers=dma_buffers,
-            ),
             chip_spec,
-        )
-        total_cores = tp * dp * pp
-        par = ParallelismRecommendation(
-            tp=tp,
-            ep=ep_val,
-            dp=dp,
-            pp=pp,
-            topology=_TPU7X_TOPOLOGIES.get(total_cores, f"{total_cores} cores"),
-            hbm_used_gb=base_rep.hbm_used_gb,
-            hbm_capacity_gb=base_rep.hbm_capacity_gb,
-            w_step_gb=base_rep.scopes[0].w_step_gb,
-            auto_selected=False,
-            dcp=dcp,
-            pcp=pcp,
+            ParallelLayout(tp=tp, ep=ep_val, dp=dp, pp=pp, dcp=dcp, pcp=pcp),
+            vmem_budget_mib,
+            dma_buffers,
+            source="",
         )
 
     common = {
@@ -1391,7 +1443,7 @@ def advise_regimes(
                 isl=32768,
                 osl=2048,
                 context=32768,
-                moe_mode="expert_grouped_vmem",
+                moe_mode="grouped_on_chip",
                 **common,  # type: ignore[arg-type]
             ),
         ),
@@ -1403,7 +1455,7 @@ def advise_regimes(
                 isl=32768,
                 osl=2048,
                 context=32768,
-                moe_mode="expert_grouped_vmem",
+                moe_mode="grouped_on_chip",
                 **common,  # type: ignore[arg-type]
             ),
         ),
@@ -1426,7 +1478,7 @@ def advise_regimes(
                 spec_tokens=3,
                 isl=3072,
                 osl=2048,
-                moe_mode="expert_grouped_vmem",
+                moe_mode="grouped_on_chip",
                 **common,  # type: ignore[arg-type]
             ),
         ),
@@ -1438,7 +1490,7 @@ def advise_regimes(
                 spec_tokens=3,
                 isl=3072,
                 osl=2048,
-                moe_mode="expert_grouped_vmem",
+                moe_mode="grouped_on_chip",
                 **common,  # type: ignore[arg-type]
             ),
         ),
@@ -1451,7 +1503,7 @@ def advise_regimes(
                 isl=32768,
                 osl=2048,
                 context=32768,
-                moe_mode="expert_grouped_vmem",
+                moe_mode="grouped_on_chip",
                 **common,  # type: ignore[arg-type]
             ),
         ),
@@ -1464,7 +1516,7 @@ def advise_regimes(
                 osl=2048,
                 chunk_size=256,
                 prefix_hit_rate=0.90,
-                moe_mode="expert_grouped_vmem",
+                moe_mode="grouped_on_chip",
                 **common,  # type: ignore[arg-type]
             ),
         ),
@@ -1476,7 +1528,7 @@ def advise_regimes(
                 isl=4096,
                 chunk_size=256,
                 prefix_hit_rate=0.9375,
-                moe_mode="expert_grouped_vmem",
+                moe_mode="grouped_on_chip",
                 **common,  # type: ignore[arg-type]
             ),
         ),
@@ -1486,11 +1538,44 @@ def advise_regimes(
                 phase="prefill",
                 batch=1,
                 isl=4096,
-                moe_mode="expert_grouped_vmem",
+                moe_mode="grouped_on_chip",
                 **common,  # type: ignore[arg-type]
             ),
         ),
     )
+
+    if dep is not None:
+        # Prefill regimes run on the prefill layout, plus the preset's windows.
+        pre = dep.prefill
+        pre_fields = {
+            "tp": pre.tp,
+            "ep": pre.ep,
+            "dp": pre.dp,
+            "pp": pre.pp,
+            "dcp": pre.dcp,
+            "pcp": pre.pcp,
+            "layer_groups": pre.layer_groups,
+        }
+        workloads = (
+            *(
+                (lbl, replace(wl, **pre_fields) if wl.phase == "prefill" else wl)
+                for lbl, wl in workloads
+            ),
+            *(
+                (
+                    f"Preset Prefill Window (W={win})",
+                    WorkloadSpec(
+                        phase="prefill",
+                        batch=1,
+                        isl=win,
+                        chunk_size=win,
+                        moe_mode="grouped_on_chip",
+                        **{**common, **pre_fields},  # type: ignore[arg-type]
+                    ),
+                )
+                for win in dep.prefill_windows
+            ),
+        )
 
     entries: list[RegimeEntry] = []
     reports: list[AdvisorReport] = []
@@ -1508,16 +1593,18 @@ def advise_regimes(
                 max_vmem_tokens=best_sc.t_vmem_max,
                 num_vmem_splits=best_sc.n_splits,
                 recommended_scope=rep.recommended_scope,
-                recommended_fusion_mode=rep.recommended_fusion_mode,
                 recommended_moe_mode=rep.recommended_moe_mode,
                 step_bound_us=best_sc.step_bound_us,
                 rationale=rep.rationale,
+                layout=ParallelLayout(
+                    tp=wl.tp, ep=wl.ep, dp=wl.dp, pp=wl.pp, dcp=wl.dcp, pcp=wl.pcp
+                ).label(),
             )
         )
 
     decode_rep = reports[2]
     vmem_parts = compute_per_token_vmem_bytes(prof, workloads[2][1])
-    cross_sc = next(s for s in decode_rep.scopes if s.scope == "cross_layer")
+    cross_sc = next(s for s in decode_rep.scopes if s.scope == "whole_step")
     one_l_sc = next(s for s in decode_rep.scopes if s.scope == "single_layer")
     ref_sc = cross_sc if cross_sc.feasible else one_l_sc
 
@@ -1528,18 +1615,19 @@ def advise_regimes(
     ridge_fb = decode_rep.ridge_dense_flop_per_byte
     guide = (
         f"Small/Med Decode & Spec Verify (T <= {t_ceil} active tokens): "
-        f"use fusion_mode='{step_mode}' with moe_mode='token_masked_vmem' (T < 32) "
-        f"or 'expert_grouped_vmem' (T >= 32) to keep [T, H] in VMEM "
+        f"use scope='{step_mode}' with moe_mode='masked_on_chip' (T < 32) "
+        f"or 'grouped_on_chip' (T >= 32) to keep [T, H] in VMEM "
         f"({ref_sc.vmem_static_mib:.1f} MiB {dma_buffers}-slot weight staging + "
         f"{slope_kib:.1f} KiB/tok).",
         f"High-Batch Decode & Chunked Prefill ({t_ceil} < T <= {t_ridge} tokens): "
-        "use fusion_mode='layer' or 'segment' "
+        "use scope='single_layer' or 'layer_group' "
         f"(single-layer VMEM ceiling T_max={one_l_sc.t_vmem_max}) "
         "so weights are not re-streamed across multi-pass token splits.",
         f"Saturated Decode & Compute-Bound Prefill (T > {t_ridge} tokens, "
-        f"AI >= {ridge_fb:.0f} FLOP/B): use fusion_mode='modular_kernel' "
-        "with moe_mode='standalone_ragged_dot' to saturate the 256x256 MXU "
-        "without reserving multi-layer weight staging VMEM.",
+        f"AI >= {ridge_fb:.0f} FLOP/B): use scope='per_op' "
+        "with moe_mode='grouped_in_hbm': tokens are grouped by expert in HBM "
+        "and each operator is its own call, so no VMEM is held for "
+        "multi-layer weight staging.",
     )
     return AdvisorSweepReport(
         model=prof.name,
@@ -1555,19 +1643,21 @@ def advise_regimes(
         regimes=tuple(entries),
         tailoring_guide=guide,
         dma_buffers=dma_buffers,
+        single_layer_vmem_tokens=one_l_sc.t_vmem_max,
+        prefill_parallelism=prefill_par,
     )
 
 
 def primary_step_mode(cross_sc: ScopeEstimate) -> str:
-    """Return full_step if cross_layer fusion is feasible, else layer."""
-    return "full_step" if cross_sc.feasible else "layer"
+    """Return whole_step if whole-step fusion is feasible, else single_layer."""
+    return "whole_step" if cross_sc.feasible else "single_layer"
 
 
 def advise_from_spec(
     model_spec: spec.ModelSpec,
     ex: exec_spec.ExecSpec,
     chip: ChipSpec | str = "tpu7x",
-    moe_mode: MoEMode = "token_masked_vmem",
+    moe_mode: MoEMode = "masked_on_chip",
     op_overhead_us: float = 0.0,
 ) -> AdvisorReport:
     """Bridge declarative ModelSpec + ExecSpec schedules via planner.plan."""
@@ -1659,18 +1749,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "DEPLOYMENT_PRESETS",
     "FIT_VMEM_HEADROOM_MIB",
     "MODEL_PRESETS",
     "REGISTERED_MODEL_ALIASES",
-    "SCOPE_TO_FUSION_MODE",
     "SUPPORTED_MODEL_TYPES",
     "AdvisorReport",
     "AdvisorSweepReport",
     "ChipSpec",
-    "FusionMode",
+    "DeploymentPreset",
     "FusionScope",
     "MoEMode",
     "ModelProfile",
+    "ParallelLayout",
     "ParallelismRecommendation",
     "Phase",
     "RegimeEntry",
