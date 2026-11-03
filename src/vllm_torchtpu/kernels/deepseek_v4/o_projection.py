@@ -178,20 +178,21 @@ def _rope_heads(
     Args:
         x: Flat ``(rows, heads_per_group * head_dim)`` activations.
         cos_sin: ``(rows, 2 * LANE)`` cosine half followed by sine half.
-        head_dim: Per-head width; must be a multiple of ``LANE``.
+        head_dim: Per-head width; a multiple of ``LANE`` and larger than it.
         heads_per_group: Number of heads packed along the last axis of ``x``.
 
     Returns:
         The roped flat ``(rows, heads_per_group * head_dim)`` value.
     """
+    # Every head has channels before its roped tail, so no slice is empty.
+    assert head_dim > LANE, f"head_dim {head_dim} must be larger than {LANE}"
     cos = cos_sin[:, :LANE]
     sin = cos_sin[:, LANE:]
     lo = head_dim - LANE
     pieces = []
     for h in range(heads_per_group):
         base = h * head_dim
-        if lo:
-            pieces.append(x[:, base : base + lo])
+        pieces.append(x[:, base : base + lo])
         tail = x[:, base + lo : base + head_dim].astype(jnp.float32)
         roped = tail * cos + _rotate_gptj(tail) * sin
         pieces.append(roped.astype(x.dtype))
