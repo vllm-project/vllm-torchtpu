@@ -5,6 +5,7 @@
 #   LAYOUT=tp32dcp8 bash serve_sweep.sh <host-rank>
 # Knobs (env, defaults = the 2026-10-30 baseline):
 #   LAYOUT        dp8tp4 | dp4tp8dcp2 | dp4tp8 | tp32dcp8 | tp32dcp4 | dp2tp16dcp4   (layout.sh)
+#                 single host: tp8 | tp8xdcp2 | dp2xtp4
 #   GLOBAL_SEQS   total concurrent requests across the slice (max-num-seqs = GLOBAL_SEQS / engines)
 #   MTP_K         draft tokens per step; 0 disables speculative decoding
 #   MNBT          --max-num-batched-tokens

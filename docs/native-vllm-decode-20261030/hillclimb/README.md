@@ -29,6 +29,16 @@ All presets use the whole 2x2x4 slice (16 chips, 32 TensorCores) and shard the 5
 | `tp32dcp8` | 1 | TP32 = 4 hosts | striped over 8 cores | TP all-reduce and EP across 4 hosts; no DP lockstep |
 | `dp2tp16dcp4` | 2 (2 hosts each) | TP16 | striped over 4 cores | experimental launch form: `--nnodes 4` with `--data-parallel-size-local 1`, hosts 1 and 3 headless |
 
+Single-host presets (one 2x2x1 host, 8 TensorCores; `NATIVE_HOST_IPS` holds one address and
+`env.sh` sets the 2x2x1 topology). Experts shard 8 ways, so a 23-layer model holds the same
+expert bytes per core as the 92-layer model does on the 32-core presets.
+
+| LAYOUT | Engines | Per engine | KV pages of a request | Where the per-layer collectives run |
+|---|---|---|---|---|
+| `tp8` | 1 | TP8 = 1 host | one core per KV-head replica | TP all-reduce and EP inside the host |
+| `tp8xdcp2` | 1 | TP8 = 1 host | striped over 2 cores | TP all-reduce and EP inside the host |
+| `dp2xtp4` | 2 | TP4 = 2 chips | one core per KV head | TP all-reduce inside 2 chips; EP and DP lockstep across the host |
+
 Why these: the model's 4 KV heads make TP4 the largest tensor-parallel degree without
 KV-head replication; above it, decode context parallel (`--decode-context-parallel-size`)
 turns the replicas into page stripes, so a request's 131K-token KV is read by 2, 4 or 8

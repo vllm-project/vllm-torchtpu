@@ -42,6 +42,9 @@ ENGINE_MAP = {
         (0, None),
         (0, None),
     ],  # one API server on host 0 fronts both engines
+    "tp8": [(0, None)],
+    "tp8xdcp2": [(0, None)],
+    "dp2xtp4": [(0, 0), (0, 1)],
 }
 METRIC_KEYS = [
     "spec_decode",

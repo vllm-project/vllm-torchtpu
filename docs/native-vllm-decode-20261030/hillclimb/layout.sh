@@ -5,11 +5,15 @@
 # Sets: PAR_ARGS (array), HEADLESS_ARGS (array), SEQS_PER_ENGINE, COMPILE_SIZES, ENGINES (count)
 # shellcheck disable=SC2034  # arrays are consumed by serve_sweep.sh after sourcing
 #
-# Every preset covers the same 16 chips / 32 TensorCores of the 2x2x4 slice.
+# Four-host presets cover the 16 chips / 32 TensorCores of the 2x2x4 slice.
 #   dp8tp4      : baseline of the 2026-10-30 run (2 engines per host, TP4 inside a host)
 #   dp4tp8dcp2  : one engine per host, TP8 over the host's 4 chips, KV pages striped over 2 cores
 #   tp32dcp8    : one engine over all 4 hosts, TP32, KV pages striped over 8 cores (production decode shape)
 #   dp2tp16dcp4 : two engines of 2 hosts each (experimental launch form, see README)
+# Single-host presets cover the 4 chips / 8 TensorCores of one 2x2x1 host (NATIVE_HOST_IPS has one address).
+#   tp8         : one engine, TP8, no DCP
+#   tp8xdcp2    : one engine, TP8, KV pages striped over 2 cores
+#   dp2xtp4     : two engines of TP4 on the host
 LAYOUT=${LAYOUT:-dp8tp4}
 GLOBAL_SEQS=${GLOBAL_SEQS:-96}
 MTP_K=${MTP_K:-3}
@@ -44,8 +48,21 @@ case "$LAYOUT" in
               --data-parallel-address "$MASTER_ADDRESS" --data-parallel-rpc-port 29650
               --master-addr "$GROUP_HEAD" --master-port 29500)
     [[ "$HOST_RANK" != 0 ]] && HEADLESS_ARGS=(--headless) ;;
+  tp8|tp8xdcp2)
+    ENGINES=1
+    DCP=1; [[ "$LAYOUT" == tp8xdcp2 ]] && DCP=2
+    PAR_ARGS=(--tensor-parallel-size 8 --decode-context-parallel-size "$DCP" --nnodes 1 --master-port 29500) ;;
+  dp2xtp4)
+    ENGINES=2
+    PAR_ARGS=(--data-parallel-size 2 --data-parallel-size-local 2 --nnodes 1
+              --tensor-parallel-size 4 --decode-context-parallel-size 1 --master-port 29500
+              --data-parallel-address "$MASTER_ADDRESS" --data-parallel-rpc-port 29650) ;;
   *) echo "unknown LAYOUT=$LAYOUT" >&2; return 2 ;;
 esac
+case "$LAYOUT" in tp8|tp8xdcp2|dp2xtp4) LAYOUT_HOSTS=1 ;; *) LAYOUT_HOSTS=4 ;; esac
+if [[ "${#HOST_IPS[@]}" != "$LAYOUT_HOSTS" ]]; then
+  echo "LAYOUT=$LAYOUT needs $LAYOUT_HOSTS host address(es), got ${#HOST_IPS[@]}" >&2; return 2
+fi
 SEQS_PER_ENGINE=$((GLOBAL_SEQS / ENGINES))
 VERIFY_TOKENS=$((SEQS_PER_ENGINE * (MTP_K + 1)))
 COMPILE_SIZES=$(python3 -c "print(sorted({$SEQS_PER_ENGINE, $VERIFY_TOKENS, $MNBT}))" | tr -d ' ')
