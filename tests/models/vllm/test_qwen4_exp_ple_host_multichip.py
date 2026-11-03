@@ -37,7 +37,8 @@ pytestmark = [
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
-def test_host_ple_compiled_transport_preserves_checkpoint_bits(tp, tmp_path):
+@pytest.mark.parametrize("native", [False, True], ids=["cpu-gather", "native-dma"])
+def test_host_ple_compiled_transport_preserves_checkpoint_bits(tp, native, tmp_path):
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -46,6 +47,8 @@ def test_host_ple_compiled_transport_preserves_checkpoint_bits(tp, tmp_path):
         "--out",
         str(tmp_path),
     ]
+    if native:
+        command.append("--native")
     with (tmp_path / "workers.log").open("w") as log:
         child = subprocess.Popen(
             command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
@@ -63,11 +66,125 @@ def test_host_ple_compiled_transport_preserves_checkpoint_bits(tp, tmp_path):
     assert code == 0, (tmp_path / "workers.log").read_text()[-12000:]
     for rank in range(8):
         result = json.loads((tmp_path / f"rank{rank}.json").read_text())
-        assert result["checks"] == 96
+        assert result["checks"] == (32 if native else 96)
         assert not result["errors"], result
 
 
-def _worker(tp, out):
+def _native_host_shards(cfg, parallel, table_group):
+    import torch
+    from vllm.config import set_current_vllm_config
+    from vllm.models.qwen4_exp.common.ngram_embedding import Qwen4ExpPLEEmbeddingMethod
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.kernels.qwen4_exp.host_lookup import host_table_num_words
+    from vllm_torchtpu.layers.adapter.custom_ops.ple_op import build_host_lookup_ops
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import HostPLETable
+
+    # Each owner has 192 rows: the logical end lies inside its last DMA page.
+    rows = 1536
+    source = (torch.arange(rows)[:, None] * 71 + torch.arange(160)[None, :]).to(
+        torch.uint8
+    )
+    method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, "ple", "float8_e4m3fn")
+    with set_current_vllm_config(cfg), set_default_torch_dtype(torch.bfloat16):
+        table = HostPLETable(
+            rows,
+            160,
+            embedding_method=method,
+            padding_size=64,
+            prefix="ple",
+            parallel_group=table_group,
+        )
+    for begin in reversed(range(0, rows, 173)):
+        table.weight_loader(
+            table.weight, source[begin : begin + 173].view(torch.float8_e4m3fn), begin
+        )
+    table.get_parameter("weight_scale").data.fill_(0.25)
+    table.to("tpu")
+    table.finalize_weights()
+    # Match the real loader: explicitly CPU buffers are not moved by a
+    # model-wide .to() before native finalization.
+    table._vocab_start = table._vocab_start.cpu()
+    native = table.allocate_native_host(torch.device("tpu"))
+    assert table._vocab_start.device.type == "tpu"
+    assert table.weight.numel() == 0
+    assert native.numel() == host_table_num_words(rows // parallel.world_size)
+    start, finish = build_host_lookup_ops(
+        rows // parallel.world_size, parallel.world_size
+    )
+    checks, errors = 0, []
+    dp_rank = parallel.dp_group.rank_in_group
+    try:
+        for slots in (1, 16, 128, 8192):
+
+            def lookup(host, ids, offset, hidden, slots=slots):
+                global_ids = parallel.gather_ids(ids)
+                local_ids = global_ids - offset
+                pending = start(host, local_ids)
+                raw, prefix = finish(pending, local_ids, hidden * 2 + 1)
+                result = parallel.combine(raw.reshape(-1, 16 * 40).clone(), slots)
+                result = result.view(torch.int8)
+                return result, prefix
+
+            compiled = torch.compile(
+                lookup, backend="tpu", fullgraph=True, dynamic=False
+            )
+            for scenario in range(4):
+                ids = (
+                    (torch.arange(slots * 16).reshape(slots, 16) * 193 + dp_rank * 127)
+                    .remainder(rows)
+                    .int()
+                )
+                # Include both sides of every ownership boundary and the
+                # incomplete final DMA page; zero-owner padding must stay zero.
+                ids.reshape(-1)[: min(slots * 16, 16)] = torch.tensor(
+                    [
+                        0,
+                        191,
+                        192,
+                        383,
+                        384,
+                        575,
+                        576,
+                        767,
+                        768,
+                        959,
+                        960,
+                        1151,
+                        1152,
+                        1343,
+                        1344,
+                        1535,
+                    ]
+                )[: min(slots * 16, 16)]
+                if scenario == 0 or scenario == 1 and dp_rank != 0:
+                    ids.fill_(-1)
+                elif scenario == 2:
+                    ids[1:] = -1
+                elif scenario == 3:
+                    ids = 1344 + ids.remainder(192)
+                expected = torch.where(
+                    (ids >= 0)[..., None], source[ids.clamp(min=0)], 0
+                ).reshape(slots, -1)
+                hidden = torch.arange(slots * 128, dtype=torch.float32).reshape(
+                    slots, 128
+                )
+                for _ in range(2):
+                    raw, prefix = compiled(
+                        native, ids.to("tpu"), table._vocab_start, hidden.to("tpu")
+                    )
+                    checks += 1
+                    if not torch.equal(
+                        raw.cpu().view(torch.uint8), expected
+                    ) or not torch.equal(prefix.cpu(), hidden * 2 + 1):
+                        errors.append(dict(slots=slots, scenario=scenario))
+            torch._dynamo.reset()
+    finally:
+        table.close()
+    return checks, errors
+
+
+def _worker(tp, out, native=False):
     import torch
     import torch_tpu  # noqa: F401
     from torch import distributed as dist
@@ -110,10 +227,20 @@ def _worker(tp, out):
     cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
     resolve_kv_cache_layout(cfg, [["LBNHC", "LBHNC"]])
     checks, errors = 0, []
-    for dtype, carrier in [
-        (torch.bfloat16, torch.int16),
-        (torch.float8_e4m3fn, torch.uint8),
-    ]:
+    if native:
+        parallel = PLEParallel(
+            ps.get_tp_group(), ps.get_dp_group(), embedding_across_dp=True
+        )
+        checks, errors = _native_host_shards(cfg, parallel, etp_group)
+    cases = (
+        []
+        if native
+        else [
+            (torch.bfloat16, torch.int16),
+            (torch.float8_e4m3fn, torch.uint8),
+        ]
+    )
+    for dtype, carrier in cases:
         source = (
             torch.arange(8192, device="cpu")[:, None] * 71
             + torch.arange(160, device="cpu")[None, :]
@@ -231,14 +358,15 @@ def _main():
     parser.add_argument("--tp", type=int, choices=(1, 2, 4, 8), required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--native", action="store_true")
     args = parser.parse_args()
     if args.worker:
-        _worker(args.tp, args.out)
+        _worker(args.tp, args.out, args.native)
         return
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from tests.distributed.tpu_test_utils import prepare_tpu_environment
+    import torch
+    import torch_tpu  # noqa: F401
 
-    prepare_tpu_environment(world_size=8)
+    torch.tpu.distributed.set_tpu_launch_env(nproc_per_node=8)
     command = [
         sys.executable,
         "-m",
@@ -253,6 +381,8 @@ def _main():
         "--out",
         str(args.out),
     ]
+    if args.native:
+        command.append("--native")
     raise SystemExit(subprocess.call(command))
 
 

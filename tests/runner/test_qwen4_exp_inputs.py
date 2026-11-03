@@ -123,6 +123,7 @@ def test_reordered_history_slots_and_group_tables_are_independent(
     layer = Mock(return_value=hidden, ple=NS(lookup_for_model=lookup))
     backbone = NS(
         host_ple_index=0 if offload else None,
+        ple_host_backend="torch",
         decode_cu=None,
         layers=[layer],
         hc_count=1,

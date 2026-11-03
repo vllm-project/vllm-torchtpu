@@ -27,6 +27,7 @@ from vllm.models.qwen4_exp.common.ple import (
     compute_ple_shard_overlap,
 )
 
+from vllm_torchtpu.kernels.qwen4_exp.host_lookup import host_table_num_words
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
     build_decode_op,
     build_raw_lookup_op,
@@ -234,6 +235,17 @@ class HostPLETable(_LoadedPLETable):
         participants = 1 if shared is None else shared.participants
         physical_share = max(1, (os.cpu_count() or 1) // participants // 2)
         self._gather_workers = min(_MAX_GATHER_WORKERS, physical_share)
+        # Ownership remains a graph input so ranks compile the same collective
+        # executable even though each rank stores a different table partition.
+        self.register_buffer(
+            "_vocab_start",
+            torch.tensor(
+                self.shard_indices.org_vocab_start_index,
+                dtype=torch.int32,
+                device="cpu",
+            ),
+            persistent=False,
+        )
 
     def allocate_embedding_weight(
         self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
@@ -292,6 +304,41 @@ class HostPLETable(_LoadedPLETable):
                 else float(self.get_parameter("weight_scale").detach().cpu().item())
             )
             self._shared_table.finish(metadata={"scale": scale})
+
+    def allocate_native_host(self, device: torch.device) -> torch.Tensor:
+        """Create a per-rank PJRT HOST table using PyTorch's offload operator."""
+        from torch._functorch._activation_offloading import offload_ops
+
+        if self.storage_dtype != torch.float8_e4m3fn or self.embedding_dim != 160:
+            raise ValueError("Native PLE HOST DMA requires FP8 rows of 160 bytes")
+
+        # vLLM constructs the model on its target device but does not run a
+        # model-wide .to() after loading explicitly CPU-resident buffers.
+        self._vocab_start = self._vocab_start.to(device)
+
+        def offload(raw):
+            # Initialization only. Keep the source alive until the async copy
+            # completes; model execution subsequently reads this HOST buffer.
+            # A shard can end inside a DMA page. Padding is storage only;
+            # the lookup still masks against its logical number of rows.
+            row_words = self.embedding_dim // raw.element_size()
+            words = host_table_num_words(raw.numel() // row_words)
+            source = torch.nn.functional.pad(raw.to(device), (0, words - raw.numel()))
+            table = offload_ops.offload(source)
+            torch.accelerator.synchronize()
+            return table
+
+        if self._shared_table is None:
+            table = offload(self.weight.detach().view(torch.int32).reshape(-1))
+            # The completed native HOST allocation now owns these bytes.
+            self.weight.data = torch.empty(0, dtype=self.storage_dtype, device="cpu")
+            return table
+        with self._shared_table.buffer() as buffer:
+            raw = torch.frombuffer(buffer, dtype=torch.int32)
+            try:
+                return offload(raw)
+            finally:
+                del raw
 
     def _take_rows(
         self, table: np.ndarray, rows: np.ndarray, output: np.ndarray

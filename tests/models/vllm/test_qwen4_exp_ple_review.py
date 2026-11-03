@@ -101,7 +101,8 @@ def test_combine_uses_word_carriers_for_each_multi_rank_group(
     )
 
 
-def test_pooled_forward_masks_null_padding_and_tail(monkeypatch):
+@pytest.mark.parametrize("packed", [False, True])
+def test_pooled_forward_masks_null_padding_and_tail(monkeypatch, packed):
     layer = Qwen4ExpPooledPLE.__new__(Qwen4ExpPooledPLE)
     nn.Module.__init__(layer)
     layer._finalized, layer.cpu_offload = True, True
@@ -109,7 +110,6 @@ def test_pooled_forward_masks_null_padding_and_tail(monkeypatch):
     before = layer.cache_owners[0].clone()
     table = HostPLETable.__new__(HostPLETable)
     nn.Module.__init__(table)
-    monkeypatch.setattr(table, "decode", lambda raw: raw)
     layer.ple_embedding = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(layer.ple_embedding)
     layer.ple_embedding.ngram_embedding = table
@@ -128,6 +128,25 @@ def test_pooled_forward_masks_null_padding_and_tail(monkeypatch):
         layer, "gated_values", lambda hidden, decoded: torch.full_like(hidden, 3)
     )
     hidden = torch.zeros((7, 8), dtype=torch.bfloat16)
+    if packed:
+        layer.ple_embedding.heads_per_ngram = 2
+        expected_raw = torch.arange(7 * 16, dtype=torch.int8).reshape(7, 16)
+        layer._host_finish = lambda pending, ids, hidden: (pending, hidden)
+        prepared, _ = layer.finish_native_lookup(
+            expected_raw.reshape(7, 2, 8).view(torch.int32),
+            torch.zeros((7, 2), dtype=torch.int32),
+            hidden,
+        )
+    else:
+        expected_raw = hidden.view(torch.int16)
+        prepared = expected_raw.unsqueeze(0)
+
+    def decode(raw):
+        assert raw.shape == expected_raw.shape and raw.dtype == expected_raw.dtype
+        assert torch.equal(raw, expected_raw)
+        return raw
+
+    monkeypatch.setattr(table, "decode", decode)
     inputs = PLEInputs(
         torch.arange(7),
         torch.tensor([0, 2, 4, 6]),
@@ -139,7 +158,7 @@ def test_pooled_forward_masks_null_padding_and_tail(monkeypatch):
         torch.tensor([0, 2, -1]),
         torch.zeros(3, dtype=torch.bool),
         torch.tensor(6),
-        hidden.view(torch.int16),
+        prepared,
     )
     expected = torch.zeros_like(hidden)
     expected[2:4] = 4

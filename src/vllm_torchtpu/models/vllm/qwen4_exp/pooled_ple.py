@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
+    build_host_lookup_ops,
     build_pooled_short_conv_op,
 )
 
@@ -50,6 +51,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         table_group: GroupCoordinator,
         cpu_offload: bool = False,
         shared: SharedPLEOptions | None = None,
+        native_host_dma: bool = False,
     ) -> None:
         if (table_group.rank_in_group, table_group.world_size) != (
             parallel.rank,
@@ -68,6 +70,18 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         )
         self.parallel = parallel
         self.cpu_offload = cpu_offload
+        self.native_host_dma = native_host_dma
+        self.register_buffer("native_host_table", None, persistent=False)
+        self._host_start: (
+            Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None
+        ) = None
+        self._host_finish: (
+            Callable[
+                [torch.Tensor, torch.Tensor, torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor],
+            ]
+            | None
+        ) = None
         self.prefix = prefix
         self.cache_owners: tuple[torch.Tensor, ...] = ()
         self._loaded: set[str] = set()
@@ -103,6 +117,13 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         if missing:
             raise ValueError(f"Missing PLE checkpoint tensors: {sorted(missing)}")
         self.storage.finalize_weights()
+        if self.native_host_dma:
+            assert isinstance(self.storage, HostPLETable)
+            device = self.ple_embedding.ngram_heads_offsets.device
+            self.native_host_table = self.storage.allocate_native_host(device)
+            self._host_start, self._host_finish = build_host_lookup_ops(
+                self.storage.shard_indices.num_org_elements, self.parallel.world_size
+            )
         self._finalized = True
 
     def bind_pool(self, pool: torch.Tensor) -> None:
@@ -164,6 +185,17 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             self.prefix,
         )
 
+    def start_native_lookup(self, inputs: PLEInputs, valid_tokens: torch.Tensor):
+        assert self._host_start is not None and self.native_host_table is not None
+        ids = self._lookup_ids(inputs, valid_tokens)
+        local_ids = ids - self.storage._vocab_start
+        return self._host_start(self.native_host_table, local_ids), local_ids
+
+    def finish_native_lookup(self, pending, ids, hidden):
+        assert self._host_finish is not None
+        raw, hidden = self._host_finish(pending, ids, hidden)
+        return raw.reshape(1, ids.shape[0], -1), hidden
+
     def forward_with_history(
         self,
         hidden_states: torch.Tensor,
@@ -177,13 +209,8 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         assert len(self.cache_owners) == 1
         if self.cpu_offload:
             assert raw_embeddings is not None, "Host PLE requires prepared raw rows"
-            # Own narrow-type inputs before in-place collective dtype views.
-            raw = raw_embeddings.reshape(
-                -1,
-                self.ple_embedding.ngram_embedding.embedding_dim
-                * (self.ple_embedding.ngram_size - 1)
-                * self.ple_embedding.heads_per_ngram,
-            ).clone()
+            # Owner collectives may update the supplied storage in place.
+            raw = raw_embeddings.reshape(-1, raw_embeddings.shape[-1]).clone()
         else:
             assert isinstance(self.storage, ResidentPLETable)
             raw = (
@@ -192,6 +219,8 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
                 else self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
             )
         raw = self.parallel.combine(raw, hidden_states.shape[0])
+        if raw.dtype == torch.int32:
+            raw = raw.view(torch.int8)
         # Keep owner collectives above the local-empty return, including on DP.
         if state_indices.shape[0] == 0:
             return torch.zeros_like(hidden_states)

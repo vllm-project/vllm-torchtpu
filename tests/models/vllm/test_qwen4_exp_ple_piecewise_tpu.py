@@ -25,6 +25,7 @@ import torch
 def test_request_indexing_across_host_lookup_compiles_all_buckets(fp8):
     from torch_tpu._internal import sync
     from vllm.compilation.backends import split_graph
+    from vllm.compilation.codegen import generate_execution_code
     from vllm.compilation.piecewise_backend import create_concrete_args
     from vllm.forward_context import override_forward_context
 
@@ -62,8 +63,9 @@ def test_request_indexing_across_host_lookup_compiles_all_buckets(fp8):
             return self.runs[int(args[self.shape_index])](*args)
 
     def backend(graph, inputs):
-        split, pieces = split_graph(graph, ["qwen4_exp::host_lookup"])
-        assert sum(piece.is_splitting_graph for piece in pieces) == 1
+        boundaries = ["qwen4_exp::host_lookup"]
+        split, pieces = split_graph(graph, boundaries)
+        assert sum(piece.is_splitting_graph for piece in pieces) == len(boundaries)
         for piece in pieces:
             if piece.is_splitting_graph:
                 continue
@@ -73,6 +75,9 @@ def test_request_indexing_across_host_lookup_compiles_all_buckets(fp8):
                 for n in output.args[0]
             )
             split.set_submodule(piece.submod_name, Piece(piece.graph))
+        # Serving also generates Python for the split graph. Merely calling
+        # split.forward misses unsupported operations on eager boundaries.
+        generate_execution_code(split)
         return split.forward
 
     def forward(tokens, starts):
@@ -124,3 +129,128 @@ def test_request_indexing_across_host_lookup_compiles_all_buckets(fp8):
     finally:
         torch._dynamo.reset()
         embedding.close()
+
+
+@pytest.mark.tpu_test
+@torch.inference_mode()
+def test_native_host_lookup_through_vllm_bucket_compiler(tmp_path, monkeypatch):
+    import dataclasses
+
+    from vllm.compilation.decorators import support_torch_compile
+    from vllm.config import (
+        CompilationConfig,
+        CompilationMode,
+        DeviceConfig,
+        SchedulerConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.forward_context import set_forward_context
+    from vllm.platforms import current_platform
+
+    import vllm_torchtpu
+    from vllm_torchtpu.compilation import tpu_compiler
+    from vllm_torchtpu.layers.adapter.custom_ops.ple_op import build_host_lookup_ops
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import HostPLETable
+
+    initialized = torch.distributed.is_initialized()
+    if not initialized:
+        torch.distributed.init_process_group(
+            "gloo", init_method=f"file://{tmp_path}/dist", rank=0, world_size=1
+        )
+    try:
+        rows = 128 * 8 + 64
+        # Nonzero table contents must not leak through the reload marker.
+        words = torch.arange(rows * 40, dtype=torch.int32) * 7919 - 777
+        table = HostPLETable.__new__(HostPLETable)
+        torch.nn.Module.__init__(table)
+        table.storage_dtype = torch.float8_e4m3fn
+        table.embedding_dim = 160
+        table._shared_table = None
+        table.weight = torch.nn.Parameter(
+            words.view(torch.float8_e4m3fn).reshape(rows, 160), requires_grad=False
+        )
+        table.register_buffer("_vocab_start", torch.tensor(0, dtype=torch.int32))
+        native = table.allocate_native_host(torch.device("tpu"))
+        assert table._vocab_start.device.type == "tpu"
+        assert table.weight.numel() == 0
+        start, finish = build_host_lookup_ops(rows)
+        monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+        monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "1")
+        monkeypatch.setenv("VLLM_USE_MEGA_AOT_ARTIFACT", "0")
+        # Only model admission and its hash need a real checkpoint config.
+        # The entire compiler pipeline and native execution remain real.
+        monkeypatch.setattr(
+            tpu_compiler,
+            "compute_tpu_compilation_hash",
+            lambda config: "native-host-regression",
+        )
+        with monkeypatch.context() as admission:
+            admission.setattr(
+                type(current_platform),
+                "check_and_update_config",
+                classmethod(lambda cls, config: None),
+            )
+            config = VllmConfig(
+                device_config=DeviceConfig(device="tpu"),
+                scheduler_config=SchedulerConfig(
+                    max_num_batched_tokens=8192,
+                    max_model_len=8192,
+                    is_encoder_decoder=False,
+                    max_num_seqs=16,
+                ),
+                compilation_config=CompilationConfig(
+                    mode=CompilationMode.VLLM_COMPILE,
+                    backend="",
+                    compile_sizes=[16, 8192],
+                    splitting_ops=["qwen4_exp::host_lookup"],
+                    cudagraph_capture_sizes=[],
+                ),
+            )
+        for field in dataclasses.fields(config.compilation_config.pass_config):
+            if isinstance(
+                getattr(config.compilation_config.pass_config, field.name), bool
+            ):
+                setattr(config.compilation_config.pass_config, field.name, False)
+        monkeypatch.setattr(
+            type(config.compilation_config), "get_compile_ranges", lambda self: []
+        )
+        vllm_torchtpu._patch_vllm_aot_compile_cache_key()
+
+        @support_torch_compile(dynamic_arg_dims={"ids": 0, "hidden": 0})
+        class Model(torch.nn.Module):
+            def __init__(self, *, vllm_config):
+                super().__init__()
+                self.prefix = "native_host_regression"
+                self.register_buffer("table", native, persistent=False)
+
+            def forward(self, ids, hidden):
+                pending = start(self.table, ids)
+                prefix = hidden * 2 + 1
+                return finish(pending, ids, prefix)
+
+        with set_current_vllm_config(config):
+            compiled = Model(vllm_config=config)
+        choices = torch.tensor(
+            [-1, 0, 25, 51, 127, 128, rows - 1, rows], dtype=torch.int32
+        )
+        for tokens in (16, 8192, 16):
+            cpu_ids = choices.repeat(tokens * 2).reshape(tokens, 16)
+            ids = cpu_ids.to("tpu")
+            hidden = torch.arange(tokens * 128, dtype=torch.float32).reshape(
+                tokens, 128
+            )
+            hidden_tpu = hidden.to("tpu")
+            torch._dynamo.mark_dynamic(ids, 0)
+            torch._dynamo.mark_dynamic(hidden_tpu, 0)
+            expected = torch.zeros((tokens, 16, 40), dtype=torch.int32)
+            valid = (cpu_ids >= 0) & (cpu_ids < rows)
+            expected[valid] = words.reshape(rows, 40)[cpu_ids[valid].long()]
+            for _ in range(3):
+                with set_forward_context({}, config):
+                    raw, prefix = compiled(ids, hidden_tpu)
+                torch.testing.assert_close(raw.cpu(), expected, rtol=0, atol=0)
+                torch.testing.assert_close(prefix.cpu(), hidden * 2 + 1, rtol=0, atol=0)
+    finally:
+        if not initialized:
+            torch.distributed.destroy_process_group()

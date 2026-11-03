@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
     TPU_PLE_FUSED_GATE: bool = False
+    VLLM_TPU_QWEN38_FLASH_PLE_HOST_BACKEND: str | None = None
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
@@ -412,6 +413,10 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Qwen3.8 Flash service-level override; unset preserves additional_config.
+    "VLLM_TPU_QWEN38_FLASH_PLE_HOST_BACKEND": env_with_choices(
+        "VLLM_TPU_QWEN38_FLASH_PLE_HOST_BACKEND", None, ["torch", "native_dma"]
+    ),
     # Qwen3.5 MoE at TP > 1: reduce-scatter the attention output, run the
     # post-attention norm and router gate on the token shard, and fold the
     # attention partial sum into the MoE all-reduce. Default MoE path only.

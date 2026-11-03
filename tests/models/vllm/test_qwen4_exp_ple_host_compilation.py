@@ -32,7 +32,7 @@ def bare_config(config_type):
     return cfg
 
 
-def launch_config(monkeypatch, instance, *, offload=True, engram=None):
+def launch_config(monkeypatch, instance, *, offload=True, engram=None, backend=None):
     from transformers import PretrainedConfig
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.aux_output import AuxOutputConfig
@@ -70,6 +70,8 @@ def launch_config(monkeypatch, instance, *, offload=True, engram=None):
             }
         },
     )
+    if backend is not None:
+        cfg.additional_config["qwen4_exp"]["ple_host_backend"] = backend
     config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
     hashed = bare_config(VllmConfig)
     hashed.aux_output_config = AuxOutputConfig()
@@ -262,3 +264,107 @@ def test_typed_launch_preserves_existing_engram_policy_hash(
 def test_disabled_offload_keeps_absent_engram_configuration(monkeypatch):
     cfg, _ = launch_config(monkeypatch, "disabled", offload=False)
     assert cfg.engram_config is None
+
+
+def test_native_boundary_and_cache_identity(monkeypatch):
+    _, original = launch_config(monkeypatch, "original")
+    cfg, native = launch_config(monkeypatch, "native", backend="native_dma")
+    assert cfg.compilation_config.splitting_ops == ["qwen4_exp::host_lookup"]
+    assert original.compute_hash() != native.compute_hash()
+
+
+@pytest.mark.parametrize("configured", [None, "torch", "native_dma"])
+@pytest.mark.parametrize("override", [None, "torch", "native_dma"])
+def test_host_backend_env_resolves_before_hashing_and_transport(
+    monkeypatch, configured, override
+):
+    name = "VLLM_TPU_QWEN38_FLASH_PLE_HOST_BACKEND"
+    monkeypatch.delenv(name, raising=False)
+    if override is not None:
+        monkeypatch.setenv(name, override)
+    cfg, hashed = launch_config(monkeypatch, "override", backend=configured)
+    expected = override if override is not None else configured
+    assert cfg.additional_config["qwen4_exp"].get("ple_host_backend") == expected
+    # Workers receive the selected backend even without the driver's env.
+    monkeypatch.delenv(name, raising=False)
+    restored = pickle.loads(pickle.dumps(cfg))
+    reference, reference_hash = launch_config(monkeypatch, "explicit", backend=expected)
+    assert restored.additional_config == reference.additional_config
+    assert hashed.compute_hash() == reference_hash.compute_hash()
+
+
+@pytest.mark.parametrize("value", ["", "0", "invalid"])
+def test_host_backend_env_rejects_invalid_selection(monkeypatch, value):
+    monkeypatch.setenv("VLLM_TPU_QWEN38_FLASH_PLE_HOST_BACKEND", value)
+    with pytest.raises(ValueError, match="VLLM_TPU_QWEN38_FLASH_PLE_HOST_BACKEND"):
+        launch_config(monkeypatch, "invalid")
+
+
+@pytest.mark.parametrize("backend", ["torch", "native_dma"])
+@pytest.mark.parametrize("offload", [False, True])
+def test_host_backend_env_preserves_offload_admission_and_dp_sharding(
+    monkeypatch, backend, offload
+):
+    from tests.models.vllm.test_qwen4_exp_parallel import config
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import (
+        Qwen4ExpForCausalLMConfig,
+        TPUQwen4ExpConfig,
+    )
+
+    monkeypatch.setenv("VLLM_TPU_QWEN38_FLASH_PLE_HOST_BACKEND", backend)
+    monkeypatch.setattr(
+        Qwen4ExpForCausalLMConfig, "verify_and_update_config", lambda cfg: None
+    )
+    cfg = config()
+    cfg.compilation_config = NS(splitting_ops=None)
+    engram = dict(cpu_offload=offload, embedding_across_dp=True, dp_shared_memory=False)
+    cfg.additional_config = {"qwen4_exp": {"engram_config": engram.copy()}}
+    if backend == "native_dma" and not offload:
+        with pytest.raises(ValueError, match="one host-offloaded PLE layer"):
+            TPUQwen4ExpConfig.verify_and_update_config(cfg)
+    else:
+        TPUQwen4ExpConfig.verify_and_update_config(cfg)
+        assert cfg.compilation_config.splitting_ops == (
+            ["qwen4_exp::host_lookup"] if offload else None
+        )
+    assert cfg.additional_config["qwen4_exp"]["ple_host_backend"] == backend
+    assert cfg.additional_config["qwen4_exp"]["engram_config"] == engram
+
+
+@pytest.mark.parametrize("backend", ["raw_dma", "raw_dma_overlap", "native_dma"])
+@pytest.mark.parametrize("offload,layers", [(False, [2]), (True, [1, 2]), (True, [2])])
+def test_host_backend_admission(backend, offload, layers):
+    from tests.models.vllm.test_qwen4_exp_parallel import config
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import validate_config
+
+    cfg = config()
+    cfg.model_config.hf_text_config.ple_layer_ids = layers
+    cfg.additional_config = {
+        "qwen4_exp": {
+            "ple_host_backend": backend,
+            "engram_config": {"cpu_offload": offload},
+        }
+    }
+    if backend != "native_dma":
+        with pytest.raises(ValueError, match="not a valid PLEHostBackend"):
+            validate_config(cfg)
+    elif offload and len(layers) == 1:
+        validate_config(cfg)
+    else:
+        with pytest.raises(ValueError, match="one host-offloaded PLE layer"):
+            validate_config(cfg)
+
+
+@pytest.mark.parametrize("across", [False, True])
+def test_native_host_dma_supports_dp_shards(across):
+    from tests.models.vllm.test_qwen4_exp_parallel import config
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import validate_config
+
+    cfg = config()
+    cfg.additional_config = {
+        "qwen4_exp": {
+            "ple_host_backend": "native_dma",
+            "engram_config": {"cpu_offload": True, "embedding_across_dp": across},
+        }
+    }
+    validate_config(cfg)

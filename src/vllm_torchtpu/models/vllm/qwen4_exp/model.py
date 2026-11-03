@@ -50,7 +50,12 @@ from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.model_hooks import qwen4_options
 
-from .config import Qwen4ExpEngramConfig, gdn_cache_spec, require_unified_pool
+from .config import (
+    PLEHostBackend,
+    Qwen4ExpEngramConfig,
+    gdn_cache_spec,
+    require_unified_pool,
+)
 from .hyperconnection import (
     GatedResidual,
     HcPackedMixState,
@@ -156,6 +161,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=prefix + ".ple",
                 cpu_offload=engram.get("cpu_offload", False),
                 shared=shared,
+                native_host_dma=qwen4_options(cfg).get("ple_host_backend")
+                == "native_dma",
             )
             if index + 1 in t.ple_layer_ids
             else None
@@ -347,6 +354,9 @@ class Qwen4ExpBackbone(nn.Module):
                 for i in range(t.num_hidden_layers)
             ]
         )
+        self.ple_host_backend = PLEHostBackend(
+            cfg.additional_config.get("qwen4_exp", {}).get("ple_host_backend", "torch")
+        )
         self.host_ple_index = next(
             (
                 i
@@ -380,16 +390,23 @@ class Qwen4ExpBackbone(nn.Module):
         context_lens,
         valid_tokens,
     ):
-        # Resolve host lookup before any decoder work so shape arithmetic
-        # stays in the main graph and model preparation precedes the D2H wait.
         ple_raw_embeddings = None
+        ple_host_ids = None
+        ple_pending = None
+        native_dma = self.ple_host_backend == PLEHostBackend.NATIVE_DMA
         if self.host_ple_index is not None:
             ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
             assert ple is not None
-            ple_raw_embeddings = ple.lookup_for_model(
-                PLEInputs(input_ids, query_start_loc, ngram_context),
-                query_start_loc[-1:],
-            )
+            inputs = PLEInputs(input_ids, query_start_loc, ngram_context)
+            if native_dma:
+                ple_pending, ple_host_ids = ple.start_native_lookup(
+                    inputs, query_start_loc[-1:]
+                )
+            else:
+                ple_raw_embeddings = ple.lookup_for_model(
+                    inputs,
+                    query_start_loc[-1:],
+                )
         hidden = (
             self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         )
@@ -443,6 +460,11 @@ class Qwen4ExpBackbone(nn.Module):
             terminal_mixer = None
             if index == last and not _module_call_observed(layer):
                 terminal_mixer = self.hyper_connection_mixer
+            if index == self.host_ple_index and native_dma:
+                assert layer.ple is not None
+                ple_raw_embeddings, hidden = layer.ple.finish_native_lookup(
+                    ple_pending, ple_host_ids, hidden
+                )
             result = layer(
                 hidden,
                 positions.to(torch.int64),

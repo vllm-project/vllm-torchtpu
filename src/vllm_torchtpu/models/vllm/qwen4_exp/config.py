@@ -15,6 +15,7 @@
 
 import math
 from collections.abc import Mapping
+from enum import StrEnum
 
 import torch
 from vllm.config.engram import EngramConfig
@@ -38,6 +39,11 @@ from vllm_torchtpu.utils import torch_dtype_from_name
 
 from .ple_host import PLEHostLaunch
 from .qsa_geometry import validate_qsa_geometry
+
+
+class PLEHostBackend(StrEnum):
+    TORCH = "torch"
+    NATIVE_DMA = "native_dma"
 
 
 @config
@@ -151,13 +157,19 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
             else Qwen4ExpForConditionalGenerationConfig
         )
         normalizer.verify_and_update_config(vllm_config)
+        # Resolve before admission, hashing and worker serialization so storage
+        # allocation and forward dispatch use the same backend.
+        if (backend := envs.VLLM_TPU_QWEN38_FLASH_PLE_HOST_BACKEND) is not None:
+            vllm_config.additional_config["qwen4_exp"] = {
+                **qwen4_options(vllm_config),
+                "ple_host_backend": backend,
+            }
         tile = envs.VLLM_TPU_HC_PREFILL_TILE
         validate_hc_prefill_mode("auto" if tile is None else tile, full_mix=True)
         validate_config(vllm_config)
         qwen = qwen4_options(vllm_config)
         if qwen.get("engram_config", {}).get("cpu_offload", False):
-            # Host PLE lookup stays eager; its device producer and decoder
-            # consumers use the existing piecewise compilation backend.
+            # Keep synchronous host lookup outside compiled device graphs.
             compilation = vllm_config.compilation_config
             if compilation.splitting_ops is None:
                 compilation.splitting_ops = []
@@ -408,6 +420,16 @@ def validate_config(cfg):
         if type(engram.get(flag, False)) is not bool:
             raise ValueError(f"Qwen4Exp engram_config.{flag} must be bool")
     offload = engram.get("cpu_offload", False)
+    backend = PLEHostBackend(qwen4_options(cfg).get("ple_host_backend", "torch"))
+    if backend != PLEHostBackend.TORCH and (
+        not offload or len(set(t.ple_layer_ids)) != 1
+    ):
+        raise ValueError("Native HOST DMA requires one host-offloaded PLE layer")
+    if (
+        backend == PLEHostBackend.NATIVE_DMA
+        and t.ple_embed_dim // ((t.ngram_size - 1) * t.heads_per_ngram) != 160
+    ):
+        raise ValueError("Native HOST DMA requires 160-byte FP8 PLE rows")
     shared = engram.get("dp_shared_memory", False)
     across = engram.get("embedding_across_dp", False)
     if shared and not offload:

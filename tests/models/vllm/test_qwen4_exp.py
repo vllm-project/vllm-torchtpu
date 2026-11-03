@@ -449,6 +449,58 @@ def test_ngram_ids_match_reference_for_any_chunking(chunks) -> None:
         assert torch.equal(torch.cat(got[request]), expected)
 
 
+@pytest.mark.parametrize(
+    "valid_tokens,empty_context",
+    [(0, True), (0, False), (1, False), (5, False), (16, False)],
+)
+def test_pooled_ple_lookup_ids_masks_padding_and_idle_requests(
+    monkeypatch, valid_tokens, empty_context
+):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.parallel import PLEParallel
+    from vllm_torchtpu.models.vllm.qwen4_exp.pooled_ple import Qwen4ExpPooledPLE
+
+    _set_tp(monkeypatch, 0, 1)
+    group = cast(GroupCoordinator, SimpleNamespace(world_size=1, rank_in_group=0))
+    parallel = PLEParallel(group, group, embedding_across_dp=False)
+    with set_default_torch_dtype(torch.bfloat16):
+        ple = Qwen4ExpPooledPLE(
+            _text_config(**_PLE),
+            0,
+            None,
+            "model.layers.0.ple",
+            parallel=parallel,
+            table_group=group,
+            cpu_offload=True,
+        )
+    tokens = torch.arange(16, dtype=torch.int32)
+    context = torch.full(
+        (0 if empty_context else 1, _PLE["ngram_size"] - 1),
+        _PLE["eos_token_id"],
+        dtype=torch.int32,
+    )
+    starts = torch.tensor([0] if empty_context else [0, valid_tokens])
+    actual = ple._lookup_ids(
+        PLEInputs(tokens, starts, context),
+        torch.tensor(valid_tokens, dtype=torch.int32),
+    )
+    embedding = ple.ple_embedding
+    expected = torch.full(
+        (16, embedding.ngram_heads_vocab_sizes.numel()), -1, dtype=torch.int32
+    )
+    if valid_tokens:
+        expected[:valid_tokens] = _ref_ngram_ids(
+            tokens[:valid_tokens].long(),
+            embedding.layer_multipliers,
+            embedding.ngram_heads_vocab_sizes,
+            embedding.ngram_heads_offsets,
+            _PLE["eos_token_id"],
+            _PLE["heads_per_ngram"],
+        ).to(torch.int32)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("chunks", list(_CHUNKS.values()), ids=list(_CHUNKS))
 def test_ple_layer_matches_reference_for_any_chunking(monkeypatch, chunks) -> None:
     """Padded, chunked batches that carry each request's conv window between

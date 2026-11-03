@@ -17,16 +17,72 @@ import functools
 
 import jax
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm.models.qwen4_exp.common.hyperconnection import GroupedGemmaRMSNorm
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.qwen4_exp.host_lookup import (
+    CHUNK_WORDS,
+    ROW_CHUNKS,
+    finish_host_lookup,
+    start_host_lookup,
+)
 from vllm_torchtpu.kernels.qwen4_exp.ple import (
     decode_embeddings,
     resident_lookup_raw,
 )
 from vllm_torchtpu.kernels.qwen4_exp.ple_gate import normalized_gate_dot
 from vllm_torchtpu.kernels.qwen4_exp.pool import pooled_short_conv
+
+
+@functools.cache
+def build_host_lookup_ops(local_rows: int, num_shards: int = 1):
+    """Launch HOST DMA before the prefix and consume rows at the PLE layer."""
+    device = pallas.get_pallas_mesh("ple_runtime").abstract_mesh.abstract_device
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("ple_host",),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=device,
+    )
+
+    def start(table: jax.Array, ids: jax.Array) -> jax.Array:
+        with jax.sharding.use_abstract_mesh(mesh):
+            return start_host_lookup(table, ids, local_rows, num_shards=num_shards)
+
+    start_op = pallas.jax_op(
+        f"qwen4_exp::ple_host_start_{local_rows}_shards{num_shards}", start
+    )
+
+    @start_op.register_fake
+    def start_fake(table, ids):
+        return ids.new_empty((ids.numel() * ROW_CHUNKS * CHUNK_WORDS,))
+
+    def start_with_host_marker(table: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        # TorchTPU recovers HOST inputs from reload through slice/view nodes
+        # when vLLM's bucket compiler supplies fresh FakeTensors. Keep a
+        # 512-byte reload in the FX graph; XLA removes it and this integer
+        # zero dependency, leaving only the asynchronous lookup.
+        hint = torch.ops.ao.reload(table[:128], ids.device)
+        return start_op(table, ids) + (hint[0] ^ hint[0])
+
+    def finish(
+        pending: jax.Array, ids: jax.Array, hidden: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        with jax.sharding.use_abstract_mesh(mesh):
+            return finish_host_lookup(pending, ids, hidden, local_rows)
+
+    finish_op = pallas.jax_op(
+        f"qwen4_exp::ple_host_finish_{local_rows}_shards{num_shards}", finish
+    )
+
+    @finish_op.register_fake
+    def finish_fake(pending, ids, hidden):
+        return ids.new_empty(
+            (*ids.shape, ROW_CHUNKS * CHUNK_WORDS), dtype=torch.int32
+        ), torch.empty_like(hidden)
+
+    return start_with_host_marker, finish_op
 
 
 @functools.cache
