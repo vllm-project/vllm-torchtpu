@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Ensure environment overrides are applied before any other imports,
 # especially torch_tpu which might read them at import time.
+import inspect
 import functools
 
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
@@ -8376,9 +8377,12 @@ class TPUModelRunner(GPUModelRunner):
         resize `block_table_cpu` so TPU staging and spec-decode warmup block
         allocations perfectly match the new underlying `BlockTable` capacity.
         """
-        cast(Any, super()).may_reinitialize_input_batch(
-            kv_cache_config, kernel_block_sizes
-        )
+        parent = cast(Any, super()).may_reinitialize_input_batch
+        # vLLM 0.32 dropped the kernel_block_sizes argument.
+        if len(inspect.signature(parent).parameters) >= 2:
+            parent(kv_cache_config, kernel_block_sizes)
+        else:
+            parent(kv_cache_config)
         if self.input_batch.block_table:
             self.max_num_blocks_per_req = self.input_batch.block_table[
                 0
