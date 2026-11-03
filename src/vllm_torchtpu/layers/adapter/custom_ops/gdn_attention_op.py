@@ -384,11 +384,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
         if hasattr(self, "in_proj_qkvz"):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
-            # The split into q/k/v/z heads and the conv read it token-minor.
+            # The conv reads q/k/v row-major; only the z gate reads z (the
+            # trailing columns) token-minor.
             setattr(
                 self.in_proj_qkvz,
                 TOKEN_MINOR_OUTPUT_ATTR,
-                self.in_proj_qkvz.output_size_per_partition,
+                self.value_dim // self.tp_size,
             )
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
