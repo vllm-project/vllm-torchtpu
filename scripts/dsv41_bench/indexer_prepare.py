@@ -54,7 +54,11 @@ def prepare(keys, columns, order):
         ),
         out_specs=(pl.BlockSpec(), pl.BlockSpec()),
         name="indexer_sorted_fp8_prepare",
-    )(keys, columns, jnp.pad(order, (0, padded - count)))
+    )(
+        keys,
+        jnp.pad(columns, (0, padded - count)),
+        jnp.pad(order, (0, padded - count)),
+    )
 
 
 def columns_gather(columns, order):
