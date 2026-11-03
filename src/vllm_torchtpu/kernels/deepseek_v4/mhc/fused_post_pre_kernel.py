@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import math
 from typing import cast
 
 import jax
@@ -32,6 +33,62 @@ MIN_TOKEN_BLOCK = 32
 # A bucket is split into at least this many grid steps, so the next block's
 # DMA still hides behind compute; smaller buckets keep MIN_TOKEN_BLOCK.
 MIN_GRID_STEPS = 4
+# Recombine/collapse tile. A bf16 vreg as loaded from VMEM holds 8 rows x
+# 256 lanes, which unpacks into two f32 vregs; at this size the tile's inputs,
+# its 20 lane-broadcast mix weights and its accumulators fit the registers.
+TILE_ROWS = 8
+TILE_LANES = 256
+
+
+def _recombine_tile(
+    x_ref, res_ref, newres_ref, post_b, comb_b, sq, rows, c, *, hc_mult, hidden_size
+):
+    """All new streams of one tile at column ``c``, from one load of x and of
+    each old stream. Adds their squares to the running squared sum ``sq``
+    (None to start one) and returns it."""
+    slab = post_b[0].shape[1]
+
+    def cols(stream):
+        return pl.ds(stream * hidden_size + c, slab)
+
+    # bf16 -> f32 casts are exact, so results are unchanged.
+    x = x_ref[rows, pl.ds(c, slab)].astype(jnp.float32)
+    old = [res_ref[rows, cols(i)].astype(jnp.float32) for i in range(hc_mult)]
+    for j in range(hc_mult):
+        acc = post_b[j] * x
+        for i in range(hc_mult):
+            acc = acc + comb_b[i * hc_mult + j] * old[i]
+        # Round to bf16 BEFORE the GEMM: the unfused path's pre reads the
+        # bf16 residual that post stored, and parity requires matching it.
+        newres_ref[rows, cols(j)] = acc.astype(jnp.bfloat16)
+        # Square the stored bf16 value. Read back rather than re-converted
+        # from `acc`, its squares compile to multiply-accumulates of the
+        # packed bf16 vreg into f32 (exact products), as in a whole-row sum.
+        new = newres_ref[rows, cols(j)].astype(jnp.float32)
+        sq = new * new if sq is None else sq + new * new
+    return sq
+
+
+def _collapse_tile(newres_ref, layer_ref, pre_b, rows, c, *, hc_mult, hidden_size):
+    """The layer input of one tile at column ``c``, from the stored new
+    streams."""
+    slab = pre_b[0].shape[1]
+
+    def stream(i):
+        return newres_ref[rows, pl.ds(i * hidden_size + c, slab)].astype(jnp.float32)
+
+    lay = pre_b[0] * stream(0)
+    for i in range(1, hc_mult):
+        lay = lay + pre_b[i] * stream(i)
+    layer_ref[rows, pl.ds(c, slab)] = lay.astype(jnp.bfloat16)
+
+
+def _lane_broadcast(cols, width):
+    """Each (rows, 1) column of ``cols`` broadcast to ``width`` lanes."""
+    return [
+        jnp.broadcast_to(cols[:, k : k + 1], (cols.shape[0], width))
+        for k in range(cols.shape[1])
+    ]
 
 
 def _fused_kernel(
@@ -52,45 +109,40 @@ def _fused_kernel(
     rms_eps,
     hc_pre_eps,
 ):
-    """One token block: recombine, store once, GEMM, collapse."""
-    post = post_ref[...]  # (tb, hc_mult) f32
-    comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
+    """One token block: recombine, GEMM, collapse.
 
-    # Keep the streams (and x) in bf16 and upcast per use: transient f32
-    # values instead of 4 held f32 copies halves the resident working set,
-    # leaving VMEM headroom for the pipeline to prefetch the next block.
-    # bf16 -> f32 casts are exact, so results are unchanged.
-    x_bf = x_ref[...]  # (tb, hidden) bf16
-    old_bf = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
-    ]
-
-    streams_bf = []
-    for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
-        for i in range(hc_mult):
-            k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
-        # Round to bf16 BEFORE the GEMM: the unfused path's pre reads the
-        # bf16 residual that post stored, and parity requires matching it.
-        new_bf = acc.astype(jnp.bfloat16)
-        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = new_bf
-        streams_bf.append(new_bf)
-
-    g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
-    acc = utils.dot_fn_chunks(g_bf, fn_ref[...], mixes_ref.shape[1])
-    mixes_ref[...] = acc
-    gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
-    sqr = jnp.sum(gf * gf, axis=-1, keepdims=True)
-    sqrsum_ref[...] = sqr
-
+    Recombine and collapse are elementwise per token, so they run in tiles
+    of TILE_ROWS x TILE_LANES that load their inputs once and store as they
+    go: each f32 intermediate lives for one tile instead of spanning the
+    block's whole width. The squared sum accumulates tile by tile, and the
+    GEMM reads the stored new streams back.
+    """
+    tb = x_ref.shape[0]
     m, h = hc_mult, hidden_size
+    slab = math.gcd(TILE_LANES, h)
+    tile_kw = dict(hc_mult=m, hidden_size=h)
+    row_groups = [pl.ds(r, TILE_ROWS) for r in range(0, tb, TILE_ROWS)]
+
+    for rows in row_groups:
+        post_b = _lane_broadcast(post_ref[rows, :], slab)  # per stream j
+        comb_b = _lane_broadcast(comb_ref[rows, :], slab)  # row-major (i, j)
+        sq = None
+        for c in range(0, h, slab):
+            sq = _recombine_tile(
+                x_ref, res_ref, newres_ref, post_b, comb_b, sq, rows, c, **tile_kw
+            )
+        sqrsum_ref[rows, :] = jnp.sum(sq, axis=-1, keepdims=True)
+
+    acc = utils.dot_fn_chunks(newres_ref[...], fn_ref[...], mixes_ref.shape[1])
+    mixes_ref[...] = acc
+    sqr = sqrsum_ref[...]
+
     scaled = acc[:, :m] * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
     pre_mix = jax.nn.sigmoid(scaled * sc_ref[0, 0] + hb_ref[:, :m]) + hc_pre_eps
-    lay = pre_mix[:, 0:1] * gf[:, :h]
-    for i in range(1, m):
-        lay = lay + pre_mix[:, i : i + 1] * gf[:, i * h : (i + 1) * h]
-    layer_ref[...] = lay.astype(jnp.bfloat16)
+    for rows in row_groups:
+        pre_b = _lane_broadcast(pre_mix[rows.start : rows.start + TILE_ROWS], slab)
+        for c in range(0, h, slab):
+            _collapse_tile(newres_ref, layer_ref, pre_b, rows, c, **tile_kw)
 
 
 @functools.partial(
