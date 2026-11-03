@@ -142,6 +142,8 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
                 prefill_moe_capacity_ep8=65536 if aggregate else 32768,
                 # Two expert tiles and one reduce-ring poll per down-column step.
                 prefill_moe_pair_tiles=2 if aggregate else 0,
+                # KDA window all-gather as unit-RMS E4M3FN rows (half the bytes).
+                prefill_kda_fp8_gather=aggregate,
             )
         )
     # The prefill computes the rings of its loader config's draft; the
