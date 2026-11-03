@@ -113,9 +113,28 @@ def test_budget_maximizes_expected_tokens_per_ms(confidence, costs, expected):
         num_sampling_reqs=2,
         num_non_draft_tokens=2,
         fixed_ms=costs.draft_cost(2 * K),
+        overhead_ms=0.0,
         costs=costs,
     )
     assert budget == expected
+
+
+def test_a_large_negative_overhead_keeps_the_budget_choice():
+    # Past every step's cost, the overhead must not make the steps look free:
+    # that would favor the largest budget instead of the cheap bucket's.
+    survival = survival_probabilities(np.full((2, K), 0.3), np.array([K, K]))
+    budgets = [
+        choose_draft_budget(
+            survival,
+            num_sampling_reqs=2,
+            num_non_draft_tokens=2,
+            fixed_ms=COSTS.draft_cost(2 * K),
+            overhead_ms=overhead_ms,
+            costs=COSTS,
+        )
+        for overhead_ms in (0.0, -1000.0)
+    ]
+    assert budgets == [6, 6]
 
 
 def test_cost_follows_real_tokens_within_a_bucket():
@@ -141,7 +160,12 @@ def test_full_windows_may_undercut_a_trimmed_step():
     )
     survival = survival_probabilities(np.full((2, K), 0.5), np.array([K, K]))
     budget = choose_draft_budget(
-        survival, num_sampling_reqs=2, num_non_draft_tokens=2, fixed_ms=1.0, costs=table
+        survival,
+        num_sampling_reqs=2,
+        num_non_draft_tokens=2,
+        fixed_ms=1.0,
+        overhead_ms=0.0,
+        costs=table,
     )
     assert budget == 2 * K
     # Draft costs still flatten noise: a larger bucket never costs less.
@@ -316,6 +340,28 @@ def test_calibration_keeps_negative_samples_and_skips_catch_up():
     clock.now += 0.001
     manager.trim(step)
     assert manager.overhead_ms == pytest.approx(one_sample)
+
+
+def test_calibration_recovers_from_an_overhead_past_the_steps_cost():
+    manager = _manager()
+    manager.calibrate_overhead = True
+    clock = manager._clock = _Clock()
+    manager.overhead_ms = -100.0
+    _record(manager, {"a": 0.9, "b": 0.9})
+    step = _decode_step({"a": 1, "b": 1})
+    manager.trim(step)
+    # 8 ms against the table's 11 ms: the sample is -3 ms.
+    clock.now += 0.008
+    manager.trim(step)
+    assert manager.overhead_ms == pytest.approx(-100.0 + 0.05 * 97.0)
+
+
+def test_bfloat16_confidences_reach_the_host():
+    manager = _manager()
+    chunk = torch.full((8, K), 0.5, dtype=torch.bfloat16)
+    manager.record_confidences(["a"], [chunk], [1])
+    manager._drain(keep=0)
+    np.testing.assert_allclose(manager._confidences["a"], [0.5] * K)
 
 
 def test_without_calibration_the_overhead_stays_put():

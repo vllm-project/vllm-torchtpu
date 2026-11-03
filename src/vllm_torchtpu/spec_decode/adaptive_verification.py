@@ -208,22 +208,30 @@ def survival_probabilities(
     return np.where(steps[None, :] < num_drafts[:, None], survival, -np.inf)
 
 
+def _predicted_step_ms(table_ms: np.ndarray, overhead_ms: float) -> np.ndarray:
+    """A step's table cost plus the calibrated overhead. The overhead comes
+    from the steps that ran lately, so a negative one can exceed a smaller
+    step's whole cost; no step is predicted faster than a catch-up gap."""
+    return np.maximum(table_ms + overhead_ms, table_ms / _STALL_FACTOR)
+
+
 def choose_draft_budget(
     survival: np.ndarray,
     num_sampling_reqs: int,
     num_non_draft_tokens: int,
     fixed_ms: float,
+    overhead_ms: float,
     costs: StepCostTable,
 ) -> int:
     """Number of draft slots that maximizes expected tokens per ms."""
     scores = np.sort(survival[np.isfinite(survival)])[::-1]
     budgets = np.arange(scores.size + 1)
     expected = num_sampling_reqs + np.concatenate(([0.0], np.cumsum(scores)))
-    step_ms = fixed_ms + costs.verify_cost(
-        num_sampling_reqs, num_non_draft_tokens + budgets
+    step_ms = _predicted_step_ms(
+        fixed_ms + costs.verify_cost(num_sampling_reqs, num_non_draft_tokens + budgets),
+        overhead_ms,
     )
-    # A calibrated overhead below zero must not flip the ratio's sign.
-    return int(np.argmax(expected / np.maximum(step_ms, 1e-3)))
+    return int(np.argmax(expected / step_ms))
 
 
 def allocate_draft_budget(survival: np.ndarray, budget: int) -> np.ndarray:
@@ -290,7 +298,8 @@ class _PendingConfidences:
         if self.ready_event is not None:
             self.ready_event.synchronize()
         rows = np.concatenate(
-            [t[:n].numpy() for t, n in zip(self.chunks_cpu, self.real_lens)]
+            # numpy has no bfloat16; the head returns the model's dtype.
+            [t[:n].float().numpy() for t, n in zip(self.chunks_cpu, self.real_lens)]
         )
         return zip(self.req_ids, rows)
 
@@ -346,10 +355,12 @@ class AdaptiveVerificationManager:
     ) -> None:
         """Start the D2H copy of one proposal's ``[rows, K]`` confidences;
         row ``i`` of the concatenated real rows belongs to ``req_ids[i]``."""
+        assert chunks, "a proposal has at least one draft chunk"
         assert sum(real_lens) == len(req_ids), (real_lens, len(req_ids))
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks]
         ready_event = None
         if chunks[0].device.type != "cpu":
+            # pyrefly: ignore[missing-attribute]
             ready_event = torch.tpu.Event()
             ready_event.record()
         self._pending.append(
@@ -420,8 +431,8 @@ class AdaptiveVerificationManager:
                 survival,
                 num_sampling_reqs=num_reqs,
                 num_non_draft_tokens=num_reqs,
-                fixed_ms=self.cost_table.draft_cost(num_reqs * self.draft_block_size)
-                + self.overhead_ms,
+                fixed_ms=self.cost_table.draft_cost(num_reqs * self.draft_block_size),
+                overhead_ms=self.overhead_ms,
                 costs=self.cost_table,
             )
             self._last_step = (now, num_reqs, num_reqs + budget)
@@ -476,8 +487,10 @@ class AdaptiveVerificationManager:
         assert self.cost_table is not None
         expected_ms = self.cost_table.draft_cost(
             num_reqs * self.draft_block_size
-        ) + float(self.cost_table.verify_cost(num_reqs, num_tokens))
-        predicted_ms = expected_ms + self.overhead_ms
+        ) + float(self.cost_table.verify_cost(num_reqs, np.asarray(num_tokens)))
+        predicted_ms = float(
+            _predicted_step_ms(np.asarray(expected_ms), self.overhead_ms)
+        )
         elapsed_ms = (now - started) * 1e3
         if not (
             predicted_ms / _STALL_FACTOR <= elapsed_ms <= _STALL_FACTOR * predicted_ms
