@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
     VLLM_TPU_QSA_DCP_Q_GATHER: bool = False
+    VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -779,6 +780,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # not their gates (the DCP attention is ungated; each rank gates its own
     # heads); half the bytes, bit-identical.
     "VLLM_TPU_QSA_DCP_Q_GATHER": env_bool("VLLM_TPU_QSA_DCP_Q_GATHER"),
+    # Compressed-key writes: take each pair's two key rows by selecting over
+    # statically shifted copies of the keys (offsets within two compression
+    # groups of the token) instead of a gather; a lax.cond falls back to the
+    # gather when a written row's offset is out of range (bit-identical pool).
+    "VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT": env_bool("VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT"),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every
