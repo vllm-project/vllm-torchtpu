@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_MLA_LOCAL_Q_GATHER: bool = False
     TPU_MLA_LOCAL_Q_FUSED_AG: bool = False
+    TPU_MLA_LOCAL_Q_FUSED_ABSORB: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
@@ -1011,6 +1012,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # then XLA's all-gather. With TPU_INDEXER_QB_OVERLAP it also replaces the
     # indexer layers' overlapped q_b. Bit-identical q.
     "TPU_MLA_LOCAL_Q_FUSED_AG": env_bool("TPU_MLA_LOCAL_Q_FUSED_AG"),
+    # With TPU_MLA_LOCAL_Q_FUSED_AG, on the layers it serves outside the indexer
+    # overlap: the kernel also absorbs this rank's heads (q_nope @ W_UK, bf16
+    # W_UK) and all-gathers them token-major, so attention skips its own absorb
+    # of all the group's heads and the relayout copy after it. f32 dots rounded
+    # to bf16 as before; the summation order may differ (tolerance tier).
+    "TPU_MLA_LOCAL_Q_FUSED_ABSORB": env_bool("TPU_MLA_LOCAL_Q_FUSED_ABSORB"),
     # Store each token's 64-byte fp8 RoPE key in 64 bytes instead of a padded
     # 128-byte row (eight tokens per 128-word row), cutting the sparse MLA
     # latent cache from 640 to 576 B/token. SparseCore layouts only; the

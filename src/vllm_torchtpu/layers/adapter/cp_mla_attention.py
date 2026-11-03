@@ -74,12 +74,16 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
 _LOCAL_Q_ALL_GATHER_OPS: dict = {}
 
 
-def local_q_all_gather_op():
+def local_q_all_gather_op(absorb: bool = False):
     """`op(x, w_q, w_s, rank, lane)`: `x @ w_q * scales` on every DCP rank, each
     rank projecting only its column window (`rank`) and all-gathering the rest
     in one Pallas kernel (kernels/quantized_matmul/fp8_window_all_gather.py,
     TPU_MLA_LOCAL_Q_FUSED_AG). `rank` / `lane` are `dcp_rank_operand` /
-    `dcp_lane_operand`. Build it outside Dynamo (load time)."""
+    `dcp_lane_operand`. Build it outside Dynamo (load time).
+
+    `absorb` (TPU_MLA_LOCAL_Q_FUSED_ABSORB): `op(x, w_q, w_s, w_uk, rank, lane)
+    -> (q, ql)`, `w_uk` this rank's heads of W_UK (bf16 [h, nope, r]) and `ql`
+    every head's absorbed q_nope, token-major [T, group heads * r]."""
     from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
@@ -90,7 +94,7 @@ def local_q_all_gather_op():
 
     mesh = get_or_create_dcp_mesh()
     world = int(mesh.shape[DCP_AXIS_NAME])
-    op = _LOCAL_Q_ALL_GATHER_OPS.get(world)
+    op = _LOCAL_Q_ALL_GATHER_OPS.get((world, absorb))
     if op is not None:
         return op
     lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
@@ -98,7 +102,7 @@ def local_q_all_gather_op():
     lane_axis = lane_axes[0] if lane_axes else None
     spec = P(DCP_AXIS_NAME)
 
-    def body(x, w_q, w_s, rank, lane):
+    def body(x, w_q, w_s, rank, lane, w_uk=None):
         return fp8_window_all_gather(
             x,
             w_q,
@@ -108,31 +112,72 @@ def local_q_all_gather_op():
             axis=DCP_AXIS_NAME,
             lane_axis=lane_axis,
             lane=None if lane_axis is None else lane,
+            w_uk=w_uk,
         )
 
-    def fn(
-        x: jax.Array,
-        w_q: jax.Array,
-        w_s: jax.Array,
-        rank: jax.Array,
-        lane: jax.Array,
-    ) -> jax.Array:
-        return jax.shard_map(
-            body, mesh=mesh, in_specs=(spec,) * 5, out_specs=spec, check_vma=False
-        )(x, w_q, w_s, rank, lane)
+    if absorb:
 
-    def fake(x: torch.Tensor, w_q: torch.Tensor, *_) -> torch.Tensor:
-        return x.new_empty((x.shape[0], w_q.shape[1]))
+        def fn_absorb(
+            x: jax.Array,
+            w_q: jax.Array,
+            w_s: jax.Array,
+            w_uk: jax.Array,
+            rank: jax.Array,
+            lane: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            def body_absorb(x, w_q, w_s, w_uk, rank, lane):
+                return body(x, w_q, w_s, rank, lane, w_uk)
 
-    op = sharded_jax_op(
-        f"pallas::fp8_window_all_gather_{world}",
-        fn,
-        mesh=mesh,
-        input_partition_specs=(spec,) * 5,
-        output_partition_specs=spec,
-        fake=fake,
-    )
-    _LOCAL_Q_ALL_GATHER_OPS[world] = op
+            return jax.shard_map(
+                body_absorb,
+                mesh=mesh,
+                in_specs=(spec,) * 6,
+                out_specs=(spec, spec),
+                check_vma=False,
+            )(x, w_q, w_s, w_uk, rank, lane)
+
+        def fake_absorb(
+            x: torch.Tensor, w_q: torch.Tensor, _w_s, w_uk: torch.Tensor, *_
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            heads, _, rank_dim = w_uk.shape
+            return (
+                x.new_empty((x.shape[0], w_q.shape[1])),
+                x.new_empty((x.shape[0], world * heads * rank_dim)),
+            )
+
+        op = sharded_jax_op(
+            f"pallas::fp8_window_all_gather_absorb_{world}",
+            fn_absorb,
+            mesh=mesh,
+            input_partition_specs=(spec,) * 6,
+            output_partition_specs=(spec, spec),
+            fake=fake_absorb,
+        )
+    else:
+
+        def fn(
+            x: jax.Array,
+            w_q: jax.Array,
+            w_s: jax.Array,
+            rank: jax.Array,
+            lane: jax.Array,
+        ) -> jax.Array:
+            return jax.shard_map(
+                body, mesh=mesh, in_specs=(spec,) * 5, out_specs=spec, check_vma=False
+            )(x, w_q, w_s, rank, lane)
+
+        def fake(x: torch.Tensor, w_q: torch.Tensor, *_) -> torch.Tensor:
+            return x.new_empty((x.shape[0], w_q.shape[1]))
+
+        op = sharded_jax_op(
+            f"pallas::fp8_window_all_gather_{world}",
+            fn,
+            mesh=mesh,
+            input_partition_specs=(spec,) * 5,
+            output_partition_specs=spec,
+            fake=fake,
+        )
+    _LOCAL_Q_ALL_GATHER_OPS[(world, absorb)] = op
     return op
 
 

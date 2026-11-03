@@ -2169,6 +2169,7 @@ class VllmTPUMLAAttention(MLAAttention):
             output=output,
             topk_indices=kwargs.get("topk_indices"),
             q_dcp_replicated=kwargs.get("q_dcp_replicated"),
+            ql_nope_dcp=kwargs.get("ql_nope_dcp"),
         )
 
 
@@ -2322,9 +2323,19 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # all-gather of the heads (`_project_local_q`).
         self.local_q_op = None
         self.local_q_window = None
-        # TPU_MLA_LOCAL_Q_FUSED_AG: the window and the gather as one kernel.
+        # TPU_MLA_LOCAL_Q_FUSED_AG: the window and the gather as one kernel; with
+        # TPU_MLA_LOCAL_Q_FUSED_ABSORB it also returns the absorbed q_nope.
         self.local_q_fused_op = None
         self.local_q_lane = None
+        self.local_q_absorb = False
+        if envs.TPU_MLA_LOCAL_Q_FUSED_ABSORB and not (
+            envs.TPU_MLA_LOCAL_Q_GATHER and envs.TPU_MLA_LOCAL_Q_FUSED_AG
+        ):
+            raise NotImplementedError(
+                "TPU_MLA_LOCAL_Q_FUSED_ABSORB absorbs inside the fused window "
+                "all-gather: it needs TPU_MLA_LOCAL_Q_GATHER and "
+                "TPU_MLA_LOCAL_Q_FUSED_AG"
+            )
         if (
             envs.TPU_MLA_LOCAL_Q_GATHER
             and self.dcp_q_replicate
@@ -2354,8 +2365,12 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             if envs.TPU_MLA_LOCAL_Q_FUSED_AG:
                 from vllm_torchtpu.distributed.dcp import dcp_lane_operand
 
-                self.local_q_fused_op = local_q_all_gather_op()
+                self.local_q_absorb = envs.TPU_MLA_LOCAL_Q_FUSED_ABSORB
+                self.local_q_fused_op = local_q_all_gather_op(self.local_q_absorb)
                 self.local_q_lane = dcp_lane_operand()
+                if self.local_q_absorb:
+                    hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
+                    hooks.append(self._check_local_q_absorb)
 
         # TPU_MLA_ROPE_NEOX_PERMUTE: set once the q / k_pe projection columns
         # are in half-split order, which is what switches `forward` to NeoX
@@ -2437,18 +2452,54 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             *operands[0].shape, self.num_heads * self.qk_head_dim
         )
 
-    def _project_local_q(self, q_c: torch.Tensor) -> torch.Tensor:
+    def _project_local_q(
+        self, q_c: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """`q_b_proj(q_c)` under query replication, bit for bit: this rank's
         heads from its column window of the replicated weight (1/dcp of the
-        bytes), all-gathered over the DCP group in head order."""
+        bytes), all-gathered over the DCP group in head order. Under
+        TPU_MLA_LOCAL_Q_FUSED_ABSORB also every group head's absorbed q_nope
+        (q_nope @ W_UK, [T, heads, kv_lora_rank]), else None."""
         operands = _qb_overlap_operands(self.q_b_proj)
         assert operands is not None and self.local_q_op is not None
         fused = getattr(self, "local_q_fused_op", None)
+        rank, lane = self.local_q_window, getattr(self, "local_q_lane", None)
+        if fused is not None and getattr(self, "local_q_absorb", False):
+            q, ql = fused(q_c, *operands, self._local_q_w_uk(), rank, lane)
+            return q, ql.view(q_c.shape[0], -1, self.kv_lora_rank)
         if fused is not None:
-            return fused(q_c, *operands, self.local_q_window, self.local_q_lane)
-        local = self.local_q_op(q_c, *operands, self.local_q_window)
+            return fused(q_c, *operands, rank, lane), None
+        local = self.local_q_op(q_c, *operands, rank)
         heads = local.view(q_c.shape[0], self.num_heads, self.qk_head_dim)
-        return all_gather_heads(heads).reshape(q_c.shape[0], -1)
+        return all_gather_heads(heads).reshape(q_c.shape[0], -1), None
+
+    def _check_local_q_absorb(self) -> None:
+        """Refuse at load a W_UK the in-kernel absorb does not take, rather than
+        at the first decode trace."""
+        if not self._local_q_serves():
+            return  # this layer keeps the replicated q_b and its absorb
+        w_uk = self._local_q_w_uk()
+        absorb = fp8_window_all_gather.Absorb(*w_uk.shape)
+        n_out = self.num_heads * self.dcp_group_size * self.qk_head_dim
+        if w_uk.dtype != torch.bfloat16 or not fp8_window_all_gather.absorb_supports(
+            n_out, self.dcp_group_size, absorb
+        ):
+            raise NotImplementedError(
+                f"TPU_MLA_LOCAL_Q_FUSED_ABSORB: {w_uk.dtype} W_UK "
+                f"{tuple(w_uk.shape)} over {self.dcp_group_size} windows of "
+                f"{n_out} q columns is not supported"
+            )
+
+    def _local_q_w_uk(self) -> torch.Tensor:
+        """This rank's heads of W_UK (`W_UK_T`, [heads, qk_nope, kv_lora_rank]):
+        the heads of its q_b window, in order (the DCP rank is the q_b rank)."""
+        w_uk = self.mla_attn.W_UK_T
+        if getattr(self.mla_attn, "W_UK_T_scale", None) is not None:
+            raise NotImplementedError(
+                "TPU_MLA_LOCAL_Q_FUSED_ABSORB absorbs with a bf16 W_UK, not a "
+                "quantized one"
+            )
+        return w_uk
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
@@ -2468,6 +2519,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
+        # TPU_MLA_LOCAL_Q_FUSED_ABSORB: the group's absorbed q_nope, from the
+        # local q projection (`_project_local_q`).
+        ql_nope_dcp = None
         output_gate = None
         early_topk = None
         # TPU_MOE_PREFILL_SEQUENCE_PARALLEL: `hidden_states` holds this rank's
@@ -2483,6 +2537,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             # Lifted on every bucket, before any token-count branch: the warmup
             # hands buckets only between traces that lift the same buffers.
             operands = (self.local_q_window, getattr(self, "local_q_lane", None))
+            if getattr(self, "local_q_absorb", False):
+                operands += (
+                    self.mla_attn.W_UK_T,
+                    getattr(self.mla_attn, "W_UK_T_scale", None),
+                )
             hidden_states = _retain_buffers(
                 hidden_states, *(t for t in operands if t is not None)
             )
@@ -2582,7 +2641,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     and q_c.shape[0] <= fp8_skinny.MAX_M
                     and self._local_q_serves()
                 ):
-                    q = self._project_local_q(q_c)
+                    q, ql_nope_dcp = self._project_local_q(q_c)
                 else:
                     q = self.q_b_proj(
                         q_c if q_rows is None else q_c.index_select(0, q_rows)
@@ -2672,6 +2731,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")  # noqa: E501
 
         if llama_4_scaling is not None:
+            if ql_nope_dcp is not None:
+                raise NotImplementedError(
+                    "TPU_MLA_LOCAL_Q_FUSED_ABSORB absorbs q_nope before "
+                    "llama_4_scaling would scale it"
+                )
             q_nope *= llama_4_scaling
             q_pe *= llama_4_scaling
 
@@ -2696,6 +2760,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 local_view = q_proj_layer._local_view
                 q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
+        absorbed = {}
+        if ql_nope_dcp is not None:
+            # Only the replicated sparse DCP path reads q_nope absorbed.
+            assert q_dcp_replicated is not None and topk_indices is not None
+            absorbed = {"ql_nope_dcp": ql_nope_dcp}
         attn_out = self.mla_attn(
             (q_nope, q_pe),
             kv_c_normed,
@@ -2703,6 +2772,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
             q_dcp_replicated=q_dcp_replicated,
+            **absorbed,
         )
 
         if output_gate is not None:

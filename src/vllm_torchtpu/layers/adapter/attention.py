@@ -2893,10 +2893,20 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
         pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
 
+        # TPU_MLA_LOCAL_Q_FUSED_ABSORB: the q projection absorbed the group's
+        # q_nope already (`_project_local_q`).
+        ql_nope_dcp = kwargs.get("ql_nope_dcp")
+        if ql_nope_dcp is not None and not use_qrep:
+            raise ValueError("ql_nope_dcp is the query-replicated sparse DCP q")
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
+        if ql_nope_dcp is not None:
+            # The group's W_UK goes unread here and is read on every other
+            # bucket: lift it (warmup hand-over).
+            ql_nope = _retain_buffers(ql_nope_dcp, w_uk_t_src, w_uk_t_scale)
+            ql_nope = ql_nope.to(input_dtype)
+        elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
             q_nope_t = q_nope.transpose(0, 1)

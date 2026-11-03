@@ -226,3 +226,57 @@ def test_decode_buckets_run_the_fused_window_all_gather():
         assert sum(x is t for x in lifted) == 2
     for name in ("q_nope", "q_pe", "kv_c", "k_pe", "topk"):
         assert torch.equal(out[name], ref[name]), name
+
+
+def test_decode_buckets_take_the_absorbed_q_from_the_fused_op():
+    """TPU_MLA_LOCAL_Q_FUSED_ABSORB: the fused op is also handed this rank's
+    W_UK and returns the group's absorbed q_nope with q; attention gets it as
+    `ql_nope_dcp`. Both buckets lift W_UK; a split bucket neither runs the op
+    nor hands an absorbed q over."""
+    hidden, positions = _inputs(16, seed=4)
+    ref = _forward(_flagged(False), hidden, positions, None)
+    w = _flagged(False)
+    uk = torch.zeros(1)
+    heads = w.num_heads * w.dcp_group_size
+    seen = {}
+
+    def fused_op(q_c, w_q, w_s, w_uk, window, lane):
+        seen.update(operands=(w_q, w_s), w_uk=w_uk, window=window, lane=lane)
+        q = w.q_b_proj(q_c)[0]
+        seen["ql"] = torch.randn(q_c.shape[0], heads * w.kv_lora_rank)
+        return q, seen["ql"]
+
+    w.local_q_op = lambda *args: None
+    w.local_q_fused_op = fused_op
+    w.local_q_absorb = True
+    w.local_q_window = torch.tensor([1], dtype=torch.int32)
+    w.local_q_lane = torch.tensor([0], dtype=torch.int32)
+    lifted = []
+
+    def retain(out, *buffers):
+        lifted.extend(buffers)
+        return out
+
+    wrapper_cls = mla_op.VllmMultiHeadLatentAttentionWrapper
+    with (
+        patch.object(mla_op, "_qb_overlap_operands", lambda layer: ("w", "s")),
+        patch.object(wrapper_cls, "_local_q_serves", lambda self: True),
+        patch.object(wrapper_cls, "_local_q_w_uk", lambda self: uk),
+        patch.object(mla_op.vllm_compilation_backends, "model_tag", "backbone"),
+        patch.object(mla_op, "_retain_buffers", retain),
+    ):
+        out = _forward(w, hidden, positions, None)
+        absorbed = w.mla_attn.call_args.kwargs["ql_nope_dcp"]
+        assert seen["w_uk"] is uk and seen["operands"] == ("w", "s")
+        assert seen["window"] is w.local_q_window and seen["lane"] is w.local_q_lane
+        assert absorbed.shape == (hidden.shape[0], heads, w.kv_lora_rank)
+        assert torch.equal(absorbed.reshape(hidden.shape[0], -1), seen["ql"])
+        assert any(x is w.mla_attn.W_UK_T for x in lifted)
+        lifted.clear()
+        seen.clear()
+        _forward(w, hidden, positions, "token_parallel")
+        assert not seen  # a split bucket keeps the replicated q_b
+        assert "ql_nope_dcp" not in w.mla_attn.call_args.kwargs
+        assert any(x is w.mla_attn.W_UK_T for x in lifted)  # lifted there too
+    for name in ("q_nope", "q_pe", "kv_c", "k_pe", "topk"):
+        assert torch.equal(out[name], ref[name]), name

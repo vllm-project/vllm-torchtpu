@@ -1838,10 +1838,12 @@ def test_rs_out_precision_chunked_merge_is_bitwise_the_unchunked_merge(
         assert not torch.equal(today.view(torch.int16), f32.view(torch.int16))
 
 
-def test_local_q_all_gather_op_hands_jax_op_an_annotated_function(monkeypatch):
-    """`local_q_all_gather_op` (TPU_MLA_LOCAL_Q_FUSED_AG) builds at model load:
-    the function it registers passes torch_tpu's signature check, which refuses
-    an unannotated JAX argument."""
+@pytest.mark.parametrize("absorb", [False, True])
+def test_local_q_all_gather_op_hands_jax_op_an_annotated_function(absorb, monkeypatch):
+    """`local_q_all_gather_op` (TPU_MLA_LOCAL_Q_FUSED_AG, with or without
+    TPU_MLA_LOCAL_Q_FUSED_ABSORB) builds at model load: the function it
+    registers passes torch_tpu's signature check, which refuses an unannotated
+    JAX argument."""
     import inspect
 
     from vllm_torchtpu.distributed import dcp
@@ -1863,5 +1865,6 @@ def test_local_q_all_gather_op_hands_jax_op_an_annotated_function(monkeypatch):
     monkeypatch.setattr(dcp, "get_or_create_dcp_mesh", lambda: _Mesh())
     monkeypatch.setattr(sjo, "sharded_jax_op", checked_op)
     monkeypatch.setattr(cp_mla, "_LOCAL_Q_ALL_GATHER_OPS", {})
-    cp_mla.local_q_all_gather_op()
-    assert built == ["pallas::fp8_window_all_gather_16"]
+    cp_mla.local_q_all_gather_op(absorb)
+    name = "fp8_window_all_gather_absorb_16" if absorb else "fp8_window_all_gather_16"
+    assert built == [f"pallas::{name}"]

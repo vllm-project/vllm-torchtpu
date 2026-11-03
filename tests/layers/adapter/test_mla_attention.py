@@ -1190,6 +1190,65 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
     torch.testing.assert_close(q_pe, q_pe_rep)
 
 
+def test_mla_forward_qrep_takes_the_projections_absorbed_q(monkeypatch):
+    """TPU_MLA_LOCAL_Q_FUSED_ABSORB: an absorbed q_nope handed over with the
+    replicated q reaches the kernel as is; the group's W_UK is not applied, but
+    still lifted (the other buckets read it: warmup hand-over)."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+    group_heads = local_heads * dcp_size
+
+    torch.manual_seed(3)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    partial = torch.randn(num_tokens, group_heads, 512)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **_kw: out[:, :local_heads, :],
+    )
+
+    lifted = []
+
+    def retain(out, *buffers):
+        lifted.extend(buffers)
+        return out
+
+    monkeypatch.setattr(attention_adapter, "_retain_buffers", retain)
+    absorbed = torch.randn(num_tokens, group_heads, 512)
+    q_pe_rep = torch.randn(num_tokens, group_heads, 64)
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(torch.randn(num_tokens, group_heads, 128), q_pe_rep),
+        ql_nope_dcp=absorbed,
+    )
+
+    _cache, ql_nope, q_pe, *_ = layer.sparse_mla_dcp_op.call_args.args
+    assert torch.equal(ql_nope, absorbed.to(ql_nope.dtype))
+    torch.testing.assert_close(q_pe, q_pe_rep)
+    assert any(b is layer.W_UK_T_dcp_qrep for b in lifted)
+
+
+def test_mla_forward_refuses_an_absorbed_q_off_the_replicated_path():
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    num_tokens = inputs["kv_c_normed"].shape[0]
+    with pytest.raises(ValueError, match="ql_nope_dcp"):
+        impl.forward(
+            layer=layer, **inputs, ql_nope_dcp=torch.zeros(num_tokens, 16, 512)
+        )
+
+
 def test_mla_forward_qrep_applies_w_uv_before_the_merge(monkeypatch):
     """With the group's W_UV built, the merge receives f32 partials already
     projected to v_head_dim, and the local W_UV is not applied again."""
