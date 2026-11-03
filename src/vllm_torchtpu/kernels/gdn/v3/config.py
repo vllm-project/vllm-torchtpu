@@ -122,6 +122,15 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # PER_SEQ chunked GDN only: the tile holds two chunks of the same
+    # sequence (tile_size = 2 * sub_chunk_size), whose state-independent
+    # work is batched over heads (TPU_GDN_CHUNK_PAIR).
+    chunk_pair: bool = False
+
+    @property
+    def sub_chunk_size(self) -> int:
+        """Rows of one GDN chunk: half the tile when chunks are paired."""
+        return self.chunk_size // 2 if self.chunk_pair else self.chunk_size
 
     @property
     def chunk_size(self) -> int:
@@ -215,6 +224,8 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
+        if self.chunk_pair:
+            suffix += "_pair"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
