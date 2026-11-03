@@ -42,7 +42,6 @@ import torch
 from jax import lax
 from jax.sharding import PartitionSpec as P
 from vllm.compilation import backends as vllm_compilation_backends
-from vllm.distributed import tensor_model_parallel_all_gather
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
@@ -929,6 +928,7 @@ def attention_rows(
     topk_rows: torch.Tensor,
     attn_metadata: Any,
     rank: torch.Tensor,
+    heads_op: Any,
 ) -> torch.Tensor:
     """Sparse MLA of a split bucket on sequence-parallel rows
     (`mla_prefill_rows`): `[R, heads, kv_lora_rank]`, every head of this
@@ -936,7 +936,9 @@ def attention_rows(
     `*_dcp` of the DCP sub-batch's rows `[0, split_rows)` (rank 0's own
     first rows, filled in from the DCP path); `kv_c_normed` / `k_pe` every
     row's quantized latents; `topk_rows` as `indexer_rows_aligned` returns
-    them; `rank` this rank's index as data (any shape of one element)."""
+    them; `rank` this rank's index as data (any shape of one element);
+    `heads_op` gathers every rank's head slice of the DCP rows onto every
+    rank (`dcp_token_parallel.all_heads`)."""
     from vllm_torchtpu.layers.adapter.cp_mla_attention import (
         merge_lse_partials_scatter_heads,
     )
@@ -976,6 +978,6 @@ def attention_rows(
         lse,
     )
     # Every head of the DCP rows, in place of rank 0's first own rows.
-    head = tensor_model_parallel_all_gather(head, 1)
+    head = heads_op(head)
     first = torch.where(rank.reshape(1, 1, 1) == 0, head, out[:s])
     return out.slice_scatter(first, dim=0, start=0, end=s)

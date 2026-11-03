@@ -57,7 +57,7 @@ from vllm_torchtpu.distributed.dcp import (
     get_dcp_rank,
     get_or_create_dcp_mesh,
 )
-from vllm_torchtpu.kernels.mla import rows_oproj
+from vllm_torchtpu.kernels.mla import dcp_token_parallel, rows_oproj
 from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
 from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_SCALE,
@@ -92,6 +92,7 @@ class _Rows:
 
     prefetch_op: Any
     oproj_op: Any
+    heads_op: Any
 
 
 def check_config(vllm_config: Any) -> None:
@@ -202,7 +203,7 @@ def _build_ops() -> _Rows:
         input_partition_specs=(sharded,) * 4,
         output_partition_specs=(sharded,) * 3,
     )
-    tp = mesh.devices.size
+    tp = mesh.shape[DCP_AXIS_NAME]
 
     def _gather_fake(w_o, w_uv, w_scale, *_a, **_k):
         return (
@@ -224,8 +225,38 @@ def _build_ops() -> _Rows:
             (out_latent.shape[0], w_o.shape[2])
         )
     )
-    _OPS[gather] = _Rows(prefetch_op, oproj_op)
+    _OPS[gather] = _Rows(prefetch_op, oproj_op, _heads_op())
     return _OPS[gather]
+
+
+@functools.cache
+def _heads_op() -> Any:
+    """Every DCP rank's head slice of the DCP sub-batch's rows, on every rank
+    (`dcp_token_parallel.all_heads`)."""
+    mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
+    sharded = P(DCP_AXIS_NAME)
+
+    def heads_fn(x: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            functools.partial(dcp_token_parallel.all_heads, axis_name=DCP_AXIS_NAME),
+            mesh=mesh,
+            in_specs=sharded,
+            out_specs=sharded,
+            check_vma=False,
+        )(x)
+
+    op = pallas.jax_op(
+        "pallas::mla_rows_all_heads",
+        heads_fn,
+        mesh=mesh,
+        input_partition_specs=(sharded,),
+        output_partition_specs=(sharded,),
+    )
+    world = mesh.shape[DCP_AXIS_NAME]
+    op.register_fake(
+        lambda x: x.new_empty((x.shape[0], x.shape[1] * world, *x.shape[2:]))
+    )
+    return op
 
 
 def arm(mla: Any) -> None:
@@ -418,6 +449,7 @@ def forward(
             topk_rows,
             attn_metadata,
             rank,
+            rows.heads_op,
         )
     w_o, w_uv, w_scale = gathered
     return rows.oproj_op(latent, w_uv, w_o, w_scale)

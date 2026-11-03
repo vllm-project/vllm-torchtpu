@@ -31,6 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.mla import dcp_token_parallel as tp
 
@@ -420,6 +421,29 @@ def test_gather_page_ids_and_capacity(dcp):
             assert ids[offsets[i] + v] == st.block_tables[i, v] % st.num_pages
     assert (ids[pages.sum() :] == 0).all()
     assert int(tp.total_step_pages(lay, seq_lens, qsl, st.num_seqs)) == pages.sum()
+
+
+def test_all_heads_is_every_rank_s_head_slice_in_rank_order():
+    """Bit for bit what torch's `all_gather(x, 1)` returns, on every rank."""
+    dcp, rows, local, d = 16, 8, 4, 128
+    mesh = _mesh(dcp)
+    x = jax.random.normal(jax.random.key(0), (dcp * rows, local, d), jnp.bfloat16)
+    got = jax.jit(
+        jax.shard_map(
+            lambda s: tp.all_heads(s, AXIS),
+            mesh=mesh,
+            in_specs=P(AXIS),
+            out_specs=P(AXIS),
+            check_vma=False,
+        )
+    )(x)
+    want = jnp.concatenate(jnp.split(x, dcp, axis=0), axis=1)
+    assert got.shape == (dcp * rows, dcp * local, d)
+    for r in range(dcp):
+        np.testing.assert_array_equal(
+            np.asarray(got[r * rows : (r + 1) * rows].view(jnp.uint16)),
+            np.asarray(want.view(jnp.uint16)),
+        )
 
 
 def test_layout_rejects_unservable_buckets():
