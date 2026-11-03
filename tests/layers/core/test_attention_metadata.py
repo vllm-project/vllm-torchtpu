@@ -82,9 +82,9 @@ class TestAttentionMetadataBuilderPlumbing:
             kv_cache_group_id=kv_cache_group_id,
         )
 
-    def _make_mamba_builder(self, runner, kv_cache_group_id=0):
+    def _make_mamba_builder(self, runner, kv_cache_group_id=0, block_size=16):
         spec = MambaSpec(
-            block_size=16,
+            block_size=block_size,
             shapes=[(4, 128), (8, 64, 32)],
             dtypes=[torch.bfloat16, torch.float32],
             page_size_padded=16384,
@@ -627,6 +627,142 @@ class TestAttentionMetadataBuilderPlumbing:
 
         builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
         assert source.call_count == 1  # build() did not read it again
+
+    def test_unchanged_tables_skip_repacking(self):
+        """With no BlockTable mutation since the last walk and the same walk
+        geometry, staging reuses the previous upload without reading the CPU
+        tables; a mutation or a different window re-packs."""
+        from vllm_torchtpu.layers.core import attention_metadata as am
+
+        runner = self._make_runner_mock(num_groups=2)
+        runner._block_table_stage_cpu = None
+        builders = [
+            self._make_builder(runner, kv_cache_group_id=gid) for gid in range(2)
+        ]
+        self._make_attn_groups(runner, builders)
+
+        def ctx(num_reqs=2):
+            c = AttentionMetadataBuilderContext(
+                num_reqs=num_reqs,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            runner._attn_metadata_builder_ctx = c
+            return c
+
+        source = runner.input_batch.block_table[0].get_cpu_tensor
+        c1 = ctx()
+        stage_block_table_uploads(runner, c1, 4)
+        calls = source.call_count
+        c2 = ctx()
+        stage_block_table_uploads(runner, c2, 4)
+        assert source.call_count == calls  # reused, not re-packed
+        for gid in (0, 1):
+            assert torch.equal(c1.staged_block_tables[gid], c2.staged_block_tables[gid])
+
+        am._BLOCK_TABLE_VERSION[0] += 1  # any BlockTable mutation
+        stage_block_table_uploads(runner, ctx(), 4)
+        assert source.call_count == calls + 1
+
+        stage_block_table_uploads(runner, ctx(num_reqs=1), 4)  # new window
+        assert source.call_count == calls + 2
+
+    def test_reused_upload_reuses_tables_and_rederives_mamba_indices(self):
+        """A reused upload keeps the previous walk's table outputs and
+        re-derives mamba state and checkpoint indices."""
+        window = 3
+        runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
+        runner._unified_kv_layout = True
+        runner._block_table_stage_cpu = None
+        attn = self._make_builder(runner, kv_cache_group_id=0)
+        mambas = [
+            self._make_mamba_builder(runner, kv_cache_group_id=gid) for gid in (1, 2)
+        ]
+        self._make_attn_groups(runner, [attn] + mambas)
+
+        def walk(seq_lens, staged):
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=4,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                mamba_ckpt_window=window,
+                unified_mamba_state_indices=[],
+            )
+            runner._attn_metadata_builder_ctx = ctx
+            if staged:
+                stage_block_table_uploads(runner, ctx, 4)
+            metas = [
+                b.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
+                for b in [attn] + mambas
+            ]
+            return ctx, metas
+
+        ctx1, metas1 = walk([0, 17, 33, 33], staged=True)
+        _, plain1 = walk([0, 17, 33, 33], staged=False)
+        for a, b in zip(metas1, plain1):
+            assert torch.equal(a.block_tables, b.block_tables)
+            if b.mamba_state_indices is not None:
+                assert torch.equal(a.mamba_state_indices, b.mamba_state_indices)
+                assert torch.equal(a.mamba_ckpt_indices, b.mamba_ckpt_indices)
+
+        ctx2, metas2 = walk([0, 18, 49, 33], staged=True)  # 49 crosses a block
+        assert ctx2.staged_block_tables is ctx1.staged_block_tables
+        _, plain2 = walk([0, 18, 49, 33], staged=False)
+        for a, b in zip(metas2, plain2):
+            assert torch.equal(a.block_tables, b.block_tables)
+            if b.mamba_state_indices is not None:
+                assert torch.equal(a.mamba_state_indices, b.mamba_state_indices)
+                assert torch.equal(a.mamba_ckpt_indices, b.mamba_ckpt_indices)
+
+    def test_block_table_mutations_bump_the_version(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import numpy as np
+        from vllm.v1.worker.block_table import BlockTable
+
+        from vllm_torchtpu.layers.core import attention_metadata as am
+
+        for name in (
+            "append_row",
+            "add_row",
+            "clear_row",
+            "move_row",
+            "swap_row",
+            "clear",
+        ):
+            monkeypatch.setattr(BlockTable, name, getattr(BlockTable, name))
+        monkeypatch.setattr(
+            BlockTable,
+            "_tpu_version_patch",
+            getattr(BlockTable, "_tpu_version_patch", False),
+            raising=False,
+        )
+        if hasattr(BlockTable, "_tpu_version_patch"):
+            delattr(BlockTable, "_tpu_version_patch")
+        am._install_block_table_version()
+
+        bt = SimpleNamespace(
+            num_blocks_per_row=np.array([2, 0], dtype=np.int32),
+            block_table=SimpleNamespace(np=np.ones((2, 4), dtype=np.int32)),
+            use_hybrid_blocks=False,
+        )
+        v = am._BLOCK_TABLE_VERSION[0]
+        BlockTable.append_row(bt, [], 0)  # no blocks: contents unchanged
+        assert am._BLOCK_TABLE_VERSION[0] == v
+        BlockTable.append_row(bt, [7], 1)
+        assert am._BLOCK_TABLE_VERSION[0] > v
+        v = am._BLOCK_TABLE_VERSION[0]
+        BlockTable.move_row(bt, 1, 0)
+        assert am._BLOCK_TABLE_VERSION[0] > v
+        v = am._BLOCK_TABLE_VERSION[0]
+        BlockTable.clear_row(bt, 0)
+        assert am._BLOCK_TABLE_VERSION[0] > v
 
     def test_staging_respects_gid_subset_and_dummy_override(self):
         runner = self._make_runner_mock(num_groups=2)
