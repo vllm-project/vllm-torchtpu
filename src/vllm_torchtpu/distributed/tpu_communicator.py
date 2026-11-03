@@ -15,6 +15,7 @@ rank.
 """
 
 import torch
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase,
     DeviceCommunicatorBase,
@@ -51,7 +52,9 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             and self.unique_name.split(":")[0] == "tp"
             and input_.dtype == torch.bfloat16
             and input_.dim() >= 2
-            and input_.shape[0] <= max_rows
+            # Decided without a guard: a symbolic row count that is not provably
+            # small takes psum, so the traced graph never branches on it.
+            and statically_known_true(input_.shape[0] <= max_rows)
         ):
             gathered = self.all_gather(input_.unsqueeze(0), dim=0)
             return gathered.float().sum(0).to(input_.dtype)
