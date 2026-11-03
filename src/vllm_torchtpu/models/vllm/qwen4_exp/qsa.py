@@ -390,7 +390,15 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 torch.full((1,), tp_rank % dcp, dtype=torch.int32, device=device),
                 persistent=False,
             )
-        if self.token_shard:
+        # VLLM_TPU_QSA_DECODE_TOKEN_SHARD: the replicated backbone's indexer
+        # token-sharded over the DCP pairs (the target's compressed-DCP layers).
+        self.decode_token_shard = bool(
+            envs.VLLM_TPU_QSA_DECODE_TOKEN_SHARD
+            and envs.VLLM_TPU_QSA_COMPRESSED_DCP
+            and self.main_kv_dcp > 1
+            and "mtp" not in prefix
+        )
+        if self.token_shard or self.decode_token_shard:
             # The rank as an operand of the token-sharded indexer, so every
             # rank traces the same program.
             self.register_buffer(
@@ -576,7 +584,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 self._rows_op = draft(False, True)
                 if self._shared_ops is not None:
                     self._shared_ops = (draft(True, False), draft(True, True))
-            if getattr(self, "token_shard", False):
+            if getattr(self, "token_shard", False) or self.decode_token_shard:
                 build = build_pooled_qsa_token_shard_dcp_op
                 if compressed:
                     from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (

@@ -377,7 +377,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP
                 ),
                 token_shard=(
-                    sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD
+                    self.self_attn.token_shard
+                    if sequence_parallel
+                    else self.self_attn.decode_token_shard
                 ),
             )[0]
             block = sp.reduce(block, sequence_parallel)

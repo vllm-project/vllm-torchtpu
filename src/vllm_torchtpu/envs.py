@@ -145,6 +145,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
     VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP: bool = False
     VLLM_TPU_QSA_INDEXER_TOKEN_SHARD: bool = False
+    VLLM_TPU_QSA_DECODE_TOKEN_SHARD: bool = False
     VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS: int = 8
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
@@ -893,6 +894,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # precedence over VLLM_TPU_QSA_INDEXER_SHARD in that graph.
     "VLLM_TPU_QSA_INDEXER_TOKEN_SHARD": env_bool(
         "VLLM_TPU_QSA_INDEXER_TOKEN_SHARD", default=False
+    ),
+    # Qwen4-exp pooled QSA with VLLM_TPU_QSA_COMPRESSED_DCP, the replicated
+    # (non-SP) backbone, i.e. decode / verify and the small prefill buckets:
+    # each DCP pair indexes one contiguous 1/(TP / DCP) of the step's rows
+    # (token_shard_step) and one TP all-gather brings every pair's local lists
+    # for the pair merge, instead of every pair indexing every row. The
+    # selection is the replicated indexer's.
+    "VLLM_TPU_QSA_DECODE_TOKEN_SHARD": env_bool(
+        "VLLM_TPU_QSA_DECODE_TOKEN_SHARD", default=False
     ),
     # Qwen4-exp resident PLE table: tokens per gather in the raw embedding
     # lookup (a multiple of 8). 8 is the originally validated chunk; an

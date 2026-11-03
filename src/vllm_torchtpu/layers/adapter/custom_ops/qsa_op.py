@@ -1347,7 +1347,9 @@ def _pair_qgate(qgate, head_dim, pair_group, pair_major=False, q_gather=True):
 
 def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: int):
     """``build_pooled_qsa_compressed_dcp_op`` for the prefill sequence-parallel
-    graph: each DCP pair scores one token shard (``TP / size`` shards, both
+    graph (and, with VLLM_TPU_QSA_DECODE_TOKEN_SHARD, the replicated backbone,
+    whose shards of at most one row per request slot take the decode
+    indexer): each DCP pair scores one token shard (``TP / size`` shards, both
     ranks over their owned groups), one TP all-gather brings every pair's
     local lists, and every rank merges all rows. Takes ``shard_index`` (the
     TP rank), ``dcp_rank`` and ``kv_heads`` keywords."""
@@ -1363,6 +1365,10 @@ def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: i
             args[index] = args[index].to(torch.int32)
         qgate = args[0]
         tokens, head_dim = qgate.shape[0], args[4].shape[0]
+        assert tokens % (world // size) == 0, (
+            f"token-sharded indexer: {tokens} rows do not split over "
+            f"{world // size} DCP pairs"
+        )
         args[0] = _pair_qgate(qgate, head_dim, pair_group, pair_major=True)
         pool = args[10]
         updated, q, gate, lengths, req, starts, vals, pos = token_select(
