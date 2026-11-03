@@ -451,9 +451,19 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         pages = plan.request_pages(req_meta.group_block_ids, num_tokens)
         if tuple(req_meta.local_block_ids) != pages[0]:
             raise ValueError("Qwen PD primary pages differ from the full group table")
+        # A producer serving a caching decode declares its token pages in the
+        # request-global destination byte space (dst_space_version=1), page i
+        # at i * stride, which the controller splits at destination pages and
+        # can clip at a decode-local prefix (dst_skip_bytes). Request-state
+        # pages stay page-indexed (version 0) and always move whole.
+        clippable = int(envs.TPU_RAIDEN_HANDOFF_ALIGN_TOKENS) > 0
         spans = []
         for pool, group_index in plan.pool_groups():
             ids = pages[group_index]
+            global_space = (
+                clippable
+                and plan.groups[group_index].extent is TransferExtent.TOKEN_PAGES
+            )
             spans.append(
                 PoolSpanRegistration(
                     tag=pool.tag,
@@ -462,8 +472,10 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                         PoolByteSpan(
                             src_block_ordinal=index,
                             src_offset_bytes=0,
-                            dst_block_index=index,
-                            dst_offset_bytes=0,
+                            dst_block_index=0 if global_space else index,
+                            dst_offset_bytes=(
+                                index * pool.block_stride_bytes if global_space else 0
+                            ),
                             size_bytes=pool.block_stride_bytes,
                             # A pipeline stage's pages go to every decode unit
                             # (a TP>1 decode repacks its slice); matching TP
@@ -475,6 +487,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                         for index in range(len(ids))
                     ),
                     declared_bytes=len(ids) * pool.block_stride_bytes,
+                    dst_space_version=1 if global_space else 0,
                 )
             )
         return pages, spans
