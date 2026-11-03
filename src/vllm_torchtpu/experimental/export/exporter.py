@@ -114,7 +114,8 @@ def _debug_tap_modules(
     """
     from vllm_torchtpu.experimental.export import universal_adapter
 
-    target = getattr(model, "model", model)
+    # The wrapped `nn.Module`; a model that wraps none is one itself.
+    target: Any = getattr(model, "model", model)
     draft = getattr(target, universal_adapter.MTP_DRAFT_ATTR, None)
     named = {n: m for n, m in target.named_modules() if n}
     draft_named = (
