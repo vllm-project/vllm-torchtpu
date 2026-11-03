@@ -13,12 +13,14 @@
 # limitations under the License.
 
 import functools
+import math
 import os
 import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
+    TPU_LIBRARY_PATH: str | None = None
     TPU_WORKER_ID: str | None = None
     TPU_MULTIHOST_BACKEND: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
@@ -73,6 +76,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
+    TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -108,12 +112,16 @@ if TYPE_CHECKING:
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_LAZY_PUSH: bool = False
+    TPU_PP_HANDOFF: str = "wave"
+    TPU_PP_RING_DEPTH: int = 2
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
+    TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
+    TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -302,15 +310,19 @@ def env_nonnegative_int(env_name: str, default: int) -> Callable[[], int]:
     similar, where silently substituting the default hides the typo and the
     process runs with a pool size nobody asked for.
     """
-    parse_int = env_int(env_name, default)
+    return _nonnegative(env_int(env_name, default), env_name)
 
-    def _get_nonnegative_int_env() -> int:
-        value = parse_int()
+
+def _nonnegative(parse: Callable[[], Any], env_name: str) -> Callable[[], Any]:
+    """Wrap a number parser so a negative value raises instead of passing."""
+
+    def _get_nonnegative_env() -> Any:
+        value = parse()
         if value < 0:
             raise ValueError(f"Invalid value '{value}' for {env_name}: must be >= 0.")
         return value
 
-    return _get_nonnegative_int_env
+    return _get_nonnegative_env
 
 
 def env_float(env_name: str, default: float) -> Callable[[], float]:
@@ -328,6 +340,23 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
             ) from exc
 
     return _get_float_env
+
+
+def env_nonnegative_float(env_name: str, default: float) -> Callable[[], float]:
+    """Float knob that must be finite and not negative.
+
+    `nan` and `inf` parse as floats but are rejected: as a timeout, `nan`
+    compares false against everything and `inf` never expires.
+    """
+    parse = _nonnegative(env_float(env_name, default), env_name)
+
+    def _get_nonnegative_float_env() -> float:
+        value = parse()
+        if not math.isfinite(value):
+            raise ValueError(f"Invalid value '{value}' for {env_name}: must be finite.")
+        return value
+
+    return _get_nonnegative_float_env
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -405,6 +434,10 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Qwen3.5 MoE at TP > 1: reduce-scatter the attention output, run the
+    # post-attention norm and router gate on the token shard, and fold the
+    # attention partial sum into the MoE all-reduce. Default MoE path only.
+    "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
@@ -475,6 +508,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ACCELERATOR_TYPE": lambda: os.getenv("TPU_ACCELERATOR_TYPE", None),
     # Name of the TPU resource
     "TPU_NAME": lambda: os.getenv("TPU_NAME", None),
+    # libtpu.so loaded by the TPU runtime instead of the pip libtpu package
+    # (e.g. container images that ship a prebuilt library). A path to a file
+    # other than the pip package's own libtpu.so takes precedence over an
+    # installed libtpu package, so it is used to identify the loaded library.
+    "TPU_LIBRARY_PATH": lambda: os.getenv("TPU_LIBRARY_PATH", None),
     # Worker ID for multi-host TPU setups
     "TPU_WORKER_ID": lambda: os.getenv("TPU_WORKER_ID", None),
     # Backend for multi-host communication on TPU. "" auto-detects: "mp" is
@@ -662,8 +700,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
-    # one packed sort instead of three. The ragged (counting sort) path ignores it.
+    # one packed sort instead of three (up to 2,048 routed rows on non-ragged
+    # paths). Within that cap the counting sort takes precedence unless it
+    # declines (fewer routed rows than local experts + 1, or local experts >=
+    # 512) or TPU_MOE_COUNTING_SORT is off; above 2,048 rows on non-ragged
+    # paths three sorts run.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    # Derive the MoE routing positions and group sizes on non-ragged paths
+    # (EP one-hot permute and non-EP TP, up to 2,048 routed rows) from the MXU
+    # counting sort instead of comparison sorts. Off, those paths fall back to
+    # the packed single sort (TPU_MOE_SINGLE_SORT) or the three-sort form, as
+    # before the counting sort reached them; the ragged permute path keeps the
+    # counting sort either way. A stand-down knob in case a libtpu release
+    # miscompiles the rank contraction again.
+    "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT", True),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
@@ -820,6 +870,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the pipeline only when stage 0 would otherwise idle and drops empty
     # steps, so requests share the pipeline (core/pp_lazy_step.py).
     "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
+    # How pipeline stages hand activations on: "wave" runs one collective
+    # launch on every stage per forward (distributed/pp_wave.py), "ring"
+    # sends each forward's output point to point (distributed/pp_ring.py).
+    # Goes once the ring replaces the wave.
+    "TPU_PP_HANDOFF": env_with_choices("TPU_PP_HANDOFF", "wave", ["wave", "ring"]),
+    # With TPU_PP_HANDOFF=ring: the forwards a stage may queue for sending
+    # to the next stage before end_forward waits for room.
+    "TPU_PP_RING_DEPTH": env_int("TPU_PP_RING_DEPTH", 2),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
@@ -832,6 +890,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per host and the others wait for its artifact. Off compiles every bucket
     # on every rank, sharing only through the Tier-2 cache.
     "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
+    # Under TPU_PRECOMPILE_PEER_REPLAY, how long a rank waits for a bucket's
+    # owner to save it before compiling the bucket itself. The default fits
+    # well over a single bucket compile with every rank of the host compiling
+    # at once (~165 s for the biggest Qwen3.5-397B bucket at DP8); raise it for
+    # a model whose biggest bucket takes longer, since a waiter that times out
+    # compiles concurrently with the owner. 0 checks once, then compiles.
+    "TPU_PRECOMPILE_PEER_WAIT_S": env_nonnegative_float(
+        "TPU_PRECOMPILE_PEER_WAIT_S", 600.0
+    ),
+    # With shape-specialized backbone traces (one per token-bucket group, see
+    # compilation/shape_variants.py), trace every group before compiling any
+    # bucket, then compile all buckets at once across the host's ranks
+    # (owners compile, peers replay). Without it each group's buckets compile
+    # before the next group is even traced, so the groups run one after
+    # another and most ranks wait. Needs TPU_PARALLEL_PRECOMPILE.
+    "TPU_PRECOMPILE_TRACE_FIRST": env_bool("TPU_PRECOMPILE_TRACE_FIRST", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.

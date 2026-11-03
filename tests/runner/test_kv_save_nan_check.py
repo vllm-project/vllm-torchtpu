@@ -251,6 +251,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         phase_based_profiler=None,
         _is_async_drafter=False,
         _greedy_top_tokens_this_step=lambda: False,
+        _min_tokens_batch_state=lambda: {},
         vllm_config=SimpleNamespace(),
         maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
         input_batch=SimpleNamespace(

@@ -2986,7 +2986,9 @@ def _build_spec(
     tp_size=4,
     pp_size=1,
     pcp_size=1,
+    dp_rank=None,
     dp_rank_local=0,
+    dp_index=None,
     groups=None,
     kv_cache_groups=None,
 ):
@@ -3021,8 +3023,13 @@ def _build_spec(
     vllm_config.kv_events_config.enable_kv_cache_events = False
     vllm_config.model_config.is_hybrid = False
     vllm_config.model_config.model = "org/model"
-    vllm_config.parallel_config.data_parallel_rank = dp_rank_local
+    vllm_config.parallel_config.data_parallel_rank = (
+        (0 if dp_rank_local is None else dp_rank_local) if dp_rank is None else dp_rank
+    )
     vllm_config.parallel_config.data_parallel_rank_local = dp_rank_local
+    vllm_config.parallel_config.data_parallel_index = (
+        vllm_config.parallel_config.data_parallel_rank if dp_index is None else dp_index
+    )
     kv_cache_config = SimpleNamespace(
         kv_cache_groups=kv_cache_groups or [SimpleNamespace(kv_cache_spec=object())],
         kv_cache_tensors=[object()],
@@ -3655,9 +3662,33 @@ class TestStorageSpec(unittest.TestCase):
     def test_off_passes_no_configs(self):
         spec = _build_spec({})
         self.assertIsNone(spec.storage_config)
+        self.assertEqual(spec.dp_rank, 0)
         manager_kwargs, worker_kwargs = self._get_manager_and_worker(spec)
         self.assertEqual(manager_kwargs["secondary_backend_configs"], [])
+        self.assertEqual(manager_kwargs["dp_rank"], 0)
         self.assertEqual(worker_kwargs["backend_configs"], [])
+
+    def test_global_dp_rank_forwarded_to_manager(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        # Multi-host DP: port offsets by local DP rank while KVCacheStore
+        # telemetry and RaidenId suffix use the global DP rank.
+        spec = _build_spec({}, dp_rank=3, dp_rank_local=1)
+        self.assertEqual(spec.dp_rank, 3)
+        manager_kwargs, _ = self._get_manager_and_worker(spec)
+        self.assertEqual(manager_kwargs["dp_rank"], 3)
+        self.assertEqual(
+            manager_kwargs["raiden_controller_port"],
+            rs._DEFAULT_CONTROLLER_PORT + 1,
+        )
+        self.assertEqual(manager_kwargs["raiden_job_name"], "vllm-offload-engine-dp3")
+
+        # Unset local DP rank falls back to global DP rank for port offset.
+        fallback_spec = _build_spec({}, dp_rank=3, dp_rank_local=None)
+        self.assertEqual(
+            fallback_spec.raiden_controller_port,
+            rs._DEFAULT_CONTROLLER_PORT + 3,
+        )
 
     def test_on_configures_store_and_worker(self):
         spec = _build_spec(
@@ -3859,6 +3890,17 @@ class TestStoragePlumbing(unittest.TestCase):
         plain, tiered = self.store_kwargs
         self.assertNotIn("secondary_backend_configs", plain)
         self.assertEqual(tiered["secondary_backend_configs"], [cfg])
+
+    def test_store_raiden_id_carries_dp_rank(self):
+        make_manager(None)
+        make_manager(None, dp_rank=2)
+        plain, multi_dp = self.store_kwargs
+        self.assertEqual(plain["raiden_id"], ("test", "0", "kv_cache", 0))
+        self.assertEqual(multi_dp["raiden_id"], ("test", "0", "kv_cache", 2))
+        self.assertNotIn("dp_rank", plain)
+        self.assertNotIn("dp_rank", multi_dp)
+        with self.assertRaisesRegex(ValueError, "dp_rank must be non-negative"):
+            make_manager(None, dp_rank=-1)
 
     def _start_worker(self, **kwargs):
         import torch
@@ -4065,6 +4107,52 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
         self._seed(self.ATTN, 1, 2, 3)
         self._seed(self.MAMBA, 2)
         self.assertEqual(self._hit(), 2 * self.BLOCK)
+
+
+class TestDenseDpIndex(unittest.TestCase):
+    """Dense (non-MoE) DP>1: vLLM's EngineCore resets
+    `data_parallel_rank` to 0 via `reconfigure_for_independent_dp_rank()`,
+    so the spec must read the surviving `data_parallel_index`."""
+
+    def setUp(self):
+        _isolate_storage_env(self)
+
+    def test_dp_index_reaches_raiden_id_and_job_name_suffix(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        spec = _build_spec({}, dp_rank=0, dp_rank_local=0, dp_index=2)
+        self.assertEqual(spec.dp_rank, 2)
+        # Job-name suffix and RaidenId follow data_parallel_index; port offset
+        # still follows data_parallel_rank_local.
+        self.assertEqual(spec.raiden_job_name, "vllm-offload-engine-dp2")
+        self.assertEqual(spec.raiden_controller_port, rs._DEFAULT_CONTROLLER_PORT)
+
+        manager_kwargs, _ = _get_manager_and_worker(spec)
+        self.assertEqual(manager_kwargs["dp_rank"], 2)
+        self.assertEqual(manager_kwargs["raiden_job_name"], "vllm-offload-engine-dp2")
+
+        store_kwargs: list[dict] = []
+
+        class RecordingKVCacheStore:
+            def __init__(self, **kwargs):
+                store_kwargs.append(kwargs)
+                self.raiden_id = object()
+                self.raiden_controller_address = "127.0.0.1:0"
+                self.store_server_address = ""
+
+        impl = SimpleNamespace(
+            KVCacheStore=RecordingKVCacheStore,
+            RaidenId=lambda *args: args,
+            BlockStatus=FakeBlockStatus,
+            RaidenBlockId=FakeRaidenBlockId,
+        )
+        with _fake_tpu_sync(impl):
+            # Replay the spec's exact manager kwargs into the real manager.
+            rs.RaidenOffloadingManager(**manager_kwargs)
+        (kwargs,) = store_kwargs
+        job_name, _, _, data_replica_idx = kwargs["raiden_id"]
+        self.assertEqual(data_replica_idx, 2)
+        self.assertEqual(job_name, "vllm-offload-engine-dp2")
 
 
 if __name__ == "__main__":

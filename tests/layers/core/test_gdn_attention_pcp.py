@@ -13,12 +13,12 @@
 # limitations under the License.
 
 import dataclasses
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from kernels.gdn.v3.gdn_pool_state_utils import (
@@ -53,8 +53,6 @@ from vllm_torchtpu.layers.core.utils import (
     inverse_reorder_for_sharding,
     reorder_concatenated_tensor_for_sharding,
 )
-
-pytestmark = pytest.mark.multichip
 
 _GDN_PCP_NUMERICAL_CASES = (
     pytest.param(
@@ -439,29 +437,73 @@ def test_derive_pcp_ragged_exchange_descriptors_reconstructs_reorder(
     assert int(sizes.sum()) == int(lengths.sum())
 
 
-def test_pcp_ragged_exchange_layout_accepts_tpu_generation_7(monkeypatch):
+@pytest.mark.parametrize(
+    "chip",
+    (
+        pltpu.ChipVersion.TPU_7,
+        pltpu.ChipVersion.TPU_7X,
+        pltpu.ChipVersion.TPU_8I,
+    ),
+)
+def test_pcp_ragged_exchange_layout_accepts_validated_tpu_chip(monkeypatch, chip):
     monkeypatch.setattr(
         "vllm_torchtpu.layers.core.gdn_attention.pltpu.get_tpu_info",
-        lambda: SimpleNamespace(generation=7),
+        lambda: pltpu.get_tpu_info_for_chip(chip, 1),
     )
 
     _validate_pcp_ragged_exchange_layout_support()
 
 
-@pytest.mark.parametrize("generation", (4, 5, 6, 8))
-def test_pcp_ragged_exchange_layout_rejects_unvalidated_tpu_generation(
-    monkeypatch, generation
-):
+@pytest.mark.parametrize(
+    "chip",
+    (
+        pltpu.ChipVersion.TPU_V5E,
+        pltpu.ChipVersion.TPU_V5P,
+        pltpu.ChipVersion.TPU_V6E,
+        # Same generation as TPU 8i, but not validated.
+        pltpu.ChipVersion.TPU_8T,
+    ),
+)
+def test_pcp_ragged_exchange_layout_rejects_unvalidated_tpu_chip(monkeypatch, chip):
     monkeypatch.setattr(
         "vllm_torchtpu.layers.core.gdn_attention.pltpu.get_tpu_info",
-        lambda: SimpleNamespace(generation=generation),
+        lambda: pltpu.get_tpu_info_for_chip(chip, 1),
     )
 
     with pytest.raises(
         NotImplementedError,
-        match="only validated on TPU generation 7",
+        match=rf"only validated on TPU 7, 7x, and 8i, got TPU {chip}\.",
     ):
         _validate_pcp_ragged_exchange_layout_support()
+
+
+@pytest.mark.parametrize("chip", (pltpu.ChipVersion.TPU_V6E, pltpu.ChipVersion.TPU_8T))
+def test_pooled_pcp_prefill_projection_rejects_unvalidated_tpu_chip(monkeypatch, chip):
+    # The fused projection path does not go through the ragged exchange, so it
+    # checks the chip itself before tracing anything.
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.core.gdn_attention.pltpu.get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(chip, 1),
+    )
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("pcp",))
+    unused = jnp.zeros((1,), jnp.float32)
+
+    with pytest.raises(
+        NotImplementedError,
+        match=rf"only validated on TPU 7, 7x, and 8i, got TPU {chip}\.",
+    ):
+        run_jax_gdn_attention_pooled_pcp_prefill_projection(
+            *([unused] * 14),
+            n_kq=1,
+            n_v=1,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+            pool_block_tokens=128,
+            pcp_size=1,
+            interleave_size=1,
+            mesh=mesh,
+        )
 
 
 def _require_tpu_devices(min_count, reason):
@@ -482,6 +524,7 @@ def _require_tpu_devices(min_count, reason):
     _GDN_PCP_NUMERICAL_CASES,
 )
 @pytest.mark.parametrize("state_layout", ("split", "unified_pool"))
+@pytest.mark.multichip
 def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     pcp_size,
     lengths,
@@ -735,6 +778,7 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     ),
     _GDN_PCP_FUSED_PROJECTION_CASES,
 )
+@pytest.mark.multichip
 def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     pcp_size,
     n_kq,
@@ -1239,6 +1283,7 @@ _PREFILL_CKPT_PRODUCTION_POOL = _PrefillCkptPoolConfig(
         ),
     ],
 )
+@pytest.mark.multichip
 def test_pooled_pcp_prefill_fused_projection_writes_prefill_checkpoint(
     lengths, ckpt_offsets, request_absolute_starts, pool_config, monkeypatch
 ):

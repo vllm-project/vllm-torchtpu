@@ -417,7 +417,10 @@ def _patch_vllm_compile_all_ranges() -> None:
     the host, its owner; every other rank replays the artifact the owner saves
     to vLLM's compile cache instead of tracing and compiling the range again
     (see TpuCompilerAdaptor.compile). Startup then takes about as long as the
-    slowest single range instead of the sum over ranges.
+    slowest single range instead of the sum over ranges. Peer replay needs
+    vLLM's compile cache: VLLM_DISABLE_COMPILE_CACHE=1 with the flag on fails
+    at startup (TpuPlatform.check_and_update_config), and a cache disabled any
+    other way makes the flag fall back here with a warning.
 
     Off, the default, each rank compiles every range itself, starting on a
     different one, and the ranks share only through the Tier-2 cache.
@@ -431,8 +434,19 @@ def _patch_vllm_compile_all_ranges() -> None:
         get_fake_args_from_graph,
     )
 
-    def ranks_per_host() -> int | None:
-        """How many ranks share this host, or None if that is unknown."""
+    def host_slot() -> tuple[int, int] | None:
+        """(ranks splitting the ranges on this host, this rank's slot among
+        them), or None to opt out: compile every range here, waiting on no one.
+
+        With DP > 1 (or several nodes) vLLM's world group spans every DP rank
+        (world_size_across_dp), so world_size // nodes counts all the ranks of
+        the host, whatever the TP size; dense DP replicas and elastic EP keep a
+        world group per engine and so split only within it. The slot is the
+        host-local rank, LOCAL_RANK less the TPU_LOCAL_RANK_OFFSET the worker
+        binding adds to it. Owners are dealt to slots 0..count-1 and a rank
+        waits for every owner, so a slot outside that range opts out rather
+        than leave a range owned by a slot no process holds.
+        """
         try:
             from vllm.distributed.parallel_state import (
                 get_node_count,
@@ -441,11 +455,15 @@ def _patch_vllm_compile_all_ranges() -> None:
 
             world_size = get_world_group().world_size
             nodes = get_node_count()
+            slot = int(os.environ["LOCAL_RANK"]) - envs.TPU_LOCAL_RANK_OFFSET
         except Exception:
             return None
         if nodes <= 0 or world_size % nodes:
             return None
-        return world_size // nodes
+        count = world_size // nodes
+        if count <= 1 or not 0 <= slot < count:
+            return None
+        return count, slot
 
     def compile_entry(self, range_entry) -> None:
         self._log_compile_start(range_entry.compile_range)
@@ -470,17 +488,16 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         range_entry.compiled = True
 
-    def compile_rotated(self, local_rank: int) -> None:
+    def compile_rotated(pairs, local_rank: int) -> None:
         """Compile every range here, each local rank starting on a different
         one: the order without peer replay."""
-        range_entry_list = list(self.range_entries.values())
         if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
             # Biggest first: local rank 0 starts on the biggest range, which
             # takes far longer than the others and so bounds startup, instead
             # of reaching it only after the smallest one.
-            range_entry_list.sort(key=lambda e: e.compile_range.end, reverse=True)
+            pairs = sorted(pairs, key=lambda p: p[1].compile_range.end, reverse=True)
 
-        range_entry_len = len(range_entry_list)
+        range_entry_len = len(pairs)
 
         expanded_indexes = list(range((range_entry_len + 7) // 8 * 8))
         d = deque(sorted(expanded_indexes, key=lambda x: (x % 8, x)))
@@ -488,15 +505,75 @@ def _patch_vllm_compile_all_ranges() -> None:
         indexes = list(d)
 
         for i in indexes:
-            if i >= len(range_entry_list):
+            if i >= range_entry_len:
                 continue
 
-            range_entry = range_entry_list[i]
+            backend, range_entry = pairs[i]
 
             if range_entry.compiled:
                 continue
 
-            compile_entry(self, range_entry)
+            compile_entry(backend, range_entry)
+
+    def compile_ranges(pairs) -> None:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        if not envs.TPU_PRECOMPILE_PEER_REPLAY:
+            compile_rotated(pairs, local_rank)
+            return
+        # Peers hand a compiled range over through vLLM's compile cache
+        # (TpuCompilerAdaptor saves and replays the cache artifact), so with
+        # the cache disabled there is nothing to replay: an owner/waiter split
+        # would only order the work. VLLM_DISABLE_COMPILE_CACHE=1 is already
+        # rejected at startup; this covers the cache being off for any other
+        # reason (e.g. vLLM disabling it for a feature it cannot cache).
+        if any(
+            getattr(b.vllm_backend.compiler_manager, "disable_cache", False)
+            for b, _ in pairs
+        ):
+            logger.warning_once(
+                "TPU_PRECOMPILE_PEER_REPLAY=1 has no effect while vLLM's "
+                "compile cache is disabled (e.g. VLLM_DISABLE_COMPILE_CACHE=1): "
+                "ranks share compiled ranges through that cache. Every rank "
+                "compiles every range itself; enable the compile cache to "
+                "use peer replay."
+            )
+            compile_rotated(pairs, local_rank)
+            return
+
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        host = host_slot()
+        if host is None:
+            # Layout not recognized: never wait on an owner that may not
+            # exist; every range is compiled here, ranks still staggered.
+            compile_rotated(pairs, local_rank)
+            return
+        ranks, slot = host
+
+        # Biggest first, dealt out in a snake: local rank 0 starts on the
+        # biggest range, which takes far longer than the others and so bounds
+        # startup, and a rank whose first range is small gets the next one.
+        # TPU_PRECOMPILE_BIGGEST_FIRST=0 deals them in vLLM's order instead.
+        entries = [(b, e) for b, e in pairs if not e.compiled]
+        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+            entries.sort(key=lambda p: p[1].compile_range.end, reverse=True)
+        mine, others = [], []
+        for i, (backend, range_entry) in enumerate(entries):
+            turn, position = divmod(i, ranks)
+            owner = position if turn % 2 == 0 else ranks - 1 - position
+            if owner == slot:
+                mine.append((backend, range_entry))
+            else:
+                # In the order the owners finish them: by turn, small first.
+                others.append(
+                    (turn, range_entry.compile_range.end, backend, range_entry)
+                )
+
+        for backend, range_entry in mine:
+            compile_entry(backend, range_entry)
+        with wait_for_peer_artifact(envs.TPU_PRECOMPILE_PEER_WAIT_S):
+            for _, _, backend, range_entry in sorted(others, key=lambda o: o[:2]):
+                compile_entry(backend, range_entry)
 
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
@@ -505,46 +582,66 @@ def _patch_vllm_compile_all_ranges() -> None:
             "When loading from cache/AOT artifacts, "
             "compile_all_ranges should not be called."
         )
-        local_rank = int(os.environ["LOCAL_RANK"])
-        if not envs.TPU_PRECOMPILE_PEER_REPLAY:
-            compile_rotated(self, local_rank)
+        from vllm_torchtpu.compilation import shape_variants
+
+        if shape_variants.deferring():
+            # TPU_PRECOMPILE_TRACE_FIRST: compiled with every other trace's
+            # buckets in compile_deferred, once the ladder has traced them all.
+            shape_variants.defer(self)
             return
 
-        from vllm_torchtpu.compilation.tpu_compiler import (
-            PEER_WAIT_S,
-            wait_for_peer_artifact,
+        compile_ranges([(self, e) for e in self.range_entries.values()])
+
+    def compile_deferred(backends) -> None:
+        """Compile every bucket of every deferred trace in one pass.
+
+        The same deal as compile_all_ranges, over the buckets of all traces at
+        once rather than one trace's: biggest first, one owner per bucket per
+        host, the others replay. Buckets a trace refused are handed over from
+        the trace that built them last, once every trace has compiled.
+        """
+        from vllm_torchtpu.compilation import shape_variants
+
+        to_compile, to_hand_over = [], []
+        for backend in backends:
+            for range_entry in backend.range_entries.values():
+                mode = getattr(range_entry, "_tpu_deferred", None)
+                if mode is None:
+                    continue
+                del range_entry._tpu_deferred
+                range_entry.compiled = False
+                range_entry.runnable = None
+                if mode == "compile":
+                    to_compile.append((backend, range_entry))
+                else:
+                    to_hand_over.append((backend, range_entry))
+        num_traces = len({getattr(b, "_tpu_trace", i) for i, b in enumerate(backends)})
+        logger.info(
+            "Deferred precompile: %d traces, %d buckets to compile, %d to hand over",
+            num_traces,
+            len(to_compile),
+            len(to_hand_over),
         )
+        if to_compile:
+            compile_ranges(to_compile)
 
-        ranks = ranks_per_host()
-        # Unknown: assume a full host, but do not wait on owners that may not
-        # exist; a range nobody saved yet is then compiled here.
-        wait_s = PEER_WAIT_S if ranks is not None and local_rank < ranks else 0.0
-        ranks = ranks or 8
-
-        # Biggest first, dealt out in a snake: local rank 0 starts on the
-        # biggest range, which takes far longer than the others and so bounds
-        # startup, and a rank whose first range is small gets the next one.
-        # TPU_PRECOMPILE_BIGGEST_FIRST=0 deals them in vLLM's order instead.
-        entries = [e for e in self.range_entries.values() if not e.compiled]
-        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
-            entries.sort(key=lambda e: e.compile_range.end, reverse=True)
-        mine, others = [], []
-        for i, range_entry in enumerate(entries):
-            turn, slot = divmod(i, ranks)
-            owner = slot if turn % 2 == 0 else ranks - 1 - slot
-            if owner == local_rank:
-                mine.append(range_entry)
+        # Only the last trace stays live (shape_variants.retrace replaced the
+        # earlier ones), so only its refused buckets are handed over; an
+        # earlier trace's would be checked against a graph that never runs.
+        live = max((getattr(b, "_tpu_trace", 0) for b in backends), default=0)
+        for backend, range_entry in to_hand_over:
+            if getattr(backend, "_tpu_trace", 0) == live:
+                compile_entry(backend, range_entry)
             else:
-                # In the order the owners finish them: by turn, small first.
-                others.append((turn, range_entry.compile_range.end, range_entry))
-
-        for range_entry in mine:
-            compile_entry(self, range_entry)
-        with wait_for_peer_artifact(wait_s):
-            for _, _, range_entry in sorted(others, key=lambda o: o[:2]):
-                compile_entry(self, range_entry)
+                range_entry.runnable = shape_variants.refusing_runnable(
+                    str(range_entry.compile_range)
+                )
+                range_entry.compiled = True
 
     if envs.TPU_PARALLEL_PRECOMPILE:
+        from vllm_torchtpu.compilation import shape_variants
+
+        shape_variants.register_deferred_compiler(compile_deferred)
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
         logger.info("Applied TPU patch: compile_all_ranges.")
 
@@ -644,9 +741,9 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     patch_registry.apply("engine_core")
     from vllm_torchtpu.core.pp_chunk_scheduler import patch_engine_core_for_pp_chunks
     from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
-    from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
+    from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
 
-    patch_executor_for_pp_wave(kwargs.get("vllm_config"))
+    patch_executor_for_pp_handoff(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
     patch_engine_core_for_lazy_push(kwargs.get("vllm_config"))
 
@@ -1875,6 +1972,12 @@ def _patch_vllm_block_pool_lifo_free() -> None:
 
 def _patch_vllm_abort_on_preemption() -> None:
     from vllm_torchtpu.core.abort_on_preemption import patch_scheduler_init
+
+    patch_scheduler_init()
+
+
+def _patch_vllm_raiden_pd_completion() -> None:
+    from vllm_torchtpu.core.raiden_pd import patch_scheduler_init
 
     patch_scheduler_init()
 

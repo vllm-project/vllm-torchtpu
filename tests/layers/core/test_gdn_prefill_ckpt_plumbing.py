@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 
 from vllm_torchtpu.layers.core import gdn_attention
@@ -184,6 +185,12 @@ def test_pcp_projection_wrapper_hands_checkpoint_operands_to_the_kernel(
         gdn_attention.gdn_pcp_fused_wrapper,
         "fused_qkvz_projection_pcp_gdn",
         fake_kernel,
+    )
+    # The ragged-exchange layout check reads the chip; present a validated one.
+    monkeypatch.setattr(
+        gdn_attention.pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
     )
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("pcp", "tp"))
     ckpt_kwargs = {}

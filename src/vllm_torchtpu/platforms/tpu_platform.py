@@ -319,6 +319,28 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
     )
 
 
+def _validate_peer_replay_config() -> None:
+    """Fail fast on TPU_PRECOMPILE_PEER_REPLAY with vLLM's compile cache off.
+
+    Peer replay hands a compiled range to the host's other ranks through the
+    compile cache (TpuCompilerAdaptor saves and replays the cache artifact),
+    so with VLLM_DISABLE_COMPILE_CACHE=1 there is nothing to replay.
+    """
+    if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
+        return
+    # Parse it now, so a bad value fails the launch rather than the precompile
+    # that reads it after the model has loaded.
+    envs.TPU_PRECOMPILE_PEER_WAIT_S  # noqa: B018
+    if vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
+        raise ValueError(
+            "TPU_PRECOMPILE_PEER_REPLAY=1 needs vLLM's compile cache: peer ranks "
+            "share compiled ranges through it, so it does nothing with "
+            "VLLM_DISABLE_COMPILE_CACHE=1. Unset VLLM_DISABLE_COMPILE_CACHE "
+            "(point VLLM_CACHE_ROOT at a temporary directory for a cold start "
+            "with nothing kept across runs) or set TPU_PRECOMPILE_PEER_REPLAY=0."
+        )
+
+
 def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
     """Fail fast on phased-profiling settings that would silently do nothing.
 
@@ -343,8 +365,8 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
 def _validate_lora_config(vllm_config: "VllmConfig") -> None:
     """Rejects LoRA settings that the TPU LoRA path does not support yet.
 
-    LoRA runs on a single chip with a dense model without speculative decoding.
-    Other settings fail here with the reason.
+    LoRA runs on a single chip with a dense generative model without
+    speculative decoding. Other settings fail here with the reason.
     """
     lora_config = vllm_config.lora_config
     if lora_config is None:
@@ -375,6 +397,10 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
         # FusedMoEWithLoRA requires a non-monolithic MoE; every TPU MoE method
         # is monolithic.
         "MoE models": model_config.is_moe,
+        # The runner pads the request mapping to its bucket, but a pooler
+        # hands vLLM's classification head one row per request, so the head
+        # rejects the mapping. Embedding models are untested.
+        "pooling models": model_config.runner_type == "pooling",
         # Only meaningful with tensor parallelism.
         "fully_sharded_loras": lora_config.fully_sharded_loras,
         # The TPU runner never sets the tower or connector mappings.
@@ -659,7 +685,19 @@ class TpuPlatform(Platform):
         # backend for KV offloading without instantiating model layers.
         import vllm_torchtpu.layers.adapter.attention  # noqa: F401
 
+        # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
+        # vllm.platforms while it is still loading (a cycle).
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            is_registered_attention_backend,
+        )
+
+        registered = is_registered_attention_backend(selected_backend)
         if attn_selector_config.use_mla:
+            if registered:
+                raise ValueError(
+                    f"--attention-backend {selected_backend.name.lower()} does not "
+                    "support MLA models; leave --attention-backend unset."
+                )
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 
         supported_backends = [
@@ -667,10 +705,12 @@ class TpuPlatform(Platform):
             AttentionBackendEnum.CUSTOM,
             AttentionBackendEnum.FLASH_ATTN_MLA,
         ]
-        if selected_backend not in supported_backends:
-            logger.info(
-                "Cannot use %s backend on TPU. Setting to FLASH_ATTN.", selected_backend
-            )
+        if not registered and selected_backend not in supported_backends:
+            if selected_backend is not None:
+                logger.warning_once(
+                    "Cannot use %s backend on TPU. Setting to FLASH_ATTN.",
+                    selected_backend,
+                )
             selected_backend = AttentionBackendEnum.FLASH_ATTN
         logger.info("Using %s backend.", selected_backend.name)
         return selected_backend.get_path()
@@ -749,6 +789,7 @@ class TpuPlatform(Platform):
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
         _validate_phased_profiling_config(vllm_config)
+        _validate_peer_replay_config()
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
@@ -786,11 +827,25 @@ class TpuPlatform(Platform):
             PallasBatchedRPAAttentionBackend,
         )
 
-        backend = (
-            PallasBatchedRPAAttentionBackend
-            if vllm_config.attention_config.backend == AttentionBackendEnum.CUSTOM
-            else PallasAttentionBackend
+        # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
+        # vllm.platforms while it is still loading (a cycle).
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            is_registered_attention_backend,
         )
+
+        selected_backend = vllm_config.attention_config.backend
+        if is_registered_attention_backend(selected_backend):
+            assert selected_backend is not None
+            backend = selected_backend.get_class()
+            if not issubclass(backend, PallasAttentionBackend):
+                raise TypeError(
+                    f"--attention-backend {selected_backend.name.lower()} resolves "
+                    f"to {backend.__qualname__}, not a PallasAttentionBackend."
+                )
+        elif selected_backend == AttentionBackendEnum.CUSTOM:
+            backend = PallasBatchedRPAAttentionBackend
+        else:
+            backend = PallasAttentionBackend
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
         if (
             vllm_config.model_config is not None
@@ -823,11 +878,11 @@ class TpuPlatform(Platform):
         validate_pipeline_parallel_config(vllm_config)
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
-            # get the hand-off push here; engine-core processes install it
-            # again on their side.
-            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
+            # get the hand-off's engine side here; engine-core processes
+            # install it again on their side.
+            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
 
-            patch_executor_for_pp_wave(vllm_config)
+            patch_executor_for_pp_handoff(vllm_config)
             _configure_pipeline_chunks(vllm_config)
             from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
 
@@ -953,6 +1008,9 @@ class TpuPlatform(Platform):
         cache_config = vllm_config.cache_config
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
+        is_attention_free = (
+            model_config.is_attention_free if model_config is not None else False
+        )
         if (
             vllm_config.speculative_config is not None
             and scheduler_config.async_scheduling
@@ -987,6 +1045,15 @@ class TpuPlatform(Platform):
                     "unified KV pool; remove "
                     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0."
                 )
+        if (
+            is_attention_free
+            and cache_config.enable_prefix_caching
+            and not is_decode_bench
+        ):
+            raise NotImplementedError(
+                "Prefix caching on attention-free models is not yet "
+                "supported on TPU; run with --no-enable-prefix-caching."
+            )
 
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
@@ -1130,6 +1197,16 @@ class TpuPlatform(Platform):
                 multihost_backend,
             )
             parallel_config.distributed_executor_backend = "uni"
+
+        # After the executor is chosen: whether it starts processes decides
+        # whether a registered backend's name reaches them.
+        # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
+        # vllm.platforms while it is still loading (a cycle).
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            check_attention_backend_config,
+        )
+
+        check_attention_backend_config(vllm_config)
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
