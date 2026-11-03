@@ -157,3 +157,22 @@ def test_decode_plan_rejects_hot_plans_and_bad_orders(monkeypatch, preshard, tmp
     np.savez(tmp_path / "bad.npz", order=bad)
     with pytest.raises(ValueError, match="permutations"):
         _decode(monkeypatch, root, 0, decode_expert_plan=str(tmp_path / "bad.npz"))
+
+
+@pytest.mark.parametrize("rank", [0, 7, 30])
+def test_decode_ep16_plan(monkeypatch, preshard, rank):
+    root, _, plan, order, identity = preshard
+    base = _decode(monkeypatch, root, rank, decode_expert_parallel=16)
+    same = _decode(monkeypatch, root, rank, decode_expert_parallel=16, decode_expert_plan=str(identity))
+    for name in rank_loader.EXPERT_FAMILIES:
+        np.testing.assert_array_equal(same[name], base[name])
+    placed = _decode(monkeypatch, root, rank, decode_expert_parallel=16, decode_expert_plan=str(plan))
+    chip, quarters = rank // 2, (2 * (rank % 2), 2 * (rank % 2) + 1)
+    for layer in range(LAYERS - 1):
+        experts = order[layer, 56 * chip:56 * chip + 56]
+        expected = np.array(
+            [_expert_value(4 * (e // 112) + quarters[0], layer, e % 112) for e in experts], np.float32
+        )
+        # down families join the quarters along K (axis 1 of an expert): first rows from quarters[0]
+        np.testing.assert_array_equal(placed["expert_down"][layer, :, 0, 0], expected)
+        np.testing.assert_array_equal(placed["router"][layer, 0], order[layer].astype(np.float32))
