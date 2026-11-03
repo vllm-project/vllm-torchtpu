@@ -928,6 +928,48 @@ def test_build_export_config_raises_block_size_to_fit_smem(tmp_path: Path) -> No
     assert big.max_num_pages * 4 <= 1024 * 1024 // 2
 
 
+def test_build_export_config_reads_model_shape_from_vllm_model_config(
+    tmp_path: Path,
+) -> None:
+    # Gemma 4 declares KV heads and head_dim per layer (sliding vs full
+    # attention): transformers raises when they are read as one global value.
+    # vLLM's ModelConfig resolves them, so the export reads its accessors.
+    class AmbiguousPerLayerAttributeError(Exception):
+        """Like transformers' error: not an AttributeError, so not defaulted."""
+
+    class PerLayerHfConfig:
+        num_attention_heads = 32
+        hidden_size = 5376
+        vocab_size = 262144
+
+        def __getattr__(self, name: str) -> Any:
+            if name in ("num_key_value_heads", "head_dim"):
+                raise AmbiguousPerLayerAttributeError(f"{name!r} is per layer")
+            raise AttributeError(name)
+
+    model_config = SimpleNamespace(
+        model=str(tmp_path),
+        dtype="bfloat16",
+        max_model_len=2048,
+        hf_config=PerLayerHfConfig(),
+        get_total_num_kv_heads=lambda: 4,
+        get_head_size=lambda: 512,
+        get_total_num_hidden_layers=lambda: 60,
+        get_vocab_size=lambda: 262144,
+        get_hidden_size=lambda: 5376,
+    )
+    cfg = universal_adapter.build_export_config_from_vllm(
+        SimpleNamespace(
+            model_config=model_config,
+            cache_config=SimpleNamespace(block_size=16),
+            scheduler_config=SimpleNamespace(max_num_seqs=8),
+        )
+    )
+
+    assert (cfg.num_layers, cfg.num_q_heads) == (60, 32)
+    assert (cfg.num_kv_heads, cfg.head_dim) == (4, 512)
+
+
 def test_build_export_config_pages_kv_at_the_attention_kernels_block_size(
     tmp_path: Path,
 ) -> None:
