@@ -86,6 +86,7 @@ def _reset_warning_once():
 
 # Knobs that are on when unset.
 DEFAULT_ON_KNOBS = (
+    "TPU_CACHED_PROMPT_ROWS",
     "TPU_CP_EARLY_HALO",
     "TPU_CP_EMBED_REPLICA",
     "TPU_CP_FP8_ATTENTION",
