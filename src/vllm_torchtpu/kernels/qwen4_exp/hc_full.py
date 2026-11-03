@@ -26,6 +26,13 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.qwen4_exp.hc_common import (
+    invalid_mix_rows,
+    invalid_mix_weights,
+    project_up,
+    run_mix_tiles,
+    validate_mix_geometry,
+)
 from vllm_torchtpu.kernels.qwen4_exp.hc_resources import (
     HcHardware,
     supports_full_mix,
@@ -133,16 +140,7 @@ def _kernel(
             up_dma.wait()
 
         # Match the BF16 up Linear output before NVIDIA's FP32 sigmoid/mix.
-        logits = (
-            jax.lax.dot_general(
-                gate,
-                up_vm[...],
-                dimension_numbers=(((1,), (1,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            .astype(jnp.bfloat16)
-            .astype(jnp.float32)
-        )
+        logits = project_up(gate, up_vm[...])
         weighted = jax.nn.sigmoid(logits) * norm.astype(jnp.float32)
         mixed = weighted[:, :hidden]
         for branch in range(1, branches):
@@ -166,18 +164,7 @@ def _kernel(
     # Peel the first pair so weight waits/cast are static first-tile work.
     # Down/up waits stay at their first reads, overlapping normalization.
     tiles = tokens // token_tile
-    weight = one_step(0, 0, None)
-    if tiles > 1:
-        one_step(1, 1, weight)
-
-    def step_pair(pair, carry):
-        one_step(2 * pair, 0, weight)
-        one_step(2 * pair + 1, 1, weight)
-        return carry
-
-    jax.lax.fori_loop(1, tiles // 2, step_pair, jnp.int32(0))
-    if tiles > 1 and tiles % 2:
-        one_step(tiles - 1, 0, weight)
+    run_mix_tiles(one_step, tiles)
     # A one-tile call never started parity1; do not wait its semaphore.
     for parity in range(min(tiles, 2)):
         pltpu.make_async_copy(
@@ -193,22 +180,12 @@ def _kernel(
     static_argnames=("branches", "hidden", "eps", "token_tile", "hardware"),
 )
 def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, hardware=None):
-    if branches <= 0 or hidden <= 0 or hidden % 128:
-        raise ValueError(
-            "HC full mix requires positive branches and 128-aligned hidden"
-        )
-    if token_tile <= 0 or token_tile % 128:
-        raise ValueError("HC full mix requires positive 128-aligned token tiles")
+    validate_mix_geometry(branches, hidden, token_tile, "HC full mix")
     tokens, width = x.shape
     lowrank = down.shape[0]
     if (
-        tokens == 0
-        or lowrank == 0
-        or tokens % token_tile
-        or width != branches * hidden
-        or weight.shape != (width,)
-        or down.shape != (lowrank, width)
-        or up.shape != (width, lowrank)
+        invalid_mix_rows(tokens, lowrank, token_tile, width, branches * hidden)
+        or invalid_mix_weights(weight, down, up, width, lowrank)
         or any(a.dtype != jnp.bfloat16 for a in (x, weight, down, up))
     ):
         raise ValueError("HC full mix requires full BF16 token tiles")

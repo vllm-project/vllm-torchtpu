@@ -932,3 +932,51 @@ def test_auto_terminal_admission_keeps_dtype_and_rank_guards(
     block, logits = boundary_inputs(tokens)[1:]
     assert not terminal_selected(module, terminal, x32, block, logits)
     assert not terminal_selected(module, terminal, rank3, block, logits)
+
+
+@pytest.mark.parametrize("use_combine", [False, True])
+def test_mix_registry_preserves_callback_order_and_arguments(monkeypatch, use_combine):
+    from vllm_torchtpu.kernels.qwen4_exp import hc_resources, vllm_adapter
+
+    calls = []
+    variants = [
+        ("full_mix", "full_mix"),
+        ("inject_mix", "full_mix_inject"),
+        ("inject_broadcast_mix", "full_mix_inject_broadcast"),
+        ("combine_mix", "combine_mix"),
+        ("combine_broadcast_mix", "combine_mix_broadcast"),
+        ("terminal_mix", "combine_mix_terminal"),
+    ]
+
+    def callbacks(kind):
+        def supports(*args):
+            calls.append((kind, "supports", args))
+            return args[-2] == 128
+
+        def build(*args):
+            calls.append((kind, "build", args))
+            return lambda *operands: operands
+
+        return supports, build
+
+    for kind, builder in variants:
+        supports, build = callbacks(kind)
+        monkeypatch.setattr(hc_resources, f"supports_{kind}", supports)
+        monkeypatch.setattr(vllm_adapter, f"build_{builder}_op", build)
+    monkeypatch.setattr(vllm_adapter, "current_hc_hardware", lambda: MEASURED)
+    monkeypatch.setenv("VLLM_TPU_HC_PACKED_MIX", "1")
+    module = meta_module(use_combine=use_combine, prefill_combine_tile=0)
+    active = variants[:5] if use_combine else (variants[0], variants[-1])
+    expected: list[tuple[str, str, tuple[object, ...]]] = []
+    for kind, _ in active:
+        for tile in (256, 128):
+            expected.append((kind, "supports", (4, 2560, 320, tile, MEASURED)))
+            if tile == 128:
+                expected.append(
+                    (
+                        kind,
+                        "build",
+                        (4, 2560, module.hc_norm.variance_epsilon, tile, MEASURED),
+                    )
+                )
+    assert calls == expected

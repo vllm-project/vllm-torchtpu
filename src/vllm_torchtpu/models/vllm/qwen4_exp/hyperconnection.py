@@ -75,6 +75,22 @@ def _same_tpu_bf16(reference: torch.Tensor, *tensors: torch.Tensor) -> bool:
     )
 
 
+def _mix_weights(owner) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        owner.hc_norm.weight,
+        owner.input_mix_weight_down.weight,
+        owner.input_mix_weight_up.weight,
+    )
+
+
+def _prior_combine_matches(prior, tile: int | None) -> bool:
+    return (
+        prior.use_combine
+        and prior.prefill_combine_tile != 0
+        and (prior.prefill_combine_tile == "auto" or prior._combine_token_tile == tile)
+    )
+
+
 class GatedResidual(common_hc.GatedResidual):
     """Match NVIDIA HC math with independent prefill choices.
 
@@ -185,23 +201,29 @@ class GatedResidual(common_hc.GatedResidual):
                 )
         if self.use_mix and prefill_full_tile:
             if self.config.hc_per_branch_norm:
-                self._prefill_full_ops = {
-                    tile: build_full_mix_op(
-                        self.hc_count,
-                        self.hidden_size,
-                        self.hc_norm.variance_epsilon,
-                        tile,
-                        hardware,
-                    )
-                    for tile in full_tiles
-                    if supports_full_mix(
-                        self.hc_count,
-                        self.hidden_size,
-                        self.input_mix_weight_down.weight.shape[0],
-                        tile,
-                        hardware,
-                    )
-                }
+
+                def mix_ops(
+                    builder: Callable, supports: Callable
+                ) -> dict[int, Callable]:
+                    return {
+                        tile: builder(
+                            self.hc_count,
+                            self.hidden_size,
+                            self.hc_norm.variance_epsilon,
+                            tile,
+                            hardware,
+                        )
+                        for tile in full_tiles
+                        if supports(
+                            self.hc_count,
+                            self.hidden_size,
+                            self.input_mix_weight_down.weight.shape[0],
+                            tile,
+                            hardware,
+                        )
+                    }
+
+                self._prefill_full_ops = mix_ops(build_full_mix_op, supports_full_mix)
                 if (
                     self.use_combine
                     and envs.VLLM_TPU_HC_PACKED_MIX
@@ -210,86 +232,31 @@ class GatedResidual(common_hc.GatedResidual):
                     # Same tiles, resources, and epsilon as the full-mix ops;
                     # the inject projection shares the staged normalized value
                     # so the full-width norm tensor is never materialized.
-                    self._prefill_inject_ops = {
-                        tile: build_full_mix_inject_op(
-                            self.hc_count,
-                            self.hidden_size,
-                            self.hc_norm.variance_epsilon,
-                            tile,
-                            hardware,
-                        )
-                        for tile in full_tiles
-                        if supports_inject_mix(
-                            self.hc_count,
-                            self.hidden_size,
-                            self.input_mix_weight_down.weight.shape[0],
-                            tile,
-                            hardware,
-                        )
-                    }
+                    self._prefill_inject_ops = mix_ops(
+                        build_full_mix_inject_op, supports_inject_mix
+                    )
                     # The broadcast variant serves the chain's first mix, whose
                     # residual arrives un-expanded; same tiles, weights, and
                     # epsilon, with its own resource facts for the staging
                     # planes that replace the full-width input ring.
-                    self._prefill_inject_broadcast_ops = {
-                        tile: build_full_mix_inject_broadcast_op(
-                            self.hc_count,
-                            self.hidden_size,
-                            self.hc_norm.variance_epsilon,
-                            tile,
-                            hardware,
-                        )
-                        for tile in full_tiles
-                        if supports_inject_broadcast_mix(
-                            self.hc_count,
-                            self.hidden_size,
-                            self.input_mix_weight_down.weight.shape[0],
-                            tile,
-                            hardware,
-                        )
-                    }
+                    self._prefill_inject_broadcast_ops = mix_ops(
+                        build_full_mix_inject_broadcast_op,
+                        supports_inject_broadcast_mix,
+                    )
                     # Boundary ops fuse a preceding owner's combine into this
                     # owner's inject mix; the prior owner contributes only the
                     # gate logits at call time, so the same resource facts and
                     # this owner's weights define the admission here.
-                    self._prefill_boundary_ops = {
-                        tile: build_combine_mix_op(
-                            self.hc_count,
-                            self.hidden_size,
-                            self.hc_norm.variance_epsilon,
-                            tile,
-                            hardware,
-                        )
-                        for tile in full_tiles
-                        if supports_combine_mix(
-                            self.hc_count,
-                            self.hidden_size,
-                            self.input_mix_weight_down.weight.shape[0],
-                            tile,
-                            hardware,
-                        )
-                    }
+                    self._prefill_boundary_ops = mix_ops(
+                        build_combine_mix_op, supports_combine_mix
+                    )
                     # The broadcast boundary variant serves the chain's first
                     # boundary, whose prior owner's residual arrives
                     # un-expanded; this owner's weights and resource facts
                     # define the admission exactly like the boundary above.
-                    self._prefill_boundary_broadcast_ops = {
-                        tile: build_combine_mix_broadcast_op(
-                            self.hc_count,
-                            self.hidden_size,
-                            self.hc_norm.variance_epsilon,
-                            tile,
-                            hardware,
-                        )
-                        for tile in full_tiles
-                        if supports_combine_broadcast_mix(
-                            self.hc_count,
-                            self.hidden_size,
-                            self.input_mix_weight_down.weight.shape[0],
-                            tile,
-                            hardware,
-                        )
-                    }
+                    self._prefill_boundary_broadcast_ops = mix_ops(
+                        build_combine_mix_broadcast_op, supports_combine_broadcast_mix
+                    )
                 elif (
                     not self.use_combine
                     and envs.VLLM_TPU_HC_PACKED_MIX
@@ -303,23 +270,9 @@ class GatedResidual(common_hc.GatedResidual):
                     # memory and never streams it through HBM. The prior owner
                     # contributes only its gate logits at call time, so this
                     # owner's weights define the admission here.
-                    self._prefill_terminal_ops = {
-                        tile: build_combine_mix_terminal_op(
-                            self.hc_count,
-                            self.hidden_size,
-                            self.hc_norm.variance_epsilon,
-                            tile,
-                            hardware,
-                        )
-                        for tile in full_tiles
-                        if supports_terminal_mix(
-                            self.hc_count,
-                            self.hidden_size,
-                            self.input_mix_weight_down.weight.shape[0],
-                            tile,
-                            hardware,
-                        )
-                    }
+                    self._prefill_terminal_ops = mix_ops(
+                        build_combine_mix_terminal_op, supports_terminal_mix
+                    )
                 reason = "unsupported resources/layout"
             else:
                 reason = "full mix requires per-branch normalization"
@@ -390,9 +343,7 @@ class GatedResidual(common_hc.GatedResidual):
             )
             and _same_tpu_bf16(
                 hyper_input,
-                self.hc_norm.weight,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                *_mix_weights(self),
             )
             and select_mix_tile(hyper_input.shape[0], self._prefill_full_ops)
             is not None
@@ -407,9 +358,7 @@ class GatedResidual(common_hc.GatedResidual):
             assert tile is not None
             mixed, norm = self._prefill_full_ops[tile](
                 hyper_input,
-                self.hc_norm.weight,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                *_mix_weights(self),
             )
             return mixed, (hyper_input, norm)
         norm = self._normalize(hyper_input)
@@ -444,9 +393,7 @@ class GatedResidual(common_hc.GatedResidual):
             and hyper_input.ndim == 2
             and _same_tpu_bf16(
                 hyper_input,
-                self.hc_norm.weight,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                *_mix_weights(self),
                 self.block_inject_weight.weight,
             )
             and select_mix_tile(hyper_input.shape[0], self._prefill_inject_ops)
@@ -471,9 +418,7 @@ class GatedResidual(common_hc.GatedResidual):
             assert tile is not None
             mixed, logits = self._prefill_inject_ops[tile](
                 hyper_input,
-                self.hc_norm.weight,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                *_mix_weights(self),
                 self.block_inject_weight.weight,
             )
             return mixed, HcPackedMixState(hyper_input, logits, self._hc_owner_id)
@@ -492,9 +437,7 @@ class GatedResidual(common_hc.GatedResidual):
             and embedding.ndim == 2
             and _same_tpu_bf16(
                 embedding,
-                self.hc_norm.weight,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                *_mix_weights(self),
                 self.block_inject_weight.weight,
             )
             and select_mix_tile(embedding.shape[0], self._prefill_inject_broadcast_ops)
@@ -523,9 +466,7 @@ class GatedResidual(common_hc.GatedResidual):
             assert tile is not None
             mixed, logits = self._prefill_inject_broadcast_ops[tile](
                 embedding,
-                self.hc_norm.weight,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                *_mix_weights(self),
                 self.block_inject_weight.weight,
             )
             return mixed, HcPackedMixState(
@@ -634,9 +575,7 @@ def _use_boundary_mix(prior, following, block_output, residuals):
     # tile, keeps the unfused public sequence. Auto mode leaves the combine
     # tile to the boundary admission itself.
     return (
-        prior.use_combine
-        and prior.prefill_combine_tile != 0
-        and (prior.prefill_combine_tile == "auto" or prior._combine_token_tile == tile)
+        _prior_combine_matches(prior, tile)
         and following.use_mix
         and following.use_combine
         and bool(_boundary_ops(residuals, following))
@@ -652,9 +591,7 @@ def _use_boundary_mix(prior, following, block_output, residuals):
             hyper_input,
             block_output,
             residuals.inject_logits,
-            following.hc_norm.weight,
-            following.input_mix_weight_down.weight,
-            following.input_mix_weight_up.weight,
+            *_mix_weights(following),
             following.block_inject_weight.weight,
         )
         and tile is not None
@@ -699,9 +636,7 @@ def combine_then_mix_packed(prior, following, block_output, residuals):
             residuals.hyper_input,
             block_output,
             residuals.inject_logits,
-            following.hc_norm.weight,
-            following.input_mix_weight_down.weight,
-            following.input_mix_weight_up.weight,
+            *_mix_weights(following),
             following.block_inject_weight.weight,
         )
         return (
@@ -726,9 +661,7 @@ def _use_terminal_mix(prior, terminal, block_output, residuals):
     # owner's full-width residual, so a broadcast state keeps the public
     # sequence: the combine below expands the un-expanded residual first.
     return (
-        prior.use_combine
-        and prior.prefill_combine_tile != 0
-        and (prior.prefill_combine_tile == "auto" or prior._combine_token_tile == tile)
+        _prior_combine_matches(prior, tile)
         and terminal.use_mix
         and not terminal.use_combine
         and bool(terminal._prefill_terminal_ops)
@@ -744,9 +677,7 @@ def _use_terminal_mix(prior, terminal, block_output, residuals):
             hyper_input,
             block_output,
             residuals.inject_logits,
-            terminal.hc_norm.weight,
-            terminal.input_mix_weight_down.weight,
-            terminal.input_mix_weight_up.weight,
+            *_mix_weights(terminal),
         )
         and tile is not None
     )
@@ -791,9 +722,7 @@ def combine_then_mix_terminal(prior, terminal, block_output, residuals):
             residuals.hyper_input,
             block_output,
             residuals.inject_logits,
-            terminal.hc_norm.weight,
-            terminal.input_mix_weight_down.weight,
-            terminal.input_mix_weight_up.weight,
+            *_mix_weights(terminal),
         )
     combined = prior.combine(block_output, residuals)
     return terminal.mix(combined)[0]

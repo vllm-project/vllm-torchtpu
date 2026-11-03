@@ -13,6 +13,8 @@
 # limitations under the License.
 """Mocked static resource boundaries; these are not cross-chip hardware tests."""
 
+import dataclasses
+import inspect
 from dataclasses import replace
 
 import jax
@@ -21,10 +23,23 @@ import pytest
 from jax.experimental import pallas as pl
 
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
+from vllm_torchtpu.kernels.qwen4_exp.hc_combine_mix import (
+    combine_mix_inject,
+    combine_mix_inject_broadcast,
+    combine_mix_terminal,
+)
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
+from vllm_torchtpu.kernels.qwen4_exp.hc_inject_mix import (
+    full_mix_inject,
+    full_mix_inject_broadcast,
+)
 from vllm_torchtpu.kernels.qwen4_exp.hc_resources import (
     RESIDUAL_PIPELINE,
+    CombineMixMemory,
+    FullMixMemory,
     HcHardware,
+    InjectMixMemory,
+    TerminalMixMemory,
     combine_broadcast_mix_memory,
     combine_mix_memory,
     full_mix_memory,
@@ -610,3 +625,151 @@ def test_broadcast_mix_tile_admission_is_resource_derived():
         assert not supports(4, 0, 320, 128, info)
         assert not supports(0, 2560, 320, 128, info)
         assert not supports(4, 2560, 0, 128, info)
+
+
+@pytest.mark.parametrize(
+    "record_type", [CombineMixMemory, FullMixMemory, InjectMixMemory, TerminalMixMemory]
+)
+def test_mix_memory_record_contract(record_type):
+    names = ("resident_bytes", "buffer_bytes", "working_bytes", "headroom_bytes")
+    record = record_type(1, 2, 3, 4)
+    assert type(record) is record_type
+    assert tuple(field.name for field in dataclasses.fields(record)) == names
+    assert tuple(inspect.signature(record_type).parameters) == names
+    assert dataclasses.asdict(record) == dict(zip(names, (1, 2, 3, 4)))
+    assert record.total_bytes == 10
+    assert repr(record) == (
+        f"{record_type.__name__}(resident_bytes=1, buffer_bytes=2, "
+        "working_bytes=3, headroom_bytes=4)"
+    )
+    assert record == record_type(1, 2, 3, 4)
+    assert hash(record) == hash((1, 2, 3, 4))
+    for other in (CombineMixMemory, FullMixMemory, InjectMixMemory, TerminalMixMemory):
+        if other is not record_type:
+            assert record != other(1, 2, 3, 4)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        record.resident_bytes = 0
+
+
+@pytest.mark.parametrize(
+    "builder_name",
+    [
+        "build_gated_residual_op",
+        "build_full_mix_op",
+        "build_full_mix_inject_op",
+        "build_full_mix_inject_broadcast_op",
+        "build_combine_mix_op",
+        "build_combine_mix_broadcast_op",
+        "build_combine_mix_terminal_op",
+    ],
+)
+def test_all_hc_registration_cache_keys(builder_name):
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
+
+    builder = vars(vllm_adapter)[builder_name]
+    info = hardware()
+
+    def build(branches=5, hidden=256, tile=128, eps=3e-6, target=info):
+        if builder_name == "build_gated_residual_op":
+            return builder(branches, hidden, tile, target)
+        return builder(branches, hidden, eps, tile, target)
+
+    op = build()
+    assert build() is op
+    assert build(branches=6) is not op
+    assert build(hidden=128) is not op
+    assert build(tile=256) is not op
+    assert build(target=replace(info, vmem_bytes=info.vmem_bytes + 1)) is not op
+    assert build(target=replace(info, chip="other-layout")) is not op
+    if builder_name != "build_gated_residual_op":
+        assert build(eps=3.000001e-6) is not op
+
+
+@pytest.mark.parametrize("tiles", [1, 2, 3])
+@pytest.mark.parametrize(
+    "kernel,broadcast,terminal",
+    [
+        (combine_mix_inject, False, False),
+        (combine_mix_inject_broadcast, True, False),
+        (combine_mix_terminal, False, True),
+    ],
+)
+def test_boundary_bindings_on_positive_tile_counts(kernel, broadcast, terminal, tiles):
+    tokens, branches, hidden, lowrank = tiles * 128, 3, 128, 64
+    width = branches * hidden
+    shapes = [
+        (tokens, hidden if broadcast else width),
+        (tokens, hidden),
+        (tokens, branches),
+        (width,),
+        (lowrank, width),
+        (width, lowrank),
+    ]
+    if not terminal:
+        shapes.append((branches, width))
+    operands = [jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in shapes]
+    result = jax.eval_shape(
+        lambda *args: kernel(
+            *args,
+            branches=branches,
+            hidden=hidden,
+            eps=1e-6,
+            token_tile=128,
+            hardware=hardware(),
+        ),
+        *operands,
+    )
+    outputs = (result,) if terminal else result
+    expected = (
+        ((tokens, hidden),)
+        if terminal
+        else ((tokens, width), (tokens, hidden), (tokens, branches))
+    )
+    assert tuple(output.shape for output in outputs) == expected
+    assert all(output.dtype == jnp.bfloat16 for output in outputs)
+
+
+@pytest.mark.parametrize(
+    "kernel,arity,name,broadcast",
+    [
+        (_full_mix, 4, "HC full mix", False),
+        (full_mix_inject, 5, "HC inject mix", False),
+        (full_mix_inject_broadcast, 5, "HC broadcast inject mix", True),
+        (combine_mix_inject, 7, "HC combine mix", False),
+        (combine_mix_inject_broadcast, 7, "HC broadcast combine mix", True),
+        (combine_mix_terminal, 6, "HC terminal mix", False),
+    ],
+)
+@pytest.mark.parametrize("failure", ["geometry", "tile", "empty", "ragged"])
+def test_mix_validation_preserves_first_failure(
+    kernel, arity, name, broadcast, failure
+):
+    class Unreadable:
+        @property
+        def shape(self):
+            pytest.fail("validation accessed a later operand")
+
+    operands: list[Unreadable | jax.ShapeDtypeStruct] = [
+        Unreadable() for _ in range(arity)
+    ]
+    branches, tile = (0, 0) if failure == "geometry" else (4, 0)
+    message = "positive branches and 128-aligned hidden"
+    if failure == "tile":
+        message = ("" if broadcast else "positive ") + "128-aligned token tiles"
+    elif failure in ("empty", "ragged"):
+        branches, tile = 4, 128
+        tokens = 0 if failure == "empty" else 129
+        # Down's first dimension is read before row validation, while every
+        # subsequent operand shape must remain behind its short circuit.
+        operands[0] = jax.ShapeDtypeStruct(
+            (tokens, 128 if broadcast else 512), jnp.bfloat16
+        )
+        operands[2 if arity <= 5 else 4] = jax.ShapeDtypeStruct(
+            (128, 512), jnp.bfloat16
+        )
+        message = "full BF16 token tiles"
+    with pytest.raises(ValueError) as error:
+        kernel.__wrapped__(
+            *operands, branches=branches, hidden=128, eps=1e-6, token_tile=tile
+        )
+    assert str(error.value) == f"{name} requires {message}"

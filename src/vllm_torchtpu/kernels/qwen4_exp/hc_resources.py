@@ -75,7 +75,24 @@ def _plane(rows: int, columns: int, row_tile: int, lanes: int, item: int) -> int
 
 
 @dataclasses.dataclass(frozen=True)
-class CombineMixMemory:
+class _MixMemory:
+    resident_bytes: int
+    buffer_bytes: int
+    working_bytes: int
+    headroom_bytes: int
+
+    @property
+    def total_bytes(self) -> int:
+        return (
+            self.resident_bytes
+            + self.buffer_bytes
+            + self.working_bytes
+            + self.headroom_bytes
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class CombineMixMemory(_MixMemory):
     """Sizing for the boundary kernel fusing one combine with the next mix.
 
     The staged residual tile becomes the normalization target in place, the
@@ -84,40 +101,16 @@ class CombineMixMemory:
     a block ring, an incoming-logit ring, and their FP32 conversion planes.
     """
 
-    resident_bytes: int
-    buffer_bytes: int
-    working_bytes: int
-    headroom_bytes: int
-
-    @property
-    def total_bytes(self) -> int:
-        return (
-            self.resident_bytes
-            + self.buffer_bytes
-            + self.working_bytes
-            + self.headroom_bytes
-        )
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
-class FullMixMemory:
-    resident_bytes: int
-    buffer_bytes: int
-    working_bytes: int
-    headroom_bytes: int
-
-    @property
-    def total_bytes(self) -> int:
-        return (
-            self.resident_bytes
-            + self.buffer_bytes
-            + self.working_bytes
-            + self.headroom_bytes
-        )
+class FullMixMemory(_MixMemory):
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
-class InjectMixMemory:
+class InjectMixMemory(_MixMemory):
     """Sizing for the mix variant that also projects injection gates.
 
     The normalized hyper input is consumed in vector memory in place of the
@@ -126,23 +119,11 @@ class InjectMixMemory:
     planes instead.
     """
 
-    resident_bytes: int
-    buffer_bytes: int
-    working_bytes: int
-    headroom_bytes: int
-
-    @property
-    def total_bytes(self) -> int:
-        return (
-            self.resident_bytes
-            + self.buffer_bytes
-            + self.working_bytes
-            + self.headroom_bytes
-        )
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
-class TerminalMixMemory:
+class TerminalMixMemory(_MixMemory):
     """Sizing for the boundary variant fusing the final combine with the
     terminal mix.
 
@@ -153,19 +134,7 @@ class TerminalMixMemory:
     kernel, so no [tile, width] FP32 plane exists.
     """
 
-    resident_bytes: int
-    buffer_bytes: int
-    working_bytes: int
-    headroom_bytes: int
-
-    @property
-    def total_bytes(self) -> int:
-        return (
-            self.resident_bytes
-            + self.buffer_bytes
-            + self.working_bytes
-            + self.headroom_bytes
-        )
+    pass
 
 
 def packed_projection_rows(
@@ -180,6 +149,35 @@ def packed_projection_rows(
     """
     inject_row = _align(lowrank, hardware.row_alignment)
     return inject_row, inject_row + branches
+
+
+def _supports_mix_geometry(
+    branches: int,
+    hidden: int,
+    lowrank: int,
+    tile: int,
+    hardware: HcHardware | None,
+) -> bool:
+    return not (
+        hardware is None
+        or not hardware.supported
+        or hardware.mxu_columns <= 0
+        or hardware.mxu_columns % hardware.lanes
+        or 32 % hardware.bf16_rows
+        or 32 % hardware.fp32_rows
+        or min(branches, hidden, lowrank, tile) <= 0
+        or hidden % hardware.lanes
+        or tile % 128
+        or max(branches * hidden, lowrank, tile) > 2**31 - 1
+    )
+
+
+def _normalization_headroom(width: int, hidden: int, hardware: HcHardware) -> int:
+    return (
+        6 * _plane(32, hidden, hardware.fp32_rows, hardware.lanes, 4)
+        + 2 * _plane(32, 1, hardware.fp32_rows, hardware.lanes, 4)
+        + _align(width, hardware.lanes) * 4
+    )
 
 
 def full_mix_memory(
@@ -207,9 +205,7 @@ def full_mix_memory(
         _align(width, hardware.lanes) * 2 + bf(lowrank, width) + bf(width, lowrank)
     )
     buffers = 4 * bf(tile, width) + 2 * bf(tile, hidden)
-    normalization = (
-        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
-    )
+    normalization = _normalization_headroom(width, hidden, hardware)
     lowrank_accumulator = _plane(
         tile, lowrank, hardware.fp32_rows, hardware.mxu_columns, 4
     )
@@ -253,9 +249,7 @@ def inject_mix_memory(
     # One staged input ring (normalized in place) instead of separate input
     # and normalized-value rings, plus the mixed output and logit rings.
     buffers = 2 * bf(tile, width) + 2 * bf(tile, hidden) + 2 * bf(tile, branches)
-    normalization = (
-        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
-    )
+    normalization = _normalization_headroom(width, hidden, hardware)
     packed_accumulator = _plane(
         tile, packed_rows, hardware.fp32_rows, hardware.mxu_columns, 4
     )
@@ -276,19 +270,9 @@ def supports_inject_mix(
     tile: int,
     hardware: HcHardware | None,
 ) -> bool:
-    if (
-        hardware is None
-        or not hardware.supported
-        or hardware.mxu_columns <= 0
-        or hardware.mxu_columns % hardware.lanes
-        or 32 % hardware.bf16_rows
-        or 32 % hardware.fp32_rows
-        or min(branches, hidden, lowrank, tile) <= 0
-        or hidden % hardware.lanes
-        or tile % 128
-        or max(branches * hidden, lowrank, tile) > 2**31 - 1
-    ):
+    if not _supports_mix_geometry(branches, hidden, lowrank, tile, hardware):
         return False
+    assert hardware is not None
     return inject_mix_memory(branches, hidden, lowrank, tile, hardware).total_bytes <= (
         hardware.vmem_bytes
     )
@@ -327,9 +311,7 @@ def inject_broadcast_mix_memory(
         + 2 * bf(tile, hidden)
         + 2 * bf(tile, branches)
     )
-    normalization = (
-        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
-    )
+    normalization = _normalization_headroom(width, hidden, hardware)
     packed_accumulator = _plane(
         tile, packed_rows, hardware.fp32_rows, hardware.mxu_columns, 4
     )
@@ -350,19 +332,9 @@ def supports_inject_broadcast_mix(
     tile: int,
     hardware: HcHardware | None,
 ) -> bool:
-    if (
-        hardware is None
-        or not hardware.supported
-        or hardware.mxu_columns <= 0
-        or hardware.mxu_columns % hardware.lanes
-        or 32 % hardware.bf16_rows
-        or 32 % hardware.fp32_rows
-        or min(branches, hidden, lowrank, tile) <= 0
-        or hidden % hardware.lanes
-        or tile % 128
-        or max(branches * hidden, lowrank, tile) > 2**31 - 1
-    ):
+    if not _supports_mix_geometry(branches, hidden, lowrank, tile, hardware):
         return False
+    assert hardware is not None
     memory = inject_broadcast_mix_memory(branches, hidden, lowrank, tile, hardware)
     return memory.total_bytes <= hardware.vmem_bytes
 
@@ -402,9 +374,7 @@ def combine_broadcast_mix_memory(
         + 2 * bf(tile, hidden)
         + 2 * bf(tile, branches)
     )
-    normalization = (
-        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
-    )
+    normalization = _normalization_headroom(width, hidden, hardware)
     packed_accumulator = _plane(
         tile, packed_rows, hardware.fp32_rows, hardware.mxu_columns, 4
     )
@@ -424,19 +394,9 @@ def supports_combine_broadcast_mix(
     tile: int,
     hardware: HcHardware | None,
 ) -> bool:
-    if (
-        hardware is None
-        or not hardware.supported
-        or hardware.mxu_columns <= 0
-        or hardware.mxu_columns % hardware.lanes
-        or 32 % hardware.bf16_rows
-        or 32 % hardware.fp32_rows
-        or min(branches, hidden, lowrank, tile) <= 0
-        or hidden % hardware.lanes
-        or tile % 128
-        or max(branches * hidden, lowrank, tile) > 2**31 - 1
-    ):
+    if not _supports_mix_geometry(branches, hidden, lowrank, tile, hardware):
         return False
+    assert hardware is not None
     memory = combine_broadcast_mix_memory(branches, hidden, lowrank, tile, hardware)
     return memory.total_bytes <= hardware.vmem_bytes
 
@@ -471,9 +431,7 @@ def terminal_mix_memory(
         + 2 * bf(tile, branches)
         + 2 * bf(tile, hidden)
     )
-    normalization = (
-        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
-    )
+    normalization = _normalization_headroom(width, hidden, hardware)
     lowrank_accumulator = _plane(
         tile, lowrank, hardware.fp32_rows, hardware.mxu_columns, 4
     )
@@ -495,19 +453,9 @@ def supports_terminal_mix(
     tile: int,
     hardware: HcHardware | None,
 ) -> bool:
-    if (
-        hardware is None
-        or not hardware.supported
-        or hardware.mxu_columns <= 0
-        or hardware.mxu_columns % hardware.lanes
-        or 32 % hardware.bf16_rows
-        or 32 % hardware.fp32_rows
-        or min(branches, hidden, lowrank, tile) <= 0
-        or hidden % hardware.lanes
-        or tile % 128
-        or max(branches * hidden, lowrank, tile) > 2**31 - 1
-    ):
+    if not _supports_mix_geometry(branches, hidden, lowrank, tile, hardware):
         return False
+    assert hardware is not None
     return terminal_mix_memory(
         branches, hidden, lowrank, tile, hardware
     ).total_bytes <= (hardware.vmem_bytes)
@@ -552,9 +500,7 @@ def combine_mix_memory(
         + 2 * bf(tile, hidden)
         + 2 * bf(tile, branches)
     )
-    normalization = (
-        6 * fp(32, hidden) + 2 * fp(32, 1) + _align(width, hardware.lanes) * 4
-    )
+    normalization = _normalization_headroom(width, hidden, hardware)
     packed_accumulator = _plane(
         tile, packed_rows, hardware.fp32_rows, hardware.mxu_columns, 4
     )
@@ -578,19 +524,9 @@ def supports_combine_mix(
     tile: int,
     hardware: HcHardware | None,
 ) -> bool:
-    if (
-        hardware is None
-        or not hardware.supported
-        or hardware.mxu_columns <= 0
-        or hardware.mxu_columns % hardware.lanes
-        or 32 % hardware.bf16_rows
-        or 32 % hardware.fp32_rows
-        or min(branches, hidden, lowrank, tile) <= 0
-        or hidden % hardware.lanes
-        or tile % 128
-        or max(branches * hidden, lowrank, tile) > 2**31 - 1
-    ):
+    if not _supports_mix_geometry(branches, hidden, lowrank, tile, hardware):
         return False
+    assert hardware is not None
     return combine_mix_memory(
         branches, hidden, lowrank, tile, hardware
     ).total_bytes <= (hardware.vmem_bytes)
@@ -603,19 +539,9 @@ def supports_full_mix(
     tile: int,
     hardware: HcHardware | None,
 ) -> bool:
-    if (
-        hardware is None
-        or not hardware.supported
-        or hardware.mxu_columns <= 0
-        or hardware.mxu_columns % hardware.lanes
-        or 32 % hardware.bf16_rows
-        or 32 % hardware.fp32_rows
-        or min(branches, hidden, lowrank, tile) <= 0
-        or hidden % hardware.lanes
-        or tile % 128
-        or max(branches * hidden, lowrank, tile) > 2**31 - 1
-    ):
+    if not _supports_mix_geometry(branches, hidden, lowrank, tile, hardware):
         return False
+    assert hardware is not None
     return full_mix_memory(branches, hidden, lowrank, tile, hardware).total_bytes <= (
         hardware.vmem_bytes
     )
