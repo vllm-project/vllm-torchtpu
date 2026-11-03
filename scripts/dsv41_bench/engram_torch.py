@@ -205,12 +205,17 @@ def main():
     parser.add_argument("--normal-seeds", default="")
     parser.add_argument("--with-mhc-post", action="store_true")
     parser.add_argument("--production-caller", action="store_true")
+    parser.add_argument("--compare-post-block32", action="store_true")
     parser.add_argument("--baseline-source", type=Path)
     parser.add_argument("--fallback-eps", type=float)
     parser.add_argument("--tokens", type=int, default=288)
     args = parser.parse_args()
     if args.production_caller and args.baseline_source is None:
         parser.error("--production-caller requires --baseline-source")
+    if args.compare_post_block32 and not (
+        args.production_caller and args.with_mhc_post and args.tokens == 288
+    ):
+        parser.error("post-block32 requires the production caller, post and T288")
     TOKENS = args.tokens
     if args.fallback_eps is not None:
         EPS = args.fallback_eps
@@ -331,6 +336,7 @@ def main():
         candidate = original_tail(args.out, dispatch=True, namespace=vars(bridge))
 
     post_op = None
+    candidate_post_op = None
     if args.with_mhc_post:
         sys.path.insert(0, str(ROOT / "src"))
         from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
@@ -354,13 +360,37 @@ def main():
         def fake_post(x, residual, post, comb):
             return torch.empty_like(residual)
 
-        def with_producer(fn):
+        candidate_post_op = post_op
+        if args.compare_post_block32:
+            # Keep the already-adopted Engram path identical on both sides.
+            native = candidate
+
+            def post32_jax(
+                x: jax.Array,
+                residual: jax.Array,
+                post: jax.Array,
+                comb: jax.Array,
+            ) -> jax.Array:
+                return post_kernel.mhc_post(
+                    x, residual, post, comb, token_block_size=32
+                )
+
+            candidate_post_op = pallas.jax_op(
+                "pallas::dsv41_engram_post32_bench",
+                post32_jax,
+                mesh=mesh,
+                input_partition_specs=(jax.sharding.PartitionSpec(),) * 4,
+            )
+            candidate_post_op.register_fake(fake_post)
+
+        def with_producer(fn, producer):
             def call(h, kv, qw, kw, mask, x, post, comb):
-                return fn(post_op(x, h, post, comb), kv, qw, kw, mask)
+                return fn(producer(x, h, post, comb), kv, qw, kw, mask)
 
             return call
 
-        native, candidate = with_producer(native), with_producer(candidate)
+        native = with_producer(native, post_op)
+        candidate = with_producer(candidate, candidate_post_op)
     funcs = {
         name: torch.compile(fn, backend="tpu", fullgraph=True, dynamic=False)
         for name, fn in (("native", native), ("pallas", candidate))
@@ -386,6 +416,7 @@ def main():
         "timings": {},
         "with_mhc_post": args.with_mhc_post,
         "production_caller": args.production_caller,
+        "compare_post_block32": args.compare_post_block32,
         "integration_checks": integration_checks,
     }
 
@@ -434,6 +465,11 @@ def main():
             if post_op is not None:
                 produced = post_op(values[5], values[0], values[6], values[7])
                 np.testing.assert_array_equal(produced.cpu().float().numpy(), xs[0])
+                if args.compare_post_block32:
+                    produced = candidate_post_op(
+                        values[5], values[0], values[6], values[7]
+                    )
+                    np.testing.assert_array_equal(produced.cpu().float().numpy(), xs[0])
             want = reference(xs, masked)
             outputs = {
                 name: fn(*values).cpu().float().numpy() for name, fn in funcs.items()
@@ -446,6 +482,9 @@ def main():
                 }
             )
             row["pallas_vs_native"] = compare(outputs["pallas"], outputs["native"])
+            if args.compare_post_block32:
+                np.testing.assert_array_equal(outputs["pallas"], outputs["native"])
+                row["native_candidate_exact"] = True
             if args.diagnose:
                 detailed = []
                 failed_coordinates = {
