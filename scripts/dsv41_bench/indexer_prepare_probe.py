@@ -71,7 +71,7 @@ def main():
     order = rng.permutation(288).astype(np.int32)
     functions = {"native": jax.jit(native), "candidate": jax.jit(prepare_sorted_fp8)}
     results = []
-    for kind in ("normal", "zero", "tiny", "large", "powers"):
+    for kind in ("normal", "zero", "tiny", "large", "powers", "scale_edges", "ties"):
         keys = rng.normal(size=(288, 128))
         if kind == "zero":
             keys[:] = 0
@@ -83,6 +83,23 @@ def main():
             keys = np.broadcast_to(
                 np.exp2(np.arange(288) % 40 - 20)[:, None], (288, 128)
             ).copy()
+        elif kind == "scale_edges":
+            maximum = np.array([446, 448, 450])[np.arange(288) % 3] * np.exp2(
+                np.arange(288) % 41 - 20
+            )
+            keys = rng.uniform(-0.99, 0.99, (288, 128)) * maximum[:, None]
+            keys[:, 0] = maximum
+        elif kind == "ties":
+            values = (
+                np.arange(256, dtype=np.uint8)
+                .view(ml_dtypes.float8_e4m3fn)
+                .astype(np.float32)
+            )
+            values = np.unique(values[np.isfinite(values)])
+            midpoints = (values[:-1] + values[1:]) / 2
+            keys = midpoints[np.arange(288 * 128).reshape(288, 128) % midpoints.size]
+            keys[:, 0] = 448
+            keys *= np.exp2(np.arange(288) % 41 - 20)[:, None]
         keys = keys.astype(ml_dtypes.bfloat16)
         expected = reference(keys, columns, order)
         for name, fn in functions.items():
@@ -97,30 +114,35 @@ def main():
         (args.out / "probe.json").write_text(json.dumps(results, indent=2) + "\n")
         print(results[-1], flush=True)
 
-    for tokens, dtype, page_size, num_banks in (
-        (256, jnp.bfloat16, 256, 2),
-        (288, jnp.float32, 256, 2),
-        (288, jnp.bfloat16, 128, 2),
-        (288, jnp.bfloat16, 256, 1),
+    for tokens, dtype, page_size, num_banks, offset in (
+        (256, jnp.bfloat16, 256, 2, 0),
+        (288, jnp.float32, 256, 2, 0),
+        (288, jnp.bfloat16, 128, 2, 0),
+        (288, jnp.bfloat16, 256, 1, 0),
+        (288, jnp.bfloat16, 256, 2, 16),
     ):
         stride = page_size // 2
         banks = tuple(
             jnp.full((stride * 4, 128), 17, jnp.int32) for _ in range(num_banks)
         )
-        layout = cache.PackedFP8Layout(4 * num_banks, stride, 0, page_size)
+        layout = cache.PackedFP8Layout(
+            4 * num_banks - bool(offset), stride, offset, page_size
+        )
         records = rng.choice(layout.pages * page_size, tokens, replace=False).astype(
             np.int32
         )
         records[0], records[-1] = -1, layout.pages * page_size
         keys = jnp.asarray(rng.normal(size=(tokens, 128)), dtype=dtype)
         slots = jnp.asarray(records)
-        assert not supports_sorted_fp8(banks, slots, keys, page_size)
+        supported = supports_sorted_fp8(banks, slots, keys, page_size)
+        assert supported == bool(offset)
         native_fn = functools.partial(cache._write_fp8_records_native, layout=layout)
         candidate_fn = functools.partial(cache.write_fp8_records, layout=layout)
         # The guard must produce precisely the original operations for fallback.
-        assert str(jax.make_jaxpr(native_fn)(banks, slots, keys)) == str(
-            jax.make_jaxpr(candidate_fn)(banks, slots, keys)
-        )
+        if not supported:
+            assert str(jax.make_jaxpr(native_fn)(banks, slots, keys)) == str(
+                jax.make_jaxpr(candidate_fn)(banks, slots, keys)
+            )
         original = jax.block_until_ready(jax.jit(native_fn)(banks, slots, keys))
         actual = jax.block_until_ready(jax.jit(candidate_fn)(banks, slots, keys))
         v = np.asarray(keys, np.float32)
@@ -147,7 +169,7 @@ def main():
             if record < 0 or record >= layout.pages * page_size:
                 continue
             addresses = (
-                (record // page_size) * stride * 128
+                ((record // page_size) * stride + offset) * 128
                 + np.arange(33) * page_size
                 + record % page_size
             )
@@ -156,9 +178,10 @@ def main():
         np.testing.assert_array_equal(np.concatenate(original), expected)
         results.append(
             {
-                "fallback": [tokens, str(dtype), page_size, num_banks],
+                "writer_shape": [tokens, str(dtype), page_size, num_banks, offset],
+                "fused": supported,
                 "three_way_byte_exact": True,
-                "same_jaxpr": True,
+                "same_jaxpr": not supported,
             }
         )
         (args.out / "probe.json").write_text(json.dumps(results, indent=2) + "\n")
