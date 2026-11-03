@@ -64,9 +64,19 @@ def gather_workspace(
     return lax.all_gather(cache[pages], axis_name, tiled=False)
 
 
-def position_ordered(workspace: jax.Array, interleave: int) -> jax.Array:
+def position_ordered(
+    workspace: jax.Array, interleave: int, *, seq_along_lane: bool = False
+) -> jax.Array:
     """Reorder the rank-major `[dcp, Pw, P/4, 4, W]` workspace to
-    `[Pw, dcp * P/4, 4, W]`."""
+    `[Pw, dcp * P/4, 4, W]`; with `seq_along_lane` (tokens on lanes), the
+    `[dcp, Pw, G, 4, P]` workspace to `[Pw, G, 4, dcp * P]`."""
+    if seq_along_lane:
+        dcp, num_ws_pages, groups, packing, page_size = workspace.shape
+        x = workspace.reshape(
+            dcp, num_ws_pages, groups, packing, page_size // interleave, interleave
+        )
+        x = jnp.transpose(x, (1, 2, 3, 4, 0, 5))
+        return x.reshape(num_ws_pages, groups, packing, dcp * page_size)
     dcp, num_ws_pages, rows, packing, width = workspace.shape
     page_size = rows * packing
     x = workspace.reshape(dcp, num_ws_pages, page_size // interleave, interleave, width)

@@ -34,6 +34,7 @@ request's K in position order, which it must match exactly.
 
 import functools
 import math
+import sys
 import zlib
 from types import SimpleNamespace
 
@@ -45,6 +46,10 @@ import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    KVLayout,
+    get_kv_cache_shape,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk as plain_streamindex_topk,
 )
@@ -527,7 +532,6 @@ IDX_TOPK = 64
 # Workspace buckets (context tokens) for the top-k `lax.switch`: 4 and 8
 # virtual pages here, plus the full 32-page workspace.
 IDX_BUCKET_TOKENS = (2048, 4096)
-MAX_MODEL_LEN = BLOCKS_PER_REQ * PAGE_SIZE * DCP
 
 
 def _quantize_index_k(x):
@@ -605,17 +609,26 @@ def _plain_topk(record, seq_len, q, weights):
     return np.asarray(out)[:num_q]
 
 
+@pytest.mark.parametrize("layout", ["has", "sal"])
 @pytest.mark.parametrize("pcp", [2, 4, 8])
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
-def test_pcp_indexer_topk_matches_numpy(monkeypatch, scenario, pcp):
+def test_pcp_indexer_topk_matches_numpy(monkeypatch, scenario, pcp, layout):
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
 
     mesh = _mesh()
+    # SEQ_ALONG_LANE puts tokens on lanes, so its pages are multiples of 128;
+    # the plan, the reference and the cache all read PAGE_SIZE.
+    sal = layout == "sal"
+    page_size = 128 if sal else PAGE_SIZE
+    monkeypatch.setattr(sys.modules[__name__], "PAGE_SIZE", page_size)
+    max_model_len = BLOCKS_PER_REQ * page_size * DCP
     monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", CHUNK_TOKENS)
     monkeypatch.setattr(
         mla_attention_op, "PCP_INDEXER_BUCKET_TOKENS", IDX_BUCKET_TOKENS
     )
-    rng = np.random.default_rng(zlib.crc32(f"indexer-{scenario}-{pcp}".encode()))
+    rng = np.random.default_rng(
+        zlib.crc32(f"indexer-{scenario}-{pcp}-{layout}".encode())
+    )
     steps = SCENARIOS[scenario]
     final_len = _final_lens(steps)
     packed = [_quantize_index_k(rng.standard_normal((n, IDX_DIM))) for n in final_len]
@@ -628,21 +641,31 @@ def test_pcp_indexer_topk_matches_numpy(monkeypatch, scenario, pcp):
             dcp_size=DCP,
             pcp_size=pcp,
             interleave_size=INTERLEAVE,
-            max_model_len=MAX_MODEL_LEN,
+            max_model_len=max_model_len,
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+            kv_cache_mode=layout,
         )
     )
-    cache = jnp.zeros((DCP * NUM_PAGES, PAGE_SIZE // 4, 4, IDX_WIDTH), jnp.uint8)
+    if sal:
+        # The SAL writer takes the unpadded record: fp8 K plus the scale byte.
+        k_width = IDX_DIM + 1
+        shape = get_kv_cache_shape(
+            DCP * NUM_PAGES, page_size, IDX_DIM, KVLayout.SEQ_ALONG_LANE
+        )
+    else:
+        k_width = IDX_WIDTH
+        shape = (DCP * NUM_PAGES, page_size // 4, 4, IDX_WIDTH)
+    cache = jnp.zeros(shape, jnp.uint8)
     checked = 0
     for st in _plan_steps(pcp, steps, _block_table(rng)):
         plan0, local_padded = st.plan0, st.local_padded
         k_rows, q_rows, w_rows = [], [], []
         for p in range(pcp):
-            k = np.zeros((local_padded, IDX_WIDTH), np.uint8)
+            k = np.zeros((local_padded, k_width), np.uint8)
             for i in range(local_padded):
                 tok = st.row_tokens[p * local_padded + i]
                 if tok is not None:
-                    k[i] = packed[tok[0]][0][tok[1]]
+                    k[i] = packed[tok[0]][0][tok[1]][:k_width]
             k_rows.append(k)
             q_rows.append(_fp8(rng, (local_padded, IDX_HEADS, IDX_DIM)))
             w_rows.append(

@@ -156,3 +156,22 @@ def test_remap_topk_chunk_packs_each_chunk():
         )
         np.testing.assert_array_equal(np.asarray(idx), idx_want)
         np.testing.assert_array_equal(np.asarray(owns), np.asarray(owns_want, bool))
+
+
+@pytest.mark.parametrize("dcp,interleave", [(2, 1), (4, 2), (8, 4)])
+def test_position_ordered_seq_along_lane(dcp, interleave):
+    # Tokens on lanes: rank-major [dcp, Pw, G, 4, P] -> [Pw, G, 4, dcp * P].
+    num_ws_pages, groups, page_size = 3, 2, 8
+    virtual_page = dcp * page_size
+    x = np.zeros((dcp, num_ws_pages, groups, 4, page_size), np.int32)
+    for d in range(dcp):
+        for v in range(num_ws_pages):
+            for slot in range(page_size):
+                t = (slot // interleave) * dcp * interleave + d * interleave
+                x[d, v, :, :, slot] = v * virtual_page + t + slot % interleave
+    out = np.asarray(
+        ws.position_ordered(jnp.asarray(x), interleave, seq_along_lane=True)
+    )
+    assert out.shape == (num_ws_pages, groups, 4, virtual_page)
+    want = np.arange(num_ws_pages * virtual_page).reshape(num_ws_pages, 1, 1, -1)
+    np.testing.assert_array_equal(out, np.broadcast_to(want, out.shape))
