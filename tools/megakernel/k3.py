@@ -31,10 +31,31 @@ def logical() -> int:
     return PAGE * config.active().dcp_group
 
 
+class _TokenFileTokenizer:
+    """A stand-in tokenizer over a token file: ``encode`` returns a 64-token
+    slice of the file chosen by the text, ``decode`` the ids as text."""
+
+    def __init__(self, ids: np.ndarray) -> None:
+        self.ids = ids
+
+    def encode(self, text: str, **_) -> list[int]:
+        import zlib
+
+        start = zlib.crc32(text.encode()) % (self.ids.size - 64)
+        return self.ids[start : start + 64].tolist()
+
+    def decode(self, ids) -> str:
+        return " ".join(str(int(i)) for i in ids)
+
+
 def fixed_prompt(count: int, checkpoint: str):
     """``(tokens, tokenizer)``: the first ``count`` tokens of a fixed text, the
     model repository's own Python sources (``checkpoint``: the Kimi-K3
-    checkpoint directory)."""
+    checkpoint directory). A ``.npy`` of token ids instead: its first
+    ``count`` tokens and :class:`_TokenFileTokenizer` (no checkpoint needed)."""
+    if str(checkpoint).endswith(".npy"):
+        ids = np.load(checkpoint).astype(np.int32)
+        return ids[:count].tolist(), _TokenFileTokenizer(ids)
     from vllm_torchtpu.megakernel.kimi_k3.program import kernel_modules
 
     (load,) = kernel_modules("load")
