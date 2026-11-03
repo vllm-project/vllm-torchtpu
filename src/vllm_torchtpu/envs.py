@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    VLLM_TPU_FP8_FAST_BF16_ACT_QUANT: bool = False
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -562,6 +563,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 (default) keeps W8A8 everywhere.
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
+    ),
+    # Opt-in bfloat16 activation division during dynamic FP8 activation
+    # quantization on the per-channel dense-linear path (xla_quantized_matmul)
+    # with FP8 weights and bfloat16 activations. Avoids promoting the [M, K]
+    # activation tensor to float32 before casting to float8_e4m3fn, returning
+    # the exact bfloat16 divisor widened to float32 as the row scale; the
+    # blockwise gmm_v2 path and int8/float16 activations keep float32 division.
+    # False (default) keeps exact float32 division everywhere.
+    "VLLM_TPU_FP8_FAST_BF16_ACT_QUANT": env_bool(
+        "VLLM_TPU_FP8_FAST_BF16_ACT_QUANT", False
     ),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(

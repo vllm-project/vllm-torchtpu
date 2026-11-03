@@ -56,9 +56,9 @@ def test_activation_quantization_follows_threshold(
     seen = {}
     real = linear_common.xla_quantized_matmul
 
-    def spy(x, w_q, w_s, quantize_activation=True):
+    def spy(x, w_q, w_s, quantize_activation=True, **kwargs):
         seen["quantize_activation"] = quantize_activation
-        return real(x, w_q, w_s, quantize_activation=quantize_activation)
+        return real(x, w_q, w_s, quantize_activation=quantize_activation, **kwargs)
 
     monkeypatch.setattr(linear_common, "xla_quantized_matmul", spy)
     w_q, w_s = _weights()
@@ -75,9 +75,9 @@ def test_int8_weights_keep_w8a8_below_threshold(monkeypatch):
     seen = {}
     real = linear_common.xla_quantized_matmul
 
-    def spy(x, w_q, w_s, quantize_activation=True):
+    def spy(x, w_q, w_s, quantize_activation=True, **kwargs):
         seen["quantize_activation"] = quantize_activation
-        return real(x, w_q, w_s, quantize_activation=quantize_activation)
+        return real(x, w_q, w_s, quantize_activation=quantize_activation, **kwargs)
 
     monkeypatch.setattr(linear_common, "xla_quantized_matmul", spy)
     w_q = jnp.ones((_K, _N), jnp.int8)
@@ -107,9 +107,9 @@ def test_direct_jax_bridge_defaults_to_w8a8(monkeypatch):
     seen = {}
     real = linear_common.xla_quantized_matmul
 
-    def spy(x, w_q, w_s, quantize_activation=True):
+    def spy(x, w_q, w_s, quantize_activation=True, **kwargs):
         seen["quantize_activation"] = quantize_activation
-        return real(x, w_q, w_s, quantize_activation=quantize_activation)
+        return real(x, w_q, w_s, quantize_activation=quantize_activation, **kwargs)
 
     monkeypatch.setattr(linear_common, "xla_quantized_matmul", spy)
     w_q, w_s = _weights()
@@ -130,7 +130,7 @@ def test_fp8_linear_method_forwards_w8a16_max_rows(monkeypatch, env_val, expecte
 
     seen = {}
 
-    def fake_quantized_matmul(x, w_q, w_s, w8a16_max_rows=0):
+    def fake_quantized_matmul(x, w_q, w_s, w8a16_max_rows=0, **_kwargs):
         seen["w8a16_max_rows"] = w8a16_max_rows
         return torch.zeros((x.shape[0], w_q.shape[-1]), dtype=x.dtype)
 
@@ -164,7 +164,7 @@ def test_fp8_linear_method_takes_w8a16_max_rows_from_linear_config(monkeypatch):
 
     seen = {}
 
-    def fake_quantized_matmul(x, w_q, w_s, w8a16_max_rows=0):
+    def fake_quantized_matmul(x, w_q, w_s, w8a16_max_rows=0, **_kwargs):
         seen["w8a16_max_rows"] = w8a16_max_rows
         return torch.zeros((x.shape[0], w_q.shape[-1]), dtype=x.dtype)
 
