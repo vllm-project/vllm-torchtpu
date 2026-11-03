@@ -20,6 +20,7 @@ from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
 import jax
+import jax.numpy as jnp
 import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
@@ -621,9 +622,11 @@ def _pallas_rpa_kernel_batched_from_qkv(
     fp8_compute: bool = False,
     fence_output: bool = False,
     unmasked_interior: bool = False,
-) -> tuple[jax.Array, jax.Array]:
+    output_quant_dtype: jnp.dtype | None = None,
+) -> tuple[jax.Array, ...]:
     """`_pallas_rpa_kernel_batched` on fused qkv rows (see
-    `PallasBatchedRPAAttentionBackendImpl.forward_from_qkv`)."""
+    `PallasBatchedRPAAttentionBackendImpl.forward_from_qkv`): `(new_kv_cache,
+    output)`, or `(new_kv_cache, q, scale)` with `output_quant_dtype`."""
     rpa_kwargs: dict[str, Any] = dict(
         decode_query_size=decode_query_size,
         skip_empty_launch=skip_empty_launch,
@@ -633,6 +636,8 @@ def _pallas_rpa_kernel_batched_from_qkv(
         fence_output=fence_output,
         unmasked_interior=unmasked_interior,
     )
+    if output_quant_dtype is not None:
+        rpa_kwargs["output_quant_dtype"] = output_quant_dtype
     native, page_stride, restore_pool = native_kv_cache_view(
         kv_cache, num_kv_heads, head_dim, None
     )
@@ -661,6 +666,8 @@ def _pallas_rpa_kernel_batched_from_qkv(
         soft_cap=soft_cap,
         **rpa_kwargs,
     )
+    if output_quant_dtype is not None:
+        return restore_pool(new_native), *outputs
     return restore_pool(new_native), outputs
 
 
@@ -1841,7 +1848,10 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         # Set by a model that hands this layer fused qkv rows (the q/k norm
         # epsilon); initialize_kernel then builds forward_from_qkv's op.
         self.qkv_prologue_eps: float | None = None
-        self._qkv_kernel: Callable[..., torch.Tensor] | None = None
+        # Set by a model whose FP8 o_proj takes rows quantized per token: then
+        # forward_from_qkv returns them, `(q, scale)`, in this dtype.
+        self.qkv_output_quant_dtype: torch.dtype | None = None
+        self._qkv_kernel: Callable[..., Any] | None = None
         # Run K + 1 verify tokens in the DECODE stage.
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
@@ -1908,11 +1918,19 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         (neox). One Pallas pass (`prologue.qkv_to_rpa_inputs`) replaces the
         per-head q/k (weighted) and v (unweighted) RMSNorm, the rotary, the
         static FP8 KV quantization and the kernel's input preparation.
-        Returns `[tokens, num_heads * head_size]`.
+        Returns `[tokens, num_heads * head_size]`, or with
+        `qkv_output_quant_dtype` those rows quantized per token, `(q, scale
+        [tokens, 1])` (`output_quant.quantize_head_major_output`).
         """
         tokens = qkv.shape[0]
+        width = self.num_heads * self.head_size
         if kv_cache.numel() == 0:  # determine_available_memory
-            return qkv.new_ones(tokens, self.num_heads * self.head_size)
+            out = qkv.new_ones(tokens, width)
+            if self.qkv_output_quant_dtype is None:
+                return out
+            return out.to(self.qkv_output_quant_dtype), out.new_ones(
+                tokens, 1, dtype=torch.float32
+            )
         unsupported = self.qkv_prologue_unsupported()
         if unsupported or get_vllm_model_wrapper_context().kv_cache_bundle is not None:
             raise NotImplementedError(
@@ -1938,7 +1956,9 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
             attn_metadata.query_start_loc,
             attn_metadata.request_distribution,
         )
-        return outputs.reshape(tokens, self.num_heads * self.head_size)
+        if self.qkv_output_quant_dtype is not None:
+            return outputs
+        return outputs.reshape(tokens, width)
 
     def _build_qkv_kernel(self, k_scale: float, v_scale: float, eps: float):
         """The torch op of `_pallas_rpa_kernel_batched_from_qkv` for this layer,
@@ -1957,6 +1977,11 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
             fence_output=envs.TPU_RPA_FENCE_OUTPUT,
             unmasked_interior=envs.TPU_RPA_UNMASKED_INTERIOR,
         )
+        quant_dtype = self.qkv_output_quant_dtype
+        if quant_dtype is not None:
+            entry_kwargs["output_quant_dtype"] = jnp.dtype(
+                str(quant_dtype).removeprefix("torch.")
+            )
         if self.sliding_window is not None:
             entry_kwargs["cap_sliding_decode_block"] = (
                 envs.TPU_RPA_CAP_SLIDING_DECODE_BLOCK
@@ -2005,16 +2030,20 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         num_heads, head_size = self.num_heads, self.head_size
 
         def _fake(kv_cache: torch.Tensor, qkv: torch.Tensor, *args, **kwargs):
-            out = qkv.new_empty(qkv.shape[0], num_heads, head_size)
-            return torch.empty_like(kv_cache), out
+            if quant_dtype is None:
+                out = qkv.new_empty(qkv.shape[0], num_heads, head_size)
+                return torch.empty_like(kv_cache), out
+            q = qkv.new_empty(qkv.shape[0], num_heads * head_size, dtype=quant_dtype)
+            scale = qkv.new_empty(qkv.shape[0], 1, dtype=torch.float32)
+            return torch.empty_like(kv_cache), q, scale
 
         op.register_fake(_fake)
 
         def qkv_kernel_impl(kv_cache, *args):
-            new_kv_cache, output = op(kv_cache, *args)
+            new_kv_cache, *output = op(kv_cache, *args)
             # Donation + copy_ writeback, as in `_build_rpa_kernel`.
             kv_cache.copy_(new_kv_cache)
-            return output
+            return output[0] if quant_dtype is None else tuple(output)
 
         logger.info_once(
             "Batched RPA takes fused qkv rows (norms, rotary and FP8 KV in "

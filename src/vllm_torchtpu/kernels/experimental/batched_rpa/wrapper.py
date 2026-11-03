@@ -16,7 +16,7 @@
 import dataclasses
 import functools
 import math
-from typing import cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     kernel,
+    output_quant,
     schedule,
     schedule_cp,
     utils,
@@ -671,6 +672,7 @@ def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
         "fp8_compute",
         "fence_output",
         "unmasked_interior",
+        "output_quant_dtype",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -720,8 +722,9 @@ def ragged_paged_attention(
     fp8_compute: bool = False,
     fence_output: bool = False,
     unmasked_interior: bool = False,
+    output_quant_dtype: jnp.dtype | None = None,
     prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
-) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[Any, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
     Args:
@@ -805,6 +808,11 @@ def ragged_paged_attention(
         unmasked_interior: If True, a mixed-kernel step whose KV block every
             query of the step sees whole skips the QK mask (one compare and one
             select per logit). Outputs are identical either way.
+        output_quant_dtype: If set, `out` is `(q, scale)`: the output rows
+            `[max_num_tokens, num_q_heads * head_dim]` quantized per token to
+            this dtype as `quantize_tensor` does, and their f32 `[max_num_tokens,
+            1]` scales, made in one pass over the head-major output
+            (`output_quant.quantize_head_major_output`).
         prepared_inputs: `(q_hbm, new_kv_hbm)` as `prepare_inputs` returns them
             for these queries, keys and values (e.g. from
             `prologue.qkv_to_rpa_inputs`). Then only the shapes and dtypes of
@@ -898,6 +906,8 @@ def ragged_paged_attention(
         skip_empty_launch=skip_empty_launch,
         unmasked_interior=unmasked_interior,
     )
+    if output_quant_dtype is not None and (return_lse or cp_group_size is not None):
+        raise ValueError("output_quant_dtype supports neither LSE output nor CP.")
 
     prepare = functools.partial(
         prepare_inputs,
@@ -1081,6 +1091,14 @@ def ragged_paged_attention(
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
     )
+    if output_quant_dtype is not None:
+        quantized = output_quant.quantize_head_major_output(
+            o_hbm_alias_q_hbm,
+            num_q_heads_per_kv_head=num_q_heads // num_kv_heads,
+            head_dim=head_dim,
+            quant_dtype=output_quant_dtype,
+        )
+        return quantized, kv_cache
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)

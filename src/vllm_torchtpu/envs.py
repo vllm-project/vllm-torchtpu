@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     TPU_RPA_FENCE_OUTPUT: bool = False
     TPU_GEMMA4_FUSED_ATTN_PROLOGUE: bool = False
     TPU_GEMMA4_FUSED_GELU_QUANT: bool = False
+    TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT: bool = False
     TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = False
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
     TPU_RPA_UNMASKED_INTERIOR: bool = False
@@ -856,6 +857,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernels/gelu_quant.py) instead of XLA's two passes over the activation.
     # Rounding: GELU runs in f32 and rounds once, so values can move one step.
     "TPU_GEMMA4_FUSED_GELU_QUANT": env_bool("TPU_GEMMA4_FUSED_GELU_QUANT"),
+    # With TPU_GEMMA4_FUSED_ATTN_PROLOGUE: the attention hands its FP8 o_proj
+    # the output rows quantized per token, made in one Pallas pass over the
+    # kernel's head-major output (batched_rpa/output_quant.py) instead of
+    # XLA's transpose, f32 copy, row-maximum pass and column-major cast.
+    "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT": env_bool("TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT"),
     # Cap the batched-RPA decode KV block of sliding-window layers at half the
     # window, rounded down to the block stride. The default block fills VMEM
     # (1792 tokens for a 1024-token window on Gemma4), and each decode launch

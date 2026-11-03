@@ -78,7 +78,10 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import cp_prefill
 from vllm_torchtpu.layers.adapter.norm_quant import add_rms_norm_quantize_op
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.gemma4_attention_patch import attention_from_qkv
+from vllm_torchtpu.models.vllm.gemma4_attention_patch import (
+    attention_from_qkv,
+    o_projection,
+)
 from vllm_torchtpu.models.vllm.gemma4_mlp_patch import down_proj_from_gate_up
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
@@ -307,6 +310,16 @@ def _token_chunks(x: torch.Tensor, chunks: int) -> list[torch.Tensor]:
 _attention = attention_from_qkv
 
 
+def _attention_chunks(
+    attn: Any, positions: torch.Tensor, qkv: torch.Tensor, chunks: int
+) -> list[Any]:
+    """The attention output of each token chunk, for ``o_projection``."""
+    out = _attention(attn, positions, qkv)
+    if isinstance(out, tuple):  # FP8 rows and their scales
+        return list(zip(*(_token_chunks(t, chunks) for t in out)))
+    return _token_chunks(out, chunks)
+
+
 def _sequence_parallel_layer(
     self: Gemma4DecoderLayer,
     positions: torch.Tensor,
@@ -324,9 +337,9 @@ def _sequence_parallel_layer(
     qkv = torch.cat(
         [_gathered_projection(attn.qkv_proj, self.input_layernorm(h)) for h in residual]
     )
-    attn_out = _token_chunks(_attention(attn, positions, qkv), len(residual))
+    attn_out = _attention_chunks(attn, positions, qkv, len(residual))
     hidden_states = [
-        self.post_attention_layernorm(_reduce_scatter_rows(attn.o_proj(a)[0])) + r
+        self.post_attention_layernorm(_reduce_scatter_rows(o_projection(attn, a))) + r
         for a, r in zip(attn_out, residual)
     ]
     residual = hidden_states
@@ -393,8 +406,8 @@ def _fused_norm_sequence_parallel_layer(
             for c in hidden_states
         ]
     )
-    attn_out = _token_chunks(_attention(attn, positions, qkv), len(residual))
-    o_rows = [_reduce_scatter_rows(attn.o_proj(a)[0]) for a in attn_out]
+    attn_out = _attention_chunks(attn, positions, qkv, len(residual))
+    o_rows = [_reduce_scatter_rows(o_projection(attn, a)) for a in attn_out]
     # The shape-variant hand-over matches the all-reduce trace's inputs by
     # position, and inputs are ordered by first use: each weight is used (a
     # free view) in the order the unfused layers first use them, and the unit

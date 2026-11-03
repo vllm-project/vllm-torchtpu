@@ -1565,3 +1565,21 @@ def test_fused_norm_quant_refuses_non_w8a8_projections(monkeypatch, overrides) -
     layer.self_attn.qkv_proj.quant_method = method
     with pytest.raises(ValueError, match="per-channel W8A8"):
         gemma4_patch._configure_fused_norm_quant(layer)
+
+
+def test_attention_chunks_split_quantized_rows_and_scales(monkeypatch):
+    rows = torch.arange(8 * 3, dtype=torch.float32).reshape(8, 3)
+    scales = torch.arange(8, dtype=torch.float32).reshape(8, 1)
+    monkeypatch.setattr(
+        gemma4_patch, "_attention", lambda attn, pos, qkv: (rows, scales)
+    )
+    chunks = gemma4_patch._attention_chunks(None, None, None, 2)
+    assert [tuple(t.shape) for c in chunks for t in c] == [(4, 3), (4, 1)] * 2
+    assert torch.equal(chunks[1][0], rows[4:]) and torch.equal(chunks[1][1], scales[4:])
+    monkeypatch.setattr(gemma4_patch, "_attention", lambda attn, pos, qkv: rows)
+    assert [
+        tuple(c.shape) for c in gemma4_patch._attention_chunks(None, None, None, 2)
+    ] == [
+        (4, 3),
+        (4, 3),
+    ]

@@ -508,7 +508,9 @@ def sharded_ragged_paged_attention_from_qkv(
     The worker turns its `[tokens, (q + 2 * kv heads) * head_dim]` rows into
     the kernel's inputs with `prologue.qkv_to_rpa_inputs` (q/k/v norms, rotary
     from the tokens' `cos`/`sin` rows, FP8 K/V) and attends. Returns
-    `(output [tokens, num_q_heads, head_dim], new_kv_cache)`.
+    `(output [tokens, num_q_heads, head_dim], new_kv_cache)`, or with
+    `output_quant_dtype` in `rpa_kwargs`, `((q [tokens, num_q_heads * head_dim],
+    scale [tokens, 1]), new_kv_cache)`.
     """
     shards = mesh.shape["model"]
     if shards != 1:
@@ -558,6 +560,11 @@ def sharded_ragged_paged_attention_from_qkv(
         )
 
     replicated = P(None, None)
+    out_spec = (
+        P(None, "model", None)
+        if rpa_kwargs.get("output_quant_dtype") is None
+        else (P(None, "model"), replicated)
+    )
     return shard_map.shard_map(
         _attend,
         mesh=mesh,
@@ -573,7 +580,7 @@ def sharded_ragged_paged_attention_from_qkv(
             P(None),  # cu_q_lens
             P(None),  # distribution
         ),
-        out_specs=(P(None, "model", None), kv_cache_spec),
+        out_specs=(out_spec, kv_cache_spec),
         check_rep=False,
     )(
         qkv,
