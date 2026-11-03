@@ -634,6 +634,64 @@ def mtp_draft_tensors(model: nn.Module) -> dict[str, Any]:
 _MAX_CONSTANT_ELEMENTS = 4096
 
 
+# Per-rank constant naming the rank's slice of a `RowParallelLinear` input.
+_TP_RANK_BUFFER = "export_tp_rank"
+
+
+def _patch_row_parallel_input_split(model: nn.Module) -> int:
+    """Selects each `RowParallelLinear`'s input slice by a per-rank constant.
+
+    With `input_is_parallel=False` the layer takes the full input and keeps
+    `split[self.tp_rank]`, a Python int the trace bakes into the rank's module,
+    while every device runs the one module; Muse Spark's `post_expert_proj` is
+    such a layer. Each one gains a `[1]` buffer holding its rank, a constant the
+    export lays out per device, and its forward picks the slice with it. A layer
+    with a bias is refused: only rank 0 adds it, which the trace bakes as well.
+    Returns the number of layers patched.
+    """
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+        model_parallel_is_initialized,
+    )
+    from vllm.model_executor.layers.linear import RowParallelLinear
+
+    if not model_parallel_is_initialized():
+        return 0
+    tp = get_tensor_model_parallel_world_size()
+    if tp == 1:
+        return 0
+    patched = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, RowParallelLinear) or module.input_is_parallel:
+            continue
+        if getattr(module, "bias", None) is not None and not module.skip_bias_add:
+            raise NotImplementedError(
+                f"{name}: a RowParallelLinear that splits its input and adds a bias "
+                "cannot be exported at tensor parallel size > 1"
+            )
+        device = next(module.parameters()).device
+        module.register_buffer(
+            _TP_RANK_BUFFER,
+            torch.tensor([get_tensor_model_parallel_rank()], device=device),
+            persistent=False,
+        )
+        forward = module.forward
+
+        def split_forward(input_: Any, module=module, forward=forward) -> Any:
+            rank = getattr(module, _TP_RANK_BUFFER)
+            local = input_.unflatten(-1, (tp, -1)).index_select(-2, rank).squeeze(-2)
+            module.input_is_parallel = True
+            try:
+                return forward(local)
+            finally:
+                module.input_is_parallel = False
+
+        module.forward = split_forward
+        patched += 1
+    return patched
+
+
 def _backbone_module(model: nn.Module) -> nn.Module:
     """The module whose forward maps a step's tokens to hidden states.
 
@@ -849,6 +907,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             self._patched_rope_modules += rope_patch.patch_in_graph_rotary_embedding(
                 self._mtp_draft
             )
+        _patch_row_parallel_input_split(self._model)
         if not self._export_config.uses_mrope and any(
             getattr(m, "_in_graph_rope_dim_modalities", None) is not None
             or rope_patch.compute_mrope_dim_modalities(m) is not None
