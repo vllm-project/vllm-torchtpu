@@ -1001,6 +1001,9 @@ def _routed_experts(
     mid = experts.middle
     skip_combine = _skip("moe_combine")
     batch = k._config().prefill_moe_combine_batch
+    # Route weights scale the gate/up rows; the combine adds rows unweighted
+    # and reads the zero row ``zero`` of ``packed`` for padding routes.
+    preweight = k._config().prefill_moe_preweight
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
@@ -1015,6 +1018,7 @@ def _routed_experts(
     rows, width = (metadata_row_capacity or x.shape[0], rhs.shape[-1])
     assert rows <= x.shape[0]
     tm, tn, localrows = (tile, columns, tokens // 32)
+    zero = tm
     packed_half = 512 if tokens == 8192 else tn // 2
     assert width % tn == 0
     limit = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.98)
@@ -1182,7 +1186,11 @@ def _routed_experts(
                 dest, weight = route(i)
                 value = source.at[pl.ds(i - begin, 1)][...].astype(jnp.float32)
                 target = sums.at[pl.ds(dest, 1)]
-                if not skip_combine:
+                if skip_combine:
+                    return
+                if preweight:
+                    target[...] = target[...] + value
+                else:
                     target[...] = target[...] + value * weight
 
             full = (end - start) // loop_unroll
@@ -1220,9 +1228,17 @@ def _routed_experts(
             for row in range(gu_unroll):
                 offset = panel * gu_unroll + row
                 i = jnp.minimum(start + offset, end - 1)
-                dest, prob = route(i)
-                weight = jnp.where((g > 0) & (start + offset < end), prob, 0)
                 previous = packed.at[(g + 1) % 2]
+                valid = (g > 0) & (start + offset < end)
+                if preweight:
+                    source_row = jnp.where(valid, i - begin, zero)
+                    value = previous.at[pl.ds(source_row, 1)][...].astype(jnp.float32)
+                    target = sums.at[pl.ds(destinations[i], 1)]
+                    if not skip_combine:
+                        target[...] = target[...] + value
+                    continue
+                dest, prob = route(i)
+                weight = jnp.where(valid, prob, 0)
                 value = previous.at[pl.ds(i - begin, 1)][...].astype(jnp.float32)
                 target = sums.at[pl.ds(dest, 1)]
                 if not skip_combine:
@@ -1267,8 +1283,18 @@ def _routed_experts(
                             (moved_rows if first else 0) + panel * down_unroll + row
                         )
                         i = jnp.minimum(start + offset, end - 1)
+                        valid = (g > 0) & (start + offset < end)
+                        if preweight:
+                            source_row = jnp.where(valid, i - begin, zero)
+                            value = previous.at[pl.ds(source_row, 1)][...].astype(
+                                jnp.float32
+                            )
+                            target = sums.at[pl.ds(destinations[i], 1)]
+                            if not skip_combine:
+                                target[...] = target[...] + value
+                            continue
                         dest, prob = route(i)
-                        weight = jnp.where((g > 0) & (start + offset < end), prob, 0)
+                        weight = jnp.where(valid, prob, 0)
                         value = previous.at[pl.ds(i - begin, 1)][...].astype(
                             jnp.float32
                         )
@@ -1329,8 +1355,9 @@ def _routed_experts(
             gu_partial=pltpu.VMEM((sub, mid), gu_cfg.out_dtype),
             acts=pltpu.VMEM((2, tm, 2, 1792), latent.dtype),
             act_sems=pltpu.SemaphoreType.DMA((2,)),
+            row_weights=pltpu.VMEM((2, tm, 128), jnp.float32) if preweight else None,
         )
-        def first_column(gu_partial, acts, act_sems):
+        def first_column(gu_partial, acts, act_sems, row_weights):
             def buffering(spec):
                 return dataclasses.replace(
                     spec, pipeline_mode=pl.Buffered(buffer_count=2)
@@ -1356,6 +1383,10 @@ def _routed_experts(
                         acts.at[bank, pl.ds(i, 1)],
                         act_sems.at[bank],
                     ).start()
+                    if preweight:
+                        row_weights.at[bank, pl.ds(i, 1)][...] = jnp.full(
+                            (1, 128), probabilities[begin + i], jnp.float32
+                        )
 
             def joint(gw, dw, gy, metadata, gu_partial, acts, act_sems):
                 g = pl.program_id(1)
@@ -1369,6 +1400,10 @@ def _routed_experts(
                     probabilities_ready()
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
                     packed.at[1][...] = jnp.zeros(packed.at[1].shape, packed.dtype)
+                    if preweight:
+                        packed.at[0, pl.ds(zero, 16)][...] = jnp.zeros(
+                            (16, *packed.shape[2:]), packed.dtype
+                        )
 
                 @pl.when(active_ng > 0)
                 def gate_up():
@@ -1394,6 +1429,7 @@ def _routed_experts(
                             metadata,
                             cfgs=gu_cfg,
                             overlap_work=lambda panel: gu_work(g, panel),
+                            row_weights=row_weights.at[bank] if preweight else None,
                         )
 
                 inner(gy, dw, metadata, first=True)
@@ -1505,7 +1541,7 @@ def _routed_experts(
             gm_id_to_group_id=pltpu.SMEM((max_gm,), jnp.int32),
             gm_id_to_m_offset=pltpu.SMEM((max_gm + 1,), jnp.int32),
         ),
-        packed=pltpu.VMEM((2, tm, 2, packed_half), x.dtype),
+        packed=pltpu.VMEM((2, tm + 16 * preweight, 2, packed_half), x.dtype),
         sums=pltpu.VMEM((tokens, 2, packed_half), jnp.float32),
         cast=pltpu.VMEM((store_tile, tn), x.dtype),
         sends=pltpu.SemaphoreType.DMA((streams,)),
@@ -1613,7 +1649,7 @@ def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
     return jnp.concatenate(panels, axis=1)
 
 
-def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work):
+def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work, row_weights=None):
     """GU/SiTU with the production row buckets and adjacent-expert carry.
 
     Expert boundaries need not align with the 16-row BF16 sublane. Mask outside
@@ -1631,6 +1667,9 @@ def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work):
             lhs, rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=overlap_work
         )
         value = k.apply_act_fn(value, cfgs.fuse_act)
+        if row_weights is not None:
+            # Each row's route weight (a lane-broadcast column).
+            value = value * row_weights[:rows, :1]
         row = lax.broadcasted_iota(jnp.int32, value.shape, 0)
         value = jnp.where((first <= row) & (row < last), value, 0)
         output.reshape(-1, cfgs.tiles.tile_n)[:rows] = value.astype(output.dtype)

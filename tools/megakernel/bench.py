@@ -74,8 +74,15 @@ def add_arguments(parser, profile: bool = False) -> None:
     prefill.add_argument(
         "--chain-prefix",
         action="store_true",
-        help="compute each case's prefix first (8192-token steps of a separate "
-        "request on the same blocks), so the timed step reads real cached KV",
+        help="compute each case's prefix first (--chain-step token steps of a "
+        "separate request on the same blocks), so the timed step reads real KV",
+    )
+    prefill.add_argument("--chain-step", type=int, default=8192)
+    prefill.add_argument(
+        "--fixed-prompts",
+        action="store_true",
+        help="repeat k's prompts are the same token slices in every case (a "
+        "case's prompt is a prefix of a longer case's), for first-token checks",
     )
     prefill.add_argument(
         "--token-file",
@@ -271,7 +278,8 @@ def run_prefill(args, records: harness.Records) -> None:
         prefix = int(prefix) if prefix else 0
         if length * count > k3_program.MAX_STEP_TOKENS or count > k3_prefill.SLOTS:
             harness.fail(
-                f"prefill case {part}: N * LEN must fit one 8192-token step, "
+                f"prefill case {part}: N * LEN must fit one "
+                f"{k3_program.MAX_STEP_TOKENS}-token step, "
                 f"N <= {k3_prefill.SLOTS}"
             )
         if prefix % k3.PAGE:
@@ -351,24 +359,36 @@ def run_prefill(args, records: harness.Records) -> None:
                 prefiller.program.capacity,
             )
         )
-        times = []
+        times, first_tokens = [], []
         for repeat in range(args.repeats + 1):  # the first is a warm-up of this shape
-            prompts = [_prompt_tokens(rng, corpus, prefix + length) for r in range(count)]
-            if getattr(args, "chain_prefix", False) and prefix:
+            if args.fixed_prompts:
+                prompts = []
+                for r in range(count):
+                    fixed = np.random.default_rng(1000 + 16 * repeat + r)
+                    start = int(fixed.integers(0, corpus.size - 262144))
+                    prompts.append(corpus[start : start + prefix + length])
+            else:
+                prompts = [
+                    _prompt_tokens(rng, corpus, prefix + length) for _ in range(count)
+                ]
+            if args.chain_prefix and prefix:
                 # The prefix as its own prompt on the same blocks (untimed): its
                 # pages and final KDA state are what the timed step's hit reads.
                 for r in range(count):
-                    for start in range(0, prefix, k3_program.MAX_STEP_TOKENS):
-                        size = min(k3_program.MAX_STEP_TOKENS, prefix - start)
-                        bridge.materialize(prefiller.step(mk.StepInput([mk.RequestInput(
+                    for begin in range(0, prefix, args.chain_step):
+                        size = min(args.chain_step, prefix - begin)
+                        chained = mk.RequestInput(
                             req_id=f"{tag}-{repeat}-{r}-prefix",
-                            computed=start,
+                            computed=begin,
                             scheduled=size,
                             token_ids=prompts[r][:prefix],
                             num_tokens=prefix,
                             num_prompt_tokens=prefix,
                             block_tables=tables[r],
-                        )])).tokens)
+                        )
+                        bridge.materialize(
+                            prefiller.step(mk.StepInput([chained])).tokens
+                        )
             rows = [
                 mk.RequestInput(
                     req_id=f"{tag}-{repeat}-{r}",
@@ -386,13 +406,7 @@ def run_prefill(args, records: harness.Records) -> None:
                 stepped = prefiller.step(mk.StepInput(rows))
                 bridge.materialize(stepped.tokens)
                 elapsed = 1e3 * (time.perf_counter() - started)
-            if repeat == args.repeats and harness.rank() == 0:
-                # Correctness fingerprint: first tokens and a checksum of every KV pool.
-                sums = []
-                for tensor in pools.tensors:
-                    sums.append(float(tensor.float().abs().sum().cpu()))
-                harness.log(f"fingerprint {tag}: tokens {stepped.tokens.cpu().tolist()} "
-                            f"pools {' '.join(f'{x:.6e}' for x in sums)}")
+            first_tokens.append(stepped.tokens[:count, 0].cpu().tolist())
             if repeat:
                 times.append(elapsed)
         ms = statistics.median(times)
@@ -412,4 +426,5 @@ def run_prefill(args, records: harness.Records) -> None:
             ms=round(ms, 2),
             tokens_per_s=round(rate, 1),
             repeats=[round(t, 2) for t in times],
+            first_tokens=first_tokens,
         )

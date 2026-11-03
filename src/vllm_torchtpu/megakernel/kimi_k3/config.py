@@ -106,6 +106,9 @@ class KernelConfig:
     # Fused MoE token combine: rows per batch whose loads all precede their
     # stores (0: one row at a time).
     prefill_moe_combine_batch: int = 0
+    # Fused MoE: scale gate/up rows by their route weight so the token
+    # combine adds expert rows unweighted (same math up to BF16 rounding).
+    prefill_moe_preweight: bool = False
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.
