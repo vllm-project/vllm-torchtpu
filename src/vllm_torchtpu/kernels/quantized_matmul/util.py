@@ -35,6 +35,19 @@ def unfold_args(
 def quantize_tensor(
     x: jax.Array, dtype: jnp.dtype, dim: int = -1, block_size: int | None = None
 ):
+    if (
+        jax.default_backend() == "tpu"
+        and x.ndim == 2
+        and x.shape[0] == 288
+        and x.shape[1] in (1280, 2304, 5120, 6144)
+        and x.dtype in (jnp.bfloat16, jnp.float32)
+        and dtype == jnp.float8_e4m3fn
+        and dim in (-1, 1)
+        and block_size is None
+    ):
+        from vllm_torchtpu.kernels.experimental.decode_preparation import quantize_rows
+
+        return quantize_rows(x)
     if block_size is not None:
         # Flatten all leading dims into a single batch dim for block
         # quantization, then restore the original shape.
