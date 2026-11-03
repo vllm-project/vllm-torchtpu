@@ -23,7 +23,7 @@ from bench_cached_extend import (
     load_frozen_input,
     summarize_startup,
 )
-from server_step_worker import DECODE_SCENARIO
+from server_step_worker import SCENARIOS
 
 
 def source_identity(
@@ -112,25 +112,40 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--startup-timeout", type=float, default=3000)
-    parser.add_argument(
-        "--scenario", choices=["encoder_extend", "decode"], default="encoder_extend"
-    )
+    parser.add_argument("--scenario", choices=list(SCENARIOS), default="encoder_extend")
+    parser.add_argument("--host-rank", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--head-address")
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
+    multihost = args.scenario == "decode_dp16"
+    worker = multihost and args.host_rank == 1
+    if multihost != bool(args.head_address) or (args.host_rank and not multihost):
+        parser.error("decode_dp16 requires --head-address and two host ranks")
+    if multihost and args.profile:
+        parser.error("The CI multihost launcher runs formal measurements only")
+    scenario = SCENARIOS[args.scenario]
+    decode = scenario.name == "decode"
     if args.rounds is None:
-        args.rounds = 1 if args.scenario == "decode" else 5
+        args.rounds = 1 if decode else 5
     if args.rounds < 1:
         parser.error("The integrated launcher requires at least one formal window")
     if args.scenario == "encoder_extend":
         load_frozen_input(args.input)
 
+    shutdown_requested = False
+
     def terminate(signum, frame):
+        nonlocal shutdown_requested
+        if worker and signum == signal.SIGTERM:
+            shutdown_requested = True
+            return
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, terminate)
     args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=False)
+    (args.out / "launcher.pid").write_text(str(os.getpid()))
     try:
         response = requests.get("http://127.0.0.1:8000/health", timeout=2)
     except requests.RequestException:
@@ -159,26 +174,21 @@ def main() -> None:
         TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="disabled",
     )
     env["KV_BYTES"] = "auto"
-    decode = args.scenario == "decode"
     env["MOE_FUSED_EP_PREPROCESS_BACKEND"] = "topology" if decode else "native"
     # Steady target verification is exactly local_concurrency * (K + 1) rows;
     # padding it to 384 runs every layer on 25% padding rows.
-    verify_rows = DECODE_SCENARIO.local_concurrency * (
-        DECODE_SCENARIO.dspark_tokens + 1
-    )
+    verify_rows = scenario.local_concurrency * (scenario.dspark_tokens + 1)
     # Target and context-KV buckets; draft queries derive their own ladder
     # from request buckets and the draft block size.
-    buckets = [verify_rows, DECODE_SCENARIO.chunk_tokens] if decode else [128, 2048]
+    buckets = [verify_rows, scenario.chunk_tokens] if decode else [128, 2048]
     env.update(
         TP="1",
-        DP="8",
-        CHUNK=str(DECODE_SCENARIO.chunk_tokens) if decode else "2048",
-        MAX_SEQS=str(DECODE_SCENARIO.local_concurrency) if decode else "1",
+        DP=str(scenario.dp_size),
+        CHUNK=str(scenario.chunk_tokens),
+        MAX_SEQS=str(scenario.local_concurrency),
     )
     if decode:
-        env["MAX_MODEL_LEN"] = str(
-            DECODE_SCENARIO.prefix_tokens + DECODE_SCENARIO.output_tokens
-        )
+        env["MAX_MODEL_LEN"] = str(scenario.prefix_tokens + scenario.output_tokens)
     else:
         env.pop("MAX_MODEL_LEN", None)
     env["USE_PHASED_PROFILER"] = "0"
@@ -191,6 +201,52 @@ def main() -> None:
         "--compilation-config",
         json.dumps({"compile_sizes": buckets}),
     ]
+    if decode and not worker:
+        server_command += ["--enable-log-requests", "--max-log-len", "0"]
+    if multihost:
+        # Native MP owns bootstrap; do not inherit a single-host SliceBuilder.
+        for key in (
+            "MEGASCALE_COORDINATOR_ADDRESS",
+            "MEGASCALE_NUM_SLICES",
+            "MEGASCALE_PORT",
+            "MEGASCALE_SLICE_ID",
+            "TPU_PROCESS_ADDRESSES",
+            "TPU_PROCESS_PORT",
+            "TPU_WORKER_HOSTNAMES",
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        ):
+            env.pop(key, None)
+        head = socket.gethostbyname(args.head_address)
+        env.update(
+            TPU_MULTIHOST_BACKEND="mp",
+            TPU_SKIP_MDS_QUERY="1",
+            TORCH_TPU_DP_MASTER_ADDR=head,
+            TORCH_TPU_DP_MASTER_PORT="19700",
+            MASTER_ADDR=head,
+            MASTER_PORT="19700",
+            TORCH_TPU_BASE_PORT="19000",
+            HOST="127.0.0.1",
+            HEADLESS=str(int(worker)),
+            TPU_DEEPSEEK_V41_ENGRAM_HBM="first",
+            MOE_FUSED_EP_KERNEL_IMPL="push",
+            MOE_FUSED_EP_PUSH_SC_PREPUSH="2",
+            MOE_FUSED_EP_PUSH_TC_EXCHANGE="1",
+            TPU_RECLAIM_COMPILE_MEMORY="1",
+            LD_PRELOAD="",
+            ENGRAM_CONFIG='{"cpu_offload":true,"dp_shared_memory":false}',
+        )
+        server_command += [
+            "--data-parallel-size-local",
+            "8",
+            "--data-parallel-address",
+            head,
+            "--data-parallel-rpc-port",
+            "19500",
+        ]
+        # On the API host, even start-rank=0 selects hybrid LB and rejects
+        # headless remote engines. Only the headless worker needs the offset.
+        if worker:
+            server_command += ["--data-parallel-start-rank", "8"]
     if args.profile:
         server_command += [
             "--profiler-config",
@@ -214,6 +270,19 @@ def main() -> None:
         },
         "startup_scope": "server launch through HTTP health readiness",
     }
+    if multihost:
+        manifest.update(
+            host_rank=args.host_rank,
+            hostname=socket.gethostname(),
+            engram_hbm="first",
+            engram_dp_shared_memory=False,
+            moe_kernel=env["MOE_FUSED_EP_KERNEL_IMPL"],
+            moe_push_sc_prepush=int(env["MOE_FUSED_EP_PUSH_SC_PREPUSH"]),
+            moe_push_tc_exchange=env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1",
+            moe_preprocess=env["MOE_FUSED_EP_PREPROCESS_BACKEND"],
+            allocator="glibc",
+            reclaim_compile_memory=True,
+        )
     import vllm
 
     model = Path(env["MODEL_PATH"])
@@ -233,11 +302,16 @@ def main() -> None:
         "model_config_sha256": hashlib.sha256(
             (model / "config.json").read_bytes()
         ).hexdigest(),
-        "parallelism": "TP1/DP8/EP8/PP1 on one v7x-8 host",
+        "parallelism": (
+            "TP1/DP16/EP16/PP1 on two v7x hosts (8 physical chips)"
+            if multihost
+            else "TP1/DP8/EP8/PP1 on one v7x-8 host"
+        ),
     }
     manifest["identity"] = identity
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    bootstrap_ports(env, args.out)
+    if not multihost:
+        bootstrap_ports(env, args.out)
     server = None
     started = time.monotonic()
     timing = {
@@ -255,6 +329,15 @@ def main() -> None:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            if worker:
+                # The host launcher stops this process only after the head client
+                # finishes. An earlier serving exit is a failed benchmark.
+                while not shutdown_requested:
+                    if server.poll() is not None:
+                        raise RuntimeError(f"Worker server exited: {server.returncode}")
+                    time.sleep(2)
+                timing.update(completed=True, shutdown_requested=True)
+                return
             deadline = started + args.startup_timeout
             while True:
                 if server.poll() is not None:
@@ -295,7 +378,12 @@ def main() -> None:
                 str(args.input),
             ]
             if decode:
-                base += ["--server-log", str(args.out / "server.log")]
+                base += [
+                    "--scenario",
+                    args.scenario,
+                    "--server-log",
+                    str(args.out / "server.log"),
+                ]
             timing["formal_status"] = "failed"
             with (args.out / "client-fixed.log").open("w") as client_log:
                 subprocess.run(
@@ -339,6 +427,17 @@ def main() -> None:
                         check=True,
                     )
                 timing["profile_status"] = "passed"
+            if multihost:
+                # Keep the head alive until the host coordinator has stopped
+                # the worker. Killing the DP master first looks like a peer crash.
+                (args.out / "formal-complete").touch()
+                deadline = time.monotonic() + 240
+                while not (args.out / "shutdown-permitted").exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "Host coordinator did not finish worker shutdown"
+                        )
+                    time.sleep(2)
             timing["completed"] = True
     finally:
         stop(server)

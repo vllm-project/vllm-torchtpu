@@ -42,6 +42,31 @@ DECODE_SCENARIO = Scenario(
     "decode", 384, prefix_tokens=98304, output_tokens=512, chunk_tokens=2048
 )
 SCENARIOS = {s.name: s for s in (SCENARIO, DECODE_SCENARIO)}
+SCENARIOS["decode_dp16"] = Scenario(
+    "decode", 768, output_tokens=512, dp_size=16, physical_chips=8
+)
+
+
+def require_dp16_push() -> None:
+    """Check the push recipe in every worker before measuring decode."""
+    from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
+    from vllm_torchtpu.envs import (
+        MOE_FUSED_EP_KERNEL_IMPL,
+        MOE_FUSED_EP_PUSH_SC_PREPUSH,
+        MOE_FUSED_EP_PUSH_TC_EXCHANGE,
+    )
+
+    mesh = build_ep_mesh()
+    if mesh is None or mesh.size != 16:
+        raise ValueError("DP16 decode CI requires an EP16 mesh")
+    if (
+        MOE_FUSED_EP_KERNEL_IMPL,
+        MOE_FUSED_EP_PUSH_SC_PREPUSH,
+        MOE_FUSED_EP_PUSH_TC_EXCHANGE,
+    ) != ("push", 2, True):
+        raise ValueError(
+            "DP16 decode CI requires push with SC_PREPUSH=2, TC_EXCHANGE=1"
+        )
 
 
 def classify_rows(starts: list[int], ends: list[int], prompts: list[int]) -> str:
@@ -268,17 +293,15 @@ def _gather_dp(value: dict) -> list[dict]:
     from vllm.distributed import get_dp_group
 
     group = get_dp_group()
-    if group.world_size != 8:
-        raise ValueError("Expected eight node-local DP workers")
     gathered = [None] * group.world_size
     # vLLM's DP utility RPC executes on every engine but returns engine 0 only.
-    # Gather on the workers so that the returned payload contains all eight ranks.
+    # Gather on the workers so that the returned payload contains all DP ranks.
     torch.distributed.all_gather_object(gathered, value, group=group.cpu_group)
     return gathered
 
 
 class ServerStepWorker:
-    def synchronized_profile_arm(self, output_dir: str):
+    def synchronized_profile_arm(self, output_dir: str, scenario: str = "decode"):
         import torch.distributed as dist
         from vllm.distributed import get_dp_group
 
@@ -287,9 +310,9 @@ class ServerStepWorker:
         runner = self.model_runner
         group = get_dp_group()
         rank = self.vllm_config.parallel_config.data_parallel_rank
-        assert group.world_size == 8
         assert not hasattr(self, "_sync_capture")
-        scenario = DECODE_SCENARIO
+        scenario = SCENARIOS[scenario]
+        assert group.world_size == scenario.dp_size
         original = runner._dp_coordinated_step
         state = {
             "rank": rank,
@@ -302,7 +325,7 @@ class ServerStepWorker:
         }
         self._sync_capture = state
         root = Path(output_dir) / "synchronized-profile"
-        root.mkdir(exist_ok=True)
+        root.mkdir(parents=True, exist_ok=True)
 
         def boundary(*args, **kwargs):
             result = original(*args, **kwargs)
@@ -340,7 +363,7 @@ class ServerStepWorker:
                 )
                 return result
             if not state["active"]:
-                gathered = [None] * 8
+                gathered = [None] * group.world_size
                 dist.all_gather_object(
                     gathered,
                     {"rank": rank, "ready": ready, **row},
@@ -387,23 +410,25 @@ class ServerStepWorker:
             DeepseekV41EncoderStage,
         )
 
+        if scenario not in SCENARIOS:
+            raise ValueError(f"Unknown scenario: {scenario}")
+        selected = SCENARIOS[scenario]
+        if scenario == "decode_dp16":
+            require_dp16_push()
         config = self.vllm_config.parallel_config
         if (
             config.tensor_parallel_size,
             config.data_parallel_size,
             config.pipeline_parallel_size,
             config.enable_expert_parallel,
-        ) != (1, 8, 1, True):
-            raise ValueError("Benchmark requires TP1/DP8/EP8/PP1")
+        ) != (1, selected.dp_size, 1, True):
+            raise ValueError(f"Benchmark requires TP1/DP{selected.dp_size}/EP/PP1")
         spec = self.vllm_config.speculative_config
         if spec is None or spec.method != "dspark" or spec.num_speculative_tokens != 5:
             raise ValueError("Benchmark requires DSpark K=5")
         hf = self.vllm_config.model_config.hf_config
         if hf.num_hidden_layers != 40 or hf.sliding_window != 128:
             raise ValueError("Expected the 40-layer DSv4.1 model with SWA=128")
-        if scenario not in SCENARIOS:
-            raise ValueError(f"Unknown scenario: {scenario}")
-        selected = SCENARIOS[scenario]
         if self.vllm_config.scheduler_config.max_num_seqs != selected.local_concurrency:
             raise ValueError(
                 "max_num_seqs must equal the scenario's per-DP concurrency"
@@ -446,6 +471,7 @@ class ServerStepWorker:
         recorder.pending = None
         recorder.in_flight = 0
         recorder.enabled = True
+        recorder.audit_start_wall_ns = time.time_ns()
         _ACTIVE = recorder
         cache = self.model_runner.kv_cache_config
         if cache is None:
@@ -479,6 +505,10 @@ class ServerStepWorker:
             {
                 "rank": recorder.rank,
                 "hostname": socket.gethostname(),
+                "audit_wall_interval_ns": [
+                    recorder.audit_start_wall_ns,
+                    time.time_ns(),
+                ],
                 "steps": recorder.steps,
                 "stages": recorder.stages,
                 "scenario": recorder.scenario.to_dict(),

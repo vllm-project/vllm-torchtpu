@@ -101,6 +101,7 @@ steps:
         tests/scripts/test_dsv41_decode_worker_capture.py
         tests/scripts/test_dsv41_decode_accounting.py
         tests/scripts/test_dsv41_serve_recipe.py
+        tests/scripts/test_dsv41_multihost_ci.py
         -q --junitxml=/perf_eval_results/dsv41-benchmark-cpu.xml
     artifact_paths:
       - "perf_eval_results/**/*"
@@ -139,6 +140,9 @@ steps:
     steps:
       - label: "DeepSeek-V4.1-Flash: DP8 C384 DSpark + full GSM8K"
         key: "dsv41_flash_dp8_ep_gsm8k"
+        notify:
+          - github_check:
+              name: "DeepSeek-V4.1 DP8 GSM8K eval"
         timeout_in_minutes: 180
         agents:
           queue: "tpu_v7x_8_queue"
@@ -157,29 +161,41 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
-      - label: "DeepSeek-V4.1-Flash: DP8 C384 steady DSpark decode"
-        key: "dsv41_flash_dp8_c384_decode"
-        # Exercise halfplane Index-K in the TP1/DP8 benchmark path.
+      - label: "DeepSeek-V4.1 decode kernels: TPU parity"
+        key: "dsv41_decode_kernel_parity"
+        timeout_in_minutes: 30
+        agents:
+          queue: "tpu_v7x_8_queue"
+        commands:
+          - >-
+            bash .buildkite/scripts/run_in_docker.sh
+            bash .buildkite/scripts/run_dsv41_decode_kernel_checks.sh
+            /perf_eval_results/dsv41-decode-kernels
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
+      - label: "DeepSeek-V4.1-Flash: DP16 C768 steady DSpark decode (8 chips)"
+        key: "dsv41_flash_dp16_c768_decode"
+        depends_on: "dsv41_decode_kernel_parity"
+        # Two hosts, eight devices/four physical chips each, using push dispatch.
         notify:
           - github_check:
-              name: "DeepSeek-V4.1 DP8 Decode throughput"
+              name: "DeepSeek-V4.1 DP16 Decode throughput"
               output:
-                title: "DP8 C384 DSpark decode"
+                title: "DP16 C768 DSpark decode (8 chips, L1 Engram HBM)"
                 summary: "No valid throughput result has been published yet."
         timeout_in_minutes: 180
         agents:
-          queue: "tpu_v7x_8_queue"
+          queue: "tpu_v7x_16_queue"
         env:
           CONTAINER_SHM_SIZE: "256g"
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
           - >-
-            bash .buildkite/scripts/run_in_docker.sh
-            bash .buildkite/scripts/run_dsv41_dp8_benchmark.sh
-            decode
+            bash .buildkite/scripts/run_multihost.sh --backend mp --dsv41-decode
             gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
-            /perf_eval_results/deepseek-v41-flash-dp8-96k-c384-decode
+            /perf_eval_results/deepseek-v41-flash-dp16-96k-c768-decode
         artifact_paths:
           - "perf_eval_results/**/*"
 
@@ -202,7 +218,7 @@ steps:
         commands:
           - >-
             bash .buildkite/scripts/run_in_docker.sh
-            bash .buildkite/scripts/run_dsv41_dp8_benchmark.sh
+            bash .buildkite/scripts/run_dsv41_benchmark.sh
             encoder_extend
             gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
             /perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend

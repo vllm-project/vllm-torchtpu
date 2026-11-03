@@ -3,8 +3,11 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
+from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +45,127 @@ def test_decode_prefix_hit_rejects_invalid_alignment():
 
     with pytest.raises(ValueError, match="alignment must be positive"):
         expected_prefix_hit(98304, 0, 0)
+
+
+def test_decode_admission_waits_for_all_current_requests(tmp_path, monkeypatch):
+    import bench_decode as client
+
+    scenario = replace(
+        client.SCENARIOS["decode_dp16"],
+        prefix_tokens=16,
+        dp_size=2,
+        concurrency=4,
+    )
+    monkeypatch.setitem(client.SCENARIOS, "decode_dp16", scenario)
+    inputs = tmp_path / "inputs.json"
+    inputs.write_text(
+        json.dumps(
+            {
+                "prompts": [[i] * 17 for i in range(4)],
+                "prime_suffix": [[99, 100]] * 4,
+                "manifest": {},
+            }
+        )
+    )
+    log = tmp_path / "server.log"
+    log.write_text("Added request cmpl-old-0-01234567.\n" * 4)
+    arrived, resume = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    requests = []
+    acknowledged = set()
+    polls = 0
+
+    def response(value):
+        return SimpleNamespace(
+            content=b"json", json=lambda: value, raise_for_status=lambda: None
+        )
+
+    def post(url, json, **kwargs):
+        if url.endswith("/v1/completions"):
+            with lock:
+                requests.append((json, kwargs["headers"]))
+                if len(requests) == 4:
+                    arrived.set()
+            assert resume.wait(5)
+            return response({"usage": {"prompt_tokens": 16, "completion_tokens": 512}})
+        if url.endswith("/resume"):
+            # HTTP threads starting is not enough: all post-send log records
+            # must have been observed before any request is allowed to execute.
+            assert len(acknowledged) == 4
+            resume.set()
+        return response({})
+
+    def sleep(_):
+        nonlocal polls
+        assert arrived.wait(5)
+        polls += 1
+        with log.open("a") as stream:
+            for payload, _ in requests[: 2 if polls == 1 else 4]:
+                request_id = payload["request_id"]
+                acknowledged.add(request_id)
+                # Duplicate acknowledgements must not satisfy missing IDs.
+                stream.write(f"Added request cmpl-{request_id}-0-01234567.\n" * 2)
+
+    monkeypatch.setattr(client.requests, "post", post)
+    monkeypatch.setattr(client.time, "sleep", sleep)
+    client.client_main(
+        [
+            "--scenario",
+            "decode_dp16",
+            "--input",
+            str(inputs),
+            "--out",
+            str(tmp_path / "profile"),
+            "--server-log",
+            str(log),
+            "--profile-only",
+        ]
+    )
+    assert polls == 2
+    assert len({payload["request_id"] for payload, _ in requests}) == 4
+    assert sorted(headers["X-data-parallel-rank"] for _, headers in requests) == [
+        "0",
+        "0",
+        "1",
+        "1",
+    ]
+
+
+def test_decode_admission_timeout_rejects_old_and_incomplete_logs(tmp_path):
+    from bench_decode import wait_for_admission
+
+    log = tmp_path / "server.log"
+    log.write_text("Added request cmpl-wave-1-0-01234567.\n")
+    offset = log.stat().st_size
+    with log.open("a") as stream:
+        stream.write("Received request cmpl-wave-1-0: params: ...\n")
+        stream.write("Added request cmpl-wave-0-0-01234567.\n" * 2)
+        stream.write("Added request cmpl-wave-1-0-01234567.")
+    with pytest.raises(TimeoutError, match="1/2 requests missing"):
+        wait_for_admission(
+            log, offset, {"cmpl-wave-0-0", "cmpl-wave-1-0"}, [], timeout=0
+        )
+    with log.open("a") as stream:
+        stream.write("\n")
+    wait_for_admission(log, offset, {"cmpl-wave-0-0", "cmpl-wave-1-0"}, [])
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_decode_admission_rejects_early_completion(tmp_path, failed):
+    from bench_decode import wait_for_admission
+
+    log = tmp_path / "server.log"
+    log.touch()
+    future = Future()
+    if failed:
+        future.set_exception(ValueError("request failed"))
+    else:
+        future.set_result({})
+    with pytest.raises(
+        ValueError if failed else RuntimeError,
+        match="request failed" if failed else "scheduler was paused",
+    ):
+        wait_for_admission(log, 0, {"cmpl-wave-0-0"}, [future])
 
 
 @pytest.mark.parametrize(
@@ -82,6 +206,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
             "results",
             "--startup-timeout",
             "7200",
+            *(["--head-address", "127.0.0.1"] if scenario == "decode_dp16" else []),
             *(["--profile"] if profile != "disabled" else []),
         ],
     )
@@ -98,6 +223,11 @@ def test_ci_launch_and_optional_profile_share_one_server(
     )
     for key in inherited_roots:
         monkeypatch.setenv(key, str(tmp_path / "persistent-cache"))
+    if scenario == "decode_dp16":
+        monkeypatch.setenv("HOST", "0.0.0.0")
+        monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
+        monkeypatch.setenv("MOE_FUSED_EP_PUSH_SC_PREPUSH", "1")
+        monkeypatch.setenv("MOE_FUSED_EP_PUSH_TC_EXCHANGE", "0")
     compiler_roots = []
     starts, clients, stopped, audits = [], [], [], []
     server = SimpleNamespace(poll=lambda: None)
@@ -107,7 +237,31 @@ def test_ci_launch_and_optional_profile_share_one_server(
         compiler_roots.append(Path(env["VLLM_CACHE_ROOT"]))
         assert compiler_roots[-1].is_dir()
         assert env["USE_PHASED_PROFILER"] == "0"
-        assert env["TP"] == "1" and env["DP"] == "8"
+        assert env["TP"] == "1"
+        assert env["DP"] == ("16" if scenario == "decode_dp16" else "8")
+        if scenario in ("decode", "decode_dp16"):
+            assert "--enable-log-requests" in command
+            assert command[command.index("--max-log-len") + 1] == "0"
+        if scenario == "decode_dp16":
+            assert env["HEADLESS"] == "0"
+            assert env["HOST"] == "127.0.0.1"
+            assert env["TPU_DEEPSEEK_V41_ENGRAM_HBM"] == "first"
+            assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
+            assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
+            assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"
+            assert env["MOE_FUSED_EP_PREPROCESS_BACKEND"] == "topology"
+            assert env["MAX_SEQS"] == "48"
+            assert env["MAX_MODEL_LEN"] == "98816"
+            assert env["LD_PRELOAD"] == ""
+            assert env["TPU_RECLAIM_COMPILE_MEMORY"] == "1"
+            assert json.loads(env["ENGRAM_CONFIG"]) == {
+                "cpu_offload": True,
+                "dp_shared_memory": False,
+            }
+            assert command[command.index("--data-parallel-size-local") + 1] == "8"
+            # An explicit start rank would make vLLM infer hybrid LB, which
+            # rejects the headless worker used by this single-API deployment.
+            assert "--data-parallel-start-rank" not in command
         assert env["CHUNK"] == "2048"
         assert env["VLLM_DISABLE_COMPILE_CACHE"] == "1"
         assert env["JAX_ENABLE_COMPILATION_CACHE"] == "false"
@@ -123,6 +277,9 @@ def test_ci_launch_and_optional_profile_share_one_server(
             return
         out = Path(command[command.index("--out") + 1])
         out.mkdir()
+        if scenario == "decode_dp16":
+            assert command[command.index("--scenario") + 1] == "decode_dp16"
+            (out.parent / "shutdown-permitted").touch()
         for i in range(1, rounds + 1):
             (out / f"round-{i}-summary.json").write_text(
                 json.dumps({"audit_wall_interval_ns": [2 * i, 2 * i + 1]})
@@ -144,6 +301,10 @@ def test_ci_launch_and_optional_profile_share_one_server(
     assert all(not root.exists() for root in compiler_roots)
     manifest = json.loads((tmp_path / "results/manifest.json").read_text())
     assert manifest["cache_mode"] == "disabled"
+    if scenario == "decode_dp16":
+        assert manifest["moe_kernel"] == "push"
+        assert manifest["moe_push_sc_prepush"] == 2
+        assert manifest["moe_push_tc_exchange"] is True
     assert manifest["serialization"] == "enabled"
     assert manifest["engram_transfer"] == "raw_dma"
     assert manifest["identity"]["engram_transfer"] == "raw_dma"
@@ -165,6 +326,80 @@ def test_ci_launch_and_optional_profile_share_one_server(
     assert status["formal_status"] == "passed"
     assert status["profile_status"] == profile
     assert status["completed"] == (profile != "failed")
+
+
+def test_dp16_ci_launch_keeps_local_shapes_and_selects_hbm(tmp_path, monkeypatch):
+    test_ci_launch_and_optional_profile_share_one_server(
+        tmp_path,
+        monkeypatch,
+        "decode_dp16",
+        1,
+        [288, 2048],
+        "disabled",
+        "gs://test-bucket/checkpoint",
+    )
+
+
+@pytest.mark.parametrize("early_exit", [False, True])
+def test_dp16_worker_waits_for_shutdown_and_never_runs_client(
+    tmp_path, monkeypatch, early_exit
+):
+    monkeypatch.setenv("MODEL_PATH", str(tmp_path))
+    (tmp_path / "config.json").write_text("{}")
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(__file__=__file__))
+    monkeypatch.setattr(launcher, "source_identity", lambda *a, **kw: {})
+    monkeypatch.setattr(launcher.importlib.metadata, "version", lambda _: "1")
+    monkeypatch.setattr(
+        launcher.requests, "get", lambda *a, **kw: SimpleNamespace(ok=False)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run.py",
+            "--scenario",
+            "decode_dp16",
+            "--input",
+            "unused.json",
+            "--out",
+            str(tmp_path / "worker"),
+            "--host-rank",
+            "1",
+            "--head-address",
+            "127.0.0.1",
+        ],
+    )
+    handlers, commands, stopped = {}, [], []
+    monkeypatch.setattr(launcher.signal, "signal", lambda s, f: handlers.update({s: f}))
+    monkeypatch.setattr(
+        launcher.time, "sleep", lambda _: handlers[signal.SIGTERM](signal.SIGTERM, None)
+    )
+    server = SimpleNamespace(poll=lambda: 17 if early_exit else None, returncode=17)
+
+    def start(command, *, env, **kwargs):
+        commands.append(command)
+        assert env["HEADLESS"] == "1" and env["DP"] == "16"
+        assert env["HOST"] == "127.0.0.1"
+        assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
+        assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
+        assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"
+        assert command[command.index("--data-parallel-start-rank") + 1] == "8"
+        return server
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", start)
+    monkeypatch.setattr(
+        launcher.subprocess, "run", lambda *a, **kw: pytest.fail("worker ran client")
+    )
+    monkeypatch.setattr(launcher, "stop", stopped.append)
+    if early_exit:
+        with pytest.raises(RuntimeError, match="Worker server exited"):
+            launcher.main()
+    else:
+        launcher.main()
+    timing = json.loads((tmp_path / "worker/startup.json").read_text())
+    assert timing["completed"] == (not early_exit)
+    assert timing["formal_status"] == "pending"
+    assert len(commands) == 1 and stopped == [server]
 
 
 @pytest.mark.parametrize("profile_only,waves", [(False, 6), (True, 1)])

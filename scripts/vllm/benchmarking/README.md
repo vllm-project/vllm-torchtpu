@@ -140,17 +140,18 @@ entry of that config, writing `<results-dir>/decode/sweep.md`:
   --config <model-config> --results-dir <DIR>
 ```
 
-### DP8 cached-extend and steady DSpark decode CI
+### DP8 cached-extend and DP16 steady DSpark decode CI
 
 The `epic/dsv41` lane runs the audited recipes from
-[`server_steps`](../../dsv41_bench/server_steps/README.md), using TP1/DP8/EP8,
+[`server_steps`](../../dsv41_bench/server_steps/README.md), using TP1, EP,
 FP8 KV, CED, Engram CPU offload and DSpark K5:
 
-- Cached extend: C8, 98,304 cached prefix tokens plus 16,384 new input tokens,
-  2,048-token chunks, one output token and five formal rounds. The only compile
-  bucket is `[2048]`. The model-default serving context limit and automatic KV
+- Cached extend: DP8, C8, 98,304 cached prefix tokens plus 16,384 new input tokens,
+  2,048-token chunks, one output token and five formal rounds. Compile
+  buckets are `[128,2048]`. The model-default serving context limit and automatic KV
   sizing are retained.
-- Steady decode: C384 (48 requests per DP), 98,304 input tokens and 512 output
+- Steady decode: DP16 on eight physical chips, C768 (48 requests per DP),
+  L1 Engram HBM, 98,304 input tokens and 512 output
   tokens, 2,048-token chunks, one warmup and one formal window. The serving
   context limit is 98,816; compile buckets are `[288,2048]`.
 
@@ -163,7 +164,7 @@ removed. The ordinary
 C4/C8/C16 decode and smoke/GSM8K steps remain separate. Related: #1794, #1890
 and #1912; #1891 improves priming for the superseded TP8/DP1 C64 recipe.
 
-`run_dsv41_dp8_benchmark.sh` mounts checkpoint metadata read-only through
+`run_dsv41_benchmark.sh` mounts checkpoint metadata read-only through
 GCSFuse and prepares scenario-specific LongBench-v2 inputs with the existing
 dataset SHA check. The target and DSpark models stream weights directly from
 the GCS URI; tokenization uses the mount. The wrapper uses the shared CI image's
@@ -175,7 +176,7 @@ Buildkite publishes inputs, package versions, startup records, server/client
 logs and `benchmark/fixed/round-*-summary.json` under:
 
 - `perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend/`
-- `perf_eval_results/deepseek-v41-flash-dp8-96k-c384-decode/`
+- `perf_eval_results/deepseek-v41-flash-dp16-96k-c768-decode/`
 
 Each job also publishes a native GitHub Check with global and per-chip
 throughput, the median across formal rounds, benchmark duration and commit.

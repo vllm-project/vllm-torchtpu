@@ -45,7 +45,7 @@ def prepare_main(argv: list[str]) -> None:
     parser.add_argument("--scenario", choices=list(SCENARIOS), default="encoder_extend")
     args = parser.parse_args(argv)
     scenario = SCENARIOS[args.scenario]
-    count = scenario.concurrency if args.scenario == "decode" else 128
+    count = scenario.concurrency if scenario.name == "decode" else 128
     prefix = scenario.prefix_tokens
     row_tokens = max(prefix + scenario.extend_tokens, prefix + 1)
     from transformers import AutoTokenizer
@@ -62,7 +62,7 @@ def prepare_main(argv: list[str]) -> None:
         raise ValueError("Need two distinct single-token prime suffixes")
     documents = sorted(json.loads(args.dataset.read_text()), key=lambda d: d["_id"])
     rows, sources, suffixes, hashes = [], [], [], set()
-    windows_per_document = count if args.scenario == "decode" else 16
+    windows_per_document = count if scenario.name == "decode" else 16
     for doc in documents:
         if doc.get("domain") != "Code Repository Understanding":
             continue

@@ -269,3 +269,40 @@ class AccountingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def multihost_records(offset_ns=0):
+    import copy
+
+    data = records() + copy.deepcopy(records())
+    for index, rank in enumerate(data):
+        rank["rank"] = index
+        rank["hostname"] = f"host-{index // 8}"
+        rank["scenario"] = SCENARIOS["decode_dp16"].to_dict()
+        if index >= 8:
+            for step in rank["steps"]:
+                step["start_ns"] += offset_ns
+                step["observed_ns"] += offset_ns
+    return data
+
+
+def test_dp16_cadence_is_independent_of_host_clock_origin():
+    baseline = summarize(multihost_records(), "decode_dp16")
+    shifted = summarize(multihost_records(10**15), "decode_dp16")
+    assert baseline["decode_throughput"] == shifted["decode_throughput"]
+    assert shifted["categories"]["decode"]["median_step_ms"] == pytest.approx(200)
+    assert shifted["decode_throughput"]["global_tokens_s"] == pytest.approx(
+        768 * 3.47 / 0.2
+    )
+    assert (
+        shifted["categories"]["decode"]["global_tokens_s"]
+        == baseline["categories"]["decode"]["global_tokens_s"]
+    )
+
+
+def test_dp16_partial_rank_does_not_qualify():
+    data = multihost_records(10**15)
+    for step in data[15]["steps"]:
+        step["stages"][0]["requests"] = 47
+    with pytest.raises(ValueError, match="full-DP"):
+        summarize(data, "decode_dp16")

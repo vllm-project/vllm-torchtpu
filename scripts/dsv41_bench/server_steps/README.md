@@ -1,4 +1,4 @@
-# DP8 cached-extend and startup benchmark
+# DSV4.1 cached-extend, decode and startup benchmarks
 
 The greedy target head defaults to `TPU_GREEDY_HEAD_BACKEND=auto` for both
 benchmark and profile runs. On TPU v7, DSV4.1 TP1/PP1 DSpark decode with
@@ -43,7 +43,7 @@ padding rows from earlier chunks. Speculative warmup covers the bucket grid
 and mixed prefill/verify steps.
 
 The shared serving launcher sets `--xla_tpu_dvfs_p_state=7` in
-`LIBTPU_INIT_ARGS`. Both DP8 Buildkite benchmarks run on every build of the
+`LIBTPU_INIT_ARGS`. The DP8 prefill and DP16 decode benchmarks run on every build of the
 `epic/dsv41` lane, including PR builds admitted by the `ready` label check.
 
 The harness has three scripts:
@@ -131,7 +131,7 @@ prefill wave; the server must have been started with a profiler configuration.
 
 ### CI coverage
 
-The DP8 cases in `.buildkite/pipeline_dsv41.yml` each start one server with
+The cases in `.buildkite/pipeline_dsv41.yml` each start one serving session with
 persistent compilation caches disabled and no profile: prefill runs one warmup
 plus five formal rounds; decode runs one warmup plus one formal round.
 They already avoid a second server start,
@@ -145,13 +145,13 @@ lengths; the concurrency setting does not imply a continuously full decode batch
 `run_eval_flow.sh --lm-eval-limit none` selects the full split; numeric limits
 remain available for smoke runs. TP8 serving recipes have been removed.
 
-The same lane runs these CPU regressions on PRs as well as branch builds; the
-expensive DP8 benchmarks remain branch-only:
+The same lane runs these CPU regressions on PRs as well as branch builds:
 
 ```bash
 python -m pytest --confcutdir=tests/scripts \
   tests/scripts/test_dsv41_server_session.py \
   tests/scripts/test_dsv41_decode_worker_capture.py \
+  tests/scripts/test_dsv41_multihost_ci.py \
   tests/scripts/test_dsv41_decode_accounting.py -q
 ```
 
@@ -280,7 +280,52 @@ benchmark's single output token does not establish model accuracy. Long-context
 TPU fallback accuracy, TP>1, steady decode and mixed workloads remain unqualified;
 no performance or accuracy claim is made for those modes.
 
-## Steady decode (C384)
+## Default decode CI: DP16, C768, eight physical chips
+
+The default decode job uses `tpu_v7x_16_queue`: two v7x hosts, each with four
+physical chips/eight logical devices (2x2x2 chip topology). TP1/DP16/EP16/PP1
+keeps 48 requests per DP rank and raises global concurrency from 384 to 768.
+Each request uses a 98304-token cached prefix and 512 output tokens, with
+DSpark K5. Local target/draft shapes remain 288/240 rows and the target
+compile buckets remain `[288,2048]`. KV sizing is automatic at memory
+utilization 0.85, with FP8 KV/indexer, block size 64 and max model length 98816.
+
+Both hosts use `TPU_DEEPSEEK_V41_ENGRAM_HBM=first`, Engram `cpu_offload=true`
+and `dp_shared_memory=false`, `MOE_FUSED_EP_KERNEL_IMPL=push`,
+`MOE_FUSED_EP_PUSH_SC_PREPUSH=2`, and `MOE_FUSED_EP_PUSH_TC_EXCHANGE=1`.
+This uses the push-dispatch implementation from #2519. The recipe retains
+`MOE_FUSED_EP_PREPROCESS_BACKEND=topology` so the serve script enables
+`--xla_mosaic_unsafe_allow_multicore_remote_dma=true`; push does not consume
+the topology preprocessing object or require #2646's split all-gather support.
+Runtime/wheel pins are unchanged; #2523 is not required.
+The worker audit requires an EP16 mesh and the push parameters above, and the
+host manifests record the same parameters for artifact validation.
+Each container gets 256 GiB of `/dev/shm`. This decode job clears the CI image's
+tcmalloc preload and enables `TPU_RECLAIM_COMPILE_MEMORY=1` with glibc.
+GSM8K and cached-extend retain their DP8 recipes and allocator settings.
+
+`run_multihost.sh --backend mp --dsv41-decode` starts both containers and
+waits for image/model/input preparation before releasing MP rendezvous. After
+one warmup and one formal round, it stops the worker before the DP master and
+collects both hosts' logs. Worker exits, failed SSH sessions, missing logs or
+compiler events during either host's formal window fail the job. The existing
+single-host decode kernel checks run in a separate prerequisite on the
+8-device queue.
+
+The audit requires all 16 ranks and verifies both hosts' source/runtime/model
+identities. Cadence is calculated within each host's monotonic clock, taking
+the maximum host interval at matching forward IDs. Never subtract timestamps
+from different hosts. Actual accepted-token throughput uses the sum of host
+token counts divided by the maximum host window; this is a host-observed
+estimate. The primary fixed-3.47 estimate remains separate from those counters.
+Per-chip throughput divides by eight. No fixed performance threshold is added.
+
+The CI check publishes only after `audit_multihost.py` writes a successful
+`benchmark/multihost-audit.json`. Artifacts include the head's `benchmark/`,
+the peer's `worker/benchmark/`, raw rank records and per-host startup logs.
+The multihost CI launcher does not collect profiles.
+
+## Single-host steady decode (C384)
 
 `bench_decode.py` measures steady decode on the same single-host TP1/DP8/EP8
 configuration, with DSpark K5, 40 layers and SWA128. Prepare a dedicated input file with
@@ -330,6 +375,7 @@ export PYTHONPATH="$PWD/scripts/dsv41_bench/server_steps${PYTHONPATH:+:$PYTHONPA
 TP=1 DP=8 CHUNK=2048 MAX_SEQS=48 MAX_MODEL_LEN=98816 KV_BYTES=auto \
   bash scripts/dsv41_bench/serve_cached_prefill.sh \
   --worker-extension-cls server_step_worker.ServerStepWorker \
+  --enable-log-requests --max-log-len 0 \
   --compilation-config '{"compile_sizes":[288,2048]}' \
   2>&1 | tee /results/decode-server.log
 ```
@@ -350,6 +396,15 @@ incomplete responses, missing ranks, unexpected prefix hits, preemption and
 logged compilation in formal windows. Compilation
 log checks cannot detect silent runtime compilation; device attribution requires
 a separate profile. Run on an otherwise idle server.
+
+For each decode wave, the client pauses scheduling and waits for the pinned
+vLLM API server's `Added request` log entry for every unique request ID before
+resuming. These entries are written after dispatch to the selected engine;
+the initial five-second settling delay alone does not prove admission of all
+long token-ID requests. Missing entries fail after 120 seconds, and old or
+duplicate entries cannot satisfy the barrier. `run.py` enables request logging
+with prompt logging capped at zero; manual servers need the flags shown above.
+The full-DP shape and consecutive-window checks still apply after admission.
 
 The recorder observes native output consumption without additional device waits.
 The summary retains only consecutive full-C decode observations: 48 requests,

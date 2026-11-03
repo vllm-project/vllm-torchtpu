@@ -45,13 +45,16 @@ def test_decode_captures_scheduled_drafts_and_native_prepare_shapes():
     assert len(recorder.stages) == 1
 
 
-def test_synchronized_profile_writes_to_requested_directory(tmp_path, monkeypatch):
+@pytest.mark.parametrize("dp_size", [8, 16])
+def test_synchronized_profile_writes_to_requested_directory(
+    tmp_path, monkeypatch, dp_size
+):
     rank = 0
     calls, barriers, syncs = [], [], []
-    group = SimpleNamespace(world_size=8, cpu_group="cpu")
+    group = SimpleNamespace(world_size=dp_size, cpu_group="cpu")
 
     def gather(target, value, group):
-        target[:] = [{**value, "rank": i} for i in range(8)]
+        target[:] = [{**value, "rank": i} for i in range(dp_size)]
 
     dist = SimpleNamespace(
         all_gather_object=gather, barrier=lambda **kw: barriers.append(kw)
@@ -80,12 +83,57 @@ def test_synchronized_profile_writes_to_requested_directory(tmp_path, monkeypatc
         parallel_config=SimpleNamespace(data_parallel_rank=rank)
     )
     worker.profile = lambda **kw: calls.append(kw)
-    worker.synchronized_profile_arm(output_dir=str(tmp_path))
+    worker.synchronized_profile_arm(
+        output_dir=str(tmp_path), scenario="decode" if dp_size == 8 else "decode_dp16"
+    )
     for _ in range(7):
         assert runner._dp_coordinated_step(288) == "native"
     assert runner._dp_coordinated_step is original
     assert len(calls) == 2
     assert len(barriers) == 4 and len(syncs) == 2
     capture = worker.synchronized_profile_check()
+    assert len(capture) == dp_size
     assert all(r["completed"] and r["captured_steps"] == 6 for r in capture)
     assert (tmp_path / "synchronized-profile" / f"rank-{rank}-capture.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "mesh_size,impl,prepush,exchange,error",
+    [
+        (16, "push", 2, True, None),
+        (None, "push", 2, True, "EP16 mesh"),
+        (8, "push", 2, True, "EP16 mesh"),
+        (16, "v2", 2, True, "requires push"),
+        (16, "push", 1, True, "SC_PREPUSH=2"),
+        (16, "push", 2, False, "TC_EXCHANGE=1"),
+    ],
+)
+def test_dp16_ci_requires_push_without_split_topology(
+    monkeypatch, mesh_size, impl, prepush, exchange, error
+):
+    from server_step_worker import require_dp16_push
+
+    mesh = None if mesh_size is None else SimpleNamespace(size=mesh_size)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_torchtpu.distributed.ep_mesh",
+        SimpleNamespace(build_ep_mesh=lambda: mesh),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_torchtpu.envs",
+        SimpleNamespace(
+            MOE_FUSED_EP_KERNEL_IMPL=impl,
+            MOE_FUSED_EP_PUSH_SC_PREPUSH=prepush,
+            MOE_FUSED_EP_PUSH_TC_EXCHANGE=exchange,
+        ),
+    )
+    # Push works without #2646: no topology preprocessing is required.
+    monkeypatch.setitem(
+        sys.modules, "vllm_torchtpu.compilation.moe_preprocessing", None
+    )
+    if error is None:
+        require_dp16_push()
+    else:
+        with pytest.raises(ValueError, match=error):
+            require_dp16_push()
