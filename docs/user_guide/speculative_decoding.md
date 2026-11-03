@@ -83,13 +83,14 @@ vllm serve Qwen/Qwen3-4B \
 
 ## 4. DSpark Speculative Decoding
 
-DSpark drafts a block in one parallel forward and then corrects each slot with a lightweight Markov head conditioned on the previously drafted token. `DeepSeek-V4` checkpoints that ship a DSpark draft carry it under `mtp.*`, so no separate model is needed:
+DSpark drafts a block in one parallel forward and then corrects each slot with a lightweight Markov head conditioned on the previously drafted token. `DeepSeek-V4` checkpoints that ship a DSpark draft carry it under `mtp.*`, so no separate model is needed. Start from the `DeepSeek-V4-Pro` `v7x-16` recipe in the [TPU v7x serving recipes](../deployment/v7x_recipes.md), with its environment variables, and add the speculative config:
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-V4-Pro-DSpark \
-  --quantization deepseek_v4_fp8 \
-  --data-parallel-size 16 --enable-expert-parallel \
-  --async-scheduling \
+  --quantization deepseek_v4_fp8 --kv-cache-dtype fp8_e4m3 \
+  --tensor-parallel-size 1 --data-parallel-size 16 --enable-expert-parallel \
+  --max-model-len 9216 --max-num-batched-tokens 1024 \
+  --no-enable-prefix-caching --async-scheduling \
   --speculative-config '{
     "method": "dspark",
     "num_speculative_tokens": 5

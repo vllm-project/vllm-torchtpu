@@ -2928,11 +2928,12 @@ class TPUModelRunner(GPUModelRunner):
         )
         if not trimmed.any():
             return None
-        counts = np.zeros(padded_num_reqs, dtype=np.int32)
-        counts[:num_reqs] = trimmed
         if md is not None:
-            counts[:num_reqs] += md.draft_lengths_cpu
-        return torch.from_numpy(counts).to(self.device, non_blocking=True)
+            trimmed += md.draft_lengths_cpu
+        counts = zeros_h2d_source(self, padded_num_reqs)
+        counts[:num_reqs] = torch.from_numpy(trimmed)
+        # The copy is asynchronous, so the staging fence keeps its CPU source.
+        return stage_h2d_upload(self, counts)
 
     def _record_draft_confidences(self) -> None:
         """Hand this step's proposal confidences to adaptive verification."""
@@ -2957,6 +2958,40 @@ class TPUModelRunner(GPUModelRunner):
         manager.record_confidences(
             req_ids, chunks, [num_reqs for _, num_reqs in confidences.spans]
         )
+
+    def _readmit_trimmed_drafts(
+        self,
+        scheduler_output: "SchedulerOutput",
+        local_num_chunks: int,
+        target_num_chunks: int,
+    ) -> "tuple[SchedulerOutput, int, int] | None":
+        """Under DP lockstep, carry this rank's trimmed drafts in the padding
+        of the DP-wide bucket (`AdaptiveVerificationManager.expand`).
+
+        Returns the expanded scheduler output, with the input batch's spec
+        tokens and segment order updated to it, and its
+        `(num_decode, num_windowed)` split; None when nothing changes."""
+        manager = self._adaptive_verification
+        if (
+            manager is None
+            or self._dp_target_bucket is None
+            or not local_num_chunks == target_num_chunks == 1
+        ):
+            return None
+        expanded = manager.expand(
+            self._dp_target_bucket - scheduler_output.total_num_scheduled_tokens
+        )
+        if expanded is None:
+            return None
+        scheduler_output, changed_req_ids = expanded
+        for req_id in changed_req_ids:
+            self.input_batch.update_req_spec_token_ids(
+                self.requests[req_id], scheduler_output.scheduled_spec_decode_tokens
+            )
+        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
+            scheduler_output
+        )
+        return scheduler_output, num_decode_reqs, num_windowed_reqs
 
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
         """Async-spec substitution assembler.
@@ -4016,24 +4051,11 @@ class TPUModelRunner(GPUModelRunner):
             local_any_decode=self._any_decode(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
-        if (
-            self._adaptive_verification is not None
-            and self._dp_target_bucket is not None
-            and local_num_chunks == target_num_chunks == 1
-        ):
-            expanded = self._adaptive_verification.expand(
-                self._dp_target_bucket - scheduler_output.total_num_scheduled_tokens
-            )
-            if expanded is not None:
-                scheduler_output, changed_req_ids = expanded
-                for req_id in changed_req_ids:
-                    self.input_batch.update_req_spec_token_ids(
-                        self.requests[req_id],
-                        scheduler_output.scheduled_spec_decode_tokens,
-                    )
-                num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
-                    scheduler_output
-                )
+        readmitted = self._readmit_trimmed_drafts(
+            scheduler_output, local_num_chunks, target_num_chunks
+        )
+        if readmitted is not None:
+            scheduler_output, num_decode_reqs, num_windowed_reqs = readmitted
         if isinstance(self._pp_wave, PPRing) and not self._pp_is_first:
             # Post this step's receives first, so the previous stage can send
             # while this one prepares its inputs.
@@ -7674,11 +7696,13 @@ class TPUModelRunner(GPUModelRunner):
         warm the trimmed verify steps it can schedule."""
         manager = self._adaptive_verification
         assert manager is not None
-        manager.cost_table = self._profile_adaptive_verification_costs()
-        self._warmup_adaptive_verification()
+        warmup_plan, max_num_reqs = self._adaptive_verification_warmup_plan()
+        manager.max_num_reqs = max_num_reqs
+        manager.cost_table = self._profile_adaptive_verification_costs(max_num_reqs)
+        self._warmup_adaptive_verification(warmup_plan)
         manager.reset()
 
-    def _profile_adaptive_verification_costs(self) -> StepCostTable:
+    def _profile_adaptive_verification_costs(self, max_num_reqs: int) -> StepCostTable:
         """Time the decode-shaped verify steps of
         `_adaptive_verification_profile_plan` and the draft forward at every
         draft bucket.
@@ -7697,7 +7721,7 @@ class TPUModelRunner(GPUModelRunner):
         # model length leaves room for a full window.
         context_len = vllm_envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN
         prefix = max(0, min(context_len, self.max_model_len - (1 + K)))
-        plan = self._adaptive_verification_profile_plan()
+        plan = self._adaptive_verification_profile_plan(max_num_reqs)
         draft_buckets = drafter.draft_forward_buckets()
         timings: list[float] = []
         with self._precompile_timed("adaptive verification cost profile"):
@@ -7742,26 +7766,23 @@ class TPUModelRunner(GPUModelRunner):
         return StepCostTable.from_samples(pads, verify, draft)
 
     def _adaptive_verification_profile_plan(
-        self,
+        self, max_num_reqs: int
     ) -> list[tuple[int, int, list[int]]]:
         """(request count, real tokens, query lengths) of each decode-shaped
-        verify step the cost profile times.
+        verify step the cost profile times, for steps of up to `max_num_reqs`
+        requests.
 
-        Request counts run in powers of two up to the most one step holds, so
-        neighbors differ by at most 2 <= 1 + K and their token spans overlap
-        (see `StepCostTable.verify_cost`). For each, the token counts run
-        from one token per request to a full window each, at both ends of
-        every token bucket on the way. A step's drafts are spread evenly
-        over its requests."""
+        Request counts run in powers of two up to the most a trimmed step
+        holds, so neighbors differ by at most 2 <= 1 + K and their token spans
+        overlap (see `StepCostTable.verify_cost`). For each, the token counts
+        run from one token per request to a full window each, at both ends of
+        every token bucket on the way. A step's drafts are spread evenly over
+        its requests."""
         assert self.speculative_config is not None
         K = self.speculative_config.num_speculative_tokens
         pads = list(self.num_tokens_paddings)
         max_window_tokens = min(pads[-1], int(self.max_num_tokens))
-        max_reqs = min(
-            int(self.scheduler_config.max_num_seqs),
-            int(self.num_reqs_max_model_len),
-            max_window_tokens,
-        )
+        max_reqs = min(max_num_reqs, int(self.num_reqs_max_model_len))
         grid = sorted({1 << i for i in range(max_reqs.bit_length())} | {max_reqs})
         plan: list[tuple[int, int, list[int]]] = []
         for num_reqs in grid:
@@ -7779,13 +7800,20 @@ class TPUModelRunner(GPUModelRunner):
                 plan.append((num_reqs, num_tokens, query_lens))
         return plan
 
-    def _adaptive_verification_warmup_plan(self) -> list[tuple[int, int]]:
+    def _adaptive_verification_warmup_plan(
+        self,
+    ) -> tuple[list[tuple[int, int]], int]:
         """(request count, draft budget) pairs covering the program buckets of
-        every trimmed decode step that the full-window warmup leaves cold.
+        every trimmed decode step that the full-window warmup leaves cold, and
+        the most requests a step may hold to be trimmed.
 
         A trimmed step keeps its request pad and draft-row bucket but drops to
         a lower token (and logits-row) bucket, or verifies no draft at all and
-        takes the non-spec sampling path."""
+        takes the non-spec sampling path. The pairs run through full windows,
+        so they reach only request counts whose full windows fit the largest
+        token bucket. A step with more requests, whose windows the token
+        budget cut short, is trimmed only while every shape trimming can give
+        it is already warmed."""
         assert self.speculative_config is not None
         K = self.speculative_config.num_speculative_tokens
         drafter = self.drafter
@@ -7804,9 +7832,10 @@ class TPUModelRunner(GPUModelRunner):
             )
 
         max_window_tokens = min(pads[-1], int(self.max_num_tokens))
+        max_seqs = int(self.scheduler_config.max_num_seqs)
         counts = [
             num_reqs
-            for num_reqs in range(1, int(self.scheduler_config.max_num_seqs) + 1)
+            for num_reqs in range(1, max_seqs + 1)
             if num_reqs * (1 + K) <= max_window_tokens
         ]
         warmed = {key(num_reqs, num_reqs * K) for num_reqs in counts}
@@ -7816,16 +7845,25 @@ class TPUModelRunner(GPUModelRunner):
                 if (k := key(num_reqs, budget)) not in warmed:
                     warmed.add(k)
                     plan.append((num_reqs, budget))
-        return plan
+        max_num_reqs = len(counts)
+        for num_reqs in range(max_num_reqs + 1, min(max_seqs, max_window_tokens) + 1):
+            # Such a step schedules at most the drafts that fit beside its
+            # tokens, and a trimmed one verifies fewer.
+            if num_reqs * drafter.block_size > pads[-1] or any(
+                key(num_reqs, budget) not in warmed
+                for budget in range(max_window_tokens - num_reqs)
+            ):
+                break
+            max_num_reqs = num_reqs
+        return plan, max_num_reqs
 
-    def _warmup_adaptive_verification(self) -> None:
-        """Run `_adaptive_verification_warmup_plan` through the real
+    def _warmup_adaptive_verification(self, plan: list[tuple[int, int]]) -> None:
+        """Run `_adaptive_verification_warmup_plan`'s pairs through the real
         spec-decode path, the manager forced to each pair's budget."""
         manager = self._adaptive_verification
         assert manager is not None
         if not envs.SPEC_WARMUP:
             return
-        plan = self._adaptive_verification_warmup_plan()
         logger.info(
             "adaptive verification warmup: %d (requests, drafts) steps %s",
             len(plan),
