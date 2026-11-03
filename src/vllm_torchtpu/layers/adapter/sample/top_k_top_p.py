@@ -311,3 +311,87 @@ def apply_top_k_top_p_candidates(
         logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
     )
     return torch.where(top_k > 0, masked, logits)
+
+
+def blocked_argmax(logits: torch.Tensor) -> torch.Tensor:
+    """`torch.argmax(logits, dim=-1)` (first maximal index) in two short passes.
+
+    Reduces each CANDIDATE_BLOCK block to its max, takes the first block that
+    holds the row max, then the first maximal index inside that block. Gives
+    the same index as the full-row argmax for every finite input.
+
+    Args:
+      logits: [batch, vocab_size], vocab_size a multiple of CANDIDATE_BLOCK.
+
+    Returns:
+      int64 [batch].
+    """
+    rows, vocab_size = logits.shape
+    blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
+    block_ids = torch.argmax(blocks.amax(dim=-1), dim=-1)
+    block = torch.gather(
+        blocks, 1, block_ids.view(rows, 1, 1).expand(-1, 1, CANDIDATE_BLOCK)
+    ).squeeze(1)
+    return block_ids * CANDIDATE_BLOCK + torch.argmax(block, dim=-1)
+
+
+def first_argmax_ids(values: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """The smallest id among the maximal entries of each row of `values`.
+
+    `ids` holds each entry's vocab id; this is the tie rule of a full-vocab
+    `torch.argmax`, for entries gathered out of vocab order. Returns [batch].
+    """
+    row_max = values.amax(dim=-1, keepdim=True)
+    sentinel = torch.full_like(ids, torch.iinfo(ids.dtype).max)
+    return torch.where(values == row_max, ids, sentinel).amin(dim=-1)
+
+
+def top_k_top_p_candidate_logits(
+    logits: torch.Tensor,
+    scale: Callable[[torch.Tensor], torch.Tensor],
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    num_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`apply_top_k_top_p_candidates(scale(logits), ...)` restricted to the
+    candidate entries, without materializing the scaled full row.
+
+    `scale` must be elementwise and monotone non-decreasing (temperature
+    division), so scale(block max of logits) equals the block max of
+    scale(logits) bit for bit: the same blocks are picked, in the same order,
+    and the candidates, the kept set and the cutoff are those of
+    `apply_top_k_top_p_candidates`. The masked full row of that function is
+    -1e12 outside the returned candidates, except where more than
+    `num_blocks - k + 1` logits tie at the cutoff (its documented limit).
+    Rows with top_k <= 0 (padded slots) get the unmasked candidates.
+
+    Args:
+      logits: [batch, vocab_size] unscaled, vocab_size a multiple of
+        CANDIDATE_BLOCK.
+      scale: Elementwise monotone map applied to logits (e.g. / temperature).
+      top_k: [batch, 1] integer.
+      top_p: [batch, 1] float.
+      num_blocks: Candidate blocks.
+
+    Returns:
+      (candidate vocab ids int64 [batch, num_blocks * CANDIDATE_BLOCK],
+       masked scaled candidate logits, same shape).
+    """
+    rows, vocab_size = logits.shape
+    blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
+    block_max = scale(blocks.amax(dim=-1))
+    block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+    candidates = scale(
+        torch.gather(
+            blocks, 1, block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
+        ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
+    )
+    kept = apply_top_k_top_p(candidates, top_k, top_p) > MASKED_LOGIT_VALUE
+    inf = torch.full_like(candidates, float("inf"))
+    cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
+    masked_value = torch.full_like(candidates, MASKED_LOGIT_VALUE)
+    masked = torch.where(candidates >= cutoff, candidates, masked_value)
+    masked = torch.where(top_k > 0, masked, candidates)
+    lane = torch.arange(CANDIDATE_BLOCK, device=logits.device, dtype=block_ids.dtype)
+    ids = (block_ids.unsqueeze(-1) * CANDIDATE_BLOCK + lane).reshape(rows, -1)
+    return ids, masked
