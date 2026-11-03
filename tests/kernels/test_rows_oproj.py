@@ -124,7 +124,7 @@ def test_rows_oproj_matches_per_rank_partials():
 def test_gather_shards_stacks_every_rank_in_mesh_order(mode):
     """Every gather mode gives every rank every rank's shards, bit for bit,
     in mesh order (CPU virtual devices; the ring is any cycle of the mesh)."""
-    ring = (0, 1, 3, 2)
+    ring = (0, 1, 3, 2) if ro.needs_ring(mode) else None
     if jax.device_count() < SHARDS:
         pytest.skip(f"requires {SHARDS} devices; CPU virtual devices are sufficient")
     mesh = jax.sharding.Mesh(np.array(jax.devices()[:SHARDS]), ("x",))
