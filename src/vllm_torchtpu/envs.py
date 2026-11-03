@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     TPU_PCP_SHARDING_PLAN: str = "headtail"
     TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
     TPU_PCP_KV_CHUNK_TOKENS: int = 65536
+    TPU_PCP_KV_PIPELINE: bool = False
+    TPU_PCP_KV_OVERLAP_DECODE: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -483,6 +485,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
     # PCP manager: context tokens gathered per all-gather chunk.
     "TPU_PCP_KV_CHUNK_TOKENS": env_int("TPU_PCP_KV_CHUNK_TOKENS", 65536),
+    # PCP manager: attend the split-prefill workspace chunk by chunk and merge
+    # by lse, so each chunk's all-gather can overlap the previous chunk's
+    # attention. Off: one gather, then one attention call.
+    "TPU_PCP_KV_PIPELINE": env_bool("TPU_PCP_KV_PIPELINE", default=False),
+    # PCP manager: run the decode rows' sparse MLA and the split prefill in one
+    # op, so the prefill's KV gather can overlap the decode attention.
+    "TPU_PCP_KV_OVERLAP_DECODE": env_bool("TPU_PCP_KV_OVERLAP_DECODE", default=False),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must

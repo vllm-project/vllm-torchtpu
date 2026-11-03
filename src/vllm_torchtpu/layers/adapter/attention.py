@@ -2543,6 +2543,133 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return pcp_prefill_impl
 
+    def _build_pcp_mixed_op(self, layer: Any):
+        """Decode rows plus split prefill in one op (TPU_PCP_KV_OVERLAP_DECODE);
+        see `sparse_mla_attention_pcp_mixed`."""
+        from vllm_torchtpu.layers.core.attention_interface import (
+            sparse_mla_attention_pcp_mixed,
+        )
+
+        mesh = self._dcp_mesh
+        assert mesh is not None
+        dcp_size = self.dcp_size
+        interleave_size = self.dcp_interleave_size
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def pcp_mixed_core(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            dcp_ql_nope: jax.Array,
+            dcp_q_pe: jax.Array,
+            dcp_kv_c_normed: jax.Array,
+            dcp_k_pe: jax.Array,
+            dcp_local_topk_indices: jax.Array,
+            dcp_seq_lens: jax.Array,
+            dcp_block_tables: jax.Array,
+            dcp_query_start_loc: jax.Array,
+            dcp_request_distribution: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            topk_indices: jax.Array,
+            split_block_tables: jax.Array,
+            ws_req: jax.Array,
+            ws_vpage: jax.Array,
+            ws_page_offset: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            num_split_reqs: jax.Array,
+            ws_used_pages: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_attention_pcp_mixed(
+                dcp_ql_nope,
+                dcp_q_pe,
+                dcp_kv_c_normed,
+                dcp_k_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                dcp_local_topk_indices,
+                dcp_seq_lens,
+                dcp_block_tables,
+                dcp_query_start_loc,
+                dcp_request_distribution,
+                ql_nope,
+                q_pe,
+                topk_indices,
+                split_block_tables,
+                ws_req,
+                ws_vpage,
+                ws_page_offset,
+                query_start_loc,
+                request_distribution,
+                num_split_reqs,
+                ws_used_pages,
+                mesh,
+                nope_spec,
+                rope_spec,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+                chunk_pages=pcp_chunk_pages(nope_spec.page_size, dcp_size),
+            )
+
+        sharded = P(DCP_AXIS_NAME)
+        replicated = P()
+        op_name = f"pallas::pcp_mixed_mla_{layer.layer_name.replace('.', '_')}"
+        jax_op = pcp_streaming_jax_op(
+            op_name,
+            pcp_mixed_core,
+            donate_argnums=(0, 1),
+            mesh=mesh,
+            input_partition_specs=(
+                *_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
+                sharded,  # ql_nope: this rank's local rows, TP head slice
+                sharded,  # q_pe
+                sharded,  # topk_indices: local rows, global positions
+                replicated,  # split_block_tables
+                replicated,  # ws_req
+                replicated,  # ws_vpage
+                sharded,  # ws_page_offset
+                sharded,  # query_start_loc
+                sharded,  # request_distribution
+                replicated,  # num_split_reqs
+                replicated,  # ws_used_pages
+            ),
+            output_partition_specs=(
+                *_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
+                sharded,  # split prefill output
+            ),
+        )
+
+        def _fake(kv_cache_nope, kv_cache_rope, dcp_ql_nope, *rest, **kwargs):
+            del kwargs
+            ql_nope = rest[8]
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                torch.empty_like(dcp_ql_nope),
+                dcp_ql_nope.new_empty(dcp_ql_nope.shape[:2], dtype=torch.float32),
+                torch.empty_like(ql_nope),
+            )
+
+        jax_op.register_fake(_fake)
+
+        def pcp_mixed_impl(
+            kv_cache: tuple[torch.Tensor, torch.Tensor], *args: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            nope_cache, rope_cache = kv_cache
+            new_nope, new_rope, dcp_out, dcp_lse, prefill_out = jax_op(
+                nope_cache, rope_cache, *args
+            )
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+            return dcp_out, dcp_lse, prefill_out
+
+        return pcp_mixed_impl
+
     def _forward_pcp_kv_gather(
         self,
         layer: Any,
@@ -2578,8 +2705,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             pcp.split_block_tables,
             pcp.split_query_start_loc,
         )
-        partial, lse = layer.sparse_mla_dcp_op(
-            kv_cache,
+        decode_args = (
             all_gather_heads(kvg.take_decode_rows(ql_nope, md)),
             all_gather_heads(kvg.take_decode_rows(q_pe, md)),
             kvg.take_decode_rows(kv_c_normed, md),
@@ -2590,10 +2716,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             pcp.rep_query_start_loc,
             pcp.rep_request_distribution,
         )
-        decode_out = merge_lse_partials_scatter_heads(partial, lse)
-
-        prefill_out = layer.pcp_prefill_op(
-            kv_cache,
+        prefill_args = (
             ql_nope,
             q_pe,
             topk_indices,
@@ -2606,6 +2729,17 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             pcp.num_split_reqs,
             pcp.ws_used_pages,
         )
+        if getattr(layer, "pcp_mixed_op", None) is not None:
+            # TPU_PCP_KV_OVERLAP_DECODE: one op, so the prefill's KV gather can
+            # run under the decode attention.
+            partial, lse, prefill_out = layer.pcp_mixed_op(
+                kv_cache, *decode_args, *prefill_args
+            )
+            decode_out = merge_lse_partials_scatter_heads(partial, lse)
+        else:
+            partial, lse = layer.sparse_mla_dcp_op(kv_cache, *decode_args)
+            decode_out = merge_lse_partials_scatter_heads(partial, lse)
+            prefill_out = layer.pcp_prefill_op(kv_cache, *prefill_args)
         return kvg.merge_decode_rows(prefill_out, decode_out, md)
 
     def forward(

@@ -64,9 +64,19 @@ def gather_workspace(
     return lax.all_gather(cache[pages], axis_name, tiled=False)
 
 
-def position_ordered(workspace: jax.Array, interleave: int) -> jax.Array:
+def position_ordered(
+    workspace: jax.Array, interleave: int, *, seq_along_lane: bool = False
+) -> jax.Array:
     """Reorder the rank-major `[dcp, Pw, P/4, 4, W]` workspace to
-    `[Pw, dcp * P/4, 4, W]`."""
+    `[Pw, dcp * P/4, 4, W]`; with `seq_along_lane` (tokens on lanes), the
+    `[dcp, Pw, G, 4, P]` workspace to `[Pw, G, 4, dcp * P]`."""
+    if seq_along_lane:
+        dcp, num_ws_pages, groups, packing, page_size = workspace.shape
+        x = workspace.reshape(
+            dcp, num_ws_pages, groups, packing, page_size // interleave, interleave
+        )
+        x = jnp.transpose(x, (1, 2, 3, 4, 0, 5))
+        return x.reshape(num_ws_pages, groups, packing, dcp * page_size)
     dcp, num_ws_pages, rows, packing, width = workspace.shape
     page_size = rows * packing
     x = workspace.reshape(dcp, num_ws_pages, page_size // interleave, interleave, width)
@@ -130,21 +140,56 @@ def topk_workspace_coords(
     return valid, owner, ws_page, lpos % page_size
 
 
-def remap_topk_chunked(
+def workspace_buckets(num_ws_pages: int, chunk_pages: int) -> list[int]:
+    """Workspace sizes in pages: `chunk_pages` doubling, capped at `num_ws_pages`."""
+    sizes, size = set(), max(1, min(chunk_pages, num_ws_pages))
+    while size < num_ws_pages:
+        sizes.add(size)
+        size *= 2
+    return sorted(sizes | {num_ws_pages})
+
+
+def remap_topk_flat(
     coords: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     *,
-    chunk_pages: int,
+    num_ws_pages: int,
     page_size: int,
-    dcp_size: int,
 ) -> jax.Array:
-    """Map workspace coordinates to flat token indices in the chunked workspace.
+    """Map workspace coordinates to flat token indices in the rank-major
+    `[dcp, num_ws_pages, page_size]` workspace that `gather_workspace` returns.
 
-    The shape of chunked workspace is `[chunk, dcp, chunk_pages, page_size]`
+    A row with no valid entry keeps index 0: the kernel needs `kv_len >= 1`.
     """
     valid, owner, ws_page, slot = coords
-    chunk = ws_page // chunk_pages
-    page = (chunk * dcp_size + owner) * chunk_pages + (ws_page - chunk * chunk_pages)
+    page = owner * num_ws_pages + ws_page
     idx = jnp.where(valid, page * page_size + slot, -1).astype(jnp.int32)
     empty = ~jnp.any(valid, axis=1)
     col = jnp.arange(idx.shape[1], dtype=jnp.int32)[None, :]
     return jnp.where((col == 0) & empty[:, None], 0, idx)
+
+
+def remap_topk_chunk(
+    coords: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    first_page: int,
+    num_pages: int,
+    *,
+    page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Indices into the `[dcp, num_pages, page_size]` gather of workspace pages
+    `[first_page, first_page + num_pages)`, valid entries first, and whether
+    each row has any.
+
+    A row with none keeps index 0 (`kv_len >= 1`); the caller masks its lse.
+    """
+    valid, owner, ws_page, slot = coords
+    local = ws_page - first_page
+    in_chunk = valid & (local >= 0) & (local < num_pages)
+    page = owner * num_pages + local
+    idx = jnp.where(in_chunk, page * page_size + slot, -1).astype(jnp.int32)
+    # The kernel derives kv_len from the -1 tail, so pack each row.
+    width = idx.shape[1]
+    col = jnp.arange(width, dtype=jnp.int32)[None, :]
+    key = jnp.where(in_chunk, col, width + col)
+    _, idx = lax.sort_key_val(key, idx, dimension=1)
+    owns = jnp.any(in_chunk, axis=1)
+    return jnp.where((col == 0) & ~owns[:, None], 0, idx), owns
