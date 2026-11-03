@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
+    VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
     VLLM_TPU_QSA_FUSED_DCP_BLOCKS: bool = False
     VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
     VLLM_TPU_QSA_DCP_Q_GATHER: bool = False
@@ -825,6 +826,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # input once instead of a separate merge kernel writing it and the mix
     # reading it back (bit-identical).
     "VLLM_TPU_HC_PREFILL_COMBINE_MIX": env_bool("VLLM_TPU_HC_PREFILL_COMBINE_MIX"),
+    # Prefill HC full mix: token tile for calls whose rows divide two such tiles
+    # (0 = always hc_prefill_full_tile). Rows are independent, so the tile only
+    # changes the schedule (bit-identical); 256 is ~25 us/call faster than 128
+    # at 1024 rows.
+    "VLLM_TPU_HC_PREFILL_WIDE_TILE": env_nonnegative_int(
+        "VLLM_TPU_HC_PREFILL_WIDE_TILE", 0
+    ),
     # With VLLM_TPU_QSA_COMPRESSED_DCP: merge a pair's local top-k lists into the
     # global selection with one TensorCore Pallas kernel (radix select, tie
     # cut, bitonic sort) instead of the SparseCore top-k + keep mask + sort
