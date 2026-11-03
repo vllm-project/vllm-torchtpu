@@ -1334,7 +1334,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                     draft.do_not_compile = prev
 
         def greedy(hidden: Any) -> Any:
-            return self.compute_logits(hidden, lm_head).argmax(dim=-1).to(torch.int32)
+            return self.greedy_tokens(hidden, lm_head)
 
         hidden = run(
             input_ids,
@@ -1549,6 +1549,35 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         local = self._local_logits(hidden_states, lm_head_weight)
         gathered = tensor_model_parallel_all_gather(local, dim=-1)
         return gathered[..., : self._export_config.vocab_size]
+
+    def greedy_tokens(
+        self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """The argmax token `i32[R]` of `compute_logits(hidden_states, lm_head_weight)`.
+
+        Each rank takes the maximum of its own vocabulary shard, and the ranks
+        gather only those `[R, tp]` maxima and their indices instead of the
+        `[R, vocab_size]` logits; the first shard holding the overall maximum
+        names the token, so ties resolve to the lowest index, as a full argmax
+        does. With vocabulary padding the last shard's padded columns would join
+        the race, and the shard a rank holds is unknown while tracing, so a
+        padded vocabulary gathers the logits instead.
+        """
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        local = self._local_logits(hidden_states, lm_head_weight)
+        shard = int(local.shape[-1])
+        tp = self._export_config.tensor_parallel_size
+        if shard * tp != self._export_config.vocab_size:
+            logits = self.compute_logits(hidden_states, lm_head_weight)
+            return logits.argmax(dim=-1).to(torch.int32)
+        index = local.argmax(dim=-1, keepdim=True)
+        best = local.gather(-1, index)
+        best = tensor_model_parallel_all_gather(best, dim=-1)
+        index = tensor_model_parallel_all_gather(index.to(torch.int32), dim=-1)
+        rank = best.argmax(dim=-1, keepdim=True)
+        token = rank.to(torch.int32) * shard + index.gather(-1, rank)
+        return token.squeeze(-1)
 
     def _local_logits(
         self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor
