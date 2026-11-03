@@ -1384,9 +1384,9 @@ def sparse_mla_attention_pcp_prefill(
     """PCP manager sparse MLA for the split prefill rows (read-only).
 
     Under `lax.cond(num_split_reqs > 0)`, gathers the split requests' KV into
-    a fixed-size workspace, `chunk_pages` pages per DCP all-gather and only as
-    many chunks as in use, then attends the local queries' top-k (global
-    positions) over it in one call.
+    a workspace of the smallest size bucket (`chunk_pages` doubling) that holds
+    the pages in use, with one DCP all-gather, then attends the local queries'
+    top-k (global positions) over it in one call.
 
     Returns `[local_tokens, local_heads, lkv_dim]`; zeros when nothing is split.
     """
@@ -1453,59 +1453,48 @@ def sparse_mla_attention_pcp_prefill(
                 dcp_size=dcp_size,
                 interleave=interleave_size,
             )
-            ws_idx = ws.remap_topk_chunked(
-                coords,
-                chunk_pages=chunk_pages,
-                page_size=nope_spec.page_size,
-                dcp_size=dcp_size,
-            )
-
-            # Gather only the chunks in use, then attend once (no merge).
-            # Workspace pages: [chunk, dcp, chunk_pages]
-            num_ws_chunks = ws_req_.shape[0] // chunk_pages
-            rows_per_chunk = dcp_size * chunk_pages
-            ws_rows = num_ws_chunks * rows_per_chunk
-
-            def gather_body(c, bufs):
-                buf_nope, buf_rope = bufs
-                chunk_ids = jax.lax.dynamic_slice_in_dim(
-                    pages, c * chunk_pages, chunk_pages
-                )
-                g_nope = ws.gather_workspace(nope, chunk_ids, axis_name=dcp_axis_name)
-                g_rope = ws.gather_workspace(rope, chunk_ids, axis_name=dcp_axis_name)
-                at = c * rows_per_chunk
-                buf_nope = jax.lax.dynamic_update_slice_in_dim(
-                    buf_nope, g_nope.reshape(-1, *g_nope.shape[2:]), at, axis=0
-                )
-                buf_rope = jax.lax.dynamic_update_slice_in_dim(
-                    buf_rope, g_rope.reshape(-1, *g_rope.shape[2:]), at, axis=0
-                )
-                return buf_nope, buf_rope
-
-            num_chunks = (ws_used_pages_[0] + chunk_pages - 1) // chunk_pages
-            # TODO(weiyulin): This line zero entire workspace, we should benchmark
-            # if this time-consuming.
-            init = (
-                jnp.zeros((ws_rows, *nope.shape[1:]), nope.dtype),
-                jnp.zeros((ws_rows, *rope.shape[1:]), rope.dtype),
-            )
-            ws_nope, ws_rope = jax.lax.fori_loop(0, num_chunks, gather_body, init)
-
             q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-            output = sparse_mla_kernel.sparse_ragged_paged_attention(
-                q,
-                ws_nope,
-                ws_rope,
-                ws_idx,
-                None,
-                qsl_,
-                rd_,
-                sm_scale=sm_scale or 1.0,
-                k_scale=dequant_scale,
-                cache_layout=cache_layout,
-            )
-            # Drop the rope tail: only the nope part is the MLA value.
-            return output[..., :lkv_dim].astype(ql_nope.dtype)
+
+            def gather(first, count):
+                ids = pages[first : first + count]
+                g_nope = ws.gather_workspace(nope, ids, axis_name=dcp_axis_name)
+                g_rope = ws.gather_workspace(rope, ids, axis_name=dcp_axis_name)
+                return (
+                    g_nope.reshape(-1, *g_nope.shape[2:]),
+                    g_rope.reshape(-1, *g_rope.shape[2:]),
+                )
+
+            def attend(ws_nope, ws_rope, ws_idx):
+                output = sparse_mla_kernel.sparse_ragged_paged_attention(
+                    q,
+                    ws_nope,
+                    ws_rope,
+                    ws_idx,
+                    None,
+                    qsl_,
+                    rd_,
+                    sm_scale=sm_scale or 1.0,
+                    k_scale=dequant_scale,
+                    cache_layout=cache_layout,
+                )
+                # Drop the rope tail: only the nope part is the MLA value.
+                return output[..., :lkv_dim].astype(ql_nope.dtype)
+
+            # One all-gather of the smallest bucket that holds the pages in
+            # use, straight into the workspace: no zero fill, no copy loop.
+            def at_size(size):
+                def branch(_):
+                    ws_idx = ws.remap_topk_flat(
+                        coords, num_ws_pages=size, page_size=nope_spec.page_size
+                    )
+                    return attend(*gather(0, size), ws_idx)
+
+                return branch
+
+            buckets = ws.workspace_buckets(ws_req_.shape[0], chunk_pages)
+            used = ws_used_pages_[0]
+            which = sum((used > b).astype(jnp.int32) for b in buckets[:-1])
+            return jax.lax.switch(which, [at_size(b) for b in buckets], None)
 
         def skip(caches):
             del caches

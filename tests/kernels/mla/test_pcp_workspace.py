@@ -100,11 +100,39 @@ def test_topk_rows_past_token_end_are_masked():
     valid = np.asarray(coords[0])
     np.testing.assert_array_equal(valid[:2], np.asarray(topk[:2]) >= 0)
     assert not valid[2:].any()
+    num_ws_pages = 2 * chunk_pages
     idx = np.asarray(
-        ws.remap_topk_chunked(
-            coords, chunk_pages=chunk_pages, page_size=page_size, dcp_size=dcp
-        )
+        ws.remap_topk_flat(coords, num_ws_pages=num_ws_pages, page_size=page_size)
     )
     # Masked rows read one in-bounds dummy key and nothing else.
     np.testing.assert_array_equal(idx[2:], [[0, -1, -1], [0, -1, -1]])
-    assert idx[:2].max() < 2 * chunk_pages * dcp * page_size
+    assert idx[:2].max() < num_ws_pages * dcp * page_size
+
+
+@pytest.mark.parametrize(
+    "num_ws_pages,chunk_pages,expected",
+    [(32, 2, [2, 4, 8, 16, 32]), (24, 4, [4, 8, 16, 24]), (3, 8, [3]), (8, 8, [8])],
+)
+def test_workspace_buckets(num_ws_pages, chunk_pages, expected):
+    assert ws.workspace_buckets(num_ws_pages, chunk_pages) == expected
+
+
+def _coords(owner, ws_page, slot, valid):
+    return tuple(jnp.asarray(x) for x in (np.asarray(valid), owner, ws_page, slot))
+
+
+def test_remap_topk_flat_is_rank_major():
+    page_size, num_ws_pages = 4, 3
+    owner = [[0, 1, 1], [0, 0, 0]]
+    ws_page = [[2, 0, 2], [0, 0, 0]]
+    slot = [[3, 1, 0], [0, 0, 0]]
+    valid = [[True, True, False], [False, False, False]]
+    idx = np.asarray(
+        ws.remap_topk_flat(
+            _coords(owner, ws_page, slot, valid),
+            num_ws_pages=num_ws_pages,
+            page_size=page_size,
+        )
+    )
+    # (owner * num_ws_pages + ws_page) * page_size + slot; empty row -> dummy 0.
+    np.testing.assert_array_equal(idx, [[11, 13, -1], [0, -1, -1]])
