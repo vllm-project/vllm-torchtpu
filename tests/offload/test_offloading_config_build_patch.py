@@ -204,6 +204,21 @@ def test_dcp_scales_mixed_mla_group():
     assert module.resolve_kv_cache_block_sizes is resolve_before
 
 
+def test_pcp_manager_uses_dcp_scaling(monkeypatch):
+    """Under the PCP manager DCP spans TP x PCP, so only DCP scales the span."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.setenv("USE_TPU_PCP_MANAGER", "1")
+    assert envs.USE_TPU_PCP_MANAGER
+    module = _patched_offloading_config_module()
+
+    vllm_config = _vllm_config(pcp=2, block_size=256, dcp=16)
+    config = module.build_offloading_config(vllm_config, _mixed_mla_kv_cache_config())
+
+    assert tuple(g.tokens_per_block for g in config.groups) == (4096,)
+    assert config.cache.tokens_per_hash == 4096
+
+
 def test_dcp_rescales_chunk_block_size():
     """A kv_connector_extra_config block_size counts logical DCP tokens."""
     module = _patched_offloading_config_module()
