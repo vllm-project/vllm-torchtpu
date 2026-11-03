@@ -29,6 +29,15 @@ def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
     return op
 
 
+def _up_operand(up_t: bool):
+    """The kernel's up operand from the checkpoint's [width, low rank] weight.
+
+    Transposing here rather than at the Torch call site keeps every graph's
+    operands (and their first-use order) the checkpoint parameters.
+    """
+    return (lambda up: up.T) if up_t else (lambda up: up)
+
+
 @functools.cache
 def build_full_mix_op(
     branches: int,
@@ -38,7 +47,9 @@ def build_full_mix_op(
     up_t: bool = False,
     inject: bool = False,
 ):
-    """``up_t``: the op takes the up projection as its [low rank, width] transpose.
+    """``up_t``: the kernel reads the up projection as its [low rank, width]
+    transpose, taken inside the op (a bitcast of the checkpoint's column-major
+    weight); the op's operands stay the checkpoint tensors either way.
     ``inject``: it also takes the combine's gate weight and returns the BF16 gate
     projection [tokens, branches] in place of the normalized input."""
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
@@ -46,6 +57,7 @@ def build_full_mix_op(
     static = dict(
         branches=branches, hidden=hidden, eps=eps, token_tile=token_tile, up_t=up_t
     )
+    _up = _up_operand(up_t)
     # torch.library.infer_schema takes explicit tensor parameters only.
     if inject:
 
@@ -56,14 +68,14 @@ def build_full_mix_op(
             up: jax.Array,
             inject_weight: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
-            return _full_mix(x, weight, down, up, inject_weight, **static)
+            return _full_mix(x, weight, down, _up(up), inject_weight, **static)
 
     else:
 
         def core(
             x: jax.Array, weight: jax.Array, down: jax.Array, up: jax.Array
         ) -> tuple[jax.Array, jax.Array]:
-            return _full_mix(x, weight, down, up, **static)
+            return _full_mix(x, weight, down, _up(up), **static)
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
@@ -99,6 +111,7 @@ def build_combine_full_mix_op(
     static = dict(
         branches=branches, hidden=hidden, eps=eps, token_tile=token_tile, up_t=up_t
     )
+    _up = _up_operand(up_t)
     if inject:
 
         def core(
@@ -111,7 +124,7 @@ def build_combine_full_mix_op(
             inject_weight: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             return _combine_full_mix(
-                residual, block, gates, weight, down, up, inject_weight, **static
+                residual, block, gates, weight, down, _up(up), inject_weight, **static
             )
 
     else:
@@ -124,7 +137,9 @@ def build_combine_full_mix_op(
             down: jax.Array,
             up: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            return _combine_full_mix(residual, block, gates, weight, down, up, **static)
+            return _combine_full_mix(
+                residual, block, gates, weight, down, _up(up), **static
+            )
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_combine_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
