@@ -959,6 +959,11 @@ def _check_context_parallel(model: Gemma4Model, vllm_config: VllmConfig) -> None
             ("TPU_PRECOMPILE_PEER_REPLAY", envs.TPU_PRECOMPILE_PEER_REPLAY),
             # One block-table shape per bucket.
             ("VLLM_TPU_MOST_MODEL_LEN", envs.VLLM_TPU_MOST_MODEL_LEN is not None),
+            # The early exchange runs the prologue kernel on the sent rows.
+            (
+                "TPU_CP_EARLY_HALO without TPU_CP_FUSED_PROLOGUE",
+                envs.TPU_CP_EARLY_HALO and not envs.TPU_CP_FUSED_PROLOGUE,
+            ),
         )
         if present
     ]

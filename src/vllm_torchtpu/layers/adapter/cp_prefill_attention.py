@@ -207,18 +207,30 @@ def _build_ops_from_qkv(cfg: cp_prefill.LayerConfig, cache_view) -> LayerOps:
         )
         return LayerOps(**ops)
 
-    def fake_exchange(new_kv, seq_lens, rank, page_size):
-        halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, page_size)
-        rows = (3 * halo_pages + 1) * page_size
-        return new_kv.new_empty((rows, 2 * kv_heads * d), dtype=torch.int8)
+    def fake_exchange(x, *args):
+        # Two piece tails of halo pages, then halo + 1 window pages.
+        halo_pages = cp_prefill.num_halo_pages(cfg.sliding_window, args[-1])
+        rows = (3 * halo_pages + 1) * args[-1]
+        return x.new_empty((rows, 2 * kv_heads * d), dtype=torch.int8)
 
-    ops["sliding_exchange"] = _register(
-        "sliding_exchange_from_kv",
-        cp_prefill.sliding_exchange_rows_from_kv,
-        fake_exchange,
-        donate=False,
-        cfg=cfg,
-    )
+    if cfg.exchange_from_qkv:
+        # (qkv, cos, sin, q norm weight, k norm weight, seq_lens, rank, page size)
+        ops["sliding_exchange"] = _register(
+            "sliding_exchange_from_qkv",
+            cp_prefill.sliding_exchange_rows_from_qkv,
+            fake_exchange,
+            donate=False,
+            cfg=cfg,
+        )
+    else:
+        # (new_kv, seq_lens, rank, page size)
+        ops["sliding_exchange"] = _register(
+            "sliding_exchange_from_kv",
+            cp_prefill.sliding_exchange_rows_from_kv,
+            fake_exchange,
+            donate=False,
+            cfg=cfg,
+        )
     ops["sliding_attention"] = _register_layer(
         "sliding_attention_from_q",
         cp_prefill.sliding_attention_layer_from_q,
@@ -322,6 +334,9 @@ def _layer_config(
         head_page_writes=envs.TPU_CP_KV_WRITE_KERNEL and not sliding,
         prologue_eps=prologue_eps,
         fp8_out_rows=envs.TPU_CP_FUSED_EPILOGUE,
+        exchange_from_qkv=(
+            envs.TPU_CP_EARLY_HALO and sliding and prologue_eps is not None
+        ),
     )
     if cfg.local_kv_heads != impl.num_kv_heads:
         raise ValueError(
@@ -512,9 +527,16 @@ def cp_prefill_attention_from_qkv(
             qkv.new_empty(rows, cfg.num_heads * cfg.head_dim), cfg
         )
     ops: LayerOps = attn._cp_prefill_ops
-    q_hbm, new_kv = ops.prologue(qkv, cos, sin, q_norm_weight, k_norm_weight)
     group = get_tp_group().device_group
     seq_lens, block_tables = attn_metadata.seq_lens, attn_metadata.block_tables
+    weights = (q_norm_weight, k_norm_weight)
+    if cfg.exchange_from_qkv:
+        # The exchanged rows' own prologue: the all-gather overlaps the rest's.
+        exchanged = ops.sliding_exchange(
+            qkv, cos, sin, *weights, seq_lens, rank, plan.page_size
+        )
+        gathered = _waited(funcol.all_gather_single(exchanged, 0, group))
+    q_hbm, new_kv = ops.prologue(qkv, cos, sin, *weights)
     if cfg.sliding_window is None:
         # [rows, slots, 4, d] is `pack_kv_rows`' order: 2-D rows, as int8.
         kv_rows = new_kv.view(torch.int8).reshape(rows, -1)
@@ -523,8 +545,9 @@ def cp_prefill_attention_from_qkv(
             kv_cache, q_hbm, gathered, seq_lens, block_tables, rank
         )
     else:
-        exchanged = ops.sliding_exchange(new_kv, seq_lens, rank, plan.page_size)
-        gathered = _waited(funcol.all_gather_single(exchanged, 0, group))
+        if not cfg.exchange_from_qkv:
+            exchanged = ops.sliding_exchange(new_kv, seq_lens, rank, plan.page_size)
+            gathered = _waited(funcol.all_gather_single(exchanged, 0, group))
         new_kv_cache, *out = ops.sliding_attention(
             kv_cache, q_hbm, new_kv, gathered, seq_lens, block_tables, rank
         )

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     TPU_CP_FUSED_PROLOGUE: bool = False
     TPU_CP_EMBED_REPLICA: bool = False
     TPU_CP_FUSED_EPILOGUE: bool = False
+    TPU_CP_EARLY_HALO: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -549,6 +550,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel straight from the attention kernel's head-major output, instead of
     # bf16 token-major rows that XLA transposes and quantizes.
     "TPU_CP_FUSED_EPILOGUE": env_bool("TPU_CP_FUSED_EPILOGUE", default=False),
+    # With TPU_CP_FUSED_PROLOGUE: a context-parallel sliding-window layer runs
+    # the qkv prologue of the rows it sends (its pieces' tails and the decode
+    # window) first, so its all-gather overlaps the prologue of the other rows
+    # instead of waiting for all of them. Same rows.
+    "TPU_CP_EARLY_HALO": env_bool("TPU_CP_EARLY_HALO", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and

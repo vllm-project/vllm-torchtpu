@@ -655,6 +655,48 @@ def test_sliding_exchange_rows_from_kv_match(seq_len):
         np.testing.assert_array_equal(_bytes(got), _bytes(want))
 
 
+def _qkv_inputs(rows, num_heads, num_kv_heads, head_dim, seed):
+    """qkv projection rows, rotary cache rows and q/k norm weights."""
+    key = jax.random.key(seed)
+    width = (num_heads + 2 * num_kv_heads) * head_dim
+    qkv = (jax.random.normal(key, (rows, width)) * 2).astype(jnp.bfloat16)
+    inv = 1.0 / (10000.0 ** (jnp.arange(head_dim // 2) / (head_dim // 2)))
+    angle = jnp.arange(rows)[:, None] * inv[None]
+    cos, sin = jnp.cos(angle).astype(jnp.bfloat16), jnp.sin(angle).astype(jnp.bfloat16)
+    wq, wk = (
+        (1 + 0.1 * jax.random.normal(jax.random.fold_in(key, i), (head_dim,))).astype(
+            jnp.bfloat16
+        )
+        for i in (1, 2)
+    )
+    return qkv, cos, sin, wq, wk
+
+
+@pytest.mark.parametrize("seq_len", [16 * 8 * PAGE, 9 * 8 * PAGE + 100])
+def test_sliding_exchange_rows_from_qkv_match_the_full_prologue(seq_len):
+    num_kv_heads, window = 8, 1024
+    plan = cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
+    cfg = dataclasses.replace(
+        _layer_config(num_kv_heads, window, LAYOUTS[0]),
+        prologue_eps=1e-6,
+        exchange_from_qkv=True,
+    )
+    rows = 2 * plan.piece_tokens
+    seq_lens = jnp.array([seq_len], jnp.int32)
+    for rank in (0, 3, 7):
+        qkv, cos, sin, wq, wk = _qkv_inputs(
+            rows, 2 * num_kv_heads, num_kv_heads, 128, rank
+        )
+        args = (seq_lens, jnp.array([rank], jnp.int32), PAGE)
+        with pltpu.force_tpu_interpret_mode():
+            _, new_kv = cp_prefill.qkv_prologue(qkv, cos, sin, wq, wk, cfg=cfg)
+            want = cp_prefill.sliding_exchange_rows_from_kv(new_kv, *args, cfg=cfg)
+            got = cp_prefill.sliding_exchange_rows_from_qkv(
+                qkv, cos, sin, wq, wk, *args, cfg=cfg
+            )
+        np.testing.assert_array_equal(_bytes(got), _bytes(want))
+
+
 def _attention_stub(calls, pages_seen=None):
     """cp_prefill_attention that records how it was called (and, given
     `pages_seen`, the pages it attends over) and returns its query (or the
@@ -719,7 +761,10 @@ def test_full_attention_layer_from_q_caches_like_from_q_k_v(
         assert prepared_q is q_hbm and prepared_kv.shape == (rows, 1, 4, 128)
 
 
-def test_sliding_attention_layer_from_q_caches_like_from_q_k_v(monkeypatch):
+@pytest.mark.parametrize("exchange_from_qkv", [False, True])
+def test_sliding_attention_layer_from_q_caches_like_from_q_k_v(
+    monkeypatch, exchange_from_qkv
+):
     calls, pages_seen = [], []
     monkeypatch.setattr(
         cp_prefill, "cp_prefill_attention", _attention_stub(calls, pages_seen)
@@ -761,7 +806,7 @@ def test_sliding_attention_layer_from_q_caches_like_from_q_k_v(monkeypatch):
                 q_hbm,
                 new_kv,
                 *args,
-                cfg=cfg,
+                cfg=dataclasses.replace(cfg, exchange_from_qkv=exchange_from_qkv),
                 cache_view=_identity_view,
             )
         np.testing.assert_array_equal(_bytes(got), _bytes(want))
@@ -919,3 +964,32 @@ def test_fp8_rows_layers_from_q_lower_for_tpu7x(heads, head_dim, window):
             lowered = jax.jit(fn).trace(cache, q_hbm, new_kv, gathered, *meta)
         text = lowered.lower(lowering_platforms=("tpu",)).as_text()
     assert "RPAm-snh-p256" in text and "rpa_output_quantize" in text
+
+
+def test_sliding_exchange_rows_from_qkv_lower_for_tpu7x():
+    # Gemma4-26B sliding layers on one CP rank of a 122,880-token bucket.
+    plan = cp_prefill.make_zigzag_plan(122880, world=8, page_size=PAGE)
+    cfg = dataclasses.replace(
+        _layer_config(8, 1024, configs.KVLayout.HEAD_ALONG_SUBLANE),
+        num_heads=16,
+        head_dim=256,
+        prologue_eps=1e-6,
+        exchange_from_qkv=True,
+    )
+    rows = 2 * plan.piece_tokens
+    with use_abstract_mesh(TPU7X):
+        args = (
+            jax.ShapeDtypeStruct((rows, 32 * 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct((rows, 128), jnp.bfloat16),
+            jax.ShapeDtypeStruct((rows, 128), jnp.bfloat16),
+            jax.ShapeDtypeStruct((256,), jnp.bfloat16),
+            jax.ShapeDtypeStruct((256,), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+        )
+        fn = functools.partial(
+            cp_prefill.sliding_exchange_rows_from_qkv, page_size=PAGE, cfg=cfg
+        )
+        lowered = jax.jit(fn).trace(*args).lower(lowering_platforms=("tpu",))
+    assert lowered.out_info.shape == (13 * PAGE, 2 * 8 * 256)
+    assert "tpu_custom_call" in lowered.as_text()

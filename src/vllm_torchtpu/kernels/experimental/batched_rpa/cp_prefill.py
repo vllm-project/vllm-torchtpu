@@ -657,15 +657,47 @@ def window_rows_held(
     return pack_kv_rows(jnp.take(keys, rows, axis=0), jnp.take(values, rows, axis=0))
 
 
-def _window_rows(plan: ZigzagPlan, rank: Rank, position_pages: jax.Array) -> jax.Array:
-    """The rank's rows (indices) of the window pages, clipped to its rows."""
-    pp, ps = plan.piece_pages, plan.page_size
+def _window_local_pages(
+    plan: ZigzagPlan, rank: Rank, position_pages: jax.Array
+) -> jax.Array:
+    """The rank's pages (indices into its rows' pages) of the window pages,
+    clipped to its pages."""
+    pp = plan.piece_pages
     first, second = plan.rank_pieces(rank)
     piece = position_pages // pp
     local = jnp.where(
         piece == first, position_pages - first * pp, position_pages - second * pp + pp
     )
-    return (jnp.clip(local, 0, 2 * pp - 1)[:, None] * ps + jnp.arange(ps)).reshape(-1)
+    return jnp.clip(local, 0, 2 * pp - 1)
+
+
+def _window_rows(plan: ZigzagPlan, rank: Rank, position_pages: jax.Array) -> jax.Array:
+    """The rank's rows (indices) of the window pages, clipped to its rows."""
+    ps = plan.page_size
+    local = _window_local_pages(plan, rank, position_pages)
+    return (local[:, None] * ps + jnp.arange(ps)).reshape(-1)
+
+
+def _exchange_rows_of(
+    x: jax.Array,
+    plan: ZigzagPlan,
+    rank: Rank,
+    position_pages: jax.Array,
+    halo_pages: int,
+) -> jax.Array:
+    """x's rows (the rank's rows, first axis) in `sliding_exchange_rows`'
+    order: the tails of the rank's two pieces, then the window pages
+    (`_window_rows`), each page one dynamic slice."""
+    piece, ps = plan.piece_tokens, plan.page_size
+    halo = halo_pages * ps
+    local = _window_local_pages(plan, rank, position_pages)
+    window = [
+        jax.lax.dynamic_slice_in_dim(x, local[j] * ps, ps)
+        for j in range(position_pages.shape[0])
+    ]
+    return jnp.concatenate(
+        [x[piece - halo : piece], x[2 * piece - halo : 2 * piece], *window]
+    )
 
 
 def window_page_owners(plan: ZigzagPlan, position_pages: jax.Array) -> jax.Array:
@@ -729,6 +761,10 @@ class LayerConfig:
     # scales (`ragged_paged_attention(output_quant_dtype=...)`) instead of bf16
     # rows.
     fp8_out_rows: bool = False
+    # A sliding-window layer's exchange rows come from their own qkv rows
+    # (`sliding_exchange_rows_from_qkv`), and the layer bitcasts the gathered
+    # int8 rows to fp8 after taking the ones it reads.
+    exchange_from_qkv: bool = False
 
     def __post_init__(self):
         if not self.head_page_writes:
@@ -994,6 +1030,42 @@ def sliding_exchange_rows_from_kv(
     return jax.lax.bitcast_convert_type(rows.reshape(rows.shape[0], -1), jnp.int8)
 
 
+def sliding_exchange_rows_from_qkv(
+    qkv: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    q_norm_weight: jax.Array,
+    k_norm_weight: jax.Array,
+    seq_lens: jax.Array,
+    rank: jax.Array,
+    page_size: int,
+    *,
+    cfg: LayerConfig,
+) -> jax.Array:
+    """`sliding_exchange_rows_from_kv` of `qkv_prologue(qkv, cos, sin, ...)`'s
+    K/V, from the prologue of only the exchanged rows: the all-gather can start
+    while the prologue of the others runs. The prologue is row-wise, so the
+    rows are the same."""
+    rank = rank[0]
+    plan = cfg.plan(qkv.shape[0], page_size)
+    halo_pages, _ = _sliding_exchange_pages(cfg, page_size)
+    plan.check_halo_pages(halo_pages)
+    position_pages, _ = window_position_pages(
+        seq_lens[0], cfg.sliding_window, page_size
+    )
+    pick = functools.partial(
+        _exchange_rows_of,
+        plan=plan,
+        rank=rank,
+        position_pages=position_pages,
+        halo_pages=halo_pages,
+    )
+    _, new_kv = qkv_prologue(
+        pick(qkv), pick(cos), pick(sin), q_norm_weight, k_norm_weight, cfg=cfg
+    )
+    return jax.lax.bitcast_convert_type(new_kv.reshape(new_kv.shape[0], -1), jnp.int8)
+
+
 def sliding_attention_layer(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -1112,11 +1184,24 @@ def _sliding_attention(
             f"Exchange rows {gathered.shape} are not {cfg.world} x {num_rows} "
             f"rows of {width} bytes ({page_size}-token pages)."
         )
-    rows = jax.lax.bitcast_convert_type(gathered, keys.dtype)
-    rows = rows.reshape(cfg.world, num_rows, width)
+    if cfg.exchange_from_qkv:
+        # Bitcast only the rows read: the whole buffer's bitcast is a copy.
+        rows = gathered.reshape(cfg.world, num_rows, width)
+
+        def fp8(x):
+            return jax.lax.bitcast_convert_type(x, keys.dtype)
+    else:
+        rows = jax.lax.bitcast_convert_type(gathered, keys.dtype)
+        rows = rows.reshape(cfg.world, num_rows, width)
+
+        def fp8(x):
+            return x
+
     first_src, second_src = halo_neighbours(rank, cfg.world)
     halos = kv_pages_from_rows(
-        jnp.concatenate([rows[first_src, :halo], rows[second_src, halo : 2 * halo]]),
+        fp8(
+            jnp.concatenate([rows[first_src, :halo], rows[second_src, halo : 2 * halo]])
+        ),
         cfg.head_dim,
         page_size,
     )
@@ -1143,6 +1228,7 @@ def _sliding_attention(
         *tp_kv_heads(cfg.num_kv_heads, cfg.world, rank),
         cfg.head_dim,
     )
+    slots = fp8(slots)
     table = _request_block_table(block_tables, seq_lens) * page_stride
     writes = window_page_writes(table, position_pages, count)
     mine = cache_pages_from_slots(slots, cfg.kv_layout)
