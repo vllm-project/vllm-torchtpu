@@ -23,6 +23,17 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
+# Most tokens per grid step of the mixes + collapse kernel. Each step
+# pushes the resident fn chunks into the MXU once, so a bigger block
+# amortizes that over more tokens.
+COLLAPSE_TOKEN_BLOCK = 128
+# Its token block at small (decode-size) buckets, and the multiple blocks
+# round to.
+COLLAPSE_MIN_TOKEN_BLOCK = 64
+# A bucket is split into at least this many grid steps, so the next block's
+# DMA still hides behind compute; smaller buckets keep the minimum block.
+COLLAPSE_MIN_GRID_STEPS = 4
+
 
 def _mixes_kernel(x_ref, fn_ref, mixes_ref, sqrsum_ref):
     """One token block: exact GEMM against the resident stacked fn chunks.
@@ -158,10 +169,14 @@ def mhc_pre_mixes_collapse(
     rms_eps: float,
     hc_pre_eps: float,
     *,
-    token_block_size: int = 64,
+    token_block_size: int = COLLAPSE_TOKEN_BLOCK,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Mixes + in-block collapse: the full memory-bound half of ``mhc_pre``.
+
+    ``token_block_size`` is the most tokens per grid step; below it, a
+    bucket is split into COLLAPSE_MIN_GRID_STEPS blocks, but none smaller
+    than COLLAPSE_MIN_TOKEN_BLOCK.
 
     Returns (mixes (T, hc_mult3) f32 — raw, unscaled, for the XLA gates;
     sqrsum (T, 1) f32; layer_input2d (T, hidden_size) bf16).
@@ -188,9 +203,17 @@ def mhc_pre_mixes_collapse(
             + 3 * hc_mult3 * hc_hidden * 2
         )
 
+    per_step = utils.round_up(num_tokens, utils.SUBLANE) // COLLAPSE_MIN_GRID_STEPS
+    block = min(
+        token_block_size,
+        max(
+            COLLAPSE_MIN_TOKEN_BLOCK,
+            per_step // COLLAPSE_MIN_TOKEN_BLOCK * COLLAPSE_MIN_TOKEN_BLOCK,
+        ),
+    )
     tb, padded_tokens = utils.select_token_block(
         num_tokens,
-        token_block_size,
+        block,
         vmem_need=_vmem_need,
         vmem_limit_bytes=vmem_limit_bytes,
     )
@@ -250,7 +273,7 @@ def mhc_pre(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
-    token_block_size: int = 64,
+    token_block_size: int = COLLAPSE_TOKEN_BLOCK,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``mhc_pre`` with the mix GEMM AND the collapse in Pallas; only the

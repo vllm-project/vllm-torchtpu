@@ -556,7 +556,7 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
             _to_np(got_sqrsum), _to_np(want_sqrsum), rtol=F32_RTOL, atol=F32_ATOL
         )
 
-    @parameterized.product(num_tokens=[16, 128], sinkhorn_repeat=[1, 20])
+    @parameterized.product(num_tokens=[16, 128, 1024], sinkhorn_repeat=[1, 20])
     def test_full_op_matches_reference(self, num_tokens, sinkhorn_repeat):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
 
