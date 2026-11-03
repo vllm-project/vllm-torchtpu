@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
+    VLLM_TPU_QSA_DCP_Q_GATHER: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -753,6 +754,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the partial attention (all-to-all) instead of all-gathering every
     # partial; half the bytes, bit-identical.
     "VLLM_TPU_QSA_DCP_HEAD_EXCHANGE": env_bool("VLLM_TPU_QSA_DCP_HEAD_EXCHANGE"),
+    # Qwen4-exp token-shard DCP prefill: all-gather only the pair's q heads,
+    # not their gates (the DCP attention is ungated; each rank gates its own
+    # heads); half the bytes, bit-identical.
+    "VLLM_TPU_QSA_DCP_Q_GATHER": env_bool("VLLM_TPU_QSA_DCP_Q_GATHER"),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every
