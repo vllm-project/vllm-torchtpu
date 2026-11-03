@@ -189,6 +189,12 @@ class DFlashProposer:
         layout overrides this to K (the anchor is the first prediction)."""
         return K + 1
 
+    def _observe_draft_aux(
+        self, aux: torch.Tensor, chunk_index: int, chunk: DraftChunkInputs
+    ) -> None:
+        """Receives the second output of a chunk's
+        `_dflash_forward_and_sample`; `chunk_index` 0 starts a `propose`."""
+
     def load_model(self, target_model) -> None:
         """Load the draft model, share embeddings, and tag target layers."""
         # Tag the target model to extract aux hidden states
@@ -662,11 +668,12 @@ class DFlashProposer:
                     mesh=self.runner.mesh, vllm_config=self.vllm_config
                 ),
             ):
-                draft_tokens_chunk, _ = self._dflash_forward_and_sample(
+                draft_tokens_chunk, draft_aux = self._dflash_forward_and_sample(
                     input_ids, positions, block_size
                 )
 
             draft_logits_per_chunk.append(draft_tokens_chunk)
+            self._observe_draft_aux(draft_aux, i, chunk)
         for _ in range(extra_chunks):
             self._dp_dummy_forward()
 
