@@ -111,6 +111,7 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenLoadStoreSpec,
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
+    offload_cp_scale,
 )
 
 if TYPE_CHECKING:
@@ -278,8 +279,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         # A lazy store copies one HBM block under the key its cached hash
         # names, so every group must offload whole blocks, one chunk each.
         parallel_config = vllm_config.parallel_config
-        cp_size = int(parallel_config.decode_context_parallel_size or 1) * int(
-            parallel_config.prefill_context_parallel_size or 1
+        cp_size = offload_cp_scale(
+            int(parallel_config.prefill_context_parallel_size or 1),
+            int(parallel_config.decode_context_parallel_size or 1),
         )
         unsupported = [
             group.group_idx

@@ -3814,5 +3814,339 @@ class TestLazyOffload(unittest.TestCase):
         )
 
 
+# -- PCP manager x DCP ----------------------------------------------------------
+
+_CP_KERNEL_BLOCK = 4  # rank-local tokens per block
+_CP_ROW = 8  # values per token row
+_CP_INTERLEAVE = 4
+
+
+def _cp_spec(*, tp_size, pcp_size, dcp_size, manager, tokens_per_block=None):
+    """A real TPURaidenStoreOffloadingSpec under a CP topology, the PCP manager
+    flag patched to `manager`."""
+    import torch
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+    from vllm_torchtpu.offload import raiden_store as rs
+
+    if tokens_per_block is None:
+        with patch.object(rs.envs, "USE_TPU_PCP_MANAGER", manager):
+            scale = rs.offload_cp_scale(pcp_size, dcp_size)
+        tokens_per_block = _CP_KERNEL_BLOCK * scale
+    world = tp_size * pcp_size
+    config = SimpleNamespace(
+        extra_config={"cpu_bytes_to_use": 1 << 20},
+        enable_kv_cache_events=False,
+        groups=[SimpleNamespace(tokens_per_block=tokens_per_block)],
+        cache=SimpleNamespace(tokens_per_hash=tokens_per_block, blocks_per_chunk=1),
+        parallel=SimpleNamespace(
+            tp_size=tp_size,
+            pp_size=1,
+            pcp_size=pcp_size,
+            dcp_size=dcp_size,
+            world_size=world,
+        ),
+        worker_kv_bytes_per_block=_CP_KERNEL_BLOCK * _CP_ROW * 4,
+        engine_id="engine",
+    )
+    vllm_config = MagicMock()
+    vllm_config.kv_events_config.enable_kv_cache_events = False
+    vllm_config.model_config.is_hybrid = False
+    vllm_config.model_config.model = "org/model"
+    vllm_config.parallel_config.data_parallel_rank = 0
+    vllm_config.parallel_config.data_parallel_rank_local = 0
+    vllm_config.parallel_config.cp_kv_cache_interleave_size = _CP_INTERLEAVE
+    attn = MagicMock(spec=AttentionSpec)
+    attn.block_size = _CP_KERNEL_BLOCK
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=attn)],
+        kv_cache_tensors=[object()],
+    )
+    geometry = (
+        _CP_KERNEL_BLOCK,
+        (_CP_KERNEL_BLOCK, _CP_ROW),
+        torch.float32,
+        _CP_KERNEL_BLOCK,
+    )
+    with (
+        patch.object(rs.envs, "USE_TPU_PCP_MANAGER", manager),
+        patch.object(rs, "resolve_kernel_geometry", return_value=geometry),
+        patch.object(rs, "resolve_block_major_contract", return_value=None),
+    ):
+        return rs.TPURaidenStoreOffloadingSpec(config, vllm_config, kv_cache_config)
+
+
+class _RecordingKVCacheManager:
+    """Stand-in for raiden's KVCacheManager: records each registration."""
+
+    registered: list[dict] = []
+
+    def __init__(self, **kwargs):
+        type(self).registered.append(kwargs)
+
+
+class TestPcpManagerKvLayout(unittest.TestCase):
+    """PCP x DCP under USE_TPU_PCP_MANAGER: the KV world is plain DCP, so each
+    world rank offloads its DCP shard exactly as under DCP alone."""
+
+    def test_cp_scale_is_dcp_only_under_pcp_manager(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with patch.object(rs.envs, "USE_TPU_PCP_MANAGER", True):
+            self.assertTrue(rs.pcp_manager_kv_layout(2, 16))
+            self.assertEqual(rs.offload_cp_scale(2, 16), 16)
+            # One axis alone keeps the product (pcp-only, dcp-only).
+            self.assertFalse(rs.pcp_manager_kv_layout(2, 1))
+            self.assertEqual(rs.offload_cp_scale(2, 1), 2)
+            self.assertEqual(rs.offload_cp_scale(1, 16), 16)
+        with patch.object(rs.envs, "USE_TPU_PCP_MANAGER", False):
+            self.assertFalse(rs.pcp_manager_kv_layout(2, 16))
+            self.assertEqual(rs.offload_cp_scale(2, 16), 32)
+
+    def test_guard_relaxed_under_pcp_manager(self):
+        spec = _cp_spec(tp_size=8, pcp_size=2, dcp_size=16, manager=True)
+        self.assertTrue(spec.pcp_manager_kv)
+        self.assertEqual(spec.world_size, 16)
+
+    def test_legacy_pcp_guard_still_fires(self):
+        with self.assertRaisesRegex(AssertionError, "USE_TPU_PCP_MANAGER=1"):
+            _cp_spec(
+                tp_size=8,
+                pcp_size=2,
+                dcp_size=16,
+                manager=False,
+                tokens_per_block=_CP_KERNEL_BLOCK * 32,
+            )
+
+    def test_legacy_pcp_alone_unchanged(self):
+        spec = _cp_spec(tp_size=8, pcp_size=2, dcp_size=1, manager=False)
+        self.assertFalse(spec.pcp_manager_kv)
+        spec = _cp_spec(tp_size=8, pcp_size=2, dcp_size=1, manager=True)
+        self.assertFalse(spec.pcp_manager_kv)
+
+    def test_pcp_manager_needs_dcp_spanning_world(self):
+        with self.assertRaisesRegex(AssertionError, "dcp == tp \\* pcp == world"):
+            _cp_spec(tp_size=8, pcp_size=2, dcp_size=8, manager=True)
+
+    def test_pcp_manager_rejects_pcp_scaled_blocks(self):
+        # A block span scaled by pcp * dcp means the offload build took the PCP path.
+        with self.assertRaisesRegex(AssertionError, "cp=16"):
+            _cp_spec(
+                tp_size=8,
+                pcp_size=2,
+                dcp_size=16,
+                manager=True,
+                tokens_per_block=_CP_KERNEL_BLOCK * 32,
+            )
+
+    def _workers(self, spec_kwargs, *, dcp_rank_of=None, num_blocks=8):
+        """Start one worker per world rank, each on its own spec (one process
+        per rank), its KV filled with its DCP shard. Returns the registrations
+        and the specs."""
+        import torch
+        from vllm.v1.kv_offload.base import (
+            CanonicalKVCacheRef,
+            CanonicalKVCaches,
+            CanonicalKVCacheTensor,
+        )
+
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        tp_size = spec_kwargs["tp_size"]
+        pcp_size = spec_kwargs["pcp_size"]
+        dcp_size = spec_kwargs["dcp_size"]
+        page_bytes = _CP_KERNEL_BLOCK * _CP_ROW * 4
+        _RecordingKVCacheManager.registered = []
+        specs = []
+        for pcp_rank in range(pcp_size):
+            for tp_rank in range(tp_size):
+                world_rank = pcp_rank * tp_size + tp_rank
+                # The KV cache's DCP rank: PCP-major over TP, as vLLM groups it.
+                dcp_rank = (
+                    world_rank if dcp_rank_of is None else dcp_rank_of(world_rank)
+                )
+                spec = _cp_spec(**spec_kwargs)
+                kv = torch.zeros(num_blocks, page_bytes, dtype=torch.int8)
+                kv.view(torch.float32).view(num_blocks, _CP_KERNEL_BLOCK, _CP_ROW)[
+                    :
+                ] = _dcp_shard(dcp_rank % dcp_size, dcp_size, num_blocks)
+                kv_caches = CanonicalKVCaches(
+                    tensors=[
+                        CanonicalKVCacheTensor(tensor=kv, page_size_bytes=page_bytes)
+                    ],
+                    group_data_refs=[
+                        [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_bytes)]
+                    ],
+                )
+                with (
+                    _fake_tpu_sync(
+                        FAKE_STORAGE_IMPL, kv_cache_manager_cls=_RecordingKVCacheManager
+                    ),
+                    patch.object(rs.envs, "USE_TPU_PCP_MANAGER", spec_kwargs["manager"]),
+                    patch.object(
+                        rs,
+                        "resolve_kernel_geometry",
+                        return_value=(
+                            _CP_KERNEL_BLOCK,
+                            (_CP_KERNEL_BLOCK, _CP_ROW),
+                            torch.float32,
+                            _CP_KERNEL_BLOCK,
+                        ),
+                    ),
+                    patch.object(
+                        rs.RaidenStoreOffloadingWorker,
+                        "_controller_reachable",
+                        return_value=True,
+                    ),
+                    patch(
+                        "vllm.distributed.parallel_state.get_world_group",
+                        return_value=SimpleNamespace(rank_in_group=world_rank),
+                    ),
+                    patch(
+                        "vllm_torchtpu.distributed.dcp.get_dcp_rank",
+                        return_value=dcp_rank,
+                    ),
+                    patch(
+                        "vllm_torchtpu.distributed.dcp.get_dcp_world_size",
+                        return_value=dcp_size,
+                    ),
+                ):
+                    worker = spec.get_worker(kv_caches)
+                    worker._register_thread.join(timeout=10.0)
+                self.addCleanup(worker.shutdown)
+                specs.append(spec)
+        return list(_RecordingKVCacheManager.registered), specs
+
+    def test_worker_rank_must_be_its_dcp_rank(self):
+        kwargs = dict(tp_size=8, pcp_size=2, dcp_size=16, manager=True)
+        with self.assertRaisesRegex(AssertionError, "must be DCP rank"):
+            # A TP-major DCP grouping would hand rank 1 the shard of rank 8.
+            self._workers(kwargs, dcp_rank_of=lambda r: (r % 2) * 8 + r // 2)
+
+    def test_round_trip_matches_dcp16_without_pcp(self):
+        """Save every rank's block, load it into a fresh engine: the bytes come
+        back, and each shard holds what DCP16 (TP16, no PCP) stores there."""
+        import torch
+
+        pcp_regs, pcp_specs = self._workers(
+            dict(tp_size=8, pcp_size=2, dcp_size=16, manager=True)
+        )
+        dcp_regs, dcp_specs = self._workers(
+            dict(tp_size=16, pcp_size=1, dcp_size=16, manager=False)
+        )
+        self.assertEqual(
+            sorted(r["node_id"] for r in pcp_regs), list(range(16))
+        )
+        self.assertEqual(
+            [s.offload_logical_blocks_capacity for s in pcp_specs],
+            [s.offload_logical_blocks_capacity for s in dcp_specs],
+        )
+        self.assertEqual(
+            {s.world_size for s in pcp_specs}, {s.world_size for s in dcp_specs}
+        )
+
+        def save(regs, block_ids):
+            # Raiden copies one block per registered node, keyed by node_id.
+            return {
+                (b, r["node_id"]): r["kv_caches"][0][0][b].clone()
+                for r in regs
+                for b in block_ids
+            }
+
+        block_ids = [3, 5]
+        pcp_saved = save(pcp_regs, block_ids)
+        dcp_saved = save(dcp_regs, block_ids)
+        self.assertEqual(pcp_saved.keys(), dcp_saved.keys())
+        for key in pcp_saved:
+            self.assertTrue(torch.equal(pcp_saved[key], dcp_saved[key]), key)
+
+        # Load into a fresh PCP engine at other device blocks.
+        fresh_regs, _ = self._workers(
+            dict(tp_size=8, pcp_size=2, dcp_size=16, manager=True)
+        )
+        for r in fresh_regs:
+            r["kv_caches"][0][0].zero_()
+        dst = {3: 6, 5: 1}
+        for r in fresh_regs:
+            for b in block_ids:
+                r["kv_caches"][0][0][dst[b]] = pcp_saved[(b, r["node_id"])]
+        by_rank = {r["node_id"]: r["kv_caches"][0][0] for r in fresh_regs}
+        for b in block_ids:
+            tokens = _gather_dcp_block(by_rank, dst[b], 16)
+            expected = _logical_block(b)
+            self.assertTrue(torch.equal(tokens, expected), b)
+
+    def test_lazy_offload_accepts_dcp_span_under_pcp_manager(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingScheduler,
+        )
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched.config = SimpleNamespace(
+            kv_group_configs=(
+                SimpleNamespace(
+                    group_idx=0,
+                    tokens_per_chunk=256 * 16,
+                    sliding_window_size_in_chunks=None,
+                    requires_cow_source=False,
+                ),
+            ),
+            blocks_per_chunk=1,
+        )
+        sched._raiden_manager = MagicMock()
+        vllm_config = MagicMock()
+        vllm_config.parallel_config.prefill_context_parallel_size = 2
+        vllm_config.parallel_config.decode_context_parallel_size = 16
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=256))]
+        )
+        spec = SimpleNamespace(extra_config={})
+        with patch.object(rs.envs, "USE_TPU_PCP_MANAGER", True):
+            lazy = sched._init_lazy_offload(spec, vllm_config, kv_cache_config)
+        self.assertEqual(lazy.chunk_tokens, {0: 4096})
+        with (
+            patch.object(rs.envs, "USE_TPU_PCP_MANAGER", False),
+            self.assertRaisesRegex(ValueError, "lazy_offload"),
+        ):
+            sched._init_lazy_offload(spec, vllm_config, kv_cache_config)
+
+
+def _logical_block(b):
+    """Token rows of logical block `b`: row t is (b * span + t) * 100 + col."""
+    import torch
+
+    span = _CP_KERNEL_BLOCK * 16
+    t = torch.arange(span, dtype=torch.float32) + b * span
+    return t[:, None] * 100 + torch.arange(_CP_ROW, dtype=torch.float32)[None, :]
+
+
+def _dcp_shard(dcp_rank, dcp_size, num_blocks):
+    """Device block b of this DCP rank holds logical block b's tokens it owns."""
+    import torch
+
+    out = torch.empty(num_blocks, _CP_KERNEL_BLOCK, _CP_ROW)
+    for b in range(num_blocks):
+        rows = _logical_block(b)
+        owned = [
+            t for t in range(rows.shape[0]) if (t // _CP_INTERLEAVE) % dcp_size == dcp_rank
+        ]
+        out[b] = rows[owned]
+    return out
+
+
+def _gather_dcp_block(by_rank, device_block, dcp_size):
+    """Reassemble a logical block from every DCP rank's device block."""
+    import torch
+
+    span = _CP_KERNEL_BLOCK * dcp_size
+    out = torch.empty(span, _CP_ROW)
+    for t in range(span):
+        d = (t // _CP_INTERLEAVE) % dcp_size
+        slot = (t // (_CP_INTERLEAVE * dcp_size)) * _CP_INTERLEAVE + t % _CP_INTERLEAVE
+        out[t] = by_rank[d][device_block][slot]
+    return out
+
+
 if __name__ == "__main__":
     unittest.main()

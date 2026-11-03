@@ -31,7 +31,8 @@ Key components and mechanisms:
 
 - Model and parallelism support: Supports dense full-attention (single KV group)
   and hybrid attention+Mamba models on the TPU unified block pool. Supports
-  Prefill Context Parallelism (PCP) across ranks and Data Parallelism (DP)
+  Prefill Context Parallelism (PCP) across ranks, PCP x DCP under the PCP
+  manager (plain DCP KV layout, world rank = DCP rank), and Data Parallelism (DP)
   with independent per-engine controller ports and job names.
 
 - Two-phase admission: `insert` atomically pins the whole batch, then a
@@ -2050,6 +2051,19 @@ def resolve_storage_config(
     )
 
 
+def pcp_manager_kv_layout(pcp_size: int, dcp_size: int) -> bool:
+    """Whether PCP x DCP runs under the PCP manager, whose KV cache is plain
+    DCP (DCP = TP x PCP; PCP splits only a step's query tokens)."""
+    return pcp_size > 1 and dcp_size > 1 and bool(envs.USE_TPU_PCP_MANAGER)
+
+
+def offload_cp_scale(pcp_size: int, dcp_size: int) -> int:
+    """How many ranks' rank-local blocks one scheduler block spans."""
+    if pcp_manager_kv_layout(pcp_size, dcp_size):
+        return dcp_size
+    return pcp_size * dcp_size
+
+
 @dataclass(frozen=True)
 class StorageRankCoords:
     """Where one rank's shards sit in the storage layout.
@@ -2200,10 +2214,29 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             f"{config.cache.blocks_per_chunk}"
         )
         parallel = config.parallel
-        assert not (parallel.pcp_size > 1 and parallel.dcp_size > 1), (
-            "TPURaidenOffloadingConnector: concurrent PCP and DCP is not "
-            f"supported: got pcp={parallel.pcp_size}, dcp={parallel.dcp_size}"
+        self.pcp_manager_kv = pcp_manager_kv_layout(
+            parallel.pcp_size, parallel.dcp_size
         )
+        assert self.pcp_manager_kv or not (
+            parallel.pcp_size > 1 and parallel.dcp_size > 1
+        ), (
+            "TPURaidenOffloadingConnector: concurrent PCP and DCP is only "
+            "supported under USE_TPU_PCP_MANAGER=1: got "
+            f"pcp={parallel.pcp_size}, dcp={parallel.dcp_size}"
+        )
+        if self.pcp_manager_kv:
+            # World rank r holds DCP shard r only when DCP spans the whole world.
+            assert (
+                parallel.dcp_size
+                == parallel.tp_size * parallel.pcp_size
+                == parallel.world_size
+            ), (
+                "TPURaidenOffloadingConnector: the PCP manager needs "
+                f"dcp == tp * pcp == world, got dcp={parallel.dcp_size}, "
+                f"tp={parallel.tp_size}, pcp={parallel.pcp_size}, "
+                f"world={parallel.world_size}"
+            )
+        self.dcp_size = parallel.dcp_size
         # Count all ranks in the distributed execution group (TP * PP * PCP)
         # for registration barriers, save fanout, and total host capacity sizing.
         self.world_size = parallel.world_size
@@ -2245,10 +2278,11 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         # Verify CP scaling invariant: scheduler chunks at the logical all-CP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
-        # scales by pcp_size * dcp_size so OffloadKey spans match scheduler blocks.
+        # scales by pcp_size * dcp_size (dcp_size alone under the PCP manager)
+        # so OffloadKey spans match scheduler blocks.
+        expected_cp_scale = offload_cp_scale(parallel.pcp_size, parallel.dcp_size)
         for group_config, group in zip(config.groups, kv_cache_config.kv_cache_groups):
             if isinstance(group.kv_cache_spec, AttentionSpec):
-                expected_cp_scale = parallel.pcp_size * parallel.dcp_size
                 assert group_config.tokens_per_block == (
                     group.kv_cache_spec.block_size * expected_cp_scale
                 ), (
@@ -2410,6 +2444,26 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             from vllm.distributed import parallel_state
 
             rank = parallel_state.get_world_group().rank_in_group
+            if self.pcp_manager_kv:
+                from vllm_torchtpu.distributed.dcp import (
+                    get_dcp_rank,
+                    get_dcp_world_size,
+                )
+
+                # Shard identity is the world rank; it must name this rank's DCP shard.
+                dcp_rank, dcp_world = get_dcp_rank(), get_dcp_world_size()
+                assert (dcp_rank, dcp_world) == (rank, self.dcp_size), (
+                    "TPURaidenOffloadingConnector: under the PCP manager world "
+                    f"rank {rank} must be DCP rank {rank} of {self.dcp_size}, "
+                    f"got DCP rank {dcp_rank} of {dcp_world}"
+                )
+                logger.info(
+                    "TPURaidenOffloadingConnector: PCP manager: rank %d offloads "
+                    "DCP shard %d of %d",
+                    rank,
+                    dcp_rank,
+                    dcp_world,
+                )
             # Direct workers to dial the controller on store_server_ip when configured
             # (bind-and-advertise), falling back to loopback (127.0.0.1) for local runs.
             controller_address = (
