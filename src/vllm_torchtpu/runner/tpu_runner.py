@@ -803,11 +803,17 @@ class TPUModelRunner(GPUModelRunner):
         # recurrent slots (= max_num_reqs + 1, slot 0 = null block) instead of
         # the full attention `num_blocks`, and the per-request slot id is
         # carried in `AttentionMetadata.mamba_state_indices` instead of being
-        # derived from the attention `block_tables[:, 0]`. None until the
-        # override runs (and stays None if it is skipped, e.g. CPU-only tests
-        # or a user-pinned num_gpu_blocks_override) — in which case mamba and
-        # attention share the uniform `num_blocks` as before.
+        # derived from the attention `block_tables[:, 0]`. None until compact
+        # sizing runs in `get_kv_cache_spec` (and stays None if it is skipped,
+        # e.g. CPU-only tests or a user-pinned num_gpu_blocks_override) — in
+        # which case mamba and attention share the uniform `num_blocks` as
+        # before.
         self._mamba_num_blocks: int | None = None
+        # Hybrid KV block count this worker sized from its own HBM in
+        # `get_kv_cache_spec`. Kept apart from the user-facing
+        # `cache_config.num_gpu_blocks_override`: the executor reconciles it
+        # across workers and pins the result on the engine.
+        self._sized_num_gpu_blocks: int | None = None
         # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
         # allocated when a request first appears and retained until its KV
         # ownership ends. Keying on req_id (rather than persistent-batch
@@ -1796,6 +1802,9 @@ class TPUModelRunner(GPUModelRunner):
         self._refresh_smem_request_caps()
         with set_current_vllm_config(self.vllm_config):
             return self.kv_cache_manager.get_kv_cache_spec()
+
+    def get_sized_num_gpu_blocks(self) -> int | None:
+        return self._sized_num_gpu_blocks
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with set_current_vllm_config(self.vllm_config):
@@ -5656,8 +5665,8 @@ class TPUModelRunner(GPUModelRunner):
         leave free.
 
         TPUWorker.determine_available_memory and the KV cache manager's
-        block-count overrides both subtract it. Without one shared source, a
-        reserve added to only one of them would let the other fill that HBM
+        hybrid block-count sizing both subtract it. Without one shared source,
+        a reserve added to only one of them would let the other fill that HBM
         with KV blocks.
         """
         return utils.HbmReserves(

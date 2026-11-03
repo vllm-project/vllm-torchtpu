@@ -340,6 +340,19 @@ def test_determine_available_memory_is_min_across_ep_dp(
     assert worker.determine_available_memory() == (peer if coupled else local)
 
 
+def test_get_sized_num_gpu_blocks_reports_the_runner_count():
+    """Executors collect the worker-measured hybrid block count through this
+    RPC; it reads the runner, not the user-facing num_gpu_blocks_override."""
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None)
+    )
+    worker.model_runner = MagicMock()
+    worker.model_runner.get_sized_num_gpu_blocks.return_value = 4096
+
+    assert worker.get_sized_num_gpu_blocks() == 4096
+
+
 def test_determine_available_memory_fails_on_every_ep_dp_engine(monkeypatch):
     """An engine whose own budget fits still fails when a coupled peer's does not."""
     worker = _ep_dp_worker(

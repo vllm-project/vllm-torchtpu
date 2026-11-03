@@ -39,6 +39,8 @@ from vllm.v1.engine.input_processor import InputProcessor
 import vllm_torchtpu as plugin
 import vllm_torchtpu.platforms.tpu_platform as tpu_platform
 from vllm_torchtpu import patch_registry
+from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
+from vllm_torchtpu.executors.tpu_uniproc_executor import TpuUniProcExecutor
 from vllm_torchtpu.platforms.tpu_platform import (
     TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP,
     TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
@@ -678,6 +680,34 @@ class TestTpuPlatform:
         assert (
             vllm_config.compilation_config.dynamic_shapes_config.type == expected_type
         )
+
+    @pytest.mark.parametrize(
+        ("tensor_parallel_size", "executor_cls"),
+        [(1, TpuUniProcExecutor), (2, TpuMultiprocExecutor)],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_picks_an_executor_that_pins_kv_sizing(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        tensor_parallel_size,
+        executor_cls,
+    ):
+        """Workers record their hybrid KV block count without writing the
+        user-facing override, so every single-host engine, the single-chip
+        one included, must run an executor that pins it on the engine."""
+        monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
+        vllm_config.parallel_config.tensor_parallel_size = tensor_parallel_size
+        vllm_config.parallel_config.world_size = tensor_parallel_size
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.parallel_config.distributed_executor_backend is executor_cls
 
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(

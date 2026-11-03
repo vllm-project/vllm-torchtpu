@@ -437,7 +437,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         },
         # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
         # resolved block count, which every rank shares via kv_cache_config.
-        # The raw per-worker num_gpu_blocks_override is a pre-alignment HBM
+        # The raw per-worker sized hybrid block count is a pre-alignment HBM
         # measurement that diverges by a few blocks across ranks (the executor
         # aligns the value actually used to min()); hashing it would split
         # ranks into separate cache dirs and force asymmetric recompiles.

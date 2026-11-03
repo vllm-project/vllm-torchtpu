@@ -295,11 +295,15 @@ class TestKVCacheManager:
         self.runner.kv_cache_manager = KVCacheManager(self.runner)
         # Compact-mamba state starts unset (matches real __init__).
         self.runner._mamba_num_blocks = None
+        self.runner._sized_num_gpu_blocks = None
         self.runner._uniform_mamba_layout = vllm_config.kv_transfer_config is not None
         self.runner._unified_kv_layout = False
         self.runner.kv_cache_raw_tensors = []
         self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
             self.runner
+        )
+        self.runner.get_sized_num_gpu_blocks = (
+            TPUModelRunner.get_sized_num_gpu_blocks.__get__(self.runner)
         )
         self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
             self.runner
@@ -352,7 +356,91 @@ class TestKVCacheManager:
         #       (9,663,676,416 - 3,394,560) // (1 * 4096) = 2,358,467
         mock_mem_info.assert_called_once()
         assert self.runner._mamba_num_blocks == 17
-        assert self.runner.cache_config.num_gpu_blocks_override == 2358467
+        # The worker-measured count lives on the runner; the user-facing
+        # override stays untouched for the executor to pin.
+        assert self.runner.get_sized_num_gpu_blocks() == 2358467
+        assert self.runner.cache_config.num_gpu_blocks_override is None
+
+    def _hybrid_layers(self) -> dict:
+        """1 attention + 3 mamba layers, as in test_update_mamba_page_size_padded."""
+        layers = {"attn_0": _attention_layer_mock()}
+        layers["attn_0"].num_kv_heads = 2
+        layers["attn_0"].head_size = 128
+        for i in range(3):
+            layers[f"mamba_{i}"] = DummyMamba()
+        return layers
+
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_hybrid_sizing_measures_hbm_once(self, mock_mem_info, mock_get_page_size):
+        """The spec is rebuilt more than once (vLLM's get_kv_cache_specs, the
+        drafter's load_model). A worker process never sees the override the
+        engine pins, so its own sized count must stop later calls from
+        re-measuring HBM that the KV cache may already occupy."""
+        layers = self._hybrid_layers()
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+
+        mock_mem_info.return_value = (5 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024)
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+
+        mock_mem_info.assert_called_once()
+        assert self.runner._mamba_num_blocks == 17
+        assert self.runner.get_sized_num_gpu_blocks() == 2358467
+        assert self.runner.cache_config.num_gpu_blocks_override is None
+
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_hybrid_sizing_respects_user_override(
+        self, mock_mem_info, mock_get_page_size
+    ):
+        self.runner.cache_config.num_gpu_blocks_override = 1234
+
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(
+            self._hybrid_layers()
+        )
+
+        mock_mem_info.assert_not_called()
+        assert self.runner._mamba_num_blocks is None
+        assert self.runner.get_sized_num_gpu_blocks() is None
+        assert self.runner.cache_config.num_gpu_blocks_override == 1234
+
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_uniform_hybrid_sizing_records_two_step_count(
+        self, mock_mem_info, mock_get_page_size
+    ):
+        """With compact sizing off (a KV connector), the two-step flooring
+        count is recorded the same way."""
+        self.runner._uniform_mamba_layout = True
+
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(
+            self._hybrid_layers()
+        )
+
+        avail = int(10 * utils.GBYTES * 0.9)
+        assert self.runner._mamba_num_blocks is None
+        assert self.runner.get_sized_num_gpu_blocks() == (
+            4096 * (avail // 4096) // 203776
+        )
+        assert self.runner.cache_config.num_gpu_blocks_override is None
 
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
@@ -463,7 +551,8 @@ class TestKVCacheManager:
         #   avail = 10 GiB * 0.9 - 1 GiB = 8,589,934,592
         #   attn_num_blocks = (8,589,934,592 - 3 * 17 * 66560) // 4096
         #                   = 2,096,323  (vs 2,358,467 with no reserve)
-        assert self.runner.cache_config.num_gpu_blocks_override == 2096323
+        assert self.runner.get_sized_num_gpu_blocks() == 2096323
+        assert self.runner.cache_config.num_gpu_blocks_override is None
 
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
@@ -492,7 +581,8 @@ class TestKVCacheManager:
         self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
 
         # Same 1 GiB cut as test_kv_connector_reserve_shrinks_num_blocks_override.
-        assert self.runner.cache_config.num_gpu_blocks_override == 2096323
+        assert self.runner.get_sized_num_gpu_blocks() == 2096323
+        assert self.runner.cache_config.num_gpu_blocks_override is None
 
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape",

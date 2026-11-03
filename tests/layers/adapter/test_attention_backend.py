@@ -19,6 +19,8 @@ from unittest.mock import MagicMock
 import pytest
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
+from vllm_torchtpu.executors.tpu_uniproc_executor import TpuUniProcExecutor
 from vllm_torchtpu.layers.adapter import attention_backend as ab
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
@@ -46,7 +48,7 @@ def registered():
     delattr(AttentionBackendEnum, member.name)
 
 
-def _vllm_config(backend, *, executor="uni", dp_backend="mp"):
+def _vllm_config(backend, *, executor=TpuUniProcExecutor, dp_backend="mp"):
     return SimpleNamespace(
         attention_config=SimpleNamespace(backend=backend),
         parallel_config=SimpleNamespace(
@@ -108,15 +110,35 @@ def test_platform_still_overrides_an_unsupported_builtin():
 @pytest.mark.parametrize(
     ("env", "executor", "in_ray_actor", "reason"),
     [
-        ({"TPU_MULTIHOST_BACKEND": "ray"}, "uni", False, "TPU_MULTIHOST_BACKEND=ray"),
-        ({}, "uni", True, "Ray actor"),
+        (
+            {"TPU_MULTIHOST_BACKEND": "ray"},
+            TpuUniProcExecutor,
+            False,
+            "TPU_MULTIHOST_BACKEND=ray",
+        ),
+        ({}, TpuUniProcExecutor, True, "Ray actor"),
         ({"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}, "uni", False, "spawn"),
+        (
+            {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"},
+            TpuUniProcExecutor,
+            False,
+            "spawn",
+        ),
         (
             {
                 "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                 "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
             },
             "mp",
+            False,
+            "spawn",
+        ),
+        (
+            {
+                "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+                "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+            },
+            TpuMultiprocExecutor,
             False,
             "spawn",
         ),
@@ -141,6 +163,7 @@ def test_check_rejects_ray_data_parallel_engines(registered, monkeypatch):
         ab.check_attention_backend_config(_vllm_config(registered, dp_backend="ray"))
 
 
+@pytest.mark.parametrize("executor", ["uni", TpuUniProcExecutor])
 @pytest.mark.parametrize(
     "env",
     [
@@ -152,13 +175,15 @@ def test_check_rejects_ray_data_parallel_engines(registered, monkeypatch):
         },
     ],
 )
-def test_check_accepts_forked_or_in_process_engines(registered, monkeypatch, env):
+def test_check_accepts_forked_or_in_process_engines(
+    registered, monkeypatch, env, executor
+):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
     monkeypatch.setattr(ab, "is_in_ray_actor", lambda: False)
 
-    ab.check_attention_backend_config(_vllm_config(registered))
+    ab.check_attention_backend_config(_vllm_config(registered, executor=executor))
 
 
 def test_check_ignores_the_default_backend(monkeypatch):

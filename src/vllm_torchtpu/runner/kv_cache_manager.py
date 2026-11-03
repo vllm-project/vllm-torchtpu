@@ -869,10 +869,9 @@ class KVCacheManager:
         # `max_num_reqs + 1` recurrent slots and give the freed HBM to the
         # attention pool. Mamba state is recurrent — one slot per active
         # request — so the uniform layout wastes `num_blocks - max_num_reqs`
-        # mamba slots forever. On success this pins
-        # `num_gpu_blocks_override` to the (larger) attention block count and
-        # sets `_mamba_num_blocks`.
-        self._maybe_set_compact_mamba_num_blocks_override(
+        # mamba slots forever. On success this records the (larger) attention
+        # block count in `_sized_num_gpu_blocks` and sets `_mamba_num_blocks`.
+        self._maybe_size_compact_mamba_blocks(
             attn_page_size_bytes,
             int(unpadded_mamba_page_size),
             num_attn_groups,
@@ -881,27 +880,38 @@ class KVCacheManager:
         )
 
         # Fallback (compact sizing skipped, e.g. CPU-only tests or a
-        # user-pinned num_gpu_blocks_override): pin vLLM's num_blocks via the two-step
-        # flooring that keeps peak HBM within `gpu_memory_utilization ×
-        # total_hbm` at high utilization. See `_maybe_set_num_blocks_override`
+        # user-pinned num_gpu_blocks_override): size vLLM's num_blocks via the
+        # two-step flooring that keeps peak HBM within `gpu_memory_utilization ×
+        # total_hbm` at high utilization. See `_maybe_size_uniform_hybrid_blocks`
         # for the formula and rationale; the short version is that vLLM's
         # single-step `floor(avail / (uniform × group_size))` can land one
         # block higher than the two-step value, and that extra block ×
         # group_size × uniform bytes is enough to push past the budget against
         # imprecision in vLLM's `avail` estimate.
         if self.runner._mamba_num_blocks is None:
-            self._maybe_set_num_blocks_override(
+            self._maybe_size_uniform_hybrid_blocks(
                 attn_page_size_bytes, int(uniform_page_size_bytes), group_size
             )
 
+    def _hybrid_block_count_decided(self) -> bool:
+        """Whether the hybrid block count needs no sizing here: the user pinned
+        `num_gpu_blocks_override`, or an earlier `get_kv_cache_spec` call
+        already sized it. The spec is rebuilt more than once (e.g. by the
+        drafter's `load_model`), and later calls keep the first measured count
+        instead of re-measuring HBM."""
+        return (
+            self.runner.cache_config.num_gpu_blocks_override is not None
+            or self.runner._sized_num_gpu_blocks is not None
+        )
+
     def _available_kv_cache_hbm(self) -> int:
-        """KV-cache HBM budget for the block-count override paths.
+        """KV-cache HBM budget for the hybrid block-count sizing paths.
 
         Matches `TPUWorker.determine_available_memory()`: the
         `utils.compute_hbm_budget` result (which reserves the
         `gpu_memory_utilization` cap minus
         `TPUModelRunner.post_profile_hbm_reserves` (HBM allocated after
-        profile_run, such as the offload H2D staging pool). Sizing overrides
+        profile_run, such as the offload H2D staging pool). Sizing block counts
         against this budget keeps them from filling these reserves back up
         with KV blocks and defeating the worker-side subtraction.
         """
@@ -915,7 +925,7 @@ class KVCacheManager:
             budget.available - sum(self.runner.post_profile_hbm_reserves()),
         )
 
-    def _maybe_set_compact_mamba_num_blocks_override(
+    def _maybe_size_compact_mamba_blocks(
         self,
         attn_page_size_bytes: int,
         unpadded_mamba_page_size_bytes: int,
@@ -923,15 +933,15 @@ class KVCacheManager:
         num_mamba_groups: int,
         group_size: int,
     ) -> None:
-        """Cap mamba layers at `max_num_reqs + 1` recurrent slots and pin
-        `cache_config.num_gpu_blocks_override` so the freed HBM grows the
-        attention pool.
+        """Cap mamba layers at `max_num_reqs + 1` recurrent slots and record
+        the attention block count in `runner._sized_num_gpu_blocks` so the
+        freed HBM grows the attention pool.
 
         Tradeoff vs. the uniform num_blocks layout
         ------------------------------------------
         Mamba state is recurrent: one slot per *active* request, regardless of
-        context length. The uniform layout (set by
-        `_maybe_set_num_blocks_override`) gives every layer the same
+        context length. The uniform layout (sized by
+        `_maybe_size_uniform_hybrid_blocks`) gives every layer the same
         `num_blocks`, leaving `num_blocks - max_num_reqs` mamba slots idle
         forever. The compact layout caps mamba at `max_num_reqs + 1` (the `+1`
         is the null/sentinel slot), which is strictly better for any model
@@ -964,18 +974,19 @@ class KVCacheManager:
             num_mamba_groups: # mamba layers backed by each KVCacheTensor.
             group_size: # layer regions vLLM allocates (= layers per
                 kv-cache group); the same value passed to
-                `_maybe_set_num_blocks_override`.
+                `_maybe_size_uniform_hybrid_blocks`.
 
-        On success: sets `cache_config.num_gpu_blocks_override` (attention
-        block count) and `_mamba_num_blocks`. Raises when the KV budget cannot
-        hold the mamba slots; the remaining precondition-fail paths leave both
-        unset so the caller falls back to uniform sizing.
+        On success: sets `runner._sized_num_gpu_blocks` (attention block
+        count) and `_mamba_num_blocks`; the executor reconciles the former
+        across workers into the engine's `num_gpu_blocks_override`. Raises when
+        the KV budget cannot hold the mamba slots; the remaining
+        precondition-fail paths leave both unset so the caller falls back to
+        uniform sizing.
         """
         if self.runner._uniform_mamba_layout:
             logger.info("Compact mamba sizing skipped.")
             return
-        cache_config = self.runner.cache_config
-        if cache_config.num_gpu_blocks_override is not None:
+        if self._hybrid_block_count_decided():
             return
         if group_size <= 0:
             return
@@ -1022,7 +1033,7 @@ class KVCacheManager:
                 f"`gpu_memory_utilization` or lower `max_num_seqs`."
             )
 
-        cache_config.num_gpu_blocks_override = int(attn_num_blocks)
+        self.runner._sized_num_gpu_blocks = int(attn_num_blocks)
         self.runner._mamba_num_blocks = int(mamba_num_blocks)
 
         # Total HBM = group_size regions, each holding num_attn_groups
@@ -1037,7 +1048,7 @@ class KVCacheManager:
             * unpadded_mamba_page_size_bytes
         )
         logger.info(
-            "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
+            "Compact-mamba KV cache: sized_num_gpu_blocks=%d (attn), "
             "_mamba_num_blocks=%d. HBM split: attn=%.2f GiB; "
             "mamba=%.2f GiB; total=%.2f GiB / avail=%.2f GiB.",
             attn_num_blocks,
@@ -1048,11 +1059,11 @@ class KVCacheManager:
             avail / (2**30),
         )
 
-    def _maybe_set_num_blocks_override(
+    def _maybe_size_uniform_hybrid_blocks(
         self, attn_page_size_bytes: int, uniform_page_size_bytes: int, group_size: int
     ) -> None:
-        """Pin `cache_config.num_gpu_blocks_override` to the two-step
-        flooring value that keeps peak HBM within the user-set
+        """Record in `runner._sized_num_gpu_blocks` the two-step flooring
+        value that keeps peak HBM within the user-set
         `gpu_memory_utilization` budget at high utilization.
 
         Formula:
@@ -1068,10 +1079,11 @@ class KVCacheManager:
         single-step formula silently removes.
 
         `avail` comes from `_available_kv_cache_hbm`, so the block count
-        pinned here matches the KV-cache budget
+        sized here matches the KV-cache budget
         `TPUWorker.determine_available_memory()` hands vLLM.
 
-        Skipped only if the user has explicitly set `num_gpu_blocks_override`.
+        Skipped if the user has explicitly set `num_gpu_blocks_override` or an
+        earlier call already sized the pool.
 
         Args:
             attn_page_size_bytes: TPU-actual bytes per block for one
@@ -1084,11 +1096,12 @@ class KVCacheManager:
                 vLLM to compute `num_blocks` from the attention tensor size.
 
         Returns:
-            None. Side effect: sets `cache_config.num_gpu_blocks_override`
-            if all preconditions hold; otherwise leaves it unset.
+            None. Side effect: sets `runner._sized_num_gpu_blocks` if all
+            preconditions hold; otherwise leaves it unset. The executor
+            reconciles it across workers into the engine's
+            `num_gpu_blocks_override`.
         """
-        cache_config = self.runner.cache_config
-        if cache_config.num_gpu_blocks_override is not None:
+        if self._hybrid_block_count_decided():
             return
 
         avail = self._available_kv_cache_hbm()
@@ -1103,9 +1116,9 @@ class KVCacheManager:
         if num_blocks_tpu <= 0:
             return
 
-        cache_config.num_gpu_blocks_override = int(num_blocks_tpu)
+        self.runner._sized_num_gpu_blocks = int(num_blocks_tpu)
         logger.info(
-            "Hybrid KV cache: setting num_gpu_blocks_override=%d to align "
+            "Hybrid KV cache: sized_num_gpu_blocks=%d to align "
             "the scheduler's block pool with per-layer TPU allocation "
             "(avail=%d, naive_vllm_num_blocks=%d).",
             num_blocks_tpu,
@@ -1689,7 +1702,7 @@ class KVCacheManager:
 
                 if isinstance(kv_cache_spec, MambaSpec):
                     # Compact-mamba: allocate only `_mamba_num_blocks`
-                    # recurrent slots (= max_num_reqs + 1) when the override
+                    # recurrent slots (= max_num_reqs + 1) when compact sizing
                     # succeeded; otherwise fall back to the uniform
                     # `num_blocks`. Attention layers always keep `num_blocks`.
                     mamba_num_blocks = (

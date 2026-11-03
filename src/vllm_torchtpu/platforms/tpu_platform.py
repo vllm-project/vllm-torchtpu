@@ -1145,10 +1145,14 @@ class TpuPlatform(Platform):
                 and parallel_config.tensor_parallel_size == 1
             ):
                 logger.info(
-                    "Force using UniProcExecutor for TPU on "
+                    "Force using TpuUniProcExecutor for TPU on "
                     "single host without tensor/pipeline parallelism."
                 )
-                parallel_config.distributed_executor_backend = "uni"
+                from vllm_torchtpu.executors.tpu_uniproc_executor import (
+                    TpuUniProcExecutor,
+                )
+
+                parallel_config.distributed_executor_backend = TpuUniProcExecutor
             else:
                 logger.info(
                     "Force using TpuMultiprocExecutor for TPU on single host "
@@ -1189,10 +1193,12 @@ class TpuPlatform(Platform):
                 logger.info("Force using RayDistributedExecutor for TPU on multihost.")
         else:
             logger.warning(
-                "Unknown TPU multihost backend: %s. Using uniproc_executor.",
+                "Unknown TPU multihost backend: %s. Using TpuUniProcExecutor.",
                 multihost_backend,
             )
-            parallel_config.distributed_executor_backend = "uni"
+            from vllm_torchtpu.executors.tpu_uniproc_executor import TpuUniProcExecutor
+
+            parallel_config.distributed_executor_backend = TpuUniProcExecutor
 
         # After the executor is chosen: whether it starts processes decides
         # whether a registered backend's name reaches them.

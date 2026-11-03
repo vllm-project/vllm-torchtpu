@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from vllm import envs as vllm_envs
 from vllm.ray.lazy_utils import is_in_ray_actor
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
 from vllm_torchtpu import envs
 
@@ -62,6 +63,12 @@ def is_registered_attention_backend(backend: AttentionBackendEnum | None) -> boo
     return backend is not None and backend.name.lower() in _REGISTERED_BACKENDS
 
 
+def _is_uniproc_executor_backend(backend: object) -> bool:
+    return backend == "uni" or (
+        isinstance(backend, type) and issubclass(backend, UniProcExecutor)
+    )
+
+
 def check_attention_backend_config(vllm_config: "VllmConfig") -> None:
     """Raise if a registered backend is selected for an engine whose processes
     cannot rebuild its name.
@@ -79,7 +86,9 @@ def check_attention_backend_config(vllm_config: "VllmConfig") -> None:
     parallel_config = vllm_config.parallel_config
     starts_processes = (
         vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING
-        or parallel_config.distributed_executor_backend != "uni"
+        or not _is_uniproc_executor_backend(
+            parallel_config.distributed_executor_backend
+        )
     )
     reasons = []
     if envs.TPU_MULTIHOST_BACKEND == "ray":

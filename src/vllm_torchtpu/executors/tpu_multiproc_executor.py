@@ -19,35 +19,18 @@ instead of all 14 shapes sharing a single window and timing out.
 """
 
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from vllm_torchtpu.executors.kv_block_override import reconcile_num_gpu_blocks_override
+from vllm_torchtpu.executors.kv_block_override import KVBlockOverrideMixin
 
 
-class TpuMultiprocExecutor(MultiprocExecutor):
+class TpuMultiprocExecutor(KVBlockOverrideMixin, MultiprocExecutor):
     def _init_executor(self) -> None:
         # EngineCore does not run platform patch setup before spawning workers.
         from vllm_torchtpu import _patch_multiproc_worker_global_rank_env
 
         _patch_multiproc_worker_global_rank_env()
         super()._init_executor()
-
-    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
-        specs = super().get_kv_cache_specs()
-
-        if self.vllm_config.cache_config.num_gpu_blocks_override is None:
-            # Compact-mamba sizing sets `num_gpu_blocks_override` on the worker's
-            # cache_config during the RPC above; workers are separate processes, so
-            # copy it to the engine-side config here.
-            pc = self.vllm_config.parallel_config
-            agreed = reconcile_num_gpu_blocks_override(
-                self.collective_rpc("get_num_gpu_blocks_override"),
-                workers_per_stage=pc.world_size // pc.pipeline_parallel_size,
-            )
-            if agreed is not None:
-                self.vllm_config.cache_config.num_gpu_blocks_override = agreed
-
-        return specs
 
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
         super().initialize_from_config(kv_cache_configs)

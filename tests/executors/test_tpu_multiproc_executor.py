@@ -17,18 +17,25 @@ from unittest.mock import MagicMock, patch
 import pytest
 from vllm.config import CacheConfig
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
 from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
+from vllm_torchtpu.executors.tpu_uniproc_executor import TpuUniProcExecutor
 
 # Sentinel returned by the parent get_kv_cache_specs; the override plumbing must
 # pass this through unchanged.
 _SPECS = [{"layer": MagicMock()}]
 
 
-def _make_executor(engine_override, worker_overrides, pipeline_parallel_size=1):
+def _make_executor(
+    engine_override,
+    worker_overrides,
+    pipeline_parallel_size=1,
+    executor_cls=TpuMultiprocExecutor,
+):
     """Build an executor without running __init__, with a mocked engine
     cache_config and a collective_rpc that returns the per-worker overrides."""
-    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor = executor_cls.__new__(executor_cls)
     executor.vllm_config = MagicMock()
     executor.vllm_config.cache_config = MagicMock(spec=CacheConfig)
     executor.vllm_config.cache_config.num_gpu_blocks_override = engine_override
@@ -46,7 +53,7 @@ def test_copies_override_from_workers_when_engine_unset(mock_super):
     specs = executor.get_kv_cache_specs()
 
     assert specs is _SPECS
-    executor.collective_rpc.assert_called_once_with("get_num_gpu_blocks_override")
+    executor.collective_rpc.assert_called_once_with("get_sized_num_gpu_blocks")
     assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5428
 
 
@@ -175,20 +182,50 @@ def test_pipeline_stages_without_any_override_leave_it_unset(mock_super):
     assert executor.vllm_config.cache_config.num_gpu_blocks_override is None
 
 
+@patch.object(UniProcExecutor, "get_kv_cache_specs", return_value=_SPECS)
+def test_uniproc_executor_pins_worker_sized_override(mock_super):
+    """The in-process worker shares the engine's cache_config but no longer
+    writes num_gpu_blocks_override itself, so the single-process executor
+    pins the sized count just like the multi-process ones."""
+    executor = _make_executor(
+        engine_override=None,
+        worker_overrides=[5428],
+        executor_cls=TpuUniProcExecutor,
+    )
+
+    specs = executor.get_kv_cache_specs()
+
+    assert specs is _SPECS
+    executor.collective_rpc.assert_called_once_with("get_sized_num_gpu_blocks")
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5428
+
+
+@patch.object(UniProcExecutor, "get_kv_cache_specs", return_value=_SPECS)
+def test_uniproc_executor_preserves_user_override(mock_super):
+    executor = _make_executor(
+        engine_override=1234,
+        worker_overrides=[5428],
+        executor_cls=TpuUniProcExecutor,
+    )
+
+    specs = executor.get_kv_cache_specs()
+
+    assert specs is _SPECS
+    executor.collective_rpc.assert_not_called()
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 1234
+
+
 def _make_ray_executor(engine_override, worker_overrides):
     """Same shape as _make_executor but for the Ray multi-host executor."""
     from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
         RayDistributedExecutorV2,
     )
 
-    executor = RayDistributedExecutorV2.__new__(RayDistributedExecutorV2)
-    executor.vllm_config = MagicMock()
-    executor.vllm_config.cache_config = MagicMock(spec=CacheConfig)
-    executor.vllm_config.cache_config.num_gpu_blocks_override = engine_override
-    executor.vllm_config.parallel_config.world_size = len(worker_overrides)
-    executor.vllm_config.parallel_config.pipeline_parallel_size = 1
-    executor.collective_rpc = MagicMock(return_value=worker_overrides)
-    return executor
+    return _make_executor(
+        engine_override=engine_override,
+        worker_overrides=worker_overrides,
+        executor_cls=RayDistributedExecutorV2,
+    )
 
 
 def test_ray_executor_tolerates_measurement_jitter():

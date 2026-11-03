@@ -239,7 +239,7 @@ def estimate_kv_connector_hbm_reserve(vllm_config: Any) -> int:
 
     Offloading specs can advertise an estimate_hbm_reserve_bytes classmethod
     through the same metadata used by vLLM's spec factory. Keep this lookup
-    shared so worker budgeting and runner block-count overrides cannot
+    shared so worker budgeting and runner hybrid block-count sizing cannot
     disagree about the available KV-cache memory.
     """
     kv_tc = vllm_config.kv_transfer_config

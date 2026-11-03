@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reconcile per-worker compact-mamba block-count overrides.
+"""Reconcile per-worker hybrid KV block counts.
 
 Workers size the KV pool from their OWN measured free HBM, so their block
 counts never agree exactly. The spread that matters is relative: a few tens
@@ -23,12 +23,22 @@ Accept whichever tolerance is larger, so the check still catches a worker
 that genuinely disagrees about the budget, and pin the MINIMUM so no worker
 is asked for more blocks than it measured.
 
-Shared by every executor that collects `get_num_gpu_blocks_override` from
-its workers (multiproc and Ray multi-host); build 155 failed on the Ray
+Shared by every executor that mixes in `KVBlockOverrideMixin`
+(`TpuUniProcExecutor`, `TpuMultiprocExecutor`, and
+`RayDistributedExecutorV2`), which collects `get_sized_num_gpu_blocks` from
+its workers right after `get_kv_cache_specs`; build 155 failed on the Ray
 path's own copy of this logic, which still demanded exact agreement.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, cast
+
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.executor.abstract import Executor
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 logger = init_logger(__name__)
 
@@ -64,8 +74,8 @@ def reconcile_num_gpu_blocks_override(
         missing = [i for i, value in enumerate(stage_values) if value is None]
         if missing:
             raise ValueError(
-                f"[kv-sizing] pipeline stage(s) {missing} set no compact-mamba "
-                "attention block count while the other stages did (per-stage "
+                f"[kv-sizing] pipeline stage(s) {missing} set no hybrid KV "
+                "block count while the other stages did (per-stage "
                 f"values: {stage_values}). vLLM applies one block count to "
                 "every stage, and a stage that did not size its own pool has "
                 "no measured capacity for it. Partition the layers so every "
@@ -82,19 +92,18 @@ def reconcile_num_gpu_blocks_override(
     tol = max(_NUM_BLOCKS_OVERRIDE_TOL, int(lo * _NUM_BLOCKS_OVERRIDE_REL_TOL))
     if hi - lo > tol:
         raise ValueError(
-            "[kv-sizing] workers disagree on the compact-mamba "
-            f"attention block count by {hi - lo} blocks "
+            "[kv-sizing] workers disagree on the hybrid KV "
+            f"block count by {hi - lo} blocks "
             f"(min={lo}, max={hi}, tolerance={tol}). Each worker "
             "sizes the pool from its own measured free HBM, so a "
             "spread this large means the workers do not have "
             "comparable HBM budgets -- check the per-worker "
-            "'Compact-mamba KV cache:' lines in "
-            "tpu_runner._maybe_set_compact_mamba_num_blocks_"
-            f"override for the outlier. Per-worker values: "
-            f"{sorted(overrides)}"
+            "'Compact-mamba KV cache:' or 'Hybrid KV cache:' lines from "
+            "runner/kv_cache_manager.py for the outlier. "
+            f"Per-worker values: {sorted(overrides)}"
         )
     logger.info(
-        "[kv-sizing] compact-mamba attention blocks across %d "
+        "[kv-sizing] hybrid KV blocks across %d "
         "workers: min=%d max=%d spread=%d (tolerance=%d); "
         "pinning num_gpu_blocks_override=%d",
         len(overrides),
@@ -105,3 +114,29 @@ def reconcile_num_gpu_blocks_override(
         lo,
     )
     return lo
+
+
+class KVBlockOverrideMixin:
+    """Executor mixin that pins the worker-sized hybrid KV block count.
+
+    Workers record their hybrid KV block count during `get_kv_cache_spec`
+    without touching the user-facing `cache_config.num_gpu_blocks_override`.
+    Place this mixin before the concrete ``Executor`` base class so that,
+    right after ``super().get_kv_cache_specs()``, it reconciles the
+    worker-sized counts onto the engine's ``num_gpu_blocks_override`` unless
+    the user pinned one.
+    """
+
+    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+        # pyrefly: ignore[missing-attribute]
+        specs: list[dict[str, KVCacheSpec]] = super().get_kv_cache_specs()
+        executor = cast("Executor", self)
+        if executor.vllm_config.cache_config.num_gpu_blocks_override is None:
+            pc = executor.vllm_config.parallel_config
+            agreed = reconcile_num_gpu_blocks_override(
+                executor.collective_rpc("get_sized_num_gpu_blocks"),
+                workers_per_stage=pc.world_size // pc.pipeline_parallel_size,
+            )
+            if agreed is not None:
+                executor.vllm_config.cache_config.num_gpu_blocks_override = agreed
+        return specs
