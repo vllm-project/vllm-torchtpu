@@ -401,3 +401,64 @@ def validate_exported_model_dir(output_dir: str) -> None:
                         f"{actual_out['shape']}"
                     )
                 _check_dtype(m_out, actual_out["dtype"], where)
+
+    _check_mtp_draft(meta, functions)
+
+
+def _check_mtp_draft(meta: dict[str, Any], functions: dict[str, Any]) -> None:
+    """The MTP drafting contract across functions (RFC 0002, `mtp_draft`).
+
+    An artifact declaring `speculative_config.method = "mtp"` exports
+    `mtp_draft` for exactly the `forward` buckets; each variant takes the
+    forward's `hidden_states` and returns `draft_tokens` `[max_num_seqs, k]`.
+    """
+    serving = meta.get("serving_config") or {}
+    speculative = serving.get("speculative_config") or {}
+    mtp = functions.get("mtp_draft")
+    if speculative.get("method") == "mtp" and not mtp:
+        raise ValueError(
+            "speculative_config declares method 'mtp' but the artifact exports "
+            "no mtp_draft"
+        )
+    if not mtp:
+        return
+    forward = functions.get("forward") or {}
+    if set(mtp) != set(forward):
+        raise ValueError(
+            f"mtp_draft buckets {sorted(mtp, key=int)} differ from forward buckets "
+            f"{sorted(forward, key=int)}"
+        )
+    k = int(speculative.get("num_speculative_tokens", 1))
+    want_draft = [int(serving.get("max_num_seqs", 0)), k]
+    for bucket, spec in mtp.items():
+        where = f"mtp_draft_bucket{bucket}"
+        hidden_in = [
+            i
+            for i in spec.get("inputs", [])
+            if i.get("argument_type") == "intermediate"
+            and i.get("name") == "hidden_states"
+        ]
+        hidden_out = [
+            o
+            for o in forward[bucket].get("outputs", [])
+            if o.get("argument_type") == "intermediate"
+            and o.get("name") == "hidden_states"
+        ]
+        if len(hidden_in) != 1 or not hidden_out:
+            raise ValueError(f"{where} must take forward's hidden_states intermediate")
+        if (hidden_in[0].get("shape"), hidden_in[0].get("dtype")) != (
+            hidden_out[0].get("shape"),
+            hidden_out[0].get("dtype"),
+        ):
+            raise ValueError(
+                f"{where} takes hidden_states {hidden_in[0].get('dtype')}"
+                f"{hidden_in[0].get('shape')}, forward returns "
+                f"{hidden_out[0].get('dtype')}{hidden_out[0].get('shape')}"
+            )
+        draft = [o for o in spec.get("outputs", []) if o.get("name") == "draft_tokens"]
+        if (
+            len(draft) != 1
+            or draft[0].get("shape") != want_draft
+            or (canonical_dtype(draft[0].get("dtype", "")) != "i32")
+        ):
+            raise ValueError(f"{where} must return draft_tokens i32{want_draft}")

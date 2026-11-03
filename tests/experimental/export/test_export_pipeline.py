@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from collections.abc import Mapping, Sequence
@@ -152,6 +153,16 @@ class _TinyPyTorchCausalLM(nn.Module):
                 rotary_dim=32,
                 mrope_section=mrope_section,
             )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: list[torch.Tensor] | None = None,
+        attn_metadata: Any = None,
+    ) -> torch.Tensor:
+        # As a vLLM *ForCausalLM, whose forward the export calls, runs its decoder.
+        return self.model(input_ids, positions, kv_caches, attn_metadata)
 
 
 class _TinyTorchExportableLLM(api.ExportableTextOnlyLLM):
@@ -591,7 +602,8 @@ def test_metadata_declares_the_speculative_config_it_was_exported_with(
         max_num_seqs=8,
         max_model_len=64,
         token_buckets=(8,),
-        req_buckets=(4, 8),
+        # 8 requests verifying 4 drafts each: 40 LM-head rows.
+        req_buckets=(8, 40),
         emit_byte_tokenizer=True,
         speculative_config=speculative,
     )
@@ -720,12 +732,20 @@ def test_export_speculative_config_keeps_vllm_field_names() -> None:
         "prompt_lookup_max": 3,
         "prompt_lookup_min": 3,
     }
+    assert cli.export_speculative_config(
+        {"method": "mtp", "num_speculative_tokens": 2}
+    ) == {"method": "mtp", "num_speculative_tokens": 2}
 
 
 @pytest.mark.parametrize(
     "raw, error",
     [
-        ({"method": "mtp", "num_speculative_tokens": 1}, "not supported"),
+        ({"method": "eagle3", "num_speculative_tokens": 1}, "not supported"),
+        ({"method": "mtp", "num_speculative_tokens": 0}, "num_speculative_tokens"),
+        (
+            {"method": "mtp", "num_speculative_tokens": 1, "prompt_lookup_max": 3},
+            "fields",
+        ),
         ({"method": "ngram", "prompt_lookup_max": 3}, "num_speculative_tokens"),
         ({"method": "ngram", "num_speculative_tokens": 2}, "prompt_lookup_max"),
         (
@@ -918,12 +938,164 @@ def test_build_export_config_raises_block_size_to_fit_smem(tmp_path: Path) -> No
     assert big.max_num_pages * 4 <= 1024 * 1024 // 2
 
 
+def test_build_export_config_reads_model_shape_from_vllm_model_config(
+    tmp_path: Path,
+) -> None:
+    # Gemma 4 declares KV heads and head_dim per layer (sliding vs full
+    # attention): transformers raises when they are read as one global value.
+    # vLLM's ModelConfig resolves them, so the export reads its accessors.
+    class AmbiguousPerLayerAttributeError(Exception):
+        """Like transformers' error: not an AttributeError, so not defaulted."""
+
+    class PerLayerHfConfig:
+        num_attention_heads = 32
+        hidden_size = 5376
+        vocab_size = 262144
+
+        def __getattr__(self, name: str) -> Any:
+            if name in ("num_key_value_heads", "head_dim"):
+                raise AmbiguousPerLayerAttributeError(f"{name!r} is per layer")
+            raise AttributeError(name)
+
+    model_config = SimpleNamespace(
+        model=str(tmp_path),
+        dtype="bfloat16",
+        max_model_len=2048,
+        hf_config=PerLayerHfConfig(),
+        get_total_num_kv_heads=lambda: 4,
+        get_head_size=lambda: 512,
+        get_total_num_hidden_layers=lambda: 60,
+        get_vocab_size=lambda: 262144,
+        get_hidden_size=lambda: 5376,
+    )
+    cfg = universal_adapter.build_export_config_from_vllm(
+        SimpleNamespace(
+            model_config=model_config,
+            cache_config=SimpleNamespace(block_size=16),
+            scheduler_config=SimpleNamespace(max_num_seqs=8),
+        )
+    )
+
+    assert (cfg.num_layers, cfg.num_q_heads) == (60, 32)
+    assert (cfg.num_kv_heads, cfg.head_dim) == (4, 512)
+
+
+def test_build_export_config_pages_kv_at_the_attention_kernels_block_size(
+    tmp_path: Path,
+) -> None:
+    from vllm.model_executor.layers.attention import Attention
+
+    class RpaBackend:
+        @staticmethod
+        def get_supported_kernel_block_sizes(kv_cache_spec: Any = None) -> list[int]:
+            return [128, 256]
+
+        @staticmethod
+        def get_name() -> str:
+            return "RPA"
+
+    attn = object.__new__(Attention)
+    attn.attn_backend = RpaBackend
+
+    def cfg(block_size: int) -> Any:
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                model=str(tmp_path), dtype="bfloat16", max_model_len=2048
+            ),
+            cache_config=SimpleNamespace(block_size=block_size, num_gpu_blocks=100),
+            scheduler_config=SimpleNamespace(max_num_seqs=64),
+            compilation_config=SimpleNamespace(
+                static_forward_context={"layers.3.self_attn.attn": attn}
+            ),
+        )
+
+    build = universal_adapter.build_export_config_from_vllm
+    # A unified block pool sizes a hybrid model's blocks to hold a recurrent
+    # state; the runner splits each into kernel pages, the largest that divides.
+    paged = build(cfg(1152))
+    assert (paged.block_size, paged.num_blocks) == (128, 900)
+    paged = build(cfg(1280))
+    assert (paged.block_size, paged.num_blocks) == (256, 500)
+    assert build(cfg(256)).block_size == 256
+    with pytest.raises(ValueError, match="No common block size"):
+        build(cfg(1000))
+
+
+def test_build_export_config_req_buckets_cover_speculative_verify_rows(
+    tmp_path: Path,
+) -> None:
+    def cfg(max_num_seqs: int, num_speculative_tokens: int | None) -> Any:
+        spec = (
+            None
+            if num_speculative_tokens is None
+            else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        )
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                model=str(tmp_path), dtype="bfloat16", max_model_len=128
+            ),
+            cache_config=SimpleNamespace(block_size=16),
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+            speculative_config=spec,
+        )
+
+    build = universal_adapter.build_export_config_from_vllm
+    tokens = (16, 256)
+    # 8 requests verifying 2 drafts each run the LM head on 24 rows.
+    assert build(cfg(8, 2), token_buckets=tokens).req_buckets == (8, 16, 24)
+    assert build(cfg(8, None), token_buckets=tokens).req_buckets == (8,)
+    # A step's LM-head rows are some of its tokens, so they stop at the largest
+    # token bucket: 64 requests x 5 rows would be 320.
+    assert build(cfg(64, 4), token_buckets=tokens).req_buckets == (
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+    )
+
+
 def _adapter_without_model(cfg: api.TextOnlyLLMExportConfig) -> Any:
     adapter = object.__new__(universal_adapter.UniversalVllmExportableLLM)
     adapter._export_config = cfg
     adapter._vllm_config = None
     adapter._model = nn.Module()
     return adapter
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+def test_greedy_tokens_match_the_argmax_of_the_gathered_logits(tp: int) -> None:
+    """Each rank's shard maximum, gathered, names the full argmax, ties included."""
+    shard = 5
+    vocab = shard * tp
+    full = torch.zeros(4, vocab, dtype=torch.bfloat16)
+    full[0, vocab - 1] = 3  # the maximum in the last shard
+    full[1, [vocab - 2, 1]] = 2  # tied across shards (at tp > 1): the lower index wins
+    full[2, [vocab - 3, vocab - 1]] = 1  # tied within a shard
+    full[3] = -1  # every logit negative and equal
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=shard * tp, num_partitions=tp
+    )
+
+    def greedy(rank: int, gather: Any) -> torch.Tensor:
+        adapter = _adapter_without_model(cfg)
+        adapter._local_logits = lambda h, w: full[:, rank * shard : (rank + 1) * shard]
+        with mock.patch(
+            "vllm.distributed.tensor_model_parallel_all_gather", side_effect=gather
+        ):
+            return adapter.greedy_tokens(torch.zeros(4, 1), torch.zeros(1))
+
+    # Record what each rank contributes to each gather, then gather it.
+    sent: list[list[torch.Tensor]] = []
+    for rank in range(tp):
+        sent.append([])
+        greedy(rank, lambda t, dim=-1, out=sent[-1]: out.append(t) or t.repeat(1, tp))
+    for rank in range(tp):
+        gathered = [torch.cat(ts, dim=-1) for ts in zip(*sent)]
+        tokens = greedy(rank, gathered)
+        assert tokens.dtype == torch.int32
+        assert torch.equal(tokens, full.argmax(dim=-1).to(torch.int32))
 
 
 def test_fit_num_blocks_to_hbm_fills_the_budget_with_exported_kv_blocks() -> None:
@@ -987,6 +1159,152 @@ def test_fit_num_blocks_to_hbm_takes_recurrent_state_off_the_budget_first() -> N
     fixed = cfg.num_state_slots * state_bytes
     assert adapter.fit_num_blocks_to_hbm(0.9, fixed + 33 * kv_block_bytes + 1) == 33
     assert adapter.abstract_states()[1].shape[0] == cfg.num_state_slots
+
+
+def test_fit_num_blocks_to_hbm_counts_the_mtp_draft_kv() -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny",
+        num_layers=1,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+    )
+    adapter = _adapter_without_model(cfg)
+    adapter._mtp_draft = nn.Module()
+
+    def kv() -> list[api.ShapeDtypeStruct]:
+        return [api.ShapeDtypeStruct((adapter.export_config.num_blocks, 1024), "bf16")]
+
+    adapter.abstract_states = kv
+    adapter.mtp_abstract_states = kv
+    # Each block is a target KV block and an MTP KV block: 2 x 2048 bytes.
+    assert adapter.fit_num_blocks_to_hbm(0.9, 10 * 4096 + 1) == 10
+
+
+def test_a_speculating_recurrent_model_keeps_a_checkpoint_per_draft_token() -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny",
+        num_layers=1,
+        max_num_seqs=8,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 2},
+    )
+    assert (cfg.recurrent_window, cfg.num_state_slots) == (3, 8 * 3 + 1)
+    adapter = _adapter_without_model(cfg)
+    adapter._has_recurrent_layers = lambda: True
+    assert adapter.extra_user_inputs() == [
+        ("mamba_state_indices", (8,)),
+        ("mamba_slot_read_offsets", (25,)),
+        ("mamba_ckpt_indices", (8, 3)),
+    ]
+    # Attention runs verify windows as mixed sequences, the recurrent kernels in
+    # their windowed segment: each gets its own request distribution.
+    assert exporter._req_dist_len(adapter) == 6
+    plain = _adapter_without_model(dataclasses.replace(cfg, speculative_config=None))
+    plain._has_recurrent_layers = lambda: True
+    assert plain.export_config.num_state_slots == 9
+    assert plain.extra_user_inputs() == [("mamba_state_indices", (8,))]
+    assert exporter._req_dist_len(plain) == 3
+
+
+def test_a_recurrent_model_verifying_without_a_drafter_keeps_its_checkpoints() -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", num_layers=1, max_num_seqs=8, max_verify_tokens=3
+    )
+    assert (cfg.recurrent_window, cfg.num_state_slots) == (4, 8 * 4 + 1)
+    adapter = _adapter_without_model(cfg)
+    adapter._has_recurrent_layers = lambda: True
+    assert adapter.extra_user_inputs() == [
+        ("mamba_state_indices", (8,)),
+        ("mamba_slot_read_offsets", (33,)),
+        ("mamba_ckpt_indices", (8, 4)),
+    ]
+    assert exporter._req_dist_len(adapter) == 6
+    # A drafter proposing 2 tokens leaves the window at 4 verify slots.
+    mtp = {"method": "mtp", "num_speculative_tokens": 2}
+    assert dataclasses.replace(cfg, speculative_config=mtp).recurrent_window == 4
+    with pytest.raises(ValueError, match="must exceed"):
+        dataclasses.replace(
+            cfg, speculative_config={**mtp, "num_speculative_tokens": 3}
+        )
+    with pytest.raises(ValueError, match=">= 0"):
+        dataclasses.replace(cfg, max_verify_tokens=-1)
+
+
+def test_max_verify_tokens_loads_vllm_with_a_drafterless_speculative_config(
+    tmp_path: Path,
+) -> None:
+    spec = cli.verify_window_speculative_config(3)
+    assert spec["method"] == "ngram" and spec["num_speculative_tokens"] == 3
+    assert cli.export_speculative_config(spec) == spec
+    # The artifact declares none, and its forced verify rows skip the LM head, so
+    # the request buckets cover one row per request.
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model=str(tmp_path), dtype="bfloat16", max_model_len=128
+        ),
+        cache_config=SimpleNamespace(block_size=16),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+    )
+    cfg = universal_adapter.build_export_config_from_vllm(
+        vllm_config, token_buckets=(16, 256), max_verify_tokens=3
+    )
+    assert (cfg.speculative_config, cfg.max_verify_tokens) == (None, 3)
+    assert cfg.req_buckets == (8,)
+    # With MTP, vLLM loads the artifact's config with the wider window, and the
+    # request buckets cover the drafter's rows only.
+    mtp = {"method": "mtp", "num_speculative_tokens": 2}
+    assert cli.verify_window_speculative_config(8, mtp) == {
+        "method": "mtp",
+        "num_speculative_tokens": 8,
+    }
+    vllm_config.speculative_config = SimpleNamespace(num_speculative_tokens=8)
+    cfg = universal_adapter.build_export_config_from_vllm(
+        vllm_config,
+        token_buckets=(16, 256),
+        max_verify_tokens=8,
+        num_speculative_tokens=2,
+    )
+    assert cfg.req_buckets == (8, 16, 24)
+    args = SimpleNamespace(speculative_config=mtp, max_verify_tokens=2)
+    with pytest.raises(ValueError, match="must exceed"):
+        cli.run_export_from_args(args, vllm_config=vllm_config)
+
+
+def _target_with_mtp_draft() -> nn.Module:
+    """A target with a tied LM head, and an MTP draft sharing its embedding and
+    LM head, with its own `fc` and a buffer."""
+    target = nn.Module()
+    target.model = nn.Module()
+    target.model.embed_tokens = nn.Embedding(8, 4)
+    target.lm_head = nn.Linear(4, 8, bias=False)
+    target.lm_head.weight = target.model.embed_tokens.weight
+    draft = nn.Module()
+    draft.model = nn.Module()
+    draft.model.embed_tokens = target.model.embed_tokens
+    draft.model.fc = nn.Linear(8, 4, bias=False)
+    draft.model.register_buffer("scale", torch.ones(2))
+    draft.lm_head = target.lm_head
+    object.__setattr__(target, universal_adapter.MTP_DRAFT_ATTR, draft)
+    return target
+
+
+def test_mtp_draft_weights_keep_the_target_names_they_share() -> None:
+    target = _target_with_mtp_draft()
+    assert universal_adapter.mtp_draft_names(target) == {
+        "model.embed_tokens.weight": "model.embed_tokens.weight",
+        "model.fc.weight": "mtp.fc.weight",
+        "lm_head.weight": "model.embed_tokens.weight",
+        "model.scale": "mtp.scale",
+    }
+    # The draft is not part of the target's module tree.
+    assert not any("fc" in n for n, _ in target.named_parameters())
+    tensors = checkpoint.local_tensors(target)
+    assert tensors["mtp.fc.weight"] is target._export_mtp_draft.model.fc.weight
+    assert set(tensors) == {
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "mtp.fc.weight",
+        "mtp.scale",
+    }
 
 
 def test_fit_num_blocks_to_hbm_rejects_a_budget_without_room_for_a_block() -> None:
@@ -1349,6 +1667,8 @@ def test_compute_logits_returns_the_vocabulary_without_padding() -> None:
     exportable = SimpleNamespace(
         _export_config=SimpleNamespace(vocab_size=10),
         _local_logits=lambda h, w: torch.matmul(h, w.T),
+        _model=nn.Module(),
+        _vllm_config=None,
     )
     hidden = torch.ones(3, 4)
     lm_head = torch.arange(48.0).reshape(12, 4)
@@ -1357,6 +1677,40 @@ def test_compute_logits_returns_the_vocabulary_without_padding() -> None:
     )
     assert logits.shape == (3, 10)
     assert torch.equal(logits, torch.matmul(hidden, lm_head.T)[:, :10])
+
+
+class _SoftCappedLM(nn.Module):
+    """A vLLM-style LM whose `compute_logits` soft-caps after the projection."""
+
+    def __init__(self, tied: bool) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(10, 4)
+        if not tied:
+            self.lm_head = nn.Linear(4, 10, bias=False)
+
+    def head(self) -> torch.Tensor:
+        return (getattr(self, "lm_head", None) or self.model.embed_tokens).weight
+
+    def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        return 2.0 * torch.tanh(torch.matmul(hidden, self.head().T) / 2.0)
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_compute_logits_runs_the_models_own_with_the_bound_head(tied: bool) -> None:
+    """The model's post-projection steps are exported, with the weight input bound."""
+    model = _SoftCappedLM(tied)
+    adapter = _adapter_without_model(
+        api.TextOnlyLLMExportConfig(model_name="tiny", vocab_size=10)
+    )
+    adapter._model = model
+    adapter._vllm_config = SimpleNamespace()
+    hidden = torch.randn(3, 4)
+    # A weight other than the module's own, so the bound one must be the one used.
+    weight = torch.randn(10, 4) * 5
+    logits = adapter.compute_logits(hidden, weight)
+    torch.testing.assert_close(logits, 2.0 * torch.tanh(hidden @ weight.T / 2.0))
+    assert not torch.equal(model.head(), weight)
 
 
 class _LlamaLikeBackbone(nn.Module):
@@ -1395,11 +1749,11 @@ class _KvCacheArgBackbone(_LlamaLikeBackbone):
 def _run_backbone_forward(backbone: nn.Module) -> tuple[Sequence[Any], Any]:
     cfg = api.TextOnlyLLMExportConfig(model_name="tiny", num_layers=0)
     adapter = _adapter_without_model(cfg)
-    adapter._model = nn.Module()
-    adapter._model.model = backbone
+    # The export calls the model's own forward, here the backbone's.
+    adapter._model = backbone
     weight = torch.arange(32.0).reshape(8, 4)
     return adapter.forward(
-        {"model.embed_tokens.weight": weight},
+        {"embed_tokens.weight": weight},
         [],
         input_ids=torch.tensor([1, 2, 3]),
         positions=torch.tensor([0, 1, 2]),
@@ -1767,9 +2121,19 @@ class _BackboneWithRouter(nn.Module):
         return input_ids.float()[:, None] + self.experts.router.bias[None, :]
 
 
+class _CausalLMOf(nn.Module):
+    """A vLLM-style *ForCausalLM around `model`: its forward runs the decoder."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> Any:
+        return self.model(input_ids, positions)
+
+
 def test_forward_binds_weights_held_outside_the_module_tree() -> None:
-    wrapper = nn.Module()
-    wrapper.model = _BackboneWithRouter()
+    wrapper = _CausalLMOf(_BackboneWithRouter())
     original = wrapper.model.gate.bias
     exportable = object.__new__(universal_adapter.UniversalVllmExportableLLM)
     exportable._model = wrapper
@@ -1903,3 +2267,362 @@ def test_zero_temperature_rows_take_the_argmax() -> None:
         uniform,
     )
     assert tokens.squeeze(-1).tolist() == [1, 0]
+
+
+class _TinyMtpExportableLLM(_TinyTorchExportableLLM):
+    """The tiny model with an MTP layer: its own `mtp.fc` among its parameters,
+    the target's embedding and LM head, and one paged KV state."""
+
+    def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
+        cfg = self._cfg
+        return {
+            **super().abstract_params(),
+            "mtp.fc.weight": api.ShapeDtypeStruct(
+                (2 * cfg.hidden_size, cfg.hidden_size), cfg.dtype
+            ),
+        }
+
+    def mtp_abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
+        cfg = self._cfg
+        return [
+            api.ShapeDtypeStruct(
+                (cfg.num_blocks, cfg.block_size, 2 * cfg.num_kv_heads, cfg.head_dim),
+                cfg.dtype,
+            )
+        ]
+
+    def mtp_draft(
+        self,
+        weights: Mapping[str, torch.Tensor],
+        kv_caches: Sequence[torch.Tensor],
+        *,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        req_dist: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> tuple[Sequence[torch.Tensor], torch.Tensor]:
+        del positions, kv_lens, block_tables, query_start_loc, req_dist
+        emb = weights["model.embed_tokens.weight"][input_ids.to(torch.int64)]
+        fused = torch.cat([emb, hidden_states.to(emb.dtype)], dim=-1)
+        rows = torch.matmul(fused, weights["mtp.fc.weight"])[
+            last_token_indices.to(torch.int64)
+        ]
+        logits = torch.matmul(rows, weights["lm_head.weight"])
+        return list(kv_caches), logits.argmax(dim=-1).to(torch.int32).view(-1, 1)
+
+
+class _ReadTracker(torch.Tensor):
+    """A lowering argument that records, in `reads`, whether any op used it."""
+
+    reads: set[int]
+    arg_index: int
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        flat, _ = torch.utils._pytree.tree_flatten((args, kwargs))
+        for a in flat:
+            if isinstance(a, _ReadTracker):
+                a.reads.add(a.arg_index)
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*args, **kwargs)
+
+
+def _mock_lower_reading_used_args(
+    fn: Any,
+    arg_specs: Sequence[api.ShapeDtypeStruct],
+    *,
+    donate_argnums: Sequence[int] = (),
+    module_name: str | None = None,
+) -> str:
+    """Like `_mock_lower_torch_callable_to_mlir`, but `@main` reads only the
+    arguments that `fn` used, as the traced graph of a real lowering does."""
+    reads: set[int] = set()
+
+    def tracked(*args: torch.Tensor) -> Any:
+        wrapped = []
+        for i, a in enumerate(args):
+            t = a.as_subclass(_ReadTracker)
+            t.reads, t.arg_index = reads, i
+            wrapped.append(t)
+        return fn(*wrapped)
+
+    mlir = _mock_lower_torch_callable_to_mlir(
+        tracked, arg_specs, donate_argnums=donate_argnums, module_name=module_name
+    )
+    return "\n".join(
+        line
+        for line in mlir.split("\n")
+        if not (
+            "optimization_barrier" in line
+            and int(line.split("%arg")[1].split(")")[0]) not in reads
+        )
+    )
+
+
+def _mtp_config() -> api.TextOnlyLLMExportConfig:
+    return api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8, 16),
+        req_buckets=(4, 8, 16),
+        emit_byte_tokenizer=True,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+    )
+
+
+def _export_mtp(tmp_path: Path, model_cls: type = _TinyMtpExportableLLM) -> str:
+    cfg = _mtp_config()
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_reading_used_args,
+    ):
+        exporter.export(model_cls(cfg), out_dir)
+    return out_dir
+
+
+def test_mtp_draft_follows_the_contract(tmp_path) -> None:
+    out_dir = _export_mtp(tmp_path)
+    meta = json.loads(Path(out_dir, "metadata.json").read_text())
+    functions = meta["functions"]
+    assert set(functions["mtp_draft"]) == set(functions["forward"]) == {"8", "16"}
+    assert meta["serving_config"]["speculative_config"]["method"] == "mtp"
+
+    variant = functions["mtp_draft"]["16"]
+    by_name = {i["name"]: i for i in variant["inputs"]}
+    assert Path(out_dir, variant["file_path"]).is_file()
+    # The forward's controls, shifted input_ids, then the last accepted rows.
+    user = [i["name"] for i in variant["inputs"] if i["argument_type"] == "user_io"]
+    assert user == [
+        "input_ids",
+        "positions",
+        "kv_lens",
+        "block_tables",
+        "query_start_loc",
+        "req_dist",
+        "last_token_indices",
+    ]
+    assert by_name["last_token_indices"]["shape"] == [8]
+    assert by_name["hidden_states"]["argument_type"] == "intermediate"
+    assert by_name["hidden_states"]["shape"] == [16, 16]
+
+    # Shared weights bind the target's slots; the MTP layer's own get new ones.
+    forward_slots = {
+        i["name"]: i["index"]
+        for i in functions["forward"]["16"]["inputs"]
+        if i["argument_type"] == "weight"
+    }
+    logits_slots = {
+        i["name"]: i["index"]
+        for i in functions["compute_logits"]["4"]["inputs"]
+        if i["argument_type"] == "weight"
+    }
+    assert (
+        by_name["model.embed_tokens.weight"]["index"]
+        == forward_slots["model.embed_tokens.weight"]
+    )
+    assert by_name["lm_head.weight"]["index"] == logits_slots["lm_head.weight"]
+    assert "mtp.fc.weight" not in forward_slots
+    # mtp_draft takes the weights it reads: the shared ones, then its own.
+    weights = [i["name"] for i in variant["inputs"] if i["argument_type"] == "weight"]
+    assert weights == ["model.embed_tokens.weight", "lm_head.weight", "mtp.fc.weight"]
+    assert by_name["mtp.fc.weight"]["index"] not in forward_slots.values()
+
+    # The MTP KV is a donated state numbered after the target's.
+    target_states = [
+        i for i in functions["forward"]["16"]["inputs"] if i["argument_type"] == "state"
+    ]
+    mtp_state = by_name["mtp_kv_cache_layer_0"]
+    assert mtp_state["buffer_donor"] is True
+    assert mtp_state["index"] == len(target_states)
+    draft = [o for o in variant["outputs"] if o["name"] == "draft_tokens"]
+    assert draft[0]["shape"] == [8, 1] and draft[0]["dtype"] == "i32"
+
+
+class _TappableMtpExportableLLM(_TinyMtpExportableLLM):
+    """`_TinyMtpExportableLLM` whose forward and draft run modules a debug tap
+    can hook: the target's `final` and the draft's `fc_act`, which the chain
+    would call once per draft."""
+
+    def __init__(self, cfg: api.TextOnlyLLMExportConfig) -> None:
+        super().__init__(cfg)
+        self.model = nn.Module()
+        self.model.final = nn.Tanh()
+        draft = nn.Module()
+        draft.model = nn.Module()
+        draft.model.fc_act = nn.Tanh()
+        object.__setattr__(self.model, universal_adapter.MTP_DRAFT_ATTR, draft)
+
+    def forward(self, weights, kv_caches, **controls):  # type: ignore[override]
+        kvs, hidden = super().forward(weights, kv_caches, **controls)
+        return kvs, self.model.final(hidden)
+
+    def mtp_draft(self, weights, kv_caches, **controls):  # type: ignore[override]
+        draft = getattr(self.model, universal_adapter.MTP_DRAFT_ATTR)
+        hidden = draft.model.fc_act(controls.pop("hidden_states"))
+        draft.model.fc_act(hidden)
+        return super().mtp_draft(weights, kv_caches, hidden_states=hidden, **controls)
+
+
+def test_debug_taps_export_tapped_variants_under_assets_extra(tmp_path) -> None:
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_reading_used_args,
+    ):
+        exporter.export(
+            _TappableMtpExportableLLM(_mtp_config()),
+            out_dir,
+            debug_taps=["final", "mtp.fc_*"],
+        )
+    manifest = json.loads(Path(out_dir, "assets.extra/debug/taps.json").read_text())
+    functions = manifest["functions"]
+    # The smallest token bucket only, after the serving variant's own results:
+    # the forward's one state and hidden_states, the draft's state and drafts.
+    forward = functions["forward"]["8"]
+    assert set(functions["forward"]) == set(functions["mtp_draft"]) == {"8"}
+    assert forward["num_outputs"] == 2
+    assert forward["taps"] == [
+        {"name": "final", "output_index": 2, "shape": [8, 16], "dtype": "bf16"}
+    ]
+    assert Path(out_dir, forward["file_path"]).is_file()
+    assert forward["file_path"].startswith("assets.extra/debug/")
+    # A module the chain calls twice records each call.
+    draft_taps = [t["name"] for t in functions["mtp_draft"]["8"]["taps"]]
+    assert draft_taps == ["mtp.fc_act", "mtp.fc_act#1"]
+    # The serving artifact does not name the debug modules.
+    meta = Path(out_dir, "metadata.json").read_text()
+    assert "assets.extra" not in meta and "_debug_" not in meta
+
+
+def test_a_debug_tap_must_match_a_module(tmp_path) -> None:
+    with pytest.raises(ValueError, match="matches no module"):
+        exporter.export(
+            _TappableMtpExportableLLM(_mtp_config()),
+            str(tmp_path / "out"),
+            debug_taps=["no.such.module"],
+        )
+
+
+def test_a_speculative_export_needs_request_buckets_for_every_verify_row(
+    tmp_path,
+) -> None:
+    # 8 requests verifying 1 draft each run the LM head on 16 rows.
+    model = _TinyMtpExportableLLM(
+        dataclasses.replace(
+            _TinyMtpExportableLLM(_mtp_config()).export_config, req_buckets=(4, 8)
+        )
+    )
+    with pytest.raises(ValueError, match="16 LM-head rows"):
+        exporter.export(model, str(tmp_path / "out"))
+
+
+def test_a_speculative_export_needs_no_request_bucket_above_the_largest_step(
+    tmp_path,
+) -> None:
+    # 8 requests verifying 1 draft each would be 16 rows, but a step takes at most
+    # 8 tokens, so request buckets up to 8 suffice.
+    cfg = dataclasses.replace(_mtp_config(), token_buckets=(8,), req_buckets=(4, 8))
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_reading_used_args,
+    ):
+        exporter.export(_TinyMtpExportableLLM(cfg), str(tmp_path / "out"))
+
+
+def test_mtp_needs_a_model_that_drafts(tmp_path) -> None:
+    with pytest.raises(ValueError, match="mtp_abstract_states"):
+        _export_mtp(tmp_path, model_cls=_TinyTorchExportableLLM)
+
+
+class _TinyMtpWithoutWeights(_TinyMtpExportableLLM):
+    """Drafts, but its parameters have no `mtp.` layer."""
+
+    def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
+        return _TinyTorchExportableLLM.abstract_params(self)
+
+
+def test_mtp_needs_the_mtp_layer_among_the_parameters(tmp_path) -> None:
+    with pytest.raises(ValueError, match="no 'mtp.' parameters"):
+        _export_mtp(tmp_path, model_cls=_TinyMtpWithoutWeights)
+
+
+def test_validator_rejects_mtp_draft_missing_a_bucket(tmp_path) -> None:
+    out_dir = _export_mtp(tmp_path)
+    meta_path = Path(out_dir, "metadata.json")
+    meta = json.loads(meta_path.read_text())
+    del meta["functions"]["mtp_draft"]["8"]
+    meta_path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="differ from forward buckets"):
+        validator.validate_exported_model_dir(out_dir)
+    del meta["functions"]["mtp_draft"]
+    meta_path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="exports no mtp_draft"):
+        validator.validate_exported_model_dir(out_dir)
+
+
+def test_a_row_parallel_layer_selects_its_input_slice_by_a_per_rank_constant() -> None:
+    """A RowParallelLinear that splits its input picks its rank's slice in-graph."""
+    from vllm.model_executor.layers.linear import RowParallelLinear
+
+    seen: list[torch.Tensor] = []
+
+    class Layer(RowParallelLinear):
+        def __init__(self) -> None:
+            nn.Module.__init__(self)
+            self.input_is_parallel = False
+            self.bias = None
+            self.skip_bias_add = False
+            self.weight = nn.Parameter(torch.zeros(1))
+
+        def forward(self, input_):  # type: ignore[override]
+            assert self.input_is_parallel
+            seen.append(input_)
+            return input_
+
+    model = nn.Module()
+    model.down = Layer()
+    with (
+        mock.patch("vllm.distributed.model_parallel_is_initialized", return_value=True),
+        mock.patch(
+            "vllm.distributed.get_tensor_model_parallel_world_size", return_value=4
+        ),
+        mock.patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=2),
+    ):
+        assert universal_adapter._patch_row_parallel_input_split(model) == 1
+    # The rank is a buffer, a per-device constant, not a Python int in the trace.
+    assert model.down.export_tp_rank.tolist() == [2]
+    x = torch.arange(16.0).reshape(2, 8)
+    model.down(x)
+    torch.testing.assert_close(seen[0], x[:, 4:6])
+    assert model.down.input_is_parallel is False
+
+    # Only rank 0 adds the bias, which the trace would bake in too.
+    model.down = Layer()
+    model.down.bias = nn.Parameter(torch.zeros(1))
+    with (
+        mock.patch("vllm.distributed.model_parallel_is_initialized", return_value=True),
+        mock.patch(
+            "vllm.distributed.get_tensor_model_parallel_world_size", return_value=4
+        ),
+        mock.patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=2),
+        pytest.raises(NotImplementedError, match="adds a bias"),
+    ):
+        universal_adapter._patch_row_parallel_input_split(model)

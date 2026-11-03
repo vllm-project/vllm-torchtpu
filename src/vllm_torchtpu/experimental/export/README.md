@@ -81,10 +81,42 @@ per request, so these pools hold one slot per request plus null slot 0
 (`num_state_slots = max_num_seqs + 1`, recorded in `serving_config`) rather
 than one per KV block. The forward graphs take one more `user_io` input after
 the states, `mamba_state_indices[max_num_seqs]`: the slot holding each
-request's recurrent state. These layers keep this per-layer layout rather than
+request's recurrent state. With `--speculative-config` each request holds
+`K + 1` consecutive slots, its state slot then one checkpoint per draft token
+(`num_state_slots = max_num_seqs * (K + 1) + 1`), and the forward also takes
+`mamba_slot_read_offsets[num_state_slots]`, the checkpoint each request resumes
+from after a verify step, and `mamba_ckpt_indices[max_num_seqs, K + 1]`, its
+`K + 1` slots. Without `--speculative-config`, `--max-verify-tokens K` gives
+the same windows for tokens a step verifies without a drafter, such as tokens a
+grammar forces: vLLM loads the model under an ngram config of `K` tokens, which
+adds no drafter, and the artifact declares no speculative decoding. With
+`--speculative-config`, `--max-verify-tokens` above its `num_speculative_tokens`
+widens the window past the drafter's tokens (vLLM loads the config with `K`
+tokens; the artifact keeps its own draft count). Each window slot costs one more
+recurrent state per request. These layers keep this per-layer
+layout rather than
 vLLM's unified KV block pool, and the export runs with prefix caching off. The
 recurrent state bytes come off the KV budget before it is divided among KV
 blocks.
+
+### MTP drafting
+
+With `--speculative-config '{"method": "mtp", "num_speculative_tokens": K}'`
+the export loads the model together with the MTP draft vLLM builds for it (for
+Qwen3.5, `Qwen3_5MTP` from the checkpoint's `mtp.*` weights) and adds
+`mtp_draft_bucket{B}` for every forward bucket. The draft projects with the
+target's embedding and LM head, which keep their slots, so the artifact stores
+them once; its own weights are exported under their checkpoint names (`mtp.`).
+Its paged KV is a state numbered after the target's and counts against the KV
+budget like the target's. `mtp_draft` runs the draft over every row of the step
+and drafts the first token at each request's `last_token_indices` row; each
+further token comes from one more pass over one row per request, as vLLM's MTP
+proposer chains them.
+
+A model outside vLLM lists its MTP layer's weights among `abstract_params()`
+under `mtp.` names and implements `mtp_abstract_states()` and `mtp_draft()`.
+The export finds the target weights the draft shares by lowering it once, as
+for the forward.
 
 ### Example: match a `vllm serve` run
 
@@ -133,3 +165,52 @@ CPU, one process per rank. Either way, one process per rank saves that rank's
 shards: the processes join a JAX distributed runtime and Orbax writes each array's
 chunks from the host memory of the rank that holds them, so the host needs
 roughly the model size in free RAM.
+
+## Debugging: `--debug-taps`
+
+To find where an exported artifact and the vLLM runner diverge numerically,
+`--debug-taps` exports the intermediates of chosen modules. It takes
+comma-separated glob patterns of module names:
+
+- the target's modules are named as in the wrapped model's `named_modules()`,
+  e.g. `language_model.model.layers.3.self_attn`;
+- the MTP draft's are named as in the checkpoint, e.g. `mtp.fc`.
+
+A pattern that matches no module fails, and the error lists example names.
+
+For the smallest token bucket, `forward` and `mtp_draft` are also exported with
+the matching modules' outputs as extra results, after the variant's own:
+
+```bash
+python -m vllm_torchtpu.experimental.export ... \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}' \
+  --debug-taps '*model.norm,mtp.fc,mtp.layers.0,mtp.pre_fc_norm_*'
+```
+
+```text
+<output-dir>/assets.extra/debug/
+  forward_debug_bucket16.mlir
+  mtp_draft_debug_bucket16.mlir
+  taps.json
+```
+
+`taps.json` lists, per function and bucket:
+
+- the module's `file_path`;
+- `num_outputs`, the serving variant's result count;
+- for each tap, its `name`, `output_index`, `shape` and `dtype`.
+
+Shapes are shard-local, as in the other modules. Tap names follow these rules:
+
+- a module returning several tensors records `name.{i}` (a decoder layer's
+  hidden states and residual are `.0` and `.1`);
+- a module called more than once (the MTP layer in the draft chain) records
+  `name#{call}` from its second call on.
+
+Each debug module takes exactly the inputs of its serving variant
+(`functions.<function>.<bucket>.inputs` in `metadata.json`), so a runtime can run
+it in place of that variant for a step and read the taps back.
+
+`assets.extra/` holds files outside the serving contract. `metadata.json` does
+not name them, so a runtime reads nothing there unless a debug mode asks for it,
+and the serving artifact is the same with or without `--debug-taps`.
