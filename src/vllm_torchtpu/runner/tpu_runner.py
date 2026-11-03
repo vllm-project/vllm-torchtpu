@@ -1875,6 +1875,15 @@ class TPUModelRunner(GPUModelRunner):
             # dummy runs); see `stage_block_table_uploads`.
             stage_block_table_uploads(self, ctx, effective_num_reqs_padded)
 
+        if ctx.staged_block_tables is not None and ctx.position_ids_override is None:
+            staged_fn = getattr(
+                self,
+                "_build_attention_metadata_staged",
+                TPUModelRunner._build_attention_metadata_staged.__get__(self),
+            )
+            fast = staged_fn(ctx)
+            if fast is not None:
+                return fast, None
         common = SimpleNamespace(num_reqs=effective_num_reqs_padded)
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
         for group_list in self.attn_groups:
@@ -1888,6 +1897,86 @@ class TPUModelRunner(GPUModelRunner):
                 for layer_name in group.layer_names:
                     per_layer_attn_metadata[layer_name] = built
         return per_layer_attn_metadata, None
+
+    def _build_attention_metadata_staged(self, ctx):
+        """Inlined group walk for a staged chunk: builds the same metadata
+        objects (staged table, shared step tensors, the walk program's mamba
+        indices) without one builder dispatch and branch per group per step.
+        Returns None when a group needs `build()`'s per-group fallback (custom
+        builder, missing staged table, or missing unified mamba products), so
+        the caller runs the ordinary walk."""
+        plan = self.__dict__.get("_fast_metadata_plan")
+        if plan is None or plan[0] is not self.attn_groups:
+            groups: list[tuple[int, bool, tuple[str, ...]]] = []
+            supported = True
+            for group_list in self.attn_groups:
+                for group in group_list:
+                    builder = group.metadata_builders[0]
+                    if type(builder) is not AttentionMetadataBuilder:
+                        supported = False
+                        break
+                    groups.append(
+                        (
+                            builder.kv_cache_group_id,
+                            builder.is_mamba_group,
+                            tuple(group.layer_names),
+                        )
+                    )
+                if not supported:
+                    break
+            plan = self._fast_metadata_plan = (
+                self.attn_groups,
+                groups if supported else None,
+            )
+        if plan[1] is None:
+            return None
+        staged = ctx.staged_block_tables
+        if staged is None:
+            return None
+        compact = ctx.mamba_state_indices
+        unified = compact is None and getattr(self, "_unified_kv_layout", False)
+        products = ctx.staged_mamba_products
+        for gid, is_mamba, _ in plan[1]:
+            if gid not in staged or (
+                is_mamba and unified and (products is None or gid not in products)
+            ):
+                return None
+        descriptor = ctx.sequence_layout_descriptor
+        shared = dict(
+            input_positions=self.position_ids,
+            seq_lens=ctx.seq_lens,
+            query_start_loc=ctx.query_start_loc,
+            request_distribution=ctx.request_distribution,
+            sequence_layout_kind=descriptor.kind.value,
+            sequence_layout_protocol=descriptor.protocol,
+            sequence_layout_version=descriptor.version,
+        )
+        per_layer: dict[str, AttentionMetadata] = {}
+        for gid, is_mamba, layer_names in plan[1]:
+            if is_mamba:
+                ckpt = None
+                if compact is not None:
+                    state = compact
+                elif unified:
+                    assert products is not None
+                    state, ckpt = products[gid]
+                else:
+                    state = None
+                if unified and ctx.unified_mamba_state_indices is not None:
+                    ctx.unified_mamba_state_indices.append(state)
+                built = AttentionMetadata(
+                    block_tables=staged[gid],
+                    mamba_state_indices=state,
+                    mamba_slot_read_offsets=ctx.mamba_slot_read_offsets,
+                    mamba_ckpt_indices=ckpt,
+                    mamba_request_distribution=ctx.mamba_request_distribution,
+                    **shared,
+                )
+            else:
+                built = AttentionMetadata(block_tables=staged[gid], **shared)
+            for layer_name in layer_names:
+                per_layer[layer_name] = built
+        return per_layer
 
     def build_attention_metadata_for_layers(
         self,
