@@ -225,11 +225,11 @@ class GatedResidual(common_hc.GatedResidual):
         return next(t for t in self._prefill_full_ops if rows % (2 * t) == 0)
 
     def _prefill_weights(self):
-        up = self.input_mix_weight_up.weight
         weights = (
             self.hc_norm.weight,
             self.input_mix_weight_down.weight,
-            up.t() if self._prefill_full_up_t else up,
+            # VLLM_TPU_HC_PREFILL_UP_T transposes inside the op.
+            self.input_mix_weight_up.weight,
         )
         if self._prefill_inject:
             weights += (self.block_inject_weight.weight,)
