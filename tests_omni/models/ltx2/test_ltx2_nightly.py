@@ -134,6 +134,9 @@ def test_ltx2_seed_determinism_tpu(omni_runner: OmniRunner) -> None:
     )
 
 
+# NOTE: To regenerate the golden or recalibrate LTX2_GOLDEN_LIMITS, use the
+# generator script and commands in the description of
+# https://github.com/vllm-project/vllm-torchtpu/pull/2464.
 @pytest.mark.parametrize(
     "omni_runner",
     [get_ltx2_model()],
