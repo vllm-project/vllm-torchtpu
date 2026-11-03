@@ -202,11 +202,11 @@ def _rows_oproj_kernel(
             part = part * xs * ws_ref[pl.ds(s, 1), cols]
 
             @pl.when(s == 0)
-            def _():
+            def _(*, cols=cols, part=part):
                 acc_ref[:, cols] = part
 
             @pl.when(s > 0)
-            def _():
+            def _(*, cols=cols, part=part):
                 acc_ref[:, cols] += part
 
     # The block holds a whole sublane tile of heads: this shard's start at a
