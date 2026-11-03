@@ -265,6 +265,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SPEC_TAIL_COMPILED: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
     VLLM_TPU_REASONING_COUNT_SKIP_TOOLS: bool = False
+    VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS: int = 0
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1633,6 +1634,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # re-parsing its tool calls (core/reasoning_count_patch.py). The full
     # re-parse is quadratic in tool-argument length and freezes the server.
     "VLLM_TPU_REASONING_COUNT_SKIP_TOOLS": env_bool("VLLM_TPU_REASONING_COUNT_SKIP_TOOLS"),
+    # TP all-reduce of BF16 tensors with at most this many rows (0 = off): one-shot
+    # all-gather + local f32 sum (tpu_communicator.TpuDeviceCommunicator.all_reduce).
+    # Faster for decode-sized tensors; not bit-identical to psum.
+    "VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS": env_nonnegative_int("VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS", 0),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for
