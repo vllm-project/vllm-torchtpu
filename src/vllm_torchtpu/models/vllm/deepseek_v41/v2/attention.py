@@ -509,6 +509,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     # TP1 FP8-KV layers run the fused Q-A/KV, Q-B and compressor kernels.
     _fused_preprocess = False
     _packed_compressor_op: Any = None
+    _address_compressor_op: Any = None
     _swa_query_group_size = 1
 
     @classmethod
@@ -844,15 +845,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         kv_meta = metadata[self.prefix]
         index_k = self.indexer.k_cache
         starts = _window_starts()
-        compressed_slots = _cache_slots(
-            self.kv_cache, kv_meta, positions, compress_ratio=ratio
-        )
-        index_slots = _cache_slots(
-            index_k.kv_cache,
-            metadata[index_k.prefix],
-            positions,
-            compress_ratio=index_k.compress_ratio,
-        )
         group_positions = self._group_positions(positions)
         args = [
             hidden_states,
@@ -892,7 +884,57 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
             )
         )
-        if packed:
+        index_meta = metadata[index_k.prefix]
+        addresses = (
+            packed
+            and state_cache is not None
+            and state_cache.raw_hi is not None
+            and self._address_compressor_op is not None
+            and isinstance(self.kv_cache, PagedCacheRows)
+            and isinstance(index_k.kv_cache, PackedFP8IndexCacheRows)
+            and self.kv_cache.shape[1] == self.kv_cache.page_stride == 128
+            and self.kv_cache.row_offset == 0
+            and index_k.kv_cache.shape[1] == 256
+            and index_k.compress_ratio == 2
+            and index_meta.query_start_loc is kv_meta.query_start_loc
+            and _block_table(kv_meta).shape == (48, 386)
+            and _block_table(index_meta).shape == (48, 193)
+            and _block_table(kv_meta).dtype == torch.int32
+            and _block_table(index_meta).dtype == torch.int32
+            and state_cache.raw.shape == (33423360, 128)
+            and state_cache.raw_hi.shape == (28652288, 128)
+        )
+        compressed_slots = index_slots = records = None
+        if not addresses:
+            compressed_slots = _cache_slots(
+                self.kv_cache, kv_meta, positions, compress_ratio=ratio
+            )
+            index_slots = _cache_slots(
+                index_k.kv_cache,
+                metadata[index_k.prefix],
+                positions,
+                compress_ratio=index_k.compress_ratio,
+            )
+        if addresses:
+            assert state_meta is not None and state_cache is not None
+            assert state_cache.raw_hi is not None
+            latent, words, scales, low, high, valid, records, index_slots = (
+                self._address_compressor_op(
+                    _block_table(state_meta),
+                    state_meta.query_start_loc,
+                    kv_meta.query_start_loc,
+                    positions,
+                    starts,
+                    *args,
+                    state_cache.raw,
+                    state_cache.raw_hi,
+                    _block_table(kv_meta),
+                    _block_table(index_meta),
+                )
+            )
+            state_cache.raw.copy_(low)
+            state_cache.raw_hi.copy_(high)
+        elif packed:
             assert state_meta is not None and state_cache is not None
             assert state_cache.raw_hi is not None
             latent, words, scales, low, high, valid = self._packed_compressor_op(
@@ -952,13 +994,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             latent, words, scales, *states = op(*args)
             for pool, state in zip(pools, states, strict=True):
                 pool.copy_(state)
-        records = self.kv_cache.row_indices(compressed_slots.clamp(min=0))
-        csa2_adapter.publish_main(
-            self.kv_cache,
-            records.masked_fill(~valid | (compressed_slots < 0), -1),
-            words,
-            scales,
-        )
+        if not addresses:
+            assert compressed_slots is not None
+            records = self.kv_cache.row_indices(compressed_slots.clamp(min=0))
+            records = records.masked_fill(~valid | (compressed_slots < 0), -1)
+        assert records is not None and index_slots is not None
+        csa2_adapter.publish_main(self.kv_cache, records, words, scales)
         self._produce_index_k(
             latent, group_positions, index_k.kv_cache, index_slots, valid
         )
@@ -2114,6 +2155,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 if ratio == 2:
                     self._packed_compressor_op = preprocess_ops.compress_rope_packed(
                         self.compressor.rms_norm_eps
+                    )
+                    self._address_compressor_op = (
+                        preprocess_ops.compress_rope_addresses(
+                            self.compressor.rms_norm_eps
+                        )
                     )
                 for banks in (0,) if ratio == 1 else (1, 2):
                     preprocess_ops.compress_rope(

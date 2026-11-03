@@ -134,6 +134,7 @@ def caller_functions(ops, state_capacity=16):
             self.compress_ratio = 2
             self.window_size = 128
             self._packed_compressor_op = op
+            self._address_compressor_op = None
             self.kv_cache = Cache(64)
             self.indexer = SimpleNamespace(
                 k_cache=SimpleNamespace(
