@@ -1085,6 +1085,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else self.window_size
         )
         csa2_metadata = csa2_bounds = csa2_write_records = None
+        swa_published = False
         if self._csa2:
             if not isinstance(swa_cache, PagedCacheRows):
                 raise ValueError("CSA2 requires a native shared word-row cache")
@@ -1106,16 +1107,37 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             cached = stage_cache.get(meta_key) if stage_cache is not None else None
             if cached is None or cached[0] is not swa.block_tables:
-                csa2_metadata, csa2_bounds, csa2_write_records = (
-                    csa2_adapter.prepare_swa(
-                        swa_table,
-                        swa.query_start_loc,
-                        positions,
-                        minimum,
-                        swa_cache,
-                        non_causal,
+                if (
+                    self._fused_preprocess
+                    and positions.shape == (288,)
+                    and swa_table.shape[0] == 48
+                    and swa_cache.native_swa
+                    and rows_per_page == swa_cache.page_stride == 64
+                    and swa_cache.row_offset == 0
+                    and not non_causal
+                ):
+                    csa2_metadata, csa2_bounds, csa2_write_records = (
+                        csa2_adapter.prepare_publish_swa(
+                            swa_table,
+                            swa.query_start_loc,
+                            positions,
+                            minimum,
+                            swa_cache,
+                            kv.reshape(-1, 512),
+                        )
                     )
-                )
+                    swa_published = True
+                else:
+                    csa2_metadata, csa2_bounds, csa2_write_records = (
+                        csa2_adapter.prepare_swa(
+                            swa_table,
+                            swa.query_start_loc,
+                            positions,
+                            minimum,
+                            swa_cache,
+                            non_causal,
+                        )
+                    )
                 if stage_cache is not None:
                     stage_cache[meta_key] = (
                         swa.block_tables,
@@ -1402,7 +1424,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             kv = self._rotate(kv, positions)
         if self._csa2:
             assert csa2_write_records is not None
-            csa2_adapter.publish_swa(swa_cache, csa2_write_records, kv.reshape(-1, 512))
+            if not swa_published:
+                csa2_adapter.publish_swa(
+                    swa_cache, csa2_write_records, kv.reshape(-1, 512)
+                )
         else:
             _insert(swa_cache, swa_slots, kv, swa_valid)
         weights = None
