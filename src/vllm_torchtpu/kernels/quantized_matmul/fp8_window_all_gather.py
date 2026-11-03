@@ -41,6 +41,11 @@ MESH = pl.DeviceIdType.MESH
 # all-reduces (5), the reduce-scatter (7), the all-gather (9), the all-to-all (11)
 # and the sparse MLA kernel's exchange (13).
 COLLECTIVE_ID = 15
+# Row slices a weight tile is copied in, all in flight at once: the window kernel's
+# single 2 MB strided copy took 3.6 us in situ (j-6482bc6e), where the replicated
+# kernel's four tiles in flight stream 2.5 TB/s. The tile's dot still runs once
+# over the whole K, so the arithmetic is unchanged.
+_TILE_COPY_PARTS = 4
 
 
 def supports(m: int, k: int, n: int, num_cores: int) -> bool:
@@ -79,13 +84,25 @@ def _kernel(
             ids[lane_axis] = lane_ref[0]
         return ids
 
-    def copy(j):
-        return pltpu.make_async_copy(
-            w_hbm.at[:, pl.ds(col0 + j * t, t)], wbuf.at[j % nbuf], wsem.at[j % nbuf]
-        )
+    k = w_hbm.shape[0]
+    parts = _TILE_COPY_PARTS if k % (_TILE_COPY_PARTS * 32) == 0 else 1
+    rows = k // parts
+
+    def tile(j):
+        return w_hbm.at[:, pl.ds(col0 + j * t, t)], wbuf.at[j % nbuf], wsem.at[j % nbuf]
+
+    def start(j):
+        src, dst, sem = tile(j)
+        for p in range(parts):
+            part = pl.ds(p * rows, rows)
+            pltpu.make_async_copy(src.at[part], dst.at[part], sem).start()
+
+    def wait(j):
+        # The parts signal one semaphore; wait for the whole tile's bytes.
+        pltpu.make_async_copy(*tile(j)).wait()
 
     for j in range(min(nbuf, n_tiles)):
-        copy(j).start()
+        start(j)
     for j in range(n):
         pl.semaphore_signal(bsem, 1, device_id=peer(j), device_id_type=MESH)
 
@@ -104,14 +121,14 @@ def _kernel(
 
     dn = (((1,), (0,)), ((), ()))
     for j in range(n_tiles):
-        copy(j).wait()
+        wait(j)
         y = jax.lax.dot_general(
             xq_ref[...], wbuf[j % nbuf], dn, preferred_element_type=jnp.float32
         )
         cols = pl.ds(col0 + j * t, t)
         o_ref[:, cols] = (y * xs_ref[...] * ws_ref[:, cols]).astype(o_ref.dtype)
         if j + nbuf < n_tiles:
-            copy(j + nbuf).start()
+            start(j + nbuf)
 
     mine = o_ref.at[:, pl.ds(col0, width)]
     pl.semaphore_wait(bsem, n)
