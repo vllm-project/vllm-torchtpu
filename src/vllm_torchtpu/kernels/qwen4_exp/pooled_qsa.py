@@ -2,6 +2,7 @@
 """QSA over one donated pool, with independent group-native block tables."""
 
 import dataclasses
+import functools
 import math
 from typing import ClassVar
 
@@ -987,6 +988,50 @@ def token_shard_step(starts, context, shard_index, rows):
     return base, sub_starts, (context + before).astype(context.dtype)
 
 
+def token_shard_selection(select, iq, lengths, req, starts, context, max_query_len, token_shard):
+    """``select``'s rows of token shard ``token_shard=(index, size)`` of a step.
+
+    ``select(query, lengths=, req=, starts=, context=, max_query_len=)`` is the
+    indexer over a ragged request batch. Shards wider than the request slots
+    take the ragged prefill indexer on the shard, as the replicated shard
+    does. Narrower shards take the decode indexer, which selects a request's
+    rows exactly only when the shard holds the whole request: a step in which
+    any request crosses a shard boundary indexes the whole step instead and
+    keeps the shard's rows.
+    """
+    index, size = token_shard
+    width = len(iq) // size
+    base, sub_starts, sub_context = token_shard_step(starts, context, index, width)
+
+    def own(x):
+        return jax.lax.dynamic_slice_in_dim(x, base, width)
+
+    def sharded(_):
+        return select(
+            own(iq), lengths=own(lengths), req=own(req), starts=sub_starts,
+            context=sub_context, max_query_len=1,
+        )
+
+    if width > len(context):
+        return sharded(None)
+
+    def whole(_):
+        out = select(
+            iq, lengths=lengths, req=req, starts=starts, context=context,
+            max_query_len=max_query_len,
+        )
+        return jax.tree_util.tree_map(own, out)
+
+    return jax.lax.cond(requests_within_shards(starts, width), sharded, whole, None)
+
+
+def requests_within_shards(starts, width):
+    """Whether every nonempty request's rows lie in one ``width``-row shard."""
+    begins, ends = starts[:-1], starts[1:]
+    live = ends > begins
+    return jnp.all(~live | (begins // width == (ends - 1) // width))
+
+
 def compressed_kernel_pages(pages: jax.Array, pool: jax.Array, slot: int = 0, ratio: int = 4) -> jax.Array:
     """Flat kernel-page ids of compressed block-table columns `pages`.
 
@@ -1611,34 +1656,26 @@ def _pooled_qsa(
         keep = picked = None
     if compressed_dcp and shared is None:
         assert dcp is not None and rows is None and shard is None
-        own_iq, own_lengths, own_req = iq, lengths, req
-        sub_starts, sub_context, query_len = starts, context, max_query_len
-        if token_shard is not None:
-            # The pair scores one token shard together (``index`` = the pair's
-            # shard); the ragged prefill indexer as in the replicated shard.
-            index, size = token_shard
-            width = len(iq) // size
-            base, sub_starts, sub_context = token_shard_step(starts, context, index, width)
-
-            def own(x):
-                return jax.lax.dynamic_slice_in_dim(x, base, width)
-
-            own_iq, own_lengths, own_req = own(iq), own(lengths), own(req)
-            query_len = 1
-        vals, pos = select_blocks(
-            own_iq,
-            pool,
-            own_lengths,
-            compressed_table,
-            own_req,
-            sub_starts,
-            sub_context,
+        select = functools.partial(
+            select_blocks,
+            pool=pool,
+            table=compressed_table,
             ratio=compress_ratio,
             block_topk=token_topk // compress_ratio,
             slot=compressed_slot,
-            max_query_len=query_len,
             dcp=dcp,
         )
+        if token_shard is None:
+            vals, pos = select(
+                iq, lengths=lengths, req=req, starts=starts, context=context,
+                max_query_len=max_query_len,
+            )
+        else:
+            # The pair scores one token shard together (``index`` = the pair's
+            # shard) and keeps that shard's rows of the selection.
+            vals, pos = token_shard_selection(
+                select, iq, lengths, req, starts, context, max_query_len, token_shard
+            )
         return pool, q, gate, lengths, req, starts, vals, pos
     if token_shard is not None:
         assert rows is None, "the token shard covers the all-token prefill path"
