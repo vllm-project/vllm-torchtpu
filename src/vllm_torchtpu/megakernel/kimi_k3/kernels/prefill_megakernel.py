@@ -952,13 +952,14 @@ def _regions(rows, width):
 STRIPE = 64
 SP_BLOCK = 32 * STRIPE
 SMALL_WINDOWS = (512, 1024)
+MAX_WINDOW = 16384
 
 
 def check_window(seq_len, what):
     """Reject a window the sequence-parallel kernels can't run: 512, 1024,
-    or a multiple of 2048 up to 8192."""
-    if seq_len not in SMALL_WINDOWS and (seq_len % SP_BLOCK or not SP_BLOCK <= seq_len <= 8192):
-        raise ValueError(f"{what} needs T in {SMALL_WINDOWS} or 2048..8192 (a multiple of 2048)")
+    or a multiple of 2048 up to 16384."""
+    if seq_len not in SMALL_WINDOWS and (seq_len % SP_BLOCK or not SP_BLOCK <= seq_len <= MAX_WINDOW):
+        raise ValueError(f"{what} needs T in {SMALL_WINDOWS} or 2048..{MAX_WINDOW} (a multiple of 2048)")
 
 
 def window_stripe(local_rows):
@@ -1410,6 +1411,22 @@ def _project_ring_kernel(
             output.wait()
 
 
+def _ring_halves(x, *, axis, rows, call):
+    """Run a whole-window ring (at most 256 local rows) over 8192-token parts
+    of a larger window: each part is whole 2048-token SP blocks, so rank r's
+    rows of part i are its local rows [256 i, 256 (i + 1)). Returns the
+    [32 * rows, D] token shards of the window."""
+    if rows % 256:
+        raise ValueError("K3 rings over 256 local rows need whole 8192-token parts")
+    parts = [
+        call(jax.lax.slice_in_dim(x, 8192 * i, 8192 * (i + 1), axis=axis))
+        for i in range(rows // 256)
+    ]
+    width = parts[0].shape[-1]
+    joined = jnp.concatenate([p.reshape(32, 256, width) for p in parts], axis=1)
+    return joined.reshape(32 * rows, width)
+
+
 def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
     """Fuse a three-head BF16 attention projection with SP32 RS."""
     if (
@@ -1424,7 +1441,8 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
     tokens = x.shape[1]
     rows = tokens // 32
     if rows > 256:
-        raise ValueError("K3 projection/RS needs at most 256 rows per rank")
+        return _ring_halves(x, axis=1, rows=rows, call=lambda part: project_reduce_scatter(
+            part, w, mesh, tables, collective_id=collective_id))
     regions = _regions(rows, 7168)
     streams = len(regions)
     chunk = max(size for _, size, _, _ in regions)
@@ -4972,8 +4990,11 @@ def ring_reduce_scatter_fp32(partials, mesh, tables, *, collective_id=43, dtype=
     if partials.ndim != 3 or partials.shape[0] != 32 or partials.dtype not in (jnp.float32, jnp.bfloat16):
         raise ValueError("FP32 ring needs [32,T,D] BF16 or FP32 partials")
     tokens, width = partials.shape[1:]
-    if tokens % 32 or tokens // 32 > 256:
-        raise ValueError("FP32 ring needs at most 256 local rows")
+    if tokens % 32:
+        raise ValueError("FP32 ring needs a multiple of 32 tokens")
+    if tokens // 32 > 256:
+        return _ring_halves(partials, axis=1, rows=tokens // 32, call=lambda part: ring_reduce_scatter_fp32(
+            part, mesh, tables, collective_id=collective_id, dtype=dtype))
     rows = tokens // 32
     regions = _regions(rows, width)
     streams, buffers = len(regions), 2
@@ -5519,6 +5540,26 @@ def _norm_gather_body(
     )
 
 
+def _norm_gather_parts(mesh, *, seq_len, token_ranks, collective_id, eps):
+    """``make_norm_gather_sp`` over 8192-token parts of a larger window (its
+    VMEM holds the whole window's local rows): part i is rank r's local rows
+    [256 i, 256 (i + 1))."""
+    part = make_norm_gather_sp(mesh, seq_len=8192, token_ranks=token_ranks,
+                               collective_id=collective_id, eps=eps)
+    parts = seq_len // 8192
+
+    def run(prefix, blocks, folded, norm, active):
+        normalized, gathered = [], []
+        for i in range(parts):
+            rows = slice(256 * i, 256 * (i + 1))
+            n, g = part(prefix[:, rows], blocks[:, :, rows], folded, norm, active)
+            normalized.append(n)
+            gathered.append(g)
+        return jnp.concatenate(normalized, axis=1), jnp.concatenate(gathered, axis=0)
+
+    return jax.jit(run)
+
+
 def make_norm_gather_sp(mesh, *, seq_len, token_ranks=None,
                         collective_id=37, eps=1e-5):
     """Return ``(normalized [32,T/32,H], gathered [T,H])``.
@@ -5529,6 +5570,9 @@ def make_norm_gather_sp(mesh, *, seq_len, token_ranks=None,
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("norm/gather requires a flat k3_sp TP32 mesh")
     check_window(seq_len, "fused norm/gather")
+    if seq_len > 8192:
+        return _norm_gather_parts(mesh, seq_len=seq_len, token_ranks=token_ranks,
+                                  collective_id=collective_id, eps=eps)
     rows, width = seq_len // 32, 7168
     if token_ranks is None:
         token_ranks = tuple(range(32))

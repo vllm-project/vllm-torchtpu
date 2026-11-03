@@ -259,7 +259,8 @@ def run_prefill(args, records: harness.Records) -> None:
         prefix = int(prefix) if prefix else 0
         if length * count > k3_program.MAX_STEP_TOKENS or count > k3_prefill.SLOTS:
             harness.fail(
-                f"prefill case {part}: N * LEN must fit one 8192-token step, "
+                f"prefill case {part}: N * LEN must fit one "
+                f"{k3_program.MAX_STEP_TOKENS}-token step, "
                 f"N <= {k3_prefill.SLOTS}"
             )
         if prefix % k3.PAGE:
@@ -276,7 +277,10 @@ def run_prefill(args, records: harness.Records) -> None:
             "prefill",
             max_num_seqs=max_seqs,
             max_model_len=max_model_len,
-            max_num_batched_tokens=k3_program.MAX_STEP_TOKENS,
+            # 16384-token windows only when a case needs them.
+            max_num_batched_tokens=k3_program.prefill_step_tokens(
+                max(length * count for length, count, _ in cases)
+            ),
         ),
         args.presharded,
         tp_rank=torch.distributed.get_rank(),

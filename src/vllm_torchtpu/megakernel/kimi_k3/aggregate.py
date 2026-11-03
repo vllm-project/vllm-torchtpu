@@ -46,14 +46,14 @@ logger = init_logger(__name__)
 
 def role_config(config: MegakernelEngineConfig, role: str) -> MegakernelEngineConfig:
     """The aggregate engine's configuration as program ``role`` sees it."""
-    from vllm_torchtpu.megakernel.kimi_k3.program import MAX_STEP_TOKENS
+    from vllm_torchtpu.megakernel.kimi_k3.program import prefill_step_tokens
 
     if role == "decode":
         return dataclasses.replace(config, role="decode")
     return dataclasses.replace(
         config,
         role="prefill",
-        max_num_batched_tokens=min(config.max_num_batched_tokens, MAX_STEP_TOKENS),
+        max_num_batched_tokens=prefill_step_tokens(config.max_num_batched_tokens),
         num_speculative_tokens=0,
         num_speculative_tokens_per_batch_size=None,
         synthetic_acceptance_rates=None,
