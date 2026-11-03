@@ -313,7 +313,7 @@ def _attend_window(
     )
 
 
-def _swa_attention(q, pool, records, sink, scale):
+def _swa_attention(q, pool, records, sink, scale, query_group_size=1):
     """Fuse pure SWA without materializing split Q or merged O layouts."""
     from vllm_torchtpu.kernels.mla.swa_attention import attend_swa
 
@@ -322,30 +322,67 @@ def _swa_attention(q, pool, records, sink, scale):
         kv = kv.reshape(4, *records.shape, 128)
         return attend_swa(q, kv, (records >= 0)[:, None, :], sink, scale)
 
-    tokens = q.shape[0]
-    if tokens < 128 or tokens % 64 or tokens % 6 == 0 or records.shape[1] != 128:
-        return direct(q, records)
-    union, mask, uncovered = _window_union(records, 64)
+    tokens, width = records.shape
 
-    def shared(_):
-        # A 192-row union is padded to one 256-row MXU RHS tile.
-        padded = jnp.pad(union, ((0, 0), (0, 256 - union.shape[1])), constant_values=-1)
-        kv = gather_cache_pieces(pool, padded.reshape(-1), q.shape[-1])
-        kv = kv.reshape(4, *padded.shape, 128)
-        padded_mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 256 - union.shape[1])))
-        result = attend_swa(q, kv, padded_mask, sink, scale)
+    def fallback(_):
+        if tokens < 128 or tokens % 64 or tokens % 6 == 0 or records.shape[1] != 128:
+            return direct(q, records)
+        union, mask, uncovered = _window_union(records, 64)
 
-        def patch(result):
-            index = jnp.nonzero(uncovered.reshape(-1), size=64, fill_value=tokens)[0]
-            source = jnp.minimum(index, tokens - 1)
-            sub_records = jnp.where((index < tokens)[:, None], records[source], -1)
-            return result.at[index].set(direct(q[source], sub_records), mode="drop")
+        def shared(_):
+            # A 192-row union is padded to one 256-row MXU RHS tile.
+            padded = jnp.pad(
+                union, ((0, 0), (0, 256 - union.shape[1])), constant_values=-1
+            )
+            kv = gather_cache_pieces(pool, padded.reshape(-1), q.shape[-1])
+            kv = kv.reshape(4, *padded.shape, 128)
+            padded_mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 256 - union.shape[1])))
+            result = attend_swa(q, kv, padded_mask, sink, scale)
 
-        return jax.lax.cond(uncovered.any(), patch, lambda x: x, result)
+            def patch(result):
+                index = jnp.nonzero(uncovered.reshape(-1), size=64, fill_value=tokens)[
+                    0
+                ]
+                source = jnp.minimum(index, tokens - 1)
+                sub_records = jnp.where((index < tokens)[:, None], records[source], -1)
+                return result.at[index].set(direct(q[source], sub_records), mode="drop")
 
-    return jax.lax.cond(
-        uncovered.sum() > 64, lambda _: direct(q, records), shared, None
-    )
+            return jax.lax.cond(uncovered.any(), patch, lambda x: x, result)
+
+        return jax.lax.cond(
+            uncovered.sum() > 64, lambda _: direct(q, records), shared, None
+        )
+
+    queries = query_group_size
+    # The existing kernel holds at most 256 keys. Share only when padding
+    # still reduces gathering, and prove overlap instead of trusting the hint.
+    if (
+        queries > 1
+        and tokens > 0
+        and tokens % queries == 0
+        and width + queries - 1 <= 256 < queries * width
+    ):
+        rows = records.reshape(-1, queries, width)
+        union = jnp.concatenate((rows[:, 0], rows[:, -1, -(queries - 1) :]), axis=1)
+        offsets = jnp.arange(queries)[:, None] + jnp.arange(width)[None, :]
+        valid = jnp.all(rows == union[:, offsets])
+
+        def shared_queries(_):
+            padded = jnp.pad(
+                union, ((0, 0), (0, 256 - union.shape[1])), constant_values=-1
+            )
+            kv = gather_cache_pieces(pool, padded.reshape(-1), q.shape[-1])
+            kv = kv.reshape(4, *padded.shape, 128)
+            column = jnp.arange(padded.shape[1])[None, None, :]
+            slot = jnp.arange(queries)[None, :, None]
+            mask = (
+                (column >= slot) & (column < width + slot) & (padded[:, None, :] >= 0)
+            )
+            return attend_swa(q, kv, mask, sink, scale)
+
+        return jax.lax.cond(valid, shared_queries, fallback, None)
+
+    return fallback(None)
 
 
 def _general_paged_attention_jax(
@@ -357,11 +394,12 @@ def _general_paged_attention_jax(
     sink: jax.Array,
     scale: float,
     gathered: jax.Array | None = None,
+    query_group_size: int = 1,
 ) -> jax.Array:
     from vllm_torchtpu.kernels.mla.swa_attention import supports_swa
 
     if main_records.shape[1] == 0 and supports_swa(q, swa_records):
-        return _swa_attention(q, swa_pool, swa_records, sink, scale)
+        return _swa_attention(q, swa_pool, swa_records, sink, scale, query_group_size)
     # SWA widths in the released model are multiples of 64, preserving the
     # reference's accumulation boundaries when compressed rows follow.
     maximum, denominator, numerator = _attend(
@@ -385,7 +423,9 @@ def paged_attention_jax(
     sink: jax.Array,
     scale: float,
     gathered: jax.Array | None = None,
+    query_group_size: int = 1,
 ) -> jax.Array:
+    """Attend physical cache records; query_group_size is a checked sharing hint."""
     if (
         q.shape == (240, 64, 512)
         and q.dtype == jnp.bfloat16
@@ -399,12 +439,28 @@ def paged_attention_jax(
             shared,
             lambda _: _shared_draft_attention(q, swa_pool, swa_records, sink),
             lambda _: _general_paged_attention_jax(
-                q, swa_pool, main_pool, swa_records, main_records, sink, scale, gathered
+                q,
+                swa_pool,
+                main_pool,
+                swa_records,
+                main_records,
+                sink,
+                scale,
+                gathered,
+                query_group_size,
             ),
             None,
         )
     return _general_paged_attention_jax(
-        q, swa_pool, main_pool, swa_records, main_records, sink, scale, gathered
+        q,
+        swa_pool,
+        main_pool,
+        swa_records,
+        main_records,
+        sink,
+        scale,
+        gathered,
+        query_group_size,
     )
 
 
@@ -1312,7 +1368,7 @@ def initialize_paged_attention():
         paged_attention_jax,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None, P()))
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None, P(), None))
         ),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
@@ -1328,6 +1384,7 @@ def initialize_paged_attention():
         sink: jax.Array,
         scale: float,
         gathered: jax.Array | None = None,
+        query_group_size: int = 1,
     ) -> jax.Array:
         return paged_attention_jax(
             q,
@@ -1338,6 +1395,7 @@ def initialize_paged_attention():
             sink,
             scale,
             gathered,
+            query_group_size,
         )
 
     _attention_2bank_op = pallas.jax_op(
@@ -1345,7 +1403,7 @@ def initialize_paged_attention():
         paged_attention_2bank,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None, P()))
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None, P(), None))
         ),
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
@@ -2115,7 +2173,9 @@ def sparse_fp8_attention_qo(
     )
 
 
-def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
+def paged_attention(
+    q, swa, main, swa_records, main_records, sink, scale, query_group_size=1
+):
     gathered = None
     cache = _active_gathered_kv
     if cache is not None and main_records.shape[1]:
@@ -2148,6 +2208,7 @@ def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
             sink,
             scale,
             gathered,
+            query_group_size,
         )
     assert _attention_op is not None
     return _attention_op(
@@ -2159,6 +2220,7 @@ def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
         sink,
         scale,
         gathered,
+        query_group_size,
     )
 
 

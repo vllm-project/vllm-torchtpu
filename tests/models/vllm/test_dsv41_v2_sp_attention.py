@@ -122,6 +122,7 @@ def test_decoder_layer_init_and_sp_binding(monkeypatch):
     vllm_cfg = SimpleNamespace(
         additional_config={},
         engram_config=None,
+        speculative_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(num_hidden_layers=40),

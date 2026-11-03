@@ -2219,18 +2219,35 @@ def test_gather_reuse_in_compiled_twenty_layer_stage(monkeypatch):
     lib.define("gather(Tensor pool, Tensor? hi, Tensor records, int dim) -> Tensor")
     lib.define(
         "attend(Tensor q, Tensor swa, Tensor main, Tensor sr, Tensor mr, "
-        "Tensor sink, float scale, Tensor? gathered=None) -> Tensor"
+        "Tensor sink, float scale, Tensor? gathered=None, "
+        "int query_group_size=1) -> Tensor"
     )
     lib.impl("gather", lambda pool, hi, records, dim: pool.clone(), "CPU")
     lib.impl("gather", lambda pool, hi, records, dim: torch.empty_like(pool), "Meta")
     lib.impl(
         "attend",
-        lambda q, swa, main, sr, mr, sink, scale, gathered=None: q.clone(),
+        lambda q,
+        swa,
+        main,
+        sr,
+        mr,
+        sink,
+        scale,
+        gathered=None,
+        query_group_size=1: q.clone(),
         "CPU",
     )
     lib.impl(
         "attend",
-        lambda q, swa, main, sr, mr, sink, scale, gathered=None: torch.empty_like(q),
+        lambda q,
+        swa,
+        main,
+        sr,
+        mr,
+        sink,
+        scale,
+        gathered=None,
+        query_group_size=1: torch.empty_like(q),
         "Meta",
     )
     gather_op = torch.ops.dsv41_gather_test.gather.default

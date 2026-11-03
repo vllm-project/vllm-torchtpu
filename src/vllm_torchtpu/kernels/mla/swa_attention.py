@@ -235,8 +235,11 @@ def attend_swa(
     assert heads in (8, 16, 32, 64) and keys in (128, 256)
     assert mask.dtype == jnp.bool_ and mask.shape == (groups, queries, keys)
     assert tokens == groups * queries and sink.shape == (heads,)
-    query_tile = min(queries, SWA_QUERY_ROWS // heads)
-    assert queries % query_tile == 0
+    query_tile = max(
+        tile
+        for tile in range(1, min(queries, SWA_QUERY_ROWS // heads) + 1)
+        if queries % tile == 0
+    )
     # Four attention regions plus a 256-row permutation fit in the v7x MRB.
     group_batch = math.gcd(groups, SWA_DECODE_GROUPS) if queries == 1 else 1
     windows = groups // group_batch

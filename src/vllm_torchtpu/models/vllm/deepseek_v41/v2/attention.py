@@ -505,6 +505,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _q_projection_rope_op: Any = None
     # TP1 FP8-KV layers run the fused Q-A/KV, Q-B and compressor kernels.
     _fused_preprocess = False
+    _swa_query_group_size = 1
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -529,6 +530,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # FP8 main KV uses DSV4's packed record (448 e4m3 + 64 e8m0 bytes)
         # plus a BF16 RoPE companion; see cache.encode_fp8_kv.
         self._fp8_kv = self.kv_cache_torch_dtype == torch.float8_e4m3fn
+        speculative = vllm_config.speculative_config
+        if speculative is not None and speculative.num_speculative_tokens is not None:
+            self._swa_query_group_size = speculative.num_speculative_tokens + 1
         csa2_supported = (
             get_tensor_model_parallel_world_size() == 1
             and self._fp8_kv
@@ -1697,6 +1701,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     main_records,
                     self.attn_sink,
                     self.scale,
+                    self._swa_query_group_size,
                 )
             output.copy_(result.masked_fill(swa_invalid_3d, 0))
             return None
