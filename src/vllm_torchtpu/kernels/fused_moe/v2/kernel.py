@@ -1256,7 +1256,6 @@ def _build_fused_ep_moe_kernel(
                         tp_barrier(visit_i)
                         tp_scales_starts(visit_i + 1, ns)
                         tp_w1_starts(visit_i + 1)
-                        tp_w2_starts(visit_i + 1, ns)
                     else:
                         tp_barrier(2 * visit_i)
                         tp_w1_starts(visit_i + 1)
@@ -2232,7 +2231,6 @@ def _build_fused_ep_moe_kernel(
                             tp_barrier(visit_i)
                             tp_scales_starts(visit_i + 1, ns)
                             tp_w1_starts(visit_i + 1)
-                            tp_w2_starts(visit_i + 1, ns)
                         else:
                             tp_barrier(2 * visit_i)
                             tp_w1_starts(visit_i + 1)
@@ -2243,7 +2241,9 @@ def _build_fused_ep_moe_kernel(
 
                 @pl.when(visit_i + 1 < n_tp_visit)
                 def _():
-                    if not tp_dbuf_w2:
+                    if tp_dbuf_w2:
+                        tp_w2_starts(visit_i + 1, ns)
+                    else:
                         tp_barrier(2 * visit_i + 1)
                         tp_scales_starts(visit_i + 1, ns)
                         tp_w2_starts(visit_i + 1, ns)
