@@ -50,9 +50,31 @@ PRIORITY_NIGHTLY = 1
 # Max TPU jobs one author's PR builds may have in flight on kube (~2 PRs at ~19 jobs).
 PR_TPU_JOBS_PER_AUTHOR = 40
 
-# Suite lanes (.buildkite/pipeline_<lane>.yml), in upload order. CI_LANES overrides;
-# otherwise perf runs only on nightlies, integration, or run-perf-eval/run-full-ci PRs.
-ALL_LANES: tuple[str, ...] = ("verify", "perf", "integration", "tests")
+# Pipeline shape (`pipeline upload` prepends right after bootstrap, so `promote`
+# uploads first, `LANES` in reverse, and `build` last):
+#
+#   build -> cpu => (gate) -> tests / integration / perf -> verify
+#                                                        -> promote (integration only)
+
+
+@dataclass(frozen=True)
+class Lane:
+    """One suite fragment between `pipeline_build.yml` and `pipeline_promote.yml`."""
+
+    name: str
+    file: str
+    tpu: bool = True  # skipped by skip-tpu-ci; waits on cpu_checks when gated
+    perf_only: bool = False  # nightly, integration, or run-perf-eval/run-full-ci PRs
+
+
+LANES: tuple[Lane, ...] = (
+    Lane("cpu", ".buildkite/pipeline_cpu.yml", tpu=False),
+    Lane("tests", ".buildkite/pipeline_tests.yml"),
+    Lane("integration", ".buildkite/pipeline_integration.yml"),
+    Lane("perf", ".buildkite/pipeline_perf.yml", perf_only=True),
+    Lane("verify", ".buildkite/pipeline_verify.yml"),
+)
+ALL_LANES: tuple[str, ...] = tuple(lane.name for lane in LANES)
 
 # Pipeline slugs and fragment paths.
 INTEGRATION_PIPELINE_SLUG = "vllm-torchtpu-integration"
@@ -73,6 +95,7 @@ _DOCS_ONLY_RE = re.compile(
     r"|^LICENSE$|^\.git-blame-ignore-revs$|^\.pyrefly-baseline\.json$)"
 )
 _MERGED_PR_RE = re.compile(r"\(#([0-9]+)\)$")
+_RELEASE_TAG_RE = re.compile(r"^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$")
 _VLLM_PIN_RE = re.compile(
     r".*vllm @ git\+https://github\.com/vllm-project/vllm\.git@([a-zA-Z0-9.-]+).*"
 )
@@ -194,7 +217,7 @@ class UploadPlan:
     """Resolved lane selection, exported flags, and annotations for upload."""
 
     nightly: bool
-    skip_tpu_ci: bool
+    cpu_gate: str
     lanes: tuple[str, ...]
     lane_files: tuple[str, ...]
     build_file: str
@@ -350,26 +373,26 @@ def resolve_vllm_commit_hash(base_hash: str, override: str) -> str:
 
 
 def _select_lanes(
-    ctx: BuildContext, *, nightly: bool, skip_tpu_ci: bool
-) -> tuple[tuple[str, ...], str | None]:
-    """Resolve requested lanes (`CI_LANES` override or build defaults) and validate."""
+    ctx: BuildContext, *, nightly: bool, skip_tpu: bool
+) -> tuple[tuple[Lane, ...], str | None]:
+    """Resolve active `LANES` (`CI_LANES` override or build defaults) and validate."""
     if ctx.ci_lanes_raw:
-        requested = tuple(ctx.ci_lanes_raw.split())
-        bad = next((lane for lane in requested if lane not in ALL_LANES), None)
-        err = (
-            f"ERROR: CI_LANES names '{bad}'; lanes are: {' '.join(ALL_LANES)}"
-            if bad
-            else None
-        )
-        return requested, err
-    if skip_tpu_ci:
-        return ("tests",), None
+        by_name = {lane.name: lane for lane in LANES}
+        names = tuple(ctx.ci_lanes_raw.split())
+        bad = next((name for name in names if name not in by_name), None)
+        if bad is not None:
+            return (), f"ERROR: CI_LANES names '{bad}'; lanes are: {' '.join(by_name)}"
+        return tuple(lane for lane in LANES if lane.name in names), None
     run_perf = (
         nightly
         or ctx.is_integration
         or (ctx.is_pr and "run-perf-eval" in ctx.pr_labels)
     )
-    lanes = ALL_LANES if run_perf else tuple(x for x in ALL_LANES if x != "perf")
+    lanes = tuple(
+        lane
+        for lane in LANES
+        if not (skip_tpu and lane.tpu) and (run_perf or not lane.perf_only)
+    )
     return lanes, None
 
 
@@ -379,7 +402,7 @@ def plan_uploads(
     merged_labels: Sequence[str],
     existing_lane_files: Container[str],
 ) -> UploadPlan:
-    """Decide lanes, annotations, `SKIP_TPU_CI`, and `OMNI_IMAGE_SKIP`."""
+    """Decide lanes, `CPU_GATE`, annotations, and `OMNI_IMAGE_SKIP`."""
     pre_annotations: list[Annotation] = []
     nightly = ctx.nightly_env
     if ctx.is_pr and "run-full-ci" in ctx.pr_labels:
@@ -406,18 +429,16 @@ def plan_uploads(
             )
         )
 
-    # skip-tpu-ci keeps only the tests lane, and SKIP_TPU_CI leaves out its TPU
-    # group (pipeline_tests.yml reads it when the lane is uploaded), so the
-    # image build, the type check and the CPU unit tests still run, on the PR
-    # and again on its post-merge build. It overrides run-perf-eval and
-    # run-full-ci.
+    # skip-tpu-ci drops every `tpu=True` lane, so only the image build (minus
+    # -omni) and `pipeline_cpu.yml` upload, on the PR and again on its
+    # post-merge build. It overrides run-perf-eval and run-full-ci.
     skip_labels: Sequence[str] = (
         ctx.pr_labels
         if ctx.is_pr
         else (merged_labels if ctx.is_post_merge_webhook else ())
     )
-    skip_tpu_ci = ctx.skip_tpu_ci_env or ("skip-tpu-ci" in skip_labels)
-    if skip_tpu_ci:
+    skip_tpu = ctx.skip_tpu_ci_env or ("skip-tpu-ci" in skip_labels)
+    if skip_tpu:
         pre_annotations.append(
             Annotation(
                 style="info",
@@ -428,18 +449,25 @@ def plan_uploads(
             )
         )
 
-    requested_lanes, invalid_error = _select_lanes(
-        ctx, nightly=nightly, skip_tpu_ci=skip_tpu_ci
+    selected_lanes, invalid_error = _select_lanes(
+        ctx, nightly=nightly, skip_tpu=skip_tpu
     )
-    lane_files: list[str] = []
+    uploaded_lanes: list[Lane] = []
     missing: list[str] = []
-    if invalid_error is None:
-        for lane in ALL_LANES:
-            if lane in requested_lanes:
-                rel_path = f".buildkite/pipeline_{lane}.yml"
-                (lane_files if rel_path in existing_lane_files else missing).append(
-                    rel_path
-                )
+    for lane in selected_lanes:
+        if lane.file in existing_lane_files:
+            uploaded_lanes.append(lane)
+        else:
+            missing.append(lane.file)
+
+    is_gated = (
+        ctx.source != "schedule"
+        and "oncall-fix" not in ctx.pr_labels
+        and not bool(_RELEASE_TAG_RE.match(ctx.tag))
+    )
+    has_cpu = any(not lane.tpu for lane in uploaded_lanes)
+    has_tpu = any(lane.tpu for lane in uploaded_lanes)
+    cpu_gate = "cpu_checks" if (is_gated and has_cpu and has_tpu) else "build_docker"
 
     post_annotations: list[Annotation] = []
     missing_error: str | None = None
@@ -462,20 +490,18 @@ def plan_uploads(
 
     # pipeline_build.yml skips the -omni image build when this is non-empty.
     # Buildkite rejects the upload if a skip reason is over 70 characters.
-    if "tests" not in requested_lanes:
-        omni_image_skip = (
-            "Only the tests lane uses the -omni image; this build has none."
-        )
-    elif skip_tpu_ci:
-        omni_image_skip = "Only TPU steps use the -omni image; skip-tpu-ci skips them."
-    else:
-        omni_image_skip = ""
+    lane_names = tuple(lane.name for lane in selected_lanes)
+    omni_image_skip = (
+        ""
+        if "tests" in lane_names
+        else "Only the tests lane uses the -omni image; this build has none."
+    )
 
     return UploadPlan(
         nightly=nightly,
-        skip_tpu_ci=skip_tpu_ci,
-        lanes=requested_lanes,
-        lane_files=tuple(lane_files),
+        cpu_gate=cpu_gate,
+        lanes=lane_names,
+        lane_files=tuple(lane.file for lane in uploaded_lanes),
         build_file=BUILD_PIPELINE_FILE,
         omni_image_skip=omni_image_skip,
         pre_lane_annotations=tuple(pre_annotations),
@@ -835,11 +861,9 @@ def run_bootstrap(
             effects=effects,
         )
 
-    # Since Buildkite prepends uploaded steps (inserts in reverse order),
-    # uploading the test steps first and build steps last ensures they are
-    # displayed and queued in correct order: Build -> Tests.
+    # Buildkite prepends each uploaded file right after bootstrap, so upload
+    # promote first, LANES in reverse, and build last to match LANES order.
     if ctx.is_integration:
-        # Upload promote step FIRST so Buildkite places it LAST after test steps.
         print("Uploading Promotion Pipeline Fragment")
         _upload(PROMOTE_PIPELINE_FILE, nightly=ctx.nightly_env)
 
@@ -849,11 +873,7 @@ def run_bootstrap(
         if pr_num is not None:
             merged_labels = effects.merged_pr_labels(pr_num, env=child_env)
 
-    existing_lanes = {
-        f".buildkite/pipeline_{lane}.yml"
-        for lane in ALL_LANES
-        if (repo_root / f".buildkite/pipeline_{lane}.yml").is_file()
-    }
+    existing_lanes = {lane.file for lane in LANES if (repo_root / lane.file).is_file()}
     upload_plan = plan_uploads(
         ctx,
         merged_labels=merged_labels,
@@ -862,14 +882,14 @@ def run_bootstrap(
 
     if upload_plan.nightly:
         child_env["NIGHTLY"] = "1"
-    child_env["SKIP_TPU_CI"] = "1" if upload_plan.skip_tpu_ci else "0"
+    child_env["CPU_GATE"] = upload_plan.cpu_gate
     for annotation in upload_plan.pre_lane_annotations:
         effects.annotate(annotation, env=child_env)
 
     if upload_plan.invalid_ci_lanes_error is not None:
         raise BootstrapError(upload_plan.invalid_ci_lanes_error)
 
-    for lane_file in upload_plan.lane_files:
+    for lane_file in reversed(upload_plan.lane_files):
         print(f"Uploading {lane_file}")
         _upload(lane_file, nightly=upload_plan.nightly)
 

@@ -24,6 +24,8 @@ x-run-condition: &run-on-nightly-or-tag
 steps:
   - label: "Upload Tests for Models & Features"
     <<: *run-on-nightly-or-tag
+    env:
+      CPU_GATE: "${CPU_GATE:-build_docker}"
     agents:
       queue: cpu
     commands:

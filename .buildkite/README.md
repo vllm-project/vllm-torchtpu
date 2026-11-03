@@ -1,20 +1,24 @@
 # Buildkite pipelines
 
-CI runs on the Kueue fleet: `bootstrap.sh` uploads the `pipeline_<lane>.yml`
-lanes (`tests`, `integration`, `perf`, `verify`), and every step runs in a pod
-through `.buildkite/kubernetes/run.sh`.
+CI runs on the Kueue fleet: `bootstrap.sh` (`bootstrap.py`) uploads the
+`pipeline_<lane>.yml` lanes (`cpu`, `tests`, `integration`, `perf`, `verify`),
+and every step runs in a pod through `.buildkite/kubernetes/run.sh`.
 
-`pipeline_tests.yml` runs unmarked unit tests in `tests/` in CPU pods and
-tests marked `tpu_test` (or `multichip`) on TPU v7x slices (1x1x1 and 2x2x1).
-PR steps exclude `nightly` tests; nightly steps include them. Both use the CI
-image built by `pipeline_build.yml`. The CPU steps set `JAX_PLATFORMS=cpu` so
-JAX does not look for a TPU.
+`pipeline_cpu.yml` runs the full `pyrefly` type check and unmarked unit tests in
+`tests/` in CPU pods (`key: cpu_checks`, with `JAX_PLATFORMS=cpu` so JAX does
+not look for a TPU). `pipeline_tests.yml` runs tests marked `tpu_test` (or
+`multichip`) on TPU v7x slices (1x1x1 and 2x2x1). PR steps exclude `nightly`
+tests; nightly steps include them. Both use the CI image built by
+`pipeline_build.yml`. On gated builds (anything other than scheduled builds,
+`oncall-fix` PRs, and release tags), `bootstrap.py` exports
+`CPU_GATE=cpu_checks` so TPU steps across `tests`, `integration`, `perf`, and
+`verify` wait for `cpu_checks` to pass before claiming TPU chips.
 
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
 PR has the `run-perf-eval` label (or `run-full-ci`, which sets `NIGHTLY=1` and
-runs the full nightly suite across every lane: `tests`, `integration`, `perf`
-and `verify`); adding either label to a PR that already has
+runs the full nightly suite across every lane: `cpu`, `tests`, `integration`,
+`perf` and `verify`); adding either label to a PR that already has
 `ready` starts a build that includes them. The 02:00 PT nightly runs
 all of them. Between nightlies, schedules on `vllm-torchtpu-ci` that set
 `CI_LANES=perf` run the perf lane alone; without `NIGHTLY` that is only the
@@ -22,11 +26,11 @@ steps not gated on it. The schedules keep clear of the hours the nightly's
 perf steps take. The integration pipeline also runs the lane, because its LKG
 promotion waits on two of its steps.
 
-A PR labeled `skip-tpu-ci` (it still needs `ready`) runs only the `tests` lane
-and the image build, and the lane's `Unit Tests on TPU` group is skipped through
-`SKIP_TPU_CI`, so what runs is the type check and the CPU unit tests. The
-post-merge build of such a PR does the same: `bootstrap.sh` reads the merged
-PR's labels from GitHub. Keep TPU steps of the `tests` lane inside that group.
+A PR labeled `skip-tpu-ci` (it still needs `ready`) uploads only the `cpu` lane
+and the image build (skipping the `-omni` image and every TPU lane), so what
+runs is the image build, the type check, and the CPU unit tests. The post-merge
+build of such a PR does the same: `bootstrap.py` reads the merged PR's labels
+from GitHub.
 
 Releases and nightly images are published by the `vllm-torchtpu-release`
 pipeline in the TPU Release cluster; [`release/README.md`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/release/README.md)
