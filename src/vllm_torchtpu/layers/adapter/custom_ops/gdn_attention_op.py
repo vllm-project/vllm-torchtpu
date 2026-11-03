@@ -1162,7 +1162,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            # Reshaping the strided view would reshape all of mixed_qkvz and
+            # slice z's heads from it; a contiguous z is a plain column slice.
+            z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
