@@ -10,7 +10,7 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
-from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
+from vllm_torchtpu.kernels.qwen4_exp.hc_full import _combine_full_mix, _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
 from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
 
@@ -62,6 +62,52 @@ def build_full_mix_op(
         return (
             x.new_empty((x.shape[0], hidden), dtype=torch.bfloat16),
             x.new_empty(x.shape, dtype=torch.bfloat16),
+        )
+
+    return op
+
+
+@functools.cache
+def build_combine_full_mix_op(
+    branches: int, hidden: int, eps: float, token_tile: int, up_t: bool
+):
+    """``(mixed, norm, combined)``: the gated residual merge, then the full mix."""
+    eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+
+    def core(
+        residual: jax.Array,
+        block: jax.Array,
+        gates: jax.Array,
+        weight: jax.Array,
+        down: jax.Array,
+        up: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return _combine_full_mix(
+            residual,
+            block,
+            gates,
+            weight,
+            down,
+            up,
+            branches=branches,
+            hidden=hidden,
+            eps=eps,
+            token_tile=token_tile,
+            up_t=up_t,
+        )
+
+    op = pallas.jax_op(
+        f"qwen4_exp::hc_combine_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"{'_upt' if up_t else ''}_v1",
+        core,
+    )
+
+    @op.register_fake
+    def fake(residual, block, gates, weight, down, up):
+        return (
+            residual.new_empty((residual.shape[0], hidden), dtype=torch.bfloat16),
+            residual.new_empty(residual.shape, dtype=torch.bfloat16),
+            residual.new_empty(residual.shape, dtype=torch.bfloat16),
         )
 
     return op

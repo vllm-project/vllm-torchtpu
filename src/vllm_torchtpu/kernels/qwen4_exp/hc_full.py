@@ -14,55 +14,89 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _kernel(
-    x_hbm,
-    weight_hbm,
-    down_hbm,
-    up_hbm,
-    mixed_hbm,
-    norm_hbm,
-    x_vm,
-    weight_vm,
-    down_vm,
-    up_vm,
-    mixed_vm,
-    norm_vm,
-    x_sems,
-    weight_sem,
-    down_sem,
-    up_sem,
-    mixed_sems,
-    norm_sems,
-    *,
-    token_tile,
-    tokens,
-    hidden,
-    branches,
-    eps,
-    up_t,
-):
+def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine):
+    if combine:
+        (x_hbm, block_hbm, gates_hbm, weight_hbm, down_hbm, up_hbm) = refs[:6]
+        (mixed_hbm, norm_hbm, combined_hbm) = refs[6:9]
+        (x_vm, block_vm, gates_vm, weight_vm, down_vm, up_vm, mixed_vm, norm_vm) = refs[
+            9:17
+        ]
+        (x_sems, block_sems, gates_sems, weight_sem, down_sem, up_sem) = refs[17:23]
+        (mixed_sems, norm_sems, combined_sems) = refs[23:]
+    else:
+        (x_hbm, weight_hbm, down_hbm, up_hbm, mixed_hbm, norm_hbm) = refs[:6]
+        (x_vm, weight_vm, down_vm, up_vm, mixed_vm, norm_vm) = refs[6:12]
+        (x_sems, weight_sem, down_sem, up_sem, mixed_sems, norm_sems) = refs[12:]
     weight_dma = pltpu.make_async_copy(weight_hbm, weight_vm, weight_sem)
     down_dma = pltpu.make_async_copy(down_hbm, down_vm, down_sem)
     up_dma = pltpu.make_async_copy(up_hbm, up_vm, up_sem)
     weight_dma.start()
     down_dma.start()
     up_dma.start()
-    pltpu.make_async_copy(
-        x_hbm.at[pl.ds(0, token_tile)], x_vm.at[0], x_sems.at[0]
-    ).start()
+
+    def input_copies(step, slot):
+        rows = pl.ds(step * token_tile, token_tile)
+        copies = [pltpu.make_async_copy(x_hbm.at[rows], x_vm.at[slot], x_sems.at[slot])]
+        if combine:
+            copies.append(
+                pltpu.make_async_copy(
+                    block_hbm.at[rows], block_vm.at[slot], block_sems.at[slot]
+                )
+            )
+            copies.append(
+                pltpu.make_async_copy(
+                    gates_hbm.at[rows], gates_vm.at[slot], gates_sems.at[slot]
+                )
+            )
+        return copies
+
+    for copy in input_copies(0, 0):
+        copy.start()
+
+    def combine_rows(parity):
+        """x tile <- bf16(residual + block * gate) per branch (the gated residual)."""
+
+        def rows(index, carry):
+            offset = pl.ds(index * 32, 32)
+            block = block_vm[parity, offset, :].astype(jnp.float32)
+            gates = gates_vm[parity, offset, :]
+            for branch in range(branches):
+                cols = pl.ds(branch * hidden, hidden)
+                residual = x_vm[parity, offset, cols].astype(jnp.float32)
+                x_vm[parity, offset, cols] = (
+                    residual + block * gates[:, branch : branch + 1]
+                ).astype(jnp.bfloat16)
+            return carry
+
+        jax.lax.fori_loop(0, token_tile // 32, rows, jnp.int32(0))
 
     def one_step(step, parity):
         # The previous step started this input copy. Wait at its first read.
-        pltpu.make_async_copy(
-            x_vm.at[parity], x_vm.at[parity], x_sems.at[parity]
-        ).wait()
+        for copy in input_copies(step, parity):
+            copy.wait()
+
+        if combine:
+
+            @pl.when(step >= 1)
+            def _wait_prior_combined_output():
+                # The next input copy reuses the slot the previous step wrote out.
+                pltpu.make_async_copy(
+                    x_vm.at[1 - parity],
+                    x_vm.at[1 - parity],
+                    combined_sems.at[1 - parity],
+                ).wait()
 
         @pl.when(step + 1 < tokens // token_tile)
         def _start_next_input():
+            for copy in input_copies(step + 1, 1 - parity):
+                copy.start()
+
+        if combine:
+            combine_rows(parity)
             pltpu.make_async_copy(
-                x_hbm.at[pl.ds((step + 1) * token_tile, token_tile)],
-                x_vm.at[1 - parity],
-                x_sems.at[1 - parity],
+                x_vm.at[parity],
+                combined_hbm.at[pl.ds(step * token_tile, token_tile)],
+                combined_sems.at[parity],
             ).start()
 
         if token_tile >= 32 and token_tile % 32 == 0:
@@ -201,13 +235,13 @@ def _kernel(
         pltpu.make_async_copy(
             mixed_vm.at[parity], mixed_vm.at[parity], mixed_sems.at[parity]
         ).wait()
+    if combine:
+        # The last step (odd parity) wrote the final combined tile.
+        pltpu.make_async_copy(x_vm.at[1], x_vm.at[1], combined_sems.at[1]).wait()
 
 
-@functools.partial(
-    jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile", "up_t")
-)
-def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, up_t=False):
-    """``up_t``: ``up`` is given as its [low rank, width] transpose."""
+def _pallas_mix(x, weight, down, up, extra, *, branches, hidden, eps, token_tile, up_t):
+    """The full mix over ``x`` (``extra``: (block, gates) to combine into it first)."""
     tokens, width = x.shape
     lowrank = down.shape[0]
     if (
@@ -219,7 +253,46 @@ def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, up_t=Fa
         or any(a.dtype != jnp.bfloat16 for a in (x, weight, down, up))
     ):
         raise ValueError("HC full mix requires even BF16 token tiles")
+    combine = bool(extra)
+    if combine:
+        block, gates = extra
+        if (
+            block.shape != (tokens, hidden)
+            or gates.shape != (tokens, branches)
+            or block.dtype != jnp.bfloat16
+            or gates.dtype != jnp.float32
+        ):
+            raise ValueError("HC combine requires a BF16 block and FP32 gates")
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    dma = pltpu.SemaphoreType.DMA
+    tiles = [pltpu.VMEM((2, token_tile, width), jnp.bfloat16)]
+    if combine:
+        tiles += [
+            pltpu.VMEM((2, token_tile, hidden), jnp.bfloat16),
+            pltpu.VMEM((2, token_tile, branches), jnp.float32),
+        ]
+    scratch = (
+        *tiles,
+        pltpu.VMEM((width,), jnp.bfloat16),
+        pltpu.VMEM((lowrank, width), jnp.bfloat16),
+        pltpu.VMEM(up.shape, jnp.bfloat16),
+        pltpu.VMEM((2, token_tile, hidden), jnp.bfloat16),
+        pltpu.VMEM((2, token_tile, width), jnp.bfloat16),
+        *(dma((2,)) for _ in tiles),
+        dma,
+        dma,
+        dma,
+        dma((2,)),
+        dma((2,)),
+        *((dma((2,)),) if combine else ()),
+    )
+    out_shape = [
+        jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
+        jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16),
+    ]
+    if combine:
+        out_shape.append(jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16))
+    inputs = (x, *extra, weight, down, up)
     return pl.pallas_call(
         functools.partial(
             _kernel,
@@ -229,31 +302,60 @@ def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, up_t=Fa
             branches=branches,
             eps=eps,
             up_t=up_t,
+            combine=combine,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             grid=(),
-            in_specs=(hbm,) * 4,
-            out_specs=(hbm,) * 2,
-            scratch_shapes=(
-                pltpu.VMEM((2, token_tile, width), jnp.bfloat16),
-                pltpu.VMEM((width,), jnp.bfloat16),
-                pltpu.VMEM((lowrank, width), jnp.bfloat16),
-                pltpu.VMEM(up.shape, jnp.bfloat16),
-                pltpu.VMEM((2, token_tile, hidden), jnp.bfloat16),
-                pltpu.VMEM((2, token_tile, width), jnp.bfloat16),
-                pltpu.SemaphoreType.DMA((2,)),
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA((2,)),
-                pltpu.SemaphoreType.DMA((2,)),
-            ),
+            in_specs=(hbm,) * len(inputs),
+            out_specs=(hbm,) * len(out_shape),
+            scratch_shapes=scratch,
         ),
-        out_shape=(
-            jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
-            jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16),
-        ),
+        out_shape=tuple(out_shape),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=60 << 20),
-        name=f"qwen4exp_hc_branchstore32_m{token_tile}",
-    )(x, weight, down, up)
+        name=f"qwen4exp_hc_{'combine_' if combine else ''}branchstore32_m{token_tile}",
+    )(*inputs)
+
+
+@functools.partial(
+    jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile", "up_t")
+)
+def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, up_t=False):
+    """``up_t``: ``up`` is given as its [low rank, width] transpose."""
+    return _pallas_mix(
+        x,
+        weight,
+        down,
+        up,
+        (),
+        branches=branches,
+        hidden=hidden,
+        eps=eps,
+        token_tile=token_tile,
+        up_t=up_t,
+    )
+
+
+@functools.partial(
+    jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile", "up_t")
+)
+def _combine_full_mix(
+    residual, block, gates, weight, down, up, *, branches, hidden, eps, token_tile, up_t
+):
+    """``_full_mix(gated_residual(residual, block, gates), ...)`` in one kernel.
+
+    Returns ``(mixed, norm, combined)``; ``combined`` is the gated residual
+    (the next hyper input), written once while its tile is normalized.
+    """
+    return _pallas_mix(
+        residual,
+        weight,
+        down,
+        up,
+        (block, gates),
+        branches=branches,
+        hidden=hidden,
+        eps=eps,
+        token_tile=token_tile,
+        up_t=up_t,
+    )
