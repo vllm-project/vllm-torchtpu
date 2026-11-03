@@ -207,6 +207,7 @@ def main():
     parser.add_argument("--production-caller", action="store_true")
     parser.add_argument("--compare-post-block32", action="store_true")
     parser.add_argument("--post-layout3d", action="store_true")
+    parser.add_argument("--post-whole-tile", action="store_true")
     parser.add_argument("--baseline-source", type=Path)
     parser.add_argument("--fallback-eps", type=float)
     parser.add_argument("--tokens", type=int, default=288)
@@ -375,7 +376,9 @@ def main():
                 if args.post_layout3d:
                     import mhc_post_layout
 
-                    return mhc_post_layout.post3d(x, residual, post, comb)
+                    return mhc_post_layout.post3d(
+                        x, residual, post, comb, whole_tile=args.post_whole_tile
+                    )
                 return post_kernel.mhc_post(
                     x, residual, post, comb, token_block_size=32
                 )
@@ -423,6 +426,7 @@ def main():
         "production_caller": args.production_caller,
         "compare_post_block32": args.compare_post_block32,
         "post_layout3d": args.post_layout3d,
+        "post_whole_tile": args.post_whole_tile,
         "integration_checks": integration_checks,
     }
 
