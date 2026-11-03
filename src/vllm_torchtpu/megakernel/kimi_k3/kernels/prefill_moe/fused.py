@@ -1003,8 +1003,10 @@ def _routed_experts(
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
-    gu_unroll = 4 if tokens < 8192 else 8
-    first_down_unroll = 2 if tokens < 8192 else 8
+    gu_unroll = k._config().prefill_moe_gu_unroll or (4 if tokens < 8192 else 8)
+    first_down_unroll = k._config().prefill_moe_first_down_unroll or (
+        2 if tokens < 8192 else 8
+    )
     metadata_row_capacity = 0 if tokens < 8192 else _capacity(tokens, experts)
     ring_dtype = jnp.float32
     assert tokens in (512, 1024, 2048, 4096, 8192)

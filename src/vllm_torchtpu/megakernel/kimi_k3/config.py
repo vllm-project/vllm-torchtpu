@@ -99,6 +99,10 @@ class KernelConfig:
     # Fused EP8 MoE at 8K: routes one rank's compact path holds in SMEM (more
     # take the unfused overflow path for the layer).
     prefill_moe_capacity_ep8: int = 32768
+    # Fused MoE first column: previous-expert rows combined per GU panel and
+    # per first-down panel (0: 4/2 below 8K, 8/8 at 8K).
+    prefill_moe_gu_unroll: int = 0
+    prefill_moe_first_down_unroll: int = 0
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.
