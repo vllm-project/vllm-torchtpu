@@ -96,6 +96,12 @@ class KernelConfig:
     # The fused MoE at prefill_expert_parallel 8 (EP8/TP4), as the aggregate
     # engine's prefill runs it; off: EP8 takes the unfused path.
     prefill_fused_moe_ep8: bool = False
+    # Prefill KDA chunk sub-block (rows per decay anchor): 16, or 32 (one
+    # matmul fewer per 16 rows; factors up to exp(80)).
+    prefill_kda_sub_block: int = 16
+    # Prefill KDA layer diagnostics (invalid results, timing only): no_tiles,
+    # no_rings, no_gather, no_reduce, no_chunk skip that part of the layer.
+    prefill_kda_diag: tuple[str, ...] = ()
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.
@@ -144,6 +150,11 @@ class KernelConfig:
             raise ValueError("fp8_wires holds t0 and/or t10")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
+        if self.prefill_kda_sub_block not in (16, 32):
+            raise ValueError("prefill_kda_sub_block is 16 or 32")
+        if not set(self.prefill_kda_diag) <= {
+            "no_tiles", "no_rings", "no_gather", "no_reduce", "no_chunk"}:
+            raise ValueError("unknown prefill_kda_diag entry")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
             raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):

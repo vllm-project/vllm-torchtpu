@@ -51,6 +51,7 @@ the header); the TP32 rings from ``vllm_torchtpu.kernels.kimi_k3.collectives``.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from abc import ABC, abstractmethod
@@ -2927,6 +2928,11 @@ def gmm_v2(
 # Chunked KDA math, the MLA projections and the logits' residual mixture.
 
 
+def _phase(name):
+    """A named trace scope with ``KernelConfig.phase_scopes``, else a no-op."""
+    return jax.named_scope(name) if _config().phase_scopes else contextlib.nullcontext()
+
+
 # Structural constants of the K3 per-rank (TP32) layout.
 _HEADS = 3  # attention heads per rank (96 total)
 _CHANNELS = 128
@@ -3655,6 +3661,8 @@ def kda_prefill_tiled_body(
         a_log = jnp.exp(alog_vmem[...])  # [3, 1] FP32
         dt_bias = dt_vmem[...]  # [3, 128] FP32
         norm = norm_vmem[0]
+        scope = _phase("kda_projections")
+        scope.__enter__()
         hidden_tile = hidden_bufs.at[buf][...]  # [tile, hidden]
         # ---- projections ----
         gate_features = _dot(hidden_tile, gate_w_vmem[...]).astype(jnp.bfloat16)  # [tile, 128]
@@ -3671,6 +3679,9 @@ def kda_prefill_tiled_body(
         raw_gate = _row_where(real_rows, raw_gate, -1e30)
         update_rate = _row_where(real_rows, update_rate, -1e30)
 
+        scope.__exit__(None, None, None)
+        scope = _phase("kda_conv")
+        scope.__enter__()
         # ---- 4-tap causal conv (carrying the 3-token history) ----
         window = jnp.concatenate((conv_hist_vmem[...], qkv), axis=0)  # [tile+3, 3,3,128]
         convolved = jnp.zeros((tile, 3, head_count, channels), jnp.float32)
@@ -3707,11 +3718,17 @@ def kda_prefill_tiled_body(
         decay = kda_decay(decay_lower_bound, a_log[None], raw_gate, dt_bias[None])  # [tile, 3, 128] FP32
         beta = jax.nn.sigmoid(update_rate.astype(jnp.float32))  # [tile, 3] FP32
 
+        scope.__exit__(None, None, None)
+        scope = _phase("kda_chunks")
+        scope.__enter__()
         # ---- chunked delta rule over this tile's 64-token chunks ----
         outputs = []
+        chunk_fn = functools.partial(kda_chunk, sub_block=_config().prefill_kda_sub_block)
+        if "no_chunk" in _config().prefill_kda_diag:  # timing only
+            chunk_fn = lambda q, k, v, g, b, state: (q * v + g, state)  # noqa: E731
         for c in range(tile // _KDA_CHUNK):
             s0, s1 = c * _KDA_CHUNK, (c + 1) * _KDA_CHUNK
-            chunk_out, new_state = kda_chunk(
+            chunk_out, new_state = chunk_fn(
                 query[s0:s1].transpose(1, 0, 2),
                 key[s0:s1].transpose(1, 0, 2),
                 value[s0:s1].transpose(1, 0, 2),
@@ -3723,6 +3740,9 @@ def kda_prefill_tiled_body(
             outputs.append(chunk_out.transpose(1, 0, 2))  # [64, 3, 128]
 
         attended = jnp.concatenate(outputs, axis=0)  # [tile, 3, 128] FP32
+        scope.__exit__(None, None, None)
+        scope = _phase("kda_output")
+        scope.__enter__()
         attended = attended.astype(jnp.bfloat16).astype(jnp.float32)
         attended *= jax.lax.rsqrt(
             jnp.mean(attended * attended, axis=-1, keepdims=True) + epsilon
@@ -3738,6 +3758,7 @@ def kda_prefill_tiled_body(
                 partial_bufs.at[buf, :, pl.ds(c * columns, columns)][...] = _dot(
                     attended, weight_vmem[:, pl.ds(c * columns, columns)]
                 ).astype(jnp.bfloat16)
+        scope.__exit__(None, None, None)
 
         if tile_segment is not None:
             segment, segment_end, current, offset, position = tile_segment
@@ -5630,23 +5651,29 @@ def _kda_layer_body(
             tile=stripe, eps=eps,
         )
 
-    @pl.when(phase < blocks)
-    def gather():
-        _half_gather_step(tables_ref, normalized_ref, gathered_ref, *gather_sems,
-                          step=ring_step, block=phase)
+    diag = set(_config().prefill_kda_diag)  # timing-only skips
+    gather_on = not diag & {"no_rings", "no_gather"}
+    reduce_on = not diag & {"no_rings", "no_reduce"}
 
-    @pl.when(phase >= 2)
+    @pl.when((phase < blocks) & gather_on)
+    def gather():
+        with _phase("kda_gather"):
+            _half_gather_step(tables_ref, normalized_ref, gathered_ref, *gather_sems,
+                              step=ring_step, block=phase)
+
+    @pl.when((phase >= 2) & reduce_on)
     def reduce():
-        _half_reduce_step(
-            tables_ref, length_ref, partial_ref, prefix_ref, final_ref,
-            *reduce_sems, *views(_kda_reduce_shapes(stripe)),
-            step=ring_step, block=phase - 2, replace=slot % 9 == 0,
-        )
+        with _phase("kda_reduce"):
+            _half_reduce_step(
+                tables_ref, length_ref, partial_ref, prefix_ref, final_ref,
+                *reduce_sems, *views(_kda_reduce_shapes(stripe)),
+                step=ring_step, block=phase - 2, replace=slot % 9 == 0,
+            )
 
     # One call site for the KDA tile: inlined twice, the layer would no
     # longer fit the instruction memory.
     block_tiles = 32 * stripe // 128
-    attending = (phase >= 1) & (phase <= blocks)
+    attending = (phase >= 1) & (phase <= blocks) & ("no_tiles" not in diag)
     first_tile = jnp.where(
         attending, (phase - 1) * block_tiles + ring_step * block_tiles // HALF_STEPS, 0)
     end_tile = jnp.where(

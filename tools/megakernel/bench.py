@@ -109,8 +109,14 @@ def _trace(directory: str, tag: str, last: bool):
         return
     from torch_tpu._internal.profiler import _impl as profiler
 
+    from vllm_torchtpu.megakernel.kimi_k3.config import active
+
     path = os.path.join(directory, tag)
-    profiler.start_trace(path)
+    if active().phase_scopes:  # kernel phase scopes need the device tracer at level 10
+        profiler.start_trace(path, profiler.ProfileOptions(
+            device_tracer_level=10, host_tracer_level=2))
+    else:
+        profiler.start_trace(path)
     try:
         yield
     finally:
