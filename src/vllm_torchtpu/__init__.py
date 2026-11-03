@@ -793,7 +793,8 @@ def _patch_vllm_offloading_config_build() -> None:
     def build_offloading_config_tpu(vllm_config, kv_cache_config):
         pcp = vllm_config.parallel_config.prefill_context_parallel_size
         dcp = vllm_config.parallel_config.decode_context_parallel_size
-        if pcp <= 1 and dcp > 1:
+        # The PCP manager keeps the plain DCP KV layout: blocks span DCP only.
+        if dcp > 1 and (pcp <= 1 or envs.USE_TPU_PCP_MANAGER):
             return build_offloading_config_dcp(vllm_config, kv_cache_config, dcp)
         if pcp <= 1:
             return original_build(vllm_config, kv_cache_config)

@@ -219,6 +219,25 @@ def test_dcp_rescales_chunk_block_size():
     assert config.cache.blocks_per_chunk == 2
 
 
+def test_pcp_manager_takes_dcp_path(monkeypatch):
+    """Under the PCP manager (DCP = TP x PCP) the KV layout is plain DCP, so
+    groups span block_size * dcp tokens, not * pcp."""
+    from vllm_torchtpu import envs
+
+    module = _patched_offloading_config_module()
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True)
+
+    vllm_config = _vllm_config(pcp=2, block_size=256, dcp=16)
+    vllm_config.parallel_config.tensor_parallel_size = 8
+    config = module.build_offloading_config(vllm_config, _mixed_mla_kv_cache_config())
+
+    tokens_per_hash = config.cache.tokens_per_hash
+    assert tuple(g.tokens_per_block for g in config.groups) == (4096,)
+    assert tokens_per_hash == 4096
+    assert all(g.tokens_per_block % tokens_per_hash == 0 for g in config.groups)
+    assert config.parallel.dcp_size == 16
+
+
 def test_offload_lookup_skips_unaligned_fine_prefix_hit(monkeypatch):
     """A GPU hit ending inside a chunk never starts an offload load."""
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
