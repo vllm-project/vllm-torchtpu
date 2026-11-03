@@ -48,7 +48,7 @@ from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
 )
-from vllm.v1.kv_offload.base import LookupResult, make_offload_key
+from vllm.v1.kv_offload.base import make_offload_key
 from vllm.v1.request import Request
 
 from vllm_torchtpu import envs
@@ -57,7 +57,6 @@ from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
-_WARM_RESULTS = (LookupResult.HIT, LookupResult.HIT_PENDING)
 
 # Priority tiers: lower values admit earlier.
 _TIER_PREEMPTED = 1
@@ -130,7 +129,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         """Prompt tokens right past the HBM hit that the offload tier can load.
 
         Counts the run of whole chunks the tier holds (or is storing) from the
-        chunk that starts at the HBM hit. A hit ending inside a chunk gets
+        chunk that starts at the HBM hit, in the host pool or, when one is
+        configured, the storage tier behind it. A hit ending inside a chunk gets
         nothing: tier loads start only from a chunk-aligned local hit (see
         ``_patch_vllm_offload_fine_prefix_alignment``).
         """
@@ -165,21 +165,17 @@ class PrefixAwareScheduler(AsyncScheduler):
         stop_chunk = min(max_chunks, first_chunk + self.TIER_PROBE_MAX_CHUNKS)
         try:
             block_hashes = request.block_hashes
-            chunks = 0
+            keys = []
             for chunk in range(first_chunk, stop_chunk):
                 hash_idx = (chunk + 1) * hashes_per_chunk - 1
                 if hash_idx >= len(block_hashes):
                     break
-                key = make_offload_key(block_hashes[hash_idx], group.group_idx)
-                # Local-only probe: RaidenOffloadingManager.lookup neither pins
-                # nor reorders local hits, and local_only=True skips remote
-                # global-registry RPCs and _remote_slices mutation.
-                if (
-                    sched._raiden_manager.lookup(key, None, local_only=True)
-                    not in _WARM_RESULTS
-                ):
-                    break
-                chunks += 1
+                keys.append(make_offload_key(block_hashes[hash_idx], group.group_idx))
+            # One store call for the whole run: RaidenOffloadingManager's
+            # probe counts the chunks the host pool or the storage tier holds
+            # (or is still storing), never asks the global registry, and
+            # neither pins, reorders nor stashes anything.
+            chunks = sched._raiden_manager.probe_warm_chunks(keys) if keys else 0
         except Exception:
             self._tier_probe_broken = True
             logger.exception(

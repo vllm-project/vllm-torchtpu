@@ -50,6 +50,7 @@ physical TPU hardware or native C++ wheels:
 
 import enum
 import os
+import random
 import sys
 import tempfile
 import types
@@ -2170,11 +2171,13 @@ class TestStorageTierLookups(unittest.TestCase):
 
 
 class TestLocalOnlyLookup(unittest.TestCase):
-    """`lookup(..., local_only=True)` is the scheduler's tier-warmth probe.
+    """`lookup(..., local_only=True)` answers as the scheduler's tier-warmth
+    probe does.
 
-    It answers from the host pool alone: it does not ask the global registry,
-    counts neither a peer's block nor a storage-tier block as a hit, and stashes
-    nothing for a `prepare_load` that the probe never makes.
+    It does not ask the global registry, so a peer's block is a miss. It counts
+    a storage-tier block, which the store answers for in the same lookup and a
+    load would read. It stashes nothing for a `prepare_load` that the probe
+    never makes.
     """
 
     def setUp(self):
@@ -2197,24 +2200,38 @@ class TestLocalOnlyLookup(unittest.TestCase):
         self.assertEqual(self._probe_enable_global_flags(), [False, True])
         self.assertTrue(self.manager._remote_slices)
 
-    def test_storage_tier_block_is_miss(self):
+    def test_storage_tier_block_is_hit_and_stashes_nothing(self):
         key = _key(2)
         seed_storage_entries(self.store, key)
         self.assertEqual(
-            self.manager.lookup(key, _ctx(), local_only=True), LookupResult.MISS
+            self.manager.lookup(key, _ctx(), local_only=True), LookupResult.HIT
         )
+        self.assertEqual(self._probe_enable_global_flags(), [False])
         self.assertEqual(self.manager._remote_slices, {})
+        self.assertEqual(self.store.pinned_hashes(), {})
+        # The default lookup of the same key stashes the storage slices for
+        # the load it prepares.
         self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.assertTrue(self.manager._remote_slices)
 
-    def test_host_prefix_with_storage_remainder_is_miss(self):
+    def test_host_prefix_with_storage_remainder_is_hit(self):
         key = _key(3)
         for h in sub_hashes(key)[:2]:
             self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
         seed_storage_entries(self.store, key)
         self.assertEqual(
-            self.manager.lookup(key, _ctx(), local_only=True), LookupResult.MISS
+            self.manager.lookup(key, _ctx(), local_only=True), LookupResult.HIT
         )
         self.assertEqual(self.manager._remote_slices, {})
+
+    def test_storage_block_with_a_read_in_flight_is_hit_pending(self):
+        key = _key(5)
+        seed_storage_entries(self.store, key)
+        self.manager._hash_to_admission[sub_hashes(key)[0]] = object()
+        self.assertEqual(
+            self.manager.lookup(key, _ctx(), local_only=True),
+            LookupResult.HIT_PENDING,
+        )
 
     def test_host_pool_hit_needs_no_req_context_and_takes_no_pin(self):
         key = _key(4)
@@ -2222,6 +2239,122 @@ class TestLocalOnlyLookup(unittest.TestCase):
         self.assertEqual(self.manager.lookup(key, local_only=True), LookupResult.HIT)
         self.assertEqual(self.store.pinned_hashes(), {})
         self.assertEqual(self.manager._remote_slices, {})
+
+
+class TestProbeWarmChunks(unittest.TestCase):
+    """`probe_warm_chunks(keys)` is the scheduler's tier-warmth probe for a run
+    of chunk keys: the leading keys a load could serve now or soon, from one
+    store call per run instead of one per key, never asking the registry,
+    pinning or stashing.
+    """
+
+    def setUp(self):
+        self.store = FakeKVCacheStore()
+        self.manager = make_global_manager(self.store)
+
+    def _lookups(self):
+        return self.store.calls_named("lookup")
+
+    def _assert_probe_only(self):
+        self.assertTrue(all(call.args[1] is False for call in self._lookups()))
+        self.assertTrue(all(call.args[2] is False for call in self._lookups()))
+        self.assertEqual(self.manager._remote_slices, {})
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_host_then_storage_run_is_one_store_call(self):
+        keys = [_key(i) for i in range(6)]
+        for key in keys[:2]:
+            seed_host_entries(self.store, key)
+        for key in keys[2:5]:
+            seed_storage_entries(self.store, key)
+        self.assertEqual(self.manager.probe_warm_chunks(keys), 5)
+        self.assertEqual(len(self._lookups()), 1)
+        self.assertEqual(
+            self._lookups()[0].args[0], [h for k in keys for h in sub_hashes(k)]
+        )
+        self._assert_probe_only()
+
+    def test_storage_only_session_is_counted(self):
+        keys = [_key(i) for i in range(4)]
+        for key in keys:
+            seed_storage_entries(self.store, key)
+        self.assertEqual(self.manager.probe_warm_chunks(keys), 4)
+        self.assertEqual(len(self._lookups()), 1)
+        self._assert_probe_only()
+
+    def test_stops_at_the_first_missing_or_partial_key(self):
+        keys = [_key(i) for i in range(4)]
+        seed_host_entries(self.store, keys[0])
+        seed_host_entries(self.store, keys[1])
+        # Key 2 lacks one sub-hash; key 3 is whole but comes after it.
+        seed_host_entries(self.store, keys[2])
+        del self.store.entries[sub_hashes(keys[2])[3]]
+        seed_host_entries(self.store, keys[3])
+        self.assertEqual(self.manager.probe_warm_chunks(keys), 2)
+
+    def test_keys_with_a_save_in_flight_count_without_a_store_call(self):
+        keys = [_key(i) for i in range(4)]
+        seed_host_entries(self.store, keys[0])
+        self.manager._inflight_store_keys.update(keys[1:3])
+        seed_host_entries(self.store, keys[3])
+        self.assertEqual(self.manager.probe_warm_chunks(keys), 4)
+        # Keys 0 and 3 are asked about, one store call each; keys 1-2 are not.
+        self.assertEqual(
+            [call.args[0] for call in self._lookups()],
+            [sub_hashes(keys[0]), sub_hashes(keys[3])],
+        )
+
+    def test_hbm_entries_count_only_with_a_save_in_flight(self):
+        keys = [_key(0), _key(1)]
+        for key in keys:
+            for h in sub_hashes(key):
+                self.store.entries[h] = _Entry(status=FakeBlockStatus.HBM)
+        for h in sub_hashes(keys[0]):
+            self.manager._hash_to_admission[h] = object()
+        # Key 0: a save in flight (HIT_PENDING). Key 1: residue of a failed
+        # save (MISS), which ends the count.
+        self.assertEqual(self.manager.probe_warm_chunks(keys), 1)
+
+    def test_peer_blocks_do_not_count(self):
+        keys = [_key(0), _key(1)]
+        seed_host_entries(self.store, keys[0])
+        seed_global_entries(self.store, keys[1])
+        self.assertEqual(self.manager.probe_warm_chunks(keys), 1)
+        self._assert_probe_only()
+
+    def test_empty_run_asks_nothing(self):
+        self.assertEqual(self.manager.probe_warm_chunks([]), 0)
+        self.assertEqual(self._lookups(), [])
+
+    def test_matches_per_key_local_only_lookups(self):
+        # Random tier layouts: the probe counts the same leading keys as
+        # per-key local-only lookups, except a host-pool block past a
+        # storage-tier miss (storage files pruned while the host pool kept
+        # the block), which the layouts here never produce.
+        rng = random.Random(1234)
+        for trial in range(200):
+            store = FakeKVCacheStore()
+            manager = make_global_manager(store)
+            keys = [b"t%03d_" % trial + _key(i) for i in range(8)]
+            for key in keys:
+                tier = rng.choice(["host", "host", "storage", "both", "none", "inflight"])
+                if tier in ("host", "both"):
+                    seed_host_entries(store, key)
+                if tier in ("storage", "both", "host"):
+                    # Every completed save is also written to the storage tier.
+                    seed_storage_entries(store, key)
+                if tier == "inflight":
+                    manager._inflight_store_keys.add(key)
+            expected = 0
+            for key in keys:
+                if manager.lookup(key, local_only=True) not in (
+                    LookupResult.HIT,
+                    LookupResult.HIT_PENDING,
+                ):
+                    break
+                expected += 1
+            self.assertEqual(manager.probe_warm_chunks(keys), expected, trial)
+            self.assertEqual(manager._remote_slices, {})
 
 
 class TestStorageTierRemoteReads(unittest.TestCase):

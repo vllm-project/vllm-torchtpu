@@ -573,14 +573,21 @@ class RaidenOffloadingManager(OffloadingManager):
             # (SHARED_STORAGE) are both read with read_remote straight into
             # HBM. The storage tier answers whether or not the global registry
             # is enabled, so only a peer hit is gated on it.
-            if not local_only and (
-                (status == self._block_status.REMOTE and allow_remote)
-                or status == self._block_status.SHARED_STORAGE
-            ):
+            if (
+                status == self._block_status.REMOTE and allow_remote
+            ) or status == self._block_status.SHARED_STORAGE:
                 if sub_hash in self._hash_to_admission:
                     # A read_remote for this sub-hash is already in flight;
                     # a second launch on the same hash must not race it.
                     return LookupResult.HIT_PENDING
+                if local_only:
+                    # A local-only probe still counts a storage-tier block: the
+                    # store answered for it in this same lookup (the storage
+                    # tier is asked whatever enable_global is), and a load
+                    # would read it. Nothing is stashed for a `prepare_load`
+                    # the probe never makes. A peer's block cannot get here:
+                    # allow_remote is False for a local-only probe.
+                    continue
                 all_local = False
                 remote_slices[sub_hash] = block
                 continue
@@ -588,6 +595,73 @@ class RaidenOffloadingManager(OffloadingManager):
         if not all_local:
             self._remote_slices.update(remote_slices)
         return LookupResult.HIT
+
+    def probe_warm_chunks(self, keys: Sequence[OffloadKey]) -> int:
+        """How many of `keys`, from the first, a load could serve now or soon.
+
+        The scheduler's tier-warmth probe for a run of chunk keys. A key
+        counts when `lookup(key, local_only=True)` would answer HIT or
+        HIT_PENDING, and the count stops at the first key it would not. Like
+        that lookup, the probe never asks the global registry, pins nothing
+        and stashes nothing.
+
+        It asks the store once for the whole run instead of once per key: the
+        store answers with the resident prefix of what it was asked, host pool
+        first and then the storage tier for the tail, and the storage tier
+        batches its existence checks and stops at its first absent block.
+        Keys with a save in flight count without a store call, as in `lookup`,
+        so the store is asked once per run of keys between them.
+
+        One difference from a per-key lookup: past the first block the host
+        pool lacks, only the storage tier answers, so a host-pool block that
+        follows a storage-tier miss ends the count. Every completed save is
+        also written to the storage tier, so this takes storage files pruned
+        while the host pool still holds their blocks. The probe then ranks the
+        request colder than a load would serve it; it never ranks it warmer.
+        """
+        keys = list(keys)
+        warm = 0
+        i = 0
+        while i < len(keys):
+            if keys[i] in self._inflight_store_keys:
+                warm += 1
+                i += 1
+                continue
+            j = i
+            while j < len(keys) and keys[j] not in self._inflight_store_keys:
+                j += 1
+            run = [self._sub_hashes(key) for key in keys[i:j]]
+            matches = self._probe([h for subs in run for h in subs])
+            answered = self._count_warm_prefix(run, matches)
+            warm += answered
+            if answered < len(run):
+                break
+            i = j
+        return warm
+
+    def _count_warm_prefix(
+        self, run: list[list[bytes]], matches: list[tuple[bytes, Any]]
+    ) -> int:
+        """The leading keys of `run` (each a list of sub-hashes) that `matches`
+        covers in full with blocks a load can serve now or soon."""
+        status = self._block_status
+        servable = (status.HOST, status.HOST_AND_HBM, status.SHARED_STORAGE)
+        pos = 0
+        count = 0
+        for subs in run:
+            chunk = matches[pos : pos + len(subs)]
+            if len(chunk) < len(subs):
+                break
+            for sub_hash, block in chunk:
+                if block.status in servable:
+                    continue
+                if block.status == status.HBM and sub_hash in self._hash_to_admission:
+                    # A save in flight: `lookup` answers HIT_PENDING.
+                    continue
+                return count
+            pos += len(subs)
+            count += 1
+        return count
 
     def touch(self, keys, req_context: ReqContext) -> None:
         # A lookup pins what it finds and releasing drops the entry back at

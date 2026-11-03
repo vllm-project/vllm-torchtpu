@@ -107,26 +107,31 @@ def _chunk_key(request: SimpleNamespace, chunk: int) -> bytes:
 
 
 class _FakeTierManager:
-    """Answers lookups from a key set; records how often it was asked."""
+    """Answers tier probes from a key set; records each probe's keys.
+
+    Mirrors RaidenOffloadingManager.probe_warm_chunks: the number of leading
+    keys that are held (`keys`) or still being stored (`pending`).
+    """
 
     def __init__(self, keys=(), pending=(), fail=False):
         self.keys = set(keys)
         self.pending = set(pending)
         self.fail = fail
         self.calls = 0
-        self.local_only_calls = 0
+        self.probed: list[list[bytes]] = []
 
-    def lookup(self, key, req_context=None, *, local_only: bool = False):
-        from vllm.v1.kv_offload.base import LookupResult
-
+    def probe_warm_chunks(self, keys):
         self.calls += 1
-        if local_only:
-            self.local_only_calls += 1
+        keys = list(keys)
+        self.probed.append(keys)
         if self.fail:
             raise RuntimeError("simulated store failure")
-        if key in self.pending:
-            return LookupResult.HIT_PENDING
-        return LookupResult.HIT if key in self.keys else LookupResult.MISS
+        warm = 0
+        for key in keys:
+            if key not in self.keys and key not in self.pending:
+                break
+            warm += 1
+        return warm
 
 
 def _offload_connector(
@@ -448,7 +453,7 @@ def test_tier_probe_accounts_for_flagged_eagle_group_tail_pop():
     assert s_one._prefix_warmth(r) == 0
 
 
-def test_tier_probe_caps_chunks_and_requests_local_only():
+def test_tier_probe_caps_chunks_in_one_store_probe():
     now = time.time()
     r = _hashed_request("r", num_tokens=100 * 4096, arrival_time=now)
     manager = _FakeTierManager(keys=[_chunk_key(r, c) for c in range(100)])
@@ -456,8 +461,23 @@ def test_tier_probe_caps_chunks_and_requests_local_only():
         [r], {"r": 0}, tier_warmth=True, connector=_offload_connector(manager)
     )
     assert s._prefix_warmth(r) == s.TIER_PROBE_MAX_CHUNKS * 4096
-    assert manager.calls == s.TIER_PROBE_MAX_CHUNKS
-    assert manager.local_only_calls == s.TIER_PROBE_MAX_CHUNKS
+    # One probe per request covers the whole capped run, not one per chunk.
+    assert manager.calls == 1
+    assert manager.probed == [
+        [_chunk_key(r, c) for c in range(s.TIER_PROBE_MAX_CHUNKS)]
+    ]
+
+
+def test_tier_probe_asks_for_the_chunks_past_the_hbm_hit():
+    now = time.time()
+    r = _hashed_request("r", num_tokens=10 * 4096, arrival_time=now)
+    manager = _FakeTierManager(keys=[_chunk_key(r, c) for c in range(10)])
+    s = _make_scheduler(
+        [r], {"r": 3 * 4096}, tier_warmth=True, connector=_offload_connector(manager)
+    )
+    # A hit covers at most num_tokens - 1 tokens: chunks 3-8 are probed.
+    assert s._prefix_warmth(r) == 9 * 4096
+    assert manager.probed == [[_chunk_key(r, c) for c in range(3, 9)]]
 
 
 def test_paw_tier_tokens_excludes_already_computed_requests():
