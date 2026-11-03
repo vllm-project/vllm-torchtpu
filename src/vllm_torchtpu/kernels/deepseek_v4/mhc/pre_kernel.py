@@ -52,29 +52,30 @@ def _mixes_collapse_kernel(
     fn_ref,
     sc_ref,
     hb_ref,
-    mixes_ref,
-    sqrsum_ref,
+    post_ref,
+    comb_ref,
     layer_ref,
     *,
     hc_mult,
     hidden_size,
     rms_eps,
     hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
 ):
-    """Mixes kernel plus the in-block collapse.
+    """Mixes kernel plus the in-block collapse and gates.
 
     The collapse's weights are ``pre_mix`` — the sigmoid read gates,
     which need no Sinkhorn and are per-token, so they are computable
-    entirely in-block. The Sinkhorn/post/comb gates stay in
-    XLA on the raw ``mixes`` output.
+    entirely in-block. The post and comb gates, Sinkhorn included, are
+    per-token too and are emitted in place of the raw mixes.
     """
     m, h = hc_mult, hidden_size
     x = x_ref[...]
-    acc = utils.dot_fn_chunks(x, fn_ref[...], mixes_ref.shape[1])
-    mixes_ref[...] = acc
+    acc = utils.dot_fn_chunks(x, fn_ref[...], hb_ref.shape[1])
     xf = x.astype(jnp.float32)
     sqr = jnp.sum(xf * xf, axis=-1, keepdims=True)
-    sqrsum_ref[...] = sqr
     # Same op order as utils.mhc_pre_gates for bit-level agreement.
     scaled = acc[:, :m] * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
     pre_mix = jax.nn.sigmoid(scaled * sc_ref[0, 0] + hb_ref[:, :m]) + hc_pre_eps
@@ -82,6 +83,22 @@ def _mixes_collapse_kernel(
     for i in range(1, m):
         lay = lay + pre_mix[:, i : i + 1] * xf[:, i * h : (i + 1) * h]
     layer_ref[...] = lay.astype(jnp.bfloat16)
+
+    post_t, comb_t = utils.mhc_post_comb_gates_t(
+        acc.T,
+        sqr.T,
+        sc_ref[0, 1],
+        sc_ref[0, 2],
+        hb_ref[...].T,
+        hc_mult=m,
+        hidden_size=h,
+        rms_eps=rms_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+    )
+    post_ref[...] = post_t.T
+    comb_ref[...] = comb_t.T
 
 
 @functools.partial(jax.jit, static_argnames=("token_block_size", "vmem_limit_bytes"))
@@ -159,7 +176,15 @@ def mhc_pre_mixes(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("rms_eps", "hc_pre_eps", "token_block_size", "vmem_limit_bytes"),
+    static_argnames=(
+        "rms_eps",
+        "hc_pre_eps",
+        "hc_sinkhorn_eps",
+        "hc_post_mult_value",
+        "sinkhorn_repeat",
+        "token_block_size",
+        "vmem_limit_bytes",
+    ),
 )
 def mhc_pre_mixes_collapse(
     x2d: jax.Array,
@@ -168,18 +193,21 @@ def mhc_pre_mixes_collapse(
     hc_base: jax.Array,
     rms_eps: float,
     hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
     *,
     token_block_size: int = COLLAPSE_TOKEN_BLOCK,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Mixes + in-block collapse: the full memory-bound half of ``mhc_pre``.
+    """Mixes + in-block collapse and gates: all of ``mhc_pre``.
 
     ``token_block_size`` is the most tokens per grid step; below it, a
     bucket is split into COLLAPSE_MIN_GRID_STEPS blocks, but none smaller
     than COLLAPSE_MIN_TOKEN_BLOCK.
 
-    Returns (mixes (T, hc_mult3) f32 — raw, unscaled, for the XLA gates;
-    sqrsum (T, 1) f32; layer_input2d (T, hidden_size) bf16).
+    Returns (post_mix (T, hc_mult) f32; comb_mix (T, hc_mult * hc_mult)
+    f32, row-major (i, j); layer_input2d (T, hidden_size) bf16).
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
     assert fn.dtype == jnp.float32, fn.dtype
@@ -217,8 +245,8 @@ def mhc_pre_mixes_collapse(
         vmem_need=_vmem_need,
         vmem_limit_bytes=vmem_limit_bytes,
     )
-    # Zero rows are safe: they produce zero mixes/sqrsum/layer rows and
-    # are sliced off below.
+    # Zero rows are safe: they produce zero layer rows and finite gates,
+    # and are sliced off below.
     (x2d,) = utils.pad_to(padded_tokens, x2d)
 
     compiler_params = pltpu.CompilerParams(
@@ -228,13 +256,16 @@ def mhc_pre_mixes_collapse(
     )
 
     resident = pl.BlockSpec(fn_chunks.shape, lambda i: (0, 0))
-    mixes, sqrsum, layer2d = pl.pallas_call(
+    post_mix, comb_mix, layer2d = pl.pallas_call(
         functools.partial(
             _mixes_collapse_kernel,
             hc_mult=hc_mult,
             hidden_size=hidden_size,
             rms_eps=rms_eps,
             hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
         ),
         grid=(padded_tokens // tb,),
         in_specs=[
@@ -244,13 +275,13 @@ def mhc_pre_mixes_collapse(
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
         ],
         out_specs=[
-            pl.BlockSpec((tb, hc_mult3), lambda i: (i, 0)),
-            pl.BlockSpec((tb, 1), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
         ],
         out_shape=[
-            jax.ShapeDtypeStruct((padded_tokens, hc_mult3), jnp.float32),
-            jax.ShapeDtypeStruct((padded_tokens, 1), jnp.float32),
+            jax.ShapeDtypeStruct((padded_tokens, hc_mult), jnp.float32),
+            jax.ShapeDtypeStruct((padded_tokens, hc_mult * hc_mult), jnp.float32),
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
         ],
         compiler_params=compiler_params,
@@ -258,7 +289,7 @@ def mhc_pre_mixes_collapse(
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array],
-        utils.trim_to(num_tokens, mixes, sqrsum, layer2d),
+        utils.trim_to(num_tokens, post_mix, comb_mix, layer2d),
     )
 
 
@@ -276,15 +307,12 @@ def mhc_pre(
     token_block_size: int = COLLAPSE_TOKEN_BLOCK,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """``mhc_pre`` with the mix GEMM AND the collapse in Pallas; only the
-    tiny gates/Sinkhorn stay in XLA.
+    """``mhc_pre`` as one Pallas kernel: mix GEMM, collapse and gates.
 
     Same contract as vLLM's ``mhc_pre_torch``:
     residual (..., hc_mult, hidden_size) bf16 in; post_mix (..., hc_mult, 1)
     f32, comb_mix (..., hc_mult, hc_mult) f32, layer_input (..., hidden_size)
-    bf16 out. The gates recompute ``pre_mix`` on the raw mixes; its cost is
-    a few tiny VPU ops and keeping ``utils.mhc_pre_gates`` shared and
-    unsliced is worth more than removing them.
+    bf16 out.
     """
     assert residual.dtype == jnp.bfloat16
     assert fn.dtype == jnp.float32
@@ -293,21 +321,9 @@ def mhc_pre(
     hc_mult, hidden_size = residual.shape[-2:]
     x2d = residual.reshape(-1, hc_mult * hidden_size)
 
-    mixes, sqrsum, layer2d = mhc_pre_mixes_collapse(
+    post_mix, comb_mix, layer2d = mhc_pre_mixes_collapse(
         x2d,
         fn,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        token_block_size=token_block_size,
-        vmem_limit_bytes=vmem_limit_bytes,
-    )
-    _, post_mix, comb_mix = utils.mhc_pre_gates(
-        mixes,
-        sqrsum,
-        hc_mult,
-        hidden_size,
         hc_scale,
         hc_base,
         rms_eps,
@@ -315,6 +331,8 @@ def mhc_pre(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        token_block_size=token_block_size,
+        vmem_limit_bytes=vmem_limit_bytes,
     )
 
     return (
