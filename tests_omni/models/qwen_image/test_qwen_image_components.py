@@ -118,43 +118,34 @@ class TestQwenEmbedRopeOnTpu:
         ref_vid, ref_txt = cpu_embedder(
             video_fhw, txt_seq_lens, device=torch.device("cpu")
         )
-        for table, actual, reference, max_rel_l2, max_abs in (
-            (
-                "txt",
-                txt_real,
-                torch.real(ref_txt),
-                ROPE_FREQS_TXT_MAX_REL_L2,
-                ROPE_FREQS_TXT_MAX_ABS,
-            ),
-            (
-                "txt",
-                txt_imag,
-                torch.imag(ref_txt),
-                ROPE_FREQS_TXT_MAX_REL_L2,
-                ROPE_FREQS_TXT_MAX_ABS,
-            ),
-            (
-                "vid",
-                vid_real,
-                torch.real(ref_vid),
-                ROPE_FREQS_VID_MAX_REL_L2,
-                ROPE_FREQS_VID_MAX_ABS,
-            ),
-            (
-                "vid",
-                vid_imag,
-                torch.imag(ref_vid),
-                ROPE_FREQS_VID_MAX_REL_L2,
-                ROPE_FREQS_VID_MAX_ABS,
-            ),
-        ):
-            assert_parity(
-                actual,
-                reference,
-                name=f"{rope_cls.__name__} {table} freqs",
-                max_rel_l2=max_rel_l2,
-                max_abs=max_abs,
-            )
+        assert_parity(
+            txt_real,
+            torch.real(ref_txt),
+            name=f"{rope_cls.__name__} txt real freqs",
+            max_rel_l2=ROPE_FREQS_TXT_MAX_REL_L2,
+            max_abs=ROPE_FREQS_TXT_MAX_ABS,
+        )
+        assert_parity(
+            txt_imag,
+            torch.imag(ref_txt),
+            name=f"{rope_cls.__name__} txt imag freqs",
+            max_rel_l2=ROPE_FREQS_TXT_MAX_REL_L2,
+            max_abs=ROPE_FREQS_TXT_MAX_ABS,
+        )
+        assert_parity(
+            vid_real,
+            torch.real(ref_vid),
+            name=f"{rope_cls.__name__} vid real freqs",
+            max_rel_l2=ROPE_FREQS_VID_MAX_REL_L2,
+            max_abs=ROPE_FREQS_VID_MAX_ABS,
+        )
+        assert_parity(
+            vid_imag,
+            torch.imag(ref_vid),
+            name=f"{rope_cls.__name__} vid imag freqs",
+            max_rel_l2=ROPE_FREQS_VID_MAX_REL_L2,
+            max_abs=ROPE_FREQS_VID_MAX_ABS,
+        )
 
 
 def _complex_rotary_reference(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
