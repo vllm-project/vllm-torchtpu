@@ -6,6 +6,7 @@ import ast
 import hashlib
 import importlib.metadata
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -194,6 +195,7 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--diagnose", action="store_true")
     parser.add_argument("--normal-seeds", default="")
+    parser.add_argument("--with-mhc-post", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     import torch
@@ -221,6 +223,37 @@ def main():
             mask = torch.ones(h.shape[0], dtype=torch.float32, device=h.device)
         return custom(h, kv, qw, kw, mask)
 
+    post_op = None
+    if args.with_mhc_post:
+        sys.path.insert(0, str(ROOT / "src"))
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
+
+        def post_jax(
+            x: jax.Array,
+            residual: jax.Array,
+            post: jax.Array,
+            comb: jax.Array,
+        ) -> jax.Array:
+            return post_kernel.mhc_post(x, residual, post, comb)
+
+        post_op = pallas.jax_op(
+            "pallas::dsv41_engram_original_mhc_post_bench",
+            post_jax,
+            mesh=mesh,
+            input_partition_specs=(jax.sharding.PartitionSpec(),) * 4,
+        )
+
+        @post_op.register_fake
+        def fake_post(x, residual, post, comb):
+            return torch.empty_like(residual)
+
+        def with_producer(fn):
+            def call(h, kv, qw, kw, mask, x, post, comb):
+                return fn(post_op(x, h, post, comb), kv, qw, kw, mask)
+
+            return call
+
+        native, candidate = with_producer(native), with_producer(candidate)
     funcs = {
         name: torch.compile(fn, backend="tpu", fullgraph=True, dynamic=False)
         for name, fn in (("native", native), ("pallas", candidate))
@@ -244,15 +277,28 @@ def main():
         },
         "correctness": [],
         "timings": {},
+        "with_mhc_post": args.with_mhc_post,
     }
 
     def save():
         (args.out / "results.json").write_text(json.dumps(result, indent=2) + "\n")
 
     def inputs(xs, masked):
-        return tuple(
+        values = tuple(
             torch.from_numpy(a).to(dtype=torch.bfloat16, device="tpu") for a in xs[:4]
         ) + (torch.from_numpy(xs[4]).to("tpu") if masked else None,)
+        if args.with_mhc_post:
+            # Dynamic identity fixture: execute the unchanged full producer
+            # while making its BF16 output independently known, including trim.
+            extras = (
+                torch.zeros((TOKENS, DIM), dtype=torch.bfloat16, device="tpu"),
+                torch.zeros((TOKENS, MULT, 1), dtype=torch.float32, device="tpu"),
+                torch.from_numpy(
+                    np.tile(np.eye(MULT, dtype=np.float32), (TOKENS, 1, 1))
+                ).to("tpu"),
+            )
+            values += extras
+        return values
 
     save()
     cases = (
@@ -273,6 +319,9 @@ def main():
         xs = fixture(kind, seed)
         for masked in (True, False):
             values = inputs(xs, masked)
+            if post_op is not None:
+                produced = post_op(values[5], values[0], values[6], values[7])
+                np.testing.assert_array_equal(produced.cpu().float().numpy(), xs[0])
             want = reference(xs, masked)
             outputs = {
                 name: fn(*values).cpu().float().numpy() for name, fn in funcs.items()
