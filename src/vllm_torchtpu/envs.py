@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
     TPU_RPA_UNMASKED_INTERIOR: bool = False
     TPU_RPA_PROLOGUE_DMA_STORES: bool = False
+    TPU_RPA_PROLOGUE_FP8_QUERIES: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -893,6 +894,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # q and K/V rows as 32-bit words in contiguous VMEM buffers and writes them
     # with strided DMAs, instead of sublane-packing stores. Outputs unchanged.
     "TPU_RPA_PROLOGUE_DMA_STORES": env_bool("TPU_RPA_PROLOGUE_DMA_STORES"),
+    # With TPU_RPA_PROLOGUE_DMA_STORES: on fp8_compute layers the prologue also
+    # writes the FP8 queries the mixed kernel reads, instead of a separate XLA
+    # cast and relayout of its bf16 queries (wrapper.quantize_queries).
+    "TPU_RPA_PROLOGUE_FP8_QUERIES": env_bool("TPU_RPA_PROLOGUE_FP8_QUERIES"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.

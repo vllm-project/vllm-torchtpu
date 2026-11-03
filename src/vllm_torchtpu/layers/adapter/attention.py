@@ -624,6 +624,7 @@ def _pallas_rpa_kernel_batched_from_qkv(
     unmasked_interior: bool = False,
     output_quant_dtype: jnp.dtype | None = None,
     prologue_dma_stores: bool = False,
+    prologue_fp8_queries: bool = False,
 ) -> tuple[jax.Array, ...]:
     """`_pallas_rpa_kernel_batched` on fused qkv rows (see
     `PallasBatchedRPAAttentionBackendImpl.forward_from_qkv`): `(new_kv_cache,
@@ -641,6 +642,8 @@ def _pallas_rpa_kernel_batched_from_qkv(
         rpa_kwargs["output_quant_dtype"] = output_quant_dtype
     if prologue_dma_stores:
         rpa_kwargs["prologue_dma_stores"] = True
+    if prologue_fp8_queries:
+        rpa_kwargs["prologue_fp8_queries"] = True
     native, page_stride, restore_pool = native_kv_cache_view(
         kv_cache, num_kv_heads, head_dim, None
     )
@@ -1981,11 +1984,19 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
             unmasked_interior=envs.TPU_RPA_UNMASKED_INTERIOR,
             prologue_dma_stores=envs.TPU_RPA_PROLOGUE_DMA_STORES,
         )
+        if envs.TPU_RPA_PROLOGUE_FP8_QUERIES and not envs.TPU_RPA_PROLOGUE_DMA_STORES:
+            raise ValueError(
+                "TPU_RPA_PROLOGUE_FP8_QUERIES needs TPU_RPA_PROLOGUE_DMA_STORES"
+            )
         quant_dtype = self.qkv_output_quant_dtype
         if quant_dtype is not None:
             entry_kwargs["output_quant_dtype"] = jnp.dtype(
                 str(quant_dtype).removeprefix("torch.")
             )
+        # The prologue's FP8 queries replace quantize_queries' ones.
+        entry_kwargs["prologue_fp8_queries"] = (
+            envs.TPU_RPA_PROLOGUE_FP8_QUERIES and self.fp8_compute
+        )
         if self.sliding_window is not None:
             entry_kwargs["cap_sliding_decode_block"] = (
                 envs.TPU_RPA_CAP_SLIDING_DECODE_BLOCK

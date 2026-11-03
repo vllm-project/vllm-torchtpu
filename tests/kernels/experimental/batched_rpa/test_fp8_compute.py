@@ -167,3 +167,52 @@ def test_fp8_mixed_kernel_lowers_for_tpu7x():
     text = lowered.as_text()
     assert "RPAm-snh-p256-b1-q2048-k512" in text
     assert "RPAd-snh-p256" in text
+
+
+def _mixed_args(tokens=1024, num_q_heads=4, num_kv_heads=1, head_dim=512):
+    max_seqs, pages_per_seq, page_size = 8, 32, 256
+    cache_shape = wrapper.get_kv_cache_shape(
+        max_seqs * pages_per_seq, page_size, num_kv_heads, head_dim, FP8
+    )
+    return (
+        jax.ShapeDtypeStruct((tokens, num_q_heads, head_dim), jnp.bfloat16),
+        jax.ShapeDtypeStruct((tokens, num_kv_heads, head_dim), FP8),
+        jax.ShapeDtypeStruct((tokens, num_kv_heads, head_dim), FP8),
+        jax.ShapeDtypeStruct(cache_shape, FP8),
+        jax.ShapeDtypeStruct((max_seqs,), jnp.int32),
+        jax.ShapeDtypeStruct((max_seqs * pages_per_seq,), jnp.int32),
+        jax.ShapeDtypeStruct((max_seqs + 1,), jnp.int32),
+        jax.ShapeDtypeStruct((3,), jnp.int32),
+    )
+
+
+def test_prepared_fp8_queries_replace_quantize_queries():
+    """A prepared third array is used as the fp8 kernel's queries; it is
+    refused without fp8_compute."""
+    args = _mixed_args()
+    mesh = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+
+    def call(*xs, fp8_compute=True, sm_scale=1.0, **kwargs):
+        prepare = jax.tree.map(
+            jnp.zeros_like,
+            jax.eval_shape(
+                lambda q, k, v: wrapper.prepare_inputs(q, k, v, jnp.bfloat16, FP8),
+                *xs[:3],
+            ),
+        )
+        q_fetch = wrapper.quantize_queries(prepare[0], FP8)
+        return wrapper.ragged_paged_attention(
+            *xs,
+            sm_scale=sm_scale,
+            k_scale=1.0,
+            v_scale=1.0,
+            fp8_compute=fp8_compute,
+            prepared_inputs=(*prepare, q_fetch),
+            **kwargs,
+        )
+
+    with use_abstract_mesh(mesh):
+        text = jax.jit(call).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+        assert "RPAm-snh-p256-b1-q2048-k512" in text
+        with pytest.raises(ValueError, match="fp8_compute"):
+            jax.jit(lambda *xs: call(*xs, fp8_compute=False)).trace(*args)

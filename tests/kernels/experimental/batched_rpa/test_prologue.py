@@ -160,6 +160,57 @@ def test_dma_stores_write_the_same_bits(tokens, nq, nkv, d, rotary_dim, block_to
     )
 
 
+@pytest.mark.parametrize(
+    "tokens,nq,nkv,d,rotary_dim,block_tokens",
+    [
+        (64, 16, 2, 512, 128, 32),  # Gemma4-31B TP2 global layer (fp8_compute)
+        (48, 8, 1, 256, 256, 16),  # two FP8 query words per KV head
+    ],
+)
+def test_fp8_queries_are_quantize_queries(tokens, nq, nkv, d, rotary_dim, block_tokens):
+    key = jax.random.key(tokens + nq * d)
+    qkv = jax.random.normal(key, (tokens, (nq + 2 * nkv) * d), jnp.float32) * 3
+    qkv = qkv.astype(jnp.bfloat16)
+    angle = jax.random.uniform(jax.random.fold_in(key, 1), (tokens, rotary_dim // 2))
+    cos, sin = jnp.cos(angle).astype(jnp.bfloat16), jnp.sin(angle).astype(jnp.bfloat16)
+    w = jnp.ones((d,), jnp.bfloat16)
+    kwargs = dict(
+        num_q_heads=nq,
+        num_kv_heads=nkv,
+        head_dim=d,
+        eps=_EPS,
+        k_scale=1.0,
+        v_scale=1.0,
+        block_tokens=block_tokens,
+        interpret=True,
+    )
+    q, kv = prologue.qkv_to_rpa_inputs(qkv, cos, sin, w, w, **kwargs)
+    q_dma, kv_dma, q_fp8 = prologue.qkv_to_rpa_inputs(
+        qkv, cos, sin, w, w, dma_stores=True, fp8_queries=True, **kwargs
+    )
+    ref = KB.quantize_queries(q, jnp.float8_e4m3fn)
+    assert q_fp8.shape == ref.shape and q_fp8.dtype == ref.dtype
+    np.testing.assert_array_equal(
+        np.asarray(q_fp8.view(jnp.uint8)), np.asarray(ref.view(jnp.uint8))
+    )
+    np.testing.assert_array_equal(
+        np.asarray(q_dma.view(jnp.uint16)), np.asarray(q.view(jnp.uint16))
+    )
+    np.testing.assert_array_equal(
+        np.asarray(kv_dma.view(jnp.uint8)), np.asarray(kv.view(jnp.uint8))
+    )
+
+
+def test_fp8_queries_need_dma_stores_and_heads_in_fours():
+    qkv = jnp.zeros((32, 4 * 256), jnp.bfloat16)
+    cs = jnp.zeros((32, 128), jnp.bfloat16)
+    w = jnp.ones((256,), jnp.bfloat16)
+    kwargs = dict(num_q_heads=2, num_kv_heads=1, head_dim=256, eps=_EPS)
+    kwargs.update(k_scale=1.0, v_scale=1.0, fp8_queries=True, interpret=True)
+    with pytest.raises(ValueError, match="fp8_queries"):
+        prologue.qkv_to_rpa_inputs(qkv, cs, cs, w, w, dma_stores=True, **kwargs)
+
+
 def _assert_within_one_step(out, ref, bits):
     """Same values up to one representable step on at most 0.1% of elements."""
     a = np.asarray(out.view(bits)).astype(np.int32)
@@ -200,11 +251,31 @@ def test_block_tokens_fit_vmem_and_tile():
         prologue.choose_block_tokens(24, 512, 1, 1, 256)
 
 
-def test_sharded_attention_from_qkv_lowers_for_tpu():
+@pytest.mark.parametrize(
+    "nq,nkv,d,rpa_kwargs",
+    [
+        pytest.param(2, 1, 256, {}, id="bf16-queries"),
+        pytest.param(
+            4,
+            1,
+            512,
+            dict(fp8_compute=True, prologue_dma_stores=True, prologue_fp8_queries=True),
+            id="fp8-queries-from-the-prologue",
+        ),
+        pytest.param(
+            8,
+            2,
+            256,
+            dict(prologue_dma_stores=True, output_quant_dtype=jnp.float8_e4m3fn),
+            id="dma-stores-quantized-output",
+        ),
+    ],
+)
+def test_sharded_attention_from_qkv_lowers_for_tpu(nq, nkv, d, rpa_kwargs):
     """The sharded entry runs the prologue kernel, then the batched RPA kernels."""
     from vllm_torchtpu.layers.core import attention_interface
 
-    tokens, nq, nkv, d = 16, 2, 1, 256
+    tokens = 16
     device = jax.sharding.AbstractDevice(
         device_kind="TPU7x", num_cores=1, platform="tpu"
     )
@@ -241,9 +312,27 @@ def test_sharded_attention_from_qkv_lowers_for_tpu():
                 sm_scale=d**-0.5,
                 k_scale=1.0,
                 v_scale=1.0,
+                **rpa_kwargs,
             )
 
         out, new_cache = jax.eval_shape(attend, *args)
         text = jax.jit(attend).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
-    assert out.shape == (tokens, nq, d) and new_cache.shape == cache
+    if "output_quant_dtype" in rpa_kwargs:
+        q, scale = out
+        assert q.shape == (tokens, nq * d) and scale.shape == (tokens, 1)
+        assert "rpa_output_quantize" in text
+    else:
+        assert out.shape == (tokens, nq, d)
+    assert new_cache.shape == cache
     assert "qkv_to_rpa_inputs" in text
+    if rpa_kwargs.get("prologue_fp8_queries"):
+        # The FP8 queries come from the prologue: no cast of the bf16 ones
+        # (quantize_queries' convert bf16 -> f8E4M3FN).
+        casts = [
+            line
+            for line in text.splitlines()
+            if "stablehlo.convert" in line
+            and "bf16>) -> tensor<" in line
+            and "f8E4M3FN>" in line
+        ]
+        assert "RPAm" in text and not casts, casts
