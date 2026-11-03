@@ -587,6 +587,7 @@ def _load_mtp_draft(vllm_config: Any, target: nn.Module) -> nn.Module | None:
     draft_vllm_config = copy.copy(vllm_config)
     draft_model_config = copy.copy(spec.draft_model_config)
     draft_model_config.runner_type = "draft"
+    import typing
     with trace("export.load_mtp_draft"), set_current_vllm_config(draft_vllm_config):
         loader = cast(
             Callable[..., torch.nn.Module],
