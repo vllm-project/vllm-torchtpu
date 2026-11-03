@@ -24,7 +24,7 @@ EPS, CLAMP = 1e-20, 1e-6
 RTOL, ATOL = 1 / 128, 2e-6
 
 
-def original_tail(out):
+def original_tail(out, source=SOURCE, *, dispatch=False, namespace=None):
     class BindAttributes(ast.NodeTransformer):
         def visit_Attribute(self, node):
             if isinstance(node.value, ast.Name) and node.value.id == "self":
@@ -40,7 +40,7 @@ def original_tail(out):
                 return ast.Constant(value=constants[node.attr])
             return self.generic_visit(node)
 
-    tree = ast.parse(SOURCE.read_text())
+    tree = ast.parse(source.read_text())
     cls = next(
         n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Engram"
     )
@@ -49,6 +49,13 @@ def original_tail(out):
     )
     selected, active = [], False
     for node in forward.body:
+        if (
+            dispatch
+            and isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "kv" for t in node.targets)
+        ):
+            active = True
+            continue
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id == "keys" for t in node.targets
         ):
@@ -61,11 +68,11 @@ def original_tail(out):
         + "\n".join("    " + line for part in selected for line in part.splitlines())
         + "\n"
     )
-    (out / "original-tail.py").write_text(text)
+    (out / ("candidate-tail.py" if dispatch else "original-tail.py")).write_text(text)
     import torch
 
-    scope = {"torch": torch}
-    exec(compile(text, str(SOURCE), "exec"), scope)
+    scope = {"torch": torch, **(namespace or {})}
+    exec(compile(text, str(source), "exec"), scope)
     return scope["tail"]
 
 
@@ -189,6 +196,7 @@ def compare(actual, expected):
 
 
 def main():
+    global EPS, TOKENS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=200)
@@ -196,7 +204,16 @@ def main():
     parser.add_argument("--diagnose", action="store_true")
     parser.add_argument("--normal-seeds", default="")
     parser.add_argument("--with-mhc-post", action="store_true")
+    parser.add_argument("--production-caller", action="store_true")
+    parser.add_argument("--baseline-source", type=Path)
+    parser.add_argument("--fallback-eps", type=float)
+    parser.add_argument("--tokens", type=int, default=288)
     args = parser.parse_args()
+    if args.production_caller and args.baseline_source is None:
+        parser.error("--production-caller requires --baseline-source")
+    TOKENS = args.tokens
+    if args.fallback_eps is not None:
+        EPS = args.fallback_eps
     args.out.mkdir(parents=True, exist_ok=True)
     import torch
     import torch_tpu  # noqa: F401
@@ -216,12 +233,102 @@ def main():
     def fake(h, kv, qw, kw, mask):
         return torch.empty_like(h)
 
-    native = original_tail(args.out)
+    native = original_tail(args.out, args.baseline_source or SOURCE)
 
     def candidate(h, kv, qw, kw, mask):
         if mask is None:
             mask = torch.ones(h.shape[0], dtype=torch.float32, device=h.device)
         return custom(h, kv, qw, kw, mask)
+
+    integration_checks = {}
+    if args.production_caller:
+        sys.path.insert(0, str(ROOT / "src"))
+        from types import ModuleType, SimpleNamespace
+
+        # The kernel runtime does not install vLLM's unrelated model registry.
+        # Preserve the real module search paths and load the bridge/context
+        # unchanged, without executing only those two parent initializers.
+        for name in ("vllm_torchtpu.models", "vllm_torchtpu.models.vllm"):
+            if name not in sys.modules:
+                package = ModuleType(name)
+                package.__path__ = [str(ROOT / "src" / name.replace(".", "/"))]
+                sys.modules[name] = package
+
+        from vllm_torchtpu.models.vllm.deepseek_v41.common import engram_gate as bridge
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            set_vllm_model_wrapper_context,
+        )
+
+        # Exercise the exact registration calls in the existing model setup
+        # context; full model construction and weight loading remain outside scope.
+        hooks = []
+        with set_vllm_model_wrapper_context(mesh=mesh):
+            for relative in ("v1/model.py", "v2/model.py", "v2/dspark.py"):
+                source = SOURCE.parents[1] / relative
+                tree = ast.parse(source.read_text())
+                calls = [
+                    n
+                    for n in ast.walk(tree)
+                    if isinstance(n, ast.Expr)
+                    and isinstance(n.value, ast.Call)
+                    and isinstance(n.value.func, ast.Name)
+                    and n.value.func.id == "initialize_engram_gate"
+                ]
+                assert len(calls) == 1, relative
+                exec(
+                    compile(
+                        ast.Module(body=calls, type_ignores=[]), str(source), "exec"
+                    ),
+                    vars(bridge),
+                )
+                hooks.append(relative)
+            first = bridge._gate_op
+            bridge.initialize_engram_gate()
+            assert first is not None and first is bridge._gate_op
+        integration_checks["model_registration_hooks"] = hooks
+        integration_checks["registration_cache"] = True
+        integration_checks["unrelated_model_registry_bypassed"] = True
+
+        def tensor(shape, dtype=torch.bfloat16, device="tpu"):
+            return SimpleNamespace(
+                shape=shape, dtype=dtype, device=torch.device(device)
+            )
+
+        nominal = [
+            tensor((288, 4, 5120)),
+            tensor((288, 25600)),
+            tensor((4, 5120)),
+            tensor((4, 5120)),
+            tensor((288,), torch.float32),
+            1e-20,
+            1e-6,
+        ]
+        assert bridge.supports_engram_gate(*nominal)
+        assert bridge.supports_engram_gate(*nominal[:4], None, *nominal[5:])
+        rejected = []
+        for name, index, value in (
+            ("token_count", 0, tensor((287, 4, 5120))),
+            ("hidden_rank", 0, tensor((288, 20480))),
+            ("kv_width", 1, tensor((288, 25599))),
+            ("q_dtype", 2, tensor((4, 5120), torch.float32)),
+            ("k_shape", 3, tensor((1, 5120))),
+            ("hidden_dtype", 0, tensor((288, 4, 5120), torch.float32)),
+            ("kv_dtype", 1, tensor((288, 25600), torch.float32)),
+            ("mask_dtype", 4, tensor((288,), torch.bool)),
+            ("mask_shape", 4, tensor((288, 1), torch.float32)),
+            ("cpu", 0, tensor((288, 4, 5120), device="cpu")),
+            ("eps", 5, 1e-6),
+            ("clamp", 6, 1e-4),
+        ):
+            values = nominal.copy()
+            values[index] = value
+            assert not bridge.supports_engram_gate(*values), name
+            rejected.append(name)
+        bridge._gate_op = None
+        assert not bridge.supports_engram_gate(*nominal)
+        bridge._gate_op = first
+        integration_checks["rejected_contracts"] = rejected + ["uninitialized"]
+        candidate = original_tail(args.out, dispatch=True, namespace=vars(bridge))
 
     post_op = None
     if args.with_mhc_post:
@@ -278,6 +385,8 @@ def main():
         "correctness": [],
         "timings": {},
         "with_mhc_post": args.with_mhc_post,
+        "production_caller": args.production_caller,
+        "integration_checks": integration_checks,
     }
 
     def save():
@@ -319,6 +428,9 @@ def main():
         xs = fixture(kind, seed)
         for masked in (True, False):
             values = inputs(xs, masked)
+            if args.production_caller:
+                selected = bridge.supports_engram_gate(*values[:5], EPS, CLAMP)
+                assert selected == (EPS == 1e-20 and TOKENS == 288)
             if post_op is not None:
                 produced = post_op(values[5], values[0], values[6], values[7])
                 np.testing.assert_array_equal(produced.cpu().float().numpy(), xs[0])
