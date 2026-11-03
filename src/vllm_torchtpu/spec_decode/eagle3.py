@@ -1343,14 +1343,12 @@ class Eagle3Proposer:
         indices = indices.clamp_min(0)
         return torch.index_select(positions, positions.ndim - 1, indices)
 
-    @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def _draft_rows_carry_and_token(
+    def _draft_rows_carry_and_token_impl(
         self, positions: torch.Tensor, indices: torch.Tensor, last_hidden: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # `_draft_gather_positions` + `_draft_propose_token` as one program for
-        # a row-selected step 0 (VLLM_TPU_DRAFT_CARRY_FUSED): the position
-        # carry and the first draft token, the same ops in one dispatch.
+        # a row-selected step 0: the position carry and the first draft token,
+        # the same ops in one dispatch.
         assert self.draft_model is not None
         indices = indices.clamp_min(0)
         positions_carry = torch.index_select(positions, positions.ndim - 1, indices)
@@ -1367,6 +1365,22 @@ class Eagle3Proposer:
             ).argmax(dim=-1)
             token = (draft_id + d2t[draft_id]).to(torch.int32)
         return positions_carry, token
+
+    @_static_shape_args
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _draft_rows_carry_and_token_compiled(
+        self, positions: torch.Tensor, indices: torch.Tensor, last_hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._draft_rows_carry_and_token_impl(positions, indices, last_hidden)
+
+    def _draft_rows_carry_and_token(
+        self, positions: torch.Tensor, indices: torch.Tensor, last_hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if positions.device.type == "tpu":
+            return self._draft_rows_carry_and_token_compiled(
+                positions, indices, last_hidden
+            )
+        return self._draft_rows_carry_and_token_impl(positions, indices, last_hidden)
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1566,11 +1580,7 @@ class Eagle3Proposer:
                 else last_token_indices
             )
             fused_token0 = None
-            if (
-                self._draft_rows
-                and envs.VLLM_TPU_DRAFT_CARRY_FUSED
-                and not has_non_default_layout
-            ):
+            if self._draft_rows and not has_non_default_layout:
                 # Position carry + first draft token in one program.
                 hidden_carry, last_hidden_carry = hidden, last_hidden
                 with set_model_tag("eagle_head"):
@@ -2612,7 +2622,7 @@ class Eagle3Proposer:
         self._precompile_combine_hidden_states()
         self._precompile_draft_seed()
         self._precompile_compute_logits()
-        if envs.VLLM_TPU_DRAFT_CARRY_FUSED and self._draft_rows:
+        if self._draft_rows:
             self._precompile_draft_rows_carry_and_token()
         if envs.VLLM_TPU_DRAFT_SEED_FUSED and envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED:
             self._precompile_async_seed_inputs()

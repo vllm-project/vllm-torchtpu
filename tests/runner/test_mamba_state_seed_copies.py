@@ -944,3 +944,110 @@ def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
     _collect(fake, _sched({"a": 4}))
     assert fake._mamba_state_pos["a"] == 1
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8, 6)]
+
+
+@pytest.mark.parametrize(
+    "rows, width, num_reqs, num_groups",
+    [
+        (2, 4, 2, 1),  # rows < width (pads to width)
+        (4, 4, 3, 2),  # rows == width, padded tail row past num_reqs + multi-group
+        (6, 4, 3, 2),  # rows > width (truncates to width) + padded row past num_reqs
+    ],
+)
+def test_verify_fused_read_offsets_matches_update_read_offsets(
+    rows: int, width: int, num_reqs: int, num_groups: int
+):
+    vocab = 16
+    k = 3
+    torch.manual_seed(17 + rows * 7 + width * 3 + num_reqs)
+    total_tokens = rows * (k + 1)
+    logits = torch.randn((total_tokens, vocab), dtype=torch.float32)
+    bonus_idx = torch.arange(rows, dtype=torch.int64) * (k + 1) + k
+    target_idx = torch.tensor(
+        [r * (k + 1) + j for r in range(rows) for j in range(k)], dtype=torch.int64
+    )
+    temps = torch.ones((rows, 1), dtype=torch.float32)
+    top_k = torch.zeros((rows, 1), dtype=torch.int32)
+    top_p = torch.ones((rows, 1), dtype=torch.float32)
+    bonus_u = torch.full((rows, vocab), 0.5, dtype=torch.float32)
+    accept_u = torch.tensor(
+        [0.01 if (i % (k + 1)) < (i // (k + 1) + 1) else 0.99 for i in range(rows * k)],
+        dtype=torch.float32,
+    )
+    recover_u = torch.full((rows * k, vocab), 0.5, dtype=torch.float32)
+    draft_token_ids = logits[target_idx].argmax(dim=-1).to(torch.int32)
+    draft_lengths = torch.full((rows,), k, dtype=torch.int32)
+    segment_ids = torch.arange(rows, dtype=torch.int64).repeat_interleave(k)
+    group_indices = torch.arange(k, dtype=torch.int64).repeat(rows)
+
+    next_only = runner_mod._verify_fused_impl(
+        logits,
+        bonus_idx,
+        target_idx,
+        temps,
+        top_k,
+        top_p,
+        bonus_u,
+        accept_u,
+        recover_u,
+        draft_token_ids,
+        draft_lengths,
+        segment_ids,
+        group_indices,
+        None,
+        k,
+        False,
+        0,
+        None,
+    )
+    num_reqs_t = torch.tensor(num_reqs, dtype=torch.int32)
+    next_tokens, row_offsets = runner_mod._verify_fused_impl(
+        logits,
+        bonus_idx,
+        target_idx,
+        temps,
+        top_k,
+        top_p,
+        bonus_u,
+        accept_u,
+        recover_u,
+        draft_token_ids,
+        draft_lengths,
+        segment_ids,
+        group_indices,
+        None,
+        k,
+        False,
+        0,
+        num_reqs_t,
+    )
+    assert torch.equal(next_tokens, next_only)
+    # Negative control: padded rows past num_reqs must take offset 0.
+    if num_reqs < rows:
+        assert (row_offsets[num_reqs:] == 0).all()
+
+    groups = [
+        torch.tensor(
+            [1 + g * (width + 2) + i if i < num_reqs else 0 for i in range(width)],
+            dtype=torch.int32,
+        )
+        for g in range(num_groups)
+    ]
+    ref_slots = torch.full((NUM_BLOCKS,), 99, dtype=torch.int32)
+    ref_slots[0] = 0
+    runner_mod._update_read_offsets_impl(ref_slots, groups, next_tokens, num_reqs_t)
+
+    fused_slots = torch.full((NUM_BLOCKS,), 99, dtype=torch.int32)
+    fused_slots[0] = 0
+    vals = (
+        row_offsets[:width]
+        if rows >= width
+        else torch.nn.functional.pad(row_offsets, (0, width - rows))
+    ).to(fused_slots.dtype)
+    if len(groups) > 1:
+        idx = torch.cat(groups, dim=0).long()
+        vals = vals.repeat(len(groups))
+    else:
+        idx = groups[0].long()
+    fused_slots.index_put_((idx,), vals)
+    assert torch.equal(fused_slots, ref_slots)

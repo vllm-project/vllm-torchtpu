@@ -4819,8 +4819,7 @@ class TPUModelRunner(GPUModelRunner):
         ro_groups, ro_num_reqs = self._fused_read_offsets
         slot_offsets = self.mamba_slot_read_offsets
         fold_ro = (
-            envs.VLLM_TPU_VERIFY_FUSED_READ_OFFSETS
-            and slot_offsets is not None
+            slot_offsets is not None
             and bool(ro_groups)
             and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
             and slot_offsets.device.type == "tpu"
@@ -6873,7 +6872,7 @@ class TPUModelRunner(GPUModelRunner):
             candidates.append(blocks)
         # With the read-offset fold on, only the num_reqs variant runs.
         fold_ro = bool(
-            envs.VLLM_TPU_VERIFY_FUSED_READ_OFFSETS
+            envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
             and self.mamba_slot_read_offsets is not None
         )
         for topk_candidates in candidates:
