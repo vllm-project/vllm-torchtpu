@@ -1109,8 +1109,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if cached is None or cached[0] is not swa.block_tables:
                 if (
                     self._fused_preprocess
-                    and positions.shape == (288,)
-                    and swa_table.shape[0] == 48
                     and swa_cache.native_swa
                     and rows_per_page == swa_cache.page_stride == 64
                     and swa_cache.row_offset == 0
