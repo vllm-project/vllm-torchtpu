@@ -183,6 +183,16 @@ def test_layer_config_passes_the_output_fence(fence):
     assert kwargs["sliding_window"] == 1024
 
 
+@pytest.mark.parametrize("window", [None, 1024])
+@pytest.mark.parametrize("unmasked", [False, True])
+def test_layer_config_passes_unmasked_interior(window, unmasked):
+    cfg = dataclasses.replace(
+        _layer_config(16, window, configs.KVLayout.HEAD_ALONG_SUBLANE),
+        unmasked_interior=unmasked,
+    )
+    assert cfg.rpa_kwargs().get("unmasked_interior", False) is unmasked
+
+
 def test_sub_request_metadata_places_queries_at_absolute_positions():
     plan = cp_prefill.make_zigzag_plan(81920, world=8, page_size=PAGE)
     cu_q_lens, kv_lens, distribution = plan.sub_request_metadata(2)

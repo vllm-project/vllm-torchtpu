@@ -765,6 +765,9 @@ class LayerConfig:
     # (`sliding_exchange_rows_from_qkv`), and the layer bitcasts the gathered
     # int8 rows to fp8 after taking the ones it reads.
     exchange_from_qkv: bool = False
+    # The attention kernel skips the mask on steps that mask nothing
+    # (`ragged_paged_attention(unmasked_interior=True)`).
+    unmasked_interior: bool = False
 
     def __post_init__(self):
         if not self.head_page_writes:
@@ -805,6 +808,8 @@ class LayerConfig:
                 kwargs["sliding_prefill_max_bkv"] = self.sliding_prefill_max_bkv
         if self.fence_output:
             kwargs["fence_output"] = True
+        if self.unmasked_interior:
+            kwargs["unmasked_interior"] = True
         if self.fp8_out_rows:
             kwargs["output_quant_dtype"] = jnp.float8_e4m3fn
         return kwargs

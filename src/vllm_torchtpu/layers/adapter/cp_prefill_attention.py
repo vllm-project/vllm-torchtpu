@@ -331,6 +331,7 @@ def _layer_config(
             envs.TPU_RPA_SLIDING_PREFILL_MAX_BKV if sliding else None
         ),
         fence_output=envs.TPU_RPA_FENCE_OUTPUT,
+        unmasked_interior=envs.TPU_RPA_UNMASKED_INTERIOR,
         head_page_writes=envs.TPU_CP_KV_WRITE_KERNEL and not sliding,
         prologue_eps=prologue_eps,
         fp8_out_rows=envs.TPU_CP_FUSED_EPILOGUE,
