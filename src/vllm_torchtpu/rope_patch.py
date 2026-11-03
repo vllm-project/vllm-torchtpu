@@ -430,15 +430,14 @@ class InGraphCosSinCache:
         self,
         segments: Sequence[CosSinSegment],
         dtype: torch.dtype,
-        num_rows: int,
-        width: int,
+        *shape: int,
         half: Literal["cos", "sin"] | None = None,
     ) -> None:
         self.segments = tuple(segments)
         # "cos" or "sin" for a table holding only that half, else `[cos | sin]`.
         self.half = half
         self.dtype = dtype
-        self.shape = torch.Size((num_rows, width))
+        self.shape = torch.Size(shape)
         self.ndim = 2
 
     def size(self, dim: int | None = None) -> Any:
