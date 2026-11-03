@@ -530,6 +530,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             )
         self._dcp_op = None
         self._token_shard_dcp_op = None
+        self._decode_token_shard_dcp_op = None
         if self.main_kv_dcp > 1:
             from vllm.distributed import get_tp_group
 
@@ -583,7 +584,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 self._rows_op = draft(False, True)
                 if self._shared_ops is not None:
                     self._shared_ops = (draft(True, False), draft(True, True))
-            if getattr(self, "token_shard", False) or self.decode_token_shard:
+            if getattr(self, "token_shard", False):
                 build = build_pooled_qsa_token_shard_dcp_op
                 if compressed:
                     from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
@@ -591,6 +592,20 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     )
                 self._token_shard_dcp_op = partial(
                     build(get_tp_group(), pair, self.main_kv_dcp),
+                    kv_heads=self.num_kv_heads,
+                    **keywords,
+                )
+            self._decode_token_shard_dcp_op = None
+            if self.decode_token_shard:
+                from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                    build_pooled_qsa_token_shard_compressed_dcp_op,
+                )
+
+                # The replicated backbone traces symbolic rows: no split merge.
+                self._decode_token_shard_dcp_op = partial(
+                    build_pooled_qsa_token_shard_compressed_dcp_op(
+                        get_tp_group(), pair, self.main_kv_dcp, shard_merge=False
+                    ),
                     kv_heads=self.num_kv_heads,
                     **keywords,
                 )
@@ -771,6 +786,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         replicated_indexer=False,
         token_shard=False,
         shared=None,
+        decode_token_shard=False,
     ):
         """Attention output and selected tokens.
 
@@ -787,7 +803,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         token shard of the step and all-gather the selections, when built.
         """
         output, selected = self.attend_with_indices(
-            hidden, positions, metadata, rows, replicated_indexer, token_shard, shared
+            hidden,
+            positions,
+            metadata,
+            rows,
+            replicated_indexer,
+            token_shard,
+            shared,
+            decode_token_shard,
         )
         output = self.o_proj(output)
         if reduce and self.tp_size > 1:
@@ -807,6 +830,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         replicated_indexer=False,
         token_shard=False,
         shared=None,
+        decode_token_shard=False,
     ):
         """``forward_with_indices`` without the output projection and all-reduce.
 
@@ -851,6 +875,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             if token_shard and self._token_shard_dcp_op is not None:
                 op = partial(
                     self._token_shard_dcp_op,
+                    shard_index=self.token_shard_index,
+                    dcp_rank=self.dcp_rank,
+                )
+            elif decode_token_shard and self._decode_token_shard_dcp_op is not None:
+                # VLLM_TPU_QSA_DECODE_TOKEN_SHARD (the replicated backbone).
+                op = partial(
+                    self._decode_token_shard_dcp_op,
                     shard_index=self.token_shard_index,
                     dcp_rank=self.dcp_rank,
                 )
