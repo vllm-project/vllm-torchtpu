@@ -25,6 +25,7 @@ is used.
 from __future__ import annotations
 
 import dataclasses
+import os
 from pathlib import Path
 from typing import Any, cast
 
@@ -130,13 +131,17 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
 
         # Kernel modules read the config at import: install it before the
         # program imports them.
+        # K3_AGG_EP16=1: the aggregate's decode and prefill share EP16/TP2
+        # experts (the prefill's fused EP16 MoE) instead of EP8/TP4.
+        aggregate_ep = 16 if aggregate and os.environ.get("K3_AGG_EP16") == "1" else 8
         kernel_config.install(
             kernel_config.KernelConfig(
                 attention_dp=config.attention_dp,
                 dcp_group=config.decode_context_parallel_size,
                 moe_reduce_dtype=moe_reduce_dtype,
-                # The aggregate prefill shares the decode's EP8 experts.
-                prefill_expert_parallel=8 if aggregate else 16,
+                # The aggregate prefill shares the decode's experts.
+                prefill_expert_parallel=aggregate_ep if aggregate else 16,
+                decode_expert_parallel=aggregate_ep,
                 prefill_fused_moe_ep8=aggregate,
                 # Every 8K window's routes on the fused path (no unfused overflow).
                 prefill_moe_capacity_ep8=65536 if aggregate else 32768,

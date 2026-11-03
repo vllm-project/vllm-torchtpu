@@ -7,8 +7,9 @@ selected by an engine without a KV transfer config) holds a
 :class:`KimiPrefiller` and a :class:`KimiDecoder` over the same devices and the
 same vLLM unified pools, and one copy of the weights they share: the decoder
 loads its pre-shard as the decode role does, and the prefill takes the
-decoder's tensors for every family that is the same (EP8 experts, attention,
-router, embedding and LM head) and reads only its sequence-parallel projections
+decoder's tensors for every family that is the same (experts: EP8/TP4, or
+EP16/TP2 with ``decode_expert_parallel`` 16; attention, router, embedding and
+LM head) and reads only its sequence-parallel projections
 (``rank_loader.PREFILL_SHARED``).
 
 A step hands each request to one program, as a P/D pair splits it:
@@ -112,10 +113,15 @@ class KimiAggregate:
         from vllm_torchtpu.megakernel.kimi_k3.program import build_decoder
 
         kernel = active()
-        if kernel.prefill_expert_parallel != 8:
+        if kernel.prefill_expert_parallel != kernel.decode_expert_parallel:
             raise NotImplementedError(
-                "the K3 aggregate engine shares the decode's EP8 experts: "
-                "it needs prefill_expert_parallel 8"
+                "the K3 aggregate engine shares the decode's experts: it needs "
+                "prefill_expert_parallel == decode_expert_parallel (8 or 16)"
+            )
+        if kernel.prefill_expert_plan:
+            raise NotImplementedError(
+                "the K3 aggregate engine does not run a prefill expert plan "
+                "(K3_PREFILL_EXPERT_PLAN): it reorders the shared experts"
             )
         if kernel.kd_hot_plan or kernel.kd_replica_plan:
             raise NotImplementedError(

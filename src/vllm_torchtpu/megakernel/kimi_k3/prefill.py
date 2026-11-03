@@ -316,7 +316,14 @@ class PrefillProgram:
             presharded, cache, self.rank, split_experts=True, skip=frozenset(shared)
         )
         self._expert_banks = []
-        if active().prefill_fused_moe and active().prefill_expert_parallel == 16:
+        # The decode's experts (aggregate) are one 92-layer family each.
+        kernel = active()
+        if (
+            kernel.prefill_fused_moe
+            and kernel.prefill_expert_parallel == 16
+            and kernel.prefill_expert_banks
+            and not set(shared) & set(_EXPERT_FAMILIES)
+        ):
             self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
             iterator = _bank_expert_weights(iterator)
 

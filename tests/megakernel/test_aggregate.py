@@ -244,21 +244,48 @@ def test_prefill_loader_skips_shared_families(monkeypatch, preshard):
     }
 
 
-def test_prefill_loader_shares_experts_only_at_ep8(monkeypatch, preshard):
+def test_prefill_loader_shares_experts_only_in_the_decode_layout(monkeypatch, preshard):
     root, cache = preshard
     monkeypatch.setattr(
         rank_loader, "_config", lambda: KernelConfig(prefill_expert_parallel=16)
     )
-    with pytest.raises(ValueError, match="EP8"):
+    with pytest.raises(ValueError, match="decode's layout"):
         list(
             rank_loader.iter_prefill_rank(
                 root, cache, 0, skip=frozenset(rank_loader.EXPERT_FAMILIES)
             )
         )
     monkeypatch.setattr(
+        rank_loader,
+        "_config",
+        lambda: KernelConfig(
+            prefill_expert_parallel=16,
+            decode_expert_parallel=16,
+            prefill_expert_plan="x.npz",
+        ),
+    )
+    with pytest.raises(ValueError, match="decode's layout"):
+        list(
+            rank_loader.iter_prefill_rank(
+                root, cache, 0, skip=frozenset(rank_loader.EXPERT_FAMILIES)
+            )
+        )
+    monkeypatch.setattr(
+        rank_loader,
+        "_config",
+        lambda: KernelConfig(prefill_expert_parallel=16, decode_expert_parallel=16),
+    )
+    left = {
+        n.partition("@")[0]
+        for _, n, _ in rank_loader.iter_prefill_rank(
+            root, cache, 0, skip=frozenset(rank_loader.EXPERT_FAMILIES)
+        )
+    }
+    assert not left & set(rank_loader.EXPERT_FAMILIES)
+    monkeypatch.setattr(
         rank_loader, "_config", lambda: KernelConfig(prefill_expert_parallel=8)
     )
-    with pytest.raises(ValueError, match="EP8"):
+    with pytest.raises(ValueError, match="decode's layout"):
         list(
             rank_loader.iter_prefill_rank(root, cache, 0, skip=frozenset({"expert_gu"}))
         )

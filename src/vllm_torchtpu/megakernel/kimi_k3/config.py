@@ -33,6 +33,9 @@ class KernelConfig:
     mla_decode_ktile: int = 1024
     # Routed experts and weight layout (the pre-shard format).
     expert_gate_up: str = "mxfp4"  # "mxfp4" or "fp8" (reblocked)
+    # Decode routed experts: 8 (EP8/TP4, the pre-shard layout) or 16 (EP16/TP2,
+    # the prefill's regrouped layout; each expert runs as two TP4-width halves).
+    decode_expert_parallel: int = 8
     mxfp4_block: int = 2048
     mxfp4_pair_tile: int = 512
     mxfp4_static_tile: int = 0
@@ -89,6 +92,9 @@ class KernelConfig:
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
     prefill_expert_parallel: int = 16
+    # EP16 fused MoE: expert families resident as per-group banks (False: one
+    # 92-layer family each, as when the aggregate shares the decode's EP16 experts).
+    prefill_expert_banks: bool = True
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
     # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
     # False: the unfused SparseCore gather/combine.
@@ -180,6 +186,11 @@ class KernelConfig:
             raise ValueError("kd_hot_plan and kd_replica_plan are exclusive")
         if not set(self.fp8_wires) <= {"t0", "t10"}:
             raise ValueError("fp8_wires holds t0 and/or t10")
+        if self.decode_expert_parallel not in (8, 16):
+            raise ValueError("decode_expert_parallel is 8 or 16")
+        hot = self.kd_hot_plan or self.kd_replica_plan
+        if self.decode_expert_parallel == 16 and hot:
+            raise ValueError("hot-expert plans need decode_expert_parallel 8")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
         if self.prefill_kda_sub_block not in (16, 32):

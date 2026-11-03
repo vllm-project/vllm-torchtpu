@@ -37,7 +37,7 @@ PREFILL_IO = ("embedding", "lm_head", "output_res", "final_norm")
 PREFILL_KDA = ("k_gate", "k_fb", "k_projection", "k_conv", "k_a_log", "k_dt", "k_norm", "k_o")
 PREFILL_MLA = ("m_qa", "m_qb", "m_ka", "m_kb", "m_gate", "m_qnorm", "m_knorm", "m_o")
 PREFILL_MOE_DENSE = ("router", "router_bias", "latent_norm")
-# Prefill families that are the decode's tensors as loaded (EP8 experts; k_o and
+# Prefill families that are the decode's tensors as loaded (experts in the decode's layout; k_o and
 # m_o differ, and the latent and shared projections come from the SP cache).
 PREFILL_SHARED = (PREFILL_IO + PREFILL_COMMON
                   + tuple(n for n in PREFILL_KDA if n != "k_o")
@@ -407,6 +407,16 @@ def _replica_table(latent_norm, experts, order):
     return table
 
 
+def _ep16_expert_jobs(presharded, rank_dir: RankDir, rank: int, layers: int):
+    """EP16/TP2 expert families regrouped from the EP8 group's quarters (same
+    host): 56 experts, half the intermediate (the prefill's EP16 layout)."""
+    group = 4 * (rank // 4)
+    quarters, part = (2 * (rank % 2), 2 * (rank % 2) + 1), (rank // 2) % 2
+    quarter_dirs = [RankDir(presharded, group + q, layers) for q in quarters]
+    for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n))):
+        yield from rank_dir.regrouped_expert_parts(name, quarter_dirs, part, 2)
+
+
 def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: bool = False,
                      attention_dp: int = 1) -> Iterator[tuple[str, str, np.ndarray]]:
     """The decode megakernel's weights for ``rank`` (MXFP4 experts as stored).
@@ -418,11 +428,16 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
     rest), with at most ``KernelConfig.load_inflight_gb`` of host buffers in flight.
     With ``attention_dp`` > 1 the head-sharded attention families hold the
     rank's held TP32 shards (see :func:`attention_dp_families`).
+    ``KernelConfig.decode_expert_parallel`` 16: the experts are the EP16/TP2
+    regrouping (always per file).
     """
     rank_dir = RankDir(presharded, rank, layers)
     plan = hot_plan(rank, layers)
     replicas = replica_plan(rank, layers)
-    jobs = list(_expert_jobs(rank_dir, split_experts))
+    if _config().decode_expert_parallel == 16:
+        jobs = list(_ep16_expert_jobs(presharded, rank_dir, rank, layers))
+    else:
+        jobs = list(_expert_jobs(rank_dir, split_experts))
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for key, value in _budgeted(jobs):
         if plan is not None and key != "dense":
@@ -557,7 +572,7 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
     Yields ``(group, name, array)`` with ``group`` in io/common/kda/mla/moe
     (per-rank arrays, without the rank axis); expert families first
     (``split_experts``: per file, as in :func:`iter_decode_rank`). Families in
-    ``skip`` (a subset of :data:`PREFILL_SHARED`, EP8 only for the experts)
+    ``skip`` (a subset of :data:`PREFILL_SHARED`; experts only in the decode's layout)
     are not read: the caller already holds them.
     """
     if not skip <= set(PREFILL_SHARED):
@@ -581,11 +596,15 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
                 lambda: projection(name))
 
     ep = _config().prefill_expert_parallel
-    if skip & set(EXPERT_FAMILIES) and (ep != 8 or not set(EXPERT_FAMILIES) <= skip):
-        raise ValueError("only all four EP8 prefill expert families are the decode's tensors")
+    if skip & set(EXPERT_FAMILIES) and (
+        ep != _config().decode_expert_parallel
+        or (ep == 16 and _config().prefill_expert_plan)
+        or not set(EXPERT_FAMILIES) <= skip
+    ):
+        raise ValueError("only all four prefill expert families, in the decode's layout, are the decode's tensors")
     jobs: list[tuple] = []
     if skip & set(EXPERT_FAMILIES):
-        pass  # the decode's EP8 experts
+        pass  # the decode's experts (EP8, or EP16 without a placement plan)
     elif ep in (16, 32):  # regrouped from the EP8 group's quarters (same host)
         group = 4 * (rank // 4)
         if ep == 32:  # 28 whole experts
