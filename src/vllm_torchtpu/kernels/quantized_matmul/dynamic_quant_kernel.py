@@ -111,14 +111,14 @@ def _kernel(x_ref, w_ref, w_scale_ref, out_ref, x_q_ref, x_scale_ref, *, out_blo
         n_chunks = w_ref.shape[1] // out_block
         per_chunk = -(-len(quant_starts) // n_chunks)
         x_q = x_q_ref.at[(s + 1) % 2]
-        x_scale = x_scale_ref.at[(s + 1) % 2]
+        x_scale = x_scale_ref[(s + 1) % 2]
         # One basic block, so the scheduler interleaves the quantization of
         # the next row block with these matmuls. The last step re-quantizes
         # the last block into the free slot rather than branch.
         for j in range(n_chunks):
             cols = pl.ds(j * out_block, out_block)
             acc = jnp.dot(x_q[...], w_ref[:, cols], preferred_element_type=jnp.float32)
-            acc = acc * x_scale[...]
+            acc = acc * x_scale
             acc = acc * w_scale_ref[:, cols]
             out_ref[:, cols] = acc.astype(out_ref.dtype)
             quantize(quant_starts[j * per_chunk : (j + 1) * per_chunk])
