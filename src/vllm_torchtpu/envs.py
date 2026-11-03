@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    TPU_FP8_DECODE_GEMV_MAX_ROWS: int = 0
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -690,6 +691,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 (default) keeps W8A8 everywhere.
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
+    ),
+    # Opt-in weight-streaming kernel for small FP8 dense-linear steps. A step
+    # whose padded token bucket has at most this many rows runs its per-channel
+    # W8A8 projection as one Pallas weight stream that quantizes the rows while
+    # the first weight tiles land (kernels/quantized_matmul/decode_gemv.py)
+    # instead of XLA's activation-quantization fusions and dot fusion. Same
+    # quantization and scaling; the FP8 dot accumulates in Mosaic's order, which
+    # on some shapes rounds differently from XLA's. Buckets under
+    # TPU_FP8_LINEAR_W8A16_MAX_ROWS keep W8A16. 0 (default) keeps XLA.
+    "TPU_FP8_DECODE_GEMV_MAX_ROWS": env_nonnegative_int(
+        "TPU_FP8_DECODE_GEMV_MAX_ROWS", 0
     ),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(

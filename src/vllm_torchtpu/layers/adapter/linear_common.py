@@ -27,6 +27,7 @@ from vllm_torchtpu.kernels.gelu_quant import (
     gelu_tanh_and_mul_quantize as _gelu_tanh_and_mul_quantize_kernel,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.quantized_matmul import decode_gemv
 from vllm_torchtpu.kernels.quantized_matmul.util import (
     quantize_tensor,
     xla_prequantized_matmul,
@@ -74,11 +75,36 @@ def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     raise ValueError(f"Unsupported quantized dtype: {w_q_dtype}")
 
 
+def _use_decode_gemv(
+    rows: int, w_q: jax.Array, w_s: jax.Array, decode_gemv_max_rows: int
+) -> bool:
+    """Whether a `rows`-row bucket runs `decode_gemv` (TPU_FP8_DECODE_GEMV_MAX_ROWS).
+
+    Rows is static at trace time, so each token bucket picks one path; a
+    weight the kernel cannot take keeps XLA's, and the log line says which.
+    """
+    if not 0 < rows <= decode_gemv_max_rows:
+        return False
+    k, n = w_q.shape
+    use = decode_gemv.supports(rows, k, n, w_q.dtype, w_s.ndim)
+    # Logged at trace time, so absent when executables load from the cache.
+    logger.info_once(
+        "FP8 dense linear [%d, %d] -> [%d] on the %d-row bucket: %s.",
+        rows,
+        k,
+        n,
+        rows,
+        "decode weight-streaming kernel" if use else "XLA (kernel does not fit)",
+    )
+    return use
+
+
 def _quantized_matmul_jax(
     x: jax.Array,
     w_q: jax.Array,
     w_s: jax.Array,
     w8a16_max_rows: int = 0,
+    decode_gemv_max_rows: int = 0,
 ) -> jax.Array:
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
@@ -133,6 +159,8 @@ def _quantized_matmul_jax(
             rows,
             w8a16_max_rows,
         )
+    elif _use_decode_gemv(rows, w_q, w_s, decode_gemv_max_rows):
+        return decode_gemv.fp8_decode_matmul(x, w_q, w_s)
     return xla_quantized_matmul(x, w_q, w_s, quantize_activation=not use_w8a16)
 
 
@@ -156,8 +184,9 @@ def _get_quantized_matmul_op() -> Callable:
             w_q: torch.Tensor,
             w_s: torch.Tensor,
             w8a16_max_rows: int = 0,
+            decode_gemv_max_rows: int = 0,
         ):
-            del w_s, w8a16_max_rows
+            del w_s, w8a16_max_rows, decode_gemv_max_rows
             return torch.empty(
                 x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
             )
@@ -172,6 +201,7 @@ def quantized_matmul(
     w_q: torch.Tensor,
     w_s: torch.Tensor,
     w8a16_max_rows: int = 0,
+    decode_gemv_max_rows: int = 0,
 ) -> torch.Tensor:
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
@@ -189,7 +219,9 @@ def quantized_matmul(
 
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
+    out_2d = _get_quantized_matmul_op()(
+        x_2d, w_q, w_s, w8a16_max_rows, decode_gemv_max_rows
+    )
     return out_2d.reshape(orig_out_shape)
 
 
@@ -229,8 +261,16 @@ _quantize_activation_ops = {
 
 
 def _prequantized_matmul_bf16_jax(
-    x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_s: jax.Array
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    decode_gemv_max_rows: int = 0,
 ) -> jax.Array:
+    if _use_decode_gemv(x_q.shape[0], w_q, w_s, decode_gemv_max_rows):
+        return decode_gemv.fp8_decode_prequantized_matmul(
+            x_q, x_scale, w_q, w_s, jnp.bfloat16
+        )
     return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, jnp.bfloat16)
 
 
@@ -239,8 +279,8 @@ _prequantized_matmul_bf16_op = pallas.jax_op(
 )
 
 
-def _fake_prequantized_matmul_bf16(x_q, x_scale, w_q, w_s):
-    del x_scale, w_s
+def _fake_prequantized_matmul_bf16(x_q, x_scale, w_q, w_s, decode_gemv_max_rows=0):
+    del x_scale, w_s, decode_gemv_max_rows
     return torch.empty(
         x_q.shape[0], w_q.shape[-1], dtype=torch.bfloat16, device=x_q.device
     )
@@ -324,6 +364,7 @@ def prequantized_matmul(
     x_scale: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
+    decode_gemv_max_rows: int = 0,
 ) -> torch.Tensor:
     """`quantized_matmul` for bf16 activations, after `quantize_activation`.
 
@@ -336,7 +377,7 @@ def prequantized_matmul(
             f"Input hidden dim {x_q.shape[-1]} must match weight hidden dim "
             f"{w_q.shape[0]}."
         )
-    return _prequantized_matmul_bf16_op(x_q, x_scale, w_q, w_s)
+    return _prequantized_matmul_bf16_op(x_q, x_scale, w_q, w_s, decode_gemv_max_rows)
 
 
 def _quantized_matmul_fp4_jax(
