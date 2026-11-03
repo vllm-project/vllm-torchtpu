@@ -238,6 +238,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "patch_disable_eagle_block_drop",
         "_patch_dflash_drafting_slot_budget",
         "_patch_vllm_merge_multimodal_embeddings",
+        "install_agentic_telemetry_patches",
     ]
     assert stages["platform_activation"] == (
         stages["worker_init"] + stages["model_load"]
