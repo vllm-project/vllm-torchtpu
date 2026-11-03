@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
     VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
     VLLM_TPU_QSA_INDEXER_HOIST_META: bool = False
+    VLLM_TPU_QSA_INDEXER_TILE_ALIGNED_SCORES: bool = False
     VLLM_TPU_QSA_INDEXER_MIXED_ONLY: bool = False
     VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: bool = False
     VLLM_TPU_QWEN4_NGRAM_WINDOW: str = ""
@@ -639,6 +640,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # XLA computes them once per step instead of once per QSA layer.
     "VLLM_TPU_QSA_INDEXER_HOIST_META": env_bool(
         "VLLM_TPU_QSA_INDEXER_HOIST_META", default=False
+    ),
+    # Qwen4-exp decode / verify indexer: StreamIndex pads each token's score
+    # rows to whole (8, 128) int32 tiles, so its HBM scores reach the
+    # SparseCore top-k as a bitcast instead of a relayout copy (~8 us per QSA
+    # layer at c48). The padding lies past every row length (same selection).
+    "VLLM_TPU_QSA_INDEXER_TILE_ALIGNED_SCORES": env_bool(
+        "VLLM_TPU_QSA_INDEXER_TILE_ALIGNED_SCORES", default=False
     ),
     # Qwen4-exp QSA indexer on decode / verify steps: score every request in the
     # mixed pass and drop the two one-token decode passes (empty on verify
