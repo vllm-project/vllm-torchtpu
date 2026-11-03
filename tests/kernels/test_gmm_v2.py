@@ -559,13 +559,13 @@ def test_gmm_v2_nvfp4_global_scale_matches_dequantized_reference(compact_scale):
     _require_tpu()
 
     batch_size, num_groups, size_k, size_n = 512, 8, 1024, 512
-    key = jax.random.key(2)
-    packed, scale = make_nvfp4_rhs(key, num_groups, size_k, size_n)
+    rhs_key, lhs_key = jax.random.split(jax.random.key(2))
+    packed, scale = make_nvfp4_rhs(rhs_key, num_groups, size_k, size_n)
     global_scale = make_gate_up_global_scale(jax.random.key(3), num_groups, size_n)
     rhs = dequantize_nvfp4_kmajor(
         packed, scale.astype(jnp.float32) * global_scale, jnp.bfloat16
     )
-    lhs = jax.random.uniform(key, (batch_size, size_k), jnp.bfloat16, -1, 1)
+    lhs = jax.random.uniform(lhs_key, (batch_size, size_k), jnp.bfloat16, -1, 1)
     group_sizes = get_group_sizes(batch_size, num_groups)
     expected = reference_gmm(lhs, rhs, group_sizes)
     if compact_scale:
