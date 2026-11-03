@@ -639,7 +639,13 @@ def dcp_combine_own(out_pair, lse_pair, gate, *, out_dtype=jnp.bfloat16):
 def dcp_combine_step(
     out_pair: jax.Array, lse_pair: jax.Array, gate: jax.Array, rank: jax.Array
 ) -> jax.Array:
-    """``dcp_combine`` with a fully annotated signature for ``jax_op``."""
+    """``dcp_combine`` with a fully annotated signature for ``jax_op``.
+
+    ``gate`` may be the whole ``[T, heads, 2 D]`` q/gate row
+    (VLLM_TPU_QSA_DCP_GATE_IN_COMBINE); its gate half is sliced here."""
+    head_dim = out_pair.shape[-1]
+    if gate.shape[-1] == 2 * head_dim:
+        gate = gate[..., head_dim:]
     return dcp_combine(out_pair, lse_pair, gate, rank)
 
 
@@ -647,6 +653,9 @@ def dcp_combine_own_step(
     out_pair: jax.Array, lse_pair: jax.Array, gate: jax.Array
 ) -> jax.Array:
     """``dcp_combine_own`` with a fully annotated signature for ``jax_op``."""
+    head_dim = out_pair.shape[-1]
+    if gate.shape[-1] == 2 * head_dim:  # the whole q/gate row (VLLM_TPU_QSA_DCP_GATE_IN_COMBINE)
+        gate = gate[..., head_dim:]
     return dcp_combine_own(out_pair, lse_pair, gate)
 
 

@@ -266,6 +266,7 @@ if TYPE_CHECKING:
     VLLM_TPU_REASONING_COUNT_SKIP_TOOLS: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_OWNED: bool = False
     VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR: bool = False
+    VLLM_TPU_QSA_DCP_GATE_IN_COMBINE: bool = False
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1629,6 +1630,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (dim 0) and join the heads inside the step, instead of a dim -1 gather
     # whose head join runs as a standalone copy (bit-identical).
     "VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR": env_bool("VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR"),
+    # Main-KV DCP: pass the whole q/gate row to the pair combine, which slices
+    # the gate half itself, instead of slicing it on the Torch side
+    # (a standalone strided slice plus relayout; bit-identical).
+    "VLLM_TPU_QSA_DCP_GATE_IN_COMBINE": env_bool("VLLM_TPU_QSA_DCP_GATE_IN_COMBINE"),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for

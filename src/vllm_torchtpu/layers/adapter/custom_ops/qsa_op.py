@@ -979,14 +979,15 @@ def _dcp_ops():
 
     @combine.register_fake
     def combine_fake(out_pair, lse_pair, gate, rank):
-        return gate.new_empty(gate.shape, dtype=torch.bfloat16)
+        # ``gate`` may be the whole q/gate row (VLLM_TPU_QSA_DCP_GATE_IN_COMBINE).
+        return gate.new_empty((*gate.shape[:-1], out_pair.shape[-1]), dtype=torch.bfloat16)
 
     if envs.VLLM_TPU_QSA_DCP_HEAD_EXCHANGE:
         own = pallas.jax_op("qwen4_exp::qsa_dcp_combine_own", dcp_combine_own_step)
 
         @own.register_fake
         def own_fake(out_pair, lse_pair, gate):
-            return gate.new_empty(gate.shape, dtype=torch.bfloat16)
+            return gate.new_empty((*gate.shape[:-1], out_pair.shape[-1]), dtype=torch.bfloat16)
 
         # _dcp_finish exchanges heads instead of gathering every partial.
         combine = (combine, own)
@@ -998,7 +999,11 @@ def _dcp_finish(out, lse, qgate, head_dim, dcp_rank, pair_group, combine):
     """Gather the pair's partial attention and merge this rank's heads."""
     tokens = qgate.shape[0]
     heads = qgate.shape[1] // (2 * head_dim)
-    gate = qgate.reshape(tokens, heads, 2 * head_dim)[..., head_dim:]
+    gate = qgate.reshape(tokens, heads, 2 * head_dim)
+    if not envs.VLLM_TPU_QSA_DCP_GATE_IN_COMBINE:
+        # The strided gate half runs as a standalone slice plus a relayout
+        # copy; with the flag the combine slices it, fused with its consumer.
+        gate = gate[..., head_dim:]
     if isinstance(combine, tuple):
         # VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: each rank sends every other rank
         # only that rank's heads of its partials (an all-to-all over the
