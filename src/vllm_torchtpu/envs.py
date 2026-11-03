@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     TPU_RPA_SKIP_EMPTY_LAUNCH: bool = False
     TPU_RPA_FENCE_OUTPUT: bool = False
     TPU_GEMMA4_FUSED_ATTN_PROLOGUE: bool = False
+    TPU_GEMMA4_FUSED_GELU_QUANT: bool = False
     TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = False
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
     TPU_RPA_UNMASKED_INTERIOR: bool = False
@@ -843,6 +844,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/vllm/gemma4_attention_patch.py). Rounding: the norms' sums of
     # squares are added in another order, so values can move one step.
     "TPU_GEMMA4_FUSED_ATTN_PROLOGUE": env_bool("TPU_GEMMA4_FUSED_ATTN_PROLOGUE"),
+    # Gemma4's GeGLU (tanh GELU) and the down projection's per-token FP8 input
+    # quantization run as one Pallas pass (models/vllm/gemma4_mlp_patch.py,
+    # kernels/gelu_quant.py) instead of XLA's two passes over the activation.
+    # Rounding: GELU runs in f32 and rounds once, so values can move one step.
+    "TPU_GEMMA4_FUSED_GELU_QUANT": env_bool("TPU_GEMMA4_FUSED_GELU_QUANT"),
     # Cap the batched-RPA decode KV block of sliding-window layers at half the
     # window, rounded down to the block stride. The default block fills VMEM
     # (1792 tokens for a 1024-token window on Gemma4), and each decode launch

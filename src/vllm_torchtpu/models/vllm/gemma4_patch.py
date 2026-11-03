@@ -78,6 +78,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import cp_prefill
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.gemma4_attention_patch import attention_from_qkv
+from vllm_torchtpu.models.vllm.gemma4_mlp_patch import down_proj_from_gate_up
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
@@ -248,13 +249,10 @@ def _sequence_parallel_layer(
     residual = hidden_states
 
     mlp_out = [
-        mlp.down_proj(
-            mlp.act_fn(
-                _gathered_projection(
-                    mlp.gate_up_proj, self.pre_feedforward_layernorm(h)
-                )
-            )
-        )[0]
+        down_proj_from_gate_up(
+            mlp,
+            _gathered_projection(mlp.gate_up_proj, self.pre_feedforward_layernorm(h)),
+        )
         for h in hidden_states
     ]
     if self.enable_moe_block:

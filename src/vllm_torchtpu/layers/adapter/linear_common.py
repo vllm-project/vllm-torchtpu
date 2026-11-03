@@ -23,6 +23,9 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels.gelu_quant import (
+    gelu_tanh_and_mul_quantize as _gelu_tanh_and_mul_quantize_kernel,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import (
     quantize_tensor,
@@ -260,6 +263,53 @@ def quantize_activation(
     op = _quantize_activation_ops.get(w_q.dtype)
     if op is None:
         raise ValueError(f"no per-token activation quantization for {w_q.dtype}")
+    return op(x)
+
+
+def _gelu_tanh_and_mul_quantize_jax(
+    x: jax.Array, *, quant_dtype: jnp.dtype
+) -> tuple[jax.Array, jax.Array]:
+    return _gelu_tanh_and_mul_quantize_kernel(x, quant_dtype)
+
+
+def _make_gelu_quantize_op(quant_dtype: torch.dtype) -> Callable:
+    name = str(quant_dtype).removeprefix("torch.")
+    op = pallas.jax_op(
+        f"pallas::gelu_tanh_and_mul_quantize_{name}",
+        functools.partial(_gelu_tanh_and_mul_quantize_jax, quant_dtype=jnp.dtype(name)),
+    )
+
+    def _fake(x: torch.Tensor):
+        d = x.shape[-1] // 2
+        return (
+            torch.empty((x.shape[0], d), dtype=quant_dtype, device=x.device),
+            torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+        )
+
+    op.register_fake(_fake)
+    return op
+
+
+_gelu_quantize_ops = {
+    dtype: _make_gelu_quantize_op(dtype)
+    for dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+}
+
+
+def gelu_tanh_and_mul_quantize(
+    x: torch.Tensor, w_q: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`quantize_activation(GeluAndMul("tanh")(x), w_q)` in one Pallas pass.
+
+    `x` is the 2-D `[tokens, 2 * d]` gate/up rows; returns the `[tokens, d]`
+    rows in `w_q`'s FP8 dtype and their f32 `[tokens, 1]` scales, for
+    `prequantized_matmul` (kernels/gelu_quant.py for the rounding).
+    """
+    if x.dim() != 2:
+        raise ValueError(f"expected 2-D gate/up rows, got {tuple(x.shape)}")
+    op = _gelu_quantize_ops.get(w_q.dtype)
+    if op is None:
+        raise ValueError(f"no fused GELU quantization for {w_q.dtype}")
     return op(x)
 
 
