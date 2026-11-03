@@ -131,7 +131,7 @@ _KIMI_K3_PRO_CFG = {
     "quantization_config": {"quant_method": "fp8", "expert_dtype": "mxfp4"},
 }
 
-_NUM_SCOPES = 4
+_NUM_SCOPES = 5
 _NUM_REGIMES = 12
 _KIMI_ROUTED_HIDDEN = 3584
 _KIMI_KDA_LAYERS = 69
@@ -586,8 +586,11 @@ def test_all_four_fusion_scopes_reachable() -> None:
     r_ep8_sat = advisor.advise(
         p397, advisor.WorkloadSpec(phase="decode", batch=600, tp=2, dp=4, ep=8), "tpu7x"
     )
-    assert r_ep8_sat.recommended_scope == "per_op"
-    assert r_ep8_sat.recommended_moe_mode == "grouped_in_hbm"
+    # Saturated DP4 x TP2 decode: 150 tok/core overflow the whole-step ceiling;
+    # with MoE priced in the recommended on-chip grouped mode, one call per
+    # layer beats per-op kernels.
+    assert r_ep8_sat.recommended_scope == "single_layer"
+    assert r_ep8_sat.recommended_moe_mode == "grouped_on_chip"
 
     r_llama_pre = advisor.advise(
         pllama, advisor.WorkloadSpec(phase="prefill", batch=1, isl=4096, tp=8), "tpu7x"
@@ -1008,3 +1011,52 @@ def test_reports_name_mechanisms_not_kernels(model: str) -> None:
     sweep = advisor.advise_regimes(model, "tpu7x")
     rendered = advisor.format_regime_table(sweep) + advisor.render_advisor_html(sweep)
     assert _KERNEL_NAME_DENYLIST.search(rendered) is None
+
+
+def test_whole_step_tiles_overflow_and_reads_weights_once() -> None:
+    """Verify whole_step tiles tokens past the ceiling instead of re-passing."""
+    dep = advisor.DEPLOYMENT_PRESETS["qwen3.5-397b"]
+    rep = advisor.advise(
+        advisor.resolve_model_profile("qwen3.5-397b"),
+        _preset_workload(
+            dep.decode,
+            phase="verify",
+            batch=_QWEN35_SHIPPED_VERIFY_ROWS // (dep.decode.spec_tokens + 1),
+            spec_tokens=dep.decode.spec_tokens,
+            moe_mode="grouped_on_chip",
+        ),
+        "tpu7x",
+    )
+    tiled = next(s for s in rep.scopes if s.scope == "whole_step")
+    repass = next(s for s in rep.scopes if s.scope == "whole_step_repass")
+    assert tiled.n_splits == repass.n_splits > 1
+    assert repass.feasible
+    assert tiled.w_step_gb <= repass.w_step_gb * repass.n_splits
+    assert tiled.step_bound_us < repass.step_bound_us
+
+
+def test_whole_step_repass_needs_more_than_one_pass() -> None:
+    """Verify whole_step_repass is only offered when tokens overflow VMEM."""
+    rep = advisor.advise(
+        advisor.resolve_model_profile("qwen3.5-397b"),
+        advisor.WorkloadSpec(phase="decode", batch=4, tp=8, ep=8),
+        "tpu7x",
+    )
+    repass = next(s for s in rep.scopes if s.scope == "whole_step_repass")
+    assert repass.n_splits == 1
+    assert not repass.feasible
+
+
+def test_fused_scopes_price_the_recommended_moe_mode() -> None:
+    """Verify a full row tile per EP rank prices on-chip grouping either way."""
+    prof = advisor.resolve_model_profile("qwen3.5-397b")
+    steps = []
+    for mode in ("masked_on_chip", "grouped_on_chip"):
+        rep = advisor.advise(
+            prof,
+            advisor.WorkloadSpec(phase="decode", batch=64, tp=8, ep=8, moe_mode=mode),
+            "tpu7x",
+        )
+        steps.append(next(s for s in rep.scopes if s.scope == "whole_step"))
+        assert rep.recommended_moe_mode == "grouped_on_chip"
+    assert steps[0].moe_flop_factor == steps[1].moe_flop_factor

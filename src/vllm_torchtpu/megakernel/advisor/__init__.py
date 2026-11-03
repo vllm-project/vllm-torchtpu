@@ -51,7 +51,9 @@ if TYPE_CHECKING:
 
 # Where the kernel boundary falls: one call per operator, per layer, per group
 # of N layers (a model preset or a pipeline stage), or one call per step.
-FusionScope = Literal["per_op", "single_layer", "layer_group", "whole_step"]
+FusionScope = Literal[
+    "per_op", "single_layer", "layer_group", "whole_step", "whole_step_repass"
+]
 Phase = Literal["decode", "verify", "prefill", "mixed"]
 # Where routed tokens are grouped by expert and where the data lives.
 MoEMode = Literal["masked_on_chip", "grouped_on_chip", "grouped_in_hbm", "dense_mlp"]
@@ -564,7 +566,7 @@ def _scope_vmem_and_ops(
             reason = (
                 "No layer grouping: needs a model preset, pp > 1, or segment_layers"
             )
-    elif scope == "whole_step" and no_whole_step:
+    elif scope in ("whole_step", "whole_step_repass") and no_whole_step:
         feasible = False
         reason = plan_error or "Bounded by layer groups, single layers, or non-periodic"
 
@@ -629,7 +631,41 @@ def _scope_vmem_and_ops(
     n_splits = active_tokens if t_max == 0 else ceil(active_tokens / t_max)
     if t_max == 0:
         feasible, reason = False, "Weight buffers exceed VMEM"
+    elif scope == "whole_step_repass" and n_splits == 1 and feasible:
+        feasible, reason = False, "Same as whole_step when tokens fit in one pass"
     return static_vmem_bytes, act_bytes, n_ops, t_max, n_splits, feasible, reason
+
+
+def _moe_weights_and_padding(
+    ctx: _ScopeContext,
+    profile: ModelProfile,
+    tile_tokens: int,
+    *,
+    tiled: bool,
+    grouped: bool,
+) -> tuple[float, float]:
+    """Return weight bytes read per step and the MoE matmul padding factor."""
+    experts_local, ep_dp = ctx.experts_local, ctx.ep_dp
+    if experts_local == 0:
+        return ctx.w_static, 1.0
+
+    def experts_hit(tokens_ep: int) -> float:
+        """Return expected distinct local experts hit by `tokens_ep` tokens."""
+        miss = (1.0 - min(1.0, profile.top_k / profile.num_experts)) ** tokens_ep
+        return max(1.0, experts_local * (1.0 - miss))
+
+    t_ep = tile_tokens * ep_dp
+    e_hit = experts_hit(t_ep)
+    pairs = max(1.0, t_ep * profile.top_k * experts_local / profile.num_experts)
+    avg_m = max(1.0, pairs / e_hit)
+    # Tiled scopes stream each hit expert once for all tiles of the step.
+    hit = experts_hit(ctx.active_tokens * ep_dp) if tiled else e_hit
+    w_step = ctx.w_static + ctx.l_moe * hit * ctx.exp_bytes
+    # Price the MoE mode advise() recommends: on-chip grouping once a tile gives
+    # each EP rank a full row tile (rec_moe in advise()).
+    if grouped or t_ep >= _GROUPED_MOE_MIN_TOKENS:
+        return w_step, ceil(avg_m / ctx.row_floor) * ctx.row_floor / avg_m
+    return w_step, max(1.0, (ops.rup(t_ep, 16) * e_hit) / pairs)
 
 
 def _evaluate_scopes(
@@ -637,17 +673,19 @@ def _evaluate_scopes(
     profile: ModelProfile,
     workload: WorkloadSpec,
 ) -> tuple[list[ScopeEstimate], dict[FusionScope, float]]:
-    """Evaluate all four FusionScope options against VMEM, HBM, and matmul bounds."""
+    """Evaluate every FusionScope against VMEM, HBM, and matmul bounds.
+
+    Overflow past the VMEM token ceiling (`n_splits > 1`) is priced two ways:
+    whole_step and layer_group tile tokens inside each layer while that
+    layer's weights stay resident (weights read once per step, plus residual
+    spill and per-tile fill/drain); whole_step_repass and single_layer re-run
+    the call per token pass and re-read weights each pass.
+    """
     layers_local, l_moe = ctx.layers_local, ctx.l_moe
     active_tokens = ctx.active_tokens
     token_residual_bytes = ctx.token_residual_bytes
-    w_static, exp_bytes = ctx.w_static, ctx.exp_bytes
-    experts_local, ep_dp = ctx.experts_local, ctx.ep_dp
-    row_floor, num_ar, ar_hops = (
-        ctx.row_floor,
-        ctx.num_ar,
-        ctx.ar_hops,
-    )
+    ep_dp = ctx.ep_dp
+    num_ar, ar_hops = ctx.num_ar, ctx.ar_hops
     ar_vol, egress_bw, lat_coll = (
         ctx.ar_vol,
         ctx.egress_bw,
@@ -672,6 +710,7 @@ def _evaluate_scopes(
         "single_layer",
         "layer_group",
         "whole_step",
+        "whole_step_repass",
     )
 
     for scope in scopes_order:
@@ -684,23 +723,18 @@ def _evaluate_scopes(
             feasible,
             reason,
         ) = _scope_vmem_and_ops(scope, ctx, profile, workload)
-        w_step, phi = w_static, 1.0
-        t_ep = ceil(active_tokens / max(1, n_splits)) * ep_dp
-        if experts_local > 0:
-            e_hit = max(
-                1.0,
-                experts_local
-                * (1.0 - (1.0 - min(1.0, profile.top_k / profile.num_experts)) ** t_ep),
-            )
-            pairs = max(1.0, t_ep * profile.top_k * experts_local / profile.num_experts)
-            avg_m = max(1.0, pairs / e_hit)
-            w_step = w_static + l_moe * e_hit * exp_bytes
-            is_binned = scope == "per_op" or workload.moe_mode in _GROUPED_MOE_MODES
-            phi = (
-                ceil(avg_m / row_floor) * row_floor / avg_m
-                if is_binned
-                else max(1.0, (ops.rup(t_ep, 16) * e_hit) / pairs)
-            )
+        tiled = scope in ("whole_step", "layer_group") and n_splits > 1
+        tile_tokens = ceil(active_tokens / max(1, n_splits))
+        w_step, phi = _moe_weights_and_padding(
+            ctx,
+            profile,
+            tile_tokens,
+            tiled=tiled,
+            grouped=scope == "per_op" or workload.moe_mode in _GROUPED_MOE_MODES,
+        )
+        if tiled:
+            # Residual of tokens outside the active tile round-trips HBM per layer.
+            act_bytes += 2.0 * layers_local * token_residual_bytes
 
         # Out-of-kernel XLA collectives (per_op) execute 2-phase RS + AG on HBM
         # buffers, whereas in-kernel megakernel collectives push directly VMEM->VMEM.
@@ -728,9 +762,18 @@ def _evaluate_scopes(
         pipeline_fill_drain_s = (n_ops - 1) * (
             first_slot_bytes / bw_hbm + 2.0 * lat_coll
         )
+        if tiled:
+            # Each extra tile restarts the per-layer pipeline: its residual tile
+            # loads before compute starts, plus the begin/end semaphore syncs.
+            tile_residual_bytes = tile_tokens * profile.hidden_size * 2.0
+            pipeline_fill_drain_s += (
+                (n_splits - 1)
+                * layers_local
+                * (tile_residual_bytes / bw_hbm + 2.0 * lat_coll)
+            )
         t_matmul = flops_dense / peak_w + (phi * flops_moe) / peak_e
         act_saved = 4.0 * layers_local * token_residual_bytes - act_bytes
-        hbm_int = n_splits * w_step + eff_state_bytes
+        hbm_int = (1 if tiled else n_splits) * w_step + eff_state_bytes
         d_ops = sub_ops - n_ops
         roof_us = (
             max(t_matmul, (hbm_int + act_bytes) / bw_hbm)
@@ -742,7 +785,7 @@ def _evaluate_scopes(
         )
         pure_us = (
             roof_us + (act_bytes + (n_splits - 1) * w_step) / bw_hbm * 1e6
-            if base_ai >= peak_w / bw_hbm and n_splits > 1
+            if base_ai >= peak_w / bw_hbm and n_splits > 1 and not tiled
             else (
                 max(t_matmul, hbm_int / bw_hbm)
                 + act_bytes / bw_hbm

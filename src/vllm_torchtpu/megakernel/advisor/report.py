@@ -39,8 +39,12 @@ _MOE_MODE_SHORT_HINTS: Mapping[str, str] = {
     "dense_mlp": "Dense feed-forward; no routed experts",
 }
 _SCOPE_HINTS: Mapping[str, str] = {
-    "whole_step": "one call for the whole step; [T, H] stays in VMEM",
-    "layer_group": "one call per group of N layers",
+    "whole_step": "one call for the whole step; [T, H] stays in VMEM, and tokens "
+    "past the VMEM ceiling are tiled inside each layer while its weights stay "
+    "resident",
+    "whole_step_repass": "one call per token pass past the VMEM ceiling; every "
+    "pass re-reads all weights",
+    "layer_group": "one call per group of N layers, tiled like whole_step",
     "single_layer": "one call per layer",
     "per_op": "one call per operator; activations hand off through HBM",
 }
@@ -263,6 +267,7 @@ _SVG_TICKS = (1, 8, 64, 512, 4096, 32768)
 # Okabe-Ito colorblind-safe palette; each scope also has its own marker shape.
 _SCOPE_MARKS: Mapping[str, tuple[str, str]] = {
     "whole_step": ("#009E73", "circle"),
+    "whole_step_repass": ("#D55E00", "triangle"),
     "layer_group": ("#56B4E9", "diamond"),
     "single_layer": ("#E69F00", "diamond"),
     "per_op": ("#CC79A7", "square"),
@@ -285,7 +290,7 @@ def _svg_text(
 
 
 def _svg_marker(shape: str, cx: float, cy: float, color: str, title: str) -> str:
-    """Return a circle, diamond, or square marker with a hover tooltip."""
+    """Return a circle, diamond, square, or triangle marker with a tooltip."""
     r = 6.0
     tip = f"<title>{_esc(title)}</title>"
     common = f'fill="{color}" stroke="#0f172a" stroke-width="1.5"'
@@ -296,6 +301,10 @@ def _svg_marker(shape: str, cx: float, cy: float, color: str, title: str) -> str
             f'<rect x="{cx - r:.1f}" y="{cy - r:.1f}" width="{2 * r}" '
             f'height="{2 * r}" {common}>{tip}</rect>'
         )
+    if shape == "triangle":
+        pts = f"{cx:.1f},{cy - r - 1:.1f} {cx + r + 1:.1f},{cy + r:.1f} "
+        pts += f"{cx - r - 1:.1f},{cy + r:.1f}"
+        return f'<polygon points="{pts}" {common}>{tip}</polygon>'
     pts = f"{cx:.1f},{cy - r - 1:.1f} {cx + r + 1:.1f},{cy:.1f} "
     pts += f"{cx:.1f},{cy + r + 1:.1f} {cx - r - 1:.1f},{cy:.1f}"
     return f'<polygon points="{pts}" {common}>{tip}</polygon>'
@@ -334,6 +343,13 @@ def render_regime_dot_plot_svg(sweep: AdvisorSweepReport) -> str:
     )
     title = "Where each workload lands: tokens per core vs on-chip limits"
     width = max(width, pad + svg_text_width(title, 15) + pad)
+    width = max(
+        width,
+        *(
+            pad + 22 + svg_text_width(f"{n}: {_SCOPE_HINTS[n]}") + pad
+            for n in _SCOPE_MARKS
+        ),
+    )
     top = 30.0 + 18.0 * len(marks) + 8.0
     bottom = top + row_h * len(regimes)
     legend_y = bottom + 58.0
