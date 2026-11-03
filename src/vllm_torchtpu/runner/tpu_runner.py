@@ -516,6 +516,9 @@ def _spec_logprob_row_tokens(
     return out[:num_rows, None]
 
 
+# The input ids reaching async substitution can carry the forward's
+# mark_dynamic stamp, which outranks dynamic=False; strip it before dispatch.
+@_static_shape_args
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
