@@ -27,6 +27,7 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -35,6 +36,7 @@ from vllm.model_executor.models import gemma4
 from vllm.model_executor.models.gemma4 import (
     Gemma4Attention,
     Gemma4DecoderLayer,
+    Gemma4ForCausalLM,
     Gemma4MLP,
     Gemma4Model,
 )
@@ -218,6 +220,11 @@ class _Experts:
         return out
 
 
+def _gelu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    gate, up = gate_up.chunk(2, dim=-1)
+    return F.gelu(gate, approximate="tanh") * up
+
+
 def _causal_mix(q, k, v, num_heads: int, num_kv_heads: int, head_dim: int):
     """Token-mixing stand-in for the attention kernel (a causal prefix mean)."""
     t = q.shape[0]
@@ -293,6 +300,8 @@ class _Model:
             is_kv_shared_layer=False,
             num_heads=heads,
             num_kv_heads=kv_heads,
+            total_num_heads=self.heads,
+            total_num_kv_heads=self.kv_heads,
             head_dim=hd,
             q_size=heads * hd,
             kv_size=kv_heads * hd,
@@ -336,7 +345,7 @@ class _Model:
                 self.method,
                 all_reduce,
             ),
-            act_fn=lambda gu: F.gelu(gu[:, :inter], approximate="tanh") * gu[:, inter:],
+            act_fn=_gelu_and_mul,
         )
         norms = lw["norms"]
         router_norm = norms["router"]
@@ -836,6 +845,572 @@ def test_maybe_patch_waits_for_gemma4(monkeypatch: pytest.MonkeyPatch) -> None:
         assert Gemma4Model.__init__ is gemma4_patch._patched_model_init
         assert Gemma4Model.forward is gemma4_patch._patched_model_forward
         assert gemma4_patch._microbatches == 2
+    finally:
+        for (cls, name), value in saved.items():
+            setattr(cls, name, value)
+
+
+# ---------------------------------------------------------------------------
+# Context parallelism
+# ---------------------------------------------------------------------------
+
+
+class _GqaModel(_Model):
+    kv_heads = 4
+
+
+def _zigzag_plan(world: int, num_tokens: int, page_size: int = 2) -> Any:
+    return gemma4_patch.cp_prefill.make_zigzag_plan(num_tokens, world, page_size)
+
+
+@pytest.mark.parametrize("world", [3, 4, 8])
+def test_zigzag_rows_round_trip(world: int) -> None:
+    plan = _zigzag_plan(world, 4 * world * 2)
+    tokens = torch.arange(plan.num_tokens)
+    rank_major = gemma4_patch._rank_major(tokens, plan)
+    size = plan.piece_tokens
+    for rank in range(world):
+        rows = gemma4_patch._rank_rows(tokens, plan, rank)
+        assert torch.equal(rank_major.view(world, -1)[rank], rows)
+        first, second = plan.rank_pieces(rank)
+        assert rows.tolist() == [
+            *range(first * size, (first + 1) * size),
+            *range(second * size, (second + 1) * size),
+        ]
+    assert torch.equal(gemma4_patch._token_order(rank_major, plan), tokens)
+
+
+@pytest.fixture(autouse=True)
+def _eager_vocab_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """vLLM compiles get_masked_input_and_mask for its platform; the TPU
+    platform installs an eager one, which this stands in for."""
+
+    def masked(ids, start, end, padding, added_start, added_end):
+        in_shard = (ids >= start) & (ids < end)
+        in_added = (ids >= added_start) & (ids < added_end)
+        offset = start * in_shard + (added_start - (end - start) - padding) * in_added
+        keep = in_shard | in_added
+        return keep * (ids - offset), ~keep
+
+    monkeypatch.setattr(
+        gemma4_patch.vocab_parallel_embedding, "get_masked_input_and_mask", masked
+    )
+
+
+def _rows(plan: Any, rank: int) -> torch.Tensor:
+    return gemma4_patch._rank_rows(torch.arange(plan.num_tokens), plan, rank)
+
+
+def _vocab_shard(embedding: torch.Tensor, rank: int, world: int) -> SimpleNamespace:
+    """A VocabParallelEmbedding shard: rows [rank * V/world, (rank + 1) * V/world)."""
+    vocab = embedding.shape[0]
+    start, end = rank * vocab // world, (rank + 1) * vocab // world
+    return SimpleNamespace(
+        weight=embedding[start:end],
+        shard_indices=SimpleNamespace(
+            org_vocab_start_index=start,
+            org_vocab_end_index=end,
+            num_org_vocab_padding=0,
+            added_vocab_start_index=vocab,
+            added_vocab_end_index=vocab,
+        ),
+        quant_method=SimpleNamespace(embedding=lambda layer, ids: layer.weight[ids]),
+    )
+
+
+def test_vocab_shard_embedding_reads_registered_bounds() -> None:
+    """Shard bounds come from the TPU platform's buffers where it registers them."""
+    embedding = torch.randn(16, 4)
+    shard = _vocab_shard(embedding, 1, 4)  # ints say rows [4, 8)
+    ids = torch.tensor([0, 5, 9, 15])
+    torch.testing.assert_close(
+        gemma4_patch._vocab_shard_embedding(shard, ids),
+        torch.stack(
+            [embedding[0] * 0, embedding[5], embedding[0] * 0, embedding[0] * 0]
+        ),
+    )
+    shard.org_vocab_start_index = torch.tensor(8)  # buffers say rows [8, 12)
+    shard.org_vocab_end_index = torch.tensor(12)
+    shard.weight = embedding[8:12]
+    torch.testing.assert_close(
+        gemma4_patch._vocab_shard_embedding(shard, ids),
+        torch.stack(
+            [embedding[0] * 0, embedding[0] * 0, embedding[9], embedding[0] * 0]
+        ),
+    )
+
+
+class _AllExperts:
+    """Every expert of _Experts' layout on one rank, nothing reduced."""
+
+    def __init__(self, weights: list[torch.Tensor]) -> None:
+        self.weights = weights
+
+    def __call__(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        gates = torch.softmax(router_logits, dim=-1)
+        return sum(
+            gates[:, e : e + 1] * (hidden_states @ w)
+            for e, w in enumerate(self.weights)
+        )
+
+
+def _replica(model: _Model, index: int) -> SimpleNamespace:
+    """The projections of one layer, whole, as Gemma4ProjectionReplica holds them."""
+    lw = model.layer_weights[index]
+
+    def linear(weight: torch.Tensor) -> _Linear:
+        return _Linear(weight, 1, model.method)
+
+    return SimpleNamespace(
+        self_attn=SimpleNamespace(
+            qkv_proj=linear(torch.cat([lw["q"], lw["k"], lw["v"]], dim=1)),
+            o_proj=linear(lw["o"]),
+        ),
+        mlp=SimpleNamespace(
+            gate_up_proj=linear(torch.cat([lw["gate"], lw["up"]], dim=1)),
+            down_proj=linear(lw["down"]),
+        ),
+        experts=_AllExperts(lw["experts"]) if model.moe else None,
+    )
+
+
+def _cp_attention_reference(mock: _TPCollectiveMock, model: _Model, plan: Any):
+    """_causal_mix over the whole prompt, for one rank's zigzag rows."""
+    num_tokens = plan.num_tokens
+    heads, kv_heads, hd = model.heads, model.kv_heads, model.head_dim
+
+    def attention(attn, q, k, v, plan, rank):
+        kv = gemma4_patch._token_order(mock.all_gather(k + v), plan)
+        kv = kv.view(num_tokens, kv_heads, hd).repeat_interleave(heads // kv_heads, 1)
+        prefix = kv.cumsum(0) / torch.arange(1, num_tokens + 1).view(-1, 1, 1)
+        rows = _rows(plan, int(rank[0]))
+        return (q.view(-1, heads, hd) * prefix[rows]).flatten(1)
+
+    return attention
+
+
+@pytest.mark.parametrize("world", [3, 4])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_context_parallel_forward_matches_tp(mock_collectives, world, fp8) -> None:
+    """Zigzag rows through whole projections == upstream's TP forward, by token."""
+    num_layers, normalizer = 2, torch.tensor(2.0)
+    mock = mock_collectives(world)
+    model = _GqaModel(1, moe=False, fp8=fp8, num_layers=num_layers)
+    plan = _zigzag_plan(world, 2 * world * 4)
+    num_tokens = plan.num_tokens
+    input_ids = torch.randint(0, model.embedding.shape[0], (num_tokens,))
+    positions = torch.arange(num_tokens)
+
+    def reference() -> torch.Tensor:
+        x = model.embedding[input_ids] * normalizer
+        for i in range(num_layers):
+            layer = model.layer(i, 0, lambda t: t)
+            x, _ = _UPSTREAM_LAYER_FORWARD(layer, positions, x, None)
+        return model.final_norm(x)
+
+    attention = _cp_attention_reference(mock, model, plan)
+
+    def rank_fn(rank: int) -> torch.Tensor:
+        fake = SimpleNamespace(
+            embed_tokens=_vocab_shard(model.embedding, rank, world),
+            normalizer=normalizer,
+            layers=[model.layer(i, 0, lambda t: t) for i in range(num_layers)],
+            cp_replica=SimpleNamespace(
+                layers=[_replica(model, i) for i in range(num_layers)]
+            ),
+            norm=model.final_norm,
+        )
+        return gemma4_patch._context_parallel_forward(
+            fake,
+            input_ids,
+            positions,
+            plan,
+            torch.tensor([rank]),
+            _rows(plan, rank),
+            attention,
+        )
+
+    expected = reference()
+    for out in _run_ranks(world, rank_fn):
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+    # One embedding scatter of every row, then only the K/V gathers until the
+    # final gather of every rank's rows.
+    rows = num_tokens // world
+    assert [c[2] for c in mock.calls] == [
+        (num_tokens, model.hidden),
+        *[(rows, model.kv_heads * model.head_dim)] * num_layers,
+        (rows, model.hidden),
+    ]
+
+
+def test_context_parallel_moe_forward_matches_tp(mock_collectives) -> None:
+    """MoE layers: dense MLP and every expert local == upstream's TP forward,
+    whose ranks each hold one expert and all-reduce."""
+    world, num_layers, normalizer = 4, 2, torch.tensor(2.0)
+    mock = mock_collectives(world)
+    model = _GqaModel(world, moe=True, fp8=False, num_layers=num_layers)
+    plan = _zigzag_plan(world, 2 * world * 4)
+    input_ids = torch.randint(0, model.embedding.shape[0], (plan.num_tokens,))
+    positions = torch.arange(plan.num_tokens)
+
+    def tp_rank(rank: int) -> torch.Tensor:
+        x = model.embedding[input_ids] * normalizer
+        for i in range(num_layers):
+            layer = model.layer(i, rank, mock.all_reduce)
+            x, _ = _UPSTREAM_LAYER_FORWARD(layer, positions, x, None)
+        return model.final_norm(x)
+
+    expected = _run_ranks(world, tp_rank)[0]
+    attention = _cp_attention_reference(mock, model, plan)
+
+    def cp_rank(rank: int) -> torch.Tensor:
+        fake = SimpleNamespace(
+            embed_tokens=_vocab_shard(model.embedding, rank, world),
+            normalizer=normalizer,
+            layers=[model.layer(i, rank, mock.all_reduce) for i in range(num_layers)],
+            cp_replica=SimpleNamespace(
+                layers=[_replica(model, i) for i in range(num_layers)]
+            ),
+            norm=model.final_norm,
+        )
+        return gemma4_patch._context_parallel_forward(
+            fake,
+            input_ids,
+            positions,
+            plan,
+            torch.tensor([rank]),
+            _rows(plan, rank),
+            attention,
+        )
+
+    for out in _run_ranks(world, cp_rank):
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def _rank_scaled_query(attn, q, k, v, plan, rank):
+    """An attention stand-in that reads the rank tensor, as the real op does."""
+    return q * rank.to(q.dtype)
+
+
+def _trace_context_parallel_forward(monkeypatch, rank: int) -> Any:
+    """Dynamo's graph of `_context_parallel_forward` on rank ``rank`` of 4, with
+    collectives and attention that are the same on every rank and the vocab
+    shard bounds as the TPU platform's buffers."""
+    world = 4
+    model = _GqaModel(1, moe=False, fp8=True, num_layers=2)
+    plan = _zigzag_plan(world, 2 * world * 4)
+    monkeypatch.setattr(
+        gemma4_patch, "_reduce_scatter_rows", lambda x: x[: x.shape[0] // world] * 1
+    )
+    monkeypatch.setattr(gemma4_patch, "_all_gather_rows", lambda x: x.repeat(world, 1))
+    embed = _vocab_shard(model.embedding, rank, world)
+    for name in ("org_vocab_start_index", "org_vocab_end_index"):
+        setattr(embed, name, torch.tensor(getattr(embed.shard_indices, name)))
+    fake = SimpleNamespace(
+        embed_tokens=embed,
+        normalizer=torch.tensor(2.0),
+        layers=[model.layer(i, 0, lambda t: t) for i in range(2)],
+        cp_replica=SimpleNamespace(layers=[_replica(model, i) for i in range(2)]),
+        norm=model.final_norm,
+    )
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    class Program(torch.nn.Module):
+        """The rank and its rows as Gemma4ContextParallelProgram holds them."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer(
+                "rank", torch.tensor([rank], dtype=torch.int32), persistent=False
+            )
+            self.register_buffer("rows", _rows(plan, rank), persistent=False)
+
+        def forward(self, ids: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+            return gemma4_patch._context_parallel_forward(
+                fake, ids, pos, plan, self.rank, self.rows, _rank_scaled_query
+            )
+
+    program = Program()
+    ids = torch.randint(0, model.embedding.shape[0], (plan.num_tokens,))
+    pos = torch.arange(plan.num_tokens)
+    torch._dynamo.mark_dynamic(ids, 0)
+    torch._dynamo.mark_dynamic(pos, 0)
+    torch._dynamo.reset()
+    # As TorchCompileWithNoGuardsWrapper compiles a vLLM module's forward.
+    out = torch.compile(program.forward, backend=backend, fullgraph=True)(ids, pos)
+    assert out.shape == (plan.num_tokens, model.hidden)
+    return graphs[0], plan.num_tokens
+
+
+def test_context_parallel_trace_keeps_the_bucket_symbolic(monkeypatch) -> None:
+    """Only the token slices touch the token dimension: no specialization, and
+    the trace refuses smaller buckets, as shape_variants reads its guards."""
+    graph, num_tokens = _trace_context_parallel_forward(monkeypatch, 1)
+    shape_env = shape_variants.trace_shape_env(graph)
+    assert shape_env is not None and shape_env.var_to_range
+    assert shape_variants.unsupported_reason(shape_env, num_tokens) is None
+    assert shape_variants.unsupported_reason(shape_env, num_tokens // 2) is not None
+
+
+def test_context_parallel_trace_is_the_same_on_every_rank(monkeypatch) -> None:
+    """The rank reaches the program only through the module's buffers, which
+    Dynamo lifts to inputs (collectives compiled into the program assume every
+    rank runs the same one)."""
+    graphs = [_trace_context_parallel_forward(monkeypatch, r)[0] for r in (0, 1, 3)]
+    assert graphs[0].code == graphs[1].code == graphs[2].code
+    placeholders = [n.name for n in graphs[0].graph.nodes if n.op == "placeholder"]
+    assert any("buffers_rank" in n for n in placeholders), placeholders
+    assert any("buffers_rows" in n for n in placeholders), placeholders
+
+
+def _cp_config(**overrides: Any) -> SimpleNamespace:
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            tensor_parallel_size=8,
+            enable_ep_weight_filter=False,
+            enable_eplb=False,
+        ),
+        lora_config=None,
+        speculative_config=None,
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        compilation_config=SimpleNamespace(
+            compile_sizes=[16, 256, 4096, 16384, 32768, 65536, 81920]
+        ),
+    )
+    for key, value in overrides.items():
+        obj = config
+        *path, attr = key.split(".")
+        for name in path:
+            obj = getattr(obj, name)
+        setattr(obj, attr, value)
+    return config
+
+
+def _cp_model(**overrides: Any) -> SimpleNamespace:
+    layer = SimpleNamespace(
+        enable_moe_block=False,
+        per_layer_input_gate=None,
+        self_attn=SimpleNamespace(
+            is_kv_shared_layer=False, o_proj=SimpleNamespace(bias=None)
+        ),
+    )
+    model = SimpleNamespace(fast_prefill_enabled=False, layers=[layer])
+    for key, value in overrides.items():
+        obj = model
+        *path, attr = key.split(".")
+        for name in path:
+            obj = obj.layers[0] if name == "layer" else getattr(obj, name)
+        setattr(obj, attr, value)
+    return model
+
+
+@pytest.fixture
+def cp_envs(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(gemma4_patch, "_cp_min_tokens", 32768)
+    monkeypatch.setattr(envs, "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", 16384)
+    monkeypatch.setattr(envs, "TPU_PRECOMPILE_PEER_REPLAY", False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MOST_MODEL_LEN", None)
+    return monkeypatch
+
+
+@pytest.mark.parametrize(
+    ("solo", "cp_min", "ok"),
+    [
+        (16384, 32768, True),
+        (10000, 20000, True),  # bucket 16384 < 20000 <= 32768
+        (16384, 16384, False),  # a regular step's bucket would run CP
+        (16384, 65536, False),  # solo steps padded to 32768 would not
+        (0, 32768, False),  # no solo-prefill scheduler
+        (81920, 100000, False),  # nothing above the solo bucket
+    ],
+)
+def test_check_context_parallel_bucket_rule(cp_envs, solo, cp_min, ok) -> None:
+    cp_envs.setattr(envs, "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", solo)
+    cp_envs.setattr(gemma4_patch, "_cp_min_tokens", cp_min)
+    if ok:
+        gemma4_patch._check_context_parallel(_cp_model(), _cp_config())
+    else:
+        with pytest.raises(ValueError, match="VLLM_TPU_SOLO_PREFILL_OVER_TOKENS"):
+            gemma4_patch._check_context_parallel(_cp_model(), _cp_config())
+
+
+@pytest.mark.parametrize(
+    ("model", "config", "env", "match"),
+    [
+        ({}, {"parallel_config.pipeline_parallel_size": 2}, {}, "PP"),
+        ({}, {"parallel_config.data_parallel_size": 2}, {}, "DP"),
+        ({}, {"lora_config": object()}, {}, "LoRA"),
+        ({}, {"speculative_config": object()}, {}, "speculative"),
+        ({}, {"cache_config.enable_prefix_caching": True}, {}, "prefix caching"),
+        ({"fast_prefill_enabled": True}, {}, {}, "kv_sharing_fast_prefill"),
+        ({}, {}, {"TPU_PRECOMPILE_PEER_REPLAY": True}, "PEER_REPLAY"),
+        ({}, {}, {"VLLM_TPU_MOST_MODEL_LEN": 4096}, "MOST_MODEL_LEN"),
+        ({"layer.self_attn.is_kv_shared_layer": True}, {}, {}, "KV sharing"),
+        ({"layer.per_layer_input_gate": object()}, {}, {}, "per-layer"),
+        ({"layer.self_attn.o_proj.bias": object()}, {}, {}, "biases"),
+        ({}, {"parallel_config.tensor_parallel_size": 2}, {}, "TP >= 3"),
+        (
+            {"layer.enable_moe_block": True},
+            {"parallel_config.enable_ep_weight_filter": True},
+            {},
+            "EP weight filter",
+        ),
+        (
+            {"layer.enable_moe_block": True},
+            {"parallel_config.enable_eplb": True},
+            {},
+            "EPLB",
+        ),
+    ],
+)
+def test_check_context_parallel_refuses(cp_envs, model, config, env, match) -> None:
+    for name, value in env.items():
+        cp_envs.setattr(envs, name, value)
+    with pytest.raises(ValueError, match=match):
+        gemma4_patch._check_context_parallel(_cp_model(**model), _cp_config(**config))
+
+
+def test_check_solo_prompt(monkeypatch) -> None:
+    def with_layout(query_start_loc, seq_lens) -> None:
+        context = SimpleNamespace(
+            query_start_loc_cpu=query_start_loc, seq_lens_cpu=seq_lens
+        )
+        monkeypatch.setattr(
+            gemma4_patch, "get_vllm_model_wrapper_context", lambda: context
+        )
+        gemma4_patch._check_solo_prompt(32768)
+
+    with_layout(None, None)  # warmup
+    with_layout(np.array([0, 20000]), np.array([20000]))
+    with pytest.raises(RuntimeError, match="one prompt"):
+        with_layout(np.array([0, 20000, 20001]), np.array([20000, 70]))
+    with pytest.raises(RuntimeError, match="cached"):
+        with_layout(np.array([0, 20000]), np.array([20512]))
+
+
+def test_load_weights_tees_the_projections(monkeypatch) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(
+        gemma4_patch,
+        "_orig_model_load_weights",
+        lambda self, weights: {name for name, _ in weights if not seen.append(name)},
+    )
+    names = [
+        "embed_tokens.weight",
+        "layers.0.self_attn.q_proj.weight",
+        "layers.0.self_attn.k_proj.weight_scale",
+        "layers.0.self_attn.k_norm.weight",
+        "layers.0.self_attn.o_proj.weight",
+        "layers.10.mlp.gate_proj.weight",
+        "layers.10.mlp.down_proj.weight_scale",
+        "layers.10.input_layernorm.weight",
+        "layers.3.experts.7.gate_proj.weight",
+        "layers.3.experts.7.down_proj.weight_scale",
+        "layers.3.router.proj.weight",
+        "layers.3.router.per_expert_scale",
+        "norm.weight",
+    ]
+    weights = [(name, torch.zeros(1)) for name in names]
+    model = torch.nn.Module()
+    gemma4_patch._patched_model_load_weights(model, weights)
+    assert seen == names  # no replica, nothing added
+    seen.clear()
+    model.cp_replica = torch.nn.Module()
+    gemma4_patch._patched_model_load_weights(model, weights)
+    expected = []
+    for name in names:
+        expected.append(name)
+        if "_proj." in name and ".router." not in name:
+            expected.append(f"cp_replica.{name}")
+    assert seen == expected
+
+
+def test_replica_layer_builds_upstreams_experts_unsharded(monkeypatch) -> None:
+    """A MoE layer's replica: upstream's FusedMoEFactory arguments, tp=dp=1."""
+
+    class _Recorded(torch.nn.Module):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__()
+            self.args, self.kwargs = args, kwargs
+
+    for name in (
+        "QKVParallelLinear",
+        "RowParallelLinear",
+        "MergedColumnParallelLinear",
+        "FusedMoEFactory",
+    ):
+        monkeypatch.setattr(gemma4_patch, name, _Recorded)
+    router = SimpleNamespace(routing_function=object())
+    layer = SimpleNamespace(
+        hidden_size=32,
+        enable_moe_block=True,
+        router=router,
+        self_attn=SimpleNamespace(
+            hidden_size=32, head_dim=8, total_num_heads=8, total_num_kv_heads=4
+        ),
+        mlp=SimpleNamespace(down_proj=SimpleNamespace(input_size=64)),
+    )
+    config = SimpleNamespace(
+        num_experts=16, top_k_experts=4, hidden_size=32, moe_intermediate_size=48
+    )
+    replica = gemma4_patch._ReplicaLayer(
+        layer, config, "qc", "model.cp_replica.layers.3"
+    )
+    assert replica.experts.kwargs == dict(
+        num_experts=16,
+        top_k=4,
+        hidden_size=32,
+        intermediate_size=48,
+        renormalize=True,
+        quant_config="qc",
+        tp_size=1,
+        dp_size=1,
+        prefix="model.cp_replica.layers.3.experts",
+        custom_routing_function=router.routing_function,
+        activation="gelu_tanh",
+    )
+    assert replica.self_attn.qkv_proj.kwargs["disable_tp"] is True
+    assert replica.mlp.down_proj.args == (64, 32)
+    layer.enable_moe_block = False
+    assert not hasattr(gemma4_patch._ReplicaLayer(layer, config, "qc", "p"), "experts")
+
+
+def test_maybe_patch_context_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(envs, "TPU_GEMMA4_CP_MIN_TOKENS", 0)
+    assert gemma4_patch.maybe_patch_gemma4_context_parallel(None) is None
+    monkeypatch.setattr(envs, "TPU_GEMMA4_CP_MIN_TOKENS", 32768)
+    assert gemma4_patch.maybe_patch_gemma4_context_parallel(None) is False
+    text = SimpleNamespace(model_type="gemma4_text")
+    multimodal = SimpleNamespace(
+        hf_text_config=text, architecture="Gemma4ForConditionalGeneration"
+    )
+    with pytest.raises(ValueError, match="Gemma4ForCausalLM"):
+        gemma4_patch.maybe_patch_gemma4_context_parallel(multimodal)
+
+    saved = {
+        (cls, name): cls.__dict__[name]
+        for cls, name in (
+            (Gemma4ForCausalLM, "__init__"),
+            (Gemma4ForCausalLM, "forward"),
+            (Gemma4Model, "load_weights"),
+        )
+    }
+    monkeypatch.setattr(gemma4_patch, "_cp_min_tokens", 0)
+    causal_lm = SimpleNamespace(hf_text_config=text, architecture="Gemma4ForCausalLM")
+    try:
+        assert gemma4_patch.maybe_patch_gemma4_context_parallel(causal_lm) is None
+        assert gemma4_patch._cp_min_tokens == 32768
+        assert Gemma4ForCausalLM.__init__ is gemma4_patch._patched_causal_lm_init
+        assert Gemma4ForCausalLM.forward is gemma4_patch._patched_causal_lm_forward
+        assert Gemma4Model.load_weights is gemma4_patch._patched_model_load_weights
     finally:
         for (cls, name), value in saved.items():
             setattr(cls, name, value)
