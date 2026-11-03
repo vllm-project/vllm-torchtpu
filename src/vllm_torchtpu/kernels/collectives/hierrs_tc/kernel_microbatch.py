@@ -13,10 +13,11 @@
 # limitations under the License.
 """Pallas body of the micro-batched hierarchical reduce-scatter."""
 
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.collectives.hierrs_tc.config import Config
+from vllm_torchtpu.kernels.collectives.hierrs_tc.config import SCALE_LANE, Config
 from vllm_torchtpu.kernels.collectives.hierrs_tc.dma_pipeline import (
     DmaManager,
 )
@@ -28,20 +29,61 @@ def hier_rs_kernel(
     output_ref,
     running_sum_ref,
     recv_buf_ref,
-    # Separate from recv_buf_ref so a neighbour's phase-2 chunk cannot land on
-    # phase-1 data this device has not consumed yet.
-    phase2_landing_ref,
-    recv_bref,
-    run_bref,
-    out_bref,
-    phase1_send_sems,
-    phase1_recv_sems,
-    phase2_send_sems,
-    phase2_recv_sems,
-    *,
+    *args,
     config: Config,
     axis_name: str = "x",
+    fp8_comm: bool = False,
+    fp8_static_scale: float | None = None,
 ):
+    if fp8_comm:
+        (
+            fp8_send_ref,
+            fp8_recv_ref,
+            scale_send_ref,
+            scale_recv_ref,
+            recv_bref,
+            run_bref,
+            out_bref,
+            phase1_send_sems,
+            phase1_recv_sems,
+            phase2_send_sems,
+            phase2_recv_sems,
+            scale_p2_send_sems,
+            scale_p2_recv_sems,
+            fp8_send_bref,
+            scale_send_bref,
+            fp8_recv_bref,
+            scale_bref,
+        ) = args
+        fp8_dma_refs = dict(
+            fp8_send_buf=fp8_send_ref,
+            fp8_recv_buf=fp8_recv_ref,
+            scale_send_buf=scale_send_ref,
+            scale_recv_buf=scale_recv_ref,
+            scale_p2_send_sems=scale_p2_send_sems,
+            scale_p2_recv_sems=scale_p2_recv_sems,
+            fp8_send_bref=fp8_send_bref,
+            scale_send_bref=scale_send_bref,
+            fp8_recv_bref=fp8_recv_bref,
+            scale_bref=scale_bref,
+        )
+        # The FP8 copies land in fp8_recv_ref and never use this.
+        phase2_landing_ref = recv_buf_ref
+    else:
+        (
+            # Separate from recv_buf_ref so a neighbour's phase-2 chunk cannot
+            # land on phase-1 data this device has not consumed yet.
+            phase2_landing_ref,
+            recv_bref,
+            run_bref,
+            out_bref,
+            phase1_send_sems,
+            phase1_recv_sems,
+            phase2_send_sems,
+            phase2_recv_sems,
+        ) = args
+        fp8_dma_refs = {}
+
     topo = Topology(axis_name)
     locator = ChunkLocator(config, topo)
     dma = DmaManager(
@@ -55,6 +97,8 @@ def hier_rs_kernel(
         phase1_recv_sems,
         phase2_send_sems,
         phase2_recv_sems,
+        **fp8_dma_refs,
+        fp8_static_scale=fp8_static_scale,
     )
     num_mb = config.num_micro_batches
     phase1_ops = []
@@ -79,14 +123,29 @@ def hier_rs_kernel(
         )
 
     def start_phase2(mb, step):
-        phase2_ops.extend(
-            dma.start_phase2_c2c_copies(
-                mb_idx=mb, step_idx=step, src=running_sum_ref, dst=phase2_landing_ref
-            )
+        if fp8_comm:
+            dma.quantize_chunks_to_fp8_staging(running_sum_ref, mb, step_idx=step)
+        copies = dma.start_phase2_c2c_copies(
+            mb_idx=mb,
+            step_idx=step,
+            src=running_sum_ref,
+            dst=phase2_landing_ref,
+            fp8=fp8_comm,
         )
+        phase2_ops.extend(data for data, _ in copies)
+        phase2_ops.extend(scale for _, scale in copies if scale is not None)
 
     def accumulate_phase2(mb, step):
         is_last_step = step == config.num_hcube_dims - 1
+        if fp8_comm:
+            dma.run_phase2_dequant_accumulate_pipeline(
+                running_sum_ref,
+                output_ref,
+                mb,
+                step_idx=step,
+                is_last_step=is_last_step,
+            )
+            return
         dma.run_phase2_accumulate_pipeline(
             src1=phase2_landing_ref,
             src2=running_sum_ref,
@@ -132,6 +191,7 @@ def make_unified_scratch_shapes(
     num_chips,
     num_hcube_dims,
     num_micro_batches,
+    fp8_comm: bool = False,
 ):
     block_spec = pl.BlockSpec(
         block_shape=(seq_chunk_size, mb_size), index_map=lambda *args: (0, 0)
@@ -156,5 +216,23 @@ def make_unified_scratch_shapes(
         pltpu.SemaphoreType.DMA(p2_sem_shape),
         pltpu.SemaphoreType.DMA(p2_sem_shape),
     ]
+    if fp8_comm:
+        fp8_block_spec = pl.BlockSpec(
+            block_shape=(seq_chunk_size, mb_size), index_map=lambda *a: (0, 0)
+        )
+        scale_block_spec = pl.BlockSpec(
+            block_shape=(1, SCALE_LANE), index_map=lambda *a: (0, 0)
+        )
+        fp8 = jnp.float8_e4m3fn
+        # The FP8 data copies reuse the phase-2 semaphores; only the scale
+        # copies need their own.
+        scratch_shapes += [
+            pltpu.SemaphoreType.DMA(p2_sem_shape),
+            pltpu.SemaphoreType.DMA(p2_sem_shape),
+            pltpu.BufferedRef.output(fp8_block_spec, fp8, buffer_count=2),
+            pltpu.BufferedRef.output(scale_block_spec, jnp.float32, buffer_count=2),
+            pltpu.BufferedRef.input(fp8_block_spec, fp8, buffer_count=2),
+            pltpu.BufferedRef.input(scale_block_spec, jnp.float32, buffer_count=2),
+        ]
     # In hier_rs_kernel's parameter order.
     return scratch_shapes

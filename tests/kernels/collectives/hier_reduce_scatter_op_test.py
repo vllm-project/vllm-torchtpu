@@ -31,15 +31,18 @@ def _snr_db(ref: np.ndarray, got: np.ndarray) -> float:
 @pytest.mark.multichip
 @pytest.mark.parametrize("order", [tuple(range(8)), _TPU7X_RANK_AT_MESH_INDEX])
 @pytest.mark.parametrize(
-    "stream, stream_min_bytes",
+    "fp8_comm, fp8_static_scale, stream, min_snr_db",
     [
-        pytest.param(False, 0, id="micro_batched"),
-        pytest.param(True, 0, id="row_streaming"),
+        pytest.param(False, None, False, 40.0, id="bf16_micro_batched"),
+        pytest.param(False, None, True, 40.0, id="bf16_row_streaming"),
+        pytest.param(True, 16.0, False, 30.0, id="fp8_micro_batched"),
+        pytest.param(True, None, False, 28.0, id="fp8_dynamic_micro_batched"),
+        pytest.param(True, 16.0, True, 30.0, id="fp8_row_streaming"),
     ],
 )
 @pytest.mark.parametrize("rows_per_rank", [1024, 2048, 4096, 8192, 16384])
 def test_matches_rank_ordered_reduce_scatter(
-    order, stream, stream_min_bytes, rows_per_rank
+    order, fp8_comm, fp8_static_scale, stream, min_snr_db, rows_per_rank
 ):
     import jax
     import jax.numpy as jnp
@@ -54,8 +57,11 @@ def test_matches_rank_ordered_reduce_scatter(
         mesh,
         order,
         axis_name="d",
+        fp8_comm=fp8_comm,
+        fp8_static_scale=fp8_static_scale,
+        fp8_min_bytes=0,
         stream=stream,
-        stream_min_bytes=stream_min_bytes,
+        stream_min_bytes=0,
     )
 
     hidden, n = 4096, 8
@@ -77,7 +83,7 @@ def test_matches_rank_ordered_reduce_scatter(
         [summed[r * block : (r + 1) * block] for r in order], axis=0
     )
     snr = _snr_db(expected, out)
-    assert snr > 40.0, f"SNR {snr:.1f} dB <= 40 dB"
+    assert snr > min_snr_db, f"SNR {snr:.1f} dB <= {min_snr_db} dB"
     for i, r in enumerate(order):
         got = out[i * block : (i + 1) * block]
         errs = [
