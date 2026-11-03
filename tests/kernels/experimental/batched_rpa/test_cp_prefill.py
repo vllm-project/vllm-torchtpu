@@ -530,7 +530,12 @@ def test_sliding_layers_cache_the_decode_window(monkeypatch, layout):
 
 @pytest.mark.parametrize(
     "heads,head_dim,window,fp8_compute",
-    [((32, 4), 512, None, True), ((32, 16), 256, 1024, False)],
+    [
+        ((32, 4), 512, None, True),
+        # Gemma4-26B full attention: every rank's 16 query / 2 KV heads.
+        ((16, 2), 512, None, True),
+        ((32, 16), 256, 1024, False),
+    ],
 )
 def test_cp_prefill_attention_lowers_for_tpu7x(heads, head_dim, window, fp8_compute):
     plan = cp_prefill.make_zigzag_plan(16 * 4 * PAGE, world=8, page_size=PAGE)

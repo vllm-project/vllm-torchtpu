@@ -201,6 +201,13 @@ def _layer_config(
             "are not whole fp8 packing groups."
         )
     sliding = impl.sliding_window is not None
+    # The layer runs every head here, so its own head ratio can admit fp8 QK/PV
+    # where the tensor-parallel shard's does not.
+    fp8_compute = impl.fp8_compute or (
+        envs.TPU_FP8_ATTENTION
+        and envs.TPU_CP_FP8_ATTENTION
+        and impl._fp8_compute_supported(num_heads, num_kv_heads)
+    )
     cfg = cp_prefill.LayerConfig(
         world=world,
         num_heads=num_heads,
@@ -211,7 +218,7 @@ def _layer_config(
         soft_cap=impl.logits_soft_cap,
         k_scale=attn._k_scale_float,
         v_scale=attn._v_scale_float,
-        fp8_compute=impl.fp8_compute,
+        fp8_compute=fp8_compute,
         kv_layout=impl.kv_layout,
         sliding_prefill_max_bkv=(
             envs.TPU_RPA_SLIDING_PREFILL_MAX_BKV if sliding else None

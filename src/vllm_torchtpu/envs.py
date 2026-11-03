@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     TPU_GEMMA4_FUSED_NORM_QUANT: bool = False
     TPU_GEMMA4_CP_MIN_TOKENS: int = 0
     TPU_CP_KV_WRITE_KERNEL: bool = False
+    TPU_CP_FP8_ATTENTION: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -523,6 +524,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the packed slot axis (SEQ_ALONG_LANE caches: one KV head per rank).
     # Same bytes.
     "TPU_CP_KV_WRITE_KERNEL": env_bool("TPU_CP_KV_WRITE_KERNEL", default=False),
+    # With TPU_FP8_ATTENTION, context-parallel prefill: a layer whose query heads
+    # per KV head, counted over all ranks, are whole fp8 packing groups runs fp8
+    # QK^T and PV (`ragged_paged_attention(fp8_compute=True)`) even where its
+    # tensor-parallel shard's ratio does not qualify (Gemma4-26B full attention
+    # at TP8).
+    "TPU_CP_FP8_ATTENTION": env_bool("TPU_CP_FP8_ATTENTION", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and

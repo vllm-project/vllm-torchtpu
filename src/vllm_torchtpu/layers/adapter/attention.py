@@ -2068,8 +2068,12 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         self._kernel_config_cache[config_key] = qkv_kernel_impl
         return qkv_kernel_impl
 
-    def _fp8_compute_supported(self) -> bool:
-        """Whether `ragged_paged_attention(fp8_compute=True)` can run this layer.
+    def _fp8_compute_supported(
+        self, num_heads: int | None = None, num_kv_heads: int | None = None
+    ) -> bool:
+        """Whether `ragged_paged_attention(fp8_compute=True)` can run this layer,
+        on its own heads or on `num_heads` / `num_kv_heads` (all ranks' heads,
+        as a context-parallel prefill runs it).
 
         It needs a chip whose MXU runs fp8 faster than bf16, an e4m3 KV cache
         (queries and probabilities are cast to it) and query heads per KV head
@@ -2079,10 +2083,14 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         if self.kv_cache_quantized_dtype != torch.float8_e4m3fn:
             return False
         packing = get_dtype_packing(self.kv_cache_quantized_dtype)
+        if (num_heads is None) != (num_kv_heads is None):
+            raise ValueError("Pass both head counts or neither.")
+        if num_heads is None or num_kv_heads is None:
+            num_heads, num_kv_heads = self.num_heads, self.num_kv_heads
         return (
             chip.fp8_ops_per_second > chip.bf16_ops_per_second
             and self.head_size != 64
-            and (self.num_heads // self.num_kv_heads) % packing == 0
+            and (num_heads // num_kv_heads) % packing == 0
             and self.sinks is None
         )
 
