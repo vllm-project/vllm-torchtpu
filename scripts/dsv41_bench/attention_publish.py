@@ -120,7 +120,13 @@ def prepare(
         )
         candidate_ns["indexer_fp8"] = SimpleNamespace(_write_op=candidate_op)
         extract(BASE / "indexer_cache.py", ["PackedFP8IndexCacheRows"], candidate_ns)
-        candidate_index = candidate_ns["PackedFP8IndexCacheRows"]
+        # Preserve the actual caller's isinstance guard. Only the unchanged
+        # write method uses a namespace pointing at the experimental bridge.
+        candidate_index = type(
+            "CandidatePackedFP8IndexCacheRows",
+            (ns["PackedFP8IndexCacheRows"],),
+            {"write": candidate_ns["PackedFP8IndexCacheRows"].write},
+        )
     extract(
         BASE / "csa2_adapter.py",
         ["_publish_main_banked", "_manual_bridge", "publish_main"],
