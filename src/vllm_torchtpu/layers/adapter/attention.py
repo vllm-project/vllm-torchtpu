@@ -543,6 +543,7 @@ def _pallas_rpa_kernel_batched(
     skip_empty_launch: bool = False,
     cap_sliding_decode_block: bool = False,
     sliding_prefill_max_bkv: int | None = None,
+    sliding_decode_lanes: int | None = None,
     fp8_compute: bool = False,
     fence_output: bool = False,
     unmasked_interior: bool = False,
@@ -558,6 +559,8 @@ def _pallas_rpa_kernel_batched(
         rpa_kwargs["cap_sliding_decode_block"] = True
     if sliding_prefill_max_bkv is not None:
         rpa_kwargs["sliding_prefill_max_bkv"] = sliding_prefill_max_bkv
+    if sliding_decode_lanes is not None:
+        rpa_kwargs["sliding_decode_lanes"] = sliding_decode_lanes
     if fp8_compute:
         rpa_kwargs["fp8_compute"] = True
     if fence_output:
@@ -619,6 +622,7 @@ def _pallas_rpa_kernel_batched_from_qkv(
     skip_empty_launch: bool = False,
     cap_sliding_decode_block: bool = False,
     sliding_prefill_max_bkv: int | None = None,
+    sliding_decode_lanes: int | None = None,
     fp8_compute: bool = False,
     fence_output: bool = False,
     unmasked_interior: bool = False,
@@ -634,6 +638,7 @@ def _pallas_rpa_kernel_batched_from_qkv(
         skip_empty_launch=skip_empty_launch,
         cap_sliding_decode_block=cap_sliding_decode_block,
         sliding_prefill_max_bkv=sliding_prefill_max_bkv,
+        sliding_decode_lanes=sliding_decode_lanes,
         fp8_compute=fp8_compute,
         fence_output=fence_output,
         unmasked_interior=unmasked_interior,
@@ -1212,6 +1217,17 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "sees the whole KV block."
                 )
                 entry_kwargs["unmasked_interior"] = True
+            decode_lanes = envs.TPU_RPA_SLIDING_DECODE_LANES
+            if (
+                "sliding_decode_lanes" in entry_params
+                and decode_lanes
+                and self.sliding_window is not None
+            ):
+                logger.info_once(
+                    "Batched RPA sliding-window decode kernels on %d lanes.",
+                    decode_lanes,
+                )
+                entry_kwargs["sliding_decode_lanes"] = decode_lanes
             if self.fp8_compute:
                 if "fp8_compute" not in entry_params:
                     raise NotImplementedError(
@@ -2003,6 +2019,9 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
             )
             entry_kwargs["sliding_prefill_max_bkv"] = (
                 envs.TPU_RPA_SLIDING_PREFILL_MAX_BKV or None
+            )
+            entry_kwargs["sliding_decode_lanes"] = (
+                envs.TPU_RPA_SLIDING_DECODE_LANES or None
             )
         registry_key = (
             f"{self._kernel_op_prefix}_qkv",

@@ -159,3 +159,43 @@ def test_sliding_prefill_max_bkv_caps_only_sliding_prefill(sliding_window):
         assert capped[1].batch_size == default[1].batch_size
     else:
         assert capped[1] == default[1]
+
+
+@pytest.mark.parametrize("sliding_window,lanes", [(1024, 4), (1024, 8), (None, 4)])
+def test_sliding_decode_lanes_change_only_sliding_decode_lanes(sliding_window, lanes):
+    # Gemma4 31B TP2 sliding-layer shapes: 8 lanes of 256-token blocks by default.
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=16,
+        num_kv_heads=8,
+        head_dim=256,
+        sliding_window=sliding_window,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=64,
+        page_size=256,
+        total_q_tokens=16,
+        num_page_indices=64 * 640,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+    )
+    vmem_limit = 64 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        default = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, vmem_limit, cap_sliding_decode_block=True
+        )
+        fewer = wrapper.calculate_block_sizes(
+            model_cfg,
+            serve_cfg,
+            vmem_limit,
+            cap_sliding_decode_block=True,
+            sliding_decode_lanes=lanes,
+        )
+    assert default[0].batch_size == 8
+    expected_lanes = lanes if sliding_window and lanes < 8 else 8
+    assert fewer[0] == dataclasses.replace(default[0], batch_size=expected_lanes)
+    assert fewer[1] == default[1]

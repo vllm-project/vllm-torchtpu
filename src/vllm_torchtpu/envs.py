@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     TPU_RPA_UNMASKED_INTERIOR: bool = False
     TPU_RPA_PROLOGUE_DMA_STORES: bool = False
     TPU_RPA_PROLOGUE_FP8_QUERIES: bool = False
+    TPU_RPA_SLIDING_DECODE_LANES: int = 0
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -968,6 +969,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # writes the FP8 queries the mixed kernel reads, instead of a separate XLA
     # cast and relayout of its bf16 queries (wrapper.quantize_queries).
     "TPU_RPA_PROLOGUE_FP8_QUERIES": env_bool("TPU_RPA_PROLOGUE_FP8_QUERIES"),
+    # Lanes of the batched-RPA decode kernel on sliding-window layers, when
+    # fewer than the default 8; the KV block stays the default's. Every lane of
+    # a step is computed, active or not, and one decode sequence's window spans
+    # a few blocks, so at one or two sequences per engine most lanes are idle.
+    # Lanes only regroup the blocks: outputs are unchanged. 0 (default) keeps 8.
+    "TPU_RPA_SLIDING_DECODE_LANES": env_nonnegative_int(
+        "TPU_RPA_SLIDING_DECODE_LANES", 0
+    ),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
