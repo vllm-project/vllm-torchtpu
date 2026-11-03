@@ -22,7 +22,7 @@ single TPU v7x chip using the canonical 2-step 512x768x25 request (24 fps,
 2. ``test_ltx2_seed_determinism_tpu``: verifies bitwise-identical video and
    audio across repeated runs with seed 42 and divergence against seed 43.
 
-Measured on TPU v7x (``j-50558160-e001-496d-a3cf``, 158.69s total for module,
+Measured on TPU v7x (158.69s total for module,
 well within the 1800s CI Nightly per-test timeout):
 - Engine initialization: 58.81s; first request (with XLA compile): 89.32s
   (``test_ltx2_t2v_smoke_tpu`` total: 148.13s).
