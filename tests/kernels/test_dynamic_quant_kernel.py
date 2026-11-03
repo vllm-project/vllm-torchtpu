@@ -45,6 +45,12 @@ def _operands(rows, k, n):
     return jnp.asarray(x, jnp.bfloat16), w_q, w_scale.reshape(-1)
 
 
+def _token_minor_cols(part, n):
+    # "tail" splits the output like GDN's in_proj_qkvz: q/k/v row-major, z
+    # (the last 1024 columns at TP 8) token-minor.
+    return {"none": 0, "all": n, "tail": 128 if n <= 512 else 1024}[part]
+
+
 @pytest.mark.parametrize(
     "rows,k,n",
     [
@@ -55,13 +61,14 @@ def _operands(rows, k, n):
         (1024, 256, 384),  # output chunk narrower than OUT_BLOCK
     ],
 )
-@pytest.mark.parametrize("transpose_out", [False, True])
-def test_matches_plain_jax(rows, k, n, transpose_out):
+@pytest.mark.parametrize("token_minor", ["none", "all", "tail"])
+def test_matches_plain_jax(rows, k, n, token_minor):
     x, w_q, w_scale = _operands(rows, k, n)
-    assert dynamic_quant_kernel.supports(x, w_q, w_scale, transpose_out)
+    cols = _token_minor_cols(token_minor, n)
+    assert dynamic_quant_kernel.supports(x, w_q, w_scale, cols)
     with pltpu.force_tpu_interpret_mode():
         got = dynamic_quant_kernel.dynamic_quant_matmul(
-            x, w_q, w_scale, transpose_out=transpose_out
+            x, w_q, w_scale, token_minor_cols=cols
         )
     want = jax.jit(_reference)(x, w_q, w_scale)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
@@ -70,11 +77,11 @@ def test_matches_plain_jax(rows, k, n, transpose_out):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("rows,k,n", [(16384, 4096, 2560), (1024, 256, 384)])
-@pytest.mark.parametrize("transpose_out", [False, True])
-def test_compiled_matches_xla(rows, k, n, transpose_out):
+@pytest.mark.parametrize("token_minor", ["none", "all", "tail"])
+def test_compiled_matches_xla(rows, k, n, token_minor):
     x, w_q, w_scale = _operands(rows, k, n)
     got = dynamic_quant_kernel.dynamic_quant_matmul(
-        x, w_q, w_scale, transpose_out=transpose_out
+        x, w_q, w_scale, token_minor_cols=_token_minor_cols(token_minor, n)
     )
     want = jax.jit(_reference)(x, w_q, w_scale)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
@@ -93,3 +100,12 @@ def test_unsupported_operands_stay_on_plain_jax(x_shape, x_dtype, w_dtype):
     x = jnp.zeros(x_shape, x_dtype)
     w_q = jnp.zeros((x_shape[1], 512), w_dtype)
     assert not dynamic_quant_kernel.supports(x, w_q, jnp.ones((512,), jnp.float32))
+
+
+@pytest.mark.parametrize("token_minor_cols", [64, -128, 640])
+def test_unsupported_token_minor_split_stays_on_plain_jax(token_minor_cols):
+    # No 128-multiple chunk divides 64; -128 and 640 are outside [0, n].
+    x = jnp.zeros((512, 512), jnp.bfloat16)
+    w_q = jnp.zeros((512, 512), jnp.float8_e4m3fn)
+    w_scale = jnp.ones((512,), jnp.float32)
+    assert not dynamic_quant_kernel.supports(x, w_q, w_scale, token_minor_cols)

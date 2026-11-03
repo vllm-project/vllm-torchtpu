@@ -43,27 +43,28 @@ QUANT_ROWS = 32
 VMEM_HEADROOM = 1.5
 
 
-def _out_block(n: int) -> int | None:
+def _out_block(n: int, token_minor_cols: int) -> int | None:
+    # Each chunk lands wholly in the row-major or the token-minor part.
     for block in range(OUT_BLOCK, 0, -128):
-        if n % block == 0:
+        if n % block == 0 and token_minor_cols % block == 0:
             return block
     return None
 
 
-def _vmem_limit_bytes(k: int, n: int, out_block: int, transpose_out: bool) -> int:
+def _vmem_limit_bytes(k: int, n: int, out_block: int, token_minor_cols: int) -> int:
     x = 2 * ROW_BLOCK * k * 2  # double-buffered bf16 input block
     x_q = 2 * ROW_BLOCK * k  # two fp8 slots
     x_scale = 2 * ROW_BLOCK * 128 * 4  # (rows, 1) f32 pads to 128 lanes
-    # Resident fp8 weight and its scale: (n, 1) pads to 128 lanes, (1, n) to 8
-    # sublanes.
-    w = k * n + (128 if transpose_out else 8) * n * 4
-    out = 2 * ROW_BLOCK * n * 2  # double-buffered bf16 output block
+    # Resident fp8 weight and its scales: (n_tm, 1) pads to 128 lanes,
+    # (1, n_rm) to 8 sublanes.
+    w = k * n + (8 * (n - token_minor_cols) + 128 * token_minor_cols) * 4
+    out = 2 * ROW_BLOCK * n * 2  # double-buffered bf16 output blocks
     acc = ROW_BLOCK * out_block * 4
     return int(VMEM_HEADROOM * (x + x_q + x_scale + w + out + acc))
 
 
 def supports(
-    x: jax.Array, w_q: jax.Array, w_scale: jax.Array, transpose_out: bool = False
+    x: jax.Array, w_q: jax.Array, w_scale: jax.Array, token_minor_cols: int = 0
 ) -> bool:
     """Whether `dynamic_quant_matmul` takes these operands (static shapes)."""
     if x.ndim != 2 or w_q.ndim != 2 or w_scale.shape != w_q.shape[1:]:
@@ -72,12 +73,12 @@ def supports(
         return False
     m, k = x.shape
     n = w_q.shape[1]
-    if m == 0 or m % ROW_BLOCK or k % 128:
+    if m == 0 or m % ROW_BLOCK or k % 128 or not 0 <= token_minor_cols <= n:
         return False
-    out_block = _out_block(n)
+    out_block = _out_block(n, token_minor_cols)
     if out_block is None:
         return False
-    vmem = _vmem_limit_bytes(k, n, out_block, transpose_out)
+    vmem = _vmem_limit_bytes(k, n, out_block, token_minor_cols)
     return vmem <= min(DEVICE_VMEM_LIMIT.values())
 
 
@@ -95,17 +96,19 @@ def _quantize_rows(x_ref, x_q_ref, x_scale_ref, rows):
     x_q_ref[rows, :] = jnp.clip(x / scale, q_min, q_max).astype(q_dtype)
 
 
-def _kernel(
-    x_ref,
-    w_ref,
-    w_scale_ref,
-    out_ref,
-    x_q_ref,
-    x_scale_ref,
-    *,
-    out_block,
-    transpose_out,
-):
+def _kernel(x_ref, w_ref, *refs, out_block, n_rm, n_tm):
+    # Operands present only for a non-empty part: the row-major part's (1, n_rm)
+    # scale and (rows, n_rm) output, the token-minor part's (n_tm, 1) scale and
+    # (n_tm, rows) output.
+    refs = list(refs)
+    rm_scale_ref = refs.pop(0) if n_rm else None
+    tm_scale_ref = refs.pop(0) if n_tm else None
+    rm_out_ref = refs.pop(0) if n_rm else None
+    tm_out_ref = refs.pop(0) if n_tm else None
+    x_q_ref, x_scale_ref = refs
+    # w_ref is (n, k) when any part is token-minor, else (k, n).
+    w_nk = n_tm > 0
+
     # Step s quantizes row block s into slot s % 2 and multiplies row block
     # s - 1 from the other slot.
     s = pl.program_id(0)
@@ -123,91 +126,114 @@ def _kernel(
 
     @pl.when(s > 0)
     def _():
-        n_chunks = out_ref.shape[0 if transpose_out else 1] // out_block
+        n_chunks = (n_rm + n_tm) // out_block
         per_chunk = -(-len(quant_starts) // n_chunks)
         x_q = x_q_ref.at[(s + 1) % 2]
         x_scale = x_scale_ref[(s + 1) % 2]
-        if transpose_out:
-            # The (n, rows) output block scales its columns, so the per-row
+        if n_tm:
+            # The (n_tm, rows) output block scales its columns, so the per-row
             # scales go lane-major once per block.
             rows = x_scale.shape[0]
-            x_scale = jnp.transpose(jnp.broadcast_to(x_scale, (rows, 128)))[:1]
+            x_scale_t = jnp.transpose(jnp.broadcast_to(x_scale, (rows, 128)))[:1]
         # One basic block, so the scheduler interleaves the quantization of
         # the next row block with these matmuls. The last step re-quantizes
         # the last block into the free slot rather than branch.
         for j in range(n_chunks):
             cols = pl.ds(j * out_block, out_block)
-            if transpose_out:
-                # w_ref is (n, k): contract both operands on k for an
-                # (out_block, rows) slice of the transposed output.
+            if j * out_block >= n_rm:
+                # Contract both operands on k for an (out_block, rows) slice
+                # of the transposed output.
+                part = pl.ds(j * out_block - n_rm, out_block)
                 acc = jax.lax.dot_general(
                     w_ref[cols, :],
                     x_q[...],
                     (((1,), (1,)), ((), ())),
                     preferred_element_type=jnp.float32,
                 )
-                acc = acc * x_scale
-                acc = acc * w_scale_ref[cols, :]
-                out_ref[cols, :] = acc.astype(out_ref.dtype)
+                acc = acc * x_scale_t
+                acc = acc * tm_scale_ref[part, :]
+                tm_out_ref[part, :] = acc.astype(tm_out_ref.dtype)
             else:
-                acc = jnp.dot(
-                    x_q[...], w_ref[:, cols], preferred_element_type=jnp.float32
-                )
+                if w_nk:
+                    acc = jax.lax.dot_general(
+                        x_q[...],
+                        w_ref[cols, :],
+                        (((1,), (1,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )
+                else:
+                    acc = jnp.dot(
+                        x_q[...], w_ref[:, cols], preferred_element_type=jnp.float32
+                    )
                 acc = acc * x_scale
-                acc = acc * w_scale_ref[:, cols]
-                out_ref[:, cols] = acc.astype(out_ref.dtype)
+                acc = acc * rm_scale_ref[:, cols]
+                rm_out_ref[:, cols] = acc.astype(rm_out_ref.dtype)
             quantize(quant_starts[j * per_chunk : (j + 1) * per_chunk])
 
 
-@functools.partial(jax.jit, static_argnames=("transpose_out",))
+@functools.partial(jax.jit, static_argnames=("token_minor_cols",))
 def dynamic_quant_matmul(
     x: jax.Array,  # [m, k] bf16
     w_q: jax.Array,  # [k, n] fp8
     w_scale: jax.Array,  # [n]
-    transpose_out: bool = False,
+    token_minor_cols: int = 0,
 ) -> jax.Array:
     """`x @ w_q` with per-row dynamic FP8 quantization of `x`, as [m, n].
 
-    With `transpose_out` the kernel writes the result as [n, m] row-major and
-    returns its transpose, so a consumer that wants the [m, n] result
-    token-minor gets it as a layout change instead of a transposing copy.
+    The last `token_minor_cols` output columns are written as an [n_tm, m]
+    row-major array and returned transposed, so a consumer that reads those
+    columns token-minor gets them through a layout change instead of a
+    transposing copy; the other columns are written [m, n_rm] row-major. A
+    split result is the concatenation of the two parts, which XLA folds away
+    when the consumers slice at the split.
     """
-    if not supports(x, w_q, w_scale, transpose_out):
+    if not supports(x, w_q, w_scale, token_minor_cols):
         raise ValueError(f"unsupported operands {x.shape=} {x.dtype=} {w_q.shape=}")
     m, k = x.shape
     n = w_q.shape[1]
-    out_block = _out_block(n)
+    n_tm = token_minor_cols
+    n_rm = n - n_tm
+    out_block = _out_block(n, n_tm)
     nb = m // ROW_BLOCK
     w_scale = w_scale.astype(jnp.float32)
-    if transpose_out:
-        w_spec = pl.BlockSpec((n, k), lambda s: (0, 0))
-        w_scale_spec = pl.BlockSpec((n, 1), lambda s: (0, 0))
-        out_spec = pl.BlockSpec((n, ROW_BLOCK), lambda s: (0, jnp.maximum(s - 1, 0)))
-        out_shape = (n, m)
-        w_q, w_scale = w_q.T, w_scale.reshape(n, 1)
-    else:
-        w_spec = pl.BlockSpec((k, n), lambda s: (0, 0))
-        w_scale_spec = pl.BlockSpec((1, n), lambda s: (0, 0))
-        out_spec = pl.BlockSpec((ROW_BLOCK, n), lambda s: (jnp.maximum(s - 1, 0), 0))
-        out_shape = (m, n)
-        w_scale = w_scale.reshape(1, n)
-    out = pl.pallas_call(
-        functools.partial(_kernel, out_block=out_block, transpose_out=transpose_out),
+    rm_out_spec = pl.BlockSpec((ROW_BLOCK, n_rm), lambda s: (jnp.maximum(s - 1, 0), 0))
+    tm_out_spec = pl.BlockSpec((n_tm, ROW_BLOCK), lambda s: (0, jnp.maximum(s - 1, 0)))
+    if n_tm:
+        w_q = w_q.T
+    in_specs = [
+        pl.BlockSpec((ROW_BLOCK, k), lambda s: (jnp.minimum(s, nb - 1), 0)),
+        pl.BlockSpec(w_q.shape, lambda s: (0, 0)),
+    ]
+    operands = [x, w_q]
+    out_specs, out_shapes = [], []
+    if n_rm:
+        in_specs.append(pl.BlockSpec((1, n_rm), lambda s: (0, 0)))
+        operands.append(w_scale[:n_rm].reshape(1, n_rm))
+        out_specs.append(rm_out_spec)
+        out_shapes.append(jax.ShapeDtypeStruct((m, n_rm), x.dtype))
+    if n_tm:
+        in_specs.append(pl.BlockSpec((n_tm, 1), lambda s: (0, 0)))
+        operands.append(w_scale[n_rm:].reshape(n_tm, 1))
+        out_specs.append(tm_out_spec)
+        out_shapes.append(jax.ShapeDtypeStruct((n_tm, m), x.dtype))
+    outs = pl.pallas_call(
+        functools.partial(_kernel, out_block=out_block, n_rm=n_rm, n_tm=n_tm),
         grid=(nb + 1,),
-        in_specs=[
-            pl.BlockSpec((ROW_BLOCK, k), lambda s: (jnp.minimum(s, nb - 1), 0)),
-            w_spec,
-            w_scale_spec,
-        ],
-        out_specs=out_spec,
-        out_shape=jax.ShapeDtypeStruct(out_shape, x.dtype),
+        in_specs=in_specs,
+        out_specs=out_specs,
+        out_shape=out_shapes,
         scratch_shapes=[
             pltpu.VMEM((2, ROW_BLOCK, k), w_q.dtype),
             pltpu.VMEM((2, ROW_BLOCK, 1), jnp.float32),
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=_vmem_limit_bytes(k, n, out_block, transpose_out),
+            vmem_limit_bytes=_vmem_limit_bytes(k, n, out_block, n_tm),
         ),
-    )(x, w_q, w_scale)
-    return out.T if transpose_out else out
+    )(*operands)
+    parts = []
+    if n_rm:
+        parts.append(outs[0])
+    if n_tm:
+        parts.append(outs[-1].T)
+    return parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=1)

@@ -385,7 +385,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if hasattr(self, "in_proj_qkvz"):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
             # The split into q/k/v/z heads and the conv read it token-minor.
-            setattr(self.in_proj_qkvz, TOKEN_MINOR_OUTPUT_ATTR, True)
+            setattr(
+                self.in_proj_qkvz,
+                TOKEN_MINOR_OUTPUT_ATTR,
+                self.in_proj_qkvz.output_size_per_partition,
+            )
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].

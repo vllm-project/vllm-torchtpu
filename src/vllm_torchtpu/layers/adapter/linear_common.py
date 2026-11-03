@@ -40,11 +40,12 @@ logger = init_logger(__name__)
 # name-matched list would not.
 KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 
-# Set the same way, by the module that consumes a linear's output, when it
-# reads that output token-minor: the FP8 matmul then writes it transposed
-# instead of leaving XLA a transposing copy after a row-major kernel. The
-# transposed kernel reads the weight [n_out, n_in], so pair it with
-# KEEP_VLLM_LAYOUT_ATTR or every call pays a weight transpose instead.
+# Set the same way, by the module that consumes a linear's output, to the
+# number of trailing output columns it reads token-minor: the FP8 matmul then
+# writes those columns transposed instead of leaving XLA a transposing copy
+# after a row-major kernel. The transposed kernel reads the weight
+# [n_out, n_in], so pair it with KEEP_VLLM_LAYOUT_ATTR or every call pays a
+# weight transpose instead.
 TOKEN_MINOR_OUTPUT_ATTR = "_tpu_token_minor_output"
 
 # Idempotence guard, set by the linear method once it has flipped a weight.
@@ -78,7 +79,7 @@ def _quantized_matmul_jax(
     w_q: jax.Array,
     w_s: jax.Array,
     w8a16_max_rows: int = 0,
-    out_token_minor: bool = False,
+    token_minor_cols: int = 0,
 ) -> jax.Array:
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
@@ -138,7 +139,7 @@ def _quantized_matmul_jax(
         w_q,
         w_s,
         quantize_activation=not use_w8a16,
-        out_token_minor=out_token_minor,
+        token_minor_cols=token_minor_cols,
     )
 
 
@@ -162,9 +163,9 @@ def _get_quantized_matmul_op() -> Callable:
             w_q: torch.Tensor,
             w_s: torch.Tensor,
             w8a16_max_rows: int = 0,
-            out_token_minor: bool = False,
+            token_minor_cols: int = 0,
         ):
-            del w_s, w8a16_max_rows, out_token_minor
+            del w_s, w8a16_max_rows, token_minor_cols
             return torch.empty(
                 x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
             )
@@ -179,7 +180,7 @@ def quantized_matmul(
     w_q: torch.Tensor,
     w_s: torch.Tensor,
     w8a16_max_rows: int = 0,
-    out_token_minor: bool = False,
+    token_minor_cols: int = 0,
 ) -> torch.Tensor:
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
@@ -197,7 +198,9 @@ def quantized_matmul(
 
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows, out_token_minor)
+    out_2d = _get_quantized_matmul_op()(
+        x_2d, w_q, w_s, w8a16_max_rows, token_minor_cols
+    )
     return out_2d.reshape(orig_out_shape)
 
 

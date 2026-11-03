@@ -1685,7 +1685,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 weight,
                 layer.weight_scale,
                 w8a16_max_rows=self.w8a16_max_rows,
-                out_token_minor=getattr(layer, TOKEN_MINOR_OUTPUT_ATTR, False),
+                token_minor_cols=getattr(layer, TOKEN_MINOR_OUTPUT_ATTR, 0),
             )
         if bias is not None:
             out = out + bias
