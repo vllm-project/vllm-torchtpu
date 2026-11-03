@@ -15,11 +15,12 @@
 
 Under MoE tensor parallelism vLLM runs the shared expert, scales and adds the
 routed output, and all-reduces the sum over the TP group. For an armed layer
-one torch op does all of it: at the token counts the kernel admits (16, 32 and 64)
-one Pallas call per rank covers routing, the shared expert, the routed experts
-and the all-reduce; every other count runs the usual TP path (router top-k,
-fused_moe_func, the shared expert's linears) and a psum in the same exported
-program. The token count is static there, so one torch op serves every bucket.
+one torch op does all of it: at the token counts the kernel admits (16, 32, 64,
+80 and 96) one Pallas call per rank covers routing, the shared expert, the
+routed experts and the all-reduce; every other count runs the usual TP path
+(router top-k, fused_moe_func, the shared expert's linears) and a psum in the
+same exported program. The token count is static there, so one torch op serves
+every bucket.
 The op's output is reduced, so arming also takes the shared expert and the
 routed scale off the runner, and VllmMoERunner._fused_output_is_reduced turns
 the runner's all-reduce off for that layer.
