@@ -28,6 +28,7 @@ from vllm_torchtpu.kernels.qwen4_exp.fused_kv_write import (
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _indexer_updates,
+    _shift_clip,
     _token_metadata,
     produce,
 )
@@ -438,6 +439,35 @@ def write_main_cache(
     )
 
 
+def _pair_values_by_shift(keys, local, mask, ratio):
+    """``keys[clip(local)]`` for the rows ``mask`` keeps, without a gather.
+
+    Row ``t``'s group members sit at ``local[t, h] = t + o`` with a small
+    static offset ``o`` (``[-ratio, ratio)`` for the first half, ``[0,
+    2 * ratio)`` for the second, when the row's logical position follows its
+    token index), so a select over statically shifted copies gives the same
+    rows. Rows ``mask`` drops are never written and may hold any value; if a
+    kept row's offset is outside that range the gather runs instead.
+    """
+    t = jnp.arange(len(keys), dtype=local.dtype)[:, None]
+    offset = local - t
+    halves, ok = [], []
+    for h in range(local.shape[1]):
+        o = offset[:, h]
+        low = (h - 1) * ratio
+        candidates = range(low, low + 2 * ratio)
+        out = _shift_clip(keys, candidates[0])
+        for d in candidates[1:]:
+            out = jnp.where((o == d)[:, None], _shift_clip(keys, d), out)
+        halves.append(out)
+        ok.append(jnp.all(((o >= low) & (o < low + 2 * ratio)) | ~mask[:, h]))
+    return jax.lax.cond(
+        jnp.all(jnp.stack(ok)),
+        lambda: jnp.stack(halves, axis=1),
+        lambda: keys[jnp.clip(local, 0, len(keys) - 1)],
+    )
+
+
 def compressed_pairs(
     pool, keys, complete, req, logical, starts, context, table, ratio, slot=0, dcp=None
 ):
@@ -481,7 +511,10 @@ def compressed_pairs(
         - context[req, None]
     )
     mask = (local >= starts[req, None]) & (local < starts[req + 1, None])
-    values = keys[jnp.clip(local, 0, len(keys) - 1)]
+    if envs.VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT and len(local) == len(keys):
+        values = _pair_values_by_shift(keys, local, mask, ratio)
+    else:
+        values = keys[jnp.clip(local, 0, len(keys) - 1)]
     values = jnp.pad(values, ((0, 0), (0, 0), (0, width - keys.shape[-1])))
     return pair, write, mask, values
 

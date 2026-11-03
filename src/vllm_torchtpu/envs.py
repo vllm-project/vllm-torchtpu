@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_DCP_SHARD_MERGE: bool = False
+    VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
     VLLM_TPU_QSA_FUSED_DCP_BLOCKS: bool = False
     VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
     VLLM_TPU_QSA_DCP_Q_GATHER: bool = False
@@ -793,6 +794,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather shares the merged selection, instead of every rank merging
     # every row of every pair's raw lists (bit-identical).
     "VLLM_TPU_QSA_DCP_SHARD_MERGE": env_bool("VLLM_TPU_QSA_DCP_SHARD_MERGE"),
+    # Compressed-key writes: take each pair's two key rows by selecting over
+    # statically shifted copies of the keys (offsets within two compression
+    # groups of the token) instead of a gather; a lax.cond falls back to the
+    # gather when a written row's offset is out of range (bit-identical pool).
+    "VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT": env_bool("VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT"),
     # With VLLM_TPU_QSA_COMPRESSED_DCP: merge a pair's local top-k lists into the
     # global selection with one TensorCore Pallas kernel (radix select, tie
     # cut, bitonic sort) instead of the SparseCore top-k + keep mask + sort
