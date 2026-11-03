@@ -67,6 +67,13 @@ def prepare(
         supports_compressor_state_packed,
     )
 
+    if indexer_prepare_compare:
+        from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+            _write_fp8_records_native,
+        )
+
+        write_fp8_records = _write_fp8_records_native
+
     ns = dict(
         torch=torch,
         jax=jax,
@@ -104,7 +111,9 @@ def prepare(
     ns["indexer_fp8"] = SimpleNamespace(_write_op=write_op)
     candidate_index = None
     if indexer_prepare_compare:
-        from indexer_prepare import write_fp8_records as candidate_write
+        from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+            write_fp8_records as candidate_write,
+        )
 
         candidate_ns = dict(ns, write_fp8_records=candidate_write)
         extract(BASE / "indexer_fp8.py", ["_write"], candidate_ns)
