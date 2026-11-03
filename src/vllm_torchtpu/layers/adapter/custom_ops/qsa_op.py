@@ -899,7 +899,10 @@ def _dcp_ops():
         pooled_qsa_shard_attend_dcp_step,
         pooled_qsa_token_select_dcp_step,
     )
-    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import dcp_combine_step
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import (
+        dcp_combine_own_step,
+        dcp_combine_step,
+    )
 
     step = pallas.jax_op("qwen4_exp::pooled_qsa_dcp", pooled_qsa_dcp_step, donate_argnums=(10,))
 
@@ -968,6 +971,16 @@ def _dcp_ops():
     def combine_fake(out_pair, lse_pair, gate, rank):
         return gate.new_empty(gate.shape, dtype=torch.bfloat16)
 
+    if envs.VLLM_TPU_QSA_DCP_HEAD_EXCHANGE:
+        own = pallas.jax_op("qwen4_exp::qsa_dcp_combine_own", dcp_combine_own_step)
+
+        @own.register_fake
+        def own_fake(out_pair, lse_pair, gate):
+            return gate.new_empty(gate.shape, dtype=torch.bfloat16)
+
+        # _dcp_finish exchanges heads instead of gathering every partial.
+        combine = (combine, own)
+
     return step, select, attend, combine
 
 
@@ -976,6 +989,22 @@ def _dcp_finish(out, lse, qgate, head_dim, dcp_rank, pair_group, combine):
     tokens = qgate.shape[0]
     heads = qgate.shape[1] // (2 * head_dim)
     gate = qgate.reshape(tokens, heads, 2 * head_dim)[..., head_dim:]
+    if isinstance(combine, tuple):
+        # VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: each rank sends every other rank
+        # only that rank's heads of its partials (an all-to-all over the
+        # pair), half the bytes of gathering all of them; same values.
+        size = out.shape[1] // heads
+        out_mine = _all_to_all(
+            out.reshape(tokens, size, heads, head_dim).transpose(0, 1).reshape(
+                size * tokens, heads, head_dim
+            ),
+            pair_group,
+        ).reshape(size, tokens, heads, head_dim)
+        lse_mine = _all_to_all(
+            lse.reshape(tokens, size, heads).transpose(0, 1).reshape(size * tokens, heads),
+            pair_group,
+        ).reshape(size, tokens, heads)
+        return combine[1](out_mine, lse_mine, gate).reshape(tokens, heads * head_dim)
     out_pair = pair_group.all_gather(out.unsqueeze(0).contiguous(), dim=0)
     lse_pair = pair_group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
     return combine(out_pair, lse_pair, gate, dcp_rank).reshape(tokens, heads * head_dim)

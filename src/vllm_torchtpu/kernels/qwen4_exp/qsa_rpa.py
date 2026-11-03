@@ -612,6 +612,12 @@ def dcp_combine(out_pair, lse_pair, gate, rank, *, out_dtype=jnp.bfloat16):
     start = rank.reshape(()).astype(jnp.int32) * heads
     out_pair = jax.lax.dynamic_slice_in_dim(out_pair, start, heads, axis=2)
     lse_pair = jax.lax.dynamic_slice_in_dim(lse_pair, start, heads, axis=2)
+    return dcp_combine_own(out_pair, lse_pair, gate, out_dtype=out_dtype)
+
+
+def dcp_combine_own(out_pair, lse_pair, gate, *, out_dtype=jnp.bfloat16):
+    """``dcp_combine`` from every group rank's partials for this rank's heads
+    only: ``out_pair`` [size, T, H, D], ``lse_pair`` [size, T, H]."""
     top = jnp.max(lse_pair, axis=0)
     finite = jnp.isfinite(top)
     weight = jnp.where(finite[None], jnp.exp(lse_pair - jnp.where(finite, top, 0)[None]), 0)
@@ -629,6 +635,13 @@ def dcp_combine_step(
 ) -> jax.Array:
     """``dcp_combine`` with a fully annotated signature for ``jax_op``."""
     return dcp_combine(out_pair, lse_pair, gate, rank)
+
+
+def dcp_combine_own_step(
+    out_pair: jax.Array, lse_pair: jax.Array, gate: jax.Array
+) -> jax.Array:
+    """``dcp_combine_own`` with a fully annotated signature for ``jax_op``."""
+    return dcp_combine_own(out_pair, lse_pair, gate)
 
 
 def qsa_attention(

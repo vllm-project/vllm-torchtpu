@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
+    VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -748,6 +749,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split the same way; each rank scores its owned groups and the pair merges
     # the local top-k lists into the exact global selection.
     "VLLM_TPU_QSA_COMPRESSED_DCP": env_bool("VLLM_TPU_QSA_COMPRESSED_DCP"),
+    # With VLLM_TPU_QSA_MAIN_KV_DCP: the pair exchanges each rank's heads of
+    # the partial attention (all-to-all) instead of all-gathering every
+    # partial; half the bytes, bit-identical.
+    "VLLM_TPU_QSA_DCP_HEAD_EXCHANGE": env_bool("VLLM_TPU_QSA_DCP_HEAD_EXCHANGE"),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every
