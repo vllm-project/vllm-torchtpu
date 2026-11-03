@@ -279,6 +279,13 @@ class TestKVCacheManager:
         self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        # No LoRA, so adapter swaps reserve no HBM.
+        self.runner.lora_slot_write_hbm_bytes.return_value = 0
+        # No ring hand-off, so no buffers are reserved for it.
+        self.runner.pp_handoff_hbm_reserve_bytes.return_value = 0
+        self.runner.post_profile_hbm_reserves = (
+            TPUModelRunner.post_profile_hbm_reserves.__get__(self.runner)
+        )
         # Slots per request in the mamba pool (1 without spec decode).
         self.runner._mamba_slot_stride = 1
 
@@ -459,6 +466,35 @@ class TestKVCacheManager:
         assert self.runner.cache_config.num_gpu_blocks_override == 2096323
 
     @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_lora_slot_write_shrinks_num_blocks_override(
+        self, mock_mem_info, mock_get_page_size
+    ):
+        """The HBM an adapter swap holds while it runs must come out of the
+        budget the block-count overrides size against, as the KV-connector
+        reserve does, or the pinned blocks leave no room for the swap."""
+        self.runner.lora_slot_write_hbm_bytes.return_value = utils.GBYTES
+
+        layers = {}
+        mock_attn = _attention_layer_mock()
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        layers["attn_0"] = mock_attn
+        for i in range(3):
+            layers[f"mamba_{i}"] = DummyMamba()
+
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+
+        # Same 1 GiB cut as test_kv_connector_reserve_shrinks_num_blocks_override.
+        assert self.runner.cache_config.num_gpu_blocks_override == 2096323
+
+    @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape",
         return_value=(100, 16, 2, 1, 128),
     )
@@ -585,7 +621,8 @@ class TestKVCacheManager:
     ):
         """Compact-mamba: when _mamba_num_blocks is set, mamba layers allocate
         exactly that many recurrent slots while attention keeps num_blocks, and
-        the slot pool is initialized to _mamba_num_blocks."""
+        the slot pool is initialized to _mamba_num_blocks. Every cache is
+        allocated on the device (no host copy) and flushed by one sync."""
         num_blocks = 100
         mamba_num_blocks = 17  # max_num_reqs(16) + 1
         uniform_size = 203776
@@ -637,7 +674,24 @@ class TestKVCacheManager:
         self.runner.input_batch = mock_input_batch.return_value
         self.runner.kv_caches = []
         self.runner._mamba_num_blocks = mamba_num_blocks
-        self.runner.initialize_kv_cache(kv_cache_config)
+        # Record the `device` each torch.zeros result was created with. On a
+        # CPU runner a host tensor copied with `.to(device)` is the same object,
+        # so a cache built that way records no device.
+        real_zeros = torch.zeros
+        zeros_device: dict[int, torch.device | None] = {}
+
+        def recording_zeros(*args, **kwargs):
+            out = real_zeros(*args, **kwargs)
+            zeros_device[id(out)] = kwargs.get("device")
+            return out
+
+        with (
+            patch.object(torch, "zeros", side_effect=recording_zeros),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors"
+            ) as mock_sync,
+        ):
+            self.runner.initialize_kv_cache(kv_cache_config)
 
         created_caches = mock_bind_kv_cache.call_args[0][0]
         # Mamba: only mamba_num_blocks slots; attention: full num_blocks.
@@ -647,6 +701,14 @@ class TestKVCacheManager:
         assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
         # Slot pool sized to the compact mamba block count.
         self.runner._init_mamba_slot_pool.assert_called_once_with(mamba_num_blocks)
+        # Each cache is allocated on the device, and one sync flushes them all.
+        caches = [created_caches["attn.0"]]
+        for name in ["mamba.0", "mamba.1", "mamba.2"]:
+            caches.extend(created_caches[name])
+        for cache in caches:
+            assert zeros_device.get(id(cache)) == self.runner.device
+        mock_sync.assert_called_once()
+        assert {id(t) for t in mock_sync.call_args[0][0]} == {id(c) for c in caches}
 
     @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
     def test_batched_kv_spec_rpc_establishes_config_context(self, mock_get_layers):
@@ -1279,12 +1341,16 @@ class TestKVCacheManager:
                 "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
                 return_value=False,
             ),
+            patch("vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors") as sync,
         ):
             self.runner.initialize_kv_cache(config)
         caches = bind.call_args.args[0]
         unique = {id(cache): cache for cache in caches.values()}
         assert sum(cache.nbytes for cache in unique.values()) == budget
         assert len(unique) == 2
+        # One sync flushes the shared caches, as it does the per-layer ones.
+        sync.assert_called_once()
+        assert {id(t) for t in sync.call_args.args[0]} == set(unique)
         for index in range(2):
             assert caches[f"full.{index}"] is caches[f"swa.{index}"]
             assert caches[f"full.{index}"].shape[0] == num_blocks

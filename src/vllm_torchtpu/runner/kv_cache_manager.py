@@ -900,11 +900,10 @@ class KVCacheManager:
         Matches `TPUWorker.determine_available_memory()`: the
         `utils.compute_hbm_budget` result (which reserves the
         `gpu_memory_utilization` cap minus
-        `utils.estimate_kv_connector_hbm_reserve` (HBM a connector allocates
-        after profile_run, such as the offload H2D
-        staging pool). Sizing overrides against this budget keeps them from
-        filling the connector reserve back up with KV blocks and defeating
-        the worker-side subtraction.
+        `TPUModelRunner.post_profile_hbm_reserves` (HBM allocated after
+        profile_run, such as the offload H2D staging pool). Sizing overrides
+        against this budget keeps them from filling these reserves back up
+        with KV blocks and defeating the worker-side subtraction.
         """
         if kv_cache_memory_bytes := self.runner.cache_config.kv_cache_memory_bytes:
             return kv_cache_memory_bytes
@@ -913,8 +912,7 @@ class KVCacheManager:
         )
         return utils.min_across_ep_dp(
             self.runner.vllm_config.parallel_config,
-            budget.available
-            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config),
+            budget.available - sum(self.runner.post_profile_hbm_reserves()),
         )
 
     def _maybe_set_compact_mamba_num_blocks_override(
@@ -1601,6 +1599,9 @@ class KVCacheManager:
                 tuple[torch.Tensor, ...],
             ],
         ] = {}
+        # Caches allocated on the device below (shared attention regions, then
+        # per-layer attention and mamba caches), flushed after the loop.
+        device_caches: list[torch.Tensor] = []
 
         def allocate_attention_region(
             region: tuple[int, int],
@@ -1626,10 +1627,13 @@ class KVCacheManager:
                     f"budget: region={region}, allocated={allocated_bytes}, "
                     f"required={required_bytes}, budget={budget}"
                 )
+            # Allocate on the device: a host tensor staged through `.to()` costs
+            # about twice the cache size in host RAM per worker.
             caches = tuple(
-                torch.zeros(shape, dtype=dtype).to(self.runner.device)
+                torch.zeros(shape, dtype=dtype, device=self.runner.device)
                 for shape, dtype in geometry
             )
+            device_caches.extend(caches)
             if native_caches is not None:
                 native_caches[key] = caches
             return caches
@@ -1669,6 +1673,7 @@ class KVCacheManager:
                     attn_backend=backend_cls,
                     device=self.runner.device,
                 )
+            device_caches.extend(shared_attention_caches.values())
 
         for kv_cache_tensor in [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors:
             # Each descriptor names layers within the whole backing allocation;
@@ -1699,8 +1704,11 @@ class KVCacheManager:
                     ):
                         cache_shape = (mamba_num_blocks, *shape)
                         mamba_states.append(
-                            torch.zeros(cache_shape, dtype=dtype).to(self.runner.device)
+                            torch.zeros(
+                                cache_shape, dtype=dtype, device=self.runner.device
+                            )
                         )
+                    device_caches.extend(mamba_states)
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
                     attn_module = self.runner.vllm_config.compilation_config.static_forward_context.get(  # noqa: E501
@@ -1781,6 +1789,12 @@ class KVCacheManager:
                         )[0]
                 else:
                     raise NotImplementedError
+
+        # torch_tpu defers a device zero-fill until first use. Flush these caches
+        # so the precompile below sees them in HBM, as the unified path flushes
+        # its pool (where PJRT donates only buffers with no pending write).
+        if device_caches:
+            synchronize_tensors(device_caches)
 
         self._add_shared_kv_cache_aliases(kv_caches)
 

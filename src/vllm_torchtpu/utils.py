@@ -203,6 +203,22 @@ class HbmBudget(NamedTuple):
     available: int
 
 
+class HbmReserves(NamedTuple):
+    """HBM allocated after profile_run, which the KV-cache budget must leave
+    free. Its sum is what the budget subtracts.
+
+    All fields are bytes:
+      kv_connector:    what the KV connector allocates, such as the offload
+                       H2D staging pool.
+      lora_slot_write: what an adapter swap holds while it runs.
+      pp_handoff:      what the pipeline ring hand-off's buffers take.
+    """
+
+    kv_connector: int
+    lora_slot_write: int
+    pp_handoff: int
+
+
 def compute_hbm_budget(devices: Any, gpu_memory_utilization: float) -> HbmBudget:
     """Compute the HBM budget available for the KV cache."""
     total_limit = total_used = 0
@@ -362,6 +378,20 @@ def synchronize_tensors(
     sync.synchronize(tensors=tensors, wait=wait)
 
 
+# Copied by `fresh_buffer` through bfloat16, which holds each of their non-NaN
+# values exactly. Not `float4_e2m1fn_x2`: it packs two values per element, and
+# a bfloat16 round trip corrupts it.
+_FLOAT8_DTYPES = frozenset(
+    {
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e8m0fnu,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2fnuz,
+    }
+)
+
+
 def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
     """Return a copy of `t` backed by a fresh device buffer of its own shape.
 
@@ -373,11 +403,23 @@ def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
 
     `torch.empty(...).copy_(t)` is not enough: torch_tpu may satisfy a
     same-shape, same-dtype `copy_` by aliasing the destination's storage to
-    `t`'s base buffer, which keeps the shape mismatch. On TPU the `+ 0` forces
-    a real op whose output buffer has `t`'s logical shape. Other devices get a
-    plain contiguous clone (CPU has no `add` kernel for float8 dtypes).
+    `t`'s base buffer, which keeps the shape mismatch. On TPU a real op forces
+    an output buffer of `t`'s logical shape: `+ 0`, or for float8 a round trip
+    through bfloat16. Other devices get a plain contiguous clone (CPU has no
+    `add` kernel for float8 dtypes).
+
+    Float8 takes the round trip because torch_tpu builds since commit cf43c606
+    (google-pytorch/torch_tpu) have no float8 `add`, while casts stay
+    supported. Every non-NaN value comes back bit-identical; a NaN stays NaN
+    but may lose its sign or payload. A uint8 `+ 0` viewed back as float8 is no
+    substitute: the result is a dtype view, and a model loaded that way halted
+    at its first warmup step in torch_tpu's `tt_jit_execute_as_strided`
+    programs.
     """
     out = torch.clone(t, memory_format=torch.contiguous_format)
     if out.device.type == "tpu":
-        out = out + 0
+        if out.dtype in _FLOAT8_DTYPES:
+            out = out.to(torch.bfloat16).to(out.dtype)
+        else:
+            out = out + 0
     return out

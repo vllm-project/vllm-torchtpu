@@ -83,14 +83,11 @@ class TpuCompilationHandle:
 
 _tpu_backend = TpuBackend()
 
-# How long a rank waits for the rank of its host that compiles a bucket, and
-# how often it looks. The wait is bounded for a peer that never saves the
-# artifact (its serialize() failed, it crashed, or it does not exist); the rank
-# then compiles the bucket itself. A single bucket compiles in well under this
-# even with every rank of the host compiling at once (~165 s for the biggest
-# Qwen3.5-397B bucket at DP8), so a timeout costs one redundant compile rather
-# than stalling startup for an hour.
-PEER_WAIT_S = 600.0
+# How often a rank looks for the artifact of the rank of its host that compiles
+# a bucket. How long it waits is TPU_PRECOMPILE_PEER_WAIT_S (default 600 s):
+# the wait is bounded for a peer that never saves the artifact (its serialize()
+# failed, it crashed, or it does not exist); the rank then compiles the bucket
+# itself, so a timeout costs one redundant compile rather than a stalled start.
 _PEER_POLL_S = 0.5
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
 # weights rather than constants, by dtype and shape.
@@ -198,6 +195,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PARALLEL_PRECOMPILE",
     "TPU_PRECOMPILE_BIGGEST_FIRST",
     "TPU_PRECOMPILE_PEER_REPLAY",
+    "TPU_PRECOMPILE_PEER_WAIT_S",
+    "TPU_PRECOMPILE_TRACE_FIRST",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -235,6 +234,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Engine-side timing of the pipeline pushes; the workers' programs are
     # the same either way.
     "TPU_PP_LAZY_PUSH",
+    # The hand-off between pipeline stages and its depth: it runs outside
+    # the compiled forwards, which take the same inputs either way.
+    "TPU_PP_HANDOFF",
+    "TPU_PP_RING_DEPTH",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
@@ -267,6 +270,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # `import torch_tpu` (via libtpu.configure_library_path()) sets this to
+    # <site-packages>/libtpu/libtpu.so, so the raw path would change the key
+    # with the venv prefix or mount path. get_libtpu_cache_key() already
+    # identifies the loaded build without its path.
+    "TPU_LIBRARY_PATH",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -408,6 +416,9 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
 
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
+    # Deferred: tpu_info imports Pallas, which this module otherwise avoids.
+    from vllm_torchtpu.tpu_info import get_libtpu_cache_key
+
     cache_config = vllm_config.cache_config
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
@@ -416,7 +427,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "torch_tpu": importlib_metadata.version("torch-tpu"),
         "jax": importlib_metadata.version("jax"),
         "jaxlib": importlib_metadata.version("jaxlib"),
-        "libtpu": importlib_metadata.version("libtpu"),
+        "libtpu": get_libtpu_cache_key(),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         "parallel": {

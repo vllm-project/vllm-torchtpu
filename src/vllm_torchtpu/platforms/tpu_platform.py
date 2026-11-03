@@ -327,6 +327,9 @@ def _validate_peer_replay_config() -> None:
     """
     if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
         return
+    # Parse it now, so a bad value fails the launch rather than the precompile
+    # that reads it after the model has loaded.
+    envs.TPU_PRECOMPILE_PEER_WAIT_S  # noqa: B018
     if vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
         raise ValueError(
             "TPU_PRECOMPILE_PEER_REPLAY=1 needs vLLM's compile cache: peer ranks "
@@ -361,8 +364,8 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
 def _validate_lora_config(vllm_config: "VllmConfig") -> None:
     """Rejects LoRA settings that the TPU LoRA path does not support yet.
 
-    LoRA runs on a single chip with a dense model without speculative decoding.
-    Other settings fail here with the reason.
+    LoRA runs on a single chip with a dense generative model without
+    speculative decoding. Other settings fail here with the reason.
     """
     lora_config = vllm_config.lora_config
     if lora_config is None:
@@ -393,6 +396,10 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
         # FusedMoEWithLoRA requires a non-monolithic MoE; every TPU MoE method
         # is monolithic.
         "MoE models": model_config.is_moe,
+        # The runner pads the request mapping to its bucket, but a pooler
+        # hands vLLM's classification head one row per request, so the head
+        # rejects the mapping. Embedding models are untested.
+        "pooling models": model_config.runner_type == "pooling",
         # Only meaningful with tensor parallelism.
         "fully_sharded_loras": lora_config.fully_sharded_loras,
         # The TPU runner never sets the tower or connector mappings.
@@ -867,11 +874,11 @@ class TpuPlatform(Platform):
         validate_pipeline_parallel_config(vllm_config)
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
-            # get the hand-off push here; engine-core processes install it
-            # again on their side.
-            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
+            # get the hand-off's engine side here; engine-core processes
+            # install it again on their side.
+            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
 
-            patch_executor_for_pp_wave(vllm_config)
+            patch_executor_for_pp_handoff(vllm_config)
             _configure_pipeline_chunks(vllm_config)
             from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
 
@@ -997,6 +1004,9 @@ class TpuPlatform(Platform):
         cache_config = vllm_config.cache_config
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
+        is_attention_free = (
+            model_config.is_attention_free if model_config is not None else False
+        )
         if (
             vllm_config.speculative_config is not None
             and scheduler_config.async_scheduling
@@ -1031,6 +1041,15 @@ class TpuPlatform(Platform):
                     "unified KV pool; remove "
                     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0."
                 )
+        if (
+            is_attention_free
+            and cache_config.enable_prefix_caching
+            and not is_decode_bench
+        ):
+            raise NotImplementedError(
+                "Prefix caching on attention-free models is not yet "
+                "supported on TPU; run with --no-enable-prefix-caching."
+            )
 
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
