@@ -103,6 +103,9 @@ class KernelConfig:
     # per first-down panel (0: 4/2 below 8K, 8/8 at 8K).
     prefill_moe_gu_unroll: int = 0
     prefill_moe_first_down_unroll: int = 0
+    # Fused MoE token combine: rows per batch whose loads all precede their
+    # stores (0: one row at a time).
+    prefill_moe_combine_batch: int = 0
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.

@@ -1000,6 +1000,7 @@ def _routed_experts(
     """Joint GU/SiTU/first-down pipeline followed by remaining columns."""
     mid = experts.middle
     skip_combine = _skip("moe_combine")
+    batch = k._config().prefill_moe_combine_batch
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
@@ -1151,6 +1152,26 @@ def _routed_experts(
         def route(i):
             return (destinations[i], probabilities[i])
 
+        def combine(rows, source, begin):
+            """Add (row, weight) pairs of one expert tile into sums, ``batch``
+            rows at a time: all loads, then the stores in reverse order.
+
+            One expert holds a token at most once, so a batch's destinations
+            differ except for rows clamped to the tile's last row (weight 0,
+            later in the batch); storing in reverse order keeps the real one.
+            """
+            if skip_combine:
+                return
+            for first_row in range(0, len(rows), batch):
+                updates = []
+                for i, weight in rows[first_row:first_row + batch]:
+                    dest = destinations[i]
+                    value = source.at[pl.ds(i - begin, 1)][...].astype(jnp.float32)
+                    target = sums.at[pl.ds(dest, 1)]
+                    updates.append((target, target[...] + value * weight))
+                for target, total in reversed(updates):
+                    target[...] = total
+
         def consume(tile_g, source, first=0, *, loop_unroll=unroll):
             start = metadata.gm_id_to_m_offset[tile_g]
             end = metadata.gm_id_to_m_offset[tile_g + 1]
@@ -1168,6 +1189,10 @@ def _routed_experts(
 
             @pl.loop(0, full)
             def chunk(b):
+                if batch:
+                    rows = [start + b * loop_unroll + u for u in range(loop_unroll)]
+                    combine([(i, probabilities[i]) for i in rows], source, begin)
+                    return
                 for u in range(loop_unroll):
                     update(start + b * loop_unroll + u)
 
@@ -1183,6 +1208,15 @@ def _routed_experts(
             start = metadata.gm_id_to_m_offset[previous_g]
             end = metadata.gm_id_to_m_offset[previous_g + 1]
             begin = start // sub * sub
+            if batch:
+                rows = []
+                for row in range(gu_unroll):
+                    offset = panel * gu_unroll + row
+                    i = jnp.minimum(start + offset, end - 1)
+                    valid = (g > 0) & (start + offset < end)
+                    rows.append((i, jnp.where(valid, probabilities[i], 0)))
+                combine(rows, packed.at[(g + 1) % 2], begin)
+                return
             for row in range(gu_unroll):
                 offset = panel * gu_unroll + row
                 i = jnp.minimum(start + offset, end - 1)
@@ -1217,6 +1251,17 @@ def _routed_experts(
                 begin = start // sub * sub
 
                 def work():
+                    if batch:
+                        rows = []
+                        for row in range(down_unroll):
+                            offset = (
+                                (moved_rows if first else 0) + panel * down_unroll + row
+                            )
+                            i = jnp.minimum(start + offset, end - 1)
+                            valid = (g > 0) & (start + offset < end)
+                            rows.append((i, jnp.where(valid, probabilities[i], 0)))
+                        combine(rows, previous, begin)
+                        return
                     for row in range(down_unroll):
                         offset = (
                             (moved_rows if first else 0) + panel * down_unroll + row
