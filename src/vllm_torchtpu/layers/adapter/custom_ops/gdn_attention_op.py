@@ -57,6 +57,7 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     SPLIT_OUTPUT_ATTR,
+    SPLIT_OUTPUT_HEAD_DIM_ATTR,
 )
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
@@ -384,12 +385,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
         if hasattr(self, "in_proj_qkvz"):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
-            # `forward` splits z (the trailing columns) off q/k/v.
+            # `forward` splits z (the trailing columns) off q/k/v and reshapes
+            # it into heads.
             setattr(
                 self.in_proj_qkvz,
                 SPLIT_OUTPUT_ATTR,
                 self.value_dim // self.tp_size,
             )
+            setattr(self.in_proj_qkvz, SPLIT_OUTPUT_HEAD_DIM_ATTR, self.head_v_dim)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].

@@ -45,6 +45,9 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # matmul then writes those columns to a separate buffer, so slicing them off
 # (and the leading columns) needs no copy.
 SPLIT_OUTPUT_ATTR = "_tpu_split_output_cols"
+# And to the head size it reshapes those columns into: the FP8 matmul then
+# writes them as [tokens, heads, head size], so that reshape needs no relayout.
+SPLIT_OUTPUT_HEAD_DIM_ATTR = "_tpu_split_output_head_dim"
 
 # Idempotence guard, set by the linear method once it has flipped a weight.
 # Not how `apply` picks its contraction -- that keys off the marker above.
@@ -79,6 +82,7 @@ def _quantized_matmul_jax(
     w8a16_max_rows: int = 0,
     split_cols: int = 0,
     weight_nk: bool = False,
+    split_head_dim: int = 0,
 ) -> jax.Array:
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
@@ -140,6 +144,7 @@ def _quantized_matmul_jax(
         quantize_activation=not use_w8a16,
         split_cols=split_cols,
         weight_nk=weight_nk,
+        split_head_dim=split_head_dim,
     )
 
 
@@ -165,8 +170,9 @@ def _get_quantized_matmul_op() -> Callable:
             w8a16_max_rows: int = 0,
             split_cols: int = 0,
             weight_nk: bool = False,
+            split_head_dim: int = 0,
         ):
-            del w_s, w8a16_max_rows, split_cols, weight_nk
+            del w_s, w8a16_max_rows, split_cols, weight_nk, split_head_dim
             return torch.empty(
                 x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
             )
@@ -183,6 +189,7 @@ def quantized_matmul(
     w8a16_max_rows: int = 0,
     split_cols: int = 0,
     weight_nk: bool = False,
+    split_head_dim: int = 0,
 ) -> torch.Tensor:
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
@@ -201,7 +208,7 @@ def quantized_matmul(
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(
-        x_2d, w_q, w_s, w8a16_max_rows, split_cols, weight_nk
+        x_2d, w_q, w_s, w8a16_max_rows, split_cols, weight_nk, split_head_dim
     )
     return out_2d.reshape(orig_out_shape)
 
