@@ -14,6 +14,7 @@
 
 from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op as gdn_attention_op
 from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op as kda_attention_op
+from vllm_torchtpu.layers.adapter.custom_ops import mamba_mixer2_op as mamba_mixer2_op
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_attention_op
 from vllm_torchtpu.layers.adapter.custom_ops import moe_runner as moe_runner
 
