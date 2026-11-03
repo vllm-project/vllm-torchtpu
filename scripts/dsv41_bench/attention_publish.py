@@ -54,6 +54,7 @@ def prepare(
     capture_only=False,
     fallback=False,
     writer_stage="both",
+    indexer_prepare_compare=False,
 ):
     import torch
 
@@ -101,6 +102,25 @@ def prepare(
         (0,),
     )
     ns["indexer_fp8"] = SimpleNamespace(_write_op=write_op)
+    candidate_index = None
+    if indexer_prepare_compare:
+        from indexer_prepare import write_fp8_records as candidate_write
+
+        candidate_ns = dict(ns, write_fp8_records=candidate_write)
+        extract(BASE / "indexer_fp8.py", ["_write"], candidate_ns)
+        candidate_op = ns["_register"](
+            "pallas::dsv41_indexer_sorted_prepare_write",
+            candidate_ns["_write"],
+            lambda banks, records, keys, after, layout: tuple(
+                torch.empty_like(b) for b in banks
+            ),
+            4,
+            1,
+            (0,),
+        )
+        candidate_ns["indexer_fp8"] = SimpleNamespace(_write_op=candidate_op)
+        extract(BASE / "indexer_cache.py", ["PackedFP8IndexCacheRows"], candidate_ns)
+        candidate_index = candidate_ns["PackedFP8IndexCacheRows"]
     extract(
         BASE / "csa2_adapter.py",
         ["_publish_main_banked", "_manual_bridge", "publish_main"],
@@ -167,7 +187,9 @@ def prepare(
         def __init__(self, expanded):
             self.prefix, self.compress_ratio, self.window_size = "main", 2, 128
             self._packed_compressor_op = packed_op
-            self._address_compressor_op = address_op if expanded else None
+            self._address_compressor_op = (
+                address_op if expanded or indexer_prepare_compare else None
+            )
             self.kv_cache = Paged(
                 banks, ((pages, 128, 512), torch.uint8, 65536, 0), scale=scale_banks
             )
@@ -175,7 +197,11 @@ def prepare(
                 k_cache=SimpleNamespace(
                     prefix="index",
                     compress_ratio=2,
-                    kv_cache=Index(banks, ((pages, 256, 132), torch.uint8, 65536, 0)),
+                    kv_cache=(
+                        candidate_index
+                        if indexer_prepare_compare and expanded
+                        else Index
+                    )(banks, ((pages, 256, 132), torch.uint8, 65536, 0)),
                 )
             )
             self.compressor = SimpleNamespace(
@@ -335,6 +361,7 @@ def main():
     p.add_argument("--profile", action="store_true")
     p.add_argument("--capture-only", action="store_true")
     p.add_argument("--fallback", action="store_true")
+    p.add_argument("--indexer-prepare-compare", action="store_true")
     p.add_argument("--writer-stage", choices=("both", "main", "index"), default="both")
     args = p.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -363,6 +390,7 @@ def main():
         capture_only=args.capture_only,
         fallback=args.fallback,
         writer_stage=args.writer_stage,
+        indexer_prepare_compare=args.indexer_prepare_compare,
     )
     functions = dict(
         zip(
@@ -395,6 +423,7 @@ def main():
         ),
         "capture_only": args.capture_only,
         "fallback": args.fallback,
+        "indexer_prepare_compare": args.indexer_prepare_compare,
         "writer_stage": args.writer_stage,
         "runtime": {
             n: importlib.metadata.version(n)
