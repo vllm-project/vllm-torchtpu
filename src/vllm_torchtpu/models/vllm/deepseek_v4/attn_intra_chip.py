@@ -46,10 +46,10 @@ does the following:
      Chiplet 0 has [Out0_P0 + Out0_P1], Chiplet 1 has [Out1_P0 + Out1_P1]
 
 Experimental: `DeepseekV4DecoderLayer` uses this class when
-TPU_DSV4_ATTN_INTRA_CHIP_TP=1. When the config allows (2 x max_num_batched_tokens <=
-512, token buckets multiples of 8), step 5 is fused into step 6: the neighboring
-chiplet's rows are fetched by remote DMA inside the `wo_a` kernel. Otherwise the
-exchange runs as described.
+TPU_DSV4_ATTN_INTRA_CHIP_TP=1. When every compile size allows it (2 x size <= 512,
+size a multiple of 8), step 5 is fused into step 6: the neighboring chiplet's rows
+are fetched by remote DMA inside the `wo_a` kernel. Otherwise the exchange runs as
+described.
 """
 
 from __future__ import annotations
@@ -248,26 +248,27 @@ class _FusedOFetch:
 
 
 def _check_fused_o_fetch_supported(vllm_config) -> bool:
-    """Whether the fused o-fetch kernel can run this config; logs why not.
+    """Whether the fused o-fetch kernel can run at every compile size; warns
+    why not.
 
     It covers one token tile of both chiplets' tokens, and its row offsets
-    assume every token bucket is a multiple of the 8-row sublane tile.
+    assume the token count is a multiple of the 8-row sublane tile. The runner
+    warms up every compile size and pads each step to one of them, so checking
+    the sizes also covers max_num_batched_tokens.
     """
-    reason = None
-    pair_tokens = 2 * vllm_config.scheduler_config.max_num_batched_tokens
     sizes = vllm_config.compilation_config.compile_sizes or []
-    unaligned = [size for size in sizes if size % 8]
-    if pair_tokens > O_FETCH_MAX_TOKENS:
-        reason = f"2 x max_num_batched_tokens = {pair_tokens} > {O_FETCH_MAX_TOKENS}"
-    elif unaligned:
-        reason = f"token buckets {unaligned} are not multiples of 8"
-    if reason:
-        logger.info_once(
+    # A tuple: warning_once caches on its (hashable) arguments.
+    unsupported = tuple(
+        size for size in sizes if 2 * size > O_FETCH_MAX_TOKENS or size % 8
+    )
+    if unsupported:
+        logger.warning_once(
             "ATTN_INTRA_CHIP_TP: o rows exchanged before wo_a, not fetched "
-            "inside it: %s",
-            reason,
+            "inside it: compile sizes %s are above %d or not multiples of 8",
+            unsupported,
+            O_FETCH_MAX_TOKENS // 2,
         )
-    return reason is None
+    return not unsupported
 
 
 class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):

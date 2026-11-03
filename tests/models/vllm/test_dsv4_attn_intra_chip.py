@@ -85,7 +85,11 @@ def _load_module(monkeypatch):
     stubs["vllm.model_executor.layers.linear"].ColumnParallelLinear = object
     stubs["vllm.model_executor.layers.linear"].RowParallelLinear = object
     logger = types.SimpleNamespace(
-        info=lambda *a: None, info_once=lambda *a: None, warning=lambda *a: None
+        info=lambda *a: None,
+        info_once=lambda *a: None,
+        warning=lambda *a: None,
+        # Like the real one, which is lru_cached: the arguments must hash.
+        warning_once=lambda *a: hash(a),
     )
     stubs["vllm_torchtpu.logger"].init_logger = lambda name: logger
     for name, module in stubs.items():
@@ -283,18 +287,25 @@ def _fused_o_fetch_config(max_num_batched_tokens, compile_sizes):
     "max_num_batched_tokens,compile_sizes,supported",
     [
         (256, [16, 24, 128, 256], True),
-        (257, [16, 256], False),
+        (264, [16, 264], False),
+        (256, [16, 256, 512], False),
         (256, [16, 20, 256], False),
     ],
-    ids=["fused", "too-many-tokens", "unaligned-bucket"],
+    ids=["fused", "too-many-tokens", "size-above-budget", "unaligned-bucket"],
 )
 def test_fused_o_fetch_falls_back_when_unsupported(
     monkeypatch, max_num_batched_tokens, compile_sizes, supported
 ):
     """Configs the kernel cannot run take the exchange path instead."""
     aic = _load_module(monkeypatch)
+    warnings = []
+    monkeypatch.setattr(
+        aic.logger, "warning_once", lambda *a: warnings.append(a) or hash(a)
+    )
     config = _fused_o_fetch_config(max_num_batched_tokens, compile_sizes)
     assert aic._check_fused_o_fetch_supported(config) is supported
+    # An automatic fallback warns once (R-5.3).
+    assert len(warnings) == (0 if supported else 1)
 
 
 def test_fused_o_fetch_finds_neighbor_and_chiplet_index(monkeypatch):
