@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from math import gcd
 from pathlib import Path
+from typing import TypedDict
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel import errors
@@ -271,13 +272,42 @@ def supports_hf_config(
     _validate_layer_tokens(tc, has_gdn_kda_heads=has_gdn_kda_heads)
 
 
-_MLA_DEFAULTS: dict[str, object] = {
+class _MlaDefaults(TypedDict):
+    """Multi-head latent attention projection ranks shared by MLA presets."""
+
+    kv_lora_rank: int
+    q_lora_rank: int
+    qk_nope_head_dim: int
+    qk_rope_head_dim: int
+
+
+class _KimiK3Defaults(_MlaDefaults):
+    """Keyword defaults for Kimi-K3 presets; experts and top-k stay positional."""
+
+    moe_intermediate_size: int
+    num_moe_layers: int
+    shared_expert_intermediate_size: int
+    routed_expert_hidden_size: int
+    expert_dtype: str
+    model_type: str
+
+
+class _DeepSeekDefaults(_MlaDefaults):
+    """Keyword defaults for DeepSeek-style presets; layers and type stay explicit."""
+
+    num_experts: int
+    top_k: int
+    moe_intermediate_size: int
+    shared_expert_intermediate_size: int
+
+
+_MLA_DEFAULTS: _MlaDefaults = {
     "kv_lora_rank": 512,
     "q_lora_rank": 1536,
     "qk_nope_head_dim": 128,
     "qk_rope_head_dim": 64,
 }
-_KIMI_K3_DEFAULTS: dict[str, object] = {
+_KIMI_K3_DEFAULTS: _KimiK3Defaults = {
     **_MLA_DEFAULTS,
     "moe_intermediate_size": 3072,
     "num_moe_layers": 92,
@@ -286,7 +316,7 @@ _KIMI_K3_DEFAULTS: dict[str, object] = {
     "expert_dtype": "mxfp4",
     "model_type": "kimi_linear",
 }
-_DEEPSEEK_DEFAULTS: dict[str, object] = {
+_DEEPSEEK_DEFAULTS: _DeepSeekDefaults = {
     **_MLA_DEFAULTS,
     "num_experts": 256,
     "top_k": 8,
