@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_GEMMA4_SEQUENCE_PARALLEL: bool = True
     TPU_GEMMA4_SP_MICROBATCHES: int = 1
+    TPU_GEMMA4_CP_MIN_TOKENS: int = 16384
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = True
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -469,6 +470,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_GEMMA4_SEQUENCE_PARALLEL: split a large bucket into this many
     # contiguous token chunks whose collectives and projections can overlap.
     "TPU_GEMMA4_SP_MICROBATCHES": env_int("TPU_GEMMA4_SP_MICROBATCHES", 1),
+    # Gemma4ForCausalLM at TP >= 3: token buckets of at least this many tokens
+    # run context-parallel over the TP group (zigzag pieces of the step's one
+    # prompt per rank, every projection whole on every rank); 0 disables. Needs
+    # VLLM_TPU_SOLO_PREFILL_OVER_TOKENS whose bucket is the one below. See
+    # models/vllm/gemma4_patch.py.
+    "TPU_GEMMA4_CP_MIN_TOKENS": env_nonnegative_int("TPU_GEMMA4_CP_MIN_TOKENS", 16384),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and

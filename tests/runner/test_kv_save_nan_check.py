@@ -273,6 +273,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         },
         _run_dp_dummy_chunk=MagicMock(),
         query_start_loc_np=np.zeros(4, dtype=np.int32),
+        seq_lens_np=np.zeros(3, dtype=np.int32),
         _last_sequence_layout_plan=None,
         position_ids=torch.zeros(2, dtype=torch.int32),
         _flush_mamba_state_seed_copies=lambda: None,
