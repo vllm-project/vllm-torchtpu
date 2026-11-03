@@ -11,7 +11,7 @@ import pytest
 N_KQ, N_V, DIM, WIDTH = 2, 6, 128, 2 * 2 * 128 + 6 * 128
 
 
-def _inputs(tokens, seed):
+def _inputs(tokens, seed, num_seqs=1):
     rng = np.random.default_rng(seed)
 
     def normal(shape, dtype=jnp.bfloat16, scale=0.5):
@@ -21,8 +21,9 @@ def _inputs(tokens, seed):
         qkv=normal((tokens, WIDTH)),
         b=normal((tokens, N_V)),
         a=normal((tokens, N_V)),
-        conv=normal((3, 3, WIDTH), jnp.float32, 0.1),
-        ssm=normal((3, N_V, DIM, DIM), jnp.float32, 0.05),
+        # Slot 0 is the null block; sequence i uses slot i + 1.
+        conv=normal((num_seqs + 1, 3, WIDTH), jnp.float32, 0.1),
+        ssm=normal((num_seqs + 1, N_V, DIM, DIM), jnp.float32, 0.05),
         weight=normal((WIDTH, 1, 4), scale=0.2),
         bias=normal((WIDTH,), scale=0.1),
         a_log=normal((N_V,), jnp.float32),
@@ -50,6 +51,10 @@ def _run(x, query_start_loc, indices, distribution, seq_lens):
         (2048,),  # whole pairs
         (2176,),  # odd last chunk
         (1, 1, 1000),  # two decodes then a prefill with a ragged tail
+        (1000,),
+        (1, 1, 2048),
+        (3, 1000),  # a short prefill ahead of a long one
+        (5, 300, 1, 700),  # a 1-token sequence inside the PER_SEQ segment
     ],
 )
 def test_chunk_pair_bit_identical(lens, monkeypatch):
@@ -57,11 +62,12 @@ def test_chunk_pair_bit_identical(lens, monkeypatch):
 
     monkeypatch.setattr(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", True)
     tokens = sum(lens)
-    x = _inputs(tokens, seed=tokens)
     n = len(lens)
+    x = _inputs(tokens, seed=tokens, num_seqs=n)
     query_start_loc = jnp.asarray(np.concatenate([[0], np.cumsum(lens)]), jnp.int32)
     indices = jnp.arange(1, n + 1, dtype=jnp.int32)
-    decodes = sum(1 for t in lens if t == 1)
+    # Only the leading 1-token sequences form the batched decode segment.
+    decodes = next((i for i, t in enumerate(lens) if t != 1), n)
     distribution = jnp.asarray([decodes, n, n], jnp.int32)
     seq_lens = jnp.asarray([256 + t for t in lens], jnp.int32)
 
