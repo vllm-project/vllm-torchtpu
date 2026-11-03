@@ -245,6 +245,13 @@ if TYPE_CHECKING:
     VLLM_TPU_DECODE_TPOT_CAP_MS: tuple[tuple[int, float], ...] = ()
     VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST: float = 0.0
     VLLM_TPU_DP_LB_EXACT_INFLIGHT: bool = False
+    TPU_DP_PIPELINE_PREFILL: bool = False
+    TPU_DP_PIPELINE_STAGES: int = 4
+    TPU_DP_PIPELINE_SPLITS: str = "2:30;3:20,41;4:14,29,44"
+    TPU_DP_PIPELINE_MIN_TOKENS: int = 32768
+    TPU_DP_PIPELINE_STAGE_TOKENS: str = "3:40960;4:73728"
+    TPU_DP_PIPELINE_HELPER_IDLE_MS: float = 250.0
+    TPU_DP_PIPELINE_TIMEOUT_S: float = 300.0
 
 
 def env_with_choices(
@@ -1547,6 +1554,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # engine with the fewest of its unfinished requests, ignoring the DP
     # coordinator's lagging snapshot (core/dp_lb_exact_inflight.py).
     "VLLM_TPU_DP_LB_EXACT_INFLIGHT": env_bool("VLLM_TPU_DP_LB_EXACT_INFLIGHT"),
+    # Prefill a long prompt as a pipeline over idle data-parallel engines, each
+    # running a range of the layers (distributed/dp_pipeline). Gemma4 text
+    # models only; needs VLLM_TPU_DP_LB_EXACT_INFLIGHT.
+    "TPU_DP_PIPELINE_PREFILL": env_bool("TPU_DP_PIPELINE_PREFILL"),
+    # TPU_DP_PIPELINE_PREFILL: the most engines one prompt's pipeline uses.
+    "TPU_DP_PIPELINE_STAGES": env_int("TPU_DP_PIPELINE_STAGES", 4),
+    # TPU_DP_PIPELINE_PREFILL: per pipeline size S, the layers where stages
+    # change, S:b1,...,b(S-1)[;...]; the default balances Gemma4-31B's 60
+    # sliding and global layers at long context (other models need their own).
+    "TPU_DP_PIPELINE_SPLITS": env_str(
+        "TPU_DP_PIPELINE_SPLITS", "2:30;3:20,41;4:14,29,44"
+    ),
+    # TPU_DP_PIPELINE_PREFILL: shorter prompts are prefilled by one engine.
+    "TPU_DP_PIPELINE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DP_PIPELINE_MIN_TOKENS", 32768
+    ),
+    # TPU_DP_PIPELINE_PREFILL: per stage count S > 2, the shortest prompt split
+    # into S stages, S:tokens[;...]; each stage adds a hand-off to the fill.
+    "TPU_DP_PIPELINE_STAGE_TOKENS": env_str(
+        "TPU_DP_PIPELINE_STAGE_TOKENS", "3:40960;4:73728"
+    ),
+    # TPU_DP_PIPELINE_PREFILL: an engine helps only after it has had nothing in
+    # flight for this long; a closed-loop client refills a freed engine sooner.
+    "TPU_DP_PIPELINE_HELPER_IDLE_MS": env_nonnegative_float(
+        "TPU_DP_PIPELINE_HELPER_IDLE_MS", 250.0
+    ),
+    # TPU_DP_PIPELINE_PREFILL: a stage waiting longer than this for a hand-off
+    # fails the step.
+    "TPU_DP_PIPELINE_TIMEOUT_S": env_nonnegative_float(
+        "TPU_DP_PIPELINE_TIMEOUT_S", 300.0
+    ),
 }
 
 
