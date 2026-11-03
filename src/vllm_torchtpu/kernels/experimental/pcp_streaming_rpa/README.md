@@ -88,23 +88,17 @@ as duplicated runtime fields.
 
 ## Kernel Execution
 
-The metadata entry splits execution into two Pallas calls:
-
-1. The current-chunk causal pass starts at the first current page group,
-   streams only current-chunk KV pages through the ring, and produces
-   online-softmax state `(m, l, acc)`.
-2. The history no-causal pass consumes historical page groups through the same
-   ring structure, reuses the state from the current pass, and writes `acc / l`
-   back to HBM.
-
-Both passes use the packed batched-RPA KV-cache layout and reuse each ring
-transfer for all local KV heads.
+The metadata entry writes fresh KV into each rank's local paged KV-cache shard
+(across window 0 plus any overflow windows when a cache rank owns more than
+`local_tokens` rows) and streams one unified Tokamax Splash attention pass over
+sorted active virtual-page groups (`[history + current]`), using single-call
+group rungs up to `512` virtual pages and online FP32 `logsumexp` merging above.
 
 ## Entry Points
 
 - `pcp_streaming_attention_page_groups_packed_local_from_metadata`: production
-  metadata-driven entry. It builds a JAX schedule from vLLM metadata, then runs
-  the split current/history packed-local kernels.
+  metadata-driven entry consuming a stage-level `PCPStagePlan` shared across
+  all layers in a pipeline stage.
 
 ## Current Constraints
 
@@ -113,9 +107,6 @@ The production path is intentionally narrow:
 - Full attention only; sliding-window attention is not supported here.
 - `cp_kv_cache_interleave_size <= page_size`, and `page_size` must be
   divisible by `cp_kv_cache_interleave_size`.
-- `q_block_size` must be a multiple of the interleave size.
 - The metadata schedule path supports `num_lanes == 1` and
   `kv_pages_per_block == 1`.
 - `head_dim == 64` and attention sinks are not supported.
-- The current pass captures fresh KV while attention consumes the ring; the
-  cache writeback completes before the history pass begins.
