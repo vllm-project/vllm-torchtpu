@@ -19,6 +19,8 @@ import jax.numpy as jnp
 
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
+# Rows in an f32 vreg tile.
+F32_SUBLANE = 8
 
 # Explicit scoped-VMEM budget, repo convention (mla/v1, deepseek_v4 and
 # fused_moe use the same constant). Never rely on the backend default —
@@ -156,3 +158,63 @@ def mhc_pre_gates(
             jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps
         )
     return pre_mix, post_mix, comb_mix
+
+
+def mhc_post_comb_gates_t(
+    mixes_t: jax.Array,
+    sqrsum_t: jax.Array,
+    post_scale: jax.Array,
+    comb_scale: jax.Array,
+    base_t: jax.Array,
+    *,
+    hc_mult: int,
+    hidden_size: int,
+    rms_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[jax.Array, jax.Array]:
+    """``mhc_pre_gates``' post and comb gates inside a kernel, tokens on lanes.
+
+    Takes the transposed mixes (hc_mult3, T), squared sums (1, T) and
+    logit biases (hc_mult3, 1); returns post_mix (M, T) and comb_mix
+    (M * M, T), row-major (i, j). Each comb row is an (M, T) array, so a
+    row sum is a sublane reduction and a column sum adds the rows; with
+    the tokens on sublanes instead, 16 of 128 lanes would hold data. The
+    formulas are ``mhc_pre_gates``', in its order; the sums may associate
+    differently.
+    """
+    m = hc_mult
+    eps = hc_sinkhorn_eps
+    mixes_t = mixes_t * jax.lax.rsqrt(sqrsum_t / (m * hidden_size) + rms_eps)
+
+    post_logits = mixes_t[m : 2 * m] * post_scale + base_t[m : 2 * m]
+    post_t = jax.nn.sigmoid(post_logits) * hc_post_mult_value
+
+    def comb_row(i):
+        k = (2 + i) * m
+        return mixes_t[k : k + m] * comb_scale + base_t[k : k + m]
+
+    def padded(row):
+        # Zero rows up to whole f32 sublane tiles: rows then add without
+        # sublane shifts, and the zero entries leave every sum unchanged.
+        extra = round_up(m, F32_SUBLANE) - m
+        if not extra:
+            return row
+        return jnp.concatenate([row, jnp.zeros((extra, row.shape[1]), row.dtype)])
+
+    rows = [padded(jax.nn.softmax(comb_row(i), axis=0) + eps) for i in range(m)]
+
+    def normalize_cols(rows):
+        col_sum = rows[0]
+        for r in rows[1:]:
+            col_sum = col_sum + r
+        return [r / (col_sum + eps) for r in rows]
+
+    def normalize_rows(rows):
+        return [r / (jnp.sum(r, axis=0, keepdims=True) + eps) for r in rows]
+
+    rows = normalize_cols(rows)
+    for _ in range(sinkhorn_repeat - 1):
+        rows = normalize_cols(normalize_rows(rows))
+    return post_t, jnp.concatenate([r[:m] for r in rows], axis=0)
