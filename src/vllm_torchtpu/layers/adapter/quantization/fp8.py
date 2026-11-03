@@ -87,6 +87,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
+    TOKEN_MINOR_OUTPUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     quantized_matmul,
 )
@@ -1684,6 +1685,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 weight,
                 layer.weight_scale,
                 w8a16_max_rows=self.w8a16_max_rows,
+                out_token_minor=getattr(layer, TOKEN_MINOR_OUTPUT_ATTR, False),
             )
         if bias is not None:
             out = out + bias

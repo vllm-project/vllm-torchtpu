@@ -54,7 +54,10 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
 )
-from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    TOKEN_MINOR_OUTPUT_ATTR,
+)
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
@@ -381,6 +384,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
         if hasattr(self, "in_proj_qkvz"):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
+            # The split into q/k/v/z heads and the conv read it token-minor.
+            setattr(self.in_proj_qkvz, TOKEN_MINOR_OUTPUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].
