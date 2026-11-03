@@ -2,6 +2,7 @@
 """Actual shifted mHC Torch bridge with public and terminal-post boundaries."""
 
 import argparse
+import ast
 import hashlib
 import importlib.metadata
 import json
@@ -31,6 +32,19 @@ def main():
 
     torch.set_num_threads(1)
     torch.empty(1, device="tpu").cpu()
+    # Match the production load-time packing, including contiguous storage.
+    pack_source = gate.ROOT / "src/vllm_torchtpu/models/vllm/deepseek_v41/common/mhc.py"
+    pack_node = next(
+        n
+        for n in ast.parse(pack_source.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "pack_mix_weight"
+    )
+    pack_namespace = {"torch": torch}
+    exec(
+        compile(ast.Module([pack_node], type_ignores=[]), str(pack_source), "exec"),
+        pack_namespace,
+    )
+    pack_weight = pack_namespace["pack_mix_weight"]
     # Skip unrelated model/layer registries; import the target bridge unchanged.
     for name in (
         "vllm_torchtpu.models",
@@ -194,6 +208,7 @@ def main():
                 gate.SOURCE,
                 Path(bridge.__file__),
                 Path(post_kernel.__file__),
+                pack_source,
             )
         },
         "correctness": [],
@@ -204,16 +219,37 @@ def main():
     def save():
         (args.out / "results.json").write_text(json.dumps(result, indent=2) + "\n")
 
-    def inputs(cpu):
-        return tuple(
-            torch.from_numpy(a.astype(np.float32)).to(
+    def inputs(cpu, weights):
+        tensors = []
+        layouts = []
+        for i, a in enumerate(cpu):
+            if i in (5, 10):
+                tensor = pack_weight(torch.from_numpy(weights[0 if i == 5 else 1]))
+                np.testing.assert_array_equal(
+                    tensor.float().numpy(), a.astype(np.float32)
+                )
+                assert tensor.is_contiguous()
+            else:
+                tensor = torch.from_numpy(a.astype(np.float32))
+            tensor = tensor.to(
                 device="tpu",
                 dtype=(
                     torch.bfloat16 if a.dtype == ml_dtypes.bfloat16 else torch.float32
                 ),
             )
-            for a in cpu
+            tensors.append(tensor)
+            layouts.append(
+                {
+                    "index": i,
+                    "shape": list(tensor.shape),
+                    "stride": list(tensor.stride()),
+                }
+            )
+        result["input_layouts"] = layouts
+        result["weight_packing"] = (
+            "original pack_mix_weight, exact independent pack match"
         )
+        return tuple(tensors)
 
     save()
     for kind, seed in (
@@ -232,7 +268,7 @@ def main():
             + want[2] * cpu[0].astype(np.float64)[:, None, :]
         )
         wanted = {"public": want, "terminal": (want[0], want[4], terminal_ref, want[5])}
-        xs = inputs(cpu)
+        xs = inputs(cpu, weights)
         for label, variants in funcs.items():
             actual = {}
             errors = {}
@@ -271,7 +307,7 @@ def main():
             save()
             print(json.dumps(row), flush=True)
     result["precision_passed"] = True
-    xs = inputs(chain.fixture("normal")[0])
+    xs = inputs(*chain.fixture("normal"))
     for label, variants in funcs.items():
 
         def run(fn):
