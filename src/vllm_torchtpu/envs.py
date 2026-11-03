@@ -268,6 +268,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FREEZE_PYSPY_S: float = 120.0
     VLLM_TPU_REASONING_COUNT_SKIP_TOOLS: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_OWNED: bool = False
+    VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR: bool = False
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1644,6 +1645,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # words only, instead of a global bitset then an owned-word gather
     # (bit-identical).
     "VLLM_TPU_QSA_PREFILL_BITSET_OWNED": env_bool("VLLM_TPU_QSA_PREFILL_BITSET_OWNED"),
+    # Compressed main-KV DCP ops: all-gather the pair's q/gate rank-major
+    # (dim 0) and join the heads inside the step, instead of a dim -1 gather
+    # whose head join runs as a standalone copy (bit-identical).
+    "VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR": env_bool("VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR"),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for

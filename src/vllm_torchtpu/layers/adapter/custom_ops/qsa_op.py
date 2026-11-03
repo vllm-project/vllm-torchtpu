@@ -399,6 +399,15 @@ def build_pooled_qsa_shared_op(with_rows: bool):
     return run
 
 
+def _qgate_dims(qgate: torch.Tensor) -> tuple[int, int]:
+    """(tokens, joined width) of a ``_pair_qgate`` result."""
+    if qgate.dim() == 4:  # rank-major q heads only (VLLM_TPU_QSA_DCP_Q_GATHER)
+        return qgate.shape[1], qgate.shape[0] * qgate.shape[2] * qgate.shape[3] * 2
+    if qgate.dim() == 3:
+        return qgate.shape[1], qgate.shape[0] * qgate.shape[2]
+    return qgate.shape[0], qgate.shape[1]
+
+
 def _all_gather_ranks(x: torch.Tensor, group) -> torch.Tensor:
     """``[...]`` on every rank -> ``[ranks, ...]`` in rank order."""
     return group.all_gather(x.unsqueeze(0).contiguous(), dim=0)
@@ -1142,8 +1151,8 @@ def _compressed_dcp_ops():
                     starts, context, ring_ids, main_table, compressed_table, dcp_rank,
                     compress_ratio, token_topk, norm_eps, rotary_dim, dcp_size=2, k_scale=1.0,
                     v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1):
-        tokens, head_dim = qgate.shape[0], nq.shape[0]
-        heads = qgate.shape[1] // (2 * head_dim)
+        (tokens, width), head_dim = _qgate_dims(qgate), nq.shape[0]
+        heads = width // (2 * head_dim)
         k = token_topk // compress_ratio
         return (
             torch.empty_like(pool),
@@ -1188,7 +1197,7 @@ def _compressed_dcp_ops():
         out = select_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig,
                           pool, starts, context, ring_ids, main_table, compressed_table,
                           dcp_rank, compress_ratio, token_topk, norm_eps, rotary_dim)
-        rows = qgate.shape[0] // shard_size
+        rows = _qgate_dims(qgate)[0] // shard_size
         return (*out[:6], out[6][:rows], out[7][:rows])
 
     return select, attend, token_select
@@ -1285,7 +1294,7 @@ def build_pooled_qsa_compressed_dcp_op(pair_group, size: int):
             args[index] = args[index].to(torch.int32)
         qgate = args[0]
         head_dim = args[4].shape[0]
-        args[0] = pair_group.all_gather(qgate.contiguous(), dim=-1)
+        args[0] = _pair_qgate(qgate, head_dim, pair_group, pair_major=True, q_gather=False)
         pool = args[10]
         updated, q, gate, lengths, req, starts, vals, pos = select(
             *args, dcp_rank, dcp_size=size, **kwargs
@@ -1308,16 +1317,26 @@ def build_pooled_qsa_compressed_dcp_op(pair_group, size: int):
     return run
 
 
-def _pair_qgate(qgate, head_dim, pair_group):
-    """The pair's concatenated ``qgate`` for the DCP prefill select step.
+def _pair_qgate(qgate, head_dim, pair_group, pair_major=False, q_gather=True):
+    """The pair's ``qgate`` for the DCP prefill select step: ``[T, pair * C]``
+    (heads joined by a dim -1 all-gather, which copies the rows into place).
+
     VLLM_TPU_QSA_DCP_Q_GATHER: gather only the q halves and zero the gates;
     the DCP attention returns ungated partials and ``_dcp_finish`` gates with
-    this rank's own ``qgate``, so half the bytes and the same values."""
-    if not envs.VLLM_TPU_QSA_DCP_Q_GATHER:
-        return pair_group.all_gather(qgate.contiguous(), dim=-1)
+    this rank's own ``qgate``, so half the bytes and the same values.
+    ``pair_major`` with VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR (steps that join the
+    heads themselves): the dim-0 gather's rank-major ``[pair, T, C]``, or with
+    the q gather ``[pair, T, H, D]`` q heads whose zero gates the step adds.
+    ``q_gather=False``: never drop the gates (ops the q gather does not cover)."""
+    q_only = q_gather and envs.VLLM_TPU_QSA_DCP_Q_GATHER
     tokens = qgate.shape[0]
-    q = qgate.reshape(tokens, -1, 2 * head_dim)[..., :head_dim]
-    q_pair = pair_group.all_gather(q.contiguous(), dim=1)
+    if q_only:
+        qgate = qgate.reshape(tokens, -1, 2 * head_dim)[..., :head_dim]
+    if pair_major and envs.VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR:
+        return pair_group.all_gather(qgate.contiguous().unsqueeze(0), dim=0)
+    if not q_only:
+        return pair_group.all_gather(qgate.contiguous(), dim=-1)
+    q_pair = pair_group.all_gather(qgate.contiguous(), dim=1)
     return torch.cat([q_pair, torch.zeros_like(q_pair)], dim=-1).reshape(tokens, -1)
 
 
@@ -1339,7 +1358,7 @@ def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: i
             args[index] = args[index].to(torch.int32)
         qgate = args[0]
         tokens, head_dim = qgate.shape[0], args[4].shape[0]
-        args[0] = _pair_qgate(qgate, head_dim, pair_group)
+        args[0] = _pair_qgate(qgate, head_dim, pair_group, pair_major=True)
         pool = args[10]
         updated, q, gate, lengths, req, starts, vals, pos = token_select(
             *args, torch.div(shard_index, size, rounding_mode="floor"), dcp_rank,

@@ -1524,6 +1524,16 @@ def _pooled_qsa(
     # Native BlockTable pads this one-block ring row to token alignment.
     # Only column zero owns storage; the remaining entries are padding.
     ring_ids = ring_ids.reshape(len(context), -1)[:, 0]
+    if qgate.ndim == 4:
+        # With VLLM_TPU_QSA_DCP_Q_GATHER too: [pair, T, H, D] q heads only;
+        # the DCP attention is ungated, so their gates are zeros.
+        qgate = jnp.concatenate([qgate, jnp.zeros_like(qgate)], axis=-1)
+        qgate = qgate.reshape(*qgate.shape[:2], -1)
+    if qgate.ndim == 3:
+        # VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR: the pair's q/gate rows arrive
+        # rank-major ([pair, T, C], a dim-0 all-gather); join each token's
+        # ranks here, where XLA fuses the transpose into its consumers.
+        qgate = jnp.moveaxis(qgate, 0, 1).reshape(qgate.shape[1], -1)
     q, k, v, gate, iq, raw = produce(
         qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim
     )
