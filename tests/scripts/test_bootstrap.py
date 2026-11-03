@@ -35,11 +35,6 @@ from unittest import mock
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SCRIPTS_DIR = _REPO_ROOT / ".buildkite" / "scripts"
 
-_ALL_LANE_FILES = frozenset(
-    f".buildkite/pipeline_{lane}.yml"
-    for lane in ("cpu", "tests", "integration", "perf", "verify")
-)
-
 _FAKE_AGENT_BODY = """
 import json
 import os
@@ -180,32 +175,189 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertIsNone(bp.parse_merged_pr_number("chore: direct commit"))
 
-    def test_plan_uploads_lanes_overrides_and_skip_reasons(self) -> None:
+    def test_choose_suite_and_plan_uploads(self) -> None:
         bp = self.bp
-        default_plan = bp.plan_uploads(
-            bp.BuildContext.from_env({"BUILDKITE_PULL_REQUEST": "10"}),
-            merged_labels=(),
-            existing_lane_files=_ALL_LANE_FILES,
+
+        # 1. One test per branch of choose_suite (first match wins).
+        # Branch 1: CI_SUITE override beats integration, skip-tpu-ci, and labels.
+        self.assertEqual(
+            bp.choose_suite(
+                bp.BuildContext.from_env(
+                    {
+                        "CI_SUITE": "perf",
+                        "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration",
+                        "BUILDKITE_PULL_REQUEST": "10",
+                        "BUILDKITE_PULL_REQUEST_LABELS": "skip-tpu-ci,run-full-ci",
+                    }
+                )
+            ),
+            "perf",
         )
-        self.assertEqual(default_plan.lanes, ("cpu", "tests", "integration", "verify"))
+        # Branch 2: vllm-torchtpu-integration pipeline.
+        self.assertEqual(
+            bp.choose_suite(
+                bp.BuildContext.from_env(
+                    {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"}
+                )
+            ),
+            "integration",
+        )
+        # Branch 3: skip-tpu-ci (PR label or post-merge merged_labels)
+        # beats run-full-ci and run-perf-eval.
+        self.assertEqual(
+            bp.choose_suite(
+                bp.BuildContext.from_env(
+                    {
+                        "BUILDKITE_PULL_REQUEST": "10",
+                        "BUILDKITE_PULL_REQUEST_LABELS": (
+                            "run-full-ci,run-perf-eval,skip-tpu-ci"
+                        ),
+                    }
+                )
+            ),
+            "cpu-only",
+        )
+        self.assertEqual(
+            bp.choose_suite(
+                bp.BuildContext.from_env(
+                    {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"}
+                ),
+                merged_labels=("skip-tpu-ci",),
+            ),
+            "cpu-only",
+        )
+        # Branch 4: NIGHTLY=1, run-full-ci, or run-perf-eval -> "full".
+        for full_env in (
+            {"NIGHTLY": "1"},
+            {
+                "BUILDKITE_PULL_REQUEST": "10",
+                "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-full-ci",
+            },
+            {
+                "BUILDKITE_PULL_REQUEST": "10",
+                "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-perf-eval",
+            },
+        ):
+            self.assertEqual(
+                bp.choose_suite(bp.BuildContext.from_env(full_env)), "full"
+            )
+        # Branch 5: default for vllm-torchtpu-ci, torchtpu-nightly, main, unknown slug.
+        for default_env in (
+            {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-ci"},
+            {
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-torchtpu-nightly",
+                "TORCHTPU_NIGHTLY": "1",
+            },
+            {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
+            {"BUILDKITE_PIPELINE_SLUG": "custom-pipeline"},
+        ):
+            self.assertEqual(
+                bp.choose_suite(bp.BuildContext.from_env(default_env)), "default"
+            )
+
+        # 2. One test per suite in SUITES via plan_uploads.
+        # "default" suite: gated PR waits on cpu_checks and builds -omni.
+        default_plan = bp.plan_uploads(
+            bp.BuildContext.from_env({"BUILDKITE_PULL_REQUEST": "10"})
+        )
+        self.assertEqual(default_plan.suite, "default")
+        self.assertEqual(
+            default_plan.lanes, ("build", "cpu", "tests", "integration", "verify")
+        )
         self.assertEqual(default_plan.cpu_gate, "cpu_checks")
         self.assertEqual(default_plan.omni_image_skip, "")
+        self.assertFalse(default_plan.nightly)
+        self.assertEqual(default_plan.annotations, ())
 
-        # Gated PR with run-perf-eval or run-full-ci still waits on cpu_checks.
+        # "full" suite: run-full-ci sets nightly=True; run-perf-eval keeps False.
         gated_full = bp.plan_uploads(
             bp.BuildContext.from_env(
                 {
                     "BUILDKITE_PULL_REQUEST": "10",
                     "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-full-ci",
                 }
-            ),
-            merged_labels=(),
-            existing_lane_files=_ALL_LANE_FILES,
+            )
         )
+        self.assertEqual(gated_full.suite, "full")
         self.assertTrue(gated_full.nightly)
-        self.assertEqual(gated_full.lanes, bp.ALL_LANES)
+        self.assertEqual(
+            gated_full.lanes,
+            ("build", "cpu", "tests", "integration", "perf", "verify"),
+        )
         self.assertEqual(gated_full.cpu_gate, "cpu_checks")
-        self.assertEqual(gated_full.pre_lane_annotations[0].context, "full-ci")
+        self.assertEqual(gated_full.annotations[0].context, "full-ci")
+
+        gated_perf_eval = bp.plan_uploads(
+            bp.BuildContext.from_env(
+                {
+                    "BUILDKITE_PULL_REQUEST": "10",
+                    "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-perf-eval",
+                }
+            )
+        )
+        self.assertEqual(gated_perf_eval.suite, "full")
+        self.assertFalse(gated_perf_eval.nightly)
+        self.assertEqual(gated_perf_eval.cpu_gate, "cpu_checks")
+        self.assertEqual(gated_perf_eval.annotations[0].context, "perf-eval")
+
+        # "perf" suite (CI_SUITE=perf): build + perf only, skips -omni, no cpu_checks.
+        perf_only = bp.plan_uploads(bp.BuildContext.from_env({"CI_SUITE": "perf"}))
+        self.assertEqual(perf_only.suite, "perf")
+        self.assertEqual(perf_only.lanes, ("build", "perf"))
+        self.assertEqual(
+            perf_only.lane_files,
+            (".buildkite/pipeline_build.yml", ".buildkite/pipeline_perf.yml"),
+        )
+        self.assertEqual(perf_only.cpu_gate, "build_docker")
+        self.assertTrue(bool(perf_only.omni_image_skip))
+        self.assertLessEqual(len(perf_only.omni_image_skip), 70)
+        self.assertEqual(perf_only.annotations, ())
+
+        # "cpu-only" suite: build + cpu only, skips -omni, no cpu_checks.
+        skip_plan = bp.plan_uploads(
+            bp.BuildContext.from_env(
+                {
+                    "BUILDKITE_PULL_REQUEST": "10",
+                    "BUILDKITE_PULL_REQUEST_LABELS": (
+                        "run-full-ci,run-perf-eval,skip-tpu-ci"
+                    ),
+                }
+            )
+        )
+        self.assertEqual(skip_plan.suite, "cpu-only")
+        self.assertEqual(skip_plan.lanes, ("build", "cpu"))
+        self.assertEqual(
+            skip_plan.lane_files,
+            (".buildkite/pipeline_build.yml", ".buildkite/pipeline_cpu.yml"),
+        )
+        self.assertEqual(skip_plan.cpu_gate, "build_docker")
+        self.assertFalse(skip_plan.nightly)
+        self.assertEqual(skip_plan.annotations[0].context, "skip-tpu-ci")
+        self.assertTrue(bool(skip_plan.omni_image_skip))
+        self.assertLessEqual(len(skip_plan.omni_image_skip), 70)
+
+        post_merge_skip = bp.plan_uploads(
+            bp.BuildContext.from_env(
+                {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"}
+            ),
+            merged_labels=("skip-tpu-ci",),
+        )
+        self.assertEqual(post_merge_skip.suite, "cpu-only")
+        self.assertEqual(post_merge_skip.lanes, ("build", "cpu"))
+
+        # "integration" suite: includes promote at the end.
+        integ_plan = bp.plan_uploads(
+            bp.BuildContext.from_env(
+                {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"}
+            )
+        )
+        self.assertEqual(integ_plan.suite, "integration")
+        self.assertEqual(
+            integ_plan.lanes,
+            ("build", "cpu", "tests", "integration", "perf", "verify", "promote"),
+        )
+        self.assertEqual(integ_plan.cpu_gate, "cpu_checks")
+        self.assertEqual(integ_plan.omni_image_skip, "")
 
         # Ungated builds: oncall-fix PR, scheduled build, and release tag.
         for env in (
@@ -217,89 +369,16 @@ class TestBootstrapUnits(unittest.TestCase):
             {"BUILDKITE_TAG": "v0.32.0"},
             {"BUILDKITE_TAG": "0.32.0rc1"},
         ):
-            ungated = bp.plan_uploads(
-                bp.BuildContext.from_env(env),
-                merged_labels=(),
-                existing_lane_files=_ALL_LANE_FILES,
-            )
+            ungated = bp.plan_uploads(bp.BuildContext.from_env(env))
             self.assertEqual(ungated.cpu_gate, "build_docker")
 
-        # skip-tpu-ci uploads ONLY cpu (no TPU files), overriding run-full-ci/perf.
-        skip_plan = bp.plan_uploads(
-            bp.BuildContext.from_env(
-                {
-                    "BUILDKITE_PULL_REQUEST": "10",
-                    "BUILDKITE_PULL_REQUEST_LABELS": (
-                        "run-full-ci,run-perf-eval,skip-tpu-ci"
-                    ),
-                }
-            ),
-            merged_labels=(),
-            existing_lane_files=_ALL_LANE_FILES,
-        )
-        self.assertEqual(skip_plan.lanes, ("cpu",))
-        self.assertEqual(skip_plan.lane_files, (".buildkite/pipeline_cpu.yml",))
-        self.assertEqual(skip_plan.cpu_gate, "build_docker")
-        self.assertTrue(bool(skip_plan.omni_image_skip))
-        self.assertLessEqual(len(skip_plan.omni_image_skip), 70)
-
-        # Post-merge webhook honors merged PR's skip-tpu-ci label; CI_LANES=perf
-        # uploads only perf, skips -omni, and never references cpu_checks.
-        post_merge_skip = bp.plan_uploads(
-            bp.BuildContext.from_env(
-                {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"}
-            ),
-            merged_labels=("skip-tpu-ci",),
-            existing_lane_files=_ALL_LANE_FILES,
-        )
-        self.assertEqual(post_merge_skip.lanes, ("cpu",))
-        self.assertEqual(post_merge_skip.lane_files, (".buildkite/pipeline_cpu.yml",))
-
-        perf_only = bp.plan_uploads(
-            bp.BuildContext.from_env({"CI_LANES": "perf"}),
-            merged_labels=(),
-            existing_lane_files=_ALL_LANE_FILES,
-        )
-        self.assertEqual(perf_only.lanes, ("perf",))
-        self.assertEqual(perf_only.lane_files, (".buildkite/pipeline_perf.yml",))
-        self.assertEqual(perf_only.cpu_gate, "build_docker")
-        self.assertTrue(bool(perf_only.omni_image_skip))
-        self.assertLessEqual(len(perf_only.omni_image_skip), 70)
-
-        cpu_and_tests = bp.plan_uploads(
-            bp.BuildContext.from_env(
-                {"BUILDKITE_PULL_REQUEST": "10", "CI_LANES": "tests cpu"}
-            ),
-            merged_labels=(),
-            existing_lane_files=_ALL_LANE_FILES,
-        )
-        self.assertEqual(cpu_and_tests.lanes, ("cpu", "tests"))
-        self.assertEqual(cpu_and_tests.cpu_gate, "cpu_checks")
-        self.assertEqual(cpu_and_tests.omni_image_skip, "")
-
-        # Invalid CI_LANES and missing lane handling (warn by default, fail when named).
-        invalid = bp.plan_uploads(
-            bp.BuildContext.from_env({"CI_LANES": "bogus"}),
-            merged_labels=(),
-            existing_lane_files=_ALL_LANE_FILES,
-        )
-        self.assertIsNotNone(invalid.invalid_ci_lanes_error)
-
-        gap_warn = bp.plan_uploads(
-            bp.BuildContext.from_env({}),
-            merged_labels=(),
-            existing_lane_files={".buildkite/pipeline_tests.yml"},
-        )
-        self.assertIsNone(gap_warn.missing_ci_lanes_error)
-        self.assertEqual(gap_warn.cpu_gate, "build_docker")
-        self.assertEqual(gap_warn.post_lane_annotations[0].context, "lane-gaps")
-
-        gap_err = bp.plan_uploads(
-            bp.BuildContext.from_env({"CI_LANES": "perf"}),
-            merged_labels=(),
-            existing_lane_files={".buildkite/pipeline_tests.yml"},
-        )
-        self.assertIsNotNone(gap_err.missing_ci_lanes_error)
+        # Unknown CI_SUITE fails listing the valid suite names.
+        with self.assertRaisesRegex(
+            bp.BootstrapError,
+            r"ERROR: unknown CI_SUITE 'bogus'; "
+            r"suites are: default full perf cpu-only integration",
+        ):
+            bp.plan_uploads(bp.BuildContext.from_env({"CI_SUITE": "bogus"}))
 
         rendered = bp.prepare_upload_yaml(
             'if: \'build.env("NIGHTLY") == "1"\'\n', job_priority=12, nightly=True
@@ -707,8 +786,8 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertEqual([u[0] for u in fx.uploads], ["cpu", "build"])
             self.assertTrue(bool(fx.uploads[1][2]["OMNI_IMAGE_SKIP"]))
 
-        # CI_LANES=perf uploads ONLY ["perf", "build"] with no cpu_checks dependency.
-        perf_sched = run({"CI_LANES": "perf", "BUILDKITE_BRANCH": "main"})
+        # CI_SUITE=perf uploads ONLY ["perf", "build"] with no cpu_checks dependency.
+        perf_sched = run({"CI_SUITE": "perf", "BUILDKITE_BRANCH": "main"})
         self.assertEqual([u[0] for u in perf_sched.uploads], ["perf", "build"])
         self.assertEqual(perf_sched.uploads[0][2]["CPU_GATE"], "build_docker")
         self.assertNotIn("cpu_checks", perf_sched.uploads[0][1])
@@ -746,6 +825,25 @@ class TestBootstrapUnits(unittest.TestCase):
             for _, content, _ in fx.uploads:
                 self.assertNotIn('build.env("NIGHTLY")', content)
 
+        # torchtpu-nightly schedule runs default suite at priority 1 (ungated).
+        torchtpu_nightly = run(
+            {
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-torchtpu-nightly",
+                "TORCHTPU_NIGHTLY": "1",
+                "BUILDKITE_SOURCE": "schedule",
+                "BUILDKITE_BRANCH": "main",
+            }
+        )
+        self.assertEqual(
+            torchtpu_nightly.meta,
+            [("JOB_PRIORITY", "1"), ("VLLM_COMMIT_HASH", pinned)],
+        )
+        self.assertEqual(
+            [u[0] for u in torchtpu_nightly.uploads],
+            ["verify", "integration", "tests", "cpu", "build"],
+        )
+        self.assertEqual(torchtpu_nightly.uploads[0][2]["CPU_GATE"], "build_docker")
+
         # Release tag is ungated; integration pipeline uploads promote first.
         tag_fx = run({"BUILDKITE_TAG": "v0.32.0", "BUILDKITE_BRANCH": "v0.32.0"})
         self.assertEqual(tag_fx.uploads[0][2]["CPU_GATE"], "build_docker")
@@ -774,18 +872,14 @@ class TestBootstrapUnits(unittest.TestCase):
         # order: reversed(uploads)), and nightly_report.sh's step-key scan.
         bk_bin = shutil.which("bk")
         if bk_bin is not None:
-            for lane_path in (
-                bp.BUILD_PIPELINE_FILE,
-                *(lane.file for lane in bp.LANES),
-                bp.PROMOTE_PIPELINE_FILE,
-            ):
+            for lane in bp.LANES.values():
                 subprocess.run(
                     [
                         bk_bin,
                         "pipeline",
                         "validate",
                         "--file",
-                        str(_REPO_ROOT / lane_path),
+                        str(_REPO_ROOT / lane.file),
                     ],
                     check=True,
                     capture_output=True,
@@ -803,7 +897,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 for name, scenario_fx in (
                     ("pr", pr),
                     ("skip_tpu_ci", skip_fx),
-                    ("ci_lanes_perf", perf_sched),
+                    ("ci_suite_perf", perf_sched),
                     ("nightly", nightly),
                     ("integration", integ),
                 ):

@@ -21,7 +21,7 @@ runs the full nightly suite across every lane: `cpu`, `tests`, `integration`,
 `perf` and `verify`); adding either label to a PR that already has
 `ready` starts a build that includes them. The 02:00 PT nightly runs
 all of them. Between nightlies, schedules on `vllm-torchtpu-ci` that set
-`CI_LANES=perf` run the perf lane alone; without `NIGHTLY` that is only the
+`CI_SUITE=perf` run the perf lane alone; without `NIGHTLY` that is only the
 steps not gated on it. The schedules keep clear of the hours the nightly's
 perf steps take. The integration pipeline also runs the lane, because its LKG
 promotion waits on two of its steps.
