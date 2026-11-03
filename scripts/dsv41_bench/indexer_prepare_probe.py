@@ -72,7 +72,16 @@ def main():
     order = rng.permutation(288).astype(np.int32)
     functions = {"native": jax.jit(native), "candidate": jax.jit(prepare_sorted_fp8)}
     results = []
-    for kind in ("normal", "zero", "tiny", "large", "powers", "scale_edges", "ties"):
+    for kind in (
+        "normal",
+        "zero",
+        "tiny",
+        "large",
+        "powers",
+        "scale_edges",
+        "ties",
+        "subnormal_edges",
+    ):
         keys = rng.normal(size=(288, 128))
         if kind == "zero":
             keys[:] = 0
@@ -100,6 +109,11 @@ def main():
             midpoints = (values[:-1] + values[1:]) / 2
             keys = midpoints[np.arange(288 * 128).reshape(288, 128) % midpoints.size]
             keys[:, 0] = 448
+            keys *= np.exp2(np.arange(288) % 41 - 20)[:, None]
+        elif kind == "subnormal_edges":
+            keys = np.zeros((288, 128), np.float32)
+            keys[:, 0] = 448
+            keys[:, 1:7] = np.array([1, 2, 3, -1, -2, -3]) * (2.0**-9)
             keys *= np.exp2(np.arange(288) % 41 - 20)[:, None]
         keys = keys.astype(ml_dtypes.bfloat16)
         expected = reference(keys, columns, order)
