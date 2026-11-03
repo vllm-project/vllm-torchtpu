@@ -20,8 +20,17 @@
 # unified block pool, a fixed 40.4 GB fp8 KV pool and the prefix-aware
 # scheduler. The trace replay itself runs outside this repository; the sweep
 # below is a random-prompt stand-in at the replay's concurrency (64), with
-# every prompt 65536 tokens long (the replay's mean is about 71k in, 584 out)
-# so that each of its 64 decodes passes 65536 tokens of context.
+# every prompt 65536 tokens long (RANDOM_RANGE_RATIO=1.0 fixes the lengths;
+# the replay's mean is about 71k in, 584 out) so that each of its 64 decodes
+# passes 65536 tokens of context.
+#
+# The exports copy the recipe's environment as it is. Some are read by no
+# code in this tree (TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER,
+# TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, USE_BATCHED_RPA_LONGCTX,
+# DP_SCHED_BATCH_PREFILL), and the two VLLM_TPU_*DRAFT*/EAGLE knobs do
+# nothing without a speculative config; they are kept so the server's
+# environment matches the recipe's. TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS
+# acts only through LIBTPU_INIT_ARGS below.
 MODEL="Qwen/Qwen3.5-397B-A17B-FP8"
 TENSOR_PARALLELISM=8
 DATA_PARALLELISM=1
@@ -71,8 +80,8 @@ export VLLM_ENGINE_READY_TIMEOUT_S="7200"
 
 # The deployment's libtpu flags: its defaults, the SparseCore hierarchical
 # all-reduce from TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS tokens of hidden
-# size 4096 in bf16, and the async SparseCore all-gather that
-# TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER turns on. env_override.py appends its own.
+# size 4096 in bf16, and the async SparseCore all-gather the recipe adds when
+# TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER=1. env_override.py appends its own.
 export LIBTPU_INIT_ARGS="--xla_tpu_use_minor_sharding_for_major_trivial_input=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_ars_combiner_threshold_in_bytes=0 --xla_tpu_enable_async_collective_merger=false --xla_tpu_enable_sparse_core_hierarchical_all_reduce=true --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=$((TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS * 4096 * 2)) --xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144"
 
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--prefill-schedule-interval=1 --language-model-only --block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false} --tool-call-parser=qwen3_coder --reasoning-parser=qwen3 --mamba-cache-mode align --trust-remote-code --enable-prompt-tokens-details --kv-cache-memory-bytes 40400000000 --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
