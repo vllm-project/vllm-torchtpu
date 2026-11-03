@@ -171,6 +171,19 @@ def compare(actual, expected):
         "different_elements": int(np.count_nonzero(delta)),
         "max_abs": float(np.max(delta)),
         "max_tolerance_ratio": float(np.max(delta / allowed)),
+        "failures": [
+            {
+                "index": list(index),
+                "actual": float(actual[index]),
+                "expected": float(expected[index]),
+                "absolute_error": float(delta[index]),
+                "allowed_error": float(allowed[index]),
+            }
+            for index in (
+                tuple(int(i) for i in coordinate)
+                for coordinate in np.argwhere(~good)[:8]
+            )
+        ],
     }
 
 
@@ -179,6 +192,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=200)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--diagnose", action="store_true")
+    parser.add_argument("--normal-seeds", default="")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     import torch
@@ -240,7 +255,7 @@ def main():
         ) + (torch.from_numpy(xs[4]).to("tpu") if masked else None,)
 
     save()
-    for kind, seed in (
+    cases = (
         ("normal", 42),
         ("normal", 137),
         ("masked", 42),
@@ -249,7 +264,12 @@ def main():
         ("tiny", 42),
         ("cancellation", 42),
         ("clamp_boundary", 42),
-    ):
+    )
+    if args.diagnose:
+        cases = (("normal", 137),)
+    if args.normal_seeds:
+        cases = tuple(("normal", int(seed)) for seed in args.normal_seeds.split(","))
+    for kind, seed in cases:
         xs = fixture(kind, seed)
         for masked in (True, False):
             values = inputs(xs, masked)
@@ -265,6 +285,51 @@ def main():
                 }
             )
             row["pallas_vs_native"] = compare(outputs["pallas"], outputs["native"])
+            if args.diagnose:
+                detailed = []
+                failed_coordinates = {
+                    tuple(failure["index"])
+                    for metric in ("native_vs_reference", "pallas_vs_reference")
+                    for failure in row[metric]["failures"]
+                }
+                for t, m, d in sorted(failed_coordinates):
+                    h = xs[0][t, m].astype(np.longdouble)
+                    keys = (
+                        xs[1][t, : MULT * DIM]
+                        .reshape(MULT, DIM)[m]
+                        .astype(np.longdouble)
+                    )
+                    q, k = [a[m].astype(np.longdouble) for a in xs[2:4]]
+                    dot = np.sum(h * q * k * keys)
+                    dot /= np.sqrt(np.mean(h * h) + np.longdouble(EPS))
+                    dot /= np.sqrt(np.mean(keys * keys) + np.longdouble(EPS)) * np.sqrt(
+                        np.longdouble(DIM)
+                    )
+                    gate = 1 / (
+                        1
+                        + np.exp(
+                            -np.copysign(
+                                np.sqrt(max(abs(dot), np.longdouble(CLAMP))),
+                                -1 if dot < 0 else 1,
+                            )
+                        )
+                    )
+                    value = np.longdouble(xs[1][t, MULT * DIM + d])
+                    exact = h[d] + gate * value
+                    detailed.append(
+                        {
+                            "index": [t, m, d],
+                            "float64_reference": float(want[t, m, d]),
+                            "longdouble_residual": float(exact),
+                            "longdouble_gate": float(gate),
+                            "longdouble_dot": float(dot),
+                            "hidden": float(h[d]),
+                            "value": float(value),
+                            "native": float(outputs["native"][t, m, d]),
+                            "pallas": float(outputs["pallas"][t, m, d]),
+                        }
+                    )
+                row["diagnostic"] = detailed
             result["correctness"].append(row)
             save()
             print(json.dumps(row), flush=True)
@@ -274,6 +339,10 @@ def main():
         for metric in ("native_vs_reference", "pallas_vs_reference", "pallas_vs_native")
     )
     save()
+    if args.diagnose:
+        result["completed"] = True
+        save()
+        return
     # Failed precision is recorded first; timings remain diagnostic and never
     # promote a numerically failing candidate into a production default.
     for masked in (True, False):
