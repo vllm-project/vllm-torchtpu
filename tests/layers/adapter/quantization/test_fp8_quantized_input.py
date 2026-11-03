@@ -96,6 +96,7 @@ def test_supports_quantized_input(
 
 @pytest.mark.cpu_test
 def test_quantized_input_round_trip_uses_layer_weights(monkeypatch):
+    monkeypatch.setenv("TPU_FP8_DECODE_GEMV_MAX_ROWS", "16")
     calls = []
 
     def fake_quantize(x, w_q):
@@ -115,4 +116,4 @@ def test_quantized_input_round_trip_uses_layer_weights(monkeypatch):
     assert out.shape == (8, _N)
     assert calls[0] == ("quantize", layer.weight)
     assert calls[1][1] is layer.weight and calls[1][2] is layer.weight_scale
-    assert calls[1][3] == method.decode_gemv_max_rows
+    assert method.decode_gemv_max_rows == 16 and calls[1][3] == 16
