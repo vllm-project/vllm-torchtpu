@@ -114,6 +114,13 @@ def _full_mix_variants_match(device):
             ),
             (mixed, norm, combined),
         )
+    # Rows are independent: a wider tile changes only the schedule.
+    wide = dict(static, token_tile=256)
+    _bitwise(_full_mix(x, weight, down, up, **wide), expected)
+    _bitwise(
+        _combine_full_mix(x, block, gates, weight, down, up, **wide, up_t=False),
+        (mixed, norm, combined),
+    )
 
 
 def test_full_mix_variants_are_bit_identical_interpret():

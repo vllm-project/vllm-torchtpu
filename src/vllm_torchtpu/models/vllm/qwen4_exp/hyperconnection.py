@@ -60,29 +60,37 @@ class GatedResidual(common_hc.GatedResidual):
             and self.config.hc_per_branch_norm
             and hasattr(self, "input_mix_weight_down")
         ):
-            from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_full_mix_op
+            from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
+                build_combine_full_mix_op,
+                build_full_mix_op,
+            )
 
             self._prefill_full_up_t = envs.VLLM_TPU_HC_PREFILL_UP_T
-            self._prefill_full_op = build_full_mix_op(
-                self.hc_count,
-                self.hidden_size,
-                self.hc_norm.variance_epsilon,
-                prefill_full_tile,
-                self._prefill_full_up_t,
-            )
+            wide = envs.VLLM_TPU_HC_PREFILL_WIDE_TILE
+            if wide and (wide % prefill_full_tile or wide <= prefill_full_tile):
+                raise ValueError(
+                    "VLLM_TPU_HC_PREFILL_WIDE_TILE must be a larger multiple of "
+                    "hc_prefill_full_tile"
+                )
+            # Full-mix ops by token tile, widest first.
+            tiles = (wide, prefill_full_tile) if wide else (prefill_full_tile,)
+            args = (self.hc_count, self.hidden_size, self.hc_norm.variance_epsilon)
+            self._prefill_full_ops = {
+                tile: build_full_mix_op(*args, tile, self._prefill_full_up_t)
+                for tile in tiles
+            }
+            self._prefill_full_op = self._prefill_full_ops[prefill_full_tile]
             if envs.VLLM_TPU_HC_PREFILL_COMBINE_MIX:
-                from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
-                    build_combine_full_mix_op,
-                )
-
                 # Used by the preceding HC's combine_mix (attn -> mlp).
-                self._prefill_combine_full_op = build_combine_full_mix_op(
-                    self.hc_count,
-                    self.hidden_size,
-                    self.hc_norm.variance_epsilon,
-                    prefill_full_tile,
-                    self._prefill_full_up_t,
-                )
+                self._prefill_combine_full_ops = {
+                    tile: build_combine_full_mix_op(
+                        *args, tile, self._prefill_full_up_t
+                    )
+                    for tile in tiles
+                }
+                self._prefill_combine_full_op = self._prefill_combine_full_ops[
+                    prefill_full_tile
+                ]
         if prefill_norm_tile and self.config.hc_per_branch_norm:
             from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_norm_op
 
@@ -211,6 +219,10 @@ class GatedResidual(common_hc.GatedResidual):
             and self.input_mix_weight_up.weight.dtype == torch.bfloat16
         )
 
+    def _prefill_tile(self, rows: int) -> int:
+        """The widest full-mix tile whose pairs divide ``rows`` (``_prefill_full``)."""
+        return next(t for t in self._prefill_full_ops if rows % (2 * t) == 0)
+
     def _prefill_weights(self):
         up = self.input_mix_weight_up.weight
         return (
@@ -239,7 +251,8 @@ class GatedResidual(common_hc.GatedResidual):
                 return mixed, (hyper_input, injection)
             return out, (hyper_input, None)
         if not small_rows and self._prefill_full(hyper_input):
-            mixed, norm = self._prefill_full_op(hyper_input, *self._prefill_weights())
+            op = self._prefill_full_ops[self._prefill_tile(hyper_input.shape[0])]
+            mixed, norm = op(hyper_input, *self._prefill_weights())
             return mixed, self._residual(hyper_input, norm)
         norm = self._normalize(hyper_input, small_rows)
         gate = F.linear(norm, self.input_mix_weight_down.weight) / self.hc_count
@@ -342,7 +355,8 @@ class GatedResidual(common_hc.GatedResidual):
             and next_hc._prefill_full(hyper_input)
         ):
             # The merge this HC's combine would run, as the next mix's prologue.
-            mixed, norm, combined = next_hc._prefill_combine_full_op(
+            tile = next_hc._prefill_tile(hyper_input.shape[0])
+            mixed, norm, combined = next_hc._prefill_combine_full_ops[tile](
                 hyper_input,
                 block_output,
                 self._injection(residuals),
