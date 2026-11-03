@@ -22,6 +22,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
 | `TPU_LIBRARY_PATH` | `None` | `libtpu.so` loaded by the TPU runtime. `import libtpu` sets it to the pip package's own library. A custom path (any other file) takes precedence over an installed `libtpu` package: a fingerprint of that file replaces the package version in the compile and Raiden layout cache keys, and the minimum libtpu version check is skipped. |
 | `TPU_NORM_WEIGHTS_FP32` | `False` | Opt-in. Stores learned RMSNorm weights in float32 at load, removing a per-norm weight convert from every step. Outputs are unchanged where every norm goes through the TPU `rms_norm` providers (verified on Gemma4); code that reads norm weights directly sees float32. |
+| `TPU_CACHED_PROMPT_ROWS` | `False` | Opt-in. Keeps each request's prompt as an int32 array next to its token list, so a request re-entering the persistent batch (it sat steps out, e.g. a solo prefill step) gets its prompt row as one array copy instead of a per-token list conversion (~2.4 ms per 87K-token prompt). Same row contents. |
 
 ---
 
