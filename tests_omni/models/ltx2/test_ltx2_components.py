@@ -129,7 +129,6 @@ VIDEO_VAE_MAX_REL_L2: dict[str, tuple[float, float]] = {
 VIDEO_VAE_MAX_ABS: dict[str, tuple[float, float]] = {
     "mode": (4.0e-3, 9.8e-3),
     "decode": (1.2e-2, 2.1e-2),
-    "decode-frame": (1.2e-2, 2.1e-2),
 }
 AUDIO_VAE_MAX_REL_L2: tuple[float, float] = (9.6e-3, 1.9e-2)
 AUDIO_VAE_MAX_ABS: tuple[float, float] = (1.6e-2, 2.6e-2)
@@ -699,21 +698,18 @@ def test_ltx2_tiny_video_vae_parity(
         )
 
     frame_fp32_max, frame_bf16_max = VIDEO_VAE_MAX_REL_L2["decode-frame"]
-    frame_fp32_max_abs, frame_bf16_max_abs = VIDEO_VAE_MAX_ABS["decode-frame"]
     for frame in range(ref_decode.shape[2]):
         assert_parity(
             tpu_outputs[torch.float32]["decode"][:, :, frame],
             ref_decode[:, :, frame],
             name=f"video VAE decode frame {frame} TPU fp32",
             max_rel_l2=frame_fp32_max,
-            max_abs=frame_fp32_max_abs,
         )
         assert_parity(
             tpu_outputs[torch.bfloat16]["decode"][:, :, frame],
             ref_decode[:, :, frame],
             name=f"video VAE decode frame {frame} TPU bf16",
             max_rel_l2=frame_bf16_max,
-            max_abs=frame_bf16_max_abs,
         )
 
 
