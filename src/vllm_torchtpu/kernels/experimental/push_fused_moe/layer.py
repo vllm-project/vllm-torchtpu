@@ -41,7 +41,6 @@ import jax.numpy as jnp
 from jax import lax
 
 from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
-    build_routing_tables_sharded,
     local_sort_activations,
     push_dispatch_segments,
     run_tables,
@@ -50,6 +49,7 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
     build_combine_fs_kernel,
     build_push_moe_kernel,
 )
+from vllm_torchtpu.kernels.experimental.push_fused_moe.routing import prepare_routing
 from vllm_torchtpu.kernels.experimental.push_fused_moe.sc_dispatch import (
     sc_dispatch_chunk_2core,
 )
@@ -63,8 +63,6 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     ROWBLK,
     U32_SUBLANE_TILE,
     GatheredPairs,
-    RoutingTables,
-    ShardRoutingTables,
     WeightFormat,
     act_scale_slab_rows,
     align_up,
@@ -627,22 +625,40 @@ def fused_ep_moe_push(
                 n_tokens=T,
                 topk=topk,
             )
-            routing = build_routing_tables_sharded(me, gathered, runs, **plan_kw)
+            (
+                pos,
+                mirror_pos,
+                slab_row,
+                kernel_tables,
+                expert_rows,
+                slab_base,
+                counts,
+            ) = prepare_routing(me, gathered, tuple(runs), **plan_kw)
         else:
             routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
-        # Both slab tables scatter onto this shard's own slab. The rows of
-        # the other shards are dropped where they are computed rather than
-        # built into a replicated slab and sliced away afterwards.
-        slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
+            slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
+            block_tables = shard_transport_tables_in_blocks(
+                routing, me, e_total=e_total, ep=ep
+            )
+            row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
+            kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
+            expert_rows, slab_base = shard_expert_slabs(
+                routing, me, e_total=e_total, ep=ep
+            )
+            counts = shard_count_vector(
+                routing, expert_rows, me, e_total=e_total, ep=ep
+            )
+            pos = lax.dynamic_slice(
+                routing.arrival_row, (me * t_local, 0), (t_local, topk)
+            )
+            mirror_pos = lax.dynamic_slice(
+                routing.mirror_row, (me * t_local, 0), (t_local, topk)
+            )
         # Keep the scale-slab scatter (a SparseCore offload) behind the
         # pre-push on the SparseCore queue.
         slab_row, scale_bits_g, slab = lax.optimization_barrier(
             (slab_row, scale_bits_g, slab)
         )
-        block_tables = shard_transport_tables_in_blocks(
-            routing, me, e_total=e_total, ep=ep
-        )
-        row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on (v2's scale slab; see there).
         if form.quantized_activations:
@@ -656,12 +672,9 @@ def fused_ep_moe_push(
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
-        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
         w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
-        counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
-        kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
         arrivals, arrival_scales = kfn(
             kernel_tables,
             expert_rows,
@@ -682,25 +695,6 @@ def fused_ep_moe_push(
             slab=slab,
         )
 
-        # The destination's own table: one arrival row per selection slot.
-        pos = (
-            cast(ShardRoutingTables, routing).pos
-            if sharded_plan
-            else lax.dynamic_slice(
-                cast(RoutingTables, routing).arrival_row,
-                (me * t_local, 0),
-                (t_local, topk),
-            )
-        )
-        mirror_pos = (
-            cast(ShardRoutingTables, routing).mirror_pos
-            if sharded_plan
-            else lax.dynamic_slice(
-                cast(RoutingTables, routing).mirror_row,
-                (me * t_local, 0),
-                (t_local, topk),
-            )
-        )
         combined = _combine_arrivals_fs(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
         )
