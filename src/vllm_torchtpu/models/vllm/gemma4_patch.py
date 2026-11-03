@@ -775,6 +775,27 @@ def _rotary_rows(rope: Any, x: torch.Tensor, positions: torch.Tensor) -> tuple:
     return tuple(half.contiguous() for half in cos_sin.chunk(2, dim=-1))
 
 
+def _o_projection(o_proj: Any, attended: Any) -> torch.Tensor:
+    """The o projection of the attention's bf16 rows, or (TPU_CP_FUSED_EPILOGUE)
+    of the per-token fp8 rows and scales the attention returned, which are
+    the rows the projection would quantize itself."""
+    if not isinstance(attended, tuple):
+        return o_proj(attended)[0]
+    x_q, x_scale = attended
+    method = o_proj.quant_method
+    if not (
+        isinstance(method, VllmFp8LinearMethodTPU)
+        and method.supports_quantized_input(o_proj, x_q.shape[0])
+        and o_proj.weight.dtype == x_q.dtype
+    ):
+        raise NotImplementedError(
+            "TPU_CP_FUSED_EPILOGUE needs an o projection that quantizes its input "
+            f"per token to {x_q.dtype}, got {type(method).__name__} with "
+            f"{o_proj.weight.dtype} weights"
+        )
+    return method.apply_quantized_input(o_proj, x_q, x_scale)
+
+
 def _context_parallel_layer(
     layer: Any,
     replica: Any,
@@ -807,7 +828,7 @@ def _context_parallel_layer(
         q, k = attn.rotary_emb(positions, q, k.flatten(-2, -1))
         v = attn.v_norm(v.unflatten(-1, (kv_heads, head_dim))).flatten(-2, -1)
         attended = attention(attn.attn, q, k, v, plan, rank)
-    out, _ = replica.self_attn.o_proj(attended)
+    out = _o_projection(replica.self_attn.o_proj, attended)
     x = layer.post_attention_layernorm(out) + residual
     residual = x
 

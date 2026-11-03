@@ -816,3 +816,106 @@ def test_layers_from_q_lower_for_tpu7x(heads, head_dim, window):
         text = lowered.lower(lowering_platforms=("tpu",)).as_text()
     assert "RPAm-snh-p256" in text
 
+
+@pytest.mark.parametrize("window", [None, 1024])
+@pytest.mark.parametrize("fp8_out_rows", [False, True])
+def test_layer_config_asks_the_kernel_for_fp8_output_rows(window, fp8_out_rows):
+    # The pass itself is output_quant's (test_output_quant.py).
+    cfg = dataclasses.replace(
+        _layer_config(16, window, configs.KVLayout.HEAD_ALONG_SUBLANE),
+        fp8_out_rows=fp8_out_rows,
+    )
+    want = FP8 if fp8_out_rows else None
+    assert cfg.rpa_kwargs().get("output_quant_dtype") == want
+
+
+def test_full_attention_layer_fp8_rows_returns_the_o_proj_input(monkeypatch):
+    from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
+
+    plan = cp_prefill.make_zigzag_plan(16 * 2 * PAGE, world=8, page_size=PAGE)
+    num_kv_heads, rows = 2, 2 * plan.piece_tokens
+    attended = jax.random.normal(jax.random.PRNGKey(30), (rows, 4, 128))
+    attended = attended.astype(jnp.bfloat16)
+
+    def attention(q, pages, *args, return_kv_pages=False, **kw):
+        # The kernel's quantized output: ragged_paged_attention(output_quant_dtype).
+        out = quantize_tensor(attended.reshape(rows, -1), kw["output_quant_dtype"])
+        return (out, pages) if return_kv_pages else out
+
+    monkeypatch.setattr(cp_prefill, "cp_prefill_attention", attention)
+    k, v = _kv(plan.num_tokens, num_kv_heads, 128, seed=31)
+    gathered = jnp.concatenate(
+        [
+            cp_prefill.pack_kv_rows(_rank_rows(k, plan, r), _rank_rows(v, plan, r))
+            for r in range(plan.world)
+        ]
+    )
+    block_table = _block_table(48, plan.num_pages, seed=32)
+    cfg = dataclasses.replace(
+        _layer_config(num_kv_heads, None, configs.KVLayout.HEAD_ALONG_SUBLANE),
+        fp8_out_rows=True,
+    )
+    cache = jnp.full((48, PAGE, 1, 4, 128), 7, FP8)
+    with pltpu.force_tpu_interpret_mode():
+        _, got_rows, got_scales = cp_prefill.full_attention_layer_fp8_rows(
+            cache,
+            jnp.zeros((rows, 4, 128), jnp.bfloat16),
+            _int8(gathered),
+            jnp.array([plan.num_tokens], jnp.int32),
+            block_table,
+            jnp.array([3], jnp.int32),
+            cfg=cfg,
+            cache_view=_identity_view,
+        )
+    want_rows, want_scales = quantize_tensor(attended.reshape(rows, -1), FP8)
+    np.testing.assert_array_equal(_bytes(got_rows), _bytes(want_rows))
+    np.testing.assert_array_equal(np.asarray(got_scales), np.asarray(want_scales))
+
+
+@pytest.mark.parametrize(
+    "heads,head_dim,window",
+    # Gemma4-26B full attention (fp8 QK/PV) and sliding window.
+    [((16, 2), 512, None), ((16, 8), 256, 1024)],
+)
+def test_fp8_rows_layers_from_q_lower_for_tpu7x(heads, head_dim, window):
+    plan = cp_prefill.make_zigzag_plan(16 * 8 * PAGE, world=8, page_size=PAGE)
+    num_q_heads, num_kv_heads = heads
+    rows, slots = 2 * plan.piece_tokens, 2 * num_kv_heads // 4
+    cfg = dataclasses.replace(
+        _layer_config(num_kv_heads, window, configs.KVLayout.HEAD_ALONG_SUBLANE),
+        num_heads=num_q_heads,
+        head_dim=head_dim,
+        fp8_compute=window is None,
+        head_page_writes=window is None,
+        prologue_eps=1e-6,
+        fp8_out_rows=True,
+    )
+    with use_abstract_mesh(TPU7X):
+        q_hbm = jax.ShapeDtypeStruct(
+            (num_kv_heads, rows, num_q_heads // num_kv_heads // 2, 2, head_dim),
+            jnp.bfloat16,
+        )
+        cache = jax.ShapeDtypeStruct((64, PAGE, 1, 4, head_dim), FP8)
+        meta = (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((plan.num_pages,), jnp.int32),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+        )
+        width = 2 * num_kv_heads * head_dim
+        kw = dict(cfg=cfg, cache_view=_identity_view)
+        if window is None:
+            gathered = jax.ShapeDtypeStruct((plan.num_tokens, width), jnp.int8)
+            fn = functools.partial(
+                cp_prefill.full_attention_layer_from_q_fp8_rows, **kw
+            )
+            lowered = jax.jit(fn).trace(cache, q_hbm, gathered, *meta)
+        else:
+            new_kv = jax.ShapeDtypeStruct((rows, slots, 4, head_dim), FP8)
+            exchange_rows = (3 * cp_prefill.num_halo_pages(window, PAGE) + 1) * PAGE
+            gathered = jax.ShapeDtypeStruct((8 * exchange_rows, width), jnp.int8)
+            fn = functools.partial(
+                cp_prefill.sliding_attention_layer_from_q_fp8_rows, **kw
+            )
+            lowered = jax.jit(fn).trace(cache, q_hbm, new_kv, gathered, *meta)
+        text = lowered.lower(lowering_platforms=("tpu",)).as_text()
+    assert "RPAm-snh-p256" in text and "rpa_output_quantize" in text

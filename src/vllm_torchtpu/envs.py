@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     TPU_CP_FP8_ATTENTION: bool = False
     TPU_CP_FUSED_PROLOGUE: bool = False
     TPU_CP_EMBED_REPLICA: bool = False
+    TPU_CP_FUSED_EPILOGUE: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_FP8_ATTENTION: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -543,6 +544,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rank), so a rank looks up its own rows instead of every row of the
     # step in its vocab shard followed by a reduce-scatter. Same values.
     "TPU_CP_EMBED_REPLICA": env_bool("TPU_CP_EMBED_REPLICA", default=False),
+    # Context-parallel prefill: each layer's attention returns its output as
+    # the o projection's per-token fp8 rows and scales, quantized by a Pallas
+    # kernel straight from the attention kernel's head-major output, instead of
+    # bf16 token-major rows that XLA transposes and quantizes.
+    "TPU_CP_FUSED_EPILOGUE": env_bool("TPU_CP_FUSED_EPILOGUE", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and

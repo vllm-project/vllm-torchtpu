@@ -288,7 +288,7 @@ def cp_prefill_attention(
     return_kv_pages: bool = False,
     prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
     **rpa_kwargs,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
+) -> Any:
     """Attention of the rank's two pieces against `kv_pages`.
 
     Args:
@@ -315,8 +315,10 @@ def cp_prefill_attention(
         **rpa_kwargs: Further static `ragged_paged_attention` arguments.
 
     Returns:
-        [2 * piece_tokens, num_q_heads, head_dim] attention output, and with
-        `return_kv_pages` the pages (the kernel's aliased cache output).
+        [2 * piece_tokens, num_q_heads, head_dim] attention output (with
+        `output_quant_dtype` in `rpa_kwargs`, its per-token quantized rows and
+        scales), and with `return_kv_pages` the pages (the kernel's aliased
+        cache output).
 
     `ragged_paged_attention` donates its cache argument, so outside a jit this
     consumes `kv_pages`.
@@ -723,6 +725,10 @@ class LayerConfig:
     # The q/k/v norm epsilon of a layer whose attention starts from its qkv
     # projection rows (`prologue.qkv_to_rpa_inputs`); None: from q, k and v.
     prologue_eps: float | None = None
+    # The layer returns its output as the o projection's per-token fp8 rows and
+    # scales (`ragged_paged_attention(output_quant_dtype=...)`) instead of bf16
+    # rows.
+    fp8_out_rows: bool = False
 
     def __post_init__(self):
         if not self.head_page_writes:
@@ -763,6 +769,8 @@ class LayerConfig:
                 kwargs["sliding_prefill_max_bkv"] = self.sliding_prefill_max_bkv
         if self.fence_output:
             kwargs["fence_output"] = True
+        if self.fp8_out_rows:
+            kwargs["output_quant_dtype"] = jnp.float8_e4m3fn
         return kwargs
 
 
@@ -866,6 +874,13 @@ def full_attention_layer_from_q(
     )
 
 
+def _layer_output(out: Any, cfg: LayerConfig) -> tuple[jax.Array, ...]:
+    """The layer output after the attention kernel: its bf16 rows, or with
+    `cfg.fp8_out_rows` the fp8 rows and per-token scales the o projection
+    takes (`LayerConfig.rpa_kwargs`)."""
+    return tuple(out) if cfg.fp8_out_rows else (out,)
+
+
 def _full_attention(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -876,7 +891,7 @@ def _full_attention(
     cfg: LayerConfig,
     cache_view: CacheView,
     q_hbm: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, ...]:
     native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
     plan = cfg.plan(query.shape[0], page_size)
     rows = jax.lax.bitcast_convert_type(kv_rows, native.dtype)
@@ -898,10 +913,10 @@ def _full_attention(
         new_native = write_kv_head_pages(
             native, pages, first, *writes, num_heads=count, kv_layout=cfg.kv_layout
         )
-        return restore(new_native), out
+        return restore(new_native), *_layer_output(out, cfg)
     out = cp_prefill_attention(query, pages, tables, plan, rank, **kwargs)
     mine = cache_pages_from_slots(kv_head_slots(pages, first, count), cfg.kv_layout)
-    return restore(write_kv_pages(native, mine, *writes)), out
+    return restore(write_kv_pages(native, mine, *writes)), *_layer_output(out, cfg)
 
 
 def _sliding_exchange_pages(cfg: LayerConfig, page_size: int) -> tuple[int, int]:
@@ -1082,7 +1097,7 @@ def _sliding_attention(
     cache_view: CacheView,
     own_tail: Callable[[int, int], jax.Array],
     prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, ...]:
     """`sliding_attention_layer`'s body; `own_tail(halo tokens, page size)`
     gives the pages of the rank's first-piece tail."""
     if cfg.sliding_window is None:
@@ -1131,4 +1146,121 @@ def _sliding_attention(
     table = _request_block_table(block_tables, seq_lens) * page_stride
     writes = window_page_writes(table, position_pages, count)
     mine = cache_pages_from_slots(slots, cfg.kv_layout)
-    return restore(write_kv_pages(native, mine, *writes)), out
+    return restore(write_kv_pages(native, mine, *writes)), *_layer_output(out, cfg)
+
+
+# The layer ops of a `LayerConfig` with `fp8_out_rows`: (the new kv_cache,
+# [rows, num_heads * head_dim] fp8 rows, [rows, 1] f32 scales).
+
+
+def full_attention_layer_fp8_rows(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    kv_rows: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    rank: jax.Array,
+    *,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`full_attention_layer` returning the o projection's fp8 input."""
+    return _fp8_rows_layer(
+        full_attention_layer,
+        cfg,
+        kv_cache,
+        query,
+        kv_rows,
+        seq_lens,
+        block_tables,
+        rank,
+        cache_view=cache_view,
+    )
+
+
+def full_attention_layer_from_q_fp8_rows(
+    kv_cache: jax.Array,
+    q_hbm: jax.Array,
+    kv_rows: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    rank: jax.Array,
+    *,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`full_attention_layer_from_q` returning the o projection's fp8 input."""
+    return _fp8_rows_layer(
+        full_attention_layer_from_q,
+        cfg,
+        kv_cache,
+        q_hbm,
+        kv_rows,
+        seq_lens,
+        block_tables,
+        rank,
+        cache_view=cache_view,
+    )
+
+
+def sliding_attention_layer_fp8_rows(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    gathered: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    rank: jax.Array,
+    *,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`sliding_attention_layer` returning the o projection's fp8 input."""
+    return _fp8_rows_layer(
+        sliding_attention_layer,
+        cfg,
+        kv_cache,
+        query,
+        keys,
+        values,
+        gathered,
+        seq_lens,
+        block_tables,
+        rank,
+        cache_view=cache_view,
+    )
+
+
+def sliding_attention_layer_from_q_fp8_rows(
+    kv_cache: jax.Array,
+    q_hbm: jax.Array,
+    new_kv: jax.Array,
+    gathered: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    rank: jax.Array,
+    *,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`sliding_attention_layer_from_q` returning the o projection's fp8 input."""
+    return _fp8_rows_layer(
+        sliding_attention_layer_from_q,
+        cfg,
+        kv_cache,
+        q_hbm,
+        new_kv,
+        gathered,
+        seq_lens,
+        block_tables,
+        rank,
+        cache_view=cache_view,
+    )
+
+
+def _fp8_rows_layer(layer: Callable[..., Any], cfg: LayerConfig, *args, **kwargs):
+    if not cfg.fp8_out_rows:
+        raise ValueError(f"{layer.__name__}: the layer config has no fp8_out_rows")
+    kv_cache, rows, scales = layer(*args, cfg=cfg, **kwargs)
+    return kv_cache, rows, scales
