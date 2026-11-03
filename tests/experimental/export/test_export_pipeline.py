@@ -154,6 +154,16 @@ class _TinyPyTorchCausalLM(nn.Module):
                 mrope_section=mrope_section,
             )
 
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: list[torch.Tensor] | None = None,
+        attn_metadata: Any = None,
+    ) -> torch.Tensor:
+        # As a vLLM *ForCausalLM, whose forward the export calls, runs its decoder.
+        return self.model(input_ids, positions, kv_caches, attn_metadata)
+
 
 class _TinyTorchExportableLLM(api.ExportableTextOnlyLLM):
     """Minimal PyTorch-backed ExportableTextOnlyLLM for protocol testing."""
@@ -1697,11 +1707,11 @@ class _KvCacheArgBackbone(_LlamaLikeBackbone):
 def _run_backbone_forward(backbone: nn.Module) -> tuple[Sequence[Any], Any]:
     cfg = api.TextOnlyLLMExportConfig(model_name="tiny", num_layers=0)
     adapter = _adapter_without_model(cfg)
-    adapter._model = nn.Module()
-    adapter._model.model = backbone
+    # The export calls the model's own forward, here the backbone's.
+    adapter._model = backbone
     weight = torch.arange(32.0).reshape(8, 4)
     return adapter.forward(
-        {"model.embed_tokens.weight": weight},
+        {"embed_tokens.weight": weight},
         [],
         input_ids=torch.tensor([1, 2, 3]),
         positions=torch.tensor([0, 1, 2]),
@@ -2069,9 +2079,19 @@ class _BackboneWithRouter(nn.Module):
         return input_ids.float()[:, None] + self.experts.router.bias[None, :]
 
 
+class _CausalLMOf(nn.Module):
+    """A vLLM-style *ForCausalLM around `model`: its forward runs the decoder."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> Any:
+        return self.model(input_ids, positions)
+
+
 def test_forward_binds_weights_held_outside_the_module_tree() -> None:
-    wrapper = nn.Module()
-    wrapper.model = _BackboneWithRouter()
+    wrapper = _CausalLMOf(_BackboneWithRouter())
     original = wrapper.model.gate.bias
     exportable = object.__new__(universal_adapter.UniversalVllmExportableLLM)
     exportable._model = wrapper

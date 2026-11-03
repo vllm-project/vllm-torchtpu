@@ -692,20 +692,6 @@ def _patch_row_parallel_input_split(model: nn.Module) -> int:
     return patched
 
 
-def _backbone_module(model: nn.Module) -> nn.Module:
-    """The module whose forward maps a step's tokens to hidden states.
-
-    vLLM's `*ForCausalLM` keeps its decoder at `.model`; a model whose `.model`
-    only groups its components (Muse Spark's holds `language_model` and the
-    encoders, and defines no `forward`) runs its own `forward` instead.
-    """
-    inner = getattr(model, "model", None)
-    forward = getattr(type(inner), "forward", None)
-    if isinstance(inner, nn.Module) and forward is not nn.Module.forward:
-        return inner
-    return model
-
-
 def _backbone_kwargs(
     backbone: nn.Module,
     *,
@@ -1487,19 +1473,13 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             mamba_request_distribution=recurrent_dist,
         )
 
-        backbone: Any = _backbone_module(self._model)
-        call_weights: dict[str, Any] = {}
-        if backbone is not self._model:
-            prefix = "model."
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    call_weights[k[len(prefix) :]] = v
-                elif not k.startswith("lm_head."):
-                    call_weights[k] = v
-        else:
-            call_weights = {
-                k: v for k, v in weights.items() if not k.startswith("lm_head.")
-            }
+        # The model's own forward, as `tpu_runner.forward_model` calls it: whatever a
+        # top-level forward does around its decoder (multimodal embedding merges,
+        # positions handling) is in the artifact, and weights keep their names.
+        backbone: Any = self._model
+        call_weights = {
+            k: v for k, v in weights.items() if not k.startswith("lm_head.")
+        }
 
         named_layers = self._named_attention_layers()
         attn_layers = [m for _, m in named_layers]
