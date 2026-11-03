@@ -40,49 +40,34 @@ import cap_pr_tpu_concurrency
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parents[1]
 
-# Priority constants for pipeline jobs.
-# On-call fix > Post-merge > Pre-merge > Integration pipeline > Benchmark >
-# Other/Default > Nightly
+# Job priorities: On-call fix > Post-merge > Pre-merge > Default > Nightly.
 PRIORITY_ONCALL_FIX = 12
 PRIORITY_POST_MERGE = 11
 PRIORITY_PRE_MERGE = 6
-PRIORITY_INTEGRATION = 4
-PRIORITY_BENCHMARK = 3
 PRIORITY_DEFAULT = 2
 PRIORITY_NIGHTLY = 1
-PRIORITY_KERNEL_TUNING = -9
 
-# How many TPU jobs on the kube fleet one author's pull-request builds may have
-# in flight at once, waiting in Kueue or running. The rest wait in Buildkite as
-# `limited`, holding no agent pod and no place in Kueue's queue, so one author's
-# burst of PRs does not queue ahead of everyone else's. A PR build runs about
-# 19, so this is two PRs at a time; 40 capped 6 of 45 authors in the week to
-# 10-16. Nightly, post-merge and release builds are not PR builds and have no
-# cap.
+# Max TPU jobs one author's PR builds may have in flight on kube (~2 PRs at ~19 jobs).
 PR_TPU_JOBS_PER_AUTHOR = 40
 
-# The suite's lanes, in upload order. Lane <lane> is
-# .buildkite/pipeline_<lane>.yml; no other file is uploaded as a lane. CI_LANES
-# picks a subset - a scheduled pipeline names its own lane. Without it a build
-# runs every lane but perf, which has scheduled builds of its own; nightly
-# builds still run perf, and so does the integration pipeline, whose LKG
-# promotion waits on two perf steps. A PR whose change needs perf/eval coverage
-# asks for it with the run-perf-eval label, or the full nightly suite across
-# every lane with run-full-ci; adding either label to a ready PR starts a build.
+# Suite lanes (.buildkite/pipeline_<lane>.yml), in upload order. CI_LANES overrides;
+# otherwise perf runs only on nightlies, integration, or run-perf-eval/run-full-ci PRs.
 ALL_LANES: tuple[str, ...] = ("verify", "perf", "integration", "tests")
-DEFAULT_LANES: tuple[str, ...] = ("verify", "integration", "tests")
-DEFAULT_INTEGRATION_SLUG = "vllm-torchtpu-integration"
+
+# Pipeline slugs and fragment paths.
+INTEGRATION_PIPELINE_SLUG = "vllm-torchtpu-integration"
+BUILD_PIPELINE_FILE = ".buildkite/pipeline_build.yml"
+PROMOTE_PIPELINE_FILE = ".buildkite/pipeline_promote.yml"
 DEFAULT_DEV_PIPELINE_FILE = ".buildkite/pipeline_dev.yml"
+
+# External repositories and API endpoints.
 VLLM_UPSTREAM_REPO = "https://github.com/vllm-project/vllm.git"
 GITHUB_REPO = "vllm-project/vllm-torchtpu"
 GITHUB_API_BASE_URL = "https://api.github.com"
 
+# Commit-message, changed-file, and vLLM-pin patterns (.pyrefly-baseline-full.json stays
+# out of _DOCS_ONLY_RE because the Buildkite typecheck step reads it).
 _SKIP_CI_RE = re.compile(r"\[(skip\sci|ci\sskip)\]")
-# True when every path is documentation or another file no step reads (docs, md,
-# icons, CODEOWNERS, LICENSE, .git-blame-ignore-revs, .pyrefly-baseline.json).
-# The pre-commit GitHub Action checks .pyrefly-baseline.json and no Buildkite
-# step reads it. .pyrefly-baseline-full.json stays out of this list: only the
-# Buildkite type check reads it.
 _DOCS_ONLY_RE = re.compile(
     r"(\.md$|\.ico$|\.png$|^README$|^docs/|^\.github/CODEOWNERS$"
     r"|^LICENSE$|^\.git-blame-ignore-revs$|^\.pyrefly-baseline\.json$)"
@@ -126,7 +111,6 @@ class BuildContext:
     source: str
     tag: str
     pipeline_slug: str
-    integration_slug: str
     pull_request: str | None
     pr_base_branch: str
     pr_labels: tuple[str, ...]
@@ -145,7 +129,7 @@ class BuildContext:
 
     @property
     def is_integration(self) -> bool:
-        return self.pipeline_slug == self.integration_slug
+        return self.pipeline_slug == INTEGRATION_PIPELINE_SLUG
 
     @property
     def is_post_merge_webhook(self) -> bool:
@@ -166,9 +150,6 @@ class BuildContext:
             source=env.get("BUILDKITE_SOURCE", ""),
             tag=env.get("BUILDKITE_TAG", ""),
             pipeline_slug=env.get("BUILDKITE_PIPELINE_SLUG", ""),
-            integration_slug=_env_or(
-                env, "VLLM_INTEGRATION_PIPELINE_SLUG", DEFAULT_INTEGRATION_SLUG
-            ),
             pull_request=None if pr_raw == "false" else pr_raw,
             pr_base_branch=_env_or(env, "BUILDKITE_PULL_REQUEST_BASE_BRANCH", "main"),
             pr_labels=_split_labels(env.get("BUILDKITE_PULL_REQUEST_LABELS", "")),
@@ -368,6 +349,30 @@ def resolve_vllm_commit_hash(base_hash: str, override: str) -> str:
     return override if override else base_hash
 
 
+def _select_lanes(
+    ctx: BuildContext, *, nightly: bool, skip_tpu_ci: bool
+) -> tuple[tuple[str, ...], str | None]:
+    """Resolve requested lanes (`CI_LANES` override or build defaults) and validate."""
+    if ctx.ci_lanes_raw:
+        requested = tuple(ctx.ci_lanes_raw.split())
+        bad = next((lane for lane in requested if lane not in ALL_LANES), None)
+        err = (
+            f"ERROR: CI_LANES names '{bad}'; lanes are: {' '.join(ALL_LANES)}"
+            if bad
+            else None
+        )
+        return requested, err
+    if skip_tpu_ci:
+        return ("tests",), None
+    run_perf = (
+        nightly
+        or ctx.is_integration
+        or (ctx.is_pr and "run-perf-eval" in ctx.pr_labels)
+    )
+    lanes = ALL_LANES if run_perf else tuple(x for x in ALL_LANES if x != "perf")
+    return lanes, None
+
+
 def plan_uploads(
     ctx: BuildContext,
     *,
@@ -386,37 +391,33 @@ def plan_uploads(
                 body="Runs the full (nightly) suite (`run-full-ci` label).",
             )
         )
-
-    if nightly or ctx.is_integration:
-        default_lanes = ALL_LANES
-    elif ctx.is_pr and "run-perf-eval" in ctx.pr_labels:
-        default_lanes = ALL_LANES
-        if not ctx.ci_lanes_raw:
-            pre_annotations.append(
-                Annotation(
-                    style="info",
-                    context="perf-eval",
-                    body="Runs the perf/eval lane (`run-perf-eval` label).",
-                )
+    elif (
+        not nightly
+        and not ctx.is_integration
+        and ctx.is_pr
+        and "run-perf-eval" in ctx.pr_labels
+        and not ctx.ci_lanes_raw
+    ):
+        pre_annotations.append(
+            Annotation(
+                style="info",
+                context="perf-eval",
+                body="Runs the perf/eval lane (`run-perf-eval` label).",
             )
-    else:
-        default_lanes = DEFAULT_LANES
+        )
 
     # skip-tpu-ci keeps only the tests lane, and SKIP_TPU_CI leaves out its TPU
     # group (pipeline_tests.yml reads it when the lane is uploaded), so the
     # image build, the type check and the CPU unit tests still run, on the PR
     # and again on its post-merge build. It overrides run-perf-eval and
     # run-full-ci.
-    if ctx.is_pr:
-        skip_labels: Sequence[str] = ctx.pr_labels
-    elif ctx.is_post_merge_webhook:
-        skip_labels = merged_labels
-    else:
-        skip_labels = ()
-
+    skip_labels: Sequence[str] = (
+        ctx.pr_labels
+        if ctx.is_pr
+        else (merged_labels if ctx.is_post_merge_webhook else ())
+    )
     skip_tpu_ci = ctx.skip_tpu_ci_env or ("skip-tpu-ci" in skip_labels)
     if skip_tpu_ci:
-        default_lanes = ("tests",)
         pre_annotations.append(
             Annotation(
                 style="info",
@@ -427,28 +428,18 @@ def plan_uploads(
             )
         )
 
-    requested_lanes = (
-        tuple(ctx.ci_lanes_raw.split()) if ctx.ci_lanes_raw else default_lanes
+    requested_lanes, invalid_error = _select_lanes(
+        ctx, nightly=nightly, skip_tpu_ci=skip_tpu_ci
     )
-    invalid_error: str | None = None
-    for lane in requested_lanes:
-        if lane not in ALL_LANES:
-            invalid_error = (
-                f"ERROR: CI_LANES names '{lane}'; lanes are: {' '.join(ALL_LANES)}"
-            )
-            break
-
     lane_files: list[str] = []
     missing: list[str] = []
     if invalid_error is None:
         for lane in ALL_LANES:
-            if lane not in requested_lanes:
-                continue
-            rel_path = f".buildkite/pipeline_{lane}.yml"
-            if rel_path in existing_lane_files:
-                lane_files.append(rel_path)
-            else:
-                missing.append(rel_path)
+            if lane in requested_lanes:
+                rel_path = f".buildkite/pipeline_{lane}.yml"
+                (lane_files if rel_path in existing_lane_files else missing).append(
+                    rel_path
+                )
 
     post_annotations: list[Annotation] = []
     missing_error: str | None = None
@@ -485,7 +476,7 @@ def plan_uploads(
         skip_tpu_ci=skip_tpu_ci,
         lanes=requested_lanes,
         lane_files=tuple(lane_files),
-        build_file=".buildkite/pipeline_build.yml",
+        build_file=BUILD_PIPELINE_FILE,
         omni_image_skip=omni_image_skip,
         pre_lane_annotations=tuple(pre_annotations),
         post_lane_annotations=tuple(post_annotations),
@@ -832,22 +823,25 @@ def run_bootstrap(
     effects.set_metadata("VLLM_COMMIT_HASH", vllm_commit_hash, env=child_env)
     print(f"Using vLLM commit: {vllm_commit_hash}")
 
+    def _upload(yaml_file: str, *, nightly: bool) -> None:
+        upload_with_priority(
+            yaml_file,
+            repo_root=repo_root,
+            job_priority=priority_plan.job_priority,
+            nightly=nightly,
+            pr_tpu_concurrency_group=priority_plan.pr_tpu_concurrency_group,
+            pr_tpu_jobs_per_author=ctx.pr_tpu_jobs_per_author,
+            env=child_env,
+            effects=effects,
+        )
+
     # Since Buildkite prepends uploaded steps (inserts in reverse order),
     # uploading the test steps first and build steps last ensures they are
     # displayed and queued in correct order: Build -> Tests.
     if ctx.is_integration:
         # Upload promote step FIRST so Buildkite places it LAST after test steps.
         print("Uploading Promotion Pipeline Fragment")
-        upload_with_priority(
-            ".buildkite/pipeline_promote.yml",
-            repo_root=repo_root,
-            job_priority=priority_plan.job_priority,
-            nightly=ctx.nightly_env,
-            pr_tpu_concurrency_group=priority_plan.pr_tpu_concurrency_group,
-            pr_tpu_jobs_per_author=ctx.pr_tpu_jobs_per_author,
-            env=child_env,
-            effects=effects,
-        )
+        _upload(PROMOTE_PIPELINE_FILE, nightly=ctx.nightly_env)
 
     merged_labels: tuple[str, ...] = ()
     if ctx.is_post_merge_webhook:
@@ -877,16 +871,7 @@ def run_bootstrap(
 
     for lane_file in upload_plan.lane_files:
         print(f"Uploading {lane_file}")
-        upload_with_priority(
-            lane_file,
-            repo_root=repo_root,
-            job_priority=priority_plan.job_priority,
-            nightly=upload_plan.nightly,
-            pr_tpu_concurrency_group=priority_plan.pr_tpu_concurrency_group,
-            pr_tpu_jobs_per_author=ctx.pr_tpu_jobs_per_author,
-            env=child_env,
-            effects=effects,
-        )
+        _upload(lane_file, nightly=upload_plan.nightly)
 
     if upload_plan.missing_ci_lanes_error is not None:
         raise BootstrapError(upload_plan.missing_ci_lanes_error)
@@ -895,16 +880,7 @@ def run_bootstrap(
 
     child_env["OMNI_IMAGE_SKIP"] = upload_plan.omni_image_skip
     print("Uploading Build Pipeline")
-    upload_with_priority(
-        upload_plan.build_file,
-        repo_root=repo_root,
-        job_priority=priority_plan.job_priority,
-        nightly=upload_plan.nightly,
-        pr_tpu_concurrency_group=priority_plan.pr_tpu_concurrency_group,
-        pr_tpu_jobs_per_author=ctx.pr_tpu_jobs_per_author,
-        env=child_env,
-        effects=effects,
-    )
+    _upload(upload_plan.build_file, nightly=upload_plan.nightly)
 
     print("--- Buildkite Bootstrap Finished")
     return 0
