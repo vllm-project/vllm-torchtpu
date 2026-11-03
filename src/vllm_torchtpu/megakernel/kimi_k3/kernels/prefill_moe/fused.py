@@ -1004,6 +1004,9 @@ def _routed_experts(
     # Route weights scale the gate/up rows; the combine adds rows unweighted
     # and reads the zero row ``zero`` of ``packed`` for padding routes.
     preweight = k._config().prefill_moe_preweight
+    # Remaining down columns: 1 two tiles per step, 2 also one ring poll per
+    # step. EP8 only: EP16's doubled 8K blocks exceed VMEM.
+    pair_tiles = k._config().prefill_moe_pair_tiles if experts == EP8 else 0
     columns = 1792 if tokens < 8192 else 896
     tile = 128 if tokens < 8192 else 256
     unroll = 8 if tokens < 8192 else 32
@@ -1244,17 +1247,22 @@ def _routed_experts(
                 if not skip_combine:
                     target[...] = target[...] + value * weight
 
-        def inner(x, w, metadata, *, first=False, subtotal_vmem=None):
+        def inner(x, w, metadata, *, first=False, subtotal_vmem=None, tile=None, poll=True):
             g, n = (pl.program_id(1), 0 if first else pl.program_id(0) + 1)
+            if tile is not None:
+                g = tile
             if not first:
 
                 @pl.when(g == 0)
                 def clear():
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
 
-            if not first:
+            if not first and poll:
                 with _scope("ring_poll"):
-                    advance(jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem, poll_round=g)
+                    advance(
+                        jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem,
+                        poll_round=g // 2 if pair_tiles == 2 else g,
+                    )
             current = packed.at[g % 2]
             previous = packed.at[(g + 1) % 2]
             previous_g = jnp.maximum(g - 1, 0)
@@ -1320,6 +1328,7 @@ def _routed_experts(
                         metadata,
                         cfgs=cfg,
                         overlap_work=overlap_work,
+                        group=g,
                     )
 
             @pl.when(g > 0)
@@ -1512,12 +1521,53 @@ def _routed_experts(
             def remaining(x, w, metadata):
                 inner(x, w, metadata, subtotal_vmem=subtotal_vmem)
 
+            if not pair_tiles:
+                pltpu.emit_pipeline(
+                    remaining,
+                    grid=(width // tn - 1, ng, 1),
+                    in_specs=(xs, shifted_ws),
+                    out_specs=(),
+                )(middle.reshape(-1, sub, mid), w, scratches=(metadata,))
+                return
+
+            # Two expert tiles per pipeline step: half the steps' fixed cost.
+            def tile_of(spec, second):
+                index_map = spec.index_map
+
+                def mapped(n, h, k):
+                    tile = 2 * h + 1 if second else 2 * h
+                    return index_map(n, jnp.minimum(tile, ng - 1), k)
+
+                return dataclasses.replace(spec, index_map=mapped)
+
+            def pair(specs, second):
+                return jax.tree.map(
+                    lambda spec: tile_of(spec, second),
+                    specs,
+                    is_leaf=lambda v: isinstance(v, pl.BlockSpec),
+                )
+
+            def remaining_pair(xa, xb, wa, wb, metadata):
+                h = pl.program_id(1)
+                inner(xa, wa, metadata, subtotal_vmem=subtotal_vmem, tile=2 * h)
+
+                @pl.when(2 * h + 1 < ng)
+                def second():
+                    inner(
+                        xb, wb, metadata, subtotal_vmem=subtotal_vmem,
+                        tile=2 * h + 1, poll=pair_tiles == 1,
+                    )
+
+            rows = middle.reshape(-1, sub, mid)
             pltpu.emit_pipeline(
-                remaining,
-                grid=(width // tn - 1, ng, 1),
-                in_specs=(xs, shifted_ws),
+                remaining_pair,
+                grid=(width // tn - 1, (ng + 1) // 2, 1),
+                in_specs=(
+                    pair(xs, False), pair(xs, True),
+                    pair(shifted_ws, False), pair(shifted_ws, True),
+                ),
                 out_specs=(),
-            )(middle.reshape(-1, sub, mid), w, scratches=(metadata,))
+            )(rows, rows, w, w, scratches=(metadata,))
 
     def run(**scratch):
         kernel(
@@ -1690,14 +1740,14 @@ def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work, row_we
     lax.switch(jnp.maximum(last // cfgs.tiles.bucket_base - first_bucket, 0), branches)
 
 
-def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
+def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work, group=None):
     """Down projection stored as packed rows for token-wise VALU combine.
 
     Each valid expert row is consumed individually, so this output needs no
     adjacent-expert carry. BF16 rounding precedes FP32 routing weighting.
     """
     assert cfgs.fuse_act is None
-    group = pl.program_id(1)
+    group = pl.program_id(1) if group is None else group
     start = metadata.gm_id_to_m_offset[group]
     end = metadata.gm_id_to_m_offset[group + 1]
     aligned = start - start % cfgs.dims.size_lhs_sublane

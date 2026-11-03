@@ -109,6 +109,10 @@ class KernelConfig:
     # Fused MoE: scale gate/up rows by their route weight so the token
     # combine adds expert rows unweighted (same math up to BF16 rounding).
     prefill_moe_preweight: bool = False
+    # Fused MoE remaining down columns: 1 runs two expert tiles per pipeline
+    # step, 2 also polls the reduce ring once per step (0: one tile per step).
+    # EP8 only.
+    prefill_moe_pair_tiles: int = 0
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.
