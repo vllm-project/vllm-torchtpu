@@ -129,11 +129,18 @@ def test_each_range_has_one_owner_per_host(compile_all_ranges, monkeypatch):
 
 
 def test_other_ranges_wait_for_their_owner(compile_all_ranges, monkeypatch):
+    monkeypatch.delenv("TPU_PRECOMPILE_PEER_WAIT_S", raising=False)
     calls = _compile(compile_all_ranges, monkeypatch, 0)
     assert calls == [(4096, 0.0)] + [
-        (end, tpu_compiler.PEER_WAIT_S)
-        for end in [32, 64, 128, 256, 512, 1024, 2048, 16]
+        (end, 600.0) for end in [32, 64, 128, 256, 512, 1024, 2048, 16]
     ]
+
+
+@pytest.mark.parametrize("value, wait", [("1800", 1800.0), ("0", 0.0)])
+def test_peer_wait_is_read_from_the_env(compile_all_ranges, monkeypatch, value, wait):
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", value)
+    calls = _compile(compile_all_ranges, monkeypatch, 0)
+    assert {w for _, w in calls[1:]} == {wait}
 
 
 def test_every_rank_compiles_every_range(compile_all_ranges, monkeypatch):
