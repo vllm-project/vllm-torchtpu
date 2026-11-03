@@ -231,7 +231,7 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
             activation = _nearest(
                 by_id[kernel.operand_ids[11]],
                 by_id,
-                ("moe_activation_ag", "topology_three_phase_ag"),
+                ("moe_activation_ag", "topology_three_phase_ag", "all_gather"),
                 "async-start",
                 stop_at_other_starts=True,
             )
@@ -245,6 +245,16 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                 continue
             metadata_start = by_id[metadata_done.operand_ids[0]]
             if metadata_start.opcode not in ("async-start", "async-update"):
+                continue
+            # A plain all_gather also matches the activation marker, including the
+            # native gather of a call that split_sc_plan sent back to native
+            # preprocessing. Only the split branch emits moe_early_ag_route, so a
+            # graph without it keeps its schedule. The topology kernel is named,
+            # needs no such check, and is left exactly as it was.
+            if "topology_three_phase_ag" not in activation.metadata.op_name and not any(
+                "moe_early_ag_route" in by_id[n].metadata.op_name
+                for n in _ancestors(metadata_start, by_id)
+            ):
                 continue
             scatter = _nearest(
                 by_id[kernel.operand_ids[10]],

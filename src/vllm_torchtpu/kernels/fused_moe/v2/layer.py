@@ -768,7 +768,7 @@ def fused_ep_moe_v2(
         if not use_split_sc and t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
         merged_scale_bits = None
-        if use_split_sc:
+        if use_sc_scatter:
             from vllm_torchtpu.kernels.fused_moe.v2.scatter import scatter_pair
 
             token_gather, merged_scale_bits = scatter_pair(
@@ -898,21 +898,20 @@ def fused_ep_moe_v2(
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         return token_layout.restore(combined, ax)
 
-    from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import (
-        supports_activation_gather,
-    )
+    from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import split_sc_plan
     from vllm_torchtpu.kernels.fused_moe.v2.scatter import can_scatter_pair
 
-    use_split_sc = (
-        preprocess_topology is not None
-        and stage == "fused"
-        and weight_format == WeightFormat.FP4
-        and supports_activation_gather(t_local * hidden)
-        and can_scatter_pair(
+    split_topology, use_sc_scatter, use_split_sc = split_sc_plan(
+        preprocess_topology,
+        fused=stage == "fused",
+        fp4=weight_format == WeightFormat.FP4,
+        t_local=t_local,
+        hidden=hidden,
+        scatter_fits=lambda: can_scatter_pair(
             T * topk,
             ragged_stride,
             act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
-        )
+        ),
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -928,9 +927,19 @@ def fused_ep_moe_v2(
                 all_gather,
             )
 
-            q_g = all_gather(
-                q_l, ax, (preprocess_topology.masks, preprocess_topology.wire_map)
-            )
+            assert split_topology is not None
+            if split_topology.custom_gather:
+                q_g = all_gather(
+                    q_l, ax, (split_topology.masks, split_topology.wire_map)
+                )
+            else:
+                with jax.named_scope("moe_activation_ag"):
+                    q_g = compute_on(
+                        lambda p: lax.all_gather(p, ax, axis=0, tiled=True),
+                        compute_type="tpu_sparsecore",
+                        out_memory_spaces=jax.memory.Space.Device,
+                        compiler_options={"sparse_core_config": {"core_ids": [1]}},
+                    )(q_l)
             with jax.named_scope("moe_early_ag_route"):
                 topk_weights, packed, local_blocks, block_hist, row_routes = (
                     select_local(gate_l, hash_l, score_bias_l, row_scale_l)
