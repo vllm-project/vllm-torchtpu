@@ -132,7 +132,13 @@ class Qwen4ExpPoolLayout:
         return self.page_bytes // self.compressed_kernel_bytes
 
 
-def pooled_cache_specs(cfg, *, tp: int | None = None, main_dcp: int | None = None):
+def pooled_cache_specs(
+    cfg,
+    *,
+    tp: int | None = None,
+    main_dcp: int | None = None,
+    pack_compressed: bool | None = None,
+):
     """Derive uniform physical pages without widening compressed-key coverage.
 
     Increasing a compressed page's *logical* span merely to fill the pool
@@ -163,8 +169,8 @@ def pooled_cache_specs(cfg, *, tp: int | None = None, main_dcp: int | None = Non
     KV keep ``B``, so prefix hashing and the draft are unchanged.
     ``VLLM_TPU_QSA_MTP_KV_DCP`` gives the draft's main KV groups ``2 * B`` too.
     """
-    # ``tp`` / ``main_dcp`` describe another engine (a PD peer's geometry,
-    # pd_staging); by default this engine's.
+    # ``tp`` / ``main_dcp`` / ``pack_compressed`` describe another engine (a
+    # PD peer's geometry, pd_staging); by default this engine's.
     tp = cfg.parallel_config.tensor_parallel_size if tp is None else tp
     specs = native_cache_specs(cfg, tp)
     text = cfg.model_config.hf_text_config
@@ -203,7 +209,9 @@ def pooled_cache_specs(cfg, *, tp: int | None = None, main_dcp: int | None = Non
     packed_slots = page_bytes // (block_size // QSA_BLOCK_SIZE * compressed_bytes)
     compressed_names = [name for name in specs if name.endswith(".compressed_k")]
     owners: list[tuple[str, str, int]] = []
-    if pack_compressed_k_enabled() and packed_slots > 1:
+    if pack_compressed is None:
+        pack_compressed = pack_compressed_k_enabled()
+    if pack_compressed and packed_slots > 1:
         # Consecutive QSA layers (the MTP draft's last) share one owner
         # group; one block table and one page lifetime cover all of them,
         # since compressed keys of every layer track the same token span.

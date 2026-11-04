@@ -179,8 +179,12 @@ def compressed_rows(
     dst_block: int,
     start: int = 0,
     src_first: int = 0,
+    dst_offset: int = 0,
 ) -> tuple[list[int], list[int]]:
     """Rows ("pairs") holding the compressed keys of the first ``num_tokens``.
+
+    ``dst_offset`` rows shift every destination row within its page: a
+    packed member's slot (``compressed_destinations``).
 
     Pair ``p`` of a page holds compressed groups ``2p`` and ``2p + 1``, i.e.
     tokens ``[2 p ratio, 2 (p + 1) ratio)`` of the page's span
@@ -198,8 +202,35 @@ def compressed_rows(
         src.append(
             src_pages[t // src_block - src_first] * src_block + (t % src_block) // span
         )
-        dst.append(dst_pages[t // dst_block] * dst_block + (t % dst_block) // span)
+        dst.append(
+            dst_pages[t // dst_block] * dst_block + dst_offset + (t % dst_block) // span
+        )
     return src, dst
+
+
+def compressed_destinations(
+    layout, dst_owner: dict[str, int], dst_block: int, ratio: int
+) -> dict[str, tuple[int, int]]:
+    """Each compressed-key owner's destination group and in-page row offset.
+
+    Unpacked, every owner has its own group at offset 0. Packed
+    (``layout.compressed_slots`` > 1), member ``s`` of a group named after
+    its first member stores its ``dst_block // (2 * ratio)`` pair rows at
+    kernel pages ``[s * main_kernel_pages, (s + 1) * main_kernel_pages)``,
+    i.e. rows ``[s * member_rows, (s + 1) * member_rows)`` of the page.
+    """
+    member_rows = dst_block // (2 * ratio)
+    out: dict[str, tuple[int, int]] = {}
+    if layout.compressed_owners:
+        if member_rows * layout.compressed_slots > dst_block:
+            raise ValueError("Packed compressed members overflow the page")
+        for prefix, owner, slot in layout.compressed_owners:
+            out[prefix + ".compressed_k"] = (dst_owner[owner], slot * member_rows)
+    else:
+        for name, gi in dst_owner.items():
+            if owner_kind(name) == "compressed":
+                out[name] = (gi, 0)
+    return out
 
 
 def page_prefix_rows(
@@ -426,22 +457,25 @@ class StagedConsumer:
         )
 
         from .pd import TransferExtent, build_transfer_groups
-        from .pool_layout import pack_compressed_k_enabled, pack_main_kv_enabled, pooled_cache_specs
+        from .pool_layout import pack_main_kv_enabled, pooled_cache_specs
 
-        if pack_compressed_k_enabled() or pack_main_kv_enabled():
+        if pack_main_kv_enabled():
             raise ValueError(
-                "A staged Qwen PD decode needs QWEN4_EXP_PACK_COMPRESSED_K=0 and "
-                "QWEN4_EXP_PACK_MAIN_KV=0 (the pipeline producer's layout)"
+                "A staged Qwen PD decode needs QWEN4_EXP_PACK_MAIN_KV=0 (the "
+                "pipeline producer's layout)"
             )
+        # Packed compressed keys (QWEN4_EXP_PACK_COMPRESSED_K=1) are this
+        # decode's own layout: the repack writes each layer's pairs at its
+        # slot of the owner group's page. The producer never packs.
         self.cfg, self.rank, self.pool = cfg, rank, pool
         self.dst_layout = decode_layout
         self.dst_groups = decode_groups
-        # The producer: TP1 stages, no main-KV DCP, the same packing flags,
+        # The producer: TP1 stages, no main-KV DCP, unpacked compressed keys,
         # and no MTP draft: a decode-only draft (this engine's
         # speculative_config) adds draft owners and speculative state blocks
         # the producer's plan does not have.
         self.src_layout, src_specs = pooled_cache_specs(
-            without_speculation(cfg), tp=1, main_dcp=1
+            without_speculation(cfg), tp=1, main_dcp=1, pack_compressed=False
         )
         self.src_groups = build_transfer_groups(get_kv_cache_groups(cfg, dict(src_specs)))
         self.src_block, self.dst_block = self.src_layout.block_size, decode_layout.block_size
@@ -481,12 +515,21 @@ class StagedConsumer:
         )
         self._src_owner = {n: g.group_index for g in self.src_groups for n in g.layer_names}
         self._dst_owner = {n: g.group_index for g in self.dst_groups for n in g.layer_names}
-        # Decode-only MTP: the draft layer's owners have no producer pages;
-        # its prompt KV starts empty (synthetic acceptance does not read it).
-        missing = set(self._dst_owner) - set(self._src_owner)
+        # Compressed-key owner -> (destination group, row offset in its page):
+        # a packed member sits in its owner's group at slot * member rows.
+        self._dst_compressed = compressed_destinations(
+            decode_layout, self._dst_owner, self.dst_block, self.ratio
+        )
+        # Decode-only MTP: the draft layer's owners (and its packed compressed
+        # slot) have no producer pages; its prompt KV starts empty (synthetic
+        # acceptance does not read it).
+        missing = (set(self._dst_owner) | set(self._dst_compressed)) - set(self._src_owner)
         if any(not n.startswith("mtp.") for n in missing):
             raise ValueError(f"Qwen PD staging lacks producer pages for {sorted(missing)}")
         self._dst_owner = {n: g for n, g in self._dst_owner.items() if n not in missing}
+        self._dst_compressed = {
+            n: v for n, v in self._dst_compressed.items() if n not in missing
+        }
         # A speculative state table holds the committed state, then K
         # speculative checkpoints; the connector hands the repack only the
         # committed entry (_Stage3TransferGroup.transfer_pages).
@@ -588,8 +631,18 @@ class StagedConsumer:
         pages); ``first[g]`` is the source page group ``g``'s staging starts at."""
         first = first or [0] * len(self.src_groups)
         main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = [], [], [], [], [], []
+        for name, (gi, offset) in self._dst_compressed.items():
+            s, d = compressed_rows(
+                num_tokens, self.ratio, src_pages[self._src_owner[name]],
+                self.src_block, dst_tables[gi], self.dst_block, start=skip_tokens,
+                src_first=first[self._src_owner[name]], dst_offset=offset,
+            )
+            copy_s += s
+            copy_d += d
         for name, gi in self._dst_owner.items():
             kind = owner_kind(name)
+            if kind == "compressed":
+                continue
             src = src_pages[self._src_owner[name]]
             src_first = first[self._src_owner[name]]
             dst = dst_tables[gi]
@@ -598,11 +651,6 @@ class StagedConsumer:
                                  self.rank, start=skip_tokens, src_first=src_first)
                 main_s += s
                 main_d += d
-            elif kind == "compressed":
-                s, d = compressed_rows(num_tokens, self.ratio, src, self.src_block, dst,
-                                       self.dst_block, start=skip_tokens, src_first=src_first)
-                copy_s += s
-                copy_d += d
             elif kind in ("ring", "ple"):
                 entry = dst[self._state_entry] if kind == "ple" else dst[0]
                 s, d = page_prefix_rows(src[0], self.src_block, entry, self.dst_block,
