@@ -814,7 +814,10 @@ def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_ke
     if envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE:
         # Dummy runs (zero-filled) never key a reuse.
         key = stage_key if ctx.position_ids_override is None else None
-        runner._block_table_stage_prev = (table_geom, flat.clone(), staged_dev, key)
+        # On a reuse hit `flat` equals `prev[1]`, so keep that copy instead of
+        # cloning another multi-MB host tensor.
+        cached_flat = prev[1] if reused else flat.clone()
+        runner._block_table_stage_prev = (table_geom, cached_flat, staged_dev, key)
     if reused:
         # Nothing uploads `flat`: return it to the pool now rather than leak
         # a registered buffer on every reused walk.

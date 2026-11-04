@@ -700,12 +700,15 @@ class TestAttentionMetadataBuilderPlumbing:
         first = walk()
         assert len(runner._unfenced_h2d_sources) == 1
         uploaded = runner._unfenced_h2d_sources[0][0]
+        cached = runner._block_table_stage_prev[1]
 
         # A version bump with unchanged contents re-packs, then reuses.
         am._BLOCK_TABLE_VERSION[0] += 1
         second = walk()
         assert torch.equal(second.staged_block_tables[0], first.staged_block_tables[0])
         assert len(runner._unfenced_h2d_sources) == 1  # no second upload
+        # The reuse keeps the cached host copy rather than cloning a new one.
+        assert runner._block_table_stage_prev[1] is cached
         (packed,) = runner._free_h2d_sources[key]
         assert packed is not uploaded
         assert id(packed) in runner._registered_h2d_sources
