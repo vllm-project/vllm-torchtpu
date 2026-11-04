@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Count-based presort metadata fusion; preserve the original FP8 gather."""
+"""Count-based presort metadata fusion; preserve the original FP8 gather.
+
+Use --production --tokens {96,192,256,288,384} for integrated dispatch.
+The baseline is frozen at 09b82cc91, including its original T288 fusion.
+Pass --profile to save separate profiles alongside synchronized AB/BA samples.
+"""
 
 import argparse
 import functools
@@ -70,7 +75,7 @@ def metadata_candidate(pairs, counts, *, revision=1):
             precision=lax.Precision.HIGHEST,
         ).astype(jnp.int32)
     else:
-        # One-hot rows select one integer in [0, 288]. Both base-256 digits
+        # One-hot rows select one integer in [0, 384]. Both base-256 digits
         # are exactly representable in BF16; FP32 products/sums are exact.
         hot = onehot.astype(jnp.bfloat16)
         low = (cumulative & 255).T.astype(jnp.bfloat16)
@@ -83,16 +88,12 @@ def metadata_candidate(pairs, counts, *, revision=1):
     return order, start
 
 
-def native(pairs, counts, q):
-    return host.local_sort_activations(pairs, counts, q, e_total=384, topk=6)
-
-
-def fixture(kind, seed=42):
+def fixture(kind, seed=42, *, tokens=288):
     rng = np.random.default_rng(seed)
     pairs = np.stack(
         [
             rng.choice(12 if kind == "skew" else 384, 6, replace=False)
-            for _ in range(288)
+            for _ in range(tokens)
         ]
     ).astype(np.int32)
     if kind == "empty":
@@ -108,7 +109,7 @@ def fixture(kind, seed=42):
         pairs[::5, ::2] = 10000
     flat = pairs.reshape(-1)
     counts = np.bincount(flat[flat < 384], minlength=384).astype(np.int32)
-    raw = rng.integers(0, 256, (288, 40, 128), dtype=np.uint8)
+    raw = rng.integers(0, 256, (tokens, 40, 128), dtype=np.uint8)
     raw.reshape(-1)[:256] = np.arange(256, dtype=np.uint8)
     return flat, counts, raw.view(ml_dtypes.float8_e4m3fn)
 
@@ -135,30 +136,68 @@ def assert_equal(a, b):
     np.testing.assert_array_equal(a[1], b[1])
 
 
+BASELINE_REF = "09b82cc911236e585d172b54ad3a2fa0e8c959d8"
+BASELINE_SHA256 = "b7e5bce9f621dc2fca5fb6ee70b3d50639b7d013f8924e073022cfb6daf6ee1a"
+BASELINE_PATH = Path(__file__).with_name("_presort_baseline_09b82cc91.py")
+BASELINE_DEPENDENCIES = {
+    "experimental/push_fused_moe/host.py": (
+        "de18842f1d16bdc4eb07db4b766d451d86e86ea537bfcf1b2478c19d2e543900"
+    ),
+    "experimental/decode_preparation.py": (
+        "45196d72d3b617228b7cb71709d6f692963564b7eb49e7b426eec1723e1840a0"
+    ),
+}
+
+
+def load_production_baseline():
+    """Load an exact original source, never the mutable production candidate."""
+    source = BASELINE_PATH.read_bytes()
+    assert hashlib.sha256(source).hexdigest() == BASELINE_SHA256
+    for relative, digest in BASELINE_DEPENDENCIES.items():
+        path = ROOT / "src/vllm_torchtpu/kernels" / relative
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, (
+            f"Frozen baseline dependency changed: {path}"
+        )
+    name = "vllm_torchtpu.kernels.experimental.push_fused_moe._frozen_presort"
+    module = types.ModuleType(name)
+    module.__file__ = str(BASELINE_PATH)
+    module.__package__ = name.rpartition(".")[0]
+    exec(compile(source, str(BASELINE_PATH), "exec"), vars(module))
+    return module
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--samples", default=200, type=int)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--revision", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument(
+        "--tokens", type=int, choices=(96, 192, 256, 288, 384), default=288
+    )
     parser.add_argument("--production", action="store_true")
     args = parser.parse_args()
+    if args.samples <= 0:
+        parser.error("--samples must be positive")
     args.out.mkdir(parents=True, exist_ok=True)
-    initial = tuple(jax.device_put(x) for x in fixture("uniform"))
-    fused = fuse_function(
-        functools.partial(metadata_candidate, revision=args.revision),
-        (
-            initial[0] if args.revision == 3 else initial[0].reshape(288, 6).T,
-            initial[1],
-        ),
-        name=f"dsv41_presort_metadata_v{args.revision}",
-    )
-
-    def candidate(pairs, counts, q):
-        order, start = fused(
-            pairs if args.revision == 3 else pairs.reshape(288, 6).T, counts
+    initial = tuple(jax.device_put(x) for x in fixture("uniform", tokens=args.tokens))
+    if not args.production:
+        fused = fuse_function(
+            functools.partial(metadata_candidate, revision=args.revision),
+            (
+                initial[0]
+                if args.revision == 3
+                else initial[0].reshape(args.tokens, 6).T,
+                initial[1],
+            ),
+            name=f"dsv41_presort_metadata_v{args.revision}",
         )
-        return q[order], start
+
+        def candidate(pairs, counts, q):
+            order, start = fused(
+                pairs if args.revision == 3 else pairs.reshape(q.shape[0], 6).T, counts
+            )
+            return q[order], start
 
     if args.production:
         from vllm_torchtpu.kernels.experimental.push_fused_moe import layer, presort
@@ -169,9 +208,19 @@ def main():
         def candidate(pairs, counts, q):
             return layer.local_sort_activations(pairs, counts, q, e_total=384, topk=6)
 
-    funcs = {"native": jax.jit(native), "pallas": jax.jit(candidate)}
+    baseline = load_production_baseline()
+    baseline_fused = baseline.supports_local_sort(*initial, e_total=384, topk=6)
+    if args.production:
+        assert baseline_fused == (args.tokens == 288)
+    funcs = {
+        "baseline": jax.jit(
+            functools.partial(baseline.local_sort_activations, e_total=384, topk=6)
+        ),
+        "pallas": jax.jit(candidate),
+    }
     source_paths = [
         Path(__file__),
+        BASELINE_PATH,
         ROOT / "src/vllm_torchtpu/kernels/experimental/decode_preparation.py",
         ROOT / "src/vllm_torchtpu/kernels/experimental/push_fused_moe/host.py",
         ROOT / "src/vllm_torchtpu/kernels/experimental/push_fused_moe/layer.py",
@@ -181,8 +230,24 @@ def main():
             ROOT / "src/vllm_torchtpu/kernels/experimental/push_fused_moe/presort.py"
         )
     result = {
-        "revision": args.revision,
+        "revision": 2 if args.production else args.revision,
         "production": args.production,
+        "baseline": {
+            "git_ref": BASELINE_REF,
+            "source_sha256": BASELINE_SHA256,
+            "implementation": "original_fused" if baseline_fused else "native",
+        },
+        "candidate_dispatch": "layer.local_sort_activations"
+        if args.production
+        else "experimental_metadata",
+        "tokens": args.tokens,
+        "shapes": {
+            "q": [args.tokens, 40, 128],
+            "pairs": [6 * args.tokens],
+            "counts": [384],
+        },
+        "timing_protocol": "synchronized AB/BA alternation, profiler disabled",
+        "profiles": [],
         "runtime": {
             "versions": {
                 n: importlib.metadata.version(n)
@@ -196,7 +261,7 @@ def main():
             for p in source_paths
         },
         "scope": (
-            "original local_sort_activations versus metadata Pallas including "
+            "frozen original production dispatch versus candidate including "
             "input transpose, outputs and unchanged native FP8 gather; "
             "communication excluded at existing optimization barriers"
         ),
@@ -210,7 +275,17 @@ def main():
     save()
     for name, fn in funcs.items():
         compiled = fn.lower(*initial).compile()
-        (args.out / f"{name}-optimized.txt").write_text(compiled.as_text())
+        hlo = compiled.as_text()
+        (args.out / f"{name}-optimized.txt").write_text(hlo)
+        if name == "baseline":
+            assert ("dsv41_presort_metadata" in hlo) == baseline_fused
+            result["baseline_hits_pallas"] = baseline_fused
+        if name == "pallas":
+            assert "dsv41_presort_metadata" in hlo and "custom-call" in hlo, (
+                "Candidate did not compile to the presort Pallas custom call"
+            )
+            result["candidate_hits_pallas"] = True
+            save()
         (args.out / f"{name}-stablehlo.txt").write_text(
             str(fn.lower(*initial).compiler_ir())
         )
@@ -224,7 +299,7 @@ def main():
         ("sentinel", 42),
         ("full_count", 42),
     ]:
-        cpu = fixture(kind, seed)
+        cpu = fixture(kind, seed, tokens=args.tokens)
         xs = tuple(jax.device_put(x) for x in cpu)
         np.testing.assert_array_equal(
             np.asarray(xs[2]).view(np.uint8), cpu[2].view(np.uint8)
@@ -233,7 +308,7 @@ def main():
         outputs = {n: jax.block_until_ready(fn(*xs)) for n, fn in funcs.items()}
         for output in outputs.values():
             assert_equal(output, want)
-        assert_equal(outputs["native"], outputs["pallas"])
+        assert_equal(outputs["baseline"], outputs["pallas"])
         row = {
             "case": kind,
             "seed": seed,
@@ -246,16 +321,16 @@ def main():
         print(json.dumps(row), flush=True)
     if args.production:
         result["fallbacks"] = []
-        base = fixture("uniform")
+        base = fixture("uniform", tokens=args.tokens)
         for kind in ("tokens", "dtype", "topk", "experts", "width", "index_dtype"):
             p, c, q = (x.copy() for x in base)
             e, k = 384, 6
             if kind == "tokens":
-                q, p = q[:256], p[: 256 * k]
+                p, c, q = fixture("uniform", tokens=128)
             elif kind == "dtype":
                 q = q.astype(ml_dtypes.bfloat16)
             elif kind == "topk":
-                p, k = p.reshape(288, 6)[:, :4].reshape(-1), 4
+                p, k = p.reshape(q.shape[0], 6)[:, :4].reshape(-1), 4
             elif kind == "experts":
                 e = 128
             elif kind == "width":
@@ -285,7 +360,7 @@ def main():
             save()
     result["precision_passed"] = True
     for kind in ("uniform", "skew"):
-        xs = tuple(jax.device_put(x) for x in fixture(kind))
+        xs = tuple(jax.device_put(x) for x in fixture(kind, tokens=args.tokens))
         for _ in range(20):
             for fn in funcs.values():
                 jax.block_until_ready(fn(*xs))
@@ -315,6 +390,7 @@ def main():
             flush=True,
         )
         if args.profile:
+            result["profiles"].append("profile-" + kind)
             with jax.profiler.trace(str(args.out / ("profile-" + kind))):
                 for i in range(16):
                     order = list(funcs.items())
