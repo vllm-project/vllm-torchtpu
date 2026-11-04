@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
-    TPU_ONEHOT_TABLE_LOOKUP: bool = False
+    TPU_ONEHOT_TABLE_LOOKUP: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
@@ -95,20 +95,20 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     MOE_FUSED_EP_PUSH_SC_PREPUSH: int = 2
     MOE_FUSED_EP_PUSH_TC_EXCHANGE: bool = False
-    MOE_FUSED_EP_PUSH_TAIL_BARRIER: bool = True
-    MOE_FUSED_EP_PUSH_ONEHOT_SLOTS: bool = False
-    MOE_FUSED_EP_PUSH_HBM_STAGING: bool = False
-    MOE_FUSED_EP_PUSH_DISPATCH_AHEAD: int = 1
+    MOE_FUSED_EP_PUSH_TAIL_BARRIER: bool = False
+    MOE_FUSED_EP_PUSH_ONEHOT_SLOTS: bool = True
+    MOE_FUSED_EP_PUSH_HBM_STAGING: bool = True
+    MOE_FUSED_EP_PUSH_DISPATCH_AHEAD: int = 25
     MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS: bool = False
-    MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT: bool = False
-    MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER: bool = False
-    MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS: bool = False
-    MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER: bool = False
-    MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META: bool = False
+    MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT: bool = True
+    MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER: bool = True
+    MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS: bool = True
+    MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER: bool = True
+    MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META: bool = True
     MOE_FUSED_EP_PUSH_EARLY_ROW_GATHER: bool = False
-    MOE_FUSED_EP_PUSH_TABLE_KERNEL: bool = False
-    MOE_FUSED_EP_PUSH_EXCHANGE_TABLES: bool = False
-    MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES: bool = False
+    MOE_FUSED_EP_PUSH_TABLE_KERNEL: bool = True
+    MOE_FUSED_EP_PUSH_EXCHANGE_TABLES: bool = True
+    MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES: bool = True
     MOE_FUSED_EP_PUSH_I32_SCALE_SLAB: bool = False
     MOE_FUSED_EP_PUSH_STAGING_SLOTS: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
@@ -489,7 +489,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Look up per-request tables (query starts, sequence lengths, window
     # starts) by token as a one-hot sum instead of a gather or a bucketize
     # (`layers/core/table_lookup.py`). Integer-exact.
-    "TPU_ONEHOT_TABLE_LOOKUP": env_bool("TPU_ONEHOT_TABLE_LOOKUP", default=False),
+    "TPU_ONEHOT_TABLE_LOOKUP": env_bool("TPU_ONEHOT_TABLE_LOOKUP", default=True),
     # Debug: on every incremental step, rebuild the full packed table on the
     # host and check it against the device-resident copy (raises on mismatch).
     "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(
@@ -817,20 +817,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_KERNEL_IMPL=push: keep the all-pairs barrier the expert
     # kernel runs after its transport drain. 0 drops it; the drain's exact
     # counts already cover every write a peer makes during the call.
-    "MOE_FUSED_EP_PUSH_TAIL_BARRIER": env_bool(
-        "MOE_FUSED_EP_PUSH_TAIL_BARRIER", default=True
-    ),
+    "MOE_FUSED_EP_PUSH_TAIL_BARRIER": env_bool("MOE_FUSED_EP_PUSH_TAIL_BARRIER", default=False),
     # MOE_FUSED_EP_KERNEL_IMPL=push with an expert layout: map each selected
     # expert to its replica slot with a one-hot matmul instead of two gathers.
-    "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS": env_bool("MOE_FUSED_EP_PUSH_ONEHOT_SLOTS"),
+    "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS": env_bool("MOE_FUSED_EP_PUSH_ONEHOT_SLOTS", default=True),
     # MOE_FUSED_EP_KERNEL_IMPL=push: ship the expert kernel's result tiles
     # through its HBM contribution slab instead of straight from VMEM, so the
     # remote pushes do not hold a VMEM staging slot while the fabric drains.
-    "MOE_FUSED_EP_PUSH_HBM_STAGING": env_bool("MOE_FUSED_EP_PUSH_HBM_STAGING"),
+    "MOE_FUSED_EP_PUSH_HBM_STAGING": env_bool("MOE_FUSED_EP_PUSH_HBM_STAGING", default=True),
     # MOE_FUSED_EP_KERNEL_IMPL=push: how many visit positions the expert
     # kernel's own dispatch pushes run ahead of its compute (>= 1); the experts
     # per shard or more pushes every position right after the head barrier.
-    "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD": env_int("MOE_FUSED_EP_PUSH_DISPATCH_AHEAD", 1),
+    "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD": env_int("MOE_FUSED_EP_PUSH_DISPATCH_AHEAD", 25),
     # MOE_FUSED_EP_KERNEL_IMPL=push: visit each shard's experts alternating
     # heaviest and lightest instead of most rows first (output unchanged).
     "MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS": env_bool(
@@ -838,30 +836,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # MOE_FUSED_EP_KERNEL_IMPL=push: build the scale slab's per-pair row
     # scales with a one-hot matmul instead of jnp.repeat.
-    "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT": env_bool(
-        "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT"
-    ),
+    "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT": env_bool("MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT", default=True),
     # MOE_FUSED_EP_KERNEL_IMPL=push with MOE_FUSED_EP_PUSH_TC_EXCHANGE=1: the
     # routing-exchange kernel also copies the expert-sorted activation rows
     # while it waits on its peers.
-    "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER": env_bool(
-        "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER"
-    ),
+    "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER": env_bool("MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER", default=True),
     # MOE_FUSED_EP_KERNEL_IMPL=push: find the expert-sorted token order with
     # two single-pass bf16 matmuls instead of a cumsum and a HIGHEST matmul.
-    "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS": env_bool(
-        "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS"
-    ),
+    "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS": env_bool("MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS", default=True),
     # MOE_FUSED_EP_KERNEL_IMPL=push: keep the run tables out of the barrier
     # that orders the SparseCore pre-push ahead of the routing plan.
-    "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER": env_bool(
-        "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER"
-    ),
+    "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER": env_bool("MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER", default=True),
     # MOE_FUSED_EP_KERNEL_IMPL=push: build the pre-push counts and the
     # kernel's remote-row count with the dispatch segments, in fewer ops.
-    "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META": env_bool(
-        "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META"
-    ),
+    "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META": env_bool("MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META", default=True),
     # With MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER=1: issue the row copies
     # before the exchange kernel's entry barrier instead of after its pushes.
     "MOE_FUSED_EP_PUSH_EARLY_ROW_GATHER": env_bool(
@@ -869,17 +857,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # MOE_FUSED_EP_KERNEL_IMPL=push: build the dispatch and shard tables in
     # one TensorCore kernel (plan_kernel.py) instead of ~50 XLA ops.
-    "MOE_FUSED_EP_PUSH_TABLE_KERNEL": env_bool("MOE_FUSED_EP_PUSH_TABLE_KERNEL"),
+    "MOE_FUSED_EP_PUSH_TABLE_KERNEL": env_bool("MOE_FUSED_EP_PUSH_TABLE_KERNEL", default=True),
     # With TABLE_KERNEL=1 and EXCHANGE_ROW_GATHER=1: build the tables inside
     # the routing-exchange kernel while its row copies finish.
-    "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES": env_bool(
-        "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES"
-    ),
+    "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES": env_bool("MOE_FUSED_EP_PUSH_EXCHANGE_TABLES", default=True),
     # With TABLE_KERNEL=1: the routing plan's small tables come from the
     # table kernel too; XLA keeps only the per-pair lookups.
-    "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES": env_bool(
-        "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES"
-    ),
+    "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES": env_bool("MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES", default=True),
     # MOE_FUSED_EP_KERNEL_IMPL=push: hand the expert kernel the activation
     # scale slab as i32 bit patterns and bitcast each tile's column in VMEM.
     "MOE_FUSED_EP_PUSH_I32_SCALE_SLAB": env_bool("MOE_FUSED_EP_PUSH_I32_SCALE_SLAB"),
