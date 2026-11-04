@@ -17,10 +17,7 @@ Per query token at position ``p`` and KV head ``h`` the lightning indexer
 scores every causal-visible KV block ``b`` as ``max_{j in b} iq[p, h] . ik[j]``,
 forces the local block ``p // block_size`` (and ``init_blocks`` leading
 blocks) into the selection, and keeps the ``topk`` best blocks. Attention then
-runs over the selected blocks only. The block attention reuses the shared
-ragged paged attention kernel: every token becomes a one-token sequence whose
-page table lists its selected blocks in ascending order, so the local block is
-last and the kernel's causal mask truncates it at the token itself.
+runs over the selected blocks only (`msa_attention.msa_sparse_attention`).
 """
 
 import functools
@@ -30,10 +27,10 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import merge_kv
+from vllm_torchtpu.models.minimax_m3.kernels.msa_attention import (
+    msa_sparse_attention,
+)
 
-# Rows a single virtual-table attention call may carry. The kernel keeps the
-# page table in SMEM: rows * topk * 4 bytes must stay within half of it.
-MAX_ROWS_PER_ATTENTION_CALL = 2048
 # Query windows the block scorer tries, smallest first; the step's token
 # bucket is always the last tier.
 SCORE_WINDOW_TIERS = (16, 256)
@@ -242,50 +239,32 @@ def sparse_attention(
     block_tables_2d: jax.Array,
     seq_id: jax.Array,
     pos: jax.Array,
-    num_real_tokens: jax.Array,
+    token_pages: jax.Array,
+    valid: jax.Array,
     *,
     sm_scale: float,
-    rpa_func: Callable,
-    max_rows: int = MAX_ROWS_PER_ATTENTION_CALL,
+    interpret: bool = False,
 ) -> jax.Array:
     """GQA attention of every token over its selected blocks."""
-    num_tokens, _, head_dim = q.shape
     if selected.shape[1] != 1:
         raise NotImplementedError(
-            "MSA attention shares one page table across a rank's KV heads, so it "
-            f"needs one KV head per rank; got {selected.shape[1]}. Use a tensor "
-            "parallel size of at least num_key_value_heads."
+            "MSA attention selects pages for one KV head per rank; got "
+            f"{selected.shape[1]}. Use a tensor parallel size of at least "
+            "num_key_value_heads."
         )
     block_size = kv_cache.shape[1]
     selected = selected[:, 0]
-    is_selected = selected >= 0
     pages = block_tables_2d[seq_id[:, None], jnp.maximum(selected, 0)]
-    pages = jnp.where(is_selected, pages, 0)
-    num_selected = is_selected.sum(axis=-1, dtype=jnp.int32)
-    kv_lens = (num_selected - 1) * block_size + pos % block_size + 1
-    dummy_kv = jnp.zeros((num_tokens, 1, head_dim), q.dtype)
-
-    outputs = []
-    for start in range(0, num_tokens, max_rows):
-        rows = min(max_rows, num_tokens - start)
-        real = jnp.clip(num_real_tokens - start, 0, rows).astype(jnp.int32)
-        cu_q_lens = jnp.minimum(jnp.arange(rows + 1, dtype=jnp.int32), real)
-        out, _ = rpa_func(
-            q[start : start + rows],
-            dummy_kv[start : start + rows],
-            dummy_kv[start : start + rows],
-            kv_cache,
-            jnp.where(jnp.arange(rows) < real, kv_lens[start : start + rows], 0),
-            pages[start : start + rows].reshape(-1),
-            cu_q_lens,
-            jnp.stack([real, real, real]),
-            sm_scale=sm_scale,
-            skip_kv_update=True,
-        )
-        outputs.append(out)
-    out = jnp.concatenate(outputs, axis=0)
-    real_rows = jnp.arange(num_tokens) < num_real_tokens
-    return jnp.where(real_rows[:, None, None], out, 0).astype(q.dtype)
+    pages = jnp.where((selected >= 0) & valid[:, None], pages, -1)
+    return msa_sparse_attention(
+        q,
+        kv_cache,
+        pages,
+        jnp.where(valid, token_pages, -1),
+        pos % block_size + 1,
+        sm_scale=sm_scale,
+        interpret=interpret,
+    )
 
 
 def msa_forward(
@@ -305,7 +284,7 @@ def msa_forward(
     topk: int,
     init_blocks: int,
     local_blocks: int,
-    rpa_func: Callable,
+    interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Write this step's K/V and index keys, select blocks, attend.
 
@@ -340,8 +319,9 @@ def msa_forward(
         block_tables_2d,
         seq_id,
         pos,
-        cu_q_lens[-1],
+        pages,
+        valid,
         sm_scale=sm_scale,
-        rpa_func=rpa_func,
+        interpret=interpret,
     )
     return kv_cache, index_cache, out

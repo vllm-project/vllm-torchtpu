@@ -20,9 +20,6 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
-    ragged_paged_attention,
-)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.minimax_m3.kernels import msa
 
@@ -69,7 +66,6 @@ def get_msa_op(
             topk=topk,
             init_blocks=init_blocks,
             local_blocks=local_blocks,
-            rpa_func=ragged_paged_attention,
         )
 
     op_name = (
