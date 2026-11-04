@@ -244,7 +244,8 @@ def _contiguous_plus_one(experts, ep):
     return np.asarray(slot_expert, np.int32), np.asarray(table, np.int32)
 
 
-def test_expert_layout_serves_the_same_tokens_and_counts_its_rows():
+@pytest.mark.parametrize("onehot_slots", [False, True], ids=["gather", "onehot"])
+def test_expert_layout_serves_the_same_tokens_and_counts_its_rows(onehot_slots):
     """A replicated layout (R = 2): the weights in slot order, gating per
     logical expert. The output must be the unplaced layer's (every copy holds
     the same weights, so only where the rows run changes), and the load
@@ -278,6 +279,7 @@ def test_expert_layout_serves_the_same_tokens_and_counts_its_rows():
         gating,
         expert_slot=jax.device_put(jnp.asarray(table), replicated),
         expert_load=jax.device_put(load0, replicated),
+        onehot_slots=onehot_slots,
         **common,
     )
     plain = fused_ep_moe_push(x, *logical, gating, **common)

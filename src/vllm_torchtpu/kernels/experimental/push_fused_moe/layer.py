@@ -153,19 +153,38 @@ def _combine_arrivals_fs(
     return combine(arrivals, arrival_scales, scl, topk_weights, rows)
 
 
-def _to_slots(topk_idx, expert_slot, row_base):
+def _to_slots(topk_idx, expert_slot, row_base, *, onehot=False):
     """Selected global ids [rows, K] -> slots under an [experts, R] table.
 
     Row r's selection of e takes replica (row_base + r) mod (replicas of e),
     so a replicated expert's rows split evenly over its copies within every
     step. Positions are kept, so the k combine terms keep their order.
+
+    `onehot` reads the selected expert's table row through one one-hot
+    matmul instead of two gathers: XLA offloads a small gather to the
+    SparseCore and the TensorCore waits for it, while this is one small dot.
+    Same values: each output is one table entry (< 2**24) times 1.0 at
+    HIGHEST precision.
     """
+    experts, replicas = expert_slot.shape
     n_rep = jnp.sum(expert_slot >= 0, axis=1, dtype=jnp.int32)
-    e = jnp.clip(topk_idx, 0, expert_slot.shape[0] - 1)
+    e = jnp.clip(topk_idx, 0, experts - 1)
     token = row_base + lax.broadcasted_iota(jnp.int32, topk_idx.shape, 0)
-    replica = lax.rem(token, jnp.take(n_rep, e, axis=0))
-    flat = e * expert_slot.shape[1] + replica
-    return jnp.take(expert_slot.reshape(-1), flat, axis=0)
+    if not onehot:
+        replica = lax.rem(token, jnp.take(n_rep, e, axis=0))
+        flat = e * replicas + replica
+        return jnp.take(expert_slot.reshape(-1), flat, axis=0)
+    hit = (e.reshape(-1, 1) == jnp.arange(experts, dtype=jnp.int32)).astype(jnp.float32)
+    rows = jnp.concatenate([n_rep[:, None], expert_slot], axis=1).astype(jnp.float32)
+    picked = jnp.dot(hit, rows, precision=lax.Precision.HIGHEST).astype(jnp.int32)
+    replica = lax.rem(token.reshape(-1), picked[:, 0])
+    slot = jnp.sum(
+        jnp.where(
+            replica[:, None] == jnp.arange(replicas, dtype=jnp.int32), picked[:, 1:], 0
+        ),
+        axis=1,
+    )
+    return slot.reshape(topk_idx.shape).astype(jnp.int32)
 
 
 _LAYER_SM_CACHE = {}
@@ -205,6 +224,7 @@ def fused_ep_moe_push(
     tc_exchange=False,
     height_rungs_override=0,
     tail_barrier=True,
+    onehot_slots=False,
     expert_slot=None,
     expert_load=None,
 ):
@@ -221,8 +241,9 @@ def fused_ep_moe_push(
     instead of XLA's all-gather. `height_rungs_override` is the tile-height
     ladder's rung count (0 = the default; see kernel.tile_height_rungs).
     `tail_barrier=False` drops the kernel's closing all-pairs barrier (see
-    kernel._build_push_moe_kernel). The caller
-    (layers/adapter/fused_moe_ep.py) reads all four from envs.
+    kernel._build_push_moe_kernel), and `onehot_slots` maps the layout's
+    slots without gathers (see `_to_slots`). The caller
+    (layers/adapter/fused_moe_ep.py) reads all five from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -468,7 +489,9 @@ def fused_ep_moe_push(
             topk_idx = hash_l.astype(jnp.int32)
             topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
             if expert_slot_l is not None:
-                topk_idx = _to_slots(topk_idx, expert_slot_l, me * t_local)
+                topk_idx = _to_slots(
+                    topk_idx, expert_slot_l, me * t_local, onehot=onehot_slots
+                )
         elif score_bias_l is None:
             topk_weights, topk_idx = pallas_select(
                 scores, topk=topk, block_rows=select_rows
@@ -481,7 +504,9 @@ def fused_ep_moe_push(
                 weight_scores=scores,
             )
         if expert_slot_l is not None and hash_l is None:
-            topk_idx = _to_slots(topk_idx, expert_slot_l, me * t_local)
+            topk_idx = _to_slots(
+                topk_idx, expert_slot_l, me * t_local, onehot=onehot_slots
+            )
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
         )
@@ -810,6 +835,7 @@ def fused_ep_moe_push(
         tc_exchange,
         height_rungs_override,
         tail_barrier,
+        bool(onehot_slots),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_SC_PREPUSH: int = 2
     MOE_FUSED_EP_PUSH_TC_EXCHANGE: bool = False
     MOE_FUSED_EP_PUSH_TAIL_BARRIER: bool = True
+    MOE_FUSED_EP_PUSH_ONEHOT_SLOTS: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -731,6 +732,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_PUSH_TAIL_BARRIER": env_bool(
         "MOE_FUSED_EP_PUSH_TAIL_BARRIER", default=True
     ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with an expert layout: map each selected
+    # expert to its replica slot with a one-hot matmul instead of two gathers.
+    "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS": env_bool("MOE_FUSED_EP_PUSH_ONEHOT_SLOTS"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device

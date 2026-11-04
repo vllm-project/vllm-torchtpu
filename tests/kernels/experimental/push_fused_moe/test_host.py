@@ -20,6 +20,8 @@ is where the local sort put the run. The plan builder itself must also stay
 value-identical to v2's.
 """
 
+import itertools
+
 import numpy as np
 import pytest
 
@@ -214,6 +216,40 @@ def test_to_slots_splits_rows_over_replicas():
     got = np.asarray(_to_slots(jnp.asarray(ids), jnp.asarray(table), jnp.int32(4)))
     # Row r takes replica (4 + r) mod (copies of its expert).
     np.testing.assert_array_equal(got, [[3, 5], [7, 0], [0, 3]])
+
+
+@pytest.mark.parametrize("replicas", [1, 2, 10])
+def test_to_slots_forms_agree(replicas):
+    """Both forms return exactly the table entry the definition names, at
+    the served sizes (288 rows, top-6, 384 experts over 400 slots), for
+    every row base parity and an out-of-range id."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.layer import _to_slots
+
+    rng = np.random.default_rng(replicas)
+    experts, rows, topk = 384, 288, 6
+    n_rep = np.ones(experts, np.int32)
+    n_rep[rng.choice(experts, 16, replace=False)] = rng.integers(1, replicas + 1, 16)
+    perm = rng.permutation(experts + 16 * replicas)
+    table = np.full((experts, replicas), -1, np.int32)
+    k = 0
+    for e in range(experts):
+        table[e, : n_rep[e]] = perm[k : k + n_rep[e]]
+        k += n_rep[e]
+    ids = np.stack([rng.choice(experts, topk, replace=False) for _ in range(rows)])
+    ids[3, 2] = experts  # a row's no-route sentinel
+    for row_base, onehot in itertools.product((0, 5, 4 * rows), (False, True)):
+        got = np.asarray(
+            _to_slots(
+                jnp.asarray(ids, jnp.int32),
+                jnp.asarray(table),
+                row_base,
+                onehot=onehot,
+            )
+        )
+        e = np.clip(ids, 0, experts - 1)
+        token = row_base + np.arange(rows)[:, None]
+        want = table[e, token % n_rep[e]]
+        np.testing.assert_array_equal(got, want)
 
 
 @pytest.mark.parametrize(

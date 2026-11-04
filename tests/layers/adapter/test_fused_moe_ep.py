@@ -1156,6 +1156,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
     monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_TC_EXCHANGE", True)
     monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", 4)
     monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_TAIL_BARRIER", False)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS", True)
     bridge._build_op(None, 2, True, "silu", None, False)
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     operands = (
@@ -1175,6 +1176,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         assert forwarded["tc_exchange"] is True
         assert forwarded["height_rungs_override"] == 4
         assert forwarded["tail_barrier"] is False
+        assert forwarded["onehot_slots"] is True
     else:
         push_kernel.assert_not_called()
         forwarded = v2_kernel.call_args.kwargs
@@ -1183,6 +1185,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
             "tc_exchange",
             "height_rungs_override",
             "tail_barrier",
+            "onehot_slots",
         ):
             assert knob not in forwarded
 
@@ -1201,7 +1204,7 @@ def _placed_layer(slots=5, experts_logical=8, **overrides):
     table[:, 0] = torch.arange(experts_logical)
     table[0, 1] = experts_logical  # expert 0 twice: slots 0 and the spare
     table[1, 1] = experts_logical + slots  # expert 1 twice: the other spare
-    setattr(layer, "_tpu_expert_slot", table)
+    layer._tpu_expert_slot = table
     return layer
 
 
