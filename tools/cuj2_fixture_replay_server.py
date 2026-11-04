@@ -18,6 +18,37 @@ DEFAULT_FIXTURE = (
     Path(__file__).resolve().parent / "fixtures" / "cuj2_golden_spans.jsonl"
 )
 
+_OTEL_CONFIGURED_ENDPOINT: str | None = None
+
+
+def _ensure_otel_exporter(otlp_endpoint: str) -> None:
+    """Configure a global TracerProvider + OTLPSpanExporter on first use."""
+    global _OTEL_CONFIGURED_ENDPOINT
+    if _OTEL_CONFIGURED_ENDPOINT == otlp_endpoint:
+        return
+    from opentelemetry import trace
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    try:
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+            OTLPSpanExporter,
+        )
+    except ImportError:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+
+    provider = TracerProvider(
+        resource=Resource.create({"service.name": "vllm-torchtpu-replay"})
+    )
+    provider.add_span_processor(
+        SimpleSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint))
+    )
+    trace.set_tracer_provider(provider)
+    _OTEL_CONFIGURED_ENDPOINT = otlp_endpoint
+
 
 def load_fixtures(path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
@@ -36,6 +67,7 @@ def maybe_emit_otel_span(
     if not otlp_endpoint:
         return
     try:
+        _ensure_otel_exporter(otlp_endpoint)
         from opentelemetry import trace
         from opentelemetry.propagate import extract
         from opentelemetry.trace import SpanKind
@@ -48,7 +80,7 @@ def maybe_emit_otel_span(
             for k, v in attrs.items():
                 if v is not None:
                     span.set_attribute(k, v)
-    except ImportError:
+    except Exception:
         pass
 
 
