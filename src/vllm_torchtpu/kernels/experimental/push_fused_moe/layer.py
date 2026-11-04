@@ -226,6 +226,7 @@ def fused_ep_moe_push(
     tail_barrier=True,
     onehot_slots=False,
     hbm_staging=False,
+    dispatch_ahead=1,
     expert_slot=None,
     expert_load=None,
 ):
@@ -243,9 +244,11 @@ def fused_ep_moe_push(
     ladder's rung count (0 = the default; see kernel.tile_height_rungs).
     `tail_barrier=False` drops the kernel's closing all-pairs barrier (see
     kernel._build_push_moe_kernel), `onehot_slots` maps the layout's
-    slots without gathers (see `_to_slots`), and `hbm_staging` ships result
-    tiles through the HBM contribution slab (see the kernel). The caller
-    (layers/adapter/fused_moe_ep.py) reads all six from envs.
+    slots without gathers (see `_to_slots`), `hbm_staging` ships result
+    tiles through the HBM contribution slab and `dispatch_ahead` is how many
+    visit positions the TensorCore's dispatch pushes run ahead of its compute
+    (see the kernel). The caller (layers/adapter/fused_moe_ep.py) reads all
+    seven from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -400,6 +403,8 @@ def fused_ep_moe_push(
     height_rungs_override = int(height_rungs_override)
     tail_barrier = bool(tail_barrier)
     hbm_staging = bool(hbm_staging)
+    # Every window past the last visit position issues the same program.
+    dispatch_ahead = min(int(dispatch_ahead), g_local)
     kfn = build_push_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -419,6 +424,7 @@ def fused_ep_moe_push(
         height_rungs_override=height_rungs_override,
         tail_barrier=tail_barrier,
         hbm_staging=hbm_staging,
+        dispatch_ahead=dispatch_ahead,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -841,6 +847,7 @@ def fused_ep_moe_push(
         tail_barrier,
         bool(onehot_slots),
         hbm_staging,
+        dispatch_ahead,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

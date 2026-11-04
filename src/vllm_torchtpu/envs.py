@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_TAIL_BARRIER: bool = True
     MOE_FUSED_EP_PUSH_ONEHOT_SLOTS: bool = False
     MOE_FUSED_EP_PUSH_HBM_STAGING: bool = False
+    MOE_FUSED_EP_PUSH_DISPATCH_AHEAD: int = 1
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -740,6 +741,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # through its HBM contribution slab instead of straight from VMEM, so the
     # remote pushes do not hold a VMEM staging slot while the fabric drains.
     "MOE_FUSED_EP_PUSH_HBM_STAGING": env_bool("MOE_FUSED_EP_PUSH_HBM_STAGING"),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: how many visit positions the expert
+    # kernel's own dispatch pushes run ahead of its compute (>= 1); the experts
+    # per shard or more pushes every position right after the head barrier.
+    "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD": env_int("MOE_FUSED_EP_PUSH_DISPATCH_AHEAD", 1),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device

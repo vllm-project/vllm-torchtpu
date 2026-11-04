@@ -117,6 +117,7 @@ def _build_push_moe_kernel(
     height_rungs_override=0,
     tail_barrier=True,
     hbm_staging=False,
+    dispatch_ahead=1,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -129,7 +130,9 @@ def _build_push_moe_kernel(
     destination's per-local-expert receive semaphore. Visit positions
     [0, sc_prepush) were pushed by the SparseCore before this kernel
     (sc_dispatch.sc_dispatch_chunk_2core), so their tiles start with no wait;
-    the TensorCore pushes the rest a visit position ahead of its own compute,
+    the TensorCore pushes the rest `dispatch_ahead` visit positions ahead of
+    its own compute (the first window right after the head barrier, one more
+    position per visit; a value of g_local or more pushes everything there),
     and waits an expert's semaphore for its pair count before loading its
     first tile. Tiles then read their rows as one contiguous slab copy, so no
     token-gather table exists. Only data movement changes: same rows, same
@@ -160,6 +163,11 @@ def _build_push_moe_kernel(
     fabric is the busy resource the tile loop runs ahead of it instead of
     waiting at the slot-reuse guard.
     """
+    if dispatch_ahead < 1:
+        raise ValueError(
+            f"dispatch_ahead {dispatch_ahead} must be at least 1: a visit "
+            "position is pushed before the visit that reads it"
+        )
     if pad_scale_rows and weight_format != host.WeightFormat.FP4:
         raise ValueError(
             "pad_scale_rows describes the four-bit block-scale tables; "
@@ -1383,7 +1391,7 @@ def _build_push_moe_kernel(
 
         _all_pairs_barrier(ep)
         if tc_dispatch:
-            dispatch_issue(sc_prepush, min(sc_prepush + 1, g_local))
+            dispatch_issue(sc_prepush, min(sc_prepush + dispatch_ahead, g_local))
 
         def push_expert(e):
             """Push expert e's remote regions and hop its own-dest region."""
@@ -1452,9 +1460,10 @@ def _build_push_moe_kernel(
             """One step of the visit list: compute, then drain and push."""
             e = visit_sm[visit_i]
             if tc_dispatch:
-                # Push the position sc_prepush + 1 visits ahead, so a peer's
-                # rows for its next expert are in flight while it computes.
-                ahead = visit_i + sc_prepush + 1
+                # Push the position sc_prepush + dispatch_ahead visits ahead,
+                # so a peer's rows for its next experts are in flight while it
+                # computes.
+                ahead = visit_i + sc_prepush + dispatch_ahead
 
                 @pl.when(ahead < g_local)
                 def _():
@@ -1501,7 +1510,9 @@ def _build_push_moe_kernel(
         if tc_dispatch:
             # Whatever visit positions the loop did not reach -- this shard
             # may visit fewer experts than its peers -- then the sends.
-            dispatch_issue(jnp.minimum(n_visit + sc_prepush + 1, g_local), g_local)
+            dispatch_issue(
+                jnp.minimum(n_visit + sc_prepush + dispatch_ahead, g_local), g_local
+            )
             n_remote = dmeta_sm[2 * g_local + 1]
 
             @pl.when(n_remote > 0)
@@ -1638,6 +1649,7 @@ def _build_push_moe_kernel(
             f"_g{g_local}_c{capacity}_nb{nbuf}_s{sc_prepush}"
             f"{'' if tail_barrier else '_notail'}"
             f"{'_hbmst' if hbm_staging else ''}"
+            f"{'' if dispatch_ahead == 1 else f'_da{dispatch_ahead}'}"
         )
         return pl.pallas_call(
             kernel,

@@ -1158,6 +1158,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
     monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_TAIL_BARRIER", False)
     monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS", True)
     monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_HBM_STAGING", True)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD", 25)
     bridge._build_op(None, 2, True, "silu", None, False)
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     operands = (
@@ -1179,6 +1180,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         assert forwarded["tail_barrier"] is False
         assert forwarded["onehot_slots"] is True
         assert forwarded["hbm_staging"] is True
+        assert forwarded["dispatch_ahead"] == 25
     else:
         push_kernel.assert_not_called()
         forwarded = v2_kernel.call_args.kwargs
@@ -1189,6 +1191,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
             "tail_barrier",
             "onehot_slots",
             "hbm_staging",
+            "dispatch_ahead",
         ):
             assert knob not in forwarded
 
