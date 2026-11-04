@@ -581,7 +581,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
-    # from SparseCore geometry (0 on hosts without SparseCore). 0 keeps every
+    # from SparseCore geometry and, under EP, the full decode step's routed
+    # rows (0 on hosts without SparseCore). 0 keeps every
     # size on the SparseCore path; a positive value forces that
     # threshold. The knob and its row-count semantics come from
     # tpu-inference PR #2674.
