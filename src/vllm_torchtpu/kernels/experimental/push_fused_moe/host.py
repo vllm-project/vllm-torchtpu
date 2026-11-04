@@ -157,8 +157,10 @@ def interleave_visits(visit, n_visit):
     q = jnp.arange(g_local, dtype=jnp.int32)
     n = n_visit.reshape(()).astype(jnp.int32)
     src = jnp.where(q % 2 == 0, q // 2, n - 1 - q // 2)
-    src = jnp.where(q < n, src, q)
-    return jnp.take(visit, jnp.clip(src, 0, g_local - 1))
+    src = jnp.clip(jnp.where(q < n, src, q), 0, g_local - 1)
+    # visit[src] as a compare-select-sum: a gather of a few dozen entries
+    # lowers to a per-element loop on the TensorCore.
+    return jnp.sum(jnp.where(src[:, None] == q[None, :], visit[None, :], 0), axis=1)
 
 
 def push_dispatch_segments(
