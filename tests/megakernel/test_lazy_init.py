@@ -71,12 +71,14 @@ import sys
 for name in ("jax", "jaxlib", "torch", "vllm"):
     sys.modules[name] = None
 import vllm_torchtpu.megakernel as mk
-import vllm_torchtpu.megakernel.errors as errors
+import vllm_torchtpu.megakernel.dma as dma
 import vllm_torchtpu.megakernel.runtime as rt
 import vllm_torchtpu.megakernel.runtime.contract as contract
-assert errors.MegakernelLayoutError and errors.MegakernelConfigError
-assert errors.EligibilityResult is contract.EligibilityResult is rt.EligibilityResult
+assert mk.MegakernelLayoutError and mk.MegakernelConfigError
+assert mk.EligibilityResult is contract.EligibilityResult is rt.EligibilityResult
 assert contract.TpuMonoSpec("toy", "1", create="m:create").parallelism == {{"tp"}}
+assert dma.__all__
+assert sys.modules["jax"] is None
 heavy = [m for m in {heavy!r} if m in sys.modules]
 assert not heavy, heavy
 print("OK")
@@ -90,26 +92,25 @@ def test_package_imports_without_jax_torch_or_vllm() -> None:
 
 
 _LAZY_ONLY = """
-import sys
-root_jax = "jax" in sys.modules
-import vllm_torchtpu
-root_jax = "jax" in sys.modules
+import pathlib, sys, types
+pkg = types.ModuleType("vllm_torchtpu")
+pkg.__path__ = [str(pathlib.Path({src!r}) / "vllm_torchtpu")]
+sys.modules["vllm_torchtpu"] = pkg
+import vllm_torchtpu.megakernel as mk
+import vllm_torchtpu.megakernel.dma
 import vllm_torchtpu.megakernel.runtime.contract
-import vllm_torchtpu.megakernel.errors
+assert mk.MegakernelLayoutError and mk.MegakernelConfigError
+assert "jax" not in sys.modules
 heavy = [m for m in {heavy!r} if m in sys.modules]
 assert not heavy, heavy
-print("root_imports_jax" if root_jax else "no_jax")
+print("OK")
 """
 
 
 def test_package_import_loads_no_megakernel_submodule() -> None:
-    """With jax importable, importing the packages imports no heavy submodule.
-
-    The `vllm_torchtpu` root package itself imports jax (`env_override`
-    patches the Pallas `fori_loop` lowering at import), so the jax-free
-    property is checked with jax blocked, above.
-    """
-    assert _run(_LAZY_ONLY.format(heavy=_HEAVY)) in ("root_imports_jax", "no_jax")
+    """With jax importable, importing the packages imports neither jax nor any
+    heavy megakernel submodule."""
+    assert _run(_LAZY_ONLY.format(src=str(_SRC), heavy=_HEAVY)) == "OK"
 
 
 _REGISTRIES = """
