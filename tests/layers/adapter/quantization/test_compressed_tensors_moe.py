@@ -11,20 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
-from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEConfig,
-    FusedMoEParallelConfig,
-    MoEActivation,
-    RoutingMethodType,
-)
-from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
 
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     VllmCompressedTensorsConfig,
@@ -38,10 +29,7 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
     VllmCompressedTensorsW4ANMxfp4MoEMethod,
 )
-from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-    VllmFp8Config,
-    VllmFp8MoEMethodTPU,
-)
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
 
 class FakeQuantArgs:
@@ -221,82 +209,45 @@ def _compressed_tensors_fp8_config(weights: dict) -> VllmCompressedTensorsConfig
             (2, 2, 2),
             id="block",
         ),
-        # Per-channel already used `weight_scale`; it must keep doing so.
+        # Channel and tensor already used `weight_scale`; they must keep doing so.
         pytest.param({"strategy": "channel"}, (2, 512, 1), (2, 256, 1), id="channel"),
+        pytest.param({"strategy": "tensor"}, (2, 2), (2,), id="tensor"),
     ],
 )
 def test_fp8_experts_register_compressed_tensors_scale_names(
-    monkeypatch, weights, w13_scale_shape, w2_scale_shape
+    make_routed_experts, monkeypatch, weights, w13_scale_shape, w2_scale_shape
 ):
     """compressed-tensors names every scale `weight_scale`; the fused layer must
     register that name, not the DeepSeek-style `weight_scale_inv`."""
-    vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(enable_expert_parallel=False)
-    )
-    monkeypatch.setattr(VllmCompressedTensorsConfig, "vllm_config", vllm_config)
-    monkeypatch.setattr(VllmFp8Config, "vllm_config", vllm_config)
-    # Block-scale geometry asks the TP group for its size; no group exists here.
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8."
-        "get_tensor_model_parallel_world_size",
-        lambda: 1,
-    )
-    monkeypatch.setattr(
-        "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1
-    )
-    parallel = FusedMoEParallelConfig(
-        tp_size=1,
-        pcp_size=1,
-        dp_size=1,
-        ep_size=1,
-        tp_rank=0,
-        pcp_rank=0,
-        dp_rank=0,
-        ep_rank=0,
-        sp_size=1,
-        use_ep=False,
-        all2all_backend="allgather_reducescatter",
-        enable_eplb=False,
-    )
-    with set_current_vllm_config(vllm_config):
-        layer = RoutedExperts(
-            layer_name="model.layers.0.mlp.experts",
-            params_dtype=torch.bfloat16,
-            moe_config=FusedMoEConfig(
-                num_experts=2,
-                experts_per_token=1,
-                hidden_dim=256,
-                intermediate_size=256,
-                num_local_experts=2,
-                num_logical_experts=2,
-                activation=MoEActivation.SILU,
-                device=torch.device("cpu"),
-                routing_method=RoutingMethodType.Renormalize,
-                moe_parallel_config=parallel,
-                in_dtype=torch.bfloat16,
-            ),
-            quant_config=_compressed_tensors_fp8_config(weights),
-            expert_map_manager=ExpertMapManager(
-                max_num_batched_tokens=16,
-                top_k=1,
-                global_num_experts=2,
-                num_redundant_experts=0,
-                num_expert_group=None,
-                moe_parallel_config=parallel,
-                placement_strategy="linear",
-                enable_eplb=False,
-            ),
-        )
+    layer = make_routed_experts(_compressed_tensors_fp8_config(weights))
 
     assert isinstance(layer.quant_method, VllmFp8MoEMethodTPU)
     params = dict(layer.named_parameters())
     assert not [name for name in params if name.endswith("weight_scale_inv")]
     assert params["w13_weight_scale"].shape == w13_scale_shape
     assert params["w2_weight_scale"].shape == w2_scale_shape
-    # Expert loaders pass the checkpoint's own tensor name to the loader.
-    w2_scale = params["w2_weight_scale"]
-    scales = torch.arange(w2_scale[0].numel(), dtype=torch.float32).reshape(
-        w2_scale.shape[1:]
+
+    # Expert loaders look the parameters up by the checkpoint's tensor names.
+    weight = torch.ones(256, 256, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    scale = torch.full(w2_scale_shape[1:] or (1,), 2.0)
+    list(
+        layer.load_weights(
+            (f"{expert}.{proj}_proj.{name}", tensor)
+            for expert in range(2)
+            for proj in ("gate", "up", "down")
+            for name, tensor in (("weight", weight), ("weight_scale", scale))
+        )
     )
-    layer.weight_loader(w2_scale, scales, "w2_weight_scale", "w2", 0)
-    torch.testing.assert_close(w2_scale[0], scales)
+    assert torch.all(layer.w13_weight_scale == 2)
+    assert torch.all(layer.w2_weight_scale == 2)
+
+    # Building the Pallas op needs a TPU; swapping in the runtime scales does not.
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.quantization.fp8.prebuild_fused_moe_kernel",
+        lambda **kwargs: None,
+    )
+    layer.quant_method.process_weights_after_loading(layer)
+    assert not hasattr(layer, "w13_weight_scale")
+    assert not hasattr(layer, "w2_weight_scale")
+    assert isinstance(layer.w13_weight_scale_inv, torch.nn.Parameter)
+    assert isinstance(layer.w2_weight_scale_inv, torch.nn.Parameter)

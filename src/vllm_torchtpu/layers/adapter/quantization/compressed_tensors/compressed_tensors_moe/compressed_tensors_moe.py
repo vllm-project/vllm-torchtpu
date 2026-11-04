@@ -113,7 +113,7 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
             # `weight_scale_inv`.
             return VllmFp8MoEMethodTPU(
                 fp8_config,
-                fp8_config.get_moe_config(layer),
+                quant_config.get_moe_config(layer),
                 weight_scale_name="weight_scale",
             )
         # Fallback

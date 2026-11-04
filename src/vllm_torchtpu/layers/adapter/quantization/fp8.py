@@ -43,7 +43,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from math import gcd
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -787,14 +787,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         self,
         quant_config: Fp8Config,
         moe_config,
-        weight_scale_name: str | None = None,
+        weight_scale_name: Literal["weight_scale", "weight_scale_inv"] | None = None,
     ):
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
-        # Native fp8 checkpoints name block scales `weight_scale_inv`; other
-        # formats pass their own name (compressed-tensors: `weight_scale`).
+        # Native fp8 checkpoints name block scales `weight_scale_inv`.
         if weight_scale_name is None:
             weight_scale_name = (
                 "weight_scale_inv" if self.block_quant else "weight_scale"
