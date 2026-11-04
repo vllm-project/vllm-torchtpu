@@ -208,9 +208,19 @@ class Qwen4ExpPooledCache:
 
     def _materialize(self, pages: int, *, final: bool) -> None:
         runner = self.runner
-        config = get_kv_cache_config_from_groups(
-            runner.vllm_config, self.groups, pages * self.block_bytes
-        )
+        cache_config = runner.vllm_config.cache_config
+        override = cache_config.num_gpu_blocks_override
+        # The planner applies --num-gpu-blocks-override, which under
+        # QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR is the scheduler's block-ID
+        # count, larger than this stage's pool: plan the pool's own pages.
+        if override is not None and override != pages:
+            cache_config.num_gpu_blocks_override = pages
+        try:
+            config = get_kv_cache_config_from_groups(
+                runner.vllm_config, self.groups, pages * self.block_bytes
+            )
+        finally:
+            cache_config.num_gpu_blocks_override = override
         assert config.num_blocks == pages, (config.num_blocks, pages)
         # EngineCore attaches the resolved layout after invoking the planner.
         # Profiling allocates earlier, so preserve that same final contract.
