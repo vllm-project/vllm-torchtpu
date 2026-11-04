@@ -38,6 +38,7 @@ from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 from vllm.utils.math_utils import cdiv, round_up
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as _batched_rpa_configs,
@@ -190,6 +191,7 @@ def _pallas_rpa_kernel_dcp(
     ),
     decode_query_size: int = 1,
     max_model_len: int | None = None,
+    decode_block_sizes: _batched_rpa_configs.BlockSizes | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
     output, lse). decode_query_size widens the DECODE bucket so speculative
@@ -200,7 +202,8 @@ def _pallas_rpa_kernel_dcp(
     write on the right physical page of this rank's DCP-interleaved
     kv_cache (its own write offset is otherwise global, not rank-local).
     max_model_len, if set, bounds the block-table columns passed on.
-    A one-token NEW_TOKENS_ONLY decode pass uses _new_tokens_decode_block.
+    decode_block_sizes sets the DECODE block (kernel default if None); a
+    one-token NEW_TOKENS_ONLY pass uses _new_tokens_decode_block instead.
     """
     import jax.numpy as jnp
 
@@ -214,7 +217,6 @@ def _pallas_rpa_kernel_dcp(
             decode_query_size,
             cp_group_size,
         )
-    decode_block_sizes = None
     if (
         attention_scope == _batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY
         and decode_query_size == 1
@@ -251,6 +253,29 @@ def _pallas_rpa_kernel_dcp(
 # ---------------------------------------------------------------------------
 # Kernel op builder
 # ---------------------------------------------------------------------------
+
+
+def dcp_cache_decode_block(
+    decode_query_size: int,
+) -> _batched_rpa_configs.BlockSizes | None:
+    """TPU_BATCHED_RPA_DECODE_BLOCK as the one-query decode block of the
+    cache pass, as for the non-DCP kernel; None keeps the kernel default.
+    Call outside the compiled forward: it reads the environment and logs.
+    """
+    block = envs.TPU_BATCHED_RPA_DECODE_BLOCK
+    if block is None or decode_query_size != 1:
+        return None
+    bkv, batch, buffers = block
+    logger.info_once(
+        "Batched RPA decode block (DCP cache pass): bkv %d, batch %d, %d buffers",
+        bkv,
+        batch,
+        buffers,
+    )
+    return _batched_rpa_configs.BlockSizes(
+        bq_sz=1, bq_c_sz=1, bkv_sz=bkv, batch_size=batch, n_buffer=buffers
+    )
+
 
 # Class-level registry shared across all PallasAttentionBackendImpl instances.
 # Keyed by config tuple; values are the (cache_kernel_impl, new_kernel_impl)
@@ -310,8 +335,12 @@ def build_dcp_kernels(
     ),
     decode_query_size: int = 1,
     max_model_len: int | None = None,
+    cache_decode_block: _batched_rpa_configs.BlockSizes | None = None,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
+
+    cache_decode_block, if set, is the DECODE block of the CACHE_ONLY pass
+    (see dcp_cache_decode_block).
 
     Returns:
         (cache_kernel, new_kernel) where each is callable as
@@ -334,6 +363,7 @@ def build_dcp_kernels(
         kv_layout,
         decode_query_size,
         max_model_len,
+        cache_decode_block,
     )
     cache_key = ("dcp_cache", *base_key)
     new_key = ("dcp_new", *base_key)
@@ -355,6 +385,7 @@ def build_dcp_kernels(
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
             max_model_len=max_model_len,
+            decode_block_sizes=cache_decode_block,
         )
         cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
@@ -404,6 +435,7 @@ def forward_with_dcp(
     ),
     decode_query_size: int = 1,
     max_model_len: int | None = None,
+    cache_decode_block: _batched_rpa_configs.BlockSizes | None = None,
 ) -> torch.Tensor:
     """Orchestrate the two-pass DCP attention forward.
 
@@ -433,6 +465,7 @@ def forward_with_dcp(
         kv_layout=kv_layout,
         decode_query_size=decode_query_size,
         max_model_len=max_model_len,
+        cache_decode_block=cache_decode_block,
     )
 
     own_num_heads = query.shape[1]
