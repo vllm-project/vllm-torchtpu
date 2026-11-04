@@ -33,7 +33,6 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
-from ..common.engram_gate import initialize_engram_gate
 from ..common.mhc import (
     collapse,
     initialize_delayed_mhc,
@@ -464,7 +463,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         cache_ops.initialize_cache_ops()
         initialize_delayed_mhc()
         initialize_mhc_post()
-        initialize_engram_gate()
         compressor_ops.initialize_compressor_ops()
         ced_ops.initialize_ced_attention()
         indexer_ops.initialize_indexer()

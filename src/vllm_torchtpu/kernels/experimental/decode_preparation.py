@@ -70,100 +70,6 @@ def fuse_function(fn, args, *, name, interpret=False):
     return lambda *xs: jax.tree.unflatten(tree, call(*xs))
 
 
-def dispatch_flat(counts, seg_start, rank):
-    """Same tables, without dynamic slices or non-tiled expert reshapes."""
-    ep, experts = counts.shape
-    local = experts // ep
-    e = jnp.arange(experts, dtype=jnp.int32)
-    d = jnp.arange(ep, dtype=jnp.int32)
-    aligned = (counts + 1) & -2
-    starts = prefix_sum(aligned, axis=0) - aligned
-    rows = aligned.sum(axis=0)
-    same = e[:, None] // local == e[None, :] // local
-    key = e % local - rows * local
-    order = jnp.sum(same & (key[None, :] < key[:, None]), axis=1)
-    # Each segment is visit-major, then destination-major.
-    visit_number, destination = e // ep, e % ep
-    selected = (e[None, :] // local == destination[:, None]) & (
-        order[None, :] == visit_number[:, None]
-    )
-    chosen = jnp.sum(jnp.where(selected, e[None, :], 0), axis=1)
-    selected = selected & (rows[None, :] > 0)
-    mine = jnp.sum(jnp.where(d[:, None] == rank[0], counts, 0), axis=0)
-    run_mine = jnp.sum(jnp.where(d[:, None] == rank[0], starts, 0), axis=0)
-    base = jnp.sum(
-        jnp.where(same & (e[None, :] < e[:, None]), rows[None, :], 0), axis=1
-    )
-
-    def select(values):
-        return jnp.sum(jnp.where(selected, values[None, :], 0), axis=1)
-
-    count, source, target = select(mine), select(seg_start), select(base + run_mine)
-    seg = jnp.concatenate(
-        (
-            (destination << 24) | ((chosen % local) << 16) | count,
-            source,
-            jnp.where(count > 0, target, 0),
-        )
-    )
-    local_e = jnp.arange(local, dtype=jnp.int32)
-    recv = jnp.sum(
-        jnp.where(
-            e[None, :] == rank[0] * local + local_e[:, None],
-            counts.sum(axis=0)[None, :],
-            0,
-        ),
-        axis=1,
-    )
-    remote = destination != rank[0]
-    remaining = jnp.sum(jnp.where(remote & (visit_number >= 2), count, 0))
-    meta = jnp.concatenate(
-        (jnp.zeros(local + 1, jnp.int32), recv, jnp.stack((remaining, count.sum())))
-    )
-    visit = jnp.sum(
-        jnp.where(
-            (destination[None, :] == rank[0])
-            & (visit_number[None, :] == local_e[:, None]),
-            (chosen % local)[None, :],
-            0,
-        ),
-        axis=1,
-    )
-    recv_two = jnp.sum(
-        jnp.where(visit[:2, None] == local_e[None, :], recv[None, :], 0), axis=1
-    )
-    sc = jnp.concatenate(
-        (
-            recv_two,
-            jnp.stack(
-                [
-                    jnp.sum(jnp.where(remote & (visit_number == v), count, 0))
-                    for v in range(2)
-                ]
-            ),
-        )
-    )
-    return counts.T, aligned.T, starts.T, rows, seg, meta, visit, sc
-
-
-def dispatch_layout_call(xs, interpret=False):
-    """Keep run-table storage in the baseline's expert-minor layout."""
-
-    def body(*args):
-        a, b, c, *rest = dispatch_flat(*args)
-        return a.T, b.T, c.T, *rest
-
-    fused = fuse_function(
-        body, xs, name="dsv41_moe_dispatch_layout", interpret=interpret
-    )
-
-    def call(*args):
-        a, b, c, *rest = fused(*args)
-        return a.T, b.T, c.T, *rest
-
-    return call
-
-
 def metadata_matrix(table, starts, positions, minimum):
     """Keep explicit row/column dimensions through gather and reductions."""
     tokens, requests = positions.shape[1], table.shape[0]
@@ -296,17 +202,6 @@ def main_records_call(xs, *, page_size):
         return records, counts.reshape(t)
 
     return call
-
-
-def quantize_rows(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
-
-    def body(value):
-        q, scale = quantize_block(value, axis=-1, target_dtype=jnp.float8_e4m3fn)
-        return q, scale.astype(jnp.float32).T
-
-    q, scale = fuse_function(body, (x,), name="decode_row_quantize")(x)
-    return q, scale.T
 
 
 def compact_records(records: jax.Array, total_records: int, tb: int):
