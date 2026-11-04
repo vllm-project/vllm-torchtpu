@@ -45,5 +45,5 @@ evals:
 perf:  # AgentX trace replay, 3600 s steady window
   - {concurrency: 4, median_tpot_ms: 31.6, median_ttft_ms: 1134, total_token_throughput: 7477}
   - {concurrency: 16, median_tpot_ms: 174.8, median_ttft_ms: 2707, total_token_throughput: 12378}
-  # concurrency 48: pending (rerun after a node preemption)
+  - {concurrency: 48, median_tpot_ms: 639.1, median_ttft_ms: 17744, total_token_throughput: 8780}
   - {concurrency: 64, median_tpot_ms: 754.0, median_ttft_ms: 15757, total_token_throughput: 8406}
