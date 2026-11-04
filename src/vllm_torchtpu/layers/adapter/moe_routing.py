@@ -188,34 +188,26 @@ def _gather_partitioned_topk(
     )
 
 
-def route(
+def _route_logical(
     layer,
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     input_ids: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantization-independent routing entry point for the TPU MoE methods.
-
-    Every ``apply_monolithic`` (fp8, unquantized, nvfp4, mxfp4, and the two
-    compressed-tensors MoE methods) needs the same three-way routing
-    decision: routing simulation (test-only override) takes
-    priority if enabled, else a model-supplied ``custom_routing_function`` if
-    present, else our own ``select_experts``. That decision was previously
-    duplicated in each quant method; centralizing it here means the simulation
-    hook -- and any future routing-path change -- lives in exactly one place.
-    """
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Compute logical `(topk_weights, topk_ids, already_gathered)`."""
     topk = layer.moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
-        return simulated
+        return simulated[0], simulated[1], False
     custom_routing_fn = layer.custom_routing_function
     if custom_routing_fn is not None:
-        return custom_routing_fn(
+        weights, ids = custom_routing_fn(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=topk,
             renormalize=layer.renormalize,
         )
+        return weights, ids, False
     if router_logits.shape[0] < hidden_states.shape[0]:
         from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
@@ -237,8 +229,9 @@ def route(
             layer=layer,
             input_ids=local_input_ids,
         )
-        return _gather_partitioned_topk(group, local_weights, local_ids, topk)
-    return select_experts(
+        weights, ids = _gather_partitioned_topk(group, local_weights, local_ids, topk)
+        return weights, ids, True
+    weights, ids = select_experts(
         hidden_states=hidden_states,
         router_logits=router_logits,
         topk=topk,
@@ -247,6 +240,112 @@ def route(
         layer=layer,
         input_ids=input_ids,
     )
+    return weights, ids, False
+
+
+def _apply_placement_and_load(
+    layer,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    already_gathered: bool = False,
+) -> torch.Tensor:
+    """Map selected logical expert IDs to physical slot IDs and accumulate load.
+
+    When Dynamic EPLB (`TPU_MOE_EPLB_DYNAMIC=1`) places `layer`, `layer` carries
+    an `[E_logical, replica_cap]` int32 buffer `_tpu_expert_slot` (padded with
+    -1) and a `[E_physical]` int32 accumulator `_tpu_expert_load`. Token row `r`
+    selecting logical expert `e` is mapped to replica `(row_base + r) mod n_rep[e]`
+    (matching `_to_slots` in `fused_ep_moe_v2`), and the routed row counts per
+    physical slot are added into `_tpu_expert_load`.
+    """
+    from vllm_torchtpu import expert_placement
+    from vllm_torchtpu.layers.adapter import expert_load
+
+    slot_table = (
+        expert_placement.expert_slot_table(layer) if layer is not None else None
+    )
+    if slot_table is None:
+        return topk_ids
+    if slot_table.device != topk_ids.device:
+        slot_table = slot_table.to(topk_ids.device)
+
+    orig_shape = topk_ids.shape
+    topk = orig_shape[-1]
+    ids_2d = topk_ids.reshape(-1, topk)
+    num_tokens = ids_2d.shape[0]
+    num_logical, max_rep = slot_table.shape
+
+    row_base = 0
+    collective_group = None
+    if not already_gathered:
+        from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+            _get_moe_collective_group,
+            enable_pipelined_collective_and_compute,
+        )
+
+        if enable_pipelined_collective_and_compute():
+            collective_group, _ = _get_moe_collective_group()
+            if collective_group is not None and int(collective_group.world_size) > 1:
+                row_base = int(collective_group.rank_in_group) * num_tokens
+
+    safe_e = ids_2d.to(torch.long).clamp(0, num_logical - 1)
+    n_rep = (slot_table >= 0).sum(dim=1, dtype=torch.int32).clamp_min(1)
+    token_idx = (
+        torch.arange(num_tokens, device=topk_ids.device, dtype=torch.int32).unsqueeze(1)
+        + row_base
+    )
+    replica = torch.remainder(token_idx, n_rep[safe_e])
+    flat = safe_e * max_rep + replica.to(torch.long)
+    slots_2d = slot_table.reshape(-1)[flat]
+
+    load_buf = expert_load.operand(layer)
+    if load_buf is not None:
+        physical = int(load_buf.shape[0])
+        weights_2d = topk_weights.reshape(-1, topk)
+        valid = (slots_2d >= 0) & (slots_2d < physical) & (weights_2d != 0)
+        safe_slots = torch.where(valid, slots_2d, 0).reshape(-1).to(torch.long)
+        counts = (
+            torch.nn.functional.one_hot(safe_slots, num_classes=physical).to(
+                torch.int32
+            )
+            * valid.reshape(-1, 1).to(torch.int32)
+        ).sum(dim=0, dtype=torch.int32)
+        if collective_group is not None and int(collective_group.world_size) > 1:
+            counts = collective_group.all_reduce(counts)
+        if load_buf.device != counts.device:
+            counts = counts.to(load_buf.device)
+        load_buf.add_(counts)
+
+    return slots_2d.reshape(orig_shape).to(topk_ids.dtype)
+
+
+def route(
+    layer,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantization-independent routing entry point for the TPU MoE methods.
+
+    Every ``apply_monolithic`` (fp8, unquantized, nvfp4, mxfp4, and the two
+    compressed-tensors MoE methods) needs the same three-way routing
+    decision: routing simulation (test-only override) takes
+    priority if enabled, else a model-supplied ``custom_routing_function`` if
+    present, else our own ``select_experts``. When Dynamic EPLB places ``layer``,
+    the selected logical expert IDs are remapped to physical slot IDs and
+    accumulated into ``layer._tpu_expert_load``.
+    """
+    topk_weights, topk_ids, already_gathered = _route_logical(
+        layer, hidden_states, router_logits, input_ids=input_ids
+    )
+    topk_ids = _apply_placement_and_load(
+        layer,
+        topk_weights,
+        topk_ids,
+        already_gathered=already_gathered,
+    )
+    return topk_weights, topk_ids
 
 
 def _apply_scoring_fn(scoring_fn: str, router_logits: torch.Tensor) -> torch.Tensor:
@@ -397,6 +496,10 @@ def get_experts_start(layer) -> int | None:
     """
     if not layer.moe_config.moe_parallel_config.use_ep:
         return None
+    from vllm_torchtpu import expert_placement
+
+    if expert_placement.expert_slot_table(layer) is not None:
+        return int(layer.moe_config.ep_rank) * int(layer.local_num_experts)
     base = layer.global_num_experts // layer.moe_config.ep_size
     remainder = layer.global_num_experts % layer.moe_config.ep_size
     return layer.moe_config.ep_rank * base + min(layer.moe_config.ep_rank, remainder)
@@ -421,6 +524,9 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
     in the compiled graph"); same fix shape -- rank-derived values must reach
     the compiled graph as runtime data, not compile-time constants.
     """
+    from vllm_torchtpu import expert_placement
+    from vllm_torchtpu.layers.adapter import expert_load
+
     experts_start = get_experts_start(layer)
     buffer = (
         torch.tensor(experts_start, dtype=torch.int32, device=device)
@@ -428,6 +534,19 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
         else None
     )
     layer.register_buffer("_experts_start", buffer, persistent=False)
+    slot_table = expert_placement.expert_slot_table(layer)
+    if slot_table is not None:
+        if slot_table.device != device:
+            layer.register_buffer(
+                expert_placement.EXPERT_SLOT_ATTR,
+                slot_table.to(device),
+                persistent=False,
+            )
+        expert_load.register(
+            layer,
+            physical=int(layer.local_num_experts) * int(layer.moe_config.ep_size),
+            device=device,
+        )
 
 
 def validate_linear_ep_placement(layer) -> None:

@@ -573,3 +573,44 @@ def test_model_filter_preserves_original_checkpoint_names():
     assert [call.args[0] for call in keep.call_args_list] == [skipped_name, kept_name]
     requests = streamer.stream_files.call_args.args[0]
     assert [(request.offsets, request.sizes) for request in requests] == [([108], [4])]
+
+
+# ---------------------------------------------------------------------------
+# Static expert layout: a placed layer's rank fetches the experts its slots
+# name, replicas included; unlisted layers keep the linear set.
+
+
+@pytest.mark.cpu_test
+def test_fetch_filter_follows_the_layout_for_placed_layers(monkeypatch):
+    from vllm_torchtpu import expert_placement, model_loader_patches
+
+    group = expert_placement.Group(
+        experts=8,
+        shards=2,
+        slots=7,
+        initial_ranks=((7, 0, 5, 2, 1), (1, 6, 3, 4, 7)),
+        staging=2,
+        replica_cap=2,
+    )
+    monkeypatch.setattr(expert_placement, "_GROUP", group)
+    monkeypatch.setattr(model_loader_patches, "_ep_rank", lambda: 1)
+    linear = {4, 5, 6, 7}
+    target = "model.layers.3.ffn.experts.{}.w1.weight"
+    # Rank 1 holds 1, 6, 3, 4 and a replica of 7: the linear block would be 4-7.
+    assert not _should_skip(target.format(1), linear)
+    assert not _should_skip(target.format(7), linear)
+    assert _should_skip(target.format(5), linear)
+    assert _should_skip(target.format(0), linear)
+    # The drafter's mtp tensors keep the linear set.
+    assert not _should_skip("mtp.0.ffn.experts.0.w1.weight", {0, 1})
+    assert _should_skip("mtp.0.ffn.experts.3.w1.weight", {0, 1})
+
+
+@pytest.mark.cpu_test
+def test_fetch_filter_is_the_linear_one_until_a_layer_applies(monkeypatch):
+    from vllm_torchtpu import expert_placement
+
+    monkeypatch.setattr(expert_placement, "_GROUP", None)
+    name = "model.layers.3.ffn.experts.{}.w1.weight"
+    assert _should_skip(name.format(5), _LOCAL)
+    assert not _should_skip(name.format(27), _LOCAL)
