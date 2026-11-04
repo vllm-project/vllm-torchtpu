@@ -20,7 +20,7 @@ reciprocal multiply, so every exact window multiple rounds up (800 / 100 ->
 8.000001 -> 9 windows) and the following ``split`` raises because the window
 lengths no longer add up to the input. CPU computes the same expression
 exactly, which is why the CPU unit tests in test_omni_platform.py cannot see
-the bug. ``_patch_qwen3_omni_audio_chunk_lengths`` moves ``feature_lens`` to CPU
+the bug. ``maybe_patch_qwen3_omni_thinker`` moves ``feature_lens`` to CPU
 for that computation.
 
 The tests build the real encoder with the real chunking geometry (128 mel
@@ -40,11 +40,22 @@ TPU:
 from __future__ import annotations
 
 from collections.abc import Generator
+from types import SimpleNamespace
 from typing import NamedTuple
 
+import portpicker
 import pytest
 import torch
+import torch.distributed as dist
 from transformers import Qwen3OmniMoeAudioEncoderConfig
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    ensure_model_parallel_initialized,
+    init_distributed_environment,
+)
+from vllm.distributed.parallel_state import model_parallel_is_initialized
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
@@ -55,9 +66,9 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 )
 
 from tests_omni.omni_test_utils import assert_numerical_parity
-from vllm_torchtpu.omni.patches import (
+from vllm_torchtpu.models.vllm.qwen3omni_thinker_patch import (
     _AUDIO_CHUNK_LENGTHS_PATCHED,
-    _patch_qwen3_omni_audio_chunk_lengths,
+    maybe_patch_qwen3_omni_thinker,
 )
 
 pytestmark = [pytest.mark.omni]
@@ -77,6 +88,17 @@ PARITY_LENGTHS = [799, 800, 801]
 PARITY_ATOL = 1e-2
 PARITY_RTOL = 1e-2
 PARITY_MIN_COS_SIM = 0.999
+
+
+def _thinker_model_config() -> SimpleNamespace:
+    """The part of a Stage-0 ``ModelConfig`` the patch callback looks at."""
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="qwen3_omni_moe_thinker",
+            architectures=["Qwen3OmniMoeThinkerForConditionalGeneration"],
+        ),
+        model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    )
 
 
 def _tiny_audio_config() -> Qwen3OmniMoeAudioEncoderConfig:
@@ -219,23 +241,14 @@ def tpu_device() -> torch.device:
 
 
 @pytest.fixture(scope="module")
-def dist_ctx() -> Generator[None, None, None]:
+def dist_ctx(tpu_device: torch.device) -> Generator[None, None, None]:
     """Single-rank world and model-parallel groups for the encoder's layers.
 
     Mirrors ``dist_ctx`` in tests/conftest.py, which tests_omni/ does not
-    inherit: destroys only the groups it created.
+    inherit: destroys only the groups it created. Depends on ``tpu_device``
+    because the groups bind to the TPU device; without one the module skips
+    before any distributed state is created.
     """
-    import portpicker
-    import torch.distributed as dist
-    from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.distributed import (
-        destroy_distributed_environment,
-        destroy_model_parallel,
-        ensure_model_parallel_initialized,
-        init_distributed_environment,
-    )
-    from vllm.distributed.parallel_state import model_parallel_is_initialized
-
     owns_world = not dist.is_initialized()
     if owns_world:
         init_distributed_environment(
@@ -265,7 +278,9 @@ def encoders(dist_ctx: None, tpu_device: torch.device) -> Encoders:
     The TPU encoder runs the patched forward, as in production. The CPU
     reference runs the same module with native custom ops.
     """
-    _patch_qwen3_omni_audio_chunk_lengths()  # idempotent; production does this too
+    # The registry callback with a thinker-stage config: the same path
+    # TPUWorker.load_model() takes in production. Idempotent.
+    assert maybe_patch_qwen3_omni_thinker(_thinker_model_config()) is True
     assert getattr(
         Qwen3OmniMoeAudioEncoder.forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False
     )
@@ -286,7 +301,7 @@ def encoders(dist_ctx: None, tpu_device: torch.device) -> Encoders:
 def test_tpu_float_ceil_still_inexact_for_window_multiples(
     tpu_device: torch.device,
 ) -> None:
-    """Canary for the bug behind ``_patch_qwen3_omni_audio_chunk_lengths``.
+    """Canary for the bug behind ``maybe_patch_qwen3_omni_thinker``.
 
     Evaluates the upstream ``chunk_num`` expression on TPU for every whole
     window up to 100 s of audio. When this fails, TPU rounds the division
@@ -300,7 +315,7 @@ def test_tpu_float_ceil_still_inexact_for_window_multiples(
     if torch.equal(upstream, exact):
         pytest.fail(
             "torch.ceil(feature_lens / 100) is exact on this TPU for every window "
-            "multiple up to 10000 frames. Remove _patch_qwen3_omni_audio_chunk_lengths "
+            "multiple up to 10000 frames. Remove maybe_patch_qwen3_omni_thinker "
             "and this canary."
         )
     assert torch.equal(torch.ceil(lengths / window).long(), exact), (
