@@ -905,3 +905,10 @@ class TPUWorker(WorkerBase):
         if metadata is None:
             return None
         return {_get_kv_connector_handshake_metadata_key(metadata): metadata}
+
+    def shutdown(self) -> None:
+        if hasattr(self, "model_runner") and hasattr(self.model_runner, "shutdown"):
+            self.model_runner.shutdown()
+        super_shutdown = getattr(super(), "shutdown", None)
+        if super_shutdown is not None:
+            super_shutdown()

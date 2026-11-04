@@ -15,6 +15,7 @@
 
 from collections.abc import Callable
 
+import torch
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -46,7 +47,18 @@ class VllmMoERunner(MoERunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # pyrefly: ignore[bad-argument-type]
+        self.routed_experts.capture_fn = None
         self._take_over_moe_quant_config_init()
+
+    @property
+    def capture_fn(self) -> Callable[[torch.Tensor], None] | None:
+        return getattr(self.routed_experts, "capture_fn", None)
+
+    @capture_fn.setter
+    def capture_fn(self, fn: Callable[[torch.Tensor], None] | None) -> None:
+        # pyrefly: ignore[bad-argument-type]
+        self.routed_experts.capture_fn = fn
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts

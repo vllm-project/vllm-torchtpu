@@ -177,24 +177,30 @@ def route(
     topk = layer.moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
-        return simulated
-    custom_routing_fn = layer.custom_routing_function
-    if custom_routing_fn is not None:
-        return custom_routing_fn(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=topk,
-            renormalize=layer.renormalize,
-        )
-    return select_experts(
-        hidden_states=hidden_states,
-        router_logits=router_logits,
-        topk=topk,
-        renormalize=layer.renormalize,
-        scoring_fn=layer.scoring_func,
-        layer=layer,
-        input_ids=input_ids,
-    )
+        topk_weights, topk_ids = simulated
+    else:
+        custom_routing_fn = layer.custom_routing_function
+        if custom_routing_fn is not None:
+            topk_weights, topk_ids = custom_routing_fn(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=topk,
+                renormalize=layer.renormalize,
+            )
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk=topk,
+                renormalize=layer.renormalize,
+                scoring_fn=layer.scoring_func,
+                layer=layer,
+                input_ids=input_ids,
+            )
+    capture_fn = layer.capture_fn
+    if capture_fn is not None:
+        capture_fn(topk_ids)
+    return topk_weights, topk_ids
 
 
 def _apply_scoring_fn(scoring_fn: str, router_logits: torch.Tensor) -> torch.Tensor:

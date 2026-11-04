@@ -108,6 +108,7 @@ def _routing_layer(topk=10, renormalize=True):
         e_score_correction_bias=None,
         routed_scaling_factor=1.0,
         moe_config=SimpleNamespace(experts_per_token=topk),
+        capture_fn=None,
     )
 
 
@@ -329,3 +330,31 @@ def test_uniform_random_routing_honours_topk_weights_float32(monkeypatch):
     monkeypatch.setattr(moe_routing.envs, "TPU_MOE_TOPK_WEIGHTS_FLOAT32", True)
     weights_fp32, _ = moe_routing._uniform_random_routing(hidden, logits, topk=2)
     assert weights_fp32.dtype == torch.float32
+
+
+def test_route_hands_topk_ids_to_the_layer_capture_fn(monkeypatch):
+    """Router replay: route() reports the ids it returns, once, when bound."""
+    import torch
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    hidden = torch.ones(2, 4)
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]])
+    captured = []
+    layer = _routing_layer(topk=2)
+    layer.capture_fn = captured.append
+    _, topk_ids = moe_routing.route(layer, hidden, logits)
+    assert len(captured) == 1
+    assert captured[0] is topk_ids
+
+
+def test_route_skips_capture_when_unbound(monkeypatch):
+    """A layer with capture_fn=None routes untouched."""
+    import torch
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    hidden = torch.ones(2, 4)
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]])
+    layer = _routing_layer(topk=2)
+    assert layer.capture_fn is None
+    _, topk_ids = moe_routing.route(layer, hidden, logits)
+    assert topk_ids.shape == (2, 2)

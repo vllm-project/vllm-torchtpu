@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -22,6 +22,9 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
 )
+
+if TYPE_CHECKING:
+    from vllm.distributed.aux_output_connector.worker import PendingAuxOutput
 
 INVALID_TOKEN_ID = -1
 
@@ -190,12 +193,51 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         copy_state: AsyncTPUCopyState | None,
         discard_sampled_tokens_req_indices: list[int],
+        pending_aux_output: "PendingAuxOutput | None" = None,
+        aux_copy_event: "Any | None" = None,
+        aux_routed_cpu: "torch.Tensor | None" = None,
     ):
         self._model_runner_output: ModelRunnerOutput = model_runner_output
         self.copy_state = copy_state
         self.discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
+        self.pending_aux_output = pending_aux_output
+        self.aux_copy_event = aux_copy_event
+        self.aux_routed_cpu = aux_routed_cpu
 
     def get_output(self) -> ModelRunnerOutput:
+        output = self._get_output()
+        if self.pending_aux_output is not None:
+            # Synchronize the asynchronous D2H copy launched on the main
+            # thread before host consumers read routed_experts.
+            if self.aux_copy_event is not None:
+                self.aux_copy_event.synchronize()
+                self.aux_copy_event = None
+            if self.aux_routed_cpu is not None:
+                self.pending_aux_output.routed_experts_gpu = self.aux_routed_cpu
+                self.aux_routed_cpu = None
+
+            # Consume the step's routed-experts snapshot on every path,
+            # including _get_output's early returns: the connector requires
+            # step outputs to be consumed in order, so a skipped step would
+            # trip its in-flight bound on a later one.
+            num_reqs = len(output.req_ids)
+            sampled = output.sampled_token_ids
+            num_sampled = np.array(
+                [len(sampled[i]) if i < len(sampled) else 0 for i in range(num_reqs)],
+                dtype=np.int32,
+            )
+            # Speculative decoding is refused with routed-experts capture on
+            # TPU (see TPUModelRunner._initialize_aux_output_connector), so
+            # no executed row was rejected.
+            num_rejected = np.zeros(num_reqs, dtype=np.int32)
+            self.pending_aux_output.enqueue_cpu_copy(num_sampled, num_rejected)
+            output.aux_output_connector_output = (
+                self.pending_aux_output.process_output()
+            )
+            self.pending_aux_output = None
+        return output
+
+    def _get_output(self) -> ModelRunnerOutput:
         if self.copy_state is None:
             self._model_runner_output.sampled_token_ids = []
             return self._model_runner_output
@@ -227,6 +269,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
                 valid_sampled_token_ids[i].clear()
 
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
+
         return self._model_runner_output
 
 
