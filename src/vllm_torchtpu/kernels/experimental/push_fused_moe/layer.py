@@ -53,6 +53,7 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
     build_push_moe_kernel,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+    build_exchange_rows_tables,
     build_push_tables,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.sc_dispatch import (
@@ -271,6 +272,7 @@ def fused_ep_moe_push(
     fused_dispatch_meta=False,
     early_row_gather=False,
     table_kernel=False,
+    exchange_tables=False,
     staging_slots=0,
     expert_slot=None,
     expert_load=None,
@@ -309,8 +311,9 @@ def fused_ep_moe_push(
     its entry barrier, `staging_slots` gives the VMEM-staged expert kernel
     that many result staging slots (see the kernel), and `table_kernel`
     builds the dispatch and shard tables in one TensorCore kernel
-    (plan_kernel.build_push_tables). The caller
-    (layers/adapter/fused_moe_ep.py) reads all sixteen from envs.
+    (plan_kernel.build_push_tables) -- inside the routing-exchange kernel,
+    while its row copies finish, with `exchange_tables`. The caller
+    (layers/adapter/fused_moe_ep.py) reads all seventeen from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -463,6 +466,10 @@ def fused_ep_moe_push(
         n_pre = g_local
     tc_exchange = bool(tc_exchange)
     exchange_row_gather = bool(exchange_row_gather)
+    if exchange_tables and not (table_kernel and exchange_row_gather):
+        raise ValueError("exchange_tables needs table_kernel and exchange_row_gather")
+    if exchange_tables and early_row_gather:
+        raise ValueError("exchange_tables issues the row copies after the pushes")
     if table_kernel and interleave_visits:
         raise ValueError("table_kernel builds the most-rows-first visit order only")
     if early_row_gather and not exchange_row_gather:
@@ -635,8 +642,12 @@ def fused_ep_moe_push(
         bias_it,
         out_dtype,
         expert_load_l=None,
+        pre_tables=None,
     ):
-        """Dispatch tables, SparseCore pre-push, plan, kernel and combine."""
+        """Dispatch tables, SparseCore pre-push, plan, kernel and combine.
+
+        `pre_tables`, where the exchange kernel already built them, are
+        build_push_tables' outputs."""
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
@@ -651,7 +662,9 @@ def fused_ep_moe_push(
         with jax.named_scope("moe_dispatch_tables"):
             runs = run_tables(rows_by_dest)
             shard_tables = None
-            if table_kernel:
+            if pre_tables is not None:
+                seg, dmeta, visit, counts_sc, *shard_tables = pre_tables
+            elif table_kernel:
                 seg, dmeta, visit, counts_sc, *shard_tables = build_push_tables(
                     rows_by_dest,
                     seg_start,
@@ -796,9 +809,7 @@ def fused_ep_moe_push(
             block_tables = shard_transport_tables_in_blocks(
                 routing, me, e_total=e_total, ep=ep
             )
-            row_tables = shard_push_tables_in_rows(
-                routing, me, e_total=e_total, ep=ep
-            )
+            row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
             expert_rows, slab_base = shard_expert_slabs(
                 routing, me, e_total=e_total, ep=ep
             )
@@ -873,6 +884,7 @@ def fused_ep_moe_push(
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
         )
+        pre_tables = None
         my_counts = block_hist.sum(axis=0)
         if exchange_row_gather:
             # The sorted rows are copied by the exchange kernel itself.
@@ -884,12 +896,23 @@ def fused_ep_moe_push(
                     topk=topk,
                     bf16_counts=bf16_sort_counts,
                 )
-            exchange, q_sorted = build_tc_exchange_all_gather_rows(
-                ep=ep,
-                width=layout[-1],
-                n_rows=tok.shape[0],
-                before_barrier=early_row_gather,
-            )(packed, rank_l[0, 0], q_l, tok)
+            if exchange_tables:
+                exchange, q_sorted, *pre_tables = build_exchange_rows_tables(
+                    ep=ep,
+                    width=layout[-1],
+                    n_rows=tok.shape[0],
+                    count_at=layout[1],
+                    e_total=e_total,
+                    n_pre=n_pre,
+                    tile_m=capacity,
+                )(packed, rank_l[0, 0], q_l, tok, seg_start)
+            else:
+                exchange, q_sorted = build_tc_exchange_all_gather_rows(
+                    ep=ep,
+                    width=layout[-1],
+                    n_rows=tok.shape[0],
+                    before_barrier=early_row_gather,
+                )(packed, rank_l[0, 0], q_l, tok)
             exchange = exchange.reshape(ep, layout[-1])
         else:
             # Issue the routing exchange before the local sort, so the sort
@@ -926,6 +949,7 @@ def fused_ep_moe_push(
             bias_it,
             x_l.dtype,
             expert_load_l,
+            pre_tables,
         )
 
     bias_args = tuple(b for b in (w1_bias, w2_bias) if b is not None)
@@ -1005,6 +1029,7 @@ def fused_ep_moe_push(
         bool(early_row_gather),
         int(staging_slots),
         bool(table_kernel),
+        bool(exchange_tables),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

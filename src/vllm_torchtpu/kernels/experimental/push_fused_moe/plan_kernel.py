@@ -29,6 +29,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.experimental.push_fused_moe import tc_exchange as tx
 from vllm_torchtpu.kernels.fused_moe.v2.host import ROWBLK, ROWBLK_SHIFT, pow2_shift
 
 LANES = 128
@@ -217,17 +218,9 @@ def _build(ep, g, n_pre, tile_m, interpret):
     def kernel(me_sm, r3_ref, seg3_ref, *outs):
         t = _tables(r3_ref[...], seg3_ref[...], me_sm[0], ep=ep, g=g, n_pre=n_pre,
                     tile_m=tile_m)  # fmt: skip
-        seg_o, small_o, kt_o, counts_o = outs[0], outs[1], outs[2:7], outs[7]
-        for k, part in enumerate(t["seg"]):
-            seg_o[k] = part[:g, :ep]
-        for k, part in enumerate(t["small"]):
-            small_o[k : k + 1, :] = part
-        for o, part in zip(kt_o, t["kernel_tables"]):
-            o[...] = part[:g, :ep]
-        counts_o[...] = t["counts"][:8, :ep]
+        _store_tables(t, outs, ep=ep, g=g)
 
     vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
-    i32 = jnp.int32
     return pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -236,12 +229,7 @@ def _build(ep, g, n_pre, tile_m, interpret):
             out_specs=[vmem] * 8,
             grid=(),
         ),
-        out_shape=(
-            jax.ShapeDtypeStruct((3, g, ep), i32),
-            jax.ShapeDtypeStruct((8, LANES), i32),
-            *(jax.ShapeDtypeStruct((g, ep), i32) for _ in range(5)),
-            jax.ShapeDtypeStruct((8, ep), i32),
-        ),
+        out_shape=_table_out_shapes(ep, g),
         interpret=interpret,
         name=f"moe_push_tables_ep{ep}_g{g}",
     )
@@ -265,13 +253,35 @@ def build_push_tables(rows_by_dest, seg_start_local, me, *, ep, n_pre, tile_m,
         rows_by_dest.astype(jnp.int32).reshape(ep, ep, g),
         ((0, 0), (0, 0), (0, LANES - g)),
     )
-    seg3 = jnp.pad(
-        seg_start_local.astype(jnp.int32).reshape(ep, g), ((0, 0), (0, LANES - g))
-    )
     me_arr = jnp.asarray(me, jnp.int32).reshape(1)
     seg, small, *kt, counts = _build(ep, g, int(n_pre), int(tile_m), bool(interpret))(
-        me_arr, r3, seg3
+        me_arr, r3, _seg3(seg_start_local, ep, g)
     )
+    return _unpack_tables(seg, small, kt, counts, g)
+
+
+def _store_tables(t, outs, *, ep, g):
+    seg_o, small_o, kt_o, counts_o = outs[0], outs[1], outs[2:7], outs[7]
+    for k, part in enumerate(t["seg"]):
+        seg_o[k] = part[:g, :ep]
+    for k, part in enumerate(t["small"]):
+        small_o[k : k + 1, :] = part
+    for o, part in zip(kt_o, t["kernel_tables"]):
+        o[...] = part[:g, :ep]
+    counts_o[...] = t["counts"][:8, :ep]
+
+
+def _table_out_shapes(ep, g):
+    i32 = jnp.int32
+    return (
+        jax.ShapeDtypeStruct((3, g, ep), i32),
+        jax.ShapeDtypeStruct((8, LANES), i32),
+        *(jax.ShapeDtypeStruct((g, ep), i32) for _ in range(5)),
+        jax.ShapeDtypeStruct((8, ep), i32),
+    )
+
+
+def _unpack_tables(seg, small, kt, counts, g):
     return (
         seg.reshape(-1),
         small[0, : 2 * g + 3],
@@ -281,4 +291,100 @@ def build_push_tables(rows_by_dest, seg_start_local, me, *, ep, n_pre, tile_m,
         small[3, :g],
         small[4, :g],
         counts,
+    )
+
+
+def _seg3(seg_start_local, ep, g):
+    return jnp.pad(
+        seg_start_local.astype(jnp.int32).reshape(ep, g), ((0, 0), (0, LANES - g))
+    )
+
+
+@functools.cache
+def _build_exchange_rows_tables(ep, width, n_rows, count_at, g, n_pre, tile_m):
+    slab_rows = tx._slab_rows(width)
+    r_lo = count_at // LANES
+    r_hi = (count_at + ep * g - 1) // LANES
+    n_cnt = r_hi - r_lo + 1
+
+    def kernel(rank_sm, idx_sm, x_hbm, src_hbm, seg3_vm, out_hbm, dst_hbm, *rest):
+        outs, (send_sem, recv_sem, lsem, gsem, csem, cnt_vm, r3_vm) = rest[:8], rest[8:]
+        me = rank_sm[0]
+
+        def copy_rows():
+            def one(j, c):
+                pltpu.make_async_copy(
+                    src_hbm.at[pl.ds(idx_sm[j], 1)], dst_hbm.at[pl.ds(j, 1)], gsem
+                ).start()
+                return c
+
+            lax.fori_loop(0, n_rows, one, jnp.int32(0), unroll=8)
+
+        tx._exchange(ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem, copy_rows)
+        # Every peer's row has landed; the row copies may still be in flight,
+        # and the tables are built meanwhile from the exchanged counts.
+        cp = pltpu.make_async_copy(out_hbm.at[:, pl.ds(r_lo, n_cnt), :], cnt_vm, csem)
+        cp.start()
+        cp.wait()
+        cnt = cnt_vm[...]  # [s, n_cnt, 128]
+        lane = lax.broadcasted_iota(jnp.int32, (ep, LANES), 1)
+        for d in range(ep):
+            start = count_at + d * g - r_lo * LANES
+            r0, off = divmod(start, LANES)
+            lo = cnt[:, r0, :]
+            if off:
+                lo = pltpu.roll(lo, LANES - off, 1)
+                if off + g > LANES:
+                    hi = pltpu.roll(cnt[:, r0 + 1, :], LANES - off, 1)
+                    lo = jnp.where(lane < LANES - off, lo, hi)
+            r3_vm[:, d, :] = jnp.where(lane < g, lo, 0)
+        t = _tables(
+            r3_vm[...], seg3_vm[...], me, ep=ep, g=g, n_pre=n_pre, tile_m=tile_m
+        )
+        _store_tables(t, outs, ep=ep, g=g)
+        pltpu.make_async_copy(dst_hbm, dst_hbm, gsem).wait()
+
+    def fn(packed, rank, rows, idx, seg_start_local):
+        idx = idx.astype(jnp.int32).reshape(-1)
+        r, slab = tx._payload(packed, rank, width)
+        vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
+        out, gathered, seg, small, *kt, counts = pl.pallas_call(
+            kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=[tx._HBM, tx._HBM, vmem],
+                out_specs=(tx._HBM, tx._HBM) + (vmem,) * 8,
+                scratch_shapes=(pltpu.SemaphoreType.DMA,) * 5
+                + (
+                    pltpu.VMEM((ep, n_cnt, LANES), jnp.int32),
+                    pltpu.VMEM((ep, ep, LANES), jnp.int32),
+                ),
+                grid=(),
+            ),
+            out_shape=(
+                jax.ShapeDtypeStruct((ep, slab_rows, LANES), jnp.int32),
+                jax.ShapeDtypeStruct((n_rows, *rows.shape[1:]), rows.dtype),
+            )
+            + _table_out_shapes(ep, g),
+            compiler_params=tx._compiler_params(),
+            name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}_tables",
+        )(r, idx, slab, rows, _seg3(seg_start_local, ep, g))
+        return (tx._unpad(out, ep, width), gathered) + _unpack_tables(
+            seg, small, kt, counts, g
+        )
+
+    return fn
+
+
+def build_exchange_rows_tables(*, ep, width, n_rows, count_at, e_total, n_pre, tile_m):
+    """tc_exchange.build_tc_exchange_all_gather_rows' kernel that also builds
+    build_push_tables' tables from the exchanged counts (words
+    [count_at, count_at + e_total) of every rank's payload), while its row
+    copies finish. fn(packed, rank, rows, idx, seg_start_local) ->
+    (exchange, rows[idx], *build_push_tables(...))."""
+    g = e_total // ep
+    if g > LANES or ep > LANES or 2 * g + 3 > LANES:
+        raise ValueError(f"the table kernel takes g_local, ep <= {LANES}")
+    return _build_exchange_rows_tables(
+        ep, width, n_rows, count_at, g, int(n_pre), int(tile_m)
     )
