@@ -54,6 +54,7 @@ import vllm_torchtpu
 import vllm_torchtpu.env_override
 from vllm_torchtpu.compilation import shape_variants, tpu_compiler
 from vllm_torchtpu.compilation.shape_variants import unsupported_reason
+from vllm_torchtpu.layers.adapter import small_all_reduce_op
 
 if not hasattr(vllm, "__version__"):  # namespace-package quirk in the CPU image
     import importlib.metadata
@@ -78,6 +79,12 @@ torch.library.register_fake(
     "tpu_shape_variants_test::split", lambda x: torch.empty_like(x)
 )
 SPLIT = torch.ops.tpu_shape_variants_test.split
+# Stands in for the small all-reduce kernel: same operands, opaque to Dynamo.
+_lib.define("small_all_reduce(Tensor x, Tensor rank) -> Tensor")
+_lib.impl("small_all_reduce", lambda x, rank: x.clone(), "CPU")
+torch.library.register_fake(
+    "tpu_shape_variants_test::small_all_reduce", lambda x, rank: torch.empty_like(x)
+)
 
 
 @support_torch_compile(dynamic_arg_dims={"x": 0})
@@ -127,6 +134,21 @@ class FlatModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return WAVE(x)
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class SmallAllReduceModel(nn.Module):
+    """A TP all-reduce through the small all-reduce bridge (rows <= MAX_ROWS
+    take the kernel), with ``wave`` as vLLM's all-reduce."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # The bridge takes bf16 rows whose width is a whole number of lane tiles.
+        block = x.to(torch.bfloat16).repeat(1, 128 // HIDDEN)
+        y = small_all_reduce_op.all_reduce_or(block, (0,), WAVE)
+        return y.float()[:, :HIDDEN]
 
 
 @dataclasses.dataclass
@@ -834,3 +856,25 @@ def test_signature_delta_ignores_order():
     assert shape_variants._signature_delta(a, a[::-1]) == (
         "2 inputs vs 2. Only in the earlier trace: nothing. Only in this one: nothing"
     )
+
+
+def _small_all_reduce_fork_hands_buckets_over(cache_root):
+    config, backend = prepare(cache_root)
+    small_all_reduce_op._AR_OP = torch.ops.tpu_shape_variants_test.small_all_reduce
+    small_all_reduce_op._RANK = torch.tensor([0], dtype=torch.int32)
+    small_all_reduce_op._CORES = 1
+    small_all_reduce_op._MESH_RANKS = (0,)
+    model = build(SmallAllReduceModel, config)
+    assert warm(model, config) == 1
+    # 16 rows took the kernel, 2048 and 4096 vLLM's collective (one wave op).
+    assert backend.compiled == [(16, 0), (2048, 1), (4096, 1)]
+    CALLS.clear()
+    for num_tokens in BUCKETS:
+        assert run(model, config, num_tokens).shape[0] == num_tokens
+    assert CALLS == [(16, 0), (2048, 1), (4096, 1)]
+
+
+def test_small_all_reduce_row_fork_hands_buckets_over(tmp_path):
+    """Both sides of the small all-reduce row fork lift the rank buffer, so the
+    warmup hands each bucket to the trace that serves it."""
+    in_child(partial(_small_all_reduce_fork_hands_buckets_over, str(tmp_path)))
