@@ -212,6 +212,7 @@ def _route_hidden_states(
     live_rows=None,
     replica_table=None,
     replica_entries=0,
+    on_winners=None,
 ):
     """Project and select local expert routes through one shared B1/B2 path.
 
@@ -294,6 +295,8 @@ def _route_hidden_states(
             after_selection(selection)
         all_winners = jnp.stack(winners_by_slot, axis=1)
         all_probabilities = jnp.stack(probabilities_by_slot, axis=1)
+        if on_winners is not None:
+            on_winners(all_winners)
         to_copy, holder, slot = _replica_dispatch(
             all_winners, replica_table, replica_entries, local_expert_count, expert_counts
         )
@@ -322,10 +325,12 @@ def _route_hidden_states(
         )
     # Only top-k rank is sequential. Every score reduction and ownership
     # operation carries the leading batch dimension with no per-row control.
+    winners_by_slot = []
     for selection in range(selected_expert_count):
         winners = jnp.argmax(
             routing_scores_vmem[:, :expert_count], axis=1
         ).astype(jnp.int32)
+        winners_by_slot.append(winners)
         winner_mask = expert_ids == winners[:, None]
         probabilities = jnp.sum(
             jnp.where(winner_mask, uncorrected_probabilities, 0), axis=1
@@ -363,6 +368,8 @@ def _route_hidden_states(
             winners, owned_locally, counts_before_selection, selected_experts
         )
         after_selection(selection)
+    if on_winners is not None:
+        on_winners(jnp.stack(winners_by_slot, axis=1))
 
     return (
         selected_experts,
@@ -390,6 +397,7 @@ def _route_owned_rows(
     after_selection,
     after_scores=None,
     live_rows=None,
+    on_winners=None,
 ):
     """``_route_hidden_states`` with the top-k sharded over the local rank pairs.
 
@@ -472,6 +480,8 @@ def _route_owned_rows(
 
     gathered = selections_vmem[...]
     all_winners = gathered[:, :k].astype(jnp.int32)
+    if on_winners is not None:
+        on_winners(all_winners)
     all_probabilities = gathered[:, k : 2 * k]
     selected_experts = jnp.zeros((batch_size, k), jnp.int32)
     selected_probabilities = jnp.zeros((batch_size, k), jnp.float32)
@@ -2517,8 +2527,12 @@ def moe(
     token_scatter_owners: int = 4,
     owned_hidden_ref=None,
     live_rows=None,
+    route_dump_ref=None,
 ) -> None:
     """Execute one mixture-of-experts layer inside a Pallas program.
+
+    ``route_dump_ref`` (bench diagnostic, HBM [batch_size, 128] int32): every
+    row's selected global expert ids in lanes 0..k-1 (dead rows included).
 
     ``token_scatter_output`` leaves each of the ``token_scatter_owners`` local
     row owners (4: rank pairs; 8: ranks) with its batch // owners rows.
@@ -2939,6 +2953,19 @@ def moe(
                     latent_input_copy,
                 )
 
+        def dump_winners(all_winners):
+            # Bench diagnostic: the step's global routes to HBM.
+            def store(buffer, semaphore):
+                buffer[...] = jnp.concatenate(
+                    (all_winners, jnp.full((batch_size, 128 - selected_expert_count), -1, jnp.int32)),
+                    axis=1,
+                )
+                copy = tpu.make_async_copy(buffer, route_dump_ref, semaphore)
+                copy.start()
+                copy.wait()
+
+            pl.run_scoped(store, tpu.VMEM((batch_size, 128), jnp.int32), tpu.SemaphoreType.DMA)
+
         with _phase("p3_route"):
           (
             selected_experts,
@@ -2963,6 +2990,7 @@ def moe(
                 after_selection=overlap_routing_with_latent_gather,
                 after_scores=after_routing_scores,
                 live_rows=live_rows,
+                on_winners=dump_winners if route_dump_ref is not None else None,
             )
             if owned_hidden_ref is not None
             else _route_hidden_states(
@@ -2986,6 +3014,7 @@ def moe(
                     weights.latent_normalization[:, REPLICA_LANE : REPLICA_LANE + 256] if replica_slots else None
                 ),
                 replica_entries=8 * replica_slots,
+                on_winners=dump_winners if route_dump_ref is not None else None,
             )
         )
         if hot_info is not None:
@@ -6763,7 +6792,7 @@ def stack(
     gate_first_kda_projection: bool = True,
     sequence_rows: int = 1,
     aux_hidden_layers: tuple[int, ...] = (),
-    aux_capture: Literal["layer", "attention", "mixture_input"] = "layer",
+    aux_capture: Literal["layer", "attention", "mixture_input", "routes"] = "layer",
     include_layer_zero: bool = False,
     state_row=None,
     attention_dp: int = 1,
@@ -6855,9 +6884,13 @@ def stack(
             "aux_hidden_layers are distinct layer ids in 1..layers-1; id L "
             "captures the residual stream entering layer L"
         )
-    if aux_capture not in ("layer", "attention", "mixture_input"):
-        raise ValueError("aux_capture must be 'layer', 'attention' or 'mixture_input'")
-    if aux_capture != "layer" and attention_token_scatter:
+    # "routes" (bench diagnostic): aux slot L - 1 holds MoE layer L's routes
+    # (moe route_dump_ref) instead of hidden rows.
+    if aux_capture not in ("layer", "attention", "mixture_input", "routes"):
+        raise ValueError("aux_capture must be 'layer', 'attention', 'mixture_input' or 'routes'")
+    if aux_capture == "routes" and aux_hidden_layers != tuple(range(1, layers)):
+        raise ValueError("Route capture needs aux_hidden_layers 1..layers-1")
+    if aux_capture in ("attention", "mixture_input") and attention_token_scatter:
         raise ValueError("Attention-point aux capture needs complete prefix rows")
     b4_attention_gather = (
         B4_ATTENTION_GATHER and batch_size == 4 and not attention_token_scatter
@@ -8974,6 +9007,9 @@ def stack(
                         else None
                     ),
                     token_scatter_owners=sp_owners,
+                    route_dump_ref=(
+                        aux_output_ref.at[layer_index - 1] if aux_capture == "routes" else None
+                    ),
                     owned_hidden_ref=owned_rows_vmem if shard_routing else None,
                     live_rows=active_rows,
                 )
@@ -9371,8 +9407,12 @@ def stack(
             )
         ),
         *state_output_shapes,
-        jax.ShapeDtypeStruct(
-            (max(1, len(aux_hidden_layers)), batch_size, hidden_size), jnp.bfloat16
+        (
+            jax.ShapeDtypeStruct((len(aux_hidden_layers), batch_size, 128), jnp.int32)
+            if aux_capture == "routes"
+            else jax.ShapeDtypeStruct(
+                (max(1, len(aux_hidden_layers)), batch_size, hidden_size), jnp.bfloat16
+            )
         ),
     )
     pooled_expert_names = (
@@ -9726,7 +9766,7 @@ def decode_local(
     batched_decoder_boundaries: bool | None = None,
     sequence_rows: int = 1,
     aux_hidden_layers: tuple[int, ...] = (),
-    aux_capture: Literal["layer", "attention", "mixture_input"] = "layer",
+    aux_capture: Literal["layer", "attention", "mixture_input", "routes"] = "layer",
     state_row=None,
     attention_dp: int = 1,
     attention_schedule: Literal["auto", "pooled", "legacy", "overlap"] = "auto",

@@ -71,6 +71,9 @@ class KernelConfig:
     # Plain decode without attention DP up to this batch: the router score
     # exchange overlaps the latent projection and gather (0: off).
     decode_overlap_router_latent_max: int = 0
+    # Bench diagnostic: plain decode steps also return every MoE layer's
+    # routes [92, batch, 16] (DecodeOps.route_log).
+    decode_route_dump: bool = False
     # Attention DP verifies (sequence_rows > 1) also take these plain B64/B128
     # overlaps: "shared128" (shared-expert reduction at 128 rows), "router"
     # (router latent, 128 rows), "dense" (dense scatter rows), "sp8" (SP8

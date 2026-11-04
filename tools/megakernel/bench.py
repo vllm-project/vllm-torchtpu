@@ -83,6 +83,12 @@ def add_arguments(parser, profile: bool = False) -> None:
         default="",
         help="file: rank 0 saves each case's timed greedy tokens [steps, batch] (npz)",
     )
+    decode.add_argument(
+        "--save-routes",
+        default="",
+        help="file (with --set decode_route_dump=true): rank 0 saves each case's routes of every "
+        "plain step [steps, 92, batch, 16] int16 global expert ids, the last repeats x steps timed (npz)",
+    )
     prefill = sub.add_parser("prefill", help="the prefill stack")
     prefill.add_argument(
         "--prompts",
@@ -233,7 +239,10 @@ def run_decode(args, records: harness.Records) -> None:
     )
     sampling = (args.temperature, 0.95 if args.temperature > 0 else 1.0, 0, 7)
 
-    corpus = np.load(args.context_file).astype(np.int32) if args.real_context else None
+    context_file = args.context_file
+    if not os.path.exists(context_file):  # a bare name: tools/megakernel/data
+        context_file = os.path.join(os.path.dirname(__file__), "data", context_file)
+    corpus = np.load(context_file).astype(np.int32) if args.real_context else None
     real_rng = np.random.default_rng(args.context_seed)
 
     def rows_for(batch, context, first, tag):
@@ -267,9 +276,11 @@ def run_decode(args, records: harness.Records) -> None:
 
     results = []
     streams = {}
+    route_streams = {}
     for batch, context in cases:
         label = context if not isinstance(context, list) else "mix " + args.mix
         tag = f"b{batch}c{context if not isinstance(context, list) else 'mix'}"
+        ops.route_log.clear()
         # First step: rows reset at the context.
         replay_started = time.perf_counter()
         decoder.step(rows_for(batch, context, True, tag))
@@ -334,9 +345,16 @@ def run_decode(args, records: harness.Records) -> None:
         results.append((batch, label, ms))
         if args.save_tokens:
             streams[tag] = torch.stack([o[:batch, 0] for o in outs]).cpu().numpy()
+        if args.save_routes and ops.route_log:
+            route_streams[tag] = (
+                torch.stack([r.cpu() for r in ops.route_log]).numpy()[:, :, :batch].astype(np.int16)
+            )
+            ops.route_log.clear()
         decoder.forget([f"{tag}-{r}" for r in range(batch)])
     if args.save_tokens and harness.rank() == 0:
         np.savez(args.save_tokens, **streams)
+    if args.save_routes and harness.rank() == 0:
+        np.savez(args.save_routes, **route_streams)
     harness.log("summary: " + "; ".join(f"B{b}@{c}={ms:.2f}ms" for b, c, ms in results))
 
 

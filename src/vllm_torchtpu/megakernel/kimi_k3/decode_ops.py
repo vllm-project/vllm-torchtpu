@@ -178,6 +178,7 @@ class DecodeOps:
         self.owner_table: tuple[int, ...] | None = None
         self._ops: dict[Any, Any] = {}  # the step ops (over the bound pools)
         self._shared: dict[Any, Any] = {}  # cached_op's
+        self.route_log: list[Any] = []  # KernelConfig.decode_route_dump
 
     def cached_op(self, key: Any, build: Callable[[], Any]) -> Any:
         """The op (or op-registering object) kept under ``key``, built with
@@ -307,6 +308,9 @@ class DecodeOps:
         paged, names = self.paged, self.names
         count = len(names)
         options = decode_options(batch)
+        dump = kernel_config.active().decode_route_dump
+        if dump:
+            options.update(aux_hidden_layers=tuple(range(1, NUM_LAYERS)), aux_capture="routes")
         pool_map, owner_table = self.pool_map, self.owner_table
         pools = len(self.unified_pools)
         width = self.VERIFY_ROWS
@@ -324,7 +328,7 @@ class DecodeOps:
                 )
             slot, token, position, row, plan, tables = control.inputs(state, batch)
             state_slot = control.state_slot(slot, row)
-            logits, conv, recurrent, pool = paged.decode_paged(
+            logits, *routes, conv, recurrent, pool = paged.decode_paged(
                 weights,
                 conv,
                 recurrent,
@@ -355,10 +359,11 @@ class DecodeOps:
                 chosen = jnp.where(temperature > 0, draws, chosen)
             emitted = jnp.full((batch, width), -1, jnp.int32).at[:, 0].set(chosen)
             state = control.advance(state, batch, slot, chosen, position + 1, row)
-            return (emitted, state, conv[None], recurrent[None], *pool)
+            extra = (routes[0][:, :, :16],) if dump else ()
+            return (emitted, state, conv[None], recurrent[None], *pool, *extra)
 
         in_specs = (P(AXIS),) * (count + 2 + pools) + (P(),)
-        out_specs = (P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * pools
+        out_specs = (P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * pools + ((P(),) if dump else ())
         name = (
             f"pallas::k3_decode_owned_b{batch}"
             f"{'_sampled' if sampled else ''}{'_masked' if masked else ''}"
@@ -529,6 +534,9 @@ class DecodeOps:
         if mask is not None:
             (state,) = self._build_mask_pack(control, batch)(state, mask)
         outputs = self._run(op, batch, *self._operands(), state)
+        if kernel_config.active().decode_route_dump:
+            self.route_log.append(outputs[-1])
+            outputs = outputs[:-1]
         emitted, state, conv, recurrent, *pools = outputs
         self._adopt(conv, recurrent, pools)
         return emitted, state
