@@ -5167,7 +5167,9 @@ def routed_experts(
     order, ``ragged_gather_reduce`` back, weighting and summing each token's
     top-k contributions in FP32.
     """
+    down_layer = None
     if expert_layer is not None:
+        down_layer = expert_family_slot(expert_down.shape[0], expert_layer)
         expert_layer = expert_family_slot(expert_gate_up.shape[0], expert_layer)
     tokens, input_width = latent.shape
     local_experts = expert_gate_up.shape[-3]
@@ -5213,7 +5215,7 @@ def routed_experts(
         fuse_act="situ:4:25",
     )
     down = gmm_v2(
-        middle, expert_down, counts, rhs_scale=down_scale, rhs_layer=expert_layer,
+        middle, expert_down, counts, rhs_scale=down_scale, rhs_layer=down_layer,
         rhs_quant_dtype=jnp.float4_e2m1fn,
         maybe_quantize_lhs=False, zero_initialize=False,
     )

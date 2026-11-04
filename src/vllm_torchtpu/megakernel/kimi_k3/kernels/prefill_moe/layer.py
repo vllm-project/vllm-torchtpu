@@ -127,7 +127,9 @@ def routed_experts_prepared(
     global_route_max=None,
 ):
     """Consume prepared expert-major metadata with the existing GU/down path."""
+    down_layer = None
     if expert_layer is not None:
+        down_layer = expert_family_slot(expert_down.shape[0], expert_layer)
         expert_layer = expert_family_slot(expert_gate_up.shape[0], expert_layer)
     tokens = latent.shape[0]
     # The E8M0 exponent bytes go to the GMM as they are (it converts each
@@ -141,7 +143,7 @@ def routed_experts_prepared(
     )
     options = dict(
         tokens=tokens,
-        layer=expert_layer,
+        layer=down_layer,
         ring_dtype=jnp.dtype(_config().moe_reduce_dtype),
     )
     if tokens == 8192:

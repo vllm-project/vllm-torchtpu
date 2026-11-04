@@ -54,14 +54,18 @@ EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)
 
 def bank_expert_parts(iterator, sizes=EXPERT_BANK_SIZES):
     """Stream checkpoint parts into exactly one resident copy of each expert
-    (banks of ``sizes`` layers)."""
-    EXPERT_BANK_SIZES = sizes  # noqa: N806 (the banks this call builds)
+    (banks of ``sizes`` layers, or per family when ``sizes`` is a dict)."""
+
+    def sizes_of(family):
+        return sizes[family] if isinstance(sizes, dict) else sizes
+
     state: dict[str, list[Any]] = {}
     for group, name, value in iterator:
         family, marker, suffix = name.partition("@")
         if family not in EXPERT_FAMILIES:
             yield group, name, value
             continue
+        bank_sizes = sizes_of(family)
         part, parts = map(int, suffix.split("/")) if marker else (0, 1)
         entry = state.setdefault(family, [0, 0, 0, None])
         expected_part, bank, used, buffer = entry
@@ -69,9 +73,9 @@ def bank_expert_parts(iterator, sizes=EXPERT_BANK_SIZES):
             raise ValueError(f"Out-of-order expert checkpoint part: {name}")
         offset = 0
         while offset < value.shape[0]:
-            if bank == len(EXPERT_BANK_SIZES):
+            if bank == len(bank_sizes):
                 raise ValueError(f"Too many expert layers for {family}")
-            capacity = EXPERT_BANK_SIZES[bank]
+            capacity = bank_sizes[bank]
             if buffer is None:
                 buffer = np.empty((capacity, *value.shape[1:]), dtype=value.dtype)
             count = min(capacity - used, value.shape[0] - offset)
@@ -82,10 +86,10 @@ def bank_expert_parts(iterator, sizes=EXPERT_BANK_SIZES):
                 yield group, f"{family}#bank{bank}", buffer
                 bank, used, buffer = bank + 1, 0, None
         state[family] = [part + 1, bank, used, buffer]
-        if part + 1 == parts and (bank != len(EXPERT_BANK_SIZES) or used):
+        if part + 1 == parts and (bank != len(bank_sizes) or used):
             raise ValueError(f"Incomplete expert checkpoint: {family}")
     if set(state) != set(EXPERT_FAMILIES) or any(
-        bank != len(EXPERT_BANK_SIZES) or used for _, bank, used, _ in state.values()
+        bank != len(sizes_of(f)) or used for f, (_, bank, used, _) in state.items()
     ):
         raise ValueError("Missing expert checkpoint parts")
 

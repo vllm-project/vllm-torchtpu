@@ -1103,7 +1103,7 @@ def _routed_experts(
         ring_meta,
     ):
         w = dataclasses.replace(
-            w, weight=w.weight.at[layer[0]], scale=w.scale.at[layer[0]]
+            w, weight=w.weight.at[layer[1]], scale=w.scale.at[layer[1]]
         )
         w = dataclasses.replace(w, weight=w.weight.bitcast(jnp.float4_e2m1fn))
         gu = dataclasses.replace(
@@ -2223,6 +2223,8 @@ def _layer_kernel(
         # correspond to first/group/final programs with 3/8/1 MoE families.
         family = k.expert_family_slot(expert_gu.shape[0], control[1])
         s["family"][0] = family
+        # The down families' slot (their resident chunk may differ, diagnostics).
+        s["family"][1] = k.expert_family_slot(expert_down.shape[0], control[1])
 
         def count_copy():
             return pltpu.make_async_copy(s["counts_v"], s["counts"], s["count_sem"])
@@ -2355,7 +2357,7 @@ def _layer_kernel(
             maximum=smem((1,), jnp.int32) if tokens == 8192 else None,
             ids=smem((capacity // 128, 128), jnp.int32),
             probs=smem((capacity // 128, 128), jnp.float32),
-            family=smem((1,), jnp.int32),
+            family=smem((2,), jnp.int32),
             offset=smem((1,), jnp.int32),
             pad=smem((1,), jnp.int32),
             count_sem=dma,

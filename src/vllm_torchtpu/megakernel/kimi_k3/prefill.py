@@ -302,13 +302,23 @@ class PrefillProgram:
         ):
             if kernel.prefill_expert_chunks:
                 counts = [int(c) for c in kernel.prefill_expert_chunks.split(",")]
-                self._unit_chunk, sizes, bank = [], [], 0
+                unit_chunk, sizes, bank = [], [], 0
                 for chunk, count in enumerate(counts):
                     sizes.append(sum(bank_sizes[bank:bank + count]))
-                    self._unit_chunk += [chunk] * count
+                    unit_chunk += [chunk] * count
                     bank += count
-                self._expert_banks = [{} for _ in sizes]
-                iterator = loader.bank_expert_parts(iterator, tuple(sizes))
+                chunked = {
+                    {"gu": "expert_gu", "gus": "expert_gus", "down": "expert_down",
+                     "ds": "expert_ds"}[f]
+                    for f in filter(None, kernel.prefill_expert_chunk_families.split(","))
+                } or set(families)
+                # Every bank index holds its chunk's tensor for chunked families.
+                self._chunk_of = {f: unit_chunk if f in chunked else list(range(len(bank_sizes))) for f in families}
+                self._expert_banks = [{} for _ in bank_sizes]
+                iterator = loader.bank_expert_parts(
+                    iterator, {f: tuple(sizes) if f in chunked else bank_sizes for f in families}
+                )
+                self._unit_chunk = unit_chunk
             else:
                 self._expert_banks = [{} for _ in bank_sizes]
                 iterator = loader.bank_expert_parts(iterator)
@@ -320,7 +330,12 @@ class PrefillProgram:
             family, marker, index = name.partition("#bank")
             if marker:
                 bank = int(index)
-                self._expert_banks[bank][family] = tensor
+                if self._unit_chunk:
+                    for unit, chunk in enumerate(self._chunk_of[family]):
+                        if chunk == bank:
+                            self._expert_banks[unit][family] = tensor
+                else:
+                    self._expert_banks[bank][family] = tensor
                 # The default dictionary retains handles to bank zero so common
                 # shape/introspection code still sees every named family.
                 if bank != 0:
@@ -366,8 +381,6 @@ class PrefillProgram:
         report_load_stats("prefill", self.rank, stats)
 
     def _flat(self, *groups: str, expert_bank: int = 0) -> list[torch.Tensor]:
-        if self._unit_chunk:
-            expert_bank = self._unit_chunk[expert_bank]
         experts = self._expert_banks[expert_bank] if self._expert_banks else {}
         return [
             experts[n] if g == "moe" and n in experts else self.weights[g][n]

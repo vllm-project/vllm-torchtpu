@@ -108,6 +108,9 @@ class KernelConfig:
     # banks, as comma-separated bank counts (e.g. "6,7"; chunk sizes in layers
     # must differ). Empty: the banks.
     prefill_expert_chunks: str = ""
+    # Families the chunks apply to (gu, gus, down, ds; empty: all), the rest
+    # stay in the 13 banks.
+    prefill_expert_chunk_families: str = ""
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
     # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
     # False: the unfused SparseCore gather/combine.
