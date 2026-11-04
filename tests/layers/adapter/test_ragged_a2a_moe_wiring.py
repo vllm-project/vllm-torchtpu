@@ -50,6 +50,7 @@ def test_ragged_a2a_op_threshold_covers_the_ep_decode_step(
     monkeypatch, max_num_seqs, compile_sizes, draft_tokens, expected
 ):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    monkeypatch.setattr(envs, "TPU_MOE_A2A_CAPACITY", 2.0, raising=False)
     sc_info = SimpleNamespace(num_lanes=16, num_cores=2, num_subcores=16)
     monkeypatch.setattr(
         fused_moe_gmm.pltpu,
@@ -82,3 +83,4 @@ def test_ragged_a2a_op_threshold_covers_the_ep_decode_step(
         topk=10, activation="silu", rhs_quant_dtype=None, skip_padded_tokens=False
     )
     assert seen["onehot_moe_permute_threshold"] == expected
+    assert seen["capacity_factor"] == 2.0

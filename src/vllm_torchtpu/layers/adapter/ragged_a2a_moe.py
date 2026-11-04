@@ -30,7 +30,12 @@ from torch_tpu._internal import pallas
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.fused_moe import _decode_routed_rows
 from vllm_torchtpu.layers.core.fused_moe_gmm import resolve_onehot_permute_threshold
-from vllm_torchtpu.layers.core.ragged_a2a_moe import DP_AXIS, TP_AXIS, ragged_a2a_moe
+from vllm_torchtpu.layers.core.ragged_a2a_moe import (
+    DP_AXIS,
+    TP_AXIS,
+    exchange_capacity,
+    ragged_a2a_moe,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -92,10 +97,12 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
     if op is not None:
         return op
     mesh = get_dp_tp_mesh()
-    # Each rank receives into one region per DP member, sized for all of that
-    # member's tokens: the local permute sees the all-gather path's rows.
+    # The full-size exchange receives into one region per DP member, sized for
+    # all of that member's tokens: the local permute sees the all-gather
+    # path's rows, so the threshold follows the full decode step.
     decode_routed_rows = _decode_routed_rows(topk)
     onehot_threshold = resolve_onehot_permute_threshold(decode_routed_rows)
+    capacity_factor = envs.TPU_MOE_A2A_CAPACITY
     run = functools.partial(
         ragged_a2a_moe,
         mesh=mesh,
@@ -105,6 +112,7 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
         onehot_moe_permute_threshold=onehot_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        capacity_factor=capacity_factor,
     )
 
     # torch_tpu infers static argnums from annotations: every operand is jax.Array.
@@ -144,7 +152,42 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
         onehot_threshold,
         decode_routed_rows,
     )
+    _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows)
     return op
+
+
+def _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows) -> None:
+    """Log the capacity sizes of a full decode step (at op build, untraced)."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    text = getattr(getattr(cfg, "model_config", None), "hf_text_config", None)
+    num_experts = getattr(text, "num_experts", None) or getattr(
+        text, "n_routed_experts", None
+    )
+    dp_size, tp_size = mesh.shape[DP_AXIS], mesh.shape[TP_AXIS]
+    if not num_experts or not decode_routed_rows:
+        return
+    decode_tokens = decode_routed_rows // (dp_size * topk)
+    rows, routes = exchange_capacity(
+        dp_size=dp_size,
+        tp_size=tp_size,
+        num_tokens=decode_tokens,
+        topk=topk,
+        local_num_experts=num_experts // (dp_size * tp_size),
+        factor=envs.TPU_MOE_A2A_CAPACITY,
+        onehot_moe_permute_threshold=onehot_threshold,
+        use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+    )
+    logger.info(
+        "Ragged A2A MoE capacity x%g | decode step: %d of %d rows, %d of %d "
+        "routes per rank",
+        envs.TPU_MOE_A2A_CAPACITY,
+        rows,
+        dp_size * decode_tokens,
+        routes,
+        decode_routed_rows,
+    )
 
 
 def prebuild_ragged_a2a_moe(*, topk, activation, rhs_quant_dtype=None) -> None:

@@ -30,8 +30,10 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 from vllm_torchtpu.layers.core.ragged_a2a_moe import (
     DP_AXIS,
     TP_AXIS,
+    _capacity_overflow,
     _gather_routing,
     _tile_rows,
+    exchange_capacity,
     exchange_need,
     ragged_a2a_moe,
 )
@@ -285,7 +287,7 @@ def _previous_ragged_a2a_moe_local(
     return rows.astype(jnp.float32).sum(axis=0).astype(x.dtype)
 
 
-def _inputs(num_ranks, tp_size, num_tokens, num_experts, *, skew):
+def _inputs(num_ranks, tp_size, num_tokens, num_experts, *, skew, topk=TOPK):
     key = jax.random.key(num_ranks * 100 + num_tokens + skew)
     kx, kl, k1, k2 = jax.random.split(key, 4)
     engines = num_ranks // tp_size
@@ -302,7 +304,7 @@ def _inputs(num_ranks, tp_size, num_tokens, num_experts, *, skew):
         logits = logits + jnp.where(owner_dp == 0, 4.0, 0.0)
     logits = jnp.broadcast_to(logits, (engines, tp_size, num_tokens, num_experts))
     logits = logits.reshape(-1, num_experts)
-    weights, ids = jax.lax.top_k(jax.nn.softmax(logits, axis=-1), TOPK)
+    weights, ids = jax.lax.top_k(jax.nn.softmax(logits, axis=-1), topk)
     w1 = jax.random.normal(k1, (num_experts, HIDDEN, 2 * INTER)) / 8
     w2 = jax.random.normal(k2, (num_experts, INTER, HIDDEN)) / 8
     w1, s1 = quantize_to_native_fp4_kmajor(w1, 256, pack=False)
@@ -438,3 +440,253 @@ def test_ragged_a2a_matches_previous_exchange(
         )(*stacked)
         got = np.asarray(got).reshape(previous.shape[0], -1).view(np.uint16)
         np.testing.assert_array_equal(got, previous, err_msg=rule)
+
+
+@pytest.mark.cpu_test
+def test_exchange_capacity_sizes():
+    # Proxy dp2 x tp4, top-10 of 512: ~74% of the 96 rows reach a rank, so the
+    # rows stay full; the routes shrink to 2 x 120, rounded to 256.
+    kw = dict(topk=10, local_num_experts=64, onehot_moe_permute_threshold=960)
+    assert ra_capacity(dp_size=2, tp_size=4, num_tokens=48, factor=2.0, **kw) == (
+        96,
+        256,
+    )
+    assert ra_capacity(dp_size=2, tp_size=4, num_tokens=48, factor=0.0, **kw) == (
+        96,
+        960,
+    )
+    # 4 hosts dp8 x tp4 (16 experts per rank): ~27% of 96 rows, 30 routes.
+    kw = dict(topk=10, local_num_experts=16, onehot_moe_permute_threshold=960)
+    assert ra_capacity(dp_size=8, tp_size=4, num_tokens=12, factor=2.0, **kw) == (
+        64,
+        128,
+    )
+    # 8 hosts dp16 x tp4 with 3 drafts: 768 rows of 7680 routed rows exceed the
+    # one-hot cap; capacity brings them under it.
+    kw = dict(topk=10, local_num_experts=8, onehot_moe_permute_threshold=3840)
+    assert ra_capacity(dp_size=16, tp_size=4, num_tokens=48, factor=2.0, **kw) == (
+        240,
+        256,
+    )
+    # Above the one-hot threshold the routes are not bounded.
+    kw = dict(topk=10, local_num_experts=64, onehot_moe_permute_threshold=511)
+    assert ra_capacity(dp_size=2, tp_size=4, num_tokens=48, factor=2.0, **kw) == (
+        96,
+        960,
+    )
+
+
+def ra_capacity(**kw):
+    return exchange_capacity(use_sparse_core=True, **kw)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("factor", [0.5, 1.0, 2.0])
+@pytest.mark.parametrize(
+    "dp_size,tp_size,num_tokens,topk,skew",
+    [
+        (2, 4, 48, 10, False),  # proxy decode step: route capacity only
+        (2, 4, 48, 2, False),  # ~24% occupancy: row capacity too
+        (2, 4, 48, 2, True),  # skewed onto DP position 0: overflow
+        (4, 2, 24, 2, False),
+        (8, 1, 48, 10, False),  # 8 members, 3840 routed rows
+        (8, 1, 12, 2, True),
+    ],
+)
+def test_capacity_exchange_matches_full_exchange(
+    dp_size, tp_size, num_tokens, topk, skew, factor
+):
+    """Bitwise the full-size exchange, whether the step fits the capacity
+    buffers or overflows into the full-size path (factor 0.5 always
+    overflows at top-10)."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, w1, w2, s1, s2, weights, ids, es = _inputs(
+        8, tp_size, num_tokens, 64, skew=skew, topk=topk
+    )
+    stacked = tuple(
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:])
+        for a in (x, w1, w2, s1, s2, weights, ids, es)
+    )
+    threshold = resolve_onehot_permute_threshold(dp_size * num_tokens * topk)
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+    )
+    full = jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked)
+    full = np.asarray(full)
+    assert np.isfinite(full.astype(np.float32)).all()
+    assert np.abs(full.astype(np.float32)).max() > 0
+    got = jax.jit(functools.partial(ragged_a2a_moe, capacity_factor=factor, **common))(
+        *stacked
+    )
+    np.testing.assert_array_equal(np.asarray(got).view(np.uint16), full.view(np.uint16))
+
+
+@pytest.mark.multichip
+def test_capacity_exchange_runs_both_branches():
+    """One step that fits the capacity buffers, one that overflows them (every
+    token routed to rank 0's experts), through the same jitted program."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(2, 4), (DP_AXIS, TP_AXIS))
+    threshold = resolve_onehot_permute_threshold(2 * 48 * 2)
+    common = dict(
+        mesh=mesh,
+        topk=2,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+    )
+    full_run = jax.jit(functools.partial(ragged_a2a_moe, **common))
+    capacity_run = jax.jit(
+        functools.partial(ragged_a2a_moe, capacity_factor=2.0, **common)
+    )
+    rows, routes = exchange_capacity(
+        dp_size=2,
+        tp_size=4,
+        num_tokens=48,
+        topk=2,
+        local_num_experts=8,
+        factor=2.0,
+        onehot_moe_permute_threshold=threshold,
+        use_sparse_core=True,
+    )
+    assert rows < 96
+    args = _inputs(8, 4, 48, 64, skew=False, topk=2)
+    for forced in (False, True):
+        if forced:
+            ids = jnp.broadcast_to(jnp.asarray([0, 1], jnp.int32), args[6].shape)
+            args = args[:6] + (ids, args[7])
+        stacked = tuple(a.reshape(2, 4, -1, *a.shape[1:]) for a in args)
+        gathered = np.asarray(ids_by_engine(args[6], 2, 4))
+        assert _overflow_reference(gathered, 4, 8, rows, routes) == forced
+        full = np.asarray(full_run(*stacked)).view(np.uint16)
+        got = np.asarray(capacity_run(*stacked)).view(np.uint16)
+        np.testing.assert_array_equal(got, full)
+
+
+def ids_by_engine(ids, dp_size, tp_size):
+    return ids.reshape(dp_size, tp_size, -1, ids.shape[-1])[:, 0]
+
+
+def _overflow_reference(ids, tp_size, local_num_experts, rows, routes):
+    dp_size, num_tokens, _ = ids.shape
+    num_ranks = dp_size * tp_size
+    hit = np.zeros((dp_size, num_tokens, num_ranks), bool)
+    rank_routes = np.zeros(num_ranks, int)
+    for s in range(dp_size):
+        for t in range(num_tokens):
+            for e in ids[s, t]:
+                hit[s, t, e // local_num_experts] = True
+                rank_routes[e // local_num_experts] += 1
+    recv = hit.sum(axis=(0, 1))
+    send = hit.reshape(dp_size, num_tokens, dp_size, tp_size).sum(axis=(1, 2))
+    return bool(rank_routes.max() > routes or recv.max() > rows or send.max() > rows)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("dp_size,tp_size", [(2, 4), (4, 2), (8, 1)])
+@pytest.mark.parametrize("topk", [2, 10])
+def test_capacity_overflow_matches_brute_force(dp_size, tp_size, topk):
+    devices = jax.devices()
+    if len(devices) < 8:
+        pytest.skip("needs 8 devices")
+    local = 8
+    rng = np.random.default_rng(dp_size * 10 + topk)
+    ids = np.stack(
+        [
+            np.stack(
+                [
+                    rng.choice(dp_size * tp_size * local, topk, replace=False)
+                    for _ in range(12)
+                ]
+            )
+            for _ in range(dp_size)
+        ]
+    ).astype(np.int32)
+    mesh = Mesh(np.asarray(devices[:8]).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    for rows, routes in [
+        (4, 1000),
+        (8, 1000),
+        (12, 1000),
+        (24, 10),
+        (24, 20),
+        (24, 1000),
+    ]:
+        body = functools.partial(
+            _capacity_overflow,
+            tp_size=tp_size,
+            local_num_experts=local,
+            rows=rows,
+            routes=routes,
+        )
+        got = jax.jit(
+            jax.shard_map(
+                lambda g, body=body: body(g[0, 0])[None, None],
+                mesh=mesh,
+                in_specs=P(DP_AXIS, TP_AXIS),
+                out_specs=P(DP_AXIS, TP_AXIS),
+                check_vma=False,
+            )
+        )(
+            jnp.broadcast_to(
+                jnp.asarray(ids)[None, None], (dp_size, tp_size) + ids.shape
+            )
+        )
+        want = _overflow_reference(ids, tp_size, local, rows, routes)
+        assert (np.asarray(got) == want).all(), (rows, routes)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize(
+    "num_tokens,max_local_routes,skip_padded",
+    [
+        (96, 128, False),  # proxy rank: 96 rows, ~120 local routes
+        (96, 256, False),
+        (96, 256, True),
+        (384, 1024, False),  # 8 members: 3840 routed rows
+        (64, 640, False),  # bound at the routed rows: no rows skipped
+    ],
+)
+def test_local_routes_matches_onehot_path(num_tokens, max_local_routes, skip_padded):
+    """``max_local_routes`` gives the one-hot path's output bitwise when the
+    local routes fit."""
+    devices = _require_eight_tpu_devices()
+    num_experts, local = 64, 8
+    x, w1, w2, s1, s2, weights, ids, _ = _inputs(
+        8, 1, num_tokens, num_experts, skew=False
+    )
+    x, weights, ids = x[:num_tokens], weights[:num_tokens], ids[:num_tokens]
+    if skip_padded:
+        weights = weights.at[-7:].set(0)
+    # Rank 0 hosts experts 0..7; keep the local routes within the bound.
+    ids_np = np.array(ids)
+    local_rows = np.nonzero((ids_np < local).any(axis=1))[0]
+    keep = max_local_routes
+    drop = local_rows[np.cumsum((ids_np[local_rows] < local).sum(axis=1)) > keep]
+    ids_np[drop] = np.where(ids_np[drop] < local, ids_np[drop] + local, ids_np[drop])
+    ids = jnp.asarray(ids_np)
+    assert (ids_np < local).sum() <= max_local_routes
+    threshold = num_tokens * TOPK
+    kw = dict(
+        experts_start=jnp.int32(0),
+        topk=TOPK,
+        activation="silu",
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+        skip_padded_tokens=skip_padded,
+    )
+    args = (x, w1[:local], w2[:local], s1[:local], s2[:local], None, None, weights, ids)
+    with jax.default_device(devices[0]):
+        want = jax.jit(functools.partial(fused_moe_func, **kw))(*args)
+        got = jax.jit(
+            functools.partial(fused_moe_func, max_local_routes=max_local_routes, **kw)
+        )(*args)
+    want = np.asarray(want)
+    assert np.isfinite(want.astype(np.float32)).all()
+    assert np.abs(want.astype(np.float32)).max() > 0
+    np.testing.assert_array_equal(np.asarray(got).view(np.uint16), want.view(np.uint16))

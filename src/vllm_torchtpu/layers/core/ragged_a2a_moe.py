@@ -34,9 +34,17 @@ ragged all-to-all costs grow with the number of slices, so packing them with a
 gather on each side is cheaper than one slice per token. The home rank adds the
 returned partials in DP-position order, where the reduce-scatter used its own
 order.
+
+With many DP members, a rank receives only a fraction of the group's tokens
+(about a quarter at 32 EP ranks, top-10 of 512 experts) and sees fewer routes
+still. The capacity exchange sizes its buffers and the local MoE for a
+multiple of those means instead of the whole group; a step whose routing does
+not fit on some rank runs the full-size exchange, so results never depend on
+the capacity.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +54,9 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import fused_moe_func
 
 DP_AXIS = "dp"
 TP_AXIS = "tp"
+# Capacity buffers grow in whole bf16 row tiles and whole GMM row tiles.
+_ROW_TILE = 16
+_ROUTE_TILE = 128
 
 
 def _member_index(
@@ -140,31 +151,91 @@ def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array):
     return jnp.right_shift(packed, 16), read
 
 
-def ragged_a2a_moe_local(
-    x: jax.Array,
-    w1: jax.Array,
-    w2: jax.Array,
-    w1_scale: jax.Array,
-    w2_scale: jax.Array,
-    topk_weights: jax.Array,
-    topk_ids: jax.Array,
-    experts_start: jax.Array,
+def exchange_capacity(
+    *,
+    dp_size: int,
+    tp_size: int,
+    num_tokens: int,
+    topk: int,
+    local_num_experts: int,
+    factor: float,
+    onehot_moe_permute_threshold: int,
+    use_sparse_core: bool,
+) -> tuple[int, int]:
+    """Static sizes of the capacity exchange: ``(rows, routes)``.
+
+    ``rows`` bounds the token rows each rank sends and receives, ``routes``
+    the routes hitting its local experts: ``factor`` times their mean under
+    uniform routing, rounded up to whole tiles and capped at the sizes that
+    always fit (``dp_size * num_tokens`` rows, ``topk`` routes per row). The
+    route bound only applies where the local MoE runs one-hot matmuls.
+    """
+    slots = dp_size * num_tokens
+    if factor <= 0:
+        return slots, slots * topk
+    num_ranks = dp_size * tp_size
+    num_experts = num_ranks * local_num_experts
+    miss = 1.0  # a token's topk distinct experts all on other ranks
+    for i in range(topk):
+        miss *= max(num_experts - local_num_experts - i, 0) / (num_experts - i)
+    rows = -(-math.ceil(factor * slots * (1 - miss)) // _ROW_TILE) * _ROW_TILE
+    rows = min(rows, slots)
+    if not (use_sparse_core and rows * topk <= onehot_moe_permute_threshold):
+        return rows, rows * topk
+    routes = math.ceil(factor * slots * topk / num_ranks)
+    routes = -(-routes // _ROUTE_TILE) * _ROUTE_TILE
+    return rows, min(routes, rows * topk)
+
+
+def _capacity_overflow(
+    gathered_ids: jax.Array,
     *,
     tp_size: int,
-    dp_size: int,
-    topk: int,
-    activation: str,
-    use_sparse_core: bool,
-    onehot_moe_permute_threshold: int,
-    rhs_quant_dtype=None,
-    skip_padded_tokens: bool = False,
+    local_num_experts: int,
+    rows: int,
+    routes: int,
 ) -> jax.Array:
-    """Per-rank body (inside shard_map over the (dp, tp) mesh).
+    """Whether any rank of the mesh would send or receive more than ``rows``
+    token rows, or see more than ``routes`` routes to its experts.
 
-    ``x`` [S, H] and the routing [S, K] are this engine's tokens;
-    ``experts_start`` [1] is this rank's first global expert id. Returns this
-    rank's [S, H] sum over its DP group, before the TP all-reduce.
+    Every rank holds the routing of every engine, so all ranks compute the same
+    answer and take the same branch around their collectives.
     """
+    dp_size, num_tokens, _ = gathered_ids.shape
+    num_ranks = dp_size * tp_size
+    owner = gathered_ids // local_num_experts
+    owner = jnp.where((gathered_ids >= 0) & (owner < num_ranks), owner, num_ranks)
+    hit = owner[..., None] == jnp.arange(num_ranks, dtype=jnp.int32)  # [D, S, K, R]
+    rank_routes = hit.sum(axis=(0, 1, 2), dtype=jnp.int32)
+    rows_hit = hit.any(axis=2)  # [D, S, R]: token reaches EP rank
+    recv_rows = rows_hit.sum(axis=(0, 1), dtype=jnp.int32)
+    send_rows = rows_hit.reshape(dp_size, num_tokens, dp_size, tp_size).sum(
+        axis=(1, 2), dtype=jnp.int32
+    )
+    return (
+        (rank_routes.max() > routes)
+        | (recv_rows.max() > rows)
+        | (send_rows.max() > rows)
+    )
+
+
+def _exclusive_cumsum(a: jax.Array, axis: int) -> jax.Array:
+    return jnp.cumsum(a, axis=axis, dtype=jnp.int32) - a
+
+
+def _full_exchange(
+    x,
+    w1,
+    topk_ids,
+    gathered_ids,
+    read_routes,
+    experts_start,
+    *,
+    tp_size,
+    dp_size,
+    moe,
+):
+    """One receive region per DP member, sized for all of its tokens."""
     num_tokens, hidden = x.shape
     local_num_experts = w1.shape[0]
     ep_rank = experts_start[0] // local_num_experts
@@ -178,7 +249,6 @@ def ragged_a2a_moe_local(
         local_num_experts=local_num_experts,
     )
 
-    gathered_ids, read_routes = _gather_routing(topk_ids, topk_weights)
     member = jnp.arange(dp_size, dtype=jnp.int32)
     token = jnp.arange(num_tokens, dtype=jnp.int32)
     region = member * num_tokens
@@ -220,25 +290,7 @@ def ragged_a2a_moe_local(
         axis_name=DP_AXIS,
     ).reshape(slots, hidden)
 
-    partial = fused_moe_func(
-        received,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        None,
-        None,
-        recv_weights,
-        recv_ids,
-        experts_start=experts_start[0],
-        topk=topk,
-        activation=activation,
-        use_ep=True,
-        use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+    partial = moe(received, recv_weights, recv_ids)
 
     # Return path: the rows received from s go back to s, which finds member
     # d's partials at d's region in the order it sent them.
@@ -259,6 +311,213 @@ def ragged_a2a_moe_local(
     return rows.astype(jnp.float32).sum(axis=0).astype(x.dtype)
 
 
+def _capacity_exchange(
+    x,
+    w1,
+    topk_ids,
+    gathered_ids,
+    read_routes,
+    experts_start,
+    *,
+    tp_size,
+    dp_size,
+    rows,
+    moe,
+):
+    """Send and receive buffers of ``rows`` rows, filled without gaps.
+
+    A rank sends its tokens grouped by destination member, each group in token
+    order, and receives the groups of its sources in DP-position order, each
+    in that source's token order: the receiver sees the full exchange's rows
+    with the empty slots removed. Offsets come from the [D, D] matrix of
+    member-to-member token counts, which every member of the DP group derives
+    from the gathered routing.
+    """
+    num_tokens, hidden = x.shape
+    local_num_experts = w1.shape[0]
+    ep_rank = experts_start[0] // local_num_experts
+    dp_pos = ep_rank // tp_size
+    member_index = functools.partial(
+        _member_index,
+        ep_rank=ep_rank,
+        dp_size=dp_size,
+        tp_size=tp_size,
+        local_num_experts=local_num_experts,
+    )
+    member = jnp.arange(dp_size, dtype=jnp.int32)
+    token = jnp.arange(num_tokens, dtype=jnp.int32)
+    row = jnp.arange(rows, dtype=jnp.int32)
+
+    need_out = (member_index(topk_ids)[:, :, None] == member).any(axis=1)  # [S, D]
+    need = (member_index(gathered_ids)[..., None] == member).any(axis=2)  # [D, S, D]
+    need_in = (need & (member == dp_pos)).any(axis=2)  # [D, S]
+    counts = need.sum(axis=1, dtype=jnp.int32)  # [source, destination]
+    send_sizes = need_out.sum(axis=0, dtype=jnp.int32)
+    recv_sizes = need_in.sum(axis=1, dtype=jnp.int32)
+    send_start = _exclusive_cumsum(send_sizes, 0)
+    recv_start = _exclusive_cumsum(recv_sizes, 0)
+    earlier = (member < dp_pos).astype(jnp.int32)
+    # Where this rank's group lands on each destination: after the groups of
+    # the sources before it. Where each source finds this rank's partials:
+    # after the groups it sent to the members before this one.
+    send_landing = (counts * earlier[:, None]).sum(axis=0)
+    back_landing = (counts * earlier[None, :]).sum(axis=1)
+
+    out_row = send_start[None, :] + jnp.cumsum(need_out, axis=0, dtype=jnp.int32) - 1
+    out_row = jnp.where(need_out, out_row, rows)  # [S, D]
+    send_index = jnp.where(
+        out_row[None] == row[:, None, None], token[None, :, None], 0
+    ).sum(axis=(1, 2))
+    in_row = recv_start[:, None] + jnp.cumsum(need_in, axis=1, dtype=jnp.int32) - 1
+    in_row = jnp.where(need_in, in_row, rows)  # [D, S]
+    in_hit = in_row[None] == row[:, None, None]  # [rows, D, S]
+    source = (member[:, None] * num_tokens + token[None, :])[None]
+    source_row = jnp.where(
+        in_hit.any(axis=(1, 2)),
+        jnp.where(in_hit, source, 0).sum(axis=(1, 2)),
+        dp_size * num_tokens,
+    )
+    recv_ids, recv_weights = read_routes(source_row)
+
+    sent = _tile_rows(x[send_index])
+    received = jax.lax.ragged_all_to_all(
+        sent,
+        jnp.zeros_like(sent),
+        send_start,
+        send_sizes,
+        send_landing,
+        recv_sizes,
+        axis_name=DP_AXIS,
+    ).reshape(rows, hidden)
+
+    partial = moe(received, recv_weights, recv_ids)
+
+    # Every row the home rank reads below is written by this exchange, so the
+    # spent send buffer takes the returns.
+    back = jax.lax.ragged_all_to_all(
+        _tile_rows(partial),
+        sent,
+        recv_start,
+        recv_sizes,
+        back_landing,
+        send_sizes,
+        axis_name=DP_AXIS,
+    ).reshape(rows, hidden)
+    back = jnp.concatenate([back, jnp.zeros((1, hidden), back.dtype)], axis=0)
+    partials = back[out_row.T]  # [D, S, H]; tokens that skipped d read the zero row
+    return partials.astype(jnp.float32).sum(axis=0).astype(x.dtype)
+
+
+def ragged_a2a_moe_local(
+    x: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array,
+    *,
+    tp_size: int,
+    dp_size: int,
+    topk: int,
+    activation: str,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool = False,
+    capacity_factor: float = 0.0,
+) -> jax.Array:
+    """Per-rank body (inside shard_map over the (dp, tp) mesh).
+
+    ``x`` [S, H] and the routing [S, K] are this engine's tokens;
+    ``experts_start`` [1] is this rank's first global expert id. Returns this
+    rank's [S, H] sum over its DP group, before the TP all-reduce.
+
+    With ``capacity_factor`` > 0 the exchange and the local MoE are sized by
+    ``exchange_capacity``; a step whose routing exceeds those sizes on any rank
+    runs the full-size exchange instead. Both give the same result.
+    """
+    num_tokens = x.shape[0]
+    local_num_experts = w1.shape[0]
+    slots = dp_size * num_tokens
+    gathered_ids, read_routes = _gather_routing(topk_ids, topk_weights)
+
+    def moe(max_local_routes):
+        def run(received, recv_weights, recv_ids):
+            return fused_moe_func(
+                received,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                None,
+                None,
+                recv_weights,
+                recv_ids,
+                experts_start=experts_start[0],
+                topk=topk,
+                activation=activation,
+                use_ep=True,
+                use_sparse_core=use_sparse_core,
+                onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+                rhs_quant_dtype=rhs_quant_dtype,
+                skip_padded_tokens=skip_padded_tokens,
+                max_local_routes=max_local_routes,
+            )
+
+        return run
+
+    def full():
+        return _full_exchange(
+            x,
+            w1,
+            topk_ids,
+            gathered_ids,
+            read_routes,
+            experts_start,
+            tp_size=tp_size,
+            dp_size=dp_size,
+            moe=moe(0),
+        )
+
+    rows, routes = exchange_capacity(
+        dp_size=dp_size,
+        tp_size=tp_size,
+        num_tokens=num_tokens,
+        topk=topk,
+        local_num_experts=local_num_experts,
+        factor=capacity_factor,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        use_sparse_core=use_sparse_core,
+    )
+    if rows >= slots and routes >= slots * topk:
+        return full()
+
+    def capacity():
+        return _capacity_exchange(
+            x,
+            w1,
+            topk_ids,
+            gathered_ids,
+            read_routes,
+            experts_start,
+            tp_size=tp_size,
+            dp_size=dp_size,
+            rows=rows,
+            moe=moe(routes if routes < rows * topk else 0),
+        )
+
+    overflow = _capacity_overflow(
+        gathered_ids,
+        tp_size=tp_size,
+        local_num_experts=local_num_experts,
+        rows=rows,
+        routes=routes,
+    )
+    return jax.lax.cond(overflow, full, capacity)
+
+
 def ragged_a2a_moe(
     x: jax.Array,
     w1: jax.Array,
@@ -276,6 +535,7 @@ def ragged_a2a_moe(
     onehot_moe_permute_threshold: int,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool = False,
+    capacity_factor: float = 0.0,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
     two leading axes [dp, tp, ...], and so is the result [dp, tp, S, H]."""
@@ -290,6 +550,7 @@ def ragged_a2a_moe(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        capacity_factor=capacity_factor,
     )
 
     def body(*args):

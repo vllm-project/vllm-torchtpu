@@ -14,6 +14,8 @@
 #   tp8         : one engine, TP8, no DCP
 #   tp8xdcp2    : one engine, TP8, KV pages striped over 2 cores
 #   dp2xtp4     : two engines of TP4 on the host
+#   dp4xtp2     : four engines of TP2 on the host (EP over 4 DP members per TP rank)
+#   dp8xtp1     : eight engines of TP1 on the host (EP over 8 DP members)
 LAYOUT=${LAYOUT:-dp8tp4}
 GLOBAL_SEQS=${GLOBAL_SEQS:-96}
 MTP_K=${MTP_K:-3}
@@ -57,9 +59,14 @@ case "$LAYOUT" in
     PAR_ARGS=(--data-parallel-size 2 --data-parallel-size-local 2 --nnodes 1
               --tensor-parallel-size 4 --decode-context-parallel-size 1 --master-port 29500
               --data-parallel-address "$MASTER_ADDRESS" --data-parallel-rpc-port 29650) ;;
+  dp4xtp2|dp8xtp1)
+    ENGINES=${LAYOUT:2:1}
+    PAR_ARGS=(--data-parallel-size "$ENGINES" --data-parallel-size-local "$ENGINES" --nnodes 1
+              --tensor-parallel-size $((8 / ENGINES)) --decode-context-parallel-size 1 --master-port 29500
+              --data-parallel-address "$MASTER_ADDRESS" --data-parallel-rpc-port 29650) ;;
   *) echo "unknown LAYOUT=$LAYOUT" >&2; return 2 ;;
 esac
-case "$LAYOUT" in tp8|tp8xdcp2|dp2xtp4) LAYOUT_HOSTS=1 ;; *) LAYOUT_HOSTS=4 ;; esac
+case "$LAYOUT" in tp8|tp8xdcp2|dp2xtp4|dp4xtp2|dp8xtp1) LAYOUT_HOSTS=1 ;; *) LAYOUT_HOSTS=4 ;; esac
 if [[ "${#HOST_IPS[@]}" != "$LAYOUT_HOSTS" ]]; then
   echo "LAYOUT=$LAYOUT needs $LAYOUT_HOSTS host address(es), got ${#HOST_IPS[@]}" >&2; return 2
 fi
