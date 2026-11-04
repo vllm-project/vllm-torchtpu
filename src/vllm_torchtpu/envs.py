@@ -270,6 +270,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
+    VLLM_TPU_DETOK_PRIME_TOKENS: int = 32
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = True
@@ -1869,6 +1870,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
     ),
+    # API server: prime the detokenizer with this many prompt-tail tokens; 0 = off.
+    "VLLM_TPU_DETOK_PRIME_TOKENS": env_int("VLLM_TPU_DETOK_PRIME_TOKENS", 32),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
