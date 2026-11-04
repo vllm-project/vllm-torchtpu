@@ -101,6 +101,8 @@ class KernelConfig:
     # The banks at EP8 too (the fused EP8 MoE; an aggregate also needs
     # decode_expert_banks to share them).
     prefill_expert_banks_ep8: bool = False
+    # Diagnostic: the prefill ops take bank-sized views of one-tensor families.
+    prefill_expert_bank_views: bool = False
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
     # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
     # False: the unfused SparseCore gather/combine.

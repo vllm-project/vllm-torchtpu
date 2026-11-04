@@ -322,6 +322,14 @@ class PrefillProgram:
             for name in names:
                 if name in shared:
                     self.weights.setdefault(group, {})[name] = shared[name]
+        if kernel.prefill_expert_bank_views and not self._expert_banks:
+            # Bank-sized views of the 92-layer families (leading rank axis).
+            bounds = np.cumsum((0, *bank_sizes))
+            moe = self.weights["moe"]
+            self._expert_banks = [
+                {f: moe[f][:, int(lo):int(hi)] for f in families}
+                for lo, hi in zip(bounds[:-1], bounds[1:])
+            ]
         if self._expert_banks and any(
             set(bank) != set(families) for bank in self._expert_banks
         ):
