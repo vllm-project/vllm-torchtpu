@@ -168,6 +168,27 @@ def test_step_mix_tracker_and_ab_calibrator() -> None:
     assert off.record(1.0, padded_tokens=8) is None
 
 
+def test_step_mix_share_excludes_ab_stock_steps() -> None:
+    # With A/B calibration, an eligible key alternates `_ab_mk` / `_ab_stock`;
+    # the megakernel count and share cover only the steps it ran.
+    tracker = StepMixTracker(period_s=3600.0)
+    ab = MKABCalibrator(enabled=True, period_s=3600.0)
+    runs = [tracker.note_step("mk_t1_b8", True, ab)[0] for _ in range(4)]
+    assert runs == [True, False, True, False]
+    assert tracker.note_step("stock_prefill", False, ab)[0] is False
+    tracker.period_s = 0.0
+    run, snap = tracker.note_step("mk_t4_b16", True, ab)
+    assert run is True and snap is not None
+    _, mk_cnt, total, pct, counts = snap
+    assert counts == {
+        "mk_t1_b8_ab_mk": 2,
+        "mk_t1_b8_ab_stock": 2,
+        "mk_t4_b16_ab_mk": 1,
+        "stock_prefill": 1,
+    }
+    assert (mk_cnt, total) == (3, 6) and pct == 50.0
+
+
 def _reference_batch_shape(
     num_reqs: int | None,
     has_roff: bool,

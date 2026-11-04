@@ -499,7 +499,12 @@ def parse_mk_stats_log(
                         bucket_counts[k] = bucket_counts.get(k, 0) + int(v)
 
     total_steps = sum(bucket_counts.values())
-    mk_steps = sum(v for k, v in bucket_counts.items() if k.startswith("mk_"))
+    # A/B-calibration stock steps (`mk_..._ab_stock`) didn't run the megakernel.
+    mk_steps = sum(
+        v
+        for k, v in bucket_counts.items()
+        if k.startswith("mk_") and not k.endswith("_ab_stock")
+    )
     mk_pct = (100.0 * mk_steps / float(total_steps)) if total_steps > 0 else 0.0
     shares = (
         {

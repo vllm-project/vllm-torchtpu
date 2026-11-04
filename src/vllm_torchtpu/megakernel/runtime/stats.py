@@ -219,8 +219,18 @@ class MKABCalibrator:
         return json.dumps(out, separators=(",", ":"))
 
 
+def _ran_megakernel(mix_key: str) -> bool:
+    # An A/B calibration step of an eligible key is `mk_..._ab_mk` or
+    # `mk_..._ab_stock`; only the first ran the megakernel.
+    return mix_key.startswith("mk_") and not mix_key.endswith("_ab_stock")
+
+
 class StepMixTracker:
-    """Periodic step-mix counter and summary formatter."""
+    """Periodic step-mix counter and summary formatter.
+
+    The summary's megakernel count and share cover the steps the megakernel
+    actually ran: A/B-calibration stock steps (`..._ab_stock`) are excluded.
+    """
 
     def __init__(self, period_s: float = 60.0) -> None:
         self.period_s, self.counts, self.t0 = float(period_s), {}, time.monotonic()
@@ -242,7 +252,7 @@ class StepMixTracker:
         if (elapsed := now - self.t0) < self.period_s:
             return actual_run, None
         total = sum(self.counts.values())
-        mk_cnt = sum(v for k, v in self.counts.items() if k.startswith("mk_"))
+        mk_cnt = sum(v for k, v in self.counts.items() if _ran_megakernel(k))
         pct, snap = 100.0 * mk_cnt / max(total, 1), dict(sorted(self.counts.items()))
         self.counts, self.t0 = {}, now
         return actual_run, (elapsed, mk_cnt, total, pct, snap)
