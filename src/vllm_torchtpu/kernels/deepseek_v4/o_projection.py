@@ -35,6 +35,9 @@ SUBLANE = 8
 TILE_T_CAP = 1024
 SUB_T_CAP = 256
 
+# Tokens per gather_cos_sin group: a group whose positions are consecutive is
+# fetched with one DMA instead of one per token.
+GATHER_GROUP = 8
 # Tokens per gather_cos_sin chunk: a chunk is laid out and written back while
 # the row DMAs of later chunks land.
 GATHER_CHUNK = 128
@@ -87,27 +90,53 @@ def _cos_sin_kernel(
     gather_sems: jax.Ref,
     writeback_sems: jax.Ref,
     *,
+    group: int,
     chunk: int,
 ) -> None:
     """Copies each token's two table rows, then lays them out side by side.
 
-    All row DMAs are issued up front; each ``chunk`` of tokens is laid out and
-    written back once its own DMAs land.
+    A group of ``group`` tokens at consecutive positions (a prefill request's)
+    is one DMA; any other group is one DMA per token. All row DMAs are issued
+    up front; each ``chunk`` of tokens is laid out and written back once its
+    own DMAs land.
     """
     num_chunks = out_ref.shape[0] // chunk
     last_position = table_hbm_ref.shape[0] // 2 - 1
 
+    def fetch(token, position, rows: int, sem) -> None:
+        pltpu.make_async_copy(
+            table_hbm_ref.at[pl.ds(2 * position, 2 * rows)],
+            rows_ref.at[pl.ds(2 * token, 2 * rows)],
+            sem,
+        ).start()
+
     def fetch_chunk(c: int) -> None:
         sem = gather_sems.at[c]
 
-        @pl.loop(c * chunk, (c + 1) * chunk)
-        def _(token):
-            position = jnp.minimum(positions_ref[token], last_position)
-            pltpu.make_async_copy(
-                table_hbm_ref.at[pl.ds(2 * position, 2)],
-                rows_ref.at[pl.ds(2 * token, 2)],
-                sem,
-            ).start()
+        @pl.loop(c * chunk // group, (c + 1) * chunk // group)
+        def _(g):
+            token = g * group
+            first = positions_ref[token]
+            # Nonzero iff some position in the group is not ``first + j``.
+            terms = [(positions_ref[token + j] - first) ^ j for j in range(1, group)]
+            while len(terms) > 1:
+                pairs = [a | b for a, b in zip(terms[::2], terms[1::2])]
+                terms = pairs + terms[len(pairs) * 2 :]
+            mismatch = terms[0] if terms else jnp.int32(0)
+            # The group's rows are one run of the table.
+            run = (mismatch == 0) & (first <= last_position + 1 - group)
+
+            @pl.when(run)
+            def _():
+                fetch(token, first, group, sem)
+
+            @pl.when(jnp.logical_not(run))
+            def _():
+                # A rolled loop keeps this rare path a branch: if-converted,
+                # its per-token copies would cost issue slots in every group.
+                @pl.loop(token, token + group)
+                def _(t):
+                    fetch(t, jnp.minimum(positions_ref[t], last_position), 1, sem)
 
     for c in range(num_chunks):
         fetch_chunk(c)
@@ -149,9 +178,10 @@ def gather_cos_sin(
     num_tokens = positions.shape[0]
     chunk = _largest_divisor(num_tokens, cap=GATHER_CHUNK)
     num_chunks = num_tokens // chunk
+    group = _largest_divisor(chunk, cap=GATHER_GROUP)
     dtype = table.dtype
     return pl.pallas_call(
-        functools.partial(_cos_sin_kernel, chunk=chunk),
+        functools.partial(_cos_sin_kernel, group=group, chunk=chunk),
         out_shape=jax.ShapeDtypeStruct((num_tokens, 2 * LANE), dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
