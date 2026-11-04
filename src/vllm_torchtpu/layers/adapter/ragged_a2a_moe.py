@@ -1,0 +1,193 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Torch bridge for the ragged all-to-all EP exchange (``TPU_MOE_RAGGED_A2A``).
+
+With the knob on, the quant method owns the EP exchange
+(``supports_internal_mk``): vLLM hands it this engine's tokens, routing runs
+locally, and ``layers.core.ragged_a2a_moe`` moves each token only to the DP
+group members that host its experts. vLLM's TP all-reduce still finishes the
+reduction.
+"""
+
+import functools
+
+import jax
+import torch
+from jax.sharding import PartitionSpec
+from torch_tpu._internal import pallas
+
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.core.fused_moe_gmm import resolve_onehot_permute_threshold
+from vllm_torchtpu.layers.core.ragged_a2a_moe import DP_AXIS, TP_AXIS, ragged_a2a_moe
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+_MESH = None
+_OPS: dict[tuple, object] = {}
+
+
+def ragged_a2a_enabled() -> bool:
+    return envs.TPU_MOE_RAGGED_A2A
+
+
+def get_dp_tp_mesh():
+    """A (dp, tp) mesh over the torch.distributed world, partition = rank.
+
+    The exchange assumes vLLM's layout: global rank ``dp_rank * tp + tp_rank``
+    and EP rank equal to the global rank. Checked here, outside any trace.
+    """
+    global _MESH
+    if _MESH is not None:
+        return _MESH
+    import torch.distributed as dist
+    from torch_tpu._internal.pallas import get_pallas_mesh
+    from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_tp_group
+
+    from vllm_torchtpu.distributed.mesh_utils import get_pipeline_stage
+
+    dp, tp, ep = get_dp_group(), get_tp_group(), get_ep_group()
+    dp_size, tp_size = int(dp.world_size), int(tp.world_size)
+    rank, world = int(dist.get_rank()), int(dist.get_world_size())
+    _, stages = get_pipeline_stage()
+    dp_rank, tp_rank = int(dp.rank_in_group), int(tp.rank_in_group)
+    expected = {
+        "world": (world, dp_size * tp_size),
+        "pipeline stages": (stages, 1),
+        "rank": (rank, dp_rank * tp_size + tp_rank),
+        "dp group": (tuple(dp.ranks), tuple(range(tp_rank, world, tp_size))),
+        "tp group": (
+            tuple(tp.ranks),
+            tuple(range(dp_rank * tp_size, (dp_rank + 1) * tp_size)),
+        ),
+        "ep group": (tuple(ep.ranks), tuple(range(world))),
+    }
+    bad = {k: v for k, v in expected.items() if v[0] != v[1]}
+    if bad:
+        raise NotImplementedError(
+            f"TPU_MOE_RAGGED_A2A needs a rank-aligned DP x TP layout: {bad}"
+        )
+    _MESH = get_pallas_mesh(
+        axis_names=(DP_AXIS, TP_AXIS), mesh_shape=(dp_size, tp_size)
+    )
+    logger.info("Ragged A2A MoE mesh | dp=%d tp=%d", dp_size, tp_size)
+    return _MESH
+
+
+def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
+    key = (topk, activation, rhs_quant_dtype, skip_padded_tokens)
+    op = _OPS.get(key)
+    if op is not None:
+        return op
+    mesh = get_dp_tp_mesh()
+    run = functools.partial(
+        ragged_a2a_moe,
+        mesh=mesh,
+        topk=topk,
+        activation=activation,
+        use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+
+    # torch_tpu infers static argnums from annotations: every operand is jax.Array.
+    def fn(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array,
+    ) -> jax.Array:
+        return run(x, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, experts_start)
+
+    # One mesh axis per dimension: the operands carry two leading unit axes.
+    spec = PartitionSpec(DP_AXIS, TP_AXIS)
+    op = pallas.jax_op(
+        f"pallas::ragged_a2a_moe_{len(_OPS)}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,) * 8,
+        # A tuple of per-output specs: a bare PartitionSpec is not a tuple, so
+        # torch_tpu would read its first axis name as the whole spec.
+        output_partition_specs=(spec,),
+    )
+    # vLLM traces the token dimension as dynamic; the output matches x.
+    op.register_fake(lambda x, *args, **kwargs: torch.empty_like(x))
+    _OPS[key] = op
+    logger.info_once(
+        "Ragged A2A MoE armed | topk=%d activation=%s dp=%d tp=%d",
+        topk,
+        activation,
+        mesh.shape[DP_AXIS],
+        mesh.shape[TP_AXIS],
+    )
+    return op
+
+
+def prebuild_ragged_a2a_moe(*, topk, activation, rhs_quant_dtype=None) -> None:
+    """Build the mesh and op at weight load, outside the traced forward."""
+    _get_op(
+        topk=topk,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
+    )
+
+
+def ragged_a2a_fused_moe_gmm(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    experts_start: torch.Tensor,
+    topk: int,
+    activation: str,
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool | None = None,
+) -> torch.Tensor:
+    """Same contract as ``fused_moe_gmm`` with local tokens in and out; the
+    result still needs vLLM's TP all-reduce."""
+    if w1_bias is not None or w2_bias is not None:
+        raise NotImplementedError("TPU_MOE_RAGGED_A2A does not take expert biases")
+    if w1_scale is None or w2_scale is None or experts_start is None:
+        raise NotImplementedError("TPU_MOE_RAGGED_A2A needs scaled EP weights")
+    if skip_padded_tokens is None:
+        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
+    op = _get_op(
+        topk=topk,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    stacked = (
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids.to(torch.int32),
+        experts_start.reshape(1),
+    )
+    out = op(*(t.reshape(1, 1, *t.shape) for t in stacked))
+    return out.reshape(hidden_states.shape)

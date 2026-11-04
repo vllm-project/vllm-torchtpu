@@ -82,6 +82,11 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import resolve_online_fp8
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import map_online_fp8
+from vllm_torchtpu.layers.adapter.ragged_a2a_moe import (
+    prebuild_ragged_a2a_moe,
+    ragged_a2a_enabled,
+    ragged_a2a_fused_moe_gmm,
+)
 from vllm_torchtpu.layers.core.quant_methods import NVFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_tensor,
@@ -317,6 +322,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
 
         return (
             enable_pipelined_collective_and_compute()
+            or ragged_a2a_enabled()
             or fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
         )
@@ -524,6 +530,21 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 activation=activation_str,
                 use_ep=layer.moe_config.moe_parallel_config.use_ep,
             )
+        if ragged_a2a_enabled():
+            if op is not None or self._use_adaptive_fused_moe:
+                raise NotImplementedError(
+                    "TPU_MOE_RAGGED_A2A serves the grouped-matmul path only"
+                )
+            if enable_pipelined_collective_and_compute():
+                raise NotImplementedError(
+                    "TPU_MOE_RAGGED_A2A and TPU_MOE_COLLECTION_CHUNK_SIZE both own "
+                    "the EP exchange; set one"
+                )
+            if not layer.moe_config.moe_parallel_config.use_ep:
+                raise NotImplementedError("TPU_MOE_RAGGED_A2A needs expert parallelism")
+            prebuild_ragged_a2a_moe(
+                topk=layer.moe_config.experts_per_token, activation=activation_str
+            )
 
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = op
@@ -613,6 +634,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
+        if ragged_a2a_enabled():
+            return ragged_a2a_fused_moe_gmm(**kwargs)
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 

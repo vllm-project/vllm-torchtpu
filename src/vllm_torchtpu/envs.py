@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_RAGGED_A2A: bool = False
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -764,6 +765,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
         os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"
     ),
+    # Grouped-matmul MoE under DP + EP: exchange tokens with a ragged
+    # all-to-all inside each DP group (each token once to each member hosting
+    # one of its experts) instead of an all-gather and a reduce-scatter.
+    "TPU_MOE_RAGGED_A2A": env_bool("TPU_MOE_RAGGED_A2A"),
     # Override the PCP full-attention kernel page without changing KV manager pages.
     "PCP_FA_KERNEL_BLOCK_SIZE": env_positive_int_or_none("PCP_FA_KERNEL_BLOCK_SIZE"),
     # GDN stage/projection budget; token ownership still follows PCP interleave.

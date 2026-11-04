@@ -39,6 +39,8 @@ BLOCK_SIZE=${BLOCK_SIZE:-384}
 HOT_SET=${HOT_SET:-}
 EXPERT_BLOCK=${EXPERT_BLOCK:-}
 ATTN_BLOCK=${ATTN_BLOCK:-}
+MOE_A2A=${MOE_A2A:-0}
+A2A_SC_OFFLOAD=${A2A_SC_OFFLOAD:-}
 FUSED_DRAFT=${FUSED_DRAFT:-0}
 FAST_SUBST=${FAST_SUBST:-0}
 PACKED_DISPATCH=${PACKED_DISPATCH:-0}
@@ -65,6 +67,16 @@ case "$FUSED_COMBINE" in
   *) echo "FUSED_COMBINE must be 0 or 1" >&2; exit 2 ;;
 esac
 [[ -n "$EXPERT_BLOCK" ]] && export MOE_REQUANTIZE_BLOCK_SIZE="$EXPERT_BLOCK"
+case "$MOE_A2A" in
+  0) ;;
+  1) export TPU_MOE_RAGGED_A2A=1 ;;
+  *) echo "MOE_A2A must be 0 or 1" >&2; exit 2 ;;
+esac
+case "$A2A_SC_OFFLOAD" in
+  "") ;;
+  0) LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS --xla_tpu_enable_sparse_core_collective_offload_ragged_all_to_all=false"; export LIBTPU_INIT_ARGS ;;
+  *) echo "A2A_SC_OFFLOAD must be empty or 0" >&2; exit 2 ;;
+esac
 case "$ATTN_BLOCK" in
   "") ;;
   long) export TPU_BATCHED_RPA_DECODE_BLOCK=8192,4,2 ;;
@@ -104,7 +116,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \
