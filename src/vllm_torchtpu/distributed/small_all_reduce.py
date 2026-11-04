@@ -27,7 +27,8 @@ None (use the usual all-reduce) unless:
 
 - the flag is on and `arm()` has prepared this communicator's group: the
   group spans the whole torch.distributed world (TP = world; torch_tpu
-  meshes must span the world), with at least 2 ranks;
+  meshes must span the world) and has 2 to TPU_SMALL_ALL_REDUCE_MAX_RANKS
+  ranks (default 8: the size whose speed was measured);
 - the tensor is bf16 with a last dimension the kernel can split into n
   lane-aligned chunks (a multiple of n x 128), and, when its row count is a
   plain int, at most TPU_SMALL_ALL_REDUCE_MAX_BYTES bytes.
@@ -223,6 +224,24 @@ def _selftest(ctx: _Context, device) -> list[str]:
     return failures
 
 
+def group_refusal(tp_ranks: tuple[int, ...], world: int, max_ranks: int) -> str | None:
+    """Why the kernel must not arm for this TP group, or None.
+
+    The group must span the whole world (torch_tpu meshes span the world)
+    and have 2 to `max_ranks` ranks. The rank limit exists because speed was
+    measured only on one 8-device host; a larger group (for example TP16
+    over two hosts) keeps XLA's all-reduce unless the limit is raised.
+    """
+    n = len(tp_ranks)
+    if n < 2:
+        return "the TP group has one rank"
+    if tp_ranks != tuple(range(world)):
+        return f"TP ranks {tp_ranks} do not span the world of {world}"
+    if n > max_ranks:
+        return f"{n} ranks > TPU_SMALL_ALL_REDUCE_MAX_RANKS={max_ranks}"
+    return None
+
+
 def _build_context() -> _Context | str:
     """The mesh, rank operand and op for this rank, or a refusal reason."""
     got = _mesh_for_world()
@@ -248,11 +267,15 @@ def arm() -> bool:
     tp = parallel_state.get_tp_group()
     comm = getattr(tp, "device_communicator", None)
     world = int(dist.get_world_size())
-    reason = None
-    if comm is None or int(tp.world_size) < 2:
-        reason = "the TP group has one rank or no device communicator"
-    elif tuple(int(r) for r in tp.ranks) != tuple(range(world)):
-        reason = f"TP ranks {tuple(tp.ranks)} do not span the world of {world}"
+    reason = (
+        "the TP group has no device communicator"
+        if comm is None
+        else group_refusal(
+            tuple(int(r) for r in tp.ranks),
+            world,
+            int(envs.TPU_SMALL_ALL_REDUCE_MAX_RANKS),
+        )
+    )
     ctx = None
     if reason is None:
         # A failure while building the op turns the path off on every rank

@@ -179,6 +179,7 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_KERNEL: bool = True
     TPU_SMALL_ALL_REDUCE_MAX_BYTES: int = 589824
     TPU_SMALL_ALL_REDUCE_ALGO: str = "auto"
+    TPU_SMALL_ALL_REDUCE_MAX_RANKS: int = 8
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
@@ -1204,6 +1205,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SMALL_ALL_REDUCE_ALGO": env_with_choices(
         "TPU_SMALL_ALL_REDUCE_ALGO", "auto", ["auto", "flat2", "hier1", "hier2"]
     ),
+    # Largest TP group the kernel arms for. Its speed is measured only on one
+    # 8-device tpu7x host; larger groups (TP16 over two hosts) keep XLA's
+    # all-reduce until measured.
+    "TPU_SMALL_ALL_REDUCE_MAX_RANKS": env_int("TPU_SMALL_ALL_REDUCE_MAX_RANKS", 8),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),

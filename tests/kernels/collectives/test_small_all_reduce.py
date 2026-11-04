@@ -94,6 +94,17 @@ def test_eligibility():
     assert not bridge._eligible(8, 8, H, "hier1", one_mib)
 
 
+def test_group_refusal():
+    from vllm_torchtpu.distributed import small_all_reduce as bridge
+
+    eight = tuple(range(8))
+    assert bridge.group_refusal(eight, 8, 8) is None
+    assert bridge.group_refusal((0,), 1, 8) is not None  # one rank
+    assert bridge.group_refusal((0, 1, 2, 3), 8, 8) is not None  # not the world
+    assert bridge.group_refusal(tuple(range(16)), 16, 8) is not None  # over the limit
+    assert bridge.group_refusal(tuple(range(16)), 16, 16) is None
+
+
 def _worker() -> dict:
     """Runs in the subprocess on 8 CPU devices."""
     import jax
