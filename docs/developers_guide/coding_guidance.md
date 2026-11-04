@@ -341,12 +341,18 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
 
 ## 7. Diff discipline
 
-- **R-7.1** **Small, single-purpose PRs.** Kernel changes get their own PR.
-  Reviewers may refuse oversized diffs outright ("oversized" is reviewer
-  judgment, not a fixed line count); very large designs need an RFC/design
-  doc first. Stacked PRs cite their base explicitly.
-- **R-7.2** **Refactor first, feature second.** Land the enabling refactor or
-  cleanup as its own PR before the feature/optimization PR that needs it.
+- **R-7.1** **Small, single-purpose PRs** ([Small CLs](https://google.github.io/eng-practices/review/developer/small-cls.html)).
+  Aim for ≤ 300 changed lines (excluding baselines and lockfiles) doing one
+  self-contained thing. Kernel changes under `src/vllm_torchtpu/kernels/`
+  (plus their standalone kernel tests) get their own PR separate from
+  `layers/`, `runner/`, or `models/` wiring; shared runner/layer changes land
+  before model-specific bring-up. Reviewers may refuse oversized diffs
+  outright ("oversized" is reviewer judgment, not a fixed line count); very
+  large designs need an RFC/design doc first. Each PR in a stack must pass
+  tests on its own and cite its base PR explicitly.
+- **R-7.2** **Refactor first, feature second.** Land the enabling refactor,
+  helper move, or signature change as its own behavior-preserving PR before
+  the feature or optimization PR that needs it.
 - **R-7.3** **Do not include changes unrelated to the PR's purpose.** If a
   hunk is not needed for what the PR is about — reformatting of lines the
   change didn't touch, a rename done in passing, an unrelated typo fix —
@@ -460,6 +466,8 @@ Background material for the rules above.
   the entry points and registration hooks §2 and R-3.5 build on.
 - [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html):
   the style baseline for R-1.1.
+- [Small CLs](https://google.github.io/eng-practices/review/developer/small-cls.html):
+  how and why to split changes into small, single-purpose PRs (R-7.1, R-7.2).
 - [optimization_best_practices.md](optimization_best_practices.md): PR
   discipline (PR-x), performance (P-x), and quantization (Q-x) rules, and its
   own reference list for TPU hardware and kernel material.
