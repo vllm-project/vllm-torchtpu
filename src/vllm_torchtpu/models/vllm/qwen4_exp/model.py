@@ -255,19 +255,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             block = self.linear_attn(block)
         else:
-            fused_output = not isinstance(
-                residual, HcPackedMixState
-            ) and self.self_attn.can_prefetch_output(block)
+            fused_output = self.self_attn.can_prefetch_output(block)
             projection_args = {}
             if fused_output:
-                hyper_input, hyper_norm = residual
-                injection = torch.nn.functional.linear(
-                    hyper_norm, self.attn_hyper_connection.block_inject_weight.weight
-                )
-                injection = 2.0 * torch.sigmoid(
-                    injection.float() / self.attn_hyper_connection.hc_count
-                )
                 connection = self.attn_hyper_connection
+                hyper_input, injection = connection.project_injection(residual)
+                injection = 2.0 * torch.sigmoid(injection.float() / connection.hc_count)
                 projection_args = {
                     "residual": hyper_input,
                     "hc_gate": injection,

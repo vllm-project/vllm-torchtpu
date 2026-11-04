@@ -195,17 +195,25 @@ def assert_metrics(actual, expected, threshold=0.01):
     assert cos >= 0.999
 
 
-def test_mix_packed_outside_admitted_layout_returns_public_mix():
-    module, x, _ = owner_fixture()
+def test_mix_packed_outside_admitted_layout_preserves_public_math():
+    module, x, block = owner_fixture()
     packed_mixed, packed_residual = module.mix_packed(x)
     public_mixed, public_residual = module.mix(x)
     torch.testing.assert_close(packed_mixed, public_mixed, rtol=0, atol=0)
-    # The fallback keeps the public tuple carrier, not a packed state.
-    assert isinstance(packed_residual, tuple) and not isinstance(
-        packed_residual, HcPackedMixState
+    assert isinstance(packed_residual, HcPackedMixState)
+    torch.testing.assert_close(packed_residual.hyper_input, x, rtol=0, atol=0)
+    torch.testing.assert_close(
+        packed_residual.inject_logits,
+        F.linear(public_residual[1], module.block_inject_weight.weight),
+        rtol=0,
+        atol=0,
     )
-    for first, second in zip(packed_residual, public_residual, strict=True):
-        torch.testing.assert_close(first, second, rtol=0, atol=0)
+    torch.testing.assert_close(
+        module.combine(block, packed_residual),
+        module.combine(block, public_residual),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_mix_packed_broadcast_outside_admitted_layout_returns_public_mix():
@@ -213,7 +221,7 @@ def test_mix_packed_broadcast_outside_admitted_layout_returns_public_mix():
 
     Host tensors are outside the device-bound admission, so the entry must
     reproduce the public ``mix_packed`` result over the explicitly expanded
-    embedding exactly, with the public tuple carrier.
+    embedding exactly, including the injection logits.
     """
     module, x, _ = owner_fixture()
     embedding = x[:, : module.hidden_size]
@@ -222,11 +230,13 @@ def test_mix_packed_broadcast_outside_admitted_layout_returns_public_mix():
         embedding.repeat(1, module.hc_count)
     )
     torch.testing.assert_close(broadcast_mixed, public_mixed, rtol=0, atol=0)
-    assert isinstance(broadcast_residual, tuple) and not isinstance(
-        broadcast_residual, HcPackedMixState
+    assert isinstance(broadcast_residual, HcPackedMixState)
+    torch.testing.assert_close(
+        broadcast_residual.hyper_input, public_residual.hyper_input, rtol=0, atol=0
     )
-    for first, second in zip(broadcast_residual, public_residual, strict=True):
-        torch.testing.assert_close(first, second, rtol=0, atol=0)
+    torch.testing.assert_close(
+        broadcast_residual.inject_logits, public_residual.inject_logits, rtol=0, atol=0
+    )
 
 
 def test_broadcast_state_combine_expands_first_residual():
@@ -267,9 +277,11 @@ def test_combine_then_mix_fallback_with_broadcast_state_returns_unfused_sequence
     expected_mixed, expected_state = following.mix_packed(expected_combined)
     torch.testing.assert_close(combined, expected_combined, rtol=0, atol=0)
     torch.testing.assert_close(mixed, expected_mixed, rtol=0, atol=0)
-    assert isinstance(residual, tuple) and not isinstance(residual, HcPackedMixState)
-    for first, second in zip(residual, expected_state, strict=True):
-        torch.testing.assert_close(first, second, rtol=0, atol=0)
+    assert isinstance(residual, HcPackedMixState)
+    torch.testing.assert_close(residual.hyper_input, expected_combined, rtol=0, atol=0)
+    torch.testing.assert_close(
+        residual.inject_logits, expected_state.inject_logits, rtol=0, atol=0
+    )
 
 
 def test_packed_state_combine_keeps_original_gate_boundary():
@@ -322,9 +334,11 @@ def test_combine_then_mix_fallback_returns_unfused_sequence():
     expected_mixed, expected_state = following.mix_packed(expected_combined)
     torch.testing.assert_close(combined, expected_combined, rtol=0, atol=0)
     torch.testing.assert_close(mixed, expected_mixed, rtol=0, atol=0)
-    assert isinstance(state, tuple) and not isinstance(state, HcPackedMixState)
-    for first, second in zip(state, expected_state, strict=True):
-        torch.testing.assert_close(first, second, rtol=0, atol=0)
+    assert isinstance(state, HcPackedMixState)
+    torch.testing.assert_close(state.hyper_input, expected_combined, rtol=0, atol=0)
+    torch.testing.assert_close(
+        state.inject_logits, expected_state.inject_logits, rtol=0, atol=0
+    )
 
 
 def test_combine_then_mix_rejects_foreign_packed_state():
@@ -687,13 +701,15 @@ def test_hc_tpu_boundary_falls_back_below_admitted_tokens():
     following = following.to("tpu")
     x_tpu, block_tpu = x.to("tpu"), block.to("tpu")
     # 130 tokens are not a full tile, so the boundary entry point keeps the
-    # unfused public sequence with the tuple carrier.
+    # unfused public sequence, while keeping the packed state contract.
+    calls = record_fused_dispatch(following._prefill_boundary_ops)
     with torch.inference_mode():
         _, residual = prior.mix_packed(x_tpu)
         combined, mixed, state = combine_then_mix_packed(
             prior, following, block_tpu, residual
         )
-    assert isinstance(state, tuple) and not isinstance(state, HcPackedMixState)
+    assert isinstance(state, HcPackedMixState)
+    assert not calls
     with torch.inference_mode():
         expected_combined = prior.combine(block_tpu, residual)
         expected_mixed, _ = following.mix_packed(expected_combined)
@@ -749,13 +765,11 @@ def test_hc_tpu_packed_owner_roundtrip_keeps_fallback():
         _, state = module.mix_packed(x.to("tpu"))
         assert isinstance(state, HcPackedMixState)
     # Back on the host the owner is outside the device-bound admission; the
-    # single entry point returns the public tuple carrier with correct math.
+    # single entry point computes the packed state with public operations.
     module = module.to("cpu")
     with torch.inference_mode():
         mixed, residual = module.mix_packed(x)
-        assert isinstance(residual, tuple) and not isinstance(
-            residual, HcPackedMixState
-        )
+        assert isinstance(residual, HcPackedMixState)
     expected_mixed, _ = _reference_mix(module, x)
     assert_metrics(_np(mixed), _np(expected_mixed))
 
@@ -772,6 +786,40 @@ class _StandInBlock(nn.Module):
 
     def forward(self, x):
         return torch.sigmoid(F.linear(x, self.weight))
+
+
+@TPU
+def test_hc_decode_prefill_subgraph_parameter_order():
+    """Bucket handover requires the split graph's ordered inputs to agree."""
+    from torch.fx.passes.split_module import split_module
+
+    with torch.device("cpu"):
+        hc, x, _ = owner_fixture(tokens=128)
+        block = _StandInBlock(137, hc.hidden_size)
+    hc, block = hc.to("tpu"), block.to("tpu")
+    signatures = []
+
+    def backend(graph, _inputs):
+        partitioned = split_module(graph, graph, lambda _node: 0)
+        subgraph = partitioned.get_submodule("submod_0")
+        signatures.append(
+            [node.name for node in subgraph.graph.nodes if node.op == "placeholder"]
+        )
+        return graph.forward
+
+    def entry(hyper_input):
+        mixed, state = hc.mix_packed(hyper_input)
+        return hc.combine(block(mixed), state)
+
+    run = torch.compile(entry, backend=backend, fullgraph=True, dynamic=False)
+    with torch.inference_mode():
+        for tokens in (16, 128):
+            value = x[:tokens].to("tpu")
+            actual = run(value)
+            expected = entry(value)
+            np.testing.assert_array_equal(_words(actual), _words(expected))
+    assert len(signatures) == 2
+    assert signatures[0] == signatures[1]
 
 
 @pytest.mark.parametrize("state_kind", ["tuple", "packed", "broadcast"])
@@ -842,7 +890,7 @@ def test_indexed_decoder_combines_attention_once_for_each_mix_state(state_kind):
         attention_mix=attention_mix,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert layer.self_attn.projected == [state_kind == "tuple"]
+    assert layer.self_attn.projected == [True]
 
 
 @TPU

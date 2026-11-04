@@ -406,9 +406,11 @@ class GatedResidual(common_hc.GatedResidual):
         The normalized hyper input stays resident in the kernel: the injection
         logits are computed from it and returned in an ``HcPackedMixState``
         instead of materializing the full-width norm tensor. ``combine``
-        accepts that state directly. Outside the admitted prefill layout this
-        returns exactly the public ``mix`` result, so callers can use one
-        entry point for every distribution.
+        accepts that state directly. Outside the admitted prefill layout,
+        compute the same logits with the public linear. Both paths read the
+        injection weight before the block, keeping split-graph input order
+        consistent across decode and prefill. Mix-only owners retain the
+        public ``mix`` result.
         """
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if not self.use_mix:
@@ -422,7 +424,12 @@ class GatedResidual(common_hc.GatedResidual):
                 self.block_inject_weight.weight,
             )
             return mixed, HcPackedMixState(hyper_input, logits, self._hc_owner_id)
-        return self.mix(hyper_input)
+        mixed, residuals = self.mix(hyper_input)
+        if not self.use_combine:
+            return mixed, residuals
+        _, norm = residuals
+        logits = F.linear(norm, self.block_inject_weight.weight)
+        return mixed, HcPackedMixState(hyper_input, logits, self._hc_owner_id)
 
     def _use_broadcast_mix(self, embedding):
         # The broadcast kernel reads one [tokens, hidden] tile where the
@@ -500,7 +507,10 @@ class GatedResidual(common_hc.GatedResidual):
             )
         )
 
-    def combine(self, block_output, residuals):
+    def project_injection(
+        self, residuals: HcPackedMixState | tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the expanded residual and this owner's injection logits."""
         if not self.use_combine:
             raise RuntimeError("combine was disabled for this hyper-connection")
         if isinstance(residuals, HcPackedMixState):
@@ -521,19 +531,19 @@ class GatedResidual(common_hc.GatedResidual):
                 # here so the combine runs over the genuine expanded words the
                 # unfused caller would have passed.
                 hyper_input = hyper_input.repeat(1, self.hc_count)
-            # The logits already carry this owner's injection weight with the
-            # BF16 projection boundary; only the FP32 gate remains.
-            injection = 2.0 * torch.sigmoid(
-                residuals.inject_logits.float() / self.hc_count
-            )
+            logits = residuals.inject_logits
         else:
             hyper_input, gate_operand = residuals
-            injection = F.linear(gate_operand, self.block_inject_weight.weight)
-            injection = 2.0 * torch.sigmoid(injection.float() / self.hc_count)
+            logits = F.linear(gate_operand, self.block_inject_weight.weight)
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
+        return hyper_input, logits
+
+    def combine(self, block_output, residuals):
+        hyper_input, logits = self.project_injection(residuals)
+        injection = 2.0 * torch.sigmoid(logits.float() / self.hc_count)
         assert block_output.shape[-1] == self.hidden_size
 
-        if self._use_prefill_combine(block_output, hyper_input, gate_operand):
+        if self._use_prefill_combine(block_output, hyper_input, logits):
             assert self._prefill_combine_op is not None
             return self._prefill_combine_op(hyper_input, block_output, injection)
         # Keep each HC branch in the projection-native flat layout. The
@@ -620,8 +630,7 @@ def combine_then_mix_packed(prior, following, block_output, residuals):
         residuals: The prior owner's ``mix_packed`` result.
 
     Returns:
-        (combined, mixed, packed state of ``following``); the tuple carrier
-        appears unchanged in the fallback.
+        (combined, mixed, packed state of ``following``).
     """
     if (
         isinstance(residuals, HcPackedMixState)
