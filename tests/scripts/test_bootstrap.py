@@ -275,32 +275,43 @@ class TestBootstrapUnits(unittest.TestCase):
         ):
             self.assertEqual(bp.choose_suite(ctx(default_env)), "default")
 
-        # 2. Every suite in SUITES maps to existing .buildkite/pipeline_<lane>.yml.
+        # 2. Every suite in SUITES maps to existing .buildkite/pipeline_<lane>.yml,
+        # and every dependency names a lane inside its own suite with no cycles.
         self.assertEqual(
             bp.SUITES,
             {
-                "default": ("build", "cpu", "tests", "integration", "verify"),
-                "full": ("build", "cpu", "tests", "integration", "perf", "verify"),
-                "perf": ("build", "perf"),
-                "cpu-only": ("build", "cpu"),
-                "integration": (
-                    "build",
-                    "cpu",
-                    "tests",
-                    "integration",
-                    "perf",
-                    "verify",
-                    "promote",
-                ),
-            },
-        )
-        self.assertEqual(
-            bp.DEPENDS_ON,
-            {
-                "tests": ("cpu",),
-                "integration": ("cpu",),
-                "perf": ("cpu",),
-                "verify": ("cpu",),
+                "default": {
+                    "build": [],
+                    "cpu": [],
+                    "tests": ["cpu"],
+                    "integration": ["cpu"],
+                    "verify": ["cpu"],
+                },
+                "full": {
+                    "build": [],
+                    "cpu": [],
+                    "tests": ["cpu"],
+                    "integration": ["cpu"],
+                    "perf": ["cpu"],
+                    "verify": ["cpu"],
+                },
+                "perf": {
+                    "build": [],
+                    "perf": [],
+                },
+                "cpu-only": {
+                    "build": [],
+                    "cpu": [],
+                },
+                "integration": {
+                    "build": [],
+                    "cpu": [],
+                    "tests": ["cpu"],
+                    "integration": ["cpu"],
+                    "perf": ["cpu"],
+                    "verify": ["cpu"],
+                    "promote": [],
+                },
             },
         )
         self.assertEqual(
@@ -314,21 +325,27 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertEqual(bp.phases(bp.SUITES["perf"]), (("build", "perf"),))
         self.assertEqual(bp.phases(bp.SUITES["cpu-only"]), (("build", "cpu"),))
         self.assertEqual(
-            bp.phases(bp.SUITES["default"], gated=False), (bp.SUITES["default"],)
+            bp.phases(bp.SUITES["default"], gated=False),
+            (tuple(bp.SUITES["default"]),),
         )
-        self.assertEqual(bp.phases(()), ())
+        self.assertEqual(bp.phases({}), ())
+        with self.assertRaisesRegex(
+            bp.BootstrapError,
+            r"lane 'perf' depends on 'cpu', which is not in the suite",
+        ):
+            bp.phases({"build": [], "perf": ["cpu"]})
         with self.assertRaisesRegex(
             bp.BootstrapError, r"dependency cycle in lanes: cpu tests"
         ):
-            bp.phases(
-                ("build", "cpu", "tests"),
-                depends_on={"cpu": ("tests",), "tests": ("cpu",)},
-            )
-        for lanes in bp.SUITES.values():
-            for lane in lanes:
+            bp.phases({"build": [], "cpu": ["tests"], "tests": ["cpu"]})
+        for suite_lanes in bp.SUITES.values():
+            bp.phases(suite_lanes)
+            for lane, deps in suite_lanes.items():
                 self.assertTrue(
                     (_REPO_ROOT / f".buildkite/pipeline_{lane}.yml").is_file()
                 )
+                for dep in deps:
+                    self.assertIn(dep, suite_lanes)
 
     def test_github_labels_resilience(self) -> None:
         bp = self.bp
@@ -796,13 +813,15 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertIn("tpu-pr/alice@example.com", pr_phase2.uploads[2][1])
 
-        # 3-level DEPENDS_ON (cpu -> tests -> verify) chains phases 0 -> 1 -> 2.
-        three_level_deps = {
-            "tests": ("cpu",),
-            "integration": ("cpu",),
-            "verify": ("tests",),
+        # 3-level suite dict (cpu -> tests -> verify) chains phases 0 -> 1 -> 2.
+        three_level_suite = {
+            "build": [],
+            "cpu": [],
+            "tests": ["cpu"],
+            "integration": ["cpu"],
+            "verify": ["tests"],
         }
-        with mock.patch.object(bp, "DEPENDS_ON", three_level_deps):
+        with mock.patch.dict(bp.SUITES, {"default": three_level_suite}):
             chain_p0 = run({"BUILDKITE_PULL_REQUEST": "42"})
             self.assertEqual(
                 [u[0] for u in chain_p0.uploads],

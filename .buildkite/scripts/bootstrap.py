@@ -47,31 +47,44 @@ _GITHUB_API_URL = "https://api.github.com"
 PR_TPU_JOBS_PER_AUTHOR = 40
 
 # Each lane is .buildkite/pipeline_<lane>.yml.
-# Lane -> lanes it depends on. On gated builds a lane is uploaded only after every
-# lane it depends on has passed; other builds upload all lanes at once.
-# A lane that others depend on wraps its steps in one top-level group with key: <lane>.
-DEPENDS_ON: dict[str, tuple[str, ...]] = {
-    "tests": ("cpu",),
-    "integration": ("cpu",),
-    "perf": ("cpu",),
-    "verify": ("cpu",),
-}
-
-# Lane sets a build can run, each in run order.
-SUITES: dict[str, tuple[str, ...]] = {
-    "default": ("build", "cpu", "tests", "integration", "verify"),
-    "full": ("build", "cpu", "tests", "integration", "perf", "verify"),
-    "perf": ("build", "perf"),
-    "cpu-only": ("build", "cpu"),
-    "integration": (
-        "build",
-        "cpu",
-        "tests",
-        "integration",
-        "perf",
-        "verify",
-        "promote",
-    ),
+# A suite maps each lane it runs to the lanes it depends on, in run order.
+# On gated builds a lane is uploaded only after the lanes it depends on have
+# passed; other builds upload every lane at once. A lane that others depend on
+# wraps its steps in one top-level group with key: <lane>.
+SUITES: dict[str, dict[str, list[str]]] = {
+    "default": {
+        "build": [],
+        "cpu": [],
+        "tests": ["cpu"],
+        "integration": ["cpu"],
+        "verify": ["cpu"],
+    },
+    "full": {
+        "build": [],
+        "cpu": [],
+        "tests": ["cpu"],
+        "integration": ["cpu"],
+        "perf": ["cpu"],
+        "verify": ["cpu"],
+    },
+    "perf": {
+        "build": [],
+        "perf": [],
+    },
+    "cpu-only": {
+        "build": [],
+        "cpu": [],
+    },
+    "integration": {  # ungated pipeline: everything uploads at once
+        "build": [],
+        "cpu": [],
+        "tests": ["cpu"],
+        "integration": ["cpu"],
+        "perf": ["cpu"],
+        "verify": ["cpu"],
+        # pipeline_promote.yml's own `wait` holds it until the tests finish
+        "promote": [],
+    },
 }
 
 
@@ -145,7 +158,7 @@ _MISSING_VLLM_PIN_ERROR = (
 
 
 def is_gated(ctx: BuildContext) -> bool:
-    """True when lanes in `DEPENDS_ON` wait until their dependencies pass."""
+    """True when a suite's lanes wait until their dependencies in `SUITES` pass."""
     return (
         ctx.source != "schedule"
         and not ctx.is_integration
@@ -155,28 +168,28 @@ def is_gated(ctx: BuildContext) -> bool:
 
 
 def phases(
-    lanes: Sequence[str],
+    suite_lanes: Mapping[str, Sequence[str]],
     *,
     gated: bool = True,
-    depends_on: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[tuple[str, ...], ...]:
-    """Layer `lanes` topologically by `DEPENDS_ON` (single phase when ungated)."""
-    if not lanes:
+    """Layer `suite_lanes` topologically (single phase when ungated)."""
+    if not suite_lanes:
         return ()
+    for lane, deps in suite_lanes.items():
+        for dep in deps:
+            if dep not in suite_lanes:
+                raise BootstrapError(
+                    f"ERROR: lane '{lane}' depends on '{dep}', "
+                    "which is not in the suite"
+                )
     if not gated:
-        return (tuple(lanes),)
-    deps_map = DEPENDS_ON if depends_on is None else depends_on
-    in_suite = set(lanes)
-    deps = {
-        lane: tuple(d for d in deps_map.get(lane, ()) if d in in_suite)
-        for lane in lanes
-    }
+        return (tuple(suite_lanes),)
     placed: set[str] = set()
-    remaining = list(lanes)
+    remaining = list(suite_lanes)
     result: list[tuple[str, ...]] = []
     while remaining:
         layer = tuple(
-            lane for lane in remaining if all(d in placed for d in deps[lane])
+            lane for lane in remaining if all(d in placed for d in suite_lanes[lane])
         )
         if not layer:
             raise BootstrapError(
@@ -579,14 +592,8 @@ def upload_phase(
     next_idx = phase_idx + 1
     if next_idx < len(all_phases):
         next_lanes = all_phases[next_idx]
-        in_suite = set(suite_lanes)
         deps = tuple(
-            dict.fromkeys(
-                dep
-                for lane in next_lanes
-                for dep in DEPENDS_ON.get(lane, ())
-                if dep in in_suite
-            )
+            dict.fromkeys(dep for lane in next_lanes for dep in suite_lanes[lane])
         )
         step_env = {
             k: child_env[k]
