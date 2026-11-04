@@ -134,3 +134,86 @@ def test_validate_libtpu_version_still_rejects_old_package(monkeypatch):
 
     with pytest.raises(RuntimeError, match="libtpu < 0.0.35"):
         tpu_runner._validate_libtpu_version()
+
+
+def test_get_node_worker_id_prefers_tpu_worker_id_then_lws_worker_index(monkeypatch):
+    monkeypatch.setattr(
+        tpu_info,
+        "get_tpu_metadata",
+        lambda key="": pytest.fail("GCE metadata should not be queried"),
+    )
+    monkeypatch.setenv("TPU_WORKER_ID", "2")
+    monkeypatch.setenv("LWS_WORKER_INDEX", "1")
+    assert tpu_info.get_node_worker_id() == 2
+
+    monkeypatch.delenv("TPU_WORKER_ID", raising=False)
+    assert tpu_info.get_node_worker_id() == 1
+
+
+def test_get_node_worker_id_falls_back_to_gce_metadata_and_zero(monkeypatch):
+    monkeypatch.delenv("TPU_WORKER_ID", raising=False)
+    monkeypatch.delenv("LWS_WORKER_INDEX", raising=False)
+    monkeypatch.setattr(tpu_info, "get_tpu_metadata", lambda key="": "3")
+    assert tpu_info.get_node_worker_id() == 3
+
+    monkeypatch.setattr(tpu_info, "get_tpu_metadata", lambda key="": None)
+    assert tpu_info.get_node_worker_id() == 0
+
+
+def test_get_num_chips_filters_non_tpu_vfio_and_caps_at_max_per_host(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(tpu_info.glob, "glob", lambda pattern: [])
+    # Simulate 10 Google TPU VFIO groups (0..9) and 6 non-TPU VFIO groups (10..15).
+    monkeypatch.setattr(
+        tpu_info.os,
+        "listdir",
+        lambda path: [str(i) for i in range(16)] + ["vfio"]
+        if path == "/dev/vfio"
+        else ["0000:00:04.0"],
+    )
+    monkeypatch.setattr(
+        tpu_info.os.path,
+        "exists",
+        lambda path: path == "/sys/kernel/iommu_groups",
+    )
+
+    def _fake_open(path, *args, **kwargs):
+        import io
+
+        group = int(path.split("/sys/kernel/iommu_groups/")[1].split("/")[0])
+        vendor = "0x1ae0\n" if group < 10 else "0x15b3\n"
+        return io.StringIO(vendor)
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert tpu_info.get_num_chips() == 8
+
+    # When only 4 VFIO groups are Google TPUs, return 4.
+    def _fake_open_4(path, *args, **kwargs):
+        import io
+
+        group = int(path.split("/sys/kernel/iommu_groups/")[1].split("/")[0])
+        vendor = "0x1ae0\n" if group < 4 else "0x10de\n"
+        return io.StringIO(vendor)
+
+    monkeypatch.setattr("builtins.open", _fake_open_4)
+    assert tpu_info.get_num_chips() == 4
+
+
+def test_sanitize_lws_multihost_tpu_env(monkeypatch):
+    from vllm_torchtpu import env_override
+
+    for key in env_override._LWS_SINGLE_HOST_DEVICE_PLUGIN_ENV_VARS:
+        monkeypatch.setenv(key, "stale-value")
+    monkeypatch.delenv("TPU_WORKER_ID", raising=False)
+    monkeypatch.setenv("LWS_WORKER_INDEX", "1")
+    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
+    monkeypatch.setenv(
+        "LWS_LEADER_ADDRESS", "ubench-lws-0.ubench-lws.default.svc.cluster.local"
+    )
+
+    env_override._sanitize_lws_multihost_tpu_env()
+
+    assert tpu_info.os.environ.get("TPU_WORKER_ID") == "1"
+    for key in env_override._LWS_SINGLE_HOST_DEVICE_PLUGIN_ENV_VARS:
+        assert key not in tpu_info.os.environ

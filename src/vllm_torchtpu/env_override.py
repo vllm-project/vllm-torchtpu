@@ -21,6 +21,44 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+_LWS_SINGLE_HOST_DEVICE_PLUGIN_ENV_VARS = (
+    "TPU_VISIBLE_CHIPS",
+    "TPU_VISIBLE_DEVICE_PATHS",
+    "CLOUD_TPU_TASK_ID",
+    "TPU_CHIPS_PER_HOST_BOUNDS",
+    "TPU_HOST_BOUNDS",
+)
+
+
+def _sanitize_lws_multihost_tpu_env() -> None:
+    """Clear single-host K8s TPU device-plugin env vars under multi-host LWS.
+
+    In a multi-host LeaderWorkerSet (LWS) where each pod requests
+    ``google.com/tpu: 4`` independently (e.g. on bare-metal TPU clusters), the
+    node's K8s TPU device plugin injects single-host bounds and device
+    visibility variables (such as ``TPU_HOST_BOUNDS=1,1,1``,
+    ``CLOUD_TPU_TASK_ID=0``, and ``TPU_VISIBLE_DEVICE_PATHS``) into each
+    container. Ray and TorchTPU's distributed slicebuilder manage per-rank
+    device binding and full-slice topology directly via ``LOCAL_RANK`` and
+    ``TORCH_TPU_*``, so leaving the single-host device-plugin variables set
+    causes VFIO device collisions or slice topology mismatches across hosts.
+    """
+    lws_worker_index = os.getenv("LWS_WORKER_INDEX")
+    if lws_worker_index is not None:
+        os.environ.setdefault("TPU_WORKER_ID", lws_worker_index)
+
+    try:
+        lws_group_size = int(os.getenv("LWS_GROUP_SIZE", "1"))
+    except ValueError:
+        lws_group_size = 1
+
+    if lws_group_size > 1 or os.getenv("LWS_LEADER_ADDRESS"):
+        for key in _LWS_SINGLE_HOST_DEVICE_PLUGIN_ENV_VARS:
+            os.environ.pop(key, None)
+
+
+_sanitize_lws_multihost_tpu_env()
+
 # Configure TorchTPU compilation cache environment variables directly
 if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
     # Enable Tier-2 cache in memory (required by Tier-3)
