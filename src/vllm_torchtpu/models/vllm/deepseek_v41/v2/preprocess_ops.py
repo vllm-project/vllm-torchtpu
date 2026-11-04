@@ -17,6 +17,7 @@ import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.attention_preprocessing import (
     compress_rope as compress_kernel,
 )
@@ -127,7 +128,13 @@ def _qb(
 ) -> jax.Array:
     if not qr.shape[0]:
         return jnp.zeros((0, weight.shape[1] // _HEAD_DIM, _HEAD_DIM), jnp.bfloat16)
-    return qb_kernel.fused_qb_rope(qr, weight, weight_scale, rope_rows)
+    return qb_kernel.fused_qb_rope(
+        qr,
+        weight,
+        weight_scale,
+        rope_rows,
+        exact_rows=envs.TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS,
+    )
 
 
 def _qb_fake(qr, weight, weight_scale, rope_rows):

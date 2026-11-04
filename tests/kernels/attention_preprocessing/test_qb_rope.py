@@ -150,3 +150,46 @@ def test_invalid_small_grid_fails_at_trace_time(heads, head_dim):
     call = functools.partial(qb_rope.fused_qb_rope, head_dim=head_dim)
     with pytest.raises((ValueError, StopIteration)):
         jax.eval_shape(call, qr, weight, scales, rows)
+
+
+@pytest.mark.parametrize("tokens", [240, 136])
+def test_exact_rows_skips_the_padded_slice(tokens):
+    qr, weight, scale, rows = (
+        jax.ShapeDtypeStruct((tokens, 1280), jnp.bfloat16),
+        jax.ShapeDtypeStruct((1280, 32768), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((32768,), jnp.float32),
+        jax.ShapeDtypeStruct((tokens, 64), jnp.float32),
+    )
+    exact = functools.partial(qb_rope.fused_qb_rope, exact_rows=True)
+    padded = str(jax.make_jaxpr(qb_rope.fused_qb_rope)(qr, weight, scale, rows))
+    graph = str(jax.make_jaxpr(exact)(qr, weight, scale, rows))
+    out_slice = f"limit_indices=({tokens}, 64, 512)"
+    assert out_slice in padded and out_slice not in graph
+    assert jax.eval_shape(exact, qr, weight, scale, rows).shape == (tokens, 64, 512)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "token_block"),
+    [(240, None), (240, 32), (136, None), (100, None), (288, None), (2048, None)],
+)
+def test_exact_rows_is_bitwise_the_sliced_result(tokens, token_block):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Requires a TPU backend")
+    positions = (np.arange(tokens) * 37) % 4096
+    qr, weight, scale, rows = _inputs(tokens, 64, positions)
+    config = None
+    if token_block is not None:  # several tiles; the last one is ragged
+        config = qb_rope.QBRopeConfig(
+            token_block=token_block,
+            head_block=8,
+            output_slots=2,
+            quant_fragment=32,
+            post_fragment=16,
+        )
+    run = functools.partial(qb_rope.fused_qb_rope, config=config)
+    sliced = jax.jit(run)(qr, weight, scale, rows)
+    exact = jax.jit(functools.partial(run, exact_rows=True))(qr, weight, scale, rows)
+    assert exact.shape == sliced.shape == (tokens, 64, 512)
+    np.testing.assert_array_equal(
+        np.asarray(exact).view(np.uint16), np.asarray(sliced).view(np.uint16)
+    )

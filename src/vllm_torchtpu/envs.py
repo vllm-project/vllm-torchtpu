@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = False
     TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = False
+    TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_ONEHOT_TABLE_LOOKUP: bool = False
@@ -428,6 +429,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output stays in VMEM). Same arithmetic as the two kernels (bit-exact).
     "TPU_DEEPSEEK_V41_FUSED_WO_AB": env_bool(
         "TPU_DEEPSEEK_V41_FUSED_WO_AB", default=False
+    ),
+    # Fused Q-B/RoPE at token counts that are not a multiple of 32 (the DSpark
+    # drafter's 240 rows): write only the real rows instead of slicing a padded
+    # [256, 64, 512] result. Same values (bit-exact).
+    "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS": env_bool(
+        "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS", default=False
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
