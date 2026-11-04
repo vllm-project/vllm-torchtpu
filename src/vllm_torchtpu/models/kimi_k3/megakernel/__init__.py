@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Kimi-K3 Megakernel runtime plugin entry point."""
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/kimi_k3/__init__.py
-"""Isolated Kimi-K3 megakernel package."""
+from __future__ import annotations
+
+from .spec import SPEC
+
+__all__ = ["SPEC"]
