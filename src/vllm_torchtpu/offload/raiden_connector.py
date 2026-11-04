@@ -105,6 +105,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.core.eagle_block_drop import offload_config_without_eagle_groups
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -263,6 +264,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(spec, vllm_config, kv_cache_config)
+        if tpu_envs.VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP:
+            self.config = offload_config_without_eagle_groups(self.config)
+            logger.info(
+                "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP: tier lookups keep "
+                "their last hit chunk (EAGLE/MTP drop disabled)."
+            )
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}

@@ -27,6 +27,13 @@ For a multi-turn replay with a 1152-token scheduler block, this gives up to
 one extra block of prefix hit per turn, which means ~1152 fewer prefill
 tokens. Enable it with ``VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP=1``. Check real
 (non-synthetic) MTP acceptance when A/B testing.
+
+vLLM's KV offloading connector drops the same trailing chunk again, on every
+lookup in its host tier: with EAGLE/MTP it marks every KV cache group as a
+draft group (``SchedulerOffloadConfig.from_spec``) and each lookup gives up
+the last hit chunk. ``offload_config_without_eagle_groups`` clears those
+marks, so a tier hit is loaded whole, as the HBM prefix cache serves it.
+Enable it with ``VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP=1``.
 """
 
 from functools import wraps
@@ -110,3 +117,18 @@ def patch_disable_eagle_block_drop() -> None:
     Scheduler.__init__ = __init__
     Scheduler._mamba_block_aligned_split = split
     logger.info("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: patch installed.")
+
+
+def offload_config_without_eagle_groups(config):
+    """An offloading scheduler config in which no group drops its last hit chunk.
+
+    ``is_eagle_group`` is read by lookups (the last hit chunk), by request
+    stores while decoding (the trailing chunk) and by the sliding-window store
+    filter (one more reachable chunk). Chunk sizes, windows and keys stay as
+    built.
+    """
+    return config._replace(
+        kv_group_configs=tuple(
+            group._replace(is_eagle_group=False) for group in config.kv_group_configs
+        )
+    )

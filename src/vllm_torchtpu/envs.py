@@ -285,6 +285,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
+    VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -2113,6 +2114,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
         "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
+    ),
+    # KV offloading: keep the trailing chunk of a tier hit that EAGLE/MTP
+    # normally drops on every lookup. Host-only.
+    "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP": env_bool(
+        "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP", default=False
     ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
