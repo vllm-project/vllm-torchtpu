@@ -286,6 +286,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP: bool = False
+    VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -2119,6 +2120,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # normally drops on every lookup. Host-only.
     "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP": env_bool(
         "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP", default=False
+    ),
+    # Lazy KV offloading: also store a partly filled cached HBM block under
+    # the hash of its valid tokens, and load it as a request's partial tail.
+    # Needs VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP. Host-only.
+    "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS": env_bool(
+        "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS", default=False
     ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
