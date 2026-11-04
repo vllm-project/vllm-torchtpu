@@ -317,6 +317,45 @@ def test_single_query_or_padding_drains_pipeline(valid_tokens):
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
 
 
+@pytest.mark.parametrize("tiles", [1, 2, 3, 4, 5, 7, 8, 9])
+def test_shared_tile_loop_preserves_buffer_wraparound(tiles):
+    """Exercise startup, both buffer rings, and every final input-buffer slot."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("Async MXU operations require TPU")
+    args, kwargs = _decode_inputs(1, 8, 64)
+    q, words, scales, swa, _, positions, sink, rope = args
+    tokens = tiles * 2
+    indices = jnp.arange(tokens) % q.shape[0]
+    args = (
+        q[indices],
+        words[indices],
+        scales[indices],
+        swa,
+        jnp.array([0, 0, tokens], jnp.int32),
+        positions[0] + jnp.arange(tokens),
+        sink,
+        rope[indices],
+    )
+    metadata = jnp.repeat(kwargs["swa_metadata"], 2, axis=0)
+    lengths = kwargs["main_lengths"][indices]
+    expected = prefill_reference(*args, swa_metadata=metadata, main_lengths=lengths)
+
+    def run():
+        return csa2(
+            *args,
+            swa_metadata=metadata,
+            main_lengths=lengths,
+            bq=2,
+            round_scales=False,
+        )
+
+    actual = run()
+    np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+    # A staged RHS left unconsumed at return can corrupt the next invocation.
+    for _ in range(3):
+        np.testing.assert_array_equal(run(), actual)
+
+
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("valid_tokens", [0, 1])
 def test_single_tile_attention_traces_through_final_drain(valid_tokens):

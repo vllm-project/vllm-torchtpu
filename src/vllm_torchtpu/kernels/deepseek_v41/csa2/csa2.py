@@ -149,7 +149,7 @@ def _csa2_kernel(
     scale: float,
     non_causal: bool,
 ) -> None:
-    """Persistent attention with four input buffers and two output buffers."""
+    """Persistent attention with one steady tile body and rotating buffers."""
     tokens, heads, _ = q_hbm.shape
     bq = q_buf.shape[1]
     batch = pages_ref.shape[0]
@@ -157,6 +157,7 @@ def _csa2_kernel(
     cache_page_size = swa_hbm[0].shape[1]
     page_size = swa_buf.shape[-2]
     num_pages = 256 // page_size
+    resident_metadata = scales_buf is None
     # These layouts have one tile per fixed query block, including padding.
     count = (
         tokens // bq if bq == 1 or (batch == 1 and tokens % bq == 0) else count_ref[0]
@@ -174,27 +175,21 @@ def _csa2_kernel(
     )
 
     def rows(tile):
-        tile = jnp.clip(tile, 0, count - 1)
         start = jnp.minimum(tiles_ref[tile, 1], tokens - bq)
         return pl.ds(start, bq)
 
     def input_copies(tile, bank):
+        sources = ((q_hbm, q_buf), (kv_hbm, kv_buf))
+        if not resident_metadata:
+            sources += ((scales_hbm, scales_buf), (rope_hbm, rope_buf))
         return tuple(
             pltpu.make_async_copy(
                 source.at[rows(tile)], target.at[bank], input_sems.at[bank, i]
             )
-            for i, (source, target) in enumerate(
-                (
-                    (q_hbm, q_buf),
-                    (kv_hbm, kv_buf),
-                    (scales_hbm, scales_buf),
-                    (rope_hbm, rope_buf),
-                )
-            )
+            for i, (source, target) in enumerate(sources)
         )
 
     def swa_copies(tile, bank):
-        tile = jnp.clip(tile, 0, count - 1)
         request = jnp.minimum(tiles_ref[tile, 0], batch - 1)
         _, left, right, anchor = swa_window(
             tile,
@@ -244,13 +239,11 @@ def _csa2_kernel(
             copy.start()
 
     def output_copy(tile, bank):
-        tile = jnp.clip(tile, 0, count - 1)
         return pltpu.make_async_copy(
             outputs.at[bank], out_hbm.at[pl.ds(tile * bq, bq)], output_sems.at[bank]
         )
 
     def prepare(tile, bank, work_bank):
-        tile = jnp.clip(tile, 0, count - 1)
         _prepare_swa(
             tile,
             tiles_ref,
@@ -269,7 +262,9 @@ def _csa2_kernel(
     def finish(tile, bank):
         """Drain pending PV, apply inverse RoPE, and mask padded rows."""
         target = outputs.at[bank]
-        rotations = rope_saved.at[bank]
+        rotations = (
+            rope_hbm.at[rows(tile)] if resident_metadata else rope_saved.at[bank]
+        )
         start = tiles_ref[tile, 1]
         row_offset = start - jnp.minimum(start, tokens - bq)
         for i in range(bq):
@@ -303,11 +298,13 @@ def _csa2_kernel(
     def compute(tile, bank, sb, *, steady=False):
         """Finish the preceding tile while leaving this tile's PV live."""
         first_tile = isinstance(tile, int) and tile == 0
-        rope_saved[bank] = rope_buf[sb]
-        tile = jnp.clip(tile, 0, count - 1)
+        if not resident_metadata:
+            rope_saved[bank] = rope_buf[sb]
         q_ref = q_buf.at[sb]
         main_cache_ref = kv_buf.at[sb]
-        main_scale_ref = scales_buf.at[sb]
+        main_scale_ref = (
+            scales_hbm.at[rows(tile)] if resident_metadata else scales_buf.at[sb]
+        )
         main_kv_ref = decoded
         swa_ref = swa_work.at[bank]
         swa_score_ref = swa_scores
@@ -334,12 +331,14 @@ def _csa2_kernel(
 
         def prepare_next():
             if steady:
-                prepare(tile + 1, (sb + 1) % 4, 1 - bank)
+                # Select the next resident input slot for the pipelined body.
+                next_tile = jnp.minimum(tile + 1, count - 1)
+                prepare(next_tile, next_tile & 3, 1 - bank)
             else:
 
                 @pl.when(tile + 1 < count)
                 def _():
-                    prepare(tile + 1, (sb + 1) % 4, 1 - bank)
+                    prepare(tile + 1, (sb + 1) & 3, 1 - bank)
 
         def preload_next(mxu):
             def push():
@@ -506,7 +505,7 @@ def _csa2_kernel(
         prepare_next()
         main_unpack(indices)
         if not first_tile:
-            finish(jnp.clip(tile - 1, 0, count - 1), 1 - bank)
+            finish(tile - 1, 1 - bank)
         swa_qk_pop(0, bq)
         main_qk_compute(indices)
         for r, i in enumerate(indices):
@@ -519,70 +518,69 @@ def _csa2_kernel(
         if not first_tile:
             output_copy(tile - 1, 1 - bank).start()
 
-    def step(tile, bank, sb, *, steady=False):
+    for i in range(4):
+
+        @pl.when(i < count)
+        def _(*, i=i):
+            start(i, i)
+
+    for copy in (*input_copies(0, 0), *swa_copies(0, 0)):
+        copy.wait()
+    prepare(0, 0, 0)
+
+    # compute(0) prepares and stages tile 1 before the next iteration.
+    @pl.when(count > 1)
+    def _():
+        for copy in swa_copies(1, 1):
+            copy.wait()
+
+    compute(0, 0, 0)
+
+    @pl.when(count > 4)
+    def _():
+        start(4, 0)
+
+    def step(tile, *, steady, last=False):
+        sb = tile & 3
+        bank = tile & 1
         for copy in input_copies(tile, sb):
             copy.wait()
-        if isinstance(tile, int) and tile == 0:
-            for copy in swa_copies(tile, sb):
-                copy.wait()
-            prepare(tile, sb, bank)
 
         def wait_next():
-            for copy in swa_copies(tile + 1, (sb + 1) % 4):
+            for copy in swa_copies(tile + 1, (sb + 1) & 3):
                 copy.wait()
 
         if steady:
             wait_next()
         else:
+            pl.when(tile + 1 < count)(wait_next)
 
-            @pl.when(tile + 1 < count)
-            def _():
-                wait_next()
-
-        if not isinstance(tile, int) or tile >= 3:
+        @pl.when(tile >= 3)
+        def _():
             output_copy(tile - 3, 1 - bank).wait()
-        compute(tile, bank, sb, steady=steady)
+
+        compute(tile, bank, sb, steady=not last)
+
         if steady:
             start(tile + 4, sb)
         else:
+            pl.when(tile + 4 < count)(lambda: start(tile + 4, sb))
 
-            @pl.when(tile + 4 < count)
-            def _():
-                start(tile + 4, sb)
-
-    for i in range(4):
-
-        @pl.when(i < count)
-        def _():
-            start(i, i)
-
-    for i in range(4):
-
-        @pl.when(i < count)
-        def _():
-            step(i, i % 2, i)
-
-    groups = (
-        max((count - 8) // 4, 0)
-        if isinstance(count, int)
-        else jnp.maximum((count - 8) // 4, 0)
+    # Retain one tile body per loop; the drain loop handles the prefetched tail.
+    end = max(count - 4, 1) if isinstance(count, int) else jnp.maximum(count - 4, 1)
+    lax.fori_loop(1, end, lambda tile, _: step(tile, steady=True), None, unroll=False)
+    lax.fori_loop(
+        end,
+        jnp.maximum(count - 1, end),
+        lambda tile, _: step(tile, steady=False),
+        None,
+        unroll=False,
     )
 
-    def body(group, unused):
-        for j in range(4):
-            step(4 + group * 4 + j, j % 2, j, steady=True)
-        return None
-
-    lax.fori_loop(0, groups, body, None)
-
-    # A four-tile steady iteration leaves at most seven drain tiles.
-    # Keep their buffer slots static while PV remains live across steps.
-    for j in range(7):
-        tile = 4 + groups * 4 + j
-
-        @pl.when(tile < count)
-        def _():
-            step(tile, j % 2, j % 4)
+    # Every staged RHS must be consumed before the kernel returns.
+    @pl.when(count > 1)
+    def _():
+        step(count - 1, steady=False, last=True)
 
     @pl.when(count >= 3)
     def _():
@@ -728,6 +726,10 @@ def csa2(
             num_tiles = tokens
     bounds = swa_bounds if non_causal else jnp.zeros((batch, 2), jnp.int32)
     scalars = (tiles, positions, main_lengths, swa_metadata, bounds)
+    # Reserve three quarters of VMEM for the attention buffers and temporaries.
+    metadata_bytes = main_kv_scale.nbytes + rope_cache.nbytes
+    resident_metadata = metadata_bytes <= pltpu.get_tpu_info().vmem_capacity_bytes // 4
+    metadata_space = pltpu.VMEM if resident_metadata else pltpu.HBM
     page_size = min(cache_page_size, 64)
     num_pages = 256 // page_size
 
@@ -740,18 +742,18 @@ def csa2(
             in_specs=(
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=metadata_space),
                 tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in banks),
                 pl.BlockSpec(memory_space=pltpu.VMEM),
-                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=metadata_space),
             ),
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=(
                 pltpu.VMEM((4, bq, heads, 512), jnp.bfloat16),
                 pltpu.VMEM((4, bq, 512, 128), jnp.int32),
-                pltpu.VMEM((4, bq, 1, 512), jnp.float32),
-                pltpu.VMEM((4, bq, 2, 128), jnp.float32),
-                pltpu.VMEM((2, bq, 2, 128), jnp.float32),
+                None if resident_metadata else pltpu.VMEM((4, bq, 1, 512), jnp.float32),
+                None if resident_metadata else pltpu.VMEM((4, bq, 2, 128), jnp.float32),
+                None if resident_metadata else pltpu.VMEM((2, bq, 2, 128), jnp.float32),
                 pltpu.VMEM(
                     (4, num_pages * len(banks), 1, page_size, 512), jnp.bfloat16
                 ),
@@ -761,7 +763,7 @@ def csa2(
                 pltpu.VMEM((bq, heads, 256), jnp.float32),
                 pltpu.VMEM((bq, heads, 512), jnp.bfloat16),
                 pltpu.VMEM((bq, heads, 256), jnp.bfloat16),
-                pltpu.SemaphoreType.DMA((4, 4)),
+                pltpu.SemaphoreType.DMA((4, 2 if resident_metadata else 4)),
                 pltpu.SemaphoreType.DMA((4, num_pages * len(banks))),
                 pltpu.SemaphoreType.DMA((2,)),
             ),
