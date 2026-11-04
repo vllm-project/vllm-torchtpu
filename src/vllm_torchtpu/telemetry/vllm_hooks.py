@@ -16,6 +16,7 @@ CATEGORIES: tuple[str, ...] = (
     "affinity_honored_eviction",
     "routing_loss",
     "prefix_mutation_loss",
+    "unreused_reply_loss",
     "new_input",
 )
 
@@ -35,6 +36,7 @@ SPAN_ATTRIBUTE_KEYS: tuple[str, ...] = (
     "gen_ai.usage.input_tokens.affinity_honored_eviction",
     "gen_ai.usage.input_tokens.routing_loss",
     "gen_ai.usage.input_tokens.prefix_mutation_loss",
+    "gen_ai.usage.input_tokens.unreused_reply_loss",
     "gen_ai.usage.input_tokens.new_input",
     "gen_ai.usage.mutation_offset_token_idx",
     "vllm.kv_cache.time_since_eviction_ms",
