@@ -162,9 +162,10 @@ def _build_push_moe_kernel(
     visit's tiles are committed. Same bytes to the same places; what changes
     is that the remote pushes no longer hold a VMEM staging slot, so when the
     fabric is the busy resource the tile loop runs ahead of it instead of
-    waiting at the slot-reuse guard. A staged build also pushes each visit's
-    runs at the end of the NEXT visit, so the commits it waits for there have
-    had a whole visit to land.
+    waiting at the slot-reuse guard. A staged build commits each tile with
+    one copy into a contribution slab shaped like the expert slab, and
+    pushes each visit's runs at the end of the NEXT visit, so the commits it
+    waits for there have had a whole visit to land.
 
     `staging_slots=N` (N > OUT_PARITIES; 0 = the default two) gives a build
     that ships tiles straight from VMEM N staging slots instead of two, so
@@ -984,6 +985,23 @@ def _build_push_moe_kernel(
             def commit_tile(parity, t, tile_block_base, live_blocks):
                 """Commit the tile's intersection with each (expert, dest) run."""
                 assert commit_sems is not None and commit_scl_sems is not None
+                if hbm_staging:
+                    # A staged build lays the contribution slab out like the
+                    # expert slab, so the whole tile commits as one copy to
+                    # its own slab rows and push_expert reads each run there.
+                    pltpu.make_async_copy(
+                        out_vm.at[parity, pl.ds(0, live_blocks * ROWBLK)],
+                        contrib_hbm.at[
+                            pl.ds(slab_base + t * tile_m, live_blocks * ROWBLK)
+                        ],
+                        commit_sems.at[parity],
+                    ).start()
+                    pltpu.make_async_copy(
+                        oscl_vm.at[parity],
+                        cscl_hbm.at[pl.ds(_mirror_base(e) + t, 1)],
+                        commit_scl_sems.at[parity],
+                    ).start()
+                    return
                 # The runs tile the expert slab contiguously, so the
                 # per-dest lengths sum to exactly live_blocks. Rows go per
                 # run; the scales go once, below, because a tile's are one
@@ -1444,7 +1462,13 @@ def _build_push_moe_kernel(
             # on its own length: a zero-length REMOTE DMA must never issue.
             for d in range(ep):
                 region_blocks = commit_len_sm[e, d]
-                src_block = contrib_off_sm[e, d]
+                # A staged build's contribution slab is shaped like the expert
+                # slab (see commit_tile); otherwise it is packed per dest.
+                src_row = (
+                    expert_base_sm[e] + commit_start_sm[e, d] * ROWBLK
+                    if hbm_staging
+                    else contrib_off_sm[e, d] * ROWBLK
+                )
                 dst_block = push_dst_sm[e, d]
                 is_me = jnp.int32(d) == me
 
@@ -1456,9 +1480,7 @@ def _build_push_moe_kernel(
                     def push_run():
                         """The rows themselves, at their true length."""
                         pltpu.make_async_remote_copy(
-                            src_ref=contrib_hbm.at[
-                                pl.ds(src_block * ROWBLK, true_rows)
-                            ],
+                            src_ref=contrib_hbm.at[pl.ds(src_row, true_rows)],
                             dst_ref=recv_hbm.at[
                                 pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
                             ],
@@ -1487,9 +1509,7 @@ def _build_push_moe_kernel(
                 @pl.when(_and_nonempty(is_me, region_blocks))
                 def _():
                     pltpu.make_async_copy(
-                        contrib_hbm.at[
-                            pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)
-                        ],
+                        contrib_hbm.at[pl.ds(src_row, region_blocks * ROWBLK)],
                         recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
                         mehop_sem,
                     ).start()
