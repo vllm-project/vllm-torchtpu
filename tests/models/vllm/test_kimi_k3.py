@@ -31,15 +31,21 @@ from vllm.model_executor.models.interfaces import supports_pp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.kimi_k3.common.mm_preprocess import navit_resize_image
 from vllm.platforms import current_platform
+from vllm.renderers.chat_utils import get_tool_call_id_type
+from vllm.transformers_utils.config import _CONFIG_REGISTRY, _register_config_class
+from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
 import vllm_torchtpu.models.vllm.kimi_k3.model as kimi_model
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
+from vllm_torchtpu import envs
 from vllm_torchtpu.compilation.shape_variants import trace_shape_env, unsupported_reason
 from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op as kimi_custom_ops
+from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32, quantize_tensor
+from vllm_torchtpu.models.vllm import _TPUKimiK31Config, register_models
 from vllm_torchtpu.models.vllm.kimi_k3 import (
     KimiDeltaAttention,
     KimiK3ForConditionalGeneration,
@@ -47,6 +53,7 @@ from vllm_torchtpu.models.vllm.kimi_k3 import (
     KimiModel,
     MultiHeadLatentAttention,
 )
+from vllm_torchtpu.models.vllm.kimi_k3 import indexer as kimi_indexer
 from vllm_torchtpu.models.vllm.kimi_k3.layers import AttentionResidual, SituAndMul
 
 
@@ -78,12 +85,17 @@ def test_kimi_architectures_are_registered() -> None:
     architectures = {
         "KimiLinearForCausalLM": KimiLinearForCausalLM,
         "KimiK3ForConditionalGeneration": KimiK3ForConditionalGeneration,
+        "KimiK31ForConditionalGeneration": KimiK3ForConditionalGeneration,
     }
     previous = {
         architecture: ModelRegistry.models.get(architecture)
         for architecture in architectures
     }
-    previous_config = MODELS_CONFIG_MAP.get("KimiK3ForConditionalGeneration")
+    previous_configs = {
+        architecture: MODELS_CONFIG_MAP.get(architecture)
+        for architecture in architectures
+    }
+    previous_config_class = _CONFIG_REGISTRY.get("kimi_k31")
     try:
         register_layers()
         for architecture, expected in architectures.items():
@@ -114,10 +126,15 @@ def test_kimi_architectures_are_registered() -> None:
             )
         )
     finally:
-        if previous_config is None:
-            MODELS_CONFIG_MAP.pop("KimiK3ForConditionalGeneration", None)
+        for architecture, previous_config in previous_configs.items():
+            if previous_config is None:
+                MODELS_CONFIG_MAP.pop(architecture, None)
+            else:
+                MODELS_CONFIG_MAP[architecture] = previous_config
+        if previous_config_class is None:
+            _CONFIG_REGISTRY.pop("kimi_k31", None)
         else:
-            MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = previous_config
+            _CONFIG_REGISTRY["kimi_k31"] = previous_config_class
         for architecture, registered in previous.items():
             if registered is None:
                 ModelRegistry.models.pop(architecture, None)
@@ -225,6 +242,15 @@ def test_checkpoint_name_mapping_is_conditional_for_mla() -> None:
     )
     assert name == "model.layers.1.self_attn.fused_qkv_a_proj.weight"
     assert weight.shard_id == 0
+
+    for checkpoint_name, shard_id in (
+        ("language_model.layers.3.self_attn.indexer.wk.weight", 0),
+        ("language_model.layers.3.self_attn.indexer.weights_proj.weight", 1),
+    ):
+        weight = torch.empty(1)
+        [(name, weight)] = list(fused_mapper.apply([(checkpoint_name, weight)]))
+        assert name == "model.layers.3.self_attn.indexer.wk_weights_proj.weight"
+        assert weight.shard_id == shard_id
 
 
 @pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
@@ -2633,3 +2659,187 @@ def test_kimi_k3_encoder_cudagraph_capture_rejects_budget_past_rope_table() -> N
         KimiK3ForConditionalGeneration.prepare_encoder_cudagraph_capture_inputs(
             stub, 1000, 1, 1, torch.device("cpu"), torch.float32
         )
+
+
+_K31_DSA_CONFIG = {
+    "index_topk": 4,
+    "index_num_heads": 2,
+    "index_head_dim": 128,
+    "index_rope_dim": 0,
+    "index_k_norm_type": "layernorm",
+    "index_topk_freq": 1,
+    "dsa_layers": [2, 4],
+}
+
+
+def _k31_config(**dsa_overrides) -> KimiLinearConfig:
+    return KimiLinearConfig(
+        hidden_size=64,
+        num_hidden_layers=4,
+        q_lora_rank=32,
+        rms_norm_eps=1e-5,
+        linear_attn_config={"kda_layers": [1, 3], "full_attn_layers": [2, 4]},
+        dsa_config={**_K31_DSA_CONFIG, **dsa_overrides},
+    )
+
+
+def test_kimi_dsa_config_parses_one_based_mla_layers() -> None:
+    assert kimi_indexer.kimi_dsa_config(_mla_config()) is None
+    assert kimi_indexer.kimi_dsa_config(_k31_config()) == kimi_indexer.KimiDSAConfig(
+        index_topk=4, index_n_heads=2, index_head_dim=128
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"index_rope_dim": 64},
+        {"index_k_norm_type": "rmsnorm"},
+        {"index_topk_freq": 2},
+        {"index_head_dim": 64},
+        {"dsa_layers": [1, 2]},
+        {"dsa_layers": [2]},
+        {"dsa_layers": [2, 4, 6]},
+    ],
+)
+def test_kimi_dsa_config_rejects_unsupported_layouts(overrides) -> None:
+    with pytest.raises(NotImplementedError):
+        kimi_indexer.kimi_dsa_config(_k31_config(**overrides))
+
+
+def test_kimi_k31_config_class_parses_like_k3_and_leaves_it_alone() -> None:
+    register_models()
+    config_class = _CONFIG_REGISTRY["kimi_k31"]
+    _register_config_class("kimi_k31", config_class)
+    assert KimiK3Config.model_type == "kimi_k3"
+    assert isinstance(config_class(text_config={}).text_config, KimiLinearConfig)
+
+
+@pytest.mark.parametrize(
+    ("tokenizer_mode", "expected"), [("auto", "kimi_k3"), ("hf", "hf")]
+)
+def test_kimi_k31_serves_through_k3_chat_path(tokenizer_mode, expected) -> None:
+    model_config = SimpleNamespace(
+        tokenizer_mode=tokenizer_mode,
+        hf_config=SimpleNamespace(model_type="kimi_k31"),
+        hf_text_config=SimpleNamespace(model_type="kimi_linear"),
+    )
+    _TPUKimiK31Config.verify_and_update_model_config(model_config)
+    assert model_config.tokenizer_mode == expected
+    assert get_tool_call_id_type(model_config) == "kimi_k2"
+
+
+def _k31_vllm_config(
+    speculative_config=None, cache_dtype="fp8", dtype=torch.bfloat16, kv_lora_rank=512
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        speculative_config=speculative_config,
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        model_config=SimpleNamespace(
+            dtype=dtype,
+            hf_text_config=SimpleNamespace(
+                kv_lora_rank=kv_lora_rank, qk_rope_head_dim=64
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"speculative_config": object()}, "speculative"),
+        ({"cache_dtype": "auto"}, "fp8_e4m3"),
+        ({"cache_dtype": "fp8_e5m2"}, "fp8_e4m3"),
+        ({"cache_dtype": "fp8_ds_mla"}, "fp8_e4m3"),
+        ({"dtype": torch.float32}, "bfloat16"),
+        ({"kv_lora_rank": 256}, "kv_lora_rank=512"),
+    ],
+)
+def test_kimi_k31_config_rejects_unsupported_serving(overrides, message) -> None:
+    _TPUKimiK31Config.verify_and_update_config(_k31_vllm_config())
+    with pytest.raises(NotImplementedError, match=message):
+        _TPUKimiK31Config.verify_and_update_config(_k31_vllm_config(**overrides))
+
+
+def test_kimi_k31_config_rejects_sp_prefill(monkeypatch) -> None:
+    monkeypatch.setattr(envs, "TPU_K3_SP_PREFILL", True)
+    with pytest.raises(NotImplementedError, match="TPU_K3_SP_PREFILL"):
+        _TPUKimiK31Config.verify_and_update_config(_k31_vllm_config())
+
+
+class _RecordingIndexerOp(nn.Module):
+    def __init__(self, *args) -> None:
+        super().__init__()
+        self.calls: list[tuple[torch.Tensor, ...]] = []
+
+    def forward(self, hidden_states, q_fp8, k, weights):
+        self.calls.append((q_fp8, k, weights))
+        return hidden_states.new_zeros(hidden_states.shape[0], 4, dtype=torch.int32)
+
+
+def test_kimi_k31_indexer_matches_reference_math(monkeypatch, request) -> None:
+    monkeypatch.setattr(kimi_indexer, "VllmTPUSparseAttnIndexer", _RecordingIndexerOp)
+    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    request.getfixturevalue("dist_ctx")
+    config = _k31_config()
+    dsa = kimi_indexer.kimi_dsa_config(config)
+    assert dsa is not None
+    buffer = torch.full((8, dsa.index_topk), -1, dtype=torch.int32)
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        vllm_config.model_config = SimpleNamespace(max_model_len=32)
+        vllm_config.attention_config.sparse_mla_prefill_workspace_factor = 1
+        default_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            indexer = kimi_indexer.KimiDSAIndexer(
+                vllm_config, config, dsa, buffer, "model.layers.1.self_attn.indexer"
+            )
+        finally:
+            torch.set_default_dtype(default_dtype)
+    torch.manual_seed(5)
+    for parameter in indexer.parameters():
+        nn.init.normal_(parameter, std=0.1)
+    for layer in (indexer.wq_b, indexer.wk_weights_proj):
+        layer._cpu_skip_gemm_dispatch = True
+        layer.quant_method.process_weights_after_loading(layer)
+    hidden = torch.randn(5, config.hidden_size, dtype=torch.bfloat16)
+    q_c = torch.randn(5, config.q_lora_rank, dtype=torch.bfloat16)
+    indexer(hidden, q_c, torch.arange(5))
+    [(q_fp8, k, weights)] = indexer.indexer_op.calls
+
+    q = nn.functional.linear(q_c, indexer.wq_b.weight).view(5, 2, 128).float()
+    wk, weights_proj = indexer.wk_weights_proj.weight.split([128, 2])
+    expected_k = nn.functional.layer_norm(
+        nn.functional.linear(hidden, wk).float(),
+        (128,),
+        indexer.k_norm.weight,
+        indexer.k_norm.bias,
+        config.rms_norm_eps,
+    )
+    amax = q.abs().amax(-1, keepdim=True).clamp_min(1e-10)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    expected_q = (q / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    expected_weights = (
+        nn.functional.linear(hidden, weights_proj).float()
+        * scale.squeeze(-1)
+        * (128**-0.5 * 2**-0.5)
+    )
+    torch.testing.assert_close(q_fp8.view(torch.uint8), expected_q.view(torch.uint8))
+    torch.testing.assert_close(k.float(), expected_k, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(weights, expected_weights, atol=0, rtol=0)
+
+    # The power-of-two query scale folded into the weights leaves the scores
+    # of the unscaled query intact.
+    k_fp8, k_scale = quantize_tensor(k, torch.float8_e4m3fn, use_ue8m0=True)
+    keys = k_fp8.float() * e8m0_to_fp32(k_scale)
+    scores = (
+        torch.einsum("thd,sd->ths", q_fp8.float(), keys).relu() * weights[..., None]
+    ).sum(1)
+    reference = (
+        torch.einsum("thd,sd->ths", q, keys).relu()
+        * nn.functional.linear(hidden, weights_proj).float()[..., None]
+    ).sum(1) * (128**-0.5 * 2**-0.5)
+    torch.testing.assert_close(scores, reference, atol=0.05, rtol=0.1)

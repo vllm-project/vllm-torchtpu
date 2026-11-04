@@ -75,11 +75,13 @@ from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
 from .collective_ops import TokenShardCollectives
+from .indexer import KimiDSAConfig, kimi_dsa_config
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
@@ -93,6 +95,8 @@ class KimiDecoderLayer(nn.Module):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str,
+        dsa: KimiDSAConfig | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
@@ -107,6 +111,8 @@ class KimiDecoderLayer(nn.Module):
                 config,
                 vllm_config,
                 prefix=f"{prefix}.self_attn",
+                dsa=dsa,
+                topk_indices_buffer=topk_indices_buffer,
             )
 
         is_moe = (
@@ -233,6 +239,21 @@ class KimiModel(nn.Module):
                 raise ValueError("K3 SP prefill requires TP32/EP32 and PP1/DP1")
             self.sp_group = TokenShardCollectives(get_tp_group())
 
+        dsa = kimi_dsa_config(config)
+        self.topk_indices_buffer = None
+        if dsa is not None:
+            if unified_kv_layout_enabled_for_architecture(
+                vllm_config.model_config.architecture
+            ):
+                raise ValueError(
+                    "Kimi DSA layers have no unified KV pool layout; set "
+                    "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0"
+                )
+            self.topk_indices_buffer = torch.full(
+                (vllm_config.scheduler_config.max_num_batched_tokens, dsa.index_topk),
+                -1,
+                dtype=torch.int32,
+            )
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -245,6 +266,8 @@ class KimiModel(nn.Module):
                     config,
                     vllm_config,
                     prefix=f"{prefix}.layers.{layer_idx}",
+                    dsa=dsa,
+                    topk_indices_buffer=self.topk_indices_buffer,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -343,6 +366,8 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         orig_to_new_stacked={
             ".q_a_proj.": (".fused_qkv_a_proj.", 0),
             ".kv_a_proj_with_mqa.": (".fused_qkv_a_proj.", 1),
+            ".indexer.wk.": (".indexer.wk_weights_proj.", 0),
+            ".indexer.weights_proj.": (".indexer.wk_weights_proj.", 1),
         },
     )
     fused_attention_params_mapping = (
