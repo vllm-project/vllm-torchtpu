@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_MOE_ROUTER_TOPK_BIAS: bool = False
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
@@ -838,6 +839,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
+    # With the rowmax router and a score-correction bias, add the bias inside
+    # the top-k kernel and return the unbiased scores at the chosen ids, so the
+    # separate scores.gather goes away. Ids and weights are bit-identical.
+    "TPU_MOE_ROUTER_TOPK_BIAS": env_bool("TPU_MOE_ROUTER_TOPK_BIAS"),
     # Keep FusedMoE top-k routing weights in float32 precision instead of casting
     # to the activation dtype (e.g. bfloat16) in fused_moe_gmm. Improves numerical
     # parity with training frameworks (e.g. MaxText) in RL and distillation workloads.

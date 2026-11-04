@@ -494,6 +494,7 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_ITER_MODE",
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
+        "TPU_MOE_ROUTER_TOPK_BIAS",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",

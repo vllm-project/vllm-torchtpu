@@ -24,7 +24,7 @@ import pytest
 import torch
 from jax import lax
 
-from vllm_torchtpu.kernels.router_topk import MAX_BLOCK_ROWS, select
+from vllm_torchtpu.kernels.router_topk import MAX_BLOCK_ROWS, select, select_bias
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 EXPERTS = 512
@@ -164,3 +164,58 @@ def test_kernel_ties_and_nan_match_the_reference():
 def test_grid_rounds_up_over_the_tuned_block(rows, grid):
     block = min(MAX_BLOCK_ROWS, rows)
     assert -(-rows // block) == grid
+
+
+GLM_EXPERTS = 256
+GLM_TOPK = 8
+
+
+def _gather_reference(scores, bias, k):
+    """The flag-off router: ids from rowmax_topk(scores + bias), then a gather."""
+    s = torch.from_numpy(scores)
+    _, ids = rowmax_topk(s + torch.from_numpy(bias).view(1, -1), k)
+    return s.gather(-1, ids.long()).numpy(), ids.numpy()
+
+
+def _bias_case(rows, n, seed):
+    rng = np.random.default_rng(seed)
+    logits = rng.standard_normal((rows, n), dtype=np.float32) * 2.0
+    scores = (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+    bias = (rng.standard_normal(n, dtype=np.float32) * 0.1).astype(np.float32)
+    return scores, bias
+
+
+@pytest.mark.parametrize(
+    "rows,n,k",
+    [
+        (16, GLM_EXPERTS, GLM_TOPK),
+        (17, GLM_EXPERTS, GLM_TOPK),
+        (4096, GLM_EXPERTS, GLM_TOPK),
+        (1040, EXPERTS, TOPK),
+    ],
+)
+def test_select_bias_matches_gather_path(rows, n, k):
+    scores, bias = _bias_case(rows, n, rows + n)
+    kw, ki = select_bias(jnp.asarray(scores), jnp.asarray(bias), k, interpret=True)
+    rw, ri = _gather_reference(scores, bias, k)
+    np.testing.assert_array_equal(np.asarray(ki), ri)
+    np.testing.assert_array_equal(np.asarray(kw), rw)
+
+
+def test_select_bias_ties_match_gather_path():
+    """Ties in the biased score break to the lowest id; weights unbiased."""
+    n, k = GLM_EXPERTS, GLM_TOPK
+    scores = np.zeros((5, n), dtype=np.float32)
+    bias = np.zeros(n, dtype=np.float32)
+    scores[0] = 0.5  # all tied
+    scores[1, 10:30] = 0.75  # tie across the top-k boundary
+    # Biased ties whose unbiased scores differ.
+    scores[2, :] = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    bias[:] = -scores[2]
+    scores[3] = np.nan  # poisoned row
+    scores[4, :4] = np.nan
+    scores[4, 100:110] = np.linspace(1.0, 0.1, 10)
+    kw, ki = select_bias(jnp.asarray(scores), jnp.asarray(bias), k, interpret=True)
+    rw, ri = _gather_reference(scores, bias, k)
+    np.testing.assert_array_equal(np.asarray(ki), ri)
+    np.testing.assert_array_equal(np.asarray(kw), rw)  # NaN == NaN here

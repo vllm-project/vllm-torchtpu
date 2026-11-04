@@ -17,7 +17,10 @@ import torch
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
+from vllm_torchtpu.layers.adapter.router_topk import (
+    rowmax_select,
+    rowmax_select_bias,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -25,6 +28,7 @@ logger = init_logger(__name__)
 # Resolved once, at import, so the compiled forward never reads the
 # environment.
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
+_ROUTER_TOPK_BIAS = envs.TPU_MOE_ROUTER_TOPK_BIAS
 
 
 def _get_topk_weights_dtype(default_dtype: torch.dtype) -> torch.dtype:
@@ -321,9 +325,14 @@ def select_experts(
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]
         bias = e_score_correction_bias.float().view(bias_shape)
-        scores_for_choice = scores + bias
-        _, topk_ids = _topk(scores_for_choice, topk)
-        topk_weights = scores.gather(-1, topk_ids.long())
+        if _ROUTER_TOPK == "rowmax" and _ROUTER_TOPK_BIAS and scores.dim() == 2:
+            # Bias added inside the kernel, unbiased scores returned at the
+            # chosen ids: same ids and weights, no scores.gather.
+            topk_weights, topk_ids = rowmax_select_bias(scores, bias, topk)
+        else:
+            scores_for_choice = scores + bias
+            _, topk_ids = _topk(scores_for_choice, topk)
+            topk_weights = scores.gather(-1, topk_ids.long())
     else:
         topk_weights, topk_ids = _topk(scores, topk)
 

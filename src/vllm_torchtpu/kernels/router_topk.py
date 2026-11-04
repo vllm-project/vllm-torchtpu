@@ -17,6 +17,10 @@
 slice, so at 512 experts it runs a 45-stage bitonic network over three arrays
 to keep 10 values. This kernel selects the same 10 with ``k`` max-and-mask
 passes over one VMEM-resident block: ``O(k*N)`` instead of ``O(N*log^2 N)``.
+
+``select_bias`` selects on ``scores + bias`` (the score-correction bias) and
+returns the unbiased scores at the chosen ids, so the router needs no
+separate gather.
 """
 
 import functools
@@ -98,3 +102,64 @@ def select(
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """``select`` with a jax_op-compatible signature (arrays, then statics)."""
     return select(scores, topk)
+
+
+def _select_bias_kernel(s_ref, b_ref, w_ref, i_ref, *, topk: int, n: int):
+    """``_select_kernel`` on ``scores + bias``, returning the unbiased scores.
+
+    The ids are exactly those ``_select_kernel`` picks from the f32 sum
+    ``scores + bias`` (same clamp, same lowest-id tie rule). The weights are
+    ``scores`` read at those ids -- what ``scores.gather(-1, ids)`` returns --
+    so the caller needs no gather. The one-hot that masks the chosen column
+    also selects its unbiased score: a max over one live lane is exact.
+    No NaN poisoning: the gather it replaces does not poison either.
+    """
+    s = s_ref[...]
+    x = s + b_ref[...]
+    x = jnp.where(x > NEG, x, NEG)
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    for j in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
+        sel = iota == idx[:, None]
+        w_ref[:, j] = jnp.max(jnp.where(sel, s, -jnp.inf), axis=1)
+        i_ref[:, j] = idx.astype(jnp.int32)
+        x = jnp.where(sel, masked, x)
+
+
+def select_bias(
+    scores: jax.Array, bias: jax.Array, topk: int, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """Top-k ids of ``scores + bias``; weights are ``scores`` at those ids.
+
+    ``scores`` is ``[rows, experts]`` f32, ``bias`` is ``[1, experts]`` f32
+    (the routing score-correction bias). Returns ``(weights f32, indices
+    int32)`` of shape ``[rows, topk]``, ordered by descending biased score.
+    """
+    rows, n = scores.shape
+    block = min(MAX_BLOCK_ROWS, rows)
+    return pl.pallas_call(
+        functools.partial(_select_bias_kernel, topk=topk, n=n),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[
+            pl.BlockSpec((block, n), lambda i: (i, 0)),
+            pl.BlockSpec((1, n), lambda i: (0, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, topk), jnp.float32),
+            jax.ShapeDtypeStruct((rows, topk), jnp.int32),
+        ],
+        interpret=interpret,
+    )(scores, bias.reshape(1, n))
+
+
+def router_topk_bias(
+    scores: jax.Array, bias: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array]:
+    """``select_bias`` with a jax_op-compatible signature."""
+    return select_bias(scores, bias, topk)
