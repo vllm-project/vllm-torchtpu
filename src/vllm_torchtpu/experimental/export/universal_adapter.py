@@ -1233,6 +1233,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         from vllm_torchtpu.kv_cache_spec_normalizer import (
             normalize_kv_cache_specs_for_tpu,
         )
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
         from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
         named_layers = self._named_attention_layers()
@@ -1273,7 +1274,10 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             specs = normalize_kv_cache_specs_for_tpu(
                 specs,
                 tpu_lowering.torch_dtype(per_layer[0][0].dtype),
-                attention_backend=TpuPlatform._find_non_ssm_backend(self._vllm_config),
+                attention_backend=cast(
+                    "type[PallasAttentionBackend] | None",
+                    TpuPlatform._find_non_ssm_backend(self._vllm_config),
+                ),
             )
             groups = get_kv_cache_groups(self._vllm_config, specs)
         if len(groups) <= 1:
