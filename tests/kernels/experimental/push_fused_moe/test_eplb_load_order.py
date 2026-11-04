@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """CPU contract for push EPLB load accumulation after mesh relabeling."""
 
 import ast

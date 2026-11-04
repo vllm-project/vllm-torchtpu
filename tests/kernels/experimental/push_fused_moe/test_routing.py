@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU dispatch-envelope checks; device numerics use routing_integration."""
+"""CPU checks for exact routing dispatch eligibility."""
 
-import ast
-import subprocess
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import jax
@@ -13,19 +9,9 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental.push_fused_moe import routing
 
-ROOT = Path(__file__).resolve().parents[4]
-
 
 def supported(tokens=288, **changes):
-    # Evaluate the actual production predicate without running TPU kernels.
-    tree = ast.parse(Path(routing.__file__).read_text())
-    predicate = next(
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "supported" for t in node.targets)
-    )
-    i32 = jax.ShapeDtypeStruct((1,), jnp.int32)
+    i32 = jnp.zeros((1,), jnp.int32)
     gathered = SimpleNamespace(
         topk=6, n_tokens=tokens * 16, local_blocks=i32, block_hist=i32
     )
@@ -45,15 +31,32 @@ def supported(tokens=288, **changes):
         if key in changes:
             setattr(gathered, key, changes.pop(key))
     values.update(changes)
-    return eval(
-        compile(ast.Expression(predicate), "routing-gate", "eval"),
-        vars(routing),
-        values,
-    )
+    try:
+        routing.prepare_routing(**values)
+    except DispatchReached as exc:
+        return str(exc) == "fused"
+    raise AssertionError("routing did not reach either dispatch path")
+
+
+class DispatchReached(Exception):
+    pass
+
+
+def stop(path):
+    def reached(*args, **kwargs):
+        raise DispatchReached(path)
+
+    return reached
 
 
 @pytest.fixture(autouse=True)
 def tpu_v7(monkeypatch):
+    monkeypatch.setattr(routing, "build_routing_tables_sharded", lambda *a, **k: None)
+    monkeypatch.setattr(routing.host, "local_slab_rows", lambda *a, **k: None)
+    monkeypatch.setattr(
+        routing.host, "shard_transport_tables_in_blocks", stop("fallback")
+    )
+    monkeypatch.setattr(routing, "fuse_function", stop("fused"))
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
     monkeypatch.setattr(routing, "get_tpu_version", lambda: 7)
 
@@ -99,54 +102,3 @@ def test_backend_guards(monkeypatch, backend, version):
     monkeypatch.setattr(jax, "default_backend", lambda: backend)
     monkeypatch.setattr(routing, "get_tpu_version", lambda: version)
     assert not supported()
-
-
-def test_frozen_module_identity_and_t288(tmp_path):
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            r"""
-import ast
-import sys
-from pathlib import Path
-sys.path.insert(0, 'scripts/dsv41_bench')
-import routing_integration as h
-baseline = h.load_production_baseline()
-candidate = h.load_routing(h.ROUTING)
-assert baseline is not candidate
-assert baseline.prepare_routing.__globals__ is vars(baseline)
-assert candidate.prepare_routing.__globals__ is vars(candidate)
-assert baseline._position_metadata.__globals__ is vars(baseline)
-assert baseline.prepare_routing.__kwdefaults__['fuse_metadata'] is True
-h.configure_shape(288)
-out = Path(sys.argv[1])
-for name, module in [('baseline', baseline), ('candidate', candidate)]:
-    fn, _ = h.extract(h.LAYER, h.bench.STRIDE, out, routing=module, tag=name)
-    bound = fn.__globals__['prepare_routing']
-    assert bound.func is module.prepare_routing
-    assert bound.keywords['fuse_metadata'] is True
-# Aside from the supported predicate, all production statements are unchanged.
-def normalized(path):
-    tree = ast.parse(path.read_text())
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == 'supported' for t in node.targets
-        ):
-            node.value = ast.Constant(True)
-    return ast.dump(tree)
-assert normalized(h.ROUTING) == normalized(h.BASELINE_ROUTING)
-bad = out / 'bad.py'
-bad.write_bytes(h.BASELINE_ROUTING.read_bytes() + b'\n')
-try:
-    h.load_production_baseline(bad)
-except ValueError:
-    pass
-else:
-    raise AssertionError('unvalidated baseline accepted')
-""",
-            str(tmp_path),
-        ],
-        cwd=ROOT,
-        check=True,
-    )

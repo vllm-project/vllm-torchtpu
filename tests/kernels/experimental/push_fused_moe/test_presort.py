@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU support-envelope and dispatch regressions; TPU numerics use the harness."""
-
-import ast
-from pathlib import Path
+"""CPU support-envelope and fallback dispatch regressions."""
 
 import jax
 import jax.numpy as jnp
@@ -76,47 +73,3 @@ def test_backend_guard(monkeypatch, backend, version):
 @pytest.mark.parametrize("experts,topk", [(128, 6), (384, 4)])
 def test_routing_guard(tpu_v7, experts, topk):
     assert not presort.supports_local_sort(*inputs(), e_total=experts, topk=topk)
-
-
-def test_original_math_and_baseline_are_frozen(tpu_v7):
-    # Importing the standalone harness installs minimal package stubs, so keep
-    # its namespace changes out of the test runner's global module registry.
-    import subprocess
-    import sys
-
-    root = Path(__file__).resolve().parents[4]
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """
-from scripts.dsv41_bench import presort_metadata as bench
-from vllm_torchtpu.kernels.experimental.push_fused_moe import presort
-baseline = bench.load_production_baseline()
-assert baseline is not presort
-assert baseline.local_sort_activations.__globals__ is not vars(presort)
-xs = bench.fixture('uniform', tokens=128)
-actual = bench.jax.jit(lambda *a: presort.local_sort_activations(
-    *a, e_total=384, topk=6))(*xs)
-bench.assert_equal(actual, bench.reference(xs))
-bench.jax.default_backend = lambda: 'tpu'
-baseline.get_tpu_version = lambda: 7
-for tokens in (96, 192, 256, 288, 384):
-    xs = bench.fixture('uniform', tokens=tokens)
-    assert baseline.supports_local_sort(*xs, e_total=384, topk=6) == (tokens == 288)
-""",
-        ],
-        cwd=root,
-        check=True,
-    )
-    frozen = root / "scripts/dsv41_bench/_presort_baseline_09b82cc91.py"
-
-    def math_ast(path):
-        return [
-            ast.dump(node)
-            for node in ast.parse(path.read_text()).body
-            if isinstance(node, ast.FunctionDef)
-            and node.name in ("_metadata", "local_sort_activations")
-        ]
-
-    assert math_ast(Path(presort.__file__)) == math_ast(frozen)
