@@ -488,11 +488,27 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         # can clip at a decode-local prefix (dst_skip_bytes). Request-state
         # pages stay page-indexed (version 0) and always move whole.
         clippable = int(envs.TPU_RAIDEN_HANDOFF_ALIGN_TOKENS) > 0
+        # An unpacked compressed-key page holds one layer's keys for the page's
+        # tokens in its first block_size / 128 kernel pages (12% of a TP1
+        # stage's 3200-token page); the rest is padding. Send only the keys.
+        layout = self.runner.model_adapter.cache.layout
+        compressed_bytes = (
+            layout.block_size // layout.kernel_block_size
+        ) * layout.compressed_kernel_bytes
+        trim_compressed = (
+            layout.compressed_slots == 1
+            and 0 < compressed_bytes < layout.page_bytes
+        )
         spans = []
         for pool, group_index in plan.pool_groups():
             ids = pages[group_index]
             if translate is not None:
                 ids = translate(group_index, ids)
+            size_bytes = (
+                compressed_bytes
+                if trim_compressed and pool.layer_name.endswith(".compressed_k")
+                else pool.block_stride_bytes
+            )
             global_space = (
                 clippable
                 and plan.groups[group_index].extent is TransferExtent.TOKEN_PAGES
@@ -509,7 +525,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                             dst_offset_bytes=(
                                 index * pool.block_stride_bytes if global_space else 0
                             ),
-                            size_bytes=pool.block_stride_bytes,
+                            size_bytes=size_bytes,
                             # A pipeline stage's pages go to every decode unit
                             # (a TP>1 decode repacks its slice); matching TP
                             # sends rank k to rank k.
@@ -519,7 +535,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                         )
                         for index in range(len(ids))
                     ),
-                    declared_bytes=len(ids) * pool.block_stride_bytes,
+                    declared_bytes=len(ids) * size_bytes,
                     dst_space_version=1 if global_space else 0,
                 )
             )
