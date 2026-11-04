@@ -18,7 +18,10 @@ from typing import cast
 
 import pytest
 import torch
+import vllm.lora.layers.logits_processor as lora_lp_mod
 import vllm.model_executor.layers.logits_processor as logits_processor_mod
+from vllm.config import LoRAConfig
+from vllm.lora.layers import LogitsProcessorWithLoRA, LoRAMapping
 from vllm.model_executor.custom_op import maybe_get_oot_by_class, op_registry_oot
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -27,6 +30,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 
 import vllm_torchtpu.layers  # noqa: F401 - triggers registration side effect
 from vllm_torchtpu.layers.adapter.logits_processor import TpuLogitsProcessor
+from vllm_torchtpu.lora.torch_punica_tpu import PunicaWrapperTPU
 
 
 def _make_processor(
@@ -201,7 +205,7 @@ def test_matches_upstream_and_applies_pre_gather(
             assert not torch.equal(our_pre_gather[rank], ref_pre_gather[rank])
 
 
-def test_delegates_tp1_skip_gather_logits_input_and_lora(
+def test_delegates_tp1_skip_gather_and_logits_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rng = torch.Generator().manual_seed(7)
@@ -270,20 +274,59 @@ def test_delegates_tp1_skip_gather_logits_input_and_lora(
         LogitsProcessor.forward(ref_proc_in, head_tp2, raw_logits.clone()),
     )
 
-    # LogitsProcessorWithLoRA invokes type(self.base_layer).forward(self, ...)
-    # unbound with a wrapper whose _get_logits adds the LoRA delta post-gather.
-    gathered_plus_lora = (hidden @ w.T)[:, :6] + 3.0
-    lora_wrapper = cast(
-        "LogitsProcessor",
-        SimpleNamespace(
-            logits_as_input=False,
-            soft_cap=30.0,
-            scale=0.5,
-            org_vocab_size=6,
-            _get_logits=lambda _h, _head, _b, _skip=False: gathered_plus_lora.clone(),
-        ),
+
+def test_real_logits_processor_with_lora_delegates_to_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real LogitsProcessorWithLoRA calls type(self.base_layer).forward(self, ...)
+    unbound and adds its LoRA delta post-gather inside _get_logits before
+    soft_cap and scale run."""
+    rng = torch.Generator().manual_seed(11)
+    # org_vocab_size=6 padded to 8 across TP=2: shard 0 holds [0, 1, 2, pad],
+    # shard 1 holds [3, 4, 5, pad], reindexed by sharded_to_full_mapping.
+    sharded_to_full = [0, 1, 2, 4, 5, 6, 3, 7]
+    w_full = (torch.randn(8, 4, generator=rng) * 10.0).to(torch.bfloat16)
+    hidden = torch.randn(2, 4, generator=rng).to(torch.bfloat16)
+    w_shards = list(w_full.chunk(2, dim=0))
+
+    monkeypatch.setattr(lora_lp_mod, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(lora_lp_mod, "get_tensor_model_parallel_rank", lambda: 0)
+    gathered_base = hidden @ w_full.T
+    monkeypatch.setattr(
+        logits_processor_mod,
+        "tensor_model_parallel_all_gather",
+        lambda _tensor: gathered_base.clone(),
     )
-    out_lora = TpuLogitsProcessor.forward(lora_wrapper, head_tp2, hidden)
-    ref_lora = LogitsProcessor.forward(lora_wrapper, head_tp2, hidden)
-    assert out_lora is not None and ref_lora is not None
+
+    def build_wrapped(
+        cls: type[LogitsProcessor], *, active_adapter: bool
+    ) -> LogitsProcessorWithLoRA:
+        base = _make_processor(
+            cls, org_vocab_size=6, vocab_size=8, soft_cap=30.0, scale=0.5
+        )
+        wrapped = LogitsProcessorWithLoRA(
+            base, 4, torch.bfloat16, torch.device("cpu"), sharded_to_full
+        )
+        wrapped.create_lora_weights(
+            2, LoRAConfig(max_lora_rank=8, max_loras=2, lora_dtype=torch.bfloat16)
+        )
+        wrapped.lora_a_stacked[1, 0, 0, :] = 1.0
+        wrapped.lora_b_stacked[1, 0, :6, 0] = 5.0
+        punica = PunicaWrapperTPU(8, 2, "cpu")
+        prompt_map = (3, 0) if active_adapter else (0, 0)
+        punica.update_metadata(LoRAMapping(prompt_map, prompt_map), [None, 3], 3, 8)
+        wrapped.set_mapping(punica)
+        return wrapped
+
+    head_tp2 = _make_lm_head(2, w_shards[0])
+    out_lora = build_wrapped(TpuLogitsProcessor, active_adapter=True)(head_tp2, hidden)
+    ref_lora = build_wrapped(LogitsProcessor, active_adapter=True)(head_tp2, hidden)
+    out_no_lora = build_wrapped(TpuLogitsProcessor, active_adapter=False)(
+        head_tp2, hidden
+    )
+
+    assert out_lora is not None and ref_lora is not None and out_no_lora is not None
     assert torch.equal(out_lora, ref_lora)
+    # Control: request 0 carries adapter 3's delta; request 1 carries none.
+    assert not torch.equal(out_lora[0], out_no_lora[0])
+    assert torch.equal(out_lora[1], out_no_lora[1])

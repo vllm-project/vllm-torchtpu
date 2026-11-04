@@ -27,14 +27,16 @@ class TpuLogitsProcessor(LogitsProcessor):
     which runs the elementwise tanh/division/multiply on every TP rank over the
     full vocabulary ``[B, V]``. Applying them on each rank's local shard
     ``[B, V_shard]`` before the all-gather divides VPU work by ``tp_size`` and
-    lets XLA fuse the elementwise epilogue into the local ``lm_head``
-    projection before the collective.
+    keeps the soft-cap/scale temporaries at shard width ``[B, V_shard]`` rather
+    than full vocabulary width ``[B, V]`` on every rank.
 
     Only the multi-rank gathering path with active ``soft_cap`` or ``scale`` is
     overridden; everything else delegates to ``LogitsProcessor.forward``.
     """
 
     def _apply_soft_cap_and_scale(self, logits: torch.Tensor) -> torch.Tensor:
+        # Preserve upstream LogitsProcessor.forward's op order (divide, tanh,
+        # multiply, then scale) so pre-gather output stays bit-identical.
         if self.soft_cap is not None:
             logits = logits / self.soft_cap
             logits = torch.tanh(logits)
@@ -63,6 +65,9 @@ class TpuLogitsProcessor(LogitsProcessor):
             return LogitsProcessor.forward(
                 self, lm_head, hidden_states, embedding_bias, skip_gather
             )
+        # Reorders LogitsProcessor.forward and LogitsProcessor._get_logits from
+        # vllm/model_executor/layers/logits_processor.py (vllm v0.32.0) so
+        # soft_cap and scale run on each rank's shard before _gather_logits.
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         logits = self._apply_soft_cap_and_scale(logits)
         logits = self._gather_logits(logits)
