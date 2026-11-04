@@ -328,6 +328,9 @@ def _router_tensors(runner) -> list[tuple[str, torch.Tensor]]:
     # The table the TPU MoE path routes hash layers with (moe_routing).
     if getattr(layer, "hash_indices_table", None) is not None:
         tensors.append(("ids", layer.hash_indices_table))
+    # One entry per tensor, so none is permuted twice: a model may pass its
+    # gate's own bias as the score bias (vLLM's K2 Horizon does).
+    tensors = list({id(t): (kind, t) for kind, t in tensors}.values())
     known = {id(t) for _, t in tensors}
     other = [n for n, p in gate.named_parameters() if id(p) not in known]
     if other:

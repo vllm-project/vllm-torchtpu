@@ -265,6 +265,18 @@ def test_permute_routers_renumbers_gate_rows_and_score_bias(placement_file, bias
     expert_placement.check_routers_permuted()
 
 
+def test_a_score_bias_that_is_the_gate_bias_is_permuted_once(placement_file):
+    # vLLM's K2 Horizon passes its gate's own bias as e_score_correction_bias.
+    runner = _Runner("model.layers.3.ffn.experts", bias=True)
+    del runner.gate.e_score_correction_bias
+    runner.routed_experts.e_score_correction_bias = runner.gate.bias
+    bias = runner.gate.bias.detach().clone()
+    model = _model(runner)
+    assert expert_placement.apply(runner)
+    expert_placement.permute_routers(model)
+    torch.testing.assert_close(runner.gate.bias.detach(), bias[list(ORDER)])
+
+
 def test_permute_routers_maps_hash_table_ids_to_slots(placement_file):
     runner = _Runner("model.layers.3.ffn.experts", hash_layer=True)
     table = runner.routed_experts.hash_indices_table.detach().clone()
