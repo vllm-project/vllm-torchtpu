@@ -89,6 +89,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.layer import (
     _relabel_expert_ids_to_mesh_order,
     _row_routes,
     _unpack_routing_exchange,
+    _unpermute_load_to_ep_rank_order,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
@@ -534,7 +535,12 @@ def fused_ep_moe_push(
         updated_load = (
             None
             if expert_load_l is None
-            else expert_load_l + rows_by_dest.sum(axis=0).astype(jnp.int32)
+            else expert_load_l
+            + _unpermute_load_to_ep_rank_order(
+                rows_by_dest.sum(axis=0).astype(jnp.int32),
+                g_local=g_local,
+                mesh_ep_ranks=mesh_ep_ranks,
+            )
         )
         with jax.named_scope("moe_dispatch_tables"):
             runs = run_tables(rows_by_dest)
