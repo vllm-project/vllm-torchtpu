@@ -229,6 +229,37 @@ _KV_SCALE_NAMES = {
 }
 
 
+_MAIN_KV_DCP_GROUPS: dict[int, object] = {}
+
+
+def main_kv_dcp_group(size: int):
+    """The TP rank groups (0, 1), (2, 3), ... that share a KV head, for the
+    main-KV DCP pair combine (VLLM_TPU_QSA_MAIN_KV_DCP). Built once, by every
+    rank, the first time a layer binds the pool."""
+    if size not in _MAIN_KV_DCP_GROUPS:
+        import torch.distributed as dist
+        from vllm.distributed import get_tp_group
+        from vllm.distributed.parallel_state import (
+            get_world_group,
+            init_model_parallel_group,
+        )
+
+        tp = get_tp_group()
+        ranks = list(tp.ranks)
+        groups = [ranks[i : i + size] for i in range(0, len(ranks), size)]
+        world = int(dist.get_world_size())
+        if world > len(ranks):
+            # Every TP group of the world creates its pairs (collective call).
+            groups = [list(range(i, i + size)) for i in range(0, world, size)]
+        _MAIN_KV_DCP_GROUPS[size] = init_model_parallel_group(
+            groups,
+            get_world_group().local_rank,
+            dist.get_backend(tp.device_group),
+            group_name=f"qsa_main_kv_dcp{size}",
+        )
+    return _MAIN_KV_DCP_GROUPS[size]
+
+
 class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     """Config-derived gated attention with a replicated MQA indexer.
 
@@ -346,6 +377,26 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             persistent=False,
         )
         self.token_shard = self._token_shard_mode(tp_size, pooled, max_num_seqs)
+        # VLLM_TPU_QSA_MAIN_KV_DCP: target layers split their main KV over TP
+        # rank pairs sharing a KV head; the MTP draft keeps whole pages unless
+        # VLLM_TPU_QSA_MTP_KV_DCP splits it the same way.
+        self.main_kv_dcp = 1
+        dcp = int(envs.VLLM_TPU_QSA_MAIN_KV_DCP or 0)
+        if dcp > 1 and pooled and ("mtp" not in prefix or envs.VLLM_TPU_QSA_MTP_KV_DCP):
+            if dcp != 2 or tp_size % (dcp * self.total_num_kv_heads) != 0:
+                raise ValueError(
+                    f"VLLM_TPU_QSA_MAIN_KV_DCP={dcp} requires dcp=2 and "
+                    f"tensor_parallel_size divisible by "
+                    f"2 * num_key_value_heads ({2 * self.total_num_kv_heads}), "
+                    f"got tensor_parallel_size={tp_size} and "
+                    f"num_key_value_heads={self.total_num_kv_heads}"
+                )
+            self.main_kv_dcp = dcp
+            self.register_buffer(
+                "dcp_rank",
+                torch.full((1,), tp_rank % dcp, dtype=torch.int32, device=device),
+                persistent=False,
+            )
         if self.token_shard:
             # The rank as an operand of the token-sharded indexer, so every
             # rank traces the same program.
@@ -477,13 +528,89 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 kv_heads=self.num_kv_heads,
                 **keywords,
             )
+        self._dcp_op = None
+        self._token_shard_dcp_op = None
+        main_kv_dcp = getattr(self, "main_kv_dcp", 1)
+        if main_kv_dcp > 1:
+            if self._select_op is not None:
+                raise ValueError(
+                    "VLLM_TPU_QSA_MAIN_KV_DCP and VLLM_TPU_MEGAKERNEL cannot "
+                    "be enabled together: the megakernel's select op and "
+                    "whole-step cache writer assume replicated main-KV pages; "
+                    "unset VLLM_TPU_MEGAKERNEL or VLLM_TPU_QSA_MAIN_KV_DCP"
+                )
+            from vllm.distributed import get_tp_group
+
+            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                build_pooled_qsa_dcp_op,
+                build_pooled_qsa_token_shard_dcp_op,
+            )
+
+            pair = main_kv_dcp_group(main_kv_dcp)
+            self._dcp_op = partial(
+                build_pooled_qsa_dcp_op(pair, main_kv_dcp), **keywords
+            )
+            compressed = bool(envs.VLLM_TPU_QSA_COMPRESSED_DCP)
+            if compressed:
+                from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                    build_pooled_qsa_compressed_dcp_op,
+                )
+
+                # VLLM_TPU_QSA_COMPRESSED_DCP: owned-group scoring, pair merge.
+                self._dcp_op = partial(
+                    build_pooled_qsa_compressed_dcp_op(pair, main_kv_dcp),
+                    kv_heads=self.num_kv_heads,
+                    **keywords,
+                )
+            if "mtp" in self.prefix:
+                from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                    build_pooled_qsa_draft_dcp_op,
+                )
+
+                # VLLM_TPU_QSA_MTP_KV_DCP: the draft's rows and shared-selection
+                # ops over its DCP main KV.
+                def draft(shared, with_rows):
+                    return partial(
+                        build_pooled_qsa_draft_dcp_op(
+                            pair, main_kv_dcp, shared=shared, with_rows=with_rows
+                        ),
+                        dcp_rank=self.dcp_rank,
+                        **({"compressed_dcp": True} if compressed and shared else {}),
+                        **keywords,
+                    )
+
+                # Under compressed DCP the draft attends the target's selection
+                # only: its own rows indexer would need the pair merge.
+                if compressed and self._shared_ops is None:
+                    raise ValueError(
+                        "VLLM_TPU_QSA_COMPRESSED_DCP requires "
+                        "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION=1 for MTP draft "
+                        "attention"
+                    )
+                self._rows_op = draft(False, True)
+                if self._shared_ops is not None:
+                    self._shared_ops = (draft(True, False), draft(True, True))
+            if getattr(self, "token_shard", False):
+                build = build_pooled_qsa_token_shard_dcp_op
+                if compressed:
+                    from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                        build_pooled_qsa_token_shard_compressed_dcp_op as build,
+                    )
+                self._token_shard_dcp_op = partial(
+                    build(get_tp_group(), pair, main_kv_dcp),
+                    kv_heads=self.num_kv_heads,
+                    **keywords,
+                )
         # With VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP a single-graph module (the
         # MTP draft, traced once for every bucket including prefill chunks)
         # keeps the replicated indexer: it cannot pick per bucket.
         if (
             envs.VLLM_TPU_QSA_INDEXER_SHARD
-            and self.tp_size > 1
+            and getattr(self, "tp_size", 1) > 1
             and not (self.single_graph and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP)
+            # The key-sharded ops attend whole main-KV pages; under DCP they
+            # would take a DCP draft's rows path.
+            and main_kv_dcp == 1
         ):
             from vllm.distributed import get_tp_group
 
@@ -726,6 +853,17 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if token_shard and rows is None and token_shard_op is not None:
             # Takes precedence over the key-sharded indexer in this graph.
             op = partial(token_shard_op, shard_index=self.token_shard_index)
+        dcp_op = getattr(self, "_dcp_op", None)
+        if dcp_op is not None and rows is None:
+            # VLLM_TPU_QSA_MAIN_KV_DCP: this rank's main-KV rows, pair-combined.
+            if token_shard and self._token_shard_dcp_op is not None:
+                op = partial(
+                    self._token_shard_dcp_op,
+                    shard_index=self.token_shard_index,
+                    dcp_rank=self.dcp_rank,
+                )
+            else:
+                op = partial(dcp_op, dcp_rank=self.dcp_rank)
         shared_ops = getattr(self, "_shared_ops", None)
         source = getattr(self, "_selection_source", None)
         if shared is None and source is not None and shared_ops is not None:

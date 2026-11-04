@@ -539,6 +539,35 @@ def validate_config(cfg):
             "Qwen4Exp TPU requires PP/CP1, "
             "linear expert placement and no DBO/EPLB/elastic EP"
         )
+    from .pool_layout import MAIN_KV_DCP_ENV, main_kv_dcp
+
+    # The QSA main-KV split over TP rank pairs is this model's own path (vLLM's
+    # decode_context_parallel_size stays 1, rejected above): each replicated KV
+    # head is split across a pair of adjacent TP ranks on the unified pool.
+    dcp = main_kv_dcp()
+    if dcp > 1 and (
+        not pooled
+        or p.tensor_parallel_size < dcp * t.num_key_value_heads
+        or p.tensor_parallel_size % (dcp * t.num_key_value_heads)
+    ):
+        raise ValueError(
+            f"{MAIN_KV_DCP_ENV}={dcp} splits each replicated KV head across "
+            f"{dcp}-rank TP pairs on the unified pool: requires the unified "
+            f"pool and tensor_parallel_size divisible by "
+            f"{dcp} * num_key_value_heads ({dcp * t.num_key_value_heads}), got "
+            f"tensor_parallel_size={p.tensor_parallel_size} and "
+            f"num_key_value_heads={t.num_key_value_heads}; set "
+            f"tensor_parallel_size to a multiple of "
+            f"{dcp * t.num_key_value_heads} or unset {MAIN_KV_DCP_ENV}"
+        )
+    raw_mk = str(envs.VLLM_TPU_MEGAKERNEL or "").strip().lower()
+    if dcp > 1 and raw_mk and raw_mk not in ("0", "false", "off"):
+        raise ValueError(
+            f"{MAIN_KV_DCP_ENV}={dcp} and VLLM_TPU_MEGAKERNEL cannot be "
+            "enabled together: the megakernel's select op and whole-step "
+            "cache writer assume replicated main-KV pages; unset "
+            f"VLLM_TPU_MEGAKERNEL or {MAIN_KV_DCP_ENV}"
+        )
     # SparseCore top-k writes 16-lane vectors; this is a kernel boundary,
     # independent of checkpoint head counts and compression geometry.
     block_topk = t.indexer_budget // t.indexer_compress_ratio
