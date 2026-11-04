@@ -57,8 +57,8 @@ def decode_projected_kernel(
     hc_gate: jax.Array,
     cfgs: configs.RpaConfigs,
     policy: DecodePolicy,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Return aliased query/cache and projected output, optionally including HC."""
+) -> tuple[jax.Array, jax.Array]:
+    """Return aliased query and projected output; the cache is read-only."""
     if (
         cfgs.mode != configs.RpaCase.DECODE
         or cfgs.serve.return_lse
@@ -95,13 +95,11 @@ def decode_projected_kernel(
         residual_ref,
         hc_gate_ref,
         out_ref,
-        out_cache_ref,
         projected_ref,
         weight_buf,
         attended_buf,
         projection_sems,
     ):
-        del out_cache_ref  # The aliased cache is read-only for this entry.
         allocs = kernel.create_allocs(cache_ref, query_ref, None, cfgs)
 
         @pl.with_scoped(
@@ -254,7 +252,6 @@ def decode_projected_kernel(
         run,
         out_shape=[
             query,
-            cache,
             jax.ShapeDtypeStruct((cfgs.serve.num_seqs, result_width), jnp.bfloat16),
         ],
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -270,7 +267,6 @@ def decode_projected_kernel(
                 pl.BlockSpec(hc_gate.shape, lambda *_: (0, 0)),
             ],
             out_specs=[
-                hbm,
                 hbm,
                 pl.BlockSpec((cfgs.serve.num_seqs, result_width), lambda *_: (0, 0)),
             ],

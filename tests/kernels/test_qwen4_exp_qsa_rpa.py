@@ -35,6 +35,53 @@ def page_metadata_backend(monkeypatch):
         monkeypatch.setattr(pl, "pallas_call", partial(pl.pallas_call, interpret=True))
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+def test_small_bucket_preserves_query_preparation(monkeypatch, prepared):
+    from vllm_torchtpu.kernels import sparse_gqa_decode
+    from vllm_torchtpu.kernels.sparse_gqa_decode import decode
+
+    query = jnp.ones((2, 2, 128), jnp.bfloat16)
+    if prepared:
+        query = query.astype(jnp.float32)
+    cache = jnp.zeros((2, 128, 1, 2, 128), jnp.bfloat16)
+    cu = jnp.array([0, 1, 2], jnp.int32)
+    launch = object()
+    calls = []
+
+    def plan(logical_query, *_args, **_kwargs):
+        # The native planner accepts logical BF16 queries. A prepared producer
+        # stores those exact values in the FP32 reader layout.
+        assert logical_query.dtype == jnp.bfloat16
+        return launch
+
+    def execute(actual_query, _gate, _blocks, _lengths, _table, owner, **kwargs):
+        assert actual_query is query
+        assert kwargs["launch"] is launch
+        np.testing.assert_array_equal(kwargs["prepared_cu"], cu)
+        calls.append(True)
+        return actual_query.astype(jnp.bfloat16), owner
+
+    monkeypatch.setattr(sparse_gqa_decode, "plan_decode", plan)
+    monkeypatch.setattr(decode, "execute_decode", execute)
+    output, owner = qsa_rpa.qsa_attention(
+        query,
+        jnp.zeros_like(query),
+        jnp.zeros((2, 4), jnp.int32),
+        jnp.array([1, 1], jnp.int32),
+        jnp.zeros((2, 1), jnp.int32),
+        cache,
+        cu,
+        request_distribution=jnp.array([2, 2, 2], jnp.int32),
+        kv_heads=1,
+        ratio=4,
+        query_prepared=prepared,
+        prepared_cu=cu,
+    )
+    assert calls == [True]
+    assert owner is cache
+    np.testing.assert_array_equal(output, query.astype(jnp.bfloat16))
+
+
 def test_virtual_pages_preserve_sparse_order_and_tail(page_metadata_backend):
     blocks = jnp.array([[32, 0, -1], [-1, -1, -1]], jnp.int32)
     # A budget of two complete groups plus the 133rd token's partial group.

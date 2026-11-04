@@ -640,3 +640,65 @@ def test_dynamic_prefix_keeps_read_only_cache_without_pool_copy(fp8, tmp_path):
         np.testing.assert_array_equal(
             np.asarray(args[5]).view(np.uint8), cache_before.view(np.uint8)
         )
+
+
+@pytest.mark.tpu_test
+def test_projected_decode_scratch_does_not_scale_with_cache():
+    """A read-only pool must not become an unused full-size Pallas output."""
+    from vllm_torchtpu.kernels.sparse_gqa_decode.projection import projected_attention
+
+    if pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X:
+        pytest.skip("Measured output projection requires TPU7x")
+    args = _case(16, 2051, 1664, True)
+    cache_before = np.asarray(args[5]).view(np.uint8).copy()
+    rng = np.random.default_rng(5173)
+    weight = jnp.asarray(rng.normal(0, 0.025, (5, 6144, 512)), jnp.bfloat16)
+    residual = jnp.asarray(rng.normal(0, 0.2, (16, 10240)), jnp.bfloat16)
+    hc_gate = jnp.asarray(rng.uniform(0.5, 1.5, (16, 4)), jnp.float32)
+    distribution = jnp.asarray([16, 16, 16], jnp.int32)
+
+    def run(q, gate, blocks, lengths, table, cache, weight, residual, hc_gate, dist):
+        output, _ = projected_attention(
+            q,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            jnp.arange(17, dtype=jnp.int32),
+            weight,
+            residual,
+            hc_gate,
+            request_distribution=dist,
+            kv_heads=2,
+            ratio=4,
+            k_scale=0.375,
+            v_scale=2.5,
+        )
+        return output
+
+    values = (*args, weight, residual, hc_gate, distribution)
+    compiled = jax.jit(run).lower(*values).compile()
+    larger = list(values)
+    larger[5] = jax.ShapeDtypeStruct((512, *args[5].shape[1:]), args[5].dtype)
+    large_compiled = jax.jit(run).lower(*larger).compile()
+    small_memory = compiled.memory_analysis()
+    large_memory = large_compiled.memory_analysis()
+    assert small_memory is not None and large_memory is not None
+    # Only backing capacity grows: query counts, schedules and projection
+    # work are identical. Allow small compiler bookkeeping, not a pool copy.
+    assert (
+        large_memory.temp_size_in_bytes <= small_memory.temp_size_in_bytes + 1024 * 1024
+    ), (small_memory, large_memory)
+
+    projected = compiled(*values)
+    fallback = compiled(*values[:-1], jnp.asarray([0, 0, 16], jnp.int32))
+    actual = np.asarray(projected, np.float32)
+    expected = np.asarray(fallback, np.float32)
+    assert np.isfinite(actual).all()
+    assert (
+        np.linalg.norm(actual - expected) / max(np.linalg.norm(expected), 1e-12) < 0.01
+    )
+    idle = np.asarray(args[3]) == 0
+    np.testing.assert_array_equal(actual[idle], np.asarray(residual, np.float32)[idle])
+    np.testing.assert_array_equal(np.asarray(args[5]).view(np.uint8), cache_before)

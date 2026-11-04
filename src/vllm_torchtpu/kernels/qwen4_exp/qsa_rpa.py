@@ -352,6 +352,8 @@ def qsa_attention(
             jnp.where(positions < active_tokens, lengths, 0),
             table,
             cache,
+            query_prepared=query_prepared,
+            prepared_cu=prepared_cu,
             **options,
         )
     suffix = (positions >= prefix_tokens) & (positions < active_tokens)

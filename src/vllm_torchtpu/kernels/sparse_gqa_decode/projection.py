@@ -57,7 +57,7 @@ def projected_attention(
     prepared_cu: jax.Array | None = None,
     sc_min_context: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return projected HC output and donated cache, retaining a generic fallback."""
+    """Return projected HC output and the unchanged cache owner."""
     from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import planning_query
 
     launch = plan_decode(
@@ -171,7 +171,7 @@ def projected_attention(
         )
         q_lens = (kv_lens > 0).astype(jnp.int32)
         metadata = schedule.generate(starts, kv_lens, pages, cfgs)
-        _, _, output = decode_projected_kernel(
+        _, output = decode_projected_kernel(
             cu_q_lens=starts,
             compressed_query_offsets=kv_lens - q_lens,
             q_lens=q_lens,
