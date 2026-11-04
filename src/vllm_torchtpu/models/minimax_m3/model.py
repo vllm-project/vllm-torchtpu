@@ -92,6 +92,8 @@ class MiniMaxM3Model(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
         self.config = config
+        # Keys this model's compile-artifact cache directory.
+        self.prefix = prefix
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
         )
