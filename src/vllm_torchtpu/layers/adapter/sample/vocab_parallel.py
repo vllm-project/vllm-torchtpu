@@ -9,11 +9,19 @@ from vllm.distributed import tensor_model_parallel_all_gather
 def local_argmax_pair(
     logits: torch.Tensor, vocab_start: torch.Tensor, vocab_end: torch.Tensor
 ) -> torch.Tensor:
-    """Return (value, global ID); IDs must be exactly representable in fp32."""
-    ids = torch.arange(logits.shape[-1], device=logits.device) + vocab_start
+    """Return (value, global ID); IDs must be exactly representable in fp32.
+
+    Index arithmetic stays in the bounds' dtype (int32 on TPU), which holds
+    every such ID exactly.
+    """
+    ids = (
+        torch.arange(logits.shape[-1], device=logits.device, dtype=vocab_start.dtype)
+        + vocab_start
+    )
     logits = torch.where(ids < vocab_end, logits, -float("inf"))
     values, indices = logits.max(dim=-1)
-    return torch.stack((values.float(), (indices + vocab_start).float()), dim=-1)
+    global_ids = indices.to(vocab_start.dtype) + vocab_start
+    return torch.stack((values.float(), global_ids.float()), dim=-1)
 
 
 def select_argmax_pair(pairs: torch.Tensor) -> torch.Tensor:

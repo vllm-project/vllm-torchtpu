@@ -23,6 +23,7 @@ import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from vllm_torchtpu.layers.core.sequence_layout import (
+    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
@@ -300,6 +301,9 @@ def _rank0_pcp_plan() -> SequenceLayoutPlan:
 
 
 class _CarryAggregationAfterGatherPlan:
+    # Any layout but the default one aggregates request-aligned carries.
+    descriptor = SimpleNamespace(cache_key="test-partial-layout")
+
     def __init__(self, events):
         self._events = events
 
@@ -567,8 +571,9 @@ def test_propose_delegates_carry_aggregation_after_gather():
 
     def record_gather(hidden, positions, last_hidden, gather_indices):
         events.append("gather")
-        assert gather_indices.cpu().tolist() == [0, 2]
-        return (hidden[:2], positions[:2], last_hidden[gather_indices])
+        # Raw: the compiled gather clamps the unowned row's -1 itself.
+        assert gather_indices.cpu().tolist() == [-1, 2]
+        return (hidden[:2], positions[:2], last_hidden[gather_indices.clamp_min(0)])
 
     proposer._draft_gather_carries = record_gather
 
@@ -585,6 +590,83 @@ def test_propose_delegates_carry_aggregation_after_gather():
     )
 
     assert events == ["gather", "aggregate", "propose_token"]
+
+
+def test_default_layout_carries_skip_owner_mask_and_aggregation(monkeypatch):
+    """The default layout owns every row: its carries come straight from the
+    compiled gather, with no eager owner mask or aggregation in between."""
+    device = torch.device("cpu")
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 1
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=2, req_ids=["r0", "r1"]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[16, 32],
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    chunk = _make_chunk(
+        input_ids=torch.zeros(3, dtype=torch.int32, device=device),
+        position_ids=torch.zeros(3, dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 1, 2], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        hidden=1,
+        device=device,
+        hidden_states=torch.zeros((3, 1), device=device),
+        attn_ctx=SimpleNamespace(use_max_model_len=True),
+    )
+    plan = chunk.sequence_layout_plan
+    assert plan.descriptor == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+
+    def no_aggregation(*_args):
+        pytest.fail("the default layout must not aggregate carries")
+
+    monkeypatch.setattr(type(plan), "aggregate_request_aligned_tensor", no_aggregation)
+    proposer.draft_chunks = [chunk]
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(use_aux_hidden_state=False)
+    )
+    indices = torch.tensor([0, 2], dtype=torch.int64, device=device)
+    proposer._prepare_draft_inputs = lambda *_args, **_kwargs: (
+        torch.zeros(3, dtype=torch.int32, device=device),
+        chunk.position_ids,
+        indices,
+        np.zeros(2, dtype=np.int32),
+    )
+    proposer._forward_draft = lambda **_kwargs: (
+        torch.tensor([[99.0], [7.0], [20.0]], device=device),
+        torch.zeros((3, 1), device=device),
+    )
+    proposer._draft_gather_carries = inspect.unwrap(
+        Eagle3Proposer._draft_gather_carries
+    ).__get__(proposer)
+    proposed = []
+    proposer._draft_propose_token = lambda last_hidden: proposed.append(
+        last_hidden
+    ) or last_hidden[:, 0].to(torch.int32)
+    proposer.propose(
+        sampled_token_ids=[[101], [202]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+    )
+    assert torch.equal(proposed[0], torch.tensor([[99.0], [20.0]]))
+
+
+def test_carry_gather_clamps_unowned_rows_to_row_zero():
+    """A -1 row (owned by another PCP rank) reads row 0, as the eager
+    clamp_min before the gather did, never the buffer's last row."""
+    gather = inspect.unwrap(Eagle3Proposer._draft_gather_carries)
+    hidden = torch.arange(12.0).reshape(4, 3)
+    positions = torch.arange(4, dtype=torch.int32)
+    indices = torch.tensor([-1, 3, 1], dtype=torch.int64)
+    out = gather(None, hidden, positions, hidden + 100, indices)
+    safe = indices.clamp_min(0)
+    assert torch.equal(out[0], hidden[safe])
+    assert torch.equal(out[1], positions[safe])
+    assert torch.equal(out[2], (hidden + 100)[safe])
 
 
 def test_prepare_draft_inputs_async_device(device):
