@@ -25,7 +25,7 @@ from collections.abc import Container, Mapping, Sequence
 from ..errors import MegakernelConfigError
 from ..profiles.default import chip_budget
 from .contract import EligibilityResult, StepDecision
-from .policy import BucketPolicy
+from .policy import MTP_VERIFY_TOKENS, BucketPolicy
 from .stats import (
     BatchShape,
     MKABCalibrator,
@@ -157,7 +157,11 @@ def check_step_eligibility(
     input_rows: int,
     mrope_ok: bool = True,
 ) -> StepDecision:
-    """Decide whether a forward step with `batch_shape` can run on a bucket."""
+    """Decide whether a forward step with `batch_shape` can run on a bucket.
+
+    The bucket policy serves `T=1` decode and `T=MTP_VERIFY_TOKENS` verify
+    steps; any other uniform step size is `stock_q{T}`.
+    """
     if not batch_shape.eligible or batch_shape.num_reqs <= 0:
         return StepDecision(
             False,
@@ -166,12 +170,13 @@ def check_step_eligibility(
             batch_shape.tokens_per_seq,
         )
     num_reqs, T = batch_shape.num_reqs, batch_shape.tokens_per_seq
+    if T not in (1, MTP_VERIFY_TOKENS):
+        return StepDecision(False, f"stock_q{T}", num_reqs, T)
     if not mrope_ok:
         return StepDecision(False, "stock_mrope", num_reqs, T)
-    if T not in (1, 4):
-        return StepDecision(False, f"stock_q{T}", num_reqs, T)
-    b_list = bucket_policy.verify_buckets if T == 4 else bucket_policy.buckets
-    max_b = bucket_policy.max_verify_bucket if T == 4 else bucket_policy.max_bucket
+    is_verify = T == MTP_VERIFY_TOKENS
+    b_list = bucket_policy.verify_buckets if is_verify else bucket_policy.buckets
+    max_b = bucket_policy.max_verify_bucket if is_verify else bucket_policy.max_bucket
     active_rows = num_reqs * T
     if not b_list or active_rows > max_b:
         return StepDecision(False, f"stock_t{T}_n{num_reqs}", num_reqs, T)

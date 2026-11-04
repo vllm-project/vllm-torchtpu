@@ -1056,7 +1056,11 @@ class Qwen35Program:
             attn_md = md[self.attn_layer_name]
             m_mds = [md[n] for n in self.mamba_layer_names]
             bs = fwd.batch_shape(attn_md, m_mds[0])
-            num_reqs, tokens_per_seq = bs.num_reqs, (bs.tokens_per_seq or 1)
+            # The batch shape reports any uniform step size; serve only the
+            # decode / verify sizes this program compiles (else decode).
+            served = bs.tokens_per_seq in (1, mk_rt.MTP_VERIFY_TOKENS)
+            num_reqs = bs.num_reqs
+            tokens_per_seq = bs.tokens_per_seq if served else 1
             active_rows = max(tokens_per_seq, num_reqs * tokens_per_seq)
             bkt = self.bucket_policy.select(active_rows, tokens_per_seq, clamp=True)
             step_fn = fwd.steps[(tokens_per_seq, bkt)]

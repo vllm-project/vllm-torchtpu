@@ -36,7 +36,11 @@ class BatchShape:
 
 
 def check_qsl_uniform(qsl: Any, num_reqs: int) -> BatchShape:
-    """Check whether `qsl[:num_reqs + 1]` has a uniform step size in `{1, 4}`."""
+    """Check whether `qsl[:num_reqs + 1]` has a uniform, positive step size.
+
+    Any uniform step size is eligible here; whether a program serves it (for
+    example, which `T` its buckets cover) is the program's decision.
+    """
     if num_reqs <= 0 or len(qsl) <= num_reqs:
         return BatchShape(False, 0, 0, "stock_n0")
     s = qsl[: num_reqs + 1]
@@ -47,7 +51,7 @@ def check_qsl_uniform(qsl: Any, num_reqs: int) -> BatchShape:
     for i in range(1, num_reqs):
         if int(vals[i + 1]) - int(vals[i]) != q0:
             return BatchShape(False, num_reqs, 0, "stock_mixed")
-    if q0 in (1, 4):
+    if q0 > 0:
         return BatchShape(True, num_reqs, q0, "ok")
     return BatchShape(False, num_reqs, 0, f"stock_q{q0}")
 

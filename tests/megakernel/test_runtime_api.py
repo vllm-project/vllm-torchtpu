@@ -509,6 +509,17 @@ def test_step_eligibility_cases():
             0,
         ),
         (
+            # An unserved step size is reported before the M-RoPE check.
+            dict(
+                batch_shape=BatchShape(True, 2, 8, "ok"),
+                input_rows=16,
+                mrope_ok=False,
+            ),
+            False,
+            "stock_q8",
+            0,
+        ),
+        (
             dict(
                 batch_shape=BatchShape(True, 20, 1, "ok"),
                 input_rows=32,
