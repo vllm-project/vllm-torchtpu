@@ -2,6 +2,8 @@
 
 All environment variables read by `vllm-torchtpu` are declared and validated in [`src/vllm_torchtpu/envs.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/envs.py) (enforced in CI by `tools/check_env_reads.py`). Boolean variables accept `"1"`, `"true"`, `"yes"`, `"on"` or `"0"`, `"false"`, `"no"`, `"off"` (case-insensitive); invalid values raise a `ValueError` at startup.
 
+At startup, `vllm-torchtpu` reports set environment variables that neither vLLM nor this package reads, and suggests the closest name for a likely typo. `--fail-on-environ-validation` turns the report into an error.
+
 ---
 
 ## 1. Platform, Runtime & Compilation Cache
