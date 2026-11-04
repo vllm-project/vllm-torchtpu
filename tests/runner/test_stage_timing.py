@@ -36,6 +36,7 @@ def events(monkeypatch):
     factory = MagicMock(side_effect=make_event)
     factory.events = created
     monkeypatch.setattr(stage_timing, "TpuEvent", factory)
+    monkeypatch.setattr(stage_timing, "has_kv_transfer_group", lambda: True)
     return factory
 
 
@@ -139,3 +140,13 @@ def test_completed_stages_are_drained_in_record_order(events):
         [],
         [("0", "main_forward", 0.001), ("0", "sample", 0.002)],
     )
+
+
+def test_timing_skipped_without_sink(monkeypatch):
+    monkeypatch.setattr(stage_timing, "has_kv_transfer_group", lambda: False)
+    timing = stage_timing.RunnerStageTiming(0)
+    with timing.stage("main_forward"):
+        pass
+    with timing.host_stage("cpu_step"):
+        pass
+    assert timing.take_samples() == ([], [])
