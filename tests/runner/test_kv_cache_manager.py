@@ -54,6 +54,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
     RunLocalStateSpec,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
+from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.runner.kv_cache_manager import (
@@ -816,6 +817,25 @@ class TestKVCacheManager:
         for i in range(3):
             assert kv_cache_specs[f"mamba_{i}"].page_size_padded == expected_padded_size
         mock_get_page_size.assert_called()
+
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    def test_get_kv_cache_spec_takes_owned_cache_spec(self, mock_get_layers):
+        class _OwnedCache(TpuOwnedKVCache):
+            def get_kv_cache_spec(self, vllm_config):
+                return MLAAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+                )
+
+            def get_attn_backend(self):
+                return PallasMLAttentionBackend
+
+        mock_get_layers.return_value = {"layer.0.index_cache": _OwnedCache()}
+
+        spec = self.runner.get_kv_cache_spec()["layer.0.index_cache"]
+
+        assert isinstance(spec, MLAAttentionSpec)
+        assert (spec.block_size, spec.head_size) == (16, 128)
+        assert spec.dtype == torch.bfloat16
 
     @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
     @patch(

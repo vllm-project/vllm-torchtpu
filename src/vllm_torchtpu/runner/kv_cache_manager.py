@@ -81,6 +81,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
+from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -418,6 +419,10 @@ class KVCacheManager:
                 kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(
                     self.runner.vllm_config
                 )
+            elif isinstance(attn_module, TpuOwnedKVCache):
+                spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
             else:
                 continue
 
