@@ -56,7 +56,11 @@ def write_swa_pages(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    if prepared is None and records.shape == (288,) and page_size == 64:
+    if (
+        prepared is None
+        and records.shape in ((96,), (192,), (288,))
+        and page_size == 64
+    ):
         from vllm_torchtpu.kernels.experimental.decode_preparation import swa_pack
 
         prepared = swa_pack(banks, records, values)
