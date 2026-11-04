@@ -371,8 +371,10 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             if self.reads_token_padding_mask and zeroes_padding_routes(
                 self.moe.is_sequence_parallel
             ):
-                topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-                    topk_ids, topk_weights, is_local_tensor=True
+                topk_ids, topk_weights = (
+                    token_padding.zero_local_routing_weights_for_padding(
+                        topk_ids, topk_weights
+                    )
                 )
                 if drops_padded_routes(
                     x.shape[0],

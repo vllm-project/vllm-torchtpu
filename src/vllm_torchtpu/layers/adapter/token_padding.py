@@ -24,13 +24,20 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # int32 [2]: this rank's [valid, padded) row bounds of the step, which
+    # local_padding_mask marks as padding.
+    local_padding_bounds: torch.Tensor | None = None
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
         local_padding_mask = torch.zeros(
             max_local_tokens, dtype=torch.bool, device=device
         )
-        return cls(local_padding_mask=local_padding_mask)
+        local_padding_bounds = torch.zeros(2, dtype=torch.int32, device=device)
+        return cls(
+            local_padding_mask=local_padding_mask,
+            local_padding_bounds=local_padding_bounds,
+        )
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
@@ -38,13 +45,30 @@ class TokenPaddingState:
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        if self.local_padding_bounds is not None:
+            self.local_padding_bounds.copy_(
+                torch.tensor(
+                    [local_valid_tokens, local_padded_tokens], dtype=torch.int32
+                )
+            )
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
-        # A gather, not a slice: slicing the max-sized buffer guards
-        # num_tokens <= its length, which pins a trace taken at the largest
-        # bucket to that one size (ConstraintViolationError on the token dim).
-        rows = torch.arange(num_tokens, device=self.local_padding_mask.device)
-        return self.local_padding_mask.index_select(0, rows)
+        return self.local_padding_mask[:num_tokens]
+
+    def get_local_padding_rows(self, num_tokens: int) -> torch.Tensor:
+        """get_local_padding_mask(num_tokens), computed from the row bounds.
+
+        Elementwise, so it fuses into its consumer, and it reads no
+        max-sized buffer: slicing one guards num_tokens <= its length, which
+        pins a trace taken at the largest bucket to that size.
+        """
+        assert self.local_padding_bounds is not None
+        rows = torch.arange(
+            num_tokens, dtype=torch.int32, device=self.local_padding_bounds.device
+        )
+        return (rows >= self.local_padding_bounds[0]) & (
+            rows < self.local_padding_bounds[1]
+        )
 
 
 def set_padding_state(state: "TokenPaddingState | None") -> None:
@@ -107,6 +131,20 @@ def zero_routing_weights_for_padding(
             is_padding = local_padding.ne(0)
         else:
             is_padding = _padding_state.get_local_padding_mask(num_tokens)
+    topk_weights = torch.where(
+        is_padding[:, None], torch.zeros_like(topk_weights), topk_weights
+    )
+    return topk_ids, topk_weights
+
+
+def zero_local_routing_weights_for_padding(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """zero_routing_weights_for_padding for this rank's local rows, with the
+    padding rows taken from get_local_padding_rows."""
+    if _padding_state is None:
+        return topk_ids, topk_weights
+    is_padding = _padding_state.get_local_padding_rows(topk_ids.shape[0])
     topk_weights = torch.where(
         is_padding[:, None], torch.zeros_like(topk_weights), topk_weights
     )
