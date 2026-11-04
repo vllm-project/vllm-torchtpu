@@ -87,6 +87,13 @@ def main() -> int:
         "X-data-parallel-rank header; through a P/D proxy, of both engines. "
         "Replicas differ slightly in greedy output, and this compares tokens.",
     )
+    p.add_argument(
+        "--warm-reference",
+        action="store_true",
+        help="Warm each prefix once and record an immediate same-slot cache "
+        "hit as its reference before interleaving, isolating state restore "
+        "from cold-vs-warm prefill chunking differences.",
+    )
     a = p.parse_args()
     url = f"http://{a.host}:{a.port}"
     headers = {}
@@ -116,7 +123,37 @@ def main() -> int:
                 return 1
 
             if tag not in reference:
-                # Round 1 is uncached: this is the ground truth.
+                if a.warm_reference:
+                    print(
+                        json.dumps(
+                            {
+                                "round": rnd,
+                                "prefix": tag,
+                                "prompt_tokens": r["prompt_tokens"],
+                                "cached_tokens": r["cached_tokens"],
+                                "verdict": "warmup",
+                                "text": r["text"][:80],
+                            }
+                        ),
+                        flush=True,
+                    )
+                    try:
+                        r = complete(
+                            url,
+                            a.model,
+                            prompts[tag],
+                            a.max_tokens,
+                            a.timeout,
+                            headers,
+                        )
+                    except (urllib.error.URLError, TimeoutError) as exc:
+                        print(f"STATE_CONTAMINATION_REQUEST_FAILED {tag} r{rnd}: {exc}")
+                        return 1
+                    if r["cached_tokens"] <= 0:
+                        print("STATE_CONTAMINATION_NO_HITS 1")
+                        return 1
+                # Round 1 establishes the uncontaminated ground truth (cold by
+                # default, or an immediate same-slot hit with --warm-reference).
                 reference[tag] = r
                 verdict = "reference"
             else:

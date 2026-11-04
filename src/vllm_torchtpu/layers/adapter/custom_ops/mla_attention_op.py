@@ -42,7 +42,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, rope_patch
 from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
@@ -1364,6 +1364,31 @@ VllmMultiHeadLatentAttentionWrapper = VllmTPUMultiHeadLatentAttentionWrapper
 @DeepseekScalingRotaryEmbedding.register_oot
 class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
     """TPU-compatible DeepSeek Scaling RoPE implementation."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        use_tier1 = (
+            type(self) is VllmDeepseekScalingRotaryEmbedding and envs.TPU_ROPE_IN_GRAPH
+        )
+        if use_tier1:
+            self._tpu_skip_cos_sin_cache_alloc = True
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            self.__dict__.pop("_tpu_skip_cos_sin_cache_alloc", None)
+        if use_tier1:
+            rope_patch.install_tier1_in_graph_rope(
+                self, device=torch.get_default_device()
+            )
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        if getattr(self, "_tpu_skip_cos_sin_cache_alloc", False):
+            return torch.empty((0, self.rotary_dim), dtype=torch.float32, device="cpu")
+        return super()._compute_cos_sin_cache()
+
+    def _apply(self, fn: Any, recurse: bool = True) -> Any:
+        res = super()._apply(fn, recurse=recurse)
+        rope_patch.apply_in_graph_cache_transform(self, fn)
+        return res
 
     def forward_native(
         self,

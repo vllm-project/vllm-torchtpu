@@ -90,6 +90,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `TPU_ROPE_IN_GRAPH` | `False` | Set `1` to compute rotary `cos`/`sin` in-graph from positions instead of indexing a precomputed `[max_position, rotary_dim]` HBM table (DeepSeek-V4 Pallas rotary kernels keep the precomputed table until migrated). |
 
 ---
 
