@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
+    TPU_ONEHOT_TABLE_LOOKUP: bool = False
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
@@ -400,6 +401,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD": env_bool(
         "TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", default=True
     ),
+    # Look up per-request tables (query starts, sequence lengths, window
+    # starts) by token as a one-hot sum instead of a gather or a bucketize
+    # (`layers/core/table_lookup.py`). Integer-exact.
+    "TPU_ONEHOT_TABLE_LOOKUP": env_bool("TPU_ONEHOT_TABLE_LOOKUP", default=False),
     # Debug: on every incremental step, rebuild the full packed table on the
     # host and check it against the device-resident copy (raises on mismatch).
     "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(

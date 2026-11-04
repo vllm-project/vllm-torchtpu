@@ -22,6 +22,7 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
 )
+from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
@@ -210,10 +211,10 @@ class NgramHashState(upstream.NgramHashState):
         _, ngram = multipliers.shape
         dev = input_ids.device
         rows = torch.arange(count, device=dev)
-        reqs = torch.bucketize(rows, query_start_loc[1:], right=True).clamp(
+        reqs = table_lookup.bucketize_right(rows, query_start_loc[1:]).clamp(
             max=lookback_token_ids.shape[0] - 1
         )
-        starts = query_start_loc[reqs].long().clamp(max=count - 1)
+        starts = table_lookup.take(query_start_loc, reqs).long().clamp(max=count - 1)
         chunk_positions = positions[starts]
         shifts = torch.arange(ngram, device=dev)
         past = positions[:, None] - shifts
