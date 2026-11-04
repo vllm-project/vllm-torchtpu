@@ -157,7 +157,8 @@ def prepare_routing(
     slab_row = host.local_slab_rows(routing, me, shard_stride=shard_stride)
     supported = (
         fuse_metadata
-        and (t_local, gathered.topk, e_total, ep, tile_m) == (288, 6, 384, 16, 128)
+        and t_local in (96, 192, 256, 288, 384)
+        and (gathered.topk, e_total, ep, tile_m) == (6, 384, 16, 128)
         and gathered.n_tokens == t_local * ep
         and block == host.routing_block(t_local, gathered.topk)
         and shard_stride
