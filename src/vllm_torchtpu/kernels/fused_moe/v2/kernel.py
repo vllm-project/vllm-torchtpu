@@ -265,8 +265,12 @@ def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=T
     """
 
     def half(lo, hi):
-        """One post-scale half of the accumulator, columns [lo, hi)."""
-        scaled = acc1[:, lo:hi]
+        """One post-scale half of the accumulator, columns [lo, hi).
+
+        acc1 is either the [m, 2 * inter] accumulator or a callable handing
+        back its columns [lo, hi) from wherever they are held (the TP-pair
+        layout keeps them in two halves)."""
+        scaled = acc1(lo, hi) if callable(acc1) else acc1[:, lo:hi]
         if act_scale is not None:
             scaled = scaled * act_scale
         if w1s is not None:
@@ -344,11 +348,47 @@ def expert_ffn_fp8(
     """
     if wait_w1 is not None:
         wait_w1()
-    w1_arr = w1() if callable(w1) else w1
-    inter = w1_arr.shape[-1] // 2
-    acc1 = lax.dot_general(act_q, w1_arr, DN, preferred_element_type=jnp.float32)
-    if retire_w1 is not None:
-        retire_w1()
+    if isinstance(w1, tuple):
+        # The TP-pair layout: the gate/up slab arrives as two contiguous
+        # [k, 2 * i_slice] halves ([gate | up] each), own half first. The
+        # two matmuls accumulate into two [m, 2 * i_slice] halves and the
+        # activation reads its chunks straight out of them in the logical
+        # [gate(inter) | up(inter)] order, position-major within each, so
+        # no [m, 4 * i_slice] concatenation is ever materialized.
+        w1_own, w1_peer = (w() if callable(w) else w for w in w1)
+        i_slice = w1_own.shape[-1] // 2
+        inter = i_slice * ep_tp_size
+        acc_halves = (
+            lax.dot_general(act_q, w1_own, DN, preferred_element_type=jnp.float32),
+            lax.dot_general(act_q, w1_peer, DN, preferred_element_type=jnp.float32),
+        )
+        if retire_w1 is not None:
+            retire_w1()
+
+        def acc1(lo, hi):
+            """Columns [lo, hi) of the logical [gate | up] accumulator.
+
+            A chunk inside one position's half is a slice of that half; a
+            chunk spanning both (only where the activation chunk is wider
+            than a half, i.e. small test shapes) joins the two pieces."""
+            half, lo_j = divmod(lo, inter)
+            assert (hi - 1) // inter == half, (lo, hi, inter)
+            hi_j = hi - half * inter
+            pieces = []
+            for pos in range(ep_tp_size):
+                p_lo = max(lo_j, pos * i_slice) - pos * i_slice
+                p_hi = min(hi_j, (pos + 1) * i_slice) - pos * i_slice
+                if p_hi > p_lo:
+                    start = half * i_slice + p_lo
+                    pieces.append(acc_halves[pos][:, start : start + (p_hi - p_lo)])
+            return pieces[0] if len(pieces) == 1 else jnp.concatenate(pieces, axis=-1)
+
+    else:
+        w1_arr = w1() if callable(w1) else w1
+        inter = w1_arr.shape[-1] // 2
+        acc1 = lax.dot_general(act_q, w1_arr, DN, preferred_element_type=jnp.float32)
+        if retire_w1 is not None:
+            retire_w1()
     mid_q, mid_scale = _intermediate_rows(
         acc1, act_scale, inter, w1s=w1s, act_fn=act_fn, w1b=w1b
     )
@@ -699,9 +739,55 @@ def _build_fused_ep_moe_kernel(
     )
     prefetch_distance = 0 if ep_tp_size > 1 else slots.distance
     nbuf = 1 if ep_tp_size > 1 else slots.nbuf
-    tp_dbuf_extra = inter * hidden + (2 * inter + (2 * ep_tp_size - 1) * hidden) * 4
-    tp_dbuf_w2 = ep_tp_size > 1 and (slots.vmem_bytes + tp_dbuf_extra <= slots.limit)
-    tp_w2_slots = 2 if tp_dbuf_w2 else 1
+    # The TP-pair schedule (ep_tp_size == 2). Each core of the pair holds its
+    # I-slice of every expert in the group and the pair splits the group's
+    # visit list between them: a core computes its own expert on the full I
+    # by receiving the peer's half of the expert's gate/up and down slabs
+    # over the intra-chip link, pushed by the peer out of the peer's HBM.
+    #
+    # Weight VMEM (one expert of slabs, 48 MiB at 6144x2048 fp8) is laid out
+    # as: the local gate/up half, one slot; the PEER's gate/up half, TWO
+    # slots; and the down slab, one slot holding both halves. The peer half
+    # of gate/up is the largest cross-core transfer of the visit (12 MiB)
+    # and the one that used to be exposed: with a single slot it could not
+    # be started until both cores had retired the previous visit's gate/up,
+    # which left the last tile's down matmul to hide it. Two slots let it go
+    # out a whole visit ahead, so the only transfer the pair barrier gates is
+    # the 6 MiB down half, which the next visit's first gate/up matmul and
+    # its transport bookkeeping cover.
+    #
+    # Each core's slabs are CONTIGUOUS [hidden, 2 * inter_slice] slices of
+    # its own HBM ([gate_me | up_me]), so every weight DMA is one contiguous
+    # transfer rather than two minor-axis-strided ones. The intermediate axis
+    # is therefore ordered by POSITION in the pair (own half first, peer's
+    # second) on every core, and the scale tables and down rows follow that
+    # same order, so the arithmetic is the same on both cores up to the
+    # (commutative) order of the two down partial sums.
+    tp_scl_slots = 2 if ep_tp_size > 1 else 0
+    tp_w1p_slots = 2 if ep_tp_size > 1 else 0
+    if ep_tp_size > 1:
+        if ep_tp_size != 2:
+            raise NotImplementedError(
+                "the fused EP MoE TP-pair schedule takes ep_tp_size=2; "
+                f"got {ep_tp_size}"
+            )
+        # What the pair layout costs beyond the one-slot estimate above: the
+        # gate/up slab shrinks to the local half and gains two peer-half
+        # slots (net +0 at two members), plus the second scale-table slot
+        # and the pair's down scales.
+        tp_extra = (
+            hidden * 2 * inter_slice * tp_w1p_slots
+            - hidden * inter
+            + (2 * inter) * 4 * (tp_scl_slots - 1)
+            + (ep_tp_size * hidden) * 4 * tp_scl_slots
+        )
+        if slots.vmem_bytes + tp_extra > slots.limit:
+            raise ValueError(
+                f"the TP-pair schedule needs "
+                f"{(slots.vmem_bytes + tp_extra) / 2**20:.1f}MiB of VMEM, over "
+                f"the {slots.limit / 2**20:.1f}MiB budget, for experts of "
+                f"{hidden}x{inter} at capacity={capacity}"
+            )
     # The relation the whole schedule rests on: a refill writes its slot
     # while the readers of `distance` earlier experts are still live, so
     # distance + 1 consecutive experts have to occupy distinct slots. This
@@ -948,6 +1034,9 @@ def _build_fused_ep_moe_kernel(
             mehop_scl_sem = next(it)
         if ep_tp_size > 1:
             tp_w2s_vm = next(it)
+            # The peer's gate/up half, two slots deep (see the schedule note
+            # at the top of the build).
+            tp_w1p_vm = next(it)
             tp_w1_s_sem, tp_w1_r_sem = (next(it) for _ in range(2))
             tp_w2_s_sem, tp_w2_r_sem = (next(it) for _ in range(2))
             tp_w1s_s_sem, tp_w1s_r_sem = (next(it) for _ in range(2))
@@ -955,6 +1044,7 @@ def _build_fused_ep_moe_kernel(
             tp_bar_sem = next(it)
         else:
             tp_w2s_vm = None
+            tp_w1p_vm = None
             tp_w1_s_sem = tp_w1_r_sem = None
             tp_w2_s_sem = tp_w2_r_sem = None
             tp_w1s_s_sem = tp_w1s_r_sem = None
@@ -1059,140 +1149,122 @@ def _build_fused_ep_moe_kernel(
                     )
                 pl.semaphore_wait(tp_bar_sem.at[1], ep_tp_size)
 
-        def tp_w1_starts(step):
-            """Start gate/up weight DMAs for `step` across TP peers."""
-            for m in range(ep_tp_size):
-                exp_m = m * g_local + visit_sm[m, step]
-                peer_id = (tp_grp * ep_tp_size + m,)
+        # ---- TP-pair weight transport (ep_tp_size == 2) ----
+        # Expert e of member m is HBM slab m * g_local + visit_sm[m, step]
+        # on EVERY core of the pair: each core holds its I-slice of the whole
+        # group. A core's own half is a local copy; the peer's half is PUSHED
+        # by the peer out of the peer's HBM into this core's VMEM (a remote
+        # DMA writes the far side), so each core issues, per step, one local
+        # copy and one push of its own slice of the PEER's expert.
+        #
+        # Positions, not members, index the intermediate axis: own half at
+        # position 0, the peer's at position 1, on both cores.
+        tp_peer = jnp.int32(1) - tp_me
+        tp_peer_id = (tp_grp * ep_tp_size + tp_peer,)
 
-                @pl.when(jnp.int32(m) == tp_me)
-                def _(m=m, exp_m=exp_m):
-                    pltpu.make_async_copy(
-                        w1_hbm.at[exp_m, :, pl.ds(0, inter_slice)],
-                        w1_vm.at[0, :, pl.ds(m * inter_slice, inter_slice)],
-                        w1_sems.at[0],
-                    ).start(priority=WEIGHT_DMA_PRIORITY)
-                    pltpu.make_async_copy(
-                        w1_hbm.at[exp_m, :, pl.ds(inter_slice, inter_slice)],
-                        w1_vm.at[0, :, pl.ds(inter + m * inter_slice, inter_slice)],
-                        w1_sems.at[0],
-                    ).start(priority=WEIGHT_DMA_PRIORITY)
+        def _tp_expert(m, step):
+            return m * g_local + visit_sm[m, step]
 
-                @pl.when(jnp.int32(m) != tp_me)
-                def _(exp_m=exp_m, peer_id=peer_id):
-                    pltpu.make_async_remote_copy(
-                        src_ref=w1_hbm.at[exp_m, :, pl.ds(0, inter_slice)],
-                        dst_ref=w1_vm.at[0, :, pl.ds(tp_me * inter_slice, inter_slice)],
-                        send_sem=tp_w1_s_sem,
-                        recv_sem=tp_w1_r_sem,
-                        device_id=peer_id,
-                        device_id_type=pl.DeviceIdType.MESH,
-                    ).start()
-                    pltpu.make_async_remote_copy(
-                        src_ref=w1_hbm.at[exp_m, :, pl.ds(inter_slice, inter_slice)],
-                        dst_ref=w1_vm.at[
-                            0, :, pl.ds(inter + tp_me * inter_slice, inter_slice)
-                        ],
-                        send_sem=tp_w1_s_sem,
-                        recv_sem=tp_w1_r_sem,
-                        device_id=peer_id,
-                        device_id_type=pl.DeviceIdType.MESH,
-                    ).start()
+        def tp_w1_local_start(step):
+            """Own gate/up half of this core's expert at `step`, one slab."""
+            pltpu.make_async_copy(
+                w1_hbm.at[_tp_expert(tp_me, step)],
+                w1_vm.at[0],
+                w1_sems.at[0],
+            ).start(priority=WEIGHT_DMA_PRIORITY)
+
+        def tp_w1_peer_start(step, s):
+            """Push this core's half of the PEER's expert at `step` into the
+            peer's slot `s`; the peer does the same for this core."""
+            pltpu.make_async_remote_copy(
+                src_ref=w1_hbm.at[_tp_expert(tp_peer, step)],
+                dst_ref=tp_w1p_vm.at[s],
+                send_sem=tp_w1_s_sem.at[s],
+                recv_sem=tp_w1_r_sem.at[s],
+                device_id=tp_peer_id,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
 
         def tp_scales_starts(step, s):
-            """Start scale DMAs for `step` into slot `s` across TP peers."""
-            for m in range(ep_tp_size):
-                exp_m = m * g_local + visit_sm[m, step]
-                peer_id = (tp_grp * ep_tp_size + m,)
+            """Scale tables for `step` into slot `s`, own half at position 0
+            locally and this core's half at position 1 on the peer."""
+            exp_me = _tp_expert(tp_me, step)
+            exp_pr = _tp_expert(tp_peer, step)
+            pltpu.make_async_copy(
+                w1s_hbm.at[exp_me, pl.ds(0, inter_slice)],
+                w1s_vm.at[s, pl.ds(0, inter_slice)],
+                w1s_sems.at[s],
+            ).start(priority=WEIGHT_DMA_PRIORITY)
+            pltpu.make_async_copy(
+                w1s_hbm.at[exp_me, pl.ds(inter_slice, inter_slice)],
+                w1s_vm.at[s, pl.ds(inter, inter_slice)],
+                w1s_sems.at[s],
+            ).start(priority=WEIGHT_DMA_PRIORITY)
+            pltpu.make_async_copy(
+                w2s_hbm.at[exp_me, pl.ds(0, hidden)],
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                w2s_sems.at[s],
+            ).start(priority=WEIGHT_DMA_PRIORITY)
+            pltpu.make_async_remote_copy(
+                src_ref=w1s_hbm.at[exp_pr, pl.ds(0, inter_slice)],
+                dst_ref=w1s_vm.at[s, pl.ds(inter_slice, inter_slice)],
+                send_sem=tp_w1s_s_sem.at[s],
+                recv_sem=tp_w1s_r_sem.at[s],
+                device_id=tp_peer_id,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+            pltpu.make_async_remote_copy(
+                src_ref=w1s_hbm.at[exp_pr, pl.ds(inter_slice, inter_slice)],
+                dst_ref=w1s_vm.at[s, pl.ds(inter + inter_slice, inter_slice)],
+                send_sem=tp_w1s_s_sem.at[s],
+                recv_sem=tp_w1s_r_sem.at[s],
+                device_id=tp_peer_id,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+            pltpu.make_async_remote_copy(
+                src_ref=w2s_hbm.at[exp_pr, pl.ds(0, hidden)],
+                dst_ref=tp_w2s_vm.at[s, pl.ds(hidden, hidden)],
+                send_sem=tp_w2s_s_sem.at[s],
+                recv_sem=tp_w2s_r_sem.at[s],
+                device_id=tp_peer_id,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
 
-                @pl.when(jnp.int32(m) == tp_me)
-                def _(m=m, exp_m=exp_m):
-                    pltpu.make_async_copy(
-                        w1s_hbm.at[exp_m, pl.ds(0, inter_slice)],
-                        w1s_vm.at[s, pl.ds(m * inter_slice, inter_slice)],
-                        w1s_sems.at[s],
-                    ).start(priority=WEIGHT_DMA_PRIORITY)
-                    pltpu.make_async_copy(
-                        w1s_hbm.at[exp_m, pl.ds(inter_slice, inter_slice)],
-                        w1s_vm.at[s, pl.ds(inter + m * inter_slice, inter_slice)],
-                        w1s_sems.at[s],
-                    ).start(priority=WEIGHT_DMA_PRIORITY)
-                    pltpu.make_async_copy(
-                        w2s_hbm.at[exp_m, pl.ds(0, hidden)],
-                        tp_w2s_vm.at[s, pl.ds(m * hidden, hidden)],
-                        w2s_sems.at[s],
-                    ).start(priority=WEIGHT_DMA_PRIORITY)
-
-                @pl.when(jnp.int32(m) != tp_me)
-                def _(exp_m=exp_m, peer_id=peer_id):
-                    pltpu.make_async_remote_copy(
-                        src_ref=w1s_hbm.at[exp_m, pl.ds(0, inter_slice)],
-                        dst_ref=w1s_vm.at[s, pl.ds(tp_me * inter_slice, inter_slice)],
-                        send_sem=tp_w1s_s_sem.at[s],
-                        recv_sem=tp_w1s_r_sem.at[s],
-                        device_id=peer_id,
-                        device_id_type=pl.DeviceIdType.MESH,
-                    ).start()
-                    pltpu.make_async_remote_copy(
-                        src_ref=w1s_hbm.at[exp_m, pl.ds(inter_slice, inter_slice)],
-                        dst_ref=w1s_vm.at[
-                            s, pl.ds(inter + tp_me * inter_slice, inter_slice)
-                        ],
-                        send_sem=tp_w1s_s_sem.at[s],
-                        recv_sem=tp_w1s_r_sem.at[s],
-                        device_id=peer_id,
-                        device_id_type=pl.DeviceIdType.MESH,
-                    ).start()
-                    pltpu.make_async_remote_copy(
-                        src_ref=w2s_hbm.at[exp_m, pl.ds(0, hidden)],
-                        dst_ref=tp_w2s_vm.at[s, pl.ds(tp_me * hidden, hidden)],
-                        send_sem=tp_w2s_s_sem.at[s],
-                        recv_sem=tp_w2s_r_sem.at[s],
-                        device_id=peer_id,
-                        device_id_type=pl.DeviceIdType.MESH,
-                    ).start()
-
-        def tp_w2_starts(step, s):
-            """Start down-weight DMAs for `step` into slot `s` across TP peers."""
-            for m in range(ep_tp_size):
-                exp_m = m * g_local + visit_sm[m, step]
-                peer_id = (tp_grp * ep_tp_size + m,)
-
-                @pl.when(jnp.int32(m) == tp_me)
-                def _(m=m, exp_m=exp_m):
-                    pltpu.make_async_copy(
-                        w2_hbm.at[exp_m],
-                        w2_vm.at[s, pl.ds(m * inter_slice, inter_slice), :],
-                        w2_sems.at[s],
-                    ).start(priority=WEIGHT_DMA_PRIORITY)
-
-                @pl.when(jnp.int32(m) != tp_me)
-                def _(exp_m=exp_m, peer_id=peer_id):
-                    pltpu.make_async_remote_copy(
-                        src_ref=w2_hbm.at[exp_m],
-                        dst_ref=w2_vm.at[s, pl.ds(tp_me * inter_slice, inter_slice), :],
-                        send_sem=tp_w2_s_sem.at[s],
-                        recv_sem=tp_w2_r_sem.at[s],
-                        device_id=peer_id,
-                        device_id_type=pl.DeviceIdType.MESH,
-                    ).start()
+        def tp_w2_starts(step):
+            """Down slab for `step`: own rows at position 0 locally, this
+            core's rows at position 1 on the peer. One slot."""
+            pltpu.make_async_copy(
+                w2_hbm.at[_tp_expert(tp_me, step)],
+                w2_vm.at[0, pl.ds(0, inter_slice), :],
+                w2_sems.at[0],
+            ).start(priority=WEIGHT_DMA_PRIORITY)
+            pltpu.make_async_remote_copy(
+                src_ref=w2_hbm.at[_tp_expert(tp_peer, step)],
+                dst_ref=w2_vm.at[0, pl.ds(inter_slice, inter_slice), :],
+                send_sem=tp_w2_s_sem.at[0],
+                recv_sem=tp_w2_r_sem.at[0],
+                device_id=tp_peer_id,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
 
         def tp_wait_scales(s):
-            n_s1 = (ep_tp_size - 1) * 2 * inter_slice
-            n_s2 = (ep_tp_size - 1) * hidden
+            # Semaphores count bytes: each wait names a view of the bytes the
+            # matching starts moved, own half and pushed half alike. The send
+            # waits drain this core's own pushes (the peer's credit mirrors
+            # them), so every semaphore returns to zero once per slot use.
             pltpu.make_async_copy(
                 w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
                 w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
                 w1s_sems.at[s],
             ).wait()
             pltpu.make_async_copy(
-                w1s_vm.at[s, pl.ds(0, n_s1)],
-                w1s_vm.at[s, pl.ds(0, n_s1)],
+                w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
+                w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
                 tp_w1s_s_sem.at[s],
             ).wait()
             pltpu.make_async_copy(
-                w1s_vm.at[s, pl.ds(0, n_s1)],
-                w1s_vm.at[s, pl.ds(0, n_s1)],
+                w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
+                w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
                 tp_w1s_r_sem.at[s],
             ).wait()
             pltpu.make_async_copy(
@@ -1201,66 +1273,67 @@ def _build_fused_ep_moe_kernel(
                 w2s_sems.at[s],
             ).wait()
             pltpu.make_async_copy(
-                tp_w2s_vm.at[s, pl.ds(0, n_s2)],
-                tp_w2s_vm.at[s, pl.ds(0, n_s2)],
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
                 tp_w2s_s_sem.at[s],
             ).wait()
             pltpu.make_async_copy(
-                tp_w2s_vm.at[s, pl.ds(0, n_s2)],
-                tp_w2s_vm.at[s, pl.ds(0, n_s2)],
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
                 tp_w2s_r_sem.at[s],
             ).wait()
 
-        def tp_wait_w1():
-            n_rem = (ep_tp_size - 1) * 2 * inter_slice
+        def tp_wait_w1(s):
+            """Land the own half and the peer half (slot `s`) of gate/up."""
+            pltpu.make_async_copy(w1_vm.at[0], w1_vm.at[0], w1_sems.at[0]).wait()
             pltpu.make_async_copy(
-                w1_vm.at[0, :, pl.ds(0, 2 * inter_slice)],
-                w1_vm.at[0, :, pl.ds(0, 2 * inter_slice)],
-                w1_sems.at[0],
+                tp_w1p_vm.at[s], tp_w1p_vm.at[s], tp_w1_s_sem.at[s]
             ).wait()
             pltpu.make_async_copy(
-                w1_vm.at[0, :, pl.ds(0, n_rem)],
-                w1_vm.at[0, :, pl.ds(0, n_rem)],
-                tp_w1_s_sem,
-            ).wait()
-            pltpu.make_async_copy(
-                w1_vm.at[0, :, pl.ds(0, n_rem)],
-                w1_vm.at[0, :, pl.ds(0, n_rem)],
-                tp_w1_r_sem,
+                tp_w1p_vm.at[s], tp_w1p_vm.at[s], tp_w1_r_sem.at[s]
             ).wait()
 
-        def tp_wait_w2(s):
-            n_rem = (ep_tp_size - 1) * inter_slice
-            pltpu.make_async_copy(
-                w2_vm.at[s, pl.ds(0, inter_slice), :],
-                w2_vm.at[s, pl.ds(0, inter_slice), :],
-                w2_sems.at[s],
-            ).wait()
-            pltpu.make_async_copy(
-                w2_vm.at[s, pl.ds(0, n_rem), :],
-                w2_vm.at[s, pl.ds(0, n_rem), :],
-                tp_w2_s_sem.at[s],
-            ).wait()
-            pltpu.make_async_copy(
-                w2_vm.at[s, pl.ds(0, n_rem), :],
-                w2_vm.at[s, pl.ds(0, n_rem), :],
-                tp_w2_r_sem.at[s],
-            ).wait()
+        def tp_wait_w2():
+            """Land both halves of the down slab."""
+            half = w2_vm.at[0, pl.ds(0, inter_slice), :]
+            pltpu.make_async_copy(half, half, w2_sems.at[0]).wait()
+            pltpu.make_async_copy(half, half, tp_w2_s_sem.at[0]).wait()
+            pltpu.make_async_copy(half, half, tp_w2_r_sem.at[0]).wait()
 
         def _tp_retire_w1(visit_i, last_tile):
+            """`() -> ()`: at the last read of this visit's gate/up, refill the
+            OWN half for the next visit. Local VMEM, this core's own reads,
+            so no pair barrier stands in front of it; the peer half for the
+            next visit landed in its other slot a whole visit ago."""
+
             def retire():
                 @pl.when(jnp.logical_and(last_tile, visit_i + 1 < n_tp_visit))
                 def _():
-                    if tp_dbuf_w2:
-                        ns = lax.rem(visit_i + 1, jnp.int32(tp_w2_slots))
-                        tp_barrier(visit_i)
-                        tp_scales_starts(visit_i + 1, ns)
-                        tp_w1_starts(visit_i + 1)
-                    else:
-                        tp_barrier(2 * visit_i)
-                        tp_w1_starts(visit_i + 1)
+                    tp_w1_local_start(visit_i + 1)
 
             return retire
+
+        def tp_after_visit(visit_i):
+            """End of visit `visit_i`, both cores: the one pair barrier of
+            the visit, then every push whose destination slot it freed.
+
+            After the barrier neither core reads visit_i's buffers, so: the
+            down slot takes visit_i + 1 (its only runway is the next visit's
+            first gate/up matmul and the transport bookkeeping before it);
+            the peer gate/up slot and scale slot visit_i used take
+            visit_i + 2, a whole visit ahead of their first read.
+            """
+
+            @pl.when(visit_i + 1 < n_tp_visit)
+            def _():
+                s = lax.rem(visit_i, jnp.int32(tp_w1p_slots))
+                tp_barrier(visit_i)
+                tp_w2_starts(visit_i + 1)
+
+                @pl.when(visit_i + 2 < n_tp_visit)
+                def _():
+                    tp_scales_starts(visit_i + 2, s)
+                    tp_w1_peer_start(visit_i + 2, s)
 
         def _start_next_gate_up(visit_i, slot, last_tile):
             """`() -> ()`: start the NEXT expert's gate/up slab, called from
@@ -1918,8 +1991,11 @@ def _build_fused_ep_moe_kernel(
                         )
                     else:
                         first_tile, last_tile = t == 0, t == n_tiles - 1
+                        # The pair schedule slots its scale tables and the
+                        # peer gate/up half by visit parity; the own gate/up
+                        # half and the down slab have one slot each.
                         tp_s = (
-                            lax.rem(visit_i, jnp.int32(tp_w2_slots))
+                            lax.rem(visit_i, jnp.int32(tp_scl_slots))
                             if ep_tp_size > 1
                             else slot
                         )
@@ -1931,13 +2007,21 @@ def _build_fused_ep_moe_kernel(
                         acc2, mid_scale = expert_ffn_fp8(
                             act_rows,
                             act_scales,
-                            lambda: w1_vm[slot],
-                            lambda: w2_vm[tp_s],
+                            (
+                                (lambda: w1_vm[0], lambda: tp_w1p_vm[tp_s])
+                                if ep_tp_size > 1
+                                else (lambda: w1_vm[slot])
+                            ),
+                            (
+                                (lambda: w2_vm[0])
+                                if ep_tp_size > 1
+                                else (lambda: w2_vm[slot])
+                            ),
                             w1s_vm[pl.ds(tp_s, 1), :],
                             act_fn=act_fn,
                             w1b=w1b_row,
                             wait_w1=(
-                                (lambda: pl.when(first_tile)(tp_wait_w1))
+                                (lambda: pl.when(first_tile)(lambda: tp_wait_w1(tp_s)))
                                 if ep_tp_size > 1
                                 else (
                                     (lambda: wait_slab(w1_copy, 0))
@@ -1955,7 +2039,7 @@ def _build_fused_ep_moe_kernel(
                                 )
                             ),
                             wait_w2=(
-                                (lambda: pl.when(first_tile)(lambda: tp_wait_w2(tp_s)))
+                                (lambda: pl.when(first_tile)(tp_wait_w2))
                                 if ep_tp_size > 1
                                 else (
                                     (lambda: wait_slab(w2_copy, 0))
@@ -2202,12 +2286,22 @@ def _build_fused_ep_moe_kernel(
         if ep_tp_size == 1:
             carry_end = lax.fori_loop(0, n_visit, visit_step, carry0)
         else:
+            # The pair schedule's prologue: everything visit 0 reads, and the
+            # peer gate/up half and scale tables of visit 1 into their other
+            # slot, so that visit 1 is a visit ahead from the start.
 
             @pl.when(n_tp_visit > 0)
             def _():
                 tp_scales_starts(jnp.int32(0), jnp.int32(0))
-                tp_w1_starts(jnp.int32(0))
-                tp_w2_starts(jnp.int32(0), jnp.int32(0))
+                tp_w1_local_start(jnp.int32(0))
+                tp_w1_peer_start(jnp.int32(0), jnp.int32(0))
+                tp_w2_starts(jnp.int32(0))
+
+                @pl.when(n_tp_visit > 1)
+                def _():
+                    tp_scales_starts(jnp.int32(1), jnp.int32(1))
+                    tp_w1_peer_start(jnp.int32(1), jnp.int32(1))
+
                 e0 = visit_sm[tp_me, 0]
 
                 @pl.when(expert_rows_sm[e0] > 0)
@@ -2217,36 +2311,30 @@ def _build_fused_ep_moe_kernel(
             def tp_visit_step(visit_i, carry):
                 e = visit_sm[tp_me, visit_i]
                 rows = expert_rows_sm[e]
-                s = lax.rem(visit_i, jnp.int32(tp_w2_slots))
-                ns = lax.rem(visit_i + 1, jnp.int32(tp_w2_slots))
+                s = lax.rem(visit_i, jnp.int32(tp_scl_slots))
                 tp_wait_scales(s)
 
+                # A core whose expert at this step is empty (its peer's is
+                # not: an all-empty step is not in the list) still owes the
+                # step's waits, so the semaphores and the pushes it is the
+                # far side of stay in step with the peer's, and it refills
+                # its own gate/up half here since no tile will.
                 @pl.when(rows == 0)
                 def _():
-                    tp_wait_w1()
+                    tp_wait_w1(s)
+                    tp_wait_w2()
 
                     @pl.when(visit_i + 1 < n_tp_visit)
                     def _():
-                        if tp_dbuf_w2:
-                            tp_barrier(visit_i)
-                            tp_scales_starts(visit_i + 1, ns)
-                            tp_w1_starts(visit_i + 1)
-                        else:
-                            tp_barrier(2 * visit_i)
-                            tp_w1_starts(visit_i + 1)
-
-                    tp_wait_w2(s)
+                        tp_w1_local_start(visit_i + 1)
 
                 carry = expert_tiles(e, visit_i, carry)
 
+                # The next expert's first tile goes out before the pair
+                # barrier, so its row fetch runs under whatever the barrier
+                # waits for.
                 @pl.when(visit_i + 1 < n_tp_visit)
                 def _():
-                    if tp_dbuf_w2:
-                        tp_w2_starts(visit_i + 1, ns)
-                    else:
-                        tp_barrier(2 * visit_i + 1)
-                        tp_scales_starts(visit_i + 1, ns)
-                        tp_w2_starts(visit_i + 1, ns)
                     nxt = visit_sm[tp_me, visit_i + 1]
 
                     @pl.when(expert_rows_sm[nxt] > 0)
@@ -2257,6 +2345,8 @@ def _build_fused_ep_moe_kernel(
                             carry[-1],
                             rows > 0,
                         )
+
+                tp_after_visit(visit_i)
 
                 if push_from_vmem:
                     return carry
@@ -2301,6 +2391,15 @@ def _build_fused_ep_moe_kernel(
         _all_pairs_barrier(ep)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+
+    def _tp_scratch_shape(arr_name, shape):
+        """The pair schedule's shape for one of the host-listed buffers."""
+        if arr_name == "w1_vm":
+            return (1, hidden, 2 * inter_slice)
+        if arr_name == "w1s_vm":
+            return (tp_scl_slots, *shape[1:])
+        return shape
+
     # The VMEM buffers come from the same list the VMEM accounting sums, in
     # the order the kernel body unpacks them: lhs_vm, w1_vm, w2_vm, the scale
     # tables where the format has them, the bias tables each build asked for,
@@ -2314,10 +2413,11 @@ def _build_fused_ep_moe_kernel(
             pltpu.SMEM((gather_window_rows,), jnp.int32),
         ]
         + [
+            # The pair schedule re-slots two of these (see the schedule note
+            # at the top of the build): the gate/up slab holds the OWN half
+            # only, and the gate/up scale table is visit-parity deep.
             pltpu.VMEM(
-                (tp_w2_slots, *shape[1:])
-                if (ep_tp_size > 1 and arr_name in ("w2_vm", "w1s_vm"))
-                else shape,
+                _tp_scratch_shape(arr_name, shape) if ep_tp_size > 1 else shape,
                 dtype,
             )
             for arr_name, shape, dtype in host.vmem_scratch_arrays(
@@ -2340,19 +2440,17 @@ def _build_fused_ep_moe_kernel(
             # the lhs_vm and ls_vm buffers it guards, is an out-parity.
             pltpu.SemaphoreType.DMA((OUT_PARITIES,)),
             pltpu.SemaphoreType.DMA((nbuf,)),  # w1_sems
-            pltpu.SemaphoreType.DMA(
-                (tp_w2_slots if ep_tp_size > 1 else nbuf,)
-            ),  # w2_sems
+            pltpu.SemaphoreType.DMA((nbuf,)),  # w2_sems
         ]
         + (
             [
                 # The scale tables travel with the slabs they scale, so they are
                 # slot-deep and need their own sems: a wait is per-buffer.
                 pltpu.SemaphoreType.DMA(
-                    (tp_w2_slots if ep_tp_size > 1 else nbuf,)
+                    (tp_scl_slots if ep_tp_size > 1 else nbuf,)
                 ),  # w1s_sems
                 pltpu.SemaphoreType.DMA(
-                    (tp_w2_slots if ep_tp_size > 1 else nbuf,)
+                    (tp_scl_slots if ep_tp_size > 1 else nbuf,)
                 ),  # w2s_sems
             ]
             if has_scales
@@ -2383,16 +2481,19 @@ def _build_fused_ep_moe_kernel(
         + (
             [
                 pltpu.VMEM(
-                    (tp_w2_slots, ep_tp_size * hidden), jnp.float32
+                    (tp_scl_slots, ep_tp_size * hidden), jnp.float32
                 ),  # tp_w2s_vm
-                pltpu.SemaphoreType.DMA,  # tp_w1_s_sem
-                pltpu.SemaphoreType.DMA,  # tp_w1_r_sem
-                pltpu.SemaphoreType.DMA((tp_w2_slots,)),  # tp_w2_s_sem
-                pltpu.SemaphoreType.DMA((tp_w2_slots,)),  # tp_w2_r_sem
-                pltpu.SemaphoreType.DMA((tp_w2_slots,)),  # tp_w1s_s_sem
-                pltpu.SemaphoreType.DMA((tp_w2_slots,)),  # tp_w1s_r_sem
-                pltpu.SemaphoreType.DMA((tp_w2_slots,)),  # tp_w2s_s_sem
-                pltpu.SemaphoreType.DMA((tp_w2_slots,)),  # tp_w2s_r_sem
+                pltpu.VMEM(
+                    (tp_w1p_slots, hidden, 2 * inter_slice), form.weight_dtype
+                ),  # tp_w1p_vm
+                pltpu.SemaphoreType.DMA((tp_w1p_slots,)),  # tp_w1_s_sem
+                pltpu.SemaphoreType.DMA((tp_w1p_slots,)),  # tp_w1_r_sem
+                pltpu.SemaphoreType.DMA((nbuf,)),  # tp_w2_s_sem
+                pltpu.SemaphoreType.DMA((nbuf,)),  # tp_w2_r_sem
+                pltpu.SemaphoreType.DMA((tp_scl_slots,)),  # tp_w1s_s_sem
+                pltpu.SemaphoreType.DMA((tp_scl_slots,)),  # tp_w1s_r_sem
+                pltpu.SemaphoreType.DMA((tp_scl_slots,)),  # tp_w2s_s_sem
+                pltpu.SemaphoreType.DMA((tp_scl_slots,)),  # tp_w2s_r_sem
                 pltpu.SemaphoreType.REGULAR((2,)),  # tp_bar_sem
             ]
             if ep_tp_size > 1
