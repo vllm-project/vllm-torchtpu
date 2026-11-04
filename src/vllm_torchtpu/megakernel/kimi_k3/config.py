@@ -163,6 +163,11 @@ class KernelConfig:
     dcp_skip: tuple[str, ...] = ()
     debug_skip: tuple[str, ...] = ()
     phase_scopes: bool = False
+    # bench prefill diagnostics: unused device memory (GiB) in chunks, allocated
+    # after (or before, diag_ballast_first) the weights.
+    diag_ballast_gb: float = 0.0
+    diag_ballast_chunk_gb: float = 0.0
+    diag_ballast_first: bool = False
     # Hot-expert fp8 copies (off when empty): an npz whose ``experts``
     # [92, 8, S] holds the global expert id in copy slot j of EP group g
     # per MoE layer (-1: empty). A bare name loads from kimi_k3/data.

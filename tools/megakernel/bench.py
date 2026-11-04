@@ -304,7 +304,28 @@ def run_prefill(args, records: harness.Records) -> None:
         args.presharded,
         tp_rank=torch.distributed.get_rank(),
     )
+    ballast = []
+
+    def allocate_ballast():
+        # Diagnostics: diag_ballast_gb of unused device memory in
+        # diag_ballast_chunk_gb tensors (HBM placement experiments).
+        total = kernel_config.active().diag_ballast_gb
+        chunk = kernel_config.active().diag_ballast_chunk_gb or total
+        while total > 0:
+            size = int(min(chunk, total) * 2**30)
+            ballast.append(torch.zeros(size, dtype=torch.uint8, device="tpu"))
+            bridge.materialize(ballast[-1])
+            total -= chunk
+        if ballast:
+            harness.log(f"ballast: {len(ballast)} tensors, {sum(b.numel() for b in ballast) / 2**30:.1f} GiB")
+
+    from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
+
+    if kernel_config.active().diag_ballast_first:
+        allocate_ballast()
     prefiller.load_weights()
+    if not kernel_config.active().diag_ballast_first:
+        allocate_ballast()
     # Per request slot: real MLA pages for the longest case that uses it (the
     # window reads and writes them), but a KDA state block only at the
     # columns a step touches -- a hit's and the final one; the rest of the
