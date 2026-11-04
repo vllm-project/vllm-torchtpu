@@ -2730,10 +2730,15 @@ def test_kimi_k31_serves_through_k3_chat_path(tokenizer_mode, expected) -> None:
 
 
 def _k31_vllm_config(
-    speculative_config=None, cache_dtype="fp8", dtype=torch.bfloat16, kv_lora_rank=512
+    speculative_config=None,
+    cache_dtype="fp8",
+    dtype=torch.bfloat16,
+    kv_lora_rank=512,
+    dcp=1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         speculative_config=speculative_config,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
         cache_config=SimpleNamespace(cache_dtype=cache_dtype),
         model_config=SimpleNamespace(
             dtype=dtype,
@@ -2747,7 +2752,11 @@ def _k31_vllm_config(
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"speculative_config": object()}, "speculative"),
+        ({"speculative_config": SimpleNamespace(method="mtp")}, "only DSpark"),
+        (
+            {"speculative_config": SimpleNamespace(method="dspark"), "dcp": 8},
+            "decode-context-parallel-size",
+        ),
         ({"cache_dtype": "auto"}, "fp8_e4m3"),
         ({"cache_dtype": "fp8_e5m2"}, "fp8_e4m3"),
         ({"cache_dtype": "fp8_ds_mla"}, "fp8_e4m3"),
@@ -2759,6 +2768,12 @@ def test_kimi_k31_config_rejects_unsupported_serving(overrides, message) -> None
     _TPUKimiK31Config.verify_and_update_config(_k31_vllm_config())
     with pytest.raises(NotImplementedError, match=message):
         _TPUKimiK31Config.verify_and_update_config(_k31_vllm_config(**overrides))
+
+
+def test_kimi_k31_config_accepts_dspark() -> None:
+    _TPUKimiK31Config.verify_and_update_config(
+        _k31_vllm_config(speculative_config=SimpleNamespace(method="dspark"))
+    )
 
 
 def test_kimi_k31_config_rejects_sp_prefill(monkeypatch) -> None:
