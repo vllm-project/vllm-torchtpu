@@ -41,7 +41,7 @@ from typing import Any
 
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 
-from .plugin import API_VERSION, SHORTHANDS, TpuMonoSpec
+from .plugin import API_VERSION, SHORTHANDS, Shorthand, TpuMonoSpec
 
 RUNTIME_KEYS = frozenset({"plugin", "options", "enabled", "ab", "stats_period_s"})
 _LEGACY_KEYS = frozenset().union(*(s.legacy_keys for s in SHORTHANDS.values()))
@@ -272,13 +272,37 @@ def _hf_arch_candidates(hf_config: Any) -> list[str]:
     return cands
 
 
+def _matches_hf_fields(sh: Shorthand, hf_config: object) -> bool:
+    if not sh.hf_fields:
+        return True
+    if hf_config is None:
+        return False
+
+    def sub(cfg: Any, k: str) -> Any:
+        return cfg.get(k) if isinstance(cfg, Mapping) else getattr(cfg, k, None)
+
+    for k, v in sh.hf_fields:
+        val = None
+        for root in (hf_config, sub(hf_config, "text_config")):
+            if root is not None and (val := sub(root, k)) is not None:
+                break
+        if val != v:
+            return False
+    return True
+
+
 def shorthand_for_arch(hf_config: Any) -> str | None:
     """The shorthand template that serves this checkpoint's arch, if any (from
     the HF config's `architectures` / `model_type` only)."""
-    for cand in _hf_arch_candidates(hf_config):
-        for name, sh in SHORTHANDS.items():
-            if cand in sh.architectures or cand in sh.model_types:
-                return name
+    candidates = _hf_arch_candidates(hf_config)
+    for with_fields in (True, False):
+        for cand in candidates:
+            for name, sh in SHORTHANDS.items():
+                if bool(sh.hf_fields) != with_fields:
+                    continue
+                is_arch = cand in sh.architectures or cand in sh.model_types
+                if is_arch and _matches_hf_fields(sh, hf_config):
+                    return name
     return None
 
 
@@ -292,8 +316,21 @@ def resolve_plugin_ref(
         name = cfg.plugin.lower()
         ref = PluginRef(SHORTHANDS[name].module, shorthand=name)
     elif cfg.plugin is not None:
-        mod, _, attr = cfg.plugin.partition(":")
-        ref = PluginRef(mod.strip(), attr.strip() or "SPEC")
+        raw_plugin = cfg.plugin.strip()
+        if ":" in raw_plugin:
+            mod, _, attr = raw_plugin.partition(":")
+            ref = PluginRef(mod.strip(), attr.strip() or "SPEC")
+        elif "." in raw_plugin:
+            ref = PluginRef(raw_plugin, "SPEC")
+        else:
+            mod_name = f"vllm_torchtpu.models.{raw_plugin}.megakernel"
+            try:  # imports only the model package, never the plugin module
+                found = importlib.util.find_spec(mod_name) is not None
+            except ModuleNotFoundError as exc:
+                if not f"{mod_name}.".startswith(f"{exc.name}."):
+                    raise  # a nested missing module stays visible
+                found = False
+            ref = PluginRef(mod_name if found else raw_plugin, "SPEC")
     else:
         name = shorthand_for_arch(hf_config)
         if name is None:

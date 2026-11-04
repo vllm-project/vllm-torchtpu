@@ -145,6 +145,9 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     create_sequence_layout_planner,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel_runtime.hooks import (
+    load_tensor_stream,
+)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -5291,16 +5294,33 @@ class TPUModelRunner(GPUModelRunner):
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
-        with (
-            set_vllm_model_wrapper_context(
-                mesh=self.mesh, vllm_config=self.vllm_config
-            ),
-            set_current_vllm_config(self.vllm_config),
-        ):
-            load_model = cast(Callable[..., torch.nn.Module], model_loader.load_model)
-            model = load_model(
-                vllm_config=self.vllm_config, model_config=self.model_config
-            )
+
+        orig_get_all_weights = getattr(model_loader, "get_all_weights", None)
+        if callable(orig_get_all_weights):
+
+            def _stream_weights(
+                *args: object, **kwargs: object
+            ) -> Iterator[tuple[str, torch.Tensor]]:
+                weights = orig_get_all_weights(*args, **kwargs)
+                return load_tensor_stream(self.vllm_config, weights)
+
+            model_loader.get_all_weights = _stream_weights
+        try:
+            with (
+                set_vllm_model_wrapper_context(
+                    mesh=self.mesh, vllm_config=self.vllm_config
+                ),
+                set_current_vllm_config(self.vllm_config),
+            ):
+                load_model = cast(
+                    Callable[..., torch.nn.Module], model_loader.load_model
+                )
+                model = load_model(
+                    vllm_config=self.vllm_config, model_config=self.model_config
+                )
+        finally:
+            if orig_get_all_weights is not None:
+                model_loader.get_all_weights = orig_get_all_weights
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         if self.is_pooling_model:

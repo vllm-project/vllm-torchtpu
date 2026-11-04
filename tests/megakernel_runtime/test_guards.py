@@ -255,13 +255,6 @@ def test_features_before_requires() -> None:
     assert res is not None and res.code == "spec_decode_unsupported"
 
 
-@pytest.mark.parametrize("domain", ["tp_x_dcp", "kernel_mesh"])
-def test_unsupported_collective_domain_is_a_named_decline(domain: str) -> None:
-    res = _check(testing.fake_runner(), collective_domain=domain)
-    assert res is not None and res.code == f"parallelism_unsupported:{domain}"
-    assert _check(testing.fake_runner(), collective_domain="tp") is None
-
-
 def test_find_backbone_and_aux_hidden_state_layers() -> None:
     backbone = SimpleNamespace(layers=[], norm=None)
     for model in (

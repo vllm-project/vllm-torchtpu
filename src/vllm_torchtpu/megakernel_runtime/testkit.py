@@ -154,6 +154,16 @@ def route_lazy_loggers(monkeypatch: pytest.MonkeyPatch, *packages: str) -> None:
             lazy._resolve()
         except ModuleNotFoundError:
             monkeypatch.setattr(lazy, "_logger", logging.getLogger(lazy._name))
+    import contextlib
+
+    with contextlib.suppress(Exception):
+        import vllm.distributed.parallel_state as ps
+
+        if ps._TP is None:
+            monkeypatch.setattr(ps, "get_tensor_model_parallel_rank", lambda: 0)
+            import vllm.distributed as dist_mod
+
+            monkeypatch.setattr(dist_mod, "get_tensor_model_parallel_rank", lambda: 0)
 
 
 # --- check_spec -----------------------------------------------------------------
@@ -295,22 +305,28 @@ def run_cpu_e2e(
         runner = runner()
     if plugin is not None or options is not None:
         _set_plugin(runner, plugin, options)
-    drv = maybe_create(runner)
-    if drv is None or not drv.serving:
-        decline = getattr(drv, "decline", None)
-        raise AssertionError(f"megakernel not serving after startup: {decline}")
-    runner._megakernel = drv
-    drv.bind_and_warmup(runner)
-    if runner._megakernel is not drv:
-        decline = getattr(runner._megakernel, "decline", None)
-        raise AssertionError(f"megakernel declined at bind: {decline}")
-    program = drv.program
-    md = metadata(program) if callable(metadata) else dict(metadata or {})
-    ctxs = steps(program) if callable(steps) else steps
-    hits: list[bool] = []
-    outputs: list[Any] = []
-    fwd_ctx = SimpleNamespace(attn_metadata=md)
-    with mock.patch.object(driver_mod, "get_forward_context", lambda: fwd_ctx):
+    runner_rank = getattr(runner, "tp_rank", 0)
+    fwd_ctx = SimpleNamespace(attn_metadata=None)
+    with (
+        mock.patch.object(driver_mod, "get_forward_context", lambda: fwd_ctx),
+        mock.patch.object(driver_mod, "_local_tp_rank", lambda: runner_rank),
+        mock.patch.object(driver_mod, "_get_pallas_mesh_fn", lambda: None),
+    ):
+        drv = maybe_create(runner)
+        if drv is None or not drv.serving:
+            decline = getattr(drv, "decline", None)
+            raise AssertionError(f"megakernel not serving after startup: {decline}")
+        runner._megakernel = drv
+        drv.bind_and_warmup(runner)
+        if runner._megakernel is not drv:
+            decline = getattr(runner._megakernel, "decline", None)
+            raise AssertionError(f"megakernel declined at bind: {decline}")
+        program = drv.program
+        md = metadata(program) if callable(metadata) else dict(metadata or {})
+        fwd_ctx.attn_metadata = md
+        ctxs = steps(program) if callable(steps) else steps
+        hits: list[bool] = []
+        outputs: list[Any] = []
         for ctx in _step_contexts(ctxs):
             hit, out = drv.try_forward(runner, ctx)
             hits.append(bool(hit))
@@ -336,6 +352,8 @@ for lazy in (d.logger, a.logger):
     except ModuleNotFoundError:
         lazy._logger = logging.getLogger("mk")
 a._tp_cpu_group = lambda: dist.group.WORLD
+d._local_tp_rank = lambda: rank
+d._get_pallas_mesh_fn = lambda: None
 runner = testing.fake_runner(
     tp_size=2,
     megakernel={"plugin": plugin, "options": json.loads(options)},

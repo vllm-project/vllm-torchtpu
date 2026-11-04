@@ -86,7 +86,8 @@ def test_shorthand_table_entries() -> None:
         )
         assert entry.architectures and entry.model_types
         for key in (*entry.architectures, *entry.model_types):
-            assert isinstance(key, str) and claimed.setdefault(key, name) == name
+            claim_key = f"{key}:{entry.hf_fields}" if entry.hf_fields else key
+            assert isinstance(key, str) and claimed.setdefault(claim_key, name) == name
 
 
 def test_plugin_reexports_the_contract() -> None:

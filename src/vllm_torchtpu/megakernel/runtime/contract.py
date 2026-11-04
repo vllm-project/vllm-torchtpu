@@ -94,8 +94,7 @@ NUMERICS: frozenset[str] = frozenset({"exact", "approx"})
 
 # --- Collective domains: the group of ranks a spec's kernel communicates
 # across, which is the group the runtime's startup / bind agreements must
-# span. Only "tp" (the TP group) is served today; the others decline at
-# startup with `parallelism_unsupported:<domain>`.
+# span.
 DOMAIN_TP = "tp"
 DOMAIN_TP_X_DCP = "tp_x_dcp"
 DOMAIN_KERNEL_MESH = "kernel_mesh"
@@ -275,6 +274,7 @@ class TpuMonoSpec:
     numerics: str = "exact"
     collective_domain: str = DOMAIN_TP
     layout_request: str | Callable[..., Any] | None = None
+    load_tensor: str | Callable[..., Any] | None = None
     decline_codes: tuple[str, ...] = ()
     source_root: str | None = None
     api_version: int = API_VERSION

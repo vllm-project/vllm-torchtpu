@@ -23,7 +23,7 @@ from typing import Any
 
 from vllm_torchtpu import _OFFLOADING_CONNECTORS
 from vllm_torchtpu.megakernel.runtime.contract import (
-    DOMAIN_TP,
+    DOMAIN_KERNEL_MESH,
     PARALLELISM_UNSUPPORTED,
     REQUIRES_KEYS,
     REQUIRES_UNMET,
@@ -150,13 +150,27 @@ _PARALLELISM_DETAIL = {
 }
 
 
+def _dp_size(runner: Any) -> int:
+    """Return the effective data-parallel size for the runner."""
+    p_cfg = _runner_cfg(runner, "parallel_config")
+    return int(os.environ.get("TORCH_TPU_DP_SIZE", "0") or 0) or int(
+        getattr(p_cfg, "data_parallel_size", 1) or 1
+    )
+
+
+def domain_world_size(domain: str, runner: Any, view: RunnerView) -> int:
+    """The rank count a spec's collective domain communicates across."""
+    if domain == DOMAIN_KERNEL_MESH:
+        return _dp_size(runner) * view.tp_size
+    # tp and tp_x_dcp: vLLM keeps DCP inside TP when PCP == 1.
+    return view.tp_size
+
+
 def detect_parallelism(runner: Any, tp_size: int) -> list[str]:
     """The parallelism kinds (beyond "tp") the runner uses, in check order.
     Reads config and group sizes only: no collective."""
     p_cfg = _runner_cfg(runner, "parallel_config")
-    dp = int(os.environ.get("TORCH_TPU_DP_SIZE", "0") or 0) or int(
-        getattr(p_cfg, "data_parallel_size", 1) or 1
-    )
+    dp = _dp_size(runner)
     ep_wide = _ep_group_size() > max(1, int(tp_size))
     dp_fn = getattr(runner, "_dp_lockstep_enabled", None)
     pp_multi = not (
@@ -216,13 +230,7 @@ def check_spec(runner: Any, spec: Any, *, view: RunnerView) -> EligibilityResult
             f"{tp_size}; skipping."
         )
         return EligibilityResult(False, UNSUPPORTED_TP_SIZE, msg)
-    domain = spec.collective_domain
-    if domain != DOMAIN_TP:
-        return _decline(
-            f"{PARALLELISM_UNSUPPORTED}:{domain}",
-            f"agrees across the TP group only: collective_domain {domain!r} "
-            "is unsupported",
-        )
+
     for kind in detect_parallelism(runner, tp_size):
         if kind not in spec.parallelism:
             return _decline(

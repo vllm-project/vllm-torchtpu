@@ -461,26 +461,6 @@ def test_agreements_run_over_the_declared_domain_group(
     assert log == [("resolve", "tp"), ("all_reduce", group)] * 2
 
 
-@pytest.mark.parametrize("domain", ["tp_x_dcp", "kernel_mesh"])
-def test_unsupported_collective_domain_declines_before_any_collective(
-    toy: Path, monkeypatch: pytest.MonkeyPatch, domain: str
-) -> None:
-    src = toy.read_text("utf-8").replace(
-        'decline_codes=("toy_declined",)',
-        f'decline_codes=("toy_declined",), collective_domain="{domain}"',
-    )
-    toy.write_text(src, encoding="utf-8")
-    _forbid_create_and_collectives(monkeypatch)
-
-    def no_group(*_a: Any, **_k: Any) -> Any:
-        raise AssertionError("must decline before resolving an agreement group")
-
-    monkeypatch.setattr(driver_mod, "agreement_group", no_group)
-    monkeypatch.setattr(agreement_mod, "agreement_group", no_group)
-    monkeypatch.setattr(agreement_mod, "_tp_cpu_group", no_group)
-    assert driver_mod.ProgramDriver.maybe_create(_runner()) is None
-
-
 def test_weight_update_guard() -> None:
     mkr.guard_weight_update(SimpleNamespace(_megakernel=None))
     mkr.guard_weight_update(SimpleNamespace())

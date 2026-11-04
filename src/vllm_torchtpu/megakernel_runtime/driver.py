@@ -71,6 +71,7 @@ from vllm_torchtpu.megakernel_runtime.guards import (
     check_runner_features,
     check_spec,
     detect_parallelism,
+    domain_world_size,
     kv_connector_is_offloading,
     kv_connector_names,
 )
@@ -133,13 +134,17 @@ def _get_pallas_mesh_fn() -> Any:
     return get_pallas_mesh
 
 
-def check_mesh_size(tp_size: int, mesh_size: int) -> EligibilityResult | None:
-    """`mesh_size_mismatch` when the TP-rank mesh doesn't hold `tp_size`
-    devices (`None` if it does). The chip and the TP size are `check_spec`'s."""
-    if int(mesh_size) != int(tp_size):
+def check_mesh_size(expected_size: int, mesh_size: int) -> EligibilityResult | None:
+    """Check that the rank mesh holds the expected device count.
+
+    Returns `mesh_size_mismatch` when the rank mesh doesn't hold `expected_size`
+    devices (`None` if it does). The chip and rank count are checked by
+    `check_spec`.
+    """
+    if int(mesh_size) != int(expected_size):
         msg = (
             f"Megakernel TP-rank mesh has {mesh_size} devices, "
-            f"expected {tp_size}; skipping."
+            f"expected {expected_size}; skipping."
         )
         return EligibilityResult(False, "mesh_size_mismatch", msg)
     return None
@@ -470,7 +475,6 @@ class ProgramDriver:
                 loaded_numerics_note(plugin.numerics, options),
                 fprint[:16],
             )
-            tp_size = view.tp_size
             el = check_spec(runner, plugin, view=view)
             if el is not None:
                 cls._log_startup_ineligible(el)
@@ -483,14 +487,15 @@ class ProgramDriver:
             out = create(view, dict(options))
             decline = _check_create_result(out, ref)
             if decline is None:
+                mesh_ranks = domain_world_size(domain, runner, view)
                 try:
                     mesh = _build_tp_rank_mesh(
-                        tp_size, fallback_mesh=getattr(runner, "mesh", None)
+                        mesh_ranks, fallback_mesh=getattr(runner, "mesh", None)
                     )
                 except MeshDecline as exc:
                     decline = exc.result
                 else:
-                    decline = check_mesh_size(tp_size, int(mesh.devices.size))
+                    decline = check_mesh_size(mesh_ranks, int(mesh.devices.size))
         except BaseException:
             _vote_startup_failure(token, codes, domain, runner)
             raise

@@ -119,11 +119,14 @@ def test_declined_driver_joins_the_bind_agreement(fake_tp_group: Any) -> None:
 
 def test_agreement_group_resolves_the_tp_group(monkeypatch: pytest.MonkeyPatch) -> None:
     tp = object()
+    world = object()
     monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: tp)
+    monkeypatch.setattr(agreement_mod, "_world_cpu_group", lambda: world)
     assert agreement_mod.agreement_group("tp", None) is tp
-    for domain in ("tp_x_dcp", "kernel_mesh"):
-        with pytest.raises(MegakernelPluginError, match=domain):
-            agreement_mod.agreement_group(domain, None)
+    assert agreement_mod.agreement_group("tp_x_dcp", None) is tp
+    assert agreement_mod.agreement_group("kernel_mesh", None) is world
+    with pytest.raises(MegakernelPluginError, match="bogus_domain"):
+        agreement_mod.agreement_group("bogus_domain", None)
 
 
 def _spec(**kw: Any) -> TpuMonoSpec:

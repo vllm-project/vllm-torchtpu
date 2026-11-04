@@ -56,6 +56,7 @@ class Shorthand(NamedTuple):
     architectures: tuple[str, ...]
     model_types: tuple[str, ...]
     legacy_keys: frozenset[str]
+    hf_fields: tuple[tuple[str, Any], ...] = ()
 
 
 # Built-in templates by shorthand name. Imported by string only, so the
@@ -83,6 +84,25 @@ SHORTHANDS: Mapping[str, Shorthand] = {
                 "compile_hlo_check",
             }
         ),
+    ),
+    "qwen38_2_4t": Shorthand(
+        module="vllm_torchtpu.models.qwen38_2_4t.megakernel",
+        architectures=(
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForCausalLM",
+        ),
+        model_types=("qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text"),
+        legacy_keys=frozenset(),
+        hf_fields=(("num_hidden_layers", 92), ("hidden_size", 8192)),
+    ),
+    "kimi_k3": Shorthand(
+        module="vllm_torchtpu.models.kimi_k3.megakernel",
+        architectures=("KimiK3ForConditionalGeneration",),
+        model_types=("kimi_k3",),
+        legacy_keys=frozenset(),
+        hf_fields=(),
     ),
 }
 

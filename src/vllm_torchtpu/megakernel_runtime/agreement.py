@@ -25,7 +25,12 @@ import torch
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.runtime import stats as _stats
-from vllm_torchtpu.megakernel.runtime.contract import DOMAIN_TP, EligibilityResult
+from vllm_torchtpu.megakernel.runtime.contract import (
+    DOMAIN_KERNEL_MESH,
+    DOMAIN_TP,
+    DOMAIN_TP_X_DCP,
+    EligibilityResult,
+)
 from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext, is_suppressed
 
@@ -77,14 +82,26 @@ def _tp_cpu_group() -> Any:
     return tp_group.cpu_group
 
 
+def _world_cpu_group() -> Any:
+    """The world CPU (gloo) group, or `None` on a single rank."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    from vllm.distributed import get_world_group
+
+    world = get_world_group()
+    return world.cpu_group if int(world.world_size) > 1 else None
+
+
 def agreement_group(domain: str, runner: Any) -> Any:
     """The CPU process group a spec's agreements run over for its
     `collective_domain` (`None` on a single rank): the ranks its kernel
-    communicates with. Only "tp" (the TP group) resolves today;
-    `check_spec` declines the other domains before any collective."""
+    communicates with."""
     del runner
-    if domain == DOMAIN_TP:
+    # tp_x_dcp: vLLM keeps DCP inside TP when PCP == 1 (tp % dcp == 0).
+    if domain in (DOMAIN_TP, DOMAIN_TP_X_DCP):
         return _tp_cpu_group()
+    if domain == DOMAIN_KERNEL_MESH:
+        return _world_cpu_group()
     raise MegakernelPluginError(f"collective_domain {domain!r} has no agreement group")
 
 
