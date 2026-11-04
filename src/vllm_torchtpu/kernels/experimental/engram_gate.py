@@ -22,6 +22,19 @@ def gate_residual(
     mask: jax.Array,
 ) -> jax.Array:
     """Tile32 candidate with the actual model constants and BF16 inputs."""
+    if hidden.shape[0] != TOKENS:
+        h = hidden.astype(jnp.float32)
+        keys = (
+            kv[:, : MULT * DIM].reshape(hidden.shape[0], MULT, DIM).astype(jnp.float32)
+        )
+        values = kv[:, MULT * DIM :].astype(jnp.float32)
+        dot = jnp.sum(h * qw.astype(jnp.float32) * kw.astype(jnp.float32) * keys, -1)
+        dot *= lax.rsqrt(jnp.mean(h * h, axis=-1) + EPS)
+        dot *= lax.rsqrt(jnp.mean(keys * keys, axis=-1) + EPS) * DIM**-0.5
+        root = jnp.sqrt(jnp.maximum(jnp.abs(dot), CLAMP))
+        gate = jax.nn.sigmoid(jnp.where(dot < 0, -root, root)) * mask[:, None]
+        return (h + gate[:, :, None] * values[:, None, :]).astype(hidden.dtype)
+
     tile = 32
 
     def kernel(hr, kr, qr, wr, mr, output):

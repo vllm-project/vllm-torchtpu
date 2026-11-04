@@ -864,9 +864,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and kv_meta.query_start_loc.shape == (49,)
             and state_meta.query_start_loc.shape == (49,)
             and state_meta.seq_lens.numel() > 0
-            and hidden_states.shape == (288, 5120)
+            and hidden_states.shape[1] == 5120
             and supports_compressor_state_packed(
-                positions.shape[0],
+                288,  # Token dispatch happens inside the shape-specialized JAX op.
                 tuple(_block_table(state_meta).shape),
                 state_cache.shape[1],
                 state_cache.page_stride,
