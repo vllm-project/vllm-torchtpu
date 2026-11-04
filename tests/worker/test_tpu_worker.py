@@ -280,6 +280,15 @@ class TestProfileCaptureAndMerge:
         assert not list(tmp_path.iterdir())
 
 
+def test_reset_encoder_cache_delegates_to_model_runner():
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.model_runner = MagicMock()
+
+    worker.reset_encoder_cache()
+
+    worker.model_runner.reset_encoder_cache.assert_called_once_with()
+
+
 def test_initialize_from_config_updates_num_gpu_blocks():
     worker = TPUWorker.__new__(TPUWorker)
     worker.cache_config = MagicMock(num_gpu_blocks=None)
