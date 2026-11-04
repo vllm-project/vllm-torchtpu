@@ -358,7 +358,7 @@ def test_coordinated_encoder_dp_shards_and_gathers_empty_and_uneven_ranks(
     def tensors_gather(padded, *, dim):
         assert dim == 0
         torch.testing.assert_close(padded, gathered[rank * 12 : (rank + 1) * 12])
-        assert mm.synchronize_tensors.call_args == call(padded, wait=True)
+        assert mm.synchronize_tensors.call_args == call(padded, wait=False)
         return gathered
 
     tp.all_gather.side_effect = tensors_gather
@@ -369,7 +369,7 @@ def test_coordinated_encoder_dp_shards_and_gathers_empty_and_uneven_ranks(
     assert manager._compiled_budget_forward.call_count == (
         1 if assignments[rank] else 2
     )
-    assert mm.synchronize_tensors.call_args == call(gathered, wait=True)
+    assert mm.synchronize_tensors.call_args == call(gathered, wait=False)
     tp.all_gather.assert_called_once()
 
 
@@ -409,7 +409,7 @@ def test_data_parallel_execute_gathers_between_synchronizations(
         torch.testing.assert_close(
             padded, gathered[rank * max_tokens : (rank + 1) * max_tokens]
         )
-        assert mm.synchronize_tensors.call_args == call(padded, wait=True)
+        assert mm.synchronize_tensors.call_args == call(padded, wait=False)
         return gathered
 
     tp.all_gather.side_effect = tensors_gather
@@ -417,7 +417,7 @@ def test_data_parallel_execute_gathers_between_synchronizations(
     assert [o.shape[0] for o in outputs] == counts
     for count, output in zip(counts, outputs, strict=True):
         assert (output == count).all()
-    assert mm.synchronize_tensors.call_args == call(gathered, wait=True)
+    assert mm.synchronize_tensors.call_args == call(gathered, wait=False)
     tp.all_gather.assert_called_once()
 
 
