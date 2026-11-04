@@ -426,6 +426,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS",
         "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER",
         "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META",
+        "MOE_FUSED_EP_PUSH_EARLY_ROW_GATHER",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

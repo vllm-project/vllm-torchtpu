@@ -266,6 +266,7 @@ def fused_ep_moe_push(
     bf16_sort_counts=False,
     slim_prepush_barrier=False,
     fused_dispatch_meta=False,
+    early_row_gather=False,
     expert_slot=None,
     expert_load=None,
 ):
@@ -298,8 +299,10 @@ def fused_ep_moe_push(
     tables out of the pre-push barrier, and `fused_dispatch_meta` builds the
     pre-push counts, this shard's visit list and the kernel's remote-row
     count with the dispatch segments (host.push_dispatch_tables) instead of
-    decoding them back out of them. The caller
-    (layers/adapter/fused_moe_ep.py) reads all thirteen from envs.
+    decoding them back out of them, and `early_row_gather` (with
+    `exchange_row_gather`) issues the exchange kernel's row copies before
+    its entry barrier. The caller (layers/adapter/fused_moe_ep.py) reads all
+    fourteen from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -452,6 +455,8 @@ def fused_ep_moe_push(
         n_pre = g_local
     tc_exchange = bool(tc_exchange)
     exchange_row_gather = bool(exchange_row_gather)
+    if early_row_gather and not exchange_row_gather:
+        raise ValueError("early_row_gather needs exchange_row_gather")
     if exchange_row_gather and not tc_exchange:
         raise ValueError(
             "exchange_row_gather needs the TensorCore exchange (tc_exchange)"
@@ -850,7 +855,10 @@ def fused_ep_moe_push(
                     bf16_counts=bf16_sort_counts,
                 )
             exchange, q_sorted = build_tc_exchange_all_gather_rows(
-                ep=ep, width=layout[-1], n_rows=tok.shape[0]
+                ep=ep,
+                width=layout[-1],
+                n_rows=tok.shape[0],
+                before_barrier=early_row_gather,
             )(packed, rank_l[0, 0], q_l, tok)
             exchange = exchange.reshape(ep, layout[-1])
         else:
@@ -964,6 +972,7 @@ def fused_ep_moe_push(
         bool(bf16_sort_counts),
         bool(slim_prepush_barrier),
         bool(fused_dispatch_meta),
+        bool(early_row_gather),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

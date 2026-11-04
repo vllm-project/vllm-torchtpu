@@ -80,17 +80,21 @@ def build_tc_exchange_all_gather(*, ep, width):
     return _memoized(("plain", ep, width), lambda: _build_plain(ep=ep, width=width))
 
 
-def build_tc_exchange_all_gather_rows(*, ep, width, n_rows):
+def build_tc_exchange_all_gather_rows(*, ep, width, n_rows, before_barrier=False):
     """fn(packed, rank, rows [n_src, ...], idx i32 [n_rows]) ->
     (the exchange as build_tc_exchange_all_gather's, rows[idx]).
 
     The row copy is one local DMA per row, issued once the exchange's pushes
-    are in flight, so it runs while the kernel waits on its peers instead of
-    as a TensorCore gather of its own. Every idx entry must be in range.
+    are in flight (`before_barrier`: before the entry barrier, so the issue
+    also overlaps the wait for the slowest peer), so it runs while the
+    kernel waits on its peers instead of as a TensorCore gather of its own.
+    Every idx entry must be in range.
     """
     return _memoized(
-        ("rows", ep, width, n_rows),
-        lambda: _build_rows(ep=ep, width=width, n_rows=n_rows),
+        ("rows", ep, width, n_rows, before_barrier),
+        lambda: _build_rows(
+            ep=ep, width=width, n_rows=n_rows, before_barrier=before_barrier
+        ),
     )
 
 
@@ -109,9 +113,13 @@ def _slab_rows(width):
     return -(-width // (SUBLANES * LANES)) * SUBLANES  # whole (8, 128) tiles
 
 
-def _exchange(ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem, while_in_flight):
-    """Barrier, push this shard's row everywhere, run `while_in_flight`,
-    then wait for every row in and out."""
+def _exchange(
+    ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem, while_in_flight, before=None
+):
+    """Run `before`, barrier, push this shard's row everywhere, run
+    `while_in_flight`, then wait for every row in and out."""
+    if before is not None:
+        before()
     _double_barrier(ep, me)
     mine = out_hbm.at[pl.ds(me, 1)]
     local = pltpu.make_async_copy(x_hbm, mine, lsem)
@@ -189,7 +197,7 @@ def _build_plain(*, ep, width):
     return fn
 
 
-def _build_rows(*, ep, width, n_rows):
+def _build_rows(*, ep, width, n_rows, before_barrier):
     def kernel(
         rank_sm, idx_sm, x_hbm, src_hbm, out_hbm, dst_hbm,
         send_sem, recv_sem, lsem, gsem,
@@ -203,7 +211,17 @@ def _build_rows(*, ep, width, n_rows):
 
             lax.fori_loop(0, n_rows, one, jnp.int32(0), unroll=8)
 
-        _exchange(ep, rank_sm[0], x_hbm, out_hbm, send_sem, recv_sem, lsem, copy_rows)
+        _exchange(
+            ep,
+            rank_sm[0],
+            x_hbm,
+            out_hbm,
+            send_sem,
+            recv_sem,
+            lsem,
+            (lambda: None) if before_barrier else copy_rows,
+            before=copy_rows if before_barrier else None,
+        )
         # One wait the size of all n_rows rows retires every row copy.
         pltpu.make_async_copy(dst_hbm, dst_hbm, gsem).wait()
 
@@ -226,7 +244,8 @@ def _build_rows(*, ep, width, n_rows):
                 jax.ShapeDtypeStruct((n_rows, *rows.shape[1:]), rows.dtype),
             ),
             compiler_params=_compiler_params(),
-            name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}",
+            name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}"
+            + ("_early" if before_barrier else ""),
         )(r, idx, slab, rows)
         return _unpad(out, ep, width), gathered
 

@@ -451,13 +451,14 @@ def test_served_dims_program_knobs_are_bit_exact(shape):
     assert _rel(wrong, want) > CONTROL_BOUND
 
 
-# The MoE-front switches change no arithmetic.
+# The MoE-front switches change no arithmetic (`a+b`: both on).
 FRONT_SWITCHES = (
     "matmul_scale_repeat",
     "exchange_row_gather",
     "bf16_sort_counts",
     "slim_prepush_barrier",
     "fused_dispatch_meta",
+    "exchange_row_gather+early_row_gather",
 )
 
 
@@ -490,7 +491,8 @@ def test_served_dims_front_switches_are_bit_exact(shape, switch):
     )
     want = np.asarray(fused_ep_moe_push(x, *weights, gating, **common))
     assert np.isfinite(want.astype(np.float32)).all()
-    got = fused_ep_moe_push(x, *weights, gating, **{switch: True}, **common)
+    on = {name: True for name in switch.split("+")}
+    got = fused_ep_moe_push(x, *weights, gating, **on, **common)
     np.testing.assert_array_equal(np.asarray(got), want)
     wrong = fused_ep_moe_push(x, *_roll(weights), gating, **common)
     assert _rel(wrong, want) > CONTROL_BOUND
