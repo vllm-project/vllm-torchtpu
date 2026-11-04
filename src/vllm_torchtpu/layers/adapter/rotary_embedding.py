@@ -83,6 +83,14 @@ class TpuApplyRotaryEmb(ApplyRotaryEmb):
     forward_tpu = forward_oot  # pyrefly: ignore[bad-override]
 
 
+# Largest step, in tokens, that takes the rolled GPT-J rotation. In the GLM-5.2
+# microbenchmark the rolled form saved about 1.3 us per layer at 16 tokens, but
+# made a 4096-token mixed step about 3% slower: at that size the extra
+# elementwise passes cost more than the relayout copies they remove. Larger
+# steps keep the upstream strided form. Both forms give bit-identical results.
+ROPE_GPTJ_ROLL_MAX_TOKENS = 256
+
+
 def _rotate_gptj_fp32_rolled(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
@@ -142,9 +150,14 @@ def _apply_rotary_fp32(
     """``ApplyRotaryEmb.forward_static`` in float32, with the rolled GPT-J path.
 
     ``TPU_ROPE_GPTJ_ROLL`` selects ``_rotate_gptj_fp32_rolled`` for GPT-J style
-    rotations. NeoX style rotations always take the upstream code.
+    rotations of steps of at most ``ROPE_GPTJ_ROLL_MAX_TOKENS`` tokens. NeoX
+    style rotations and larger steps take the upstream code.
     """
-    if not is_neox_style and envs.TPU_ROPE_GPTJ_ROLL:
+    if (
+        not is_neox_style
+        and envs.TPU_ROPE_GPTJ_ROLL
+        and cos.shape[0] <= ROPE_GPTJ_ROLL_MAX_TOKENS
+    ):
         return _rotate_gptj_fp32_rolled(x, cos, sin)
     return ApplyRotaryEmb.forward_static(
         x, cos, sin, is_neox_style, enable_fp32_compute=True
