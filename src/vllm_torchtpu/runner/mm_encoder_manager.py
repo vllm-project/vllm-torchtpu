@@ -358,7 +358,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 output = self._compiled_budget_forward(
                     dict(self.budget_templates["default"][budget]), path="default"
                 )
-            synchronize_tensors(output, wait=True)
+            synchronize_tensors(output, wait=False)
         local_outputs = [outputs[index] for index in range(len(tokens))]
         if self.use_dp:
             return self._gather_dp_outputs(
@@ -406,10 +406,10 @@ class MMEncoderManager(EncoderCudaGraphManager):
         for output in local_outputs:
             padded[offset : offset + len(output)].copy_(output)
             offset += len(output)
-        synchronize_tensors(padded, wait=True)
+        synchronize_tensors(padded, wait=False)
         gathered = get_tp_group().all_gather(padded, dim=0)
         # Empty engines must materialize the collective before discarding its output.
-        synchronize_tensors(gathered, wait=True)
+        synchronize_tensors(gathered, wait=False)
         outputs: dict[int, torch.Tensor] = {}
         start = 0
         for rank, count in enumerate(images_per_rank):
