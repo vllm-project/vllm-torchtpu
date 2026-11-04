@@ -17,7 +17,7 @@
         --dir src/vllm_torchtpu/models/<model>/megakernel --name <model> \\
         [--model-name <model def name>]
 
-`--from` is a shorthand (`megakernel_runtime.plugin.SHORTHANDS`), a package
+`--from` is a shorthand (`megakernel_runtime.plugin.shorthands()`), a package
 name or a folder. The folder imports its own files relatively, so the copy
 runs as is under the package its directory gives it. The names the library
 registries key on by name are rewritten: `SPEC.name` -> `--name`, profile
@@ -45,7 +45,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 from . import provenance
-from .plugin import SHORTHANDS
+from .plugin import shorthands
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_.]*$")
 _DIST_PACKAGE = "vllm_torchtpu"
@@ -70,7 +70,8 @@ def resolve_template(ref: str) -> Path:
     path = Path(ref)
     if path.is_dir():
         return path.resolve()
-    module = SHORTHANDS[ref].module if ref in SHORTHANDS else ref
+    entries = shorthands()
+    module = entries[ref].module if ref in entries else ref
     try:
         spec = importlib.util.find_spec(module)
     except (ImportError, ValueError) as exc:

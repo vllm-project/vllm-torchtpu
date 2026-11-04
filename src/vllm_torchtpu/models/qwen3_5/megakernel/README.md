@@ -38,9 +38,13 @@ side: `SPEC.name` becomes `<model>`, the profile names `qwen35-*` become
 this folder"). The folder imports its own files relatively, so the copy runs
 as is under its new package name; the scaffold prints the next steps (run the
 copy's tests, serve it). Then adapt the `ModelDef` (`model.py`:
-`hf_architectures`, `hf_model_type`, geometry), and add a shorthand to
-`megakernel_runtime.plugin.SHORTHANDS` if the model should be picked from its
-checkpoint's architecture. See "Adapting this folder" below.
+`hf_architectures`, `hf_model_type`, geometry) and `SPEC.architectures` /
+`SPEC.model_types`: a folder under `vllm_torchtpu.models` whose `SPEC` lists a
+checkpoint's architecture or model type is picked for it, and selectable as
+`plugin=<SPEC.name>`, with no shared-code edit. An entry in
+`megakernel_runtime.plugin.SHORTHANDS` is needed only for top-level template
+keys or the bare `VLLM_TPU_MEGAKERNEL=<name>` form. See "Adapting this folder"
+below.
 
 ### 2. Test (CPU, no TPU)
 
@@ -210,8 +214,9 @@ settings from `SPEC` before `create` runs; the checkpoint checks are
    profiles after the model, and set `DEFAULT_PROFILE`.
 4. `adapter.py`: adjust `create`'s checkpoint checks and the program's weight
    loading / cache binding to the new model's vLLM modules.
-5. `__init__.py`: set `SPEC` (`name`, `chips`, `tp_sizes`, `parallelism`,
-   `features`, `requires`, `numerics`, `decline_codes`).
+5. `__init__.py`: set `SPEC` (`name`, `architectures`, `model_types`,
+   `chips`, `tp_sizes`, `parallelism`, `features`, `requires`, `numerics`,
+   `decline_codes`).
 6. `tests/` and `tests/models/<model>/megakernel/`: adapt the CPU end-to-end
    test and the goldens; `serving/`: the serve flags and the smoke.
 
