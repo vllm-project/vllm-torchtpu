@@ -19,6 +19,8 @@ import contextlib
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from vllm_torchtpu import envs
+
 
 def _resolve_submod_and_param(
     weight_name: str, model: Any = None
@@ -172,6 +174,13 @@ def infer_weight_sharding(
         return [None]
 
     if rank == 2:
+        if ".in_proj_qkvz." in weight_name and envs.TPU_GDN_QKVZ_KERNEL_LAYOUT:
+            # TODO: shard dim 1 once this reads the layer's layout marker
+            # (`exporter.py` calls this without the model).
+            raise NotImplementedError(
+                "The AOT export shards in_proj_qkvz in vLLM's [n_out, n_in] "
+                "layout; unset TPU_GDN_QKVZ_KERNEL_LAYOUT to export at TP > 1."
+            )
         if (
             weight_name.endswith("embed_tokens.weight")
             or weight_name == "lm_head.weight"
