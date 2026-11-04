@@ -55,7 +55,7 @@ def _reference(q, kv, selected, local_page, local_limit):
     [
         (37, 35, None),  # last tile part padding, token count not a tile multiple
         (48, 20, None),  # one tile entirely padding
-        (40, 33, 16),  # several kernel calls (a distinct shape: no jit reuse)
+        (150, 140, 64),  # several kernel calls (a distinct shape: no jit reuse)
     ],
 )
 def test_matches_dense_reference(num_tokens, num_real, tokens_per_call, monkeypatch):
