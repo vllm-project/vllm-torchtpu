@@ -281,7 +281,12 @@ def swa_prepare_publish(banks, table, starts, positions, minimum, values):
 
     # Shape dispatch belongs inside the JAX bridge. A Torch-side equality
     # specializes dimensions that the model explicitly marks dynamic.
-    if positions.shape != (288,) or table.shape[0] != 48:
+    if (positions.shape, table.shape[0]) not in (
+        ((288,), 48),
+        ((96,), 16),
+        ((192,), 32),
+        ((288,), 32),
+    ):
         from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
 
         metadata, bounds, records = prepare_swa_metadata(
