@@ -142,7 +142,7 @@ def _csa2_kernel(
     query_offset: int,
     owners: str,
 ) -> None:
-    """Persistent attention with four input buffers and two output buffers.
+    """Persistent attention with one steady tile body and rotating buffers.
 
     Output rows land at query_offset onward. With ``owners`` "new" or
     "aliased", the main KV rows are also copied to the matching rows of the
@@ -423,12 +423,12 @@ def _csa2_kernel(
 
         def prepare_next():
             if steady:
-                prepare(tile + 1, (sb + 1) % 4, 1 - bank)
+                prepare(tile + 1, (sb + 1) & 3, 1 - bank)
             else:
 
                 @pl.when(tile + 1 < count)
                 def _():
-                    prepare(tile + 1, (sb + 1) % 4, 1 - bank)
+                    prepare(tile + 1, (sb + 1) & 3, 1 - bank)
 
         def preload_next(mxu):
             def push():
@@ -608,75 +608,79 @@ def _csa2_kernel(
         if not first_tile:
             output_copy(tile - 1, 1 - bank).start()
 
-    def step(tile, bank, sb, *, steady=False):
-        for copy in input_copies(tile, sb):
-            copy.wait()
-        if kv_out_hbm is not None:
-            kv_copy(tile, sb).start()
-        if isinstance(tile, int) and tile == 0:
-            for copy in swa_copies(tile, sb):
-                copy.wait()
-            prepare(tile, sb, bank)
-
-        def wait_next():
-            for copy in swa_copies(tile + 1, (sb + 1) % 4):
-                copy.wait()
-
-        if steady:
-            wait_next()
-        else:
-
-            @pl.when(tile + 1 < count)
-            def _():
-                wait_next()
-
-        if not isinstance(tile, int) or tile >= 3:
-            output_copy(tile - 3, 1 - bank).wait()
-        compute(tile, bank, sb, steady=steady)
-        if kv_out_hbm is not None:
-            # start(tile + 4, sb) below refills this KV buffer.
-            kv_copy(tile, sb).wait()
-        if steady:
-            start(tile + 4, sb)
-        else:
-
-            @pl.when(tile + 4 < count)
-            def _():
-                start(tile + 4, sb)
-
     for i in range(4):
 
         @pl.when(i < count)
         def _(*, i=i):
             start(i, i)
 
-    for i in range(4):
+    for copy in (*input_copies(0, 0), *swa_copies(0, 0)):
+        copy.wait()
+    prepare(0, 0, 0)
 
-        @pl.when(i < count)
-        def _(*, i=i):
-            step(i, i % 2, i)
+    # compute(0) prepares and stages tile 1 before the next iteration.
+    @pl.when(count > 1)
+    def _():
+        for copy in swa_copies(1, 1):
+            copy.wait()
 
-    groups = (
-        max((count - 8) // 4, 0)
-        if isinstance(count, int)
-        else jnp.maximum((count - 8) // 4, 0)
+    if kv_out_hbm is not None:
+        kv_copy(0, 0).start()
+    compute(0, 0, 0)
+    if kv_out_hbm is not None:
+        kv_copy(0, 0).wait()
+
+    @pl.when(count > 4)
+    def _():
+        start(4, 0)
+
+    def step(tile, *, steady, last=False):
+        sb = tile & 3
+        bank = tile & 1
+        for copy in input_copies(tile, sb):
+            copy.wait()
+
+        if kv_out_hbm is not None:
+            kv_copy(tile, sb).start()
+
+        def wait_next():
+            for copy in swa_copies(tile + 1, (sb + 1) & 3):
+                copy.wait()
+
+        if steady:
+            wait_next()
+        else:
+            pl.when(tile + 1 < count)(wait_next)
+
+        @pl.when(tile >= 3)
+        def _():
+            output_copy(tile - 3, 1 - bank).wait()
+
+        compute(tile, bank, sb, steady=not last)
+        if kv_out_hbm is not None:
+            # The next input DMA reuses this KV buffer.
+            kv_copy(tile, sb).wait()
+
+        if steady:
+            start(tile + 4, sb)
+        else:
+            pl.when(tile + 4 < count)(lambda: start(tile + 4, sb))
+
+    # Retain one tile body per loop; the drain loop handles the prefetched tail.
+    end = max(count - 4, 1) if isinstance(count, int) else jnp.maximum(count - 4, 1)
+    lax.fori_loop(1, end, lambda tile, _: step(tile, steady=True), None, unroll=False)
+    lax.fori_loop(
+        end,
+        jnp.maximum(count - 1, end),
+        lambda tile, _: step(tile, steady=False),
+        None,
+        unroll=False,
     )
 
-    def body(group, unused):
-        for j in range(4):
-            step(4 + group * 4 + j, j % 2, j, steady=True)
-        return None
-
-    lax.fori_loop(0, groups, body, None)
-
-    # A four-tile steady iteration leaves at most seven drain tiles.
-    # Keep their buffer slots static while PV remains live across steps.
-    for j in range(7):
-        tile = 4 + groups * 4 + j
-
-        @pl.when(tile < count)
-        def _(*, tile=tile, j=j):
-            step(tile, j % 2, j % 4)
+    # Every staged RHS must be consumed before the kernel returns.
+    @pl.when(count > 1)
+    def _():
+        step(count - 1, steady=False, last=True)
 
     @pl.when(count >= 3)
     def _():
