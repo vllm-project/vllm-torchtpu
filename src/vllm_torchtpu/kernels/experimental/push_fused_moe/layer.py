@@ -43,6 +43,7 @@ from jax import lax
 from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
     build_routing_tables_sharded,
     local_sort_activations,
+    local_sort_tokens,
     push_dispatch_segments,
     run_tables,
 )
@@ -55,6 +56,7 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.sc_dispatch import (
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.tc_exchange import (
     build_tc_exchange_all_gather,
+    build_tc_exchange_all_gather_rows,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
@@ -202,9 +204,9 @@ def _repeat_bits(bits, repeats):
     n = align_up(n_in, lanes)
     bits = jnp.pad(bits, (0, n - n_in))
     shifts = 8 * jnp.arange(4, dtype=jnp.int32)[:, None, None]
-    planes = (jnp.right_shift(bits.reshape(1, n // lanes, lanes), shifts) & 255).reshape(
-        4 * n // lanes, lanes
-    )
+    planes = (
+        jnp.right_shift(bits.reshape(1, n // lanes, lanes), shifts) & 255
+    ).reshape(4 * n // lanes, lanes)
     spread = (
         jnp.arange(lanes * repeats, dtype=jnp.int32)[None, :] // repeats
         == jnp.arange(lanes, dtype=jnp.int32)[:, None]
@@ -259,6 +261,7 @@ def fused_ep_moe_push(
     dispatch_ahead=1,
     interleave_visits=False,
     matmul_scale_repeat=False,
+    exchange_row_gather=False,
     expert_slot=None,
     expert_load=None,
 ):
@@ -280,10 +283,13 @@ def fused_ep_moe_push(
     tiles through the HBM contribution slab and `dispatch_ahead` is how many
     visit positions the TensorCore's dispatch pushes run ahead of its compute
     (see the kernel), `interleave_visits` alternates every shard's heaviest
-    and lightest experts in its visit order (host.interleave_visits), and
+    and lightest experts in its visit order (host.interleave_visits),
     `matmul_scale_repeat` builds the scale slab's per-pair activation scales
-    with `_repeat_bits` instead of jnp.repeat. The caller
-    (layers/adapter/fused_moe_ep.py) reads all nine from envs.
+    with `_repeat_bits` instead of jnp.repeat, and `exchange_row_gather`
+    (with `tc_exchange`) has the routing-exchange kernel also copy the
+    expert-sorted activation rows, while it waits on its peers, instead of a
+    TensorCore gather after it. The caller (layers/adapter/fused_moe_ep.py)
+    reads all ten from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -435,6 +441,11 @@ def fused_ep_moe_push(
         )
         n_pre = g_local
     tc_exchange = bool(tc_exchange)
+    exchange_row_gather = bool(exchange_row_gather)
+    if exchange_row_gather and not tc_exchange:
+        raise ValueError(
+            "exchange_row_gather needs the TensorCore exchange (tc_exchange)"
+        )
     height_rungs_override = int(height_rungs_override)
     tail_barrier = bool(tail_barrier)
     hbm_staging = bool(hbm_staging)
@@ -794,17 +805,28 @@ def fused_ep_moe_push(
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
         )
-        # Issue the routing exchange before the local sort, so the sort runs
-        # on the TensorCore while the exchange is in flight.
         my_counts = block_hist.sum(axis=0)
-        packed, q_l, local_blocks, my_counts = lax.optimization_barrier(
-            (packed, q_l, local_blocks, my_counts)
-        )
-        exchange = exchange_all_gather(packed, rank_l).reshape(ep, layout[-1])
-        with jax.named_scope("moe_early_qsort"):
-            q_sorted, seg_start = local_sort_activations(
-                local_blocks.reshape(-1), my_counts, q_l, e_total=e_total, topk=topk
+        if exchange_row_gather:
+            # The sorted rows are copied by the exchange kernel itself.
+            with jax.named_scope("moe_early_qsort"):
+                tok, seg_start = local_sort_tokens(
+                    local_blocks.reshape(-1), my_counts, e_total=e_total, topk=topk
+                )
+            exchange, q_sorted = build_tc_exchange_all_gather_rows(
+                ep=ep, width=layout[-1], n_rows=tok.shape[0]
+            )(packed, rank_l[0, 0], q_l, tok)
+            exchange = exchange.reshape(ep, layout[-1])
+        else:
+            # Issue the routing exchange before the local sort, so the sort
+            # runs on the TensorCore while the exchange is in flight.
+            packed, q_l, local_blocks, my_counts = lax.optimization_barrier(
+                (packed, q_l, local_blocks, my_counts)
             )
+            exchange = exchange_all_gather(packed, rank_l).reshape(ep, layout[-1])
+            with jax.named_scope("moe_early_qsort"):
+                q_sorted, seg_start = local_sort_activations(
+                    local_blocks.reshape(-1), my_counts, q_l, e_total=e_total, topk=topk
+                )
         exchange, q_sorted, seg_start = lax.optimization_barrier(
             (exchange, q_sorted, seg_start)
         )
@@ -896,6 +918,7 @@ def fused_ep_moe_push(
         dispatch_ahead,
         bool(interleave_visits),
         bool(matmul_scale_repeat),
+        exchange_row_gather,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

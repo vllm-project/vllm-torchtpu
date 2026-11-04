@@ -106,17 +106,9 @@ def _sorted_tokens_by_argsort(pid, seg_end, *, t_local, topk):
     return jnp.where(jj < seg_end[-1], order // topk, jnp.int32(t_local - 1))
 
 
-def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
-    """Sort this shard's rows `q_l` by global expert, tokens ascending within.
-
-    `my_pairs` [t_local * topk] are this shard's selections (e_total = routes
-    nowhere) and `my_counts` [e_total] their per-expert counts. Depends only
-    on local routing, so it runs on the TensorCore while the routing
-    exchange is in flight. Returns `(q_sorted, seg_start)`: row j of q_sorted
-    is the j-th routed pair in (expert, token) order and seg_start [e_total]
-    the first row of each expert's run. Decode sizes find each row's token
-    by counting; above ARGSORT_MIN_TOKENS a stable argsort (same result).
-    """
+def local_sort_tokens(my_pairs, my_counts, *, e_total, topk):
+    """`local_sort_activations` without the row gather: `(tok, seg_start)`,
+    tok [t_local * topk] the source row of each expert-sorted row."""
     n = my_pairs.shape[0]
     t_local = n // topk
     my_pairs = my_pairs.astype(jnp.int32)
@@ -131,8 +123,24 @@ def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
         tok_j = _sorted_tokens_by_count(
             pid, seg_start_local, seg_end, e_total=e_total, t_local=t_local, topk=topk
         )
-    q_sorted = q_l[tok_j]
-    return q_sorted, seg_start_local
+    return tok_j, seg_start_local
+
+
+def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
+    """Sort this shard's rows `q_l` by global expert, tokens ascending within.
+
+    `my_pairs` [t_local * topk] are this shard's selections (e_total = routes
+    nowhere) and `my_counts` [e_total] their per-expert counts. Depends only
+    on local routing, so it runs on the TensorCore while the routing
+    exchange is in flight. Returns `(q_sorted, seg_start)`: row j of q_sorted
+    is the j-th routed pair in (expert, token) order and seg_start [e_total]
+    the first row of each expert's run. Decode sizes find each row's token
+    by counting; above ARGSORT_MIN_TOKENS a stable argsort (same result).
+    """
+    tok_j, seg_start_local = local_sort_tokens(
+        my_pairs, my_counts, e_total=e_total, topk=topk
+    )
+    return q_l[tok_j], seg_start_local
 
 
 def interleave_visits(visit, n_visit):

@@ -422,6 +422,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD",
         "MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS",
         "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT",
+        "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

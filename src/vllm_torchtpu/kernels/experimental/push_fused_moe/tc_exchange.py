@@ -77,78 +77,157 @@ def build_tc_exchange_all_gather(*, ep, width):
 
     Memoized per (ep, width) under a lock, like the package's other builders.
     """
-    key = (ep, width)
+    return _memoized(("plain", ep, width), lambda: _build_plain(ep=ep, width=width))
+
+
+def build_tc_exchange_all_gather_rows(*, ep, width, n_rows):
+    """fn(packed, rank, rows [n_src, ...], idx i32 [n_rows]) ->
+    (the exchange as build_tc_exchange_all_gather's, rows[idx]).
+
+    The row copy is one local DMA per row, issued once the exchange's pushes
+    are in flight, so it runs while the kernel waits on its peers instead of
+    as a TensorCore gather of its own. Every idx entry must be in range.
+    """
+    return _memoized(
+        ("rows", ep, width, n_rows),
+        lambda: _build_rows(ep=ep, width=width, n_rows=n_rows),
+    )
+
+
+def _memoized(key, build):
     fn = _CACHE.get(key)
     if fn is None:
         with _CACHE_LOCK:
             fn = _CACHE.get(key)
             if fn is None:
-                fn = _build_tc_exchange_all_gather(ep=ep, width=width)
+                fn = build()
                 _CACHE[key] = fn
     return fn
 
 
-def _build_tc_exchange_all_gather(*, ep, width):
-    tile = SUBLANES * LANES
-    rows = -(-width // tile) * SUBLANES  # whole (8, 128) tiles
+def _slab_rows(width):
+    return -(-width // (SUBLANES * LANES)) * SUBLANES  # whole (8, 128) tiles
 
+
+def _exchange(ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem, while_in_flight):
+    """Barrier, push this shard's row everywhere, run `while_in_flight`,
+    then wait for every row in and out."""
+    _double_barrier(ep, me)
+    mine = out_hbm.at[pl.ds(me, 1)]
+    local = pltpu.make_async_copy(x_hbm, mine, lsem)
+    local.start()
+
+    def push(i, c):
+        dest = lax.rem(me + i, ep)
+        pltpu.make_async_remote_copy(
+            src_ref=x_hbm,
+            dst_ref=mine,
+            send_sem=send_sem,
+            recv_sem=recv_sem,
+            device_id=(dest,),
+            device_id_type=pl.DeviceIdType.MESH,
+        ).start()
+        return c
+
+    lax.fori_loop(1, ep, push, jnp.int32(0))
+    while_in_flight()
+    local.wait()
+    if ep > 1:
+        # DMA semaphores count bytes: one wait the size of ep - 1 rows
+        # retires every incoming (resp. outgoing) row.
+        blk = out_hbm.at[pl.ds(0, ep - 1)]
+        pltpu.make_async_copy(blk, blk, recv_sem).wait()
+        pltpu.make_async_copy(blk, blk, send_sem).wait()
+
+
+def _compiler_params():
+    return pltpu.CompilerParams(
+        collective_id=COLLECTIVE_ID,
+        disable_bounds_checks=True,
+    )
+
+
+def _payload(packed, rank, width):
+    flat = packed.astype(jnp.int32).reshape(-1)
+    if flat.shape[0] != width:
+        raise ValueError(f"expected a [{width}] payload, got {flat.shape}")
+    rows = _slab_rows(width)
+    slab = jnp.pad(flat, (0, rows * LANES - width)).reshape(1, rows, LANES)
+    return jnp.asarray(rank).astype(jnp.int32).reshape(-1)[:1], slab
+
+
+def _unpad(out, ep, width):
+    return out.reshape(ep, _slab_rows(width) * LANES)[:, :width].reshape(-1)
+
+
+_HBM = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+
+
+def _build_plain(*, ep, width):
     def kernel(rank_sm, x_hbm, out_hbm, send_sem, recv_sem, lsem):
-        me = rank_sm[0]
-        _double_barrier(ep, me)
-        mine = out_hbm.at[pl.ds(me, 1)]
-        local = pltpu.make_async_copy(x_hbm, mine, lsem)
-        local.start()
+        _exchange(
+            ep, rank_sm[0], x_hbm, out_hbm, send_sem, recv_sem, lsem, lambda: None
+        )
 
-        def push(i, c):
-            dest = lax.rem(me + i, ep)
-            pltpu.make_async_remote_copy(
-                src_ref=x_hbm,
-                dst_ref=mine,
-                send_sem=send_sem,
-                recv_sem=recv_sem,
-                device_id=(dest,),
-                device_id_type=pl.DeviceIdType.MESH,
-            ).start()
-            return c
-
-        lax.fori_loop(1, ep, push, jnp.int32(0))
-        local.wait()
-        if ep > 1:
-            # DMA semaphores count bytes: one wait the size of ep - 1 rows
-            # retires every incoming (resp. outgoing) row.
-            blk = out_hbm.at[pl.ds(0, ep - 1)]
-            pltpu.make_async_copy(blk, blk, recv_sem).wait()
-            pltpu.make_async_copy(blk, blk, send_sem).wait()
-
-    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[hbm],
-            out_specs=hbm,
-            scratch_shapes=(
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-            ),
+            in_specs=[_HBM],
+            out_specs=_HBM,
+            scratch_shapes=(pltpu.SemaphoreType.DMA,) * 3,
             grid=(),
         ),
-        out_shape=jax.ShapeDtypeStruct((ep, rows, LANES), jnp.int32),
-        compiler_params=pltpu.CompilerParams(
-            collective_id=COLLECTIVE_ID,
-            disable_bounds_checks=True,
-        ),
+        out_shape=jax.ShapeDtypeStruct((ep, _slab_rows(width), LANES), jnp.int32),
+        compiler_params=_compiler_params(),
         name=f"moe_tc_routing_exchange_ep{ep}_w{width}",
     )
 
     def fn(packed, rank):
-        flat = packed.astype(jnp.int32).reshape(-1)
-        if flat.shape[0] != width:
-            raise ValueError(f"expected a [{width}] payload, got {flat.shape}")
-        slab = jnp.pad(flat, (0, rows * LANES - width)).reshape(1, rows, LANES)
-        r = jnp.asarray(rank).astype(jnp.int32).reshape(-1)[:1]
-        out = call(r, slab)
-        return out.reshape(ep, rows * LANES)[:, :width].reshape(-1)
+        return _unpad(call(*_payload(packed, rank, width)), ep, width)
+
+    return fn
+
+
+def _build_rows(*, ep, width, n_rows):
+    def kernel(
+        rank_sm, idx_sm, x_hbm, src_hbm, out_hbm, dst_hbm,
+        send_sem, recv_sem, lsem, gsem,
+    ):  # fmt: skip
+        def copy_rows():
+            def one(j, c):
+                pltpu.make_async_copy(
+                    src_hbm.at[pl.ds(idx_sm[j], 1)], dst_hbm.at[pl.ds(j, 1)], gsem
+                ).start()
+                return c
+
+            lax.fori_loop(0, n_rows, one, jnp.int32(0), unroll=8)
+
+        _exchange(ep, rank_sm[0], x_hbm, out_hbm, send_sem, recv_sem, lsem, copy_rows)
+        # One wait the size of all n_rows rows retires every row copy.
+        pltpu.make_async_copy(dst_hbm, dst_hbm, gsem).wait()
+
+    def fn(packed, rank, rows, idx):
+        idx = idx.astype(jnp.int32).reshape(-1)
+        if idx.shape[0] != n_rows:
+            raise ValueError(f"expected [{n_rows}] row indices, got {idx.shape}")
+        r, slab = _payload(packed, rank, width)
+        out, gathered = pl.pallas_call(
+            kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=[_HBM, _HBM],
+                out_specs=(_HBM, _HBM),
+                scratch_shapes=(pltpu.SemaphoreType.DMA,) * 4,
+                grid=(),
+            ),
+            out_shape=(
+                jax.ShapeDtypeStruct((ep, _slab_rows(width), LANES), jnp.int32),
+                jax.ShapeDtypeStruct((n_rows, *rows.shape[1:]), rows.dtype),
+            ),
+            compiler_params=_compiler_params(),
+            name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}",
+        )(r, idx, slab, rows)
+        return _unpad(out, ep, width), gathered
 
     return fn

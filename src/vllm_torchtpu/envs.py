@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_DISPATCH_AHEAD: int = 1
     MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS: bool = False
     MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT: bool = False
+    MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -756,6 +757,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scales with a one-hot matmul instead of jnp.repeat.
     "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT": env_bool(
         "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT"
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with MOE_FUSED_EP_PUSH_TC_EXCHANGE=1: the
+    # routing-exchange kernel also copies the expert-sorted activation rows
+    # while it waits on its peers.
+    "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER": env_bool(
+        "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER"
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and

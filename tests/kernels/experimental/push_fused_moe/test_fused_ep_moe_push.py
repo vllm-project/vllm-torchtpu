@@ -38,6 +38,7 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.kernels.experimental.push_fused_moe import fused_ep_moe_push
 from vllm_torchtpu.kernels.experimental.push_fused_moe.tc_exchange import (
     build_tc_exchange_all_gather,
+    build_tc_exchange_all_gather_rows,
 )
 from vllm_torchtpu.kernels.fused_moe.v2 import AXIS, WeightFormat, fused_ep_moe_v2
 
@@ -320,6 +321,43 @@ def test_tc_exchange_all_gather_equals_lax_all_gather(width):
     np.testing.assert_array_equal(np.asarray(tc)[0], np.asarray(data).reshape(-1))
 
 
+def test_tc_exchange_row_gather_equals_take():
+    """The exchange kernel's row copy is rows[idx] (repeats and every row
+    of the source included) and leaves the exchange itself unchanged."""
+    mesh = _mesh()
+    width, n_src, n = 384, 48, 96
+    fn = build_tc_exchange_all_gather_rows(ep=EP, width=width, n_rows=n)
+
+    def local(p, rows, idx):
+        flat = p.reshape(-1)
+        tc, got = fn(flat, lax.axis_index(AXIS), rows[0], idx.reshape(-1))
+        xla = lax.all_gather(flat, AXIS, axis=0, tiled=True)
+        return tc[None], xla[None], got[None]
+
+    rng = np.random.default_rng(3)
+    data = (jnp.arange(EP * width, dtype=jnp.int32) * 7 - 3).reshape(EP, width)
+    rows = rng.normal(0, 1, (EP, n_src, 40, 128)).astype(np.float32)
+    rows = jnp.asarray(rows).astype(jnp.float8_e4m3fn)
+    idx = np.stack([rng.permutation(np.repeat(np.arange(n_src), 2)) for _ in range(EP)])
+    shard = NamedSharding(mesh, P(AXIS))
+    tc, xla, got = jax.jit(
+        jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=(P(AXIS),) * 3,
+            out_specs=(P(AXIS),) * 3,
+            check_vma=False,
+        )
+    )(
+        jax.device_put(data, shard),
+        jax.device_put(rows, shard),
+        jax.device_put(jnp.asarray(idx, jnp.int32), shard),
+    )
+    np.testing.assert_array_equal(np.asarray(tc), np.asarray(xla))
+    want = np.stack([np.asarray(rows[d])[idx[d]] for d in range(EP)])
+    np.testing.assert_array_equal(np.asarray(got).view(np.uint8), want.view(np.uint8))
+
+
 # The served DSv4.1-Flash expert dims (hidden 5120, inter 2560 holding a
 # logical 2304, fp4 block-512 weights with row-padded flat scale tables) at
 # the DP16 C768 per-shard shapes, on eight shards: the target layers' 25
@@ -414,7 +452,7 @@ def test_served_dims_program_knobs_are_bit_exact(shape):
 
 
 # The MoE-front switches change no arithmetic.
-FRONT_SWITCHES = ("matmul_scale_repeat",)
+FRONT_SWITCHES = ("matmul_scale_repeat", "exchange_row_gather")
 
 
 @pytest.mark.parametrize("switch", FRONT_SWITCHES)
