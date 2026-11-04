@@ -33,13 +33,16 @@ NUM_PAGES = 40
 
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize(
-    "q_lens,ctx_lens,block_q,pages_per_step",
+    "q_lens,ctx_lens,block_q,large_block_q,pages_per_step",
     [
-        ([1, 130, 3], [300, 200, 0], 64, 4),  # multi-tile request, decode, prefill
-        ([1, 1], [1000, 5], 128, 2),  # decode only, several page groups
+        # small (decode, 3 tokens) and large (130 tokens: 3 large tiles)
+        ([1, 130, 3], [300, 200, 0], 64, 48, 4),
+        ([1, 1], [1000, 5], 128, 512, 2),  # small class only, page groups
     ],
 )
-def test_matches_reference(q_lens, ctx_lens, block_q, pages_per_step, dtype):
+def test_matches_reference(
+    q_lens, ctx_lens, block_q, large_block_q, pages_per_step, dtype
+):
     rng = np.random.default_rng(len(q_lens))
     num_seqs = len(q_lens)
     num_real = sum(q_lens)
@@ -66,6 +69,7 @@ def test_matches_reference(q_lens, ctx_lens, block_q, pages_per_step, dtype):
         jnp.asarray(cu_q),
         jnp.int32(num_seqs),
         block_q=block_q,
+        large_block_q=large_block_q,
         pages_per_step=pages_per_step,
         interpret=True,
     )

@@ -69,6 +69,11 @@ def write_rows(
     """Scatter one row per token into a packed ``[pages, S / p, p, W]`` cache."""
     packing = cache.shape[2]
     slot = pos % page_size(cache)
+    if jnp.issubdtype(cache.dtype, jnp.floating) and jnp.finfo(cache.dtype).bits == 8:
+        # e4m3fn has no inf: an out-of-range value would be stored as NaN and
+        # poison every token attending its page (0 * NaN in p @ v).
+        limit = float(jnp.finfo(cache.dtype).max)
+        rows = jnp.clip(rows, -limit, limit)
     return cache.at[pages, slot // packing, slot % packing].set(
         rows.astype(cache.dtype), mode="drop"
     )
@@ -177,6 +182,7 @@ def msa_forward(
         cu_q_lens,
         distribution[2],
         block_q=msa_indexer.DEFAULT_BLOCK_Q,
+        large_block_q=msa_indexer.DEFAULT_LARGE_BLOCK_Q,
         pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
         interpret=interpret,
     )

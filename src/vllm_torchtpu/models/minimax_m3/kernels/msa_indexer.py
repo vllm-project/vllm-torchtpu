@@ -39,6 +39,7 @@ from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
 )
 
 DEFAULT_BLOCK_Q = 128
+DEFAULT_LARGE_BLOCK_Q = 512
 DEFAULT_PAGES_PER_STEP = 32
 _TILE_SHIFT = 16
 _GROUP_MASK = (1 << _TILE_SHIFT) - 1
@@ -69,12 +70,10 @@ def _kernel(
     o_ref[...] = jnp.concatenate(maxima, axis=0)
 
 
-def _tiles(cu_q_lens: jax.Array, num_seqs: jax.Array, num_tokens: int, block_q: int):
-    """Query tiles that never span requests: (request, first row) per tile."""
+def _tiles(cu_q_lens: jax.Array, seq_in_class: jax.Array, block_q: int, max_tiles: int):
+    """Query tiles of one tile class; tiles never span requests."""
     max_num_seqs = cu_q_lens.shape[0] - 1
-    max_tiles = num_tokens // block_q + max_num_seqs
-    seq_ids = jnp.arange(max_num_seqs, dtype=jnp.int32)
-    q_lens = jnp.where(seq_ids < num_seqs, cu_q_lens[1:] - cu_q_lens[:-1], 0)
+    q_lens = jnp.where(seq_in_class, cu_q_lens[1:] - cu_q_lens[:-1], 0)
     tiles_per_seq = -(-q_lens // block_q)
     tile_ends = jnp.cumsum(tiles_per_seq)
     tile = jnp.arange(max_tiles, dtype=jnp.int32)
@@ -82,51 +81,36 @@ def _tiles(cu_q_lens: jax.Array, num_seqs: jax.Array, num_tokens: int, block_q: 
         jnp.searchsorted(tile_ends, tile, side="right").astype(jnp.int32),
         max_num_seqs - 1,
     )
-    first_tile = tile_ends[tile_seq] - tiles_per_seq[tile_seq]
-    tile_row0 = cu_q_lens[tile_seq] + (tile - first_tile) * block_q
-    num_tiles = tile_ends[-1]
-    return tile_seq, tile_row0, tiles_per_seq, tile_ends, num_tiles
+    first_tile = tile_ends - tiles_per_seq
+    tile_row0 = cu_q_lens[tile_seq] + (tile - first_tile[tile_seq]) * block_q
+    return tile_seq, tile_row0, first_tile, tile_ends[-1]
 
 
-@functools.partial(jax.jit, static_argnames=("block_q", "pages_per_step", "interpret"))
-def block_scores(
-    index_q: jax.Array,
-    index_cache: jax.Array,
-    seq_lens: jax.Array,
-    block_tables: jax.Array,
-    cu_q_lens: jax.Array,
-    num_seqs: jax.Array,
+def _class_scores(
+    index_q,
+    index_cache,
+    seq_lens,
+    block_tables,
+    cu_q_lens,
+    seq_in_class,
     *,
-    block_q: int = DEFAULT_BLOCK_Q,
-    pages_per_step: int = DEFAULT_PAGES_PER_STEP,
-    interpret: bool = False,
-) -> jax.Array:
-    """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
-
-    Args:
-      index_q: ``[T, 1, D]`` index queries (one index head per rank).
-      index_cache: ``[pages, S / p, p, D]`` key-only cache (bf16 or fp8).
-      seq_lens, block_tables, cu_q_lens, num_seqs: ragged batch metadata.
-    Pages past a token's own page hold scores of keys it must not see, and
-    pages past its request's last page are not written; callers mask both.
-    """
-    num_tokens, num_heads, head_dim = index_q.shape
-    if num_heads != 1:
-        raise NotImplementedError(
-            f"MSA indexer scores one index head per rank, got {num_heads}."
-        )
+    block_q,
+    max_tiles,
+    pages_per_step,
+    interpret,
+):
+    """Scores ``[T, P]`` for the tokens of requests in one tile class."""
+    num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
-    check_page_dtype(packing, index_cache.dtype)
     page_size = rows_per_page * packing
     max_num_seqs = seq_lens.shape[0]
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     num_groups_per_seq = -(-pages_per_seq // pages_per_step)
     padded_pages = num_groups_per_seq * pages_per_step
 
-    tile_seq, tile_row0, _, _, num_tiles = _tiles(
-        cu_q_lens, num_seqs, num_tokens, block_q
+    tile_seq, tile_row0, first_tile, num_tiles = _tiles(
+        cu_q_lens, seq_in_class, block_q, max_tiles
     )
-    max_tiles = tile_seq.shape[0]
     rows = tile_row0[:, None] + jnp.arange(block_q, dtype=jnp.int32)
     q_tiles = index_q[jnp.clip(rows, 0, num_tokens - 1), 0].reshape(-1, head_dim)
 
@@ -159,7 +143,7 @@ def block_scores(
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,
-        # One step even for an empty batch; its scores are never read.
+        # One step even with no tile in the class; its scores are never read.
         grid=(jnp.maximum(group_ends[-1], 1),),
         in_specs=[
             pl.BlockSpec(
@@ -190,9 +174,79 @@ def block_scores(
         jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32),
         max_num_seqs - 1,
     )
-    _, _, tiles_per_seq, tile_ends, _ = _tiles(cu_q_lens, num_seqs, num_tokens, block_q)
     offset = tok - cu_q_lens[seq]
-    first_tile = tile_ends[seq] - tiles_per_seq[seq]
-    col = (first_tile + offset // block_q) * block_q + offset % block_q
+    col = (first_tile[seq] + offset // block_q) * block_q + offset % block_q
     col = jnp.clip(col, 0, max_tiles * block_q - 1)
-    return scores_t[:, col].T[:, None, :]
+    return scores_t[:, col].T
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("block_q", "large_block_q", "pages_per_step", "interpret"),
+)
+def block_scores(
+    index_q: jax.Array,
+    index_cache: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
+    *,
+    block_q: int = DEFAULT_BLOCK_Q,
+    large_block_q: int = DEFAULT_LARGE_BLOCK_Q,
+    pages_per_step: int = DEFAULT_PAGES_PER_STEP,
+    interpret: bool = False,
+) -> jax.Array:
+    """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
+
+    Requests of at most `block_q` query tokens (decode, short chunks) are
+    scored in `block_q`-row tiles; longer prefill chunks in `large_block_q`-row
+    tiles, so a request's index keys are read once per large tile rather than
+    once per `block_q` rows.
+
+    Args:
+      index_q: ``[T, 1, D]`` index queries (one index head per rank).
+      index_cache: ``[pages, S / p, p, D]`` key-only cache (bf16 or fp8).
+      seq_lens, block_tables, cu_q_lens, num_seqs: ragged batch metadata.
+    Pages past a token's own page hold scores of keys it must not see, and
+    pages past its request's last page are not written; callers mask both.
+    """
+    num_tokens, num_heads, _ = index_q.shape
+    if num_heads != 1:
+        raise NotImplementedError(
+            f"MSA indexer scores one index head per rank, got {num_heads}."
+        )
+    check_page_dtype(index_cache.shape[2], index_cache.dtype)
+    max_num_seqs = seq_lens.shape[0]
+    seq_ids = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    active = seq_ids < num_seqs
+    is_large = active & (q_lens > block_q)
+    score = functools.partial(
+        _class_scores,
+        index_q,
+        index_cache,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        pages_per_step=pages_per_step,
+        interpret=interpret,
+    )
+    small = score(
+        active & ~is_large, block_q=block_q, max_tiles=min(max_num_seqs, num_tokens)
+    )
+    # Large requests have more than block_q tokens each.
+    max_large = min(max_num_seqs, num_tokens // (block_q + 1))
+    if max_large == 0:
+        return small[:, None, :]
+    large = score(
+        is_large,
+        block_q=large_block_q,
+        max_tiles=num_tokens // large_block_q + max_large,
+    )
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq = jnp.minimum(
+        jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32),
+        max_num_seqs - 1,
+    )
+    return jnp.where(is_large[seq][:, None], large, small)[:, None, :]
