@@ -20,8 +20,9 @@ neither there nor in vLLM's registry does nothing. Two cases are reported:
   registry has them (for example a removed ``VLLM_TPU_*`` knob).
 - Names that share a prefix with this package's knobs (``TPU_``, ``MOE_``,
   ...) and look like a typo of a registered name: a close ``difflib`` match
-  with the same number of ``_``-separated tokens that differs by more than
-  digits. Sibling names in a namespace another reader owns, such as
+  that equals it once ``_`` is removed, or that has the same number of
+  ``_``-separated tokens and differs by more than digits. Sibling names in a
+  namespace another reader owns, such as
   ``TORCH_TPU_TIER2_COMPILATION_CACHE`` next to
   ``TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT``, are left alone, as are other
   ``TPU_*`` names: libtpu, JAX and GKE read and inject many of them, and no
@@ -103,7 +104,13 @@ def _closest(name: str, candidates: Collection[str]) -> str | None:
 
 
 def _looks_like_typo(name: str, registered: str) -> bool:
-    """A different token count or a digit-only difference names a sibling."""
+    """A different token count or a digit-only difference names a sibling.
+
+    A name that matches once underscores are removed is a typo even with a
+    different token count: a dropped or extra ``_``.
+    """
+    if name.replace("_", "") == registered.replace("_", ""):
+        return True
     if name.count("_") != registered.count("_"):
         return False
     strip_digits = str.maketrans("", "", "0123456789")

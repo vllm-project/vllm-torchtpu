@@ -68,6 +68,16 @@ EXTERNAL_TPU_NAMES = [
             id="typo_in_other_package_prefix",
         ),
         pytest.param(
+            ["TPU_PARALLELPRECOMPILE"],
+            [UnreadEnvVar("TPU_PARALLELPRECOMPILE", "TPU_PARALLEL_PRECOMPILE")],
+            id="dropped_underscore",
+        ),
+        pytest.param(
+            ["TPU_PARALLEL_PRE_COMPILE"],
+            [UnreadEnvVar("TPU_PARALLEL_PRE_COMPILE", "TPU_PARALLEL_PRECOMPILE")],
+            id="extra_underscore",
+        ),
+        pytest.param(
             ["VLLM_TPU_USE_NAIVE_KDA"],
             [UnreadEnvVar("VLLM_TPU_USE_NAIVE_KDA")],
             id="removed_vllm_tpu_knob",
@@ -150,7 +160,11 @@ def test_platform_accepts_registered_and_written_names(
     monkeypatch.setenv("VLLM_TPU_USING_PATHWAYS", "0")
     monkeypatch.setenv("TORCH_TPU_TIER2_COMPILATION_CACHE", "tpu_tier2_cache")
     # No registry has it; only PACKAGE_WRITTEN_ENV_VARS keeps it from the exact
-    # VLLM_* check (omni/patches.py writes it).
+    # VLLM_* check (omni/patches.py writes it). Pin the external prefixes to ()
+    # so that VLLM_OMNI_ does not hide it where vllm_omni is installed.
+    monkeypatch.setattr(
+        TpuPlatform, "external_env_var_prefixes", classmethod(lambda cls: ())
+    )
     monkeypatch.setenv("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800")
     TpuPlatform.validate_environ(hard_fail=True)
     _warning.assert_not_called()
