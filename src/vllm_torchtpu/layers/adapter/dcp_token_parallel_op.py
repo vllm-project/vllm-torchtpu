@@ -33,6 +33,7 @@ hold raises in the runner (`check_step_capacity`) instead of running.
 """
 
 import functools
+import weakref
 from collections.abc import Callable
 from typing import Any
 
@@ -56,6 +57,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
 from vllm_torchtpu.kernels.mla import dcp_token_parallel, page_gather
 from vllm_torchtpu.kernels.mla.kv_cache_utils import update_sparse_mla_kv_cache_dcp
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
+from vllm_torchtpu.utils import get_shared_jax_op
 
 # Smallest bucket that takes the split (a power of two: `bucket_gate_edge`).
 MIN_TOKENS = 1024
@@ -322,20 +324,32 @@ def build_attention_op(
     if layer.kv_cache_quantized_dtype is not None:
         _, k_scale, _ = impl._get_kv_scales(layer)
     dequant = float(k_scale) if k_scale is not None else 1.0
+    sm_scale = float(layer.scale)
     from vllm_torchtpu.layers.core.attention_interface import (
         _mixed_body_levers,
         sparse_mla_attention_dcp,
     )
 
     rank_tensor = _sharded_rank_ids()
-    uv_in_tp = envs.TPU_DCP_PREFILL_TP_UV_BEFORE_A2A and not hasattr(
-        layer, "W_UV_scale"
+    has_rank = rank_tensor is not None
+    uv_in_tp = bool(
+        envs.TPU_DCP_PREFILL_TP_UV_BEFORE_A2A and not hasattr(layer, "W_UV_scale")
     )
-    split_q = envs.TPU_MLA_SPARSE_SPLIT_Q
+    split_q = bool(envs.TPU_MLA_SPARSE_SPLIT_Q)
     mixed_levers = _mixed_body_levers(
         envs.TPU_DCP_MLA_MIXED_BODY, envs.TPU_DCP_MLA_MIXED_KERNEL_V2
     )
-    fused_subbatch = envs.TPU_DCP_PREFILL_FUSED_SUBBATCH
+    fused_subbatch = bool(envs.TPU_DCP_PREFILL_FUSED_SUBBATCH)
+    num_heads = int(layer.num_heads)
+    out_dim = int(layer.v_head_dim if uv_in_tp else layer.kv_lora_rank)
+    chunk_tokens = envs.TPU_SPARSE_MLA_CHUNK_TOKENS
+    target_layer = layer
+    del layer, impl
+
+    # KV cache specs are recorded after the op is built, so the shared op reads
+    # them from the first sparse layer at trace time and checks that all other
+    # sharers recorded the same specs.
+    layers: list[weakref.ref] = []
 
     def _run(
         kv_cache_nope: jax.Array,
@@ -357,7 +371,20 @@ def build_attention_op(
             kv_cache_nope, kv_cache_rope = _after_reads(
                 kv_cache_nope, kv_cache_rope, after=after
             )
-        nope_spec, rope_spec = layer.mla_kv_spec
+        live = [
+            sharer
+            for ref in layers
+            if (sharer := ref()) is not None and hasattr(sharer, "mla_kv_spec")
+        ]
+        nope_spec, rope_spec = live[0].mla_kv_spec
+        for other in live[1:]:
+            if other.mla_kv_spec != (nope_spec, rope_spec):
+                raise NotImplementedError(
+                    f"{getattr(other, 'layer_name', other)} shares a sparse MLA "
+                    f"TP op with {getattr(live[0], 'layer_name', live[0])} but "
+                    f"recorded different KV cache specs "
+                    f"({other.mla_kv_spec} != {(nope_spec, rope_spec)})."
+                )
         if nope_spec.page_size != layout.page_size:
             raise ValueError(
                 f"sparse MLA cache page {nope_spec.page_size} != block size "
@@ -383,7 +410,7 @@ def build_attention_op(
             )
 
         attend = make_attend(
-            sm_scale=layer.scale,
+            sm_scale=sm_scale,
             k_scale=dequant,
             cache_layout=nope_spec.layout.value,
             packed_rope=rope_spec.packed_rope,
@@ -513,7 +540,7 @@ def build_attention_op(
             mesh,
             nope_spec,
             rope_spec,
-            sm_scale=layer.scale,
+            sm_scale=sm_scale,
             k_scale=dequant,
             dcp_size=dcp,
             interleave_size=il,
@@ -858,25 +885,11 @@ def build_attention_op(
     in_specs += (rep, rep, sharded, rep, rep, rep, rep)
     if not fused_subbatch:
         in_specs += (sharded,)
-    if rank_tensor is not None:
+    if has_rank:
         in_specs += (sharded,)
     if uv_in_tp:
         in_specs += (sharded,)
-    fn = _build_wrapper(rank_tensor is not None, uv_in_tp)
-    op = pcp_streaming_jax_op(
-        f"pallas::sparse_mla_tp_{layer.layer_name.replace('.', '_')}"
-        + ("_qrep" if q_replicated else "")
-        + ("_uv" if uv_in_tp else "")
-        + ("_sq" if use_split_op else "")
-        + ("_fsb" if fused_subbatch else ""),
-        fn,
-        donate_argnums=(0, 1),
-        mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=(sharded, sharded, sharded),
-    )
-    num_heads = layer.num_heads
-    out_dim = layer.v_head_dim if uv_in_tp else layer.kv_lora_rank
+    fn = _build_wrapper(has_rank, uv_in_tp)
 
     def _fake(kv_cache_nope, kv_cache_rope, q, *rest, **kwargs):
         del kwargs
@@ -887,7 +900,41 @@ def build_attention_op(
             q.new_empty((kv_c_normed.shape[0], num_heads, out_dim)),
         )
 
-    op.register_fake(_fake)
+    def _build_op(op_name: str):
+        built = pcp_streaming_jax_op(
+            op_name,
+            fn,
+            donate_argnums=(0, 1),
+            mesh=mesh,
+            input_partition_specs=in_specs,
+            output_partition_specs=(sharded, sharded, sharded),
+        )
+        built.register_fake(_fake)
+        return built, layers
+
+    op, sharers = get_shared_jax_op(
+        "sparse_mla_tp",
+        (
+            id(mesh),
+            layout,
+            bool(q_replicated),
+            sm_scale,
+            dequant,
+            uv_in_tp,
+            bool(use_split_op),
+            mixed_levers,
+            bool(fused_subbatch),
+            chunk_tokens,
+            has_rank,
+            num_heads,
+            out_dim,
+        ),
+        _build_op,
+    )
+    if getattr(target_layer, "use_sparse", True) and not any(
+        ref() is target_layer for ref in sharers
+    ):
+        sharers.append(weakref.ref(target_layer))
 
     def run(
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -1110,13 +1157,17 @@ def build_indexer_op(
         else None
     )
     rank_tensor = _sharded_rank_ids()
+    has_rank = rank_tensor is not None
     small_ag = bool(
         fused_subbatch
         and envs.TPU_DCP_INDEXER_SMALL_AG
         and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
-        and rank_tensor is not None
+        and has_rank
     )
     lane_tensor = dcp_lane_operand() if small_ag else None
+    has_lane = lane_tensor is not None
+    shared_meta = bool(shared_meta)
+    del indexer
     sharded, rep = P(DCP_AXIS_NAME), P()
 
     def _run(
@@ -1288,7 +1339,7 @@ def build_indexer_op(
 
     def _build_idx_wrapper():
         if fused_subbatch:
-            if rank_tensor is None:
+            if not has_rank:
 
                 def f0(
                     qb: jax.Array,
@@ -1303,7 +1354,7 @@ def build_indexer_op(
                     return _run(qb, w, kv, kp, sl, pi, cql, dist, None, None, None)
 
                 return f0
-            if lane_tensor is None:
+            if not has_lane:
 
                 def f1(
                     qb: jax.Array,
@@ -1336,7 +1387,7 @@ def build_indexer_op(
 
             return f2
 
-        if rank_tensor is None:
+        if not has_rank:
 
             def u0(
                 qb: jax.Array,
@@ -1373,20 +1424,10 @@ def build_indexer_op(
     in_specs = (q_spec, q_spec, sharded, rep, rep, rep, rep, rep)
     if not fused_subbatch:
         in_specs += (sharded,)
-    if rank_tensor is not None:
+    if has_rank:
         in_specs += (sharded,)
-    if lane_tensor is not None:
+    if has_lane:
         in_specs += (sharded,)
-    op = pcp_streaming_jax_op(
-        f"pallas::streamidx_topk_tp_{indexer.k_cache.prefix.replace('.', '_')}"
-        + ("_qown" if q_own_rows else "")
-        + ("_fsb" if fused_subbatch else ""),
-        _build_idx_wrapper(),
-        donate_argnums=(2,),
-        mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=(sharded, sharded),
-    )
 
     def _fake(q_bytes, weights, cache_kv, *rest, **kwargs):
         del weights, rest, kwargs
@@ -1403,7 +1444,45 @@ def build_indexer_op(
             q_bytes.new_empty((out_rows, topk), dtype=torch.int32),
         )
 
-    op.register_fake(_fake)
+    def _build_idx_op(op_name: str):
+        built = pcp_streaming_jax_op(
+            op_name,
+            _build_idx_wrapper(),
+            donate_argnums=(2,),
+            mesh=mesh,
+            input_partition_specs=in_specs,
+            output_partition_specs=(sharded, sharded),
+        )
+        built.register_fake(_fake)
+        return built
+
+    op = get_shared_jax_op(
+        "streamidx_topk_tp",
+        (
+            id(mesh),
+            layout,
+            bool(q_own_rows),
+            int(topk),
+            chunk_tokens,
+            bool(hist_merge),
+            bool(a2a_merge),
+            int(a2a_min_tokens),
+            small_bucket,
+            kv_cache_mode,
+            bool(skip_empty_decode),
+            bool(skip_empty_decode_chunked),
+            mixed_bkvp,
+            bool(decode_pack),
+            shared_meta,
+            bool(k_write_compact),
+            bool(fused_subbatch),
+            global_group,
+            has_rank,
+            small_ag,
+            has_lane,
+        ),
+        _build_idx_op,
+    )
 
     def run(*args: torch.Tensor) -> torch.Tensor:
         extra = ()
