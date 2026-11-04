@@ -346,8 +346,11 @@ def run_decode(args, records: harness.Records) -> None:
         if args.save_tokens:
             streams[tag] = torch.stack([o[:batch, 0] for o in outs]).cpu().numpy()
         if args.save_routes and ops.route_log:
+            # The timed steps' shape (context replay steps may run smaller batches).
+            width = ops.route_log[-1].shape[1]
             route_streams[tag] = (
-                torch.stack([r.cpu() for r in ops.route_log]).numpy()[:, :, :batch].astype(np.int16)
+                torch.stack([r.cpu() for r in ops.route_log if r.shape[1] == width])
+                .numpy()[:, :, :batch].astype(np.int16)
             )
             ops.route_log.clear()
         decoder.forget([f"{tag}-{r}" for r in range(batch)])
