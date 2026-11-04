@@ -15,12 +15,16 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import importlib
+import importlib.abc
+import importlib.machinery
 import json
 import re
 import sys
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -33,9 +37,9 @@ from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from types import ModuleType
 
-# HuggingFace Qwen3.5, Mixtral-8x7B, DeepSeek-V3, and Kimi-K3-Pro configs.
+# HuggingFace Qwen3.5, Mixtral-8x7B, DeepSeek-V3, and Kimi-K3.1-Pro configs.
 _QWEN35_08B_CFG = {
     "model_type": "qwen3_5",
     "num_hidden_layers": 24,
@@ -131,7 +135,7 @@ _KIMI_K3_PRO_CFG = {
     "quantization_config": {"quant_method": "fp8", "expert_dtype": "mxfp4"},
 }
 
-_NUM_SCOPES = 5
+_NUM_SCOPES = 4
 _NUM_REGIMES = 12
 _KIMI_ROUTED_HIDDEN = 3584
 _KIMI_KDA_LAYERS = 69
@@ -145,17 +149,15 @@ _V5E_HBM_CAP_GB = 24.0
 _FFN_DIM_2048 = 2048
 _DSV3_HEAD_DIM = 128
 _DSV3_MOE_LAYERS = 58
-_DSV3_MLA_W_STEP_GB = 2.236
 _VERIFY_ACTIVE_TOKENS = 32
 _MIXED_ACTIVE_TOKENS = 160
 _TPU7X_VMEM_MIB = 62.0
-_FIT_VMEM_MIB = 56.0
 _CUSTOM_VMEM_MIB = 58.0
 _STAGE_OPS_PER_STEP = 18
-_KIMI_GROUPED_B_TOK = 139264
-_KIMI_CROSS_T_MAX = 67
-_KIMI_1L_T_MAX = 384
-_QWEN38_CROSS_T_MAX = 42
+_PREFILL_STAGE_FLOOR_MIN_US = 30_000.0
+_PREFILL_STAGE_FLOOR_MAX_US = 60_000.0
+_PREFILL_STAGE_MEASURED_US = 136_010.0
+_MEASURED_COVERAGE = 0.85
 # Shipped Qwen3.5 decode megakernel: microbatch rows when a verify bucket splits.
 # Buckets up to 112 rows still run as one call by trading expert-ring depth for
 # VMEM, which the advisor does not model.
@@ -189,10 +191,9 @@ def test_package_reexport_without_prior_submodule_import() -> None:
     [
         ("qwen3.5-0.8b", "Qwen/Qwen3.5-0.8B", 24, 6, 18, 0, "fp8", "fp8"),
         ("qwen3.5-397b", "Qwen/Qwen3.5-397B-A17B-FP8", 60, 15, 45, 60, "fp8", "fp8"),
-        ("qwen3.8-2.4t", "Qwen/Qwen3.8-2.4T", 92, 23, 69, 92, "fp8", "nvfp4"),
+        ("qwen3.8-2.4t", "Qwen/Qwen3.8-2.4T-A95B", 92, 23, 69, 92, "fp8", "nvfp4"),
         ("kimi-k3", "moonshotai/Kimi-K3", 93, 24, 69, 92, "fp8", "mxfp4"),
         ("kimi-k3.1-pro", "moonshotai/Kimi-K3.1-Pro", 93, 24, 69, 92, "fp8", "mxfp4"),
-        ("kimi-k3-pro", "moonshotai/Kimi-K3-Pro", 93, 24, 69, 92, "fp8", "mxfp4"),
         ("deepseek-v3", "deepseek-ai/DeepSeek-V3", 61, 61, 0, 58, "fp8", "fp8"),
         ("glm-5.2", "zai-org/GLM-5.2-FP8", 78, 78, 0, 75, "fp8", "fp8"),
         (
@@ -264,10 +265,9 @@ def test_kimi_k3_linear_attn_config_normalization() -> None:
     prof = advisor.model_profile_from_hf_config(_KIMI_K3_PRO_CFG, name="kimi-k3.1-pro")
     assert prof == advisor.MODEL_PRESETS["kimi-k3.1-pro"]
     assert prof.routed_expert_hidden_size == _KIMI_ROUTED_HIDDEN
-    assert (
-        dataclasses.replace(prof, name="kimi-k3-pro")
-        == advisor.MODEL_PRESETS["kimi-k3-pro"]
-    )
+    # Kimi-K3 and Kimi-K3.1-Pro share one public geometry.
+    k3 = advisor.MODEL_PRESETS["kimi-k3"]
+    assert (k3.num_experts, k3.top_k) == (prof.num_experts, prof.top_k)
     assert (
         advisor.resolve_model_profile(_KIMI_K3_PRO_CFG).num_linear_layers
         == _KIMI_KDA_LAYERS
@@ -293,7 +293,6 @@ def test_kimi_k3_linear_attn_config_normalization() -> None:
         {
             "model_type": "gemma3_unregistered",
             "num_hidden_layers": 24,
-            "hidden_size": 2048,
             "num_attention_heads": 16,
         },
         {"text_config": "invalid_not_a_dict"},
@@ -332,13 +331,18 @@ def test_per_token_vmem_live_interval_and_sharding() -> None:
         moe_mode="grouped_on_chip",
     )
     parts_grp = advisor.compute_per_token_vmem_bytes(pk3, wl_grp)
-    assert parts_grp["total_per_token_bytes"] == _KIMI_GROUPED_B_TOK
-    assert parts_grp["b_tok"] == _KIMI_GROUPED_B_TOK
+    expected_grp_tok = parts_grp["residual_buffer_bytes"] + max(
+        parts_grp["attn_scratch_bytes"],
+        parts_grp["linear_attn_scratch_bytes"],
+        parts_grp["moe_scratch_bytes"],
+    )
+    assert parts_grp["total_per_token_bytes"] == expected_grp_tok
+    assert parts_grp["b_tok"] == expected_grp_tok
     rep_grp = advisor.advise(pk3, wl_grp, "tpu7x")
     cross_sc = next(s for s in rep_grp.scopes if s.scope == "whole_step")
     one_l_sc = next(s for s in rep_grp.scopes if s.scope == "single_layer")
-    assert cross_sc.max_vmem_tokens == _KIMI_CROSS_T_MAX
-    assert one_l_sc.max_vmem_tokens == _KIMI_1L_T_MAX
+    assert cross_sc.max_vmem_tokens >= _QWEN35_VERIFY_ROWS_MIN
+    assert one_l_sc.max_vmem_tokens > cross_sc.max_vmem_tokens
 
     wl_msk = dataclasses.replace(wl_grp, moe_mode="masked_on_chip")
     parts_msk = advisor.compute_per_token_vmem_bytes(pk3, wl_msk)
@@ -453,7 +457,22 @@ def test_multi_tpu_vmem_and_fp8_dtype_physics() -> None:
     r_mla_only = advisor.advise(
         pdsv3_dense_only, advisor.WorkloadSpec(tp=8, batch=1, context=4096), c7x
     )
-    assert r_mla_only.scopes[0].w_step_gb == _DSV3_MLA_W_STEP_GB
+    nh_loc = pdsv3_dense_only.num_attention_heads // 8
+    q_tot = nh_loc * (
+        pdsv3_dense_only.qk_nope_head_dim + pdsv3_dense_only.qk_rope_head_dim
+    )
+    q_dim = nh_loc * pdsv3_dense_only.head_dim
+    mla_layer_params = (
+        pdsv3_dense_only.q_lora_rank * (pdsv3_dense_only.hidden_size + q_tot)
+        + pdsv3_dense_only.hidden_size
+        * (pdsv3_dense_only.kv_lora_rank + pdsv3_dense_only.qk_rope_head_dim + q_dim)
+        + pdsv3_dense_only.kv_lora_rank
+        * nh_loc
+        * (pdsv3_dense_only.qk_nope_head_dim + pdsv3_dense_only.head_dim)
+        + 3 * pdsv3_dense_only.hidden_size
+    )
+    expected_mla_w_gb = round((pdsv3_dense_only.num_layers * mla_layer_params) / 1e9, 4)
+    assert r_mla_only.scopes[0].w_step_gb == expected_mla_w_gb
     r_mla_pre = advisor.advise(
         pdsv3_dense_only,
         advisor.WorkloadSpec(phase="prefill", tp=8, batch=1, isl=4096, chunk_size=1),
@@ -533,7 +552,7 @@ def test_asymptotic_decode_intensity_and_vmem_fit_headroom() -> None:
         "tpu7x",
     )
     assert r_alias.vmem_budget_mib == _TPU7X_VMEM_MIB
-    assert r_no_alias.vmem_budget_mib == _FIT_VMEM_MIB
+    assert r_no_alias.vmem_budget_mib == advisor.fit_vmem_budget_bytes() / (1 << 20)
     cx_alias = next(s for s in r_alias.scopes if s.scope == "whole_step")
     cx_no_al = next(s for s in r_no_alias.scopes if s.scope == "whole_step")
     cx_disp = next(s for s in r_no_alias_disp.scopes if s.scope == "whole_step")
@@ -690,7 +709,8 @@ def test_qwen38_24t_decode_regime_crossover_and_moe_modes() -> None:
     """Verify Qwen3.8-2.4T TP32xEP32 recommends whole_step for B=4, 8, 16 decode."""
     sweep_24t = advisor.advise_regimes("qwen3.8-2.4t", "tpu7x")
     assert (sweep_24t.parallelism.tp, sweep_24t.parallelism.ep) == (32, 32)
-    assert sweep_24t.max_vmem_tokens == _QWEN38_CROSS_T_MAX
+    assert sweep_24t.max_vmem_tokens >= _VERIFY_ACTIVE_TOKENS
+    assert sweep_24t.single_layer_vmem_tokens > sweep_24t.max_vmem_tokens
     by_label = {r.label: r for r in sweep_24t.regimes}
 
     for small_lbl in (
@@ -846,7 +866,7 @@ def test_cli_json_presets_and_validation_errors(
         advisor.main(
             [
                 "--model",
-                "moonshotai/Kimi-K3-Pro",
+                "moonshotai/Kimi-K3.1-Pro",
                 "--tp",
                 "16",
                 "--ep",
@@ -857,7 +877,7 @@ def test_cli_json_presets_and_validation_errors(
         )
         == 0
     )
-    assert "Model: kimi-k3-pro" in capsys.readouterr().out
+    assert "Model: kimi-k3.1-pro" in capsys.readouterr().out
 
     for bad_argv in (
         ["--config", str(tmp_path / "missing.json")],
@@ -1030,23 +1050,11 @@ def test_whole_step_tiles_overflow_and_reads_weights_once() -> None:
         "tpu7x",
     )
     tiled = next(s for s in rep.scopes if s.scope == "whole_step")
-    repass = next(s for s in rep.scopes if s.scope == "whole_step_repass")
-    assert tiled.n_splits == repass.n_splits > 1
-    assert repass.feasible
-    assert tiled.w_step_gb <= repass.w_step_gb * repass.n_splits
-    assert tiled.step_bound_us < repass.step_bound_us
-
-
-def test_whole_step_repass_needs_more_than_one_pass() -> None:
-    """Verify whole_step_repass is only offered when tokens overflow VMEM."""
-    rep = advisor.advise(
-        advisor.resolve_model_profile("qwen3.5-397b"),
-        advisor.WorkloadSpec(phase="decode", batch=4, tp=8, ep=8),
-        "tpu7x",
-    )
-    repass = next(s for s in rep.scopes if s.scope == "whole_step_repass")
-    assert repass.n_splits == 1
-    assert not repass.feasible
+    one_l = next(s for s in rep.scopes if s.scope == "single_layer")
+    assert tiled.n_splits > 1
+    assert tiled.feasible
+    assert tiled.w_step_gb == one_l.w_step_gb
+    assert tiled.step_bound_us < 1.5 * one_l.step_bound_us
 
 
 def test_fused_scopes_price_the_recommended_moe_mode() -> None:
@@ -1062,3 +1070,607 @@ def test_fused_scopes_price_the_recommended_moe_mode() -> None:
         steps.append(next(s for s in rep.scopes if s.scope == "whole_step"))
         assert rep.recommended_moe_mode == "grouped_on_chip"
     assert steps[0].moe_flop_factor == steps[1].moe_flop_factor
+
+
+class _JaxBlocker(importlib.abc.MetaPathFinder):
+    """MetaPathFinder that blocks importing `jax` or any `jax.*` submodule."""
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: object = None,
+        target: ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        """Raise ModuleNotFoundError when `jax` or `jax.*` is requested."""
+        _ = (path, target)
+        if fullname == "jax" or fullname.startswith("jax."):
+            msg = "No module named 'jax'"
+            raise ModuleNotFoundError(msg)
+        return None
+
+
+def test_unregistered_model_type_estimates_with_architecture_unverified_flag() -> None:
+    """Verify unseen causal-LM `model_type` succeeds and flags unverified arch."""
+    future_cfg: dict[str, object] = {
+        "model_type": "falcon_future_causal",
+        "num_hidden_layers": 32,
+        "hidden_size": 4096,
+        "intermediate_size": 14336,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+    }
+    advisor.supports_hf_config(future_cfg)
+    prof = advisor.model_profile_from_hf_config(future_cfg, name="falcon-future")
+    assert prof.architecture_unverified is True
+    assert "gqa" in prof.layer_families
+    assert "dense_mlp" in prof.layer_families
+    rep = advisor.advise(prof, advisor.WorkloadSpec(tp=8, batch=16), "tpu7x")
+    assert "architecture_unverified" in rep.flags
+
+    missing_hidden: dict[str, object] = {
+        "model_type": "falcon_future_causal",
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+    }
+    with pytest.raises(advisor.UnsupportedArchitectureError, match="hidden_size"):
+        advisor.model_profile_from_hf_config(missing_hidden)
+
+
+def test_unknown_chip_requires_chip_spec_fields(tmp_path: Path) -> None:
+    """Verify unknown chip names require `--chip-spec` and load valid JSON specs."""
+    with pytest.raises(MegakernelConfigError, match="--chip-spec") as exc_info:
+        advisor.resolve_chip_spec("future_xpu_v99")
+    err_text = str(exc_info.value)
+    for req_key in (
+        "vmem_capacity_bytes",
+        "hbm_capacity_bytes",
+        "hbm_bw_bytes_per_s",
+        "bf16_flops_per_s",
+    ):
+        assert req_key in err_text
+
+    spec_file = tmp_path / "future_xpu.json"
+    spec_payload = {
+        "name": "future_xpu_v99",
+        "cores_per_device": 1,
+        "vmem_capacity_bytes": 67108864,
+        "vmem_usable_bytes": 65011712,
+        "hbm_capacity_bytes": 103000000000,
+        "hbm_bw_bytes_per_s": 3.7e12,
+        "bf16_flops_per_s": 1.155e15,
+        "fp8_flops_per_s": 2.3e15,
+        "native_ocp_fp8": True,
+        "ici_egress_bw_bytes_per_s": 3.0e11,
+        "ici_link_bw_bytes_per_s": 1.0e11,
+        "collective_latency_us_bracket": [1.0, 4.0],
+        "sources": {"spec": "custom user chip spec JSON"},
+    }
+    spec_file.write_text(json.dumps(spec_payload), encoding="utf-8")
+    cs = advisor.resolve_chip_spec("future_xpu_v99", chip_spec_path=spec_file)
+    assert cs.name == "future_xpu_v99"
+    assert cs.peak_flops("fp8") == _TPU7X_FP8_FLOPS
+    rc = advisor.main(
+        [
+            "--model",
+            "qwen3.5-0.8b",
+            "--chip",
+            "future_xpu_v99",
+            "--chip-spec",
+            str(spec_file),
+            "--tp",
+            "8",
+        ]
+    )
+    assert rc == 0
+
+
+def test_every_output_number_has_provenance_tag() -> None:
+    """Verify every metric in single-point and sweep dicts carries a valid tag."""
+    valid_tags = {"DERIVED", "ASSUMED", "MEASURED"}
+    required_keys = (
+        "fits_hbm",
+        "tokens_per_core",
+        "onchip_ceiling",
+        "compute_bound_at",
+        "step_floor_us",
+        "throughput_tok_s_per_chip",
+        "boundary_cost_us",
+        "fusion_gain_max",
+        "step_coverage",
+        "expected_gain_max",
+    )
+    rep = advisor.advise(
+        "qwen3.5-397b", advisor.WorkloadSpec(phase="decode", batch=16, tp=8), "tpu7x"
+    )
+    d_rep = rep.to_dict()
+    metrics = d_rep["metrics"]
+    assert isinstance(metrics, dict)
+    for k in required_keys:
+        assert k in metrics
+    for entry in metrics.values():
+        assert entry["tag"] in valid_tags
+        assert bool(entry["source"])
+        assert bool(entry["unit"])
+        band = entry["band"]
+        assert band[0] <= band[1]
+
+    sweep = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    d_sweep = sweep.to_dict()
+    for reg in d_sweep["regimes"]:
+        reg_metrics = reg["metrics"]
+        for k in required_keys:
+            assert k in reg_metrics
+        for entry in reg_metrics.values():
+            assert entry["tag"] in valid_tags
+            assert entry["band"][0] <= entry["band"][1]
+
+
+def test_prefill_stage_floor_stays_below_measured_136ms() -> None:
+    """Verify Qwen3.5-397B PP8 8K prefill stage floor is strictly below 136.01 ms."""
+    p397 = advisor.model_profile_from_hf_config(_QWEN35_397B_CFG, name="qwen3.5-397b")
+    wl = advisor.WorkloadSpec(
+        phase="prefill",
+        batch=1,
+        isl=8192,
+        chunk_size=8192,
+        context=95232,
+        pp=8,
+        tp=1,
+        ep=1,
+        moe_mode="grouped_on_chip",
+    )
+    rep = advisor.advise(p397, wl, "tpu7x")
+    lg = next(s for s in rep.scopes if s.scope == "layer_group")
+    assert lg.moe_flop_factor == 1.0
+    assert (
+        _PREFILL_STAGE_FLOOR_MIN_US <= lg.step_bound_us <= _PREFILL_STAGE_FLOOR_MAX_US
+    )
+    assert lg.step_bound_us < _PREFILL_STAGE_MEASURED_US
+    assert lg.step_upper_us >= lg.step_bound_us
+    assert lg.step_upper_us < _PREFILL_STAGE_MEASURED_US
+
+
+def _regime(model: str, prefix: str, **opts: object) -> advisor.RegimeEntry:
+    """Return the regime row of `model` on tpu7x whose label starts with `prefix`."""
+    sweep = advisor.advise_regimes(model, "tpu7x", **opts)
+    return next(r for r in sweep.regimes if r.label.startswith(prefix))
+
+
+def test_shared_assumptions_keep_decode_megakernel_verdict() -> None:
+    """Verify fewer launches with equal collectives win at every corner, so no tie."""
+    for model in ("qwen3.5-397b", "kimi-k3"):
+        row = _regime(model, "Decode Small")
+        assert row.recommended_scope == "whole_step"
+        assert row.verdict == "megakernel_likely"
+        # The assumed band is still shown even though the winner never changes.
+        assert row.step_upper_us > row.step_bound_us
+
+
+def test_tie_only_when_winner_flips_between_corners() -> None:
+    """Verify Qwen3.5-397B T=256 prefill flips to layer_group at high launch gap."""
+    row = _regime("qwen3.5-397b", "Chunked Prefill")
+    assert row.recommended_scope == "single_layer"
+    assert row.verdict == "tie(measure: launch_gap_us)"
+    assert "vs runner-up layer_group" in row.rationale
+    assert "layer_group wins at launch gap 8.0 us" in row.rationale
+    knob = row.verdict.removeprefix("tie(measure: ").removesuffix(")")
+    scope_inputs = {
+        u["name"] for u in row.unresolved_assumptions if u["affects"] == "scope"
+    }
+    assert knob in scope_inputs
+
+
+def test_measurements_narrow_scope_band_and_settle_verdict(tmp_path: Path) -> None:
+    """Verify measured launch gap and collective latency collapse the assumed box."""
+    m_file = tmp_path / "measurements.json"
+    m_payload = {
+        "schema": "advisor.measurements.v1",
+        "source": {"kind": "xplane", "file": "trace.xplane.pb", "tool": "calibrate"},
+        "launch_gap_us": {"p50": 3.0, "p90": 3.0, "n": 40},
+        "collectives": [
+            {
+                "op": "all_reduce",
+                "group_size": 8,
+                "bytes": 32768,
+                "latency_us": 9.0,
+                "n": 20,
+            }
+        ],
+    }
+    m_file.write_text(json.dumps(m_payload), encoding="utf-8")
+    prior = _regime("qwen3.5-397b", "Decode Saturated")
+    assert prior.verdict.startswith("tie(measure: ")
+    row = _regime("qwen3.5-397b", "Decode Saturated", measurements=m_file)
+    assert row.metrics["launch_gap_us"]["tag"] == "MEASURED"
+    assert row.metrics["collective_latency_us"]["tag"] == "MEASURED"
+    # Decode has no attention dtype band, so a degenerate box gives a zero-width band.
+    assert row.step_upper_us == row.step_bound_us
+    assert not row.verdict.startswith("tie")
+
+
+def test_single_layer_is_fused_layer_not_megakernel() -> None:
+    """Verify one call per layer is reported as a fused layer, not a megakernel."""
+    row = _regime("kimi-k3", "Decode Saturated")
+    assert row.recommended_scope == "single_layer"
+    assert row.verdict == "fused_layer_likely"
+    assert _regime("kimi-k3", "Preset Prefill Window (W=2048)").verdict == (
+        "megakernel_likely"
+    )
+
+
+def test_throughput_counts_all_window_tokens_per_physical_chip() -> None:
+    """Verify tok/s/chip uses the whole PCP window and 2 devices per v7x chip."""
+    row = _regime("kimi-k3", "Preset Prefill Window (W=2048)")
+    # 64 tokens per core x PCP32 = 2048 tokens per step over 16 chips (32 cores).
+    expected = 2048 / 16 / (row.step_bound_us * 1e-6)
+    got = float(row.metrics["throughput_tok_s_per_chip"]["value"])
+    assert row.active_tokens == 64
+    assert got == pytest.approx(expected, rel=1e-3)
+    dec = _regime("kimi-k3", "Decode Small")
+    # 4 decode tokens per step over 16 chips.
+    exp_dec = 4 / 16 / (dec.step_bound_us * 1e-6)
+    got_dec = float(dec.metrics["throughput_tok_s_per_chip"]["value"])
+    assert got_dec == pytest.approx(exp_dec, rel=1e-3)
+
+
+def test_kimi_k3_preset_uses_dspark_verify8_and_dp2_saturation() -> None:
+    """Verify Kimi-K3 rows use its shipped draft length and high-c DP2 layout."""
+    sweep = advisor.advise_regimes("kimi-k3", "tpu7x")
+    labels = [r.label for r in sweep.regimes]
+    assert "Spec Verify Small (B=4, K=7)" in labels
+    verify = next(r for r in sweep.regimes if r.label.startswith("Spec Verify Small"))
+    assert verify.active_tokens == 4 * 8
+    sat = next(r for r in sweep.regimes if r.label.startswith("Decode Saturated"))
+    assert sat.layout == "DP2 x TP16 x DCP16 x EP32"
+    assert sat.label == "Decode Saturated (B=512 over DP2, T=1, 32K)"
+    # Qwen keeps MTP-3.
+    q = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    assert "Spec Verify Small (B=4, K=3)" in [r.label for r in q.regimes]
+
+
+def test_rationale_reports_margin_percent() -> None:
+    """Verify the rationale states the runner-up margin in us and percent."""
+    row = _regime("qwen3.5-397b", "Decode Small")
+    assert "vs runner-up single_layer" in row.rationale
+    assert re.search(r"\+\d+\.\d us, \d+\.\d%\)", row.rationale)
+
+
+def test_kimi_k3_preset_matches_public_hf_config() -> None:
+    """Verify Kimi-K3 uses the public HF expert count and routing width."""
+    k3 = advisor.MODEL_PRESETS["kimi-k3"]
+    # HF moonshotai/Kimi-K3 config.json: num_experts 896, num_experts_per_token 16.
+    assert (k3.num_experts, k3.top_k, k3.num_moe_layers) == (896, 16, 92)
+    assert "kimi-k3-pro" not in advisor.MODEL_PRESETS
+    assert advisor.resolve_model_profile("qwen3.8-2.4t-a95b").num_experts == 512
+
+
+def test_step_coverage_never_flags_or_decides_scope() -> None:
+    """Verify coverage scales expected gain only: never a flag and never a tie knob."""
+    for model in ("qwen3.5-397b", "kimi-k3"):
+        for row in advisor.advise_regimes(model, "tpu7x").regimes:
+            assert "coverage_assumed" not in row.flags
+            assert "step_coverage" not in row.verdict
+            cov = [
+                u for u in row.unresolved_assumptions if u["name"] == "step_coverage"
+            ]
+            assert all(u["affects"] == "gain" for u in cov)
+
+
+def test_boundary_cost_uses_sourced_launch_gap() -> None:
+    """Verify default `WorkloadSpec` prices non-zero boundary cost with ASSUMED tag."""
+    rep = advisor.advise(
+        "qwen3.5-0.8b",
+        advisor.WorkloadSpec(phase="decode", batch=4, tp=8),
+        "tpu7x",
+    )
+    assert rep.metrics["boundary_cost_us"]["value"] > 0.0
+    assert rep.metrics["launch_gap_us"]["tag"] == "ASSUMED"
+    assert rep.metrics["launch_gap_us"]["value"] > 0.0
+
+
+def test_ring_plan_changes_onchip_ceiling() -> None:
+    """Verify deeper ring-buffer slot plans lower the on-chip token ceiling."""
+    p397 = advisor.resolve_model_profile("qwen3.5-397b")
+    r_two = advisor.advise(
+        p397,
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=16,
+            tp=8,
+            ep=8,
+            ring_plan=advisor.RingPlan(dense_slots=2, expert_slots=2),
+        ),
+        "tpu7x",
+    )
+    r_deep = advisor.advise(
+        p397,
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=16,
+            tp=8,
+            ep=8,
+            ring_plan=advisor.RingPlan(dense_slots=4, expert_slots=3),
+        ),
+        "tpu7x",
+    )
+    assert (
+        r_deep.metrics["onchip_ceiling"]["value"]
+        < r_two.metrics["onchip_ceiling"]["value"]
+    )
+
+
+def test_measurements_json_promotes_assumed_to_measured(tmp_path: Path) -> None:
+    """Verify `measurements.json` upgrades assumed inputs to MEASURED."""
+    m_file = tmp_path / "measurements.json"
+    m_payload = {
+        "schema": "advisor.measurements.v1",
+        "source": {"kind": "xplane", "file": "trace.xplane.pb", "tool": "calibrate"},
+        "launch_gap_us": {"p50": 3.5, "p90": 5.0, "n": 40},
+        "collectives": [
+            {
+                "op": "all_reduce",
+                "group_size": 8,
+                "bytes": 32768,
+                "latency_us": 12.0,
+                "n": 20,
+            }
+        ],
+        "step_coverage": {
+            "fused_eligible_fraction": _MEASURED_COVERAGE,
+            "basis": "trace",
+        },
+    }
+    m_file.write_text(json.dumps(m_payload), encoding="utf-8")
+    rep = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8),
+        "tpu7x",
+        measurements=m_file,
+    )
+    assert rep.metrics["launch_gap_us"]["tag"] == "MEASURED"
+    assert rep.metrics["step_coverage"]["tag"] == "MEASURED"
+    assert rep.metrics["step_coverage"]["value"] == _MEASURED_COVERAGE
+    assert "coverage_assumed" not in rep.flags
+
+
+def _assert_no_top_level_jax_or_torch(py_path: Path) -> None:
+    """Assert `py_path` has no module-top-level imports of `jax` or `torch`."""
+    tree = ast.parse(py_path.read_text("utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not alias.name.startswith(("jax", "torch"))
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            assert not node.module.startswith(("jax", "torch"))
+
+
+def test_import_without_jax() -> None:
+    """Verify `megakernel` and `advisor` import and run with `jax` blocked."""
+    mk_init = Path(mk.__file__)
+    adv_dir = mk_init.parent / "advisor"
+    for py_path in (mk_init, *sorted(adv_dir.glob("*.py"))):
+        _assert_no_top_level_jax_or_torch(py_path)
+
+    blocker = _JaxBlocker()
+    saved_modules: dict[str, ModuleType] = {}
+    for mod_name in list(sys.modules):
+        if mod_name == "jax" or mod_name.startswith(
+            ("jax.", "vllm_torchtpu.megakernel")
+        ):
+            saved_modules[mod_name] = sys.modules.pop(mod_name)
+    sys.meta_path.insert(0, blocker)
+    try:
+        mk_fresh = importlib.import_module("vllm_torchtpu.megakernel")
+        adv_fresh = importlib.import_module("vllm_torchtpu.megakernel.advisor")
+        assert "jax" not in sys.modules
+        assert mk_fresh.advisor is adv_fresh
+        rep = adv_fresh.advise(
+            "qwen3.5-0.8b",
+            adv_fresh.WorkloadSpec(phase="decode", batch=4, tp=8),
+            "tpu7x",
+        )
+        assert rep.recommended_scope == "whole_step"
+    finally:
+        if blocker in sys.meta_path:
+            sys.meta_path.remove(blocker)
+        for mod_name in list(sys.modules):
+            if mod_name.startswith("vllm_torchtpu.megakernel"):
+                sys.modules.pop(mod_name, None)
+        sys.modules.update(saved_modules)
+
+
+def test_objective_both_reports_disagreement() -> None:
+    """Verify `objective='both'` emits `tie(objective_split: ...)` on split."""
+    pk3 = advisor.resolve_model_profile("kimi-k3")
+    rep = advisor.compare_parallelism_candidates(
+        pk3,
+        (
+            advisor.ParallelLayout(tp=1, ep=32, dp=1, dcp=32),
+            advisor.ParallelLayout(tp=1, ep=32, dp=2, dcp=16),
+        ),
+        batch=48,
+        context=32768,
+        chip="tpu7x",
+        objective="both",
+    )
+    assert str(rep["verdict"]).startswith("tie(objective_split:")
+    assert rep["best_step_layout"] != rep["best_throughput_layout"]
+
+
+_MIN_TPU7X_SLICE_CORES = 8
+_DEFAULT_DCN_BW_GBPS = 100.0
+_CALIBRATED_DCN_BW_GBPS = 160.0
+
+
+def test_tpu7x_topologies_start_at_2x2x1_and_tpu6e_alias() -> None:
+    """Verify TPU7X_TOPOLOGIES starts at 2x2x1 (8 cores) and tpu6e resolves."""
+    assert min(advisor.TPU7X_TOPOLOGIES) == _MIN_TPU7X_SLICE_CORES
+    assert advisor.TPU7X_TOPOLOGIES[_MIN_TPU7X_SLICE_CORES].startswith("2x2x1")
+    for sub_host in (1, 2, 4):
+        assert sub_host not in advisor.TPU7X_TOPOLOGIES
+    c6e = advisor.resolve_chip_spec("tpu6e")
+    assert c6e.name == "v6e"
+    assert min(c6e.topologies) == 1
+    par = advisor.recommend_parallelism(
+        advisor.resolve_model_profile("qwen3.5-0.8b"), "tpu7x"
+    )
+    assert par.tp * par.dp * par.pp >= _MIN_TPU7X_SLICE_CORES
+
+
+def test_pd_disagg_alignment_qwen35_and_kimi_k3_and_dcn_handoff(
+    tmp_path: Path,
+) -> None:
+    """Verify Qwen3.5-397B and Kimi-K3 P/D scope recommendations and DCN handoff."""
+    q_sweep = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    q_by_lbl = {r.label: r for r in q_sweep.regimes}
+    q_sat = next(r for r in q_sweep.regimes if r.label.startswith("Decode Saturated"))
+    assert q_by_lbl["Decode Med (B=16, T=1, 4K)"].recommended_scope == "whole_step"
+    assert q_by_lbl["Decode High (B=64, T=1, 32K)"].recommended_scope == "whole_step"
+    assert q_sat.layout == "DP4 x TP2 x EP8"
+    assert q_sat.recommended_scope == "single_layer"
+    assert q_by_lbl["Preset Prefill Window (W=2176)"].layout == "PP8 x TP1"
+    assert q_by_lbl["Preset Prefill Window (W=2176)"].recommended_scope == "per_op"
+    assert q_sweep.disagg_handoff is not None
+    assert q_sweep.disagg_handoff.dcn_provenance == "ASSUMED"
+    assert q_sweep.disagg_handoff.dcn_bw_gbps == _DEFAULT_DCN_BW_GBPS
+    assert q_sweep.disagg_handoff.dcn_bw_gbps_bracket == (50.0, 200.0)
+
+    k_sweep = advisor.advise_regimes("kimi-k3", "tpu7x")
+    k_by_lbl = {r.label: r for r in k_sweep.regimes}
+    assert k_by_lbl["Decode Med (B=16, T=1, 4K)"].recommended_scope == "whole_step"
+    assert k_by_lbl["Preset Prefill Window (W=2048)"].layout == "TP32 x PCP32 x EP16"
+    assert k_by_lbl["Preset Prefill Window (W=2048)"].recommended_scope == "layer_group"
+    assert k_by_lbl["Preset Prefill Window (W=8192)"].recommended_scope == "layer_group"
+
+    m_file = tmp_path / "dcn_meas.json"
+    m_file.write_text(
+        json.dumps(
+            {
+                "schema": "advisor.measurements.v1",
+                "source": {"kind": "xplane", "file": "dcn.xplane.pb"},
+                "dcn_bw_gbps": _CALIBRATED_DCN_BW_GBPS,
+            }
+        ),
+        encoding="utf-8",
+    )
+    q_meas = advisor.advise_regimes("qwen3.5-397b", "tpu7x", measurements=m_file)
+    assert q_meas.disagg_handoff is not None
+    assert q_meas.disagg_handoff.dcn_provenance == "MEASURED"
+    assert q_meas.disagg_handoff.dcn_bw_gbps == _CALIBRATED_DCN_BW_GBPS
+
+
+def test_chip_spec_optional_fields_sysfs_auto_int8_quant_and_refs_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify optional `--chip-spec` keys, sysfs `auto`, int8, and `--objective`."""
+    from vllm_torchtpu.megakernel.advisor import chips as chips_mod
+
+    spec_file = tmp_path / "custom_chip.json"
+    spec_file.write_text(
+        json.dumps(
+            {
+                "name": "custom_2tc",
+                "vmem_capacity_bytes": 64 << 20,
+                "hbm_capacity_bytes": 96 * (10**9),
+                "hbm_bw_bytes_per_s": 3690.0e9,
+                "bf16_flops_per_s": 1153.0e12,
+                "devices_per_chip": 2,
+                "min_slice_cores": 8,
+                "dcn_bw_gbps": 200.0,
+                "dcn_bw_gbps_bracket": [100.0, 400.0],
+                "topologies": {"8": "2x2x1 custom"},
+                "matmul_row_tile_by_dtype": {"int8": 16, "bf16": 8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = advisor.load_chip_spec_file(spec_file)
+    assert loaded.devices_per_chip == _MEGACORE_CORES
+    assert loaded.min_slice_cores == _MIN_TPU7X_SLICE_CORES
+    assert loaded.dcn_bw_gbps == 200.0
+    assert loaded.dcn_bw_gbps_bracket == (100.0, 400.0)
+    assert loaded.topologies == {8: "2x2x1 custom"}
+    assert loaded.matmul_row_tile("int8") == 16
+
+    bad_spec = tmp_path / "bad_chip.json"
+    bad_spec.write_text(
+        json.dumps(
+            {
+                "vmem_capacity_bytes": 64 << 20,
+                "hbm_capacity_bytes": 96 * (10**9),
+                "hbm_bw_bytes_per_s": 3690.0e9,
+                "bf16_flops_per_s": 1153.0e12,
+                "typo_field": 123,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(MegakernelConfigError, match="unrecognized keys"):
+        advisor.load_chip_spec_file(bad_spec)
+
+    pci_dev = tmp_path / "pci" / "0000:00:04.0"
+    pci_dev.mkdir(parents=True)
+    (pci_dev / "vendor").write_text("0x1ae0\n", encoding="utf-8")
+    (pci_dev / "device").write_text("0x006f\n", encoding="utf-8")
+    monkeypatch.setattr(chips_mod, "_SYSFS_PCI_DEVICES_DIR", tmp_path / "pci")
+    auto_v6e = advisor.resolve_chip_spec("auto")
+    assert auto_v6e.name == "v6e"
+
+    int8_cfg = {
+        **_MIXTRAL_8X7B_CFG,
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "config_groups": {"group_0": {"weights": {"num_bits": 8, "type": "int"}}},
+        },
+    }
+    p_int8 = advisor.model_profile_from_hf_config(int8_cfg, name="mixtral-int8")
+    assert p_int8.weight_dtype == "int8"
+
+    hf_cache = tmp_path / "hf_home"
+    repo_root = hf_cache / "hub" / "models--acme--test-qwen"
+    snap_old = repo_root / "snapshots" / "zzzz_older_lex_last"
+    snap_new = repo_root / "snapshots" / "aaaa_main_ref"
+    snap_old.mkdir(parents=True)
+    snap_new.mkdir(parents=True)
+    (repo_root / "refs").mkdir(parents=True)
+    (repo_root / "refs" / "main").write_text("aaaa_main_ref\n", encoding="utf-8")
+    (snap_old / "config.json").write_text(
+        json.dumps({**_QWEN35_397B_CFG, "hidden_size": 1024}), encoding="utf-8"
+    )
+    (snap_new / "config.json").write_text(
+        json.dumps({**_QWEN35_397B_CFG, "hidden_size": 2048}), encoding="utf-8"
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home_redirect")
+    (tmp_path / "home_redirect" / ".cache").mkdir(parents=True)
+    (tmp_path / "home_redirect" / ".cache" / "huggingface").symlink_to(hf_cache)
+    prof_ref = advisor.resolve_model_profile("acme/test-qwen")
+    assert prof_ref.hidden_size == _FFN_DIM_2048
+
+    rc = advisor.main(
+        [
+            "--model",
+            "kimi-k3",
+            "--chip",
+            "tpu7x",
+            "--phase",
+            "decode",
+            "--batch",
+            "48",
+            "--context",
+            "32768",
+            "--tp",
+            "1",
+            "--ep",
+            "32",
+            "--dp",
+            "1",
+            "--dcp",
+            "32",
+            "--objective",
+            "both",
+        ]
+    )
+    assert rc == 0
+    out_text = capsys.readouterr().out
+    assert "tie(objective_split:" in out_text

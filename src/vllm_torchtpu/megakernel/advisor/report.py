@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from vllm_torchtpu.megakernel.advisor import (
+    from . import (
         AdvisorReport,
         AdvisorSweepReport,
     )
@@ -42,8 +42,6 @@ _SCOPE_HINTS: Mapping[str, str] = {
     "whole_step": "one call for the whole step; [T, H] stays in VMEM, and tokens "
     "past the VMEM ceiling are tiled inside each layer while its weights stay "
     "resident",
-    "whole_step_repass": "one call per token pass past the VMEM ceiling; every "
-    "pass re-reads all weights",
     "layer_group": "one call per group of N layers, tiled like whole_step",
     "single_layer": "one call per layer",
     "per_op": "one call per operator; activations hand off through HBM",
@@ -55,7 +53,9 @@ def _esc(val: object) -> str:
     return "" if val is None else html.escape(str(val))
 
 
-def format_advisor_summary(rep: AdvisorReport) -> str:
+def format_advisor_summary(
+    rep: AdvisorReport, *, explain: bool = False, unresolved: bool = False
+) -> str:
     """Format single-workload AdvisorReport for terminal output."""
     slope_kib = rep.per_token_vmem_bytes / 1024.0
     ridge_fb = rep.ridge_dense_flop_per_byte
@@ -67,7 +67,7 @@ def format_advisor_summary(rep: AdvisorReport) -> str:
         (
             f"Recommended: {rep.recommended_scope} "
             f"[moe={rep.recommended_moe_mode}] "
-            f"(build={rep.build_megakernel})"
+            f"(build={rep.build_megakernel}, verdict={rep.verdict})"
         ),
         f"Rationale: {rep.rationale}",
         (
@@ -83,6 +83,20 @@ def format_advisor_summary(rep: AdvisorReport) -> str:
         f"static_vmem={sc.vmem_static_mib:5.2f} MiB]"
         for sc in rep.scopes
     )
+    if explain and rep.metrics:
+        lines.append("Provenance Breakdown:")
+        lines.extend(
+            f"  * [{item['tag']}] {key}: {item['value']} {item['unit']} "
+            f"(band=[{item['band'][0]}, {item['band'][1]}], source={item['source']})"
+            for key, item in rep.metrics.items()
+        )
+    if unresolved and rep.unresolved_assumptions:
+        lines.append("Unresolved Assumptions:")
+        lines.extend(
+            f"  * {item['name']} (band={item['band']} {item['unit']}): "
+            f"{item['how_to_settle']}"
+            for item in rep.unresolved_assumptions
+        )
     return "\n".join(lines)
 
 
@@ -267,7 +281,6 @@ _SVG_TICKS = (1, 8, 64, 512, 4096, 32768)
 # Okabe-Ito colorblind-safe palette; each scope also has its own marker shape.
 _SCOPE_MARKS: Mapping[str, tuple[str, str]] = {
     "whole_step": ("#009E73", "circle"),
-    "whole_step_repass": ("#D55E00", "triangle"),
     "layer_group": ("#56B4E9", "diamond"),
     "single_layer": ("#E69F00", "diamond"),
     "per_op": ("#CC79A7", "square"),

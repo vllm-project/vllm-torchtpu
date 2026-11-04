@@ -13,7 +13,7 @@
 # limitations under the License.
 """Module entrypoint for `python -m vllm_torchtpu.megakernel.advisor`."""
 
-from vllm_torchtpu.megakernel.advisor.cli import main
+from .cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -22,9 +22,12 @@ from dataclasses import fields
 from pathlib import Path
 from typing import TYPE_CHECKING, get_args
 
-from vllm_torchtpu.megakernel import errors
-from vllm_torchtpu.megakernel.advisor import (
+from .. import errors
+from ..advisor.models import resolve_model_profile
+from . import (
+    DEPLOYMENT_PRESETS,
     MoEMode,
+    ObjectiveMode,
     Phase,
     WorkloadSpec,
     advise,
@@ -32,8 +35,7 @@ from vllm_torchtpu.megakernel.advisor import (
     recommend_parallelism,
     resolve_chip_spec,
 )
-from vllm_torchtpu.megakernel.advisor.models import resolve_model_profile
-from vllm_torchtpu.megakernel.advisor.report import (
+from .report import (
     format_advisor_summary,
     format_regime_table,
     write_advisor_html,
@@ -41,6 +43,28 @@ from vllm_torchtpu.megakernel.advisor.report import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+
+def _parse_layer_groups(raw: str | None) -> tuple[int, ...]:
+    """Parse a comma-separated layer-group string into a tuple of ints."""
+    if not raw:
+        return ()
+    try:
+        return tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    except ValueError as exc:
+        msg = f"Invalid --layer-groups value {raw!r}; expected comma-separated integers"
+        raise errors.MegakernelConfigError(msg) from exc
+
+
+def _emit_json(payload: dict[str, object], dest: str) -> None:
+    """Write formatted JSON to stdout when `dest == '-'`, else to file `dest`."""
+    rendered = json.dumps(payload, indent=2) + "\n"
+    if dest == "-":
+        sys.stdout.write(rendered)
+        return
+    out_path = Path(dest)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(rendered, encoding="utf-8")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -71,11 +95,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         parser.add_argument(f"--{dtype_flag.replace('_', '-')}", type=str, default=None)
 
     parser.add_argument("--chip", type=str, default="tpu7x")
+    parser.add_argument(
+        "--chip-spec",
+        type=str,
+        default=None,
+        help="Path to JSON hardware chip specification file",
+    )
+    parser.add_argument(
+        "--measurements",
+        type=str,
+        default=None,
+        help="Path to calibrated advisor.measurements.v1 JSON file",
+    )
     parser.add_argument("--ici-bw-gbps", type=float, default=None)
     parser.add_argument("--collective-latency-us", type=float, default=None)
     parser.add_argument("--phase", choices=get_args(Phase), default="decode")
     parser.add_argument(
         "--moe-mode", choices=get_args(MoEMode), default="masked_on_chip"
+    )
+    parser.add_argument("--objective", choices=get_args(ObjectiveMode), default="step")
+    parser.add_argument(
+        "--layer-groups",
+        type=str,
+        default=None,
+        help="Comma-separated layer counts per fused call group",
     )
     parser.add_argument("--no-vmem-alias", dest="vmem_alias", action="store_false")
     parser.add_argument(
@@ -87,10 +130,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     for bool_flag in (
         "--megacore",
         "--vmem-fit-headroom",
-        "--json",
         "--regime-sweep",
+        "--explain",
+        "--unresolved",
     ):
         parser.add_argument(bool_flag, action="store_true")
+    parser.add_argument(
+        "--json",
+        nargs="?",
+        const="-",
+        default=None,
+        help="Emit JSON to stdout or to the given file path",
+    )
     parser.add_argument(
         "--html",
         type=str,
@@ -102,7 +153,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Execute the megakernel advisor CLI."""
-    args = build_arg_parser().parse_args(argv)
+    argv_list = list(argv) if argv is not None else list(sys.argv[1:])
+    if argv_list and argv_list[0] == "estimate":
+        argv_list = argv_list[1:]
+    args = build_arg_parser().parse_args(argv_list)
     if args.config and not Path(args.config).is_file():
         msg = f"Missing config file: {args.config!r}"
         raise errors.MegakernelConfigError(msg)
@@ -120,10 +174,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         megacore=args.megacore,
         ici_bw_gbps=args.ici_bw_gbps,
         collective_latency_us=args.collective_latency_us,
+        chip_spec_path=args.chip_spec,
     )
 
     auto_mesh = args.tp is None
-    if auto_mesh:
+    dep = DEPLOYMENT_PRESETS.get(profile.name) if args.deployment_preset else None
+    dp_val = int(args.dp)
+    dcp_val = int(args.dcp)
+    if (
+        auto_mesh
+        and args.objective == "throughput"
+        and args.phase == "decode"
+        and dep is not None
+        and dep.saturation is not None
+    ):
+        tp_val = dep.saturation.tp
+        ep_val = args.ep if args.ep is not None else dep.saturation.ep
+        if dp_val == 1:
+            dp_val = dep.saturation.dp
+        if dcp_val == 1:
+            dcp_val = dep.saturation.dcp
+    elif auto_mesh:
         rec = recommend_parallelism(profile, chip_spec, dp=args.dp, pp=args.pp)
         tp_val = rec.tp
         ep_val = args.ep if args.ep is not None else rec.ep
@@ -147,32 +218,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             vmem_budget_mib=args.vmem_budget_mib,
             dma_buffers=args.dma_buffers,
             deployment_preset=args.deployment_preset,
+            measurements=args.measurements,
+            objective=args.objective,
         )
         if args.html:
             write_advisor_html(sweep, args.html)
-        if args.regime_sweep:
-            out = (
-                json.dumps(sweep.to_dict(), indent=2)
-                if args.json
-                else format_regime_table(sweep)
-            )
-            sys.stdout.write(out + "\n")
-            return 0
+        if args.json is not None:
+            _emit_json(sweep.to_dict(), args.json)
+        elif args.regime_sweep:
+            sys.stdout.write(format_regime_table(sweep) + "\n")
+        return 0
 
     batch_val = (
         args.batch if args.batch is not None else (1 if args.phase == "prefill" else 16)
     )
+    ns = vars(args)
     wl_kwargs = {
-        fld.name: getattr(args, fld.name)
-        for fld in fields(WorkloadSpec)
-        if hasattr(args, fld.name)
+        fld.name: ns[fld.name] for fld in fields(WorkloadSpec) if fld.name in ns
     }
-    wl_kwargs.update({"batch": batch_val, "tp": tp_val, "ep": ep_val})
-    report = advise(profile, WorkloadSpec(**wl_kwargs), chip_spec)
-    out = (
-        json.dumps(report.to_dict(), indent=2)
-        if args.json
-        else format_advisor_summary(report)
+    wl_kwargs.update(
+        {
+            "batch": batch_val,
+            "tp": tp_val,
+            "ep": ep_val,
+            "dp": dp_val,
+            "dcp": dcp_val,
+            "layer_groups": _parse_layer_groups(args.layer_groups),
+            "objective": args.objective,
+        }
+    )
+    report = advise(
+        profile,
+        WorkloadSpec(**wl_kwargs),
+        chip_spec,
+        measurements=args.measurements,
+    )
+    if args.json is not None:
+        _emit_json(report.to_dict(), args.json)
+        return 0
+    out = format_advisor_summary(
+        report, explain=args.explain, unresolved=args.unresolved
     )
     sys.stdout.write(out + "\n")
     return 0

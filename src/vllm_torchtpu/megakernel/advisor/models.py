@@ -20,21 +20,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from math import gcd
 from pathlib import Path
-from typing import TypedDict
 
-from vllm_torchtpu import envs
-from vllm_torchtpu.megakernel import errors
+from .. import errors
 
 _MIN_INTERVAL = 2
 _BITS_FP8 = 8
 _BITS_FP4 = 4
+_PRESETS_DIR = Path(__file__).resolve().parent / "data" / "presets"
 
 
 class UnsupportedArchitectureError(errors.MegakernelConfigError, ValueError):
-    """Raised when a model preset or HuggingFace config is unregistered."""
+    """Raised when a model preset or HuggingFace config is unsupported or malformed."""
 
 
-SUPPORTED_MODEL_TYPES: frozenset[str] = frozenset(
+VERIFIED_MEGAKERNEL_MODEL_TYPES: frozenset[str] = frozenset(
     {
         "deepseek_v2",
         "deepseek_v3",
@@ -62,6 +61,8 @@ SUPPORTED_MODEL_TYPES: frozenset[str] = frozenset(
         "qwen3_next",
     }
 )
+
+SUPPORTED_MODEL_TYPES: frozenset[str] = VERIFIED_MEGAKERNEL_MODEL_TYPES
 
 _UNSUPPORTED_NON_CAUSAL_TYPES: frozenset[str] = frozenset(
     {"bert", "roberta", "t5", "whisper", "vit", "clip", "dit", "flux", "sdxl"}
@@ -117,6 +118,8 @@ _VALID_LAYER_TOKENS: frozenset[str] = frozenset(
     }
 )
 
+_KDA_MODEL_TYPES: frozenset[str] = frozenset({"kimi_k2", "kimi_k3", "kimi_linear"})
+
 
 @dataclass(frozen=True)
 class ModelProfile:
@@ -153,9 +156,11 @@ class ModelProfile:
     kv_dtype: str = "fp8"
     state_dtype: str = "bf16"
     model_type: str = ""
+    architecture_unverified: bool = False
+    layer_families: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        """Derive default attention/MoE layer counts, periodicity, and expert dtype."""
+        """Derive attention/MoE layer counts, periodicity, and layer families."""
         num_layers = self.num_layers
         has_experts = self.num_experts > 0
         moe_layers = self.num_moe_layers
@@ -164,15 +169,43 @@ class ModelProfile:
         periodic = self.is_periodic and not (0 < moe_layers < num_layers - 1)
         moe_inter = self.moe_intermediate_size or (self.intermediate_size * has_experts)
         exp_dt = self.expert_dtype or self.weight_dtype
+        mtype = self.model_type.strip().lower()
+        unverified = self.architecture_unverified or bool(
+            mtype and mtype not in VERIFIED_MEGAKERNEL_MODEL_TYPES
+        )
+        families = self.layer_families or _derive_layer_families(
+            self, attn_layers=attn_layers, moe_layers=moe_layers
+        )
         updates = (
             ("num_attention_layers", attn_layers),
             ("num_moe_layers", moe_layers),
             ("is_periodic", periodic),
             ("moe_intermediate_size", moe_inter),
             ("expert_dtype", exp_dt),
+            ("architecture_unverified", unverified),
+            ("layer_families", families),
         )
         for key, val in updates:
             object.__setattr__(self, key, val)
+
+
+def _derive_layer_families(
+    profile: ModelProfile, *, attn_layers: int, moe_layers: int
+) -> tuple[str, ...]:
+    """Derive canonical layer families from a ModelProfile's layer counts."""
+    families: list[str] = []
+    if attn_layers > 0:
+        families.append("mla" if profile.kv_lora_rank > 0 else "gqa")
+    if profile.num_linear_layers > 0:
+        mtype = profile.model_type.strip().lower()
+        families.append("kda" if mtype in _KDA_MODEL_TYPES else "gdn")
+    if moe_layers > 0:
+        families.append("moe")
+    if moe_layers < profile.num_layers and profile.intermediate_size > 0:
+        families.append("dense_mlp")
+    if 0 < moe_layers < profile.num_layers - 1:
+        families.append("dense_prefix_moe")
+    return tuple(families)
 
 
 def _int_field(mapping: Mapping[str, object], *keys: str, default: int = 0) -> int:
@@ -241,6 +274,17 @@ def _validate_layer_tokens(
             raise UnsupportedArchitectureError(msg)
 
 
+def _validate_required_geometry(tc: Mapping[str, object]) -> None:
+    """Validate required causal-LM geometry keys on a HuggingFace config."""
+    for req_key in ("num_hidden_layers", "hidden_size", "num_attention_heads"):
+        if _int_field(tc, req_key) < 1:
+            msg = (
+                f"HuggingFace config missing required causal-LM geometry key "
+                f"{req_key!r} >= 1"
+            )
+            raise UnsupportedArchitectureError(msg)
+
+
 def supports_hf_config(
     raw_cfg: Mapping[str, object], *, require_model_type: bool = False
 ) -> None:
@@ -258,245 +302,57 @@ def supports_hf_config(
     if mtype in _UNSUPPORTED_SSM_MODEL_TYPES and not has_gdn_kda_heads:
         msg = f"Unsupported state-space model_type {mtype!r} without GDN/KDA heads"
         raise UnsupportedArchitectureError(msg)
-    if mtype and mtype not in SUPPORTED_MODEL_TYPES:
-        msg = (
-            f"Unregistered model_type {mtype!r}; supported: "
-            f"{sorted(SUPPORTED_MODEL_TYPES)}"
-        )
-        raise UnsupportedArchitectureError(msg)
     if ("ssm_cfg" in tc or "state_size" in tc) and not (
         tc.get("num_attention_heads") or has_gdn_kda_heads
     ):
         msg = "Unmodeled state-space config missing attention and GDN/KDA heads"
         raise UnsupportedArchitectureError(msg)
+    _validate_required_geometry(tc)
     _validate_layer_tokens(tc, has_gdn_kda_heads=has_gdn_kda_heads)
 
 
-class _MlaDefaults(TypedDict):
-    """Multi-head latent attention projection ranks shared by MLA presets."""
+def _load_model_presets() -> tuple[
+    Mapping[str, ModelProfile], Mapping[str, str], Mapping[str, str]
+]:
+    """Load builtin model presets, aliases, and source provenance from JSON."""
+    payload = json.loads((_PRESETS_DIR / "models.json").read_text("utf-8"))
+    raw_presets = payload["presets"]
+    presets: dict[str, ModelProfile] = {}
+    sources: dict[str, str] = {}
+    for slug, entry in raw_presets.items():
+        sources[slug] = str(entry.get("source", f"models.json:{slug}"))
+        presets[slug] = ModelProfile(
+            name=slug,
+            num_layers=int(entry["num_layers"]),
+            hidden_size=int(entry.get("hidden_size", 4096)),
+            intermediate_size=int(entry.get("intermediate_size", 11008)),
+            num_attention_heads=int(entry.get("num_attention_heads", 32)),
+            num_kv_heads=int(entry.get("num_kv_heads", 8)),
+            head_dim=int(entry.get("head_dim", 128)),
+            num_linear_layers=int(entry.get("num_linear_layers", 0)),
+            linear_key_heads=int(entry.get("linear_key_heads", 0)),
+            linear_value_heads=int(entry.get("linear_value_heads", 0)),
+            num_experts=int(entry.get("num_experts", 0)),
+            top_k=int(entry.get("top_k", 0)),
+            moe_intermediate_size=int(entry.get("moe_intermediate_size", 0)),
+            shared_expert_intermediate_size=int(
+                entry.get("shared_expert_intermediate_size", 0)
+            ),
+            num_moe_layers=int(entry.get("num_moe_layers", -1)),
+            kv_lora_rank=int(entry.get("kv_lora_rank", 0)),
+            q_lora_rank=int(entry.get("q_lora_rank", 0)),
+            qk_nope_head_dim=int(entry.get("qk_nope_head_dim", 0)),
+            qk_rope_head_dim=int(entry.get("qk_rope_head_dim", 0)),
+            routed_expert_hidden_size=int(entry.get("routed_expert_hidden_size", 0)),
+            weight_dtype=str(entry.get("weight_dtype", "fp8")),
+            expert_dtype=str(entry.get("expert_dtype", "")),
+            model_type=str(entry.get("model_type", "")),
+        )
+    aliases: dict[str, str] = {str(k): str(v) for k, v in payload["aliases"].items()}
+    return presets, aliases, sources
 
-    kv_lora_rank: int
-    q_lora_rank: int
-    qk_nope_head_dim: int
-    qk_rope_head_dim: int
 
-
-class _KimiK3Defaults(_MlaDefaults):
-    """Keyword defaults for Kimi-K3 presets; experts and top-k stay positional."""
-
-    moe_intermediate_size: int
-    num_moe_layers: int
-    shared_expert_intermediate_size: int
-    routed_expert_hidden_size: int
-    expert_dtype: str
-    model_type: str
-
-
-class _DeepSeekDefaults(_MlaDefaults):
-    """Keyword defaults for DeepSeek-style presets; layers and type stay explicit."""
-
-    num_experts: int
-    top_k: int
-    moe_intermediate_size: int
-    shared_expert_intermediate_size: int
-
-
-_MLA_DEFAULTS: _MlaDefaults = {
-    "kv_lora_rank": 512,
-    "q_lora_rank": 1536,
-    "qk_nope_head_dim": 128,
-    "qk_rope_head_dim": 64,
-}
-_KIMI_K3_DEFAULTS: _KimiK3Defaults = {
-    **_MLA_DEFAULTS,
-    "moe_intermediate_size": 3072,
-    "num_moe_layers": 92,
-    "shared_expert_intermediate_size": 6144,
-    "routed_expert_hidden_size": 3584,
-    "expert_dtype": "mxfp4",
-    "model_type": "kimi_linear",
-}
-_DEEPSEEK_DEFAULTS: _DeepSeekDefaults = {
-    **_MLA_DEFAULTS,
-    "num_experts": 256,
-    "top_k": 8,
-    "moe_intermediate_size": 2048,
-    "shared_expert_intermediate_size": 2048,
-}
-
-MODEL_PRESETS: Mapping[str, ModelProfile] = {
-    profile.name: profile
-    for profile in (
-        ModelProfile(
-            "qwen3.5-0.8b",
-            24,
-            1024,
-            3584,
-            8,
-            2,
-            256,
-            18,
-            16,
-            16,
-            model_type="qwen3_5",
-        ),
-        ModelProfile(
-            "qwen3.5-397b",
-            60,
-            4096,
-            1024,
-            32,
-            2,
-            256,
-            45,
-            16,
-            64,
-            512,
-            10,
-            1024,
-            1024,
-            model_type="qwen3_5_moe",
-        ),
-        ModelProfile(
-            "qwen3.8-2.4t",
-            92,
-            8192,
-            2048,
-            64,
-            4,
-            256,
-            69,
-            16,
-            128,
-            512,
-            10,
-            2048,
-            2048,
-            expert_dtype="nvfp4",
-            model_type="qwen3_8_moe",
-        ),
-        *(
-            ModelProfile(
-                preset_name,
-                93,
-                7168,
-                33792,
-                96,
-                96,
-                128,
-                69,
-                96,
-                96,
-                896,
-                16,
-                **_KIMI_K3_DEFAULTS,
-            )
-            for preset_name in ("kimi-k3.1-pro", "kimi-k3-pro")
-        ),
-        ModelProfile(
-            "kimi-k3",
-            93,
-            7168,
-            33792,
-            96,
-            96,
-            128,
-            69,
-            96,
-            96,
-            384,
-            8,
-            **_KIMI_K3_DEFAULTS,
-        ),
-        ModelProfile(
-            "deepseek-v3",
-            61,
-            7168,
-            18432,
-            128,
-            128,
-            128,
-            num_moe_layers=58,
-            model_type="deepseek_v3",
-            **_DEEPSEEK_DEFAULTS,
-        ),
-        ModelProfile(
-            "glm-5.2",
-            78,
-            6144,
-            16384,
-            96,
-            96,
-            128,
-            num_moe_layers=75,
-            model_type="glm5",
-            **_DEEPSEEK_DEFAULTS,
-        ),
-        ModelProfile("mistral-large", 88, 12288, 28672, 96, model_type="mistral"),
-        ModelProfile("llama-3.1-405b", 126, 16384, 53248, 128, model_type="llama"),
-        ModelProfile(
-            "mixtral-8x22b",
-            56,
-            6144,
-            16384,
-            48,
-            num_experts=8,
-            top_k=2,
-            weight_dtype="bf16",
-            model_type="mixtral",
-        ),
-        ModelProfile(
-            "llama-4-maverick",
-            48,
-            5120,
-            8192,
-            40,
-            num_experts=128,
-            top_k=1,
-            shared_expert_intermediate_size=8192,
-            model_type="llama4",
-        ),
-        ModelProfile(
-            "gpt-oss-120b",
-            36,
-            2880,
-            2880,
-            64,
-            head_dim=64,
-            num_experts=128,
-            top_k=4,
-            expert_dtype="mxfp4",
-            model_type="gpt_oss",
-        ),
-    )
-}
-
-REGISTERED_MODEL_ALIASES: Mapping[str, str] = {
-    "qwen3.5-0.8b": "qwen3.5-0.8b",
-    "qwen3.5-397b": "qwen3.5-397b",
-    "qwen3.5-397b-a17b": "qwen3.5-397b",
-    "qwen3.5-397b-a17b-fp8": "qwen3.5-397b",
-    "qwen3.8-2.4t": "qwen3.8-2.4t",
-    "qwen3.8-2.4t-fp8": "qwen3.8-2.4t",
-    "kimi-k3": "kimi-k3",
-    "kimi-k3-pro": "kimi-k3-pro",
-    "kimi-k3.1-pro": "kimi-k3.1-pro",
-    "deepseek-v3": "deepseek-v3",
-    "deepseek-v3-fp8": "deepseek-v3",
-    "glm-5.2": "glm-5.2",
-    "glm-5.2-fp8": "glm-5.2",
-    "mistral-large": "mistral-large",
-    "mistral-large-instruct-2411": "mistral-large",
-    "mixtral-8x22b": "mixtral-8x22b",
-    "mixtral-8x22b-v0.1": "mixtral-8x22b",
-    "llama-3.1-405b": "llama-3.1-405b",
-    "llama-3.1-405b-instruct": "llama-3.1-405b",
-    "llama-3.1-405b-instruct-fp8": "llama-3.1-405b",
-    "llama-4-maverick": "llama-4-maverick",
-    "llama-4-maverick-17b-128e": "llama-4-maverick",
-    "llama-4-maverick-17b-128e-instruct-fp8": "llama-4-maverick",
-    "gpt-oss-120b": "gpt-oss-120b",
-}
+MODEL_PRESETS, REGISTERED_MODEL_ALIASES, MODEL_PRESET_SOURCES = _load_model_presets()
 
 
 @dataclass(frozen=True)
@@ -536,26 +392,50 @@ class DeploymentPreset:
     prefill_windows: tuple[int, ...] = ()
 
 
-DEPLOYMENT_PRESETS: Mapping[str, DeploymentPreset] = {
-    # Kimi-K3 megakernel serving: decode on one TP32 kernel mesh with 32-way
-    # decode context parallel attention; prefill shards each packed window
-    # 32 ways by sequence, runs MoE at EP16, and fuses layers as
-    # embedding + layers 0-3, eleven 8-layer groups (4-91), layer 92 + logits.
-    "kimi-k3": DeploymentPreset(
-        decode=ParallelLayout(tp=32, ep=32, dcp=32),
-        prefill=ParallelLayout(tp=32, ep=16, pcp=32, layer_groups=(4, *(8,) * 11, 1)),
-        prefill_windows=(2048, 8192),
-    ),
-    # Qwen3.5-397B disaggregated 1P1D serving: decode TP8 x DCP4 x EP8 with
-    # MTP-3 verify (4 rows per sequence); prefill PP8 x TP1; DP4 x TP2 x EP8
-    # decode for saturated concurrency.
-    "qwen3.5-397b": DeploymentPreset(
-        decode=ParallelLayout(tp=8, ep=8, dcp=4, spec_tokens=3),
-        prefill=ParallelLayout(tp=1, ep=1, pp=8),
-        saturation=ParallelLayout(tp=2, ep=8, dp=4),
-        prefill_windows=(2176,),
-    ),
-}
+def _parse_parallel_layout(raw: Mapping[str, object]) -> ParallelLayout:
+    """Parse a ParallelLayout mapping from deployments.json."""
+    raw_groups = raw.get("layer_groups")
+    groups: tuple[int, ...] = (
+        tuple(int(str(x)) for x in raw_groups) if type(raw_groups) is list else ()
+    )
+    return ParallelLayout(
+        tp=int(str(raw.get("tp", 1))),
+        ep=int(str(raw.get("ep", 1))),
+        dp=int(str(raw.get("dp", 1))),
+        pp=int(str(raw.get("pp", 1))),
+        dcp=int(str(raw.get("dcp", 1))),
+        pcp=int(str(raw.get("pcp", 1))),
+        spec_tokens=int(str(raw.get("spec_tokens", 0))),
+        layer_groups=groups,
+    )
+
+
+def _load_deployment_presets() -> tuple[
+    Mapping[str, DeploymentPreset], Mapping[str, str]
+]:
+    """Load deployment layout presets and source strings from JSON."""
+    payload = json.loads((_PRESETS_DIR / "deployments.json").read_text("utf-8"))
+    raw_deps = payload["deployments"]
+    deps: dict[str, DeploymentPreset] = {}
+    sources: dict[str, str] = {}
+    for slug, entry in raw_deps.items():
+        sources[slug] = str(entry.get("source", f"deployments.json:{slug}"))
+        sat_raw = entry.get("saturation")
+        sat = _parse_parallel_layout(sat_raw) if type(sat_raw) is dict else None
+        win_raw = entry.get("prefill_windows")
+        windows: tuple[int, ...] = (
+            tuple(int(x) for x in win_raw) if type(win_raw) is list else ()
+        )
+        deps[slug] = DeploymentPreset(
+            decode=_parse_parallel_layout(entry["decode"]),
+            prefill=_parse_parallel_layout(entry["prefill"]),
+            saturation=sat,
+            prefill_windows=windows,
+        )
+    return deps, sources
+
+
+DEPLOYMENT_PRESETS, DEPLOYMENT_PRESET_SOURCES = _load_deployment_presets()
 
 
 def _resolve_linear_topology(
@@ -610,24 +490,37 @@ def _infer_quant_dtypes(
         or "bf16"
     )
     bits = _int_field(quant_cfg, "bits", "w_bit")
+    quant_w_type = str(quant_cfg.get("type") or "").strip().lower()
     cfg_groups = quant_cfg.get("config_groups")
-    if isinstance(cfg_groups, Mapping) and bits == 0:
+    if isinstance(cfg_groups, Mapping):
         for grp in cfg_groups.values():
             if isinstance(grp, Mapping) and isinstance(grp.get("weights"), Mapping):
-                nb = _int_field(grp["weights"], "num_bits")
-                if nb > 0:
+                w_grp = grp["weights"]
+                nb = _int_field(w_grp, "num_bits")
+                if bits == 0 and nb > 0:
                     bits = nb
+                if not quant_w_type and w_grp.get("type"):
+                    quant_w_type = str(w_grp.get("type")).strip().lower()
+                if bits > 0 and quant_w_type:
                     break
     quant_tag = (
         f"{quant_cfg.get('quant_method', '')} "
         f"{quant_cfg.get('format', '')} "
         f"{quant_cfg.get('quant_algo', '')} {torch_dt}"
     ).lower()
-    fallback_dt = (
-        "fp8"
-        if bits == _BITS_FP8 or any(k in quant_tag for k in ("fp8", "float8", "e4m3"))
-        else ("fp32" if "32" in quant_tag else "bf16")
+    has_fp8_tag = any(k in quant_tag for k in ("fp8", "float8", "e4m3"))
+    is_int_quant = quant_w_type in ("int", "int8") or any(
+        k in quant_tag
+        for k in ("int8", "w8a8", "smoothquant", "gptq", "awq", "int-quantized")
     )
+    if has_fp8_tag:
+        fallback_dt = "fp8"
+    elif bits == _BITS_FP8:
+        fallback_dt = "int8" if is_int_quant else "fp8"
+    elif is_int_quant and "int8" in quant_tag:
+        fallback_dt = "int8"
+    else:
+        fallback_dt = "fp32" if "32" in quant_tag else "bf16"
     inferred_dt = (
         "nvfp4"
         if "nvfp4" in quant_tag
@@ -674,11 +567,6 @@ def model_profile_from_hf_config(
     num_layers = _int_field(cfg, "num_hidden_layers")
     hidden_size = _int_field(cfg, "hidden_size")
     num_heads = _int_field(cfg, "num_attention_heads")
-    if min(num_layers, hidden_size, num_heads) < 1:
-        msg = (
-            "Model num_hidden_layers, hidden_size, and num_attention_heads must be >= 1"
-        )
-        raise UnsupportedArchitectureError(msg)
 
     num_linear_layers, is_periodic = _resolve_linear_topology(cfg, lin_cfg, num_layers)
     lin_k_heads = _int_field(
@@ -839,16 +727,28 @@ def resolve_model_profile(
 
     if "/" in raw_str and not raw_str.endswith(".json"):
         org_repo = raw_str.strip("/").replace("/", "--")
-        hf_home = Path(
-            getattr(envs, "HF_HOME", None) or (Path.home() / ".cache" / "huggingface")
-        )
+        hf_home = Path.home() / ".cache" / "huggingface"
         for root in (hf_home / "hub", hf_home):
-            snap_dir = root / f"models--{org_repo}" / "snapshots"
+            repo_dir = root / f"models--{org_repo}"
+            snap_dir = repo_dir / "snapshots"
             if snap_dir.is_dir():
-                snaps = sorted(snap_dir.glob("*/config.json"))
-                if snaps:
+                cfg_file_path: Path | None = None
+                ref_main = repo_dir / "refs" / "main"
+                if ref_main.is_file():
+                    rev = ref_main.read_text("utf-8").strip()
+                    cand_cfg = snap_dir / rev / "config.json"
+                    if cand_cfg.is_file():
+                        cfg_file_path = cand_cfg
+                if cfg_file_path is None:
+                    snaps = sorted(
+                        snap_dir.glob("*/config.json"),
+                        key=lambda p: (p.stat().st_mtime_ns, p.parent.name),
+                    )
+                    if snaps:
+                        cfg_file_path = snaps[-1]
+                if cfg_file_path is not None:
                     return model_profile_from_hf_config(
-                        json.loads(snaps[-1].read_text("utf-8")),
+                        json.loads(cfg_file_path.read_text("utf-8")),
                         tail,
                         weight_dtype,
                         expert_dtype,
@@ -860,6 +760,6 @@ def resolve_model_profile(
     msg = (
         f"Unregistered model or missing config path: {target!r}. "
         f"Registered presets: {sorted(MODEL_PRESETS)}; "
-        f"supported HF model_types: {sorted(SUPPORTED_MODEL_TYPES)}"
+        f"verified HF model_types: {sorted(VERIFIED_MEGAKERNEL_MODEL_TYPES)}"
     )
     raise UnsupportedArchitectureError(msg)
