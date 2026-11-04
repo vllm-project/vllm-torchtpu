@@ -48,7 +48,7 @@ def _kernel(
     selected_ref,  # [Bq, K] physical pages, -1 padded
     local_page_ref,  # [Bq, 1]
     local_limit_ref,  # [Bq, 1] visible slots of the local page
-    kv_ref,  # [S, 1, 2, D] bf16 K/V packed per 32-bit word
+    kv_ref,  # [1, S, 2, D] bf16 K/V packed per 32-bit word
     # Out
     o_ref,  # [H, Bq, D]
     # Scratch
@@ -61,7 +61,7 @@ def _kernel(
     w = pl.program_id(0)
     page = work_page_ref[w]
     num_heads, block_q, head_dim = q_ref.shape
-    page_size = kv_ref.shape[0]
+    page_size = kv_ref.shape[1]
 
     @pl.when(work_first_ref[w] == 1)
     def _init():
@@ -69,7 +69,8 @@ def _kernel(
         l_ref[...] = jnp.zeros_like(l_ref)
         acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    packed = kv_ref.bitcast(jnp.uint32).reshape(page_size, head_dim)[...]
+    # Same rank in and out: Mosaic bitcasts the packed axis 2 -> 1.
+    packed = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
     k = pltpu.bitcast((packed & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
     v = pltpu.bitcast((packed >> 16).astype(jnp.uint16), jnp.bfloat16)
 
@@ -84,9 +85,10 @@ def _kernel(
     )
     limit = jnp.where(local_page_ref[...] == page, local_limit_ref[...], page_size)
     limit = limit * is_selected
-    slots = jax.lax.broadcasted_iota(jnp.int32, (block_q, page_size), 1)
-    token_mask = slots < limit
-    mask = jnp.concatenate([token_mask] * num_heads, axis=0)
+    # Rows are head-major: row h * block_q + t is token t's head h.
+    row_limit = jnp.concatenate([limit] * num_heads, axis=0)
+    slots = jax.lax.broadcasted_iota(jnp.int32, s.shape, 1)
+    mask = slots < row_limit
     s = jnp.where(mask, s, _MASK_VALUE)
 
     m_prev = m_ref[...]
@@ -191,8 +193,8 @@ def msa_sparse_attention(
             pl.BlockSpec((block_q, 1), tile_block),
             pl.BlockSpec((block_q, 1), tile_block),
             pl.BlockSpec(
-                (None, page_size, 1, 2, head_dim),
-                lambda w, tile, page, *_: (page[w], 0, 0, 0, 0),
+                (1, page_size, 2, head_dim),
+                lambda w, tile, page, *_: (page[w], 0, 0, 0),
             ),
         ],
         out_specs=pl.BlockSpec(
@@ -220,6 +222,6 @@ def msa_sparse_attention(
         selected,
         local_page[:, None],
         local_limit[:, None],
-        kv_cache,
+        kv_cache.reshape(-1, page_size, 2, head_dim),
     )
     return out.transpose(1, 0, 2)[:num_tokens]
