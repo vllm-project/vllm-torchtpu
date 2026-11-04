@@ -458,3 +458,35 @@ def test_plan_from_kernel_tables_matches_the_sharded_plan(skew):
             np.asarray(mirror_pos), np.asarray(want.mirror_pos)
         )
         np.testing.assert_array_equal(np.asarray(slab_row), np.asarray(want_slab))
+
+
+@pytest.mark.parametrize("count_at", [2176, 2000, 300])
+def test_relane_counts_matches_the_reshape(count_at):
+    """The exchange-tables kernel's re-laning of the exchanged count words
+    (interpret mode) equals reshaping them to [s, d, g] at ep 16, g 25, for
+    lane-aligned and unaligned count offsets."""
+    from jax.experimental import pallas as pl
+
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+        LANES,
+        _relane_counts,
+    )
+
+    ep, g = 16, 25
+    r_lo = count_at // LANES
+    n_cnt = (count_at + ep * g - 1) // LANES - r_lo + 1
+    rng = np.random.default_rng(count_at)
+    words = rng.integers(0, 1000, (ep, (r_lo + n_cnt) * LANES)).astype(np.int32)
+    cnt = words.reshape(ep, r_lo + n_cnt, LANES)[:, r_lo:]
+
+    def kernel(c_ref, o_ref):
+        _relane_counts(c_ref[...], o_ref, count_at=count_at - r_lo * LANES, g=g)
+
+    got = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((ep, ep, LANES), jnp.int32),
+        interpret=True,
+    )(jnp.asarray(cnt))
+    want = words[:, count_at : count_at + ep * g].reshape(ep, ep, g)
+    np.testing.assert_array_equal(np.asarray(got)[:, :, :g], want)
+    np.testing.assert_array_equal(np.asarray(got)[:, :, g:], 0)

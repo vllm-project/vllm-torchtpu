@@ -366,6 +366,23 @@ def _seg3(seg_start_local, ep, g):
     )
 
 
+def _relane_counts(cnt, r3_ref, *, count_at, g):
+    """Exchanged rows' count words -> r3_ref [s, d, 128] (local expert e of
+    destination d on lane e, zero past g). cnt [s, rows, 128] holds every
+    source's flat count section starting at word count_at."""
+    ep = cnt.shape[0]
+    lane = lax.broadcasted_iota(jnp.int32, (ep, LANES), 1)
+    for d in range(ep):
+        r0, off = divmod(count_at + d * g, LANES)
+        lo = cnt[:, r0, :]
+        if off:
+            lo = pltpu.roll(lo, LANES - off, 1)
+            if off + g > LANES:
+                hi = pltpu.roll(cnt[:, r0 + 1, :], LANES - off, 1)
+                lo = jnp.where(lane < LANES - off, lo, hi)
+        r3_ref[:, d, :] = jnp.where(lane < g, lo, 0)
+
+
 @functools.cache
 def _build_exchange_rows_tables(
     ep, width, n_rows, count_at, g, n_pre, tile_m, before_barrier
@@ -405,18 +422,7 @@ def _build_exchange_rows_tables(
         cp = pltpu.make_async_copy(out_hbm.at[:, pl.ds(r_lo, n_cnt), :], cnt_vm, csem)
         cp.start()
         cp.wait()
-        cnt = cnt_vm[...]  # [s, n_cnt, 128]
-        lane = lax.broadcasted_iota(jnp.int32, (ep, LANES), 1)
-        for d in range(ep):
-            start = count_at + d * g - r_lo * LANES
-            r0, off = divmod(start, LANES)
-            lo = cnt[:, r0, :]
-            if off:
-                lo = pltpu.roll(lo, LANES - off, 1)
-                if off + g > LANES:
-                    hi = pltpu.roll(cnt[:, r0 + 1, :], LANES - off, 1)
-                    lo = jnp.where(lane < LANES - off, lo, hi)
-            r3_vm[:, d, :] = jnp.where(lane < g, lo, 0)
+        _relane_counts(cnt_vm[...], r3_vm, count_at=count_at - r_lo * LANES, g=g)
         t = _tables(
             r3_vm[...], seg3_vm[...], me, ep=ep, g=g, n_pre=n_pre, tile_m=tile_m
         )
