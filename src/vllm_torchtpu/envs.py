@@ -99,6 +99,8 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    USE_ROUTING_MOE: bool = False
+    ROUTING_MOE_REMOTE_SCATTER: bool = True
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -775,6 +777,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
         or env_bool("USE_MOE_FUSED_EP_KERNEL")()
     ),
+    # Run expert-parallel MoE layers with tokamax's routing_moe kernel
+    # (layers/adapter/routing_moe.py). Exclusive with USE_MOE_FUSED_EP_KERNEL.
+    "USE_ROUTING_MOE": env_bool("USE_ROUTING_MOE"),
+    # routing_moe sends each result row straight to the token's device (1), or
+    # sums partial results per device and reduce-scatters them (0).
+    "ROUTING_MOE_REMOTE_SCATTER": env_bool("ROUTING_MOE_REMOTE_SCATTER", True),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
