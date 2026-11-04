@@ -241,6 +241,14 @@ def test_get_output_attaches_spec_logprobs():
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
 
 
+class _FakeEvent:
+    def __init__(self):
+        self.synchronized = False
+
+    def synchronize(self):
+        self.synchronized = True
+
+
 class _PendingAuxOutput:
     """Stands in for vLLM's PendingAuxOutput: records the per-request counts
     the runner output hands it and what process_output returned."""
@@ -249,6 +257,7 @@ class _PendingAuxOutput:
         self.num_sampled = None
         self.num_rejected = None
         self.processed = 0
+        self.routed_experts_gpu = torch.tensor([1, 2, 3])
 
     def enqueue_cpu_copy(self, num_sampled, num_rejected):
         self.num_sampled = num_sampled
@@ -316,3 +325,26 @@ def test_get_output_without_pending_aux_output_leaves_connector_output_unset():
         discard_sampled_tokens_req_indices=[],
     ).get_output()
     assert out.aux_output_connector_output is None
+
+
+def test_get_output_synchronizes_aux_copy_event_and_swaps_cpu_tensor():
+    pending = _PendingAuxOutput()
+    event = _FakeEvent()
+    cpu_tensor = torch.tensor([4, 5, 6])
+    async_output = AsyncTPUModelRunnerOutput(
+        model_runner_output=_three_request_output(),
+        copy_state=None,
+        discard_sampled_tokens_req_indices=[],
+        pending_aux_output=pending,
+        aux_copy_event=event,
+        aux_routed_cpu=cpu_tensor,
+    )
+    assert event.synchronized is False
+    assert pending.routed_experts_gpu.tolist() == [1, 2, 3]
+
+    out = async_output.get_output()
+    assert event.synchronized is True
+    assert pending.routed_experts_gpu is cpu_tensor
+    assert out.aux_output_connector_output == {"aux": 1}
+    assert async_output.aux_copy_event is None
+    assert async_output.aux_routed_cpu is None

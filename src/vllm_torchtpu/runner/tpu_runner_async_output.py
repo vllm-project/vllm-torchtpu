@@ -194,15 +194,28 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         copy_state: AsyncTPUCopyState | None,
         discard_sampled_tokens_req_indices: list[int],
         pending_aux_output: "PendingAuxOutput | None" = None,
+        aux_copy_event: "Any | None" = None,
+        aux_routed_cpu: "torch.Tensor | None" = None,
     ):
         self._model_runner_output: ModelRunnerOutput = model_runner_output
         self.copy_state = copy_state
         self.discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
         self.pending_aux_output = pending_aux_output
+        self.aux_copy_event = aux_copy_event
+        self.aux_routed_cpu = aux_routed_cpu
 
     def get_output(self) -> ModelRunnerOutput:
         output = self._get_output()
         if self.pending_aux_output is not None:
+            # Synchronize the asynchronous D2H copy launched on the main
+            # thread before host consumers read routed_experts.
+            if self.aux_copy_event is not None:
+                self.aux_copy_event.synchronize()
+                self.aux_copy_event = None
+            if self.aux_routed_cpu is not None:
+                self.pending_aux_output.routed_experts_gpu = self.aux_routed_cpu
+                self.aux_routed_cpu = None
+
             # Consume the step's routed-experts snapshot on every path,
             # including _get_output's early returns: the connector requires
             # step outputs to be consumed in order, so a skipped step would
