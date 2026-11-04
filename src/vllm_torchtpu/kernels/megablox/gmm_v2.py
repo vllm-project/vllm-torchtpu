@@ -359,10 +359,14 @@ def generate_block_specs(
         index_map.lhs_index_map,
     )
 
+    # Two weight buffers with lookahead: the next group's weights load while
+    # the current group computes, however many grid steps that group spans.
+    # A third buffer would also issue the group after next at the start of a
+    # call, where that DMA shares HBM bandwidth with the one step 1 waits on.
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=True),
     )
     rhs_scale_block_spec = rhs_bias_block_spec = None
     if cfgs.rhs_cfgs.has_bias:
@@ -979,7 +983,7 @@ def calculate_tiling(
             lhs_quant_bits = jax.dtypes.itemsize_bits(lhs_cfgs.quant_dtype)
             lhs_vmem += tm * tk * (lhs_quant_bits // 8)
 
-        # 2. RHS tile (triple-buffered, includes scale and bias if present)
+        # 2. RHS tile (budgeted as triple-buffered, includes scale and bias)
         # If fuse_act is enabled, we have both gate and up weights,
         # so RHS memory is doubled.
         rhs_weight_vmem = tk * tn * rhs_bits // 8
@@ -1294,8 +1298,8 @@ def gmm_v2(
     """GMM kernel implemented with emit_pipeline.
 
     Dynamically calculate offset lhs/out tiles to reduce redundant computations.
-    Additionally, it adjusts dma size based on number of valid rows and utilize
-    triple buffering on weights to better utilize memory.
+    Additionally, it adjusts dma size based on number of valid rows and loads
+    the next group's weights while the current group computes.
 
     Args:
         lhs: lhs with shape [size_m, size_k].
