@@ -52,10 +52,8 @@ from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
 from vllm_torchtpu.megakernel.kimi_k3.config import active
 from vllm_torchtpu.megakernel.kimi_k3.layout import NUM_LAYERS
 from vllm_torchtpu.megakernel.kimi_k3.pools import (
-    CONV_ROWS,
     KDA_LAYERS,
     MLA_LAYERS,
-    SSM_ROWS,
     bind_raw_pools,
     draft_raw_pools,
     kda_blocks_at_column,
@@ -438,6 +436,7 @@ class PrefillProgram:
             mla_flash_tile=256,
             segments=count,
             prefix_capacity=self.capacity,
+            compute_logits=self.compute_logits,
         )
         logits_op = (
             self._kernels.make_prefill_logits_sp(
@@ -631,7 +630,11 @@ class PrefillProgram:
             ((replicated,) if self.compute_logits else ())
             + (sharded,)
             + (sharded,) * nroute,
-            donate_argnums=tuple(range(3 + nroute)),
+            donate_argnums=(
+                tuple(range(3 + nroute))
+                if self.compute_logits
+                else tuple(range(2, 3 + nroute))
+            ),
             export_key=self._export_key(f"{name}_final", window),
         )
         if not self._pairs:
@@ -917,42 +920,32 @@ class PoolWriter:
         """(inside an op) ``count`` sequences' KDA states, ``[69, count,
         ...]``, into ``kda_blocks`` ``[count * 69]`` (each sequence's 69
         blocks in turn; unused sequences aim at the null block)."""
-        from vllm_torchtpu.kernels import pool_adapters
+        from vllm_torchtpu.megakernel.kimi_k3.pools import (
+            kda_state_packed_shapes,
+            scatter_kda_state_fused,
+        )
 
         blocks = kda_blocks.reshape(count, KDA_LAYERS)
-        for k in range(KDA_LAYERS):
-            index, ids = self._kda_raw[k], blocks[:, k]
-            ssm_shape = jax.eval_shape(
-                lambda raw=raws[index], ids=ids: pool_adapters.gather_region(
-                    raw,
-                    ids,
-                    tok0=0,
-                    ntok=SSM_ROWS,
-                    out_dtype=jnp.float32,
-                    out_lanes=128,
-                )
-            ).shape
-            ssm = recurrent[k].reshape(count, -1, 128)
-            ssm = jnp.pad(ssm, ((0, 0), (0, ssm_shape[1] - ssm.shape[1]), (0, 0)))
-            raws[index] = pool_adapters.scatter_region(
-                raws[index], ssm, ids, tok0=0, ntok=SSM_ROWS
+        for p in range(len(raws)):
+            ks = [k for k in range(KDA_LAYERS) if self._kda_raw[k] == p]
+            if not ks:
+                continue
+            (ssm_rows, _), (conv_rows, lanes) = kda_state_packed_shapes(raws[p])
+            n_items = len(ks) * count
+            ids = jnp.stack([blocks[:, k] for k in ks], axis=0).reshape(n_items)
+            ssm = jnp.stack([recurrent[k] for k in ks], axis=0).reshape(
+                n_items, -1, 128
             )
-            conv_shape = jax.eval_shape(
-                lambda raw=raws[index], ids=ids: pool_adapters.gather_region(
-                    raw, ids, tok0=SSM_ROWS, ntok=CONV_ROWS, out_dtype=jnp.bfloat16
-                )
-            ).shape
-            taps = conv[k].reshape(count, -1).astype(jnp.bfloat16)
+            ssm = jnp.pad(ssm, ((0, 0), (0, ssm_rows - ssm.shape[1]), (0, 0)))
+            taps = (
+                jnp.stack([conv[k] for k in ks], axis=0)
+                .reshape(n_items, -1)
+                .astype(jnp.bfloat16)
+            )
             taps = jnp.pad(
-                taps, ((0, 0), (0, int(np.prod(conv_shape[1:])) - taps.shape[1]))
-            )
-            raws[index] = pool_adapters.scatter_region(
-                raws[index],
-                taps.reshape(conv_shape),
-                ids,
-                tok0=SSM_ROWS,
-                ntok=CONV_ROWS,
-            )
+                taps, ((0, 0), (0, conv_rows * lanes - taps.shape[1]))
+            ).reshape(n_items, conv_rows, lanes)
+            raws[p] = scatter_kda_state_fused(raws[p], ssm, taps, ids)
         return raws
 
     def write_packed(
@@ -1216,7 +1209,7 @@ class PoolWriter:
         return recurrent, conv
 
     def _read_states_op(self, sequences: int) -> Any:
-        from vllm_torchtpu.kernels import pool_adapters
+        from vllm_torchtpu.megakernel.kimi_k3.pools import gather_kda_state_fused
 
         key = ("read", sequences)
         if key not in self._ops:
@@ -1232,27 +1225,23 @@ class PoolWriter:
                     args[:num_raw],
                     args[num_raw].reshape(sequences, KDA_LAYERS),
                 )
-                recurrent, conv = [], []
-                for k in range(KDA_LAYERS):
-                    raw, ids = raws[kda_raw[k]], blocks[:, k]
-                    ssm = pool_adapters.gather_region(
-                        raw,
-                        ids,
-                        tok0=0,
-                        ntok=SSM_ROWS,
-                        out_dtype=jnp.float32,
-                        out_lanes=128,
-                    )
-                    recurrent.append(ssm[:, : 3 * 128].reshape(-1, 3, 128, 128))
-                    taps = pool_adapters.gather_region(
-                        raw, ids, tok0=SSM_ROWS, ntok=CONV_ROWS, out_dtype=jnp.bfloat16
-                    )
-                    conv.append(
-                        taps.reshape(sequences, -1)[:, : 3 * 3 * 3 * 128].reshape(
-                            -1, 3, 3, 3, 128
-                        )
-                    )
-                recurrent, conv = jnp.stack(recurrent), jnp.stack(conv)
+                rec_by_k: list[Any] = [None] * KDA_LAYERS
+                conv_by_k: list[Any] = [None] * KDA_LAYERS
+                for p in range(num_raw):
+                    ks = [k for k in range(KDA_LAYERS) if kda_raw[k] == p]
+                    if not ks:
+                        continue
+                    n_items = len(ks) * sequences
+                    ids = jnp.stack([blocks[:, k] for k in ks], axis=0).reshape(n_items)
+                    ssm, taps = gather_kda_state_fused(raws[p], ids)
+                    ssm_k = ssm[:, : 3 * 128].reshape(len(ks), sequences, 3, 128, 128)
+                    taps_k = taps.reshape(len(ks), sequences, -1)[
+                        :, :, : 3 * 3 * 3 * 128
+                    ].reshape(len(ks), sequences, 3, 3, 3, 128)
+                    for idx_in_p, k in enumerate(ks):
+                        rec_by_k[k] = ssm_k[idx_in_p]
+                        conv_by_k[k] = taps_k[idx_in_p]
+                recurrent, conv = jnp.stack(rec_by_k), jnp.stack(conv_by_k)
                 if perm is not None:
                     recurrent = jax.lax.ppermute(recurrent, AXIS, perm)
                     conv = jax.lax.ppermute(conv, AXIS, perm)
@@ -1779,8 +1768,8 @@ class KimiPrefiller:
             state.state, state.start = pair, piece.end
             if "after" in ring_out:
                 state.ring = ring_out["after"][s]
-        if self.rank == 0:
-            logger.info(
+        if self.rank == 0 and logger.isEnabledFor(10):  # logging.DEBUG
+            logger.debug(
                 "K3 prefill: packed %d-token window: %s",
                 window,
                 ", ".join(
@@ -1806,10 +1795,8 @@ class KimiPrefiller:
         self._route_windows = getattr(self, "_route_windows", 0) + 1
         ep_tp = 32 // active().prefill_expert_parallel
         local_experts = 896 // active().prefill_expert_parallel
-        if (
-            self._route_windows % active().prefill_route_counts_every
-            or self.rank % ep_tp
-        ):
+        every = active().prefill_route_counts_every
+        if self._route_windows % every or self.rank % ep_tp:
             return
         directory = envs.K3_PREFILL_ROUTE_COUNTS_DIR or "/tmp/prefill_route_counts"
         os.makedirs(directory, exist_ok=True)

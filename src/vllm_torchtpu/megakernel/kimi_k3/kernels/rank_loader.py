@@ -19,6 +19,7 @@ independent of JAX so a vLLM worker can upload them through torch, and
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import threading
@@ -56,18 +57,32 @@ STREAMS = _config().read_streams  # handles per contiguous range
 MIN_STREAM_BYTES = 256 << 20
 
 
-def _read_range(path: Path, offset: int, view: memoryview) -> None:
+def _read_range(
+    path: Path, offset: int, view: memoryview, *, drop_cache: bool = False
+) -> None:
     with open(path, "rb", buffering=0) as handle:
-        handle.seek(offset)
-        position = 0
-        while position < len(view):
-            count = handle.readinto(view[position:position + CHUNK])
-            if not count:
-                raise EOFError(f"{path}: short read at {offset + position}")
-            position += count
+        try:
+            handle.seek(offset)
+            position = 0
+            while position < len(view):
+                count = handle.readinto(view[position : position + CHUNK])
+                if not count:
+                    raise EOFError(f"{path}: short read at {offset + position}")
+                position += count
+        finally:
+            if drop_cache and hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                with contextlib.suppress(OSError):
+                    os.posix_fadvise(handle.fileno(), offset, len(view), os.POSIX_FADV_DONTNEED)
 
 
-def read_into(path: Path, offset: int, out: np.ndarray, streams: int | None = None) -> np.ndarray:
+def read_into(
+    path: Path,
+    offset: int,
+    out: np.ndarray,
+    streams: int | None = None,
+    *,
+    drop_cache: bool = False,
+) -> np.ndarray:
     """Fill ``out`` (C-contiguous) from ``path`` at ``offset``: ``streams``
     handles (default ``KernelConfig.read_streams``), each reading its own contiguous
     part sequentially. Network storage throughput scales with handles, not
@@ -75,13 +90,20 @@ def read_into(path: Path, offset: int, out: np.ndarray, streams: int | None = No
     view = memoryview(out.reshape(-1).view(np.uint8))
     streams = max(1, min(streams or STREAMS, len(view) // MIN_STREAM_BYTES))
     if streams == 1:
-        _read_range(path, offset, view)
+        _read_range(path, offset, view, drop_cache=drop_cache)
         return out
     step = -(-len(view) // streams)
     step = -(-step // CHUNK) * CHUNK
-    parts = [(start, view[start:start + step]) for start in range(0, len(view), step)]
+    parts = [(start, view[start : start + step]) for start in range(0, len(view), step)]
     with ThreadPoolExecutor(len(parts)) as pool:
-        list(pool.map(lambda part: _read_range(path, offset + part[0], part[1]), parts))
+        list(
+            pool.map(
+                lambda part: _read_range(
+                    path, offset + part[0], part[1], drop_cache=drop_cache
+                ),
+                parts,
+            )
+        )
     return out
 
 
@@ -344,7 +366,7 @@ def _hot_table(latent_norm, experts):
     return table
 
 
-def replica_plan(rank: int, layers: int):
+def replica_plan(rank: int, layers: int, *, expert_order: np.ndarray | None = None):
     """MXFP4 replicas (KernelConfig.kd_replica_plan): this rank's EP group's slots as global expert ids
     [layers - 1, S] (-1 empty), the whole plan [layers - 1, 8, S] and the dispatch order [layers - 1, 8 S],
     or None. Fails closed on malformed plans."""
@@ -356,6 +378,14 @@ def replica_plan(rank: int, layers: int):
     experts = plan["experts"][: layers - 1].astype(np.int64)
     _check_slots(path, experts)
     order = plan["order"][: layers - 1].astype(np.int64)
+    is_physical = bool(plan["physical"]) if "physical" in plan else False
+    if expert_order is not None and not is_physical:
+        inv_order = np.argsort(expert_order, axis=1)
+        remapped = experts.copy()
+        for layer in range(experts.shape[0]):
+            mask = experts[layer] >= 0
+            remapped[layer, mask] = inv_order[layer, experts[layer, mask]]
+        experts = remapped
     count = experts.shape[2]
     if order.shape != (experts.shape[0], 8 * count) or any(
         sorted(order[layer].tolist()) != list(range(8 * count)) for layer in range(order.shape[0])
@@ -368,24 +398,39 @@ def replica_plan(rank: int, layers: int):
     return experts[:, rank // 4, :], experts, order
 
 
-def _extend_replicas(rank_dir, presharded, name, part, lo, slots, rank):
+def _extend_replicas(rank_dir, presharded, name, part, lo, slots, rank, *, expert_order=None):
     """Append S MXFP4 replica entries per layer to one layer-range part of an expert family: slot j holds this
     rank's TP4 quarter of global expert slots[layer, j], read from the owning group's rank directory."""
     n_layers = part.shape[0]
     count = slots.shape[1]
     extra = np.zeros((n_layers, count, *part.shape[2:]), part.dtype)
-    sources = {}
+    spec = rank_dir.families[name]
+    shape = tuple(spec["shape"])
+    expert_bytes = int(np.prod(shape[2:])) * part.dtype.itemsize
+    filename = next(
+        fn for fn, (r_lo, r_hi) in zip(spec["files"], spec["layer_ranges"]) if r_lo == lo and r_hi == lo + n_layers
+    )
+    sources: dict[int, RankDir] = {}
+    read_jobs: list[tuple[Path, int, memoryview]] = []
     for i in range(n_layers):
         for j, expert in enumerate(slots[lo + i]):
             if expert < 0:
                 continue
-            owner = 4 * (int(expert) // HOT_LOCAL) + rank % 4
-            if owner == rank:
-                extra[i, j] = part[i, int(expert) % HOT_LOCAL]
+            p = int(expert)
+            if p // HOT_LOCAL == rank // 4:
+                extra[i, j] = part[i, p % HOT_LOCAL]
                 continue
+            orig_e = int(expert_order[lo + i, p]) if expert_order is not None else p
+            owner = 4 * (orig_e // HOT_LOCAL) + rank % 4
             if owner not in sources:
                 sources[owner] = RankDir(presharded, owner, rank_dir.index["layers"])
-            extra[i, j] = _family_slice(sources[owner], name, lo + i, int(expert) % HOT_LOCAL)
+            offset = (i * HOT_LOCAL + (orig_e % HOT_LOCAL)) * expert_bytes
+            read_jobs.append(
+                (sources[owner].path / filename, offset, memoryview(extra[i, j].reshape(-1).view(np.uint8)))
+            )
+    if read_jobs:
+        with ThreadPoolExecutor(min(16, len(read_jobs))) as pool:
+            list(pool.map(lambda job: _read_range(job[0], job[1], job[2], drop_cache=True), read_jobs))
     return np.concatenate([part, extra], axis=1)
 
 
@@ -421,8 +466,23 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
     """
     rank_dir = RankDir(presharded, rank, layers)
     plan = hot_plan(rank, layers)
-    replicas = replica_plan(rank, layers)
-    jobs = list(_expert_jobs(rank_dir, split_experts))
+    expert_order = (
+        prefill_expert_plan(layers)
+        if _config().prefill_expert_parallel == 8 and plan is None
+        else None
+    )
+    replicas = replica_plan(rank, layers, expert_order=expert_order)
+    jobs: list[tuple[str, int, object]]
+    if expert_order is not None:
+        jobs = [
+            job
+            for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
+            for job in _planned_expert_jobs_ep8(
+                presharded, rank_dir, name, rank, expert_order, layers, split=split_experts
+            )
+        ]
+    else:
+        jobs = list(_expert_jobs(rank_dir, split_experts))
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for key, value in _budgeted(jobs):
         if plan is not None and key != "dense":
@@ -434,13 +494,25 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
             family, _, part = key.partition("@")
             index = int(part.split("/")[0]) if part else 0
             lo = rank_dir.families[family]["layer_ranges"][index][0] if part else 0
-            value = _extend_replicas(rank_dir, presharded, family, value, lo, replicas[0], rank)
+            value = _extend_replicas(
+                rank_dir, presharded, family, value, lo, replicas[0], rank, expert_order=expert_order
+            )
         if key == "dense":
             families = split_kda_projection(value)
             if plan is not None:
                 families["latent_norm"] = _hot_table(families["latent_norm"], plan[1])
             if replicas is not None:
                 families["latent_norm"] = _replica_table(families["latent_norm"], replicas[1], replicas[2])
+            if expert_order is not None:
+                for rname in ("router", "router_bias"):
+                    if rname in families:
+                        families[rname] = np.ascontiguousarray(
+                            np.take_along_axis(
+                                families[rname],
+                                expert_order[:, None, :].astype(np.int64),
+                                axis=-1,
+                            )
+                        )
             if attention_dp > 1:
                 families.update(attention_dp_families(families, presharded, rank, layers, attention_dp))
             for name, family in families.items():
@@ -549,6 +621,61 @@ def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
         yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
 
 
+def _planned_expert_jobs_ep8(
+    presharded, rank_dir, name, rank, order, layers, *, split: bool
+):
+    """EP8/TP4 expert parts permuted by ``order [layers - 1, 896]``:
+    EP8 group ``rank // 4`` holds ``order[l, 112 g : 112 g + 112]``
+    (quarter ``rank % 4``)."""
+    spec = rank_dir.spec(name)
+    shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
+    dtype = _dtype(spec["dtype"])
+    ep_group, quarter = rank // 4, rank % 4
+    dirs = [RankDir(presharded, 4 * g + quarter, layers) for g in range(8)]
+
+    count = len(spec["files"])
+    expert_bytes = int(np.prod(shape[2:])) * dtype.itemsize
+    nbytes = 112 * expert_bytes
+    parts = []
+    for index, (filename, (lo, hi)) in enumerate(
+        zip(spec["files"], spec["layer_ranges"])
+    ):
+        part_bytes = (hi - lo) * nbytes
+
+        def reader(filename=filename, lo=lo, hi=hi):
+            out = np.empty((hi - lo, 112, *shape[2:]), dtype)
+            jobs = []
+            for layer in range(lo, hi):
+                experts = order[layer, 112 * ep_group : 112 * ep_group + 112]
+                for slot, expert in enumerate(experts):
+                    sg, idx = int(expert) // 112, int(expert) % 112
+                    offset = ((layer - lo) * 112 + idx) * expert_bytes
+                    jobs.append(
+                        (dirs[sg].path / filename, offset, out[layer - lo, slot])
+                    )
+            with ThreadPoolExecutor(32) as pool:
+                list(
+                    pool.map(
+                        lambda job: read_into(
+                            job[0], job[1], job[2], streams=1, drop_cache=True
+                        ),
+                        jobs,
+                    )
+                )
+            return out
+
+        parts.append((f"{name}@{index}/{count}", part_bytes, reader))
+
+    if split:
+        yield from parts
+    else:
+        yield (
+            name,
+            _family_bytes(spec),
+            lambda parts=parts: np.concatenate([fn() for _, _, fn in parts], axis=0),
+        )
+
+
 def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 93,
                       split_experts: bool = False,
                       skip: frozenset = frozenset()) -> Iterator[tuple[str, str, np.ndarray]]:
@@ -601,7 +728,17 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
             jobs += [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
                      for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)]
     else:
-        jobs += list(_expert_jobs(rank_dir, split_experts))
+        plan = prefill_expert_plan(layers) if ep == 8 else None
+        if plan is not None:
+            jobs += [
+                job
+                for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
+                for job in _planned_expert_jobs_ep8(
+                    presharded, rank_dir, name, rank, plan, layers, split=split_experts
+                )
+            ]
+        else:
+            jobs += list(_expert_jobs(rank_dir, split_experts))
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for name, source in (("latent_down", "latent_down"), ("latent_up", "latent_up"),
                          ("shared_gu", f"shared_gu_{parity}"), ("shared_down", f"shared_down_{parity}")):
@@ -633,7 +770,7 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
             if name == "m_o":
                 family = _sequence_parallel_output(family, peer_dir, "m_o", rank)
             yield "mla", name, family
-        plan = prefill_expert_plan(layers) if ep == 16 else None
+        plan = prefill_expert_plan(layers) if ep in (8, 16) else None
         for name in PREFILL_MOE_DENSE:
             if name in skip:
                 continue

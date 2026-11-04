@@ -116,12 +116,10 @@ class KimiAggregate:
             raise NotImplementedError(
                 "the K3 aggregate engine requires prefill_expert_parallel 8 or 16"
             )
-        if kernel.prefill_expert_parallel == 8 and (
-            kernel.kd_hot_plan or kernel.kd_replica_plan
-        ):
+        if kernel.prefill_expert_parallel == 8 and kernel.kd_hot_plan:
             raise NotImplementedError(
-                "the K3 aggregate engine does not run hot-expert plans "
-                "(K3_HOT_PLAN, K3_REPLICA_PLAN): they change the shared experts"
+                "the K3 aggregate engine does not run K3_HOT_PLAN at EP8; "
+                "use K3_REPLICA_PLAN instead"
             )
         if config.attention_dp != 1:
             raise NotImplementedError(

@@ -33,7 +33,7 @@ _RMW_BATCH = 2
 _RMW_DUMMY_SLOTS = 16
 
 
-def _sort_route_steps(keys, probabilities, *, size):
+def _sort_route_steps(keys, probabilities, token_ids=None, *, size, bits=0):
     """Yield after each 4096-route window of the in-place bitonic network.
 
     Keys encode (local expert, original route position), so all live keys are
@@ -41,11 +41,12 @@ def _sort_route_steps(keys, probabilities, *, size):
     Probability values follow exactly the same swaps as their keys.
     """
     window, rows = 4096, 32
-    assert size >= window and size & (size - 1) == 0
+    assert size >= 2 * window and size & (size - 1) == 0
     shape = (rows, 128)
     row = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
     lane = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
     positions = row * 128 + lane
+    mask = (1 << bits) - 1
 
     def view(ref, ordinal):
         return ref.at[pl.ds(ordinal * rows, rows), :]
@@ -75,6 +76,17 @@ def _sort_route_steps(keys, probabilities, *, size):
             value, lane ^ distance, axis=1, mode="promise_in_bounds"
         )
 
+    def apply_in_window(x, p, ordinal, steps):
+        global_position = positions + ordinal * window
+        for distance, group in steps:
+            y, q = partner(x, distance), partner(p, distance)
+            descending = (global_position & group) != 0
+            upper = (global_position & distance) != 0
+            take_min = ~(descending ^ upper)
+            keep = ~((x < y) ^ take_min)
+            x, p = jnp.where(keep, x, y), jnp.where(keep, p, q)
+        return x, p
+
     pending = []
 
     def flush():
@@ -82,26 +94,46 @@ def _sort_route_steps(keys, probabilities, *, size):
             return
         for ordinal in range(size // window):
             kr, pr = view(keys, ordinal), view(probabilities, ordinal)
-            x, p = kr[...], pr[...]
-            global_position = positions + ordinal * window
-            for distance, group in pending:
-                y, q = partner(x, distance), partner(p, distance)
-                descending = (global_position & group) != 0
-                upper = (global_position & distance) != 0
-                take_min = ~(descending ^ upper)
-                keep = ~((x < y) ^ take_min)
-                x, p = jnp.where(keep, x, y), jnp.where(keep, p, q)
+            x, p = apply_in_window(kr[...], pr[...], ordinal, pending)
             kr[...], pr[...] = x, p
             yield
         pending.clear()
 
     for stage in range(1, size.bit_length()):
+        group = 1 << stage
         for shift in reversed(range(stage)):
-            distance, group = 1 << shift, 1 << stage
+            distance = 1 << shift
             if distance < window:
                 pending.append((distance, group))
                 continue
             yield from flush()
+            if distance == window:
+                tail_steps = [(1 << s, group) for s in reversed(range(shift))]
+                is_final = (group == size) and (token_ids is not None)
+                for ordinal in range(size // (2 * window)):
+                    low, high = 2 * ordinal, 2 * ordinal + 1
+                    kl, kh = view(keys, low), view(keys, high)
+                    plow, phigh = view(probabilities, low), view(probabilities, high)
+                    x, y, p, q = kl[...], kh[...], plow[...], phigh[...]
+                    ascending = (low * window & group) == 0
+                    keep = ~((x < y) ^ ascending)
+                    xl, xh = jnp.where(keep, x, y), jnp.where(keep, y, x)
+                    pl_v, ph_v = jnp.where(keep, p, q), jnp.where(keep, q, p)
+                    xl, pl_v = apply_in_window(xl, pl_v, low, tail_steps)
+                    if is_final:
+                        view(token_ids, low)[...] = (xl & mask) // 16
+                    else:
+                        kl[...] = xl
+                    plow[...] = pl_v
+                    yield
+                    xh, ph_v = apply_in_window(xh, ph_v, high, tail_steps)
+                    if is_final:
+                        view(token_ids, high)[...] = (xh & mask) // 16
+                    else:
+                        kh[...] = xh
+                    phigh[...] = ph_v
+                    yield
+                break
             stride = distance // window
             for ordinal in range(size // (2 * window)):
                 low = ordinal // stride * (2 * stride) + ordinal % stride
@@ -121,13 +153,11 @@ class _Top16:
     """Incremental biased sigmoid Top16; ties choose the lowest expert ID."""
 
     def __init__(self, logits, bias):
-        rows, experts = logits.shape
         self.raw = 1.0 / (1.0 + jnp.exp(-logits))
         self.scores = self.raw + bias
         self.experts = jax.lax.broadcasted_iota(jnp.int32, logits.shape, 1)
-        self.slots = jax.lax.broadcasted_iota(jnp.int32, (rows, 16), 1)
-        self.selected = jnp.zeros((rows, 16), jnp.int32)
-        self.probabilities = jnp.zeros((rows, 16), jnp.float32)
+        self.selected: list[jax.Array] = []
+        self.probabilities: list[jax.Array] = []
         self.index = 0
 
     def step(self):
@@ -139,20 +169,20 @@ class _Top16:
         )
         chosen = self.experts == winner
         probability = jnp.sum(jnp.where(chosen, self.raw, 0.0), axis=1, keepdims=True)
-        self.selected = jnp.where(self.slots == self.index, winner, self.selected)
-        self.probabilities = jnp.where(
-            self.slots == self.index, probability, self.probabilities
-        )
+        self.selected.append(winner)
+        self.probabilities.append(probability)
         self.scores = jnp.where(chosen, -jnp.inf, self.scores)
         self.index += 1
 
     def finish(self, valid):
         while self.index < 16:
             self.step()
+        selected = jnp.concatenate(self.selected, axis=1)
+        probabilities = jnp.concatenate(self.probabilities, axis=1)
         denominator = jnp.maximum(
-            jnp.sum(self.probabilities, axis=1, keepdims=True), 1e-30
+            jnp.sum(probabilities, axis=1, keepdims=True), 1e-30
         )
-        return self.selected, jnp.where(valid, self.probabilities / denominator, 0.0)
+        return selected, jnp.where(valid, probabilities / denominator, 0.0)
 
 
 def _metadata_steps(
@@ -209,14 +239,14 @@ def _metadata_steps(
         probabilities[pl.ds(chunk * 16, 16), :] = probs.reshape(16, 128)
         # Count routes on the packed 16x128 layout.
         local_flat = local.reshape(16, 128)
-        ids_flat = ids.reshape(16, 128)
-        live_flat = probs.reshape(16, 128) != 0
         tile_counts = jnp.zeros((local_experts,), jnp.int32)
         for expert in range(local_experts):
             count = jnp.sum((local_flat == expert).astype(jnp.int32))
             tile_counts = jnp.where(expert_index == expert, count, tile_counts)
         total_counts += tile_counts
-        if tokens == 8192:
+        if maximum is not None:
+            ids_flat = ids.reshape(16, 128)
+            live_flat = probs.reshape(16, 128) != 0
             tile_groups = jnp.zeros((ep_groups,), jnp.int32)
             groups = ids_flat // local_experts
             for group in range(ep_groups):
@@ -228,12 +258,9 @@ def _metadata_steps(
     if maximum is not None:
         maximum[...] = jnp.max(total_groups)[None]
     counts_ready()
-    yield from _sort_route_steps(keys, probabilities, size=tokens * 16)
-
-    @pl.loop(0, tokens * 16 // 4096)
-    def extract(chunk):
-        index = pl.ds(chunk * 32, 32)
-        token_ids[index, :] = (keys[index, :] & ((1 << bits) - 1)) // 16
+    yield from _sort_route_steps(
+        keys, probabilities, token_ids, size=tokens * 16, bits=bits
+    )
 
 
 def _dense_panels(lhs, weights, buffers, semaphores, *, columns):
@@ -642,17 +669,17 @@ def _prologue(
             router_v = s["router_gu"].at[:, :896]
         else:
             buffers, router_v = s["gu_buffers"], s["router"]
+        copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
         router_copy = pltpu.make_async_copy(router, router_v, s["gu_sems"][0])
         bias_copy = pltpu.make_async_copy(bias, s["bias"], s["gu_sems"][1])
+        copy.start()
         router_copy.start()
         bias_copy.start()
-        copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
-        copy.start()
-        copy.wait()
         _enter_mesh()
         pl.semaphore_signal(
             s["peer_credit"], 1, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL
         )
+        copy.wait()
         pl.semaphore_wait(s["peer_credit"], 1)
         peer_input = pltpu.make_async_remote_copy(
             own,
@@ -691,7 +718,7 @@ def _prologue(
                 )
 
         def metadata_progress():
-            for _ in range(2 if rows <= 128 else 6):
+            for _ in range(2 if rows <= 128 else 5):
                 next(metadata_steps, None)
 
         if rows == 256:
@@ -1060,16 +1087,33 @@ def _routed_experts(
         # Six directed rings: [target, source, 32 local-contribution row bases].
         # One initialization per layer call, reused across all four columns.
         rank = lax.axis_index("k3_sp")
-        for directed in range(6):
-            family, direction = directed // 2, -1 if directed % 2 == 0 else 1
-            position = tables[family, 0, rank]
-            ring_meta[directed * 34] = tables[family, 1, (position + direction) & 31]
-            ring_meta[directed * 34 + 1] = tables[family, 1, (position - direction) & 31]
-            @pl.loop(0, 32)
-            def hop(step, *, family=family, position=position, direction=direction, directed=directed):
-                owner_mesh = tables[family, 1, (position - direction * (step + 1)) & 31]
-                owner = tables[family, 2, owner_mesh]
-                ring_meta[directed * 34 + 2 + step] = owner * localrows
+        positions = [tables[f, 0, rank] for f in range(3)]
+        peers = []
+        for family in range(3):
+            position = positions[family]
+            peer_neg = tables[family, 1, (position - 1) & 31]
+            peer_pos = tables[family, 1, (position + 1) & 31]
+            d_neg, d_pos = 2 * family, 2 * family + 1
+            ring_meta[d_neg * 34] = peer_neg
+            ring_meta[d_neg * 34 + 1] = peer_pos
+            ring_meta[d_pos * 34] = peer_pos
+            ring_meta[d_pos * 34 + 1] = peer_neg
+            peers.append((peer_neg,))
+            peers.append((peer_pos,))
+
+        @pl.loop(0, 32)
+        def hop(step):
+            delta = step + 1
+            for family in range(3):
+                position = positions[family]
+                owner_pos = tables[family, 1, (position + delta) & 31]
+                owner_neg = tables[family, 1, (position - delta) & 31]
+                ring_meta[(2 * family) * 34 + 2 + step] = (
+                    tables[family, 2, owner_pos] * localrows
+                )
+                ring_meta[(2 * family + 1) * 34 + 2 + step] = (
+                    tables[family, 2, owner_neg] * localrows
+                )
 
         active_ng = k.fill_metadata(counts, offset, metadata, cfgs=cfg)
 
@@ -1082,6 +1126,12 @@ def _routed_experts(
         ng = jnp.maximum(active_ng, 1)
         (xs, ws), _ = k.generate_block_specs(metadata, cfg)
         state[0] = 0
+
+        @functools.partial(pl.run_scoped, ready=pltpu.SemaphoreType.REGULAR)
+        def initialized(ready):
+            for peer in peers:
+                pl.semaphore_signal(ready, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH)
+            pl.semaphore_wait(ready, len(peers))
 
         # Real-prompt tuning: short expert loops need all twelve streams per
         # poll; longer loops alternate six-stream groups to bound polling cost.
@@ -1157,7 +1207,7 @@ def _routed_experts(
             def chunk(b):
                 base = start + b * loop_unroll
                 for u in range(0, loop_unroll, step_b):
-                    batched_unclamped(source, begin, base + u, step_b)
+                    batched_unclamped(source, begin, base + u, min(step_b, loop_unroll - u))
 
             tail_start = start + full * loop_unroll
             tail_steps = pl.cdiv(end - tail_start, step_b)
@@ -1176,11 +1226,11 @@ def _routed_experts(
         gu_panels = pl.cdiv(gu_width, pltpu.get_tpu_info().mxu_column_size)
         moved_rows = gu_panels * gu_unroll
         ep8_8k = tokens == 8192 and mid_width == 768
-        gu_u_by_bucket = (4, 8, 10, 12) if ep8_8k else (gu_unroll,) * 4
+        gu_u_by_bucket = (4, 8, 12, 16) if ep8_8k else (gu_unroll,) * 4
         first_down_u_by_bucket = (
-            (4, 8, 12, 14) if ep8_8k else (first_down_unroll,) * 4
+            (4, 8, 16, 20) if ep8_8k else (first_down_unroll,) * 4
         )
-        rem_down_u_by_bucket = (8, 16, 24, 24) if ep8_8k else (unroll,) * 4
+        rem_down_u_by_bucket = (8, 16, 28, 36) if ep8_8k else (unroll,) * 4
 
         def gu_work(g, panel, bucket_index=0):
             gu_u = gu_u_by_bucket[bucket_index]
@@ -1196,7 +1246,7 @@ def _routed_experts(
                     begin,
                     start + panel * gu_u + row,
                     end,
-                    step_b,
+                    min(step_b, gu_u - row),
                     guard=(g > 0),
                     dummy_base=panel * gu_u + row,
                 )
@@ -1235,7 +1285,7 @@ def _routed_experts(
                         begin,
                         start + base_off + row,
                         end,
-                        step_b,
+                        min(step_b, down_u - row),
                         guard=(g > 0),
                         dummy_base=panel * down_u + row,
                     )
@@ -1823,18 +1873,6 @@ def _ready_reduce(
 
     @pl.when(state[0] == 0)
     def initialize():
-        peers = [(ring_meta[d * 34],) for d in range(6)]
-        sem = pltpu.get_barrier_semaphore()
-        for peer in peers:
-            pl.semaphore_signal(sem, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH)
-        pl.semaphore_wait(sem, len(peers))
-
-        @functools.partial(pl.run_scoped, ready=pltpu.SemaphoreType.REGULAR)
-        def initialized(ready):
-            for peer in peers:
-                pl.semaphore_signal(ready, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH)
-            pl.semaphore_wait(ready, len(peers))
-
         for stream, region in enumerate(streams):
             begin, size, col_begin, width = region
             base = (stream % 6) * 34
@@ -1944,7 +1982,6 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
         copy = pltpu.make_async_copy(norm_weight, s["norm"], s["norm_sem"])
         copy.start()
         copy.wait()
-        panels = 7168 // 512
 
         def weight_copy(panel):
             return pltpu.make_async_copy(
@@ -1977,11 +2014,11 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
         s["normalized"][...] = ((routed * inverse) * s["norm"][...]).astype(
             jnp.bfloat16
         )
-        for panel in range(panels):
+        for panel in range(14):
             bank = panel % 3
             weight_copy(panel).wait()
             prefix_copy(panel).wait()
-            if panel + 2 < panels:
+            if panel + 2 < 14:
                 if panel >= 1:
                     output_copy(panel - 1).wait()
                 weight_copy(panel + 2).start()
@@ -1995,7 +2032,7 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
             value = jnp.where(valid, value, 0)
             s["tiles"][bank][...] = s["tiles"][bank][...] + value
             output_copy(panel).start()
-        for panel in range(panels - 3, panels):
+        for panel in (11, 12, 13):
             output_copy(panel).wait()
 
     pl.run_scoped(
@@ -2082,7 +2119,7 @@ def _layer_kernel(
 
         def counts_ready():
             count_copy().start()
-            if tokens == 8192:
+            if maximum is not None:
                 maximum_copy().start()
 
         def probability_copy(probs_v):
@@ -2120,11 +2157,11 @@ def _layer_kernel(
             if route_counts is not None:
                 for e in range(local_experts):
                     route_counts[e] = s["counts"][e]
-            if tokens == 8192:
+            if maximum is not None:
                 maximum_copy().wait()
             if tokens != 8192:
                 metadata_ready()
-            if tokens == 8192:
+            if maximum is not None:
 
                 @pl.when(s["maximum"][0] > capacity)
                 def export_overflow():
@@ -2177,7 +2214,7 @@ def _layer_kernel(
                 control, s["reduced"], s["shared"], norm, latent_up, prefix, output
             )
 
-        if tokens < 8192:
+        if maximum is None:
             fast()
         else:
 
@@ -2193,16 +2230,16 @@ def _layer_kernel(
             probs_v=vmem(shape, jnp.float32) if tokens < 8192 else None,
             counts_v=vmem((local_experts,), jnp.int32),
             counts=smem((local_experts,), jnp.int32),
-            maximum=smem((1,), jnp.int32) if tokens == 8192 else None,
+            maximum=smem((1,), jnp.int32) if maximum is not None else None,
             ids=smem((capacity // 128, 128), jnp.int32),
             probs=smem((capacity // 128, 128), jnp.float32),
             family=smem((1,), jnp.int32),
             offset=smem((1,), jnp.int32),
             count_sem=dma,
-            max_sem=dma if tokens == 8192 else None,
+            max_sem=dma if maximum is not None else None,
             index_sem=dma,
             prob_sem=dma,
-            export_sem=dma,
+            export_sem=dma if maximum is not None else None,
         ),
     )
 
@@ -2241,9 +2278,10 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         ((seq_len * 16, mid_width), bf16),
     ]
     output_specs = [hbm] * 3
-    if seq_len == 8192:
-        # Only 8K can overflow compact SMEM routing capacity. At <=4K every
-        # route fits, so omit the unused overflow outputs and maximum DMA.
+    can_overflow = seq_len == 8192 and ep > 8
+    if can_overflow:
+        # Only 8K at EP16 can overflow compact SMEM routing capacity (65536).
+        # At <=4K or EP8 every route fits, so omit the unused overflow outputs.
         workspace_shapes += [
             (shape, jnp.int32),
             (shape, jnp.float32),
@@ -2253,13 +2291,19 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         ]
         output_specs += [hbm] * 4 + [pl.BlockSpec()]
     counting = k._config().prefill_route_counts
-    body = _layer_kernel
     if counting:
         workspace_shapes += [((local_experts,), jnp.int32)]
         output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
 
-        def body(*refs):
+    def body(*refs):
+        refs = list(refs)
+        for idx in (8, 9, 10, 11):
+            if refs[idx].shape[1] != local_experts:
+                refs[idx] = refs[idx].at[:, pl.ds(0, local_experts)]
+        if counting:
             return _layer_kernel(*refs[:-1], route_counts=refs[-1])
+        return _layer_kernel(*refs)
+
     kernel = pl.pallas_call(
         body,
         out_shape=tuple(jax.ShapeDtypeStruct(s, d) for s, d in workspace_shapes),
@@ -2308,16 +2352,20 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         if counting:
             *outputs, routes = outputs
             routes = routes[None]
-        if seq_len < 8192:
+        if not can_overflow:
             return (outputs[0][None], routes) if counting else outputs[0][None]
         final, latent, _, ids, probs, counts, shared, maximum = outputs
 
         def overflow():
+            extra_slots = w["expert_gu"].shape[1] - local_experts
+            counts_for_prep = (
+                jnp.pad(counts, (0, extra_slots)) if extra_slots > 0 else counts
+            )
             reduced = routed_experts_prepared(
                 latent,
                 ids.reshape(-1),
                 probs.reshape(-1),
-                counts,
+                counts_for_prep,
                 w["expert_gu"],
                 w["expert_gus"],
                 w["expert_down"],
@@ -2372,13 +2420,18 @@ def _make_moe_16k(mesh):
         ((window_rows, 7168), bf16),
         ((tokens, 2, 1792), bf16),
         ((tokens * 16, mid_width), bf16),
-        (shape, jnp.int32),
-        (shape, jnp.float32),
-        ((local_experts,), jnp.int32),
-        ((rows, 7168), bf16),
-        ((1,), jnp.int32),
     ]
-    output_specs = [hbm] * 7 + [pl.BlockSpec()]
+    output_specs = [hbm] * 3
+    can_overflow = ep > 8
+    if can_overflow:
+        workspace_shapes += [
+            (shape, jnp.int32),
+            (shape, jnp.float32),
+            ((local_experts,), jnp.int32),
+            ((rows, 7168), bf16),
+            ((1,), jnp.int32),
+        ]
+        output_specs += [hbm] * 4 + [pl.BlockSpec()]
     counting = k._config().prefill_route_counts
     if counting:
         workspace_shapes += [((local_experts,), jnp.int32)]
@@ -2395,6 +2448,9 @@ def _make_moe_16k(mesh):
             own = pl.ds(half * rows, rows)
             for index in (2, 1 + inputs, 2 + inputs):  # hidden, prefix, output
                 refs[index] = refs[index].at[own]
+            for idx in (8, 9, 10, 11):  # expert_gu, expert_gus, expert_down, expert_ds
+                if refs[idx].shape[1] != local_experts:
+                    refs[idx] = refs[idx].at[:, pl.ds(0, local_experts)]
             if counting:
                 return _layer_kernel(*refs[:-1], route_counts=refs[-1])
             return _layer_kernel(*refs)
@@ -2428,7 +2484,6 @@ def _make_moe_16k(mesh):
     )
     def local(hidden, prefix, families, length, slot):
         w = {name: value[0] for name, value in families.items()}
-        lengths = (jnp.minimum(length, tokens), jnp.maximum(length - tokens, 0))
         operands = (
             hidden[0],
             w["router"],
@@ -2444,6 +2499,7 @@ def _make_moe_16k(mesh):
             w["latent_up"],
             prefix[0],
         )
+        lengths = (jnp.minimum(length, tokens), jnp.maximum(length - tokens, 0))
         halves, routes, previous = [], None, ()
         for half, kernel in enumerate(kernels):
             control = jnp.concatenate((lengths[half].reshape(1), slot.reshape(1)))
@@ -2454,14 +2510,23 @@ def _make_moe_16k(mesh):
             halves.append(outputs)
             previous = (outputs[0],)
         final = halves[1][0]
+        if not can_overflow:
+            if counting:
+                assert routes is not None
+                return final[None], routes[None]
+            return final[None]
 
         def overflow(half):
             _, latent, _, ids, probs, counts, shared, maximum = halves[half]
+            extra_slots = w["expert_gu"].shape[1] - local_experts
+            counts_for_prep = (
+                jnp.pad(counts, (0, extra_slots)) if extra_slots > 0 else counts
+            )
             reduced = routed_experts_prepared(
                 latent,
                 ids.reshape(-1),
                 probs.reshape(-1),
-                counts,
+                counts_for_prep,
                 w["expert_gu"],
                 w["expert_gus"],
                 w["expert_down"],
@@ -2474,7 +2539,7 @@ def _make_moe_16k(mesh):
             return k._moe_sp_tail(
                 reduced,
                 shared,
-                prefix[0, half * rows : (half + 1) * rows],
+                prefix[0][half * rows : (half + 1) * rows],
                 lengths[half],
                 selected,
                 axis_name="k3_sp",
