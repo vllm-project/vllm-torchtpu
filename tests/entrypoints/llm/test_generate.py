@@ -179,3 +179,9 @@ def test_logprobs(llm: LLM):
 def test_log_stats(llm: LLM):
     outputs = llm.generate(PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS)
     assert all(output.metrics is not None for output in outputs)
+
+
+def test_reset_encoder_cache(llm: LLM):
+    llm.llm_engine.reset_encoder_cache()
+    outputs = llm.generate(PROMPTS[:1], sampling_params=GREEDY_SAMPLING_PARAMS)
+    assert len(outputs) == 1
