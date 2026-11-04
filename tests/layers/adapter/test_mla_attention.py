@@ -718,6 +718,8 @@ def test_mla_requires_declared_g_proj():
 def test_mla_weight_layout_is_restored_on_error(layout):
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
     torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = False
+    attention.dcp_q_replicate = False
     attention.kv_b_proj = torch.nn.Module()
     weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     parameter_name = "weight_packed" if layout == "packed" else "weight"
@@ -788,6 +790,34 @@ def test_no_qrep_leaves_no_replicated_weights():
     attention._gather_dcp_qrep_weights()
     assert attention.W_UK_T_dcp_qrep is None
     assert attention.W_UK_T_dcp_qrep_scale is None
+
+
+def test_upstream_weight_processing_runs_without_qrep():
+    """Upstream would gather W_UK_T across DCP as well; it must see the flag
+    off, and the flag must come back whether or not upstream raises."""
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.kv_b_proj = torch.nn.Module()
+    attention.kv_b_proj.register_parameter(
+        "weight", torch.nn.Parameter(torch.zeros(2, 3))
+    )
+    attention.dcp_q_replicate = True
+    seen = []
+
+    def upstream_process(act_dtype):
+        seen.append(attention.dcp_q_replicate)
+        raise RuntimeError("stop after upstream")
+
+    with (
+        patch(
+            "vllm.model_executor.layers.attention.mla_attention.MLAAttention.process_weights_after_loading",
+            side_effect=upstream_process,
+        ),
+        pytest.raises(RuntimeError, match="stop after upstream"),
+    ):
+        attention.process_weights_after_loading(torch.float32)
+    assert seen == [False]
+    assert attention.dcp_q_replicate is True
 
 
 def test_mla_flipped_projection_requires_weight():

@@ -944,9 +944,7 @@ class VllmTPUMLAAttention(MLAAttention):
             if original_selector_get_backend is not None:
                 selector.get_mla_prefill_backend = original_selector_get_backend
 
-        # Set after super(), not through it: upstream's
-        # process_weights_after_loading gathers W_UK_T on the flag too, and
-        # this class does that itself once the weight is on device.
+        # process_weights_after_loading masks this around upstream's copy.
         self.dcp_q_replicate = dcp_q_replicate
         # The shared top-k table. A layer that reuses an earlier layer's
         # indices has no indexer, so this is where its top-k width is stated.
@@ -1006,9 +1004,13 @@ class VllmTPUMLAAttention(MLAAttention):
             self.kv_b_proj.weight = Parameter(
                 kv_b_weight.transpose(0, 1).contiguous(), requires_grad=False
             )
+        # Upstream would gather W_UK_T across DCP too; _gather_dcp_qrep_weights
+        # does it once, on device.
+        dcp_q_replicate, self.dcp_q_replicate = self.dcp_q_replicate, False
         try:
             super().process_weights_after_loading(act_dtype)
         finally:
+            self.dcp_q_replicate = dcp_q_replicate
             if flipped:
                 assert kv_b_weight is not None
                 self.kv_b_proj.weight = Parameter(kv_b_weight, requires_grad=False)
