@@ -255,7 +255,7 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
         jnp.take_along_axis(expected_scales, order, axis=1),
     )
 
-    def pipeline(chunk, early_gather=False):
+    def pipeline(chunk, early_gather=False, deep_gather=False):
         return csa2_pipeline(
             q,
             word_banks,
@@ -271,16 +271,19 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
             counts,
             chunk_size=chunk,
             early_gather=early_gather,
+            deep_gather=deep_gather,
             **kwargs,
         )
 
     output, gathered_words, gathered_scales = pipeline(chunk_size)
-    # Early gather only reorders scheduling: chunked and single-chunk results
-    # must be bitwise equal to the default.
+    # Early and deep gathers only change scheduling and staging: chunked and
+    # single-chunk results, including zeroed invalid rows, must be bitwise
+    # equal to the default.
     for chunk in (chunk_size, tokens):
         reference = pipeline(chunk)
-        for early, default in zip(pipeline(chunk, early_gather=True), reference):
-            np.testing.assert_array_equal(early, default)
+        for option in ("early_gather", "deep_gather"):
+            for variant, default in zip(pipeline(chunk, **{option: True}), reference):
+                np.testing.assert_array_equal(variant, default)
     np.testing.assert_allclose(output, expected, atol=2e-3, rtol=2e-2)
     np.testing.assert_array_equal(output[155:], 0)
     np.testing.assert_array_equal(gathered_words, expected_words)

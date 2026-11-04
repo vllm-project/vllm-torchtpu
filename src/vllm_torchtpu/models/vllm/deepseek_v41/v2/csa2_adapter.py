@@ -180,6 +180,7 @@ def _gather_attend(
         scale=scale,
         compress_ratio=ratio,
         early_gather=envs.TPU_DEEPSEEK_V41_CSA2_EARLY_GATHER,
+        deep_gather=envs.TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER,
     )
     return output, words, scales, counts
 
