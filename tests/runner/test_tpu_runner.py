@@ -2887,6 +2887,7 @@ class TestInputStagingFence:
             _has_mamba_state=False,
             mamba_slot_read_offsets=None,
             _mamba_ckpt_window=1,
+            _prefill_ckpt_units=None,
             _unified_kv_layout=False,
             empty_slot_mappings={},
             position_ids=torch.zeros(64, dtype=torch.int32),
