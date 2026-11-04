@@ -395,6 +395,40 @@ def test_tpu_sdpa_attention_backend():
     assert res_gqa.shape == (1, 16, 8, 16)
 
 
+@pytest.mark.parametrize("mask_kind", ["2d", "b11k"])
+def test_tpu_sdpa_masked_calls_use_math_backend(monkeypatch, mask_kind):
+    # torch_tpu's default SDPA lowering is wrong with an attn_mask, so masked
+    # calls must run under sdpa_kernel(MATH); unmasked calls must not.
+    from vllm_torchtpu.omni import attention as omni_attention
+
+    backends = []
+    real_sdpa_kernel = omni_attention.sdpa_kernel
+
+    def recording_sdpa_kernel(backend):
+        backends.append(backend)
+        return real_sdpa_kernel(backend)
+
+    monkeypatch.setattr(omni_attention, "sdpa_kernel", recording_sdpa_kernel)
+    impl = TpuSDPAImpl(num_heads=4, head_size=16, softmax_scale=0.25)
+    query = torch.randn(2, 8, 4, 16)
+    key = torch.randn(2, 6, 4, 16)
+    value = torch.randn(2, 6, 4, 16)
+    keep = torch.arange(6) < 5
+    keep_2d = keep[None, :].expand(2, -1)
+    mask = keep_2d if mask_kind == "2d" else keep_2d[:, None, None, :]
+
+    impl.forward(query, key, value)
+    impl.forward(query, key, value, SimpleNamespace(attn_mask=None))
+    assert backends == []
+
+    out = impl.forward(query, key, value, SimpleNamespace(attn_mask=mask))
+    assert backends == [omni_attention.SDPBackend.MATH]
+    scores = torch.einsum("bqhd,bkhd->bhqk", query, key) * 0.25
+    scores = scores.masked_fill(~keep[None, None, None, :], float("-inf"))
+    ref = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(dim=-1), value)
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize(
     "rope_cls_name",
     ["QwenEmbedRope", "QwenEmbedLayer3DRope"],

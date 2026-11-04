@@ -16,7 +16,8 @@
 Tested FLUX Components:
 =======================
 1. TpuSDPAImpl (vllm_torchtpu): TPU SDPA diffusion attention parity for standard,
-   asymmetric joint text/image, and GQA head expansion against CPU ground truth.
+   asymmetric joint text/image, GQA head expansion and key-padding masks against
+   CPU ground truth.
 2. FluxPosEmbed / Flux2PosEmbed (vllm_omni): RoPE frequencies computed on TPU (float64,
    as in production) against the same module on CPU.
 3. RotaryEmbedding / apply_rope_to_qk (vllm_omni): RoPE rotation kernel application
@@ -244,6 +245,59 @@ class TestFluxTpuSDPAAttention:
         assert_numerical_parity(
             tpu_out.cpu(), ref_out, atol=2e-2, rtol=2e-2, min_cos_sim=0.999
         )
+
+    @pytest.mark.parametrize(
+        "batch_size,q_len,kv_len,valid_len,mask_kind",
+        [
+            (1, 128, 128, 126, "2d"),
+            (2, 128, 128, 126, "b11k"),
+            # LTX-2.3 audio_to_video_attn under Ulysses 4: a local video
+            # shard against SP-padded audio keys (126 -> 128).
+            (2, 1536, 128, 126, "b11k"),
+            (2, 1536, 128, 128, "b11k"),
+        ],
+    )
+    def test_masked_sdpa_numeric_parity_on_tpu(
+        self, batch_size, q_len, kv_len, valid_len, mask_kind
+    ):
+        """Masked TpuSDPAImpl matches a float64 masked reference on TPU.
+
+        torch_tpu's default SDPA lowering returned max abs errors of ~2 (and
+        sometimes NaN) for any attn_mask, which blanked LTX-2.3 video and
+        turned its audio into NaN under Ulysses.
+        """
+        torch.manual_seed(7)
+        num_heads, head_size = 32, 64
+        scale = 1.0 / math.sqrt(head_size)
+        impl = TpuSDPAImpl(
+            num_heads=num_heads, head_size=head_size, softmax_scale=scale
+        )
+        query_cpu = torch.randn(
+            batch_size, q_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        key_cpu = torch.randn(
+            batch_size, kv_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        value_cpu = torch.randn(
+            batch_size, kv_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        keep = torch.arange(kv_len) < valid_len
+        keep_2d = keep[None, :].expand(batch_size, -1)
+        mask_cpu = keep_2d if mask_kind == "2d" else keep_2d[:, None, None, :]
+
+        q, k, v = (t.double() for t in (query_cpu, key_cpu, value_cpu))
+        scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * scale
+        scores = scores.masked_fill(~keep[None, None, None, :], float("-inf"))
+        ref_out = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(dim=-1), v)
+
+        tpu_out = impl.forward(
+            query_cpu.to("tpu"),
+            key_cpu.to("tpu"),
+            value_cpu.to("tpu"),
+            SimpleNamespace(attn_mask=mask_cpu.to("tpu")),
+        ).cpu()
+        assert torch.all(torch.isfinite(tpu_out))
+        assert_numerical_parity(tpu_out, ref_out, atol=2e-2, rtol=2e-2)
 
     def test_flux_masked_attention_fallback_matches_sdpa_on_tpu(self, monkeypatch):
         """Verify masked calls fall back from TpuFlashAttentionImpl to TpuSDPAImpl."""
