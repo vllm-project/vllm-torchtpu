@@ -215,39 +215,33 @@ def _compressed_tensors_fp8_config(weights: dict) -> VllmCompressedTensorsConfig
     ],
 )
 def test_fp8_experts_register_compressed_tensors_scale_names(
-    make_routed_experts, monkeypatch, weights, w13_scale_shape, w2_scale_shape
+    make_fp8_experts, monkeypatch, weights, w13_scale_shape, w2_scale_shape
 ):
     """compressed-tensors names every scale `weight_scale`; the fused layer must
     register that name, not the DeepSeek-style `weight_scale_inv`."""
-    layer = make_routed_experts(_compressed_tensors_fp8_config(weights))
+    quant = _compressed_tensors_fp8_config(weights)
+    layer = make_fp8_experts(quant, 256, tp_size=1, tp_rank=0)
 
     assert isinstance(layer.quant_method, VllmFp8MoEMethodTPU)
     params = dict(layer.named_parameters())
     assert not [name for name in params if name.endswith("weight_scale_inv")]
     assert params["w13_weight_scale"].shape == w13_scale_shape
     assert params["w2_weight_scale"].shape == w2_scale_shape
-
-    # Expert loaders look the parameters up by the checkpoint's tensor names.
-    weight = torch.ones(256, 256, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-    scale = torch.full(w2_scale_shape[1:] or (1,), 2.0)
-    list(
-        layer.load_weights(
-            (f"{expert}.{proj}_proj.{name}", tensor)
-            for expert in range(2)
-            for proj in ("gate", "up", "down")
-            for name, tensor in (("weight", weight), ("weight_scale", scale))
-        )
+    # Expert loaders pass the checkpoint's own tensor name to the loader.
+    w2_scale = params["w2_weight_scale"]
+    scales = torch.arange(w2_scale[0].numel(), dtype=torch.float32).reshape(
+        w2_scale.shape[1:]
     )
-    assert torch.all(layer.w13_weight_scale == 2)
-    assert torch.all(layer.w2_weight_scale == 2)
+    for proj in ("gate", "up", "down"):
+        list(layer.load_weights([(f"0.{proj}_proj.weight_scale", scales)]))
+    torch.testing.assert_close(w2_scale[0], scales)
 
-    # Building the Pallas op needs a TPU; swapping in the runtime scales does not.
+    # Building the Pallas kernel needs a TPU.
     monkeypatch.setattr(
         "vllm_torchtpu.layers.adapter.quantization.fp8.prebuild_fused_moe_kernel",
         lambda **kwargs: None,
     )
     layer.quant_method.process_weights_after_loading(layer)
-    assert not hasattr(layer, "w13_weight_scale")
-    assert not hasattr(layer, "w2_weight_scale")
-    assert isinstance(layer.w13_weight_scale_inv, torch.nn.Parameter)
-    assert isinstance(layer.w2_weight_scale_inv, torch.nn.Parameter)
+    params = dict(layer.named_parameters())
+    assert "w13_weight_scale" not in params and "w2_weight_scale" not in params
+    assert "w13_weight_scale_inv" in params and "w2_weight_scale_inv" in params

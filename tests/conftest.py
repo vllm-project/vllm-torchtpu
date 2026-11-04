@@ -146,11 +146,11 @@ def dist_ctx():
 
 
 @pytest.fixture
-def make_routed_experts(monkeypatch):
-    """CPU `RoutedExperts` under `quant_config` for one TP rank, no engine needed."""
-    # Here rather than in tests/layers/adapter/quantization/conftest.py: see dist_ctx.
+def make_fp8_experts(monkeypatch):
+    """CPU `RoutedExperts` under `quant`, holding TP rank `tp_rank` of the experts."""
+    # Here rather than in tests/layers/adapter/quantization/: see dist_ctx.
 
-    def make(quant_config, *, intermediate_size=256, tp_size=1, tp_rank=0):
+    def make(quant, shard_size, *, tp_size=2, tp_rank=1):
         from types import SimpleNamespace
 
         from vllm.config import set_current_vllm_config
@@ -165,14 +165,6 @@ def make_routed_experts(monkeypatch):
             ExpertMapManager,
         )
 
-        monkeypatch.setattr(
-            "vllm.model_executor.layers.quantization.fp8."
-            "get_tensor_model_parallel_world_size",
-            lambda: tp_size,
-        )
-        monkeypatch.setattr(
-            "vllm.distributed.get_tensor_model_parallel_world_size", lambda: tp_size
-        )
         parallel = FusedMoEParallelConfig(
             tp_size=tp_size,
             pcp_size=1,
@@ -187,38 +179,49 @@ def make_routed_experts(monkeypatch):
             all2all_backend="allgather_reducescatter",
             enable_eplb=False,
         )
-        vllm_config = SimpleNamespace(
-            parallel_config=SimpleNamespace(enable_expert_parallel=False)
+        config = FusedMoEConfig(
+            num_experts=2,
+            experts_per_token=1,
+            hidden_dim=256,
+            intermediate_size=tp_size * shard_size,
+            num_local_experts=2,
+            num_logical_experts=2,
+            activation=MoEActivation.SILU,
+            device=torch.device("cpu"),
+            routing_method=RoutingMethodType.Renormalize,
+            moe_parallel_config=parallel,
+            in_dtype=torch.bfloat16,
         )
-        monkeypatch.setattr(type(quant_config), "vllm_config", vllm_config)
-        with set_current_vllm_config(vllm_config):
+        expert_map = ExpertMapManager(
+            max_num_batched_tokens=16,
+            top_k=1,
+            global_num_experts=2,
+            num_redundant_experts=0,
+            num_expert_group=None,
+            moe_parallel_config=parallel,
+            placement_strategy="linear",
+            enable_eplb=False,
+        )
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.quantization.fp8."
+            "get_tensor_model_parallel_world_size",
+            lambda: tp_size,
+        )
+        monkeypatch.setattr(
+            "vllm.distributed.get_tensor_model_parallel_world_size",
+            lambda: tp_size,
+        )
+        quant.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_expert_parallel=False),
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
+        )
+        with set_current_vllm_config(quant.vllm_config):
             return RoutedExperts(
                 layer_name="model.layers.0.mlp.experts",
                 params_dtype=torch.bfloat16,
-                moe_config=FusedMoEConfig(
-                    num_experts=2,
-                    experts_per_token=1,
-                    hidden_dim=256,
-                    intermediate_size=intermediate_size,
-                    num_local_experts=2,
-                    num_logical_experts=2,
-                    activation=MoEActivation.SILU,
-                    device=torch.device("cpu"),
-                    routing_method=RoutingMethodType.Renormalize,
-                    moe_parallel_config=parallel,
-                    in_dtype=torch.bfloat16,
-                ),
-                quant_config=quant_config,
-                expert_map_manager=ExpertMapManager(
-                    max_num_batched_tokens=16,
-                    top_k=1,
-                    global_num_experts=2,
-                    num_redundant_experts=0,
-                    num_expert_group=None,
-                    moe_parallel_config=parallel,
-                    placement_strategy="linear",
-                    enable_eplb=False,
-                ),
+                moe_config=config,
+                quant_config=quant,
+                expert_map_manager=expert_map,
             )
 
     return make
