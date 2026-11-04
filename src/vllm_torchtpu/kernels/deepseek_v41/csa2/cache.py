@@ -425,9 +425,19 @@ def prepare_main_records(
         raise ValueError("CSA2 main selection width must be at most 512")
     if (
         jax.default_backend() == "tpu"
-        and selected.shape == (288, 512)
-        and physical_pages.shape[0] == 48
-        and physical_pages.shape[1] in (386, 772)
+        and selected.shape[1] == 512
+        and (
+            (
+                selected.shape[0] == 288
+                and physical_pages.shape[0] == 48
+                and physical_pages.shape[1] in (386, 772)
+            )
+            or (
+                (selected.shape[0], physical_pages.shape[0])
+                in ((96, 16), (192, 32), (288, 32))
+                and (physical_pages.shape[1], page_size) in ((386, 128), (772, 64))
+            )
+        )
     ):
         from vllm_torchtpu.kernels.experimental.decode_preparation import (
             main_records_call,
