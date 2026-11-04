@@ -13,16 +13,16 @@
 # limitations under the License.
 """Hook through which modules reach the optional fused pool I/O helpers.
 
-`GQAModule` and `GDNModule` never import `experimental.fused_pool_io`; when fused
-pool I/O is selected (`CacheExec.FUSED`) they call `fused_io()`, which returns
-the implementation that `experimental/fused_pool_io.py` registers on import
-(loaded on the first lookup, `_builtins.ensure_builtins`). Without a registered
+Mixer modules never import the fused pool I/O implementation directly; when
+fused pool I/O is selected (`CacheExec.FUSED`) they call `fused_io()`, which
+returns the implementation registered via `register_fused_io()` (loaded on the
+first lookup, `_builtins.ensure_builtins`). Without a registered
 implementation, `"auto"` fused selection falls back to split pool I/O
 (`fused_io_available()`), and an explicit fused build fails with
 `MegakernelConfigError`.
 
 This module depends only on `errors` and `_builtins` (both stdlib at import), so
-importing the experimental helpers does not load any module.
+importing it does not load any mixer module.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 
 class FusedPoolIO(Protocol):
-    """Fused pool I/O helpers for `GQAModule` / `GDNModule` (`CacheExec.FUSED`)."""
+    """Fused pool I/O helper protocol (`CacheExec.FUSED`)."""
 
     def gqa_fused_states(self, ex: ExecSpec) -> list[StateDecl]: ...
 

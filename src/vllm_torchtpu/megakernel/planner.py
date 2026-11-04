@@ -193,9 +193,8 @@ def plan(
     """Derive weight tile sizes, stream schedules, smalls layout, and metadata.
 
     Pure function of `model_spec` and `ex` (`ex.resolve_tiles(g)`): never fits
-    tiles or queries device budgets. VMEM ring-depth fitting lives in
-    `vmem.fit_default_tiles` (and `vmem.fitted_plan`), called by
-    `vmem.build_scratch` and `kernel.build`.
+    ring depths to VMEM capacity, allocates scratch buffers, or queries device
+    budgets.
     """
     active_modules = model_spec.all_modules()
     active_names = {m.name for m in active_modules}
