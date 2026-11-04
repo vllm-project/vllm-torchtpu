@@ -437,65 +437,80 @@ def _to_row_major(tensor: torch.Tensor) -> torch.Tensor:
     return device_tensor
 
 
-def relayout_rope_caches(model: torch.nn.Module):
+def relayout_rope_caches(*models: torch.nn.Module) -> None:
     """Re-materialize every rope cache with a row-major device layout."""
-    # Share one relayouted device tensor across modules that share a buffer.
+    if not models:
+        return
+    # Share one relayouted device tensor across modules/models that share a
+    # buffer, and visit get_rope()-shared module instances once across models.
+    seen_modules: set[int] = set()
     relayouted_by_id: dict[int, torch.Tensor] = {}
     num_changed = 0
-    for name, module in model.named_modules():
-        if not isinstance(module, RotaryEmbeddingBase):
-            continue
-        # The buffers on a rotary module that are indexed by position.
-        caches: list[tuple[str, Any]] = [
-            (buf_name, getattr(module, buf_name, None))
-            for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")
-        ]
-        caches = [(n, b) for n, b in caches if isinstance(b, torch.Tensor)]
-        if not caches:
-            continue
-        if any(b.ndim != 2 for _, b in caches):
-            continue
-        for buf_name, buf in caches:
-            buf_id = id(buf)
-            relayouted = relayouted_by_id.get(buf_id)
-            if relayouted is None:
-                relayouted = _to_row_major(buf)
-                relayouted_by_id[buf_id] = relayouted
-            setattr(module, buf_name, relayouted)
-        num_changed += 1
-        logger.info(
-            "Relayouted rope cache %s to {1,0} (shape %s)",
-            name,
-            tuple(caches[0][1].shape),
-        )
+    for model in models:
+        for name, module in model.named_modules():
+            if id(module) in seen_modules:
+                continue
+            seen_modules.add(id(module))
+            if not isinstance(module, RotaryEmbeddingBase):
+                continue
+            # The buffers on a rotary module that are indexed by position.
+            caches: list[tuple[str, Any]] = [
+                (buf_name, getattr(module, buf_name, None))
+                for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")
+            ]
+            caches = [(n, b) for n, b in caches if isinstance(b, torch.Tensor)]
+            if not caches:
+                continue
+            if any(b.ndim != 2 for _, b in caches):
+                continue
+            for buf_name, buf in caches:
+                buf_id = id(buf)
+                relayouted = relayouted_by_id.get(buf_id)
+                if relayouted is None:
+                    relayouted = _to_row_major(buf)
+                    relayouted_by_id[buf_id] = relayouted
+                setattr(module, buf_name, relayouted)
+            num_changed += 1
+            logger.info(
+                "Relayouted rope cache %s to {1,0} (shape %s)",
+                name,
+                tuple(caches[0][1].shape),
+            )
 
     if num_changed:
         _install_entry_layout_pin()
     logger.info("Row-major relayouted %d rope caches", num_changed)
 
 
-def relayout_hash_tables(model: torch.nn.Module):
+def relayout_hash_tables(*models: torch.nn.Module) -> None:
     """Re-materialize every MOE hash-routing table row-major."""
+    if not models:
+        return
+    seen_modules: set[int] = set()
     seen: set[int] = set()
     num_changed = 0
-    for name, module in model.named_modules():
-        # The attributes under which one hash-routing table is reachable;
-        # the same tensor object is bound to all of them.
-        for attr in ("tid2eid", "hash_indices_table"):
-            table: torch.Tensor | None = getattr(module, attr, None)
-            if not isinstance(table, torch.Tensor) or id(table) in seen:
+    for model in models:
+        for name, module in model.named_modules():
+            if id(module) in seen_modules:
                 continue
-            seen.add(id(table))
-            if table.ndim != 2:
-                continue
-            table.data = _to_row_major(table.data)
-            num_changed += 1
-            logger.info(
-                "Relayouted hash table %s.%s to {1,0} (shape %s)",
-                name,
-                attr,
-                tuple(table.shape),
-            )
+            seen_modules.add(id(module))
+            # The attributes under which one hash-routing table is reachable;
+            # the same tensor object is bound to all of them.
+            for attr in ("tid2eid", "hash_indices_table"):
+                table: torch.Tensor | None = getattr(module, attr, None)
+                if not isinstance(table, torch.Tensor) or id(table) in seen:
+                    continue
+                seen.add(id(table))
+                if table.ndim != 2:
+                    continue
+                table.data = _to_row_major(table.data)
+                num_changed += 1
+                logger.info(
+                    "Relayouted hash table %s.%s to {1,0} (shape %s)",
+                    name,
+                    attr,
+                    tuple(table.shape),
+                )
 
     if num_changed:
         _install_entry_layout_pin()
