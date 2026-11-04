@@ -48,23 +48,45 @@ DP_AXIS = "dp"
 TP_AXIS = "tp"
 
 
+def _member_index(
+    ids: jax.Array,
+    ep_rank: jax.Array,
+    *,
+    dp_size: int,
+    tp_size: int,
+    local_num_experts: int,
+) -> jax.Array:
+    """DP position of the member of this TP rank's DP group that hosts each
+    expert id, or ``dp_size`` when no member does (another TP rank's expert,
+    or no expert).
+
+    Linear placement puts expert ``e`` on EP rank ``e // local_num_experts``,
+    and EP rank ``d * tp_size + r`` is DP position ``d`` at TP rank ``r``.
+    """
+    owner = ids // local_num_experts
+    routed = (ids >= 0) & (owner < dp_size * tp_size)
+    here = routed & (owner % tp_size == ep_rank % tp_size)
+    return jnp.where(here, owner // tp_size, dp_size)
+
+
 def exchange_need(
     gathered_ids: jax.Array, ep_rank: jax.Array, *, tp_size: int, local_num_experts: int
 ) -> jax.Array:
     """Which DP-group members each token of the group must reach.
 
     ``gathered_ids`` [D, S, K] holds the global expert ids of every token of
-    this DP group, by DP position. Linear placement puts expert ``e`` on EP
-    rank ``e // local_num_experts``, and EP rank ``d * tp_size + r`` is DP
-    position ``d`` at TP rank ``r``. Returns ``need`` [D, S, D]:
+    this DP group, by DP position. Returns ``need`` [D, S, D]:
     ``need[s, t, d]`` is true when token ``t`` of member ``s`` has an expert on
     member ``d`` of this TP rank's DP group.
     """
     dp_size = gathered_ids.shape[0]
-    owner = gathered_ids // local_num_experts
-    routed = (gathered_ids >= 0) & (owner < dp_size * tp_size)
-    here = routed & (owner % tp_size == ep_rank % tp_size)
-    dest = jnp.where(here, owner // tp_size, dp_size)
+    dest = _member_index(
+        gathered_ids,
+        ep_rank,
+        dp_size=dp_size,
+        tp_size=tp_size,
+        local_num_experts=local_num_experts,
+    )
     hits = jax.nn.one_hot(dest, dp_size + 1, dtype=jnp.int32)[..., :dp_size]
     return hits.max(axis=2) > 0
 
@@ -79,20 +101,43 @@ def _tile_rows(a: jax.Array) -> jax.Array:
     return a.reshape(rows, 1, hidden)
 
 
+# A packed route with expert id -1 and weight +0.0: what an empty slot reads.
+_EMPTY_ROUTE = -1 << 16
+
+
 def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array):
     """All-gather the DP group's routing in one collective when it packs:
-    a bf16 weight and an expert id below 2**15 share one int32."""
+    a bf16 weight and an expert id below 2**15 share one int32.
+
+    Returns the gathered ids [D, S, K] and a function that reads the routes
+    of the given flat (member, token) rows; an out-of-range row reads expert
+    id -1 with weight 0.
+    """
     if topk_weights.dtype != jnp.bfloat16:
-        return (
-            jax.lax.all_gather(topk_ids, DP_AXIS),
-            jax.lax.all_gather(topk_weights, DP_AXIS),
-        )
+        ids = jax.lax.all_gather(topk_ids, DP_AXIS)
+        weights = jax.lax.all_gather(topk_weights, DP_AXIS)
+
+        def read(rows):
+            flat_ids = ids.reshape(-1, ids.shape[-1])
+            flat_weights = weights.reshape(-1, weights.shape[-1])
+            return (
+                flat_ids.at[rows].get(mode="fill", fill_value=-1),
+                flat_weights.at[rows].get(mode="fill", fill_value=0),
+            )
+
+        return ids, read
     bits = jax.lax.bitcast_convert_type(topk_weights, jnp.uint16).astype(jnp.int32)
     packed = jax.lax.all_gather(jnp.left_shift(topk_ids, 16) | bits, DP_AXIS)
-    weights = jax.lax.bitcast_convert_type(
-        jnp.bitwise_and(packed, 0xFFFF).astype(jnp.uint16), jnp.bfloat16
-    )
-    return jnp.right_shift(packed, 16), weights
+
+    def read(rows):
+        routes = packed.reshape(-1, packed.shape[-1])
+        routes = routes.at[rows].get(mode="fill", fill_value=_EMPTY_ROUTE)
+        weights = jax.lax.bitcast_convert_type(
+            jnp.bitwise_and(routes, 0xFFFF).astype(jnp.uint16), jnp.bfloat16
+        )
+        return jnp.right_shift(routes, 16), weights
+
+    return jnp.right_shift(packed, 16), read
 
 
 def ragged_a2a_moe_local(
@@ -125,22 +170,24 @@ def ragged_a2a_moe_local(
     ep_rank = experts_start[0] // local_num_experts
     dp_pos = ep_rank // tp_size
     slots = dp_size * num_tokens
-
-    gathered_ids, gathered_weights = _gather_routing(topk_ids, topk_weights)
-    need = exchange_need(
-        gathered_ids, ep_rank, tp_size=tp_size, local_num_experts=local_num_experts
+    member_index = functools.partial(
+        _member_index,
+        ep_rank=ep_rank,
+        dp_size=dp_size,
+        tp_size=tp_size,
+        local_num_experts=local_num_experts,
     )
-    counts = need.sum(axis=1, dtype=jnp.int32)  # [source, destination]
-    send_sizes = jnp.take(counts, dp_pos, axis=0)
-    recv_sizes = jnp.take(counts, dp_pos, axis=1)
+
+    gathered_ids, read_routes = _gather_routing(topk_ids, topk_weights)
     member = jnp.arange(dp_size, dtype=jnp.int32)
     token = jnp.arange(num_tokens, dtype=jnp.int32)
     region = member * num_tokens
     landing = jnp.full((dp_size,), dp_pos * num_tokens, dtype=jnp.int32)
 
     # Outgoing: member d's region holds this rank's tokens that need d, in
-    # token order.
-    need_out = jnp.take(need, dp_pos, axis=0)  # [S, D]
+    # token order. This rank's own routing decides it.
+    need_out = (member_index(topk_ids)[:, :, None] == member).any(axis=1)  # [S, D]
+    send_sizes = need_out.sum(axis=0, dtype=jnp.int32)
     pos_out = jnp.cumsum(need_out, axis=0, dtype=jnp.int32) - 1
     slot_out = jnp.where(need_out, region[None, :] + pos_out, slots)
     send_index = (
@@ -150,26 +197,17 @@ def ragged_a2a_moe_local(
     )
 
     # Incoming: source s's region holds its tokens that need this rank, in
-    # its token order; rows past its count stay empty.
-    need_in = jnp.take(need, dp_pos, axis=2)  # [D, S]
+    # its token order; rows past its count read no route.
+    need_in = (member_index(gathered_ids) == dp_pos).any(axis=2)  # [D, S]
+    recv_sizes = need_in.sum(axis=1, dtype=jnp.int32)
     pos_in = jnp.cumsum(need_in, axis=1, dtype=jnp.int32) - 1
     slot_in = jnp.where(need_in, region[:, None] + pos_in, slots)
     source_row = (
-        jnp.zeros((slots,), jnp.int32)
+        jnp.full((slots,), slots, jnp.int32)
         .at[slot_in.reshape(-1)]
         .set((region[:, None] + token[None, :]).reshape(-1), mode="drop")
     )
-    filled = (jnp.arange(slots, dtype=jnp.int32) % num_tokens) < jnp.repeat(
-        recv_sizes, num_tokens, total_repeat_length=slots
-    )
-    recv_ids = jnp.where(
-        filled[:, None], gathered_ids.reshape(slots, topk)[source_row], -1
-    )
-    recv_weights = jnp.where(
-        filled[:, None],
-        gathered_weights.reshape(slots, topk)[source_row],
-        jnp.zeros((), gathered_weights.dtype),
-    )
+    recv_ids, recv_weights = read_routes(source_row)
 
     sent = _tile_rows(x[send_index])
     received = jax.lax.ragged_all_to_all(
@@ -214,6 +252,8 @@ def ragged_a2a_moe_local(
         send_sizes,
         axis_name=DP_AXIS,
     ).reshape(slots, hidden)
+    # A zero row, not a fill-mode gather: with the fill, XLA added the members'
+    # partials below in bf16 rather than f32.
     back = jnp.concatenate([back, jnp.zeros((1, hidden), back.dtype)], axis=0)
     rows = back[slot_out.T]  # [D, S, H]; tokens that skipped d read the zero row
     return rows.astype(jnp.float32).sum(axis=0).astype(x.dtype)

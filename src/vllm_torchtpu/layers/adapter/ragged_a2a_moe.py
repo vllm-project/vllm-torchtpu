@@ -28,6 +28,7 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter.fused_moe import _decode_routed_rows
 from vllm_torchtpu.layers.core.fused_moe_gmm import resolve_onehot_permute_threshold
 from vllm_torchtpu.layers.core.ragged_a2a_moe import DP_AXIS, TP_AXIS, ragged_a2a_moe
 from vllm_torchtpu.logger import init_logger
@@ -91,13 +92,17 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
     if op is not None:
         return op
     mesh = get_dp_tp_mesh()
+    # Each rank receives into one region per DP member, sized for all of that
+    # member's tokens: the local permute sees the all-gather path's rows.
+    decode_routed_rows = _decode_routed_rows(topk)
+    onehot_threshold = resolve_onehot_permute_threshold(decode_routed_rows)
     run = functools.partial(
         ragged_a2a_moe,
         mesh=mesh,
         topk=topk,
         activation=activation,
         use_sparse_core=envs.USE_MOE_SPARSE_CORE,
-        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+        onehot_moe_permute_threshold=onehot_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
     )
@@ -130,11 +135,14 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
     op.register_fake(lambda x, *args, **kwargs: torch.empty_like(x))
     _OPS[key] = op
     logger.info_once(
-        "Ragged A2A MoE armed | topk=%d activation=%s dp=%d tp=%d",
+        "Ragged A2A MoE armed | topk=%d activation=%s dp=%d tp=%d | one-hot "
+        "permute threshold %d routed rows (full decode step: %d routed rows)",
         topk,
         activation,
         mesh.shape[DP_AXIS],
         mesh.shape[TP_AXIS],
+        onehot_threshold,
+        decode_routed_rows,
     )
     return op
 

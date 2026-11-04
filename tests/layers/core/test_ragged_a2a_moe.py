@@ -30,6 +30,8 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 from vllm_torchtpu.layers.core.ragged_a2a_moe import (
     DP_AXIS,
     TP_AXIS,
+    _gather_routing,
+    _tile_rows,
     exchange_need,
     ragged_a2a_moe,
 )
@@ -79,6 +81,53 @@ def test_exchange_need_matches_brute_force(dp_size, tp_size):
         )
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("weight_dtype", [jnp.bfloat16, jnp.float32])
+def test_gather_routing_reads_rows_and_empty_slots(weight_dtype):
+    """Rows read the gathered routing bitwise; out-of-range rows read id -1
+    with weight +0.0."""
+    devices = jax.devices()
+    if len(devices) < 2:
+        pytest.skip("needs 2 devices")
+    mesh = Mesh(np.asarray(devices[:2]), (DP_AXIS,))
+    rng = np.random.default_rng(0)
+    ids = rng.integers(-1, 512, size=(2, 6, TOPK)).astype(np.int32)
+    weights = rng.standard_normal((2, 6, TOPK)).astype(np.float32)
+    weights[0, 0, 0] = -0.0
+    weights = jnp.asarray(weights).astype(weight_dtype)
+    rows = jnp.asarray([[11, 0, 12, 5, 6, 13]] * 2, jnp.int32)
+
+    def body(i, w, r):
+        gathered_ids, read = _gather_routing(i[0], w[0])
+        got_ids, got_weights = read(r[0])
+        return gathered_ids[None], got_ids[None], got_weights[None]
+
+    spec = P(DP_AXIS)
+    gathered, got_ids, got_weights = jax.jit(
+        jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(spec,) * 3,
+            out_specs=(spec,) * 3,
+            check_vma=False,
+        )
+    )(jnp.asarray(ids), weights, rows)
+    # Compare on the host: device-side indexing may drop the sign of -0.0.
+    gathered, got_ids = np.asarray(gathered), np.asarray(got_ids)
+    got_bits = np.asarray(got_weights).view(np.uint8)
+    flat_ids = ids.reshape(12, TOPK)
+    flat_bits = np.asarray(weights).reshape(12, TOPK).view(np.uint8)
+    for rank in range(2):
+        np.testing.assert_array_equal(gathered[rank], ids)
+        for j, row in enumerate(np.asarray(rows[rank])):
+            if row < 12:
+                np.testing.assert_array_equal(got_ids[rank, j], flat_ids[row])
+                np.testing.assert_array_equal(got_bits[rank, j], flat_bits[row])
+            else:
+                assert (got_ids[rank, j] == -1).all()
+                assert (got_bits[rank, j] == 0).all()
+
+
 def _require_eight_tpu_devices():
     devices = jax.devices()
     if devices[0].platform != "tpu" or len(devices) < 8:
@@ -111,6 +160,131 @@ def _allgather_moe_local(
     return jax.lax.psum_scatter(out, DP_AXIS, scatter_dimension=0, tiled=True)
 
 
+def _previous_gather_routing(topk_ids, topk_weights):
+    if topk_weights.dtype != jnp.bfloat16:
+        return (
+            jax.lax.all_gather(topk_ids, DP_AXIS),
+            jax.lax.all_gather(topk_weights, DP_AXIS),
+        )
+    bits = jax.lax.bitcast_convert_type(topk_weights, jnp.uint16).astype(jnp.int32)
+    packed = jax.lax.all_gather(jnp.left_shift(topk_ids, 16) | bits, DP_AXIS)
+    weights = jax.lax.bitcast_convert_type(
+        jnp.bitwise_and(packed, 0xFFFF).astype(jnp.uint16), jnp.bfloat16
+    )
+    return jnp.right_shift(packed, 16), weights
+
+
+def _previous_ragged_a2a_moe_local(
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    topk_weights,
+    topk_ids,
+    experts_start,
+    *,
+    tp_size,
+    dp_size,
+    topk,
+    activation,
+    use_sparse_core,
+    onehot_moe_permute_threshold,
+    rhs_quant_dtype=None,
+    skip_padded_tokens=False,
+):
+    """The exchange as first built (one routing gather, per-member slices)."""
+    num_tokens, hidden = x.shape
+    local_num_experts = w1.shape[0]
+    ep_rank = experts_start[0] // local_num_experts
+    dp_pos = ep_rank // tp_size
+    slots = dp_size * num_tokens
+
+    gathered_ids, gathered_weights = _previous_gather_routing(topk_ids, topk_weights)
+    need = exchange_need(
+        gathered_ids, ep_rank, tp_size=tp_size, local_num_experts=local_num_experts
+    )
+    counts = need.sum(axis=1, dtype=jnp.int32)
+    send_sizes = jnp.take(counts, dp_pos, axis=0)
+    recv_sizes = jnp.take(counts, dp_pos, axis=1)
+    member = jnp.arange(dp_size, dtype=jnp.int32)
+    token = jnp.arange(num_tokens, dtype=jnp.int32)
+    region = member * num_tokens
+    landing = jnp.full((dp_size,), dp_pos * num_tokens, dtype=jnp.int32)
+
+    need_out = jnp.take(need, dp_pos, axis=0)
+    pos_out = jnp.cumsum(need_out, axis=0, dtype=jnp.int32) - 1
+    slot_out = jnp.where(need_out, region[None, :] + pos_out, slots)
+    send_index = (
+        jnp.zeros((slots,), jnp.int32)
+        .at[slot_out.reshape(-1)]
+        .set(jnp.broadcast_to(token[:, None], need_out.shape).reshape(-1), mode="drop")
+    )
+
+    need_in = jnp.take(need, dp_pos, axis=2)
+    pos_in = jnp.cumsum(need_in, axis=1, dtype=jnp.int32) - 1
+    slot_in = jnp.where(need_in, region[:, None] + pos_in, slots)
+    source_row = (
+        jnp.zeros((slots,), jnp.int32)
+        .at[slot_in.reshape(-1)]
+        .set((region[:, None] + token[None, :]).reshape(-1), mode="drop")
+    )
+    filled = (jnp.arange(slots, dtype=jnp.int32) % num_tokens) < jnp.repeat(
+        recv_sizes, num_tokens, total_repeat_length=slots
+    )
+    recv_ids = jnp.where(
+        filled[:, None], gathered_ids.reshape(slots, topk)[source_row], -1
+    )
+    recv_weights = jnp.where(
+        filled[:, None],
+        gathered_weights.reshape(slots, topk)[source_row],
+        jnp.zeros((), gathered_weights.dtype),
+    )
+
+    sent = _tile_rows(x[send_index])
+    received = jax.lax.ragged_all_to_all(
+        sent,
+        jnp.zeros_like(sent),
+        region,
+        send_sizes,
+        landing,
+        recv_sizes,
+        axis_name=DP_AXIS,
+    ).reshape(slots, hidden)
+    partial = fused_moe_func(
+        received,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        None,
+        None,
+        recv_weights,
+        recv_ids,
+        experts_start=experts_start[0],
+        topk=topk,
+        activation=activation,
+        use_ep=True,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    returned = _tile_rows(partial)
+    back = jax.lax.ragged_all_to_all(
+        returned,
+        jnp.zeros_like(returned),
+        region,
+        recv_sizes,
+        landing,
+        send_sizes,
+        axis_name=DP_AXIS,
+    ).reshape(slots, hidden)
+    back = jnp.concatenate([back, jnp.zeros((1, hidden), back.dtype)], axis=0)
+    rows = back[slot_out.T]
+    return rows.astype(jnp.float32).sum(axis=0).astype(x.dtype)
+
+
 def _inputs(num_ranks, tp_size, num_tokens, num_experts, *, skew):
     key = jax.random.key(num_ranks * 100 + num_tokens + skew)
     kx, kl, k1, k2 = jax.random.split(key, 4)
@@ -139,19 +313,30 @@ def _inputs(num_ranks, tp_size, num_tokens, num_experts, *, skew):
     return x, w1, w2, s1, s2, weights.astype(jnp.bfloat16), ids.astype(jnp.int32), es
 
 
+def _onehot_threshold(rule, dp_size, num_tokens):
+    """``auto``: the SparseCore-block default; ``decode``: raised to this
+    step's routed rows, as the adapters resolve it for a decode step."""
+    if rule == "auto":
+        return resolve_onehot_permute_threshold()
+    return resolve_onehot_permute_threshold(dp_size * num_tokens * TOPK)
+
+
 @pytest.mark.multichip
+@pytest.mark.parametrize("threshold", ["auto", "decode"])
 @pytest.mark.parametrize(
     "dp_size,tp_size,num_tokens,skew",
     [
         (2, 4, 12, False),  # proxy layout, decode batch below the one-hot cap
-        (2, 4, 48, False),  # proxy layout, 960 routed rows (SparseCore permute)
+        (2, 4, 48, False),  # proxy layout, 960 routed rows
         (2, 4, 12, True),
         (4, 2, 12, False),
         (8, 1, 12, False),
         (8, 1, 12, True),
     ],
 )
-def test_ragged_a2a_matches_allgather_path(dp_size, tp_size, num_tokens, skew):
+def test_ragged_a2a_matches_allgather_path(
+    dp_size, tp_size, num_tokens, skew, threshold
+):
     devices = _require_eight_tpu_devices()
     mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
     num_experts = 64
@@ -159,7 +344,7 @@ def test_ragged_a2a_matches_allgather_path(dp_size, tp_size, num_tokens, skew):
     kw = dict(
         activation="silu",
         use_sparse_core=True,
-        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+        onehot_moe_permute_threshold=_onehot_threshold(threshold, dp_size, num_tokens),
     )
     spec = P((DP_AXIS, TP_AXIS))
     reference = jax.jit(
@@ -186,3 +371,70 @@ def test_ragged_a2a_matches_allgather_path(dp_size, tp_size, num_tokens, skew):
         np.testing.assert_array_equal(ragged, reference)
     else:
         np.testing.assert_allclose(ragged, reference, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize(
+    "dp_size,tp_size,num_tokens,skew,weight_dtype,padded",
+    [
+        (2, 4, 48, False, jnp.bfloat16, False),  # proxy decode step, 960 rows
+        (2, 4, 12, False, jnp.bfloat16, False),
+        (2, 4, 48, True, jnp.bfloat16, False),
+        (2, 4, 48, False, jnp.float32, False),  # unpacked routing gather
+        (2, 4, 48, False, jnp.bfloat16, True),  # zero-weight padded tokens
+        (4, 2, 24, False, jnp.bfloat16, False),
+        (8, 1, 12, True, jnp.bfloat16, False),
+    ],
+)
+def test_ragged_a2a_matches_previous_exchange(
+    dp_size, tp_size, num_tokens, skew, weight_dtype, padded
+):
+    """Bitwise the exchange as first built, which permuted with the SparseCore
+    kernels above the auto threshold: with that threshold, and with the
+    decode-step threshold that moves the local permute to one-hot matmuls."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, w1, w2, s1, s2, weights, ids, es = _inputs(8, tp_size, num_tokens, 64, skew=skew)
+    weights = weights.astype(weight_dtype)
+    if padded:
+        # Padded tokens keep their expert ids but carry zero routing weights.
+        weights = weights.reshape(8, num_tokens, TOPK).at[:, -5:].set(0)
+        weights = weights.reshape(-1, TOPK)
+    args = (x, w1, w2, s1, s2, weights, ids, es)
+    common = dict(
+        topk=TOPK, activation="silu", use_sparse_core=True, skip_padded_tokens=padded
+    )
+    previous_local = functools.partial(
+        _previous_ragged_a2a_moe_local,
+        tp_size=tp_size,
+        dp_size=dp_size,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+        **common,
+    )
+    spec = P((DP_AXIS, TP_AXIS))
+    previous = jax.jit(
+        jax.shard_map(
+            lambda *a: previous_local(*a[:7], a[7].reshape(1)),
+            mesh=mesh,
+            in_specs=(spec,) * 8,
+            out_specs=spec,
+            check_vma=False,
+        )
+    )(*args)
+    assert np.isfinite(np.asarray(previous, np.float32)).all()
+    assert np.abs(np.asarray(previous, np.float32)).max() > 0
+    previous = np.asarray(previous).view(np.uint16)
+    stacked = tuple(a.reshape(dp_size, tp_size, -1, *a.shape[1:]) for a in args)
+    for rule in ("auto", "decode"):
+        got = jax.jit(
+            functools.partial(
+                ragged_a2a_moe,
+                mesh=mesh,
+                onehot_moe_permute_threshold=_onehot_threshold(
+                    rule, dp_size, num_tokens
+                ),
+                **common,
+            )
+        )(*stacked)
+        got = np.asarray(got).reshape(previous.shape[0], -1).view(np.uint16)
+        np.testing.assert_array_equal(got, previous, err_msg=rule)
