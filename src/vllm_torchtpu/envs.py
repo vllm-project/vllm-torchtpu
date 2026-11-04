@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
+    TPU_PRECOMPILE_ASYNC: bool = False
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
@@ -917,6 +918,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PRECOMPILE_PEER_WAIT_S": env_nonnegative_float(
         "TPU_PRECOMPILE_PEER_WAIT_S", 600.0
     ),
+    # Under TPU_PRECOMPILE_PEER_REPLAY, compile the buckets a rank owns at
+    # once on torch_tpu's async compile pool: they are traced one after
+    # another on the calling thread and their XLA compiles overlap. Off
+    # compiles a rank's buckets one after another. Default off until peak host
+    # RAM from 2-3 concurrent XLA compiles per rank (across all 8 ranks of a
+    # host) is validated on the largest models (such as Qwen3.5-397B at DP8
+    # and DeepSeek-V4); becomes the default under peer replay once validated.
+    "TPU_PRECOMPILE_ASYNC": env_bool("TPU_PRECOMPILE_ASYNC", default=False),
     # With shape-specialized backbone traces (one per token-bucket group, see
     # compilation/shape_variants.py), trace every group before compiling any
     # bucket, then compile all buckets at once across the host's ranks

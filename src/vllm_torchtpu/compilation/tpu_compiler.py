@@ -21,6 +21,7 @@ pipeline. Each shape bucket gets its own compiled executable.
 import contextlib
 import copy
 import dataclasses
+import functools
 import glob
 import hashlib
 import importlib.util
@@ -205,6 +206,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
     "TPU_PRECOMPILE_BIGGEST_FIRST",
+    "TPU_PRECOMPILE_ASYNC",
     "TPU_PRECOMPILE_PEER_REPLAY",
     "TPU_PRECOMPILE_PEER_WAIT_S",
     "TPU_PRECOMPILE_TRACE_FIRST",
@@ -539,6 +541,49 @@ def _single_size(compile_range: Range) -> int | None:
     return compile_range.start if compile_range.is_single_size() else None
 
 
+def artifact_key(compile_range: Range, graph_index: int) -> str:
+    """The cache key `CompilerManager.compile` builds for a bucket."""
+    return (
+        f"artifact_compile_range_{compile_range.start}_{compile_range.end}"
+        f"_subgraph_{graph_index}"
+    )
+
+
+class _AsyncRunnable:
+    """Run an async-compiled TpuBackend runnable as if it were compiled in line.
+
+    Under `async_compile` the runnable's first call raises
+    AsyncCompilationSubmitted instead of running, so as not to block on the
+    compile that call would otherwise wait for. Here that call waits for the
+    compile and runs the program; nothing ran before the signal was raised.
+    """
+
+    def __init__(self, fn: Callable[..., Any]) -> None:
+        self._fn = fn
+        self._resolved = False
+
+    def wait(self) -> None:
+        if self._resolved:
+            return
+        from torch_tpu._internal.compile._backend import AsyncCompilationSubmitted
+
+        self._resolved = True
+        try:
+            self._fn()
+        except AsyncCompilationSubmitted as submitted:
+            submitted.resolve()
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        from torch_tpu._internal.compile._backend import AsyncCompilationSubmitted
+
+        try:
+            return self._fn(*args, **kwargs)
+        except AsyncCompilationSubmitted as submitted:
+            self._resolved = True
+            submitted.resolve()
+            return self._fn(*args, **kwargs)
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -552,6 +597,11 @@ class TpuCompilerAdaptor(CompilerInterface):
     def __init__(self):
         self.cache_dir: str | None = None
         self._disable_cache = False
+        # Buckets `prebuild` submitted ahead of vLLM asking for them, keyed by
+        # (artifact key, id of the graph they were built from): a callable
+        # finishing the compile, or a result that needed no backend.
+        self._prebuilt: dict[tuple[str, int], Any] = {}
+        self._prebuilt_lock = threading.Lock()
 
     def initialize_cache(
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
@@ -579,6 +629,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         self,
         graph: fx.GraphModule,
         example_inputs: list[Any],
+        async_compile: bool = False,
     ) -> tuple[Callable[..., Any], Any | None]:
         """Compile `graph` with TpuBackend, and grab its serializable entry.
 
@@ -589,6 +640,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         caller applies the `_ensure_tuple_output` unwrap. `entry` is None when
         the backend attached no `serialize`, which it skips for dynamic-symint
         graphs and in debug mode (see TpuBackend.__call__).
+
+        With `async_compile`, TpuBackend returns once the graph is traced and
+        leaves MLIR lowering and the XLA compile to its own background pool
+        (torch_tpu's `async_compile` option): the entry is returned at once and
+        pickling it waits for that compile. The runnable resolves the compile on
+        its first call instead of raising torch_tpu's warmup signal.
         """
         # `_tpu_backend` calls detect_fake_mode(), which asserts a single
         # FakeTensorMode. The Dynamo tracing context's mode differs from the
@@ -616,9 +673,20 @@ class TpuCompilerAdaptor(CompilerInterface):
         # rank already put in the Tier-2 cache.
         from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
 
-        config.reset_scheduling_group_ids()
+        # Not under async_compile: the previous program may still be lowering
+        # on torch_tpu's pool, and restarting the ids under it could hand two
+        # of its groups one id. Its ids then depend on what this process built
+        # before, which only costs a cross-rank Tier-2 hit: under peer replay
+        # the other ranks replay this rank's artifact rather than compile it.
+        if not async_compile:
+            config.reset_scheduling_group_ids()
         with torch._guards.tracing(tracing_ctx):
-            compiled_fn = _tpu_backend(graph, example_inputs)
+            if async_compile:
+                compiled_fn = _tpu_backend(
+                    graph, example_inputs, options={"async_compile": True}
+                )
+            else:
+                compiled_fn = _tpu_backend(graph, example_inputs)
 
         # Read `serialize` off the object TpuBackend returned, before any
         # wrapping: the unwrap below replaces it with a plain closure that does
@@ -634,6 +702,8 @@ class TpuCompilerAdaptor(CompilerInterface):
                     "not be cached: %s",
                     e,
                 )
+        if async_compile:
+            compiled_fn = _AsyncRunnable(compiled_fn)
         return compiled_fn, entry
 
     def _save_handle(
@@ -879,6 +949,31 @@ class TpuCompilerAdaptor(CompilerInterface):
         Returning `(fn, None)` means "usable now, but nothing was persisted" --
         vLLM will call `compile` again next run.
         """
+        # Submitted ahead of time (see `prebuild`): finish it and hand it over.
+        if key is not None:
+            with self._prebuilt_lock:
+                prebuilt = self._prebuilt.pop((key, id(graph)), None)
+            if prebuilt is not None:
+                return prebuilt() if callable(prebuilt) else prebuilt
+        result = self._compile(graph, example_inputs, compile_range, key)
+        assert not callable(result)
+        return result
+
+    def _compile(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        compile_range: Range,
+        key: str | None = None,
+        async_compile: bool = False,
+    ) -> tuple[Callable[..., Any] | None, Any | None] | Callable[[], Any]:
+        """`compile`, minus the hand-over of a prebuilt bucket.
+
+        With `async_compile`, a bucket that needs the backend comes back as a
+        zero-argument callable once its graph is traced: calling it waits for
+        the XLA compile, persists the artifact and returns what `compile`
+        would. A bucket served without the backend comes back as usual.
+        """
         # A bucket this graph cannot serve, or one an earlier trace of the same
         # model already built, is not compiled here (see shape_variants).
         size = _single_size(compile_range)
@@ -939,8 +1034,41 @@ class TpuCompilerAdaptor(CompilerInterface):
                 shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
             return compiled_fn, handle
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
+        compiled_fn, entry = self._run_backend(graph, example_inputs, async_compile)
+        finish = functools.partial(
+            self._finish_compile,
+            compiled_fn,
+            entry,
+            graph,
+            was_wrapped,
+            caching,
+            fingerprint,
+            compile_range,
+            key,
+            size,
+        )
+        return finish if async_compile else finish()
 
+    def _finish_compile(
+        self,
+        compiled_fn: Callable[..., Any],
+        entry: Any | None,
+        graph: fx.GraphModule,
+        was_wrapped: bool,
+        caching: bool,
+        fingerprint: str | None,
+        compile_range: Range,
+        key: str | None,
+        size: int | None,
+    ) -> tuple[Callable[..., Any], Any | None]:
+        """The rest of `_compile` once the backend has run: unwrap, persist
+        and offer the bucket. Pickling an async entry waits for its compile;
+        when no artifact is saved (`entry is None`, caching off, or pickling
+        failed because the async compile failed), `wait` finishes the compile
+        and surfaces any compile error before handing the bucket over."""
+        async_runnable = (
+            compiled_fn if isinstance(compiled_fn, _AsyncRunnable) else None
+        )
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the
             # single tensor the original graph returned.
@@ -960,7 +1088,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # recompile path in `load`, not this one.
         handle = None
         if caching and entry is not None:
-            assert self.cache_dir is not None
+            assert self.cache_dir is not None and key is not None
             save_path = os.path.join(self.cache_dir, key)
             if self._save_handle(
                 key, save_path, entry, graph, was_wrapped, fingerprint
@@ -980,6 +1108,8 @@ class TpuCompilerAdaptor(CompilerInterface):
                 self._mark_failed(key, fingerprint)
             else:
                 self._clear_failed(key)
+        if handle is None and async_runnable is not None:
+            async_runnable.wait()
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
@@ -987,6 +1117,62 @@ class TpuCompilerAdaptor(CompilerInterface):
         if key is not None and size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn, handle
+
+    def prebuild(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        compile_range: Range,
+        key: str,
+    ) -> bool:
+        """Trace a bucket now and leave its XLA compile running in the
+        background, for the `compile` call vLLM makes for it later.
+
+        Calling this for several buckets in a row runs their XLA compiles at
+        once on torch_tpu's async compile pool, each overlapping the tracing of
+        the next. The serial CompilerManager.compile that follows gets each
+        bucket back from `compile`, which waits for its compile and persists it
+        as `compile` always does: both run `_compile`, so the result is the
+        same.
+
+        True if the bucket was submitted. A failure is logged and leaves the
+        bucket to the serial `compile`, which then reports it as before.
+        """
+        try:
+            result = self._compile(
+                graph, example_inputs, compile_range, key, async_compile=True
+            )
+        except Exception:
+            logger.warning(
+                "[TpuCompilerAdaptor] Prebuild of range %s failed; it will be "
+                "compiled serially",
+                compile_range,
+                exc_info=True,
+            )
+            return False
+        with self._prebuilt_lock:
+            self._prebuilt[(key, id(graph))] = result
+        return True
+
+    def discard_prebuilt(self, graph: fx.GraphModule) -> None:
+        """Drop prebuilt buckets of `graph` that vLLM never asked for."""
+        with self._prebuilt_lock:
+            dropped = [
+                (k[0], self._prebuilt.pop(k))
+                for k in list(self._prebuilt)
+                if k[1] == id(graph)
+            ]
+        for _, prebuilt in dropped:
+            if isinstance(prebuilt, functools.partial) and isinstance(
+                prebuilt.args[0], _AsyncRunnable
+            ):
+                with contextlib.suppress(Exception):
+                    prebuilt.args[0].wait()
+        if dropped:
+            logger.warning_once(
+                "[TpuCompilerAdaptor] Dropping unclaimed prebuilt bucket(s): %s",
+                ", ".join(key for key, _ in dropped),
+            )
 
     def load(
         self,
