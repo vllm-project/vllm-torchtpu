@@ -275,6 +275,7 @@ def fused_ep_moe_push(
     table_kernel=False,
     exchange_tables=False,
     kernel_plan_tables=False,
+    i32_scale_slab=False,
     staging_slots=0,
     expert_slot=None,
     expert_load=None,
@@ -316,8 +317,9 @@ def fused_ep_moe_push(
     (plan_kernel.build_push_tables) -- inside the routing-exchange kernel,
     while its row copies finish, with `exchange_tables`; with
     `kernel_plan_tables` the plan's small tables come from that kernel too
-    (host.routing_pairs_from_tables). The caller
-    (layers/adapter/fused_moe_ep.py) reads all eighteen from envs.
+    (host.routing_pairs_from_tables); `i32_scale_slab` hands the expert
+    kernel the scale slab's i32 bit patterns to bitcast in VMEM. The caller
+    (layers/adapter/fused_moe_ep.py) reads all nineteen from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -508,6 +510,7 @@ def fused_ep_moe_push(
         hbm_staging=hbm_staging,
         dispatch_ahead=dispatch_ahead,
         staging_slots=int(staging_slots),
+        act_scale_bits=bool(i32_scale_slab),
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -817,12 +820,14 @@ def fused_ep_moe_push(
                 else jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             )
             scale_rows = act_scale_slab_rows(ragged_stride)
-            scale_slab = lax.bitcast_convert_type(
+            scale_slab = (
                 jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
                 .at[slab_row]
-                .add(scale_bits, mode="drop"),
-                jnp.float32,
-            ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+                .add(scale_bits, mode="drop")
+                .reshape(scale_rows, HIDDEN_LANE_BLOCK)
+            )
+            if not i32_scale_slab:
+                scale_slab = lax.bitcast_convert_type(scale_slab, jnp.float32)
         else:
             scale_slab = None
         if shard_tables is not None:
@@ -1058,6 +1063,7 @@ def fused_ep_moe_push(
         bool(table_kernel),
         bool(exchange_tables),
         bool(kernel_plan_tables),
+        bool(i32_scale_slab),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

@@ -119,6 +119,7 @@ def _build_push_moe_kernel(
     hbm_staging=False,
     dispatch_ahead=1,
     staging_slots=0,
+    act_scale_bits=False,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -171,6 +172,10 @@ def _build_push_moe_kernel(
     that ships tiles straight from VMEM N staging slots instead of two, so
     the tile loop can run N tiles ahead of the fabric before a slot-reuse
     guard waits, with no HBM round trip. The activation slots stay two.
+
+    `act_scale_bits=True` takes the activation scale slab as the i32 bit
+    patterns of the scales (what the layer's scatter writes) and bitcasts
+    each tile's column in VMEM, so no bitcast copy of the slab runs first.
     """
     if staging_slots and hbm_staging:
         raise ValueError("staging_slots stages in VMEM; hbm_staging stages in HBM")
@@ -1217,6 +1222,9 @@ def _build_push_moe_kernel(
                         if has_act_scale
                         else None
                     )
+                    if act_scales is not None and act_scale_bits:
+                        # The slab holds the scales' bit patterns.
+                        act_scales = lax.bitcast_convert_type(act_scales, jnp.float32)
                     w1b_row = (
                         cast(jax.Ref, w1b_vm)[pl.ds(e, 1), :] if has_w1_bias else None
                     )
@@ -1634,7 +1642,7 @@ def _build_push_moe_kernel(
                 (out_slots, *shape[1:])
                 if deep_staging and name in ("out_vm", "oscl_vm")
                 else shape,
-                dtype,
+                jnp.int32 if act_scale_bits and name == "ls_vm" else dtype,
             )
             for name, shape, dtype in host.vmem_scratch_arrays(
                 g_local,
@@ -1760,6 +1768,7 @@ def _build_push_moe_kernel(
             f"{'_hbmst' if hbm_staging else ''}"
             f"{'' if dispatch_ahead == 1 else f'_da{dispatch_ahead}'}"
             f"{f'_st{out_slots}' if deep_staging else ''}"
+            f"{'_lsbits' if act_scale_bits else ''}"
         )
         return pl.pallas_call(
             kernel,

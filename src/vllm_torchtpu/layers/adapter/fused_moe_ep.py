@@ -224,6 +224,7 @@ def _build_op(
             table_kernel=envs.MOE_FUSED_EP_PUSH_TABLE_KERNEL,
             exchange_tables=envs.MOE_FUSED_EP_PUSH_EXCHANGE_TABLES,
             kernel_plan_tables=envs.MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES,
+            i32_scale_slab=envs.MOE_FUSED_EP_PUSH_I32_SCALE_SLAB,
             staging_slots=envs.MOE_FUSED_EP_PUSH_STAGING_SLOTS,
         )
 
