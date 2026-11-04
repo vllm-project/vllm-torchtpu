@@ -37,7 +37,8 @@ class KernelConfig:
     # the prefill's regrouped layout; each expert runs as two TP4-width halves).
     decode_expert_parallel: int = 8
     # Decode experts resident as the prefill's per-group banks (rank_loader.
-    # bank_expert_parts) so an aggregate prefill shares them banked.
+    # bank_expert_parts) so an aggregate prefill shares them banked. Does not
+    # run yet: the plain step then exceeds torch's 64-operand op limit.
     decode_expert_banks: bool = False
     mxfp4_block: int = 2048
     mxfp4_pair_tile: int = 512
