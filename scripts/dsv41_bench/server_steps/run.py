@@ -117,6 +117,9 @@ def main() -> None:
     parser.add_argument("--head-address")
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
+    # Development iterations only: compile caches keyed by program content cut
+    # the ~23 min startup compile to the changed programs. Formal runs omit it.
+    parser.add_argument("--compile-cache", type=Path)
     args = parser.parse_args()
     multihost = args.scenario == "decode_dp16"
     worker = multihost and args.host_rank == 1
@@ -173,6 +176,25 @@ def main() -> None:
         TORCH_TPU_TIER2_COMPILATION_CACHE="disabled",
         TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="disabled",
     )
+    if args.compile_cache:
+        # Only executable caches keyed by program content; vLLM's and
+        # Inductor's graph caches stay off so a source edit cannot reuse them.
+        # Tier 2 lives under /dev/shm by name; a symlink keeps it on disk.
+        cache = args.compile_cache.resolve()
+        tier2_name = "dsv41-dev"
+        tier2_link = Path("/dev/shm/torch_tpu_cache") / tier2_name
+        (cache / "tier2").mkdir(parents=True, exist_ok=True)
+        tier2_link.parent.mkdir(parents=True, exist_ok=True)
+        if not tier2_link.is_symlink():
+            tier2_link.symlink_to(cache / "tier2")
+        elif tier2_link.resolve() != cache / "tier2":
+            parser.error(f"{tier2_link} points elsewhere")
+        env.update(
+            JAX_ENABLE_COMPILATION_CACHE="true",
+            JAX_COMPILATION_CACHE_DIR=str(cache / "jax"),
+            TORCH_TPU_TIER2_COMPILATION_CACHE=tier2_name,
+            TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=str(cache / "tier3"),
+        )
     env["KV_BYTES"] = "auto"
     env["MOE_FUSED_EP_PREPROCESS_BACKEND"] = "topology" if decode else "native"
     # Steady target verification is exactly local_concurrency * (K + 1) rows;
@@ -261,10 +283,14 @@ def main() -> None:
     manifest = {
         "scenario": args.scenario,
         "compile_sizes": buckets,
-        "cache_mode": "disabled",
+        "cache_mode": f"persistent:{args.compile_cache}"
+        if args.compile_cache
+        else "disabled",
         "serialization": "enabled",
         "engram_transfer": "raw_dma",
-        "tier2": "disabled (public and internal)",
+        "tier2": "dsv41-dev"
+        if args.compile_cache
+        else "disabled (public and internal)",
         "packages": {
             name: importlib.metadata.version(name)
             for name in [
