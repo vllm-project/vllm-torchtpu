@@ -101,6 +101,11 @@ Template settings go in `VLLM_TPU_MEGAKERNEL` (`k=v,k=v` or JSON) or
 `--additional-config '{"megakernel": {"options": {...}}}'`: `profile`,
 `mode` (`ep` / `tp`), `buckets`, `verify_buckets`, `fused_pool_io`,
 `pool_gather`, `compile_hlo_check`. Runtime settings: `stats_period_s`, `ab`.
+Per key the later source wins (`additional_config` over the environment).
+The last source that turns the megakernel on or off explicitly (`0` / `1`,
+`ep` / `tp`, the shorthand, `enabled=...` or a `plugin`) decides; without
+one, any setting turns it on. So `VLLM_TPU_MEGAKERNEL=0` stays off whatever
+settings `additional_config` adds, unless it sets `enabled` or a `plugin`.
 
 ### 4. Smoke (real checkpoint, decode + MTP)
 

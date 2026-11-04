@@ -16,11 +16,13 @@ driver with a missing shorthand template."""
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+import vllm_torchtpu.megakernel_runtime.driver as driver_mod
 from vllm_torchtpu.megakernel_runtime import config as cfg_mod
 from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
 
@@ -94,17 +96,52 @@ def _template_profile_names(monkeypatch: pytest.MonkeyPatch) -> None:
             )
 
 
+def _enabled_by_rule(*sources: Any) -> bool:
+    """`enabled` by the config's documented rule, independently of it: the
+    last explicit on / off, else on when any source configures anything."""
+    explicit: bool | None = None
+    configured = False
+    for src in sources:
+        if src is None:
+            continue
+        if isinstance(src, bool):
+            explicit = src
+            continue
+        if isinstance(src, str):
+            low = src.strip().lower()
+            if not low:
+                continue
+            if low in ("0", "false", "no", "off", "none"):
+                explicit = False
+                continue
+            if low in ("1", "true", "yes", "on", "ep", "tp"):
+                explicit = True
+                continue
+            if low.startswith("{"):
+                src = json.loads(src)
+            else:
+                src = dict(kv.split("=", 1) for kv in low.split(","))
+        configured = configured or any(v is not None for v in src.values())
+        if src.get("enabled") is not None:
+            explicit = cfg_mod.parse_bool(src["enabled"])
+        elif src.get("plugin") is not None:
+            explicit = True
+    return configured if explicit is None else explicit
+
+
 @pytest.mark.usefixtures("_template_profile_names")
 @pytest.mark.parametrize("env", _LEGACY_ENV)
 @pytest.mark.parametrize("add", _LEGACY_ADD)
 def test_legacy_inputs_match_parse_runtime_config(env: Any, add: Any) -> None:
-    """Legacy syntaxes resolve to what `parse_runtime_config` gave before: the
-    runtime keys directly, the template settings through `options`."""
+    """Legacy syntaxes resolve to what `parse_runtime_config` gives: the
+    runtime keys directly, the template settings through `options`. `enabled`
+    follows the runtime's rule instead: an earlier explicit off holds over a
+    later source's settings (`parse_runtime_config` turns such a source on)."""
     from vllm_torchtpu.megakernel.runtime import parse_runtime_config
 
     old = parse_runtime_config(env, add)
     new = cfg_mod.parse_config(env, add, raw_env=env)
-    assert new.enabled == old["enabled"]
+    assert new.enabled == _enabled_by_rule(env, add)
     assert new.ab == old["ab"] and new.stats_period_s == old["stats_period_s"]
     resolved = cfg_mod.resolve_plugin_ref(new, _QWEN_HF)
     assert resolved is not None
@@ -121,7 +158,6 @@ def test_missing_shorthand_template_leaves_the_megakernel_off(
     stays off: no error, no collective."""
     import logging
 
-    import vllm_torchtpu.megakernel_runtime.driver as driver_mod
     from vllm_torchtpu.megakernel_runtime import testing
 
     gone = plugin_mod.SHORTHANDS["qwen35"]._replace(

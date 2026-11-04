@@ -236,6 +236,55 @@ def test_additional_config_overrides_env_per_key() -> None:
     assert not cfg_mod.collect_config("", {"other": 1}).enabled
 
 
+def test_enabled_follows_the_last_explicit_source() -> None:
+    # An explicit off holds whatever settings a later source adds.
+    off = cfg_mod.parse_config("0", {"options": {"mode": "tp"}})
+    assert not off.enabled and dict(off.options) == {"mode": "tp"}
+    assert not cfg_mod.parse_config("ab=1", {"enabled": False}).enabled
+    assert not cfg_mod.parse_config({"enabled": False}, {"options": {"a": 1}}).enabled
+    assert not cfg_mod.parse_config("1", {"enabled": "0", "ab": True}).enabled
+    # Without an explicit on / off, any settings turn it on; nothing is off.
+    ab = cfg_mod.parse_config("ab=1")
+    assert ab.enabled and ab.ab
+    assert cfg_mod.parse_config({"options": {"mode": "tp"}}).enabled
+    assert cfg_mod.parse_config("", {"options": {"mode": "tp"}}).enabled
+    assert not cfg_mod.parse_config("", None).enabled
+    assert cfg_mod.parse_config(None, {"stats_period_s": 3}).enabled
+    assert not cfg_mod.parse_config().enabled
+    assert not cfg_mod.parse_config(None, {}).enabled
+    assert not cfg_mod.parse_config({"options": None}).enabled
+    # A plugin key without `enabled` counts as on; an explicit `enabled` wins.
+    assert cfg_mod.parse_config("0", {"plugin": "my.pkg"}).enabled
+    assert not cfg_mod.parse_config({"plugin": "my.pkg", "enabled": False}).enabled
+    assert not cfg_mod.parse_config({"plugin": "my.pkg"}, "0").enabled
+
+
+def test_mode_overrides_across_sources() -> None:
+    cfg = cfg_mod.parse_config("ep", {"options": {"mode": "tp"}})
+    assert cfg.enabled and dict(cfg.options) == {"mode": "tp"} and not cfg.legacy
+    cfg = cfg_mod.parse_config({"options": {"mode": "tp"}}, "ep")
+    assert dict(cfg.options) == {"mode": "ep"}
+    # A top-level template key and `options` override each other too.
+    cfg = cfg_mod.parse_config("ep", {"mode": "tp"})
+    assert not cfg.options and dict(cfg.legacy) == {"mode": "tp"}
+    cfg = cfg_mod.parse_config('{"mode": "tp"}', {"options": {"mode": "ep"}})
+    assert dict(cfg.options) == {"mode": "ep"} and not cfg.legacy
+    _, options = cfg_mod.resolve_plugin_ref(
+        cfg_mod.parse_config(_SHORTHAND, "ep", {"mode": "tp"})
+    )
+    assert options == {"mode": "tp"}
+    # Only one source setting a key both ways is an error.
+    with pytest.raises(MegakernelConfigError, match="both at top level"):
+        cfg_mod.parse_config({"mode": "tp", "options": {"mode": "ep"}})
+
+
+def test_ep_with_an_explicit_plugin() -> None:
+    cfg = cfg_mod.parse_config("ep", {"plugin": "my.pkg"})
+    ref, options = cfg_mod.resolve_plugin_ref(cfg)
+    assert (ref.module, ref.shorthand) == ("my.pkg", None)
+    assert options == {"mode": "ep"}
+
+
 def test_bare_shorthand_selects_its_template() -> None:
     for src in (_SHORTHAND, f" {_SHORTHAND.upper()} "):
         cfg = cfg_mod.parse_config(src)

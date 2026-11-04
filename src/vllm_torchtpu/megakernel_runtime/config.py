@@ -13,11 +13,15 @@
 # limitations under the License.
 """Megakernel runtime config and plugin loading (stdlib only).
 
-Sources, in order (per key the later one wins; `options` merges per key):
-`VLLM_TPU_MEGAKERNEL`, then `additional_config["megakernel"]`. Each is unset /
-a false string (off), a true string (on, plugin from the checkpoint's HF arch),
-`ep` / `tp` (on, `options.mode`), a shorthand template name (`plugin.SHORTHANDS`),
-a JSON object, or `k=v,k=v` (`:` separates list items; `options` needs JSON).
+Sources, in order: `VLLM_TPU_MEGAKERNEL`, then `additional_config["megakernel"]`.
+Each is unset (`None` or an empty string), a bool, a string or a mapping. A
+string is a false word (off), a true word (on, plugin from the checkpoint's HF
+arch), `ep` / `tp` (on, with `options.mode`), a shorthand template name
+(`plugin.SHORTHANDS`; on, with that plugin), a JSON object, or `k=v,k=v`
+(`options` needs JSON).
+
+Precedence is per key, the later source winning; `parse_config` states the
+rule, including how `enabled` is decided.
 
 Runtime keys: `plugin`, `options`, `enabled`, `ab`, `stats_period_s`. A
 top-level template key (e.g. `profile`) is forwarded into `options` only when
@@ -106,7 +110,21 @@ def _parse_plugin_ref(val: Any) -> str:
 
 
 def parse_config(*sources: Any, raw_env: Any = None) -> MegakernelConfig:
-    """Parse config sources (str, bool or mapping; `None` skipped) in order."""
+    """Parse config sources (str, bool or mapping; `None` skipped) in order.
+
+    Precedence is per key, the later source winning: `options` merges per key,
+    and a top-level template key (e.g. `mode`) and the same key in `options`
+    override each other across sources (a source setting both is an error).
+
+    `enabled` is decided by the last source that sets it explicitly: a bool, a
+    false / true word, `ep` / `tp`, a shorthand name, an `enabled` key, or a
+    `plugin` key without `enabled` (which counts as true). If no source sets it
+    explicitly, the megakernel is on when any source configures it (any runtime
+    or template key, e.g. `ab=1` or `{"options": {...}}`) and off when no
+    source configures anything. So `VLLM_TPU_MEGAKERNEL=0` stays off whatever
+    settings a later source adds, unless that source turns it on explicitly,
+    and `ab=1` alone turns it on.
+    """
     st: dict[str, Any] = {
         "enabled": False,
         "plugin": None,
@@ -115,9 +133,31 @@ def parse_config(*sources: Any, raw_env: Any = None) -> MegakernelConfig:
         "stats_period_s": DEFAULT_STATS_PERIOD_S,
     }
     legacy: dict[str, Any] = {}
+    # The last explicit on / off, and whether any source configured anything.
+    explicit: list[bool] = []
+    configured = False
+
+    def set_enabled(on: bool) -> None:
+        explicit[:] = [on]
+
+    def merge(src_options: dict[str, Any], src_legacy: dict[str, Any]) -> None:
+        # One source's template settings: a key it sets at top level or in
+        # `options` replaces that key from every earlier source.
+        if clash := sorted(set(src_legacy) & set(src_options)):
+            raise MegakernelConfigError(
+                f"megakernel config: {clash} set both at top level and in 'options'"
+            )
+        for k in src_options:
+            legacy.pop(k, None)
+        for k in src_legacy:
+            st["options"].pop(k, None)
+        st["options"] = {**st["options"], **src_options}
+        legacy.update(src_legacy)
 
     def apply_dict(d: Mapping[str, Any]) -> None:
-        st["enabled"] = parse_bool(d.get("enabled", True))
+        nonlocal configured
+        src_options: dict[str, Any] = {}
+        src_legacy: dict[str, Any] = {}
         for k, v in d.items():
             k = str(k)
             if k not in RUNTIME_KEYS and k not in _LEGACY_KEYS:
@@ -125,12 +165,17 @@ def parse_config(*sources: Any, raw_env: Any = None) -> MegakernelConfig:
                     f"megakernel config: unknown key {k!r}; runtime keys are "
                     f"{sorted(RUNTIME_KEYS)} and template settings go in 'options'"
                 )
-            if v is None or k == "enabled":
+            if v is None:
                 continue
-            if k == "plugin":
+            configured = True
+            if k == "enabled":
+                set_enabled(parse_bool(v))
+            elif k == "plugin":
                 st["plugin"] = _parse_plugin_ref(v)
+                if d.get("enabled") is None:
+                    set_enabled(True)
             elif k == "options":
-                st["options"] = {**st["options"], **_parse_options(v)}
+                src_options.update(_parse_options(v))
             elif k == "ab":
                 st["ab"] = parse_bool(v, key="ab")
             elif k == "stats_period_s":
@@ -141,25 +186,30 @@ def parse_config(*sources: Any, raw_env: Any = None) -> MegakernelConfig:
                         f"megakernel config: invalid stats_period_s={v!r}"
                     ) from exc
             else:
-                legacy[k] = v
+                src_legacy[k] = v
+        merge(src_options, src_legacy)
 
     for src in sources:
         if src is None:
             continue
         if isinstance(src, bool):
-            st["enabled"] = src
+            set_enabled(src)
         elif isinstance(src, Mapping):
             apply_dict(src)
         else:
             s, sl = str(src).strip(), str(src).strip().lower()
+            if not sl:
+                continue  # an empty string (an unset variable) is no source
             if sl in _FALSE_STRS:
-                st["enabled"] = False
+                set_enabled(False)
             elif sl in _TRUE_STRS:
-                st["enabled"] = True
+                set_enabled(True)
             elif sl in ("ep", "tp"):
-                st["enabled"], legacy["mode"] = True, sl
+                set_enabled(True)
+                merge({"mode": sl}, {})
             elif sl in SHORTHANDS:
-                st["enabled"], st["plugin"] = True, sl
+                set_enabled(True)
+                st["plugin"] = sl
             elif s.startswith("{"):
                 try:
                     parsed = json.loads(s)
@@ -183,10 +233,7 @@ def parse_config(*sources: Any, raw_env: Any = None) -> MegakernelConfig:
                     kv[k.strip()] = v.strip()
                 apply_dict(kv)
 
-    if clash := sorted(set(legacy) & set(st["options"])):
-        raise MegakernelConfigError(
-            f"megakernel config: {clash} set both at top level and in 'options'"
-        )
+    st["enabled"] = explicit[0] if explicit else configured
     raw = "" if raw_env is None else str(raw_env)
     return MegakernelConfig(**st, legacy=legacy, raw_env=raw)
 
