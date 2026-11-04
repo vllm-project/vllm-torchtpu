@@ -85,10 +85,11 @@ def comm_params(
             f"all-reduce slice width CW={CW} (AR_C={AR_C}, R={R}) "
             "must be a multiple of 128"
         )
+    pow2_r = R >= 1 and (R & (R - 1)) == 0
     valid_mode = HIER in (0, 1, 2, 3) and (
-        HIER == 0
+        (HIER == 0 and pow2_r)
         or (HIER in (1, 2) and R == 8)
-        or (HIER == 3 and R >= 2 and (R & (R - 1)) == 0)
+        or (HIER == 3 and R >= 2 and pow2_r)
     )
     if not valid_mode:
         raise MegakernelConfigError(f"unsupported all-reduce mode: hier={HIER}, R={R}")
