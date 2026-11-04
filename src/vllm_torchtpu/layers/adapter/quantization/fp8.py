@@ -1346,7 +1346,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     """
     TPU FP8 linear method that keeps weights in FP8 at runtime and quantizes
     activations dynamically inside a Pallas matmul bridge, unless
-    TPU_FP8_LINEAR_W8A16_MAX_ROWS is opted in for small token buckets.
+    TPU_FP8_LINEAR_W8A16_MAX_ROWS is opted in for small token buckets (and
+    with optional bfloat16 activation division via
+    VLLM_TPU_FP8_FAST_BF16_ACT_QUANT).
 
     Reuses vLLM's Fp8LinearMethod.create_weights() for correct FP8 weight and
     scale parameter allocation (needed by the weight loader). After loading,

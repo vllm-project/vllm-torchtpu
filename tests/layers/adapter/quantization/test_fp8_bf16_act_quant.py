@@ -60,18 +60,39 @@ def test_quantize_block_bf16_hlo_and_roundtrip() -> None:
     assert "bf16[64,512]{1,0} divide(" in hlo_text
     assert "f32[64,512]{1,0} divide(" not in hlo_text
 
+    x_q_fp32, x_s_fp32 = util.quantize_block(
+        x, axis=1, target_dtype=jnp.float8_e4m3fn, bf16_act_quant=False
+    )
     x_q, x_s = util.quantize_block(
         x, axis=1, target_dtype=jnp.float8_e4m3fn, bf16_act_quant=True
     )
     assert x_q.dtype == jnp.float8_e4m3fn
     assert x_s.dtype == jnp.float32
     assert jnp.array_equal(x_s, x_s.astype(jnp.bfloat16).astype(jnp.float32))
+    assert jnp.allclose(x_s, x_s_fp32, rtol=2**-7, atol=0.0)
 
+    x_deq_fp32 = x_q_fp32.astype(jnp.float32) * x_s_fp32
     x_deq = x_q.astype(jnp.float32) * x_s
     rel_err = jnp.mean(jnp.abs(x.astype(jnp.float32) - x_deq)) / jnp.mean(
         jnp.abs(x.astype(jnp.float32))
     )
     assert float(rel_err) < 0.05
+
+    # Compare bf16-division output directly against the fp32-division path:
+    # double rounding can shift at most 1 fp8_e4m3fn ULP plus 1 bf16 scale ULP,
+    # and mean drift across the tensor stays << 1%.
+    fp8_eps = float(jnp.finfo(jnp.float8_e4m3fn).eps)
+    bf16_eps = float(jnp.finfo(jnp.bfloat16).eps)
+    assert jnp.allclose(
+        x_deq,
+        x_deq_fp32,
+        rtol=fp8_eps + bf16_eps,
+        atol=(2**-9) * float(jnp.max(x_s_fp32)),
+    )
+    bf16_vs_fp32_rel_err = jnp.mean(jnp.abs(x_deq - x_deq_fp32)) / jnp.mean(
+        jnp.abs(x_deq_fp32)
+    )
+    assert float(bf16_vs_fp32_rel_err) < 0.01
 
 
 def test_quantize_block_edge_cases() -> None:
