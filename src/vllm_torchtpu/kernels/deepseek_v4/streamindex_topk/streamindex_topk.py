@@ -831,6 +831,59 @@ def kernel(
     ### ------- Kernel end ------- ###
 
 
+@functools.cache
+def _score_body_for_config(
+    bq_sz, bkv_p, seq_batch_size, buffer_count, kv_layout, chunk_idx, components
+):
+    """Reuse the static score body; scheduling and DMA contracts stay outside."""
+    return functools.partial(
+        kernel,
+        bq_sz=bq_sz,
+        bkv_p=bkv_p,
+        seq_batch_size=seq_batch_size,
+        buffer_count=buffer_count,
+        kv_layout=kv_layout,
+        chunk_idx=chunk_idx,
+        components=components,
+    )
+
+
+@functools.cache
+def _score_call_for_config(
+    body_config,
+    output_shape,
+    out_dtype,
+    num_scalar_prefetch,
+    num_flat_prefetches,
+    aliased,
+    vmem_limit_bytes,
+    scope_name,
+):
+    """Reuse only the original statically configured Pallas call constructor."""
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    in_specs = [hbm_spec, hbm_spec, hbm_spec]
+    if aliased:
+        in_specs.append(hbm_spec)
+    return pl.pallas_call(
+        _score_body_for_config(*body_config),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=num_scalar_prefetch,
+            in_specs=in_specs,
+            out_specs=hbm_spec,
+            grid=(1,),
+            scratch_shapes=[],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        out_shape=jax.ShapeDtypeStruct(shape=output_shape, dtype=out_dtype),
+        input_output_aliases=({num_flat_prefetches + 3: 0} if aliased else {}),
+        name=scope_name,
+    )
+
+
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
@@ -1420,21 +1473,8 @@ def streamindex_topk(
         bkv_p = num_kv_pages_per_block
         bq_sz, bkv_sz = _block_sizes(num_queries_per_block, bkv_p, static_q_len)
 
-        hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-        # Passes 2 and 3 donate the previous pass's HBM buffer so its rows survive
-        # into this output. Only pass 1 has no donor, so Pallas allocates it there;
-        # one buffer per chunk either way.
+        # Passes 2/3 retain the previous score rows through the original alias.
         aliased = scores_init is not None
-        in_specs = [
-            hbm_spec,  # q
-            hbm_spec,  # prepared_indexer_weights
-            hbm_spec,  # cache_kv
-        ]
-        if aliased:
-            in_specs.append(hbm_spec)  # scores_init, aliased to out
-        out_specs = hbm_spec
-
-        scratch_shapes = []
 
         chunk_start = 0 if chunk_token_start is None else chunk_token_start
         scalar_prefetches = (
@@ -1447,9 +1487,6 @@ def streamindex_topk(
 
         num_scalar_prefetch = len(scalar_prefetches)
         num_flat_prefetches = len(jax.tree_util.tree_leaves(scalar_prefetches))
-        # The aliased `scores_init` is the 4th operand after the flat prefetches.
-        input_output_aliases = {num_flat_prefetches + 3: 0} if aliased else {}
-
         layout_tag = "" if kv_layout == KVLayout.HEAD_ALONG_SUBLANE else "-sal"
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}"
         if chunked:
@@ -1457,44 +1494,32 @@ def streamindex_topk(
             # sizes shows up in the profile instead of silently reusing one shape.
             scope_name += f"-c{max_num_tokens // chunk_tokens}"
         pallas_kernel = jax.named_scope(scope_name)(
-            pl.pallas_call(
-                functools.partial(
-                    kernel,
-                    bq_sz=bq_sz,
-                    bkv_p=bkv_p,
-                    seq_batch_size=seq_batch_size,
-                    buffer_count=buffer_count,
-                    kv_layout=kv_layout,
-                    chunk_idx=chunk_idx,
-                    components=components,
+            _score_call_for_config(
+                (
+                    bq_sz,
+                    bkv_p,
+                    seq_batch_size,
+                    buffer_count,
+                    kv_layout,
+                    chunk_idx,
+                    components,
                 ),
-                grid_spec=pltpu.PrefetchScalarGridSpec(
-                    num_scalar_prefetch=num_scalar_prefetch,
-                    in_specs=in_specs,
-                    out_specs=out_specs,
-                    grid=(1,),
-                    scratch_shapes=scratch_shapes,
-                ),
-                compiler_params=pltpu.CompilerParams(
-                    dimension_semantics=("arbitrary",),
-                    vmem_limit_bytes=vmem_limit_bytes,
-                    disable_bounds_checks=True,
-                ),
-                out_shape=jax.ShapeDtypeStruct(
-                    shape=(
-                        chunk_tokens,
-                        align_to(
-                            num_sublanes_total
-                            if score_sublanes is None
-                            else score_sublanes,
-                            pltpu.get_tpu_info().num_sublanes,
-                        ),
-                        128,
+                (
+                    chunk_tokens,
+                    align_to(
+                        num_sublanes_total
+                        if score_sublanes is None
+                        else score_sublanes,
+                        pltpu.get_tpu_info().num_sublanes,
                     ),
-                    dtype=out_dtype,
+                    128,
                 ),
-                input_output_aliases=input_output_aliases,
-                name=scope_name,
+                out_dtype,
+                num_scalar_prefetch,
+                num_flat_prefetches,
+                aliased,
+                vmem_limit_bytes,
+                scope_name,
             )
         )
         scores = pallas_kernel(

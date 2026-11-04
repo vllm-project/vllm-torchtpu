@@ -693,6 +693,32 @@ def _topk_scratch_types(
         else None,  # shared_key_vmem
     )
 
+
+@functools.cache
+def _topk_body_for_shape(
+    b, n, k, p, slice_len, num_waves, write_empty, return_scores, has_local_idxs
+):
+    """Reuse a static kernel body across distinct outer scheduling groups."""
+    body_fn = functools.partial(
+        _topk_body,
+        b=b,
+        n=n,
+        k=k,
+        p=p,
+        slice_len=slice_len,
+        num_waves=num_waves,
+        write_empty=write_empty,
+        return_scores=return_scores,
+    )
+    if has_local_idxs:
+        orig_body = body_fn
+
+        def body_fn(scores, lengths, idx, *rest):
+            return orig_body(scores, lengths, *rest, local_idxs_hbm=idx)
+
+    return body_fn
+
+
 def _sc_topk_direct(
     scores: jax.Array,  # f32[b, n]
     k: int,
@@ -756,23 +782,17 @@ def _sc_topk_direct(
 
     scratch_types = _topk_scratch_types(k, p, return_scores, sc.num_subcores)
 
-    body_fn = functools.partial(
-        _topk_body,
-        b=b,
-        n=n,
-        k=k,
-        p=p,
-        slice_len=slice_len,
-        num_waves=num_waves,
-        write_empty=write_empty,
-        return_scores=return_scores,
+    body_fn = _topk_body_for_shape(
+        b,
+        n,
+        k,
+        p,
+        slice_len,
+        num_waves,
+        write_empty,
+        return_scores,
+        local_idxs is not None,
     )
-    if local_idxs is not None:
-        orig_body = body_fn
-
-        def body_fn(scores, lengths, idx, *rest):
-            return orig_body(scores, lengths, *rest, local_idxs_hbm=idx)
-
     out = pl.kernel(
         body_fn,
         out_type=out_type,
@@ -796,8 +816,6 @@ def _sc_topk_direct(
         keys_2d = keys.reshape(padded_b, k)[:b]
         return slots_2d, keys_2d
     return slots_2d
-
-
 
 
 def _pick_partition(b: int, n: int, k: int) -> int:

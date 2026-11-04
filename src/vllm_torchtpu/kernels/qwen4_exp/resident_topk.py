@@ -85,6 +85,63 @@ def _resident_prefix_words(
     return resident
 
 
+@functools.cache
+def _resident_body_for_shape(
+    b,
+    n,
+    k,
+    p,
+    slice_len,
+    num_waves,
+    write_empty,
+    return_scores,
+    resident_n,
+    prefix_p,
+    prefix_waves,
+):
+    """Reuse static prefix/full bodies without capturing a scheduling ID."""
+    body_fn = functools.partial(
+        _topk_body,
+        b=b,
+        n=n,
+        k=k,
+        p=p,
+        slice_len=slice_len,
+        num_waves=num_waves,
+        write_empty=write_empty,
+        return_scores=return_scores,
+    )
+    full_body = body_fn
+    prefix_body = functools.partial(
+        _topk_body,
+        b=b,
+        n=resident_n,
+        k=k,
+        p=prefix_p,
+        slice_len=_align_to(resident_n // prefix_p, LANES),
+        num_waves=prefix_waves,
+        write_empty=write_empty,
+        return_scores=return_scores,
+        physical_pitch=p * slice_len,
+    )
+
+    def body_fn(scores, lengths, prefix_lengths, choice, out, keys, *scratch):
+        choice_vmem = scratch[-1]
+        common_scratch = scratch[:-1]
+        pltpu.sync_copy(choice, choice_vmem)
+        enabled = choice_vmem[pl.ds(0, LANES)][0] != 0
+
+        @pl.when(enabled)
+        def prefix():
+            prefix_body(scores, prefix_lengths, out, keys, *common_scratch)
+
+        @pl.when(~enabled)
+        def full():
+            full_body(scores, lengths, out, keys, *common_scratch)
+
+    return body_fn
+
+
 def _sc_topk_resident(
     scores: jax.Array,  # f32[b, n]
     k: int,
@@ -124,8 +181,12 @@ def _sc_topk_resident(
     resident_n = None
     prefix_p = prefix_waves = prefix_padded_b = 0
     candidate_n = _resident_prefix_words(
-        b, n, k, return_scores=return_scores,
-        capacity_bytes=sc.vmem_capacity_bytes, num_lanes=sc.num_lanes,
+        b,
+        n,
+        k,
+        return_scores=return_scores,
+        capacity_bytes=sc.vmem_capacity_bytes,
+        num_lanes=sc.num_lanes,
         dma_granule_bytes=sc.dma_granule_size_bytes,
         pipeline_lanes=info.num_lanes,
     )
@@ -153,13 +214,16 @@ def _sc_topk_resident(
 
     if resident_n is None:
         return _sc_topk_direct(
-            scores, k, row_lengths, p=p, write_empty=write_empty,
-            return_scores=return_scores, scheduling_group_id=scheduling_group_id,
+            scores,
+            k,
+            row_lengths,
+            p=p,
+            write_empty=write_empty,
+            return_scores=return_scores,
+            scheduling_group_id=scheduling_group_id,
         )
 
-    prefix_lengths = jnp.pad(
-        row_lengths.astype(jnp.int32), (0, prefix_padded_b - b)
-    )
+    prefix_lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, prefix_padded_b - b))
     if prefix_p > 1:
         prefix_lengths = jnp.repeat(prefix_lengths, prefix_p)
     prefix_lengths = jnp.pad(prefix_lengths[:, None], ((0, 0), (0, LANES - 1)))
@@ -179,40 +243,20 @@ def _sc_topk_resident(
 
     scratch_types = _topk_scratch_types(k, p, return_scores, sc.num_subcores)
 
-    body_fn = functools.partial(
-        _topk_body,
-        b=b,
-        n=n,
-        k=k,
-        p=p,
-        slice_len=slice_len,
-        num_waves=num_waves,
-        write_empty=write_empty,
-        return_scores=return_scores,
-    )
     scratch_types = (*scratch_types, pltpu.VMEM((LANES,), jnp.int32))
-    full_body = body_fn
-    prefix_body = functools.partial(
-        _topk_body, b=b, n=resident_n, k=k, p=prefix_p,
-        slice_len=_align_to(resident_n // prefix_p, LANES),
-        num_waves=prefix_waves, write_empty=write_empty,
-        return_scores=return_scores, physical_pitch=p * slice_len,
+    body_fn = _resident_body_for_shape(
+        b,
+        n,
+        k,
+        p,
+        slice_len,
+        num_waves,
+        write_empty,
+        return_scores,
+        resident_n,
+        prefix_p,
+        prefix_waves,
     )
-
-    def body_fn(scores, lengths, prefix_lengths, choice, out, keys, *scratch):
-        choice_vmem = scratch[-1]
-        common_scratch = scratch[:-1]
-        pltpu.sync_copy(choice, choice_vmem)
-        enabled = choice_vmem[pl.ds(0, LANES)][0] != 0
-
-        @pl.when(enabled)
-        def prefix():
-            prefix_body(scores, prefix_lengths, out, keys, *common_scratch)
-
-        @pl.when(~enabled)
-        def full():
-            full_body(scores, lengths, out, keys, *common_scratch)
-
 
     out = pl.kernel(
         body_fn,
@@ -266,8 +310,11 @@ def qwen_sparsecore_topk(
 
     if row_lengths is None:
         return sparsecore_topk(
-            scores, k, write_empty_rows=write_empty_rows,
-            scheduling_group_id=scheduling_group_id, return_scores=return_scores,
+            scores,
+            k,
+            write_empty_rows=write_empty_rows,
+            scheduling_group_id=scheduling_group_id,
+            return_scores=return_scores,
         )
     row_lengths = row_lengths.astype(jnp.int32)
 
