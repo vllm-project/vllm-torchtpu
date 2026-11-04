@@ -97,10 +97,17 @@ def select_blocks(
         visible & (blocks >= num_visible - local_blocks), _FORCED_LOCAL_SCORE, s
     )
     s = jnp.where(visible & (blocks < init_blocks), _FORCED_INIT_SCORE, s)
-    top_scores, top_blocks = jax.lax.top_k(s, topk)
-    top_blocks = jnp.where(top_scores > _NEG_INF, top_blocks, jnp.iinfo(jnp.int32).max)
-    top_blocks = jnp.sort(top_blocks, axis=-1)
-    return jnp.where(top_blocks == jnp.iinfo(jnp.int32).max, -1, top_blocks)
+    # topk rounds of argmax-and-mask: lax.top_k sorts each row on TPU, which
+    # takes tens of ms per layer for an 8K-token chunk over every block.
+    no_block = jnp.iinfo(jnp.int32).max
+    picked = []
+    for _ in range(topk):
+        best = jnp.argmax(s, axis=-1).astype(jnp.int32)
+        found = jnp.max(s, axis=-1) > _NEG_INF
+        picked.append(jnp.where(found, best, no_block))
+        s = jnp.where(blocks == best[..., None], _NEG_INF, s)
+    top_blocks = jnp.sort(jnp.stack(picked, axis=-1), axis=-1)
+    return jnp.where(top_blocks == no_block, -1, top_blocks)
 
 
 def sparse_attention(
